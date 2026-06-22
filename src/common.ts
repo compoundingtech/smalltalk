@@ -136,7 +136,13 @@ export const RESERVED_NAMES: readonly string[] = [
 ];
 
 const FILENAME_RE = /^[0-9]{13}-[0-9a-z]{6}\.md$/;
-const IDENTITY_RE = /^[a-z0-9]([a-z0-9-]*[a-z0-9])?$/;
+// Identities are lowercase ASCII alphanumeric + hyphens and PERIODS,
+// starting and ending with an alphanumeric. The period (issue #1) is
+// a convention for encoding hierarchy in a flat namespace, e.g.
+// `orchestrator.session-1.child-7`. Real nested folders (paths with
+// `/`) are deliberately NOT supported — see issue #1 for the
+// decision and the use-cases that prompted the question.
+const IDENTITY_RE = /^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$/;
 
 // ─── Pluralize ───────────────────────────────────────────────────────────
 

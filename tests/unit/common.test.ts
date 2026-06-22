@@ -289,6 +289,12 @@ describe('validIdentity', () => {
     expect(validIdentity('pty-relay-claude')).toBe(true);
   });
 
+  it('accepts internal periods (issue #1: dotted hierarchy)', () => {
+    expect(validIdentity('orchestrator.session-1')).toBe(true);
+    expect(validIdentity('a.b.c')).toBe(true);
+    expect(validIdentity('parent.child.grandchild')).toBe(true);
+  });
+
   it('accepts a 32-char name', () => {
     expect(validIdentity('a'.repeat(32))).toBe(true);
   });
@@ -320,10 +326,21 @@ describe('validIdentity', () => {
     expect(validIdentity('alice ')).toBe(false);
   });
 
-  it('rejects non-[a-z0-9-] chars', () => {
-    expect(validIdentity('alice.bob')).toBe(false);
-    expect(validIdentity('alice_bob')).toBe(false);
+  it('rejects leading period', () => {
+    expect(validIdentity('.alice')).toBe(false);
+  });
+
+  it('rejects trailing period', () => {
+    expect(validIdentity('alice.')).toBe(false);
+  });
+
+  it('rejects path separators (slashes are NOT supported — issue #1)', () => {
     expect(validIdentity('alice/bob')).toBe(false);
+    expect(validIdentity('../etc')).toBe(false);
+  });
+
+  it('rejects non-[a-z0-9.-] chars', () => {
+    expect(validIdentity('alice_bob')).toBe(false);
     expect(validIdentity('aliçe')).toBe(false);
   });
 
