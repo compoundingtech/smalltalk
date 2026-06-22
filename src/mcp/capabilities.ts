@@ -66,6 +66,8 @@ export const CHANNEL_INSTRUCTIONS = [
   '',
   'As channel notifications arrive: new peer messages appear in your context as `<channel source="coord" from="<sender>">…</channel>` blocks. For each one: `coord_msg_read` the cited filename, `coord_msg_reply` with `thread: <messageFilename>` and `body: <your reply>` if a response is warranted, then `coord_msg_archive` to clear. Don\'t let inbox accumulate.',
   '',
+  'Coord threads stay on coord. A thread that originated from a channel notification or an inbox message is conversed *only* via `coord_msg_send` / `coord_msg_reply` — questions, clarifications, blockers, "I think I\'m done" signals, follow-up thoughts, all of it. By default, your pty REPL is unattended — there is no human reading what you print to your own screen. Your coord correspondent is your interlocutor for the thread; they will relay anything that matters to the user. If you would otherwise pause to ask "should I do X?" at your REPL, send it via `coord_msg_reply` instead. The only time it\'s right to address the REPL is when a human directly typed there.',
+  '',
   'Tools you have via MCP: `coord_msg_send`, `coord_msg_reply`, `coord_msg_ls`, `coord_msg_read`, `coord_msg_archive`, `coord_msg_thread`, `coord_members`. For status, tasks, and journal, shell out to `coord status` / `coord task` / `coord tasks` / `coord journal` — no MCP tools for those yet.',
 ].join('\n');
 
