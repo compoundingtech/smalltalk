@@ -30,8 +30,10 @@ sync. There are no machine-local marker files inside the folder.
   *shared* identity (a "team alias" — `dispatch`, `oncall`, etc.) is also
   supported: multiple participants keep the folder synced and share the
   inbox. See [walkthrough.md](notes/walkthrough.md) for usage patterns.
-- Lowercase ASCII alphanumeric and hyphens. 1–32 characters. No leading or
-  trailing hyphen.
+- Lowercase ASCII alphanumeric, hyphens, and periods. Must start and end
+  with an alphanumeric. Periods encode hierarchy in the flat namespace
+  (e.g. `persona.session-1.child-7`) — see issue #1. No upper bound on
+  length beyond what the underlying filesystem accepts.
 - Reserved names (must not be used as an identity): `inbox`, `archive`,
   `tasks`, `journal`, `status`, `name`, `available`, `busy`, `away`,
   `dnd`, `offline`, `unknown`, `members`, `overview`.

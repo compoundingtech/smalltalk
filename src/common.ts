@@ -190,7 +190,6 @@ export function filenameTimestamp(s: string): number {
 
 export function validIdentity(s: string): boolean {
   if (!s) return false;
-  if (s.length > 32) return false;
   if (!IDENTITY_RE.test(s)) return false;
   if (RESERVED_NAMES.includes(s)) return false;
   return true;

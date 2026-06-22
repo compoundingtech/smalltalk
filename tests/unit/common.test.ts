@@ -295,16 +295,18 @@ describe('validIdentity', () => {
     expect(validIdentity('parent.child.grandchild')).toBe(true);
   });
 
-  it('accepts a 32-char name', () => {
-    expect(validIdentity('a'.repeat(32))).toBe(true);
+  it('accepts long names (issue #1: 32-char cap removed)', () => {
+    // A delegation-path-as-identity wants `<persona>.<26-char-ulid>` or
+    // deeper, which blows the old 32-char cap immediately. The cap was
+    // defensive, not load-bearing — POSIX paths accept far longer, and
+    // there's no coord invariant that depends on a length bound.
+    expect(validIdentity('a'.repeat(64))).toBe(true);
+    expect(validIdentity('persona.01arz3ndektsv4rrffq69g5fav')).toBe(true);
+    expect(validIdentity('a'.repeat(255))).toBe(true);
   });
 
   it('rejects empty', () => {
     expect(validIdentity('')).toBe(false);
-  });
-
-  it('rejects 33+ chars', () => {
-    expect(validIdentity('a'.repeat(33))).toBe(false);
   });
 
   it('rejects uppercase', () => {
