@@ -13,6 +13,46 @@ frontmatter, plain `rsync` between machines.
 
 > **Pre-1.0.** Conventions and CLI may break between commits.
 
+## Why this shape
+
+**The one rule: across identities, only `inbox/` is writable.** Every
+other folder under an identity — `archive/`, `tasks/`, `journal/`,
+`status` — is single-writer, owned by that identity. Peers read but
+never write. This gives you several useful properties for free:
+
+- **Lock-free coordination.** Every new message is a new file with a
+  globally unique `<unix-ms>-<rand6>.md` name. No two writers ever
+  contend for the same path, so there's nothing to lock and nothing to
+  reconcile. The sender writes; sync moves the bytes; the recipient
+  reads at their own pace.
+
+- **No cross-identity edits.** One identity can't reach into another's
+  `tasks/` and change a task status, can't edit a journal entry it
+  doesn't own. If you want a peer to do something, you message their
+  inbox suggesting it. They decide whether to act and update their own
+  state. That's the entire authorization model.
+
+- **Inbox files can carry attachments.** The inbox is just a folder —
+  alongside the canonical `<ts>-<rand6>.md` message file, a sender can
+  drop additional files (a screenshot, a CSV, a tarball). Same
+  lock-free property; the recipient sees them with plain `ls`. Mail
+  with arbitrary payloads, no protocol.
+
+- **One identity per container.** Because an identity is exactly a
+  folder, you can mount `$COORD_ROOT/<identity>/` into a container,
+  jail, or sandboxed process and that's the entire surface that
+  identity needs. No daemon to authenticate to; no broker to
+  configure.
+
+- **Pluggable sync.** `coord` defaults to plain bidirectional `rsync`,
+  which works against any host you can ssh to. But because the API is
+  *just a folder*, anything that surfaces a writable folder works:
+  [ZeroFS](https://github.com/Barre/ZeroFS) (serves S3-compatible
+  buckets as a POSIX filesystem over NFS/9P) lets you sync via object
+  storage with no rsync host in the loop; Syncthing, Dropbox, NFS,
+  or a shared volume in a multi-container setup all work the same
+  way. The convention doesn't care how the bytes arrive.
+
 ## Install
 
 ```sh
