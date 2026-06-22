@@ -32,6 +32,11 @@ describe('CHANNEL_INSTRUCTIONS — load-bearing substrings', () => {
     'coord journal new',
     // Channel-arrival message format
     '<channel source="coord"',
+    // Coord-threads-stay-on-coord rule: any thread originated via channel
+    // / inbox is conversed via coord, not the REPL. Pins the load-bearing
+    // phrases so the rule can't be silently weakened.
+    'Coord threads stay on coord',
+    'pty REPL is unattended',
   ] as const;
 
   for (const needle of REQUIRED_SUBSTRINGS) {
