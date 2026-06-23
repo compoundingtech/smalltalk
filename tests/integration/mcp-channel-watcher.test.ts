@@ -215,21 +215,26 @@ describe('channel-watcher — frontmatter edge cases', () => {
   });
 });
 
-// ─── Pre-emit sweep (archive-zombie suppression) ──────────────────────
+// ─── Channel emit semantics with an archive twin present ─────────────
+//
+// Post sweep-as-convergence: the watcher does NOT presweep on emit. A
+// byte-identical inbox/archive twin will fire a (spurious) notification;
+// the recipient's lazy-read sweep cleans up on the next read. Divergent
+// twins still fire as before — the inbox version is the new arrival.
 
-describe('channel-watcher — pre-emit sweep', () => {
-  it('byte-identical inbox+archive twin → sweep removes inbox copy, no notification', async () => {
+describe('channel-watcher — archive twin behavior', () => {
+  it('byte-identical inbox+archive twin → notification STILL fires (no pre-emit sweep)', async () => {
     const filename = '1714826789080-hhhhhh.md';
     const bytes = '---\nfrom: bob\n---\nzombie\n';
-    // Drop the archive copy first, then the inbox copy.
     writeFileSync(join(coordRoot, 'alice', 'archive', filename), bytes);
     writeFileSync(join(inbox, filename), bytes);
-    // Wait long enough for the watcher to fire and the sweep to run.
-    await new Promise((r) => setTimeout(r, 250));
-    expect(received).toHaveLength(0);
+    // Spurious notification will fire; recipient's lazy-read sweep
+    // is responsible for cleaning up the inbox copy on next access.
+    await waitFor(() => received.length === 1);
+    expect(received[0]!.params.meta.messageFilename).toBe(filename);
   });
 
-  it('divergent inbox/archive copies → notification still fires (sweep skips)', async () => {
+  it('divergent inbox/archive copies → notification fires for the inbox version', async () => {
     const filename = '1714826789090-iiiiii.md';
     writeFileSync(
       join(coordRoot, 'alice', 'archive', filename),

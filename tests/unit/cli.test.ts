@@ -162,34 +162,36 @@ describe('runCli — per-command --help / -h prints command-specific usage', () 
   });
 });
 
-// ─── Universal pre-command sweep runs before the command ────────────────
+// ─── Non-sync commands DO NOT presweep (post sweep-as-convergence) ──────
 
-describe('runCli — universal pre-command sweep (Z1)', () => {
-  it('sweep happens BEFORE `ls`, removing zombie inbox before listing', async () => {
+describe('runCli — no inline presweep on non-sync commands', () => {
+  it('`ls` shows the zombie inbox copy (no inline sweep)', async () => {
+    // Per the new sweep-as-convergence policy, ls does not run a
+    // presweep — a byte-identical inbox/archive twin will appear in
+    // ls output until lazy-read sweep, `coord sweep`, or a sync runs.
     setupIdentity('bob');
     const f = '1714826789010-aaaaaa.md';
-    // Zombie state: inbox/X.md byte-identical to archive/X.md.
     writeFileSync(join(coordRoot, 'bob', 'inbox', f), 'same');
     writeFileSync(join(coordRoot, 'bob', 'archive', f), 'same');
     const cap = makeContext();
     const code = await runCli(['message', 'ls', 'bob'], cap.ctx);
     expect(code).toBe(0);
-    // The zombie was swept BEFORE ls walked the inbox.
-    expect(cap.stdout).toBe('');
-    expect(cap.stderr).toContain('# 0 messages in inbox');
-    expect(existsSync(join(coordRoot, 'bob', 'inbox', f))).toBe(false);
+    expect(cap.stdout).toContain(f);
+    // Zombie still on disk after ls.
+    expect(existsSync(join(coordRoot, 'bob', 'inbox', f))).toBe(true);
   });
 
-  it('sweep does NOT run for top-level help', async () => {
-    // Set up a state that WOULD trigger sweep removal; verify it's not
-    // touched by `coord help`.
+  it('`read` lazy-sweeps the zombie inbox copy (byte-identical twin)', async () => {
     setupIdentity('bob');
     const f = '1714826789010-aaaaaa.md';
     writeFileSync(join(coordRoot, 'bob', 'inbox', f), 'same');
     writeFileSync(join(coordRoot, 'bob', 'archive', f), 'same');
     const cap = makeContext();
-    await runCli(['help'], cap.ctx);
-    expect(existsSync(join(coordRoot, 'bob', 'inbox', f))).toBe(true);
+    const code = await runCli(['message', 'read', 'bob', f], cap.ctx);
+    expect(code).toBe(0);
+    // Lazy-read sweep cleaned up the inbox copy.
+    expect(existsSync(join(coordRoot, 'bob', 'inbox', f))).toBe(false);
+    expect(existsSync(join(coordRoot, 'bob', 'archive', f))).toBe(true);
   });
 });
 

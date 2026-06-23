@@ -178,13 +178,22 @@ correctly across machines:
 
 > If `archive/X.md` exists on this machine, then `inbox/X.md` must not.
 
-Every coord operation runs a **sweep** before doing its work: for each file
-in any `<identity>/archive/`, remove the matching file from the same
-identity's `inbox/` if it exists. This is idempotent — safe to run
-repeatedly, on any machine, in any order.
+**Sweep is a convergence operation, not transactional.** It restores
+the invariant in three places: (1) on-demand via `coord sweep`;
+(2) lazily on read — when a reader opens an inbox file whose
+byte-identical twin exists in archive, the inbox copy is removed and
+the archive copy is returned instead (one stat + one byte-compare,
+bounded); (3) before AND after every `coord sync` push/pull.
+Idempotent — safe to run repeatedly, on any machine, in any order.
 
-The sweep restores the invariant after `rsync` has copied an archived
-message back into a peer's inbox.
+Operations on `inbox/` and `archive/` **MUST NOT** depend on a recent
+sweep for correctness. The invariant is restored as work flows through
+the system, not before every read or write. Tooling that ran an inline
+presweep before every command (some earlier implementations did) is
+fine to do — it's just expensive at scale and not part of the contract.
+
+The sweep-on-sync is the load-bearing one: without it, `rsync` would
+resurrect archived messages into peers' inboxes on every push.
 
 ## Status (optional)
 

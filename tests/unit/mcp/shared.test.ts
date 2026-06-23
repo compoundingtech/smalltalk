@@ -161,33 +161,33 @@ describe('shared — concurrent tool calls', () => {
   });
 });
 
-// ─── Pre-command sweep regression ─────────────────────────────────────
+// ─── No inline presweep, but lazy-read sweep cleans on coord_msg_read ──
 
-describe('shared — universal pre-command sweep', () => {
-  it('byte-identical inbox+archive twin is cleaned before any tool runs (read-only too)', async () => {
+describe('shared — sweep is a convergence operation', () => {
+  it('coord_msg_ls does NOT presweep — zombie stays visible', async () => {
     const f = '1714826789010-aaaaaa.md';
     writeFileSync(join(coordRoot, 'alice', 'inbox', f), 'same');
     writeFileSync(join(coordRoot, 'alice', 'archive', f), 'same');
-
-    // coord_msg_ls is read-only at the API level; sweep must still fire.
     const r = await call('coord_msg_ls', {});
     expect(r.isError).toBeUndefined();
-    expect(r.structuredContent?.matches).toEqual([]);
-    expect(existsSync(join(coordRoot, 'alice', 'inbox', f))).toBe(false);
+    expect(r.structuredContent?.matches).toEqual([f]);
+    expect(existsSync(join(coordRoot, 'alice', 'inbox', f))).toBe(true);
     expect(existsSync(join(coordRoot, 'alice', 'archive', f))).toBe(true);
   });
 
-  it('sweep is idempotent under concurrent tool calls', async () => {
+  it('coord_msg_read lazy-sweeps the byte-identical inbox twin', async () => {
     const f = '1714826789010-aaaaaa.md';
-    writeFileSync(join(coordRoot, 'alice', 'inbox', f), 'same');
-    writeFileSync(join(coordRoot, 'alice', 'archive', f), 'same');
-
-    // 10 parallel calls — each fires the pre-command sweep. Final state
-    // unchanged; no errors.
-    const results = await Promise.all(
-      Array.from({ length: 10 }, () => call('coord_msg_ls', {}))
+    writeFileSync(
+      join(coordRoot, 'alice', 'inbox', f),
+      '---\nfrom: bob\n---\nbody\n'
     );
-    for (const r of results) expect(r.isError).toBeUndefined();
+    writeFileSync(
+      join(coordRoot, 'alice', 'archive', f),
+      '---\nfrom: bob\n---\nbody\n'
+    );
+    const r = await call('coord_msg_read', { filename: f });
+    expect(r.isError).toBeUndefined();
+    // Lazy-read cleaned the inbox copy, archive stayed.
     expect(existsSync(join(coordRoot, 'alice', 'inbox', f))).toBe(false);
     expect(existsSync(join(coordRoot, 'alice', 'archive', f))).toBe(true);
   });

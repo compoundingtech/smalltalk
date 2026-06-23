@@ -4,14 +4,14 @@
 // parses argv, calls the typed core, and writes output via the
 // {@link CliContext} sinks. This file is now essentially:
 // (1) parse the top-level subcommand,
-// (2) run the universal pre-command sweep,
+// (2) dispatch to subcommands,
 // (3) dispatch to the right cmdXCli,
 // (4) catch CoordError → stderr + exit 1.
 
 import { realpathSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 
-import { coordConfigFrom, coordRootFrom, sweep } from './common.ts';
+import { coordConfigFrom, coordRootFrom } from './common.ts';
 import type { CliContext } from './cli-context.ts';
 import { cmdArchiveCli } from './commands/archive.ts';
 import { cmdDingCli } from './commands/ding.ts';
@@ -130,17 +130,6 @@ const NESTED_MESSAGE_VERBS = new Set([
 
 const MESSAGE_GROUP_NAMES = new Set(['message', 'msg']);
 
-const SKIP_PRESWEEP = new Set(['help', '--help', '-h']);
-
-function runPreSweep(ctx: CliContext, cmd: string): void {
-  if (SKIP_PRESWEEP.has(cmd)) return;
-  try {
-    sweep(ctx.coordRoot);
-  } catch {
-    // best-effort
-  }
-}
-
 async function dispatchMessage(
   args: readonly string[],
   ctx: CliContext
@@ -187,7 +176,6 @@ export async function runCli(
     return 0;
   }
   const rest = argv.slice(1);
-  runPreSweep(ctx, cmd);
   try {
     if (MESSAGE_GROUP_NAMES.has(cmd)) {
       return await dispatchMessage(rest, ctx);

@@ -15,8 +15,11 @@
 // - Zero stdout/stderr writes. The library returns values; the caller
 //   decides how to display them.
 //
-// Every method runs the universal pre-command sweep first (LAYOUT-defined
-// archive-as-tombstone invariant); the existing common.ts `sweep()` is
+// Sync methods run the universal sweep first (LAYOUT-defined
+// archive-as-tombstone invariant — without it, byte-identical inbox
+// twins would propagate across machines on push/pull). Non-sync
+// methods do NOT presweep — sweep is a convergence operation now, not
+// transactional. The existing common.ts `sweep()` is
 // what does the work.
 
 import { homedir } from 'node:os';
@@ -231,7 +234,10 @@ export function createCoord(options: CoordOptions): Coord {
 
   const lib_env = {} as NodeJS.ProcessEnv; // empty: API never reads env
 
-  /** Run the universal pre-command sweep (matches CLI). */
+  /** Run sweep before sync push/pull so byte-identical inbox/archive
+   *  twins don't propagate across machines. NOT called from non-sync
+   *  methods — sweep is a convergence operation, not transactional;
+   *  see LAYOUT.md "Convergence: archive is a tombstone". */
   function presweep(): void {
     try {
       runSweep(root);
@@ -271,7 +277,6 @@ export function createCoord(options: CoordOptions): Coord {
     configRoot,
 
     async send(to, body, opts = {}): Promise<Filename> {
-      presweep();
       const r = cmdSend({
         to,
         from: opts.from ?? identity,
@@ -287,7 +292,6 @@ export function createCoord(options: CoordOptions): Coord {
     },
 
     async ls(id?, opts = {}): Promise<Filename[]> {
-      presweep();
       const r = cmdLs({
         recipient: id ?? identity,
         ...(opts.archive !== undefined && { archive: opts.archive }),
@@ -300,7 +304,6 @@ export function createCoord(options: CoordOptions): Coord {
     },
 
     async read(id, filename, opts = {}): Promise<MessageWithLocation> {
-      presweep();
       const r = cmdRead({
         recipient: id,
         filename,
@@ -324,7 +327,6 @@ export function createCoord(options: CoordOptions): Coord {
     },
 
     async archive(id, filename): Promise<void> {
-      presweep();
       cmdArchive({
         recipient: id,
         filename,
@@ -334,7 +336,6 @@ export function createCoord(options: CoordOptions): Coord {
     },
 
     async archiveTrim(id, opts): Promise<Filename[]> {
-      presweep();
       const r = cmdArchiveTrim({
         recipient: id,
         ...(opts.olderThan !== undefined && { olderThan: opts.olderThan }),
@@ -348,7 +349,6 @@ export function createCoord(options: CoordOptions): Coord {
     },
 
     async thread(id, filename, opts = {}): Promise<MessageWithLocation[]> {
-      presweep();
       // The dynamic import keeps the Promise<Module> circle-safe when
       // bundlers tree-shake; static import works the same at runtime.
       const { cmdThread } = await import('./commands/thread.ts');
@@ -404,7 +404,6 @@ export function createCoord(options: CoordOptions): Coord {
     },
 
     async getStatus(id): Promise<State> {
-      presweep();
       const r = cmdStatus({
         recipient: id,
         env: lib_env,
@@ -415,7 +414,6 @@ export function createCoord(options: CoordOptions): Coord {
     },
 
     async setStatus(id, state): Promise<void> {
-      presweep();
       cmdStatus({
         recipient: id,
         setState: state,
@@ -425,7 +423,6 @@ export function createCoord(options: CoordOptions): Coord {
     },
 
     members(opts = {}): MemberSummary[] | MemberSummaryEnriched[] {
-      presweep();
       return getMembers(root, {
         ...(opts.status !== undefined && { status: opts.status }),
         ...(opts.enrich !== undefined && { enrich: opts.enrich }),
@@ -433,7 +430,6 @@ export function createCoord(options: CoordOptions): Coord {
     },
 
     overview(opts = {}): Overview {
-      presweep();
       const target = opts.identity ?? identity;
       return getOverview(root, target, {
         ...(opts.recent !== undefined && { recent: opts.recent }),
