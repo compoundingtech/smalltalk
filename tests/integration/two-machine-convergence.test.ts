@@ -119,9 +119,14 @@ d('two-machine convergence (real rsync)', () => {
     expect(listArchive(rootB, 'bob')).toEqual([filename]);
   });
 
-  it('asymmetric sync: A pushes twice, B never syncs — B inbox is clean after archive', () => {
-    // The Z1 regression from dx-review-2: a receiver that doesn't run sync
-    // itself should not see phantom inbox entries when the sender re-pushes.
+  it('asymmetric sync: A re-pushes, B sees the zombie until lazy-read sweep', () => {
+    // Originally the Z1 regression from dx-review-2 — fixed by inline
+    // presweep. Inline presweep is gone (sweep is now a convergence
+    // operation per LAYOUT). Two assertions pin the new contract:
+    // (1) `ls` reflects what's on disk — the re-deposited inbox copy
+    //     IS visible until a convergence operation runs.
+    // (2) `read` triggers lazy-read sweep, which removes the inbox
+    //     copy (byte-identical twin) and reads the archive copy.
     resetAll();
     const send = runCoord(['message', 'send', 'bob', '--from', 'alice'], {
       coordRoot: rootA,
@@ -138,20 +143,30 @@ d('two-machine convergence (real rsync)', () => {
       coordIdentity: 'bob',
     });
     // A pushes again — A still has bob/inbox/X locally because A's sync
-    // hasn't pulled bob/archive/X back yet.
+    // hasn't pulled bob/archive/X back yet. So A re-deposits inbox on B.
     runCoord(['sync', 'push', `local:${rootB}`], {
       coordRoot: rootA,
       coordIdentity: 'alice',
     });
-    // A's push re-deposited the inbox copy on B.
-    // Now B reads its inbox WITHOUT first running its own sync. The
-    // universal pre-command sweep on `coord ls` cleans the zombie.
-    const ls = runCoord(['message', 'ls', 'bob', '--count'], {
+    // (1) Before any read/sweep, the zombie is visible to ls.
+    const lsBefore = runCoord(['message', 'ls', 'bob', '--count'], {
       coordRoot: rootB,
       coordIdentity: 'bob',
     });
-    expect(ls.exitCode).toBe(0);
-    expect(ls.stdout.trim()).toBe('0');
+    expect(lsBefore.exitCode).toBe(0);
+    expect(lsBefore.stdout.trim()).toBe('1');
+    expect(listInbox(rootB, 'bob')).toEqual([filename]);
+    // (2) Reading triggers lazy-read sweep — inbox copy is removed.
+    runCoord(['message', 'read', 'bob', filename], {
+      coordRoot: rootB,
+      coordIdentity: 'bob',
+    });
+    const lsAfter = runCoord(['message', 'ls', 'bob', '--count'], {
+      coordRoot: rootB,
+      coordIdentity: 'bob',
+    });
+    expect(lsAfter.exitCode).toBe(0);
+    expect(lsAfter.stdout.trim()).toBe('0');
     expect(listInbox(rootB, 'bob')).toEqual([]);
     expect(listArchive(rootB, 'bob')).toEqual([filename]);
   });

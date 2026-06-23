@@ -1,6 +1,6 @@
 // commands/read.ts — print one message.
 
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readFileSync, rmSync } from 'node:fs';
 
 import {
   archiveDir,
@@ -70,6 +70,28 @@ export function cmdRead(input: ReadInput): ReadResult {
     label = 'archive';
   } else {
     throw new MessageNotFoundError(recipient, input.filename);
+  }
+
+  // Lazy-read sweep: if we resolved to inbox and a byte-identical
+  // archive twin exists, the inbox copy is a zombie (archive-as-
+  // tombstone invariant). Remove the inbox copy now and read the
+  // archive copy instead. Bounded work — one stat + at most one
+  // byte-compare per read. Bytes differ? Leave both alone; that's
+  // an unrelated message authored under a colliding filename, not a
+  // twin. Errors during compare/remove are non-fatal; the read
+  // proceeds with the inbox copy we already found.
+  if (label === 'inbox' && existsSync(archivePath)) {
+    try {
+      const inboxBuf = readFileSync(path);
+      const archiveBuf = readFileSync(archivePath);
+      if (inboxBuf.equals(archiveBuf)) {
+        rmSync(path);
+        path = archivePath;
+        label = 'archive';
+      }
+    } catch {
+      // leave both alone on error; the original path/label still works
+    }
   }
 
   const text = readFileSync(path, 'utf8');

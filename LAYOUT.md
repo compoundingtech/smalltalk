@@ -59,6 +59,31 @@ Every message file in `inbox/` or `archive/` has a globally unique name:
 Sortable by time. Effectively unique without coordination — at human-scale
 write rates the rand6 namespace (~10⁹) eliminates collisions.
 
+## Attachments
+
+A sender may drop additional files alongside the canonical
+`<unix-ms>-<rand6>.md` message file in `<recipient>/inbox/`. Files
+sharing that message's prefix are **attachments of that message**, by
+prefix association:
+
+```
+inbox/
+  1719012345-abc123.md              # the message file
+  1719012345-abc123.options.json    # structured payload
+  1719012345-abc123.schema.json     # optional schema describing the payload
+```
+
+Any file shape is fine — JSON, CSV, image, tarball. Attachments sync
+like everything else under `$COORD_ROOT/` and are inspectable with
+plain `ls` / `cat`. Their schema and interpretation are the
+participants' concern, not coord's — coord guarantees only that the
+bytes arrive and that the shared prefix is preserved.
+
+There is no first-class "attachment" verb in the current CLI; archive,
+sweep, and read operate on the canonical `.md` file. Tooling that
+wants to keep attachments lifecycle-coupled to their message file can
+glob the prefix.
+
 ## File contents
 
 Each message is markdown with a YAML frontmatter block:
@@ -153,13 +178,22 @@ correctly across machines:
 
 > If `archive/X.md` exists on this machine, then `inbox/X.md` must not.
 
-Every coord operation runs a **sweep** before doing its work: for each file
-in any `<identity>/archive/`, remove the matching file from the same
-identity's `inbox/` if it exists. This is idempotent — safe to run
-repeatedly, on any machine, in any order.
+**Sweep is a convergence operation, not transactional.** It restores
+the invariant in three places: (1) on-demand via `coord sweep`;
+(2) lazily on read — when a reader opens an inbox file whose
+byte-identical twin exists in archive, the inbox copy is removed and
+the archive copy is returned instead (one stat + one byte-compare,
+bounded); (3) before AND after every `coord sync` push/pull.
+Idempotent — safe to run repeatedly, on any machine, in any order.
 
-The sweep restores the invariant after `rsync` has copied an archived
-message back into a peer's inbox.
+Operations on `inbox/` and `archive/` **MUST NOT** depend on a recent
+sweep for correctness. The invariant is restored as work flows through
+the system, not before every read or write. Tooling that ran an inline
+presweep before every command (some earlier implementations did) is
+fine to do — it's just expensive at scale and not part of the contract.
+
+The sweep-on-sync is the load-bearing one: without it, `rsync` would
+resurrect archived messages into peers' inboxes on every push.
 
 ## Status (optional)
 

@@ -45,7 +45,7 @@ export async function startChannelWatcher(
   const chokidar = await import('chokidar');
   const { existsSync, readFileSync } = await import('node:fs');
   const { join } = await import('node:path');
-  const { parseFrontmatter, sweep, validFilename } = await import(
+  const { parseFrontmatter, validFilename } = await import(
     '../common.ts'
   );
 
@@ -114,13 +114,14 @@ export async function startChannelWatcher(
     try {
       const filename = filepath.split('/').pop() ?? '';
       if (!validFilename(filename)) return;
-      // Pre-emit sweep: if both inbox and archive hold byte-identical
-      // copies, the inbox zombie is removed and we don't fire.
-      try {
-        sweep(opts.root);
-      } catch {
-        // best-effort, like the CLI sweep
-      }
+      // No pre-emit sweep: sweep is a convergence operation now, not
+      // transactional (see LAYOUT.md). If a byte-identical archive
+      // twin exists for this inbox file, lazy-read sweep in cmdRead
+      // will clean it up the next time something reads it; a spurious
+      // channel emit for an already-archived message is recoverable
+      // (the recipient archives the dup, lazy sweep clears the inbox
+      // copy on next read). Worth it to drop the per-emit sweep tax
+      // on chokidar's hot path.
       if (!existsSync(filepath)) return;
       const text = readFileSync(filepath, 'utf8');
       const { fm, body } = parseFrontmatter(text);

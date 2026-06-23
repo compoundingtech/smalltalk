@@ -249,18 +249,22 @@ describe('coord_msg_ls — typed error mapping', () => {
   });
 });
 
-// ─── Pre-command sweep regression ─────────────────────────────────────
+// ─── No inline presweep on non-sync paths (post sweep-as-convergence) ──
 
-describe('coord_msg_ls — pre-command sweep', () => {
-  it('byte-identical inbox+archive twin is gone after ls (sweep ran)', async () => {
+describe('coord_msg_ls — no inline presweep', () => {
+  it('byte-identical inbox+archive twin is STILL visible after ls', async () => {
+    // Per the sweep-as-convergence policy, ls does not presweep — a
+    // zombie will surface in ls output until lazy-read sweep,
+    // `coord sweep`, or a sync runs. (Test stays expressive: this
+    // pins the new contract so a regression to inline presweep
+    // would fail this assertion.)
     const f = '1714826789010-aaaaaa.md';
     writeFileSync(join(coordRoot, 'alice', 'inbox', f), 'same');
     writeFileSync(join(coordRoot, 'alice', 'archive', f), 'same');
     const r = await call();
-    expect(r.structuredContent?.matches).toEqual([]);
-    // The Coord factory's sweep ran; the inbox copy is gone.
+    expect(r.structuredContent?.matches).toEqual([f]);
     expect(
       require('node:fs').existsSync(join(coordRoot, 'alice', 'inbox', f))
-    ).toBe(false);
+    ).toBe(true);
   });
 });
