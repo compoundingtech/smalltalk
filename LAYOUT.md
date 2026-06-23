@@ -59,6 +59,31 @@ Every message file in `inbox/` or `archive/` has a globally unique name:
 Sortable by time. Effectively unique without coordination — at human-scale
 write rates the rand6 namespace (~10⁹) eliminates collisions.
 
+## Attachments
+
+A sender may drop additional files alongside the canonical
+`<unix-ms>-<rand6>.md` message file in `<recipient>/inbox/`. Files
+sharing that message's prefix are **attachments of that message**, by
+prefix association:
+
+```
+inbox/
+  1719012345-abc123.md              # the message file
+  1719012345-abc123.options.json    # structured payload
+  1719012345-abc123.schema.json     # optional schema describing the payload
+```
+
+Any file shape is fine — JSON, CSV, image, tarball. Attachments sync
+like everything else under `$COORD_ROOT/` and are inspectable with
+plain `ls` / `cat`. Their schema and interpretation are the
+participants' concern, not coord's — coord guarantees only that the
+bytes arrive and that the shared prefix is preserved.
+
+There is no first-class "attachment" verb in the current CLI; archive,
+sweep, and read operate on the canonical `.md` file. Tooling that
+wants to keep attachments lifecycle-coupled to their message file can
+glob the prefix.
+
 ## File contents
 
 Each message is markdown with a YAML frontmatter block:
