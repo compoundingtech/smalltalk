@@ -45,7 +45,12 @@ import {
   type TaskState,
 } from '../errors.ts';
 
-const TASK_STATES: readonly TaskState[] = ['todo', 'doing', 'done', 'blocked'];
+export const TASK_STATES: readonly TaskState[] = [
+  'todo',
+  'doing',
+  'done',
+  'blocked',
+];
 const PRIORITIES = new Set(['low', 'normal', 'high']);
 
 // ─── Shape ──────────────────────────────────────────────────────────────

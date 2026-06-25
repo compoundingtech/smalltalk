@@ -14,6 +14,7 @@ import { fileURLToPath } from 'node:url';
 import { coordConfigFrom, coordRootFrom } from './common.ts';
 import type { CliContext } from './cli-context.ts';
 import { cmdArchiveCli } from './commands/archive.ts';
+import { cmdCompletionsCli } from './commands/completions.ts';
 import { cmdDingCli } from './commands/ding.ts';
 import { cmdInitCli } from './commands/init.ts';
 import { cmdJournalCli } from './commands/journal.ts';
@@ -111,7 +112,11 @@ const TOP_LEVEL_USAGE =
   `  ding <pty-session> [--identity ID] [--interval MS]\n` +
   `                                   busy-aware push notifier; pty-sends a\n` +
   `                                   notice on each new arrival when the agent\n` +
-  `                                   isn't busy/dnd\n\n` +
+  `                                   isn't busy/dnd\n` +
+  `  completions <shell>              print a shell completion script to\n` +
+  `                                   stdout (fish | bash | zsh), e.g.\n` +
+  `                                   coord completions fish > \\\n` +
+  `                                     ~/.config/fish/completions/coord.fish\n\n` +
   `Run \`coord message --help\` for the full message-verb flag surface.\n` +
   `See LAYOUT.md for the data-format spec.\n`;
 
@@ -203,6 +208,8 @@ export async function runCli(
         return await cmdInitCli(rest, ctx);
       case 'ding':
         return await cmdDingCli(rest, ctx);
+      case 'completions':
+        return cmdCompletionsCli(rest, ctx);
       default:
         // Helpful pointer for users who still type the pre-brief-017
         // flat forms: `coord send` → `coord message send`.

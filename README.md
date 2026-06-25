@@ -115,6 +115,22 @@ coord watch                                                 # cross-tree activit
 `coord help` lists every subcommand; `coord <subcommand> --help` shows
 that command's usage.
 
+### Shell completions
+
+`coord completions <shell>` prints a completion script to stdout for
+`fish`, `bash`, or `zsh`:
+
+```sh
+coord completions fish > ~/.config/fish/completions/coord.fish
+coord completions bash > /etc/bash_completion.d/coord
+coord completions zsh  > "${fpath[1]}/_coord"
+```
+
+The scripts complete subcommands, their verbs and flags, and the closed
+value sets (status states, task states, priorities). The fish script also
+disambiguates the reused verbs (`ls`, `new`, `status`) across the
+`message` / `task` / `journal` groups.
+
 ## Programmatic API
 
 Embed coord into a Node TUI, an Electron main process, or any host that
