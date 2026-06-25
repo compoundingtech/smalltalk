@@ -64,7 +64,7 @@ const MESSAGE_USAGE =
   `  send <to> [--from ID] [--subject S] [--in-reply-to F] [--tags T,T] [--priority P]\n` +
   `                                   read body from stdin\n` +
   `  ls [<identity>] [--archive] [--count|--json] [--since UNIX_MS] [--from ID]\n` +
-  `  read [<identity>] <filename> [--raw] [--archive]\n` +
+  `  read [<identity>] <filename> [--raw|--json] [--archive]\n` +
   `  archive [<identity>] <filename>\n` +
   `  archive trim [<identity>] [--older-than DURATION] [--keep-last N] [--dry-run]\n` +
   `  thread [<identity>] <filename> [--tree]\n`;

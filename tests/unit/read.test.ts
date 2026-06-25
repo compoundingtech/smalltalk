@@ -6,10 +6,13 @@ import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import {
+  buildReadJsonShape,
   cmdRead,
+  cmdReadCli,
   splitReadPositionals,
   type ReadInput,
 } from '../../src/commands/read.ts';
+import type { CliContext } from '../../src/cli-context.ts';
 
 let scratch: string;
 let coordRoot: string;
@@ -326,5 +329,187 @@ describe('splitReadPositionals', () => {
     expect(() => splitReadPositionals(['a', 'b', 'c'])).toThrowError(
       /too many arguments/
     );
+  });
+});
+
+// ─── --json (issue #7) ─────────────────────────────────────────────────────
+
+describe('cmdRead — fm/recipient on result', () => {
+  it('formatted mode populates fm with parsed frontmatter', () => {
+    setupIdentity('bob');
+    writeFile(
+      'bob',
+      '1714826789010-aaaaaa.md',
+      '---\nfrom: alice\nsubject: hi\n---\nthe body\n'
+    );
+    const r = cmdRead(baseInput());
+    expect(r.fm).toEqual({ from: 'alice', subject: 'hi' });
+    expect(r.recipient).toBe('bob');
+  });
+
+  it('raw mode returns empty fm (no parse cost)', () => {
+    setupIdentity('bob');
+    writeFile(
+      'bob',
+      '1714826789010-aaaaaa.md',
+      '---\nfrom: alice\n---\nbody\n'
+    );
+    const r = cmdRead(baseInput({ raw: true }));
+    expect(r.fm).toEqual({});
+    expect(r.recipient).toBe('bob');
+  });
+
+  it('untyped file returns empty fm', () => {
+    setupIdentity('bob');
+    writeFile('bob', '1714826789010-aaaaaa.md', 'no frontmatter here\n');
+    const r = cmdRead(baseInput());
+    expect(r.fm).toEqual({});
+    expect(r.untyped).toBe(true);
+  });
+});
+
+describe('buildReadJsonShape', () => {
+  function read(content: string): ReturnType<typeof cmdRead> {
+    setupIdentity('bob');
+    writeFile('bob', '1714826789010-aaaaaa.md', content);
+    return cmdRead(baseInput());
+  }
+
+  it('mirrors the MCP coord_msg_read shape: { filename, identity, folder, message }', () => {
+    const r = read('---\nfrom: alice\nsubject: hi\n---\nthe body\n');
+    const j = buildReadJsonShape('1714826789010-aaaaaa.md', r);
+    expect(j).toEqual({
+      filename: '1714826789010-aaaaaa.md',
+      identity: 'bob',
+      folder: 'inbox',
+      message: { from: 'alice', subject: 'hi', body: 'the body\n' },
+    });
+  });
+
+  it('archive folder is reflected', () => {
+    setupIdentity('bob');
+    writeFile(
+      'bob',
+      '1714826789010-aaaaaa.md',
+      '---\nfrom: alice\n---\nb\n',
+      'archive'
+    );
+    const r = cmdRead(baseInput({ fromArchive: true }));
+    const j = buildReadJsonShape('1714826789010-aaaaaa.md', r);
+    expect(j.folder).toBe('archive');
+  });
+
+  it('omits optional keys absent from frontmatter', () => {
+    const r = read('---\nfrom: alice\n---\nbody\n');
+    const j = buildReadJsonShape('1714826789010-aaaaaa.md', r);
+    expect(j.message).toEqual({ from: 'alice', body: 'body\n' });
+    expect('subject' in j.message).toBe(false);
+    expect('inReplyTo' in j.message).toBe(false);
+    expect('tags' in j.message).toBe(false);
+    expect('priority' in j.message).toBe(false);
+  });
+
+  it('renames in-reply-to → inReplyTo (camelCase like MCP)', () => {
+    const r = read(
+      '---\nfrom: alice\nin-reply-to: 1714826789000-zzzzzz.md\n---\nbody\n'
+    );
+    const j = buildReadJsonShape('1714826789010-aaaaaa.md', r);
+    expect(j.message.inReplyTo).toBe('1714826789000-zzzzzz.md');
+  });
+
+  it('parses inline tags scalar to a string[]', () => {
+    const r = read('---\nfrom: alice\ntags: [a, b, c]\n---\nbody\n');
+    const j = buildReadJsonShape('1714826789010-aaaaaa.md', r);
+    expect(j.message.tags).toEqual(['a', 'b', 'c']);
+  });
+
+  it('priority projects only the closed enum (drops bogus values)', () => {
+    const r1 = read('---\nfrom: a\npriority: high\n---\nbody\n');
+    expect(buildReadJsonShape('1714826789010-aaaaaa.md', r1).message.priority).toBe('high');
+    const r2 = read('---\nfrom: a\npriority: bogus\n---\nbody\n');
+    expect(buildReadJsonShape('1714826789010-aaaaaa.md', r2).message.priority).toBeUndefined();
+  });
+
+  it('untyped message: from is "" and body is the whole file (permissive)', () => {
+    const r = read('plain text, no fm\n');
+    const j = buildReadJsonShape('1714826789010-aaaaaa.md', r);
+    expect(j.message.from).toBe('');
+    expect(j.message.body).toBe('plain text, no fm\n');
+  });
+});
+
+describe('cmdReadCli — --json', () => {
+  function run(args: string[]): { stdout: string; stderr: string; code: number } {
+    let stdout = '';
+    let stderr = '';
+    const ctx: CliContext = {
+      env: { COORD_ROOT: coordRoot, COORD_IDENTITY: 'bob' },
+      coordRoot,
+      coordConfig: join(scratch, 'config'),
+      stdout: (s) => {
+        stdout += s;
+      },
+      stderr: (s) => {
+        stderr += s;
+      },
+      readStdin: async () => Buffer.alloc(0),
+    };
+    const code = cmdReadCli(args, ctx);
+    return { stdout, stderr, code };
+  }
+
+  it('--json prints one line of JSON to stdout, no header on stderr', () => {
+    setupIdentity('bob');
+    writeFile(
+      'bob',
+      '1714826789010-aaaaaa.md',
+      '---\nfrom: alice\nsubject: hi\n---\nbody\n'
+    );
+    const r = run(['1714826789010-aaaaaa.md', '--json']);
+    expect(r.code).toBe(0);
+    expect(r.stderr).toBe('');
+    expect(r.stdout.endsWith('\n')).toBe(true);
+    const parsed = JSON.parse(r.stdout);
+    expect(parsed).toEqual({
+      filename: '1714826789010-aaaaaa.md',
+      identity: 'bob',
+      folder: 'inbox',
+      message: { from: 'alice', subject: 'hi', body: 'body\n' },
+    });
+  });
+
+  it('--json + --raw is rejected', () => {
+    setupIdentity('bob');
+    writeFile('bob', '1714826789010-aaaaaa.md', '---\nfrom: a\n---\nb\n');
+    expect(() =>
+      run(['1714826789010-aaaaaa.md', '--json', '--raw'])
+    ).toThrowError(/mutually exclusive/);
+  });
+
+  it('--json on archive (with --archive) emits folder: "archive"', () => {
+    setupIdentity('bob');
+    writeFile(
+      'bob',
+      '1714826789010-aaaaaa.md',
+      '---\nfrom: alice\n---\nbody\n',
+      'archive'
+    );
+    const r = run(['1714826789010-aaaaaa.md', '--json', '--archive']);
+    expect(r.code).toBe(0);
+    expect(JSON.parse(r.stdout).folder).toBe('archive');
+  });
+
+  it('--json on an untyped file: from="" and body is whole text', () => {
+    setupIdentity('bob');
+    writeFile('bob', '1714826789010-aaaaaa.md', 'untyped\n');
+    const r = run(['1714826789010-aaaaaa.md', '--json']);
+    const parsed = JSON.parse(r.stdout);
+    expect(parsed.message).toEqual({ from: '', body: 'untyped\n' });
+  });
+
+  it('help string mentions --json', () => {
+    const r = run(['--help']);
+    expect(r.code).toBe(0);
+    expect(r.stderr).toContain('--json');
   });
 });

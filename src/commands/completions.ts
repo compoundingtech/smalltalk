@@ -93,6 +93,7 @@ const COMMANDS: readonly CommandSpec[] = [
         flags: [
           { name: 'raw', desc: 'Print raw message' },
           { name: 'archive', desc: 'Read from archive' },
+          JSON_FLAG,
         ],
       },
       {
