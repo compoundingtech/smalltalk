@@ -13,6 +13,7 @@ import {
   buildToolResult,
   withErrorMapping,
 } from '../error-mapping.ts';
+import { registerDualTool } from './dual-register.ts';
 
 const sendInputShape = {
   to: z.string().describe('Recipient identity (LAYOUT-004 grammar)'),
@@ -48,8 +49,9 @@ const sendOutputShape = {
 };
 
 export function registerSendTool(mcp: McpServer, coord: Coord): void {
-  mcp.registerTool(
-    'coord_msg_send',
+  registerDualTool(
+    mcp,
+    'msg_send',
     {
       title: 'Send a coord message',
       description:

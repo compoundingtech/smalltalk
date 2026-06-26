@@ -16,6 +16,7 @@ import {
   buildToolResult,
   withErrorMapping,
 } from '../error-mapping.ts';
+import { registerDualTool } from './dual-register.ts';
 
 const archiveInputShape = {
   filename: z
@@ -40,8 +41,9 @@ const archiveOutputShape = {
 };
 
 export function registerArchiveTool(mcp: McpServer, coord: Coord): void {
-  mcp.registerTool(
-    'coord_msg_archive',
+  registerDualTool(
+    mcp,
+    'msg_archive',
     {
       title: 'Archive a coord message',
       description:

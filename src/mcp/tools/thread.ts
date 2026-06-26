@@ -14,6 +14,7 @@ import {
   buildToolResult,
   withErrorMapping,
 } from '../error-mapping.ts';
+import { registerDualTool } from './dual-register.ts';
 
 const threadInputShape = {
   filename: z
@@ -52,8 +53,9 @@ const threadOutputShape = {
 };
 
 export function registerThreadTool(mcp: McpServer, coord: Coord): void {
-  mcp.registerTool(
-    'coord_msg_thread',
+  registerDualTool(
+    mcp,
+    'msg_thread',
     {
       title: 'Walk a coord thread',
       description:

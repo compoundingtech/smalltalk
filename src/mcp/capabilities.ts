@@ -5,6 +5,12 @@
 import type { ServerOptions } from '@modelcontextprotocol/sdk/server/index.js';
 import type { Implementation } from '@modelcontextprotocol/sdk/types.js';
 
+/**
+ * Default server identity — preserved for back-compat with imports
+ * that pre-date brief-005-phase0. New code should call
+ * {@link buildServerInfo} so the server announces under whichever
+ * name (`coord` / `st`) the CLI was invoked as.
+ */
 export const SERVER_INFO: Implementation = {
   name: 'coord',
   // Tracks the package version. We don't read package.json here to keep
@@ -28,6 +34,15 @@ export const SERVER_INFO: Implementation = {
   //         hence the minor bump.
   version: '0.3.0',
 };
+
+/**
+ * Build a server-info record that announces under the canonical name
+ * derived from the binary the user invoked. `coord` → `coord`;
+ * `st` / `smalltalk` → `st`. brief-005-phase0 §2.
+ */
+export function buildServerInfo(name: 'coord' | 'st'): Implementation {
+  return { ...SERVER_INFO, name };
+}
 
 /** Phase-1 (no `--channel`) options: tools capability only. */
 export const SERVER_OPTIONS: ServerOptions = {
@@ -92,22 +107,31 @@ export function buildServerOptions(opts: {
   };
 }
 
-/** Non-channel tool set. Names prefixed `coord_msg_` per brief-017
- * mark the message-group; `coord_members` (brief-019) is the first
- * non-message tool. `coord_task_*` / `coord_overview` remain parked. */
-export const EXPECTED_TOOL_NAMES = [
-  'coord_msg_send',
-  'coord_msg_ls',
-  'coord_msg_read',
-  'coord_msg_archive',
-  'coord_msg_thread',
-  'coord_members',
+/** The base tool names (sans prefix) registered in non-channel mode.
+ *  `msg_send/ls/read/archive/thread` per brief-017; `members` per
+ *  brief-019. `task_*` / `overview` remain parked. */
+export const EXPECTED_TOOL_BASE_NAMES = [
+  'msg_send',
+  'msg_ls',
+  'msg_read',
+  'msg_archive',
+  'msg_thread',
+  'members',
 ] as const;
 
-/** Channel-mode tool set: non-channel set + `coord_msg_reply`. */
+/** brief-005-phase0 §3: every tool dual-registers under `coord_*`
+ *  (legacy) AND `st_*` (new). The Phase-1 set is both prefixes for
+ *  every base name. Phase 5 drops the `coord_*` variants. */
+export const EXPECTED_TOOL_NAMES = [
+  ...EXPECTED_TOOL_BASE_NAMES.map((n) => `coord_${n}` as const),
+  ...EXPECTED_TOOL_BASE_NAMES.map((n) => `st_${n}` as const),
+] as const;
+
+/** Channel-mode tool set: non-channel set + msg_reply (dual-prefixed). */
 export const EXPECTED_TOOL_NAMES_CHANNEL = [
   ...EXPECTED_TOOL_NAMES,
   'coord_msg_reply',
+  'st_msg_reply',
 ] as const;
 
 export type ToolName = (typeof EXPECTED_TOOL_NAMES_CHANNEL)[number];

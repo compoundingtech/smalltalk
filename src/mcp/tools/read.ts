@@ -9,6 +9,7 @@ import {
   buildToolResult,
   withErrorMapping,
 } from '../error-mapping.ts';
+import { registerDualTool } from './dual-register.ts';
 
 const readInputShape = {
   filename: z
@@ -43,8 +44,9 @@ const readOutputShape = {
 };
 
 export function registerReadTool(mcp: McpServer, coord: Coord): void {
-  mcp.registerTool(
-    'coord_msg_read',
+  registerDualTool(
+    mcp,
+    'msg_read',
     {
       title: 'Read one coord message',
       description:

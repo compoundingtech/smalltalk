@@ -6,7 +6,12 @@
 // command's call path.
 
 import type { CliContext } from '../cli-context.ts';
-import { coordRootFrom } from '../common.ts';
+import {
+  canonicalServerName,
+  coordRootFrom,
+  envIdentityFrom,
+  invokedAsFrom,
+} from '../common.ts';
 
 export async function cmdMcpCli(
   args: readonly string[],
@@ -37,15 +42,15 @@ export async function cmdMcpCli(
     throw new Error(`unknown flag: ${a}`);
   }
 
-  // `coord mcp` follows the same env contract as every other coord
-  // verb: COORD_ROOT defaults to ~/.local/state/coord via
-  // coordRootFrom(); COORD_IDENTITY has no default and must be set
-  // by the host (Claude Code, Codex, Pi) so the server knows whose
-  // inbox to watch.
+  // `st mcp` / `coord mcp` follows the env contract every other verb
+  // uses: ST_ROOT > COORD_ROOT > default state path via coordRootFrom();
+  // ST_IDENTITY > COORD_IDENTITY (with the one-time fallback warning)
+  // and no default — must be set by the host (Claude Code, Codex, Pi)
+  // so the server knows whose inbox to watch.
   const root = coordRootFrom(ctx.env);
-  const identity = ctx.env.COORD_IDENTITY;
+  const identity = envIdentityFrom(ctx.env);
   if (!identity) {
-    throw new Error('COORD_IDENTITY must be set for `coord mcp`');
+    throw new Error('ST_IDENTITY (or COORD_IDENTITY) must be set for `mcp`');
   }
 
   // Lazy-import: the @modelcontextprotocol/sdk + zod dep cost is paid
@@ -53,10 +58,13 @@ export async function cmdMcpCli(
   const { createMcpServer } = await import('../mcp/index.ts');
   const { asIdentity } = await import('../types.ts');
 
+  const serverName = canonicalServerName(invokedAsFrom(ctx.env));
+
   const handle = createMcpServer({
     root,
     identity: asIdentity(identity),
     channel,
+    serverName,
   });
 
   await handle.run();

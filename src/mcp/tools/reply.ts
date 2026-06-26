@@ -23,6 +23,7 @@ import {
   buildToolResult,
   withErrorMapping,
 } from '../error-mapping.ts';
+import { registerDualTool } from './dual-register.ts';
 
 const replyInputShape = {
   thread: z
@@ -100,8 +101,9 @@ function locateThread(
 }
 
 export function registerReplyTool(mcp: McpServer, coord: Coord): void {
-  mcp.registerTool(
-    'coord_msg_reply',
+  registerDualTool(
+    mcp,
+    'msg_reply',
     {
       title: 'Reply to a coord message',
       description:

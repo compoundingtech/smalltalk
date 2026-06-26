@@ -25,7 +25,7 @@ import {
 } from '../commands/status.ts';
 import { createCoord, type Coord } from '../lib.ts';
 import type { Identity } from '../types.ts';
-import { buildServerOptions, SERVER_INFO } from './capabilities.ts';
+import { buildServerInfo, buildServerOptions } from './capabilities.ts';
 import { evaluateDrift } from './tidy-check.ts';
 import { registerArchiveTool } from './tools/archive.ts';
 import { registerLsTool } from './tools/ls.ts';
@@ -71,6 +71,14 @@ export interface McpServerOptions {
    * — see the gate in runWith.
    */
   tidyCheckIntervalMs?: number | undefined;
+  /**
+   * brief-005-phase0: which canonical name the MCP server announces
+   * itself as. `coord` (legacy) or `st` (new short canonical).
+   * Derived from the bash shim's `_ST_INVOKED_AS` env var; defaults
+   * to `coord` for back-compat with tests / direct lib embedders
+   * that don't set it.
+   */
+  serverName?: 'coord' | 'st' | undefined;
 }
 
 export interface McpServerHandle {
@@ -106,7 +114,11 @@ export function createMcpServer(opts: McpServerOptions): McpServerHandle {
     ...(opts.configRoot !== undefined && { configRoot: opts.configRoot }),
   });
 
-  const mcp = new McpServer(SERVER_INFO, buildServerOptions({ channel }));
+  const serverName = opts.serverName ?? 'coord';
+  const mcp = new McpServer(
+    buildServerInfo(serverName),
+    buildServerOptions({ channel })
+  );
 
   // Tool registration. Each register* call wires one tool over the
   // `coord` instance; ordering doesn't matter (the SDK installs the

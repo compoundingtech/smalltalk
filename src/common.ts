@@ -268,9 +268,13 @@ export function resolveIdentity(opts: ResolveIdentityOpts = {}): string {
   if (opts.explicit) {
     id = opts.explicit;
     fromExplicit = true;
+  } else if (env.ST_IDENTITY) {
+    id = env.ST_IDENTITY;
+    fromExplicit = false;
   } else if (env.COORD_IDENTITY) {
     id = env.COORD_IDENTITY;
     fromExplicit = false;
+    warnCoordFallback('ST_IDENTITY', 'COORD_IDENTITY');
   } else {
     throw new IdentityRequiredError();
   }
@@ -293,15 +297,117 @@ export function resolveIdentity(opts: ResolveIdentityOpts = {}): string {
 }
 
 // ─── Paths ───────────────────────────────────────────────────────────────
+//
+// brief-005-phase0 (issue: rename coord → smalltalk/st): the resolver
+// honors BOTH the new `ST_*` names and the legacy `COORD_*` names; ST_
+// wins when both are set. The fallback emits a one-time stderr notice
+// per env-var-name per process so operators see which configs still
+// reference the old name without breakage. The default state path
+// prefers `~/.local/state/smalltalk` when it exists, falls back to
+// `~/.local/state/coord` when only that exists, and creates
+// `~/.local/state/smalltalk` on a brand-new install. Config dir
+// (~/.config/coord) is intentionally NOT included in this phase per
+// the brief — it ships in a later phase.
+
+const warnedCoordFallbacks = new Set<string>();
+
+/** Test-only: drop the one-time-warning latch so each test can observe
+ *  the warning fresh. Not exported from the package barrel. */
+export function _resetCoordFallbackWarnings(): void {
+  warnedCoordFallbacks.clear();
+}
+
+function warnCoordFallback(stName: string, coordName: string): void {
+  if (warnedCoordFallbacks.has(coordName)) return;
+  warnedCoordFallbacks.add(coordName);
+  // Best-effort — never crash a CLI invocation because the warning
+  // pipe is closed (rare; pre-shutdown stderr can be EPIPE under
+  // pipelines).
+  try {
+    process.stderr.write(
+      `[smalltalk] honoring ${coordName} — migrate to ${stName} when convenient\n`
+    );
+  } catch {
+    // ignore: we tried to warn, no point in killing the call over it
+  }
+}
+
+function defaultStateRoot(env: NodeJS.ProcessEnv): string {
+  const home = env.HOME ?? homedir();
+  const stPath = join(home, '.local/state/smalltalk');
+  const coordPath = join(home, '.local/state/coord');
+  // Both exist (Phase 1 migration in flight on this machine) → prefer
+  // the new path silently. cos clarified the warning belongs on env
+  // vars (the actionable signal), not on the state-dir itself.
+  try {
+    if (statSync(stPath).isDirectory()) return stPath;
+  } catch {
+    // not present
+  }
+  try {
+    if (statSync(coordPath).isDirectory()) return coordPath;
+  } catch {
+    // not present
+  }
+  return stPath; // brand-new install: the new path becomes the default
+}
 
 export function coordRootFrom(env: NodeJS.ProcessEnv = process.env): string {
-  const v = env.COORD_ROOT;
-  return v && v.length > 0 ? v : join(homedir(), '.local/state/coord');
+  const stv = env.ST_ROOT;
+  if (stv && stv.length > 0) return stv;
+  const cv = env.COORD_ROOT;
+  if (cv && cv.length > 0) {
+    warnCoordFallback('ST_ROOT', 'COORD_ROOT');
+    return cv;
+  }
+  return defaultStateRoot(env);
 }
 
 export function coordConfigFrom(env: NodeJS.ProcessEnv = process.env): string {
   const v = env.COORD_CONFIG;
   return v && v.length > 0 ? v : join(homedir(), '.config/coord');
+}
+
+/**
+ * Read the identity from `ST_IDENTITY` (preferred) or `COORD_IDENTITY`
+ * (legacy, with one-time fallback notice). Returns `undefined` when
+ * neither is set — callers throw their own context-specific error.
+ * Mirrors the env-fallback half of {@link resolveIdentity} for code
+ * paths (e.g. `coord mcp`) that read the env directly rather than
+ * going through the full resolver.
+ */
+export function envIdentityFrom(
+  env: NodeJS.ProcessEnv = process.env
+): string | undefined {
+  if (env.ST_IDENTITY && env.ST_IDENTITY.length > 0) return env.ST_IDENTITY;
+  if (env.COORD_IDENTITY && env.COORD_IDENTITY.length > 0) {
+    warnCoordFallback('ST_IDENTITY', 'COORD_IDENTITY');
+    return env.COORD_IDENTITY;
+  }
+  return undefined;
+}
+
+/**
+ * The name the CLI was invoked as (`coord` / `st` / `smalltalk`).
+ * Set by the bash shim via `_ST_INVOKED_AS` BEFORE any symlink walk so
+ * we capture the user-typed name, not the resolved real path. Defaults
+ * to `coord` for back-compat with callers (tests, library embeds) that
+ * never set the env var.
+ */
+export type InvokedAs = 'coord' | 'st' | 'smalltalk';
+
+export function invokedAsFrom(
+  env: NodeJS.ProcessEnv = process.env
+): InvokedAs {
+  const raw = env._ST_INVOKED_AS;
+  if (raw === 'st' || raw === 'smalltalk' || raw === 'coord') return raw;
+  return 'coord';
+}
+
+/** Canonicalize an invocation name down to `coord` (legacy alias) or
+ *  `st` (the new short canonical name). `smalltalk` resolves to `st`. */
+export function canonicalServerName(invoked: InvokedAs): 'coord' | 'st' {
+  return invoked === 'coord' ? 'coord' : 'st';
 }
 
 export function coordRoot(): string {

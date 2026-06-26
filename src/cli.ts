@@ -8,7 +8,9 @@
 // (3) dispatch to the right cmdXCli,
 // (4) catch CoordError → stderr + exit 1.
 
-import { realpathSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import { realpathSync, statSync } from 'node:fs';
+import { delimiter, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { coordConfigFrom, coordRootFrom } from './common.ts';
@@ -218,9 +220,24 @@ export async function runCli(
           ctx.stderr(
             `coord: unknown subcommand: ${cmd}. Did you mean \`coord message ${cmd}\`?\n\n`
           );
-        } else {
-          ctx.stderr(`coord: unknown subcommand: ${cmd}\n\n`);
+          ctx.stderr(TOP_LEVEL_USAGE);
+          return 2;
         }
+        // brief-005-phase0 §6: git-style PATH dispatch. Look up
+        // `st-<cmd>` (canonical), then `smalltalk-<cmd>`, then
+        // `coord-<cmd>` (legacy). Built-in commands above always
+        // win — only unknown verbs reach this branch.
+        {
+          const plugin = findPlugin(cmd, ctx.env);
+          if (plugin !== null) {
+            const r = spawnSync(plugin, rest, {
+              stdio: 'inherit',
+              env: ctx.env,
+            });
+            return r.status ?? 1;
+          }
+        }
+        ctx.stderr(`coord: unknown subcommand: ${cmd}\n\n`);
         ctx.stderr(TOP_LEVEL_USAGE);
         return 2;
     }
@@ -229,6 +246,44 @@ export async function runCli(
     ctx.stderr(`coord: ${msg}\n`);
     return 1;
   }
+}
+
+/**
+ * brief-005-phase0 §6: locate a plugin script on PATH.
+ *
+ * Tries each prefix in order — `st-`, `smalltalk-`, `coord-` — and
+ * returns the absolute path of the first match. The match must be a
+ * regular file with at least one of the user/group/other exec bits
+ * set. Per-bucket short-circuit means we won't iterate the full PATH
+ * for prefixes that don't match anywhere.
+ *
+ * Built-in commands are dispatched before this is called, so a verb
+ * like `st-message` (if one existed) can't shadow the built-in
+ * `coord message` group.
+ */
+function findPlugin(
+  cmd: string,
+  env: NodeJS.ProcessEnv
+): string | null {
+  const path = env.PATH ?? '';
+  if (path.length === 0) return null;
+  const dirs = path.split(delimiter).filter((d) => d.length > 0);
+  for (const prefix of ['st-', 'smalltalk-', 'coord-']) {
+    const name = `${prefix}${cmd}`;
+    for (const dir of dirs) {
+      const candidate = join(dir, name);
+      try {
+        const st = statSync(candidate);
+        // 0o111 = any-exec bit (user|group|other). On a real Unix-y
+        // PATH, this is the right gate — the file is a runnable script
+        // or binary. Skip non-regular files (directories, FIFOs).
+        if (st.isFile() && (st.mode & 0o111) !== 0) return candidate;
+      } catch {
+        // not found in this dir
+      }
+    }
+  }
+  return null;
 }
 
 // Entry-point guard. Two paths to canonicalize because Node follows

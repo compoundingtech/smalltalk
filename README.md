@@ -63,8 +63,40 @@ export PATH="$PWD/bin:$PATH"
 ```
 
 Requires Node 22.6+ (for `node --experimental-strip-types`) and `rsync`
-on `$PATH`. `bin/coord` is a small bash shim that execs Node against
-`src/cli.ts`.
+on `$PATH`. `bin/st` (canonical), `bin/smalltalk` (symlink), and
+`bin/coord` (legacy alias) are all small bash shims that exec Node
+against `src/cli.ts`.
+
+## Names
+
+`coord` is being renamed to `smalltalk` (long) / `st` (canonical short).
+This is a phased migration; **the alias period is the entire current
+phase** and dropping `coord_*` only happens once every config-at-rest
+has migrated. For now:
+
+- All three CLI names — `st`, `smalltalk`, `coord` — are installed and
+  behave identically.
+- MCP tools are dual-registered: every `coord_<verb>` (e.g.
+  `coord_msg_ls`) is also reachable as `st_<verb>` (`st_msg_ls`). Same
+  schema, same handler.
+- The MCP server announces itself as `coord` or `st` depending on
+  which binary was invoked.
+- Environment variables follow the same pattern. The CLI honors both
+  `ST_IDENTITY` (preferred) and `COORD_IDENTITY` (legacy), and the
+  same for `ST_ROOT` / `COORD_ROOT`. When only the legacy name is
+  set, a one-time stderr notice ("`[smalltalk] honoring COORD_…`")
+  flags that the config can migrate when convenient.
+- The default state directory is `~/.local/state/smalltalk` for fresh
+  installs; existing installs at `~/.local/state/coord` continue
+  working unchanged. Set `ST_ROOT` / `COORD_ROOT` to override.
+
+### Plugin proxy
+
+`coord <cmd>` (or `st <cmd>`) that doesn't match a built-in subcommand
+falls back to looking for `st-<cmd>` → `smalltalk-<cmd>` →
+`coord-<cmd>` on `$PATH`. The first match is exec'd with the rest of
+argv, git-style. Built-in commands always take priority over plugins
+of the same name, so plugins can extend the CLI without shadowing it.
 
 ## First time on a machine
 

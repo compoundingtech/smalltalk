@@ -1,25 +1,16 @@
 #!/usr/bin/env bash
-# coord — Node entry point.
+# coord — back-compat alias for `st`. brief-005-phase0.
 #
-# Per brief-006 task 12, the bash CLI has been replaced by the Node port.
-# This shim execs `node --experimental-strip-types` against src/cli.ts so
-# the TypeScript runs natively without a build step.
+# Existing `.mcp.json` files point at `bin/coord`; this file stays at
+# the same path so they continue to resolve. It captures the invoked
+# name ("coord") into the env var the node entry checks, then chains
+# to the real `bin/st` shim. The next shim sees `_ST_INVOKED_AS`
+# already set and keeps it.
+#
+# Phase 5 (much later, after every agent's config has migrated to
+# `bin/st`) is when this alias gets dropped.
 
 set -euo pipefail
 
-# Resolve any symlink chain (including the `npm link` indirection) to the
-# real bin/coord, then walk one level up to the repo root. macOS doesn't
-# ship `readlink -f`, so do it the portable way: at each step, treat the
-# readlink target as relative-to-the-symlink-dir unless it's absolute.
-COORD_BIN="${BASH_SOURCE[0]}"
-while [ -L "$COORD_BIN" ]; do
-  COORD_DIR="$(cd "$(dirname "$COORD_BIN")" && pwd)"
-  TARGET="$(readlink "$COORD_BIN")"
-  case "$TARGET" in
-    /*) COORD_BIN="$TARGET" ;;
-    *)  COORD_BIN="$COORD_DIR/$TARGET" ;;
-  esac
-done
-COORD_REPO="$(cd "$(dirname "$COORD_BIN")/.." && pwd)"
-
-exec node --experimental-strip-types "$COORD_REPO/src/cli.ts" "$@"
+export _ST_INVOKED_AS="${_ST_INVOKED_AS:-$(basename "$0")}"
+exec "$(cd "$(dirname "$0")" && pwd)/st" "$@"

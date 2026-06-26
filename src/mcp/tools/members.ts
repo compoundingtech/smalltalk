@@ -14,6 +14,7 @@ import {
   buildToolResult,
   withErrorMapping,
 } from '../error-mapping.ts';
+import { registerDualTool } from './dual-register.ts';
 
 const membersInputShape = {
   status: z
@@ -65,8 +66,9 @@ const membersOutputShape = {
 };
 
 export function registerMembersTool(mcp: McpServer, coord: Coord): void {
-  mcp.registerTool(
-    'coord_members',
+  registerDualTool(
+    mcp,
+    'members',
     {
       title: 'Enumerate coord identities',
       description:

@@ -9,6 +9,7 @@ import {
   buildToolResult,
   withErrorMapping,
 } from '../error-mapping.ts';
+import { registerDualTool } from './dual-register.ts';
 
 const lsInputShape = {
   identity: z
@@ -46,8 +47,9 @@ const lsOutputShape = {
 };
 
 export function registerLsTool(mcp: McpServer, coord: Coord): void {
-  mcp.registerTool(
-    'coord_msg_ls',
+  registerDualTool(
+    mcp,
+    'msg_ls',
     {
       title: 'List inbox or archive',
       description:

@@ -25,11 +25,14 @@
     }
   },
   "bin": {
+    "st": "./bin/st",
+    "smalltalk": "./bin/smalltalk",
     "coord": "./bin/coord"
   },
   "files": [
     "bin/",
     "src/",
+    "CHANGELOG.md",
     "LAYOUT.md",
     "README.md"
   ],

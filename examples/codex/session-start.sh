@@ -50,8 +50,14 @@ fi
 
 # ─── Read inbox ───────────────────────────────────────────────────────
 
-if ! items_json=$(coord message ls --json 2>&1); then
-  emit_system_message "coord message ls --json failed: $items_json"
+# brief-005-phase0: capture stdout and stderr separately so warnings
+# (e.g. "[smalltalk] honoring COORD_IDENTITY") don't corrupt the JSON
+# payload. The stderr stream is preserved for the failure-diagnostic
+# path below.
+err_file=$(mktemp -t coord-hook-err.XXXXXX)
+trap "rm -f '$err_file'" EXIT
+if ! items_json=$(coord message ls --json 2>"$err_file"); then
+  emit_system_message "coord message ls --json failed: $(cat "$err_file")"
   exit 0
 fi
 

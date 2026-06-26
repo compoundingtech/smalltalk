@@ -68,8 +68,15 @@ now_ms=$(jq -n 'now * 1000 | floor')
 # coord message ls --since filters by filename's <unix-ms> prefix. Files that
 # arrived via sync with an older prefix are missed by design — Stop is
 # a notification cue, not a backfill audit.
-if ! items_json=$(coord message ls --json --since "$last_checked" 2>&1); then
-  emit_system_message "coord message ls --json failed: $items_json"
+#
+# brief-005-phase0: capture stdout and stderr separately so the
+# `[smalltalk] honoring COORD_IDENTITY` warning doesn't corrupt the
+# JSON payload while still being available for the failure-diagnostic
+# path below.
+err_file=$(mktemp -t coord-hook-err.XXXXXX)
+trap "rm -f '$err_file'" EXIT
+if ! items_json=$(coord message ls --json --since "$last_checked" 2>"$err_file"); then
+  emit_system_message "coord message ls --json failed: $(cat "$err_file")"
   exit 0
 fi
 
