@@ -13,4 +13,19 @@
 set -euo pipefail
 
 export _ST_INVOKED_AS="${_ST_INVOKED_AS:-$(basename "$0")}"
-exec "$(cd "$(dirname "$0")" && pwd)/st" "$@"
+
+# Walk the symlink chain to find the real bin/coord in the package
+# dir, then exec the sibling `bin/st`. Required for `npm link`, where
+# the global `coord` is a symlink chain into the package's bin/, and
+# `bin/st` is NOT necessarily linked into the same global directory.
+COORD_BIN="${BASH_SOURCE[0]}"
+while [ -L "$COORD_BIN" ]; do
+  COORD_DIR="$(cd "$(dirname "$COORD_BIN")" && pwd)"
+  TARGET="$(readlink "$COORD_BIN")"
+  case "$TARGET" in
+    /*) COORD_BIN="$TARGET" ;;
+    *)  COORD_BIN="$COORD_DIR/$TARGET" ;;
+  esac
+done
+COORD_DIR="$(cd "$(dirname "$COORD_BIN")" && pwd)"
+exec "$COORD_DIR/st" "$@"
