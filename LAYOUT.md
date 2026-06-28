@@ -35,11 +35,10 @@ sync. There are no machine-local marker files inside the folder.
   (e.g. `persona.session-1.child-7`) — see issue #1. No upper bound on
   length beyond what the underlying filesystem accepts.
 - Reserved names (must not be used as an identity): `inbox`, `archive`,
-  `journal`, `status`, `name`, `available`, `busy`, `away`,
-  `dnd`, `offline`, `unknown`, `members`, `overview`.
-- Every identity sub-folder contains at minimum two folders: `inbox/` and
-  `archive/`. One further optional folder, `journal/`, may also be
-  present (see below). No other sub-folders are part of the convention.
+  `status`, `name`, `available`, `busy`, `away`, `dnd`, `offline`,
+  `unknown`, `members`, `overview`.
+- Every identity sub-folder contains exactly two folders: `inbox/` and
+  `archive/`. No other sub-folders are part of the convention.
 - An identity may *optionally* have a single-line `<identity>/name` file
   containing a human-friendly display name. Synced like everything else.
 
@@ -132,16 +131,6 @@ prefix is the canonical send time.
   been processed.
 - **`archive/`** holds messages that have been processed. Move (`mv`) is the
   only operation that puts a file in archive.
-- **`journal/`** *(optional)* is the identity's own terse work log,
-  audience-facing. Each entry is its own markdown file named
-  `<unix-ms>-<slug>.md`, optionally with `topic` / `tags` frontmatter.
-  **Only the identity owner writes here**; other participants read via
-  sync. **Append-only at file granularity** — never edit an entry once
-  written, only add new ones. Distinct from `inbox/archive/` (which are
-  messages from others): a journal entry is a short narrative from this
-  identity to everyone else. Terse by convention — a few sentences, not
-  a stream-of-thought log; if you need more, write it in a brief. The
-  folder is created lazily on first `coord journal new`.
 
 ## Append-only and rename-only
 

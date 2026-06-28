@@ -99,7 +99,6 @@ describe('constants', () => {
     for (const name of [
       'inbox',
       'archive',
-      'journal', // brief-024
       'status',
       'name',
       'offline',
@@ -115,14 +114,6 @@ describe('constants', () => {
     }
     // Names that look reserved but are not.
     expect(RESERVED_NAMES.includes('outbox')).toBe(false);
-  });
-
-  it('validIdentity rejects `journal` (reserved per brief-024)', () => {
-    // Sanity that the reserved-list addition propagates through
-    // identity validation — otherwise someone could create a folder
-    // named `journal/` at $COORD_ROOT and shadow every identity's
-    // `journal/` sub-folder.
-    expect(validIdentity('journal')).toBe(false);
   });
 
   it('validIdentity rejects `away` (reserved per brief-029)', () => {

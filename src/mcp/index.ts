@@ -220,20 +220,15 @@ export function createMcpServer(opts: McpServerOptions): McpServerHandle {
     }
   };
 
-  // brief-030: periodic tidy-check tick. Walks inbox / journal for
-  // drift conditions; emits a synthetic
-  // `notifications/claude/channel` frame (from: coord-system) when
-  // anything new has drifted since the last emit. No emit when status
-  // is busy/dnd/unknown — busy/dnd defer until the agent flips back;
-  // unknown means we don't know what state they're in and shouldn't
-  // pile on. Dedup is per-condition: if the same drift booleans fired
-  // last time, don't re-fire. A condition that cleared and re-emerged
-  // does re-fire (the dedup tracks current state, not historical).
+  // brief-030: periodic tidy-check tick. Walks inbox for drift; emits
+  // a synthetic `notifications/claude/channel` frame (from:
+  // coord-system) when drift turns from false→true since the last
+  // emit. No emit when status is busy/dnd/unknown — busy/dnd defer
+  // until the agent flips back; unknown means we don't know what state
+  // they're in and shouldn't pile on. Dedup tracks current state, not
+  // historical: a drift that clears and re-emerges fires again.
   let tidyCheckTimer: ReturnType<typeof setInterval> | undefined;
-  let lastTidyFired: {
-    inbox: boolean;
-    journal: boolean;
-  } = { inbox: false, journal: false };
+  let lastTidyFired: { inbox: boolean } = { inbox: false };
   const tidyCheck = (): void => {
     if (!opts.identity || opts.identity.length === 0) return;
     let currentStatus: string;
@@ -258,11 +253,9 @@ export function createMcpServer(opts: McpServerOptions): McpServerHandle {
     } catch {
       return; // best-effort
     }
-    // New-condition test: at least one boolean went false→true
-    // compared to last fired. Same-or-less drift doesn't re-emit.
-    const newCondition =
-      (drift.inbox && !lastTidyFired.inbox) ||
-      (drift.journal && !lastTidyFired.journal);
+    // New-condition test: drift went false→true compared to last
+    // fired. Same-or-less drift doesn't re-emit.
+    const newCondition = drift.inbox && !lastTidyFired.inbox;
     if (newCondition && drift.body.length > 0) {
       void mcp.server
         .notification({
@@ -285,10 +278,7 @@ export function createMcpServer(opts: McpServerOptions): McpServerHandle {
     // Update lastTidyFired on every eligible tick (not just emits)
     // so a drift that clears stops looking "new" on its next
     // recurrence — only the recurrence-after-clear fires.
-    lastTidyFired = {
-      inbox: drift.inbox,
-      journal: drift.journal,
-    };
+    lastTidyFired = { inbox: drift.inbox };
   };
   const startTidyCheck = (): void => {
     const ms = opts.tidyCheckIntervalMs ?? TIDY_CHECK_INTERVAL_MS;
