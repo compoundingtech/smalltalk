@@ -19,7 +19,6 @@ import { cmdArchiveCli } from './commands/archive.ts';
 import { cmdCompletionsCli } from './commands/completions.ts';
 import { cmdDingCli } from './commands/ding.ts';
 import { cmdInitCli } from './commands/init.ts';
-import { cmdJournalCli } from './commands/journal.ts';
 import { cmdLsCli } from './commands/ls.ts';
 import { cmdMcpCli } from './commands/mcp.ts';
 import { cmdMembersCli } from './commands/members.ts';
@@ -82,12 +81,6 @@ const TOP_LEVEL_USAGE =
   `  status [<identity>] [--set <state>]\n` +
   `  members [--status STATE] [--json [--enrich]]\n` +
   `  overview [--recent N] [--json]\n\n` +
-  `Journal:\n` +
-  `  journal new "<body>" [--slug ...] [--topic ...] [--tag T,T]\n` +
-  `              [--stdin | --edit]\n` +
-  `  journal ls [<identity>] [--since <unix-ms>]\n` +
-  `  journal cat [<identity>] <filename>\n` +
-  `  journal tail [<identity>] [-n N]\n\n` +
   `Sync:\n` +
   `  sync push <peer>\n` +
   `  sync push --all\n` +
@@ -188,8 +181,6 @@ export async function runCli(
         return cmdOverviewCli(rest, ctx);
       case 'sync':
         return cmdSyncCli(rest, ctx);
-      case 'journal':
-        return await cmdJournalCli(rest, ctx);
       case 'mcp':
         return await cmdMcpCli(rest, ctx);
       case 'init':

@@ -1,9 +1,9 @@
 # coord
 
 A small Node CLI **and** TypeScript library for the **coord** file-folder
-convention. The folder is the API: `<identity>/inbox/`, `<identity>/archive/`,
-plus the optional `<identity>/journal/` log, plain markdown files with YAML
-frontmatter, plain `rsync` between machines.
+convention. The folder is the API: `<identity>/inbox/` and
+`<identity>/archive/`, plain markdown files with YAML frontmatter, plain
+`rsync` between machines.
 
 - **Convention:** [LAYOUT.md](LAYOUT.md) — the binding spec.
 - **Philosophy:** [IDEA.md](IDEA.md).
@@ -16,7 +16,7 @@ frontmatter, plain `rsync` between machines.
 ## Why this shape
 
 **The one rule: across identities, only `inbox/` is writable.** Every
-other folder under an identity — `archive/`, `journal/`, `status` — is
+other folder under an identity — `archive/`, `status` — is
 single-writer, owned by that identity. Peers read but never write. This
 gives you several useful properties for free:
 
@@ -27,10 +27,10 @@ gives you several useful properties for free:
   reads at their own pace.
 
 - **No cross-identity edits.** One identity can't reach into another's
-  `journal/` and edit an entry it doesn't own. If you want a peer to do
-  something, you message their inbox suggesting it. They decide whether
-  to act and update their own state. That's the entire authorization
-  model.
+  `archive/` and re-open a message it doesn't own. If you want a peer
+  to do something, you message their inbox suggesting it. They decide
+  whether to act and update their own state. That's the entire
+  authorization model.
 
 - **Inbox files can carry attachments.** The inbox is just a folder —
   alongside the canonical `<ts>-<rand6>.md` message file, a sender can
@@ -133,8 +133,6 @@ coord message read bob 1714826789012-x9k4mz.md              # parsed view of one
 coord message archive 1714826789012-x9k4mz.md               # mv inbox -> archive
 coord message thread bob 1714826789012-x9k4mz.md            # walk the in-reply-to chain
 coord status --set busy                                     # update my status (available | busy | away | dnd | offline)
-coord journal new "shipped brief-024" --tag layout          # terse work-log entry
-coord journal tail worker-claude -n 5                       # follow a peer's narrative
 coord members --status available                            # who's around?
 coord overview                                              # at-a-glance dashboard
 coord init                                                  # wire .mcp.json into the current repo
@@ -157,9 +155,7 @@ coord completions zsh  > "${fpath[1]}/_coord"
 ```
 
 The scripts complete subcommands, their verbs and flags, and the closed
-value sets (status states, priorities). The fish script also
-disambiguates the reused verbs (`ls`, `new`) across the `message` /
-`journal` groups.
+value sets (status states, priorities).
 
 ## Programmatic API
 
@@ -248,12 +244,10 @@ chokidar startup cost.
 The MCP server ships an `instructions` string covering the **boot
 ritual**: on connect, the agent writes `available` to its status
 file, drains any inbox backlog (ls → read → reply → archive), and
-runs `coord_members` for peer state. As non-trivial progress happens,
-it drops `coord journal new` entries so peers can follow what shipped.
-On shutdown (`SIGTERM`, `SIGINT`, or transport close), the server
-writes `offline` to the status file so peers see the right state
-immediately. The full text lives in `src/mcp/capabilities.ts`
-(`CHANNEL_INSTRUCTIONS`).
+runs `coord_members` for peer state. On shutdown (`SIGTERM`, `SIGINT`,
+or transport close), the server writes `offline` to the status file so
+peers see the right state immediately. The full text lives in
+`src/mcp/capabilities.ts` (`CHANNEL_INSTRUCTIONS`).
 
 ## Harness integrations
 

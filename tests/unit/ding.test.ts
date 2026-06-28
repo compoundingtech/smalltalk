@@ -16,10 +16,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import {
-  STALE_INBOX_MS,
-  STALE_JOURNAL_MS,
-} from '../../src/common.ts';
+import { STALE_INBOX_MS } from '../../src/common.ts';
 import {
   buildPtySendArgs,
   cmdDingCli,
@@ -609,7 +606,7 @@ describe('cmdDingCli — arg parsing', () => {
 //
 // These tests point the fake Coord's `root` at a real /tmp scratch
 // dir so `evaluateDrift` (a real filesystem walk) can read planted
-// inbox/journal files. The watch/read/getStatus fakes are unchanged
+// inbox files. The watch/read/getStatus fakes are unchanged
 // — drift detection doesn't go through those methods.
 
 describe('runDing — tidy-check tick', () => {
@@ -648,18 +645,6 @@ describe('runDing — tidy-check tick', () => {
     }
     return path;
   }
-  function plantJournal(filename: string, ageMs: number): string {
-    const dir = join(identityRoot, 'journal');
-    mkdirSync(dir, { recursive: true });
-    const path = join(dir, filename);
-    writeFileSync(path, '---\ntopic: misc\n---\nentry\n');
-    if (ageMs > 0) {
-      const t = new Date(Date.now() - ageMs);
-      utimesSync(path, t, t);
-    }
-    return path;
-  }
-
   it('stale inbox → tidy line fires on first tick', async () => {
     plantInbox('1714826789010-aaaaaa.md', STALE_INBOX_MS + 60_000);
     fake.setStatus('available');
@@ -784,27 +769,6 @@ describe('runDing — tidy-check tick', () => {
     await r.done;
   });
 
-  it('combination: inbox + stale journal → both appear in the line', async () => {
-    plantInbox('1714826789010-aaaaaa.md', STALE_INBOX_MS + 60_000);
-    plantJournal(
-      '1714826789020-shipped.md',
-      STALE_JOURNAL_MS + 60_000
-    );
-    fake.setStatus('available');
-    const r = startDing({
-      coord: fake.coord,
-      ptySend: sender.send,
-      tidyIntervalMs: 30,
-    });
-    await new Promise((res) => setTimeout(res, 80));
-    expect(sender.calls()).toHaveLength(1);
-    const line = sender.calls()[0]!.sequences[0]!;
-    expect(line).toContain('inbox=1');
-    expect(line).toContain('no journal entry');
-    r.ac.abort();
-    await r.done;
-  });
-
   it('tidyIntervalMs: 0 → no tidy tick at all (push-only mode)', async () => {
     plantInbox('1714826789010-aaaaaa.md', STALE_INBOX_MS + 60_000);
     fake.setStatus('available');
@@ -855,10 +819,10 @@ describe('runDing — tidy-check tick', () => {
   // scratch + fake fixtures are still in scope.)
 
   it('opts.tidyNow injects a deterministic clock for drift age', async () => {
-    // Plant a journal entry with a current mtime — drift would NOT
-    // fire on real Date.now, but its age crosses STALE_JOURNAL_MS
-    // once the clock is advanced 2h into the future.
-    plantJournal('1714826789010-shipped.md', 0);
+    // Plant an inbox file with a current mtime — drift would NOT fire
+    // on real Date.now, but its age crosses STALE_INBOX_MS once the
+    // clock is advanced 2h into the future.
+    plantInbox('1714826789010-aaaaaa.md', 0);
     fake.setStatus('available');
     const fixed = Date.now() + 2 * 60 * 60_000;
     const r = startDing({
@@ -869,7 +833,7 @@ describe('runDing — tidy-check tick', () => {
     });
     await new Promise((res) => setTimeout(res, 80));
     expect(sender.calls()).toHaveLength(1);
-    expect(sender.calls()[0]!.sequences[0]).toContain('no journal');
+    expect(sender.calls()[0]!.sequences[0]).toContain('inbox=1');
     r.ac.abort();
     await r.done;
   });

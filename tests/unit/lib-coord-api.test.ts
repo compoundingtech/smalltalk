@@ -176,10 +176,10 @@ describe('coord.createIdentity', () => {
     );
   });
 
-  it('rejects a reserved name (e.g. `journal`)', async () => {
+  it('rejects a reserved name (e.g. `members`)', async () => {
     // RESERVED_NAMES includes folder/sidecar names + state words +
     // verb names — validIdentity guards them. Sample one.
-    await expect(coord.createIdentity('journal')).rejects.toThrow(
+    await expect(coord.createIdentity('members')).rejects.toThrow(
       InvalidIdentityError
     );
   });
@@ -191,10 +191,9 @@ describe('coord.createIdentity', () => {
     );
   });
 
-  it('does NOT set status or create the journal folder', async () => {
+  it('does NOT set status', async () => {
     await coord.createIdentity('frank');
     expect(existsSync(join(coordRoot, 'frank', 'status'))).toBe(false);
-    expect(existsSync(join(coordRoot, 'frank', 'journal'))).toBe(false);
   });
 });
 
@@ -208,7 +207,6 @@ describe('public surface (brief-028)', () => {
     for (const name of [
       'inbox',
       'archive',
-      'journal',
       'status',
       'unknown',
       'available',

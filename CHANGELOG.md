@@ -6,6 +6,30 @@ minor releases until 1.0.
 
 ## Unreleased
 
+### Removed (brief-009 item 2 — `journal/` surface gone)
+
+**Breaking.** The `journal/` folder and every CLI/MCP surface that
+referenced it is removed. Same motivation as the tasks removal: paring
+the surface to what the friend onboarding actually needs.
+
+- **CLI:** `coord journal new/ls/cat/tail` deleted (\`src/commands/journal.ts\`
+  removed).
+- **MCP onboarding text:** the channel-mode instructions no longer
+  reference journal entries; the boot ritual is now status + inbox-drain
+  + members only.
+- **MCP tidy-check:** the journal-lag drift condition is gone.
+  Detection is **inbox staleness only**; \`DriftResult\` and
+  \`DriftDetail\` shrank accordingly.
+- **\`coord ding\`:** the tidy-line is now \`coord tidy-check: inbox=N
+  (oldest Xm).\` (no journal segment).
+- **RESERVED_NAMES:** \`journal\` is dropped.
+- **Removed constant:** \`STALE_JOURNAL_MS\`.
+- **Removed helper:** \`journalDir()\`.
+- **Downstream impact:** consuming agents that reference \`coord
+  journal\` in their boot rituals need to drop those steps. The cos
+  agent owns sweeping the consuming agent CLAUDE.md files alongside
+  the tasks-removal sweep.
+
 ### Removed (brief-009 item 1 — `tasks/` surface gone)
 
 **Breaking.** The `tasks/` folder and every CLI/SDK/MCP surface that
@@ -16,8 +40,9 @@ onboarding story.
 - **CLI:** `coord task ...` and `coord tasks` subcommands deleted.
 - **MCP onboarding text:** the channel-mode instructions no longer
   reference task-file ritual.
-- **MCP tidy-check:** the `doingTask` drift condition is gone;
-  detection now covers inbox staleness + journal lag only.
+- **MCP tidy-check:** the `doingTask` drift condition is gone; the
+  detector now covers inbox + journal-lag (journal-lag is removed in
+  the next entry, item 2).
 - **SDK:** no task types/methods were exposed (none existed); the
   `MemberTaskCounts` type and the `tasks` field on
   `MemberSummaryEnriched` / `coord_members` (enriched) are removed.

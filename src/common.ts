@@ -99,17 +99,12 @@ export const TIDY_CHECK_INTERVAL_MS = 20 * 60 * 1000;
  *  Tunable per myobie's loose initial framing. */
 export const STALE_INBOX_MS = 10 * 60 * 1000;
 
-/** Drift threshold: when the latest journal entry is older than this,
- *  the agent has shipped without journaling — drift. */
-export const STALE_JOURNAL_MS = 60 * 60 * 1000;
-
 export const RESERVED_NAMES: readonly string[] = [
-  // Per-identity sub-folders / sidecars (LAYOUT-004 + brief-015 +
-  // brief-024). Each is a folder or file inside an identity dir; an
-  // identity name that collides with one of these would shadow it.
+  // Per-identity sub-folders / sidecars. Each is a folder or file inside
+  // an identity dir; an identity name that collides with one of these
+  // would shadow it.
   'inbox',
   'archive',
-  'journal',
   'status',
   'name',
   // Status states (would alias-collide with `coord status <token>`).
@@ -421,10 +416,6 @@ export function inboxDir(id: string, root: string = coordRoot()): string {
 
 export function archiveDir(id: string, root: string = coordRoot()): string {
   return join(root, id, 'archive');
-}
-
-export function journalDir(id: string, root: string = coordRoot()): string {
-  return join(root, id, 'journal');
 }
 
 export function statusPath(id: string, root: string = coordRoot()): string {

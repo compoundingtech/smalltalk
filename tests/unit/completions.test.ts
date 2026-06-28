@@ -103,7 +103,6 @@ describe('coord completions fish — surface', () => {
       'status',
       'members',
       'overview',
-      'journal',
       'sync',
       'mcp',
       'init',

@@ -34,7 +34,9 @@ export const SERVER_INFO: Implementation = {
   //         hence the minor bump.
   // 0.4.0 — brief-009 phase 1: tasks/ surface removed across CLI,
   //         SDK, MCP onboarding, and tidy-check.
-  version: '0.4.0',
+  // 0.5.0 — brief-009 phase 2: journal/ surface removed (same
+  //         treatment). Tidy-check is now inbox-staleness only.
+  version: '0.5.0',
 };
 
 /**
@@ -56,28 +58,26 @@ export const SERVER_OPTIONS: ServerOptions = {
 /**
  * Instructions sent to the host when channel mode is on. Defines the
  * full boot ritual every connected agent runs so myobie's visibility
- * surface — status files, inbox flow, journal — stays honest.
+ * surface — status files + inbox flow — stays honest.
  *
  * Load-bearing substrings (asserted by tests/unit/channel-instructions
  * regression guard): `available`, `coord status`, `coord_msg_ls`,
  * `coord_msg_read`, `coord_msg_archive`, `coord_msg_reply`,
- * `coord_members`, `coord journal new`, `<channel source="coord"`.
+ * `coord_members`, `<channel source="coord"`.
  */
 export const CHANNEL_INSTRUCTIONS = [
-  'You are connected to coord. This is myobie\'s visibility layer: they look at status files, inbox/archive, and journal/ to understand what every agent is doing. Maintain those records.',
+  'You are connected to coord. This is myobie\'s visibility layer: they look at status files and inbox/archive to understand what every agent is doing. Maintain those records.',
   '',
   'On first opportunity in a fresh context (cold start or /clear):',
   '  1. Write `available` to your status file. Shell out: `coord status <your-identity> --set available`. Use $COORD_IDENTITY.',
   '  2. Drain your inbox backlog. Call `coord_msg_ls` to enumerate filenames, then for each one `coord_msg_read` it, `coord_msg_reply` if appropriate, and `coord_msg_archive` to clear. Don\'t leave inbox items un-addressed.',
   '  3. Check `coord_members` (with `enrich: true`) to see who\'s around and whether any peers are waiting on you.',
   '',
-  'As you make non-trivial progress, drop a terse `coord journal new "<body>"` entry. Audience is everyone else, not your own monologue — a few sentences saying what just landed and why. Good shape: "Shipped brief-NNN. Y was the load-bearing fix; Z stayed parked." NOT: a stream-of-thought log or step-by-step narrative — that belongs in a brief. Peers follow via `coord journal tail <your-identity>` without interrupting you.',
-  '',
   'As channel notifications arrive: new peer messages appear in your context as `<channel source="coord" from="<sender>">…</channel>` blocks. For each one: `coord_msg_read` the cited filename, `coord_msg_reply` with `thread: <messageFilename>` and `body: <your reply>` if a response is warranted, then `coord_msg_archive` to clear. Don\'t let inbox accumulate.',
   '',
   'Coord threads stay on coord. A thread that originated from a channel notification or an inbox message is conversed *only* via `coord_msg_send` / `coord_msg_reply` — questions, clarifications, blockers, "I think I\'m done" signals, follow-up thoughts, all of it. By default, your pty REPL is unattended — there is no human reading what you print to your own screen. Your coord correspondent is your interlocutor for the thread; they will relay anything that matters to the user. If you would otherwise pause to ask "should I do X?" at your REPL, send it via `coord_msg_reply` instead. The only time it\'s right to address the REPL is when a human directly typed there.',
   '',
-  'Tools you have via MCP: `coord_msg_send`, `coord_msg_reply`, `coord_msg_ls`, `coord_msg_read`, `coord_msg_archive`, `coord_msg_thread`, `coord_members`. For status and journal, shell out to `coord status` / `coord journal` — no MCP tools for those yet.',
+  'Tools you have via MCP: `coord_msg_send`, `coord_msg_reply`, `coord_msg_ls`, `coord_msg_read`, `coord_msg_archive`, `coord_msg_thread`, `coord_members`. For status, shell out to `coord status` — no MCP tool for it yet.',
 ].join('\n');
 
 /**

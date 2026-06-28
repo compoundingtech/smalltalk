@@ -149,30 +149,6 @@ const COMMANDS: readonly CommandSpec[] = [
     flags: [{ name: 'recent', desc: 'Number of recent items' }, JSON_FLAG],
   },
   {
-    name: 'journal',
-    desc: 'Append/read journal entries',
-    verbs: [
-      {
-        name: 'new',
-        desc: 'Append a journal entry',
-        flags: [
-          { name: 'slug', desc: 'Entry slug' },
-          { name: 'topic', desc: 'Entry topic' },
-          { name: 'tag', desc: 'Comma-separated tags' },
-          { name: 'stdin', desc: 'Read body from stdin' },
-          { name: 'edit', desc: 'Open $EDITOR for the body' },
-        ],
-      },
-      {
-        name: 'ls',
-        desc: 'List journal entries',
-        flags: [{ name: 'since', desc: 'Only since UNIX_MS' }],
-      },
-      { name: 'cat', desc: 'Print a journal entry' },
-      { name: 'tail', desc: 'Tail recent journal entries' },
-    ],
-  },
-  {
     name: 'sync',
     desc: 'Push/pull against peers',
     verbs: [
