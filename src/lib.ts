@@ -234,6 +234,10 @@ export interface Coord {
       url: string;
       title?: string;
       tags?: string[];
+      /** Optional free-form relation: `owns` / `relates-to` /
+       *  `depends-on` are canonical (non-enforced); agents may invent
+       *  their own. Never inferred — absent by default. */
+      relation?: string;
       body?: string;
     }): Promise<Filename>;
     list(identity?: Identity): Promise<ResourceWithLocation[]>;
@@ -484,6 +488,7 @@ export function createCoord(options: CoordOptions): Coord {
           url: input.url,
           ...(input.title !== undefined && { title: input.title }),
           ...(input.tags !== undefined && { tags: input.tags }),
+          ...(input.relation !== undefined && { relation: input.relation }),
           ...(input.body !== undefined && { body: input.body }),
           identity,
           env: lib_env,
@@ -587,6 +592,7 @@ function recordToResource(rec: ResourceRecord): Resource {
   const r: Resource = { url: rec.url, body: rec.body };
   if (rec.title !== null) r.title = rec.title;
   if (rec.tags.length > 0) r.tags = rec.tags;
+  if (rec.relation !== null) r.relation = rec.relation;
   return r;
 }
 

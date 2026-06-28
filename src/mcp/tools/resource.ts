@@ -30,6 +30,12 @@ const addInputShape = {
     .array(z.string())
     .optional()
     .describe('Optional list of tag strings.'),
+  relation: z
+    .string()
+    .optional()
+    .describe(
+      'Optional free-form relation between the agent and the URL. Canonical (non-enforced) values: `owns` / `relates-to` / `depends-on`. Never inferred — absent by default. The bare URL stays first-class.'
+    ),
   body: z
     .string()
     .optional()
@@ -58,6 +64,7 @@ const lsOutputShape = {
       url: z.string(),
       title: z.string().nullable(),
       tags: z.array(z.string()),
+      relation: z.string().nullable(),
     })
   ),
 };
@@ -78,6 +85,7 @@ const readOutputShape = {
   url: z.string(),
   title: z.string().nullable(),
   tags: z.array(z.string()),
+  relation: z.string().nullable(),
   body: z.string(),
 };
 
@@ -114,6 +122,7 @@ export function registerResourceTools(mcp: McpServer, coord: Coord): void {
           url: args.url,
           ...(args.title !== undefined && { title: args.title }),
           ...(args.tags !== undefined && { tags: args.tags }),
+          ...(args.relation !== undefined && { relation: args.relation }),
           ...(args.body !== undefined && { body: args.body }),
         });
         return buildToolResult({
@@ -145,6 +154,7 @@ export function registerResourceTools(mcp: McpServer, coord: Coord): void {
           url: it.resource.url,
           title: it.resource.title ?? null,
           tags: it.resource.tags ?? [],
+          relation: it.resource.relation ?? null,
         }));
         const count = resources.length;
         const summary =
@@ -182,6 +192,7 @@ export function registerResourceTools(mcp: McpServer, coord: Coord): void {
             url: r.url,
             title: r.title ?? null,
             tags: r.tags ?? [],
+            relation: r.relation ?? null,
             body: r.body,
           },
         });

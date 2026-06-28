@@ -137,13 +137,21 @@ prefix is the canonical send time.
   chosen to surface to peers — links to PRs they own, pty sessions
   they supervise, repos, docs, anything URL-shaped. Each file is
   `<unix-ms>-<rand6>.md` (same grammar as messages); frontmatter
-  carries `url:` (required) plus optional `title:` / `tags:`; body is
-  an optional markdown description. **Only the identity owner writes
-  here**; peers read via sync but never write. The folder is created
-  lazily on first `coord resource add`. URLs accept any scheme — the
-  convention is `https://` for the web, `pty://<session-name>` for a
-  pty session, and otherwise whatever scheme the participants agree
-  on.
+  carries `url:` (required) plus optional `title:` / `tags:` /
+  `relation:`; body is an optional markdown description. **Only the
+  identity owner writes here**; peers read via sync but never write.
+  The folder is created lazily on first `coord resource add`. URLs
+  accept any scheme — the convention is `https://` for the web,
+  `pty://<session-name>` for a pty session, and otherwise whatever
+  scheme the participants agree on.
+
+  The optional **`relation:`** field describes the agent's
+  relationship to the URL. Free-form string; **never inferred**
+  (absent by default). The canonical, non-enforced values are
+  `owns`, `relates-to`, and `depends-on`; agents may invent their own
+  (`considers-blocking`, `mentored-by`, whatever fits). A resource
+  with no `relation:` is fully first-class — the bare URL is the
+  primary thing the field annotates.
 
 ## Append-only and rename-only
 

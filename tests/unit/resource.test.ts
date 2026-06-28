@@ -142,6 +142,62 @@ describe('cmdResourceAdd', () => {
     const rec = items.find((it) => it.filename === r.filename)!;
     expect(rec.tags).toEqual(['a', 'b', 'c']);
   });
+
+  it('absent `relation` → null (never inferred from url/tags/title)', () => {
+    setupIdentity('alice');
+    const added = cmdResourceAdd({
+      url: 'https://example.com/owned-pr',
+      title: 'my own PR',
+      tags: ['owns'],
+      env: envFor('alice'),
+      coordRoot,
+    });
+    const items = listResourceRecords('alice', coordRoot);
+    const rec = items.find((it) => it.filename === added.filename)!;
+    // Even though the title literally says "my own" and there's an
+    // `owns` tag, relation stays null — the field is never inferred.
+    expect(rec.relation).toBeNull();
+  });
+
+  it('persists `relation` when set (free-form string; canonical: owns/relates-to/depends-on)', () => {
+    setupIdentity('alice');
+    const added = cmdResourceAdd({
+      url: 'https://example.com/my-pr',
+      relation: 'owns',
+      env: envFor('alice'),
+      coordRoot,
+    });
+    const text = readFileSync(added.path, 'utf8');
+    expect(text).toContain('relation: owns');
+    const items = listResourceRecords('alice', coordRoot);
+    const rec = items.find((it) => it.filename === added.filename)!;
+    expect(rec.relation).toBe('owns');
+  });
+
+  it('accepts non-canonical relation strings (free-form, not enum-validated)', () => {
+    setupIdentity('alice');
+    const added = cmdResourceAdd({
+      url: 'https://example.com',
+      relation: 'considers-blocking',
+      env: envFor('alice'),
+      coordRoot,
+    });
+    const items = listResourceRecords('alice', coordRoot);
+    expect(items[0]?.relation).toBe('considers-blocking');
+  });
+
+  it('empty-string relation behaves like absent (treated as null on read)', () => {
+    setupIdentity('alice');
+    const added = cmdResourceAdd({
+      url: 'https://example.com',
+      relation: '',
+      env: envFor('alice'),
+      coordRoot,
+    });
+    const items = listResourceRecords('alice', coordRoot);
+    const rec = items.find((it) => it.filename === added.filename)!;
+    expect(rec.relation).toBeNull();
+  });
 });
 
 // ─── ls ────────────────────────────────────────────────────────────────
@@ -281,6 +337,23 @@ describe('cmdResourceRead', () => {
     });
     expect(r.record.title).toBeNull();
     expect(r.record.tags).toEqual([]);
+    expect(r.record.relation).toBeNull();
+  });
+
+  it('round-trips relation in the read result', () => {
+    setupIdentity('alice');
+    const added = cmdResourceAdd({
+      url: 'https://example.com',
+      relation: 'depends-on',
+      env: envFor('alice'),
+      coordRoot,
+    });
+    const r = cmdResourceRead({
+      filename: added.filename,
+      env: envFor('alice'),
+      coordRoot,
+    });
+    expect(r.record.relation).toBe('depends-on');
   });
 });
 

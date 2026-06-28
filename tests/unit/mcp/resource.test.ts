@@ -117,6 +117,33 @@ describe('coord_resource_add', () => {
     });
     expect(r.isError).toBeUndefined();
   });
+
+  it('persists the optional relation field when set', async () => {
+    setupIdentity('alice');
+    await boot();
+    const added = (await call('coord_resource_add', {
+      url: 'https://example.com',
+      relation: 'owns',
+    })) as CallResult;
+    const filename = (added.structuredContent as { filename: string })
+      .filename;
+    const r = (await call('coord_resource_read', { filename })) as CallResult;
+    const sc = r.structuredContent as { relation: string | null };
+    expect(sc.relation).toBe('owns');
+  });
+
+  it('omits relation by default → null in read output', async () => {
+    setupIdentity('alice');
+    await boot();
+    const added = (await call('coord_resource_add', {
+      url: 'https://example.com',
+    })) as CallResult;
+    const filename = (added.structuredContent as { filename: string })
+      .filename;
+    const r = (await call('coord_resource_read', { filename })) as CallResult;
+    const sc = r.structuredContent as { relation: string | null };
+    expect(sc.relation).toBeNull();
+  });
 });
 
 // ─── Ls ────────────────────────────────────────────────────────────────

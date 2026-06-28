@@ -7,7 +7,7 @@
 // single-writer convention from brief-015 (now removed).
 //
 // Subcommands (each pairs a typed core function with a CLI wrapper):
-//   coord resource add <url> [--title T] [--tag T,T] [--body-stdin]
+//   coord resource add <url> [--title T] [--tag T,T] [--relation REL] [--body-stdin]
 //   coord resource ls [<identity>]
 //   coord resource read [<identity>] <filename>
 //   coord resource rm <filename>
@@ -44,6 +44,10 @@ export interface ResourceRecord {
   url: string;
   title: string | null;
   tags: string[];
+  /** Optional, free-form. Canonical (non-enforced) values:
+   *  `owns` / `relates-to` / `depends-on`. Never inferred. `null` when
+   *  the frontmatter key is absent — the bare URL stays first-class. */
+  relation: string | null;
   body: string;
 }
 
@@ -85,7 +89,12 @@ function readResourceFile(path: string, filename: string): ResourceRecord {
       )
       .filter((t) => t.length > 0);
   }
-  return { filename, url, title, tags, body };
+  // `relation` is free-form. Absent → null. Empty string → null.
+  const relation =
+    typeof fm.relation === 'string' && fm.relation.length > 0
+      ? fm.relation
+      : null;
+  return { filename, url, title, tags, relation, body };
 }
 
 function normalizeTags(input: string | string[] | undefined): string[] {
@@ -108,7 +117,13 @@ export interface ResourceAddInput {
   url: string;
   title?: string | undefined;
   tags?: string | string[] | undefined;
-  /** Optional body (description). Frontmatter is built from url/title/tags. */
+  /** Optional free-form relation between the agent and the URL. Canonical
+   *  values: `owns` / `relates-to` / `depends-on`. Never inferred —
+   *  absent means "no claim about the relationship; the bare URL
+   *  stands". */
+  relation?: string | undefined;
+  /** Optional body (description). Frontmatter is built from
+   *  url/title/tags/relation. */
   body?: string | undefined;
   /** Override the owning identity. Defaults to env COORD_IDENTITY. */
   identity?: string | undefined;
@@ -141,6 +156,9 @@ export function cmdResourceAdd(input: ResourceAddInput): ResourceAddResult {
   }
   const tags = normalizeTags(input.tags);
   if (tags.length > 0) fm.tags = tags;
+  if (input.relation !== undefined && input.relation.length > 0) {
+    fm.relation = input.relation;
+  }
 
   const body = input.body !== undefined ? input.body : '';
   const content = emitFrontmatter(fm, body);
@@ -286,14 +304,18 @@ export function cmdResourceRemove(
 
 const RESOURCE_HELP =
   'usage: coord resource <subcommand> [args...]\n\n' +
-  '  add <url> [--title T] [--tag T,T] [--body-stdin]\n' +
+  '  add <url> [--title T] [--tag T,T] [--relation REL] [--body-stdin]\n' +
   '  ls [<identity>]\n' +
   '  read [<identity>] <filename>\n' +
   '  rm <filename>\n\n' +
   '  Resources live at $COORD_ROOT/<identity>/resources/.\n' +
   '  Each file is <unix-ms>-<rand6>.md with `url:` in frontmatter\n' +
   '  and an optional description in the body. Single-writer: only\n' +
-  '  the identity owner writes; peers read via sync.\n';
+  '  the identity owner writes; peers read via sync.\n\n' +
+  '  --relation REL  Optional, free-form. Canonical (non-enforced)\n' +
+  '                  values: `owns`, `relates-to`, `depends-on`.\n' +
+  '                  Never inferred; absent by default. The bare\n' +
+  '                  URL is first-class with or without it.\n';
 
 export async function cmdResourceCli(
   args: readonly string[],
@@ -328,6 +350,7 @@ async function cmdResourceAddCli(
   let url: string | undefined;
   let title: string | undefined;
   const tags: string[] = [];
+  let relation: string | undefined;
   let bodyStdin = false;
   for (let i = 0; i < args.length; i++) {
     const a = args[i]!;
@@ -337,6 +360,9 @@ async function cmdResourceAddCli(
         break;
       case '--tag':
         tags.push(args[++i] ?? '');
+        break;
+      case '--relation':
+        relation = args[++i];
         break;
       case '--body-stdin':
         bodyStdin = true;
@@ -363,6 +389,7 @@ async function cmdResourceAddCli(
     url,
     ...(title !== undefined && { title }),
     ...(tags.length > 0 && { tags }),
+    ...(relation !== undefined && { relation }),
     ...(body !== undefined && { body }),
     env: ctx.env,
     coordRoot: ctx.coordRoot,
@@ -445,6 +472,7 @@ function cmdResourceReadCli(
         url: r.record.url,
         title: r.record.title,
         tags: r.record.tags,
+        relation: r.record.relation,
         body: r.record.body,
       })}\n`
     );
@@ -454,6 +482,9 @@ function cmdResourceReadCli(
   if (r.record.title !== null) ctx.stdout(`title: ${r.record.title}\n`);
   if (r.record.tags.length > 0) {
     ctx.stdout(`tags: ${r.record.tags.join(', ')}\n`);
+  }
+  if (r.record.relation !== null) {
+    ctx.stdout(`relation: ${r.record.relation}\n`);
   }
   if (r.record.body.length > 0) {
     ctx.stdout('\n');
