@@ -81,16 +81,24 @@ has migrated. For now:
 
 - All three CLI names — `st`, `smalltalk`, `coord` — are installed and
   behave identically.
+- The primary noun is **agent** (brief-009 item 3, replacing the older
+  *identity*). The deprecated alias also works everywhere — the
+  `members` CLI verb still dispatches to `agents`; `coord_members` MCP
+  tool still hits the same handler as `coord_agents`; the SDK keeps
+  `Identity` / `asIdentity` / `IdentityRequiredError` as `@deprecated`
+  type aliases of `Agent` / `asAgent` / `AgentRequiredError`.
 - MCP tools are dual-registered: every `coord_<verb>` (e.g.
   `coord_msg_ls`) is also reachable as `st_<verb>` (`st_msg_ls`). Same
   schema, same handler.
 - The MCP server announces itself as `coord` or `st` depending on
   which binary was invoked.
-- Environment variables follow the same pattern. The CLI honors both
-  `ST_IDENTITY` (preferred) and `COORD_IDENTITY` (legacy), and the
-  same for `ST_ROOT` / `COORD_ROOT`. When only the legacy name is
-  set, a one-time stderr notice ("`[smalltalk] honoring COORD_…`")
-  flags that the config can migrate when convenient.
+- Environment variables follow a three-level fallback chain. The CLI
+  honors `ST_AGENT` (preferred) → `ST_IDENTITY` (deprecated) →
+  `COORD_IDENTITY` (legacy). Same shape for `ST_ROOT` / `COORD_ROOT`
+  (two-level). Each legacy hit emits a one-time stderr notice
+  (`[smalltalk] honoring … — migrate to ST_AGENT when convenient`) so
+  operators can sweep per-machine config at their own pace. A future
+  release drops the legacy honors.
 - The default state directory is `~/.local/state/smalltalk` for fresh
   installs; existing installs at `~/.local/state/coord` continue
   working unchanged. Set `ST_ROOT` / `COORD_ROOT` to override.
@@ -106,12 +114,13 @@ of the same name, so plugins can extend the CLI without shadowing it.
 ## First time on a machine
 
 ```sh
-mkdir -p $HOME/.local/state/coord/alice/{inbox,archive}
-export COORD_IDENTITY=alice
+mkdir -p $HOME/.local/state/smalltalk/alice/{inbox,archive}
+export ST_AGENT=alice
 ```
 
-`COORD_IDENTITY` (or an explicit `--from <id>` per command) tells coord
-which identity is acting; commands die loudly when neither is set.
+`ST_AGENT` (or an explicit `--from <agent>` per command) tells coord
+which agent is acting; commands die loudly when none of `ST_AGENT` /
+`ST_IDENTITY` / `COORD_IDENTITY` are set.
 
 To wire up an MCP host (Claude Code, etc.) inside a repo, run `coord init`
 in that repo's root. It writes (or merges into) a `.mcp.json` with the
@@ -138,7 +147,7 @@ coord message read bob 1714826789012-x9k4mz.md              # parsed view of one
 coord message archive 1714826789012-x9k4mz.md               # mv inbox -> archive
 coord message thread bob 1714826789012-x9k4mz.md            # walk the in-reply-to chain
 coord status --set busy                                     # update my status (available | busy | away | dnd | offline)
-coord members --status available                            # who's around?
+coord agents --status available                             # who's around? (alias: members)
 coord overview                                              # at-a-glance dashboard
 coord resource add https://github.com/myobie/smalltalk/pull/19  # publish a URL alice cares about
 coord resource ls bob                                       # what URLs has bob published?
@@ -170,14 +179,14 @@ Embed coord into a Node TUI, an Electron main process, or any host that
 wants to drive coord without shelling out to `bin/coord`:
 
 ```ts
-import { createCoord, asIdentity } from '@myobie/coord';
+import { createCoord, asAgent } from '@myobie/coord';
 
 const coord = createCoord({
-  root: '/Users/me/.local/state/coord',
-  identity: asIdentity('me'),
+  root: '/Users/me/.local/state/smalltalk',
+  identity: asAgent('me'),
 });
 
-await coord.send(asIdentity('teammate'), 'hello');
+await coord.send(asAgent('teammate'), 'hello');
 
 const ac = new AbortController();
 for await (const ev of coord.watch(undefined, { signal: ac.signal })) {
@@ -185,7 +194,8 @@ for await (const ev of coord.watch(undefined, { signal: ac.signal })) {
 }
 ```
 
-Branded `Identity` / `Filename`, async-iterable `watch` with
+(`asIdentity` is a `@deprecated` alias of `asAgent` and continues to
+work.) Branded `Agent` / `Filename`, async-iterable `watch` with
 `AbortSignal`, typed `CoordError` subclasses (each with a stable
 `code`), zero stdio writes. Full surface: [src/index.ts](src/index.ts).
 Runnable example: [examples/tui-watch.ts](examples/tui-watch.ts) (`npm
@@ -211,7 +221,7 @@ portably. For hosts that need a hand-written config, the shape is:
     "coord": {
       "command": "coord",
       "args": ["mcp"],
-      "env": { "COORD_ROOT": "/Users/me/.local/state/coord", "COORD_IDENTITY": "me" }
+      "env": { "ST_ROOT": "/Users/me/.local/state/smalltalk", "ST_AGENT": "me" }
     }
   }
 }
@@ -239,7 +249,7 @@ hosts. The hand-written shape:
     "coord": {
       "command": "coord",
       "args": ["mcp", "--channel"],
-      "env": { "COORD_ROOT": "/Users/me/.local/state/coord", "COORD_IDENTITY": "me" }
+      "env": { "ST_ROOT": "/Users/me/.local/state/smalltalk", "ST_AGENT": "me" }
     }
   }
 }

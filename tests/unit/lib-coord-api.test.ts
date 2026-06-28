@@ -22,7 +22,7 @@ import { asIdentity, type Identity } from '../../src/types.ts';
 import type {
   MemberSummary,
   MemberSummaryEnriched,
-} from '../../src/commands/members.ts';
+} from '../../src/commands/agents.ts';
 import type { Overview } from '../../src/commands/overview.ts';
 
 let scratch: string;

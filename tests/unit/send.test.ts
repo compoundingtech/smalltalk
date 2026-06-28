@@ -90,28 +90,28 @@ describe('cmdSend — recipient validation', () => {
   it('rejects an invalid recipient name (uppercase)', () => {
     setupIdentity('alice');
     expect(() => cmdSend(baseInput({ to: 'BOB' }))).toThrowError(
-      /invalid identity/
+      /invalid (agent name|identity)/
     );
   });
 
   it('rejects a reserved recipient name (inbox)', () => {
     setupIdentity('alice');
     expect(() => cmdSend(baseInput({ to: 'inbox' }))).toThrowError(
-      /invalid identity/
+      /invalid (agent name|identity)/
     );
   });
 
   it('rejects a reserved recipient name (status)', () => {
     setupIdentity('alice');
     expect(() => cmdSend(baseInput({ to: 'status' }))).toThrowError(
-      /invalid identity/
+      /invalid (agent name|identity)/
     );
   });
 
   it('rejects leading hyphen', () => {
     setupIdentity('alice');
     expect(() => cmdSend(baseInput({ to: '-alice' }))).toThrowError(
-      /invalid identity/
+      /invalid (agent name|identity)/
     );
   });
 });
@@ -152,13 +152,13 @@ describe('cmdSend — --from resolution', () => {
     setupIdentity('alice');
     expect(() =>
       cmdSend(baseInput({ from: 'ghost' }))
-    ).toThrowError(/identity folder missing for ghost/);
+    ).toThrowError(/(agent|identity) folder missing for ghost/);
   });
 
   it('errors when --from is an invalid identity name', () => {
     expect(() =>
       cmdSend(baseInput({ from: 'INVALID' }))
-    ).toThrowError(/invalid identity/);
+    ).toThrowError(/invalid (agent name|identity)/);
   });
 });
 

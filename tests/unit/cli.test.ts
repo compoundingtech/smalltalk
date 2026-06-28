@@ -203,7 +203,7 @@ describe('runCli — error formatting', () => {
     const cap = makeContext();
     const code = await runCli(['message', 'ls'], cap.ctx);
     expect(code).toBe(1);
-    expect(cap.stderr).toMatch(/^coord: identity required/);
+    expect(cap.stderr).toMatch(/^coord: (agent|identity) required/);
   });
 
   it('unknown flag → exit 1 with "unknown flag" message', async () => {

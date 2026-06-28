@@ -387,7 +387,7 @@ describe('cmdThread — errors', () => {
 
   it('missing identity folder errors with mkdir hint', () => {
     expect(() => cmdThread(input({ recipient: 'ghost' }))).toThrowError(
-      /identity folder missing/
+      /(agent|identity) folder missing/
     );
   });
 });

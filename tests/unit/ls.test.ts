@@ -223,7 +223,7 @@ describe('cmdLs — identity resolution', () => {
 
   it('errors with mkdir hint when identity folder is missing', () => {
     expect(() => cmdLs(baseInput({ recipient: 'ghost' }))).toThrowError(
-      /identity folder missing/
+      /(agent|identity) folder missing/
     );
   });
 });

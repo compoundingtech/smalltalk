@@ -29,7 +29,7 @@ import { buildServerInfo, buildServerOptions } from './capabilities.ts';
 import { evaluateDrift } from './tidy-check.ts';
 import { registerArchiveTool } from './tools/archive.ts';
 import { registerLsTool } from './tools/ls.ts';
-import { registerMembersTool } from './tools/members.ts';
+import { registerAgentsTool } from './tools/agents.ts';
 import { registerReadTool } from './tools/read.ts';
 import { registerReplyTool } from './tools/reply.ts';
 import { registerResourceTools } from './tools/resource.ts';
@@ -129,9 +129,9 @@ export function createMcpServer(opts: McpServerOptions): McpServerHandle {
   registerReadTool(mcp, coord);
   registerArchiveTool(mcp, coord);
   registerThreadTool(mcp, coord);
-  // coord_members is available in both modes — peer discovery is
-  // useful regardless of whether channel push is on.
-  registerMembersTool(mcp, coord);
+  // coord_agents (+ coord_members deprecated alias) is available in
+  // both modes — peer discovery is useful regardless of channel.
+  registerAgentsTool(mcp, coord);
   // coord_resource_* (brief-009 item 5): add/ls/read/remove. Available
   // in both modes; resources are part of the always-on agent surface.
   registerResourceTools(mcp, coord);
