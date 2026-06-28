@@ -24,6 +24,7 @@ import { cmdMcpCli } from './commands/mcp.ts';
 import { cmdMembersCli } from './commands/members.ts';
 import { cmdOverviewCli } from './commands/overview.ts';
 import { cmdReadCli } from './commands/read.ts';
+import { cmdResourceCli } from './commands/resource.ts';
 import { cmdSendCli } from './commands/send.ts';
 import { cmdStatusCli } from './commands/status.ts';
 import { cmdSyncCli } from './commands/sync.ts';
@@ -81,6 +82,11 @@ const TOP_LEVEL_USAGE =
   `  status [<identity>] [--set <state>]\n` +
   `  members [--status STATE] [--json [--enrich]]\n` +
   `  overview [--recent N] [--json]\n\n` +
+  `Resources:\n` +
+  `  resource add <url> [--title T] [--tag T,T] [--body-stdin]\n` +
+  `  resource ls [<identity>] [--json]\n` +
+  `  resource read [<identity>] <filename> [--json]\n` +
+  `  resource rm <filename>\n\n` +
   `Sync:\n` +
   `  sync push <peer>\n` +
   `  sync push --all\n` +
@@ -181,6 +187,8 @@ export async function runCli(
         return cmdOverviewCli(rest, ctx);
       case 'sync':
         return cmdSyncCli(rest, ctx);
+      case 'resource':
+        return await cmdResourceCli(rest, ctx);
       case 'mcp':
         return await cmdMcpCli(rest, ctx);
       case 'init':

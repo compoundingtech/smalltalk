@@ -43,6 +43,13 @@ import {
   type Overview,
 } from './commands/overview.ts';
 import { cmdRead } from './commands/read.ts';
+import {
+  cmdResourceAdd,
+  cmdResourceRead,
+  cmdResourceRemove,
+  listResourceRecords,
+  type ResourceRecord,
+} from './commands/resource.ts';
 import { cmdSend } from './commands/send.ts';
 import { cmdStatus } from './commands/status.ts';
 import {
@@ -79,6 +86,8 @@ import {
   type MessageWithLocation,
   type Peer,
   type Priority,
+  type Resource,
+  type ResourceWithLocation,
   type State,
   type WatchEvent,
 } from './types.ts';
@@ -214,6 +223,23 @@ export interface Coord {
    */
   createIdentity(name: string): Promise<{ created: boolean }>;
   sweep(): Promise<{ removed: number }>;
+  /**
+   * brief-009 item 5: read/write annotated URLs an identity surfaces to
+   * peers. Lives at `<root>/<identity>/resources/<filename>.md`. Add /
+   * remove operate on the handle's OWN identity (single-writer per the
+   * LAYOUT encapsulation rule); list / read accept any identity.
+   */
+  resources: {
+    add(input: {
+      url: string;
+      title?: string;
+      tags?: string[];
+      body?: string;
+    }): Promise<Filename>;
+    list(identity?: Identity): Promise<ResourceWithLocation[]>;
+    read(identity: Identity, filename: Filename): Promise<Resource>;
+    remove(filename: Filename): Promise<void>;
+  };
   sync: {
     push(peer: Peer): Promise<SyncResult>;
     pull(peer: Peer): Promise<SyncResult>;
@@ -452,6 +478,43 @@ export function createCoord(options: CoordOptions): Coord {
       return runSweep(root);
     },
 
+    resources: {
+      async add(input): Promise<Filename> {
+        const r = cmdResourceAdd({
+          url: input.url,
+          ...(input.title !== undefined && { title: input.title }),
+          ...(input.tags !== undefined && { tags: input.tags }),
+          ...(input.body !== undefined && { body: input.body }),
+          identity,
+          env: lib_env,
+          coordRoot: root,
+        });
+        return asFilename(r.filename);
+      },
+      async list(id?): Promise<ResourceWithLocation[]> {
+        const target = id ?? identity;
+        const recs = listResourceRecords(target, root);
+        return recs.map((rec) => recordToWithLocation(rec, target));
+      },
+      async read(id, filename): Promise<Resource> {
+        const r = cmdResourceRead({
+          identity: id,
+          filename,
+          env: lib_env,
+          coordRoot: root,
+        });
+        return recordToResource(r.record);
+      },
+      async remove(filename): Promise<void> {
+        cmdResourceRemove({
+          identity,
+          filename,
+          env: lib_env,
+          coordRoot: root,
+        });
+      },
+    },
+
     sync: {
       async push(peer): Promise<SyncResult> {
         presweep();
@@ -519,6 +582,24 @@ export function createCoord(options: CoordOptions): Coord {
 }
 
 // ─── Helpers ────────────────────────────────────────────────────────────
+
+function recordToResource(rec: ResourceRecord): Resource {
+  const r: Resource = { url: rec.url, body: rec.body };
+  if (rec.title !== null) r.title = rec.title;
+  if (rec.tags.length > 0) r.tags = rec.tags;
+  return r;
+}
+
+function recordToWithLocation(
+  rec: ResourceRecord,
+  identity: string
+): ResourceWithLocation {
+  return {
+    resource: recordToResource(rec),
+    identity: asIdentity(identity),
+    filename: asFilename(rec.filename),
+  };
+}
 
 function toMessageWithLocation(
   fm: Record<string, unknown>,

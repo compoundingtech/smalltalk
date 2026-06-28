@@ -36,7 +36,9 @@ export const SERVER_INFO: Implementation = {
   //         SDK, MCP onboarding, and tidy-check.
   // 0.5.0 — brief-009 phase 2: journal/ surface removed (same
   //         treatment). Tidy-check is now inbox-staleness only.
-  version: '0.5.0',
+  // 0.6.0 — brief-009 phase 5: resources/ surface added (annotated
+  //         URLs per identity). 4 new MCP tools, dual-prefixed.
+  version: '0.6.0',
 };
 
 /**
@@ -103,7 +105,7 @@ export function buildServerOptions(opts: {
 
 /** The base tool names (sans prefix) registered in non-channel mode.
  *  `msg_send/ls/read/archive/thread` per brief-017; `members` per
- *  brief-019. `task_*` / `overview` remain parked. */
+ *  brief-019; `resource_*` per brief-009 item 5. */
 export const EXPECTED_TOOL_BASE_NAMES = [
   'msg_send',
   'msg_ls',
@@ -111,6 +113,10 @@ export const EXPECTED_TOOL_BASE_NAMES = [
   'msg_archive',
   'msg_thread',
   'members',
+  'resource_add',
+  'resource_ls',
+  'resource_read',
+  'resource_remove',
 ] as const;
 
 /** brief-005-phase0 §3: every tool dual-registers under `coord_*`
