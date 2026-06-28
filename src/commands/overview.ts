@@ -1,9 +1,9 @@
 // commands/overview.ts — synthesized at-a-glance dashboard.
 //
-// Composes existing read paths (members, ls, tasks, raw mtimes)
-// into one snapshot for the active $COORD_IDENTITY. Designed for
-// "what's the state of my coord world right now?" — typed for
-// embedders via --json; text for humans by default.
+// Composes existing read paths (members, ls, raw mtimes) into one
+// snapshot for the active $COORD_IDENTITY. Designed for "what's the
+// state of my coord world right now?" — typed for embedders via --json;
+// text for humans by default.
 
 import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
 import { join } from 'node:path';
@@ -17,13 +17,11 @@ import {
   parseFrontmatter,
   resolveIdentity,
   statusPath,
-  tasksDir,
   validFilename,
 } from '../common.ts';
 import type { Filename, Identity } from '../types.ts';
 
 import { cmdMembers, type MemberSummaryEnriched } from './members.ts';
-import { listTaskRecords } from './task.ts';
 
 export interface OverviewInboxOldest {
   filename: Filename;
@@ -37,7 +35,7 @@ export interface OverviewInbox {
   oldest: OverviewInboxOldest | null;
 }
 
-export type ActivityKind = 'message' | 'archive' | 'task' | 'status';
+export type ActivityKind = 'message' | 'archive' | 'status';
 
 export interface OverviewActivity {
   kind: ActivityKind;
@@ -245,35 +243,6 @@ function computeRecentActivity(
         });
       }
     }
-    // Tasks owned by <id>.
-    const tdir = tasksDir(id, root);
-    if (existsSync(tdir)) {
-      const taskRecs = listTaskRecords(id, root);
-      const byFn = new Map(taskRecs.map((r) => [r.filename, r]));
-      let names: string[];
-      try {
-        names = readdirSync(tdir);
-      } catch {
-        names = [];
-      }
-      for (const name of names) {
-        if (name === 'README.md' || !name.endsWith('.md')) continue;
-        const path = join(tdir, name);
-        consider(path, () => {
-          const rec = byFn.get(name);
-          const a: OverviewActivity = {
-            kind: 'task',
-            identity: id as Identity,
-            ageMs: 0,
-            filename: name as Filename,
-          };
-          if (rec?.title !== undefined && rec.title.length > 0) {
-            a.subject = rec.title;
-          }
-          return a;
-        });
-      }
-    }
     // Status file (single, identity-scoped).
     const sp = statusPath(id, root);
     if (existsSync(sp)) {
@@ -322,9 +291,7 @@ function formatText(o: Overview): string {
   } else {
     for (const m of o.members) {
       let line = `  ${pad(m.identity, 12)} ${pad(m.status, 10)} `;
-      if (m.tasks.doing > 0) {
-        line += `Working on ${m.tasks.doing} task${m.tasks.doing === 1 ? '' : 's'}`;
-      } else if (m.lastActivity !== null) {
+      if (m.lastActivity !== null) {
         line += `last active ${formatAge(Math.max(0, msNow() - m.lastActivity))} ago`;
       } else {
         line += '—';
@@ -352,8 +319,6 @@ function formatActivityLine(r: OverviewActivity): string {
       return `${r.identity} → ${r.target ?? '?'} — ${r.subject ?? r.filename ?? ''}`;
     case 'archive':
       return `archive ${r.identity} → ${r.target ?? '?'} — ${r.subject ?? r.filename ?? ''}`;
-    case 'task':
-      return `task ${r.identity}: ${r.subject ?? r.filename ?? ''}`;
     case 'status':
       return `${r.identity} status changed`;
   }
@@ -377,7 +342,7 @@ const OVERVIEW_HELP =
   'usage: coord overview [--recent N] [--json]\n\n' +
   '  At-a-glance snapshot for $COORD_IDENTITY:\n' +
   '    - your inbox unread count + oldest item\n' +
-  '    - every identity\'s status + task counts\n' +
+  '    - every identity\'s status + last-activity\n' +
   '    - top N recent activity entries across the tree\n';
 
 export function cmdOverviewCli(

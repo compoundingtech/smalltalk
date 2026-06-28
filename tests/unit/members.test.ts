@@ -11,7 +11,6 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
-import { cmdTaskNew, cmdTaskStatus } from '../../src/commands/task.ts';
 import {
   cmdMembers,
   listIdentities,
@@ -40,10 +39,6 @@ function setStatus(id: string, state: string): void {
   writeFileSync(join(coordRoot, id, 'status'), `${state}\n`);
 }
 
-function envFor(id: string): NodeJS.ProcessEnv {
-  return { COORD_IDENTITY: id } as NodeJS.ProcessEnv;
-}
-
 // ─── Enumeration ────────────────────────────────────────────────────────
 
 describe('cmdMembers / listIdentities', () => {
@@ -56,11 +51,6 @@ describe('cmdMembers / listIdentities', () => {
     setupIdentity('alice');
     setupIdentity('bob');
     expect(listIdentities(coordRoot)).toEqual(['alice', 'bob']);
-  });
-
-  it('accepts an identity with ONLY tasks/ (no messages yet)', () => {
-    mkdirSync(join(coordRoot, 'futurist', 'tasks'), { recursive: true });
-    expect(listIdentities(coordRoot)).toContain('futurist');
   });
 
   it('accepts an identity with ONLY inbox/ (lazy peer from a single send)', () => {
@@ -82,8 +72,8 @@ describe('cmdMembers / listIdentities', () => {
 
   it('skips reserved names at the root', () => {
     setupIdentity('alice');
-    // A bare `tasks/` at the root would be a misnamed identity.
-    mkdirSync(join(coordRoot, 'tasks', 'inbox'), { recursive: true });
+    // A bare `journal/` at the root would be a misnamed identity.
+    mkdirSync(join(coordRoot, 'journal', 'inbox'), { recursive: true });
     expect(listIdentities(coordRoot)).toEqual(['alice']);
   });
 
@@ -104,7 +94,7 @@ describe('cmdMembers / listIdentities', () => {
     ]);
   });
 
-  it('an empty-but-existing identity folder (no inbox/archive/tasks) is NOT enumerated', () => {
+  it('an empty-but-existing identity folder (no inbox/archive) is NOT enumerated', () => {
     mkdirSync(join(coordRoot, 'orphan'), { recursive: true });
     expect(listIdentities(coordRoot)).toEqual([]);
   });
@@ -200,7 +190,7 @@ describe('cmdMembers --enrich', () => {
     expect(m.lastActivity).toBeNull();
   });
 
-  it('lastActivity is the newest mtime across inbox + archive + tasks + status', () => {
+  it('lastActivity is the newest mtime across inbox + archive + status', () => {
     setupIdentity('alice');
     // Plant three files at staggered mtimes; the newest should be
     // the value lastActivity returns.
@@ -219,54 +209,6 @@ describe('cmdMembers --enrich', () => {
     // and our utimesSync values are seconds. 5000 seconds = 5e6 ms.
     expect(m.lastActivity).toBeGreaterThanOrEqual(5_000_000);
     expect(m.lastActivity).toBeLessThan(5_001_000);
-  });
-
-  it('task counts default to 0 when no tasks/ folder', () => {
-    setupIdentity('alice');
-    const r = cmdMembers({ enrich: true, coordRoot });
-    const m = r.items[0] as MemberSummaryEnriched;
-    expect(m.tasks).toEqual({ todo: 0, doing: 0, done: 0, blocked: 0 });
-  });
-
-  it('task counts reflect actual statuses', () => {
-    setupIdentity('alice');
-    cmdTaskNew({
-      title: 'a',
-      env: envFor('alice'),
-      coordRoot,
-      noEdit: true,
-    });
-    cmdTaskNew({
-      title: 'b',
-      env: envFor('alice'),
-      coordRoot,
-      noEdit: true,
-    });
-    cmdTaskNew({
-      title: 'c',
-      env: envFor('alice'),
-      coordRoot,
-      noEdit: true,
-    });
-    // Flip one to doing, one to done.
-    const filenames = require('node:fs')
-      .readdirSync(join(coordRoot, 'alice', 'tasks'))
-      .filter((f: string) => f.endsWith('.md') && f !== 'README.md');
-    cmdTaskStatus({
-      filename: filenames[0]!,
-      state: 'doing',
-      env: envFor('alice'),
-      coordRoot,
-    });
-    cmdTaskStatus({
-      filename: filenames[1]!,
-      state: 'done',
-      env: envFor('alice'),
-      coordRoot,
-    });
-    const r = cmdMembers({ enrich: true, coordRoot });
-    const m = r.items[0] as MemberSummaryEnriched;
-    expect(m.tasks).toEqual({ todo: 1, doing: 1, done: 1, blocked: 0 });
   });
 
   it('inbox count matches the valid-filename count', () => {

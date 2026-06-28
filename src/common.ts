@@ -89,24 +89,18 @@ export const STATUS_STALE_MS = 15 * 60 * 1000;
 export const STATUS_REFRESH_MS = 5 * 60 * 1000;
 
 /** brief-030: how often the MCP server runs its tidy-check tick (the
- *  drift detector that nudges an agent when their inbox / tasks /
- *  journal are out of date relative to the boot ritual). Default 20
- *  minutes — long enough that an active agent isn't constantly
- *  reminded, short enough that drift gets caught within a working
- *  session. */
+ *  drift detector that nudges an agent when their inbox is out of date
+ *  relative to the boot ritual). Default 20 minutes — long enough that
+ *  an active agent isn't constantly reminded, short enough that drift
+ *  gets caught within a working session. */
 export const TIDY_CHECK_INTERVAL_MS = 20 * 60 * 1000;
 
 /** Drift threshold: an inbox file older than this is "unaddressed."
  *  Tunable per myobie's loose initial framing. */
 export const STALE_INBOX_MS = 10 * 60 * 1000;
 
-/** Drift threshold: a task in `doing` whose file hasn't been touched
- *  in this long has probably been abandoned without a status flip. */
-export const STALE_DOING_TASK_MS = 60 * 60 * 1000;
-
-/** Drift threshold: when the latest journal entry is older than this
- *  AND a task has transitioned to `done` since that entry was
- *  written, the agent has shipped without journaling — drift. */
+/** Drift threshold: when the latest journal entry is older than this,
+ *  the agent has shipped without journaling — drift. */
 export const STALE_JOURNAL_MS = 60 * 60 * 1000;
 
 export const RESERVED_NAMES: readonly string[] = [
@@ -115,7 +109,6 @@ export const RESERVED_NAMES: readonly string[] = [
   // identity name that collides with one of these would shadow it.
   'inbox',
   'archive',
-  'tasks',
   'journal',
   'status',
   'name',
@@ -428,10 +421,6 @@ export function inboxDir(id: string, root: string = coordRoot()): string {
 
 export function archiveDir(id: string, root: string = coordRoot()): string {
   return join(root, id, 'archive');
-}
-
-export function tasksDir(id: string, root: string = coordRoot()): string {
-  return join(root, id, 'tasks');
 }
 
 export function journalDir(id: string, root: string = coordRoot()): string {

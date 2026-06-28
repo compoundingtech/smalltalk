@@ -514,9 +514,6 @@ const defaultIsSessionAlive: IsSessionAlive = (sessionName) => {
  * Single-line summary suitable for pty-send into a terminal session.
  * Distinct from the MCP frame body (which is multi-line markdown) —
  * Codex sees this as one line of typed input, so we keep it scannable.
- *
- * Shape per brief-031 example:
- *   coord tidy-check: inbox=3 (oldest 47m); doing-task "refactor X" untouched 2h; no journal since last task→done 90m ago.
  */
 function formatTidyLine(drift: DriftResult): string {
   const parts: string[] = [];
@@ -525,14 +522,9 @@ function formatTidyLine(drift: DriftResult): string {
       `inbox=${drift.detail.inboxStaleCount} (oldest ${formatAge(drift.detail.oldestInboxAgeMs)})`
     );
   }
-  if (drift.doingTask && drift.detail.staleDoingTaskTitle !== null) {
-    parts.push(
-      `doing-task "${drift.detail.staleDoingTaskTitle}" untouched ${formatAge(drift.detail.staleDoingTaskAgeMs)}`
-    );
-  }
   if (drift.journal) {
     parts.push(
-      `no journal since last task→done ${formatAge(drift.detail.journalLagMs)} ago`
+      `no journal entry for ${formatAge(drift.detail.journalLagMs)}`
     );
   }
   return `coord tidy-check: ${parts.join('; ')}.`;

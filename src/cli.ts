@@ -28,8 +28,6 @@ import { cmdReadCli } from './commands/read.ts';
 import { cmdSendCli } from './commands/send.ts';
 import { cmdStatusCli } from './commands/status.ts';
 import { cmdSyncCli } from './commands/sync.ts';
-import { cmdTaskCli } from './commands/task.ts';
-import { cmdTasksCli } from './commands/tasks.ts';
 import { cmdThreadCli } from './commands/thread.ts';
 import { cmdWatchCli } from './commands/watch.ts';
 
@@ -84,15 +82,6 @@ const TOP_LEVEL_USAGE =
   `  status [<identity>] [--set <state>]\n` +
   `  members [--status STATE] [--json [--enrich]]\n` +
   `  overview [--recent N] [--json]\n\n` +
-  `Tasks:\n` +
-  `  task new "<title>" [--priority P] [--tag T,T] [--due Y-M-D]\n` +
-  `                     [--from-message <inbox-filename>] [--no-edit]\n` +
-  `  task ls [--status STATE] [--tag T] [--priority P] [--json]\n` +
-  `  task status <filename> <STATE>\n` +
-  `  task done <filename>\n` +
-  `  task edit <filename>\n` +
-  `  tasks [<identity>] [--status STATE] [--tag T] [--priority P]\n` +
-  `                     [--json [--include-body]] [--watch [--interval MS]]\n\n` +
   `Journal:\n` +
   `  journal new "<body>" [--slug ...] [--topic ...] [--tag T,T]\n` +
   `              [--stdin | --edit]\n` +
@@ -199,10 +188,6 @@ export async function runCli(
         return cmdOverviewCli(rest, ctx);
       case 'sync':
         return cmdSyncCli(rest, ctx);
-      case 'task':
-        return await cmdTaskCli(rest, ctx);
-      case 'tasks':
-        return await cmdTasksCli(rest, ctx);
       case 'journal':
         return await cmdJournalCli(rest, ctx);
       case 'mcp':

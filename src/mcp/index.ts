@@ -220,8 +220,8 @@ export function createMcpServer(opts: McpServerOptions): McpServerHandle {
     }
   };
 
-  // brief-030: periodic tidy-check tick. Walks inbox / tasks / journal
-  // for drift conditions; emits a synthetic
+  // brief-030: periodic tidy-check tick. Walks inbox / journal for
+  // drift conditions; emits a synthetic
   // `notifications/claude/channel` frame (from: coord-system) when
   // anything new has drifted since the last emit. No emit when status
   // is busy/dnd/unknown — busy/dnd defer until the agent flips back;
@@ -232,9 +232,8 @@ export function createMcpServer(opts: McpServerOptions): McpServerHandle {
   let tidyCheckTimer: ReturnType<typeof setInterval> | undefined;
   let lastTidyFired: {
     inbox: boolean;
-    doingTask: boolean;
     journal: boolean;
-  } = { inbox: false, doingTask: false, journal: false };
+  } = { inbox: false, journal: false };
   const tidyCheck = (): void => {
     if (!opts.identity || opts.identity.length === 0) return;
     let currentStatus: string;
@@ -263,7 +262,6 @@ export function createMcpServer(opts: McpServerOptions): McpServerHandle {
     // compared to last fired. Same-or-less drift doesn't re-emit.
     const newCondition =
       (drift.inbox && !lastTidyFired.inbox) ||
-      (drift.doingTask && !lastTidyFired.doingTask) ||
       (drift.journal && !lastTidyFired.journal);
     if (newCondition && drift.body.length > 0) {
       void mcp.server
@@ -289,7 +287,6 @@ export function createMcpServer(opts: McpServerOptions): McpServerHandle {
     // recurrence — only the recurrence-after-clear fires.
     lastTidyFired = {
       inbox: drift.inbox,
-      doingTask: drift.doingTask,
       journal: drift.journal,
     };
   };

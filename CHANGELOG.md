@@ -6,6 +6,31 @@ minor releases until 1.0.
 
 ## Unreleased
 
+### Removed (brief-009 item 1 — `tasks/` surface gone)
+
+**Breaking.** The `tasks/` folder and every CLI/SDK/MCP surface that
+referenced it is removed. Tasks were never widely used outside
+myobie's own agents; the slim-down clears the way for a tighter
+onboarding story.
+
+- **CLI:** `coord task ...` and `coord tasks` subcommands deleted.
+- **MCP onboarding text:** the channel-mode instructions no longer
+  reference task-file ritual.
+- **MCP tidy-check:** the `doingTask` drift condition is gone;
+  detection now covers inbox staleness + journal lag only.
+- **SDK:** no task types/methods were exposed (none existed); the
+  `MemberTaskCounts` type and the `tasks` field on
+  `MemberSummaryEnriched` / `coord_members` (enriched) are removed.
+- **Public types:** `TaskState`, `TaskNotFoundError`,
+  `TasksSingleWriterError`, `InvalidTaskTitleError`, and
+  `InvalidTaskStateError` are no longer exported.
+- **RESERVED_NAMES:** `tasks` is dropped (the name is once again
+  available as an identity, though we'd advise against it).
+- **Docs:** README, LAYOUT.md, completions guidance updated.
+- **Downstream impact:** consuming agents that reference `coord task`
+  / `coord tasks` in their boot rituals need to drop those steps. The
+  cos agent owns sweeping the consuming agent CLAUDE.md files.
+
 ### Added (alias groundwork for the coord → smalltalk/st rename — Phase 0)
 
 The package is being renamed to `smalltalk` (long) / `st` (canonical

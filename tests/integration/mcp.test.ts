@@ -530,7 +530,6 @@ describe('mcp integration — coord_members', () => {
     status: string;
     name: string | null;
     lastActivity?: number | null;
-    tasks?: { todo: number; doing: number; done: number; blocked: number };
     inbox?: number;
   }
 
@@ -558,13 +557,12 @@ describe('mcp integration — coord_members', () => {
     expect(members.map((m) => m.identity)).toEqual(['bob']);
   });
 
-  it('enrich: true returns lastActivity/tasks/inbox fields', async () => {
+  it('enrich: true returns lastActivity/inbox fields', async () => {
     const r = await callTool(client, 'coord_members', { enrich: true });
     const members = (r.structuredContent?.members as MemberShape[]) ?? [];
     expect(members.length).toBeGreaterThan(0);
     for (const m of members) {
       expect(m).toHaveProperty('lastActivity');
-      expect(m).toHaveProperty('tasks');
       expect(m).toHaveProperty('inbox');
     }
   });

@@ -55,7 +55,6 @@ interface MemberShape {
   status: string;
   name: string | null;
   lastActivity?: number | null;
-  tasks?: { todo: number; doing: number; done: number; blocked: number };
   inbox?: number;
 }
 
@@ -113,7 +112,6 @@ describe('coord_members — happy paths', () => {
       expect(m).toHaveProperty('status');
       expect(m).toHaveProperty('name');
       expect(m).not.toHaveProperty('lastActivity');
-      expect(m).not.toHaveProperty('tasks');
       expect(m).not.toHaveProperty('inbox');
     }
   });
@@ -167,14 +165,7 @@ describe('coord_members — happy paths', () => {
     expect(members).toHaveLength(2);
     for (const m of members) {
       expect(m).toHaveProperty('lastActivity');
-      expect(m).toHaveProperty('tasks');
       expect(m).toHaveProperty('inbox');
-      expect(m.tasks).toMatchObject({
-        todo: expect.any(Number),
-        doing: expect.any(Number),
-        done: expect.any(Number),
-        blocked: expect.any(Number),
-      });
     }
     const bob = members.find((m) => m.identity === 'bob');
     expect(bob?.inbox).toBe(1);

@@ -1,14 +1,14 @@
 // commands/members.ts — enumerate identities under $COORD_ROOT.
 //
 // "Roster" verb: walks `<root>/<*>` and reports every identity-shaped
-// sub-folder (one with at least one of inbox/, archive/, or tasks/).
-// Plain filesystem read, no resolveIdentity — does not auto-create
-// or mutate anything for the identities it walks.
+// sub-folder (one with at least one of inbox/ or archive/). Plain
+// filesystem read, no resolveIdentity — does not auto-create or mutate
+// anything for the identities it walks.
 //
 //   coord members                  # text, sorted alphabetically
 //   coord members --status STATE   # filter to a single status
 //   coord members --json           # machine-readable
-//   coord members --json --enrich  # + lastActivity, task counts, inbox
+//   coord members --json --enrich  # + lastActivity, inbox count
 //
 // Reserved as an identity name in common.ts so no one can collide
 // with the verb's namespace.
@@ -22,13 +22,11 @@ import {
   inboxDir,
   RESERVED_NAMES,
   statusPath,
-  tasksDir,
   validFilename,
   validIdentity,
 } from '../common.ts';
 import { type State } from '../types.ts';
 
-import { listTaskRecords } from './task.ts';
 import { readIdentityStatus } from './status.ts';
 
 export interface MemberSummary {
@@ -37,18 +35,10 @@ export interface MemberSummary {
   name: string | null;
 }
 
-export interface MemberTaskCounts {
-  todo: number;
-  doing: number;
-  done: number;
-  blocked: number;
-}
-
 export interface MemberSummaryEnriched extends MemberSummary {
-  /** Newest mtime across inbox/archive/tasks/status, or null if
+  /** Newest mtime across inbox/archive/status, or null if
    * nothing at all under the identity has been touched. */
   lastActivity: number | null;
-  tasks: MemberTaskCounts;
   /** Count of valid-grammar files in <id>/inbox/ (mirrors `coord ls --count`). */
   inbox: number;
 }
@@ -79,7 +69,7 @@ export interface GetMembersOpts {
  * brief-028.
  *
  * Read-only: walks `<root>/*` and consults each identity's status / name
- * / inbox / tasks. No writes.
+ * / inbox. No writes.
  */
 export function getMembers(
   root: string,
@@ -101,7 +91,6 @@ export function getMembers(
   const enriched: MemberSummaryEnriched[] = filtered.map((m) => ({
     ...m,
     lastActivity: computeLastActivity(m.identity, root),
-    tasks: computeTaskCounts(m.identity, root),
     inbox: computeInboxCount(m.identity, root),
   }));
   return enriched;
@@ -135,10 +124,9 @@ export function cmdMembers(
  * Filters:
  *   - skip dotfiles (defensive; nothing in coord uses them today)
  *   - skip non-directories
- *   - skip reserved names (defensive — a `tasks` folder at the root
- *     can't be a valid identity)
+ *   - skip reserved names (defensive)
  *   - keep only names where validIdentity(name) holds AND at least
- *     one of `<name>/inbox`, `<name>/archive`, `<name>/tasks` exists
+ *     one of `<name>/inbox`, `<name>/archive` exists
  *
  * Returns alphabetically sorted.
  */
@@ -164,8 +152,7 @@ export function listIdentities(root: string): string[] {
     if (!st.isDirectory()) continue;
     if (
       !isDir(inboxDir(name, root)) &&
-      !isDir(archiveDir(name, root)) &&
-      !isDir(tasksDir(name, root))
+      !isDir(archiveDir(name, root))
     ) {
       continue;
     }
@@ -186,7 +173,7 @@ function readNameFile(id: string, root: string): string | null {
   }
 }
 
-/** Newest mtime across inbox/archive/tasks/status under <id>/. */
+/** Newest mtime across inbox/archive/status under <id>/. */
 export function computeLastActivity(
   identity: string,
   root: string
@@ -207,7 +194,6 @@ export function computeLastActivity(
   for (const dir of [
     inboxDir(identity, root),
     archiveDir(identity, root),
-    tasksDir(identity, root),
   ]) {
     if (!isDir(dir)) continue;
     let names: string[];
@@ -222,23 +208,6 @@ export function computeLastActivity(
   const sp = statusPath(identity, root);
   if (existsSync(sp)) consider(sp);
   return newest;
-}
-
-export function computeTaskCounts(
-  identity: string,
-  root: string
-): MemberTaskCounts {
-  const counts: MemberTaskCounts = { todo: 0, doing: 0, done: 0, blocked: 0 };
-  const items = listTaskRecords(identity, root);
-  for (const t of items) {
-    if (t.status === 'todo') counts.todo++;
-    else if (t.status === 'doing') counts.doing++;
-    else if (t.status === 'done') counts.done++;
-    else if (t.status === 'blocked') counts.blocked++;
-    // Unknown statuses ignored — defensive against malformed
-    // frontmatter; the file is still listed by `coord task ls`.
-  }
-  return counts;
 }
 
 export function computeInboxCount(identity: string, root: string): number {
@@ -266,7 +235,7 @@ function isDir(p: string): boolean {
 const MEMBERS_HELP =
   'usage: coord members [--status STATE] [--json [--enrich]]\n\n' +
   '  Enumerate every identity under $COORD_ROOT — i.e. any\n' +
-  '  sub-folder with at least one of inbox/, archive/, or tasks/.\n' +
+  '  sub-folder with at least one of inbox/ or archive/.\n' +
   '  Sorted alphabetically. Plain read; does not mutate state.\n';
 
 export function cmdMembersCli(

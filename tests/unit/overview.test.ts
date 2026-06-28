@@ -12,7 +12,6 @@ import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import { cmdOverview } from '../../src/commands/overview.ts';
-import { cmdTaskNew, cmdTaskStatus } from '../../src/commands/task.ts';
 
 let scratch: string;
 let coordRoot: string;
@@ -75,14 +74,6 @@ describe('cmdOverview — shape', () => {
       expect(typeof m.identity).toBe('string');
       expect(typeof m.status).toBe('string');
       expect('lastActivity' in m).toBe(true);
-      expect(m.tasks).toEqual(
-        expect.objectContaining({
-          todo: expect.any(Number),
-          doing: expect.any(Number),
-          done: expect.any(Number),
-          blocked: expect.any(Number),
-        })
-      );
       expect(typeof m.inbox).toBe('number');
     }
   });
@@ -170,28 +161,6 @@ describe('cmdOverview — members section', () => {
     );
   });
 
-  it('task counts surface in members (reflects cross-tree "who is doing what")', () => {
-    setupIdentity('myobie');
-    setupIdentity('alice');
-    cmdTaskNew({
-      title: 'work',
-      env: envFor('alice'),
-      coordRoot,
-      noEdit: true,
-    });
-    const created = require('node:fs')
-      .readdirSync(join(coordRoot, 'alice', 'tasks'))
-      .filter((f: string) => f.endsWith('.md') && f !== 'README.md')[0]!;
-    cmdTaskStatus({
-      filename: created,
-      state: 'doing',
-      env: envFor('alice'),
-      coordRoot,
-    });
-    const r = cmdOverview({ env: envFor('myobie'), coordRoot });
-    const alice = r.members.find((m) => m.identity === 'alice')!;
-    expect(alice.tasks.doing).toBe(1);
-  });
 });
 
 // ─── Recent activity ────────────────────────────────────────────────────
@@ -220,7 +189,7 @@ describe('cmdOverview — recent activity', () => {
     expect(r.recent[2]!.filename).toContain('zzzzz3');
   });
 
-  it('tags entries with the right kind: message / archive / task / status', () => {
+  it('tags entries with the right kind: message / archive / status', () => {
     setupIdentity('myobie');
     setupIdentity('alice');
     plantInbox('myobie', '1714826789010-aaaaaa.md', 'alice', 'm');
@@ -229,37 +198,11 @@ describe('cmdOverview — recent activity', () => {
       '---\nfrom: alice\n---\na\n'
     );
     writeFileSync(join(coordRoot, 'myobie', 'status'), 'busy\n');
-    cmdTaskNew({
-      title: 'task',
-      env: envFor('myobie'),
-      coordRoot,
-      noEdit: true,
-    });
     const r = cmdOverview({ env: envFor('myobie'), coordRoot });
     const kinds = new Set(r.recent.map((a) => a.kind));
     expect(kinds.has('message')).toBe(true);
     expect(kinds.has('archive')).toBe(true);
-    expect(kinds.has('task')).toBe(true);
     expect(kinds.has('status')).toBe(true);
-  });
-
-  it('cross-identity activity is visible in self overview', () => {
-    setupIdentity('myobie');
-    setupIdentity('alice');
-    // Alice has a task; myobie's overview should still see it under
-    // "recent activity" tagged identity=alice.
-    cmdTaskNew({
-      title: 'alice-task',
-      env: envFor('alice'),
-      coordRoot,
-      noEdit: true,
-    });
-    const r = cmdOverview({ env: envFor('myobie'), coordRoot });
-    const aliceTask = r.recent.find(
-      (a) => a.kind === 'task' && a.identity === 'alice'
-    );
-    expect(aliceTask).toBeDefined();
-    expect(aliceTask?.subject).toBe('alice-task');
   });
 
   it('--recent 0 returns an empty recent list', () => {

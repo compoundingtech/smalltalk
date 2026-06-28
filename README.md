@@ -2,7 +2,7 @@
 
 A small Node CLI **and** TypeScript library for the **coord** file-folder
 convention. The folder is the API: `<identity>/inbox/`, `<identity>/archive/`,
-plus the optional `<identity>/tasks/` queue, plain markdown files with YAML
+plus the optional `<identity>/journal/` log, plain markdown files with YAML
 frontmatter, plain `rsync` between machines.
 
 - **Convention:** [LAYOUT.md](LAYOUT.md) — the binding spec.
@@ -16,9 +16,9 @@ frontmatter, plain `rsync` between machines.
 ## Why this shape
 
 **The one rule: across identities, only `inbox/` is writable.** Every
-other folder under an identity — `archive/`, `tasks/`, `journal/`,
-`status` — is single-writer, owned by that identity. Peers read but
-never write. This gives you several useful properties for free:
+other folder under an identity — `archive/`, `journal/`, `status` — is
+single-writer, owned by that identity. Peers read but never write. This
+gives you several useful properties for free:
 
 - **Lock-free coordination.** Every new message is a new file with a
   globally unique `<unix-ms>-<rand6>.md` name. No two writers ever
@@ -27,10 +27,10 @@ never write. This gives you several useful properties for free:
   reads at their own pace.
 
 - **No cross-identity edits.** One identity can't reach into another's
-  `tasks/` and change a task status, can't edit a journal entry it
-  doesn't own. If you want a peer to do something, you message their
-  inbox suggesting it. They decide whether to act and update their own
-  state. That's the entire authorization model.
+  `journal/` and edit an entry it doesn't own. If you want a peer to do
+  something, you message their inbox suggesting it. They decide whether
+  to act and update their own state. That's the entire authorization
+  model.
 
 - **Inbox files can carry attachments.** The inbox is just a folder —
   alongside the canonical `<ts>-<rand6>.md` message file, a sender can
@@ -133,8 +133,6 @@ coord message read bob 1714826789012-x9k4mz.md              # parsed view of one
 coord message archive 1714826789012-x9k4mz.md               # mv inbox -> archive
 coord message thread bob 1714826789012-x9k4mz.md            # walk the in-reply-to chain
 coord status --set busy                                     # update my status (available | busy | away | dnd | offline)
-coord task new "fix login" --priority high                  # add a task to my queue
-coord tasks worker-claude --status doing                    # what's worker-claude doing right now?
 coord journal new "shipped brief-024" --tag layout          # terse work-log entry
 coord journal tail worker-claude -n 5                       # follow a peer's narrative
 coord members --status available                            # who's around?
@@ -159,9 +157,9 @@ coord completions zsh  > "${fpath[1]}/_coord"
 ```
 
 The scripts complete subcommands, their verbs and flags, and the closed
-value sets (status states, task states, priorities). The fish script also
-disambiguates the reused verbs (`ls`, `new`, `status`) across the
-`message` / `task` / `journal` groups.
+value sets (status states, priorities). The fish script also
+disambiguates the reused verbs (`ls`, `new`) across the `message` /
+`journal` groups.
 
 ## Programmatic API
 
@@ -250,11 +248,12 @@ chokidar startup cost.
 The MCP server ships an `instructions` string covering the **boot
 ritual**: on connect, the agent writes `available` to its status
 file, drains any inbox backlog (ls → read → reply → archive), and
-runs `coord_members` for peer state. As work happens, it records
-tasks via `coord task new/status/done`. On shutdown (`SIGTERM`,
-`SIGINT`, or transport close), the server writes `offline` to the
-status file so peers see the right state immediately. The full text
-lives in `src/mcp/capabilities.ts` (`CHANNEL_INSTRUCTIONS`).
+runs `coord_members` for peer state. As non-trivial progress happens,
+it drops `coord journal new` entries so peers can follow what shipped.
+On shutdown (`SIGTERM`, `SIGINT`, or transport close), the server
+writes `offline` to the status file so peers see the right state
+immediately. The full text lives in `src/mcp/capabilities.ts`
+(`CHANNEL_INSTRUCTIONS`).
 
 ## Harness integrations
 

@@ -9,13 +9,12 @@
 //
 // Enum binding is per-command-node, not per-flag-name: `--status` resolves
 // to different value sets depending on context (settable states under
-// `status --set` / `members --status`, task states under `tasks --status`
-// / `task ls --status`), so the values live on the node that owns the flag.
+// `status --set` / `members --status`), so the values live on the node
+// that owns the flag.
 
 import type { CliContext } from '../cli-context.ts';
 import { SETTABLE_STATES } from '../common.ts';
 import { PRIORITIES } from '../types.ts';
-import { TASK_STATES } from './task.ts';
 
 // ─── Spec ──────────────────────────────────────────────────────────────────
 //
@@ -25,7 +24,6 @@ import { TASK_STATES } from './task.ts';
 
 const STATE_VALUES = SETTABLE_STATES.map(String);
 const PRIORITY_VALUES = PRIORITIES.map(String);
-const TASK_STATE_VALUES = TASK_STATES.map(String);
 
 /** A `--flag`. `values` (when present) is the closed set of completions for
  *  the flag's argument; absence means a boolean flag or a free-form value. */
@@ -149,53 +147,6 @@ const COMMANDS: readonly CommandSpec[] = [
     name: 'overview',
     desc: 'Tree overview of recent activity',
     flags: [{ name: 'recent', desc: 'Number of recent items' }, JSON_FLAG],
-  },
-  {
-    name: 'task',
-    desc: 'Manage a single task',
-    verbs: [
-      {
-        name: 'new',
-        desc: 'Create a task',
-        flags: [
-          { name: 'priority', desc: 'Task priority', values: PRIORITY_VALUES },
-          { name: 'tag', desc: 'Comma-separated tags' },
-          { name: 'due', desc: 'Due date (Y-M-D)' },
-          { name: 'from-message', desc: 'Seed from inbox filename' },
-          { name: 'no-edit', desc: 'Skip opening $EDITOR' },
-        ],
-      },
-      {
-        name: 'ls',
-        desc: 'List tasks',
-        flags: [
-          { name: 'status', desc: 'Filter by task state', values: TASK_STATE_VALUES },
-          { name: 'tag', desc: 'Filter by tag' },
-          { name: 'priority', desc: 'Filter by priority', values: PRIORITY_VALUES },
-          JSON_FLAG,
-        ],
-      },
-      {
-        name: 'status',
-        desc: 'Set a task state',
-        positionalValues: TASK_STATE_VALUES,
-      },
-      { name: 'done', desc: 'Mark a task done' },
-      { name: 'edit', desc: 'Edit a task' },
-    ],
-  },
-  {
-    name: 'tasks',
-    desc: 'List tasks across members',
-    flags: [
-      { name: 'status', desc: 'Filter by task state', values: TASK_STATE_VALUES },
-      { name: 'tag', desc: 'Filter by tag' },
-      { name: 'priority', desc: 'Filter by priority', values: PRIORITY_VALUES },
-      { name: 'include-body', desc: 'Include task body in JSON' },
-      { name: 'watch', desc: 'Re-render on changes' },
-      { name: 'interval', desc: 'Poll interval (ms)' },
-      JSON_FLAG,
-    ],
   },
   {
     name: 'journal',
@@ -410,14 +361,12 @@ function bashScript(): string {
   return lines.join('\n') + '\n';
 }
 
-/** Build the bash `case "$prev"` block that completes enum flag values and
- *  the `task status` positional, scoped by the first word so the 4-vs-5
- *  status split stays correct. */
+/** Build the bash `case "$prev"` block that completes enum flag values,
+ *  scoped by the first word where needed. */
 function bashEnumCases(): string {
   const lines: string[] = [];
-  // Flag-value enums, scoped by (cmd, verb) where needed.
+  // Flag-value enums, scoped by cmd where needed.
   // status --set → settable; members --status → settable.
-  // tasks --status → task states; task ls --status → task states.
   // priorities are unambiguous wherever they appear.
   lines.push('  case "$prev" in');
   lines.push(`    --set) COMPREPLY=( $(compgen -W "${STATE_VALUES.join(' ')}" -- "$cur") ); return 0 ;;`);
@@ -425,15 +374,9 @@ function bashEnumCases(): string {
   lines.push('    --status)');
   lines.push('      case "$cmd" in');
   lines.push(`        members) COMPREPLY=( $(compgen -W "${STATE_VALUES.join(' ')}" -- "$cur") ) ;;`);
-  lines.push(`        task|tasks) COMPREPLY=( $(compgen -W "${TASK_STATE_VALUES.join(' ')}" -- "$cur") ) ;;`);
   lines.push('      esac');
   lines.push('      return 0 ;;');
   lines.push('  esac');
-  // `task status <filename> <STATE>` positional.
-  lines.push(`  if [ "$cmd" = "task" ] && [ "$verb" = "status" ] && [ "$COMP_CWORD" -ge 4 ]; then`);
-  lines.push(`    COMPREPLY=( $(compgen -W "${TASK_STATE_VALUES.join(' ')}" -- "$cur") )`);
-  lines.push('    return 0');
-  lines.push('  fi');
   return lines.join('\n');
 }
 
@@ -460,14 +403,9 @@ function zshScript(): string {
   lines.push('    --status)');
   lines.push('      case "$cmd" in');
   lines.push(`        members) compadd ${STATE_VALUES.join(' ')} ;;`);
-  lines.push(`        task|tasks) compadd ${TASK_STATE_VALUES.join(' ')} ;;`);
   lines.push('      esac');
   lines.push('      return ;;');
   lines.push('  esac');
-  lines.push('');
-  lines.push('  if [ "$cmd" = "task" ] && [ "$verb" = "status" ] && [ "$CURRENT" -ge 5 ]; then');
-  lines.push(`    compadd ${TASK_STATE_VALUES.join(' ')}; return`);
-  lines.push('  fi');
   lines.push('');
   lines.push('  if [ "$CURRENT" -eq 2 ]; then');
   lines.push(`    compadd ${tops}; return`);

@@ -17,7 +17,6 @@ import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import {
-  STALE_DOING_TASK_MS,
   STALE_INBOX_MS,
   STALE_JOURNAL_MS,
 } from '../../../src/common.ts';
@@ -51,23 +50,6 @@ function plantInbox(filename: string, ageMs: number): string {
   return path;
 }
 
-function plantTask(
-  filename: string,
-  status: 'todo' | 'doing' | 'done' | 'blocked',
-  title: string,
-  ageMs: number
-): string {
-  const dir = join(identityRoot, 'tasks');
-  mkdirSync(dir, { recursive: true });
-  const path = join(dir, filename);
-  writeFileSync(path, `---\nstatus: ${status}\n---\n# ${title}\n`);
-  if (ageMs > 0) {
-    const t = new Date(Date.now() - ageMs);
-    utimesSync(path, t, t);
-  }
-  return path;
-}
-
 function plantJournal(filename: string, ageMs: number): string {
   const dir = join(identityRoot, 'journal');
   mkdirSync(dir, { recursive: true });
@@ -86,7 +68,6 @@ describe('evaluateDrift — clean fixtures', () => {
   it('empty identity → no drift', () => {
     const r = evaluateDrift(ID, coordRoot);
     expect(r.inbox).toBe(false);
-    expect(r.doingTask).toBe(false);
     expect(r.journal).toBe(false);
     expect(r.body).toBe('');
   });
@@ -97,15 +78,10 @@ describe('evaluateDrift — clean fixtures', () => {
     expect(r.inbox).toBe(false);
   });
 
-  it('doing-task fresher than STALE_DOING_TASK_MS → no doingTask drift', () => {
-    plantTask(
-      '1714826789010-tdoing.md',
-      'doing',
-      'in flight',
-      STALE_DOING_TASK_MS - 60_000
-    );
+  it('journal entry fresher than STALE_JOURNAL_MS → no journal drift', () => {
+    plantJournal('1714826789010-recent.md', STALE_JOURNAL_MS - 60_000);
     const r = evaluateDrift(ID, coordRoot);
-    expect(r.doingTask).toBe(false);
+    expect(r.journal).toBe(false);
   });
 });
 
@@ -145,137 +121,63 @@ describe('evaluateDrift — inbox condition', () => {
   });
 });
 
-// ─── Doing-task drift ──────────────────────────────────────────────────
-
-describe('evaluateDrift — doing-task condition', () => {
-  it('a stale doing task fires doingTask drift', () => {
-    plantTask(
-      '1714826789010-refactor-x.md',
-      'doing',
-      'refactor X',
-      STALE_DOING_TASK_MS + 60_000
-    );
-    const r = evaluateDrift(ID, coordRoot);
-    expect(r.doingTask).toBe(true);
-    expect(r.detail.staleDoingTaskTitle).toBe('refactor X');
-    expect(r.body).toContain('doing-task: "refactor X" untouched');
-  });
-
-  it('stale `todo` or `done` tasks do NOT fire (status filter)', () => {
-    plantTask(
-      '1714826789010-old-todo.md',
-      'todo',
-      'idea',
-      STALE_DOING_TASK_MS * 5
-    );
-    plantTask(
-      '1714826789020-old-done.md',
-      'done',
-      'shipped',
-      STALE_DOING_TASK_MS * 5
-    );
-    const r = evaluateDrift(ID, coordRoot);
-    expect(r.doingTask).toBe(false);
-  });
-
-  it('with multiple stale doing tasks, the longest-untouched wins for the body', () => {
-    plantTask(
-      '1714826789010-recent.md',
-      'doing',
-      'recent',
-      STALE_DOING_TASK_MS + 30 * 60_000
-    );
-    plantTask(
-      '1714826789020-ancient.md',
-      'doing',
-      'ancient',
-      STALE_DOING_TASK_MS + 5 * 60 * 60_000
-    );
-    const r = evaluateDrift(ID, coordRoot);
-    expect(r.detail.staleDoingTaskTitle).toBe('ancient');
-  });
-});
-
 // ─── Journal drift ─────────────────────────────────────────────────────
 
 describe('evaluateDrift — journal condition', () => {
-  it('done task AFTER the last journal AND journal is stale → fires', () => {
+  it('latest journal entry older than STALE_JOURNAL_MS → fires', () => {
     plantJournal(
       '1714826789010-old.md',
       STALE_JOURNAL_MS + 30 * 60_000
     );
-    plantTask(
-      '1714826789020-done.md',
-      'done',
-      'shipped',
-      10 * 60_000 // shipped 10 min ago, after the old journal
-    );
     const r = evaluateDrift(ID, coordRoot);
     expect(r.journal).toBe(true);
-    expect(r.body).toContain('No journal entry since last task→done');
+    expect(r.body).toContain('No journal entry for');
   });
 
-  it('done task BEFORE the last journal → no journal drift (already journaled)', () => {
-    plantTask(
-      '1714826789010-done.md',
-      'done',
-      'shipped',
-      STALE_JOURNAL_MS + 2 * 60 * 60_000
-    );
+  it('latest journal entry fresher than threshold → no drift', () => {
     plantJournal(
       '1714826789020-recent.md',
-      STALE_JOURNAL_MS - 60_000 // fresher than threshold
+      STALE_JOURNAL_MS - 60_000
     );
     const r = evaluateDrift(ID, coordRoot);
     expect(r.journal).toBe(false);
   });
 
-  it('no journal AND no done tasks → no journal drift', () => {
-    // Boundary: bare identity with no work yet shouldn't fire.
+  it('no journal folder → no journal drift (nothing to be stale)', () => {
+    // Bare identity with no work yet shouldn't fire.
     const r = evaluateDrift(ID, coordRoot);
     expect(r.journal).toBe(false);
   });
 
-  it('no journal AND a done task → fires (latest-journal-mtime=0 baseline)', () => {
-    plantTask(
-      '1714826789010-done.md',
-      'done',
-      'shipped',
-      10 * 60_000
+  it('latest of multiple entries is what we compare against', () => {
+    plantJournal(
+      '1714826789010-old.md',
+      STALE_JOURNAL_MS + 5 * 60 * 60_000
+    );
+    plantJournal(
+      '1714826789020-fresh.md',
+      STALE_JOURNAL_MS - 60_000
     );
     const r = evaluateDrift(ID, coordRoot);
-    expect(r.journal).toBe(true);
+    // Newest entry is fresh, so no drift.
+    expect(r.journal).toBe(false);
   });
 });
 
 // ─── Combinations + body shape ─────────────────────────────────────────
 
 describe('evaluateDrift — combinations', () => {
-  it('all three conditions fire together → body lists all three', () => {
+  it('both conditions fire together → body lists both', () => {
     plantInbox('1714826789010-aaaaaa.md', STALE_INBOX_MS + 60_000);
-    plantTask(
-      '1714826789020-stale-doing.md',
-      'doing',
-      'long-running thing',
-      STALE_DOING_TASK_MS + 60_000
-    );
     plantJournal(
       '1714826789030-old-journal.md',
       STALE_JOURNAL_MS + 60_000
     );
-    plantTask(
-      '1714826789040-done.md',
-      'done',
-      'shipped',
-      10 * 60_000
-    );
     const r = evaluateDrift(ID, coordRoot);
     expect(r.inbox).toBe(true);
-    expect(r.doingTask).toBe(true);
     expect(r.journal).toBe(true);
     expect(r.body).toContain('inbox:');
-    expect(r.body).toContain('doing-task:');
-    expect(r.body).toContain('No journal entry since last task→done');
+    expect(r.body).toContain('No journal entry for');
     expect(r.body.startsWith('Tidy check (drift detected):')).toBe(true);
   });
 
@@ -304,7 +206,6 @@ describe('evaluateDrift — resilience', () => {
     mkdirSync(scratch);
     const r = evaluateDrift(ID, coordRoot);
     expect(r.inbox).toBe(false);
-    expect(r.doingTask).toBe(false);
     expect(r.journal).toBe(false);
   });
 });

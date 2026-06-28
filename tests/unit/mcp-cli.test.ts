@@ -77,9 +77,9 @@ describe('cmdMcpCli — env contract', () => {
     };
     expect(opts.identity).toBe('alice');
     expect(opts.channel).toBe(false);
-    // Default root is ~/.local/state/coord — exact path is host-dependent,
-    // but the suffix is stable.
-    expect(opts.root.endsWith('.local/state/coord')).toBe(true);
+    // Default root is ~/.local/state/smalltalk (phase 0 rename) —
+    // exact path is host-dependent, but the suffix is stable.
+    expect(opts.root.endsWith('.local/state/smalltalk')).toBe(true);
   });
 
   it('explicit COORD_ROOT wins over the default', async () => {

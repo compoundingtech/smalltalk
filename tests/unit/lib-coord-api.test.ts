@@ -72,7 +72,6 @@ describe('coord.members', () => {
       expect(m).toHaveProperty('name');
       // Non-enriched shape: no extras.
       expect(m).not.toHaveProperty('lastActivity');
-      expect(m).not.toHaveProperty('tasks');
       expect(m).not.toHaveProperty('inbox');
     }
   });
@@ -82,13 +81,6 @@ describe('coord.members', () => {
     expect(r.length).toBeGreaterThan(0);
     for (const m of r) {
       expect(m).toHaveProperty('lastActivity');
-      expect(m).toHaveProperty('tasks');
-      expect(m.tasks).toMatchObject({
-        todo: expect.any(Number),
-        doing: expect.any(Number),
-        done: expect.any(Number),
-        blocked: expect.any(Number),
-      });
       expect(m).toHaveProperty('inbox');
     }
   });
@@ -146,10 +138,10 @@ describe('coord.overview', () => {
     expect(full.recent.length).toBeGreaterThanOrEqual(limited.recent.length);
   });
 
-  it('includes a members section enriched with task counts', () => {
+  it('includes a members section enriched with lastActivity', () => {
     const r = coord.overview();
     expect(r.members.length).toBeGreaterThan(0);
-    expect(r.members[0]).toHaveProperty('tasks');
+    expect(r.members[0]).toHaveProperty('lastActivity');
   });
 });
 
@@ -184,10 +176,10 @@ describe('coord.createIdentity', () => {
     );
   });
 
-  it('rejects a reserved name (e.g. `tasks`)', async () => {
+  it('rejects a reserved name (e.g. `journal`)', async () => {
     // RESERVED_NAMES includes folder/sidecar names + state words +
     // verb names — validIdentity guards them. Sample one.
-    await expect(coord.createIdentity('tasks')).rejects.toThrow(
+    await expect(coord.createIdentity('journal')).rejects.toThrow(
       InvalidIdentityError
     );
   });
@@ -199,16 +191,9 @@ describe('coord.createIdentity', () => {
     );
   });
 
-  it('rejects `journal` (added in brief-024)', async () => {
-    await expect(coord.createIdentity('journal')).rejects.toThrow(
-      InvalidIdentityError
-    );
-  });
-
-  it('does NOT set status or create tasks/journal folders', async () => {
+  it('does NOT set status or create the journal folder', async () => {
     await coord.createIdentity('frank');
     expect(existsSync(join(coordRoot, 'frank', 'status'))).toBe(false);
-    expect(existsSync(join(coordRoot, 'frank', 'tasks'))).toBe(false);
     expect(existsSync(join(coordRoot, 'frank', 'journal'))).toBe(false);
   });
 });
@@ -223,7 +208,6 @@ describe('public surface (brief-028)', () => {
     for (const name of [
       'inbox',
       'archive',
-      'tasks',
       'journal',
       'status',
       'unknown',

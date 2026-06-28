@@ -35,12 +35,11 @@ sync. There are no machine-local marker files inside the folder.
   (e.g. `persona.session-1.child-7`) — see issue #1. No upper bound on
   length beyond what the underlying filesystem accepts.
 - Reserved names (must not be used as an identity): `inbox`, `archive`,
-  `tasks`, `journal`, `status`, `name`, `available`, `busy`, `away`,
+  `journal`, `status`, `name`, `available`, `busy`, `away`,
   `dnd`, `offline`, `unknown`, `members`, `overview`.
 - Every identity sub-folder contains at minimum two folders: `inbox/` and
-  `archive/`. Two further optional folders, `tasks/` and `journal/`, may
-  also be present (see below). No other sub-folders are part of the
-  convention.
+  `archive/`. One further optional folder, `journal/`, may also be
+  present (see below). No other sub-folders are part of the convention.
 - An identity may *optionally* have a single-line `<identity>/name` file
   containing a human-friendly display name. Synced like everything else.
 
@@ -133,28 +132,16 @@ prefix is the canonical send time.
   been processed.
 - **`archive/`** holds messages that have been processed. Move (`mv`) is the
   only operation that puts a file in archive.
-- **`tasks/`** *(optional)* is the identity's own work queue. Each file is
-  a markdown document with optional YAML frontmatter (`priority`, `tags`,
-  `due`, `status`). Unlike `inbox/` and `archive/`, files in `tasks/` are
-  mutable — the identity owner edits them as work progresses. **Only the
-  identity owner writes here**; other participants read via sync but never
-  write. Single-writer keeps rsync convergence trivial: there is no
-  multi-machine concurrent mutation to reconcile. The folder is created
-  lazily by the CLI; an identity that has no tasks simply has no `tasks/`
-  folder. Filenames are not constrained by the inbox grammar — `coord
-  task new` defaults to `<unix-ms>-<slug>.md`, but any markdown filename
-  is accepted by readers.
 - **`journal/`** *(optional)* is the identity's own terse work log,
   audience-facing. Each entry is its own markdown file named
   `<unix-ms>-<slug>.md`, optionally with `topic` / `tags` frontmatter.
   **Only the identity owner writes here**; other participants read via
   sync. **Append-only at file granularity** — never edit an entry once
-  written, only add new ones. Distinct from `tasks/` (which carry
-  state) and from `inbox/archive/` (which are messages from others):
-  a journal entry is a short narrative from this identity to everyone
-  else. Terse by convention — a few sentences, not a stream-of-thought
-  log; if you need more, write it in a task body or a brief. The folder
-  is created lazily on first `coord journal new`.
+  written, only add new ones. Distinct from `inbox/archive/` (which are
+  messages from others): a journal entry is a short narrative from this
+  identity to everyone else. Terse by convention — a few sentences, not
+  a stream-of-thought log; if you need more, write it in a brief. The
+  folder is created lazily on first `coord journal new`.
 
 ## Append-only and rename-only
 

@@ -11,7 +11,6 @@
 //   7. Disk-full / write failure → clear error, no partial state.
 //   8. Permission errors → no crash; surface empties.
 
-import { execSync } from 'node:child_process';
 import {
   chmodSync,
   mkdirSync,
@@ -28,8 +27,6 @@ import { cmdLs } from '../../src/commands/ls.ts';
 import { cmdMembers } from '../../src/commands/members.ts';
 import { cmdRead } from '../../src/commands/read.ts';
 import { cmdStatus } from '../../src/commands/status.ts';
-import { cmdTaskNew, cmdTaskStatus } from '../../src/commands/task.ts';
-import { cmdTasks } from '../../src/commands/tasks.ts';
 import { cmdThread } from '../../src/commands/thread.ts';
 
 let scratch: string;
@@ -57,10 +54,6 @@ afterEach(() => {
 function setupIdentity(id: string): void {
   mkdirSync(join(coordRoot, id, 'inbox'), { recursive: true });
   mkdirSync(join(coordRoot, id, 'archive'), { recursive: true });
-}
-
-function envFor(id: string): NodeJS.ProcessEnv {
-  return { COORD_IDENTITY: id } as NodeJS.ProcessEnv;
 }
 
 function rememberChmod(path: string, currentMode: number): void {
@@ -96,12 +89,6 @@ describe('resilience: missing identity folder on read', () => {
     expect(r.items).toEqual([]);
   });
 
-  it('cmdTasks with identities lacking tasks/ → those identities yield no rows', () => {
-    setupIdentity('alice');
-    setupIdentity('bob');
-    const r = cmdTasks({ env: {} as NodeJS.ProcessEnv, coordRoot });
-    expect(r.items).toEqual([]);
-  });
 });
 
 // ─── Rule 2 — malformed frontmatter ────────────────────────────────────
@@ -301,68 +288,6 @@ describe('resilience: concurrent status writes', () => {
   });
 });
 
-// ─── Rule 7 — write to a non-writable path surfaces a clear error ──────
-
-describe('resilience: write failures', () => {
-  it('cmdTaskNew to a tasks dir under a chmod-000 identity folder errors loudly', () => {
-    setupIdentity('alice');
-    const aliceDir = join(coordRoot, 'alice');
-    rememberChmod(aliceDir, 0o755);
-    chmodSync(aliceDir, 0o000);
-    let caught: unknown;
-    try {
-      cmdTaskNew({
-        title: 'denied',
-        env: envFor('alice'),
-        coordRoot,
-        noEdit: true,
-      });
-    } catch (e) {
-      caught = e;
-    }
-    // The error surface is the underlying fs.ENOACCES — message
-    // should mention something like permission denied or EACCES.
-    expect(caught).toBeDefined();
-    const msg = caught instanceof Error ? caught.message : String(caught);
-    expect(/permission denied|EACCES/.test(msg)).toBe(true);
-  });
-
-  it('cmdTaskStatus on a chmod-000 task file errors but leaves the file intact', () => {
-    setupIdentity('alice');
-    cmdTaskNew({
-      title: 'preserve me',
-      env: envFor('alice'),
-      coordRoot,
-      noEdit: true,
-    });
-    const tasksDir = join(coordRoot, 'alice', 'tasks');
-    const fn = execSync(`ls "${tasksDir}" | grep "^[0-9]"`)
-      .toString()
-      .trim();
-    const path = join(tasksDir, fn);
-    const before = readFileSync(path, 'utf8');
-    chmodSync(tasksDir, 0o500); // read+exec only — can't rename
-    rememberChmod(tasksDir, 0o755);
-    let threw = false;
-    try {
-      cmdTaskStatus({
-        filename: fn,
-        state: 'doing',
-        env: envFor('alice'),
-        coordRoot,
-      });
-    } catch {
-      threw = true;
-    }
-    expect(threw).toBe(true);
-    chmodSync(tasksDir, 0o755); // restore so we can read
-    // File is intact — atomic-rename means we either succeed or
-    // the file is unchanged. No half-written state.
-    const after = readFileSync(path, 'utf8');
-    expect(after).toBe(before);
-  });
-});
-
 // ─── Rule 8 — permission-blocked reads degrade gracefully ──────────────
 
 describe('resilience: permission errors on read', () => {
@@ -385,24 +310,4 @@ describe('resilience: permission errors on read', () => {
     expect(r.matches).toEqual([]);
   });
 
-  it('chmod 000 tasks dir → cmdTasks skips it without crashing', () => {
-    setupIdentity('alice');
-    setupIdentity('bob');
-    cmdTaskNew({
-      title: 'visible',
-      env: envFor('bob'),
-      coordRoot,
-      noEdit: true,
-    });
-    const tasksDir = join(coordRoot, 'alice', 'tasks');
-    mkdirSync(tasksDir, { recursive: true });
-    rememberChmod(tasksDir, 0o755);
-    chmodSync(tasksDir, 0o000);
-    let result: ReturnType<typeof cmdTasks>;
-    expect(() => {
-      result = cmdTasks({ env: {} as NodeJS.ProcessEnv, coordRoot });
-    }).not.toThrow();
-    // Bob's task is still visible; alice's locked dir yields nothing.
-    expect(result!.items.map((t) => t.identity)).toEqual(['bob']);
-  });
 });

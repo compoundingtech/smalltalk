@@ -2,14 +2,13 @@
 //
 // Exercises the dispatcher path (runCli) and the generated-script shape for
 // each supported shell, plus the enum value sets that the spec derives from
-// the canonical SETTABLE_STATES / PRIORITIES / TASK_STATES constants.
+// the canonical SETTABLE_STATES / PRIORITIES constants.
 
 import { describe, expect, it } from 'vitest';
 
 import { runCli, type CliContext } from '../../src/cli.ts';
 import { SETTABLE_STATES } from '../../src/common.ts';
 import { PRIORITIES } from '../../src/types.ts';
-import { TASK_STATES } from '../../src/commands/task.ts';
 
 interface Capture {
   stdout: string;
@@ -104,8 +103,6 @@ describe('coord completions fish — surface', () => {
       'status',
       'members',
       'overview',
-      'task',
-      'tasks',
       'journal',
       'sync',
       'mcp',
@@ -124,14 +121,7 @@ describe('coord completions fish — surface', () => {
     );
   });
 
-  it('binds task states to `tasks --status` (4, not the 5 settable)', async () => {
-    const script = await fish();
-    expect(script).toContain(`-l status -x -a '${TASK_STATES.join(' ')}'`);
-    // The two enums must be distinct so the binding can't be a coincidence.
-    expect(SETTABLE_STATES.length).not.toBe(TASK_STATES.length);
-  });
-
-  it('offers priorities for task `--priority`', async () => {
+  it('offers priorities for `--priority`', async () => {
     const script = await fish();
     expect(script).toContain(`-l priority -x -a '${PRIORITIES.join(' ')}'`);
   });

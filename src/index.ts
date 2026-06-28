@@ -86,7 +86,6 @@ export {
 export {
   type MemberSummary,
   type MemberSummaryEnriched,
-  type MemberTaskCounts,
 } from './commands/members.ts';
 
 export {

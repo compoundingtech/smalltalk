@@ -17,7 +17,6 @@ import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import {
-  STALE_DOING_TASK_MS,
   STALE_INBOX_MS,
   STALE_JOURNAL_MS,
 } from '../../src/common.ts';
@@ -610,8 +609,8 @@ describe('cmdDingCli — arg parsing', () => {
 //
 // These tests point the fake Coord's `root` at a real /tmp scratch
 // dir so `evaluateDrift` (a real filesystem walk) can read planted
-// inbox/tasks/journal files. The watch/read/getStatus fakes are
-// unchanged — drift detection doesn't go through those methods.
+// inbox/journal files. The watch/read/getStatus fakes are unchanged
+// — drift detection doesn't go through those methods.
 
 describe('runDing — tidy-check tick', () => {
   let scratch: string;
@@ -649,16 +648,11 @@ describe('runDing — tidy-check tick', () => {
     }
     return path;
   }
-  function plantTask(
-    filename: string,
-    status: 'todo' | 'doing' | 'done' | 'blocked',
-    title: string,
-    ageMs: number
-  ): string {
-    const dir = join(identityRoot, 'tasks');
+  function plantJournal(filename: string, ageMs: number): string {
+    const dir = join(identityRoot, 'journal');
     mkdirSync(dir, { recursive: true });
     const path = join(dir, filename);
-    writeFileSync(path, `---\nstatus: ${status}\n---\n# ${title}\n`);
+    writeFileSync(path, '---\ntopic: misc\n---\nentry\n');
     if (ageMs > 0) {
       const t = new Date(Date.now() - ageMs);
       utimesSync(path, t, t);
@@ -790,13 +784,11 @@ describe('runDing — tidy-check tick', () => {
     await r.done;
   });
 
-  it('combination: inbox + doing-task → both appear in the line', async () => {
+  it('combination: inbox + stale journal → both appear in the line', async () => {
     plantInbox('1714826789010-aaaaaa.md', STALE_INBOX_MS + 60_000);
-    plantTask(
-      '1714826789020-refactor-x.md',
-      'doing',
-      'refactor X',
-      STALE_DOING_TASK_MS + 60_000
+    plantJournal(
+      '1714826789020-shipped.md',
+      STALE_JOURNAL_MS + 60_000
     );
     fake.setStatus('available');
     const r = startDing({
@@ -808,7 +800,7 @@ describe('runDing — tidy-check tick', () => {
     expect(sender.calls()).toHaveLength(1);
     const line = sender.calls()[0]!.sequences[0]!;
     expect(line).toContain('inbox=1');
-    expect(line).toContain('doing-task "refactor X" untouched');
+    expect(line).toContain('no journal entry');
     r.ac.abort();
     await r.done;
   });
@@ -863,18 +855,10 @@ describe('runDing — tidy-check tick', () => {
   // scratch + fake fixtures are still in scope.)
 
   it('opts.tidyNow injects a deterministic clock for drift age', async () => {
-    // Plant a journal entry old enough that drift would NOT fire
-    // with real Date.now (recent file mtime), but ages past
-    // STALE_JOURNAL_MS under a clock advanced 2h into the future.
-    const tdir = join(identityRoot, 'tasks');
-    mkdirSync(tdir, { recursive: true });
-    const donePath = join(tdir, '1714826789010-done.md');
-    writeFileSync(donePath, '---\nstatus: done\n---\n# shipped\n');
-    // No journal at all + a done task → tidy fires for journal lag
-    // once we move the clock forward. Without tidyNow, this test
-    // would still fire because the journal-lag baseline (no entries)
-    // makes age > STALE_JOURNAL_MS trivially true. The point of the
-    // injected clock is showing the seam works at all.
+    // Plant a journal entry with a current mtime — drift would NOT
+    // fire on real Date.now, but its age crosses STALE_JOURNAL_MS
+    // once the clock is advanced 2h into the future.
+    plantJournal('1714826789010-shipped.md', 0);
     fake.setStatus('available');
     const fixed = Date.now() + 2 * 60 * 60_000;
     const r = startDing({

@@ -24,11 +24,7 @@ describe('CHANNEL_INSTRUCTIONS — load-bearing substrings', () => {
     'coord_msg_reply',
     // Peer discovery
     'coord_members',
-    // Task verbs (Phase 8 MCP tools stay parked; CLI shell-out is the contract)
-    'coord task new',
-    'coord task status',
-    'coord task done',
-    // Journal verb (brief-025 — narrative counterpart to tasks; CLI shell-out)
+    // Journal verb (brief-025 — narrative work record; CLI shell-out)
     'coord journal new',
     // Channel-arrival message format
     '<channel source="coord"',
@@ -52,9 +48,7 @@ describe('CHANNEL_INSTRUCTIONS — load-bearing substrings', () => {
     expect(CHANNEL_INSTRUCTIONS.split('\n').length).toBeGreaterThanOrEqual(10);
   });
 
-  it('mentions tasks as the work-record concept', () => {
-    // Soft-bound check: "task" is overloaded in software, so we look
-    // for the verb-phrasing the ritual uses.
-    expect(CHANNEL_INSTRUCTIONS).toMatch(/task file|task new|tasks\//i);
+  it('mentions journal as the narrative work record', () => {
+    expect(CHANNEL_INSTRUCTIONS).toMatch(/journal new|journal\//i);
   });
 });

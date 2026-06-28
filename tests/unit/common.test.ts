@@ -99,7 +99,6 @@ describe('constants', () => {
     for (const name of [
       'inbox',
       'archive',
-      'tasks',
       'journal', // brief-024
       'status',
       'name',
@@ -561,9 +560,9 @@ describe('path helpers', () => {
     );
   });
 
-  it('coordRootFrom falls back to ~/.local/state/coord', () => {
+  it('coordRootFrom falls back to ~/.local/state/smalltalk', () => {
     const v = coordRootFrom({} as NodeJS.ProcessEnv);
-    expect(v.endsWith('.local/state/coord')).toBe(true);
+    expect(v.endsWith('.local/state/smalltalk')).toBe(true);
   });
 
   it('coordConfigFrom honors $COORD_CONFIG', () => {

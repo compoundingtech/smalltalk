@@ -29,7 +29,7 @@ const membersInputShape = {
     .boolean()
     .optional()
     .describe(
-      'Include lastActivity, task counts, and inbox unread count per identity.'
+      'Include lastActivity and inbox unread count per identity.'
     ),
 };
 
@@ -41,16 +41,7 @@ const memberShape = {
     .number()
     .nullable()
     .optional()
-    .describe('Newest mtime under <id>/ across inbox/archive/tasks/status. Enriched only.'),
-  tasks: z
-    .object({
-      todo: z.number().int().nonnegative(),
-      doing: z.number().int().nonnegative(),
-      done: z.number().int().nonnegative(),
-      blocked: z.number().int().nonnegative(),
-    })
-    .optional()
-    .describe('Count of tasks by status. Enriched only.'),
+    .describe('Newest mtime under <id>/ across inbox/archive/status. Enriched only.'),
   inbox: z
     .number()
     .int()
@@ -72,7 +63,7 @@ export function registerMembersTool(mcp: McpServer, coord: Coord): void {
     {
       title: 'Enumerate coord identities',
       description:
-        'Equivalent to `coord members`. Enumerate identities present in $COORD_ROOT with their effective status. Pass `enrich: true` to include `lastActivity`, task counts, and inbox unread count per identity. Useful for peer discovery before sending — call this when you need to know who\'s available to message.',
+        'Equivalent to `coord members`. Enumerate identities present in $COORD_ROOT with their effective status. Pass `enrich: true` to include `lastActivity` and inbox unread count per identity. Useful for peer discovery before sending — call this when you need to know who\'s available to message.',
       inputSchema: membersInputShape,
       outputSchema: membersOutputShape,
     },
