@@ -6,6 +6,34 @@ minor releases until 1.0.
 
 ## Unreleased
 
+### Added (brief-009 item 5 — `resources/` surface)
+
+A third optional per-identity folder for publishing annotated URLs to
+peers. Each resource is `<unix-ms>-<rand6>.md` with `url:` in
+frontmatter (required) and optional `title:` / `tags:` / body
+description. Mirrors the inbox-vs-archive single-writer rule:
+`resources/` is owned by its identity; peers read via sync.
+
+- **CLI:** `coord resource add <url> [--title T] [--tag T,T] [--body-stdin]`,
+  `coord resource ls [<identity>] [--json]`, `coord resource read
+  [<identity>] <filename> [--json]`, `coord resource rm <filename>`.
+- **SDK:** `coord.resources.{add,list,read,remove}` on the Coord
+  handle. New types `Resource` + `ResourceWithLocation` re-exported
+  from `@myobie/coord`.
+- **MCP:** four new tools, dual-prefixed (`coord_resource_*` +
+  `st_resource_*`) — `resource_add`, `resource_ls`, `resource_read`,
+  `resource_remove`. Available in both channel and non-channel modes.
+- **LAYOUT.md** documents the new folder + frontmatter shape.
+- **RESERVED_NAMES** adds `resources` so an identity can't shadow the
+  folder name.
+- **New errors:** `ResourceNotFoundError`, `InvalidResourceUrlError`.
+- **VERSION** bumps to `0.6.0`.
+
+URL validation is intentionally lenient: any string with a scheme
+prefix (`https://`, `pty://`, anything else an agent invents) is
+accepted. The `pty://<session-name>` convention is documented but
+not enforced.
+
 ### Docs (brief-009 add-on — onboard-a-friend support)
 
 Three new notes added, plus a small update to an existing one, to
