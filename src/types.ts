@@ -143,11 +143,17 @@ export function deriveTs(filename: Filename): number {
  * peers. Lives at `<root>/<identity>/resources/<filename>.md` with the
  * url in frontmatter and an optional description in the body. Per
  * brief-009 item 5.
+ *
+ * `relation` is **very optional** — it's never inferred and the bare
+ * URL stays first-class. Canonical (but non-enforced) values:
+ * `owns` / `relates-to` / `depends-on`. Agents may invent their own
+ * relation strings.
  */
 export interface Resource {
   url: string;
   title?: string;
   tags?: string[];
+  relation?: string;
   body: string;
 }
 

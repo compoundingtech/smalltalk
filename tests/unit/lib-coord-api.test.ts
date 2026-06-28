@@ -245,13 +245,23 @@ describe('coord.resources', () => {
       url: 'https://example.com',
       title: 'eg',
       tags: ['a', 'b'],
+      relation: 'owns',
       body: 'desc\n',
     });
     const r = await coord.resources.read(asIdentity('alice'), fn);
     expect(r.url).toBe('https://example.com');
     expect(r.title).toBe('eg');
     expect(r.tags).toEqual(['a', 'b']);
+    expect(r.relation).toBe('owns');
     expect(r.body).toContain('desc');
+  });
+
+  it('relation is absent on the returned Resource when not set on add', async () => {
+    const fn = await coord.resources.add({
+      url: 'https://example.com',
+    });
+    const r = await coord.resources.read(asIdentity('alice'), fn);
+    expect(r.relation).toBeUndefined();
   });
 
   it('remove deletes the file; subsequent list shows it gone', async () => {

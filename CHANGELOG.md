@@ -10,13 +10,14 @@ minor releases until 1.0.
 
 A third optional per-identity folder for publishing annotated URLs to
 peers. Each resource is `<unix-ms>-<rand6>.md` with `url:` in
-frontmatter (required) and optional `title:` / `tags:` / body
-description. Mirrors the inbox-vs-archive single-writer rule:
+frontmatter (required) and optional `title:` / `tags:` / `relation:`
+/ body description. Mirrors the inbox-vs-archive single-writer rule:
 `resources/` is owned by its identity; peers read via sync.
 
-- **CLI:** `coord resource add <url> [--title T] [--tag T,T] [--body-stdin]`,
-  `coord resource ls [<identity>] [--json]`, `coord resource read
-  [<identity>] <filename> [--json]`, `coord resource rm <filename>`.
+- **CLI:** `coord resource add <url> [--title T] [--tag T,T]
+  [--relation REL] [--body-stdin]`, `coord resource ls [<identity>]
+  [--json]`, `coord resource read [<identity>] <filename> [--json]`,
+  `coord resource rm <filename>`.
 - **SDK:** `coord.resources.{add,list,read,remove}` on the Coord
   handle. New types `Resource` + `ResourceWithLocation` re-exported
   from `@myobie/coord`.
@@ -33,6 +34,12 @@ URL validation is intentionally lenient: any string with a scheme
 prefix (`https://`, `pty://`, anything else an agent invents) is
 accepted. The `pty://<session-name>` convention is documented but
 not enforced.
+
+The `relation:` field is **very optional** — absent by default,
+**never inferred** from the URL / title / tags. The bare URL stays
+first-class with or without it. Canonical (non-enforced) values:
+`owns`, `relates-to`, `depends-on`. Agents may invent their own
+relation strings; the schema is free-form.
 
 ### Docs (brief-009 add-on — onboard-a-friend support)
 

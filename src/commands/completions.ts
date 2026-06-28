@@ -154,10 +154,14 @@ const COMMANDS: readonly CommandSpec[] = [
     verbs: [
       {
         name: 'add',
-        desc: 'Add a resource (a URL with optional title/tags/body)',
+        desc: 'Add a resource (a URL with optional title/tags/relation/body)',
         flags: [
           { name: 'title', desc: 'One-line title' },
           { name: 'tag', desc: 'Comma-separated tags' },
+          {
+            name: 'relation',
+            desc: 'Free-form relation (canonical: owns | relates-to | depends-on)',
+          },
           { name: 'body-stdin', desc: 'Read body description from stdin' },
         ],
       },
