@@ -182,7 +182,7 @@ What we're using today:
 Future structural enforcement (deferred):
 
 - A PreToolUse soft-warning hook that fires when the manager is about to Edit/Write inside implementation paths (`src/`, `lib/`, `tests/`) — warns to stderr, doesn't block. Catches drift without amputating the toolbox. ~20 lines of bash.
-- An external task tracker (could be coord itself — write briefs/tasks/state into a shared coord identity, agents read from there). Workflow state outside the context window. The `tasks/` folder per identity ships today (brief-015); `journal/` (brief-024) is the narrative counterpart — a manager can read a worker's recent `coord journal tail` to follow what they're thinking without interrupting.
+- An external task tracker (could be coord itself — write briefs/state into a shared coord identity, agents read from there). Workflow state outside the context window. Earlier `tasks/` (brief-015) and `journal/` (brief-024) folders prototyped this; both were removed in brief-009's slim-down. A future formal mechanism may revive a piece of this — see [actor-model.md](actor-model.md) for the framing.
 - Per-role env vars surfaced in pty session tags (already partially there via `#role=agent`).
 
 None of these are needed today. Worth revisiting if prompt-layer enforcement repeatedly fails.
