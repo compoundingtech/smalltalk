@@ -1,17 +1,21 @@
-// commands/members.ts — enumerate identities under $COORD_ROOT.
+// commands/agents.ts — enumerate agents under $ST_ROOT.
 //
-// "Roster" verb: walks `<root>/<*>` and reports every identity-shaped
+// "Roster" verb: walks `<root>/<*>` and reports every agent-shaped
 // sub-folder (one with at least one of inbox/ or archive/). Plain
-// filesystem read, no resolveIdentity — does not auto-create or mutate
-// anything for the identities it walks.
+// filesystem read, no resolveAgent — does not auto-create or mutate
+// anything for the agents it walks.
 //
-//   coord members                  # text, sorted alphabetically
-//   coord members --status STATE   # filter to a single status
-//   coord members --json           # machine-readable
-//   coord members --json --enrich  # + lastActivity, inbox count
+//   coord agents                  # text, sorted alphabetically
+//   coord agents --status STATE   # filter to a single status
+//   coord agents --json           # machine-readable
+//   coord agents --json --enrich  # + lastActivity, inbox count
 //
-// Reserved as an identity name in common.ts so no one can collide
-// with the verb's namespace.
+// brief-009 item 3 (rename): `members` is the deprecated alias of this
+// verb. Both spellings work; CLI + MCP both dual-register. The type
+// names below — MemberSummary / MemberSummaryEnriched / MembersInput /
+// MembersResult / GetMembersOpts — keep the legacy "Members" prefix
+// for back-compat re-exports. New code should prefer the Agent*
+// aliases declared at the bottom of this file.
 
 import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
 import { join } from 'node:path';
@@ -22,61 +26,63 @@ import {
   inboxDir,
   RESERVED_NAMES,
   statusPath,
+  validAgent,
   validFilename,
-  validIdentity,
 } from '../common.ts';
 import { type State } from '../types.ts';
 
 import { readIdentityStatus } from './status.ts';
 
-export interface MemberSummary {
+export interface AgentSummary {
+  /** The agent's name. Field kept as `identity` for back-compat with
+   *  embedder destructures; will rename to `agent` in a follow-up. */
   identity: string;
   status: State;
   name: string | null;
 }
 
-export interface MemberSummaryEnriched extends MemberSummary {
-  /** Newest mtime across inbox/archive/status, or null if
-   * nothing at all under the identity has been touched. */
+export interface AgentSummaryEnriched extends AgentSummary {
+  /** Newest mtime across inbox/archive/status, or null if nothing at
+   *  all under the agent has been touched. */
   lastActivity: number | null;
-  /** Count of valid-grammar files in <id>/inbox/ (mirrors `coord ls --count`). */
+  /** Count of valid-grammar files in <agent>/inbox/ (mirrors `coord ls
+   *  --count`). */
   inbox: number;
 }
 
-export interface MembersInput {
+export interface AgentsInput {
   status?: string | undefined;
   enrich?: boolean | undefined;
   coordRoot: string;
 }
 
-export interface MembersResult<TEnriched extends boolean = false> {
-  items: TEnriched extends true ? MemberSummaryEnriched[] : MemberSummary[];
+export interface AgentsResult<TEnriched extends boolean = false> {
+  items: TEnriched extends true ? AgentSummaryEnriched[] : AgentSummary[];
 }
 
 // ─── Core ───────────────────────────────────────────────────────────────
 
-export interface GetMembersOpts {
-  /** Filter to identities whose effective status matches. */
+export interface GetAgentsOpts {
+  /** Filter to agents whose effective status matches. */
   status?: string | undefined;
-  /** When true, return MemberSummaryEnriched[]; otherwise MemberSummary[]. */
+  /** When true, return AgentSummaryEnriched[]; otherwise AgentSummary[]. */
   enrich?: boolean | undefined;
 }
 
 /**
- * Pure library-shaped enumeration. Same computation as {@link cmdMembers}
+ * Pure library-shaped enumeration. Same computation as {@link cmdAgents}
  * but takes positional `root` and returns the bare array (no `{items}`
- * envelope) — what `coord.members(...)` exposes to embedders per
- * brief-028.
+ * envelope) — what `coord.agents(...)` exposes to embedders.
  *
- * Read-only: walks `<root>/*` and consults each identity's status / name
- * / inbox. No writes.
+ * Read-only: walks `<root>/*` and consults each agent's status / name /
+ * inbox. No writes.
  */
-export function getMembers(
+export function getAgents(
   root: string,
-  opts: GetMembersOpts = {}
-): MemberSummary[] | MemberSummaryEnriched[] {
-  const ids = listIdentities(root);
-  const base: MemberSummary[] = ids.map((id) => ({
+  opts: GetAgentsOpts = {}
+): AgentSummary[] | AgentSummaryEnriched[] {
+  const ids = listAgents(root);
+  const base: AgentSummary[] = ids.map((id) => ({
     identity: id,
     status: readIdentityStatus(id, root),
     name: readNameFile(id, root),
@@ -88,7 +94,7 @@ export function getMembers(
   if (opts.enrich !== true) {
     return filtered;
   }
-  const enriched: MemberSummaryEnriched[] = filtered.map((m) => ({
+  const enriched: AgentSummaryEnriched[] = filtered.map((m) => ({
     ...m,
     lastActivity: computeLastActivity(m.identity, root),
     inbox: computeInboxCount(m.identity, root),
@@ -97,40 +103,39 @@ export function getMembers(
 }
 
 /**
- * CLI-shaped wrapper retained for backward compatibility: keeps the
- * `{items}` envelope return shape and the input-object signature that
- * existing callers (the MCP coord_members tool, overview.ts, the
- * existing test suite) depend on. Delegates to {@link getMembers}; do
- * not duplicate logic here.
+ * CLI-shaped wrapper: keeps the `{items}` envelope return shape and the
+ * input-object signature that existing callers (the MCP tools,
+ * overview.ts, the existing test suite) depend on. Delegates to
+ * {@link getAgents}; do not duplicate logic here.
  */
-export function cmdMembers(
-  input: MembersInput
-): MembersResult<false> | MembersResult<true> {
-  const items = getMembers(input.coordRoot, {
+export function cmdAgents(
+  input: AgentsInput
+): AgentsResult<false> | AgentsResult<true> {
+  const items = getAgents(input.coordRoot, {
     ...(input.status !== undefined && { status: input.status }),
     ...(input.enrich !== undefined && { enrich: input.enrich }),
   });
   if (input.enrich === true) {
-    return { items: items as MemberSummaryEnriched[] };
+    return { items: items as AgentSummaryEnriched[] };
   }
-  return { items: items as MemberSummary[] };
+  return { items: items as AgentSummary[] };
 }
 
 // ─── Helpers (exported for overview.ts) ─────────────────────────────────
 
 /**
- * Walk `<root>/*` and return identity-shaped subfolders.
+ * Walk `<root>/*` and return agent-shaped subfolders.
  *
  * Filters:
  *   - skip dotfiles (defensive; nothing in coord uses them today)
  *   - skip non-directories
  *   - skip reserved names (defensive)
- *   - keep only names where validIdentity(name) holds AND at least
- *     one of `<name>/inbox`, `<name>/archive` exists
+ *   - keep only names where validAgent(name) holds AND at least one of
+ *     `<name>/inbox`, `<name>/archive` exists
  *
  * Returns alphabetically sorted.
  */
-export function listIdentities(root: string): string[] {
+export function listAgents(root: string): string[] {
   let entries: string[];
   try {
     entries = readdirSync(root);
@@ -141,7 +146,7 @@ export function listIdentities(root: string): string[] {
   for (const name of entries) {
     if (name.startsWith('.')) continue;
     if (RESERVED_NAMES.includes(name)) continue;
-    if (!validIdentity(name)) continue;
+    if (!validAgent(name)) continue;
     const dir = join(root, name);
     let st: ReturnType<typeof statSync>;
     try {
@@ -173,7 +178,7 @@ function readNameFile(id: string, root: string): string | null {
   }
 }
 
-/** Newest mtime across inbox/archive/status under <id>/. */
+/** Newest mtime across inbox/archive/status under <agent>/. */
 export function computeLastActivity(
   identity: string,
   root: string
@@ -232,13 +237,14 @@ function isDir(p: string): boolean {
 
 // ─── CLI wrapper ────────────────────────────────────────────────────────
 
-const MEMBERS_HELP =
-  'usage: coord members [--status STATE] [--json [--enrich]]\n\n' +
-  '  Enumerate every identity under $COORD_ROOT — i.e. any\n' +
-  '  sub-folder with at least one of inbox/ or archive/.\n' +
-  '  Sorted alphabetically. Plain read; does not mutate state.\n';
+const AGENTS_HELP =
+  'usage: coord agents [--status STATE] [--json [--enrich]]\n\n' +
+  '  Enumerate every agent under $ST_ROOT — i.e. any sub-folder\n' +
+  '  with at least one of inbox/ or archive/. Sorted alphabetically.\n' +
+  '  Plain read; does not mutate state.\n\n' +
+  '  Note: `coord members` is the deprecated alias of this verb.\n';
 
-export function cmdMembersCli(
+export function cmdAgentsCli(
   args: readonly string[],
   ctx: CliContext
 ): number {
@@ -259,7 +265,7 @@ export function cmdMembersCli(
         break;
       case '-h':
       case '--help':
-        ctx.stderr(MEMBERS_HELP);
+        ctx.stderr(AGENTS_HELP);
         return 0;
       default:
         throw new Error(`unknown flag: ${a}`);
@@ -268,7 +274,7 @@ export function cmdMembersCli(
   if (enrich && !json) {
     throw new Error('--enrich requires --json');
   }
-  const r = cmdMembers({
+  const r = cmdAgents({
     ...(status !== undefined && { status }),
     enrich,
     coordRoot: ctx.coordRoot,
@@ -282,3 +288,28 @@ export function cmdMembersCli(
   }
   return 0;
 }
+
+// ─── Deprecated aliases (brief-009 item 3) ─────────────────────────────
+//
+// `members` was renamed to `agents`. The old names remain as
+// @deprecated value-aliases pointing at the new exports for one
+// release cycle so existing imports keep compiling.
+
+/** @deprecated Use {@link AgentSummary}. */
+export type MemberSummary = AgentSummary;
+/** @deprecated Use {@link AgentSummaryEnriched}. */
+export type MemberSummaryEnriched = AgentSummaryEnriched;
+/** @deprecated Use {@link AgentsInput}. */
+export type MembersInput = AgentsInput;
+/** @deprecated Use {@link AgentsResult}. */
+export type MembersResult<TEnriched extends boolean = false> = AgentsResult<TEnriched>;
+/** @deprecated Use {@link GetAgentsOpts}. */
+export type GetMembersOpts = GetAgentsOpts;
+/** @deprecated Use {@link getAgents}. */
+export const getMembers = getAgents;
+/** @deprecated Use {@link cmdAgents}. */
+export const cmdMembers = cmdAgents;
+/** @deprecated Use {@link cmdAgentsCli}. */
+export const cmdMembersCli = cmdAgentsCli;
+/** @deprecated Use {@link listAgents}. */
+export const listIdentities = listAgents;

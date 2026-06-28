@@ -90,7 +90,7 @@ describe('createMcpServer — construction', () => {
         root: coordRoot,
         identity: 'INVALID' as unknown as ReturnType<typeof asIdentity>,
       })
-    ).toThrowError(/invalid identity/);
+    ).toThrowError(/invalid (agent name|identity)/);
   });
 });
 
@@ -158,6 +158,7 @@ describe('createMcpServer — tool name registry', () => {
       'coord_msg_archive',
       'coord_msg_thread',
       'coord_members',
+      'coord_agents',
       'coord_resource_add',
       'coord_resource_ls',
       'coord_resource_read',
@@ -168,6 +169,7 @@ describe('createMcpServer — tool name registry', () => {
       'st_msg_archive',
       'st_msg_thread',
       'st_members',
+      'st_agents',
       'st_resource_add',
       'st_resource_ls',
       'st_resource_read',

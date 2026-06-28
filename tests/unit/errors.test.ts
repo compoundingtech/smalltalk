@@ -51,23 +51,23 @@ describe('IdentityRequiredError', () => {
   });
 });
 
-describe('IdentityNotHostedError', () => {
-  it('mentions the identity name + mkdir hint', () => {
+describe('IdentityNotHostedError (alias of AgentNotHostedError)', () => {
+  it('mentions the agent name + mkdir hint', () => {
     const err = new IdentityNotHostedError('ghost');
     expect(err.code).toBe('IDENTITY_NOT_HOSTED');
     expect(err.identity).toBe('ghost');
-    expect(err.message).toContain('identity folder missing for ghost');
+    expect(err.message).toContain('agent folder missing for ghost');
     expect(err.message).toContain('mkdir -p');
     expect(err.details).toEqual({ identity: 'ghost' });
   });
 });
 
-describe('InvalidIdentityError', () => {
+describe('InvalidIdentityError (alias of InvalidAgentError)', () => {
   it('round-trips the value', () => {
     const err = new InvalidIdentityError('INVALID');
     expect(err.code).toBe('INVALID_IDENTITY');
     expect(err.value).toBe('INVALID');
-    expect(err.message).toBe('invalid identity: INVALID');
+    expect(err.message).toBe('invalid agent name: INVALID');
   });
 });
 

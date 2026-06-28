@@ -139,7 +139,7 @@ describe('cmdArchive — input validation', () => {
   it('errors with mkdir hint when identity folder is missing', () => {
     expect(() =>
       cmdArchive(archiveInput({ recipient: 'ghost' }))
-    ).toThrowError(/identity folder missing/);
+    ).toThrowError(/(agent|identity) folder missing/);
   });
 
   it('falls back to COORD_IDENTITY when recipient omitted', () => {
@@ -269,7 +269,7 @@ describe('cmdArchiveTrim — empty / non-existent archive', () => {
     rmSync(join(coordRoot, 'bob', 'archive'), { recursive: true });
     expect(() =>
       cmdArchiveTrim(trimInput({ keepLast: 100 }))
-    ).toThrowError(/identity folder missing/);
+    ).toThrowError(/(agent|identity) folder missing/);
   });
 });
 

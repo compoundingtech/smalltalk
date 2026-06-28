@@ -21,7 +21,7 @@ import { cmdDingCli } from './commands/ding.ts';
 import { cmdInitCli } from './commands/init.ts';
 import { cmdLsCli } from './commands/ls.ts';
 import { cmdMcpCli } from './commands/mcp.ts';
-import { cmdMembersCli } from './commands/members.ts';
+import { cmdAgentsCli } from './commands/agents.ts';
 import { cmdOverviewCli } from './commands/overview.ts';
 import { cmdReadCli } from './commands/read.ts';
 import { cmdResourceCli } from './commands/resource.ts';
@@ -80,7 +80,7 @@ const TOP_LEVEL_USAGE =
   `                     [--interval MS] [--once]\n` +
   `                     default: watch your own inbox; --all is cross-tree\n` +
   `  status [<identity>] [--set <state>]\n` +
-  `  members [--status STATE] [--json [--enrich]]\n` +
+  `  agents [--status STATE] [--json [--enrich]]    (alias: members)\n` +
   `  overview [--recent N] [--json]\n\n` +
   `Resources:\n` +
   `  resource add <url> [--title T] [--tag T,T] [--body-stdin]\n` +
@@ -181,8 +181,9 @@ export async function runCli(
         return await cmdWatchCli(rest, ctx);
       case 'status':
         return cmdStatusCli(rest, ctx);
+      case 'agents':
       case 'members':
-        return cmdMembersCli(rest, ctx);
+        return cmdAgentsCli(rest, ctx);
       case 'overview':
         return cmdOverviewCli(rest, ctx);
       case 'sync':

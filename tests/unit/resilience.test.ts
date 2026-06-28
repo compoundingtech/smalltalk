@@ -24,7 +24,7 @@ import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import { cmdLs } from '../../src/commands/ls.ts';
-import { cmdMembers } from '../../src/commands/members.ts';
+import { cmdMembers } from '../../src/commands/agents.ts';
 import { cmdRead } from '../../src/commands/read.ts';
 import { cmdStatus } from '../../src/commands/status.ts';
 import { cmdThread } from '../../src/commands/thread.ts';

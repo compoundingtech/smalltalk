@@ -251,7 +251,7 @@ describe('cmdRead — errors', () => {
   it('unknown identity → mkdir hint', () => {
     expect(() =>
       cmdRead(baseInput({ recipient: 'ghost' }))
-    ).toThrowError(/identity folder missing/);
+    ).toThrowError(/(agent|identity) folder missing/);
   });
 
   it('no recipient + no COORD_IDENTITY → identity-required error', () => {

@@ -16,7 +16,7 @@ import {
   listIdentities,
   type MemberSummary,
   type MemberSummaryEnriched,
-} from '../../src/commands/members.ts';
+} from '../../src/commands/agents.ts';
 
 let scratch: string;
 let coordRoot: string;

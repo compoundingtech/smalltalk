@@ -6,6 +6,61 @@ minor releases until 1.0.
 
 ## Unreleased
 
+### Renamed (brief-009 item 3 — identity → agent)
+
+**Soft-breaking with a deprecation chain.** The project's primary
+noun changed from `identity` to `agent`. Every old name is kept as a
+deprecated alias for one release cycle, so existing embedders /
+running agents / consuming pty.toml configs all keep working
+unchanged. Cos coordinates the per-machine pty.toml sweep over the
+~8 downstream repos at her own pace.
+
+- **SDK types:** `Agent` brand (replaces `Identity`); `asAgent` /
+  `isAgent` (replace `asIdentity` / `isIdentity`). Old names are
+  `@deprecated` re-exports pointing at the new brand — values are
+  interchangeable.
+- **SDK errors:** `AgentRequiredError` / `AgentNotHostedError` /
+  `InvalidAgentError`. Old `Identity*Error` names are `@deprecated`
+  consts aliased to the new classes — `instanceof` works either way.
+  Error CODE strings (`IDENTITY_REQUIRED`, `IDENTITY_NOT_HOSTED`,
+  `INVALID_IDENTITY`) stay stable as wire format. Error MESSAGE
+  text changed ("identity required" → "agent required", etc.).
+- **CLI verb:** `coord agents` (canonical) + `coord members`
+  (deprecated alias) — both dispatch to the same handler.
+- **MCP tool:** `coord_agents` + `st_agents` registered as the
+  canonical names; `coord_members` + `st_members` kept as deprecated
+  aliases pointing at the same handler. All four tool names work.
+- **Env vars (cos coordinates):** `ST_AGENT` (preferred) → `ST_IDENTITY`
+  (deprecated, warns once per process) → `COORD_IDENTITY` (legacy,
+  warns once per process). The `[smalltalk] honoring … — migrate to
+  ST_AGENT when convenient` notice fires per legacy hit. Per-machine
+  `pty.toml` env blocks should migrate from `COORD_IDENTITY` /
+  `ST_IDENTITY` to `ST_AGENT` at cos's pace; no flag day required.
+- **SDK helpers:** `resolveAgent` / `envAgentFrom` (replace
+  `resolveIdentity` / `envIdentityFrom`). Old names aliased.
+- **Internal:** `validAgent` (replaces `validIdentity`); `cmdAgents`
+  / `cmdAgentsCli` / `getAgents` / `listAgents` (replace `cmdMembers`
+  / `cmdMembersCli` / `getMembers` / `listIdentities`). All old
+  names aliased.
+- **RESERVED_NAMES:** adds `agents`; keeps `members` (deprecated CLI
+  verb name).
+- **Field names on returned shapes** (e.g.
+  `MessageWithLocation.identity`, `Overview.members`) — KEPT as-is
+  for one release for back-compat with embedder destructures. A
+  follow-up release will rename them to `.agent` / `.agents`.
+- **`<channel source="coord" from="…">`** — KEPT as-is. Phase 5 of
+  brief-005 (the `coord_*` tool-name drop) owns flipping this to
+  `source="st"`.
+- **VERSION** bumps to `0.7.0`.
+- **Docs:** README, LAYOUT.md updated to lead with "agent" and the
+  three-level env-var fallback.
+
+Downstream sweep (cos owns): `[sessions.*.env].COORD_IDENTITY` (or
+`ST_IDENTITY`) → `ST_AGENT` across ~8 pty.toml repos; agent boot
+rituals referencing `coord_members` / `coord members` →
+`coord_agents` / `coord agents`. Three-level fallback means nothing
+breaks mid-sweep.
+
 ### Added (brief-009 item 5 — `resources/` surface)
 
 A third optional per-identity folder for publishing annotated URLs to
