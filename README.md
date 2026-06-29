@@ -7,6 +7,11 @@ convention. The folder is the API: `<identity>/inbox/` and
 
 - **Convention:** [LAYOUT.md](LAYOUT.md) — the binding spec.
 - **Philosophy:** [IDEA.md](IDEA.md).
+- **Framing:** [notes/actor-model.md](notes/actor-model.md) — how
+  smalltalk realizes the actor model in folders and files.
+- **Onboarding:** [notes/onboarding.md](notes/onboarding.md) —
+  zero-to-first-message for a new participant.
+- **Repo ownership convention:** [notes/repo-ownership.md](notes/repo-ownership.md).
 - **Walkthrough:** [notes/walkthrough.md](notes/walkthrough.md) — three
   participants, three machines, an end-to-end play.
 - **Loss argument:** [notes/PROOF.md](notes/PROOF.md).

@@ -6,6 +6,34 @@ minor releases until 1.0.
 
 ## Unreleased
 
+### Docs (brief-009 add-on — onboard-a-friend support)
+
+Three new notes added, plus a small update to an existing one, to
+bring narrative docs in line with the slimmed-down surface and to
+name the actor-model framing the system has always implicitly
+assumed:
+
+- **`notes/actor-model.md`** *(new)*: maps actor-model concepts —
+  actor / mailbox / state / encapsulation / asynchrony — to coord's
+  data shape. Provides the framing that makes the encapsulation rule
+  ("across identities, only `inbox/` is writable") and the
+  Coord-threads-stay-on-coord rule fall out as obvious consequences
+  rather than ad-hoc conventions.
+- **`notes/onboarding.md`** *(new)*: public zero-to-first-message
+  recipe for a fresh participant (human or agent). Covers install,
+  identity pick, status, send/receive, MCP wiring, and sync. The
+  pre-existing `notes/agent-onboarding.md` is `.gitignore`'d (it's a
+  myobie-specific machine runbook); this is the shippable
+  counterpart.
+- **`notes/repo-ownership.md`** *(new)*: codifies the
+  `<repo>-claude` identity-naming convention and notes where the
+  binding actually lives at runtime (`pty.toml`, `.mcp.json`). Points
+  to brief-009 item 5 (resources) as the formal mechanism that will
+  supersede the convention.
+- **`notes/agent-roles.md`** *(minor update)*: reframed the future
+  "external task tracker" paragraph to acknowledge tasks/journal are
+  gone and point at the actor-model doc.
+
 ### Removed (brief-009 item 2 — `journal/` surface gone)
 
 **Breaking.** The `journal/` folder and every CLI/MCP surface that
