@@ -3,6 +3,6 @@ import { VERSION } from '../../src/index.ts';
 
 describe('scaffold', () => {
   it('exports the current package VERSION', () => {
-    expect(VERSION).toBe('0.7.0');
+    expect(VERSION).toBe('0.8.0');
   });
 });

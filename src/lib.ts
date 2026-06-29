@@ -32,7 +32,9 @@ import {
   cmdArchive,
   cmdArchiveTrim,
 } from './commands/archive.ts';
+import { runDing, type DingDeps } from './commands/ding.ts';
 import { cmdLs } from './commands/ls.ts';
+import { filenameTimestamp } from './common.ts';
 import {
   getAgents,
   type AgentSummary,
@@ -132,8 +134,34 @@ export interface TrimOptions {
   keepLast?: number;
   /** When true, return the victim list without deleting. */
   dryRun?: boolean;
+  /**
+   * Issue #8: when true, delete prefix-sibling attachments alongside
+   * the canonical `.md` victims. Default false preserves the
+   * LAYOUT-004 "coord owns only the .md" semantic.
+   */
+  withAttachments?: boolean;
   /** Override now() for deterministic --older-than testing. */
   now?: () => number;
+}
+
+export interface ArchiveOptions {
+  /**
+   * Issue #8: when true, also move prefix-sibling attachments — every
+   * file in inbox/ whose `<unix-ms>-<rand6>` prefix matches the
+   * canonical `.md`. Default false preserves the LAYOUT-004 "coord
+   * owns only the .md" semantic.
+   */
+  withAttachments?: boolean;
+}
+
+/**
+ * One orphan attachment entry as returned by {@link Coord.lsOrphans}.
+ * `ts` is parsed from the LAYOUT prefix `<unix-ms>`; orphans have no
+ * frontmatter to project.
+ */
+export interface OrphanItem {
+  filename: Filename;
+  ts: number;
 }
 
 export interface ThreadOptions {
@@ -189,8 +217,24 @@ export interface Coord {
     filename: Filename,
     opts?: ReadOptions
   ): Promise<MessageWithLocation>;
-  archive(identity: Identity, filename: Filename): Promise<void>;
+  archive(
+    identity: Identity,
+    filename: Filename,
+    opts?: ArchiveOptions
+  ): Promise<void>;
   archiveTrim(identity: Identity, opts: TrimOptions): Promise<Filename[]>;
+  /**
+   * Issue #8: list prefix-sibling attachments in `<identity>/inbox/`
+   * (or `<identity>/archive/` with opts.archive) whose canonical `.md`
+   * is no longer present in the same folder — i.e. orphans left behind
+   * when a `.md` was archived without `--with-attachments`. Returns
+   * `{filename, ts}` because orphans have no frontmatter to project.
+   * Identity defaults to the Coord's own.
+   */
+  lsOrphans(
+    identity?: Identity,
+    opts?: { archive?: boolean }
+  ): Promise<OrphanItem[]>;
   thread(
     identity: Identity,
     filename: Filename,
@@ -256,6 +300,16 @@ export interface Coord {
     pullAll(): Promise<FanOutItem[]>;
     all(): Promise<FanOutBidiItem[]>;
   };
+  /**
+   * brief-031 / brief-009 item 4: long-running pty-side notifier — wraps
+   * `runDing` for embedders that want to start a ding from inside a TUI
+   * or supervisor process instead of shelling out. Resolves when the
+   * daemon exits (via `deps.signal` or session-watch). `deps.identity`
+   * defaults to the Coord's own identity if you don't override it.
+   */
+  ding(deps: Omit<DingDeps, 'coord' | 'identity'> & {
+    identity?: Identity;
+  }): Promise<void>;
 }
 
 // ─── Factory ────────────────────────────────────────────────────────────
@@ -361,10 +415,13 @@ export function createCoord(options: CoordOptions): Coord {
       );
     },
 
-    async archive(id, filename): Promise<void> {
+    async archive(id, filename, opts = {}): Promise<void> {
       cmdArchive({
         recipient: id,
         filename,
+        ...(opts.withAttachments !== undefined && {
+          withAttachments: opts.withAttachments,
+        }),
         env: lib_env,
         coordRoot: root,
       });
@@ -376,11 +433,39 @@ export function createCoord(options: CoordOptions): Coord {
         ...(opts.olderThan !== undefined && { olderThan: opts.olderThan }),
         ...(opts.keepLast !== undefined && { keepLast: opts.keepLast }),
         ...(opts.dryRun !== undefined && { dryRun: opts.dryRun }),
+        ...(opts.withAttachments !== undefined && {
+          withAttachments: opts.withAttachments,
+        }),
         ...(opts.now !== undefined && { now: opts.now }),
         env: lib_env,
         coordRoot: root,
       });
       return r.victims.map(asFilename);
+    },
+
+    async lsOrphans(id, opts = {}): Promise<OrphanItem[]> {
+      const target = id ?? identity;
+      const r = cmdLs({
+        recipient: target,
+        ...(opts.archive !== undefined && { archive: opts.archive }),
+        orphans: true,
+        env: lib_env,
+        coordRoot: root,
+      });
+      // Orphans have no frontmatter; the LAYOUT-004 timestamp prefix
+      // may parse for grammar-conforming siblings but not for arbitrary
+      // ones (e.g. `.DS_Store`). Best-effort: try filenameTimestamp,
+      // fall back to leading-digit scan, fall back to 0.
+      return r.matches.map((fn) => {
+        let ts = 0;
+        try {
+          ts = filenameTimestamp(fn);
+        } catch {
+          const m = /^(\d{13})/.exec(fn);
+          if (m) ts = Number(m[1]);
+        }
+        return { filename: fn as Filename, ts };
+      });
     },
 
     async thread(id, filename, opts = {}): Promise<MessageWithLocation[]> {
@@ -529,6 +614,15 @@ export function createCoord(options: CoordOptions): Coord {
           coordRoot: root,
         });
       },
+    },
+
+    async ding(deps): Promise<void> {
+      const dingDeps: DingDeps = {
+        ...deps,
+        coord,
+        identity: deps.identity ?? identity,
+      };
+      return runDing(dingDeps);
     },
 
     sync: {

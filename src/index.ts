@@ -6,17 +6,19 @@
 // The CLI entry point (`bin/coord` → `src/cli.ts`) is invoked separately;
 // it is not re-exported here.
 
-export const VERSION = '0.7.0';
+export const VERSION = '0.8.0';
 
 // ─── Factory + handle ──────────────────────────────────────────────────
 
 export {
   createCoord,
+  type ArchiveOptions,
   type Coord,
   type CoordOptions,
   type FanOutBidiItem,
   type FanOutItem,
   type LsOptions,
+  type OrphanItem,
   type ReadOptions,
   type SendOptions,
   type SyncResult,
