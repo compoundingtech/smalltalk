@@ -66,11 +66,11 @@ describe('asIdentity', () => {
   });
 
   it('throws on invalid', () => {
-    expect(() => asIdentity('INVALID')).toThrowError(/invalid identity/);
+    expect(() => asIdentity('INVALID')).toThrowError(/invalid (agent name|identity)/);
   });
 
   it('throws on reserved name', () => {
-    expect(() => asIdentity('inbox')).toThrowError(/invalid identity/);
+    expect(() => asIdentity('inbox')).toThrowError(/invalid (agent name|identity)/);
   });
 });
 
@@ -162,7 +162,7 @@ describe('deriveTo', () => {
 
   it('throws when the path piece is not a valid identity', () => {
     const f = asFilename('1714826789012-x9k4mz.md');
-    expect(() => deriveTo(f, 'INVALID')).toThrowError(/invalid identity/);
+    expect(() => deriveTo(f, 'INVALID')).toThrowError(/invalid (agent name|identity)/);
   });
 });
 

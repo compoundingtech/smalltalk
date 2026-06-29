@@ -110,7 +110,7 @@ describe('cmdStatus — form 2 (get <identity>)', () => {
 
   it('errors with mkdir hint when identity folder is missing', () => {
     expect(() => cmdStatus(input({ recipient: 'ghost' }))).toThrowError(
-      /identity folder missing/
+      /(agent|identity) folder missing/
     );
   });
 });
@@ -174,7 +174,7 @@ describe('cmdStatus — form 4 (<identity> --set <state>)', () => {
     setupIdentity('alice');
     expect(() =>
       cmdStatus(input({ recipient: 'carol', setState: 'busy' }))
-    ).toThrowError(/identity folder missing for carol/);
+    ).toThrowError(/(agent|identity) folder missing for carol/);
   });
 });
 
@@ -240,13 +240,13 @@ describe('cmdStatus — reserved identity names rejected', () => {
   it('positional state-word "busy" → invalid identity (no longer a write)', () => {
     setupIdentity('alice');
     expect(() => cmdStatus(input({ recipient: 'busy' }))).toThrowError(
-      /invalid identity/
+      /invalid (agent name|identity)/
     );
   });
 
   it('positional "offline" likewise', () => {
     expect(() => cmdStatus(input({ recipient: 'offline' }))).toThrowError(
-      /invalid identity/
+      /invalid (agent name|identity)/
     );
   });
 });

@@ -210,7 +210,8 @@ describe('edge-cases — half-formed sender identity', () => {
       stdin: 'body',
     });
     expect(r.exitCode).not.toBe(0);
-    expect(r.stderr).toContain('identity folder missing for half');
+    // Post-rename: error message says "agent folder missing".
+    expect(r.stderr).toMatch(/(agent|identity) folder missing for half/);
   });
 });
 

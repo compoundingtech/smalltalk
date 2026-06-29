@@ -38,7 +38,12 @@ export const SERVER_INFO: Implementation = {
   //         treatment). Tidy-check is now inbox-staleness only.
   // 0.6.0 — brief-009 phase 5: resources/ surface added (annotated
   //         URLs per identity). 4 new MCP tools, dual-prefixed.
-  version: '0.6.0',
+  // 0.7.0 — brief-009 item 3: identity → agent rename across SDK
+  //         types, MCP tool names (coord_members → coord_agents
+  //         keeping coord_members as deprecated alias), CLI verb
+  //         (members → agents, members deprecated alias), and env
+  //         vars (ST_AGENT preferred → ST_IDENTITY → COORD_IDENTITY).
+  version: '0.7.0',
 };
 
 /**
@@ -105,7 +110,8 @@ export function buildServerOptions(opts: {
 
 /** The base tool names (sans prefix) registered in non-channel mode.
  *  `msg_send/ls/read/archive/thread` per brief-017; `members` per
- *  brief-019; `resource_*` per brief-009 item 5. */
+ *  brief-019; `resource_*` per brief-009 item 5; `agents` per
+ *  brief-009 item 3 (rename) with `members` kept as deprecated alias. */
 export const EXPECTED_TOOL_BASE_NAMES = [
   'msg_send',
   'msg_ls',
@@ -113,6 +119,7 @@ export const EXPECTED_TOOL_BASE_NAMES = [
   'msg_archive',
   'msg_thread',
   'members',
+  'agents',
   'resource_add',
   'resource_ls',
   'resource_read',

@@ -67,7 +67,7 @@ describe('createCoord — construction', () => {
         root: coordRoot,
         identity: 'INVALID' as unknown as Identity,
       })
-    ).toThrowError(/invalid identity/);
+    ).toThrowError(/invalid (agent name|identity)/);
   });
 });
 

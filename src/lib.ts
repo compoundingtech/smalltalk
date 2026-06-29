@@ -34,10 +34,10 @@ import {
 } from './commands/archive.ts';
 import { cmdLs } from './commands/ls.ts';
 import {
-  getMembers,
-  type MemberSummary,
-  type MemberSummaryEnriched,
-} from './commands/members.ts';
+  getAgents,
+  type AgentSummary,
+  type AgentSummaryEnriched,
+} from './commands/agents.ts';
 import {
   getOverview,
   type Overview,
@@ -201,13 +201,18 @@ export interface Coord {
   setStatus(identity: Identity, state: State): Promise<void>;
   /**
    * brief-028: enumerate identities under $COORD_ROOT. Mirrors
-   * `coord members` but returns the typed payload directly so an
+   * `coord agents` but returns the typed payload directly so an
    * embedder can render their own UI without re-parsing.
    */
+  agents(opts?: {
+    status?: State;
+    enrich?: boolean;
+  }): AgentSummary[] | AgentSummaryEnriched[];
+  /** @deprecated Use {@link Coord.agents}. */
   members(opts?: {
     status?: State;
     enrich?: boolean;
-  }): MemberSummary[] | MemberSummaryEnriched[];
+  }): AgentSummary[] | AgentSummaryEnriched[];
   /**
    * brief-028: at-a-glance dashboard for `identity` (defaults to the
    * handle's own identity). Mirrors `coord overview`.
@@ -452,8 +457,14 @@ export function createCoord(options: CoordOptions): Coord {
       });
     },
 
-    members(opts = {}): MemberSummary[] | MemberSummaryEnriched[] {
-      return getMembers(root, {
+    agents(opts = {}): AgentSummary[] | AgentSummaryEnriched[] {
+      return getAgents(root, {
+        ...(opts.status !== undefined && { status: opts.status }),
+        ...(opts.enrich !== undefined && { enrich: opts.enrich }),
+      });
+    },
+    members(opts = {}): AgentSummary[] | AgentSummaryEnriched[] {
+      return getAgents(root, {
         ...(opts.status !== undefined && { status: opts.status }),
         ...(opts.enrich !== undefined && { enrich: opts.enrich }),
       });

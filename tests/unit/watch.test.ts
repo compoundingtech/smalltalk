@@ -99,7 +99,7 @@ describe('resolveWatchSetup — per-identity mode', () => {
   it('errors with mkdir hint for missing identity', () => {
     expect(() =>
       resolveWatchSetup(input({ recipient: 'ghost' }))
-    ).toThrowError(/identity folder missing/);
+    ).toThrowError(/(agent|identity) folder missing/);
   });
 });
 

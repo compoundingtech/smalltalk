@@ -589,7 +589,7 @@ describe('cmdDingCli — arg parsing', () => {
     // INVALID has uppercase; asIdentity rejects.
     await expect(
       cmdDingCli(['session', '--identity', 'INVALID'], ctx())
-    ).rejects.toThrow(/invalid identity/i);
+    ).rejects.toThrow(/invalid (agent name|identity)/i);
   });
 
   it('--tidy-interval-ms requires non-negative integer', async () => {
