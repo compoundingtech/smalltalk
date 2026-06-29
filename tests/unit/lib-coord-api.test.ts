@@ -207,11 +207,75 @@ describe('public surface (brief-028)', () => {
     for (const name of [
       'inbox',
       'archive',
+      'resources',
       'status',
       'unknown',
       'available',
     ]) {
       expect(mod.RESERVED_NAMES).toContain(name);
     }
+  });
+});
+
+// ─── coord.resources (brief-009 item 5) ────────────────────────────────
+
+describe('coord.resources', () => {
+  it('add returns a Filename, list surfaces it back', async () => {
+    const fn = await coord.resources.add({
+      url: 'https://example.com',
+    });
+    expect(/^[0-9]{13}-[0-9a-z]{6}\.md$/.test(fn)).toBe(true);
+    const items = await coord.resources.list();
+    expect(items).toHaveLength(1);
+    expect(items[0]!.filename).toBe(fn);
+    expect(items[0]!.identity).toBe('alice');
+    expect(items[0]!.resource.url).toBe('https://example.com');
+  });
+
+  it('list defaults to the handle\'s own identity; explicit arg switches to a peer', async () => {
+    await coord.resources.add({ url: 'https://alice.example/' });
+    const ownItems = await coord.resources.list();
+    expect(ownItems).toHaveLength(1);
+    const bobItems = await coord.resources.list(asIdentity('bob'));
+    expect(bobItems).toHaveLength(0);
+  });
+
+  it('read returns the parsed Resource with optional fields populated', async () => {
+    const fn = await coord.resources.add({
+      url: 'https://example.com',
+      title: 'eg',
+      tags: ['a', 'b'],
+      relation: 'owns',
+      body: 'desc\n',
+    });
+    const r = await coord.resources.read(asIdentity('alice'), fn);
+    expect(r.url).toBe('https://example.com');
+    expect(r.title).toBe('eg');
+    expect(r.tags).toEqual(['a', 'b']);
+    expect(r.relation).toBe('owns');
+    expect(r.body).toContain('desc');
+  });
+
+  it('relation is absent on the returned Resource when not set on add', async () => {
+    const fn = await coord.resources.add({
+      url: 'https://example.com',
+    });
+    const r = await coord.resources.read(asIdentity('alice'), fn);
+    expect(r.relation).toBeUndefined();
+  });
+
+  it('remove deletes the file; subsequent list shows it gone', async () => {
+    const fn = await coord.resources.add({
+      url: 'https://example.com',
+    });
+    await coord.resources.remove(fn);
+    const items = await coord.resources.list();
+    expect(items).toHaveLength(0);
+  });
+
+  it('add rejects URLs without a scheme', async () => {
+    await expect(
+      coord.resources.add({ url: 'example.com' })
+    ).rejects.toThrow();
   });
 });

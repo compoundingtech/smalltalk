@@ -105,6 +105,7 @@ export const RESERVED_NAMES: readonly string[] = [
   // would shadow it.
   'inbox',
   'archive',
+  'resources',
   'status',
   'name',
   // Status states (would alias-collide with `coord status <token>`).
@@ -416,6 +417,10 @@ export function inboxDir(id: string, root: string = coordRoot()): string {
 
 export function archiveDir(id: string, root: string = coordRoot()): string {
   return join(root, id, 'archive');
+}
+
+export function resourcesDir(id: string, root: string = coordRoot()): string {
+  return join(root, id, 'resources');
 }
 
 export function statusPath(id: string, root: string = coordRoot()): string {

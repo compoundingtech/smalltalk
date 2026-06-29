@@ -136,6 +136,34 @@ export function deriveTs(filename: Filename): number {
   return Number(filename.slice(0, 13));
 }
 
+// ─── Resource + ResourceWithLocation ───────────────────────────────────
+
+/**
+ * A resource is an annotated URL an identity has chosen to surface to
+ * peers. Lives at `<root>/<identity>/resources/<filename>.md` with the
+ * url in frontmatter and an optional description in the body. Per
+ * brief-009 item 5.
+ *
+ * `relation` is **very optional** — it's never inferred and the bare
+ * URL stays first-class. Canonical (but non-enforced) values:
+ * `owns` / `relates-to` / `depends-on`. Agents may invent their own
+ * relation strings.
+ */
+export interface Resource {
+  url: string;
+  title?: string;
+  tags?: string[];
+  relation?: string;
+  body: string;
+}
+
+/** Locator + resource: what resources.read / resources.ls return. */
+export interface ResourceWithLocation {
+  resource: Resource;
+  identity: Identity;
+  filename: Filename;
+}
+
 // ─── Watch event ────────────────────────────────────────────────────────
 
 export interface WatchEvent {

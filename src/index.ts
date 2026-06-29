@@ -6,7 +6,7 @@
 // The CLI entry point (`bin/coord` → `src/cli.ts`) is invoked separately;
 // it is not re-exported here.
 
-export const VERSION = '0.3.0';
+export const VERSION = '0.6.0';
 
 // ─── Factory + handle ──────────────────────────────────────────────────
 
@@ -46,6 +46,8 @@ export {
   type Peer,
   type PeerKind,
   type Priority,
+  type Resource,
+  type ResourceWithLocation,
   type State,
   type WatchEvent,
 } from './types.ts';
@@ -62,10 +64,12 @@ export {
   InvalidFilenameError,
   InvalidIdentityError,
   InvalidPriorityError,
+  InvalidResourceUrlError,
   InvalidStateError,
   MessageNotFoundError,
   PeersConfigInvalidError,
   PeersConfigMissingError,
+  ResourceNotFoundError,
   type SyncStage,
   SyncFailedError,
 } from './errors.ts';

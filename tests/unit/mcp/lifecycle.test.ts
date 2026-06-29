@@ -158,12 +158,20 @@ describe('createMcpServer — tool name registry', () => {
       'coord_msg_archive',
       'coord_msg_thread',
       'coord_members',
+      'coord_resource_add',
+      'coord_resource_ls',
+      'coord_resource_read',
+      'coord_resource_remove',
       'st_msg_send',
       'st_msg_ls',
       'st_msg_read',
       'st_msg_archive',
       'st_msg_thread',
       'st_members',
+      'st_resource_add',
+      'st_resource_ls',
+      'st_resource_read',
+      'st_resource_remove',
     ]);
   });
 });

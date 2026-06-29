@@ -115,6 +115,8 @@ describe('root subpath — every documented export is present', () => {
     'PeersConfigInvalidError',
     'EmptyBodyError',
     'ArchiveConflictError',
+    'ResourceNotFoundError',
+    'InvalidResourceUrlError',
   ])('%s error class is exported', (name) => {
     const ctor = (index as Record<string, unknown>)[name];
     expect(typeof ctor).toBe('function');

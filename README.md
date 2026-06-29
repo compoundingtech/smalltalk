@@ -140,6 +140,8 @@ coord message thread bob 1714826789012-x9k4mz.md            # walk the in-reply-
 coord status --set busy                                     # update my status (available | busy | away | dnd | offline)
 coord members --status available                            # who's around?
 coord overview                                              # at-a-glance dashboard
+coord resource add https://github.com/myobie/smalltalk/pull/19  # publish a URL alice cares about
+coord resource ls bob                                       # what URLs has bob published?
 coord init                                                  # wire .mcp.json into the current repo
 coord sync pull --all                                       # conservative cron
 coord watch                                                 # cross-tree activity

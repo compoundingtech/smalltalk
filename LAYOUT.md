@@ -35,10 +35,12 @@ sync. There are no machine-local marker files inside the folder.
   (e.g. `persona.session-1.child-7`) — see issue #1. No upper bound on
   length beyond what the underlying filesystem accepts.
 - Reserved names (must not be used as an identity): `inbox`, `archive`,
-  `status`, `name`, `available`, `busy`, `away`, `dnd`, `offline`,
-  `unknown`, `members`, `overview`.
-- Every identity sub-folder contains exactly two folders: `inbox/` and
-  `archive/`. No other sub-folders are part of the convention.
+  `resources`, `status`, `name`, `available`, `busy`, `away`, `dnd`,
+  `offline`, `unknown`, `members`, `overview`.
+- Every identity sub-folder contains at minimum two folders: `inbox/`
+  and `archive/`. One further optional folder, `resources/`, may also
+  be present (see below). No other sub-folders are part of the
+  convention.
 - An identity may *optionally* have a single-line `<identity>/name` file
   containing a human-friendly display name. Synced like everything else.
 
@@ -131,6 +133,25 @@ prefix is the canonical send time.
   been processed.
 - **`archive/`** holds messages that have been processed. Move (`mv`) is the
   only operation that puts a file in archive.
+- **`resources/`** *(optional)* holds annotated URLs the identity has
+  chosen to surface to peers — links to PRs they own, pty sessions
+  they supervise, repos, docs, anything URL-shaped. Each file is
+  `<unix-ms>-<rand6>.md` (same grammar as messages); frontmatter
+  carries `url:` (required) plus optional `title:` / `tags:` /
+  `relation:`; body is an optional markdown description. **Only the
+  identity owner writes here**; peers read via sync but never write.
+  The folder is created lazily on first `coord resource add`. URLs
+  accept any scheme — the convention is `https://` for the web,
+  `pty://<session-name>` for a pty session, and otherwise whatever
+  scheme the participants agree on.
+
+  The optional **`relation:`** field describes the agent's
+  relationship to the URL. Free-form string; **never inferred**
+  (absent by default). The canonical, non-enforced values are
+  `owns`, `relates-to`, and `depends-on`; agents may invent their own
+  (`considers-blocking`, `mentored-by`, whatever fits). A resource
+  with no `relation:` is fully first-class — the bare URL is the
+  primary thing the field annotates.
 
 ## Append-only and rename-only
 

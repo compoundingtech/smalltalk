@@ -149,6 +149,36 @@ const COMMANDS: readonly CommandSpec[] = [
     flags: [{ name: 'recent', desc: 'Number of recent items' }, JSON_FLAG],
   },
   {
+    name: 'resource',
+    desc: 'Manage annotated URLs you publish (brief-009 item 5)',
+    verbs: [
+      {
+        name: 'add',
+        desc: 'Add a resource (a URL with optional title/tags/relation/body)',
+        flags: [
+          { name: 'title', desc: 'One-line title' },
+          { name: 'tag', desc: 'Comma-separated tags' },
+          {
+            name: 'relation',
+            desc: 'Free-form relation (canonical: owns | relates-to | depends-on)',
+          },
+          { name: 'body-stdin', desc: 'Read body description from stdin' },
+        ],
+      },
+      {
+        name: 'ls',
+        desc: 'List resources for an identity',
+        flags: [JSON_FLAG],
+      },
+      {
+        name: 'read',
+        desc: 'Read one resource',
+        flags: [JSON_FLAG],
+      },
+      { name: 'rm', desc: 'Remove one of your own resources' },
+    ],
+  },
+  {
     name: 'sync',
     desc: 'Push/pull against peers',
     verbs: [

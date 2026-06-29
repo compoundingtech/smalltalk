@@ -180,3 +180,31 @@ export class ArchiveConflictError extends CoordError {
   }
 }
 
+// ─── Resources (brief-009 item 5) ──────────────────────────────────────
+
+export class ResourceNotFoundError extends CoordError {
+  readonly identity: string;
+  readonly filename: string;
+  constructor(identity: string, filename: string) {
+    super(
+      'RESOURCE_NOT_FOUND',
+      `resource not found: ${identity}/resources/${filename}`,
+      { identity, filename }
+    );
+    this.identity = identity;
+    this.filename = filename;
+  }
+}
+
+export class InvalidResourceUrlError extends CoordError {
+  readonly value: string;
+  constructor(value: string) {
+    super(
+      'INVALID_RESOURCE_URL',
+      `invalid resource url: ${JSON.stringify(value)} (must contain a scheme, e.g. https://, pty://)`,
+      { value }
+    );
+    this.value = value;
+  }
+}
+

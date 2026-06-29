@@ -32,6 +32,7 @@ import { registerLsTool } from './tools/ls.ts';
 import { registerMembersTool } from './tools/members.ts';
 import { registerReadTool } from './tools/read.ts';
 import { registerReplyTool } from './tools/reply.ts';
+import { registerResourceTools } from './tools/resource.ts';
 import { registerSendTool } from './tools/send.ts';
 import { registerThreadTool } from './tools/thread.ts';
 
@@ -131,6 +132,9 @@ export function createMcpServer(opts: McpServerOptions): McpServerHandle {
   // coord_members is available in both modes — peer discovery is
   // useful regardless of whether channel push is on.
   registerMembersTool(mcp, coord);
+  // coord_resource_* (brief-009 item 5): add/ls/read/remove. Available
+  // in both modes; resources are part of the always-on agent surface.
+  registerResourceTools(mcp, coord);
   if (channel) {
     // coord_msg_reply is the channel-mode partner of the inbox watcher.
     registerReplyTool(mcp, coord);
