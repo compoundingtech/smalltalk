@@ -1,7 +1,7 @@
 // tests/unit/mcp/tidy-check.test.ts — drift detector (brief-030 task 1).
 //
-// Pure-function tests against /tmp fixtures. Each drift condition is
-// exercised in isolation, then combined. The tick wiring + dedup
+// Pure-function tests against /tmp fixtures. Inbox-staleness is the
+// sole drift condition post-brief-009. The tick wiring + dedup
 // machinery lives in src/mcp/index.ts and is covered by the
 // integration test in tests/integration/mcp-tidy-check.test.ts.
 
@@ -16,10 +16,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
-import {
-  STALE_INBOX_MS,
-  STALE_JOURNAL_MS,
-} from '../../../src/common.ts';
+import { STALE_INBOX_MS } from '../../../src/common.ts';
 import { evaluateDrift } from '../../../src/mcp/tidy-check.ts';
 
 let scratch: string;
@@ -50,25 +47,12 @@ function plantInbox(filename: string, ageMs: number): string {
   return path;
 }
 
-function plantJournal(filename: string, ageMs: number): string {
-  const dir = join(identityRoot, 'journal');
-  mkdirSync(dir, { recursive: true });
-  const path = join(dir, filename);
-  writeFileSync(path, 'entry body\n');
-  if (ageMs > 0) {
-    const t = new Date(Date.now() - ageMs);
-    utimesSync(path, t, t);
-  }
-  return path;
-}
-
-// ─── Empty / clean cases ───────────────────────────────────────────────
+// ─── Clean / fresh cases ───────────────────────────────────────────────
 
 describe('evaluateDrift — clean fixtures', () => {
   it('empty identity → no drift', () => {
     const r = evaluateDrift(ID, coordRoot);
     expect(r.inbox).toBe(false);
-    expect(r.journal).toBe(false);
     expect(r.body).toBe('');
   });
 
@@ -76,12 +60,6 @@ describe('evaluateDrift — clean fixtures', () => {
     plantInbox('1714826789010-aaaaaa.md', STALE_INBOX_MS - 60_000);
     const r = evaluateDrift(ID, coordRoot);
     expect(r.inbox).toBe(false);
-  });
-
-  it('journal entry fresher than STALE_JOURNAL_MS → no journal drift', () => {
-    plantJournal('1714826789010-recent.md', STALE_JOURNAL_MS - 60_000);
-    const r = evaluateDrift(ID, coordRoot);
-    expect(r.journal).toBe(false);
   });
 });
 
@@ -121,69 +99,18 @@ describe('evaluateDrift — inbox condition', () => {
   });
 });
 
-// ─── Journal drift ─────────────────────────────────────────────────────
+// ─── Body shape ────────────────────────────────────────────────────────
 
-describe('evaluateDrift — journal condition', () => {
-  it('latest journal entry older than STALE_JOURNAL_MS → fires', () => {
-    plantJournal(
-      '1714826789010-old.md',
-      STALE_JOURNAL_MS + 30 * 60_000
-    );
-    const r = evaluateDrift(ID, coordRoot);
-    expect(r.journal).toBe(true);
-    expect(r.body).toContain('No journal entry for');
-  });
-
-  it('latest journal entry fresher than threshold → no drift', () => {
-    plantJournal(
-      '1714826789020-recent.md',
-      STALE_JOURNAL_MS - 60_000
-    );
-    const r = evaluateDrift(ID, coordRoot);
-    expect(r.journal).toBe(false);
-  });
-
-  it('no journal folder → no journal drift (nothing to be stale)', () => {
-    // Bare identity with no work yet shouldn't fire.
-    const r = evaluateDrift(ID, coordRoot);
-    expect(r.journal).toBe(false);
-  });
-
-  it('latest of multiple entries is what we compare against', () => {
-    plantJournal(
-      '1714826789010-old.md',
-      STALE_JOURNAL_MS + 5 * 60 * 60_000
-    );
-    plantJournal(
-      '1714826789020-fresh.md',
-      STALE_JOURNAL_MS - 60_000
-    );
-    const r = evaluateDrift(ID, coordRoot);
-    // Newest entry is fresh, so no drift.
-    expect(r.journal).toBe(false);
-  });
-});
-
-// ─── Combinations + body shape ─────────────────────────────────────────
-
-describe('evaluateDrift — combinations', () => {
-  it('both conditions fire together → body lists both', () => {
-    plantInbox('1714826789010-aaaaaa.md', STALE_INBOX_MS + 60_000);
-    plantJournal(
-      '1714826789030-old-journal.md',
-      STALE_JOURNAL_MS + 60_000
-    );
-    const r = evaluateDrift(ID, coordRoot);
-    expect(r.inbox).toBe(true);
-    expect(r.journal).toBe(true);
-    expect(r.body).toContain('inbox:');
-    expect(r.body).toContain('No journal entry for');
-    expect(r.body.startsWith('Tidy check (drift detected):')).toBe(true);
-  });
-
+describe('evaluateDrift — body shape', () => {
   it('body is empty when no condition fires', () => {
     const r = evaluateDrift(ID, coordRoot);
     expect(r.body).toBe('');
+  });
+
+  it('body starts with the tidy-check header when drift fires', () => {
+    plantInbox('1714826789010-aaaaaa.md', STALE_INBOX_MS + 60_000);
+    const r = evaluateDrift(ID, coordRoot);
+    expect(r.body.startsWith('Tidy check (drift detected):')).toBe(true);
   });
 
   it('opts.now overrides Date.now for determinism', () => {
@@ -206,6 +133,5 @@ describe('evaluateDrift — resilience', () => {
     mkdirSync(scratch);
     const r = evaluateDrift(ID, coordRoot);
     expect(r.inbox).toBe(false);
-    expect(r.journal).toBe(false);
   });
 });

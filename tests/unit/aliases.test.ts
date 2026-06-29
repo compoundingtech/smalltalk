@@ -106,7 +106,7 @@ describe('env-var dual-honor (ST_* preferred over COORD_*)', () => {
       String(c[0]).includes('COORD_IDENTITY')
     );
     expect(warnCalls).toHaveLength(1);
-    expect(String(warnCalls[0]![0])).toContain('migrate to ST_IDENTITY');
+    expect(String(warnCalls[0]![0])).toContain('migrate to ST_AGENT');
   });
 
   it('no warning when ST_ROOT is set (no fallback)', () => {
@@ -118,7 +118,7 @@ describe('env-var dual-honor (ST_* preferred over COORD_*)', () => {
     expect(warnCalls).toHaveLength(0);
   });
 
-  it('resolveIdentity: ST_IDENTITY preferred', () => {
+  it('resolveIdentity: ST_IDENTITY preferred over COORD_IDENTITY', () => {
     // Real folder under our scratch HOME for the auto-create path.
     const root = join(scratch, 'state');
     mkdirSync(root, { recursive: true });
@@ -127,6 +127,50 @@ describe('env-var dual-honor (ST_* preferred over COORD_*)', () => {
       COORD_IDENTITY: 'coord-claude',
     } as NodeJS.ProcessEnv;
     expect(resolveIdentity({ env, coordRoot: root })).toBe('st-claude');
+  });
+
+  it('resolveIdentity: ST_AGENT preferred over ST_IDENTITY (brief-009 item 3)', () => {
+    const root = join(scratch, 'state');
+    mkdirSync(root, { recursive: true });
+    const env = {
+      ST_AGENT: 'st-agent',
+      ST_IDENTITY: 'st-identity',
+      COORD_IDENTITY: 'coord-identity',
+    } as NodeJS.ProcessEnv;
+    expect(resolveIdentity({ env, coordRoot: root })).toBe('st-agent');
+  });
+
+  it('resolveIdentity: three-level fallback ST_AGENT > ST_IDENTITY > COORD_IDENTITY', () => {
+    const root = join(scratch, 'state');
+    mkdirSync(root, { recursive: true });
+    // Only COORD_IDENTITY set → it gets honored.
+    const e1 = { COORD_IDENTITY: 'coord-only' } as NodeJS.ProcessEnv;
+    expect(resolveIdentity({ env: e1, coordRoot: root })).toBe('coord-only');
+    // ST_IDENTITY but no ST_AGENT → ST_IDENTITY wins.
+    const e2 = {
+      ST_IDENTITY: 'st-identity',
+      COORD_IDENTITY: 'coord-id',
+    } as NodeJS.ProcessEnv;
+    expect(resolveIdentity({ env: e2, coordRoot: root })).toBe('st-identity');
+    // All three set → ST_AGENT wins.
+    const e3 = {
+      ST_AGENT: 'st-agent',
+      ST_IDENTITY: 'st-identity',
+      COORD_IDENTITY: 'coord-id',
+    } as NodeJS.ProcessEnv;
+    expect(resolveIdentity({ env: e3, coordRoot: root })).toBe('st-agent');
+  });
+
+  it('envIdentityFrom: warns once when honoring ST_IDENTITY (post brief-009 item 3)', () => {
+    const spy = vi.spyOn(process.stderr, 'write').mockReturnValue(true);
+    const env = { ST_IDENTITY: 'st-identity-bob' } as NodeJS.ProcessEnv;
+    envIdentityFrom(env);
+    envIdentityFrom(env);
+    const warnCalls = spy.mock.calls.filter((c) =>
+      String(c[0]).includes('ST_IDENTITY')
+    );
+    expect(warnCalls).toHaveLength(1);
+    expect(String(warnCalls[0]![0])).toContain('migrate to ST_AGENT');
   });
 });
 

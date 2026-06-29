@@ -21,26 +21,37 @@ $COORD_ROOT/
 The folder is 100% syncable — every file under `$COORD_ROOT/` participates in
 sync. There are no machine-local marker files inside the folder.
 
-## Identity rules
+## Agent rules
 
-- An **identity** is a sub-folder name under `$COORD_ROOT/`. The folder name
-  is the identity's id.
-- An identity is normally hosted by a single participant — that participant's
-  machine is the canonical place where the identity's writes originate. A
-  *shared* identity (a "team alias" — `dispatch`, `oncall`, etc.) is also
-  supported: multiple participants keep the folder synced and share the
-  inbox. See [walkthrough.md](notes/walkthrough.md) for usage patterns.
+Vocabulary note: brief-009 item 3 renamed the project's primary noun
+from **identity** to **agent**. On-disk paths still read
+`<root>/<name>/{inbox,archive}` — the folder *name* IS the agent's name
+— but the type, env-var, CLI verb, and MCP tool surfaces all prefer
+`agent` over `identity` now. The old names remain honored as
+deprecated aliases for one release cycle (see Identity resolution
+below).
+
+- An **agent** is a sub-folder name under `$ST_ROOT/`. The folder name
+  is the agent's id.
+- An agent is normally hosted by a single participant — that
+  participant's machine is the canonical place where the agent's
+  writes originate. A *shared* agent (a "team alias" — `dispatch`,
+  `oncall`, etc.) is also supported: multiple participants keep the
+  folder synced and share the inbox. See
+  [walkthrough.md](notes/walkthrough.md) for usage patterns.
 - Lowercase ASCII alphanumeric, hyphens, and periods. Must start and end
   with an alphanumeric. Periods encode hierarchy in the flat namespace
   (e.g. `persona.session-1.child-7`) — see issue #1. No upper bound on
   length beyond what the underlying filesystem accepts.
-- Reserved names (must not be used as an identity): `inbox`, `archive`,
-  `journal`, `status`, `name`, `available`, `busy`, `away`,
-  `dnd`, `offline`, `unknown`, `members`, `overview`.
-- Every identity sub-folder contains at minimum two folders: `inbox/` and
-  `archive/`. One further optional folder, `journal/`, may also be
-  present (see below). No other sub-folders are part of the convention.
-- An identity may *optionally* have a single-line `<identity>/name` file
+- Reserved names (must not be used as an agent name): `inbox`,
+  `archive`, `resources`, `status`, `name`, `available`, `busy`,
+  `away`, `dnd`, `offline`, `unknown`, `members`, `agents`,
+  `overview`.
+- Every agent sub-folder contains at minimum two folders: `inbox/`
+  and `archive/`. One further optional folder, `resources/`, may also
+  be present (see below). No other sub-folders are part of the
+  convention.
+- An agent may *optionally* have a single-line `<agent>/name` file
   containing a human-friendly display name. Synced like everything else.
 
 ## Filenames
@@ -132,16 +143,25 @@ prefix is the canonical send time.
   been processed.
 - **`archive/`** holds messages that have been processed. Move (`mv`) is the
   only operation that puts a file in archive.
-- **`journal/`** *(optional)* is the identity's own terse work log,
-  audience-facing. Each entry is its own markdown file named
-  `<unix-ms>-<slug>.md`, optionally with `topic` / `tags` frontmatter.
-  **Only the identity owner writes here**; other participants read via
-  sync. **Append-only at file granularity** — never edit an entry once
-  written, only add new ones. Distinct from `inbox/archive/` (which are
-  messages from others): a journal entry is a short narrative from this
-  identity to everyone else. Terse by convention — a few sentences, not
-  a stream-of-thought log; if you need more, write it in a brief. The
-  folder is created lazily on first `coord journal new`.
+- **`resources/`** *(optional)* holds annotated URLs the identity has
+  chosen to surface to peers — links to PRs they own, pty sessions
+  they supervise, repos, docs, anything URL-shaped. Each file is
+  `<unix-ms>-<rand6>.md` (same grammar as messages); frontmatter
+  carries `url:` (required) plus optional `title:` / `tags:` /
+  `relation:`; body is an optional markdown description. **Only the
+  identity owner writes here**; peers read via sync but never write.
+  The folder is created lazily on first `coord resource add`. URLs
+  accept any scheme — the convention is `https://` for the web,
+  `pty://<session-name>` for a pty session, and otherwise whatever
+  scheme the participants agree on.
+
+  The optional **`relation:`** field describes the agent's
+  relationship to the URL. Free-form string; **never inferred**
+  (absent by default). The canonical, non-enforced values are
+  `owns`, `relates-to`, and `depends-on`; agents may invent their own
+  (`considers-blocking`, `mentored-by`, whatever fits). A resource
+  with no `relation:` is fully first-class — the bare URL is the
+  primary thing the field annotates.
 
 ## Append-only and rename-only
 
@@ -166,17 +186,22 @@ whatever sync mechanism is configured. The sender doesn't know or care.
 To receive: list and read files in `$COORD_ROOT/<self>/inbox/`. To mark a
 message as processed: `mv` it to `$COORD_ROOT/<self>/archive/`.
 
-## Identity resolution
+## Agent resolution
 
-A coord implementation needs to know "which identity is acting" for any
-command that operates on `<self>`. The convention does not auto-detect this
-from on-disk state. Instead, identity resolution is one of:
+A coord implementation needs to know "which agent is acting" for any
+command that operates on `<self>`. The convention does not auto-detect
+this from on-disk state. Instead, agent resolution is one of:
 
-- The `COORD_IDENTITY` environment variable, OR
-- An explicit identity argument on the command (e.g. `--from <id>`).
+- The `ST_AGENT` environment variable (preferred), OR
+- The `ST_IDENTITY` env var (deprecated, with a one-time stderr migration notice), OR
+- The `COORD_IDENTITY` env var (legacy, with the same notice), OR
+- An explicit agent argument on the command (e.g. `--from <agent>`).
 
-Implementations should error loudly when neither is provided rather than
-guessing.
+Implementations should error loudly when none are provided rather than
+guessing. The three-level env-var fallback exists so per-machine
+config (e.g. `pty.toml`) can migrate from `COORD_IDENTITY` →
+`ST_IDENTITY` → `ST_AGENT` at its own pace; the next major release
+drops the legacy honors.
 
 ## Archive is the tombstone
 

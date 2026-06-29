@@ -18,15 +18,17 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 
 import {
-  IdentityNotHostedError,
-  IdentityRequiredError,
+  AgentNotHostedError,
+  AgentRequiredError,
+  InvalidAgentError,
   InvalidFilenameError,
-  InvalidIdentityError,
 } from './errors.ts';
 
 // ─── Types ───────────────────────────────────────────────────────────────
 
-export type Identity = string;
+export type Agent = string;
+/** @deprecated Use {@link Agent}. */
+export type Identity = Agent;
 export type Filename = string;
 // `unknown` is a derived state: the status file's mtime is older than
 // STATUS_STALE_MS so we can't trust whatever's recorded there. Users
@@ -99,22 +101,18 @@ export const TIDY_CHECK_INTERVAL_MS = 20 * 60 * 1000;
  *  Tunable per myobie's loose initial framing. */
 export const STALE_INBOX_MS = 10 * 60 * 1000;
 
-/** Drift threshold: when the latest journal entry is older than this,
- *  the agent has shipped without journaling — drift. */
-export const STALE_JOURNAL_MS = 60 * 60 * 1000;
-
 export const RESERVED_NAMES: readonly string[] = [
-  // Per-identity sub-folders / sidecars (LAYOUT-004 + brief-015 +
-  // brief-024). Each is a folder or file inside an identity dir; an
-  // identity name that collides with one of these would shadow it.
+  // Per-agent sub-folders / sidecars. Each is a folder or file inside
+  // an agent dir; an agent name that collides with one of these would
+  // shadow it.
   'inbox',
   'archive',
-  'journal',
+  'resources',
   'status',
   'name',
   // Status states (would alias-collide with `coord status <token>`).
   // `unknown` is the brief-022 derived staleness value; reserved so
-  // it can't double as an identity name either. `away` (brief-029) is
+  // it can't double as an agent name either. `away` (brief-029) is
   // the fifth settable state.
   'offline',
   'available',
@@ -123,19 +121,21 @@ export const RESERVED_NAMES: readonly string[] = [
   'dnd',
   'unknown',
   // Verb names that the CLI enumerates the root for (brief-016).
-  // Reserving them keeps the verb-vs-identity ambiguity out.
+  // Reserving them keeps the verb-vs-agent ambiguity out. `members`
+  // is the deprecated alias of `agents`; reserved for both.
   'members',
+  'agents',
   'overview',
 ];
 
 const FILENAME_RE = /^[0-9]{13}-[0-9a-z]{6}\.md$/;
-// Identities are lowercase ASCII alphanumeric + hyphens and PERIODS,
+// Agent names are lowercase ASCII alphanumeric + hyphens and PERIODS,
 // starting and ending with an alphanumeric. The period (issue #1) is
 // a convention for encoding hierarchy in a flat namespace, e.g.
 // `orchestrator.session-1.child-7`. Real nested folders (paths with
 // `/`) are deliberately NOT supported — see issue #1 for the
 // decision and the use-cases that prompted the question.
-const IDENTITY_RE = /^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$/;
+const AGENT_RE = /^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$/;
 
 // ─── Pluralize ───────────────────────────────────────────────────────────
 
@@ -201,58 +201,71 @@ export function prefixOf(name: string): string | null {
   return m ? m[1]! : null;
 }
 
-// ─── Identity ────────────────────────────────────────────────────────────
+// ─── Agent ───────────────────────────────────────────────────────────────
 
-export function validIdentity(s: string): boolean {
+export function validAgent(s: string): boolean {
   if (!s) return false;
-  if (!IDENTITY_RE.test(s)) return false;
+  if (!AGENT_RE.test(s)) return false;
   if (RESERVED_NAMES.includes(s)) return false;
   return true;
 }
 
-export interface ResolveIdentityOpts {
-  /** explicit identity from `--from`, positional, etc. */
+/** @deprecated Use {@link validAgent}. */
+export const validIdentity = validAgent;
+
+export interface ResolveAgentOpts {
+  /** explicit agent name from `--from`, positional, etc. */
   explicit?: string | undefined;
-  /** environment to read COORD_IDENTITY from (defaults to process.env). */
+  /** environment to read ST_AGENT from (defaults to process.env). */
   env?: NodeJS.ProcessEnv;
-  /** override $COORD_ROOT used for the folder-existence check. */
+  /** override $ST_ROOT used for the folder-existence check. */
   coordRoot?: string;
   /**
    * Folder-existence policy when {@link explicit} is set.
-   * - `undefined` (default) → both `<id>/inbox` AND `<id>/archive`
+   * - `undefined` (default) → both `<agent>/inbox` AND `<agent>/archive`
    *   must exist. Use for writes (`--from <other>`) so the anti-
-   *   impersonation invariant holds: you can't act AS another
-   *   identity by half-fabricating their folder.
-   * - `'lenient'` → at least ONE of inbox/archive must exist. Use
-   *   for cross-identity reads (`coord ls <other>`, `coord read
-   *   <other>`, `coord thread <other>`, `coord watch <other>`):
-   *   a peer's folder is often partial on this machine — a single
-   *   `coord send <other>` lazily creates inbox/ but not archive/.
-   *   The actual file lookups below this gate are existsSync-gated,
-   *   so a missing folder is naturally treated as empty.
+   *   impersonation invariant holds: you can't act AS another agent by
+   *   half-fabricating their folder.
+   * - `'lenient'` → at least ONE of inbox/archive must exist. Use for
+   *   cross-agent reads (`coord ls <other>`, `coord read <other>`,
+   *   `coord thread <other>`, `coord watch <other>`): a peer's folder
+   *   is often partial on this machine — a single `coord send <other>`
+   *   lazily creates inbox/ but not archive/. The actual file lookups
+   *   below this gate are existsSync-gated, so a missing folder is
+   *   naturally treated as empty.
    *
-   * Ignored when `explicit` is unset — $COORD_IDENTITY always
-   * auto-creates regardless of `policy`.
+   * Ignored when `explicit` is unset — $ST_AGENT always auto-creates
+   * regardless of `policy`.
    */
   policy?: 'lenient';
 }
 
+/** @deprecated Use {@link ResolveAgentOpts}. */
+export type ResolveIdentityOpts = ResolveAgentOpts;
+
 /**
- * Resolve the active identity per LAYOUT-004 "Identity resolution":
+ * Resolve the active agent per LAYOUT-004 "Agent resolution":
  *   1. explicit arg if non-empty
- *   2. $COORD_IDENTITY env var
- *   3. throw "identity required"
+ *   2. $ST_AGENT env var (preferred)
+ *   3. $ST_IDENTITY env var (deprecated, warns once per process)
+ *   4. $COORD_IDENTITY env var (legacy, warns once per process)
+ *   5. throw "agent required"
  *
  * Folder-existence handling differs by source:
- *   - $COORD_IDENTITY (no explicit) → lazy bootstrap. First command
- *     for a new identity creates `<id>/{inbox,archive}` on demand.
- *     This is "you, claiming to be you" — no risk of impersonation.
- *   - explicit (--from <other>, positional <recipient>, etc.) →
- *     folder must already exist. Throws IdentityNotHostedError if
- *     not. Preserves anti-impersonation: you can't claim to act AS
- *     another identity by fabricating their folder on this machine.
+ *   - env-resolved (no explicit) → lazy bootstrap. First command for
+ *     a new agent creates `<agent>/{inbox,archive}` on demand. This is
+ *     "you, claiming to be you" — no risk of impersonation.
+ *   - explicit (--from <other>, positional <recipient>, etc.) → folder
+ *     must already exist. Throws AgentNotHostedError if not. Preserves
+ *     anti-impersonation: you can't claim to act AS another agent by
+ *     fabricating their folder on this machine.
+ *
+ * brief-009 item 3 (rename): the env-var fallback is now three levels
+ * deep — ST_AGENT → ST_IDENTITY (warn) → COORD_IDENTITY (warn). The
+ * two legacy names buy cos time to sweep ~8 pty.toml files at her own
+ * pace without breaking running agents.
  */
-export function resolveIdentity(opts: ResolveIdentityOpts = {}): string {
+export function resolveAgent(opts: ResolveAgentOpts = {}): string {
   const env = opts.env ?? process.env;
   const root = opts.coordRoot ?? coordRootFrom(env);
 
@@ -261,18 +274,22 @@ export function resolveIdentity(opts: ResolveIdentityOpts = {}): string {
   if (opts.explicit) {
     id = opts.explicit;
     fromExplicit = true;
+  } else if (env.ST_AGENT) {
+    id = env.ST_AGENT;
+    fromExplicit = false;
   } else if (env.ST_IDENTITY) {
     id = env.ST_IDENTITY;
     fromExplicit = false;
+    warnCoordFallback('ST_AGENT', 'ST_IDENTITY');
   } else if (env.COORD_IDENTITY) {
     id = env.COORD_IDENTITY;
     fromExplicit = false;
-    warnCoordFallback('ST_IDENTITY', 'COORD_IDENTITY');
+    warnCoordFallback('ST_AGENT', 'COORD_IDENTITY');
   } else {
-    throw new IdentityRequiredError();
+    throw new AgentRequiredError();
   }
-  if (!validIdentity(id)) {
-    throw new InvalidIdentityError(id);
+  if (!validAgent(id)) {
+    throw new InvalidAgentError(id);
   }
   if (fromExplicit) {
     if (opts.policy === 'lenient') {
@@ -281,13 +298,16 @@ export function resolveIdentity(opts: ResolveIdentityOpts = {}): string {
       assertIdentityFolderExists(id, root);
     }
   } else {
-    // Implicit ($COORD_IDENTITY) always auto-creates — "you,
-    // claiming to be you" needs no anti-impersonation guard, and
-    // a brand-new identity should bootstrap on its first command.
+    // Implicit ($ST_AGENT or fallback) always auto-creates — "you,
+    // claiming to be you" needs no anti-impersonation guard, and a
+    // brand-new agent should bootstrap on its first command.
     ensureIdentityDirs(id, root);
   }
   return id;
 }
+
+/** @deprecated Use {@link resolveAgent}. */
+export const resolveIdentity = resolveAgent;
 
 // ─── Paths ───────────────────────────────────────────────────────────────
 //
@@ -362,23 +382,30 @@ export function coordConfigFrom(env: NodeJS.ProcessEnv = process.env): string {
 }
 
 /**
- * Read the identity from `ST_IDENTITY` (preferred) or `COORD_IDENTITY`
- * (legacy, with one-time fallback notice). Returns `undefined` when
- * neither is set — callers throw their own context-specific error.
- * Mirrors the env-fallback half of {@link resolveIdentity} for code
- * paths (e.g. `coord mcp`) that read the env directly rather than
- * going through the full resolver.
+ * Read the agent name from `ST_AGENT` (preferred), `ST_IDENTITY`
+ * (deprecated, one-time fallback notice), or `COORD_IDENTITY` (legacy,
+ * one-time fallback notice). Returns `undefined` when none are set —
+ * callers throw their own context-specific error. Mirrors the
+ * env-fallback half of {@link resolveAgent} for code paths (e.g.
+ * `coord mcp`) that read the env directly.
  */
-export function envIdentityFrom(
+export function envAgentFrom(
   env: NodeJS.ProcessEnv = process.env
 ): string | undefined {
-  if (env.ST_IDENTITY && env.ST_IDENTITY.length > 0) return env.ST_IDENTITY;
+  if (env.ST_AGENT && env.ST_AGENT.length > 0) return env.ST_AGENT;
+  if (env.ST_IDENTITY && env.ST_IDENTITY.length > 0) {
+    warnCoordFallback('ST_AGENT', 'ST_IDENTITY');
+    return env.ST_IDENTITY;
+  }
   if (env.COORD_IDENTITY && env.COORD_IDENTITY.length > 0) {
-    warnCoordFallback('ST_IDENTITY', 'COORD_IDENTITY');
+    warnCoordFallback('ST_AGENT', 'COORD_IDENTITY');
     return env.COORD_IDENTITY;
   }
   return undefined;
 }
+
+/** @deprecated Use {@link envAgentFrom}. */
+export const envIdentityFrom = envAgentFrom;
 
 /**
  * The name the CLI was invoked as (`coord` / `st` / `smalltalk`).
@@ -423,8 +450,8 @@ export function archiveDir(id: string, root: string = coordRoot()): string {
   return join(root, id, 'archive');
 }
 
-export function journalDir(id: string, root: string = coordRoot()): string {
-  return join(root, id, 'journal');
+export function resourcesDir(id: string, root: string = coordRoot()): string {
+  return join(root, id, 'resources');
 }
 
 export function statusPath(id: string, root: string = coordRoot()): string {
@@ -444,7 +471,7 @@ export function assertIdentityFolderExists(
   const inbox = inboxDir(id, root);
   const archive = archiveDir(id, root);
   if (!isDir(inbox) || !isDir(archive)) {
-    throw new IdentityNotHostedError(id);
+    throw new AgentNotHostedError(id);
   }
 }
 
@@ -464,7 +491,7 @@ export function assertIdentityFolderExistsLenient(
   const inbox = inboxDir(id, root);
   const archive = archiveDir(id, root);
   if (!isDir(inbox) && !isDir(archive)) {
-    throw new IdentityNotHostedError(id);
+    throw new AgentNotHostedError(id);
   }
 }
 

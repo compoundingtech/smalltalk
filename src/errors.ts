@@ -22,36 +22,49 @@ export class CoordError extends Error {
   }
 }
 
-// ─── Identity / argument validation ────────────────────────────────────
+// ─── Agent / argument validation ───────────────────────────────────────
+//
+// brief-009 item 3 (rename): error class names changed from `Identity*`
+// to `Agent*`. The error CODE strings (IDENTITY_REQUIRED etc.) stay
+// stable — they're wire format that downstream pattern-matchers
+// (instanceof + .code branches) depend on. Old class names remain as
+// deprecated aliases pointing at the new classes for one release.
 
-export class IdentityRequiredError extends CoordError {
+export class AgentRequiredError extends CoordError {
   constructor() {
     super(
       'IDENTITY_REQUIRED',
-      'identity required — set COORD_IDENTITY or pass --from <id>'
+      'agent required — set ST_AGENT (or legacy ST_IDENTITY / COORD_IDENTITY) or pass --from <agent>'
     );
   }
 }
 
-export class IdentityNotHostedError extends CoordError {
+export class AgentNotHostedError extends CoordError {
   readonly identity: string;
   constructor(identity: string) {
     super(
       'IDENTITY_NOT_HOSTED',
-      `identity folder missing for ${identity} — create it: mkdir -p $COORD_ROOT/${identity}/{inbox,archive}`,
+      `agent folder missing for ${identity} — create it: mkdir -p $ST_ROOT/${identity}/{inbox,archive}`,
       { identity }
     );
     this.identity = identity;
   }
 }
 
-export class InvalidIdentityError extends CoordError {
+export class InvalidAgentError extends CoordError {
   readonly value: string;
   constructor(value: string) {
-    super('INVALID_IDENTITY', `invalid identity: ${value}`, { value });
+    super('INVALID_IDENTITY', `invalid agent name: ${value}`, { value });
     this.value = value;
   }
 }
+
+/** @deprecated Use {@link AgentRequiredError}. */
+export const IdentityRequiredError = AgentRequiredError;
+/** @deprecated Use {@link AgentNotHostedError}. */
+export const IdentityNotHostedError = AgentNotHostedError;
+/** @deprecated Use {@link InvalidAgentError}. */
+export const InvalidIdentityError = InvalidAgentError;
 
 export class InvalidFilenameError extends CoordError {
   readonly value: string;
@@ -177,6 +190,34 @@ export class ArchiveConflictError extends CoordError {
     );
     this.identity = identity;
     this.filename = filename;
+  }
+}
+
+// ─── Resources (brief-009 item 5) ──────────────────────────────────────
+
+export class ResourceNotFoundError extends CoordError {
+  readonly identity: string;
+  readonly filename: string;
+  constructor(identity: string, filename: string) {
+    super(
+      'RESOURCE_NOT_FOUND',
+      `resource not found: ${identity}/resources/${filename}`,
+      { identity, filename }
+    );
+    this.identity = identity;
+    this.filename = filename;
+  }
+}
+
+export class InvalidResourceUrlError extends CoordError {
+  readonly value: string;
+  constructor(value: string) {
+    super(
+      'INVALID_RESOURCE_URL',
+      `invalid resource url: ${JSON.stringify(value)} (must contain a scheme, e.g. https://, pty://)`,
+      { value }
+    );
+    this.value = value;
   }
 }
 

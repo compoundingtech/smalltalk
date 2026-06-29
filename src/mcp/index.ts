@@ -29,9 +29,10 @@ import { buildServerInfo, buildServerOptions } from './capabilities.ts';
 import { evaluateDrift } from './tidy-check.ts';
 import { registerArchiveTool } from './tools/archive.ts';
 import { registerLsTool } from './tools/ls.ts';
-import { registerMembersTool } from './tools/members.ts';
+import { registerAgentsTool } from './tools/agents.ts';
 import { registerReadTool } from './tools/read.ts';
 import { registerReplyTool } from './tools/reply.ts';
+import { registerResourceTools } from './tools/resource.ts';
 import { registerSendTool } from './tools/send.ts';
 import { registerThreadTool } from './tools/thread.ts';
 
@@ -128,9 +129,12 @@ export function createMcpServer(opts: McpServerOptions): McpServerHandle {
   registerReadTool(mcp, coord);
   registerArchiveTool(mcp, coord);
   registerThreadTool(mcp, coord);
-  // coord_members is available in both modes — peer discovery is
-  // useful regardless of whether channel push is on.
-  registerMembersTool(mcp, coord);
+  // coord_agents (+ coord_members deprecated alias) is available in
+  // both modes — peer discovery is useful regardless of channel.
+  registerAgentsTool(mcp, coord);
+  // coord_resource_* (brief-009 item 5): add/ls/read/remove. Available
+  // in both modes; resources are part of the always-on agent surface.
+  registerResourceTools(mcp, coord);
   if (channel) {
     // coord_msg_reply is the channel-mode partner of the inbox watcher.
     registerReplyTool(mcp, coord);
@@ -220,20 +224,15 @@ export function createMcpServer(opts: McpServerOptions): McpServerHandle {
     }
   };
 
-  // brief-030: periodic tidy-check tick. Walks inbox / journal for
-  // drift conditions; emits a synthetic
-  // `notifications/claude/channel` frame (from: coord-system) when
-  // anything new has drifted since the last emit. No emit when status
-  // is busy/dnd/unknown — busy/dnd defer until the agent flips back;
-  // unknown means we don't know what state they're in and shouldn't
-  // pile on. Dedup is per-condition: if the same drift booleans fired
-  // last time, don't re-fire. A condition that cleared and re-emerged
-  // does re-fire (the dedup tracks current state, not historical).
+  // brief-030: periodic tidy-check tick. Walks inbox for drift; emits
+  // a synthetic `notifications/claude/channel` frame (from:
+  // coord-system) when drift turns from false→true since the last
+  // emit. No emit when status is busy/dnd/unknown — busy/dnd defer
+  // until the agent flips back; unknown means we don't know what state
+  // they're in and shouldn't pile on. Dedup tracks current state, not
+  // historical: a drift that clears and re-emerges fires again.
   let tidyCheckTimer: ReturnType<typeof setInterval> | undefined;
-  let lastTidyFired: {
-    inbox: boolean;
-    journal: boolean;
-  } = { inbox: false, journal: false };
+  let lastTidyFired: { inbox: boolean } = { inbox: false };
   const tidyCheck = (): void => {
     if (!opts.identity || opts.identity.length === 0) return;
     let currentStatus: string;
@@ -258,11 +257,9 @@ export function createMcpServer(opts: McpServerOptions): McpServerHandle {
     } catch {
       return; // best-effort
     }
-    // New-condition test: at least one boolean went false→true
-    // compared to last fired. Same-or-less drift doesn't re-emit.
-    const newCondition =
-      (drift.inbox && !lastTidyFired.inbox) ||
-      (drift.journal && !lastTidyFired.journal);
+    // New-condition test: drift went false→true compared to last
+    // fired. Same-or-less drift doesn't re-emit.
+    const newCondition = drift.inbox && !lastTidyFired.inbox;
     if (newCondition && drift.body.length > 0) {
       void mcp.server
         .notification({
@@ -285,10 +282,7 @@ export function createMcpServer(opts: McpServerOptions): McpServerHandle {
     // Update lastTidyFired on every eligible tick (not just emits)
     // so a drift that clears stops looking "new" on its next
     // recurrence — only the recurrence-after-clear fires.
-    lastTidyFired = {
-      inbox: drift.inbox,
-      journal: drift.journal,
-    };
+    lastTidyFired = { inbox: drift.inbox };
   };
   const startTidyCheck = (): void => {
     const ms = opts.tidyCheckIntervalMs ?? TIDY_CHECK_INTERVAL_MS;

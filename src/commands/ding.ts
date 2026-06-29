@@ -188,7 +188,7 @@ export async function runDing(deps: DingDeps): Promise<void> {
   // pty-sends a single-line summary when a new condition appears.
   const tidyIntervalMs = deps.tidyIntervalMs ?? TIDY_CHECK_INTERVAL_MS;
   let tidyTimer: ReturnType<typeof setInterval> | undefined;
-  let lastTidyFired = { inbox: false, doingTask: false, journal: false };
+  let lastTidyFired = { inbox: false };
   async function runTidyTick(): Promise<void> {
     let state: State;
     try {
@@ -209,10 +209,7 @@ export async function runDing(deps: DingDeps): Promise<void> {
       log(`coord ding: tidy evaluate failed: ${errMsg(err)}\n`);
       return;
     }
-    const newCondition =
-      (drift.inbox && !lastTidyFired.inbox) ||
-      (drift.doingTask && !lastTidyFired.doingTask) ||
-      (drift.journal && !lastTidyFired.journal);
+    const newCondition = drift.inbox && !lastTidyFired.inbox;
     if (newCondition && drift.body.length > 0) {
       const text = formatTidyLine(drift);
       let result: { status: number; stderr: string };
@@ -236,11 +233,7 @@ export async function runDing(deps: DingDeps): Promise<void> {
     // Update lastFired on every eligible tick (not just emits) so a
     // drift that clears stops counting as "old news" — only its
     // recurrence-after-clear re-fires.
-    lastTidyFired = {
-      inbox: drift.inbox,
-      doingTask: drift.doingTask,
-      journal: drift.journal,
-    };
+    lastTidyFired = { inbox: drift.inbox };
   }
   function startTidyTick(): void {
     if (tidyIntervalMs <= 0) return;
@@ -516,18 +509,7 @@ const defaultIsSessionAlive: IsSessionAlive = (sessionName) => {
  * Codex sees this as one line of typed input, so we keep it scannable.
  */
 function formatTidyLine(drift: DriftResult): string {
-  const parts: string[] = [];
-  if (drift.inbox) {
-    parts.push(
-      `inbox=${drift.detail.inboxStaleCount} (oldest ${formatAge(drift.detail.oldestInboxAgeMs)})`
-    );
-  }
-  if (drift.journal) {
-    parts.push(
-      `no journal entry for ${formatAge(drift.detail.journalLagMs)}`
-    );
-  }
-  return `coord tidy-check: ${parts.join('; ')}.`;
+  return `coord tidy-check: inbox=${drift.detail.inboxStaleCount} (oldest ${formatAge(drift.detail.oldestInboxAgeMs)}).`;
 }
 
 function formatAge(ms: number): string {
@@ -660,7 +642,7 @@ export async function cmdDingCli(
             '  <pty-session> on every new arrival. Buffers while status\n' +
             '  is busy/dnd; flushes when status flips back to available.\n' +
             '  Also runs a periodic tidy-check that pty-sends a drift\n' +
-            '  summary when inbox/tasks/journal are out of date, AND\n' +
+            '  summary when inbox is out of date, AND\n' +
             "  refreshes the watched identity's status file mtime so\n" +
             "  the identity doesn't fall into `unknown` over long\n" +
             "  inactivity (mirrors the MCP server's brief-023 behavior\n" +

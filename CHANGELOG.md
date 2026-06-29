@@ -6,6 +6,148 @@ minor releases until 1.0.
 
 ## Unreleased
 
+### Renamed (brief-009 item 3 — identity → agent)
+
+**Soft-breaking with a deprecation chain.** The project's primary
+noun changed from `identity` to `agent`. Every old name is kept as a
+deprecated alias for one release cycle, so existing embedders /
+running agents / consuming pty.toml configs all keep working
+unchanged. Cos coordinates the per-machine pty.toml sweep over the
+~8 downstream repos at her own pace.
+
+- **SDK types:** `Agent` brand (replaces `Identity`); `asAgent` /
+  `isAgent` (replace `asIdentity` / `isIdentity`). Old names are
+  `@deprecated` re-exports pointing at the new brand — values are
+  interchangeable.
+- **SDK errors:** `AgentRequiredError` / `AgentNotHostedError` /
+  `InvalidAgentError`. Old `Identity*Error` names are `@deprecated`
+  consts aliased to the new classes — `instanceof` works either way.
+  Error CODE strings (`IDENTITY_REQUIRED`, `IDENTITY_NOT_HOSTED`,
+  `INVALID_IDENTITY`) stay stable as wire format. Error MESSAGE
+  text changed ("identity required" → "agent required", etc.).
+- **CLI verb:** `coord agents` (canonical) + `coord members`
+  (deprecated alias) — both dispatch to the same handler.
+- **MCP tool:** `coord_agents` + `st_agents` registered as the
+  canonical names; `coord_members` + `st_members` kept as deprecated
+  aliases pointing at the same handler. All four tool names work.
+- **Env vars (cos coordinates):** `ST_AGENT` (preferred) → `ST_IDENTITY`
+  (deprecated, warns once per process) → `COORD_IDENTITY` (legacy,
+  warns once per process). The `[smalltalk] honoring … — migrate to
+  ST_AGENT when convenient` notice fires per legacy hit. Per-machine
+  `pty.toml` env blocks should migrate from `COORD_IDENTITY` /
+  `ST_IDENTITY` to `ST_AGENT` at cos's pace; no flag day required.
+- **SDK helpers:** `resolveAgent` / `envAgentFrom` (replace
+  `resolveIdentity` / `envIdentityFrom`). Old names aliased.
+- **Internal:** `validAgent` (replaces `validIdentity`); `cmdAgents`
+  / `cmdAgentsCli` / `getAgents` / `listAgents` (replace `cmdMembers`
+  / `cmdMembersCli` / `getMembers` / `listIdentities`). All old
+  names aliased.
+- **RESERVED_NAMES:** adds `agents`; keeps `members` (deprecated CLI
+  verb name).
+- **Field names on returned shapes** (e.g.
+  `MessageWithLocation.identity`, `Overview.members`) — KEPT as-is
+  for one release for back-compat with embedder destructures. A
+  follow-up release will rename them to `.agent` / `.agents`.
+- **`<channel source="coord" from="…">`** — KEPT as-is. Phase 5 of
+  brief-005 (the `coord_*` tool-name drop) owns flipping this to
+  `source="st"`.
+- **VERSION** bumps to `0.7.0`.
+- **Docs:** README, LAYOUT.md updated to lead with "agent" and the
+  three-level env-var fallback.
+
+Downstream sweep (cos owns): `[sessions.*.env].COORD_IDENTITY` (or
+`ST_IDENTITY`) → `ST_AGENT` across ~8 pty.toml repos; agent boot
+rituals referencing `coord_members` / `coord members` →
+`coord_agents` / `coord agents`. Three-level fallback means nothing
+breaks mid-sweep.
+
+### Added (brief-009 item 5 — `resources/` surface)
+
+A third optional per-identity folder for publishing annotated URLs to
+peers. Each resource is `<unix-ms>-<rand6>.md` with `url:` in
+frontmatter (required) and optional `title:` / `tags:` / `relation:`
+/ body description. Mirrors the inbox-vs-archive single-writer rule:
+`resources/` is owned by its identity; peers read via sync.
+
+- **CLI:** `coord resource add <url> [--title T] [--tag T,T]
+  [--relation REL] [--body-stdin]`, `coord resource ls [<identity>]
+  [--json]`, `coord resource read [<identity>] <filename> [--json]`,
+  `coord resource rm <filename>`.
+- **SDK:** `coord.resources.{add,list,read,remove}` on the Coord
+  handle. New types `Resource` + `ResourceWithLocation` re-exported
+  from `@myobie/coord`.
+- **MCP:** four new tools, dual-prefixed (`coord_resource_*` +
+  `st_resource_*`) — `resource_add`, `resource_ls`, `resource_read`,
+  `resource_remove`. Available in both channel and non-channel modes.
+- **LAYOUT.md** documents the new folder + frontmatter shape.
+- **RESERVED_NAMES** adds `resources` so an identity can't shadow the
+  folder name.
+- **New errors:** `ResourceNotFoundError`, `InvalidResourceUrlError`.
+- **VERSION** bumps to `0.6.0`.
+
+URL validation is intentionally lenient: any string with a scheme
+prefix (`https://`, `pty://`, anything else an agent invents) is
+accepted. The `pty://<session-name>` convention is documented but
+not enforced.
+
+The `relation:` field is **very optional** — absent by default,
+**never inferred** from the URL / title / tags. The bare URL stays
+first-class with or without it. Canonical (non-enforced) values:
+`owns`, `relates-to`, `depends-on`. Agents may invent their own
+relation strings; the schema is free-form.
+
+### Docs (brief-009 add-on — onboard-a-friend support)
+
+Three new notes added, plus a small update to an existing one, to
+bring narrative docs in line with the slimmed-down surface and to
+name the actor-model framing the system has always implicitly
+assumed:
+
+- **`notes/actor-model.md`** *(new)*: maps actor-model concepts —
+  actor / mailbox / state / encapsulation / asynchrony — to coord's
+  data shape. Provides the framing that makes the encapsulation rule
+  ("across identities, only `inbox/` is writable") and the
+  Coord-threads-stay-on-coord rule fall out as obvious consequences
+  rather than ad-hoc conventions.
+- **`notes/onboarding.md`** *(new)*: public zero-to-first-message
+  recipe for a fresh participant (human or agent). Covers install,
+  identity pick, status, send/receive, MCP wiring, and sync. The
+  pre-existing `notes/agent-onboarding.md` is `.gitignore`'d (it's a
+  myobie-specific machine runbook); this is the shippable
+  counterpart.
+- **`notes/repo-ownership.md`** *(new)*: codifies the
+  `<repo>-claude` identity-naming convention and notes where the
+  binding actually lives at runtime (`pty.toml`, `.mcp.json`). Points
+  to brief-009 item 5 (resources) as the formal mechanism that will
+  supersede the convention.
+- **`notes/agent-roles.md`** *(minor update)*: reframed the future
+  "external task tracker" paragraph to acknowledge tasks/journal are
+  gone and point at the actor-model doc.
+
+### Removed (brief-009 item 2 — `journal/` surface gone)
+
+**Breaking.** The `journal/` folder and every CLI/MCP surface that
+referenced it is removed. Same motivation as the tasks removal: paring
+the surface to what the friend onboarding actually needs.
+
+- **CLI:** `coord journal new/ls/cat/tail` deleted (\`src/commands/journal.ts\`
+  removed).
+- **MCP onboarding text:** the channel-mode instructions no longer
+  reference journal entries; the boot ritual is now status + inbox-drain
+  + members only.
+- **MCP tidy-check:** the journal-lag drift condition is gone.
+  Detection is **inbox staleness only**; \`DriftResult\` and
+  \`DriftDetail\` shrank accordingly.
+- **\`coord ding\`:** the tidy-line is now \`coord tidy-check: inbox=N
+  (oldest Xm).\` (no journal segment).
+- **RESERVED_NAMES:** \`journal\` is dropped.
+- **Removed constant:** \`STALE_JOURNAL_MS\`.
+- **Removed helper:** \`journalDir()\`.
+- **Downstream impact:** consuming agents that reference \`coord
+  journal\` in their boot rituals need to drop those steps. The cos
+  agent owns sweeping the consuming agent CLAUDE.md files alongside
+  the tasks-removal sweep.
+
 ### Removed (brief-009 item 1 — `tasks/` surface gone)
 
 **Breaking.** The `tasks/` folder and every CLI/SDK/MCP surface that
@@ -16,8 +158,9 @@ onboarding story.
 - **CLI:** `coord task ...` and `coord tasks` subcommands deleted.
 - **MCP onboarding text:** the channel-mode instructions no longer
   reference task-file ritual.
-- **MCP tidy-check:** the `doingTask` drift condition is gone;
-  detection now covers inbox staleness + journal lag only.
+- **MCP tidy-check:** the `doingTask` drift condition is gone; the
+  detector now covers inbox + journal-lag (journal-lag is removed in
+  the next entry, item 2).
 - **SDK:** no task types/methods were exposed (none existed); the
   `MemberTaskCounts` type and the `tasks` field on
   `MemberSummaryEnriched` / `coord_members` (enriched) are removed.

@@ -24,8 +24,6 @@ describe('CHANNEL_INSTRUCTIONS — load-bearing substrings', () => {
     'coord_msg_reply',
     // Peer discovery
     'coord_members',
-    // Journal verb (brief-025 — narrative work record; CLI shell-out)
-    'coord journal new',
     // Channel-arrival message format
     '<channel source="coord"',
     // Coord-threads-stay-on-coord rule: any thread originated via channel
@@ -46,9 +44,5 @@ describe('CHANNEL_INSTRUCTIONS — load-bearing substrings', () => {
     // boot-ritual form has multiple sections separated by blank lines.
     // Guard against a refactor that collapses it back.
     expect(CHANNEL_INSTRUCTIONS.split('\n').length).toBeGreaterThanOrEqual(10);
-  });
-
-  it('mentions journal as the narrative work record', () => {
-    expect(CHANNEL_INSTRUCTIONS).toMatch(/journal new|journal\//i);
   });
 });

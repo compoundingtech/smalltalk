@@ -34,15 +34,22 @@ import {
 } from './commands/archive.ts';
 import { cmdLs } from './commands/ls.ts';
 import {
-  getMembers,
-  type MemberSummary,
-  type MemberSummaryEnriched,
-} from './commands/members.ts';
+  getAgents,
+  type AgentSummary,
+  type AgentSummaryEnriched,
+} from './commands/agents.ts';
 import {
   getOverview,
   type Overview,
 } from './commands/overview.ts';
 import { cmdRead } from './commands/read.ts';
+import {
+  cmdResourceAdd,
+  cmdResourceRead,
+  cmdResourceRemove,
+  listResourceRecords,
+  type ResourceRecord,
+} from './commands/resource.ts';
 import { cmdSend } from './commands/send.ts';
 import { cmdStatus } from './commands/status.ts';
 import {
@@ -79,6 +86,8 @@ import {
   type MessageWithLocation,
   type Peer,
   type Priority,
+  type Resource,
+  type ResourceWithLocation,
   type State,
   type WatchEvent,
 } from './types.ts';
@@ -192,13 +201,18 @@ export interface Coord {
   setStatus(identity: Identity, state: State): Promise<void>;
   /**
    * brief-028: enumerate identities under $COORD_ROOT. Mirrors
-   * `coord members` but returns the typed payload directly so an
+   * `coord agents` but returns the typed payload directly so an
    * embedder can render their own UI without re-parsing.
    */
+  agents(opts?: {
+    status?: State;
+    enrich?: boolean;
+  }): AgentSummary[] | AgentSummaryEnriched[];
+  /** @deprecated Use {@link Coord.agents}. */
   members(opts?: {
     status?: State;
     enrich?: boolean;
-  }): MemberSummary[] | MemberSummaryEnriched[];
+  }): AgentSummary[] | AgentSummaryEnriched[];
   /**
    * brief-028: at-a-glance dashboard for `identity` (defaults to the
    * handle's own identity). Mirrors `coord overview`.
@@ -214,6 +228,27 @@ export interface Coord {
    */
   createIdentity(name: string): Promise<{ created: boolean }>;
   sweep(): Promise<{ removed: number }>;
+  /**
+   * brief-009 item 5: read/write annotated URLs an identity surfaces to
+   * peers. Lives at `<root>/<identity>/resources/<filename>.md`. Add /
+   * remove operate on the handle's OWN identity (single-writer per the
+   * LAYOUT encapsulation rule); list / read accept any identity.
+   */
+  resources: {
+    add(input: {
+      url: string;
+      title?: string;
+      tags?: string[];
+      /** Optional free-form relation: `owns` / `relates-to` /
+       *  `depends-on` are canonical (non-enforced); agents may invent
+       *  their own. Never inferred — absent by default. */
+      relation?: string;
+      body?: string;
+    }): Promise<Filename>;
+    list(identity?: Identity): Promise<ResourceWithLocation[]>;
+    read(identity: Identity, filename: Filename): Promise<Resource>;
+    remove(filename: Filename): Promise<void>;
+  };
   sync: {
     push(peer: Peer): Promise<SyncResult>;
     pull(peer: Peer): Promise<SyncResult>;
@@ -422,8 +457,14 @@ export function createCoord(options: CoordOptions): Coord {
       });
     },
 
-    members(opts = {}): MemberSummary[] | MemberSummaryEnriched[] {
-      return getMembers(root, {
+    agents(opts = {}): AgentSummary[] | AgentSummaryEnriched[] {
+      return getAgents(root, {
+        ...(opts.status !== undefined && { status: opts.status }),
+        ...(opts.enrich !== undefined && { enrich: opts.enrich }),
+      });
+    },
+    members(opts = {}): AgentSummary[] | AgentSummaryEnriched[] {
+      return getAgents(root, {
         ...(opts.status !== undefined && { status: opts.status }),
         ...(opts.enrich !== undefined && { enrich: opts.enrich }),
       });
@@ -450,6 +491,44 @@ export function createCoord(options: CoordOptions): Coord {
 
     async sweep(): Promise<{ removed: number }> {
       return runSweep(root);
+    },
+
+    resources: {
+      async add(input): Promise<Filename> {
+        const r = cmdResourceAdd({
+          url: input.url,
+          ...(input.title !== undefined && { title: input.title }),
+          ...(input.tags !== undefined && { tags: input.tags }),
+          ...(input.relation !== undefined && { relation: input.relation }),
+          ...(input.body !== undefined && { body: input.body }),
+          identity,
+          env: lib_env,
+          coordRoot: root,
+        });
+        return asFilename(r.filename);
+      },
+      async list(id?): Promise<ResourceWithLocation[]> {
+        const target = id ?? identity;
+        const recs = listResourceRecords(target, root);
+        return recs.map((rec) => recordToWithLocation(rec, target));
+      },
+      async read(id, filename): Promise<Resource> {
+        const r = cmdResourceRead({
+          identity: id,
+          filename,
+          env: lib_env,
+          coordRoot: root,
+        });
+        return recordToResource(r.record);
+      },
+      async remove(filename): Promise<void> {
+        cmdResourceRemove({
+          identity,
+          filename,
+          env: lib_env,
+          coordRoot: root,
+        });
+      },
     },
 
     sync: {
@@ -519,6 +598,25 @@ export function createCoord(options: CoordOptions): Coord {
 }
 
 // ─── Helpers ────────────────────────────────────────────────────────────
+
+function recordToResource(rec: ResourceRecord): Resource {
+  const r: Resource = { url: rec.url, body: rec.body };
+  if (rec.title !== null) r.title = rec.title;
+  if (rec.tags.length > 0) r.tags = rec.tags;
+  if (rec.relation !== null) r.relation = rec.relation;
+  return r;
+}
+
+function recordToWithLocation(
+  rec: ResourceRecord,
+  identity: string
+): ResourceWithLocation {
+  return {
+    resource: recordToResource(rec),
+    identity: asIdentity(identity),
+    filename: asFilename(rec.filename),
+  };
+}
 
 function toMessageWithLocation(
   fm: Record<string, unknown>,

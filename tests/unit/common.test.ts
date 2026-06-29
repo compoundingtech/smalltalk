@@ -99,7 +99,6 @@ describe('constants', () => {
     for (const name of [
       'inbox',
       'archive',
-      'journal', // brief-024
       'status',
       'name',
       'offline',
@@ -115,14 +114,6 @@ describe('constants', () => {
     }
     // Names that look reserved but are not.
     expect(RESERVED_NAMES.includes('outbox')).toBe(false);
-  });
-
-  it('validIdentity rejects `journal` (reserved per brief-024)', () => {
-    // Sanity that the reserved-list addition propagates through
-    // identity validation — otherwise someone could create a folder
-    // named `journal/` at $COORD_ROOT and shadow every identity's
-    // `journal/` sub-folder.
-    expect(validIdentity('journal')).toBe(false);
   });
 
   it('validIdentity rejects `away` (reserved per brief-029)', () => {
@@ -397,7 +388,7 @@ describe('resolveIdentity', () => {
         env: {} as NodeJS.ProcessEnv,
         coordRoot: coordRootDir,
       })
-    ).toThrowError(/invalid identity/);
+    ).toThrowError(/invalid (agent name|identity)/);
   });
 
   it('errors when the identity is a reserved name', () => {
@@ -407,7 +398,7 @@ describe('resolveIdentity', () => {
         env: {} as NodeJS.ProcessEnv,
         coordRoot: coordRootDir,
       })
-    ).toThrowError(/invalid identity/);
+    ).toThrowError(/invalid (agent name|identity)/);
   });
 
   it('errors with the mkdir hint when the folder is missing', () => {
@@ -417,7 +408,7 @@ describe('resolveIdentity', () => {
         env: {} as NodeJS.ProcessEnv,
         coordRoot: coordRootDir,
       })
-    ).toThrowError(/identity folder missing for ghost/);
+    ).toThrowError(/(agent|identity) folder missing for ghost/);
   });
 
   it('errors with the mkdir hint when only inbox exists', () => {
@@ -428,7 +419,7 @@ describe('resolveIdentity', () => {
         env: {} as NodeJS.ProcessEnv,
         coordRoot: coordRootDir,
       })
-    ).toThrowError(/identity folder missing/);
+    ).toThrowError(/(agent|identity) folder missing/);
   });
 
   // ─── First-run polish: lazy bootstrap on $COORD_IDENTITY ────────────
@@ -474,7 +465,7 @@ describe('resolveIdentity', () => {
         env: { COORD_IDENTITY: 'whoever' } as NodeJS.ProcessEnv,
         coordRoot: coordRootDir,
       })
-    ).toThrowError(/identity folder missing for ghost/);
+    ).toThrowError(/(agent|identity) folder missing for ghost/);
   });
 
   it('--from <other> matching an existing identity still works after self bootstrap', () => {
@@ -525,7 +516,7 @@ describe('resolveIdentity', () => {
         coordRoot: coordRootDir,
         policy: 'lenient',
       })
-    ).toThrowError(/identity folder missing for phantom/);
+    ).toThrowError(/(agent|identity) folder missing for phantom/);
   });
 
   it("policy: 'lenient' is ignored on the $COORD_IDENTITY path (still auto-creates)", () => {
@@ -605,14 +596,14 @@ describe('assertIdentityFolderExists', () => {
     expect(() =>
       assertIdentityFolderExists('alice', coordRootDir)
     ).toThrowError(
-      /identity folder missing for alice — create it: mkdir -p \$COORD_ROOT\/alice\/{inbox,archive}/
+      /(agent|identity) folder missing for alice — create it: mkdir -p \$(ST|COORD)_ROOT\/alice\/{inbox,archive}/
     );
   });
 
   it('throws when archive is missing', () => {
     mkdirSync(join(coordRootDir, 'alice', 'inbox'), { recursive: true });
     expect(() => assertIdentityFolderExists('alice', coordRootDir)).toThrowError(
-      /identity folder missing/
+      /(agent|identity) folder missing/
     );
   });
 

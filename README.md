@@ -1,12 +1,17 @@
 # coord
 
 A small Node CLI **and** TypeScript library for the **coord** file-folder
-convention. The folder is the API: `<identity>/inbox/`, `<identity>/archive/`,
-plus the optional `<identity>/journal/` log, plain markdown files with YAML
-frontmatter, plain `rsync` between machines.
+convention. The folder is the API: `<identity>/inbox/` and
+`<identity>/archive/`, plain markdown files with YAML frontmatter, plain
+`rsync` between machines.
 
 - **Convention:** [LAYOUT.md](LAYOUT.md) — the binding spec.
 - **Philosophy:** [IDEA.md](IDEA.md).
+- **Framing:** [notes/actor-model.md](notes/actor-model.md) — how
+  smalltalk realizes the actor model in folders and files.
+- **Onboarding:** [notes/onboarding.md](notes/onboarding.md) —
+  zero-to-first-message for a new participant.
+- **Repo ownership convention:** [notes/repo-ownership.md](notes/repo-ownership.md).
 - **Walkthrough:** [notes/walkthrough.md](notes/walkthrough.md) — three
   participants, three machines, an end-to-end play.
 - **Loss argument:** [notes/PROOF.md](notes/PROOF.md).
@@ -16,7 +21,7 @@ frontmatter, plain `rsync` between machines.
 ## Why this shape
 
 **The one rule: across identities, only `inbox/` is writable.** Every
-other folder under an identity — `archive/`, `journal/`, `status` — is
+other folder under an identity — `archive/`, `status` — is
 single-writer, owned by that identity. Peers read but never write. This
 gives you several useful properties for free:
 
@@ -27,10 +32,10 @@ gives you several useful properties for free:
   reads at their own pace.
 
 - **No cross-identity edits.** One identity can't reach into another's
-  `journal/` and edit an entry it doesn't own. If you want a peer to do
-  something, you message their inbox suggesting it. They decide whether
-  to act and update their own state. That's the entire authorization
-  model.
+  `archive/` and re-open a message it doesn't own. If you want a peer
+  to do something, you message their inbox suggesting it. They decide
+  whether to act and update their own state. That's the entire
+  authorization model.
 
 - **Inbox files can carry attachments.** The inbox is just a folder —
   alongside the canonical `<ts>-<rand6>.md` message file, a sender can
@@ -76,16 +81,24 @@ has migrated. For now:
 
 - All three CLI names — `st`, `smalltalk`, `coord` — are installed and
   behave identically.
+- The primary noun is **agent** (brief-009 item 3, replacing the older
+  *identity*). The deprecated alias also works everywhere — the
+  `members` CLI verb still dispatches to `agents`; `coord_members` MCP
+  tool still hits the same handler as `coord_agents`; the SDK keeps
+  `Identity` / `asIdentity` / `IdentityRequiredError` as `@deprecated`
+  type aliases of `Agent` / `asAgent` / `AgentRequiredError`.
 - MCP tools are dual-registered: every `coord_<verb>` (e.g.
   `coord_msg_ls`) is also reachable as `st_<verb>` (`st_msg_ls`). Same
   schema, same handler.
 - The MCP server announces itself as `coord` or `st` depending on
   which binary was invoked.
-- Environment variables follow the same pattern. The CLI honors both
-  `ST_IDENTITY` (preferred) and `COORD_IDENTITY` (legacy), and the
-  same for `ST_ROOT` / `COORD_ROOT`. When only the legacy name is
-  set, a one-time stderr notice ("`[smalltalk] honoring COORD_…`")
-  flags that the config can migrate when convenient.
+- Environment variables follow a three-level fallback chain. The CLI
+  honors `ST_AGENT` (preferred) → `ST_IDENTITY` (deprecated) →
+  `COORD_IDENTITY` (legacy). Same shape for `ST_ROOT` / `COORD_ROOT`
+  (two-level). Each legacy hit emits a one-time stderr notice
+  (`[smalltalk] honoring … — migrate to ST_AGENT when convenient`) so
+  operators can sweep per-machine config at their own pace. A future
+  release drops the legacy honors.
 - The default state directory is `~/.local/state/smalltalk` for fresh
   installs; existing installs at `~/.local/state/coord` continue
   working unchanged. Set `ST_ROOT` / `COORD_ROOT` to override.
@@ -101,12 +114,13 @@ of the same name, so plugins can extend the CLI without shadowing it.
 ## First time on a machine
 
 ```sh
-mkdir -p $HOME/.local/state/coord/alice/{inbox,archive}
-export COORD_IDENTITY=alice
+mkdir -p $HOME/.local/state/smalltalk/alice/{inbox,archive}
+export ST_AGENT=alice
 ```
 
-`COORD_IDENTITY` (or an explicit `--from <id>` per command) tells coord
-which identity is acting; commands die loudly when neither is set.
+`ST_AGENT` (or an explicit `--from <agent>` per command) tells coord
+which agent is acting; commands die loudly when none of `ST_AGENT` /
+`ST_IDENTITY` / `COORD_IDENTITY` are set.
 
 To wire up an MCP host (Claude Code, etc.) inside a repo, run `coord init`
 in that repo's root. It writes (or merges into) a `.mcp.json` with the
@@ -133,10 +147,10 @@ coord message read bob 1714826789012-x9k4mz.md              # parsed view of one
 coord message archive 1714826789012-x9k4mz.md               # mv inbox -> archive
 coord message thread bob 1714826789012-x9k4mz.md            # walk the in-reply-to chain
 coord status --set busy                                     # update my status (available | busy | away | dnd | offline)
-coord journal new "shipped brief-024" --tag layout          # terse work-log entry
-coord journal tail worker-claude -n 5                       # follow a peer's narrative
-coord members --status available                            # who's around?
+coord agents --status available                             # who's around? (alias: members)
 coord overview                                              # at-a-glance dashboard
+coord resource add https://github.com/myobie/smalltalk/pull/19  # publish a URL alice cares about
+coord resource ls bob                                       # what URLs has bob published?
 coord init                                                  # wire .mcp.json into the current repo
 coord sync pull --all                                       # conservative cron
 coord watch                                                 # cross-tree activity
@@ -157,9 +171,7 @@ coord completions zsh  > "${fpath[1]}/_coord"
 ```
 
 The scripts complete subcommands, their verbs and flags, and the closed
-value sets (status states, priorities). The fish script also
-disambiguates the reused verbs (`ls`, `new`) across the `message` /
-`journal` groups.
+value sets (status states, priorities).
 
 ## Programmatic API
 
@@ -167,14 +179,14 @@ Embed coord into a Node TUI, an Electron main process, or any host that
 wants to drive coord without shelling out to `bin/coord`:
 
 ```ts
-import { createCoord, asIdentity } from '@myobie/coord';
+import { createCoord, asAgent } from '@myobie/coord';
 
 const coord = createCoord({
-  root: '/Users/me/.local/state/coord',
-  identity: asIdentity('me'),
+  root: '/Users/me/.local/state/smalltalk',
+  identity: asAgent('me'),
 });
 
-await coord.send(asIdentity('teammate'), 'hello');
+await coord.send(asAgent('teammate'), 'hello');
 
 const ac = new AbortController();
 for await (const ev of coord.watch(undefined, { signal: ac.signal })) {
@@ -182,7 +194,8 @@ for await (const ev of coord.watch(undefined, { signal: ac.signal })) {
 }
 ```
 
-Branded `Identity` / `Filename`, async-iterable `watch` with
+(`asIdentity` is a `@deprecated` alias of `asAgent` and continues to
+work.) Branded `Agent` / `Filename`, async-iterable `watch` with
 `AbortSignal`, typed `CoordError` subclasses (each with a stable
 `code`), zero stdio writes. Full surface: [src/index.ts](src/index.ts).
 Runnable example: [examples/tui-watch.ts](examples/tui-watch.ts) (`npm
@@ -208,7 +221,7 @@ portably. For hosts that need a hand-written config, the shape is:
     "coord": {
       "command": "coord",
       "args": ["mcp"],
-      "env": { "COORD_ROOT": "/Users/me/.local/state/coord", "COORD_IDENTITY": "me" }
+      "env": { "ST_ROOT": "/Users/me/.local/state/smalltalk", "ST_AGENT": "me" }
     }
   }
 }
@@ -236,7 +249,7 @@ hosts. The hand-written shape:
     "coord": {
       "command": "coord",
       "args": ["mcp", "--channel"],
-      "env": { "COORD_ROOT": "/Users/me/.local/state/coord", "COORD_IDENTITY": "me" }
+      "env": { "ST_ROOT": "/Users/me/.local/state/smalltalk", "ST_AGENT": "me" }
     }
   }
 }
@@ -248,12 +261,10 @@ chokidar startup cost.
 The MCP server ships an `instructions` string covering the **boot
 ritual**: on connect, the agent writes `available` to its status
 file, drains any inbox backlog (ls → read → reply → archive), and
-runs `coord_members` for peer state. As non-trivial progress happens,
-it drops `coord journal new` entries so peers can follow what shipped.
-On shutdown (`SIGTERM`, `SIGINT`, or transport close), the server
-writes `offline` to the status file so peers see the right state
-immediately. The full text lives in `src/mcp/capabilities.ts`
-(`CHANNEL_INSTRUCTIONS`).
+runs `coord_members` for peer state. On shutdown (`SIGTERM`, `SIGINT`,
+or transport close), the server writes `offline` to the status file so
+peers see the right state immediately. The full text lives in
+`src/mcp/capabilities.ts` (`CHANNEL_INSTRUCTIONS`).
 
 ## Harness integrations
 

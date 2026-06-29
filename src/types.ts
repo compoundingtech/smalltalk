@@ -1,46 +1,61 @@
 // types.ts — public types for the embeddable @myobie/coord API.
 //
-// Branded primitives: Identity and Filename are both nominally `string` but
+// Branded primitives: Agent and Filename are both nominally `string` but
 // carry phantom brands so a stray un-validated string doesn't compile. Use
-// `asIdentity(s)` / `asFilename(s)` at the API boundary to validate + brand;
-// `isIdentity(s)` / `isFilename(s)` are type-guard predicates.
+// `asAgent(s)` / `asFilename(s)` at the API boundary to validate + brand;
+// `isAgent(s)` / `isFilename(s)` are type-guard predicates.
+//
+// brief-009 item 3 (rename): the project's primary noun changed from
+// `identity` to `agent`. The old names — `Identity` / `asIdentity` /
+// `isIdentity` — remain as @deprecated aliases for one release cycle
+// so existing embedders keep compiling. They resolve to the same
+// underlying brand, so values are interchangeable.
 
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 
-import { validFilename, validIdentity } from './common.ts';
+import { validAgent, validFilename } from './common.ts';
 import {
+  InvalidAgentError,
   InvalidFilenameError,
-  InvalidIdentityError,
   PeersConfigInvalidError,
 } from './errors.ts';
 
 // ─── Branded primitives ─────────────────────────────────────────────────
 
-declare const IdentityBrand: unique symbol;
+declare const AgentBrand: unique symbol;
 declare const FilenameBrand: unique symbol;
 
-export type Identity = string & { readonly [IdentityBrand]: 'Identity' };
+export type Agent = string & { readonly [AgentBrand]: 'Agent' };
 export type Filename = string & { readonly [FilenameBrand]: 'Filename' };
 
-/**
- * Type-guard predicate. After `if (isIdentity(s))` the compiler narrows
- * `s` to {@link Identity}.
- */
-export function isIdentity(s: string): s is Identity {
-  return validIdentity(s);
-}
+/** @deprecated Use {@link Agent}. Alias kept for one release cycle. */
+export type Identity = Agent;
 
 /**
- * Validate `s` against the LAYOUT identity grammar and brand it. Throws
- * {@link InvalidIdentityError} on failure.
+ * Type-guard predicate. After `if (isAgent(s))` the compiler narrows
+ * `s` to {@link Agent}.
  */
-export function asIdentity(s: string): Identity {
-  if (!validIdentity(s)) {
-    throw new InvalidIdentityError(s);
-  }
-  return s as Identity;
+export function isAgent(s: string): s is Agent {
+  return validAgent(s);
 }
+
+/** @deprecated Use {@link isAgent}. */
+export const isIdentity = isAgent;
+
+/**
+ * Validate `s` against the LAYOUT agent grammar and brand it. Throws
+ * {@link InvalidAgentError} on failure.
+ */
+export function asAgent(s: string): Agent {
+  if (!validAgent(s)) {
+    throw new InvalidAgentError(s);
+  }
+  return s as Agent;
+}
+
+/** @deprecated Use {@link asAgent}. */
+export const asIdentity = asAgent;
 
 export function isFilename(s: string): s is Filename {
   return validFilename(s);
@@ -94,7 +109,7 @@ export const PRIORITIES: readonly Priority[] = ['low', 'normal', 'high'];
  * {@link deriveTs} when you need them.
  */
 export interface Message {
-  from: Identity;
+  from: Agent;
   subject?: string;
   inReplyTo?: Filename;
   tags?: string[];
@@ -105,24 +120,27 @@ export interface Message {
 /** Locator + message: what `read` / `ls` / `thread` return. */
 export interface MessageWithLocation {
   message: Message;
-  identity: Identity;
+  /** The owning agent. Field name kept as `identity` through this
+   *  release for back-compat with embedder destructures; will rename to
+   *  `agent` in a follow-up. */
+  identity: Agent;
   filename: Filename;
   folder: 'inbox' | 'archive';
 }
 
 /**
- * Derive the recipient identity from a message file path:
+ * Derive the recipient agent from a message file path:
  * `<root>/<id>/inbox/<filename>` → `<id>`. Returns null if the path
  * doesn't match the LAYOUT shape.
  */
-export function deriveTo(filename: Filename, identityFolder: string): Identity {
+export function deriveTo(filename: Filename, agentFolder: string): Agent {
   // The caller supplies the `<id>` folder name directly — this is just a
-  // narrowing helper that asserts it parses as an identity.
-  if (!validIdentity(identityFolder)) {
-    throw new InvalidIdentityError(identityFolder);
+  // narrowing helper that asserts it parses as an agent name.
+  if (!validAgent(agentFolder)) {
+    throw new InvalidAgentError(agentFolder);
   }
   void filename; // unused but kept in signature for symmetry with deriveTs
-  return identityFolder as Identity;
+  return agentFolder as Agent;
 }
 
 /**
@@ -136,11 +154,43 @@ export function deriveTs(filename: Filename): number {
   return Number(filename.slice(0, 13));
 }
 
+// ─── Resource + ResourceWithLocation ───────────────────────────────────
+
+/**
+ * A resource is an annotated URL an agent has chosen to surface to
+ * peers. Lives at `<root>/<agent>/resources/<filename>.md` with the url
+ * in frontmatter and an optional description in the body. Per
+ * brief-009 item 5.
+ *
+ * `relation` is **very optional** — it's never inferred and the bare
+ * URL stays first-class. Canonical (but non-enforced) values:
+ * `owns` / `relates-to` / `depends-on`. Agents may invent their own
+ * relation strings.
+ */
+export interface Resource {
+  url: string;
+  title?: string;
+  tags?: string[];
+  relation?: string;
+  body: string;
+}
+
+/** Locator + resource: what resources.read / resources.ls return. */
+export interface ResourceWithLocation {
+  resource: Resource;
+  /** The owning agent. Field name kept as `identity` through this
+   *  release for back-compat; will rename to `agent` in a follow-up. */
+  identity: Agent;
+  filename: Filename;
+}
+
 // ─── Watch event ────────────────────────────────────────────────────────
 
 export interface WatchEvent {
   filename: Filename;
-  identity: Identity;
+  /** The owning agent. Field name kept as `identity` through this
+   *  release for back-compat. */
+  identity: Agent;
   folder: 'inbox' | 'archive';
   /** Populated only when the watch was started with `withSubject: true`. */
   subject?: string;

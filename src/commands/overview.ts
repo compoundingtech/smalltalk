@@ -1,9 +1,9 @@
 // commands/overview.ts — synthesized at-a-glance dashboard.
 //
-// Composes existing read paths (members, ls, raw mtimes) into one
-// snapshot for the active $COORD_IDENTITY. Designed for "what's the
-// state of my coord world right now?" — typed for embedders via --json;
-// text for humans by default.
+// Composes existing read paths (agents, ls, raw mtimes) into one
+// snapshot for the active agent. Designed for "what's the state of
+// my coord world right now?" — typed for embedders via --json; text
+// for humans by default.
 
 import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
 import { join } from 'node:path';
@@ -21,7 +21,7 @@ import {
 } from '../common.ts';
 import type { Filename, Identity } from '../types.ts';
 
-import { cmdMembers, type MemberSummaryEnriched } from './members.ts';
+import { cmdAgents, type AgentSummaryEnriched } from './agents.ts';
 
 export interface OverviewInboxOldest {
   filename: Filename;
@@ -49,7 +49,9 @@ export interface OverviewActivity {
 export interface Overview {
   identity: Identity;
   inbox: OverviewInbox;
-  members: MemberSummaryEnriched[];
+  /** Field name kept as `members` for back-compat with embedder
+   *  destructures; will rename to `agents` in a follow-up. */
+  members: AgentSummaryEnriched[];
   recent: OverviewActivity[];
 }
 
@@ -86,8 +88,8 @@ export function getOverview(
   const now = opts.now ?? msNow;
 
   const members = (
-    cmdMembers({ enrich: true, coordRoot: root }).items as
-      MemberSummaryEnriched[]
+    cmdAgents({ enrich: true, coordRoot: root }).items as
+      AgentSummaryEnriched[]
   );
 
   const inbox = computeInboxSummary(identity, root, now);

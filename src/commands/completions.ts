@@ -149,27 +149,33 @@ const COMMANDS: readonly CommandSpec[] = [
     flags: [{ name: 'recent', desc: 'Number of recent items' }, JSON_FLAG],
   },
   {
-    name: 'journal',
-    desc: 'Append/read journal entries',
+    name: 'resource',
+    desc: 'Manage annotated URLs you publish (brief-009 item 5)',
     verbs: [
       {
-        name: 'new',
-        desc: 'Append a journal entry',
+        name: 'add',
+        desc: 'Add a resource (a URL with optional title/tags/relation/body)',
         flags: [
-          { name: 'slug', desc: 'Entry slug' },
-          { name: 'topic', desc: 'Entry topic' },
+          { name: 'title', desc: 'One-line title' },
           { name: 'tag', desc: 'Comma-separated tags' },
-          { name: 'stdin', desc: 'Read body from stdin' },
-          { name: 'edit', desc: 'Open $EDITOR for the body' },
+          {
+            name: 'relation',
+            desc: 'Free-form relation (canonical: owns | relates-to | depends-on)',
+          },
+          { name: 'body-stdin', desc: 'Read body description from stdin' },
         ],
       },
       {
         name: 'ls',
-        desc: 'List journal entries',
-        flags: [{ name: 'since', desc: 'Only since UNIX_MS' }],
+        desc: 'List resources for an identity',
+        flags: [JSON_FLAG],
       },
-      { name: 'cat', desc: 'Print a journal entry' },
-      { name: 'tail', desc: 'Tail recent journal entries' },
+      {
+        name: 'read',
+        desc: 'Read one resource',
+        flags: [JSON_FLAG],
+      },
+      { name: 'rm', desc: 'Remove one of your own resources' },
     ],
   },
   {

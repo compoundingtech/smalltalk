@@ -16,7 +16,7 @@ import {
   listIdentities,
   type MemberSummary,
   type MemberSummaryEnriched,
-} from '../../src/commands/members.ts';
+} from '../../src/commands/agents.ts';
 
 let scratch: string;
 let coordRoot: string;
@@ -72,8 +72,8 @@ describe('cmdMembers / listIdentities', () => {
 
   it('skips reserved names at the root', () => {
     setupIdentity('alice');
-    // A bare `journal/` at the root would be a misnamed identity.
-    mkdirSync(join(coordRoot, 'journal', 'inbox'), { recursive: true });
+    // A bare `members/` at the root would be a misnamed identity.
+    mkdirSync(join(coordRoot, 'members', 'inbox'), { recursive: true });
     expect(listIdentities(coordRoot)).toEqual(['alice']);
   });
 

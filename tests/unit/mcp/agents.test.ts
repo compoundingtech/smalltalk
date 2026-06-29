@@ -78,12 +78,21 @@ describe('coord_members — tools/list registration', () => {
     expect(tool?.outputSchema).toBeDefined();
   });
 
-  it('description contains the load-bearing peer-discovery phrase', async () => {
+  it('description contains the load-bearing peer-discovery phrase (checked on canonical coord_agents)', async () => {
     setupIdentity('alice');
     await boot();
     const r = await client.listTools();
-    const tool = r.tools.find((t) => t.name === 'coord_members');
+    const tool = r.tools.find((t) => t.name === 'coord_agents');
     expect(tool?.description).toContain('Useful for peer discovery before sending');
+  });
+
+  it('coord_agents is also registered (canonical name post-brief-009 item 3)', async () => {
+    setupIdentity('alice');
+    await boot();
+    const r = await client.listTools();
+    const names = r.tools.map((t) => t.name);
+    expect(names).toContain('coord_agents');
+    expect(names).toContain('st_agents');
   });
 
   it('all input fields are optional (zero-arg form valid)', async () => {
@@ -185,11 +194,11 @@ describe('coord_members — happy paths', () => {
     setupIdentity('alice');
     await boot();
     const one = await call();
-    expect(one.content?.[0]?.text).toBe('1 identity');
+    expect(one.content?.[0]?.text).toBe('1 agent');
     setupIdentity('bob');
     setupIdentity('carol');
     const three = await call();
-    expect(three.content?.[0]?.text).toBe('3 identities');
+    expect(three.content?.[0]?.text).toBe('3 agents');
   });
 });
 
