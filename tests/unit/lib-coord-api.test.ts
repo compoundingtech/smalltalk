@@ -18,7 +18,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import { createCoord, type Coord } from '../../src/lib.ts';
 import { InvalidIdentityError } from '../../src/errors.ts';
-import { asIdentity, type Identity } from '../../src/types.ts';
+import { asFilename, asIdentity, type Identity } from '../../src/types.ts';
 import type {
   MemberSummary,
   MemberSummaryEnriched,
@@ -277,5 +277,183 @@ describe('coord.resources', () => {
     await expect(
       coord.resources.add({ url: 'example.com' })
     ).rejects.toThrow();
+  });
+});
+
+// ─── coord.archive opts (brief-009 item 4 SDK parity) ──────────────────
+
+describe('coord.archive opts.withAttachments', () => {
+  it('without opts, the canonical .md moves and siblings stay (default behavior)', async () => {
+    const ts = 1782717800000;
+    const fn = `${ts}-test01.md`;
+    const sidecar = `${ts}-test01.options.json`;
+    writeFileSync(
+      join(coordRoot, 'alice', 'inbox', fn),
+      '---\nfrom: bob\n---\nhi\n'
+    );
+    writeFileSync(
+      join(coordRoot, 'alice', 'inbox', sidecar),
+      '{"k":1}'
+    );
+    await coord.archive(
+      asIdentity('alice'),
+      fn as unknown as ReturnType<typeof asFilename>
+    );
+    expect(existsSync(join(coordRoot, 'alice', 'archive', fn))).toBe(true);
+    // Sibling unmoved.
+    expect(existsSync(join(coordRoot, 'alice', 'inbox', sidecar))).toBe(true);
+    expect(existsSync(join(coordRoot, 'alice', 'archive', sidecar))).toBe(false);
+  });
+
+  it('with opts.withAttachments=true, siblings move alongside', async () => {
+    const ts = 1782717810000;
+    const fn = `${ts}-test02.md`;
+    const sidecar = `${ts}-test02.options.json`;
+    writeFileSync(
+      join(coordRoot, 'alice', 'inbox', fn),
+      '---\nfrom: bob\n---\nhi\n'
+    );
+    writeFileSync(
+      join(coordRoot, 'alice', 'inbox', sidecar),
+      '{"k":1}'
+    );
+    await coord.archive(
+      asIdentity('alice'),
+      fn as unknown as ReturnType<typeof asFilename>,
+      { withAttachments: true }
+    );
+    expect(existsSync(join(coordRoot, 'alice', 'archive', fn))).toBe(true);
+    expect(existsSync(join(coordRoot, 'alice', 'archive', sidecar))).toBe(true);
+    expect(existsSync(join(coordRoot, 'alice', 'inbox', sidecar))).toBe(false);
+  });
+});
+
+// ─── coord.archiveTrim opts.withAttachments ────────────────────────────
+
+describe('coord.archiveTrim opts.withAttachments', () => {
+  it('default leaves prefix-siblings in archive when their .md is trimmed', async () => {
+    const ts = 1700000000000;
+    const fn = `${ts}-old001.md`;
+    const sidecar = `${ts}-old001.options.json`;
+    writeFileSync(
+      join(coordRoot, 'alice', 'archive', fn),
+      '---\nfrom: bob\n---\nhi\n'
+    );
+    writeFileSync(
+      join(coordRoot, 'alice', 'archive', sidecar),
+      '{"k":1}'
+    );
+    const victims = await coord.archiveTrim(asIdentity('alice'), {
+      olderThan: '1d',
+      now: () => Date.now(),
+    });
+    expect(victims).toContain(fn);
+    expect(existsSync(join(coordRoot, 'alice', 'archive', fn))).toBe(false);
+    expect(existsSync(join(coordRoot, 'alice', 'archive', sidecar))).toBe(true);
+  });
+
+  it('withAttachments=true also deletes prefix-siblings', async () => {
+    const ts = 1700000010000;
+    const fn = `${ts}-old002.md`;
+    const sidecar = `${ts}-old002.options.json`;
+    writeFileSync(
+      join(coordRoot, 'alice', 'archive', fn),
+      '---\nfrom: bob\n---\nhi\n'
+    );
+    writeFileSync(
+      join(coordRoot, 'alice', 'archive', sidecar),
+      '{"k":1}'
+    );
+    await coord.archiveTrim(asIdentity('alice'), {
+      olderThan: '1d',
+      withAttachments: true,
+      now: () => Date.now(),
+    });
+    expect(existsSync(join(coordRoot, 'alice', 'archive', fn))).toBe(false);
+    expect(existsSync(join(coordRoot, 'alice', 'archive', sidecar))).toBe(false);
+  });
+});
+
+// ─── coord.lsOrphans (brief-009 item 4 SDK parity) ─────────────────────
+
+describe('coord.lsOrphans', () => {
+  it('returns [] when no orphans exist', async () => {
+    const r = await coord.lsOrphans();
+    expect(r).toEqual([]);
+  });
+
+  it('surfaces sibling files whose .md is missing in the same folder', async () => {
+    const ts = 1782717820000;
+    const orphan = `${ts}-orph01.options.json`;
+    writeFileSync(join(coordRoot, 'alice', 'inbox', orphan), '{"k":1}');
+    const r = await coord.lsOrphans();
+    expect(r.map((it) => it.filename)).toContain(orphan);
+    const item = r.find((it) => it.filename === orphan)!;
+    expect(item.ts).toBe(ts);
+  });
+
+  it('skips siblings whose .md is present (not orphaned)', async () => {
+    const ts = 1782717830000;
+    const fn = `${ts}-paired.md`;
+    const sidecar = `${ts}-paired.options.json`;
+    writeFileSync(
+      join(coordRoot, 'alice', 'inbox', fn),
+      '---\nfrom: bob\n---\nhi\n'
+    );
+    writeFileSync(
+      join(coordRoot, 'alice', 'inbox', sidecar),
+      '{"k":1}'
+    );
+    const r = await coord.lsOrphans();
+    expect(r.map((it) => it.filename)).not.toContain(sidecar);
+  });
+
+  it('opts.archive=true scans the archive folder', async () => {
+    const ts = 1782717840000;
+    const orphan = `${ts}-orph02.options.json`;
+    writeFileSync(join(coordRoot, 'alice', 'archive', orphan), '{"k":1}');
+    const r = await coord.lsOrphans(undefined, { archive: true });
+    expect(r.map((it) => it.filename)).toContain(orphan);
+  });
+
+  it('explicit identity scans a peer\'s folder', async () => {
+    const ts = 1782717850000;
+    const orphan = `${ts}-orph03.options.json`;
+    writeFileSync(join(coordRoot, 'bob', 'inbox', orphan), '{"k":1}');
+    const r = await coord.lsOrphans(asIdentity('bob'));
+    expect(r.map((it) => it.filename)).toContain(orphan);
+  });
+});
+
+// ─── coord.ding (brief-009 item 4 SDK parity) ──────────────────────────
+
+describe('coord.ding (handle wrapper around runDing)', () => {
+  it('is a function on the handle', () => {
+    expect(typeof coord.ding).toBe('function');
+  });
+
+  it('exits cleanly when the supplied signal aborts', async () => {
+    const ac = new AbortController();
+    const ptySend = async (): Promise<{ status: number; stderr: string }> => ({
+      status: 0,
+      stderr: '',
+    });
+    // Use a session-alive probe that always returns true so the
+    // session-watch tick doesn't end the daemon on us.
+    const isSessionAlive = (): boolean => true;
+    const done = coord.ding({
+      ptySession: 'fake-session',
+      ptySend,
+      isSessionAlive,
+      sessionWatchIntervalMs: 10_000,
+      tidyIntervalMs: 0,
+      statusRefreshIntervalMs: 0,
+      signal: ac.signal,
+    });
+    setTimeout(() => ac.abort(), 30);
+    await done;
+    // Reaching here without throwing is the assertion — the wrapper
+    // successfully forwarded to runDing and runDing terminated.
+    expect(true).toBe(true);
   });
 });

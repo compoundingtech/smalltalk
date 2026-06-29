@@ -43,7 +43,11 @@ export const SERVER_INFO: Implementation = {
   //         keeping coord_members as deprecated alias), CLI verb
   //         (members → agents, members deprecated alias), and env
   //         vars (ST_AGENT preferred → ST_IDENTITY → COORD_IDENTITY).
-  version: '0.7.0',
+  // 0.8.0 — brief-009 item 4: SDK parity gap-fills (coord.archive +
+  //         coord.archiveTrim gain `withAttachments`; new
+  //         coord.lsOrphans and coord.ding on the handle). No CLI
+  //         or MCP surface change.
+  version: '0.8.0',
 };
 
 /**

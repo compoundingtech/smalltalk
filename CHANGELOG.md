@@ -6,6 +6,32 @@ minor releases until 1.0.
 
 ## Unreleased
 
+### Added (brief-009 item 4 — SDK parity gap-fills)
+
+The TS SDK already had near-complete parity with the CLI post-brief-009.
+This entry closes the last four gaps surfaced by the audit. No CLI or
+MCP surface change.
+
+- **`coord.archive(id, fn, opts?: ArchiveOptions)`** — now takes an
+  opts bag. `opts.withAttachments: true` mirrors the CLI's
+  `--with-attachments` and moves prefix-sibling files alongside the
+  canonical `.md`. Default unchanged (canonical `.md` only).
+- **`coord.archiveTrim(id, opts)`** — `opts.withAttachments?: boolean`
+  added to `TrimOptions`. When true, prefix-siblings of trimmed `.md`
+  victims are also deleted from archive. Default unchanged.
+- **`coord.lsOrphans(id?, opts?: { archive?: boolean })`** — new method.
+  Returns `OrphanItem[]` (`{filename, ts}[]`) for prefix-sibling files
+  whose canonical `.md` is no longer in the same folder. Mirrors
+  `coord message ls --orphans`. Separate method (not an opt on `ls`)
+  because the return shape differs — orphans have no frontmatter.
+- **`coord.ding(deps)` on the handle** — thin wrapper around the
+  already-exported `runDing`. `deps.identity` defaults to the Coord's
+  own; `coord` is wired automatically. Useful for TUI / supervisor
+  embedders that want to start a ding inside their own process
+  instead of shelling out.
+- **New exports from `@myobie/coord`:** `ArchiveOptions`, `OrphanItem`.
+- **VERSION** bumps to `0.8.0`.
+
 ### Renamed (brief-009 item 3 — identity → agent)
 
 **Soft-breaking with a deprecation chain.** The project's primary
