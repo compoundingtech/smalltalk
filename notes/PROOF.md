@@ -1,12 +1,16 @@
 ---
 date: 2026-05-05
-audience: anyone evaluating coord's data-loss properties
+audience: anyone evaluating smalltalk's data-loss properties
 purpose: argument that the sync algorithm doesn't silently lose messages, with explicit assumptions and where they break
 ---
 
-# coord — no-loss argument
+# smalltalk — no-loss argument
 
-The claim of this document: **under a small set of assumptions, every message file ever written into a participating coord folder reaches one of three terminal states — still in some machine's inbox, in some machine's archive, or explicitly trimmed — and never silently disappears.**
+> Originally written when the project was named `coord`. The argument
+> is unchanged by the rename; CLI examples below use the current
+> canonical `st` name with `coord` working identically as an alias.
+
+The claim of this document: **under a small set of assumptions, every message file ever written into a participating smalltalk folder reaches one of three terminal states — still in some machine's inbox, in some machine's archive, or explicitly trimmed — and never silently disappears.**
 
 This isn't a formal proof. It's a careful sketch you can check by hand. It exists so a reviewer can poke at the assumptions and tell us where they think it breaks.
 
@@ -18,13 +22,13 @@ This isn't a formal proof. It's a careful sketch you can check by hand. It exist
 
 3. **Sync is `rsync -a` without `--delete`.** Rsync transfers each file once, computing checksums to verify integrity in transit. Without `--delete`, rsync only copies files in; it never removes files on the destination.
 
-4. **The sweep rule is correctly implemented.** Every coord command, before doing its work, removes any `<id>/inbox/X.md` for which `<id>/archive/X.md` exists *on the same machine*. The sweep operates only on local state; it does not consult or modify other machines' trees.
+4. **The sweep rule is correctly implemented.** Every smalltalk command, before doing its work, removes any `<id>/inbox/X.md` for which `<id>/archive/X.md` exists *on the same machine*. The sweep operates only on local state; it does not consult or modify other machines' trees.
 
-5. **The only deletion operation is `coord archive trim`.** No other command in the CLI deletes message files.
+5. **The only deletion operation is `st archive trim`.** No other command in the CLI deletes message files.
 
 ## Claim
 
-For every message file `M` that is ever successfully written by `coord send`, at every later moment in time, `M` exists at some path on at least one participating machine — either `<recipient>/inbox/M.md` or `<recipient>/archive/M.md` — until and unless `coord archive trim` is explicitly invoked.
+For every message file `M` that is ever successfully written by `st send`, at every later moment in time, `M` exists at some path on at least one participating machine — either `<recipient>/inbox/M.md` or `<recipient>/archive/M.md` — until and unless `st archive trim` is explicitly invoked.
 
 ## Argument
 
@@ -36,23 +40,23 @@ By assumption 3, rsync only ever copies `M` from a source that has it to a desti
 
 So the only way for `M` to disappear from a machine's filesystem after rsync runs is by the explicit action of one of coord's own commands.
 
-### What coord commands can do to M
+### What smalltalk commands can do to M
 
-We enumerate every coord command and check which ones can remove `M`:
+We enumerate every smalltalk command and check which ones can remove `M`:
 
-- `coord send` — only ever creates files. Cannot remove `M`.
-- `coord ls`, `coord read`, `coord status`, `coord watch`, `coord thread` — read-only with respect to message files. Cannot remove `M`. (They do trigger the implicit sweep; see below.)
-- `coord archive` — moves `<recipient>/inbox/M.md` to `<recipient>/archive/M.md` on the local machine. `M` still exists, just at a different path.
-- `coord sync push` / `coord sync pull` / `coord sync sweep` — invoke rsync (assumption 3) plus the sweep (assumption 4). Rsync can't remove `M` (above). The sweep can remove `<id>/inbox/M.md` only if `<id>/archive/M.md` exists *on the same machine*. So removal of an inbox copy of `M` requires that an archive copy of `M` also exists locally — `M` is not lost, just relocated.
-- `coord archive trim` — explicit user-initiated deletion of files in `archive/` matching the trim filter. This is the only command that ever removes a file from the filesystem without leaving a copy elsewhere. (See "Where the assumptions break" below for what this means.)
+- `st send` — only ever creates files. Cannot remove `M`.
+- `st ls`, `st read`, `st status`, `st watch`, `st thread` — read-only with respect to message files. Cannot remove `M`. (They do trigger the implicit sweep; see below.)
+- `st archive` — moves `<recipient>/inbox/M.md` to `<recipient>/archive/M.md` on the local machine. `M` still exists, just at a different path.
+- `st sync push` / `st sync pull` / `st sync sweep` — invoke rsync (assumption 3) plus the sweep (assumption 4). Rsync can't remove `M` (above). The sweep can remove `<id>/inbox/M.md` only if `<id>/archive/M.md` exists *on the same machine*. So removal of an inbox copy of `M` requires that an archive copy of `M` also exists locally — `M` is not lost, just relocated.
+- `st archive trim` — explicit user-initiated deletion of files in `archive/` matching the trim filter. This is the only command that ever removes a file from the filesystem without leaving a copy elsewhere. (See "Where the assumptions break" below for what this means.)
 
 ### Putting it together
 
 Let `t` be any moment in time after `M` was written. At time `t`, on every machine that has ever received a sync containing `M`, the file `M` lives at one of:
 
 - `<recipient>/inbox/M.md`, OR
-- `<recipient>/archive/M.md` (placed there by an explicit `coord archive`), OR
-- nowhere, *only if* `coord archive trim` has been explicitly run on that machine after `M` reached the archive.
+- `<recipient>/archive/M.md` (placed there by an explicit `st archive`), OR
+- nowhere, *only if* `st archive trim` has been explicitly run on that machine after `M` reached the archive.
 
 Because the sweep can only delete an inbox copy when an archive copy exists locally, no two paths can both be empty unless trim has run.
 
@@ -83,13 +87,13 @@ The bash reference implementation uses `set -C` (`noclobber`) plus `cat > path` 
 
 ### Manual filesystem tampering
 
-If a user `rm`s a message file by hand outside `coord archive trim`, that file is gone from that machine. If sync from a peer that still has it hasn't run yet, the file may still survive elsewhere. If every machine has been hand-deleted, the file is lost.
+If a user `rm`s a message file by hand outside `st archive trim`, that file is gone from that machine. If sync from a peer that still has it hasn't run yet, the file may still survive elsewhere. If every machine has been hand-deleted, the file is lost.
 
 This is not a flaw in the algorithm; it's a consequence of the trust model. Cooperating peers don't hand-delete each other's data.
 
 ### Clock skew
 
-Filenames embed the writer's local clock. If a writer's clock is very wrong (years ahead or behind), filenames will sort wrong and the `<since UNIX_MS>` filter on `coord watch` and `coord ls` will behave unintuitively. The `<rand6>` suffix still makes filenames unique, so no data is lost — only ordering is off.
+Filenames embed the writer's local clock. If a writer's clock is very wrong (years ahead or behind), filenames will sort wrong and the `<since UNIX_MS>` filter on `st watch` and `st ls` will behave unintuitively. The `<rand6>` suffix still makes filenames unique, so no data is lost — only ordering is off.
 
 A wildly-wrong clock that produces filenames in the future would cause readers using `--since-now` (which compares against the local now) to skip those messages until the local clock catches up to the writer's bad value. This is observable but not data-losing.
 
@@ -107,7 +111,7 @@ The reference implementation does not pass `--delete`. Any documentation suggest
 
 - **Order-of-arrival.** We do not claim messages are seen in any particular order on any particular machine. Sync is asynchronous; you may see B's reply to A before A. Threading via `in-reply-to` lets readers reconstruct the order regardless.
 - **Liveness.** We do not claim messages are delivered within any time bound. Sync runs on whatever cadence the operator configures. A peer that's offline for a year still gets the messages when it comes back.
-- **Privacy.** Anyone with read access to any participating machine's `$COORD_ROOT` can read every message there. Encryption is out of scope for v0.
+- **Privacy.** Anyone with read access to any participating machine's `$ST_ROOT` can read every message there. Encryption is out of scope for v0.
 - **Authenticity.** A peer can write `from: alice` without being alice. Out of scope for v0; signing is the intended layer.
 
 ## Asks of a reviewer

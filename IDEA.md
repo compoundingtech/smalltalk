@@ -1,4 +1,9 @@
-# coord — IDEA
+# smalltalk — IDEA
+
+> The project's legacy name `coord` still appears in some historical
+> references below (the directing-agent identity, the implementing-agent
+> identity); those are kept verbatim because they describe how the work
+> got done. The product itself is now **smalltalk**.
 
 > This is a values/intent document, not a spec. The implementation may and
 > should deviate as we learn — what's firm here is the *direction*, not the
@@ -34,8 +39,9 @@ this repo. Lesson learned. From here on:
    built minimally and iterated based on real DX testing.
 3. The directing-agent (in the `pty` repo) drives DX testing in `/tmp` after
    each round and surfaces what's broken or awkward.
-4. coord-claude (the implementing agent here) takes those findings and ships
-   the smallest fix that addresses them.
+4. smalltalk-claude (formerly `coord-claude`, the implementing agent
+   here) takes those findings and ships the smallest fix that
+   addresses them.
 5. No big PLAN.md. No big README written as a third-party spec. Those are
    premature.
 

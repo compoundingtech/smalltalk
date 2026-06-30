@@ -4,16 +4,24 @@ audience: human reviewer (myobie)
 purpose: walk through the v0 bash CLI as a play — what commands exist, what files are written where, what each step looks like from the DX side
 ---
 
-# coord v0 — a walkthrough in scenes
+# smalltalk v0 — a walkthrough in scenes
 
-> **Historical note (brief-017):** the CLI has since been restructured.
-> Message verbs are now nested under `coord message <verb>` (alias
-> `coord msg <verb>`). Translation: `coord send` → `coord message send`,
-> `coord ls` → `coord message ls`, `coord read` → `coord message read`,
-> `coord archive` → `coord message archive`, `coord thread` → `coord
-> message thread`. `coord watch` / `status` / `task` / `tasks` /
-> `members` / `overview` / `sync` are unchanged. See
-> [walkthrough.md](walkthrough.md) for the current play.
+> **Historical note.** This doc captures the v0 bash CLI shape (the
+> project was named `coord` at the time). Three things have changed
+> since:
+>
+> 1. **brief-017:** message verbs are now nested under `coord message
+>    <verb>` (alias `coord msg <verb>`). Translation: `coord send` →
+>    `coord message send`, `coord ls` → `coord message ls`, etc.
+> 2. **brief-009 item 3:** the project was renamed `coord` →
+>    `smalltalk` (long) / `st` (canonical short). All three CLI names
+>    install side-by-side and behave identically; the examples below
+>    still using `coord …` work unchanged.
+> 3. **brief-009 items 1/2:** the `tasks/` and `journal/` folders + CLI
+>    verbs were removed in the slim-down. References to `coord task` /
+>    `coord tasks` / `coord journal` below are historical.
+>
+> See [walkthrough.md](walkthrough.md) for the current play.
 
 This is what happens when two agents talk through coord. Every command shown was run for real against `/tmp/coord-dx3/` during DX verification of brief-003. Every file path is exactly what landed on disk.
 

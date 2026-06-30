@@ -29,12 +29,12 @@ The failure mode is "refuse to run", not "warn" — preventing pollution of the 
 - Spawn `pty` with an explicit `env:` block that omits `PTY_SESSION_DIR` or hardcodes a path outside the OS temp area.
 - Rely on per-test cleanup as the only guard. Test interruptions happen; the global setup is the load-bearing safety net.
 
-If a single test needs a clean session dir per case (rare), `mkdtempSync(tmpdir(), 'coord-pty-')` and override `PTY_SESSION_DIR` for that one spawn, then `rmSync` the dir in `afterEach`. Do NOT mutate `process.env.PTY_SESSION_DIR` itself — only override per-spawn.
+If a single test needs a clean session dir per case (rare), `mkdtempSync(tmpdir(), 'smalltalk-pty-')` and override `PTY_SESSION_DIR` for that one spawn, then `rmSync` the dir in `afterEach`. Do NOT mutate `process.env.PTY_SESSION_DIR` itself — only override per-spawn.
 
 ### Manual smoke check
 
-Before merging changes that touch a pty-spawning test, run `pty list` from a separate shell during or just after `npm test`, and confirm no new `coord-*` sessions appear in the user's real session dir.
+Before merging changes that touch a pty-spawning test, run `pty list` from a separate shell during or just after `npm test`, and confirm no new `coord-*` / `smalltalk-*` / `st-*` sessions appear in the user's real session dir.
 
 ### Background — why this exists
 
-A previous round of `tests/integration/ding.test.ts` leaked 120 `coord-ding-it-*` sessions into the user's real `pty list` output over a few weeks. Per-test cleanup wasn't enough — interrupted runs (crash, Ctrl-C, timeout) left orphans. The global setup makes the leak path impossible by construction.
+A previous round of `tests/integration/ding.test.ts` leaked 120 `coord-ding-it-*` sessions into the user's real `pty list` output over a few weeks (back when the project was still named `coord` — the historical prefix is preserved here for searchability). Per-test cleanup wasn't enough — interrupted runs (crash, Ctrl-C, timeout) left orphans. The global setup makes the leak path impossible by construction.

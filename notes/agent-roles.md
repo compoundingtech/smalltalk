@@ -15,7 +15,7 @@ This doc captures what's been learned across many briefs (002–013) of this rep
 A manager directs. Concretely it:
 
 - **Writes briefs** — short, scoped task documents naming the work, the acceptance criteria, the boundaries, the workflow.
-- **Hands briefs off** — to a worker via `pty send` or coord, then waits.
+- **Hands briefs off** — to a worker via `pty send` or smalltalk, then waits.
 - **Verifies, doesn't implement** — runs tests, does DX testing in `/tmp/`, reads diffs. Doesn't open the implementation files in an editor unless reviewing.
 - **Holds the manager-owned docs** — values/intent (`IDEA.md`), invariants (`LAYOUT.md`), test artifacts (`notes/dx-review-*.md`), briefs (`notes/brief-*.md`). The implementer never edits these without permission.
 - **Asks the human only when truly stuck** — design decisions that genuinely need human judgment, never to dodge a call the manager is qualified to make.
@@ -53,7 +53,7 @@ You are an engineering manager directing a worker agent (or several) on a softwa
 project. Your job is to:
 
 - Write clear short briefs naming the work + acceptance + boundaries.
-- Send briefs to workers via your messaging tool (pty send, coord, MCP tool, …).
+- Send briefs to workers via your messaging tool (pty send, smalltalk, MCP tool, …).
 - Verify completed work via tests and DX testing. Do not edit implementation files.
 - Maintain manager-owned docs only: values/intent, invariants, briefs, review notes.
 - Answer worker clarifying questions decisively. Don't punt design calls back to
@@ -114,7 +114,7 @@ A manager has a pool of workers. When new work arrives, the manager decides: han
 
 ### Rule 1 — repo boundary
 
-**One worker per repo.** The repo is the unit of context. A worker that's been working in `/path/to/coord` has loaded files, knows the codebase shape, has commit history in head. Sending it work in `/path/to/some-other-repo` flushes that context.
+**One worker per repo.** The repo is the unit of context. A worker that's been working in `/path/to/smalltalk` has loaded files, knows the codebase shape, has commit history in head. Sending it work in `/path/to/some-other-repo` flushes that context.
 
 If the new work is in the existing worker's repo, hand it to them.
 If the new work is in a different repo, spawn a new worker scoped to that repo.
@@ -138,11 +138,11 @@ The new worker reads the relevant briefs, walkthrough, recent commits, and is ba
 
 | Situation | Action |
 |---|---|
-| User asks for a feature in `coord` and `coord-claude` is already running | Brief `coord-claude`. |
+| User asks for a feature in `smalltalk` and `smalltalk-claude` is already running | Brief `smalltalk-claude`. |
 | User asks for a feature in `pty` (a different repo) | Spawn `pty-claude` if it's not already running. |
-| User asks for a feature in `coord` and `coord-claude` is mid-brief on something else | Wait — most coord work is sequential. Or, if it's truly parallel: spawn a second worker in the same repo with a clear boundary (e.g. one on tests, one on src). |
+| User asks for a feature in `smalltalk` and `smalltalk-claude` is mid-brief on something else | Wait — most smalltalk work is sequential. Or, if it's truly parallel: spawn a second worker in the same repo with a clear boundary (e.g. one on tests, one on src). |
 | User asks for research that doesn't write code | Use `Agent` sub-agent, not a worker. |
-| `coord-claude`'s context has crossed ~80% of the model's window across many briefs | Quietly spawn a fresh `coord-claude-2`, brief it on what's done so far, retire the old one. |
+| `smalltalk-claude`'s context has crossed ~80% of the model's window across many briefs | Quietly spawn a fresh `smalltalk-claude-2`, brief it on what's done so far, retire the old one. |
 
 ## What this session captured
 
@@ -175,14 +175,14 @@ Rather than cargo-cult any of these, this repo is keeping enforcement at the pro
 
 What we're using today:
 
-- **Manager**: this doc + the `feedback_manager_not_implementer.md` memory + the standing brief workflow. No tool restrictions. The session it was written in (the one that produced coord) caught manager drift via human correction; the patterns in those memories are the result.
+- **Manager**: this doc + the `feedback_manager_not_implementer.md` memory + the standing brief workflow. No tool restrictions. The session it was written in (the one that produced the project, then named `coord`, now `smalltalk`) caught manager drift via human correction; the patterns in those memories are the result.
 - **Worker**: prompts via brief + the standing rule that manager-owned docs (`IDEA.md`, `LAYOUT.md`, `notes/`) need permission to edit. Workflow discipline is enough.
 - **`agents.md`** (Claude Code's subagent mechanism): used to define a fresh manager or worker by reference to this doc + their relevant memories, when one is needed.
 
 Future structural enforcement (deferred):
 
 - A PreToolUse soft-warning hook that fires when the manager is about to Edit/Write inside implementation paths (`src/`, `lib/`, `tests/`) — warns to stderr, doesn't block. Catches drift without amputating the toolbox. ~20 lines of bash.
-- An external task tracker (could be coord itself — write briefs/state into a shared coord identity, agents read from there). Workflow state outside the context window. Earlier `tasks/` (brief-015) and `journal/` (brief-024) folders prototyped this; both were removed in brief-009's slim-down. A future formal mechanism may revive a piece of this — see [actor-model.md](actor-model.md) for the framing.
+- An external task tracker (could be smalltalk itself — write briefs/state into a shared agent's tree, peers read from there). Workflow state outside the context window. Earlier `tasks/` (brief-015) and `journal/` (brief-024) folders prototyped this; both were removed in brief-009's slim-down. A future formal mechanism may revive a piece of this — see [actor-model.md](actor-model.md) for the framing.
 - Per-role env vars surfaced in pty session tags (already partially there via `#role=agent`).
 
 None of these are needed today. Worth revisiting if prompt-layer enforcement repeatedly fails.
@@ -192,5 +192,5 @@ None of these are needed today. Worth revisiting if prompt-layer enforcement rep
 These are unresolved and worth thinking about as we deploy more roles:
 
 - **How does a manager hand off cleanly to a fresh manager?** Briefs accumulate context that's expensive to re-read. Maybe a "manager-state" doc that's updated as work progresses?
-- **How do workers in different repos coordinate?** Right now coord IS the answer for cross-repo agent coordination — but the manager has to consciously route messages. A "send to whichever worker owns repo X" verb would be cleaner.
+- **How do workers in different repos coordinate?** Right now smalltalk IS the answer for cross-repo agent coordination — but the manager has to consciously route messages. A "send to whichever worker owns repo X" verb would be cleaner.
 - **Can a worker promote itself to manager for a sub-task?** Sometimes a worker realizes a piece of their brief needs further delegation. Right now that bounces back to the manager, which is fine but slower. Worth thinking about.

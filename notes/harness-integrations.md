@@ -6,7 +6,13 @@ status: complete — all 7 phases shipped
 
 # Harness integrations — what got built
 
-We want coord to plug into the agent harnesses our agents already live in, so a coord message arrives → the agent sees it without the human having to broker. Three target harnesses: **Claude Code**, **Codex CLI**, and **Pi**.
+> **Naming note.** Written when the project was named `coord`. The
+> product is now **smalltalk**; `coord` and `coord_*` remain as
+> back-compat CLI / MCP-tool aliases. The phase names and code
+> references below preserve the original `coord` spellings — those
+> commits and identifiers exist that way on disk.
+
+We want smalltalk to plug into the agent harnesses our agents already live in, so a smalltalk message arrives → the agent sees it without the human having to broker. Three target harnesses: **Claude Code**, **Codex CLI**, and **Pi**.
 
 This document captures what got built, in roadmap order. Originally a planning doc; now serves as the integration map.
 

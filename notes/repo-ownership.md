@@ -26,8 +26,8 @@ mechanism.
   names that don't fit the pattern (`myobie`, `cos`, `pty-claude`'s
   manager incarnation).
 
-This is convention-only — nothing in coord enforces or even reads
-it. A `members` listing today doesn't carry "owns repo X" data
+This is convention-only — nothing in smalltalk enforces or even reads
+it. An `agents` listing today doesn't carry "owns repo X" data
 because there's nowhere to put it.
 
 ## Where the binding actually lives
@@ -44,7 +44,7 @@ repo:
    repo. Wires the MCP server into the agent's host so the agent
    can call `st_msg_*` / `coord_msg_*` tools. Also per-machine.
 
-Neither file is discoverable from coord's data tree. To answer
+Neither file is discoverable from smalltalk's data tree. To answer
 "which agent owns repo X?" from outside the repo you currently:
 
 - Look at the identity name (apply the convention above).
@@ -58,7 +58,7 @@ The convention is what lets a manager apply the **repo-boundary
 rule** from [`agent-roles.md`](agent-roles.md):
 
 > One worker per repo. The repo is the unit of context. A worker
-> that's been working in `/path/to/coord` has loaded files, knows
+> that's been working in `/path/to/smalltalk` has loaded files, knows
 > the codebase shape, has commit history in head. Sending it work in
 > `/path/to/some-other-repo` flushes that context.
 
@@ -70,20 +70,23 @@ the common case ("work in `pty` → `pty-claude`").
 
 - **Multi-repo agents.** A single identity that works across several
   related repos (e.g. a release-engineering identity touching `pty`
-  + `coord` + `pty-relay`). Today these are bare-named (`cos`,
+  + `smalltalk` + `pty-relay`). Today these are bare-named (`cos`,
   `myobie`) and rely on context to know which repo a given message
   is about.
 - **Multiple agents per repo.** When the
   [`agent-roles.md`](agent-roles.md) parallelism rule fires (one
   worker on tests, one on src), there's no naming pattern that
   encodes the split. Today both identities are spun up ad-hoc with
-  manual identity names (`coord-tests-claude` vs `coord-src-claude`).
+  manual identity names (`smalltalk-tests-claude` vs
+  `smalltalk-src-claude`; historically these took the form
+  `coord-tests-claude` / `coord-src-claude`).
 - **Manager vs worker for the same repo.** The agent named
-  `coord-claude` could be operating as a worker on a brief, or as a
-  manager spawning a child worker, depending on its system prompt
-  for that session. The identity name doesn't disambiguate. In
-  practice the human knows the role from the pty session's tags
-  (`role = "agent"` vs unset).
+  `smalltalk-claude` (formerly `coord-claude` — the underlying
+  identity was renamed during Phase 3 of brief-005) could be
+  operating as a worker on a brief, or as a manager spawning a child
+  worker, depending on its system prompt for that session. The
+  identity name doesn't disambiguate. In practice the human knows
+  the role from the pty session's tags (`role = "agent"` vs unset).
 
 These are tolerable today because the network is small. They'd
 become unworkable at scale.
@@ -115,10 +118,10 @@ runtime identity binding.
 ```
 
 Once resources ship, the manager doesn't need to apply the naming
-convention — it can `coord resources list <agent>` and read the
-declared bindings directly. The convention stays as a sane default
-when nobody has bothered to declare resources, but the data
-becomes the source of truth.
+convention — it can `st resource ls <agent>` and read the declared
+bindings directly. The convention stays as a sane default when nobody
+has bothered to declare resources, but the data becomes the source
+of truth.
 
 A `pty://` URL scheme is also planned for the same release —
 agents will link their pty session as a resource so peers can
@@ -128,12 +131,12 @@ identity-name string.
 ## Until then
 
 - New agent in a new repo? Name it `<repo>-claude` (or
-  `-codex` / bare). Set `ST_IDENTITY` in `pty.toml`. That's the
+  `-codex` / bare). Set `ST_AGENT` in `pty.toml`. That's the
   binding.
 - New agent in an existing repo? Pick a name that doesn't collide
-  with the existing one and is descriptive (`coord-tests-claude`,
-  `coord-research-claude`). Re-evaluate the parallelism rule before
-  spawning — most repos want one worker, not two.
+  with the existing one and is descriptive (`smalltalk-tests-claude`,
+  `smalltalk-research-claude`). Re-evaluate the parallelism rule
+  before spawning — most repos want one worker, not two.
 - Cross-repo coordinator identity? Use a bare name. Document the
   scope in the agent's system prompt or memory; don't try to encode
   it in the identity name.
