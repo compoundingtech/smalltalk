@@ -75,9 +75,12 @@ you want a reply, you send a message and either keep going or pause
 on something else (Claude Code's channel notifications, a tail, a
 human reading) until the reply arrives.
 
-This is why "Coord threads stay on coord" matters (see
+This is why "smalltalk threads stay on smalltalk" matters (the boot
+ritual still calls it "Coord threads stay on coord" verbatim — see
 [`src/mcp/capabilities.ts`](../src/mcp/capabilities.ts) →
-`CHANNEL_INSTRUCTIONS`): replying via `coord_msg_reply` keeps the
+`CHANNEL_INSTRUCTIONS` — preserved for back-compat with existing
+agent context; the underlying rule is the same): replying via
+`st_msg_reply` / `coord_msg_reply` keeps the
 correspondence in the actor channel. Replying via the REPL (where
 nobody is listening by default) breaks the actor abstraction — you
 shouted into a room with no microphone.

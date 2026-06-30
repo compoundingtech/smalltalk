@@ -1,9 +1,15 @@
-# coord
+# smalltalk
 
-A small Node CLI **and** TypeScript library for the **coord** file-folder
-convention. The folder is the API: `<identity>/inbox/` and
-`<identity>/archive/`, plain markdown files with YAML frontmatter, plain
+A small Node CLI **and** TypeScript library for the **smalltalk**
+file-folder convention. The folder is the API: `<agent>/inbox/` and
+`<agent>/archive/`, plain markdown files with YAML frontmatter, plain
 `rsync` between machines.
+
+> **Note on the name.** The project was originally named `coord` and is
+> mid-phase-rename to `smalltalk`. The `coord` name still works
+> everywhere as a back-compat alias — see [Names](#names) for the
+> full dual-honor map. New readers can use `st` / `smalltalk` / `coord`
+> interchangeably; the examples below use `st` (canonical short).
 
 - **Convention:** [LAYOUT.md](LAYOUT.md) — the binding spec.
 - **Philosophy:** [IDEA.md](IDEA.md).
@@ -20,10 +26,10 @@ convention. The folder is the API: `<identity>/inbox/` and
 
 ## Why this shape
 
-**The one rule: across identities, only `inbox/` is writable.** Every
-other folder under an identity — `archive/`, `status` — is
-single-writer, owned by that identity. Peers read but never write. This
-gives you several useful properties for free:
+**The one rule: across agents, only `inbox/` is writable.** Every
+other folder under an agent — `archive/`, `status` — is single-writer,
+owned by that agent. Peers read but never write. This gives you
+several useful properties for free:
 
 - **Lock-free coordination.** Every new message is a new file with a
   globally unique `<unix-ms>-<rand6>.md` name. No two writers ever
@@ -31,7 +37,7 @@ gives you several useful properties for free:
   reconcile. The sender writes; sync moves the bytes; the recipient
   reads at their own pace.
 
-- **No cross-identity edits.** One identity can't reach into another's
+- **No cross-agent edits.** One agent can't reach into another's
   `archive/` and re-open a message it doesn't own. If you want a peer
   to do something, you message their inbox suggesting it. They decide
   whether to act and update their own state. That's the entire
@@ -43,15 +49,15 @@ gives you several useful properties for free:
   lock-free property; the recipient sees them with plain `ls`. Mail
   with arbitrary payloads, no protocol.
 
-- **One identity per container.** Because an identity is exactly a
-  folder, you can mount `$COORD_ROOT/<identity>/` into a container,
-  jail, or sandboxed process and that's the entire surface that
-  identity needs. No daemon to authenticate to; no broker to
-  configure.
+- **One agent per container.** Because an agent is exactly a folder,
+  you can mount `$ST_ROOT/<agent>/` into a container, jail, or
+  sandboxed process and that's the entire surface that agent needs.
+  No daemon to authenticate to; no broker to configure.
 
-- **Pluggable sync.** `coord` defaults to plain bidirectional `rsync`,
-  which works against any host you can ssh to. But because the API is
-  *just a folder*, anything that surfaces a writable folder works:
+- **Pluggable sync.** smalltalk defaults to plain bidirectional
+  `rsync`, which works against any host you can ssh to. But because
+  the API is *just a folder*, anything that surfaces a writable folder
+  works:
   [ZeroFS](https://github.com/Barre/ZeroFS) (serves S3-compatible
   buckets as a POSIX filesystem over NFS/9P) lets you sync via object
   storage with no rsync host in the loop; Syncthing, Dropbox, NFS,
@@ -61,8 +67,8 @@ gives you several useful properties for free:
 ## Install
 
 ```sh
-git clone https://github.com/myobie/coord
-cd coord
+git clone https://github.com/myobie/smalltalk
+cd smalltalk
 npm install
 export PATH="$PWD/bin:$PATH"
 ```
@@ -74,10 +80,10 @@ against `src/cli.ts`.
 
 ## Names
 
-`coord` is being renamed to `smalltalk` (long) / `st` (canonical short).
-This is a phased migration; **the alias period is the entire current
-phase** and dropping `coord_*` only happens once every config-at-rest
-has migrated. For now:
+The project's legacy name `coord` is being renamed to `smalltalk`
+(long) / `st` (canonical short). This is a phased migration; **the
+alias period is the entire current phase** and dropping `coord_*` only
+happens once every config-at-rest has migrated. For now:
 
 - All three CLI names — `st`, `smalltalk`, `coord` — are installed and
   behave identically.
@@ -118,56 +124,57 @@ mkdir -p $HOME/.local/state/smalltalk/alice/{inbox,archive}
 export ST_AGENT=alice
 ```
 
-`ST_AGENT` (or an explicit `--from <agent>` per command) tells coord
-which agent is acting; commands die loudly when none of `ST_AGENT` /
-`ST_IDENTITY` / `COORD_IDENTITY` are set.
+`ST_AGENT` (or an explicit `--from <agent>` per command) tells
+smalltalk which agent is acting; commands die loudly when none of
+`ST_AGENT` / `ST_IDENTITY` / `COORD_IDENTITY` are set.
 
-To wire up an MCP host (Claude Code, etc.) inside a repo, run `coord init`
+To wire up an MCP host (Claude Code, etc.) inside a repo, run `st init`
 in that repo's root. It writes (or merges into) a `.mcp.json` with the
-coord channel-mode entry — see [MCP server](#mcp-server) below.
+smalltalk channel-mode entry — see [MCP server](#mcp-server) below.
 
 ```sh
 cd ~/work/some-repo
-coord init                  # write or merge .mcp.json in cwd
-coord init --print          # preview the entry without touching disk
+st init                  # write or merge .mcp.json in cwd
+st init --print          # preview the entry without touching disk
 ```
 
-`coord init` is idempotent: re-running it on a repo that already has
-the matching entry is a no-op. Other `mcpServers.*` entries (if any)
-are preserved untouched. The resolved `command` path is portable — it
+`st init` is idempotent: re-running it on a repo that already has the
+matching entry is a no-op. Other `mcpServers.*` entries (if any) are
+preserved untouched. The resolved `command` path is portable — it
 comes from this package's install location, not your developer
 machine.
 
 ## CLI: a few example commands
 
 ```sh
-echo "hi bob" | coord message send bob --subject hello      # send via stdin (alias: `coord msg send`)
-coord message ls                                            # list my inbox
-coord message read bob 1714826789012-x9k4mz.md              # parsed view of one file
-coord message archive 1714826789012-x9k4mz.md               # mv inbox -> archive
-coord message thread bob 1714826789012-x9k4mz.md            # walk the in-reply-to chain
-coord status --set busy                                     # update my status (available | busy | away | dnd | offline)
-coord agents --status available                             # who's around? (alias: members)
-coord overview                                              # at-a-glance dashboard
-coord resource add https://github.com/myobie/smalltalk/pull/19  # publish a URL alice cares about
-coord resource ls bob                                       # what URLs has bob published?
-coord init                                                  # wire .mcp.json into the current repo
-coord sync pull --all                                       # conservative cron
-coord watch                                                 # cross-tree activity
+echo "hi bob" | st message send bob --subject hello      # send via stdin (alias: `st msg send`)
+st message ls                                            # list my inbox
+st message read bob 1714826789012-x9k4mz.md              # parsed view of one file
+st message archive 1714826789012-x9k4mz.md               # mv inbox -> archive
+st message thread bob 1714826789012-x9k4mz.md            # walk the in-reply-to chain
+st status --set busy                                     # update my status (available | busy | away | dnd | offline)
+st agents --status available                             # who's around? (alias: members)
+st overview                                              # at-a-glance dashboard
+st resource add https://github.com/myobie/smalltalk/pull/19  # publish a URL alice cares about
+st resource ls bob                                       # what URLs has bob published?
+st init                                                  # wire .mcp.json into the current repo
+st sync pull --all                                       # conservative cron
+st watch                                                 # cross-tree activity
 ```
 
-`coord help` lists every subcommand; `coord <subcommand> --help` shows
-that command's usage.
+`st help` lists every subcommand; `st <subcommand> --help` shows that
+command's usage. (`coord` and `smalltalk` are installed alongside `st`
+and behave identically.)
 
 ### Shell completions
 
-`coord completions <shell>` prints a completion script to stdout for
+`st completions <shell>` prints a completion script to stdout for
 `fish`, `bash`, or `zsh`:
 
 ```sh
-coord completions fish > ~/.config/fish/completions/coord.fish
-coord completions bash > /etc/bash_completion.d/coord
-coord completions zsh  > "${fpath[1]}/_coord"
+st completions fish > ~/.config/fish/completions/st.fish
+st completions bash > /etc/bash_completion.d/st
+st completions zsh  > "${fpath[1]}/_st"
 ```
 
 The scripts complete subcommands, their verbs and flags, and the closed
@@ -175,8 +182,8 @@ value sets (status states, priorities).
 
 ## Programmatic API
 
-Embed coord into a Node TUI, an Electron main process, or any host that
-wants to drive coord without shelling out to `bin/coord`:
+Embed smalltalk into a Node TUI, an Electron main process, or any
+host that wants to drive it without shelling out to `bin/st`:
 
 ```ts
 import { createCoord, asAgent } from '@myobie/coord';
@@ -205,12 +212,17 @@ run example:tui-watch`). Canonical reference for each method:
 
 ## MCP server
 
-`coord mcp` runs the same surface as a [Model Context
-Protocol](https://modelcontextprotocol.io) stdio server. Tools:
-`coord_msg_send`, `coord_msg_ls`, `coord_msg_read`, `coord_msg_archive`,
-`coord_msg_thread`, `coord_members`.
+`st mcp` runs the same surface as a [Model Context
+Protocol](https://modelcontextprotocol.io) stdio server. Tools are
+dual-prefixed: `st_msg_send` / `coord_msg_send`, `st_msg_ls` /
+`coord_msg_ls`, `st_msg_read` / `coord_msg_read`, `st_msg_archive` /
+`coord_msg_archive`, `st_msg_thread` / `coord_msg_thread`, `st_agents` /
+`coord_agents` (with deprecated `st_members` / `coord_members`
+aliases), and the `st_resource_*` / `coord_resource_*` family. Both
+prefixes route to the same handler — `coord_*` is the back-compat
+alias kept through the rename window.
 
-The fast path to wire it into a repo is `coord init` (described under
+The fast path to wire it into a repo is `st init` (described under
 [First time on a machine](#first-time-on-a-machine)) — that writes a
 `.mcp.json` with the entry below, resolving the `command` path
 portably. For hosts that need a hand-written config, the shape is:
@@ -218,8 +230,8 @@ portably. For hosts that need a hand-written config, the shape is:
 ```json
 {
   "mcpServers": {
-    "coord": {
-      "command": "coord",
+    "smalltalk": {
+      "command": "st",
       "args": ["mcp"],
       "env": { "ST_ROOT": "/Users/me/.local/state/smalltalk", "ST_AGENT": "me" }
     }
@@ -227,27 +239,32 @@ portably. For hosts that need a hand-written config, the shape is:
 }
 ```
 
+(`"command": "coord"` and `"smalltalk": { ... "smalltalk": "coord" }`-style
+configs also work — `bin/coord` is the legacy alias and the MCP server
+announces under whichever binary was invoked.)
+
 Errors surface as `isError: true` with a `<CODE>:` prefixed text block
-and a structured payload under `result._meta['coord/error']` (namespaced
-passthrough — schema-free).
+and a structured payload under `result._meta['coord/error']` (the
+`coord/` namespace was set when the project was named `coord` and is
+kept for back-compat with existing pattern-matchers).
 
 ### Push mode (Claude Code channels)
 
-`coord mcp --channel` adds the push half: the server watches the
+`st mcp --channel` adds the push half: the server watches the
 configured inbox, emits `notifications/claude/channel` for every new
-message, and registers a `coord_msg_reply` tool. Aimed at Claude Code; other
-MCP hosts ignore the experimental capability and keep getting the same
-non-channel tool set.
+message, and registers a `st_msg_reply` / `coord_msg_reply` tool.
+Aimed at Claude Code; other MCP hosts ignore the experimental
+capability and keep getting the same non-channel tool set.
 
-`coord init` writes the channel-mode entry by default — use
-`coord init --no-channel` to omit the `--channel` arg for pull-only
+`st init` writes the channel-mode entry by default — use
+`st init --no-channel` to omit the `--channel` arg for pull-only
 hosts. The hand-written shape:
 
 ```json
 {
   "mcpServers": {
-    "coord": {
-      "command": "coord",
+    "smalltalk": {
+      "command": "st",
       "args": ["mcp", "--channel"],
       "env": { "ST_ROOT": "/Users/me/.local/state/smalltalk", "ST_AGENT": "me" }
     }
@@ -255,45 +272,46 @@ hosts. The hand-written shape:
 }
 ```
 
-Default `coord mcp` (no flag) is unchanged — non-Claude hosts pay no
+Default `st mcp` (no flag) is unchanged — non-Claude hosts pay no
 chokidar startup cost.
 
 The MCP server ships an `instructions` string covering the **boot
 ritual**: on connect, the agent writes `available` to its status
 file, drains any inbox backlog (ls → read → reply → archive), and
-runs `coord_members` for peer state. On shutdown (`SIGTERM`, `SIGINT`,
-or transport close), the server writes `offline` to the status file so
-peers see the right state immediately. The full text lives in
-`src/mcp/capabilities.ts` (`CHANNEL_INSTRUCTIONS`).
+runs `st_agents` / `coord_members` for peer state. On shutdown
+(`SIGTERM`, `SIGINT`, or transport close), the server writes
+`offline` to the status file so peers see the right state immediately.
+The full text lives in `src/mcp/capabilities.ts`
+(`CHANNEL_INSTRUCTIONS`).
 
 ## Harness integrations
 
-Coord plugs into three agent harnesses with reference scripts under
+smalltalk plugs into three agent harnesses with reference scripts under
 [`examples/`](examples/):
 
-- **Claude Code** — `coord mcp --channel` advertises
+- **Claude Code** — `st mcp --channel` advertises
   `experimental.claude/channel` and emits `notifications/claude/channel`
-  for every new arrival, plus a `coord_msg_reply` tool. See above.
-  A `SessionStart` hook at
+  for every new arrival, plus a `st_msg_reply` / `coord_msg_reply`
+  tool. See above. A `SessionStart` hook at
   [`examples/claude-code/`](examples/claude-code/) fires the boot
   ritual on cold start AND on every `--resume` / `/clear` / `/compact`
   so resumed sessions don't sit silent — install per
   [`examples/claude-code/README.md`](examples/claude-code/README.md).
 - **Codex CLI** — [`examples/codex/`](examples/codex/) ships
   `SessionStart` + `Stop` bash hooks that inject the inbox snapshot
-  via `coord message ls --json`, plus a `coord ding` recipe for true push
+  via `st message ls --json`, plus an `st ding` recipe for true push
   into a pty-wrapped Codex session.
 - **Pi** — [`examples/pi/coord.ts`](examples/pi/) is a single
   TypeScript extension that auto-discovers from
   `~/.pi/agent/extensions/`, watches the inbox via the embeddable
-  library, and registers the five coord verbs via
-  `pi.registerTool()` (pi has no native MCP). Its `session_start`
-  handler also fires a one-time `pi.sendUserMessage` so the boot
-  ritual runs on every fresh session and `/reload` / `/resume`.
+  library, and registers the message verbs via `pi.registerTool()`
+  (pi has no native MCP). Its `session_start` handler also fires a
+  one-time `pi.sendUserMessage` so the boot ritual runs on every
+  fresh session and `/reload` / `/resume`.
 
-For harnesses without channels or extension points, `coord ding
+For harnesses without channels or extension points, `st ding
 <pty-session>` is a busy-aware push daemon: it watches the inbox,
-respects `coord status` (suppress on `busy`/`dnd`, flush on
+respects `st status` (suppress on `busy`/`dnd`, flush on
 `available`/`offline`), and pty-sends a one-line notice into the
 target session on each new arrival.
 
@@ -308,8 +326,8 @@ npm test                # full vitest run: unit + integration
 ```
 
 Unit tests exercise every module in `src/` against in-memory fixtures.
-Integration tests spawn the actual `bin/coord` binary against real
-`$COORD_ROOT` directories, real `rsync`, and real PTYs (via
+Integration tests spawn the actual `bin/st` / `bin/coord` binaries
+against real `$ST_ROOT` directories, real `rsync`, and real PTYs (via
 `@myobie/pty/testing`) — gated by rsync's presence on `$PATH`.
 
 ## Layout reference

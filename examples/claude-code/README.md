@@ -1,40 +1,40 @@
-# Claude Code integration — coord session-boundary hooks
+# Claude Code integration — smalltalk session-boundary hooks
 
-This directory has the pieces for plugging coord into Claude Code at
-the **session boundary** layer: a `SessionStart` hook that runs the
-boot ritual on every cold start / resume / `/clear` / `/compact`, and
-a `StopFailure` hook that surfaces API-error wedges to myobie via
-coord so a quiet, wedged session doesn't go unnoticed.
+This directory has the pieces for plugging smalltalk into Claude Code
+at the **session boundary** layer: a `SessionStart` hook that runs
+the boot ritual on every cold start / resume / `/clear` / `/compact`,
+and a `StopFailure` hook that surfaces API-error wedges to myobie via
+smalltalk so a quiet, wedged session doesn't go unnoticed.
 
 ## What's in here
 
 - `hooks/session-start.sh` — minimal Claude Code `SessionStart` hook.
-  Wakes the agent with a system reminder telling it to run the coord
-  boot ritual (status → available, drain inbox, log/update its current
-  task, write a journal entry if mid-task).
+  Wakes the agent with a system reminder telling it to run the
+  smalltalk boot ritual (status → available, drain inbox).
 - `hooks/stop-failure.sh` — Claude Code `StopFailure` hook. Fires when
   a session ends mid-turn due to an Anthropic API error; branches by
   `error_type` and either sets the agent's status (away/offline) and
-  optionally `coord message send`s myobie a tuned notice — or stays
+  optionally `st message send`s myobie a tuned notice — or stays
   silent for programmer-error types. See **StopFailure** below.
 - `settings.local.example.json` — full example settings file with
   both hooks wired up. Copy to `<agent-repo>/.claude/settings.local.json`
-  and swap the absolute paths for your coord checkout.
+  and swap the absolute paths for your smalltalk checkout.
 
 ## Why it's needed
 
-Channel mode (`coord mcp --channel`) handles **new arrivals during a
+Channel mode (`st mcp --channel`) handles **new arrivals during a
 session**: the chokidar watcher emits `notifications/claude/channel`
 frames and the SDK surfaces them as `<channel source="coord" …>`
-blocks in the agent's context, triggering a turn.
+blocks in the agent's context, triggering a turn. (The `source="coord"`
+attribute is kept through the rename window for back-compat with
+downstream parsers; the Phase 5 cleanup flips it to `source="st"`.)
 
 What it doesn't handle is **start-of-session**. When Claude Code boots
 fresh, or resumes a saved conversation (`--resume`, `--continue`,
 `/resume`, `/clear`, `/compact`), the MCP server reconnects and the
 ritual instructions are loaded — but if nothing new lands in the
 inbox, the agent never gets a turn, so the ritual never runs. Result:
-the agent stays silent with stale status, an unread inbox, and no
-journal entry for whatever it's about to do.
+the agent stays silent with stale status and an unread inbox.
 
 This hook closes that gap. The `SessionStart` hook fires on every
 session boundary listed above; with `asyncRewake: true` the script
@@ -65,7 +65,7 @@ state from the first turn.
                "type": "command",
                "async": true,
                "asyncRewake": true,
-               "command": "/absolute/path/to/coord/examples/claude-code/hooks/session-start.sh"
+               "command": "/absolute/path/to/smalltalk/examples/claude-code/hooks/session-start.sh"
              }
            ]
          }
@@ -75,7 +75,7 @@ state from the first turn.
            "hooks": [
              {
                "type": "command",
-               "command": "/absolute/path/to/coord/examples/claude-code/hooks/stop-failure.sh"
+               "command": "/absolute/path/to/smalltalk/examples/claude-code/hooks/stop-failure.sh"
              }
            ]
          }
@@ -92,9 +92,11 @@ state from the first turn.
 3. (If you're using channel mode for push, which you probably are:)
    make sure Claude Code is launched with
    `--dangerously-load-development-channels server:coord` so the
-   `<channel source="coord">` blocks surface as visible turns.
-   `experimental.channelsEnabled: true` in Claude Code's settings is
-   the durable form of the same opt-in.
+   `<channel source="coord">` blocks surface as visible turns. The
+   `server:coord` token is the MCP server's announced name when
+   invoked via `bin/coord`; Phase 5 of the rename flips it to
+   `server:st`. `experimental.channelsEnabled: true` in Claude Code's
+   settings is the durable form of the same opt-in.
 
 ## How it relates to channel mode
 
@@ -102,7 +104,7 @@ The two are **complementary**, not redundant.
 
 | When | What fires | What runs |
 |---|---|---|
-| Session boundary (cold start, resume, /clear, /compact) | `SessionStart` hook → system reminder | Boot ritual (status set, inbox drain, task log, journal) |
+| Session boundary (cold start, resume, /clear, /compact) | `SessionStart` hook → system reminder | Boot ritual (status set, inbox drain) |
 | Mid-session new inbox file | `notifications/claude/channel` MCP push | Read + reply + archive the specific message |
 
 If you only run the hook, channel pushes still work — but you'd miss
@@ -127,17 +129,18 @@ reads the JSON envelope Claude Code pipes on stdin, parses
 
 | `error_type`                                  | What the hook does                                                                                                          |
 | --------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------|
-| `rate_limit`                                  | `coord status <id> --set away`. **No** coord ding (transient — would spam during Anthropic capacity events).                |
-| `server_error`                                | `coord status <id> --set away` + standard-priority `coord message send myobie` notice.                                      |
-| `authentication_failed`                       | `coord status <id> --set offline` + **high-priority** `coord message send myobie` (needs human intervention).               |
+| `rate_limit`                                  | `st status <id> --set away`. **No** ding (transient — would spam during Anthropic capacity events).                         |
+| `server_error`                                | `st status <id> --set away` + standard-priority `st message send myobie` notice.                                            |
+| `authentication_failed`                       | `st status <id> --set offline` + **high-priority** `st message send myobie` (needs human intervention).                     |
 | `oauth_org_not_allowed`                       | Same as `authentication_failed`.                                                                                            |
-| `billing_error`                               | `coord status <id> --set offline` + high-priority "billing issue" notice.                                                   |
+| `billing_error`                               | `st status <id> --set offline` + high-priority "billing issue" notice.                                                      |
 | `max_output_tokens`, `invalid_request`, `model_not_found` | **Ignored.** Programmer error / long-turn config issue — not infrastructure; the agent owns recovery.           |
-| anything else (incl. literal `unknown`)       | `coord status <id> --set away` + standard-priority notice with the `error_type` verbatim, so we extend the table after triage. |
+| anything else (incl. literal `unknown`)       | `st status <id> --set away` + standard-priority notice with the `error_type` verbatim, so we extend the table after triage. |
 
-The script reads the agent's identity from `$COORD_IDENTITY`, which
-should be set in the session env (e.g. for a pty-supervised Claude
-Code session, set it in `pty.toml`'s `[sessions.claude.env]` block).
+The script reads the agent's identity from `$ST_AGENT` (or the legacy
+`$ST_IDENTITY` / `$COORD_IDENTITY` fallbacks), which should be set in
+the session env (e.g. for a pty-supervised Claude Code session, set
+it in `pty.toml`'s `[sessions.claude.env]` block).
 
 **Why a single script with internal branching**, rather than one
 matcher-entry per `error_type` in `settings.local.json`? The policy is
@@ -147,13 +150,15 @@ not a settings.json migration across every agent's repo.
 
 **Not in scope here**: wedge detection cron, auto-restart, or any
 auto-recovery. This is visibility only. A human sees the ding, looks
-at `coord members`, and decides whether to nudge or wait.
+at `st agents`, and decides whether to nudge or wait.
 
 ## How it pairs with the other harnesses
 
 - **Pi** has an analogous `pi.sendUserMessage` call inside
   `examples/pi/coord.ts`'s `session_start` handler. Same idea: force
-  a turn on every session boundary so the boot ritual runs.
+  a turn on every session boundary so the boot ritual runs. (The
+  extension filename `coord.ts` is preserved for back-compat with
+  installed pi extensions; new installs can use any filename.)
 - **Codex** doesn't have an asyncRewake equivalent. The existing
   `examples/codex/session-start.sh` hook already runs on each new
   session and injects the inbox snapshot as `additionalContext`,
@@ -161,15 +166,15 @@ at `coord members`, and decides whether to nudge or wait.
 
 ## Boundaries
 
-- The hook **doesn't shell out to `coord`** itself. The boot ritual
+- The hook **doesn't shell out to `st`** itself. The boot ritual
   is documented in the MCP server's `CHANNEL_INSTRUCTIONS` string and
-  the coord SKILL.md — by the time the agent reads the system
+  the smalltalk SKILL.md — by the time the agent reads the system
   reminder, those instructions are already loaded. The hook just
   triggers a turn.
 - The hook **doesn't auto-set status** or auto-drain the inbox. That's
   the agent's job, per the ritual. Doing it from the hook would
   collide with the agent's own actions and break the
-  one-writer-per-identity rule.
+  one-writer-per-agent rule.
 - This script is **per-machine, per-user setup**. It's not bundled
   into anyone's automatic install path — you copy/symlink + edit
   settings.json yourself.

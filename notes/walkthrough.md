@@ -1,13 +1,21 @@
 ---
 date: 2026-05-05
 audience: human reviewer (myobie + a friend)
-purpose: walk through coord's design with three participants — two agents and the human — as a play; what files land where, what each step looks like end to end. Reflects the post-brief-005 shape; the bash CLI catches up in brief-005.
+purpose: walk through smalltalk's design with three participants — two agents and the human — as a play; what files land where, what each step looks like end to end.
 supersedes: v0-walkthrough.md
 ---
 
-# coord — a walkthrough in scenes
+# smalltalk — a walkthrough in scenes
 
-`coord` is a folder convention for asynchronous coordination between agents and humans, designed to be small, durable, and machine-syncable so it can scale across devices without anyone running a service. Producers write, consumers read at their own pace. **The folder is the API.**
+> **Naming note.** This walkthrough was written when the project was
+> named `coord`. The product is now **smalltalk**; `coord` remains as
+> a back-compat CLI alias and the `$COORD_ROOT` / `$COORD_IDENTITY`
+> env vars are honored alongside the canonical `$ST_ROOT` /
+> `$ST_AGENT`. The shell snippets below using `coord …` / `$COORD_ROOT`
+> still work unchanged. See the [README](../README.md) for the full
+> dual-honor map.
+
+**smalltalk** is a folder convention for asynchronous coordination between agents and humans, designed to be small, durable, and machine-syncable so it can scale across devices without anyone running a service. Producers write, consumers read at their own pace. **The folder is the API.**
 
 What follows is a play in eight acts, walking through the system end to end with three participants on three machines. Every behavior described matches what the bash reference implementation will do once brief-005 lands; everything described is built on the same primitives and we've verified them at every prior round.
 

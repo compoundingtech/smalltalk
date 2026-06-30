@@ -1,15 +1,21 @@
-# coord — LAYOUT
+# smalltalk — LAYOUT
 
-The minimal invariants every coord implementation must respect. Anything not
-in this file is open for the implementation to decide and iterate on.
+The minimal invariants every smalltalk implementation must respect.
+Anything not in this file is open for the implementation to decide
+and iterate on.
+
+> Naming note: the project is mid-phase-rename from `coord` to
+> `smalltalk`. The `$COORD_ROOT` env var and `~/.local/state/coord/`
+> default both remain honored as legacy aliases — see [Agent
+> resolution](#agent-resolution) for the dual-honor chain.
 
 ## The root
 
-`$COORD_ROOT` (default `~/.local/state/coord`) holds one sub-folder per
-**identity**.
+`$ST_ROOT` (default `~/.local/state/smalltalk`; legacy `$COORD_ROOT` /
+`~/.local/state/coord` honored) holds one sub-folder per **agent**.
 
 ```
-$COORD_ROOT/
+$ST_ROOT/
   alice/
     inbox/
     archive/
@@ -18,7 +24,7 @@ $COORD_ROOT/
     archive/
 ```
 
-The folder is 100% syncable — every file under `$COORD_ROOT/` participates in
+The folder is 100% syncable — every file under `$ST_ROOT/` participates in
 sync. There are no machine-local marker files inside the folder.
 
 ## Agent rules
@@ -84,24 +90,24 @@ inbox/
 ```
 
 Any file shape is fine — JSON, CSV, image, tarball. Attachments sync
-like everything else under `$COORD_ROOT/` and are inspectable with
-plain `ls` / `cat`. Their schema and interpretation are the
-participants' concern, not coord's — coord guarantees only that the
-bytes arrive and that the shared prefix is preserved.
+like everything else under `$ST_ROOT/` and are inspectable with plain
+`ls` / `cat`. Their schema and interpretation are the participants'
+concern, not smalltalk's — smalltalk guarantees only that the bytes
+arrive and that the shared prefix is preserved.
 
 Lifecycle is opt-in by default. Bare `archive`, `read`, and `trim`
 operate on the canonical `.md` file only — tooling that wants
 attachments coupled passes `--with-attachments` (see below). Without
-that flag, attachments stay where they were written; coord doesn't
+that flag, attachments stay where they were written; smalltalk doesn't
 move or reclaim them.
 
-- `coord message archive <file> --with-attachments` moves every
+- `st message archive <file> --with-attachments` moves every
   prefix-sibling alongside the `.md`. Atomic on conflict: if any
   sibling has a divergent archive twin, the whole operation refuses
   before moving anything.
-- `coord message archive trim --with-attachments` deletes archive
+- `st message archive trim --with-attachments` deletes archive
   prefix-siblings whose `.md` is being trimmed.
-- `coord message ls --orphans` lists prefix-siblings in the folder
+- `st message ls --orphans` lists prefix-siblings in the folder
   (inbox by default, archive with `--archive`) whose canonical `.md`
   is no longer present — i.e. files left behind by an earlier bare
   `archive`.
@@ -133,7 +139,7 @@ Readers must be permissive — missing or malformed frontmatter is treated as
 an untyped message; the body is still readable.
 
 The recipient (`to:`) is *not* in the frontmatter. The path tells you: a
-file at `$COORD_ROOT/bob/inbox/<filename>` is addressed to `bob`. The
+file at `$ST_ROOT/bob/inbox/<filename>` is addressed to `bob`. The
 timestamp is *not* in the frontmatter either — the filename's `<unix-ms>`
 prefix is the canonical send time.
 
@@ -150,7 +156,7 @@ prefix is the canonical send time.
   carries `url:` (required) plus optional `title:` / `tags:` /
   `relation:`; body is an optional markdown description. **Only the
   identity owner writes here**; peers read via sync but never write.
-  The folder is created lazily on first `coord resource add`. URLs
+  The folder is created lazily on first `st resource add`. URLs
   accept any scheme — the convention is `https://` for the web,
   `pty://<session-name>` for a pty session, and otherwise whatever
   scheme the participants agree on.
@@ -173,8 +179,8 @@ prefix is the canonical send time.
 
 ## Sending
 
-To send identity `bob` a message: write a new file to
-`$COORD_ROOT/bob/inbox/<filename>.md` with the frontmatter above. That's
+To send agent `bob` a message: write a new file to
+`$ST_ROOT/bob/inbox/<filename>.md` with the frontmatter above. That's
 it. The act of writing the file *is* the send. There is no separate outbox
 folder.
 
@@ -183,12 +189,12 @@ whatever sync mechanism is configured. The sender doesn't know or care.
 
 ## Receiving
 
-To receive: list and read files in `$COORD_ROOT/<self>/inbox/`. To mark a
-message as processed: `mv` it to `$COORD_ROOT/<self>/archive/`.
+To receive: list and read files in `$ST_ROOT/<self>/inbox/`. To mark a
+message as processed: `mv` it to `$ST_ROOT/<self>/archive/`.
 
 ## Agent resolution
 
-A coord implementation needs to know "which agent is acting" for any
+A smalltalk implementation needs to know "which agent is acting" for any
 command that operates on `<self>`. The convention does not auto-detect
 this from on-disk state. Instead, agent resolution is one of:
 
@@ -218,11 +224,11 @@ correctly across machines:
 > for callers who keep attachments out-of-band.
 
 **Sweep is a convergence operation, not transactional.** It restores
-the invariant in three places: (1) on-demand via `coord sweep`;
+the invariant in three places: (1) on-demand via `st sweep`;
 (2) lazily on read — when a reader opens an inbox file whose
 byte-identical twin exists in archive, the inbox copy is removed and
 the archive copy is returned instead (one stat + one byte-compare,
-bounded); (3) before AND after every `coord sync` push/pull.
+bounded); (3) before AND after every `st sync` push/pull.
 Idempotent — safe to run repeatedly, on any machine, in any order.
 
 Operations on `inbox/` and `archive/` **MUST NOT** depend on a recent
@@ -249,10 +255,10 @@ two opt-out signals:
   agent is in the middle of a long-running task and isn't reading
   inbox). Different from `busy` — `away` is "not looking right now";
   `busy` is "actively don't ping me." Senders may still deliver to
-  `away` recipients; `coord ding`'s SUPPRESS_STATES intentionally
-  does NOT suppress `away` arrivals.
+  `away` recipients; `st ding`'s SUPPRESS_STATES intentionally does
+  NOT suppress `away` arrivals.
 - `busy` — focused work in progress; please defer notifications.
-  `coord ding` buffers and flushes on the next status flip.
+  `st ding` buffers and flushes on the next status flip.
 - `dnd` — same suppression behavior as `busy`; semantic difference is
   the writer's intent (do-not-disturb is "stronger" than busy).
 - `offline` — gone; deliberate, distinct from missing-file (also
@@ -265,7 +271,7 @@ status file's mtime is older than ~15 minutes (the
 `STATUS_STALE_MS` constant in `src/common.ts`). The owning agent
 hasn't refreshed status in a while, so whatever the file says is no
 longer trusted. `unknown` is never written to disk and is not
-settable by the user — `coord status --set unknown` is rejected.
+settable by the user — `st status --set unknown` is rejected.
 
 The MCP server's periodic refresh (`STATUS_REFRESH_MS`, 5 min) keeps
 the mtime fresh for the current recorded value while the server runs,
@@ -287,10 +293,10 @@ Sync moves files between machines. The convention does not mandate any
 particular sync tool, but plain bidirectional `rsync` is the floor:
 
 ```sh
-rsync -a $COORD_ROOT/  peer:$COORD_ROOT/
-rsync -a peer:$COORD_ROOT/  $COORD_ROOT/
+rsync -a $ST_ROOT/  peer:$ST_ROOT/
+rsync -a peer:$ST_ROOT/  $ST_ROOT/
 # then sweep:
-for archived in $COORD_ROOT/*/archive/*.md; do
+for archived in $ST_ROOT/*/archive/*.md; do
   inbox=$(echo "$archived" | sed 's|/archive/|/inbox/|')
   [ -e "$inbox" ] && rm "$inbox"
 done
@@ -306,7 +312,7 @@ resurrected from peers' inboxes on every sync.
 Everything below is for the implementation to decide and iterate on:
 
 - Trim policy (when archive gets cleaned up; tombstone retention horizon).
-- CLI surface (`coord message send`, `coord message ls`, etc.). Naming,
+- CLI surface (`st message send`, `st message ls`, etc.). Naming,
   flags, output formats.
 - How sync is invoked, what peer specs look like, whether there's an
   `--all` form.
