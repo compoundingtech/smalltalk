@@ -6,7 +6,7 @@
 // The CLI entry point (`bin/coord` → `src/cli.ts`) is invoked separately;
 // it is not re-exported here.
 
-export const VERSION = '0.8.1';
+export const VERSION = '0.9.0';
 
 // ─── Factory + handle ──────────────────────────────────────────────────
 

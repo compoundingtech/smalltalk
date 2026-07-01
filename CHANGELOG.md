@@ -6,6 +6,57 @@ minor releases until 1.0.
 
 ## Unreleased
 
+### Added (brief-016 — `smalltalk launch <harness>` one-command bootstrap)
+
+New CLI verb: `st launch <claude|codex>` (also `smalltalk launch` /
+`coord launch`) that stands up a harness correctly wired to smalltalk
+in a single command. Shaped like `ollama launch`.
+
+- **Identity resolution:** `--identity <name>` explicit → `$ST_AGENT`
+  → legacy `$ST_IDENTITY` → legacy `$COORD_IDENTITY` → throwaway
+  `anon-<rand6>` (with a one-line stderr notice pointing at
+  `ST_AGENT` for persistence). Same fallback chain as `coord mcp` in
+  0.8.1.
+- **`.mcp.json` bootstrap:** delegates to `cmdInit` — idempotent
+  merge, divergent-entry prompt-gate. Channel mode defaults to `on`
+  for claude, `off` for codex.
+- **Claude session-id dance:** mirrors the `pty-claude-launcher.sh`
+  reference — pins a `.claude-session-id` UUID (if the file doesn't
+  exist), one-shot `claude --print` to bootstrap the jsonl when it's
+  missing (avoids the "session runs in-memory only" trap under
+  detached pty), then `claude --resume <SID>` for the persistent
+  run.
+- **Codex sidecar:** when the harness is `codex` and `pty` is on
+  `$PATH`, the generated `pty.toml` includes a
+  `[sessions.ding]` block running `coord ding <session> --identity
+  <agent>` with `strategy = "permanent"` so it comes back after
+  crashes — codex has no `asyncRewake` equivalent, so `coord ding`
+  is the re-wake mechanism.
+- **GLM path:** `--model <spec>` routes through `ollama launch
+  <harness> --model <spec>` so ollama does the env injection AND
+  skips its interactive model picker. Unblocks unattended
+  GLM-backed agents.
+- **pty-optional:** if `pty` is on `$PATH`, writes a minimal
+  `pty.toml` (skip-if-exists — user edits are preserved) and hands
+  off to `pty up`. If not, the dry-run prints the exact `pty.toml`
+  snippet + direct-spawn command the user can drop in later.
+- **`--dry-run`** (alias `--print`): print the identity /
+  argv / mcp.json path / pty.toml preview / channel mode / ollama
+  route summary without spawning anything. Also touches nothing on
+  disk under dry-run.
+- **New file:** `src/commands/launch.ts` + 32 unit tests covering
+  identity resolution, channel-mode defaults, argv construction,
+  pty.toml content, pty detection, session-id preservation, dry-run
+  summary, and error paths.
+- **Docs:** new README section "Bring a Codex (or Claude / GLM)
+  agent onto smalltalk" — copy-pasteable, positioned right after
+  `First time on a machine` so new readers hit it early.
+- **VERSION** bumps to `0.9.0`.
+
+Scope excluded per brief-016: no changes to pty's launcher itself.
+The `.mcp.json` writer's actual bin-path resolution and the ollama
+CLI shape are treated as external contracts.
+
 ### Fixed (`coord mcp` startup — anon-identity fallback)
 
 `coord mcp` (and `st mcp` / `smalltalk mcp`) no longer hard-exits when

@@ -19,6 +19,7 @@ import { cmdArchiveCli } from './commands/archive.ts';
 import { cmdCompletionsCli } from './commands/completions.ts';
 import { cmdDingCli } from './commands/ding.ts';
 import { cmdInitCli } from './commands/init.ts';
+import { cmdLaunchCli } from './commands/launch.ts';
 import { cmdLsCli } from './commands/ls.ts';
 import { cmdMcpCli } from './commands/mcp.ts';
 import { cmdAgentsCli } from './commands/agents.ts';
@@ -99,7 +100,12 @@ const TOP_LEVEL_USAGE =
   `  init [<dir>] [--no-channel] [--print] [--force]\n` +
   `                                   write or merge .mcp.json in <dir>\n` +
   `                                   (default: cwd) so Claude Code loads\n` +
-  `                                   the coord MCP server\n` +
+  `                                   the smalltalk MCP server\n` +
+  `  launch <claude|codex> [--identity ID] [--model SPEC] [--no-pty]\n` +
+  `                        [--no-channel] [--session-name N] [--dry-run]\n` +
+  `                                   one-command harness bootstrap onto\n` +
+  `                                   smalltalk — identity + .mcp.json +\n` +
+  `                                   session-id + pty (when available)\n` +
   `  ding <pty-session> [--identity ID] [--interval MS]\n` +
   `                                   busy-aware push notifier; pty-sends a\n` +
   `                                   notice on each new arrival when the agent\n` +
@@ -194,6 +200,8 @@ export async function runCli(
         return await cmdMcpCli(rest, ctx);
       case 'init':
         return await cmdInitCli(rest, ctx);
+      case 'launch':
+        return await cmdLaunchCli(rest, ctx);
       case 'ding':
         return await cmdDingCli(rest, ctx);
       case 'completions':

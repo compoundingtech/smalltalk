@@ -53,7 +53,12 @@ export const SERVER_INFO: Implementation = {
   //         MCP hosts (Codex etc.) that spawn the server without
   //         identity env. One-line stderr warning + lazy-create the
   //         anon agent's inbox/archive folders.
-  version: '0.8.1',
+  // 0.9.0 — brief-016: `smalltalk launch <claude|codex>` verb —
+  //         one-command harness bootstrap onto smalltalk (identity,
+  //         .mcp.json, session-id, pty registration when available,
+  //         `coord ding` sidecar for codex, `ollama launch` route
+  //         for GLM-backed launches via --model).
+  version: '0.9.0',
 };
 
 /**

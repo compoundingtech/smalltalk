@@ -144,6 +144,57 @@ preserved untouched. The resolved `command` path is portable — it
 comes from this package's install location, not your developer
 machine.
 
+## Bring a Codex (or Claude / GLM) agent onto smalltalk
+
+`st launch <harness>` is the one-command bootstrap. It sets identity,
+writes `.mcp.json`, does the harness-specific session-id dance, and
+(when `pty` is on `$PATH`) registers the session — plus a `coord ding`
+sidecar for Codex, which has no `asyncRewake` hook of its own.
+
+```sh
+cd ~/work/some-repo
+
+# Claude Code, direct anthropic. Channel mode on by default.
+st launch claude
+
+# Codex CLI. Adds a `coord ding` sidecar for re-wake pushes.
+st launch codex
+
+# GLM via ollama — the picker is skipped (--model routes through
+# `ollama launch <harness> --model <spec>`), so unattended runs
+# no longer die at the interactive menu.
+st launch claude --model glm-5.2:cloud
+st launch codex  --model glm-5.2:cloud
+
+# Explicit identity (else $ST_AGENT, else an `anon-<rand6>` throwaway).
+st launch codex --identity smalltalk-oncall
+
+# Preview what would happen without touching disk.
+st launch claude --dry-run
+```
+
+The launcher is **pty-optional**. If `pty` is on your `$PATH`, it
+writes a minimal `pty.toml` (skip-if-exists — user edits are
+preserved) and hands off to `pty up`. If `pty` isn't installed, the
+dry-run summary prints the exact `pty.toml` snippet you can drop in
+later and the direct-spawn command to run in the meantime.
+
+What each harness gets:
+
+- **Claude Code** — jsonl-bootstrap so the session persists under
+  detached pty, `--dangerously-load-development-channels server:st`
+  wired in, resumed via a pinned `.claude-session-id`.
+- **Codex CLI** — `codex resume $(cat .codex-session-id)` when the
+  session file exists (bare `codex` otherwise), plus a `[sessions.ding]`
+  sidecar running `coord ding <session> --identity <agent>` with
+  `strategy = "permanent"` so it comes back after crashes.
+
+Identity handling matches every other verb: `--identity` explicit →
+`$ST_AGENT` → legacy `$ST_IDENTITY` → legacy `$COORD_IDENTITY` →
+`anon-<rand6>` throwaway (with a one-line stderr notice pointing at
+`ST_AGENT` for persistence). Managed agents that set `ST_AGENT` see
+no fallback.
+
 ## CLI: a few example commands
 
 ```sh
@@ -157,6 +208,7 @@ st agents --status available                             # who's around? (alias:
 st overview                                              # at-a-glance dashboard
 st resource add https://github.com/myobie/smalltalk/pull/19  # publish a URL alice cares about
 st resource ls bob                                       # what URLs has bob published?
+st launch codex                                          # bring a Codex agent onto smalltalk in one command
 st init                                                  # wire .mcp.json into the current repo
 st sync pull --all                                       # conservative cron
 st watch                                                 # cross-tree activity
