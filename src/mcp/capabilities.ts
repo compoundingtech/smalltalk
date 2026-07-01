@@ -47,7 +47,13 @@ export const SERVER_INFO: Implementation = {
   //         coord.archiveTrim gain `withAttachments`; new
   //         coord.lsOrphans and coord.ding on the handle). No CLI
   //         or MCP surface change.
-  version: '0.8.0',
+  // 0.8.1 — `coord mcp` startup falls back to a throwaway
+  //         `anon-<rand6>` agent when no ST_AGENT/ST_IDENTITY/
+  //         COORD_IDENTITY is set, instead of hard-exiting. Unblocks
+  //         MCP hosts (Codex etc.) that spawn the server without
+  //         identity env. One-line stderr warning + lazy-create the
+  //         anon agent's inbox/archive folders.
+  version: '0.8.1',
 };
 
 /**

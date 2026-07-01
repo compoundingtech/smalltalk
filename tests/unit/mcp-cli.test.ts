@@ -1,10 +1,16 @@
 // tests/unit/mcp-cli.test.ts — env contract for `coord mcp` CLI.
 //
 // The CLI's env handling diverged from every other coord verb until
-// brief-021 unified it: COORD_IDENTITY is required (no default),
-// COORD_ROOT defaults to ~/.local/state/coord via coordRootFrom().
-// These tests pin both halves of that contract.
+// brief-021 unified it: ST_AGENT (or legacy ST_IDENTITY/COORD_IDENTITY)
+// resolves identity; ST_ROOT/COORD_ROOT defaults to
+// ~/.local/state/smalltalk via coordRootFrom(). When no env identity
+// is set, the server falls back to a throwaway `anon-<rand6>` identity
+// (Nathan's call, per the Codex-host gap) rather than hard-exiting.
+// These tests pin all three contracts.
 
+import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { CliContext } from '../../src/cli-context.ts';
@@ -57,16 +63,6 @@ afterEach(() => {
 });
 
 describe('cmdMcpCli — env contract', () => {
-  it('throws when COORD_IDENTITY is unset (no default)', async () => {
-    await expect(cmdMcpCli([], makeCtx({}))).rejects.toThrow(/COORD_IDENTITY/);
-  });
-
-  it('throws when COORD_IDENTITY is empty string', async () => {
-    await expect(
-      cmdMcpCli([], makeCtx({ COORD_IDENTITY: '' }))
-    ).rejects.toThrow(/COORD_IDENTITY/);
-  });
-
   it('boots with only COORD_IDENTITY set; COORD_ROOT defaults', async () => {
     await cmdMcpCli([], makeCtx({ COORD_IDENTITY: 'alice' }));
     expect(createMcpServerSpy).toHaveBeenCalledTimes(1);
@@ -107,7 +103,98 @@ describe('cmdMcpCli — env contract', () => {
     const rc = await cmdMcpCli(['--help'], ctx);
     expect(rc).toBe(0);
     expect(helpText).toContain('coord mcp');
-    expect(helpText).toContain('COORD_IDENTITY');
+    expect(helpText).toContain('ST_AGENT');
     expect(createMcpServerSpy).not.toHaveBeenCalled();
+  });
+});
+
+// ─── Anon fallback (Nathan's brief; Codex-host gap) ────────────────────
+
+describe('cmdMcpCli — anon-identity fallback', () => {
+  let scratchRoot: string;
+
+  beforeEach(() => {
+    scratchRoot = mkdtempSync(join(tmpdir(), 'st-mcp-anon-'));
+  });
+
+  afterEach(() => {
+    rmSync(scratchRoot, { recursive: true, force: true });
+  });
+
+  it('no ST_AGENT / ST_IDENTITY / COORD_IDENTITY set → boots with an anon-<rand6> identity', async () => {
+    await cmdMcpCli([], makeCtx({ ST_ROOT: scratchRoot }));
+    expect(createMcpServerSpy).toHaveBeenCalledTimes(1);
+    const opts = createMcpServerSpy.mock.calls[0]?.[0] as { identity: string };
+    expect(opts.identity).toMatch(/^anon-[0-9a-z]{6}$/);
+  });
+
+  it('writes a one-line stderr warning naming the throwaway identity + pointing at ST_AGENT', async () => {
+    let stderrCapture = '';
+    const ctx = makeCtx({ ST_ROOT: scratchRoot });
+    ctx.stderr = (s) => {
+      stderrCapture += s;
+    };
+    await cmdMcpCli([], ctx);
+    expect(stderrCapture).toMatch(/no ST_AGENT set/);
+    expect(stderrCapture).toMatch(/anon-[0-9a-z]{6}/);
+    expect(stderrCapture).toMatch(/set ST_AGENT to persist/);
+    // Exactly one warning line.
+    expect(stderrCapture.match(/\n/g)?.length).toBe(1);
+  });
+
+  it('creates the anon agent\'s inbox + archive folders on disk', async () => {
+    let stderrCapture = '';
+    const ctx = makeCtx({ ST_ROOT: scratchRoot });
+    ctx.stderr = (s) => {
+      stderrCapture += s;
+    };
+    await cmdMcpCli([], ctx);
+    const m = /anon-[0-9a-z]{6}/.exec(stderrCapture);
+    expect(m).toBeTruthy();
+    const id = m![0];
+    const { existsSync } = await import('node:fs');
+    expect(existsSync(join(scratchRoot, id, 'inbox'))).toBe(true);
+    expect(existsSync(join(scratchRoot, id, 'archive'))).toBe(true);
+  });
+
+  it('each invocation generates a fresh throwaway identity (no leakage across spawns)', async () => {
+    const ids: string[] = [];
+    for (let i = 0; i < 3; i++) {
+      createMcpServerSpy.mockClear();
+      await cmdMcpCli([], makeCtx({ ST_ROOT: scratchRoot }));
+      const opts = createMcpServerSpy.mock.calls[0]?.[0] as {
+        identity: string;
+      };
+      ids.push(opts.identity);
+    }
+    expect(new Set(ids).size).toBe(3);
+  });
+
+  it('explicit ST_AGENT wins — no fallback, no warning', async () => {
+    let stderrCapture = '';
+    const ctx = makeCtx({ ST_ROOT: scratchRoot, ST_AGENT: 'alice' });
+    ctx.stderr = (s) => {
+      stderrCapture += s;
+    };
+    await cmdMcpCli([], ctx);
+    const opts = createMcpServerSpy.mock.calls[0]?.[0] as { identity: string };
+    expect(opts.identity).toBe('alice');
+    expect(stderrCapture).not.toMatch(/anon-/);
+    expect(stderrCapture).not.toMatch(/no ST_AGENT set/);
+  });
+
+  it('legacy COORD_IDENTITY still wins over fallback (with the existing deprecation notice)', async () => {
+    let stderrCapture = '';
+    const ctx = makeCtx({
+      ST_ROOT: scratchRoot,
+      COORD_IDENTITY: 'legacy-bob',
+    });
+    ctx.stderr = (s) => {
+      stderrCapture += s;
+    };
+    await cmdMcpCli([], ctx);
+    const opts = createMcpServerSpy.mock.calls[0]?.[0] as { identity: string };
+    expect(opts.identity).toBe('legacy-bob');
+    expect(stderrCapture).not.toMatch(/anon-/);
   });
 });

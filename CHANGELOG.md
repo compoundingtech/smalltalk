@@ -6,6 +6,32 @@ minor releases until 1.0.
 
 ## Unreleased
 
+### Fixed (`coord mcp` startup — anon-identity fallback)
+
+`coord mcp` (and `st mcp` / `smalltalk mcp`) no longer hard-exits when
+no `ST_AGENT` / `ST_IDENTITY` / `COORD_IDENTITY` is set. Instead the
+server falls back to a throwaway `anon-<rand6>` agent (e.g.
+`anon-h4k2qm`) and emits a single stderr warning that names the
+throwaway id and points at `ST_AGENT` for persistence. The anon
+agent's `inbox/` + `archive/` folders are lazy-created so the channel
+watcher and status writer have something to point at.
+
+This unblocks MCP hosts that spawn `coord mcp` without identity env
+(Codex hit "cannot start the mcp server" before this fix). Managed
+hosts that set an identity explicitly are unaffected — they keep
+their explicit id and see no warning.
+
+- Scope is `mcp` only. Other CLI verbs (`coord status`, `coord
+  message send`, etc.) still require an explicit identity because
+  their behavior is address-sensitive (silently sending FROM a
+  fresh random id each invocation would mask user errors).
+- The `anon-` prefix is stable — `st agents` listings and operators
+  can spot throwaway sessions at a glance.
+- The fallback honors the existing three-level chain: `ST_AGENT` →
+  `ST_IDENTITY` (deprecation notice) → `COORD_IDENTITY` (deprecation
+  notice) → `anon-<rand6>` (this new fallback).
+- **VERSION** bumps to `0.8.1`.
+
 ### Added (brief-009 item 4 — SDK parity gap-fills)
 
 The TS SDK already had near-complete parity with the CLI post-brief-009.
