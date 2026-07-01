@@ -12,6 +12,7 @@ import {
   readFileSync,
   renameSync,
   statSync,
+  unlinkSync,
   writeFileSync,
 } from 'node:fs';
 import { randomBytes } from 'node:crypto';
@@ -185,7 +186,6 @@ function writeStatusAtomic(path: string, value: string): boolean {
   } catch {
     // best-effort cleanup of the tmp file if rename failed
     try {
-      const { unlinkSync } = require('node:fs') as typeof import('node:fs');
       unlinkSync(tmp);
     } catch {
       // ignore

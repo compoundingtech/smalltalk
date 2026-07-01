@@ -428,3 +428,112 @@ describe('cmdLaunch — side effects (non-dry-run)', () => {
     );
   });
 });
+
+// ─── Live-path regression (brief-016 followup: require-not-defined) ────
+//
+// These tests exercise the code paths that a `--dry-run` skips —
+// specifically the newUuid()/randomUUID call site that crashed under
+// CJS `require('node:crypto')` when smalltalk ran as ESM. A `require`
+// regression here fails the test rather than the live user run.
+
+describe('cmdLaunch — live-path regression (dry-run bypasses this)', () => {
+  it('claude live path: .claude-session-id + mcp.json + pty.toml all land on disk without runtime errors', async () => {
+    // captureOnly: true skips only the harness spawn; every earlier
+    // side-effect (session-id gen via randomUUID, cmdInit write,
+    // pty.toml write, ensureIdentityDirs) runs for real.
+    const fakePty = join(scratch, 'fake-pty');
+    writeFileSync(fakePty, '#!/bin/sh\necho ok\n');
+    let threw: unknown = null;
+    try {
+      await cmdLaunch(
+        baseInput({
+          harness: 'claude',
+          identity: 'live-alice',
+          dryRun: false,
+          captureOnly: true,
+          ptyBinPath: fakePty,
+        }),
+        ctx
+      );
+    } catch (err) {
+      threw = err;
+    }
+    expect(threw).toBeNull();
+    // The three files that must exist post-live-run:
+    expect(existsSync(join(cwd, '.claude-session-id'))).toBe(true);
+    expect(existsSync(join(cwd, '.mcp.json'))).toBe(true);
+    expect(existsSync(join(cwd, 'pty.toml'))).toBe(true);
+    // And the UUID must be well-formed — proves randomUUID() was
+    // actually reachable at runtime (a `require`-not-defined regression
+    // throws before this write happens).
+    const sid = readFileSync(
+      join(cwd, '.claude-session-id'),
+      'utf8'
+    ).trim();
+    expect(sid).toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
+    );
+  });
+
+  it('codex live path: mcp.json + pty.toml with ding sidecar land without runtime errors', async () => {
+    const fakePty = join(scratch, 'fake-pty');
+    writeFileSync(fakePty, '#!/bin/sh\necho ok\n');
+    let threw: unknown = null;
+    try {
+      await cmdLaunch(
+        baseInput({
+          harness: 'codex',
+          identity: 'live-bob',
+          dryRun: false,
+          captureOnly: true,
+          ptyBinPath: fakePty,
+        }),
+        ctx
+      );
+    } catch (err) {
+      threw = err;
+    }
+    expect(threw).toBeNull();
+    expect(existsSync(join(cwd, '.mcp.json'))).toBe(true);
+    const pty = readFileSync(join(cwd, 'pty.toml'), 'utf8');
+    expect(pty).toContain('[sessions.codex]');
+    expect(pty).toContain('[sessions.ding]');
+    expect(pty).toContain('coord ding codex --identity live-bob');
+    // Codex path doesn't touch newUuid(), but the init.ts /
+    // status.ts sibling `require`s in the error paths are compiled
+    // in this run — a regression there would still surface.
+  });
+
+  it('two live launches in a row generate distinct UUIDs (proves randomUUID is not memoized)', async () => {
+    const cwd2 = join(scratch, 'repo2');
+    mkdirSync(cwd2, { recursive: true });
+    await cmdLaunch(
+      baseInput({
+        harness: 'claude',
+        identity: 'live-carol',
+        dryRun: false,
+        captureOnly: true,
+      }),
+      ctx
+    );
+    await cmdLaunch(
+      baseInput({
+        harness: 'claude',
+        identity: 'live-dave',
+        cwd: cwd2,
+        dryRun: false,
+        captureOnly: true,
+      }),
+      ctx
+    );
+    const sid1 = readFileSync(
+      join(cwd, '.claude-session-id'),
+      'utf8'
+    ).trim();
+    const sid2 = readFileSync(
+      join(cwd2, '.claude-session-id'),
+      'utf8'
+    ).trim();
+    expect(sid1).not.toBe(sid2);
+  });
+});

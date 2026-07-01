@@ -23,6 +23,7 @@
 //     to non-channel + a `coord ding` sidecar (no asyncRewake).
 
 import { spawn, spawnSync } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import {
   existsSync,
   mkdirSync,
@@ -131,12 +132,11 @@ function encodedCwd(cwd: string): string {
 }
 
 function newUuid(): string {
-  // Node has crypto.randomUUID since 14.17 / 19+. Use it directly
-  // rather than shell out to uuidgen (which the reference script
-  // does; we avoid the extra subprocess).
-  const { randomUUID } = require('node:crypto') as {
-    randomUUID: () => string;
-  };
+  // Use node:crypto's randomUUID rather than shelling out to uuidgen
+  // (which the reference `pty-claude-launcher.sh` does — we avoid the
+  // extra subprocess). Imported statically at the top of this module
+  // because the file runs under ESM (`"type": "module"` + `node
+  // --experimental-strip-types`) and CJS `require()` is unavailable.
   return randomUUID();
 }
 
