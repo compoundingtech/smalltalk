@@ -269,6 +269,251 @@ describe('channel-watcher — cleanup', () => {
   });
 });
 
+// ─── brief-020 (HB-4): polling backstop for missed FSEvents ──────────
+//
+// The channel-watcher runs a `setInterval` scan of the inbox in
+// ADDITION to chokidar — a defensive layer that catches inbox files
+// FSEvents may have silently dropped (a real class of macOS bug that
+// wedges idle Claude Code agents). These tests exercise the backstop
+// in isolation via the `chokidarEnabled: false` seam: chokidar never
+// starts, so any notification that fires MUST have come from the poll.
+
+describe('channel-watcher — poll backstop (brief-020 HB-4)', () => {
+  let backstopScratch: string;
+  let backstopRoot: string;
+  let backstopInbox: string;
+  let backstopHandle: ReturnType<typeof createMcpServer>;
+  let backstopClient: Client;
+  let backstopReceived: ChannelNotification[];
+
+  beforeEach(async () => {
+    backstopScratch = mkdtempSync(join(tmpdir(), 'coord-mcp-cwatch-bs-'));
+    backstopRoot = join(backstopScratch, 'coord');
+    for (const id of ['alice', 'bob']) {
+      mkdirSync(join(backstopRoot, id, 'inbox'), { recursive: true });
+      mkdirSync(join(backstopRoot, id, 'archive'), { recursive: true });
+    }
+    backstopInbox = join(backstopRoot, 'alice', 'inbox');
+    backstopHandle = createMcpServer({
+      root: backstopRoot,
+      identity: asIdentity('alice'),
+      channel: true,
+      channelWatcherOptions: {
+        // Force chokidar OFF so any received notification proves the
+        // backstop is the delivery path. Tests must not be able to
+        // false-pass via chokidar.
+        chokidarEnabled: false,
+        // Aggressive poll interval — a real 15s backstop would blow
+        // the test budget. Small enough that a single tick fires
+        // within our waitFor window.
+        pollBackstopIntervalMs: 50,
+      },
+    });
+    backstopClient = new Client({ name: 'test-cwatch-bs', version: '1.0' });
+    backstopReceived = [];
+    backstopClient.fallbackNotificationHandler = async (n) => {
+      if (n.method === 'notifications/claude/channel') {
+        backstopReceived.push(n as unknown as ChannelNotification);
+      }
+    };
+    const [c, s] = InMemoryTransport.createLinkedPair();
+    await Promise.all([
+      backstopClient.connect(c),
+      backstopHandle.mcp.connect(s),
+    ]);
+    await backstopHandle.startChannelWatcher();
+  });
+  afterEach(async () => {
+    await backstopHandle.close();
+    rmSync(backstopScratch, { recursive: true, force: true });
+  });
+
+  async function waitForBackstop(
+    pred: () => boolean,
+    timeoutMs = 3000
+  ): Promise<void> {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      if (pred()) return;
+      await new Promise((r) => setTimeout(r, 25));
+    }
+    throw new Error(
+      `waitForBackstop: predicate did not become true within ${timeoutMs}ms; received=${JSON.stringify(backstopReceived)}`
+    );
+  }
+
+  it('backstop-only: file appearing after startup fires a channel notification', async () => {
+    writeFileSync(
+      join(backstopInbox, '1714826790000-aaaaaa.md'),
+      '---\nfrom: bob\n---\nbackstop must catch this\n'
+    );
+    await waitForBackstop(() => backstopReceived.length === 1);
+    expect(backstopReceived[0]!.params.meta.messageFilename).toBe(
+      '1714826790000-aaaaaa.md'
+    );
+    expect(backstopReceived[0]!.params.content).toBe(
+      'backstop must catch this\n'
+    );
+  });
+
+  it('backstop-only: multiple new files fire notifications in chronological order', async () => {
+    writeFileSync(
+      join(backstopInbox, '1714826790200-cccccc.md'),
+      '---\nfrom: bob\n---\nthree\n'
+    );
+    writeFileSync(
+      join(backstopInbox, '1714826790100-bbbbbb.md'),
+      '---\nfrom: bob\n---\ntwo\n'
+    );
+    writeFileSync(
+      join(backstopInbox, '1714826790000-aaaaaa.md'),
+      '---\nfrom: bob\n---\none\n'
+    );
+    await waitForBackstop(() => backstopReceived.length === 3);
+    const fns = backstopReceived.map((n) => n.params.meta.messageFilename);
+    expect(fns).toEqual([
+      '1714826790000-aaaaaa.md',
+      '1714826790100-bbbbbb.md',
+      '1714826790200-cccccc.md',
+    ]);
+  });
+
+  it('backstop-only: files already present at startup DO NOT get replayed', async () => {
+    // Simulate a fresh restart on an inbox with a historical backlog.
+    // The boot ritual (`coord_msg_ls`) is what surfaces backlog to the
+    // agent — the channel-watcher must not double-emit those on
+    // startup, or every restart would flood the context with old
+    // messages.
+    await backstopHandle.close();
+    const preExisting = join(backstopInbox, '1714826780000-oldold.md');
+    writeFileSync(preExisting, '---\nfrom: bob\n---\nhistorical\n');
+    backstopHandle = createMcpServer({
+      root: backstopRoot,
+      identity: asIdentity('alice'),
+      channel: true,
+      channelWatcherOptions: {
+        chokidarEnabled: false,
+        pollBackstopIntervalMs: 50,
+      },
+    });
+    backstopReceived = [];
+    backstopClient.fallbackNotificationHandler = async (n) => {
+      if (n.method === 'notifications/claude/channel') {
+        backstopReceived.push(n as unknown as ChannelNotification);
+      }
+    };
+    const [c, s] = InMemoryTransport.createLinkedPair();
+    backstopClient = new Client({ name: 'test-cwatch-bs2', version: '1.0' });
+    backstopClient.fallbackNotificationHandler = async (n) => {
+      if (n.method === 'notifications/claude/channel') {
+        backstopReceived.push(n as unknown as ChannelNotification);
+      }
+    };
+    await Promise.all([
+      backstopClient.connect(c),
+      backstopHandle.mcp.connect(s),
+    ]);
+    await backstopHandle.startChannelWatcher();
+    // Give the backstop ~4 ticks to (not) fire.
+    await new Promise((r) => setTimeout(r, 250));
+    expect(backstopReceived).toHaveLength(0);
+    // Now plant a NEW file — must fire.
+    writeFileSync(
+      join(backstopInbox, '1714826791000-newnew.md'),
+      '---\nfrom: bob\n---\nfresh arrival\n'
+    );
+    await waitForBackstop(() => backstopReceived.length === 1);
+    expect(backstopReceived[0]!.params.meta.messageFilename).toBe(
+      '1714826791000-newnew.md'
+    );
+  });
+
+  it('backstop-only: non-LAYOUT filenames are ignored', async () => {
+    writeFileSync(join(backstopInbox, 'random.md'), '---\nfrom: bob\n---\n');
+    writeFileSync(join(backstopInbox, 'notes.txt'), 'ignore me\n');
+    await new Promise((r) => setTimeout(r, 200));
+    expect(backstopReceived).toHaveLength(0);
+  });
+
+  it('close() disposes the backstop timer', async () => {
+    await backstopHandle.close();
+    writeFileSync(
+      join(backstopInbox, '1714826790500-postclose.md'),
+      '---\nfrom: bob\n---\nafter close\n'
+    );
+    await new Promise((r) => setTimeout(r, 200));
+    expect(backstopReceived).toHaveLength(0);
+    // Idempotent.
+    await expect(backstopHandle.close()).resolves.not.toThrow();
+  });
+});
+
+describe('channel-watcher — chokidar + backstop dedup (brief-020 HB-4)', () => {
+  // With BOTH chokidar (in test-polling mode) and the backstop running
+  // at aggressive intervals, a single arriving file must still fire
+  // exactly one notification — the two paths share a `seen` set that
+  // dedupes them.
+  let dedupScratch: string;
+  let dedupRoot: string;
+  let dedupInbox: string;
+  let dedupHandle: ReturnType<typeof createMcpServer>;
+  let dedupClient: Client;
+  let dedupReceived: ChannelNotification[];
+
+  beforeEach(async () => {
+    dedupScratch = mkdtempSync(join(tmpdir(), 'coord-mcp-cwatch-dd-'));
+    dedupRoot = join(dedupScratch, 'coord');
+    for (const id of ['alice', 'bob']) {
+      mkdirSync(join(dedupRoot, id, 'inbox'), { recursive: true });
+      mkdirSync(join(dedupRoot, id, 'archive'), { recursive: true });
+    }
+    dedupInbox = join(dedupRoot, 'alice', 'inbox');
+    dedupHandle = createMcpServer({
+      root: dedupRoot,
+      identity: asIdentity('alice'),
+      channel: true,
+      channelWatcherOptions: {
+        usePolling: true,
+        pollInterval: 20,
+        // Backstop at a fast enough tick to run alongside the
+        // chokidar poll and race for the same file.
+        pollBackstopIntervalMs: 30,
+      },
+    });
+    dedupClient = new Client({ name: 'test-cwatch-dd', version: '1.0' });
+    dedupReceived = [];
+    dedupClient.fallbackNotificationHandler = async (n) => {
+      if (n.method === 'notifications/claude/channel') {
+        dedupReceived.push(n as unknown as ChannelNotification);
+      }
+    };
+    const [c, s] = InMemoryTransport.createLinkedPair();
+    await Promise.all([
+      dedupClient.connect(c),
+      dedupHandle.mcp.connect(s),
+    ]);
+    await dedupHandle.startChannelWatcher();
+  });
+  afterEach(async () => {
+    await dedupHandle.close();
+    rmSync(dedupScratch, { recursive: true, force: true });
+  });
+
+  it('a single file fires exactly one notification even with both paths racing', async () => {
+    writeFileSync(
+      join(dedupInbox, '1714826790000-aaaaaa.md'),
+      '---\nfrom: bob\n---\nno double-emit\n'
+    );
+    // Wait long enough that either path could have fired multiple
+    // ticks (~200ms >> 30ms backstop + 20ms chokidar poll).
+    await new Promise((r) => setTimeout(r, 250));
+    expect(dedupReceived).toHaveLength(1);
+    expect(dedupReceived[0]!.params.meta.messageFilename).toBe(
+      '1714826790000-aaaaaa.md'
+    );
+  });
+});
+
 // ─── Lifecycle: runWith resolves on transport close ───────────────────
 //
 // Standalone describe block so it doesn't share the global `handle` /

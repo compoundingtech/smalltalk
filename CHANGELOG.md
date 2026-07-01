@@ -6,6 +6,45 @@ minor releases until 1.0.
 
 ## Unreleased
 
+### Fixed (brief-020 — channel-watcher wake reliability, HB-4)
+
+Idle Claude Code agents sometimes sat on delivered coord messages
+without ever surfacing them (evals-claude 56min, smalltalk-claude
+also hit it), even though `coord_msg_ls` would show the file. Root
+cause: chokidar's FSEvents backend on macOS can silently stop
+delivering `add` events on a long-idle process; the notification
+never fires and the wake never happens. Claude Code agents relied
+solely on the FSEvents-driven channel notification, so any dropped
+event meant a wedged inbox.
+
+- **`src/mcp/channel-watcher.ts`** now runs a polling backstop
+  alongside chokidar. Every `pollBackstopIntervalMs` (default 15s),
+  the watcher scans the inbox dir, dedupes against a `seen: Set`
+  shared with chokidar's `add` handler, and enqueues any un-seen
+  valid LAYOUT-grammar files through the same notification pipeline.
+  Worst-case wake latency is now bounded by the poll interval even
+  when FSEvents is fully dead.
+- **Seeding.** On startup, `seen` is populated from an initial
+  `readdirSync` so a fresh process doesn't replay historical files
+  as fresh arrivals — backlog stays the boot ritual's job.
+- **Dedup guarantees.** Chokidar `add` and the backstop check-and-add
+  atomically against the same `seen` set, so a single file fires
+  exactly one notification regardless of which path observed it
+  first. Verified by a new integration test that races both paths
+  at aggressive intervals.
+- **`COORD_CHANNEL_DEBUG=1`** flag opts into one-line stderr
+  instrumentation for each chokidar `add`, each poll-backstop
+  discovery, and each notification send. Kept off by default so a
+  healthy agent's stderr stays quiet; when it happens again, the
+  logs distinguish the FSEvents-drop path from a Claude-Code-side
+  wake failure without guesswork.
+- **6 new integration tests** exercise the backstop in isolation
+  (via `chokidarEnabled: false`), confirm chronological ordering
+  under the backstop, verify historical files are not replayed on
+  startup, confirm non-LAYOUT filenames are ignored, confirm
+  `close()` disposes the timer, and race chokidar + backstop to
+  prove the dedup path.
+
 ### Added (brief-016 — `smalltalk launch <harness>` one-command bootstrap)
 
 New CLI verb: `st launch <claude|codex>` (also `smalltalk launch` /

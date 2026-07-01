@@ -95,11 +95,21 @@ export async function cmdMcpCli(
 
   const serverName = canonicalServerName(invokedAsFrom(ctx.env));
 
+  // brief-020: opt-in stderr instrumentation for the channel watcher.
+  // Off by default (idle agents' stderr stays quiet); flip via
+  // COORD_CHANNEL_DEBUG=1 in the MCP wiring env when diagnosing a
+  // wedge. Only the flag needs to plumb through — the actual log
+  // lines are emitted from channel-watcher.ts.
+  const channelDebug = ctx.env.COORD_CHANNEL_DEBUG === '1';
+
   const handle = createMcpServer({
     root,
     identity: asAgent(identity),
     channel,
     serverName,
+    ...(channelDebug && {
+      channelWatcherOptions: { debug: true },
+    }),
   });
 
   await handle.run();

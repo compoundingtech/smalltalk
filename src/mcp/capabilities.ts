@@ -58,7 +58,14 @@ export const SERVER_INFO: Implementation = {
   //         .mcp.json, session-id, pty registration when available,
   //         `coord ding` sidecar for codex, `ollama launch` route
   //         for GLM-backed launches via --model).
-  version: '0.9.0',
+  // 0.9.1 — brief-020 (HB-4): channel-watcher wake reliability —
+  //         adds a polling backstop that catches inbox files
+  //         chokidar's FSEvents backend may have silently dropped,
+  //         so idle Claude Code agents don't wedge on unnotified
+  //         deliveries. Server surface unchanged; operators can
+  //         opt-in to stderr instrumentation via
+  //         COORD_CHANNEL_DEBUG=1.
+  version: '0.9.1',
 };
 
 /**

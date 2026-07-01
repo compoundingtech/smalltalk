@@ -51,9 +51,23 @@ export interface McpServerOptions {
    * leaves this empty (FSEvents/inotify); tests set
    * `{ usePolling: true }` so vitest's parallel pool can't starve
    * FSEvents into dropping inbox-add events.
+   *
+   * brief-020 adds:
+   *   - `pollBackstopIntervalMs` — how often the polling backstop
+   *     scans the inbox for files chokidar missed. Default 15s.
+   *   - `chokidarEnabled` — test seam that disables chokidar entirely
+   *     so the backstop can be exercised in isolation.
+   *   - `debug` — mirror of `COORD_CHANNEL_DEBUG=1`, forwarded here so
+   *     library embedders can enable the same instrumentation.
    */
   channelWatcherOptions?:
-    | { usePolling?: boolean; pollInterval?: number }
+    | {
+        usePolling?: boolean;
+        pollInterval?: number;
+        pollBackstopIntervalMs?: number;
+        chokidarEnabled?: boolean;
+        debug?: boolean;
+      }
     | undefined;
   /**
    * How often (ms) to refresh the identity's status file mtime so
@@ -161,6 +175,19 @@ export function createMcpServer(opts: McpServerOptions): McpServerHandle {
         }
         if (opts.channelWatcherOptions?.pollInterval !== undefined) {
           startOpts.pollInterval = opts.channelWatcherOptions.pollInterval;
+        }
+        if (
+          opts.channelWatcherOptions?.pollBackstopIntervalMs !== undefined
+        ) {
+          startOpts.pollBackstopIntervalMs =
+            opts.channelWatcherOptions.pollBackstopIntervalMs;
+        }
+        if (opts.channelWatcherOptions?.chokidarEnabled !== undefined) {
+          startOpts.chokidarEnabled =
+            opts.channelWatcherOptions.chokidarEnabled;
+        }
+        if (opts.channelWatcherOptions?.debug !== undefined) {
+          startOpts.debug = opts.channelWatcherOptions.debug;
         }
         return start(startOpts);
       })();

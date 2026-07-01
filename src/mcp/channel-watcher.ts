@@ -13,6 +13,13 @@ export interface ChannelWatcherHandle {
   close(): Promise<void>;
 }
 
+/** Default backstop poll interval when the caller doesn't override. 15s
+ *  is a compromise: slow enough that the CPU cost of a `readdirSync`
+ *  scan is trivial (even on a big inbox), fast enough that a missed
+ *  chokidar event doesn't leave the agent wedged for more than one
+ *  channel-response-time from a user's perspective. */
+export const DEFAULT_POLL_BACKSTOP_INTERVAL_MS = 15_000;
+
 export interface StartChannelWatcherOpts {
   mcp: McpServer;
   root: string;
@@ -27,6 +34,37 @@ export interface StartChannelWatcherOpts {
   usePolling?: boolean;
   /** Companion to {@link usePolling}. Default 50ms. */
   pollInterval?: number;
+  /**
+   * brief-020 (HB-4): how often (ms) to run the polling backstop that
+   * catches inbox files chokidar's FSEvents-backed watcher may have
+   * missed. Defaults to {@link DEFAULT_POLL_BACKSTOP_INTERVAL_MS}. Set
+   * to 0 to disable the backstop entirely (not recommended in
+   * production; agents will then depend solely on chokidar's stream,
+   * which on macOS can silently stop delivering events after long
+   * idle periods).
+   *
+   * The backstop runs `readdirSync(inboxDir)` on each tick, filters to
+   * valid LAYOUT filenames, and enqueues any not yet in the `seen`
+   * set (which is populated by both chokidar's `add` handler AND the
+   * backstop itself, so the two paths dedupe against each other).
+   */
+  pollBackstopIntervalMs?: number;
+  /**
+   * brief-020 test seam: when false, don't start chokidar at all — only
+   * the polling backstop runs. Used to verify the backstop delivers
+   * notifications in isolation, i.e. that the wake path stays honest
+   * even if FSEvents silently stops emitting. Production leaves this
+   * undefined (chokidar on).
+   */
+  chokidarEnabled?: boolean;
+  /**
+   * brief-020: when true, write one-line stderr entries for each
+   * chokidar `add`, each poll-backstop discovery, and each notification
+   * send. Wired through from `COORD_CHANNEL_DEBUG=1` in the MCP
+   * command wrapper. Kept opt-in so a healthy running agent's stderr
+   * stays quiet.
+   */
+  debug?: boolean;
 }
 
 /**
@@ -43,27 +81,62 @@ export async function startChannelWatcher(
   opts: StartChannelWatcherOpts
 ): Promise<ChannelWatcherHandle> {
   const chokidar = await import('chokidar');
-  const { existsSync, readFileSync } = await import('node:fs');
+  const { existsSync, readdirSync, readFileSync } = await import('node:fs');
   const { join } = await import('node:path');
   const { parseFrontmatter, validFilename } = await import(
     '../common.ts'
   );
 
   const inboxDir = join(opts.root, opts.identity, 'inbox');
+  const chokidarEnabled = opts.chokidarEnabled !== false;
+  const pollBackstopMs =
+    opts.pollBackstopIntervalMs ?? DEFAULT_POLL_BACKSTOP_INTERVAL_MS;
+  const debug = opts.debug === true;
 
-  const watcher = chokidar.watch(inboxDir, {
-    ignoreInitial: true,
-    persistent: true,
-    // No awaitWriteFinish: every coord producer (coord.send,
-    // tmp+atomic-rename; rsync, atomic-on-completion) writes a single
-    // final file. Polling for write stability just adds latency that
-    // makes the watcher flake on heavily-loaded test runs.
-    ...(opts.usePolling === true && {
-      usePolling: true,
-      interval: opts.pollInterval ?? 50,
-      binaryInterval: opts.pollInterval ?? 50,
-    }),
-  });
+  function debugLog(msg: string): void {
+    if (!debug) return;
+    // Emit to stderr so it never contaminates the JSON-RPC stdout
+    // channel. Prefix with a stable tag so an operator can grep it.
+    process.stderr.write(
+      `[coord-channel] ${new Date().toISOString()} ${msg}\n`
+    );
+  }
+
+  // brief-020: dedup set shared between chokidar and the polling
+  // backstop. Each path checks-and-adds before enqueueing so a file
+  // observed by both paths only emits one channel notification. Seeded
+  // from an initial `readdirSync` so historical files (e.g. an unread
+  // backlog from a prior process) don't get replayed as fresh
+  // arrivals — the boot ritual's `coord_msg_ls` handles backlog.
+  const seen = new Set<string>();
+  try {
+    for (const name of readdirSync(inboxDir)) {
+      if (validFilename(name)) seen.add(name);
+    }
+    debugLog(
+      `seeded ${seen.size} existing filename(s) in inbox=${inboxDir}`
+    );
+  } catch {
+    // inbox dir may not exist yet on very fresh identities; chokidar
+    // and the poll backstop will surface files once it does.
+  }
+
+  const watcher = chokidarEnabled
+    ? chokidar.watch(inboxDir, {
+        ignoreInitial: true,
+        persistent: true,
+        // No awaitWriteFinish: every coord producer (coord.send,
+        // tmp+atomic-rename; rsync, atomic-on-completion) writes a
+        // single final file. Polling for write stability just adds
+        // latency that makes the watcher flake on heavily-loaded test
+        // runs.
+        ...(opts.usePolling === true && {
+          usePolling: true,
+          interval: opts.pollInterval ?? 50,
+          binaryInterval: opts.pollInterval ?? 50,
+        }),
+      })
+    : null;
 
   // Burst-aware emit pipeline. chokidar's 'add' callback fires in
   // whatever order the filesystem reports (rsync source-listing order
@@ -108,7 +181,75 @@ export async function startChannelWatcher(
     }
   }
 
-  watcher.on('add', (filepath) => enqueue(filepath));
+  if (watcher !== null) {
+    watcher.on('add', (filepath) => {
+      const filename = filepath.split('/').pop() ?? '';
+      if (!validFilename(filename)) {
+        // handleOne would also skip these; short-circuit to avoid
+        // adding non-LAYOUT paths to `seen` (the poll backstop would
+        // then also skip via validFilename).
+        return;
+      }
+      // Dedup vs. the poll backstop: only the first observer of a
+      // filename enqueues. `add` won't fire twice for the same file
+      // on chokidar's side, so a hit here means the backstop already
+      // enqueued for it.
+      if (seen.has(filename)) {
+        debugLog(`chokidar add (already-seen dedup): ${filename}`);
+        return;
+      }
+      seen.add(filename);
+      debugLog(`chokidar add: ${filename}`);
+      enqueue(filepath);
+    });
+  }
+
+  // brief-020 (HB-4) polling backstop. Runs in ADDITION to chokidar
+  // (unless chokidar is disabled for tests) — a defensive scan that
+  // catches inbox files whose FSEvents notification never arrived at
+  // chokidar. The FSEvents backend on macOS can silently stop
+  // delivering events on a long-idle process (dispatch source
+  // suspension under memory pressure / long inactivity), which
+  // otherwise leaves a delivered coord message wedged in the agent's
+  // inbox with no channel notification ever fired. With this backstop,
+  // the worst-case delay from "message hits inbox" to "agent gets
+  // channel notification" is bounded by `pollBackstopMs` even when
+  // chokidar is completely dead.
+  let pollTimer: ReturnType<typeof setInterval> | undefined;
+  function pollBackstopTick(): void {
+    let entries: string[];
+    try {
+      entries = readdirSync(inboxDir);
+    } catch {
+      // inbox missing / unreadable — nothing to do this tick.
+      return;
+    }
+    let discovered = 0;
+    for (const name of entries) {
+      if (!validFilename(name)) continue;
+      if (seen.has(name)) continue;
+      seen.add(name);
+      discovered += 1;
+      enqueue(join(inboxDir, name));
+    }
+    if (discovered > 0) {
+      debugLog(
+        `poll backstop discovered ${discovered} file(s) chokidar missed`
+      );
+    }
+  }
+  function startPollBackstop(): void {
+    if (pollBackstopMs <= 0) return;
+    pollTimer = setInterval(pollBackstopTick, pollBackstopMs);
+    // Never block process exit for a backstop tick.
+    pollTimer.unref?.();
+  }
+  function stopPollBackstop(): void {
+    if (pollTimer !== undefined) {
+      clearInterval(pollTimer);
+      pollTimer = undefined;
+    }
+  }
 
   async function handleOne(filepath: string): Promise<void> {
     try {
@@ -158,6 +299,7 @@ export async function startChannelWatcher(
           method: 'notifications/claude/channel',
           params: { content, meta },
         });
+        debugLog(`notification sent: ${filename} (from=${from})`);
       } catch {
         // Non-fatal: if the transport closes while we're processing
         // an in-flight add, drop the notification.
@@ -167,16 +309,23 @@ export async function startChannelWatcher(
     }
   }
 
-  await new Promise<void>((resolve) => {
-    watcher.once('ready', () => resolve());
-  });
+  // Wait for chokidar to reach ready (if enabled) so callers can drop
+  // a file immediately after startChannelWatcher returns. With
+  // chokidar disabled we're ready immediately.
+  if (watcher !== null) {
+    await new Promise<void>((resolve) => {
+      watcher.once('ready', () => resolve());
+    });
+  }
+  startPollBackstop();
 
   let closed = false;
   return {
     async close(): Promise<void> {
       if (closed) return;
       closed = true;
-      await watcher.close();
+      stopPollBackstop();
+      if (watcher !== null) await watcher.close();
     },
   };
 }
