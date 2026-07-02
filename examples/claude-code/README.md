@@ -1,24 +1,82 @@
 # Claude Code integration — smalltalk session-boundary hooks
 
 This directory has the pieces for plugging smalltalk into Claude Code
-at the **session boundary** layer: a `SessionStart` hook that runs
-the boot ritual on every cold start / resume / `/clear` / `/compact`,
-and a `StopFailure` hook that surfaces API-error wedges to myobie via
-smalltalk so a quiet, wedged session doesn't go unnoticed.
+at the **session boundary** layer: a `SessionStart` hook that runs the
+boot ritual and rehydrates durable working-state on every cold start /
+resume / `/clear` / `/compact`, a `PreCompact` hook that stubs
+`context/now.md` right before compaction so boot-rehydrate has
+something to inject, and a `StopFailure` hook that surfaces API-error
+wedges to myobie via smalltalk so a quiet, wedged session doesn't go
+unnoticed.
 
 ## What's in here
 
-- `hooks/session-start.sh` — minimal Claude Code `SessionStart` hook.
-  Wakes the agent with a system reminder telling it to run the
-  smalltalk boot ritual (status → available, drain inbox).
+- `hooks/session-start.sh` — Claude Code `SessionStart` hook.
+  Injects the agent's `context/now.md` as a `<context>` block (when
+  present + fresh) then wakes the agent with a system reminder to run
+  the smalltalk boot ritual (status → available, drain inbox).
+  Absent-able: skips the injection cleanly when `context/now.md` is
+  missing or has aged past the staleness threshold (24h default). See
+  **brief-024 hook-legs** below.
+- `hooks/pre-compact.sh` — Claude Code `PreCompact` hook. Fires just
+  before compaction wipes the in-context state. Writes a stub to
+  `context/now.md` if the model hasn't flushed a fresh one recently, so
+  the next boot-rehydrate has something to inject. Exit 0 always;
+  errors go to a log file, never stderr. See **brief-024 hook-legs**
+  below.
 - `hooks/stop-failure.sh` — Claude Code `StopFailure` hook. Fires when
   a session ends mid-turn due to an Anthropic API error; branches by
   `error_type` and either sets the agent's status (away/offline) and
   optionally `st message send`s myobie a tuned notice — or stays
   silent for programmer-error types. See **StopFailure** below.
-- `settings.local.example.json` — full example settings file with
-  both hooks wired up. Copy to `<agent-repo>/.claude/settings.local.json`
+- `settings.local.example.json` — full example settings file with all
+  three hooks wired up. Copy to `<agent-repo>/.claude/settings.local.json`
   and swap the absolute paths for your smalltalk checkout.
+
+## brief-024 hook-legs (SessionStart rehydrate + PreCompact flush)
+
+Together with the `coord context read/write/append` verbs and the
+`~/.local/state/coord/<agent>/context/` folder that brief-024 v1
+shipped, these two hooks close the **lossless-restart** loop for the
+in-context-state leg:
+
+1. **During a session**, the model writes fresh state to
+   `context/now.md` at each meaningful step (base-persona rule 2: flush
+   as you go). It also appends decisions with a `why` to
+   `context/decisions.md` (append-only log).
+
+2. **Just before compaction**, `pre-compact.sh` fires. If the model
+   flushed recently (default: within 5 min, tunable via
+   `$COORD_PRECOMPACT_FRESH_S`), it leaves `now.md` alone. Otherwise
+   it writes a "compaction fired without a recent flush" stub via
+   `coord context write` — atomic tmp+rename, so a concurrent read
+   never sees a partial file. **exit 0 always**; errors go to
+   `context/.flush-errors.log`, never stderr, because a hook that
+   writes to stderr on the `PreCompact` boundary would inject noise
+   into every post-compaction turn.
+
+3. **On session start** (fresh, `--resume`, `/clear`, `/compact`),
+   `session-start.sh` reads `context/now.md`. If present and
+   *fresh* (default staleness: 24h, tunable via
+   `$COORD_REHYDRATE_STALE_S`), it injects the file as a `<context
+   source="coord/context/now.md" agent="…">…</context>` block into the
+   agent's stderr — Claude Code surfaces stderr as a system reminder
+   under `asyncRewake: true`, so the injected block lands as the first
+   thing the model sees. Then the boot-ritual reminder follows. When
+   `context/now.md` is absent or stale, the hook falls through to the
+   pre-brief-024 behavior — just the ritual reminder, no injection.
+
+**Absent-able is load-bearing.** The `context/` folder does not need to
+exist for either hook to work; both fall through cleanly and produce
+identical behavior to pre-brief-024 wiring. This is what lets
+evals-claude's restart-continuity eval A/B a control arm (no context/)
+against a treatment arm (populated context/) without special-casing.
+
+**The PreCompact hook is a backstop, not the primary flush mechanism.**
+Model discipline (flush proactively at each meaningful state change) is
+the real lever. The hook exists so a model that fails to flush before
+compaction still leaves a machine-readable trace, not so writing
+`context/` becomes optional.
 
 ## Why it's needed
 
