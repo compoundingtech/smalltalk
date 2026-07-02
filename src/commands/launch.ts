@@ -25,6 +25,7 @@
 import { spawn, spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import {
+  copyFileSync,
   existsSync,
   mkdirSync,
   readFileSync,
@@ -32,7 +33,7 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { homedir } from 'node:os';
-import { dirname, join, resolve } from 'node:path';
+import { dirname, isAbsolute, join, resolve } from 'node:path';
 
 import type { CliContext } from '../cli-context.ts';
 import {
@@ -83,6 +84,22 @@ export interface LaunchInput {
    * codex launches.
    */
   permissionMode?: string | undefined;
+  /**
+   * brief-022: install a persona alongside the harness. The path is
+   * copied to `<cwd>/PERSONA.md`, and the harness entry file
+   * (`CLAUDE.md` for claude, `AGENTS.md` for codex) gets a
+   * `@PERSONA.md` import line surgically appended if not already
+   * present. Both harnesses support the `@`-import mechanism
+   * (verified 2026-07-02 against codex 0.142.4 + claude 2.1.198).
+   * We git-exclude the infra we generate via `.git/info/exclude` so
+   * the persona doesn't pollute the target repo's commits.
+   *
+   * When the entry file didn't exist and we created it, that file
+   * gets excluded too; when it pre-existed (a real repo CLAUDE.md /
+   * AGENTS.md), it's left in the repo untouched — only the appended
+   * line adds an ignored import.
+   */
+  persona?: string | undefined;
 
   /** Working directory. Default: process.cwd(). */
   cwd?: string | undefined;
@@ -152,6 +169,41 @@ export interface LaunchResult {
    * runs iff we actually wrote the file. `null` when we skipped.
    */
   claudeSettingsPreview: string | null;
+  /**
+   * brief-022: summary of the persona install, or null when
+   * `--persona` was not passed. Populated in both real-run and
+   * `--dry-run` mode so tests + CLI dry-run output can inspect the
+   * decisions we would make without touching disk.
+   */
+  persona: PersonaInstallResult | null;
+}
+
+/**
+ * brief-022: what {@link cmdLaunch} decided to do with the persona
+ * install. All fields are populated regardless of --dry-run — a
+ * dry-run just skips the actual file I/O and git-exclude append. The
+ * `entryFileCreated` flag drives the exclusion decision: only files we
+ * created get excluded, so a pre-existing repo CLAUDE.md never gets
+ * added to the ignore list.
+ */
+export interface PersonaInstallResult {
+  /** Path we would (or did) copy the persona source to. */
+  personaMdPath: string;
+  /** `CLAUDE.md` (claude harness) or `AGENTS.md` (codex harness). */
+  entryFile: 'CLAUDE.md' | 'AGENTS.md';
+  /** Absolute path to the entry file. */
+  entryFilePath: string;
+  /** True when the entry file didn't exist and we created it. */
+  entryFileCreated: boolean;
+  /** True when we appended a `@PERSONA.md` line (vs. it was already
+   *  present). */
+  importLineAppended: boolean;
+  /** Entries that were (or would be) appended to `.git/info/exclude`. */
+  gitExcludeEntriesAdded: readonly string[];
+  /** True when the target cwd was not a git repo, so we couldn't
+   *  exclude. Callers can surface a warning; the persona still
+   *  installs. */
+  gitRepoAbsent: boolean;
 }
 
 // ─── Helpers ────────────────────────────────────────────────────────────
@@ -414,6 +466,211 @@ export function buildClaudeSettings(hooksDir: string): string {
   return `${JSON.stringify(settings, null, 2)}\n`;
 }
 
+// ─── brief-022: persona install ────────────────────────────────────────
+
+/** The infra files `st launch` creates in the target cwd. Persona-mode
+ *  always excludes these (except entryFile — see below). Kept as an
+ *  exported const so the CLI dry-run summary + tests can enumerate the
+ *  same list without duplicating it. */
+export const PERSONA_ALWAYS_EXCLUDE = [
+  'PERSONA.md',
+  '.mcp.json',
+  '.claude-session-id',
+  '.codex-session-id',
+  'pty.toml',
+] as const;
+
+/** Read the current `.git/info/exclude`, or empty string if missing.
+ *  Used both for the "is this line already there?" dedup and for the
+ *  final append. Failures (e.g. `.git` isn't a dir) surface as empty. */
+function readGitExclude(cwd: string): { path: string; text: string } | null {
+  const gitDir = join(cwd, '.git');
+  // A bare git repo, worktree, or non-git directory won't have
+  // .git/info/. Skip cleanly; callers surface `gitRepoAbsent: true`.
+  try {
+    const st = statSync(gitDir);
+    if (!st.isDirectory()) return null;
+  } catch {
+    return null;
+  }
+  const excludePath = join(gitDir, 'info', 'exclude');
+  let text = '';
+  try {
+    text = readFileSync(excludePath, 'utf8');
+  } catch {
+    // missing is fine; append semantics create it
+  }
+  return { path: excludePath, text };
+}
+
+/**
+ * Return the entries from `wanted` that aren't already present as a
+ * line in the exclude file. Comparison is line-by-line, trimmed.
+ * Comments (leading `#`) are ignored so `# PERSONA.md example` doesn't
+ * count as a match.
+ */
+function missingExcludeEntries(
+  excludeText: string,
+  wanted: readonly string[]
+): string[] {
+  const present = new Set<string>();
+  for (const rawLine of excludeText.split(/\r?\n/)) {
+    const trimmed = rawLine.trim();
+    if (trimmed === '' || trimmed.startsWith('#')) continue;
+    present.add(trimmed);
+  }
+  return wanted.filter((w) => !present.has(w));
+}
+
+/**
+ * Append `entries` (one per line) to `.git/info/exclude`. Ensures a
+ * trailing newline separates existing content from the append. Creates
+ * the file (and its parent `info/` dir) if needed. Idempotent when
+ * called with an empty entries list.
+ */
+function appendGitExclude(
+  excludePath: string,
+  existingText: string,
+  entries: readonly string[]
+): void {
+  if (entries.length === 0) return;
+  mkdirSync(dirname(excludePath), { recursive: true });
+  const sep = existingText.length === 0 || existingText.endsWith('\n')
+    ? ''
+    : '\n';
+  const blockHeader =
+    existingText.length === 0 ? '' : '# smalltalk-launch persona infra\n';
+  const appended = `${sep}${blockHeader}${entries.join('\n')}\n`;
+  writeFileSync(excludePath, existingText + appended);
+}
+
+/**
+ * Decide whether the entry file (`CLAUDE.md` / `AGENTS.md`) needs the
+ * `@PERSONA.md` import line appended. Returns a struct with the read
+ * text (empty when the file didn't exist), whether we'd create the
+ * file, and whether we'd append the import.
+ */
+function planEntryFileEdit(entryFilePath: string): {
+  existingText: string;
+  fileExisted: boolean;
+  importAlreadyPresent: boolean;
+} {
+  let existingText = '';
+  let fileExisted = false;
+  try {
+    existingText = readFileSync(entryFilePath, 'utf8');
+    fileExisted = true;
+  } catch {
+    // missing file → we'll create it
+  }
+  // The import line is a bare `@PERSONA.md` on its own line. We match
+  // leniently so `@PERSONA.md ` (trailing space) or `@PERSONA.md #
+  // comment` are recognized as already-present. Case-sensitive on
+  // purpose — the filename is `PERSONA.md`.
+  const importPattern = /^@PERSONA\.md\b/m;
+  const importAlreadyPresent = importPattern.test(existingText);
+  return { existingText, fileExisted, importAlreadyPresent };
+}
+
+/**
+ * Do (or plan) the persona install. When `dryRun` is true, returns
+ * the plan without touching disk; when false, performs the copy /
+ * entry-file edit / git-exclude append. All decisions (including
+ * `gitExcludeEntriesAdded`) reflect what actually happens, so the
+ * dry-run summary matches a real run byte-for-byte.
+ */
+function installPersona(opts: {
+  personaSourcePath: string;
+  cwd: string;
+  harness: Harness;
+  dryRun: boolean;
+}): PersonaInstallResult {
+  const { personaSourcePath, cwd, harness, dryRun } = opts;
+  const entryFile: PersonaInstallResult['entryFile'] =
+    harness === 'claude' ? 'CLAUDE.md' : 'AGENTS.md';
+  const entryFilePath = join(cwd, entryFile);
+  const personaMdPath = join(cwd, 'PERSONA.md');
+
+  // Read the source persona now so a bad --persona path fails loudly
+  // (missing file, unreadable, etc.) before we've touched anything on
+  // disk. Content is used both to write PERSONA.md in real-run and to
+  // guarantee the source is readable in dry-run.
+  const personaText = readFileSync(personaSourcePath, 'utf8');
+
+  const entryPlan = planEntryFileEdit(entryFilePath);
+  const importLineToAppend = !entryPlan.importAlreadyPresent;
+  const entryFileCreated =
+    !entryPlan.fileExisted && importLineToAppend;
+
+  // Compute git-exclude entries. Always exclude PERSONA_ALWAYS_EXCLUDE
+  // (only those not already present). Additionally exclude the
+  // entryFile if we created it — never exclude a pre-existing repo
+  // CLAUDE.md.
+  const wantedExcludes: string[] = [...PERSONA_ALWAYS_EXCLUDE];
+  if (entryFileCreated) wantedExcludes.push(entryFile);
+
+  const excludeInfo = readGitExclude(cwd);
+  const gitRepoAbsent = excludeInfo === null;
+  const gitExcludeEntriesAdded = excludeInfo
+    ? missingExcludeEntries(excludeInfo.text, wantedExcludes)
+    : [];
+
+  if (!dryRun) {
+    // Copy the persona source → PERSONA.md. If the file already
+    // exists in cwd with different content, we OVERWRITE — this is
+    // infra we own, not user content (we git-exclude it), and the
+    // caller is telling us the source is authoritative for this
+    // launch. copyFileSync preserves nothing about the source's
+    // permissions we don't want; markdown is markdown.
+    copyFileSync(personaSourcePath, personaMdPath);
+
+    // Entry-file edit. If missing → create with just the import line
+    // (+ trailing newline). If present without the import → append
+    // "\n@PERSONA.md\n" with a leading blank-line separator when the
+    // existing content doesn't already end in a newline.
+    if (importLineToAppend) {
+      if (!entryPlan.fileExisted) {
+        writeFileSync(entryFilePath, '@PERSONA.md\n');
+      } else {
+        const sep =
+          entryPlan.existingText.length === 0 ||
+          entryPlan.existingText.endsWith('\n')
+            ? ''
+            : '\n';
+        writeFileSync(
+          entryFilePath,
+          entryPlan.existingText + sep + '@PERSONA.md\n'
+        );
+      }
+    }
+
+    // Git-exclude append (skips silently when not a git repo).
+    if (excludeInfo && gitExcludeEntriesAdded.length > 0) {
+      appendGitExclude(
+        excludeInfo.path,
+        excludeInfo.text,
+        gitExcludeEntriesAdded
+      );
+    }
+  }
+
+  // Reference `personaText` so the read isn't optimized away in a
+  // future refactor — the read serves as an eager error surface for
+  // bad --persona paths, so we want the read to happen before any
+  // downstream work does.
+  void personaText;
+
+  return {
+    personaMdPath,
+    entryFile,
+    entryFilePath,
+    entryFileCreated,
+    importLineAppended: importLineToAppend,
+    gitExcludeEntriesAdded,
+    gitRepoAbsent,
+  };
+}
+
 function resolveRepoPrefix(cwd: string): string {
   // Fallback: basename of cwd, sanitized to agent grammar (lowercase,
   // hyphens, periods). This mirrors the pty prefix convention Nathan
@@ -475,6 +732,42 @@ export async function cmdLaunch(
       },
       ctx
     );
+  }
+
+  // ─── brief-022: persona install ─────────────────────────────────────
+  // Runs BEFORE session-id / command construction so the entry file
+  // (CLAUDE.md/AGENTS.md) is in place before the harness process
+  // reads it. Both dry-run and real-run go through `installPersona` —
+  // the returned plan is what we display in --dry-run and what we
+  // actually did in real-run; only the file I/O differs internally.
+  let personaResult: PersonaInstallResult | null = null;
+  if (input.persona !== undefined && input.persona.length > 0) {
+    const source = isAbsolute(input.persona)
+      ? input.persona
+      : resolve(process.cwd(), input.persona);
+    try {
+      personaResult = installPersona({
+        personaSourcePath: source,
+        cwd,
+        harness,
+        dryRun: input.dryRun === true,
+      });
+    } catch (err) {
+      // Surface a clean error that names the flag and the source
+      // path rather than the raw ENOENT — the caller almost always
+      // wants to know "where did you look?"
+      const msg = err instanceof Error ? err.message : String(err);
+      throw new Error(
+        `--persona: could not read persona file at ${source}: ${msg}`
+      );
+    }
+    if (personaResult.gitRepoAbsent) {
+      ctx.stderr(
+        `[smalltalk launch] --persona: ${cwd} is not a git repo; ` +
+          `skipping .git/info/exclude update. The persona files are ` +
+          `still installed.\n`
+      );
+    }
   }
 
   // ─── claude session-id bootstrap ────────────────────────────────────
@@ -631,6 +924,7 @@ export async function cmdLaunch(
       permissionMode,
       claudeSettingsPath,
       claudeSettingsPreview,
+      persona: personaResult,
     };
   }
 
@@ -700,6 +994,7 @@ export async function cmdLaunch(
     permissionMode,
     claudeSettingsPath,
     claudeSettingsPreview,
+    persona: personaResult,
   };
 }
 
@@ -731,6 +1026,13 @@ const LAUNCH_HELP =
   '                          dontAsk, plan. Precedence: this flag >\n' +
   '                          $CLAUDE_PERMISSION_MODE > default `auto`. Codex\n' +
   '                          launches ignore this (its own surface).\n' +
+  '  --persona <path>        Install <path> as PERSONA.md and surgically\n' +
+  '                          add `@PERSONA.md` to CLAUDE.md (claude) or\n' +
+  '                          AGENTS.md (codex). Pre-existing entry files\n' +
+  '                          are NEVER clobbered — only the import line\n' +
+  '                          is appended if not already present. Infra we\n' +
+  '                          create is added to `.git/info/exclude` so it\n' +
+  '                          stays out of the repo.\n' +
   '  --dry-run               Print what would happen; touch nothing.\n' +
   '  --print                 Alias for --dry-run.\n\n' +
   '  Examples:\n' +
@@ -754,6 +1056,7 @@ export async function cmdLaunchCli(
   let noHooks = false;
   let sessionName: string | undefined;
   let permissionMode: string | undefined;
+  let persona: string | undefined;
   let dryRun = false;
   for (let i = 0; i < args.length; i++) {
     const a = args[i]!;
@@ -782,6 +1085,9 @@ export async function cmdLaunchCli(
         break;
       case '--permission-mode':
         permissionMode = args[++i];
+        break;
+      case '--persona':
+        persona = args[++i];
         break;
       case '--dry-run':
       case '--print':
@@ -816,6 +1122,7 @@ export async function cmdLaunchCli(
       noHooks,
       ...(sessionName !== undefined && { sessionName }),
       ...(permissionMode !== undefined && { permissionMode }),
+      ...(persona !== undefined && { persona }),
       dryRun,
       env: ctx.env,
       coordRoot: ctx.coordRoot,
@@ -856,9 +1163,44 @@ export async function cmdLaunchCli(
         `\n.claude/settings.local.json (would write to ${r.claudeSettingsPath}):\n${r.claudeSettingsPreview}`
       );
     }
+    if (r.persona !== null) {
+      // Persona summary — reflect the exact decisions installPersona
+      // made, so the operator can eyeball "did we create the entry
+      // file? did we edit an existing one? which lines are we adding
+      // to git-exclude?" without running for real first.
+      ctx.stdout(`\npersona:\n`);
+      ctx.stdout(`  copy:         ${r.persona.personaMdPath}\n`);
+      const action = r.persona.entryFileCreated
+        ? 'create'
+        : r.persona.importLineAppended
+          ? 'append @PERSONA.md'
+          : 'no change (import already present)';
+      ctx.stdout(`  entry file:   ${r.persona.entryFilePath} (${action})\n`);
+      if (r.persona.gitRepoAbsent) {
+        ctx.stdout(
+          `  git-exclude:  skipped (${cwdForGitExcludeNote(r)} is not a git repo)\n`
+        );
+      } else if (r.persona.gitExcludeEntriesAdded.length === 0) {
+        ctx.stdout(`  git-exclude:  no new entries (all already present)\n`);
+      } else {
+        ctx.stdout(
+          `  git-exclude:  ${r.persona.gitExcludeEntriesAdded.join(', ')}\n`
+        );
+      }
+    }
     return 0;
   }
   return 0;
+}
+
+/** Small helper: extract the target cwd from the launch result path
+ *  so we don't need to pass it through separately. All the fields we
+ *  care about live under the same cwd, and dirname of the entryFile
+ *  is the cleanest source. */
+function cwdForGitExcludeNote(r: {
+  persona: PersonaInstallResult | null;
+}): string {
+  return r.persona ? dirname(r.persona.entryFilePath) : '.';
 }
 
 // Keep resolveCoordBinPath reachable for `notes/harness-integrations.md`
