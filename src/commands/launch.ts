@@ -67,6 +67,22 @@ export interface LaunchInput {
    *  process spawn. */
   dryRun?: boolean | undefined;
 
+  /**
+   * brief-023: claude `--permission-mode` value. Threaded into BOTH the
+   * bootstrap argv (`claude --print --permission-mode <mode> …`) and
+   * the main argv (`claude --permission-mode <mode> … --resume`), and
+   * baked into the generated `pty.toml` command line. Precedence at
+   * resolution time: explicit flag > env var `CLAUDE_PERMISSION_MODE`
+   * (parity with `pty-claude-launcher.sh`) > default `auto`. Values are
+   * passed through to claude verbatim (`acceptEdits`, `auto`,
+   * `bypassPermissions`, `default`, `dontAsk`, `plan`); no validation
+   * here — claude rejects unknown modes loudly enough that duplicating
+   * the enum here would just rot. Codex ignores this — the codex
+   * harness has its own approval-policy surface; silently no-ops for
+   * codex launches.
+   */
+  permissionMode?: string | undefined;
+
   /** Working directory. Default: process.cwd(). */
   cwd?: string | undefined;
   /** Test seam: override the pty detection. */
@@ -96,6 +112,14 @@ export interface LaunchResult {
   claudeSessionIdPath: string | null;
   /** Text of pty.toml when running --dry-run, else null. */
   ptyTomlPreview: string | null;
+  /**
+   * brief-023: the resolved `--permission-mode` value that was baked
+   * into the claude argv + pty.toml. Populated regardless of harness so
+   * the dry-run summary can surface it consistently; for codex this
+   * reflects the resolution but doesn't feed the argv (codex has its
+   * own approval-policy surface).
+   */
+  permissionMode: string;
 }
 
 // ─── Helpers ────────────────────────────────────────────────────────────
@@ -154,6 +178,7 @@ function buildClaudeCommand(opts: {
   home: string;
   channel: boolean;
   claudeSessionId: string;
+  permissionMode: string;
 }): {
   bootstrapArgv: readonly string[] | null;
   mainArgv: readonly string[];
@@ -173,7 +198,7 @@ function buildClaudeCommand(opts: {
   const mainArgv = [
     'claude',
     '--permission-mode',
-    'auto',
+    opts.permissionMode,
     ...channelFlag,
     '--resume',
     opts.claudeSessionId,
@@ -184,7 +209,7 @@ function buildClaudeCommand(opts: {
     'claude',
     '--print',
     '--permission-mode',
-    'auto',
+    opts.permissionMode,
     '--session-id',
     opts.claudeSessionId,
     'session init',
@@ -347,6 +372,21 @@ export async function cmdLaunch(
     }
   }
 
+  // ─── brief-023: permission-mode resolution ─────────────────────────
+  // Precedence: explicit --permission-mode flag > $CLAUDE_PERMISSION_MODE
+  // env (parity with pty-claude-launcher.sh's fallback) > default 'auto'.
+  // 'auto' preserves the pre-brief-023 behavior byte-for-byte, so
+  // existing callers see no change. Value is passed through to claude
+  // verbatim — we don't validate here (claude rejects unknown modes
+  // loudly, and duplicating the enum would just rot).
+  const permissionMode: string =
+    input.permissionMode !== undefined && input.permissionMode.length > 0
+      ? input.permissionMode
+      : input.env.CLAUDE_PERMISSION_MODE !== undefined &&
+          input.env.CLAUDE_PERMISSION_MODE.length > 0
+        ? input.env.CLAUDE_PERMISSION_MODE
+        : 'auto';
+
   // ─── Command construction ──────────────────────────────────────────
   let argv: readonly string[];
   let usedOllama = false;
@@ -364,6 +404,7 @@ export async function cmdLaunch(
       home,
       channel,
       claudeSessionId: claudeSessionId ?? '<generated-at-runtime>',
+      permissionMode,
     });
     argv = built.mainArgv;
     claudeBootstrapArgv = built.bootstrapArgv;
@@ -418,6 +459,7 @@ export async function cmdLaunch(
       ptyTomlPath: usedPty ? ptyTomlPath : null,
       claudeSessionIdPath,
       ptyTomlPreview,
+      permissionMode,
     };
   }
 
@@ -484,6 +526,7 @@ export async function cmdLaunch(
     ptyTomlPath: usedPty ? ptyTomlPath : null,
     claudeSessionIdPath,
     ptyTomlPreview,
+    permissionMode,
   };
 }
 
@@ -504,6 +547,14 @@ const LAUNCH_HELP =
   '                          claude is channel-on; for codex is channel-off.\n' +
   '  --no-pty                Don\'t register via pty even if it is on PATH.\n' +
   '  --session-name <name>   Override pty session key. Default: harness name.\n' +
+  '  --permission-mode <mode>\n' +
+  '                          Claude `--permission-mode` value. Threaded into\n' +
+  '                          the harness argv AND the generated pty.toml.\n' +
+  '                          Values pass through to claude verbatim:\n' +
+  '                          acceptEdits, auto, bypassPermissions, default,\n' +
+  '                          dontAsk, plan. Precedence: this flag >\n' +
+  '                          $CLAUDE_PERMISSION_MODE > default `auto`. Codex\n' +
+  '                          launches ignore this (its own surface).\n' +
   '  --dry-run               Print what would happen; touch nothing.\n' +
   '  --print                 Alias for --dry-run.\n\n' +
   '  Examples:\n' +
@@ -511,6 +562,7 @@ const LAUNCH_HELP =
   '    st launch claude --identity alice             # persistent identity\n' +
   '    st launch codex                               # + coord ding sidecar\n' +
   '    st launch claude --model glm-5.2:cloud        # via ollama, unattended\n' +
+  '    st launch claude --permission-mode bypassPermissions   # eval-spinner posture\n' +
   '    st launch codex --dry-run                     # audit before spawn\n';
 
 export async function cmdLaunchCli(
@@ -523,6 +575,7 @@ export async function cmdLaunchCli(
   let noPty = false;
   let noChannel = false;
   let sessionName: string | undefined;
+  let permissionMode: string | undefined;
   let dryRun = false;
   for (let i = 0; i < args.length; i++) {
     const a = args[i]!;
@@ -545,6 +598,9 @@ export async function cmdLaunchCli(
         break;
       case '--session-name':
         sessionName = args[++i];
+        break;
+      case '--permission-mode':
+        permissionMode = args[++i];
         break;
       case '--dry-run':
       case '--print':
@@ -577,6 +633,7 @@ export async function cmdLaunchCli(
       noPty,
       noChannel,
       ...(sessionName !== undefined && { sessionName }),
+      ...(permissionMode !== undefined && { permissionMode }),
       dryRun,
       env: ctx.env,
       coordRoot: ctx.coordRoot,
@@ -593,6 +650,11 @@ export async function cmdLaunchCli(
     ctx.stdout(`channel mode:   ${r.channel ? 'on' : 'off'}\n`);
     ctx.stdout(`ollama route:   ${r.usedOllama ? 'yes' : 'no'}\n`);
     ctx.stdout(`pty available:  ${r.usedPty ? 'yes' : 'no'}\n`);
+    // brief-023: show the resolved --permission-mode. Claude-only surface
+    // effect, but we surface it always so `codex --dry-run` audits still
+    // reveal what the resolution logic decided (helps debugging env-set
+    // launches).
+    ctx.stdout(`permission-mode: ${r.permissionMode}\n`);
     ctx.stdout(`mcp.json:       ${r.mcpJsonPath}\n`);
     if (r.claudeSessionIdPath !== null) {
       ctx.stdout(`session id:     ${r.claudeSessionIdPath}\n`);
