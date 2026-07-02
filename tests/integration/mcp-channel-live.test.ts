@@ -255,6 +255,17 @@ describe.skipIf(!LIVE)('mcp channel — live Claude Code agent', () => {
             HOME: homeDir,
             PATH: process.env.PATH ?? '',
             PTY_SESSION_DIR: ptySessionDir,
+            // Session.spawn merges opts.env on top of process.env, so
+            // any COORD_/ST_ vars set on the runner leak into the
+            // spawned agent's shell. If the agent then shells out to
+            // `coord message ls`, it reads the runner's real inbox
+            // tree instead of the test scratch. Explicitly rebind to
+            // the test tree so CLI paths match the MCP paths.
+            COORD_ROOT: coordRoot,
+            ST_ROOT: coordRoot,
+            COORD_IDENTITY: 'bob',
+            ST_IDENTITY: 'bob',
+            ST_AGENT: 'bob',
           },
         }
       );
@@ -267,20 +278,15 @@ describe.skipIf(!LIVE)('mcp channel — live Claude Code agent', () => {
         20_000
       );
       session.press('return');
-      // Post-boot marker. The prompt char is unicode ❯, not >; we
-      // wait for the channel-handshake confirmation text instead.
-      // This proves both that Claude finished booting AND that the
-      // coord MCP server was registered as a channel source.
-      await session.waitForText(
-        'Listening for channel messages from: server:coord',
-        60_000
-      );
-
-      // Give the channel pipeline a moment to fully establish before
-      // we start poking it. Chokidar's watcher in coord mcp --channel
-      // has up to ~500ms FSEvents latency; the JSON-RPC handshake
-      // back to Claude takes another beat.
-      await new Promise((r) => setTimeout(r, 1000));
+      // Post-boot settle. Older Claude Code builds surfaced a
+      // "Listening for channel messages from: server:coord" banner we
+      // could wait on; recent versions (v2.1.x observed 2026-07) don't
+      // print it, so the boot marker is unreliable. We just sleep long
+      // enough for the MCP handshake + channel-watcher subscribe to
+      // complete, then let the message-drop step below prove liveness
+      // end-to-end. If the channel is broken, the reply never lands
+      // and the outer pollForReply times out.
+      await new Promise((r) => setTimeout(r, 6000));
 
       // From alice (the test acting as alice), drop a question into
       // bob's inbox. The coord_msg_reply tool's contract is "reply to the
@@ -335,5 +341,93 @@ describe.skipIf(!LIVE)('mcp channel — live Claude Code agent', () => {
       expect(found.body).toMatch(answerRe);
     },
     240_000
+  );
+
+  // brief-020 (HB-4) — the acceptance criterion. A coord message to
+  // an IDLE agent (no user keystrokes) reliably surfaces and gets
+  // processed. If this passes, the channel-watcher's polling backstop
+  // + Claude Code's channel notification handling together deliver
+  // "agents just get messages automatically". If this fails but the
+  // poked-path test above passes, we've isolated the residual problem
+  // to Claude Code's client-side idle-wake handling (hypothesis B/C
+  // in the PR #27 write-up), and the asyncRewake hook in the
+  // brief-020 follow-up becomes load-bearing.
+  it(
+    'brief-020: idle agent (no user input) auto-wakes on channel notification and replies',
+    async () => {
+      session = Session.spawn(
+        'claude',
+        [
+          '--strict-mcp-config',
+          '--mcp-config',
+          mcpConfigJson,
+          '--dangerously-load-development-channels',
+          'server:coord',
+          '--dangerously-skip-permissions',
+        ],
+        {
+          cwd: spawnCwd,
+          env: {
+            HOME: homeDir,
+            PATH: process.env.PATH ?? '',
+            PTY_SESSION_DIR: ptySessionDir,
+            COORD_ROOT: coordRoot,
+            ST_ROOT: coordRoot,
+            COORD_IDENTITY: 'bob',
+            ST_IDENTITY: 'bob',
+            ST_AGENT: 'bob',
+          },
+        }
+      );
+      await session.waitForText(
+        'I am using this for local development',
+        20_000
+      );
+      session.press('return');
+      // Same 6s boot settle as the poked-path test.
+      await new Promise((r) => setTimeout(r, 6000));
+
+      // Drop the message. Same file/frontmatter as the poked test so
+      // the reply predicate is identical.
+      const original = '1714826789011-idlewk.md';
+      writeFileSync(
+        join(coordRoot, 'bob', 'inbox', original),
+        '---\nfrom: alice\nsubject: idle-wake test\n---\n' +
+          'what is 2+2? Please call the coord_msg_reply tool with my message ' +
+          'as the thread arg and your answer as the body.\n'
+      );
+
+      // DO NOT type into the pty. The agent must wake purely from the
+      // channel notification. 90s gives plenty of headroom for the
+      // polling backstop (default 15s) + Claude's turn latency, even
+      // if FSEvents drops the initial add event.
+      const fromRe = /^from: bob$/m;
+      const replyRe = new RegExp(`^in-reply-to: ${original}$`, 'm');
+      const answerRe = /\b4\b/;
+      let found: { filename: string; fm: string; body: string };
+      try {
+        found = await pollForReply(
+          'alice',
+          (filename, parsed) => {
+            if (filename === original) return false;
+            if (!fromRe.test(parsed.fm)) return false;
+            if (!replyRe.test(parsed.fm)) return false;
+            return answerRe.test(parsed.body);
+          },
+          90_000
+        );
+      } catch (err) {
+        // eslint-disable-next-line no-console
+        console.error(
+          '[claude-live-test-idle] poll failed; final session screen:\n' +
+            session?.screenshot().text
+        );
+        throw err;
+      }
+      expect(found.fm).toMatch(fromRe);
+      expect(found.fm).toMatch(replyRe);
+      expect(found.body).toMatch(answerRe);
+    },
+    180_000
   );
 });
