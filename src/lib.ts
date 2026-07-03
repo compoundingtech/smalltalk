@@ -104,11 +104,13 @@ import {
 // ─── Public option types ────────────────────────────────────────────────
 
 export interface CoordOptions {
-  /** $COORD_ROOT — the parent of every `<identity>/` folder. */
+  /** $ST_ROOT (legacy $COORD_ROOT). Parent of every `<identity>/` folder. */
   root: string;
   /** Default identity for any method that doesn't take one explicitly. */
   identity: Identity;
-  /** $COORD_CONFIG. Defaults to `~/.config/coord`. */
+  /** $ST_CONFIG (legacy $COORD_CONFIG). Defaults to `~/.config/smalltalk`
+   *  when present, `~/.config/coord` when only that exists, else the
+   *  ST path for a brand-new install. */
   configRoot?: string;
 }
 
