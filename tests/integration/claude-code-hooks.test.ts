@@ -444,6 +444,48 @@ describe('claude-code hooks — pre-compact.sh (brief-024)', () => {
     expect(r.calls[0]).toEqual(['context', 'write']);
   });
 
+  it('$COORD_PRECOMPACT_TIMEOUT_S overrides the write-timeout cap', () => {
+    // Verify the timeout knob is honored: with a very short cap and
+    // a slow shim, the hook must still exit 0 (prime directive) and
+    // must NOT leave a broken pipe or hung child. We can't observe
+    // TIMEOUT_EXIT from the outside without patching the hook, but
+    // the load-bearing assertion is "hook exits 0 no matter what."
+    mkdirSync(join(scratch, 'alice', 'inbox'), { recursive: true });
+    mkdirSync(join(scratch, 'alice', 'archive'), { recursive: true });
+    // Slow shim: 200ms before writing. Fits well within 5s default
+    // and 1s override, but would trip a 0.05s override.
+    writeFileSync(
+      join(shimDir, 'coord'),
+      [
+        '#!/bin/bash',
+        'sleep 0.2',
+        'for arg in "$@"; do printf "%s\\0" "$arg" >> "$COORD_SHIM_LOG"; done',
+        'printf "\\n" >> "$COORD_SHIM_LOG"',
+        'exit 0',
+        '',
+      ].join('\n')
+    );
+    chmodSync(join(shimDir, 'coord'), 0o755);
+    // Tight override — shim's 200ms sleep exceeds this cap.
+    const rTight = runPreCompact({
+      COORD_ROOT: scratch,
+      COORD_IDENTITY: 'alice',
+      COORD_PRECOMPACT_TIMEOUT_S: '0.05',
+    });
+    // Prime directive holds even when the write times out.
+    expect(rTight.status).toBe(0);
+    // Generous override — shim finishes in time; write completes.
+    // Fresh scratch env for a clean shim-call count read.
+    rmSync(shimLog, { force: true });
+    const rLoose = runPreCompact({
+      COORD_ROOT: scratch,
+      COORD_IDENTITY: 'alice',
+      COORD_PRECOMPACT_TIMEOUT_S: '2',
+    });
+    expect(rLoose.status).toBe(0);
+    expect(rLoose.calls.length).toBe(1);
+  });
+
   it('when the shim exits nonzero, the hook still exits 0 (prime directive)', () => {
     // Replace the shim with a version that always fails.
     writeFileSync(

@@ -33,11 +33,23 @@
 # want to clobber that quiet-but-current work with a stub. Threshold
 # is tunable via $COORD_PRECOMPACT_FRESH_S (seconds; default 300).
 #
-# 500ms hard cap via `timeout` (falls back to `gtimeout` on darwin
-# systems with coreutils installed; falls through unbounded when
-# neither is present — no exit-status change; the hook's other work
-# should complete in single-digit ms anyway, so the cap is defense-
-# in-depth, not a load-bearing invariant).
+# Hard cap on the `coord context write` call via `timeout` (falls
+# back to `gtimeout` on darwin systems with coreutils installed;
+# falls through unbounded when neither is present — no exit-status
+# change; the hook's other work should complete in single-digit ms
+# anyway, so the cap is defense-in-depth, not a load-bearing
+# invariant).
+#
+# Tunable via $COORD_PRECOMPACT_TIMEOUT_S (seconds; default 5).
+# Prior default was 0.5s, which flaked reliably under vitest's
+# singleFork integration pool on darwin: cumulative process
+# pressure (30+ spawned bashes per file, plus the ~4 fork+exec
+# chain bash→pipe→timeout→PATH lookup→coord shim→bash) pushed the
+# first flush test past the 500ms budget with exit 124 before
+# the shim even wrote to its log. 5s is still an upper bound on a
+# wedged CLI (well under any Claude Code hook-lifecycle limit) and
+# doesn't affect real-world latency since a healthy write
+# completes in ~ms.
 
 set -uo pipefail
 
@@ -63,6 +75,7 @@ err_log="$context_dir/.flush-errors.log"
 mkdir -p "$context_dir" 2>/dev/null || true
 
 fresh_s="${COORD_PRECOMPACT_FRESH_S:-300}"
+timeout_s="${COORD_PRECOMPACT_TIMEOUT_S:-5}"
 
 # ─── Freshness check ─────────────────────────────────────────────────────
 
@@ -120,11 +133,11 @@ EOF
 # lazy-create branch and mkdirs `inbox/`+`archive/` on first flush.
 if command -v timeout >/dev/null 2>&1; then
   printf '%s\n' "$stub_body" | \
-    timeout 0.5s coord context write \
+    timeout "${timeout_s}s" coord context write \
     > /dev/null 2>>"$err_log" || true
 elif command -v gtimeout >/dev/null 2>&1; then
   printf '%s\n' "$stub_body" | \
-    gtimeout 0.5s coord context write \
+    gtimeout "${timeout_s}s" coord context write \
     > /dev/null 2>>"$err_log" || true
 else
   printf '%s\n' "$stub_body" | \
