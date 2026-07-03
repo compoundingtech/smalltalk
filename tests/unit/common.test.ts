@@ -17,6 +17,7 @@ import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import {
+  _resetCoordFallbackWarnings,
   archiveDir,
   assertIdentityFolderExists,
   CROCKFORD_BASE32,
@@ -40,6 +41,8 @@ import {
   resolveIdentity,
   rfc3339FromMs,
   safeAtomicWrite,
+  stConfig,
+  stConfigFrom,
   STATES,
   statusPath,
   sweep,
@@ -618,21 +621,73 @@ describe('path helpers', () => {
     expect(v.endsWith('.local/state/smalltalk')).toBe(true);
   });
 
-  it('coordConfigFrom honors $COORD_CONFIG', () => {
+  // Phase P1 (brief-rename-cutover): stConfigFrom is the canonical
+  // resolver; coordConfigFrom is a same-signature deprecated alias.
+  // Both preserve the pre-P1 behavior for existing $COORD_CONFIG
+  // callers AND add the $ST_CONFIG-preferred + one-time-fallback-warn
+  // shape that mirrors ST_ROOT / COORD_ROOT.
+
+  it('stConfigFrom honors $ST_CONFIG when set', () => {
     expect(
-      coordConfigFrom({ COORD_CONFIG: '/tmp/y' } as NodeJS.ProcessEnv)
-    ).toBe('/tmp/y');
+      stConfigFrom({ ST_CONFIG: '/tmp/st-config' } as NodeJS.ProcessEnv)
+    ).toBe('/tmp/st-config');
   });
 
-  it('coordConfigFrom falls back to ~/.config/coord', () => {
-    const v = coordConfigFrom({} as NodeJS.ProcessEnv);
+  it('stConfigFrom falls back to $COORD_CONFIG when ST_CONFIG unset', () => {
+    _resetCoordFallbackWarnings();
+    expect(
+      stConfigFrom({ COORD_CONFIG: '/tmp/legacy' } as NodeJS.ProcessEnv)
+    ).toBe('/tmp/legacy');
+  });
+
+  it('stConfigFrom prefers $ST_CONFIG over $COORD_CONFIG when both set', () => {
+    _resetCoordFallbackWarnings();
+    expect(
+      stConfigFrom({
+        ST_CONFIG: '/tmp/st',
+        COORD_CONFIG: '/tmp/coord',
+      } as NodeJS.ProcessEnv)
+    ).toBe('/tmp/st');
+  });
+
+  it('stConfigFrom falls back to ~/.config/smalltalk (brand-new install)', () => {
+    // HOME points at a scratch dir with neither `.config/smalltalk`
+    // nor `.config/coord` present → the ST path becomes the default.
+    const v = stConfigFrom({ HOME: scratch } as NodeJS.ProcessEnv);
+    expect(v.endsWith('.config/smalltalk')).toBe(true);
+  });
+
+  it('stConfigFrom prefers existing ~/.config/coord when it exists but smalltalk does not', () => {
+    // Legacy machine: only `.config/coord` exists. The resolver
+    // silently prefers it (no env-var warning — the warn belongs on
+    // env vars, not the state-dir shape).
+    mkdirSync(join(scratch, '.config/coord'), { recursive: true });
+    const v = stConfigFrom({ HOME: scratch } as NodeJS.ProcessEnv);
     expect(v.endsWith('.config/coord')).toBe(true);
   });
 
-  it('coordRoot()/coordConfig() read live process.env', () => {
+  it('stConfigFrom prefers ~/.config/smalltalk when BOTH dirs exist (Phase-1 in flight)', () => {
+    mkdirSync(join(scratch, '.config/smalltalk'), { recursive: true });
+    mkdirSync(join(scratch, '.config/coord'), { recursive: true });
+    const v = stConfigFrom({ HOME: scratch } as NodeJS.ProcessEnv);
+    expect(v.endsWith('.config/smalltalk')).toBe(true);
+  });
+
+  it('coordConfigFrom is a same-signature alias of stConfigFrom (back-compat)', () => {
+    _resetCoordFallbackWarnings();
+    expect(coordConfigFrom).toBe(stConfigFrom);
+    expect(
+      coordConfigFrom({ COORD_CONFIG: '/tmp/legacy' } as NodeJS.ProcessEnv)
+    ).toBe('/tmp/legacy');
+  });
+
+  it('coordRoot()/coordConfig()/stConfig() read live process.env', () => {
     // Smoke test: just confirm the wrappers don't throw and return strings.
     expect(typeof coordRoot()).toBe('string');
     expect(typeof coordConfig()).toBe('string');
+    expect(typeof stConfig()).toBe('string');
+    // coordConfig is a same-signature alias of stConfig too.
+    expect(coordConfig).toBe(stConfig);
   });
 
   it('identityDir / inboxDir / archiveDir / statusPath / namePath compose correctly', () => {

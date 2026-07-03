@@ -6,6 +6,30 @@ minor releases until 1.0.
 
 ## Unreleased
 
+### Added (brief-rename-cutover Phase P1 — `$ST_CONFIG` env var)
+
+Closes the last `COORD_*` env var that had no `ST_*` equivalent, so
+the coord→st cutover's Phase D can drop `$COORD_CONFIG` support
+without a gap. Mirrors the pattern already used for `ST_ROOT` /
+`COORD_ROOT` (brief-005-phase0):
+
+- New `$ST_CONFIG` env var, preferred over `$COORD_CONFIG`. Setting
+  both is fine — `$ST_CONFIG` wins.
+- New `~/.config/smalltalk/` default location, preferred when it
+  exists. Falls back to `~/.config/coord/` when only that exists
+  (legacy machine); creates `~/.config/smalltalk/` on a brand-new
+  install. Same reasoning as the state-root logic: the warning
+  belongs on env vars (the actionable signal), not the dir shape.
+- Reading `$COORD_CONFIG` still works and emits the same one-time
+  stderr fallback notice used by `$COORD_ROOT` and
+  `$COORD_IDENTITY`.
+- `stConfigFrom(env)` is the new canonical resolver;
+  `coordConfigFrom` is a same-signature deprecated alias. Both
+  `stConfig()` and `coordConfig()` — the current-env wrappers —
+  work the same way.
+- **8 new unit tests** cover the ST-preferred / COORD-fallback /
+  dual-dir / brand-new-install / alias-equivalence axes.
+
 ### Added (task #118 — `st launch` generates `.claude/settings.local.json`)
 
 `st launch claude` now writes `<cwd>/.claude/settings.local.json`

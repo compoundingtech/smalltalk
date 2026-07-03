@@ -396,6 +396,31 @@ function defaultStateRoot(env: NodeJS.ProcessEnv): string {
   return stPath; // brand-new install: the new path becomes the default
 }
 
+/**
+ * Mirror of {@link defaultStateRoot} for the config dir. Prefers
+ * `~/.config/smalltalk` when it exists, falls back to
+ * `~/.config/coord` when only that exists, and creates
+ * `~/.config/smalltalk` on a brand-new install. Same reasoning as
+ * defaultStateRoot: the warning belongs on env vars (the actionable
+ * signal), not the dir itself.
+ */
+function defaultConfigDir(env: NodeJS.ProcessEnv): string {
+  const home = env.HOME ?? homedir();
+  const stPath = join(home, '.config/smalltalk');
+  const coordPath = join(home, '.config/coord');
+  try {
+    if (statSync(stPath).isDirectory()) return stPath;
+  } catch {
+    // not present
+  }
+  try {
+    if (statSync(coordPath).isDirectory()) return coordPath;
+  } catch {
+    // not present
+  }
+  return stPath;
+}
+
 export function coordRootFrom(env: NodeJS.ProcessEnv = process.env): string {
   const stv = env.ST_ROOT;
   if (stv && stv.length > 0) return stv;
@@ -407,10 +432,33 @@ export function coordRootFrom(env: NodeJS.ProcessEnv = process.env): string {
   return defaultStateRoot(env);
 }
 
-export function coordConfigFrom(env: NodeJS.ProcessEnv = process.env): string {
-  const v = env.COORD_CONFIG;
-  return v && v.length > 0 ? v : join(homedir(), '.config/coord');
+/**
+ * Read the config-dir path from `ST_CONFIG` (preferred) or
+ * `COORD_CONFIG` (legacy, one-time fallback notice). Falls back to
+ * {@link defaultConfigDir} — which prefers `~/.config/smalltalk`
+ * when it exists, then `~/.config/coord`, then creates the ST path
+ * for brand-new installs.
+ *
+ * brief-rename-cutover Phase P1: closes the last `COORD_*` env var
+ * that had no `ST_*` equivalent, so Phase D can drop `COORD_CONFIG`
+ * support without a gap.
+ */
+export function stConfigFrom(env: NodeJS.ProcessEnv = process.env): string {
+  const stv = env.ST_CONFIG;
+  if (stv && stv.length > 0) return stv;
+  const cv = env.COORD_CONFIG;
+  if (cv && cv.length > 0) {
+    warnCoordFallback('ST_CONFIG', 'COORD_CONFIG');
+    return cv;
+  }
+  return defaultConfigDir(env);
 }
+
+/** @deprecated Use {@link stConfigFrom}. Kept as a same-signature
+ *  alias so existing embedders and CLI-context wiring compile
+ *  unchanged. Removed once the coord→st cutover is complete
+ *  (brief-rename-cutover Phase D). */
+export const coordConfigFrom = stConfigFrom;
 
 /**
  * Read the agent name from `ST_AGENT` (preferred), `ST_IDENTITY`
@@ -465,9 +513,13 @@ export function coordRoot(): string {
   return coordRootFrom();
 }
 
-export function coordConfig(): string {
-  return coordConfigFrom();
+export function stConfig(): string {
+  return stConfigFrom();
 }
+
+/** @deprecated Use {@link stConfig}. Alias kept until the coord→st
+ *  cutover completes (brief-rename-cutover Phase D). */
+export const coordConfig = stConfig;
 
 export function identityDir(id: string, root: string = coordRoot()): string {
   return join(root, id);
