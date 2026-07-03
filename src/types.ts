@@ -14,7 +14,7 @@
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 
-import { validAgent, validFilename } from './common.ts';
+import { validAgent, validDeliverableFilename, validFilename } from './common.ts';
 import {
   InvalidAgentError,
   InvalidFilenameError,
@@ -63,6 +63,20 @@ export function isFilename(s: string): s is Filename {
 
 export function asFilename(s: string): Filename {
   if (!validFilename(s)) {
+    throw new InvalidFilenameError(s);
+  }
+  return s as Filename;
+}
+
+/**
+ * Broader-than-{@link asFilename} guard: accepts LAYOUT-004 canonical
+ * grammar OR a safe "outside" `.md` basename. Use at the boundaries
+ * that must tolerate off-format `.md` files (channel-watcher delivery,
+ * `coord message ls / read / archive`). Strict paths that depend on
+ * timestamp / prefix derivation must keep using {@link asFilename}.
+ */
+export function asDeliverableFilename(s: string): Filename {
+  if (!validDeliverableFilename(s)) {
     throw new InvalidFilenameError(s);
   }
   return s as Filename;

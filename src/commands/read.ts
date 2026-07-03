@@ -7,6 +7,7 @@ import {
   inboxDir,
   parseFrontmatter,
   resolveIdentity,
+  validDeliverableFilename,
   validFilename,
 } from '../common.ts';
 import {
@@ -54,9 +55,10 @@ export function cmdRead(input: ReadInput): ReadResult {
     coordRoot: input.coordRoot,
     ...(input.recipient ? { policy: 'lenient' as const } : {}),
   });
-  if (!validFilename(input.filename)) {
+  if (!validDeliverableFilename(input.filename)) {
     throw new InvalidFilenameError(input.filename);
   }
+  const isOutside = !validFilename(input.filename);
 
   const inboxPath = `${inboxDir(recipient, input.coordRoot)}/${input.filename}`;
   const archivePath = `${archiveDir(recipient, input.coordRoot)}/${input.filename}`;
@@ -107,6 +109,23 @@ export function cmdRead(input: ReadInput): ReadResult {
       label,
       path,
       untyped: false,
+      recipient,
+      fm: {},
+    };
+  }
+
+  // Off-format `.md` files: return the whole file as body regardless
+  // of whether it happens to have frontmatter. We can't trust the
+  // sender's claimed identity through an unofficial filename, so
+  // `fm` is empty and the file reads as an "outside" message.
+  if (isOutside) {
+    const header = `# ${label}/${input.filename} (outside: non-canonical filename)\n`;
+    return {
+      body: text,
+      header,
+      label,
+      path,
+      untyped: true,
       recipient,
       fm: {},
     };

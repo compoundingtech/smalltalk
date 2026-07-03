@@ -43,8 +43,10 @@ import {
   STATES,
   statusPath,
   sweep,
+  validDeliverableFilename,
   validFilename,
   validIdentity,
+  validOutsideFilename,
   yamlQuote,
 } from '../../src/common.ts';
 
@@ -253,6 +255,66 @@ describe('validFilename', () => {
 
   it('rejects: legacy 3-segment (<ts>-<machine>-<rand>.md)', () => {
     expect(validFilename('1714826789012-myobie-x9k4mz.md')).toBe(false);
+  });
+});
+
+describe('validOutsideFilename (task #128)', () => {
+  it('accepts a plain `.md` basename that is not the canonical grammar', () => {
+    expect(validOutsideFilename('notes.md')).toBe(true);
+    expect(validOutsideFilename('hello-world.md')).toBe(true);
+    expect(validOutsideFilename('outsider.md')).toBe(true);
+  });
+
+  it('accepts the legacy 3-segment shape (LAYOUT-004 no longer matches it)', () => {
+    // Not our canonical grammar; legitimately hand-dropped or from an
+    // older peer that predates the rename.
+    expect(validOutsideFilename('1714826789012-myobie-x9k4mz.md')).toBe(true);
+  });
+
+  it('rejects: canonical LAYOUT-004 grammar (that is a real message, not outside)', () => {
+    expect(validOutsideFilename('1714826789012-x9k4mz.md')).toBe(false);
+  });
+
+  it('rejects: attachment sidecar of a canonical .md', () => {
+    // `<unix-ms>-<r6>.<anything>.md` is a sibling of `<unix-ms>-<r6>.md`
+    // and belongs to its family — the canonical .md is responsible.
+    expect(validOutsideFilename('1714826789012-x9k4mz.subject.md')).toBe(false);
+    expect(validOutsideFilename('1714826789012-x9k4mz.body.md')).toBe(false);
+  });
+
+  it('rejects: non-.md files', () => {
+    expect(validOutsideFilename('README')).toBe(false);
+    expect(validOutsideFilename('notes.txt')).toBe(false);
+    expect(validOutsideFilename('data.json')).toBe(false);
+  });
+
+  it('rejects: bare .md', () => {
+    expect(validOutsideFilename('.md')).toBe(false);
+  });
+
+  it('rejects: dotfile / hidden .md', () => {
+    expect(validOutsideFilename('.hidden.md')).toBe(false);
+    expect(validOutsideFilename('.DS_Store.md')).toBe(false);
+  });
+
+  it('rejects: path traversal / paths with separators', () => {
+    expect(validOutsideFilename('../escape.md')).toBe(false);
+    expect(validOutsideFilename('sub/dir.md')).toBe(false);
+    expect(validOutsideFilename('a\\b.md')).toBe(false);
+  });
+
+  it('rejects: empty string', () => {
+    expect(validOutsideFilename('')).toBe(false);
+  });
+});
+
+describe('validDeliverableFilename (task #128)', () => {
+  it('is the union of validFilename and validOutsideFilename', () => {
+    expect(validDeliverableFilename('1714826789012-x9k4mz.md')).toBe(true);
+    expect(validDeliverableFilename('notes.md')).toBe(true);
+    expect(validDeliverableFilename('README')).toBe(false);
+    expect(validDeliverableFilename('../escape.md')).toBe(false);
+    expect(validDeliverableFilename('1714826789012-x9k4mz.body.md')).toBe(false);
   });
 });
 

@@ -3,6 +3,8 @@
 import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 
+import { statSync } from 'node:fs';
+
 import {
   archiveDir,
   filenameTimestamp,
@@ -12,6 +14,7 @@ import {
   prefixOf,
   resolveIdentity,
   validFilename,
+  validOutsideFilename,
 } from '../common.ts';
 
 export interface LsInput {
@@ -63,6 +66,27 @@ export interface LsResult {
    * was true. Same length and order as {@link matches}.
    */
   items?: LsItem[];
+}
+
+function buildOutsideItem(filename: string, dir: string): LsItem {
+  // Outside .md: no trustworthy frontmatter to project. Use file
+  // mtime as the derived ts so callers can still sort by arrival
+  // order (the LAYOUT-004 prefix isn't there to give it to us).
+  let ts = 0;
+  try {
+    ts = statSync(join(dir, filename)).mtimeMs;
+  } catch {
+    // Race — file removed between readdir and stat. Leave ts at 0.
+  }
+  return {
+    filename,
+    ts,
+    from: 'outside',
+    subject: null,
+    inReplyTo: null,
+    tags: [],
+    priority: null,
+  };
 }
 
 function buildItem(filename: string, dir: string): LsItem {
@@ -182,18 +206,40 @@ export function cmdLs(input: LsInput): LsResult {
   const matches: string[] = [];
   const items: LsItem[] = [];
   for (const name of names.sort()) {
-    if (!validFilename(name)) continue;
+    const canonical = validFilename(name);
+    const outside = !canonical && validOutsideFilename(name);
+    if (!canonical && !outside) continue;
     if (since !== undefined) {
-      if (filenameTimestamp(name) < since) continue;
+      // Outside filenames have no LAYOUT prefix; use mtime as the
+      // derived arrival time so `--since` treats them consistently.
+      let nameTs: number;
+      if (canonical) {
+        nameTs = filenameTimestamp(name);
+      } else {
+        try {
+          nameTs = statSync(join(dir, name)).mtimeMs;
+        } catch {
+          nameTs = 0;
+        }
+      }
+      if (nameTs < since) continue;
     }
     if (fromFilter !== undefined && fromFilter !== '') {
-      const text = readFileSync(join(dir, name), 'utf8');
-      const fm = parseFrontmatter(text).fm;
-      if (fm.from !== fromFilter) continue;
+      if (outside) {
+        // `fromFilter` is compared against `outside` as a marker so
+        // callers can specifically pull outside messages. Any other
+        // filter value can't match — outside files have no trusted
+        // sender identity.
+        if (fromFilter !== 'outside') continue;
+      } else {
+        const text = readFileSync(join(dir, name), 'utf8');
+        const fm = parseFrontmatter(text).fm;
+        if (fm.from !== fromFilter) continue;
+      }
     }
     matches.push(name);
     if (withMeta) {
-      items.push(buildItem(name, dir));
+      items.push(outside ? buildOutsideItem(name, dir) : buildItem(name, dir));
     }
   }
 

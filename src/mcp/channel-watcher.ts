@@ -83,9 +83,17 @@ export async function startChannelWatcher(
   const chokidar = await import('chokidar');
   const { existsSync, readdirSync, readFileSync } = await import('node:fs');
   const { join } = await import('node:path');
-  const { parseFrontmatter, validFilename } = await import(
+  const { parseFrontmatter, validFilename, validOutsideFilename } = await import(
     '../common.ts'
   );
+
+  /**
+   * A `.md` file that should be delivered — canonical LAYOUT-004
+   * OR safe outside grammar. Outside files fire with `from: 'outside'`
+   * so the recipient knows the sender isn't verified.
+   */
+  const isDeliverable = (name: string): boolean =>
+    validFilename(name) || validOutsideFilename(name);
 
   const inboxDir = join(opts.root, opts.identity, 'inbox');
   const chokidarEnabled = opts.chokidarEnabled !== false;
@@ -111,7 +119,7 @@ export async function startChannelWatcher(
   const seen = new Set<string>();
   try {
     for (const name of readdirSync(inboxDir)) {
-      if (validFilename(name)) seen.add(name);
+      if (isDeliverable(name)) seen.add(name);
     }
     debugLog(
       `seeded ${seen.size} existing filename(s) in inbox=${inboxDir}`
@@ -184,10 +192,11 @@ export async function startChannelWatcher(
   if (watcher !== null) {
     watcher.on('add', (filepath) => {
       const filename = filepath.split('/').pop() ?? '';
-      if (!validFilename(filename)) {
-        // handleOne would also skip these; short-circuit to avoid
-        // adding non-LAYOUT paths to `seen` (the poll backstop would
-        // then also skip via validFilename).
+      if (!isDeliverable(filename)) {
+        // Non-`.md` files, dotfiles, prefix-sibling attachments, and
+        // path-traversal names are skipped. handleOne would also skip
+        // these; short-circuit to avoid adding non-deliverable paths
+        // to `seen` (the poll backstop would then also skip).
         return;
       }
       // Dedup vs. the poll backstop: only the first observer of a
@@ -226,7 +235,7 @@ export async function startChannelWatcher(
     }
     let discovered = 0;
     for (const name of entries) {
-      if (!validFilename(name)) continue;
+      if (!isDeliverable(name)) continue;
       if (seen.has(name)) continue;
       seen.add(name);
       discovered += 1;
@@ -254,7 +263,7 @@ export async function startChannelWatcher(
   async function handleOne(filepath: string): Promise<void> {
     try {
       const filename = filepath.split('/').pop() ?? '';
-      if (!validFilename(filename)) return;
+      if (!isDeliverable(filename)) return;
       // No pre-emit sweep: sweep is a convergence operation now, not
       // transactional (see LAYOUT.md). If a byte-identical archive
       // twin exists for this inbox file, lazy-read sweep in cmdRead
@@ -265,29 +274,45 @@ export async function startChannelWatcher(
       // on chokidar's hot path.
       if (!existsSync(filepath)) return;
       const text = readFileSync(filepath, 'utf8');
-      const { fm, body } = parseFrontmatter(text);
-      const from =
-        typeof fm.from === 'string' && fm.from.length > 0
-          ? fm.from
-          : 'unknown';
-      const inReplyToRaw =
-        typeof fm['in-reply-to'] === 'string'
-          ? fm['in-reply-to']
-          : typeof fm['inReplyTo'] === 'string'
-            ? (fm['inReplyTo'] as string)
+      // Off-format `.md` files skip frontmatter interpretation: we
+      // can't verify the sender's identity so `from` is overridden to
+      // `outside`, and we don't try to derive a thread — outside
+      // messages always start a new thread. Content is the raw file
+      // text with a one-line marker so the recipient sees at a glance
+      // this arrived through the outside path.
+      const isOutside = !validFilename(filename);
+      let from: string;
+      let inReplyTo: string | undefined;
+      let content: string;
+      if (isOutside) {
+        from = 'outside';
+        inReplyTo = undefined;
+        content = `[outside .md — non-canonical filename: ${filename}]\n\n${text}`;
+      } else {
+        const { fm, body } = parseFrontmatter(text);
+        from =
+          typeof fm.from === 'string' && fm.from.length > 0
+            ? fm.from
+            : 'unknown';
+        const inReplyToRaw =
+          typeof fm['in-reply-to'] === 'string'
+            ? fm['in-reply-to']
+            : typeof fm['inReplyTo'] === 'string'
+              ? (fm['inReplyTo'] as string)
+              : undefined;
+        // Only treat in-reply-to as a thread root if it parses as a
+        // LAYOUT filename; otherwise the message starts a new thread.
+        inReplyTo =
+          inReplyToRaw !== undefined && validFilename(inReplyToRaw)
+            ? inReplyToRaw
             : undefined;
-      // Only treat in-reply-to as a thread root if it parses as a
-      // LAYOUT filename; otherwise the message starts a new thread.
-      const inReplyTo =
-        inReplyToRaw !== undefined && validFilename(inReplyToRaw)
-          ? inReplyToRaw
-          : undefined;
-      const subject =
-        typeof fm.subject === 'string' && fm.subject.length > 0
-          ? fm.subject
-          : undefined;
-      const content =
-        subject !== undefined ? `Subject: ${subject}\n\n${body}` : body;
+        const subject =
+          typeof fm.subject === 'string' && fm.subject.length > 0
+            ? fm.subject
+            : undefined;
+        content =
+          subject !== undefined ? `Subject: ${subject}\n\n${body}` : body;
+      }
       const meta = {
         from,
         messageFilename: filename,

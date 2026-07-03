@@ -6,6 +6,50 @@ minor releases until 1.0.
 
 ## Unreleased
 
+### Fixed (task #128 — inbox delivers off-format `.md` as "outside messages")
+
+Before this change, a `.md` file dropped into an agent's `inbox/`
+that didn't match the canonical `<unix-ms>-<rand6>.md` grammar was
+silently ignored: chokidar, the polling backstop, `coord message
+ls`, `read`, and `archive` all filtered it out. A collaborator
+unfamiliar with the naming convention could send a message and the
+recipient would never see it. This closes that silent-miss hole.
+
+- **`src/common.ts`** adds `validOutsideFilename` (safe off-format
+  `.md` basenames — rejects path traversal, dotfiles, and
+  prefix-sibling attachments of a canonical `.md`) and
+  `validDeliverableFilename` (union of canonical + outside).
+  `validFilename` and `filenameTimestamp` retain strict LAYOUT-004
+  semantics for callers that depend on prefix derivation.
+- **`src/types.ts`** adds `asDeliverableFilename` — brand
+  constructor that accepts either LAYOUT-004 or safe outside `.md`.
+- **`src/mcp/channel-watcher.ts`** now delivers outside `.md` files
+  through the same `notifications/claude/channel` pipeline as
+  canonical messages, with `from: "outside"` in the meta envelope,
+  a `[outside .md — non-canonical filename: <name>]` marker
+  prepended to the content, and no thread reconstruction (outside
+  files always start a new thread). Seed, chokidar `add`, and the
+  polling backstop all accept the broader `isDeliverable` check.
+- **`src/commands/{read,archive,ls}.ts`** accept outside filenames.
+  `cmdRead` returns the raw file text as body with
+  `from: "outside"` and no frontmatter projection (the file's
+  claimed sender can't be trusted through an unofficial name).
+  `cmdArchive` moves bytes verbatim; `withAttachments` is silently
+  coerced off for outside files (no LAYOUT prefix = no sibling
+  family). `cmdLs` includes outside files in `matches` with
+  `from: "outside"` in `--json`; ts is derived from file mtime.
+- **`src/lib.ts`** — `Coord.ls` maps through `asDeliverableFilename`
+  so an outside filename doesn't throw at the API boundary;
+  `Coord.read` short-circuits outside filenames to a minimal
+  `{message: {from: 'outside', body: <text>}, ...}` shape rather
+  than reinterpreting untrusted frontmatter.
+- **9 new unit tests** cover `validOutsideFilename` edge cases
+  (path traversal, dotfiles, sidecar rejection, the legacy 3-segment
+  shape). **New integration tests** in `mcp-channel-watcher.test.ts`
+  exercise the outside-.md delivery path; existing tests that
+  asserted silent-drop are updated to reflect the new "outside"
+  semantics.
+
 ### Fixed (brief-020 — channel-watcher wake reliability, HB-4)
 
 Idle Claude Code agents sometimes sat on delivered coord messages
@@ -41,9 +85,11 @@ event meant a wedged inbox.
 - **6 new integration tests** exercise the backstop in isolation
   (via `chokidarEnabled: false`), confirm chronological ordering
   under the backstop, verify historical files are not replayed on
-  startup, confirm non-LAYOUT filenames are ignored, confirm
-  `close()` disposes the timer, and race chokidar + backstop to
-  prove the dedup path.
+  startup, confirm non-`.md` files stay ignored (task #128 later
+  relaxed this to deliver off-format `.md` as "outside" messages
+  while keeping non-`.md` paths ignored), confirm `close()`
+  disposes the timer, and race chokidar + backstop to prove the
+  dedup path.
 
 ### Added (brief-016 — `smalltalk launch <harness>` one-command bootstrap)
 

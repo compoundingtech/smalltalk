@@ -35,6 +35,7 @@ export {
 // cycle. Both spellings work; the deprecation is JSDoc-only.
 export {
   asAgent,
+  asDeliverableFilename,
   asFilename,
   asIdentity,
   deriveTo,
@@ -94,8 +95,10 @@ export {
   emitFrontmatter,
   parseFrontmatter,
   RESERVED_NAMES,
+  validDeliverableFilename,
   validFilename,
   validIdentity,
+  validOutsideFilename,
   yamlQuote,
 } from './common.ts';
 

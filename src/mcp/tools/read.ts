@@ -4,7 +4,7 @@ import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 
 import type { Coord } from '../../lib.ts';
-import { asFilename, asIdentity } from '../../types.ts';
+import { asDeliverableFilename, asIdentity } from '../../types.ts';
 import {
   buildToolResult,
   withErrorMapping,
@@ -14,7 +14,9 @@ import { registerDualTool } from './dual-register.ts';
 const readInputShape = {
   filename: z
     .string()
-    .describe('Message filename (LAYOUT-004 grammar). Required.'),
+    .describe(
+      "Message filename (LAYOUT-004 grammar, or an off-format `.md` delivered as an 'outside' message). Required."
+    ),
   identity: z
     .string()
     .optional()
@@ -60,7 +62,7 @@ export function registerReadTool(mcp: McpServer, coord: Coord): void {
           args.identity !== undefined
             ? asIdentity(args.identity)
             : coord.identity;
-        const filename = asFilename(args.filename);
+        const filename = asDeliverableFilename(args.filename);
         const opts: Parameters<Coord['read']>[2] = {};
         if (args.fromArchive !== undefined) opts.fromArchive = args.fromArchive;
         const r = await coord.read(identity, filename, opts);
