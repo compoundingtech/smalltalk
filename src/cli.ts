@@ -91,10 +91,11 @@ const TOP_LEVEL_USAGE =
   `  resource rm <filename>\n\n` +
   `Context (brief-024, lossless-restart):\n` +
   `  context read [<identity>] [--decisions | --full]\n` +
-  `                                   print now.md / decisions.md / both\n` +
+  `                                   print now.md / decisions/ log / both\n` +
   `  context write [<identity>]       replace now.md from stdin\n` +
   `  context append [<identity>] --decision "<text>" --why "<text>"\n` +
-  `                                   append one bulleted line to decisions.md\n\n` +
+  `                                   append one entry to decisions/ as a new\n` +
+  `                                   file named <unix-ms>-<rand6>.md\n\n` +
   `Sync:\n` +
   `  sync push <peer>\n` +
   `  sync push --all\n` +

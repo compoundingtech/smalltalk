@@ -163,7 +163,7 @@ describe('coord_context_write', () => {
 // ─── append + read ───────────────────────────────────────────────────────
 
 describe('coord_context_append', () => {
-  it('appends a bulleted line with a caller-supplied timestamp', async () => {
+  it('creates one file per entry; returns the filename + line', async () => {
     const r = await callAppend({
       decision: 'ship v1 without hook legs',
       why: 'iterate on schema before wiring hooks',
@@ -174,9 +174,16 @@ describe('coord_context_append', () => {
     expect(line).toBe(
       '- 2026-07-02T22:30:00.000Z ship v1 without hook legs. why: iterate on schema before wiring hooks.'
     );
+    // Filename shape: LAYOUT-004 <unix-ms>-<rand6>.md — same as message
+    // inboxes. The MCP surface exposes both filename and full path.
+    const filename = r.structuredContent?.filename as string;
+    expect(filename).toMatch(/^\d+-[0-9a-z]{6}\.md$/);
+    const path = r.structuredContent?.path as string;
+    expect(path).toContain('/context/decisions/');
+    expect(path.endsWith(filename)).toBe(true);
   });
 
-  it('two appends both survive; read --decisions shows both', async () => {
+  it('two appends land in two distinct files; read --decisions shows both in chrono order', async () => {
     await callAppend({
       decision: 'a',
       why: 'one',
@@ -189,8 +196,11 @@ describe('coord_context_append', () => {
     });
     const r = await callRead({ file: 'decisions' });
     const text = r.structuredContent?.text as string;
-    expect(text).toContain('a. why: one.');
-    expect(text).toContain('b. why: two.');
+    const aIdx = text.indexOf('a. why: one.');
+    const bIdx = text.indexOf('b. why: two.');
+    expect(aIdx).toBeGreaterThanOrEqual(0);
+    // Earlier timestamp → earlier in the concatenated output.
+    expect(bIdx).toBeGreaterThan(aIdx);
   });
 
   it('append requires decision + why (schema-level)', async () => {

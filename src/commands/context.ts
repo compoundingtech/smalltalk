@@ -7,23 +7,33 @@
 // state on disk, outside the session jsonl, in the agent's smalltalk
 // network folder (~/.local/state/coord/<agent>/context/).
 //
-// Two files, two shapes:
-//   - now.md         — whole-file rewrite; `read now` prints it,
-//                      `write` replaces it from stdin. Meant for
-//                      "what I'm mid-doing" snapshots the model
-//                      flushes at each meaningful state change.
-//   - decisions.md   — append-only log. `append` adds one bulleted
-//                      line "- <ISO ts> <decision>. why: <why>.".
-//                      Never rewritten in v1 — decisions accumulate
-//                      so a restarted-you doesn't re-litigate.
+// Two surfaces, two shapes:
+//   - now.md       — whole-file rewrite; `read now` prints it,
+//                    `write` replaces it from stdin. Meant for
+//                    "what I'm mid-doing" snapshots the model
+//                    flushes at each meaningful state change.
+//   - decisions/   — folder, one file per decision entry, named
+//                    `<unix-ms>-<rand6>.md` — the same LAYOUT-004
+//                    grammar as message inboxes. `append` creates a
+//                    new file (no rewrite of any existing file), so:
+//                      * two concurrent appends never race — each is
+//                        an atomic create with a distinct rand6;
+//                      * an interrupted append leaves at most a stale
+//                        `.tmp` sibling, not a corrupted log;
+//                      * `readdir` sorted by filename gives the log
+//                        in chronological order for free.
+//                    `read --decisions` concatenates all entries in
+//                    that sorted order and re-emits them as a
+//                    bulleted list (the file bodies are already
+//                    bulleted lines, so it's a straight join).
 //
 // Absent-able (load-bearing for evals-claude's restart-continuity
 // eval): every verb tolerates a missing `context/` folder. `read`
-// returns empty text when the file is absent. `append` and `write`
-// lazy-create the folder. There is no `coord context init` — you
-// can go from zero to a first write without any ceremony, and the
-// eval's control arm can just delete the folder to A/B against the
-// treatment.
+// returns empty text when the file/folder is absent. `append` and
+// `write` lazy-create the folder. There is no `coord context init`
+// — you can go from zero to a first write without any ceremony, and
+// the eval's control arm can just delete the folder to A/B against
+// the treatment.
 //
 // Explicitly out of scope for v1 (v2 candidates surfaced by cos):
 //   - No `now edit` verb — full-rewrite discipline prevents the
@@ -38,6 +48,7 @@ import {
   existsSync,
   mkdirSync,
   readFileSync,
+  readdirSync,
   renameSync,
   unlinkSync,
   writeFileSync,
@@ -47,9 +58,11 @@ import { dirname, join } from 'node:path';
 
 import type { CliContext } from '../cli-context.ts';
 import {
-  contextDecisionsPath,
+  contextDecisionsDir,
   contextDir,
   contextNowPath,
+  msNow,
+  rand6,
   resolveIdentity,
 } from '../common.ts';
 
@@ -59,7 +72,7 @@ export type ContextVerb = 'read' | 'write' | 'append';
 
 export interface ContextReadInput {
   recipient?: string | undefined;
-  /** Which file to read. Default 'now'. */
+  /** Which surface to read. Default 'now'. */
   file?: 'now' | 'decisions' | 'full' | undefined;
   env: NodeJS.ProcessEnv;
   coordRoot: string;
@@ -67,14 +80,16 @@ export interface ContextReadInput {
 
 export interface ContextReadResult {
   identity: string;
-  /** The requested file. `full` returns both concatenated. */
+  /** The requested surface. `full` returns both concatenated. */
   file: 'now' | 'decisions' | 'full';
-  /** File contents; empty string when the file (or folder) is absent. */
+  /** Contents; empty string when the surface is absent. */
   text: string;
   /**
-   * True when the requested file was absent. For `full`, true only
-   * when BOTH files were absent. Lets callers distinguish "empty
-   * file" from "no file yet" without a second stat.
+   * True when the requested surface was absent (missing folder, missing
+   * file, or `decisions/` with no `.md` entries). For `full`, true only
+   * when BOTH surfaces were absent. Lets callers distinguish "empty
+   * file" from "no file yet" without a second stat — the eval's
+   * restart-continuity control arm consumes this flag directly.
    */
   absent: boolean;
 }
@@ -101,28 +116,42 @@ export interface ContextAppendInput {
   /** The "why" — kept separate so callers must think about the reason. */
   why: string;
   /**
-   * ISO timestamp to stamp the entry with. Callers supply this so
-   * the core stays deterministic under test (no clock reach). CLI
-   * wrapper defaults to `new Date().toISOString()`.
+   * ISO timestamp to stamp the entry body with. Callers supply this so
+   * the core stays deterministic under test (no clock reach from the
+   * body). CLI wrapper defaults to `new Date().toISOString()`.
    */
   timestamp: string;
+  /**
+   * Test seam. When provided, override the generated `<unix-ms>-<rand6>.md`
+   * filename so tests can assert exact bytes on disk. Real callers
+   * (CLI + MCP + SDK handle) never set this — we derive it from
+   * `timestamp` + a fresh rand6.
+   */
+  filename?: string | undefined;
   env: NodeJS.ProcessEnv;
   coordRoot: string;
 }
 
 export interface ContextAppendResult {
   identity: string;
+  /** Absolute path of the entry file that was written. */
   path: string;
-  /** The exact bulleted line that was appended (without trailing \n). */
+  /** Basename of {@link path} — `<unix-ms>-<rand6>.md`. */
+  filename: string;
+  /**
+   * The bulleted line that was written to the file (also what
+   * `read --decisions` will emit for this entry). No trailing `\n`.
+   */
   line: string;
 }
 
 // ─── Core ─────────────────────────────────────────────────────────────────
 
 /**
- * Read one of the context files. Absent-able: a missing folder or file
- * returns `text: ''` + `absent: true` so callers can distinguish
- * "restart with no prior context" from "restart with empty context".
+ * Read one of the context surfaces. Absent-able: a missing folder /
+ * file / empty `decisions/` returns `text: ''` + `absent: true` so
+ * callers can distinguish "restart with no prior context" from
+ * "restart with empty context."
  */
 export function cmdContextRead(input: ContextReadInput): ContextReadResult {
   const identity = resolveIdentity({
@@ -139,25 +168,21 @@ export function cmdContextRead(input: ContextReadInput): ContextReadResult {
     return { identity, file: 'now', text, absent };
   }
   if (which === 'decisions') {
-    const { text, absent } = readIfPresent(
-      contextDecisionsPath(identity, input.coordRoot)
-    );
+    const { text, absent } = readDecisionsFolder(identity, input.coordRoot);
     return { identity, file: 'decisions', text, absent };
   }
-  // `full`: now.md then decisions.md, separated by a heading so the
+  // `full`: now.md then decisions/*.md, separated by headings so the
   // reader can tell what came from where. Absent-flag is true iff
-  // BOTH files were missing — a partial rehydrate is still "present".
+  // BOTH surfaces were missing — a partial rehydrate is still "present".
   const now = readIfPresent(contextNowPath(identity, input.coordRoot));
-  const dec = readIfPresent(
-    contextDecisionsPath(identity, input.coordRoot)
-  );
+  const dec = readDecisionsFolder(identity, input.coordRoot);
   const parts: string[] = [];
   if (!now.absent) {
     parts.push('# now.md', now.text);
   }
   if (!dec.absent) {
     if (parts.length > 0) parts.push('');
-    parts.push('# decisions.md', dec.text);
+    parts.push('# decisions/', dec.text);
   }
   return {
     identity,
@@ -170,7 +195,7 @@ export function cmdContextRead(input: ContextReadInput): ContextReadResult {
 /**
  * Whole-file rewrite of `now.md`. Atomic via tmp + rename so a
  * concurrent reader can't see a partial file — matters because the
- * SessionStart hook will read this on every boot and we don't want a
+ * SessionStart hook reads this on every boot and we don't want a
  * mid-write moment to inject a truncated `<context>` block.
  */
 export function cmdContextWrite(
@@ -192,12 +217,18 @@ export function cmdContextWrite(
 }
 
 /**
- * Append one decision + why line to `decisions.md`. Format:
- *   - <ISO ts> <decision>. why: <why>.
- * We add the leading `- ` and enforce trailing periods so a hand-rolled
- * append via `>>` and a helper-driven append look identical to the
- * reader. Rejects a `\n` in either field — a decision that spans lines
- * belongs in a note or a doc, not in this log.
+ * Append one decision + why entry to `decisions/`. Semantics:
+ *   - Each entry lives in its own file named `<unix-ms>-<rand6>.md`
+ *     (LAYOUT-004 grammar). The unix-ms is derived from the caller's
+ *     `timestamp` so filename-sort order matches ISO-time order in the
+ *     bodies; a rand6 suffix prevents same-ms collisions.
+ *   - The body is one bulleted line — the same shape a hand-rolled
+ *     `>> decisions.md` append would produce in the old single-file
+ *     v1 draft. Concatenating the files in filename-sort order gives
+ *     back a bulleted list; `read --decisions` does exactly that.
+ *   - Rejects `\n` in either field: a decision that spans lines
+ *     belongs in a note or a doc, not in this log. Also rejects empty
+ *     strings on either.
  */
 export function cmdContextAppend(
   input: ContextAppendInput
@@ -221,15 +252,21 @@ export function cmdContextAppend(
     );
   }
   const line = `- ${input.timestamp} ${trimTrailingPeriod(decision)}. why: ${trimTrailingPeriod(why)}.`;
-  const path = contextDecisionsPath(identity, input.coordRoot);
-  ensureContextDir(identity, input.coordRoot);
-  // Append semantics: read + concat + atomic-rename. Not fs.appendFile
-  // because a partial-write from a crash mid-append would corrupt the
-  // log; a rename is either all-or-nothing.
-  const prior = existsSync(path) ? readFileSync(path, 'utf8') : '';
-  const sep = prior.length === 0 || prior.endsWith('\n') ? '' : '\n';
-  writeAtomic(path, prior + sep + line + '\n');
-  return { identity, path, line };
+
+  // Derive filename-ms from the body timestamp so filenames sort in
+  // strict ISO-time order (a burst of appends within the same second
+  // still sorts correctly because the rand6 suffix disambiguates).
+  // If timestamp isn't parseable, fall back to msNow() — better a
+  // "now" filename than a NaN-prefixed one that breaks sort.
+  const parsedMs = Date.parse(input.timestamp);
+  const ms = Number.isFinite(parsedMs) ? parsedMs : msNow();
+  const filename = input.filename ?? `${ms}-${rand6()}.md`;
+
+  const dir = contextDecisionsDir(identity, input.coordRoot);
+  mkdirSync(dir, { recursive: true });
+  const path = join(dir, filename);
+  writeAtomic(path, line + '\n');
+  return { identity, path, filename, line };
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────
@@ -244,6 +281,56 @@ function readIfPresent(path: string): { text: string; absent: boolean } {
     // hard error. The eval's control arm gets the same shape either way.
     return { text: '', absent: true };
   }
+}
+
+/**
+ * Enumerate + concatenate the per-decision `.md` files in
+ * `<context>/decisions/`. Missing folder OR zero entries → `absent`.
+ * Sort is plain lexicographic on filename; since names are
+ * `<unix-ms>-<rand6>.md` and ms values are fixed-width for any date
+ * in this century, lex-sort equals chronological sort.
+ *
+ * Each file's body is a bulleted line already (`- <ISO> …`), so the
+ * concatenation is a straight join with newlines — no re-bulleting.
+ * Trailing newlines on individual files are normalized so the final
+ * text ends with exactly one `\n`.
+ */
+function readDecisionsFolder(
+  identity: string,
+  root: string
+): { text: string; absent: boolean } {
+  const dir = contextDecisionsDir(identity, root);
+  if (!existsSync(dir)) return { text: '', absent: true };
+  let entries: string[];
+  try {
+    entries = readdirSync(dir)
+      .filter((n) => n.endsWith('.md'))
+      .sort();
+  } catch {
+    // Present-but-unreadable directory — treat as absent, same rationale
+    // as readIfPresent. The eval's control arm needs a stable "no
+    // context" surface regardless of transient filesystem errors.
+    return { text: '', absent: true };
+  }
+  if (entries.length === 0) return { text: '', absent: true };
+
+  const lines: string[] = [];
+  for (const name of entries) {
+    let raw: string;
+    try {
+      raw = readFileSync(join(dir, name), 'utf8');
+    } catch {
+      // Skip individual unreadable files. A single corrupt entry must
+      // not black-hole the rest of the log.
+      continue;
+    }
+    // Each file is meant to be one line + trailing newline. Trim
+    // trailing whitespace so the join produces a canonical list.
+    const line = raw.replace(/\s+$/, '');
+    if (line.length > 0) lines.push(line);
+  }
+  if (lines.length === 0) return { text: '', absent: true };
+  return { text: lines.join('\n') + '\n', absent: false };
 }
 
 function ensureContextDir(identity: string, root: string): void {
@@ -278,15 +365,18 @@ function trimTrailingPeriod(s: string): string {
 const CONTEXT_USAGE =
   'usage: coord context <verb> [args...]\n\n' +
   '  read [<identity>] [--decisions | --full]\n' +
-  '                           print now.md (default), decisions.md, or both.\n' +
+  '                           print now.md (default), decisions/ log, or both.\n' +
   '                           Absent files print nothing (exit 0) so the\n' +
   '                           SessionStart hook can `cat` unconditionally.\n' +
   '  write [<identity>]       whole-file rewrite of now.md from stdin.\n' +
   '                           Creates the context/ folder if absent.\n' +
   '  append [<identity>] --decision "<text>" --why "<text>"\n' +
-  '                           append one bulleted line to decisions.md.\n' +
-  '                           ISO timestamp stamped at the moment of append.\n\n' +
-  '  Files: ~/.local/state/coord/<identity>/context/{now.md, decisions.md}\n' +
+  '                           append one entry to decisions/ as a new file\n' +
+  '                           named <unix-ms>-<rand6>.md. No file rewrites.\n\n' +
+  '  Layout: ~/.local/state/coord/<identity>/context/\n' +
+  '           ├── now.md            whole-file, last-write-wins snapshot\n' +
+  '           └── decisions/        one file per entry\n' +
+  '               └── <unix-ms>-<rand6>.md\n' +
   '  brief-024 (context/ v1): the in-context-state leg of lossless-restart.\n';
 
 export async function cmdContextCli(

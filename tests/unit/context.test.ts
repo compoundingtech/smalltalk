@@ -98,7 +98,7 @@ describe('cmdContextRead — absent-able', () => {
     expect(r.absent).toBe(true);
   });
 
-  it('--full with one file present is not absent', () => {
+  it('--full with one surface present is not absent', () => {
     mkdirSync(join(coordRoot, 'alice', 'context'));
     writeFileSync(
       join(coordRoot, 'alice', 'context', 'now.md'),
@@ -112,7 +112,25 @@ describe('cmdContextRead — absent-able', () => {
     expect(r.absent).toBe(false);
     expect(r.text).toContain('# now.md');
     expect(r.text).toContain('mid-task');
-    expect(r.text).not.toContain('# decisions.md');
+    expect(r.text).not.toContain('# decisions/');
+  });
+
+  it('--decisions on an empty decisions/ folder returns absent', () => {
+    // Load-bearing for the eval control arm: an empty folder is
+    // functionally equivalent to no folder — the log has zero entries
+    // in both cases, and the caller must see `absent: true` either
+    // way so a rehydrate step can distinguish "no prior context" from
+    // "no decisions recorded yet on this task."
+    mkdirSync(join(coordRoot, 'alice', 'context', 'decisions'), {
+      recursive: true,
+    });
+    const r = cmdContextRead({
+      file: 'decisions',
+      env: ctx.env,
+      coordRoot,
+    });
+    expect(r.text).toBe('');
+    expect(r.absent).toBe(true);
   });
 });
 
@@ -157,14 +175,14 @@ describe('cmdContextWrite', () => {
     ).toBe('second\n');
   });
 
-  it('write does not touch decisions.md', () => {
+  it('write does not touch the decisions/ folder', () => {
     cmdContextWrite({
       body: 'now-only',
       env: ctx.env,
       coordRoot,
     });
     expect(
-      existsSync(join(coordRoot, 'alice', 'context', 'decisions.md'))
+      existsSync(join(coordRoot, 'alice', 'context', 'decisions'))
     ).toBe(false);
   });
 
@@ -182,12 +200,17 @@ describe('cmdContextWrite', () => {
   });
 });
 
-// ─── append: bulleted decision log ───────────────────────────────────────
+// ─── append: one file per decision entry ─────────────────────────────────
 
 describe('cmdContextAppend', () => {
   const ts = '2026-07-02T22:00:00.000Z';
+  // Same-second t1 vs t2 to prove that filename-sort still equals
+  // ISO-time-sort at ms granularity, and that same-ms writes don't
+  // collide (rand6 disambiguates).
+  const tsA = '2026-07-02T22:00:00.100Z';
+  const tsB = '2026-07-02T22:00:00.200Z';
 
-  it('creates decisions.md when absent and adds a bulleted line', () => {
+  it('creates the decisions/ folder + writes one entry file with a bulleted body', () => {
     const r = cmdContextAppend({
       decision: 'pick auto as default',
       why: 'preserves pre-brief-023 behavior',
@@ -195,37 +218,92 @@ describe('cmdContextAppend', () => {
       env: ctx.env,
       coordRoot,
     });
+    // Filename shape: <unix-ms>-<rand6>.md (LAYOUT-004 grammar).
+    expect(r.filename).toMatch(/^\d+-[0-9a-z]{6}\.md$/);
     expect(r.path).toBe(
-      join(coordRoot, 'alice', 'context', 'decisions.md')
+      join(coordRoot, 'alice', 'context', 'decisions', r.filename)
     );
+    // Filename's ms prefix must match the body's ISO timestamp so
+    // filename-sort equals chronological-sort at ms granularity.
+    const [msStr] = r.filename.split('-');
+    expect(Number(msStr)).toBe(Date.parse(ts));
     expect(r.line).toBe(
       `- ${ts} pick auto as default. why: preserves pre-brief-023 behavior.`
     );
     expect(readFileSync(r.path, 'utf8')).toBe(r.line + '\n');
   });
 
-  it('appends a second line without clobbering the first', () => {
-    cmdContextAppend({
+  it('two appends land in TWO distinct files, both surviving (no rewrite, no clobber)', () => {
+    const rA = cmdContextAppend({
       decision: 'first',
       why: 'a',
-      timestamp: ts,
+      timestamp: tsA,
       env: ctx.env,
       coordRoot,
     });
-    cmdContextAppend({
+    const rB = cmdContextAppend({
       decision: 'second',
       why: 'b',
+      timestamp: tsB,
+      env: ctx.env,
+      coordRoot,
+    });
+    expect(rA.filename).not.toBe(rB.filename);
+    const dir = join(coordRoot, 'alice', 'context', 'decisions');
+    const entries = require('node:fs').readdirSync(dir) as string[];
+    expect(entries.length).toBe(2);
+    // Filename-sort order == chronological order (tsA < tsB).
+    const sorted = [...entries].sort();
+    expect(sorted[0]).toBe(rA.filename);
+    expect(sorted[1]).toBe(rB.filename);
+    // Neither file was rewritten by the other's append — bodies are
+    // exactly what each call returned.
+    expect(readFileSync(join(dir, rA.filename), 'utf8')).toBe(rA.line + '\n');
+    expect(readFileSync(join(dir, rB.filename), 'utf8')).toBe(rB.line + '\n');
+  });
+
+  it('two appends with the SAME timestamp collide on ms-prefix but rand6 disambiguates', () => {
+    // Same body-ts → same ms prefix on both files. The random suffix
+    // is what stops them from writing to the same path. This is the
+    // whole reason for the folder-of-files shape: no read-modify-
+    // write, no race, one-shot atomic create.
+    const r1 = cmdContextAppend({
+      decision: 'a',
+      why: 'why-a',
       timestamp: ts,
       env: ctx.env,
       coordRoot,
     });
-    const raw = readFileSync(
-      join(coordRoot, 'alice', 'context', 'decisions.md'),
-      'utf8'
-    );
-    expect(raw).toBe(
-      `- ${ts} first. why: a.\n- ${ts} second. why: b.\n`
-    );
+    const r2 = cmdContextAppend({
+      decision: 'b',
+      why: 'why-b',
+      timestamp: ts,
+      env: ctx.env,
+      coordRoot,
+    });
+    const [ms1] = r1.filename.split('-');
+    const [ms2] = r2.filename.split('-');
+    expect(ms1).toBe(ms2); // same ms
+    expect(r1.filename).not.toBe(r2.filename); // different rand6
+    // Both files present, both readable.
+    expect(readFileSync(r1.path, 'utf8')).toBe(r1.line + '\n');
+    expect(readFileSync(r2.path, 'utf8')).toBe(r2.line + '\n');
+  });
+
+  it('accepts an optional filename test seam for deterministic assertions', () => {
+    // Real callers (CLI, MCP, SDK handle) never set this — but the
+    // seam lets tests assert exact-bytes-on-disk without depending
+    // on rand6() output.
+    const r = cmdContextAppend({
+      decision: 'seeded',
+      why: 'seed',
+      timestamp: ts,
+      filename: '1234567890-aaaaaa.md',
+      env: ctx.env,
+      coordRoot,
+    });
+    expect(r.filename).toBe('1234567890-aaaaaa.md');
+    expect(existsSync(r.path)).toBe(true);
   });
 
   it('strips duplicate trailing period from decision + why', () => {
@@ -287,8 +365,8 @@ describe('cmdContextAppend', () => {
     ).toBe(false);
   });
 
-  it('appended lines survive after a now.md write (independent files)', () => {
-    cmdContextAppend({
+  it('decisions/ entries survive after a now.md write (independent surfaces)', () => {
+    const r = cmdContextAppend({
       decision: 'thing',
       why: 'reason',
       timestamp: ts,
@@ -300,11 +378,23 @@ describe('cmdContextAppend', () => {
       env: ctx.env,
       coordRoot,
     });
-    const raw = readFileSync(
-      join(coordRoot, 'alice', 'context', 'decisions.md'),
-      'utf8'
-    );
-    expect(raw).toContain('thing. why: reason.');
+    expect(readFileSync(r.path, 'utf8')).toContain('thing. why: reason.');
+  });
+
+  it('unparseable timestamp falls back to msNow() for the filename prefix', () => {
+    const r = cmdContextAppend({
+      decision: 'x',
+      why: 'y',
+      timestamp: 'not-a-real-iso-string',
+      env: ctx.env,
+      coordRoot,
+    });
+    // Filename still parses as LAYOUT-004; ms prefix is a real number.
+    expect(r.filename).toMatch(/^\d+-[0-9a-z]{6}\.md$/);
+    const [msStr] = r.filename.split('-');
+    // Not NaN, not the parsed-then-fallback value — an actual current-
+    // clock ms. Loose sanity range: >= 2024-01-01 in ms.
+    expect(Number(msStr)).toBeGreaterThan(1704067200000);
   });
 });
 
@@ -362,9 +452,67 @@ describe('cmdContextRead — after write / append', () => {
     });
     expect(r.text).toContain('# now.md');
     expect(r.text).toContain('now-state');
-    expect(r.text).toContain('# decisions.md');
+    expect(r.text).toContain('# decisions/');
     expect(r.text).toContain('x. why: y.');
     expect(r.absent).toBe(false);
+  });
+
+  it('read --decisions concatenates entries in filename-sort order', () => {
+    // Prove the chronological-order guarantee: earlier timestamps
+    // appear earlier in the concatenated output, regardless of
+    // insertion order.
+    cmdContextAppend({
+      decision: 'later',
+      why: 'y',
+      timestamp: '2026-07-02T02:00:00.000Z',
+      env: ctx.env,
+      coordRoot,
+    });
+    cmdContextAppend({
+      decision: 'earlier',
+      why: 'y',
+      timestamp: '2026-07-02T01:00:00.000Z',
+      env: ctx.env,
+      coordRoot,
+    });
+    const r = cmdContextRead({
+      file: 'decisions',
+      env: ctx.env,
+      coordRoot,
+    });
+    const earlierIdx = r.text.indexOf('earlier');
+    const laterIdx = r.text.indexOf('later');
+    expect(earlierIdx).toBeGreaterThanOrEqual(0);
+    expect(laterIdx).toBeGreaterThan(earlierIdx);
+  });
+
+  it('read --decisions ignores non-.md siblings in the folder', () => {
+    // Someone drops a .DS_Store or a swap file into decisions/ — we
+    // must not treat it as an entry. Same defensive stance as the
+    // message ls layer.
+    cmdContextAppend({
+      decision: 'real entry',
+      why: 'y',
+      timestamp: '2026-07-02T00:00:00.000Z',
+      env: ctx.env,
+      coordRoot,
+    });
+    writeFileSync(
+      join(coordRoot, 'alice', 'context', 'decisions', '.DS_Store'),
+      'binary junk'
+    );
+    writeFileSync(
+      join(coordRoot, 'alice', 'context', 'decisions', 'notes.txt'),
+      'stray text file'
+    );
+    const r = cmdContextRead({
+      file: 'decisions',
+      env: ctx.env,
+      coordRoot,
+    });
+    expect(r.text).toContain('real entry');
+    expect(r.text).not.toContain('binary junk');
+    expect(r.text).not.toContain('stray text file');
   });
 });
 

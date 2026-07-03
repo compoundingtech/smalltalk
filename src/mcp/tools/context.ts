@@ -35,7 +35,7 @@ const readInputShape = {
     .enum(['now', 'decisions', 'full'])
     .optional()
     .describe(
-      "Which file: 'now' (default) prints now.md; 'decisions' prints decisions.md; 'full' prints both with headings."
+      "Which surface: 'now' (default) prints now.md; 'decisions' concatenates entries in context/decisions/ in filename-sort (= chronological) order; 'full' prints both under labeled headings."
     ),
 };
 
@@ -148,13 +148,20 @@ const appendInputShape = {
   identity: z
     .string()
     .optional()
-    .describe('Whose context/decisions.md to append to. Defaults to the server identity.'),
+    .describe(
+      "Whose context/decisions/ folder to append to. Defaults to the server identity."
+    ),
 };
 
 const appendOutputShape = {
   identity: z.string(),
-  path: z.string(),
-  line: z.string().describe('The exact bulleted line that was appended.'),
+  path: z.string().describe(
+    "Absolute path of the newly-written entry file: <coord-root>/<identity>/context/decisions/<unix-ms>-<rand6>.md."
+  ),
+  filename: z.string().describe(
+    "Basename of the entry file (LAYOUT-004 grammar: <unix-ms>-<rand6>.md)."
+  ),
+  line: z.string().describe('The bulleted line stored in the file.'),
 };
 
 function registerContextAppendTool(mcp: McpServer, coord: Coord): void {
@@ -162,9 +169,9 @@ function registerContextAppendTool(mcp: McpServer, coord: Coord): void {
     mcp,
     'context_append',
     {
-      title: 'Append one decision to context/decisions.md',
+      title: 'Append one decision to context/decisions/',
       description:
-        "Equivalent to `coord context append --decision <text> --why <text>`. Adds a bulleted line to decisions.md. Append-only — decisions accumulate so a restarted-you doesn't re-litigate. Lazy-creates the context/ folder.",
+        "Equivalent to `coord context append --decision <text> --why <text>`. Creates a new file `<unix-ms>-<rand6>.md` under `<coord-root>/<identity>/context/decisions/` with one bulleted line. Append semantics = new file per entry — no rewriting an existing log, no clobbering on race. Lazy-creates the context/ + decisions/ folders.",
       inputSchema: appendInputShape,
       outputSchema: appendOutputShape,
     },
@@ -178,8 +185,13 @@ function registerContextAppendTool(mcp: McpServer, coord: Coord): void {
         if (args.identity !== undefined) input.identity = asIdentity(args.identity);
         const r = coord.context.append(input);
         return buildToolResult({
-          summary: `appended: ${r.line}`,
-          value: { identity: r.identity, path: r.path, line: r.line },
+          summary: `appended: ${r.filename}`,
+          value: {
+            identity: r.identity,
+            path: r.path,
+            filename: r.filename,
+            line: r.line,
+          },
         });
       })
   );

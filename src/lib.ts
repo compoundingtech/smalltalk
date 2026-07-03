@@ -326,7 +326,15 @@ export interface Coord {
        *  handle stamps `new Date().toISOString()`. */
       timestamp?: string;
       identity?: Identity;
-    }): { identity: Identity; path: string; line: string };
+    }): {
+      identity: Identity;
+      /** Absolute path of the entry file that was written. */
+      path: string;
+      /** Basename of {@link path}. */
+      filename: Filename;
+      /** The bulleted line stored in the file. */
+      line: string;
+    };
   };
   sync: {
     push(peer: Peer): Promise<SyncResult>;
@@ -684,6 +692,7 @@ export function createCoord(options: CoordOptions): Coord {
       append(input): {
         identity: Identity;
         path: string;
+        filename: Filename;
         line: string;
       } {
         const target = input.identity ?? identity;
@@ -695,7 +704,11 @@ export function createCoord(options: CoordOptions): Coord {
           env: lib_env,
           coordRoot: root,
         });
-        return { ...r, identity: asIdentity(r.identity) };
+        return {
+          ...r,
+          identity: asIdentity(r.identity),
+          filename: asFilename(r.filename),
+        };
       },
     },
 
