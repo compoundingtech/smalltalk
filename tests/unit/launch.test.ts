@@ -658,3 +658,170 @@ describe('cmdLaunch — live-path regression (dry-run bypasses this)', () => {
     expect(sid1).not.toBe(sid2);
   });
 });
+
+// ─── brief-118: settings.local.json with asyncRewake SessionStart ──────
+
+describe('cmdLaunch — .claude/settings.local.json generation (brief-118)', () => {
+  function fakeHooksDir(): string {
+    // A directory containing fake hook scripts. Content is irrelevant —
+    // the launch only records absolute paths in the generated JSON;
+    // Claude Code executes the scripts, not the launcher.
+    const dir = join(scratch, 'fake-hooks');
+    mkdirSync(dir, { recursive: true });
+    for (const name of ['session-start.sh', 'pre-compact.sh', 'stop-failure.sh']) {
+      writeFileSync(join(dir, name), '#!/bin/sh\nexit 0\n');
+    }
+    return dir;
+  }
+
+  it('dry-run preview contains all three hooks pointing at absolute paths', async () => {
+    const hooksDir = fakeHooksDir();
+    const r = await cmdLaunch(baseInput({ identity: 'alice', hooksDir }), ctx);
+    expect(r.claudeSettingsPath).toBe(join(cwd, '.claude', 'settings.local.json'));
+    expect(r.claudeSettingsPreview).not.toBeNull();
+    const preview = r.claudeSettingsPreview!;
+    // The asyncRewake attribute IS the load-bearing bit for #118.
+    expect(preview).toContain('"async": true');
+    expect(preview).toContain('"asyncRewake": true');
+    expect(preview).toContain(`"command": "${join(hooksDir, 'session-start.sh')}"`);
+    expect(preview).toContain(`"command": "${join(hooksDir, 'pre-compact.sh')}"`);
+    expect(preview).toContain(`"command": "${join(hooksDir, 'stop-failure.sh')}"`);
+    // Absolute paths only — Claude Code doesn't resolve ~ or relative.
+    expect(preview).toMatch(/"command":\s*"\/.+session-start\.sh"/);
+    // JSON must parse — a tool that generates unparseable JSON would
+    // silently break every downstream Claude Code run.
+    expect(() => JSON.parse(preview)).not.toThrow();
+  });
+
+  it('asyncRewake is ONLY on the SessionStart hook (not PreCompact or StopFailure)', async () => {
+    const hooksDir = fakeHooksDir();
+    const r = await cmdLaunch(baseInput({ identity: 'alice', hooksDir }), ctx);
+    const parsed = JSON.parse(r.claudeSettingsPreview!);
+    const ss = parsed.hooks.SessionStart[0].hooks[0];
+    const pc = parsed.hooks.PreCompact[0].hooks[0];
+    const sf = parsed.hooks.StopFailure[0].hooks[0];
+    expect(ss.async).toBe(true);
+    expect(ss.asyncRewake).toBe(true);
+    expect(pc.async).toBeUndefined();
+    expect(pc.asyncRewake).toBeUndefined();
+    expect(sf.async).toBeUndefined();
+    expect(sf.asyncRewake).toBeUndefined();
+  });
+
+  it('writes .claude/settings.local.json on live run when absent', async () => {
+    const hooksDir = fakeHooksDir();
+    await cmdLaunch(
+      baseInput({
+        identity: 'george',
+        hooksDir,
+        dryRun: false,
+        captureOnly: true,
+      }),
+      ctx
+    );
+    const path = join(cwd, '.claude', 'settings.local.json');
+    expect(existsSync(path)).toBe(true);
+    const parsed = JSON.parse(readFileSync(path, 'utf8'));
+    expect(parsed.hooks.SessionStart[0].hooks[0].asyncRewake).toBe(true);
+    expect(parsed.hooks.SessionStart[0].hooks[0].command).toBe(
+      join(hooksDir, 'session-start.sh')
+    );
+  });
+
+  it('skip-if-exists: does not overwrite an existing settings.local.json', async () => {
+    const hooksDir = fakeHooksDir();
+    const settingsDir = join(cwd, '.claude');
+    const settingsFile = join(settingsDir, 'settings.local.json');
+    mkdirSync(settingsDir, { recursive: true });
+    writeFileSync(settingsFile, '{"_user_hand_edited": true}\n');
+    await cmdLaunch(
+      baseInput({
+        identity: 'hanna',
+        hooksDir,
+        dryRun: false,
+        captureOnly: true,
+      }),
+      ctx
+    );
+    expect(readFileSync(settingsFile, 'utf8')).toBe(
+      '{"_user_hand_edited": true}\n'
+    );
+  });
+
+  it('--no-hooks / noHooks: true skips generation entirely', async () => {
+    const hooksDir = fakeHooksDir();
+    const r = await cmdLaunch(
+      baseInput({ identity: 'ivan', hooksDir, noHooks: true }),
+      ctx
+    );
+    expect(r.claudeSettingsPath).toBeNull();
+    expect(r.claudeSettingsPreview).toBeNull();
+    // Confirm live-run also skips.
+    await cmdLaunch(
+      baseInput({
+        identity: 'ivan-live',
+        hooksDir,
+        noHooks: true,
+        dryRun: false,
+        captureOnly: true,
+      }),
+      ctx
+    );
+    expect(existsSync(join(cwd, '.claude', 'settings.local.json'))).toBe(false);
+  });
+
+  it('codex harness skips settings.local.json (no Claude Code hooks)', async () => {
+    const hooksDir = fakeHooksDir();
+    const r = await cmdLaunch(
+      baseInput({ harness: 'codex', identity: 'juno', hooksDir }),
+      ctx
+    );
+    expect(r.claudeSettingsPath).toBeNull();
+    expect(r.claudeSettingsPreview).toBeNull();
+  });
+
+  it('missing hooks dir: soft-skip with a stderr notice, launch still succeeds', async () => {
+    const missing = join(scratch, 'no-such-dir');
+    const r = await cmdLaunch(
+      baseInput({ identity: 'kai', hooksDir: missing }),
+      ctx
+    );
+    expect(r.claudeSettingsPath).toBeNull();
+    expect(r.claudeSettingsPreview).toBeNull();
+    expect(stderrBuf).toContain('shipped Claude Code hooks not found on disk');
+  });
+
+  it('CLI --no-hooks flag threads through to noHooks: true', async () => {
+    const hooksDir = fakeHooksDir();
+    // Route through the CLI wrapper; can't pass hooksDir there, so
+    // we rely on --no-hooks to skip generation regardless.
+    void hooksDir;
+    const { cmdLaunchCli } = await import('../../src/commands/launch.ts');
+    await cmdLaunchCli(
+      ['claude', '--identity', 'lena', '--no-hooks', '--dry-run'],
+      ctx
+    );
+    expect(stdoutBuf).not.toContain('claude hooks:');
+    expect(stdoutBuf).not.toContain('settings.local.json');
+  });
+
+  it('dry-run summary surfaces the settings.local.json path + JSON preview', async () => {
+    const hooksDir = fakeHooksDir();
+    // Route through cmdLaunch directly (the CLI wrapper doesn't accept
+    // hooksDir), then verify the preview is well-formed.
+    const r = await cmdLaunch(baseInput({ identity: 'mira', hooksDir }), ctx);
+    expect(r.claudeSettingsPath).toBe(join(cwd, '.claude', 'settings.local.json'));
+    expect(r.claudeSettingsPreview).toMatch(/"asyncRewake":\s*true/);
+  });
+});
+
+// ─── brief-118: help text + hook-file-list stability ───────────────────
+
+describe('cmdLaunch — --no-hooks help text', () => {
+  it('--help mentions the --no-hooks flag', async () => {
+    const { cmdLaunchCli } = await import('../../src/commands/launch.ts');
+    await cmdLaunchCli(['--help'], ctx);
+    expect(stderrBuf).toContain('--no-hooks');
+    expect(stderrBuf).toContain('asyncRewake');
+  });
+});
