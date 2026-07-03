@@ -6,6 +6,42 @@ minor releases until 1.0.
 
 ## Unreleased
 
+### Added (brief-rename-cutover — Phase C sweep scripts under `tools/cutover/`)
+
+Testable rewriters + a directory-walking driver for the per-machine
+step of the coord→st cutover. All pure functions on the file text
+(idempotent by construction) with a thin CLI driver that walks disk
+and writes back atomically (tmp+rename, `<name>.pre-cutover`
+backups on first change).
+
+- **`tools/cutover/rewrite-mcp-json.ts`** — pure rewriter for
+  `.mcp.json`. Renames `mcpServers.coord` → `mcpServers.st`,
+  flips every legal `coord`-bin path suffix
+  (`myobie/coord/bin/coord`, `myobie/smalltalk/bin/coord`,
+  `myobie/coord/bin/st`, `myobie/coord/bin/smalltalk`) to
+  `myobie/smalltalk/bin/st`, renames `env.COORD_IDENTITY` →
+  `env.ST_AGENT` (drops when `ST_AGENT` already set), same for
+  `COORD_ROOT` / `COORD_CONFIG`.
+- **`tools/cutover/rewrite-pty-toml.ts`** — pure rewriter for
+  `pty.toml`. Line-based sweep (no full TOML round-trip →
+  preserves formatting, comments, blank lines) covering
+  `server:coord` → `server:st`, `coord ding` → `st ding` (both
+  with word-boundary guards against `server:coord-web` /
+  `coord dingus` false-matches), and the same env-var
+  rename/drop rules inside `[sessions.<name>.env]` blocks.
+- **`tools/cutover/sweep.ts`** — CLI driver.
+  `node --experimental-strip-types tools/cutover/sweep.ts <path>...
+   [--dry-run] [--kind mcp-json|pty-toml|both] [--depth <n>]
+   [--no-backup]`. `--dry-run` audits without touching disk.
+  Atomic writes; backups on first change (skip-if-exists so
+  re-runs preserve the original pre-cutover snapshot).
+- **31 new unit tests** at
+  `tests/unit/tools/cutover/rewrite-*.test.ts` covering every rule,
+  idempotence, word-boundary guards, malformed input, and the
+  belt-and-suspenders "both `ST_AGENT` and `COORD_IDENTITY` set"
+  drop case.
+- **`tools/cutover/README.md`** documents the rules + usage.
+
 ### Added (brief-rename-cutover Phase P1 — `$ST_CONFIG` env var)
 
 Closes the last `COORD_*` env var that had no `ST_*` equivalent, so

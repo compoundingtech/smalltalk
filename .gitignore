@@ -23,3 +23,6 @@ notes/brief-*.md
 notes/dx-review-*.md
 notes/switchover.md
 notes/agent-onboarding.md
+# Nathan's rule: execution over planning-docs-in-PRs. Local working
+# reference for the coord→st cutover — never committed.
+notes/rename-cutover.md
