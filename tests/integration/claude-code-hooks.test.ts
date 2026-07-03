@@ -32,6 +32,13 @@ const SESSION_START_SH = join(
   'hooks',
   'session-start.sh'
 );
+const PRE_COMPACT_SH = join(
+  REPO_ROOT,
+  'examples',
+  'claude-code',
+  'hooks',
+  'pre-compact.sh'
+);
 const STOP_FAILURE_SH = join(
   REPO_ROOT,
   'examples',
@@ -126,21 +133,385 @@ function runStopFailure(
 }
 
 // ─── session-start.sh ──────────────────────────────────────────────────
-//
-// Tiny script; covered for completeness so a regression on the wake
-// mechanism (echo to stderr + exit 2) is caught early.
 
-describe('claude-code hooks — session-start.sh', () => {
-  it('exits 2 and emits the boot-ritual reminder to stderr', () => {
-    const r = spawnSync('bash', [SESSION_START_SH], {
-      encoding: 'utf8',
-      timeout: 5_000,
-    });
+interface SessionStartRun {
+  status: number;
+  stderr: string;
+  stdout: string;
+}
+
+function runSessionStart(env: NodeJS.ProcessEnv): SessionStartRun {
+  const r = spawnSync('bash', [SESSION_START_SH], {
+    encoding: 'utf8',
+    timeout: 5_000,
+    env: {
+      // Purge parent env of the smalltalk identity vars — a
+      // developer's shell running the tests could otherwise leak
+      // ST_AGENT / COORD_IDENTITY and steer the hook against a real
+      // ~/.local/state path. All identity is per-test.
+      PATH: process.env.PATH,
+      ...env,
+    },
+  });
+  return {
+    status: r.status ?? -1,
+    stderr: typeof r.stderr === 'string' ? r.stderr : '',
+    stdout: typeof r.stdout === 'string' ? r.stdout : '',
+  };
+}
+
+// Set a file's mtime to (now - ageSeconds). Works on BSD stat (darwin)
+// and GNU stat (linux) transparently — `touch -t` is portable enough
+// for our purposes at second granularity, which is what the hook's
+// mtime-based staleness check operates on.
+function ageFile(path: string, ageSeconds: number): void {
+  const d = new Date(Date.now() - ageSeconds * 1000);
+  const yyyy = d.getFullYear().toString();
+  const mm = (d.getMonth() + 1).toString().padStart(2, '0');
+  const dd = d.getDate().toString().padStart(2, '0');
+  const hh = d.getHours().toString().padStart(2, '0');
+  const mi = d.getMinutes().toString().padStart(2, '0');
+  const r = spawnSync(
+    'touch',
+    ['-t', `${yyyy}${mm}${dd}${hh}${mi}`, path],
+    { encoding: 'utf8', timeout: 5_000 }
+  );
+  if (r.status !== 0) {
+    throw new Error(
+      `touch failed: status=${r.status}, stderr=${r.stderr ?? ''}`
+    );
+  }
+}
+
+describe('claude-code hooks — session-start.sh (bare)', () => {
+  it('exits 2 and emits the boot-ritual reminder even with no identity', () => {
+    const r = runSessionStart({});
     expect(r.status).toBe(2);
     expect(r.stderr).toContain('boot ritual');
     expect(r.stderr).toContain('set status to available');
     expect(r.stderr).toContain('drain inbox');
+    expect(r.stderr).not.toContain('<context');
     expect(r.stdout).toBe('');
+  });
+});
+
+// ─── session-start.sh — brief-024 boot-rehydrate ─────────────────────────
+//
+// The hook now inspects $COORD_ROOT/<identity>/context/now.md and, when
+// fresh, injects it as a <context> block before the boot-ritual line.
+// These tests exercise all four branches:
+//   1. no identity → no injection, ritual only (regression guard).
+//   2. identity but no now.md → no injection, ritual only.
+//   3. identity + fresh now.md → injection + ritual.
+//   4. identity + stale now.md (>staleness threshold) → no injection.
+
+describe('claude-code hooks — session-start.sh boot-rehydrate (brief-024)', () => {
+  it('identity set but no context/ → ritual only, no <context> block', () => {
+    mkdirSync(join(scratch, 'alice', 'inbox'), { recursive: true });
+    mkdirSync(join(scratch, 'alice', 'archive'), { recursive: true });
+    const r = runSessionStart({
+      COORD_ROOT: scratch,
+      COORD_IDENTITY: 'alice',
+    });
+    expect(r.status).toBe(2);
+    expect(r.stderr).not.toContain('<context');
+    expect(r.stderr).toContain('boot ritual');
+  });
+
+  it('fresh now.md → injects as <context> block with identity attribute + agent name', () => {
+    mkdirSync(join(scratch, 'alice', 'context'), { recursive: true });
+    writeFileSync(
+      join(scratch, 'alice', 'context', 'now.md'),
+      '# now\ncurrent task: brief-024 hook legs\n'
+    );
+    const r = runSessionStart({
+      COORD_ROOT: scratch,
+      COORD_IDENTITY: 'alice',
+    });
+    expect(r.status).toBe(2);
+    expect(r.stderr).toContain(
+      '<context source="coord/context/now.md" agent="alice">'
+    );
+    expect(r.stderr).toContain('current task: brief-024 hook legs');
+    expect(r.stderr).toContain('</context>');
+    // Ritual reminder is still there — the injection is additive.
+    expect(r.stderr).toContain('boot ritual');
+    // The <context> block must precede the ritual line so the model
+    // reads state before being told to drain the inbox.
+    const ctxIdx = r.stderr.indexOf('<context');
+    const ritualIdx = r.stderr.indexOf('boot ritual');
+    expect(ctxIdx).toBeGreaterThanOrEqual(0);
+    expect(ritualIdx).toBeGreaterThan(ctxIdx);
+  });
+
+  it('injected block is well-formed even when now.md has no trailing newline', () => {
+    mkdirSync(join(scratch, 'alice', 'context'), { recursive: true });
+    // Deliberately omit trailing \n — the hook must add one so </context>
+    // lands on its own line.
+    writeFileSync(
+      join(scratch, 'alice', 'context', 'now.md'),
+      'no-trailing-newline'
+    );
+    const r = runSessionStart({
+      COORD_ROOT: scratch,
+      COORD_IDENTITY: 'alice',
+    });
+    expect(r.stderr).toMatch(/no-trailing-newline\n<\/context>/);
+  });
+
+  it('stale now.md (>24h old) → no injection, ritual only', () => {
+    mkdirSync(join(scratch, 'alice', 'context'), { recursive: true });
+    const nowPath = join(scratch, 'alice', 'context', 'now.md');
+    writeFileSync(nowPath, '# now\ntwo-day-old state\n');
+    // 2 days = 172_800s; well past the 24h (86_400s) default threshold.
+    ageFile(nowPath, 172_800);
+    const r = runSessionStart({
+      COORD_ROOT: scratch,
+      COORD_IDENTITY: 'alice',
+    });
+    expect(r.stderr).not.toContain('<context');
+    expect(r.stderr).not.toContain('two-day-old state');
+    expect(r.stderr).toContain('boot ritual');
+  });
+
+  it('$COORD_REHYDRATE_STALE_S overrides the staleness threshold', () => {
+    mkdirSync(join(scratch, 'alice', 'context'), { recursive: true });
+    const nowPath = join(scratch, 'alice', 'context', 'now.md');
+    writeFileSync(nowPath, '# now\nninety-minute-old state\n');
+    ageFile(nowPath, 5_400); // 90 minutes
+
+    // With the default 24h threshold, 90 min is fresh → injects.
+    const rDefault = runSessionStart({
+      COORD_ROOT: scratch,
+      COORD_IDENTITY: 'alice',
+    });
+    expect(rDefault.stderr).toContain('ninety-minute-old state');
+
+    // With a 60-minute threshold, 90 min is stale → no injection.
+    const rTight = runSessionStart({
+      COORD_ROOT: scratch,
+      COORD_IDENTITY: 'alice',
+      COORD_REHYDRATE_STALE_S: '3600',
+    });
+    expect(rTight.stderr).not.toContain('ninety-minute-old state');
+    expect(rTight.stderr).toContain('boot ritual');
+  });
+
+  it('honors the ST_AGENT / ST_IDENTITY fallback chain for the identity resolve', () => {
+    // The hook's identity resolution mirrors coord's: ST_AGENT >
+    // ST_IDENTITY > COORD_IDENTITY. Prove it by populating alice's
+    // context under ST_AGENT and confirming injection.
+    mkdirSync(join(scratch, 'alice', 'context'), { recursive: true });
+    writeFileSync(
+      join(scratch, 'alice', 'context', 'now.md'),
+      'st-agent path\n'
+    );
+    const r = runSessionStart({
+      COORD_ROOT: scratch,
+      ST_AGENT: 'alice',
+    });
+    expect(r.stderr).toContain('st-agent path');
+  });
+});
+
+// ─── pre-compact.sh — brief-024 flush ────────────────────────────────────
+
+interface PreCompactRun {
+  status: number;
+  stderr: string;
+  stdout: string;
+  calls: string[][];
+}
+
+function runPreCompact(env: NodeJS.ProcessEnv): PreCompactRun {
+  const path = `${shimDir}:${process.env.PATH ?? ''}`;
+  const r = spawnSync('bash', [PRE_COMPACT_SH], {
+    encoding: 'utf8',
+    timeout: 5_000,
+    env: {
+      PATH: path,
+      COORD_SHIM_LOG: shimLog,
+      ...env,
+    },
+  });
+  return {
+    status: r.status ?? -1,
+    stderr: typeof r.stderr === 'string' ? r.stderr : '',
+    stdout: typeof r.stdout === 'string' ? r.stdout : '',
+    calls: readShimCalls(),
+  };
+}
+
+describe('claude-code hooks — pre-compact.sh (brief-024)', () => {
+  it('exits 0 even without any identity env — never blocks compaction', () => {
+    const r = runPreCompact({});
+    // The prime directive.
+    expect(r.status).toBe(0);
+    expect(r.calls).toEqual([]);
+    // stderr must be empty (the hook writes errors to a file, not
+    // stderr, so Claude Code doesn't inject reminders on compaction).
+    expect(r.stderr).toBe('');
+  });
+
+  it('with identity + no now.md → invokes `coord context write` (implicit identity, no positional)', () => {
+    mkdirSync(join(scratch, 'alice', 'inbox'), { recursive: true });
+    mkdirSync(join(scratch, 'alice', 'archive'), { recursive: true });
+    const r = runPreCompact({
+      COORD_ROOT: scratch,
+      COORD_IDENTITY: 'alice',
+    });
+    expect(r.status).toBe(0);
+    expect(r.calls.length).toBe(1);
+    const call = r.calls[0]!;
+    // Load-bearing: no positional identity argument. Passing "$identity"
+    // positionally would trigger the anti-impersonation strict check
+    // in resolveAgent and fail on brand-new agents. We rely on the
+    // env-var fallback path (same chain the hook itself used to
+    // derive $identity) so `context write` takes the implicit
+    // lazy-create branch.
+    expect(call).toEqual(['context', 'write']);
+    // stderr silent — errors go to a file, never stderr.
+    expect(r.stderr).toBe('');
+  });
+
+  it('with FRESH now.md (<5 min) → NO write; model already flushed', () => {
+    mkdirSync(join(scratch, 'alice', 'context'), { recursive: true });
+    writeFileSync(
+      join(scratch, 'alice', 'context', 'now.md'),
+      'model flushed this recently'
+    );
+    // Age 1 minute — well under the 5-minute default threshold.
+    ageFile(join(scratch, 'alice', 'context', 'now.md'), 60);
+    const r = runPreCompact({
+      COORD_ROOT: scratch,
+      COORD_IDENTITY: 'alice',
+    });
+    expect(r.status).toBe(0);
+    // No `coord context write` — the model's fresh flush wins.
+    expect(r.calls).toEqual([]);
+  });
+
+  it('with STALE now.md (>5 min) → writes stub via `coord context write`', () => {
+    mkdirSync(join(scratch, 'alice', 'context'), { recursive: true });
+    writeFileSync(
+      join(scratch, 'alice', 'context', 'now.md'),
+      'old state the model forgot to refresh'
+    );
+    // Age 10 minutes — well past the 5-minute default threshold.
+    ageFile(join(scratch, 'alice', 'context', 'now.md'), 600);
+    const r = runPreCompact({
+      COORD_ROOT: scratch,
+      COORD_IDENTITY: 'alice',
+    });
+    expect(r.status).toBe(0);
+    expect(r.calls.length).toBe(1);
+    expect(r.calls[0]).toEqual(['context', 'write']);
+  });
+
+  it('$COORD_PRECOMPACT_FRESH_S overrides the freshness threshold', () => {
+    mkdirSync(join(scratch, 'alice', 'context'), { recursive: true });
+    writeFileSync(
+      join(scratch, 'alice', 'context', 'now.md'),
+      '30-second-old flush'
+    );
+    ageFile(join(scratch, 'alice', 'context', 'now.md'), 30);
+
+    // Default (300s): 30 s is fresh, skip.
+    const rDefault = runPreCompact({
+      COORD_ROOT: scratch,
+      COORD_IDENTITY: 'alice',
+    });
+    expect(rDefault.calls).toEqual([]);
+
+    // Tighten to 15s: 30 s is stale, must write.
+    const rTight = runPreCompact({
+      COORD_ROOT: scratch,
+      COORD_IDENTITY: 'alice',
+      COORD_PRECOMPACT_FRESH_S: '15',
+    });
+    expect(rTight.calls.length).toBe(1);
+  });
+
+  it('honors ST_AGENT identity chain (same as session-start.sh)', () => {
+    mkdirSync(join(scratch, 'alice', 'inbox'), { recursive: true });
+    mkdirSync(join(scratch, 'alice', 'archive'), { recursive: true });
+    const r = runPreCompact({
+      COORD_ROOT: scratch,
+      ST_AGENT: 'alice',
+    });
+    expect(r.status).toBe(0);
+    expect(r.calls.length).toBe(1);
+    expect(r.calls[0]).toEqual(['context', 'write']);
+  });
+
+  it('$COORD_PRECOMPACT_TIMEOUT_S overrides the write-timeout cap', () => {
+    // Verify the timeout knob is honored: with a very short cap and
+    // a slow shim, the hook must still exit 0 (prime directive) and
+    // must NOT leave a broken pipe or hung child. We can't observe
+    // TIMEOUT_EXIT from the outside without patching the hook, but
+    // the load-bearing assertion is "hook exits 0 no matter what."
+    mkdirSync(join(scratch, 'alice', 'inbox'), { recursive: true });
+    mkdirSync(join(scratch, 'alice', 'archive'), { recursive: true });
+    // Slow shim: 200ms before writing. Fits well within 5s default
+    // and 1s override, but would trip a 0.05s override.
+    writeFileSync(
+      join(shimDir, 'coord'),
+      [
+        '#!/bin/bash',
+        'sleep 0.2',
+        'for arg in "$@"; do printf "%s\\0" "$arg" >> "$COORD_SHIM_LOG"; done',
+        'printf "\\n" >> "$COORD_SHIM_LOG"',
+        'exit 0',
+        '',
+      ].join('\n')
+    );
+    chmodSync(join(shimDir, 'coord'), 0o755);
+    // Tight override — shim's 200ms sleep exceeds this cap.
+    const rTight = runPreCompact({
+      COORD_ROOT: scratch,
+      COORD_IDENTITY: 'alice',
+      COORD_PRECOMPACT_TIMEOUT_S: '0.05',
+    });
+    // Prime directive holds even when the write times out.
+    expect(rTight.status).toBe(0);
+    // Generous override — shim finishes in time; write completes.
+    // Fresh scratch env for a clean shim-call count read.
+    rmSync(shimLog, { force: true });
+    const rLoose = runPreCompact({
+      COORD_ROOT: scratch,
+      COORD_IDENTITY: 'alice',
+      COORD_PRECOMPACT_TIMEOUT_S: '2',
+    });
+    expect(rLoose.status).toBe(0);
+    expect(rLoose.calls.length).toBe(1);
+  });
+
+  it('when the shim exits nonzero, the hook still exits 0 (prime directive)', () => {
+    // Replace the shim with a version that always fails.
+    writeFileSync(
+      join(shimDir, 'coord'),
+      [
+        '#!/bin/bash',
+        '# Test shim — record args to $COORD_SHIM_LOG then FAIL.',
+        'for arg in "$@"; do printf "%s\\0" "$arg" >> "$COORD_SHIM_LOG"; done',
+        'printf "\\n" >> "$COORD_SHIM_LOG"',
+        'echo "coord: simulated failure" >&2',
+        'exit 1',
+        '',
+      ].join('\n')
+    );
+    chmodSync(join(shimDir, 'coord'), 0o755);
+    const r = runPreCompact({
+      COORD_ROOT: scratch,
+      COORD_IDENTITY: 'alice',
+    });
+    // Load-bearing: the hook MUST exit 0 even when the underlying
+    // write fails. Blocking compaction is worse than skipping a flush.
+    expect(r.status).toBe(0);
+    expect(r.calls.length).toBe(1);
+    // Error text should not have reached the hook's stderr — the hook
+    // redirects the write's stderr to a log file.
+    expect(r.stderr).not.toContain('simulated failure');
   });
 });
 

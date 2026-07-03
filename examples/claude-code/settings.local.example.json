@@ -1,6 +1,6 @@
 {
   "$schema": "https://json.schemastore.org/claude-code-settings.json",
-  "_comment": "Per-machine example for wiring coord's session boundary hooks into a Claude Code agent. Drop this at the agent repo's .claude/settings.local.json (gitignored), swap the absolute paths to your coord checkout, and the agent will run the boot ritual on every session boundary + surface API-error wedges to myobie via coord. See README.md in this directory for what each hook does and why both are needed.",
+  "_comment": "Per-machine example for wiring coord's session boundary hooks into a Claude Code agent. Drop this at the agent repo's .claude/settings.local.json (gitignored), swap the absolute paths to your coord checkout, and the agent will run the boot ritual on every session boundary + surface API-error wedges to myobie via coord. See README.md in this directory for what each hook does and why all three are needed.",
   "hooks": {
     "SessionStart": [
       {
@@ -10,6 +10,16 @@
             "async": true,
             "asyncRewake": true,
             "command": "/absolute/path/to/coord/examples/claude-code/hooks/session-start.sh"
+          }
+        ]
+      }
+    ],
+    "PreCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/absolute/path/to/coord/examples/claude-code/hooks/pre-compact.sh"
           }
         ]
       }
