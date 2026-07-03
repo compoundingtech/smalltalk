@@ -6,6 +6,41 @@ minor releases until 1.0.
 
 ## Unreleased
 
+### Added (task #118 — `st launch` generates `.claude/settings.local.json`)
+
+`st launch claude` now writes `<cwd>/.claude/settings.local.json`
+with all three smalltalk hooks pre-wired to absolute paths under
+the shipped `examples/claude-code/hooks/` directory:
+
+- **SessionStart** with `async: true` + `asyncRewake: true` — the
+  brief-020 followup. asyncRewake surfaces the hook's stderr as a
+  system reminder that triggers a turn, so a boot / `--resume` /
+  `/clear` / `/compact` doesn't leave the agent silent with a
+  stale status and an unread inbox. Complements the polling
+  backstop that shipped in brief-020.
+- **PreCompact** (task #33 hook-legs) — stubs `context/now.md`
+  when the model hasn't flushed recently, so boot-rehydrate has
+  something to inject after compaction.
+- **StopFailure** — surfaces API-error wedges to myobie via coord.
+
+Every new claude agent gets these hooks automatically on
+`st launch claude`. Behavior:
+
+- **Skip-if-exists.** An existing `.claude/settings.local.json`
+  is left alone (user may have hand-tuned it). Delete it to
+  re-bootstrap.
+- **`--no-hooks` opts out.** For anyone who wants to wire hooks
+  by hand, or an eval that doesn't need them.
+- **Codex harness skips.** Claude Code hooks are Claude Code
+  specific; codex has its own path via `coord ding`.
+- **Missing shipped `examples/`.** Soft-skip with a one-line
+  stderr notice — launch still succeeds. `examples/claude-code/`
+  is now included in the npm `files` list so installs get the
+  hook scripts by default.
+
+`--dry-run` prints the resolved `.claude/settings.local.json` path
+and the generated JSON body so the operator can audit before spawn.
+
 ### Fixed (task #128 — inbox delivers off-format `.md` as "outside messages")
 
 Before this change, a `.md` file dropped into an agent's `inbox/`

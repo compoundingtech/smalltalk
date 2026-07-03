@@ -28,10 +28,11 @@ import {
   existsSync,
   mkdirSync,
   readFileSync,
+  statSync,
   writeFileSync,
 } from 'node:fs';
 import { homedir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 
 import type { CliContext } from '../cli-context.ts';
 import {
@@ -91,6 +92,22 @@ export interface LaunchInput {
   home?: string | undefined;
   /** Test seam: skip the actual spawn; return the constructed argv. */
   captureOnly?: boolean | undefined;
+  /**
+   * brief-118 test seam: override the location of the shipped Claude
+   * Code hook scripts (`examples/claude-code/hooks/`). Production
+   * resolves this from the smalltalk repo root via
+   * `resolveCoordBinPath()`. Tests set this to a real path so the
+   * generated `settings.local.json` references stable content
+   * regardless of where the smalltalk checkout lives on the runner.
+   */
+  hooksDir?: string | undefined;
+  /**
+   * brief-118: skip generating `.claude/settings.local.json` even for
+   * the claude harness. Codex launches implicitly skip. Off by default
+   * so `st launch claude` opts every new agent into the SessionStart
+   * asyncRewake + PreCompact flush + StopFailure hooks by default.
+   */
+  noHooks?: boolean | undefined;
 
   env: NodeJS.ProcessEnv;
   coordRoot: string;
@@ -120,6 +137,21 @@ export interface LaunchResult {
    * own approval-policy surface).
    */
   permissionMode: string;
+  /**
+   * brief-118: absolute path to `.claude/settings.local.json` when the
+   * launch generated (or would have generated) one. Non-null only for
+   * the claude harness with `noHooks !== true` AND with a resolvable
+   * hooks directory on disk. `null` when we skipped for any reason
+   * (codex harness, `--no-hooks`, `noHooks: true`, or the shipped
+   * `examples/claude-code/hooks/` directory couldn't be located).
+   */
+  claudeSettingsPath: string | null;
+  /**
+   * brief-118: text of the generated `settings.local.json` — populated
+   * on --dry-run so the summary can display it, populated on live
+   * runs iff we actually wrote the file. `null` when we skipped.
+   */
+  claudeSettingsPreview: string | null;
 }
 
 // ─── Helpers ────────────────────────────────────────────────────────────
@@ -289,6 +321,99 @@ function buildPtyToml(opts: {
   return lines.join('\n') + '\n';
 }
 
+// ─── Claude Code settings.local.json (brief-118) ───────────────────────
+
+/**
+ * Resolve the absolute path to the shipped Claude Code hooks directory
+ * (`<smalltalk-root>/examples/claude-code/hooks/`). Uses the same
+ * package-json walk as {@link resolveCoordBinPath}: we know that path
+ * gives `<smalltalk-root>/bin/coord`, so the hooks live at
+ * `<smalltalk-root>/examples/claude-code/hooks/`.
+ *
+ * Returns `null` when either the coord binary path can't be resolved
+ * (e.g. degenerate PATH), or the derived hooks directory doesn't
+ * exist on disk (e.g. an npm install that didn't ship `examples/`).
+ * A null return is a soft skip — the launch still succeeds; the
+ * caller just doesn't write `settings.local.json`.
+ */
+export function resolveClaudeHooksDir(): string | null {
+  let coordBin: string;
+  try {
+    coordBin = resolveCoordBinPath();
+  } catch {
+    return null;
+  }
+  const smalltalkRoot = dirname(dirname(coordBin));
+  const hooksDir = join(smalltalkRoot, 'examples', 'claude-code', 'hooks');
+  try {
+    if (statSync(hooksDir).isDirectory()) return hooksDir;
+  } catch {
+    // hooks dir absent — soft skip.
+  }
+  return null;
+}
+
+/**
+ * Build the `.claude/settings.local.json` content wiring the three
+ * smalltalk hooks:
+ *   - **SessionStart** with `async: true` + `asyncRewake: true` so
+ *     Claude Code surfaces the hook's stderr as a system reminder
+ *     that triggers a turn — closes the "session boots but nothing
+ *     wakes the agent to run the boot ritual" gap the polling
+ *     backstop (brief-020) partially addressed. asyncRewake IS the
+ *     complementary boot leg to the polling backstop.
+ *   - **PreCompact** (task #33 hook-legs) — writes a stub to
+ *     `context/now.md` if the model hasn't recently flushed, so
+ *     boot-rehydrate has something to inject after compaction.
+ *   - **StopFailure** — surfaces API-error wedges to myobie via
+ *     coord so a quiet, wedged session doesn't go unnoticed.
+ *
+ * All three point at the shipped scripts under
+ * `<smalltalk-root>/examples/claude-code/hooks/` via absolute paths.
+ * Claude Code does NOT resolve `~` or repo-relative paths in hook
+ * commands — that's why we bake the absolute path here.
+ */
+export function buildClaudeSettings(hooksDir: string): string {
+  const settings = {
+    $schema: 'https://json.schemastore.org/claude-code-settings.json',
+    hooks: {
+      SessionStart: [
+        {
+          hooks: [
+            {
+              type: 'command',
+              async: true,
+              asyncRewake: true,
+              command: join(hooksDir, 'session-start.sh'),
+            },
+          ],
+        },
+      ],
+      PreCompact: [
+        {
+          hooks: [
+            {
+              type: 'command',
+              command: join(hooksDir, 'pre-compact.sh'),
+            },
+          ],
+        },
+      ],
+      StopFailure: [
+        {
+          hooks: [
+            {
+              type: 'command',
+              command: join(hooksDir, 'stop-failure.sh'),
+            },
+          ],
+        },
+      ],
+    },
+  };
+  return `${JSON.stringify(settings, null, 2)}\n`;
+}
+
 function resolveRepoPrefix(cwd: string): string {
   // Fallback: basename of cwd, sanitized to agent grammar (lowercase,
   // hyphens, periods). This mirrors the pty prefix convention Nathan
@@ -446,6 +571,50 @@ export async function cmdLaunch(
     });
   }
 
+  // ─── Claude settings.local.json (brief-118 asyncRewake wiring) ─────
+  // Only for the claude harness, and only when `--no-hooks` wasn't
+  // passed. Skip-if-exists convention: if `.claude/settings.local.json`
+  // already exists we leave it alone — user may have hand-tuned it and
+  // silently overwriting would erase their customizations. Under
+  // --dry-run we still populate the preview so the summary can show
+  // what would have been written.
+  let claudeSettingsPath: string | null = null;
+  let claudeSettingsPreview: string | null = null;
+  if (harness === 'claude' && input.noHooks !== true) {
+    let hooksDir: string | null;
+    if (input.hooksDir !== undefined) {
+      // Explicit override — verify the path still exists so a stale
+      // seam value produces the same soft-skip as the auto-resolution
+      // failure path. Prevents baking a bad absolute path into the
+      // generated JSON.
+      hooksDir = existsSync(input.hooksDir) ? input.hooksDir : null;
+    } else {
+      hooksDir = resolveClaudeHooksDir();
+    }
+    if (hooksDir !== null) {
+      const settingsDir = join(cwd, '.claude');
+      const settingsFile = join(settingsDir, 'settings.local.json');
+      claudeSettingsPath = settingsFile;
+      claudeSettingsPreview = buildClaudeSettings(hooksDir);
+      if (!input.dryRun && !existsSync(settingsFile)) {
+        mkdirSync(settingsDir, { recursive: true });
+        writeFileSync(settingsFile, claudeSettingsPreview);
+      }
+      // else: skip-if-exists. User can `rm .claude/settings.local.json`
+      // to re-bootstrap, or edit it in place if they only want to
+      // tweak the hook list.
+    } else {
+      // Hooks dir absent (npm install without `examples/`, or degenerate
+      // PATH). Soft skip: launch still works, agent just doesn't get
+      // the boot hooks — same as pre-brief-118 behavior. Emit a hint
+      // so the operator can wire hooks by hand if they want.
+      ctx.stderr(
+        `[smalltalk launch] shipped Claude Code hooks not found on disk; ` +
+          `skipping .claude/settings.local.json (see examples/claude-code/settings.local.example.json)\n`
+      );
+    }
+  }
+
   // ─── Dry-run / captureOnly short-circuit ───────────────────────────
   if (input.dryRun === true || input.captureOnly === true) {
     return {
@@ -460,6 +629,8 @@ export async function cmdLaunch(
       claudeSessionIdPath,
       ptyTomlPreview,
       permissionMode,
+      claudeSettingsPath,
+      claudeSettingsPreview,
     };
   }
 
@@ -527,6 +698,8 @@ export async function cmdLaunch(
     claudeSessionIdPath,
     ptyTomlPreview,
     permissionMode,
+    claudeSettingsPath,
+    claudeSettingsPreview,
   };
 }
 
@@ -546,6 +719,9 @@ const LAUNCH_HELP =
   '  --no-channel            Skip the --channel MCP wiring. Default for\n' +
   '                          claude is channel-on; for codex is channel-off.\n' +
   '  --no-pty                Don\'t register via pty even if it is on PATH.\n' +
+  '  --no-hooks              Don\'t generate .claude/settings.local.json (the\n' +
+  '                          SessionStart+asyncRewake / PreCompact / StopFailure\n' +
+  '                          boot hooks). Claude launches opt in by default.\n' +
   '  --session-name <name>   Override pty session key. Default: harness name.\n' +
   '  --permission-mode <mode>\n' +
   '                          Claude `--permission-mode` value. Threaded into\n' +
@@ -558,8 +734,9 @@ const LAUNCH_HELP =
   '  --dry-run               Print what would happen; touch nothing.\n' +
   '  --print                 Alias for --dry-run.\n\n' +
   '  Examples:\n' +
-  '    st launch claude                              # anon identity, channel mode\n' +
+  '    st launch claude                              # anon identity, channel mode + boot hooks\n' +
   '    st launch claude --identity alice             # persistent identity\n' +
+  '    st launch claude --no-hooks                   # skip .claude/settings.local.json\n' +
   '    st launch codex                               # + coord ding sidecar\n' +
   '    st launch claude --model glm-5.2:cloud        # via ollama, unattended\n' +
   '    st launch claude --permission-mode bypassPermissions   # eval-spinner posture\n' +
@@ -574,6 +751,7 @@ export async function cmdLaunchCli(
   let model: string | undefined;
   let noPty = false;
   let noChannel = false;
+  let noHooks = false;
   let sessionName: string | undefined;
   let permissionMode: string | undefined;
   let dryRun = false;
@@ -595,6 +773,9 @@ export async function cmdLaunchCli(
         break;
       case '--no-channel':
         noChannel = true;
+        break;
+      case '--no-hooks':
+        noHooks = true;
         break;
       case '--session-name':
         sessionName = args[++i];
@@ -632,6 +813,7 @@ export async function cmdLaunchCli(
       ...(model !== undefined && { model }),
       noPty,
       noChannel,
+      noHooks,
       ...(sessionName !== undefined && { sessionName }),
       ...(permissionMode !== undefined && { permissionMode }),
       dryRun,
@@ -659,12 +841,20 @@ export async function cmdLaunchCli(
     if (r.claudeSessionIdPath !== null) {
       ctx.stdout(`session id:     ${r.claudeSessionIdPath}\n`);
     }
+    if (r.claudeSettingsPath !== null) {
+      ctx.stdout(`claude hooks:   ${r.claudeSettingsPath}\n`);
+    }
     ctx.stdout(`\nharness argv:\n  ${r.argv.join(' ')}\n`);
     if (r.ptyTomlPreview !== null) {
       const heading = r.usedPty
         ? `\npty.toml (would write to ${r.ptyTomlPath}):`
         : `\npty.toml (pty not on PATH; write this file by hand if you want it):`;
       ctx.stdout(`${heading}\n${r.ptyTomlPreview}`);
+    }
+    if (r.claudeSettingsPreview !== null && r.claudeSettingsPath !== null) {
+      ctx.stdout(
+        `\n.claude/settings.local.json (would write to ${r.claudeSettingsPath}):\n${r.claudeSettingsPreview}`
+      );
     }
     return 0;
   }
