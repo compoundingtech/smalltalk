@@ -208,6 +208,127 @@ describe('cmdLaunch — command argv', () => {
   });
 });
 
+// ─── brief-023: --permission-mode ─────────────────────────────────────
+
+describe('cmdLaunch — --permission-mode (brief-023)', () => {
+  // Sanity anchor: no flag, no env → auto in BOTH bootstrap and main
+  // argv. Guards against a future refactor that changes the default
+  // silently, which would demote eval-spinner posture back to `auto`
+  // for callers that had been relying on the flag override.
+  it('defaults to auto when neither flag nor env is set', async () => {
+    const r = await cmdLaunch(
+      baseInput({ harness: 'claude', identity: 'alice' }),
+      ctx
+    );
+    expect(r.permissionMode).toBe('auto');
+    // Main argv has exactly one --permission-mode + auto pair.
+    const idx = r.argv.indexOf('--permission-mode');
+    expect(idx).toBeGreaterThanOrEqual(0);
+    expect(r.argv[idx + 1]).toBe('auto');
+  });
+
+  it('explicit --permission-mode overrides everything', async () => {
+    const r = await cmdLaunch(
+      baseInput({
+        harness: 'claude',
+        identity: 'alice',
+        permissionMode: 'bypassPermissions',
+        env: { CLAUDE_PERMISSION_MODE: 'plan' },
+      }),
+      ctx
+    );
+    expect(r.permissionMode).toBe('bypassPermissions');
+    const idx = r.argv.indexOf('--permission-mode');
+    expect(r.argv[idx + 1]).toBe('bypassPermissions');
+  });
+
+  it('CLAUDE_PERMISSION_MODE env kicks in when the flag is absent', async () => {
+    const r = await cmdLaunch(
+      baseInput({
+        harness: 'claude',
+        identity: 'alice',
+        env: { CLAUDE_PERMISSION_MODE: 'bypassPermissions' },
+      }),
+      ctx
+    );
+    expect(r.permissionMode).toBe('bypassPermissions');
+    const idx = r.argv.indexOf('--permission-mode');
+    expect(r.argv[idx + 1]).toBe('bypassPermissions');
+  });
+
+  it('empty --permission-mode value falls through to env, then default', async () => {
+    // Guard against argv shape `--permission-mode ""` (an operator
+    // wired it through a variable that expanded to empty). We treat
+    // empty like "unset" so the env / default tier still resolves,
+    // rather than passing "" to claude which would reject it.
+    const r = await cmdLaunch(
+      baseInput({
+        harness: 'claude',
+        identity: 'alice',
+        permissionMode: '',
+        env: {},
+      }),
+      ctx
+    );
+    expect(r.permissionMode).toBe('auto');
+  });
+
+  it('mode is baked into the generated pty.toml command line', async () => {
+    const r = await cmdLaunch(
+      baseInput({
+        harness: 'claude',
+        identity: 'alice',
+        permissionMode: 'bypassPermissions',
+      }),
+      ctx
+    );
+    // pty.toml quotes the shell line; we don't reconstruct it here,
+    // just assert the resolved mode appears in the emitted preview.
+    expect(r.ptyTomlPreview).toContain('--permission-mode bypassPermissions');
+    expect(r.ptyTomlPreview).not.toContain('--permission-mode auto');
+  });
+
+  it('codex launches accept the flag silently (surface has no effect)', async () => {
+    // The mode resolves in `LaunchResult` regardless of harness so the
+    // dry-run summary is consistent, but the codex argv is untouched.
+    const r = await cmdLaunch(
+      baseInput({
+        harness: 'codex',
+        identity: 'alice',
+        permissionMode: 'bypassPermissions',
+      }),
+      ctx
+    );
+    expect(r.permissionMode).toBe('bypassPermissions');
+    expect(r.argv).not.toContain('--permission-mode');
+  });
+
+  it('CLI wrapper: --permission-mode flag appears in the dry-run summary', async () => {
+    const { cmdLaunchCli } = await import('../../src/commands/launch.ts');
+    const rc = await cmdLaunchCli(
+      [
+        'claude',
+        '--identity',
+        'alice',
+        '--permission-mode',
+        'bypassPermissions',
+        '--dry-run',
+      ],
+      ctx
+    );
+    expect(rc).toBe(0);
+    expect(stdoutBuf).toContain('permission-mode: bypassPermissions');
+    // And still shows up in the harness argv line.
+    expect(stdoutBuf).toContain('--permission-mode bypassPermissions');
+  });
+
+  it('CLI wrapper: default summary shows permission-mode: auto', async () => {
+    const { cmdLaunchCli } = await import('../../src/commands/launch.ts');
+    await cmdLaunchCli(['claude', '--identity', 'alice', '--dry-run'], ctx);
+    expect(stdoutBuf).toContain('permission-mode: auto');
+  });
+});
+
 // ─── pty.toml content ─────────────────────────────────────────────────
 
 describe('cmdLaunch — pty.toml generation', () => {
