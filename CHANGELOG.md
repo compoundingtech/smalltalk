@@ -6,6 +6,35 @@ minor releases until 1.0.
 
 ## Unreleased
 
+### Added (brief-022 — `st launch --persona <path>` surgical persona linking)
+
+`st launch <harness>` now optionally installs a persona alongside the
+harness bootstrap. Given `--persona <path>`:
+
+- Copies the source file to `<cwd>/PERSONA.md`.
+- Surgically edits the harness entry file — `CLAUDE.md` (claude) or
+  `AGENTS.md` (codex) — to append `@PERSONA.md` on its own line. If the
+  file already exists, its content is preserved byte-for-byte; only
+  the import line is added, and only when not already present.
+- Git-excludes `PERSONA.md`, `.mcp.json`, `.claude-session-id`,
+  `.codex-session-id`, `pty.toml`, and the entry file (only when we
+  created it) via `.git/info/exclude`. A pre-existing repo CLAUDE.md
+  is never added to the ignore list.
+- `--dry-run` prints the exact plan (copy target, entry-file action,
+  git-exclude entries) without touching disk.
+
+Verified 2026-07-02 that codex 0.142.4 honors `@PERSONA.md` in
+`AGENTS.md` (empirical test: agent replied with persona-defined value
+when asked; directory listing in the transcript showed `AGENTS.md` and
+`PERSONA.md` were both read). Both harnesses use the same mechanism —
+same code path in launch.ts, only the entry-file name differs.
+
+12 new unit tests cover: copy target, entry-file create-vs-append,
+idempotence (re-append is a no-op), trailing-newline-less existing
+files, git-exclude entries + dedup, entry-file exclusion decision
+(never for pre-existing files), non-git-repo warning, missing source
+error, and dry-run planning.
+
 ### Added (brief-rename-cutover — Phase C sweep scripts under `tools/cutover/`)
 
 Testable rewriters + a directory-walking driver for the per-machine

@@ -825,3 +825,284 @@ describe('cmdLaunch — --no-hooks help text', () => {
     expect(stderrBuf).toContain('asyncRewake');
   });
 });
+
+// ─── brief-022: --persona persona install ───────────────────────────────
+
+describe('cmdLaunch — --persona (brief-022)', () => {
+  function makeGitRepo(dir: string): void {
+    // Enough to satisfy readGitExclude — just the .git dir and info/.
+    // We don't need an actual git binary; the launch code only reads
+    // .git/info/exclude and appends to it.
+    mkdirSync(join(dir, '.git', 'info'), { recursive: true });
+  }
+
+  function personaFixture(text = '# Persona\n\nHello.\n'): string {
+    const path = join(scratch, 'persona.md');
+    writeFileSync(path, text);
+    return path;
+  }
+
+  it('returns persona=null when --persona is not passed', async () => {
+    makeGitRepo(cwd);
+    const r = await cmdLaunch(baseInput({ identity: 'a' }), ctx);
+    expect(r.persona).toBeNull();
+  });
+
+  it('claude: copies persona to PERSONA.md and creates CLAUDE.md with @PERSONA.md when missing', async () => {
+    makeGitRepo(cwd);
+    const src = personaFixture('# You are the test agent\n');
+    const r = await cmdLaunch(
+      baseInput({
+        harness: 'claude',
+        identity: 'a',
+        persona: src,
+        dryRun: false,
+        captureOnly: true,
+      }),
+      ctx
+    );
+    expect(r.persona).not.toBeNull();
+    expect(r.persona!.entryFile).toBe('CLAUDE.md');
+    expect(r.persona!.entryFileCreated).toBe(true);
+    expect(r.persona!.importLineAppended).toBe(true);
+
+    const copied = readFileSync(join(cwd, 'PERSONA.md'), 'utf8');
+    expect(copied).toBe('# You are the test agent\n');
+
+    const entry = readFileSync(join(cwd, 'CLAUDE.md'), 'utf8');
+    expect(entry).toBe('@PERSONA.md\n');
+  });
+
+  it('codex: same shape but writes AGENTS.md', async () => {
+    makeGitRepo(cwd);
+    const src = personaFixture();
+    const r = await cmdLaunch(
+      baseInput({
+        harness: 'codex',
+        identity: 'a',
+        persona: src,
+        dryRun: false,
+        captureOnly: true,
+      }),
+      ctx
+    );
+    expect(r.persona!.entryFile).toBe('AGENTS.md');
+    expect(existsSync(join(cwd, 'AGENTS.md'))).toBe(true);
+    expect(existsSync(join(cwd, 'CLAUDE.md'))).toBe(false);
+    const entry = readFileSync(join(cwd, 'AGENTS.md'), 'utf8');
+    expect(entry).toBe('@PERSONA.md\n');
+  });
+
+  it('preserves an existing CLAUDE.md: appends @PERSONA.md without clobbering', async () => {
+    makeGitRepo(cwd);
+    const existing =
+      '# Project notes\n\nWe use TypeScript strict mode everywhere.\n';
+    writeFileSync(join(cwd, 'CLAUDE.md'), existing);
+    const src = personaFixture();
+    const r = await cmdLaunch(
+      baseInput({
+        harness: 'claude',
+        identity: 'a',
+        persona: src,
+        dryRun: false,
+        captureOnly: true,
+      }),
+      ctx
+    );
+    expect(r.persona!.entryFileCreated).toBe(false);
+    expect(r.persona!.importLineAppended).toBe(true);
+    const entry = readFileSync(join(cwd, 'CLAUDE.md'), 'utf8');
+    // Existing content intact, import appended after.
+    expect(entry.startsWith(existing)).toBe(true);
+    expect(entry).toContain('@PERSONA.md');
+    // The import line must be on its own line (matching the pattern
+    // we detect for idempotence).
+    expect(/^@PERSONA\.md$/m.test(entry)).toBe(true);
+  });
+
+  it('idempotent: does not re-append @PERSONA.md when already present', async () => {
+    makeGitRepo(cwd);
+    const existing =
+      '# Project\n\n@PERSONA.md\n\nMore project content.\n';
+    writeFileSync(join(cwd, 'CLAUDE.md'), existing);
+    const src = personaFixture();
+    const r = await cmdLaunch(
+      baseInput({
+        harness: 'claude',
+        identity: 'a',
+        persona: src,
+        dryRun: false,
+        captureOnly: true,
+      }),
+      ctx
+    );
+    expect(r.persona!.entryFileCreated).toBe(false);
+    expect(r.persona!.importLineAppended).toBe(false);
+    // Content must be byte-identical.
+    expect(readFileSync(join(cwd, 'CLAUDE.md'), 'utf8')).toBe(existing);
+  });
+
+  it('handles an existing CLAUDE.md that does not end in a newline', async () => {
+    makeGitRepo(cwd);
+    const existing = '# Project (no trailing newline)';
+    writeFileSync(join(cwd, 'CLAUDE.md'), existing);
+    const src = personaFixture();
+    await cmdLaunch(
+      baseInput({
+        harness: 'claude',
+        identity: 'a',
+        persona: src,
+        dryRun: false,
+        captureOnly: true,
+      }),
+      ctx
+    );
+    const entry = readFileSync(join(cwd, 'CLAUDE.md'), 'utf8');
+    // Original bytes preserved, separator + import added.
+    expect(entry).toBe('# Project (no trailing newline)\n@PERSONA.md\n');
+  });
+
+  it('git-exclude: adds PERSONA.md + .mcp.json + .claude-session-id + .codex-session-id + pty.toml + entryFile (when we created it)', async () => {
+    makeGitRepo(cwd);
+    const src = personaFixture();
+    const r = await cmdLaunch(
+      baseInput({
+        harness: 'claude',
+        identity: 'a',
+        persona: src,
+        dryRun: false,
+        captureOnly: true,
+      }),
+      ctx
+    );
+    const excludeText = readFileSync(
+      join(cwd, '.git', 'info', 'exclude'),
+      'utf8'
+    );
+    expect(excludeText).toContain('PERSONA.md');
+    expect(excludeText).toContain('.mcp.json');
+    expect(excludeText).toContain('.claude-session-id');
+    expect(excludeText).toContain('.codex-session-id');
+    expect(excludeText).toContain('pty.toml');
+    expect(excludeText).toContain('CLAUDE.md');
+    expect(r.persona!.gitExcludeEntriesAdded).toContain('CLAUDE.md');
+  });
+
+  it('git-exclude: does NOT add CLAUDE.md when it pre-existed', async () => {
+    makeGitRepo(cwd);
+    writeFileSync(join(cwd, 'CLAUDE.md'), '# Real repo CLAUDE.md\n');
+    const src = personaFixture();
+    const r = await cmdLaunch(
+      baseInput({
+        harness: 'claude',
+        identity: 'a',
+        persona: src,
+        dryRun: false,
+        captureOnly: true,
+      }),
+      ctx
+    );
+    const excludeText = readFileSync(
+      join(cwd, '.git', 'info', 'exclude'),
+      'utf8'
+    );
+    expect(excludeText).toContain('PERSONA.md');
+    expect(excludeText).not.toContain('\nCLAUDE.md\n');
+    expect(r.persona!.gitExcludeEntriesAdded).not.toContain('CLAUDE.md');
+    // Entry file itself is untouched (except the appended import).
+    const entry = readFileSync(join(cwd, 'CLAUDE.md'), 'utf8');
+    expect(entry.startsWith('# Real repo CLAUDE.md\n')).toBe(true);
+  });
+
+  it('git-exclude: dedupes against existing entries', async () => {
+    makeGitRepo(cwd);
+    // Pre-seed the exclude file with a few of the expected entries.
+    const preExisting = '# user notes\n.mcp.json\nPERSONA.md\n';
+    writeFileSync(
+      join(cwd, '.git', 'info', 'exclude'),
+      preExisting
+    );
+    const src = personaFixture();
+    const r = await cmdLaunch(
+      baseInput({
+        harness: 'claude',
+        identity: 'a',
+        persona: src,
+        dryRun: false,
+        captureOnly: true,
+      }),
+      ctx
+    );
+    expect(r.persona!.gitExcludeEntriesAdded).not.toContain('PERSONA.md');
+    expect(r.persona!.gitExcludeEntriesAdded).not.toContain('.mcp.json');
+    // But the others were still added.
+    expect(r.persona!.gitExcludeEntriesAdded).toContain('pty.toml');
+    const excludeText = readFileSync(
+      join(cwd, '.git', 'info', 'exclude'),
+      'utf8'
+    );
+    // Original content preserved.
+    expect(excludeText.startsWith(preExisting)).toBe(true);
+  });
+
+  it('non-git cwd: warns and still installs persona files', async () => {
+    // No .git dir.
+    const src = personaFixture();
+    const r = await cmdLaunch(
+      baseInput({
+        harness: 'claude',
+        identity: 'a',
+        persona: src,
+        dryRun: false,
+        captureOnly: true,
+      }),
+      ctx
+    );
+    expect(r.persona!.gitRepoAbsent).toBe(true);
+    expect(r.persona!.gitExcludeEntriesAdded).toHaveLength(0);
+    // Files still installed.
+    expect(existsSync(join(cwd, 'PERSONA.md'))).toBe(true);
+    expect(existsSync(join(cwd, 'CLAUDE.md'))).toBe(true);
+    // Warning surfaced on stderr.
+    expect(stderrBuf).toMatch(/not a git repo/);
+  });
+
+  it('missing --persona source: throws helpful error naming the flag + path', async () => {
+    makeGitRepo(cwd);
+    const bad = join(scratch, 'does-not-exist.md');
+    await expect(
+      cmdLaunch(
+        baseInput({
+          harness: 'claude',
+          identity: 'a',
+          persona: bad,
+          dryRun: false,
+          captureOnly: true,
+        }),
+        ctx
+      )
+    ).rejects.toThrow(/--persona.*could not read persona file/);
+  });
+
+  it('dry-run: reports the plan but touches nothing on disk', async () => {
+    makeGitRepo(cwd);
+    const src = personaFixture();
+    const r = await cmdLaunch(
+      baseInput({
+        harness: 'claude',
+        identity: 'a',
+        persona: src,
+        dryRun: true,
+      }),
+      ctx
+    );
+    expect(r.persona).not.toBeNull();
+    expect(r.persona!.importLineAppended).toBe(true);
+    expect(r.persona!.entryFileCreated).toBe(true);
+    expect(r.persona!.gitExcludeEntriesAdded.length).toBeGreaterThan(0);
+    // Nothing on disk.
+    expect(existsSync(join(cwd, 'PERSONA.md'))).toBe(false);
+    expect(existsSync(join(cwd, 'CLAUDE.md'))).toBe(false);
+    expect(existsSync(join(cwd, '.git', 'info', 'exclude'))).toBe(false);
+  });
+});
