@@ -172,6 +172,37 @@ export function validFilename(s: string): boolean {
   return FILENAME_RE.test(s);
 }
 
+/**
+ * A `.md` file that landed in an inbox but does NOT match the
+ * canonical LAYOUT-004 `<unix-ms>-<rand6>.md` grammar. Delivered as
+ * an "outside message" instead of silently dropped so a collaborator
+ * unfamiliar with the naming convention can still reach an agent.
+ *
+ * Accepted iff: ends in `.md`, is a plain basename (no path
+ * separators / traversal / dotfile), and is not a prefix-sibling
+ * attachment of a canonical `.md` (those already have a paired
+ * canonical `.md` responsible for delivery).
+ */
+export function validOutsideFilename(s: string): boolean {
+  if (!s.endsWith('.md')) return false;
+  if (s.length <= 3) return false; // '.md' alone or shorter
+  if (validFilename(s)) return false; // canonical LAYOUT-004
+  if (s.includes('/') || s.includes('\\')) return false;
+  if (s.startsWith('.')) return false; // hidden files / dot-prefixed
+  if (prefixOf(s) !== null) return false; // attachment sidecar of a canonical .md
+  return true;
+}
+
+/**
+ * The union: filenames the channel-watcher / ls / read / archive
+ * paths accept in an inbox. Canonical LAYOUT-004 OR outside `.md`.
+ * Callers that need strict canonical semantics (timestamp derivation,
+ * thread walking, sweep pairing) must keep using {@link validFilename}.
+ */
+export function validDeliverableFilename(s: string): boolean {
+  return validFilename(s) || validOutsideFilename(s);
+}
+
 export function filenameTimestamp(s: string): number {
   if (!validFilename(s)) {
     throw new InvalidFilenameError(s);

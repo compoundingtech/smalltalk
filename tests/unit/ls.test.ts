@@ -231,17 +231,53 @@ describe('cmdLs — identity resolution', () => {
 // ─── Filename grammar gating ────────────────────────────────────────────
 
 describe('cmdLs — non-grammar files in the inbox', () => {
-  it('skips files that do not match the filename grammar', () => {
+  it('non-.md files (README, dotfiles, attachment sidecars) are still skipped', () => {
     setupIdentity('bob');
     writeMsg('bob', '1714826789010-aaaaaa.md', 'alice');
-    writeFileSync(join(coordRoot, 'bob', 'inbox', 'notes.md'), 'stray');
     writeFileSync(join(coordRoot, 'bob', 'inbox', 'README'), 'stray');
+    writeFileSync(join(coordRoot, 'bob', 'inbox', '.hidden.md'), 'dotfile');
+    // Attachment sidecar of a canonical .md — reserved for the canonical.
     writeFileSync(
-      join(coordRoot, 'bob', 'inbox', '1714826789010-myobie-aaaaaa.md'),
-      'legacy'
+      join(coordRoot, 'bob', 'inbox', '1714826789010-aaaaaa.subject.md'),
+      'sidecar'
     );
     const r = cmdLs(baseInput());
     expect(r.matches).toEqual(['1714826789010-aaaaaa.md']);
+  });
+
+  // Task #128: off-format `.md` files that landed in the inbox are
+  // now surfaced as "outside" messages rather than silently dropped.
+  it('outside `.md` files are listed alongside canonical messages', () => {
+    setupIdentity('bob');
+    writeMsg('bob', '1714826789010-aaaaaa.md', 'alice');
+    writeFileSync(join(coordRoot, 'bob', 'inbox', 'notes.md'), 'stray');
+    writeFileSync(
+      join(coordRoot, 'bob', 'inbox', '1714826789010-myobie-aaaaaa.md'),
+      'legacy-shape'
+    );
+    const r = cmdLs(baseInput());
+    // Sort order is by basename (alphabetical) — that's what readdir
+    // gives us, and outside filenames have no LAYOUT prefix to sort by.
+    expect(r.matches).toContain('1714826789010-aaaaaa.md');
+    expect(r.matches).toContain('notes.md');
+    expect(r.matches).toContain('1714826789010-myobie-aaaaaa.md');
+    expect(r.matches).toHaveLength(3);
+  });
+
+  it('withMeta stamps outside .md files with from="outside" and empty projections', () => {
+    setupIdentity('bob');
+    writeFileSync(join(coordRoot, 'bob', 'inbox', 'hello.md'), 'hi\n');
+    const r = cmdLs(baseInput({ withMeta: true }));
+    expect(r.items).toBeDefined();
+    const outside = r.items!.find((i) => i.filename === 'hello.md');
+    expect(outside).toBeDefined();
+    expect(outside!.from).toBe('outside');
+    expect(outside!.subject).toBeNull();
+    expect(outside!.inReplyTo).toBeNull();
+    expect(outside!.tags).toEqual([]);
+    expect(outside!.priority).toBeNull();
+    // ts derived from file mtime — non-zero on any real filesystem.
+    expect(outside!.ts).toBeGreaterThan(0);
   });
 });
 

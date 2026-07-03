@@ -207,9 +207,56 @@ describe('channel-watcher — frontmatter edge cases', () => {
     expect(received[0]!.params.content).toBe('Subject: orphan\n\nbody\n');
   });
 
-  it('non-LAYOUT filename (no <unix-ms>-<rand6>.md grammar) is ignored', async () => {
-    writeFileSync(join(inbox, 'random.md'), 'whatever\n');
+  it('non-.md filename (e.g. README) is ignored', async () => {
+    writeFileSync(join(inbox, 'README'), 'not a message\n');
+    writeFileSync(join(inbox, '.hidden.md'), 'dotfile\n');
     // Give chokidar a moment to (not) fire.
+    await new Promise((r) => setTimeout(r, 150));
+    expect(received).toHaveLength(0);
+  });
+});
+
+// ─── Outside .md delivery (task #128 — kill the silent miss) ────────
+//
+// A `.md` file dropped into inbox/ that doesn't match the
+// LAYOUT-004 `<unix-ms>-<rand6>.md` grammar used to be silently
+// ignored. Now it fires as an "outside" message so the recipient
+// sees a collaborator's hand-dropped `.md` instead of a wedged
+// inbox.
+
+describe('channel-watcher — outside .md delivery', () => {
+  it('fires notifications/claude/channel with from="outside" for a bare `.md` filename', async () => {
+    writeFileSync(
+      join(inbox, 'random.md'),
+      '---\nfrom: alice\nsubject: forged?\n---\nthe body\n'
+    );
+    await waitFor(() => received.length === 1);
+    const n = received[0]!;
+    expect(n.params.meta.from).toBe('outside');
+    // The recipient's tool for replying (`coord_msg_reply`) can't
+    // build a thread from an outside filename — always a new thread.
+    expect(n.params.meta.messageFilename).toBe('random.md');
+    expect(n.params.meta.threadFilename).toBe('random.md');
+    expect(n.params.content).toMatch(/^\[outside \.md — non-canonical filename: random\.md\]/);
+    // Even a well-formed `from:` in the frontmatter is not trusted:
+    // the file's non-canonical name means we can't verify the sender.
+    expect(n.params.content).not.toContain('Subject: forged?');
+  });
+
+  it('a plain-body outside .md (no frontmatter) also fires', async () => {
+    writeFileSync(join(inbox, 'notes.md'), 'just plain body\n');
+    await waitFor(() => received.length === 1);
+    expect(received[0]!.params.meta.from).toBe('outside');
+    expect(received[0]!.params.content).toContain('just plain body\n');
+  });
+
+  it('prefix-sibling attachment (`<ts>-<r6>.subject.md`) is NOT delivered', async () => {
+    // Belongs to a canonical .md; delivering it as outside would
+    // double-fire when the canonical arrives.
+    writeFileSync(
+      join(inbox, '1714826789150-abc123.subject.md'),
+      'sidecar\n'
+    );
     await new Promise((r) => setTimeout(r, 150));
     expect(received).toHaveLength(0);
   });
@@ -428,11 +475,15 @@ describe('channel-watcher — poll backstop (brief-020 HB-4)', () => {
     );
   });
 
-  it('backstop-only: non-LAYOUT filenames are ignored', async () => {
-    writeFileSync(join(backstopInbox, 'random.md'), '---\nfrom: bob\n---\n');
+  it('backstop-only: non-.md files (README, notes.txt) are ignored; outside .md fires', async () => {
+    // Task #128: off-format `.md` files fire as outside messages;
+    // non-.md paths (dotfiles, README, .txt) stay ignored.
     writeFileSync(join(backstopInbox, 'notes.txt'), 'ignore me\n');
-    await new Promise((r) => setTimeout(r, 200));
-    expect(backstopReceived).toHaveLength(0);
+    writeFileSync(join(backstopInbox, '.hidden.md'), 'ignore me too\n');
+    writeFileSync(join(backstopInbox, 'random.md'), '---\nfrom: bob\n---\n');
+    await waitForBackstop(() => backstopReceived.length === 1);
+    expect(backstopReceived[0]!.params.meta.from).toBe('outside');
+    expect(backstopReceived[0]!.params.meta.messageFilename).toBe('random.md');
   });
 
   it('close() disposes the backstop timer', async () => {

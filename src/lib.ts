@@ -80,12 +80,14 @@ import {
   archiveDir as archiveDirCommon,
   ensureIdentityDirs,
   inboxDir as inboxDirCommon,
+  validFilename,
   validIdentity,
 } from './common.ts';
 import { InvalidIdentityError } from './errors.ts';
 import { spawnSync } from 'node:child_process';
 
 import {
+  asDeliverableFilename,
   asFilename,
   asIdentity,
   type Filename,
@@ -432,7 +434,10 @@ export function createCoord(options: CoordOptions): Coord {
         env: lib_env,
         coordRoot: root,
       });
-      return r.matches.map(asFilename);
+      // Task #128: cmdLs may return outside .md filenames alongside
+      // canonical ones. Use the broader validator so `asDeliverableFilename`
+      // doesn't throw on the outside path.
+      return r.matches.map(asDeliverableFilename);
     },
 
     async read(id, filename, opts = {}): Promise<MessageWithLocation> {
@@ -443,6 +448,22 @@ export function createCoord(options: CoordOptions): Coord {
         env: lib_env,
         coordRoot: root,
       });
+      // Off-format `.md`: skip the frontmatter reinterpretation. We
+      // can't trust `from` (no verified sender), the whole file is
+      // body, and `in-reply-to`, `tags`, `priority` would be forged
+      // if we projected them. `from: 'outside'` is the marker every
+      // outside-path surface uses.
+      if (!validFilename(filename)) {
+        return {
+          message: {
+            from: 'outside' as Identity,
+            body: readFileSync(r.path, 'utf8'),
+          },
+          identity: id,
+          filename,
+          folder: r.label,
+        };
+      }
       // Build a typed MessageWithLocation from cmdRead's result. cmdRead
       // returns `{ body, header, label, path, untyped }` in formatted mode;
       // we re-parse the file off disk to get the structured frontmatter

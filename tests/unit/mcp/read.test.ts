@@ -245,9 +245,12 @@ describe('coord_msg_read — typed error mapping', () => {
     expect(errorCode(r)).toBe('INVALID_FILENAME');
   });
 
-  it('legacy 3-segment filename → INVALID_FILENAME', async () => {
+  it('legacy 3-segment filename is accepted as outside .md → MESSAGE_NOT_FOUND when absent (task #128)', async () => {
+    // Post task #128: a legacy 3-segment `.md` (or any off-format
+    // `.md`) is valid to *reference* — the "outside message" path.
+    // When the file doesn't exist, error is MESSAGE_NOT_FOUND.
     const r = await call({ filename: '1714826789010-myobie-aaaaaa.md' });
-    expect(errorCode(r)).toBe('INVALID_FILENAME');
+    expect(errorCode(r)).toBe('MESSAGE_NOT_FOUND');
   });
 
   it('not found in either folder → MESSAGE_NOT_FOUND', async () => {

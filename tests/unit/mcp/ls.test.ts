@@ -183,7 +183,7 @@ describe('coord_msg_ls — filters', () => {
     ]);
   });
 
-  it('non-grammar files in the inbox are silently skipped', async () => {
+  it('non-.md files (README) are silently skipped; outside .md files are listed (task #128)', async () => {
     writeMsg('alice', '1714826789010-aaaaaa.md', 'bob');
     writeFileSync(join(coordRoot, 'alice', 'inbox', 'README'), 'x');
     writeFileSync(join(coordRoot, 'alice', 'inbox', 'notes.md'), 'x');
@@ -192,9 +192,15 @@ describe('coord_msg_ls — filters', () => {
       'legacy'
     );
     const r = await call();
-    expect(r.structuredContent?.matches).toEqual([
-      '1714826789010-aaaaaa.md',
-    ]);
+    // Canonical + both outside .md files show; README stays out.
+    expect(r.structuredContent?.matches).toEqual(
+      expect.arrayContaining([
+        '1714826789010-aaaaaa.md',
+        'notes.md',
+        '1714826789020-myobie-aaaaaa.md',
+      ])
+    );
+    expect(r.structuredContent?.matches).toHaveLength(3);
   });
 
   it('files with malformed frontmatter are silently excluded by fromFilter', async () => {

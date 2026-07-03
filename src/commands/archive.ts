@@ -12,6 +12,7 @@ import {
   pluralize,
   prefixOf,
   resolveIdentity,
+  validDeliverableFilename,
   validFilename,
 } from '../common.ts';
 import {
@@ -70,15 +71,19 @@ export function cmdArchive(input: ArchiveInput): ArchiveResult {
     env: input.env,
     coordRoot: input.coordRoot,
   });
-  if (!validFilename(input.filename)) {
+  if (!validDeliverableFilename(input.filename)) {
     throw new InvalidFilenameError(input.filename);
   }
+  const isOutside = !validFilename(input.filename);
 
   const inbox = inboxDir(recipient, input.coordRoot);
   const archive = archiveDir(recipient, input.coordRoot);
   const ipath = join(inbox, input.filename);
   const apath = join(archive, input.filename);
-  const withAttachments = input.withAttachments === true;
+  // Outside .md files have no LAYOUT prefix — no siblings to sweep.
+  // Silently ignore --with-attachments in that case rather than
+  // scanning for a non-existent prefix family.
+  const withAttachments = input.withAttachments === true && !isOutside;
 
   // ─── Discover attachment siblings (issue #8) ────────────────────────
   // Find every file in inbox/ AND archive/ that shares the canonical

@@ -112,6 +112,35 @@ describe('cmdArchive — case 0 (post-sweep idempotent)', () => {
   });
 });
 
+// ─── Outside .md (task #128) ───────────────────────────────────────────
+
+describe('cmdArchive — outside .md files', () => {
+  it('moves an off-format `.md` from inbox to archive', () => {
+    setupIdentity('bob');
+    writeFileSync(join(coordRoot, 'bob', 'inbox', 'notes.md'), 'hand-dropped\n');
+    const r = cmdArchive(archiveInput({ filename: 'notes.md' }));
+    expect(r.outcome.kind).toBe('moved');
+    expect(existsSync(join(coordRoot, 'bob', 'inbox', 'notes.md'))).toBe(false);
+    expect(existsSync(join(coordRoot, 'bob', 'archive', 'notes.md'))).toBe(true);
+    // Bytes preserved verbatim through the move.
+    expect(readFileSync(join(coordRoot, 'bob', 'archive', 'notes.md'), 'utf8'))
+      .toBe('hand-dropped\n');
+  });
+
+  it('withAttachments is silently coerced off for outside filenames (no prefix family)', () => {
+    setupIdentity('bob');
+    writeFileSync(join(coordRoot, 'bob', 'inbox', 'notes.md'), 'plain\n');
+    const r = cmdArchive(
+      archiveInput({ filename: 'notes.md', withAttachments: true })
+    );
+    expect(r.outcome.kind).toBe('moved');
+    // Outside filenames have no LAYOUT-004 prefix, so there's no
+    // sibling family to gather; the flag has no effect and the
+    // result omits `attachments` (same shape as withAttachments=false).
+    expect(r.attachments).toBeUndefined();
+  });
+});
+
 describe('cmdArchive — case 1 (not in inbox, not in archive)', () => {
   it('errors with "not found in inbox or archive"', () => {
     setupIdentity('bob');

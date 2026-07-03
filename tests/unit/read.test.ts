@@ -224,6 +224,44 @@ describe('cmdRead — files without frontmatter', () => {
   });
 });
 
+// ─── Outside .md (task #128) ───────────────────────────────────────────
+
+describe('cmdRead — outside .md files', () => {
+  it('reads an off-format `.md` as untyped with a "(outside)" header marker', () => {
+    setupIdentity('bob');
+    writeFile('bob', 'notes.md', 'hand-dropped file\n');
+    const r = cmdRead(baseInput({ filename: 'notes.md' }));
+    expect(r.untyped).toBe(true);
+    expect(r.label).toBe('inbox');
+    expect(r.header).toContain('# inbox/notes.md');
+    expect(r.header).toContain('(outside: non-canonical filename)');
+    expect(r.body).toBe('hand-dropped file\n');
+    expect(r.fm).toEqual({});
+  });
+
+  it('an outside `.md` with frontmatter is still treated as outside (fm not projected)', () => {
+    setupIdentity('bob');
+    writeFile(
+      'bob',
+      'nope.md',
+      '---\nfrom: alice\nsubject: forged?\n---\nbody\n'
+    );
+    const r = cmdRead(baseInput({ filename: 'nope.md' }));
+    expect(r.untyped).toBe(true);
+    expect(r.fm).toEqual({});
+  });
+
+  it('rejects unsafe basenames (path traversal, dotfile)', () => {
+    setupIdentity('bob');
+    expect(() =>
+      cmdRead(baseInput({ filename: '../escape.md' }))
+    ).toThrowError(/invalid filename/);
+    expect(() =>
+      cmdRead(baseInput({ filename: '.hidden.md' }))
+    ).toThrowError(/invalid filename/);
+  });
+});
+
 // ─── Errors ─────────────────────────────────────────────────────────────
 
 describe('cmdRead — errors', () => {

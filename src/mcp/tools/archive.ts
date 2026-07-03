@@ -11,7 +11,7 @@ import { z } from 'zod';
 
 import { archiveDir, inboxDir } from '../../common.ts';
 import type { Coord } from '../../lib.ts';
-import { asFilename, asIdentity } from '../../types.ts';
+import { asDeliverableFilename, asIdentity } from '../../types.ts';
 import {
   buildToolResult,
   withErrorMapping,
@@ -21,7 +21,9 @@ import { registerDualTool } from './dual-register.ts';
 const archiveInputShape = {
   filename: z
     .string()
-    .describe('Message filename (LAYOUT-004 grammar). Required.'),
+    .describe(
+      "Message filename (LAYOUT-004 grammar, or an off-format `.md` delivered as an 'outside' message). Required."
+    ),
   identity: z
     .string()
     .optional()
@@ -53,7 +55,7 @@ export function registerArchiveTool(mcp: McpServer, coord: Coord): void {
     },
     async (args) =>
       withErrorMapping(async () => {
-        const filename = asFilename(args.filename);
+        const filename = asDeliverableFilename(args.filename);
         const identity =
           args.identity !== undefined
             ? asIdentity(args.identity)

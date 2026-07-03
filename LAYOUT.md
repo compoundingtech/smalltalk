@@ -75,6 +75,19 @@ Every message file in `inbox/` or `archive/` has a globally unique name:
 Sortable by time. Effectively unique without coordination — at human-scale
 write rates the rand6 namespace (~10⁹) eliminates collisions.
 
+**Outside `.md` files.** A `.md` file that lands in `inbox/` but
+doesn't match `<unix-ms>-<rand6>.md` — e.g. a collaborator
+hand-drops `notes.md`, or an older peer wrote a legacy 3-segment
+name — is still surfaced to the recipient as an **outside
+message** rather than silently ignored. The channel notification
+fires with `from: outside` (the file's claimed sender is not
+trusted through an unofficial name); `ls`, `read`, and `archive`
+all operate on outside files by their literal basename.
+Prefix-sibling attachments (`<unix-ms>-<rand6>.foo.md`) do NOT
+count as outside — they belong to the canonical `.md`'s family and
+follow that lifecycle. Dotfiles (`.hidden.md`), non-`.md` files,
+and anything with a path separator stay ignored.
+
 ## Attachments
 
 A sender may drop additional files alongside the canonical
