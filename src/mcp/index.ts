@@ -28,6 +28,7 @@ import type { Identity } from '../types.ts';
 import { buildServerInfo, buildServerOptions } from './capabilities.ts';
 import { evaluateDrift } from './tidy-check.ts';
 import { registerArchiveTool } from './tools/archive.ts';
+import { registerContextTools } from './tools/context.ts';
 import { registerLsTool } from './tools/ls.ts';
 import { registerAgentsTool } from './tools/agents.ts';
 import { registerReadTool } from './tools/read.ts';
@@ -149,6 +150,12 @@ export function createMcpServer(opts: McpServerOptions): McpServerHandle {
   // coord_resource_* (brief-009 item 5): add/ls/read/remove. Available
   // in both modes; resources are part of the always-on agent surface.
   registerResourceTools(mcp, coord);
+  // coord_context_* (brief-024): read/write/append the per-agent
+  // context/ folder for lossless-restart. Available in both modes; the
+  // Coord's own context/ is the only writer target, but reads across
+  // identities are supported for coordinators inspecting a peer's
+  // last-known-state.
+  registerContextTools(mcp, coord);
   if (channel) {
     // coord_msg_reply is the channel-mode partner of the inbox watcher.
     registerReplyTool(mcp, coord);

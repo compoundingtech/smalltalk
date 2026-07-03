@@ -163,6 +163,9 @@ describe('createMcpServer — tool name registry', () => {
       'coord_resource_ls',
       'coord_resource_read',
       'coord_resource_remove',
+      'coord_context_read',
+      'coord_context_write',
+      'coord_context_append',
       'st_msg_send',
       'st_msg_ls',
       'st_msg_read',
@@ -174,6 +177,9 @@ describe('createMcpServer — tool name registry', () => {
       'st_resource_ls',
       'st_resource_read',
       'st_resource_remove',
+      'st_context_read',
+      'st_context_write',
+      'st_context_append',
     ]);
   });
 });

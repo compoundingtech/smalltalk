@@ -17,6 +17,7 @@ import { coordConfigFrom, coordRootFrom } from './common.ts';
 import type { CliContext } from './cli-context.ts';
 import { cmdArchiveCli } from './commands/archive.ts';
 import { cmdCompletionsCli } from './commands/completions.ts';
+import { cmdContextCli } from './commands/context.ts';
 import { cmdDingCli } from './commands/ding.ts';
 import { cmdInitCli } from './commands/init.ts';
 import { cmdLaunchCli } from './commands/launch.ts';
@@ -88,6 +89,13 @@ const TOP_LEVEL_USAGE =
   `  resource ls [<identity>] [--json]\n` +
   `  resource read [<identity>] <filename> [--json]\n` +
   `  resource rm <filename>\n\n` +
+  `Context (brief-024, lossless-restart):\n` +
+  `  context read [<identity>] [--decisions | --full]\n` +
+  `                                   print now.md / decisions/ log / both\n` +
+  `  context write [<identity>]       replace now.md from stdin\n` +
+  `  context append [<identity>] --decision "<text>" --why "<text>"\n` +
+  `                                   append one entry to decisions/ as a new\n` +
+  `                                   file named <unix-ms>-<rand6>.md\n\n` +
   `Sync:\n` +
   `  sync push <peer>\n` +
   `  sync push --all\n` +
@@ -196,6 +204,8 @@ export async function runCli(
         return cmdSyncCli(rest, ctx);
       case 'resource':
         return await cmdResourceCli(rest, ctx);
+      case 'context':
+        return await cmdContextCli(rest, ctx);
       case 'mcp':
         return await cmdMcpCli(rest, ctx);
       case 'init':

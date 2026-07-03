@@ -44,6 +44,11 @@ import {
   getOverview,
   type Overview,
 } from './commands/overview.ts';
+import {
+  cmdContextAppend,
+  cmdContextRead,
+  cmdContextWrite,
+} from './commands/context.ts';
 import { cmdRead } from './commands/read.ts';
 import {
   cmdResourceAdd,
@@ -292,6 +297,44 @@ export interface Coord {
     list(identity?: Identity): Promise<ResourceWithLocation[]>;
     read(identity: Identity, filename: Filename): Promise<Resource>;
     remove(filename: Filename): Promise<void>;
+  };
+  /**
+   * brief-024 (context/ v1): per-agent durable working-state, the
+   * in-context-state leg of lossless-restart. Two files live under
+   * `<root>/<identity>/context/`:
+   *   - now.md: whole-file rewrite; last-write-wins snapshot of
+   *     what an agent is mid-doing.
+   *   - decisions.md: append-only log of decisions + why.
+   * All three verbs are absent-able: reads on a missing folder return
+   * empty + `absent: true`; writes lazy-create the folder. The eval's
+   * control arm can just `rm -rf context/` to A/B against the
+   * treatment.
+   */
+  context: {
+    read(input?: {
+      identity?: Identity;
+      file?: 'now' | 'decisions' | 'full';
+    }): { identity: Identity; file: 'now' | 'decisions' | 'full'; text: string; absent: boolean };
+    write(input: {
+      body: string;
+      identity?: Identity;
+    }): { identity: Identity; path: string; bytes: number };
+    append(input: {
+      decision: string;
+      why: string;
+      /** Optional caller-supplied ISO timestamp. When omitted, the
+       *  handle stamps `new Date().toISOString()`. */
+      timestamp?: string;
+      identity?: Identity;
+    }): {
+      identity: Identity;
+      /** Absolute path of the entry file that was written. */
+      path: string;
+      /** Basename of {@link path}. */
+      filename: Filename;
+      /** The bulleted line stored in the file. */
+      line: string;
+    };
   };
   sync: {
     push(peer: Peer): Promise<SyncResult>;
@@ -613,6 +656,59 @@ export function createCoord(options: CoordOptions): Coord {
           env: lib_env,
           coordRoot: root,
         });
+      },
+    },
+
+    context: {
+      read(input): {
+        identity: Identity;
+        file: 'now' | 'decisions' | 'full';
+        text: string;
+        absent: boolean;
+      } {
+        const target = input?.identity ?? identity;
+        const r = cmdContextRead({
+          recipient: target,
+          file: input?.file ?? 'now',
+          env: lib_env,
+          coordRoot: root,
+        });
+        return { ...r, identity: asIdentity(r.identity) };
+      },
+      write(input): {
+        identity: Identity;
+        path: string;
+        bytes: number;
+      } {
+        const target = input.identity ?? identity;
+        const r = cmdContextWrite({
+          recipient: target,
+          body: input.body,
+          env: lib_env,
+          coordRoot: root,
+        });
+        return { ...r, identity: asIdentity(r.identity) };
+      },
+      append(input): {
+        identity: Identity;
+        path: string;
+        filename: Filename;
+        line: string;
+      } {
+        const target = input.identity ?? identity;
+        const r = cmdContextAppend({
+          recipient: target,
+          decision: input.decision,
+          why: input.why,
+          timestamp: input.timestamp ?? new Date().toISOString(),
+          env: lib_env,
+          coordRoot: root,
+        });
+        return {
+          ...r,
+          identity: asIdentity(r.identity),
+          filename: asFilename(r.filename),
+        };
       },
     },
 

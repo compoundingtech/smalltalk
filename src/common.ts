@@ -454,6 +454,42 @@ export function resourcesDir(id: string, root: string = coordRoot()): string {
   return join(root, id, 'resources');
 }
 
+// brief-024 (context/ v1): per-agent durable working-state, the in-context-
+// state leg of lossless-restart. Two surfaces:
+//   now.md         — whole-file rewrite; last-write-wins snapshot of
+//                    "what I'm mid-doing right now"
+//   decisions/     — folder, one file per decision entry, named
+//                    `<unix-ms>-<rand6>.md` (same LAYOUT-004 grammar as
+//                    message inboxes). Append semantics = create-a-new-
+//                    file; no rewriting the whole log to add a line, no
+//                    clobbering on race, sorts by name = chronological
+//                    for free. Nathan-approved shape (2026-07-03) —
+//                    replaces the pre-review decisions.md single-file
+//                    log after cos+Nathan flagged the append-in-place
+//                    footguns.
+// Both are absent-able: missing folder / missing files must not crash
+// callers. Every helper reflects that — reads on absence return empty,
+// writes lazy-create the folder. Rationale: the restart-continuity eval
+// needs a control arm with no `context/` that fails exactly like an
+// unrestored agent, plus a treatment arm that resumes cleanly.
+export function contextDir(id: string, root: string = coordRoot()): string {
+  return join(root, id, 'context');
+}
+
+export function contextNowPath(
+  id: string,
+  root: string = coordRoot()
+): string {
+  return join(contextDir(id, root), 'now.md');
+}
+
+export function contextDecisionsDir(
+  id: string,
+  root: string = coordRoot()
+): string {
+  return join(contextDir(id, root), 'decisions');
+}
+
 export function statusPath(id: string, root: string = coordRoot()): string {
   return join(root, id, 'status');
 }

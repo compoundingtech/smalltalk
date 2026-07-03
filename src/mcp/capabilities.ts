@@ -133,7 +133,8 @@ export function buildServerOptions(opts: {
 /** The base tool names (sans prefix) registered in non-channel mode.
  *  `msg_send/ls/read/archive/thread` per brief-017; `members` per
  *  brief-019; `resource_*` per brief-009 item 5; `agents` per
- *  brief-009 item 3 (rename) with `members` kept as deprecated alias. */
+ *  brief-009 item 3 (rename) with `members` kept as deprecated alias;
+ *  `context_*` per brief-024 (in-context-state leg of lossless-restart). */
 export const EXPECTED_TOOL_BASE_NAMES = [
   'msg_send',
   'msg_ls',
@@ -146,6 +147,9 @@ export const EXPECTED_TOOL_BASE_NAMES = [
   'resource_ls',
   'resource_read',
   'resource_remove',
+  'context_read',
+  'context_write',
+  'context_append',
 ] as const;
 
 /** brief-005-phase0 §3: every tool dual-registers under `coord_*`
