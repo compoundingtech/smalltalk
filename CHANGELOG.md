@@ -6,6 +6,55 @@ minor releases until 1.0.
 
 ## Unreleased
 
+### Fixed (`st launch` hooks-not-found is now LOUD instead of a silent soft-skip)
+
+Historic behavior: when `resolveClaudeHooksDir()` returned null
+(bin/shim not resolvable OR `examples/claude-code/hooks/` not on
+disk OR explicit `--hooksDir` override missing), the call site
+emitted a single line — `[smalltalk launch] shipped Claude Code
+hooks not found on disk; skipping .claude/settings.local.json` —
+and the launch proceeded HOOKLESS. Silent-ish → an operator
+missed it → Johannes's claude came up without the boot ritual,
+PreCompact flush, or StopFailure ding, exactly the silent-install-
+gap class of bug the `bin/coord` rename fix already surfaced.
+
+Two changes:
+
+- **`resolveClaudeHooksDirWithHint()`** (new; discriminated variant
+  of `resolveClaudeHooksDir()`) categorizes the failure into
+  distinct modes and returns a `hint` string quoting the path(s)
+  that were inspected and how to fix each mode:
+  - bin/shim resolution failure → names the package.json walk +
+    `which st`/`which coord` PATH lookup failure.
+  - `examples/claude-code/hooks/` missing → quotes the walked-to
+    root, suggests `npm install && npm link` from the checkout, or
+    `--no-hooks` to acknowledge intentionally.
+  - Explicit `--hooksDir` override missing → names the specific
+    path passed.
+
+- **Multi-line LOUD stderr banner** at the call site. Replaces the
+  historic one-line notice with a bracketed block naming what's
+  disabled (boot ritual, PreCompact flush, StopFailure ding), the
+  specific failure hint, and how to fix it or silence intentionally
+  with `--no-hooks`. Launch still proceeds (hookless is degraded,
+  not fatal) but the operator gets a signal they can't miss on
+  scroll-back.
+
+`resolveClaudeHooksDir()` retained as a thin wrapper around the
+new function for back-compat with test/embedder callers.
+
+Test regression guards:
+- Historic silent one-line message form is negated (`.not.toMatch`)
+  so a future refactor can't revert to it.
+- The banner + the actionable "why" line quote the missing path.
+- The `--no-hooks` escape hatch is called out in the guidance.
+- New unit test for `resolveClaudeHooksDirWithHint()` happy path in
+  the repo checkout returns real hooks dir + null hint.
+
+Also negates the specific override failure form vs. the auto-
+resolution form so a diagnostic-message copy/paste regression is
+caught.
+
 ### Added (`st launch claude --ding` — codex-style ding-mode for MCP-hostile environments)
 
 Load-bearing for Johannes's setup, where MCP servers can't run

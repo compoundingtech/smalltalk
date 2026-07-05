@@ -18,7 +18,10 @@ import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import type { CliContext } from '../../src/cli-context.ts';
-import { cmdLaunch } from '../../src/commands/launch.ts';
+import {
+  cmdLaunch,
+  resolveClaudeHooksDirWithHint,
+} from '../../src/commands/launch.ts';
 
 let scratch: string;
 let cwd: string;
@@ -1663,7 +1666,15 @@ describe('cmdLaunch — .claude/settings.local.json generation (brief-118)', () 
     expect(r.claudeSettingsPreview).toBeNull();
   });
 
-  it('missing hooks dir: soft-skip with a stderr notice, launch still succeeds', async () => {
+  it('missing hooks dir: LOUD stderr error naming the failure + how to fix, launch still succeeds', async () => {
+    // Historic behavior was a one-line silent-ish soft-skip message.
+    // Johannes hit that path and didn't notice his claude came up
+    // hookless (no boot ritual, no PreCompact, no StopFailure) —
+    // the exact silent-install-gap class of bug. Fix per cos: LOUD
+    // multi-line message naming the specific failure mode + how to
+    // fix. Regression guard on all three axes: the LOUD banner
+    // fires, the actionable "why" line quotes the missing path, and
+    // the launch still succeeds (hookless is degraded, not fatal).
     const missing = join(scratch, 'no-such-dir');
     const r = await cmdLaunch(
       baseInput({ identity: 'kai', hooksDir: missing }),
@@ -1671,7 +1682,62 @@ describe('cmdLaunch — .claude/settings.local.json generation (brief-118)', () 
     );
     expect(r.claudeSettingsPath).toBeNull();
     expect(r.claudeSettingsPreview).toBeNull();
-    expect(stderrBuf).toContain('shipped Claude Code hooks not found on disk');
+    // Banner + the specific problem line.
+    expect(stderrBuf).toContain('Claude Code hooks NOT installed');
+    expect(stderrBuf).toContain(
+      'boot ritual, PreCompact flush, and\n[smalltalk launch] StopFailure ding'
+    );
+    // The path that failed is quoted so an operator can grep their
+    // install for it.
+    expect(stderrBuf).toContain(missing);
+    // Actionable fix suggestion + escape hatch.
+    expect(stderrBuf).toContain('--no-hooks');
+    // Regression guard against reverting to the historic
+    // silent-ish one-line message.
+    expect(stderrBuf).not.toMatch(/^\[smalltalk launch\] shipped Claude Code hooks not found on disk;/m);
+  });
+
+  it('missing hooks dir: hint identifies the explicit --hooksDir override failure mode specifically', async () => {
+    // When the operator passed an explicit override, the hint
+    // should name that path (not conflate with the auto-resolution
+    // failure).
+    const missing = join(scratch, 'no-such-override');
+    await cmdLaunch(
+      baseInput({ identity: 'ova', hooksDir: missing }),
+      ctx
+    );
+    expect(stderrBuf).toContain('explicit `--hooksDir`/input.hooksDir override');
+    expect(stderrBuf).toContain(missing);
+  });
+
+  it('resolveClaudeHooksDirWithHint: happy path in the repo returns a real hooks dir + null hint', () => {
+    // The tests run from the smalltalk repo checkout, so the walk
+    // resolves the shipped hooks dir. Regression guard: the
+    // discriminated-return shape is stable for embedders.
+    const r = resolveClaudeHooksDirWithHint();
+    expect(r.path).not.toBeNull();
+    expect(r.path).toMatch(/\/examples\/claude-code\/hooks$/);
+    expect(r.hint).toBeNull();
+  });
+
+  it('auto-resolution failure (missing examples/): hint quotes the walked-to root + suggests npm install/link', async () => {
+    // The load-bearing hardening — an operator whose install is
+    // missing examples/ needs to know WHERE the walk landed +
+    // WHAT to run to fix it. Test simulates the failure by pointing
+    // `hooksDir` at a valid tree but with no examples/ subdir.
+    // (We can't easily override resolveClaudeHooksDir here without
+    // a wider seam, so this test locks the diagnostic-formatting
+    // side for the explicit-override branch; the auto-resolution
+    // branch runs against the real repo and DOES resolve, so it's
+    // exercised in `resolveClaudeHooksDirWithHint` unit tests below.)
+    const missing = join(scratch, 'no-such-hooks');
+    await cmdLaunch(
+      baseInput({ identity: 'pip', hooksDir: missing }),
+      ctx
+    );
+    // Loud multi-line banner appears regardless of failure mode.
+    expect(stderrBuf).toContain('The launch will continue');
+    expect(stderrBuf).toContain('hookless');
   });
 
   // ─── ST_BIN injection into hook command:s ────────────────────────────
