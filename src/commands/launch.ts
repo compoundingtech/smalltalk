@@ -675,20 +675,67 @@ function buildPtyToml(opts: {
  * caller just doesn't write `settings.local.json`.
  */
 export function resolveClaudeHooksDir(): string | null {
+  return resolveClaudeHooksDirWithHint().path;
+}
+
+/**
+ * Discriminated variant of {@link resolveClaudeHooksDir} that names
+ * the specific failure mode so the caller can emit a LOUD, actionable
+ * stderr error instead of the historic silent soft-skip.
+ *
+ * Returns `{ path: <abs>, hint: null }` on success. On failure returns
+ * `{ path: null, hint: "<what failed> ; <how to fix>" }`. The hint
+ * quotes the paths inspected so an operator can grep their install
+ * for the missing pieces.
+ *
+ * Historic behavior: `resolveClaudeHooksDir()` returned null in TWO
+ * distinct failure modes (bin/shim not resolvable OR examples/ dir
+ * missing) and the call site logged a single generic "hooks not found
+ * on disk" message. Silent-ish → an operator misses it → launches
+ * come up hookless (no boot ritual, no PreCompact, no StopFailure).
+ * Johannes hit this. This function surfaces WHICH mode failed so
+ * the caller's message can name it.
+ */
+export function resolveClaudeHooksDirWithHint(): {
+  path: string | null;
+  hint: string | null;
+} {
   let coordBin: string;
   try {
     coordBin = resolveCoordBinPath();
-  } catch {
-    return null;
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    return {
+      path: null,
+      hint:
+        `could not resolve the smalltalk shim (bin/st) via package.json ` +
+        `walk from this module + \`which st\` / \`which coord\` PATH ` +
+        `lookup: ${msg}. Confirm you're launching from within a ` +
+        `checkout that has @myobie/coord in its package.json chain, ` +
+        `or that \`st\` is on your $PATH.`,
+    };
   }
   const smalltalkRoot = dirname(dirname(coordBin));
   const hooksDir = join(smalltalkRoot, 'examples', 'claude-code', 'hooks');
+  let stat: ReturnType<typeof statSync> | null = null;
   try {
-    if (statSync(hooksDir).isDirectory()) return hooksDir;
+    stat = statSync(hooksDir);
   } catch {
-    // hooks dir absent — soft skip.
+    // fall through to failure branch below
   }
-  return null;
+  if (stat !== null && stat.isDirectory()) {
+    return { path: hooksDir, hint: null };
+  }
+  return {
+    path: null,
+    hint:
+      `resolved the smalltalk shim to ${coordBin} (root: ${smalltalkRoot}) ` +
+      `but ${hooksDir} does not exist on disk. Your install may have ` +
+      `skipped \`examples/\` (some npm install flavors do). Fix: from ` +
+      `the smalltalk repo checkout, run \`npm install && npm link\` so ` +
+      `the shipped hooks are present on the resolved path. Or pass ` +
+      `\`--no-hooks\` to acknowledge and launch hookless intentionally.`,
+  };
 }
 
 /**
@@ -1326,14 +1373,23 @@ export async function cmdLaunch(
   let claudeSettingsPreview: string | null = null;
   if (harness === 'claude' && input.noHooks !== true) {
     let hooksDir: string | null;
+    let hooksHint: string | null = null;
     if (input.hooksDir !== undefined) {
-      // Explicit override — verify the path still exists so a stale
-      // seam value produces the same soft-skip as the auto-resolution
-      // failure path. Prevents baking a bad absolute path into the
-      // generated JSON.
-      hooksDir = existsSync(input.hooksDir) ? input.hooksDir : null;
+      // Explicit override — verify the path still exists.
+      if (existsSync(input.hooksDir)) {
+        hooksDir = input.hooksDir;
+      } else {
+        hooksDir = null;
+        hooksHint =
+          `explicit \`--hooksDir\`/input.hooksDir override ${input.hooksDir} ` +
+          `does not exist on disk. Pass a valid path, remove the override to ` +
+          `use auto-resolution, or pass \`--no-hooks\` to launch hookless ` +
+          `intentionally.`;
+      }
     } else {
-      hooksDir = resolveClaudeHooksDir();
+      const resolved = resolveClaudeHooksDirWithHint();
+      hooksDir = resolved.path;
+      hooksHint = resolved.hint;
     }
     if (hooksDir !== null) {
       const settingsDir = join(cwd, '.claude');
@@ -1366,13 +1422,31 @@ export async function cmdLaunch(
       // to re-bootstrap, or edit it in place if they only want to
       // tweak the hook list.
     } else {
-      // Hooks dir absent (npm install without `examples/`, or degenerate
-      // PATH). Soft skip: launch still works, agent just doesn't get
-      // the boot hooks — same as pre-brief-118 behavior. Emit a hint
-      // so the operator can wire hooks by hand if they want.
+      // LOUD failure: the historic silent soft-skip meant Johannes's
+      // Claude launched hookless (no boot ritual, no PreCompact, no
+      // StopFailure) without an obvious signal. Now we emit a full
+      // multi-line error naming the specific failure mode + how to
+      // fix it. Launch still proceeds — hookless is degraded but
+      // not fatal — but the operator gets a chance to notice.
+      const hintForOperator =
+        hooksHint ?? 'unknown resolution failure (please file a bug).';
       ctx.stderr(
-        `[smalltalk launch] shipped Claude Code hooks not found on disk; ` +
-          `skipping .claude/settings.local.json (see examples/claude-code/settings.local.example.json)\n`
+        `\n` +
+          `[smalltalk launch] ────────────────────────────────────────\n` +
+          `[smalltalk launch] Claude Code hooks NOT installed. The\n` +
+          `[smalltalk launch] boot ritual, PreCompact flush, and\n` +
+          `[smalltalk launch] StopFailure ding hooks will NOT fire\n` +
+          `[smalltalk launch] for this session.\n` +
+          `[smalltalk launch]\n` +
+          `[smalltalk launch] Why: ${hintForOperator}\n` +
+          `[smalltalk launch]\n` +
+          `[smalltalk launch] The launch will continue, but the agent\n` +
+          `[smalltalk launch] will come up hookless (no session-start\n` +
+          `[smalltalk launch] rehydrate, no post-compaction stub, no\n` +
+          `[smalltalk launch] API-error visibility). Fix and re-run,\n` +
+          `[smalltalk launch] or pass --no-hooks to acknowledge and\n` +
+          `[smalltalk launch] silence this warning.\n` +
+          `[smalltalk launch] ────────────────────────────────────────\n\n`
       );
     }
   }
