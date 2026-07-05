@@ -708,7 +708,7 @@ describe('cmdLaunch — --permanent + CoS-shaped footgun-guard', () => {
       baseInput({ harness: 'claude', identity: 'cos' }),
       ctx
     );
-    expect(stderrBuf).toContain('launching a CoS without --permanent');
+    expect(stderrBuf).toContain('launching a spawner (cos/supervisor) without --permanent');
     expect(stderrBuf).toContain('pty gc may reap it');
   });
 
@@ -726,7 +726,7 @@ describe('cmdLaunch — --permanent + CoS-shaped footgun-guard', () => {
       }),
       ctx
     );
-    expect(stderrBuf).toContain('launching a CoS without --permanent');
+    expect(stderrBuf).toContain('launching a spawner (cos/supervisor) without --permanent');
   });
 
   it('footgun-guard: --permanent silences the warning for CoS-shaped launches', async () => {
@@ -738,7 +738,7 @@ describe('cmdLaunch — --permanent + CoS-shaped footgun-guard', () => {
       }),
       ctx
     );
-    expect(stderrBuf).not.toContain('launching a CoS without --permanent');
+    expect(stderrBuf).not.toContain('launching a spawner (cos/supervisor) without --permanent');
   });
 
   it('footgun-guard: non-CoS identity + no --permanent → NO warning', async () => {
@@ -748,7 +748,7 @@ describe('cmdLaunch — --permanent + CoS-shaped footgun-guard', () => {
       baseInput({ harness: 'claude', identity: 'taskflow-worker' }),
       ctx
     );
-    expect(stderrBuf).not.toContain('launching a CoS without --permanent');
+    expect(stderrBuf).not.toContain('launching a spawner (cos/supervisor) without --permanent');
   });
 
   it('CLI --permanent threads through + shows in dry-run summary', async () => {
@@ -767,6 +767,167 @@ describe('cmdLaunch — --permanent + CoS-shaped footgun-guard', () => {
       ctx
     );
     expect(stdoutBuf).toContain('permanent:      no');
+  });
+});
+
+describe('cmdLaunch — spawner-shaped detection (Nathan\'s 3-tier)', () => {
+  // Detection extends #55's CoS-shape to include supervisor per
+  // Nathan's 3-tier model:
+  //   - cos, supervisor      → spawner-shaped (bypass + warn-no-perm)
+  //   - anything else        → not spawner-shaped (auto + no warn)
+
+  it('identity `supervisor` + no --permission-mode → defaults to bypassPermissions', async () => {
+    // Bug 1 (Johannes's pty.toml audit): spawner in `auto` mode
+    // gets hard-blocked by the classifier from spawning autonomous
+    // agents. Default to bypass so a fresh onboarding produces a
+    // working spawner without the user needing to know the
+    // permission gotcha.
+    const r = await cmdLaunch(
+      baseInput({ harness: 'claude', identity: 'supervisor' }),
+      ctx
+    );
+    expect(r.permissionMode).toBe('bypassPermissions');
+    const idx = r.argv.indexOf('--permission-mode');
+    expect(idx).toBeGreaterThanOrEqual(0);
+    expect(r.argv[idx + 1]).toBe('bypassPermissions');
+  });
+
+  it('identity `cos` + no --permission-mode → defaults to bypassPermissions', async () => {
+    const r = await cmdLaunch(
+      baseInput({ harness: 'claude', identity: 'cos' }),
+      ctx
+    );
+    expect(r.permissionMode).toBe('bypassPermissions');
+  });
+
+  it('supervisor.md persona + no --permission-mode → defaults to bypassPermissions', async () => {
+    // Even a non-`supervisor` identity flips to bypass when the
+    // persona identifies the role. Ready for the cos-created
+    // supervisor.md persona (referenced by basename constant).
+    const personaFile = join(scratch, 'supervisor.md');
+    writeFileSync(personaFile, '# fake supervisor persona\n');
+    const r = await cmdLaunch(
+      baseInput({
+        harness: 'claude',
+        identity: 'my-super',
+        persona: personaFile,
+      }),
+      ctx
+    );
+    expect(r.permissionMode).toBe('bypassPermissions');
+  });
+
+  it('chief-of-staff.md persona + no --permission-mode → defaults to bypassPermissions', async () => {
+    const personaFile = join(scratch, 'chief-of-staff.md');
+    writeFileSync(personaFile, '# fake CoS persona\n');
+    const r = await cmdLaunch(
+      baseInput({
+        harness: 'claude',
+        identity: 'my-cos',
+        persona: personaFile,
+      }),
+      ctx
+    );
+    expect(r.permissionMode).toBe('bypassPermissions');
+  });
+
+  it('worker-shaped identity + no --permission-mode → stays on `auto` (leaf-agent default)', async () => {
+    // The asymmetry that matters: workers stay on `auto` because
+    // auto is correct + safe for a leaf agent. Only spawners flip.
+    const r = await cmdLaunch(
+      baseInput({ harness: 'claude', identity: 'taskflow-worker' }),
+      ctx
+    );
+    expect(r.permissionMode).toBe('auto');
+  });
+
+  it('explicit --permission-mode overrides the spawner-default', async () => {
+    // Spawner-shaped launch that EXPLICITLY passes a mode uses
+    // that mode — no magic. Guards against surprising the operator
+    // who deliberately downshifted a spawner to `plan` or similar.
+    const r = await cmdLaunch(
+      baseInput({
+        harness: 'claude',
+        identity: 'cos',
+        permissionMode: 'plan',
+      }),
+      ctx
+    );
+    expect(r.permissionMode).toBe('plan');
+  });
+
+  it('$CLAUDE_PERMISSION_MODE env overrides the spawner-default', async () => {
+    // Same precedence as pre-existing brief-023 rules — env still
+    // wins over the shape-aware default. Only the fallback branch
+    // changes.
+    const r = await cmdLaunch(
+      baseInput({
+        harness: 'claude',
+        identity: 'cos',
+        env: { CLAUDE_PERMISSION_MODE: 'acceptEdits' } as NodeJS.ProcessEnv,
+      }),
+      ctx
+    );
+    expect(r.permissionMode).toBe('acceptEdits');
+  });
+
+  it('supervisor without --permanent → footgun-guard warning fires', async () => {
+    // #55's warning extended to fire for supervisor too. Same
+    // wording change as the CoS case ("spawner (cos/supervisor)").
+    await cmdLaunch(
+      baseInput({ harness: 'claude', identity: 'supervisor' }),
+      ctx
+    );
+    expect(stderrBuf).toContain(
+      'launching a spawner (cos/supervisor) without --permanent'
+    );
+  });
+
+  it('supervisor.md persona without --permanent → footgun-guard warning fires', async () => {
+    const personaFile = join(scratch, 'supervisor.md');
+    writeFileSync(personaFile, '# fake supervisor persona\n');
+    await cmdLaunch(
+      baseInput({
+        harness: 'claude',
+        identity: 'my-super',
+        persona: personaFile,
+      }),
+      ctx
+    );
+    expect(stderrBuf).toContain(
+      'launching a spawner (cos/supervisor) without --permanent'
+    );
+  });
+
+  it('worker-shaped launch without --permanent → NO warning', async () => {
+    // Ephemeral workers/leaves must not get the spawner warning.
+    await cmdLaunch(
+      baseInput({ harness: 'claude', identity: 'taskflow-worker' }),
+      ctx
+    );
+    expect(stderrBuf).not.toContain(
+      'launching a spawner (cos/supervisor) without --permanent'
+    );
+  });
+
+  it('supervisor + --permanent → no warning + explicit bypassPermissions still fires from spawner shape', async () => {
+    const r = await cmdLaunch(
+      baseInput({
+        harness: 'claude',
+        identity: 'supervisor',
+        permanent: true,
+      }),
+      ctx
+    );
+    expect(stderrBuf).not.toContain(
+      'launching a spawner (cos/supervisor) without --permanent'
+    );
+    // With no explicit --permission-mode, the spawner default still
+    // gives bypass. `--permanent` and the perm-mode default are
+    // independent knobs (deliberate asymmetry — evals want ephemeral
+    // supervisors that still spawn autonomously).
+    expect(r.permissionMode).toBe('bypassPermissions');
+    expect(r.permanent).toBe(true);
   });
 });
 

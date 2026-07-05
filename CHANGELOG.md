@@ -6,6 +6,55 @@ minor releases until 1.0.
 
 ## Unreleased
 
+### Fixed (spawner-shaped launches default to `bypassPermissions` + guard warning extended to supervisor)
+
+Nathan's 3-tier permission model, closing Johannes's pty.toml Bug 1:
+
+- **cos + supervisor** are spawners → default `bypassPermissions`
+  when neither `--permission-mode` nor `$CLAUDE_PERMISSION_MODE`
+  is set (was `auto`, which claude's classifier hard-blocks from
+  spawning autonomous agents — the exact regression Johannes hit).
+- **workers** (any other identity + no spawner persona) → default
+  `auto`. `auto` is correct + safe for a leaf agent that does
+  work but doesn't spawn.
+
+Spawner detection matches previous PR's CoS-shape (`identity ===
+'cos'` OR persona basename === `'chief-of-staff.md'`) extended
+with `identity === 'supervisor'` OR persona basename ===
+`'supervisor.md'`. Both persona files live at
+https://github.com/myobie/personas (HEAD `b8a2cc3`).
+
+Also extended the previous PR's footgun-guard warning:
+
+- Fires for both `cos` AND `supervisor` (was CoS-only).
+- Message updated: `"launching a spawner (cos/supervisor) without
+  --permanent"` (was `"launching a CoS"`).
+- Ephemeral eval spawners intentionally decline `--permanent`
+  (they need to be reap-able on teardown) — the warning is
+  opt-in acknowledgment, not a hard block.
+
+Deliberate asymmetry (per Nathan): the permission-mode default
+flip is safe (spawners need bypass, evals want bypass), but
+permanent stays opt-in / warn-only — evals launch `--identity
+supervisor` agents that MUST stay ephemeral.
+
+Precedence at the CLI: `--permission-mode <mode>` >
+`$CLAUDE_PERMISSION_MODE` env > shape-aware default (spawner →
+bypass, worker → auto). Existing callers with explicit flags or
+env set are byte-identical.
+
+`notes/onboarding.md` updated: CoS launch command in step 2 adds
+`--permission-mode bypassPermissions` for pattern-teaching (works
+either way — the default now covers it, but the explicit flag
+teaches the pattern you'll want on your own supervisor launches).
+Resume recipe + the aliased-binary example also updated.
+
+11 new unit tests cover: cos + supervisor identity defaults, both
+persona basenames as detection triggers, worker stays on auto,
+explicit flag overrides the spawner-default, `$CLAUDE_PERMISSION_MODE`
+overrides too, supervisor warning fires + worker doesn't, and
+supervisor + --permanent = no warning but still bypass.
+
 ### Fixed (`st init`/`st launch` emit `bin/st` + `st ding`, not the legacy `bin/coord` + `coord ding`)
 
 Two rename leftovers from the coord→st cutover that were producing
