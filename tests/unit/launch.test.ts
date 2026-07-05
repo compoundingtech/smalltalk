@@ -512,6 +512,82 @@ describe('cmdLaunch — pty.toml generation', () => {
     expect(r.ptyTomlPreview).toContain('prefix = "taskflow-dev"');
   });
 
+  // ─── ST_ROOT propagation (isolation-robust across pty restart) ──────
+
+  it('ST_ROOT propagation: no ST_ROOT/COORD_ROOT in invoker env → no ST_ROOT in pty.toml', async () => {
+    // Default-path launch. pty.toml must NOT freeze today's default
+    // into future `pty up` invocations — leaves env unset so restart-
+    // time resolution runs.
+    const r = await cmdLaunch(
+      baseInput({ identity: 'alice', env: {} as NodeJS.ProcessEnv }),
+      ctx
+    );
+    expect(r.ptyTomlPreview).toContain('ST_AGENT = "alice"');
+    expect(r.ptyTomlPreview).not.toContain('ST_ROOT =');
+  });
+
+  it('ST_ROOT propagation: invoker had ST_ROOT set → pinned into pty.toml session env', async () => {
+    // The isolation-robustness case cos surfaced. A session launched
+    // under an explicit ST_ROOT should keep that root across `pty up`
+    // / `pty restart` / `pty gc` resurrection — even from a shell
+    // that never exported ST_ROOT.
+    const isolatedRoot = '/tmp/eval-scratch/state';
+    const r = await cmdLaunch(
+      baseInput({
+        identity: 'alice',
+        env: { ST_ROOT: isolatedRoot } as NodeJS.ProcessEnv,
+        coordRoot: isolatedRoot,
+      }),
+      ctx
+    );
+    expect(r.ptyTomlPreview).toContain(
+      `ST_ROOT = "${isolatedRoot}"`
+    );
+  });
+
+  it('ST_ROOT propagation: invoker had legacy COORD_ROOT set → pinned as ST_ROOT (canonicalized)', async () => {
+    // A user still on the legacy COORD_ROOT env var gets the pty
+    // session env under the canonical ST_ROOT name, matching the
+    // rest of the rename-cutover conventions. `input.coordRoot` is
+    // already resolved from COORD_ROOT at the CLI layer.
+    const legacyRoot = '/tmp/legacy-run/state';
+    const r = await cmdLaunch(
+      baseInput({
+        identity: 'alice',
+        env: { COORD_ROOT: legacyRoot } as NodeJS.ProcessEnv,
+        coordRoot: legacyRoot,
+      }),
+      ctx
+    );
+    expect(r.ptyTomlPreview).toContain(
+      `ST_ROOT = "${legacyRoot}"`
+    );
+  });
+
+  it('ST_ROOT propagation: codex ding sidecar env also gets ST_ROOT for isolation', async () => {
+    // A codex launch spawns both the main session and a `coord ding`
+    // sidecar; a `pty restart <sess>-ding` must not drift back to
+    // the live default state root either.
+    const isolatedRoot = '/tmp/codex-scratch/state';
+    const r = await cmdLaunch(
+      baseInput({
+        harness: 'codex',
+        identity: 'alice',
+        env: { ST_ROOT: isolatedRoot } as NodeJS.ProcessEnv,
+        coordRoot: isolatedRoot,
+      }),
+      ctx
+    );
+    // Both env blocks — main session + ding sidecar — carry ST_ROOT.
+    const stRootLines = r.ptyTomlPreview!.split('\n').filter((line) =>
+      line.startsWith('ST_ROOT = ')
+    );
+    expect(stRootLines).toEqual([
+      `ST_ROOT = "${isolatedRoot}"`,
+      `ST_ROOT = "${isolatedRoot}"`,
+    ]);
+  });
+
   it('claude preview has no ding sidecar', async () => {
     const r = await cmdLaunch(
       baseInput({ harness: 'claude', identity: 'alice' }),

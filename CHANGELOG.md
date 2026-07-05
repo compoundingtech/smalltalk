@@ -6,6 +6,41 @@ minor releases until 1.0.
 
 ## Unreleased
 
+### Fixed (`st launch` pins `ST_ROOT` into the generated pty.toml when the invoker set it)
+
+Historic behavior: the generated pty.toml's `[sessions.*.env]`
+carried only `ST_AGENT`. Isolation of an st-launched agent to a
+non-default state root (`ST_ROOT=/tmp/eval-scratch/state st launch
+…`) worked on first boot via env inheritance (invoker → st launch
+→ pty up → session), but a later `pty up` / `pty restart` /
+`pty gc` resurrection from a shell without `ST_ROOT` exported
+silently fell back to the live default (`~/.local/state/smalltalk`).
+Real isolation hole for anyone running an isolated tree —
+eval-cell live proof: an st-launched agent's status write landed
+in the isolated root the first time; a manual restart would have
+landed in the live bus.
+
+Fix: when the invoker had `ST_ROOT` (or legacy `COORD_ROOT`)
+explicitly set, bake the resolved absolute path into every
+`[sessions.*.env]` block as `ST_ROOT` — main session + codex ding
+sidecar. Default-path launches leave the env unset so pty.toml
+doesn't freeze today's default into tomorrow's restarts.
+
+Scope kept minimal:
+- Only `ST_ROOT` propagates; identity is already baked as
+  `ST_AGENT`, and both hook scripts and CLI code use the resolution
+  chain that prefers ST_AGENT → ST_IDENTITY → COORD_IDENTITY, so
+  the legacy aliases don't need explicit baking.
+- No `--env KEY=VAL` passthrough (deferred). Auto-propagate covers
+  the flagged isolation case; a generic passthrough is a small
+  follow-up if the need surfaces.
+- 4 new unit tests cover: no-invoker-env (nothing baked), ST_ROOT
+  set (baked), legacy COORD_ROOT set (canonicalized to ST_ROOT),
+  codex ding sidecar (both env blocks pinned).
+
+Unblocks eval cells retiring their bespoke launchers for real
+`st launch`.
+
 ### Fixed (channel-watcher re-delivers inbox contents on start — at-least-once)
 
 Historic behavior: on `startChannelWatcher`, an initial
