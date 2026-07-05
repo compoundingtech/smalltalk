@@ -1096,6 +1096,188 @@ describe('cmdLaunch — --ding claude ding-mode (no MCP)', () => {
   });
 });
 
+describe('cmdLaunch — DING-BUS.md install (ding-mode instructions blurb)', () => {
+  // Cos-approved: ding-mode agents don't get MCP `instructions:`,
+  // so `st launch --ding` installs the bus-mechanics contract via
+  // an `@DING-BUS.md` import — the ding-mode analog of
+  // src/mcp/capabilities.ts:CHANNEL_INSTRUCTIONS. Same mechanism
+  // as `--persona`; composes with it.
+
+  it('default (no --ding) → NO DING-BUS.md install; dingBus is null', async () => {
+    // Regression guard: byte-identical to pre-fix behavior on the
+    // MCP path. DING-BUS.md is a --ding-only concept.
+    const r = await cmdLaunch(
+      baseInput({ harness: 'claude', identity: 'alice' }),
+      ctx
+    );
+    expect(r.dingBus).toBeNull();
+  });
+
+  it('--ding claude → dingBus result populated (dry-run)', async () => {
+    const r = await cmdLaunch(
+      baseInput({
+        harness: 'claude',
+        identity: 'alice',
+        ding: true,
+      }),
+      ctx
+    );
+    expect(r.dingBus).not.toBeNull();
+    expect(r.dingBus!.dingBusMdPath).toBe(join(cwd, 'DING-BUS.md'));
+    expect(r.dingBus!.entryFile).toBe('CLAUDE.md');
+    expect(r.dingBus!.entryFilePath).toBe(join(cwd, 'CLAUDE.md'));
+    // Fresh cwd → CLAUDE.md didn't exist, will be created; import
+    // append required.
+    expect(r.dingBus!.entryFileCreated).toBe(true);
+    expect(r.dingBus!.importLineAppended).toBe(true);
+  });
+
+  it('--ding on live run → DING-BUS.md written with the bus-mechanics blurb + CLAUDE.md gets @DING-BUS.md', async () => {
+    await cmdLaunch(
+      baseInput({
+        harness: 'claude',
+        identity: 'alice',
+        ding: true,
+        dryRun: false,
+        captureOnly: true,
+      }),
+      ctx
+    );
+    // DING-BUS.md was written with the constant's content — sample
+    // load-bearing substrings (no `<channel>` blocks; boot ritual
+    // via CLI; `[DING]` poke handling; threads stay on the bus).
+    const dingBusText = readFileSync(join(cwd, 'DING-BUS.md'), 'utf8');
+    expect(dingBusText).toContain('You are connected to smalltalk via ding-mode');
+    expect(dingBusText).toContain('NOT receive `<channel>` blocks');
+    expect(dingBusText).toContain('st status $ST_AGENT --set available');
+    expect(dingBusText).toContain('[DING]');
+    expect(dingBusText).toContain('Threads stay on the bus');
+    // Regression guard: naming stays `smalltalk`/`st`, no `coord`
+    // leak in this user-visible bus contract.
+    expect(dingBusText).not.toMatch(/\bcoord\b/);
+    // CLAUDE.md was created with the @DING-BUS.md import line.
+    const claudeMdText = readFileSync(join(cwd, 'CLAUDE.md'), 'utf8');
+    expect(claudeMdText).toContain('@DING-BUS.md');
+  });
+
+  it('--ding composes with --persona (both @-imports land in CLAUDE.md)', async () => {
+    // Verifies the two installs don't fight — the persona's
+    // installPersona and the ding-bus install both surgically
+    // append to CLAUDE.md.
+    const personaFile = join(scratch, 'chief-of-staff.md');
+    writeFileSync(personaFile, '# fake CoS persona\n');
+    await cmdLaunch(
+      baseInput({
+        harness: 'claude',
+        identity: 'cos',
+        ding: true,
+        persona: personaFile,
+        dryRun: false,
+        captureOnly: true,
+      }),
+      ctx
+    );
+    const claudeMdText = readFileSync(join(cwd, 'CLAUDE.md'), 'utf8');
+    expect(claudeMdText).toContain('@PERSONA.md');
+    expect(claudeMdText).toContain('@DING-BUS.md');
+  });
+
+  it('--ding on live run → DING-BUS.md added to .git/info/exclude', async () => {
+    // Init a git repo in the cwd so the git-exclude branch fires.
+    const { execSync } = await import('node:child_process');
+    execSync('git init -q', { cwd });
+    await cmdLaunch(
+      baseInput({
+        harness: 'claude',
+        identity: 'alice',
+        ding: true,
+        dryRun: false,
+        captureOnly: true,
+      }),
+      ctx
+    );
+    const excludeText = readFileSync(
+      join(cwd, '.git', 'info', 'exclude'),
+      'utf8'
+    );
+    expect(excludeText).toContain('DING-BUS.md');
+    expect(excludeText).toContain('CLAUDE.md');
+  });
+
+  it('--ding codex → no DING-BUS.md install (codex has its own instructions path)', async () => {
+    // dingBus stays null for codex even when --ding is explicit.
+    const r = await cmdLaunch(
+      baseInput({
+        harness: 'codex',
+        identity: 'alice',
+        ding: true,
+      }),
+      ctx
+    );
+    expect(r.dingBus).toBeNull();
+  });
+
+  it('--ding + missing git repo → advisory stderr warning; DING-BUS.md still installs', async () => {
+    await cmdLaunch(
+      baseInput({
+        harness: 'claude',
+        identity: 'alice',
+        ding: true,
+        dryRun: false,
+        captureOnly: true,
+      }),
+      ctx
+    );
+    expect(stderrBuf).toContain('not a git repo');
+    expect(stderrBuf).toContain('DING-BUS.md is still');
+    expect(existsSync(join(cwd, 'DING-BUS.md'))).toBe(true);
+  });
+
+  it('--ding re-run: @DING-BUS.md line NOT duplicated in CLAUDE.md (idempotent)', async () => {
+    // First run creates CLAUDE.md with the import.
+    await cmdLaunch(
+      baseInput({
+        harness: 'claude',
+        identity: 'alice',
+        ding: true,
+        dryRun: false,
+        captureOnly: true,
+      }),
+      ctx
+    );
+    const firstText = readFileSync(join(cwd, 'CLAUDE.md'), 'utf8');
+    // Second run — should be a no-op on the import line.
+    stderrBuf = '';
+    const r2 = await cmdLaunch(
+      baseInput({
+        harness: 'claude',
+        identity: 'alice',
+        ding: true,
+        dryRun: false,
+        captureOnly: true,
+      }),
+      ctx
+    );
+    const secondText = readFileSync(join(cwd, 'CLAUDE.md'), 'utf8');
+    expect(secondText).toBe(firstText);
+    expect(r2.dingBus!.importLineAppended).toBe(false);
+  });
+
+  it('CLI dry-run summary shows the ding-bus block when --ding is set', async () => {
+    const { cmdLaunchCli } = await import('../../src/commands/launch.ts');
+    await cmdLaunchCli(
+      ['claude', '--identity', 'alice', '--ding', '--dry-run'],
+      ctx
+    );
+    expect(stdoutBuf).toContain('ding-bus:');
+    // The write-target path includes DING-BUS.md; the entry-file
+    // action line names it too (`create` when we made CLAUDE.md
+    // fresh, `append @DING-BUS.md` when it existed).
+    expect(stdoutBuf).toContain('DING-BUS.md');
+    expect(stdoutBuf).toContain('entry file:');
+  });
+});
+
 describe('cmdLaunch — --unattended auto-poker (F1)', () => {
   // The poker prepends a background subshell that pty-sends 4 Enter
   // keys with 4s spacing before exec'ing the main claude command,
