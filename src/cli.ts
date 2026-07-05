@@ -9,8 +9,8 @@
 // (4) catch CoordError → stderr + exit 1.
 
 import { spawnSync } from 'node:child_process';
-import { realpathSync, statSync } from 'node:fs';
-import { delimiter, join } from 'node:path';
+import { readFileSync, realpathSync, statSync } from 'node:fs';
+import { delimiter, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { coordConfigFrom, coordRootFrom } from './common.ts';
@@ -77,7 +77,8 @@ function messageUsage(name: string): string {
 
 function topLevelUsage(name: string): string {
   return (
-    `usage: ${name} <subcommand> [args...]\n\n` +
+    `usage: ${name} <subcommand> [args...]\n` +
+    `       ${name} --help | --version\n\n` +
   `Messages:\n` +
   `  message <verb> [args...]   (alias: msg)\n` +
   `    send | ls | read | archive | thread\n\n` +
@@ -179,6 +180,23 @@ async function dispatchMessage(
   }
 }
 
+/**
+ * `<invokedName> <semver>\n` — the payload for `<name> --version`.
+ * Reads package.json at runtime relative to this module's on-disk
+ * location, so it works under `npm link` (where the source lives
+ * elsewhere on the filesystem) without a build-time constant. Follows
+ * the same invoked-name convention as the help banners: `coord
+ * --version` prints `coord 0.3.0`.
+ */
+function versionString(env: NodeJS.ProcessEnv): string {
+  const here = fileURLToPath(import.meta.url);
+  const pkgPath = join(dirname(here), '..', 'package.json');
+  const pkg = JSON.parse(readFileSync(pkgPath, 'utf8')) as {
+    version: string;
+  };
+  return `${invokedName(env)} ${pkg.version}\n`;
+}
+
 export async function runCli(
   argv: readonly string[],
   ctx: CliContext = defaultCliContext()
@@ -191,6 +209,10 @@ export async function runCli(
   const cmd = argv[0]!;
   if (cmd === 'help' || cmd === '--help' || cmd === '-h') {
     ctx.stdout(topLevelUsage(name));
+    return 0;
+  }
+  if (cmd === '--version') {
+    ctx.stdout(versionString(ctx.env));
     return 0;
   }
   const rest = argv.slice(1);
