@@ -614,7 +614,9 @@ describe('cmdLaunch — pty.toml generation', () => {
     expect(r.ptyTomlPreview).toContain(
       'st ding alice-codex --identity alice'
     );
-    expect(r.ptyTomlPreview).toContain('tags = { role = "ding" }');
+    expect(r.ptyTomlPreview).toMatch(
+      /tags = { role = "ding", "st\.network" = "[^"]+" }/
+    );
     expect(r.ptyTomlPreview).not.toContain('strategy = "permanent"');
     // Rename regression guard: emit the canonical `st ding`, never
     // `coord ding`. Hardcoding the legacy name into fresh pty.toml
@@ -665,7 +667,9 @@ describe('cmdLaunch — pty.toml generation', () => {
       baseInput({ harness: 'codex', identity: 'alice' }),
       ctx
     );
-    expect(r.ptyTomlPreview).toContain('tags = { role = "agent" }');
+    expect(r.ptyTomlPreview).toMatch(
+      /tags = { role = "agent", "st\.network" = "[^"]+" }/
+    );
     // No `strategy = ...` line anywhere in the preview.
     expect(r.ptyTomlPreview).not.toMatch(/strategy = "/);
   });
@@ -679,6 +683,72 @@ describe('cmdLaunch — pty.toml generation', () => {
     expect(r.ptyTomlPreview).toContain(
       'st ding alice-agentx --identity alice'
     );
+  });
+
+  // ─── Phase-1 pty isolation: `st.network` tag ────────────────────────
+
+  it('agent + ding tags both carry `"st.network" = "<resolved network>"` (Phase-1 pty isolation)', async () => {
+    // The st.network tag is a uniform inspection signal: presence
+    // means "this is a smalltalk-network session"; value names the
+    // network. pty's --filter-tag primitive reads it via
+    // sessionTags["st.network"] — verified against smol-toml that
+    // the quoted-key form `"st.network" = "..."` parses as a
+    // literal `st.network` string key.
+    const isolatedRoot = '/tmp/eval-scratch/state';
+    const r = await cmdLaunch(
+      baseInput({
+        harness: 'codex',
+        identity: 'alice',
+        env: { ST_ROOT: isolatedRoot } as NodeJS.ProcessEnv,
+        coordRoot: isolatedRoot,
+      }),
+      ctx
+    );
+    // Both the agent AND the ding tag blocks carry the tag with
+    // the same value — the whole launch is one network.
+    const tagLines = r.ptyTomlPreview!.split('\n').filter((l) =>
+      l.includes('"st.network"')
+    );
+    expect(tagLines).toHaveLength(2);
+    for (const line of tagLines) {
+      expect(line).toContain(`"st.network" = "${isolatedRoot}"`);
+    }
+  });
+
+  it('st.network tag emits for the DEFAULT network too (unlike ST_ROOT env)', async () => {
+    // Deliberate asymmetry per pty-claude's design: the ST_ROOT
+    // *env* line omits itself on the default network (so pty.toml
+    // doesn't freeze today's default into tomorrow's restarts), but
+    // the st.network *tag* is a pure inspection label, so it emits
+    // uniformly. `st.network` present in a pty.toml = "this is a
+    // smalltalk-network session, regardless of which network."
+    const r = await cmdLaunch(
+      // No ST_ROOT/COORD_ROOT in env → default network.
+      baseInput({ harness: 'claude', identity: 'alice', env: {} as NodeJS.ProcessEnv }),
+      ctx
+    );
+    // ST_ROOT env line should NOT be baked (default-network shape).
+    expect(r.ptyTomlPreview).not.toContain('ST_ROOT =');
+    // But the st.network tag IS present (the uniformity — pty-claude's steer).
+    expect(r.ptyTomlPreview).toContain('"st.network"');
+    // Value is the resolved coordRoot (a real absolute path, the test
+    // scratch dir since we override it).
+    expect(r.ptyTomlPreview).toMatch(/"st\.network" = "\/.+"/);
+  });
+
+  it('claude launch (no ding) also carries st.network on the agent tag', async () => {
+    // Regression guard: even without a ding sidecar, the agent
+    // block MUST carry the tag. A single-tagged claude launch is
+    // still a network member.
+    const r = await cmdLaunch(
+      baseInput({ harness: 'claude', identity: 'alice' }),
+      ctx
+    );
+    const tagLines = r.ptyTomlPreview!.split('\n').filter((l) =>
+      l.includes('"st.network"')
+    );
+    expect(tagLines).toHaveLength(1);
+    expect(tagLines[0]).toContain('role = "agent"');
   });
 });
 
@@ -698,7 +768,10 @@ describe('cmdLaunch — --permanent + CoS-shaped footgun-guard', () => {
       ctx
     );
     expect(r.permanent).toBe(false);
-    expect(r.ptyTomlPreview).toContain('tags = { role = "agent" }');
+    // No `strategy =` in the agent tags between role and st.network.
+    expect(r.ptyTomlPreview).toMatch(
+      /tags = { role = "agent", "st\.network" = "[^"]+" }/
+    );
     expect(r.ptyTomlPreview).not.toContain('strategy = "permanent"');
   });
 
@@ -712,8 +785,8 @@ describe('cmdLaunch — --permanent + CoS-shaped footgun-guard', () => {
       ctx
     );
     expect(r.permanent).toBe(true);
-    expect(r.ptyTomlPreview).toContain(
-      'tags = { role = "agent", strategy = "permanent" }'
+    expect(r.ptyTomlPreview).toMatch(
+      /tags = { role = "agent", strategy = "permanent", "st\.network" = "[^"]+" }/
     );
   });
 
@@ -730,11 +803,11 @@ describe('cmdLaunch — --permanent + CoS-shaped footgun-guard', () => {
       }),
       ctx
     );
-    expect(r.ptyTomlPreview).toContain(
-      'tags = { role = "agent", strategy = "permanent" }'
+    expect(r.ptyTomlPreview).toMatch(
+      /tags = { role = "agent", strategy = "permanent", "st\.network" = "[^"]+" }/
     );
-    expect(r.ptyTomlPreview).toContain(
-      'tags = { role = "ding", strategy = "permanent" }'
+    expect(r.ptyTomlPreview).toMatch(
+      /tags = { role = "ding", strategy = "permanent", "st\.network" = "[^"]+" }/
     );
   });
 

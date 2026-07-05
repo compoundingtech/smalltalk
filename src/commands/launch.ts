@@ -601,6 +601,29 @@ function buildPtyToml(opts: {
    * matched pair.
    */
   agentStrategy: string | undefined;
+  /**
+   * Phase-1 pty isolation label baked into BOTH the agent session
+   * AND the ding sidecar tags as `"st.network" = "<value>"`.
+   * Always emitted (unlike `stRoot`, which conditionally emits an
+   * `ST_ROOT` env var); the goal is a uniform inspection signal
+   * that separates "this is a smalltalk-network session" from
+   * an operator's ad-hoc pty use. Value is the resolved network
+   * root — the same `input.coordRoot` cmdLaunch already computes
+   * via `coordRootFrom(ctx.env)`, so it's always a valid path
+   * regardless of whether the invoker set `ST_ROOT` explicitly.
+   *
+   * pty needs zero change to filter on this: its `--filter-tag
+   * st.network=<value>` primitive reads `sessionTags["st.network"]`
+   * verbatim (see ../pty/src/tags.ts:matchesAllTags). The TOML
+   * inline-table quoted-key form (`"st.network" = "..."`) parses
+   * as a literal `st.network` string key in smol-toml — verified
+   * live before landing.
+   *
+   * Key spelled `st.network` exactly (pty-claude's choice — visible,
+   * non-reserved). The dot is inside a quoted key so it's not
+   * interpreted as a TOML dotted-key nested-table.
+   */
+  network: string;
 }): string {
   // pty runs `command` via `sh -c`, so produce a shell command line by
   // space-joining shell-quoted argv elements. Then TOML-quote the
@@ -631,13 +654,17 @@ function buildPtyToml(opts: {
   lines.push(`command = "${tomlEscape(shellLine)}"`);
   // Agent tags. The optional `strategy` value gets mirrored to the
   // ding sidecar below, so the launch always emits a matched pair
-  // — no mixed-strategy pty.toml.
+  // — no mixed-strategy pty.toml. `st.network` is always emitted
+  // (see `opts.network` docstring): uniform inspection signal +
+  // pty's `--filter-tag st.network=<v>` primitive for network-scoped
+  // TUI/list operations.
+  const networkTag = `"st.network" = "${tomlEscape(opts.network)}"`;
   if (opts.agentStrategy !== undefined) {
     lines.push(
-      `tags = { role = "agent", strategy = "${tomlEscape(opts.agentStrategy)}" }`
+      `tags = { role = "agent", strategy = "${tomlEscape(opts.agentStrategy)}", ${networkTag} }`
     );
   } else {
-    lines.push(`tags = { role = "agent" }`);
+    lines.push(`tags = { role = "agent", ${networkTag} }`);
   }
   lines.push('');
   lines.push(`[sessions.${opts.sessionName}.env]`);
@@ -684,13 +711,15 @@ function buildPtyToml(opts: {
     // to `strategy = "permanent"` while the agent had no strategy
     // tag — a mismatch that zombied the ding on `pty gc` after
     // the codex session died. Now: whatever the agent got, the
-    // ding gets.
+    // ding gets. `st.network` mirrors too — the whole launch is
+    // one network, so the sidecar carries the same tag as the
+    // main session.
     if (opts.agentStrategy !== undefined) {
       lines.push(
-        `tags = { role = "ding", strategy = "${tomlEscape(opts.agentStrategy)}" }`
+        `tags = { role = "ding", strategy = "${tomlEscape(opts.agentStrategy)}", ${networkTag} }`
       );
     } else {
-      lines.push(`tags = { role = "ding" }`);
+      lines.push(`tags = { role = "ding", ${networkTag} }`);
     }
     lines.push('');
     lines.push(`[sessions.ding.env]`);
@@ -1636,6 +1665,11 @@ export async function cmdLaunch(
       unattended,
       stRoot: stRootForSession,
       agentStrategy,
+      // Phase-1 pty isolation label. Always emitted (unlike
+      // stRoot, which conditionally emits the ST_ROOT env line);
+      // input.coordRoot is resolved at the CLI layer and always
+      // a valid path.
+      network: input.coordRoot,
     });
     ptyTomlPreview = preview;
     if (!input.dryRun && !existsSync(ptyTomlPath)) {
@@ -1658,6 +1692,11 @@ export async function cmdLaunch(
       unattended,
       stRoot: stRootForSession,
       agentStrategy,
+      // Phase-1 pty isolation label. Always emitted (unlike
+      // stRoot, which conditionally emits the ST_ROOT env line);
+      // input.coordRoot is resolved at the CLI layer and always
+      // a valid path.
+      network: input.coordRoot,
     });
   }
 
