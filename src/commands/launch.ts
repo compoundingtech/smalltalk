@@ -661,7 +661,21 @@ function buildPtyToml(opts: {
     // break every `st launch codex` config generated pre-fix. Users
     // regenerate their pty.toml (rm pty.toml && st launch codex …)
     // to pick up the new form.
-    const dingLine = `st ding ${shellQuote(opts.sessionName)} --identity ${shellQuote(opts.identity)}`;
+    //
+    // The target passed to `st ding` MUST be the fully-qualified
+    // pty session name (`${prefix}-${sessionName}` = `${identity}-
+    // ${sessionName}` per F3) — same reason the F1 auto-poker at
+    // ~line 615 uses that form. pty joins prefix + sessionName with
+    // a dash (see ../pty/src/ptyfile.ts:58); addressing the bare
+    // sessionName from a `pty send` context returns
+    // `Session "<x>" not found` and every poke silently fails.
+    // Historic bug: this line used bare `opts.sessionName`, which
+    // (a) silently mis-addressed every ding poke, and (b) was
+    // masked by #62's startup-grace — the ding kept waiting for
+    // the wrong name forever, looking healthy while delivering
+    // nothing.
+    const dingTarget = `${opts.identity}-${opts.sessionName}`;
+    const dingLine = `st ding ${shellQuote(dingTarget)} --identity ${shellQuote(opts.identity)}`;
     lines.push('');
     lines.push(`[sessions.ding]`);
     lines.push(`command = "${tomlEscape(dingLine)}"`);
@@ -682,8 +696,8 @@ function buildPtyToml(opts: {
     lines.push(`[sessions.ding.env]`);
     lines.push(`ST_AGENT = "${tomlEscape(opts.identity)}"`);
     // Same rationale as the main session's env: pin the isolation
-    // root so `pty restart <sess>-ding` doesn't drift back to the
-    // live default state root.
+    // root so `pty restart <identity>-ding` doesn't drift back to
+    // the live default state root.
     if (opts.stRoot !== undefined) {
       lines.push(`ST_ROOT = "${tomlEscape(opts.stRoot)}"`);
     }

@@ -612,7 +612,7 @@ describe('cmdLaunch — pty.toml generation', () => {
     );
     expect(r.ptyTomlPreview).toContain('[sessions.ding]');
     expect(r.ptyTomlPreview).toContain(
-      'st ding codex --identity alice'
+      'st ding alice-codex --identity alice'
     );
     expect(r.ptyTomlPreview).toContain('tags = { role = "ding" }');
     expect(r.ptyTomlPreview).not.toContain('strategy = "permanent"');
@@ -621,6 +621,38 @@ describe('cmdLaunch — pty.toml generation', () => {
     // files would break every generated config the day the coord
     // alias is dropped.
     expect(r.ptyTomlPreview).not.toContain('coord ding');
+    // Identity-prefix regression guard: evals-claude caught this
+    // as the CRITICAL Johannes-CoS delivery blocker. The ding
+    // target MUST be the FQN pty session name (`${identity}-
+    // ${sessionName}` per F3), not the bare sessionName. Bare
+    // would return `Session "<x>" not found` and silently drop
+    // every poke — the failure #62's startup-grace masked. Same
+    // class as the F1 poker slash-vs-dash bug.
+    expect(r.ptyTomlPreview).not.toMatch(
+      /st ding codex --identity alice/
+    );
+  });
+
+  it('ding target is identity-prefixed even with a custom --session-name', async () => {
+    // Regression guard covering the eval scenario cos cited:
+    // identity `dm-dev`, sessionName `stev-ding-mode-...-dm-dev` →
+    // ding target must be `dm-dev-stev-ding-mode-...-dm-dev`, not
+    // the bare sessionName.
+    const r = await cmdLaunch(
+      baseInput({
+        harness: 'codex',
+        identity: 'dm-dev',
+        sessionName: 'stev-ding-mode-eval-dm-dev',
+      }),
+      ctx
+    );
+    expect(r.ptyTomlPreview).toContain(
+      'st ding dm-dev-stev-ding-mode-eval-dm-dev --identity dm-dev'
+    );
+    // Bare form MUST NOT appear.
+    expect(r.ptyTomlPreview).not.toMatch(
+      /st ding stev-ding-mode-eval-dm-dev --identity/
+    );
   });
 
   it('agent tags stay { role = "agent" } with no strategy field by default', async () => {
@@ -645,7 +677,7 @@ describe('cmdLaunch — pty.toml generation', () => {
     );
     expect(r.ptyTomlPreview).toContain('[sessions.agentx]');
     expect(r.ptyTomlPreview).toContain(
-      'st ding agentx --identity alice'
+      'st ding alice-agentx --identity alice'
     );
   });
 });
@@ -968,7 +1000,7 @@ describe('cmdLaunch — --ding claude ding-mode (no MCP)', () => {
     // Ding sidecar in pty.toml, same shape as codex.
     expect(r.ptyTomlPreview).toContain('[sessions.ding]');
     expect(r.ptyTomlPreview).toContain(
-      'st ding claude --identity alice'
+      'st ding alice-claude --identity alice'
     );
   });
 
@@ -1661,7 +1693,7 @@ describe('cmdLaunch — live-path regression (dry-run bypasses this)', () => {
     const pty = readFileSync(join(cwd, 'pty.toml'), 'utf8');
     expect(pty).toContain('[sessions.codex]');
     expect(pty).toContain('[sessions.ding]');
-    expect(pty).toContain('st ding codex --identity live-bob');
+    expect(pty).toContain('st ding live-bob-codex --identity live-bob');
     // Codex path doesn't touch newUuid(), but the init.ts /
     // status.ts sibling `require`s in the error paths are compiled
     // in this run — a regression there would still surface.

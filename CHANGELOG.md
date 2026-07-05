@@ -6,6 +6,70 @@ minor releases until 1.0.
 
 ## Unreleased
 
+### Fixed (CRITICAL — `st ding` sidecar command targets the FQN pty session, not the bare `sessionName`)
+
+evals-claude's end-to-end confirmation run of the Johannes stack
+caught a SECOND `--ding` bug that #62's startup-grace was
+masking: the ding sidecar was addressing the WRONG pty session
+name → every `[DING]` poke returned `Session "<x>" not found`
+→ delivery was silently broken even though survival looked
+healthy.
+
+Root cause: `buildPtyToml` composed the ding sidecar command as
+
+```
+st ding <sessionName> --identity <identity>
+```
+
+using the BARE `sessionName` — same value that goes into the
+`[sessions.<sessionName>]` TOML block. But pty joins `prefix +
+sessionName` with a dash (see `../pty/src/ptyfile.ts:58`, the
+same convention the F1 auto-poker dash-fix landed on), so the
+FQN pty session name is `<identity>-<sessionName>`. Addressing
+the bare form silently mis-hits every poke.
+
+Example failure mode: `st launch claude --identity cos --ding`
+→ pty.toml wrote `st ding claude --identity cos`, but the actual
+pty session key was `cos-claude`. Every poke `pty send "claude"`
+returned "Session not found".
+
+**#62 masked it perfectly:** the startup-grace waited for the
+bare name to appear, which never happens (real name is
+prefixed), so the sidecar survived forever LOOKING healthy while
+delivering nothing.
+
+Fix: one-line change at the ding-command build site — target
+`${opts.identity}-${opts.sessionName}` instead of bare
+`${opts.sessionName}`. Matches the F1 auto-poker at the same
+function (which already uses the FQN form, correctly, since the
+dash-fix landed).
+
+Class audit: this is the SECOND session-name-addressing bug in
+`launch.ts` (F1 poker slash-vs-dash was the first). Grepped all
+send-target sites: only the ding command line had the bug — the
+poker uses the FQN form, and the `[sessions.NAME]` blocks are
+structural declarations (pty prepends the prefix automatically).
+`src/commands/ding.ts` sends whatever it's told; the bug was
+purely in what launch.ts passed as the CLI arg.
+
+- **Positive regression guard**: existing `st ding <target>`
+  assertions updated to the FQN form. Every claude ding-mode +
+  codex launch now asserts the identity-prefixed target.
+- **Negative regression guard**: the bare form is explicitly
+  negated with `.not.toMatch` so a future refactor can't revert
+  to the mis-addressed shape.
+- **New scenario test** covering the eval case cos cited:
+  identity `dm-dev` + custom `--session-name` → ding target must
+  be the identity-prefixed form, not the bare sessionName.
+
+Full suite: 1531 pass, only the 4 pre-existing integration flakes.
+
+Unblocks:
+- Johannes's ding-mode CoS delivery end-to-end (#62 unmasked
+  this; now delivery actually works).
+- The eval suite's ding-mode delivery (evals-claude's confirmation
+  re-run can now truly close the loop).
+
 ### Fixed (CRITICAL — `st ding` startup grace: sidecar no longer dies on the launch race)
 
 evals-claude's live ding-mode run caught a critical defect that
