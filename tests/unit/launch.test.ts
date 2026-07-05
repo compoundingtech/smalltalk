@@ -931,6 +931,168 @@ describe('cmdLaunch — spawner-shaped detection (Nathan\'s 3-tier)', () => {
   });
 });
 
+describe('cmdLaunch — --ding claude ding-mode (no MCP)', () => {
+  // `--ding` is the Johannes-unblock: launch claude codex-style —
+  // no MCP wiring (skip .mcp.json, no --channel flag), add an
+  // `st ding` sidecar for inbox delivery. Load-bearing for
+  // environments where MCP servers can't run at all.
+
+  it('default (no --ding) → claude gets .mcp.json + channel flag; no ding sidecar', async () => {
+    // Regression guard: byte-identical to pre-fix behavior.
+    const r = await cmdLaunch(
+      baseInput({ harness: 'claude', identity: 'alice' }),
+      ctx
+    );
+    expect(r.ding).toBe(false);
+    expect(r.channel).toBe(true);
+    expect(r.argv.join(' ')).toContain(
+      '--dangerously-load-development-channels server:st'
+    );
+    expect(r.ptyTomlPreview).not.toContain('[sessions.ding]');
+  });
+
+  it('--ding on claude → no channel flag, ding sidecar added', async () => {
+    const r = await cmdLaunch(
+      baseInput({ harness: 'claude', identity: 'alice', ding: true }),
+      ctx
+    );
+    expect(r.ding).toBe(true);
+    expect(r.channel).toBe(false);
+    // No --dangerously-load-development-channels in the argv.
+    expect(r.argv.join(' ')).not.toContain(
+      '--dangerously-load-development-channels'
+    );
+    // Ding sidecar in pty.toml, same shape as codex.
+    expect(r.ptyTomlPreview).toContain('[sessions.ding]');
+    expect(r.ptyTomlPreview).toContain(
+      'st ding claude --identity alice'
+    );
+  });
+
+  it('--ding on claude → cmdInit NOT called (no .mcp.json write on live run)', async () => {
+    // The critical Johannes-blocker: skip MCP wiring entirely.
+    // cmdInit would call statSync + writeFileSync inside the cwd;
+    // its skip is what lets a Johannes-shaped env launch at all.
+    await cmdLaunch(
+      baseInput({
+        harness: 'claude',
+        identity: 'alice',
+        ding: true,
+        dryRun: false,
+        captureOnly: true,
+      }),
+      ctx
+    );
+    expect(existsSync(join(cwd, '.mcp.json'))).toBe(false);
+  });
+
+  it('--ding on claude WITHOUT --ding → .mcp.json IS written on live run (regression guard)', async () => {
+    // Prove the ding-mode skip is scoped — a non-ding claude launch
+    // still writes .mcp.json as before.
+    await cmdLaunch(
+      baseInput({
+        harness: 'claude',
+        identity: 'alice',
+        dryRun: false,
+        captureOnly: true,
+      }),
+      ctx
+    );
+    expect(existsSync(join(cwd, '.mcp.json'))).toBe(true);
+  });
+
+  it('--ding on claude → stale .mcp.json triggers an advisory stderr warning', async () => {
+    // Operator-friendly: if you switch from MCP-mode to ding-mode
+    // and left a .mcp.json behind, tell them. Advisory, not fatal.
+    writeFileSync(
+      join(cwd, '.mcp.json'),
+      '{"mcpServers": {"st": {"type": "stdio", "command": "st", "args": ["mcp"], "env": {}}}}\n'
+    );
+    await cmdLaunch(
+      baseInput({
+        harness: 'claude',
+        identity: 'alice',
+        ding: true,
+      }),
+      ctx
+    );
+    expect(stderrBuf).toContain('existing .mcp.json');
+    expect(stderrBuf).toContain('Delete it (rm .mcp.json)');
+  });
+
+  it('--ding on codex → no-op (codex is already ding-mode by default)', async () => {
+    // Byte-identical to `st launch codex` without the flag.
+    // Regression guard: flag on codex must not double-write or
+    // add a second ding session.
+    const rBaseline = await cmdLaunch(
+      baseInput({ harness: 'codex', identity: 'alice' }),
+      ctx
+    );
+    stderrBuf = '';
+    const rWithDing = await cmdLaunch(
+      baseInput({ harness: 'codex', identity: 'alice', ding: true }),
+      ctx
+    );
+    // Both should still have the codex ding sidecar exactly once.
+    const countDingSessions = (s: string): number =>
+      (s.match(/\[sessions\.ding\]/g) ?? []).length;
+    expect(countDingSessions(rBaseline.ptyTomlPreview!)).toBe(1);
+    expect(countDingSessions(rWithDing.ptyTomlPreview!)).toBe(1);
+  });
+
+  it('--ding on claude preserves hooks (settings.local.json still generated)', async () => {
+    // cos's key requirement: hooks are Claude Code hooks, MCP-
+    // independent. Ding-mode still gets boot ritual + PreCompact
+    // + StopFailure hooks. Inline mini `fakeHooksDir` since the
+    // helper lives in a different describe scope.
+    const hooksDir = join(scratch, 'ding-hooks');
+    mkdirSync(hooksDir, { recursive: true });
+    for (const name of [
+      'session-start.sh',
+      'pre-compact.sh',
+      'stop-failure.sh',
+    ]) {
+      writeFileSync(join(hooksDir, name), '#!/bin/sh\nexit 0\n');
+    }
+    const r = await cmdLaunch(
+      baseInput({
+        harness: 'claude',
+        identity: 'alice',
+        ding: true,
+        hooksDir,
+        stBinForHooks: null,
+      }),
+      ctx
+    );
+    expect(r.claudeSettingsPath).not.toBeNull();
+    expect(r.claudeSettingsPreview).not.toBeNull();
+    // The three hooks are wired.
+    expect(r.claudeSettingsPreview).toContain('SessionStart');
+    expect(r.claudeSettingsPreview).toContain('PreCompact');
+    expect(r.claudeSettingsPreview).toContain('StopFailure');
+  });
+
+  it('CLI --ding threads through + shows in dry-run summary', async () => {
+    const { cmdLaunchCli } = await import('../../src/commands/launch.ts');
+    await cmdLaunchCli(
+      ['claude', '--identity', 'alice', '--ding', '--dry-run'],
+      ctx
+    );
+    expect(stdoutBuf).toContain('ding mode:      yes');
+    // The mcp.json line in the summary reflects the skip.
+    expect(stdoutBuf).toContain('mcp.json:       (skipped — ding mode)');
+  });
+
+  it('CLI default (no --ding) → dry-run summary reports no', async () => {
+    const { cmdLaunchCli } = await import('../../src/commands/launch.ts');
+    await cmdLaunchCli(
+      ['claude', '--identity', 'alice', '--dry-run'],
+      ctx
+    );
+    expect(stdoutBuf).toContain('ding mode:      no');
+  });
+});
+
 describe('cmdLaunch — --unattended auto-poker (F1)', () => {
   // The poker prepends a background subshell that pty-sends 4 Enter
   // keys with 4s spacing before exec'ing the main claude command,

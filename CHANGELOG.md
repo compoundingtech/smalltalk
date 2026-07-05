@@ -6,6 +6,50 @@ minor releases until 1.0.
 
 ## Unreleased
 
+### Added (`st launch claude --ding` — codex-style ding-mode for MCP-hostile environments)
+
+Load-bearing for Johannes's setup, where MCP servers can't run
+at all. Without this flag `st launch claude` requires a working
+MCP transport (`.mcp.json` + `--dangerously-load-development-
+channels`); with `--ding`, the same claude agent joins the
+network the way codex does — via an `st ding` sidecar delivering
+inbox pings + the `st` CLI for bus ops (send/ls/read/archive/
+reply). No MCP.
+
+What `--ding` changes on a claude launch:
+
+- **Skips `cmdInit`** — no `.mcp.json` written. The MCP-hostile
+  environment couldn't spin up the server anyway.
+- **Forces `channel = false`** — no `--dangerously-load-development-
+  channels server:st` in the argv (there's nothing to load).
+- **Adds the `st ding` sidecar** to the generated `pty.toml`,
+  same shape as `st launch codex`. `st ding <sess> --identity
+  <id>` watches the identity's inbox and `pty send`s
+  notifications into the agent's terminal.
+- **Hooks stay generated** — the boot ritual, PreCompact flush,
+  and StopFailure ding are Claude Code hooks, MCP-independent.
+
+Stale `.mcp.json` from a prior MCP-mode launch triggers an
+advisory stderr warning ("Delete it (rm .mcp.json) if this was a
+switch from MCP-mode to ding-mode") — Claude Code will still
+read a stale file even in ding-mode, so cleanup is on the
+operator.
+
+`--ding` on `codex` is a no-op (codex is already ding-mode by
+default — `addDingSidecar` fires unconditionally for that
+harness). The flag exists on the codex path for shell-history
+symmetry; the ding sidecar count guard test locks in "no double-
+write".
+
+9 new unit tests cover: default (no --ding) preserves MCP wiring
+(byte-identical regression guard); --ding claude → no channel
+flag + ding sidecar; --ding claude on a live run doesn't write
+`.mcp.json`; non-ding claude still writes `.mcp.json` (scoped-
+skip regression guard); stale `.mcp.json` advisory warning;
+--ding codex no-op (single ding session, not double-written);
+hooks still generate under --ding; CLI plumbing + dry-run
+summary (both branches).
+
 ### Fixed (spawner-shaped launches default to `bypassPermissions` + guard warning extended to supervisor)
 
 Nathan's 3-tier permission model, closing Johannes's pty.toml Bug 1:

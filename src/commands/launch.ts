@@ -63,6 +63,29 @@ export interface LaunchInput {
   /** When true, skip `--channel` on the MCP wiring. Default for claude
    *  is channel-on; for codex is channel-off (codex has no channel UI). */
   noChannel?: boolean | undefined;
+  /**
+   * Ding-mode: launch claude the way codex launches — WITHOUT MCP
+   * wiring, WITH an `st ding` sidecar for inbox delivery. Skips
+   * `.mcp.json` generation entirely (no `cmdInit` call) and forces
+   * `channel = false` (no `--dangerously-load-development-channels`
+   * flag on the argv). Adds the ding sidecar to the generated
+   * pty.toml so the claude agent gets inbox notifications via
+   * `pty send` instead of MCP `notifications/claude/channel`.
+   *
+   * The load-bearing use case: environments where MCP servers don't
+   * work at all (Johannes's setup, some sandboxes). Without ding-mode,
+   * `st launch claude` requires a functioning MCP transport; with
+   * ding-mode, the same agent joins the network via ding delivery +
+   * the `st` CLI for all bus ops (send, ls, read, archive, reply).
+   *
+   * Hooks (`.claude/settings.local.json`) are still generated — the
+   * boot ritual + PreCompact flush + StopFailure ding are Claude
+   * Code hooks, independent of MCP.
+   *
+   * No-op for codex (codex is already ding-mode by default —
+   * `addDingSidecar` fires unconditionally for that harness).
+   */
+  ding?: boolean | undefined;
   /** Override the pty session name (default: harness name). */
   sessionName?: string | undefined;
   /**
@@ -247,6 +270,13 @@ export interface LaunchResult {
    * consistently.
    */
   permanent: boolean;
+  /**
+   * True when the launch ran in ding-mode: MCP wiring skipped
+   * (no `.mcp.json` generated) and an `st ding` sidecar added to
+   * pty.toml regardless of harness. Populated in both real-run and
+   * dry-run branches so the summary can surface the mode.
+   */
+  ding: boolean;
   /**
    * brief-118: absolute path to `.claude/settings.local.json` when the
    * launch generated (or would have generated) one. Non-null only for
@@ -1020,10 +1050,21 @@ export async function cmdLaunch(
   }
 
   // ─── .mcp.json bootstrap (via cmdInit) ──────────────────────────────
-  const channel =
-    input.noChannel === true ? false : harness === 'claude';
+  // Ding-mode: skip MCP wiring entirely. The claude agent joins the
+  // network via `st ding` sidecar + `st` CLI, same as codex. Load-
+  // bearing for environments where MCP servers can't run at all
+  // (Johannes's setup, some sandboxes).
+  const ding = input.ding === true;
+  // Channel resolution: forced off in ding-mode (there's no MCP to
+  // push through). Otherwise unchanged — claude defaults on, codex
+  // off, `--no-channel` forces off.
+  const channel = ding
+    ? false
+    : input.noChannel === true
+      ? false
+      : harness === 'claude';
   const mcpJsonPath = join(cwd, '.mcp.json');
-  if (!input.dryRun) {
+  if (!input.dryRun && !ding) {
     await cmdInit(
       {
         dir: cwd,
@@ -1034,6 +1075,18 @@ export async function cmdLaunch(
         // overwriting.
       },
       ctx
+    );
+  }
+  // Warn if ding-mode was requested but a stale .mcp.json exists in
+  // the cwd — an operator switching from MCP to ding-mode almost
+  // certainly wants the old file gone. Advisory, not a hard error.
+  if (ding && existsSync(mcpJsonPath)) {
+    ctx.stderr(
+      `[smalltalk launch] --ding: existing .mcp.json in ${cwd} left as-is. ` +
+        `Delete it (rm .mcp.json) if this was a switch from MCP-mode to ` +
+        `ding-mode; a stale .mcp.json will still be read by Claude Code ` +
+        `and may try to spin up an MCP server ding-mode assumed you didn't ` +
+        `want.\n`
     );
   }
 
@@ -1229,7 +1282,11 @@ export async function cmdLaunch(
       sessionName,
       identity,
       invocation: argv,
-      addDingSidecar: harness === 'codex',
+      // Ding sidecar: always for codex (its default), always for
+      // claude in ding-mode. `st ding <sess> --identity <id>` watches
+      // the identity's inbox and pty-sends notifications into the
+      // agent's terminal.
+      addDingSidecar: harness === 'codex' || ding,
       unattended,
       stRoot: stRootForSession,
       agentStrategy,
@@ -1247,7 +1304,11 @@ export async function cmdLaunch(
       sessionName,
       identity,
       invocation: argv,
-      addDingSidecar: harness === 'codex',
+      // Ding sidecar: always for codex (its default), always for
+      // claude in ding-mode. `st ding <sess> --identity <id>` watches
+      // the identity's inbox and pty-sends notifications into the
+      // agent's terminal.
+      addDingSidecar: harness === 'codex' || ding,
       unattended,
       stRoot: stRootForSession,
       agentStrategy,
@@ -1333,6 +1394,7 @@ export async function cmdLaunch(
       agentBinary,
       unattended,
       permanent,
+      ding,
       claudeSettingsPath,
       claudeSettingsPreview,
       persona: personaResult,
@@ -1432,6 +1494,7 @@ export async function cmdLaunch(
     agentBinary,
     unattended,
     permanent,
+    ding,
     claudeSettingsPath,
     claudeSettingsPreview,
     persona: personaResult,
@@ -1499,6 +1562,17 @@ const LAUNCH_HELP =
   '                          → both sessions are ephemeral (pty\'s default).\n' +
   '                          Warns if a CoS-shaped launch (--identity cos\n' +
   '                          or chief-of-staff persona) is missing.\n' +
+  '  --ding                  Launch claude codex-style: no MCP wiring\n' +
+  '                          (skip .mcp.json entirely, no --channel flag),\n' +
+  '                          add an `st ding` sidecar for inbox delivery,\n' +
+  '                          agent uses the `st` CLI for all bus ops.\n' +
+  '                          Load-bearing for environments where MCP\n' +
+  '                          servers can\'t run at all. Hooks\n' +
+  '                          (.claude/settings.local.json) are still\n' +
+  '                          generated — the boot ritual + PreCompact\n' +
+  '                          flush + StopFailure ding are Claude Code\n' +
+  '                          hooks, MCP-independent. No-op for codex\n' +
+  '                          (already ding-mode by default).\n' +
   '  --dry-run               Print what would happen; touch nothing.\n' +
   '  --print                 Alias for --dry-run.\n\n' +
   '  Examples:\n' +
@@ -1506,7 +1580,10 @@ const LAUNCH_HELP =
   '    st launch claude --identity alice             # persistent identity\n' +
   '    st launch claude --identity cos --permanent \\\n' +
   '        --persona ~/src/github.com/myobie/personas/chief-of-staff.md\n' +
-  '                                                  # production CoS\n' +
+  '                                                  # production CoS (MCP mode)\n' +
+  '    st launch claude --identity cos --permanent --ding \\\n' +
+  '        --persona ~/src/github.com/myobie/personas/chief-of-staff.md\n' +
+  '                                                  # production CoS (ding-mode; no MCP)\n' +
   '    st launch claude --no-hooks                   # skip .claude/settings.local.json\n' +
   '    st launch codex                               # + st ding sidecar\n' +
   '    st launch claude --model glm-5.2:cloud        # via ollama, unattended\n' +
@@ -1529,6 +1606,7 @@ export async function cmdLaunchCli(
   let agentBinary: string | undefined;
   let unattendedFlag: boolean | undefined;
   let permanent = false;
+  let ding = false;
   let dryRun = false;
   for (let i = 0; i < args.length; i++) {
     const a = args[i]!;
@@ -1576,6 +1654,9 @@ export async function cmdLaunchCli(
       case '--permanent':
         permanent = true;
         break;
+      case '--ding':
+        ding = true;
+        break;
       case '--dry-run':
       case '--print':
         dryRun = true;
@@ -1613,6 +1694,7 @@ export async function cmdLaunchCli(
       ...(agentBinary !== undefined && { agentBinary }),
       ...(unattendedFlag !== undefined && { unattended: unattendedFlag }),
       permanent,
+      ding,
       dryRun,
       env: ctx.env,
       coordRoot: ctx.coordRoot,
@@ -1637,7 +1719,12 @@ export async function cmdLaunchCli(
     ctx.stdout(`agent binary:   ${r.agentBinary}\n`);
     ctx.stdout(`unattended:     ${r.unattended ? 'yes' : 'no'}\n`);
     ctx.stdout(`permanent:      ${r.permanent ? 'yes' : 'no'}\n`);
-    ctx.stdout(`mcp.json:       ${r.mcpJsonPath}\n`);
+    ctx.stdout(`ding mode:      ${r.ding ? 'yes' : 'no'}\n`);
+    if (r.ding) {
+      ctx.stdout(`mcp.json:       (skipped — ding mode)\n`);
+    } else {
+      ctx.stdout(`mcp.json:       ${r.mcpJsonPath}\n`);
+    }
     if (r.claudeSessionIdPath !== null) {
       ctx.stdout(`session id:     ${r.claudeSessionIdPath}\n`);
     }
