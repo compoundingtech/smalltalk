@@ -555,7 +555,7 @@ describe('cmdDingCli — arg parsing', () => {
     const c = ctx();
     const code = await cmdDingCli(['--help'], c);
     expect(code).toBe(0);
-    expect(c.stderrBuf.value).toMatch(/usage: coord ding/);
+    expect(c.stderrBuf.value).toMatch(/usage: st ding/);
   });
 
   it('missing pty-session → throws', async () => {

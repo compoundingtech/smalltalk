@@ -20,7 +20,7 @@
 import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 
-import type { CliContext } from '../cli-context.ts';
+import { invokedName, type CliContext } from '../cli-context.ts';
 import {
   archiveDir,
   inboxDir,
@@ -237,12 +237,15 @@ function isDir(p: string): boolean {
 
 // ─── CLI wrapper ────────────────────────────────────────────────────────
 
-const AGENTS_HELP =
-  'usage: coord agents [--status STATE] [--json [--enrich]]\n\n' +
-  '  Enumerate every agent under $ST_ROOT — i.e. any sub-folder\n' +
-  '  with at least one of inbox/ or archive/. Sorted alphabetically.\n' +
-  '  Plain read; does not mutate state.\n\n' +
-  '  Note: `coord members` is the deprecated alias of this verb.\n';
+function agentsHelp(name: string): string {
+  return (
+    `usage: ${name} agents [--status STATE] [--json [--enrich]]\n\n` +
+    '  Enumerate every agent under $ST_ROOT — i.e. any sub-folder\n' +
+    '  with at least one of inbox/ or archive/. Sorted alphabetically.\n' +
+    '  Plain read; does not mutate state.\n\n' +
+    `  Note: \`${name} members\` is the deprecated alias of this verb.\n`
+  );
+}
 
 export function cmdAgentsCli(
   args: readonly string[],
@@ -265,7 +268,7 @@ export function cmdAgentsCli(
         break;
       case '-h':
       case '--help':
-        ctx.stderr(AGENTS_HELP);
+        ctx.stderr(agentsHelp(invokedName(ctx.env)));
         return 0;
       default:
         throw new Error(`unknown flag: ${a}`);

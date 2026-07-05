@@ -24,3 +24,19 @@ export interface CliContext {
    */
   stdinIsTty?: () => boolean;
 }
+
+/**
+ * The name the user typed to invoke this CLI — `st`, `smalltalk`, or
+ * `coord`. Set by the bin/ shims via `_ST_INVOKED_AS` before exec'ing
+ * into node. Help banners and error prefixes read this so users see
+ * the name they typed, not a hard-coded value that goes stale as the
+ * rename phases finish.
+ *
+ * Falls back to `st` when unset (fresh dev shells, unit tests, direct
+ * `node src/cli.ts` invocations).
+ */
+export function invokedName(env: NodeJS.ProcessEnv): string {
+  const raw = env._ST_INVOKED_AS;
+  if (raw === undefined || raw.length === 0) return 'st';
+  return raw;
+}

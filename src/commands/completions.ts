@@ -12,7 +12,7 @@
 // `status --set` / `members --status`), so the values live on the node
 // that owns the flag.
 
-import type { CliContext } from '../cli-context.ts';
+import { invokedName, type CliContext } from '../cli-context.ts';
 import { SETTABLE_STATES } from '../common.ts';
 import { PRIORITIES } from '../types.ts';
 
@@ -462,15 +462,18 @@ const GENERATORS: Record<string, () => string> = {
 
 const SHELLS = Object.keys(GENERATORS);
 
-const USAGE =
-  `usage: coord completions <shell>\n\n` +
-  `Print a shell completion script to stdout.\n\n` +
-  `Shells:\n` +
-  SHELLS.map((s) => `  ${s}`).join('\n') +
-  `\n\nExamples:\n` +
-  `  coord completions fish > ~/.config/fish/completions/coord.fish\n` +
-  `  coord completions bash > /etc/bash_completion.d/coord\n` +
-  `  coord completions zsh  > "\${fpath[1]}/_coord"\n`;
+function usageText(name: string): string {
+  return (
+    `usage: ${name} completions <shell>\n\n` +
+    `Print a shell completion script to stdout.\n\n` +
+    `Shells:\n` +
+    SHELLS.map((s) => `  ${s}`).join('\n') +
+    `\n\nExamples:\n` +
+    `  ${name} completions fish > ~/.config/fish/completions/${name}.fish\n` +
+    `  ${name} completions bash > /etc/bash_completion.d/${name}\n` +
+    `  ${name} completions zsh  > "\${fpath[1]}/_${name}"\n`
+  );
+}
 
 /**
  * `coord completions <shell>` — write a completion script for `shell` to
@@ -481,20 +484,22 @@ export function cmdCompletionsCli(
   args: readonly string[],
   ctx: CliContext
 ): number {
+  const name = invokedName(ctx.env);
+  const usage = usageText(name);
   const shell = args[0];
   if (shell === undefined || shell === '--help' || shell === '-h') {
     // `--help`/`-h` is an explicit request → stdout, exit 0.
     if (shell === '--help' || shell === '-h') {
-      ctx.stdout(USAGE);
+      ctx.stdout(usage);
       return 0;
     }
-    ctx.stderr(USAGE);
+    ctx.stderr(usage);
     return 2;
   }
   const gen = GENERATORS[shell];
   if (gen === undefined) {
-    ctx.stderr(`coord completions: unknown shell: ${shell}\n\n`);
-    ctx.stderr(USAGE);
+    ctx.stderr(`${name} completions: unknown shell: ${shell}\n\n`);
+    ctx.stderr(usage);
     return 2;
   }
   ctx.stdout(gen());

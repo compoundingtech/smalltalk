@@ -283,7 +283,7 @@ export { cmdRead as cmdReadCore };
 
 // ─── CLI wrapper ────────────────────────────────────────────────────────
 
-import type { CliContext } from '../cli-context.ts';
+import { invokedName, type CliContext } from '../cli-context.ts';
 
 export function cmdReadCli(args: readonly string[], ctx: CliContext): number {
   let raw = false;
@@ -305,7 +305,7 @@ export function cmdReadCli(args: readonly string[], ctx: CliContext): number {
       case '-h':
       case '--help':
         ctx.stderr(
-          'usage: coord message read [<identity>] <filename> [--raw|--json] [--archive]\n'
+          `usage: ${invokedName(ctx.env)} message read [<identity>] <filename> [--raw|--json] [--archive]\n`
         );
         return 0;
       default:

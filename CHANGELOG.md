@@ -6,6 +6,29 @@ minor releases until 1.0.
 
 ## Unreleased
 
+### Changed (help banners + error prefixes reflect the invoked name)
+
+Every `usage: …` banner and every top-level `<name>: <message>` error
+prefix now uses the name the user typed (`st`, `smalltalk`, or the
+back-compat `coord`), sourced from the `_ST_INVOKED_AS` env var that
+the `bin/` shims already export. Previously every banner said
+`usage: coord …`, which read as un-renamed even when the user had
+typed `st`.
+
+- New helper `invokedName(env)` in `src/cli-context.ts` reads
+  `env._ST_INVOKED_AS`, defaulting to `st` when unset (fresh dev
+  shells, unit tests, direct `node src/cli.ts` invocations).
+- Threaded through the top-level `runCli` banners, the message-group
+  banner, every subcommand's `--help` string, and the two top-level
+  error prefixes (`unknown subcommand: …`, generic `<name>: <msg>`).
+- No shim or hook changes needed — `bin/st`, `bin/smalltalk`, and
+  `bin/coord` already set `_ST_INVOKED_AS` from `basename $0` before
+  exec'ing into node.
+
+Users who still type `coord …` see `usage: coord …` (their existing
+behavior). Users who type `st …` see `usage: st …` — closing the
+"still says coord" gap that made the rename feel unfinished.
+
 ### Fixed (`st status <agent> --set <state>` lazy-creates the agent folder)
 
 The onboarding walkthrough tells newcomers to run

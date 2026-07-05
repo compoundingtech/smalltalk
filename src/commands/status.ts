@@ -206,7 +206,7 @@ export { cmdStatus as cmdStatusCore };
 
 // ─── CLI wrapper ────────────────────────────────────────────────────────
 
-import type { CliContext } from '../cli-context.ts';
+import { invokedName, type CliContext } from '../cli-context.ts';
 
 export function cmdStatusCli(
   args: readonly string[],
@@ -225,7 +225,9 @@ export function cmdStatusCli(
         break;
       case '-h':
       case '--help':
-        ctx.stderr('usage: coord status [<identity>] [--set <state>]\n');
+        ctx.stderr(
+          `usage: ${invokedName(ctx.env)} status [<identity>] [--set <state>]\n`
+        );
         return 0;
       default:
         if (a.startsWith('-')) throw new Error(`unknown flag: ${a}`);

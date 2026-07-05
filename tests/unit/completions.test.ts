@@ -62,7 +62,7 @@ describe('coord completions — dispatch', () => {
     const code = await runCli(['completions'], cap.ctx);
     expect(code).toBe(2);
     expect(cap.stdout).toBe('');
-    expect(cap.stderr).toContain('usage: coord completions');
+    expect(cap.stderr).toContain('usage: st completions');
   });
 
   it('unknown shell → usage on stderr, exit 2', async () => {
@@ -70,14 +70,14 @@ describe('coord completions — dispatch', () => {
     const code = await runCli(['completions', 'powershell'], cap.ctx);
     expect(code).toBe(2);
     expect(cap.stderr).toContain('unknown shell: powershell');
-    expect(cap.stderr).toContain('usage: coord completions');
+    expect(cap.stderr).toContain('usage: st completions');
   });
 
   it('--help → usage on stdout, exit 0', async () => {
     const cap = makeContext();
     const code = await runCli(['completions', '--help'], cap.ctx);
     expect(code).toBe(0);
-    expect(cap.stdout).toContain('usage: coord completions');
+    expect(cap.stdout).toContain('usage: st completions');
   });
 
   it('top-level usage advertises the completions subcommand', async () => {

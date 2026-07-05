@@ -23,7 +23,7 @@ import { randomBytes } from 'node:crypto';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import type { CliContext } from '../cli-context.ts';
+import { invokedName, type CliContext } from '../cli-context.ts';
 
 // ─── Shape ──────────────────────────────────────────────────────────────
 
@@ -299,15 +299,18 @@ async function promptYesNo(
 
 // ─── CLI wrapper ────────────────────────────────────────────────────────
 
-const INIT_HELP =
-  'usage: coord init [<dir>] [--no-channel] [--print] [--force]\n\n' +
-  '  Write or merge `.mcp.json` in <dir> (default: cwd) so a Claude\n' +
-  '  Code session in that directory loads the coord MCP server.\n\n' +
-  '  --no-channel   Write args without `--channel` (pull-only host).\n' +
-  '  --print        Print the JSON entry to stdout; do not write.\n' +
-  '  --force        Overwrite a divergent existing coord entry without\n' +
-  '                 prompting. (A byte-identical entry is always a\n' +
-  '                 no-op; non-coord entries are preserved.)\n';
+function initHelp(name: string): string {
+  return (
+    `usage: ${name} init [<dir>] [--no-channel] [--print] [--force]\n\n` +
+    '  Write or merge `.mcp.json` in <dir> (default: cwd) so a Claude\n' +
+    '  Code session in that directory loads the smalltalk MCP server.\n\n' +
+    '  --no-channel   Write args without `--channel` (pull-only host).\n' +
+    '  --print        Print the JSON entry to stdout; do not write.\n' +
+    '  --force        Overwrite a divergent existing entry without\n' +
+    '                 prompting. (A byte-identical entry is always a\n' +
+    '                 no-op; unrelated entries are preserved.)\n'
+  );
+}
 
 export async function cmdInitCli(
   args: readonly string[],
@@ -330,7 +333,7 @@ export async function cmdInitCli(
         break;
       case '-h':
       case '--help':
-        ctx.stderr(INIT_HELP);
+        ctx.stderr(initHelp(invokedName(ctx.env)));
         return 0;
       default:
         if (a.startsWith('-')) throw new Error(`unknown flag: ${a}`);

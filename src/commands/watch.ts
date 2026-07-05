@@ -361,7 +361,7 @@ export { cmdWatch as cmdWatchCore };
 
 // ─── CLI wrapper ────────────────────────────────────────────────────────
 
-import type { CliContext } from '../cli-context.ts';
+import { invokedName, type CliContext } from '../cli-context.ts';
 
 export async function cmdWatchCli(
   args: readonly string[],
@@ -412,7 +412,7 @@ export async function cmdWatchCli(
       case '-h':
       case '--help':
         ctx.stderr(
-          'usage: coord watch [<identity>] [--all] [--from <id>] [--with-subject]\n' +
+          `usage: ${invokedName(ctx.env)} watch [<identity>] [--all] [--from <id>] [--with-subject]\n` +
             '                   [--since UNIX_MS | --since-now] [--interval MS] [--once]\n\n' +
             '  Default: watch $COORD_IDENTITY/inbox/ (your own).\n' +
             '  --all:   watch every identity\'s inbox EXCEPT $COORD_IDENTITY\'s\n' +

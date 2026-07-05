@@ -307,7 +307,7 @@ export {
 
 // ─── CLI wrapper ────────────────────────────────────────────────────────
 
-import type { CliContext } from '../cli-context.ts';
+import { invokedName, type CliContext } from '../cli-context.ts';
 
 export function cmdSyncCli(args: readonly string[], ctx: CliContext): number {
   let verb: string | undefined;
@@ -321,12 +321,15 @@ export function cmdSyncCli(args: readonly string[], ctx: CliContext): number {
         break;
       case '-h':
       case '--help':
-        ctx.stderr(
-          'usage: coord sync push|pull <peer>\n' +
-            '       coord sync push|pull --all\n' +
-            '       coord sync sweep\n' +
-            '       coord sync --all\n'
-        );
+        {
+          const name = invokedName(ctx.env);
+          ctx.stderr(
+            `usage: ${name} sync push|pull <peer>\n` +
+              `       ${name} sync push|pull --all\n` +
+              `       ${name} sync sweep\n` +
+              `       ${name} sync --all\n`
+          );
+        }
         return 0;
       default:
         if (a.startsWith('-')) throw new Error(`unknown flag: ${a}`);

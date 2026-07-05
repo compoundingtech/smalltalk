@@ -255,7 +255,7 @@ export { cmdLs as cmdLsCore };
 
 // ─── CLI wrapper ────────────────────────────────────────────────────────
 
-import type { CliContext } from '../cli-context.ts';
+import { invokedName, type CliContext } from '../cli-context.ts';
 
 export function cmdLsCli(args: readonly string[], ctx: CliContext): number {
   let recipient: string | undefined;
@@ -294,7 +294,7 @@ export function cmdLsCli(args: readonly string[], ctx: CliContext): number {
       case '-h':
       case '--help':
         ctx.stderr(
-          'usage: coord message ls [<recipient>] [--archive] [--count|--json] [--since UNIX_MS] [--from ID] [--orphans]\n'
+          `usage: ${invokedName(ctx.env)} message ls [<recipient>] [--archive] [--count|--json] [--since UNIX_MS] [--from ID] [--orphans]\n`
         );
         return 0;
       default:
