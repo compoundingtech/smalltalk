@@ -507,9 +507,13 @@ const defaultIsSessionAlive: IsSessionAlive = (sessionName) => {
  * Single-line summary suitable for pty-send into a terminal session.
  * Distinct from the MCP frame body (which is multi-line markdown) —
  * Codex sees this as one line of typed input, so we keep it scannable.
+ *
+ * Prefixed with `[DING] ` (same rationale as the inbox-arrival
+ * notice above) so a scanning agent recognizes it as bus traffic
+ * rather than its own output or a human REPL keystroke.
  */
 function formatTidyLine(drift: DriftResult): string {
-  return `coord tidy-check: inbox=${drift.detail.inboxStaleCount} (oldest ${formatAge(drift.detail.oldestInboxAgeMs)}).`;
+  return `[DING] tidy-check: inbox=${drift.detail.inboxStaleCount} (oldest ${formatAge(drift.detail.oldestInboxAgeMs)}).`;
 }
 
 function formatAge(ms: number): string {
@@ -534,10 +538,27 @@ async function buildEvent(
   };
 }
 
+/**
+ * Ding-delivered notification text. The `[DING] ` prefix marks the
+ * line as bus traffic so it's visually distinct from three other
+ * things an agent might see in its terminal:
+ *   - MCP `<channel source="…">` injection blocks (MCP path only;
+ *     ding-mode agents don't get these — see DING-BUS.md follow-up).
+ *   - The agent's own output printed to its REPL.
+ *   - A human typing directly at the REPL.
+ *
+ * The prefix also lets a ding-mode agent's persona/DING-BUS.md
+ * instructions reference an unambiguous string pattern for the
+ * poke-handling flow ("when you see [DING] X, do Y").
+ *
+ * Post-rename naming: `smalltalk message`, not `coord message` —
+ * this is user-visible bus traffic and matches the CLI the agent
+ * uses to act on it (`st message …`).
+ */
 function buildSequences(ev: BufferedEvent): string[] {
   const subject = ev.subject ?? '(no subject)';
   const from = ev.from === '' ? 'unknown' : ev.from;
-  const text = `you have a new coord message: ${subject} (from ${from}); check your inbox`;
+  const text = `[DING] new smalltalk message: ${subject} (from ${from}); check your inbox`;
   return [text, 'key:return'];
 }
 
