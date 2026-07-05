@@ -170,11 +170,32 @@ describe('cmdStatus — form 4 (<identity> --set <state>)', () => {
     expect(existsSync(join(coordRoot, 'alice', 'status'))).toBe(false);
   });
 
-  it('errors when the target identity has no folder', () => {
+  it('lazy-creates the target agent folder when missing (docs promise)', () => {
+    // Onboarding docs (README + onboarding.md) promise that
+    // `st status <self> --set <state>` bootstraps the folder for a
+    // brand-new agent on its first command. Pre-fix this threw
+    // "agent folder missing"; the `'lazy-create'` policy makes the
+    // --set path create the folder inline.
+    setupIdentity('alice');
+    const r = cmdStatus(input({ recipient: 'carol', setState: 'busy' }));
+    expect(r.mode).toBe('set');
+    // Folder now exists on disk.
+    expect(existsSync(join(coordRoot, 'carol', 'inbox'))).toBe(true);
+    expect(existsSync(join(coordRoot, 'carol', 'archive'))).toBe(true);
+    expect(readFileSync(join(coordRoot, 'carol', 'status'), 'utf8')).toBe(
+      'busy\n'
+    );
+  });
+
+  it('read/get still requires the folder to exist (no lazy-create)', () => {
+    // Passive `status` (no --set) preserves the strict-check
+    // behavior — reading requires the agent to already be present
+    // on this machine. Prevents `st status ghost` from silently
+    // materializing a phantom on peer machines.
     setupIdentity('alice');
     expect(() =>
-      cmdStatus(input({ recipient: 'carol', setState: 'busy' }))
-    ).toThrowError(/(agent|identity) folder missing for carol/);
+      cmdStatus(input({ recipient: 'ghost' }))
+    ).toThrowError(/(agent|identity) folder missing for ghost/);
   });
 });
 

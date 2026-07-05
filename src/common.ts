@@ -264,11 +264,21 @@ export interface ResolveAgentOpts {
    *   lazily creates inbox/ but not archive/. The actual file lookups
    *   below this gate are existsSync-gated, so a missing folder is
    *   naturally treated as empty.
+   * - `'lazy-create'` → auto-create `<agent>/{inbox,archive}` if
+   *   missing, matching the env-resolved bootstrap path. Use for
+   *   newcomer-facing self-write verbs where the docs promise
+   *   bootstrap (`st status <self> --set …`). The anti-impersonation
+   *   guarantee weakens here: any caller with FS access can set
+   *   another agent's status, but this is the same permission
+   *   surface as `mkdir $ST_ROOT/<other>/{inbox,archive}` +
+   *   `echo state > $ST_ROOT/<other>/status`, which is already
+   *   trivially available. The convenience of first-command
+   *   bootstrap outweighs the marginal loss.
    *
    * Ignored when `explicit` is unset — $ST_AGENT always auto-creates
    * regardless of `policy`.
    */
-  policy?: 'lenient';
+  policy?: 'lenient' | 'lazy-create';
 }
 
 /** @deprecated Use {@link ResolveAgentOpts}. */
@@ -325,6 +335,12 @@ export function resolveAgent(opts: ResolveAgentOpts = {}): string {
   if (fromExplicit) {
     if (opts.policy === 'lenient') {
       assertIdentityFolderExistsLenient(id, root);
+    } else if (opts.policy === 'lazy-create') {
+      // Newcomer-facing self-write bootstrap: create the folder if
+      // missing. Docs (README + onboarding) promise this for the first
+      // command an operator runs. See the `'lazy-create'` policy note
+      // in ResolveAgentOpts.
+      ensureIdentityDirs(id, root);
     } else {
       assertIdentityFolderExists(id, root);
     }
