@@ -6,6 +6,24 @@ minor releases until 1.0.
 
 ## Unreleased
 
+### Fixed (`st launch` backgrounds `pty up` when stdin is not a TTY)
+
+Historic behavior: `st launch` shelled out to `pty up` with
+`stdio: 'inherit'` and awaited exit. `pty up` blocks ~47s+ waiting
+on its interactive attach ("ctrl+b to run in background") — an
+attended operator can read that and act, but a CoS spawning a
+specialist under `spawn()` misreads the block as a hang.
+
+Now: when `stdinIsTty()` reports false (a CoS via `spawn()`,
+headless CI, etc.), `st launch` spawns `pty up` detached with
+`stdio: 'ignore'`, `unref`'s the child, and returns immediately.
+Attended launches (real TTY) keep the current inherit-and-wait
+behavior so the operator still sees pty up's UI.
+
+Auto-detected via the same `stdinIsTty` signal F1's `--unattended`
+poker uses, so hands-off standup and non-blocking pty up flip on
+together for CoS-spawned specialists.
+
 ### Fixed (`st launch` pre-approves the project MCP server + renames the emitted key to `st`)
 
 Every fresh Claude Code session prompts "Enable the `st` MCP
