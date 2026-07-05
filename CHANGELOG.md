@@ -68,6 +68,60 @@ MCP-hostile machine, not just the top-level CoS.
 
 Full suite: 1531 pass, only the 4 pre-existing integration flakes.
 
+### Added (Phase-1 pty isolation: `"st.network"` tag on every `st launch` session)
+
+pty-claude designed the tag; this PR wires it into `st launch`.
+Every session emitted into pty.toml — the agent block AND
+(when present) the ding sidecar block — now carries an
+`"st.network" = "<value>"` tag. The tag is a uniform inspection
+signal that separates smalltalk-network sessions from an
+operator's ad-hoc pty use: **presence = "this is a smalltalk-
+network session"; value = which network.** pty's
+`--filter-tag st.network=<value>` primitive filters on it out of
+the box (verified against `../pty/src/tags.ts:matchesAllTags` +
+smol-toml's quoted-key parsing).
+
+Design decisions per pty-claude's steer:
+
+- **Value = the resolved network root** (`input.coordRoot`, which
+  cmdLaunch already computes via `coordRootFrom(ctx.env)` at the
+  CLI layer). Always a valid path regardless of whether the
+  invoker set `ST_ROOT` explicitly or is on the default.
+
+- **Emit for EVERY st-launched session, including the default
+  network** — deliberately unlike the `ST_ROOT` *env* line (which
+  omits itself on the default network to avoid freezing today's
+  default into tomorrow's restarts). The tag is a pure inspection
+  label, so uniformity means the presence-check is the signal.
+
+- **Key spelled exactly `st.network`** (pty-claude's choice —
+  visible, non-reserved in `../pty/src/tags.ts:EXACT_RESERVED`).
+  The dot is inside a quoted TOML inline-table key
+  (`"st.network" = "..."`) so it's not interpreted as a dotted
+  nested-table key. Verified live against smol-toml parsing.
+
+- **Matched-pair invariant**: same value in the agent block and
+  the ding block. A launch is one network; the sidecar carries
+  the same tag as the main session. Matches the same "agent +
+  ding stay in sync" invariant the `agentStrategy` mirror
+  enforces.
+
+3 new unit tests cover:
+- Isolated launch (explicit `ST_ROOT`) → both agent + ding blocks
+  tagged with the same value.
+- Default launch (no env) → still tagged (uniformity regression
+  guard), with `ST_ROOT` env line still absent (asymmetry
+  preserved).
+- Claude launch (no ding sidecar) → single-block launch still
+  tagged, agent-only.
+
+Existing 5 tag-shape assertions updated from strict-form
+`toContain` to regex `toMatch` — the new emitted form includes
+the network tag suffix, and the regexes lock in the "no strategy
+between role and st.network" semantic for the ephemeral case AND
+the "strategy = permanent between role and st.network" semantic
+for the permanent case. Full suite: 1534 pass.
+
 ### Fixed (CRITICAL — `st ding` sidecar command targets the FQN pty session, not the bare `sessionName`)
 
 evals-claude's end-to-end confirmation run of the Johannes stack
