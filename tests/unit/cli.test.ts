@@ -77,28 +77,75 @@ describe('runCli — no args / help', () => {
     const code = await runCli([], cap.ctx);
     expect(code).toBe(2);
     expect(cap.stdout).toBe('');
-    expect(cap.stderr).toContain('usage: coord');
+    expect(cap.stderr).toContain('usage: st');
   });
 
   it('help → usage to stdout, exit 0', async () => {
     const cap = makeContext();
     const code = await runCli(['help'], cap.ctx);
     expect(code).toBe(0);
-    expect(cap.stdout).toContain('usage: coord');
+    expect(cap.stdout).toContain('usage: st');
   });
 
   it('--help → usage to stdout, exit 0', async () => {
     const cap = makeContext();
     const code = await runCli(['--help'], cap.ctx);
     expect(code).toBe(0);
-    expect(cap.stdout).toContain('usage: coord');
+    expect(cap.stdout).toContain('usage: st');
   });
 
   it('-h → usage to stdout, exit 0', async () => {
     const cap = makeContext();
     const code = await runCli(['-h'], cap.ctx);
     expect(code).toBe(0);
-    expect(cap.stdout).toContain('usage: coord');
+    expect(cap.stdout).toContain('usage: st');
+  });
+});
+
+// ─── _ST_INVOKED_AS override ────────────────────────────────────────────
+
+describe('runCli — help banner reflects _ST_INVOKED_AS', () => {
+  // The bin/ shims export `_ST_INVOKED_AS` from their $0 basename, and
+  // the help banner interpolates that name so users see what they
+  // typed. When unset (fresh dev shells, direct `node src/cli.ts`
+  // invocations, most tests), the banner defaults to `st`.
+  it('defaults to `st` when unset', async () => {
+    const cap = makeContext('', {});
+    const code = await runCli(['help'], cap.ctx);
+    expect(code).toBe(0);
+    expect(cap.stdout).toContain('usage: st ');
+    expect(cap.stdout).not.toContain('usage: coord ');
+  });
+
+  it('reflects `coord` when the shim exports it', async () => {
+    const cap = makeContext('', { _ST_INVOKED_AS: 'coord' });
+    const code = await runCli(['help'], cap.ctx);
+    expect(code).toBe(0);
+    expect(cap.stdout).toContain('usage: coord ');
+  });
+
+  it('reflects `smalltalk` when the shim exports it', async () => {
+    const cap = makeContext('', { _ST_INVOKED_AS: 'smalltalk' });
+    const code = await runCli(['help'], cap.ctx);
+    expect(code).toBe(0);
+    expect(cap.stdout).toContain('usage: smalltalk ');
+  });
+
+  it('unknown-subcommand error prefix also reflects the invoked name', async () => {
+    const cap = makeContext('', { _ST_INVOKED_AS: 'coord' });
+    const code = await runCli(['bogus'], cap.ctx);
+    expect(code).toBe(2);
+    expect(cap.stderr).toContain('coord: unknown subcommand: bogus');
+  });
+
+  it('empty _ST_INVOKED_AS falls back to `st`', async () => {
+    // Guard against bin/ shim regressions that would export an empty
+    // string when $0 basename fails. The helper treats empty the same
+    // as unset.
+    const cap = makeContext('', { _ST_INVOKED_AS: '' });
+    const code = await runCli(['help'], cap.ctx);
+    expect(code).toBe(0);
+    expect(cap.stdout).toContain('usage: st ');
   });
 });
 
@@ -110,7 +157,7 @@ describe('runCli — unknown subcommand', () => {
     const code = await runCli(['bogus'], cap.ctx);
     expect(code).toBe(2);
     expect(cap.stderr).toContain('unknown subcommand: bogus');
-    expect(cap.stderr).toContain('usage: coord');
+    expect(cap.stderr).toContain('usage: st');
   });
 });
 
@@ -121,15 +168,15 @@ describe('runCli — per-command --help / -h prints command-specific usage', () 
   // CLI surfaces them via `coord message <verb> --help` (or the `msg`
   // alias). Non-message verbs remain top-level.
   it.each([
-    [['message', 'send'], 'usage: coord message send'],
-    [['message', 'ls'], 'usage: coord message ls'],
-    [['message', 'read'], 'usage: coord message read'],
-    [['message', 'archive'], 'usage: coord message archive'],
-    [['message', 'thread'], 'usage: coord message thread'],
-    [['msg', 'send'], 'usage: coord message send'],
-    [['watch'], 'usage: coord watch'],
-    [['status'], 'usage: coord status'],
-    [['sync'], 'usage: coord sync'],
+    [['message', 'send'], 'usage: st message send'],
+    [['message', 'ls'], 'usage: st message ls'],
+    [['message', 'read'], 'usage: st message read'],
+    [['message', 'archive'], 'usage: st message archive'],
+    [['message', 'thread'], 'usage: st message thread'],
+    [['msg', 'send'], 'usage: st message send'],
+    [['watch'], 'usage: st watch'],
+    [['status'], 'usage: st status'],
+    [['sync'], 'usage: st sync'],
   ] as const)('%j --help', async (cmd, prefix) => {
     const cap = makeContext();
     const code = await runCli([...cmd, '--help'], cap.ctx);
@@ -138,8 +185,8 @@ describe('runCli — per-command --help / -h prints command-specific usage', () 
   });
 
   it.each([
-    [['message', 'send'], 'usage: coord message send'],
-    [['message', 'ls'], 'usage: coord message ls'],
+    [['message', 'send'], 'usage: st message send'],
+    [['message', 'ls'], 'usage: st message ls'],
   ] as const)('%j -h', async (cmd, prefix) => {
     const cap = makeContext();
     const code = await runCli([...cmd, '-h'], cap.ctx);
@@ -151,14 +198,14 @@ describe('runCli — per-command --help / -h prints command-specific usage', () 
     const cap = makeContext();
     const code = await runCli(['send', 'bob'], cap.ctx);
     expect(code).toBe(2);
-    expect(cap.stderr).toContain('Did you mean `coord message send`?');
+    expect(cap.stderr).toContain('Did you mean `st message send`?');
   });
 
   it('`coord message --help` prints the message-group banner', async () => {
     const cap = makeContext();
     const code = await runCli(['message', '--help'], cap.ctx);
     expect(code).toBe(0);
-    expect(cap.stdout).toContain('coord message <verb>');
+    expect(cap.stdout).toContain('st message <verb>');
   });
 });
 
@@ -203,7 +250,7 @@ describe('runCli — error formatting', () => {
     const cap = makeContext();
     const code = await runCli(['message', 'ls'], cap.ctx);
     expect(code).toBe(1);
-    expect(cap.stderr).toMatch(/^coord: (agent|identity) required/);
+    expect(cap.stderr).toMatch(/^st: (agent|identity) required/);
   });
 
   it('unknown flag → exit 1 with "unknown flag" message', async () => {

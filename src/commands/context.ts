@@ -56,7 +56,7 @@ import {
 import { randomBytes } from 'node:crypto';
 import { dirname, join } from 'node:path';
 
-import type { CliContext } from '../cli-context.ts';
+import { invokedName, type CliContext } from '../cli-context.ts';
 import {
   contextDecisionsDir,
   contextDir,
@@ -362,22 +362,25 @@ function trimTrailingPeriod(s: string): string {
 
 // ─── CLI wrapper ─────────────────────────────────────────────────────────
 
-const CONTEXT_USAGE =
-  'usage: coord context <verb> [args...]\n\n' +
-  '  read [<identity>] [--decisions | --full]\n' +
-  '                           print now.md (default), decisions/ log, or both.\n' +
-  '                           Absent files print nothing (exit 0) so the\n' +
-  '                           SessionStart hook can `cat` unconditionally.\n' +
-  '  write [<identity>]       whole-file rewrite of now.md from stdin.\n' +
-  '                           Creates the context/ folder if absent.\n' +
-  '  append [<identity>] --decision "<text>" --why "<text>"\n' +
-  '                           append one entry to decisions/ as a new file\n' +
-  '                           named <unix-ms>-<rand6>.md. No file rewrites.\n\n' +
-  '  Layout: ~/.local/state/coord/<identity>/context/\n' +
-  '           ├── now.md            whole-file, last-write-wins snapshot\n' +
-  '           └── decisions/        one file per entry\n' +
-  '               └── <unix-ms>-<rand6>.md\n' +
-  '  brief-024 (context/ v1): the in-context-state leg of lossless-restart.\n';
+function contextUsage(name: string): string {
+  return (
+    `usage: ${name} context <verb> [args...]\n\n` +
+    '  read [<identity>] [--decisions | --full]\n' +
+    '                           print now.md (default), decisions/ log, or both.\n' +
+    '                           Absent files print nothing (exit 0) so the\n' +
+    '                           SessionStart hook can `cat` unconditionally.\n' +
+    '  write [<identity>]       whole-file rewrite of now.md from stdin.\n' +
+    '                           Creates the context/ folder if absent.\n' +
+    '  append [<identity>] --decision "<text>" --why "<text>"\n' +
+    '                           append one entry to decisions/ as a new file\n' +
+    '                           named <unix-ms>-<rand6>.md. No file rewrites.\n\n' +
+    '  Layout: $ST_ROOT/<identity>/context/\n' +
+    '           ├── now.md            whole-file, last-write-wins snapshot\n' +
+    '           └── decisions/        one file per entry\n' +
+    '               └── <unix-ms>-<rand6>.md\n' +
+    '  brief-024 (context/ v1): the in-context-state leg of lossless-restart.\n'
+  );
+}
 
 export async function cmdContextCli(
   args: readonly string[],
@@ -385,7 +388,7 @@ export async function cmdContextCli(
 ): Promise<number> {
   const sub = args[0];
   if (sub === undefined || sub === '-h' || sub === '--help') {
-    ctx.stderr(CONTEXT_USAGE);
+    ctx.stderr(contextUsage(invokedName(ctx.env)));
     return sub === undefined ? 2 : 0;
   }
   const rest = args.slice(1);
@@ -398,7 +401,7 @@ export async function cmdContextCli(
       return cliAppend(rest, ctx);
     default:
       ctx.stderr(`coord context: unknown subcommand: ${sub}\n\n`);
-      ctx.stderr(CONTEXT_USAGE);
+      ctx.stderr(contextUsage(invokedName(ctx.env)));
       return 2;
   }
 }

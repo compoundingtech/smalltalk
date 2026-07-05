@@ -563,19 +563,19 @@ describe('cmdContextCli', () => {
     const rc = await cmdContextCli(['banana'], ctx);
     expect(rc).toBe(2);
     expect(stderrBuf).toMatch(/unknown subcommand/);
-    expect(stderrBuf).toMatch(/usage: coord context/);
+    expect(stderrBuf).toMatch(/usage: st context/);
   });
 
   it('no verb → exit 2 + help', async () => {
     const rc = await cmdContextCli([], ctx);
     expect(rc).toBe(2);
-    expect(stderrBuf).toMatch(/usage: coord context/);
+    expect(stderrBuf).toMatch(/usage: st context/);
   });
 
   it('--help → exit 0 + help on stderr', async () => {
     const rc = await cmdContextCli(['--help'], ctx);
     expect(rc).toBe(0);
-    expect(stderrBuf).toMatch(/usage: coord context/);
+    expect(stderrBuf).toMatch(/usage: st context/);
   });
 
   it('read with positional identity reads that peer\'s context', async () => {

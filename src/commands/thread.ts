@@ -268,7 +268,7 @@ export { cmdThread as cmdThreadCore };
 
 // ─── CLI wrapper ────────────────────────────────────────────────────────
 
-import type { CliContext } from '../cli-context.ts';
+import { invokedName, type CliContext } from '../cli-context.ts';
 
 export function cmdThreadCli(args: readonly string[], ctx: CliContext): number {
   let tree = false;
@@ -282,7 +282,7 @@ export function cmdThreadCli(args: readonly string[], ctx: CliContext): number {
       case '-h':
       case '--help':
         ctx.stderr(
-          'usage: coord message thread [<identity>] <filename> [--tree]\n'
+          `usage: ${invokedName(ctx.env)} message thread [<identity>] <filename> [--tree]\n`
         );
         return 0;
       default:

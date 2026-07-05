@@ -21,7 +21,7 @@ import {
 } from 'node:fs';
 import { join } from 'node:path';
 
-import type { CliContext } from '../cli-context.ts';
+import { invokedName, type CliContext } from '../cli-context.ts';
 import {
   emitFrontmatter,
   genFilename,
@@ -302,28 +302,32 @@ export function cmdResourceRemove(
 
 // ─── CLI wrapper ────────────────────────────────────────────────────────
 
-const RESOURCE_HELP =
-  'usage: coord resource <subcommand> [args...]\n\n' +
-  '  add <url> [--title T] [--tag T,T] [--relation REL] [--body-stdin]\n' +
-  '  ls [<identity>]\n' +
-  '  read [<identity>] <filename>\n' +
-  '  rm <filename>\n\n' +
-  '  Resources live at $COORD_ROOT/<identity>/resources/.\n' +
-  '  Each file is <unix-ms>-<rand6>.md with `url:` in frontmatter\n' +
-  '  and an optional description in the body. Single-writer: only\n' +
-  '  the identity owner writes; peers read via sync.\n\n' +
-  '  --relation REL  Optional, free-form. Canonical (non-enforced)\n' +
-  '                  values: `owns`, `relates-to`, `depends-on`.\n' +
-  '                  Never inferred; absent by default. The bare\n' +
-  '                  URL is first-class with or without it.\n';
+function resourceHelp(name: string): string {
+  return (
+    `usage: ${name} resource <subcommand> [args...]\n\n` +
+    '  add <url> [--title T] [--tag T,T] [--relation REL] [--body-stdin]\n' +
+    '  ls [<identity>]\n' +
+    '  read [<identity>] <filename>\n' +
+    '  rm <filename>\n\n' +
+    '  Resources live at $ST_ROOT/<identity>/resources/.\n' +
+    '  Each file is <unix-ms>-<rand6>.md with `url:` in frontmatter\n' +
+    '  and an optional description in the body. Single-writer: only\n' +
+    '  the identity owner writes; peers read via sync.\n\n' +
+    '  --relation REL  Optional, free-form. Canonical (non-enforced)\n' +
+    '                  values: `owns`, `relates-to`, `depends-on`.\n' +
+    '                  Never inferred; absent by default. The bare\n' +
+    '                  URL is first-class with or without it.\n'
+  );
+}
 
 export async function cmdResourceCli(
   args: readonly string[],
   ctx: CliContext
 ): Promise<number> {
+  const name = invokedName(ctx.env);
   const sub = args[0];
   if (sub === undefined || sub === 'help' || sub === '-h' || sub === '--help') {
-    ctx.stderr(RESOURCE_HELP);
+    ctx.stderr(resourceHelp(name));
     return sub === undefined ? 2 : 0;
   }
   const rest = args.slice(1);
@@ -338,7 +342,9 @@ export async function cmdResourceCli(
     case 'remove':
       return cmdResourceRemoveCli(rest, ctx);
     default:
-      ctx.stderr(`coord resource: unknown subcommand: ${sub}\n\n${RESOURCE_HELP}`);
+      ctx.stderr(
+        `${name} resource: unknown subcommand: ${sub}\n\n${resourceHelp(name)}`
+      );
       return 2;
   }
 }
@@ -369,7 +375,7 @@ async function cmdResourceAddCli(
         break;
       case '-h':
       case '--help':
-        ctx.stderr(RESOURCE_HELP);
+        ctx.stderr(resourceHelp(invokedName(ctx.env)));
         return 0;
       default:
         if (a.startsWith('-')) throw new Error(`unknown flag: ${a}`);
@@ -406,7 +412,7 @@ function cmdResourceLsCli(
   let json = false;
   for (const a of args) {
     if (a === '-h' || a === '--help') {
-      ctx.stderr(RESOURCE_HELP);
+      ctx.stderr(resourceHelp(invokedName(ctx.env)));
       return 0;
     }
     if (a === '--json') {
@@ -438,7 +444,7 @@ function cmdResourceReadCli(
   const positional: string[] = [];
   for (const a of args) {
     if (a === '-h' || a === '--help') {
-      ctx.stderr(RESOURCE_HELP);
+      ctx.stderr(resourceHelp(invokedName(ctx.env)));
       return 0;
     }
     if (a === '--json') {
@@ -501,7 +507,7 @@ function cmdResourceRemoveCli(
   const positional: string[] = [];
   for (const a of args) {
     if (a === '-h' || a === '--help') {
-      ctx.stderr(RESOURCE_HELP);
+      ctx.stderr(resourceHelp(invokedName(ctx.env)));
       return 0;
     }
     if (a.startsWith('-')) throw new Error(`unknown flag: ${a}`);

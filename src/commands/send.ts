@@ -159,7 +159,7 @@ export { cmdSend as cmdSendCore };
 
 // ─── CLI wrapper ────────────────────────────────────────────────────────
 
-import type { CliContext } from '../cli-context.ts';
+import { invokedName, type CliContext } from '../cli-context.ts';
 
 export async function cmdSendCli(
   args: readonly string[],
@@ -203,13 +203,16 @@ export async function cmdSendCli(
       }
       case '-h':
       case '--help':
-        ctx.stderr(
-          'usage: coord message send <to> [-m <body> | --message <body>]\n' +
-            '                            [--from ID] [--subject S] [--in-reply-to F]\n' +
-            '                            [--tags T,T,...] [--priority low|normal|high]\n\n' +
-            '  Body source: pass `-m <body>` for inline, or omit and pipe the body\n' +
-            "  via stdin (e.g. `echo hi | coord message send bob`). Don't do both.\n"
-        );
+        {
+          const name = invokedName(ctx.env);
+          ctx.stderr(
+            `usage: ${name} message send <to> [-m <body> | --message <body>]\n` +
+              '                            [--from ID] [--subject S] [--in-reply-to F]\n' +
+              '                            [--tags T,T,...] [--priority low|normal|high]\n\n' +
+              '  Body source: pass `-m <body>` for inline, or omit and pipe the body\n' +
+              `  via stdin (e.g. \`echo hi | ${name} message send bob\`). Don't do both.\n`
+          );
+        }
         return 0;
       default:
         if (a.startsWith('-')) throw new Error(`unknown flag: ${a}`);

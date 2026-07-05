@@ -14,7 +14,7 @@ import { readdirSync, readFileSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 
-import type { CliContext } from '../cli-context.ts';
+import { invokedName, type CliContext } from '../cli-context.ts';
 import {
   inboxDir,
   statusPath,
@@ -634,7 +634,7 @@ export async function cmdDingCli(
       case '-h':
       case '--help':
         ctx.stderr(
-          'usage: coord ding <pty-session> [--identity ID] [--interval MS]\n' +
+          `usage: ${invokedName(ctx.env)} ding <pty-session> [--identity ID] [--interval MS]\n` +
             '                          [--tidy-interval-ms MS]\n' +
             '                          [--status-refresh-interval-ms MS]\n' +
             '                          [--no-exit-when-session-gone]\n\n' +

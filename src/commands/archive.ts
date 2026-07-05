@@ -384,7 +384,7 @@ export { cmdArchive as cmdArchiveCore, cmdArchiveTrim as cmdArchiveTrimCore };
 
 // ─── CLI wrapper ────────────────────────────────────────────────────────
 
-import type { CliContext } from '../cli-context.ts';
+import { invokedName, type CliContext } from '../cli-context.ts';
 
 export function cmdArchiveCli(
   args: readonly string[],
@@ -403,10 +403,13 @@ export function cmdArchiveCli(
         break;
       case '-h':
       case '--help':
-        ctx.stderr(
-          'usage: coord message archive [<identity>] <filename> [--with-attachments]\n' +
-            '       coord message archive trim [<identity>] [--older-than DURATION] [--keep-last N] [--dry-run] [--with-attachments]\n'
-        );
+        {
+          const name = invokedName(ctx.env);
+          ctx.stderr(
+            `usage: ${name} message archive [<identity>] <filename> [--with-attachments]\n` +
+              `       ${name} message archive trim [<identity>] [--older-than DURATION] [--keep-last N] [--dry-run] [--with-attachments]\n`
+          );
+        }
         return 0;
       default:
         if (a.startsWith('-')) throw new Error(`unknown flag: ${a}`);
@@ -462,7 +465,7 @@ function cmdArchiveTrimCli(args: readonly string[], ctx: CliContext): number {
       case '-h':
       case '--help':
         ctx.stderr(
-          'usage: coord message archive trim [<identity>] [--older-than DURATION] [--keep-last N] [--dry-run] [--with-attachments]\n'
+          `usage: ${invokedName(ctx.env)} message archive trim [<identity>] [--older-than DURATION] [--keep-last N] [--dry-run] [--with-attachments]\n`
         );
         return 0;
       default:

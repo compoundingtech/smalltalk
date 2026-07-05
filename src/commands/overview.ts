@@ -8,7 +8,7 @@
 import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 
-import type { CliContext } from '../cli-context.ts';
+import { invokedName, type CliContext } from '../cli-context.ts';
 import {
   archiveDir,
   filenameTimestamp,
@@ -340,12 +340,15 @@ function pad(s: string, width: number): string {
 
 // ─── CLI wrapper ────────────────────────────────────────────────────────
 
-const OVERVIEW_HELP =
-  'usage: coord overview [--recent N] [--json]\n\n' +
-  '  At-a-glance snapshot for $COORD_IDENTITY:\n' +
-  '    - your inbox unread count + oldest item\n' +
-  '    - every identity\'s status + last-activity\n' +
-  '    - top N recent activity entries across the tree\n';
+function overviewHelp(name: string): string {
+  return (
+    `usage: ${name} overview [--recent N] [--json]\n\n` +
+    '  At-a-glance snapshot for $COORD_IDENTITY:\n' +
+    '    - your inbox unread count + oldest item\n' +
+    '    - every identity\'s status + last-activity\n' +
+    '    - top N recent activity entries across the tree\n'
+  );
+}
 
 export function cmdOverviewCli(
   args: readonly string[],
@@ -369,7 +372,7 @@ export function cmdOverviewCli(
         break;
       case '-h':
       case '--help':
-        ctx.stderr(OVERVIEW_HELP);
+        ctx.stderr(overviewHelp(invokedName(ctx.env)));
         return 0;
       default:
         throw new Error(`unknown flag: ${a}`);

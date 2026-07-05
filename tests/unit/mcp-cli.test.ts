@@ -102,7 +102,7 @@ describe('cmdMcpCli — env contract', () => {
     };
     const rc = await cmdMcpCli(['--help'], ctx);
     expect(rc).toBe(0);
-    expect(helpText).toContain('coord mcp');
+    expect(helpText).toContain('st mcp');
     expect(helpText).toContain('ST_AGENT');
     expect(createMcpServerSpy).not.toHaveBeenCalled();
   });

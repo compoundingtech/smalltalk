@@ -14,7 +14,7 @@ import { delimiter, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { coordConfigFrom, coordRootFrom } from './common.ts';
-import type { CliContext } from './cli-context.ts';
+import { invokedName, type CliContext } from './cli-context.ts';
 import { cmdArchiveCli } from './commands/archive.ts';
 import { cmdCompletionsCli } from './commands/completions.ts';
 import { cmdContextCli } from './commands/context.ts';
@@ -61,19 +61,23 @@ async function readStdinBuffer(
   return Buffer.concat(chunks);
 }
 
-const MESSAGE_USAGE =
-  `usage: coord message <verb> [args...]   (alias: coord msg <verb>)\n\n` +
-  `  send <to> [--from ID] [--subject S] [--in-reply-to F] [--tags T,T] [--priority P]\n` +
-  `                                   read body from stdin\n` +
-  `  ls [<identity>] [--archive] [--count|--json] [--since UNIX_MS] [--from ID] [--orphans]\n` +
-  `  read [<identity>] <filename> [--raw|--json] [--archive]\n` +
-  `  archive [<identity>] <filename> [--with-attachments]\n` +
-  `  archive trim [<identity>] [--older-than DURATION] [--keep-last N] [--dry-run]\n` +
-  `                                   [--with-attachments]\n` +
-  `  thread [<identity>] <filename> [--tree]\n`;
+function messageUsage(name: string): string {
+  return (
+    `usage: ${name} message <verb> [args...]   (alias: ${name} msg <verb>)\n\n` +
+    `  send <to> [--from ID] [--subject S] [--in-reply-to F] [--tags T,T] [--priority P]\n` +
+    `                                   read body from stdin\n` +
+    `  ls [<identity>] [--archive] [--count|--json] [--since UNIX_MS] [--from ID] [--orphans]\n` +
+    `  read [<identity>] <filename> [--raw|--json] [--archive]\n` +
+    `  archive [<identity>] <filename> [--with-attachments]\n` +
+    `  archive trim [<identity>] [--older-than DURATION] [--keep-last N] [--dry-run]\n` +
+    `                                   [--with-attachments]\n` +
+    `  thread [<identity>] <filename> [--tree]\n`
+  );
+}
 
-const TOP_LEVEL_USAGE =
-  `usage: coord <subcommand> [args...]\n\n` +
+function topLevelUsage(name: string): string {
+  return (
+    `usage: ${name} <subcommand> [args...]\n\n` +
   `Messages:\n` +
   `  message <verb> [args...]   (alias: msg)\n` +
   `    send | ls | read | archive | thread\n\n` +
@@ -120,10 +124,12 @@ const TOP_LEVEL_USAGE =
   `                                   isn't busy/dnd\n` +
   `  completions <shell>              print a shell completion script to\n` +
   `                                   stdout (fish | bash | zsh), e.g.\n` +
-  `                                   coord completions fish > \\\n` +
-  `                                     ~/.config/fish/completions/coord.fish\n\n` +
-  `Run \`coord message --help\` for the full message-verb flag surface.\n` +
-  `See LAYOUT.md for the data-format spec.\n`;
+  `                                   ${name} completions fish > \\\n` +
+  `                                     ~/.config/fish/completions/${name}.fish\n\n` +
+  `Run \`${name} message --help\` for the full message-verb flag surface.\n` +
+    `See LAYOUT.md for the data-format spec.\n`
+  );
+}
 
 /**
  * Set of OLD top-level subcommand names that are now nested under
@@ -144,13 +150,14 @@ async function dispatchMessage(
   args: readonly string[],
   ctx: CliContext
 ): Promise<number> {
+  const name = invokedName(ctx.env);
   const sub = args[0];
   if (sub === undefined) {
-    ctx.stderr(MESSAGE_USAGE);
+    ctx.stderr(messageUsage(name));
     return 2;
   }
   if (sub === 'help' || sub === '--help' || sub === '-h') {
-    ctx.stdout(MESSAGE_USAGE);
+    ctx.stdout(messageUsage(name));
     return 0;
   }
   const rest = args.slice(1);
@@ -166,8 +173,8 @@ async function dispatchMessage(
     case 'thread':
       return cmdThreadCli(rest, ctx);
     default:
-      ctx.stderr(`coord message: unknown subcommand: ${sub}\n\n`);
-      ctx.stderr(MESSAGE_USAGE);
+      ctx.stderr(`${name} message: unknown subcommand: ${sub}\n\n`);
+      ctx.stderr(messageUsage(name));
       return 2;
   }
 }
@@ -176,13 +183,14 @@ export async function runCli(
   argv: readonly string[],
   ctx: CliContext = defaultCliContext()
 ): Promise<number> {
+  const name = invokedName(ctx.env);
   if (argv.length === 0) {
-    ctx.stderr(TOP_LEVEL_USAGE);
+    ctx.stderr(topLevelUsage(name));
     return 2;
   }
   const cmd = argv[0]!;
   if (cmd === 'help' || cmd === '--help' || cmd === '-h') {
-    ctx.stdout(TOP_LEVEL_USAGE);
+    ctx.stdout(topLevelUsage(name));
     return 0;
   }
   const rest = argv.slice(1);
@@ -218,12 +226,12 @@ export async function runCli(
         return cmdCompletionsCli(rest, ctx);
       default:
         // Helpful pointer for users who still type the pre-brief-017
-        // flat forms: `coord send` → `coord message send`.
+        // flat forms: `st send` → `st message send`.
         if (NESTED_MESSAGE_VERBS.has(cmd)) {
           ctx.stderr(
-            `coord: unknown subcommand: ${cmd}. Did you mean \`coord message ${cmd}\`?\n\n`
+            `${name}: unknown subcommand: ${cmd}. Did you mean \`${name} message ${cmd}\`?\n\n`
           );
-          ctx.stderr(TOP_LEVEL_USAGE);
+          ctx.stderr(topLevelUsage(name));
           return 2;
         }
         // brief-005-phase0 §6: git-style PATH dispatch. Look up
@@ -240,13 +248,13 @@ export async function runCli(
             return r.status ?? 1;
           }
         }
-        ctx.stderr(`coord: unknown subcommand: ${cmd}\n\n`);
-        ctx.stderr(TOP_LEVEL_USAGE);
+        ctx.stderr(`${name}: unknown subcommand: ${cmd}\n\n`);
+        ctx.stderr(topLevelUsage(name));
         return 2;
     }
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
-    ctx.stderr(`coord: ${msg}\n`);
+    ctx.stderr(`${name}: ${msg}\n`);
     return 1;
   }
 }
@@ -312,7 +320,9 @@ if (isMainModule()) {
       process.exitCode = code;
     },
     (err) => {
-      process.stderr.write(`coord: internal error: ${String(err)}\n`);
+      process.stderr.write(
+        `${invokedName(process.env)}: internal error: ${String(err)}\n`
+      );
       process.exitCode = 1;
     }
   );

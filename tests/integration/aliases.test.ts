@@ -47,6 +47,12 @@ function runBin(
 // ─── Item 1: binary aliases ───────────────────────────────────────────────
 
 describe('binary aliases (Item 1)', () => {
+  // The shims export `_ST_INVOKED_AS` from `basename $0`, and the CLI's
+  // help banner interpolates that name — so each shim brands its own
+  // name. This nudges `coord` users toward `st` without breaking the
+  // `coord` shim itself. The remaining test below pins the invariant
+  // we actually care about: exit code + set of subcommands is the same
+  // across all three shims.
   it('bin/coord help exits 0 with usage', () => {
     const r = runBin(BIN_COORD, ['help']);
     expect(r.exitCode).toBe(0);
@@ -56,23 +62,30 @@ describe('binary aliases (Item 1)', () => {
   it('bin/st help exits 0 with usage', () => {
     const r = runBin(BIN_ST, ['help']);
     expect(r.exitCode).toBe(0);
-    expect(r.stdout).toContain('usage: coord');
+    expect(r.stdout).toContain('usage: st');
   });
 
   it('bin/smalltalk help exits 0 with usage', () => {
     const r = runBin(BIN_SMALLTALK, ['help']);
     expect(r.exitCode).toBe(0);
-    expect(r.stdout).toContain('usage: coord');
+    expect(r.stdout).toContain('usage: smalltalk');
   });
 
-  it('all three binaries produce IDENTICAL output for `help`', () => {
+  it('all three binaries dispatch identically (exit + subcommand list) for `help`', () => {
     const c = runBin(BIN_COORD, ['help']);
     const s = runBin(BIN_ST, ['help']);
     const t = runBin(BIN_SMALLTALK, ['help']);
-    expect(s.stdout).toBe(c.stdout);
-    expect(t.stdout).toBe(c.stdout);
     expect(s.exitCode).toBe(c.exitCode);
     expect(t.exitCode).toBe(c.exitCode);
+    // Normalize the invoked-name interpolation and compare the
+    // remaining body. Every non-banner line — the subcommand list,
+    // section headers, `See LAYOUT.md for the data-format spec.` —
+    // has to match byte-for-byte across shims; otherwise the shims
+    // are running different code paths, which would be a real bug.
+    const strip = (s: string): string =>
+      s.replace(/\b(coord|smalltalk|st)\b/g, 'NAME');
+    expect(strip(s.stdout)).toBe(strip(c.stdout));
+    expect(strip(t.stdout)).toBe(strip(c.stdout));
   });
 
   it('all three propagate _ST_INVOKED_AS when invoked directly (status round-trip)', () => {
