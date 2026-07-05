@@ -6,6 +6,39 @@ minor releases until 1.0.
 
 ## Unreleased
 
+### Added (`st launch --unattended` auto-pokes Claude Code's first-launch gates)
+
+Every freshly-launched Claude Code session stalls at up to three
+first-launch TUI dialogs — workspace trust, the
+`--dangerously-load-development-channels` warning, and (on resume)
+the resume-mode picker — each dismissed with a single Enter. Prior
+to this, a CoS spawning a specialist under `spawn()` had nobody at
+the REPL to press Enter, so the specialist wedged.
+
+`st launch --unattended` bakes a startup auto-poker into the pty
+session command:
+
+```
+(sleep 4 && pty send <id>/<sess> --seq key:return; sleep 4 && ...; sleep 4 && ...; sleep 4 && ...) & exec <claude ...>
+```
+
+Four pokes with 4s spacing — enough margin for a slow box, extras
+past the last dialog land as empty submissions at the model prompt
+(no-ops). The target is the fully-qualified pty session name
+established by the identity-prefix fix (`<identity>/<sessionName>`).
+
+**Auto-on when stdin is not a TTY** — a CoS shelling out via
+`spawn()` gets hands-off standup with no flag to remember. Explicit
+`--attended` is the escape hatch for headless debug runs.
+
+Only affects the `claude` harness on the pty path. Codex has no
+dev-channels gate; `--no-pty` has no session to send to. Ignored in
+both cases even when `--unattended` is explicit, so callers can
+pass the flag generically.
+
+Lands `LaunchResult.unattended: boolean` for observability + a new
+`unattended:     yes|no` line in the `--dry-run` summary.
+
 ### Fixed (`st launch` derives the pty prefix from the identity, not the repo basename)
 
 Historic behavior: the generated `pty.toml` used the cwd basename as
