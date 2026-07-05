@@ -299,6 +299,13 @@ export interface LaunchResult {
    * decisions we would make without touching disk.
    */
   persona: PersonaInstallResult | null;
+  /**
+   * Summary of the DING-BUS.md install, or null when the launch
+   * wasn't `--ding` (or was codex, which has its own instructions
+   * path). See {@link installDingBusInstructions} + the
+   * {@link DING_BUS_INSTRUCTIONS} constant for content.
+   */
+  dingBus: DingBusInstallResult | null;
 }
 
 /**
@@ -325,6 +332,31 @@ export interface PersonaInstallResult {
   gitExcludeEntriesAdded: readonly string[];
   /** True when the target cwd was not a git repo, so we couldn't
    *  exclude. Callers can surface a warning; the persona still
+   *  installs. */
+  gitRepoAbsent: boolean;
+}
+
+/**
+ * Result of the DING-BUS.md install (only runs on `--ding` claude
+ * launches). Same shape as PersonaInstallResult but for the
+ * `@DING-BUS.md` import — see {@link installDingBusInstructions}.
+ */
+export interface DingBusInstallResult {
+  /** Absolute path we copied DING-BUS.md to. */
+  dingBusMdPath: string;
+  /** The entry file (CLAUDE.md — ding-mode is claude-only). */
+  entryFile: 'CLAUDE.md';
+  /** Absolute path of the entry file. */
+  entryFilePath: string;
+  /** True when the entry file didn't exist and we created it. */
+  entryFileCreated: boolean;
+  /** True when we appended a `@DING-BUS.md` line (vs. it was already
+   *  present). */
+  importLineAppended: boolean;
+  /** Entries that were (or would be) appended to `.git/info/exclude`. */
+  gitExcludeEntriesAdded: readonly string[];
+  /** True when the target cwd was not a git repo, so we couldn't
+   *  exclude. Callers can surface a warning; the DING-BUS.md still
    *  installs. */
   gitRepoAbsent: boolean;
 }
@@ -857,6 +889,189 @@ export function buildClaudeSettings(
   return `${JSON.stringify(settings, null, 2)}\n`;
 }
 
+// ─── ding-mode bus instructions install ────────────────────────────────
+
+/**
+ * The bus-mechanics contract delivered to a ding-mode agent — the
+ * ding-mode analog of `src/mcp/capabilities.ts:CHANNEL_INSTRUCTIONS`
+ * (which the MCP server sends as `instructions:` on the MCP
+ * capabilities). Both blurbs are two versions of ONE bus contract:
+ * MCP agents get one via the transport's `instructions:` field;
+ * ding-mode agents get the other via an `@DING-BUS.md` import in
+ * their entry file (CLAUDE.md).
+ *
+ * **Keep in sync**: when the bus contract changes (new tools, new
+ * conventions, boot-ritual updates), update BOTH this constant AND
+ * `CHANNEL_INSTRUCTIONS` in `src/mcp/capabilities.ts`. A drift
+ * between the two means MCP agents and ding-mode agents will
+ * behave differently for the same protocol event.
+ *
+ * Content shape follows the same "boot ritual → arrivals-handling →
+ * threads-stay-on-bus → tools inventory" structure as
+ * CHANNEL_INSTRUCTIONS, adapted for the CLI-based delivery path.
+ */
+export const DING_BUS_INSTRUCTIONS = `# Ding-mode bus instructions
+
+You are connected to smalltalk via ding-mode (no MCP). Bus ops go
+through the \`st\` CLI. **You will NOT receive \`<channel>\` blocks
+— those are MCP-only.** Inbound messages arrive as \`[DING]\`
+pokes in your terminal; always confirm the actual message via
+\`st message ls\` + \`st message read\` before acting.
+
+## Boot ritual (on cold start or /clear)
+
+1. \`st status $ST_AGENT --set available\` — set your status file
+   so peers see you as active.
+2. Drain your inbox backlog: \`st message ls\` to enumerate
+   filenames, then for each filename \`st message read <filename>\`,
+   \`st message reply <filename> -m "<your reply>"\` if a response
+   is warranted, and \`st message archive <filename>\` to clear.
+   Don't leave inbox items unaddressed.
+3. \`st agents --json --enrich\` to see who's around and whether
+   any peers are waiting on you.
+
+## Inbound message handling ([DING] pokes)
+
+New peer messages surface in your terminal as \`[DING] new
+smalltalk message: <subject> (from <sender>); check your inbox\`
+lines. For each poke:
+
+1. \`st message ls\` to find the new filename (or read it out of
+   the \`[DING]\` line's subject if unambiguous).
+2. \`st message read <filename>\` to fetch the body + frontmatter.
+3. \`st message reply <filename> -m "<your reply>"\` if a response
+   is warranted (the CLI derives the recipient from the message's
+   \`from:\` frontmatter and threads the reply).
+4. \`st message archive <filename>\` to clear the inbox.
+
+The tidy-check tick may also poke you with \`[DING] tidy-check:
+inbox=<n> (oldest <age>).\` — that means your inbox has drifted
+past the staleness threshold. Drain the backlog above.
+
+## Threads stay on the bus
+
+A thread that originated from a \`[DING]\` poke or an inbox
+message is conversed *only* via \`st message send\` /
+\`st message reply\` — questions, clarifications, blockers, "I
+think I'm done" signals, follow-up thoughts, all of it. By
+default, your pty REPL is unattended — no human is watching what
+you print to your own screen. Your correspondent is your
+interlocutor for the thread; they will relay anything that
+matters to the user. If you would otherwise pause to ask "should
+I do X?" at your REPL, send it via \`st message reply\` instead.
+The only time it's right to address the REPL is when a human
+directly typed there.
+
+## CLI inventory
+
+Bus ops:
+- \`st message send <to> [-m <body> | --message <body>] [--subject S] [--in-reply-to F] [--tags T,T] [--priority P]\`
+- \`st message reply <filename> -m <body> [--subject S]\`
+- \`st message ls [<identity>] [--archive] [--count | --json] [--since UNIX_MS] [--from ID] [--orphans]\`
+- \`st message read [<identity>] <filename> [--raw | --json] [--archive]\`
+- \`st message archive [<identity>] <filename> [--with-attachments]\`
+- \`st message thread [<identity>] <filename> [--tree]\`
+
+Peer discovery + state:
+- \`st agents [--status STATE] [--json [--enrich]]\`
+- \`st status [<identity>] [--set <state>]\`
+
+Working state (lossless-restart):
+- \`st context read [<identity>] [--decisions | --full]\`
+- \`st context write [<identity>]\` (reads new content from stdin)
+- \`st context append [<identity>] --decision "<text>" --why "<text>"\`
+
+Every command supports \`--help\` for the full flag surface.
+`;
+
+/**
+ * Do (or plan) the DING-BUS.md install. Same mechanics as
+ * {@link installPersona}: copy content to \`<cwd>/DING-BUS.md\`,
+ * surgically append \`@DING-BUS.md\` to CLAUDE.md if not already
+ * present, add DING-BUS.md to \`.git/info/exclude\`.
+ *
+ * Only runs when \`--ding\` was passed on a claude launch — ding-mode
+ * is claude-only (codex already has its own instructions path).
+ */
+function installDingBusInstructions(opts: {
+  cwd: string;
+  dryRun: boolean;
+}): DingBusInstallResult {
+  const { cwd, dryRun } = opts;
+  const entryFile = 'CLAUDE.md' as const;
+  const entryFilePath = join(cwd, entryFile);
+  const dingBusMdPath = join(cwd, 'DING-BUS.md');
+
+  // Plan the entry-file edit. Match `@DING-BUS.md` on its own line
+  // (leniently — trailing space or trailing comment counts as
+  // already-present).
+  let existingText = '';
+  let fileExisted = false;
+  try {
+    existingText = readFileSync(entryFilePath, 'utf8');
+    fileExisted = true;
+  } catch {
+    // missing → we'll create it
+  }
+  const importPattern = /^@DING-BUS\.md\b/m;
+  const importAlreadyPresent = importPattern.test(existingText);
+  const importLineToAppend = !importAlreadyPresent;
+  const entryFileCreated = !fileExisted && importLineToAppend;
+
+  // Git-exclude the files we own. DING-BUS.md is always excluded.
+  // The entryFile is only excluded when WE created it — a
+  // pre-existing repo CLAUDE.md is left in the repo's tracking.
+  const wantedExcludes: string[] = ['DING-BUS.md'];
+  if (entryFileCreated) wantedExcludes.push(entryFile);
+
+  const excludeInfo = readGitExclude(cwd);
+  const gitRepoAbsent = excludeInfo === null;
+  const gitExcludeEntriesAdded = excludeInfo
+    ? missingExcludeEntries(excludeInfo.text, wantedExcludes)
+    : [];
+
+  if (!dryRun) {
+    // Write DING-BUS.md — always overwrite because we own the
+    // content (it's a versioned constant, not user data).
+    writeFileSync(dingBusMdPath, DING_BUS_INSTRUCTIONS);
+
+    // Entry-file edit (mirrors installPersona logic).
+    if (importLineToAppend) {
+      if (!fileExisted) {
+        writeFileSync(entryFilePath, '@DING-BUS.md\n');
+      } else {
+        const sep =
+          existingText.length === 0 || existingText.endsWith('\n')
+            ? ''
+            : '\n';
+        writeFileSync(
+          entryFilePath,
+          existingText + sep + '@DING-BUS.md\n'
+        );
+      }
+    }
+
+    // Git-exclude append.
+    if (excludeInfo && gitExcludeEntriesAdded.length > 0) {
+      appendGitExclude(
+        excludeInfo.path,
+        excludeInfo.text,
+        gitExcludeEntriesAdded
+      );
+    }
+  }
+
+  return {
+    dingBusMdPath,
+    entryFile,
+    entryFilePath,
+    entryFileCreated,
+    importLineAppended: importLineToAppend,
+    gitExcludeEntriesAdded,
+    gitRepoAbsent,
+  };
+}
+
 // ─── brief-022: persona install ────────────────────────────────────────
 
 /** The infra files `st launch` creates in the target cwd. Persona-mode
@@ -1173,6 +1388,27 @@ export async function cmdLaunch(
     }
   }
 
+  // ─── DING-BUS.md install (ding-mode claude only) ────────────────────
+  // The ding-mode analog of the MCP CHANNEL_INSTRUCTIONS blurb. Auto-
+  // installed with `--ding` because ding-mode agents have no MCP
+  // transport to receive `instructions:` through — the persona file
+  // provides role, this file provides bus mechanics. Composes with
+  // `@PERSONA.md` via the same entry-file `@`-import mechanism.
+  let dingBusResult: DingBusInstallResult | null = null;
+  if (ding && harness === 'claude') {
+    dingBusResult = installDingBusInstructions({
+      cwd,
+      dryRun: input.dryRun === true,
+    });
+    if (dingBusResult.gitRepoAbsent) {
+      ctx.stderr(
+        `[smalltalk launch] --ding: ${cwd} is not a git repo; ` +
+          `skipping .git/info/exclude update. DING-BUS.md is still ` +
+          `installed.\n`
+      );
+    }
+  }
+
   // ─── claude session-id bootstrap ────────────────────────────────────
   let claudeSessionIdPath: string | null = null;
   let claudeSessionId: string | null = null;
@@ -1472,6 +1708,7 @@ export async function cmdLaunch(
       claudeSettingsPath,
       claudeSettingsPreview,
       persona: personaResult,
+      dingBus: dingBusResult,
     };
   }
 
@@ -1572,6 +1809,7 @@ export async function cmdLaunch(
     claudeSettingsPath,
     claudeSettingsPreview,
     persona: personaResult,
+    dingBus: dingBusResult,
   };
 }
 
@@ -1839,6 +2077,30 @@ export async function cmdLaunchCli(
       } else {
         ctx.stdout(
           `  git-exclude:  ${r.persona.gitExcludeEntriesAdded.join(', ')}\n`
+        );
+      }
+    }
+    if (r.dingBus !== null) {
+      // DING-BUS.md summary — same shape as the persona block, so an
+      // operator debugging a `--ding` launch sees exactly what the
+      // install landed alongside the persona.
+      ctx.stdout(`\nding-bus:\n`);
+      ctx.stdout(`  write:        ${r.dingBus.dingBusMdPath}\n`);
+      const action = r.dingBus.entryFileCreated
+        ? 'create'
+        : r.dingBus.importLineAppended
+          ? 'append @DING-BUS.md'
+          : 'no change (import already present)';
+      ctx.stdout(`  entry file:   ${r.dingBus.entryFilePath} (${action})\n`);
+      if (r.dingBus.gitRepoAbsent) {
+        ctx.stdout(
+          `  git-exclude:  skipped (${cwdForGitExcludeNote(r)} is not a git repo)\n`
+        );
+      } else if (r.dingBus.gitExcludeEntriesAdded.length === 0) {
+        ctx.stdout(`  git-exclude:  no new entries (all already present)\n`);
+      } else {
+        ctx.stdout(
+          `  git-exclude:  ${r.dingBus.gitExcludeEntriesAdded.join(', ')}\n`
         );
       }
     }

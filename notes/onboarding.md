@@ -161,6 +161,41 @@ What `st launch` does for you (with `--persona` + `--permanent`):
 
 The CoS opens in your terminal — now knowing it's a CoS.
 
+### Alternative: `--ding` (MCP-hostile environments)
+
+If your environment can't run MCP servers at all — sandboxed
+runners, some corporate-managed setups, or specific Claude Code
+distributions where MCP is disabled — add `--ding` to the launch:
+
+```sh
+st launch claude --identity cos --permanent --ding \
+  --permission-mode bypassPermissions \
+  --persona ~/src/github.com/myobie/personas/chief-of-staff.md
+```
+
+`--ding` swaps the MCP-based delivery path for the same
+codex-style pattern: no `.mcp.json`, no channel-injection, plus a
+`pty send`-based ding sidecar that delivers `[DING] `-prefixed
+notices into the CoS's terminal on each new inbox message. The
+CoS then uses the `st` CLI (`st message ls / read / reply /
+archive`) for all bus ops.
+
+`st launch --ding` also installs a `DING-BUS.md` file next to
+`PERSONA.md` and wires it into `CLAUDE.md` (via
+`@DING-BUS.md`) — the ding-mode analog of the bus-mechanics
+instructions the MCP server would otherwise send as
+`instructions:`. So a ding-mode CoS knows the CLI flow,
+`[DING]`-poke handling, and the "threads stay on the bus"
+convention without needing MCP.
+
+Behavior guarantees:
+- Boot ritual / PreCompact flush / StopFailure ding hooks still
+  generate — those are Claude Code hooks, MCP-independent.
+- Spawner-shaped detection still applies (cos + supervisor
+  default `bypassPermissions`, warn without `--permanent`).
+- Hooks-not-found emits the same LOUD stderr banner as MCP-mode
+  when the shipped `examples/claude-code/hooks/` isn't on disk.
+
 ## 3. What the CoS does on boot (from the persona)
 
 The `chief-of-staff.md` file the launch just installed tells the

@@ -6,6 +6,60 @@ minor releases until 1.0.
 
 ## Unreleased
 
+### Added (`st launch --ding` installs `DING-BUS.md` — bus-mechanics contract for ding-mode agents)
+
+Final step of the Johannes stack. Ding-mode agents have no MCP
+transport → no MCP `instructions:` blurb (the boot ritual /
+channel-notification-handling / tools-inventory contract every
+MCP agent gets on connect). Without an equivalent, a bare
+ding-mode CoS launches without knowing the CLI flow, how to
+handle `[DING]` pokes, or the "threads stay on the bus"
+convention. This close makes ding-only genuinely first-class,
+not degraded.
+
+Fix (cos-approved option 2):
+
+- **`DING_BUS_INSTRUCTIONS`** exported constant in `launch.ts` —
+  the ding-mode analog of `src/mcp/capabilities.ts:CHANNEL_INSTRUCTIONS`.
+  Content structured to mirror MCP's shape: boot ritual →
+  `[DING]`-poke handling → threads-stay-on-bus convention →
+  CLI inventory. Explicitly notes ding-mode agents will NOT
+  receive `<channel>` blocks (per cos's refinement — an agent
+  shouldn't wait for something that never comes).
+
+- **`installDingBusInstructions()`** mirrors `installPersona()`:
+  writes `<cwd>/DING-BUS.md`, surgically appends `@DING-BUS.md`
+  to `CLAUDE.md` (creates the file if absent; leaves a
+  pre-existing repo `CLAUDE.md` in tracking), adds `DING-BUS.md`
+  to `.git/info/exclude`. Idempotent on re-run.
+
+- **Auto-installs with `--ding`** on the claude harness — ding-mode
+  is claude-only (codex has its own instructions path).
+  `LaunchResult.dingBus: DingBusInstallResult | null` for
+  observability + a new `ding-bus:` block in the `--dry-run`
+  summary.
+
+- **Cross-reference comment** on both `CHANNEL_INSTRUCTIONS`
+  (`src/mcp/capabilities.ts`) and `DING_BUS_INSTRUCTIONS`
+  (`src/commands/launch.ts`) marking them as "two versions of one
+  bus contract — keep in sync when the contract changes." Drift
+  means MCP agents and ding-mode agents will behave differently
+  for the same protocol event.
+
+- **`notes/onboarding.md`** section 2 gains an "Alternative:
+  `--ding` (MCP-hostile environments)" subsection covering when
+  and why to use it, the full launch command, and what
+  auto-installs on top of the persona.
+
+9 new unit tests cover: no-`--ding` case leaves `dingBus` null;
+`--ding` populates the result on dry-run; live-run writes
+DING-BUS.md with the load-bearing substrings + confirms no `coord`
+leak; `@DING-BUS.md` composes with `@PERSONA.md`; git-exclude
+happens; codex + `--ding` is a no-op on the install path;
+missing-git-repo warning fires + DING-BUS.md still installs;
+idempotent re-run doesn't duplicate the import line; CLI
+`--dry-run` summary shows the `ding-bus:` block.
+
 ### Changed (ding-delivered messages now prefixed with `[DING] ` + `smalltalk` naming)
 
 Two `st ding` delivery paths — the inbox-arrival notice and the

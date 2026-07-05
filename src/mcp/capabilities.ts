@@ -93,6 +93,15 @@ export const SERVER_OPTIONS: ServerOptions = {
  * regression guard): `available`, `coord status`, `coord_msg_ls`,
  * `coord_msg_read`, `coord_msg_archive`, `coord_msg_reply`,
  * `coord_members`, `<channel source="coord"`.
+ *
+ * **Bus-contract twin: `DING_BUS_INSTRUCTIONS` in
+ * `src/commands/launch.ts`.** MCP agents receive THIS blurb via the
+ * transport's `instructions:` field; ding-mode agents receive the
+ * DING-BUS.md analog via an `@DING-BUS.md` import installed by
+ * `st launch --ding`. Two versions of ONE bus contract — when the
+ * contract changes (new tools, new conventions, boot-ritual
+ * updates), update BOTH. Drift means MCP agents and ding-mode
+ * agents will behave differently for the same protocol event.
  */
 export const CHANNEL_INSTRUCTIONS = [
   'You are connected to coord. This is myobie\'s visibility layer: they look at status files and inbox/archive to understand what every agent is doing. Maintain those records.',
