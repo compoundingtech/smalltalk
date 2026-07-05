@@ -6,6 +6,27 @@ minor releases until 1.0.
 
 ## Unreleased
 
+### Fixed (F1 auto-poker was addressing sessions with a slash — pty resolves with a dash)
+
+F1's `--unattended` auto-poker (#47) built its target as
+`${identity}/${sessionName}` (slash), but pty joins prefix + session
+name with a DASH — see `../pty/src/ptyfile.ts:58`:
+`defaultDisplayName = prefix ? '${prefix}-${rawName}' : rawName`.
+Every `pty send` returned `Session "<x>/<y>" not found`, no poke
+fired, and every CoS-spawned worker deadlocked at the
+`--dangerously-load-development-channels` gate.
+
+Surfaced by the P5 team-standup re-run — the eval that verified F1
+also caught F1's own bug. A hand-written dash-form poke
+(`pty send taskflow-dev-claude`) cleared the gate instantly,
+proving the fix scope.
+
+One-line fix: switch the poker target from
+`${identity}/${sessionName}` to `${identity}-${sessionName}`.
+Now `st launch --unattended` gives truly 0-poke CoS-driven worker
+standup. Existing F1 tests updated + a negative assertion added
+(the slash form must NOT appear).
+
 ### Fixed (`st launch` backgrounds `pty up` when stdin is not a TTY)
 
 Historic behavior: `st launch` shelled out to `pty up` with

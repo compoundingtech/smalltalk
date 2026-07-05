@@ -411,17 +411,24 @@ function tomlEscape(s: string): string {
  * dev-channels warning, optional resume-mode dialog); extras past
  * the last gate hit the model prompt as empty submissions — no-ops.
  *
- * Target is the fully-qualified pty session name
- * (`<identity>/<sessionName>`) so pty's routing is unambiguous
- * regardless of caller scope. The `pty` binary is expected to be on
- * PATH — it always is when pty spawned the session in the first
- * place. If pty fell off PATH mid-session, the pokes emit stderr
- * errors and the shell keeps going; the main claude exec is
- * unaffected.
+ * Target is the pty session name that `ptyfile.ts:58` derives from
+ * a `prefix = "…"` line plus a `[sessions.<name>]` block:
+ * `${prefix}-${sessionName}` (dash join, NOT slash). We land in
+ * `<identity>-<sessionName>` because F3 makes the prefix the
+ * identity. Prior to this fix the poker addressed the session with
+ * a slash — pty responded with `Session "<x>/<y>" not found`, every
+ * poke missed, and the CoS-spawned worker deadlocked at the
+ * dev-channels gate. See `../pty/src/ptyfile.ts:58` for the join
+ * canonicalization.
+ *
+ * The `pty` binary is expected to be on PATH — it always is when
+ * pty spawned the session in the first place. If pty fell off PATH
+ * mid-session, the pokes emit stderr errors and the shell keeps
+ * going; the main claude exec is unaffected.
  */
-function pokerPrefix(fqn: string): string {
-  const target = shellQuote(fqn);
-  const oneShot = `sleep 4 && pty send ${target} --seq key:return`;
+function pokerPrefix(target: string): string {
+  const quoted = shellQuote(target);
+  const oneShot = `sleep 4 && pty send ${quoted} --seq key:return`;
   return `(${oneShot}; ${oneShot}; ${oneShot}; ${oneShot}) &`;
 }
 
@@ -443,16 +450,17 @@ function buildPtyToml(opts: {
   // second condition is trivially met here.
   const shellLine =
     opts.unattended && opts.harness === 'claude'
-      ? `${pokerPrefix(`${opts.identity}/${opts.sessionName}`)} exec ${rawShellLine}`
+      ? `${pokerPrefix(`${opts.identity}-${opts.sessionName}`)} exec ${rawShellLine}`
       : rawShellLine;
   // Prefix is the identity — pty namespace is global and repo
   // basenames can collide (`taskflow` in two different clones both
-  // trying to be `taskflow/claude`). Identity is unique per agent by
+  // trying to be `taskflow-claude`). Identity is unique per agent by
   // construction, and it means a generic shepherd poking `pty send
-  // <identity>/<session>` always finds the right session. Historic
-  // behavior was repo-basename via a `resolveRepoPrefix(cwd)` walk;
-  // that shape is preserved by `--session-name` when a user really
-  // wants a different key inside the identity namespace.
+  // <identity>-<session>` always finds the right session (pty joins
+  // prefix + sessionName with a dash — see ../pty/src/ptyfile.ts:58).
+  // Historic behavior was repo-basename via a `resolveRepoPrefix(cwd)`
+  // walk; that shape is preserved by `--session-name` when a user
+  // really wants a different key inside the identity namespace.
   const prefix = opts.identity;
   const lines: string[] = [];
   lines.push(`prefix = "${tomlEscape(prefix)}"`);
