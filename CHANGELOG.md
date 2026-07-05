@@ -6,6 +6,34 @@ minor releases until 1.0.
 
 ## Unreleased
 
+### Docs (onboarding.md rewrite — leads with the CoS quickstart)
+
+Full rewrite of `notes/onboarding.md`. Previously walked a
+7-step manual bus-provisioning recipe (identity, folder, message
+round-trip, MCP init, sync) with no mention of `st launch`. Now
+leads with the Chief-of-Staff quickstart:
+
+1. Install smalltalk + pty side-by-side; `npm install && npm link`;
+   note the Claude Code hook install path.
+2. `st launch claude --identity cos` in a directory that will
+   become your private cos repo. `--agent <name>` for aliased
+   claude binaries (Johannes-style `cl1`, `cl2`).
+3. The CoS itself consumes https://github.com/myobie/personas
+   (SHA-pinned) for its role contract on first boot.
+4. First run: the CoS runs an interview (identity/repos/priorities/
+   team/channels → writes the private cos repo) then a readiness
+   check via `st-evals`. The exact `st-evals` invocation is
+   deliberately not hardcoded (st-evals is still being built).
+5. Operating — talk to your CoS.
+
+The zero-to-first-message bus basics (identity, folder, message
+round-trip, `st init`, multi-machine sync) live as a lower-level
+"Bus basics" appendix for tooling authors and non-CoS agents.
+
+Updated naming block, prerequisites, and troubleshooting to match
+the post-#41/#42/#43 state — `st` canonical, `st --version`
+available, `.claude/settings.local.json` commands bake `ST_BIN`.
+
 ### Changed (hooks resolve the CLI via `$ST_BIN` — absolute path baked at launch)
 
 The three shipped Claude Code hooks (`pre-compact.sh`, `stop-failure.sh`;
