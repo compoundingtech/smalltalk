@@ -75,17 +75,30 @@ export interface InitResult {
 // ─── Bin path resolution ────────────────────────────────────────────────
 
 /**
- * Resolve a portable path to `bin/coord`. Strategy:
+ * Resolve a portable path to the smalltalk shim to embed as the MCP
+ * server command in a project's `.mcp.json`. Strategy:
  *   1. Walk up from this module's file location to find the
- *      package.json whose `name === "@myobie/coord"`, then return
- *      `<package-root>/bin/coord` (works under npm-install, `npm link`,
- *      or running directly out of a checkout — `import.meta.url` is
- *      the realpath of this file in all three modes).
- *   2. Fall back to `which coord` on PATH (for users who installed
- *      coord globally and want to point .mcp.json at the PATH lookup).
+ *      package.json whose `name === "@myobie/coord"` (the package
+ *      name still says coord until the npm publish flips it), then
+ *      return `<package-root>/bin/st`. Falls back to
+ *      `<package-root>/bin/coord` only when `bin/st` isn't present
+ *      on this install (very old package tarball / hand-installed
+ *      old checkout).
+ *   2. Fall back to `which st` on PATH, then `which coord` for
+ *      legacy PATH setups.
  *
- * Throws if neither path produces an existing bin/coord file. Brief-026
- * boundary: NEVER hardcode a developer-machine absolute path.
+ * Prefers `bin/st` because it's the post-cutover canonical name —
+ * matches what `st init` writes as the `.mcp.json` server key (`st`)
+ * and what `enabledMcpjsonServers` pins. The old `bin/coord` was
+ * dual-aliased into the same target, so both work today, but pinning
+ * to the canonical name means the day we drop the coord alias
+ * doesn't break every existing `.mcp.json`. Function name kept as
+ * `resolveCoordBinPath` for now — this is a callers-are-me-only API,
+ * renaming is scope-creep on the fix.
+ *
+ * Throws if neither the checkout walk nor the PATH lookup produces
+ * an existing shim. Brief-026 boundary: NEVER hardcode a developer-
+ * machine absolute path.
  */
 export function resolveCoordBinPath(): string {
   const here = fileURLToPath(import.meta.url);
@@ -97,9 +110,19 @@ export function resolveCoordBinPath(): string {
         const raw = readFileSync(pkgPath, 'utf8');
         const parsed = JSON.parse(raw) as { name?: string };
         if (parsed.name === '@myobie/coord') {
-          const candidate = join(dir, 'bin', 'coord');
-          if (existsSync(candidate) && statSync(candidate).isFile()) {
-            return candidate;
+          // Prefer post-cutover canonical bin/st; fall back to bin/coord
+          // if bin/st isn't present (very old package or hand-install
+          // predating the cutover).
+          const stCandidate = join(dir, 'bin', 'st');
+          if (existsSync(stCandidate) && statSync(stCandidate).isFile()) {
+            return stCandidate;
+          }
+          const coordCandidate = join(dir, 'bin', 'coord');
+          if (
+            existsSync(coordCandidate) &&
+            statSync(coordCandidate).isFile()
+          ) {
+            return coordCandidate;
           }
         }
       } catch {
@@ -110,19 +133,21 @@ export function resolveCoordBinPath(): string {
     if (parent === dir) break;
     dir = parent;
   }
-  // PATH fallback.
-  try {
-    const r = spawnSync('which', ['coord'], { encoding: 'utf8' });
-    if (r.status === 0 && typeof r.stdout === 'string') {
-      const found = r.stdout.trim();
-      if (found.length > 0 && existsSync(found)) return found;
+  // PATH fallback — prefer `st`, then `coord` for legacy PATH.
+  for (const name of ['st', 'coord']) {
+    try {
+      const r = spawnSync('which', [name], { encoding: 'utf8' });
+      if (r.status === 0 && typeof r.stdout === 'string') {
+        const found = r.stdout.trim();
+        if (found.length > 0 && existsSync(found)) return found;
+      }
+    } catch {
+      // ignore
     }
-  } catch {
-    // ignore
   }
   throw new Error(
-    'coord init: could not resolve a bin/coord path. Install @myobie/coord ' +
-      '(via npm) or add `coord` to your $PATH and retry.'
+    'st init: could not resolve a bin/st path. Install @myobie/coord ' +
+      '(via npm) or add `st` to your $PATH and retry.'
   );
 }
 
