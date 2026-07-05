@@ -329,6 +329,162 @@ describe('cmdLaunch — --permission-mode (brief-023)', () => {
   });
 });
 
+// ─── --agent alias (Johannes's cl1/cl2) ─────────────────────────────────
+
+describe('cmdLaunch — --agent / $AGENT (aliased claude binaries)', () => {
+  it('defaults to `claude` when neither flag nor env is set', async () => {
+    const r = await cmdLaunch(
+      baseInput({ harness: 'claude', identity: 'alice' }),
+      ctx
+    );
+    expect(r.agentBinary).toBe('claude');
+    expect(r.argv[0]).toBe('claude');
+  });
+
+  it('explicit --agent overrides everything (flag > env > default)', async () => {
+    const r = await cmdLaunch(
+      baseInput({
+        harness: 'claude',
+        identity: 'alice',
+        agentBinary: 'cl1',
+        env: { AGENT: 'cl2' },
+      }),
+      ctx
+    );
+    expect(r.agentBinary).toBe('cl1');
+    expect(r.argv[0]).toBe('cl1');
+  });
+
+  it('$AGENT env kicks in when the flag is absent', async () => {
+    const r = await cmdLaunch(
+      baseInput({
+        harness: 'claude',
+        identity: 'alice',
+        env: { AGENT: 'cl2' },
+      }),
+      ctx
+    );
+    expect(r.agentBinary).toBe('cl2');
+    expect(r.argv[0]).toBe('cl2');
+  });
+
+  it('empty --agent value falls through to env, then default', async () => {
+    // Guard against argv shape `--agent ""` (an operator wired it
+    // through a variable that expanded to empty). Empty is treated
+    // like "unset" so the env / default tier still resolves,
+    // matching how --permission-mode handles the same shape.
+    const r1 = await cmdLaunch(
+      baseInput({
+        harness: 'claude',
+        identity: 'alice',
+        agentBinary: '',
+        env: { AGENT: 'cl2' },
+      }),
+      ctx
+    );
+    expect(r1.agentBinary).toBe('cl2');
+
+    const r2 = await cmdLaunch(
+      baseInput({
+        harness: 'claude',
+        identity: 'alice',
+        agentBinary: '',
+        env: {},
+      }),
+      ctx
+    );
+    expect(r2.agentBinary).toBe('claude');
+  });
+
+  it('alias is baked into the generated pty.toml command line', async () => {
+    const r = await cmdLaunch(
+      baseInput({
+        harness: 'claude',
+        identity: 'alice',
+        agentBinary: 'cl1',
+      }),
+      ctx
+    );
+    // pty.toml's `command = "..."` value shell-joins the argv; the
+    // alias appears as the first token after `command = "`. Assert
+    // the emitted preview starts the command line with cl1 and does
+    // NOT invoke the default `claude` binary (would drift the pty
+    // session away from the aliased build the operator wanted).
+    expect(r.ptyTomlPreview).toMatch(/command = "cl1 /);
+    expect(r.ptyTomlPreview).not.toMatch(/command = "claude /);
+  });
+
+  it('codex launches ignore --agent (codex has its own launcher)', async () => {
+    // Per the brief, `--agent` only affects the claude binary. Codex
+    // launches surface the resolution in the dry-run so the operator
+    // can eyeball what's happening, but the codex argv is untouched.
+    const r = await cmdLaunch(
+      baseInput({
+        harness: 'codex',
+        identity: 'alice',
+        agentBinary: 'cl1',
+      }),
+      ctx
+    );
+    expect(r.agentBinary).toBe('cl1');
+    expect(r.argv).not.toContain('cl1');
+    expect(r.argv[0]).toBe('codex');
+  });
+
+  it('bootstrap argv also uses the alias (jsonl init handoff)', async () => {
+    // The bootstrap `claude --print --session-id …` runs before the
+    // main `--resume`. If it uses the default `claude` while main uses
+    // the alias, the bootstrap picks the wrong binary and the jsonl
+    // is written into the wrong session — a subtle correctness bug.
+    // We route argv[0] resolution through the same `agentBinary`
+    // input so bootstrap + main line up.
+    const r = await cmdLaunch(
+      baseInput({
+        harness: 'claude',
+        identity: 'alice',
+        agentBinary: 'cl1',
+      }),
+      ctx
+    );
+    // captureOnly / dry-run bakes the alias into the returned argv;
+    // the bootstrap argv isn't exposed on LaunchResult, but the
+    // pty.toml preview reflects the invocation the pty layer will
+    // spawn, which is the same array `buildClaudeCommand` returns
+    // as `mainArgv`. If argv[0] is aliased, the bootstrap (derived
+    // from the same call) is aliased too. Sanity: assert exactly one
+    // `cl1` token in the argv[0] position.
+    expect(r.argv[0]).toBe('cl1');
+    expect(r.argv.filter((a) => a === 'cl1')).toHaveLength(1);
+  });
+
+  it('CLI wrapper: --agent flag appears in the dry-run summary', async () => {
+    const { cmdLaunchCli } = await import('../../src/commands/launch.ts');
+    const rc = await cmdLaunchCli(
+      ['claude', '--identity', 'alice', '--agent', 'cl1', '--dry-run'],
+      ctx
+    );
+    expect(rc).toBe(0);
+    expect(stdoutBuf).toContain('agent binary:   cl1');
+    // And in the harness argv line.
+    expect(stdoutBuf).toMatch(/harness argv:\n\s*cl1\s/);
+  });
+
+  it('CLI wrapper: default summary shows `agent binary: claude`', async () => {
+    const { cmdLaunchCli } = await import('../../src/commands/launch.ts');
+    await cmdLaunchCli(['claude', '--identity', 'alice', '--dry-run'], ctx);
+    expect(stdoutBuf).toContain('agent binary:   claude');
+  });
+
+  it('CLI wrapper: $AGENT env populates the summary when no --agent flag', async () => {
+    const { cmdLaunchCli } = await import('../../src/commands/launch.ts');
+    // Route AGENT through the ctx env, matching how a real shell
+    // would set it before the CLI reads process.env.
+    ctx.env = { AGENT: 'cl2' } as NodeJS.ProcessEnv;
+    await cmdLaunchCli(['claude', '--identity', 'alice', '--dry-run'], ctx);
+    expect(stdoutBuf).toContain('agent binary:   cl2');
+  });
+});
+
 // ─── pty.toml content ─────────────────────────────────────────────────
 
 describe('cmdLaunch — pty.toml generation', () => {

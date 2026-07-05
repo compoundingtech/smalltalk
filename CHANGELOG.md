@@ -6,6 +6,31 @@ minor releases until 1.0.
 
 ## Unreleased
 
+### Added (`st launch --agent <name>` / `$AGENT` env — aliased claude binaries)
+
+`st launch claude` now invokes a configurable binary as the harness
+executable, so hosts running aliased builds (`cl1`, `cl2`,
+`claude-preview`, etc.) don't have to symlink `claude`. Resolution
+precedence: `--agent <name>` flag > `$AGENT` env > `'claude'` default.
+
+- The alias is threaded through BOTH the bootstrap argv
+  (`<agent> --print --session-id …`) and the main argv
+  (`<agent> --resume …`), and baked into the generated `pty.toml`
+  `command = "…"` line so the pty-spawned process invokes the alias
+  too. No callers see a byte-level change when neither flag nor env
+  is set — the `'claude'` default is preserved.
+- The pty `session-name` stays independent — it defaults to the
+  harness kind (`claude`) so the pty layout stays consistent even
+  when the underlying binary is `cl1`. Override via
+  `--session-name <name>` if you want a different session key.
+- Codex launches ignore this (codex has its own launcher). The
+  resolution still populates the dry-run summary for consistency,
+  but the codex argv is untouched.
+
+Only affects the `claude` harness. Empty `--agent ""` falls through
+to `$AGENT`, then to the default (matching how `--permission-mode ""`
+already behaves).
+
 ### Added (brief-022 — `st launch --persona <path>` surgical persona linking)
 
 `st launch <harness>` now optionally installs a persona alongside the

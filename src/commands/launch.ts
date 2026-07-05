@@ -100,6 +100,23 @@ export interface LaunchInput {
    * line adds an ignored import.
    */
   persona?: string | undefined;
+  /**
+   * The binary name to invoke as the harness executable. Only affects
+   * the `claude` harness — codex has its own launcher and is untouched.
+   * Defaults to `'claude'`; callers can pass an alias (`cl1`, `cl2`,
+   * `claude-preview`, etc.) so aliased shells find the right binary.
+   * Resolution at CLI level: `--agent` flag > `$AGENT` env > `'claude'`
+   * default. Threaded into BOTH the bootstrap argv
+   * (`<agent> --print --session-id …`) and the main argv
+   * (`<agent> --resume …`), and baked into the generated `pty.toml`
+   * command line so the pty-spawned process invokes the alias too.
+   *
+   * The pty `session-name` stays independent of this — it defaults to
+   * the harness kind (`claude`) so the pty layout stays consistent
+   * even when the underlying binary is `cl1`. Override via
+   * `--session-name` if you want a different session key.
+   */
+  agentBinary?: string | undefined;
 
   /** Working directory. Default: process.cwd(). */
   cwd?: string | undefined;
@@ -154,6 +171,14 @@ export interface LaunchResult {
    * own approval-policy surface).
    */
   permissionMode: string;
+  /**
+   * The binary that was (or would be) invoked as argv[0] for the claude
+   * harness. Populated for both harnesses so the dry-run summary can
+   * report it consistently; for codex this reflects the resolution but
+   * doesn't feed the codex argv (codex has its own launcher). Default
+   * `'claude'` when no `--agent` flag / `$AGENT` env is set.
+   */
+  agentBinary: string;
   /**
    * brief-118: absolute path to `.claude/settings.local.json` when the
    * launch generated (or would have generated) one. Non-null only for
@@ -263,8 +288,10 @@ function buildClaudeCommand(opts: {
   channel: boolean;
   claudeSessionId: string;
   permissionMode: string;
+  /** The binary to invoke as argv[0]. See {@link LaunchInput.agentBinary}. */
+  agentBinary: string;
 }): {
-  bootstrapArgv: readonly string[] | null;
+  bootstrapArgv: readonly string[];
   mainArgv: readonly string[];
   jsonlPath: string;
 } {
@@ -279,25 +306,25 @@ function buildClaudeCommand(opts: {
   const channelFlag = opts.channel
     ? ['--dangerously-load-development-channels', 'server:st']
     : [];
-  const mainArgv = [
-    'claude',
+  const mainArgv: readonly string[] = [
+    opts.agentBinary,
     '--permission-mode',
     opts.permissionMode,
     ...channelFlag,
     '--resume',
     opts.claudeSessionId,
-  ] as const;
+  ];
   // Bootstrap fires only when the jsonl is missing; caller checks
   // `existsSync(jsonlPath)`.
-  const bootstrapArgv = [
-    'claude',
+  const bootstrapArgv: readonly string[] = [
+    opts.agentBinary,
     '--print',
     '--permission-mode',
     opts.permissionMode,
     '--session-id',
     opts.claudeSessionId,
     'session init',
-  ] as const;
+  ];
   return { bootstrapArgv, mainArgv, jsonlPath };
 }
 
@@ -805,6 +832,18 @@ export async function cmdLaunch(
         ? input.env.CLAUDE_PERMISSION_MODE
         : 'auto';
 
+  // ─── agent-binary resolution (task: Johannes's cl1/cl2 aliases) ─────
+  // Precedence: explicit `--agent` flag > `$AGENT` env > `'claude'`
+  // default. Only affects the `claude` harness; codex is untouched (it
+  // has its own launcher path). Preserves the pre-task behavior
+  // byte-for-byte when neither flag nor env is set.
+  const agentBinary: string =
+    input.agentBinary !== undefined && input.agentBinary.length > 0
+      ? input.agentBinary
+      : input.env.AGENT !== undefined && input.env.AGENT.length > 0
+        ? input.env.AGENT
+        : 'claude';
+
   // ─── Command construction ──────────────────────────────────────────
   let argv: readonly string[];
   let usedOllama = false;
@@ -823,6 +862,7 @@ export async function cmdLaunch(
       channel,
       claudeSessionId: claudeSessionId ?? '<generated-at-runtime>',
       permissionMode,
+      agentBinary,
     });
     argv = built.mainArgv;
     claudeBootstrapArgv = built.bootstrapArgv;
@@ -922,6 +962,7 @@ export async function cmdLaunch(
       claudeSessionIdPath,
       ptyTomlPreview,
       permissionMode,
+      agentBinary,
       claudeSettingsPath,
       claudeSettingsPreview,
       persona: personaResult,
@@ -992,6 +1033,7 @@ export async function cmdLaunch(
     claudeSessionIdPath,
     ptyTomlPreview,
     permissionMode,
+    agentBinary,
     claudeSettingsPath,
     claudeSettingsPreview,
     persona: personaResult,
@@ -1033,6 +1075,11 @@ const LAUNCH_HELP =
   '                          is appended if not already present. Infra we\n' +
   '                          create is added to `.git/info/exclude` so it\n' +
   '                          stays out of the repo.\n' +
+  '  --agent <name>          Invoke <name> as the harness binary instead\n' +
+  '                          of `claude`. For hosts running aliased builds\n' +
+  '                          (e.g. `cl1`, `cl2`, `claude-preview`).\n' +
+  '                          Precedence: this flag > $AGENT env > `claude`.\n' +
+  '                          Codex launches ignore this (its own launcher).\n' +
   '  --dry-run               Print what would happen; touch nothing.\n' +
   '  --print                 Alias for --dry-run.\n\n' +
   '  Examples:\n' +
@@ -1057,6 +1104,7 @@ export async function cmdLaunchCli(
   let sessionName: string | undefined;
   let permissionMode: string | undefined;
   let persona: string | undefined;
+  let agentBinary: string | undefined;
   let dryRun = false;
   for (let i = 0; i < args.length; i++) {
     const a = args[i]!;
@@ -1088,6 +1136,9 @@ export async function cmdLaunchCli(
         break;
       case '--persona':
         persona = args[++i];
+        break;
+      case '--agent':
+        agentBinary = args[++i];
         break;
       case '--dry-run':
       case '--print':
@@ -1123,6 +1174,7 @@ export async function cmdLaunchCli(
       ...(sessionName !== undefined && { sessionName }),
       ...(permissionMode !== undefined && { permissionMode }),
       ...(persona !== undefined && { persona }),
+      ...(agentBinary !== undefined && { agentBinary }),
       dryRun,
       env: ctx.env,
       coordRoot: ctx.coordRoot,
@@ -1144,6 +1196,7 @@ export async function cmdLaunchCli(
     // reveal what the resolution logic decided (helps debugging env-set
     // launches).
     ctx.stdout(`permission-mode: ${r.permissionMode}\n`);
+    ctx.stdout(`agent binary:   ${r.agentBinary}\n`);
     ctx.stdout(`mcp.json:       ${r.mcpJsonPath}\n`);
     if (r.claudeSessionIdPath !== null) {
       ctx.stdout(`session id:     ${r.claudeSessionIdPath}\n`);
