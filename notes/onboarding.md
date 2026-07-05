@@ -92,21 +92,35 @@ repo. Order: make the folder, `git init`, then launch.
 mkdir ~/src/github.com/<you>/cos && cd ~/src/github.com/<you>/cos
 git init
 st launch claude --identity cos --permanent \
+  --permission-mode bypassPermissions \
   --persona ~/src/github.com/myobie/personas/chief-of-staff.md
 ```
 
-**Both `--persona` and `--permanent` are load-bearing.** Without
-`--persona`, `st launch` spawns a bare Claude that has no idea
-it's a CoS. Without `--permanent`, the generated `pty.toml` omits
-`strategy = "permanent"` on the agent session — pty treats it as
-ephemeral, and `pty gc` may reap your CoS under idle-cleanup. A
-CoS is your always-on center; you want it durable across restarts
-and cleanup passes.
+**Three flags are load-bearing**, each closing a specific gap:
 
-`st launch` warns to stderr if you launch a CoS-shaped identity
-(`--identity cos` or a chief-of-staff persona) without
-`--permanent` — that's the reap-able-CoS footgun-guard. Same
-warning fires on re-launch / resume.
+- **`--persona`** — without it, `st launch` spawns a bare Claude
+  that has no idea it's a CoS.
+- **`--permanent`** — without it, the generated `pty.toml` omits
+  `strategy = "permanent"` on the agent session; pty treats the
+  CoS as ephemeral and `pty gc` may reap it under idle-cleanup.
+  A CoS is your always-on center; you want it durable.
+- **`--permission-mode bypassPermissions`** — without it, claude's
+  `auto` mode classifier hard-blocks the CoS from spawning
+  autonomous agents (specialists, workers), which is precisely
+  what a CoS needs to do. `st launch` DEFAULTS to
+  `bypassPermissions` for spawner-shaped identities (`cos`,
+  `supervisor`) as of the 3-tier permission fix, but passing the
+  flag explicitly teaches the pattern — you'll want it on your
+  own supervisor launches too, and readers of your shell history
+  see the intent.
+
+`st launch` warns to stderr if you launch a spawner-shaped
+identity (`--identity cos` or `--identity supervisor`, or a
+`chief-of-staff.md` / `supervisor.md` persona) without
+`--permanent` — that's the reap-able-spawner footgun-guard. Same
+warning fires on re-launch / resume. Workers (leaf agents that
+do work but don't spawn) stay on `auto` mode and never trigger
+the warning — that's the deliberate 3-tier asymmetry.
 
 With `--persona`, `st launch`:
 
@@ -122,6 +136,7 @@ explicitly:
 
 ```sh
 st launch claude --identity cos --permanent \
+  --permission-mode bypassPermissions \
   --persona ~/src/github.com/myobie/personas/chief-of-staff.md \
   --agent cl1
 ```
@@ -229,13 +244,14 @@ Cold-start recipes to keep handy:
 - **See what your CoS is thinking about:** `st context read cos`
 - **Cross-tree overview of everyone:** `st overview`
 - **Resume a suspended CoS session:** `cd` back into the cos repo
-  and rerun the same launch command (including `--persona` and
-  `--permanent`) — the session id in `.claude-session-id` is what
-  makes it a resume, not a fresh start. Re-passing `--persona` is
-  safe: `PERSONA.md` gets overwritten with the same bytes, and the
-  `@PERSONA.md` line in `CLAUDE.md` is idempotent. `--permanent`
-  re-writes the same tag into `pty.toml` (or leaves it as-is if
-  the file already exists).
+  and rerun the same launch command (including `--persona`,
+  `--permanent`, and `--permission-mode bypassPermissions`) — the
+  session id in `.claude-session-id` is what makes it a resume,
+  not a fresh start. Re-passing `--persona` is safe: `PERSONA.md`
+  gets overwritten with the same bytes, and the `@PERSONA.md`
+  line in `CLAUDE.md` is idempotent. `--permanent` re-writes the
+  same tag into `pty.toml` (or leaves it as-is if the file
+  already exists). The permission-mode flag is idempotent too.
 
 ## Bus basics — hand-wiring an identity
 

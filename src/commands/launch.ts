@@ -341,6 +341,46 @@ function newUuid(): string {
   return randomUUID();
 }
 
+/**
+ * Detect a "spawner-shaped" launch — an agent whose role is to
+ * spawn other agents (Nathan's 3-tier hierarchy: cos + supervisor
+ * are spawners; workers are leaves). Detection:
+ *   - identity ∈ {cos, supervisor}, OR
+ *   - persona basename ∈ {chief-of-staff.md, supervisor.md}.
+ *
+ * Two behavior triggers gate on this:
+ *   1. Default permission-mode flips from `auto` to
+ *      `bypassPermissions` (a spawner in auto is hard-blocked by
+ *      claude's auto-mode classifier from creating autonomous
+ *      agents — the regression Johannes's pty.toml surfaced).
+ *   2. Footgun-guard warning when `--permanent` is omitted (from
+ *      the PR-that-added-`--permanent`). Ephemeral eval spawners
+ *      intentionally decline permanent; the warning is opt-in
+ *      acknowledgment, not a hard block.
+ *
+ * Workers (identity ∉ spawner list AND persona basename ∉ spawner
+ * list) stay on `auto` — correct + safe for a leaf agent that does
+ * work but doesn't spawn. This is deliberate asymmetry: default
+ * permission-mode auto→bypass is safe (spawners need it, evals
+ * want it) but default permanent stays opt-in (evals launch
+ * ephemeral supervisors that MUST be reap-able for teardown).
+ */
+function isSpawnerShaped(
+  identity: string,
+  persona: string | undefined
+): boolean {
+  const basename =
+    persona !== undefined
+      ? persona.split('/').pop()?.split('\\').pop() ?? ''
+      : '';
+  return (
+    identity === 'cos' ||
+    identity === 'supervisor' ||
+    basename === 'chief-of-staff.md' ||
+    basename === 'supervisor.md'
+  );
+}
+
 // ─── Command construction ──────────────────────────────────────────────
 
 /**
@@ -1055,18 +1095,33 @@ export async function cmdLaunch(
 
   // ─── brief-023: permission-mode resolution ─────────────────────────
   // Precedence: explicit --permission-mode flag > $CLAUDE_PERMISSION_MODE
-  // env (parity with pty-claude-launcher.sh's fallback) > default 'auto'.
-  // 'auto' preserves the pre-brief-023 behavior byte-for-byte, so
-  // existing callers see no change. Value is passed through to claude
-  // verbatim — we don't validate here (claude rejects unknown modes
-  // loudly, and duplicating the enum would just rot).
+  // env (parity with pty-claude-launcher.sh's fallback) > shape-aware
+  // default. Value is passed through to claude verbatim — we don't
+  // validate here (claude rejects unknown modes loudly, and
+  // duplicating the enum would just rot).
+  //
+  // Shape-aware default (Nathan's 3-tier hierarchy):
+  //   - spawner-shaped launch (cos, supervisor): default
+  //     `bypassPermissions`, because claude's `auto` mode classifier
+  //     hard-blocks a spawner from creating autonomous agents — the
+  //     regression Johannes's pty.toml surfaced.
+  //   - anything else (workers, plain agents): default `auto`. Auto
+  //     is correct + safe for a leaf agent that does work but
+  //     doesn't spawn.
+  //
+  // Existing callers with explicit flags or `$CLAUDE_PERMISSION_MODE`
+  // set are byte-identical either way — the shape-aware branch only
+  // fires when neither is set.
+  const spawnerShaped = isSpawnerShaped(identity, input.persona);
   const permissionMode: string =
     input.permissionMode !== undefined && input.permissionMode.length > 0
       ? input.permissionMode
       : input.env.CLAUDE_PERMISSION_MODE !== undefined &&
           input.env.CLAUDE_PERMISSION_MODE.length > 0
         ? input.env.CLAUDE_PERMISSION_MODE
-        : 'auto';
+        : spawnerShaped
+          ? 'bypassPermissions'
+          : 'auto';
 
   // ─── agent-binary resolution (task: Johannes's cl1/cl2 aliases) ─────
   // Precedence: explicit `--agent` flag > `$AGENT` env > `'claude'`
@@ -1150,21 +1205,21 @@ export async function cmdLaunch(
   // is chief-of-staff.md) omits --permanent, warn to stderr.
   // Detection stays narrow so we don't spam the eval-cell launches
   // that legitimately want ephemeral CoS-lookalikes.
-  if (!permanent) {
-    const personaBasename =
-      input.persona !== undefined
-        ? input.persona.split('/').pop()?.split('\\').pop() ?? ''
-        : '';
-    const cosShaped =
-      identity === 'cos' || personaBasename === 'chief-of-staff.md';
-    if (cosShaped) {
-      ctx.stderr(
-        `[smalltalk launch] launching a CoS without --permanent; pty gc ` +
-          `may reap it under idle-cleanup. If this is a production CoS ` +
-          `(not an eval/test spin-up), pass --permanent so the launch ` +
-          `bakes strategy = "permanent" into pty.toml.\n`
-      );
-    }
+  // Footgun-guard: warn when a spawner-shaped launch (cos or
+  // supervisor) omits --permanent — a silently-reap-able spawner
+  // under pty gc is a nasty non-obvious failure for a newcomer
+  // following the onboarding docs. Ephemeral eval spawners
+  // intentionally decline permanent; the warning is opt-in
+  // acknowledgment, not a hard block. Reuses the same
+  // spawner-shape detection as the permission-mode default above.
+  if (!permanent && spawnerShaped) {
+    ctx.stderr(
+      `[smalltalk launch] launching a spawner (cos/supervisor) without ` +
+        `--permanent; pty gc may reap it under idle-cleanup. If this is ` +
+        `a production spawner (not an eval/test spin-up), pass ` +
+        `--permanent so the launch bakes strategy = "permanent" into ` +
+        `pty.toml.\n`
+    );
   }
   const ptyTomlPath = join(cwd, 'pty.toml');
   let ptyTomlPreview: string | null = null;
