@@ -832,7 +832,13 @@ describe('cmdLaunch — .claude/settings.local.json generation (brief-118)', () 
 
   it('dry-run preview contains all three hooks pointing at absolute paths', async () => {
     const hooksDir = fakeHooksDir();
-    const r = await cmdLaunch(baseInput({ identity: 'alice', hooksDir }), ctx);
+    // Opt out of the ST_BIN injection so the command:s are bare script
+    // paths and stable across dev machines. The ST_BIN=… wiring has
+    // its own tests below.
+    const r = await cmdLaunch(
+      baseInput({ identity: 'alice', hooksDir, stBinForHooks: null }),
+      ctx
+    );
     expect(r.claudeSettingsPath).toBe(join(cwd, '.claude', 'settings.local.json'));
     expect(r.claudeSettingsPreview).not.toBeNull();
     const preview = r.claudeSettingsPreview!;
@@ -870,6 +876,7 @@ describe('cmdLaunch — .claude/settings.local.json generation (brief-118)', () 
       baseInput({
         identity: 'george',
         hooksDir,
+        stBinForHooks: null,
         dryRun: false,
         captureOnly: true,
       }),
@@ -945,6 +952,85 @@ describe('cmdLaunch — .claude/settings.local.json generation (brief-118)', () 
     expect(r.claudeSettingsPath).toBeNull();
     expect(r.claudeSettingsPreview).toBeNull();
     expect(stderrBuf).toContain('shipped Claude Code hooks not found on disk');
+  });
+
+  // ─── ST_BIN injection into hook command:s ────────────────────────────
+  //
+  // The hook scripts shellout to `st`/`coord`. On a degenerate PATH (or
+  // a stale `coord` that shadows the launched version), that lookup
+  // silently uses the wrong binary. `st launch` fixes this by baking
+  // an absolute `ST_BIN=<abs>` assignment into each hook's `command:`
+  // string — Claude Code runs shell-form commands via `sh -c`, so the
+  // POSIX assignment-preceded simple command form applies.
+
+  it('ST_BIN=<abs> is prepended to every hook command when stBinForHooks is a string', async () => {
+    const hooksDir = fakeHooksDir();
+    const fakeStBin = '/opt/smalltalk/bin/st';
+    const r = await cmdLaunch(
+      baseInput({
+        identity: 'moss',
+        hooksDir,
+        stBinForHooks: fakeStBin,
+      }),
+      ctx
+    );
+    const parsed = JSON.parse(r.claudeSettingsPreview!);
+    for (const stage of ['SessionStart', 'PreCompact', 'StopFailure'] as const) {
+      const cmd = parsed.hooks[stage][0].hooks[0].command;
+      expect(cmd).toContain(`ST_BIN=${fakeStBin} `);
+      expect(cmd.endsWith('.sh')).toBe(true);
+    }
+  });
+
+  it('ST_BIN=<abs> uses shell-safe single-quoting when the path has spaces', async () => {
+    const hooksDir = fakeHooksDir();
+    const fakeStBin = "/opt/weird path/'quotes'/bin/st";
+    const r = await cmdLaunch(
+      baseInput({
+        identity: 'nell',
+        hooksDir,
+        stBinForHooks: fakeStBin,
+      }),
+      ctx
+    );
+    const parsed = JSON.parse(r.claudeSettingsPreview!);
+    const cmd = parsed.hooks.SessionStart[0].hooks[0].command;
+    // Path with spaces + embedded single quotes must be quoted per
+    // shellQuote — the value is wrapped in single quotes and each
+    // internal single quote is escaped as `'\''`.
+    expect(cmd).toContain("ST_BIN='/opt/weird path/'\\''quotes'\\''/bin/st'");
+  });
+
+  it('stBinForHooks: null opts out — commands are bare script paths', async () => {
+    const hooksDir = fakeHooksDir();
+    const r = await cmdLaunch(
+      baseInput({
+        identity: 'oleg',
+        hooksDir,
+        stBinForHooks: null,
+      }),
+      ctx
+    );
+    const parsed = JSON.parse(r.claudeSettingsPreview!);
+    for (const stage of ['SessionStart', 'PreCompact', 'StopFailure'] as const) {
+      const cmd = parsed.hooks[stage][0].hooks[0].command;
+      expect(cmd).not.toContain('ST_BIN=');
+    }
+  });
+
+  it('stBinForHooks default (undefined) auto-resolves via resolveStBinPath', async () => {
+    // Under the real test runner, the smalltalk repo IS an
+    // `@myobie/coord`-named package with a valid `bin/st` on disk. The
+    // auto-resolution should therefore succeed and inject an absolute
+    // path that ends in `/bin/st`.
+    const hooksDir = fakeHooksDir();
+    const r = await cmdLaunch(
+      baseInput({ identity: 'petra', hooksDir }),
+      ctx
+    );
+    const parsed = JSON.parse(r.claudeSettingsPreview!);
+    const cmd = parsed.hooks.SessionStart[0].hooks[0].command;
+    expect(cmd).toMatch(/^ST_BIN=\/.+\/bin\/st\s/);
   });
 
   it('CLI --no-hooks flag threads through to noHooks: true', async () => {

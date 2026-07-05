@@ -31,6 +31,16 @@
 
 set -uo pipefail
 
+# ─── Binary resolution ───────────────────────────────────────────────────
+#
+# Prefer an absolute path injected by `st launch` via $ST_BIN. Falls
+# back to PATH lookup for users who wired settings.local.json by hand.
+# `st` wins over `coord` (st-first; coord is the back-compat shim).
+st_bin="${ST_BIN:-}"
+if [[ -z "$st_bin" ]]; then
+  st_bin="$(command -v st 2>/dev/null || command -v coord 2>/dev/null || true)"
+fi
+
 # Read the JSON envelope Claude Code pipes in.
 input="$(cat)"
 
@@ -44,33 +54,39 @@ if [[ -z "$identity" ]]; then
   exit 0
 fi
 
+if [[ -z "$st_bin" ]]; then
+  # No CLI on PATH and no $ST_BIN — we can't ding or change status.
+  # Silent exit; Claude Code ignores our exit code.
+  exit 0
+fi
+
 # Extract error_type via jq. Falls back to "unknown" if the field is
 # missing or jq fails to parse the envelope.
 error_type="$(printf '%s' "$input" | jq -r '.error_type // "unknown"' 2>/dev/null || echo unknown)"
 
 case "$error_type" in
   rate_limit)
-    coord status "$identity" --set away
+    "$st_bin" status "$identity" --set away
     ;;
 
   server_error)
-    coord status "$identity" --set away
-    coord message send myobie \
+    "$st_bin" status "$identity" --set away
+    "$st_bin" message send myobie \
       --subject "agent ${identity} wedged: server_error" \
       -m "Agent ${identity} ended a turn on server_error (transient Anthropic-side issue). Status set to away. No action required unless the wedge persists."
     ;;
 
   authentication_failed | oauth_org_not_allowed)
-    coord status "$identity" --set offline
-    coord message send myobie \
+    "$st_bin" status "$identity" --set offline
+    "$st_bin" message send myobie \
       --priority high \
       --subject "agent ${identity}: auth failed (${error_type})" \
       -m "Agent ${identity} cannot continue — error_type=${error_type}. Status set to offline. Requires human intervention (check API key, org membership, OAuth state)."
     ;;
 
   billing_error)
-    coord status "$identity" --set offline
-    coord message send myobie \
+    "$st_bin" status "$identity" --set offline
+    "$st_bin" message send myobie \
       --priority high \
       --subject "agent ${identity}: billing issue" \
       -m "Agent ${identity} hit a billing_error and cannot continue. Status set to offline. Check billing status in the Anthropic console."
@@ -87,8 +103,8 @@ case "$error_type" in
     # Claude Code may emit, and any new error_type we haven't seen yet.
     # Status=away and ding with the type verbatim so we can extend the
     # table after triage.
-    coord status "$identity" --set away
-    coord message send myobie \
+    "$st_bin" status "$identity" --set away
+    "$st_bin" message send myobie \
       --subject "agent ${identity} wedged: ${error_type}" \
       -m "Agent ${identity} ended a turn on an unhandled error_type=${error_type}. Status set to away. Worth checking — this is an error_type the coord StopFailure hook policy doesn't yet recognize."
     ;;

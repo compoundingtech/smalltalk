@@ -6,6 +6,37 @@ minor releases until 1.0.
 
 ## Unreleased
 
+### Changed (hooks resolve the CLI via `$ST_BIN` — absolute path baked at launch)
+
+The three shipped Claude Code hooks (`pre-compact.sh`, `stop-failure.sh`;
+`session-start.sh` doesn't shell out) previously relied on PATH lookup
+of `coord` at hook-execution time. That's fragile: if PATH is degenerate
+in Claude Code's hook-exec env, or if a stale `coord` from a different
+install is on PATH, the hook silently uses the wrong binary — or none.
+
+Now:
+
+- **Hook scripts** resolve the CLI via `${ST_BIN:-$(command -v st ||
+  command -v coord)}`. Prefers an absolute path injected by `st
+  launch`; falls back to PATH lookup (st-first, coord for back-compat)
+  for hand-wired settings.local.json files.
+- **`st launch`** bakes the absolute path via
+  `resolveStBinPath(resolveCoordBinPath())` and injects it as
+  `ST_BIN=<abs>` in each hook's `command:` string. Claude Code runs
+  shell-form commands via `sh -c`, so the POSIX assignment-preceded
+  simple command form applies. Verified against
+  https://code.claude.com/docs/en/hooks — the settings.json schema
+  has no per-hook `env:` field, but shell-form command strings are
+  the intended surface for this.
+- New `LaunchInput.stBinForHooks?: string | null | undefined` test
+  seam parallel to `hooksDir`: pass `null` to skip the injection
+  (bare script paths — proves the hook's PATH-fallback branch); pass
+  a synthetic string to pin a deterministic snapshot; omit for the
+  auto-resolution behavior.
+
+Anti-impersonation posture unchanged. No new spawn surface — the
+hook already spawns `coord`, we just bake the exact binary.
+
 ### Added (`st --version` prints the CLI version)
 
 `<name> --version` prints `<invokedName> <semver>\n` (e.g. `st 0.3.0`)
