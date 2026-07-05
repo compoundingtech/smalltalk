@@ -564,21 +564,29 @@ describe('cmdLaunch — --unattended auto-poker (F1)', () => {
     expect(r.ptyTomlPreview).not.toContain('sleep 4');
   });
 
-  it('unattended: true → poker baked, targets `<identity>/<sessionName>`', async () => {
+  it('unattended: true → poker baked, targets `<identity>-<sessionName>` (dash, not slash)', async () => {
+    // pty's ptyfile.ts:58 joins prefix + sessionName with a DASH
+    // (`${prefix}-${rawName}`), not a slash. The slash-form target
+    // (`alice/claude`) was the P5 re-run's true-0-poke blocker: every
+    // `pty send` returned "Session not found" and the CoS-spawned
+    // worker deadlocked at the dev-channels gate. See PR fixing
+    // this and cos's ptr into ../pty/src/ptyfile.ts:58.
     const r = await cmdLaunch(
       baseInput({ harness: 'claude', identity: 'alice', unattended: true }),
       ctx
     );
     expect(r.unattended).toBe(true);
-    // 4 pokes with 4s spacing each — see poker shape in launch.ts.
+    // 4 pokes with 4s spacing each, targeting the DASH-joined name.
     expect(r.ptyTomlPreview).toContain(
-      'sleep 4 && pty send alice/claude --seq key:return'
+      'sleep 4 && pty send alice-claude --seq key:return'
     );
+    // Sanity: the slash form must NOT appear — that was the bug.
+    expect(r.ptyTomlPreview).not.toContain('pty send alice/claude');
     // Backgrounded subshell + `exec` for the main command.
     expect(r.ptyTomlPreview).toMatch(/\)\s*&\s*exec/);
   });
 
-  it('poker respects a custom --session-name', async () => {
+  it('poker respects a custom --session-name (still dash-joined)', async () => {
     const r = await cmdLaunch(
       baseInput({
         harness: 'claude',
@@ -589,8 +597,9 @@ describe('cmdLaunch — --unattended auto-poker (F1)', () => {
       ctx
     );
     expect(r.ptyTomlPreview).toContain(
-      'pty send taskflow-dev/primary --seq key:return'
+      'pty send taskflow-dev-primary --seq key:return'
     );
+    expect(r.ptyTomlPreview).not.toContain('taskflow-dev/primary');
   });
 
   it('auto-on when stdinIsTty() reports false', async () => {
@@ -603,7 +612,7 @@ describe('cmdLaunch — --unattended auto-poker (F1)', () => {
       stdinTtyCtx
     );
     expect(r.unattended).toBe(true);
-    expect(r.ptyTomlPreview).toContain('pty send alice/claude');
+    expect(r.ptyTomlPreview).toContain('pty send alice-claude');
   });
 
   it('stays attended when stdinIsTty() reports true', async () => {
