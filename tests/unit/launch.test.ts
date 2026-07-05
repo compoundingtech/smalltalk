@@ -491,9 +491,25 @@ describe('cmdLaunch — pty.toml generation', () => {
   it('emits a pty.toml preview even when pty is not on PATH', async () => {
     const r = await cmdLaunch(baseInput({ identity: 'alice' }), ctx);
     expect(r.ptyTomlPreview).not.toBeNull();
-    expect(r.ptyTomlPreview).toContain('prefix = "repo"');
+    // Prefix comes from identity (F3): unique per agent by
+    // construction, so pty's global namespace can't collide when two
+    // clones of the same repo launch under different identities.
+    expect(r.ptyTomlPreview).toContain('prefix = "alice"');
     expect(r.ptyTomlPreview).toContain('[sessions.claude]');
     expect(r.ptyTomlPreview).toContain('ST_AGENT = "alice"');
+  });
+
+  it('prefix reflects the identity even when identity differs from cwd basename', async () => {
+    // The point of F3 — a taskflow-dev identity launched from a
+    // taskflow/ cwd should have a `taskflow-dev`-prefixed pty session
+    // so a generic shepherd (or `pty send`) targeting the identity
+    // hits it. Historic behavior was `prefix = "taskflow"` which lost
+    // the identity in the pty namespace.
+    const r = await cmdLaunch(
+      baseInput({ identity: 'taskflow-dev' }),
+      ctx
+    );
+    expect(r.ptyTomlPreview).toContain('prefix = "taskflow-dev"');
   });
 
   it('claude preview has no ding sidecar', async () => {
