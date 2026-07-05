@@ -1184,6 +1184,18 @@ describe('cmdLaunch — DING-BUS.md install (ding-mode instructions blurb)', () 
     expect(dingBusText).toContain('st status $ST_AGENT --set available');
     expect(dingBusText).toContain('[DING]');
     expect(dingBusText).toContain('Threads stay on the bus');
+    // Propagate-through-spawns contract: DING-BUS.md must tell the
+    // agent that ding-mode is a *machine* property, so every child
+    // agent it launches ALSO needs `--ding`. Without this, a
+    // ding-mode CoS silently stands up MCP children on an
+    // MCP-hostile machine — the false-pass evals-claude caught.
+    // Load-bearing for Johannes's cos → supervisor → worker tree.
+    expect(dingBusText).toContain('Propagate ding-mode through every spawn');
+    expect(dingBusText).toContain('every agent you spawn on this machine MUST also be in\nding-mode');
+    expect(dingBusText).toContain('st launch <harness> --identity <child-id> --ding');
+    expect(dingBusText).toContain('Do NOT run plain `st launch');
+    // The CLI inventory now includes the spawn command line.
+    expect(dingBusText).toContain('Spawning children');
     // Regression guard: naming stays `smalltalk`/`st`, no `coord`
     // leak in this user-visible bus contract.
     expect(dingBusText).not.toMatch(/\bcoord\b/);
