@@ -596,7 +596,13 @@ describe('cmdLaunch — pty.toml generation', () => {
     expect(r.ptyTomlPreview).not.toContain('[sessions.ding]');
   });
 
-  it('codex preview includes the coord ding sidecar', async () => {
+  it('codex preview includes the coord ding sidecar (ephemeral by default; no permanent tag)', async () => {
+    // Historic behavior was `tags = { role = "ding", strategy =
+    // "permanent" }`, which zombied the ding via `pty gc` after an
+    // ephemeral codex eval died. Now the ding has no `strategy`
+    // tag — pty treats absence as its ephemeral default (see
+    // ../pty/src/sessions.ts:576, 620, 644). Regression guard:
+    // the permanent form MUST NOT re-appear.
     const r = await cmdLaunch(
       baseInput({ harness: 'codex', identity: 'alice' }),
       ctx
@@ -605,7 +611,23 @@ describe('cmdLaunch — pty.toml generation', () => {
     expect(r.ptyTomlPreview).toContain(
       'coord ding codex --identity alice'
     );
-    expect(r.ptyTomlPreview).toContain('strategy = "permanent"');
+    expect(r.ptyTomlPreview).toContain('tags = { role = "ding" }');
+    expect(r.ptyTomlPreview).not.toContain('strategy = "permanent"');
+  });
+
+  it('agent tags stay { role = "agent" } with no strategy field by default', async () => {
+    // Regression guard: the historic bare-agent shape is preserved.
+    // A future --permanent (or similar) flag would set a mirrored
+    // strategy on BOTH the agent and the ding (see the
+    // `agentStrategy` opts field on buildPtyToml). Today nobody
+    // sets it → agent + ding both bare.
+    const r = await cmdLaunch(
+      baseInput({ harness: 'codex', identity: 'alice' }),
+      ctx
+    );
+    expect(r.ptyTomlPreview).toContain('tags = { role = "agent" }');
+    // No `strategy = ...` line anywhere in the preview.
+    expect(r.ptyTomlPreview).not.toMatch(/strategy = "/);
   });
 
   it('--session-name overrides the pty session key', async () => {

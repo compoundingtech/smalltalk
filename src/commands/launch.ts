@@ -449,6 +449,26 @@ function buildPtyToml(opts: {
    * something explicit — pinning an isolation root through restarts.
    */
   stRoot: string | undefined;
+  /**
+   * Optional `strategy` value baked into BOTH the agent session
+   * AND the ding sidecar tags. When undefined (today's only
+   * caller), neither session carries a `strategy` tag — pty
+   * treats absence-of-tag as its ephemeral default (see
+   * `../pty/src/sessions.ts:576, 620, 644` — the ONLY explicit
+   * check pty makes is `strategy === "permanent"`). This mirroring
+   * is the invariant: a launch is either ephemeral or it isn't;
+   * a mismatch (e.g. permanent ding under an ephemeral agent, or
+   * vice-versa) is a bug in whatever code sets this. Future
+   * flags (e.g. `--permanent` for a production CoS that should
+   * survive `pty gc`) will plumb through this single knob.
+   *
+   * Historically the ding was hardcoded to `strategy = "permanent"`
+   * while the agent had no tag — a mismatch that meant an
+   * ephemeral codex eval left the ding as a zombie after `pty gc`
+   * reaped the codex session. Fixed by making the field a
+   * matched pair.
+   */
+  agentStrategy: string | undefined;
 }): string {
   // pty runs `command` via `sh -c`, so produce a shell command line by
   // space-joining shell-quoted argv elements. Then TOML-quote the
@@ -477,7 +497,16 @@ function buildPtyToml(opts: {
   lines.push('');
   lines.push(`[sessions.${opts.sessionName}]`);
   lines.push(`command = "${tomlEscape(shellLine)}"`);
-  lines.push(`tags = { role = "agent" }`);
+  // Agent tags. The optional `strategy` value gets mirrored to the
+  // ding sidecar below, so the launch always emits a matched pair
+  // — no mixed-strategy pty.toml.
+  if (opts.agentStrategy !== undefined) {
+    lines.push(
+      `tags = { role = "agent", strategy = "${tomlEscape(opts.agentStrategy)}" }`
+    );
+  } else {
+    lines.push(`tags = { role = "agent" }`);
+  }
   lines.push('');
   lines.push(`[sessions.${opts.sessionName}.env]`);
   lines.push(`ST_AGENT = "${tomlEscape(opts.identity)}"`);
@@ -497,7 +526,19 @@ function buildPtyToml(opts: {
     lines.push('');
     lines.push(`[sessions.ding]`);
     lines.push(`command = "${tomlEscape(dingLine)}"`);
-    lines.push(`tags = { role = "ding", strategy = "permanent" }`);
+    // Ding tags — mirror the agent's strategy so the launch is
+    // internally consistent. Historically the ding was hardcoded
+    // to `strategy = "permanent"` while the agent had no strategy
+    // tag — a mismatch that zombied the ding on `pty gc` after
+    // the codex session died. Now: whatever the agent got, the
+    // ding gets.
+    if (opts.agentStrategy !== undefined) {
+      lines.push(
+        `tags = { role = "ding", strategy = "${tomlEscape(opts.agentStrategy)}" }`
+      );
+    } else {
+      lines.push(`tags = { role = "ding" }`);
+    }
     lines.push('');
     lines.push(`[sessions.ding.env]`);
     lines.push(`ST_AGENT = "${tomlEscape(opts.identity)}"`);
@@ -1068,6 +1109,10 @@ export async function cmdLaunch(
       addDingSidecar: harness === 'codex',
       unattended,
       stRoot: stRootForSession,
+      // No st launch flag exposes this yet — always undefined,
+      // matching pty's ephemeral default. Future --permanent (for
+      // production CoS) or similar will plumb through here.
+      agentStrategy: undefined,
     });
     ptyTomlPreview = preview;
     if (!input.dryRun && !existsSync(ptyTomlPath)) {
@@ -1085,6 +1130,10 @@ export async function cmdLaunch(
       addDingSidecar: harness === 'codex',
       unattended,
       stRoot: stRootForSession,
+      // No st launch flag exposes this yet — always undefined,
+      // matching pty's ephemeral default. Future --permanent (for
+      // production CoS) or similar will plumb through here.
+      agentStrategy: undefined,
     });
   }
 
