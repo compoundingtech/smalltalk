@@ -386,13 +386,20 @@ function buildPtyToml(opts: {
   identity: string;
   invocation: readonly string[];
   addDingSidecar: boolean;
-  cwd: string;
 }): string {
   // pty runs `command` via `sh -c`, so produce a shell command line by
   // space-joining shell-quoted argv elements. Then TOML-quote the
   // whole thing for the `command = "..."` value.
   const shellLine = opts.invocation.map(shellQuote).join(' ');
-  const prefix = resolveRepoPrefix(opts.cwd);
+  // Prefix is the identity — pty namespace is global and repo
+  // basenames can collide (`taskflow` in two different clones both
+  // trying to be `taskflow/claude`). Identity is unique per agent by
+  // construction, and it means a generic shepherd poking `pty send
+  // <identity>/<session>` always finds the right session. Historic
+  // behavior was repo-basename via a `resolveRepoPrefix(cwd)` walk;
+  // that shape is preserved by `--session-name` when a user really
+  // wants a different key inside the identity namespace.
+  const prefix = opts.identity;
   const lines: string[] = [];
   lines.push(`prefix = "${tomlEscape(prefix)}"`);
   lines.push('');
@@ -758,17 +765,6 @@ function installPersona(opts: {
   };
 }
 
-function resolveRepoPrefix(cwd: string): string {
-  // Fallback: basename of cwd, sanitized to agent grammar (lowercase,
-  // hyphens, periods). This mirrors the pty prefix convention Nathan
-  // uses for smalltalk / pty / etc.
-  const base = cwd.split('/').filter((s) => s.length > 0).pop() ?? 'agent';
-  return base
-    .toLowerCase()
-    .replace(/[^a-z0-9.-]+/g, '-')
-    .replace(/^-+|-+$/g, '') || 'agent';
-}
-
 // ─── Core ──────────────────────────────────────────────────────────────
 
 export async function cmdLaunch(
@@ -944,7 +940,6 @@ export async function cmdLaunch(
       identity,
       invocation: argv,
       addDingSidecar: harness === 'codex',
-      cwd,
     });
     ptyTomlPreview = preview;
     if (!input.dryRun && !existsSync(ptyTomlPath)) {
@@ -960,7 +955,6 @@ export async function cmdLaunch(
       identity,
       invocation: argv,
       addDingSidecar: harness === 'codex',
-      cwd,
     });
   }
 

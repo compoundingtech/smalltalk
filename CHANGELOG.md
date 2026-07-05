@@ -6,6 +6,28 @@ minor releases until 1.0.
 
 ## Unreleased
 
+### Fixed (`st launch` derives the pty prefix from the identity, not the repo basename)
+
+Historic behavior: the generated `pty.toml` used the cwd basename as
+the pty session prefix, so an agent with identity `taskflow-dev`
+launched from `taskflow/` produced pty sessions namespaced under
+`taskflow/…`. That drifted the pty session away from the identity —
+a generic shepherd or `pty send` targeting the identity couldn't
+back it up — and left two clones of the same repo (running under
+different identities) racing for the same `<basename>/claude`
+session key in pty's global namespace.
+
+Now the prefix is the identity itself. `st launch --identity
+taskflow-dev` under any cwd produces `pty.toml` with `prefix =
+"taskflow-dev"`, so the full pty session is
+`taskflow-dev/claude` — matches the identity, unique by
+construction, uncollidable across clones.
+
+`resolveRepoPrefix(cwd)` (the old derivation) was the only caller of
+that helper, so it's gone too. `--session-name <name>` still
+overrides the session key within the identity namespace when a
+user wants a different shape.
+
 ### Docs (onboarding.md: fill in the `bin/st-evals readiness` invocation)
 
 st-evals published at https://github.com/myobie/st-evals — a
