@@ -6,7 +6,7 @@ status: living doc — update as the surface evolves
 
 # Onboarding a new participant
 
-Smalltalk is Nathan's coordination bus for humans and agents — the
+Smalltalk is a coordination bus for humans and agents — the
 filesystem is the API, `st` is the CLI. This guide brings you up on
 the recommended path: install the CLI, launch your Chief of Staff
 (CoS), and let it drive the rest of the setup.
