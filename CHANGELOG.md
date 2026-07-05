@@ -6,6 +6,48 @@ minor releases until 1.0.
 
 ## Unreleased
 
+### Fixed (channel-watcher re-delivers inbox contents on start — at-least-once)
+
+Historic behavior: on `startChannelWatcher`, an initial
+`readdirSync(inboxDir)` seeded every existing filename into the
+`seen` dedup set — a suppression policy that assumed the boot
+ritual's `coord_msg_ls` would recover any backlog. Live repro
+during the P5 team-standup re-run showed the policy is too
+aggressive: when Claude Code reconnects the MCP stdio transport
+mid-session (the current server process exits on `mcp.server.
+onclose`, Claude Code respawns a fresh one), any messages that
+landed in the inbox during the down window get seeded into the
+new process's `seen` and are never emitted as channel
+notifications. The polling backstop (brief-020 HB-4) can't rescue
+because it dedups against the same `seen` set, and asyncRewake
+doesn't force a turn when the agent's actively working — so a live
+CoS session watched 5 messages arrive in inbox with zero
+`<channel>` blocks injected. Cos hit this live.
+
+Now the initial scan **enqueues** those files instead of seeding
+them. Each fires exactly once per process, in chronological order
+(`<unix-ms>-<rand6>.md` filenames lex-sort chronologically; `rand6`
+breaks ties deterministically). Duplicates across a process
+restart are the accepted tradeoff — per Nathan: "duplicates don't
+matter to me. We want at-least-once, not at-most-once." Agent
+re-reads + archives are harmless; lazy-read sweep clears the
+byte-identical inbox twin on the next read.
+
+- Test `mcp-channel-watcher.test.ts:428` (previously "files
+  already present at startup DO NOT get replayed") inverts to
+  "files present at startup ARE delivered on watcher start (P5R-F2
+  fix)" — asserts three planted files arrive in chronological
+  order and that the polling backstop tick does NOT re-fire them.
+- No safety valve on backlog size. Inboxes stay small in practice
+  (boot ritual drains them). If big-backlog flood bites later, cap
+  is a small follow-up.
+
+Operator-visible: on a mid-session MCP reconnect, expect to see
+`<channel>` blocks for anything that arrived during the down
+window — including messages you may have already read via
+`coord_msg_ls`. The dup is easy to spot (same filename); archive
+as normal.
+
 ### Fixed (F1 auto-poker was addressing sessions with a slash — pty resolves with a dash)
 
 F1's `--unattended` auto-poker (#47) built its target as

@@ -112,17 +112,40 @@ export async function startChannelWatcher(
 
   // brief-020: dedup set shared between chokidar and the polling
   // backstop. Each path checks-and-adds before enqueueing so a file
-  // observed by both paths only emits one channel notification. Seeded
-  // from an initial `readdirSync` so historical files (e.g. an unread
-  // backlog from a prior process) don't get replayed as fresh
-  // arrivals — the boot ritual's `coord_msg_ls` handles backlog.
+  // observed by both paths only emits one channel notification.
+  //
+  // At-least-once semantic (P5R-F2 fix): the initial `readdirSync`
+  // used to seed `seen` with every existing filename — the intent
+  // was to avoid replaying "historical files" on restart, with the
+  // boot ritual's `coord_msg_ls` handling backlog. Live repro proved
+  // that policy too aggressive: a mid-session MCP disconnect +
+  // reconnect (Claude Code respawns the stdio process) creates a
+  // fresh process whose seed suppressed files that arrived DURING
+  // the down-window — the polling backstop can't rescue them
+  // because it dedups against the same `seen`, and asyncRewake
+  // doesn't force a turn when the agent's actively working.
+  //
+  // Now we ENQUEUE the initial files instead of seeding them. Each
+  // fires exactly once per process, in chronological
+  // (<unix-ms>-sorted) order via drain(). Duplicates ACROSS a
+  // process restart are accepted per user's spec — "duplicates
+  // don't matter to me, we want at-least-once, not at-most-once" —
+  // the agent re-reads + archives are harmless (lazy-read sweep
+  // clears the byte-identical inbox twin on the next read).
   const seen = new Set<string>();
+  // Track the initial-scan filenames so we can enqueue them AFTER
+  // the emit pipeline definitions below without another readdir.
+  // Populated in the same try/catch that would have seeded `seen`.
+  const initialFilenames: string[] = [];
   try {
     for (const name of readdirSync(inboxDir)) {
-      if (isDeliverable(name)) seen.add(name);
+      if (isDeliverable(name)) {
+        seen.add(name);
+        initialFilenames.push(name);
+      }
     }
     debugLog(
-      `seeded ${seen.size} existing filename(s) in inbox=${inboxDir}`
+      `initial scan queued ${initialFilenames.length} existing file(s) in inbox=${inboxDir}`
     );
   } catch {
     // inbox dir may not exist yet on very fresh identities; chokidar
@@ -341,6 +364,20 @@ export async function startChannelWatcher(
     await new Promise<void>((resolve) => {
       watcher.once('ready', () => resolve());
     });
+  }
+  // At-least-once initial delivery: enqueue every deliverable file
+  // present when the watcher started, in chronological filename
+  // order. The <unix-ms>-<rand6>.md grammar's <unix-ms> prefix makes
+  // a lexical sort chronological; rand6 breaks same-millisecond ties
+  // deterministically. Each file was already added to `seen` above,
+  // so a chokidar `add` event racing this scan or the backstop's
+  // first tick will short-circuit at the `seen.has(filename)` gate
+  // and not re-fire.
+  if (initialFilenames.length > 0) {
+    const sorted = [...initialFilenames].sort();
+    for (const name of sorted) {
+      enqueue(join(inboxDir, name));
+    }
   }
   startPollBackstop();
 
