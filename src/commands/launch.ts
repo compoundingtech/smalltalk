@@ -914,15 +914,27 @@ export function buildClaudeSettings(
  * ding-mode agents get the other via an `@DING-BUS.md` import in
  * their entry file (CLAUDE.md).
  *
- * **Keep in sync**: when the bus contract changes (new tools, new
- * conventions, boot-ritual updates), update BOTH this constant AND
- * `CHANNEL_INSTRUCTIONS` in `src/mcp/capabilities.ts`. A drift
- * between the two means MCP agents and ding-mode agents will
- * behave differently for the same protocol event.
+ * **Keep in sync**: when the *shared* bus contract changes (new
+ * tools, new conventions, boot-ritual updates), update BOTH this
+ * constant AND `CHANNEL_INSTRUCTIONS` in
+ * `src/mcp/capabilities.ts`. A drift between the two means MCP
+ * agents and ding-mode agents will behave differently for the
+ * same protocol event.
+ *
+ * **Ding-only sections don't mirror to CHANNEL_INSTRUCTIONS.** The
+ * "Propagate ding-mode through every spawn" section below is
+ * transport-specific truth — it exists because ding-mode is a
+ * *machine* property (MCP-hostile envs are hostile to every
+ * process, not just the boot agent), so a child spawn must also
+ * be ding-mode. MCP-mode has no equivalent constraint (an MCP
+ * child on an MCP-capable machine is fine), so
+ * CHANNEL_INSTRUCTIONS deliberately omits this section. Don't
+ * add a matching-but-nonsensical section there.
  *
  * Content shape follows the same "boot ritual → arrivals-handling →
  * threads-stay-on-bus → tools inventory" structure as
- * CHANNEL_INSTRUCTIONS, adapted for the CLI-based delivery path.
+ * CHANNEL_INSTRUCTIONS, adapted for the CLI-based delivery path,
+ * plus the ding-only "propagate-through-spawns" section.
  */
 export const DING_BUS_INSTRUCTIONS = `# Ding-mode bus instructions
 
@@ -976,6 +988,39 @@ I do X?" at your REPL, send it via \`st message reply\` instead.
 The only time it's right to address the REPL is when a human
 directly typed there.
 
+## Propagate ding-mode through every spawn
+
+The presence of THIS file (DING-BUS.md) tells you that you are
+in ding-mode: this machine is MCP-hostile (some sandboxed
+runners, some corporate-managed setups, some Claude Code
+distributions where MCP is disabled). ding-mode is not a
+per-agent choice — it's a property of the whole machine, so
+**every agent you spawn on this machine MUST also be in
+ding-mode.**
+
+When you \`st launch\` a specialist / worker / supervisor / any
+child agent, you MUST pass \`--ding\`:
+
+\`\`\`sh
+st launch <harness> --identity <child-id> --ding \\
+  [--persona <path>] [--permanent] [other flags…]
+\`\`\`
+
+The child gets its own DING-BUS.md and CLAUDE.md wiring
+automatically (\`st launch --ding\` installs the same contract in
+the child's cwd), so the "propagate ding through every spawn"
+rule holds at every level of a cos → supervisor → worker tree.
+
+Do NOT run plain \`st launch <harness> …\` (no \`--ding\`) — that
+spawns an MCP-mode child, which will fail to start (or worse:
+appear to start and then never deliver on the MCP transport this
+machine can't support). A mixed-mode tree — you in ding-mode,
+child in MCP-mode — is always a bug on this machine.
+
+Rule of thumb: **you can copy your own launch pattern from the
+persona / onboarding docs, but you must add \`--ding\` to any
+copied \`st launch …\` command that doesn't already have it.**
+
 ## CLI inventory
 
 Bus ops:
@@ -994,6 +1039,10 @@ Working state (lossless-restart):
 - \`st context read [<identity>] [--decisions | --full]\`
 - \`st context write [<identity>]\` (reads new content from stdin)
 - \`st context append [<identity>] --decision "<text>" --why "<text>"\`
+
+Spawning children (MUST include \`--ding\` on this machine — see
+"Propagate ding-mode through every spawn" above):
+- \`st launch <harness> --identity <id> --ding [--persona <path>] [--permanent] [--permission-mode <mode>] [--agent <bin>] [--session-name <name>]\`
 
 Every command supports \`--help\` for the full flag surface.
 `;

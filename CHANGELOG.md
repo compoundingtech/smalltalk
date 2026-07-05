@@ -6,6 +6,68 @@ minor releases until 1.0.
 
 ## Unreleased
 
+### Fixed (`DING-BUS.md` now tells the agent to propagate ding-mode through every spawn)
+
+evals-claude caught a contract-level gap in DING-BUS.md before
+its live run even finished: a ding-mode CoS following its role
+("stand up a specialist per repo") had **zero instruction to add
+`--ding`** to the children it launches. On an MCP-capable box
+the mixed-mode tree still completes → false-pass; on Johannes's
+actual MCP-hostile setup the child fails to boot and the whole
+cos → supervisor → worker chain collapses.
+
+Root cause: the shipped `DING-BUS.md` (from #61) covered
+boot-ritual, `[DING]`-poke handling, threads-on-bus, and a
+CLI inventory — but nothing about *spawning children*. The
+`st launch` command wasn't even in the inventory. A ding-mode
+agent following the contract would faithfully copy its own
+launch pattern from the persona / onboarding docs — where the
+examples are `st launch <harness> …` without `--ding` — and
+silently produce an MCP-mode child.
+
+Fix — add a new "Propagate ding-mode through every spawn"
+section to `DING_BUS_INSTRUCTIONS`:
+
+- **Rule stated plainly**: "ding-mode is not a per-agent choice
+  — it's a property of the whole machine, so every agent you
+  spawn on this machine MUST also be in ding-mode."
+- **Exact command shape**: `st launch <harness> --identity
+  <child-id> --ding [--persona <path>] [--permanent] …`
+- **Cascade guarantee**: the child gets its own DING-BUS.md
+  automatically (since `st launch --ding` installs the same
+  contract in the child's cwd), so the rule holds at every level
+  of a cos → supervisor → worker tree.
+- **Anti-pattern explicit**: "Do NOT run plain `st launch`" —
+  names the failure mode (spawns an MCP-mode child that fails to
+  start, or worse, appears to start and delivers nothing).
+- **Copy-paste warning**: "you must add `--ding` to any copied
+  `st launch …` command that doesn't already have it" — targets
+  the exact behavior that produced the false-pass.
+- **CLI inventory expanded**: `st launch <harness> --identity
+  <id> --ding [...]` now listed under a new "Spawning children"
+  block, cross-referencing the rule above.
+
+CHANNEL_INSTRUCTIONS deliberately does NOT mirror this section —
+MCP-mode has no equivalent constraint (an MCP child on an
+MCP-capable machine is fine). The `DING_BUS_INSTRUCTIONS`
+docstring calls out the asymmetry so a future reader doesn't
+add a matching-but-nonsensical section to the MCP side.
+
+Tests:
+- New positive regression guards in the existing DING-BUS.md
+  content test: the new section header, the rule statement, the
+  exact `st launch <harness> --identity <child-id> --ding`
+  command shape, the "Do NOT run plain `st launch`"
+  anti-pattern, and the new "Spawning children" CLI-inventory
+  block are all asserted present.
+- Existing negative guards (no `coord` leak, etc.) still fire.
+
+Load-bearing for Johannes's team — this is what makes his
+cos → supervisor → worker chain work end-to-end on the
+MCP-hostile machine, not just the top-level CoS.
+
+Full suite: 1531 pass, only the 4 pre-existing integration flakes.
+
 ### Fixed (CRITICAL — `st ding` sidecar command targets the FQN pty session, not the bare `sessionName`)
 
 evals-claude's end-to-end confirmation run of the Johannes stack
