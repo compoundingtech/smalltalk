@@ -33,13 +33,15 @@ top of smalltalk rather than being a first-time human user.
 
 ## 1. Install
 
-Smalltalk depends on `@myobie/pty` via a `file:` link, so clone both
-side-by-side:
+Smalltalk depends on `@myobie/pty` via a `file:` link, and the CoS
+bootstrap (step 2) needs the `personas` repo checked out for its
+`--persona` argument. Clone all three side-by-side:
 
 ```sh
 mkdir -p ~/src/github.com/myobie && cd ~/src/github.com/myobie
 git clone https://github.com/myobie/pty
 git clone https://github.com/myobie/smalltalk
+git clone https://github.com/myobie/personas
 cd smalltalk
 npm install
 npm link
@@ -80,25 +82,41 @@ has a hand-tuned `settings.local.json`.
 Your Chief of Staff is a Claude Code agent scoped to a private repo
 that holds your identity, priorities, and working state.
 
-**Pick a directory that will become your private cos repo.** `st
-launch` writes identity + hook wiring into the cwd, and marks its
-own infra files as git-excluded via `.git/info/exclude` — so it
-wants the cwd to be a git repo. If it isn't yet, `git init` first.
+**Make the cos repo first, then launch the CoS agent INSIDE it.**
+The folder is the private cos repo. `st launch` writes identity +
+hook wiring + persona infra into the cwd, and git-excludes those
+files via `.git/info/exclude` — so it wants the cwd to be a git
+repo. Order: make the folder, `git init`, then launch.
 
 ```sh
 mkdir ~/src/github.com/<you>/cos && cd ~/src/github.com/<you>/cos
 git init
-st launch claude --identity cos
+st launch claude --identity cos \
+  --persona ~/src/github.com/myobie/personas/chief-of-staff.md
 ```
+
+**The `--persona` flag is load-bearing.** Without it, `st launch`
+spawns a bare Claude that has no idea it's a CoS — no first-run
+interview, no personas awareness, no self-become. With
+`--persona`, `st launch`:
+
+- Copies `chief-of-staff.md` to `<cos-repo>/PERSONA.md`.
+- Creates `CLAUDE.md` in the cwd (or edits an existing one) with a
+  `@PERSONA.md` import line, so Claude Code loads the persona on
+  every session start.
+- git-excludes `PERSONA.md`, `CLAUDE.md`, and the other infra files
+  so the private cos repo stays uncluttered.
 
 If your `claude` binary is aliased (`cl1`, `cl2`, etc.), pass it
 explicitly:
 
 ```sh
-st launch claude --identity cos --agent cl1
+st launch claude --identity cos \
+  --persona ~/src/github.com/myobie/personas/chief-of-staff.md \
+  --agent cl1
 ```
 
-What `st launch` does for you:
+What `st launch` does for you (with the persona):
 
 - Registers the `cos` identity in `$ST_ROOT/cos/{inbox,archive}` and
   writes `available` to its status file.
@@ -107,26 +125,41 @@ What `st launch` does for you:
 - Writes `.claude/settings.local.json` with the three hooks wired up
   and `ST_BIN=<absolute path>` baked in so the hooks are robust to
   PATH drift.
+- Installs the CoS persona (copies `chief-of-staff.md` to
+  `PERSONA.md`, wires it into `CLAUDE.md`).
 - Generates a `pty.toml` so the CoS runs under `pty up` supervision
   if you've installed the pty tool.
 - Boots Claude Code with `--resume` semantics tied to the session id
   it just recorded.
 
-The CoS opens in your terminal.
+The CoS opens in your terminal — now knowing it's a CoS.
 
-## 3. The CoS consumes the `personas` repo
+## 3. What the CoS does on boot (from the persona)
 
-On first boot, the CoS clones (or fetches) the public **personas**
-repo at https://github.com/myobie/personas as its role contract —
-what "Chief of Staff" means, how to act, what conventions to follow.
-The reference is **SHA-pinned** at the personas commit the CoS
-persona was designed against, so upgrades are deliberate rather
-than incidental. You don't have to do anything for this step; it
-happens inside the CoS's boot ritual.
+The `chief-of-staff.md` file the launch just installed tells the
+fresh agent its mission and its bootstrap sequence. Concretely, on
+first boot the persona instructs the agent to:
 
-If you're offline or want to mirror personas locally, clone
-https://github.com/myobie/personas into your git tree; the CoS will
-find it via the same path convention it uses for its own repo.
+- **Run the first-run interview** — the persona references its
+  sibling `first-run-interview.md` (in the same `personas` checkout
+  you cloned in step 1) and walks you through the setup covered in
+  the next section. On subsequent boots, if the private cos repo is
+  already populated, the interview is skipped.
+- **Consult the sibling personas as needed** — `manager.md`,
+  `specialist.md`, and the others are reference material the CoS
+  reads when it spins up a peer agent for you. Same checkout; same
+  branch. The CoS is designed against a specific personas commit,
+  so pin `myobie/personas` to that SHA when you want reproducible
+  behavior across machines (`cd ~/src/github.com/myobie/personas
+  && git checkout <sha>`); pull main when you want the latest.
+- **Own its own repo** — everything the CoS writes about you and
+  your work lives in the cos folder (`context/now.md`, decisions,
+  etc.). The personas repo is READ-only reference; the cos repo is
+  the private, per-user state.
+
+You don't need to do anything for this step — the persona file the
+launch installed drives it. The interview + readiness steps in the
+next section are what the CoS actually walks you through.
 
 ## 4. First run — interview + readiness
 
@@ -184,8 +217,11 @@ Cold-start recipes to keep handy:
 - **See what your CoS is thinking about:** `st context read cos`
 - **Cross-tree overview of everyone:** `st overview`
 - **Resume a suspended CoS session:** `cd` back into the cos repo
-  and rerun `st launch claude --identity cos` — the session id in
-  `.claude-session-id` is what makes it a resume, not a fresh start.
+  and rerun the same launch command (including `--persona`) — the
+  session id in `.claude-session-id` is what makes it a resume, not
+  a fresh start. Re-passing `--persona` is safe: `PERSONA.md` gets
+  overwritten with the same bytes, and the `@PERSONA.md` line in
+  `CLAUDE.md` is idempotent.
 
 ## Bus basics — hand-wiring an identity
 
@@ -313,5 +349,17 @@ st sync pull --all
   `command:` should start with `ST_BIN=/absolute/path/to/bin/st`
   followed by the absolute path to the hook script. If those paths
   drift (you moved the smalltalk checkout), delete
-  `.claude/settings.local.json` and re-run `st launch claude
-  --identity cos` to regenerate.
+  `.claude/settings.local.json` and re-run the launch command to
+  regenerate.
+- **The CoS boots but acts like generic Claude (no first-run
+  interview, no CoS awareness):** you probably launched without
+  `--persona`. Bare `st launch claude --identity cos` produces a
+  Claude Code session with no persona wired. Confirm: in the cos
+  repo, check that `PERSONA.md` and `CLAUDE.md` exist and that
+  `CLAUDE.md` contains an `@PERSONA.md` line. If they're missing,
+  re-run the launch with `--persona
+  ~/src/github.com/myobie/personas/chief-of-staff.md`.
+- **The persona path in `--persona` didn't resolve:** verify the
+  personas repo was cloned in step 1 (`ls
+  ~/src/github.com/myobie/personas/chief-of-staff.md`). If you
+  cloned it elsewhere, use that absolute path in `--persona`.

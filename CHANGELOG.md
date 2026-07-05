@@ -6,6 +6,53 @@ minor releases until 1.0.
 
 ## Unreleased
 
+### Docs (onboarding.md: fix the missing persona bootstrap in the CoS quickstart)
+
+The CoS quickstart's step 2 said `st launch claude --identity cos`
+— which produces a bare Claude Code agent that has no idea it's a
+CoS. Step 3 then said "the CoS consumes the personas repo on boot"
+— but nothing in the actual launch command told the agent to do
+that, so the docs described a bootstrap that doesn't self-start.
+Follow the recipe literally and you get generic Claude in a
+folder.
+
+Fix per Nathan's framing — you make the repo, THEN launch the CoS
+IN it:
+
+1. **Step 1 (Install)** — extends the side-by-side clone list to
+   include `myobie/personas` alongside `pty` and `smalltalk`, so
+   the persona file is on disk before step 2 needs it.
+2. **Step 2 (Bring up your CoS)** — makes the ordering unambiguous
+   (mkdir the cos folder → `git init` → launch INSIDE it) and adds
+   the load-bearing `--persona
+   ~/src/github.com/myobie/personas/chief-of-staff.md` argument.
+   Documents what `st launch --persona` actually does (copy to
+   `PERSONA.md`, wire `@PERSONA.md` into `CLAUDE.md`, git-exclude
+   both). Notes the aliased-binary `--agent` form still applies
+   alongside `--persona`.
+3. **Step 3 (renamed "What the CoS does on boot (from the
+   persona)")** — reconciled with step 2's persona install.
+   Describes the persona's actual bootstrap: read
+   `first-run-interview.md` on a fresh network; consult sibling
+   personas as reference when spinning up peers; own the private
+   cos repo state. Clarifies personas is READ-only reference; the
+   cos repo is the writable per-user state.
+4. **Step 5 (Resume recipe)** — includes `--persona` on the resume
+   command; notes re-passing is safe (overwrites `PERSONA.md` with
+   same bytes; the `@PERSONA.md` line in `CLAUDE.md` is
+   idempotent).
+5. **Troubleshooting** — adds two entries: "CoS boots as generic
+   Claude" (probably launched without `--persona`; verify PERSONA.md
+   + CLAUDE.md wiring) and "`--persona` path didn't resolve"
+   (verify the personas clone in step 1).
+
+Verified against the actual code: `st launch --persona <path>`
+copies to `<cwd>/PERSONA.md`, creates or edits `CLAUDE.md` with a
+`@PERSONA.md` import, and git-excludes both. Verified against
+https://github.com/myobie/personas that `chief-of-staff.md` exists
+at the repo root and instructs the fresh agent to run
+`first-run-interview.md` before anything else.
+
 ### Fixed (`st launch` pins `ST_ROOT` into the generated pty.toml when the invoker set it)
 
 Historic behavior: the generated pty.toml's `[sessions.*.env]`
