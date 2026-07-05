@@ -146,12 +146,29 @@ The CoS writes the answers into your private cos repo — `context/now.md`
 and a few sibling files — so a compaction or fresh session picks
 them back up on the next boot.
 
-Then it runs a **readiness check**: clones `st-evals` and runs the
-basic set for the tools you've installed (Claude Code, pty,
-smalltalk itself), confirming your machine can actually do the work
-the CoS will ask of it before you rely on it. The exact
-`st-evals` invocation will be documented here once st-evals ships
-publicly — for now, the CoS handles the fetch and run internally.
+Then it runs a **readiness check** via
+[st-evals](https://github.com/myobie/st-evals) — a capability-gated
+hermetic smoke suite that preflights what tools you have installed
+and then only runs the scenarios your setup can actually support.
+The CoS clones st-evals into a scratch dir and runs, from the cloned
+repo root:
+
+```sh
+bin/st-evals readiness
+```
+
+`readiness` verifies the bus works, an agent spawns correctly, and
+messages route end-to-end — the minimum viable "your machine can do
+the work the CoS will ask of it" gate. Two auxiliary probes you can
+run yourself if the CoS reports a miss:
+
+- `bin/st-evals preflight` — lists installed capabilities and which
+  scenarios can run given your setup.
+- `bin/st-evals list` — the full catalog.
+
+st-evals also honors `PERSONAS_DIR` (or run `bin/ensure-personas.sh`
+to fetch a pinned copy) if you want to point it at a local mirror
+of the personas repo instead of re-fetching.
 
 ## 5. Operating
 
