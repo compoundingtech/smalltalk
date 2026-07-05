@@ -576,6 +576,19 @@ export function buildClaudeSettings(
 ): string {
   const settings = {
     $schema: 'https://json.schemastore.org/claude-code-settings.json',
+    // F2: opt every fresh Claude Code session into the project MCP
+    // server this launch just wired up in `.mcp.json`, without the
+    // "Enable the `st` MCP server?" gate blocking hands-off
+    // standup. `enableAllProjectMcpServers` blanket-approves any
+    // server in the project `.mcp.json`; `enabledMcpjsonServers`
+    // pins the specific entry — `st` matches the post-cutover
+    // mcpServers key that `st init` writes — so a future .mcp.json
+    // edit that adds an unrelated server still requires an explicit
+    // approval. Verified in the Claude Code settings docs
+    // (code.claude.com/docs/en/settings) — both fields are
+    // load-bearing.
+    enableAllProjectMcpServers: true,
+    enabledMcpjsonServers: ['st'],
     hooks: {
       SessionStart: [
         {

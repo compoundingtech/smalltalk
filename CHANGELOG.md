@@ -6,6 +6,37 @@ minor releases until 1.0.
 
 ## Unreleased
 
+### Fixed (`st launch` pre-approves the project MCP server + renames the emitted key to `st`)
+
+Every fresh Claude Code session prompts "Enable the `st` MCP
+server?" the first time it sees a project `.mcp.json` — a hands-off
+CoS spawning a specialist under `spawn()` had nobody at the REPL
+to answer that. Prior generated `.claude/settings.local.json`
+omitted the pre-approval fields, so the specialist wedged.
+
+`buildClaudeSettings` now emits both docs-confirmed fields:
+
+- `enableAllProjectMcpServers: true` — blanket-approves any server
+  in the project `.mcp.json`.
+- `enabledMcpjsonServers: ["st"]` — pins the specific entry so a
+  future `.mcp.json` edit that adds an unrelated server still
+  requires an explicit approval. Belt-and-braces alongside the
+  blanket allow.
+
+Verified in the Claude Code settings docs
+(https://code.claude.com/docs/en/settings) — both fields are
+load-bearing. The folder-trust dialog is handled by F1's
+`--unattended` poker (same Enter). This closes F2 of the
+P5-eval-surfaced unattended-standup fix set.
+
+`st init` (and the `st launch` `.mcp.json` path that fans out
+through it) also renamed the emitted `mcpServers` key from `coord`
+to `st`. The on-disk `.mcp.json` state was already `st` across
+swept repos, so launch was drifting: it wrote `coord:` into freshly-
+generated `.mcp.json` files while every peer file was `st:`.
+`enabledMcpjsonServers` above matches the new key, so a new agent
+comes up with a consistent `st`-branded MCP wiring end-to-end.
+
 ### Added (`st launch --unattended` auto-pokes Claude Code's first-launch gates)
 
 Every freshly-launched Claude Code session stalls at up to three
