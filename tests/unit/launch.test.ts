@@ -1000,6 +1000,25 @@ describe('cmdLaunch — .claude/settings.local.json generation (brief-118)', () 
     expect(() => JSON.parse(preview)).not.toThrow();
   });
 
+  it('F2: enableAllProjectMcpServers + enabledMcpjsonServers pre-approve the st MCP', async () => {
+    // Without these, first-boot claude prompts "Enable the st
+    // MCP server?" — a hands-off standup can't answer that. Docs-
+    // confirmed fields; see code.claude.com/docs/en/settings.
+    const hooksDir = fakeHooksDir();
+    const r = await cmdLaunch(
+      baseInput({ identity: 'alice', hooksDir, stBinForHooks: null }),
+      ctx
+    );
+    const parsed = JSON.parse(r.claudeSettingsPreview!);
+    expect(parsed.enableAllProjectMcpServers).toBe(true);
+    // Pin the specific server name — `st` matches the post-cutover
+    // key that `st init` now writes into `.mcp.json` (see
+    // src/commands/init.ts). A future `.mcp.json` edit that adds an
+    // unrelated server still requires an explicit approval —
+    // belt-and-braces alongside the blanket allow.
+    expect(parsed.enabledMcpjsonServers).toEqual(['st']);
+  });
+
   it('asyncRewake is ONLY on the SessionStart hook (not PreCompact or StopFailure)', async () => {
     const hooksDir = fakeHooksDir();
     const r = await cmdLaunch(baseInput({ identity: 'alice', hooksDir }), ctx);

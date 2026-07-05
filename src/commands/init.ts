@@ -158,9 +158,13 @@ export async function cmdInit(
   const path = join(targetDir, '.mcp.json');
 
   if (input.print === true) {
-    // Emit just the coord entry (under a top-level mcpServers wrapper)
-    // so the user can paste it manually if they want to.
-    const preview: McpJsonShape = { mcpServers: { coord: entry } };
+    // Emit just the st entry (under a top-level mcpServers wrapper)
+    // so the user can paste it manually if they want to. Key is `st`
+    // to match the post-cutover on-disk naming; the MCP server itself
+    // still responds to both `coord` and `st` names, so this key just
+    // has to be internally consistent with `enabledMcpjsonServers`
+    // in settings.local.json.
+    const preview: McpJsonShape = { mcpServers: { st: entry } };
     ctx.stdout(`${JSON.stringify(preview, null, 2)}\n`);
     return { outcome: 'printed-only', path, entry };
   }
@@ -205,11 +209,20 @@ export async function cmdInit(
       ? { ...existing.mcpServers }
       : {};
 
-  const prior = servers.coord;
+  // Look up the existing entry under `st` first, then the back-compat
+  // `coord` key for pre-cutover files that haven't been swept.
+  // Match either — write `st`. If both keys exist, the `st` one
+  // wins for the merge decision; the `coord` one is left alone
+  // (users can rm .mcp.json to re-init if they want a clean slate).
+  const prior = servers.st ?? servers.coord;
+  const priorKey: 'st' | 'coord' | null =
+    servers.st !== undefined ? 'st' : servers.coord !== undefined ? 'coord' : null;
   let outcome: InitOutcome;
   if (prior !== undefined && entryMatches(prior, entry)) {
     outcome = 'already-configured';
-    ctx.stderr(`coord init: ${path} already has matching coord entry — no changes.\n`);
+    ctx.stderr(
+      `st init: ${path} already has matching ${priorKey} entry — no changes.\n`
+    );
     return { outcome, path, entry };
   }
 
@@ -220,12 +233,12 @@ export async function cmdInit(
       const answer = await promptYesNo(
         ctx,
         input.promptAnswer,
-        `coord init: ${path} has a different coord entry. Overwrite? [y/N] `
+        `st init: ${path} has a different ${priorKey} entry. Overwrite? [y/N] `
       );
       overwrite = answer;
     }
     if (!overwrite) {
-      ctx.stderr(`coord init: skipped — existing coord entry preserved.\n`);
+      ctx.stderr(`st init: skipped — existing ${priorKey} entry preserved.\n`);
       return { outcome: 'skipped-by-user', path, entry: prior };
     }
     outcome = 'overwrote-divergent';
@@ -235,16 +248,20 @@ export async function cmdInit(
     outcome = 'wrote-new';
   }
 
-  servers.coord = entry;
+  // Migrate: write the entry under `st`, and drop the legacy `coord`
+  // key if it was present so the file has one canonical key rather
+  // than two. This is a no-op when only `st` (or neither) was there.
+  delete servers.coord;
+  servers.st = entry;
   const next: McpJsonShape = { ...existing, mcpServers: servers };
   atomicWriteJson(path, next);
 
   const summary =
     outcome === 'wrote-new'
-      ? `coord init: wrote ${path}\n`
+      ? `st init: wrote ${path}\n`
       : outcome === 'merged-into-existing'
-      ? `coord init: added coord entry to existing ${path}\n`
-      : `coord init: overwrote divergent coord entry in ${path}\n`;
+      ? `st init: added st entry to existing ${path}\n`
+      : `st init: overwrote divergent ${priorKey ?? 'st'} entry in ${path}\n`;
   ctx.stderr(summary);
 
   return { outcome, path, entry };

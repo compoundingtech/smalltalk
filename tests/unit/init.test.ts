@@ -1,6 +1,6 @@
 // tests/unit/init.test.ts — `coord init` writes/merges .mcp.json.
 //
-// brief-026: surgical idempotent merge on mcpServers.coord; preserves
+// brief-026: surgical idempotent merge on mcpServers.st; preserves
 // other servers; prompt-gated on divergent existing entries; atomic
 // write; portable binary path resolution.
 
@@ -114,7 +114,7 @@ describe('cmdInit — write new .mcp.json', () => {
     const parsed = readJson(target);
     expect(parsed).toEqual({
       mcpServers: {
-        coord: {
+        st: {
           type: 'stdio',
           command: FAKE_BIN,
           args: ['mcp', '--channel'],
@@ -132,17 +132,17 @@ describe('cmdInit — write new .mcp.json', () => {
     );
     expect(r.outcome).toBe('wrote-new');
     const parsed = readJson(join(scratch, '.mcp.json'));
-    const coord = (
+    const st = (
       parsed.mcpServers as Record<string, { args: string[] }>
-    ).coord;
-    expect(coord.args).toEqual(['mcp']);
+    ).st;
+    expect(st.args).toEqual(['mcp']);
   });
 });
 
 // ─── Merge into existing ────────────────────────────────────────────────
 
 describe('cmdInit — merge into existing .mcp.json', () => {
-  it('preserves other mcpServers entries when adding coord', async () => {
+  it('preserves other mcpServers entries when adding st', async () => {
     writeFileSync(
       join(scratch, '.mcp.json'),
       JSON.stringify(
@@ -167,7 +167,7 @@ describe('cmdInit — merge into existing .mcp.json', () => {
     expect(r.outcome).toBe('merged-into-existing');
     const parsed = readJson(join(scratch, '.mcp.json'));
     const servers = parsed.mcpServers as Record<string, unknown>;
-    expect(Object.keys(servers).sort()).toEqual(['coord', 'other-server']);
+    expect(Object.keys(servers).sort()).toEqual(['other-server', 'st']);
     expect((servers['other-server'] as { command: string }).command).toBe(
       '/usr/local/bin/other'
     );
@@ -184,7 +184,37 @@ describe('cmdInit — merge into existing .mcp.json', () => {
     expect(parsed.otherTopLevel).toEqual({ a: 1 });
   });
 
-  it('byte-identical coord entry → already-configured no-op', async () => {
+  it('byte-identical st entry → already-configured no-op', async () => {
+    writeFileSync(
+      join(scratch, '.mcp.json'),
+      JSON.stringify(
+        {
+          mcpServers: {
+            st: {
+              type: 'stdio',
+              command: FAKE_BIN,
+              args: ['mcp', '--channel'],
+              env: {},
+            },
+          },
+        },
+        null,
+        2
+      )
+    );
+    const ctx = makeCtx();
+    const r = await cmdInit(
+      { dir: scratch, binPath: FAKE_BIN },
+      ctx
+    );
+    expect(r.outcome).toBe('already-configured');
+    expect(ctx.stderrBuf).toMatch(/already has matching st entry/);
+  });
+
+  it('byte-identical legacy `coord` entry → already-configured no-op (back-compat)', async () => {
+    // A pre-cutover .mcp.json that still uses the `coord` key is
+    // still recognized. init reads both keys, prefers `st` when both
+    // are present. This test proves the coord back-compat read path.
     writeFileSync(
       join(scratch, '.mcp.json'),
       JSON.stringify(
@@ -214,8 +244,12 @@ describe('cmdInit — merge into existing .mcp.json', () => {
 
 // ─── Divergent existing + --force / prompt ──────────────────────────────
 
-describe('cmdInit — divergent existing coord entry', () => {
+describe('cmdInit — divergent existing entry', () => {
   function plantDivergentEntry(): void {
+    // Plants a divergent LEGACY `coord:` entry (worst-case: pre-
+    // cutover file) to exercise both back-compat read + overwrite +
+    // legacy-key drop on the write. Overwrite must land as `st:`
+    // (post-cutover shape) and remove the `coord:` key.
     writeFileSync(
       join(scratch, '.mcp.json'),
       JSON.stringify(
@@ -244,9 +278,9 @@ describe('cmdInit — divergent existing coord entry', () => {
     );
     expect(r.outcome).toBe('overwrote-divergent');
     const parsed = readJson(join(scratch, '.mcp.json'));
-    const coord = (parsed.mcpServers as Record<string, { command: string }>)
-      .coord;
-    expect(coord.command).toBe(FAKE_BIN);
+    const st = (parsed.mcpServers as Record<string, { command: string }>)
+      .st;
+    expect(st.command).toBe(FAKE_BIN);
   });
 
   it('no --force, answers "n" → skipped, original untouched', async () => {
@@ -271,9 +305,9 @@ describe('cmdInit — divergent existing coord entry', () => {
     );
     expect(r.outcome).toBe('overwrote-divergent');
     const parsed = readJson(join(scratch, '.mcp.json'));
-    const coord = (parsed.mcpServers as Record<string, { command: string }>)
-      .coord;
-    expect(coord.command).toBe(FAKE_BIN);
+    const st = (parsed.mcpServers as Record<string, { command: string }>)
+      .st;
+    expect(st.command).toBe(FAKE_BIN);
   });
 });
 
@@ -292,7 +326,7 @@ describe('cmdInit — --print', () => {
     const parsed = JSON.parse(ctx.stdoutBuf) as Record<string, unknown>;
     expect(parsed.mcpServers).toBeDefined();
     expect(
-      (parsed.mcpServers as Record<string, { command: string }>).coord
+      (parsed.mcpServers as Record<string, { command: string }>).st
         .command
     ).toBe(FAKE_BIN);
   });
