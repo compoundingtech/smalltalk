@@ -20,7 +20,7 @@
 //   - Bare harness name as pty session key (`claude` / `codex`);
 //     pty.toml's `prefix` field handles the `<repo>-` prefix.
 //   - claude defaults to channel mode (has UI for it); codex defaults
-//     to non-channel + a `coord ding` sidecar (no asyncRewake).
+//     to non-channel + an `st ding` sidecar (no asyncRewake).
 
 import { spawn, spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
@@ -552,7 +552,14 @@ function buildPtyToml(opts: {
     lines.push(`ST_ROOT = "${tomlEscape(opts.stRoot)}"`);
   }
   if (opts.addDingSidecar) {
-    const dingLine = `coord ding ${shellQuote(opts.sessionName)} --identity ${shellQuote(opts.identity)}`;
+    // Emit `st ding` (post-cutover canonical). The `coord ding` form
+    // still works because `coord` is a dual alias, but hardcoding
+    // the legacy name into every fresh pty.toml perpetuates the
+    // drift — future removal of the coord alias would silently
+    // break every `st launch codex` config generated pre-fix. Users
+    // regenerate their pty.toml (rm pty.toml && st launch codex …)
+    // to pick up the new form.
+    const dingLine = `st ding ${shellQuote(opts.sessionName)} --identity ${shellQuote(opts.identity)}`;
     lines.push('');
     lines.push(`[sessions.ding]`);
     lines.push(`command = "${tomlEscape(dingLine)}"`);
@@ -1446,7 +1453,7 @@ const LAUNCH_HELP =
   '        --persona ~/src/github.com/myobie/personas/chief-of-staff.md\n' +
   '                                                  # production CoS\n' +
   '    st launch claude --no-hooks                   # skip .claude/settings.local.json\n' +
-  '    st launch codex                               # + coord ding sidecar\n' +
+  '    st launch codex                               # + st ding sidecar\n' +
   '    st launch claude --model glm-5.2:cloud        # via ollama, unattended\n' +
   '    st launch claude --permission-mode bypassPermissions   # eval-spinner posture\n' +
   '    st launch codex --dry-run                     # audit before spawn\n';

@@ -95,14 +95,23 @@ describe('resolveCoordBinPath', () => {
     // derived from this module's location, not a literal.
     // (No hardcoded literal exists in the source; the regression
     // guard is the source-grep test below.)
-    expect(p.endsWith('/bin/coord')).toBe(true);
+    //
+    // Post-cutover: prefer `bin/st` (canonical). Falls back to
+    // `bin/coord` only if `bin/st` isn't on disk (very old package).
+    // In this repo both shims ship, so the test asserts `bin/st`.
+    expect(p.endsWith('/bin/st')).toBe(true);
+    // Rename regression guard: MUST NOT emit `bin/coord`. The old
+    // form still worked because coord is a dual alias, but pinning
+    // to the canonical name in fresh `.mcp.json` files means the
+    // day the coord alias is dropped doesn't break every launch.
+    expect(p.endsWith('/bin/coord')).toBe(false);
   });
 });
 
 // ─── Empty / new file ───────────────────────────────────────────────────
 
 describe('cmdInit — write new .mcp.json', () => {
-  it('empty dir → writes coord entry as the only mcpServer', async () => {
+  it('empty dir → writes st entry as the only mcpServer', async () => {
     const ctx = makeCtx();
     const r = await cmdInit(
       { dir: scratch, binPath: FAKE_BIN },

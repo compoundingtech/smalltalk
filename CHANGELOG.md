@@ -6,6 +6,46 @@ minor releases until 1.0.
 
 ## Unreleased
 
+### Fixed (`st init`/`st launch` emit `bin/st` + `st ding`, not the legacy `bin/coord` + `coord ding`)
+
+Two rename leftovers from the coord→st cutover that were producing
+config files pointing at the legacy shim name:
+
+- **`.mcp.json`'s MCP server command**: `st init` (and the `st
+  launch` path that fans out through it) had
+  `resolveCoordBinPath()` returning `<package-root>/bin/coord`,
+  which then landed as the `.mcp.json` `st` entry's `command:` on
+  every fresh launch. Worked (bin/coord is a dual alias for bin/st)
+  but perpetuated the drift — the day the coord alias is dropped
+  would break every generated `.mcp.json`.
+
+- **`pty.toml`'s ding sidecar command line**: `st launch codex`
+  emitted `command = "coord ding <sess> --identity <id>"` for the
+  ding session. Same dual-alias mechanic; same drift risk.
+
+Both fixes:
+
+- `resolveCoordBinPath()` now walks for and prefers `<pkg>/bin/st`,
+  falling back to `<pkg>/bin/coord` only for very-old installs
+  where the newer shim isn't present. PATH fallback is `which st`
+  first, then `which coord`. Function name kept for now (callers-
+  are-me-only; a rename is scope-creep on the fix).
+- `buildPtyToml`'s codex-ding line changed to `st ding <sess>
+  --identity <id>`.
+- Small doc + comment updates in `launch.ts` (`coord ding sidecar`
+  → `st ding sidecar` in LAUNCH_HELP + the module-level comment).
+
+Test regression guards added:
+- init.test.ts asserts `resolveCoordBinPath()` returns
+  `.../bin/st` AND explicitly negates `.../bin/coord`.
+- launch.test.ts asserts the codex ding preview contains `st ding`
+  AND explicitly negates `coord ding`.
+
+Users regenerate stale files by removing them (`rm .mcp.json
+pty.toml`) and re-running the corresponding launch. Existing
+`.mcp.json` / `pty.toml` files with the legacy names keep working
+until the coord alias is dropped; no forced migration.
+
 ### Added (`st launch --permanent` for durable CoS-shaped launches + footgun-guard)
 
 Closes the CoS-permanence gap the previous PR (ephemeral-ding fix)

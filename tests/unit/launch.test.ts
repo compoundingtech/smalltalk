@@ -565,7 +565,7 @@ describe('cmdLaunch — pty.toml generation', () => {
   });
 
   it('ST_ROOT propagation: codex ding sidecar env also gets ST_ROOT for isolation', async () => {
-    // A codex launch spawns both the main session and a `coord ding`
+    // A codex launch spawns both the main session and an `st ding`
     // sidecar; a `pty restart <sess>-ding` must not drift back to
     // the live default state root either.
     const isolatedRoot = '/tmp/codex-scratch/state';
@@ -596,7 +596,7 @@ describe('cmdLaunch — pty.toml generation', () => {
     expect(r.ptyTomlPreview).not.toContain('[sessions.ding]');
   });
 
-  it('codex preview includes the coord ding sidecar (ephemeral by default; no permanent tag)', async () => {
+  it('codex preview includes the `st ding` sidecar (ephemeral by default; no permanent tag)', async () => {
     // Historic behavior was `tags = { role = "ding", strategy =
     // "permanent" }`, which zombied the ding via `pty gc` after an
     // ephemeral codex eval died. Now the ding has no `strategy`
@@ -609,10 +609,15 @@ describe('cmdLaunch — pty.toml generation', () => {
     );
     expect(r.ptyTomlPreview).toContain('[sessions.ding]');
     expect(r.ptyTomlPreview).toContain(
-      'coord ding codex --identity alice'
+      'st ding codex --identity alice'
     );
     expect(r.ptyTomlPreview).toContain('tags = { role = "ding" }');
     expect(r.ptyTomlPreview).not.toContain('strategy = "permanent"');
+    // Rename regression guard: emit the canonical `st ding`, never
+    // `coord ding`. Hardcoding the legacy name into fresh pty.toml
+    // files would break every generated config the day the coord
+    // alias is dropped.
+    expect(r.ptyTomlPreview).not.toContain('coord ding');
   });
 
   it('agent tags stay { role = "agent" } with no strategy field by default', async () => {
@@ -637,7 +642,7 @@ describe('cmdLaunch — pty.toml generation', () => {
     );
     expect(r.ptyTomlPreview).toContain('[sessions.agentx]');
     expect(r.ptyTomlPreview).toContain(
-      'coord ding agentx --identity alice'
+      'st ding agentx --identity alice'
     );
   });
 });
@@ -1148,7 +1153,7 @@ describe('cmdLaunch — live-path regression (dry-run bypasses this)', () => {
     const pty = readFileSync(join(cwd, 'pty.toml'), 'utf8');
     expect(pty).toContain('[sessions.codex]');
     expect(pty).toContain('[sessions.ding]');
-    expect(pty).toContain('coord ding codex --identity live-bob');
+    expect(pty).toContain('st ding codex --identity live-bob');
     // Codex path doesn't touch newUuid(), but the init.ts /
     // status.ts sibling `require`s in the error paths are compiled
     // in this run — a regression there would still surface.
