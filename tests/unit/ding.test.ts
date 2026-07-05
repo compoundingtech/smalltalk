@@ -960,6 +960,80 @@ describe('runDing — session-watch (exits when session is gone)', () => {
     await r.done;
   });
 
+  it('startup-grace: session is dead from launch → ding waits, does NOT exit', async () => {
+    // The CRITICAL bug evals-claude caught: launch-time race where
+    // the ding starts before its target pty session is registered.
+    // Historic behavior: first tick sees "target gone" → daemon
+    // exits → being ephemeral, never restarts → NOTHING is
+    // delivered. Fix: startup grace — don't exit until we've seen
+    // the target alive at least once. This test locks the grace in.
+    fake.setStatus('available');
+    const log: string[] = [];
+    const r = startDing({
+      coord: fake.coord,
+      ptySend: sender.send,
+      sessionWatchIntervalMs: 30,
+      isSessionAlive: () => false, // dead from launch, never appears
+      stderr: (s) => log.push(s),
+    });
+    // Give the watch several ticks. Pre-fix, ding would have
+    // exited after the first tick (~30ms). Post-fix, the grace
+    // keeps it running.
+    await new Promise((res) => setTimeout(res, 200));
+    // Regression guard: r.done has NOT resolved.
+    let doneResolved = false;
+    void r.done.then(() => {
+      doneResolved = true;
+    });
+    // Give the promise-then a chance to fire if it already resolved.
+    await new Promise((res) => setImmediate(res));
+    expect(doneResolved).toBe(false);
+    // The startup-grace log line fired at least once, but not more —
+    // per-tick spam is intentionally avoided.
+    const waitingLines = log.filter((l) =>
+      l.includes('not yet registered')
+    );
+    expect(waitingLines.length).toBe(1);
+    // Absolute negative: the "session is gone; exiting" line MUST NOT
+    // appear — that would mean we tripped the exit path.
+    expect(log.join('')).not.toContain(
+      'target session "codex-foo" is gone; exiting'
+    );
+    // Cleanly tear down for the test.
+    r.ac.abort();
+    await r.done;
+  });
+
+  it('startup-grace: dead → alive → dead still exits (grace clears on first alive)', async () => {
+    // The grace is a startup shield, not a persistent one. Once
+    // we've SEEN the target alive, a subsequent transition to gone
+    // is a real "session ended" signal and must trigger exit.
+    fake.setStatus('available');
+    let alive = false; // dead from start
+    const r = startDing({
+      coord: fake.coord,
+      ptySend: sender.send,
+      sessionWatchIntervalMs: 25,
+      isSessionAlive: () => alive,
+    });
+    // Wait a beat — startup grace kicks in, ding waits.
+    await new Promise((res) => setTimeout(res, 100));
+    // pty registers → session comes alive.
+    alive = true;
+    // Wait a beat for the tick to observe alive.
+    await new Promise((res) => setTimeout(res, 100));
+    // Session dies for real.
+    alive = false;
+    // NOW the exit path should trigger.
+    await Promise.race([
+      r.done,
+      new Promise((_, rej) =>
+        setTimeout(() => rej(new Error('ding did not exit on real death')), 500)
+      ),
+    ]);
+    // r.done resolved without external abort.
+  });
+
   it('external AbortController still works (regression)', async () => {
     fake.setStatus('available');
     const r = startDing({

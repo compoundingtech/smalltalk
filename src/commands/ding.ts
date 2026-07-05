@@ -258,6 +258,24 @@ export async function runDing(deps: DingDeps): Promise<void> {
     deps.sessionWatchIntervalMs ?? DEFAULT_SESSION_WATCH_INTERVAL_MS;
   const isSessionAlive = deps.isSessionAlive ?? defaultIsSessionAlive;
   let sessionWatchTimer: ReturnType<typeof setInterval> | undefined;
+  // Startup-grace state. The ding sidecar racing pty registration is
+  // the load-bearing case: evals-claude's live ding-mode run caught
+  // this as the reason `--ding` delivered NOTHING unattended. The
+  // ding starts BEFORE the agent's pty session is registered → the
+  // first tick sees "target gone" → the daemon exits → being
+  // ephemeral, it never comes back. Fix: only trip the exit path
+  // AFTER we've seen the target alive at least once. Robust to any
+  // launch timing; no timeout needed (an operator who typo'd the
+  // session name will notice from other signals — hooks-loud, no
+  // delivered `[DING]`s, etc.).
+  //
+  // Once we've seen alive, revert to normal exit-when-gone
+  // behavior — a target that WAS alive but is now gone is a real
+  // "session ended" signal, not a race.
+  let seenTargetAlive = false;
+  // Bookkeeping to keep the "still waiting" log a single line, not
+  // a per-tick spam.
+  let loggedWaitingForTarget = false;
   function runSessionWatchTick(): void {
     let alive: boolean;
     try {
@@ -269,12 +287,30 @@ export async function runDing(deps: DingDeps): Promise<void> {
       log(`coord ding: session-alive check failed: ${errMsg(err)}\n`);
       return;
     }
-    if (!alive) {
-      log(
-        `coord ding: target session "${deps.ptySession}" is gone; exiting.\n`
-      );
-      internalAc.abort();
+    if (alive) {
+      seenTargetAlive = true;
+      return;
     }
+    // alive === false
+    if (!seenTargetAlive) {
+      // Startup grace: the target hasn't appeared yet. Log once so
+      // the operator sees the daemon is waiting (not dead), then
+      // stay silent until the target appears or we get an external
+      // signal.
+      if (!loggedWaitingForTarget) {
+        log(
+          `coord ding: target session "${deps.ptySession}" not yet ` +
+            `registered; waiting for it to appear before enabling the ` +
+            `exit-when-gone watch.\n`
+        );
+        loggedWaitingForTarget = true;
+      }
+      return;
+    }
+    log(
+      `coord ding: target session "${deps.ptySession}" is gone; exiting.\n`
+    );
+    internalAc.abort();
   }
   function startSessionWatch(): void {
     if (!exitWhenSessionGone) return;
