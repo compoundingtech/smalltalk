@@ -186,7 +186,7 @@ describe.skipIf(!HAS_PTY)('coord ding — end-to-end with a real pty session', (
       subject: 'deploy',
     }, 'how do we deploy?');
 
-    const screen = await waitForText('got: you have a new coord message', 12_000);
+    const screen = await waitForText('got: [DING] new smalltalk message', 12_000);
     expect(screen).toContain('deploy');
     expect(screen).toContain('alice');
   }, 30_000);
@@ -210,14 +210,14 @@ describe.skipIf(!HAS_PTY)('coord ding — end-to-end with a real pty session', (
     // least one status-tick.
     await new Promise((res) => setTimeout(res, 1000));
     const beforeFlip = ptyExec(['peek', '--plain', '--full', sessionName]).stdout;
-    expect(beforeFlip).not.toContain('you have a new coord message');
+    expect(beforeFlip).not.toContain('[DING] new smalltalk message');
 
     // Flip to available.
     spawnSync(COORD_BIN, ['status', 'bob', '--set', 'available'], {
       env: { ...process.env, COORD_ROOT: coordRoot },
     });
 
-    const screen = await waitForText('got: you have a new coord message', 8000);
+    const screen = await waitForText('got: [DING] new smalltalk message', 8000);
     expect(screen).toContain('urgent');
   }, 30_000);
 });

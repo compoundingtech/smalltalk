@@ -6,6 +6,47 @@ minor releases until 1.0.
 
 ## Unreleased
 
+### Changed (ding-delivered messages now prefixed with `[DING] ` + `smalltalk` naming)
+
+Two `st ding` delivery paths — the inbox-arrival notice and the
+tidy-check drift summary — now prepend `[DING] ` and refer to
+"smalltalk message" / "tidy-check" (not "coord message" / "coord
+tidy-check").
+
+Rationale (per Nathan):
+
+- The prefix marks the line as bus traffic, visually distinct
+  from three other things an agent might see in its terminal:
+  MCP `<channel source="…">` blocks (MCP path only), the agent's
+  own REPL output, or a human typing at the REPL.
+- The prefix lets a ding-mode agent's persona (and the upcoming
+  `DING-BUS.md` blurb) reference an unambiguous string pattern
+  in the poke-handling flow ("when you see `[DING] X`, do Y").
+- `smalltalk`/`st` naming aligns with the CLI (`st message …`)
+  the agent uses to act on the notification. `coord` in a
+  first-impression, user-visible line was a rename leftover.
+
+Concretely:
+
+- `you have a new coord message: <subject> (from <sender>);
+  check your inbox` → `[DING] new smalltalk message: <subject>
+  (from <sender>); check your inbox`
+- `coord tidy-check: inbox=<n> (oldest <age>).` →
+  `[DING] tidy-check: inbox=<n> (oldest <age>).`
+
+Test coverage:
+- Existing 8 assertion sites updated across `tests/unit/ding.test.ts`
+  and `tests/integration/ding.test.ts` to the new form.
+- New positive regression guards: `[DING] ` prefix required,
+  legacy `coord message` / `coord tidy-check` forms negated —
+  so a future refactor can't revert to the un-prefixed +
+  legacy-named form.
+
+Internal daemon log lines (`coord ding: pty send failed: …`,
+etc.) are unchanged — those are stderr for operators, not user-
+visible bus traffic. Cosmetic rename can happen alongside a
+broader daemon-log cleanup later.
+
 ### Fixed (`st launch` hooks-not-found is now LOUD instead of a silent soft-skip)
 
 Historic behavior: when `resolveClaudeHooksDir()` returned null

@@ -264,9 +264,17 @@ describe('runDing — status gating', () => {
     expect(sender.calls()).toHaveLength(1);
     expect(sender.calls()[0]!.sessionName).toBe('codex-foo');
     expect(sender.calls()[0]!.sequences).toEqual([
-      'you have a new coord message: hello (from alice); check your inbox',
+      '[DING] new smalltalk message: hello (from alice); check your inbox',
       'key:return',
     ]);
+    // Regression guards for the [DING] prefix marker + `smalltalk`
+    // naming (from Nathan). The prefix lets a ding-mode agent's
+    // persona/DING-BUS.md reference an unambiguous string pattern.
+    // The `smalltalk` naming aligns with the CLI (`st message …`)
+    // the agent uses to act on the notification.
+    expect(sender.calls()[0]!.sequences[0]).toMatch(/^\[DING\] /);
+    expect(sender.calls()[0]!.sequences[0]).toContain('smalltalk message');
+    expect(sender.calls()[0]!.sequences[0]).not.toContain('coord message');
     r.ac.abort();
     await r.done;
   });
@@ -659,8 +667,13 @@ describe('runDing — tidy-check tick', () => {
     const call = sender.calls()[0]!;
     expect(call.sessionName).toBe('codex-foo');
     expect(call.sequences[0]).toMatch(
-      /^coord tidy-check: inbox=1 \(oldest [0-9]+m\)\.$/
+      /^\[DING\] tidy-check: inbox=1 \(oldest [0-9]+m\)\.$/
     );
+    // Regression guard: the [DING] prefix marker is present, and
+    // the historic `coord tidy-check:` form is negated so a future
+    // refactor can't revert to it.
+    expect(call.sequences[0]).toMatch(/^\[DING\] /);
+    expect(call.sequences[0]).not.toContain('coord tidy-check');
     expect(call.sequences[1]).toBe('key:return');
     r.ac.abort();
     await r.done;
@@ -803,11 +816,11 @@ describe('runDing — tidy-check tick', () => {
     expect(sender.calls()).toHaveLength(2);
     const lines = sender.calls().map((c) => c.sequences[0]!);
     expect(
-      lines.some((l) => l.startsWith('coord tidy-check:'))
+      lines.some((l) => l.startsWith('[DING] tidy-check:'))
     ).toBe(true);
     expect(
       lines.some((l) =>
-        l.startsWith('you have a new coord message:')
+        l.startsWith('[DING] new smalltalk message:')
       )
     ).toBe(true);
     r.ac.abort();
@@ -1142,7 +1155,7 @@ describe('runDing — status refresh tick', () => {
 describe('buildPtySendArgs', () => {
   it('inbox-arrival shape: --with-delay 0.5 between session and --seq pairs', () => {
     const argv = buildPtySendArgs('codex-foo', [
-      'you have a new coord message: hi (from alice); check your inbox',
+      '[DING] new smalltalk message: hi (from alice); check your inbox',
       'key:return',
     ]);
     expect(argv).toEqual([
@@ -1151,7 +1164,7 @@ describe('buildPtySendArgs', () => {
       '--with-delay',
       '0.5',
       '--seq',
-      'you have a new coord message: hi (from alice); check your inbox',
+      '[DING] new smalltalk message: hi (from alice); check your inbox',
       '--seq',
       'key:return',
     ]);
@@ -1159,7 +1172,7 @@ describe('buildPtySendArgs', () => {
 
   it('tidy-check shape: same --with-delay + key:return tail', () => {
     const argv = buildPtySendArgs('vauban-codex', [
-      'coord tidy-check: inbox=3 (oldest 47m).',
+      '[DING] tidy-check: inbox=3 (oldest 47m).',
       'key:return',
     ]);
     expect(argv).toEqual([
@@ -1168,7 +1181,7 @@ describe('buildPtySendArgs', () => {
       '--with-delay',
       '0.5',
       '--seq',
-      'coord tidy-check: inbox=3 (oldest 47m).',
+      '[DING] tidy-check: inbox=3 (oldest 47m).',
       '--seq',
       'key:return',
     ]);
