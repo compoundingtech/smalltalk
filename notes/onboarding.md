@@ -91,14 +91,24 @@ repo. Order: make the folder, `git init`, then launch.
 ```sh
 mkdir ~/src/github.com/<you>/cos && cd ~/src/github.com/<you>/cos
 git init
-st launch claude --identity cos \
+st launch claude --identity cos --permanent \
   --persona ~/src/github.com/myobie/personas/chief-of-staff.md
 ```
 
-**The `--persona` flag is load-bearing.** Without it, `st launch`
-spawns a bare Claude that has no idea it's a CoS — no first-run
-interview, no personas awareness, no self-become. With
-`--persona`, `st launch`:
+**Both `--persona` and `--permanent` are load-bearing.** Without
+`--persona`, `st launch` spawns a bare Claude that has no idea
+it's a CoS. Without `--permanent`, the generated `pty.toml` omits
+`strategy = "permanent"` on the agent session — pty treats it as
+ephemeral, and `pty gc` may reap your CoS under idle-cleanup. A
+CoS is your always-on center; you want it durable across restarts
+and cleanup passes.
+
+`st launch` warns to stderr if you launch a CoS-shaped identity
+(`--identity cos` or a chief-of-staff persona) without
+`--permanent` — that's the reap-able-CoS footgun-guard. Same
+warning fires on re-launch / resume.
+
+With `--persona`, `st launch`:
 
 - Copies `chief-of-staff.md` to `<cos-repo>/PERSONA.md`.
 - Creates `CLAUDE.md` in the cwd (or edits an existing one) with a
@@ -111,12 +121,12 @@ If your `claude` binary is aliased (`cl1`, `cl2`, etc.), pass it
 explicitly:
 
 ```sh
-st launch claude --identity cos \
+st launch claude --identity cos --permanent \
   --persona ~/src/github.com/myobie/personas/chief-of-staff.md \
   --agent cl1
 ```
 
-What `st launch` does for you (with the persona):
+What `st launch` does for you (with `--persona` + `--permanent`):
 
 - Registers the `cos` identity in `$ST_ROOT/cos/{inbox,archive}` and
   writes `available` to its status file.
@@ -127,8 +137,10 @@ What `st launch` does for you (with the persona):
   PATH drift.
 - Installs the CoS persona (copies `chief-of-staff.md` to
   `PERSONA.md`, wires it into `CLAUDE.md`).
-- Generates a `pty.toml` so the CoS runs under `pty up` supervision
-  if you've installed the pty tool.
+- Generates a `pty.toml` marking BOTH the agent session AND its
+  ding sidecar with `strategy = "permanent"` so `pty up` /
+  `pty gc` treats the CoS as durable — pty resurrects it if its
+  daemon dies, and idle-cleanup won't reap it.
 - Boots Claude Code with `--resume` semantics tied to the session id
   it just recorded.
 
@@ -217,11 +229,13 @@ Cold-start recipes to keep handy:
 - **See what your CoS is thinking about:** `st context read cos`
 - **Cross-tree overview of everyone:** `st overview`
 - **Resume a suspended CoS session:** `cd` back into the cos repo
-  and rerun the same launch command (including `--persona`) — the
-  session id in `.claude-session-id` is what makes it a resume, not
-  a fresh start. Re-passing `--persona` is safe: `PERSONA.md` gets
-  overwritten with the same bytes, and the `@PERSONA.md` line in
-  `CLAUDE.md` is idempotent.
+  and rerun the same launch command (including `--persona` and
+  `--permanent`) — the session id in `.claude-session-id` is what
+  makes it a resume, not a fresh start. Re-passing `--persona` is
+  safe: `PERSONA.md` gets overwritten with the same bytes, and the
+  `@PERSONA.md` line in `CLAUDE.md` is idempotent. `--permanent`
+  re-writes the same tag into `pty.toml` (or leaves it as-is if
+  the file already exists).
 
 ## Bus basics — hand-wiring an identity
 
@@ -363,3 +377,13 @@ st sync pull --all
   personas repo was cloned in step 1 (`ls
   ~/src/github.com/myobie/personas/chief-of-staff.md`). If you
   cloned it elsewhere, use that absolute path in `--persona`.
+- **`st launch` warns "launching a CoS without --permanent":** you
+  omitted `--permanent` from the launch command. A CoS is your
+  always-on center — without the flag, the generated `pty.toml`
+  doesn't tag the session as permanent, so `pty gc` may reap it
+  under idle-cleanup. Re-run the launch WITH `--permanent`; the
+  regenerated `pty.toml` will carry `strategy = "permanent"`.
+- **CoS disappeared from `pty ls` overnight:** likely the
+  reap-able-CoS failure — the launch was missing `--permanent`.
+  Delete `pty.toml`, re-run the launch with `--permanent`, and
+  `pty up` will bring it back with the correct tag baked in.

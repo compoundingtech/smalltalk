@@ -6,6 +6,59 @@ minor releases until 1.0.
 
 ## Unreleased
 
+### Added (`st launch --permanent` for durable CoS-shaped launches + footgun-guard)
+
+Closes the CoS-permanence gap the previous PR (ephemeral-ding fix)
+surfaced: `st launch claude --identity cos` produced an agent with
+`tags = { role = "agent" }` — no strategy tag — which pty treats
+as its ephemeral default. `pty gc` would reap the CoS along with
+any idle session. That's a silent, non-obvious failure mode for
+the always-on center a newcomer just followed the onboarding docs
+to stand up.
+
+Fix:
+
+- **`--permanent` CLI flag on `st launch`.** Sets
+  `agentStrategy = "permanent"` on the buildPtyToml call, which
+  the previous PR's future-proofing hook plumbs into BOTH the
+  agent session AND (for codex) the ding sidecar. A launch is
+  either permanent or it isn't; no mixed-strategy pty.toml. pty
+  sees `strategy = "permanent"` and treats the session as
+  durable (see `../pty/src/sessions.ts:576, 620, 644`).
+
+- **Footgun-guard warning.** When a CoS-shaped launch omits
+  `--permanent`, stderr gets:
+
+  ```
+  [smalltalk launch] launching a CoS without --permanent; pty gc
+  may reap it under idle-cleanup. If this is a production CoS
+  (not an eval/test spin-up), pass --permanent so the launch
+  bakes strategy = "permanent" into pty.toml.
+  ```
+
+  Detection is narrow: `identity === 'cos'` OR the persona
+  basename is `chief-of-staff.md`. Ephemeral eval launches,
+  workers, specialists get no warning.
+
+- **`LaunchResult.permanent: boolean`** for observability; new
+  `permanent:     yes|no` line in the `--dry-run` summary.
+
+- **`notes/onboarding.md` updated.** CoS launch command in
+  step 2 now includes `--permanent`. Resume recipe includes
+  `--permanent`. Troubleshooting entries added for the warning
+  and the reap-able-CoS failure mode.
+
+- **`LAUNCH_HELP`** documents the flag; a new example line
+  demonstrates the full production-CoS invocation
+  (`--identity cos --permanent --persona chief-of-staff.md`).
+
+9 new unit tests cover: default no-tag/no-strategy, --permanent on
+agent, --permanent on codex matches ding (invariant guard), CoS
+footgun-guard by identity, CoS footgun-guard by persona basename,
+--permanent silences the warning, non-CoS identity gets no
+warning, CLI --permanent threads into dry-run summary, CLI
+default reports `permanent: no`.
+
 ### Fixed (`st launch codex` no longer bakes `strategy = "permanent"` on the ding sidecar)
 
 Historic behavior: `buildPtyToml` hardcoded
