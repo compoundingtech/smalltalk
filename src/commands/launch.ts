@@ -1151,15 +1151,41 @@ export async function cmdLaunch(
     ST_AGENT: identity,
   };
   if (usedPty && ptyPath !== null) {
-    // pty picks the sessions up from pty.toml. Exec pty up + wait.
-    const child = spawn(ptyPath, ['up'], {
-      stdio: 'inherit',
-      env: spawnEnv,
-      cwd,
-    });
-    await new Promise<void>((resolvePromise) => {
-      child.on('exit', () => resolvePromise());
-    });
+    // pty picks the sessions up from pty.toml.
+    //
+    // Attended launches inherit stdio + wait for exit so the operator
+    // gets pty up's interactive UI (attach, "ctrl+b to run in
+    // background", etc). Unattended launches — CoS spawning a
+    // specialist under `spawn()` — background pty up instead:
+    // detached, stdio ignored, `unref`'d so the parent st launch
+    // process returns immediately. Without this, `pty up` blocks
+    // ~47s+ waiting on its interactive attach, and a CoS caller
+    // reads that as a hang.
+    //
+    // F4: auto-detect unattended via `stdinIsTty()` false (mirrors
+    // F1's --unattended resolution). Callers passing --attended or
+    // running with a real TTY keep the current inherit-and-wait
+    // behavior.
+    const spawnUnattended =
+      ctx.stdinIsTty !== undefined && ctx.stdinIsTty() === false;
+    if (spawnUnattended) {
+      const child = spawn(ptyPath, ['up'], {
+        detached: true,
+        stdio: 'ignore',
+        env: spawnEnv,
+        cwd,
+      });
+      child.unref();
+    } else {
+      const child = spawn(ptyPath, ['up'], {
+        stdio: 'inherit',
+        env: spawnEnv,
+        cwd,
+      });
+      await new Promise<void>((resolvePromise) => {
+        child.on('exit', () => resolvePromise());
+      });
+    }
   } else {
     // Direct spawn of the harness. `stdio: inherit` gives the user
     // the terminal.
