@@ -6,6 +6,57 @@ minor releases until 1.0.
 
 ## Unreleased
 
+### Fixed (CRITICAL — `st ding` startup grace: sidecar no longer dies on the launch race)
+
+evals-claude's live ding-mode run caught a critical defect that
+was blocking Johannes's CoS AND the whole eval suite's
+ding-mode: the `st ding` sidecar was dying at launch, never
+delivering a single `[DING]` poke, and — being ephemeral (per
+the #54 fix) — never restarting. Ding-mode agents booted, found
+empty inboxes, and idled forever ("watching for the [DING]"
+while delegations sat unread).
+
+Root cause: the session-watch tick's default `--exit-when-
+session-gone` behavior fired on the FIRST tick, which typically
+races AHEAD of pty's registration of the target agent session.
+The tick saw "target gone" → aborted → daemon exited.
+
+Fix (cos-approved semantic): **startup grace** — only trip the
+exit-when-gone path AFTER the ding has seen the target alive at
+least once. A not-yet-appeared target is treated as "still
+launching", not "gone", and doesn't trigger exit.
+
+- New internal `seenTargetAlive` flag on `runSessionWatchTick`,
+  false at daemon start. Flips to true on the first `alive ===
+  true` observation. The exit branch is now gated on both `alive
+  === false` AND `seenTargetAlive === true`.
+- Startup-grace log line ("target session … not yet registered;
+  waiting for it to appear before enabling the exit-when-gone
+  watch") fires ONCE, gated by a `loggedWaitingForTarget` flag —
+  no per-tick spam.
+- Once the grace is cleared (target became alive), the exit path
+  works as before — a REAL "session ended" transition still
+  aborts. The grace is a startup shield, not a persistent one.
+
+Test coverage:
+- **Startup-grace test**: session is dead from launch → daemon
+  waits, does NOT exit. Regression guard on both the log
+  (waiting-line fires exactly once, no per-tick spam) and the
+  daemon lifecycle (`r.done` has not resolved after several
+  ticks).
+- **Grace-clears test**: dead → alive → dead still exits — proves
+  the grace is transient and doesn't mask real session-ended
+  signals.
+- Existing 4 session-watch tests still pass unchanged (the
+  "session goes away" case uses a scenario where alive=true is
+  observed BEFORE flipping to false, so the grace clears
+  correctly).
+
+No API changes. No new flags. Behavior automatic for every
+`st ding` daemon.
+
+Johannes-blocking; unblocks ding-mode delivery end-to-end.
+
 ### Added (`st launch --ding` installs `DING-BUS.md` — bus-mechanics contract for ding-mode agents)
 
 Final step of the Johannes stack. Ding-mode agents have no MCP
