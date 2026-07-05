@@ -544,6 +544,135 @@ describe('cmdLaunch — pty.toml generation', () => {
   });
 });
 
+// ─── F1: --unattended auto-poker ──────────────────────────────────────
+
+describe('cmdLaunch — --unattended auto-poker (F1)', () => {
+  // The poker prepends a background subshell that pty-sends 4 Enter
+  // keys with 4s spacing before exec'ing the main claude command,
+  // so Claude Code's first-launch TUI gates (workspace trust,
+  // dev-channels warning, resume-mode dialog) all get an Enter each
+  // hands-off. See notes/agent-onboarding.md:126-133 for the dialogs
+  // this closes.
+
+  it('default (no flag, no stdinIsTty) → poker NOT baked', async () => {
+    const r = await cmdLaunch(
+      baseInput({ harness: 'claude', identity: 'alice' }),
+      ctx
+    );
+    expect(r.unattended).toBe(false);
+    expect(r.ptyTomlPreview).not.toContain('pty send');
+    expect(r.ptyTomlPreview).not.toContain('sleep 4');
+  });
+
+  it('unattended: true → poker baked, targets `<identity>/<sessionName>`', async () => {
+    const r = await cmdLaunch(
+      baseInput({ harness: 'claude', identity: 'alice', unattended: true }),
+      ctx
+    );
+    expect(r.unattended).toBe(true);
+    // 4 pokes with 4s spacing each — see poker shape in launch.ts.
+    expect(r.ptyTomlPreview).toContain(
+      'sleep 4 && pty send alice/claude --seq key:return'
+    );
+    // Backgrounded subshell + `exec` for the main command.
+    expect(r.ptyTomlPreview).toMatch(/\)\s*&\s*exec/);
+  });
+
+  it('poker respects a custom --session-name', async () => {
+    const r = await cmdLaunch(
+      baseInput({
+        harness: 'claude',
+        identity: 'taskflow-dev',
+        sessionName: 'primary',
+        unattended: true,
+      }),
+      ctx
+    );
+    expect(r.ptyTomlPreview).toContain(
+      'pty send taskflow-dev/primary --seq key:return'
+    );
+  });
+
+  it('auto-on when stdinIsTty() reports false', async () => {
+    const stdinTtyCtx: CliContext = {
+      ...ctx,
+      stdinIsTty: () => false,
+    };
+    const r = await cmdLaunch(
+      baseInput({ harness: 'claude', identity: 'alice' }),
+      stdinTtyCtx
+    );
+    expect(r.unattended).toBe(true);
+    expect(r.ptyTomlPreview).toContain('pty send alice/claude');
+  });
+
+  it('stays attended when stdinIsTty() reports true', async () => {
+    const stdinTtyCtx: CliContext = {
+      ...ctx,
+      stdinIsTty: () => true,
+    };
+    const r = await cmdLaunch(
+      baseInput({ harness: 'claude', identity: 'alice' }),
+      stdinTtyCtx
+    );
+    expect(r.unattended).toBe(false);
+    expect(r.ptyTomlPreview).not.toContain('pty send');
+  });
+
+  it('explicit unattended: false overrides auto-on-no-TTY (--attended escape hatch)', async () => {
+    const stdinTtyCtx: CliContext = {
+      ...ctx,
+      stdinIsTty: () => false,
+    };
+    const r = await cmdLaunch(
+      baseInput({
+        harness: 'claude',
+        identity: 'alice',
+        unattended: false,
+      }),
+      stdinTtyCtx
+    );
+    expect(r.unattended).toBe(false);
+    expect(r.ptyTomlPreview).not.toContain('pty send');
+  });
+
+  it('codex harness is NEVER poked, even with unattended: true', async () => {
+    // Codex has no dev-channels flag and its resume-mode UX is
+    // different. The poker is Claude-Code-specific.
+    const r = await cmdLaunch(
+      baseInput({ harness: 'codex', identity: 'alice', unattended: true }),
+      ctx
+    );
+    // LaunchResult still reflects the caller's intent for observability.
+    expect(r.unattended).toBe(true);
+    // But the pty.toml command line is untouched.
+    expect(r.ptyTomlPreview).not.toContain('pty send');
+    expect(r.ptyTomlPreview).not.toContain('sleep 4');
+  });
+
+  it('CLI --unattended flag threads through', async () => {
+    const { cmdLaunchCli } = await import('../../src/commands/launch.ts');
+    await cmdLaunchCli(
+      ['claude', '--identity', 'alice', '--unattended', '--dry-run'],
+      ctx
+    );
+    expect(stdoutBuf).toContain('unattended:     yes');
+  });
+
+  it('CLI --attended overrides an auto-on-no-TTY resolution', async () => {
+    const stdinTtyCtx: CliContext = {
+      ...ctx,
+      stdinIsTty: () => false,
+    };
+    const { cmdLaunchCli } = await import('../../src/commands/launch.ts');
+    await cmdLaunchCli(
+      ['claude', '--identity', 'alice', '--attended', '--dry-run'],
+      stdinTtyCtx
+    );
+    expect(stdoutBuf).toContain('unattended:     no');
+  });
+});
+
 // ─── pty detection + write behavior ────────────────────────────────────
 
 describe('cmdLaunch — pty detection', () => {

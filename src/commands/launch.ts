@@ -65,6 +65,22 @@ export interface LaunchInput {
   noChannel?: boolean | undefined;
   /** Override the pty session name (default: harness name). */
   sessionName?: string | undefined;
+  /**
+   * When true, prepend a startup auto-poker to the pty session
+   * command so Claude Code's first-launch TUI gates (workspace trust,
+   * `--dangerously-load-development-channels` warning, optional
+   * resume-mode dialog) get an Enter each without a human at the
+   * REPL. The poker `pty send`s Enter 4 times with 4s spacing, so
+   * extra pokes past the last real dialog just fire empty prompts —
+   * no-ops. Only applies when both `harness === 'claude'` and the
+   * pty registration succeeds. Ignored for codex (no dev-channels
+   * gate) and for `--no-pty` (nothing to send to).
+   *
+   * Resolution at the CLI level: `--unattended` flag wins; when
+   * unset, auto-on when `stdinIsTty` reports non-TTY (a CoS spawning
+   * a specialist via `spawn` gets this for free with no flag).
+   */
+  unattended?: boolean | undefined;
   /** When true, print what would happen; touch nothing on disk / no
    *  process spawn. */
   dryRun?: boolean | undefined;
@@ -194,6 +210,13 @@ export interface LaunchResult {
    * `'claude'` when no `--agent` flag / `$AGENT` env is set.
    */
   agentBinary: string;
+  /**
+   * True when the auto-poker got baked into the pty session command.
+   * Populated regardless of whether pty was actually resolved (a
+   * captureOnly / dry-run launch reports it consistently) so callers
+   * can log whether hands-off standup was in force.
+   */
+  unattended: boolean;
   /**
    * brief-118: absolute path to `.claude/settings.local.json` when the
    * launch generated (or would have generated) one. Non-null only for
@@ -380,17 +403,48 @@ function tomlEscape(s: string): string {
   return s.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
 }
 
+/**
+ * Startup auto-poker for unattended claude launches. Wraps a shell
+ * command with a background subshell that `pty send`s Enter 4 times
+ * with 4s spacing, then `exec`s the main command. The pokes clear
+ * Claude Code's first-launch TUI gates in order (workspace trust,
+ * dev-channels warning, optional resume-mode dialog); extras past
+ * the last gate hit the model prompt as empty submissions — no-ops.
+ *
+ * Target is the fully-qualified pty session name
+ * (`<identity>/<sessionName>`) so pty's routing is unambiguous
+ * regardless of caller scope. The `pty` binary is expected to be on
+ * PATH — it always is when pty spawned the session in the first
+ * place. If pty fell off PATH mid-session, the pokes emit stderr
+ * errors and the shell keeps going; the main claude exec is
+ * unaffected.
+ */
+function pokerPrefix(fqn: string): string {
+  const target = shellQuote(fqn);
+  const oneShot = `sleep 4 && pty send ${target} --seq key:return`;
+  return `(${oneShot}; ${oneShot}; ${oneShot}; ${oneShot}) &`;
+}
+
 function buildPtyToml(opts: {
   harness: Harness;
   sessionName: string;
   identity: string;
   invocation: readonly string[];
   addDingSidecar: boolean;
+  unattended: boolean;
 }): string {
   // pty runs `command` via `sh -c`, so produce a shell command line by
   // space-joining shell-quoted argv elements. Then TOML-quote the
   // whole thing for the `command = "..."` value.
-  const shellLine = opts.invocation.map(shellQuote).join(' ');
+  const rawShellLine = opts.invocation.map(shellQuote).join(' ');
+  // Only claude has the first-launch TUI gates; codex doesn't. The
+  // poker also only makes sense under pty (nothing to `pty send` to
+  // otherwise). buildPtyToml is only called on the pty path, so the
+  // second condition is trivially met here.
+  const shellLine =
+    opts.unattended && opts.harness === 'claude'
+      ? `${pokerPrefix(`${opts.identity}/${opts.sessionName}`)} exec ${rawShellLine}`
+      : rawShellLine;
   // Prefix is the identity — pty namespace is global and repo
   // basenames can collide (`taskflow` in two different clones both
   // trying to be `taskflow/claude`). Identity is unique per agent by
@@ -931,6 +985,16 @@ export async function cmdLaunch(
   const ptyPath = input.noPty === true ? null : detectPtyPath(input.ptyBinPath);
   const usedPty = ptyPath !== null;
   const sessionName = input.sessionName ?? harness;
+  // F1: resolve unattended mode. Explicit `--unattended` (input.
+  // unattended === true) wins. Otherwise auto-on when the caller's
+  // stdin is definitively not a TTY — a CoS shelling out via
+  // spawn() reports stdinIsTty()=false and gets hands-off standup
+  // for free. When stdinIsTty is absent (older CliContext callers,
+  // early tests) we can't tell → default to attended.
+  const stdinNotTty =
+    ctx.stdinIsTty !== undefined && ctx.stdinIsTty() === false;
+  const unattended =
+    input.unattended === true || (input.unattended === undefined && stdinNotTty);
   const ptyTomlPath = join(cwd, 'pty.toml');
   let ptyTomlPreview: string | null = null;
   if (usedPty) {
@@ -940,6 +1004,7 @@ export async function cmdLaunch(
       identity,
       invocation: argv,
       addDingSidecar: harness === 'codex',
+      unattended,
     });
     ptyTomlPreview = preview;
     if (!input.dryRun && !existsSync(ptyTomlPath)) {
@@ -955,6 +1020,7 @@ export async function cmdLaunch(
       identity,
       invocation: argv,
       addDingSidecar: harness === 'codex',
+      unattended,
     });
   }
 
@@ -1035,6 +1101,7 @@ export async function cmdLaunch(
       ptyTomlPreview,
       permissionMode,
       agentBinary,
+      unattended,
       claudeSettingsPath,
       claudeSettingsPreview,
       persona: personaResult,
@@ -1106,6 +1173,7 @@ export async function cmdLaunch(
     ptyTomlPreview,
     permissionMode,
     agentBinary,
+    unattended,
     claudeSettingsPath,
     claudeSettingsPreview,
     persona: personaResult,
@@ -1152,6 +1220,18 @@ const LAUNCH_HELP =
   '                          (e.g. `cl1`, `cl2`, `claude-preview`).\n' +
   '                          Precedence: this flag > $AGENT env > `claude`.\n' +
   '                          Codex launches ignore this (its own launcher).\n' +
+  '  --unattended            Bake a startup auto-poker into the pty session\n' +
+  '                          command so Claude Code\'s first-launch TUI\n' +
+  '                          gates (workspace trust, --dangerously-load-\n' +
+  '                          development-channels warning, resume-mode\n' +
+  '                          dialog) each receive an Enter without a human\n' +
+  '                          at the REPL. Auto-on when stdin is not a TTY\n' +
+  '                          (a CoS spawning a specialist via `spawn` gets\n' +
+  '                          it for free). Only affects the claude harness\n' +
+  '                          + pty path; codex and --no-pty are unaffected.\n' +
+  '  --attended              Force attended even when stdin is not a TTY —\n' +
+  '                          escape hatch for headless debug runs that want\n' +
+  '                          the human-driven dialog experience.\n' +
   '  --dry-run               Print what would happen; touch nothing.\n' +
   '  --print                 Alias for --dry-run.\n\n' +
   '  Examples:\n' +
@@ -1177,6 +1257,7 @@ export async function cmdLaunchCli(
   let permissionMode: string | undefined;
   let persona: string | undefined;
   let agentBinary: string | undefined;
+  let unattendedFlag: boolean | undefined;
   let dryRun = false;
   for (let i = 0; i < args.length; i++) {
     const a = args[i]!;
@@ -1211,6 +1292,15 @@ export async function cmdLaunchCli(
         break;
       case '--agent':
         agentBinary = args[++i];
+        break;
+      case '--unattended':
+        unattendedFlag = true;
+        break;
+      case '--attended':
+        // Escape hatch: force attended even when stdin isn't a TTY
+        // (e.g. a headless CI test run that still wants the human-
+        // driven dialog experience for debugging).
+        unattendedFlag = false;
         break;
       case '--dry-run':
       case '--print':
@@ -1247,6 +1337,7 @@ export async function cmdLaunchCli(
       ...(permissionMode !== undefined && { permissionMode }),
       ...(persona !== undefined && { persona }),
       ...(agentBinary !== undefined && { agentBinary }),
+      ...(unattendedFlag !== undefined && { unattended: unattendedFlag }),
       dryRun,
       env: ctx.env,
       coordRoot: ctx.coordRoot,
@@ -1269,6 +1360,7 @@ export async function cmdLaunchCli(
     // launches).
     ctx.stdout(`permission-mode: ${r.permissionMode}\n`);
     ctx.stdout(`agent binary:   ${r.agentBinary}\n`);
+    ctx.stdout(`unattended:     ${r.unattended ? 'yes' : 'no'}\n`);
     ctx.stdout(`mcp.json:       ${r.mcpJsonPath}\n`);
     if (r.claudeSessionIdPath !== null) {
       ctx.stdout(`session id:     ${r.claudeSessionIdPath}\n`);
