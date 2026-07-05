@@ -6,6 +6,15 @@ minor releases until 1.0.
 
 ## Unreleased
 
+### Docs (onboarding.md: fill in the `bin/st-evals readiness` invocation)
+
+st-evals published at https://github.com/myobie/st-evals — a
+capability-gated hermetic smoke suite. Onboarding step 4's
+readiness placeholder now names the real invocation
+(`bin/st-evals readiness`, run from the cloned st-evals repo root),
+plus the two auxiliary probes (`preflight`, `list`) and the
+`PERSONAS_DIR` / `bin/ensure-personas.sh` hook for offline mirroring.
+
 ### Docs (onboarding.md rewrite — leads with the CoS quickstart)
 
 Full rewrite of `notes/onboarding.md`. Previously walked a
