@@ -644,6 +644,127 @@ describe('cmdLaunch — pty.toml generation', () => {
 
 // ─── F1: --unattended auto-poker ──────────────────────────────────────
 
+describe('cmdLaunch — --permanent + CoS-shaped footgun-guard', () => {
+  // --permanent bakes `strategy = "permanent"` into BOTH the agent
+  // session AND the ding sidecar (codex) tags so the launch survives
+  // `pty gc`'s idle-cleanup. Required for a production CoS. The
+  // footgun-guard warns to stderr when a CoS-shaped launch omits
+  // the flag — silently-reap-able CoS is a nasty non-obvious failure
+  // for a newcomer following the docs.
+
+  it('default (no --permanent) → no strategy tag anywhere; not permanent', async () => {
+    const r = await cmdLaunch(
+      baseInput({ harness: 'claude', identity: 'alice' }),
+      ctx
+    );
+    expect(r.permanent).toBe(false);
+    expect(r.ptyTomlPreview).toContain('tags = { role = "agent" }');
+    expect(r.ptyTomlPreview).not.toContain('strategy = "permanent"');
+  });
+
+  it('--permanent → agent gets strategy = "permanent"', async () => {
+    const r = await cmdLaunch(
+      baseInput({
+        harness: 'claude',
+        identity: 'alice',
+        permanent: true,
+      }),
+      ctx
+    );
+    expect(r.permanent).toBe(true);
+    expect(r.ptyTomlPreview).toContain(
+      'tags = { role = "agent", strategy = "permanent" }'
+    );
+  });
+
+  it('--permanent on codex → BOTH agent AND ding get strategy = "permanent" (matched pair)', async () => {
+    // Invariant: a launch is either permanent or it isn't. No mixed
+    // pty.toml. If we ever ship a permanent agent + ephemeral ding
+    // (or vice-versa), the ding fix from the previous PR would have
+    // been a regression — this test guards.
+    const r = await cmdLaunch(
+      baseInput({
+        harness: 'codex',
+        identity: 'alice',
+        permanent: true,
+      }),
+      ctx
+    );
+    expect(r.ptyTomlPreview).toContain(
+      'tags = { role = "agent", strategy = "permanent" }'
+    );
+    expect(r.ptyTomlPreview).toContain(
+      'tags = { role = "ding", strategy = "permanent" }'
+    );
+  });
+
+  it('footgun-guard: identity `cos` + no --permanent → stderr warning', async () => {
+    await cmdLaunch(
+      baseInput({ harness: 'claude', identity: 'cos' }),
+      ctx
+    );
+    expect(stderrBuf).toContain('launching a CoS without --permanent');
+    expect(stderrBuf).toContain('pty gc may reap it');
+  });
+
+  it('footgun-guard: chief-of-staff.md persona + no --permanent → stderr warning', async () => {
+    // Even with a non-`cos` identity, the persona basename is the
+    // signal. Covers the case where someone launched with
+    // `--identity my-cos --persona chief-of-staff.md`.
+    const personaFile = join(scratch, 'chief-of-staff.md');
+    writeFileSync(personaFile, '# fake CoS persona\n');
+    await cmdLaunch(
+      baseInput({
+        harness: 'claude',
+        identity: 'my-cos',
+        persona: personaFile,
+      }),
+      ctx
+    );
+    expect(stderrBuf).toContain('launching a CoS without --permanent');
+  });
+
+  it('footgun-guard: --permanent silences the warning for CoS-shaped launches', async () => {
+    await cmdLaunch(
+      baseInput({
+        harness: 'claude',
+        identity: 'cos',
+        permanent: true,
+      }),
+      ctx
+    );
+    expect(stderrBuf).not.toContain('launching a CoS without --permanent');
+  });
+
+  it('footgun-guard: non-CoS identity + no --permanent → NO warning', async () => {
+    // Ephemeral eval launches, workers, specialists, etc. must not
+    // get the warning — they're intentionally ephemeral.
+    await cmdLaunch(
+      baseInput({ harness: 'claude', identity: 'taskflow-worker' }),
+      ctx
+    );
+    expect(stderrBuf).not.toContain('launching a CoS without --permanent');
+  });
+
+  it('CLI --permanent threads through + shows in dry-run summary', async () => {
+    const { cmdLaunchCli } = await import('../../src/commands/launch.ts');
+    await cmdLaunchCli(
+      ['claude', '--identity', 'cos', '--permanent', '--dry-run'],
+      ctx
+    );
+    expect(stdoutBuf).toContain('permanent:      yes');
+  });
+
+  it('CLI default (no --permanent) → dry-run summary reports no', async () => {
+    const { cmdLaunchCli } = await import('../../src/commands/launch.ts');
+    await cmdLaunchCli(
+      ['claude', '--identity', 'alice', '--dry-run'],
+      ctx
+    );
+    expect(stdoutBuf).toContain('permanent:      no');
+  });
+});
+
 describe('cmdLaunch — --unattended auto-poker (F1)', () => {
   // The poker prepends a background subshell that pty-sends 4 Enter
   // keys with 4s spacing before exec'ing the main claude command,

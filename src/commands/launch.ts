@@ -81,6 +81,27 @@ export interface LaunchInput {
    * a specialist via `spawn` gets this for free with no flag).
    */
   unattended?: boolean | undefined;
+  /**
+   * When true, mark BOTH the agent session AND (for codex) the ding
+   * sidecar with `strategy = "permanent"` in the generated pty.toml
+   * so pty resurrects them if their daemons die and `pty gc`
+   * doesn't reap them under idle-cleanup. Load-bearing for a
+   * production CoS (or any always-on agent) that must survive
+   * across restarts and cleanup passes.
+   *
+   * When false / unset (default), the launch is ephemeral: agent
+   * and ding both carry no `strategy` tag, and pty treats them as
+   * its ephemeral default (see `../pty/src/sessions.ts:576, 620,
+   * 644`). Matches the historic bare-agent shape + the ding fix
+   * that just landed in the previous PR.
+   *
+   * A CoS-shaped launch that OMITS this flag (via `--identity cos`
+   * or a chief-of-staff persona) triggers a stderr warning
+   * ("launching a CoS without --permanent; pty gc may reap it"),
+   * because a silently-reap-able CoS is a nasty non-obvious
+   * failure for a newcomer following the onboarding docs.
+   */
+  permanent?: boolean | undefined;
   /** When true, print what would happen; touch nothing on disk / no
    *  process spawn. */
   dryRun?: boolean | undefined;
@@ -217,6 +238,15 @@ export interface LaunchResult {
    * can log whether hands-off standup was in force.
    */
   unattended: boolean;
+  /**
+   * True when the launch was marked permanent (--permanent flag).
+   * Both the agent session AND the ding sidecar (codex) got
+   * `strategy = "permanent"` in the generated pty.toml. False for
+   * the default ephemeral launch. Populated regardless of pty
+   * availability so dry-run summaries surface the resolution
+   * consistently.
+   */
+  permanent: boolean;
   /**
    * brief-118: absolute path to `.claude/settings.local.json` when the
    * launch generated (or would have generated) one. Non-null only for
@@ -1098,6 +1128,37 @@ export async function cmdLaunch(
     input.env.ST_ROOT !== undefined || input.env.COORD_ROOT !== undefined
       ? input.coordRoot
       : undefined;
+  // --permanent: plumbs through the buildPtyToml `agentStrategy?`
+  // future-proof hook that landed with the ding fix. When set,
+  // BOTH the agent session AND the ding sidecar get `strategy =
+  // "permanent"` — a launch is either ephemeral or it isn't; no
+  // mixed-strategy pty.toml.
+  const permanent = input.permanent === true;
+  const agentStrategy: string | undefined = permanent
+    ? 'permanent'
+    : undefined;
+  // Footgun-guard: a silently-reap-able CoS is a nasty non-obvious
+  // failure for a newcomer following the onboarding docs. When a
+  // CoS-shaped launch (identity 'cos' OR a persona whose basename
+  // is chief-of-staff.md) omits --permanent, warn to stderr.
+  // Detection stays narrow so we don't spam the eval-cell launches
+  // that legitimately want ephemeral CoS-lookalikes.
+  if (!permanent) {
+    const personaBasename =
+      input.persona !== undefined
+        ? input.persona.split('/').pop()?.split('\\').pop() ?? ''
+        : '';
+    const cosShaped =
+      identity === 'cos' || personaBasename === 'chief-of-staff.md';
+    if (cosShaped) {
+      ctx.stderr(
+        `[smalltalk launch] launching a CoS without --permanent; pty gc ` +
+          `may reap it under idle-cleanup. If this is a production CoS ` +
+          `(not an eval/test spin-up), pass --permanent so the launch ` +
+          `bakes strategy = "permanent" into pty.toml.\n`
+      );
+    }
+  }
   const ptyTomlPath = join(cwd, 'pty.toml');
   let ptyTomlPreview: string | null = null;
   if (usedPty) {
@@ -1109,10 +1170,7 @@ export async function cmdLaunch(
       addDingSidecar: harness === 'codex',
       unattended,
       stRoot: stRootForSession,
-      // No st launch flag exposes this yet — always undefined,
-      // matching pty's ephemeral default. Future --permanent (for
-      // production CoS) or similar will plumb through here.
-      agentStrategy: undefined,
+      agentStrategy,
     });
     ptyTomlPreview = preview;
     if (!input.dryRun && !existsSync(ptyTomlPath)) {
@@ -1130,10 +1188,7 @@ export async function cmdLaunch(
       addDingSidecar: harness === 'codex',
       unattended,
       stRoot: stRootForSession,
-      // No st launch flag exposes this yet — always undefined,
-      // matching pty's ephemeral default. Future --permanent (for
-      // production CoS) or similar will plumb through here.
-      agentStrategy: undefined,
+      agentStrategy,
     });
   }
 
@@ -1215,6 +1270,7 @@ export async function cmdLaunch(
       permissionMode,
       agentBinary,
       unattended,
+      permanent,
       claudeSettingsPath,
       claudeSettingsPreview,
       persona: personaResult,
@@ -1313,6 +1369,7 @@ export async function cmdLaunch(
     permissionMode,
     agentBinary,
     unattended,
+    permanent,
     claudeSettingsPath,
     claudeSettingsPreview,
     persona: personaResult,
@@ -1371,11 +1428,23 @@ const LAUNCH_HELP =
   '  --attended              Force attended even when stdin is not a TTY —\n' +
   '                          escape hatch for headless debug runs that want\n' +
   '                          the human-driven dialog experience.\n' +
+  '  --permanent             Bake `strategy = "permanent"` into the generated\n' +
+  '                          pty.toml for BOTH the agent session AND (codex)\n' +
+  '                          the ding sidecar, so pty resurrects them if\n' +
+  '                          their daemons die and `pty gc` doesn\'t reap\n' +
+  '                          them under idle-cleanup. Required for a\n' +
+  '                          production CoS or any always-on agent. Omitted\n' +
+  '                          → both sessions are ephemeral (pty\'s default).\n' +
+  '                          Warns if a CoS-shaped launch (--identity cos\n' +
+  '                          or chief-of-staff persona) is missing.\n' +
   '  --dry-run               Print what would happen; touch nothing.\n' +
   '  --print                 Alias for --dry-run.\n\n' +
   '  Examples:\n' +
   '    st launch claude                              # anon identity, channel mode + boot hooks\n' +
   '    st launch claude --identity alice             # persistent identity\n' +
+  '    st launch claude --identity cos --permanent \\\n' +
+  '        --persona ~/src/github.com/myobie/personas/chief-of-staff.md\n' +
+  '                                                  # production CoS\n' +
   '    st launch claude --no-hooks                   # skip .claude/settings.local.json\n' +
   '    st launch codex                               # + coord ding sidecar\n' +
   '    st launch claude --model glm-5.2:cloud        # via ollama, unattended\n' +
@@ -1397,6 +1466,7 @@ export async function cmdLaunchCli(
   let persona: string | undefined;
   let agentBinary: string | undefined;
   let unattendedFlag: boolean | undefined;
+  let permanent = false;
   let dryRun = false;
   for (let i = 0; i < args.length; i++) {
     const a = args[i]!;
@@ -1441,6 +1511,9 @@ export async function cmdLaunchCli(
         // driven dialog experience for debugging).
         unattendedFlag = false;
         break;
+      case '--permanent':
+        permanent = true;
+        break;
       case '--dry-run':
       case '--print':
         dryRun = true;
@@ -1477,6 +1550,7 @@ export async function cmdLaunchCli(
       ...(persona !== undefined && { persona }),
       ...(agentBinary !== undefined && { agentBinary }),
       ...(unattendedFlag !== undefined && { unattended: unattendedFlag }),
+      permanent,
       dryRun,
       env: ctx.env,
       coordRoot: ctx.coordRoot,
@@ -1500,6 +1574,7 @@ export async function cmdLaunchCli(
     ctx.stdout(`permission-mode: ${r.permissionMode}\n`);
     ctx.stdout(`agent binary:   ${r.agentBinary}\n`);
     ctx.stdout(`unattended:     ${r.unattended ? 'yes' : 'no'}\n`);
+    ctx.stdout(`permanent:      ${r.permanent ? 'yes' : 'no'}\n`);
     ctx.stdout(`mcp.json:       ${r.mcpJsonPath}\n`);
     if (r.claudeSessionIdPath !== null) {
       ctx.stdout(`session id:     ${r.claudeSessionIdPath}\n`);
