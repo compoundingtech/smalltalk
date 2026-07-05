@@ -6,6 +6,49 @@ minor releases until 1.0.
 
 ## Unreleased
 
+### Fixed (`st launch codex` no longer bakes `strategy = "permanent"` on the ding sidecar)
+
+Historic behavior: `buildPtyToml` hardcoded
+`tags = { role = "ding", strategy = "permanent" }` on the codex
+ding sidecar while the agent session itself carried no `strategy`
+tag — a mismatch that meant `pty gc` after an ephemeral codex run
+died would resurrect the ding as a zombie, exactly what the
+ephemeral-eval rule forbids. Blocked the 4 codex-cell eval
+retrofits.
+
+Verified against `../pty/src/sessions.ts:576, 620, 644` that pty
+only checks `strategy === "permanent"` explicitly — absence of the
+tag is pty's ephemeral default. So the fix is to drop the
+hardcoded `permanent` on the ding: `tags = { role = "ding" }`. Now
+both the agent AND the ding are ephemeral by default; `pty gc`
+reaps them together on eval teardown.
+
+Future-proofing hook: `buildPtyToml` grew an
+`agentStrategy?: string | undefined` opts field. When set, the
+value is mirrored to BOTH the agent and ding tags — a launch is
+either ephemeral or it isn't; no more mixed-strategy pty.toml. No
+CLI flag exposes this yet; a follow-up `--permanent` (for a
+production CoS that needs to survive `pty gc`) will plumb through
+here.
+
+Impact:
+- Codex ephemeral evals: unblocked. Ding no longer zombies.
+- CoS use case: unaffected. CoS runs the claude harness with no
+  ding sidecar (see `addDingSidecar: harness === 'codex'`).
+- Codex users who relied on ding-permanence to survive a codex
+  restart: behavior changes — a `pty gc` after codex dies now
+  reaps the ding. `pty up` brings both back. Note: pty gc would
+  ALSO have zombied that ding when the whole session tree died,
+  so the current permanent tag was arguably a bug either way.
+
+Test coverage:
+- Historic assertion `expect(preview).toContain('strategy =
+  "permanent"')` → negative assertion (regression guard).
+- New positive assertion: ding tags are exactly
+  `{ role = "ding" }`.
+- New positive assertion: agent tags remain `{ role = "agent" }`
+  (regression guard for the historic bare-agent shape).
+
 ### Docs (onboarding.md: fix the missing persona bootstrap in the CoS quickstart)
 
 The CoS quickstart's step 2 said `st launch claude --identity cos`
