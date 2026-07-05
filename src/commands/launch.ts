@@ -136,6 +136,21 @@ export interface LaunchInput {
    */
   hooksDir?: string | undefined;
   /**
+   * Test seam for the ST_BIN injection into hook `command:` strings.
+   * Production resolves this via `resolveStBinPath(resolveCoordBinPath())`
+   * so the hooks fire the same binary the operator ran `st launch`
+   * with, regardless of PATH state at hook-execution time.
+   *
+   * - `undefined` (default): auto-resolve.
+   * - `null`: explicitly opt out — no `ST_BIN=` prefix injected into
+   *   the hook commands. The generator emits bare script paths, and
+   *   the hook scripts fall back to their internal
+   *   `command -v st || command -v coord` PATH lookup at runtime.
+   * - a string: use that path verbatim. Tests pass a synthetic path
+   *   so the generated JSON is stable across dev machines.
+   */
+  stBinForHooks?: string | null | undefined;
+  /**
    * brief-118: skip generating `.claude/settings.local.json` even for
    * the claude harness. Codex launches implicitly skip. Off by default
    * so `st launch claude` opts every new agent into the SessionStart
@@ -433,6 +448,41 @@ export function resolveClaudeHooksDir(): string | null {
 }
 
 /**
+ * Format a hook `command:` string for `.claude/settings.local.json`.
+ * When `stBin` is non-null, prepends `ST_BIN=<abs>` as a shell
+ * assignment so the hook script sees an absolute-path binary regardless
+ * of PATH state. Claude Code executes shell-form commands (no `args`)
+ * via `sh -c`, so the leading `VAR=value cmd` form is parsed as an
+ * assignment-preceded simple command per POSIX.
+ *
+ * When `stBin` is null (bin/st not found alongside the resolved coord
+ * bin — an unusual state), the assignment is omitted and the hook
+ * falls back to its own `command -v st || command -v coord` PATH
+ * lookup. That keeps the hook usable under hand-wired settings.local
+ * files that never went through this generator.
+ */
+function hookCommand(hookScript: string, stBin: string | null): string {
+  const quotedScript = shellQuote(hookScript);
+  if (stBin === null) return quotedScript;
+  return `ST_BIN=${shellQuote(stBin)} ${quotedScript}`;
+}
+
+/** Resolve the absolute path to `bin/st` next to a resolved bin/coord.
+ *  Same directory as coordBin; different filename. Returns null when
+ *  the sibling isn't present on disk (paranoid — bin/st has shipped
+ *  since brief-005-phase0, but not worth crashing settings generation
+ *  over an installer glitch). */
+export function resolveStBinPath(coordBin: string): string | null {
+  const candidate = join(dirname(coordBin), 'st');
+  try {
+    if (statSync(candidate).isFile()) return candidate;
+  } catch {
+    // absent
+  }
+  return null;
+}
+
+/**
  * Build the `.claude/settings.local.json` content wiring the three
  * smalltalk hooks:
  *   - **SessionStart** with `async: true` + `asyncRewake: true` so
@@ -444,15 +494,25 @@ export function resolveClaudeHooksDir(): string | null {
  *   - **PreCompact** (task #33 hook-legs) — writes a stub to
  *     `context/now.md` if the model hasn't recently flushed, so
  *     boot-rehydrate has something to inject after compaction.
- *   - **StopFailure** — surfaces API-error wedges to myobie via
- *     coord so a quiet, wedged session doesn't go unnoticed.
+ *   - **StopFailure** — surfaces API-error wedges to myobie via the
+ *     st CLI so a quiet, wedged session doesn't go unnoticed.
  *
  * All three point at the shipped scripts under
  * `<smalltalk-root>/examples/claude-code/hooks/` via absolute paths.
  * Claude Code does NOT resolve `~` or repo-relative paths in hook
  * commands — that's why we bake the absolute path here.
+ *
+ * `stBin` is the absolute path to the `st` CLI. Injected as
+ * `ST_BIN=<abs>` in the hook `command:` strings so the hook scripts'
+ * shellouts use the same binary the operator launched under —
+ * robust to a degenerate PATH or a stale `coord` on PATH. Pass `null`
+ * to skip the injection and let the hooks fall back to their internal
+ * `command -v st || command -v coord` lookup.
  */
-export function buildClaudeSettings(hooksDir: string): string {
+export function buildClaudeSettings(
+  hooksDir: string,
+  stBin: string | null
+): string {
   const settings = {
     $schema: 'https://json.schemastore.org/claude-code-settings.json',
     hooks: {
@@ -463,7 +523,7 @@ export function buildClaudeSettings(hooksDir: string): string {
               type: 'command',
               async: true,
               asyncRewake: true,
-              command: join(hooksDir, 'session-start.sh'),
+              command: hookCommand(join(hooksDir, 'session-start.sh'), stBin),
             },
           ],
         },
@@ -473,7 +533,7 @@ export function buildClaudeSettings(hooksDir: string): string {
           hooks: [
             {
               type: 'command',
-              command: join(hooksDir, 'pre-compact.sh'),
+              command: hookCommand(join(hooksDir, 'pre-compact.sh'), stBin),
             },
           ],
         },
@@ -483,7 +543,7 @@ export function buildClaudeSettings(hooksDir: string): string {
           hooks: [
             {
               type: 'command',
-              command: join(hooksDir, 'stop-failure.sh'),
+              command: hookCommand(join(hooksDir, 'stop-failure.sh'), stBin),
             },
           ],
         },
@@ -928,7 +988,25 @@ export async function cmdLaunch(
       const settingsDir = join(cwd, '.claude');
       const settingsFile = join(settingsDir, 'settings.local.json');
       claudeSettingsPath = settingsFile;
-      claudeSettingsPreview = buildClaudeSettings(hooksDir);
+      // Resolve the absolute `st` binary path for ST_BIN injection into
+      // hook `command:` strings. Same package.json walk as the coord
+      // path (they're siblings in bin/). Null on resolution failure
+      // (degenerate PATH + tree not on disk); the hook scripts have
+      // their own PATH fallback so the launch still succeeds. Test
+      // seam: `input.stBinForHooks` overrides — `null` opts out of
+      // injection entirely, a string overrides the auto-resolved
+      // path (for deterministic snapshots).
+      let stBinForHooks: string | null;
+      if (input.stBinForHooks !== undefined) {
+        stBinForHooks = input.stBinForHooks;
+      } else {
+        try {
+          stBinForHooks = resolveStBinPath(resolveCoordBinPath());
+        } catch {
+          stBinForHooks = null;
+        }
+      }
+      claudeSettingsPreview = buildClaudeSettings(hooksDir, stBinForHooks);
       if (!input.dryRun && !existsSync(settingsFile)) {
         mkdirSync(settingsDir, { recursive: true });
         writeFileSync(settingsFile, claudeSettingsPreview);

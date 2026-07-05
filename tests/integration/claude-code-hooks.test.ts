@@ -62,25 +62,28 @@ beforeEach(() => {
   shimLog = join(scratch, 'coord-shim.log');
   mkdirSync(shimDir, { recursive: true });
 
-  // Plant a tiny `coord` shim that records every invocation's argv
+  // Plant a tiny CLI shim that records every invocation's argv
   // (one line per call, NUL-separated args within a line so bodies
-  // with spaces survive). The hook script will resolve `coord` to
-  // this file because we prepend shimDir to PATH below.
-  const shimPath = join(shimDir, 'coord');
-  writeFileSync(
-    shimPath,
-    [
-      '#!/bin/bash',
-      '# Test shim — records argv to $COORD_SHIM_LOG, exit 0.',
-      // Use printf with \0 between args so we can split unambiguously
-      // even when a body argument contains spaces, quotes, or newlines.
-      'for arg in "$@"; do printf "%s\\0" "$arg" >> "$COORD_SHIM_LOG"; done',
-      'printf "\\n" >> "$COORD_SHIM_LOG"',
-      'exit 0',
-      '',
-    ].join('\n')
-  );
-  chmodSync(shimPath, 0o755);
+  // with spaces survive). Both `st` and `coord` names — the hook
+  // prefers `st` on PATH (post the ST_BIN polish) but falls back to
+  // `coord`, so we plant both. Same script content; same log; either
+  // symlink target records the call verbatim.
+  const shimContents = [
+    '#!/bin/bash',
+    '# Test shim — records argv to $COORD_SHIM_LOG, exit 0.',
+    // Use printf with \0 between args so we can split unambiguously
+    // even when a body argument contains spaces, quotes, or newlines.
+    'for arg in "$@"; do printf "%s\\0" "$arg" >> "$COORD_SHIM_LOG"; done',
+    'printf "\\n" >> "$COORD_SHIM_LOG"',
+    'exit 0',
+    '',
+  ].join('\n');
+  const stShimPath = join(shimDir, 'st');
+  writeFileSync(stShimPath, shimContents);
+  chmodSync(stShimPath, 0o755);
+  const coordShimPath = join(shimDir, 'coord');
+  writeFileSync(coordShimPath, shimContents);
+  chmodSync(coordShimPath, 0o755);
 });
 
 afterEach(() => {
@@ -682,5 +685,114 @@ describe.skipIf(!HAS_JQ)('claude-code hooks — stop-failure.sh', () => {
     expect(r.exitCode).toBe(0);
     expect(r.calls.length).toBe(2);
     expect(r.calls[0]).toEqual(['status', 'bob', '--set', 'away']);
+  });
+});
+
+// ─── ST_BIN preference + PATH fallback (post-#41 polish) ───────────────
+
+describe('claude-code hooks — $ST_BIN takes precedence over PATH', () => {
+  // stop-failure.sh is the noisiest hook — most shellouts — so use it
+  // as the discriminator for the resolution branch coverage.
+
+  it('honors $ST_BIN even when nothing named `st` or `coord` is on PATH', () => {
+    // Discriminating shim: it records via ST_BIN, and PATH is scrubbed
+    // clean of both `st` and `coord`. Only path a call can travel is
+    // via the ST_BIN env var.
+    const dedicatedShim = join(scratch, 'st-injected.sh');
+    writeFileSync(
+      dedicatedShim,
+      [
+        '#!/bin/bash',
+        'for arg in "$@"; do printf "%s\\0" "$arg" >> "$COORD_SHIM_LOG"; done',
+        'printf "\\n" >> "$COORD_SHIM_LOG"',
+        'exit 0',
+        '',
+      ].join('\n')
+    );
+    chmodSync(dedicatedShim, 0o755);
+    // A PATH with /usr/bin + /bin (so bash and jq are findable) but
+    // NEITHER st NOR coord present. Ensures the hook can only reach
+    // the shim via ST_BIN.
+    const r = spawnSync('bash', [STOP_FAILURE_SH], {
+      env: {
+        PATH: '/usr/bin:/bin',
+        HOME: process.env.HOME,
+        COORD_SHIM_LOG: shimLog,
+        COORD_IDENTITY: 'bob',
+        ST_BIN: dedicatedShim,
+      },
+      input: JSON.stringify({ error_type: 'rate_limit' }),
+      encoding: 'utf8',
+      timeout: 15_000,
+    });
+    expect(r.status ?? -1).toBe(0);
+    const calls = readShimCalls();
+    expect(calls).toEqual([['status', 'bob', '--set', 'away']]);
+  });
+
+  it('empty $ST_BIN falls back to PATH lookup (both $ST_BIN unset and $ST_BIN="")', () => {
+    // Guards against a shim-regression where the launcher exports an
+    // empty string for ST_BIN (e.g. resolveStBinPath returned null but
+    // the export slipped through). The hook must treat empty the same
+    // as unset and fall back to PATH.
+    const r = spawnSync('bash', [STOP_FAILURE_SH], {
+      env: {
+        PATH: `${shimDir}:${process.env.PATH ?? ''}`,
+        HOME: process.env.HOME,
+        COORD_SHIM_LOG: shimLog,
+        COORD_IDENTITY: 'bob',
+        ST_BIN: '',
+      },
+      input: JSON.stringify({ error_type: 'rate_limit' }),
+      encoding: 'utf8',
+      timeout: 15_000,
+    });
+    expect(r.status ?? -1).toBe(0);
+    const calls = readShimCalls();
+    expect(calls).toEqual([['status', 'bob', '--set', 'away']]);
+  });
+
+  it('prefers `st` over `coord` when both are on PATH', () => {
+    // Rebuild the shim dir so only one recording target survives on PATH,
+    // but keep BOTH names present — with different bodies. `st` writes
+    // "STCALL", `coord` writes "COORDCALL". Whichever the hook picks
+    // shows up in the log.
+    const fresh = join(scratch, 'preference-bin');
+    mkdirSync(fresh, { recursive: true });
+    for (const [name, tag] of [
+      ['st', 'STCALL'],
+      ['coord', 'COORDCALL'],
+    ] as const) {
+      writeFileSync(
+        join(fresh, name),
+        [
+          '#!/bin/bash',
+          `printf '%s\\n' '${tag}' >> "$COORD_SHIM_LOG"`,
+          'exit 0',
+          '',
+        ].join('\n')
+      );
+      chmodSync(join(fresh, name), 0o755);
+    }
+    const r = spawnSync('bash', [STOP_FAILURE_SH], {
+      env: {
+        // /usr/bin:/bin for bash + jq, then the fresh shim dir which
+        // exposes BOTH `st` and `coord`. Order matters — st before
+        // coord alphabetically doesn't affect PATH lookup, but the
+        // hook script's `command -v st || command -v coord` chain
+        // does: st wins.
+        PATH: `${fresh}:/usr/bin:/bin`,
+        HOME: process.env.HOME,
+        COORD_SHIM_LOG: shimLog,
+        COORD_IDENTITY: 'bob',
+      },
+      input: JSON.stringify({ error_type: 'rate_limit' }),
+      encoding: 'utf8',
+      timeout: 15_000,
+    });
+    expect(r.status ?? -1).toBe(0);
+    const log = existsSync(shimLog) ? readFileSync(shimLog, 'utf8') : '';
+    expect(log).toContain('STCALL');
+    expect(log).not.toContain('COORDCALL');
   });
 });

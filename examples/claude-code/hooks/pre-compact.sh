@@ -53,6 +53,19 @@
 
 set -uo pipefail
 
+# ─── Binary resolution ───────────────────────────────────────────────────
+#
+# Prefer an absolute path injected by `st launch` via $ST_BIN (baked
+# to the shim in the same package that generated this hook wiring).
+# Falls back to PATH lookup for users who wired settings.local.json by
+# hand or ran launch under a version that predates the injection. `st`
+# wins over `coord` — we're st-first now, coord is the back-compat
+# shim. Emptying $ST_BIN (unset or "") always falls through.
+st_bin="${ST_BIN:-}"
+if [[ -z "$st_bin" ]]; then
+  st_bin="$(command -v st 2>/dev/null || command -v coord 2>/dev/null || true)"
+fi
+
 # ─── Identity + root resolution ──────────────────────────────────────────
 
 identity="${COORD_IDENTITY:-${ST_IDENTITY:-${ST_AGENT:-}}}"
@@ -131,17 +144,22 @@ EOF
 # resolution chain we used above to derive $identity, so the
 # resolved id is guaranteed identical — which takes the implicit
 # lazy-create branch and mkdirs `inbox/`+`archive/` on first flush.
-if command -v timeout >/dev/null 2>&1; then
+# If $st_bin didn't resolve to anything, we can't flush. Log the miss
+# and exit clean; compaction must not block on a missing CLI.
+if [[ -z "$st_bin" ]]; then
+  printf '%s pre-compact: no st/coord binary found (checked $ST_BIN + PATH); skipping flush\n' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$err_log" 2>/dev/null || true
+elif command -v timeout >/dev/null 2>&1; then
   printf '%s\n' "$stub_body" | \
-    timeout "${timeout_s}s" coord context write \
+    timeout "${timeout_s}s" "$st_bin" context write \
     > /dev/null 2>>"$err_log" || true
 elif command -v gtimeout >/dev/null 2>&1; then
   printf '%s\n' "$stub_body" | \
-    gtimeout "${timeout_s}s" coord context write \
+    gtimeout "${timeout_s}s" "$st_bin" context write \
     > /dev/null 2>>"$err_log" || true
 else
   printf '%s\n' "$stub_body" | \
-    coord context write \
+    "$st_bin" context write \
     > /dev/null 2>>"$err_log" || true
 fi
 
