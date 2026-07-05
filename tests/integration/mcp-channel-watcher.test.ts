@@ -425,15 +425,36 @@ describe('channel-watcher — poll backstop (brief-020 HB-4)', () => {
     ]);
   });
 
-  it('backstop-only: files already present at startup DO NOT get replayed', async () => {
-    // Simulate a fresh restart on an inbox with a historical backlog.
-    // The boot ritual (`coord_msg_ls`) is what surfaces backlog to the
-    // agent — the channel-watcher must not double-emit those on
-    // startup, or every restart would flood the context with old
-    // messages.
+  it('at-least-once: files present at startup ARE delivered on watcher start (P5R-F2 fix)', async () => {
+    // Simulate a fresh restart on an inbox with pending files. The
+    // prior policy suppressed these on startup (delegating backlog
+    // recovery to the boot ritual's `coord_msg_ls`); a live repro
+    // during the P5 team-standup re-run showed that policy loses
+    // messages when Claude Code reconnects the stdio transport
+    // mid-session (the fresh MCP process seeded them into `seen`
+    // and the polling backstop couldn't rescue). Nathan chose
+    // at-least-once semantics — duplicates on restart are the
+    // accepted tradeoff, the alternative is losing messages the
+    // agent may never wake to process. See CHANGELOG entry titled
+    // "channel-watcher re-delivers inbox contents on start
+    // (at-least-once)".
     await backstopHandle.close();
-    const preExisting = join(backstopInbox, '1714826780000-oldold.md');
-    writeFileSync(preExisting, '---\nfrom: bob\n---\nhistorical\n');
+    // Plant three deliverable files BEFORE the new watcher starts —
+    // filename order deliberately swapped (chronological c < b < a
+    // by <unix-ms> prefix) to prove the initial scan sorts before
+    // enqueueing.
+    writeFileSync(
+      join(backstopInbox, '1714826780200-cccccc.md'),
+      '---\nfrom: bob\n---\nthird historically\n'
+    );
+    writeFileSync(
+      join(backstopInbox, '1714826780100-bbbbbb.md'),
+      '---\nfrom: bob\n---\nsecond historically\n'
+    );
+    writeFileSync(
+      join(backstopInbox, '1714826780000-aaaaaa.md'),
+      '---\nfrom: bob\n---\nfirst historically\n'
+    );
     backstopHandle = createMcpServer({
       root: backstopRoot,
       identity: asIdentity('alice'),
@@ -461,16 +482,27 @@ describe('channel-watcher — poll backstop (brief-020 HB-4)', () => {
       backstopHandle.mcp.connect(s),
     ]);
     await backstopHandle.startChannelWatcher();
-    // Give the backstop ~4 ticks to (not) fire.
+    // All three should arrive in chronological order.
+    await waitForBackstop(() => backstopReceived.length === 3);
+    const initial = backstopReceived.map(
+      (n) => n.params.meta.messageFilename
+    );
+    expect(initial).toEqual([
+      '1714826780000-aaaaaa.md',
+      '1714826780100-bbbbbb.md',
+      '1714826780200-cccccc.md',
+    ]);
+    // Backstop tick must NOT re-emit any of the initial files —
+    // exactly-once WITHIN this process. Wait a few ticks to prove it.
     await new Promise((r) => setTimeout(r, 250));
-    expect(backstopReceived).toHaveLength(0);
-    // Now plant a NEW file — must fire.
+    expect(backstopReceived).toHaveLength(3);
+    // A NEW file arriving after startup fires exactly once, as before.
     writeFileSync(
       join(backstopInbox, '1714826791000-newnew.md'),
       '---\nfrom: bob\n---\nfresh arrival\n'
     );
-    await waitForBackstop(() => backstopReceived.length === 1);
-    expect(backstopReceived[0]!.params.meta.messageFilename).toBe(
+    await waitForBackstop(() => backstopReceived.length === 4);
+    expect(backstopReceived[3]!.params.meta.messageFilename).toBe(
       '1714826791000-newnew.md'
     );
   });
