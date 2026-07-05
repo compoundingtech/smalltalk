@@ -6,6 +6,23 @@ minor releases until 1.0.
 
 ## Unreleased
 
+### Added (`st --version` prints the CLI version)
+
+`<name> --version` prints `<invokedName> <semver>\n` (e.g. `st 0.3.0`)
+and exits 0. Follows the same brand-per-name convention as the help
+banners — `coord --version` prints `coord 0.3.0`, `smalltalk --version`
+prints `smalltalk 0.3.0`. The semver is read from `package.json` at
+runtime, so it stays in sync without a build-time constant.
+
+- New `versionString(env)` helper in `src/cli.ts` resolves
+  `package.json` via `fileURLToPath(import.meta.url)` so it works
+  under `npm link` (where the source lives elsewhere on disk).
+- Top-level help banner now names both flags: `usage: <name> --help
+  | --version`.
+- Only `--version` is honored — no `-v` (traditionally means verbose),
+  no bare `version` subcommand (would shadow any user's `st-version`
+  plugin).
+
 ### Changed (help banners + error prefixes reflect the invoked name)
 
 Every `usage: …` banner and every top-level `<name>: <message>` error

@@ -102,6 +102,36 @@ describe('runCli — no args / help', () => {
   });
 });
 
+// ─── --version ──────────────────────────────────────────────────────────
+
+describe('runCli — --version', () => {
+  // `st --version` reads package.json at runtime and prints
+  // `<invokedName> <semver>`, following the same brand-per-name
+  // convention as the help banners.
+  it('prints "<name> <semver>" to stdout, exit 0', async () => {
+    const cap = makeContext();
+    const code = await runCli(['--version'], cap.ctx);
+    expect(code).toBe(0);
+    // Match `st X.Y.Z` (semver, possibly with pre-release suffix).
+    expect(cap.stdout).toMatch(/^st \d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?\n$/);
+    expect(cap.stderr).toBe('');
+  });
+
+  it('reflects _ST_INVOKED_AS in the brand', async () => {
+    const cap = makeContext('', { _ST_INVOKED_AS: 'coord' });
+    const code = await runCli(['--version'], cap.ctx);
+    expect(code).toBe(0);
+    expect(cap.stdout).toMatch(/^coord \d+\.\d+\.\d+/);
+  });
+
+  it('mentions --version in the top-level help banner', async () => {
+    const cap = makeContext();
+    const code = await runCli(['help'], cap.ctx);
+    expect(code).toBe(0);
+    expect(cap.stdout).toContain('--version');
+  });
+});
+
 // ─── _ST_INVOKED_AS override ────────────────────────────────────────────
 
 describe('runCli — help banner reflects _ST_INVOKED_AS', () => {
