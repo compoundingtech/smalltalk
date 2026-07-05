@@ -439,6 +439,16 @@ function buildPtyToml(opts: {
   invocation: readonly string[];
   addDingSidecar: boolean;
   unattended: boolean;
+  /**
+   * When the invoker had `ST_ROOT` (or legacy `COORD_ROOT`) explicitly
+   * set, its resolved absolute value baked into `[sessions.*.env]` as
+   * `ST_ROOT`. Undefined means the invoker was on the default state
+   * root — nothing baked, so future `pty up`/`pty restart` invocations
+   * from any shell inherit whatever ST_ROOT resolution runs then
+   * (usually the same default). Only set when the invoker was doing
+   * something explicit — pinning an isolation root through restarts.
+   */
+  stRoot: string | undefined;
 }): string {
   // pty runs `command` via `sh -c`, so produce a shell command line by
   // space-joining shell-quoted argv elements. Then TOML-quote the
@@ -471,6 +481,17 @@ function buildPtyToml(opts: {
   lines.push('');
   lines.push(`[sessions.${opts.sessionName}.env]`);
   lines.push(`ST_AGENT = "${tomlEscape(opts.identity)}"`);
+  // Isolation robustness: pin the state root a `pty up`/`pty restart`
+  // invocation would use, so a session launched under an explicit
+  // `ST_ROOT` (isolation, eval harness, per-project tree, etc.) stays
+  // on that root regardless of who later resurrects the pty session.
+  // Only baked when the invoker explicitly set ST_ROOT/COORD_ROOT —
+  // default-path launches leave the env unset so pty.toml doesn't
+  // freeze today's default into future restarts. See the enclosing
+  // opts.stRoot docstring for the resolution rule.
+  if (opts.stRoot !== undefined) {
+    lines.push(`ST_ROOT = "${tomlEscape(opts.stRoot)}"`);
+  }
   if (opts.addDingSidecar) {
     const dingLine = `coord ding ${shellQuote(opts.sessionName)} --identity ${shellQuote(opts.identity)}`;
     lines.push('');
@@ -480,6 +501,12 @@ function buildPtyToml(opts: {
     lines.push('');
     lines.push(`[sessions.ding.env]`);
     lines.push(`ST_AGENT = "${tomlEscape(opts.identity)}"`);
+    // Same rationale as the main session's env: pin the isolation
+    // root so `pty restart <sess>-ding` doesn't drift back to the
+    // live default state root.
+    if (opts.stRoot !== undefined) {
+      lines.push(`ST_ROOT = "${tomlEscape(opts.stRoot)}"`);
+    }
   }
   return lines.join('\n') + '\n';
 }
@@ -1016,6 +1043,20 @@ export async function cmdLaunch(
     ctx.stdinIsTty !== undefined && ctx.stdinIsTty() === false;
   const unattended =
     input.unattended === true || (input.unattended === undefined && stdinNotTty);
+  // Isolation-robust `ST_ROOT` propagation: when the invoker had
+  // ST_ROOT (or legacy COORD_ROOT) explicitly set, bake the resolved
+  // absolute path into the generated pty.toml's `[sessions.*.env]`.
+  // `input.coordRoot` is already the resolved value (via
+  // `coordRootFrom(ctx.env)` at the CLI layer), so this pins the
+  // exact tree the launch is scoping to — a later `pty up` /
+  // `pty restart` / `pty gc` resurrection from any shell will keep
+  // the isolation instead of falling back to the live default root.
+  // Default-path launches leave the env unset so pty.toml doesn't
+  // freeze today's default into future restarts.
+  const stRootForSession: string | undefined =
+    input.env.ST_ROOT !== undefined || input.env.COORD_ROOT !== undefined
+      ? input.coordRoot
+      : undefined;
   const ptyTomlPath = join(cwd, 'pty.toml');
   let ptyTomlPreview: string | null = null;
   if (usedPty) {
@@ -1026,6 +1067,7 @@ export async function cmdLaunch(
       invocation: argv,
       addDingSidecar: harness === 'codex',
       unattended,
+      stRoot: stRootForSession,
     });
     ptyTomlPreview = preview;
     if (!input.dryRun && !existsSync(ptyTomlPath)) {
@@ -1042,6 +1084,7 @@ export async function cmdLaunch(
       invocation: argv,
       addDingSidecar: harness === 'codex',
       unattended,
+      stRoot: stRootForSession,
     });
   }
 
