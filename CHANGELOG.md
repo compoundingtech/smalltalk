@@ -6,6 +6,30 @@ minor releases until 1.0.
 
 ## Unreleased
 
+### Fixed (`st status <agent> --set <state>` lazy-creates the agent folder)
+
+The onboarding walkthrough tells newcomers to run
+`st status <self> --set available` as their first command. Pre-fix,
+this threw `agent folder missing for <self>` because the explicit
+`<agent>` positional went through the strict folder-existence check.
+Now the `--set` path lazy-creates `<agent>/{inbox,archive}` if
+missing, matching what the docs already promised.
+
+- Adds a new `'lazy-create'` policy to `resolveAgent` alongside the
+  existing `'lenient'`. When set, an explicit-identity call creates
+  the folder inline instead of failing.
+- `cmdStatus` uses the new policy iff `setState !== undefined` —
+  passive `st status <peer>` (get) still requires the folder to
+  exist so `st status ghost` doesn't silently materialize a phantom.
+- Environment-resolved calls (`ST_AGENT=alice st status --set …`)
+  already lazy-created via the implicit-bootstrap path; no change.
+
+Anti-impersonation posture: the `--set` write goes to
+`<agent>/status`, not another agent's inbox. Any local caller could
+already `mkdir $ST_ROOT/<other>/{inbox,archive}` + `echo state > …`
+by hand — the convenience of first-command bootstrap outweighs the
+marginal loss.
+
 ### Added (`st launch --agent <name>` / `$AGENT` env — aliased claude binaries)
 
 `st launch claude` now invokes a configurable binary as the harness

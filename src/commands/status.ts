@@ -41,10 +41,18 @@ export type StatusResult =
   | { mode: 'set'; identity: string; state: State; written: string };
 
 export function cmdStatus(input: StatusInput): StatusResult {
+  // `--set` is a newcomer's first command per the docs, and the
+  // onboarding walkthrough promises lazy-bootstrap of the agent
+  // folder. The `'lazy-create'` policy makes an explicit-identity
+  // `--set` create `<agent>/{inbox,archive}` if missing instead of
+  // failing with "agent folder missing". Passive `get` and env-
+  // resolved identities keep their original behavior.
+  const isSet = input.setState !== undefined;
   const identity = resolveIdentity({
     explicit: input.recipient,
     env: input.env,
     coordRoot: input.coordRoot,
+    ...(isSet ? { policy: 'lazy-create' as const } : {}),
   });
   const path = statusPath(identity, input.coordRoot);
 
