@@ -6,6 +6,46 @@ minor releases until 1.0.
 
 ## Unreleased
 
+### Added (Phase-2 pty isolation: `st launch` emits `PTY_ROOT = <ST_ROOT>/pty` on non-default networks)
+
+Set-side companion to pty-claude's Phase-2 PR (pty#55 — per-network
+`PTY_ROOT` + `pty --root`). `st launch` now emits `PTY_ROOT` in the
+pty.toml `[sessions.X.env]` block whenever the network is non-default,
+matching the existing `ST_ROOT` env-line emit trigger byte-for-byte.
+
+Derivation (Q2-A, **nested**): `PTY_ROOT = <ST_ROOT>/pty`. A network's
+whole state (bus + pty) lives under one `ST_ROOT` dir, so `rm -rf
+$ST_ROOT` removes the network entirely — the end-state Nathan
+specified ("rm the folder, network's gone").
+
+Semantics:
+- **Matched-pair invariant with `ST_ROOT`.** `PTY_ROOT` emits if and
+  only if `ST_ROOT` does. A bare-bus / shared-pty split would defeat
+  the "rm the folder" semantic; the pair moves in lockstep.
+- **Both session blocks tagged**: main session + ding sidecar env
+  blocks each carry the same `PTY_ROOT` value. Consistent with the
+  existing `ST_ROOT` mirror.
+- **Default network unchanged**: no env line emitted; pty.toml
+  doesn't freeze today's default into future restarts. Same
+  asymmetry-with-`st.network`-tag preserved.
+- **Legacy `COORD_ROOT`**: canonicalized to `ST_ROOT` via the
+  existing input.coordRoot resolution, then flows through the
+  PTY_ROOT derivation — no separate legacy path; env line name is
+  the post-cutover canonical `PTY_ROOT` regardless of which env
+  the invoker used.
+
+Post-merge, an agent launched into a non-default network gets both
+bus + pty isolation for free — an evals-side follow-up to retire
+stev's session-prefixing becomes possible.
+
+4 new unit tests: default network → no `PTY_ROOT` emitted; explicit
+`ST_ROOT` → both `ST_ROOT` and `PTY_ROOT = <ST_ROOT>/pty` present;
+codex ding sidecar carries `PTY_ROOT` too (matched-pair with
+`ST_ROOT`); legacy `COORD_ROOT` invoker env produces the canonical
+`PTY_ROOT` shape (no `COORD_PTY_ROOT` regression).
+
+Full suite: 1539 pass, only the 4 pre-existing integration flakes.
+
 ### Fixed (`st launch` git-exclude append now works in git worktrees)
 
 Historic behavior: `readGitExclude(cwd)` did

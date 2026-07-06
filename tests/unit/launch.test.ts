@@ -592,6 +592,96 @@ describe('cmdLaunch — pty.toml generation', () => {
     ]);
   });
 
+  // ─── Phase-2 pty isolation: PTY_ROOT = <ST_ROOT>/pty (nested, Q2-A) ─
+
+  it('PTY_ROOT propagation: no ST_ROOT/COORD_ROOT in invoker env → no PTY_ROOT in pty.toml', async () => {
+    // Asymmetry-with-tag preserved (per #64 st.network tag): the
+    // ST_ROOT + PTY_ROOT env lines omit on default networks so
+    // pty.toml doesn't freeze today's default into future restarts.
+    // Only the st.network *tag* emits uniformly.
+    const r = await cmdLaunch(
+      baseInput({ harness: 'claude', identity: 'alice', env: {} as NodeJS.ProcessEnv }),
+      ctx
+    );
+    expect(r.ptyTomlPreview).not.toContain('PTY_ROOT =');
+    // Belt-and-suspenders: ST_ROOT stays absent too (matched pair).
+    expect(r.ptyTomlPreview).not.toContain('ST_ROOT =');
+  });
+
+  it('PTY_ROOT propagation: invoker had ST_ROOT set → PTY_ROOT = <ST_ROOT>/pty emitted alongside ST_ROOT (nested)', async () => {
+    // Q2-A nested layout: PTY_ROOT sits under the network's root, so
+    // `rm -rf $ST_ROOT` removes bus + pty in one shot — the end-state
+    // Nathan specified ("rm the folder, network's gone").
+    const isolatedRoot = '/tmp/net-A/state';
+    const r = await cmdLaunch(
+      baseInput({
+        harness: 'claude',
+        identity: 'alice',
+        env: { ST_ROOT: isolatedRoot } as NodeJS.ProcessEnv,
+        coordRoot: isolatedRoot,
+      }),
+      ctx
+    );
+    expect(r.ptyTomlPreview).toContain(`ST_ROOT = "${isolatedRoot}"`);
+    expect(r.ptyTomlPreview).toContain(
+      `PTY_ROOT = "${isolatedRoot}/pty"`
+    );
+  });
+
+  it('PTY_ROOT propagation: codex ding sidecar env also gets PTY_ROOT (matched pair with ST_ROOT)', async () => {
+    // Both session env blocks — main + ding — carry PTY_ROOT with
+    // the same nested value. Bus and pty isolation move in
+    // lockstep; a bare-bus / shared-pty split would defeat the
+    // "rm the folder, network's gone" semantic.
+    const isolatedRoot = '/tmp/codex-net/state';
+    const r = await cmdLaunch(
+      baseInput({
+        harness: 'codex',
+        identity: 'alice',
+        env: { ST_ROOT: isolatedRoot } as NodeJS.ProcessEnv,
+        coordRoot: isolatedRoot,
+      }),
+      ctx
+    );
+    const ptyRootLines = r.ptyTomlPreview!.split('\n').filter((line) =>
+      line.startsWith('PTY_ROOT = ')
+    );
+    expect(ptyRootLines).toEqual([
+      `PTY_ROOT = "${isolatedRoot}/pty"`,
+      `PTY_ROOT = "${isolatedRoot}/pty"`,
+    ]);
+    // ST_ROOT + PTY_ROOT are strictly a matched pair — one without
+    // the other in a session block is a bug.
+    const stRootLines = r.ptyTomlPreview!.split('\n').filter((line) =>
+      line.startsWith('ST_ROOT = ')
+    );
+    expect(stRootLines).toHaveLength(ptyRootLines.length);
+  });
+
+  it('PTY_ROOT propagation: legacy COORD_ROOT also produces the nested PTY_ROOT', async () => {
+    // COORD_ROOT is canonicalized to ST_ROOT throughout the launch;
+    // regression guard that this canonicalization flows into the
+    // PTY_ROOT derivation too (no separate legacy path).
+    const legacyRoot = '/tmp/legacy-net/state';
+    const r = await cmdLaunch(
+      baseInput({
+        harness: 'claude',
+        identity: 'alice',
+        env: { COORD_ROOT: legacyRoot } as NodeJS.ProcessEnv,
+        coordRoot: legacyRoot,
+      }),
+      ctx
+    );
+    expect(r.ptyTomlPreview).toContain(`ST_ROOT = "${legacyRoot}"`);
+    expect(r.ptyTomlPreview).toContain(
+      `PTY_ROOT = "${legacyRoot}/pty"`
+    );
+    // The env line NAME is the post-cutover canonical `PTY_ROOT`
+    // regardless of which env the invoker used — regression guard
+    // against emitting a `COORD_PTY_ROOT` or similar legacy shape.
+    expect(r.ptyTomlPreview).not.toContain('COORD_PTY_ROOT');
+  });
+
   it('claude preview has no ding sidecar', async () => {
     const r = await cmdLaunch(
       baseInput({ harness: 'claude', identity: 'alice' }),
