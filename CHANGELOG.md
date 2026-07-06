@@ -6,6 +6,53 @@ minor releases until 1.0.
 
 ## Unreleased
 
+### Fixed (`st launch` git-exclude append now works in git worktrees)
+
+Historic behavior: `readGitExclude(cwd)` did
+`join(cwd, '.git', 'info', 'exclude')` and stat-checked `.git`
+as a dir. In a git **worktree** (created via `git worktree add
+<path>`), `<worktree>/.git` is a text FILE pointing at
+`<main>/.git/worktrees/<name>` — the dir check returned false,
+`readGitExclude` returned null, and every downstream caller
+surfaced `gitRepoAbsent: true`. The persona files (PERSONA.md,
+DING-BUS.md, .mcp.json, generated CLAUDE.md, session-id files,
+pty.toml) were still installed but silently NOT excluded from
+git tracking — an operator working out of a worktree
+accidentally staged them.
+
+Fix: use `git rev-parse --git-path info/exclude`. Git resolves
+this correctly for every layout:
+- Regular repo → `<cwd>/.git/info/exclude`.
+- Worktree → the SHARED `<main>/.git/info/exclude` (info/exclude
+  is shared across worktrees per git's design).
+- Bare repo → the repo's `info/exclude`.
+- Non-git dir → nonzero exit → `readGitExclude` returns null (the
+  existing `gitRepoAbsent: true` surface stays intact for
+  callers).
+
+The write path (`appendGitExclude`) already used the returned
+absolute path directly, so it flows through unchanged — the fix
+lives entirely inside `readGitExclude`.
+
+Tests:
+- New positive worktree regression guard: launch in a worktree
+  cwd → git-exclude entries land in the MAIN repo's shared
+  `.git/info/exclude`, and the worktree's `.git` is confirmed to
+  be a FILE (not a dir) we didn't touch.
+- Existing `makeGitRepo(dir)` fixture updated from `mkdir -p
+  .git/info/` (which no longer satisfies `git rev-parse`) to a
+  real `git init` — 12 persona tests now boot a real repo, more
+  faithful to production.
+- The dry-run "touches nothing" assertion updated: `git init`
+  ships with a default `.git/info/exclude` template, so the
+  test now checks the exclude file (if present) contains
+  neither our appended `PERSONA.md` line nor the
+  `smalltalk-launch` block header — a more precise "we didn't
+  write to it" guarantee than the historic "the file doesn't
+  exist" assertion.
+
+Full suite: 1532 pass, only the 4 pre-existing integration flakes.
+
 ### Fixed (`DING-BUS.md` now tells the agent to propagate ding-mode through every spawn)
 
 evals-claude caught a contract-level gap in DING-BUS.md before
