@@ -47,6 +47,28 @@ npm install
 npm link
 ```
 
+**Note on the `personas` checkout.** The personas repo evolves —
+`chief-of-staff.md`, `supervisor.md`, etc. get iterated on
+alongside real use. A rolling-HEAD checkout gets you whatever's
+on `main` today, which is usually fine and often what you want
+(latest guidance from the maintainer). But if you need
+**reproducibility** — running an eval you want to compare later,
+teaching a workshop, shipping a shared CoS setup for a team so
+everyone launches identically — pin to a specific SHA:
+
+```sh
+cd ~/src/github.com/myobie/personas
+git checkout <sha>
+```
+
+The **currently-tested set** at the time of this doc is
+`96a6331` (personas HEAD as of 2026-07-06). If you're evaluating
+smalltalk against these onboarding instructions, checking out
+that SHA gives you the persona files this doc was validated
+against. Bump the SHA in this doc when the tested set
+advances — a rolling HEAD in these instructions plus a personas
+change means the two can silently drift.
+
 `npm link` publishes the three bin shims — `st`, `smalltalk`, and
 `coord` — as global symlinks. Verify:
 
