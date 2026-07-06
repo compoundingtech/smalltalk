@@ -11,6 +11,7 @@ import {
   mkdtempSync,
   readFileSync,
   rmSync,
+  statSync,
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -2084,10 +2085,12 @@ describe('cmdLaunch — --no-hooks help text', () => {
 
 describe('cmdLaunch — --persona (brief-022)', () => {
   function makeGitRepo(dir: string): void {
-    // Enough to satisfy readGitExclude — just the .git dir and info/.
-    // We don't need an actual git binary; the launch code only reads
-    // .git/info/exclude and appends to it.
-    mkdirSync(join(dir, '.git', 'info'), { recursive: true });
+    // Real `git init` since `readGitExclude` now shells to
+    // `git rev-parse --git-path info/exclude` (worktree-safe path).
+    // A bare `mkdir .git/info/` isn't enough — git needs HEAD/refs
+    // to consider the dir a repo.
+    const { execSync } = require('node:child_process') as typeof import('node:child_process');
+    execSync('git init -q', { cwd: dir });
   }
 
   function personaFixture(text = '# Persona\n\nHello.\n'): string {
@@ -2321,6 +2324,57 @@ describe('cmdLaunch — --persona (brief-022)', () => {
     expect(stderrBuf).toMatch(/not a git repo/);
   });
 
+  it('git worktree cwd: resolves info/exclude to the SHARED main-repo path, not the naive <cwd>/.git/info/exclude', async () => {
+    // Historic bug: `readGitExclude` did `join(cwd, '.git', 'info',
+    // 'exclude')`, which in a worktree pointed at the worktree's
+    // `.git` FILE (not a dir) and returned `gitRepoAbsent: true` —
+    // silently skipping the git-exclude append for anyone working
+    // in a worktree. Fix: `git rev-parse --git-path info/exclude`.
+    // Regression guard: launch in a worktree → PERSONA.md ends up
+    // in the MAIN repo's `.git/info/exclude`, not the worktree's
+    // `.git` file.
+    const { execSync } = await import('node:child_process');
+    // Create a main repo with an initial commit (worktree add needs
+    // a real branch to check out).
+    const mainRepo = join(scratch, 'main');
+    mkdirSync(mainRepo, { recursive: true });
+    execSync('git init -q', { cwd: mainRepo });
+    execSync('git commit --allow-empty -q -m "root"', { cwd: mainRepo });
+    // Add a worktree at a different path. `cwd` (the launch target)
+    // becomes the worktree.
+    const worktree = join(scratch, 'worktree');
+    execSync(`git worktree add -q ${worktree} -b wt-branch`, {
+      cwd: mainRepo,
+    });
+    const src = personaFixture();
+    const r = await cmdLaunch(
+      baseInput({
+        harness: 'claude',
+        identity: 'a',
+        persona: src,
+        cwd: worktree,
+        dryRun: false,
+        captureOnly: true,
+      }),
+      ctx
+    );
+    // gitRepoAbsent = false — the worktree IS a git-tracked dir.
+    expect(r.persona!.gitRepoAbsent).toBe(false);
+    expect(r.persona!.gitExcludeEntriesAdded.length).toBeGreaterThan(0);
+    // The entries land in the MAIN repo's shared exclude, not the
+    // worktree's `.git` file.
+    const mainExclude = join(mainRepo, '.git', 'info', 'exclude');
+    expect(existsSync(mainExclude)).toBe(true);
+    const mainText = readFileSync(mainExclude, 'utf8');
+    expect(mainText).toContain('PERSONA.md');
+    // The worktree's `.git` is a FILE, not a dir — we should NOT have
+    // written into or beside it.
+    const worktreeGit = join(worktree, '.git');
+    expect(existsSync(worktreeGit)).toBe(true);
+    // (It's a file that says `gitdir: <path to real gitdir>`.)
+    expect(statSync(worktreeGit).isFile()).toBe(true);
+  });
+
   it('missing --persona source: throws helpful error naming the flag + path', async () => {
     makeGitRepo(cwd);
     const bad = join(scratch, 'does-not-exist.md');
@@ -2354,9 +2408,17 @@ describe('cmdLaunch — --persona (brief-022)', () => {
     expect(r.persona!.importLineAppended).toBe(true);
     expect(r.persona!.entryFileCreated).toBe(true);
     expect(r.persona!.gitExcludeEntriesAdded.length).toBeGreaterThan(0);
-    // Nothing on disk.
+    // Nothing on disk from our install.
     expect(existsSync(join(cwd, 'PERSONA.md'))).toBe(false);
     expect(existsSync(join(cwd, 'CLAUDE.md'))).toBe(false);
-    expect(existsSync(join(cwd, '.git', 'info', 'exclude'))).toBe(false);
+    // `git init` creates a default `.git/info/exclude` from git's
+    // template, so the file itself may pre-exist. What matters is
+    // that we didn't APPEND to it — no smalltalk-launch entries.
+    const excludePath = join(cwd, '.git', 'info', 'exclude');
+    if (existsSync(excludePath)) {
+      const text = readFileSync(excludePath, 'utf8');
+      expect(text).not.toContain('PERSONA.md');
+      expect(text).not.toContain('smalltalk-launch');
+    }
   });
 });

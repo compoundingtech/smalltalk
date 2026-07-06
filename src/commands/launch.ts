@@ -1149,20 +1149,35 @@ export const PERSONA_ALWAYS_EXCLUDE = [
   'pty.toml',
 ] as const;
 
-/** Read the current `.git/info/exclude`, or empty string if missing.
- *  Used both for the "is this line already there?" dedup and for the
- *  final append. Failures (e.g. `.git` isn't a dir) surface as empty. */
+/** Read the canonical `info/exclude` for `cwd`'s git repo (or empty
+ *  string if the file doesn't exist yet). Returns null when `cwd`
+ *  isn't a git-tracked directory.
+ *
+ *  Uses `git rev-parse --git-path info/exclude` rather than the naive
+ *  `join(cwd, '.git', 'info', 'exclude')`. The naive form breaks in
+ *  worktrees, where `<worktree>/.git` is a text file pointing at the
+ *  real git dir (`.git/worktrees/<name>`) — statting it as a dir
+ *  returns false and we historically bailed with `gitRepoAbsent:
+ *  true`, silently skipping the git-exclude append for anyone working
+ *  in a worktree. `git rev-parse --git-path` normalizes across:
+ *  - Regular repo → `<cwd>/.git/info/exclude`.
+ *  - Worktree → the SHARED main-repo `<main>/.git/info/exclude`
+ *    (info/exclude is shared across worktrees per git's design).
+ *  - Bare repo → the repo's `info/exclude`.
+ *  - Non-git dir → nonzero exit → we return null. */
 function readGitExclude(cwd: string): { path: string; text: string } | null {
-  const gitDir = join(cwd, '.git');
-  // A bare git repo, worktree, or non-git directory won't have
-  // .git/info/. Skip cleanly; callers surface `gitRepoAbsent: true`.
-  try {
-    const st = statSync(gitDir);
-    if (!st.isDirectory()) return null;
-  } catch {
-    return null;
-  }
-  const excludePath = join(gitDir, 'info', 'exclude');
+  const r = spawnSync(
+    'git',
+    ['-C', cwd, 'rev-parse', '--git-path', 'info/exclude'],
+    { encoding: 'utf8' }
+  );
+  if (r.status !== 0 || typeof r.stdout !== 'string') return null;
+  const raw = r.stdout.trim();
+  if (raw.length === 0) return null;
+  // git returns a path relative to cwd for a regular repo, absolute
+  // for a worktree/GIT_DIR override. Resolve to absolute for the
+  // downstream write path.
+  const excludePath = isAbsolute(raw) ? raw : join(cwd, raw);
   let text = '';
   try {
     text = readFileSync(excludePath, 'utf8');
