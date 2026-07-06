@@ -53,6 +53,28 @@ Tests:
 
 Full suite: 1532 pass, only the 4 pre-existing integration flakes.
 
+### Docs (`notes/onboarding.md` — add SHA-pin guidance for the personas checkout)
+
+Onboarding step 1 says `git clone https://github.com/myobie/
+personas`, which gives you a rolling-HEAD checkout. Fine for
+solo work following current guidance, but a problem for:
+
+- Evals: reproducibility across runs requires the persona files
+  to match the ones the eval was designed against.
+- Workshops / teaching: everyone should be on the same persona
+  content so the walk-through matches what participants see.
+- Shared team CoS setups: if two teammates clone at different
+  times, they end up with subtly different CoS behavior.
+
+Added a note right under the clone block explaining the
+tradeoff and showing how to pin (`cd personas && git checkout
+<sha>`). Also names the currently-tested set (`96a6331`, the
+personas HEAD as of 2026-07-06) so readers evaluating smalltalk
+against this doc get the exact files the doc was validated
+against. Includes a maintenance instruction to bump the SHA
+when the tested set advances — a rolling HEAD in the
+instructions plus a personas change would silently drift.
+
 ### Fixed (`DING-BUS.md` now tells the agent to propagate ding-mode through every spawn)
 
 evals-claude caught a contract-level gap in DING-BUS.md before
