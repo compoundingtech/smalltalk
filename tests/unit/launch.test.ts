@@ -628,11 +628,9 @@ describe('cmdLaunch — pty.toml generation', () => {
     );
   });
 
-  it('PTY_ROOT propagation: codex ding sidecar env also gets PTY_ROOT (matched pair with ST_ROOT)', async () => {
+  it('PTY_ROOT propagation: codex ding sidecar env also gets PTY_ROOT (nested-derive case)', async () => {
     // Both session env blocks — main + ding — carry PTY_ROOT with
-    // the same nested value. Bus and pty isolation move in
-    // lockstep; a bare-bus / shared-pty split would defeat the
-    // "rm the folder, network's gone" semantic.
+    // the same nested value when only ST_ROOT is set.
     const isolatedRoot = '/tmp/codex-net/state';
     const r = await cmdLaunch(
       baseInput({
@@ -650,12 +648,88 @@ describe('cmdLaunch — pty.toml generation', () => {
       `PTY_ROOT = "${isolatedRoot}/pty"`,
       `PTY_ROOT = "${isolatedRoot}/pty"`,
     ]);
-    // ST_ROOT + PTY_ROOT are strictly a matched pair — one without
-    // the other in a session block is a bug.
+    // In the nested-derive case, ST_ROOT is always emitted alongside.
     const stRootLines = r.ptyTomlPreview!.split('\n').filter((line) =>
       line.startsWith('ST_ROOT = ')
     );
     expect(stRootLines).toHaveLength(ptyRootLines.length);
+  });
+
+  it('PTY_ROOT propagation: direct $PTY_ROOT env is honored VERBATIM (decoupled from ST_ROOT)', async () => {
+    // The stev-retirement + socket-path-limit unblock. When the
+    // invoker explicitly sets $PTY_ROOT (e.g. a short per-run
+    // `/tmp/stev-<runid>` root), st launch bakes it verbatim into
+    // the pty.toml — NO nested derivation, NO "must match ST_ROOT"
+    // rule. This is the case that decouples bus + pty roots.
+    const shortPtyRoot = '/tmp/stev-run42';
+    const busRoot = '/tmp/net-B/state';
+    const r = await cmdLaunch(
+      baseInput({
+        harness: 'codex',
+        identity: 'alice',
+        env: {
+          ST_ROOT: busRoot,
+          PTY_ROOT: shortPtyRoot,
+        } as NodeJS.ProcessEnv,
+        coordRoot: busRoot,
+      }),
+      ctx
+    );
+    // PTY_ROOT is the VERBATIM env value, not the nested derivation.
+    const ptyRootLines = r.ptyTomlPreview!.split('\n').filter((line) =>
+      line.startsWith('PTY_ROOT = ')
+    );
+    expect(ptyRootLines).toEqual([
+      `PTY_ROOT = "${shortPtyRoot}"`,
+      `PTY_ROOT = "${shortPtyRoot}"`,
+    ]);
+    // Regression guard: the derived-nested form is NOT emitted.
+    expect(r.ptyTomlPreview).not.toContain(`PTY_ROOT = "${busRoot}/pty"`);
+    // ST_ROOT stays independent — the bus root is still baked.
+    expect(r.ptyTomlPreview).toContain(`ST_ROOT = "${busRoot}"`);
+  });
+
+  it('PTY_ROOT propagation: direct $PTY_ROOT WITHOUT ST_ROOT → PTY_ROOT emitted alone (default bus, isolated pty)', async () => {
+    // The pure stev-retirement case: default network for the bus,
+    // but a per-run isolated pty root. ST_ROOT stays absent (default);
+    // PTY_ROOT emits verbatim.
+    const shortPtyRoot = '/tmp/stev-run99';
+    const r = await cmdLaunch(
+      baseInput({
+        harness: 'codex',
+        identity: 'alice',
+        env: { PTY_ROOT: shortPtyRoot } as NodeJS.ProcessEnv,
+      }),
+      ctx
+    );
+    expect(r.ptyTomlPreview).not.toContain('ST_ROOT =');
+    const ptyRootLines = r.ptyTomlPreview!.split('\n').filter((line) =>
+      line.startsWith('PTY_ROOT = ')
+    );
+    expect(ptyRootLines).toEqual([
+      `PTY_ROOT = "${shortPtyRoot}"`,
+      `PTY_ROOT = "${shortPtyRoot}"`,
+    ]);
+  });
+
+  it('PTY_ROOT propagation: direct $PTY_ROOT empty-string in env → falls through to derive (empty ≠ set)', async () => {
+    // Regression guard on the null-ish check: an empty PTY_ROOT env
+    // shouldn't defeat the derivation from ST_ROOT.
+    const busRoot = '/tmp/net-C/state';
+    const r = await cmdLaunch(
+      baseInput({
+        harness: 'codex',
+        identity: 'alice',
+        env: {
+          ST_ROOT: busRoot,
+          PTY_ROOT: '',
+        } as NodeJS.ProcessEnv,
+        coordRoot: busRoot,
+      }),
+      ctx
+    );
+    // Empty PTY_ROOT is ignored; derive nested from ST_ROOT.
+    expect(r.ptyTomlPreview).toContain(`PTY_ROOT = "${busRoot}/pty"`);
   });
 
   it('PTY_ROOT propagation: legacy COORD_ROOT also produces the nested PTY_ROOT', async () => {
@@ -1127,6 +1201,183 @@ describe('cmdLaunch — spawner-shaped detection (Nathan\'s 3-tier)', () => {
     // supervisors that still spawn autonomously).
     expect(r.permissionMode).toBe('bypassPermissions');
     expect(r.permanent).toBe(true);
+  });
+});
+
+describe('cmdLaunch — --fresh mode (skip pinned session, no --resume)', () => {
+  // `--fresh` mints a clean-slate launch: no `.claude-session-id` /
+  // `.codex-session-id` read, no bootstrap, no `--resume` in argv.
+  // Preserves any existing pin byte-for-byte (--fresh is a one-off,
+  // not a rewrite). Mechanism for the resumability eval + the
+  // eventual drop of the session-id-resume ceremony.
+
+  it('default (no --fresh) → --resume IS in the claude argv (regression baseline)', async () => {
+    const r = await cmdLaunch(
+      baseInput({
+        harness: 'claude',
+        identity: 'alice',
+        dryRun: true,
+      }),
+      ctx
+    );
+    expect(r.fresh).toBe(false);
+    expect(r.argv.join(' ')).toContain('--resume');
+  });
+
+  it('--fresh on claude → --resume OMITTED from argv', async () => {
+    const r = await cmdLaunch(
+      baseInput({
+        harness: 'claude',
+        identity: 'alice',
+        fresh: true,
+        dryRun: true,
+      }),
+      ctx
+    );
+    expect(r.fresh).toBe(true);
+    expect(r.argv.join(' ')).not.toContain('--resume');
+    // The rest of the claude argv is untouched.
+    expect(r.argv[0]).toBe('claude');
+    expect(r.argv).toContain('--permission-mode');
+  });
+
+  it('--fresh on claude live run → .claude-session-id file NOT written', async () => {
+    // Fresh is a one-off: leaves the cwd's pinned-session
+    // filesystem untouched. Regression guard on the "preserve
+    // existing pin" invariant.
+    await cmdLaunch(
+      baseInput({
+        harness: 'claude',
+        identity: 'alice',
+        fresh: true,
+        dryRun: false,
+        captureOnly: true,
+      }),
+      ctx
+    );
+    expect(existsSync(join(cwd, '.claude-session-id'))).toBe(false);
+  });
+
+  it('--fresh on claude with a pre-existing pin → pin file preserved byte-for-byte', async () => {
+    // The load-bearing invariant: --fresh must NOT clobber the
+    // pinned session. A subsequent non-fresh launch resumes it.
+    const pinPath = join(cwd, '.claude-session-id');
+    const pinBefore = 'existing-uuid-abc123-def456\n';
+    writeFileSync(pinPath, pinBefore);
+    await cmdLaunch(
+      baseInput({
+        harness: 'claude',
+        identity: 'alice',
+        fresh: true,
+        dryRun: false,
+        captureOnly: true,
+      }),
+      ctx
+    );
+    const pinAfter = readFileSync(pinPath, 'utf8');
+    expect(pinAfter).toBe(pinBefore);
+  });
+
+  it('non-fresh claude live run → .claude-session-id file IS written (scoped-skip guard)', async () => {
+    // Regression guard: the pin-skip is scoped to --fresh only.
+    // A default claude launch still mints + writes the pin.
+    await cmdLaunch(
+      baseInput({
+        harness: 'claude',
+        identity: 'alice',
+        dryRun: false,
+        captureOnly: true,
+      }),
+      ctx
+    );
+    expect(existsSync(join(cwd, '.claude-session-id'))).toBe(true);
+  });
+
+  it('--fresh on claude → LaunchResult.claudeSessionIdPath is null', async () => {
+    const r = await cmdLaunch(
+      baseInput({
+        harness: 'claude',
+        identity: 'alice',
+        fresh: true,
+      }),
+      ctx
+    );
+    expect(r.claudeSessionIdPath).toBeNull();
+  });
+
+  it('--fresh on codex → argv is bare `codex` (no `resume <sid>`) even when .codex-session-id exists', async () => {
+    // Symmetric behavior for codex: don't read the pin, don't
+    // pass `resume <sid>`. Codex auto-mints a fresh session on start.
+    const pinPath = join(cwd, '.codex-session-id');
+    writeFileSync(pinPath, 'existing-codex-sid\n');
+    const r = await cmdLaunch(
+      baseInput({
+        harness: 'codex',
+        identity: 'alice',
+        fresh: true,
+        dryRun: true,
+      }),
+      ctx
+    );
+    expect(r.fresh).toBe(true);
+    expect(r.argv).toEqual(['codex']);
+    expect(r.argv.join(' ')).not.toContain('resume');
+    // Pin file preserved.
+    expect(readFileSync(pinPath, 'utf8')).toBe('existing-codex-sid\n');
+  });
+
+  it('non-fresh codex with pinned session → argv is `codex resume <sid>` (regression baseline)', async () => {
+    const pinPath = join(cwd, '.codex-session-id');
+    writeFileSync(pinPath, 'existing-codex-sid\n');
+    const r = await cmdLaunch(
+      baseInput({
+        harness: 'codex',
+        identity: 'alice',
+        dryRun: true,
+      }),
+      ctx
+    );
+    expect(r.argv).toEqual(['codex', 'resume', 'existing-codex-sid']);
+  });
+
+  it('--fresh composes with --ding (clean-slate ding-mode launch)', async () => {
+    // Both modes' effects layer: no MCP wiring (ding), no --resume
+    // (fresh). The resumability eval's Arm D shape.
+    const r = await cmdLaunch(
+      baseInput({
+        harness: 'claude',
+        identity: 'alice',
+        ding: true,
+        fresh: true,
+        dryRun: true,
+      }),
+      ctx
+    );
+    expect(r.ding).toBe(true);
+    expect(r.fresh).toBe(true);
+    expect(r.channel).toBe(false);
+    expect(r.argv.join(' ')).not.toContain('--dangerously-load-development-channels');
+    expect(r.argv.join(' ')).not.toContain('--resume');
+    expect(r.claudeSessionIdPath).toBeNull();
+  });
+
+  it('CLI --fresh threads through + shows in dry-run summary', async () => {
+    const { cmdLaunchCli } = await import('../../src/commands/launch.ts');
+    await cmdLaunchCli(
+      ['claude', '--identity', 'alice', '--fresh', '--dry-run'],
+      ctx
+    );
+    expect(stdoutBuf).toContain('fresh mode:     yes');
+    expect(stdoutBuf).toContain('session id:     (skipped — fresh mode; no --resume)');
+  });
+
+  it('CLI default (no --fresh) → dry-run summary reports fresh mode: no', async () => {
+    const { cmdLaunchCli } = await import('../../src/commands/launch.ts');
+    await cmdLaunchCli(
+      ['claude', '--identity', 'alice', '--dry-run'],
+      ctx
+    );
+    expect(stdoutBuf).toContain('fresh mode:     no');
   });
 });
 

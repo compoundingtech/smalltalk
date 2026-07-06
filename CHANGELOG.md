@@ -6,6 +6,104 @@ minor releases until 1.0.
 
 ## Unreleased
 
+### Changed (`st launch` honors a direct `$PTY_ROOT` env verbatim; decoupled from `$ST_ROOT`)
+
+Companion change to `--fresh`, bundled per cos (same code area).
+Previously `st launch` DERIVED `PTY_ROOT = <ST_ROOT>/pty` and
+IGNORED a directly-set `$PTY_ROOT`. Now:
+
+- `$PTY_ROOT` set + non-empty in the invoker's env → use verbatim
+- Else `$ST_ROOT` set (non-default network) → derive `<ST_ROOT>/pty`
+  (Q2-A nested, unchanged from #68)
+- Else → skip (default-network case, unchanged)
+
+**One fix, two problems:**
+1. **Eval stev-retirement cutover unblocked** — it needs a short,
+   decoupled per-run pty root (`/tmp/stev-<runid>`) that the
+   nested-derived form can't produce.
+2. **Unix 104-byte socket-path limit sidestepped** — a nested
+   `<ST_ROOT>/pty` under a deep sandbox path pushes pty's socket
+   paths over the OS ceiling. A direct short `$PTY_ROOT` avoids it.
+
+Emit is now independent of `ST_ROOT`: a launch with `$PTY_ROOT` set
+but no `$ST_ROOT` emits `PTY_ROOT` alone (default bus, isolated pty
+— the pure stev-retirement shape). The historic "matched-pair"
+invariant from #68 is deliberately loosened for the decouple case;
+the docstring on `buildPtyToml.opts.ptyRoot` names the precedence
+rule.
+
+4 new / updated tests:
+- Nested-derive case (ST_ROOT only) → PTY_ROOT = ST_ROOT/pty (unchanged
+  from #68; test description updated).
+- **Direct $PTY_ROOT env** → baked verbatim, both agent + ding blocks;
+  negative guard against the derived-nested form re-appearing.
+- **Direct $PTY_ROOT without $ST_ROOT** → PTY_ROOT emitted alone,
+  ST_ROOT absent (pure stev shape).
+- **Empty-string $PTY_ROOT** → falls through to derive (regression
+  guard on the null-ish check).
+
+### Added (`st launch --fresh` — clean-slate session, no `--resume`)
+
+New mode that skips the pinned-session bootstrap and OMITs
+`--resume` from the launched argv. The agent starts with a
+completely clean context and must rehydrate from durable state
+alone (`now.md` + git + bus).
+
+Mechanism for the **resumability eval's fresh-vs-`--resume`
+A/B** — Arm D — and, per the larger roadmap, the mechanism for
+eventually **dropping the session-id-resume ceremony**
+entirely. If durable-state rehydration proves sufficient across
+the eval, `--resume` becomes redundant and `convoy add` gets
+simpler.
+
+Semantics:
+
+- **One-off, not a rewrite.** `--fresh` leaves any existing
+  `.claude-session-id` / `.codex-session-id` file byte-for-byte
+  untouched. The next non-fresh launch from the same cwd
+  resumes the pinned session as usual. Reversible.
+- **No jsonl bootstrap.** The one-shot `claude --print
+  --session-id <SID> "session init"` that normally seeds the
+  jsonl store is skipped — Claude Code auto-mints its own
+  session on start.
+- **Symmetric across harnesses**: `st launch codex --fresh`
+  emits bare `codex` (no `resume <sid>`) even when a pin file
+  exists.
+- **Composes orthogonally** with `--ding`, `--persona`,
+  `--permanent`, `--permission-mode`, `--agent`, etc. Fresh
+  affects session-id + argv only.
+- `LaunchInput.fresh?: boolean` + `LaunchResult.fresh: boolean`
+  fields; `LaunchResult.claudeSessionIdPath` returns `null`
+  under fresh mode.
+
+Argv delta:
+
+```
+# Without --fresh (baseline)
+claude --permission-mode bypassPermissions --dangerously-load-development-channels server:st --resume <SID>
+
+# With --fresh
+claude --permission-mode bypassPermissions --dangerously-load-development-channels server:st
+```
+
+11 new unit tests: default (no --fresh) has `--resume` (regression
+baseline); `--fresh` omits `--resume`; live run doesn't write the
+pin; live run with pre-existing pin preserves it byte-for-byte;
+non-fresh live run still writes the pin (scoped-skip guard);
+`LaunchResult.claudeSessionIdPath === null` under `--fresh`;
+codex fresh skips reading `.codex-session-id` even when present;
+non-fresh codex still uses `codex resume <sid>` (regression
+baseline); `--fresh` + `--ding` compose orthogonally; CLI `--fresh`
+threads through + dry-run summary; CLI default reports
+`fresh mode: no`.
+
+Full suite: 1550 pass, only the 4 pre-existing integration flakes.
+
+Related: pty-claude may need a matching `pty-claude-launcher.sh`
+option if their launcher hard-codes `--resume`; not blocking on
+that — `st launch` builds argv directly and doesn't shell out to
+the launcher script.
+
 ### Added (Phase-2 pty isolation: `st launch` emits `PTY_ROOT = <ST_ROOT>/pty` on non-default networks)
 
 Set-side companion to pty-claude's Phase-2 PR (pty#55 — per-network

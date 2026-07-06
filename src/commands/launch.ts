@@ -218,6 +218,29 @@ export interface LaunchInput {
    */
   noHooks?: boolean | undefined;
 
+  /**
+   * Fresh-session mode: skip the `.claude-session-id` /
+   * `.codex-session-id` pinned-session bootstrap and OMIT `--resume`
+   * from the launched argv, so the agent starts with a completely
+   * clean context and must rehydrate from durable state alone
+   * (`now.md` + git + bus).
+   *
+   * Preserves any existing `.claude-session-id` / `.codex-session-id`
+   * file byte-for-byte — `--fresh` is a one-off launch, NOT a rewrite
+   * of the pinned session. The next non-fresh launch from the same
+   * cwd resumes the pinned session as usual.
+   *
+   * Mechanism for the resumability eval's fresh-vs-`--resume` A/B,
+   * and (per the larger roadmap) the eventual drop of the
+   * session-id ceremony entirely — if durable-state rehydration
+   * proves sufficient, `--resume` becomes redundant and
+   * `convoy add` gets simpler.
+   *
+   * Composes orthogonally with `--ding`, `--persona`, `--permanent`,
+   * `--permission-mode`, `--agent`, etc.
+   */
+  fresh?: boolean | undefined;
+
   env: NodeJS.ProcessEnv;
   coordRoot: string;
 }
@@ -277,6 +300,12 @@ export interface LaunchResult {
    * dry-run branches so the summary can surface the mode.
    */
   ding: boolean;
+  /**
+   * True when `--fresh` was set — the launch skipped the
+   * `.claude-session-id` / `.codex-session-id` bootstrap and emitted
+   * argv without `--resume`. See {@link LaunchInput.fresh}.
+   */
+  fresh: boolean;
   /**
    * brief-118: absolute path to `.claude/settings.local.json` when the
    * launch generated (or would have generated) one. Non-null only for
@@ -451,20 +480,43 @@ function isSpawnerShaped(
  * is true, the *caller* is responsible for running a one-shot
  * `claude --print --session-id <SID> "session init"` before the main
  * argv — we return both parts.
+ *
+ * Fresh mode (`claudeSessionId === null`): OMIT `--resume` from
+ * mainArgv, return null for both bootstrapArgv and jsonlPath. Claude
+ * Code auto-mints a fresh session on start; the agent must rehydrate
+ * from durable state (`now.md` + git + bus) alone. See
+ * {@link LaunchInput.fresh}.
  */
 function buildClaudeCommand(opts: {
   cwd: string;
   home: string;
   channel: boolean;
-  claudeSessionId: string;
+  /** Pinned session id to `--resume`, or null for fresh mode. */
+  claudeSessionId: string | null;
   permissionMode: string;
   /** The binary to invoke as argv[0]. See {@link LaunchInput.agentBinary}. */
   agentBinary: string;
 }): {
-  bootstrapArgv: readonly string[];
+  /** null in fresh mode — nothing to bootstrap. */
+  bootstrapArgv: readonly string[] | null;
   mainArgv: readonly string[];
-  jsonlPath: string;
+  /** null in fresh mode — we don't compute a session-specific path. */
+  jsonlPath: string | null;
 } {
+  const channelFlag = opts.channel
+    ? ['--dangerously-load-development-channels', 'server:st']
+    : [];
+  if (opts.claudeSessionId === null) {
+    // Fresh mode: no --resume, no jsonl bootstrap. Claude auto-mints
+    // its own session id.
+    const mainArgv: readonly string[] = [
+      opts.agentBinary,
+      '--permission-mode',
+      opts.permissionMode,
+      ...channelFlag,
+    ];
+    return { bootstrapArgv: null, mainArgv, jsonlPath: null };
+  }
   const encoded = encodedCwd(opts.cwd);
   const jsonlPath = join(
     opts.home,
@@ -473,9 +525,6 @@ function buildClaudeCommand(opts: {
     encoded,
     `${opts.claudeSessionId}.jsonl`
   );
-  const channelFlag = opts.channel
-    ? ['--dangerously-load-development-channels', 'server:st']
-    : [];
   const mainArgv: readonly string[] = [
     opts.agentBinary,
     '--permission-mode',
@@ -505,7 +554,14 @@ function buildOllamaCommand(
   return ['ollama', 'launch', harness, '--model', model];
 }
 
-function buildCodexCommand(cwd: string): readonly string[] {
+function buildCodexCommand(
+  cwd: string,
+  opts?: { fresh?: boolean }
+): readonly string[] {
+  // Fresh mode: skip the `.codex-session-id` read so codex auto-mints
+  // a fresh session on start. Existing `.codex-session-id` file
+  // stays untouched — `--fresh` is a one-off, not a rewrite.
+  if (opts?.fresh === true) return ['codex'];
   const idFile = join(cwd, '.codex-session-id');
   if (existsSync(idFile)) {
     const sid = readFileSync(idFile, 'utf8').trim();
@@ -581,6 +637,22 @@ function buildPtyToml(opts: {
    * something explicit — pinning an isolation root through restarts.
    */
   stRoot: string | undefined;
+  /**
+   * Explicit pty state root baked into `[sessions.*.env]` as
+   * `PTY_ROOT`. Resolved at the call site with this precedence:
+   *   1. `$PTY_ROOT` set explicitly in the invoker's env → use verbatim
+   *   2. Else, `stRoot` set (non-default network) → derive
+   *      `<stRoot>/pty` (Q2-A nested; `rm -rf $ST_ROOT` removes bus + pty)
+   *   3. Else → undefined (default network, nothing baked)
+   *
+   * Decoupled from `stRoot` on purpose: (a) the eval's stev-retirement
+   * cutover needs a short, per-run pty root (`/tmp/stev-<runid>`) that
+   * doesn't nest under a deep sandbox `ST_ROOT`, and (b) the unix
+   * socket-path 104-byte limit means a nested pty root under a deep
+   * `ST_ROOT` can push pty's socket paths over the OS ceiling. A
+   * direct `$PTY_ROOT` sidesteps both.
+   */
+  ptyRoot: string | undefined;
   /**
    * Optional `strategy` value baked into BOTH the agent session
    * AND the ding sidecar tags. When undefined (today's only
@@ -678,18 +750,23 @@ function buildPtyToml(opts: {
   // freeze today's default into future restarts. See the enclosing
   // opts.stRoot docstring for the resolution rule.
   //
-  // Set-side of Phase-2 pty isolation (pty-claude's #55): when the
-  // network is non-default, also emit `PTY_ROOT = <ST_ROOT>/pty`
-  // so pty (which honors `PTY_ROOT` as its state root when defined)
-  // stays inside the same isolated dir as the bus. Q2-A NESTED
-  // layout — a network's whole state (bus + pty) lives under one
-  // ST_ROOT dir, so `rm -rf $ST_ROOT` removes the network entirely.
-  // Emitted with the SAME trigger as ST_ROOT so bus and pty
-  // isolation move in lockstep; a bare-bus / shared-pty split
-  // would defeat the "rm the folder, network's gone" semantic.
+  // PTY_ROOT (set-side of Phase-2 pty isolation, pty#55): emitted
+  // independently of ST_ROOT per the direct-PTY_ROOT change. See
+  // {@link opts.ptyRoot} for resolution:
+  //   - `$PTY_ROOT` set → use verbatim (decoupled from bus root)
+  //   - Else `stRoot` set → derive `<stRoot>/pty` (Q2-A nested)
+  //   - Else undefined → skip
+  // Emit is independent so:
+  //   (a) an eval harness can supply a short, decoupled pty root
+  //       (`/tmp/stev-<runid>`) without also pinning a bus root
+  //   (b) the direct value sidesteps the unix 104-byte socket-path
+  //       limit that a deep-nested `<ST_ROOT>/pty` can push over
+  //   (c) the default-network case is still bare (nothing emitted)
   if (opts.stRoot !== undefined) {
     lines.push(`ST_ROOT = "${tomlEscape(opts.stRoot)}"`);
-    lines.push(`PTY_ROOT = "${tomlEscape(opts.stRoot)}/pty"`);
+  }
+  if (opts.ptyRoot !== undefined) {
+    lines.push(`PTY_ROOT = "${tomlEscape(opts.ptyRoot)}"`);
   }
   if (opts.addDingSidecar) {
     // Emit `st ding` (post-cutover canonical). The `coord ding` form
@@ -737,13 +814,14 @@ function buildPtyToml(opts: {
     lines.push(`ST_AGENT = "${tomlEscape(opts.identity)}"`);
     // Same rationale as the main session's env: pin the isolation
     // root so `pty restart <identity>-ding` doesn't drift back to
-    // the live default state root. `PTY_ROOT` mirrors — Phase-2 pty
-    // isolation (nested, Q2-A) means bus + pty share the network's
-    // root so the ding sidecar's pty state lives in the same
-    // isolated dir as its bus.
+    // the live default state root. PTY_ROOT resolved independently
+    // per the direct-PTY_ROOT change (see main session's ST_ROOT/
+    // PTY_ROOT comment above).
     if (opts.stRoot !== undefined) {
       lines.push(`ST_ROOT = "${tomlEscape(opts.stRoot)}"`);
-      lines.push(`PTY_ROOT = "${tomlEscape(opts.stRoot)}/pty"`);
+    }
+    if (opts.ptyRoot !== undefined) {
+      lines.push(`PTY_ROOT = "${tomlEscape(opts.ptyRoot)}"`);
     }
   }
   return lines.join('\n') + '\n';
@@ -1532,9 +1610,17 @@ export async function cmdLaunch(
   }
 
   // ─── claude session-id bootstrap ────────────────────────────────────
+  //
+  // Fresh mode (`--fresh`): skip the read + write entirely. The
+  // `.claude-session-id` file (if any) stays untouched — fresh is a
+  // one-off launch, not a rewrite of the pinned session — and the
+  // launch proceeds with `claudeSessionId === null`, which
+  // `buildClaudeCommand` translates into "omit `--resume` from
+  // argv". Claude Code auto-mints a fresh session on start.
+  const fresh = input.fresh === true;
   let claudeSessionIdPath: string | null = null;
   let claudeSessionId: string | null = null;
-  if (harness === 'claude') {
+  if (harness === 'claude' && !fresh) {
     const idFile = join(cwd, '.claude-session-id');
     claudeSessionIdPath = idFile;
     if (existsSync(idFile)) {
@@ -1609,7 +1695,11 @@ export async function cmdLaunch(
       cwd,
       home,
       channel,
-      claudeSessionId: claudeSessionId ?? '<generated-at-runtime>',
+      // Fresh mode threads a null session id → argv omits --resume
+      // and both bootstrapArgv + jsonlPath come back null.
+      claudeSessionId: fresh
+        ? null
+        : claudeSessionId ?? '<generated-at-runtime>',
       permissionMode,
       agentBinary,
     });
@@ -1617,7 +1707,7 @@ export async function cmdLaunch(
     claudeBootstrapArgv = built.bootstrapArgv;
     claudeJsonlPath = built.jsonlPath;
   } else {
-    argv = buildCodexCommand(cwd);
+    argv = buildCodexCommand(cwd, { fresh });
   }
 
   // ─── pty registration decision ─────────────────────────────────────
@@ -1648,6 +1738,20 @@ export async function cmdLaunch(
     input.env.ST_ROOT !== undefined || input.env.COORD_ROOT !== undefined
       ? input.coordRoot
       : undefined;
+  // Direct-PTY_ROOT env support: if the invoker explicitly set
+  // `$PTY_ROOT`, use it verbatim — decoupled from `stRoot`. Solves
+  // (a) the eval stev-retirement cutover, which needs a short
+  // per-run pty root (`/tmp/stev-<runid>`) that doesn't nest under
+  // a deep sandbox `ST_ROOT`, and (b) the unix 104-byte
+  // socket-path limit that a nested `<ST_ROOT>/pty` can push over.
+  // Fallback preserves the pre-fix nested behavior (derive from
+  // stRoot when the invoker only pinned bus isolation).
+  const ptyRootForSession: string | undefined =
+    input.env.PTY_ROOT !== undefined && input.env.PTY_ROOT.length > 0
+      ? input.env.PTY_ROOT
+      : stRootForSession !== undefined
+        ? `${stRootForSession}/pty`
+        : undefined;
   // --permanent: plumbs through the buildPtyToml `agentStrategy?`
   // future-proof hook that landed with the ding fix. When set,
   // BOTH the agent session AND the ding sidecar get `strategy =
@@ -1694,6 +1798,7 @@ export async function cmdLaunch(
       addDingSidecar: harness === 'codex' || ding,
       unattended,
       stRoot: stRootForSession,
+      ptyRoot: ptyRootForSession,
       agentStrategy,
       // Phase-1 pty isolation label. Always emitted (unlike
       // stRoot, which conditionally emits the ST_ROOT env line);
@@ -1721,6 +1826,7 @@ export async function cmdLaunch(
       addDingSidecar: harness === 'codex' || ding,
       unattended,
       stRoot: stRootForSession,
+      ptyRoot: ptyRootForSession,
       agentStrategy,
       // Phase-1 pty isolation label. Always emitted (unlike
       // stRoot, which conditionally emits the ST_ROOT env line);
@@ -1837,6 +1943,7 @@ export async function cmdLaunch(
       unattended,
       permanent,
       ding,
+      fresh,
       claudeSettingsPath,
       claudeSettingsPreview,
       persona: personaResult,
@@ -1938,6 +2045,7 @@ export async function cmdLaunch(
     unattended,
     permanent,
     ding,
+    fresh,
     claudeSettingsPath,
     claudeSettingsPreview,
     persona: personaResult,
@@ -2017,6 +2125,18 @@ const LAUNCH_HELP =
   '                          flush + StopFailure ding are Claude Code\n' +
   '                          hooks, MCP-independent. No-op for codex\n' +
   '                          (already ding-mode by default).\n' +
+  '  --fresh                 Skip the pinned-session bootstrap and OMIT\n' +
+  '                          `--resume` from the launched argv, so the\n' +
+  '                          agent starts with a fresh context and must\n' +
+  '                          rehydrate from durable state alone (now.md\n' +
+  '                          + git + bus). Existing .claude-session-id\n' +
+  '                          / .codex-session-id file (if any) is left\n' +
+  '                          untouched — --fresh is a ONE-OFF launch,\n' +
+  '                          not a rewrite of the pinned session. The\n' +
+  '                          next non-fresh launch from the same cwd\n' +
+  '                          resumes the pinned session as usual.\n' +
+  '                          Composes orthogonally with --ding,\n' +
+  '                          --persona, --permanent, etc.\n' +
   '  --dry-run               Print what would happen; touch nothing.\n' +
   '  --print                 Alias for --dry-run.\n\n' +
   '  Examples:\n' +
@@ -2032,6 +2152,7 @@ const LAUNCH_HELP =
   '    st launch codex                               # + st ding sidecar\n' +
   '    st launch claude --model glm-5.2:cloud        # via ollama, unattended\n' +
   '    st launch claude --permission-mode bypassPermissions   # eval-spinner posture\n' +
+  '    st launch claude --identity alice --fresh     # one-off, no --resume; pin stays intact\n' +
   '    st launch codex --dry-run                     # audit before spawn\n';
 
 export async function cmdLaunchCli(
@@ -2051,6 +2172,7 @@ export async function cmdLaunchCli(
   let unattendedFlag: boolean | undefined;
   let permanent = false;
   let ding = false;
+  let fresh = false;
   let dryRun = false;
   for (let i = 0; i < args.length; i++) {
     const a = args[i]!;
@@ -2101,6 +2223,9 @@ export async function cmdLaunchCli(
       case '--ding':
         ding = true;
         break;
+      case '--fresh':
+        fresh = true;
+        break;
       case '--dry-run':
       case '--print':
         dryRun = true;
@@ -2139,6 +2264,7 @@ export async function cmdLaunchCli(
       ...(unattendedFlag !== undefined && { unattended: unattendedFlag }),
       permanent,
       ding,
+      fresh,
       dryRun,
       env: ctx.env,
       coordRoot: ctx.coordRoot,
@@ -2164,12 +2290,15 @@ export async function cmdLaunchCli(
     ctx.stdout(`unattended:     ${r.unattended ? 'yes' : 'no'}\n`);
     ctx.stdout(`permanent:      ${r.permanent ? 'yes' : 'no'}\n`);
     ctx.stdout(`ding mode:      ${r.ding ? 'yes' : 'no'}\n`);
+    ctx.stdout(`fresh mode:     ${r.fresh ? 'yes' : 'no'}\n`);
     if (r.ding) {
       ctx.stdout(`mcp.json:       (skipped — ding mode)\n`);
     } else {
       ctx.stdout(`mcp.json:       ${r.mcpJsonPath}\n`);
     }
-    if (r.claudeSessionIdPath !== null) {
+    if (r.fresh) {
+      ctx.stdout(`session id:     (skipped — fresh mode; no --resume)\n`);
+    } else if (r.claudeSessionIdPath !== null) {
       ctx.stdout(`session id:     ${r.claudeSessionIdPath}\n`);
     }
     if (r.claudeSettingsPath !== null) {
