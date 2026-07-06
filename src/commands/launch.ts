@@ -677,8 +677,19 @@ function buildPtyToml(opts: {
   // default-path launches leave the env unset so pty.toml doesn't
   // freeze today's default into future restarts. See the enclosing
   // opts.stRoot docstring for the resolution rule.
+  //
+  // Set-side of Phase-2 pty isolation (pty-claude's #55): when the
+  // network is non-default, also emit `PTY_ROOT = <ST_ROOT>/pty`
+  // so pty (which honors `PTY_ROOT` as its state root when defined)
+  // stays inside the same isolated dir as the bus. Q2-A NESTED
+  // layout — a network's whole state (bus + pty) lives under one
+  // ST_ROOT dir, so `rm -rf $ST_ROOT` removes the network entirely.
+  // Emitted with the SAME trigger as ST_ROOT so bus and pty
+  // isolation move in lockstep; a bare-bus / shared-pty split
+  // would defeat the "rm the folder, network's gone" semantic.
   if (opts.stRoot !== undefined) {
     lines.push(`ST_ROOT = "${tomlEscape(opts.stRoot)}"`);
+    lines.push(`PTY_ROOT = "${tomlEscape(opts.stRoot)}/pty"`);
   }
   if (opts.addDingSidecar) {
     // Emit `st ding` (post-cutover canonical). The `coord ding` form
@@ -726,9 +737,13 @@ function buildPtyToml(opts: {
     lines.push(`ST_AGENT = "${tomlEscape(opts.identity)}"`);
     // Same rationale as the main session's env: pin the isolation
     // root so `pty restart <identity>-ding` doesn't drift back to
-    // the live default state root.
+    // the live default state root. `PTY_ROOT` mirrors — Phase-2 pty
+    // isolation (nested, Q2-A) means bus + pty share the network's
+    // root so the ding sidecar's pty state lives in the same
+    // isolated dir as its bus.
     if (opts.stRoot !== undefined) {
       lines.push(`ST_ROOT = "${tomlEscape(opts.stRoot)}"`);
+      lines.push(`PTY_ROOT = "${tomlEscape(opts.stRoot)}/pty"`);
     }
   }
   return lines.join('\n') + '\n';
