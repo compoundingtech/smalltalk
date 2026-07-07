@@ -707,6 +707,137 @@ describe('cmdDingCli — ST_DING_RESCAN_* env overrides', () => {
     expect(stderrBuf.value).toContain('Default 60000 (60s)');
     expect(stderrBuf.value).toContain('Default\n                                   90000 (90s)');
   });
+
+  it('ST_DING_DEBUG=1 is documented in --help', async () => {
+    // Evals runs `st ding --help` to confirm the knob exists before
+    // flipping it in the capstone spins. Regression guard on the
+    // documented surface.
+    const stderrBuf = { value: '' };
+    const c = {
+      env: {},
+      stRoot: '/tmp/fake',
+      stConfig: '/tmp/cfg',
+      stdout: (): void => {},
+      stderr: (s: string): void => {
+        stderrBuf.value += s;
+      },
+      readStdin: async (): Promise<Buffer> => Buffer.from(''),
+      stdinIsTty: (): boolean => true,
+    };
+    await cmdDingCli(['--help'], c);
+    expect(stderrBuf.value).toContain('ST_DING_DEBUG=1');
+    expect(stderrBuf.value).toContain('[st ding\n');
+    expect(stderrBuf.value).toContain('rescan-tick summary');
+  });
+});
+
+// ─── runDing — ST_DING_DEBUG diagnostic instrumentation ────────────────
+
+describe('runDing — debug: true emits [st ding debug] lines', () => {
+  let scratch: string;
+  let stRoot: string;
+  let identityRoot: string;
+  let fake: FakeSt;
+  let sender: FakeSender;
+  const IDENTITY = 'bob';
+
+  beforeEach(() => {
+    scratch = mkdtempSync(join(tmpdir(), 'st-ding-debug-'));
+    stRoot = join(scratch, 'st');
+    mkdirSync(join(stRoot, IDENTITY, 'inbox'), { recursive: true });
+    mkdirSync(join(stRoot, IDENTITY, 'archive'), { recursive: true });
+    identityRoot = join(stRoot, IDENTITY);
+    fake = makeFakeSt(asIdentity(IDENTITY), stRoot);
+    sender = makeFakeSender();
+  });
+  afterEach(() => {
+    fake.endWatch();
+    rmSync(scratch, { recursive: true, force: true });
+  });
+
+  it('rescan tick emits a summary line with inbox / in-flight / quiet / attempted counts', async () => {
+    writeFileSync(join(identityRoot, 'status'), 'available\n');
+    const now = new Date();
+    utimesSync(join(identityRoot, 'status'), now, now);
+    fake.setStatus('available');
+    let stderrBuf = '';
+    const ac = new AbortController();
+    const done = runDing({
+      st: fake.st,
+      identity: asIdentity(IDENTITY),
+      ptySession: 'cap-wk-claude',
+      ptySend: sender.send,
+      intervalMs: 30,
+      tidyIntervalMs: 0,
+      statusRefreshIntervalMs: 0,
+      exitWhenSessionGone: true,
+      sessionWatchIntervalMs: 10_000,
+      isSessionAlive: () => true,
+      rescanIntervalMs: 50,
+      rescanQuietAfterDeliveryMs: 60_000,
+      debug: true,
+      signal: ac.signal,
+      stderr: (s) => {
+        stderrBuf += s;
+      },
+    });
+    // Plant a file so the tick has something to report.
+    writeFileSync(
+      join(identityRoot, 'inbox', '1714826789010-aaaaaa.md'),
+      '---\nfrom: alice\n---\nbody\n'
+    );
+    fake.setMessage(asFilename('1714826789010-aaaaaa.md'), {
+      from: 'alice',
+    });
+    // Wait for one rescan tick + delivery attempt.
+    await new Promise((res) => setTimeout(res, 150));
+    ac.abort();
+    await done;
+    // The rescan-tick log fired.
+    expect(stderrBuf).toMatch(/\[st ding debug\] rescan tick:/);
+    expect(stderrBuf).toMatch(/inbox=1/);
+    expect(stderrBuf).toMatch(/attempted=1/);
+    // The pty-send log fired for the actual delivery.
+    expect(stderrBuf).toMatch(/\[st ding debug\] pty send/);
+    expect(stderrBuf).toMatch(/session="cap-wk-claude"/);
+    expect(stderrBuf).toMatch(/status=0/);
+  });
+
+  it('debug: false → NO [st ding debug] lines emitted (default off)', async () => {
+    writeFileSync(join(identityRoot, 'status'), 'available\n');
+    fake.setStatus('available');
+    let stderrBuf = '';
+    const ac = new AbortController();
+    const done = runDing({
+      st: fake.st,
+      identity: asIdentity(IDENTITY),
+      ptySession: 'target',
+      ptySend: sender.send,
+      intervalMs: 30,
+      tidyIntervalMs: 0,
+      statusRefreshIntervalMs: 0,
+      exitWhenSessionGone: true,
+      sessionWatchIntervalMs: 10_000,
+      isSessionAlive: () => true,
+      rescanIntervalMs: 40,
+      // debug omitted → defaults to false
+      signal: ac.signal,
+      stderr: (s) => {
+        stderrBuf += s;
+      },
+    });
+    writeFileSync(
+      join(identityRoot, 'inbox', '1714826789010-aaaaaa.md'),
+      '---\nfrom: alice\n---\nbody\n'
+    );
+    fake.setMessage(asFilename('1714826789010-aaaaaa.md'), {
+      from: 'alice',
+    });
+    await new Promise((res) => setTimeout(res, 150));
+    ac.abort();
+    await done;
+    expect(stderrBuf).not.toMatch(/\[st ding debug\]/);
+  });
 });
 
 // ─── runDing — tidy-check tick (brief-031) ─────────────────────────────

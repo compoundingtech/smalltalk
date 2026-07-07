@@ -6,6 +6,58 @@ minor releases until 1.0.
 
 ## Unreleased
 
+### Added (coord-kill piece (j) — `ST_DING_DEBUG=1` diagnostic mode)
+
+Piece (i)'s 90s quiet-window did not close the capstone: the
+with-kill capstone re-run still parked the worker for the full
+320s. Evals traced (poked worker screen + peeked `cap-wk-ding`):
+worker frozen at "waiting for the task" while the delegation
+sits unarchived; two unarchived delegations neither triggered
+their arrival poke NOR the re-scan re-pokes for 180s.
+
+`cap-wk-ding` is a headless daemon → `pty peek` shows an empty
+screen; the delivery-decision layer is invisible. Evals needs
+per-tick + per-delivery visibility to pin the failure mechanism.
+
+Ship: `ST_DING_DEBUG=1` env knob. When set, ding emits verbose
+`[st ding debug]` lines to stderr:
+
+- **Startup scan summary**: `startup scan: statusMtimeMs=<n>
+  inbox=<n> eligible=<n>` (+ file list when eligible > 0).
+- **Per-rescan-tick summary**: `rescan tick: inbox=<n>
+  in-flight-skipped=<n> quiet-skipped=<n> attempted=<n>` (+
+  file list when attempted > 0).
+- **Per-pty-send attempt**: `pty send → session="<sess>"
+  status=<n> preview=<first-non-key-sequence>` (+ stderr tail
+  when non-empty).
+
+Wire:
+- New `debug?: boolean` field on `DingDeps`.
+- `cmdDingCli` reads `ST_DING_DEBUG === '1'` from env (any other
+  value is off) → passes as `debug: debugMode` to `runDing`.
+- The `send` wrapper (send-serialization chain) emits the pty
+  send log line on every successful `rawSend`.
+- Documented in `st ding --help` under the "Env overrides"
+  block.
+
+Test coverage:
+- `cmdDingCli --help` output includes `ST_DING_DEBUG=1` +
+  "rescan-tick summary" + the `[st ding` prefix hint.
+- `runDing — debug: true` emits `[st ding debug] rescan tick:`
+  with correct counts + `[st ding debug] pty send → session=…
+  status=…` on delivery.
+- `runDing — debug: false` (default) → NO `[st ding debug]`
+  lines emitted (production-quiet regression guard).
+
+Full suite: 1392 pass (3 new tests), 3 pre-existing integration
+skipped. Pre-push name-hygiene grep: clean.
+
+Held on `feat/kill-coord-entirely` until the reboot signal. LIVE
+via the npm link. Evals will re-run the capstone with
+`ST_DING_DEBUG=1` on both `cap-*-ding` sessions and capture the
+per-filename delivery + rescan trace across the respawn window —
+that's the last mile to pinning the mechanism + owner.
+
 ### Changed (coord-kill piece (i) — capstone 6/0 last-tuning: rescanQuietAfterDeliveryMs 5min → 90s, env-overridable)
 
 Piece (h) covered the **never-delivered** case (down-window backlog,

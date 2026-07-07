@@ -153,11 +153,23 @@ export interface DingDeps {
   /**
    * Quiet period (ms) after a successful delivery before the
    * re-scan will re-poke the same file. Defaults to
-   * DEFAULT_RESCAN_QUIET_AFTER_DELIVERY_MS (5 min). Tunes how long
+   * DEFAULT_RESCAN_QUIET_AFTER_DELIVERY_MS (90s). Tunes how long
    * the agent has to archive a delivered message before ding
    * assumes it may have been missed and re-nudges.
    */
   rescanQuietAfterDeliveryMs?: number;
+  /**
+   * When true, emit verbose `[st ding debug]` lines to stderr:
+   *   - per-rescan-tick summary (inbox / in-flight / quiet-skipped
+   *     / attempted counts)
+   *   - per-delivery-attempt (filename, session name, exit status,
+   *     stderr tail)
+   *   - startup-backlog scan summary (files eligible / skipped)
+   * Used by evals + operators to diagnose delivery/rescan gaps
+   * without pty-peeking. Toggled by ST_DING_DEBUG=1 in
+   * `cmdDingCli`. Default off — production doesn't need the noise.
+   */
+  debug?: boolean;
   /** Stops the daemon. Aborts the watcher and clears the status timer. */
   signal?: AbortSignal;
   /** Where to log warnings. Defaults to `process.stderr.write`. */
@@ -245,6 +257,10 @@ export async function runDing(deps: DingDeps): Promise<void> {
   const intervalMs = deps.intervalMs ?? DEFAULT_INTERVAL_MS;
   const rawSend = deps.ptySend ?? defaultPtySend;
   const log = deps.stderr ?? ((s) => process.stderr.write(s));
+  const debug = deps.debug === true;
+  const dbg = (msg: string): void => {
+    if (debug) log(`[st ding debug] ${msg}\n`);
+  };
 
   // Send serialization: every `pty send` invocation goes through this
   // chain so `--with-delay 0.5`-widened windows can't interleave (a
@@ -257,7 +273,22 @@ export async function runDing(deps: DingDeps): Promise<void> {
     const prev = sendChain;
     const p = (async () => {
       await prev.catch(() => undefined);
-      return rawSend(sessionName, sequences);
+      const result = await rawSend(sessionName, sequences);
+      if (debug) {
+        // Preview line: extract the first non-key sequence for a
+        // human-readable hint (usually the [DING] line body).
+        const preview =
+          sequences.find((s) => !s.startsWith('key:')) ?? sequences[0] ?? '';
+        const shortPreview =
+          preview.length > 80 ? `${preview.slice(0, 77)}...` : preview;
+        const stderrTail = result.stderr.trim().slice(-120);
+        dbg(
+          `pty send → session="${sessionName}" status=${result.status}` +
+            ` preview=${JSON.stringify(shortPreview)}` +
+            (stderrTail.length > 0 ? ` stderr=${JSON.stringify(stderrTail)}` : '')
+        );
+      }
+      return result;
     })();
     sendChain = p.catch(() => undefined);
     return p;
@@ -706,6 +737,15 @@ export async function runDing(deps: DingDeps): Promise<void> {
     // Chronological by filename (the <unix-ms> prefix sorts correctly
     // lexicographically up to year 5138).
     eligible.sort((a, b) => a.filename.localeCompare(b.filename));
+    if (debug) {
+      dbg(
+        `startup scan: statusMtimeMs=${statusMtimeMs} inbox=${entries.length} ` +
+          `eligible=${eligible.length}` +
+          (eligible.length > 0
+            ? ` files=[${eligible.map((e) => e.filename).join(',')}]`
+            : '')
+      );
+    }
     for (const { filename } of eligible) {
       await onEvent(asFilename(filename));
     }
@@ -756,23 +796,47 @@ export async function runDing(deps: DingDeps): Promise<void> {
     const now = msNow();
     // Chronological by filename so re-pokes stay in original order.
     const sorted = [...inboxSet].sort((a, b) => a.localeCompare(b));
+    let inFlightSkipped = 0;
+    let quietSkipped = 0;
+    let attempted = 0;
+    const attemptedFiles: string[] = [];
     for (const name of sorted) {
       const fn = asFilename(name);
       // Skip in-flight: buffered for later flush, or read-retry pending.
-      if (buffer.some((e) => e.filename === fn)) continue;
-      if (readPending.includes(fn)) continue;
+      if (buffer.some((e) => e.filename === fn)) {
+        inFlightSkipped++;
+        continue;
+      }
+      if (readPending.includes(fn)) {
+        inFlightSkipped++;
+        continue;
+      }
       // Skip recently-delivered: give the agent time to process
       // before we re-nudge for the same file.
       const last = deliveredAt.get(fn);
       if (last !== undefined && now - last < rescanQuietAfterDeliveryMs) {
+        quietSkipped++;
         continue;
       }
+      attempted++;
+      attemptedFiles.push(name);
       // Fresh candidate → re-poke via onEvent (respects busy/dnd,
       // buffers if suppressed, retries on transient read failure).
       // Bypass startup dedup: this file may have been startup-seen,
       // but the re-scan is a first-class re-poke trigger, not a
       // startup-race dedup event.
       await onEvent(fn, { bypassStartupDedup: true });
+    }
+    if (debug) {
+      dbg(
+        `rescan tick: inbox=${inboxSet.size}` +
+          ` in-flight-skipped=${inFlightSkipped}` +
+          ` quiet-skipped=${quietSkipped}` +
+          ` attempted=${attempted}` +
+          (attempted > 0
+            ? ` files=[${attemptedFiles.join(',')}]`
+            : '')
+      );
     }
   }
   function startRescanTick(): void {
@@ -1138,7 +1202,14 @@ export async function cmdDingCli(
             '    ST_DING_RESCAN_QUIET_MS        Quiet window after a successful delivery\n' +
             '                                   before the same file is re-poked. Default\n' +
             '                                   90000 (90s). Tune down for aggressive\n' +
-            '                                   re-poking of parked agents.\n'
+            '                                   re-poking of parked agents.\n' +
+            '    ST_DING_DEBUG=1                Verbose diagnostic mode. Emits [st ding\n' +
+            '                                   debug] lines to stderr: startup scan\n' +
+            '                                   summary, per-rescan-tick summary\n' +
+            '                                   (inbox / in-flight-skipped / quiet-\n' +
+            '                                   skipped / attempted), and every pty send\n' +
+            '                                   attempt (session, status, stderr tail).\n' +
+            '                                   Off by default.\n'
         );
         return 0;
       case '--identity':
@@ -1262,6 +1333,11 @@ export async function cmdDingCli(
     ctx.stderr
   );
 
+  // Diagnostic mode: verbose delivery + rescan-tick trace to stderr.
+  // Off by default (production shouldn't pay the log volume). Toggle
+  // via ST_DING_DEBUG=1 in the env; any non-'1' value is off.
+  const debugMode = ctx.env.ST_DING_DEBUG === '1';
+
   try {
     await runDing({
       st: st,
@@ -1277,6 +1353,7 @@ export async function cmdDingCli(
         rescanQuietAfterDeliveryMs,
       }),
       exitWhenSessionGone,
+      debug: debugMode,
       signal: ac.signal,
       stderr: ctx.stderr,
     });
