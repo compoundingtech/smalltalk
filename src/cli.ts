@@ -27,6 +27,7 @@ import { cmdAgentsCli } from './commands/agents.ts';
 import { cmdOverviewCli } from './commands/overview.ts';
 import { cmdReadCli } from './commands/read.ts';
 import { cmdResourceCli } from './commands/resource.ts';
+import { cmdLaunchCoreCli } from './commands/launch-core.ts';
 import { cmdReplyCli } from './commands/reply.ts';
 import { cmdSendCli } from './commands/send.ts';
 import { cmdStatusCli } from './commands/status.ts';
@@ -248,6 +249,13 @@ export async function runCli(
         return await cmdInitCli(rest, ctx);
       case 'launch':
         return await cmdLaunchCli(rest, ctx);
+      case '__launch-core':
+        // Hidden JSON-in/JSON-out entrypoint for convoy's launch
+        // bridge. NOT listed in `st help` / completions on purpose
+        // — this is not a user surface, it's the convoy contract
+        // while the write logic still lives in TS. Retires when
+        // convoy's Swift port reaches parity.
+        return await cmdLaunchCoreCli(rest, ctx);
       case 'ding':
         return await cmdDingCli(rest, ctx);
       case 'completions':
