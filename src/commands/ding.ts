@@ -17,6 +17,7 @@ import { join } from 'node:path';
 import { invokedName, type CliContext } from '../cli-context.ts';
 import {
   inboxDir,
+  msNow,
   statusPath,
   STATUS_REFRESH_MS,
   TIDY_CHECK_INTERVAL_MS,
@@ -141,6 +142,22 @@ export interface DingDeps {
    * (5 min). Set to 0 to disable.
    */
   statusRefreshIntervalMs?: number;
+  /**
+   * Reboot self-healing: how often (ms) to re-scan the inbox for
+   * files that are unarchived + not-recently-delivered and re-poke
+   * the target session. Defaults to DEFAULT_RESCAN_INTERVAL_MS
+   * (60s). Set to 0 to disable (the pre-tick push-only behavior).
+   * Tests use a small value to observe ticks.
+   */
+  rescanIntervalMs?: number;
+  /**
+   * Quiet period (ms) after a successful delivery before the
+   * re-scan will re-poke the same file. Defaults to
+   * DEFAULT_RESCAN_QUIET_AFTER_DELIVERY_MS (5 min). Tunes how long
+   * the agent has to archive a delivered message before ding
+   * assumes it may have been missed and re-nudges.
+   */
+  rescanQuietAfterDeliveryMs?: number;
   /** Stops the daemon. Aborts the watcher and clears the status timer. */
   signal?: AbortSignal;
   /** Where to log warnings. Defaults to `process.stderr.write`. */
@@ -178,6 +195,34 @@ const MAX_DELIVER_RETRIES = 5;
  * ms. Cleared when the window expires.
  */
 const STARTUP_DEDUP_WINDOW_MS = 60_000;
+
+/**
+ * How often the periodic backlog re-scan tick fires. Reads the
+ * inbox and re-pokes for any file that's unarchived and hasn't
+ * been delivered recently.
+ *
+ * This is the reboot self-healing leg: when the target claude
+ * session dies + comes back (respawn / restart / crash), the ding
+ * sidecar's `deliver` fails during the down window and the file is
+ * dropped after MAX_DELIVER_RETRIES. Once the session returns,
+ * this tick catches the still-unarchived file and re-pokes.
+ *
+ * 60s per cos's tuning: fast enough that the capstone-eval's ~220s
+ * LOOP-CLOSED window sees a re-poke, cheap enough to run forever
+ * (readdirSync of a folder is microseconds).
+ */
+const DEFAULT_RESCAN_INTERVAL_MS = 60_000;
+
+/**
+ * Quiet period after a SUCCESSFUL delivery before the re-scan will
+ * re-poke the same file. Gives the agent time to read + archive
+ * before we nudge again. If the agent is healthy + mid-processing,
+ * the archive lands during this window and the file is gone from
+ * the inbox before the next re-scan looks at it — no wasted poke.
+ * If the agent is wedged (--resume that skipped the boot ritual),
+ * the file stays unarchived, we re-poke after this window elapses.
+ */
+const DEFAULT_RESCAN_QUIET_AFTER_DELIVERY_MS = 5 * 60 * 1000;
 
 /**
  * Run the ding daemon. Resolves when the AbortSignal aborts (or
@@ -227,6 +272,12 @@ export async function runDing(deps: DingDeps): Promise<void> {
   // Retried on each flush tick. At-least-once semantics — better than
   // silently dropping a notice on a transient FS race.
   const readPending: Filename[] = [];
+  // Last successful delivery timestamp per filename. Used by the
+  // periodic re-scan tick to skip files the agent was recently
+  // notified about (giving them time to process before we re-poke).
+  // Entries are pruned lazily at the top of runRescanTick when the
+  // file is no longer in the inbox (archived).
+  const deliveredAt = new Map<Filename, number>();
   let timer: ReturnType<typeof setInterval> | undefined;
   // Guard against re-entrant tryFlush: setInterval schedules the
   // callback at fixed times regardless of whether the previous
@@ -512,15 +563,17 @@ export async function runDing(deps: DingDeps): Promise<void> {
           if (retries >= MAX_DELIVER_RETRIES) {
             log(
               `st ding: giving up on ${ev.filename} after ${MAX_DELIVER_RETRIES} deliver attempts; ` +
-                `check pty session "${deps.ptySession}" or restart ding\n`
+                `check pty session "${deps.ptySession}" or restart ding — ` +
+                `will re-attempt via the periodic backlog re-scan\n`
             );
-            continue; // drop after cap — loud log surface
+            continue; // drop after cap — periodic re-scan retries later
           }
           buffer.unshift({ ...ev, retries });
           // Break out of the while: don't spin on the same failing
           // event within one flush call. Timer will re-fire.
           break;
         }
+        deliveredAt.set(ev.filename, msNow());
       }
       if (buffer.length === 0 && readPending.length === 0) {
         disarmTimer();
@@ -538,10 +591,15 @@ export async function runDing(deps: DingDeps): Promise<void> {
   const startupSeen = new Set<string>();
   let startupPhase = true;
 
-  async function onEvent(filename: Filename): Promise<void> {
+  async function onEvent(
+    filename: Filename,
+    opts: { bypassStartupDedup?: boolean } = {}
+  ): Promise<void> {
     // Startup-window dedup — either the scan or the watcher wins for
-    // a given filename, the other is a no-op.
-    if (startupPhase) {
+    // a given filename, the other is a no-op. The periodic re-scan
+    // (post-startup semantics) bypasses this so a file already seen
+    // during boot can still be re-poked on later ticks.
+    if (startupPhase && opts.bypassStartupDedup !== true) {
       if (startupSeen.has(filename)) return;
       startupSeen.add(filename);
     }
@@ -582,13 +640,16 @@ export async function runDing(deps: DingDeps): Promise<void> {
       if (retries >= MAX_DELIVER_RETRIES) {
         log(
           `st ding: giving up on ${event.filename} after ${MAX_DELIVER_RETRIES} deliver attempts; ` +
-            `check pty session "${deps.ptySession}" or restart ding\n`
+            `check pty session "${deps.ptySession}" or restart ding — ` +
+            `will re-attempt via the periodic backlog re-scan\n`
         );
         return;
       }
       buffer.push({ ...event, retries });
       ensureTimerArmed();
+      return;
     }
+    deliveredAt.set(event.filename, msNow());
   }
 
   // brief-035 t2: ding scan-on-startup. On boot, replay any inbox
@@ -639,6 +700,84 @@ export async function runDing(deps: DingDeps): Promise<void> {
     }
   }
 
+  // Reboot self-healing: periodic re-scan tick. Re-pokes files that
+  // are still in the inbox (unarchived) and haven't been delivered
+  // recently. Covers three failure modes the initial scan +
+  // watcher-fire path miss:
+  //   1. Ding survived but the target claude session died. `deliver`
+  //      failed during the down window and the file was dropped
+  //      after MAX_DELIVER_RETRIES. Once claude respawns, the next
+  //      tick finds the unarchived file (no `deliveredAt` entry) and
+  //      re-pokes.
+  //   2. Agent was busy → available flipped. The buffer flush covers
+  //      this normally; the re-scan is idempotent (files in the
+  //      buffer are skipped).
+  //   3. Agent respawned via `--resume` and skipped the boot ritual.
+  //      Backlog sits unarchived; after RESCAN_QUIET_AFTER_DELIVERY_MS
+  //      elapses (~5 min), we re-nudge.
+  //
+  // Buffer + readPending are the "in-flight" markers — files already
+  // being retried. Skip them so the re-scan doesn't double-buffer.
+  const rescanIntervalMs =
+    deps.rescanIntervalMs ?? DEFAULT_RESCAN_INTERVAL_MS;
+  const rescanQuietAfterDeliveryMs =
+    deps.rescanQuietAfterDeliveryMs ??
+    DEFAULT_RESCAN_QUIET_AFTER_DELIVERY_MS;
+  let rescanTimer: ReturnType<typeof setInterval> | undefined;
+  async function runRescanTick(): Promise<void> {
+    const dir = inboxDir(deps.identity, deps.st.root);
+    let entries: string[];
+    try {
+      entries = readdirSync(dir);
+    } catch {
+      return; // inbox missing / unreadable — nothing to scan
+    }
+    const inboxSet = new Set<string>();
+    for (const name of entries) {
+      if (validFilename(name)) inboxSet.add(name);
+    }
+    // Prune deliveredAt: forget files that were archived (no longer
+    // in inbox) so the map doesn't grow unbounded. Rare-cost O(map)
+    // pass; the map's size tracks unarchived files, typically small.
+    for (const fn of deliveredAt.keys()) {
+      if (!inboxSet.has(fn)) deliveredAt.delete(fn);
+    }
+    const now = msNow();
+    // Chronological by filename so re-pokes stay in original order.
+    const sorted = [...inboxSet].sort((a, b) => a.localeCompare(b));
+    for (const name of sorted) {
+      const fn = asFilename(name);
+      // Skip in-flight: buffered for later flush, or read-retry pending.
+      if (buffer.some((e) => e.filename === fn)) continue;
+      if (readPending.includes(fn)) continue;
+      // Skip recently-delivered: give the agent time to process
+      // before we re-nudge for the same file.
+      const last = deliveredAt.get(fn);
+      if (last !== undefined && now - last < rescanQuietAfterDeliveryMs) {
+        continue;
+      }
+      // Fresh candidate → re-poke via onEvent (respects busy/dnd,
+      // buffers if suppressed, retries on transient read failure).
+      // Bypass startup dedup: this file may have been startup-seen,
+      // but the re-scan is a first-class re-poke trigger, not a
+      // startup-race dedup event.
+      await onEvent(fn, { bypassStartupDedup: true });
+    }
+  }
+  function startRescanTick(): void {
+    if (rescanIntervalMs <= 0) return;
+    rescanTimer = setInterval(() => {
+      void runRescanTick();
+    }, rescanIntervalMs);
+    rescanTimer.unref?.();
+  }
+  function stopRescanTick(): void {
+    if (rescanTimer !== undefined) {
+      clearInterval(rescanTimer);
+      rescanTimer = undefined;
+    }
+  }
+
   // Arm the brief-031 tidy-check tick alongside the inbox watcher.
   // It runs on its own setInterval — independent of the
   // buffer-flush timer above — and the AbortSignal that ends the
@@ -653,6 +792,9 @@ export async function runDing(deps: DingDeps): Promise<void> {
 
   // brief-032: arm the status-file mtime refresh tick.
   startStatusRefresh();
+
+  // Reboot self-healing: arm the periodic backlog re-scan.
+  startRescanTick();
 
   // brief-035 t2 (revised): arm the watcher BEFORE the startup scan
   // to close the race window a scan-then-watch ordering left open.
@@ -718,6 +860,7 @@ export async function runDing(deps: DingDeps): Promise<void> {
     stopTidyTick();
     stopSessionWatch();
     stopStatusRefresh();
+    stopRescanTick();
   }
 }
 

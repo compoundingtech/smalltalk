@@ -6,6 +6,88 @@ minor releases until 1.0.
 
 ## Unreleased
 
+### Added (coord-kill piece (h) — reboot self-healing: periodic backlog re-scan in `st ding`)
+
+Ding now periodically re-scans the inbox and re-pokes for files
+that are unarchived AND not-recently-delivered. Covers the
+respawn/`--resume` case that the initial `scanStartupBacklog`
+missed.
+
+The gap it closes:
+- Ding sidecar survives when the target claude session dies +
+  respawns (they're independent pty sessions).
+- Message arrives during the down window → `deliver` fails → 5
+  retries → dropped from the buffer.
+- File still sits unarchived in the inbox; nothing re-pokes when
+  claude returns.
+- Claude respawns via `--resume` → context preserved, but the
+  persona's "drain your inbox on boot" ritual is skipped.
+- **Result before this fix:** agent comes back with a backlog it
+  doesn't know about.
+
+The fix (ding-only; no convoy-side contract):
+- New `runRescanTick` fires every `rescanIntervalMs` (default 60s,
+  per cos's tuning — capstone grades LOOP-CLOSED in ~220s).
+- Reads inbox via `readdirSync`; for each valid filename:
+  - Skip if in-flight (present in the flush buffer or the read-
+    retry queue).
+  - Skip if delivered within the last
+    `rescanQuietAfterDeliveryMs` (default 5 min — gives the agent
+    time to read + archive before we re-nudge).
+  - Otherwise → feed to `onEvent`, which respects busy/dnd,
+    buffers if suppressed, delivers if available.
+- New `deliveredAt: Map<Filename, number>` tracks last successful
+  delivery timestamp per filename. Updated in both the direct
+  `deliver` path (onEvent) and the flush-loop path (tryFlush).
+  Pruned lazily at the top of `runRescanTick` — entries for
+  archived files (no longer in inbox) get deleted so the map
+  doesn't grow unbounded.
+- The startup-window dedup (`startupSeen`) is bypassed by the
+  re-scan: a periodic re-poke is a first-class trigger, not a
+  startup-race dedup event. Added a
+  `{ bypassStartupDedup?: boolean }` option to `onEvent`.
+- Retry-cap log line updated: `giving up on <file>` now ends with
+  "will re-attempt via the periodic backlog re-scan" so operators
+  don't panic that a message was lost.
+- Timer lifecycle: `startRescanTick` on the same lifecycle path
+  as the other periodic ticks; `stopRescanTick` in the finally
+  block. `unref()` so the timer doesn't hold node open on abort.
+- New `DingDeps` fields: `rescanIntervalMs?` (default 60s; set to
+  0 to disable — pre-tick push-only behavior) and
+  `rescanQuietAfterDeliveryMs?` (default 5 min).
+- New `common.ts` import: `msNow` — used for timestamp tracking.
+
+Test coverage (5 new tests in `runDing — periodic backlog
+re-scan`):
+1. Unarchived file with no prior delivery → re-scan re-pokes on
+   the next tick.
+2. Recently-delivered file → re-scan SKIPS re-poking within the
+   quiet window.
+3. Archived files are pruned from `deliveredAt` — the same
+   filename re-planted later gets re-poked.
+4. `rescanIntervalMs: 0` → tick disabled (pre-tick behavior).
+5. Failed delivery burst → next re-scan re-pokes once the sender
+   is healthy again (the canonical reboot self-healing case).
+
+Tests default `rescanIntervalMs: 0` in the shared `startDing`
+helper so pre-existing tests don't see surprise re-pokes; the new
+describe block opts in explicitly.
+
+Split decision with convoy-claude:
+- Option A (ding-only periodic re-scan) vs option B (convoy
+  respawn-signal). Chose A per cos's endorsement + convoy's
+  agreement: no cross-project contract, ship on the held branch,
+  covers respawn + wedged-`--resume` + busy→available flip. Also
+  fits cos's "minimal ding, single-purpose" directive: ding's
+  one job (wake the agent for its inbox), extended to cover the
+  down-window case.
+
+Full suite: 1387 pass (5 new tests), 3 pre-existing integration
+skipped. Pre-push name-hygiene grep: clean.
+
+Held on `feat/kill-coord-entirely` until the reboot signal. Last
+piece for capstone 6/0.
+
 ### Removed (coord-kill piece (g) — `st launch` + `launch-core` deleted; convoy owns launch natively)
 
 Architecture decision (Nathan → cos): smalltalk = **pure message

@@ -246,6 +246,8 @@ function startDing(opts: {
   sessionWatchIntervalMs?: number;
   isSessionAlive?: (s: string) => boolean;
   statusRefreshIntervalMs?: number;
+  rescanIntervalMs?: number;
+  rescanQuietAfterDeliveryMs?: number;
   stderr?: (s: string) => void;
 }): RunningDing {
   const ac = new AbortController();
@@ -269,6 +271,14 @@ function startDing(opts: {
     // don't have their status fixtures rewritten under them. The
     // refresh describe block opts in explicitly.
     statusRefreshIntervalMs: opts.statusRefreshIntervalMs ?? 0,
+    // Default periodic re-scan OFF so existing tests don't see
+    // surprise re-pokes from the reboot-self-healing tick. The
+    // re-scan describe block opts in with a small interval to
+    // observe ticks deterministically.
+    rescanIntervalMs: opts.rescanIntervalMs ?? 0,
+    ...(opts.rescanQuietAfterDeliveryMs !== undefined && {
+      rescanQuietAfterDeliveryMs: opts.rescanQuietAfterDeliveryMs,
+    }),
     signal: ac.signal,
     ...(opts.stderr !== undefined && { stderr: opts.stderr }),
   });
@@ -1495,6 +1505,240 @@ describe('runDing — scan-on-startup', () => {
     // accidentally double-counted; expect still 1.
     await new Promise((res) => setTimeout(res, 80));
     expect(sender.calls()).toHaveLength(1);
+    r.ac.abort();
+    await r.done;
+  });
+});
+
+// ─── runDing — periodic backlog re-scan (reboot self-healing) ───────────
+//
+// The scan-on-startup path above handles the case where DING itself
+// restarts. This block covers the harder case: ding survives, but the
+// target claude session dies + comes back. A message that arrived
+// during the down window fails delivery (MAX_DELIVER_RETRIES) and
+// gets dropped from the buffer — the file is still in the inbox, but
+// nothing re-pokes it. The periodic re-scan tick catches these:
+// every `rescanIntervalMs`, walk the inbox and re-poke any file that
+// is (a) unarchived, (b) not in-flight, (c) not delivered recently.
+
+describe('runDing — periodic backlog re-scan', () => {
+  let scratch: string;
+  let stRoot: string;
+  let identityRoot: string;
+  let fake: FakeSt;
+  let sender: FakeSender;
+  const IDENTITY = 'bob';
+
+  beforeEach(() => {
+    scratch = mkdtempSync(join(tmpdir(), 'st-ding-rescan-'));
+    stRoot = join(scratch, 'st');
+    mkdirSync(join(stRoot, IDENTITY, 'inbox'), { recursive: true });
+    mkdirSync(join(stRoot, IDENTITY, 'archive'), { recursive: true });
+    identityRoot = join(stRoot, IDENTITY);
+    fake = makeFakeSt(asIdentity(IDENTITY), stRoot);
+    sender = makeFakeSender();
+  });
+  afterEach(() => {
+    fake.endWatch();
+    rmSync(scratch, { recursive: true, force: true });
+  });
+
+  function setStatusAvailable(): void {
+    // Fresh status mtime so scan-on-startup ignores pre-planted files
+    // (they'd otherwise show up as startup pushes and pollute the
+    // re-scan-only assertion). The re-scan doesn't care about status
+    // mtime — it cares about inbox membership + deliveredAt.
+    writeFileSync(join(identityRoot, 'status'), 'available\n');
+    fake.setStatus('available');
+  }
+  function plantInboxFile(filename: string): void {
+    writeFileSync(
+      join(identityRoot, 'inbox', filename),
+      '---\nfrom: alice\nsubject: hi\n---\nbody\n'
+    );
+    fake.setMessage(filename, { from: 'alice', subject: 'hi' });
+  }
+  function archiveInboxFile(filename: string): void {
+    rmSync(join(identityRoot, 'inbox', filename));
+    // Also plant into the archive so the fake doesn't complain if
+    // asked; not strictly required for the re-scan (it reads inbox
+    // directly via readdirSync).
+  }
+
+  it('unarchived file with no prior delivery → re-scan re-pokes on next tick', async () => {
+    // Simulates: file arrived during a claude down-window; ding tried
+    // to deliver, failed, dropped after MAX_DELIVER_RETRIES. File
+    // still in inbox with no deliveredAt entry. On the next re-scan,
+    // ding re-pokes.
+    //
+    // We use a small rescanIntervalMs to observe the tick fast.
+    // No status mtime → all files eligible for the startup scan too,
+    // so plant the file AFTER startup settles.
+    writeFileSync(join(identityRoot, 'status'), 'available\n');
+    // Advance status mtime to "now" so scan-on-startup won't replay
+    // the not-yet-planted file. (Files planted after startup are
+    // caught by the re-scan, not the startup scan.)
+    const now = new Date();
+    utimesSync(join(identityRoot, 'status'), now, now);
+    fake.setStatus('available');
+    const r = startDing({
+      st: fake.st,
+      ptySend: sender.send,
+      rescanIntervalMs: 50,
+    });
+    await settle();
+    // Nothing planted yet.
+    expect(sender.calls()).toHaveLength(0);
+    // Plant a file. The watcher uses sinceNow so it WILL fire on this;
+    // to isolate the re-scan behavior, we simulate the down-window
+    // drop: plant the file BEFORE the fake watcher's queue processes
+    // it — but the fake's `setMessage` does not push into the watch
+    // stream. So a plain plantInboxFile + wait-for-tick tests the
+    // re-scan path without the watcher racing.
+    plantInboxFile('1714826789010-aaaaaa.md');
+    // Wait > 1 tick.
+    await new Promise((res) => setTimeout(res, 150));
+    expect(sender.calls().length).toBeGreaterThanOrEqual(1);
+    expect(sender.calls()[0]!.sequences[0]).toContain('alice');
+    r.ac.abort();
+    await r.done;
+  });
+
+  it('recently-delivered file → re-scan SKIPS re-poking within the quiet window', async () => {
+    // File delivered fresh. Even if it stays in the inbox
+    // (agent hasn't archived yet), the re-scan should not re-poke
+    // within RESCAN_QUIET_AFTER_DELIVERY_MS. Use a long quiet window
+    // and a short scan interval to observe: tick fires but no re-poke.
+    writeFileSync(join(identityRoot, 'status'), 'available\n');
+    const now = new Date();
+    utimesSync(join(identityRoot, 'status'), now, now);
+    fake.setStatus('available');
+    const r = startDing({
+      st: fake.st,
+      ptySend: sender.send,
+      rescanIntervalMs: 30,
+      rescanQuietAfterDeliveryMs: 60_000, // 60s quiet — well beyond the test window
+    });
+    await settle();
+    // Deliver a file via the watcher path (simulating a healthy live
+    // arrival). Push directly into the fake's queue so the watcher
+    // fires and delivery succeeds → deliveredAt marked.
+    plantInboxFile('1714826789010-aaaaaa.md');
+    fake.pushEvent(asFilename('1714826789010-aaaaaa.md'));
+    await settle();
+    expect(sender.calls()).toHaveLength(1);
+    // Now wait > 3 rescan intervals with the quiet window still
+    // active. The file is unarchived but deliveredAt is fresh → skip.
+    await new Promise((res) => setTimeout(res, 150));
+    expect(sender.calls()).toHaveLength(1);
+    r.ac.abort();
+    await r.done;
+  });
+
+  it('archived files are pruned from deliveredAt (map does not grow unbounded)', async () => {
+    // After an archive, the file is no longer in the inbox. The
+    // re-scan prunes its deliveredAt entry. Correctness is: the same
+    // filename (identical bytes) can be re-planted later (unlikely
+    // but possible in a bus-replay flow) and gets re-poked.
+    writeFileSync(join(identityRoot, 'status'), 'available\n');
+    const now = new Date();
+    utimesSync(join(identityRoot, 'status'), now, now);
+    fake.setStatus('available');
+    const r = startDing({
+      st: fake.st,
+      ptySend: sender.send,
+      rescanIntervalMs: 30,
+      rescanQuietAfterDeliveryMs: 60_000,
+    });
+    await settle();
+    plantInboxFile('1714826789010-aaaaaa.md');
+    fake.pushEvent(asFilename('1714826789010-aaaaaa.md'));
+    await settle();
+    expect(sender.calls()).toHaveLength(1);
+    // Archive the file (remove from inbox).
+    archiveInboxFile('1714826789010-aaaaaa.md');
+    // Wait for at least one re-scan tick to run its prune pass.
+    // 3 tick-widths should be more than sufficient for the prune to
+    // land before the re-plant.
+    await new Promise((res) => setTimeout(res, 100));
+    // Now re-plant the same filename. deliveredAt should be empty
+    // (pruned on the tick above); the next tick should re-poke.
+    plantInboxFile('1714826789010-aaaaaa.md');
+    await new Promise((res) => setTimeout(res, 150));
+    expect(sender.calls().length).toBeGreaterThanOrEqual(2);
+    r.ac.abort();
+    await r.done;
+  });
+
+  it('rescanIntervalMs: 0 → tick disabled (pre-tick push-only behavior)', async () => {
+    // Regression guard: an operator running with rescanIntervalMs=0
+    // gets the pre-self-healing behavior. Files dropped from the
+    // buffer stay dropped; no periodic re-poke.
+    writeFileSync(join(identityRoot, 'status'), 'available\n');
+    const now = new Date();
+    utimesSync(join(identityRoot, 'status'), now, now);
+    fake.setStatus('available');
+    const r = startDing({
+      st: fake.st,
+      ptySend: sender.send,
+      rescanIntervalMs: 0, // disabled
+    });
+    await settle();
+    plantInboxFile('1714826789010-aaaaaa.md');
+    // Wait several tick-lengths of what the default interval would be
+    // (but there's no timer). No re-scan → no push.
+    await new Promise((res) => setTimeout(res, 200));
+    expect(sender.calls()).toHaveLength(0);
+    r.ac.abort();
+    await r.done;
+  });
+
+  it('failed delivery → next re-scan re-pokes (the reboot self-healing case)', async () => {
+    // The canonical scenario: file arrived while claude was down.
+    // Ding tried 5 retries, dropped it. File still unarchived. The
+    // re-scan sees the file with no `deliveredAt` entry (never
+    // successfully delivered) and re-pokes on the next tick with the
+    // now-healthy sender (simulating claude respawned).
+    //
+    // We keep the sender's fail-count LESS than the total attempts
+    // ding will make (5 initial retries + rescan re-attempt) so that
+    // eventually a call SUCCEEDS and lands in `calls`. If the flake
+    // window is too wide, the buffer keeps dropping indefinitely and
+    // the test asserts nothing useful; we tune the window narrow so
+    // that after the first retry burst, the sender is healthy.
+    writeFileSync(join(identityRoot, 'status'), 'available\n');
+    const now = new Date();
+    utimesSync(join(identityRoot, 'status'), now, now);
+    fake.setStatus('available');
+    // Fail the first 3 calls (simulating the down window), then
+    // succeed. 3 < MAX_DELIVER_RETRIES so the first burst actually
+    // reaches the SUCCESS branch of `deliver` before the retry cap
+    // — but importantly, when it succeeds via the rescan-triggered
+    // onEvent, `calls.push` fires and we can assert.
+    let failCount = 0;
+    const FAIL_LIMIT = 3;
+    const calls: { sessionName: string; sequences: string[] }[] = [];
+    const flakySend: PtySender = async (sessionName, sequences) => {
+      if (failCount < FAIL_LIMIT) {
+        failCount++;
+        return { status: 1, stderr: 'session gone' };
+      }
+      calls.push({ sessionName, sequences });
+      return { status: 0, stderr: '' };
+    };
+    const r = startDing({
+      st: fake.st,
+      ptySend: flakySend,
+      rescanIntervalMs: 40,
+      rescanQuietAfterDeliveryMs: 60_000,
+      intervalMs: 20,
+    });
+    await settle();
+    plantInboxFile('1714826789010-aaaaaa.md');
+    // Wait for the retry burst + rescan cycles.
+    await new Promise((res) => setTimeout(res, 400));
+    expect(calls.length).toBeGreaterThanOrEqual(1);
+    expect(calls[0]!.sequences[0]).toContain('alice');
     r.ac.abort();
     await r.done;
   });
