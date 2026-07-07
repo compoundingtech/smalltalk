@@ -9,7 +9,7 @@
 // so the underlying daemon (`runDing`) is testable without a real
 // pty binary or a real Coord — see tests/unit/ding.test.ts.
 
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { readdirSync, readFileSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
@@ -41,6 +41,21 @@ const DEFAULT_INTERVAL_MS = 1000;
  *  the agent died, not the few seconds between session-death and
  *  ding-exit. */
 const DEFAULT_SESSION_WATCH_INTERVAL_MS = 30_000;
+
+/**
+ * Session-flap debounce: how many CONSECUTIVE "target gone"
+ * observations the session-watch tick needs before tripping the
+ * exit-when-gone path. A pty `--permanent` session is auto-restarted
+ * by pty's supervisor; the window between the old process's exit
+ * and the pidfile's rewrite can look "gone" to `process.kill(pid,
+ * 0)` for a tick or two. Without debounce, ding exits right when
+ * its target is about to come back; its own supervisor restarts
+ * ding eventually but arrivals during the gap are missed. Three
+ * consecutive misses at the default 30s interval = ~90s of "really
+ * gone" evidence before we trip; at aggressive test intervals a
+ * quick flap (single miss) rides through cleanly.
+ */
+const SESSION_GONE_DEBOUNCE_MISSES = 3;
 
 const SUPPRESS_STATES: ReadonlySet<State> = new Set<State>(['busy', 'dnd']);
 
@@ -330,6 +345,16 @@ export async function runDing(deps: DingDeps): Promise<void> {
   // Bookkeeping to keep the "still waiting" log a single line, not
   // a per-tick spam.
   let loggedWaitingForTarget = false;
+  // Session-flap debounce: require N consecutive "gone" observations
+  // before tripping the exit-when-gone path. A pty `--permanent`
+  // session is auto-restarted by pty's supervisor; between the old
+  // process exiting and the pidfile being rewritten there's a
+  // window where `process.kill(pid, 0)` returns ESRCH but the
+  // session is actually about to come back. Without debounce, ding
+  // exits right when its target has just briefly flapped — its
+  // supervisor restarts ding eventually but arrivals during the gap
+  // are missed. Debounce closes that hole.
+  let consecutiveMisses = 0;
   function runSessionWatchTick(): void {
     let alive: boolean;
     try {
@@ -337,12 +362,15 @@ export async function runDing(deps: DingDeps): Promise<void> {
     } catch (err) {
       // Probe failure: be conservative — treat as alive so we don't
       // tear down on a transient permission glitch. Log so the
-      // operator can investigate.
+      // operator can investigate. Also reset the miss counter — an
+      // unknown state shouldn't count as a "gone" observation.
       log(`coord ding: session-alive check failed: ${errMsg(err)}\n`);
+      consecutiveMisses = 0;
       return;
     }
     if (alive) {
       seenTargetAlive = true;
+      consecutiveMisses = 0;
       return;
     }
     // alive === false
@@ -359,6 +387,21 @@ export async function runDing(deps: DingDeps): Promise<void> {
         );
         loggedWaitingForTarget = true;
       }
+      return;
+    }
+    // Post-startup, target has flipped from alive to gone. Debounce:
+    // require SESSION_GONE_DEBOUNCE_MISSES consecutive misses before
+    // aborting. A permanent-session flap (~1-2 misses at the default
+    // 30s interval, or ~1 miss at aggressive test intervals) rides
+    // through cleanly; a real "session ended" (target won't come
+    // back) still trips the exit path within a couple of ticks.
+    consecutiveMisses++;
+    if (consecutiveMisses < SESSION_GONE_DEBOUNCE_MISSES) {
+      log(
+        `coord ding: target session "${deps.ptySession}" appears gone ` +
+          `(miss ${consecutiveMisses}/${SESSION_GONE_DEBOUNCE_MISSES}); ` +
+          `debouncing before exit.\n`
+      );
       return;
     }
     log(
@@ -847,9 +890,52 @@ function errMsg(err: unknown): string {
 
 // ─── CLI wrapper ────────────────────────────────────────────────────────
 
+export interface PtyProbeResult {
+  available: boolean;
+  reason?: string;
+}
+
+/**
+ * PATH robustness: probe for the `pty` binary at daemon boot. Runs
+ * `pty --version` synchronously. On success → available. On ENOENT
+ * / non-zero exit → `{ available: false, reason: <human-readable> }`.
+ * A ding daemon that can't spawn `pty` runs forever with zero
+ * successful deliveries — better to exit-with-error at start than
+ * silently fail forever. Exported for tests.
+ */
+export function probePtyOnPath(): PtyProbeResult {
+  // `pty --help` returns 0 without touching live session state (unlike
+  // `pty ls` which reads the session dir). Safer for a boot-time
+  // liveness check; if `pty` is on PATH and executable, this succeeds.
+  let probe: ReturnType<typeof spawnSync>;
+  try {
+    probe = spawnSync('pty', ['--help'], {
+      stdio: 'pipe',
+      encoding: 'utf8',
+    });
+  } catch (err) {
+    return { available: false, reason: errMsg(err) };
+  }
+  if (probe.error !== undefined) {
+    return { available: false, reason: probe.error.message };
+  }
+  if (probe.status !== 0) {
+    const tail =
+      typeof probe.stderr === 'string' && probe.stderr.length > 0
+        ? `: ${probe.stderr.trim().slice(0, 200)}`
+        : '';
+    return {
+      available: false,
+      reason: `pty --help exited ${probe.status}${tail}`,
+    };
+  }
+  return { available: true };
+}
+
 export async function cmdDingCli(
   args: readonly string[],
-  ctx: CliContext
+  ctx: CliContext,
+  deps: { ptyProbe?: () => PtyProbeResult } = {}
 ): Promise<number> {
   let ptySession: string | undefined;
   let identityArg: string | undefined;
@@ -961,6 +1047,36 @@ export async function cmdDingCli(
 
   const identity = asIdentity(identityValue);
   const coord = createCoord({ root, identity });
+
+  // PATH robustness: probe for `pty` on the daemon's PATH BEFORE
+  // starting the watcher / timers. A ding daemon that can't spawn
+  // `pty` runs forever with zero successful deliveries; fail fast
+  // + LOUD is the right posture. Especially load-bearing when ding
+  // is launched from a supervisor (launchd/systemd/cron) whose
+  // environment strips PATH — the ding sidecar comes up "healthy"
+  // but silently drops every notice.
+  const probe = deps.ptyProbe ?? probePtyOnPath;
+  const probeResult = probe();
+  if (!probeResult.available) {
+    ctx.stderr(
+      `\n` +
+        `[st ding] ────────────────────────────────────────\n` +
+        `[st ding] The 'pty' binary is NOT available on PATH.\n` +
+        `[st ding] st ding cannot deliver any [DING] notices\n` +
+        `[st ding] without pty — it's the transport layer.\n` +
+        `[st ding]\n` +
+        `[st ding] Probe: ${probeResult.reason ?? 'unknown failure'}\n` +
+        `[st ding]\n` +
+        `[st ding] Fix: install pty and ensure it's on the\n` +
+        `[st ding] daemon's PATH. If ding is launched by a\n` +
+        `[st ding] supervisor (launchd/systemd), the supervisor\n` +
+        `[st ding] typically strips PATH; set PATH explicitly\n` +
+        `[st ding] in the unit/plist file. Refusing to start\n` +
+        `[st ding] rather than run forever with zero deliveries.\n` +
+        `[st ding] ────────────────────────────────────────\n\n`
+    );
+    return 2;
+  }
 
   const ac = new AbortController();
   const onSig = (): void => ac.abort();

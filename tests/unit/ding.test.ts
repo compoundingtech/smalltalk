@@ -20,9 +20,11 @@ import { STALE_INBOX_MS } from '../../src/common.ts';
 import {
   buildPtySendArgs,
   cmdDingCli,
+  probePtyOnPath,
   runDing,
   type PtySender,
 } from '../../src/commands/ding.ts';
+import type { CliContext } from '../../src/cli-context.ts';
 import type { Coord, ReadOptions, WatchOptions } from '../../src/lib.ts';
 import {
   asFilename,
@@ -1738,5 +1740,257 @@ describe('runDing — startup-race dedup (scan + watcher both fire → single de
     expect(subjects.some((s) => s?.includes('b'))).toBe(true);
     r.ac.abort();
     await r.done;
+  });
+});
+
+// ─── runDing — hardening: session-flap debounce ──────────────────────
+// A pty `--permanent` session's auto-restart briefly looks "gone"
+// between the old process's exit and the new pidfile's write. Without
+// debounce, ding would exit right when its target flapped; its own
+// supervisor eventually restarts ding but arrivals during the gap are
+// missed. Debounce requires SESSION_GONE_DEBOUNCE_MISSES consecutive
+// misses before tripping the exit path, so a quick flap rides
+// through cleanly.
+// ────────────────────────────────────────────────────────────────────
+
+describe('runDing — session-flap debounce (permanent-session respawn)', () => {
+  let fake: FakeCoord;
+  let sender: FakeSender;
+
+  beforeEach(() => {
+    fake = makeFakeCoord();
+    sender = makeFakeSender();
+  });
+  afterEach(() => {
+    fake.endWatch();
+  });
+
+  it('single "gone" miss then alive again → ding stays running (flap survived)', async () => {
+    fake.setStatus('available');
+    // Alive-then-gone-once-then-alive: mimic a permanent-session
+    // restart's tiny window where the pidfile briefly reports the
+    // old PID as gone before the new one is written.
+    const aliveSeq = [true, true, false, true, true, true];
+    let i = 0;
+    const r = startDing({
+      coord: fake.coord,
+      ptySend: sender.send,
+      sessionWatchIntervalMs: 25,
+      isSessionAlive: () => {
+        const v = aliveSeq[Math.min(i, aliveSeq.length - 1)]!;
+        i++;
+        return v;
+      },
+    });
+    // Give the tick a chance to fire several times (enough that a
+    // no-debounce build would have aborted long ago).
+    await new Promise((res) => setTimeout(res, 200));
+    // Daemon still running.
+    let doneResolved = false;
+    void r.done.then(() => {
+      doneResolved = true;
+    });
+    await new Promise((res) => setImmediate(res));
+    expect(doneResolved).toBe(false);
+    r.ac.abort();
+    await r.done;
+  });
+
+  it('N consecutive misses → ding exits (real session death still detected)', async () => {
+    fake.setStatus('available');
+    // Alive for a few ticks (so seenTargetAlive becomes true), then
+    // gone forever. Debounce should trip after N consecutive misses.
+    let ticksSeen = 0;
+    const r = startDing({
+      coord: fake.coord,
+      ptySend: sender.send,
+      sessionWatchIntervalMs: 20,
+      isSessionAlive: () => {
+        ticksSeen++;
+        return ticksSeen <= 2; // first 2 alive, then gone forever
+      },
+    });
+    // Debounce is 3 consecutive misses → ~60ms + a few ticks of
+    // slack. Wait long enough that the exit trip actually fires.
+    await Promise.race([
+      r.done,
+      new Promise((_, rej) =>
+        setTimeout(
+          () =>
+            rej(
+              new Error('ding did not exit despite target being gone')
+            ),
+          800
+        )
+      ),
+    ]);
+    // r.done resolved → exit path tripped after debounce.
+  });
+
+  it('flapping (gone-alive-gone-alive) never trips the exit path', async () => {
+    // Miss counter resets on every alive observation. Continual
+    // alternating means the counter never accumulates enough to
+    // trip. Regression guard.
+    fake.setStatus('available');
+    let idx = 0;
+    const r = startDing({
+      coord: fake.coord,
+      ptySend: sender.send,
+      sessionWatchIntervalMs: 15,
+      isSessionAlive: () => {
+        idx++;
+        // start alive, then alternate: alive/gone/alive/gone…
+        if (idx < 3) return true; // build up seenTargetAlive
+        return idx % 2 === 0; // even=gone, odd=alive
+      },
+    });
+    // Give the tick plenty of iterations. In a no-debounce build
+    // the first gone would trip after seenTargetAlive; here the
+    // resets prevent trip.
+    await new Promise((res) => setTimeout(res, 300));
+    let doneResolved = false;
+    void r.done.then(() => {
+      doneResolved = true;
+    });
+    await new Promise((res) => setImmediate(res));
+    expect(doneResolved).toBe(false);
+    r.ac.abort();
+    await r.done;
+  });
+
+  it('probe error during flap → miss counter resets (conservative)', async () => {
+    // If the alive-probe throws (transient permission glitch),
+    // that shouldn't count as a "gone" observation — miss counter
+    // resets. Otherwise a flaky probe could artificially exhaust
+    // the debounce budget and trip a false exit.
+    fake.setStatus('available');
+    let idx = 0;
+    const log: string[] = [];
+    const r = startDing({
+      coord: fake.coord,
+      ptySend: sender.send,
+      sessionWatchIntervalMs: 20,
+      stderr: (s) => log.push(s),
+      isSessionAlive: () => {
+        idx++;
+        if (idx < 3) return true; // seenTargetAlive builds up
+        if (idx % 2 === 0) throw new Error('EACCES: probe failed');
+        return true; // odd ticks: still alive
+      },
+    });
+    await new Promise((res) => setTimeout(res, 300));
+    let doneResolved = false;
+    void r.done.then(() => {
+      doneResolved = true;
+    });
+    await new Promise((res) => setImmediate(res));
+    expect(doneResolved).toBe(false);
+    // The probe errors were logged (conservative — operator can see).
+    expect(log.join('')).toContain('session-alive check failed');
+    r.ac.abort();
+    await r.done;
+  });
+});
+
+// ─── cmdDingCli — hardening: PATH robustness probe ───────────────────
+// A ding daemon that can't spawn `pty` runs forever with zero
+// successful deliveries. Especially load-bearing under a supervisor
+// (launchd/systemd/cron) whose env strips PATH: the daemon "starts
+// cleanly" and silently drops every notice for the entire uptime.
+// Fix: probe `pty --version` at boot; refuse to start with a LOUD
+// stderr banner if unavailable.
+// ────────────────────────────────────────────────────────────────────
+
+describe('cmdDingCli — PATH robustness (pty probe at boot)', () => {
+  const baseCtx = (): CliContext => {
+    let stdoutBuf = '';
+    let stderrBuf = '';
+    return {
+      env: {
+        COORD_IDENTITY: 'alice',
+        COORD_ROOT: '/tmp/whatever',
+      } as NodeJS.ProcessEnv,
+      coordRoot: '/tmp/whatever',
+      coordConfig: undefined,
+      stdout: (s) => {
+        stdoutBuf += s;
+      },
+      stderr: (s) => {
+        stderrBuf += s;
+      },
+      readStdin: async () => Buffer.alloc(0),
+      stdinIsTty: () => true,
+      get stdoutBuf() {
+        return stdoutBuf;
+      },
+      get stderrBuf() {
+        return stderrBuf;
+      },
+    } as unknown as CliContext & { stdoutBuf: string; stderrBuf: string };
+  };
+
+  it('pty probe returns unavailable → cmdDingCli refuses to start with LOUD stderr banner (exit 2)', async () => {
+    const ctx = baseCtx() as CliContext & { stderrBuf: string };
+    const rc = await cmdDingCli(['codex-foo'], ctx, {
+      ptyProbe: () => ({
+        available: false,
+        reason: "spawn pty ENOENT: not found on PATH",
+      }),
+    });
+    expect(rc).toBe(2);
+    // Banner is un-missable: multi-line, quotes the reason, tells
+    // the operator how to fix it.
+    expect(ctx.stderrBuf).toContain(
+      "The 'pty' binary is NOT available on PATH"
+    );
+    expect(ctx.stderrBuf).toContain("spawn pty ENOENT");
+    expect(ctx.stderrBuf).toContain('Fix:');
+    expect(ctx.stderrBuf).toContain('launchd/systemd');
+    expect(ctx.stderrBuf).toContain('Refusing to start');
+  });
+
+  it('pty probe returns available → cmdDingCli proceeds past the probe (falls into runDing)', async () => {
+    // We can't actually run runDing to completion here (it needs a
+    // real coord root + watcher). But we can prove the probe gate
+    // opens by making it return available and asserting the CLI
+    // proceeds past the probe (would then fail on the missing
+    // coordRoot's identity dir).
+    const ctx = baseCtx() as CliContext & { stderrBuf: string };
+    // Give it a valid enough root (tmp) so ensureIdentityDirs
+    // succeeds inside runDing's setup — actual run will abort via
+    // the AbortController we don't have hooked, so we race a small
+    // timeout.
+    (ctx as unknown as { coordRoot: string }).coordRoot = '/tmp/st-ding-probe-ok';
+    try {
+      const rc = await Promise.race([
+        cmdDingCli(['codex-foo'], ctx, {
+          ptyProbe: () => ({ available: true }),
+        }),
+        new Promise<number>((res) => setTimeout(() => res(-999), 100)),
+      ]);
+      // Either the race timeout hit (rc === -999, meaning runDing
+      // is still running past the probe) or runDing already
+      // resolved. Both mean the probe gate opened.
+      // What matters: no PATH-error banner on stderr.
+      expect(ctx.stderrBuf).not.toContain(
+        "The 'pty' binary is NOT available on PATH"
+      );
+      // rc is either 0 (unlikely — daemon usually blocks), -999
+      // (race won), or possibly 1 if some downstream error hit.
+      // The absence of exit-2 + no banner is what we're testing.
+      expect(rc).not.toBe(2);
+    } finally {
+      // Cleanup: send SIGINT-shaped signal via process (the CLI
+      // registers a listener). Tests skip this since race timeout
+      // resolves before daemon needs cleanup.
+    }
+  });
+
+  it('probePtyOnPath: happy path returns available in the test env', () => {
+    // Sanity check: the actual probe function works. Test env has
+    // pty on PATH (npm link).
+    const r = probePtyOnPath();
+    expect(r.available).toBe(true);
+    expect(r.reason).toBeUndefined();
   });
 });
