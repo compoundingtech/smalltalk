@@ -22,6 +22,16 @@
       "types": "./src/types.ts",
       "import": "./src/types.ts",
       "default": "./src/types.ts"
+    },
+    "./commands/launch": {
+      "types": "./src/commands/launch.ts",
+      "import": "./src/commands/launch.ts",
+      "default": "./src/commands/launch.ts"
+    },
+    "./commands/launch-core": {
+      "types": "./src/commands/launch-core.ts",
+      "import": "./src/commands/launch-core.ts",
+      "default": "./src/commands/launch-core.ts"
     }
   },
   "bin": {

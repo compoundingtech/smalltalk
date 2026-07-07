@@ -6,6 +6,48 @@ minor releases until 1.0.
 
 ## Unreleased
 
+### Added (coord-kill piece (f) — `cmdLaunch` importable via `package.json:exports`)
+
+Convoy's TS port replaces the `st __launch-core` subprocess bridge
+with a direct TS import. Two new subpaths added to
+`package.json:exports`:
+
+- **`@myobie/coord/commands/launch`** → `./src/commands/launch.ts`.
+  Exports `cmdLaunch`, `cmdLaunchCli`, `LaunchInput`, `LaunchResult`,
+  and the harness-specific types. This is what convoy imports for
+  its port.
+- **`@myobie/coord/commands/launch-core`** →
+  `./src/commands/launch-core.ts`. The JSON-in/JSON-out entry
+  point behind a strict schema — the same contract the
+  `st __launch-core` subprocess bridge implemented. Kept exported
+  so embedders who want the schema-validation layer can lean on
+  it directly (rather than the raw `cmdLaunch`).
+
+Tests:
+- `exports.test.ts` — three new tests: exports map declares both
+  subpaths correctly, `cmdLaunch`/`cmdLaunchCli` are reachable at
+  runtime.
+
+Design decisions (going forward the same as convoy's port):
+- Convoy imports `cmdLaunch` with the full `LaunchInput` shape and
+  passes its own `CliContext` (matching the interface). No
+  subprocess spawn required.
+- Convoy calls `cmdLaunchCli` when it needs to consume argv
+  strings and CLI output (dry-run summary lines, etc.); calls
+  `cmdLaunch` when it has already parsed its own options.
+- The `__launch-core` subprocess bridge (`bin/st __launch-core`
+  → `cmdLaunchCoreCli`) is NOT removed. It stays as a
+  compatibility surface for embedders on other runtimes
+  (Swift, Rust, etc.) that can't consume TS directly.
+- No type-alias re-exports are added — convoy imports
+  `LaunchInput` / `LaunchResult` from the same subpath as
+  `cmdLaunch`.
+
+Full suite: 1561 pass, 3 pre-existing integration skipped.
+Pre-push name-hygiene grep: clean.
+
+Held on `feat/kill-coord-entirely` until the reboot signal.
+
 ### Changed (coord-kill piece (e) — ding-mode is now the DEFAULT for `st launch`; MCP is `--mcp` opt-in)
 
 Post-cutover the transport preference flips: `st launch` (both
