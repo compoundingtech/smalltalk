@@ -6,6 +6,78 @@ minor releases until 1.0.
 
 ## Unreleased
 
+### Fixed (`st ding` session-flap debounce + PATH-robustness probe)
+
+Two `st ding` hardening follow-ups from the same review that
+produced #72 — both pre-reboot, both critical for
+ding-as-primary-transport reliability.
+
+**Fix 1: session-flap debounce.** A pty `--permanent` session is
+auto-restarted by pty's supervisor. Between the old process's
+exit and the new pidfile write there's a window where
+`process.kill(pid, 0)` returns ESRCH, but the session is
+actually about to come back. Without debounce, ding's session-
+watch tick would trip the exit-when-gone path on that first
+miss; the daemon exits; its own supervisor restarts it
+eventually but arrivals during the gap are missed.
+
+Fix: require `SESSION_GONE_DEBOUNCE_MISSES = 3` consecutive
+"gone" observations before tripping. Any alive observation
+resets the counter. A quick flap (1–2 ticks of "gone") rides
+through cleanly; a real session death still trips within a few
+ticks (~90s at the default 30s watch interval, but tests use
+aggressive intervals to verify the math). Probe errors
+(transient permission glitches, etc.) reset the counter too —
+an unknown probe state shouldn't accumulate as evidence of
+"gone."
+
+Debounce logs the intermediate miss count so an operator can
+grep the daemon's stderr for flap patterns: `target session
+"<name>" appears gone (miss 1/3); debouncing before exit.`
+
+**Fix 2: PATH-robustness probe at boot.** A ding daemon that
+can't spawn `pty` runs forever with zero successful deliveries.
+Especially load-bearing under a supervisor (launchd/systemd/
+cron) whose environment strips PATH — the daemon comes up
+"healthy" and silently drops every notice for its entire
+uptime.
+
+Fix: probe `pty --help` synchronously at the top of
+`cmdDingCli` (after arg parsing + identity validation, before
+starting timers/watchers). On ENOENT or non-zero exit, emit a
+multi-line LOUD stderr banner (same shape as the hooks-loud
+banner from #59), naming the specific probe failure and how to
+fix it (typical fix: set PATH explicitly in the supervisor's
+unit/plist). Return exit code 2 — refuse to start rather than
+run forever with zero deliveries.
+
+New exported helpers for testability:
+- `probePtyOnPath(): PtyProbeResult` — the boot probe itself
+- `cmdDingCli` accepts an optional third arg `{ ptyProbe?: () =>
+  PtyProbeResult }` — tests inject a mock probe to exercise both
+  the available and unavailable paths without shelling out
+
+7 new unit tests:
+- **Session-flap debounce**: single "gone" miss then alive again
+  → ding stays running; N consecutive misses → ding exits;
+  flapping (alternating gone/alive) never trips; probe error
+  resets the miss counter (conservative).
+- **PATH probe**: unavailable → cmdDingCli refuses to start with
+  the LOUD banner + exit 2; available → cmdDingCli proceeds
+  past the probe (no banner); `probePtyOnPath` happy path in
+  the test env returns available.
+
+Existing 65 ding tests unchanged and passing.
+
+Full suite: 1596 pass, only the 4 pre-existing integration flakes.
+
+Follow-up hardening findings NOT in this PR (deliberately scoped
+down; documented as known / deferred):
+- `isSessionAlive` false-positive on PID reuse — low-severity,
+  documented behavior
+- Cosmetic `coord ding:` log strings + unbounded buffer cap +
+  SIGINT double-tap — fold into coord-kill piece (d)
+
 ### Fixed (CRITICAL — `st ding` hardening pass for primary-transport readiness)
 
 With coord going away entirely and ding-mode becoming the DEFAULT
