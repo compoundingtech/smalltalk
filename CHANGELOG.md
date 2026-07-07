@@ -6,6 +6,69 @@ minor releases until 1.0.
 
 ## Unreleased
 
+### Fixed (CRITICAL — `st message reply` verb now exists; DING-BUS.md contract fulfilled)
+
+Every ding-mode agent booting from `DING-BUS.md` (installed by
+`st launch --ding` since #61) was instructed to run
+`st message reply <filename> -m "<body>"` on inbox arrivals, but
+the CLI dispatcher at `src/cli.ts:dispatchMessage` didn't route
+`reply` — every agent hit `unknown subcommand: reply` on their
+first response. Load-bearing gap that made ding-mode delivery
+functional but reply-ability broken.
+
+Fix:
+- New `src/commands/reply.ts` with `cmdReply` (programmatic
+  entry) and `cmdReplyCli` (CLI wrapper). Same locate + derive
+  semantics as the MCP `st_msg_reply` tool:
+  - Take `<thread-filename>` positional
+  - Locate across `<self>/inbox`, `<self>/archive`, and every
+    other identity's `archive/` (cross-identity case after sync
+    mirrors a peer's archive back to the local tree)
+  - Derive recipient from the thread's `from:` frontmatter
+  - Derive default subject as `re: <original-subject>` (or omit
+    if the original had none)
+  - Body via `-m <body>` / `--message <body>` or stdin
+    (mutually exclusive; the "both provided" case throws to
+    prevent silent drops — matches `st message send` guard)
+  - Optional `--subject S` override + `--from ID` sender override
+- `case 'reply':` added to `dispatchMessage` (`src/cli.ts:165`)
+- `messageUsage()` help text extended to include the new verb;
+  top-level `st help` also lists `reply` alongside
+  `send | ls | read | archive | thread`
+- Shared `locateThread` extracted from `src/mcp/tools/reply.ts`
+  into `src/locate-thread.ts` so CLI and MCP entry points can't
+  drift on locate semantics (single source of truth)
+
+14 new unit tests in `tests/unit/reply.test.ts`:
+- Recipient derived from thread `from:`; reply lands in that
+  identity's inbox with `in-reply-to:` + derived subject
+- Locates thread in own archive (post-archive reply works)
+- Locates thread in a peer's archive (cross-identity post-sync case)
+- `--subject` override wins over derived default
+- No subject in reply when parent had no subject
+- Thread not found → `MessageNotFoundError`-shaped error
+- Missing `$ST_AGENT` → clear error naming the env
+- CLI `-m` inline body writes reply + prints filename to stdout
+- CLI `--message` long-form works
+- CLI `--subject` override
+- CLI `--help` prints usage
+- CLI no `<thread>` arg → clear error
+- CLI `-m` + piped stdin → throws (matches `send.ts` guard)
+- Regression: `st message reply <fn>` no longer errors with
+  `unknown subcommand: reply` via the top-level `runCli` entry
+
+Full suite: 1567 pass, only the 4 pre-existing integration flakes.
+
+End-to-end smoke: `st message reply <fn> -m "<body>" < /dev/null`
+writes into `<derived-recipient>/inbox/` with `from:` +
+`in-reply-to:` + derived `subject:` frontmatter set. Ding-mode
+agents can now reply per the DING-BUS.md contract.
+
+Bug traced to #61 (DING-BUS.md install) — the contract documented
+a verb that didn't exist. Discovered via a targeted `st --help`
++ completions audit (see follow-up PRs on the same audit's
+completions binary-target and coverage-gap findings).
+
 ### Changed (`st launch` honors a direct `$PTY_ROOT` env verbatim; decoupled from `$ST_ROOT`)
 
 Companion change to `--fresh`, bundled per cos (same code area).

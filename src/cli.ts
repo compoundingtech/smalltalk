@@ -27,6 +27,7 @@ import { cmdAgentsCli } from './commands/agents.ts';
 import { cmdOverviewCli } from './commands/overview.ts';
 import { cmdReadCli } from './commands/read.ts';
 import { cmdResourceCli } from './commands/resource.ts';
+import { cmdReplyCli } from './commands/reply.ts';
 import { cmdSendCli } from './commands/send.ts';
 import { cmdStatusCli } from './commands/status.ts';
 import { cmdSyncCli } from './commands/sync.ts';
@@ -64,8 +65,11 @@ async function readStdinBuffer(
 function messageUsage(name: string): string {
   return (
     `usage: ${name} message <verb> [args...]   (alias: ${name} msg <verb>)\n\n` +
-    `  send <to> [--from ID] [--subject S] [--in-reply-to F] [--tags T,T] [--priority P]\n` +
-    `                                   read body from stdin\n` +
+    `  send <to> [-m <body> | --message <body>] [--from ID] [--subject S]\n` +
+    `           [--in-reply-to F] [--tags T,T] [--priority P]\n` +
+    `                                   read body from stdin if -m omitted\n` +
+    `  reply <thread-filename> [-m <body> | --message <body>] [--subject S] [--from ID]\n` +
+    `                                   recipient derived from thread's from:\n` +
     `  ls [<identity>] [--archive] [--count|--json] [--since UNIX_MS] [--from ID] [--orphans]\n` +
     `  read [<identity>] <filename> [--raw|--json] [--archive]\n` +
     `  archive [<identity>] <filename> [--with-attachments]\n` +
@@ -81,7 +85,7 @@ function topLevelUsage(name: string): string {
     `       ${name} --help | --version\n\n` +
   `Messages:\n` +
   `  message <verb> [args...]   (alias: msg)\n` +
-  `    send | ls | read | archive | thread\n\n` +
+  `    send | reply | ls | read | archive | thread\n\n` +
   `Live:\n` +
   `  watch [<identity>] [--all] [--with-subject] [--since UNIX_MS | --since-now]\n` +
   `                     [--interval MS] [--once]\n` +
@@ -165,6 +169,8 @@ async function dispatchMessage(
   switch (sub) {
     case 'send':
       return await cmdSendCli(rest, ctx);
+    case 'reply':
+      return await cmdReplyCli(rest, ctx);
     case 'ls':
       return cmdLsCli(rest, ctx);
     case 'read':
