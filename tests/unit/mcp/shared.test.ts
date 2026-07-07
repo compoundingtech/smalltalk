@@ -113,9 +113,9 @@ describe('shared — drift guard (capabilities + tool list)', () => {
     };
 
     // Exercise multiple tools.
-    await call('coord_msg_send', { to: 'bob', body: 'msg1' });
-    await call('coord_msg_ls', {});
-    await call('coord_msg_send', { to: 'alice', body: 'msg2', from: 'bob' });
+    await call('st_msg_send', { to: 'bob', body: 'msg1' });
+    await call('st_msg_ls', {});
+    await call('st_msg_send', { to: 'alice', body: 'msg2', from: 'bob' });
 
     const after = {
       caps: client.getServerCapabilities(),
@@ -130,9 +130,9 @@ describe('shared — drift guard (capabilities + tool list)', () => {
 // ─── Concurrency ──────────────────────────────────────────────────────
 
 describe('shared — concurrent tool calls', () => {
-  it('10 parallel coord_msg_send calls produce 10 distinct files', async () => {
+  it('10 parallel st_msg_send calls produce 10 distinct files', async () => {
     const calls = Array.from({ length: 10 }, (_, i) =>
-      call('coord_msg_send', { to: 'bob', body: `msg-${i}` })
+      call('st_msg_send', { to: 'bob', body: `msg-${i}` })
     );
     const results = await Promise.all(calls);
     const filenames = results
@@ -145,15 +145,15 @@ describe('shared — concurrent tool calls', () => {
 
   it('mixed parallel calls (send + ls + read) work without state corruption', async () => {
     // Pre-populate one message so read has something to find.
-    const send0 = await call('coord_msg_send', { to: 'alice', body: 'seed', from: 'bob' });
+    const send0 = await call('st_msg_send', { to: 'alice', body: 'seed', from: 'bob' });
     const seedFn = send0.structuredContent?.filename as string;
 
     const results = await Promise.all([
-      call('coord_msg_send', { to: 'bob', body: 'a' }),
-      call('coord_msg_send', { to: 'bob', body: 'b' }),
-      call('coord_msg_ls', {}),
-      call('coord_msg_ls', { identity: 'bob' }),
-      call('coord_msg_read', { filename: seedFn }),
+      call('st_msg_send', { to: 'bob', body: 'a' }),
+      call('st_msg_send', { to: 'bob', body: 'b' }),
+      call('st_msg_ls', {}),
+      call('st_msg_ls', { identity: 'bob' }),
+      call('st_msg_read', { filename: seedFn }),
     ]);
     for (const r of results) {
       expect(r.isError).toBeUndefined();
@@ -161,21 +161,21 @@ describe('shared — concurrent tool calls', () => {
   });
 });
 
-// ─── No inline presweep, but lazy-read sweep cleans on coord_msg_read ──
+// ─── No inline presweep, but lazy-read sweep cleans on st_msg_read ──
 
 describe('shared — sweep is a convergence operation', () => {
-  it('coord_msg_ls does NOT presweep — zombie stays visible', async () => {
+  it('st_msg_ls does NOT presweep — zombie stays visible', async () => {
     const f = '1714826789010-aaaaaa.md';
     writeFileSync(join(coordRoot, 'alice', 'inbox', f), 'same');
     writeFileSync(join(coordRoot, 'alice', 'archive', f), 'same');
-    const r = await call('coord_msg_ls', {});
+    const r = await call('st_msg_ls', {});
     expect(r.isError).toBeUndefined();
     expect(r.structuredContent?.matches).toEqual([f]);
     expect(existsSync(join(coordRoot, 'alice', 'inbox', f))).toBe(true);
     expect(existsSync(join(coordRoot, 'alice', 'archive', f))).toBe(true);
   });
 
-  it('coord_msg_read lazy-sweeps the byte-identical inbox twin', async () => {
+  it('st_msg_read lazy-sweeps the byte-identical inbox twin', async () => {
     const f = '1714826789010-aaaaaa.md';
     writeFileSync(
       join(coordRoot, 'alice', 'inbox', f),
@@ -185,7 +185,7 @@ describe('shared — sweep is a convergence operation', () => {
       join(coordRoot, 'alice', 'archive', f),
       '---\nfrom: bob\n---\nbody\n'
     );
-    const r = await call('coord_msg_read', { filename: f });
+    const r = await call('st_msg_read', { filename: f });
     expect(r.isError).toBeUndefined();
     // Lazy-read cleaned the inbox copy, archive stayed.
     expect(existsSync(join(coordRoot, 'alice', 'inbox', f))).toBe(false);
@@ -208,11 +208,11 @@ describe('shared — identity plumbing', () => {
     await Promise.all([client.connect(c), handle.mcp.connect(s)]);
 
     const cases = [
-      ['coord_msg_send', { to: 'bob', body: 'm' }],
-      ['coord_msg_ls', {}],
-      ['coord_msg_read', { filename: '1714826789010-aaaaaa.md' }],
-      ['coord_msg_archive', { filename: '1714826789010-aaaaaa.md' }],
-      ['coord_msg_thread', { filename: '1714826789010-aaaaaa.md' }],
+      ['st_msg_send', { to: 'bob', body: 'm' }],
+      ['st_msg_ls', {}],
+      ['st_msg_read', { filename: '1714826789010-aaaaaa.md' }],
+      ['st_msg_archive', { filename: '1714826789010-aaaaaa.md' }],
+      ['st_msg_thread', { filename: '1714826789010-aaaaaa.md' }],
     ] as const;
     for (const [name, args] of cases) {
       const r = await call(name, args);
@@ -227,7 +227,7 @@ describe('shared — identity plumbing', () => {
 describe('shared — error response shape', () => {
   it('every CoordError surfaces with isError + content[0].text + _meta["coord/error"]', async () => {
     // Trigger one of each error class via different tools.
-    const r1 = await call('coord_msg_send', { to: 'INVALID', body: 'm' });
+    const r1 = await call('st_msg_send', { to: 'INVALID', body: 'm' });
     expect(r1.isError).toBe(true);
     expect((r1.content?.[0] as { text: string } | undefined)?.text).toMatch(
       /^INVALID_IDENTITY:/
@@ -237,7 +237,7 @@ describe('shared — error response shape', () => {
     });
     expect(r1.structuredContent).toBeUndefined();
 
-    const r2 = await call('coord_msg_archive', { filename: 'garbage' });
+    const r2 = await call('st_msg_archive', { filename: 'garbage' });
     expect(r2.isError).toBe(true);
     expect(errorCode(r2)).toBe('INVALID_FILENAME');
     expect(r2.structuredContent).toBeUndefined();

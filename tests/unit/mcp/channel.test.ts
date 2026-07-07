@@ -3,7 +3,7 @@
 // Phase-2 task 1 of brief-010: covers the `--channel` opt-in.
 //   - Without the flag: capabilities are Phase-1 (no experimental).
 //   - With the flag: experimental['claude/channel'] is advertised and
-//     the server attaches an instructions string mentioning coord_msg_reply.
+//     the server attaches an instructions string mentioning st_msg_reply.
 //   - The flag must not break the existing five tools.
 
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
@@ -71,8 +71,8 @@ describe('buildServerOptions', () => {
     expect(opts.instructions).toBe(CHANNEL_INSTRUCTIONS);
   });
 
-  it('CHANNEL_INSTRUCTIONS mentions coord_msg_reply (so the agent knows the verb)', () => {
-    expect(CHANNEL_INSTRUCTIONS).toMatch(/coord_msg_reply/);
+  it('CHANNEL_INSTRUCTIONS mentions st_msg_reply (so the agent knows the verb)', () => {
+    expect(CHANNEL_INSTRUCTIONS).toMatch(/st_msg_reply/);
   });
 });
 
@@ -125,23 +125,23 @@ describe('createMcpServer — channel mode (--channel)', () => {
     }
   });
 
-  it('attaches instructions that mention coord_msg_reply', async () => {
+  it('attaches instructions that mention st_msg_reply', async () => {
     const { client, handle } = await connect(true);
     try {
       const ins = client.getInstructions?.();
       expect(typeof ins).toBe('string');
-      expect(ins).toMatch(/coord_msg_reply/);
+      expect(ins).toMatch(/st_msg_reply/);
     } finally {
       await handle.close();
     }
   });
 
-  it('still serves the Phase-1 five tools without regression (coord_msg_reply lands in task 3)', async () => {
+  it('still serves the Phase-1 five tools without regression (st_msg_reply lands in task 3)', async () => {
     const { client, handle } = await connect(true);
     try {
       const r = await client.listTools();
       const names = r.tools.map((t) => t.name).sort();
-      // Task 1 only wires capabilities + flag. coord_msg_reply isn't
+      // Task 1 only wires capabilities + flag. st_msg_reply isn't
       // registered yet — keep the test set narrow so task 3's commit
       // explicitly extends it.
       for (const phase1 of EXPECTED_TOOL_NAMES) {
@@ -152,11 +152,11 @@ describe('createMcpServer — channel mode (--channel)', () => {
     }
   });
 
-  it('coord_msg_send still works end-to-end with the channel flag on', async () => {
+  it('st_msg_send still works end-to-end with the channel flag on', async () => {
     const { client, handle } = await connect(true);
     try {
       const r = (await client.callTool({
-        name: 'coord_msg_send',
+        name: 'st_msg_send',
         arguments: { to: 'bob', body: 'hi via channel' },
       })) as {
         isError?: boolean;

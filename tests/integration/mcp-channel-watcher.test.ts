@@ -233,7 +233,7 @@ describe('channel-watcher — outside .md delivery', () => {
     await waitFor(() => received.length === 1);
     const n = received[0]!;
     expect(n.params.meta.from).toBe('outside');
-    // The recipient's tool for replying (`coord_msg_reply`) can't
+    // The recipient's tool for replying (`st_msg_reply`) can't
     // build a thread from an outside filename — always a new thread.
     expect(n.params.meta.messageFilename).toBe('random.md');
     expect(n.params.meta.threadFilename).toBe('random.md');
@@ -428,7 +428,7 @@ describe('channel-watcher — poll backstop (brief-020 HB-4)', () => {
   it('at-least-once: files present at startup ARE delivered on watcher start (P5R-F2 fix)', async () => {
     // Simulate a fresh restart on an inbox with pending files. The
     // prior policy suppressed these on startup (delegating backlog
-    // recovery to the boot ritual's `coord_msg_ls`); a live repro
+    // recovery to the boot ritual's `st_msg_ls`); a live repro
     // during the P5 team-standup re-run showed that policy loses
     // messages when Claude Code reconnects the stdio transport
     // mid-session (the fresh MCP process seeded them into `seen`

@@ -1,4 +1,4 @@
-// tests/unit/mcp/read.test.ts — coord_msg_read tool, in-memory.
+// tests/unit/mcp/read.test.ts — st_msg_read tool, in-memory.
 
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
@@ -44,7 +44,7 @@ interface CallResult {
 
 async function call(args: Record<string, unknown>): Promise<CallResult> {
   return (await client.callTool({
-    name: 'coord_msg_read',
+    name: 'st_msg_read',
     arguments: args,
   })) as CallResult;
 }
@@ -67,10 +67,10 @@ function writeFm(
 
 // ─── tools/list ────────────────────────────────────────────────────────
 
-describe('coord_msg_read — tools/list registration', () => {
+describe('st_msg_read — tools/list registration', () => {
   it('registers with required filename and optional identity/fromArchive', async () => {
     const r = await client.listTools();
-    const tool = r.tools.find((t) => t.name === 'coord_msg_read');
+    const tool = r.tools.find((t) => t.name === 'st_msg_read');
     expect(tool).toBeDefined();
     expect(tool?.inputSchema?.required).toEqual(['filename']);
     expect(tool?.outputSchema).toBeDefined();
@@ -79,7 +79,7 @@ describe('coord_msg_read — tools/list registration', () => {
 
 // ─── Happy paths ───────────────────────────────────────────────────────
 
-describe('coord_msg_read — happy paths', () => {
+describe('st_msg_read — happy paths', () => {
   it('returns parsed Message + location for an inbox file', async () => {
     writeFm(
       'alice',
@@ -174,7 +174,7 @@ describe('coord_msg_read — happy paths', () => {
 
 // ─── Optional frontmatter fields ──────────────────────────────────────
 
-describe('coord_msg_read — optional message fields', () => {
+describe('st_msg_read — optional message fields', () => {
   it('omits optional keys from message when absent', async () => {
     writeFm('alice', '1714826789010-aaaaaa.md', { from: 'bob' }, 'b');
     const r = await call({ filename: '1714826789010-aaaaaa.md' });
@@ -216,7 +216,7 @@ describe('coord_msg_read — optional message fields', () => {
 
 // ─── Schema validation ─────────────────────────────────────────────────
 
-describe('coord_msg_read — schema validation', () => {
+describe('st_msg_read — schema validation', () => {
   it('rejects missing filename', async () => {
     const r = await call({});
     expect(r.isError).toBe(true);
@@ -239,7 +239,7 @@ describe('coord_msg_read — schema validation', () => {
 
 // ─── Typed error mapping ──────────────────────────────────────────────
 
-describe('coord_msg_read — typed error mapping', () => {
+describe('st_msg_read — typed error mapping', () => {
   it('invalid filename grammar → INVALID_FILENAME', async () => {
     const r = await call({ filename: 'garbage' });
     expect(errorCode(r)).toBe('INVALID_FILENAME');
@@ -280,7 +280,7 @@ describe('coord_msg_read — typed error mapping', () => {
 
 // ─── Edge cases ────────────────────────────────────────────────────────
 
-describe('coord_msg_read — edge cases', () => {
+describe('st_msg_read — edge cases', () => {
   it('file without frontmatter: message.from is empty, body is whole text', async () => {
     writeFileSync(
       join(coordRoot, 'alice', 'inbox', '1714826789010-aaaaaa.md'),
@@ -303,9 +303,9 @@ describe('coord_msg_read — edge cases', () => {
   });
 
   it('subject with embedded colon and newline survives parse roundtrip', async () => {
-    // A message written via coord_msg_send → coord_msg_read roundtrip.
+    // A message written via st_msg_send → st_msg_read roundtrip.
     const send = (await client.callTool({
-      name: 'coord_msg_send',
+      name: 'st_msg_send',
       arguments: {
         to: 'bob',
         body: 'm',

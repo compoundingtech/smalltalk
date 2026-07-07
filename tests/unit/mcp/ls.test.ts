@@ -1,4 +1,4 @@
-// tests/unit/mcp/ls.test.ts — coord_msg_ls tool, in-memory.
+// tests/unit/mcp/ls.test.ts — st_msg_ls tool, in-memory.
 
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
@@ -44,7 +44,7 @@ interface CallResult {
 
 async function call(args: Record<string, unknown> = {}): Promise<CallResult> {
   return (await client.callTool({
-    name: 'coord_msg_ls',
+    name: 'st_msg_ls',
     arguments: args,
   })) as CallResult;
 }
@@ -64,10 +64,10 @@ function writeMsg(
 
 // ─── Tools/list ────────────────────────────────────────────────────────
 
-describe('coord_msg_ls — tools/list registration', () => {
+describe('st_msg_ls — tools/list registration', () => {
   it('appears with input + output schemas', async () => {
     const r = await client.listTools();
-    const tool = r.tools.find((t) => t.name === 'coord_msg_ls');
+    const tool = r.tools.find((t) => t.name === 'st_msg_ls');
     expect(tool).toBeDefined();
     expect(tool?.inputSchema).toBeDefined();
     expect(tool?.outputSchema).toBeDefined();
@@ -75,14 +75,14 @@ describe('coord_msg_ls — tools/list registration', () => {
 
   it('all input fields are optional (zero-arg form valid)', async () => {
     const r = await client.listTools();
-    const tool = r.tools.find((t) => t.name === 'coord_msg_ls');
+    const tool = r.tools.find((t) => t.name === 'st_msg_ls');
     expect(tool?.inputSchema?.required ?? []).toEqual([]);
   });
 });
 
 // ─── Happy paths ───────────────────────────────────────────────────────
 
-describe('coord_msg_ls — happy paths', () => {
+describe('st_msg_ls — happy paths', () => {
   it('zero-arg lists the Coord identity\'s inbox', async () => {
     writeMsg('alice', '1714826789010-aaaaaa.md', 'bob');
     const r = await call();
@@ -144,7 +144,7 @@ describe('coord_msg_ls — happy paths', () => {
 
 // ─── Filters ───────────────────────────────────────────────────────────
 
-describe('coord_msg_ls — filters', () => {
+describe('st_msg_ls — filters', () => {
   it('since filters by filename ts (>= cutoff)', async () => {
     writeMsg('alice', '1714826789010-aaaaaa.md', 'bob');
     writeMsg('alice', '1714826789020-bbbbbb.md', 'bob');
@@ -218,7 +218,7 @@ describe('coord_msg_ls — filters', () => {
 
 // ─── Schema validation ─────────────────────────────────────────────────
 
-describe('coord_msg_ls — schema validation', () => {
+describe('st_msg_ls — schema validation', () => {
   it('rejects negative since', async () => {
     const r = await call({ since: -1 });
     expect(r.isError).toBe(true);
@@ -237,7 +237,7 @@ describe('coord_msg_ls — schema validation', () => {
 
 // ─── Error mapping ─────────────────────────────────────────────────────
 
-describe('coord_msg_ls — typed error mapping', () => {
+describe('st_msg_ls — typed error mapping', () => {
   it('unknown identity → IDENTITY_NOT_HOSTED', async () => {
     const r = await call({ identity: 'ghost' });
     expect(errorCode(r)).toBe('IDENTITY_NOT_HOSTED');
@@ -257,7 +257,7 @@ describe('coord_msg_ls — typed error mapping', () => {
 
 // ─── No inline presweep on non-sync paths (post sweep-as-convergence) ──
 
-describe('coord_msg_ls — no inline presweep', () => {
+describe('st_msg_ls — no inline presweep', () => {
   it('byte-identical inbox+archive twin is STILL visible after ls', async () => {
     // Per the sweep-as-convergence policy, ls does not presweep — a
     // zombie will surface in ls output until lazy-read sweep,

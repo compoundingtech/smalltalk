@@ -150,28 +150,13 @@ describe('createMcpServer — capability declaration', () => {
 // per-tool tests in tasks 3–7 cover the populated-server case.
 
 describe('createMcpServer — tool name registry', () => {
-  it('EXPECTED_TOOL_NAMES is the canonical non-channel tool set, dual-prefixed (brief-005-phase0)', () => {
+  it('EXPECTED_TOOL_NAMES is the canonical non-channel tool set — `st_*` only (coord_* alias removed post-cutover)', () => {
     expect([...EXPECTED_TOOL_NAMES]).toEqual([
-      'coord_msg_send',
-      'coord_msg_ls',
-      'coord_msg_read',
-      'coord_msg_archive',
-      'coord_msg_thread',
-      'coord_members',
-      'coord_agents',
-      'coord_resource_add',
-      'coord_resource_ls',
-      'coord_resource_read',
-      'coord_resource_remove',
-      'coord_context_read',
-      'coord_context_write',
-      'coord_context_append',
       'st_msg_send',
       'st_msg_ls',
       'st_msg_read',
       'st_msg_archive',
       'st_msg_thread',
-      'st_members',
       'st_agents',
       'st_resource_add',
       'st_resource_ls',

@@ -162,7 +162,7 @@ describe('coord.createIdentity', () => {
   });
 
   it('partial state (only inbox exists) → completes the layout, returns { created: true }', async () => {
-    // A sender may have lazily mkdir'd `eve/inbox/` via coord_msg_send;
+    // A sender may have lazily mkdir'd `eve/inbox/` via st_msg_send;
     // archive is missing. createIdentity should backfill.
     mkdirSync(join(coordRoot, 'eve', 'inbox'), { recursive: true });
     const r = await coord.createIdentity('eve');

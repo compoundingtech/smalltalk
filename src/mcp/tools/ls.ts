@@ -1,4 +1,4 @@
-// mcp/tools/ls.ts — registers the `coord_msg_ls` MCP tool.
+// mcp/tools/ls.ts — registers the `st_msg_ls` MCP tool.
 
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
@@ -9,14 +9,13 @@ import {
   buildToolResult,
   withErrorMapping,
 } from '../error-mapping.ts';
-import { registerDualTool } from './dual-register.ts';
 
 const lsInputShape = {
   identity: z
     .string()
     .optional()
     .describe(
-      'Whose inbox/archive to list. Defaults to $COORD_IDENTITY.'
+      'Whose inbox/archive to list. Defaults to $ST_AGENT.'
     ),
   archive: z
     .boolean()
@@ -47,13 +46,12 @@ const lsOutputShape = {
 };
 
 export function registerLsTool(mcp: McpServer, coord: Coord): void {
-  registerDualTool(
-    mcp,
-    'msg_ls',
+  mcp.registerTool(
+    'st_msg_ls',
     {
       title: 'List inbox or archive',
       description:
-        "Equivalent to `coord message ls`. List filenames in <identity>/inbox/ (or <identity>/archive/ with archive=true). Filterable by --since (filename ts) and fromFilter (frontmatter `from:`).",
+        "Equivalent to `st message ls`. List filenames in <identity>/inbox/ (or <identity>/archive/ with archive=true). Filterable by --since (filename ts) and fromFilter (frontmatter `from:`).",
       inputSchema: lsInputShape,
       outputSchema: lsOutputShape,
     },

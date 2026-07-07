@@ -1,4 +1,4 @@
-// mcp/tools/thread.ts — registers the `coord_msg_thread` MCP tool.
+// mcp/tools/thread.ts — registers the `st_msg_thread` MCP tool.
 //
 // Wraps coord.thread(identity, filename, opts?) which walks the
 // in-reply-to graph (both directions, cross-identity) and returns an
@@ -14,7 +14,6 @@ import {
   buildToolResult,
   withErrorMapping,
 } from '../error-mapping.ts';
-import { registerDualTool } from './dual-register.ts';
 
 const threadInputShape = {
   filename: z
@@ -24,7 +23,7 @@ const threadInputShape = {
     .string()
     .optional()
     .describe(
-      "Identity slot (mostly a validation hint — the walk is global). Defaults to $COORD_IDENTITY."
+      "Identity slot (mostly a validation hint — the walk is global). Defaults to $ST_AGENT."
     ),
   tree: z
     .boolean()
@@ -53,13 +52,12 @@ const threadOutputShape = {
 };
 
 export function registerThreadTool(mcp: McpServer, coord: Coord): void {
-  registerDualTool(
-    mcp,
-    'msg_thread',
+  mcp.registerTool(
+    'st_msg_thread',
     {
-      title: 'Walk a coord thread',
+      title: 'Walk a smalltalk thread',
       description:
-        "Equivalent to `coord message thread`. Return every message reachable from <filename> via in-reply-to (both directions, cross-identity). Default = flat chronological; tree=true preserves the depth-indented hierarchy.",
+        "Equivalent to `st message thread`. Return every message reachable from <filename> via in-reply-to (both directions, cross-identity). Default = flat chronological; tree=true preserves the depth-indented hierarchy.",
       inputSchema: threadInputShape,
       outputSchema: threadOutputShape,
     },

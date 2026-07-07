@@ -1,5 +1,5 @@
-// mcp/tools/resource.ts — registers the four `coord_resource_*` MCP
-// tools (dual-prefixed as `st_resource_*` per brief-005-phase0).
+// mcp/tools/resource.ts — registers the four `st_resource_*` MCP
+// tools.
 //
 // add    — write a new resource under the agent's own identity
 // ls     — list filenames in <identity>/resources/ (any identity)
@@ -15,7 +15,6 @@ import {
   buildToolResult,
   withErrorMapping,
 } from '../error-mapping.ts';
-import { registerDualTool } from './dual-register.ts';
 
 // ─── add ───────────────────────────────────────────────────────────────
 
@@ -53,7 +52,7 @@ const lsInputShape = {
   identity: z
     .string()
     .optional()
-    .describe('Whose resources to list. Defaults to $COORD_IDENTITY.'),
+    .describe('Whose resources to list. Defaults to $ST_AGENT.'),
 };
 
 const lsOutputShape = {
@@ -76,7 +75,7 @@ const readInputShape = {
   identity: z
     .string()
     .optional()
-    .describe('Whose resource to read. Defaults to $COORD_IDENTITY.'),
+    .describe('Whose resource to read. Defaults to $ST_AGENT.'),
 };
 
 const readOutputShape = {
@@ -106,13 +105,12 @@ const removeOutputShape = {
 // ─── Registrations ─────────────────────────────────────────────────────
 
 export function registerResourceTools(mcp: McpServer, coord: Coord): void {
-  registerDualTool(
-    mcp,
-    'resource_add',
+  mcp.registerTool(
+    'st_resource_add',
     {
       title: 'Add a resource (annotated URL)',
       description:
-        "Equivalent to `coord resource add`. Write a new resource file under the agent's own resources/ folder. URL is required; title/tags/body are optional. The act of writing IS the publish; sync surfaces it to peers later.",
+        "Equivalent to `st resource add`. Write a new resource file under the agent's own resources/ folder. URL is required; title/tags/body are optional. The act of writing IS the publish; sync surfaces it to peers later.",
       inputSchema: addInputShape,
       outputSchema: addOutputShape,
     },
@@ -132,13 +130,12 @@ export function registerResourceTools(mcp: McpServer, coord: Coord): void {
       })
   );
 
-  registerDualTool(
-    mcp,
-    'resource_ls',
+  mcp.registerTool(
+    'st_resource_ls',
     {
       title: 'List an agent\'s resources',
       description:
-        'Equivalent to `coord resource ls`. Returns parsed resource records (filename + url + title + tags) for the given identity. Identity defaults to $COORD_IDENTITY but any peer is readable.',
+        'Equivalent to `st resource ls`. Returns parsed resource records (filename + url + title + tags) for the given identity. Identity defaults to $ST_AGENT but any peer is readable.',
       inputSchema: lsInputShape,
       outputSchema: lsOutputShape,
     },
@@ -166,13 +163,12 @@ export function registerResourceTools(mcp: McpServer, coord: Coord): void {
       })
   );
 
-  registerDualTool(
-    mcp,
-    'resource_read',
+  mcp.registerTool(
+    'st_resource_read',
     {
       title: 'Read one of an agent\'s resources',
       description:
-        'Equivalent to `coord resource read`. Returns the parsed Resource (url + title + tags + body). Identity defaults to $COORD_IDENTITY.',
+        'Equivalent to `st resource read`. Returns the parsed Resource (url + title + tags + body). Identity defaults to $ST_AGENT.',
       inputSchema: readInputShape,
       outputSchema: readOutputShape,
     },
@@ -199,13 +195,12 @@ export function registerResourceTools(mcp: McpServer, coord: Coord): void {
       })
   );
 
-  registerDualTool(
-    mcp,
-    'resource_remove',
+  mcp.registerTool(
+    'st_resource_remove',
     {
       title: 'Remove one of your own resources',
       description:
-        "Equivalent to `coord resource rm`. Deletes a resource from the agent's own resources/. Single-writer: only the resource owner can remove. Throws RESOURCE_NOT_FOUND if the filename doesn't exist.",
+        "Equivalent to `st resource rm`. Deletes a resource from the agent's own resources/. Single-writer: only the resource owner can remove. Throws RESOURCE_NOT_FOUND if the filename doesn't exist.",
       inputSchema: removeInputShape,
       outputSchema: removeOutputShape,
     },

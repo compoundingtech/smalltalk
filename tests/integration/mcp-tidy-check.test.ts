@@ -65,7 +65,7 @@ async function boot(opts: { tidyCheckIntervalMs?: number; channel?: boolean } = 
   client.fallbackNotificationHandler = async (n) => {
     // Filter to tidy-check frames only — chokidar's inbox-arrival
     // watcher uses the same method name, so we'd otherwise count a
-    // real `coord_msg_send`-shaped notification as a tidy emit when
+    // real `st_msg_send`-shaped notification as a tidy emit when
     // a planted file shows up under the watched inbox.
     if (n.method !== 'notifications/claude/channel') return;
     const meta = (

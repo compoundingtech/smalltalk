@@ -6,6 +6,42 @@ minor releases until 1.0.
 
 ## Unreleased
 
+### Changed (coord-kill piece (a) — MCP tools registered under `st_*` only; dual-register removed; `members` alias retired)
+
+Post-cutover the MCP tool surface is `st_*` only. The historical
+dual-register mechanism has been fully removed:
+
+- **`src/mcp/tools/dual-register.ts`** — deleted.
+- **9 tool files** rewritten to call `mcp.registerTool('st_<name>',
+  …)` directly.
+- **`members` deprecated alias retired.** `st_agents` is the sole
+  canonical name.
+- **`CHANNEL_INSTRUCTIONS` fully rewritten st-only** — every
+  `coord_*` tool name, `coord status` verb, `<channel
+  source="coord">` reference, and "Coord threads stay on coord"
+  convention line replaced.
+- **`EXPECTED_TOOL_NAMES`** is `st_*` only (was 28-entry
+  dual-prefixed; now 13-entry).
+- Tool titles + descriptions scrubbed: no `coord message`,
+  `$COORD_IDENTITY`, or `<coord-root>` phrasing remains.
+
+Test coverage:
+- `channel-instructions.test.ts` — st-only load-bearing
+  substrings; added case-insensitive assertion that `coord`
+  doesn't appear anywhere (cutover lock-in).
+- `aliases.test.ts` Item 3 — reframed as "registry is `st_*`
+  only"; asserts st_<base> present AND coord_<base> alias GONE.
+- `mcp/lifecycle.test.ts` — EXPECTED_TOOL_NAMES array flipped.
+- `mcp/context.test.ts` — dropped dual-register alias smoke.
+- ~250 `coord_*` tool-name refs across 21 test files
+  bulk-renamed to `st_*` (mechanical).
+
+Load-bearing: first coord-kill piece touching the MCP wire
+surface. Held on `feat/kill-coord-entirely` until reboot signal
+(Option B).
+
+Full suite: 1595 pass, 4 pre-existing flakes.
+
 ### Fixed (`st ding` session-flap debounce + PATH-robustness probe)
 
 Two `st ding` hardening follow-ups from the same review that

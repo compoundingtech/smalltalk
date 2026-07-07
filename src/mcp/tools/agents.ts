@@ -1,17 +1,12 @@
-// mcp/tools/agents.ts — registers the `coord_agents` MCP tool plus its
-// deprecated `coord_members` alias (and both `st_*` counterparts via
-// the dual-prefix pattern).
+// mcp/tools/agents.ts — registers the `st_agents` MCP tool.
 //
 // Thin wrapper over `cmdAgents` from commands/agents.ts. The CLI entry
 // point (cmdAgentsCli) and this tool share the same pure enumeration;
 // no shelling out.
 //
-// brief-009 item 3 (rename): `members` was renamed to `agents`. The
-// old tool name is kept registered alongside the new one with the SAME
-// handler, so calls in flight from agents that haven't migrated keep
-// working. The output payload still uses the field name `members:` in
-// the structured content — that's a wire shape kept for back-compat;
-// will rename to `agents:` in a follow-up.
+// The output payload still uses the field name `members:` in the
+// structured content — that's a wire shape kept for back-compat; will
+// rename to `agents:` in a follow-up.
 
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
@@ -23,7 +18,6 @@ import {
   buildToolResult,
   withErrorMapping,
 } from '../error-mapping.ts';
-import { registerDualTool } from './dual-register.ts';
 
 const agentsInputShape = {
   status: z
@@ -79,34 +73,15 @@ export function registerAgentsTool(mcp: McpServer, coord: Coord): void {
       });
     });
 
-  // New canonical name. Dual-prefixed: coord_agents + st_agents.
-  registerDualTool(
-    mcp,
-    'agents',
+  mcp.registerTool(
+    'st_agents',
     {
-      title: 'Enumerate coord agents',
+      title: 'Enumerate smalltalk agents',
       description:
-        "Equivalent to `coord agents`. Enumerate agents present in $ST_ROOT with their effective status. Pass `enrich: true` to include `lastActivity` and inbox unread count per agent. Useful for peer discovery before sending — call this when you need to know who's available to message.",
-      inputSchema: agentsInputShape,
-      outputSchema: agentsOutputShape,
-    },
-    handler
-  );
-
-  // Deprecated alias for back-compat. Dual-prefixed: coord_members + st_members.
-  registerDualTool(
-    mcp,
-    'members',
-    {
-      title: 'Enumerate coord agents (deprecated alias of `agents`)',
-      description:
-        "Deprecated alias of `coord_agents`. Behaves identically. Migrate boot rituals from `coord_members` / `st_members` to `coord_agents` / `st_agents` when convenient.",
+        "Equivalent to `st agents`. Enumerate agents present in $ST_ROOT with their effective status. Pass `enrich: true` to include `lastActivity` and inbox unread count per agent. Useful for peer discovery before sending — call this when you need to know who's available to message.",
       inputSchema: agentsInputShape,
       outputSchema: agentsOutputShape,
     },
     handler
   );
 }
-
-/** @deprecated Use {@link registerAgentsTool}. */
-export const registerMembersTool = registerAgentsTool;

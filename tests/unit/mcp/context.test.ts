@@ -1,9 +1,10 @@
-// tests/unit/mcp/context.test.ts — brief-024 context/ v1 MCP tools.
+// tests/unit/mcp/context.test.ts — context/ v1 MCP tools.
 //
-// Every context_* verb is dual-registered under coord_* AND st_*
-// (brief-005-phase0 §3). We exercise the coord_* side end-to-end here
-// and spot-check that the st_* alias is registered; a fuller
-// tools/list-matches-EXPECTED regression lives elsewhere.
+// Post-coord-cutover: every context_* verb is registered under
+// `st_*` only. The historical `coord_*` dual-register and the
+// alias smoke-test that verified both prefixes have been removed —
+// the tools/list-matches-EXPECTED regression at
+// tests/unit/mcp/shared.test.ts locks in the st-only surface.
 
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
@@ -48,19 +49,19 @@ interface CallResult {
 
 async function callRead(args: Record<string, unknown>): Promise<CallResult> {
   return (await client.callTool({
-    name: 'coord_context_read',
+    name: 'st_context_read',
     arguments: args,
   })) as CallResult;
 }
 async function callWrite(args: Record<string, unknown>): Promise<CallResult> {
   return (await client.callTool({
-    name: 'coord_context_write',
+    name: 'st_context_write',
     arguments: args,
   })) as CallResult;
 }
 async function callAppend(args: Record<string, unknown>): Promise<CallResult> {
   return (await client.callTool({
-    name: 'coord_context_append',
+    name: 'st_context_append',
     arguments: args,
   })) as CallResult;
 }
@@ -68,18 +69,19 @@ async function callAppend(args: Record<string, unknown>): Promise<CallResult> {
 // ─── Registration ────────────────────────────────────────────────────────
 
 describe('context_* — tools/list registration', () => {
-  it('registers all three verbs under both coord_ and st_ prefixes', async () => {
+  it('registers all three verbs under `st_*` (coord_* alias removed)', async () => {
     const r = await client.listTools();
     const names = new Set(r.tools.map((t) => t.name));
     for (const base of ['context_read', 'context_write', 'context_append']) {
-      expect(names.has(`coord_${base}`)).toBe(true);
       expect(names.has(`st_${base}`)).toBe(true);
+      // Regression guard against the historic dual-register.
+      expect(names.has(`coord_${base}`)).toBe(false);
     }
   });
 
   it('context_read: identity + file are both optional', async () => {
     const r = await client.listTools();
-    const tool = r.tools.find((t) => t.name === 'coord_context_read');
+    const tool = r.tools.find((t) => t.name === 'st_context_read');
     expect(tool).toBeDefined();
     // Nothing is required — that's the absent-able contract.
     expect(tool?.inputSchema?.required ?? []).toEqual([]);
@@ -87,13 +89,13 @@ describe('context_* — tools/list registration', () => {
 
   it('context_write requires body', async () => {
     const r = await client.listTools();
-    const tool = r.tools.find((t) => t.name === 'coord_context_write');
+    const tool = r.tools.find((t) => t.name === 'st_context_write');
     expect(tool?.inputSchema?.required).toEqual(['body']);
   });
 
   it('context_append requires decision + why', async () => {
     const r = await client.listTools();
-    const tool = r.tools.find((t) => t.name === 'coord_context_append');
+    const tool = r.tools.find((t) => t.name === 'st_context_append');
     expect(new Set(tool?.inputSchema?.required ?? [])).toEqual(
       new Set(['decision', 'why'])
     );
@@ -102,7 +104,7 @@ describe('context_* — tools/list registration', () => {
 
 // ─── Absent-able (the load-bearing property) ─────────────────────────────
 
-describe('coord_context_read — absent-able', () => {
+describe('st_context_read — absent-able', () => {
   it("cold agent (no context/ folder) → text is empty, absent: true, and the folder is NOT created", async () => {
     const r = await callRead({});
     expect(r.isError).toBeUndefined();
@@ -134,7 +136,7 @@ describe('coord_context_read — absent-able', () => {
 
 // ─── write + roundtrip ───────────────────────────────────────────────────
 
-describe('coord_context_write', () => {
+describe('st_context_write', () => {
   it('creates the context/ folder + writes now.md', async () => {
     const r = await callWrite({ body: 'brief-024 v1' });
     expect(r.isError).toBeUndefined();
@@ -162,7 +164,7 @@ describe('coord_context_write', () => {
 
 // ─── append + read ───────────────────────────────────────────────────────
 
-describe('coord_context_append', () => {
+describe('st_context_append', () => {
   it('creates one file per entry; returns the filename + line', async () => {
     const r = await callAppend({
       decision: 'ship v1 without hook legs',
@@ -213,7 +215,7 @@ describe('coord_context_append', () => {
 
 // ─── Cross-identity reads ────────────────────────────────────────────────
 
-describe("coord_context_read — reading a peer's context", () => {
+describe("st_context_read — reading a peer's context", () => {
   it("explicit identity reads bob's context/now.md", async () => {
     // Populate bob directly via the write tool with an explicit identity
     // override — proves the identity plumbing goes end-to-end.
@@ -228,18 +230,3 @@ describe("coord_context_read — reading a peer's context", () => {
   });
 });
 
-// ─── st_ alias smoke test ────────────────────────────────────────────────
-
-describe('st_context_* — dual-registration works end-to-end', () => {
-  it('st_context_write + st_context_read roundtrip identically to coord_*', async () => {
-    await client.callTool({
-      name: 'st_context_write',
-      arguments: { body: 'via st alias' },
-    });
-    const r = (await client.callTool({
-      name: 'st_context_read',
-      arguments: {},
-    })) as CallResult;
-    expect(r.structuredContent?.text).toBe('via st alias\n');
-  });
-});

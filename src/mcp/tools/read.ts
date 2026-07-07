@@ -1,4 +1,4 @@
-// mcp/tools/read.ts — registers the `coord_msg_read` MCP tool.
+// mcp/tools/read.ts — registers the `st_msg_read` MCP tool.
 
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
@@ -9,7 +9,6 @@ import {
   buildToolResult,
   withErrorMapping,
 } from '../error-mapping.ts';
-import { registerDualTool } from './dual-register.ts';
 
 const readInputShape = {
   filename: z
@@ -21,7 +20,7 @@ const readInputShape = {
     .string()
     .optional()
     .describe(
-      'Whose folder to read from. Defaults to $COORD_IDENTITY.'
+      'Whose folder to read from. Defaults to $ST_AGENT.'
     ),
   fromArchive: z
     .boolean()
@@ -46,13 +45,12 @@ const readOutputShape = {
 };
 
 export function registerReadTool(mcp: McpServer, coord: Coord): void {
-  registerDualTool(
-    mcp,
-    'msg_read',
+  mcp.registerTool(
+    'st_msg_read',
     {
-      title: 'Read one coord message',
+      title: 'Read one smalltalk message',
       description:
-        "Equivalent to `coord message read`. Return the parsed message at <identity>/inbox/<filename> (or archive, with auto-fallback). identity defaults to $COORD_IDENTITY.",
+        "Equivalent to `st message read`. Return the parsed message at <identity>/inbox/<filename> (or archive, with auto-fallback). identity defaults to $ST_AGENT.",
       inputSchema: readInputShape,
       outputSchema: readOutputShape,
     },

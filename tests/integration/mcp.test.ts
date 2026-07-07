@@ -130,11 +130,11 @@ describe('mcp integration — lifecycle', () => {
       caps: client.getServerCapabilities(),
       tools: (await client.listTools()).tools.map((t) => t.name).sort(),
     };
-    await callTool(client, 'coord_msg_send', {
+    await callTool(client, 'st_msg_send', {
       to: 'bob',
       body: 'drift-guard-msg',
     });
-    await callTool(client, 'coord_msg_ls', {});
+    await callTool(client, 'st_msg_ls', {});
     const after = {
       caps: client.getServerCapabilities(),
       tools: (await client.listTools()).tools.map((t) => t.name).sort(),
@@ -161,14 +161,14 @@ describe('mcp integration — lifecycle', () => {
     }
     expect(errored).toBe(true);
     // Server still alive: a known call should still work.
-    const r = await callTool(client, 'coord_msg_ls', {});
+    const r = await callTool(client, 'st_msg_ls', {});
     expect(r.isError).toBeUndefined();
   });
 });
 
-// ─── coord_msg_send end-to-end ─────────────────────────────────────────────
+// ─── st_msg_send end-to-end ─────────────────────────────────────────────
 
-describe('mcp integration — coord_msg_send', () => {
+describe('mcp integration — st_msg_send', () => {
   let coordRoot: string;
   let client: Client;
   let shutdown: () => Promise<void>;
@@ -194,7 +194,7 @@ describe('mcp integration — coord_msg_send', () => {
   });
 
   it('writes a real file via stdio + JSON-RPC', async () => {
-    const r = await callTool(client, 'coord_msg_send', {
+    const r = await callTool(client, 'st_msg_send', {
       to: 'bob',
       body: 'hello bob',
       subject: 'integration',
@@ -211,20 +211,20 @@ describe('mcp integration — coord_msg_send', () => {
     expect(text).toContain('subject: integration');
   });
 
-  it('roundtrips via coord_msg_ls', async () => {
-    const send = await callTool(client, 'coord_msg_send', {
+  it('roundtrips via st_msg_ls', async () => {
+    const send = await callTool(client, 'st_msg_send', {
       to: 'bob',
       body: 'roundtrip',
     });
     const filename = send.structuredContent?.filename as string;
-    const ls = await callTool(client, 'coord_msg_ls', { identity: 'bob' });
+    const ls = await callTool(client, 'st_msg_ls', { identity: 'bob' });
     expect((ls.structuredContent?.matches as string[]) ?? []).toContain(
       filename
     );
   });
 
   it('typed errors are surfaced as MCP tool errors (not transport errors)', async () => {
-    const r = await callTool(client, 'coord_msg_send', {
+    const r = await callTool(client, 'st_msg_send', {
       to: 'INVALID',
       body: 'm',
     });
@@ -233,14 +233,14 @@ describe('mcp integration — coord_msg_send', () => {
   });
 
   it('schema validation rejects malformed input as a tool error', async () => {
-    const r = await callTool(client, 'coord_msg_send', { body: 'no recipient' });
+    const r = await callTool(client, 'st_msg_send', { body: 'no recipient' });
     expect(r.isError).toBe(true);
   });
 });
 
-// ─── coord_msg_ls end-to-end ───────────────────────────────────────────────
+// ─── st_msg_ls end-to-end ───────────────────────────────────────────────
 
-describe('mcp integration — coord_msg_ls', () => {
+describe('mcp integration — st_msg_ls', () => {
   let coordRoot: string;
   let client: Client;
   let shutdown: () => Promise<void>;
@@ -265,7 +265,7 @@ describe('mcp integration — coord_msg_ls', () => {
   });
 
   it('empty inbox → matches: []', async () => {
-    const r = await callTool(client, 'coord_msg_ls', {});
+    const r = await callTool(client, 'st_msg_ls', {});
     expect((r.structuredContent?.matches as string[]) ?? []).toEqual([]);
     expect(r.structuredContent?.identity).toBe('alice');
   });
@@ -273,13 +273,13 @@ describe('mcp integration — coord_msg_ls', () => {
   it('lists messages chronologically', async () => {
     // Send three to alice (so they land in alice/inbox under bob's name).
     for (let i = 0; i < 3; i++) {
-      await callTool(client, 'coord_msg_send', {
+      await callTool(client, 'st_msg_send', {
         to: 'alice',
         body: `m${i}`,
         from: 'bob',
       });
     }
-    const r = await callTool(client, 'coord_msg_ls', {});
+    const r = await callTool(client, 'st_msg_ls', {});
     const matches = (r.structuredContent?.matches as string[]) ?? [];
     expect(matches).toHaveLength(3);
     // Filenames embed unix-ms; sorted ascending = chronological.
@@ -288,7 +288,7 @@ describe('mcp integration — coord_msg_ls', () => {
   });
 
   it('--archive switches the listed folder', async () => {
-    const r = await callTool(client, 'coord_msg_ls', {
+    const r = await callTool(client, 'st_msg_ls', {
       identity: 'alice',
       archive: true,
     });
@@ -296,9 +296,9 @@ describe('mcp integration — coord_msg_ls', () => {
   });
 });
 
-// ─── coord_msg_read + coord_msg_archive end-to-end ─────────────────────────────
+// ─── st_msg_read + st_msg_archive end-to-end ─────────────────────────────
 
-describe('mcp integration — coord_msg_read + coord_msg_archive', () => {
+describe('mcp integration — st_msg_read + st_msg_archive', () => {
   let coordRoot: string;
   let client: Client;
   let shutdown: () => Promise<void>;
@@ -318,14 +318,14 @@ describe('mcp integration — coord_msg_read + coord_msg_archive', () => {
   });
 
   it('round-trip: send → read → archive', async () => {
-    const send = await callTool(client, 'coord_msg_send', {
+    const send = await callTool(client, 'st_msg_send', {
       to: 'bob',
       body: 'roundtrip body',
       subject: 'roundtrip',
     });
     const filename = send.structuredContent?.filename as string;
 
-    const read = await callTool(client, 'coord_msg_read', {
+    const read = await callTool(client, 'st_msg_read', {
       filename,
       identity: 'bob',
     });
@@ -335,7 +335,7 @@ describe('mcp integration — coord_msg_read + coord_msg_archive', () => {
     ).toBe('alice');
     expect(read.structuredContent?.folder).toBe('inbox');
 
-    const archive = await callTool(client, 'coord_msg_archive', {
+    const archive = await callTool(client, 'st_msg_archive', {
       filename,
       identity: 'bob',
     });
@@ -348,19 +348,19 @@ describe('mcp integration — coord_msg_read + coord_msg_archive', () => {
     ).toBe(true);
   });
 
-  it('coord_msg_read on a missing file → MESSAGE_NOT_FOUND', async () => {
-    const r = await callTool(client, 'coord_msg_read', {
+  it('st_msg_read on a missing file → MESSAGE_NOT_FOUND', async () => {
+    const r = await callTool(client, 'st_msg_read', {
       filename: '1714826789010-zzzzzz.md',
       identity: 'bob',
     });
     expect(errorCode(r)).toBe('MESSAGE_NOT_FOUND');
   });
 
-  it('coord_msg_archive case-3 divergent twin → ARCHIVE_CONFLICT', async () => {
+  it('st_msg_archive case-3 divergent twin → ARCHIVE_CONFLICT', async () => {
     const f = '1714826789999-aaaaaa.md';
     writeFileSync(join(coordRoot, 'bob', 'inbox', f), 'inbox-version');
     writeFileSync(join(coordRoot, 'bob', 'archive', f), 'archive-version');
-    const r = await callTool(client, 'coord_msg_archive', {
+    const r = await callTool(client, 'st_msg_archive', {
       filename: f,
       identity: 'bob',
     });
@@ -368,9 +368,9 @@ describe('mcp integration — coord_msg_read + coord_msg_archive', () => {
   });
 });
 
-// ─── coord_msg_thread end-to-end ───────────────────────────────────────────
+// ─── st_msg_thread end-to-end ───────────────────────────────────────────
 
-describe('mcp integration — coord_msg_thread', () => {
+describe('mcp integration — st_msg_thread', () => {
   let coordRoot: string;
   let client: Client;
   let shutdown: () => Promise<void>;
@@ -391,7 +391,7 @@ describe('mcp integration — coord_msg_thread', () => {
 
   it('walks a 3-message linear chain', async () => {
     const f1 = (
-      await callTool(client, 'coord_msg_send', {
+      await callTool(client, 'st_msg_send', {
         to: 'bob',
         body: 'root',
       })
@@ -399,7 +399,7 @@ describe('mcp integration — coord_msg_thread', () => {
     // 2ms gap to keep filename sort stable.
     await new Promise((r) => setTimeout(r, 2));
     const f2 = (
-      await callTool(client, 'coord_msg_send', {
+      await callTool(client, 'st_msg_send', {
         to: 'bob',
         body: 'reply1',
         inReplyTo: f1,
@@ -407,14 +407,14 @@ describe('mcp integration — coord_msg_thread', () => {
     ).structuredContent?.filename as string;
     await new Promise((r) => setTimeout(r, 2));
     const f3 = (
-      await callTool(client, 'coord_msg_send', {
+      await callTool(client, 'st_msg_send', {
         to: 'bob',
         body: 'reply2',
         inReplyTo: f2,
       })
     ).structuredContent?.filename as string;
 
-    const r = await callTool(client, 'coord_msg_thread', {
+    const r = await callTool(client, 'st_msg_thread', {
       filename: f1,
       identity: 'bob',
     });
@@ -428,7 +428,7 @@ describe('mcp integration — coord_msg_thread', () => {
   });
 
   it('seed not found → MESSAGE_NOT_FOUND', async () => {
-    const r = await callTool(client, 'coord_msg_thread', {
+    const r = await callTool(client, 'st_msg_thread', {
       filename: '1714826789010-zzzzzz.md',
       identity: 'bob',
     });
@@ -438,24 +438,24 @@ describe('mcp integration — coord_msg_thread', () => {
   it('tree=true returns depth-indented walk order', async () => {
     // Build a small branching thread.
     const root = (
-      await callTool(client, 'coord_msg_send', {
+      await callTool(client, 'st_msg_send', {
         to: 'bob',
         body: 'r',
       })
     ).structuredContent?.filename as string;
     await new Promise((r) => setTimeout(r, 2));
-    await callTool(client, 'coord_msg_send', {
+    await callTool(client, 'st_msg_send', {
       to: 'bob',
       body: 'r1',
       inReplyTo: root,
     });
     await new Promise((r) => setTimeout(r, 2));
-    await callTool(client, 'coord_msg_send', {
+    await callTool(client, 'st_msg_send', {
       to: 'bob',
       body: 'r2',
       inReplyTo: root,
     });
-    const r = await callTool(client, 'coord_msg_thread', {
+    const r = await callTool(client, 'st_msg_thread', {
       filename: root,
       identity: 'bob',
       tree: true,
@@ -490,7 +490,7 @@ describe('mcp integration — error response shape over real stdio', () => {
   });
 
   it('CoordError → isError + content[0].text starts with code + _meta["coord/error"]', async () => {
-    const r = await callTool(client, 'coord_msg_send', {
+    const r = await callTool(client, 'st_msg_send', {
       to: 'INVALID',
       body: 'm',
     });
@@ -501,9 +501,9 @@ describe('mcp integration — error response shape over real stdio', () => {
   });
 });
 
-// ─── coord_members end-to-end ──────────────────────────────────────────
+// ─── st_agents end-to-end ──────────────────────────────────────────
 
-describe('mcp integration — coord_members', () => {
+describe('mcp integration — st_agents', () => {
   let coordRoot: string;
   let client: Client;
   let shutdown: () => Promise<void>;
@@ -535,11 +535,11 @@ describe('mcp integration — coord_members', () => {
 
   it('appears in tools/list when the server boots in non-channel mode', async () => {
     const r = await client.listTools();
-    expect(r.tools.map((t) => t.name)).toContain('coord_members');
+    expect(r.tools.map((t) => t.name)).toContain('st_agents');
   });
 
   it('zero-arg call returns all identities with effective status', async () => {
-    const r = await callTool(client, 'coord_members', {});
+    const r = await callTool(client, 'st_agents', {});
     const members = (r.structuredContent?.members as MemberShape[]) ?? [];
     expect(members.map((m) => m.identity)).toEqual(['alice', 'bob', 'carol']);
     expect(members.find((m) => m.identity === 'alice')?.status).toBe(
@@ -552,13 +552,13 @@ describe('mcp integration — coord_members', () => {
   });
 
   it('status filter narrows to a single state', async () => {
-    const r = await callTool(client, 'coord_members', { status: 'busy' });
+    const r = await callTool(client, 'st_agents', { status: 'busy' });
     const members = (r.structuredContent?.members as MemberShape[]) ?? [];
     expect(members.map((m) => m.identity)).toEqual(['bob']);
   });
 
   it('enrich: true returns lastActivity/inbox fields', async () => {
-    const r = await callTool(client, 'coord_members', { enrich: true });
+    const r = await callTool(client, 'st_agents', { enrich: true });
     const members = (r.structuredContent?.members as MemberShape[]) ?? [];
     expect(members.length).toBeGreaterThan(0);
     for (const m of members) {

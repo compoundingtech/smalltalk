@@ -1,9 +1,9 @@
 // mcp/tools/context.ts — brief-024 context/ v1 MCP tools.
 //
-// Three dual-registered tools mirror the CLI verbs 1:1:
-//   coord_context_read   / st_context_read
-//   coord_context_write  / st_context_write
-//   coord_context_append / st_context_append
+// Three tools mirror the CLI verbs 1:1:
+//   st_context_read
+//   st_context_write
+//   st_context_append
 //
 // All three are absent-able: `read` on a missing folder returns
 // `{ text: '', absent: true }`; `write` and `append` lazy-create the
@@ -20,7 +20,6 @@ import {
   buildToolResult,
   withErrorMapping,
 } from '../error-mapping.ts';
-import { registerDualTool } from './dual-register.ts';
 
 // ─── read ────────────────────────────────────────────────────────────────
 
@@ -49,13 +48,12 @@ const readOutputShape = {
 };
 
 function registerContextReadTool(mcp: McpServer, coord: Coord): void {
-  registerDualTool(
-    mcp,
-    'context_read',
+  mcp.registerTool(
+    'st_context_read',
     {
       title: 'Read agent context/ working-state',
       description:
-        "Equivalent to `coord context read`. Return the per-agent durable working-state (brief-024, in-context-state leg of lossless-restart). Absent-able: missing files return { text: '', absent: true }.",
+        "Equivalent to `st context read`. Return the per-agent durable working-state (brief-024, in-context-state leg of lossless-restart). Absent-able: missing files return { text: '', absent: true }.",
       inputSchema: readInputShape,
       outputSchema: readOutputShape,
     },
@@ -101,13 +99,12 @@ const writeOutputShape = {
 };
 
 function registerContextWriteTool(mcp: McpServer, coord: Coord): void {
-  registerDualTool(
-    mcp,
-    'context_write',
+  mcp.registerTool(
+    'st_context_write',
     {
       title: 'Rewrite agent context/now.md',
       description:
-        "Equivalent to `coord context write`. Replace now.md with `body`. Whole-file rewrite discipline — v1 rejects edit-in-place because it's how staleness creeps in. Lazy-creates the context/ folder.",
+        "Equivalent to `st context write`. Replace now.md with `body`. Whole-file rewrite discipline — v1 rejects edit-in-place because it's how staleness creeps in. Lazy-creates the context/ folder.",
       inputSchema: writeInputShape,
       outputSchema: writeOutputShape,
     },
@@ -156,7 +153,7 @@ const appendInputShape = {
 const appendOutputShape = {
   identity: z.string(),
   path: z.string().describe(
-    "Absolute path of the newly-written entry file: <coord-root>/<identity>/context/decisions/<unix-ms>-<rand6>.md."
+    "Absolute path of the newly-written entry file: <st-root>/<identity>/context/decisions/<unix-ms>-<rand6>.md."
   ),
   filename: z.string().describe(
     "Basename of the entry file (LAYOUT-004 grammar: <unix-ms>-<rand6>.md)."
@@ -165,13 +162,12 @@ const appendOutputShape = {
 };
 
 function registerContextAppendTool(mcp: McpServer, coord: Coord): void {
-  registerDualTool(
-    mcp,
-    'context_append',
+  mcp.registerTool(
+    'st_context_append',
     {
       title: 'Append one decision to context/decisions/',
       description:
-        "Equivalent to `coord context append --decision <text> --why <text>`. Creates a new file `<unix-ms>-<rand6>.md` under `<coord-root>/<identity>/context/decisions/` with one bulleted line. Append semantics = new file per entry — no rewriting an existing log, no clobbering on race. Lazy-creates the context/ + decisions/ folders.",
+        "Equivalent to `st context append --decision <text> --why <text>`. Creates a new file `<unix-ms>-<rand6>.md` under `<st-root>/<identity>/context/decisions/` with one bulleted line. Append semantics = new file per entry — no rewriting an existing log, no clobbering on race. Lazy-creates the context/ + decisions/ folders.",
       inputSchema: appendInputShape,
       outputSchema: appendOutputShape,
     },

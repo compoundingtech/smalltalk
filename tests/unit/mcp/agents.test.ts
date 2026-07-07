@@ -1,4 +1,4 @@
-// tests/unit/mcp/members.test.ts — coord_members tool, in-memory.
+// tests/unit/mcp/members.test.ts — st_agents tool, in-memory.
 
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
@@ -60,38 +60,38 @@ interface MemberShape {
 
 async function call(args: Record<string, unknown> = {}): Promise<CallResult> {
   return (await client.callTool({
-    name: 'coord_members',
+    name: 'st_agents',
     arguments: args,
   })) as CallResult;
 }
 
 // ─── tools/list registration ───────────────────────────────────────────
 
-describe('coord_members — tools/list registration', () => {
+describe('st_agents — tools/list registration', () => {
   it('appears in tools/list with input + output schemas', async () => {
     setupIdentity('alice');
     await boot();
     const r = await client.listTools();
-    const tool = r.tools.find((t) => t.name === 'coord_members');
+    const tool = r.tools.find((t) => t.name === 'st_agents');
     expect(tool).toBeDefined();
     expect(tool?.inputSchema).toBeDefined();
     expect(tool?.outputSchema).toBeDefined();
   });
 
-  it('description contains the load-bearing peer-discovery phrase (checked on canonical coord_agents)', async () => {
+  it('description contains the load-bearing peer-discovery phrase (checked on canonical st_agents)', async () => {
     setupIdentity('alice');
     await boot();
     const r = await client.listTools();
-    const tool = r.tools.find((t) => t.name === 'coord_agents');
+    const tool = r.tools.find((t) => t.name === 'st_agents');
     expect(tool?.description).toContain('Useful for peer discovery before sending');
   });
 
-  it('coord_agents is also registered (canonical name post-brief-009 item 3)', async () => {
+  it('st_agents is also registered (canonical name post-brief-009 item 3)', async () => {
     setupIdentity('alice');
     await boot();
     const r = await client.listTools();
     const names = r.tools.map((t) => t.name);
-    expect(names).toContain('coord_agents');
+    expect(names).toContain('st_agents');
     expect(names).toContain('st_agents');
   });
 
@@ -99,14 +99,14 @@ describe('coord_members — tools/list registration', () => {
     setupIdentity('alice');
     await boot();
     const r = await client.listTools();
-    const tool = r.tools.find((t) => t.name === 'coord_members');
+    const tool = r.tools.find((t) => t.name === 'st_agents');
     expect(tool?.inputSchema?.required ?? []).toEqual([]);
   });
 });
 
 // ─── Happy paths ───────────────────────────────────────────────────────
 
-describe('coord_members — happy paths', () => {
+describe('st_agents — happy paths', () => {
   it('no flags → returns all identities with MemberSummary shape', async () => {
     setupIdentity('alice');
     setupIdentity('bob');
@@ -204,7 +204,7 @@ describe('coord_members — happy paths', () => {
 
 // ─── Schema validation ─────────────────────────────────────────────────
 
-describe('coord_members — schema validation', () => {
+describe('st_agents — schema validation', () => {
   it('invalid status value → tool errors (zod enum)', async () => {
     setupIdentity('alice');
     await boot();

@@ -1,4 +1,4 @@
-// mcp/tools/archive.ts — registers the `coord_msg_archive` MCP tool.
+// mcp/tools/archive.ts — registers the `st_msg_archive` MCP tool.
 //
 // Mirrors `coord.archive(identity, filename)`. Returns
 // { outcome: 'moved' | 'idempotent' } so embedders can distinguish
@@ -16,7 +16,6 @@ import {
   buildToolResult,
   withErrorMapping,
 } from '../error-mapping.ts';
-import { registerDualTool } from './dual-register.ts';
 
 const archiveInputShape = {
   filename: z
@@ -28,7 +27,7 @@ const archiveInputShape = {
     .string()
     .optional()
     .describe(
-      "Whose folder to archive within. Defaults to $COORD_IDENTITY."
+      "Whose folder to archive within. Defaults to $ST_AGENT."
     ),
 };
 
@@ -43,13 +42,12 @@ const archiveOutputShape = {
 };
 
 export function registerArchiveTool(mcp: McpServer, coord: Coord): void {
-  registerDualTool(
-    mcp,
-    'msg_archive',
+  mcp.registerTool(
+    'st_msg_archive',
     {
-      title: 'Archive a coord message',
+      title: 'Archive a smalltalk message',
       description:
-        "Equivalent to `coord message archive`. Move <identity>/inbox/<filename> to <identity>/archive/<filename>. Idempotent on a byte-identical twin; refuses on divergent twin (ARCHIVE_CONFLICT).",
+        "Equivalent to `st message archive`. Move <identity>/inbox/<filename> to <identity>/archive/<filename>. Idempotent on a byte-identical twin; refuses on divergent twin (ARCHIVE_CONFLICT).",
       inputSchema: archiveInputShape,
       outputSchema: archiveOutputShape,
     },

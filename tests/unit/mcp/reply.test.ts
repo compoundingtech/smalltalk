@@ -1,6 +1,6 @@
-// tests/unit/mcp/reply.test.ts — coord_msg_reply tool (channel mode only).
+// tests/unit/mcp/reply.test.ts — st_msg_reply tool (channel mode only).
 //
-// Phase-2 task 3 of brief-010. coord_msg_reply is registered only when the
+// Phase-2 task 3 of brief-010. st_msg_reply is registered only when the
 // server is constructed with `channel: true`; in default Phase-1 mode
 // the tool is absent.
 
@@ -77,7 +77,7 @@ function plant(
 
 async function reply(args: Record<string, unknown>): Promise<CallResult> {
   return (await client.callTool({
-    name: 'coord_msg_reply',
+    name: 'st_msg_reply',
     arguments: args,
   })) as CallResult;
 }
@@ -88,18 +88,18 @@ function readReply(identity: string, filename: string): string {
 
 // ─── Registration / mode gating ────────────────────────────────────────
 
-describe('coord_msg_reply — registration', () => {
+describe('st_msg_reply — registration', () => {
   it('is NOT registered when channel mode is off', async () => {
     await setup({ channel: false });
     const r = await client.listTools();
     const names = r.tools.map((t) => t.name);
-    expect(names).not.toContain('coord_msg_reply');
+    expect(names).not.toContain('st_msg_reply');
   });
 
   it('IS registered when channel mode is on, with required {thread, body}', async () => {
     await setup({ channel: true });
     const r = await client.listTools();
-    const tool = r.tools.find((t) => t.name === 'coord_msg_reply');
+    const tool = r.tools.find((t) => t.name === 'st_msg_reply');
     expect(tool).toBeDefined();
     expect(tool?.inputSchema?.required).toEqual(['thread', 'body']);
     expect(tool?.outputSchema).toBeDefined();
@@ -108,7 +108,7 @@ describe('coord_msg_reply — registration', () => {
 
 // ─── Happy paths ───────────────────────────────────────────────────────
 
-describe('coord_msg_reply — happy paths', () => {
+describe('st_msg_reply — happy paths', () => {
   beforeEach(async () => {
     await setup({ channel: true });
   });
@@ -156,7 +156,7 @@ describe('coord_msg_reply — happy paths', () => {
   it('cross-identity: reply to a message that lives in a peer\'s archive', async () => {
     // Set up a synced peer archive: carol's archive holds a message
     // from alice. bob's tree doesn't contain the file at all — yet
-    // coord_msg_reply locates it via the peer-archive scan.
+    // st_msg_reply locates it via the peer-archive scan.
     const orig = '1714826789040-dddddd.md';
     plant('carol', orig, { from: 'alice', subject: 'peer' }, 'peer msg', 'archive');
     const r = await reply({ thread: orig, body: 'thanks' });
@@ -193,7 +193,7 @@ describe('coord_msg_reply — happy paths', () => {
 
 // ─── Typed errors ──────────────────────────────────────────────────────
 
-describe('coord_msg_reply — typed error mapping', () => {
+describe('st_msg_reply — typed error mapping', () => {
   beforeEach(async () => {
     await setup({ channel: true });
   });
@@ -231,7 +231,7 @@ describe('coord_msg_reply — typed error mapping', () => {
 
   it('thread file has no `from:` field → INVALID_IDENTITY', async () => {
     const orig = '1714826789080-hhhhhh.md';
-    // Frontmatter fence with no `from`; coord_msg_reply has no recipient
+    // Frontmatter fence with no `from`; st_msg_reply has no recipient
     // to send to.
     writeFileSync(
       join(coordRoot, 'bob', 'inbox', orig),
@@ -244,7 +244,7 @@ describe('coord_msg_reply — typed error mapping', () => {
 
 // ─── Side-effect isolation ────────────────────────────────────────────
 
-describe('coord_msg_reply — side effects', () => {
+describe('st_msg_reply — side effects', () => {
   beforeEach(async () => {
     await setup({ channel: true });
   });
@@ -263,9 +263,9 @@ describe('coord_msg_reply — side effects', () => {
 
 // ─── brief-035 task 1: invariant + concurrency pin-down ────────────────
 //
-// myobie observed two parallel `coord_msg_reply` calls landing in the
+// myobie observed two parallel `st_msg_reply` calls landing in the
 // recipient's *archive* instead of *inbox*, alongside three concurrent
-// `coord_msg_archive` calls on the sender's tree. Investigation: the
+// `st_msg_archive` calls on the sender's tree. Investigation: the
 // MCP `coord.send` path writes only to inboxDir(to, root) (see
 // commands/send.ts cmdSend) and the pre-command sweep only DELETES
 // inbox files that have a byte-identical twin already in archive
@@ -275,7 +275,7 @@ describe('coord_msg_reply — side effects', () => {
 // every adjacent invariant so a future refactor can't reintroduce
 // the worry.
 
-describe('coord_msg_reply — invariants under archive concurrency (brief-035)', () => {
+describe('st_msg_reply — invariants under archive concurrency (brief-035)', () => {
   beforeEach(async () => {
     await setup({ channel: true });
   });
@@ -337,12 +337,12 @@ describe('coord_msg_reply — invariants under archive concurrency (brief-035)',
 
     const archive = (filename: string) =>
       client.callTool({
-        name: 'coord_msg_archive',
+        name: 'st_msg_archive',
         arguments: { filename },
       });
     const replyCall = (thread: string) =>
       client.callTool({
-        name: 'coord_msg_reply',
+        name: 'st_msg_reply',
         arguments: { thread, body: 'reply' },
       });
 

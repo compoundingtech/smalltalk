@@ -2,7 +2,7 @@
 // extension demo. Spawns a real pi-coding-agent session pointed at
 // examples/pi/coord.ts (auto-loaded from a per-test ~/.pi/agent/),
 // drops a coord message into the agent's inbox, and waits for the
-// agent to call `coord_msg_reply` so a reply file lands in the sender's
+// agent to call `st_msg_reply` so a reply file lands in the sender's
 // inbox.
 //
 // Skip-gated by `COORD_RUN_LIVE_PI=1`. CI without `pi` on $PATH or
@@ -205,7 +205,7 @@ async function pollForReply(
 
 describe.skipIf(!LIVE)('pi extension — live agent end-to-end', () => {
   it(
-    'agent is notified of new coord arrivals and can call coord_msg_reply',
+    'agent is notified of new coord arrivals and can call st_msg_reply',
     async () => {
       const path = `${COORD_BIN_DIR}:${process.env.PATH ?? ''}`;
       // Pass through whichever provider API key the developer has set.
@@ -245,15 +245,15 @@ describe.skipIf(!LIVE)('pi extension — live agent end-to-end', () => {
       await session.waitForText('coord: watching bob/inbox/', 30_000);
 
       // Drop a question into bob's inbox from alice. The seed prompts
-      // the agent to call `coord_msg_send` with `inReplyTo` rather than
-      // `coord_msg_reply`, because pi's extension registers the five
+      // the agent to call `st_msg_send` with `inReplyTo` rather than
+      // `st_msg_reply`, because pi's extension registers the five
       // Phase-1 verbs (send/ls/read/archive/thread) but NOT
-      // coord_msg_reply (that's MCP channel-mode only).
+      // st_msg_reply (that's MCP channel-mode only).
       const original = '1714826789010-aaaaaa.md';
       writeFileSync(
         join(coordRoot, 'bob', 'inbox', original),
         '---\nfrom: alice\nsubject: math\n---\n' +
-          'what is 2+2? Use the coord_msg_send tool with to=alice, ' +
+          'what is 2+2? Use the st_msg_send tool with to=alice, ' +
           `inReplyTo=${original}, and your answer as the body.\n`
       );
 

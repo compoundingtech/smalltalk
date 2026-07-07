@@ -13,7 +13,6 @@ import {
   buildToolResult,
   withErrorMapping,
 } from '../error-mapping.ts';
-import { registerDualTool } from './dual-register.ts';
 
 const sendInputShape = {
   to: z.string().describe('Recipient identity (LAYOUT-004 grammar)'),
@@ -21,7 +20,7 @@ const sendInputShape = {
   from: z
     .string()
     .optional()
-    .describe('Sender identity. Defaults to $COORD_IDENTITY.'),
+    .describe('Sender identity. Defaults to $ST_AGENT.'),
   subject: z.string().optional().describe('Optional subject line.'),
   inReplyTo: z
     .string()
@@ -49,13 +48,12 @@ const sendOutputShape = {
 };
 
 export function registerSendTool(mcp: McpServer, coord: Coord): void {
-  registerDualTool(
-    mcp,
-    'msg_send',
+  mcp.registerTool(
+    'st_msg_send',
     {
-      title: 'Send a coord message',
+      title: 'Send a smalltalk message',
       description:
-        'Equivalent to `coord message send`. Write a new message to <to>/inbox/. The act of writing IS the send; sync moves the file across machines later.',
+        'Equivalent to `st message send`. Write a new message to <to>/inbox/. The act of writing IS the send; sync moves the file across machines later.',
       inputSchema: sendInputShape,
       outputSchema: sendOutputShape,
     },

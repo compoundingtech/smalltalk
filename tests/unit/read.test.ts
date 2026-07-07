@@ -413,7 +413,7 @@ describe('buildReadJsonShape', () => {
     return cmdRead(baseInput());
   }
 
-  it('mirrors the MCP coord_msg_read shape: { filename, identity, folder, message }', () => {
+  it('mirrors the MCP st_msg_read shape: { filename, identity, folder, message }', () => {
     const r = read('---\nfrom: alice\nsubject: hi\n---\nthe body\n');
     const j = buildReadJsonShape('1714826789010-aaaaaa.md', r);
     expect(j).toEqual({

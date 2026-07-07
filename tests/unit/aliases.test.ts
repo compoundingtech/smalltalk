@@ -2,7 +2,7 @@
 //
 // Covers four of the six Phase 0 acceptance criteria as unit tests:
 //   2. MCP server announces under the right name (coord vs st).
-//   3. Both `coord_*` and `st_*` tool names resolve to the same handler.
+//   3. MCP tools are registered under `st_*` only (coord_* alias removed).
 //   4. ST_* env vars are preferred over COORD_* (with one-time warning).
 //   5. State-dir resolution prefers `smalltalk/` over `coord/` with
 //      `smalltalk/` as the brand-new-install default.
@@ -307,9 +307,13 @@ describe('MCP server name (Item 2)', () => {
   });
 });
 
-// ─── Item 3: tool name dual-registration ──────────────────────────────────
+// ─── Item 3 (post-cutover): tool name registry is `st_*` only ─────────────
+//
+// The historical dual-register (coord_* + st_* under the same
+// handlers) has been removed — one canonical name each. This block
+// locks in the st-only surface.
 
-describe('MCP tool name dual-registration (Item 3)', () => {
+describe('MCP tool name registry (post-coord-cutover)', () => {
   async function connect(): Promise<{
     client: Client;
     close(): Promise<void>;
@@ -333,57 +337,40 @@ describe('MCP tool name dual-registration (Item 3)', () => {
     };
   }
 
-  it('listTools includes BOTH the coord_* and st_* registrations', async () => {
+  it('listTools includes ONLY the `st_*` registrations — no coord_* prefix', async () => {
     const { client, close } = await connect();
     try {
       const r = await client.listTools();
       const names = new Set(r.tools.map((t) => t.name));
-      // Spot-check both prefixes for every base name.
+      // Every canonical `st_*` base name is present.
       for (const base of [
         'msg_send',
         'msg_ls',
         'msg_read',
         'msg_archive',
         'msg_thread',
-        'members',
+        'agents',
       ]) {
-        expect(names.has(`coord_${base}`)).toBe(true);
         expect(names.has(`st_${base}`)).toBe(true);
+        // Regression guard: the historic `coord_*` alias is GONE.
+        expect(names.has(`coord_${base}`)).toBe(false);
       }
+      // Deprecated `members` alias is also gone.
+      expect(names.has('st_members')).toBe(false);
+      expect(names.has('coord_members')).toBe(false);
     } finally {
       await close();
     }
   });
 
-  it('coord_msg_ls and st_msg_ls produce identical results', async () => {
+  it('st_msg_ls resolves + returns a structured result', async () => {
     const { client, close } = await connect();
     try {
-      const r1 = (await client.callTool({
-        name: 'coord_msg_ls',
-        arguments: {},
-      })) as { structuredContent?: unknown };
-      const r2 = (await client.callTool({
+      const r = (await client.callTool({
         name: 'st_msg_ls',
         arguments: {},
       })) as { structuredContent?: unknown };
-      expect(r2.structuredContent).toEqual(r1.structuredContent);
-    } finally {
-      await close();
-    }
-  });
-
-  it('coord_members and st_members are wired to the same handler', async () => {
-    const { client, close } = await connect();
-    try {
-      const r1 = (await client.callTool({
-        name: 'coord_members',
-        arguments: {},
-      })) as { structuredContent?: unknown };
-      const r2 = (await client.callTool({
-        name: 'st_members',
-        arguments: {},
-      })) as { structuredContent?: unknown };
-      expect(r2.structuredContent).toEqual(r1.structuredContent);
+      expect(r.structuredContent).toBeDefined();
     } finally {
       await close();
     }

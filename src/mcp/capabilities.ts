@@ -86,36 +86,39 @@ export const SERVER_OPTIONS: ServerOptions = {
 
 /**
  * Instructions sent to the host when channel mode is on. Defines the
- * full boot ritual every connected agent runs so myobie's visibility
- * surface — status files + inbox flow — stays honest.
+ * full boot ritual every connected agent runs so the operator's
+ * visibility surface — status files + inbox flow — stays honest.
  *
  * Load-bearing substrings (asserted by tests/unit/channel-instructions
- * regression guard): `available`, `coord status`, `coord_msg_ls`,
- * `coord_msg_read`, `coord_msg_archive`, `coord_msg_reply`,
- * `coord_members`, `<channel source="coord"`.
+ * regression guard): `available`, `st status`, `st_msg_ls`,
+ * `st_msg_read`, `st_msg_archive`, `st_msg_reply`, `st_agents`,
+ * `<channel source="st"`.
  *
  * **Bus-contract twin: `DING_BUS_INSTRUCTIONS` in
  * `src/commands/launch.ts`.** MCP agents receive THIS blurb via the
  * transport's `instructions:` field; ding-mode agents receive the
  * DING-BUS.md analog via an `@DING-BUS.md` import installed by
  * `st launch --ding`. Two versions of ONE bus contract — when the
- * contract changes (new tools, new conventions, boot-ritual
+ * *shared* contract changes (new tools, new conventions, boot-ritual
  * updates), update BOTH. Drift means MCP agents and ding-mode
- * agents will behave differently for the same protocol event.
+ * agents will behave differently for the same protocol event. The
+ * "propagate ding-mode through spawns" section in
+ * DING_BUS_INSTRUCTIONS is transport-specific and deliberately
+ * does NOT mirror here.
  */
 export const CHANNEL_INSTRUCTIONS = [
-  'You are connected to coord. This is myobie\'s visibility layer: they look at status files and inbox/archive to understand what every agent is doing. Maintain those records.',
+  'You are connected to smalltalk. This is the operator\'s visibility layer: they look at status files and inbox/archive to understand what every agent is doing. Maintain those records.',
   '',
   'On first opportunity in a fresh context (cold start or /clear):',
-  '  1. Write `available` to your status file. Shell out: `coord status <your-identity> --set available`. Use $COORD_IDENTITY.',
-  '  2. Drain your inbox backlog. Call `coord_msg_ls` to enumerate filenames, then for each one `coord_msg_read` it, `coord_msg_reply` if appropriate, and `coord_msg_archive` to clear. Don\'t leave inbox items un-addressed.',
-  '  3. Check `coord_members` (with `enrich: true`) to see who\'s around and whether any peers are waiting on you.',
+  '  1. Write `available` to your status file. Shell out: `st status <your-identity> --set available`. Use $ST_AGENT.',
+  '  2. Drain your inbox backlog. Call `st_msg_ls` to enumerate filenames, then for each one `st_msg_read` it, `st_msg_reply` if appropriate, and `st_msg_archive` to clear. Don\'t leave inbox items un-addressed.',
+  '  3. Check `st_agents` (with `enrich: true`) to see who\'s around and whether any peers are waiting on you.',
   '',
-  'As channel notifications arrive: new peer messages appear in your context as `<channel source="coord" from="<sender>">…</channel>` blocks. For each one: `coord_msg_read` the cited filename, `coord_msg_reply` with `thread: <messageFilename>` and `body: <your reply>` if a response is warranted, then `coord_msg_archive` to clear. Don\'t let inbox accumulate.',
+  'As channel notifications arrive: new peer messages appear in your context as `<channel source="st" from="<sender>">…</channel>` blocks. For each one: `st_msg_read` the cited filename, `st_msg_reply` with `thread: <messageFilename>` and `body: <your reply>` if a response is warranted, then `st_msg_archive` to clear. Don\'t let inbox accumulate.',
   '',
-  'Coord threads stay on coord. A thread that originated from a channel notification or an inbox message is conversed *only* via `coord_msg_send` / `coord_msg_reply` — questions, clarifications, blockers, "I think I\'m done" signals, follow-up thoughts, all of it. By default, your pty REPL is unattended — there is no human reading what you print to your own screen. Your coord correspondent is your interlocutor for the thread; they will relay anything that matters to the user. If you would otherwise pause to ask "should I do X?" at your REPL, send it via `coord_msg_reply` instead. The only time it\'s right to address the REPL is when a human directly typed there.',
+  'Smalltalk threads stay on smalltalk. A thread that originated from a channel notification or an inbox message is conversed *only* via `st_msg_send` / `st_msg_reply` — questions, clarifications, blockers, "I think I\'m done" signals, follow-up thoughts, all of it. By default, your pty REPL is unattended — there is no human reading what you print to your own screen. Your smalltalk correspondent is your interlocutor for the thread; they will relay anything that matters to the user. If you would otherwise pause to ask "should I do X?" at your REPL, send it via `st_msg_reply` instead. The only time it\'s right to address the REPL is when a human directly typed there.',
   '',
-  'Tools you have via MCP: `coord_msg_send`, `coord_msg_reply`, `coord_msg_ls`, `coord_msg_read`, `coord_msg_archive`, `coord_msg_thread`, `coord_members`. For status, shell out to `coord status` — no MCP tool for it yet.',
+  'Tools you have via MCP: `st_msg_send`, `st_msg_reply`, `st_msg_ls`, `st_msg_read`, `st_msg_archive`, `st_msg_thread`, `st_agents`. For status, shell out to `st status` — no MCP tool for it yet.',
 ].join('\n');
 
 /**
@@ -140,17 +143,15 @@ export function buildServerOptions(opts: {
 }
 
 /** The base tool names (sans prefix) registered in non-channel mode.
- *  `msg_send/ls/read/archive/thread` per brief-017; `members` per
- *  brief-019; `resource_*` per brief-009 item 5; `agents` per
- *  brief-009 item 3 (rename) with `members` kept as deprecated alias;
- *  `context_*` per brief-024 (in-context-state leg of lossless-restart). */
+ *  Post-cutover: `st_*` only. The historical `coord_*` dual-register
+ *  and the deprecated `members` alias have both been removed —
+ *  `st_agents` is the canonical name. */
 export const EXPECTED_TOOL_BASE_NAMES = [
   'msg_send',
   'msg_ls',
   'msg_read',
   'msg_archive',
   'msg_thread',
-  'members',
   'agents',
   'resource_add',
   'resource_ls',
@@ -161,18 +162,16 @@ export const EXPECTED_TOOL_BASE_NAMES = [
   'context_append',
 ] as const;
 
-/** brief-005-phase0 §3: every tool dual-registers under `coord_*`
- *  (legacy) AND `st_*` (new). The Phase-1 set is both prefixes for
- *  every base name. Phase 5 drops the `coord_*` variants. */
+/** Post-coord-cutover: every tool registers under `st_*` only.
+ *  The historical `coord_*` alias set (via dual-register) has been
+ *  removed — one canonical name each. */
 export const EXPECTED_TOOL_NAMES = [
-  ...EXPECTED_TOOL_BASE_NAMES.map((n) => `coord_${n}` as const),
   ...EXPECTED_TOOL_BASE_NAMES.map((n) => `st_${n}` as const),
 ] as const;
 
-/** Channel-mode tool set: non-channel set + msg_reply (dual-prefixed). */
+/** Channel-mode tool set: non-channel set + msg_reply. */
 export const EXPECTED_TOOL_NAMES_CHANNEL = [
   ...EXPECTED_TOOL_NAMES,
-  'coord_msg_reply',
   'st_msg_reply',
 ] as const;
 

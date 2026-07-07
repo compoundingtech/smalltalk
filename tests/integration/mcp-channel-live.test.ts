@@ -2,7 +2,7 @@
 //
 // Spawns a real Claude Code session pointed at `coord mcp --channel`,
 // drops a coord message into the agent's inbox, and waits for the
-// agent to call `coord_msg_reply` so a reply file lands in the sender's
+// agent to call `st_msg_reply` so a reply file lands in the sender's
 // inbox.
 //
 // Skip-gated by `COORD_RUN_LIVE_CLAUDE=1`. CI without Claude Code on
@@ -234,7 +234,7 @@ async function pollForReply(
 
 describe.skipIf(!LIVE)('mcp channel — live Claude Code agent', () => {
   it(
-    'agent receives the channel notification and replies via coord_msg_reply',
+    'agent receives the channel notification and replies via st_msg_reply',
     async () => {
       // Spawn an interactive Claude Code session in a PTY. The
       // --dangerously-load-development-channels flag turns the coord
@@ -289,13 +289,13 @@ describe.skipIf(!LIVE)('mcp channel — live Claude Code agent', () => {
       await new Promise((r) => setTimeout(r, 6000));
 
       // From alice (the test acting as alice), drop a question into
-      // bob's inbox. The coord_msg_reply tool's contract is "reply to the
+      // bob's inbox. The st_msg_reply tool's contract is "reply to the
       // <thread>'s sender" — that's alice.
       const original = '1714826789010-aaaaaa.md';
       writeFileSync(
         join(coordRoot, 'bob', 'inbox', original),
         '---\nfrom: alice\nsubject: math\n---\n' +
-          'what is 2+2? Please call the coord_msg_reply tool with my message ' +
+          'what is 2+2? Please call the st_msg_reply tool with my message ' +
           'as the thread arg and your answer as the body.\n'
       );
 
@@ -393,7 +393,7 @@ describe.skipIf(!LIVE)('mcp channel — live Claude Code agent', () => {
       writeFileSync(
         join(coordRoot, 'bob', 'inbox', original),
         '---\nfrom: alice\nsubject: idle-wake test\n---\n' +
-          'what is 2+2? Please call the coord_msg_reply tool with my message ' +
+          'what is 2+2? Please call the st_msg_reply tool with my message ' +
           'as the thread arg and your answer as the body.\n'
       );
 

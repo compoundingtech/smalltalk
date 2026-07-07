@@ -1,4 +1,4 @@
-// tests/unit/mcp/thread.test.ts — coord_msg_thread tool, in-memory.
+// tests/unit/mcp/thread.test.ts — st_msg_thread tool, in-memory.
 
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
@@ -44,7 +44,7 @@ interface CallResult {
 
 async function call(args: Record<string, unknown>): Promise<CallResult> {
   return (await client.callTool({
-    name: 'coord_msg_thread',
+    name: 'st_msg_thread',
     arguments: args,
   })) as CallResult;
 }
@@ -81,10 +81,10 @@ function messages(r: CallResult): ThreadMessage[] {
 
 // ─── Tools/list ────────────────────────────────────────────────────────
 
-describe('coord_msg_thread — tools/list registration', () => {
+describe('st_msg_thread — tools/list registration', () => {
   it('registers with required filename + optional identity/tree', async () => {
     const r = await client.listTools();
-    const tool = r.tools.find((t) => t.name === 'coord_msg_thread');
+    const tool = r.tools.find((t) => t.name === 'st_msg_thread');
     expect(tool).toBeDefined();
     expect(tool?.inputSchema?.required).toEqual(['filename']);
     expect(tool?.outputSchema).toBeDefined();
@@ -93,7 +93,7 @@ describe('coord_msg_thread — tools/list registration', () => {
 
 // ─── Singleton ────────────────────────────────────────────────────────
 
-describe('coord_msg_thread — singleton', () => {
+describe('st_msg_thread — singleton', () => {
   it('one message, no in-reply-to → array of length 1', async () => {
     plant({
       to: 'alice',
@@ -118,7 +118,7 @@ describe('coord_msg_thread — singleton', () => {
 
 // ─── Linear chain ─────────────────────────────────────────────────────
 
-describe('coord_msg_thread — linear chain (flat default)', () => {
+describe('st_msg_thread — linear chain (flat default)', () => {
   it('walks ancestors and prints flat chronological', async () => {
     plant({
       to: 'alice',
@@ -153,7 +153,7 @@ describe('coord_msg_thread — linear chain (flat default)', () => {
 
 // ─── Branching descendants ────────────────────────────────────────────
 
-describe('coord_msg_thread — branching descendants', () => {
+describe('st_msg_thread — branching descendants', () => {
   it('all descendants appear, sorted by filename', async () => {
     plant({ to: 'alice', filename: '1714826789010-aaaaaa.md', from: 'bob', subject: 'root' });
     plant({
@@ -189,7 +189,7 @@ describe('coord_msg_thread — branching descendants', () => {
 
 // ─── tree mode ────────────────────────────────────────────────────────
 
-describe('coord_msg_thread — tree mode', () => {
+describe('st_msg_thread — tree mode', () => {
   it('tree=true preserves depth-indented hierarchy in walk order', async () => {
     plant({ to: 'alice', filename: '1714826789010-aaaaaa.md', from: 'bob', subject: 'root' });
     plant({
@@ -225,7 +225,7 @@ describe('coord_msg_thread — tree mode', () => {
 
 // ─── Cross-identity walk ──────────────────────────────────────────────
 
-describe('coord_msg_thread — cross-identity walk', () => {
+describe('st_msg_thread — cross-identity walk', () => {
   it('reaches messages in other identities via in-reply-to', async () => {
     // alice → bob: lives in bob/inbox/
     plant({
@@ -264,7 +264,7 @@ describe('coord_msg_thread — cross-identity walk', () => {
 
 // ─── Inbox + archive ──────────────────────────────────────────────────
 
-describe('coord_msg_thread — spans inbox and archive', () => {
+describe('st_msg_thread — spans inbox and archive', () => {
   it('finds an ancestor that has been archived', async () => {
     plant({
       to: 'alice',
@@ -290,7 +290,7 @@ describe('coord_msg_thread — spans inbox and archive', () => {
 
 // ─── Robustness ───────────────────────────────────────────────────────
 
-describe('coord_msg_thread — robustness', () => {
+describe('st_msg_thread — robustness', () => {
   it('orphan ancestor: only the seed walks', async () => {
     plant({
       to: 'alice',
@@ -331,7 +331,7 @@ describe('coord_msg_thread — robustness', () => {
 
 // ─── Schema validation ────────────────────────────────────────────────
 
-describe('coord_msg_thread — schema validation', () => {
+describe('st_msg_thread — schema validation', () => {
   it('rejects missing filename', async () => {
     const r = await call({});
     expect(r.isError).toBe(true);
@@ -354,7 +354,7 @@ describe('coord_msg_thread — schema validation', () => {
 
 // ─── Typed error mapping ──────────────────────────────────────────────
 
-describe('coord_msg_thread — typed error mapping', () => {
+describe('st_msg_thread — typed error mapping', () => {
   it('seed not found → MESSAGE_NOT_FOUND', async () => {
     const r = await call({ filename: '1714826789010-aaaaaa.md' });
     expect(errorCode(r)).toBe('MESSAGE_NOT_FOUND');
@@ -389,7 +389,7 @@ describe('coord_msg_thread — typed error mapping', () => {
 
 // ─── Output-shape regression ──────────────────────────────────────────
 
-describe('coord_msg_thread — output shape', () => {
+describe('st_msg_thread — output shape', () => {
   it('every message carries identity, folder, filename + parsed message', async () => {
     plant({ to: 'alice', filename: '1714826789010-aaaaaa.md', from: 'bob' });
     const r = await call({ filename: '1714826789010-aaaaaa.md' });

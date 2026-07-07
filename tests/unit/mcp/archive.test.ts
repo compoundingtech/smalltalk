@@ -1,4 +1,4 @@
-// tests/unit/mcp/archive.test.ts — coord_msg_archive tool, in-memory.
+// tests/unit/mcp/archive.test.ts — st_msg_archive tool, in-memory.
 
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
@@ -51,7 +51,7 @@ interface CallResult {
 
 async function call(args: Record<string, unknown>): Promise<CallResult> {
   return (await client.callTool({
-    name: 'coord_msg_archive',
+    name: 'st_msg_archive',
     arguments: args,
   })) as CallResult;
 }
@@ -70,10 +70,10 @@ function plant(
 
 // ─── Tools/list ────────────────────────────────────────────────────────
 
-describe('coord_msg_archive — tools/list registration', () => {
+describe('st_msg_archive — tools/list registration', () => {
   it('registers with required filename', async () => {
     const r = await client.listTools();
-    const tool = r.tools.find((t) => t.name === 'coord_msg_archive');
+    const tool = r.tools.find((t) => t.name === 'st_msg_archive');
     expect(tool).toBeDefined();
     expect(tool?.inputSchema?.required).toEqual(['filename']);
     expect(tool?.outputSchema).toBeDefined();
@@ -82,7 +82,7 @@ describe('coord_msg_archive — tools/list registration', () => {
 
 // ─── Happy paths ───────────────────────────────────────────────────────
 
-describe('coord_msg_archive — happy paths', () => {
+describe('st_msg_archive — happy paths', () => {
   it('case 4 (clean rename): inbox file → archive', async () => {
     plant('alice', '1714826789010-aaaaaa.md', 'body');
     const r = await call({ filename: '1714826789010-aaaaaa.md' });
@@ -151,7 +151,7 @@ describe('coord_msg_archive — happy paths', () => {
 
 // ─── Schema validation ─────────────────────────────────────────────────
 
-describe('coord_msg_archive — schema validation', () => {
+describe('st_msg_archive — schema validation', () => {
   it('rejects missing filename', async () => {
     const r = await call({});
     expect(r.isError).toBe(true);
@@ -173,7 +173,7 @@ describe('coord_msg_archive — schema validation', () => {
 
 // ─── Typed error mapping ─────────────────────────────────────────────
 
-describe('coord_msg_archive — typed error mapping', () => {
+describe('st_msg_archive — typed error mapping', () => {
   it('case 1 (not in either folder) → MESSAGE_NOT_FOUND', async () => {
     const r = await call({ filename: '1714826789010-aaaaaa.md' });
     expect(errorCode(r)).toBe('MESSAGE_NOT_FOUND');
@@ -249,10 +249,10 @@ describe('coord_msg_archive — typed error mapping', () => {
 
 // ─── Roundtrip via send + archive ─────────────────────────────────────
 
-describe('coord_msg_archive — roundtrip with send', () => {
-  it('coord_msg_send → coord_msg_archive moves the file', async () => {
+describe('st_msg_archive — roundtrip with send', () => {
+  it('st_msg_send → st_msg_archive moves the file', async () => {
     const send = (await client.callTool({
-      name: 'coord_msg_send',
+      name: 'st_msg_send',
       arguments: { to: 'bob', body: 'msg' },
     })) as CallResult;
     const filename = send.structuredContent?.filename as string;
@@ -264,7 +264,7 @@ describe('coord_msg_archive — roundtrip with send', () => {
 
   it('a second archive call on the same file → outcome=idempotent', async () => {
     const send = (await client.callTool({
-      name: 'coord_msg_send',
+      name: 'st_msg_send',
       arguments: { to: 'bob', body: 'msg' },
     })) as CallResult;
     const filename = send.structuredContent?.filename as string;

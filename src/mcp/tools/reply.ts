@@ -1,9 +1,9 @@
-// mcp/tools/reply.ts — registers the `coord_msg_reply` MCP tool.
+// mcp/tools/reply.ts — registers the `st_msg_reply` MCP tool.
 //
 // Channel-mode-only (Phase 2). Wraps a "find <thread> anywhere on the
 // local tree, then coord.send back to its sender" pattern. The intent
 // is: a Claude Code agent gets pinged via notifications/claude/channel,
-// reads the meta.messageFilename, and calls coord_msg_reply({ thread,
+// reads the meta.messageFilename, and calls st_msg_reply({ thread,
 // body }) to write a reply without having to think about identities.
 
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
@@ -17,7 +17,6 @@ import {
   buildToolResult,
   withErrorMapping,
 } from '../error-mapping.ts';
-import { registerDualTool } from './dual-register.ts';
 
 const replyInputShape = {
   thread: z
@@ -42,13 +41,12 @@ const replyOutputShape = {
 };
 
 export function registerReplyTool(mcp: McpServer, coord: Coord): void {
-  registerDualTool(
-    mcp,
-    'msg_reply',
+  mcp.registerTool(
+    'st_msg_reply',
     {
-      title: 'Reply to a coord message',
+      title: 'Reply to a smalltalk message',
       description:
-        "Channel-mode-only. Write a reply to <thread>'s sender. Equivalent to `coord_msg_send` with `to` derived from the original's `from:` field, `inReplyTo: <thread>`, and a default `subject` of `re: <original-subject>`.",
+        "Channel-mode-only. Write a reply to <thread>'s sender. Equivalent to `st_msg_send` with `to` derived from the original's `from:` field, `inReplyTo: <thread>`, and a default `subject` of `re: <original-subject>`.",
       inputSchema: replyInputShape,
       outputSchema: replyOutputShape,
     },

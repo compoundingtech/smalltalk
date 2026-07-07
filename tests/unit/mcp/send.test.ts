@@ -1,4 +1,4 @@
-// tests/unit/mcp/send.test.ts — coord_msg_send tool, in-memory.
+// tests/unit/mcp/send.test.ts — st_msg_send tool, in-memory.
 
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
@@ -50,16 +50,16 @@ interface CallResult {
 }
 
 async function call(args: Record<string, unknown>): Promise<CallResult> {
-  const r = await client.callTool({ name: 'coord_msg_send', arguments: args });
+  const r = await client.callTool({ name: 'st_msg_send', arguments: args });
   return r as CallResult;
 }
 
 // ─── tools/list shape ──────────────────────────────────────────────────
 
-describe('coord_msg_send — tools/list registration', () => {
+describe('st_msg_send — tools/list registration', () => {
   it('appears in tools/list with input + output schemas', async () => {
     const r = await client.listTools();
-    const tool = r.tools.find((t) => t.name === 'coord_msg_send');
+    const tool = r.tools.find((t) => t.name === 'st_msg_send');
     expect(tool).toBeDefined();
     expect(tool?.description).toMatch(/inbox/i);
     expect(tool?.inputSchema).toBeDefined();
@@ -68,7 +68,7 @@ describe('coord_msg_send — tools/list registration', () => {
 
   it('inputSchema declares to + body as required and the rest optional', async () => {
     const r = await client.listTools();
-    const tool = r.tools.find((t) => t.name === 'coord_msg_send');
+    const tool = r.tools.find((t) => t.name === 'st_msg_send');
     expect(tool?.inputSchema?.required).toEqual(
       expect.arrayContaining(['to', 'body'])
     );
@@ -79,7 +79,7 @@ describe('coord_msg_send — tools/list registration', () => {
 
 // ─── Happy paths ───────────────────────────────────────────────────────
 
-describe('coord_msg_send — happy paths', () => {
+describe('st_msg_send — happy paths', () => {
   it('minimal: to + body → file written + structuredContent.filename', async () => {
     const r = await call({ to: 'bob', body: 'hello bob' });
     expect(r.isError).toBeUndefined();
@@ -141,7 +141,7 @@ describe('coord_msg_send — happy paths', () => {
 
   it('result is a valid CallToolResult schema', async () => {
     const raw = await client.callTool({
-      name: 'coord_msg_send',
+      name: 'st_msg_send',
       arguments: { to: 'bob', body: 'hi' },
     });
     expect(() => CallToolResultSchema.parse(raw)).not.toThrow();
@@ -150,7 +150,7 @@ describe('coord_msg_send — happy paths', () => {
 
 // ─── Schema validation ─────────────────────────────────────────────────
 
-describe('coord_msg_send — schema validation', () => {
+describe('st_msg_send — schema validation', () => {
   it('rejects missing to', async () => {
     const r = await call({ body: 'no recipient' });
     expect(r.isError).toBe(true);
@@ -179,7 +179,7 @@ describe('coord_msg_send — schema validation', () => {
 
 // ─── Error mapping ─────────────────────────────────────────────────────
 
-describe('coord_msg_send — typed error mapping', () => {
+describe('st_msg_send — typed error mapping', () => {
   it('invalid recipient name → INVALID_IDENTITY', async () => {
     const r = await call({ to: 'INVALID', body: 'm' });
     expect(r.isError).toBe(true);
@@ -237,7 +237,7 @@ describe('coord_msg_send — typed error mapping', () => {
 
 // ─── Concurrency + uniqueness ─────────────────────────────────────────
 
-describe('coord_msg_send — concurrency', () => {
+describe('st_msg_send — concurrency', () => {
   it('10 parallel sends produce 10 distinct files', async () => {
     const calls = Array.from({ length: 10 }, (_, i) =>
       call({ to: 'bob', body: `msg-${i}` })
@@ -253,7 +253,7 @@ describe('coord_msg_send — concurrency', () => {
 
 // ─── Content + edge cases ─────────────────────────────────────────────
 
-describe('coord_msg_send — content + edge cases', () => {
+describe('st_msg_send — content + edge cases', () => {
   it('subject with embedded colons survives the YAML quoting roundtrip', async () => {
     const r = await call({
       to: 'bob',

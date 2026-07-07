@@ -1,4 +1,4 @@
-// tests/unit/mcp/resource.test.ts — coord_resource_{add,ls,read,remove}
+// tests/unit/mcp/resource.test.ts — st_resource_{add,ls,read,remove}
 // MCP tools driven over an in-memory transport. Same pattern as the
 // other mcp/* tool tests.
 
@@ -57,17 +57,17 @@ async function call(
 
 // ─── Registration ──────────────────────────────────────────────────────
 
-describe('coord_resource_* — registration', () => {
+describe('st_resource_* — registration', () => {
   it('all four tools appear in tools/list with input + output schemas', async () => {
     setupIdentity('alice');
     await boot();
     const r = await client.listTools();
     const names = r.tools.map((t) => t.name);
     for (const n of [
-      'coord_resource_add',
-      'coord_resource_ls',
-      'coord_resource_read',
-      'coord_resource_remove',
+      'st_resource_add',
+      'st_resource_ls',
+      'st_resource_read',
+      'st_resource_remove',
       'st_resource_add',
       'st_resource_ls',
       'st_resource_read',
@@ -75,7 +75,7 @@ describe('coord_resource_* — registration', () => {
     ]) {
       expect(names).toContain(n);
     }
-    const add = r.tools.find((t) => t.name === 'coord_resource_add')!;
+    const add = r.tools.find((t) => t.name === 'st_resource_add')!;
     expect(add.inputSchema).toBeDefined();
     expect(add.outputSchema).toBeDefined();
   });
@@ -83,11 +83,11 @@ describe('coord_resource_* — registration', () => {
 
 // ─── Add ───────────────────────────────────────────────────────────────
 
-describe('coord_resource_add', () => {
+describe('st_resource_add', () => {
   it('writes a resource under the agent\'s own identity', async () => {
     setupIdentity('alice');
     await boot();
-    const r = await call('coord_resource_add', {
+    const r = await call('st_resource_add', {
       url: 'https://example.com/foo',
       title: 'foo',
       tags: ['x', 'y'],
@@ -105,14 +105,14 @@ describe('coord_resource_add', () => {
   it('rejects an unscheme\'d URL with an error result', async () => {
     setupIdentity('alice');
     await boot();
-    const r = await call('coord_resource_add', { url: 'example.com' });
+    const r = await call('st_resource_add', { url: 'example.com' });
     expect(r.isError).toBe(true);
   });
 
   it('accepts pty:// scheme', async () => {
     setupIdentity('alice');
     await boot();
-    const r = await call('coord_resource_add', {
+    const r = await call('st_resource_add', {
       url: 'pty://my-session',
     });
     expect(r.isError).toBeUndefined();
@@ -121,13 +121,13 @@ describe('coord_resource_add', () => {
   it('persists the optional relation field when set', async () => {
     setupIdentity('alice');
     await boot();
-    const added = (await call('coord_resource_add', {
+    const added = (await call('st_resource_add', {
       url: 'https://example.com',
       relation: 'owns',
     })) as CallResult;
     const filename = (added.structuredContent as { filename: string })
       .filename;
-    const r = (await call('coord_resource_read', { filename })) as CallResult;
+    const r = (await call('st_resource_read', { filename })) as CallResult;
     const sc = r.structuredContent as { relation: string | null };
     expect(sc.relation).toBe('owns');
   });
@@ -135,12 +135,12 @@ describe('coord_resource_add', () => {
   it('omits relation by default → null in read output', async () => {
     setupIdentity('alice');
     await boot();
-    const added = (await call('coord_resource_add', {
+    const added = (await call('st_resource_add', {
       url: 'https://example.com',
     })) as CallResult;
     const filename = (added.structuredContent as { filename: string })
       .filename;
-    const r = (await call('coord_resource_read', { filename })) as CallResult;
+    const r = (await call('st_resource_read', { filename })) as CallResult;
     const sc = r.structuredContent as { relation: string | null };
     expect(sc.relation).toBeNull();
   });
@@ -148,13 +148,13 @@ describe('coord_resource_add', () => {
 
 // ─── Ls ────────────────────────────────────────────────────────────────
 
-describe('coord_resource_ls', () => {
+describe('st_resource_ls', () => {
   it('lists own resources after a few adds', async () => {
     setupIdentity('alice');
     await boot();
-    await call('coord_resource_add', { url: 'https://example.com/a' });
-    await call('coord_resource_add', { url: 'https://example.com/b' });
-    const r = await call('coord_resource_ls', {});
+    await call('st_resource_add', { url: 'https://example.com/a' });
+    await call('st_resource_add', { url: 'https://example.com/b' });
+    const r = await call('st_resource_ls', {});
     expect(r.isError).toBeUndefined();
     const sc = r.structuredContent as {
       identity: string;
@@ -181,7 +181,7 @@ describe('coord_resource_ls', () => {
     );
     const { writeFileSync } = await import('node:fs');
     writeFileSync(bobFile, '---\nurl: https://bob.example/\n---\nbody\n');
-    const r = await call('coord_resource_ls', { identity: 'bob' });
+    const r = await call('st_resource_ls', { identity: 'bob' });
     expect(r.isError).toBeUndefined();
     const sc = r.structuredContent as {
       identity: string;
@@ -195,7 +195,7 @@ describe('coord_resource_ls', () => {
   it('empty resources/ → empty array', async () => {
     setupIdentity('alice');
     await boot();
-    const r = await call('coord_resource_ls', {});
+    const r = await call('st_resource_ls', {});
     const sc = r.structuredContent as { resources: unknown[] };
     expect(sc.resources).toEqual([]);
   });
@@ -203,11 +203,11 @@ describe('coord_resource_ls', () => {
 
 // ─── Read ──────────────────────────────────────────────────────────────
 
-describe('coord_resource_read', () => {
+describe('st_resource_read', () => {
   it('round-trips url + title + tags + body', async () => {
     setupIdentity('alice');
     await boot();
-    const added = (await call('coord_resource_add', {
+    const added = (await call('st_resource_add', {
       url: 'https://example.com',
       title: 'eg',
       tags: ['a'],
@@ -215,7 +215,7 @@ describe('coord_resource_read', () => {
     })) as CallResult;
     const filename = (added.structuredContent as { filename: string })
       .filename;
-    const r = await call('coord_resource_read', { filename });
+    const r = await call('st_resource_read', { filename });
     expect(r.isError).toBeUndefined();
     const sc = r.structuredContent as {
       identity: string;
@@ -236,7 +236,7 @@ describe('coord_resource_read', () => {
   it('errors with RESOURCE_NOT_FOUND when filename missing', async () => {
     setupIdentity('alice');
     await boot();
-    const r = await call('coord_resource_read', {
+    const r = await call('st_resource_read', {
       filename: '1714826789010-aaaaaa.md',
     });
     expect(r.isError).toBe(true);
@@ -245,16 +245,16 @@ describe('coord_resource_read', () => {
 
 // ─── Remove ────────────────────────────────────────────────────────────
 
-describe('coord_resource_remove', () => {
+describe('st_resource_remove', () => {
   it('removes a previously-added resource', async () => {
     setupIdentity('alice');
     await boot();
-    const added = (await call('coord_resource_add', {
+    const added = (await call('st_resource_add', {
       url: 'https://example.com',
     })) as CallResult;
     const filename = (added.structuredContent as { filename: string })
       .filename;
-    const r = await call('coord_resource_remove', { filename });
+    const r = await call('st_resource_remove', { filename });
     expect(r.isError).toBeUndefined();
     const sc = r.structuredContent as {
       identity: string;
@@ -264,7 +264,7 @@ describe('coord_resource_remove', () => {
     expect(sc.removed).toBe(true);
     expect(sc.identity).toBe('alice');
     // And it's gone.
-    const ls = await call('coord_resource_ls', {});
+    const ls = await call('st_resource_ls', {});
     const lsSc = ls.structuredContent as { resources: unknown[] };
     expect(lsSc.resources).toHaveLength(0);
   });
@@ -272,7 +272,7 @@ describe('coord_resource_remove', () => {
   it('errors when the filename is unknown', async () => {
     setupIdentity('alice');
     await boot();
-    const r = await call('coord_resource_remove', {
+    const r = await call('st_resource_remove', {
       filename: '1714826789010-aaaaaa.md',
     });
     expect(r.isError).toBe(true);
@@ -282,14 +282,14 @@ describe('coord_resource_remove', () => {
 // ─── st_ alias parity ─────────────────────────────────────────────────
 
 describe('st_resource_* (dual-prefix parity)', () => {
-  it('st_resource_add reaches the same handler as coord_resource_add', async () => {
+  it('st_resource_add reaches the same handler as st_resource_add', async () => {
     setupIdentity('alice');
     await boot();
     const r = await call('st_resource_add', {
       url: 'https://example.com',
     });
     expect(r.isError).toBeUndefined();
-    const ls = await call('coord_resource_ls', {});
+    const ls = await call('st_resource_ls', {});
     const sc = ls.structuredContent as { resources: unknown[] };
     expect(sc.resources).toHaveLength(1);
   });

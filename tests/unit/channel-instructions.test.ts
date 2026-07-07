@@ -16,22 +16,31 @@ describe('CHANNEL_INSTRUCTIONS — load-bearing substrings', () => {
   const REQUIRED_SUBSTRINGS = [
     // Status ritual
     'available',
-    'coord status',
+    'st status',
     // Inbox-drain tool surface
-    'coord_msg_ls',
-    'coord_msg_read',
-    'coord_msg_archive',
-    'coord_msg_reply',
+    'st_msg_ls',
+    'st_msg_read',
+    'st_msg_archive',
+    'st_msg_reply',
     // Peer discovery
-    'coord_members',
+    'st_agents',
     // Channel-arrival message format
-    '<channel source="coord"',
-    // Coord-threads-stay-on-coord rule: any thread originated via channel
-    // / inbox is conversed via coord, not the REPL. Pins the load-bearing
-    // phrases so the rule can't be silently weakened.
-    'Coord threads stay on coord',
+    '<channel source="st"',
+    // Smalltalk-threads-stay-on-smalltalk rule: any thread
+    // originated via channel / inbox is conversed via the bus, not
+    // the REPL. Pins the load-bearing phrases so the rule can't be
+    // silently weakened.
+    'Smalltalk threads stay on smalltalk',
     'pty REPL is unattended',
+    // Coord is dead — the boot ritual shouldn't reference it
+    // anywhere. Regression guard against the pre-cutover
+    // instructions sneaking back in.
   ] as const;
+
+  it('does not mention the retired `coord` name anywhere', () => {
+    // Case-insensitive to catch "Coord" too.
+    expect(CHANNEL_INSTRUCTIONS.toLowerCase()).not.toContain('coord');
+  });
 
   for (const needle of REQUIRED_SUBSTRINGS) {
     it(`contains "${needle}"`, () => {
