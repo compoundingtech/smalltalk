@@ -123,9 +123,9 @@ Also — nested cleanups from earlier pieces that slipped through:
   bad `@myobie/coord` → `@myobie/st` sed (npm scope must stay).
 - `src/commands/init.ts` + `src/commands/launch.ts` reference-
   message strings: same revert.
-- `src/commands/mcp.ts` docstring: removed a "Per Nathan's call"
-  attribution + a stale `$COORD_ROOT` mention in the identity-
-  fallback chain comment.
+- `src/commands/mcp.ts` docstring: removed an attribution to
+  a specific maintainer + a stale `$COORD_ROOT` mention in the
+  identity-fallback chain comment.
 
 Full suite: 1558 pass, 3 pre-existing integration skipped.
 Pre-push name-hygiene grep: clean.
@@ -182,13 +182,12 @@ source + tests + hook scripts + README.
   error-mapping exports renamed.
 
 Test fixture data cosmetic:
-- `myobie` (agent name used as test fixture identity) renamed to
-  `operator` in test-only fixtures. Load-bearing exception: NPM
-  scope refs like `@myobie/coord` and `@myobie/pty` are preserved
-  — they're the actual package identifiers.
+- A handle used as a test fixture identity renamed to `operator`
+  in test-only fixtures. Load-bearing exception: NPM scope refs
+  like `@myobie/coord` and `@myobie/pty` are preserved — they're
+  the actual package identifiers.
 - The 3-segment legacy filename regression test uses `legacy` as
-  the middle segment (was `myobie`) — semantic behavior of the
-  test is unchanged.
+  the middle segment — semantic behavior of the test is unchanged.
 
 Vestigial migration tools removed:
 - `tools/cutover/rewrite-mcp-json.ts` + tests
@@ -211,7 +210,7 @@ post-cutover canonical shapes:
 - **`createCoord()`** factory renamed to **`createSt()`**.
 - **`Coord`** interface renamed to **`St`**.
 - **`CoordOptions`** interface renamed to **`StOptions`**.
-- **Wire meta key: `COORD_ERROR_META_KEY = 'coord/error'`** flipped to **`ST_ERROR_META_KEY = 'st/error'`** (silent flip per cos's steer — no embedder besides Nathan reading `_meta['coord/error']` today).
+- **Wire meta key: `COORD_ERROR_META_KEY = 'coord/error'`** flipped to **`ST_ERROR_META_KEY = 'st/error'`** (silent flip — no external embedder is reading `_meta['coord/error']` today).
 - **`resolveCoordBinPath()`** renamed to **`resolveStShimPath()`**. The redundant sibling helper `resolveStBinPath(coordBin)` (which took an already-resolved bin path and returned its `bin/st` sibling) has been dropped — `resolveStShimPath()` returns `bin/st` directly since #56.
 
 Test refs bulk-updated:
@@ -290,8 +289,8 @@ Full suite: 1555 pass (3 skipped integration flakes).
 Pre-push name-hygiene grep: clean.
 
 Regression guard on source-level developer-path leaks in
-`init.ts` broadened from a literal `/Users/<person>` match to a
-generic `/Volumes/`, `/Users/`, and `/home/` catch — any absolute
+`init.ts` broadened from a single-person literal match to a
+generic OS-home-directory prefix catch — any absolute
 developer-machine path fails the check.
 
 Held on `feat/kill-coord-entirely` until the reboot signal
