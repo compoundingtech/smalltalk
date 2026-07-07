@@ -6,6 +6,84 @@ minor releases until 1.0.
 
 ## Unreleased
 
+### Added (`st __launch-core` — hidden JSON-in/JSON-out entrypoint for the convoy bridge)
+
+The launch write logic (identity resolution, `.mcp.json`,
+session-id bootstrap, hooks, persona/DING-BUS install, pty.toml
+emission, argv construction) currently lives in `src/commands/
+launch.ts` — 2226 LOC of battle-tested TypeScript. When convoy
+absorbs launch, it's a Swift codebase and can't import the TS
+package as a library. Two-step cutover per convoy-claude:
+
+1. **This PR (reboot moment)**: kill the `st launch` user
+   surface (in the coord-kill branch), but keep the write logic
+   in TS behind a stable hidden entrypoint convoy calls via
+   subprocess.
+2. **Fast-follow post-reboot**: convoy ports helpers to Swift
+   one at a time, guarded by golden-file parity tests against
+   this entrypoint's output. Subprocess drops when parity is
+   green; smalltalk becomes pure bus.
+
+Contract (stable, additive-only):
+- **STDIN**: JSON body matching `LaunchInput` (minus `env` and
+  `coordRoot`, which come from the invoker's process env).
+  Unknown fields are IGNORED — forward-compat when older
+  smalltalk sees a field a newer convoy sends.
+- **STDOUT**: JSON body of `LaunchResult` on exit 0. Every
+  written file's absolute path is enumerated on a `*Path` field
+  (null when not written this launch).
+- **STDERR**: error message on non-zero exit.
+- **EXIT CODE**: 0 = success, 1 = validation error (input
+  malformed, harness not `claude`/`codex`, bad field type), 2 =
+  internal error (unexpected exception).
+
+**Hidden**: NOT listed in `st help`, `st --help`, or shell
+completions. Reachable only by name. This is not a user surface
+— it's the convoy contract. Regression-guarded via a test that
+asserts `st help` output does not mention `__launch-core`.
+
+Design decisions:
+- **JSON body over flags**: pure data contract; convoy sends
+  only what it knows; adding a new launch input field never
+  ripples flag-parsing changes into convoy.
+- **Additive-only field renames** (same commitment as
+  `AgentSummary.identity` → `agent`): field renames ship
+  additive-then-deprecate so convoy's binder can be tolerant
+  across releases.
+- **Not a helper library**: the Swift/TS boundary forces
+  subprocess-bridge; a "TS package API" is unusable from Swift.
+  The subprocess is the pragmatic API.
+
+15 new unit tests cover:
+- Happy path: valid claude dry-run JSON → LaunchResult JSON on
+  stdout, exit 0.
+- Composition: `--ding` + `--fresh` layer correctly through the
+  JSON (channel false, argv omits `--resume` + channels flag).
+- Codex harness works too.
+- Extra unknown JSON fields are ignored (forward-compat guard).
+- Minimal input (just `harness`) uses defaults.
+- Validation: non-JSON stdin, non-object JSON, missing/wrong
+  `harness`, wrong-type `identity` / `ding`, extra positional
+  argv — each emits a clear stderr message and returns exit 1.
+- `--help` returns 0 with contract description on stderr;
+  stdout stays clean.
+- **Hidden regression guard**: `st help` output does NOT
+  mention `__launch-core`.
+
+Full suite: 1581 pass, only the 4 pre-existing integration flakes.
+
+End-to-end smoke:
+```
+$ echo '{"harness":"claude","identity":"alice","ding":true,"fresh":true,"dryRun":true}' \
+    | st __launch-core
+{"identity":"alice","channel":false,"ding":true,"fresh":true,
+ "argv":["claude","--permission-mode","bypassPermissions"], …}
+$ echo $?
+0
+```
+
+Ready for convoy-claude to wire the bridge ahead of the reboot.
+
 ### Fixed (CRITICAL — `st message reply` verb now exists; DING-BUS.md contract fulfilled)
 
 Every ding-mode agent booting from `DING-BUS.md` (installed by
