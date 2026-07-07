@@ -27,7 +27,7 @@ import {
   validFilename,
   validIdentity,
 } from '../common.ts';
-import { CoordError } from '../errors.ts';
+import { StError } from '../errors.ts';
 
 export interface WatchSetup {
   /** Per-identity mode: name of the single inbox to watch. */
@@ -92,7 +92,7 @@ const DEFAULT_INTERVAL = 500;
 export function resolveWatchSetup(input: WatchInput): WatchSetupResult {
   const intervalMs = input.intervalMs ?? DEFAULT_INTERVAL;
   if (!Number.isInteger(intervalMs) || intervalMs < 0) {
-    throw new CoordError(
+    throw new StError(
       'INVALID_INTERVAL',
       '--interval must be a non-negative integer (ms)',
       { value: intervalMs }
@@ -100,7 +100,7 @@ export function resolveWatchSetup(input: WatchInput): WatchSetupResult {
   }
   if (input.since !== undefined) {
     if (!Number.isInteger(input.since) || (input.since as number) < 0) {
-      throw new CoordError(
+      throw new StError(
         'INVALID_SINCE',
         '--since must be a unix-ms integer',
         { value: input.since }
@@ -108,14 +108,14 @@ export function resolveWatchSetup(input: WatchInput): WatchSetupResult {
     }
   }
   if (input.since !== undefined && input.sinceNow === true) {
-    throw new CoordError(
+    throw new StError(
       'WATCH_FLAG_CONFLICT',
       '--since and --since-now are mutually exclusive'
     );
   }
 
   if (input.recipient && input.all === true) {
-    throw new CoordError(
+    throw new StError(
       'WATCH_FLAG_CONFLICT',
       '--all and <identity> are mutually exclusive'
     );
@@ -142,7 +142,7 @@ export function resolveWatchSetup(input: WatchInput): WatchSetupResult {
       (input.fromExplicit === undefined || input.fromExplicit === '') &&
       (!input.env.ST_AGENT || input.env.ST_AGENT === '')
     ) {
-      throw new CoordError(
+      throw new StError(
         'IDENTITY_REQUIRED_FOR_SUPPRESS',
         'identity required to determine which folder to suppress — set $ST_AGENT'
       );

@@ -8,7 +8,7 @@
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 
-import type { Coord } from '../../lib.ts';
+import type { St } from '../../lib.ts';
 import { asFilename, asIdentity } from '../../types.ts';
 import {
   buildToolResult,
@@ -51,7 +51,7 @@ const threadOutputShape = {
   ),
 };
 
-export function registerThreadTool(mcp: McpServer, coord: Coord): void {
+export function registerThreadTool(mcp: McpServer, coord: St): void {
   mcp.registerTool(
     'st_msg_thread',
     {
@@ -68,7 +68,7 @@ export function registerThreadTool(mcp: McpServer, coord: Coord): void {
           args.identity !== undefined
             ? asIdentity(args.identity)
             : coord.identity;
-        const opts: Parameters<Coord['thread']>[2] = {};
+        const opts: Parameters<St['thread']>[2] = {};
         if (args.tree !== undefined) opts.tree = args.tree;
         const messages = await coord.thread(identity, filename, opts);
         // Strip undefined-valued optional fields from each message so the

@@ -66,7 +66,7 @@ describe('package.json exports map', () => {
 
 describe('root subpath — every documented export is present', () => {
   it('has the factory + handle types', () => {
-    expect(typeof index.createCoord).toBe('function');
+    expect(typeof index.createSt).toBe('function');
     // VERSION is exported (placeholder until we publish).
     expect(typeof index.VERSION).toBe('string');
   });
@@ -100,7 +100,7 @@ describe('root subpath — every documented export is present', () => {
   });
 
   it.each([
-    'CoordError',
+    'StError',
     'IdentityRequiredError',
     'IdentityNotHostedError',
     'InvalidIdentityError',
@@ -125,7 +125,7 @@ describe('root subpath — every documented export is present', () => {
 describe('subpath modules expose the same symbols as the index re-exports', () => {
   it('errors module shape matches index', () => {
     for (const name of [
-      'CoordError',
+      'StError',
       'IdentityRequiredError',
       'EmptyBodyError',
       'SyncFailedError',
@@ -154,11 +154,11 @@ describe('subpath modules expose the same symbols as the index re-exports', () =
 });
 
 describe('round-trip smoke — embedder usage', () => {
-  it('createCoord + asIdentity compose end to end', () => {
+  it('createSt + asIdentity compose end to end', () => {
     // Static check: this should typecheck. The actual filesystem wiring
     // is exercised in lib.test.ts and library-embedding.test.ts.
     const id = index.asIdentity('alice');
-    const handle = index.createCoord({
+    const handle = index.createSt({
       root: '/tmp/coord-export-test-not-touched',
       identity: id,
     });
@@ -169,10 +169,10 @@ describe('round-trip smoke — embedder usage', () => {
     expect(typeof handle.sync.push).toBe('function');
   });
 
-  it('CoordError instances pass instanceof check across the import boundary', () => {
+  it('StError instances pass instanceof check across the import boundary', () => {
     const err = new index.IdentityRequiredError();
-    expect(err).toBeInstanceOf(index.CoordError);
-    expect(err).toBeInstanceOf(errors.CoordError);
+    expect(err).toBeInstanceOf(index.StError);
+    expect(err).toBeInstanceOf(errors.StError);
     expect(err.code).toBe('IDENTITY_REQUIRED');
   });
 });

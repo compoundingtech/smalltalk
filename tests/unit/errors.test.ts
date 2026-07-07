@@ -1,11 +1,11 @@
-// tests/unit/errors.test.ts — every CoordError subclass round-trips its
+// tests/unit/errors.test.ts — every StError subclass round-trips its
 // code, message, and details payload, and is a real instanceof Error.
 
 import { describe, expect, it } from 'vitest';
 
 import {
   ArchiveConflictError,
-  CoordError,
+  StError,
   EmptyBodyError,
   IdentityNotHostedError,
   IdentityRequiredError,
@@ -20,24 +20,24 @@ import {
   SyncFailedError,
 } from '../../src/errors.ts';
 
-describe('CoordError (base class)', () => {
+describe('StError (base class)', () => {
   it('preserves the message + code + details', () => {
-    const err = new CoordError('TEST', 'something happened', { x: 1 });
+    const err = new StError('TEST', 'something happened', { x: 1 });
     expect(err).toBeInstanceOf(Error);
-    expect(err).toBeInstanceOf(CoordError);
+    expect(err).toBeInstanceOf(StError);
     expect(err.code).toBe('TEST');
     expect(err.message).toBe('something happened');
     expect(err.details).toEqual({ x: 1 });
-    expect(err.name).toBe('CoordError');
+    expect(err.name).toBe('StError');
   });
 
   it('omits details when not provided', () => {
-    const err = new CoordError('TEST', 'oops');
+    const err = new StError('TEST', 'oops');
     expect(err.details).toBeUndefined();
   });
 
   it('passes the standard Error.message contract (typeof string)', () => {
-    const err = new CoordError('TEST', 'msg');
+    const err = new StError('TEST', 'msg');
     expect(typeof err.message).toBe('string');
   });
 });
@@ -47,7 +47,7 @@ describe('IdentityRequiredError', () => {
     const err = new IdentityRequiredError();
     expect(err.code).toBe('IDENTITY_REQUIRED');
     expect(err.message).toMatch(/ST_AGENT/);
-    expect(err).toBeInstanceOf(CoordError);
+    expect(err).toBeInstanceOf(StError);
   });
 });
 
@@ -194,19 +194,19 @@ describe('catch shape — JS-side `code` branching works', () => {
       try {
         throw new IdentityRequiredError();
       } catch (e: unknown) {
-        if (e instanceof CoordError) return e.code;
+        if (e instanceof StError) return e.code;
         return undefined;
       }
     }
     expect(getMaybeCode()).toBe('IDENTITY_REQUIRED');
   });
 
-  it('subclasses are catchable as the base CoordError', () => {
-    let caught: CoordError | undefined;
+  it('subclasses are catchable as the base StError', () => {
+    let caught: StError | undefined;
     try {
       throw new InvalidStateError('foo');
     } catch (e: unknown) {
-      if (e instanceof CoordError) caught = e;
+      if (e instanceof StError) caught = e;
     }
     expect(caught?.code).toBe('INVALID_STATE');
   });

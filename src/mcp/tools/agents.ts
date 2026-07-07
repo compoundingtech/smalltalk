@@ -12,7 +12,7 @@ import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 
 import { cmdAgents } from '../../commands/agents.ts';
-import type { Coord } from '../../lib.ts';
+import type { St } from '../../lib.ts';
 import { STATES } from '../../types.ts';
 import {
   buildToolResult,
@@ -57,7 +57,7 @@ const agentsOutputShape = {
     .describe('Agents under $ST_ROOT, sorted alphabetically. (Field name `members` kept for back-compat; renames to `agents` in a follow-up.)'),
 };
 
-export function registerAgentsTool(mcp: McpServer, coord: Coord): void {
+export function registerAgentsTool(mcp: McpServer, coord: St): void {
   const handler = async (args: { status?: string; enrich?: boolean }) =>
     withErrorMapping(async () => {
       const r = cmdAgents({

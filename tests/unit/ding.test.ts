@@ -39,7 +39,7 @@ import {
 // ─── Fakes ──────────────────────────────────────────────────────────────
 
 interface FakeCoord {
-  coord: Coord;
+  coord: St;
   pushEvent(filename: string, opts?: { folder?: 'inbox' | 'archive' }): void;
   endWatch(): void;
   setStatus(state: State): void;
@@ -235,7 +235,7 @@ interface RunningDing {
 }
 
 function startDing(opts: {
-  coord: Coord;
+  coord: St;
   identity?: Identity;
   ptySession?: string;
   ptySend: PtySender;

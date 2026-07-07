@@ -1,13 +1,13 @@
 // errors.ts — typed error subclasses for the embeddable API.
 //
-// Every CoordError carries a stable `code` string so JS callers can branch
+// Every StError carries a stable `code` string so JS callers can branch
 // on it without the type system, plus an optional `details` payload for
 // structured introspection. The CLI layer in src/cli.ts catches these and
 // maps them to user-visible messages + exit codes; embedders pattern-match
 // on `instanceof` or `code`.
 
 /** Base class for every error raised by the coord API or commands. */
-export class CoordError extends Error {
+export class StError extends Error {
   readonly code: string;
   readonly details?: unknown;
 
@@ -30,7 +30,7 @@ export class CoordError extends Error {
 // (instanceof + .code branches) depend on. Old class names remain as
 // deprecated aliases pointing at the new classes for one release.
 
-export class AgentRequiredError extends CoordError {
+export class AgentRequiredError extends StError {
   constructor() {
     super(
       'IDENTITY_REQUIRED',
@@ -39,7 +39,7 @@ export class AgentRequiredError extends CoordError {
   }
 }
 
-export class AgentNotHostedError extends CoordError {
+export class AgentNotHostedError extends StError {
   readonly identity: string;
   constructor(identity: string) {
     super(
@@ -51,7 +51,7 @@ export class AgentNotHostedError extends CoordError {
   }
 }
 
-export class InvalidAgentError extends CoordError {
+export class InvalidAgentError extends StError {
   readonly value: string;
   constructor(value: string) {
     super('INVALID_IDENTITY', `invalid agent name: ${value}`, { value });
@@ -66,7 +66,7 @@ export const IdentityNotHostedError = AgentNotHostedError;
 /** @deprecated Use {@link InvalidAgentError}. */
 export const InvalidIdentityError = InvalidAgentError;
 
-export class InvalidFilenameError extends CoordError {
+export class InvalidFilenameError extends StError {
   readonly value: string;
   constructor(value: string) {
     super('INVALID_FILENAME', `invalid filename: ${value}`, { value });
@@ -76,7 +76,7 @@ export class InvalidFilenameError extends CoordError {
 
 // ─── Lookup / state errors ─────────────────────────────────────────────
 
-export class MessageNotFoundError extends CoordError {
+export class MessageNotFoundError extends StError {
   readonly identity: string;
   readonly filename: string;
   constructor(identity: string, filename: string) {
@@ -90,7 +90,7 @@ export class MessageNotFoundError extends CoordError {
   }
 }
 
-export class InvalidStateError extends CoordError {
+export class InvalidStateError extends StError {
   readonly value: string;
   constructor(value: string) {
     super(
@@ -105,7 +105,7 @@ export class InvalidStateError extends CoordError {
   }
 }
 
-export class InvalidPriorityError extends CoordError {
+export class InvalidPriorityError extends StError {
   readonly value: string;
   constructor(value: string) {
     super(
@@ -117,7 +117,7 @@ export class InvalidPriorityError extends CoordError {
   }
 }
 
-export class InvalidDurationError extends CoordError {
+export class InvalidDurationError extends StError {
   readonly value: string;
   constructor(value: string) {
     super(
@@ -133,7 +133,7 @@ export class InvalidDurationError extends CoordError {
 
 export type SyncStage = 'push' | 'pull';
 
-export class SyncFailedError extends CoordError {
+export class SyncFailedError extends StError {
   readonly stage: SyncStage;
   readonly exitCode: number;
   readonly stderr: string | undefined;
@@ -145,7 +145,7 @@ export class SyncFailedError extends CoordError {
   }
 }
 
-export class PeersConfigMissingError extends CoordError {
+export class PeersConfigMissingError extends StError {
   readonly path: string;
   constructor(path: string) {
     super(
@@ -157,7 +157,7 @@ export class PeersConfigMissingError extends CoordError {
   }
 }
 
-export class PeersConfigInvalidError extends CoordError {
+export class PeersConfigInvalidError extends StError {
   readonly path: string;
   readonly reason: string;
   constructor(path: string, reason: string) {
@@ -173,13 +173,13 @@ export class PeersConfigInvalidError extends CoordError {
 
 // ─── Send / archive ────────────────────────────────────────────────────
 
-export class EmptyBodyError extends CoordError {
+export class EmptyBodyError extends StError {
   constructor() {
     super('EMPTY_BODY', 'message body is empty (read from stdin)');
   }
 }
 
-export class ArchiveConflictError extends CoordError {
+export class ArchiveConflictError extends StError {
   readonly identity: string;
   readonly filename: string;
   constructor(identity: string, filename: string) {
@@ -195,7 +195,7 @@ export class ArchiveConflictError extends CoordError {
 
 // ─── Resources (brief-009 item 5) ──────────────────────────────────────
 
-export class ResourceNotFoundError extends CoordError {
+export class ResourceNotFoundError extends StError {
   readonly identity: string;
   readonly filename: string;
   constructor(identity: string, filename: string) {
@@ -209,7 +209,7 @@ export class ResourceNotFoundError extends CoordError {
   }
 }
 
-export class InvalidResourceUrlError extends CoordError {
+export class InvalidResourceUrlError extends StError {
   readonly value: string;
   constructor(value: string) {
     super(

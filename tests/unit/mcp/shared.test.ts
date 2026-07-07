@@ -225,7 +225,7 @@ describe('shared — identity plumbing', () => {
 // ─── Error response shape regression ──────────────────────────────────
 
 describe('shared — error response shape', () => {
-  it('every CoordError surfaces with isError + content[0].text + _meta["coord/error"]', async () => {
+  it('every StError surfaces with isError + content[0].text + _meta["coord/error"]', async () => {
     // Trigger one of each error class via different tools.
     const r1 = await call('st_msg_send', { to: 'INVALID', body: 'm' });
     expect(r1.isError).toBe(true);

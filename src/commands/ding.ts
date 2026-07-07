@@ -22,7 +22,7 @@ import {
   TIDY_CHECK_INTERVAL_MS,
   validFilename,
 } from '../common.ts';
-import { type Coord } from '../lib.ts';
+import { type St } from '../lib.ts';
 import { refreshIdentityStatus } from '../commands/status.ts';
 import { evaluateDrift, type DriftResult } from '../mcp/tidy-check.ts';
 import {
@@ -88,8 +88,8 @@ export interface IsSessionAlive {
 }
 
 export interface DingDeps {
-  /** Pre-built Coord. Production uses `createCoord({ root, identity })`. */
-  coord: Coord;
+  /** Pre-built Coord. Production uses `createSt({ root, identity })`. */
+  coord: St;
   /** Identity whose inbox + status the daemon watches. */
   identity: Identity;
   /** Target pty session name (matches `pty list`). */
@@ -672,7 +672,7 @@ export async function runDing(deps: DingDeps): Promise<void> {
   startupDedupTimer.unref?.();
 
   const watcherPromise = (async () => {
-    const watchOpts: Parameters<Coord['watch']>[1] = {
+    const watchOpts: Parameters<St['watch']>[1] = {
       withSubject: true,
       sinceNow: true,
     };
@@ -771,7 +771,7 @@ function formatAge(ms: number): string {
 }
 
 async function buildEvent(
-  coord: Coord,
+  coord: St,
   identity: Identity,
   filename: Filename
 ): Promise<BufferedEvent> {
@@ -1042,11 +1042,11 @@ export async function cmdDingCli(
 
   // Lazy-import the embeddable factory + asIdentity so non-ding
   // invocations don't pull lib.ts into the dispatcher hot path.
-  const { createCoord } = await import('../lib.ts');
+  const { createSt } = await import('../lib.ts');
   const { asIdentity } = await import('../types.ts');
 
   const identity = asIdentity(identityValue);
-  const coord = createCoord({ root, identity });
+  const coord = createSt({ root, identity });
 
   // PATH robustness: probe for `pty` on the daemon's PATH BEFORE
   // starting the watcher / timers. A ding daemon that can't spawn

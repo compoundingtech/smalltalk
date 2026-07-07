@@ -3,7 +3,7 @@
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 
-import type { Coord } from '../../lib.ts';
+import type { St } from '../../lib.ts';
 import { asDeliverableFilename, asIdentity } from '../../types.ts';
 import {
   buildToolResult,
@@ -44,7 +44,7 @@ const readOutputShape = {
   }),
 };
 
-export function registerReadTool(mcp: McpServer, coord: Coord): void {
+export function registerReadTool(mcp: McpServer, coord: St): void {
   mcp.registerTool(
     'st_msg_read',
     {
@@ -61,7 +61,7 @@ export function registerReadTool(mcp: McpServer, coord: Coord): void {
             ? asIdentity(args.identity)
             : coord.identity;
         const filename = asDeliverableFilename(args.filename);
-        const opts: Parameters<Coord['read']>[2] = {};
+        const opts: Parameters<St['read']>[2] = {};
         if (args.fromArchive !== undefined) opts.fromArchive = args.fromArchive;
         const r = await coord.read(identity, filename, opts);
         // r.message has optional fields that are sometimes absent — strip

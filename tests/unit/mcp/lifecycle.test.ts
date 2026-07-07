@@ -84,7 +84,7 @@ describe('createMcpServer — construction', () => {
     expect(handle.coord.configRoot).toBe(cfg);
   });
 
-  it('throws if identity is invalid (asIdentity catches in createCoord)', () => {
+  it('throws if identity is invalid (asIdentity catches in createSt)', () => {
     expect(() =>
       createMcpServer({
         root: stRoot,

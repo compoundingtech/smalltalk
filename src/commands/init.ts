@@ -93,14 +93,14 @@ export interface InitResult {
  * dual-aliased into the same target, so both work today, but pinning
  * to the canonical name means the day we drop the coord alias
  * doesn't break every existing `.mcp.json`. Function name kept as
- * `resolveCoordBinPath` for now — this is a callers-are-me-only API,
+ * `resolveStShimPath` for now — this is a callers-are-me-only API,
  * renaming is scope-creep on the fix.
  *
  * Throws if neither the checkout walk nor the PATH lookup produces
  * an existing shim. Brief-026 boundary: NEVER hardcode a developer-
  * machine absolute path.
  */
-export function resolveCoordBinPath(): string {
+export function resolveStShimPath(): string {
   const here = fileURLToPath(import.meta.url);
   let dir = dirname(here);
   for (let i = 0; i < 16; i++) {
@@ -177,7 +177,7 @@ export async function cmdInit(
   ctx: CliContext
 ): Promise<InitResult> {
   const binPath =
-    input.binPath !== undefined ? input.binPath : resolveCoordBinPath();
+    input.binPath !== undefined ? input.binPath : resolveStShimPath();
   const entry = buildCoordEntry(binPath, input.noChannel === true);
   const targetDir = isAbsolute(input.dir) ? input.dir : resolve(input.dir);
   const path = join(targetDir, '.mcp.json');

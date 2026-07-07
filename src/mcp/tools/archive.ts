@@ -10,7 +10,7 @@ import { join } from 'node:path';
 import { z } from 'zod';
 
 import { archiveDir, inboxDir } from '../../common.ts';
-import type { Coord } from '../../lib.ts';
+import type { St } from '../../lib.ts';
 import { asDeliverableFilename, asIdentity } from '../../types.ts';
 import {
   buildToolResult,
@@ -41,7 +41,7 @@ const archiveOutputShape = {
     ),
 };
 
-export function registerArchiveTool(mcp: McpServer, coord: Coord): void {
+export function registerArchiveTool(mcp: McpServer, coord: St): void {
   mcp.registerTool(
     'st_msg_archive',
     {

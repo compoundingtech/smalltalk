@@ -2445,7 +2445,7 @@ describe('cmdLaunch — .claude/settings.local.json generation (brief-118)', () 
     }
   });
 
-  it('stBinForHooks default (undefined) auto-resolves via resolveStBinPath', async () => {
+  it('stBinForHooks default (undefined) auto-resolves via resolveStShimPath', async () => {
     // Under the real test runner, the smalltalk repo IS an
     // `@myobie/coord`-named package with a valid `bin/st` on disk. The
     // auto-resolution should therefore succeed and inject an absolute

@@ -10,7 +10,7 @@ import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 
 import { EmptyBodyError } from '../../errors.ts';
-import type { Coord } from '../../lib.ts';
+import type { St } from '../../lib.ts';
 import { locateThread } from '../../locate-thread.ts';
 import { asFilename, asIdentity } from '../../types.ts';
 import {
@@ -40,7 +40,7 @@ const replyOutputShape = {
   identity: z.string().describe('Recipient identity (the original `from`).'),
 };
 
-export function registerReplyTool(mcp: McpServer, coord: Coord): void {
+export function registerReplyTool(mcp: McpServer, coord: St): void {
   mcp.registerTool(
     'st_msg_reply',
     {
@@ -63,7 +63,7 @@ export function registerReplyTool(mcp: McpServer, coord: Coord): void {
             : located.subject !== undefined
               ? `re: ${located.subject}`
               : undefined;
-        const sendOpts: Parameters<Coord['send']>[2] = {
+        const sendOpts: Parameters<St['send']>[2] = {
           inReplyTo: thread,
         };
         if (subject !== undefined) sendOpts.subject = subject;

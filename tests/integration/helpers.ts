@@ -93,7 +93,7 @@ export function mkIdentity(root: string, id: string): void {
 
 // ─── runCoord (one-shot child_process) ──────────────────────────────────
 
-export interface RunCoordOptions {
+export interface RunStOptions {
   /** $ST_ROOT for this invocation. */
   stRoot?: string;
   /** $ST_CONFIG for this invocation. */
@@ -124,7 +124,7 @@ export interface RunCoordResult {
  */
 export function runCoord(
   args: readonly string[],
-  opts: RunCoordOptions = {}
+  opts: RunStOptions = {}
 ): RunCoordResult {
   const env: NodeJS.ProcessEnv = {
     // Strip parent COORD_* vars so a misconfigured shell can't leak in.

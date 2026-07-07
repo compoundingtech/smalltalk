@@ -6,7 +6,7 @@
 // (1) parse the top-level subcommand,
 // (2) dispatch to subcommands,
 // (3) dispatch to the right cmdXCli,
-// (4) catch CoordError → stderr + exit 1.
+// (4) catch StError → stderr + exit 1.
 
 import { spawnSync } from 'node:child_process';
 import { readFileSync, realpathSync, statSync } from 'node:fs';

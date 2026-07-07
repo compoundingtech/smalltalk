@@ -42,7 +42,7 @@ import {
   envAgentFrom,
   rand6,
 } from '../common.ts';
-import { cmdInit, resolveCoordBinPath } from './init.ts';
+import { cmdInit, resolveStShimPath } from './init.ts';
 
 // ─── Shape ──────────────────────────────────────────────────────────────
 
@@ -190,14 +190,14 @@ export interface LaunchInput {
    * brief-118 test seam: override the location of the shipped Claude
    * Code hook scripts (`examples/claude-code/hooks/`). Production
    * resolves this from the smalltalk repo root via
-   * `resolveCoordBinPath()`. Tests set this to a real path so the
+   * `resolveStShimPath()`. Tests set this to a real path so the
    * generated `settings.local.json` references stable content
    * regardless of where the smalltalk checkout lives on the runner.
    */
   hooksDir?: string | undefined;
   /**
    * Test seam for the ST_BIN injection into hook `command:` strings.
-   * Production resolves this via `resolveStBinPath(resolveCoordBinPath())`
+   * Production resolves this via `resolveStShimPath()`
    * so the hooks fire the same binary the operator ran `st launch`
    * with, regardless of PATH state at hook-execution time.
    *
@@ -832,7 +832,7 @@ function buildPtyToml(opts: {
 /**
  * Resolve the absolute path to the shipped Claude Code hooks directory
  * (`<smalltalk-root>/examples/claude-code/hooks/`). Uses the same
- * package-json walk as {@link resolveCoordBinPath}: we know that path
+ * package-json walk as {@link resolveStShimPath}: we know that path
  * gives `<smalltalk-root>/bin/coord`, so the hooks live at
  * `<smalltalk-root>/examples/claude-code/hooks/`.
  *
@@ -870,7 +870,7 @@ export function resolveClaudeHooksDirWithHint(): {
 } {
   let coordBin: string;
   try {
-    coordBin = resolveCoordBinPath();
+    coordBin = resolveStShimPath();
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     return {
@@ -924,21 +924,6 @@ function hookCommand(hookScript: string, stBin: string | null): string {
   const quotedScript = shellQuote(hookScript);
   if (stBin === null) return quotedScript;
   return `ST_BIN=${shellQuote(stBin)} ${quotedScript}`;
-}
-
-/** Resolve the absolute path to `bin/st` next to a resolved bin/coord.
- *  Same directory as coordBin; different filename. Returns null when
- *  the sibling isn't present on disk (paranoid — bin/st has shipped
- *  since brief-005-phase0, but not worth crashing settings generation
- *  over an installer glitch). */
-export function resolveStBinPath(coordBin: string): string | null {
-  const candidate = join(dirname(coordBin), 'st');
-  try {
-    if (statSync(candidate).isFile()) return candidate;
-  } catch {
-    // absent
-  }
-  return null;
 }
 
 /**
@@ -1882,7 +1867,7 @@ export async function cmdLaunch(
         stBinForHooks = input.stBinForHooks;
       } else {
         try {
-          stBinForHooks = resolveStBinPath(resolveCoordBinPath());
+          stBinForHooks = resolveStShimPath();
         } catch {
           stBinForHooks = null;
         }
@@ -2380,6 +2365,6 @@ function cwdForGitExcludeNote(r: {
   return r.persona ? dirname(r.persona.entryFilePath) : '.';
 }
 
-// Keep resolveCoordBinPath reachable for `notes/harness-integrations.md`
+// Keep resolveStShimPath reachable for `notes/harness-integrations.md`
 // linkage; also used by the tests that mock cmdInit.
-export { resolveCoordBinPath };
+export { resolveStShimPath };

@@ -1,7 +1,7 @@
 // @myobie/coord — programmatic API.
 //
 // Embedders import from this entry point:
-//   import { createCoord, asIdentity } from '@myobie/coord';
+//   import { createSt, asIdentity } from '@myobie/coord';
 //
 // The CLI entry point (`bin/coord` → `src/cli.ts`) is invoked separately;
 // it is not re-exported here.
@@ -11,10 +11,10 @@ export const VERSION = '0.9.0';
 // ─── Factory + handle ──────────────────────────────────────────────────
 
 export {
-  createCoord,
+  createSt,
   type ArchiveOptions,
-  type Coord,
-  type CoordOptions,
+  type St,
+  type StOptions,
   type FanOutBidiItem,
   type FanOutItem,
   type LsOptions,
@@ -70,7 +70,7 @@ export {
   AgentNotHostedError,
   AgentRequiredError,
   ArchiveConflictError,
-  CoordError,
+  StError,
   EmptyBodyError,
   IdentityNotHostedError,
   IdentityRequiredError,

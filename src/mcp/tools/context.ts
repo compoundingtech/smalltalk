@@ -14,7 +14,7 @@
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 
-import type { Coord } from '../../lib.ts';
+import type { St } from '../../lib.ts';
 import { asIdentity } from '../../types.ts';
 import {
   buildToolResult,
@@ -47,7 +47,7 @@ const readOutputShape = {
   ),
 };
 
-function registerContextReadTool(mcp: McpServer, coord: Coord): void {
+function registerContextReadTool(mcp: McpServer, coord: St): void {
   mcp.registerTool(
     'st_context_read',
     {
@@ -59,7 +59,7 @@ function registerContextReadTool(mcp: McpServer, coord: Coord): void {
     },
     async (args) =>
       withErrorMapping(async () => {
-        const input: Parameters<Coord['context']['read']>[0] = {};
+        const input: Parameters<St['context']['read']>[0] = {};
         if (args.identity !== undefined) input.identity = asIdentity(args.identity);
         if (args.file !== undefined) input.file = args.file;
         const r = coord.context.read(input);
@@ -98,7 +98,7 @@ const writeOutputShape = {
   bytes: z.number(),
 };
 
-function registerContextWriteTool(mcp: McpServer, coord: Coord): void {
+function registerContextWriteTool(mcp: McpServer, coord: St): void {
   mcp.registerTool(
     'st_context_write',
     {
@@ -110,7 +110,7 @@ function registerContextWriteTool(mcp: McpServer, coord: Coord): void {
     },
     async (args) =>
       withErrorMapping(async () => {
-        const input: Parameters<Coord['context']['write']>[0] = {
+        const input: Parameters<St['context']['write']>[0] = {
           body: args.body,
         };
         if (args.identity !== undefined) input.identity = asIdentity(args.identity);
@@ -161,7 +161,7 @@ const appendOutputShape = {
   line: z.string().describe('The bulleted line stored in the file.'),
 };
 
-function registerContextAppendTool(mcp: McpServer, coord: Coord): void {
+function registerContextAppendTool(mcp: McpServer, coord: St): void {
   mcp.registerTool(
     'st_context_append',
     {
@@ -173,7 +173,7 @@ function registerContextAppendTool(mcp: McpServer, coord: Coord): void {
     },
     async (args) =>
       withErrorMapping(async () => {
-        const input: Parameters<Coord['context']['append']>[0] = {
+        const input: Parameters<St['context']['append']>[0] = {
           decision: args.decision,
           why: args.why,
         };
@@ -195,7 +195,7 @@ function registerContextAppendTool(mcp: McpServer, coord: Coord): void {
 
 // ─── Public entry point ──────────────────────────────────────────────────
 
-export function registerContextTools(mcp: McpServer, coord: Coord): void {
+export function registerContextTools(mcp: McpServer, coord: St): void {
   registerContextReadTool(mcp, coord);
   registerContextWriteTool(mcp, coord);
   registerContextAppendTool(mcp, coord);

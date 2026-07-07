@@ -6,6 +6,26 @@ minor releases until 1.0.
 
 ## Unreleased
 
+### Changed (coord-kill piece (c) — SDK / wire renames: `CoordError` → `StError`, `createCoord` → `createSt`, `Coord` → `St`, wire meta key flip)
+
+Public SDK surface and wire-format constants renamed to their
+post-cutover canonical shapes:
+
+- **`CoordError`** base class + all 15 subclasses (`AgentRequiredError`, `AgentNotHostedError`, `InvalidAgentError`, `InvalidFilenameError`, `MessageNotFoundError`, `InvalidStateError`, `InvalidPriorityError`, `InvalidDurationError`, `SyncFailedError`, `PeersConfigMissingError`, `PeersConfigInvalidError`, `EmptyBodyError`, `ArchiveConflictError`, `ResourceNotFoundError`, `InvalidResourceUrlError`, plus the legacy `InvalidIdentityError` alias) renamed to **`StError`** + subclasses. Public export from `@myobie/coord/errors`.
+- **`createCoord()`** factory renamed to **`createSt()`**.
+- **`Coord`** interface renamed to **`St`**.
+- **`CoordOptions`** interface renamed to **`StOptions`**.
+- **Wire meta key: `COORD_ERROR_META_KEY = 'coord/error'`** flipped to **`ST_ERROR_META_KEY = 'st/error'`** (silent flip per cos's steer — no embedder besides Nathan reading `_meta['coord/error']` today).
+- **`resolveCoordBinPath()`** renamed to **`resolveStShimPath()`**. The redundant sibling helper `resolveStBinPath(coordBin)` (which took an already-resolved bin path and returned its `bin/st` sibling) has been dropped — `resolveStShimPath()` returns `bin/st` directly since #56.
+
+Test refs bulk-updated:
+- `_meta['coord/error']` → `_meta['st/error']` across integration + unit MCP tests.
+- ~30 `Coord`-as-type refs across test files updated to `St`.
+- `createCoord` call sites in embedding tests → `createSt`.
+
+Full suite: 1555 pass, 3 pre-existing integration skipped.
+Pre-push name-hygiene grep: clean. Updated the memory'd grep pattern to exclude the `@myobie/` npm scope — that's the actual package identity in `package.json` + import statements, not a personal-brand leak. All other `myobie` references (comments, test fixtures) are still caught.
+
 ### Changed (coord-kill piece (b) — CLI + env: `bin/coord`, `members`, `coord-` plugin prefix, and `COORD_*` env vars removed)
 
 Post-cutover the CLI surface + env fallbacks are `st_*` only.

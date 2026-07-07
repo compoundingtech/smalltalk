@@ -732,7 +732,7 @@ describe('claude-code hooks — $ST_BIN takes precedence over PATH', () => {
 
   it('empty $ST_BIN falls back to PATH lookup (both $ST_BIN unset and $ST_BIN="")', () => {
     // Guards against a shim-regression where the launcher exports an
-    // empty string for ST_BIN (e.g. resolveStBinPath returned null but
+    // empty string for ST_BIN (e.g. resolveStShimPath returned null but
     // the export slipped through). The hook must treat empty the same
     // as unset and fall back to PATH.
     const r = spawnSync('bash', [STOP_FAILURE_SH], {

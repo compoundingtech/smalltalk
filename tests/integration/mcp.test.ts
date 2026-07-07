@@ -489,7 +489,7 @@ describe('mcp integration — error response shape over real stdio', () => {
     rmSync(stRoot, { recursive: true, force: true });
   });
 
-  it('CoordError → isError + content[0].text starts with code + _meta["coord/error"]', async () => {
+  it('StError → isError + content[0].text starts with code + _meta["coord/error"]', async () => {
     const r = await callTool(client, 'st_msg_send', {
       to: 'INVALID',
       body: 'm',

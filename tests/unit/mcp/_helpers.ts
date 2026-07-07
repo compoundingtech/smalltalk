@@ -10,26 +10,26 @@ export interface CallResult {
   _meta?: Record<string, unknown>;
 }
 
-export interface CoordErrorPayloadShape {
+export interface StErrorPayloadShape {
   code: string;
   message: string;
   details?: unknown;
 }
 
 /**
- * Read the structured CoordError payload from a tool result. The MCP
+ * Read the structured StError payload from a tool result. The MCP
  * server places the error code/message/details under
- * `_meta['coord/error']` (rather than `structuredContent`) so the
+ * `_meta['st/error']` (rather than `structuredContent`) so the
  * Client's outputSchema validator doesn't reject the response.
  */
 export function errorPayload(
   r: CallResult | CallToolResult
-): CoordErrorPayloadShape | undefined {
+): StErrorPayloadShape | undefined {
   const meta = (r as CallResult)._meta;
   if (!meta) return undefined;
-  const payload = meta['coord/error'];
+  const payload = meta['st/error'];
   if (typeof payload === 'object' && payload !== null) {
-    return payload as unknown as CoordErrorPayloadShape;
+    return payload as unknown as StErrorPayloadShape;
   }
   return undefined;
 }

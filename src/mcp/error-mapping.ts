@@ -7,34 +7,34 @@
 // `structuredContent` against the tool's `outputSchema` whenever it's
 // present (even on isError responses, despite the comment in the SDK
 // suggesting otherwise), so we put the structured error payload under
-// `_meta['coord/error']` instead — `_meta` is reserved namespaced
+// `_meta['st/error']` instead — `_meta` is reserved namespaced
 // passthrough that does NOT get schema-validated.
 //
-// Concretely, every CoordError surfaces as:
+// Concretely, every StError surfaces as:
 //
 //   {
 //     isError: true,
 //     content: [{ type: 'text', text: '<CODE>: <message>' }],
-//     _meta: { 'coord/error': { code, message, details? } }
+//     _meta: { 'st/error': { code, message, details? } }
 //   }
 //
-// Embedders read `result._meta['coord/error'].code`; older MCP clients
+// Embedders read `result._meta['st/error'].code`; older MCP clients
 // still see a useful prefixed text line.
 
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 
-import { CoordError } from '../errors.ts';
+import { StError } from '../errors.ts';
 
-export const COORD_ERROR_META_KEY = 'coord/error' as const;
+export const ST_ERROR_META_KEY = 'st/error' as const;
 
-export interface CoordErrorPayload {
+export interface StErrorPayload {
   code: string;
   message: string;
   details?: unknown;
 }
 
 /**
- * Map any thrown value to a CallToolResult. CoordError instances get
+ * Map any thrown value to a CallToolResult. StError instances get
  * their stable code; anything else falls through to INTERNAL_ERROR.
  */
 export function coordErrorToToolResult(err: unknown): CallToolResult {
@@ -45,7 +45,7 @@ export function coordErrorToToolResult(err: unknown): CallToolResult {
       { type: 'text', text: `${payload.code}: ${payload.message}` },
     ],
     _meta: {
-      [COORD_ERROR_META_KEY]: payload as unknown as Record<string, unknown>,
+      [ST_ERROR_META_KEY]: payload as unknown as Record<string, unknown>,
     },
   };
 }
@@ -54,21 +54,21 @@ export function coordErrorToToolResult(err: unknown): CallToolResult {
  * Extract the structured error payload from a CallToolResult, if any.
  * Returns undefined for success results.
  */
-export function readCoordErrorPayload(
+export function readStErrorPayload(
   result: CallToolResult
-): CoordErrorPayload | undefined {
+): StErrorPayload | undefined {
   const meta = result._meta;
   if (!meta) return undefined;
-  const payload = (meta as Record<string, unknown>)[COORD_ERROR_META_KEY];
+  const payload = (meta as Record<string, unknown>)[ST_ERROR_META_KEY];
   if (typeof payload === 'object' && payload !== null) {
-    return payload as unknown as CoordErrorPayload;
+    return payload as unknown as StErrorPayload;
   }
   return undefined;
 }
 
-function errorPayload(err: unknown): CoordErrorPayload {
-  if (err instanceof CoordError) {
-    const payload: CoordErrorPayload = {
+function errorPayload(err: unknown): StErrorPayload {
+  if (err instanceof StError) {
+    const payload: StErrorPayload = {
       code: err.code,
       message: err.message,
     };
@@ -104,7 +104,7 @@ export function buildToolResult<T extends Record<string, unknown>>(opts: {
 }
 
 /**
- * Convenience: wrap an async tool body so any thrown CoordError or
+ * Convenience: wrap an async tool body so any thrown StError or
  * Error is mapped to a structured error response. The body returns the
  * happy-path CallToolResult itself; rejections are caught here.
  */

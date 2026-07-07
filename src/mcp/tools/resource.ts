@@ -9,7 +9,7 @@
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 
-import type { Coord } from '../../lib.ts';
+import type { St } from '../../lib.ts';
 import { asFilename, asIdentity } from '../../types.ts';
 import {
   buildToolResult,
@@ -104,7 +104,7 @@ const removeOutputShape = {
 
 // ─── Registrations ─────────────────────────────────────────────────────
 
-export function registerResourceTools(mcp: McpServer, coord: Coord): void {
+export function registerResourceTools(mcp: McpServer, coord: St): void {
   mcp.registerTool(
     'st_resource_add',
     {

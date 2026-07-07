@@ -16,7 +16,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
-import { createCoord, type Coord } from '../../src/lib.ts';
+import { createSt, type St } from '../../src/lib.ts';
 import { InvalidIdentityError } from '../../src/errors.ts';
 import { asFilename, asIdentity, type Identity } from '../../src/types.ts';
 import type {
@@ -27,7 +27,7 @@ import type { Overview } from '../../src/commands/overview.ts';
 
 let scratch: string;
 let stRoot: string;
-let coord: Coord;
+let coord: St;
 
 function setupIdentity(id: string): void {
   mkdirSync(join(stRoot, id, 'inbox'), { recursive: true });
@@ -45,7 +45,7 @@ beforeEach(() => {
   setupIdentity('alice');
   setupIdentity('bob');
   setupIdentity('carol');
-  coord = createCoord({
+  coord = createSt({
     root: stRoot,
     identity: asIdentity('alice'),
     configRoot: join(scratch, 'config'),

@@ -3,7 +3,7 @@
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 
-import type { Coord } from '../../lib.ts';
+import type { St } from '../../lib.ts';
 import { asIdentity } from '../../types.ts';
 import {
   buildToolResult,
@@ -45,7 +45,7 @@ const lsOutputShape = {
   identity: z.string().describe('Resolved identity that was listed.'),
 };
 
-export function registerLsTool(mcp: McpServer, coord: Coord): void {
+export function registerLsTool(mcp: McpServer, coord: St): void {
   mcp.registerTool(
     'st_msg_ls',
     {
@@ -57,7 +57,7 @@ export function registerLsTool(mcp: McpServer, coord: Coord): void {
     },
     async (args) =>
       withErrorMapping(async () => {
-        const opts: Parameters<Coord['ls']>[1] = {};
+        const opts: Parameters<St['ls']>[1] = {};
         if (args.archive !== undefined) opts.archive = args.archive;
         if (args.since !== undefined) opts.since = args.since;
         if (args.fromFilter !== undefined) {

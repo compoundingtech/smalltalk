@@ -7,8 +7,8 @@
 // This file exposes two symmetric entry points:
 //
 // - `cmdSend` (alias `cmdSendCore`): the pure, typed core. Takes a
-//   {@link SendInput} object, throws CoordError subclasses, returns
-//   {@link SendResult}. Used directly by createCoord and the unit tests.
+//   {@link SendInput} object, throws StError subclasses, returns
+//   {@link SendResult}. Used directly by createSt and the unit tests.
 //
 // - `cmdSendCli`: the CLI wrapper. Parses argv, reads stdin, calls the
 //   core, formats output via the {@link CliContext} sinks. Used by the

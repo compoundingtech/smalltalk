@@ -7,7 +7,7 @@
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 
-import type { Coord } from '../../lib.ts';
+import type { St } from '../../lib.ts';
 import { asFilename, asIdentity, type Filename } from '../../types.ts';
 import {
   buildToolResult,
@@ -47,7 +47,7 @@ const sendOutputShape = {
     .describe('The recipient identity the file was written under.'),
 };
 
-export function registerSendTool(mcp: McpServer, coord: Coord): void {
+export function registerSendTool(mcp: McpServer, coord: St): void {
   mcp.registerTool(
     'st_msg_send',
     {
@@ -60,7 +60,7 @@ export function registerSendTool(mcp: McpServer, coord: Coord): void {
     async (args) =>
       withErrorMapping(async () => {
         const to = asIdentity(args.to);
-        const opts: Parameters<Coord['send']>[2] = {};
+        const opts: Parameters<St['send']>[2] = {};
         if (args.from !== undefined) opts.from = asIdentity(args.from);
         if (args.subject !== undefined) opts.subject = args.subject;
         if (args.inReplyTo !== undefined) {

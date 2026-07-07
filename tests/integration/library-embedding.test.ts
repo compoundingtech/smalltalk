@@ -1,4 +1,4 @@
-// tests/integration/library-embedding.test.ts — proves createCoord works
+// tests/integration/library-embedding.test.ts — proves createSt works
 // the way an Electron main process or a Node TUI would use it.
 //
 // Two Coord handles bound to two distinct $ST_ROOT directories ("two
@@ -11,8 +11,8 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import {
   asIdentity,
-  type Coord,
-  createCoord,
+  type St,
+  createSt,
   IdentityNotHostedError,
 } from '../../src/index.ts';
 import {
@@ -25,19 +25,19 @@ import {
 const skip = !rsyncAvailable();
 const d = skip ? describe.skip : describe;
 
-d('library embedding (createCoord)', () => {
+d('library embedding (createSt)', () => {
   let rootA: string;
   let rootB: string;
-  let coordA: Coord;
-  let coordB: Coord;
+  let coordA: St;
+  let coordB: St;
 
   beforeEach(() => {
     rootA = mkRoot();
     rootB = mkRoot();
     mkIdentity(rootA, 'alice');
     mkIdentity(rootB, 'bob');
-    coordA = createCoord({ root: rootA, identity: asIdentity('alice') });
-    coordB = createCoord({ root: rootB, identity: asIdentity('bob') });
+    coordA = createSt({ root: rootA, identity: asIdentity('alice') });
+    coordB = createSt({ root: rootB, identity: asIdentity('bob') });
   });
   afterEach(() => {
     cleanupRoot(rootA);

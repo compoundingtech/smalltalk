@@ -1,7 +1,7 @@
-// lib.ts — embeddable createCoord({ root, identity, configRoot? }) factory.
+// lib.ts — embeddable createSt({ root, identity, configRoot? }) factory.
 //
 // What CLI consumers get from `bin/coord` and what library consumers get
-// from `createCoord(...)` are functionally identical — the same code paths
+// from `createSt(...)` are functionally identical — the same code paths
 // in src/commands/ underpin both. Library consumers get:
 //
 // - A typed `Coord` handle with `{ root, identity, configRoot }` baked in.
@@ -10,7 +10,7 @@
 // - AbortSignal support on `watch` for cancellation.
 // - Branded `Identity` / `Filename` parameters that compile-error if you
 //   pass an unvalidated string.
-// - Typed errors (CoordError + subclasses) you can pattern-match on with
+// - Typed errors (StError + subclasses) you can pattern-match on with
 //   instanceof or a stable `code` string.
 // - Zero stdout/stderr writes. The library returns values; the caller
 //   decides how to display them.
@@ -103,7 +103,7 @@ import {
 
 // ─── Public option types ────────────────────────────────────────────────
 
-export interface CoordOptions {
+export interface StOptions {
   /** $ST_ROOT — parent of every `<identity>/` folder. */
   root: string;
   /** Default identity for any method that doesn't take one explicitly. */
@@ -212,7 +212,7 @@ export interface FanOutBidiItem {
 
 // ─── Coord interface ────────────────────────────────────────────────────
 
-export interface Coord {
+export interface St {
   readonly root: string;
   readonly identity: Identity;
   readonly configRoot: string;
@@ -361,7 +361,7 @@ export interface Coord {
 
 const DEFAULT_INTERVAL_MS = 500;
 
-export function createCoord(options: CoordOptions): Coord {
+export function createSt(options: StOptions): St {
   const root = options.root;
   const identity = asIdentity(options.identity);
   const configRoot = options.configRoot ?? join(homedir(), '.config', 'coord');
@@ -405,7 +405,7 @@ export function createCoord(options: CoordOptions): Coord {
     return { stRoot: root, stConfig: configRoot, deps };
   }
 
-  const coord: Coord = {
+  const coord: St = {
     root,
     identity,
     configRoot,

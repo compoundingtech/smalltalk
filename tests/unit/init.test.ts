@@ -21,7 +21,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import type { CliContext } from '../../src/cli-context.ts';
 import {
   cmdInit,
-  resolveCoordBinPath,
+  resolveStShimPath,
 } from '../../src/commands/init.ts';
 
 const FAKE_BIN = '/usr/local/bin/coord';
@@ -77,9 +77,9 @@ function readJson(path: string): Record<string, unknown> {
 
 // ─── Bin path resolution ────────────────────────────────────────────────
 
-describe('resolveCoordBinPath', () => {
+describe('resolveStShimPath', () => {
   it('returns a path that exists on disk', () => {
-    const p = resolveCoordBinPath();
+    const p = resolveStShimPath();
     expect(existsSync(p)).toBe(true);
     expect(statSync(p).isFile()).toBe(true);
   });
@@ -89,7 +89,7 @@ describe('resolveCoordBinPath', () => {
     // machine is if someone hardcoded a developer path. The check is
     // narrow on purpose — `/Users/...` and `/home/...` are legitimate
     // install locations on real machines.
-    const p = resolveCoordBinPath();
+    const p = resolveStShimPath();
     // The path may *coincidentally* live under /Volumes when the repo
     // checkout itself does — that's fine, we just want to verify it's
     // derived from this module's location, not a literal.

@@ -1,6 +1,6 @@
 // tests/unit/mcp/errors.test.ts — coordErrorToToolResult mapping.
 //
-// Every CoordError subclass surfaces with its stable `code`, the
+// Every StError subclass surfaces with its stable `code`, the
 // content[0].text prefixed `<CODE>:`, and structuredContent carrying
 // { code, message, details }.
 
@@ -8,7 +8,7 @@ import { describe, expect, it } from 'vitest';
 
 import {
   ArchiveConflictError,
-  CoordError,
+  StError,
   EmptyBodyError,
   IdentityNotHostedError,
   IdentityRequiredError,
@@ -28,7 +28,7 @@ import {
   withErrorMapping,
 } from '../../../src/mcp/error-mapping.ts';
 
-describe('coordErrorToToolResult — every CoordError subclass round-trips', () => {
+describe('coordErrorToToolResult — every StError subclass round-trips', () => {
   it.each([
     [new IdentityRequiredError(), 'IDENTITY_REQUIRED'],
     [new IdentityNotHostedError('ghost'), 'IDENTITY_NOT_HOSTED'],
@@ -52,22 +52,22 @@ describe('coordErrorToToolResult — every CoordError subclass round-trips', () 
     expect(r.content[0]).toMatchObject({ type: 'text' });
     const text = (r.content[0] as { text: string }).text;
     expect(text).toMatch(new RegExp(`^${code}:`));
-    expect(r._meta?.['coord/error']).toMatchObject({
+    expect(r._meta?.['st/error']).toMatchObject({
       code,
-      message: (err as CoordError).message,
+      message: (err as StError).message,
     });
     expect(r.structuredContent).toBeUndefined();
   });
 });
 
-describe('coordErrorToToolResult — non-CoordError fallback', () => {
+describe('coordErrorToToolResult — non-StError fallback', () => {
   it('plain Error → INTERNAL_ERROR with the message', () => {
     const r = coordErrorToToolResult(new Error('something bad'));
     expect(r.isError).toBe(true);
     expect((r.content[0] as { text: string }).text).toBe(
       'INTERNAL_ERROR: something bad'
     );
-    expect(r._meta?.['coord/error']).toEqual({
+    expect(r._meta?.['st/error']).toEqual({
       code: 'INTERNAL_ERROR',
       message: 'something bad',
     });
@@ -79,23 +79,23 @@ describe('coordErrorToToolResult — non-CoordError fallback', () => {
     expect((r.content[0] as { text: string }).text).toBe(
       'INTERNAL_ERROR: boom'
     );
-    expect(r._meta?.['coord/error']).toEqual({
+    expect(r._meta?.['st/error']).toEqual({
       code: 'INTERNAL_ERROR',
       message: 'boom',
     });
   });
 
-  it('CoordError subclasses preserve the details payload in _meta', () => {
+  it('StError subclasses preserve the details payload in _meta', () => {
     const r = coordErrorToToolResult(new IdentityNotHostedError('ghost'));
-    expect(r._meta?.['coord/error']).toMatchObject({
+    expect(r._meta?.['st/error']).toMatchObject({
       code: 'IDENTITY_NOT_HOSTED',
       details: { identity: 'ghost' },
     });
   });
 
-  it('CoordError without details omits the details key', () => {
+  it('StError without details omits the details key', () => {
     const r = coordErrorToToolResult(new IdentityRequiredError());
-    expect(r._meta?.['coord/error']).toEqual({
+    expect(r._meta?.['st/error']).toEqual({
       code: 'IDENTITY_REQUIRED',
       message: expect.stringContaining('ST_AGENT'),
     });
@@ -138,13 +138,13 @@ describe('withErrorMapping — wraps async tool bodies', () => {
     expect(r.content[0]).toMatchObject({ text: 'ok' });
   });
 
-  it('catches CoordError and maps to a structured error response', async () => {
+  it('catches StError and maps to a structured error response', async () => {
     const r = await withErrorMapping(async () => {
       throw new EmptyBodyError();
     });
     expect(r.isError).toBe(true);
     expect((r.content[0] as { text: string }).text).toMatch(/^EMPTY_BODY:/);
-    expect(r._meta?.['coord/error']).toMatchObject({ code: 'EMPTY_BODY' });
+    expect(r._meta?.['st/error']).toMatchObject({ code: 'EMPTY_BODY' });
   });
 
   it('catches plain Error → INTERNAL_ERROR', async () => {
@@ -152,7 +152,7 @@ describe('withErrorMapping — wraps async tool bodies', () => {
       throw new Error('oops');
     });
     expect(r.isError).toBe(true);
-    expect(r._meta?.['coord/error']).toMatchObject({
+    expect(r._meta?.['st/error']).toMatchObject({
       code: 'INTERNAL_ERROR',
       message: 'oops',
     });
@@ -163,7 +163,7 @@ describe('withErrorMapping — wraps async tool bodies', () => {
       throw 42;
     });
     expect(r.isError).toBe(true);
-    expect(r._meta?.['coord/error']).toMatchObject({
+    expect(r._meta?.['st/error']).toMatchObject({
       code: 'INTERNAL_ERROR',
       message: '42',
     });

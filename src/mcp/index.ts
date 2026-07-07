@@ -23,7 +23,7 @@ import {
   readIdentityStatus,
   refreshIdentityStatus,
 } from '../commands/status.ts';
-import { createCoord, type Coord } from '../lib.ts';
+import { createSt, type St } from '../lib.ts';
 import type { Identity } from '../types.ts';
 import { buildServerInfo, buildServerOptions } from './capabilities.ts';
 import { evaluateDrift } from './tidy-check.ts';
@@ -101,7 +101,7 @@ export interface McpServerHandle {
   /** The underlying high-level server. */
   mcp: McpServer;
   /** The Coord instance baked into every tool handler. */
-  coord: Coord;
+  coord: St;
   /** Connect to a stdio transport and run until the transport closes
    * or the process receives SIGINT/SIGTERM. */
   run(): Promise<void>;
@@ -124,7 +124,7 @@ export interface McpServerHandle {
 
 export function createMcpServer(opts: McpServerOptions): McpServerHandle {
   const channel = opts.channel === true;
-  const coord = createCoord({
+  const coord = createSt({
     root: opts.root,
     identity: opts.identity,
     ...(opts.configRoot !== undefined && { configRoot: opts.configRoot }),

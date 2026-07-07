@@ -1,4 +1,4 @@
-// tests/unit/lib.test.ts — exercise createCoord's wiring.
+// tests/unit/lib.test.ts — exercise createSt's wiring.
 //
 // The deep edge cases are covered by tests/unit/<command>.test.ts. This
 // file just verifies the factory routes calls correctly, threads
@@ -10,7 +10,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
-import { createCoord, type Coord } from '../../src/lib.ts';
+import { createSt, type St } from '../../src/lib.ts';
 import { asFilename, asIdentity, type Filename, type Identity } from '../../src/types.ts';
 import {
   EmptyBodyError,
@@ -23,7 +23,7 @@ let scratch: string;
 let stRoot: string;
 let alice: Identity;
 let bob: Identity;
-let coord: Coord;
+let coord: St;
 
 beforeEach(() => {
   scratch = mkdtempSync(join(tmpdir(), 'coord-lib-test-'));
@@ -35,7 +35,7 @@ beforeEach(() => {
   mkdirSync(join(stRoot, 'bob', 'archive'), { recursive: true });
   alice = asIdentity('alice');
   bob = asIdentity('bob');
-  coord = createCoord({
+  coord = createSt({
     root: stRoot,
     identity: alice,
     configRoot: join(scratch, 'config'),
@@ -49,7 +49,7 @@ afterEach(() => {
 
 // ─── construction ──────────────────────────────────────────────────────
 
-describe('createCoord — construction', () => {
+describe('createSt — construction', () => {
   it('exposes root, identity, configRoot', () => {
     expect(coord.root).toBe(stRoot);
     expect(coord.identity).toBe('alice');
@@ -57,13 +57,13 @@ describe('createCoord — construction', () => {
   });
 
   it('defaults configRoot to ~/.config/coord', () => {
-    const c = createCoord({ root: stRoot, identity: alice });
+    const c = createSt({ root: stRoot, identity: alice });
     expect(c.configRoot.endsWith('.config/coord')).toBe(true);
   });
 
   it('throws if identity is invalid (asIdentity catches at construction)', () => {
     expect(() =>
-      createCoord({
+      createSt({
         root: stRoot,
         identity: 'INVALID' as unknown as Identity,
       })
