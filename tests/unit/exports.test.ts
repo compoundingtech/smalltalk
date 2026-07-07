@@ -56,31 +56,6 @@ describe('package.json exports map', () => {
     expect(pkg.exports['./types']?.default).toBe('./src/types.ts');
   });
 
-  it('./commands/launch subpath resolves to ./src/commands/launch.ts (coord-kill piece f)', () => {
-    // Convoy's TS port imports cmdLaunch + LaunchInput + LaunchResult
-    // directly instead of shelling out to `st __launch-core`. This
-    // subpath makes the launch verb a public embed target.
-    expect(pkg.exports['./commands/launch']?.default).toBe(
-      './src/commands/launch.ts'
-    );
-    expect(pkg.exports['./commands/launch']?.types).toBe(
-      './src/commands/launch.ts'
-    );
-    expect(pkg.exports['./commands/launch']?.import).toBe(
-      './src/commands/launch.ts'
-    );
-  });
-
-  it('./commands/launch-core subpath resolves to ./src/commands/launch-core.ts (JSON-in/JSON-out entry)', () => {
-    // launch-core is the same logic behind a strict JSON schema — the
-    // subprocess-bridge contract convoy previously used via `st
-    // __launch-core`. Kept exported so embedders can lean on the
-    // schema layer directly if they want validation.
-    expect(pkg.exports['./commands/launch-core']?.default).toBe(
-      './src/commands/launch-core.ts'
-    );
-  });
-
   it('declares only the `st` + `smalltalk` binaries (post-coord-cutover)', () => {
     expect(pkg.bin).toEqual({
       st: './bin/st',
@@ -199,22 +174,5 @@ describe('round-trip smoke — embedder usage', () => {
     expect(err).toBeInstanceOf(index.StError);
     expect(err).toBeInstanceOf(errors.StError);
     expect(err.code).toBe('IDENTITY_REQUIRED');
-  });
-});
-
-describe('subpath — @myobie/coord/commands/launch is importable', () => {
-  it('cmdLaunch + LaunchInput + LaunchResult all reachable', async () => {
-    // Use dynamic import so the subpath is exercised (import-map
-    // resolution). Cast through unknown because the tsconfig's
-    // moduleResolution may or may not resolve the exports map at
-    // test time; this is a runtime shape check either way.
-    const launchMod = (await import(
-      '../../src/commands/launch.ts'
-    )) as {
-      cmdLaunch: unknown;
-      cmdLaunchCli: unknown;
-    };
-    expect(typeof launchMod.cmdLaunch).toBe('function');
-    expect(typeof launchMod.cmdLaunchCli).toBe('function');
   });
 });
