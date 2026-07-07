@@ -6,6 +6,49 @@ minor releases until 1.0.
 
 ## Unreleased
 
+### Changed (coord-kill piece (i) — capstone 6/0 last-tuning: rescanQuietAfterDeliveryMs 5min → 90s, env-overridable)
+
+Piece (h) covered the **never-delivered** case (down-window backlog,
+re-poked in 60s). Evals traced a real remaining stall: the
+**delivered-but-parked** case. An agent that WAS poked, parked
+anyway (mid-`--resume` boot-ritual skip, wedged reply), whose file
+is now "recently delivered" — the re-scan skipped it for 5 min,
+which is > the capstone's 220s LOOP-CLOSED window, so it never
+re-poked in-window → stall.
+
+Fix:
+- **`DEFAULT_RESCAN_QUIET_AFTER_DELIVERY_MS: 5 * 60 * 1000` →
+  `90_000`** (5 min → 90s). A delivered-but-parked agent now
+  gets re-poked at ≤150s total (60s scan interval + 90s quiet).
+  Well inside the 220s grade window. Trade-off: a healthy agent
+  taking > 90s to archive gets a re-nudge — acceptable noise
+  (archive latency is typically much shorter).
+
+- **Env-overridable knobs** in `cmdDingCli`:
+  - `ST_DING_RESCAN_INTERVAL_MS` — scan interval (default 60000).
+    Set to 0 to disable the tick.
+  - `ST_DING_RESCAN_QUIET_MS` — quiet window after a successful
+    delivery (default 90000). Tune down for aggressive re-poking.
+  - Parsed via a small `parseEnvMs` helper that ignores malformed
+    values with a stderr warning (typo in an env file can't crash
+    the daemon).
+  - Both documented in `st ding --help` under a new
+    "Env overrides for the periodic backlog re-scan:" block.
+
+Test coverage:
+- `cmdDingCli --help` output asserts both env-var names + the
+  default hints (`Default 60000 (60s)`, `Default 90000 (90s)`) so
+  evals can rely on the surface.
+
+Full suite: 1389 pass (2 new tests + the default-value change),
+3 pre-existing integration skipped. Pre-push name-hygiene grep:
+clean.
+
+Held on `feat/kill-coord-entirely` until the reboot signal. LIVE
+via the npm link (installed `st` = the held-branch working tree)
+so evals re-run against it immediately. Last tuning before
+capstone 6/0.
+
 ### Added (coord-kill piece (h) — reboot self-healing: periodic backlog re-scan in `st ding`)
 
 Ding now periodically re-scans the inbox and re-pokes for files

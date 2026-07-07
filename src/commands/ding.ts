@@ -219,10 +219,21 @@ const DEFAULT_RESCAN_INTERVAL_MS = 60_000;
  * before we nudge again. If the agent is healthy + mid-processing,
  * the archive lands during this window and the file is gone from
  * the inbox before the next re-scan looks at it — no wasted poke.
- * If the agent is wedged (--resume that skipped the boot ritual),
- * the file stays unarchived, we re-poke after this window elapses.
+ * If the agent parks (delivered but never drained — mid-`--resume`
+ * that skipped the boot ritual, or a wedged reply), the file stays
+ * unarchived and we re-poke after this window elapses.
+ *
+ * 90s per capstone tuning: the capstone grades LOOP-CLOSED in
+ * ~220s, so the quiet window MUST be < 220s for a delivered-but-
+ * parked agent to be re-poked in time. 5 min (300s) missed the
+ * window and left parked agents stuck; 90s means at most ~150s
+ * total (60s scan interval + 90s quiet) before a re-poke — well
+ * inside the 220s grade window. Trade-off: a healthy agent
+ * mid-read gets a re-nudge if they take longer than 90s to
+ * archive — acceptable noise, and archive latency is typically
+ * much shorter than that.
  */
-const DEFAULT_RESCAN_QUIET_AFTER_DELIVERY_MS = 5 * 60 * 1000;
+const DEFAULT_RESCAN_QUIET_AFTER_DELIVERY_MS = 90_000;
 
 /**
  * Run the ding daemon. Resolves when the AbortSignal aborts (or
@@ -1119,7 +1130,15 @@ export async function cmdDingCli(
             '                                   Set to 0 to disable.\n' +
             '  --exit-when-session-gone         Exit when the target pty session is gone (default).\n' +
             '  --no-exit-when-session-gone      Keep running even when the target session\n' +
-            '                                   is gone (rare; opt-out).\n'
+            '                                   is gone (rare; opt-out).\n' +
+            '\n' +
+            '  Env overrides for the periodic backlog re-scan:\n' +
+            '    ST_DING_RESCAN_INTERVAL_MS     Scan interval. Default 60000 (60s).\n' +
+            '                                   Set to 0 to disable the re-scan tick.\n' +
+            '    ST_DING_RESCAN_QUIET_MS        Quiet window after a successful delivery\n' +
+            '                                   before the same file is re-poked. Default\n' +
+            '                                   90000 (90s). Tune down for aggressive\n' +
+            '                                   re-poking of parked agents.\n'
         );
         return 0;
       case '--identity':
@@ -1227,6 +1246,22 @@ export async function cmdDingCli(
   process.once('SIGINT', onSig);
   process.once('SIGTERM', onSig);
 
+  // Env-overridable knobs for the periodic backlog re-scan. Lets
+  // evals + operators tune without a code change or CLI flag. Both
+  // are non-negative integers (ms); malformed values are ignored
+  // (log to stderr, fall back to defaults) so a typo in an env file
+  // can't crash the daemon.
+  const rescanIntervalMs = parseEnvMs(
+    ctx.env.ST_DING_RESCAN_INTERVAL_MS,
+    'ST_DING_RESCAN_INTERVAL_MS',
+    ctx.stderr
+  );
+  const rescanQuietAfterDeliveryMs = parseEnvMs(
+    ctx.env.ST_DING_RESCAN_QUIET_MS,
+    'ST_DING_RESCAN_QUIET_MS',
+    ctx.stderr
+  );
+
   try {
     await runDing({
       st: st,
@@ -1237,6 +1272,10 @@ export async function cmdDingCli(
       ...(statusRefreshIntervalMs !== undefined && {
         statusRefreshIntervalMs,
       }),
+      ...(rescanIntervalMs !== undefined && { rescanIntervalMs }),
+      ...(rescanQuietAfterDeliveryMs !== undefined && {
+        rescanQuietAfterDeliveryMs,
+      }),
       exitWhenSessionGone,
       signal: ac.signal,
       stderr: ctx.stderr,
@@ -1246,4 +1285,25 @@ export async function cmdDingCli(
     process.removeListener('SIGTERM', onSig);
   }
   return 0;
+}
+
+/**
+ * Parse a non-negative integer (ms) from a env var value. Returns
+ * undefined for missing/empty (caller uses the default) and for
+ * malformed values (caller uses the default; also emits a stderr
+ * warning so an operator misconfiguration is visible).
+ */
+function parseEnvMs(
+  raw: string | undefined,
+  name: string,
+  stderr: (s: string) => void
+): number | undefined {
+  if (raw === undefined || raw === '') return undefined;
+  if (!/^[0-9]+$/.test(raw)) {
+    stderr(
+      `st ding: ignoring ${name}=${JSON.stringify(raw)} — must be a non-negative integer (ms); using default\n`
+    );
+    return undefined;
+  }
+  return Number(raw);
 }
