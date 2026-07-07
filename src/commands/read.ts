@@ -23,7 +23,7 @@ export interface ReadInput {
   fromArchive?: boolean;
 
   env: NodeJS.ProcessEnv;
-  coordRoot: string;
+  stRoot: string;
 }
 
 export interface ReadResult {
@@ -52,7 +52,7 @@ export function cmdRead(input: ReadInput): ReadResult {
   const recipient = resolveIdentity({
     explicit: input.recipient,
     env: input.env,
-    coordRoot: input.coordRoot,
+    stRoot: input.stRoot,
     ...(input.recipient ? { policy: 'lenient' as const } : {}),
   });
   if (!validDeliverableFilename(input.filename)) {
@@ -60,8 +60,8 @@ export function cmdRead(input: ReadInput): ReadResult {
   }
   const isOutside = !validFilename(input.filename);
 
-  const inboxPath = `${inboxDir(recipient, input.coordRoot)}/${input.filename}`;
-  const archivePath = `${archiveDir(recipient, input.coordRoot)}/${input.filename}`;
+  const inboxPath = `${inboxDir(recipient, input.stRoot)}/${input.filename}`;
+  const archivePath = `${archiveDir(recipient, input.stRoot)}/${input.filename}`;
 
   let path: string;
   let label: 'inbox' | 'archive';
@@ -171,7 +171,7 @@ export function cmdRead(input: ReadInput): ReadResult {
 }
 
 /**
- * Build the structured shape emitted by `coord message read --json`.
+ * Build the structured shape emitted by `st message read --json`.
  *
  * Mirrors the {@link Coord.read} / `coord_msg_read` MCP tool projection so
  * a programmatic consumer can use one parser across both surfaces.
@@ -256,7 +256,7 @@ function formatHeaderRow(key: string, value: string): string {
  * The single-positional case uses the `.md` suffix to disambiguate:
  * identity names can't contain `.` per LAYOUT-004, so any positional
  * ending in `.md` is a filename. This lets a typo like
- * `coord message read nope.md` reach the cmdRead filename validator
+ * `st message read nope.md` reach the cmdRead filename validator
  * (which surfaces a clear InvalidFilenameError) instead of being
  * mis-parsed as the optional identity and bailing with the
  * misleading "<filename> required" message.
@@ -324,7 +324,7 @@ export function cmdReadCli(args: readonly string[], ctx: CliContext): number {
     raw,
     fromArchive,
     env: ctx.env,
-    coordRoot: ctx.coordRoot,
+    stRoot: ctx.stRoot,
   });
   if (raw) {
     ctx.stdout(r.body);

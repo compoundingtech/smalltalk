@@ -45,14 +45,14 @@ describe('edge-cases — 1MB body', () => {
     // Use printable bytes so utf-8 → buffer roundtrip is identity-stable.
     const body = 'a'.repeat(1024 * 1024); // 1 MiB
     const send = runCoord(['message', 'send', 'bob', '--from', 'alice'], {
-      coordRoot: root,
+      stRoot: root,
       coordIdentity: 'alice',
       stdin: body,
     });
     expect(send.exitCode).toBe(0);
     const filename = send.stdout.trim();
     const read = runCoord(['message', 'read', 'bob', filename, '--raw'], {
-      coordRoot: root,
+      stRoot: root,
       coordIdentity: 'alice',
     });
     expect(read.exitCode).toBe(0);
@@ -71,13 +71,13 @@ describe('edge-cases — 1MB body', () => {
       mkIdentity(peer, 'bob');
       const body = 'x'.repeat(1024 * 1024);
       const send = runCoord(['message', 'send', 'bob', '--from', 'alice'], {
-        coordRoot: root,
+        stRoot: root,
         coordIdentity: 'alice',
         stdin: body,
       });
       const filename = send.stdout.trim();
       runCoord(['sync', 'push', `local:${peer}`], {
-        coordRoot: root,
+        stRoot: root,
         coordIdentity: 'alice',
       });
       const local = readFileSync(join(root, 'bob', 'inbox', filename));
@@ -104,8 +104,8 @@ describe('edge-cases — concurrent sends', () => {
             env: {
               PATH: process.env.PATH,
               HOME: process.env.HOME,
-              COORD_ROOT: root,
-              COORD_IDENTITY: 'alice',
+              ST_ROOT: root,
+              ST_AGENT: 'alice',
             },
             stdio: ['pipe', 'pipe', 'pipe'],
           }
@@ -136,7 +136,7 @@ describe('edge-cases — concurrent sends', () => {
   it('30 rapid serial sends produce 30 distinct files', () => {
     for (let i = 0; i < 30; i++) {
       const r = runCoord(['message', 'send', 'bob', '--from', 'alice'], {
-        coordRoot: root,
+        stRoot: root,
         coordIdentity: 'alice',
         stdin: `msg ${i}`,
       });
@@ -152,7 +152,7 @@ describe('edge-cases — empty body', () => {
   it('errors with non-zero exit, no file is created', () => {
     const before = listInbox(root, 'bob');
     const r = runCoord(['message', 'send', 'bob', '--from', 'alice'], {
-      coordRoot: root,
+      stRoot: root,
       coordIdentity: 'alice',
       stdin: '',
     });
@@ -172,7 +172,7 @@ describe('edge-cases — --in-reply-to', () => {
     const r = runCoord(
       ['message', 'send', 'bob', '--from', 'alice', '--in-reply-to', phantom],
       {
-        coordRoot: root,
+        stRoot: root,
         coordIdentity: 'alice',
         stdin: 'reply to nothing',
       }
@@ -187,7 +187,7 @@ describe('edge-cases — --in-reply-to', () => {
     const r = runCoord(
       ['message', 'send', 'bob', '--from', 'alice', '--in-reply-to', 'garbage'],
       {
-        coordRoot: root,
+        stRoot: root,
         coordIdentity: 'alice',
         stdin: 'body',
       }
@@ -205,7 +205,7 @@ describe('edge-cases — half-formed sender identity', () => {
     mkdirSync(join(root, 'half'), { recursive: true });
     // Note: only the parent dir exists — no inbox/archive subdirs.
     const r = runCoord(['message', 'send', 'bob', '--from', 'half'], {
-      coordRoot: root,
+      stRoot: root,
       coordIdentity: 'alice',
       stdin: 'body',
     });
@@ -237,7 +237,7 @@ describe('edge-cases — archive trim --dry-run', () => {
 
     const r = runCoord(
       ['message', 'archive', 'trim', 'alice', '--keep-last', '2', '--dry-run'],
-      { coordRoot: root, coordIdentity: 'alice' }
+      { stRoot: root, coordIdentity: 'alice' }
     );
     expect(r.exitCode).toBe(0);
 
@@ -269,7 +269,7 @@ describe('edge-cases — archive trim --dry-run', () => {
     }
     const r = runCoord(
       ['message', 'archive', 'trim', 'alice', '--keep-last', '2'],
-      { coordRoot: root, coordIdentity: 'alice' }
+      { stRoot: root, coordIdentity: 'alice' }
     );
     expect(r.exitCode).toBe(0);
     expect(r.stderr).toContain('trimmed 3 files');
@@ -288,7 +288,7 @@ describe('edge-cases — corrupted/missing frontmatter on read', () => {
     const filename = '1714826789010-aaaaaa.md';
     writeFileSync(join(root, 'alice', 'inbox', filename), 'just text\n');
     const r = runCoord(['message', 'read', 'alice', filename], {
-      coordRoot: root,
+      stRoot: root,
       coordIdentity: 'alice',
     });
     expect(r.exitCode).toBe(0);
@@ -306,7 +306,7 @@ describe('edge-cases — corrupted/missing frontmatter on read', () => {
     writeFileSync(join(root, 'alice', 'inbox', badFile), 'no fences\n');
 
     const r = runCoord(['message', 'ls', 'alice', '--from', 'bob'], {
-      coordRoot: root,
+      stRoot: root,
       coordIdentity: 'alice',
     });
     expect(r.exitCode).toBe(0);

@@ -22,20 +22,20 @@ import {
 } from '../../src/commands/archive.ts';
 
 let scratch: string;
-let coordRoot: string;
+let stRoot: string;
 
 beforeEach(() => {
   scratch = mkdtempSync(join(tmpdir(), 'coord-archive-test-'));
-  coordRoot = join(scratch, 'coord');
-  mkdirSync(coordRoot, { recursive: true });
+  stRoot = join(scratch, 'coord');
+  mkdirSync(stRoot, { recursive: true });
 });
 afterEach(() => {
   rmSync(scratch, { recursive: true, force: true });
 });
 
 function setupIdentity(id: string): void {
-  mkdirSync(join(coordRoot, id, 'inbox'), { recursive: true });
-  mkdirSync(join(coordRoot, id, 'archive'), { recursive: true });
+  mkdirSync(join(stRoot, id, 'inbox'), { recursive: true });
+  mkdirSync(join(stRoot, id, 'archive'), { recursive: true });
 }
 
 function writeMsg(
@@ -45,7 +45,7 @@ function writeMsg(
   folder: 'inbox' | 'archive' = 'inbox'
 ): void {
   writeFileSync(
-    join(coordRoot, id, folder, filename),
+    join(stRoot, id, folder, filename),
     `---\nfrom: alice\n---\n${body}\n`
   );
 }
@@ -55,7 +55,7 @@ function archiveInput(overrides: Partial<ArchiveInput> = {}): ArchiveInput {
     recipient: 'bob',
     filename: '1714826789010-aaaaaa.md',
     env: {} as NodeJS.ProcessEnv,
-    coordRoot,
+    stRoot,
     ...overrides,
   };
 }
@@ -69,8 +69,8 @@ describe('cmdArchive — case 4 (clean rename)', () => {
     const r = cmdArchive(archiveInput());
     expect(r.outcome.kind).toBe('moved');
     expect(r.outcome.message).toBe('archived');
-    expect(existsSync(join(coordRoot, 'bob', 'inbox', '1714826789010-aaaaaa.md'))).toBe(false);
-    expect(existsSync(join(coordRoot, 'bob', 'archive', '1714826789010-aaaaaa.md'))).toBe(true);
+    expect(existsSync(join(stRoot, 'bob', 'inbox', '1714826789010-aaaaaa.md'))).toBe(false);
+    expect(existsSync(join(stRoot, 'bob', 'archive', '1714826789010-aaaaaa.md'))).toBe(true);
   });
 });
 
@@ -81,8 +81,8 @@ describe('cmdArchive — case 2 (idempotent: byte-identical twin)', () => {
     writeMsg('bob', '1714826789010-aaaaaa.md', 'same', 'archive');
     const r = cmdArchive(archiveInput());
     expect(r.outcome.kind).toBe('idempotent');
-    expect(existsSync(join(coordRoot, 'bob', 'inbox', '1714826789010-aaaaaa.md'))).toBe(false);
-    expect(readFileSync(join(coordRoot, 'bob', 'archive', '1714826789010-aaaaaa.md'), 'utf8')).toContain('same');
+    expect(existsSync(join(stRoot, 'bob', 'inbox', '1714826789010-aaaaaa.md'))).toBe(false);
+    expect(readFileSync(join(stRoot, 'bob', 'archive', '1714826789010-aaaaaa.md'), 'utf8')).toContain('same');
   });
 });
 
@@ -90,16 +90,16 @@ describe('cmdArchive — case 3 (refuse: divergent twin)', () => {
   it('refuses with a clear error and leaves both copies in place', () => {
     setupIdentity('bob');
     writeFileSync(
-      join(coordRoot, 'bob', 'inbox', '1714826789010-aaaaaa.md'),
+      join(stRoot, 'bob', 'inbox', '1714826789010-aaaaaa.md'),
       'inbox-version'
     );
     writeFileSync(
-      join(coordRoot, 'bob', 'archive', '1714826789010-aaaaaa.md'),
+      join(stRoot, 'bob', 'archive', '1714826789010-aaaaaa.md'),
       'archive-version'
     );
     expect(() => cmdArchive(archiveInput())).toThrowError(/refuse to archive/);
-    expect(existsSync(join(coordRoot, 'bob', 'inbox', '1714826789010-aaaaaa.md'))).toBe(true);
-    expect(existsSync(join(coordRoot, 'bob', 'archive', '1714826789010-aaaaaa.md'))).toBe(true);
+    expect(existsSync(join(stRoot, 'bob', 'inbox', '1714826789010-aaaaaa.md'))).toBe(true);
+    expect(existsSync(join(stRoot, 'bob', 'archive', '1714826789010-aaaaaa.md'))).toBe(true);
   });
 });
 
@@ -117,19 +117,19 @@ describe('cmdArchive — case 0 (post-sweep idempotent)', () => {
 describe('cmdArchive — outside .md files', () => {
   it('moves an off-format `.md` from inbox to archive', () => {
     setupIdentity('bob');
-    writeFileSync(join(coordRoot, 'bob', 'inbox', 'notes.md'), 'hand-dropped\n');
+    writeFileSync(join(stRoot, 'bob', 'inbox', 'notes.md'), 'hand-dropped\n');
     const r = cmdArchive(archiveInput({ filename: 'notes.md' }));
     expect(r.outcome.kind).toBe('moved');
-    expect(existsSync(join(coordRoot, 'bob', 'inbox', 'notes.md'))).toBe(false);
-    expect(existsSync(join(coordRoot, 'bob', 'archive', 'notes.md'))).toBe(true);
+    expect(existsSync(join(stRoot, 'bob', 'inbox', 'notes.md'))).toBe(false);
+    expect(existsSync(join(stRoot, 'bob', 'archive', 'notes.md'))).toBe(true);
     // Bytes preserved verbatim through the move.
-    expect(readFileSync(join(coordRoot, 'bob', 'archive', 'notes.md'), 'utf8'))
+    expect(readFileSync(join(stRoot, 'bob', 'archive', 'notes.md'), 'utf8'))
       .toBe('hand-dropped\n');
   });
 
   it('withAttachments is silently coerced off for outside filenames (no prefix family)', () => {
     setupIdentity('bob');
-    writeFileSync(join(coordRoot, 'bob', 'inbox', 'notes.md'), 'plain\n');
+    writeFileSync(join(stRoot, 'bob', 'inbox', 'notes.md'), 'plain\n');
     const r = cmdArchive(
       archiveInput({ filename: 'notes.md', withAttachments: true })
     );
@@ -171,16 +171,16 @@ describe('cmdArchive — input validation', () => {
     ).toThrowError(/(agent|identity) folder missing/);
   });
 
-  it('falls back to COORD_IDENTITY when recipient omitted', () => {
+  it('falls back to ST_AGENT when recipient omitted', () => {
     setupIdentity('bob');
     writeMsg('bob', '1714826789010-aaaaaa.md');
     cmdArchive(
       archiveInput({
         recipient: undefined,
-        env: { COORD_IDENTITY: 'bob' } as NodeJS.ProcessEnv,
+        env: { ST_AGENT: 'bob' } as NodeJS.ProcessEnv,
       })
     );
-    expect(existsSync(join(coordRoot, 'bob', 'archive', '1714826789010-aaaaaa.md'))).toBe(true);
+    expect(existsSync(join(stRoot, 'bob', 'archive', '1714826789010-aaaaaa.md'))).toBe(true);
   });
 });
 
@@ -246,7 +246,7 @@ function trimInput(overrides: Partial<ArchiveTrimInput> = {}): ArchiveTrimInput 
   return {
     recipient: 'bob',
     env: {} as NodeJS.ProcessEnv,
-    coordRoot,
+    stRoot,
     ...overrides,
   };
 }
@@ -290,12 +290,12 @@ describe('cmdArchiveTrim — empty / non-existent archive', () => {
   });
 
   it('missing archive directory: no-op (no throw)', () => {
-    mkdirSync(join(coordRoot, 'bob', 'inbox'), { recursive: true });
+    mkdirSync(join(stRoot, 'bob', 'inbox'), { recursive: true });
     // Note: identity-folder check requires archive/ too; create then remove
     // it AFTER resolveIdentity runs… here we just simulate by setting up
     // both dirs and removing archive after.
-    mkdirSync(join(coordRoot, 'bob', 'archive'), { recursive: true });
-    rmSync(join(coordRoot, 'bob', 'archive'), { recursive: true });
+    mkdirSync(join(stRoot, 'bob', 'archive'), { recursive: true });
+    rmSync(join(stRoot, 'bob', 'archive'), { recursive: true });
     expect(() =>
       cmdArchiveTrim(trimInput({ keepLast: 100 }))
     ).toThrowError(/(agent|identity) folder missing/);
@@ -313,7 +313,7 @@ describe('cmdArchiveTrim — --keep-last', () => {
       '1714826789050',
     ]) {
       writeFileSync(
-        join(coordRoot, 'bob', 'archive', `${ts}-aaaaaa.md`),
+        join(stRoot, 'bob', 'archive', `${ts}-aaaaaa.md`),
         'msg'
       );
     }
@@ -325,17 +325,17 @@ describe('cmdArchiveTrim — --keep-last', () => {
     ]);
     expect(r.summary).toBe('# trimmed 3 files');
     expect(
-      existsSync(join(coordRoot, 'bob', 'archive', '1714826789040-aaaaaa.md'))
+      existsSync(join(stRoot, 'bob', 'archive', '1714826789040-aaaaaa.md'))
     ).toBe(true);
     expect(
-      existsSync(join(coordRoot, 'bob', 'archive', '1714826789050-aaaaaa.md'))
+      existsSync(join(stRoot, 'bob', 'archive', '1714826789050-aaaaaa.md'))
     ).toBe(true);
   });
 
   it('--keep-last 0 trims everything', () => {
     setupIdentity('bob');
     writeFileSync(
-      join(coordRoot, 'bob', 'archive', '1714826789010-aaaaaa.md'),
+      join(stRoot, 'bob', 'archive', '1714826789010-aaaaaa.md'),
       'x'
     );
     const r = cmdArchiveTrim(trimInput({ keepLast: 0 }));
@@ -345,7 +345,7 @@ describe('cmdArchiveTrim — --keep-last', () => {
   it('--keep-last larger than count trims nothing', () => {
     setupIdentity('bob');
     writeFileSync(
-      join(coordRoot, 'bob', 'archive', '1714826789010-aaaaaa.md'),
+      join(stRoot, 'bob', 'archive', '1714826789010-aaaaaa.md'),
       'x'
     );
     const r = cmdArchiveTrim(trimInput({ keepLast: 100 }));
@@ -355,11 +355,11 @@ describe('cmdArchiveTrim — --keep-last', () => {
   it('singular pluralization: "trimmed 1 file"', () => {
     setupIdentity('bob');
     writeFileSync(
-      join(coordRoot, 'bob', 'archive', '1714826789010-aaaaaa.md'),
+      join(stRoot, 'bob', 'archive', '1714826789010-aaaaaa.md'),
       'x'
     );
     writeFileSync(
-      join(coordRoot, 'bob', 'archive', '1714826789020-bbbbbb.md'),
+      join(stRoot, 'bob', 'archive', '1714826789020-bbbbbb.md'),
       'x'
     );
     const r = cmdArchiveTrim(trimInput({ keepLast: 1 }));
@@ -374,11 +374,11 @@ describe('cmdArchiveTrim — --older-than', () => {
     const oldTs = now - 100 * 86400 * 1000; // 100 days ago
     const recentTs = now - 1; // 1ms ago
     writeFileSync(
-      join(coordRoot, 'bob', 'archive', `${oldTs}-aaaaaa.md`),
+      join(stRoot, 'bob', 'archive', `${oldTs}-aaaaaa.md`),
       'x'
     );
     writeFileSync(
-      join(coordRoot, 'bob', 'archive', `${recentTs}-bbbbbb.md`),
+      join(stRoot, 'bob', 'archive', `${recentTs}-bbbbbb.md`),
       'x'
     );
     const r = cmdArchiveTrim(
@@ -401,7 +401,7 @@ describe('cmdArchiveTrim — both flags (union, deduped)', () => {
     for (let i = 0; i < tsList.length; i++) {
       writeFileSync(
         join(
-          coordRoot,
+          stRoot,
           'bob',
           'archive',
           `${tsList[i]}-${'abcdef'[i]!.repeat(6)}.md`
@@ -435,7 +435,7 @@ describe('cmdArchiveTrim — --dry-run', () => {
       '1714826789050',
     ]) {
       writeFileSync(
-        join(coordRoot, 'bob', 'archive', `${ts}-aaaaaa.md`),
+        join(stRoot, 'bob', 'archive', `${ts}-aaaaaa.md`),
         'x'
       );
     }
@@ -454,7 +454,7 @@ describe('cmdArchiveTrim — --dry-run', () => {
       '1714826789050',
     ]) {
       expect(
-        existsSync(join(coordRoot, 'bob', 'archive', `${ts}-aaaaaa.md`))
+        existsSync(join(stRoot, 'bob', 'archive', `${ts}-aaaaaa.md`))
       ).toBe(true);
     }
   });
@@ -463,23 +463,23 @@ describe('cmdArchiveTrim — --dry-run', () => {
 describe('cmdArchiveTrim — non-grammar files in archive/', () => {
   it('skips non-.md and grammar-violating files (preserves them)', () => {
     setupIdentity('bob');
-    writeFileSync(join(coordRoot, 'bob', 'archive', 'README'), 'x');
-    writeFileSync(join(coordRoot, 'bob', 'archive', 'notes.md'), 'x');
+    writeFileSync(join(stRoot, 'bob', 'archive', 'README'), 'x');
+    writeFileSync(join(stRoot, 'bob', 'archive', 'notes.md'), 'x');
     writeFileSync(
-      join(coordRoot, 'bob', 'archive', '1714826789010-myobie-aaaaaa.md'),
+      join(stRoot, 'bob', 'archive', '1714826789010-operator-aaaaaa.md'),
       'legacy'
     );
     writeFileSync(
-      join(coordRoot, 'bob', 'archive', '1714826789020-aaaaaa.md'),
+      join(stRoot, 'bob', 'archive', '1714826789020-aaaaaa.md'),
       'real'
     );
     const r = cmdArchiveTrim(trimInput({ keepLast: 0 }));
     expect(r.victims).toEqual(['1714826789020-aaaaaa.md']);
-    expect(existsSync(join(coordRoot, 'bob', 'archive', 'README'))).toBe(true);
-    expect(existsSync(join(coordRoot, 'bob', 'archive', 'notes.md'))).toBe(true);
+    expect(existsSync(join(stRoot, 'bob', 'archive', 'README'))).toBe(true);
+    expect(existsSync(join(stRoot, 'bob', 'archive', 'notes.md'))).toBe(true);
     expect(
       existsSync(
-        join(coordRoot, 'bob', 'archive', '1714826789010-myobie-aaaaaa.md')
+        join(stRoot, 'bob', 'archive', '1714826789010-operator-aaaaaa.md')
       )
     ).toBe(true);
   });
@@ -493,7 +493,7 @@ function writeAttachment(
   body: string,
   folder: 'inbox' | 'archive' = 'inbox'
 ): void {
-  writeFileSync(join(coordRoot, id, folder, filename), body);
+  writeFileSync(join(stRoot, id, folder, filename), body);
 }
 
 describe('cmdArchive — --with-attachments', () => {
@@ -514,8 +514,8 @@ describe('cmdArchive — --with-attachments', () => {
       ATT2,
     ]);
     for (const f of [MD, ATT1, ATT2]) {
-      expect(existsSync(join(coordRoot, 'bob', 'inbox', f))).toBe(false);
-      expect(existsSync(join(coordRoot, 'bob', 'archive', f))).toBe(true);
+      expect(existsSync(join(stRoot, 'bob', 'inbox', f))).toBe(false);
+      expect(existsSync(join(stRoot, 'bob', 'archive', f))).toBe(true);
     }
   });
 
@@ -525,9 +525,9 @@ describe('cmdArchive — --with-attachments', () => {
     writeAttachment('bob', ATT1, 'x');
     const r = cmdArchive(archiveInput());
     expect(r.attachments).toBeUndefined();
-    expect(existsSync(join(coordRoot, 'bob', 'archive', MD))).toBe(true);
-    expect(existsSync(join(coordRoot, 'bob', 'inbox', ATT1))).toBe(true);
-    expect(existsSync(join(coordRoot, 'bob', 'archive', ATT1))).toBe(false);
+    expect(existsSync(join(stRoot, 'bob', 'archive', MD))).toBe(true);
+    expect(existsSync(join(stRoot, 'bob', 'inbox', ATT1))).toBe(true);
+    expect(existsSync(join(stRoot, 'bob', 'archive', ATT1))).toBe(false);
   });
 
   it('empty attachment array when no siblings exist', () => {
@@ -547,8 +547,8 @@ describe('cmdArchive — --with-attachments', () => {
       cmdArchive(archiveInput({ withAttachments: true }))
     ).toThrowError(/refuse to archive/);
     // Nothing moved: the .md is still in inbox.
-    expect(existsSync(join(coordRoot, 'bob', 'inbox', MD))).toBe(true);
-    expect(existsSync(join(coordRoot, 'bob', 'archive', MD))).toBe(false);
+    expect(existsSync(join(stRoot, 'bob', 'inbox', MD))).toBe(true);
+    expect(existsSync(join(stRoot, 'bob', 'archive', MD))).toBe(false);
   });
 
   it('idempotent on byte-identical siblings already in archive', () => {
@@ -564,8 +564,8 @@ describe('cmdArchive — --with-attachments', () => {
     expect(r.attachments).toHaveLength(1);
     expect(r.attachments![0]!.outcome.kind).toBe('idempotent');
     // Inbox copies cleared.
-    expect(existsSync(join(coordRoot, 'bob', 'inbox', MD))).toBe(false);
-    expect(existsSync(join(coordRoot, 'bob', 'inbox', ATT1))).toBe(false);
+    expect(existsSync(join(stRoot, 'bob', 'inbox', MD))).toBe(false);
+    expect(existsSync(join(stRoot, 'bob', 'inbox', ATT1))).toBe(false);
   });
 
   it('sibling that exists only in archive (post-sync) is handled idempotently', () => {
@@ -585,8 +585,8 @@ describe('cmdArchive — --with-attachments', () => {
     writeAttachment('bob', 'README', 'junk');
     const r = cmdArchive(archiveInput({ withAttachments: true }));
     expect(r.attachments).toEqual([]);
-    expect(existsSync(join(coordRoot, 'bob', 'inbox', '.DS_Store'))).toBe(true);
-    expect(existsSync(join(coordRoot, 'bob', 'inbox', 'README'))).toBe(true);
+    expect(existsSync(join(stRoot, 'bob', 'inbox', '.DS_Store'))).toBe(true);
+    expect(existsSync(join(stRoot, 'bob', 'inbox', 'README'))).toBe(true);
   });
 });
 
@@ -609,11 +609,11 @@ describe('cmdArchiveTrim — --with-attachments', () => {
     );
     expect(r.victims).toEqual([MD1]); // older one trimmed
     expect(r.attachments).toEqual([ATT1A, ATT1B]); // its siblings
-    expect(existsSync(join(coordRoot, 'bob', 'archive', MD1))).toBe(false);
-    expect(existsSync(join(coordRoot, 'bob', 'archive', ATT1A))).toBe(false);
-    expect(existsSync(join(coordRoot, 'bob', 'archive', ATT1B))).toBe(false);
+    expect(existsSync(join(stRoot, 'bob', 'archive', MD1))).toBe(false);
+    expect(existsSync(join(stRoot, 'bob', 'archive', ATT1A))).toBe(false);
+    expect(existsSync(join(stRoot, 'bob', 'archive', ATT1B))).toBe(false);
     // MD2's sibling preserved.
-    expect(existsSync(join(coordRoot, 'bob', 'archive', ATT2))).toBe(true);
+    expect(existsSync(join(stRoot, 'bob', 'archive', ATT2))).toBe(true);
   });
 
   it('without --with-attachments leaves siblings (regression)', () => {
@@ -623,7 +623,7 @@ describe('cmdArchiveTrim — --with-attachments', () => {
     const r = cmdArchiveTrim(trimInput({ keepLast: 0 }));
     expect(r.victims).toEqual([MD1]);
     expect(r.attachments).toBeUndefined();
-    expect(existsSync(join(coordRoot, 'bob', 'archive', ATT1A))).toBe(true);
+    expect(existsSync(join(stRoot, 'bob', 'archive', ATT1A))).toBe(true);
   });
 
   it('--dry-run + --with-attachments lists siblings without deleting', () => {
@@ -635,7 +635,7 @@ describe('cmdArchiveTrim — --with-attachments', () => {
     );
     expect(r.victims).toEqual([MD1]);
     expect(r.attachments).toEqual([ATT1A]);
-    expect(existsSync(join(coordRoot, 'bob', 'archive', MD1))).toBe(true);
-    expect(existsSync(join(coordRoot, 'bob', 'archive', ATT1A))).toBe(true);
+    expect(existsSync(join(stRoot, 'bob', 'archive', MD1))).toBe(true);
+    expect(existsSync(join(stRoot, 'bob', 'archive', ATT1A))).toBe(true);
   });
 });

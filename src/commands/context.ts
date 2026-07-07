@@ -1,4 +1,4 @@
-// commands/context.ts — `coord context <verb>` for per-agent durable
+// commands/context.ts — `st context <verb>` for per-agent durable
 // working-state (brief-024, context/ v1).
 //
 // Purpose. Solve the in-context-state loss leg of lossless-restart: a
@@ -30,7 +30,7 @@
 // Absent-able (load-bearing for evals-claude's restart-continuity
 // eval): every verb tolerates a missing `context/` folder. `read`
 // returns empty text when the file/folder is absent. `append` and
-// `write` lazy-create the folder. There is no `coord context init`
+// `write` lazy-create the folder. There is no `st context init`
 // — you can go from zero to a first write without any ceremony, and
 // the eval's control arm can just delete the folder to A/B against
 // the treatment.
@@ -75,7 +75,7 @@ export interface ContextReadInput {
   /** Which surface to read. Default 'now'. */
   file?: 'now' | 'decisions' | 'full' | undefined;
   env: NodeJS.ProcessEnv;
-  coordRoot: string;
+  stRoot: string;
 }
 
 export interface ContextReadResult {
@@ -99,7 +99,7 @@ export interface ContextWriteInput {
   /** Whole-file rewrite content for now.md. */
   body: string;
   env: NodeJS.ProcessEnv;
-  coordRoot: string;
+  stRoot: string;
 }
 
 export interface ContextWriteResult {
@@ -129,7 +129,7 @@ export interface ContextAppendInput {
    */
   filename?: string | undefined;
   env: NodeJS.ProcessEnv;
-  coordRoot: string;
+  stRoot: string;
 }
 
 export interface ContextAppendResult {
@@ -157,25 +157,25 @@ export function cmdContextRead(input: ContextReadInput): ContextReadResult {
   const identity = resolveIdentity({
     explicit: input.recipient,
     env: input.env,
-    coordRoot: input.coordRoot,
+    stRoot: input.stRoot,
   });
   const which = input.file ?? 'now';
 
   if (which === 'now') {
     const { text, absent } = readIfPresent(
-      contextNowPath(identity, input.coordRoot)
+      contextNowPath(identity, input.stRoot)
     );
     return { identity, file: 'now', text, absent };
   }
   if (which === 'decisions') {
-    const { text, absent } = readDecisionsFolder(identity, input.coordRoot);
+    const { text, absent } = readDecisionsFolder(identity, input.stRoot);
     return { identity, file: 'decisions', text, absent };
   }
   // `full`: now.md then decisions/*.md, separated by headings so the
   // reader can tell what came from where. Absent-flag is true iff
   // BOTH surfaces were missing — a partial rehydrate is still "present".
-  const now = readIfPresent(contextNowPath(identity, input.coordRoot));
-  const dec = readDecisionsFolder(identity, input.coordRoot);
+  const now = readIfPresent(contextNowPath(identity, input.stRoot));
+  const dec = readDecisionsFolder(identity, input.stRoot);
   const parts: string[] = [];
   if (!now.absent) {
     parts.push('# now.md', now.text);
@@ -204,10 +204,10 @@ export function cmdContextWrite(
   const identity = resolveIdentity({
     explicit: input.recipient,
     env: input.env,
-    coordRoot: input.coordRoot,
+    stRoot: input.stRoot,
   });
-  const path = contextNowPath(identity, input.coordRoot);
-  ensureContextDir(identity, input.coordRoot);
+  const path = contextNowPath(identity, input.stRoot);
+  ensureContextDir(identity, input.stRoot);
   // Normalize trailing newline so the file always ends with \n. Keeps
   // downstream tools happy (git diff, `cat`), matches the shape the
   // model writes when the body already ends with a newline.
@@ -236,7 +236,7 @@ export function cmdContextAppend(
   const identity = resolveIdentity({
     explicit: input.recipient,
     env: input.env,
-    coordRoot: input.coordRoot,
+    stRoot: input.stRoot,
   });
   const decision = input.decision.trim();
   const why = input.why.trim();
@@ -262,7 +262,7 @@ export function cmdContextAppend(
   const ms = Number.isFinite(parsedMs) ? parsedMs : msNow();
   const filename = input.filename ?? `${ms}-${rand6()}.md`;
 
-  const dir = contextDecisionsDir(identity, input.coordRoot);
+  const dir = contextDecisionsDir(identity, input.stRoot);
   mkdirSync(dir, { recursive: true });
   const path = join(dir, filename);
   writeAtomic(path, line + '\n');
@@ -400,7 +400,7 @@ export async function cmdContextCli(
     case 'append':
       return cliAppend(rest, ctx);
     default:
-      ctx.stderr(`coord context: unknown subcommand: ${sub}\n\n`);
+      ctx.stderr(`st context: unknown subcommand: ${sub}\n\n`);
       ctx.stderr(contextUsage(invokedName(ctx.env)));
       return 2;
   }
@@ -430,7 +430,7 @@ function cliRead(args: readonly string[], ctx: CliContext): number {
     ...(recipient !== undefined && { recipient }),
     file,
     env: ctx.env,
-    coordRoot: ctx.coordRoot,
+    stRoot: ctx.stRoot,
   });
   // Print the text as-is (including empty). Absent files exit 0 with
   // empty output — the SessionStart hook can `cat $(coord context
@@ -457,7 +457,7 @@ async function cliWrite(
     ...(recipient !== undefined && { recipient }),
     body,
     env: ctx.env,
-    coordRoot: ctx.coordRoot,
+    stRoot: ctx.stRoot,
   });
   ctx.stdout(`wrote ${r.bytes} bytes to ${r.path}\n`);
   return 0;
@@ -500,7 +500,7 @@ function cliAppend(args: readonly string[], ctx: CliContext): number {
     why,
     timestamp: new Date().toISOString(),
     env: ctx.env,
-    coordRoot: ctx.coordRoot,
+    stRoot: ctx.stRoot,
   });
   ctx.stdout(`${r.line}\n`);
   return 0;

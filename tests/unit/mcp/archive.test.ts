@@ -19,19 +19,19 @@ import { errorCode, errorPayload } from "./_helpers.ts";
 import { asIdentity } from '../../../src/types.ts';
 
 let scratch: string;
-let coordRoot: string;
+let stRoot: string;
 let client: Client;
 let handle: ReturnType<typeof createMcpServer>;
 
 beforeEach(async () => {
   scratch = mkdtempSync(join(tmpdir(), 'coord-mcp-archive-'));
-  coordRoot = join(scratch, 'coord');
+  stRoot = join(scratch, 'coord');
   for (const id of ['alice', 'bob']) {
-    mkdirSync(join(coordRoot, id, 'inbox'), { recursive: true });
-    mkdirSync(join(coordRoot, id, 'archive'), { recursive: true });
+    mkdirSync(join(stRoot, id, 'inbox'), { recursive: true });
+    mkdirSync(join(stRoot, id, 'archive'), { recursive: true });
   }
   handle = createMcpServer({
-    root: coordRoot,
+    root: stRoot,
     identity: asIdentity('alice'),
   });
   client = new Client({ name: 'test-archive', version: '1.0' });
@@ -63,7 +63,7 @@ function plant(
   folder: 'inbox' | 'archive' = 'inbox'
 ): void {
   writeFileSync(
-    join(coordRoot, identity, folder, filename),
+    join(stRoot, identity, folder, filename),
     `---\nfrom: bob\n---\n${body}\n`
   );
 }
@@ -93,10 +93,10 @@ describe('st_msg_archive — happy paths', () => {
       outcome: 'moved',
     });
     expect(
-      existsSync(join(coordRoot, 'alice', 'inbox', '1714826789010-aaaaaa.md'))
+      existsSync(join(stRoot, 'alice', 'inbox', '1714826789010-aaaaaa.md'))
     ).toBe(false);
     expect(
-      existsSync(join(coordRoot, 'alice', 'archive', '1714826789010-aaaaaa.md'))
+      existsSync(join(stRoot, 'alice', 'archive', '1714826789010-aaaaaa.md'))
     ).toBe(true);
   });
 
@@ -112,12 +112,12 @@ describe('st_msg_archive — happy paths', () => {
     // method) removes the byte-identical inbox copy first; archive then
     // sees inbox-empty + archive-present (case 0).
     const f = '1714826789010-aaaaaa.md';
-    writeFileSync(join(coordRoot, 'alice', 'inbox', f), 'same');
-    writeFileSync(join(coordRoot, 'alice', 'archive', f), 'same');
+    writeFileSync(join(stRoot, 'alice', 'inbox', f), 'same');
+    writeFileSync(join(stRoot, 'alice', 'archive', f), 'same');
     const r = await call({ filename: f });
     expect(r.structuredContent?.outcome).toBe('idempotent');
-    expect(existsSync(join(coordRoot, 'alice', 'inbox', f))).toBe(false);
-    expect(readFileSync(join(coordRoot, 'alice', 'archive', f), 'utf8')).toBe(
+    expect(existsSync(join(stRoot, 'alice', 'inbox', f))).toBe(false);
+    expect(readFileSync(join(stRoot, 'alice', 'archive', f), 'utf8')).toBe(
       'same'
     );
   });
@@ -130,7 +130,7 @@ describe('st_msg_archive — happy paths', () => {
     });
     expect(r.structuredContent?.identity).toBe('bob');
     expect(
-      existsSync(join(coordRoot, 'bob', 'archive', '1714826789010-aaaaaa.md'))
+      existsSync(join(stRoot, 'bob', 'archive', '1714826789010-aaaaaa.md'))
     ).toBe(true);
   });
 
@@ -184,8 +184,8 @@ describe('st_msg_archive — typed error mapping', () => {
     // DIFFERENT content. Sweep is content-aware (cmp -s) and skips
     // divergent pairs; archive then refuses with ARCHIVE_CONFLICT.
     const f = '1714826789010-aaaaaa.md';
-    writeFileSync(join(coordRoot, 'alice', 'inbox', f), 'inbox-version');
-    writeFileSync(join(coordRoot, 'alice', 'archive', f), 'archive-version');
+    writeFileSync(join(stRoot, 'alice', 'inbox', f), 'inbox-version');
+    writeFileSync(join(stRoot, 'alice', 'archive', f), 'archive-version');
     const r = await call({ filename: f });
     expect(errorCode(r)).toBe('ARCHIVE_CONFLICT');
     expect(errorPayload(r)?.details).toMatchObject({
@@ -193,8 +193,8 @@ describe('st_msg_archive — typed error mapping', () => {
       filename: f,
     });
     // Both copies preserved.
-    expect(existsSync(join(coordRoot, 'alice', 'inbox', f))).toBe(true);
-    expect(existsSync(join(coordRoot, 'alice', 'archive', f))).toBe(true);
+    expect(existsSync(join(stRoot, 'alice', 'inbox', f))).toBe(true);
+    expect(existsSync(join(stRoot, 'alice', 'archive', f))).toBe(true);
   });
 
   it('invalid filename grammar → INVALID_FILENAME', async () => {
@@ -207,7 +207,7 @@ describe('st_msg_archive — typed error mapping', () => {
     // `.md`) is valid to *reference* — it's the "outside message"
     // path. When the file doesn't exist, the error is
     // MESSAGE_NOT_FOUND, not INVALID_FILENAME.
-    const r = await call({ filename: '1714826789010-myobie-aaaaaa.md' });
+    const r = await call({ filename: '1714826789010-operator-aaaaaa.md' });
     expect(errorCode(r)).toBe('MESSAGE_NOT_FOUND');
   });
 
@@ -258,8 +258,8 @@ describe('st_msg_archive — roundtrip with send', () => {
     const filename = send.structuredContent?.filename as string;
     const r = await call({ filename, identity: 'bob' });
     expect(r.structuredContent?.outcome).toBe('moved');
-    expect(existsSync(join(coordRoot, 'bob', 'inbox', filename))).toBe(false);
-    expect(existsSync(join(coordRoot, 'bob', 'archive', filename))).toBe(true);
+    expect(existsSync(join(stRoot, 'bob', 'inbox', filename))).toBe(false);
+    expect(existsSync(join(stRoot, 'bob', 'archive', filename))).toBe(true);
   });
 
   it('a second archive call on the same file → outcome=idempotent', async () => {

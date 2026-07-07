@@ -1,14 +1,14 @@
-// commands/mcp.ts — `coord mcp` CLI wrapper.
+// commands/mcp.ts — `st mcp` CLI wrapper.
 //
 // Lazy-imports the heavy `@modelcontextprotocol/sdk` deps inside the
-// function body so `coord send` / `ls` / `read` etc. don't pay the
+// function body so `st send` / `ls` / `read` etc. don't pay the
 // startup cost. Every MCP-related symbol is reachable only via this
 // command's call path.
 
 import { invokedName, type CliContext } from '../cli-context.ts';
 import {
   canonicalServerName,
-  coordRootFrom,
+  stRootFrom,
   ensureIdentityDirs,
   envAgentFrom,
   invokedAsFrom,
@@ -39,14 +39,14 @@ export async function cmdMcpCli(
         ctx.stderr(
           `usage: ${name} mcp [--channel]\n\n` +
             `  Run the MCP server over stdio. Reads $ST_AGENT (or\n` +
-            '  legacy $ST_IDENTITY / $COORD_IDENTITY) from the environment.\n' +
-            '  If none are set, falls back to a throwaway `anon-<rand6>`\n' +
-            `  identity so the server still starts under MCP hosts that\n` +
-            `  spawn \`${name} mcp\` without identity env (Codex, etc.). The\n` +
+            '  legacy $ST_IDENTITY) from the environment. If none is\n' +
+            `  set, falls back to a throwaway 'anon-<rand6>' identity\n` +
+            `  so the server still starts under MCP hosts that spawn\n` +
+            `  \`${name} mcp\` without identity env (Codex, etc.). The\n` +
             '  fallback is loud — one stderr line names the throwaway id\n' +
-            '  and points at ST_AGENT for persistence. $ST_ROOT (or\n' +
-            `  $COORD_ROOT) defaults to ~/.local/state/smalltalk, same as\n` +
-            `  every other ${name} verb. Intended to be invoked by an MCP\n` +
+            '  and points at ST_AGENT for persistence. $ST_ROOT\n' +
+            '  defaults to ~/.local/state/smalltalk, same as every other\n' +
+            `  ${name} verb. Intended to be invoked by an MCP\n` +
             '  host (Claude Code, Codex, Pi).\n\n' +
             '  --channel   Enable Claude Code channel mode: advertise the\n' +
             '              experimental.claude/channel capability, watch the\n' +
@@ -64,17 +64,17 @@ export async function cmdMcpCli(
     throw new Error(`unknown flag: ${a}`);
   }
 
-  // `st mcp` / `coord mcp` follows the env contract every other verb
-  // uses: ST_ROOT > COORD_ROOT > default state path via coordRootFrom();
+  // `st mcp` / `st mcp` follows the env contract every other verb
+  // uses: ST_ROOT > COORD_ROOT > default state path via stRootFrom();
   // ST_AGENT > ST_IDENTITY (warn) > COORD_IDENTITY (warn).
   //
   // When none of those are set, the previous behavior was a hard exit.
-  // That broke any MCP host that spawned `coord mcp` without an env
+  // That broke any MCP host that spawned `st mcp` without an env
   // identity (Codex hit this in poc-server). Per Nathan's call, we
   // now fall back to a throwaway `anon-<rand6>` identity with a
   // single stderr warning — "so we don't just not work." Managed
   // hosts that DO set an identity are unaffected.
-  const root = coordRootFrom(ctx.env);
+  const root = stRootFrom(ctx.env);
   let identity = envAgentFrom(ctx.env);
   if (!identity) {
     identity = generateAnonAgent();
@@ -92,18 +92,18 @@ export async function cmdMcpCli(
   }
 
   // Lazy-import: the @modelcontextprotocol/sdk + zod dep cost is paid
-  // only when `coord mcp` is actually invoked.
+  // only when `st mcp` is actually invoked.
   const { createMcpServer } = await import('../mcp/index.ts');
   const { asAgent } = await import('../types.ts');
 
   const serverName = canonicalServerName(invokedAsFrom(ctx.env));
 
-  // brief-020: opt-in stderr instrumentation for the channel watcher.
+  // Opt-in stderr instrumentation for the channel watcher.
   // Off by default (idle agents' stderr stays quiet); flip via
-  // COORD_CHANNEL_DEBUG=1 in the MCP wiring env when diagnosing a
+  // ST_CHANNEL_DEBUG=1 in the MCP wiring env when diagnosing a
   // wedge. Only the flag needs to plumb through — the actual log
   // lines are emitted from channel-watcher.ts.
-  const channelDebug = ctx.env.COORD_CHANNEL_DEBUG === '1';
+  const channelDebug = ctx.env.ST_CHANNEL_DEBUG === '1';
 
   const handle = createMcpServer({
     root,

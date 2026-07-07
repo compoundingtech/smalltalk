@@ -1,4 +1,4 @@
-// commands/archive.ts — `coord archive [<id>] <filename>` and `coord archive trim ...`
+// commands/archive.ts — `st archive [<id>] <filename>` and `st archive trim ...`
 
 import { existsSync, readFileSync, readdirSync, renameSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
@@ -36,7 +36,7 @@ export interface ArchiveInput {
    */
   withAttachments?: boolean;
   env: NodeJS.ProcessEnv;
-  coordRoot: string;
+  stRoot: string;
 }
 
 export type ArchiveOutcome =
@@ -69,15 +69,15 @@ export function cmdArchive(input: ArchiveInput): ArchiveResult {
   const recipient = resolveIdentity({
     explicit: input.recipient,
     env: input.env,
-    coordRoot: input.coordRoot,
+    stRoot: input.stRoot,
   });
   if (!validDeliverableFilename(input.filename)) {
     throw new InvalidFilenameError(input.filename);
   }
   const isOutside = !validFilename(input.filename);
 
-  const inbox = inboxDir(recipient, input.coordRoot);
-  const archive = archiveDir(recipient, input.coordRoot);
+  const inbox = inboxDir(recipient, input.stRoot);
+  const archive = archiveDir(recipient, input.stRoot);
   const ipath = join(inbox, input.filename);
   const apath = join(archive, input.filename);
   // Outside .md files have no LAYOUT prefix — no siblings to sweep.
@@ -146,7 +146,7 @@ export function cmdArchive(input: ArchiveInput): ArchiveResult {
     // Case 1: not in either folder.
     throw new MessageNotFoundError(recipient, input.filename);
   } else {
-    ensureIdentityDirs(recipient, input.coordRoot);
+    ensureIdentityDirs(recipient, input.stRoot);
     if (existsSync(apath)) {
       // Case 2 — byte-identical already validated upstream.
       rmSync(ipath);
@@ -201,7 +201,7 @@ function idempotentOutcome(): ArchiveOutcome {
  * Single-positional disambiguation: the `.md` suffix wins (identity
  * names can't contain `.` per LAYOUT-004). Pre-brief-017a this used
  * the strict `validFilename` grammar, which mis-parsed
- * `coord message archive nope.md` as an identity and bailed with
+ * `st message archive nope.md` as an identity and bailed with
  * the misleading "<filename> required" message.
  */
 export function splitArchivePositionals(
@@ -234,14 +234,14 @@ export interface ArchiveTrimInput {
   dryRun?: boolean;
   /**
    * Issue #8: when true, also delete prefix-sibling attachments of each
-   * trimmed `.md` — symmetric with `coord message archive
+   * trimmed `.md` — symmetric with `st message archive
    * --with-attachments`. Default false matches the LAYOUT-004 "coord
    * owns only the .md" semantic.
    */
   withAttachments?: boolean;
 
   env: NodeJS.ProcessEnv;
-  coordRoot: string;
+  stRoot: string;
   /** Override now() for testability. Defaults to {@link msNow}. */
   now?: () => number;
 }
@@ -266,7 +266,7 @@ export function cmdArchiveTrim(input: ArchiveTrimInput): ArchiveTrimResult {
   const recipient = resolveIdentity({
     explicit: input.recipient,
     env: input.env,
-    coordRoot: input.coordRoot,
+    stRoot: input.stRoot,
   });
 
   if (input.olderThan === undefined && input.keepLast === undefined) {
@@ -282,7 +282,7 @@ export function cmdArchiveTrim(input: ArchiveTrimInput): ArchiveTrimResult {
     }
   }
 
-  const adir = archiveDir(recipient, input.coordRoot);
+  const adir = archiveDir(recipient, input.stRoot);
   const dryRun = input.dryRun === true;
 
   let entries: string[];
@@ -423,7 +423,7 @@ export function cmdArchiveCli(
     filename,
     withAttachments,
     env: ctx.env,
-    coordRoot: ctx.coordRoot,
+    stRoot: ctx.stRoot,
   });
   ctx.stderr(`${r.outcome.message}\n`);
   if (r.attachments !== undefined && r.attachments.length > 0) {
@@ -481,7 +481,7 @@ function cmdArchiveTrimCli(args: readonly string[], ctx: CliContext): number {
     dryRun,
     withAttachments,
     env: ctx.env,
-    coordRoot: ctx.coordRoot,
+    stRoot: ctx.stRoot,
   });
   for (const f of r.victims) ctx.stdout(`${f}\n`);
   if (r.attachments !== undefined) {

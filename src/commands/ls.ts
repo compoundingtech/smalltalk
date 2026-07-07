@@ -27,7 +27,7 @@ export interface LsInput {
   /**
    * When true, populate {@link LsResult.items} with parsed frontmatter
    * for each match. Off by default to preserve the cheap filename-only
-   * path that `coord ls` and `coord watch` rely on.
+   * path that `st ls` and `st watch` rely on.
    */
   withMeta?: boolean;
   /**
@@ -40,7 +40,7 @@ export interface LsInput {
   orphans?: boolean;
 
   env: NodeJS.ProcessEnv;
-  coordRoot: string;
+  stRoot: string;
 }
 
 export interface LsItem {
@@ -136,13 +136,13 @@ export function cmdLs(input: LsInput): LsResult {
   const recipient = resolveIdentity({
     explicit: input.recipient,
     env: input.env,
-    coordRoot: input.coordRoot,
+    stRoot: input.stRoot,
     ...(input.recipient ? { policy: 'lenient' as const } : {}),
   });
   const archive = input.archive === true;
   const dir = archive
-    ? archiveDir(recipient, input.coordRoot)
-    : inboxDir(recipient, input.coordRoot);
+    ? archiveDir(recipient, input.stRoot)
+    : inboxDir(recipient, input.stRoot);
   const label = archive ? 'archive' : 'inbox';
 
   if (!existsSync(dir)) {
@@ -319,7 +319,7 @@ export function cmdLsCli(args: readonly string[], ctx: CliContext): number {
     withMeta: json && !orphans,
     orphans,
     env: ctx.env,
-    coordRoot: ctx.coordRoot,
+    stRoot: ctx.stRoot,
   });
   if (count) {
     ctx.stdout(`${r.matches.length}\n`);

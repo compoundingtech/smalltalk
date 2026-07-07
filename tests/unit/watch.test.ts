@@ -19,20 +19,20 @@ import {
 } from '../../src/commands/watch.ts';
 
 let scratch: string;
-let coordRoot: string;
+let stRoot: string;
 
 beforeEach(() => {
   scratch = mkdtempSync(join(tmpdir(), 'coord-watch-test-'));
-  coordRoot = join(scratch, 'coord');
-  mkdirSync(coordRoot, { recursive: true });
+  stRoot = join(scratch, 'coord');
+  mkdirSync(stRoot, { recursive: true });
 });
 afterEach(() => {
   rmSync(scratch, { recursive: true, force: true });
 });
 
 function setupIdentity(id: string): void {
-  mkdirSync(join(coordRoot, id, 'inbox'), { recursive: true });
-  mkdirSync(join(coordRoot, id, 'archive'), { recursive: true });
+  mkdirSync(join(stRoot, id, 'inbox'), { recursive: true });
+  mkdirSync(join(stRoot, id, 'archive'), { recursive: true });
 }
 
 function writeMsg(
@@ -41,7 +41,7 @@ function writeMsg(
   subject = 'sub'
 ): void {
   writeFileSync(
-    join(coordRoot, to, 'inbox', filename),
+    join(stRoot, to, 'inbox', filename),
     `---\nfrom: alice\nsubject: ${subject}\n---\nbody\n`
   );
 }
@@ -49,7 +49,7 @@ function writeMsg(
 function input(overrides: Partial<WatchInput> = {}): WatchInput {
   return {
     env: {} as NodeJS.ProcessEnv,
-    coordRoot,
+    stRoot,
     ...overrides,
   };
 }
@@ -104,10 +104,10 @@ describe('resolveWatchSetup — per-identity mode', () => {
 });
 
 describe('resolveWatchSetup — default mode (brief-017a)', () => {
-  it('no recipient, no --all → singleId = $COORD_IDENTITY (own inbox)', () => {
+  it('no recipient, no --all → singleId = $ST_AGENT (own inbox)', () => {
     setupIdentity('bob');
     const r = resolveWatchSetup(
-      input({ env: { COORD_IDENTITY: 'bob' } as NodeJS.ProcessEnv })
+      input({ env: { ST_AGENT: 'bob' } as NodeJS.ProcessEnv })
     );
     expect(r.setup.singleId).toBe('bob');
     expect(r.setup.suppressId).toBeUndefined();
@@ -118,7 +118,7 @@ describe('resolveWatchSetup — default mode (brief-017a)', () => {
     const r = resolveWatchSetup(
       input({
         fromExplicit: 'alice',
-        env: { COORD_IDENTITY: 'bob' } as NodeJS.ProcessEnv,
+        env: { ST_AGENT: 'bob' } as NodeJS.ProcessEnv,
       })
     );
     expect(r.setup.singleId).toBe('alice');
@@ -126,7 +126,7 @@ describe('resolveWatchSetup — default mode (brief-017a)', () => {
 
   it('errors with the standard identity-required message when neither is set', () => {
     expect(() => resolveWatchSetup(input())).toThrowError(
-      /COORD_IDENTITY/
+      /ST_AGENT/
     );
   });
 });
@@ -139,17 +139,17 @@ describe('resolveWatchSetup — --all (cross-tree)', () => {
     expect(r.setup.suppressId).toBe('bob');
   });
 
-  it('--all falls back to $COORD_IDENTITY for the suppression id', () => {
+  it('--all falls back to $ST_AGENT for the suppression id', () => {
     setupIdentity('bob');
     const r = resolveWatchSetup(
-      input({ all: true, env: { COORD_IDENTITY: 'bob' } as NodeJS.ProcessEnv })
+      input({ all: true, env: { ST_AGENT: 'bob' } as NodeJS.ProcessEnv })
     );
     expect(r.setup.suppressId).toBe('bob');
   });
 
-  it('--all errors when neither --from nor $COORD_IDENTITY is set', () => {
+  it('--all errors when neither --from nor $ST_AGENT is set', () => {
     expect(() => resolveWatchSetup(input({ all: true }))).toThrowError(
-      /identity required to determine which folder to suppress — set COORD_IDENTITY/
+      /identity required to determine which folder to suppress — set \$ST_AGENT/
     );
   });
 
@@ -193,9 +193,9 @@ describe('watchTargetDirs — per-identity', () => {
     const dirs = watchTargetDirs({
       singleId: 'bob',
       cutoff: 0,
-      coordRoot,
+      stRoot,
     });
-    expect(dirs).toEqual([join(coordRoot, 'bob', 'inbox')]);
+    expect(dirs).toEqual([join(stRoot, 'bob', 'inbox')]);
   });
 });
 
@@ -203,24 +203,24 @@ describe('watchTargetDirs — cross-tree', () => {
   it('returns all valid-identity inboxes EXCEPT the suppressed one', () => {
     setupIdentity('bob');
     setupIdentity('alice');
-    setupIdentity('myobie');
+    setupIdentity('operator');
     const dirs = watchTargetDirs({
       suppressId: 'bob',
       cutoff: 0,
-      coordRoot,
+      stRoot,
     });
     const names = dirs.map((d) => join(d, '..').split('/').pop()).sort();
-    expect(names).toEqual(['alice', 'myobie']);
+    expect(names).toEqual(['alice', 'operator']);
   });
 
   it('skips folders whose name fails valid_identity (e.g. uppercase)', () => {
     setupIdentity('bob');
-    mkdirSync(join(coordRoot, 'BAD', 'inbox'), { recursive: true });
-    mkdirSync(join(coordRoot, 'BAD', 'archive'), { recursive: true });
+    mkdirSync(join(stRoot, 'BAD', 'inbox'), { recursive: true });
+    mkdirSync(join(stRoot, 'BAD', 'archive'), { recursive: true });
     const dirs = watchTargetDirs({
       suppressId: 'bob',
       cutoff: 0,
-      coordRoot,
+      stRoot,
     });
     expect(dirs).toEqual([]);
   });
@@ -230,7 +230,7 @@ describe('watchTargetDirs — cross-tree', () => {
     const dirs = watchTargetDirs({
       suppressId: 'bob',
       cutoff: 0,
-      coordRoot,
+      stRoot,
     });
     expect(dirs).toEqual([]);
   });
@@ -243,7 +243,7 @@ describe('watchReplay — per-identity', () => {
     setupIdentity('bob');
     writeMsg('bob', '1714826789010-aaaaaa.md');
     writeMsg('bob', '1714826789020-bbbbbb.md');
-    const r = watchReplay({ singleId: 'bob', cutoff: 0, coordRoot });
+    const r = watchReplay({ singleId: 'bob', cutoff: 0, stRoot });
     expect(r.lines.map((l) => l.filename)).toEqual([
       '1714826789010-aaaaaa.md',
       '1714826789020-bbbbbb.md',
@@ -259,7 +259,7 @@ describe('watchReplay — per-identity', () => {
     const r = watchReplay({
       singleId: 'bob',
       cutoff: 1714826789020,
-      coordRoot,
+      stRoot,
     });
     expect(r.lines.map((l) => l.filename)).toEqual([
       '1714826789020-bbbbbb.md',
@@ -275,7 +275,7 @@ describe('watchReplay — per-identity', () => {
     const r = watchReplay({
       singleId: 'bob',
       cutoff: 9_999_999_999_999,
-      coordRoot,
+      stRoot,
     });
     expect(r.lines).toEqual([]);
     expect(r.seen.has('1714826789010-aaaaaa.md')).toBe(true);
@@ -284,9 +284,9 @@ describe('watchReplay — per-identity', () => {
   it('skips files that fail filename grammar', () => {
     setupIdentity('bob');
     writeMsg('bob', '1714826789010-aaaaaa.md');
-    writeFileSync(join(coordRoot, 'bob', 'inbox', 'README'), 'x');
-    writeFileSync(join(coordRoot, 'bob', 'inbox', 'notes.md'), 'x');
-    const r = watchReplay({ singleId: 'bob', cutoff: 0, coordRoot });
+    writeFileSync(join(stRoot, 'bob', 'inbox', 'README'), 'x');
+    writeFileSync(join(stRoot, 'bob', 'inbox', 'notes.md'), 'x');
+    const r = watchReplay({ singleId: 'bob', cutoff: 0, stRoot });
     expect(r.lines.map((l) => l.filename)).toEqual([
       '1714826789010-aaaaaa.md',
     ]);
@@ -298,7 +298,7 @@ describe('watchReplay — per-identity', () => {
     const r = watchReplay({
       singleId: 'bob',
       cutoff: 0,
-      coordRoot,
+      stRoot,
       withSubject: true,
     });
     expect(r.lines).toEqual([
@@ -313,13 +313,13 @@ describe('watchReplay — per-identity', () => {
   it('--with-subject for files without frontmatter → empty subject', () => {
     setupIdentity('bob');
     writeFileSync(
-      join(coordRoot, 'bob', 'inbox', '1714826789010-aaaaaa.md'),
+      join(stRoot, 'bob', 'inbox', '1714826789010-aaaaaa.md'),
       'no frontmatter\n'
     );
     const r = watchReplay({
       singleId: 'bob',
       cutoff: 0,
-      coordRoot,
+      stRoot,
       withSubject: true,
     });
     expect(r.lines).toEqual([
@@ -332,14 +332,14 @@ describe('watchReplay — cross-tree', () => {
   it('emits files from EVERY non-suppressed inbox', () => {
     setupIdentity('bob');
     setupIdentity('alice');
-    setupIdentity('myobie');
+    setupIdentity('operator');
     writeMsg('alice', '1714826789010-aaaaaa.md');
-    writeMsg('myobie', '1714826789020-bbbbbb.md');
+    writeMsg('operator', '1714826789020-bbbbbb.md');
     writeMsg('bob', '1714826789030-cccccc.md');
     const r = watchReplay({
       suppressId: 'bob',
       cutoff: 0,
-      coordRoot,
+      stRoot,
     });
     const names = r.lines.map((l) => l.filename).sort();
     expect(names).toEqual([
@@ -357,7 +357,7 @@ describe('watchPoll', () => {
     writeMsg('bob', '1714826789010-aaaaaa.md');
     const seen = new Set(['1714826789010-aaaaaa.md']);
     const r = watchPoll(
-      { singleId: 'bob', cutoff: 0, coordRoot },
+      { singleId: 'bob', cutoff: 0, stRoot },
       seen
     );
     expect(r.lines).toEqual([]);
@@ -369,14 +369,14 @@ describe('watchPoll', () => {
     const replay = watchReplay({
       singleId: 'bob',
       cutoff: 0,
-      coordRoot,
+      stRoot,
     });
     expect(replay.lines).toHaveLength(1);
 
     // Now a new file arrives.
     writeMsg('bob', '1714826789020-bbbbbb.md');
     const r = watchPoll(
-      { singleId: 'bob', cutoff: 0, coordRoot },
+      { singleId: 'bob', cutoff: 0, stRoot },
       replay.seen
     );
     expect(r.lines.map((l) => l.filename)).toEqual([
@@ -389,12 +389,12 @@ describe('watchPoll', () => {
     const seen = new Set<string>();
     writeMsg('bob', '1714826789010-aaaaaa.md');
     const r1 = watchPoll(
-      { singleId: 'bob', cutoff: 0, coordRoot },
+      { singleId: 'bob', cutoff: 0, stRoot },
       seen
     );
     expect(r1.lines).toHaveLength(1);
     const r2 = watchPoll(
-      { singleId: 'bob', cutoff: 0, coordRoot },
+      { singleId: 'bob', cutoff: 0, stRoot },
       seen
     );
     expect(r2.lines).toEqual([]);
@@ -406,18 +406,18 @@ describe('watchPoll', () => {
     const seen = new Set<string>();
     writeMsg('alice', '1714826789010-aaaaaa.md');
     const r1 = watchPoll(
-      { suppressId: 'bob', cutoff: 0, coordRoot },
+      { suppressId: 'bob', cutoff: 0, stRoot },
       seen
     );
     expect(r1.lines.map((l) => l.filename)).toEqual([
       '1714826789010-aaaaaa.md',
     ]);
 
-    // myobie's folder appears AFTER replay started.
-    setupIdentity('myobie');
-    writeMsg('myobie', '1714826789020-bbbbbb.md');
+    // operator's folder appears AFTER replay started.
+    setupIdentity('operator');
+    writeMsg('operator', '1714826789020-bbbbbb.md');
     const r2 = watchPoll(
-      { suppressId: 'bob', cutoff: 0, coordRoot },
+      { suppressId: 'bob', cutoff: 0, stRoot },
       seen
     );
     expect(r2.lines.map((l) => l.filename)).toEqual([
@@ -431,18 +431,18 @@ describe('watchPoll', () => {
     const replay = watchReplay({
       singleId: 'bob',
       cutoff: 0,
-      coordRoot,
+      stRoot,
     });
     expect(replay.lines).toHaveLength(1);
 
     // Move the file to archive (not a new inbox arrival).
     const fs = require('node:fs') as typeof import('node:fs');
     fs.renameSync(
-      join(coordRoot, 'bob', 'inbox', '1714826789010-aaaaaa.md'),
-      join(coordRoot, 'bob', 'archive', '1714826789010-aaaaaa.md')
+      join(stRoot, 'bob', 'inbox', '1714826789010-aaaaaa.md'),
+      join(stRoot, 'bob', 'archive', '1714826789010-aaaaaa.md')
     );
     const r = watchPoll(
-      { singleId: 'bob', cutoff: 0, coordRoot },
+      { singleId: 'bob', cutoff: 0, stRoot },
       replay.seen
     );
     expect(r.lines).toEqual([]);
@@ -453,11 +453,11 @@ describe('watchPoll', () => {
     const replay = watchReplay({
       singleId: 'bob',
       cutoff: 0,
-      coordRoot,
+      stRoot,
     });
-    writeFileSync(join(coordRoot, 'bob', 'status'), 'busy\n');
+    writeFileSync(join(stRoot, 'bob', 'status'), 'busy\n');
     const r = watchPoll(
-      { singleId: 'bob', cutoff: 0, coordRoot },
+      { singleId: 'bob', cutoff: 0, stRoot },
       replay.seen
     );
     expect(r.lines).toEqual([]);

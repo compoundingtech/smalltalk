@@ -29,12 +29,12 @@ import { createMcpServer } from '../../../src/mcp/index.ts';
 import { asIdentity } from '../../../src/types.ts';
 
 let scratch: string;
-let coordRoot: string;
+let stRoot: string;
 let statusFile: string;
 
 function makeHandle(opts: { refreshMs?: number } = {}) {
   return createMcpServer({
-    root: coordRoot,
+    root: stRoot,
     identity: asIdentity('alice'),
     ...(opts.refreshMs !== undefined && {
       statusRefreshIntervalMs: opts.refreshMs,
@@ -62,9 +62,9 @@ async function wait(ms: number): Promise<void> {
 
 beforeEach(() => {
   scratch = mkdtempSync(join(tmpdir(), 'coord-status-refresh-'));
-  coordRoot = join(scratch, 'coord');
-  mkdirSync(join(coordRoot, 'alice'), { recursive: true });
-  statusFile = join(coordRoot, 'alice', 'status');
+  stRoot = join(scratch, 'coord');
+  mkdirSync(join(stRoot, 'alice'), { recursive: true });
+  statusFile = join(stRoot, 'alice', 'status');
 });
 
 afterEach(() => {

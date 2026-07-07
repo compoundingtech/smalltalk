@@ -1,4 +1,4 @@
-// tests/unit/overview.test.ts — `coord overview` synthesized dashboard.
+// tests/unit/overview.test.ts — `st overview` synthesized dashboard.
 
 import {
   mkdirSync,
@@ -14,24 +14,24 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { cmdOverview } from '../../src/commands/overview.ts';
 
 let scratch: string;
-let coordRoot: string;
+let stRoot: string;
 
 beforeEach(() => {
   scratch = mkdtempSync(join(tmpdir(), 'coord-overview-test-'));
-  coordRoot = join(scratch, 'coord');
-  mkdirSync(coordRoot, { recursive: true });
+  stRoot = join(scratch, 'coord');
+  mkdirSync(stRoot, { recursive: true });
 });
 afterEach(() => {
   rmSync(scratch, { recursive: true, force: true });
 });
 
 function setupIdentity(id: string): void {
-  mkdirSync(join(coordRoot, id, 'inbox'), { recursive: true });
-  mkdirSync(join(coordRoot, id, 'archive'), { recursive: true });
+  mkdirSync(join(stRoot, id, 'inbox'), { recursive: true });
+  mkdirSync(join(stRoot, id, 'archive'), { recursive: true });
 }
 
 function envFor(id: string): NodeJS.ProcessEnv {
-  return { COORD_IDENTITY: id } as NodeJS.ProcessEnv;
+  return { ST_AGENT: id } as NodeJS.ProcessEnv;
 }
 
 function plantInbox(
@@ -44,7 +44,7 @@ function plantInbox(
   let head = `---\nfrom: ${from}\n`;
   if (subject !== undefined) head += `subject: ${subject}\n`;
   head += '---\n';
-  const path = join(coordRoot, recipient, 'inbox', filename);
+  const path = join(stRoot, recipient, 'inbox', filename);
   writeFileSync(path, head + 'body\n');
   if (mtimeSec !== undefined) utimesSync(path, mtimeSec, mtimeSec);
 }
@@ -52,20 +52,20 @@ function plantInbox(
 // ─── Basic shape ────────────────────────────────────────────────────────
 
 describe('cmdOverview — shape', () => {
-  it('empty $COORD_ROOT just contains the self identity → empty inbox + no members other than self + no recent', () => {
-    setupIdentity('myobie');
-    const r = cmdOverview({ env: envFor('myobie'), coordRoot });
-    expect(r.identity).toBe('myobie');
+  it('empty $ST_ROOT just contains the self identity → empty inbox + no members other than self + no recent', () => {
+    setupIdentity('operator');
+    const r = cmdOverview({ env: envFor('operator'), stRoot });
+    expect(r.identity).toBe('operator');
     expect(r.inbox.unread).toBe(0);
     expect(r.inbox.oldest).toBeNull();
-    expect(r.members.map((m) => m.identity)).toEqual(['myobie']);
+    expect(r.members.map((m) => m.identity)).toEqual(['operator']);
     expect(r.recent).toEqual([]);
   });
 
   it('JSON shape covers every documented field', () => {
-    setupIdentity('myobie');
+    setupIdentity('operator');
     setupIdentity('alice');
-    const r = cmdOverview({ env: envFor('myobie'), coordRoot });
+    const r = cmdOverview({ env: envFor('operator'), stRoot });
     expect(typeof r.identity).toBe('string');
     expect(typeof r.inbox.unread).toBe('number');
     expect(Array.isArray(r.members)).toBe(true);
@@ -82,33 +82,33 @@ describe('cmdOverview — shape', () => {
 // ─── Inbox summary ──────────────────────────────────────────────────────
 
 describe('cmdOverview — inbox summary', () => {
-  it('counts unread matches `coord ls --count` semantics (valid filenames only)', () => {
-    setupIdentity('myobie');
-    plantInbox('myobie', '1714826789010-aaaaaa.md', 'alice', 'q1');
-    plantInbox('myobie', '1714826789020-bbbbbb.md', 'bob', 'q2');
-    writeFileSync(join(coordRoot, 'myobie', 'inbox', 'noise.md'), 'x');
-    const r = cmdOverview({ env: envFor('myobie'), coordRoot });
+  it('counts unread matches `st ls --count` semantics (valid filenames only)', () => {
+    setupIdentity('operator');
+    plantInbox('operator', '1714826789010-aaaaaa.md', 'alice', 'q1');
+    plantInbox('operator', '1714826789020-bbbbbb.md', 'bob', 'q2');
+    writeFileSync(join(stRoot, 'operator', 'inbox', 'noise.md'), 'x');
+    const r = cmdOverview({ env: envFor('operator'), stRoot });
     expect(r.inbox.unread).toBe(2);
   });
 
   it('oldest item carries filename + from + subject + ageMs (chronological by filename)', () => {
-    setupIdentity('myobie');
+    setupIdentity('operator');
     plantInbox(
-      'myobie',
+      'operator',
       '1714826789010-aaaaaa.md',
       'alice',
       'first question'
     );
     plantInbox(
-      'myobie',
+      'operator',
       '1714826789020-bbbbbb.md',
       'bob',
       'second question'
     );
     const fixedNow = 1714826800000;
     const r = cmdOverview({
-      env: envFor('myobie'),
-      coordRoot,
+      env: envFor('operator'),
+      stRoot,
       now: () => fixedNow,
     });
     expect(r.inbox.oldest).toEqual({
@@ -120,19 +120,19 @@ describe('cmdOverview — inbox summary', () => {
   });
 
   it('inbox.oldest is null when no valid files', () => {
-    setupIdentity('myobie');
-    writeFileSync(join(coordRoot, 'myobie', 'inbox', 'noise.md'), 'x');
-    const r = cmdOverview({ env: envFor('myobie'), coordRoot });
+    setupIdentity('operator');
+    writeFileSync(join(stRoot, 'operator', 'inbox', 'noise.md'), 'x');
+    const r = cmdOverview({ env: envFor('operator'), stRoot });
     expect(r.inbox.oldest).toBeNull();
   });
 
   it('inbox.oldest from-frontmatter missing → "unknown"', () => {
-    setupIdentity('myobie');
+    setupIdentity('operator');
     writeFileSync(
-      join(coordRoot, 'myobie', 'inbox', '1714826789010-aaaaaa.md'),
+      join(stRoot, 'operator', 'inbox', '1714826789010-aaaaaa.md'),
       'no fence here\n'
     );
-    const r = cmdOverview({ env: envFor('myobie'), coordRoot });
+    const r = cmdOverview({ env: envFor('operator'), stRoot });
     expect(r.inbox.oldest?.from).toBe('unknown');
   });
 });
@@ -140,22 +140,22 @@ describe('cmdOverview — inbox summary', () => {
 // ─── Members section ────────────────────────────────────────────────────
 
 describe('cmdOverview — members section', () => {
-  it('includes every identity under $COORD_ROOT (self + peers)', () => {
-    setupIdentity('myobie');
+  it('includes every identity under $ST_ROOT (self + peers)', () => {
+    setupIdentity('operator');
     setupIdentity('alice');
     setupIdentity('bob');
-    const r = cmdOverview({ env: envFor('myobie'), coordRoot });
+    const r = cmdOverview({ env: envFor('operator'), stRoot });
     expect(r.members.map((m) => m.identity).sort()).toEqual([
       'alice',
       'bob',
-      'myobie',
+      'operator',
     ]);
   });
 
   it('member with no status file reports offline', () => {
-    setupIdentity('myobie');
+    setupIdentity('operator');
     setupIdentity('alice');
-    const r = cmdOverview({ env: envFor('myobie'), coordRoot });
+    const r = cmdOverview({ env: envFor('operator'), stRoot });
     expect(r.members.find((m) => m.identity === 'alice')?.status).toBe(
       'offline'
     );
@@ -167,19 +167,19 @@ describe('cmdOverview — members section', () => {
 
 describe('cmdOverview — recent activity', () => {
   it('returns the top N entries sorted by mtime desc', () => {
-    setupIdentity('myobie');
+    setupIdentity('operator');
     setupIdentity('alice');
     // Plant five inbox files at strictly-increasing mtimes.
     for (let i = 1; i <= 5; i++) {
       const fn = `${1000 + i}000000000-zzzzz${i}.md`;
-      const path = join(coordRoot, 'myobie', 'inbox', fn);
+      const path = join(stRoot, 'operator', 'inbox', fn);
       writeFileSync(path, `---\nfrom: alice\n---\nb${i}\n`);
       utimesSync(path, i * 1000, i * 1000);
     }
     const r = cmdOverview({
-      env: envFor('myobie'),
+      env: envFor('operator'),
       recent: 3,
-      coordRoot,
+      stRoot,
       now: () => 10_000_000,
     });
     expect(r.recent).toHaveLength(3);
@@ -190,15 +190,15 @@ describe('cmdOverview — recent activity', () => {
   });
 
   it('tags entries with the right kind: message / archive / status', () => {
-    setupIdentity('myobie');
+    setupIdentity('operator');
     setupIdentity('alice');
-    plantInbox('myobie', '1714826789010-aaaaaa.md', 'alice', 'm');
+    plantInbox('operator', '1714826789010-aaaaaa.md', 'alice', 'm');
     writeFileSync(
-      join(coordRoot, 'myobie', 'archive', '1714826789020-bbbbbb.md'),
+      join(stRoot, 'operator', 'archive', '1714826789020-bbbbbb.md'),
       '---\nfrom: alice\n---\na\n'
     );
-    writeFileSync(join(coordRoot, 'myobie', 'status'), 'busy\n');
-    const r = cmdOverview({ env: envFor('myobie'), coordRoot });
+    writeFileSync(join(stRoot, 'operator', 'status'), 'busy\n');
+    const r = cmdOverview({ env: envFor('operator'), stRoot });
     const kinds = new Set(r.recent.map((a) => a.kind));
     expect(kinds.has('message')).toBe(true);
     expect(kinds.has('archive')).toBe(true);
@@ -206,25 +206,25 @@ describe('cmdOverview — recent activity', () => {
   });
 
   it('--recent 0 returns an empty recent list', () => {
-    setupIdentity('myobie');
-    plantInbox('myobie', '1714826789010-aaaaaa.md', 'alice', 'x');
+    setupIdentity('operator');
+    plantInbox('operator', '1714826789010-aaaaaa.md', 'alice', 'x');
     const r = cmdOverview({
-      env: envFor('myobie'),
+      env: envFor('operator'),
       recent: 0,
-      coordRoot,
+      stRoot,
     });
     expect(r.recent).toEqual([]);
   });
 
   it('messages carry (sender=identity, recipient=target) + subject', () => {
-    setupIdentity('myobie');
+    setupIdentity('operator');
     setupIdentity('alice');
-    plantInbox('myobie', '1714826789010-aaaaaa.md', 'alice', 'hi');
-    const r = cmdOverview({ env: envFor('myobie'), coordRoot });
+    plantInbox('operator', '1714826789010-aaaaaa.md', 'alice', 'hi');
+    const r = cmdOverview({ env: envFor('operator'), stRoot });
     const msg = r.recent.find((a) => a.kind === 'message');
     expect(msg).toBeDefined();
     expect(msg?.identity).toBe('alice');
-    expect(msg?.target).toBe('myobie');
+    expect(msg?.target).toBe('operator');
     expect(msg?.subject).toBe('hi');
   });
 });

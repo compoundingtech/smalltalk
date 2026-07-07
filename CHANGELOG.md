@@ -6,6 +6,81 @@ minor releases until 1.0.
 
 ## Unreleased
 
+### Changed (coord-kill piece (b) — CLI + env: `bin/coord`, `members`, `coord-` plugin prefix, and `COORD_*` env vars removed)
+
+Post-cutover the CLI surface + env fallbacks are `st_*` only.
+
+- **`bin/coord`** — deleted. `package.json:bin` no longer declares
+  the `coord` entry.
+- **`case 'members':`** CLI alias in `dispatchTop` removed.
+  `st agents` is the sole canonical verb.
+- **`coord-<cmd>`** — dropped from the git-style PATH-plugin scan
+  in `findPlugin`. Only `st-<cmd>` and `smalltalk-<cmd>` prefixes
+  are tried now.
+- **`COORD_ROOT` / `COORD_IDENTITY` / `COORD_CONFIG` /
+  `COORD_CHANNEL_DEBUG`** — no longer honored by any code path.
+  `stRootFrom`, `stConfigFrom`, `envAgentFrom`, `resolveAgent`,
+  and `cmdMcpCli` all read only `ST_*` env vars now. The
+  `ST_IDENTITY → ST_AGENT` legacy alias (a smalltalk-era rename)
+  is preserved with a one-time deprecation warning.
+- **`coordRootFrom` / `coordConfigFrom` / `coordRoot` /
+  `coordConfig`** helpers renamed to `stRootFrom` / `stConfigFrom`
+  / `stRoot` / `stConfig` — ~200 call sites across `src/lib.ts`
+  and every command module. `ResolveAgentOpts.coordRoot` field
+  renamed to `stRoot`. `CliContext.coordRoot` → `stRoot`;
+  `CliContext.coordConfig` → `stConfig`.
+- **`warnCoordFallback`** internal helper renamed to
+  `warnLegacyEnvFallback` (now only covers the
+  `ST_IDENTITY → ST_AGENT` deprecation).
+- **`invokedAsFrom`** now defaults to `'st'` (not `'coord'`); the
+  `InvokedAs` type narrowed from `'coord' | 'st' | 'smalltalk'`
+  to `'st' | 'smalltalk'`. `canonicalServerName` always returns
+  `'st'`; `SERVER_INFO.name` is `'st'`; `buildServerInfo` accepts
+  only `'st'`.
+- **`~/.local/state/coord`** and **`~/.config/coord`** — no longer
+  read as fallbacks. `defaultStateRoot` returns
+  `~/.local/state/smalltalk`; `defaultConfigDir` returns
+  `~/.config/smalltalk`.
+- **`.mcp.json` legacy `coord` key** — no longer read or migrated.
+  `cmdInit` only reads/writes `mcpServers.st`; a pre-cutover file
+  with only a `coord:` entry is treated as absent (the `st` entry
+  gets added; the `coord` entry is left alone).
+- **User-visible verb strings** — bulk-scrubbed across source +
+  hook scripts + tests: `coord ding` → `st ding`, `coord init` →
+  `st init`, `` `coord X` `` in error messages → `` `st X` ``,
+  `<coord-root>` in tool descriptions → `<st-root>`,
+  `<channel source="coord">` phrasing removed from source
+  comments. Codex hooks (`examples/codex/*.sh`) + Claude Code
+  hooks (`examples/claude-code/hooks/*.sh`) rewritten st-only.
+
+Piece (a)'s `EXPECTED_TOOL_NAMES` regression guard extended with
+piece (b)'s reframed alias tests:
+- `env-var resolution (ST_* only)` — regression guards that
+  `$COORD_ROOT`, `$COORD_IDENTITY`, `$COORD_CONFIG` are NOT
+  honored (each individually assertion).
+- `state-dir resolution` — always resolves to
+  `~/.local/state/smalltalk` even when `~/.local/state/coord`
+  exists (regression guard).
+- `bin/coord is REMOVED` — new source-guard regression assertion.
+- `coord-<cmd>` plugin prefix NOT scanned — new regression
+  assertion.
+- `package.json bin` — asserts only `st` + `smalltalk` declared.
+
+Cutover tools (`tools/cutover/rewrite-mcp-json.ts`,
+`tools/cutover/rewrite-pty-toml.ts`, `tools/cutover/sweep.ts`) and
+their tests removed — the migration they were built for is done.
+
+Full suite: 1555 pass (3 skipped integration flakes).
+Pre-push name-hygiene grep: clean.
+
+Regression guard on source-level developer-path leaks in
+`init.ts` broadened from a literal `/Users/<person>` match to a
+generic `/Volumes/`, `/Users/`, and `/home/` catch — any absolute
+developer-machine path fails the check.
+
+Held on `feat/kill-coord-entirely` until the reboot signal
+(Option B).
+
 ### Changed (coord-kill piece (a) — MCP tools registered under `st_*` only; dual-register removed; `members` alias retired)
 
 Post-cutover the MCP tool surface is `st_*` only. The historical

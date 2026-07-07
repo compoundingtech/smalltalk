@@ -11,22 +11,22 @@ import { createMcpServer } from '../../../src/mcp/index.ts';
 import { asIdentity } from '../../../src/types.ts';
 
 let scratch: string;
-let coordRoot: string;
+let stRoot: string;
 let client: Client;
 let handle: ReturnType<typeof createMcpServer>;
 
 function setupIdentity(id: string): void {
-  mkdirSync(join(coordRoot, id, 'inbox'), { recursive: true });
-  mkdirSync(join(coordRoot, id, 'archive'), { recursive: true });
+  mkdirSync(join(stRoot, id, 'inbox'), { recursive: true });
+  mkdirSync(join(stRoot, id, 'archive'), { recursive: true });
 }
 
 function setStatus(id: string, status: string): void {
-  writeFileSync(join(coordRoot, id, 'status'), `${status}\n`);
+  writeFileSync(join(stRoot, id, 'status'), `${status}\n`);
 }
 
 async function boot(identity = 'alice'): Promise<void> {
   handle = createMcpServer({
-    root: coordRoot,
+    root: stRoot,
     identity: asIdentity(identity),
   });
   client = new Client({ name: 'test-members', version: '1.0' });
@@ -36,7 +36,7 @@ async function boot(identity = 'alice'): Promise<void> {
 
 beforeEach(() => {
   scratch = mkdtempSync(join(tmpdir(), 'coord-mcp-members-'));
-  coordRoot = join(scratch, 'coord');
+  stRoot = join(scratch, 'coord');
 });
 
 afterEach(async () => {
@@ -165,7 +165,7 @@ describe('st_agents — happy paths', () => {
     setupIdentity('bob');
     // Drop a valid-grammar inbox file under bob so inbox count is 1.
     writeFileSync(
-      join(coordRoot, 'bob', 'inbox', '1714826789010-aaaaaa.md'),
+      join(stRoot, 'bob', 'inbox', '1714826789010-aaaaaa.md'),
       '---\nfrom: alice\n---\nhi bob\n'
     );
     await boot();
@@ -181,9 +181,9 @@ describe('st_agents — happy paths', () => {
     expect(typeof bob?.lastActivity).toBe('number');
   });
 
-  it('empty $COORD_ROOT → returns []', async () => {
-    // boot without setupIdentity — coordRoot has no identities at all.
-    mkdirSync(coordRoot, { recursive: true });
+  it('empty $ST_ROOT → returns []', async () => {
+    // boot without setupIdentity — stRoot has no identities at all.
+    mkdirSync(stRoot, { recursive: true });
     await boot();
     const r = await call();
     expect(r.isError).toBeUndefined();

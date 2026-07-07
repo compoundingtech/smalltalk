@@ -12,19 +12,19 @@ import { errorCode, errorPayload } from "./_helpers.ts";
 import { asIdentity } from '../../../src/types.ts';
 
 let scratch: string;
-let coordRoot: string;
+let stRoot: string;
 let client: Client;
 let handle: ReturnType<typeof createMcpServer>;
 
 beforeEach(async () => {
   scratch = mkdtempSync(join(tmpdir(), 'coord-mcp-ls-'));
-  coordRoot = join(scratch, 'coord');
+  stRoot = join(scratch, 'coord');
   for (const id of ['alice', 'bob']) {
-    mkdirSync(join(coordRoot, id, 'inbox'), { recursive: true });
-    mkdirSync(join(coordRoot, id, 'archive'), { recursive: true });
+    mkdirSync(join(stRoot, id, 'inbox'), { recursive: true });
+    mkdirSync(join(stRoot, id, 'archive'), { recursive: true });
   }
   handle = createMcpServer({
-    root: coordRoot,
+    root: stRoot,
     identity: asIdentity('alice'),
   });
   client = new Client({ name: 'test-ls', version: '1.0' });
@@ -57,7 +57,7 @@ function writeMsg(
   folder: 'inbox' | 'archive' = 'inbox'
 ): void {
   writeFileSync(
-    join(coordRoot, identity, folder, filename),
+    join(stRoot, identity, folder, filename),
     `---\nfrom: ${fromValue}\n---\n${body}\n`
   );
 }
@@ -185,10 +185,10 @@ describe('st_msg_ls — filters', () => {
 
   it('non-.md files (README) are silently skipped; outside .md files are listed (task #128)', async () => {
     writeMsg('alice', '1714826789010-aaaaaa.md', 'bob');
-    writeFileSync(join(coordRoot, 'alice', 'inbox', 'README'), 'x');
-    writeFileSync(join(coordRoot, 'alice', 'inbox', 'notes.md'), 'x');
+    writeFileSync(join(stRoot, 'alice', 'inbox', 'README'), 'x');
+    writeFileSync(join(stRoot, 'alice', 'inbox', 'notes.md'), 'x');
     writeFileSync(
-      join(coordRoot, 'alice', 'inbox', '1714826789020-myobie-aaaaaa.md'),
+      join(stRoot, 'alice', 'inbox', '1714826789020-operator-aaaaaa.md'),
       'legacy'
     );
     const r = await call();
@@ -197,7 +197,7 @@ describe('st_msg_ls — filters', () => {
       expect.arrayContaining([
         '1714826789010-aaaaaa.md',
         'notes.md',
-        '1714826789020-myobie-aaaaaa.md',
+        '1714826789020-operator-aaaaaa.md',
       ])
     );
     expect(r.structuredContent?.matches).toHaveLength(3);
@@ -206,7 +206,7 @@ describe('st_msg_ls — filters', () => {
   it('files with malformed frontmatter are silently excluded by fromFilter', async () => {
     writeMsg('alice', '1714826789010-aaaaaa.md', 'bob');
     writeFileSync(
-      join(coordRoot, 'alice', 'inbox', '1714826789020-bbbbbb.md'),
+      join(stRoot, 'alice', 'inbox', '1714826789020-bbbbbb.md'),
       'no frontmatter'
     );
     const r = await call({ fromFilter: 'bob' });
@@ -265,12 +265,12 @@ describe('st_msg_ls — no inline presweep', () => {
     // pins the new contract so a regression to inline presweep
     // would fail this assertion.)
     const f = '1714826789010-aaaaaa.md';
-    writeFileSync(join(coordRoot, 'alice', 'inbox', f), 'same');
-    writeFileSync(join(coordRoot, 'alice', 'archive', f), 'same');
+    writeFileSync(join(stRoot, 'alice', 'inbox', f), 'same');
+    writeFileSync(join(stRoot, 'alice', 'archive', f), 'same');
     const r = await call();
     expect(r.structuredContent?.matches).toEqual([f]);
     expect(
-      require('node:fs').existsSync(join(coordRoot, 'alice', 'inbox', f))
+      require('node:fs').existsSync(join(stRoot, 'alice', 'inbox', f))
     ).toBe(true);
   });
 });

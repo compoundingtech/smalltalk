@@ -23,14 +23,14 @@ import { createMcpServer } from '../../../src/mcp/index.ts';
 import { asIdentity } from '../../../src/types.ts';
 
 let scratch: string;
-let coordRoot: string;
+let stRoot: string;
 
 beforeEach(() => {
   scratch = mkdtempSync(join(tmpdir(), 'coord-mcp-channel-'));
-  coordRoot = join(scratch, 'coord');
+  stRoot = join(scratch, 'coord');
   for (const id of ['alice', 'bob']) {
-    mkdirSync(join(coordRoot, id, 'inbox'), { recursive: true });
-    mkdirSync(join(coordRoot, id, 'archive'), { recursive: true });
+    mkdirSync(join(stRoot, id, 'inbox'), { recursive: true });
+    mkdirSync(join(stRoot, id, 'archive'), { recursive: true });
   }
 });
 afterEach(() => {
@@ -42,7 +42,7 @@ async function connect(channel: boolean): Promise<{
   handle: ReturnType<typeof createMcpServer>;
 }> {
   const handle = createMcpServer({
-    root: coordRoot,
+    root: stRoot,
     identity: asIdentity('alice'),
     channel,
   });

@@ -33,7 +33,7 @@ export interface StatusInput {
   /** Present iff the user passed `--set <state>`. */
   setState?: string | undefined;
   env: NodeJS.ProcessEnv;
-  coordRoot: string;
+  stRoot: string;
 }
 
 export type StatusResult =
@@ -51,10 +51,10 @@ export function cmdStatus(input: StatusInput): StatusResult {
   const identity = resolveIdentity({
     explicit: input.recipient,
     env: input.env,
-    coordRoot: input.coordRoot,
+    stRoot: input.stRoot,
     ...(isSet ? { policy: 'lazy-create' as const } : {}),
   });
-  const path = statusPath(identity, input.coordRoot);
+  const path = statusPath(identity, input.stRoot);
 
   if (input.setState === undefined) {
     return { mode: 'get', identity, state: readState(path) };
@@ -102,9 +102,9 @@ function readState(path: string): State {
 
 /**
  * Read `<id>/status` without going through resolveIdentity (which
- * auto-creates folders). Used by `coord members` and `coord overview`
+ * auto-creates folders). Used by `coord members` and `st overview`
  * for passive cross-tree enumeration. Same permissive rules as the
- * `coord status` getter: missing file → `offline`, malformed
+ * `st status` getter: missing file → `offline`, malformed
  * contents → `offline`.
  */
 export function readIdentityStatus(identity: string, root: string): State {
@@ -133,7 +133,7 @@ export type RefreshOutcome =
  * brief-023 + brief-032: re-write an identity's status file to bump
  * mtime so peers don't see them fall into `unknown` (mtime > 15 min
  * stale) while they're still alive. Both the MCP server's
- * 5-min-interval tick AND `coord ding`'s mirror tick call this; same
+ * 5-min-interval tick AND `st ding`'s mirror tick call this; same
  * logic per identity, no matter which surface is running.
  *
  * Rules:
@@ -239,7 +239,7 @@ export function cmdStatusCli(
     ...(recipient !== undefined && { recipient }),
     ...(setState !== undefined && { setState }),
     env: ctx.env,
-    coordRoot: ctx.coordRoot,
+    stRoot: ctx.stRoot,
   });
   if (r.mode === 'get') {
     ctx.stdout(`${r.state}\n`);

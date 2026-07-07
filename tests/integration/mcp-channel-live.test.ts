@@ -1,6 +1,6 @@
 // tests/integration/mcp-channel-live.test.ts — end-to-end channel demo.
 //
-// Spawns a real Claude Code session pointed at `coord mcp --channel`,
+// Spawns a real Claude Code session pointed at `st mcp --channel`,
 // drops a coord message into the agent's inbox, and waits for the
 // agent to call `st_msg_reply` so a reply file lands in the sender's
 // inbox.
@@ -39,7 +39,7 @@ import { COORD_BIN } from './helpers.ts';
 const LIVE = process.env.COORD_RUN_LIVE_CLAUDE === '1';
 
 let scratch: string;
-let coordRoot: string;
+let stRoot: string;
 let homeDir: string;
 let spawnCwd: string;
 let mcpConfigJson: string;
@@ -84,10 +84,10 @@ beforeEach(() => {
   mkdirSync(ptySessionDir, { recursive: true });
 
   scratch = mkdtempSync(join(tmpdir(), 'coord-it-channel-'));
-  coordRoot = join(scratch, 'coord');
+  stRoot = join(scratch, 'coord');
   for (const id of ['alice', 'bob']) {
-    mkdirSync(join(coordRoot, id, 'inbox'), { recursive: true });
-    mkdirSync(join(coordRoot, id, 'archive'), { recursive: true });
+    mkdirSync(join(stRoot, id, 'inbox'), { recursive: true });
+    mkdirSync(join(stRoot, id, 'archive'), { recursive: true });
   }
 
   // We use the developer's real $HOME (not an isolated one) so:
@@ -145,7 +145,7 @@ beforeEach(() => {
 
   // Build the inline MCP config string passed via --mcp-config. This
   // bypasses ~/.claude.json's mcpServers entirely (--strict-mcp-config
-  // means "only these servers"). The COORD_ROOT/COORD_IDENTITY env
+  // means "only these servers"). The ST_ROOT/ST_AGENT env
   // is passed to the coord subprocess via the env array.
   mcpConfigJson = JSON.stringify({
     mcpServers: {
@@ -153,8 +153,8 @@ beforeEach(() => {
         command: COORD_BIN,
         args: ['mcp', '--channel'],
         env: {
-          COORD_ROOT: coordRoot,
-          COORD_IDENTITY: 'bob',
+          ST_ROOT: stRoot,
+          ST_AGENT: 'bob',
         },
       },
     },
@@ -205,7 +205,7 @@ async function pollForReply(
   predicate: (filename: string, parsed: { fm: string; body: string }) => boolean,
   timeoutMs: number
 ): Promise<{ filename: string; fm: string; body: string }> {
-  const dir = join(coordRoot, recipient, 'inbox');
+  const dir = join(stRoot, recipient, 'inbox');
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     if (existsSync(dir)) {
@@ -258,12 +258,12 @@ describe.skipIf(!LIVE)('mcp channel — live Claude Code agent', () => {
             // Session.spawn merges opts.env on top of process.env, so
             // any COORD_/ST_ vars set on the runner leak into the
             // spawned agent's shell. If the agent then shells out to
-            // `coord message ls`, it reads the runner's real inbox
+            // `st message ls`, it reads the runner's real inbox
             // tree instead of the test scratch. Explicitly rebind to
             // the test tree so CLI paths match the MCP paths.
-            COORD_ROOT: coordRoot,
-            ST_ROOT: coordRoot,
-            COORD_IDENTITY: 'bob',
+            ST_ROOT: stRoot,
+            ST_ROOT: stRoot,
+            ST_AGENT: 'bob',
             ST_IDENTITY: 'bob',
             ST_AGENT: 'bob',
           },
@@ -293,7 +293,7 @@ describe.skipIf(!LIVE)('mcp channel — live Claude Code agent', () => {
       // <thread>'s sender" — that's alice.
       const original = '1714826789010-aaaaaa.md';
       writeFileSync(
-        join(coordRoot, 'bob', 'inbox', original),
+        join(stRoot, 'bob', 'inbox', original),
         '---\nfrom: alice\nsubject: math\n---\n' +
           'what is 2+2? Please call the st_msg_reply tool with my message ' +
           'as the thread arg and your answer as the body.\n'
@@ -371,9 +371,9 @@ describe.skipIf(!LIVE)('mcp channel — live Claude Code agent', () => {
             HOME: homeDir,
             PATH: process.env.PATH ?? '',
             PTY_SESSION_DIR: ptySessionDir,
-            COORD_ROOT: coordRoot,
-            ST_ROOT: coordRoot,
-            COORD_IDENTITY: 'bob',
+            ST_ROOT: stRoot,
+            ST_ROOT: stRoot,
+            ST_AGENT: 'bob',
             ST_IDENTITY: 'bob',
             ST_AGENT: 'bob',
           },
@@ -391,7 +391,7 @@ describe.skipIf(!LIVE)('mcp channel — live Claude Code agent', () => {
       // the reply predicate is identical.
       const original = '1714826789011-idlewk.md';
       writeFileSync(
-        join(coordRoot, 'bob', 'inbox', original),
+        join(stRoot, 'bob', 'inbox', original),
         '---\nfrom: alice\nsubject: idle-wake test\n---\n' +
           'what is 2+2? Please call the st_msg_reply tool with my message ' +
           'as the thread arg and your answer as the body.\n'

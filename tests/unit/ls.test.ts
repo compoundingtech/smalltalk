@@ -14,20 +14,20 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { cmdLs, type LsInput } from '../../src/commands/ls.ts';
 
 let scratch: string;
-let coordRoot: string;
+let stRoot: string;
 
 beforeEach(() => {
   scratch = mkdtempSync(join(tmpdir(), 'coord-ls-test-'));
-  coordRoot = join(scratch, 'coord');
-  mkdirSync(coordRoot, { recursive: true });
+  stRoot = join(scratch, 'coord');
+  mkdirSync(stRoot, { recursive: true });
 });
 afterEach(() => {
   rmSync(scratch, { recursive: true, force: true });
 });
 
 function setupIdentity(id: string): void {
-  mkdirSync(join(coordRoot, id, 'inbox'), { recursive: true });
-  mkdirSync(join(coordRoot, id, 'archive'), { recursive: true });
+  mkdirSync(join(stRoot, id, 'inbox'), { recursive: true });
+  mkdirSync(join(stRoot, id, 'archive'), { recursive: true });
 }
 
 function writeMsg(
@@ -38,7 +38,7 @@ function writeMsg(
   folder: 'inbox' | 'archive' = 'inbox'
 ): void {
   writeFileSync(
-    join(coordRoot, id, folder, filename),
+    join(stRoot, id, folder, filename),
     `---\nfrom: ${fromValue}\n---\n${body}\n`
   );
 }
@@ -47,7 +47,7 @@ function baseInput(overrides: Partial<LsInput> = {}): LsInput {
   return {
     recipient: 'bob',
     env: {} as NodeJS.ProcessEnv,
-    coordRoot,
+    stRoot,
     ...overrides,
   };
 }
@@ -170,7 +170,7 @@ describe('cmdLs — --from', () => {
     writeMsg('bob', '1714826789010-aaaaaa.md', 'alice');
     // Malformed: no fences, body only.
     writeFileSync(
-      join(coordRoot, 'bob', 'inbox', '1714826789020-bbbbbb.md'),
+      join(stRoot, 'bob', 'inbox', '1714826789020-bbbbbb.md'),
       'just body, no frontmatter'
     );
     const r = cmdLs(baseInput({ fromFilter: 'alice' }));
@@ -197,19 +197,19 @@ describe('cmdLs — identity resolution', () => {
     const r = cmdLs(
       baseInput({
         recipient: 'bob',
-        env: { COORD_IDENTITY: 'alice' } as NodeJS.ProcessEnv,
+        env: { ST_AGENT: 'alice' } as NodeJS.ProcessEnv,
       })
     );
     expect(r.matches).toHaveLength(1);
   });
 
-  it('falls back to COORD_IDENTITY when no positional', () => {
+  it('falls back to ST_AGENT when no positional', () => {
     setupIdentity('bob');
     writeMsg('bob', '1714826789010-aaaaaa.md', 'alice');
     const r = cmdLs(
       baseInput({
         recipient: undefined,
-        env: { COORD_IDENTITY: 'bob' } as NodeJS.ProcessEnv,
+        env: { ST_AGENT: 'bob' } as NodeJS.ProcessEnv,
       })
     );
     expect(r.matches).toHaveLength(1);
@@ -218,7 +218,7 @@ describe('cmdLs — identity resolution', () => {
   it('errors when neither positional nor env identity is set', () => {
     expect(() =>
       cmdLs(baseInput({ recipient: undefined, env: {} as NodeJS.ProcessEnv }))
-    ).toThrowError(/COORD_IDENTITY/);
+    ).toThrowError(/ST_AGENT/);
   });
 
   it('errors with mkdir hint when identity folder is missing', () => {
@@ -234,11 +234,11 @@ describe('cmdLs — non-grammar files in the inbox', () => {
   it('non-.md files (README, dotfiles, attachment sidecars) are still skipped', () => {
     setupIdentity('bob');
     writeMsg('bob', '1714826789010-aaaaaa.md', 'alice');
-    writeFileSync(join(coordRoot, 'bob', 'inbox', 'README'), 'stray');
-    writeFileSync(join(coordRoot, 'bob', 'inbox', '.hidden.md'), 'dotfile');
+    writeFileSync(join(stRoot, 'bob', 'inbox', 'README'), 'stray');
+    writeFileSync(join(stRoot, 'bob', 'inbox', '.hidden.md'), 'dotfile');
     // Attachment sidecar of a canonical .md — reserved for the canonical.
     writeFileSync(
-      join(coordRoot, 'bob', 'inbox', '1714826789010-aaaaaa.subject.md'),
+      join(stRoot, 'bob', 'inbox', '1714826789010-aaaaaa.subject.md'),
       'sidecar'
     );
     const r = cmdLs(baseInput());
@@ -250,9 +250,9 @@ describe('cmdLs — non-grammar files in the inbox', () => {
   it('outside `.md` files are listed alongside canonical messages', () => {
     setupIdentity('bob');
     writeMsg('bob', '1714826789010-aaaaaa.md', 'alice');
-    writeFileSync(join(coordRoot, 'bob', 'inbox', 'notes.md'), 'stray');
+    writeFileSync(join(stRoot, 'bob', 'inbox', 'notes.md'), 'stray');
     writeFileSync(
-      join(coordRoot, 'bob', 'inbox', '1714826789010-myobie-aaaaaa.md'),
+      join(stRoot, 'bob', 'inbox', '1714826789010-operator-aaaaaa.md'),
       'legacy-shape'
     );
     const r = cmdLs(baseInput());
@@ -260,13 +260,13 @@ describe('cmdLs — non-grammar files in the inbox', () => {
     // gives us, and outside filenames have no LAYOUT prefix to sort by.
     expect(r.matches).toContain('1714826789010-aaaaaa.md');
     expect(r.matches).toContain('notes.md');
-    expect(r.matches).toContain('1714826789010-myobie-aaaaaa.md');
+    expect(r.matches).toContain('1714826789010-operator-aaaaaa.md');
     expect(r.matches).toHaveLength(3);
   });
 
   it('withMeta stamps outside .md files with from="outside" and empty projections', () => {
     setupIdentity('bob');
-    writeFileSync(join(coordRoot, 'bob', 'inbox', 'hello.md'), 'hi\n');
+    writeFileSync(join(stRoot, 'bob', 'inbox', 'hello.md'), 'hi\n');
     const r = cmdLs(baseInput({ withMeta: true }));
     expect(r.items).toBeDefined();
     const outside = r.items!.find((i) => i.filename === 'hello.md');
@@ -286,7 +286,7 @@ describe('cmdLs — non-grammar files in the inbox', () => {
 describe('cmdLs — missing inbox dir', () => {
   it('returns 0 matches without throwing if the inbox dir disappears', () => {
     setupIdentity('bob');
-    rmSync(join(coordRoot, 'bob', 'inbox'), { recursive: true });
+    rmSync(join(stRoot, 'bob', 'inbox'), { recursive: true });
     // Cross-identity reads are lenient: as long as ONE of
     // inbox/archive exists, the resolver succeeds and the missing
     // folder is treated as empty by existsSync below. Auto-create
@@ -295,7 +295,7 @@ describe('cmdLs — missing inbox dir', () => {
     const r = cmdLs(baseInput());
     expect(r.matches).toEqual([]);
     // bob/inbox was NOT recreated by the read.
-    expect(existsSync(join(coordRoot, 'bob', 'inbox'))).toBe(false);
+    expect(existsSync(join(stRoot, 'bob', 'inbox'))).toBe(false);
   });
 
   it('after recreating only inbox, listing is empty', () => {
@@ -349,7 +349,7 @@ describe('cmdLs — withMeta', () => {
   it('parses subject + in-reply-to + priority when present', () => {
     setupIdentity('bob');
     writeFileSync(
-      join(coordRoot, 'bob', 'inbox', '1714826789010-aaaaaa.md'),
+      join(stRoot, 'bob', 'inbox', '1714826789010-aaaaaa.md'),
       '---\n' +
         'from: alice\n' +
         'subject: deploy question\n' +
@@ -366,7 +366,7 @@ describe('cmdLs — withMeta', () => {
   it('parses tags written as a YAML-list scalar', () => {
     setupIdentity('bob');
     writeFileSync(
-      join(coordRoot, 'bob', 'inbox', '1714826789010-aaaaaa.md'),
+      join(stRoot, 'bob', 'inbox', '1714826789010-aaaaaa.md'),
       '---\nfrom: alice\ntags: [a, b, c]\n---\nbody\n'
     );
     const item = cmdLs(baseInput({ withMeta: true })).items![0]!;
@@ -376,7 +376,7 @@ describe('cmdLs — withMeta', () => {
   it('files with no frontmatter still appear with from=null', () => {
     setupIdentity('bob');
     writeFileSync(
-      join(coordRoot, 'bob', 'inbox', '1714826789010-aaaaaa.md'),
+      join(stRoot, 'bob', 'inbox', '1714826789010-aaaaaa.md'),
       'no fence here, just words\n'
     );
     const item = cmdLs(baseInput({ withMeta: true })).items![0]!;
@@ -432,8 +432,8 @@ describe('cmdLsCli — --json output', () => {
     let stdout = '';
     cmdLsCli(['bob', '--json'], {
       env: {} as NodeJS.ProcessEnv,
-      coordRoot,
-      coordConfig: '',
+      stRoot,
+      stConfig: '',
       stdout: (s) => {
         stdout += s;
       },
@@ -451,8 +451,8 @@ describe('cmdLsCli — --json output', () => {
     let stdout = '';
     cmdLsCli(['bob', '--json'], {
       env: {} as NodeJS.ProcessEnv,
-      coordRoot,
-      coordConfig: '',
+      stRoot,
+      stConfig: '',
       stdout: (s) => {
         stdout += s;
       },
@@ -468,8 +468,8 @@ describe('cmdLsCli — --json output', () => {
     expect(() =>
       cmdLsCli(['bob', '--count', '--json'], {
         env: {} as NodeJS.ProcessEnv,
-        coordRoot,
-        coordConfig: '',
+        stRoot,
+        stConfig: '',
         stdout: () => {},
         stderr: () => {},
         readStdin: async () => Buffer.from(''),
@@ -486,7 +486,7 @@ function writeAttachment(
   body: string,
   folder: 'inbox' | 'archive' = 'inbox'
 ): void {
-  writeFileSync(join(coordRoot, id, folder, filename), body);
+  writeFileSync(join(stRoot, id, folder, filename), body);
 }
 
 describe('cmdLs — --orphans', () => {
@@ -594,8 +594,8 @@ describe('cmdLs — --orphans', () => {
     let stdout = '';
     cmdLsCli(['bob', '--orphans', '--json'], {
       env: {} as NodeJS.ProcessEnv,
-      coordRoot,
-      coordConfig: '',
+      stRoot,
+      stConfig: '',
       stdout: (s) => {
         stdout += s;
       },
@@ -613,8 +613,8 @@ describe('cmdLs — --orphans', () => {
     expect(() =>
       cmdLsCli(['bob', '--orphans', '--from', 'alice'], {
         env: {} as NodeJS.ProcessEnv,
-        coordRoot,
-        coordConfig: '',
+        stRoot,
+        stConfig: '',
         stdout: () => {},
         stderr: () => {},
         readStdin: async () => Buffer.from(''),
@@ -638,8 +638,8 @@ describe('cmdLs — --orphans', () => {
     let stdout = '';
     cmdLsCli(['bob', '--orphans', '--count'], {
       env: {} as NodeJS.ProcessEnv,
-      coordRoot,
-      coordConfig: '',
+      stRoot,
+      stConfig: '',
       stdout: (s) => {
         stdout += s;
       },

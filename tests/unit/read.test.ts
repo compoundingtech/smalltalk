@@ -15,20 +15,20 @@ import {
 import type { CliContext } from '../../src/cli-context.ts';
 
 let scratch: string;
-let coordRoot: string;
+let stRoot: string;
 
 beforeEach(() => {
   scratch = mkdtempSync(join(tmpdir(), 'coord-read-test-'));
-  coordRoot = join(scratch, 'coord');
-  mkdirSync(coordRoot, { recursive: true });
+  stRoot = join(scratch, 'coord');
+  mkdirSync(stRoot, { recursive: true });
 });
 afterEach(() => {
   rmSync(scratch, { recursive: true, force: true });
 });
 
 function setupIdentity(id: string): void {
-  mkdirSync(join(coordRoot, id, 'inbox'), { recursive: true });
-  mkdirSync(join(coordRoot, id, 'archive'), { recursive: true });
+  mkdirSync(join(stRoot, id, 'inbox'), { recursive: true });
+  mkdirSync(join(stRoot, id, 'archive'), { recursive: true });
 }
 
 function writeFile(
@@ -37,7 +37,7 @@ function writeFile(
   content: string,
   folder: 'inbox' | 'archive' = 'inbox'
 ): void {
-  writeFileSync(join(coordRoot, id, folder, filename), content);
+  writeFileSync(join(stRoot, id, folder, filename), content);
 }
 
 function baseInput(overrides: Partial<ReadInput> = {}): ReadInput {
@@ -45,7 +45,7 @@ function baseInput(overrides: Partial<ReadInput> = {}): ReadInput {
     recipient: 'bob',
     filename: '1714826789010-aaaaaa.md',
     env: {} as NodeJS.ProcessEnv,
-    coordRoot,
+    stRoot,
     ...overrides,
   };
 }
@@ -292,10 +292,10 @@ describe('cmdRead — errors', () => {
     ).toThrowError(/(agent|identity) folder missing/);
   });
 
-  it('no recipient + no COORD_IDENTITY → identity-required error', () => {
+  it('no recipient + no ST_AGENT → identity-required error', () => {
     expect(() =>
       cmdRead(baseInput({ recipient: undefined }))
-    ).toThrowError(/COORD_IDENTITY/);
+    ).toThrowError(/ST_AGENT/);
   });
 });
 
@@ -309,19 +309,19 @@ describe('cmdRead — identity resolution', () => {
     const r = cmdRead(
       baseInput({
         recipient: 'bob',
-        env: { COORD_IDENTITY: 'alice' } as NodeJS.ProcessEnv,
+        env: { ST_AGENT: 'alice' } as NodeJS.ProcessEnv,
       })
     );
     expect(r.label).toBe('inbox');
   });
 
-  it('falls back to COORD_IDENTITY when no positional', () => {
+  it('falls back to ST_AGENT when no positional', () => {
     setupIdentity('bob');
     writeFile('bob', '1714826789010-aaaaaa.md', '---\nfrom: a\n---\nb\n');
     const r = cmdRead(
       baseInput({
         recipient: undefined,
-        env: { COORD_IDENTITY: 'bob' } as NodeJS.ProcessEnv,
+        env: { ST_AGENT: 'bob' } as NodeJS.ProcessEnv,
       })
     );
     expect(r.label).toBe('inbox');
@@ -481,9 +481,9 @@ describe('cmdReadCli — --json', () => {
     let stdout = '';
     let stderr = '';
     const ctx: CliContext = {
-      env: { COORD_ROOT: coordRoot, COORD_IDENTITY: 'bob' },
-      coordRoot,
-      coordConfig: join(scratch, 'config'),
+      env: { ST_ROOT: stRoot, ST_AGENT: 'bob' },
+      stRoot,
+      stConfig: join(scratch, 'config'),
       stdout: (s) => {
         stdout += s;
       },

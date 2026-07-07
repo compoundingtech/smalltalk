@@ -53,7 +53,7 @@ export interface SendInput {
   body: string | Buffer;
 
   env: NodeJS.ProcessEnv;
-  coordRoot: string;
+  stRoot: string;
 }
 
 export interface SendResult {
@@ -75,7 +75,7 @@ export function cmdSend(input: SendInput): SendResult {
   const from = resolveIdentity({
     explicit: input.from,
     env: input.env,
-    coordRoot: input.coordRoot,
+    stRoot: input.stRoot,
   });
 
   if (input.inReplyTo !== undefined && input.inReplyTo !== '') {
@@ -112,7 +112,7 @@ export function cmdSend(input: SendInput): SendResult {
     fm.priority = input.priority;
   }
 
-  const inbox = inboxDir(input.to, input.coordRoot);
+  const inbox = inboxDir(input.to, input.stRoot);
   mkdirSync(inbox, { recursive: true });
 
   // Compose the file body. Frontmatter + body, with a trailing newline if
@@ -252,7 +252,7 @@ export async function cmdSendCli(
     ...(priority !== undefined && { priority }),
     body,
     env: ctx.env,
-    coordRoot: ctx.coordRoot,
+    stRoot: ctx.stRoot,
   });
   ctx.stdout(`${r.filename}\n`);
   return 0;

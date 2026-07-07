@@ -460,7 +460,7 @@ describe('runDing — pty send failures', () => {
     fake.pushEvent('1714826789010-aaaaaa.md');
     await settle();
     expect(sender.calls()).toHaveLength(1);
-    expect(stderr).toMatch(/coord ding: pty send to "codex-foo" exited 7/);
+    expect(stderr).toMatch(/st ding: pty send to "codex-foo" exited 7/);
     expect(stderr).toMatch(/session not found/);
 
     // Daemon is still alive — second event delivers.
@@ -526,7 +526,7 @@ describe('runDing — coord.read failures', () => {
     fake.pushEvent('1714826789010-aaaaaa.md');
     await settle();
     expect(sender.calls()).toHaveLength(0);
-    expect(stderr).toMatch(/coord ding: read failed/);
+    expect(stderr).toMatch(/st ding: read failed/);
     expect(stderr).toMatch(/disk fell over/);
     r.ac.abort();
     await r.done;
@@ -582,8 +582,8 @@ describe('runDing — abort + signal cleanup', () => {
 describe('cmdDingCli — arg parsing', () => {
   function ctx(env: NodeJS.ProcessEnv = {}): {
     env: NodeJS.ProcessEnv;
-    coordRoot: string;
-    coordConfig: string;
+    stRoot: string;
+    stConfig: string;
     stdout: () => void;
     stderr: (s: string) => void;
     readStdin: () => Promise<Buffer>;
@@ -592,8 +592,8 @@ describe('cmdDingCli — arg parsing', () => {
     const stderrBuf = { value: '' };
     return {
       env,
-      coordRoot: '/tmp/fake-coord',
-      coordConfig: '/tmp/fake-cfg',
+      stRoot: '/tmp/fake-coord',
+      stConfig: '/tmp/fake-cfg',
       stdout: () => {},
       stderr: (s) => {
         stderrBuf.value += s;
@@ -626,14 +626,14 @@ describe('cmdDingCli — arg parsing', () => {
 
   it('--interval requires integer', async () => {
     await expect(
-      cmdDingCli(['session', '--interval', 'abc'], ctx({ COORD_IDENTITY: 'bob' }))
+      cmdDingCli(['session', '--interval', 'abc'], ctx({ ST_AGENT: 'bob' }))
     ).rejects.toThrow(/--interval must be a positive integer/);
   });
 
-  it('missing identity (no --identity, no $COORD_IDENTITY) → throws', async () => {
+  it('missing identity (no --identity, no $ST_AGENT) → throws', async () => {
     // Don't actually start the watcher; provide a session arg, no identity.
     await expect(cmdDingCli(['session'], ctx())).rejects.toThrow(
-      /needs --identity ID or \$COORD_IDENTITY/
+      /needs --identity ID or \$ST_AGENT/
     );
   });
 
@@ -648,7 +648,7 @@ describe('cmdDingCli — arg parsing', () => {
     await expect(
       cmdDingCli(
         ['session', '--tidy-interval-ms', 'abc'],
-        ctx({ COORD_IDENTITY: 'bob' })
+        ctx({ ST_AGENT: 'bob' })
       )
     ).rejects.toThrow(/--tidy-interval-ms must be a non-negative integer/);
   });
@@ -663,7 +663,7 @@ describe('cmdDingCli — arg parsing', () => {
 
 describe('runDing — tidy-check tick', () => {
   let scratch: string;
-  let coordRoot: string;
+  let stRoot: string;
   let identityRoot: string;
   let fake: FakeCoord;
   let sender: FakeSender;
@@ -671,11 +671,11 @@ describe('runDing — tidy-check tick', () => {
 
   beforeEach(() => {
     scratch = mkdtempSync(join(tmpdir(), 'coord-ding-tidy-'));
-    coordRoot = join(scratch, 'coord');
-    mkdirSync(join(coordRoot, IDENTITY, 'inbox'), { recursive: true });
-    mkdirSync(join(coordRoot, IDENTITY, 'archive'), { recursive: true });
-    identityRoot = join(coordRoot, IDENTITY);
-    fake = makeFakeCoord(asIdentity(IDENTITY), coordRoot);
+    stRoot = join(scratch, 'coord');
+    mkdirSync(join(stRoot, IDENTITY, 'inbox'), { recursive: true });
+    mkdirSync(join(stRoot, IDENTITY, 'archive'), { recursive: true });
+    identityRoot = join(stRoot, IDENTITY);
+    fake = makeFakeCoord(asIdentity(IDENTITY), stRoot);
     sender = makeFakeSender();
     // brief-035 t2: write a current-mtime status file so the
     // scan-on-startup considers all pre-planted tidy fixtures already
@@ -1095,18 +1095,18 @@ describe('runDing — session-watch (exits when session is gone)', () => {
     // Just verify the flag parses cleanly; the full daemon path
     // requires a real pty subprocess so we can't smoke the wire.
     // Confirm via the cmdDingCli arg parser via an isolated invocation
-    // that fails on missing $COORD_IDENTITY (proves parsing reached
+    // that fails on missing $ST_AGENT (proves parsing reached
     // identity validation, i.e., the flag itself didn't blow up).
     await expect(
       cmdDingCli(['session', '--no-exit-when-session-gone'], {
         env: {} as NodeJS.ProcessEnv,
-        coordRoot: '/tmp',
-        coordConfig: '/tmp',
+        stRoot: '/tmp',
+        stConfig: '/tmp',
         stdout: () => {},
         stderr: () => {},
         readStdin: async () => Buffer.alloc(0),
       })
-    ).rejects.toThrow(/needs --identity ID or \$COORD_IDENTITY/);
+    ).rejects.toThrow(/needs --identity ID or \$ST_AGENT/);
   });
 });
 
@@ -1119,7 +1119,7 @@ describe('runDing — session-watch (exits when session is gone)', () => {
 
 describe('runDing — status refresh tick', () => {
   let scratch: string;
-  let coordRoot: string;
+  let stRoot: string;
   let identityRoot: string;
   let statusFile: string;
   let fake: FakeCoord;
@@ -1128,12 +1128,12 @@ describe('runDing — status refresh tick', () => {
 
   beforeEach(() => {
     scratch = mkdtempSync(join(tmpdir(), 'coord-ding-srefresh-'));
-    coordRoot = join(scratch, 'coord');
-    mkdirSync(join(coordRoot, ID, 'inbox'), { recursive: true });
-    mkdirSync(join(coordRoot, ID, 'archive'), { recursive: true });
-    identityRoot = join(coordRoot, ID);
+    stRoot = join(scratch, 'coord');
+    mkdirSync(join(stRoot, ID, 'inbox'), { recursive: true });
+    mkdirSync(join(stRoot, ID, 'archive'), { recursive: true });
+    identityRoot = join(stRoot, ID);
     statusFile = join(identityRoot, 'status');
-    fake = makeFakeCoord(asIdentity(ID), coordRoot);
+    fake = makeFakeCoord(asIdentity(ID), stRoot);
     sender = makeFakeSender();
   });
   afterEach(() => {
@@ -1249,9 +1249,9 @@ describe('runDing — status refresh tick', () => {
       cmdDingCli(
         ['session', '--status-refresh-interval-ms', 'abc'],
         {
-          env: { COORD_IDENTITY: 'bob' } as NodeJS.ProcessEnv,
-          coordRoot: '/tmp',
-          coordConfig: '/tmp',
+          env: { ST_AGENT: 'bob' } as NodeJS.ProcessEnv,
+          stRoot: '/tmp',
+          stConfig: '/tmp',
           stdout: () => {},
           stderr: () => {},
           readStdin: async () => Buffer.alloc(0),
@@ -1330,7 +1330,7 @@ describe('buildPtySendArgs', () => {
 
 describe('runDing — scan-on-startup', () => {
   let scratch: string;
-  let coordRoot: string;
+  let stRoot: string;
   let identityRoot: string;
   let fake: FakeCoord;
   let sender: FakeSender;
@@ -1338,11 +1338,11 @@ describe('runDing — scan-on-startup', () => {
 
   beforeEach(() => {
     scratch = mkdtempSync(join(tmpdir(), 'coord-ding-scan-'));
-    coordRoot = join(scratch, 'coord');
-    mkdirSync(join(coordRoot, IDENTITY, 'inbox'), { recursive: true });
-    mkdirSync(join(coordRoot, IDENTITY, 'archive'), { recursive: true });
-    identityRoot = join(coordRoot, IDENTITY);
-    fake = makeFakeCoord(asIdentity(IDENTITY), coordRoot);
+    stRoot = join(scratch, 'coord');
+    mkdirSync(join(stRoot, IDENTITY, 'inbox'), { recursive: true });
+    mkdirSync(join(stRoot, IDENTITY, 'archive'), { recursive: true });
+    identityRoot = join(stRoot, IDENTITY);
+    fake = makeFakeCoord(asIdentity(IDENTITY), stRoot);
     sender = makeFakeSender();
   });
   afterEach(() => {
@@ -1907,11 +1907,11 @@ describe('cmdDingCli — PATH robustness (pty probe at boot)', () => {
     let stderrBuf = '';
     return {
       env: {
-        COORD_IDENTITY: 'alice',
-        COORD_ROOT: '/tmp/whatever',
+        ST_AGENT: 'alice',
+        ST_ROOT: '/tmp/whatever',
       } as NodeJS.ProcessEnv,
-      coordRoot: '/tmp/whatever',
-      coordConfig: undefined,
+      stRoot: '/tmp/whatever',
+      stConfig: undefined,
       stdout: (s) => {
         stdoutBuf += s;
       },
@@ -1954,13 +1954,13 @@ describe('cmdDingCli — PATH robustness (pty probe at boot)', () => {
     // real coord root + watcher). But we can prove the probe gate
     // opens by making it return available and asserting the CLI
     // proceeds past the probe (would then fail on the missing
-    // coordRoot's identity dir).
+    // stRoot's identity dir).
     const ctx = baseCtx() as CliContext & { stderrBuf: string };
     // Give it a valid enough root (tmp) so ensureIdentityDirs
     // succeeds inside runDing's setup — actual run will abort via
     // the AbortController we don't have hooked, so we race a small
     // timeout.
-    (ctx as unknown as { coordRoot: string }).coordRoot = '/tmp/st-ding-probe-ok';
+    (ctx as unknown as { stRoot: string }).stRoot = '/tmp/st-ding-probe-ok';
     try {
       const rc = await Promise.race([
         cmdDingCli(['codex-foo'], ctx, {

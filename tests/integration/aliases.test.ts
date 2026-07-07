@@ -44,21 +44,9 @@ function runBin(
   };
 }
 
-// ─── Item 1: binary aliases ───────────────────────────────────────────────
+// ─── Binary aliases (post-coord-cutover: st + smalltalk only) ────────────
 
-describe('binary aliases (Item 1)', () => {
-  // The shims export `_ST_INVOKED_AS` from `basename $0`, and the CLI's
-  // help banner interpolates that name — so each shim brands its own
-  // name. This nudges `coord` users toward `st` without breaking the
-  // `coord` shim itself. The remaining test below pins the invariant
-  // we actually care about: exit code + set of subcommands is the same
-  // across all three shims.
-  it('bin/coord help exits 0 with usage', () => {
-    const r = runBin(BIN_COORD, ['help']);
-    expect(r.exitCode).toBe(0);
-    expect(r.stdout).toContain('usage: coord');
-  });
-
+describe('binary aliases', () => {
   it('bin/st help exits 0 with usage', () => {
     const r = runBin(BIN_ST, ['help']);
     expect(r.exitCode).toBe(0);
@@ -71,43 +59,25 @@ describe('binary aliases (Item 1)', () => {
     expect(r.stdout).toContain('usage: smalltalk');
   });
 
-  it('all three binaries dispatch identically (exit + subcommand list) for `help`', () => {
-    const c = runBin(BIN_COORD, ['help']);
+  it('both binaries dispatch identically (exit + subcommand list) for `help`', () => {
     const s = runBin(BIN_ST, ['help']);
     const t = runBin(BIN_SMALLTALK, ['help']);
-    expect(s.exitCode).toBe(c.exitCode);
-    expect(t.exitCode).toBe(c.exitCode);
-    // Normalize the invoked-name interpolation and compare the
-    // remaining body. Every non-banner line — the subcommand list,
-    // section headers, `See LAYOUT.md for the data-format spec.` —
-    // has to match byte-for-byte across shims; otherwise the shims
-    // are running different code paths, which would be a real bug.
-    const strip = (s: string): string =>
-      s.replace(/\b(coord|smalltalk|st)\b/g, 'NAME');
-    expect(strip(s.stdout)).toBe(strip(c.stdout));
-    expect(strip(t.stdout)).toBe(strip(c.stdout));
+    expect(t.exitCode).toBe(s.exitCode);
+    // Normalize the invoked-name interpolation and compare the rest.
+    const strip = (str: string): string =>
+      str.replace(/\b(smalltalk|st)\b/g, 'NAME');
+    expect(strip(t.stdout)).toBe(strip(s.stdout));
   });
 
-  it('all three propagate _ST_INVOKED_AS when invoked directly (status round-trip)', () => {
-    // The cleanest end-to-end probe of the shim's invoked-as capture
-    // is a verb that depends on env / identity working. `coord status
-    // <id>` with no value just reads the file — and it works under all
-    // three names with a freshly-created scratch root.
-    const root = join(scratch, 'root');
-    const env = { ST_ROOT: root, ST_IDENTITY: 'tester' };
-    runBin(BIN_COORD, ['status', '--set', 'available'], env);
-    const r1 = runBin(BIN_COORD, ['status'], env);
-    const r2 = runBin(BIN_ST, ['status'], env);
-    const r3 = runBin(BIN_SMALLTALK, ['status'], env);
-    expect(r1.stdout.trim()).toBe('available');
-    expect(r2.stdout).toBe(r1.stdout);
-    expect(r3.stdout).toBe(r1.stdout);
+  it('bin/coord is REMOVED (regression guard for the coord-cutover)', async () => {
+    const { existsSync } = await import('node:fs');
+    expect(existsSync(BIN_COORD)).toBe(false);
   });
 });
 
-// ─── Item 6: plugin proxy ─────────────────────────────────────────────────
+// ─── Plugin proxy (git-style PATH dispatch) ──────────────────────────────
 
-describe('plugin proxy (Item 6)', () => {
+describe('plugin proxy', () => {
   function writePlugin(
     pluginName: string,
     contents: string
@@ -121,13 +91,10 @@ describe('plugin proxy (Item 6)', () => {
     return path;
   }
 
-  it('`coord <cmd>` execs `st-<cmd>` from PATH with the rest of argv', () => {
-    writePlugin(
-      'st-hello',
-      'echo "hello-args: $*"\nexit 0'
-    );
+  it('`st <cmd>` execs `st-<cmd>` from PATH with the rest of argv', () => {
+    writePlugin('st-hello', 'echo "hello-args: $*"\nexit 0');
     const r = runBin(
-      BIN_COORD,
+      BIN_ST,
       ['hello', 'one', 'two', '--flag'],
       { PATH: `${scratch}:${process.env.PATH ?? ''}` }
     );
@@ -136,33 +103,28 @@ describe('plugin proxy (Item 6)', () => {
   });
 
   it('also matches smalltalk-<cmd> when st-<cmd> is absent', () => {
-    writePlugin(
-      'smalltalk-greet',
-      'echo "via smalltalk prefix"\nexit 0'
-    );
-    const r = runBin(BIN_COORD, ['greet'], {
+    writePlugin('smalltalk-greet', 'echo "via smalltalk prefix"\nexit 0');
+    const r = runBin(BIN_ST, ['greet'], {
       PATH: `${scratch}:${process.env.PATH ?? ''}`,
     });
     expect(r.exitCode).toBe(0);
     expect(r.stdout.trim()).toBe('via smalltalk prefix');
   });
 
-  it('also matches coord-<cmd> as the legacy fallback prefix', () => {
-    writePlugin(
-      'coord-legacy',
-      'echo "via coord prefix"\nexit 0'
-    );
-    const r = runBin(BIN_COORD, ['legacy'], {
+  it('coord-<cmd> is NO LONGER scanned (regression guard for the coord-cutover)', () => {
+    writePlugin('coord-legacy', 'echo "should not run"\nexit 0');
+    const r = runBin(BIN_ST, ['legacy'], {
       PATH: `${scratch}:${process.env.PATH ?? ''}`,
     });
-    expect(r.exitCode).toBe(0);
-    expect(r.stdout.trim()).toBe('via coord prefix');
+    // Unknown verb — coord- prefix is retired, so no plugin matches.
+    expect(r.exitCode).toBe(2);
+    expect(r.stderr).toContain('unknown subcommand');
   });
 
-  it('precedence: st-<cmd> wins over coord-<cmd> when both exist', () => {
+  it('precedence: st-<cmd> wins over smalltalk-<cmd> when both exist', () => {
     writePlugin('st-pick', 'echo "from st"\nexit 0');
-    writePlugin('coord-pick', 'echo "from coord"\nexit 1');
-    const r = runBin(BIN_COORD, ['pick'], {
+    writePlugin('smalltalk-pick', 'echo "from smalltalk"\nexit 1');
+    const r = runBin(BIN_ST, ['pick'], {
       PATH: `${scratch}:${process.env.PATH ?? ''}`,
     });
     expect(r.exitCode).toBe(0);
@@ -170,14 +132,11 @@ describe('plugin proxy (Item 6)', () => {
   });
 
   it('built-in commands ALWAYS win over plugins of the same name', () => {
-    // `members` is a built-in. A plugin named st-members must NOT
-    // shadow it; coord's own list-members runs instead.
-    writePlugin(
-      'st-members',
-      'echo "PLUGIN-SHOULD-NOT-RUN"\nexit 1'
-    );
-    const r = runBin(BIN_COORD, ['members'], {
-      ST_ROOT: scratch, // empty root → no members; clean exit
+    // `agents` is a built-in. A plugin named st-agents must NOT
+    // shadow it; the built-in runs instead.
+    writePlugin('st-agents', 'echo "PLUGIN-SHOULD-NOT-RUN"\nexit 1');
+    const r = runBin(BIN_ST, ['agents'], {
+      ST_ROOT: scratch, // empty root → no agents; clean exit
       PATH: `${scratch}:${process.env.PATH ?? ''}`,
     });
     expect(r.exitCode).toBe(0);
@@ -186,7 +145,7 @@ describe('plugin proxy (Item 6)', () => {
 
   it('plugin exit code propagates to the parent', () => {
     writePlugin('st-fail', 'exit 7');
-    const r = runBin(BIN_COORD, ['fail'], {
+    const r = runBin(BIN_ST, ['fail'], {
       PATH: `${scratch}:${process.env.PATH ?? ''}`,
     });
     expect(r.exitCode).toBe(7);
@@ -194,11 +153,8 @@ describe('plugin proxy (Item 6)', () => {
 
   it('unknown command with no matching plugin → exit 2 with usage', () => {
     const r = runBin(
-      BIN_COORD,
+      BIN_ST,
       ['this-command-definitely-does-not-exist'],
-      // Keep parent PATH so the shim can still find `node` to exec —
-      // but the scratch dir on its own contains no plugins matching
-      // our nonsense verb.
       { PATH: `${scratch}:${process.env.PATH ?? ''}` }
     );
     expect(r.exitCode).toBe(2);

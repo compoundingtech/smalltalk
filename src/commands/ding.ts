@@ -4,7 +4,7 @@
 // only when the agent is `available` or `offline`. Buffers while
 // `busy`/`dnd`, flushes when status flips back.
 //
-// Long-running. Lives in the same process as `coord ding ...`; pair
+// Long-running. Lives in the same process as `st ding ...`; pair
 // with `pty up` (or any supervisor) for restart-on-crash. Designed
 // so the underlying daemon (`runDing`) is testable without a real
 // pty binary or a real Coord — see tests/unit/ding.test.ts.
@@ -263,7 +263,7 @@ export async function runDing(deps: DingDeps): Promise<void> {
     try {
       state = await deps.coord.getStatus(deps.identity);
     } catch (err) {
-      log(`coord ding: tidy getStatus failed: ${errMsg(err)}\n`);
+      log(`st ding: tidy getStatus failed: ${errMsg(err)}\n`);
       return; // best-effort; don't arm dedup on errors
     }
     // Gate: busy/dnd/unknown → no emit, no lastFired update. Drift
@@ -275,7 +275,7 @@ export async function runDing(deps: DingDeps): Promise<void> {
       if (deps.tidyNow !== undefined) driftOpts.now = deps.tidyNow;
       drift = evaluateDrift(deps.identity, deps.coord.root, driftOpts);
     } catch (err) {
-      log(`coord ding: tidy evaluate failed: ${errMsg(err)}\n`);
+      log(`st ding: tidy evaluate failed: ${errMsg(err)}\n`);
       return;
     }
     const newCondition = drift.inbox && !lastTidyFired.inbox;
@@ -285,14 +285,14 @@ export async function runDing(deps: DingDeps): Promise<void> {
       try {
         result = await send(deps.ptySession, [text, 'key:return']);
       } catch (err) {
-        log(`coord ding: tidy pty send failed: ${errMsg(err)}\n`);
+        log(`st ding: tidy pty send failed: ${errMsg(err)}\n`);
         // Don't arm lastFired — we want a retry on next tick.
         return;
       }
       if (result.status !== 0) {
         const tail = result.stderr.trim().slice(-200);
         log(
-          `coord ding: tidy pty send to "${deps.ptySession}" exited ${result.status}${
+          `st ding: tidy pty send to "${deps.ptySession}" exited ${result.status}${
             tail ? `: ${tail}` : ''
           }\n`
         );
@@ -364,7 +364,7 @@ export async function runDing(deps: DingDeps): Promise<void> {
       // tear down on a transient permission glitch. Log so the
       // operator can investigate. Also reset the miss counter — an
       // unknown state shouldn't count as a "gone" observation.
-      log(`coord ding: session-alive check failed: ${errMsg(err)}\n`);
+      log(`st ding: session-alive check failed: ${errMsg(err)}\n`);
       consecutiveMisses = 0;
       return;
     }
@@ -381,7 +381,7 @@ export async function runDing(deps: DingDeps): Promise<void> {
       // signal.
       if (!loggedWaitingForTarget) {
         log(
-          `coord ding: target session "${deps.ptySession}" not yet ` +
+          `st ding: target session "${deps.ptySession}" not yet ` +
             `registered; waiting for it to appear before enabling the ` +
             `exit-when-gone watch.\n`
         );
@@ -398,14 +398,14 @@ export async function runDing(deps: DingDeps): Promise<void> {
     consecutiveMisses++;
     if (consecutiveMisses < SESSION_GONE_DEBOUNCE_MISSES) {
       log(
-        `coord ding: target session "${deps.ptySession}" appears gone ` +
+        `st ding: target session "${deps.ptySession}" appears gone ` +
           `(miss ${consecutiveMisses}/${SESSION_GONE_DEBOUNCE_MISSES}); ` +
           `debouncing before exit.\n`
       );
       return;
     }
     log(
-      `coord ding: target session "${deps.ptySession}" is gone; exiting.\n`
+      `st ding: target session "${deps.ptySession}" is gone; exiting.\n`
     );
     internalAc.abort();
   }
@@ -437,11 +437,11 @@ export async function runDing(deps: DingDeps): Promise<void> {
     const outcome = refreshIdentityStatus(deps.identity, deps.coord.root);
     if (outcome === 'error') {
       log(
-        `coord ding: status refresh for "${deps.identity}" failed (best-effort, will retry next tick).\n`
+        `st ding: status refresh for "${deps.identity}" failed (best-effort, will retry next tick).\n`
       );
     } else if (outcome === 'left-corrupt') {
       log(
-        `coord ding: status file for "${deps.identity}" contains invalid content; refresh skipped.\n`
+        `st ding: status file for "${deps.identity}" contains invalid content; refresh skipped.\n`
       );
     }
     // refreshed / wrote-default / left-unknown are silent — they're
@@ -477,7 +477,7 @@ export async function runDing(deps: DingDeps): Promise<void> {
             buffer.push(ev);
           } catch (err) {
             log(
-              `coord ding: read retry still failing for ${fn}: ${errMsg(err)}\n`
+              `st ding: read retry still failing for ${fn}: ${errMsg(err)}\n`
             );
             readPending.push(fn);
           }
@@ -492,7 +492,7 @@ export async function runDing(deps: DingDeps): Promise<void> {
         state = await deps.coord.getStatus(deps.identity);
       } catch (err) {
         log(
-          `coord ding: getStatus failed: ${errMsg(err)}\n`
+          `st ding: getStatus failed: ${errMsg(err)}\n`
         );
         return;
       }
@@ -511,7 +511,7 @@ export async function runDing(deps: DingDeps): Promise<void> {
           const retries = (ev.retries ?? 0) + 1;
           if (retries >= MAX_DELIVER_RETRIES) {
             log(
-              `coord ding: giving up on ${ev.filename} after ${MAX_DELIVER_RETRIES} deliver attempts; ` +
+              `st ding: giving up on ${ev.filename} after ${MAX_DELIVER_RETRIES} deliver attempts; ` +
                 `check pty session "${deps.ptySession}" or restart ding\n`
             );
             continue; // drop after cap — loud log surface
@@ -549,7 +549,7 @@ export async function runDing(deps: DingDeps): Promise<void> {
     try {
       state = await deps.coord.getStatus(deps.identity);
     } catch (err) {
-      log(`coord ding: getStatus failed: ${errMsg(err)}\n`);
+      log(`st ding: getStatus failed: ${errMsg(err)}\n`);
       // If we can't read status, lean toward delivering — better
       // than silently dropping a coord message.
       state = 'available';
@@ -563,7 +563,7 @@ export async function runDing(deps: DingDeps): Promise<void> {
       // mid-rename → transient error → succeeds on retry. At-least-
       // once. Comment at the original ("lean toward delivering —
       // better than silently dropping") applies here too.
-      log(`coord ding: read failed for ${filename}: ${errMsg(err)}\n`);
+      log(`st ding: read failed for ${filename}: ${errMsg(err)}\n`);
       readPending.push(filename);
       ensureTimerArmed();
       return;
@@ -581,7 +581,7 @@ export async function runDing(deps: DingDeps): Promise<void> {
       const retries = (event.retries ?? 0) + 1;
       if (retries >= MAX_DELIVER_RETRIES) {
         log(
-          `coord ding: giving up on ${event.filename} after ${MAX_DELIVER_RETRIES} deliver attempts; ` +
+          `st ding: giving up on ${event.filename} after ${MAX_DELIVER_RETRIES} deliver attempts; ` +
             `check pty session "${deps.ptySession}" or restart ding\n`
         );
         return;
@@ -691,7 +691,7 @@ export async function runDing(deps: DingDeps): Promise<void> {
         !(err instanceof Error && err.name === 'AbortError') &&
         !signal.aborted
       ) {
-        log(`coord ding: watcher errored: ${errMsg(err)}\n`);
+        log(`st ding: watcher errored: ${errMsg(err)}\n`);
       }
     }
   })();
@@ -704,7 +704,7 @@ export async function runDing(deps: DingDeps): Promise<void> {
   try {
     await scanStartupBacklog();
   } catch (err) {
-    log(`coord ding: startup scan errored: ${errMsg(err)}\n`);
+    log(`st ding: startup scan errored: ${errMsg(err)}\n`);
   }
 
   // Watcher owns the daemon lifetime — it exits when the signal
@@ -798,7 +798,7 @@ async function buildEvent(
  * instructions reference an unambiguous string pattern for the
  * poke-handling flow ("when you see [DING] X, do Y").
  *
- * Post-rename naming: `smalltalk message`, not `coord message` —
+ * Post-rename naming: `smalltalk message`, not `st message` —
  * this is user-visible bus traffic and matches the CLI the agent
  * uses to act on it (`st message …`).
  */
@@ -824,13 +824,13 @@ async function deliver(
   try {
     result = await send(sessionName, sequences);
   } catch (err) {
-    log(`coord ding: pty send failed: ${errMsg(err)}\n`);
+    log(`st ding: pty send failed: ${errMsg(err)}\n`);
     return false;
   }
   if (result.status !== 0) {
     const tail = result.stderr.trim().slice(-200);
     log(
-      `coord ding: pty send to "${sessionName}" exited ${result.status}${
+      `st ding: pty send to "${sessionName}" exited ${result.status}${
         tail ? `: ${tail}` : ''
       }\n`
     );
@@ -966,7 +966,7 @@ export async function cmdDingCli(
             "  for Codex agents that don't run an MCP server per identity).\n" +
             '  Exits cleanly when the target pty session is gone.\n' +
             '  Long-running — pair with `pty up` for supervision.\n\n' +
-            '  --identity ID                    Coord identity to watch. Defaults to $COORD_IDENTITY.\n' +
+            '  --identity ID                    Smalltalk identity to watch. Defaults to $ST_AGENT.\n' +
             '  --interval MS                    Status poll interval while buffered. Default 1000ms.\n' +
             '  --tidy-interval-ms MS            Tidy-check tick interval. Default 20 min.\n' +
             '                                   Set to 0 to disable tidy-check entirely\n' +
@@ -1029,14 +1029,14 @@ export async function cmdDingCli(
     throw new Error('coord ding requires a <pty-session> name');
   }
 
-  const root = ctx.coordRoot;
+  const root = ctx.stRoot;
   if (!root) {
-    throw new Error('COORD_ROOT must be set for `coord ding`');
+    throw new Error('ST_ROOT must be set for `st ding`');
   }
-  const identityValue = identityArg ?? ctx.env.COORD_IDENTITY;
+  const identityValue = identityArg ?? ctx.env.ST_AGENT;
   if (!identityValue) {
     throw new Error(
-      '`coord ding` needs --identity ID or $COORD_IDENTITY to know which inbox to watch'
+      '`st ding` needs --identity ID or $ST_AGENT to know which inbox to watch'
     );
   }
 

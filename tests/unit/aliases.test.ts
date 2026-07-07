@@ -30,9 +30,9 @@ import {
 } from 'vitest';
 
 import {
-  _resetCoordFallbackWarnings,
+  _resetLegacyEnvFallbackWarnings,
   canonicalServerName,
-  coordRootFrom,
+  stRootFrom,
   envIdentityFrom,
   invokedAsFrom,
   resolveIdentity,
@@ -44,7 +44,7 @@ import { asIdentity } from '../../src/types.ts';
 let scratch: string;
 beforeEach(() => {
   scratch = mkdtempSync(join(tmpdir(), 'coord-aliases-test-'));
-  _resetCoordFallbackWarnings();
+  _resetLegacyEnvFallbackWarnings();
 });
 afterEach(() => {
   rmSync(scratch, { recursive: true, force: true });
@@ -53,117 +53,47 @@ afterEach(() => {
 
 // ─── Item 4: env-var dual-honor ───────────────────────────────────────────
 
-describe('env-var dual-honor (ST_* preferred over COORD_*)', () => {
-  it('coordRootFrom: ST_ROOT wins when both are set', () => {
+describe('env-var resolution (ST_* only; no COORD_* fallback)', () => {
+  it('stRootFrom: honors $ST_ROOT when set', () => {
+    const env = { ST_ROOT: '/tmp/isolated' } as NodeJS.ProcessEnv;
+    expect(stRootFrom(env)).toBe('/tmp/isolated');
+  });
+
+  it('stRootFrom: $COORD_ROOT is NOT honored (post-cutover)', () => {
+    // Regression guard for the coord-cutover: setting $COORD_ROOT
+    // must NOT be picked up. stRootFrom falls back to the default
+    // state root instead.
+    const env = { COORD_ROOT: '/tmp/legacy' } as NodeJS.ProcessEnv;
+    expect(stRootFrom(env)).not.toBe('/tmp/legacy');
+    expect(stRootFrom(env)).toMatch(/\.local\/state\/smalltalk$/);
+  });
+
+  it('envIdentityFrom: ST_AGENT wins over ST_IDENTITY when both are set', () => {
     const env = {
-      ST_ROOT: '/st/path',
-      COORD_ROOT: '/coord/path',
+      ST_AGENT: 'newname',
+      ST_IDENTITY: 'oldname',
     } as NodeJS.ProcessEnv;
-    expect(coordRootFrom(env)).toBe('/st/path');
+    expect(envIdentityFrom(env)).toBe('newname');
   });
 
-  it('coordRootFrom: COORD_ROOT used as fallback when ST_ROOT unset', () => {
-    const env = { COORD_ROOT: '/coord/path' } as NodeJS.ProcessEnv;
-    expect(coordRootFrom(env)).toBe('/coord/path');
+  it('envIdentityFrom: ST_IDENTITY used as fallback (warns once)', () => {
+    const env = { ST_IDENTITY: 'oldname' } as NodeJS.ProcessEnv;
+    expect(envIdentityFrom(env)).toBe('oldname');
   });
 
-  it('envIdentityFrom: ST_IDENTITY wins when both are set', () => {
-    const env = {
-      ST_IDENTITY: 'st-bob',
-      COORD_IDENTITY: 'coord-bob',
-    } as NodeJS.ProcessEnv;
-    expect(envIdentityFrom(env)).toBe('st-bob');
-  });
-
-  it('envIdentityFrom: COORD_IDENTITY used as fallback', () => {
-    const env = { COORD_IDENTITY: 'coord-bob' } as NodeJS.ProcessEnv;
-    expect(envIdentityFrom(env)).toBe('coord-bob');
+  it('envIdentityFrom: $COORD_IDENTITY is NOT honored (post-cutover)', () => {
+    // Regression guard: coord-era env alias no longer resolves.
+    const env = { COORD_IDENTITY: 'legacy' } as NodeJS.ProcessEnv;
+    expect(envIdentityFrom(env)).toBeUndefined();
   });
 
   it('envIdentityFrom: neither set → undefined (caller throws own error)', () => {
     expect(envIdentityFrom({} as NodeJS.ProcessEnv)).toBeUndefined();
   });
 
-  it('warns ONCE per process when COORD_ROOT is honored', () => {
+  it('envIdentityFrom: warns once when honoring the legacy ST_IDENTITY', () => {
     const spy = vi.spyOn(process.stderr, 'write').mockReturnValue(true);
-    const env = { COORD_ROOT: '/coord/path' } as NodeJS.ProcessEnv;
-    coordRootFrom(env);
-    coordRootFrom(env);
-    coordRootFrom(env);
-    const warnCalls = spy.mock.calls.filter((c) =>
-      String(c[0]).includes('COORD_ROOT')
-    );
-    expect(warnCalls).toHaveLength(1);
-    expect(String(warnCalls[0]![0])).toContain('migrate to ST_ROOT');
-  });
-
-  it('warns ONCE per process when COORD_IDENTITY is honored', () => {
-    const spy = vi.spyOn(process.stderr, 'write').mockReturnValue(true);
-    const env = { COORD_IDENTITY: 'coord-bob' } as NodeJS.ProcessEnv;
-    envIdentityFrom(env);
-    envIdentityFrom(env);
-    const warnCalls = spy.mock.calls.filter((c) =>
-      String(c[0]).includes('COORD_IDENTITY')
-    );
-    expect(warnCalls).toHaveLength(1);
-    expect(String(warnCalls[0]![0])).toContain('migrate to ST_AGENT');
-  });
-
-  it('no warning when ST_ROOT is set (no fallback)', () => {
-    const spy = vi.spyOn(process.stderr, 'write').mockReturnValue(true);
-    coordRootFrom({ ST_ROOT: '/st' } as NodeJS.ProcessEnv);
-    const warnCalls = spy.mock.calls.filter((c) =>
-      String(c[0]).includes('honoring COORD_')
-    );
-    expect(warnCalls).toHaveLength(0);
-  });
-
-  it('resolveIdentity: ST_IDENTITY preferred over COORD_IDENTITY', () => {
-    // Real folder under our scratch HOME for the auto-create path.
-    const root = join(scratch, 'state');
-    mkdirSync(root, { recursive: true });
-    const env = {
-      ST_IDENTITY: 'st-claude',
-      COORD_IDENTITY: 'coord-claude',
-    } as NodeJS.ProcessEnv;
-    expect(resolveIdentity({ env, coordRoot: root })).toBe('st-claude');
-  });
-
-  it('resolveIdentity: ST_AGENT preferred over ST_IDENTITY (brief-009 item 3)', () => {
-    const root = join(scratch, 'state');
-    mkdirSync(root, { recursive: true });
-    const env = {
-      ST_AGENT: 'st-agent',
-      ST_IDENTITY: 'st-identity',
-      COORD_IDENTITY: 'coord-identity',
-    } as NodeJS.ProcessEnv;
-    expect(resolveIdentity({ env, coordRoot: root })).toBe('st-agent');
-  });
-
-  it('resolveIdentity: three-level fallback ST_AGENT > ST_IDENTITY > COORD_IDENTITY', () => {
-    const root = join(scratch, 'state');
-    mkdirSync(root, { recursive: true });
-    // Only COORD_IDENTITY set → it gets honored.
-    const e1 = { COORD_IDENTITY: 'coord-only' } as NodeJS.ProcessEnv;
-    expect(resolveIdentity({ env: e1, coordRoot: root })).toBe('coord-only');
-    // ST_IDENTITY but no ST_AGENT → ST_IDENTITY wins.
-    const e2 = {
-      ST_IDENTITY: 'st-identity',
-      COORD_IDENTITY: 'coord-id',
-    } as NodeJS.ProcessEnv;
-    expect(resolveIdentity({ env: e2, coordRoot: root })).toBe('st-identity');
-    // All three set → ST_AGENT wins.
-    const e3 = {
-      ST_AGENT: 'st-agent',
-      ST_IDENTITY: 'st-identity',
-      COORD_IDENTITY: 'coord-id',
-    } as NodeJS.ProcessEnv;
-    expect(resolveIdentity({ env: e3, coordRoot: root })).toBe('st-agent');
-  });
-
-  it('envIdentityFrom: warns once when honoring ST_IDENTITY (post brief-009 item 3)', () => {
-    const spy = vi.spyOn(process.stderr, 'write').mockReturnValue(true);
-    const env = { ST_IDENTITY: 'st-identity-bob' } as NodeJS.ProcessEnv;
+    const env = { ST_IDENTITY: 'legacyname' } as NodeJS.ProcessEnv;
     envIdentityFrom(env);
     envIdentityFrom(env);
     const warnCalls = spy.mock.calls.filter((c) =>
@@ -171,36 +101,44 @@ describe('env-var dual-honor (ST_* preferred over COORD_*)', () => {
     );
     expect(warnCalls).toHaveLength(1);
     expect(String(warnCalls[0]![0])).toContain('migrate to ST_AGENT');
+    spy.mockRestore();
+  });
+
+  it('resolveIdentity: ST_AGENT preferred over ST_IDENTITY', () => {
+    const root = join(scratch, 'state');
+    mkdirSync(root, { recursive: true });
+    const env = {
+      ST_AGENT: 'primary',
+      ST_IDENTITY: 'secondary',
+    } as NodeJS.ProcessEnv;
+    expect(resolveIdentity({ env, stRoot: root })).toBe('primary');
+  });
+
+  it('resolveIdentity: $COORD_IDENTITY is NOT honored (post-cutover)', () => {
+    const root = join(scratch, 'state');
+    mkdirSync(root, { recursive: true });
+    const env = { COORD_IDENTITY: 'legacy' } as NodeJS.ProcessEnv;
+    expect(() => resolveIdentity({ env, stRoot: root })).toThrow(
+      /agent required/
+    );
   });
 });
 
-// ─── Item 5: state-dir resolution ─────────────────────────────────────────
+// ─── Item 5: state-dir resolution (post-cutover: smalltalk/ only) ────────
 
-describe('state-dir resolution (~/.local/state/smalltalk vs /coord)', () => {
+describe('state-dir resolution (~/.local/state/smalltalk)', () => {
   function withFakeHome(setup: (home: string) => void): string {
     const home = join(scratch, 'home');
     mkdirSync(home, { recursive: true });
     setup(home);
-    return coordRootFrom({ HOME: home } as NodeJS.ProcessEnv);
+    return stRootFrom({ HOME: home } as NodeJS.ProcessEnv);
   }
 
-  it('only smalltalk/ exists → use smalltalk/', () => {
+  it('always resolves to ~/.local/state/smalltalk (no coord fallback)', () => {
+    // Post-cutover: even when `~/.local/state/coord` exists on the
+    // machine, it's ignored. `smalltalk/` is the sole default state
+    // root.
     const r = withFakeHome((home) => {
-      mkdirSync(join(home, '.local/state/smalltalk'), { recursive: true });
-    });
-    expect(r).toMatch(/\.local\/state\/smalltalk$/);
-  });
-
-  it('only coord/ exists → fall back to coord/', () => {
-    const r = withFakeHome((home) => {
-      mkdirSync(join(home, '.local/state/coord'), { recursive: true });
-    });
-    expect(r).toMatch(/\.local\/state\/coord$/);
-  });
-
-  it('BOTH exist → silently prefer smalltalk/ (per pty-claude Nit 2)', () => {
-    const r = withFakeHome((home) => {
-      mkdirSync(join(home, '.local/state/smalltalk'), { recursive: true });
       mkdirSync(join(home, '.local/state/coord'), { recursive: true });
     });
     expect(r).toMatch(/\.local\/state\/smalltalk$/);
@@ -217,18 +155,15 @@ describe('state-dir resolution (~/.local/state/smalltalk vs /coord)', () => {
     });
     void r; // setup
     expect(
-      coordRootFrom({ ST_ROOT: '/explicit', HOME: scratch } as NodeJS.ProcessEnv)
+      stRootFrom({ ST_ROOT: '/explicit', HOME: scratch } as NodeJS.ProcessEnv)
     ).toBe('/explicit');
   });
 });
 
 // ─── invokedAs + canonical-server-name helpers ────────────────────────────
 
-describe('invokedAsFrom + canonicalServerName', () => {
-  it('reads _ST_INVOKED_AS and accepts the three canonical names', () => {
-    expect(invokedAsFrom({ _ST_INVOKED_AS: 'coord' } as NodeJS.ProcessEnv)).toBe(
-      'coord'
-    );
+describe('invokedAsFrom + canonicalServerName (post-coord-cutover)', () => {
+  it('reads _ST_INVOKED_AS and accepts st + smalltalk', () => {
     expect(invokedAsFrom({ _ST_INVOKED_AS: 'st' } as NodeJS.ProcessEnv)).toBe(
       'st'
     );
@@ -237,57 +172,27 @@ describe('invokedAsFrom + canonicalServerName', () => {
     ).toBe('smalltalk');
   });
 
-  it('defaults to coord when env var is absent or unknown', () => {
-    expect(invokedAsFrom({} as NodeJS.ProcessEnv)).toBe('coord');
+  it('defaults to `st` when env var is absent or unknown', () => {
+    expect(invokedAsFrom({} as NodeJS.ProcessEnv)).toBe('st');
     expect(invokedAsFrom({ _ST_INVOKED_AS: 'nope' } as NodeJS.ProcessEnv)).toBe(
-      'coord'
+      'st'
     );
   });
 
-  it('canonicalServerName: coord → coord; st/smalltalk → st', () => {
-    expect(canonicalServerName('coord')).toBe('coord');
+  it('canonicalServerName: st + smalltalk both → st', () => {
     expect(canonicalServerName('st')).toBe('st');
     expect(canonicalServerName('smalltalk')).toBe('st');
   });
 });
 
-// ─── Item 2: MCP server name dual-registration ────────────────────────────
+// ─── MCP server name (post-coord-cutover: always `st`) ───────────────────
 
-describe('MCP server name (Item 2)', () => {
+describe('MCP server name (post-coord-cutover)', () => {
   it('buildServerInfo returns the name passed in', () => {
-    expect(buildServerInfo('coord').name).toBe('coord');
     expect(buildServerInfo('st').name).toBe('st');
   });
 
-  it('version is preserved across both names', () => {
-    expect(buildServerInfo('coord').version).toBe(
-      buildServerInfo('st').version
-    );
-  });
-
-  it('server announces "st" when serverName: "st" passed to createMcpServer', async () => {
-    const root = join(scratch, 'state');
-    mkdirSync(join(root, 'tester', 'inbox'), { recursive: true });
-    mkdirSync(join(root, 'tester', 'archive'), { recursive: true });
-    const handle = createMcpServer({
-      root,
-      identity: asIdentity('tester'),
-      serverName: 'st',
-    });
-    const [a, b] = InMemoryTransport.createLinkedPair();
-    const client = new Client({ name: 'aliases-test', version: '0' });
-    await Promise.all([client.connect(a), handle.mcp.connect(b)]);
-    try {
-      // serverVersion includes name + version.
-      const info = client.getServerVersion();
-      expect(info?.name).toBe('st');
-    } finally {
-      await client.close();
-      await handle.close();
-    }
-  });
-
-  it('server announces "coord" by default (back-compat)', async () => {
+  it('server announces "st" by default (no coord back-compat)', async () => {
     const root = join(scratch, 'state');
     mkdirSync(join(root, 'tester', 'inbox'), { recursive: true });
     mkdirSync(join(root, 'tester', 'archive'), { recursive: true });
@@ -299,7 +204,7 @@ describe('MCP server name (Item 2)', () => {
     const client = new Client({ name: 'aliases-test', version: '0' });
     await Promise.all([client.connect(a), handle.mcp.connect(b)]);
     try {
-      expect(client.getServerVersion()?.name).toBe('coord');
+      expect(client.getServerVersion()?.name).toBe('st');
     } finally {
       await client.close();
       await handle.close();

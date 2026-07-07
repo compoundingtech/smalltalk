@@ -17,19 +17,19 @@ import { createMcpServer } from '../../../src/mcp/index.ts';
 import { asIdentity } from '../../../src/types.ts';
 
 let scratch: string;
-let coordRoot: string;
+let stRoot: string;
 let client: Client;
 let handle: ReturnType<typeof createMcpServer>;
 
 beforeEach(async () => {
   scratch = mkdtempSync(join(tmpdir(), 'coord-mcp-context-'));
-  coordRoot = join(scratch, 'coord');
+  stRoot = join(scratch, 'coord');
   for (const id of ['alice', 'bob']) {
-    mkdirSync(join(coordRoot, id, 'inbox'), { recursive: true });
-    mkdirSync(join(coordRoot, id, 'archive'), { recursive: true });
+    mkdirSync(join(stRoot, id, 'inbox'), { recursive: true });
+    mkdirSync(join(stRoot, id, 'archive'), { recursive: true });
   }
   handle = createMcpServer({
-    root: coordRoot,
+    root: stRoot,
     identity: asIdentity('alice'),
   });
   client = new Client({ name: 'test-context', version: '1.0' });
@@ -116,7 +116,7 @@ describe('st_context_read — absent-able', () => {
     });
     // A read must not create the folder — the eval's control arm needs
     // this to stay absent so the "no context" scenario is testable.
-    expect(existsSync(join(coordRoot, 'alice', 'context'))).toBe(false);
+    expect(existsSync(join(stRoot, 'alice', 'context'))).toBe(false);
   });
 
   it('summary line reflects the absent state', async () => {

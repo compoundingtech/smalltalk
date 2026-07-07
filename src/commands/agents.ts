@@ -45,7 +45,7 @@ export interface AgentSummaryEnriched extends AgentSummary {
   /** Newest mtime across inbox/archive/status, or null if nothing at
    *  all under the agent has been touched. */
   lastActivity: number | null;
-  /** Count of valid-grammar files in <agent>/inbox/ (mirrors `coord ls
+  /** Count of valid-grammar files in <agent>/inbox/ (mirrors `st ls
    *  --count`). */
   inbox: number;
 }
@@ -53,7 +53,7 @@ export interface AgentSummaryEnriched extends AgentSummary {
 export interface AgentsInput {
   status?: string | undefined;
   enrich?: boolean | undefined;
-  coordRoot: string;
+  stRoot: string;
 }
 
 export interface AgentsResult<TEnriched extends boolean = false> {
@@ -111,7 +111,7 @@ export function getAgents(
 export function cmdAgents(
   input: AgentsInput
 ): AgentsResult<false> | AgentsResult<true> {
-  const items = getAgents(input.coordRoot, {
+  const items = getAgents(input.stRoot, {
     ...(input.status !== undefined && { status: input.status }),
     ...(input.enrich !== undefined && { enrich: input.enrich }),
   });
@@ -280,7 +280,7 @@ export function cmdAgentsCli(
   const r = cmdAgents({
     ...(status !== undefined && { status }),
     enrich,
-    coordRoot: ctx.coordRoot,
+    stRoot: ctx.stRoot,
   });
   if (json) {
     ctx.stdout(`${JSON.stringify(r.items)}\n`);

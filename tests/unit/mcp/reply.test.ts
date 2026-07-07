@@ -31,13 +31,13 @@ interface CallResult {
 }
 
 let scratch: string;
-let coordRoot: string;
+let stRoot: string;
 let client: Client;
 let handle: ReturnType<typeof createMcpServer>;
 
 async function setup(opts: { channel: boolean; identity?: string }): Promise<void> {
   handle = createMcpServer({
-    root: coordRoot,
+    root: stRoot,
     identity: asIdentity(opts.identity ?? 'bob'),
     channel: opts.channel,
   });
@@ -48,10 +48,10 @@ async function setup(opts: { channel: boolean; identity?: string }): Promise<voi
 
 beforeEach(() => {
   scratch = mkdtempSync(join(tmpdir(), 'coord-mcp-reply-'));
-  coordRoot = join(scratch, 'coord');
+  stRoot = join(scratch, 'coord');
   for (const id of ['alice', 'bob', 'carol']) {
-    mkdirSync(join(coordRoot, id, 'inbox'), { recursive: true });
-    mkdirSync(join(coordRoot, id, 'archive'), { recursive: true });
+    mkdirSync(join(stRoot, id, 'inbox'), { recursive: true });
+    mkdirSync(join(stRoot, id, 'archive'), { recursive: true });
   }
 });
 afterEach(async () => {
@@ -70,7 +70,7 @@ function plant(
     .map(([k, v]) => `${k}: ${v}`)
     .join('\n');
   writeFileSync(
-    join(coordRoot, identity, folder, filename),
+    join(stRoot, identity, folder, filename),
     `---\n${head}\n---\n${body}\n`
   );
 }
@@ -83,7 +83,7 @@ async function reply(args: Record<string, unknown>): Promise<CallResult> {
 }
 
 function readReply(identity: string, filename: string): string {
-  return readFileSync(join(coordRoot, identity, 'inbox', filename), 'utf8');
+  return readFileSync(join(stRoot, identity, 'inbox', filename), 'utf8');
 }
 
 // ─── Registration / mode gating ────────────────────────────────────────
@@ -163,7 +163,7 @@ describe('st_msg_reply — happy paths', () => {
     expect(r.isError).toBeUndefined();
     const sc = r.structuredContent as { identity: string; filename: string };
     expect(sc.identity).toBe('alice');
-    expect(existsSync(join(coordRoot, 'alice', 'inbox', sc.filename))).toBe(true);
+    expect(existsSync(join(stRoot, 'alice', 'inbox', sc.filename))).toBe(true);
   });
 
   it('explicit subject overrides the auto-derived re: form', async () => {
@@ -215,8 +215,11 @@ describe('st_msg_reply — typed error mapping', () => {
   });
 
   it('legacy 3-segment filename → INVALID_FILENAME', async () => {
+    // Legacy filenames included a middle name segment (`<unix-ms>-
+    // <sender>-<rand6>.md`) — brief-017 dropped that back to a
+    // 2-segment grammar. Any 3+ segment filename hits the validator.
     const r = await reply({
-      thread: '1714826789010-myobie-aaaaaa.md',
+      thread: '1714826789010-legacy-aaaaaa.md',
       body: 'x',
     });
     expect(errorCode(r)).toBe('INVALID_FILENAME');
@@ -234,7 +237,7 @@ describe('st_msg_reply — typed error mapping', () => {
     // Frontmatter fence with no `from`; st_msg_reply has no recipient
     // to send to.
     writeFileSync(
-      join(coordRoot, 'bob', 'inbox', orig),
+      join(stRoot, 'bob', 'inbox', orig),
       '---\nsubject: orphan\n---\nbody\n'
     );
     const r = await reply({ thread: orig, body: 'x' });
@@ -254,26 +257,26 @@ describe('st_msg_reply — side effects', () => {
     plant('bob', orig, { from: 'alice' }, 'q');
     await reply({ thread: orig, body: 'a' });
     // bob's inbox has only the original message; archive empty.
-    expect(readdirSync(join(coordRoot, 'bob', 'inbox'))).toEqual([orig]);
-    expect(readdirSync(join(coordRoot, 'bob', 'archive'))).toEqual([]);
+    expect(readdirSync(join(stRoot, 'bob', 'inbox'))).toEqual([orig]);
+    expect(readdirSync(join(stRoot, 'bob', 'archive'))).toEqual([]);
     // alice received exactly one new file.
-    expect(readdirSync(join(coordRoot, 'alice', 'inbox'))).toHaveLength(1);
+    expect(readdirSync(join(stRoot, 'alice', 'inbox'))).toHaveLength(1);
   });
 });
 
-// ─── brief-035 task 1: invariant + concurrency pin-down ────────────────
+// ─── Concurrency invariant pin-down ────────────────────────────────────
 //
-// myobie observed two parallel `st_msg_reply` calls landing in the
-// recipient's *archive* instead of *inbox*, alongside three concurrent
-// `st_msg_archive` calls on the sender's tree. Investigation: the
-// MCP `coord.send` path writes only to inboxDir(to, root) (see
-// commands/send.ts cmdSend) and the pre-command sweep only DELETES
-// inbox files that have a byte-identical twin already in archive
-// (common.ts:sweep). There is no MCP path that writes to or moves
-// into archive. The anomaly almost certainly came from coord-web's
-// archive UI (myobie clicking through messages). These tests pin
-// every adjacent invariant so a future refactor can't reintroduce
-// the worry.
+// An operator observed two parallel `st_msg_reply` calls landing in
+// the recipient's *archive* instead of *inbox*, alongside three
+// concurrent `st_msg_archive` calls on the sender's tree.
+// Investigation: the MCP send path writes only to inboxDir(to, root)
+// (see commands/send.ts cmdSend) and the pre-command sweep only
+// DELETES inbox files that have a byte-identical twin already in
+// archive (common.ts:sweep). There is no MCP path that writes to or
+// moves into archive. The anomaly almost certainly came from an
+// external UI clicking through messages. These tests pin every
+// adjacent invariant so a future refactor can't reintroduce the
+// worry.
 
 describe('st_msg_reply — invariants under archive concurrency (brief-035)', () => {
   beforeEach(async () => {
@@ -287,11 +290,11 @@ describe('st_msg_reply — invariants under archive concurrency (brief-035)', ()
     expect(r.isError).toBeUndefined();
     const filename = r.structuredContent?.filename as string;
     // Affirmative: in alice/inbox.
-    expect(existsSync(join(coordRoot, 'alice', 'inbox', filename))).toBe(
+    expect(existsSync(join(stRoot, 'alice', 'inbox', filename))).toBe(
       true
     );
     // Negative: NOT in alice/archive.
-    expect(existsSync(join(coordRoot, 'alice', 'archive', filename))).toBe(
+    expect(existsSync(join(stRoot, 'alice', 'archive', filename))).toBe(
       false
     );
   });
@@ -329,10 +332,10 @@ describe('st_msg_reply — invariants under archive concurrency (brief-035)', ()
     plant('bob', '1714826789050-eeeeee.md', { from: 'alice' }, 'q2');
 
     const aliceInboxBefore = readdirSync(
-      join(coordRoot, 'alice', 'inbox')
+      join(stRoot, 'alice', 'inbox')
     ).length;
     const aliceArchiveBefore = readdirSync(
-      join(coordRoot, 'alice', 'archive')
+      join(stRoot, 'alice', 'archive')
     ).length;
 
     const archive = (filename: string) =>
@@ -361,9 +364,9 @@ describe('st_msg_reply — invariants under archive concurrency (brief-035)', ()
     }
 
     // alice receives EXACTLY two replies, both in inbox, zero in archive.
-    const aliceInboxAfter = readdirSync(join(coordRoot, 'alice', 'inbox'));
+    const aliceInboxAfter = readdirSync(join(stRoot, 'alice', 'inbox'));
     const aliceArchiveAfter = readdirSync(
-      join(coordRoot, 'alice', 'archive')
+      join(stRoot, 'alice', 'archive')
     );
     expect(aliceInboxAfter.length - aliceInboxBefore).toBe(2);
     expect(aliceArchiveAfter.length - aliceArchiveBefore).toBe(0);
@@ -371,12 +374,12 @@ describe('st_msg_reply — invariants under archive concurrency (brief-035)', ()
     // bob's tree: the three archived messages are now in archive, the
     // two alice messages remain in inbox (since they weren't archived,
     // only replied to).
-    expect(readdirSync(join(coordRoot, 'bob', 'archive')).sort()).toEqual([
+    expect(readdirSync(join(stRoot, 'bob', 'archive')).sort()).toEqual([
       '1714826789010-aaaaaa.md',
       '1714826789020-bbbbbb.md',
       '1714826789030-cccccc.md',
     ]);
-    expect(readdirSync(join(coordRoot, 'bob', 'inbox')).sort()).toEqual([
+    expect(readdirSync(join(stRoot, 'bob', 'inbox')).sort()).toEqual([
       '1714826789040-dddddd.md',
       '1714826789050-eeeeee.md',
     ]);
@@ -399,14 +402,14 @@ describe('st_msg_reply — invariants under archive concurrency (brief-035)', ()
     plant('bob', orig, { from: 'alice' }, 'q');
     const r = await reply({ thread: orig, body: 'a' });
     const filename = r.structuredContent?.filename as string;
-    expect(existsSync(join(coordRoot, 'alice', 'inbox', filename))).toBe(
+    expect(existsSync(join(stRoot, 'alice', 'inbox', filename))).toBe(
       true
     );
-    expect(existsSync(join(coordRoot, 'alice', 'archive', filename))).toBe(
+    expect(existsSync(join(stRoot, 'alice', 'archive', filename))).toBe(
       false
     );
     // archive still has just the pre-existing unrelated file.
-    expect(readdirSync(join(coordRoot, 'alice', 'archive'))).toEqual([
+    expect(readdirSync(join(stRoot, 'alice', 'archive'))).toEqual([
       '1714826789000-zzzzzz.md',
     ]);
   });

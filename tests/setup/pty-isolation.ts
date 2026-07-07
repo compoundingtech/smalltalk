@@ -4,7 +4,7 @@
 // `spawn`/`spawnSync('pty', ...)` call inherits a temp PTY_SESSION_DIR
 // via process.env and the user's real ~/.local/state/pty/ stays clean.
 //
-// Background: brief-020 — myobie discovered 120 leaked
+// Background: brief-020 — operator discovered 120 leaked
 // `coord-ding-it-*` sessions in their real pty session list, all
 // originating from tests/integration/ding.test.ts spawning real pty
 // sessions without isolating PTY_SESSION_DIR. A one-off test fix

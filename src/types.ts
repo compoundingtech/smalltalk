@@ -72,7 +72,7 @@ export function asFilename(s: string): Filename {
  * Broader-than-{@link asFilename} guard: accepts LAYOUT-004 canonical
  * grammar OR a safe "outside" `.md` basename. Use at the boundaries
  * that must tolerate off-format `.md` files (channel-watcher delivery,
- * `coord message ls / read / archive`). Strict paths that depend on
+ * `st message ls / read / archive`). Strict paths that depend on
  * timestamp / prefix derivation must keep using {@link asFilename}.
  */
 export function asDeliverableFilename(s: string): Filename {

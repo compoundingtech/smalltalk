@@ -30,13 +30,13 @@ import { cmdStatus } from '../../src/commands/status.ts';
 import { cmdThread } from '../../src/commands/thread.ts';
 
 let scratch: string;
-let coordRoot: string;
+let stRoot: string;
 const chmodRestores: Array<{ path: string; mode: number }> = [];
 
 beforeEach(() => {
   scratch = mkdtempSync(join(tmpdir(), 'coord-resilience-test-'));
-  coordRoot = join(scratch, 'coord');
-  mkdirSync(coordRoot, { recursive: true });
+  stRoot = join(scratch, 'coord');
+  mkdirSync(stRoot, { recursive: true });
 });
 afterEach(() => {
   // Restore any permissions we changed so rmSync can clean up.
@@ -52,8 +52,8 @@ afterEach(() => {
 });
 
 function setupIdentity(id: string): void {
-  mkdirSync(join(coordRoot, id, 'inbox'), { recursive: true });
-  mkdirSync(join(coordRoot, id, 'archive'), { recursive: true });
+  mkdirSync(join(stRoot, id, 'inbox'), { recursive: true });
+  mkdirSync(join(stRoot, id, 'archive'), { recursive: true });
 }
 
 function rememberChmod(path: string, currentMode: number): void {
@@ -64,28 +64,28 @@ function rememberChmod(path: string, currentMode: number): void {
 
 describe('resilience: missing identity folder on read', () => {
   it('cmdLs <id> with only inbox/ exists → empty list, no throw', () => {
-    mkdirSync(join(coordRoot, 'partial', 'inbox'), { recursive: true });
+    mkdirSync(join(stRoot, 'partial', 'inbox'), { recursive: true });
     const r = cmdLs({
       recipient: 'partial',
       env: {} as NodeJS.ProcessEnv,
-      coordRoot,
+      stRoot,
     });
     expect(r.matches).toEqual([]);
   });
 
   it('cmdLs --archive on identity with only inbox/ → empty list, no throw', () => {
-    mkdirSync(join(coordRoot, 'partial', 'inbox'), { recursive: true });
+    mkdirSync(join(stRoot, 'partial', 'inbox'), { recursive: true });
     const r = cmdLs({
       recipient: 'partial',
       archive: true,
       env: {} as NodeJS.ProcessEnv,
-      coordRoot,
+      stRoot,
     });
     expect(r.matches).toEqual([]);
   });
 
   it('cmdMembers with no identities → empty array, no throw', () => {
-    const r = cmdMembers({ coordRoot });
+    const r = cmdMembers({ stRoot });
     expect(r.items).toEqual([]);
   });
 
@@ -100,7 +100,7 @@ describe('resilience: malformed frontmatter', () => {
 
   it('cmdRead tolerates unterminated frontmatter fence', () => {
     writeFileSync(
-      join(coordRoot, 'alice', 'inbox', '1714826789010-aaaaaa.md'),
+      join(stRoot, 'alice', 'inbox', '1714826789010-aaaaaa.md'),
       '---\nfrom: bob\nsubject: x\n(no closing fence)\nbody continues\n'
     );
     expect(() =>
@@ -108,52 +108,52 @@ describe('resilience: malformed frontmatter', () => {
         recipient: 'alice',
         filename: '1714826789010-aaaaaa.md',
         env: {} as NodeJS.ProcessEnv,
-        coordRoot,
+        stRoot,
       })
     ).not.toThrow();
   });
 
   it('cmdLs lists files with key-only frontmatter lines', () => {
     writeFileSync(
-      join(coordRoot, 'alice', 'inbox', '1714826789010-aaaaaa.md'),
+      join(stRoot, 'alice', 'inbox', '1714826789010-aaaaaa.md'),
       '---\nfrom\nrandomKey:\n---\nbody\n'
     );
     const r = cmdLs({
       recipient: 'alice',
       env: {} as NodeJS.ProcessEnv,
-      coordRoot,
+      stRoot,
     });
     expect(r.matches).toContain('1714826789010-aaaaaa.md');
   });
 
   it('cmdLs tolerates a file of binary-ish bytes', () => {
     writeFileSync(
-      join(coordRoot, 'alice', 'inbox', '1714826789010-aaaaaa.md'),
+      join(stRoot, 'alice', 'inbox', '1714826789010-aaaaaa.md'),
       Buffer.from([0x00, 0xff, 0x7f, 0x01, 0x02])
     );
     expect(() =>
       cmdLs({
         recipient: 'alice',
         env: {} as NodeJS.ProcessEnv,
-        coordRoot,
+        stRoot,
       })
     ).not.toThrow();
   });
 
   it('cmdLs --from filter with malformed frontmatter just skips non-matches', () => {
     writeFileSync(
-      join(coordRoot, 'alice', 'inbox', '1714826789010-aaaaaa.md'),
+      join(stRoot, 'alice', 'inbox', '1714826789010-aaaaaa.md'),
       'no fence at all\n'
     );
     writeFileSync(
-      join(coordRoot, 'alice', 'inbox', '1714826789020-bbbbbb.md'),
+      join(stRoot, 'alice', 'inbox', '1714826789020-bbbbbb.md'),
       '---\nfrom: bob\n---\nb\n'
     );
     const r = cmdLs({
       recipient: 'alice',
       fromFilter: 'bob',
       env: {} as NodeJS.ProcessEnv,
-      coordRoot,
+      stRoot,
     });
     expect(r.matches).toEqual(['1714826789020-bbbbbb.md']);
   });
@@ -165,7 +165,7 @@ describe('resilience: broken in-reply-to chain', () => {
   it('cmdThread tolerates an in-reply-to filename that doesn\'t exist', () => {
     setupIdentity('alice');
     writeFileSync(
-      join(coordRoot, 'alice', 'inbox', '1714826789020-bbbbbb.md'),
+      join(stRoot, 'alice', 'inbox', '1714826789020-bbbbbb.md'),
       '---\nfrom: bob\nin-reply-to: 1714826789010-ghost1.md\n---\nreply\n'
     );
     // Should NOT throw; the walk yields what it can.
@@ -174,7 +174,7 @@ describe('resilience: broken in-reply-to chain', () => {
         recipient: 'alice',
         filename: '1714826789020-bbbbbb.md',
         env: {} as NodeJS.ProcessEnv,
-        coordRoot,
+        stRoot,
       })
     ).not.toThrow();
   });
@@ -188,23 +188,23 @@ describe('resilience: partial-write files', () => {
   });
 
   it('0-byte inbox file does not crash cmdLs', () => {
-    writeFileSync(join(coordRoot, 'alice', 'inbox', '1714826789010-aaaaaa.md'), '');
+    writeFileSync(join(stRoot, 'alice', 'inbox', '1714826789010-aaaaaa.md'), '');
     const r = cmdLs({
       recipient: 'alice',
       env: {} as NodeJS.ProcessEnv,
-      coordRoot,
+      stRoot,
     });
     expect(r.matches).toContain('1714826789010-aaaaaa.md');
   });
 
   it('0-byte inbox file does not crash cmdRead', () => {
-    writeFileSync(join(coordRoot, 'alice', 'inbox', '1714826789010-aaaaaa.md'), '');
+    writeFileSync(join(stRoot, 'alice', 'inbox', '1714826789010-aaaaaa.md'), '');
     expect(() =>
       cmdRead({
         recipient: 'alice',
         filename: '1714826789010-aaaaaa.md',
         env: {} as NodeJS.ProcessEnv,
-        coordRoot,
+        stRoot,
       })
     ).not.toThrow();
   });
@@ -212,7 +212,7 @@ describe('resilience: partial-write files', () => {
   it('half-written frontmatter (missing closing fence) does not crash cmdLs --from', () => {
     // Simulates an rsync mid-transfer that copied half the bytes.
     writeFileSync(
-      join(coordRoot, 'alice', 'inbox', '1714826789010-aaaaaa.md'),
+      join(stRoot, 'alice', 'inbox', '1714826789010-aaaaaa.md'),
       '---\nfrom: bob\nsub'
     );
     expect(() =>
@@ -220,7 +220,7 @@ describe('resilience: partial-write files', () => {
         recipient: 'alice',
         fromFilter: 'bob',
         env: {} as NodeJS.ProcessEnv,
-        coordRoot,
+        stRoot,
       })
     ).not.toThrow();
   });
@@ -231,11 +231,11 @@ describe('resilience: partial-write files', () => {
 describe('resilience: malformed status file', () => {
   it('garbage status file → cmdStatus reports offline', () => {
     setupIdentity('alice');
-    writeFileSync(join(coordRoot, 'alice', 'status'), '???\n');
+    writeFileSync(join(stRoot, 'alice', 'status'), '???\n');
     const r = cmdStatus({
       recipient: 'alice',
       env: {} as NodeJS.ProcessEnv,
-      coordRoot,
+      stRoot,
     });
     expect(r.mode).toBe('get');
     if (r.mode === 'get') expect(r.state).toBe('offline');
@@ -244,13 +244,13 @@ describe('resilience: malformed status file', () => {
   it('multiline status file → first line wins; garbage normalizes to offline', () => {
     setupIdentity('alice');
     writeFileSync(
-      join(coordRoot, 'alice', 'status'),
+      join(stRoot, 'alice', 'status'),
       'random text\navailable\n'
     );
     const r = cmdStatus({
       recipient: 'alice',
       env: {} as NodeJS.ProcessEnv,
-      coordRoot,
+      stRoot,
     });
     if (r.mode === 'get') expect(r.state).toBe('offline');
   });
@@ -258,9 +258,9 @@ describe('resilience: malformed status file', () => {
   it('cmdMembers --status filter routes malformed-status to offline', () => {
     setupIdentity('alice');
     setupIdentity('bob');
-    writeFileSync(join(coordRoot, 'alice', 'status'), 'JUNK!!!\n');
-    writeFileSync(join(coordRoot, 'bob', 'status'), 'available\n');
-    const offline = cmdMembers({ status: 'offline', coordRoot });
+    writeFileSync(join(stRoot, 'alice', 'status'), 'JUNK!!!\n');
+    writeFileSync(join(stRoot, 'bob', 'status'), 'available\n');
+    const offline = cmdMembers({ status: 'offline', stRoot });
     expect(offline.items.map((m) => m.identity)).toEqual(['alice']);
   });
 });
@@ -274,16 +274,16 @@ describe('resilience: concurrent status writes', () => {
       recipient: 'alice',
       setState: 'busy',
       env: {} as NodeJS.ProcessEnv,
-      coordRoot,
+      stRoot,
     });
     cmdStatus({
       recipient: 'alice',
       setState: 'available',
       env: {} as NodeJS.ProcessEnv,
-      coordRoot,
+      stRoot,
     });
     // File ends up with exactly the last state, plus newline.
-    const text = readFileSync(join(coordRoot, 'alice', 'status'), 'utf8');
+    const text = readFileSync(join(stRoot, 'alice', 'status'), 'utf8');
     expect(text.trim()).toBe('available');
   });
 });
@@ -294,16 +294,16 @@ describe('resilience: permission errors on read', () => {
   it('chmod 000 inbox dir → cmdLs returns empty (does not crash)', () => {
     setupIdentity('alice');
     writeFileSync(
-      join(coordRoot, 'alice', 'inbox', '1714826789010-aaaaaa.md'),
+      join(stRoot, 'alice', 'inbox', '1714826789010-aaaaaa.md'),
       '---\nfrom: bob\n---\nx\n'
     );
-    const inboxPath = join(coordRoot, 'alice', 'inbox');
+    const inboxPath = join(stRoot, 'alice', 'inbox');
     rememberChmod(inboxPath, 0o755);
     chmodSync(inboxPath, 0o000);
     const r = cmdLs({
       recipient: 'alice',
       env: {} as NodeJS.ProcessEnv,
-      coordRoot,
+      stRoot,
     });
     // Reads degrade gracefully — empty list, no throw, no
     // misleading "0 messages" claim is more honest than crashing.

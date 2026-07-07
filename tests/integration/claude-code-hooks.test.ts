@@ -150,7 +150,7 @@ function runSessionStart(env: NodeJS.ProcessEnv): SessionStartRun {
     env: {
       // Purge parent env of the smalltalk identity vars — a
       // developer's shell running the tests could otherwise leak
-      // ST_AGENT / COORD_IDENTITY and steer the hook against a real
+      // ST_AGENT / ST_AGENT and steer the hook against a real
       // ~/.local/state path. All identity is per-test.
       PATH: process.env.PATH,
       ...env,
@@ -200,7 +200,7 @@ describe('claude-code hooks — session-start.sh (bare)', () => {
 
 // ─── session-start.sh — brief-024 boot-rehydrate ─────────────────────────
 //
-// The hook now inspects $COORD_ROOT/<identity>/context/now.md and, when
+// The hook now inspects $ST_ROOT/<identity>/context/now.md and, when
 // fresh, injects it as a <context> block before the boot-ritual line.
 // These tests exercise all four branches:
 //   1. no identity → no injection, ritual only (regression guard).
@@ -213,8 +213,8 @@ describe('claude-code hooks — session-start.sh boot-rehydrate (brief-024)', ()
     mkdirSync(join(scratch, 'alice', 'inbox'), { recursive: true });
     mkdirSync(join(scratch, 'alice', 'archive'), { recursive: true });
     const r = runSessionStart({
-      COORD_ROOT: scratch,
-      COORD_IDENTITY: 'alice',
+      ST_ROOT: scratch,
+      ST_AGENT: 'alice',
     });
     expect(r.status).toBe(2);
     expect(r.stderr).not.toContain('<context');
@@ -228,12 +228,12 @@ describe('claude-code hooks — session-start.sh boot-rehydrate (brief-024)', ()
       '# now\ncurrent task: brief-024 hook legs\n'
     );
     const r = runSessionStart({
-      COORD_ROOT: scratch,
-      COORD_IDENTITY: 'alice',
+      ST_ROOT: scratch,
+      ST_AGENT: 'alice',
     });
     expect(r.status).toBe(2);
     expect(r.stderr).toContain(
-      '<context source="coord/context/now.md" agent="alice">'
+      '<context source="st/context/now.md" agent="alice">'
     );
     expect(r.stderr).toContain('current task: brief-024 hook legs');
     expect(r.stderr).toContain('</context>');
@@ -256,8 +256,8 @@ describe('claude-code hooks — session-start.sh boot-rehydrate (brief-024)', ()
       'no-trailing-newline'
     );
     const r = runSessionStart({
-      COORD_ROOT: scratch,
-      COORD_IDENTITY: 'alice',
+      ST_ROOT: scratch,
+      ST_AGENT: 'alice',
     });
     expect(r.stderr).toMatch(/no-trailing-newline\n<\/context>/);
   });
@@ -269,15 +269,15 @@ describe('claude-code hooks — session-start.sh boot-rehydrate (brief-024)', ()
     // 2 days = 172_800s; well past the 24h (86_400s) default threshold.
     ageFile(nowPath, 172_800);
     const r = runSessionStart({
-      COORD_ROOT: scratch,
-      COORD_IDENTITY: 'alice',
+      ST_ROOT: scratch,
+      ST_AGENT: 'alice',
     });
     expect(r.stderr).not.toContain('<context');
     expect(r.stderr).not.toContain('two-day-old state');
     expect(r.stderr).toContain('boot ritual');
   });
 
-  it('$COORD_REHYDRATE_STALE_S overrides the staleness threshold', () => {
+  it('$ST_REHYDRATE_STALE_S overrides the staleness threshold', () => {
     mkdirSync(join(scratch, 'alice', 'context'), { recursive: true });
     const nowPath = join(scratch, 'alice', 'context', 'now.md');
     writeFileSync(nowPath, '# now\nninety-minute-old state\n');
@@ -285,16 +285,16 @@ describe('claude-code hooks — session-start.sh boot-rehydrate (brief-024)', ()
 
     // With the default 24h threshold, 90 min is fresh → injects.
     const rDefault = runSessionStart({
-      COORD_ROOT: scratch,
-      COORD_IDENTITY: 'alice',
+      ST_ROOT: scratch,
+      ST_AGENT: 'alice',
     });
     expect(rDefault.stderr).toContain('ninety-minute-old state');
 
     // With a 60-minute threshold, 90 min is stale → no injection.
     const rTight = runSessionStart({
-      COORD_ROOT: scratch,
-      COORD_IDENTITY: 'alice',
-      COORD_REHYDRATE_STALE_S: '3600',
+      ST_ROOT: scratch,
+      ST_AGENT: 'alice',
+      ST_REHYDRATE_STALE_S: '3600',
     });
     expect(rTight.stderr).not.toContain('ninety-minute-old state');
     expect(rTight.stderr).toContain('boot ritual');
@@ -302,7 +302,7 @@ describe('claude-code hooks — session-start.sh boot-rehydrate (brief-024)', ()
 
   it('honors the ST_AGENT / ST_IDENTITY fallback chain for the identity resolve', () => {
     // The hook's identity resolution mirrors coord's: ST_AGENT >
-    // ST_IDENTITY > COORD_IDENTITY. Prove it by populating alice's
+    // ST_IDENTITY > ST_AGENT. Prove it by populating alice's
     // context under ST_AGENT and confirming injection.
     mkdirSync(join(scratch, 'alice', 'context'), { recursive: true });
     writeFileSync(
@@ -310,7 +310,7 @@ describe('claude-code hooks — session-start.sh boot-rehydrate (brief-024)', ()
       'st-agent path\n'
     );
     const r = runSessionStart({
-      COORD_ROOT: scratch,
+      ST_ROOT: scratch,
       ST_AGENT: 'alice',
     });
     expect(r.stderr).toContain('st-agent path');
@@ -356,12 +356,12 @@ describe('claude-code hooks — pre-compact.sh (brief-024)', () => {
     expect(r.stderr).toBe('');
   });
 
-  it('with identity + no now.md → invokes `coord context write` (implicit identity, no positional)', () => {
+  it('with identity + no now.md → invokes `st context write` (implicit identity, no positional)', () => {
     mkdirSync(join(scratch, 'alice', 'inbox'), { recursive: true });
     mkdirSync(join(scratch, 'alice', 'archive'), { recursive: true });
     const r = runPreCompact({
-      COORD_ROOT: scratch,
-      COORD_IDENTITY: 'alice',
+      ST_ROOT: scratch,
+      ST_AGENT: 'alice',
     });
     expect(r.status).toBe(0);
     expect(r.calls.length).toBe(1);
@@ -386,15 +386,15 @@ describe('claude-code hooks — pre-compact.sh (brief-024)', () => {
     // Age 1 minute — well under the 5-minute default threshold.
     ageFile(join(scratch, 'alice', 'context', 'now.md'), 60);
     const r = runPreCompact({
-      COORD_ROOT: scratch,
-      COORD_IDENTITY: 'alice',
+      ST_ROOT: scratch,
+      ST_AGENT: 'alice',
     });
     expect(r.status).toBe(0);
-    // No `coord context write` — the model's fresh flush wins.
+    // No `st context write` — the model's fresh flush wins.
     expect(r.calls).toEqual([]);
   });
 
-  it('with STALE now.md (>5 min) → writes stub via `coord context write`', () => {
+  it('with STALE now.md (>5 min) → writes stub via `st context write`', () => {
     mkdirSync(join(scratch, 'alice', 'context'), { recursive: true });
     writeFileSync(
       join(scratch, 'alice', 'context', 'now.md'),
@@ -403,15 +403,15 @@ describe('claude-code hooks — pre-compact.sh (brief-024)', () => {
     // Age 10 minutes — well past the 5-minute default threshold.
     ageFile(join(scratch, 'alice', 'context', 'now.md'), 600);
     const r = runPreCompact({
-      COORD_ROOT: scratch,
-      COORD_IDENTITY: 'alice',
+      ST_ROOT: scratch,
+      ST_AGENT: 'alice',
     });
     expect(r.status).toBe(0);
     expect(r.calls.length).toBe(1);
     expect(r.calls[0]).toEqual(['context', 'write']);
   });
 
-  it('$COORD_PRECOMPACT_FRESH_S overrides the freshness threshold', () => {
+  it('$ST_PRECOMPACT_FRESH_S overrides the freshness threshold', () => {
     mkdirSync(join(scratch, 'alice', 'context'), { recursive: true });
     writeFileSync(
       join(scratch, 'alice', 'context', 'now.md'),
@@ -421,16 +421,16 @@ describe('claude-code hooks — pre-compact.sh (brief-024)', () => {
 
     // Default (300s): 30 s is fresh, skip.
     const rDefault = runPreCompact({
-      COORD_ROOT: scratch,
-      COORD_IDENTITY: 'alice',
+      ST_ROOT: scratch,
+      ST_AGENT: 'alice',
     });
     expect(rDefault.calls).toEqual([]);
 
     // Tighten to 15s: 30 s is stale, must write.
     const rTight = runPreCompact({
-      COORD_ROOT: scratch,
-      COORD_IDENTITY: 'alice',
-      COORD_PRECOMPACT_FRESH_S: '15',
+      ST_ROOT: scratch,
+      ST_AGENT: 'alice',
+      ST_PRECOMPACT_FRESH_S: '15',
     });
     expect(rTight.calls.length).toBe(1);
   });
@@ -439,7 +439,7 @@ describe('claude-code hooks — pre-compact.sh (brief-024)', () => {
     mkdirSync(join(scratch, 'alice', 'inbox'), { recursive: true });
     mkdirSync(join(scratch, 'alice', 'archive'), { recursive: true });
     const r = runPreCompact({
-      COORD_ROOT: scratch,
+      ST_ROOT: scratch,
       ST_AGENT: 'alice',
     });
     expect(r.status).toBe(0);
@@ -447,7 +447,7 @@ describe('claude-code hooks — pre-compact.sh (brief-024)', () => {
     expect(r.calls[0]).toEqual(['context', 'write']);
   });
 
-  it('$COORD_PRECOMPACT_TIMEOUT_S overrides the write-timeout cap', () => {
+  it('$ST_PRECOMPACT_TIMEOUT_S overrides the write-timeout cap', () => {
     // Verify the timeout knob is honored: with a very short cap and
     // a slow shim, the hook must still exit 0 (prime directive) and
     // must NOT leave a broken pipe or hung child. We can't observe
@@ -471,9 +471,9 @@ describe('claude-code hooks — pre-compact.sh (brief-024)', () => {
     chmodSync(join(shimDir, 'coord'), 0o755);
     // Tight override — shim's 200ms sleep exceeds this cap.
     const rTight = runPreCompact({
-      COORD_ROOT: scratch,
-      COORD_IDENTITY: 'alice',
-      COORD_PRECOMPACT_TIMEOUT_S: '0.05',
+      ST_ROOT: scratch,
+      ST_AGENT: 'alice',
+      ST_PRECOMPACT_TIMEOUT_S: '0.05',
     });
     // Prime directive holds even when the write times out.
     expect(rTight.status).toBe(0);
@@ -481,9 +481,9 @@ describe('claude-code hooks — pre-compact.sh (brief-024)', () => {
     // Fresh scratch env for a clean shim-call count read.
     rmSync(shimLog, { force: true });
     const rLoose = runPreCompact({
-      COORD_ROOT: scratch,
-      COORD_IDENTITY: 'alice',
-      COORD_PRECOMPACT_TIMEOUT_S: '2',
+      ST_ROOT: scratch,
+      ST_AGENT: 'alice',
+      ST_PRECOMPACT_TIMEOUT_S: '2',
     });
     expect(rLoose.status).toBe(0);
     expect(rLoose.calls.length).toBe(1);
@@ -505,8 +505,8 @@ describe('claude-code hooks — pre-compact.sh (brief-024)', () => {
     );
     chmodSync(join(shimDir, 'coord'), 0o755);
     const r = runPreCompact({
-      COORD_ROOT: scratch,
-      COORD_IDENTITY: 'alice',
+      ST_ROOT: scratch,
+      ST_AGENT: 'alice',
     });
     // Load-bearing: the hook MUST exit 0 even when the underlying
     // write fails. Blocking compaction is worse than skipping a flush.
@@ -525,17 +525,17 @@ describe.skipIf(!HAS_JQ)('claude-code hooks — stop-failure.sh', () => {
   it('rate_limit → coord status away, no message send', () => {
     const r = runStopFailure(
       { error_type: 'rate_limit', session_id: 'abc' },
-      { COORD_IDENTITY: 'bob' }
+      { ST_AGENT: 'bob' }
     );
     expect(r.exitCode).toBe(0);
     expect(r.calls).toEqual([['status', 'bob', '--set', 'away']]);
   });
 
   // ── server_error: status=away + ding ─────────────────────────────────
-  it('server_error → status away + message to myobie (no priority high)', () => {
+  it('server_error → status away + message to operator (no priority high)', () => {
     const r = runStopFailure(
       { error_type: 'server_error' },
-      { COORD_IDENTITY: 'bob' }
+      { ST_AGENT: 'bob' }
     );
     expect(r.exitCode).toBe(0);
     expect(r.calls.length).toBe(2);
@@ -543,7 +543,7 @@ describe.skipIf(!HAS_JQ)('claude-code hooks — stop-failure.sh', () => {
     const send = r.calls[1]!;
     expect(send[0]).toBe('message');
     expect(send[1]).toBe('send');
-    expect(send[2]).toBe('myobie');
+    expect(send[2]).toBe('operator');
     expect(send).not.toContain('--priority');
     expect(send).toContain('--subject');
     const subject = send[send.indexOf('--subject') + 1]!;
@@ -556,13 +556,13 @@ describe.skipIf(!HAS_JQ)('claude-code hooks — stop-failure.sh', () => {
   it('authentication_failed → status offline + priority-high ding', () => {
     const r = runStopFailure(
       { error_type: 'authentication_failed' },
-      { COORD_IDENTITY: 'bob' }
+      { ST_AGENT: 'bob' }
     );
     expect(r.exitCode).toBe(0);
     expect(r.calls.length).toBe(2);
     expect(r.calls[0]).toEqual(['status', 'bob', '--set', 'offline']);
     const send = r.calls[1]!;
-    expect(send.slice(0, 3)).toEqual(['message', 'send', 'myobie']);
+    expect(send.slice(0, 3)).toEqual(['message', 'send', 'operator']);
     expect(send).toContain('--priority');
     expect(send[send.indexOf('--priority') + 1]).toBe('high');
     const subject = send[send.indexOf('--subject') + 1]!;
@@ -574,7 +574,7 @@ describe.skipIf(!HAS_JQ)('claude-code hooks — stop-failure.sh', () => {
   it('oauth_org_not_allowed → status offline + priority-high ding (auth-shape)', () => {
     const r = runStopFailure(
       { error_type: 'oauth_org_not_allowed' },
-      { COORD_IDENTITY: 'bob' }
+      { ST_AGENT: 'bob' }
     );
     expect(r.exitCode).toBe(0);
     expect(r.calls.length).toBe(2);
@@ -589,7 +589,7 @@ describe.skipIf(!HAS_JQ)('claude-code hooks — stop-failure.sh', () => {
   it('billing_error → status offline + priority-high billing ding', () => {
     const r = runStopFailure(
       { error_type: 'billing_error' },
-      { COORD_IDENTITY: 'bob' }
+      { ST_AGENT: 'bob' }
     );
     expect(r.exitCode).toBe(0);
     expect(r.calls.length).toBe(2);
@@ -609,7 +609,7 @@ describe.skipIf(!HAS_JQ)('claude-code hooks — stop-failure.sh', () => {
     it(`${errType} → no coord calls (programmer error, not infra)`, () => {
       const r = runStopFailure(
         { error_type: errType },
-        { COORD_IDENTITY: 'bob' }
+        { ST_AGENT: 'bob' }
       );
       expect(r.exitCode).toBe(0);
       expect(r.calls).toEqual([]);
@@ -620,7 +620,7 @@ describe.skipIf(!HAS_JQ)('claude-code hooks — stop-failure.sh', () => {
   it('unknown → status away + ding with error_type verbatim', () => {
     const r = runStopFailure(
       { error_type: 'unknown' },
-      { COORD_IDENTITY: 'bob' }
+      { ST_AGENT: 'bob' }
     );
     expect(r.exitCode).toBe(0);
     expect(r.calls.length).toBe(2);
@@ -636,7 +636,7 @@ describe.skipIf(!HAS_JQ)('claude-code hooks — stop-failure.sh', () => {
   it('novel error_type (not in the table) → catch-all: away + ding verbatim', () => {
     const r = runStopFailure(
       { error_type: 'overloaded_error' },
-      { COORD_IDENTITY: 'bob' }
+      { ST_AGENT: 'bob' }
     );
     expect(r.exitCode).toBe(0);
     expect(r.calls.length).toBe(2);
@@ -648,11 +648,11 @@ describe.skipIf(!HAS_JQ)('claude-code hooks — stop-failure.sh', () => {
     expect(body).toContain('error_type=overloaded_error');
   });
 
-  // ── identity propagation: a different COORD_IDENTITY → in subject ────
-  it('uses $COORD_IDENTITY in status target and subject', () => {
+  // ── identity propagation: a different ST_AGENT → in subject ────
+  it('uses $ST_AGENT in status target and subject', () => {
     const r = runStopFailure(
       { error_type: 'server_error' },
-      { COORD_IDENTITY: 'coord-claude' }
+      { ST_AGENT: 'coord-claude' }
     );
     expect(r.exitCode).toBe(0);
     expect(r.calls[0]).toEqual(['status', 'coord-claude', '--set', 'away']);
@@ -661,8 +661,8 @@ describe.skipIf(!HAS_JQ)('claude-code hooks — stop-failure.sh', () => {
     expect(subject).toContain('coord-claude');
   });
 
-  // ── missing COORD_IDENTITY: silent exit 0, no coord calls ────────────
-  it('missing COORD_IDENTITY → exit 0, no coord calls (silent)', () => {
+  // ── missing ST_AGENT: silent exit 0, no coord calls ────────────
+  it('missing ST_AGENT → exit 0, no coord calls (silent)', () => {
     const r = runStopFailure({ error_type: 'rate_limit' }, {});
     expect(r.exitCode).toBe(0);
     expect(r.calls).toEqual([]);
@@ -672,7 +672,7 @@ describe.skipIf(!HAS_JQ)('claude-code hooks — stop-failure.sh', () => {
   it('envelope without error_type → catch-all (away + ding)', () => {
     const r = runStopFailure(
       { session_id: 'abc' },
-      { COORD_IDENTITY: 'bob' }
+      { ST_AGENT: 'bob' }
     );
     expect(r.exitCode).toBe(0);
     expect(r.calls.length).toBe(2);
@@ -681,7 +681,7 @@ describe.skipIf(!HAS_JQ)('claude-code hooks — stop-failure.sh', () => {
 
   // ── malformed JSON stdin: treated as unknown, never throws ───────────
   it('non-JSON stdin → catch-all (defensive: never crash the hook)', () => {
-    const r = runStopFailure('not json at all', { COORD_IDENTITY: 'bob' });
+    const r = runStopFailure('not json at all', { ST_AGENT: 'bob' });
     expect(r.exitCode).toBe(0);
     expect(r.calls.length).toBe(2);
     expect(r.calls[0]).toEqual(['status', 'bob', '--set', 'away']);
@@ -718,7 +718,7 @@ describe('claude-code hooks — $ST_BIN takes precedence over PATH', () => {
         PATH: '/usr/bin:/bin',
         HOME: process.env.HOME,
         COORD_SHIM_LOG: shimLog,
-        COORD_IDENTITY: 'bob',
+        ST_AGENT: 'bob',
         ST_BIN: dedicatedShim,
       },
       input: JSON.stringify({ error_type: 'rate_limit' }),
@@ -740,7 +740,7 @@ describe('claude-code hooks — $ST_BIN takes precedence over PATH', () => {
         PATH: `${shimDir}:${process.env.PATH ?? ''}`,
         HOME: process.env.HOME,
         COORD_SHIM_LOG: shimLog,
-        COORD_IDENTITY: 'bob',
+        ST_AGENT: 'bob',
         ST_BIN: '',
       },
       input: JSON.stringify({ error_type: 'rate_limit' }),
@@ -784,7 +784,7 @@ describe('claude-code hooks — $ST_BIN takes precedence over PATH', () => {
         PATH: `${fresh}:/usr/bin:/bin`,
         HOME: process.env.HOME,
         COORD_SHIM_LOG: shimLog,
-        COORD_IDENTITY: 'bob',
+        ST_AGENT: 'bob',
       },
       input: JSON.stringify({ error_type: 'rate_limit' }),
       encoding: 'utf8',

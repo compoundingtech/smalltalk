@@ -19,26 +19,26 @@ import {
 } from '../../src/commands/status.ts';
 
 let scratch: string;
-let coordRoot: string;
+let stRoot: string;
 
 beforeEach(() => {
   scratch = mkdtempSync(join(tmpdir(), 'coord-status-test-'));
-  coordRoot = join(scratch, 'coord');
-  mkdirSync(coordRoot, { recursive: true });
+  stRoot = join(scratch, 'coord');
+  mkdirSync(stRoot, { recursive: true });
 });
 afterEach(() => {
   rmSync(scratch, { recursive: true, force: true });
 });
 
 function setupIdentity(id: string): void {
-  mkdirSync(join(coordRoot, id, 'inbox'), { recursive: true });
-  mkdirSync(join(coordRoot, id, 'archive'), { recursive: true });
+  mkdirSync(join(stRoot, id, 'inbox'), { recursive: true });
+  mkdirSync(join(stRoot, id, 'archive'), { recursive: true });
 }
 
 function input(overrides: Partial<StatusInput> = {}): StatusInput {
   return {
-    env: { COORD_IDENTITY: 'alice' } as NodeJS.ProcessEnv,
-    coordRoot,
+    env: { ST_AGENT: 'alice' } as NodeJS.ProcessEnv,
+    stRoot,
     ...overrides,
   };
 }
@@ -63,7 +63,7 @@ describe('isValidState', () => {
 
 // ─── form 1: get my status ──────────────────────────────────────────────
 
-describe('cmdStatus — form 1 (get COORD_IDENTITY)', () => {
+describe('cmdStatus — form 1 (get ST_AGENT)', () => {
   it('returns offline when no status file exists', () => {
     setupIdentity('alice');
     const r = cmdStatus(input());
@@ -72,7 +72,7 @@ describe('cmdStatus — form 1 (get COORD_IDENTITY)', () => {
 
   it('returns the stored state when file exists', () => {
     setupIdentity('alice');
-    writeFileSync(join(coordRoot, 'alice', 'status'), 'busy\n');
+    writeFileSync(join(stRoot, 'alice', 'status'), 'busy\n');
     const r = cmdStatus(input());
     expect(r).toEqual({ mode: 'get', identity: 'alice', state: 'busy' });
   });
@@ -81,7 +81,7 @@ describe('cmdStatus — form 1 (get COORD_IDENTITY)', () => {
     'reads back stored state %s',
     (s) => {
       setupIdentity('alice');
-      writeFileSync(join(coordRoot, 'alice', 'status'), `${s}\n`);
+      writeFileSync(join(stRoot, 'alice', 'status'), `${s}\n`);
       const r = cmdStatus(input());
       expect(r).toMatchObject({ mode: 'get', state: s });
     }
@@ -94,16 +94,16 @@ describe('cmdStatus — form 2 (get <identity>)', () => {
   it('reads bob status with explicit positional', () => {
     setupIdentity('alice');
     setupIdentity('bob');
-    writeFileSync(join(coordRoot, 'bob', 'status'), 'dnd\n');
+    writeFileSync(join(stRoot, 'bob', 'status'), 'dnd\n');
     const r = cmdStatus(input({ recipient: 'bob' }));
     expect(r).toEqual({ mode: 'get', identity: 'bob', state: 'dnd' });
   });
 
-  it('positional wins over COORD_IDENTITY env', () => {
+  it('positional wins over ST_AGENT env', () => {
     setupIdentity('alice');
     setupIdentity('bob');
-    writeFileSync(join(coordRoot, 'alice', 'status'), 'busy\n');
-    writeFileSync(join(coordRoot, 'bob', 'status'), 'dnd\n');
+    writeFileSync(join(stRoot, 'alice', 'status'), 'busy\n');
+    writeFileSync(join(stRoot, 'bob', 'status'), 'dnd\n');
     const r = cmdStatus(input({ recipient: 'bob' }));
     expect(r.state).toBe('dnd');
   });
@@ -119,7 +119,7 @@ describe('cmdStatus — form 2 (get <identity>)', () => {
 
 describe('cmdStatus — form 3 (--set <state>)', () => {
   it.each(['offline', 'available', 'busy', 'away', 'dnd'])(
-    'writes %s for COORD_IDENTITY',
+    'writes %s for ST_AGENT',
     (s) => {
       setupIdentity('alice');
       const r = cmdStatus(input({ setState: s }));
@@ -129,7 +129,7 @@ describe('cmdStatus — form 3 (--set <state>)', () => {
         state: s,
         written: s,
       });
-      expect(readFileSync(join(coordRoot, 'alice', 'status'), 'utf8')).toBe(
+      expect(readFileSync(join(stRoot, 'alice', 'status'), 'utf8')).toBe(
         `${s}\n`
       );
     }
@@ -159,15 +159,15 @@ describe('cmdStatus — form 3 (--set <state>)', () => {
 // ─── form 4: set someone else's status ──────────────────────────────────
 
 describe('cmdStatus — form 4 (<identity> --set <state>)', () => {
-  it('writes the state for the explicit identity, not COORD_IDENTITY', () => {
+  it('writes the state for the explicit identity, not ST_AGENT', () => {
     setupIdentity('alice');
     setupIdentity('bob');
     cmdStatus(input({ recipient: 'bob', setState: 'busy' }));
-    expect(readFileSync(join(coordRoot, 'bob', 'status'), 'utf8')).toBe(
+    expect(readFileSync(join(stRoot, 'bob', 'status'), 'utf8')).toBe(
       'busy\n'
     );
     // alice untouched.
-    expect(existsSync(join(coordRoot, 'alice', 'status'))).toBe(false);
+    expect(existsSync(join(stRoot, 'alice', 'status'))).toBe(false);
   });
 
   it('lazy-creates the target agent folder when missing (docs promise)', () => {
@@ -180,9 +180,9 @@ describe('cmdStatus — form 4 (<identity> --set <state>)', () => {
     const r = cmdStatus(input({ recipient: 'carol', setState: 'busy' }));
     expect(r.mode).toBe('set');
     // Folder now exists on disk.
-    expect(existsSync(join(coordRoot, 'carol', 'inbox'))).toBe(true);
-    expect(existsSync(join(coordRoot, 'carol', 'archive'))).toBe(true);
-    expect(readFileSync(join(coordRoot, 'carol', 'status'), 'utf8')).toBe(
+    expect(existsSync(join(stRoot, 'carol', 'inbox'))).toBe(true);
+    expect(existsSync(join(stRoot, 'carol', 'archive'))).toBe(true);
+    expect(readFileSync(join(stRoot, 'carol', 'status'), 'utf8')).toBe(
       'busy\n'
     );
   });
@@ -204,32 +204,32 @@ describe('cmdStatus — form 4 (<identity> --set <state>)', () => {
 describe('cmdStatus — read normalizes invalid file content', () => {
   it('garbage content → offline', () => {
     setupIdentity('alice');
-    writeFileSync(join(coordRoot, 'alice', 'status'), 'garbage\n');
+    writeFileSync(join(stRoot, 'alice', 'status'), 'garbage\n');
     expect(cmdStatus(input()).state).toBe('offline');
   });
 
   it('empty file → offline', () => {
     setupIdentity('alice');
-    writeFileSync(join(coordRoot, 'alice', 'status'), '');
+    writeFileSync(join(stRoot, 'alice', 'status'), '');
     expect(cmdStatus(input()).state).toBe('offline');
   });
 
   it('uppercase value → offline (normalize)', () => {
     setupIdentity('alice');
-    writeFileSync(join(coordRoot, 'alice', 'status'), 'BUSY\n');
+    writeFileSync(join(stRoot, 'alice', 'status'), 'BUSY\n');
     expect(cmdStatus(input()).state).toBe('offline');
   });
 
   it('extra whitespace around a valid state still parses', () => {
     setupIdentity('alice');
-    writeFileSync(join(coordRoot, 'alice', 'status'), '  busy  \n');
+    writeFileSync(join(stRoot, 'alice', 'status'), '  busy  \n');
     expect(cmdStatus(input()).state).toBe('busy');
   });
 
   it('multi-line content: only first line considered', () => {
     setupIdentity('alice');
     writeFileSync(
-      join(coordRoot, 'alice', 'status'),
+      join(stRoot, 'alice', 'status'),
       'busy\nextra\nlines\n'
     );
     expect(cmdStatus(input()).state).toBe('busy');
@@ -238,7 +238,7 @@ describe('cmdStatus — read normalizes invalid file content', () => {
   it('multi-line content with garbage first line → offline', () => {
     setupIdentity('alice');
     writeFileSync(
-      join(coordRoot, 'alice', 'status'),
+      join(stRoot, 'alice', 'status'),
       'garbage\nbusy\n'
     );
     expect(cmdStatus(input()).state).toBe('offline');
@@ -248,10 +248,10 @@ describe('cmdStatus — read normalizes invalid file content', () => {
 // ─── identity-required error ────────────────────────────────────────────
 
 describe('cmdStatus — identity-required error', () => {
-  it('errors mentioning COORD_IDENTITY when neither positional nor env', () => {
+  it('errors mentioning ST_AGENT when neither positional nor env', () => {
     expect(() =>
-      cmdStatus({ env: {} as NodeJS.ProcessEnv, coordRoot })
-    ).toThrowError(/COORD_IDENTITY/);
+      cmdStatus({ env: {} as NodeJS.ProcessEnv, stRoot })
+    ).toThrowError(/ST_AGENT/);
   });
 });
 

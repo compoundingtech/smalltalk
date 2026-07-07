@@ -19,75 +19,75 @@ import {
 } from '../../src/commands/agents.ts';
 
 let scratch: string;
-let coordRoot: string;
+let stRoot: string;
 
 beforeEach(() => {
   scratch = mkdtempSync(join(tmpdir(), 'coord-members-test-'));
-  coordRoot = join(scratch, 'coord');
-  mkdirSync(coordRoot, { recursive: true });
+  stRoot = join(scratch, 'coord');
+  mkdirSync(stRoot, { recursive: true });
 });
 afterEach(() => {
   rmSync(scratch, { recursive: true, force: true });
 });
 
 function setupIdentity(id: string): void {
-  mkdirSync(join(coordRoot, id, 'inbox'), { recursive: true });
-  mkdirSync(join(coordRoot, id, 'archive'), { recursive: true });
+  mkdirSync(join(stRoot, id, 'inbox'), { recursive: true });
+  mkdirSync(join(stRoot, id, 'archive'), { recursive: true });
 }
 
 function setStatus(id: string, state: string): void {
-  writeFileSync(join(coordRoot, id, 'status'), `${state}\n`);
+  writeFileSync(join(stRoot, id, 'status'), `${state}\n`);
 }
 
 // ─── Enumeration ────────────────────────────────────────────────────────
 
 describe('cmdMembers / listIdentities', () => {
-  it('empty $COORD_ROOT → [] for items, no throw', () => {
-    expect(cmdMembers({ coordRoot }).items).toEqual([]);
-    expect(listIdentities(coordRoot)).toEqual([]);
+  it('empty $ST_ROOT → [] for items, no throw', () => {
+    expect(cmdMembers({ stRoot }).items).toEqual([]);
+    expect(listIdentities(stRoot)).toEqual([]);
   });
 
   it('detects identities by inbox-or-archive presence', () => {
     setupIdentity('alice');
     setupIdentity('bob');
-    expect(listIdentities(coordRoot)).toEqual(['alice', 'bob']);
+    expect(listIdentities(stRoot)).toEqual(['alice', 'bob']);
   });
 
   it('accepts an identity with ONLY inbox/ (lazy peer from a single send)', () => {
-    mkdirSync(join(coordRoot, 'partial', 'inbox'), { recursive: true });
-    expect(listIdentities(coordRoot)).toContain('partial');
+    mkdirSync(join(stRoot, 'partial', 'inbox'), { recursive: true });
+    expect(listIdentities(stRoot)).toContain('partial');
   });
 
   it('skips dotfile entries at the root', () => {
     setupIdentity('alice');
-    mkdirSync(join(coordRoot, '.hidden'), { recursive: true });
-    expect(listIdentities(coordRoot)).toEqual(['alice']);
+    mkdirSync(join(stRoot, '.hidden'), { recursive: true });
+    expect(listIdentities(stRoot)).toEqual(['alice']);
   });
 
   it('skips non-directory entries at the root', () => {
     setupIdentity('alice');
-    writeFileSync(join(coordRoot, 'looseFile.md'), 'noise');
-    expect(listIdentities(coordRoot)).toEqual(['alice']);
+    writeFileSync(join(stRoot, 'looseFile.md'), 'noise');
+    expect(listIdentities(stRoot)).toEqual(['alice']);
   });
 
   it('skips reserved names at the root', () => {
     setupIdentity('alice');
     // A bare `members/` at the root would be a misnamed identity.
-    mkdirSync(join(coordRoot, 'members', 'inbox'), { recursive: true });
-    expect(listIdentities(coordRoot)).toEqual(['alice']);
+    mkdirSync(join(stRoot, 'members', 'inbox'), { recursive: true });
+    expect(listIdentities(stRoot)).toEqual(['alice']);
   });
 
   it('skips invalid-identity-grammar names (uppercase, underscore, etc)', () => {
     setupIdentity('alice');
-    mkdirSync(join(coordRoot, 'NOT_VALID', 'inbox'), { recursive: true });
-    expect(listIdentities(coordRoot)).toEqual(['alice']);
+    mkdirSync(join(stRoot, 'NOT_VALID', 'inbox'), { recursive: true });
+    expect(listIdentities(stRoot)).toEqual(['alice']);
   });
 
   it('sorts alphabetically', () => {
     setupIdentity('charlie');
     setupIdentity('alice');
     setupIdentity('bob');
-    expect(cmdMembers({ coordRoot }).items.map((m) => m.identity)).toEqual([
+    expect(cmdMembers({ stRoot }).items.map((m) => m.identity)).toEqual([
       'alice',
       'bob',
       'charlie',
@@ -95,8 +95,8 @@ describe('cmdMembers / listIdentities', () => {
   });
 
   it('an empty-but-existing identity folder (no inbox/archive) is NOT enumerated', () => {
-    mkdirSync(join(coordRoot, 'orphan'), { recursive: true });
-    expect(listIdentities(coordRoot)).toEqual([]);
+    mkdirSync(join(stRoot, 'orphan'), { recursive: true });
+    expect(listIdentities(stRoot)).toEqual([]);
   });
 });
 
@@ -105,7 +105,7 @@ describe('cmdMembers / listIdentities', () => {
 describe('cmdMembers — status + name fields', () => {
   it('status defaults to offline when no status file', () => {
     setupIdentity('alice');
-    const r = cmdMembers({ coordRoot });
+    const r = cmdMembers({ stRoot });
     expect(r.items[0]).toMatchObject({
       identity: 'alice',
       status: 'offline',
@@ -118,27 +118,27 @@ describe('cmdMembers — status + name fields', () => {
     setupIdentity('bob');
     setStatus('alice', 'available');
     setStatus('bob', 'busy');
-    const byId = mapBy(cmdMembers({ coordRoot }).items);
+    const byId = mapBy(cmdMembers({ stRoot }).items);
     expect(byId.alice!.status).toBe('available');
     expect(byId.bob!.status).toBe('busy');
   });
 
   it('malformed status file → offline (does not crash)', () => {
     setupIdentity('alice');
-    writeFileSync(join(coordRoot, 'alice', 'status'), '???garbage???\n');
-    expect(cmdMembers({ coordRoot }).items[0]!.status).toBe('offline');
+    writeFileSync(join(stRoot, 'alice', 'status'), '???garbage???\n');
+    expect(cmdMembers({ stRoot }).items[0]!.status).toBe('offline');
   });
 
   it('reads display name from <id>/name', () => {
     setupIdentity('alice');
-    writeFileSync(join(coordRoot, 'alice', 'name'), 'Alice Awesome\n');
-    expect(cmdMembers({ coordRoot }).items[0]!.name).toBe('Alice Awesome');
+    writeFileSync(join(stRoot, 'alice', 'name'), 'Alice Awesome\n');
+    expect(cmdMembers({ stRoot }).items[0]!.name).toBe('Alice Awesome');
   });
 
   it('empty name file → null', () => {
     setupIdentity('alice');
-    writeFileSync(join(coordRoot, 'alice', 'name'), '\n');
-    expect(cmdMembers({ coordRoot }).items[0]!.name).toBeNull();
+    writeFileSync(join(stRoot, 'alice', 'name'), '\n');
+    expect(cmdMembers({ stRoot }).items[0]!.name).toBeNull();
   });
 });
 
@@ -156,12 +156,12 @@ describe('cmdMembers — --status filter', () => {
 
   it('filters to a single status', () => {
     expect(
-      cmdMembers({ status: 'available', coordRoot }).items.map(
+      cmdMembers({ status: 'available', stRoot }).items.map(
         (m) => m.identity
       )
     ).toEqual(['alice']);
     expect(
-      cmdMembers({ status: 'offline', coordRoot }).items.map((m) => m.identity)
+      cmdMembers({ status: 'offline', stRoot }).items.map((m) => m.identity)
     ).toEqual(['carol']);
   });
 
@@ -171,12 +171,12 @@ describe('cmdMembers — --status filter', () => {
     // the sibling test's expectations.
     setStatus('carol', 'away');
     expect(
-      cmdMembers({ status: 'away', coordRoot }).items.map((m) => m.identity)
+      cmdMembers({ status: 'away', stRoot }).items.map((m) => m.identity)
     ).toEqual(['carol']);
   });
 
   it('empty filter returns everyone', () => {
-    expect(cmdMembers({ coordRoot }).items).toHaveLength(3);
+    expect(cmdMembers({ stRoot }).items).toHaveLength(3);
   });
 });
 
@@ -185,7 +185,7 @@ describe('cmdMembers — --status filter', () => {
 describe('cmdMembers --enrich', () => {
   it('lastActivity is null when nothing has been written under <id>/', () => {
     setupIdentity('quiet');
-    const r = cmdMembers({ enrich: true, coordRoot });
+    const r = cmdMembers({ enrich: true, stRoot });
     const m = r.items[0] as MemberSummaryEnriched;
     expect(m.lastActivity).toBeNull();
   });
@@ -194,16 +194,16 @@ describe('cmdMembers --enrich', () => {
     setupIdentity('alice');
     // Plant three files at staggered mtimes; the newest should be
     // the value lastActivity returns.
-    const inboxFile = join(coordRoot, 'alice', 'inbox', '1.md');
+    const inboxFile = join(stRoot, 'alice', 'inbox', '1.md');
     writeFileSync(inboxFile, 'a');
     utimesSync(inboxFile, 1000, 1000);
-    const archiveFile = join(coordRoot, 'alice', 'archive', '2.md');
+    const archiveFile = join(stRoot, 'alice', 'archive', '2.md');
     writeFileSync(archiveFile, 'b');
     utimesSync(archiveFile, 2000, 2000);
-    const statusFile = join(coordRoot, 'alice', 'status');
+    const statusFile = join(stRoot, 'alice', 'status');
     writeFileSync(statusFile, 'available\n');
     utimesSync(statusFile, 5000, 5000);
-    const r = cmdMembers({ enrich: true, coordRoot });
+    const r = cmdMembers({ enrich: true, stRoot });
     const m = r.items[0] as MemberSummaryEnriched;
     // Allow ~ms imprecision — mtimeMs is millisecond-resolution
     // and our utimesSync values are seconds. 5000 seconds = 5e6 ms.
@@ -214,23 +214,23 @@ describe('cmdMembers --enrich', () => {
   it('inbox count matches the valid-filename count', () => {
     setupIdentity('alice');
     writeFileSync(
-      join(coordRoot, 'alice', 'inbox', '1714826789010-aaaaaa.md'),
+      join(stRoot, 'alice', 'inbox', '1714826789010-aaaaaa.md'),
       '---\nfrom: bob\n---\nx\n'
     );
     writeFileSync(
-      join(coordRoot, 'alice', 'inbox', '1714826789020-bbbbbb.md'),
+      join(stRoot, 'alice', 'inbox', '1714826789020-bbbbbb.md'),
       '---\nfrom: bob\n---\ny\n'
     );
     // Noise file that doesn't match the grammar — should be skipped.
-    writeFileSync(join(coordRoot, 'alice', 'inbox', 'noise.md'), 'z');
-    const r = cmdMembers({ enrich: true, coordRoot });
+    writeFileSync(join(stRoot, 'alice', 'inbox', 'noise.md'), 'z');
+    const r = cmdMembers({ enrich: true, stRoot });
     const m = r.items[0] as MemberSummaryEnriched;
     expect(m.inbox).toBe(2);
   });
 
   it('inbox count is 0 when inbox folder missing entirely', () => {
-    mkdirSync(join(coordRoot, 'archived', 'archive'), { recursive: true });
-    const r = cmdMembers({ enrich: true, coordRoot });
+    mkdirSync(join(stRoot, 'archived', 'archive'), { recursive: true });
+    const r = cmdMembers({ enrich: true, stRoot });
     expect((r.items[0] as MemberSummaryEnriched).inbox).toBe(0);
   });
 });

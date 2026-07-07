@@ -25,15 +25,15 @@ import {
 } from '../../src/commands/sync.ts';
 
 let scratch: string;
-let coordRoot: string;
-let coordConfig: string;
+let stRoot: string;
+let stConfig: string;
 
 beforeEach(() => {
   scratch = mkdtempSync(join(tmpdir(), 'coord-sync-test-'));
-  coordRoot = join(scratch, 'coord');
-  coordConfig = join(scratch, 'config');
-  mkdirSync(coordRoot, { recursive: true });
-  mkdirSync(coordConfig, { recursive: true });
+  stRoot = join(scratch, 'coord');
+  stConfig = join(scratch, 'config');
+  mkdirSync(stRoot, { recursive: true });
+  mkdirSync(stConfig, { recursive: true });
 });
 afterEach(() => {
   rmSync(scratch, { recursive: true, force: true });
@@ -58,12 +58,12 @@ function makeMockRsync(state: MockState): SyncDeps {
 }
 
 function ctx(deps: SyncDeps = {}): SyncContext {
-  return { coordRoot, coordConfig, deps };
+  return { stRoot, stConfig, deps };
 }
 
 function setupIdentity(id: string): void {
-  mkdirSync(join(coordRoot, id, 'inbox'), { recursive: true });
-  mkdirSync(join(coordRoot, id, 'archive'), { recursive: true });
+  mkdirSync(join(stRoot, id, 'inbox'), { recursive: true });
+  mkdirSync(join(stRoot, id, 'archive'), { recursive: true });
 }
 
 // ─── parsePeersYaml ─────────────────────────────────────────────────────
@@ -152,7 +152,7 @@ describe('resolvePeer', () => {
 
   it('bare token resolves via peers.yaml alias', () => {
     writeFileSync(
-      join(coordConfig, 'peers.yaml'),
+      join(stConfig, 'peers.yaml'),
       'bobby: bob.example.com:/srv/coord\n'
     );
     expect(resolvePeer('bobby', ctx())).toBe(
@@ -162,7 +162,7 @@ describe('resolvePeer', () => {
 
   it('bare token unmapped in peers.yaml falls back to bare hostname', () => {
     writeFileSync(
-      join(coordConfig, 'peers.yaml'),
+      join(stConfig, 'peers.yaml'),
       'other: somewhere.example.com\n'
     );
     expect(resolvePeer('bobby', ctx())).toBe(
@@ -173,7 +173,7 @@ describe('resolvePeer', () => {
   it('alias targeting local: resolves through to local-style result', () => {
     const target = join(scratch, 'aliased');
     writeFileSync(
-      join(coordConfig, 'peers.yaml'),
+      join(stConfig, 'peers.yaml'),
       `peer: local:${target}\n`
     );
     expect(resolvePeer('peer', ctx())).toBe(`${target}/`);
@@ -190,11 +190,11 @@ describe('cmdSyncSweep', () => {
   it('byte-identical inbox/archive twin → removes inbox, summary singular', () => {
     setupIdentity('bob');
     writeFileSync(
-      join(coordRoot, 'bob', 'inbox', '1714826789010-aaaaaa.md'),
+      join(stRoot, 'bob', 'inbox', '1714826789010-aaaaaa.md'),
       'same'
     );
     writeFileSync(
-      join(coordRoot, 'bob', 'archive', '1714826789010-aaaaaa.md'),
+      join(stRoot, 'bob', 'archive', '1714826789010-aaaaaa.md'),
       'same'
     );
     const r = cmdSyncSweep(ctx());
@@ -208,8 +208,8 @@ describe('cmdSyncSweep', () => {
       '1714826789010-aaaaaa.md',
       '1714826789020-bbbbbb.md',
     ]) {
-      writeFileSync(join(coordRoot, 'bob', 'inbox', f), 'x');
-      writeFileSync(join(coordRoot, 'bob', 'archive', f), 'x');
+      writeFileSync(join(stRoot, 'bob', 'inbox', f), 'x');
+      writeFileSync(join(stRoot, 'bob', 'archive', f), 'x');
     }
     const r = cmdSyncSweep(ctx());
     expect(r.removed).toBe(2);
@@ -220,12 +220,12 @@ describe('cmdSyncSweep', () => {
 // ─── cmdSyncPush ────────────────────────────────────────────────────────
 
 describe('cmdSyncPush', () => {
-  it('invokes rsync with $COORD_ROOT/ → resolved peer/', () => {
+  it('invokes rsync with $ST_ROOT/ → resolved peer/', () => {
     setupIdentity('alice');
     const target = join(scratch, 'peer-target');
     const state: MockState = { calls: [], exitCode: 0 };
     cmdSyncPush(`local:${target}`, ctx(makeMockRsync(state)));
-    expect(state.calls).toEqual([[`${coordRoot}/`, `${target}/`]]);
+    expect(state.calls).toEqual([[`${stRoot}/`, `${target}/`]]);
   });
 
   it('rsync non-zero exit → throws "rsync push failed: ..."', () => {
@@ -240,26 +240,26 @@ describe('cmdSyncPush', () => {
     ).toThrowError(/rsync push failed/);
   });
 
-  it('errors loudly when COORD_ROOT does not exist', () => {
-    rmSync(coordRoot, { recursive: true });
+  it('errors loudly when ST_ROOT does not exist', () => {
+    rmSync(stRoot, { recursive: true });
     expect(() =>
       cmdSyncPush('local:/tmp/x', ctx(makeMockRsync({ calls: [], exitCode: 0 })))
-    ).toThrowError(/no COORD_ROOT to push from/);
+    ).toThrowError(/no ST_ROOT to push from/);
   });
 
   it('runs sweep BEFORE rsync (zombies don\'t propagate)', () => {
     setupIdentity('alice');
     // Pre-existing zombie pair locally.
     const f = '1714826789010-aaaaaa.md';
-    writeFileSync(join(coordRoot, 'alice', 'inbox', f), 'same');
-    writeFileSync(join(coordRoot, 'alice', 'archive', f), 'same');
+    writeFileSync(join(stRoot, 'alice', 'inbox', f), 'same');
+    writeFileSync(join(stRoot, 'alice', 'archive', f), 'same');
     const state: MockState = { calls: [], exitCode: 0 };
     cmdSyncPush(
       `local:${join(scratch, 'peer')}`,
       ctx(makeMockRsync(state))
     );
     // By the time rsync ran, the inbox copy was already gone (sweep before).
-    expect(existsSync(join(coordRoot, 'alice', 'inbox', f))).toBe(false);
+    expect(existsSync(join(stRoot, 'alice', 'inbox', f))).toBe(false);
     expect(state.calls).toHaveLength(1);
   });
 });
@@ -267,23 +267,23 @@ describe('cmdSyncPush', () => {
 // ─── cmdSyncPull ────────────────────────────────────────────────────────
 
 describe('cmdSyncPull', () => {
-  it('invokes rsync with peer/ → $COORD_ROOT/', () => {
+  it('invokes rsync with peer/ → $ST_ROOT/', () => {
     setupIdentity('alice');
     const target = join(scratch, 'peer-source');
     mkdirSync(target);
     const state: MockState = { calls: [], exitCode: 0 };
     cmdSyncPull(`local:${target}`, ctx(makeMockRsync(state)));
-    expect(state.calls).toEqual([[`${target}/`, `${coordRoot}/`]]);
+    expect(state.calls).toEqual([[`${target}/`, `${stRoot}/`]]);
   });
 
-  it('creates COORD_ROOT if missing (mkdir -p)', () => {
-    rmSync(coordRoot, { recursive: true });
-    expect(existsSync(coordRoot)).toBe(false);
+  it('creates ST_ROOT if missing (mkdir -p)', () => {
+    rmSync(stRoot, { recursive: true });
+    expect(existsSync(stRoot)).toBe(false);
     cmdSyncPull(
       `local:${join(scratch, 'peer')}`,
       ctx(makeMockRsync({ calls: [], exitCode: 0 }))
     );
-    expect(existsSync(coordRoot)).toBe(true);
+    expect(existsSync(stRoot)).toBe(true);
   });
 
   it('rsync non-zero exit → throws "rsync pull failed: ..."', () => {
@@ -306,7 +306,7 @@ describe('cmdSyncAllPush / cmdSyncAllPull', () => {
   });
 
   it('errors when peers.yaml is empty / has no peers', () => {
-    writeFileSync(join(coordConfig, 'peers.yaml'), '# only comments\n');
+    writeFileSync(join(stConfig, 'peers.yaml'), '# only comments\n');
     expect(() => cmdSyncAllPush(ctx(makeMockRsync({ calls: [], exitCode: 0 }))))
       .toThrowError(/no peers found/);
   });
@@ -314,7 +314,7 @@ describe('cmdSyncAllPush / cmdSyncAllPull', () => {
   it('push --all calls rsync once per peer (PUSH direction only)', () => {
     setupIdentity('alice');
     writeFileSync(
-      join(coordConfig, 'peers.yaml'),
+      join(stConfig, 'peers.yaml'),
       [
         `bobby: local:${join(scratch, 'peer-bob')}`,
         `laptop: local:${join(scratch, 'peer-laptop')}`,
@@ -324,9 +324,9 @@ describe('cmdSyncAllPush / cmdSyncAllPull', () => {
     const state: MockState = { calls: [], exitCode: 0 };
     cmdSyncAllPush(ctx(makeMockRsync(state)));
     expect(state.calls).toHaveLength(2);
-    // All push direction: source = COORD_ROOT, target = peer.
+    // All push direction: source = ST_ROOT, target = peer.
     for (const args of state.calls) {
-      expect(args[0]).toBe(`${coordRoot}/`);
+      expect(args[0]).toBe(`${stRoot}/`);
       expect(args[1]!.startsWith(`${scratch}/peer-`)).toBe(true);
     }
   });
@@ -336,12 +336,12 @@ describe('cmdSyncAllPush / cmdSyncAllPull', () => {
     const peerTarget = join(scratch, 'peer-bob');
     mkdirSync(peerTarget);
     writeFileSync(
-      join(coordConfig, 'peers.yaml'),
+      join(stConfig, 'peers.yaml'),
       `bobby: local:${peerTarget}\n`
     );
     const state: MockState = { calls: [], exitCode: 0 };
     cmdSyncAllPull(ctx(makeMockRsync(state)));
-    expect(state.calls).toEqual([[`${peerTarget}/`, `${coordRoot}/`]]);
+    expect(state.calls).toEqual([[`${peerTarget}/`, `${stRoot}/`]]);
   });
 
   it('continues iterating peers even when one fails', () => {
@@ -349,7 +349,7 @@ describe('cmdSyncAllPush / cmdSyncAllPull', () => {
     const peerA = join(scratch, 'peer-a');
     const peerB = join(scratch, 'peer-b');
     writeFileSync(
-      join(coordConfig, 'peers.yaml'),
+      join(stConfig, 'peers.yaml'),
       [`a: local:${peerA}`, `b: local:${peerB}`].join('\n')
     );
     let n = 0;
@@ -372,15 +372,15 @@ describe('cmdSyncAll (push + pull every peer)', () => {
     setupIdentity('alice');
     const peerTarget = join(scratch, 'peer');
     writeFileSync(
-      join(coordConfig, 'peers.yaml'),
+      join(stConfig, 'peers.yaml'),
       `peer: local:${peerTarget}\n`
     );
     const state: MockState = { calls: [], exitCode: 0 };
     const r = cmdSyncAll(ctx(makeMockRsync(state)));
     // Push direction first, then pull direction.
     expect(state.calls).toHaveLength(2);
-    expect(state.calls[0]).toEqual([`${coordRoot}/`, `${peerTarget}/`]);
-    expect(state.calls[1]).toEqual([`${peerTarget}/`, `${coordRoot}/`]);
+    expect(state.calls[0]).toEqual([`${stRoot}/`, `${peerTarget}/`]);
+    expect(state.calls[1]).toEqual([`${peerTarget}/`, `${stRoot}/`]);
     expect(r.successes).toEqual([`local:${peerTarget}`]);
   });
 });

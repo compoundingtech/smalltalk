@@ -32,7 +32,7 @@ export type Identity = Agent;
 export type Filename = string;
 // `unknown` is a derived state: the status file's mtime is older than
 // STATUS_STALE_MS so we can't trust whatever's recorded there. Users
-// cannot `coord status --set unknown` — see SETTABLE_STATES below and
+// cannot `st status --set unknown` — see SETTABLE_STATES below and
 // the validator in commands/status.ts.
 // `away` (brief-029) is a fifth settable state meaning "present but not
 // actively engaged" — distinct from `busy` (focused work, don't
@@ -64,7 +64,7 @@ export const STATES: readonly State[] = [
   'unknown',
 ];
 
-/** States a user can write to disk via `coord status --set <state>`.
+/** States a user can write to disk via `st status --set <state>`.
  *  `unknown` is derived from mtime staleness — the user can never set it
  *  directly. */
 export const SETTABLE_STATES: readonly State[] = [
@@ -98,7 +98,7 @@ export const STATUS_REFRESH_MS = 5 * 60 * 1000;
 export const TIDY_CHECK_INTERVAL_MS = 20 * 60 * 1000;
 
 /** Drift threshold: an inbox file older than this is "unaddressed."
- *  Tunable per myobie's loose initial framing. */
+ *  Tunable per operator's loose initial framing. */
 export const STALE_INBOX_MS = 10 * 60 * 1000;
 
 export const RESERVED_NAMES: readonly string[] = [
@@ -110,7 +110,7 @@ export const RESERVED_NAMES: readonly string[] = [
   'resources',
   'status',
   'name',
-  // Status states (would alias-collide with `coord status <token>`).
+  // Status states (would alias-collide with `st status <token>`).
   // `unknown` is the brief-022 derived staleness value; reserved so
   // it can't double as an agent name either. `away` (brief-029) is
   // the fifth settable state.
@@ -250,7 +250,7 @@ export interface ResolveAgentOpts {
   /** environment to read ST_AGENT from (defaults to process.env). */
   env?: NodeJS.ProcessEnv;
   /** override $ST_ROOT used for the folder-existence check. */
-  coordRoot?: string;
+  stRoot?: string;
   /**
    * Folder-existence policy when {@link explicit} is set.
    * - `undefined` (default) → both `<agent>/inbox` AND `<agent>/archive`
@@ -258,9 +258,9 @@ export interface ResolveAgentOpts {
    *   impersonation invariant holds: you can't act AS another agent by
    *   half-fabricating their folder.
    * - `'lenient'` → at least ONE of inbox/archive must exist. Use for
-   *   cross-agent reads (`coord ls <other>`, `coord read <other>`,
-   *   `coord thread <other>`, `coord watch <other>`): a peer's folder
-   *   is often partial on this machine — a single `coord send <other>`
+   *   cross-agent reads (`st ls <other>`, `st read <other>`,
+   *   `st thread <other>`, `st watch <other>`): a peer's folder
+   *   is often partial on this machine — a single `st send <other>`
    *   lazily creates inbox/ but not archive/. The actual file lookups
    *   below this gate are existsSync-gated, so a missing folder is
    *   naturally treated as empty.
@@ -289,8 +289,7 @@ export type ResolveIdentityOpts = ResolveAgentOpts;
  *   1. explicit arg if non-empty
  *   2. $ST_AGENT env var (preferred)
  *   3. $ST_IDENTITY env var (deprecated, warns once per process)
- *   4. $COORD_IDENTITY env var (legacy, warns once per process)
- *   5. throw "agent required"
+ *   4. throw "agent required"
  *
  * Folder-existence handling differs by source:
  *   - env-resolved (no explicit) → lazy bootstrap. First command for
@@ -300,15 +299,10 @@ export type ResolveIdentityOpts = ResolveAgentOpts;
  *     must already exist. Throws AgentNotHostedError if not. Preserves
  *     anti-impersonation: you can't claim to act AS another agent by
  *     fabricating their folder on this machine.
- *
- * brief-009 item 3 (rename): the env-var fallback is now three levels
- * deep — ST_AGENT → ST_IDENTITY (warn) → COORD_IDENTITY (warn). The
- * two legacy names buy cos time to sweep ~8 pty.toml files at her own
- * pace without breaking running agents.
  */
 export function resolveAgent(opts: ResolveAgentOpts = {}): string {
   const env = opts.env ?? process.env;
-  const root = opts.coordRoot ?? coordRootFrom(env);
+  const root = opts.stRoot ?? stRootFrom(env);
 
   let id: string;
   let fromExplicit: boolean;
@@ -321,11 +315,7 @@ export function resolveAgent(opts: ResolveAgentOpts = {}): string {
   } else if (env.ST_IDENTITY) {
     id = env.ST_IDENTITY;
     fromExplicit = false;
-    warnCoordFallback('ST_AGENT', 'ST_IDENTITY');
-  } else if (env.COORD_IDENTITY) {
-    id = env.COORD_IDENTITY;
-    fromExplicit = false;
-    warnCoordFallback('ST_AGENT', 'COORD_IDENTITY');
+    warnLegacyEnvFallback('ST_AGENT', 'ST_IDENTITY');
   } else {
     throw new AgentRequiredError();
   }
@@ -369,132 +359,71 @@ export const resolveIdentity = resolveAgent;
 // (~/.config/coord) is intentionally NOT included in this phase per
 // the brief — it ships in a later phase.
 
-const warnedCoordFallbacks = new Set<string>();
+const warnedLegacyEnvFallbacks = new Set<string>();
 
 /** Test-only: drop the one-time-warning latch so each test can observe
  *  the warning fresh. Not exported from the package barrel. */
-export function _resetCoordFallbackWarnings(): void {
-  warnedCoordFallbacks.clear();
+export function _resetLegacyEnvFallbackWarnings(): void {
+  warnedLegacyEnvFallbacks.clear();
 }
 
-function warnCoordFallback(stName: string, coordName: string): void {
-  if (warnedCoordFallbacks.has(coordName)) return;
-  warnedCoordFallbacks.add(coordName);
-  // Best-effort — never crash a CLI invocation because the warning
-  // pipe is closed (rare; pre-shutdown stderr can be EPIPE under
-  // pipelines).
+/** Emit a one-time stderr warning when a deprecated env-var alias is
+ *  honored. Currently only covers the ST_IDENTITY → ST_AGENT
+ *  rename. */
+function warnLegacyEnvFallback(canonicalName: string, legacyName: string): void {
+  if (warnedLegacyEnvFallbacks.has(legacyName)) return;
+  warnedLegacyEnvFallbacks.add(legacyName);
   try {
     process.stderr.write(
-      `[smalltalk] honoring ${coordName} — migrate to ${stName} when convenient\n`
+      `[smalltalk] honoring ${legacyName} — migrate to ${canonicalName} when convenient\n`
     );
   } catch {
     // ignore: we tried to warn, no point in killing the call over it
   }
 }
 
+/** Default state-root path: `~/.local/state/smalltalk`. */
 function defaultStateRoot(env: NodeJS.ProcessEnv): string {
   const home = env.HOME ?? homedir();
-  const stPath = join(home, '.local/state/smalltalk');
-  const coordPath = join(home, '.local/state/coord');
-  // Both exist (Phase 1 migration in flight on this machine) → prefer
-  // the new path silently. cos clarified the warning belongs on env
-  // vars (the actionable signal), not on the state-dir itself.
-  try {
-    if (statSync(stPath).isDirectory()) return stPath;
-  } catch {
-    // not present
-  }
-  try {
-    if (statSync(coordPath).isDirectory()) return coordPath;
-  } catch {
-    // not present
-  }
-  return stPath; // brand-new install: the new path becomes the default
+  return join(home, '.local/state/smalltalk');
 }
 
-/**
- * Mirror of {@link defaultStateRoot} for the config dir. Prefers
- * `~/.config/smalltalk` when it exists, falls back to
- * `~/.config/coord` when only that exists, and creates
- * `~/.config/smalltalk` on a brand-new install. Same reasoning as
- * defaultStateRoot: the warning belongs on env vars (the actionable
- * signal), not the dir itself.
- */
+/** Default config-dir path: `~/.config/smalltalk`. */
 function defaultConfigDir(env: NodeJS.ProcessEnv): string {
   const home = env.HOME ?? homedir();
-  const stPath = join(home, '.config/smalltalk');
-  const coordPath = join(home, '.config/coord');
-  try {
-    if (statSync(stPath).isDirectory()) return stPath;
-  } catch {
-    // not present
-  }
-  try {
-    if (statSync(coordPath).isDirectory()) return coordPath;
-  } catch {
-    // not present
-  }
-  return stPath;
+  return join(home, '.config/smalltalk');
 }
 
-export function coordRootFrom(env: NodeJS.ProcessEnv = process.env): string {
+/** Read the state-root path from `$ST_ROOT`, or fall back to the
+ *  install-time default. */
+export function stRootFrom(env: NodeJS.ProcessEnv = process.env): string {
   const stv = env.ST_ROOT;
   if (stv && stv.length > 0) return stv;
-  const cv = env.COORD_ROOT;
-  if (cv && cv.length > 0) {
-    warnCoordFallback('ST_ROOT', 'COORD_ROOT');
-    return cv;
-  }
   return defaultStateRoot(env);
 }
 
-/**
- * Read the config-dir path from `ST_CONFIG` (preferred) or
- * `COORD_CONFIG` (legacy, one-time fallback notice). Falls back to
- * {@link defaultConfigDir} — which prefers `~/.config/smalltalk`
- * when it exists, then `~/.config/coord`, then creates the ST path
- * for brand-new installs.
- *
- * brief-rename-cutover Phase P1: closes the last `COORD_*` env var
- * that had no `ST_*` equivalent, so Phase D can drop `COORD_CONFIG`
- * support without a gap.
- */
+/** Read the config-dir path from `$ST_CONFIG` (preferred), or fall
+ *  back to {@link defaultConfigDir}. */
 export function stConfigFrom(env: NodeJS.ProcessEnv = process.env): string {
   const stv = env.ST_CONFIG;
   if (stv && stv.length > 0) return stv;
-  const cv = env.COORD_CONFIG;
-  if (cv && cv.length > 0) {
-    warnCoordFallback('ST_CONFIG', 'COORD_CONFIG');
-    return cv;
-  }
   return defaultConfigDir(env);
 }
 
-/** @deprecated Use {@link stConfigFrom}. Kept as a same-signature
- *  alias so existing embedders and CLI-context wiring compile
- *  unchanged. Removed once the coord→st cutover is complete
- *  (brief-rename-cutover Phase D). */
-export const coordConfigFrom = stConfigFrom;
-
 /**
- * Read the agent name from `ST_AGENT` (preferred), `ST_IDENTITY`
- * (deprecated, one-time fallback notice), or `COORD_IDENTITY` (legacy,
- * one-time fallback notice). Returns `undefined` when none are set —
- * callers throw their own context-specific error. Mirrors the
- * env-fallback half of {@link resolveAgent} for code paths (e.g.
- * `coord mcp`) that read the env directly.
+ * Read the agent name from `$ST_AGENT` (preferred) or `$ST_IDENTITY`
+ * (deprecated, one-time fallback notice). Returns `undefined` when
+ * none are set — callers throw their own context-specific error.
+ * Mirrors the env-fallback half of {@link resolveAgent} for code
+ * paths (e.g. `st mcp`) that read the env directly.
  */
 export function envAgentFrom(
   env: NodeJS.ProcessEnv = process.env
 ): string | undefined {
   if (env.ST_AGENT && env.ST_AGENT.length > 0) return env.ST_AGENT;
   if (env.ST_IDENTITY && env.ST_IDENTITY.length > 0) {
-    warnCoordFallback('ST_AGENT', 'ST_IDENTITY');
+    warnLegacyEnvFallback('ST_AGENT', 'ST_IDENTITY');
     return env.ST_IDENTITY;
-  }
-  if (env.COORD_IDENTITY && env.COORD_IDENTITY.length > 0) {
-    warnCoordFallback('ST_AGENT', 'COORD_IDENTITY');
-    return env.COORD_IDENTITY;
   }
   return undefined;
 }
@@ -505,51 +434,44 @@ export const envIdentityFrom = envAgentFrom;
 /**
  * The name the CLI was invoked as (`coord` / `st` / `smalltalk`).
  * Set by the bash shim via `_ST_INVOKED_AS` BEFORE any symlink walk so
- * we capture the user-typed name, not the resolved real path. Defaults
- * to `coord` for back-compat with callers (tests, library embeds) that
- * never set the env var.
- */
-export type InvokedAs = 'coord' | 'st' | 'smalltalk';
+ * we capture the user-typed name. Defaults to `st` for callers
+ * (tests, library embeds) that never set the env var. */
+export type InvokedAs = 'st' | 'smalltalk';
 
 export function invokedAsFrom(
   env: NodeJS.ProcessEnv = process.env
 ): InvokedAs {
   const raw = env._ST_INVOKED_AS;
-  if (raw === 'st' || raw === 'smalltalk' || raw === 'coord') return raw;
-  return 'coord';
+  if (raw === 'smalltalk') return 'smalltalk';
+  return 'st';
 }
 
-/** Canonicalize an invocation name down to `coord` (legacy alias) or
- *  `st` (the new short canonical name). `smalltalk` resolves to `st`. */
-export function canonicalServerName(invoked: InvokedAs): 'coord' | 'st' {
-  return invoked === 'coord' ? 'coord' : 'st';
+/** Canonicalize an invocation name to `st`. */
+export function canonicalServerName(_invoked: InvokedAs): 'st' {
+  return 'st';
 }
 
-export function coordRoot(): string {
-  return coordRootFrom();
+export function stRoot(): string {
+  return stRootFrom();
 }
 
 export function stConfig(): string {
   return stConfigFrom();
 }
 
-/** @deprecated Use {@link stConfig}. Alias kept until the coord→st
- *  cutover completes (brief-rename-cutover Phase D). */
-export const coordConfig = stConfig;
-
-export function identityDir(id: string, root: string = coordRoot()): string {
+export function identityDir(id: string, root: string = stRoot()): string {
   return join(root, id);
 }
 
-export function inboxDir(id: string, root: string = coordRoot()): string {
+export function inboxDir(id: string, root: string = stRoot()): string {
   return join(root, id, 'inbox');
 }
 
-export function archiveDir(id: string, root: string = coordRoot()): string {
+export function archiveDir(id: string, root: string = stRoot()): string {
   return join(root, id, 'archive');
 }
 
-export function resourcesDir(id: string, root: string = coordRoot()): string {
+export function resourcesDir(id: string, root: string = stRoot()): string {
   return join(root, id, 'resources');
 }
 
@@ -571,29 +493,29 @@ export function resourcesDir(id: string, root: string = coordRoot()): string {
 // writes lazy-create the folder. Rationale: the restart-continuity eval
 // needs a control arm with no `context/` that fails exactly like an
 // unrestored agent, plus a treatment arm that resumes cleanly.
-export function contextDir(id: string, root: string = coordRoot()): string {
+export function contextDir(id: string, root: string = stRoot()): string {
   return join(root, id, 'context');
 }
 
 export function contextNowPath(
   id: string,
-  root: string = coordRoot()
+  root: string = stRoot()
 ): string {
   return join(contextDir(id, root), 'now.md');
 }
 
 export function contextDecisionsDir(
   id: string,
-  root: string = coordRoot()
+  root: string = stRoot()
 ): string {
   return join(contextDir(id, root), 'decisions');
 }
 
-export function statusPath(id: string, root: string = coordRoot()): string {
+export function statusPath(id: string, root: string = stRoot()): string {
   return join(root, id, 'status');
 }
 
-export function namePath(id: string, root: string = coordRoot()): string {
+export function namePath(id: string, root: string = stRoot()): string {
   return join(root, id, 'name');
 }
 
@@ -601,7 +523,7 @@ export function namePath(id: string, root: string = coordRoot()): string {
 
 export function assertIdentityFolderExists(
   id: string,
-  root: string = coordRoot()
+  root: string = stRoot()
 ): void {
   const inbox = inboxDir(id, root);
   const archive = archiveDir(id, root);
@@ -614,14 +536,14 @@ export function assertIdentityFolderExists(
  * Lenient form of {@link assertIdentityFolderExists}: succeeds if at
  * least one of `<id>/inbox` or `<id>/archive` exists. Used by
  * cross-identity read paths (ls, read, thread, watch), where peer
- * folders are often partial — e.g. `coord send bob` lazily creates
+ * folders are often partial — e.g. `st send bob` lazily creates
  * `bob/inbox/` but not `bob/archive/`, so a follow-up
- * `coord ls bob` from the sender's side would fail under the strict
+ * `st ls bob` from the sender's side would fail under the strict
  * check even though there's a message to read.
  */
 export function assertIdentityFolderExistsLenient(
   id: string,
-  root: string = coordRoot()
+  root: string = stRoot()
 ): void {
   const inbox = inboxDir(id, root);
   const archive = archiveDir(id, root);
@@ -640,7 +562,7 @@ function isDir(p: string): boolean {
 
 export function ensureIdentityDirs(
   id: string,
-  root: string = coordRoot()
+  root: string = stRoot()
 ): void {
   mkdirSync(inboxDir(id, root), { recursive: true });
   mkdirSync(archiveDir(id, root), { recursive: true });
@@ -828,7 +750,7 @@ export interface SweepResult {
 
 /**
  * Enforce the LAYOUT archive-as-tombstone invariant: for every
- * `<id>/archive/X.md` under `coordRoot`, remove `<id>/inbox/X.md` if it
+ * `<id>/archive/X.md` under `stRoot`, remove `<id>/inbox/X.md` if it
  * is byte-identical to the archive copy. Skips divergent pairs (a violated
  * invariant — likely manual edit; surfaced by archive case-3). Idempotent.
  *
@@ -839,7 +761,7 @@ export interface SweepResult {
  * an unrelated user-dropped file.
  */
 export function sweep(rootArg?: string): SweepResult {
-  const root = rootArg ?? coordRoot();
+  const root = rootArg ?? stRoot();
   let removed = 0;
 
   let topEntries: string[];

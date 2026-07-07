@@ -128,7 +128,7 @@ export interface ResourceAddInput {
   /** Override the owning identity. Defaults to env COORD_IDENTITY. */
   identity?: string | undefined;
   env: NodeJS.ProcessEnv;
-  coordRoot: string;
+  stRoot: string;
 }
 
 export interface ResourceAddResult {
@@ -144,9 +144,9 @@ export function cmdResourceAdd(input: ResourceAddInput): ResourceAddResult {
   const identity = resolveIdentity({
     ...(input.identity !== undefined && { explicit: input.identity }),
     env: input.env,
-    coordRoot: input.coordRoot,
+    stRoot: input.stRoot,
   });
-  const dir = ensureResourcesDir(identity, input.coordRoot);
+  const dir = ensureResourcesDir(identity, input.stRoot);
   const filename = genFilename();
   const path = join(dir, filename);
 
@@ -173,7 +173,7 @@ export interface ResourceLsInput {
   /** Whose resources to list. Defaults to env COORD_IDENTITY. */
   identity?: string | undefined;
   env: NodeJS.ProcessEnv;
-  coordRoot: string;
+  stRoot: string;
 }
 
 export interface ResourceLsResult {
@@ -185,12 +185,12 @@ export function cmdResourceLs(input: ResourceLsInput): ResourceLsResult {
   const identity = resolveIdentity({
     ...(input.identity !== undefined && { explicit: input.identity }),
     env: input.env,
-    coordRoot: input.coordRoot,
+    stRoot: input.stRoot,
     // Read-side: don't require the inbox/archive skeleton — peers may have
     // only resources/ for an identity in some edge cases.
     policy: 'lenient',
   });
-  const dir = resourcesDir(identity, input.coordRoot);
+  const dir = resourcesDir(identity, input.stRoot);
   if (!existsSync(dir)) return { identity, matches: [] };
   let names: string[];
   try {
@@ -238,7 +238,7 @@ export interface ResourceReadInput {
   identity?: string | undefined;
   filename: string;
   env: NodeJS.ProcessEnv;
-  coordRoot: string;
+  stRoot: string;
 }
 
 export interface ResourceReadResult {
@@ -253,10 +253,10 @@ export function cmdResourceRead(input: ResourceReadInput): ResourceReadResult {
   const identity = resolveIdentity({
     ...(input.identity !== undefined && { explicit: input.identity }),
     env: input.env,
-    coordRoot: input.coordRoot,
+    stRoot: input.stRoot,
     policy: 'lenient',
   });
-  const path = join(resourcesDir(identity, input.coordRoot), input.filename);
+  const path = join(resourcesDir(identity, input.stRoot), input.filename);
   if (!existsSync(path)) {
     throw new ResourceNotFoundError(identity, input.filename);
   }
@@ -272,7 +272,7 @@ export interface ResourceRemoveInput {
   identity?: string | undefined;
   filename: string;
   env: NodeJS.ProcessEnv;
-  coordRoot: string;
+  stRoot: string;
 }
 
 export interface ResourceRemoveResult {
@@ -290,9 +290,9 @@ export function cmdResourceRemove(
   const identity = resolveIdentity({
     ...(input.identity !== undefined && { explicit: input.identity }),
     env: input.env,
-    coordRoot: input.coordRoot,
+    stRoot: input.stRoot,
   });
-  const path = join(resourcesDir(identity, input.coordRoot), input.filename);
+  const path = join(resourcesDir(identity, input.stRoot), input.filename);
   if (!existsSync(path)) {
     throw new ResourceNotFoundError(identity, input.filename);
   }
@@ -398,7 +398,7 @@ async function cmdResourceAddCli(
     ...(relation !== undefined && { relation }),
     ...(body !== undefined && { body }),
     env: ctx.env,
-    coordRoot: ctx.coordRoot,
+    stRoot: ctx.stRoot,
   });
   ctx.stdout(`${r.filename}\n`);
   return 0;
@@ -426,7 +426,7 @@ function cmdResourceLsCli(
   const r = cmdResourceLs({
     ...(identity !== undefined && { identity }),
     env: ctx.env,
-    coordRoot: ctx.coordRoot,
+    stRoot: ctx.stRoot,
   });
   if (json) {
     ctx.stdout(`${JSON.stringify(r.matches)}\n`);
@@ -468,7 +468,7 @@ function cmdResourceReadCli(
     ...(identity !== undefined && { identity }),
     filename,
     env: ctx.env,
-    coordRoot: ctx.coordRoot,
+    stRoot: ctx.stRoot,
   });
   if (json) {
     ctx.stdout(
@@ -519,7 +519,7 @@ function cmdResourceRemoveCli(
   const r = cmdResourceRemove({
     filename: positional[0]!,
     env: ctx.env,
-    coordRoot: ctx.coordRoot,
+    stRoot: ctx.stRoot,
   });
   ctx.stdout(`${r.identity}/${r.filename}: removed\n`);
   return 0;

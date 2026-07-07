@@ -17,14 +17,14 @@ import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import {
-  _resetCoordFallbackWarnings,
+  _resetLegacyEnvFallbackWarnings,
   archiveDir,
   assertIdentityFolderExists,
   CROCKFORD_BASE32,
-  coordConfig,
-  coordConfigFrom,
-  coordRoot,
-  coordRootFrom,
+  stConfig,
+  stConfigFrom,
+  stRoot,
+  stRootFrom,
   emitFrontmatter,
   ensureIdentityDirs,
   filenameTimestamp,
@@ -56,12 +56,12 @@ import {
 // ─── Per-test scratch dirs ──────────────────────────────────────────────
 
 let scratch: string;
-let coordRootDir: string;
+let stRootDir: string;
 
 beforeEach(() => {
   scratch = mkdtempSync(join(tmpdir(), 'coord-common-test-'));
-  coordRootDir = join(scratch, 'coord');
-  mkdirSync(coordRootDir, { recursive: true });
+  stRootDir = join(scratch, 'coord');
+  mkdirSync(stRootDir, { recursive: true });
 });
 
 afterEach(() => {
@@ -123,7 +123,7 @@ describe('constants', () => {
 
   it('validIdentity rejects `away` (reserved per brief-029)', () => {
     // Same defense as the other state words — an identity literally
-    // named `away` would collide with `coord status alice --set away`
+    // named `away` would collide with `st status alice --set away`
     // tokenization at the CLI layer.
     expect(validIdentity('away')).toBe(false);
   });
@@ -257,7 +257,7 @@ describe('validFilename', () => {
   });
 
   it('rejects: legacy 3-segment (<ts>-<machine>-<rand>.md)', () => {
-    expect(validFilename('1714826789012-myobie-x9k4mz.md')).toBe(false);
+    expect(validFilename('1714826789012-operator-x9k4mz.md')).toBe(false);
   });
 });
 
@@ -271,7 +271,7 @@ describe('validOutsideFilename (task #128)', () => {
   it('accepts the legacy 3-segment shape (LAYOUT-004 no longer matches it)', () => {
     // Not our canonical grammar; legitimately hand-dropped or from an
     // older peer that predates the rename.
-    expect(validOutsideFilename('1714826789012-myobie-x9k4mz.md')).toBe(true);
+    expect(validOutsideFilename('1714826789012-operator-x9k4mz.md')).toBe(true);
   });
 
   it('rejects: canonical LAYOUT-004 grammar (that is a real message, not outside)', () => {
@@ -415,35 +415,35 @@ describe('validIdentity', () => {
 
 describe('resolveIdentity', () => {
   it('uses the explicit arg when provided (env ignored)', () => {
-    setupIdentity(coordRootDir, 'alice');
-    setupIdentity(coordRootDir, 'bob');
+    setupIdentity(stRootDir, 'alice');
+    setupIdentity(stRootDir, 'bob');
     expect(
       resolveIdentity({
         explicit: 'alice',
-        env: { COORD_IDENTITY: 'bob' } as NodeJS.ProcessEnv,
-        coordRoot: coordRootDir,
+        env: { ST_AGENT: 'bob' } as NodeJS.ProcessEnv,
+        stRoot: stRootDir,
       })
     ).toBe('alice');
   });
 
-  it('falls back to COORD_IDENTITY when no explicit arg', () => {
-    setupIdentity(coordRootDir, 'bob');
+  it('falls back to ST_AGENT when no explicit arg', () => {
+    setupIdentity(stRootDir, 'bob');
     expect(
       resolveIdentity({
-        env: { COORD_IDENTITY: 'bob' } as NodeJS.ProcessEnv,
-        coordRoot: coordRootDir,
+        env: { ST_AGENT: 'bob' } as NodeJS.ProcessEnv,
+        stRoot: stRootDir,
       })
     ).toBe('bob');
   });
 
-  it('errors loudly mentioning COORD_IDENTITY when neither is set', () => {
-    setupIdentity(coordRootDir, 'bob');
+  it('errors loudly mentioning ST_AGENT when neither is set', () => {
+    setupIdentity(stRootDir, 'bob');
     expect(() =>
       resolveIdentity({
         env: {} as NodeJS.ProcessEnv,
-        coordRoot: coordRootDir,
+        stRoot: stRootDir,
       })
-    ).toThrowError(/COORD_IDENTITY/);
+    ).toThrowError(/ST_AGENT/);
   });
 
   it('errors when the resolved identity is not valid', () => {
@@ -451,7 +451,7 @@ describe('resolveIdentity', () => {
       resolveIdentity({
         explicit: 'INVALID',
         env: {} as NodeJS.ProcessEnv,
-        coordRoot: coordRootDir,
+        stRoot: stRootDir,
       })
     ).toThrowError(/invalid (agent name|identity)/);
   });
@@ -461,7 +461,7 @@ describe('resolveIdentity', () => {
       resolveIdentity({
         explicit: 'inbox',
         env: {} as NodeJS.ProcessEnv,
-        coordRoot: coordRootDir,
+        stRoot: stRootDir,
       })
     ).toThrowError(/invalid (agent name|identity)/);
   });
@@ -471,75 +471,75 @@ describe('resolveIdentity', () => {
       resolveIdentity({
         explicit: 'ghost',
         env: {} as NodeJS.ProcessEnv,
-        coordRoot: coordRootDir,
+        stRoot: stRootDir,
       })
     ).toThrowError(/(agent|identity) folder missing for ghost/);
   });
 
   it('errors with the mkdir hint when only inbox exists', () => {
-    mkdirSync(join(coordRootDir, 'half', 'inbox'), { recursive: true });
+    mkdirSync(join(stRootDir, 'half', 'inbox'), { recursive: true });
     expect(() =>
       resolveIdentity({
         explicit: 'half',
         env: {} as NodeJS.ProcessEnv,
-        coordRoot: coordRootDir,
+        stRoot: stRootDir,
       })
     ).toThrowError(/(agent|identity) folder missing/);
   });
 
-  // ─── First-run polish: lazy bootstrap on $COORD_IDENTITY ────────────
+  // ─── First-run polish: lazy bootstrap on $ST_AGENT ────────────
 
-  it('auto-creates <id>/{inbox,archive} when $COORD_IDENTITY resolves and folders are missing', () => {
+  it('auto-creates <id>/{inbox,archive} when $ST_AGENT resolves and folders are missing', () => {
     // Fresh root, no pre-existing identity. Should NOT throw — first
     // command for a brand-new identity bootstraps the folders on
     // demand.
     expect(
       resolveIdentity({
-        env: { COORD_IDENTITY: 'newperson' } as NodeJS.ProcessEnv,
-        coordRoot: coordRootDir,
+        env: { ST_AGENT: 'newperson' } as NodeJS.ProcessEnv,
+        stRoot: stRootDir,
       })
     ).toBe('newperson');
     expect(
-      isDirSync(join(coordRootDir, 'newperson', 'inbox'))
+      isDirSync(join(stRootDir, 'newperson', 'inbox'))
     ).toBe(true);
     expect(
-      isDirSync(join(coordRootDir, 'newperson', 'archive'))
+      isDirSync(join(stRootDir, 'newperson', 'archive'))
     ).toBe(true);
   });
 
   it('auto-create is idempotent — second call with the same identity is a no-op', () => {
     resolveIdentity({
-      env: { COORD_IDENTITY: 'idempot' } as NodeJS.ProcessEnv,
-      coordRoot: coordRootDir,
+      env: { ST_AGENT: 'idempot' } as NodeJS.ProcessEnv,
+      stRoot: stRootDir,
     });
     // Second call works the same way; no error, no double-mkdir issue.
     expect(() =>
       resolveIdentity({
-        env: { COORD_IDENTITY: 'idempot' } as NodeJS.ProcessEnv,
-        coordRoot: coordRootDir,
+        env: { ST_AGENT: 'idempot' } as NodeJS.ProcessEnv,
+        stRoot: stRootDir,
       })
     ).not.toThrow();
   });
 
   it('--from <other> still errors if <other> is missing (anti-impersonation)', () => {
     // The lazy bootstrap is for "you, claiming to be you" via
-    // $COORD_IDENTITY. Explicit <other> stays strict.
+    // $ST_AGENT. Explicit <other> stays strict.
     expect(() =>
       resolveIdentity({
         explicit: 'ghost',
-        env: { COORD_IDENTITY: 'whoever' } as NodeJS.ProcessEnv,
-        coordRoot: coordRootDir,
+        env: { ST_AGENT: 'whoever' } as NodeJS.ProcessEnv,
+        stRoot: stRootDir,
       })
     ).toThrowError(/(agent|identity) folder missing for ghost/);
   });
 
   it('--from <other> matching an existing identity still works after self bootstrap', () => {
-    setupIdentity(coordRootDir, 'bob');
+    setupIdentity(stRootDir, 'bob');
     expect(
       resolveIdentity({
         explicit: 'bob',
-        env: { COORD_IDENTITY: 'newperson' } as NodeJS.ProcessEnv,
-        coordRoot: coordRootDir,
+        env: { ST_AGENT: 'newperson' } as NodeJS.ProcessEnv,
+        stRoot: stRootDir,
       })
     ).toBe('bob');
   });
@@ -547,30 +547,30 @@ describe('resolveIdentity', () => {
   // ─── Lenient policy: cross-identity reads tolerate partial peer trees ──
 
   it("policy: 'lenient' accepts <id> when ONLY inbox/ exists", () => {
-    mkdirSync(join(coordRootDir, 'partial', 'inbox'), { recursive: true });
+    mkdirSync(join(stRootDir, 'partial', 'inbox'), { recursive: true });
     expect(
       resolveIdentity({
         explicit: 'partial',
         env: {} as NodeJS.ProcessEnv,
-        coordRoot: coordRootDir,
+        stRoot: stRootDir,
         policy: 'lenient',
       })
     ).toBe('partial');
     // partial's archive was NOT created — lenient is observe-only.
-    expect(isDirSync(join(coordRootDir, 'partial', 'archive'))).toBe(false);
+    expect(isDirSync(join(stRootDir, 'partial', 'archive'))).toBe(false);
   });
 
   it("policy: 'lenient' accepts <id> when ONLY archive/ exists", () => {
-    mkdirSync(join(coordRootDir, 'archived', 'archive'), { recursive: true });
+    mkdirSync(join(stRootDir, 'archived', 'archive'), { recursive: true });
     expect(
       resolveIdentity({
         explicit: 'archived',
         env: {} as NodeJS.ProcessEnv,
-        coordRoot: coordRootDir,
+        stRoot: stRootDir,
         policy: 'lenient',
       })
     ).toBe('archived');
-    expect(isDirSync(join(coordRootDir, 'archived', 'inbox'))).toBe(false);
+    expect(isDirSync(join(stRootDir, 'archived', 'inbox'))).toBe(false);
   });
 
   it("policy: 'lenient' still throws when NEITHER inbox nor archive exists", () => {
@@ -578,22 +578,22 @@ describe('resolveIdentity', () => {
       resolveIdentity({
         explicit: 'phantom',
         env: {} as NodeJS.ProcessEnv,
-        coordRoot: coordRootDir,
+        stRoot: stRootDir,
         policy: 'lenient',
       })
     ).toThrowError(/(agent|identity) folder missing for phantom/);
   });
 
-  it("policy: 'lenient' is ignored on the $COORD_IDENTITY path (still auto-creates)", () => {
+  it("policy: 'lenient' is ignored on the $ST_AGENT path (still auto-creates)", () => {
     // Same `policy: 'lenient'` call but no `explicit` — bootstrap
     // wins because we never reach the policy branch.
     resolveIdentity({
-      env: { COORD_IDENTITY: 'ownbootstrap' } as NodeJS.ProcessEnv,
-      coordRoot: coordRootDir,
+      env: { ST_AGENT: 'ownbootstrap' } as NodeJS.ProcessEnv,
+      stRoot: stRootDir,
       policy: 'lenient',
     });
-    expect(isDirSync(join(coordRootDir, 'ownbootstrap', 'inbox'))).toBe(true);
-    expect(isDirSync(join(coordRootDir, 'ownbootstrap', 'archive'))).toBe(
+    expect(isDirSync(join(stRootDir, 'ownbootstrap', 'inbox'))).toBe(true);
+    expect(isDirSync(join(stRootDir, 'ownbootstrap', 'archive'))).toBe(
       true
     );
   });
@@ -610,22 +610,16 @@ function isDirSync(p: string): boolean {
 // ─── Path helpers ───────────────────────────────────────────────────────
 
 describe('path helpers', () => {
-  it('coordRootFrom honors $COORD_ROOT when set', () => {
-    expect(coordRootFrom({ COORD_ROOT: '/tmp/x' } as NodeJS.ProcessEnv)).toBe(
+  it('stRootFrom honors $ST_ROOT when set', () => {
+    expect(stRootFrom({ ST_ROOT: '/tmp/x' } as NodeJS.ProcessEnv)).toBe(
       '/tmp/x'
     );
   });
 
-  it('coordRootFrom falls back to ~/.local/state/smalltalk', () => {
-    const v = coordRootFrom({} as NodeJS.ProcessEnv);
+  it('stRootFrom falls back to ~/.local/state/smalltalk', () => {
+    const v = stRootFrom({} as NodeJS.ProcessEnv);
     expect(v.endsWith('.local/state/smalltalk')).toBe(true);
   });
-
-  // Phase P1 (brief-rename-cutover): stConfigFrom is the canonical
-  // resolver; coordConfigFrom is a same-signature deprecated alias.
-  // Both preserve the pre-P1 behavior for existing $COORD_CONFIG
-  // callers AND add the $ST_CONFIG-preferred + one-time-fallback-warn
-  // shape that mirrors ST_ROOT / COORD_ROOT.
 
   it('stConfigFrom honors $ST_CONFIG when set', () => {
     expect(
@@ -633,61 +627,15 @@ describe('path helpers', () => {
     ).toBe('/tmp/st-config');
   });
 
-  it('stConfigFrom falls back to $COORD_CONFIG when ST_CONFIG unset', () => {
-    _resetCoordFallbackWarnings();
-    expect(
-      stConfigFrom({ COORD_CONFIG: '/tmp/legacy' } as NodeJS.ProcessEnv)
-    ).toBe('/tmp/legacy');
-  });
-
-  it('stConfigFrom prefers $ST_CONFIG over $COORD_CONFIG when both set', () => {
-    _resetCoordFallbackWarnings();
-    expect(
-      stConfigFrom({
-        ST_CONFIG: '/tmp/st',
-        COORD_CONFIG: '/tmp/coord',
-      } as NodeJS.ProcessEnv)
-    ).toBe('/tmp/st');
-  });
-
-  it('stConfigFrom falls back to ~/.config/smalltalk (brand-new install)', () => {
-    // HOME points at a scratch dir with neither `.config/smalltalk`
-    // nor `.config/coord` present → the ST path becomes the default.
+  it('stConfigFrom falls back to ~/.config/smalltalk when $ST_CONFIG unset', () => {
     const v = stConfigFrom({ HOME: scratch } as NodeJS.ProcessEnv);
     expect(v.endsWith('.config/smalltalk')).toBe(true);
   });
 
-  it('stConfigFrom prefers existing ~/.config/coord when it exists but smalltalk does not', () => {
-    // Legacy machine: only `.config/coord` exists. The resolver
-    // silently prefers it (no env-var warning — the warn belongs on
-    // env vars, not the state-dir shape).
-    mkdirSync(join(scratch, '.config/coord'), { recursive: true });
-    const v = stConfigFrom({ HOME: scratch } as NodeJS.ProcessEnv);
-    expect(v.endsWith('.config/coord')).toBe(true);
-  });
-
-  it('stConfigFrom prefers ~/.config/smalltalk when BOTH dirs exist (Phase-1 in flight)', () => {
-    mkdirSync(join(scratch, '.config/smalltalk'), { recursive: true });
-    mkdirSync(join(scratch, '.config/coord'), { recursive: true });
-    const v = stConfigFrom({ HOME: scratch } as NodeJS.ProcessEnv);
-    expect(v.endsWith('.config/smalltalk')).toBe(true);
-  });
-
-  it('coordConfigFrom is a same-signature alias of stConfigFrom (back-compat)', () => {
-    _resetCoordFallbackWarnings();
-    expect(coordConfigFrom).toBe(stConfigFrom);
-    expect(
-      coordConfigFrom({ COORD_CONFIG: '/tmp/legacy' } as NodeJS.ProcessEnv)
-    ).toBe('/tmp/legacy');
-  });
-
-  it('coordRoot()/coordConfig()/stConfig() read live process.env', () => {
+  it('stRoot()/stConfig() read live process.env', () => {
     // Smoke test: just confirm the wrappers don't throw and return strings.
-    expect(typeof coordRoot()).toBe('string');
-    expect(typeof coordConfig()).toBe('string');
+    expect(typeof stRoot()).toBe('string');
     expect(typeof stConfig()).toBe('string');
-    // coordConfig is a same-signature alias of stConfig too.
-    expect(coordConfig).toBe(stConfig);
   });
 
   it('identityDir / inboxDir / archiveDir / statusPath / namePath compose correctly', () => {
@@ -704,38 +652,38 @@ describe('path helpers', () => {
 
 describe('assertIdentityFolderExists', () => {
   it('passes when both inbox and archive exist', () => {
-    setupIdentity(coordRootDir, 'alice');
-    expect(() => assertIdentityFolderExists('alice', coordRootDir)).not.toThrow();
+    setupIdentity(stRootDir, 'alice');
+    expect(() => assertIdentityFolderExists('alice', stRootDir)).not.toThrow();
   });
 
   it('throws naming the path when inbox is missing', () => {
-    mkdirSync(join(coordRootDir, 'alice', 'archive'), { recursive: true });
+    mkdirSync(join(stRootDir, 'alice', 'archive'), { recursive: true });
     expect(() =>
-      assertIdentityFolderExists('alice', coordRootDir)
+      assertIdentityFolderExists('alice', stRootDir)
     ).toThrowError(
-      /(agent|identity) folder missing for alice — create it: mkdir -p \$(ST|COORD)_ROOT\/alice\/{inbox,archive}/
+      /(agent|identity) folder missing for alice — create it: mkdir -p \$ST_ROOT\/alice\/{inbox,archive}/
     );
   });
 
   it('throws when archive is missing', () => {
-    mkdirSync(join(coordRootDir, 'alice', 'inbox'), { recursive: true });
-    expect(() => assertIdentityFolderExists('alice', coordRootDir)).toThrowError(
+    mkdirSync(join(stRootDir, 'alice', 'inbox'), { recursive: true });
+    expect(() => assertIdentityFolderExists('alice', stRootDir)).toThrowError(
       /(agent|identity) folder missing/
     );
   });
 
   it('throws when nothing exists', () => {
-    expect(() => assertIdentityFolderExists('ghost', coordRootDir)).toThrow();
+    expect(() => assertIdentityFolderExists('ghost', stRootDir)).toThrow();
   });
 });
 
 describe('ensureIdentityDirs', () => {
   it('creates inbox and archive (idempotent)', () => {
-    ensureIdentityDirs('alice', coordRootDir);
-    expect(() => assertIdentityFolderExists('alice', coordRootDir)).not.toThrow();
+    ensureIdentityDirs('alice', stRootDir);
+    expect(() => assertIdentityFolderExists('alice', stRootDir)).not.toThrow();
     // Re-running is a no-op.
-    ensureIdentityDirs('alice', coordRootDir);
-    expect(() => assertIdentityFolderExists('alice', coordRootDir)).not.toThrow();
+    ensureIdentityDirs('alice', stRootDir);
+    expect(() => assertIdentityFolderExists('alice', stRootDir)).not.toThrow();
   });
 });
 
@@ -995,99 +943,99 @@ describe('safeAtomicWrite', () => {
 // ─── sweep ──────────────────────────────────────────────────────────────
 
 describe('sweep', () => {
-  it('empty $COORD_ROOT (no children) → { removed: 0 }', () => {
-    expect(sweep(coordRootDir)).toEqual({ removed: 0 });
+  it('empty $ST_ROOT (no children) → { removed: 0 }', () => {
+    expect(sweep(stRootDir)).toEqual({ removed: 0 });
   });
 
   it('inbox file with no archive twin → preserved', () => {
-    setupIdentity(coordRootDir, 'bob');
+    setupIdentity(stRootDir, 'bob');
     const f = '1714826789010-aaaaaa.md';
-    writeFileSync(join(coordRootDir, 'bob', 'inbox', f), 'live');
-    expect(sweep(coordRootDir)).toEqual({ removed: 0 });
-    expect(readFileSync(join(coordRootDir, 'bob', 'inbox', f), 'utf8')).toBe(
+    writeFileSync(join(stRootDir, 'bob', 'inbox', f), 'live');
+    expect(sweep(stRootDir)).toEqual({ removed: 0 });
+    expect(readFileSync(join(stRootDir, 'bob', 'inbox', f), 'utf8')).toBe(
       'live'
     );
   });
 
   it('inbox + identical archive twin → inbox copy removed, removed=1', () => {
-    setupIdentity(coordRootDir, 'bob');
+    setupIdentity(stRootDir, 'bob');
     const f = '1714826789010-aaaaaa.md';
-    writeFileSync(join(coordRootDir, 'bob', 'inbox', f), 'same');
-    writeFileSync(join(coordRootDir, 'bob', 'archive', f), 'same');
-    expect(sweep(coordRootDir)).toEqual({ removed: 1 });
+    writeFileSync(join(stRootDir, 'bob', 'inbox', f), 'same');
+    writeFileSync(join(stRootDir, 'bob', 'archive', f), 'same');
+    expect(sweep(stRootDir)).toEqual({ removed: 1 });
     expect(
-      require('node:fs').existsSync(join(coordRootDir, 'bob', 'inbox', f))
+      require('node:fs').existsSync(join(stRootDir, 'bob', 'inbox', f))
     ).toBe(false);
     expect(
-      readFileSync(join(coordRootDir, 'bob', 'archive', f), 'utf8')
+      readFileSync(join(stRootDir, 'bob', 'archive', f), 'utf8')
     ).toBe('same');
   });
 
   it('inbox + DIVERGENT archive twin → inbox preserved (skip)', () => {
-    setupIdentity(coordRootDir, 'bob');
+    setupIdentity(stRootDir, 'bob');
     const f = '1714826789010-aaaaaa.md';
-    writeFileSync(join(coordRootDir, 'bob', 'inbox', f), 'inbox-version');
-    writeFileSync(join(coordRootDir, 'bob', 'archive', f), 'archive-version');
-    expect(sweep(coordRootDir)).toEqual({ removed: 0 });
+    writeFileSync(join(stRootDir, 'bob', 'inbox', f), 'inbox-version');
+    writeFileSync(join(stRootDir, 'bob', 'archive', f), 'archive-version');
+    expect(sweep(stRootDir)).toEqual({ removed: 0 });
     expect(
-      readFileSync(join(coordRootDir, 'bob', 'inbox', f), 'utf8')
+      readFileSync(join(stRootDir, 'bob', 'inbox', f), 'utf8')
     ).toBe('inbox-version');
   });
 
   it('multiple identities, mixed states, each handled independently', () => {
-    setupIdentity(coordRootDir, 'alice');
-    setupIdentity(coordRootDir, 'bob');
-    setupIdentity(coordRootDir, 'carol');
+    setupIdentity(stRootDir, 'alice');
+    setupIdentity(stRootDir, 'bob');
+    setupIdentity(stRootDir, 'carol');
 
     // alice: identical pair → swept.
     const f1 = '1714826789010-aaaaaa.md';
-    writeFileSync(join(coordRootDir, 'alice', 'inbox', f1), 'A');
-    writeFileSync(join(coordRootDir, 'alice', 'archive', f1), 'A');
+    writeFileSync(join(stRootDir, 'alice', 'inbox', f1), 'A');
+    writeFileSync(join(stRootDir, 'alice', 'archive', f1), 'A');
 
     // bob: inbox-only → preserved.
     const f2 = '1714826789020-bbbbbb.md';
-    writeFileSync(join(coordRootDir, 'bob', 'inbox', f2), 'B');
+    writeFileSync(join(stRootDir, 'bob', 'inbox', f2), 'B');
 
     // carol: identical pair → swept.
     const f3 = '1714826789030-cccccc.md';
-    writeFileSync(join(coordRootDir, 'carol', 'inbox', f3), 'C');
-    writeFileSync(join(coordRootDir, 'carol', 'archive', f3), 'C');
+    writeFileSync(join(stRootDir, 'carol', 'inbox', f3), 'C');
+    writeFileSync(join(stRootDir, 'carol', 'archive', f3), 'C');
 
-    expect(sweep(coordRootDir)).toEqual({ removed: 2 });
+    expect(sweep(stRootDir)).toEqual({ removed: 2 });
   });
 
   it('identity with no archive/ dir → no-op (no error)', () => {
-    mkdirSync(join(coordRootDir, 'lonely', 'inbox'), { recursive: true });
-    expect(() => sweep(coordRootDir)).not.toThrow();
-    expect(sweep(coordRootDir)).toEqual({ removed: 0 });
+    mkdirSync(join(stRootDir, 'lonely', 'inbox'), { recursive: true });
+    expect(() => sweep(stRootDir)).not.toThrow();
+    expect(sweep(stRootDir)).toEqual({ removed: 0 });
   });
 
   it('archive/ contains non-.md files → ignored', () => {
-    setupIdentity(coordRootDir, 'bob');
-    writeFileSync(join(coordRootDir, 'bob', 'archive', 'notes.md'), 'x'); // bad grammar
-    writeFileSync(join(coordRootDir, 'bob', 'archive', 'README'), 'x');
-    expect(sweep(coordRootDir)).toEqual({ removed: 0 });
+    setupIdentity(stRootDir, 'bob');
+    writeFileSync(join(stRootDir, 'bob', 'archive', 'notes.md'), 'x'); // bad grammar
+    writeFileSync(join(stRootDir, 'bob', 'archive', 'README'), 'x');
+    expect(sweep(stRootDir)).toEqual({ removed: 0 });
   });
 
   it('archive has X.md, no <id>/inbox/ dir → no-op', () => {
-    mkdirSync(join(coordRootDir, 'bob', 'archive'), { recursive: true });
+    mkdirSync(join(stRootDir, 'bob', 'archive'), { recursive: true });
     writeFileSync(
-      join(coordRootDir, 'bob', 'archive', '1714826789010-aaaaaa.md'),
+      join(stRootDir, 'bob', 'archive', '1714826789010-aaaaaa.md'),
       'x'
     );
-    expect(sweep(coordRootDir)).toEqual({ removed: 0 });
+    expect(sweep(stRootDir)).toEqual({ removed: 0 });
   });
 
   it('idempotent: a second sweep is a no-op', () => {
-    setupIdentity(coordRootDir, 'bob');
+    setupIdentity(stRootDir, 'bob');
     const f = '1714826789010-aaaaaa.md';
-    writeFileSync(join(coordRootDir, 'bob', 'inbox', f), 'same');
-    writeFileSync(join(coordRootDir, 'bob', 'archive', f), 'same');
-    expect(sweep(coordRootDir)).toEqual({ removed: 1 });
-    expect(sweep(coordRootDir)).toEqual({ removed: 0 });
+    writeFileSync(join(stRootDir, 'bob', 'inbox', f), 'same');
+    writeFileSync(join(stRootDir, 'bob', 'archive', f), 'same');
+    expect(sweep(stRootDir)).toEqual({ removed: 1 });
+    expect(sweep(stRootDir)).toEqual({ removed: 0 });
   });
 
-  it('returns { removed: 0 } when $COORD_ROOT does not exist', () => {
+  it('returns { removed: 0 } when $ST_ROOT does not exist', () => {
     expect(sweep(join(scratch, 'does-not-exist'))).toEqual({ removed: 0 });
   });
 
@@ -1100,73 +1048,73 @@ describe('sweep', () => {
 
   describe('attachment families (issue #8)', () => {
     it('sibling byte-identical pair + matching archive .md → sibling swept', () => {
-      setupIdentity(coordRootDir, 'bob');
+      setupIdentity(stRootDir, 'bob');
       const md = '1714826789010-aaaaaa.md';
       const att = '1714826789010-aaaaaa.options.json';
-      writeFileSync(join(coordRootDir, 'bob', 'inbox', md), 'M');
-      writeFileSync(join(coordRootDir, 'bob', 'archive', md), 'M');
-      writeFileSync(join(coordRootDir, 'bob', 'inbox', att), '{"k":1}');
-      writeFileSync(join(coordRootDir, 'bob', 'archive', att), '{"k":1}');
-      expect(sweep(coordRootDir)).toEqual({ removed: 2 });
+      writeFileSync(join(stRootDir, 'bob', 'inbox', md), 'M');
+      writeFileSync(join(stRootDir, 'bob', 'archive', md), 'M');
+      writeFileSync(join(stRootDir, 'bob', 'inbox', att), '{"k":1}');
+      writeFileSync(join(stRootDir, 'bob', 'archive', att), '{"k":1}');
+      expect(sweep(stRootDir)).toEqual({ removed: 2 });
       expect(
-        require('node:fs').existsSync(join(coordRootDir, 'bob', 'inbox', md))
+        require('node:fs').existsSync(join(stRootDir, 'bob', 'inbox', md))
       ).toBe(false);
       expect(
-        require('node:fs').existsSync(join(coordRootDir, 'bob', 'inbox', att))
+        require('node:fs').existsSync(join(stRootDir, 'bob', 'inbox', att))
       ).toBe(false);
     });
 
     it('sibling without a matching archive .md → preserved (not coord-owned)', () => {
-      setupIdentity(coordRootDir, 'bob');
+      setupIdentity(stRootDir, 'bob');
       const att = '1714826789010-aaaaaa.options.json';
-      writeFileSync(join(coordRootDir, 'bob', 'inbox', att), 'X');
-      writeFileSync(join(coordRootDir, 'bob', 'archive', att), 'X');
+      writeFileSync(join(stRootDir, 'bob', 'inbox', att), 'X');
+      writeFileSync(join(stRootDir, 'bob', 'archive', att), 'X');
       // No matching archive/.md; sweep must not touch this — it's
       // indistinguishable from a random file the user happened to put
       // in both folders.
-      expect(sweep(coordRootDir)).toEqual({ removed: 0 });
+      expect(sweep(stRootDir)).toEqual({ removed: 0 });
       expect(
-        require('node:fs').existsSync(join(coordRootDir, 'bob', 'inbox', att))
+        require('node:fs').existsSync(join(stRootDir, 'bob', 'inbox', att))
       ).toBe(true);
     });
 
     it('divergent sibling pair → preserved (no data loss)', () => {
-      setupIdentity(coordRootDir, 'bob');
+      setupIdentity(stRootDir, 'bob');
       const md = '1714826789010-aaaaaa.md';
       const att = '1714826789010-aaaaaa.options.json';
-      writeFileSync(join(coordRootDir, 'bob', 'inbox', md), 'M');
-      writeFileSync(join(coordRootDir, 'bob', 'archive', md), 'M');
-      writeFileSync(join(coordRootDir, 'bob', 'inbox', att), 'inbox');
-      writeFileSync(join(coordRootDir, 'bob', 'archive', att), 'archive');
+      writeFileSync(join(stRootDir, 'bob', 'inbox', md), 'M');
+      writeFileSync(join(stRootDir, 'bob', 'archive', md), 'M');
+      writeFileSync(join(stRootDir, 'bob', 'inbox', att), 'inbox');
+      writeFileSync(join(stRootDir, 'bob', 'archive', att), 'archive');
       // The .md still gets swept; the divergent sibling does NOT.
-      expect(sweep(coordRootDir)).toEqual({ removed: 1 });
+      expect(sweep(stRootDir)).toEqual({ removed: 1 });
       expect(
-        require('node:fs').existsSync(join(coordRootDir, 'bob', 'inbox', att))
+        require('node:fs').existsSync(join(stRootDir, 'bob', 'inbox', att))
       ).toBe(true);
     });
 
     it('random file (no LAYOUT prefix) is always ignored', () => {
-      setupIdentity(coordRootDir, 'bob');
-      writeFileSync(join(coordRootDir, 'bob', 'inbox', '.DS_Store'), 'x');
-      writeFileSync(join(coordRootDir, 'bob', 'archive', '.DS_Store'), 'x');
-      expect(sweep(coordRootDir)).toEqual({ removed: 0 });
+      setupIdentity(stRootDir, 'bob');
+      writeFileSync(join(stRootDir, 'bob', 'inbox', '.DS_Store'), 'x');
+      writeFileSync(join(stRootDir, 'bob', 'archive', '.DS_Store'), 'x');
+      expect(sweep(stRootDir)).toEqual({ removed: 0 });
       expect(
         require('node:fs').existsSync(
-          join(coordRootDir, 'bob', 'inbox', '.DS_Store')
+          join(stRootDir, 'bob', 'inbox', '.DS_Store')
         )
       ).toBe(true);
     });
 
     it('multiple siblings of one .md → all swept', () => {
-      setupIdentity(coordRootDir, 'bob');
+      setupIdentity(stRootDir, 'bob');
       const md = '1714826789010-aaaaaa.md';
       const att1 = '1714826789010-aaaaaa.options.json';
       const att2 = '1714826789010-aaaaaa.schema.json';
       for (const f of [md, att1, att2]) {
-        writeFileSync(join(coordRootDir, 'bob', 'inbox', f), f);
-        writeFileSync(join(coordRootDir, 'bob', 'archive', f), f);
+        writeFileSync(join(stRootDir, 'bob', 'inbox', f), f);
+        writeFileSync(join(stRootDir, 'bob', 'archive', f), f);
       }
-      expect(sweep(coordRootDir)).toEqual({ removed: 3 });
+      expect(sweep(stRootDir)).toEqual({ removed: 3 });
     });
   });
 });

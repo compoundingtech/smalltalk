@@ -26,26 +26,26 @@ import {
 } from '../../src/commands/context.ts';
 
 let scratch: string;
-let coordRoot: string;
+let stRoot: string;
 let stdoutBuf: string;
 let stderrBuf: string;
 let ctx: CliContext;
 
 beforeEach(() => {
   scratch = mkdtempSync(join(tmpdir(), 'coord-context-test-'));
-  coordRoot = join(scratch, 'coord');
-  mkdirSync(coordRoot, { recursive: true });
+  stRoot = join(scratch, 'coord');
+  mkdirSync(stRoot, { recursive: true });
   // Create alice's identity dirs so resolveIdentity is happy. The
   // context/ folder is intentionally absent — that's the point of the
   // absent-able tests.
-  mkdirSync(join(coordRoot, 'alice', 'inbox'), { recursive: true });
-  mkdirSync(join(coordRoot, 'alice', 'archive'), { recursive: true });
+  mkdirSync(join(stRoot, 'alice', 'inbox'), { recursive: true });
+  mkdirSync(join(stRoot, 'alice', 'archive'), { recursive: true });
   stdoutBuf = '';
   stderrBuf = '';
   ctx = {
-    env: { COORD_IDENTITY: 'alice' },
-    coordRoot,
-    coordConfig: '/unused',
+    env: { ST_AGENT: 'alice' },
+    stRoot,
+    stConfig: '/unused',
     stdout: (s) => {
       stdoutBuf += s;
     },
@@ -66,7 +66,7 @@ describe('cmdContextRead — absent-able', () => {
   it('missing context/ folder → text is empty, absent is true', () => {
     const r = cmdContextRead({
       env: ctx.env,
-      coordRoot,
+      stRoot,
     });
     expect(r.identity).toBe('alice');
     expect(r.file).toBe('now');
@@ -75,14 +75,14 @@ describe('cmdContextRead — absent-able', () => {
     // Sanity: the read must NOT have created the folder — the eval's
     // control arm relies on "no context/" staying that way through a
     // read.
-    expect(existsSync(join(coordRoot, 'alice', 'context'))).toBe(false);
+    expect(existsSync(join(stRoot, 'alice', 'context'))).toBe(false);
   });
 
   it('--decisions on a missing folder returns empty', () => {
     const r = cmdContextRead({
       file: 'decisions',
       env: ctx.env,
-      coordRoot,
+      stRoot,
     });
     expect(r.text).toBe('');
     expect(r.absent).toBe(true);
@@ -92,22 +92,22 @@ describe('cmdContextRead — absent-able', () => {
     const r = cmdContextRead({
       file: 'full',
       env: ctx.env,
-      coordRoot,
+      stRoot,
     });
     expect(r.text).toBe('');
     expect(r.absent).toBe(true);
   });
 
   it('--full with one surface present is not absent', () => {
-    mkdirSync(join(coordRoot, 'alice', 'context'));
+    mkdirSync(join(stRoot, 'alice', 'context'));
     writeFileSync(
-      join(coordRoot, 'alice', 'context', 'now.md'),
+      join(stRoot, 'alice', 'context', 'now.md'),
       'mid-task\n'
     );
     const r = cmdContextRead({
       file: 'full',
       env: ctx.env,
-      coordRoot,
+      stRoot,
     });
     expect(r.absent).toBe(false);
     expect(r.text).toContain('# now.md');
@@ -121,13 +121,13 @@ describe('cmdContextRead — absent-able', () => {
     // in both cases, and the caller must see `absent: true` either
     // way so a rehydrate step can distinguish "no prior context" from
     // "no decisions recorded yet on this task."
-    mkdirSync(join(coordRoot, 'alice', 'context', 'decisions'), {
+    mkdirSync(join(stRoot, 'alice', 'context', 'decisions'), {
       recursive: true,
     });
     const r = cmdContextRead({
       file: 'decisions',
       env: ctx.env,
-      coordRoot,
+      stRoot,
     });
     expect(r.text).toBe('');
     expect(r.absent).toBe(true);
@@ -141,9 +141,9 @@ describe('cmdContextWrite', () => {
     const r = cmdContextWrite({
       body: 'brief-024 v1 in-flight',
       env: ctx.env,
-      coordRoot,
+      stRoot,
     });
-    expect(r.path).toBe(join(coordRoot, 'alice', 'context', 'now.md'));
+    expect(r.path).toBe(join(stRoot, 'alice', 'context', 'now.md'));
     // Trailing newline enforced.
     const raw = readFileSync(r.path, 'utf8');
     expect(raw).toBe('brief-024 v1 in-flight\n');
@@ -154,7 +154,7 @@ describe('cmdContextWrite', () => {
     const r = cmdContextWrite({
       body: 'already ends in newline\n',
       env: ctx.env,
-      coordRoot,
+      stRoot,
     });
     expect(readFileSync(r.path, 'utf8')).toBe('already ends in newline\n');
   });
@@ -163,15 +163,15 @@ describe('cmdContextWrite', () => {
     cmdContextWrite({
       body: 'first',
       env: ctx.env,
-      coordRoot,
+      stRoot,
     });
     cmdContextWrite({
       body: 'second',
       env: ctx.env,
-      coordRoot,
+      stRoot,
     });
     expect(
-      readFileSync(join(coordRoot, 'alice', 'context', 'now.md'), 'utf8')
+      readFileSync(join(stRoot, 'alice', 'context', 'now.md'), 'utf8')
     ).toBe('second\n');
   });
 
@@ -179,10 +179,10 @@ describe('cmdContextWrite', () => {
     cmdContextWrite({
       body: 'now-only',
       env: ctx.env,
-      coordRoot,
+      stRoot,
     });
     expect(
-      existsSync(join(coordRoot, 'alice', 'context', 'decisions'))
+      existsSync(join(stRoot, 'alice', 'context', 'decisions'))
     ).toBe(false);
   });
 
@@ -190,10 +190,10 @@ describe('cmdContextWrite', () => {
     cmdContextWrite({
       body: 'x',
       env: ctx.env,
-      coordRoot,
+      stRoot,
     });
     const entries = require('node:fs').readdirSync(
-      join(coordRoot, 'alice', 'context')
+      join(stRoot, 'alice', 'context')
     ) as string[];
     // Only now.md; no `.context.tmp-*` sibling should remain.
     expect(entries.filter((n) => n.startsWith('.context.tmp'))).toEqual([]);
@@ -216,12 +216,12 @@ describe('cmdContextAppend', () => {
       why: 'preserves pre-brief-023 behavior',
       timestamp: ts,
       env: ctx.env,
-      coordRoot,
+      stRoot,
     });
     // Filename shape: <unix-ms>-<rand6>.md (LAYOUT-004 grammar).
     expect(r.filename).toMatch(/^\d+-[0-9a-z]{6}\.md$/);
     expect(r.path).toBe(
-      join(coordRoot, 'alice', 'context', 'decisions', r.filename)
+      join(stRoot, 'alice', 'context', 'decisions', r.filename)
     );
     // Filename's ms prefix must match the body's ISO timestamp so
     // filename-sort equals chronological-sort at ms granularity.
@@ -239,17 +239,17 @@ describe('cmdContextAppend', () => {
       why: 'a',
       timestamp: tsA,
       env: ctx.env,
-      coordRoot,
+      stRoot,
     });
     const rB = cmdContextAppend({
       decision: 'second',
       why: 'b',
       timestamp: tsB,
       env: ctx.env,
-      coordRoot,
+      stRoot,
     });
     expect(rA.filename).not.toBe(rB.filename);
-    const dir = join(coordRoot, 'alice', 'context', 'decisions');
+    const dir = join(stRoot, 'alice', 'context', 'decisions');
     const entries = require('node:fs').readdirSync(dir) as string[];
     expect(entries.length).toBe(2);
     // Filename-sort order == chronological order (tsA < tsB).
@@ -272,14 +272,14 @@ describe('cmdContextAppend', () => {
       why: 'why-a',
       timestamp: ts,
       env: ctx.env,
-      coordRoot,
+      stRoot,
     });
     const r2 = cmdContextAppend({
       decision: 'b',
       why: 'why-b',
       timestamp: ts,
       env: ctx.env,
-      coordRoot,
+      stRoot,
     });
     const [ms1] = r1.filename.split('-');
     const [ms2] = r2.filename.split('-');
@@ -300,7 +300,7 @@ describe('cmdContextAppend', () => {
       timestamp: ts,
       filename: '1234567890-aaaaaa.md',
       env: ctx.env,
-      coordRoot,
+      stRoot,
     });
     expect(r.filename).toBe('1234567890-aaaaaa.md');
     expect(existsSync(r.path)).toBe(true);
@@ -312,7 +312,7 @@ describe('cmdContextAppend', () => {
       why: 'also has a period.',
       timestamp: ts,
       env: ctx.env,
-      coordRoot,
+      stRoot,
     });
     expect(r.line).toBe(
       `- ${ts} has a period. why: also has a period.`
@@ -326,7 +326,7 @@ describe('cmdContextAppend', () => {
         why: 'reason',
         timestamp: ts,
         env: ctx.env,
-        coordRoot,
+        stRoot,
       })
     ).toThrow(/--decision is required/);
     expect(() =>
@@ -335,7 +335,7 @@ describe('cmdContextAppend', () => {
         why: '   ',
         timestamp: ts,
         env: ctx.env,
-        coordRoot,
+        stRoot,
       })
     ).toThrow(/--why is required/);
   });
@@ -347,7 +347,7 @@ describe('cmdContextAppend', () => {
         why: 'reason',
         timestamp: ts,
         env: ctx.env,
-        coordRoot,
+        stRoot,
       })
     ).toThrow(/single lines/);
   });
@@ -358,10 +358,10 @@ describe('cmdContextAppend', () => {
       why: 'reason',
       timestamp: ts,
       env: ctx.env,
-      coordRoot,
+      stRoot,
     });
     expect(
-      existsSync(join(coordRoot, 'alice', 'context', 'now.md'))
+      existsSync(join(stRoot, 'alice', 'context', 'now.md'))
     ).toBe(false);
   });
 
@@ -371,12 +371,12 @@ describe('cmdContextAppend', () => {
       why: 'reason',
       timestamp: ts,
       env: ctx.env,
-      coordRoot,
+      stRoot,
     });
     cmdContextWrite({
       body: 'now',
       env: ctx.env,
-      coordRoot,
+      stRoot,
     });
     expect(readFileSync(r.path, 'utf8')).toContain('thing. why: reason.');
   });
@@ -387,7 +387,7 @@ describe('cmdContextAppend', () => {
       why: 'y',
       timestamp: 'not-a-real-iso-string',
       env: ctx.env,
-      coordRoot,
+      stRoot,
     });
     // Filename still parses as LAYOUT-004; ms prefix is a real number.
     expect(r.filename).toMatch(/^\d+-[0-9a-z]{6}\.md$/);
@@ -405,11 +405,11 @@ describe('cmdContextRead — after write / append', () => {
     cmdContextWrite({
       body: '# now\nstate\n',
       env: ctx.env,
-      coordRoot,
+      stRoot,
     });
     const r = cmdContextRead({
       env: ctx.env,
-      coordRoot,
+      stRoot,
     });
     expect(r.text).toBe('# now\nstate\n');
     expect(r.absent).toBe(false);
@@ -421,12 +421,12 @@ describe('cmdContextRead — after write / append', () => {
       why: 'y',
       timestamp: '2026-07-02T00:00:00.000Z',
       env: ctx.env,
-      coordRoot,
+      stRoot,
     });
     const r = cmdContextRead({
       file: 'decisions',
       env: ctx.env,
-      coordRoot,
+      stRoot,
     });
     expect(r.text).toContain('x. why: y.');
     expect(r.absent).toBe(false);
@@ -436,19 +436,19 @@ describe('cmdContextRead — after write / append', () => {
     cmdContextWrite({
       body: 'now-state',
       env: ctx.env,
-      coordRoot,
+      stRoot,
     });
     cmdContextAppend({
       decision: 'x',
       why: 'y',
       timestamp: '2026-07-02T00:00:00.000Z',
       env: ctx.env,
-      coordRoot,
+      stRoot,
     });
     const r = cmdContextRead({
       file: 'full',
       env: ctx.env,
-      coordRoot,
+      stRoot,
     });
     expect(r.text).toContain('# now.md');
     expect(r.text).toContain('now-state');
@@ -466,19 +466,19 @@ describe('cmdContextRead — after write / append', () => {
       why: 'y',
       timestamp: '2026-07-02T02:00:00.000Z',
       env: ctx.env,
-      coordRoot,
+      stRoot,
     });
     cmdContextAppend({
       decision: 'earlier',
       why: 'y',
       timestamp: '2026-07-02T01:00:00.000Z',
       env: ctx.env,
-      coordRoot,
+      stRoot,
     });
     const r = cmdContextRead({
       file: 'decisions',
       env: ctx.env,
-      coordRoot,
+      stRoot,
     });
     const earlierIdx = r.text.indexOf('earlier');
     const laterIdx = r.text.indexOf('later');
@@ -495,20 +495,20 @@ describe('cmdContextRead — after write / append', () => {
       why: 'y',
       timestamp: '2026-07-02T00:00:00.000Z',
       env: ctx.env,
-      coordRoot,
+      stRoot,
     });
     writeFileSync(
-      join(coordRoot, 'alice', 'context', 'decisions', '.DS_Store'),
+      join(stRoot, 'alice', 'context', 'decisions', '.DS_Store'),
       'binary junk'
     );
     writeFileSync(
-      join(coordRoot, 'alice', 'context', 'decisions', 'notes.txt'),
+      join(stRoot, 'alice', 'context', 'decisions', 'notes.txt'),
       'stray text file'
     );
     const r = cmdContextRead({
       file: 'decisions',
       env: ctx.env,
-      coordRoot,
+      stRoot,
     });
     expect(r.text).toContain('real entry');
     expect(r.text).not.toContain('binary junk');
@@ -520,7 +520,7 @@ describe('cmdContextRead — after write / append', () => {
 
 describe('cmdContextCli', () => {
   it('read on empty prints nothing and exits 0 (absent-able)', async () => {
-    // Load-bearing for the SessionStart hook: `coord context read` on a
+    // Load-bearing for the SessionStart hook: `st context read` on a
     // fresh agent must be exit-0 + no output so hooks can `cat` it
     // unconditionally.
     const rc = await cmdContextCli(['read'], ctx);
@@ -580,11 +580,11 @@ describe('cmdContextCli', () => {
 
   it('read with positional identity reads that peer\'s context', async () => {
     // Set up a peer with a context/now.md.
-    mkdirSync(join(coordRoot, 'bob', 'inbox'), { recursive: true });
-    mkdirSync(join(coordRoot, 'bob', 'archive'), { recursive: true });
-    mkdirSync(join(coordRoot, 'bob', 'context'), { recursive: true });
+    mkdirSync(join(stRoot, 'bob', 'inbox'), { recursive: true });
+    mkdirSync(join(stRoot, 'bob', 'archive'), { recursive: true });
+    mkdirSync(join(stRoot, 'bob', 'context'), { recursive: true });
     writeFileSync(
-      join(coordRoot, 'bob', 'context', 'now.md'),
+      join(stRoot, 'bob', 'context', 'now.md'),
       "bob's state\n"
     );
     const rc = await cmdContextCli(['read', 'bob'], ctx);

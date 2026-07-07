@@ -46,7 +46,7 @@ describe('IdentityRequiredError', () => {
   it('has stable code + canonical message', () => {
     const err = new IdentityRequiredError();
     expect(err.code).toBe('IDENTITY_REQUIRED');
-    expect(err.message).toMatch(/COORD_IDENTITY/);
+    expect(err.message).toMatch(/ST_AGENT/);
     expect(err).toBeInstanceOf(CoordError);
   });
 });

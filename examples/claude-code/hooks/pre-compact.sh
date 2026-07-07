@@ -1,5 +1,5 @@
 #!/bin/bash
-# coord PreCompact hook — brief-024 hook-legs.
+# st PreCompact hook — brief-024 hook-legs.
 #
 # Fires just before Claude Code compacts the current context. Compaction
 # wipes the model's in-context state; without a flush, everything the
@@ -11,18 +11,18 @@
 # load-bearing operation — a hung or crashing hook that blocks it
 # would wedge the entire session. All failure modes fall through to
 # `exit 0`, and all error output is redirected to a file under
-# `<coord-root>/<identity>/context/.flush-errors.log`; NEVER stderr,
+# `<st-root>/<identity>/context/.flush-errors.log`; NEVER stderr,
 # because Claude Code surfaces our stderr as a system-reminder in the
 # very next turn — which would flood every post-compaction context
 # with hook chatter.
 #
 # What it actually does:
-#   1. Refuses cleanly if $COORD_IDENTITY / $ST_IDENTITY / $ST_AGENT
+#   1. Refuses cleanly if $ST_AGENT / $ST_IDENTITY / $ST_AGENT
 #      is unset (nothing meaningful to flush).
 #   2. If `now.md` exists AND was written in the last 5 minutes, we
 #      trust that the model already flushed. No action.
 #   3. Otherwise, writes a "compaction-fired stub" to `now.md` via
-#      `coord context write` (atomic tmp+rename). Boot-rehydrate will
+#      `st context write` (atomic tmp+rename). Boot-rehydrate will
 #      inject the stub as a `<context>` block; the model sees "the
 #      last thing that happened was compaction, no fresh state was
 #      captured, reconstruct from git+inbox."
@@ -31,20 +31,20 @@
 # should be flushing at each meaningful state change, but if it's
 # been quietly working for a few minutes without flushing, we don't
 # want to clobber that quiet-but-current work with a stub. Threshold
-# is tunable via $COORD_PRECOMPACT_FRESH_S (seconds; default 300).
+# is tunable via $ST_PRECOMPACT_FRESH_S (seconds; default 300).
 #
-# Hard cap on the `coord context write` call via `timeout` (falls
+# Hard cap on the `st context write` call via `timeout` (falls
 # back to `gtimeout` on darwin systems with coreutils installed;
 # falls through unbounded when neither is present — no exit-status
 # change; the hook's other work should complete in single-digit ms
 # anyway, so the cap is defense-in-depth, not a load-bearing
 # invariant).
 #
-# Tunable via $COORD_PRECOMPACT_TIMEOUT_S (seconds; default 5).
+# Tunable via $ST_PRECOMPACT_TIMEOUT_S (seconds; default 5).
 # Prior default was 0.5s, which flaked reliably under vitest's
 # singleFork integration pool on darwin: cumulative process
 # pressure (30+ spawned bashes per file, plus the ~4 fork+exec
-# chain bash→pipe→timeout→PATH lookup→coord shim→bash) pushed the
+# chain bash→pipe→timeout→PATH lookup→→bash) pushed the
 # first flush test past the 500ms budget with exit 124 before
 # the shim even wrote to its log. 5s is still an upper bound on a
 # wedged CLI (well under any Claude Code hook-lifecycle limit) and
@@ -59,16 +59,16 @@ set -uo pipefail
 # to the shim in the same package that generated this hook wiring).
 # Falls back to PATH lookup for users who wired settings.local.json by
 # hand or ran launch under a version that predates the injection. `st`
-# wins over `coord` — we're st-first now, coord is the back-compat
+# is the canonical binary. Wired via $ST_BIN or `command -v st`.
 # shim. Emptying $ST_BIN (unset or "") always falls through.
 st_bin="${ST_BIN:-}"
 if [[ -z "$st_bin" ]]; then
-  st_bin="$(command -v st 2>/dev/null || command -v coord 2>/dev/null || true)"
+  st_bin="$(command -v st 2>/dev/null || true)"
 fi
 
 # ─── Identity + root resolution ──────────────────────────────────────────
 
-identity="${COORD_IDENTITY:-${ST_IDENTITY:-${ST_AGENT:-}}}"
+identity="${ST_AGENT:-${ST_IDENTITY:-${ST_AGENT:-}}}"
 if [[ -z "$identity" ]]; then
   # No identity → nothing to flush. Exit clean; do NOT write to stderr
   # (would inject a reminder into the compacted context).
@@ -78,17 +78,17 @@ fi
 # `${HOME-}` (not `${HOME:-}`) so an unset HOME degrades to empty
 # rather than tripping `set -u`. See the analogous comment in
 # session-start.sh.
-coord_root="${COORD_ROOT:-${ST_ROOT:-${HOME-}/.local/state/coord}}"
-context_dir="$coord_root/$identity/context"
+st_root="${ST_ROOT:-${ST_ROOT:-${HOME-}/.local/state/smalltalk}}"
+context_dir="$st_root/$identity/context"
 now_md="$context_dir/now.md"
 err_log="$context_dir/.flush-errors.log"
 
 # Ensure the context dir exists so we have somewhere to put the error
-# log even before `coord context write` lazy-creates it on first flush.
+# log even before `st context write` lazy-creates it on first flush.
 mkdir -p "$context_dir" 2>/dev/null || true
 
-fresh_s="${COORD_PRECOMPACT_FRESH_S:-300}"
-timeout_s="${COORD_PRECOMPACT_TIMEOUT_S:-5}"
+fresh_s="${ST_PRECOMPACT_FRESH_S:-300}"
+timeout_s="${ST_PRECOMPACT_TIMEOUT_S:-5}"
 
 # ─── Freshness check ─────────────────────────────────────────────────────
 
@@ -113,7 +113,7 @@ fi
 # ─── Stub write ──────────────────────────────────────────────────────────
 
 # Build the stub body once into a variable so we can pipe it into
-# `coord context write` under the timeout wrapper without dealing with
+# `st context write` under the timeout wrapper without dealing with
 # the sub-shell / variable-scope headaches of `bash -c "$(declare -f)"`.
 ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 stub_body=$(cat <<EOF
@@ -125,7 +125,7 @@ git status, recent commits, and open inbox items.
 
 If you see this after a restart: your last known-good working-state
 was NOT captured before compaction. That's a discipline miss (the
-base-persona rule is to flush \`coord context write\` at each
+base-persona rule is to flush \`st context write\` at each
 meaningful state change), not a hook bug. Reconstruct and flush
 proactively going forward.
 EOF
@@ -136,18 +136,18 @@ EOF
 # failure of the write itself sinks to $err_log via the `2>>` on the
 # pipeline. `|| true` on every branch guarantees we never inherit a
 # non-zero status from the write.
-# We do NOT pass `$identity` as a positional to `coord context write`.
+# We do NOT pass `$identity` as a positional to `st context write`.
 # Passing it positionally would trigger the anti-impersonation strict
 # check in resolveAgent (explicit id → folder must pre-exist,
 # AgentNotHostedError otherwise). Instead we rely on the env-var
-# fallback path (ST_AGENT / ST_IDENTITY / COORD_IDENTITY) — same
+# fallback path (ST_AGENT / ST_IDENTITY / ST_AGENT) — same
 # resolution chain we used above to derive $identity, so the
 # resolved id is guaranteed identical — which takes the implicit
 # lazy-create branch and mkdirs `inbox/`+`archive/` on first flush.
 # If $st_bin didn't resolve to anything, we can't flush. Log the miss
 # and exit clean; compaction must not block on a missing CLI.
 if [[ -z "$st_bin" ]]; then
-  printf '%s pre-compact: no st/coord binary found (checked $ST_BIN + PATH); skipping flush\n' \
+  printf '%s pre-compact: no st binary found (checked $ST_BIN + PATH); skipping flush\n' \
     "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$err_log" 2>/dev/null || true
 elif command -v timeout >/dev/null 2>&1; then
   printf '%s\n' "$stub_body" | \

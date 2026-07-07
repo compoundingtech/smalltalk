@@ -26,27 +26,27 @@ import type {
 import type { Overview } from '../../src/commands/overview.ts';
 
 let scratch: string;
-let coordRoot: string;
+let stRoot: string;
 let coord: Coord;
 
 function setupIdentity(id: string): void {
-  mkdirSync(join(coordRoot, id, 'inbox'), { recursive: true });
-  mkdirSync(join(coordRoot, id, 'archive'), { recursive: true });
+  mkdirSync(join(stRoot, id, 'inbox'), { recursive: true });
+  mkdirSync(join(stRoot, id, 'archive'), { recursive: true });
 }
 
 function setStatus(id: string, value: string): void {
-  writeFileSync(join(coordRoot, id, 'status'), `${value}\n`);
+  writeFileSync(join(stRoot, id, 'status'), `${value}\n`);
 }
 
 beforeEach(() => {
   scratch = mkdtempSync(join(tmpdir(), 'coord-lib-api-'));
-  coordRoot = join(scratch, 'coord');
-  mkdirSync(coordRoot, { recursive: true });
+  stRoot = join(scratch, 'coord');
+  mkdirSync(stRoot, { recursive: true });
   setupIdentity('alice');
   setupIdentity('bob');
   setupIdentity('carol');
   coord = createCoord({
-    root: coordRoot,
+    root: stRoot,
     identity: asIdentity('alice'),
     configRoot: join(scratch, 'config'),
   });
@@ -94,8 +94,8 @@ describe('coord.members', () => {
   });
 
   it('returns [] when no identities have hosting folders', () => {
-    rmSync(coordRoot, { recursive: true, force: true });
-    mkdirSync(coordRoot, { recursive: true });
+    rmSync(stRoot, { recursive: true, force: true });
+    mkdirSync(stRoot, { recursive: true });
     expect(coord.members()).toEqual([]);
   });
 });
@@ -126,7 +126,7 @@ describe('coord.overview', () => {
       const suffix = ['aaaaaa', 'bbbbbb', 'cccccc', 'dddddd', 'eeeeee', 'ffffff', 'gggggg'][i]!;
       const actual = `${1714826789000 + i * 10}-${suffix}.md`;
       writeFileSync(
-        join(coordRoot, 'alice', 'inbox', actual),
+        join(stRoot, 'alice', 'inbox', actual),
         `---\nfrom: bob\n---\nm${i}\n`
       );
       // suppress unused-var warning from the unused `filename` above
@@ -151,8 +151,8 @@ describe('coord.createIdentity', () => {
   it('new name → { created: true } and both folders exist', async () => {
     const r = await coord.createIdentity('dave');
     expect(r).toEqual({ created: true });
-    expect(existsSync(join(coordRoot, 'dave', 'inbox'))).toBe(true);
-    expect(existsSync(join(coordRoot, 'dave', 'archive'))).toBe(true);
+    expect(existsSync(join(stRoot, 'dave', 'inbox'))).toBe(true);
+    expect(existsSync(join(stRoot, 'dave', 'archive'))).toBe(true);
   });
 
   it('existing name → { created: false } (idempotent)', async () => {
@@ -164,10 +164,10 @@ describe('coord.createIdentity', () => {
   it('partial state (only inbox exists) → completes the layout, returns { created: true }', async () => {
     // A sender may have lazily mkdir'd `eve/inbox/` via st_msg_send;
     // archive is missing. createIdentity should backfill.
-    mkdirSync(join(coordRoot, 'eve', 'inbox'), { recursive: true });
+    mkdirSync(join(stRoot, 'eve', 'inbox'), { recursive: true });
     const r = await coord.createIdentity('eve');
     expect(r).toEqual({ created: true });
-    expect(existsSync(join(coordRoot, 'eve', 'archive'))).toBe(true);
+    expect(existsSync(join(stRoot, 'eve', 'archive'))).toBe(true);
   });
 
   it('rejects an invalid identity grammar', async () => {
@@ -193,7 +193,7 @@ describe('coord.createIdentity', () => {
 
   it('does NOT set status', async () => {
     await coord.createIdentity('frank');
-    expect(existsSync(join(coordRoot, 'frank', 'status'))).toBe(false);
+    expect(existsSync(join(stRoot, 'frank', 'status'))).toBe(false);
   });
 });
 
@@ -288,21 +288,21 @@ describe('coord.archive opts.withAttachments', () => {
     const fn = `${ts}-test01.md`;
     const sidecar = `${ts}-test01.options.json`;
     writeFileSync(
-      join(coordRoot, 'alice', 'inbox', fn),
+      join(stRoot, 'alice', 'inbox', fn),
       '---\nfrom: bob\n---\nhi\n'
     );
     writeFileSync(
-      join(coordRoot, 'alice', 'inbox', sidecar),
+      join(stRoot, 'alice', 'inbox', sidecar),
       '{"k":1}'
     );
     await coord.archive(
       asIdentity('alice'),
       fn as unknown as ReturnType<typeof asFilename>
     );
-    expect(existsSync(join(coordRoot, 'alice', 'archive', fn))).toBe(true);
+    expect(existsSync(join(stRoot, 'alice', 'archive', fn))).toBe(true);
     // Sibling unmoved.
-    expect(existsSync(join(coordRoot, 'alice', 'inbox', sidecar))).toBe(true);
-    expect(existsSync(join(coordRoot, 'alice', 'archive', sidecar))).toBe(false);
+    expect(existsSync(join(stRoot, 'alice', 'inbox', sidecar))).toBe(true);
+    expect(existsSync(join(stRoot, 'alice', 'archive', sidecar))).toBe(false);
   });
 
   it('with opts.withAttachments=true, siblings move alongside', async () => {
@@ -310,11 +310,11 @@ describe('coord.archive opts.withAttachments', () => {
     const fn = `${ts}-test02.md`;
     const sidecar = `${ts}-test02.options.json`;
     writeFileSync(
-      join(coordRoot, 'alice', 'inbox', fn),
+      join(stRoot, 'alice', 'inbox', fn),
       '---\nfrom: bob\n---\nhi\n'
     );
     writeFileSync(
-      join(coordRoot, 'alice', 'inbox', sidecar),
+      join(stRoot, 'alice', 'inbox', sidecar),
       '{"k":1}'
     );
     await coord.archive(
@@ -322,9 +322,9 @@ describe('coord.archive opts.withAttachments', () => {
       fn as unknown as ReturnType<typeof asFilename>,
       { withAttachments: true }
     );
-    expect(existsSync(join(coordRoot, 'alice', 'archive', fn))).toBe(true);
-    expect(existsSync(join(coordRoot, 'alice', 'archive', sidecar))).toBe(true);
-    expect(existsSync(join(coordRoot, 'alice', 'inbox', sidecar))).toBe(false);
+    expect(existsSync(join(stRoot, 'alice', 'archive', fn))).toBe(true);
+    expect(existsSync(join(stRoot, 'alice', 'archive', sidecar))).toBe(true);
+    expect(existsSync(join(stRoot, 'alice', 'inbox', sidecar))).toBe(false);
   });
 });
 
@@ -336,11 +336,11 @@ describe('coord.archiveTrim opts.withAttachments', () => {
     const fn = `${ts}-old001.md`;
     const sidecar = `${ts}-old001.options.json`;
     writeFileSync(
-      join(coordRoot, 'alice', 'archive', fn),
+      join(stRoot, 'alice', 'archive', fn),
       '---\nfrom: bob\n---\nhi\n'
     );
     writeFileSync(
-      join(coordRoot, 'alice', 'archive', sidecar),
+      join(stRoot, 'alice', 'archive', sidecar),
       '{"k":1}'
     );
     const victims = await coord.archiveTrim(asIdentity('alice'), {
@@ -348,8 +348,8 @@ describe('coord.archiveTrim opts.withAttachments', () => {
       now: () => Date.now(),
     });
     expect(victims).toContain(fn);
-    expect(existsSync(join(coordRoot, 'alice', 'archive', fn))).toBe(false);
-    expect(existsSync(join(coordRoot, 'alice', 'archive', sidecar))).toBe(true);
+    expect(existsSync(join(stRoot, 'alice', 'archive', fn))).toBe(false);
+    expect(existsSync(join(stRoot, 'alice', 'archive', sidecar))).toBe(true);
   });
 
   it('withAttachments=true also deletes prefix-siblings', async () => {
@@ -357,11 +357,11 @@ describe('coord.archiveTrim opts.withAttachments', () => {
     const fn = `${ts}-old002.md`;
     const sidecar = `${ts}-old002.options.json`;
     writeFileSync(
-      join(coordRoot, 'alice', 'archive', fn),
+      join(stRoot, 'alice', 'archive', fn),
       '---\nfrom: bob\n---\nhi\n'
     );
     writeFileSync(
-      join(coordRoot, 'alice', 'archive', sidecar),
+      join(stRoot, 'alice', 'archive', sidecar),
       '{"k":1}'
     );
     await coord.archiveTrim(asIdentity('alice'), {
@@ -369,8 +369,8 @@ describe('coord.archiveTrim opts.withAttachments', () => {
       withAttachments: true,
       now: () => Date.now(),
     });
-    expect(existsSync(join(coordRoot, 'alice', 'archive', fn))).toBe(false);
-    expect(existsSync(join(coordRoot, 'alice', 'archive', sidecar))).toBe(false);
+    expect(existsSync(join(stRoot, 'alice', 'archive', fn))).toBe(false);
+    expect(existsSync(join(stRoot, 'alice', 'archive', sidecar))).toBe(false);
   });
 });
 
@@ -385,7 +385,7 @@ describe('coord.lsOrphans', () => {
   it('surfaces sibling files whose .md is missing in the same folder', async () => {
     const ts = 1782717820000;
     const orphan = `${ts}-orph01.options.json`;
-    writeFileSync(join(coordRoot, 'alice', 'inbox', orphan), '{"k":1}');
+    writeFileSync(join(stRoot, 'alice', 'inbox', orphan), '{"k":1}');
     const r = await coord.lsOrphans();
     expect(r.map((it) => it.filename)).toContain(orphan);
     const item = r.find((it) => it.filename === orphan)!;
@@ -397,11 +397,11 @@ describe('coord.lsOrphans', () => {
     const fn = `${ts}-paired.md`;
     const sidecar = `${ts}-paired.options.json`;
     writeFileSync(
-      join(coordRoot, 'alice', 'inbox', fn),
+      join(stRoot, 'alice', 'inbox', fn),
       '---\nfrom: bob\n---\nhi\n'
     );
     writeFileSync(
-      join(coordRoot, 'alice', 'inbox', sidecar),
+      join(stRoot, 'alice', 'inbox', sidecar),
       '{"k":1}'
     );
     const r = await coord.lsOrphans();
@@ -411,7 +411,7 @@ describe('coord.lsOrphans', () => {
   it('opts.archive=true scans the archive folder', async () => {
     const ts = 1782717840000;
     const orphan = `${ts}-orph02.options.json`;
-    writeFileSync(join(coordRoot, 'alice', 'archive', orphan), '{"k":1}');
+    writeFileSync(join(stRoot, 'alice', 'archive', orphan), '{"k":1}');
     const r = await coord.lsOrphans(undefined, { archive: true });
     expect(r.map((it) => it.filename)).toContain(orphan);
   });
@@ -419,7 +419,7 @@ describe('coord.lsOrphans', () => {
   it('explicit identity scans a peer\'s folder', async () => {
     const ts = 1782717850000;
     const orphan = `${ts}-orph03.options.json`;
-    writeFileSync(join(coordRoot, 'bob', 'inbox', orphan), '{"k":1}');
+    writeFileSync(join(stRoot, 'bob', 'inbox', orphan), '{"k":1}');
     const r = await coord.lsOrphans(asIdentity('bob'));
     expect(r.map((it) => it.filename)).toContain(orphan);
   });

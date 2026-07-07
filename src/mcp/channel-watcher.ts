@@ -2,7 +2,7 @@
 // `notifications/claude/channel` for every new inbox arrival.
 //
 // Lazy-imported by `createMcpServer` only when channel mode is on, so
-// non-channel `coord mcp` invocations never load chokidar.
+// non-channel `st mcp` invocations never load chokidar.
 
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 
@@ -60,7 +60,7 @@ export interface StartChannelWatcherOpts {
   /**
    * brief-020: when true, write one-line stderr entries for each
    * chokidar `add`, each poll-backstop discovery, and each notification
-   * send. Wired through from `COORD_CHANNEL_DEBUG=1` in the MCP
+   * send. Wired through from `ST_CHANNEL_DEBUG=1` in the MCP
    * command wrapper. Kept opt-in so a healthy running agent's stderr
    * stays quiet.
    */

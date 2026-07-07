@@ -20,23 +20,23 @@ import {
 } from '../../src/errors.ts';
 
 let scratch: string;
-let coordRoot: string;
+let stRoot: string;
 let alice: Identity;
 let bob: Identity;
 let coord: Coord;
 
 beforeEach(() => {
   scratch = mkdtempSync(join(tmpdir(), 'coord-lib-test-'));
-  coordRoot = join(scratch, 'coord');
-  mkdirSync(coordRoot, { recursive: true });
-  mkdirSync(join(coordRoot, 'alice', 'inbox'), { recursive: true });
-  mkdirSync(join(coordRoot, 'alice', 'archive'), { recursive: true });
-  mkdirSync(join(coordRoot, 'bob', 'inbox'), { recursive: true });
-  mkdirSync(join(coordRoot, 'bob', 'archive'), { recursive: true });
+  stRoot = join(scratch, 'coord');
+  mkdirSync(stRoot, { recursive: true });
+  mkdirSync(join(stRoot, 'alice', 'inbox'), { recursive: true });
+  mkdirSync(join(stRoot, 'alice', 'archive'), { recursive: true });
+  mkdirSync(join(stRoot, 'bob', 'inbox'), { recursive: true });
+  mkdirSync(join(stRoot, 'bob', 'archive'), { recursive: true });
   alice = asIdentity('alice');
   bob = asIdentity('bob');
   coord = createCoord({
-    root: coordRoot,
+    root: stRoot,
     identity: alice,
     configRoot: join(scratch, 'config'),
   });
@@ -51,20 +51,20 @@ afterEach(() => {
 
 describe('createCoord — construction', () => {
   it('exposes root, identity, configRoot', () => {
-    expect(coord.root).toBe(coordRoot);
+    expect(coord.root).toBe(stRoot);
     expect(coord.identity).toBe('alice');
     expect(coord.configRoot).toBe(join(scratch, 'config'));
   });
 
   it('defaults configRoot to ~/.config/coord', () => {
-    const c = createCoord({ root: coordRoot, identity: alice });
+    const c = createCoord({ root: stRoot, identity: alice });
     expect(c.configRoot.endsWith('.config/coord')).toBe(true);
   });
 
   it('throws if identity is invalid (asIdentity catches at construction)', () => {
     expect(() =>
       createCoord({
-        root: coordRoot,
+        root: stRoot,
         identity: 'INVALID' as unknown as Identity,
       })
     ).toThrowError(/invalid (agent name|identity)/);
@@ -77,13 +77,13 @@ describe('coord.send', () => {
   it('writes a file and returns its branded Filename', async () => {
     const filename = await coord.send(bob, 'hello bob');
     expect(filename).toMatch(/^[0-9]{13}-[0-9a-z]{6}\.md$/);
-    expect(existsSync(join(coordRoot, 'bob', 'inbox', filename))).toBe(true);
+    expect(existsSync(join(stRoot, 'bob', 'inbox', filename))).toBe(true);
   });
 
   it('uses the Coord identity as `from` by default', async () => {
     const filename = await coord.send(bob, 'body');
     const text = require('node:fs').readFileSync(
-      join(coordRoot, 'bob', 'inbox', filename),
+      join(stRoot, 'bob', 'inbox', filename),
       'utf8'
     );
     expect(text).toContain('from: alice');
@@ -94,7 +94,7 @@ describe('coord.send', () => {
       from: asIdentity('bob'), // bob sending to himself for the test
     });
     const text = require('node:fs').readFileSync(
-      join(coordRoot, 'bob', 'inbox', filename),
+      join(stRoot, 'bob', 'inbox', filename),
       'utf8'
     );
     expect(text).toContain('from: bob');
@@ -111,7 +111,7 @@ describe('coord.send', () => {
       priority: 'high',
     });
     const text = require('node:fs').readFileSync(
-      join(coordRoot, 'bob', 'inbox', filename),
+      join(stRoot, 'bob', 'inbox', filename),
       'utf8'
     );
     expect(text).toContain('subject: "re: hello"');
@@ -191,8 +191,8 @@ describe('coord.archive', () => {
   it('moves inbox → archive', async () => {
     const f = await coord.send(bob, 'msg');
     await coord.archive(bob, f);
-    expect(existsSync(join(coordRoot, 'bob', 'inbox', f))).toBe(false);
-    expect(existsSync(join(coordRoot, 'bob', 'archive', f))).toBe(true);
+    expect(existsSync(join(stRoot, 'bob', 'inbox', f))).toBe(false);
+    expect(existsSync(join(stRoot, 'bob', 'archive', f))).toBe(true);
   });
 });
 
@@ -200,7 +200,7 @@ describe('coord.archiveTrim', () => {
   it('removes files older than the cutoff and returns the victims', async () => {
     // Plant 5 archived files at known timestamps.
     const fakeNow = 1_800_000_000_000;
-    const archDir = join(coordRoot, 'alice', 'archive');
+    const archDir = join(stRoot, 'alice', 'archive');
     for (let i = 0; i < 5; i++) {
       const ts = fakeNow - (i + 1) * 24 * 60 * 60 * 1000;
       writeFileSync(join(archDir, `${ts}-aaaaaa.md`), 'x');
@@ -213,7 +213,7 @@ describe('coord.archiveTrim', () => {
   });
 
   it('--dry-run returns victims without deleting', async () => {
-    const archDir = join(coordRoot, 'alice', 'archive');
+    const archDir = join(stRoot, 'alice', 'archive');
     for (const ts of ['1714826789010', '1714826789020', '1714826789030']) {
       writeFileSync(join(archDir, `${ts}-aaaaaa.md`), 'x');
     }
@@ -270,8 +270,8 @@ describe('coord.getStatus / setStatus', () => {
 describe('coord.sweep', () => {
   it('removes byte-identical inbox+archive twins', async () => {
     const f = '1714826789010-aaaaaa.md';
-    writeFileSync(join(coordRoot, 'bob', 'inbox', f), 'same');
-    writeFileSync(join(coordRoot, 'bob', 'archive', f), 'same');
+    writeFileSync(join(stRoot, 'bob', 'inbox', f), 'same');
+    writeFileSync(join(stRoot, 'bob', 'archive', f), 'same');
     const r = await coord.sweep();
     expect(r.removed).toBe(1);
   });
@@ -348,7 +348,7 @@ describe('coord.watch', () => {
 
   it('default watch (no id, no --all) watches the Coord identity\'s own inbox', async () => {
     // brief-017a bug 3: default is now "watch own inbox" — same as
-    // CLI `coord watch` with no args.
+    // CLI `st watch` with no args.
     await coord.send(alice, 'self-msg', { from: bob });
     await coord.send(bob, 'peer-msg', { from: alice });
     const ac = new AbortController();

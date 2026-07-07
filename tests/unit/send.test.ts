@@ -16,20 +16,20 @@ import { parseFrontmatter, validFilename } from '../../src/common.ts';
 import { cmdSend, cmdSendCli, type SendInput } from '../../src/commands/send.ts';
 
 let scratch: string;
-let coordRoot: string;
+let stRoot: string;
 
 beforeEach(() => {
   scratch = mkdtempSync(join(tmpdir(), 'coord-send-test-'));
-  coordRoot = join(scratch, 'coord');
-  mkdirSync(coordRoot, { recursive: true });
+  stRoot = join(scratch, 'coord');
+  mkdirSync(stRoot, { recursive: true });
 });
 afterEach(() => {
   rmSync(scratch, { recursive: true, force: true });
 });
 
 function setupIdentity(id: string): void {
-  mkdirSync(join(coordRoot, id, 'inbox'), { recursive: true });
-  mkdirSync(join(coordRoot, id, 'archive'), { recursive: true });
+  mkdirSync(join(stRoot, id, 'inbox'), { recursive: true });
+  mkdirSync(join(stRoot, id, 'archive'), { recursive: true });
 }
 
 function baseInput(overrides: Partial<SendInput> = {}): SendInput {
@@ -38,7 +38,7 @@ function baseInput(overrides: Partial<SendInput> = {}): SendInput {
     from: 'alice',
     body: 'hello bob',
     env: {} as NodeJS.ProcessEnv,
-    coordRoot,
+    stRoot,
     ...overrides,
   };
 }
@@ -48,7 +48,7 @@ describe('cmdSend — happy path', () => {
     setupIdentity('alice');
     const r = cmdSend(baseInput({ subject: 'hi' }));
     expect(validFilename(r.filename)).toBe(true);
-    expect(r.path).toBe(join(coordRoot, 'bob', 'inbox', r.filename));
+    expect(r.path).toBe(join(stRoot, 'bob', 'inbox', r.filename));
     expect(existsSync(r.path)).toBe(true);
     const text = readFileSync(r.path, 'utf8');
     const parsed = parseFrontmatter(text);
@@ -59,7 +59,7 @@ describe('cmdSend — happy path', () => {
 
   it('creates <to>/inbox/ on the fly when the recipient is not yet hosted', () => {
     setupIdentity('alice');
-    expect(existsSync(join(coordRoot, 'newcomer'))).toBe(false);
+    expect(existsSync(join(stRoot, 'newcomer'))).toBe(false);
     const r = cmdSend(baseInput({ to: 'newcomer' }));
     expect(existsSync(r.path)).toBe(true);
   });
@@ -67,7 +67,7 @@ describe('cmdSend — happy path', () => {
   it('does NOT mutate sender state (no spurious files in <from>/inbox/)', () => {
     setupIdentity('alice');
     cmdSend(baseInput());
-    const ls = require('node:fs').readdirSync(join(coordRoot, 'alice', 'inbox'));
+    const ls = require('node:fs').readdirSync(join(stRoot, 'alice', 'inbox'));
     expect(ls).toEqual([]);
   });
 
@@ -123,7 +123,7 @@ describe('cmdSend — --from resolution', () => {
     const r = cmdSend(
       baseInput({
         from: 'charlie',
-        env: { COORD_IDENTITY: 'alice' } as NodeJS.ProcessEnv,
+        env: { ST_AGENT: 'alice' } as NodeJS.ProcessEnv,
       })
     );
     expect(parseFrontmatter(readFileSync(r.path, 'utf8')).fm.from).toBe(
@@ -131,21 +131,21 @@ describe('cmdSend — --from resolution', () => {
     );
   });
 
-  it('falls back to COORD_IDENTITY when --from omitted', () => {
+  it('falls back to ST_AGENT when --from omitted', () => {
     setupIdentity('alice');
     const r = cmdSend(
       baseInput({
         from: undefined,
-        env: { COORD_IDENTITY: 'alice' } as NodeJS.ProcessEnv,
+        env: { ST_AGENT: 'alice' } as NodeJS.ProcessEnv,
       })
     );
     expect(parseFrontmatter(readFileSync(r.path, 'utf8')).fm.from).toBe('alice');
   });
 
-  it('errors mentioning COORD_IDENTITY when neither --from nor env is set', () => {
+  it('errors mentioning ST_AGENT when neither --from nor env is set', () => {
     expect(() =>
       cmdSend(baseInput({ from: undefined, env: {} as NodeJS.ProcessEnv }))
-    ).toThrowError(/COORD_IDENTITY/);
+    ).toThrowError(/ST_AGENT/);
   });
 
   it('errors with mkdir hint when --from points at a non-hosted identity', () => {
@@ -269,7 +269,7 @@ describe('cmdSend — --in-reply-to', () => {
   it('rejects legacy 3-segment filename', () => {
     setupIdentity('alice');
     expect(() =>
-      cmdSend(baseInput({ inReplyTo: '1714826789012-myobie-abcdef.md' }))
+      cmdSend(baseInput({ inReplyTo: '1714826789012-operator-abcdef.md' }))
     ).toThrowError(/invalid filename/);
   });
 });
@@ -339,7 +339,7 @@ describe('cmdSend — uniqueness under rapid fire', () => {
       expect(seen.has(r.filename)).toBe(false);
       seen.add(r.filename);
     }
-    const ls = require('node:fs').readdirSync(join(coordRoot, 'bob', 'inbox'));
+    const ls = require('node:fs').readdirSync(join(stRoot, 'bob', 'inbox'));
     expect(ls).toHaveLength(30);
   });
 });
@@ -353,9 +353,9 @@ describe('cmdSendCli — -m flag (brief-033)', () => {
   } = {}): CliContext & { stdoutBuf: string[] } {
     const stdoutBuf: string[] = [];
     const ctx = {
-      env: { COORD_IDENTITY: 'alice' } as NodeJS.ProcessEnv,
-      coordRoot,
-      coordConfig: join(scratch, 'config'),
+      env: { ST_AGENT: 'alice' } as NodeJS.ProcessEnv,
+      stRoot,
+      stConfig: join(scratch, 'config'),
       stdout: (s: string) => stdoutBuf.push(s),
       stderr: () => {},
       readStdin: async () => Buffer.from(opts.stdin ?? '', 'utf8'),
@@ -373,7 +373,7 @@ describe('cmdSendCli — -m flag (brief-033)', () => {
     const filename = ctx.stdoutBuf.join('').trim();
     expect(validFilename(filename)).toBe(true);
     const content = readFileSync(
-      join(coordRoot, 'bob', 'inbox', filename),
+      join(stRoot, 'bob', 'inbox', filename),
       'utf8'
     );
     expect(parseFrontmatter(content).body).toBe('hi inline\n');
@@ -390,7 +390,7 @@ describe('cmdSendCli — -m flag (brief-033)', () => {
     expect(rc).toBe(0);
     const filename = ctx.stdoutBuf.join('').trim();
     const content = readFileSync(
-      join(coordRoot, 'bob', 'inbox', filename),
+      join(stRoot, 'bob', 'inbox', filename),
       'utf8'
     );
     expect(parseFrontmatter(content).body).toBe('hi via long form\n');
@@ -404,7 +404,7 @@ describe('cmdSendCli — -m flag (brief-033)', () => {
     expect(rc).toBe(0);
     const filename = ctx.stdoutBuf.join('').trim();
     const content = readFileSync(
-      join(coordRoot, 'bob', 'inbox', filename),
+      join(stRoot, 'bob', 'inbox', filename),
       'utf8'
     );
     expect(parseFrontmatter(content).body).toBe('from stdin\n');
@@ -421,7 +421,7 @@ describe('cmdSendCli — -m flag (brief-033)', () => {
       cmdSendCli(['bob', '-m', 'inline body'], ctx)
     ).rejects.toThrow(/-m OR stdin, not both/);
     const ls = require('node:fs').readdirSync(
-      join(coordRoot, 'bob', 'inbox')
+      join(stRoot, 'bob', 'inbox')
     );
     expect(ls).toHaveLength(0);
   });

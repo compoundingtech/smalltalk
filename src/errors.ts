@@ -34,7 +34,7 @@ export class AgentRequiredError extends CoordError {
   constructor() {
     super(
       'IDENTITY_REQUIRED',
-      'agent required — set ST_AGENT (or legacy ST_IDENTITY / COORD_IDENTITY) or pass --from <agent>'
+      'agent required — set $ST_AGENT (or the legacy $ST_IDENTITY) or pass --from <agent>'
     );
   }
 }

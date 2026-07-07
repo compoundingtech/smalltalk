@@ -5,15 +5,15 @@
 
 export interface CliContext {
   env: NodeJS.ProcessEnv;
-  coordRoot: string;
-  coordConfig: string;
+  stRoot: string;
+  stConfig: string;
   stdout: (s: string) => void;
   stderr: (s: string) => void;
   /** Read all of stdin as a Buffer. CLI uses process.stdin; tests pass any. */
   readStdin: () => Promise<Buffer>;
   /**
    * brief-033: whether stdin is connected to a TTY (i.e., the user is
-   * typing interactively, no piped input). Used by `coord message
+   * typing interactively, no piped input). Used by `st message
    * send` to distinguish "user passed -m and also piped stdin" (an
    * error) from "user passed -m, no pipe" (the happy inline path).
    * Defaults via the dispatcher to `() => process.stdin.isTTY === true`.

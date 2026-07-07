@@ -56,11 +56,10 @@ describe('package.json exports map', () => {
     expect(pkg.exports['./types']?.default).toBe('./src/types.ts');
   });
 
-  it('declares the st / smalltalk / coord binaries (brief-005-phase0)', () => {
+  it('declares only the `st` + `smalltalk` binaries (post-coord-cutover)', () => {
     expect(pkg.bin).toEqual({
       st: './bin/st',
       smalltalk: './bin/smalltalk',
-      coord: './bin/coord',
     });
   });
 });

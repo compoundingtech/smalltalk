@@ -18,15 +18,15 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { runCli, type CliContext } from '../../src/cli.ts';
 
 let scratch: string;
-let coordRoot: string;
-let coordConfig: string;
+let stRoot: string;
+let stConfig: string;
 
 beforeEach(() => {
   scratch = mkdtempSync(join(tmpdir(), 'coord-cli-test-'));
-  coordRoot = join(scratch, 'coord');
-  coordConfig = join(scratch, 'config');
-  mkdirSync(coordRoot, { recursive: true });
-  mkdirSync(coordConfig, { recursive: true });
+  stRoot = join(scratch, 'coord');
+  stConfig = join(scratch, 'config');
+  mkdirSync(stRoot, { recursive: true });
+  mkdirSync(stConfig, { recursive: true });
 });
 afterEach(() => {
   rmSync(scratch, { recursive: true, force: true });
@@ -50,8 +50,8 @@ function makeContext(
   };
   cap.ctx = {
     env: envOverrides,
-    coordRoot,
-    coordConfig,
+    stRoot,
+    stConfig,
     stdout: (s) => {
       cap.stdout += s;
     },
@@ -65,8 +65,8 @@ function makeContext(
 }
 
 function setupIdentity(id: string): void {
-  mkdirSync(join(coordRoot, id, 'inbox'), { recursive: true });
-  mkdirSync(join(coordRoot, id, 'archive'), { recursive: true });
+  mkdirSync(join(stRoot, id, 'inbox'), { recursive: true });
+  mkdirSync(join(stRoot, id, 'archive'), { recursive: true });
 }
 
 // ─── No args / help ─────────────────────────────────────────────────────
@@ -194,8 +194,8 @@ describe('runCli — unknown subcommand', () => {
 // ─── Per-command --help ─────────────────────────────────────────────────
 
 describe('runCli — per-command --help / -h prints command-specific usage', () => {
-  // Brief-017: message verbs are nested under `coord message`; the
-  // CLI surfaces them via `coord message <verb> --help` (or the `msg`
+  // Brief-017: message verbs are nested under `st message`; the
+  // CLI surfaces them via `st message <verb> --help` (or the `msg`
   // alias). Non-message verbs remain top-level.
   it.each([
     [['message', 'send'], 'usage: st message send'],
@@ -224,14 +224,14 @@ describe('runCli — per-command --help / -h prints command-specific usage', () 
     expect(cap.stderr).toContain(prefix);
   });
 
-  it('top-level `coord send` (pre-brief-017 flat form) errors with a pointer', async () => {
+  it('top-level `st send` (pre-brief-017 flat form) errors with a pointer', async () => {
     const cap = makeContext();
     const code = await runCli(['send', 'bob'], cap.ctx);
     expect(code).toBe(2);
     expect(cap.stderr).toContain('Did you mean `st message send`?');
   });
 
-  it('`coord message --help` prints the message-group banner', async () => {
+  it('`st message --help` prints the message-group banner', async () => {
     const cap = makeContext();
     const code = await runCli(['message', '--help'], cap.ctx);
     expect(code).toBe(0);
@@ -248,27 +248,27 @@ describe('runCli — no inline presweep on non-sync commands', () => {
     // ls output until lazy-read sweep, `coord sweep`, or a sync runs.
     setupIdentity('bob');
     const f = '1714826789010-aaaaaa.md';
-    writeFileSync(join(coordRoot, 'bob', 'inbox', f), 'same');
-    writeFileSync(join(coordRoot, 'bob', 'archive', f), 'same');
+    writeFileSync(join(stRoot, 'bob', 'inbox', f), 'same');
+    writeFileSync(join(stRoot, 'bob', 'archive', f), 'same');
     const cap = makeContext();
     const code = await runCli(['message', 'ls', 'bob'], cap.ctx);
     expect(code).toBe(0);
     expect(cap.stdout).toContain(f);
     // Zombie still on disk after ls.
-    expect(existsSync(join(coordRoot, 'bob', 'inbox', f))).toBe(true);
+    expect(existsSync(join(stRoot, 'bob', 'inbox', f))).toBe(true);
   });
 
   it('`read` lazy-sweeps the zombie inbox copy (byte-identical twin)', async () => {
     setupIdentity('bob');
     const f = '1714826789010-aaaaaa.md';
-    writeFileSync(join(coordRoot, 'bob', 'inbox', f), 'same');
-    writeFileSync(join(coordRoot, 'bob', 'archive', f), 'same');
+    writeFileSync(join(stRoot, 'bob', 'inbox', f), 'same');
+    writeFileSync(join(stRoot, 'bob', 'archive', f), 'same');
     const cap = makeContext();
     const code = await runCli(['message', 'read', 'bob', f], cap.ctx);
     expect(code).toBe(0);
     // Lazy-read sweep cleaned up the inbox copy.
-    expect(existsSync(join(coordRoot, 'bob', 'inbox', f))).toBe(false);
-    expect(existsSync(join(coordRoot, 'bob', 'archive', f))).toBe(true);
+    expect(existsSync(join(stRoot, 'bob', 'inbox', f))).toBe(false);
+    expect(existsSync(join(stRoot, 'bob', 'archive', f))).toBe(true);
   });
 });
 
@@ -285,7 +285,7 @@ describe('runCli — error formatting', () => {
 
   it('unknown flag → exit 1 with "unknown flag" message', async () => {
     setupIdentity('bob');
-    const cap = makeContext('', { COORD_IDENTITY: 'bob' });
+    const cap = makeContext('', { ST_AGENT: 'bob' });
     const code = await runCli(['message', 'ls', '--bogus'], cap.ctx);
     expect(code).toBe(1);
     expect(cap.stderr).toContain('unknown flag: --bogus');
@@ -299,7 +299,7 @@ describe('runCli — end-to-end smoke', () => {
     setupIdentity('alice');
     setupIdentity('bob'); // need full folder so the ls/read on bob can resolve
     // send: stdin is the body; --from alice writes from alice to bob.
-    const send = makeContext('hello bob', { COORD_IDENTITY: 'alice' });
+    const send = makeContext('hello bob', { ST_AGENT: 'alice' });
     const sendCode = await runCli(
       ['message', 'send', 'bob', '--from', 'alice', '--subject', 'hi'],
       send.ctx
@@ -309,14 +309,14 @@ describe('runCli — end-to-end smoke', () => {
     expect(filename).toMatch(/^[0-9]{13}-[0-9a-z]{6}\.md$/);
 
     // ls bob: header on stderr, filename on stdout.
-    const lsCap = makeContext('', { COORD_IDENTITY: 'alice' });
+    const lsCap = makeContext('', { ST_AGENT: 'alice' });
     const lsCode = await runCli(['message', 'ls', 'bob'], lsCap.ctx);
     expect(lsCode).toBe(0);
     expect(lsCap.stdout).toBe(`${filename}\n`);
     expect(lsCap.stderr).toContain('# 1 message in inbox');
 
     // read bob <filename>: header on stderr, body on stdout.
-    const readCap = makeContext('', { COORD_IDENTITY: 'alice' });
+    const readCap = makeContext('', { ST_AGENT: 'alice' });
     const readCode = await runCli(
       ['message', 'read', 'bob', filename],
       readCap.ctx
@@ -329,14 +329,14 @@ describe('runCli — end-to-end smoke', () => {
 
   it('status get/set roundtrip', async () => {
     setupIdentity('alice');
-    const setCap = makeContext('', { COORD_IDENTITY: 'alice' });
+    const setCap = makeContext('', { ST_AGENT: 'alice' });
     await runCli(['status', '--set', 'busy'], setCap.ctx);
     expect(setCap.stdout).toBe('status: busy\n');
-    expect(readFileSync(join(coordRoot, 'alice', 'status'), 'utf8')).toBe(
+    expect(readFileSync(join(stRoot, 'alice', 'status'), 'utf8')).toBe(
       'busy\n'
     );
 
-    const getCap = makeContext('', { COORD_IDENTITY: 'alice' });
+    const getCap = makeContext('', { ST_AGENT: 'alice' });
     await runCli(['status'], getCap.ctx);
     expect(getCap.stdout).toBe('busy\n');
   });
@@ -345,14 +345,14 @@ describe('runCli — end-to-end smoke', () => {
     setupIdentity('bob');
     const f = '1714826789010-aaaaaa.md';
     writeFileSync(
-      join(coordRoot, 'bob', 'inbox', f),
+      join(stRoot, 'bob', 'inbox', f),
       `---\nfrom: alice\n---\nbody\n`
     );
-    const cap = makeContext('', { COORD_IDENTITY: 'bob' });
+    const cap = makeContext('', { ST_AGENT: 'bob' });
     const code = await runCli(['message', 'archive', f], cap.ctx);
     expect(code).toBe(0);
     expect(cap.stderr).toContain('archived');
-    expect(existsSync(join(coordRoot, 'bob', 'inbox', f))).toBe(false);
-    expect(existsSync(join(coordRoot, 'bob', 'archive', f))).toBe(true);
+    expect(existsSync(join(stRoot, 'bob', 'inbox', f))).toBe(false);
+    expect(existsSync(join(stRoot, 'bob', 'archive', f))).toBe(true);
   });
 });

@@ -21,15 +21,15 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = resolve(HERE, '..', '..');
-const COORD_BIN = join(REPO_ROOT, 'bin', 'coord');
+const COORD_BIN = join(REPO_ROOT, 'bin', 'st');
 
 let scratch: string;
-let coordRoot: string;
+let stRoot: string;
 
 beforeEach(() => {
   scratch = mkdtempSync('/tmp/coord-mcp-shutdown-');
-  coordRoot = join(scratch, 'coord');
-  mkdirSync(join(coordRoot, 'alice'), { recursive: true });
+  stRoot = join(scratch, 'coord');
+  mkdirSync(join(stRoot, 'alice'), { recursive: true });
 });
 
 afterEach(() => {
@@ -38,13 +38,13 @@ afterEach(() => {
 
 async function bootAndSignal(signal: 'SIGTERM' | 'SIGINT'): Promise<string> {
   // Pre-seed status: this is what peers see right now.
-  writeFileSync(join(coordRoot, 'alice', 'status'), 'available\n');
+  writeFileSync(join(stRoot, 'alice', 'status'), 'available\n');
 
   const proc = spawn(COORD_BIN, ['mcp'], {
     env: {
       ...process.env,
-      COORD_ROOT: coordRoot,
-      COORD_IDENTITY: 'alice',
+      ST_ROOT: stRoot,
+      ST_AGENT: 'alice',
     },
     stdio: ['pipe', 'pipe', 'pipe'],
   });
@@ -67,7 +67,7 @@ async function bootAndSignal(signal: 'SIGTERM' | 'SIGINT'): Promise<string> {
     });
   });
 
-  const statusFile = join(coordRoot, 'alice', 'status');
+  const statusFile = join(stRoot, 'alice', 'status');
   if (!existsSync(statusFile)) {
     throw new Error('status file missing after shutdown');
   }

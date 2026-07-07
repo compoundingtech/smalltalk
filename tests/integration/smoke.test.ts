@@ -1,7 +1,7 @@
 // tests/integration/smoke.test.ts — confirms the integration harness works.
 //
-// Each integration test should be able to: spawn bin/coord with a fresh
-// COORD_ROOT, capture its output, and inspect the resulting filesystem.
+// Each integration test should be able to: spawn bin/st with a fresh
+// ST_ROOT, capture its output, and inspect the resulting filesystem.
 // This file pins those guarantees with the smallest possible scenarios.
 
 import { existsSync } from 'node:fs';
@@ -19,23 +19,23 @@ import {
 } from './helpers.ts';
 
 describe('integration smoke', () => {
-  it('the bin/coord shim exists on disk', () => {
+  it('the bin/st shim exists on disk', () => {
     expect(existsSync(COORD_BIN)).toBe(true);
   });
 
-  it('invokes coord with --help and exits 0', () => {
+  it('invokes st with --help and exits 0', () => {
     const r = runCoord(['--help']);
     expect(r.exitCode).toBe(0);
-    expect(r.stdout).toContain('usage: coord');
+    expect(r.stdout).toContain('usage: st');
   });
 
-  it('coord with no args exits 2 and prints usage to stderr', () => {
+  it('st with no args exits 2 and prints usage to stderr', () => {
     const r = runCoord([]);
     expect(r.exitCode).toBe(2);
-    expect(r.stderr).toContain('usage: coord');
+    expect(r.stderr).toContain('usage: st');
   });
 
-  it('coord <unknown> exits 2 with the unknown-subcommand message', () => {
+  it('st <unknown> exits 2 with the unknown-subcommand message', () => {
     const r = runCoord(['bogus-cmd']);
     expect(r.exitCode).toBe(2);
     expect(r.stderr).toContain('unknown subcommand: bogus-cmd');
@@ -46,7 +46,7 @@ describe('integration smoke', () => {
     try {
       mkIdentity(root, 'alice');
       const r = runCoord(['message', 'send', 'bob', '--from', 'alice', '--subject', 'hi'], {
-        coordRoot: root,
+        stRoot: root,
         stdin: 'hello bob',
       });
       expect(r.exitCode).toBe(0);
@@ -70,11 +70,11 @@ describe('integration smoke', () => {
       sessions = [];
     });
 
-    it('Session.spawn returns a usable session for `coord help`', async () => {
+    it('Session.spawn returns a usable session for `st help`', async () => {
       const s = runCoordPty(['help']);
       sessions.push(s);
-      const ss = await s.waitForText('usage: coord');
-      expect(ss.text).toContain('usage: coord');
+      const ss = await s.waitForText('usage: st');
+      expect(ss.text).toContain('usage: st');
     });
   });
 });

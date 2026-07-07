@@ -1,4 +1,4 @@
-// tests/integration/sync-errors.test.ts — failure paths through `coord sync`.
+// tests/integration/sync-errors.test.ts — failure paths through `st sync`.
 //
 // The cases pin: rsync transport failure (bogus host), rsync target failure
 // (unwritable local dir), missing peers.yaml, empty peers.yaml, and the
@@ -25,14 +25,14 @@ const d = skip ? describe.skip : describe;
 
 d('sync error paths', () => {
   let root: string;
-  let coordConfig: string;
+  let stConfig: string;
   const allRoots: string[] = [];
 
   beforeEach(() => {
     root = mkRoot();
-    coordConfig = mkScratch();
+    stConfig = mkScratch();
     mkIdentity(root, 'alice');
-    allRoots.push(root, coordConfig);
+    allRoots.push(root, stConfig);
   });
 
   afterAll(() => {
@@ -46,7 +46,7 @@ d('sync error paths', () => {
     const r = runCoord(
       ['sync', 'push', 'this-host-does-not-resolve.invalid.example.com'],
       {
-        coordRoot: root,
+        stRoot: root,
         coordIdentity: 'alice',
         timeoutMs: 20_000,
       }
@@ -58,7 +58,7 @@ d('sync error paths', () => {
   it('rsync failure leaves the local tree unchanged', () => {
     // Pre-populate alice's outbound with a message.
     runCoord(['message', 'send', 'bob', '--from', 'alice'], {
-      coordRoot: root,
+      stRoot: root,
       coordIdentity: 'alice',
       stdin: 'preserved',
     });
@@ -67,7 +67,7 @@ d('sync error paths', () => {
     runCoord(
       ['sync', 'push', 'this-host-does-not-resolve.invalid.example.com'],
       {
-        coordRoot: root,
+        stRoot: root,
         coordIdentity: 'alice',
         timeoutMs: 20_000,
       }
@@ -90,19 +90,19 @@ d('sync error paths', () => {
     const target = join(lockedParent, 'cannot-create');
 
     const r = runCoord(['sync', 'push', `local:${target}`], {
-      coordRoot: root,
+      stRoot: root,
       coordIdentity: 'alice',
     });
     expect(r.exitCode).not.toBe(0);
-    expect(r.stderr).toMatch(/coord:.*(permission denied|rsync push failed)/);
+    expect(r.stderr).toMatch(/st:.*(permission denied|rsync push failed)/);
   });
 
   // ── peers.yaml missing / empty ─────────────────────────────────────
 
   it('sync --all with no peers.yaml exits non-zero with a clear message', () => {
     const r = runCoord(['sync', '--all'], {
-      coordRoot: root,
-      coordConfig,
+      stRoot: root,
+      stConfig,
       coordIdentity: 'alice',
     });
     expect(r.exitCode).not.toBe(0);
@@ -110,10 +110,10 @@ d('sync error paths', () => {
   });
 
   it('sync --all with empty peers.yaml (no entries) exits non-zero', () => {
-    writeFileSync(join(coordConfig, 'peers.yaml'), '# only comments\n');
+    writeFileSync(join(stConfig, 'peers.yaml'), '# only comments\n');
     const r = runCoord(['sync', '--all'], {
-      coordRoot: root,
-      coordConfig,
+      stRoot: root,
+      stConfig,
       coordIdentity: 'alice',
     });
     expect(r.exitCode).not.toBe(0);
@@ -122,8 +122,8 @@ d('sync error paths', () => {
 
   it('sync push --all with no peers.yaml errors loudly', () => {
     const r = runCoord(['sync', 'push', '--all'], {
-      coordRoot: root,
-      coordConfig,
+      stRoot: root,
+      stConfig,
       coordIdentity: 'alice',
     });
     expect(r.exitCode).not.toBe(0);
@@ -132,8 +132,8 @@ d('sync error paths', () => {
 
   it('sync pull --all with no peers.yaml errors loudly', () => {
     const r = runCoord(['sync', 'pull', '--all'], {
-      coordRoot: root,
-      coordConfig,
+      stRoot: root,
+      stConfig,
       coordIdentity: 'alice',
     });
     expect(r.exitCode).not.toBe(0);
@@ -154,7 +154,7 @@ d('sync error paths', () => {
     const r = runCoord(
       ['sync', 'push', 'this-host-does-not-resolve.invalid.example.com'],
       {
-        coordRoot: root,
+        stRoot: root,
         coordIdentity: 'alice',
         timeoutMs: 20_000,
       }
@@ -172,12 +172,12 @@ d('sync error paths', () => {
 
   it('sync --all with verb "sweep" errors: sweep is local-only', () => {
     writeFileSync(
-      join(coordConfig, 'peers.yaml'),
+      join(stConfig, 'peers.yaml'),
       `bobby: local:${join(mkScratch(), 'b')}\n`
     );
     const r = runCoord(['sync', 'sweep', '--all'], {
-      coordRoot: root,
-      coordConfig,
+      stRoot: root,
+      stConfig,
       coordIdentity: 'alice',
     });
     expect(r.exitCode).not.toBe(0);

@@ -6,45 +6,45 @@
 # reports messages that arrived AFTER the previous Stop. Empty delta
 # → silent exit; the agent goes idle uninterrupted.
 #
-# State path: $XDG_STATE_HOME/coord-codex-hooks/last-checked.txt, or
-# $HOME/.local/state/coord-codex-hooks/last-checked.txt if XDG isn't
+# State path: $XDG_STATE_HOME/st-codex-hooks/last-checked.txt, or
+# $HOME/.local/state/st-codex-hooks/last-checked.txt if XDG isn't
 # set. The file holds a single decimal unix-ms integer.
 
 set -u
 
 emit_system_message() {
   if command -v jq >/dev/null 2>&1; then
-    printf '%s' "$1" | jq -Rs '{systemMessage: ("coord hook failed: " + .), continue: true}'
+    printf '%s' "$1" | jq -Rs '{systemMessage: ("st hook failed: " + .), continue: true}'
   else
-    printf '{"systemMessage": "coord hook failed: %s", "continue": true}\n' "$1"
+    printf '{"systemMessage": "st hook failed: %s", "continue": true}\n' "$1"
   fi
 }
 
 # ─── Env + dep checks ─────────────────────────────────────────────────
 
-if [ -z "${COORD_ROOT:-}" ]; then
-  printf 'coord-codex-hook: COORD_ROOT not set\n' >&2
+if [ -z "${ST_ROOT:-}" ]; then
+  printf 'st-codex-hook: ST_ROOT not set\n' >&2
   exit 1
 fi
 
-if [ -z "${COORD_IDENTITY:-}" ]; then
-  printf 'coord-codex-hook: COORD_IDENTITY not set\n' >&2
+if [ -z "${ST_AGENT:-}" ]; then
+  printf 'st-codex-hook: ST_AGENT not set\n' >&2
   exit 1
 fi
 
-if ! command -v coord >/dev/null 2>&1; then
-  printf 'coord-codex-hook: coord not on PATH\n' >&2
+if ! command -v st >/dev/null 2>&1; then
+  printf 'st-codex-hook: st not on PATH\n' >&2
   exit 1
 fi
 
 if ! command -v jq >/dev/null 2>&1; then
-  printf 'coord-codex-hook: jq not on PATH (required by this hook)\n' >&2
+  printf 'st-codex-hook: jq not on PATH (required by this hook)\n' >&2
   exit 1
 fi
 
 # ─── State file ───────────────────────────────────────────────────────
 
-state_dir="${XDG_STATE_HOME:-$HOME/.local/state}/coord-codex-hooks"
+state_dir="${XDG_STATE_HOME:-$HOME/.local/state}/st-codex-hooks"
 state_file="$state_dir/last-checked.txt"
 
 if ! mkdir -p "$state_dir" 2>/dev/null; then
@@ -65,18 +65,18 @@ now_ms=$(jq -n 'now * 1000 | floor')
 
 # ─── Read inbox delta ─────────────────────────────────────────────────
 
-# coord message ls --since filters by filename's <unix-ms> prefix. Files that
+# st message ls --since filters by filename's <unix-ms> prefix. Files that
 # arrived via sync with an older prefix are missed by design — Stop is
 # a notification cue, not a backfill audit.
 #
 # brief-005-phase0: capture stdout and stderr separately so the
-# `[smalltalk] honoring COORD_IDENTITY` warning doesn't corrupt the
+# `[smalltalk] honoring ST_AGENT` warning doesn't corrupt the
 # JSON payload while still being available for the failure-diagnostic
 # path below.
-err_file=$(mktemp -t coord-hook-err.XXXXXX)
+err_file=$(mktemp -t st-hook-err.XXXXXX)
 trap "rm -f '$err_file'" EXIT
-if ! items_json=$(coord message ls --json --since "$last_checked" 2>"$err_file"); then
-  emit_system_message "coord message ls --json failed: $(cat "$err_file")"
+if ! items_json=$(st message ls --json --since "$last_checked" 2>"$err_file"); then
+  emit_system_message "st message ls --json failed: $(cat "$err_file")"
   exit 0
 fi
 
@@ -91,7 +91,7 @@ fi
 
 # ─── Build payload ────────────────────────────────────────────────────
 
-header="## coord inbox ($count new since last check)"
+header="## st inbox ($count new since last check)"
 
 printf '%s' "$items_json" | jq \
   --arg header "$header" \

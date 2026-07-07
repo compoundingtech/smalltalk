@@ -23,19 +23,19 @@ import { errorCode, errorPayload } from "./_helpers.ts";
 import { asIdentity } from '../../../src/types.ts';
 
 let scratch: string;
-let coordRoot: string;
+let stRoot: string;
 let client: Client;
 let handle: ReturnType<typeof createMcpServer>;
 
 beforeEach(async () => {
   scratch = mkdtempSync(join(tmpdir(), 'coord-mcp-shared-'));
-  coordRoot = join(scratch, 'coord');
+  stRoot = join(scratch, 'coord');
   for (const id of ['alice', 'bob']) {
-    mkdirSync(join(coordRoot, id, 'inbox'), { recursive: true });
-    mkdirSync(join(coordRoot, id, 'archive'), { recursive: true });
+    mkdirSync(join(stRoot, id, 'inbox'), { recursive: true });
+    mkdirSync(join(stRoot, id, 'archive'), { recursive: true });
   }
   handle = createMcpServer({
-    root: coordRoot,
+    root: stRoot,
     identity: asIdentity('alice'),
   });
   client = new Client({ name: 'test-shared', version: '1.0' });
@@ -140,7 +140,7 @@ describe('shared — concurrent tool calls', () => {
       .filter(Boolean);
     expect(filenames).toHaveLength(10);
     expect(new Set(filenames).size).toBe(10);
-    expect(readdirSync(join(coordRoot, 'bob', 'inbox'))).toHaveLength(10);
+    expect(readdirSync(join(stRoot, 'bob', 'inbox'))).toHaveLength(10);
   });
 
   it('mixed parallel calls (send + ls + read) work without state corruption', async () => {
@@ -166,41 +166,41 @@ describe('shared — concurrent tool calls', () => {
 describe('shared — sweep is a convergence operation', () => {
   it('st_msg_ls does NOT presweep — zombie stays visible', async () => {
     const f = '1714826789010-aaaaaa.md';
-    writeFileSync(join(coordRoot, 'alice', 'inbox', f), 'same');
-    writeFileSync(join(coordRoot, 'alice', 'archive', f), 'same');
+    writeFileSync(join(stRoot, 'alice', 'inbox', f), 'same');
+    writeFileSync(join(stRoot, 'alice', 'archive', f), 'same');
     const r = await call('st_msg_ls', {});
     expect(r.isError).toBeUndefined();
     expect(r.structuredContent?.matches).toEqual([f]);
-    expect(existsSync(join(coordRoot, 'alice', 'inbox', f))).toBe(true);
-    expect(existsSync(join(coordRoot, 'alice', 'archive', f))).toBe(true);
+    expect(existsSync(join(stRoot, 'alice', 'inbox', f))).toBe(true);
+    expect(existsSync(join(stRoot, 'alice', 'archive', f))).toBe(true);
   });
 
   it('st_msg_read lazy-sweeps the byte-identical inbox twin', async () => {
     const f = '1714826789010-aaaaaa.md';
     writeFileSync(
-      join(coordRoot, 'alice', 'inbox', f),
+      join(stRoot, 'alice', 'inbox', f),
       '---\nfrom: bob\n---\nbody\n'
     );
     writeFileSync(
-      join(coordRoot, 'alice', 'archive', f),
+      join(stRoot, 'alice', 'archive', f),
       '---\nfrom: bob\n---\nbody\n'
     );
     const r = await call('st_msg_read', { filename: f });
     expect(r.isError).toBeUndefined();
     // Lazy-read cleaned the inbox copy, archive stayed.
-    expect(existsSync(join(coordRoot, 'alice', 'inbox', f))).toBe(false);
-    expect(existsSync(join(coordRoot, 'alice', 'archive', f))).toBe(true);
+    expect(existsSync(join(stRoot, 'alice', 'inbox', f))).toBe(false);
+    expect(existsSync(join(stRoot, 'alice', 'archive', f))).toBe(true);
   });
 });
 
 // ─── Identity plumbing ────────────────────────────────────────────────
 
 describe('shared — identity plumbing', () => {
-  it('bad COORD_IDENTITY at server construction → every tool surfaces IDENTITY_NOT_HOSTED', async () => {
+  it('bad ST_AGENT at server construction → every tool surfaces IDENTITY_NOT_HOSTED', async () => {
     // Tear down and rebuild against a missing identity.
     await handle.close();
     handle = createMcpServer({
-      root: coordRoot,
+      root: stRoot,
       identity: asIdentity('ghost'), // valid grammar but no folder on disk
     });
     client = new Client({ name: 'test-shared-ghost', version: '1.0' });

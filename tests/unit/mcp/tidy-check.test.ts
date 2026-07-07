@@ -20,17 +20,17 @@ import { STALE_INBOX_MS } from '../../../src/common.ts';
 import { evaluateDrift } from '../../../src/mcp/tidy-check.ts';
 
 let scratch: string;
-let coordRoot: string;
+let stRoot: string;
 let identityRoot: string;
 
 const ID = 'alice';
 
 beforeEach(() => {
   scratch = mkdtempSync(join(tmpdir(), 'coord-tidy-unit-'));
-  coordRoot = join(scratch, 'coord');
-  mkdirSync(join(coordRoot, ID, 'inbox'), { recursive: true });
-  mkdirSync(join(coordRoot, ID, 'archive'), { recursive: true });
-  identityRoot = join(coordRoot, ID);
+  stRoot = join(scratch, 'coord');
+  mkdirSync(join(stRoot, ID, 'inbox'), { recursive: true });
+  mkdirSync(join(stRoot, ID, 'archive'), { recursive: true });
+  identityRoot = join(stRoot, ID);
 });
 
 afterEach(() => {
@@ -51,14 +51,14 @@ function plantInbox(filename: string, ageMs: number): string {
 
 describe('evaluateDrift — clean fixtures', () => {
   it('empty identity → no drift', () => {
-    const r = evaluateDrift(ID, coordRoot);
+    const r = evaluateDrift(ID, stRoot);
     expect(r.inbox).toBe(false);
     expect(r.body).toBe('');
   });
 
   it('inbox file fresher than STALE_INBOX_MS → no inbox drift', () => {
     plantInbox('1714826789010-aaaaaa.md', STALE_INBOX_MS - 60_000);
-    const r = evaluateDrift(ID, coordRoot);
+    const r = evaluateDrift(ID, stRoot);
     expect(r.inbox).toBe(false);
   });
 });
@@ -68,7 +68,7 @@ describe('evaluateDrift — clean fixtures', () => {
 describe('evaluateDrift — inbox condition', () => {
   it('a single stale inbox file fires inbox drift', () => {
     plantInbox('1714826789010-aaaaaa.md', STALE_INBOX_MS + 60_000);
-    const r = evaluateDrift(ID, coordRoot);
+    const r = evaluateDrift(ID, stRoot);
     expect(r.inbox).toBe(true);
     expect(r.detail.inboxStaleCount).toBe(1);
     expect(r.detail.oldestInboxAgeMs).toBeGreaterThan(STALE_INBOX_MS);
@@ -79,7 +79,7 @@ describe('evaluateDrift — inbox condition', () => {
     plantInbox('1714826789010-aaaaaa.md', STALE_INBOX_MS + 60_000);
     plantInbox('1714826789020-bbbbbb.md', STALE_INBOX_MS + 30 * 60_000);
     plantInbox('1714826789030-cccccc.md', STALE_INBOX_MS + 5 * 60_000);
-    const r = evaluateDrift(ID, coordRoot);
+    const r = evaluateDrift(ID, stRoot);
     expect(r.inbox).toBe(true);
     expect(r.detail.inboxStaleCount).toBe(3);
     // oldest is the +30min one
@@ -94,7 +94,7 @@ describe('evaluateDrift — inbox condition', () => {
     writeFileSync(noisePath, 'docs');
     const oldT = new Date(Date.now() - STALE_INBOX_MS * 10);
     utimesSync(noisePath, oldT, oldT);
-    const r = evaluateDrift(ID, coordRoot);
+    const r = evaluateDrift(ID, stRoot);
     expect(r.detail.inboxStaleCount).toBe(1);
   });
 });
@@ -103,13 +103,13 @@ describe('evaluateDrift — inbox condition', () => {
 
 describe('evaluateDrift — body shape', () => {
   it('body is empty when no condition fires', () => {
-    const r = evaluateDrift(ID, coordRoot);
+    const r = evaluateDrift(ID, stRoot);
     expect(r.body).toBe('');
   });
 
   it('body starts with the tidy-check header when drift fires', () => {
     plantInbox('1714826789010-aaaaaa.md', STALE_INBOX_MS + 60_000);
-    const r = evaluateDrift(ID, coordRoot);
+    const r = evaluateDrift(ID, stRoot);
     expect(r.body.startsWith('Tidy check (drift detected):')).toBe(true);
   });
 
@@ -119,7 +119,7 @@ describe('evaluateDrift — body shape', () => {
     const baseline = 2_000_000_000_000;
     const pastT = new Date(baseline - STALE_INBOX_MS - 1);
     utimesSync(path, pastT, pastT);
-    const r = evaluateDrift(ID, coordRoot, { now: () => baseline });
+    const r = evaluateDrift(ID, stRoot, { now: () => baseline });
     expect(r.inbox).toBe(true);
   });
 });
@@ -131,7 +131,7 @@ describe('evaluateDrift — resilience', () => {
     rmSync(scratch, { recursive: true, force: true });
     // Re-mkdir scratch so afterEach's rmSync doesn't error.
     mkdirSync(scratch);
-    const r = evaluateDrift(ID, coordRoot);
+    const r = evaluateDrift(ID, stRoot);
     expect(r.inbox).toBe(false);
   });
 });

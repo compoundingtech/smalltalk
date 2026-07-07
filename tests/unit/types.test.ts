@@ -87,7 +87,7 @@ describe('isFilename', () => {
     '171482678901-x9k4mz.md', // 12-digit ts
     '1714826789012-x9k4m.md', // 5-char rand
     '1714826789012-X9K4MZ.md', // uppercase
-    '1714826789012-myobie-x9k4mz.md', // legacy 3-segment
+    '1714826789012-operator-x9k4mz.md', // legacy 3-segment
     ' 1714826789012-x9k4mz.md', // leading whitespace
     '1714826789012-x9k4mz.md\n', // trailing newline
   ])('rejects %s', (s) => {

@@ -20,12 +20,12 @@ import { STATUS_STALE_MS } from '../../src/common.ts';
 import { readIdentityStatus } from '../../src/commands/status.ts';
 
 let scratch: string;
-let coordRoot: string;
+let stRoot: string;
 
 beforeEach(() => {
   scratch = mkdtempSync(join(tmpdir(), 'coord-status-staleness-'));
-  coordRoot = join(scratch, 'coord');
-  mkdirSync(join(coordRoot, 'alice'), { recursive: true });
+  stRoot = join(scratch, 'coord');
+  mkdirSync(join(stRoot, 'alice'), { recursive: true });
 });
 
 afterEach(() => {
@@ -33,7 +33,7 @@ afterEach(() => {
 });
 
 function writeStatus(id: string, value: string): string {
-  const path = join(coordRoot, id, 'status');
+  const path = join(stRoot, id, 'status');
   writeFileSync(path, `${value}\n`);
   return path;
 }
@@ -46,19 +46,19 @@ function backdate(path: string, ageMs: number): void {
 describe('readIdentityStatus — mtime staleness', () => {
   it('fresh file → reads the recorded value', () => {
     writeStatus('alice', 'available');
-    expect(readIdentityStatus('alice', coordRoot)).toBe('available');
+    expect(readIdentityStatus('alice', stRoot)).toBe('available');
   });
 
   it('file mtime within the staleness window → recorded value still trusted', () => {
     const path = writeStatus('alice', 'busy');
     backdate(path, STATUS_STALE_MS - 60_000); // 1 min under the threshold
-    expect(readIdentityStatus('alice', coordRoot)).toBe('busy');
+    expect(readIdentityStatus('alice', stRoot)).toBe('busy');
   });
 
   it('file mtime older than STATUS_STALE_MS → returns `unknown`', () => {
     const path = writeStatus('alice', 'available');
     backdate(path, STATUS_STALE_MS + 60_000); // 1 min past the threshold
-    expect(readIdentityStatus('alice', coordRoot)).toBe('unknown');
+    expect(readIdentityStatus('alice', stRoot)).toBe('unknown');
   });
 
   it('stale-yet-recorded `offline` also surfaces as `unknown`', () => {
@@ -66,25 +66,25 @@ describe('readIdentityStatus — mtime staleness', () => {
     // recorded value doesn't matter, only the mtime.
     const path = writeStatus('alice', 'offline');
     backdate(path, STATUS_STALE_MS + 60_000);
-    expect(readIdentityStatus('alice', coordRoot)).toBe('unknown');
+    expect(readIdentityStatus('alice', stRoot)).toBe('unknown');
   });
 
   it('missing file → `offline` (unchanged from pre-brief-022 behavior)', () => {
     // No status file at all is distinct from a stale one: an agent that
     // never wrote status isn't necessarily dead, it just hasn't booted
     // through the ritual yet. LAYOUT-004 says this case is `offline`.
-    expect(readIdentityStatus('alice', coordRoot)).toBe('offline');
+    expect(readIdentityStatus('alice', stRoot)).toBe('offline');
   });
 
   it('corrupt contents on a fresh file → `offline` (brief-006 rule)', () => {
     writeStatus('alice', 'garbage-value');
-    expect(readIdentityStatus('alice', coordRoot)).toBe('offline');
+    expect(readIdentityStatus('alice', stRoot)).toBe('offline');
   });
 
   it('corrupt contents on a stale file → `unknown` (staleness wins)', () => {
     const path = writeStatus('alice', 'garbage-value');
     backdate(path, STATUS_STALE_MS + 60_000);
     // mtime is checked before contents — stale is stale regardless.
-    expect(readIdentityStatus('alice', coordRoot)).toBe('unknown');
+    expect(readIdentityStatus('alice', stRoot)).toBe('unknown');
   });
 });

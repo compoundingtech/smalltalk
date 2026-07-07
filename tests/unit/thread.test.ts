@@ -13,20 +13,20 @@ import {
 } from '../../src/commands/thread.ts';
 
 let scratch: string;
-let coordRoot: string;
+let stRoot: string;
 
 beforeEach(() => {
   scratch = mkdtempSync(join(tmpdir(), 'coord-thread-test-'));
-  coordRoot = join(scratch, 'coord');
-  mkdirSync(coordRoot, { recursive: true });
+  stRoot = join(scratch, 'coord');
+  mkdirSync(stRoot, { recursive: true });
 });
 afterEach(() => {
   rmSync(scratch, { recursive: true, force: true });
 });
 
 function setupIdentity(id: string): void {
-  mkdirSync(join(coordRoot, id, 'inbox'), { recursive: true });
-  mkdirSync(join(coordRoot, id, 'archive'), { recursive: true });
+  mkdirSync(join(stRoot, id, 'inbox'), { recursive: true });
+  mkdirSync(join(stRoot, id, 'archive'), { recursive: true });
 }
 
 interface Msg {
@@ -40,7 +40,7 @@ interface Msg {
 
 function writeMsg(m: Msg): void {
   const folder = m.folder ?? 'inbox';
-  const dir = join(coordRoot, m.to, folder);
+  const dir = join(stRoot, m.to, folder);
   mkdirSync(dir, { recursive: true });
   let head = `---\nfrom: ${m.from}\nsubject: ${m.subject}\n`;
   if (m.inReplyTo) head += `in-reply-to: ${m.inReplyTo}\n`;
@@ -53,7 +53,7 @@ function input(overrides: Partial<ThreadInput> = {}): ThreadInput {
     recipient: 'bob',
     filename: '1714826789010-aaaaaa.md',
     env: {} as NodeJS.ProcessEnv,
-    coordRoot,
+    stRoot,
     ...overrides,
   };
 }
@@ -346,7 +346,7 @@ describe('cmdThread — robustness', () => {
     // writing the literal "in-reply-to: " (empty value) — the parser
     // returns an empty string which our walk treats as no parent.
     writeFileSync(
-      join(coordRoot, 'bob', 'inbox', '1714826789010-aaaaaa.md'),
+      join(stRoot, 'bob', 'inbox', '1714826789010-aaaaaa.md'),
       '---\nfrom: alice\nsubject: solo\nin-reply-to: \n---\nbody\n'
     );
     const r = cmdThread(input());
@@ -358,7 +358,7 @@ describe('cmdThread — robustness', () => {
   it('parent ref that is not a valid filename is treated as no parent', () => {
     setupIdentity('bob');
     writeFileSync(
-      join(coordRoot, 'bob', 'inbox', '1714826789010-aaaaaa.md'),
+      join(stRoot, 'bob', 'inbox', '1714826789010-aaaaaa.md'),
       '---\nfrom: alice\nin-reply-to: garbage\n---\nbody\n'
     );
     const r = cmdThread(input());

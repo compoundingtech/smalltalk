@@ -60,7 +60,7 @@ export interface OverviewInput {
   /** Override now() for deterministic tests. */
   now?: () => number;
   env: NodeJS.ProcessEnv;
-  coordRoot: string;
+  stRoot: string;
 }
 
 const DEFAULT_RECENT_N = 10;
@@ -88,7 +88,7 @@ export function getOverview(
   const now = opts.now ?? msNow;
 
   const members = (
-    cmdAgents({ enrich: true, coordRoot: root }).items as
+    cmdAgents({ enrich: true, stRoot: root }).items as
       AgentSummaryEnriched[]
   );
 
@@ -110,9 +110,9 @@ export function getOverview(
 export function cmdOverview(input: OverviewInput): Overview {
   const identity = resolveIdentity({
     env: input.env,
-    coordRoot: input.coordRoot,
+    stRoot: input.stRoot,
   }) as Identity;
-  return getOverview(input.coordRoot, identity, {
+  return getOverview(input.stRoot, identity, {
     ...(input.recent !== undefined && { recent: input.recent }),
     ...(input.now !== undefined && { now: input.now }),
   });
@@ -381,7 +381,7 @@ export function cmdOverviewCli(
   const r = cmdOverview({
     ...(recent !== undefined && { recent }),
     env: ctx.env,
-    coordRoot: ctx.coordRoot,
+    stRoot: ctx.stRoot,
   });
   if (json) {
     ctx.stdout(`${JSON.stringify(r)}\n`);

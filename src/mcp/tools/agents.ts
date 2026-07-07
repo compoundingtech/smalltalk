@@ -61,7 +61,7 @@ export function registerAgentsTool(mcp: McpServer, coord: Coord): void {
   const handler = async (args: { status?: string; enrich?: boolean }) =>
     withErrorMapping(async () => {
       const r = cmdAgents({
-        coordRoot: coord.root,
+        stRoot: coord.root,
         ...(args.status !== undefined && { status: args.status }),
         ...(args.enrich !== undefined && { enrich: args.enrich }),
       });

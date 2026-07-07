@@ -20,14 +20,14 @@ import { createMcpServer } from '../../../src/mcp/index.ts';
 import { asIdentity } from '../../../src/types.ts';
 
 let scratch: string;
-let coordRoot: string;
+let stRoot: string;
 
 beforeEach(() => {
-  scratch = mkdtempSync(join(tmpdir(), 'coord-mcp-lifecycle-'));
-  coordRoot = join(scratch, 'coord');
-  mkdirSync(coordRoot, { recursive: true });
-  mkdirSync(join(coordRoot, 'alice', 'inbox'), { recursive: true });
-  mkdirSync(join(coordRoot, 'alice', 'archive'), { recursive: true });
+  scratch = mkdtempSync(join(tmpdir(), 'st-mcp-lifecycle-'));
+  stRoot = join(scratch, 'st');
+  mkdirSync(stRoot, { recursive: true });
+  mkdirSync(join(stRoot, 'alice', 'inbox'), { recursive: true });
+  mkdirSync(join(stRoot, 'alice', 'archive'), { recursive: true });
 });
 afterEach(() => {
   rmSync(scratch, { recursive: true, force: true });
@@ -38,7 +38,7 @@ async function connectInMemory(opts?: { identity?: string }): Promise<{
   handle: ReturnType<typeof createMcpServer>;
 }> {
   const handle = createMcpServer({
-    root: coordRoot,
+    root: stRoot,
     identity: asIdentity(opts?.identity ?? 'alice'),
   });
   const client = new Client({ name: 'test-client', version: '1.0' });
@@ -55,7 +55,7 @@ async function connectInMemory(opts?: { identity?: string }): Promise<{
 describe('createMcpServer — construction', () => {
   it('returns a handle with mcp + coord + run + close', () => {
     const handle = createMcpServer({
-      root: coordRoot,
+      root: stRoot,
       identity: asIdentity('alice'),
     });
     expect(handle.mcp).toBeDefined();
@@ -66,10 +66,10 @@ describe('createMcpServer — construction', () => {
 
   it('threads root + identity through to the embedded Coord', () => {
     const handle = createMcpServer({
-      root: coordRoot,
+      root: stRoot,
       identity: asIdentity('alice'),
     });
-    expect(handle.coord.root).toBe(coordRoot);
+    expect(handle.coord.root).toBe(stRoot);
     expect(handle.coord.identity).toBe('alice');
   });
 
@@ -77,7 +77,7 @@ describe('createMcpServer — construction', () => {
     const cfg = join(scratch, 'cfg');
     mkdirSync(cfg);
     const handle = createMcpServer({
-      root: coordRoot,
+      root: stRoot,
       identity: asIdentity('alice'),
       configRoot: cfg,
     });
@@ -87,7 +87,7 @@ describe('createMcpServer — construction', () => {
   it('throws if identity is invalid (asIdentity catches in createCoord)', () => {
     expect(() =>
       createMcpServer({
-        root: coordRoot,
+        root: stRoot,
         identity: 'INVALID' as unknown as ReturnType<typeof asIdentity>,
       })
     ).toThrowError(/invalid (agent name|identity)/);
@@ -98,7 +98,7 @@ describe('createMcpServer — construction', () => {
 
 describe('createMcpServer — capability declaration', () => {
   it('SERVER_INFO carries the canonical name + version', () => {
-    expect(SERVER_INFO.name).toBe('coord');
+    expect(SERVER_INFO.name).toBe('st');
     expect(typeof SERVER_INFO.version).toBe('string');
     expect(SERVER_INFO.version.length).toBeGreaterThan(0);
   });
@@ -114,7 +114,7 @@ describe('createMcpServer — capability declaration', () => {
     const { client, handle } = await connectInMemory();
     try {
       const v = client.getServerVersion();
-      expect(v?.name).toBe('coord');
+      expect(v?.name).toBe('st');
       expect(typeof v?.version).toBe('string');
     } finally {
       await handle.close();

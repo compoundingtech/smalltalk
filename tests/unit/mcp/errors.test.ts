@@ -97,7 +97,7 @@ describe('coordErrorToToolResult — non-CoordError fallback', () => {
     const r = coordErrorToToolResult(new IdentityRequiredError());
     expect(r._meta?.['coord/error']).toEqual({
       code: 'IDENTITY_REQUIRED',
-      message: expect.stringContaining('COORD_IDENTITY'),
+      message: expect.stringContaining('ST_AGENT'),
     });
   });
 

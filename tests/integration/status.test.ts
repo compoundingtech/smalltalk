@@ -37,7 +37,7 @@ d('status round-trip across machines', () => {
 
   it('A sets status; sync; B reads the new state', () => {
     const set = runCoord(['status', '--set', 'busy'], {
-      coordRoot: A,
+      stRoot: A,
       coordIdentity: 'alice',
     });
     expect(set.exitCode).toBe(0);
@@ -45,14 +45,14 @@ d('status round-trip across machines', () => {
     expect(readFileSync(join(A, 'alice', 'status'), 'utf8')).toBe('busy\n');
 
     runCoord(['sync', 'push', `local:${B}`], {
-      coordRoot: A,
+      stRoot: A,
       coordIdentity: 'alice',
     });
 
     // B can read alice's status via its synced view of alice's folder.
     expect(existsSync(join(B, 'alice', 'status'))).toBe(true);
     const get = runCoord(['status', 'alice'], {
-      coordRoot: B,
+      stRoot: B,
       coordIdentity: 'bob',
     });
     expect(get.exitCode).toBe(0);
@@ -61,7 +61,7 @@ d('status round-trip across machines', () => {
 
   it('B status defaults to offline when no status file exists', () => {
     const r = runCoord(['status'], {
-      coordRoot: B,
+      stRoot: B,
       coordIdentity: 'bob',
     });
     expect(r.exitCode).toBe(0);
@@ -71,18 +71,18 @@ d('status round-trip across machines', () => {
 
   it('A sets offline; sync; B still reads offline (default == explicit)', () => {
     runCoord(['status', '--set', 'offline'], {
-      coordRoot: A,
+      stRoot: A,
       coordIdentity: 'alice',
     });
     expect(readFileSync(join(A, 'alice', 'status'), 'utf8')).toBe('offline\n');
 
     runCoord(['sync', 'push', `local:${B}`], {
-      coordRoot: A,
+      stRoot: A,
       coordIdentity: 'alice',
     });
 
     const get = runCoord(['status', 'alice'], {
-      coordRoot: B,
+      stRoot: B,
       coordIdentity: 'bob',
     });
     expect(get.exitCode).toBe(0);
@@ -91,28 +91,28 @@ d('status round-trip across machines', () => {
 
   it('bidirectional: both machines set their own status, both files survive', () => {
     runCoord(['status', '--set', 'busy'], {
-      coordRoot: A,
+      stRoot: A,
       coordIdentity: 'alice',
     });
     runCoord(['status', '--set', 'dnd'], {
-      coordRoot: B,
+      stRoot: B,
       coordIdentity: 'bob',
     });
 
     runCoord(['sync', 'push', `local:${B}`], {
-      coordRoot: A,
+      stRoot: A,
       coordIdentity: 'alice',
     });
     runCoord(['sync', 'pull', `local:${B}`], {
-      coordRoot: A,
+      stRoot: A,
       coordIdentity: 'alice',
     });
     runCoord(['sync', 'push', `local:${A}`], {
-      coordRoot: B,
+      stRoot: B,
       coordIdentity: 'bob',
     });
     runCoord(['sync', 'pull', `local:${A}`], {
-      coordRoot: B,
+      stRoot: B,
       coordIdentity: 'bob',
     });
 
@@ -130,7 +130,7 @@ d('status round-trip across machines', () => {
       'garbage\n'
     );
     const r = runCoord(['status'], {
-      coordRoot: B,
+      stRoot: B,
       coordIdentity: 'bob',
     });
     expect(r.exitCode).toBe(0);
@@ -143,12 +143,12 @@ d('status round-trip across machines', () => {
       'BUSY\n' // uppercase = not a valid state per LAYOUT
     );
     runCoord(['sync', 'push', `local:${B}`], {
-      coordRoot: A,
+      stRoot: A,
       coordIdentity: 'alice',
     });
 
     const r = runCoord(['status', 'alice'], {
-      coordRoot: B,
+      stRoot: B,
       coordIdentity: 'bob',
     });
     expect(r.exitCode).toBe(0);

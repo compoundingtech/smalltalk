@@ -36,7 +36,7 @@ interface ChannelNotification {
 }
 
 let scratch: string;
-let coordRoot: string;
+let stRoot: string;
 let inbox: string;
 let client: Client;
 let handle: ReturnType<typeof createMcpServer>;
@@ -44,15 +44,15 @@ let received: ChannelNotification[];
 
 beforeEach(async () => {
   scratch = mkdtempSync(join(tmpdir(), 'coord-mcp-cwatch-'));
-  coordRoot = join(scratch, 'coord');
+  stRoot = join(scratch, 'coord');
   for (const id of ['alice', 'bob']) {
-    mkdirSync(join(coordRoot, id, 'inbox'), { recursive: true });
-    mkdirSync(join(coordRoot, id, 'archive'), { recursive: true });
+    mkdirSync(join(stRoot, id, 'inbox'), { recursive: true });
+    mkdirSync(join(stRoot, id, 'archive'), { recursive: true });
   }
-  inbox = join(coordRoot, 'alice', 'inbox');
+  inbox = join(stRoot, 'alice', 'inbox');
 
   handle = createMcpServer({
-    root: coordRoot,
+    root: stRoot,
     identity: asIdentity('alice'),
     channel: true,
     // Force polling: vitest's parallel pool starves macOS FSEvents
@@ -273,7 +273,7 @@ describe('channel-watcher — archive twin behavior', () => {
   it('byte-identical inbox+archive twin → notification STILL fires (no pre-emit sweep)', async () => {
     const filename = '1714826789080-hhhhhh.md';
     const bytes = '---\nfrom: bob\n---\nzombie\n';
-    writeFileSync(join(coordRoot, 'alice', 'archive', filename), bytes);
+    writeFileSync(join(stRoot, 'alice', 'archive', filename), bytes);
     writeFileSync(join(inbox, filename), bytes);
     // Spurious notification will fire; recipient's lazy-read sweep
     // is responsible for cleaning up the inbox copy on next access.
@@ -284,7 +284,7 @@ describe('channel-watcher — archive twin behavior', () => {
   it('divergent inbox/archive copies → notification fires for the inbox version', async () => {
     const filename = '1714826789090-iiiiii.md';
     writeFileSync(
-      join(coordRoot, 'alice', 'archive', filename),
+      join(stRoot, 'alice', 'archive', filename),
       '---\nfrom: bob\n---\narchived version\n'
     );
     writeFileSync(
@@ -605,14 +605,14 @@ describe('channel-watcher — chokidar + backstop dedup (brief-020 HB-4)', () =>
 
 describe('channel-watcher — runWith lifecycle', () => {
   let scratch2: string;
-  let coordRoot2: string;
+  let stRoot2: string;
 
   beforeEach(() => {
     scratch2 = mkdtempSync(join(tmpdir(), 'coord-mcp-rw-'));
-    coordRoot2 = join(scratch2, 'coord');
+    stRoot2 = join(scratch2, 'coord');
     for (const id of ['alice', 'bob']) {
-      mkdirSync(join(coordRoot2, id, 'inbox'), { recursive: true });
-      mkdirSync(join(coordRoot2, id, 'archive'), { recursive: true });
+      mkdirSync(join(stRoot2, id, 'inbox'), { recursive: true });
+      mkdirSync(join(stRoot2, id, 'archive'), { recursive: true });
     }
   });
   afterEach(() => {
@@ -621,7 +621,7 @@ describe('channel-watcher — runWith lifecycle', () => {
 
   it('host closing the transport → runWith resolves and the watcher is torn down', async () => {
     const h = createMcpServer({
-      root: coordRoot2,
+      root: stRoot2,
       identity: asIdentity('alice'),
       channel: true,
       channelWatcherOptions: { usePolling: true, pollInterval: 20 },
@@ -648,7 +648,7 @@ describe('channel-watcher — runWith lifecycle', () => {
 
     // Sanity: the watcher fires before close.
     writeFileSync(
-      join(coordRoot2, 'alice', 'inbox', '1714826789010-aaaaaa.md'),
+      join(stRoot2, 'alice', 'inbox', '1714826789010-aaaaaa.md'),
       '---\nfrom: bob\n---\nbefore close\n'
     );
     const deadline = Date.now() + 3000;
@@ -678,7 +678,7 @@ describe('channel-watcher — runWith lifecycle', () => {
     // No further notifications should fire from new inbox arrivals.
     await h.close();
     writeFileSync(
-      join(coordRoot2, 'alice', 'inbox', '1714826789020-bbbbbb.md'),
+      join(stRoot2, 'alice', 'inbox', '1714826789020-bbbbbb.md'),
       '---\nfrom: bob\n---\nafter close\n'
     );
     await new Promise((r) => setTimeout(r, 200));

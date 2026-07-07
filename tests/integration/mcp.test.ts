@@ -37,7 +37,7 @@ interface CallResult {
 }
 
 /**
- * Spawn `bin/coord mcp` once per describe. The COORD_ROOT env is
+ * Spawn `bin/coord mcp` once per describe. The ST_ROOT env is
  * pinned at boot — per-test isolation comes from each test using a
  * fresh subdirectory under that root and asking for it via the
  * `identity` arg in tool calls.
@@ -46,7 +46,7 @@ interface CallResult {
  * coord's MCP server is stateless given a clean root (the Coord
  * factory has no per-call mutable state beyond the filesystem).
  */
-async function bootSubprocess(coordRoot: string): Promise<{
+async function bootSubprocess(stRoot: string): Promise<{
   client: Client;
   transport: StdioClientTransport;
   shutdown: () => Promise<void>;
@@ -57,8 +57,8 @@ async function bootSubprocess(coordRoot: string): Promise<{
     env: {
       PATH: process.env.PATH ?? '',
       HOME: process.env.HOME ?? '',
-      COORD_ROOT: coordRoot,
-      COORD_IDENTITY: 'alice',
+      ST_ROOT: stRoot,
+      ST_AGENT: 'alice',
     },
     stderr: 'pipe',
   });
@@ -90,16 +90,16 @@ function setupIdentity(root: string, id: string): void {
 // ─── Lifecycle: server boots and responds ──────────────────────────────
 
 describe('mcp integration — lifecycle', () => {
-  let coordRoot: string;
+  let stRoot: string;
   let client: Client;
   let shutdown: () => Promise<void>;
 
   beforeAll(async () => {
-    coordRoot = mkScratch();
-    mkdirSync(coordRoot, { recursive: true });
-    setupIdentity(coordRoot, 'alice');
-    setupIdentity(coordRoot, 'bob');
-    const r = await bootSubprocess(coordRoot);
+    stRoot = mkScratch();
+    mkdirSync(stRoot, { recursive: true });
+    setupIdentity(stRoot, 'alice');
+    setupIdentity(stRoot, 'bob');
+    const r = await bootSubprocess(stRoot);
     client = r.client;
     shutdown = r.shutdown;
   }, 30_000);
@@ -107,14 +107,14 @@ describe('mcp integration — lifecycle', () => {
   afterAll(async () => {
     await shutdown();
     try {
-      rmSync(coordRoot, { recursive: true, force: true });
+      rmSync(stRoot, { recursive: true, force: true });
     } catch {
       // best-effort
     }
   });
 
   it('initialize handshake completes; serverInfo + capabilities advertised', () => {
-    expect(client.getServerVersion()?.name).toBe('coord');
+    expect(client.getServerVersion()?.name).toBe('st');
     expect(client.getServerCapabilities()?.tools).toBeDefined();
   });
 
@@ -169,22 +169,22 @@ describe('mcp integration — lifecycle', () => {
 // ─── st_msg_send end-to-end ─────────────────────────────────────────────
 
 describe('mcp integration — st_msg_send', () => {
-  let coordRoot: string;
+  let stRoot: string;
   let client: Client;
   let shutdown: () => Promise<void>;
 
   beforeAll(async () => {
-    coordRoot = mkScratch();
-    mkdirSync(coordRoot, { recursive: true });
-    setupIdentity(coordRoot, 'alice');
-    setupIdentity(coordRoot, 'bob');
-    const r = await bootSubprocess(coordRoot);
+    stRoot = mkScratch();
+    mkdirSync(stRoot, { recursive: true });
+    setupIdentity(stRoot, 'alice');
+    setupIdentity(stRoot, 'bob');
+    const r = await bootSubprocess(stRoot);
     client = r.client;
     shutdown = r.shutdown;
   }, 30_000);
   afterAll(async () => {
     await shutdown();
-    rmSync(coordRoot, { recursive: true, force: true });
+    rmSync(stRoot, { recursive: true, force: true });
   });
 
   let driftToolCount: number;
@@ -202,9 +202,9 @@ describe('mcp integration — st_msg_send', () => {
     expect(r.isError).toBeUndefined();
     const filename = r.structuredContent?.filename as string;
     expect(filename).toMatch(/^[0-9]{13}-[0-9a-z]{6}\.md$/);
-    expect(existsSync(join(coordRoot, 'bob', 'inbox', filename))).toBe(true);
+    expect(existsSync(join(stRoot, 'bob', 'inbox', filename))).toBe(true);
     const text = readFileSync(
-      join(coordRoot, 'bob', 'inbox', filename),
+      join(stRoot, 'bob', 'inbox', filename),
       'utf8'
     );
     expect(text).toContain('from: alice');
@@ -241,22 +241,22 @@ describe('mcp integration — st_msg_send', () => {
 // ─── st_msg_ls end-to-end ───────────────────────────────────────────────
 
 describe('mcp integration — st_msg_ls', () => {
-  let coordRoot: string;
+  let stRoot: string;
   let client: Client;
   let shutdown: () => Promise<void>;
 
   beforeAll(async () => {
-    coordRoot = mkScratch();
-    mkdirSync(coordRoot, { recursive: true });
-    setupIdentity(coordRoot, 'alice');
-    setupIdentity(coordRoot, 'bob');
-    const r = await bootSubprocess(coordRoot);
+    stRoot = mkScratch();
+    mkdirSync(stRoot, { recursive: true });
+    setupIdentity(stRoot, 'alice');
+    setupIdentity(stRoot, 'bob');
+    const r = await bootSubprocess(stRoot);
     client = r.client;
     shutdown = r.shutdown;
   }, 30_000);
   afterAll(async () => {
     await shutdown();
-    rmSync(coordRoot, { recursive: true, force: true });
+    rmSync(stRoot, { recursive: true, force: true });
   });
 
   beforeEach(async () => {
@@ -299,22 +299,22 @@ describe('mcp integration — st_msg_ls', () => {
 // ─── st_msg_read + st_msg_archive end-to-end ─────────────────────────────
 
 describe('mcp integration — st_msg_read + st_msg_archive', () => {
-  let coordRoot: string;
+  let stRoot: string;
   let client: Client;
   let shutdown: () => Promise<void>;
 
   beforeAll(async () => {
-    coordRoot = mkScratch();
-    mkdirSync(coordRoot, { recursive: true });
-    setupIdentity(coordRoot, 'alice');
-    setupIdentity(coordRoot, 'bob');
-    const r = await bootSubprocess(coordRoot);
+    stRoot = mkScratch();
+    mkdirSync(stRoot, { recursive: true });
+    setupIdentity(stRoot, 'alice');
+    setupIdentity(stRoot, 'bob');
+    const r = await bootSubprocess(stRoot);
     client = r.client;
     shutdown = r.shutdown;
   }, 30_000);
   afterAll(async () => {
     await shutdown();
-    rmSync(coordRoot, { recursive: true, force: true });
+    rmSync(stRoot, { recursive: true, force: true });
   });
 
   it('round-trip: send → read → archive', async () => {
@@ -341,10 +341,10 @@ describe('mcp integration — st_msg_read + st_msg_archive', () => {
     });
     expect(archive.structuredContent?.outcome).toBe('moved');
     expect(
-      existsSync(join(coordRoot, 'bob', 'inbox', filename))
+      existsSync(join(stRoot, 'bob', 'inbox', filename))
     ).toBe(false);
     expect(
-      existsSync(join(coordRoot, 'bob', 'archive', filename))
+      existsSync(join(stRoot, 'bob', 'archive', filename))
     ).toBe(true);
   });
 
@@ -358,8 +358,8 @@ describe('mcp integration — st_msg_read + st_msg_archive', () => {
 
   it('st_msg_archive case-3 divergent twin → ARCHIVE_CONFLICT', async () => {
     const f = '1714826789999-aaaaaa.md';
-    writeFileSync(join(coordRoot, 'bob', 'inbox', f), 'inbox-version');
-    writeFileSync(join(coordRoot, 'bob', 'archive', f), 'archive-version');
+    writeFileSync(join(stRoot, 'bob', 'inbox', f), 'inbox-version');
+    writeFileSync(join(stRoot, 'bob', 'archive', f), 'archive-version');
     const r = await callTool(client, 'st_msg_archive', {
       filename: f,
       identity: 'bob',
@@ -371,22 +371,22 @@ describe('mcp integration — st_msg_read + st_msg_archive', () => {
 // ─── st_msg_thread end-to-end ───────────────────────────────────────────
 
 describe('mcp integration — st_msg_thread', () => {
-  let coordRoot: string;
+  let stRoot: string;
   let client: Client;
   let shutdown: () => Promise<void>;
 
   beforeAll(async () => {
-    coordRoot = mkScratch();
-    mkdirSync(coordRoot, { recursive: true });
-    setupIdentity(coordRoot, 'alice');
-    setupIdentity(coordRoot, 'bob');
-    const r = await bootSubprocess(coordRoot);
+    stRoot = mkScratch();
+    mkdirSync(stRoot, { recursive: true });
+    setupIdentity(stRoot, 'alice');
+    setupIdentity(stRoot, 'bob');
+    const r = await bootSubprocess(stRoot);
     client = r.client;
     shutdown = r.shutdown;
   }, 30_000);
   afterAll(async () => {
     await shutdown();
-    rmSync(coordRoot, { recursive: true, force: true });
+    rmSync(stRoot, { recursive: true, force: true });
   });
 
   it('walks a 3-message linear chain', async () => {
@@ -472,21 +472,21 @@ describe('mcp integration — st_msg_thread', () => {
 // ─── Error-shape regression across stdio ───────────────────────────────
 
 describe('mcp integration — error response shape over real stdio', () => {
-  let coordRoot: string;
+  let stRoot: string;
   let client: Client;
   let shutdown: () => Promise<void>;
 
   beforeAll(async () => {
-    coordRoot = mkScratch();
-    mkdirSync(coordRoot, { recursive: true });
-    setupIdentity(coordRoot, 'alice');
-    const r = await bootSubprocess(coordRoot);
+    stRoot = mkScratch();
+    mkdirSync(stRoot, { recursive: true });
+    setupIdentity(stRoot, 'alice');
+    const r = await bootSubprocess(stRoot);
     client = r.client;
     shutdown = r.shutdown;
   }, 30_000);
   afterAll(async () => {
     await shutdown();
-    rmSync(coordRoot, { recursive: true, force: true });
+    rmSync(stRoot, { recursive: true, force: true });
   });
 
   it('CoordError → isError + content[0].text starts with code + _meta["coord/error"]', async () => {
@@ -504,25 +504,25 @@ describe('mcp integration — error response shape over real stdio', () => {
 // ─── st_agents end-to-end ──────────────────────────────────────────
 
 describe('mcp integration — st_agents', () => {
-  let coordRoot: string;
+  let stRoot: string;
   let client: Client;
   let shutdown: () => Promise<void>;
 
   beforeAll(async () => {
-    coordRoot = mkScratch();
-    mkdirSync(coordRoot, { recursive: true });
-    setupIdentity(coordRoot, 'alice');
-    setupIdentity(coordRoot, 'bob');
-    setupIdentity(coordRoot, 'carol');
-    writeFileSync(join(coordRoot, 'alice', 'status'), 'available\n');
-    writeFileSync(join(coordRoot, 'bob', 'status'), 'busy\n');
-    const r = await bootSubprocess(coordRoot);
+    stRoot = mkScratch();
+    mkdirSync(stRoot, { recursive: true });
+    setupIdentity(stRoot, 'alice');
+    setupIdentity(stRoot, 'bob');
+    setupIdentity(stRoot, 'carol');
+    writeFileSync(join(stRoot, 'alice', 'status'), 'available\n');
+    writeFileSync(join(stRoot, 'bob', 'status'), 'busy\n');
+    const r = await bootSubprocess(stRoot);
     client = r.client;
     shutdown = r.shutdown;
   }, 30_000);
   afterAll(async () => {
     await shutdown();
-    rmSync(coordRoot, { recursive: true, force: true });
+    rmSync(stRoot, { recursive: true, force: true });
   });
 
   interface MemberShape {

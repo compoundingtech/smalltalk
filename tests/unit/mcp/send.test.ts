@@ -19,19 +19,19 @@ import { errorCode, errorPayload } from "./_helpers.ts";
 import { asIdentity } from '../../../src/types.ts';
 
 let scratch: string;
-let coordRoot: string;
+let stRoot: string;
 let client: Client;
 let handle: ReturnType<typeof createMcpServer>;
 
 beforeEach(async () => {
   scratch = mkdtempSync(join(tmpdir(), 'coord-mcp-send-'));
-  coordRoot = join(scratch, 'coord');
-  mkdirSync(join(coordRoot, 'alice', 'inbox'), { recursive: true });
-  mkdirSync(join(coordRoot, 'alice', 'archive'), { recursive: true });
-  mkdirSync(join(coordRoot, 'bob', 'inbox'), { recursive: true });
-  mkdirSync(join(coordRoot, 'bob', 'archive'), { recursive: true });
+  stRoot = join(scratch, 'coord');
+  mkdirSync(join(stRoot, 'alice', 'inbox'), { recursive: true });
+  mkdirSync(join(stRoot, 'alice', 'archive'), { recursive: true });
+  mkdirSync(join(stRoot, 'bob', 'inbox'), { recursive: true });
+  mkdirSync(join(stRoot, 'bob', 'archive'), { recursive: true });
   handle = createMcpServer({
-    root: coordRoot,
+    root: stRoot,
     identity: asIdentity('alice'),
   });
   client = new Client({ name: 'test-send', version: '1.0' });
@@ -86,7 +86,7 @@ describe('st_msg_send — happy paths', () => {
     const filename = r.structuredContent?.filename as string;
     expect(filename).toMatch(/^[0-9]{13}-[0-9a-z]{6}\.md$/);
     expect(r.structuredContent?.identity).toBe('bob');
-    expect(existsSync(join(coordRoot, 'bob', 'inbox', filename))).toBe(true);
+    expect(existsSync(join(stRoot, 'bob', 'inbox', filename))).toBe(true);
   });
 
   it('full options: subject + tags + priority + inReplyTo + from', async () => {
@@ -102,7 +102,7 @@ describe('st_msg_send — happy paths', () => {
     expect(r.isError).toBeUndefined();
     const filename = r.structuredContent?.filename as string;
     const text = readFileSync(
-      join(coordRoot, 'bob', 'inbox', filename),
+      join(stRoot, 'bob', 'inbox', filename),
       'utf8'
     );
     expect(text).toContain('from: alice');
@@ -116,7 +116,7 @@ describe('st_msg_send — happy paths', () => {
     const r = await call({ to: 'bob', body: 'msg' });
     const filename = r.structuredContent?.filename as string;
     const text = readFileSync(
-      join(coordRoot, 'bob', 'inbox', filename),
+      join(stRoot, 'bob', 'inbox', filename),
       'utf8'
     );
     expect(text).toContain('from: alice');
@@ -128,7 +128,7 @@ describe('st_msg_send — happy paths', () => {
     const r = await call({ to: 'alice', body: 'm', from: 'bob' });
     const filename = r.structuredContent?.filename as string;
     const text = readFileSync(
-      join(coordRoot, 'alice', 'inbox', filename),
+      join(stRoot, 'alice', 'inbox', filename),
       'utf8'
     );
     expect(text).toContain('from: bob');
@@ -218,7 +218,7 @@ describe('st_msg_send — typed error mapping', () => {
     const r = await call({
       to: 'bob',
       body: 'm',
-      inReplyTo: '1714826789012-myobie-abcdef.md',
+      inReplyTo: '1714826789012-operator-abcdef.md',
     });
     expect(errorCode(r)).toBe('INVALID_FILENAME');
   });
@@ -261,7 +261,7 @@ describe('st_msg_send — content + edge cases', () => {
       subject: 'auth: drop legacy cookie',
     });
     const f = r.structuredContent?.filename as string;
-    const text = readFileSync(join(coordRoot, 'bob', 'inbox', f), 'utf8');
+    const text = readFileSync(join(stRoot, 'bob', 'inbox', f), 'utf8');
     expect(text).toContain('subject: "auth: drop legacy cookie"');
   });
 
@@ -272,7 +272,7 @@ describe('st_msg_send — content + edge cases', () => {
       subject: 'line1\nline2',
     });
     const f = r.structuredContent?.filename as string;
-    const text = readFileSync(join(coordRoot, 'bob', 'inbox', f), 'utf8');
+    const text = readFileSync(join(stRoot, 'bob', 'inbox', f), 'utf8');
     expect(text).toContain('subject: "line1\\nline2"');
   });
 
@@ -281,7 +281,7 @@ describe('st_msg_send — content + edge cases', () => {
     const r = await call({ to: 'bob', body });
     expect(r.isError).toBeUndefined();
     const f = r.structuredContent?.filename as string;
-    const text = readFileSync(join(coordRoot, 'bob', 'inbox', f), 'utf8');
+    const text = readFileSync(join(stRoot, 'bob', 'inbox', f), 'utf8');
     expect(text.endsWith(`${body}\n`)).toBe(true);
   });
 
@@ -292,7 +292,7 @@ describe('st_msg_send — content + edge cases', () => {
       tags: ['has space', 'simple'],
     });
     const f = r.structuredContent?.filename as string;
-    const text = readFileSync(join(coordRoot, 'bob', 'inbox', f), 'utf8');
+    const text = readFileSync(join(stRoot, 'bob', 'inbox', f), 'utf8');
     // "has space" needs quoting; "simple" stays plain — mixed flow list.
     expect(text).toContain('tags: ["has space", simple]');
   });

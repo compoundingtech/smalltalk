@@ -53,7 +53,7 @@ const EXTENSION_SRC = join(REPO_ROOT, 'examples', 'pi', 'coord.ts');
 const LIVE = process.env.COORD_RUN_LIVE_PI === '1';
 
 let scratch: string;
-let coordRoot: string;
+let stRoot: string;
 let extDir: string;
 let ptySessionDir: string;
 let piSessionsDirBefore: Set<string>;
@@ -87,10 +87,10 @@ beforeEach(() => {
   mkdirSync(ptySessionDir, { recursive: true });
 
   scratch = mkdtempSync(join(tmpdir(), 'coord-pi-it-'));
-  coordRoot = join(scratch, 'coord');
+  stRoot = join(scratch, 'coord');
   for (const id of ['alice', 'bob']) {
-    mkdirSync(join(coordRoot, id, 'inbox'), { recursive: true });
-    mkdirSync(join(coordRoot, id, 'archive'), { recursive: true });
+    mkdirSync(join(stRoot, id, 'inbox'), { recursive: true });
+    mkdirSync(join(stRoot, id, 'archive'), { recursive: true });
   }
 
   // The extension lives under scratch (not in $HOME/.pi/...) — we
@@ -122,9 +122,9 @@ beforeEach(() => {
     })
   );
   const nm = join(extDir, 'node_modules');
-  mkdirSync(join(nm, '@myobie'), { recursive: true });
+  mkdirSync(join(nm, '@operator'), { recursive: true });
   mkdirSync(join(nm, '@mariozechner'), { recursive: true });
-  symlinkSync(REPO_ROOT, join(nm, '@myobie', 'coord'));
+  symlinkSync(REPO_ROOT, join(nm, '@operator', 'coord'));
   symlinkSync(
     join(REPO_ROOT, 'node_modules', 'typebox'),
     join(nm, 'typebox')
@@ -177,7 +177,7 @@ async function pollForReply(
   predicate: (filename: string, parsed: { fm: string; body: string }) => boolean,
   timeoutMs: number
 ): Promise<{ filename: string; fm: string; body: string }> {
-  const dir = join(coordRoot, recipient, 'inbox');
+  const dir = join(stRoot, recipient, 'inbox');
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     if (existsSync(dir)) {
@@ -233,8 +233,8 @@ describe.skipIf(!LIVE)('pi extension — live agent end-to-end', () => {
           env: {
             HOME: process.env.HOME!,
             PATH: path,
-            COORD_ROOT: coordRoot,
-            COORD_IDENTITY: 'bob',
+            ST_ROOT: stRoot,
+            ST_AGENT: 'bob',
             PTY_SESSION_DIR: ptySessionDir,
             ...providerEnv,
           },
@@ -251,7 +251,7 @@ describe.skipIf(!LIVE)('pi extension — live agent end-to-end', () => {
       // st_msg_reply (that's MCP channel-mode only).
       const original = '1714826789010-aaaaaa.md';
       writeFileSync(
-        join(coordRoot, 'bob', 'inbox', original),
+        join(stRoot, 'bob', 'inbox', original),
         '---\nfrom: alice\nsubject: math\n---\n' +
           'what is 2+2? Use the st_msg_send tool with to=alice, ' +
           `inReplyTo=${original}, and your answer as the body.\n`

@@ -36,15 +36,15 @@ function jqAvailable(): boolean {
 const HAS_JQ = jqAvailable();
 
 let scratch: string;
-let coordRoot: string;
+let stRoot: string;
 let stateHome: string;
 
 beforeEach(() => {
   scratch = mkdtempSync(join(tmpdir(), 'coord-it-codex-'));
-  coordRoot = join(scratch, 'coord');
+  stRoot = join(scratch, 'coord');
   for (const id of ['alice', 'bob']) {
-    mkdirSync(join(coordRoot, id, 'inbox'), { recursive: true });
-    mkdirSync(join(coordRoot, id, 'archive'), { recursive: true });
+    mkdirSync(join(stRoot, id, 'inbox'), { recursive: true });
+    mkdirSync(join(stRoot, id, 'archive'), { recursive: true });
   }
   stateHome = join(scratch, 'state');
   mkdirSync(stateHome, { recursive: true });
@@ -63,7 +63,7 @@ function plant(
     .map(([k, v]) => `${k}: ${v}`)
     .join('\n');
   writeFileSync(
-    join(coordRoot, identity, 'inbox', filename),
+    join(stRoot, identity, 'inbox', filename),
     `---\n${head}\n---\n${body}\n`
   );
 }
@@ -109,8 +109,8 @@ describe.skipIf(!HAS_JQ)('codex hooks — session-start.sh', () => {
     plant('bob', '1714826789020-bbbbbb.md', { from: 'alice' }, 'ping');
 
     const r = runHook(SESSION_START_SH, {
-      COORD_ROOT: coordRoot,
-      COORD_IDENTITY: 'bob',
+      ST_ROOT: stRoot,
+      ST_AGENT: 'bob',
     });
 
     expect(r.exitCode).toBe(0);
@@ -119,7 +119,7 @@ describe.skipIf(!HAS_JQ)('codex hooks — session-start.sh', () => {
       continue: boolean;
     };
     expect(payload.continue).toBe(true);
-    expect(payload.additionalContext).toContain('## coord inbox (2 unread)');
+    expect(payload.additionalContext).toContain('## st inbox (2 unread)');
     expect(payload.additionalContext).toContain('1714826789010-aaaaaa.md');
     expect(payload.additionalContext).toContain('1714826789020-bbbbbb.md');
     expect(payload.additionalContext).toContain('Subject: deploy question');
@@ -128,35 +128,35 @@ describe.skipIf(!HAS_JQ)('codex hooks — session-start.sh', () => {
 
   it('empty inbox → silent stdout, exit 0', () => {
     const r = runHook(SESSION_START_SH, {
-      COORD_ROOT: coordRoot,
-      COORD_IDENTITY: 'bob',
+      ST_ROOT: stRoot,
+      ST_AGENT: 'bob',
     });
     expect(r.exitCode).toBe(0);
     expect(r.stdout).toBe('');
   });
 
-  it('missing COORD_ROOT → exit non-zero, stderr message, stdout silent', () => {
-    const r = runHook(SESSION_START_SH, { COORD_IDENTITY: 'bob' });
+  it('missing ST_ROOT → exit non-zero, stderr message, stdout silent', () => {
+    const r = runHook(SESSION_START_SH, { ST_AGENT: 'bob' });
     expect(r.exitCode).not.toBe(0);
     expect(r.stdout).toBe('');
-    expect(r.stderr).toContain('COORD_ROOT not set');
+    expect(r.stderr).toContain('ST_ROOT not set');
   });
 
-  it('missing COORD_IDENTITY → exit non-zero, stderr message, stdout silent', () => {
-    const r = runHook(SESSION_START_SH, { COORD_ROOT: coordRoot });
+  it('missing ST_AGENT → exit non-zero, stderr message, stdout silent', () => {
+    const r = runHook(SESSION_START_SH, { ST_ROOT: stRoot });
     expect(r.exitCode).not.toBe(0);
     expect(r.stdout).toBe('');
-    expect(r.stderr).toContain('COORD_IDENTITY not set');
+    expect(r.stderr).toContain('ST_AGENT not set');
   });
 
   it('files without `from:` still appear with from=unknown', () => {
     writeFileSync(
-      join(coordRoot, 'bob', 'inbox', '1714826789010-aaaaaa.md'),
+      join(stRoot, 'bob', 'inbox', '1714826789010-aaaaaa.md'),
       'no fence here, just words\n'
     );
     const r = runHook(SESSION_START_SH, {
-      COORD_ROOT: coordRoot,
-      COORD_IDENTITY: 'bob',
+      ST_ROOT: stRoot,
+      ST_AGENT: 'bob',
     });
     expect(r.exitCode).toBe(0);
     const payload = JSON.parse(r.stdout) as { additionalContext: string };
@@ -172,8 +172,8 @@ describe.skipIf(!HAS_JQ)('codex hooks — stop.sh', () => {
     plant('bob', '1714826789010-aaaaaa.md', { from: 'alice' }, 'msg');
 
     const env = {
-      COORD_ROOT: coordRoot,
-      COORD_IDENTITY: 'bob',
+      ST_ROOT: stRoot,
+      ST_AGENT: 'bob',
       XDG_STATE_HOME: stateHome,
     };
 
@@ -194,17 +194,17 @@ describe.skipIf(!HAS_JQ)('codex hooks — stop.sh', () => {
     expect(second.stdout).toBe('');
   });
 
-  it('creates and updates state file at $XDG_STATE_HOME/coord-codex-hooks/last-checked.txt', () => {
+  it('creates and updates state file at $XDG_STATE_HOME/st-codex-hooks/last-checked.txt', () => {
     const stateFile = join(
       stateHome,
-      'coord-codex-hooks',
+      'st-codex-hooks',
       'last-checked.txt'
     );
     expect(existsSync(stateFile)).toBe(false);
 
     runHook(STOP_SH, {
-      COORD_ROOT: coordRoot,
-      COORD_IDENTITY: 'bob',
+      ST_ROOT: stRoot,
+      ST_AGENT: 'bob',
       XDG_STATE_HOME: stateHome,
     });
 
@@ -217,8 +217,8 @@ describe.skipIf(!HAS_JQ)('codex hooks — stop.sh', () => {
     // Sleep 5ms so the unix-ms timestamps are distinguishable.
     spawnSync('sleep', ['0.005']);
     runHook(STOP_SH, {
-      COORD_ROOT: coordRoot,
-      COORD_IDENTITY: 'bob',
+      ST_ROOT: stRoot,
+      ST_AGENT: 'bob',
       XDG_STATE_HOME: stateHome,
     });
     const second = readFileSync(stateFile, 'utf8').trim();
@@ -227,8 +227,8 @@ describe.skipIf(!HAS_JQ)('codex hooks — stop.sh', () => {
 
   it('files arriving AFTER the cursor are reported on the next Stop', () => {
     const env = {
-      COORD_ROOT: coordRoot,
-      COORD_IDENTITY: 'bob',
+      ST_ROOT: stRoot,
+      ST_AGENT: 'bob',
       XDG_STATE_HOME: stateHome,
     };
 
@@ -236,7 +236,7 @@ describe.skipIf(!HAS_JQ)('codex hooks — stop.sh', () => {
     runHook(STOP_SH, env);
     const stateFile = join(
       stateHome,
-      'coord-codex-hooks',
+      'st-codex-hooks',
       'last-checked.txt'
     );
     const cursor = Number(readFileSync(stateFile, 'utf8').trim());
@@ -252,14 +252,14 @@ describe.skipIf(!HAS_JQ)('codex hooks — stop.sh', () => {
     expect(payload.additionalContext).toContain(fname);
   });
 
-  it('missing COORD_ROOT → exit non-zero, stderr message, stdout silent', () => {
+  it('missing ST_ROOT → exit non-zero, stderr message, stdout silent', () => {
     const r = runHook(STOP_SH, {
-      COORD_IDENTITY: 'bob',
+      ST_AGENT: 'bob',
       XDG_STATE_HOME: stateHome,
     });
     expect(r.exitCode).not.toBe(0);
     expect(r.stdout).toBe('');
-    expect(r.stderr).toContain('COORD_ROOT not set');
+    expect(r.stderr).toContain('ST_ROOT not set');
   });
 });
 

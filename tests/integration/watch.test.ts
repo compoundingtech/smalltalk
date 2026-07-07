@@ -1,4 +1,4 @@
-// tests/integration/watch.test.ts — `coord watch` driven through a real PTY.
+// tests/integration/watch.test.ts — `st watch` driven through a real PTY.
 //
 // Uses @myobie/pty/testing's Session.spawn so we exercise the actual long-
 // running polling loop, real filesystem polling, real signal handling.
@@ -61,7 +61,7 @@ describe('coord watch <id> — per-identity', () => {
     const s = track(
       runCoordPty(
         ['watch', 'alice', '--interval', '100'],
-        { coordRoot: root, coordIdentity: 'alice' }
+        { stRoot: root, coordIdentity: 'alice' }
       )
     );
     // Give the watcher a moment to start its replay phase against an empty
@@ -84,7 +84,7 @@ describe('coord watch --all — cross-tree', () => {
     const s = track(
       runCoordPty(
         ['watch', '--all', '--interval', '100'],
-        { coordRoot: root, coordIdentity: 'alice' }
+        { stRoot: root, coordIdentity: 'alice' }
       )
     );
 
@@ -102,13 +102,13 @@ describe('coord watch --all — cross-tree', () => {
     expect(ss.text).not.toContain(ownFilename);
   });
 
-  it('default (no --all, no positional) → watches $COORD_IDENTITY only', async () => {
+  it('default (no --all, no positional) → watches $ST_AGENT only', async () => {
     mkIdentity(root, 'alice');
     mkIdentity(root, 'bob');
     const s = track(
       runCoordPty(
         ['watch', '--interval', '100'],
-        { coordRoot: root, coordIdentity: 'alice' }
+        { stRoot: root, coordIdentity: 'alice' }
       )
     );
 
@@ -139,7 +139,7 @@ describe('coord watch --once', () => {
     const s = track(
       runCoordPty(
         ['watch', 'alice', '--once'],
-        { coordRoot: root, coordIdentity: 'alice' }
+        { stRoot: root, coordIdentity: 'alice' }
       )
     );
     await s.waitForText(filename, 5_000);
@@ -160,7 +160,7 @@ describe('coord watch --with-subject', () => {
     const s = track(
       runCoordPty(
         ['watch', 'alice', '--once', '--with-subject'],
-        { coordRoot: root, coordIdentity: 'alice' }
+        { stRoot: root, coordIdentity: 'alice' }
       )
     );
     // The line should look like "<filename>\thello there" — and after PTY
@@ -184,7 +184,7 @@ describe('coord watch --since-now', () => {
     const s = track(
       runCoordPty(
         ['watch', 'alice', '--since-now', '--interval', '100'],
-        { coordRoot: root, coordIdentity: 'alice' }
+        { stRoot: root, coordIdentity: 'alice' }
       )
     );
 
@@ -208,7 +208,7 @@ describe('coord watch — graceful shutdown', () => {
     mkIdentity(root, 'alice');
     const s = runCoordPty(
       ['watch', 'alice', '--interval', '100'],
-      { coordRoot: root, coordIdentity: 'alice' }
+      { stRoot: root, coordIdentity: 'alice' }
     );
     // Verify it's actually running before we kill it.
     await new Promise((r) => setTimeout(r, 200));

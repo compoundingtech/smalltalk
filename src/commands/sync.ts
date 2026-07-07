@@ -43,8 +43,8 @@ export interface SyncDeps {
 }
 
 export interface SyncContext {
-  coordRoot: string;
-  coordConfig: string;
+  stRoot: string;
+  stConfig: string;
   deps?: SyncDeps;
 }
 
@@ -69,7 +69,7 @@ export function resolvePeer(spec: string, ctx: SyncContext): string {
     return `${stripTrailingSlash(spec)}/`;
   }
   // Bare token: try peers.yaml alias first; else fall back to bare hostname.
-  const aliased = lookupPeerAlias(spec, ctx.coordConfig);
+  const aliased = lookupPeerAlias(spec, ctx.stConfig);
   if (aliased !== undefined) {
     return resolvePeer(aliased, ctx);
   }
@@ -113,8 +113,8 @@ export function parsePeersYaml(text: string): { name: string; spec: string }[] {
   return out;
 }
 
-function readPeersYaml(coordConfig: string): { name: string; spec: string }[] {
-  const cfg = join(coordConfig, 'peers.yaml');
+function readPeersYaml(stConfig: string): { name: string; spec: string }[] {
+  const cfg = join(stConfig, 'peers.yaml');
   if (!existsSync(cfg)) {
     throw new PeersConfigMissingError(cfg);
   }
@@ -127,9 +127,9 @@ function readPeersYaml(coordConfig: string): { name: string; spec: string }[] {
 
 function lookupPeerAlias(
   name: string,
-  coordConfig: string
+  stConfig: string
 ): string | undefined {
-  const cfg = join(coordConfig, 'peers.yaml');
+  const cfg = join(stConfig, 'peers.yaml');
   if (!existsSync(cfg)) return undefined;
   const peers = parsePeersYaml(readFileSync(cfg, 'utf8'));
   for (const p of peers) {
@@ -154,7 +154,7 @@ function defaultRunRsync(args: string[]): RsyncResult {
 // ─── sweep entry point (verbose) ────────────────────────────────────────
 
 export function cmdSyncSweep(ctx: SyncContext): { removed: number; summary: string } {
-  const r = sweep(ctx.coordRoot);
+  const r = sweep(ctx.stRoot);
   const summary =
     r.removed > 0
       ? `# sweep: removed ${r.removed} redundant inbox ${pluralize(r.removed, 'file', 'files')}`
@@ -174,29 +174,29 @@ export function cmdSyncPush(
   peerSpec: string,
   ctx: SyncContext
 ): PushPullResult {
-  if (!existsSync(ctx.coordRoot)) {
+  if (!existsSync(ctx.stRoot)) {
     throw new PeersConfigInvalidError(
-      ctx.coordRoot,
-      'no COORD_ROOT to push from'
+      ctx.stRoot,
+      'no ST_ROOT to push from'
     );
   }
   const banner = ctx.deps?.bannerSink ?? defaultBanner;
   const rsyncRoot = resolvePeer(peerSpec, ctx);
 
-  const before = sweep(ctx.coordRoot).removed;
-  banner(`# push: ${ctx.coordRoot}/ -> ${rsyncRoot}`);
+  const before = sweep(ctx.stRoot).removed;
+  banner(`# push: ${ctx.stRoot}/ -> ${rsyncRoot}`);
   const runRsync = ctx.deps?.runRsync ?? defaultRunRsync;
-  const r = runRsync([`${ctx.coordRoot}/`, rsyncRoot]);
+  const r = runRsync([`${ctx.stRoot}/`, rsyncRoot]);
   if (r.status !== 0) {
     if (r.stderr) banner(r.stderr.trimEnd());
     throw new SyncFailedError(
       'push',
       r.status,
       r.stderr,
-      `rsync push failed: ${ctx.coordRoot}/ -> ${rsyncRoot}`
+      `rsync push failed: ${ctx.stRoot}/ -> ${rsyncRoot}`
     );
   }
-  const after = sweep(ctx.coordRoot).removed;
+  const after = sweep(ctx.stRoot).removed;
   return { rsyncRoot, removedBefore: before, removedAfter: after };
 }
 
@@ -206,22 +206,22 @@ export function cmdSyncPull(
 ): PushPullResult {
   const banner = ctx.deps?.bannerSink ?? defaultBanner;
   const rsyncRoot = resolvePeer(peerSpec, ctx);
-  mkdirSync(ctx.coordRoot, { recursive: true });
+  mkdirSync(ctx.stRoot, { recursive: true });
 
-  const before = sweep(ctx.coordRoot).removed;
-  banner(`# pull: ${rsyncRoot} -> ${ctx.coordRoot}/`);
+  const before = sweep(ctx.stRoot).removed;
+  banner(`# pull: ${rsyncRoot} -> ${ctx.stRoot}/`);
   const runRsync = ctx.deps?.runRsync ?? defaultRunRsync;
-  const r = runRsync([rsyncRoot, `${ctx.coordRoot}/`]);
+  const r = runRsync([rsyncRoot, `${ctx.stRoot}/`]);
   if (r.status !== 0) {
     if (r.stderr) banner(r.stderr.trimEnd());
     throw new SyncFailedError(
       'pull',
       r.status,
       r.stderr,
-      `rsync pull failed: ${rsyncRoot} -> ${ctx.coordRoot}/`
+      `rsync pull failed: ${rsyncRoot} -> ${ctx.stRoot}/`
     );
   }
-  const after = sweep(ctx.coordRoot).removed;
+  const after = sweep(ctx.stRoot).removed;
   return { rsyncRoot, removedBefore: before, removedAfter: after };
 }
 
@@ -240,10 +240,10 @@ export function cmdSyncAllPull(ctx: SyncContext): FanOutResult {
   return fanOut('pull', ctx, (spec) => cmdSyncPull(spec, ctx));
 }
 
-/** push then pull for each peer (the aggressive `coord sync --all`). */
+/** push then pull for each peer (the aggressive `st sync --all`). */
 export function cmdSyncAll(ctx: SyncContext): FanOutResult {
   const banner = ctx.deps?.bannerSink ?? defaultBanner;
-  const peers = readPeersYaml(ctx.coordConfig);
+  const peers = readPeersYaml(ctx.stConfig);
   const successes: string[] = [];
   const failures: { peer: string; error: string }[] = [];
   for (const { spec } of peers) {
@@ -273,7 +273,7 @@ function fanOut(
   action: (spec: string) => unknown
 ): FanOutResult {
   const banner = ctx.deps?.bannerSink ?? defaultBanner;
-  const peers = readPeersYaml(ctx.coordConfig);
+  const peers = readPeersYaml(ctx.stConfig);
   const successes: string[] = [];
   const failures: { peer: string; error: string }[] = [];
   for (const { spec } of peers) {
@@ -339,8 +339,8 @@ export function cmdSyncCli(args: readonly string[], ctx: CliContext): number {
     }
   }
   const sctx: SyncContext = {
-    coordRoot: ctx.coordRoot,
-    coordConfig: ctx.coordConfig,
+    stRoot: ctx.stRoot,
+    stConfig: ctx.stConfig,
   };
   if (all) {
     if (peer !== undefined) throw new Error('--all takes no <peer> argument');

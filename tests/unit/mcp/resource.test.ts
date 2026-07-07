@@ -13,18 +13,18 @@ import { createMcpServer } from '../../../src/mcp/index.ts';
 import { asIdentity } from '../../../src/types.ts';
 
 let scratch: string;
-let coordRoot: string;
+let stRoot: string;
 let client: Client;
 let handle: ReturnType<typeof createMcpServer>;
 
 function setupIdentity(id: string): void {
-  mkdirSync(join(coordRoot, id, 'inbox'), { recursive: true });
-  mkdirSync(join(coordRoot, id, 'archive'), { recursive: true });
+  mkdirSync(join(stRoot, id, 'inbox'), { recursive: true });
+  mkdirSync(join(stRoot, id, 'archive'), { recursive: true });
 }
 
 async function boot(identity = 'alice'): Promise<void> {
   handle = createMcpServer({
-    root: coordRoot,
+    root: stRoot,
     identity: asIdentity(identity),
   });
   client = new Client({ name: 'test-resource', version: '1.0' });
@@ -34,7 +34,7 @@ async function boot(identity = 'alice'): Promise<void> {
 
 beforeEach(() => {
   scratch = mkdtempSync(join(tmpdir(), 'coord-mcp-resource-'));
-  coordRoot = join(scratch, 'coord');
+  stRoot = join(scratch, 'coord');
 });
 
 afterEach(async () => {
@@ -172,9 +172,9 @@ describe('st_resource_ls', () => {
     await boot('alice');
     // Alice can't add to bob's resources via the MCP tool (it always
     // writes to coord.identity). Plant directly.
-    mkdirSync(join(coordRoot, 'bob', 'resources'), { recursive: true });
+    mkdirSync(join(stRoot, 'bob', 'resources'), { recursive: true });
     const bobFile = join(
-      coordRoot,
+      stRoot,
       'bob',
       'resources',
       '1714826789010-aaaaaa.md'

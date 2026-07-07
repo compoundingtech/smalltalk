@@ -12,19 +12,19 @@ import { errorCode, errorPayload } from "./_helpers.ts";
 import { asIdentity } from '../../../src/types.ts';
 
 let scratch: string;
-let coordRoot: string;
+let stRoot: string;
 let client: Client;
 let handle: ReturnType<typeof createMcpServer>;
 
 beforeEach(async () => {
   scratch = mkdtempSync(join(tmpdir(), 'coord-mcp-read-'));
-  coordRoot = join(scratch, 'coord');
+  stRoot = join(scratch, 'coord');
   for (const id of ['alice', 'bob']) {
-    mkdirSync(join(coordRoot, id, 'inbox'), { recursive: true });
-    mkdirSync(join(coordRoot, id, 'archive'), { recursive: true });
+    mkdirSync(join(stRoot, id, 'inbox'), { recursive: true });
+    mkdirSync(join(stRoot, id, 'archive'), { recursive: true });
   }
   handle = createMcpServer({
-    root: coordRoot,
+    root: stRoot,
     identity: asIdentity('alice'),
   });
   client = new Client({ name: 'test-read', version: '1.0' });
@@ -60,7 +60,7 @@ function writeFm(
     .map(([k, v]) => `${k}: ${v}`)
     .join('\n');
   writeFileSync(
-    join(coordRoot, identity, folder, filename),
+    join(stRoot, identity, folder, filename),
     `---\n${head}\n---\n${body}\n`
   );
 }
@@ -249,7 +249,7 @@ describe('st_msg_read — typed error mapping', () => {
     // Post task #128: a legacy 3-segment `.md` (or any off-format
     // `.md`) is valid to *reference* — the "outside message" path.
     // When the file doesn't exist, error is MESSAGE_NOT_FOUND.
-    const r = await call({ filename: '1714826789010-myobie-aaaaaa.md' });
+    const r = await call({ filename: '1714826789010-operator-aaaaaa.md' });
     expect(errorCode(r)).toBe('MESSAGE_NOT_FOUND');
   });
 
@@ -283,7 +283,7 @@ describe('st_msg_read — typed error mapping', () => {
 describe('st_msg_read — edge cases', () => {
   it('file without frontmatter: message.from is empty, body is whole text', async () => {
     writeFileSync(
-      join(coordRoot, 'alice', 'inbox', '1714826789010-aaaaaa.md'),
+      join(stRoot, 'alice', 'inbox', '1714826789010-aaaaaa.md'),
       'just text\n'
     );
     const r = await call({ filename: '1714826789010-aaaaaa.md' });
@@ -294,7 +294,7 @@ describe('st_msg_read — edge cases', () => {
 
   it('empty file → empty body, untyped', async () => {
     writeFileSync(
-      join(coordRoot, 'alice', 'inbox', '1714826789010-aaaaaa.md'),
+      join(stRoot, 'alice', 'inbox', '1714826789010-aaaaaa.md'),
       ''
     );
     const r = await call({ filename: '1714826789010-aaaaaa.md' });

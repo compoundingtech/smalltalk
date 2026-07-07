@@ -3,9 +3,9 @@
 // logic without depending on the `st launch` user CLI surface.
 //
 // Contract (stable, additive-only):
-// - STDIN: a JSON body of `LaunchInput` (minus `env` and `coordRoot`,
+// - STDIN: a JSON body of `LaunchInput` (minus `env` and `stRoot`,
 //   which come from the invoker's process env and the resolved
-//   coordRoot chain — same resolution as any other `st` command).
+//   stRoot chain — same resolution as any other `st` command).
 //   Unknown fields are IGNORED (forward-compat when older
 //   consumers send a subset).
 // - STDOUT: a JSON body of `LaunchResult` (the same struct
@@ -42,7 +42,7 @@ const HARNESSES: readonly Harness[] = ['claude', 'codex'];
 function toLaunchInput(
   raw: unknown,
   env: NodeJS.ProcessEnv,
-  coordRoot: string
+  stRoot: string
 ): LaunchInput {
   if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
     throw new Error(
@@ -80,7 +80,7 @@ function toLaunchInput(
   const input: LaunchInput = {
     harness: r.harness as Harness,
     env,
-    coordRoot,
+    stRoot,
   };
   // Optional strings.
   for (const key of [
@@ -130,7 +130,7 @@ async function readAllStdin(ctx: CliContext): Promise<string> {
 const LAUNCH_CORE_HELP =
   'usage: st __launch-core\n\n' +
   '  Hidden JSON-in/JSON-out entrypoint. Contract:\n' +
-  '  - STDIN: JSON body of LaunchInput (minus env + coordRoot).\n' +
+  '  - STDIN: JSON body of LaunchInput (minus env + stRoot).\n' +
   '  - STDOUT: JSON body of LaunchResult on success.\n' +
   '  - STDERR: error message on non-zero exit.\n' +
   '  - EXIT: 0=ok, 1=validation-error, 2=internal-error.\n\n' +
@@ -178,7 +178,7 @@ export async function cmdLaunchCoreCli(
 
   let input: LaunchInput;
   try {
-    input = toLaunchInput(raw, ctx.env, ctx.coordRoot);
+    input = toLaunchInput(raw, ctx.env, ctx.stRoot);
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     ctx.stderr(`${msg}\n`);

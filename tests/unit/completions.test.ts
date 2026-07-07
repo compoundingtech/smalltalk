@@ -1,4 +1,4 @@
-// tests/unit/completions.test.ts — coverage for `coord completions <shell>`.
+// tests/unit/completions.test.ts — coverage for `st completions <shell>`.
 //
 // Exercises the dispatcher path (runCli) and the generated-script shape for
 // each supported shell, plus the enum value sets that the spec derives from
@@ -24,8 +24,8 @@ function makeContext(): Capture {
   };
   cap.ctx = {
     env: {},
-    coordRoot: '/tmp/does-not-matter',
-    coordConfig: '/tmp/does-not-matter',
+    stRoot: '/tmp/does-not-matter',
+    stConfig: '/tmp/does-not-matter',
     stdout: (s) => {
       cap.stdout += s;
     },

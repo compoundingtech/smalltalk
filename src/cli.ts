@@ -13,7 +13,7 @@ import { readFileSync, realpathSync, statSync } from 'node:fs';
 import { delimiter, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { coordConfigFrom, coordRootFrom } from './common.ts';
+import { stConfigFrom, stRootFrom } from './common.ts';
 import { invokedName, type CliContext } from './cli-context.ts';
 import { cmdArchiveCli } from './commands/archive.ts';
 import { cmdCompletionsCli } from './commands/completions.ts';
@@ -40,8 +40,8 @@ export type { CliContext } from './cli-context.ts';
 export function defaultCliContext(): CliContext {
   return {
     env: process.env,
-    coordRoot: coordRootFrom(process.env),
-    coordConfig: coordConfigFrom(process.env),
+    stRoot: stRootFrom(process.env),
+    stConfig: stConfigFrom(process.env),
     stdout: (s) => process.stdout.write(s),
     stderr: (s) => process.stderr.write(s),
     readStdin: () => readStdinBuffer(process.stdin),
@@ -139,7 +139,7 @@ function topLevelUsage(name: string): string {
 
 /**
  * Set of OLD top-level subcommand names that are now nested under
- * `coord message`. The dispatcher detects them and emits a helpful
+ * `st message`. The dispatcher detects them and emits a helpful
  * "Did you mean coord message <verb>?" pointer.
  */
 const NESTED_MESSAGE_VERBS = new Set([
@@ -233,7 +233,6 @@ export async function runCli(
       case 'status':
         return cmdStatusCli(rest, ctx);
       case 'agents':
-      case 'members':
         return cmdAgentsCli(rest, ctx);
       case 'overview':
         return cmdOverviewCli(rest, ctx);
@@ -270,9 +269,8 @@ export async function runCli(
           ctx.stderr(topLevelUsage(name));
           return 2;
         }
-        // brief-005-phase0 §6: git-style PATH dispatch. Look up
-        // `st-<cmd>` (canonical), then `smalltalk-<cmd>`, then
-        // `coord-<cmd>` (legacy). Built-in commands above always
+        // Git-style PATH dispatch: look up `st-<cmd>` (canonical)
+        // then `smalltalk-<cmd>`. Built-in commands above always
         // win — only unknown verbs reach this branch.
         {
           const plugin = findPlugin(cmd, ctx.env);
@@ -296,17 +294,18 @@ export async function runCli(
 }
 
 /**
- * brief-005-phase0 §6: locate a plugin script on PATH.
+ * Locate a plugin script on PATH.
  *
- * Tries each prefix in order — `st-`, `smalltalk-`, `coord-` — and
- * returns the absolute path of the first match. The match must be a
- * regular file with at least one of the user/group/other exec bits
- * set. Per-bucket short-circuit means we won't iterate the full PATH
- * for prefixes that don't match anywhere.
+ * Tries each prefix in order — `st-`, `smalltalk-` — and returns the
+ * absolute path of the first match. Post-coord-cutover the `coord-`
+ * prefix is no longer scanned. The match must be a regular file with
+ * at least one of the user/group/other exec bits set. Per-bucket
+ * short-circuit means we won't iterate the full PATH for prefixes
+ * that don't match anywhere.
  *
  * Built-in commands are dispatched before this is called, so a verb
  * like `st-message` (if one existed) can't shadow the built-in
- * `coord message` group.
+ * `st message` group.
  */
 function findPlugin(
   cmd: string,
@@ -315,7 +314,7 @@ function findPlugin(
   const path = env.PATH ?? '';
   if (path.length === 0) return null;
   const dirs = path.split(delimiter).filter((d) => d.length > 0);
-  for (const prefix of ['st-', 'smalltalk-', 'coord-']) {
+  for (const prefix of ['st-', 'smalltalk-']) {
     const name = `${prefix}${cmd}`;
     for (const dir of dirs) {
       const candidate = join(dir, name);

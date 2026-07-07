@@ -104,13 +104,11 @@ import {
 // ─── Public option types ────────────────────────────────────────────────
 
 export interface CoordOptions {
-  /** $ST_ROOT (legacy $COORD_ROOT). Parent of every `<identity>/` folder. */
+  /** $ST_ROOT — parent of every `<identity>/` folder. */
   root: string;
   /** Default identity for any method that doesn't take one explicitly. */
   identity: Identity;
-  /** $ST_CONFIG (legacy $COORD_CONFIG). Defaults to `~/.config/smalltalk`
-   *  when present, `~/.config/coord` when only that exists, else the
-   *  ST path for a brand-new install. */
+  /** $ST_CONFIG — defaults to `~/.config/smalltalk`. */
   configRoot?: string;
 }
 
@@ -189,7 +187,7 @@ export interface WatchOptions {
   /**
    * When true, watch every peer's inbox EXCEPT the Coord's own
    * identity (cross-tree supervisor mode). Default is to watch
-   * the Coord's own identity inbox — same default as `coord watch`
+   * the Coord's own identity inbox — same default as `st watch`
    * post-brief-017a. Mutually exclusive with the `identity` arg.
    */
   all?: boolean;
@@ -253,9 +251,9 @@ export interface Coord {
   getStatus(identity: Identity): Promise<State>;
   setStatus(identity: Identity, state: State): Promise<void>;
   /**
-   * brief-028: enumerate identities under $COORD_ROOT. Mirrors
-   * `coord agents` but returns the typed payload directly so an
-   * embedder can render their own UI without re-parsing.
+   * Enumerate identities under $ST_ROOT. Mirrors `st agents` but
+   * returns the typed payload directly so an embedder can render
+   * their own UI without re-parsing.
    */
   agents(opts?: {
     status?: State;
@@ -268,7 +266,7 @@ export interface Coord {
   }): AgentSummary[] | AgentSummaryEnriched[];
   /**
    * brief-028: at-a-glance dashboard for `identity` (defaults to the
-   * handle's own identity). Mirrors `coord overview`.
+   * handle's own identity). Mirrors `st overview`.
    */
   overview(opts?: { identity?: Identity; recent?: number }): Overview;
   /**
@@ -404,7 +402,7 @@ export function createCoord(options: CoordOptions): Coord {
         captured.stderr += `${line}\n`;
       },
     };
-    return { coordRoot: root, coordConfig: configRoot, deps };
+    return { stRoot: root, stConfig: configRoot, deps };
   }
 
   const coord: Coord = {
@@ -422,7 +420,7 @@ export function createCoord(options: CoordOptions): Coord {
         ...(opts.priority !== undefined && { priority: opts.priority }),
         body,
         env: lib_env,
-        coordRoot: root,
+        stRoot: root,
       });
       return asFilename(r.filename);
     },
@@ -434,7 +432,7 @@ export function createCoord(options: CoordOptions): Coord {
         ...(opts.since !== undefined && { since: opts.since }),
         ...(opts.fromFilter !== undefined && { fromFilter: opts.fromFilter }),
         env: lib_env,
-        coordRoot: root,
+        stRoot: root,
       });
       // Task #128: cmdLs may return outside .md filenames alongside
       // canonical ones. Use the broader validator so `asDeliverableFilename`
@@ -448,7 +446,7 @@ export function createCoord(options: CoordOptions): Coord {
         filename,
         ...(opts.fromArchive !== undefined && { fromArchive: opts.fromArchive }),
         env: lib_env,
-        coordRoot: root,
+        stRoot: root,
       });
       // Off-format `.md`: skip the frontmatter reinterpretation. We
       // can't trust `from` (no verified sender), the whole file is
@@ -489,7 +487,7 @@ export function createCoord(options: CoordOptions): Coord {
           withAttachments: opts.withAttachments,
         }),
         env: lib_env,
-        coordRoot: root,
+        stRoot: root,
       });
     },
 
@@ -504,7 +502,7 @@ export function createCoord(options: CoordOptions): Coord {
         }),
         ...(opts.now !== undefined && { now: opts.now }),
         env: lib_env,
-        coordRoot: root,
+        stRoot: root,
       });
       return r.victims.map(asFilename);
     },
@@ -516,7 +514,7 @@ export function createCoord(options: CoordOptions): Coord {
         ...(opts.archive !== undefined && { archive: opts.archive }),
         orphans: true,
         env: lib_env,
-        coordRoot: root,
+        stRoot: root,
       });
       // Orphans have no frontmatter; the LAYOUT-004 timestamp prefix
       // may parse for grammar-conforming siblings but not for arbitrary
@@ -543,7 +541,7 @@ export function createCoord(options: CoordOptions): Coord {
         filename,
         ...(opts.tree !== undefined && { tree: opts.tree }),
         env: lib_env,
-        coordRoot: root,
+        stRoot: root,
       });
       // For each line, locate the file, parse it, and build a
       // MessageWithLocation. We re-locate-anywhere because thread's lines
@@ -584,7 +582,7 @@ export function createCoord(options: CoordOptions): Coord {
         ...(opts.sinceNow !== undefined && { sinceNow: opts.sinceNow }),
         intervalMs: opts.intervalMs ?? DEFAULT_INTERVAL_MS,
         env: lib_env,
-        coordRoot: root,
+        stRoot: root,
       };
       return watchAsyncIterable(watchInput, opts.signal);
     },
@@ -593,7 +591,7 @@ export function createCoord(options: CoordOptions): Coord {
       const r = cmdStatus({
         recipient: id,
         env: lib_env,
-        coordRoot: root,
+        stRoot: root,
       });
       if (r.mode !== 'get') throw new Error('unreachable: getStatus mode');
       return r.state;
@@ -604,7 +602,7 @@ export function createCoord(options: CoordOptions): Coord {
         recipient: id,
         setState: state,
         env: lib_env,
-        coordRoot: root,
+        stRoot: root,
       });
     },
 
@@ -654,7 +652,7 @@ export function createCoord(options: CoordOptions): Coord {
           ...(input.body !== undefined && { body: input.body }),
           identity,
           env: lib_env,
-          coordRoot: root,
+          stRoot: root,
         });
         return asFilename(r.filename);
       },
@@ -668,7 +666,7 @@ export function createCoord(options: CoordOptions): Coord {
           identity: id,
           filename,
           env: lib_env,
-          coordRoot: root,
+          stRoot: root,
         });
         return recordToResource(r.record);
       },
@@ -677,7 +675,7 @@ export function createCoord(options: CoordOptions): Coord {
           identity,
           filename,
           env: lib_env,
-          coordRoot: root,
+          stRoot: root,
         });
       },
     },
@@ -694,7 +692,7 @@ export function createCoord(options: CoordOptions): Coord {
           recipient: target,
           file: input?.file ?? 'now',
           env: lib_env,
-          coordRoot: root,
+          stRoot: root,
         });
         return { ...r, identity: asIdentity(r.identity) };
       },
@@ -708,7 +706,7 @@ export function createCoord(options: CoordOptions): Coord {
           recipient: target,
           body: input.body,
           env: lib_env,
-          coordRoot: root,
+          stRoot: root,
         });
         return { ...r, identity: asIdentity(r.identity) };
       },
@@ -725,7 +723,7 @@ export function createCoord(options: CoordOptions): Coord {
           why: input.why,
           timestamp: input.timestamp ?? new Date().toISOString(),
           env: lib_env,
-          coordRoot: root,
+          stRoot: root,
         });
         return {
           ...r,

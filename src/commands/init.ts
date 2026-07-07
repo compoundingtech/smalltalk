@@ -1,4 +1,4 @@
-// commands/init.ts — `coord init` verb.
+// commands/init.ts — `st init` verb.
 //
 // Writes (or merges) `.mcp.json` in a target directory so a Claude
 // Code session in that repo will load the coord MCP server. Resolves
@@ -195,7 +195,7 @@ export async function cmdInit(
   }
 
   if (!existsSync(targetDir) || !statSync(targetDir).isDirectory()) {
-    throw new Error(`coord init: target directory does not exist: ${targetDir}`);
+    throw new Error(`st init: target directory does not exist: ${targetDir}`);
   }
 
   let existing: McpJsonShape = {};
@@ -207,7 +207,7 @@ export async function cmdInit(
       raw = readFileSync(path, 'utf8');
     } catch (err) {
       throw new Error(
-        `coord init: could not read ${path}: ${(err as Error).message}`
+        `st init: could not read ${path}: ${(err as Error).message}`
       );
     }
     try {
@@ -222,7 +222,7 @@ export async function cmdInit(
       existing = parsed as McpJsonShape;
     } catch (err) {
       throw new Error(
-        `coord init: ${path} is not valid JSON: ${(err as Error).message}. Refusing to overwrite.`
+        `st init: ${path} is not valid JSON: ${(err as Error).message}. Refusing to overwrite.`
       );
     }
   }
@@ -234,19 +234,14 @@ export async function cmdInit(
       ? { ...existing.mcpServers }
       : {};
 
-  // Look up the existing entry under `st` first, then the back-compat
-  // `coord` key for pre-cutover files that haven't been swept.
-  // Match either — write `st`. If both keys exist, the `st` one
-  // wins for the merge decision; the `coord` one is left alone
-  // (users can rm .mcp.json to re-init if they want a clean slate).
-  const prior = servers.st ?? servers.coord;
-  const priorKey: 'st' | 'coord' | null =
-    servers.st !== undefined ? 'st' : servers.coord !== undefined ? 'coord' : null;
+  // Look up the existing entry under `st`. Post-coord-cutover the
+  // legacy `coord` key is no longer read or written.
+  const prior = servers.st;
   let outcome: InitOutcome;
   if (prior !== undefined && entryMatches(prior, entry)) {
     outcome = 'already-configured';
     ctx.stderr(
-      `st init: ${path} already has matching ${priorKey} entry — no changes.\n`
+      `st init: ${path} already has matching st entry — no changes.\n`
     );
     return { outcome, path, entry };
   }
@@ -258,12 +253,12 @@ export async function cmdInit(
       const answer = await promptYesNo(
         ctx,
         input.promptAnswer,
-        `st init: ${path} has a different ${priorKey} entry. Overwrite? [y/N] `
+        `st init: ${path} has a different st entry. Overwrite? [y/N] `
       );
       overwrite = answer;
     }
     if (!overwrite) {
-      ctx.stderr(`st init: skipped — existing ${priorKey} entry preserved.\n`);
+      ctx.stderr(`st init: skipped — existing st entry preserved.\n`);
       return { outcome: 'skipped-by-user', path, entry: prior };
     }
     outcome = 'overwrote-divergent';
@@ -273,10 +268,6 @@ export async function cmdInit(
     outcome = 'wrote-new';
   }
 
-  // Migrate: write the entry under `st`, and drop the legacy `coord`
-  // key if it was present so the file has one canonical key rather
-  // than two. This is a no-op when only `st` (or neither) was there.
-  delete servers.coord;
   servers.st = entry;
   const next: McpJsonShape = { ...existing, mcpServers: servers };
   atomicWriteJson(path, next);
@@ -286,7 +277,7 @@ export async function cmdInit(
       ? `st init: wrote ${path}\n`
       : outcome === 'merged-into-existing'
       ? `st init: added st entry to existing ${path}\n`
-      : `st init: overwrote divergent ${priorKey ?? 'st'} entry in ${path}\n`;
+      : `st init: overwrote divergent st entry in ${path}\n`;
   ctx.stderr(summary);
 
   return { outcome, path, entry };

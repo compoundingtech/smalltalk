@@ -1,13 +1,13 @@
 // mcp/index.ts — createMcpServer factory.
 //
-// `coord mcp` runs this server over stdio. The factory builds an
+// `st mcp` runs this server over stdio. The factory builds an
 // McpServer wrapping a Coord instance and registers the five tools.
 // The `run()` method connects to a stdio transport and awaits SIGINT,
 // SIGTERM, or transport close — whichever comes first.
 //
 // All MCP imports are reachable only when this module is loaded — keep
 // it isolated from the rest of src/ so the cost of `@modelcontextprotocol/sdk`
-// is paid only by `coord mcp`, never by `coord send` / `ls` / etc.
+// is paid only by `st mcp`, never by `st send` / `ls` / etc.
 
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
@@ -94,7 +94,7 @@ export interface McpServerOptions {
    * to `coord` for back-compat with tests / direct lib embedders
    * that don't set it.
    */
-  serverName?: 'coord' | 'st' | undefined;
+  serverName?: 'st' | undefined;
 }
 
 export interface McpServerHandle {
@@ -130,7 +130,7 @@ export function createMcpServer(opts: McpServerOptions): McpServerHandle {
     ...(opts.configRoot !== undefined && { configRoot: opts.configRoot }),
   });
 
-  const serverName = opts.serverName ?? 'coord';
+  const serverName = opts.serverName ?? 'st';
   const mcp = new McpServer(
     buildServerInfo(serverName),
     buildServerOptions({ channel })

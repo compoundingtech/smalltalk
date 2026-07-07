@@ -12,19 +12,19 @@ import { errorCode, errorPayload } from "./_helpers.ts";
 import { asIdentity } from '../../../src/types.ts';
 
 let scratch: string;
-let coordRoot: string;
+let stRoot: string;
 let client: Client;
 let handle: ReturnType<typeof createMcpServer>;
 
 beforeEach(async () => {
   scratch = mkdtempSync(join(tmpdir(), 'coord-mcp-thread-'));
-  coordRoot = join(scratch, 'coord');
+  stRoot = join(scratch, 'coord');
   for (const id of ['alice', 'bob']) {
-    mkdirSync(join(coordRoot, id, 'inbox'), { recursive: true });
-    mkdirSync(join(coordRoot, id, 'archive'), { recursive: true });
+    mkdirSync(join(stRoot, id, 'inbox'), { recursive: true });
+    mkdirSync(join(stRoot, id, 'archive'), { recursive: true });
   }
   handle = createMcpServer({
-    root: coordRoot,
+    root: stRoot,
     identity: asIdentity('alice'),
   });
   client = new Client({ name: 'test-thread', version: '1.0' });
@@ -60,7 +60,7 @@ interface PlantOpts {
 
 function plant(opts: PlantOpts): void {
   const folder = opts.folder ?? 'inbox';
-  const dir = join(coordRoot, opts.to, folder);
+  const dir = join(stRoot, opts.to, folder);
   mkdirSync(dir, { recursive: true });
   let head = `from: ${opts.from}\n`;
   if (opts.subject) head += `subject: ${opts.subject}\n`;
@@ -366,7 +366,7 @@ describe('st_msg_thread — typed error mapping', () => {
   });
 
   it('legacy 3-segment filename → INVALID_FILENAME', async () => {
-    const r = await call({ filename: '1714826789010-myobie-aaaaaa.md' });
+    const r = await call({ filename: '1714826789010-operator-aaaaaa.md' });
     expect(errorCode(r)).toBe('INVALID_FILENAME');
   });
 

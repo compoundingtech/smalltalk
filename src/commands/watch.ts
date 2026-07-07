@@ -1,10 +1,10 @@
-// commands/watch.ts — emit one line per new file appearing under $COORD_ROOT.
+// commands/watch.ts — emit one line per new file appearing under $ST_ROOT.
 //
 // Two modes (mirror of lib/cmd_watch.sh):
 //   - per-identity:  cmdWatch with `recipient` set → watches <id>/inbox/.
 //   - cross-tree:    cmdWatch without recipient    → watches every
 //                    <peer>/inbox/ EXCEPT the watcher's own folder
-//                    (suppression id from --from / $COORD_IDENTITY).
+//                    (suppression id from --from / $ST_AGENT).
 //
 // The state machine is split into two pure-ish functions:
 //   watchReplay() — initial pass: emit files at or above the cutoff,
@@ -37,8 +37,8 @@ export interface WatchSetup {
   /** Replay cutoff: emit files with filename ts >= cutoff. */
   cutoff: number;
   withSubject?: boolean;
-  /** $COORD_ROOT — explicit so tests can use temp dirs. */
-  coordRoot: string;
+  /** $ST_ROOT — explicit so tests can use temp dirs. */
+  stRoot: string;
 }
 
 export interface WatchInput {
@@ -60,7 +60,7 @@ export interface WatchInput {
   intervalMs?: number;
   once?: boolean;
   env: NodeJS.ProcessEnv;
-  coordRoot: string;
+  stRoot: string;
   /** Override now() for deterministic --since-now testing. */
   now?: () => number;
 }
@@ -131,35 +131,35 @@ export function resolveWatchSetup(input: WatchInput): WatchSetupResult {
     singleId = resolveIdentity({
       explicit: input.recipient,
       env: input.env,
-      coordRoot: input.coordRoot,
+      stRoot: input.stRoot,
       policy: 'lenient',
     });
   } else if (input.all === true) {
     // Cross-tree mode: watch every peer's inbox, suppressing the
     // watcher's own folder. Needs an identity for the suppression
-    // (via --from or $COORD_IDENTITY).
+    // (via --from or $ST_AGENT).
     if (
       (input.fromExplicit === undefined || input.fromExplicit === '') &&
-      (!input.env.COORD_IDENTITY || input.env.COORD_IDENTITY === '')
+      (!input.env.ST_AGENT || input.env.ST_AGENT === '')
     ) {
       throw new CoordError(
         'IDENTITY_REQUIRED_FOR_SUPPRESS',
-        'identity required to determine which folder to suppress — set COORD_IDENTITY'
+        'identity required to determine which folder to suppress — set $ST_AGENT'
       );
     }
     suppressId = resolveIdentity({
       explicit: input.fromExplicit,
       env: input.env,
-      coordRoot: input.coordRoot,
+      stRoot: input.stRoot,
     });
   } else {
-    // brief-017a default: no args → watch $COORD_IDENTITY's own
+    // brief-017a default: no args → watch $ST_AGENT's own
     // inbox, consistent with `ls`, `status`, etc. Pre-017a this was
     // cross-tree (which was surprising — see brief-017a bug 3).
     singleId = resolveIdentity({
       explicit: input.fromExplicit,
       env: input.env,
-      coordRoot: input.coordRoot,
+      stRoot: input.stRoot,
     });
   }
 
@@ -178,7 +178,7 @@ export function resolveWatchSetup(input: WatchInput): WatchSetupResult {
       suppressId,
       cutoff,
       withSubject: input.withSubject === true,
-      coordRoot: input.coordRoot,
+      stRoot: input.stRoot,
     },
     intervalMs,
     once: input.once === true,
@@ -221,11 +221,11 @@ export function watchPoll(
  */
 export function watchTargetDirs(setup: WatchSetup): string[] {
   if (setup.singleId !== undefined) {
-    return [inboxDir(setup.singleId, setup.coordRoot)];
+    return [inboxDir(setup.singleId, setup.stRoot)];
   }
   let topEntries: string[];
   try {
-    topEntries = readdirSync(setup.coordRoot);
+    topEntries = readdirSync(setup.stRoot);
   } catch {
     return [];
   }
@@ -233,7 +233,7 @@ export function watchTargetDirs(setup: WatchSetup): string[] {
   for (const id of topEntries) {
     if (!validIdentity(id)) continue;
     if (id === setup.suppressId) continue;
-    const d = inboxDir(id, setup.coordRoot);
+    const d = inboxDir(id, setup.stRoot);
     if (!isDir(d)) continue;
     dirs.push(d);
   }
@@ -414,9 +414,9 @@ export async function cmdWatchCli(
         ctx.stderr(
           `usage: ${invokedName(ctx.env)} watch [<identity>] [--all] [--from <id>] [--with-subject]\n` +
             '                   [--since UNIX_MS | --since-now] [--interval MS] [--once]\n\n' +
-            '  Default: watch $COORD_IDENTITY/inbox/ (your own).\n' +
-            '  --all:   watch every identity\'s inbox EXCEPT $COORD_IDENTITY\'s\n' +
-            '           (cross-tree supervisor mode; uses --from / $COORD_IDENTITY\n' +
+            '  Default: watch $ST_AGENT/inbox/ (your own).\n' +
+            '  --all:   watch every identity\'s inbox EXCEPT $ST_AGENT\'s\n' +
+            '           (cross-tree supervisor mode; uses --from / $ST_AGENT\n' +
             '           for the suppression id).\n' +
             '  <identity>: watch THAT identity\'s inbox specifically.\n'
         );
@@ -438,7 +438,7 @@ export async function cmdWatchCli(
       intervalMs,
       once,
       env: ctx.env,
-      coordRoot: ctx.coordRoot,
+      stRoot: ctx.stRoot,
     },
     {
       emit: (line) => {

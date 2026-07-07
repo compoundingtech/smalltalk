@@ -34,7 +34,7 @@ export interface ReplyInput {
    *  fallbacks). Same resolution as `st message send`. */
   from?: string | undefined;
   env: NodeJS.ProcessEnv;
-  coordRoot: string;
+  stRoot: string;
 }
 
 export interface ReplyResult {
@@ -56,7 +56,7 @@ export function cmdReply(input: ReplyInput): ReplyResult {
   }
   const thread = asFilename(input.thread);
   const located = locateThread(
-    input.coordRoot,
+    input.stRoot,
     asIdentity(selfId),
     thread
   );
@@ -74,7 +74,7 @@ export function cmdReply(input: ReplyInput): ReplyResult {
     inReplyTo: thread,
     body: input.body,
     env: input.env,
-    coordRoot: input.coordRoot,
+    stRoot: input.stRoot,
   });
   return { filename: r.filename, identity: recipient };
 }
@@ -152,7 +152,7 @@ export async function cmdReplyCli(
     ...(subject !== undefined && { subject }),
     ...(from !== undefined && { from }),
     env: ctx.env,
-    coordRoot: ctx.coordRoot,
+    stRoot: ctx.stRoot,
   });
   ctx.stdout(`${r.filename}\n`);
   return 0;

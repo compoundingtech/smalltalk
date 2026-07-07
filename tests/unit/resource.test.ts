@@ -29,24 +29,24 @@ import {
 } from '../../src/errors.ts';
 
 let scratch: string;
-let coordRoot: string;
+let stRoot: string;
 
 beforeEach(() => {
   scratch = mkdtempSync(join(tmpdir(), 'coord-resource-test-'));
-  coordRoot = join(scratch, 'coord');
-  mkdirSync(coordRoot, { recursive: true });
+  stRoot = join(scratch, 'coord');
+  mkdirSync(stRoot, { recursive: true });
 });
 afterEach(() => {
   rmSync(scratch, { recursive: true, force: true });
 });
 
 function setupIdentity(id: string): void {
-  mkdirSync(join(coordRoot, id, 'inbox'), { recursive: true });
-  mkdirSync(join(coordRoot, id, 'archive'), { recursive: true });
+  mkdirSync(join(stRoot, id, 'inbox'), { recursive: true });
+  mkdirSync(join(stRoot, id, 'archive'), { recursive: true });
 }
 
 function envFor(id: string): NodeJS.ProcessEnv {
-  return { COORD_IDENTITY: id } as NodeJS.ProcessEnv;
+  return { ST_AGENT: id } as NodeJS.ProcessEnv;
 }
 
 // ─── add ───────────────────────────────────────────────────────────────
@@ -57,7 +57,7 @@ describe('cmdResourceAdd', () => {
     const r = cmdResourceAdd({
       url: 'https://example.com/foo',
       env: envFor('alice'),
-      coordRoot,
+      stRoot,
     });
     expect(r.identity).toBe('alice');
     expect(/^[0-9]{13}-[0-9a-z]{6}\.md$/.test(r.filename)).toBe(true);
@@ -69,24 +69,24 @@ describe('cmdResourceAdd', () => {
 
   it('lazily creates resources/ on first add', () => {
     setupIdentity('alice');
-    expect(existsSync(join(coordRoot, 'alice', 'resources'))).toBe(false);
+    expect(existsSync(join(stRoot, 'alice', 'resources'))).toBe(false);
     cmdResourceAdd({
       url: 'https://example.com',
       env: envFor('alice'),
-      coordRoot,
+      stRoot,
     });
-    expect(existsSync(join(coordRoot, 'alice', 'resources'))).toBe(true);
+    expect(existsSync(join(stRoot, 'alice', 'resources'))).toBe(true);
   });
 
   it('persists title + tags + body in the on-disk file', () => {
     setupIdentity('alice');
     const r = cmdResourceAdd({
-      url: 'https://github.com/myobie/smalltalk/pull/17',
+      url: 'https://github.com/operator/smalltalk/pull/17',
       title: 'PR #17 — remove tasks',
       tags: ['pr', 'brief-009'],
       body: 'first slim-down PR\n',
       env: envFor('alice'),
-      coordRoot,
+      stRoot,
     });
     const text = readFileSync(r.path, 'utf8');
     // title contains `:` (none here actually) and `#` — yamlQuote
@@ -103,7 +103,7 @@ describe('cmdResourceAdd', () => {
       cmdResourceAdd({
         url: 'example.com',
         env: envFor('alice'),
-        coordRoot,
+        stRoot,
       })
     ).toThrow(InvalidResourceUrlError);
   });
@@ -114,7 +114,7 @@ describe('cmdResourceAdd', () => {
       cmdResourceAdd({
         url: 'pty://my-session',
         env: envFor('alice'),
-        coordRoot,
+        stRoot,
       })
     ).not.toThrow();
   });
@@ -125,7 +125,7 @@ describe('cmdResourceAdd', () => {
       cmdResourceAdd({
         url: '',
         env: envFor('alice'),
-        coordRoot,
+        stRoot,
       })
     ).toThrow(InvalidResourceUrlError);
   });
@@ -136,9 +136,9 @@ describe('cmdResourceAdd', () => {
       url: 'https://example.com',
       tags: 'a,b,c',
       env: envFor('alice'),
-      coordRoot,
+      stRoot,
     });
-    const items = listResourceRecords('alice', coordRoot);
+    const items = listResourceRecords('alice', stRoot);
     const rec = items.find((it) => it.filename === r.filename)!;
     expect(rec.tags).toEqual(['a', 'b', 'c']);
   });
@@ -150,9 +150,9 @@ describe('cmdResourceAdd', () => {
       title: 'my own PR',
       tags: ['owns'],
       env: envFor('alice'),
-      coordRoot,
+      stRoot,
     });
-    const items = listResourceRecords('alice', coordRoot);
+    const items = listResourceRecords('alice', stRoot);
     const rec = items.find((it) => it.filename === added.filename)!;
     // Even though the title literally says "my own" and there's an
     // `owns` tag, relation stays null — the field is never inferred.
@@ -165,11 +165,11 @@ describe('cmdResourceAdd', () => {
       url: 'https://example.com/my-pr',
       relation: 'owns',
       env: envFor('alice'),
-      coordRoot,
+      stRoot,
     });
     const text = readFileSync(added.path, 'utf8');
     expect(text).toContain('relation: owns');
-    const items = listResourceRecords('alice', coordRoot);
+    const items = listResourceRecords('alice', stRoot);
     const rec = items.find((it) => it.filename === added.filename)!;
     expect(rec.relation).toBe('owns');
   });
@@ -180,9 +180,9 @@ describe('cmdResourceAdd', () => {
       url: 'https://example.com',
       relation: 'considers-blocking',
       env: envFor('alice'),
-      coordRoot,
+      stRoot,
     });
-    const items = listResourceRecords('alice', coordRoot);
+    const items = listResourceRecords('alice', stRoot);
     expect(items[0]?.relation).toBe('considers-blocking');
   });
 
@@ -192,9 +192,9 @@ describe('cmdResourceAdd', () => {
       url: 'https://example.com',
       relation: '',
       env: envFor('alice'),
-      coordRoot,
+      stRoot,
     });
-    const items = listResourceRecords('alice', coordRoot);
+    const items = listResourceRecords('alice', stRoot);
     const rec = items.find((it) => it.filename === added.filename)!;
     expect(rec.relation).toBeNull();
   });
@@ -205,7 +205,7 @@ describe('cmdResourceAdd', () => {
 describe('cmdResourceLs', () => {
   it('empty resources/ → empty matches', () => {
     setupIdentity('alice');
-    const r = cmdResourceLs({ env: envFor('alice'), coordRoot });
+    const r = cmdResourceLs({ env: envFor('alice'), stRoot });
     expect(r.matches).toEqual([]);
   });
 
@@ -214,20 +214,20 @@ describe('cmdResourceLs', () => {
     const r1 = cmdResourceAdd({
       url: 'https://example.com/1',
       env: envFor('alice'),
-      coordRoot,
+      stRoot,
     });
     const r2 = cmdResourceAdd({
       url: 'https://example.com/2',
       env: envFor('alice'),
-      coordRoot,
+      stRoot,
     });
     // Noise file that shouldn't match the grammar
-    writeFileSync(join(coordRoot, 'alice', 'resources', 'README'), 'noise');
+    writeFileSync(join(stRoot, 'alice', 'resources', 'README'), 'noise');
     writeFileSync(
-      join(coordRoot, 'alice', 'resources', 'not-a-resource.md'),
+      join(stRoot, 'alice', 'resources', 'not-a-resource.md'),
       'noise'
     );
-    const r = cmdResourceLs({ env: envFor('alice'), coordRoot });
+    const r = cmdResourceLs({ env: envFor('alice'), stRoot });
     expect(r.matches).toContain(r1.filename);
     expect(r.matches).toContain(r2.filename);
     expect(r.matches).not.toContain('README');
@@ -240,12 +240,12 @@ describe('cmdResourceLs', () => {
     const r = cmdResourceAdd({
       url: 'https://example.com',
       env: envFor('bob'),
-      coordRoot,
+      stRoot,
     });
     const ls = cmdResourceLs({
       identity: 'bob',
       env: envFor('alice'),
-      coordRoot,
+      stRoot,
     });
     expect(ls.identity).toBe('bob');
     expect(ls.matches).toContain(r.filename);
@@ -253,7 +253,7 @@ describe('cmdResourceLs', () => {
 
   it('missing resources/ folder yields empty matches, not throw', () => {
     setupIdentity('alice');
-    const r = cmdResourceLs({ env: envFor('alice'), coordRoot });
+    const r = cmdResourceLs({ env: envFor('alice'), stRoot });
     expect(r.matches).toEqual([]);
   });
 });
@@ -269,12 +269,12 @@ describe('cmdResourceRead', () => {
       tags: ['x', 'y'],
       body: 'a description\n',
       env: envFor('alice'),
-      coordRoot,
+      stRoot,
     });
     const r = cmdResourceRead({
       filename: added.filename,
       env: envFor('alice'),
-      coordRoot,
+      stRoot,
     });
     expect(r.identity).toBe('alice');
     expect(r.record.url).toBe('https://example.com/foo');
@@ -289,13 +289,13 @@ describe('cmdResourceRead', () => {
     const added = cmdResourceAdd({
       url: 'https://example.com',
       env: envFor('bob'),
-      coordRoot,
+      stRoot,
     });
     const r = cmdResourceRead({
       identity: 'bob',
       filename: added.filename,
       env: envFor('alice'),
-      coordRoot,
+      stRoot,
     });
     expect(r.identity).toBe('bob');
     expect(r.record.url).toBe('https://example.com');
@@ -307,7 +307,7 @@ describe('cmdResourceRead', () => {
       cmdResourceRead({
         filename: '1714826789010-aaaaaa.md',
         env: envFor('alice'),
-        coordRoot,
+        stRoot,
       })
     ).toThrow(ResourceNotFoundError);
   });
@@ -318,7 +318,7 @@ describe('cmdResourceRead', () => {
       cmdResourceRead({
         filename: 'not-a-grammar',
         env: envFor('alice'),
-        coordRoot,
+        stRoot,
       })
     ).toThrow(InvalidFilenameError);
   });
@@ -328,12 +328,12 @@ describe('cmdResourceRead', () => {
     const added = cmdResourceAdd({
       url: 'https://example.com',
       env: envFor('alice'),
-      coordRoot,
+      stRoot,
     });
     const r = cmdResourceRead({
       filename: added.filename,
       env: envFor('alice'),
-      coordRoot,
+      stRoot,
     });
     expect(r.record.title).toBeNull();
     expect(r.record.tags).toEqual([]);
@@ -346,12 +346,12 @@ describe('cmdResourceRead', () => {
       url: 'https://example.com',
       relation: 'depends-on',
       env: envFor('alice'),
-      coordRoot,
+      stRoot,
     });
     const r = cmdResourceRead({
       filename: added.filename,
       env: envFor('alice'),
-      coordRoot,
+      stRoot,
     });
     expect(r.record.relation).toBe('depends-on');
   });
@@ -365,19 +365,19 @@ describe('cmdResourceRemove', () => {
     const added = cmdResourceAdd({
       url: 'https://example.com',
       env: envFor('alice'),
-      coordRoot,
+      stRoot,
     });
     cmdResourceRemove({
       filename: added.filename,
       env: envFor('alice'),
-      coordRoot,
+      stRoot,
     });
     expect(existsSync(added.path)).toBe(false);
     expect(() =>
       cmdResourceRead({
         filename: added.filename,
         env: envFor('alice'),
-        coordRoot,
+        stRoot,
       })
     ).toThrow(ResourceNotFoundError);
   });
@@ -388,7 +388,7 @@ describe('cmdResourceRemove', () => {
       cmdResourceRemove({
         filename: '1714826789010-aaaaaa.md',
         env: envFor('alice'),
-        coordRoot,
+        stRoot,
       })
     ).toThrow(ResourceNotFoundError);
   });
@@ -402,13 +402,13 @@ describe('cmdResourceRemove', () => {
     const bobAdded = cmdResourceAdd({
       url: 'https://example.com',
       env: envFor('bob'),
-      coordRoot,
+      stRoot,
     });
     expect(() =>
       cmdResourceRemove({
         filename: bobAdded.filename,
         env: envFor('alice'),
-        coordRoot,
+        stRoot,
       })
     ).toThrow(ResourceNotFoundError);
     // Bob's file is intact.
@@ -424,20 +424,20 @@ describe('listResourceRecords', () => {
     cmdResourceAdd({
       url: 'https://example.com/a',
       env: envFor('alice'),
-      coordRoot,
+      stRoot,
     });
     cmdResourceAdd({
       url: 'https://example.com/b',
       env: envFor('alice'),
-      coordRoot,
+      stRoot,
     });
-    const items = listResourceRecords('alice', coordRoot);
+    const items = listResourceRecords('alice', stRoot);
     expect(items).toHaveLength(2);
     // sorted by filename (which is timestamp-prefixed)
     expect(items[0]!.filename < items[1]!.filename).toBe(true);
   });
 
   it('missing folder → [] (no throw)', () => {
-    expect(listResourceRecords('nobody', coordRoot)).toEqual([]);
+    expect(listResourceRecords('nobody', stRoot)).toEqual([]);
   });
 });

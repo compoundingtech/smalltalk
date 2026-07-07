@@ -23,7 +23,7 @@ import type { CliContext } from '../../src/cli-context.ts';
 import { cmdReply, cmdReplyCli } from '../../src/commands/reply.ts';
 
 let scratch: string;
-let coordRoot: string;
+let stRoot: string;
 let ctx: CliContext;
 let stdoutBuf: string;
 let stderrBuf: string;
@@ -35,7 +35,7 @@ function plantMessage(
   fm: Record<string, string>,
   body: string
 ): void {
-  const dir = join(coordRoot, identity, sub);
+  const dir = join(stRoot, identity, sub);
   mkdirSync(dir, { recursive: true });
   const head = Object.entries(fm)
     .map(([k, v]) => `${k}: ${v}`)
@@ -45,16 +45,16 @@ function plantMessage(
 
 beforeEach(() => {
   scratch = mkdtempSync(join(tmpdir(), 'st-reply-'));
-  coordRoot = scratch;
+  stRoot = scratch;
   stdoutBuf = '';
   stderrBuf = '';
   ctx = {
     env: {
       ST_AGENT: 'bob',
-      ST_ROOT: coordRoot,
+      ST_ROOT: stRoot,
     } as NodeJS.ProcessEnv,
-    coordRoot,
-    coordConfig: undefined,
+    stRoot,
+    stConfig: undefined,
     stdout: (s) => {
       stdoutBuf += s;
     },
@@ -85,17 +85,17 @@ describe('cmdReply — programmatic reply to a message', () => {
       thread: '1783400000000-abcdef.md',
       body: 'hi alice',
       env: ctx.env,
-      coordRoot,
+      stRoot,
     });
     // Reply lives in alice/inbox (recipient derived from parent's from:).
     expect(r.identity).toBe('alice');
-    const aliceInbox = readdirSync(join(coordRoot, 'alice', 'inbox'));
+    const aliceInbox = readdirSync(join(stRoot, 'alice', 'inbox'));
     expect(aliceInbox).toContain(r.filename);
     // The reply body includes the frontmatter with inReplyTo + subject.
     // Note: no explicit `to:` in the frontmatter — the directory it
     // was written into IS the recipient (LAYOUT-004).
     const replyText = readFileSync(
-      join(coordRoot, 'alice', 'inbox', r.filename),
+      join(stRoot, 'alice', 'inbox', r.filename),
       'utf8'
     );
     expect(replyText).toContain('from: bob');
@@ -119,12 +119,12 @@ describe('cmdReply — programmatic reply to a message', () => {
       thread: '1783400000001-abcdef.md',
       body: 'reply to archived',
       env: ctx.env,
-      coordRoot,
+      stRoot,
     });
     expect(r.identity).toBe('alice');
     // Subject still derives from the archived parent.
     const t = readFileSync(
-      join(coordRoot, 'alice', 'inbox', r.filename),
+      join(stRoot, 'alice', 'inbox', r.filename),
       'utf8'
     );
     expect(t).toContain('re: archived');
@@ -145,7 +145,7 @@ describe('cmdReply — programmatic reply to a message', () => {
       thread: '1783400000002-abcdef.md',
       body: 'from bob',
       env: ctx.env,
-      coordRoot,
+      stRoot,
     });
     expect(r.identity).toBe('alice');
   });
@@ -163,10 +163,10 @@ describe('cmdReply — programmatic reply to a message', () => {
       body: 'hi',
       subject: 'custom-subject',
       env: ctx.env,
-      coordRoot,
+      stRoot,
     });
     const t = readFileSync(
-      join(coordRoot, 'alice', 'inbox', r.filename),
+      join(stRoot, 'alice', 'inbox', r.filename),
       'utf8'
     );
     expect(t).toContain('subject: custom-subject');
@@ -185,10 +185,10 @@ describe('cmdReply — programmatic reply to a message', () => {
       thread: '1783400000004-abcdef.md',
       body: 'hi',
       env: ctx.env,
-      coordRoot,
+      stRoot,
     });
     const t = readFileSync(
-      join(coordRoot, 'alice', 'inbox', r.filename),
+      join(stRoot, 'alice', 'inbox', r.filename),
       'utf8'
     );
     expect(t).not.toContain('subject:');
@@ -208,7 +208,7 @@ describe('cmdReply — programmatic reply to a message', () => {
         thread: '1783400000005-bbbbbb.md',
         body: 'x',
         env: ctx.env,
-        coordRoot,
+        stRoot,
       })
     ).toThrow(/not found/i);
   });
@@ -222,13 +222,13 @@ describe('cmdReply — programmatic reply to a message', () => {
       'x'
     );
     // Drop ST_AGENT.
-    const envNoId = { ST_ROOT: coordRoot } as NodeJS.ProcessEnv;
+    const envNoId = { ST_ROOT: stRoot } as NodeJS.ProcessEnv;
     expect(() =>
       cmdReply({
         thread: '1783400000006-abcdef.md',
         body: 'x',
         env: envNoId,
-        coordRoot,
+        stRoot,
       })
     ).toThrow(/ST_AGENT/);
   });
@@ -251,10 +251,10 @@ describe('cmdReplyCli — parses <thread> + -m + --subject and delegates', () =>
     // Filename printed to stdout.
     expect(stdoutBuf).toMatch(/^\d+-[a-z0-9]+\.md\n$/);
     // Reply landed in alice's inbox.
-    const files = readdirSync(join(coordRoot, 'alice', 'inbox'));
+    const files = readdirSync(join(stRoot, 'alice', 'inbox'));
     expect(files).toHaveLength(1);
     const t = readFileSync(
-      join(coordRoot, 'alice', 'inbox', files[0]!),
+      join(stRoot, 'alice', 'inbox', files[0]!),
       'utf8'
     );
     expect(t).toContain('inline body');
@@ -277,9 +277,9 @@ describe('cmdReplyCli — parses <thread> + -m + --subject and delegates', () =>
       ctx
     );
     expect(rc).toBe(0);
-    const files = readdirSync(join(coordRoot, 'alice', 'inbox'));
+    const files = readdirSync(join(stRoot, 'alice', 'inbox'));
     const t = readFileSync(
-      join(coordRoot, 'alice', 'inbox', files[0]!),
+      join(stRoot, 'alice', 'inbox', files[0]!),
       'utf8'
     );
     expect(t).toContain('long-form');
@@ -303,9 +303,9 @@ describe('cmdReplyCli — parses <thread> + -m + --subject and delegates', () =>
       ],
       ctx
     );
-    const files = readdirSync(join(coordRoot, 'alice', 'inbox'));
+    const files = readdirSync(join(stRoot, 'alice', 'inbox'));
     const t = readFileSync(
-      join(coordRoot, 'alice', 'inbox', files[0]!),
+      join(stRoot, 'alice', 'inbox', files[0]!),
       'utf8'
     );
     expect(t).toContain('subject: CUSTOM');

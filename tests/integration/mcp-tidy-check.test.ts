@@ -43,7 +43,7 @@ interface TidyNotification {
 const ID = 'alice';
 
 let scratch: string;
-let coordRoot: string;
+let stRoot: string;
 let client: Client;
 let handle: ReturnType<typeof createMcpServer>;
 let run: Promise<void> | undefined;
@@ -51,7 +51,7 @@ let received: TidyNotification[];
 
 async function boot(opts: { tidyCheckIntervalMs?: number; channel?: boolean } = {}): Promise<void> {
   handle = createMcpServer({
-    root: coordRoot,
+    root: stRoot,
     identity: asIdentity(ID),
     channel: opts.channel ?? true,
     channelWatcherOptions: { usePolling: true, pollInterval: 50 },
@@ -85,12 +85,12 @@ async function boot(opts: { tidyCheckIntervalMs?: number; channel?: boolean } = 
 
 beforeEach(() => {
   scratch = mkdtempSync(join(tmpdir(), 'coord-mcp-tidy-'));
-  coordRoot = join(scratch, 'coord');
-  mkdirSync(join(coordRoot, ID, 'inbox'), { recursive: true });
-  mkdirSync(join(coordRoot, ID, 'archive'), { recursive: true });
+  stRoot = join(scratch, 'coord');
+  mkdirSync(join(stRoot, ID, 'inbox'), { recursive: true });
+  mkdirSync(join(stRoot, ID, 'archive'), { recursive: true });
   // Mark identity as `available` so the gate doesn't suppress emits
   // by default. Tests that exercise busy/dnd/unknown overwrite this.
-  writeFileSync(join(coordRoot, ID, 'status'), 'available\n');
+  writeFileSync(join(stRoot, ID, 'status'), 'available\n');
   received = [];
 });
 
@@ -129,7 +129,7 @@ async function waitFor(
 }
 
 function plantInboxStale(filename: string): void {
-  const path = join(coordRoot, ID, 'inbox', filename);
+  const path = join(stRoot, ID, 'inbox', filename);
   writeFileSync(path, '---\nfrom: bob\n---\nbody\n');
   const t = new Date(Date.now() - STALE_INBOX_MS - 60_000);
   utimesSync(path, t, t);
@@ -179,7 +179,7 @@ describe('tidy-check tick — dedup behavior', () => {
     await waitFor(() => received.length >= 1);
 
     // Clear the inbox.
-    rmSync(join(coordRoot, ID, 'inbox', filename));
+    rmSync(join(stRoot, ID, 'inbox', filename));
     // Give the tick a beat to observe "no drift" and update lastFired.
     await new Promise((r) => setTimeout(r, 100));
 
@@ -194,7 +194,7 @@ describe('tidy-check tick — dedup behavior', () => {
 
 describe('tidy-check tick — status gate', () => {
   async function withStatus(status: string): Promise<void> {
-    writeFileSync(join(coordRoot, ID, 'status'), `${status}\n`);
+    writeFileSync(join(stRoot, ID, 'status'), `${status}\n`);
   }
 
   it('status: busy → tick is a no-op (no emit)', async () => {
@@ -229,7 +229,7 @@ describe('tidy-check tick — status gate', () => {
 
     // Flip back; the gate stops returning early, and since lastFired
     // wasn't updated during busy, the drift still looks new.
-    writeFileSync(join(coordRoot, ID, 'status'), 'available\n');
+    writeFileSync(join(stRoot, ID, 'status'), 'available\n');
     await waitFor(() => received.length >= 1);
   });
 });

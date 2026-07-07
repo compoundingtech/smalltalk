@@ -25,8 +25,8 @@ function makeCtx(): CliContext {
       ST_AGENT: 'alice',
       HOME: process.env.HOME ?? '/tmp',
     } as NodeJS.ProcessEnv,
-    coordRoot: scratch,
-    coordConfig: undefined,
+    stRoot: scratch,
+    stConfig: undefined,
     stdout: (s) => {
       stdoutBuf += s;
     },

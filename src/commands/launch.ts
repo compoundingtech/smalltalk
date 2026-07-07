@@ -37,7 +37,7 @@ import { dirname, isAbsolute, join, resolve } from 'node:path';
 
 import type { CliContext } from '../cli-context.ts';
 import {
-  coordRootFrom,
+  stRootFrom,
   ensureIdentityDirs,
   envAgentFrom,
   rand6,
@@ -242,7 +242,7 @@ export interface LaunchInput {
   fresh?: boolean | undefined;
 
   env: NodeJS.ProcessEnv;
-  coordRoot: string;
+  stRoot: string;
 }
 
 export interface LaunchResult {
@@ -680,8 +680,8 @@ function buildPtyToml(opts: {
    * `ST_ROOT` env var); the goal is a uniform inspection signal
    * that separates "this is a smalltalk-network session" from
    * an operator's ad-hoc pty use. Value is the resolved network
-   * root — the same `input.coordRoot` cmdLaunch already computes
-   * via `coordRootFrom(ctx.env)`, so it's always a valid path
+   * root — the same `input.stRoot` cmdLaunch already computes
+   * via `stRootFrom(ctx.env)`, so it's always a valid path
    * regardless of whether the invoker set `ST_ROOT` explicitly.
    *
    * pty needs zero change to filter on this: its `--filter-tag
@@ -769,7 +769,7 @@ function buildPtyToml(opts: {
     lines.push(`PTY_ROOT = "${tomlEscape(opts.ptyRoot)}"`);
   }
   if (opts.addDingSidecar) {
-    // Emit `st ding` (post-cutover canonical). The `coord ding` form
+    // Emit `st ding` (post-cutover canonical). The `st ding` form
     // still works because `coord` is a dual alias, but hardcoding
     // the legacy name into every fresh pty.toml perpetuates the
     // drift — future removal of the coord alias would silently
@@ -953,7 +953,7 @@ export function resolveStBinPath(coordBin: string): string | null {
  *   - **PreCompact** (task #33 hook-legs) — writes a stub to
  *     `context/now.md` if the model hasn't recently flushed, so
  *     boot-rehydrate has something to inject after compaction.
- *   - **StopFailure** — surfaces API-error wedges to myobie via the
+ *   - **StopFailure** — surfaces API-error wedges to operator via the
  *     st CLI so a quiet, wedged session doesn't go unnoticed.
  *
  * All three point at the shipped scripts under
@@ -1508,7 +1508,7 @@ export async function cmdLaunch(
   // Lazy-create the agent's inbox/archive so channel watcher + status
   // writer have something to point at.
   if (!input.dryRun) {
-    ensureIdentityDirs(identity, input.coordRoot);
+    ensureIdentityDirs(identity, input.stRoot);
   }
 
   // ─── .mcp.json bootstrap (via cmdInit) ──────────────────────────────
@@ -1727,8 +1727,8 @@ export async function cmdLaunch(
   // Isolation-robust `ST_ROOT` propagation: when the invoker had
   // ST_ROOT (or legacy COORD_ROOT) explicitly set, bake the resolved
   // absolute path into the generated pty.toml's `[sessions.*.env]`.
-  // `input.coordRoot` is already the resolved value (via
-  // `coordRootFrom(ctx.env)` at the CLI layer), so this pins the
+  // `input.stRoot` is already the resolved value (via
+  // `stRootFrom(ctx.env)` at the CLI layer), so this pins the
   // exact tree the launch is scoping to — a later `pty up` /
   // `pty restart` / `pty gc` resurrection from any shell will keep
   // the isolation instead of falling back to the live default root.
@@ -1736,7 +1736,7 @@ export async function cmdLaunch(
   // freeze today's default into future restarts.
   const stRootForSession: string | undefined =
     input.env.ST_ROOT !== undefined || input.env.COORD_ROOT !== undefined
-      ? input.coordRoot
+      ? input.stRoot
       : undefined;
   // Direct-PTY_ROOT env support: if the invoker explicitly set
   // `$PTY_ROOT`, use it verbatim — decoupled from `stRoot`. Solves
@@ -1802,9 +1802,9 @@ export async function cmdLaunch(
       agentStrategy,
       // Phase-1 pty isolation label. Always emitted (unlike
       // stRoot, which conditionally emits the ST_ROOT env line);
-      // input.coordRoot is resolved at the CLI layer and always
+      // input.stRoot is resolved at the CLI layer and always
       // a valid path.
-      network: input.coordRoot,
+      network: input.stRoot,
     });
     ptyTomlPreview = preview;
     if (!input.dryRun && !existsSync(ptyTomlPath)) {
@@ -1830,9 +1830,9 @@ export async function cmdLaunch(
       agentStrategy,
       // Phase-1 pty isolation label. Always emitted (unlike
       // stRoot, which conditionally emits the ST_ROOT env line);
-      // input.coordRoot is resolved at the CLI layer and always
+      // input.stRoot is resolved at the CLI layer and always
       // a valid path.
-      network: input.coordRoot,
+      network: input.stRoot,
     });
   }
 
@@ -2143,10 +2143,10 @@ const LAUNCH_HELP =
   '    st launch claude                              # anon identity, channel mode + boot hooks\n' +
   '    st launch claude --identity alice             # persistent identity\n' +
   '    st launch claude --identity cos --permanent \\\n' +
-  '        --persona ~/src/github.com/myobie/personas/chief-of-staff.md\n' +
+  '        --persona ~/src/github.com/operator/personas/chief-of-staff.md\n' +
   '                                                  # production CoS (MCP mode)\n' +
   '    st launch claude --identity cos --permanent --ding \\\n' +
-  '        --persona ~/src/github.com/myobie/personas/chief-of-staff.md\n' +
+  '        --persona ~/src/github.com/operator/personas/chief-of-staff.md\n' +
   '                                                  # production CoS (ding-mode; no MCP)\n' +
   '    st launch claude --no-hooks                   # skip .claude/settings.local.json\n' +
   '    st launch codex                               # + st ding sidecar\n' +
@@ -2267,7 +2267,7 @@ export async function cmdLaunchCli(
       fresh,
       dryRun,
       env: ctx.env,
-      coordRoot: ctx.coordRoot,
+      stRoot: ctx.stRoot,
     },
     ctx
   );

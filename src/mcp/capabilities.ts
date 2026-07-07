@@ -1,5 +1,5 @@
 // mcp/capabilities.ts — canonical name/version/capabilities for the
-// `coord mcp` server. Centralized here so lifecycle / channel tests can
+// `st mcp` server. Centralized here so lifecycle / channel tests can
 // snapshot the exact same options the server is built from.
 
 import type { ServerOptions } from '@modelcontextprotocol/sdk/server/index.js';
@@ -12,7 +12,7 @@ import type { Implementation } from '@modelcontextprotocol/sdk/types.js';
  * name (`coord` / `st`) the CLI was invoked as.
  */
 export const SERVER_INFO: Implementation = {
-  name: 'coord',
+  name: 'st',
   // Tracks the package version. We don't read package.json here to keep
   // the MCP module side-effect free; bump on every coord release.
   // 0.1.0 — brief-022 ships unknown-state + boot ritual + offline-on-
@@ -47,7 +47,7 @@ export const SERVER_INFO: Implementation = {
   //         coord.archiveTrim gain `withAttachments`; new
   //         coord.lsOrphans and coord.ding on the handle). No CLI
   //         or MCP surface change.
-  // 0.8.1 — `coord mcp` startup falls back to a throwaway
+  // 0.8.1 — `st mcp` startup falls back to a throwaway
   //         `anon-<rand6>` agent when no ST_AGENT/ST_IDENTITY/
   //         COORD_IDENTITY is set, instead of hard-exiting. Unblocks
   //         MCP hosts (Codex etc.) that spawn the server without
@@ -56,7 +56,7 @@ export const SERVER_INFO: Implementation = {
   // 0.9.0 — brief-016: `smalltalk launch <claude|codex>` verb —
   //         one-command harness bootstrap onto smalltalk (identity,
   //         .mcp.json, session-id, pty registration when available,
-  //         `coord ding` sidecar for codex, `ollama launch` route
+  //         `st ding` sidecar for codex, `ollama launch` route
   //         for GLM-backed launches via --model).
   // 0.9.1 — brief-020 (HB-4): channel-watcher wake reliability —
   //         adds a polling backstop that catches inbox files
@@ -69,11 +69,11 @@ export const SERVER_INFO: Implementation = {
 };
 
 /**
- * Build a server-info record that announces under the canonical name
- * derived from the binary the user invoked. `coord` → `coord`;
- * `st` / `smalltalk` → `st`. brief-005-phase0 §2.
+ * Build a server-info record that announces under the canonical name.
+ * Post-coord-cutover: `st` is the only canonical name — `smalltalk`
+ * resolves to `st` via {@link canonicalServerName}.
  */
-export function buildServerInfo(name: 'coord' | 'st'): Implementation {
+export function buildServerInfo(name: 'st'): Implementation {
   return { ...SERVER_INFO, name };
 }
 

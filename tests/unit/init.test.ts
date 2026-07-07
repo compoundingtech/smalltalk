@@ -1,4 +1,4 @@
-// tests/unit/init.test.ts — `coord init` writes/merges .mcp.json.
+// tests/unit/init.test.ts — `st init` writes/merges .mcp.json.
 //
 // brief-026: surgical idempotent merge on mcpServers.st; preserves
 // other servers; prompt-gated on divergent existing entries; atomic
@@ -52,8 +52,8 @@ function makeCtx(stdin = ''): RecordedCtx {
   const stderrBuf = { v: '' };
   const ctx: RecordedCtx = {
     env: {} as NodeJS.ProcessEnv,
-    coordRoot: '/unused',
-    coordConfig: '/unused',
+    stRoot: '/unused',
+    stConfig: '/unused',
     stdout: (s) => {
       stdoutBuf.v += s;
     },
@@ -220,10 +220,12 @@ describe('cmdInit — merge into existing .mcp.json', () => {
     expect(ctx.stderrBuf).toMatch(/already has matching st entry/);
   });
 
-  it('byte-identical legacy `coord` entry → already-configured no-op (back-compat)', async () => {
-    // A pre-cutover .mcp.json that still uses the `coord` key is
-    // still recognized. init reads both keys, prefers `st` when both
-    // are present. This test proves the coord back-compat read path.
+  it('legacy `coord` key is IGNORED — treated as absent (regression guard for the cutover)', async () => {
+    // Post-coord-cutover: init no longer reads the `coord` key from
+    // pre-cutover .mcp.json files. A file with only `coord:` looks
+    // "empty" to init, which merges its own `st:` entry alongside.
+    // The `coord:` key is left untouched (users can rm .mcp.json to
+    // re-init a clean file).
     writeFileSync(
       join(scratch, '.mcp.json'),
       JSON.stringify(
@@ -246,8 +248,14 @@ describe('cmdInit — merge into existing .mcp.json', () => {
       { dir: scratch, binPath: FAKE_BIN },
       ctx
     );
-    expect(r.outcome).toBe('already-configured');
-    expect(ctx.stderrBuf).toMatch(/already has matching coord entry/);
+    // NOT `already-configured` — the coord entry is invisible.
+    expect(r.outcome).toBe('merged-into-existing');
+    // The st entry now exists; coord entry is left alone (not read,
+    // not written, not deleted).
+    const parsed = readJson(join(scratch, '.mcp.json'));
+    const servers = parsed.mcpServers as Record<string, { command: string }>;
+    expect(servers.st?.command).toBe(FAKE_BIN);
+    expect(servers.coord).toBeDefined(); // untouched
   });
 });
 
@@ -255,18 +263,16 @@ describe('cmdInit — merge into existing .mcp.json', () => {
 
 describe('cmdInit — divergent existing entry', () => {
   function plantDivergentEntry(): void {
-    // Plants a divergent LEGACY `coord:` entry (worst-case: pre-
-    // cutover file) to exercise both back-compat read + overwrite +
-    // legacy-key drop on the write. Overwrite must land as `st:`
-    // (post-cutover shape) and remove the `coord:` key.
+    // Plants a divergent `st:` entry to exercise overwrite +
+    // prompt-skip paths.
     writeFileSync(
       join(scratch, '.mcp.json'),
       JSON.stringify(
         {
           mcpServers: {
-            coord: {
+            st: {
               type: 'stdio',
-              command: '/old/path/to/coord',
+              command: '/old/path/to/st',
               args: ['mcp'],
               env: {},
             },
@@ -403,14 +409,16 @@ describe('cmdInit — error handling', () => {
 // ─── Source-level regression: no hardcoded developer paths ──────────────
 
 describe('source guard — no hardcoded developer paths in init.ts', () => {
-  it('init.ts does not contain a literal `/Volumes/` or `/Users/myobie`', () => {
-    // brief-026 boundary: the verb is meant to *eliminate* hardcoded
-    // paths, so the implementation itself must not contain one.
+  it('init.ts does not contain any hardcoded developer paths', () => {
+    // The verb is meant to *eliminate* hardcoded paths, so the
+    // implementation itself must not contain one.
     const src = readFileSync(
       new URL('../../src/commands/init.ts', import.meta.url),
       'utf8'
     );
-    expect(src).not.toMatch(/\/Volumes\//);
-    expect(src).not.toMatch(/\/Users\/myobie/);
+    // No absolute paths under /Volumes, /Users, or /home.
+    expect(src).not.toMatch(/\/Volumes\/[A-Za-z]/);
+    expect(src).not.toMatch(/\/Users\/[a-z]/);
+    expect(src).not.toMatch(/\/home\/[a-z]+\//);
   });
 });

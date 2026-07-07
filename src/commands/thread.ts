@@ -26,7 +26,7 @@ export interface ThreadInput {
   /** When true, indented hierarchical output. Otherwise flat chronological. */
   tree?: boolean;
   env: NodeJS.ProcessEnv;
-  coordRoot: string;
+  stRoot: string;
 }
 
 export interface ThreadLine {
@@ -50,7 +50,7 @@ export function cmdThread(input: ThreadInput): ThreadResult {
   resolveIdentity({
     explicit: input.recipient,
     env: input.env,
-    coordRoot: input.coordRoot,
+    stRoot: input.stRoot,
     ...(input.recipient ? { policy: 'lenient' as const } : {}),
   });
 
@@ -58,7 +58,7 @@ export function cmdThread(input: ThreadInput): ThreadResult {
     throw new InvalidFilenameError(input.filename);
   }
 
-  const seedPath = locateAnywhere(input.coordRoot, input.filename);
+  const seedPath = locateAnywhere(input.stRoot, input.filename);
   if (seedPath === undefined) {
     throw new MessageNotFoundError('', input.filename);
   }
@@ -68,7 +68,7 @@ export function cmdThread(input: ThreadInput): ThreadResult {
   const inChain = new Set<string>();
   let current: string | undefined = input.filename;
   while (current !== undefined) {
-    const path = locateAnywhere(input.coordRoot, current);
+    const path = locateAnywhere(input.stRoot, current);
     if (path === undefined) break;
     ancestorsTopDown.unshift(current);
     inChain.add(current);
@@ -80,32 +80,32 @@ export function cmdThread(input: ThreadInput): ThreadResult {
   }
 
   if (input.tree === true) {
-    return treeOutput(input.coordRoot, input.filename, ancestorsTopDown);
+    return treeOutput(input.stRoot, input.filename, ancestorsTopDown);
   }
-  return flatOutput(input.coordRoot, input.filename, ancestorsTopDown);
+  return flatOutput(input.stRoot, input.filename, ancestorsTopDown);
 }
 
 // ─── Output modes ───────────────────────────────────────────────────────
 
 function flatOutput(
-  coordRoot: string,
+  stRoot: string,
   seed: string,
   ancestors: readonly string[]
 ): ThreadResult {
   const reachable = new Set<string>(ancestors);
-  collectDescendants(coordRoot, seed, reachable);
+  collectDescendants(stRoot, seed, reachable);
 
   const sorted = [...reachable].sort();
   const lines: ThreadLine[] = sorted.map((name) => ({
     filename: name,
-    ...readFromSubject(coordRoot, name),
+    ...readFromSubject(stRoot, name),
     depth: 0,
   }));
   return { lines };
 }
 
 function treeOutput(
-  coordRoot: string,
+  stRoot: string,
   seed: string,
   ancestors: readonly string[]
 ): ThreadResult {
@@ -116,27 +116,27 @@ function treeOutput(
     const name = ancestors[i]!;
     lines.push({
       filename: name,
-      ...readFromSubject(coordRoot, name),
+      ...readFromSubject(stRoot, name),
       depth: i,
     });
     printed.add(name);
   }
-  descendForTree(coordRoot, seed, ancestors.length, printed, lines);
+  descendForTree(stRoot, seed, ancestors.length, printed, lines);
   return { lines };
 }
 
 // ─── Walk helpers ───────────────────────────────────────────────────────
 
-function locateAnywhere(coordRoot: string, name: string): string | undefined {
+function locateAnywhere(stRoot: string, name: string): string | undefined {
   let topEntries: string[];
   try {
-    topEntries = readdirSync(coordRoot);
+    topEntries = readdirSync(stRoot);
   } catch {
     return undefined;
   }
   for (const id of topEntries) {
     for (const sub of ['inbox', 'archive']) {
-      const candidate = join(coordRoot, id, sub, name);
+      const candidate = join(stRoot, id, sub, name);
       try {
         if (statSync(candidate).isFile()) return candidate;
       } catch {
@@ -156,10 +156,10 @@ function readFm(path: string): { fm: Record<string, unknown>; body: string } {
 }
 
 function readFromSubject(
-  coordRoot: string,
+  stRoot: string,
   name: string
 ): { from: string; subject: string } {
-  const path = locateAnywhere(coordRoot, name);
+  const path = locateAnywhere(stRoot, name);
   if (path === undefined) return { from: '', subject: '' };
   const fm = readFm(path).fm;
   const from = typeof fm.from === 'string' ? fm.from : '';
@@ -167,17 +167,17 @@ function readFromSubject(
   return { from, subject };
 }
 
-function findChildrenOf(coordRoot: string, parent: string): string[] {
+function findChildrenOf(stRoot: string, parent: string): string[] {
   const children = new Set<string>();
   let topEntries: string[];
   try {
-    topEntries = readdirSync(coordRoot);
+    topEntries = readdirSync(stRoot);
   } catch {
     return [];
   }
   for (const id of topEntries) {
     for (const sub of ['inbox', 'archive']) {
-      const dir = join(coordRoot, id, sub);
+      const dir = join(stRoot, id, sub);
       let entries: string[];
       try {
         entries = readdirSync(dir);
@@ -196,37 +196,37 @@ function findChildrenOf(coordRoot: string, parent: string): string[] {
 }
 
 function collectDescendants(
-  coordRoot: string,
+  stRoot: string,
   parent: string,
   set: Set<string>
 ): void {
   // Track which children we actually added; only recurse into those, so
   // a cycle in in-reply-to doesn't bounce between the same two names.
   const fresh: string[] = [];
-  for (const name of findChildrenOf(coordRoot, parent)) {
+  for (const name of findChildrenOf(stRoot, parent)) {
     if (set.has(name)) continue;
     set.add(name);
     fresh.push(name);
   }
   for (const name of fresh) {
-    collectDescendants(coordRoot, name, set);
+    collectDescendants(stRoot, name, set);
   }
 }
 
 function descendForTree(
-  coordRoot: string,
+  stRoot: string,
   parent: string,
   depth: number,
   printed: Set<string>,
   out: ThreadLine[]
 ): void {
-  const children = findChildrenOf(coordRoot, parent).filter(
+  const children = findChildrenOf(stRoot, parent).filter(
     (c) => !printed.has(c)
   );
   for (const name of children) {
-    out.push({ filename: name, ...readFromSubject(coordRoot, name), depth });
+    out.push({ filename: name, ...readFromSubject(stRoot, name), depth });
     printed.add(name);
-    descendForTree(coordRoot, name, depth + 1, printed, out);
+    descendForTree(stRoot, name, depth + 1, printed, out);
   }
 }
 
@@ -297,7 +297,7 @@ export function cmdThreadCli(args: readonly string[], ctx: CliContext): number {
     filename,
     tree,
     env: ctx.env,
-    coordRoot: ctx.coordRoot,
+    stRoot: ctx.stRoot,
   });
   for (const line of r.lines) ctx.stdout(`${formatThreadLine(line)}\n`);
   return 0;

@@ -1,9 +1,9 @@
-// tests/unit/mcp-cli.test.ts — env contract for `coord mcp` CLI.
+// tests/unit/mcp-cli.test.ts — env contract for `st mcp` CLI.
 //
 // The CLI's env handling diverged from every other coord verb until
-// brief-021 unified it: ST_AGENT (or legacy ST_IDENTITY/COORD_IDENTITY)
-// resolves identity; ST_ROOT/COORD_ROOT defaults to
-// ~/.local/state/smalltalk via coordRootFrom(). When no env identity
+// brief-021 unified it: ST_AGENT (or legacy ST_IDENTITY/ST_AGENT)
+// resolves identity; ST_ROOT/ST_ROOT defaults to
+// ~/.local/state/smalltalk via stRootFrom(). When no env identity
 // is set, the server falls back to a throwaway `anon-<rand6>` identity
 // (Nathan's call, per the Codex-host gap) rather than hard-exiting.
 // These tests pin all three contracts.
@@ -46,8 +46,8 @@ vi.mock('../../src/mcp/index.ts', () => ({
 function makeCtx(env: NodeJS.ProcessEnv): CliContext {
   return {
     env,
-    coordRoot: '/unused-by-mcp',
-    coordConfig: '/unused-by-mcp',
+    stRoot: '/unused-by-mcp',
+    stConfig: '/unused-by-mcp',
     stdout: () => {},
     stderr: () => {},
     readStdin: async () => Buffer.alloc(0),
@@ -63,8 +63,8 @@ afterEach(() => {
 });
 
 describe('cmdMcpCli — env contract', () => {
-  it('boots with only COORD_IDENTITY set; COORD_ROOT defaults', async () => {
-    await cmdMcpCli([], makeCtx({ COORD_IDENTITY: 'alice' }));
+  it('boots with only ST_AGENT set; ST_ROOT defaults', async () => {
+    await cmdMcpCli([], makeCtx({ ST_AGENT: 'alice' }));
     expect(createMcpServerSpy).toHaveBeenCalledTimes(1);
     const opts = createMcpServerSpy.mock.calls[0]?.[0] as {
       root: string;
@@ -78,10 +78,10 @@ describe('cmdMcpCli — env contract', () => {
     expect(opts.root.endsWith('.local/state/smalltalk')).toBe(true);
   });
 
-  it('explicit COORD_ROOT wins over the default', async () => {
+  it('explicit ST_ROOT wins over the default', async () => {
     await cmdMcpCli(
       [],
-      makeCtx({ COORD_IDENTITY: 'alice', COORD_ROOT: '/tmp/some-root' })
+      makeCtx({ ST_AGENT: 'alice', ST_ROOT: '/tmp/some-root' })
     );
     expect(createMcpServerSpy).toHaveBeenCalledTimes(1);
     const opts = createMcpServerSpy.mock.calls[0]?.[0] as { root: string };
@@ -89,7 +89,7 @@ describe('cmdMcpCli — env contract', () => {
   });
 
   it('--channel flag flips channel mode on', async () => {
-    await cmdMcpCli(['--channel'], makeCtx({ COORD_IDENTITY: 'alice' }));
+    await cmdMcpCli(['--channel'], makeCtx({ ST_AGENT: 'alice' }));
     const opts = createMcpServerSpy.mock.calls[0]?.[0] as { channel: boolean };
     expect(opts.channel).toBe(true);
   });
@@ -121,7 +121,7 @@ describe('cmdMcpCli — anon-identity fallback', () => {
     rmSync(scratchRoot, { recursive: true, force: true });
   });
 
-  it('no ST_AGENT / ST_IDENTITY / COORD_IDENTITY set → boots with an anon-<rand6> identity', async () => {
+  it('no ST_AGENT / ST_IDENTITY / ST_AGENT set → boots with an anon-<rand6> identity', async () => {
     await cmdMcpCli([], makeCtx({ ST_ROOT: scratchRoot }));
     expect(createMcpServerSpy).toHaveBeenCalledTimes(1);
     const opts = createMcpServerSpy.mock.calls[0]?.[0] as { identity: string };
@@ -183,11 +183,11 @@ describe('cmdMcpCli — anon-identity fallback', () => {
     expect(stderrCapture).not.toMatch(/no ST_AGENT set/);
   });
 
-  it('legacy COORD_IDENTITY still wins over fallback (with the existing deprecation notice)', async () => {
+  it('legacy ST_AGENT still wins over fallback (with the existing deprecation notice)', async () => {
     let stderrCapture = '';
     const ctx = makeCtx({
       ST_ROOT: scratchRoot,
-      COORD_IDENTITY: 'legacy-bob',
+      ST_AGENT: 'legacy-bob',
     });
     ctx.stderr = (s) => {
       stderrCapture += s;

@@ -1,6 +1,6 @@
-// tests/integration/helpers.ts — shared utilities for the real-bin/coord suite.
+// tests/integration/helpers.ts — shared utilities for the real-bin/st suite.
 //
-// These helpers spawn the actual `bin/coord` binary (which execs `node
+// These helpers spawn the actual `bin/st` binary (which execs `node
 // --experimental-strip-types src/cli.ts`) so the integration tests
 // exercise argv parsing, stdin handling, exit codes, and real-rsync
 // invocation end to end.
@@ -19,7 +19,7 @@ import { Session } from '@myobie/pty/testing';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 export const REPO_ROOT = resolve(HERE, '..', '..');
-export const COORD_BIN = join(REPO_ROOT, 'bin', 'coord');
+export const COORD_BIN = join(REPO_ROOT, 'bin', 'st');
 
 // ─── Auto-cleanup of scratch dirs ───────────────────────────────────────
 
@@ -62,7 +62,7 @@ export function mkScratch(): string {
 }
 
 /**
- * Creates a fresh `$COORD_ROOT` subdirectory under a scratch dir.
+ * Creates a fresh `$ST_ROOT` subdirectory under a scratch dir.
  * Equivalent to mkScratch() + a child `coord/` folder so tests that
  * also want a scratch peer directory can do `mkScratch()` separately.
  */
@@ -94,11 +94,11 @@ export function mkIdentity(root: string, id: string): void {
 // ─── runCoord (one-shot child_process) ──────────────────────────────────
 
 export interface RunCoordOptions {
-  /** $COORD_ROOT for this invocation. */
-  coordRoot?: string;
-  /** $COORD_CONFIG for this invocation. */
-  coordConfig?: string;
-  /** $COORD_IDENTITY for this invocation. */
+  /** $ST_ROOT for this invocation. */
+  stRoot?: string;
+  /** $ST_CONFIG for this invocation. */
+  stConfig?: string;
+  /** $ST_AGENT for this invocation. */
   coordIdentity?: string;
   /** Additional env variables (merged on top of the above). */
   env?: NodeJS.ProcessEnv;
@@ -119,7 +119,7 @@ export interface RunCoordResult {
 /**
  * Spawns `bin/coord <args...>` synchronously and returns captured stdout,
  * stderr, and exit code. Uses spawnSync so tests stay simple — the only
- * commands that need streaming output are `coord watch`, which uses
+ * commands that need streaming output are `st watch`, which uses
  * {@link runCoordPty} instead.
  */
 export function runCoord(
@@ -132,9 +132,9 @@ export function runCoord(
     HOME: process.env.HOME,
     ...(opts.env ?? {}),
   };
-  if (opts.coordRoot !== undefined) env.COORD_ROOT = opts.coordRoot;
-  if (opts.coordConfig !== undefined) env.COORD_CONFIG = opts.coordConfig;
-  if (opts.coordIdentity !== undefined) env.COORD_IDENTITY = opts.coordIdentity;
+  if (opts.stRoot !== undefined) env.ST_ROOT = opts.stRoot;
+  if (opts.stConfig !== undefined) env.ST_CONFIG = opts.stConfig;
+  if (opts.coordIdentity !== undefined) env.ST_AGENT = opts.coordIdentity;
 
   const spawnOpts: SpawnSyncOptions = {
     cwd: opts.cwd ?? REPO_ROOT,
@@ -159,8 +159,8 @@ export function runCoord(
 // ─── runCoordPty (real PTY via @myobie/pty/testing Session.spawn) ──────
 
 export interface RunCoordPtyOptions {
-  coordRoot?: string;
-  coordConfig?: string;
+  stRoot?: string;
+  stConfig?: string;
   coordIdentity?: string;
   env?: Record<string, string>;
   rows?: number;
@@ -182,9 +182,9 @@ export function runCoordPty(
   opts: RunCoordPtyOptions = {}
 ): Session {
   const env: Record<string, string> = {};
-  if (opts.coordRoot !== undefined) env.COORD_ROOT = opts.coordRoot;
-  if (opts.coordConfig !== undefined) env.COORD_CONFIG = opts.coordConfig;
-  if (opts.coordIdentity !== undefined) env.COORD_IDENTITY = opts.coordIdentity;
+  if (opts.stRoot !== undefined) env.ST_ROOT = opts.stRoot;
+  if (opts.stConfig !== undefined) env.ST_CONFIG = opts.stConfig;
+  if (opts.coordIdentity !== undefined) env.ST_AGENT = opts.coordIdentity;
   Object.assign(env, opts.env ?? {});
 
   const spawnOpts: { rows?: number; cols?: number; env: Record<string, string> } = {

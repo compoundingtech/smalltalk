@@ -1,7 +1,7 @@
 // tests/integration/library-embedding.test.ts — proves createCoord works
 // the way an Electron main process or a Node TUI would use it.
 //
-// Two Coord handles bound to two distinct $COORD_ROOT directories ("two
+// Two Coord handles bound to two distinct $ST_ROOT directories ("two
 // machines"). Real rsync between them via the local: peer spec. Real
 // filesystem. The whole loop a real embedder would drive.
 
