@@ -20,14 +20,12 @@ import { cmdCompletionsCli } from './commands/completions.ts';
 import { cmdContextCli } from './commands/context.ts';
 import { cmdDingCli } from './commands/ding.ts';
 import { cmdInitCli } from './commands/init.ts';
-import { cmdLaunchCli } from './commands/launch.ts';
 import { cmdLsCli } from './commands/ls.ts';
 import { cmdMcpCli } from './commands/mcp.ts';
 import { cmdAgentsCli } from './commands/agents.ts';
 import { cmdOverviewCli } from './commands/overview.ts';
 import { cmdReadCli } from './commands/read.ts';
 import { cmdResourceCli } from './commands/resource.ts';
-import { cmdLaunchCoreCli } from './commands/launch-core.ts';
 import { cmdReplyCli } from './commands/reply.ts';
 import { cmdSendCli } from './commands/send.ts';
 import { cmdStatusCli } from './commands/status.ts';
@@ -119,11 +117,6 @@ function topLevelUsage(name: string): string {
   `                                   write or merge .mcp.json in <dir>\n` +
   `                                   (default: cwd) so Claude Code loads\n` +
   `                                   the smalltalk MCP server\n` +
-  `  launch <claude|codex> [--identity ID] [--model SPEC] [--no-pty]\n` +
-  `                        [--no-channel] [--session-name N] [--dry-run]\n` +
-  `                                   one-command harness bootstrap onto\n` +
-  `                                   smalltalk — identity + .mcp.json +\n` +
-  `                                   session-id + pty (when available)\n` +
   `  ding <pty-session> [--identity ID] [--interval MS]\n` +
   `                                   busy-aware push notifier; pty-sends a\n` +
   `                                   notice on each new arrival when the agent\n` +
@@ -246,15 +239,6 @@ export async function runCli(
         return await cmdMcpCli(rest, ctx);
       case 'init':
         return await cmdInitCli(rest, ctx);
-      case 'launch':
-        return await cmdLaunchCli(rest, ctx);
-      case '__launch-core':
-        // Hidden JSON-in/JSON-out entrypoint for convoy's launch
-        // bridge. NOT listed in `st help` / completions on purpose
-        // — this is not a user surface, it's the convoy contract
-        // while the write logic still lives in TS. Retires when
-        // convoy's Swift port reaches parity.
-        return await cmdLaunchCoreCli(rest, ctx);
       case 'ding':
         return await cmdDingCli(rest, ctx);
       case 'completions':

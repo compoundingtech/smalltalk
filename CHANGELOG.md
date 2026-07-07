@@ -6,6 +6,80 @@ minor releases until 1.0.
 
 ## Unreleased
 
+### Removed (coord-kill piece (g) — `st launch` + `launch-core` deleted; convoy owns launch natively)
+
+Architecture decision (Nathan → cos): smalltalk = **pure message
+bus + minimal `st ding` sidecar.** Convoy owns launch natively
+going forward. Convoy-claude signaled handoff-ready (native
+launch committed ts-port 9775c99, convoy no longer shells
+`st launch`), so the whole launch surface is now deleted.
+
+Deleted:
+- `src/commands/launch.ts` (~2400 lines): `cmdLaunch`,
+  `cmdLaunchCli`, `LaunchInput`, `LaunchResult`, `LAUNCH_HELP`,
+  `DING_BUS_INSTRUCTIONS`, `resolveStShimPath` (no longer needed
+  here — it was launch-only), the persona-install +
+  DING-BUS.md-install helpers, the hooks-writer, and every
+  `st launch` verb + `--ding` / `--mcp` flag.
+- `src/commands/launch-core.ts`: `cmdLaunchCoreCli`,
+  `parseLaunchCoreInput`, the JSON-in schema-validation surface.
+  The `__launch-core` hidden verb went with it.
+- `tests/unit/launch.test.ts` (~2700 lines): 162 tests covering
+  the launch surface.
+- `tests/unit/launch-core.test.ts`: the JSON-in/JSON-out contract
+  tests.
+
+Wire changes:
+- `src/cli.ts` dispatch: dropped `case 'launch':` and
+  `case '__launch-core':`; dropped the two related imports.
+  Dropped the `launch` subcommand from the top-level `st help`
+  text (visible surface).
+- `src/commands/completions.ts`: dropped the `launch` entry (13
+  lines) so shell completions no longer suggest the verb.
+
+Docstring cross-refs updated:
+- `src/mcp/capabilities.ts` — `CHANNEL_INSTRUCTIONS` doc block
+  no longer references `DING_BUS_INSTRUCTIONS` (moved to
+  convoy). New note: convoy owns the DING-BUS.md template; when
+  the shared bus contract changes, keep MCP's blurb in sync
+  with convoy's vendored version.
+- `src/commands/reply.ts` header: dropped the "was missing
+  through the ding-mode work" backstory (that was launch-era
+  context); kept the ding-contract note.
+- `src/commands/ding.ts` `[DING]`-prefix rationale doc: reworded
+  the DING-BUS.md refs to "the launcher's bus-instructions
+  file" (transport-agnostic phrasing).
+
+What smalltalk KEEPS (per convoy's ask):
+1. The bus: `st message send/reply/ls/read/archive/thread`,
+   `st agents`, `st status`. Unchanged.
+2. `st ding` — the sidecar binary. Convoy spawns
+   `st ding <agent>-claude --identity <agent>` as a runtime
+   command. Kept as a bin surface.
+3. The three Claude Code hook scripts under
+   `examples/claude-code/hooks/{session-start,pre-compact,
+   stop-failure}.sh` + `bin/st`. Convoy's native launch writes
+   each agent's `.claude/settings.local.json` referencing these
+   by absolute path (resolved via SMALLTALK_DIR / sibling
+   `../smalltalk`). Kept as a stable public location.
+
+What was DING-BUS.md's owner:
+- Convoy vendored the DING-BUS.md template (captured from
+  st-launch output, with the "spawn children" section updated
+  to `convoy add` since `st launch` is gone). Smalltalk no
+  longer maintains the ding-mode instructions template — that's
+  convoy's now.
+
+Full suite: 1382 pass (down from 1558 pre-deletion by the
+removed launch tests), 3 pre-existing integration skipped.
+
+Pre-push name-hygiene grep: clean.
+
+Held on `feat/kill-coord-entirely` until the reboot signal.
+Next: trim `st ding` to minimal per cos's directive (single-
+purpose: inbox-watch + wake the agent; orchestration lives in
+convoy).
+
 ### Changed (coord-kill piece (e) — ding-mode is now the DEFAULT for `st launch`; MCP is `--mcp` opt-in)
 
 Post-cutover the transport preference flips: `st launch` (both

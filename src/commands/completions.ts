@@ -199,20 +199,6 @@ const COMMANDS: readonly CommandSpec[] = [
       { name: 'force', desc: 'Overwrite existing config' },
     ],
   },
-  {
-    name: 'launch',
-    desc: 'One-command harness bootstrap onto smalltalk',
-    positionalValues: ['claude', 'codex'],
-    flags: [
-      { name: 'identity', desc: 'Explicit agent name' },
-      { name: 'model', desc: 'Ollama model spec (routes via `ollama launch`)' },
-      { name: 'no-pty', desc: "Don't register via pty even if it's on PATH" },
-      { name: 'no-channel', desc: 'Skip --channel MCP wiring' },
-      { name: 'session-name', desc: 'Override pty session key' },
-      { name: 'dry-run', desc: 'Print what would happen; touch nothing' },
-      { name: 'print', desc: 'Alias for --dry-run' },
-    ],
-  },
   { name: 'ding', desc: 'Busy-aware push notifier' },
   {
     name: 'completions',

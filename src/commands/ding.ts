@@ -790,13 +790,14 @@ async function buildEvent(
  * line as bus traffic so it's visually distinct from three other
  * things an agent might see in its terminal:
  *   - MCP `<channel source="…">` injection blocks (MCP path only;
- *     ding-mode agents don't get these — see DING-BUS.md follow-up).
+ *     ding-mode agents don't get these — their launcher's
+ *     bus-instructions file describes the ding poke flow instead).
  *   - The agent's own output printed to its REPL.
  *   - A human typing directly at the REPL.
  *
- * The prefix also lets a ding-mode agent's persona/DING-BUS.md
- * instructions reference an unambiguous string pattern for the
- * poke-handling flow ("when you see [DING] X, do Y").
+ * The prefix also lets a ding-mode agent's bus-instructions file
+ * reference an unambiguous string pattern for the poke-handling
+ * flow ("when you see [DING] X, do Y").
  *
  * Post-rename naming: `smalltalk message`, not `st message` —
  * this is user-visible bus traffic and matches the CLI the agent

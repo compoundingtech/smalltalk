@@ -94,17 +94,14 @@ export const SERVER_OPTIONS: ServerOptions = {
  * `st_msg_read`, `st_msg_archive`, `st_msg_reply`, `st_agents`,
  * `<channel source="st"`.
  *
- * **Bus-contract twin: `DING_BUS_INSTRUCTIONS` in
- * `src/commands/launch.ts`.** MCP agents receive THIS blurb via the
- * transport's `instructions:` field; ding-mode agents receive the
- * DING-BUS.md analog via an `@DING-BUS.md` import installed by
- * `st launch --ding`. Two versions of ONE bus contract — when the
- * *shared* contract changes (new tools, new conventions, boot-ritual
- * updates), update BOTH. Drift means MCP agents and ding-mode
- * agents will behave differently for the same protocol event. The
- * "propagate ding-mode through spawns" section in
- * DING_BUS_INSTRUCTIONS is transport-specific and deliberately
- * does NOT mirror here.
+ * **Bus-contract note (post `st launch` deletion):** MCP agents
+ * receive THIS blurb via the transport's `instructions:` field.
+ * Ding-mode agents receive an analogous DING-BUS.md installed by
+ * their launcher (convoy owns that surface now — see convoy's
+ * DING-BUS template). When the *shared* contract changes (new
+ * tools, new conventions, boot-ritual updates), keep this blurb in
+ * sync with convoy's vendored template so MCP agents and ding-mode
+ * agents behave identically for the same protocol event.
  */
 export const CHANNEL_INSTRUCTIONS = [
   'You are connected to smalltalk. This is the operator\'s visibility layer: they look at status files and inbox/archive to understand what every agent is doing. Maintain those records.',

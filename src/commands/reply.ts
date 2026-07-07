@@ -6,12 +6,9 @@
 // derive semantics as the MCP `st_msg_reply` tool (both share
 // `src/locate-thread.ts`).
 //
-// Was missing from the CLI dispatcher through the ding-mode work:
-// DING-BUS.md instructs every ding-mode agent to run `st message
-// reply <filename> -m "<body>"` on inbox arrivals, but the CLI
-// switch at `src/cli.ts:dispatchMessage` didn't route `reply`. Every
-// ding-mode agent errored with `unknown subcommand: reply` on their
-// first response. This module wires the verb.
+// The ding-mode contract instructs every ding-mode agent to run
+// `st message reply <filename> -m "<body>"` on inbox arrivals, so
+// this verb has to route through the CLI dispatcher.
 
 import { envAgentFrom } from '../common.ts';
 import { invokedName } from '../cli-context.ts';
