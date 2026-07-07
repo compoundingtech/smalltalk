@@ -136,7 +136,33 @@ interface BufferedEvent {
   filename: Filename;
   from: Identity | '';
   subject?: string;
+  /**
+   * Retry counter — bumped when `deliver()` returns a failure signal
+   * and the event gets requeued. Capped by {@link MAX_DELIVER_RETRIES}
+   * so a permanently-broken target doesn't produce an infinite retry
+   * loop. Undefined = first attempt.
+   */
+  retries?: number;
 }
+
+/**
+ * Max retries per event before giving up (with a loud log). Bounded so
+ * a permanently-broken pty target doesn't monopolize the flush loop
+ * forever, but generous enough to survive a session flap +
+ * restart-in-under-a-minute (each retry runs on the flush interval,
+ * so 5 retries = ~5s at the default 1s interval).
+ */
+const MAX_DELIVER_RETRIES = 5;
+
+/**
+ * How long after the daemon starts to keep the startup-dedup set
+ * populated. Beyond this window the scan+watcher race is over — any
+ * arrival goes through the watcher, and the dedup set only wastes
+ * memory. 60s is more than enough for a fresh filesystem watcher to
+ * settle; a slow FSEvents subscription typically arms in single-digit
+ * ms. Cleared when the window expires.
+ */
+const STARTUP_DEDUP_WINDOW_MS = 60_000;
 
 /**
  * Run the ding daemon. Resolves when the AbortSignal aborts (or
@@ -146,8 +172,25 @@ interface BufferedEvent {
  */
 export async function runDing(deps: DingDeps): Promise<void> {
   const intervalMs = deps.intervalMs ?? DEFAULT_INTERVAL_MS;
-  const send = deps.ptySend ?? defaultPtySend;
+  const rawSend = deps.ptySend ?? defaultPtySend;
   const log = deps.stderr ?? ((s) => process.stderr.write(s));
+
+  // Send serialization: every `pty send` invocation goes through this
+  // chain so `--with-delay 0.5`-widened windows can't interleave (a
+  // second send starting mid-way through the first's text-then-Enter
+  // sequence would let text-A/text-B/return-A/return-B garble on the
+  // receiving terminal). The chain awaits the previous send's
+  // completion (regardless of its outcome) before invoking the next.
+  let sendChain: Promise<unknown> = Promise.resolve();
+  const send: PtySender = async (sessionName, sequences) => {
+    const prev = sendChain;
+    const p = (async () => {
+      await prev.catch(() => undefined);
+      return rawSend(sessionName, sequences);
+    })();
+    sendChain = p.catch(() => undefined);
+    return p;
+  };
 
   // brief-031 amendment: an internal AbortController so the
   // session-watch tick can end runDing on its own (target session
@@ -164,7 +207,18 @@ export async function runDing(deps: DingDeps): Promise<void> {
   const signal = internalAc.signal;
 
   const buffer: BufferedEvent[] = [];
+  // Filenames whose `buildEvent` failed (e.g. peer's atomic write
+  // races the watcher fire → read sees mid-rename / partial file).
+  // Retried on each flush tick. At-least-once semantics — better than
+  // silently dropping a notice on a transient FS race.
+  const readPending: Filename[] = [];
   let timer: ReturnType<typeof setInterval> | undefined;
+  // Guard against re-entrant tryFlush: setInterval schedules the
+  // callback at fixed times regardless of whether the previous
+  // invocation is still awaiting `deliver`. Two concurrent flushes
+  // shifting the same buffer risked out-of-order delivery + wasted
+  // work; the guard makes flush single-threaded.
+  let flushing = false;
 
   function ensureTimerArmed(): void {
     if (timer !== undefined) return;
@@ -366,32 +420,88 @@ export async function runDing(deps: DingDeps): Promise<void> {
   }
 
   async function tryFlush(): Promise<void> {
-    if (buffer.length === 0) {
-      disarmTimer();
-      return;
-    }
-    let state: State;
+    if (flushing) return; // re-entry guard — setInterval doesn't skip
+    flushing = true;
     try {
-      state = await deps.coord.getStatus(deps.identity);
-    } catch (err) {
-      log(
-        `coord ding: getStatus failed: ${errMsg(err)}\n`
-      );
-      return;
+      // Retry any pending reads first — a peer's atomic-rename race
+      // may have resolved. Failed reads stay in readPending; a
+      // successful read pushes into buffer for the drain below.
+      if (readPending.length > 0) {
+        const attemptList = readPending.splice(0);
+        for (const fn of attemptList) {
+          try {
+            const ev = await buildEvent(deps.coord, deps.identity, fn);
+            buffer.push(ev);
+          } catch (err) {
+            log(
+              `coord ding: read retry still failing for ${fn}: ${errMsg(err)}\n`
+            );
+            readPending.push(fn);
+          }
+        }
+      }
+      if (buffer.length === 0 && readPending.length === 0) {
+        disarmTimer();
+        return;
+      }
+      let state: State;
+      try {
+        state = await deps.coord.getStatus(deps.identity);
+      } catch (err) {
+        log(
+          `coord ding: getStatus failed: ${errMsg(err)}\n`
+        );
+        return;
+      }
+      if (SUPPRESS_STATES.has(state)) {
+        // Still busy — keep the timer armed.
+        return;
+      }
+      // Drain in chronological insertion order. On a `deliver` failure,
+      // requeue at the HEAD with an incremented retry count so we
+      // retry-then-move-on rather than blocking newer arrivals behind
+      // a broken target. Capped by MAX_DELIVER_RETRIES.
+      while (buffer.length > 0) {
+        const ev = buffer.shift()!;
+        const ok = await deliver(send, deps.ptySession, ev, log);
+        if (!ok) {
+          const retries = (ev.retries ?? 0) + 1;
+          if (retries >= MAX_DELIVER_RETRIES) {
+            log(
+              `coord ding: giving up on ${ev.filename} after ${MAX_DELIVER_RETRIES} deliver attempts; ` +
+                `check pty session "${deps.ptySession}" or restart ding\n`
+            );
+            continue; // drop after cap — loud log surface
+          }
+          buffer.unshift({ ...ev, retries });
+          // Break out of the while: don't spin on the same failing
+          // event within one flush call. Timer will re-fire.
+          break;
+        }
+      }
+      if (buffer.length === 0 && readPending.length === 0) {
+        disarmTimer();
+      }
+    } finally {
+      flushing = false;
     }
-    if (SUPPRESS_STATES.has(state)) {
-      // Still busy — keep the timer armed.
-      return;
-    }
-    // Drain in chronological insertion order.
-    while (buffer.length > 0) {
-      const ev = buffer.shift()!;
-      await deliver(send, deps.ptySession, ev, log);
-    }
-    disarmTimer();
   }
 
+  // Startup-race dedup: during the first STARTUP_DEDUP_WINDOW_MS the
+  // watcher iteration + `scanStartupBacklog` run concurrently, and
+  // both feed `onEvent`. This set catches the overlap-window arrivals
+  // that would otherwise be double-delivered. Cleared after the
+  // window closes; subsequent `onEvent` calls skip the check.
+  const startupSeen = new Set<string>();
+  let startupPhase = true;
+
   async function onEvent(filename: Filename): Promise<void> {
+    // Startup-window dedup — either the scan or the watcher wins for
+    // a given filename, the other is a no-op.
+    if (startupPhase) {
+      if (startupSeen.has(filename)) return;
+      startupSeen.add(filename);
+    }
     let state: State;
     try {
       state = await deps.coord.getStatus(deps.identity);
@@ -405,7 +515,14 @@ export async function runDing(deps: DingDeps): Promise<void> {
     try {
       event = await buildEvent(deps.coord, deps.identity, filename);
     } catch (err) {
+      // Buffer the bare filename for retry on the next flush tick.
+      // Peer's atomic write races the watcher fire → read sees
+      // mid-rename → transient error → succeeds on retry. At-least-
+      // once. Comment at the original ("lean toward delivering —
+      // better than silently dropping") applies here too.
       log(`coord ding: read failed for ${filename}: ${errMsg(err)}\n`);
+      readPending.push(filename);
+      ensureTimerArmed();
       return;
     }
     if (SUPPRESS_STATES.has(state)) {
@@ -413,7 +530,22 @@ export async function runDing(deps: DingDeps): Promise<void> {
       ensureTimerArmed();
       return;
     }
-    await deliver(send, deps.ptySession, event, log);
+    // Direct delivery path — retry on failure by pushing back into
+    // the buffer (arms the flush timer). Same MAX_DELIVER_RETRIES cap
+    // as the flush-loop drain.
+    const ok = await deliver(send, deps.ptySession, event, log);
+    if (!ok) {
+      const retries = (event.retries ?? 0) + 1;
+      if (retries >= MAX_DELIVER_RETRIES) {
+        log(
+          `coord ding: giving up on ${event.filename} after ${MAX_DELIVER_RETRIES} deliver attempts; ` +
+            `check pty session "${deps.ptySession}" or restart ding\n`
+        );
+        return;
+      }
+      buffer.push({ ...event, retries });
+      ensureTimerArmed();
+    }
   }
 
   // brief-035 t2: ding scan-on-startup. On boot, replay any inbox
@@ -479,30 +611,66 @@ export async function runDing(deps: DingDeps): Promise<void> {
   // brief-032: arm the status-file mtime refresh tick.
   startStatusRefresh();
 
-  // brief-035 t2: replay any inbox backlog BEFORE the watcher's
-  // sinceNow:true filter starts, so messages that landed while ding
-  // was down (or before a binary upgrade) still get pushed. Files
-  // arriving DURING the scan are out of luck (not in the readdir
-  // snapshot, and watcher hasn't armed yet) — but the next live
-  // arrival or tidy-check tick will surface the drift.
-  await scanStartupBacklog();
+  // brief-035 t2 (revised): arm the watcher BEFORE the startup scan
+  // to close the race window a scan-then-watch ordering left open.
+  // Historic ordering: scan → watch, with the scan reading a readdir
+  // snapshot and the watcher armed after. Files arriving BETWEEN the
+  // scan's readdir and the watcher's arm were in neither set — a
+  // silent-drop race on daemon startup. Fix: run the watcher's
+  // for-await loop in a concurrent async task, THEN run the scan.
+  // Both feed `onEvent`, which dedups via `startupSeen` for the
+  // first STARTUP_DEDUP_WINDOW_MS. After the window closes, dedup
+  // stops (drops the set to free memory) — the watcher is the sole
+  // event source from that point on.
+  const startupDedupTimer = setTimeout(() => {
+    startupPhase = false;
+    startupSeen.clear();
+  }, STARTUP_DEDUP_WINDOW_MS);
+  startupDedupTimer.unref?.();
 
-  // Drive the watcher. coord.watch returns an AsyncIterable; the loop
-  // exits when the AbortSignal aborts.
-  try {
+  const watcherPromise = (async () => {
     const watchOpts: Parameters<Coord['watch']>[1] = {
       withSubject: true,
       sinceNow: true,
     };
     watchOpts.signal = signal;
-    for await (const ev of deps.coord.watch(
-      deps.identity,
-      watchOpts
-    ) as AsyncIterable<WatchEvent>) {
-      if (ev.folder !== 'inbox') continue;
-      await onEvent(ev.filename);
+    try {
+      for await (const ev of deps.coord.watch(
+        deps.identity,
+        watchOpts
+      ) as AsyncIterable<WatchEvent>) {
+        if (ev.folder !== 'inbox') continue;
+        await onEvent(ev.filename);
+      }
+    } catch (err) {
+      // AbortError is expected when the signal fires; surface others.
+      if (
+        !(err instanceof Error && err.name === 'AbortError') &&
+        !signal.aborted
+      ) {
+        log(`coord ding: watcher errored: ${errMsg(err)}\n`);
+      }
     }
+  })();
+
+  // Now run the startup scan concurrently. Any file that arrives
+  // during the scan is caught by the (already-armed) watcher; both
+  // sources dedup via `startupSeen`. Chronological ordering within
+  // the scan is preserved by its own sort; concurrent watcher events
+  // slot in via the buffer as they arrive.
+  try {
+    await scanStartupBacklog();
+  } catch (err) {
+    log(`coord ding: startup scan errored: ${errMsg(err)}\n`);
+  }
+
+  // Watcher owns the daemon lifetime — it exits when the signal
+  // aborts. Await here so `runDing` doesn't resolve until the loop
+  // has actually torn down.
+  try {
+    await watcherPromise;
   } finally {
+    clearTimeout(startupDedupTimer);
     disarmTimer();
     stopTidyTick();
     stopSessionWatch();
@@ -603,14 +771,18 @@ async function deliver(
   sessionName: string,
   ev: BufferedEvent,
   log: (s: string) => void
-): Promise<void> {
+): Promise<boolean> {
+  // Returns true on success, false on failure. Callers requeue on
+  // false so a transient pty error (target respawning, ECHILD/EPIPE
+  // on the send subprocess pipe, brief supervisor hiccup) doesn't
+  // silently drop a notice. The at-least-once delivery rule.
   const sequences = buildSequences(ev);
   let result: { status: number; stderr: string };
   try {
     result = await send(sessionName, sequences);
   } catch (err) {
     log(`coord ding: pty send failed: ${errMsg(err)}\n`);
-    return;
+    return false;
   }
   if (result.status !== 0) {
     const tail = result.stderr.trim().slice(-200);
@@ -619,7 +791,9 @@ async function deliver(
         tail ? `: ${tail}` : ''
       }\n`
     );
+    return false;
   }
+  return true;
 }
 
 /**

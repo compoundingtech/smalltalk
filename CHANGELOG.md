@@ -6,6 +6,109 @@ minor releases until 1.0.
 
 ## Unreleased
 
+### Fixed (CRITICAL — `st ding` hardening pass for primary-transport readiness)
+
+With coord going away entirely and ding-mode becoming the DEFAULT
+for `st launch`, `st ding` is now the PRIMARY inbox transport for
+the whole network — not a fallback. On an MCP-hostile machine
+(the operator's cos → supervisor → worker chain), a ding daemon
+that crashes, silently loses messages, or garbles deliveries =
+the whole setup fails silently.
+
+A targeted hardening review found 3 blocker-severity gaps + 1
+important (all with concrete production failure scenarios). This
+PR closes them.
+
+**Blocker 1: concurrent `pty send` calls were unserialized (race).**
+Watcher-onEvent, buffer-flush drain, tidy tick, and startup scan
+could all spawn `pty send` concurrently against the same session.
+With `--with-delay 0.5` widening the per-send window to ~500ms,
+text-A/text-B/return-A/return-B could interleave on the receiving
+terminal — the first Enter committing A with B stuck in the paste
+buffer, or A never committing because B's return already fired.
+
+Fix: every `pty send` invocation goes through a per-daemon async
+chain. The chain awaits the previous send's completion (regardless
+of outcome) before invoking the next. Serialization is added at
+the `send` reference used inside `runDing`, so all downstream
+callers (deliver, tidy tick, etc.) get it automatically. Also
+guards `tryFlush` re-entry (setInterval doesn't skip a tick when
+the previous callback is still awaiting `deliver`) via a
+`flushing` flag.
+
+**Blocker 2: at-most-once semantics on `pty send` failure
+(retry-semantics).** `deliver()` logged + dropped when `send` threw
+OR returned non-zero. The operator's rule is at-least-once. A
+transient pty error (target respawning, ECHILD/EPIPE, brief
+supervisor hiccup) silently lost a notice.
+
+Fix: `deliver()` returns a boolean (true on success, false on
+failure). Callers requeue on false with an incremented `retries`
+counter. Cap at `MAX_DELIVER_RETRIES = 5` per event — a
+permanently-broken target drops the notice with a loud stderr line
+("giving up on <fn> after 5 deliver attempts; check pty session
+<name> or restart ding") rather than either dropping silently OR
+blocking newer arrivals forever.
+
+**Blocker 3: `buildEvent` read failures silently dropped
+(retry-semantics).** `onEvent` at :404-410 caught read errors and
+returned without buffering. Peer's atomic-rename race → read sees
+mid-write → throws → notice lost. The nearby comment claimed
+"lean toward delivering — better than silently dropping" but the
+read branch violated it.
+
+Fix: on read failure, buffer the bare filename in a new
+`readPending` list. Each flush tick retries the reads; on success,
+the event moves into the main buffer for delivery. Same
+at-least-once guarantee as the send-retry path.
+
+**Important 4: startup scan → watcher-arm race window.**
+Historic ordering was `scan → arm watcher`. Files arriving BETWEEN
+the readdirSync snapshot and the watcher arming were in neither
+source — silently dropped on daemon startup. The relevant comment
+even acknowledged the hole ("Files arriving DURING the scan are
+out of luck").
+
+Fix: arm the watcher's for-await loop FIRST (in a concurrent async
+task), THEN run the scan. Both sources feed `onEvent`. `onEvent`
+dedups via a `startupSeen` set for the first
+`STARTUP_DEDUP_WINDOW_MS` (60 seconds — well beyond any real FS
+watcher settle time). After the window closes the set is cleared;
+the watcher is the sole event source from that point on.
+
+8 new unit tests cover:
+- Three concurrent arrivals → sender's peak concurrent-inflight
+  count stays ≤ 1 (send serialization guard).
+- Busy → available: 3 buffered notices flush without send overlap
+  (flush-timer serialization guard).
+- `pty send` fails once → requeues + delivers on next flush
+  (retry-on-send-fail).
+- `pty send` fails permanently → gives up after
+  MAX_DELIVER_RETRIES with a loud log (retry cap).
+- `coord.read` fails 1 time → filename buffered, delivers on next
+  tick (retry-on-read-fail).
+- `coord.read` fails 3 times → still delivers on the 4th tick
+  (multi-retry).
+- Watcher fires the same filename twice → delivered exactly once
+  (startup dedup, direct).
+- Two distinct filenames + one duplicate → 2 deliveries, dupe
+  dropped (dedup precision).
+
+Existing 57 ding tests unchanged and passing (regression-safe
+refactor).
+
+Full suite: 1589 pass, only the 4 pre-existing integration flakes.
+
+Follow-ups (from the same review, not in this PR):
+- Session-flap tripping exit-when-gone (debounce needed) —
+  separate PR pre-reboot
+- `spawn('pty')` PATH robustness (boot-time probe) — separate PR
+  pre-reboot
+- `isSessionAlive` false-positive on PID reuse — low-severity,
+  documented as known behavior
+- Cosmetic `coord ding:` log-string leaks + unbounded buffer +
+  SIGINT double-tap → fold into coord-kill piece (d)
+
 ### Added (`st __launch-core` — hidden JSON-in/JSON-out entrypoint for the convoy bridge)
 
 The launch write logic (identity resolution, `.mcp.json`,

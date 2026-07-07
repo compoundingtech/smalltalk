@@ -43,6 +43,10 @@ interface FakeCoord {
   setStatus(state: State): void;
   setMessage(filename: string, msg: { from: string; subject?: string }): void;
   setReadError(err: Error): void;
+  /** Fail the next N `read` calls with the given error; subsequent
+   *  calls fall through to the planted message. Enables
+   *  read-retry-semantics tests. */
+  failReadN(count: number, err: Error): void;
   setStatusError(err: Error): void;
 }
 
@@ -57,6 +61,7 @@ function makeFakeCoord(
   let statusError: Error | undefined;
   const messages = new Map<string, { from: string; subject?: string }>();
   let readError: Error | undefined;
+  let readFailQueue: Error[] = [];
 
   const watch = (
     _id?: Identity,
@@ -106,6 +111,9 @@ function makeFakeCoord(
       filename: Filename,
       _opts?: ReadOptions
     ): Promise<MessageWithLocation> {
+      if (readFailQueue.length > 0) {
+        throw readFailQueue.shift()!;
+      }
       if (readError) throw readError;
       const msg = messages.get(filename);
       if (msg === undefined) {
@@ -149,6 +157,9 @@ function makeFakeCoord(
     setReadError(err): void {
       readError = err;
     },
+    failReadN(count, err): void {
+      for (let i = 0; i < count; i++) readFailQueue.push(err);
+    },
     setStatusError(err): void {
       statusError = err;
     },
@@ -159,26 +170,57 @@ interface FakeSender {
   send: PtySender;
   calls(): { sessionName: string; sequences: string[] }[];
   failNext(reason: string, status?: number): void;
+  /** Queue N consecutive failures (with the same reason/status).
+   *  Subsequent calls after the queue empties succeed. Enables
+   *  retry-semantics tests. */
+  failN(count: number, reason: string, status?: number): void;
+  /** Simulate a per-call delay (blocks the send promise for `ms`).
+   *  Combined with `maxConcurrent()` this lets tests verify send
+   *  serialization: if two calls overlap, maxConcurrent > 1. */
+  setDelayMs(ms: number): void;
+  /** Highest observed number of simultaneously-in-flight `send`
+   *  calls. Should stay ≤ 1 for a serialized daemon. */
+  maxConcurrent(): number;
 }
 
 function makeFakeSender(): FakeSender {
   const calls: { sessionName: string; sequences: string[] }[] = [];
-  let queuedFailure:
-    | { reason: string; status: number }
-    | undefined;
+  const failures: { reason: string; status: number }[] = [];
+  let delayMs = 0;
+  let inFlight = 0;
+  let peakInFlight = 0;
   return {
     send: async (sessionName, sequences) => {
-      calls.push({ sessionName, sequences: [...sequences] });
-      if (queuedFailure) {
-        const { reason, status } = queuedFailure;
-        queuedFailure = undefined;
-        return { status, stderr: reason };
+      inFlight++;
+      peakInFlight = Math.max(peakInFlight, inFlight);
+      try {
+        calls.push({ sessionName, sequences: [...sequences] });
+        if (delayMs > 0) {
+          await new Promise((r) => setTimeout(r, delayMs));
+        }
+        if (failures.length > 0) {
+          const { reason, status } = failures.shift()!;
+          return { status, stderr: reason };
+        }
+        return { status: 0, stderr: '' };
+      } finally {
+        inFlight--;
       }
-      return { status: 0, stderr: '' };
     },
     calls: () => calls,
     failNext(reason, status = 1): void {
-      queuedFailure = { reason, status };
+      failures.push({ reason, status });
+    },
+    failN(count, reason, status = 1): void {
+      for (let i = 0; i < count; i++) {
+        failures.push({ reason, status });
+      }
+    },
+    setDelayMs(ms): void {
+      delayMs = ms;
+    },
+    maxConcurrent(): number {
+      return peakInFlight;
     },
   };
 }
@@ -1451,6 +1493,249 @@ describe('runDing — scan-on-startup', () => {
     // accidentally double-counted; expect still 1.
     await new Promise((res) => setTimeout(res, 80));
     expect(sender.calls()).toHaveLength(1);
+    r.ac.abort();
+    await r.done;
+  });
+});
+
+// ─── runDing — hardening: send serialization (rock-solid primary
+// transport). With ding-mode as the DEFAULT delivery path (post-coord-
+// kill + MCP-hostile deployments), any `pty send` interleaving would
+// garble notices on the receiving terminal. The daemon MUST serialize
+// all sends through a single async queue. Failure mode caught by the
+// review: watcher-onEvent, buffer-flush drain, tidy tick, and startup-
+// scan can all spawn concurrent `pty send` calls against the same
+// session; with --with-delay 0.5 widening the per-send window,
+// text-A/text-B/return-A/return-B could interleave, causing the first
+// Enter to commit A with B stuck in the paste buffer.
+// ────────────────────────────────────────────────────────────────────
+
+describe('runDing — send serialization (concurrent pty sends never overlap)', () => {
+  let fake: FakeCoord;
+  let sender: FakeSender;
+
+  beforeEach(() => {
+    fake = makeFakeCoord();
+    sender = makeFakeSender();
+  });
+  afterEach(() => {
+    fake.endWatch();
+  });
+
+  it('three concurrent arrivals → sender.maxConcurrent stays ≤ 1', async () => {
+    fake.setStatus('available');
+    for (const [idx, name] of [
+      '1714826789010-aaaaaa.md',
+      '1714826789020-bbbbbb.md',
+      '1714826789030-cccccc.md',
+    ].entries()) {
+      fake.setMessage(name, {
+        from: 'alice',
+        subject: `subj-${idx}`,
+      });
+    }
+    sender.setDelayMs(40);
+    const r = startDing({ coord: fake.coord, ptySend: sender.send });
+    fake.pushEvent('1714826789010-aaaaaa.md');
+    fake.pushEvent('1714826789020-bbbbbb.md');
+    fake.pushEvent('1714826789030-cccccc.md');
+    await new Promise((res) => setTimeout(res, 200));
+    expect(sender.calls()).toHaveLength(3);
+    expect(sender.maxConcurrent()).toBeLessThanOrEqual(1);
+    const subjects = sender
+      .calls()
+      .map((c) => c.sequences[0])
+      .join(' | ');
+    expect(subjects.indexOf('subj-0')).toBeLessThan(subjects.indexOf('subj-1'));
+    expect(subjects.indexOf('subj-1')).toBeLessThan(subjects.indexOf('subj-2'));
+    r.ac.abort();
+    await r.done;
+  });
+
+  it('busy → available: 3 buffered notices flush without send overlap', async () => {
+    fake.setStatus('busy');
+    for (const name of [
+      '1714826789010-aaaaaa.md',
+      '1714826789020-bbbbbb.md',
+      '1714826789030-cccccc.md',
+    ]) {
+      fake.setMessage(name, { from: 'alice' });
+    }
+    sender.setDelayMs(20);
+    const r = startDing({
+      coord: fake.coord,
+      ptySend: sender.send,
+      intervalMs: 25,
+    });
+    fake.pushEvent('1714826789010-aaaaaa.md');
+    fake.pushEvent('1714826789020-bbbbbb.md');
+    fake.pushEvent('1714826789030-cccccc.md');
+    await new Promise((res) => setTimeout(res, 30));
+    expect(sender.calls()).toHaveLength(0);
+    fake.setStatus('available');
+    await new Promise((res) => setTimeout(res, 200));
+    expect(sender.calls()).toHaveLength(3);
+    expect(sender.maxConcurrent()).toBeLessThanOrEqual(1);
+    r.ac.abort();
+    await r.done;
+  });
+});
+
+// ─── runDing — hardening: at-least-once retry semantics ─────────────
+// The delivery rule is at-least-once, not at-most-once. The
+// pre-hardening deliver path logged + dropped on transient send
+// failures; a target respawning during an eval window would silently
+// lose notices. Same for read failures (peer's atomic write races the
+// watcher fire). The daemon now requeues on failure with a bounded
+// retry count.
+// ────────────────────────────────────────────────────────────────────
+
+describe('runDing — retry semantics (at-least-once on transient failure)', () => {
+  let fake: FakeCoord;
+  let sender: FakeSender;
+
+  beforeEach(() => {
+    fake = makeFakeCoord();
+    sender = makeFakeSender();
+  });
+  afterEach(() => {
+    fake.endWatch();
+  });
+
+  it('pty send fails once → notice requeues + eventually delivers on next flush', async () => {
+    fake.setStatus('available');
+    fake.setMessage('1714826789010-aaaaaa.md', {
+      from: 'alice',
+      subject: 'transient',
+    });
+    sender.failNext('transient pty error', 1);
+    const r = startDing({
+      coord: fake.coord,
+      ptySend: sender.send,
+      intervalMs: 25,
+    });
+    fake.pushEvent('1714826789010-aaaaaa.md');
+    await new Promise((res) => setTimeout(res, 100));
+    expect(sender.calls().length).toBeGreaterThanOrEqual(2);
+    expect(sender.calls()[0]!.sequences[0]).toContain('transient');
+    expect(sender.calls()[1]!.sequences[0]).toContain('transient');
+    r.ac.abort();
+    await r.done;
+  });
+
+  it('pty send fails permanently → gives up after MAX_DELIVER_RETRIES with a loud log', async () => {
+    fake.setStatus('available');
+    fake.setMessage('1714826789010-aaaaaa.md', { from: 'alice' });
+    sender.failN(20, 'always fails', 1);
+    const logs: string[] = [];
+    const r = startDing({
+      coord: fake.coord,
+      ptySend: sender.send,
+      intervalMs: 25,
+      stderr: (s) => logs.push(s),
+    });
+    fake.pushEvent('1714826789010-aaaaaa.md');
+    await new Promise((res) => setTimeout(res, 500));
+    expect(sender.calls().length).toBeLessThanOrEqual(6);
+    expect(logs.join('')).toContain('giving up');
+    expect(logs.join('')).toContain('1714826789010-aaaaaa.md');
+    r.ac.abort();
+    await r.done;
+  });
+
+  it('coord.read fails once → filename buffered, delivers on next flush tick', async () => {
+    fake.setStatus('available');
+    fake.setMessage('1714826789010-aaaaaa.md', {
+      from: 'alice',
+      subject: 'race',
+    });
+    fake.failReadN(1, new Error('EAGAIN: temporarily unavailable'));
+    const r = startDing({
+      coord: fake.coord,
+      ptySend: sender.send,
+      intervalMs: 25,
+    });
+    fake.pushEvent('1714826789010-aaaaaa.md');
+    await new Promise((res) => setTimeout(res, 100));
+    expect(sender.calls()).toHaveLength(1);
+    expect(sender.calls()[0]!.sequences[0]).toContain('race');
+    r.ac.abort();
+    await r.done;
+  });
+
+  it('coord.read fails 3 times → still delivers on the 4th flush tick', async () => {
+    fake.setStatus('available');
+    fake.setMessage('1714826789010-aaaaaa.md', { from: 'alice' });
+    fake.failReadN(3, new Error('partial write'));
+    const r = startDing({
+      coord: fake.coord,
+      ptySend: sender.send,
+      intervalMs: 25,
+    });
+    fake.pushEvent('1714826789010-aaaaaa.md');
+    await new Promise((res) => setTimeout(res, 300));
+    expect(sender.calls()).toHaveLength(1);
+    r.ac.abort();
+    await r.done;
+  });
+});
+
+// ─── runDing — hardening: startup-race dedup ────────────────────────
+// The historic ordering (scan → arm watcher) left a race window: files
+// arriving between the readdirSync snapshot and the watcher arming
+// were in NEITHER source and were silently lost. Fix: arm watcher
+// concurrently with the scan; both feed onEvent, which dedups via
+// `startupSeen` for the startup window.
+// ────────────────────────────────────────────────────────────────────
+
+describe('runDing — startup-race dedup (scan + watcher both fire → single delivery)', () => {
+  let fake: FakeCoord;
+  let sender: FakeSender;
+
+  beforeEach(() => {
+    fake = makeFakeCoord();
+    sender = makeFakeSender();
+  });
+  afterEach(() => {
+    fake.endWatch();
+  });
+
+  it('watcher fires the SAME filename twice on startup → delivered exactly once', async () => {
+    fake.setStatus('available');
+    fake.setMessage('1714826789010-aaaaaa.md', {
+      from: 'alice',
+      subject: 'once',
+    });
+    const r = startDing({ coord: fake.coord, ptySend: sender.send });
+    fake.pushEvent('1714826789010-aaaaaa.md');
+    fake.pushEvent('1714826789010-aaaaaa.md');
+    fake.pushEvent('1714826789010-aaaaaa.md');
+    await new Promise((res) => setTimeout(res, 50));
+    expect(sender.calls()).toHaveLength(1);
+    expect(sender.calls()[0]!.sequences[0]).toContain('once');
+    r.ac.abort();
+    await r.done;
+  });
+
+  it('two distinct filenames within the startup window → both delivered', async () => {
+    fake.setStatus('available');
+    fake.setMessage('1714826789010-aaaaaa.md', {
+      from: 'alice',
+      subject: 'a',
+    });
+    fake.setMessage('1714826789020-bbbbbb.md', {
+      from: 'alice',
+      subject: 'b',
+    });
+    const r = startDing({ coord: fake.coord, ptySend: sender.send });
+    fake.pushEvent('1714826789010-aaaaaa.md');
+    fake.pushEvent('1714826789020-bbbbbb.md');
+    fake.pushEvent('1714826789010-aaaaaa.md');
+    await new Promise((res) => setTimeout(res, 50));
+    expect(sender.calls()).toHaveLength(2);
+    const subjects = sender.calls().map((c) => c.sequences[0]);
+    expect(subjects.some((s) => s?.includes('a'))).toBe(true);
+    expect(subjects.some((s) => s?.includes('b'))).toBe(true);
     r.ac.abort();
     await r.done;
   });
