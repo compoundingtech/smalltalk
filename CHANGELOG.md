@@ -6,6 +6,71 @@ minor releases until 1.0.
 
 ## Unreleased
 
+### Fixed (coord-kill piece (k) — `st ding` mkdir -p missing agent folder at startup)
+
+Pinned by evals + cos (piece (j)'s debug logs surfaced it,
+before I could even ship them): `st ding` was DYING at startup
+when the watched identity's `$ST_ROOT/<id>/{inbox,archive}`
+folder didn't exist yet.
+
+Repro:
+- Convoy's native launch spawns the worker's ding sidecar
+  BEFORE the agent has written anything to its own inbox — the
+  folder doesn't exist yet.
+- `runDing`'s watcher's first poll throws `AgentNotHostedError`
+  → error bubbles up → `runDing`'s finally block clears every
+  timer → the daemon exits.
+- The target session is never poked. The delegation eventually
+  lands (cos creates the folder + writes a message), but the
+  ding is already dead. Worker parks silently. 90s re-scan
+  never rescues it because the ding process itself is gone.
+- Race-flaky because convoy sometimes wins the ordering (folder
+  exists before ding boots) but usually doesn't.
+
+Fix (matches what the error message itself suggests):
+- **`cmdDingCli` calls `ensureIdentityDirs(identity, root)`
+  BEFORE handing off to `runDing`.** Idempotent — a no-op when
+  the folder already exists. Runs after the identity is
+  resolved but before the pty probe (so it lands even when
+  ding would otherwise exit-2 for missing pty).
+- Same lazy-create semantic every other verb uses when the
+  invoker is the identity's own owner. Ding shouldn't need to
+  race the agent's first write.
+
+Test coverage (2 new tests in
+`cmdDingCli — startup-race hardening`):
+1. **Missing identity folder** → `cmdDingCli` creates it
+   before touching runDing. Regression guard on the
+   "watcher errored: agent folder missing" stderr line NOT
+   appearing.
+2. **Pre-existing identity folder** → no-op (idempotent).
+   Uses inode compare to prove `mkdirSync` didn't rewrite.
+
+Tests use a fake `ptyProbe` returning unavailable so
+cmdDingCli returns 2 without running `runDing` — enough to
+observe the mkdir side-effect without a real pty dependency.
+
+This is the last piece for capstone 6/0 — the pinned mechanism
+across ALL the parking (worker in ts5/7/8, resumed cos in ts6
+where its inbox may not have re-existed post-respawn). Ding is
+now robust to being spawned before its target agent's folder
+exists AND to the agent folder momentarily disappearing (via a
+future paranoid check — currently the fix covers only the
+startup race, which is the one convoy hits).
+
+Full suite: 1394 pass (2 new tests), 3 pre-existing integration
+skipped. Pre-push name-hygiene grep: clean.
+
+Held on `feat/kill-coord-entirely` until the reboot signal.
+LIVE via the npm link. Evals re-runs the capstone the moment
+this commit lands.
+
+Coordination note: convoy is also adding bus-folder-creation
+to its native-launch wiring as the architectural root — this
+smalltalk-side `mkdir -p` is the defense-in-depth belt so the
+ding doesn't die on ANY future ordering bug from ANY launcher
+(convoy, hand-launch, alternate harnesses).
+
 ### Added (coord-kill piece (j) — `ST_DING_DEBUG=1` diagnostic mode)
 
 Piece (i)'s 90s quiet-window did not close the capstone: the

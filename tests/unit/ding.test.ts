@@ -5,6 +5,7 @@
 // behavior is testable without a real pty subprocess or filesystem.
 
 import {
+  existsSync,
   mkdirSync,
   mkdtempSync,
   rmSync,
@@ -728,6 +729,114 @@ describe('cmdDingCli — ST_DING_RESCAN_* env overrides', () => {
     expect(stderrBuf.value).toContain('ST_DING_DEBUG=1');
     expect(stderrBuf.value).toContain('[st ding\n');
     expect(stderrBuf.value).toContain('rescan-tick summary');
+  });
+});
+
+// ─── cmdDingCli — startup-race hardening: mkdir -p missing folder ─────
+
+describe('cmdDingCli — startup-race hardening (auto-mkdir the watched identity)', () => {
+  // Real bug pinned by evals during the capstone run: convoy
+  // spawns the ding sidecar BEFORE the target agent's inbox
+  // folder exists (agent hasn't sent its first message yet).
+  // The watcher's first poll throws AgentNotHostedError → error
+  // bubbles up → runDing's finally block clears every timer →
+  // the daemon exits, leaving the target session un-poked
+  // forever. Fix: `st ding` ensures the identity dirs exist
+  // before handing off to runDing. Idempotent; matches the
+  // lazy-create semantic other verbs use for identity's own owner.
+  //
+  // These tests run cmdDingCli in a fake filesystem and assert
+  // the folders get created — proving the fix is scoped to the
+  // right layer (CLI startup, not runDing's watch loop).
+  //
+  // We use `--exit-when-session-gone` + a fake ptyProbe so the
+  // command short-circuits BEFORE actually running runDing —
+  // enough to observe the mkdir side-effect without a pty
+  // dependency.
+  let scratch: string;
+  let ptyOverride: string;
+
+  beforeEach(() => {
+    scratch = mkdtempSync(join(tmpdir(), 'st-ding-startup-'));
+    // Fake pty binary so the PATH probe passes.
+    ptyOverride = join(scratch, 'fake-pty');
+    writeFileSync(ptyOverride, '#!/bin/sh\nexit 0\n');
+  });
+
+  afterEach(() => {
+    rmSync(scratch, { recursive: true, force: true });
+  });
+
+  // Fake ptyProbe that reports pty unavailable → cmdDingCli returns
+  // 2 before it would call runDing. We only care about the mkdir
+  // side-effect that runs BEFORE the probe check.
+  const unavailableProbe = (): { available: false; reason: string } => ({
+    available: false,
+    reason: 'test seam: pty not available',
+  });
+
+  it('missing identity folder → cmdDingCli creates it before touching runDing', async () => {
+    const stRoot = join(scratch, 'st');
+    mkdirSync(stRoot, { recursive: true });
+    // No cap-wk/{inbox,archive} folder yet — the exact capstone
+    // repro shape.
+    expect(existsSync(join(stRoot, 'cap-wk'))).toBe(false);
+    let stderrBuf = '';
+    const ctx = {
+      env: {
+        ST_AGENT: 'cap-wk',
+        ST_ROOT: stRoot,
+      } as NodeJS.ProcessEnv,
+      stRoot,
+      stConfig: '/tmp/cfg',
+      stdout: (): void => {},
+      stderr: (s: string): void => {
+        stderrBuf += s;
+      },
+      readStdin: async (): Promise<Buffer> => Buffer.from(''),
+      stdinIsTty: (): boolean => true,
+    };
+    const code = await cmdDingCli(
+      ['target-session', '--identity', 'cap-wk'],
+      ctx,
+      { ptyProbe: unavailableProbe }
+    );
+    // pty probe fails → returns 2 without running runDing.
+    expect(code).toBe(2);
+    // But the mkdir landed BEFORE the probe check.
+    expect(existsSync(join(stRoot, 'cap-wk', 'inbox'))).toBe(true);
+    expect(existsSync(join(stRoot, 'cap-wk', 'archive'))).toBe(true);
+    // Regression guard: the "watcher errored: agent folder missing"
+    // message did NOT appear because the mkdir preempted the error.
+    expect(stderrBuf).not.toContain('watcher errored: agent folder missing');
+  });
+
+  it('pre-existing identity folder → no-op (idempotent)', async () => {
+    const stRoot = join(scratch, 'st');
+    mkdirSync(join(stRoot, 'cap-wk', 'inbox'), { recursive: true });
+    mkdirSync(join(stRoot, 'cap-wk', 'archive'), { recursive: true });
+    const inboxStat = statSync(join(stRoot, 'cap-wk', 'inbox'));
+    const ctx = {
+      env: {
+        ST_AGENT: 'cap-wk',
+        ST_ROOT: stRoot,
+      } as NodeJS.ProcessEnv,
+      stRoot,
+      stConfig: '/tmp/cfg',
+      stdout: (): void => {},
+      stderr: (): void => {},
+      readStdin: async (): Promise<Buffer> => Buffer.from(''),
+      stdinIsTty: (): boolean => true,
+    };
+    await cmdDingCli(
+      ['target-session', '--identity', 'cap-wk'],
+      ctx,
+      { ptyProbe: unavailableProbe }
+    );
+    // Folder still exists; ino unchanged (mkdirSync is a no-op on
+    // existing dirs, doesn't rewrite the inode).
+    const afterStat = statSync(join(stRoot, 'cap-wk', 'inbox'));
+    expect(afterStat.ino).toBe(inboxStat.ino);
   });
 });
 

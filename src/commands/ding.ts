@@ -1278,8 +1278,26 @@ export async function cmdDingCli(
   // invocations don't pull lib.ts into the dispatcher hot path.
   const { createSt } = await import('../lib.ts');
   const { asIdentity } = await import('../types.ts');
+  const { ensureIdentityDirs } = await import('../common.ts');
 
   const identity = asIdentity(identityValue);
+
+  // Startup-race hardening: ensure the watched identity's folder
+  // exists before we hand off to runDing. Otherwise the watcher
+  // throws `agent folder missing for <id>` at first poll, the
+  // watcher async iterator errors out, `runDing` cleans up its
+  // timers, and the whole daemon exits — leaving the target
+  // session un-poked forever.
+  //
+  // The race: convoy (or any supervisor) can spawn the ding
+  // sidecar BEFORE the target agent's folder exists (the agent
+  // itself hasn't sent its first message yet). Rather than
+  // depend on ordering, `st ding` self-heals: create the folder
+  // if missing. Idempotent — matches the same lazy-create
+  // semantic every other verb uses when the invoker is the
+  // identity's own owner.
+  ensureIdentityDirs(identity, root);
+
   const st = createSt({ root, identity });
 
   // PATH robustness: probe for `pty` on the daemon's PATH BEFORE
