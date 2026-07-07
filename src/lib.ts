@@ -1,10 +1,10 @@
 // lib.ts — embeddable createSt({ root, identity, configRoot? }) factory.
 //
-// What CLI consumers get from `bin/coord` and what library consumers get
+// What CLI consumers get from `bin/st` and what library consumers get
 // from `createSt(...)` are functionally identical — the same code paths
 // in src/commands/ underpin both. Library consumers get:
 //
-// - A typed `Coord` handle with `{ root, identity, configRoot }` baked in.
+// - A typed `St` handle with `{ root, identity, configRoot }` baked in.
 //   No env-var juggling per call.
 // - Promise-returning methods. Async-iterable `watch` for streaming.
 // - AbortSignal support on `watch` for cancellation.
@@ -113,7 +113,7 @@ export interface StOptions {
 }
 
 export interface SendOptions {
-  /** Sender identity. Defaults to the Coord's `identity`. */
+  /** Sender identity. Defaults to the network's `identity`. */
   from?: Identity;
   subject?: string;
   inReplyTo?: Filename;
@@ -144,7 +144,7 @@ export interface TrimOptions {
   /**
    * Issue #8: when true, delete prefix-sibling attachments alongside
    * the canonical `.md` victims. Default false preserves the
-   * LAYOUT-004 "coord owns only the .md" semantic.
+   * LAYOUT-004 "st owns only the .md" semantic.
    */
   withAttachments?: boolean;
   /** Override now() for deterministic --older-than testing. */
@@ -155,14 +155,14 @@ export interface ArchiveOptions {
   /**
    * Issue #8: when true, also move prefix-sibling attachments — every
    * file in inbox/ whose `<unix-ms>-<rand6>` prefix matches the
-   * canonical `.md`. Default false preserves the LAYOUT-004 "coord
+   * canonical `.md`. Default false preserves the LAYOUT-004 "st
    * owns only the .md" semantic.
    */
   withAttachments?: boolean;
 }
 
 /**
- * One orphan attachment entry as returned by {@link Coord.lsOrphans}.
+ * One orphan attachment entry as returned by {@link St.lsOrphans}.
  * `ts` is parsed from the LAYOUT prefix `<unix-ms>`; orphans have no
  * frontmatter to project.
  */
@@ -185,9 +185,9 @@ export interface WatchOptions {
   /** AbortSignal to cancel the iterable. */
   signal?: AbortSignal;
   /**
-   * When true, watch every peer's inbox EXCEPT the Coord's own
+   * When true, watch every peer's inbox EXCEPT the network's own
    * identity (cross-tree supervisor mode). Default is to watch
-   * the Coord's own identity inbox — same default as `st watch`
+   * the network's own identity inbox — same default as `st watch`
    * post-brief-017a. Mutually exclusive with the `identity` arg.
    */
   all?: boolean;
@@ -210,7 +210,7 @@ export interface FanOutBidiItem {
   pullOk: boolean;
 }
 
-// ─── Coord interface ────────────────────────────────────────────────────
+// ─── St interface ────────────────────────────────────────────────────
 
 export interface St {
   readonly root: string;
@@ -236,7 +236,7 @@ export interface St {
    * is no longer present in the same folder — i.e. orphans left behind
    * when a `.md` was archived without `--with-attachments`. Returns
    * `{filename, ts}` because orphans have no frontmatter to project.
-   * Identity defaults to the Coord's own.
+   * Identity defaults to the network's own.
    */
   lsOrphans(
     identity?: Identity,
@@ -259,7 +259,7 @@ export interface St {
     status?: State;
     enrich?: boolean;
   }): AgentSummary[] | AgentSummaryEnriched[];
-  /** @deprecated Use {@link Coord.agents}. */
+  /** @deprecated Use {@link St.agents}. */
   members(opts?: {
     status?: State;
     enrich?: boolean;
@@ -350,9 +350,9 @@ export interface St {
    * `runDing` for embedders that want to start a ding from inside a TUI
    * or supervisor process instead of shelling out. Resolves when the
    * daemon exits (via `deps.signal` or session-watch). `deps.identity`
-   * defaults to the Coord's own identity if you don't override it.
+   * defaults to the network's own identity if you don't override it.
    */
-  ding(deps: Omit<DingDeps, 'coord' | 'identity'> & {
+  ding(deps: Omit<DingDeps, 'st' | 'identity'> & {
     identity?: Identity;
   }): Promise<void>;
 }
@@ -364,7 +364,7 @@ const DEFAULT_INTERVAL_MS = 500;
 export function createSt(options: StOptions): St {
   const root = options.root;
   const identity = asIdentity(options.identity);
-  const configRoot = options.configRoot ?? join(homedir(), '.config', 'coord');
+  const configRoot = options.configRoot ?? join(homedir(), '.config', 'smalltalk');
 
   const lib_env = {} as NodeJS.ProcessEnv; // empty: API never reads env
 
@@ -405,7 +405,7 @@ export function createSt(options: StOptions): St {
     return { stRoot: root, stConfig: configRoot, deps };
   }
 
-  const coord: St = {
+  const st: St = {
     root,
     identity,
     configRoot,
@@ -572,7 +572,7 @@ export function createSt(options: StOptions): St {
       const watchInput: WatchInput = {
         ...(id !== undefined && { recipient: id }),
         ...(opts.all === true && { all: true }),
-        // The library's "who am I" comes from the Coord's identity.
+        // The library's "who am I" comes from the network's identity.
         // Pass it as fromExplicit so the resolver knows which folder
         // is "self" — used both by the new default (singleId = self)
         // and by the --all path's suppression target.
@@ -736,7 +736,7 @@ export function createSt(options: StOptions): St {
     async ding(deps): Promise<void> {
       const dingDeps: DingDeps = {
         ...deps,
-        coord,
+        st: st,
         identity: deps.identity ?? identity,
       };
       return runDing(dingDeps);
@@ -805,7 +805,7 @@ export function createSt(options: StOptions): St {
     },
   };
 
-  return coord;
+  return st;
 }
 
 // ─── Helpers ────────────────────────────────────────────────────────────

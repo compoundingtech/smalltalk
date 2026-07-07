@@ -7,7 +7,7 @@
 // Long-running. Lives in the same process as `st ding ...`; pair
 // with `pty up` (or any supervisor) for restart-on-crash. Designed
 // so the underlying daemon (`runDing`) is testable without a real
-// pty binary or a real Coord — see tests/unit/ding.test.ts.
+// pty binary or a real St — see tests/unit/ding.test.ts.
 
 import { spawn, spawnSync } from 'node:child_process';
 import { readdirSync, readFileSync, statSync } from 'node:fs';
@@ -88,8 +88,8 @@ export interface IsSessionAlive {
 }
 
 export interface DingDeps {
-  /** Pre-built Coord. Production uses `createSt({ root, identity })`. */
-  coord: St;
+  /** Pre-built St. Production uses `createSt({ root, identity })`. */
+  st: St;
   /** Identity whose inbox + status the daemon watches. */
   identity: Identity;
   /** Target pty session name (matches `pty list`). */
@@ -261,7 +261,7 @@ export async function runDing(deps: DingDeps): Promise<void> {
   async function runTidyTick(): Promise<void> {
     let state: State;
     try {
-      state = await deps.coord.getStatus(deps.identity);
+      state = await deps.st.getStatus(deps.identity);
     } catch (err) {
       log(`st ding: tidy getStatus failed: ${errMsg(err)}\n`);
       return; // best-effort; don't arm dedup on errors
@@ -273,7 +273,7 @@ export async function runDing(deps: DingDeps): Promise<void> {
     try {
       const driftOpts: { now?: () => number } = {};
       if (deps.tidyNow !== undefined) driftOpts.now = deps.tidyNow;
-      drift = evaluateDrift(deps.identity, deps.coord.root, driftOpts);
+      drift = evaluateDrift(deps.identity, deps.st.root, driftOpts);
     } catch (err) {
       log(`st ding: tidy evaluate failed: ${errMsg(err)}\n`);
       return;
@@ -434,7 +434,7 @@ export async function runDing(deps: DingDeps): Promise<void> {
     deps.statusRefreshIntervalMs ?? STATUS_REFRESH_MS;
   let statusRefreshTimer: ReturnType<typeof setInterval> | undefined;
   function runStatusRefreshTick(): void {
-    const outcome = refreshIdentityStatus(deps.identity, deps.coord.root);
+    const outcome = refreshIdentityStatus(deps.identity, deps.st.root);
     if (outcome === 'error') {
       log(
         `st ding: status refresh for "${deps.identity}" failed (best-effort, will retry next tick).\n`
@@ -473,7 +473,7 @@ export async function runDing(deps: DingDeps): Promise<void> {
         const attemptList = readPending.splice(0);
         for (const fn of attemptList) {
           try {
-            const ev = await buildEvent(deps.coord, deps.identity, fn);
+            const ev = await buildEvent(deps.st, deps.identity, fn);
             buffer.push(ev);
           } catch (err) {
             log(
@@ -489,7 +489,7 @@ export async function runDing(deps: DingDeps): Promise<void> {
       }
       let state: State;
       try {
-        state = await deps.coord.getStatus(deps.identity);
+        state = await deps.st.getStatus(deps.identity);
       } catch (err) {
         log(
           `st ding: getStatus failed: ${errMsg(err)}\n`
@@ -547,16 +547,16 @@ export async function runDing(deps: DingDeps): Promise<void> {
     }
     let state: State;
     try {
-      state = await deps.coord.getStatus(deps.identity);
+      state = await deps.st.getStatus(deps.identity);
     } catch (err) {
       log(`st ding: getStatus failed: ${errMsg(err)}\n`);
       // If we can't read status, lean toward delivering — better
-      // than silently dropping a coord message.
+      // than silently dropping a st message.
       state = 'available';
     }
     let event: BufferedEvent;
     try {
-      event = await buildEvent(deps.coord, deps.identity, filename);
+      event = await buildEvent(deps.st, deps.identity, filename);
     } catch (err) {
       // Buffer the bare filename for retry on the next flush tick.
       // Peer's atomic write races the watcher fire → read sees
@@ -604,14 +604,14 @@ export async function runDing(deps: DingDeps): Promise<void> {
     let statusMtimeMs = 0;
     try {
       statusMtimeMs = statSync(
-        statusPath(deps.identity, deps.coord.root)
+        statusPath(deps.identity, deps.st.root)
       ).mtimeMs;
     } catch {
       // missing or unreadable status file → treat as 0 (all inbox files
       // are eligible). A fresh agent that never set status still gets
       // the backlog replayed.
     }
-    const dir = inboxDir(deps.identity, deps.coord.root);
+    const dir = inboxDir(deps.identity, deps.st.root);
     let entries: string[];
     try {
       entries = readdirSync(dir);
@@ -678,7 +678,7 @@ export async function runDing(deps: DingDeps): Promise<void> {
     };
     watchOpts.signal = signal;
     try {
-      for await (const ev of deps.coord.watch(
+      for await (const ev of deps.st.watch(
         deps.identity,
         watchOpts
       ) as AsyncIterable<WatchEvent>) {
@@ -771,13 +771,13 @@ function formatAge(ms: number): string {
 }
 
 async function buildEvent(
-  coord: St,
+  st: St,
   identity: Identity,
   filename: Filename
 ): Promise<BufferedEvent> {
   // Read the file to extract `from` for the notice. Errors propagate
   // to the caller (which logs + drops the event).
-  const r = await coord.read(identity, filename);
+  const r = await st.read(identity, filename);
   return {
     filename,
     from: r.message.from,
@@ -1026,7 +1026,7 @@ export async function cmdDingCli(
   }
 
   if (ptySession === undefined) {
-    throw new Error('coord ding requires a <pty-session> name');
+    throw new Error('st ding requires a <pty-session> name');
   }
 
   const root = ctx.stRoot;
@@ -1046,7 +1046,7 @@ export async function cmdDingCli(
   const { asIdentity } = await import('../types.ts');
 
   const identity = asIdentity(identityValue);
-  const coord = createSt({ root, identity });
+  const st = createSt({ root, identity });
 
   // PATH robustness: probe for `pty` on the daemon's PATH BEFORE
   // starting the watcher / timers. A ding daemon that can't spawn
@@ -1085,7 +1085,7 @@ export async function cmdDingCli(
 
   try {
     await runDing({
-      coord,
+      st: st,
       identity,
       ptySession,
       ...(intervalMs !== undefined && { intervalMs }),

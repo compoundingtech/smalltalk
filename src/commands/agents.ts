@@ -5,10 +5,10 @@
 // filesystem read, no resolveAgent — does not auto-create or mutate
 // anything for the agents it walks.
 //
-//   coord agents                  # text, sorted alphabetically
-//   coord agents --status STATE   # filter to a single status
-//   coord agents --json           # machine-readable
-//   coord agents --json --enrich  # + lastActivity, inbox count
+//   st agents                  # text, sorted alphabetically
+//   st agents --status STATE   # filter to a single status
+//   st agents --json           # machine-readable
+//   st agents --json --enrich  # + lastActivity, inbox count
 //
 // brief-009 item 3 (rename): `members` is the deprecated alias of this
 // verb. Both spellings work; CLI + MCP both dual-register. The type
@@ -72,7 +72,7 @@ export interface GetAgentsOpts {
 /**
  * Pure library-shaped enumeration. Same computation as {@link cmdAgents}
  * but takes positional `root` and returns the bare array (no `{items}`
- * envelope) — what `coord.agents(...)` exposes to embedders.
+ * envelope) — what `st.agents(...)` exposes to embedders.
  *
  * Read-only: walks `<root>/*` and consults each agent's status / name /
  * inbox. No writes.
@@ -127,7 +127,7 @@ export function cmdAgents(
  * Walk `<root>/*` and return agent-shaped subfolders.
  *
  * Filters:
- *   - skip dotfiles (defensive; nothing in coord uses them today)
+ *   - skip dotfiles (defensive; nothing in st uses them today)
  *   - skip non-directories
  *   - skip reserved names (defensive)
  *   - keep only names where validAgent(name) holds AND at least one of

@@ -2,7 +2,7 @@
 //
 // Composes existing read paths (agents, ls, raw mtimes) into one
 // snapshot for the active agent. Designed for "what's the state of
-// my coord world right now?" — typed for embedders via --json; text
+// my st world right now?" — typed for embedders via --json; text
 // for humans by default.
 
 import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
@@ -78,7 +78,7 @@ export interface GetOverviewOpts {
  * Pure library-shaped overview computation. Takes positional `root` and
  * `identity` (no env resolution) so an embedder can render a dashboard
  * for any identity without going through `$COORD_IDENTITY`. Read-only.
- * Added in brief-028 to back `coord.overview(...)` on the Coord handle.
+ * Added in brief-028 to back `st.overview(...)` on the smalltalk instance handle.
  */
 export function getOverview(
   root: string,

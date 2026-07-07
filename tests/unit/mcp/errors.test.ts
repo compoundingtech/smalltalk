@@ -1,4 +1,4 @@
-// tests/unit/mcp/errors.test.ts — coordErrorToToolResult mapping.
+// tests/unit/mcp/errors.test.ts — stErrorToToolResult mapping.
 //
 // Every StError subclass surfaces with its stable `code`, the
 // content[0].text prefixed `<CODE>:`, and structuredContent carrying
@@ -24,11 +24,11 @@ import {
 } from '../../../src/errors.ts';
 import {
   buildToolResult,
-  coordErrorToToolResult,
+  stErrorToToolResult,
   withErrorMapping,
 } from '../../../src/mcp/error-mapping.ts';
 
-describe('coordErrorToToolResult — every StError subclass round-trips', () => {
+describe('stErrorToToolResult — every StError subclass round-trips', () => {
   it.each([
     [new IdentityRequiredError(), 'IDENTITY_REQUIRED'],
     [new IdentityNotHostedError('ghost'), 'IDENTITY_NOT_HOSTED'],
@@ -47,7 +47,7 @@ describe('coordErrorToToolResult — every StError subclass round-trips', () => 
     [new EmptyBodyError(), 'EMPTY_BODY'],
     [new ArchiveConflictError('bob', 'X.md'), 'ARCHIVE_CONFLICT'],
   ])('maps %s → code=%s', (err, code) => {
-    const r = coordErrorToToolResult(err);
+    const r = stErrorToToolResult(err);
     expect(r.isError).toBe(true);
     expect(r.content[0]).toMatchObject({ type: 'text' });
     const text = (r.content[0] as { text: string }).text;
@@ -60,9 +60,9 @@ describe('coordErrorToToolResult — every StError subclass round-trips', () => 
   });
 });
 
-describe('coordErrorToToolResult — non-StError fallback', () => {
+describe('stErrorToToolResult — non-StError fallback', () => {
   it('plain Error → INTERNAL_ERROR with the message', () => {
-    const r = coordErrorToToolResult(new Error('something bad'));
+    const r = stErrorToToolResult(new Error('something bad'));
     expect(r.isError).toBe(true);
     expect((r.content[0] as { text: string }).text).toBe(
       'INTERNAL_ERROR: something bad'
@@ -74,7 +74,7 @@ describe('coordErrorToToolResult — non-StError fallback', () => {
   });
 
   it('non-Error throw (string) → INTERNAL_ERROR with the stringified value', () => {
-    const r = coordErrorToToolResult('boom');
+    const r = stErrorToToolResult('boom');
     expect(r.isError).toBe(true);
     expect((r.content[0] as { text: string }).text).toBe(
       'INTERNAL_ERROR: boom'
@@ -86,7 +86,7 @@ describe('coordErrorToToolResult — non-StError fallback', () => {
   });
 
   it('StError subclasses preserve the details payload in _meta', () => {
-    const r = coordErrorToToolResult(new IdentityNotHostedError('ghost'));
+    const r = stErrorToToolResult(new IdentityNotHostedError('ghost'));
     expect(r._meta?.['st/error']).toMatchObject({
       code: 'IDENTITY_NOT_HOSTED',
       details: { identity: 'ghost' },
@@ -94,7 +94,7 @@ describe('coordErrorToToolResult — non-StError fallback', () => {
   });
 
   it('StError without details omits the details key', () => {
-    const r = coordErrorToToolResult(new IdentityRequiredError());
+    const r = stErrorToToolResult(new IdentityRequiredError());
     expect(r._meta?.['st/error']).toEqual({
       code: 'IDENTITY_REQUIRED',
       message: expect.stringContaining('ST_AGENT'),
@@ -102,7 +102,7 @@ describe('coordErrorToToolResult — non-StError fallback', () => {
   });
 
   it('error responses do NOT set structuredContent (would fail outputSchema)', () => {
-    const r = coordErrorToToolResult(new IdentityRequiredError());
+    const r = stErrorToToolResult(new IdentityRequiredError());
     expect(r.structuredContent).toBeUndefined();
   });
 });

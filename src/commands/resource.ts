@@ -7,10 +7,10 @@
 // single-writer convention from brief-015 (now removed).
 //
 // Subcommands (each pairs a typed core function with a CLI wrapper):
-//   coord resource add <url> [--title T] [--tag T,T] [--relation REL] [--body-stdin]
-//   coord resource ls [<identity>]
-//   coord resource read [<identity>] <filename>
-//   coord resource rm <filename>
+//   st resource add <url> [--title T] [--tag T,T] [--relation REL] [--body-stdin]
+//   st resource ls [<identity>]
+//   st resource read [<identity>] <filename>
+//   st resource rm <filename>
 
 import {
   existsSync,
@@ -111,7 +111,7 @@ function ensureResourcesDir(identity: string, root: string): string {
   return dir;
 }
 
-// ─── coord resource add ─────────────────────────────────────────────────
+// ─── st resource add ─────────────────────────────────────────────────
 
 export interface ResourceAddInput {
   url: string;
@@ -167,7 +167,7 @@ export function cmdResourceAdd(input: ResourceAddInput): ResourceAddResult {
   return { filename, path, identity };
 }
 
-// ─── coord resource ls ──────────────────────────────────────────────────
+// ─── st resource ls ──────────────────────────────────────────────────
 
 export interface ResourceLsInput {
   /** Whose resources to list. Defaults to env COORD_IDENTITY. */
@@ -204,7 +204,7 @@ export function cmdResourceLs(input: ResourceLsInput): ResourceLsResult {
 
 /**
  * Walk an identity's resources/ folder and return parsed records. Used
- * by the SDK's `coord.resources.list` and the MCP tool. No
+ * by the SDK's `st.resources.list` and the MCP tool. No
  * resolveIdentity — the caller passes the identity directly.
  */
 export function listResourceRecords(
@@ -231,7 +231,7 @@ export function listResourceRecords(
   return items;
 }
 
-// ─── coord resource read ────────────────────────────────────────────────
+// ─── st resource read ────────────────────────────────────────────────
 
 export interface ResourceReadInput {
   /** Whose resource to read. Defaults to env COORD_IDENTITY. */
@@ -263,7 +263,7 @@ export function cmdResourceRead(input: ResourceReadInput): ResourceReadResult {
   return { identity, record: readResourceFile(path, input.filename) };
 }
 
-// ─── coord resource rm ──────────────────────────────────────────────────
+// ─── st resource rm ──────────────────────────────────────────────────
 
 export interface ResourceRemoveInput {
   /** Defaults to env COORD_IDENTITY. rm only operates on the OWNER's
@@ -384,7 +384,7 @@ async function cmdResourceAddCli(
     }
   }
   if (url === undefined) {
-    throw new Error('coord resource add requires a <url>');
+    throw new Error('st resource add requires a <url>');
   }
   let body: string | undefined;
   if (bodyStdin) {
@@ -462,7 +462,7 @@ function cmdResourceReadCli(
     identity = positional[0];
     filename = positional[1]!;
   } else {
-    throw new Error('coord resource read requires [<identity>] <filename>');
+    throw new Error('st resource read requires [<identity>] <filename>');
   }
   const r = cmdResourceRead({
     ...(identity !== undefined && { identity }),
@@ -514,7 +514,7 @@ function cmdResourceRemoveCli(
     positional.push(a);
   }
   if (positional.length !== 1) {
-    throw new Error('coord resource rm requires a <filename>');
+    throw new Error('st resource rm requires a <filename>');
   }
   const r = cmdResourceRemove({
     filename: positional[0]!,

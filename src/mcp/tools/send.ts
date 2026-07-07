@@ -1,6 +1,6 @@
-// mcp/tools/send.ts — registers the `coord_msg_send` MCP tool.
+// mcp/tools/send.ts — registers the `st_msg_send` MCP tool.
 //
-// Mirrors the `coord.send(to, body, opts)` API method 1:1. Required:
+// Mirrors the `st.send(to, body, opts)` API method 1:1. Required:
 // to, body. Optional: from, subject, inReplyTo, tags[], priority.
 // Returns { filename, identity } in structuredContent on success.
 
@@ -47,7 +47,7 @@ const sendOutputShape = {
     .describe('The recipient identity the file was written under.'),
 };
 
-export function registerSendTool(mcp: McpServer, coord: St): void {
+export function registerSendTool(mcp: McpServer, st: St): void {
   mcp.registerTool(
     'st_msg_send',
     {
@@ -68,7 +68,7 @@ export function registerSendTool(mcp: McpServer, coord: St): void {
         }
         if (args.tags !== undefined) opts.tags = args.tags;
         if (args.priority !== undefined) opts.priority = args.priority;
-        const filename: Filename = await coord.send(to, args.body, opts);
+        const filename: Filename = await st.send(to, args.body, opts);
         return buildToolResult({
           summary: `sent: ${to}/${filename}`,
           value: { filename, identity: to },

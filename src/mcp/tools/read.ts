@@ -44,7 +44,7 @@ const readOutputShape = {
   }),
 };
 
-export function registerReadTool(mcp: McpServer, coord: St): void {
+export function registerReadTool(mcp: McpServer, st: St): void {
   mcp.registerTool(
     'st_msg_read',
     {
@@ -59,11 +59,11 @@ export function registerReadTool(mcp: McpServer, coord: St): void {
         const identity =
           args.identity !== undefined
             ? asIdentity(args.identity)
-            : coord.identity;
+            : st.identity;
         const filename = asDeliverableFilename(args.filename);
         const opts: Parameters<St['read']>[2] = {};
         if (args.fromArchive !== undefined) opts.fromArchive = args.fromArchive;
-        const r = await coord.read(identity, filename, opts);
+        const r = await st.read(identity, filename, opts);
         // r.message has optional fields that are sometimes absent — strip
         // undefined keys so the structuredContent reflects the actual
         // shape on disk (zod outputSchema accepts the optionals).

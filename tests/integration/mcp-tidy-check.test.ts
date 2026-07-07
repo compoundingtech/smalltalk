@@ -144,7 +144,7 @@ describe('tidy-check tick — fires on drift', () => {
     await waitFor(() => received.length >= 1);
     const n = received[0]!;
     expect(n.params.meta.kind).toBe('tidy-check');
-    expect(n.params.meta.from).toBe('coord-system');
+    expect(n.params.meta.from).toBe('st-system');
     expect(n.params.meta.messageFilename).toBeNull();
     expect(n.params.meta.threadFilename).toBeNull();
     expect(n.params.meta.identity).toBe(ID);

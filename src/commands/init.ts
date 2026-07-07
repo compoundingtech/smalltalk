@@ -1,9 +1,9 @@
 // commands/init.ts — `st init` verb.
 //
 // Writes (or merges) `.mcp.json` in a target directory so a Claude
-// Code session in that repo will load the coord MCP server. Resolves
-// the bin/coord path portably (via this module's location, then
-// `which coord` on PATH) so the file never carries a hardcoded
+// Code session in that repo will load the st MCP server. Resolves
+// the bin/st path portably (via this module's location, then
+// `which st` on PATH) so the file never carries a hardcoded
 // developer-machine path.
 //
 // Per brief-026: surgical addition only — leaves other mcpServers
@@ -59,7 +59,7 @@ export interface InitInput {
   print?: boolean;
   /** When true, overwrite a divergent existing entry without prompting. */
   force?: boolean;
-  /** Test seam: override the resolved bin/coord path. */
+  /** Test seam: override the resolved bin/st path. */
   binPath?: string;
   /** Test seam: prompt response. When set, used instead of stdin /TTY. */
   promptAnswer?: 'y' | 'n';
@@ -68,7 +68,7 @@ export interface InitInput {
 export interface InitResult {
   outcome: InitOutcome;
   path: string;
-  /** The coord entry that was (or would have been) written. */
+  /** The st entry that was (or would have been) written. */
   entry: McpServerEntry;
 }
 
@@ -78,20 +78,20 @@ export interface InitResult {
  * Resolve a portable path to the smalltalk shim to embed as the MCP
  * server command in a project's `.mcp.json`. Strategy:
  *   1. Walk up from this module's file location to find the
- *      package.json whose `name === "@myobie/coord"` (the package
- *      name still says coord until the npm publish flips it), then
+ *      package.json whose `name === "@myobie/st"` (the package
+ *      name still says st until the npm publish flips it), then
  *      return `<package-root>/bin/st`. Falls back to
- *      `<package-root>/bin/coord` only when `bin/st` isn't present
+ *      `<package-root>/bin/st` only when `bin/st` isn't present
  *      on this install (very old package tarball / hand-installed
  *      old checkout).
- *   2. Fall back to `which st` on PATH, then `which coord` for
+ *   2. Fall back to `which st` on PATH, then `which st` for
  *      legacy PATH setups.
  *
  * Prefers `bin/st` because it's the post-cutover canonical name —
  * matches what `st init` writes as the `.mcp.json` server key (`st`)
- * and what `enabledMcpjsonServers` pins. The old `bin/coord` was
+ * and what `enabledMcpjsonServers` pins. The old `bin/st` was
  * dual-aliased into the same target, so both work today, but pinning
- * to the canonical name means the day we drop the coord alias
+ * to the canonical name means the day we drop the st alias
  * doesn't break every existing `.mcp.json`. Function name kept as
  * `resolveStShimPath` for now — this is a callers-are-me-only API,
  * renaming is scope-creep on the fix.
@@ -110,19 +110,10 @@ export function resolveStShimPath(): string {
         const raw = readFileSync(pkgPath, 'utf8');
         const parsed = JSON.parse(raw) as { name?: string };
         if (parsed.name === '@myobie/coord') {
-          // Prefer post-cutover canonical bin/st; fall back to bin/coord
-          // if bin/st isn't present (very old package or hand-install
-          // predating the cutover).
-          const stCandidate = join(dir, 'bin', 'st');
-          if (existsSync(stCandidate) && statSync(stCandidate).isFile()) {
-            return stCandidate;
-          }
-          const coordCandidate = join(dir, 'bin', 'coord');
-          if (
-            existsSync(coordCandidate) &&
-            statSync(coordCandidate).isFile()
-          ) {
-            return coordCandidate;
+          // Return the canonical bin/st shim.
+          const candidate = join(dir, 'bin', 'st');
+          if (existsSync(candidate) && statSync(candidate).isFile()) {
+            return candidate;
           }
         }
       } catch {
@@ -133,8 +124,8 @@ export function resolveStShimPath(): string {
     if (parent === dir) break;
     dir = parent;
   }
-  // PATH fallback — prefer `st`, then `coord` for legacy PATH.
-  for (const name of ['st', 'coord']) {
+  // PATH fallback — prefer `st`, then `st` for legacy PATH.
+  for (const name of ['st', 'st']) {
     try {
       const r = spawnSync('which', [name], { encoding: 'utf8' });
       if (r.status === 0 && typeof r.stdout === 'string') {
@@ -146,7 +137,7 @@ export function resolveStShimPath(): string {
     }
   }
   throw new Error(
-    'st init: could not resolve a bin/st path. Install @myobie/coord ' +
+    'st init: could not resolve a bin/st path. Install @myobie/st ' +
       '(via npm) or add `st` to your $PATH and retry.'
   );
 }
@@ -165,7 +156,7 @@ function buildCoordEntry(
   };
 }
 
-/** True if two coord entries are byte-equivalent for our merge purposes. */
+/** True if two st entries are byte-equivalent for our merge purposes. */
 function entryMatches(a: McpServerEntry, b: McpServerEntry): boolean {
   return JSON.stringify(a) === JSON.stringify(b);
 }
@@ -186,7 +177,7 @@ export async function cmdInit(
     // Emit just the st entry (under a top-level mcpServers wrapper)
     // so the user can paste it manually if they want to. Key is `st`
     // to match the post-cutover on-disk naming; the MCP server itself
-    // still responds to both `coord` and `st` names, so this key just
+    // still responds to both `st` and `st` names, so this key just
     // has to be internally consistent with `enabledMcpjsonServers`
     // in settings.local.json.
     const preview: McpJsonShape = { mcpServers: { st: entry } };
@@ -234,8 +225,8 @@ export async function cmdInit(
       ? { ...existing.mcpServers }
       : {};
 
-  // Look up the existing entry under `st`. Post-coord-cutover the
-  // legacy `coord` key is no longer read or written.
+  // Look up the existing entry under `st`. Post-st-cutover the
+  // legacy `st` key is no longer read or written.
   const prior = servers.st;
   let outcome: InitOutcome;
   if (prior !== undefined && entryMatches(prior, entry)) {

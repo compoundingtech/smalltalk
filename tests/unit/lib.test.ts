@@ -56,9 +56,9 @@ describe('createSt — construction', () => {
     expect(coord.configRoot).toBe(join(scratch, 'config'));
   });
 
-  it('defaults configRoot to ~/.config/coord', () => {
+  it('defaults configRoot to ~/.config/smalltalk', () => {
     const c = createSt({ root: stRoot, identity: alice });
-    expect(c.configRoot.endsWith('.config/coord')).toBe(true);
+    expect(c.configRoot.endsWith('.config/smalltalk')).toBe(true);
   });
 
   it('throws if identity is invalid (asIdentity catches at construction)', () => {

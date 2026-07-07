@@ -30,7 +30,7 @@ export interface ArchiveInput {
   /**
    * Issue #8: when true, also move prefix-sibling attachments — every
    * file in inbox/ whose `<unix-ms>-<rand6>` prefix matches the canonical
-   * `.md`. Default false preserves the LAYOUT-004 "coord owns only the
+   * `.md`. Default false preserves the LAYOUT-004 "st owns only the
    * .md" semantic; opt-in keeps attachments lifecycle-coupled when the
    * caller wants that.
    */
@@ -235,7 +235,7 @@ export interface ArchiveTrimInput {
   /**
    * Issue #8: when true, also delete prefix-sibling attachments of each
    * trimmed `.md` — symmetric with `st message archive
-   * --with-attachments`. Default false matches the LAYOUT-004 "coord
+   * --with-attachments`. Default false matches the LAYOUT-004 "st
    * owns only the .md" semantic.
    */
   withAttachments?: boolean;

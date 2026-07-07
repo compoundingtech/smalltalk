@@ -173,7 +173,7 @@ export function cmdRead(input: ReadInput): ReadResult {
 /**
  * Build the structured shape emitted by `st message read --json`.
  *
- * Mirrors the {@link Coord.read} / `coord_msg_read` MCP tool projection so
+ * Mirrors the {@link St.read} / `st_msg_read` MCP tool projection so
  * a programmatic consumer can use one parser across both surfaces.
  * Untyped messages (no frontmatter) get `message.from = ""`, matching the
  * lib.ts permissive shape.

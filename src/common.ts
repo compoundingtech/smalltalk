@@ -1,4 +1,4 @@
-// common.ts — shared helpers for the coord CLI (Node port).
+// common.ts — shared helpers for the st CLI (Node port).
 //
 // Mirror of lib/common.sh. Behavior is 1:1 with the bash reference where
 // reasonable; minor improvements (newline-safe YAML quoting on emit/parse
@@ -36,7 +36,7 @@ export type Filename = string;
 // the validator in commands/status.ts.
 // `away` (brief-029) is a fifth settable state meaning "present but not
 // actively engaged" — distinct from `busy` (focused work, don't
-// interrupt) and `offline` (gone). coord-web's
+// interrupt) and `offline` (gone). the web UI's
 // document.visibilitychange handler is the canonical writer.
 export type State =
   | 'offline'
@@ -348,15 +348,15 @@ export const resolveIdentity = resolveAgent;
 
 // ─── Paths ───────────────────────────────────────────────────────────────
 //
-// brief-005-phase0 (issue: rename coord → smalltalk/st): the resolver
+// brief-005-phase0 (issue: rename st → smalltalk/st): the resolver
 // honors BOTH the new `ST_*` names and the legacy `COORD_*` names; ST_
 // wins when both are set. The fallback emits a one-time stderr notice
 // per env-var-name per process so operators see which configs still
 // reference the old name without breakage. The default state path
 // prefers `~/.local/state/smalltalk` when it exists, falls back to
-// `~/.local/state/coord` when only that exists, and creates
+// `~/.local/state/st` when only that exists, and creates
 // `~/.local/state/smalltalk` on a brand-new install. Config dir
-// (~/.config/coord) is intentionally NOT included in this phase per
+// (~/.config/st) is intentionally NOT included in this phase per
 // the brief — it ships in a later phase.
 
 const warnedLegacyEnvFallbacks = new Set<string>();
@@ -432,7 +432,7 @@ export function envAgentFrom(
 export const envIdentityFrom = envAgentFrom;
 
 /**
- * The name the CLI was invoked as (`coord` / `st` / `smalltalk`).
+ * The name the CLI was invoked as (`st` / `st` / `smalltalk`).
  * Set by the bash shim via `_ST_INVOKED_AS` BEFORE any symlink walk so
  * we capture the user-typed name. Defaults to `st` for callers
  * (tests, library embeds) that never set the env var. */
@@ -757,7 +757,7 @@ export interface SweepResult {
  * Issue #8 extension: the rule also applies to prefix-sibling attachments
  * — `archive/X.options.json` byte-identical to `inbox/X.options.json`
  * is removed from inbox iff a matching `archive/X.md` exists, so the
- * file is recognized as part of a real coord message family rather than
+ * file is recognized as part of a real st message family rather than
  * an unrelated user-dropped file.
  */
 export function sweep(rootArg?: string): SweepResult {
@@ -779,7 +779,7 @@ export function sweep(rootArg?: string): SweepResult {
     } catch {
       continue;
     }
-    // Coord-owned: a `.md` matching LAYOUT-004 grammar, OR an attachment
+    // St-owned: a `.md` matching LAYOUT-004 grammar, OR an attachment
     // whose prefix matches one. This filter is what prevents sweep from
     // acting on random files a user manually dropped into archive/.
     const mdPrefixes = new Set<string>();

@@ -5,7 +5,7 @@
 // restart-from-summary / auto-compaction / crash used to wipe the
 // model's memory of what it was mid-doing. `context/` persists that
 // state on disk, outside the session jsonl, in the agent's smalltalk
-// network folder (~/.local/state/coord/<agent>/context/).
+// network folder (~/.local/state/st/<agent>/context/).
 //
 // Two surfaces, two shapes:
 //   - now.md       — whole-file rewrite; `read now` prints it,
@@ -433,7 +433,7 @@ function cliRead(args: readonly string[], ctx: CliContext): number {
     stRoot: ctx.stRoot,
   });
   // Print the text as-is (including empty). Absent files exit 0 with
-  // empty output — the SessionStart hook can `cat $(coord context
+  // empty output — the SessionStart hook can `cat $(st context
   // read)` unconditionally without a special-case for first-boot
   // agents.
   ctx.stdout(r.text);

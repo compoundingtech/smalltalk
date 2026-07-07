@@ -57,11 +57,11 @@ const agentsOutputShape = {
     .describe('Agents under $ST_ROOT, sorted alphabetically. (Field name `members` kept for back-compat; renames to `agents` in a follow-up.)'),
 };
 
-export function registerAgentsTool(mcp: McpServer, coord: St): void {
+export function registerAgentsTool(mcp: McpServer, st: St): void {
   const handler = async (args: { status?: string; enrich?: boolean }) =>
     withErrorMapping(async () => {
       const r = cmdAgents({
-        stRoot: coord.root,
+        stRoot: st.root,
         ...(args.status !== undefined && { status: args.status }),
         ...(args.enrich !== undefined && { enrich: args.enrich }),
       });

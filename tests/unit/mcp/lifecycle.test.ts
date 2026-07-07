@@ -53,24 +53,24 @@ async function connectInMemory(opts?: { identity?: string }): Promise<{
 // ─── Construction ──────────────────────────────────────────────────────
 
 describe('createMcpServer — construction', () => {
-  it('returns a handle with mcp + coord + run + close', () => {
+  it('returns a handle with mcp + st + run + close', () => {
     const handle = createMcpServer({
       root: stRoot,
       identity: asIdentity('alice'),
     });
     expect(handle.mcp).toBeDefined();
-    expect(handle.coord).toBeDefined();
+    expect(handle.st).toBeDefined();
     expect(typeof handle.run).toBe('function');
     expect(typeof handle.close).toBe('function');
   });
 
-  it('threads root + identity through to the embedded Coord', () => {
+  it('threads root + identity through to the embedded St', () => {
     const handle = createMcpServer({
       root: stRoot,
       identity: asIdentity('alice'),
     });
-    expect(handle.coord.root).toBe(stRoot);
-    expect(handle.coord.identity).toBe('alice');
+    expect(handle.st.root).toBe(stRoot);
+    expect(handle.st.identity).toBe('alice');
   });
 
   it('honors configRoot when supplied', () => {
@@ -81,7 +81,7 @@ describe('createMcpServer — construction', () => {
       identity: asIdentity('alice'),
       configRoot: cfg,
     });
-    expect(handle.coord.configRoot).toBe(cfg);
+    expect(handle.st.configRoot).toBe(cfg);
   });
 
   it('throws if identity is invalid (asIdentity catches in createSt)', () => {

@@ -9,27 +9,27 @@ import type { Implementation } from '@modelcontextprotocol/sdk/types.js';
  * Default server identity — preserved for back-compat with imports
  * that pre-date brief-005-phase0. New code should call
  * {@link buildServerInfo} so the server announces under whichever
- * name (`coord` / `st`) the CLI was invoked as.
+ * name (`st` / `st`) the CLI was invoked as.
  */
 export const SERVER_INFO: Implementation = {
   name: 'st',
   // Tracks the package version. We don't read package.json here to keep
-  // the MCP module side-effect free; bump on every coord release.
+  // the MCP module side-effect free; bump on every st release.
   // 0.1.0 — brief-022 ships unknown-state + boot ritual + offline-on-
   //         shutdown. Real surface change visible to MCP hosts.
   // 0.2.0 — brief-023 (status-file mtime refresh) + brief-024
   //         (`journal/` folder + CLI verbs). MCP surface unchanged
   //         (Phase 8 journal tools deferred), but the data-model
   //         layout grows so peers see a new folder shape.
-  // 0.2.1 — brief-028 (lib API: coord.members / coord.overview /
-  //         coord.createIdentity + type re-exports). MCP surface
+  // 0.2.1 — brief-028 (lib API: st.members / st.overview /
+  //         st.createIdentity + type re-exports). MCP surface
   //         unchanged; library-only addition.
   // 0.2.2 — brief-029 (`away` State, fifth settable). Additive
-  //         enum extension; coord_members filter enum picks it up
+  //         enum extension; st_members filter enum picks it up
   //         via STATES, no schema-bump beyond the new value.
   // 0.3.0 — brief-030 (tidy-check tick): MCP server emits
   //         synthetic notifications/claude/channel frames from
-  //         coord-system when drift is detected (stale inbox,
+  //         st-system when drift is detected (stale inbox,
   //         untouched doing-task, journal lag). Real feature,
   //         hence the minor bump.
   // 0.4.0 — brief-009 phase 1: tasks/ surface removed across CLI,
@@ -39,13 +39,13 @@ export const SERVER_INFO: Implementation = {
   // 0.6.0 — brief-009 phase 5: resources/ surface added (annotated
   //         URLs per identity). 4 new MCP tools, dual-prefixed.
   // 0.7.0 — brief-009 item 3: identity → agent rename across SDK
-  //         types, MCP tool names (coord_members → coord_agents
-  //         keeping coord_members as deprecated alias), CLI verb
+  //         types, MCP tool names (st_members → st_agents
+  //         keeping st_members as deprecated alias), CLI verb
   //         (members → agents, members deprecated alias), and env
   //         vars (ST_AGENT preferred → ST_IDENTITY → COORD_IDENTITY).
-  // 0.8.0 — brief-009 item 4: SDK parity gap-fills (coord.archive +
-  //         coord.archiveTrim gain `withAttachments`; new
-  //         coord.lsOrphans and coord.ding on the handle). No CLI
+  // 0.8.0 — brief-009 item 4: SDK parity gap-fills (st.archive +
+  //         st.archiveTrim gain `withAttachments`; new
+  //         st.lsOrphans and st.ding on the handle). No CLI
   //         or MCP surface change.
   // 0.8.1 — `st mcp` startup falls back to a throwaway
   //         `anon-<rand6>` agent when no ST_AGENT/ST_IDENTITY/
@@ -70,7 +70,7 @@ export const SERVER_INFO: Implementation = {
 
 /**
  * Build a server-info record that announces under the canonical name.
- * Post-coord-cutover: `st` is the only canonical name — `smalltalk`
+ * Post-st-cutover: `st` is the only canonical name — `smalltalk`
  * resolves to `st` via {@link canonicalServerName}.
  */
 export function buildServerInfo(name: 'st'): Implementation {
@@ -143,7 +143,7 @@ export function buildServerOptions(opts: {
 }
 
 /** The base tool names (sans prefix) registered in non-channel mode.
- *  Post-cutover: `st_*` only. The historical `coord_*` dual-register
+ *  Post-cutover: `st_*` only. The historical `st_*` dual-register
  *  and the deprecated `members` alias have both been removed —
  *  `st_agents` is the canonical name. */
 export const EXPECTED_TOOL_BASE_NAMES = [
@@ -162,8 +162,8 @@ export const EXPECTED_TOOL_BASE_NAMES = [
   'context_append',
 ] as const;
 
-/** Post-coord-cutover: every tool registers under `st_*` only.
- *  The historical `coord_*` alias set (via dual-register) has been
+/** Post-st-cutover: every tool registers under `st_*` only.
+ *  The historical `st_*` alias set (via dual-register) has been
  *  removed — one canonical name each. */
 export const EXPECTED_TOOL_NAMES = [
   ...EXPECTED_TOOL_BASE_NAMES.map((n) => `st_${n}` as const),

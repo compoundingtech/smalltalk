@@ -1,7 +1,7 @@
 // mcp/index.ts — createMcpServer factory.
 //
 // `st mcp` runs this server over stdio. The factory builds an
-// McpServer wrapping a Coord instance and registers the five tools.
+// McpServer wrapping a St instance and registers the five tools.
 // The `run()` method connects to a stdio transport and awaits SIGINT,
 // SIGTERM, or transport close — whichever comes first.
 //
@@ -44,7 +44,7 @@ export interface McpServerOptions {
   /**
    * When true, advertise `experimental['claude/channel']`, attach the
    * channel-mode instructions, and (in later tasks) start the inbox
-   * watcher and register `coord_msg_reply`. Default: false.
+   * watcher and register `st_msg_reply`. Default: false.
    */
   channel?: boolean | undefined;
   /**
@@ -89,9 +89,9 @@ export interface McpServerOptions {
   tidyCheckIntervalMs?: number | undefined;
   /**
    * brief-005-phase0: which canonical name the MCP server announces
-   * itself as. `coord` (legacy) or `st` (new short canonical).
+   * itself as. `st` (legacy) or `st` (new short canonical).
    * Derived from the bash shim's `_ST_INVOKED_AS` env var; defaults
-   * to `coord` for back-compat with tests / direct lib embedders
+   * to `st` for back-compat with tests / direct lib embedders
    * that don't set it.
    */
   serverName?: 'st' | undefined;
@@ -100,8 +100,8 @@ export interface McpServerOptions {
 export interface McpServerHandle {
   /** The underlying high-level server. */
   mcp: McpServer;
-  /** The Coord instance baked into every tool handler. */
-  coord: St;
+  /** The St instance baked into every tool handler. */
+  st: St;
   /** Connect to a stdio transport and run until the transport closes
    * or the process receives SIGINT/SIGTERM. */
   run(): Promise<void>;
@@ -124,7 +124,7 @@ export interface McpServerHandle {
 
 export function createMcpServer(opts: McpServerOptions): McpServerHandle {
   const channel = opts.channel === true;
-  const coord = createSt({
+  const st = createSt({
     root: opts.root,
     identity: opts.identity,
     ...(opts.configRoot !== undefined && { configRoot: opts.configRoot }),
@@ -137,28 +137,28 @@ export function createMcpServer(opts: McpServerOptions): McpServerHandle {
   );
 
   // Tool registration. Each register* call wires one tool over the
-  // `coord` instance; ordering doesn't matter (the SDK installs the
+  // `st` instance; ordering doesn't matter (the SDK installs the
   // request handlers lazily on first registration).
-  registerSendTool(mcp, coord);
-  registerLsTool(mcp, coord);
-  registerReadTool(mcp, coord);
-  registerArchiveTool(mcp, coord);
-  registerThreadTool(mcp, coord);
-  // coord_agents (+ coord_members deprecated alias) is available in
+  registerSendTool(mcp, st);
+  registerLsTool(mcp, st);
+  registerReadTool(mcp, st);
+  registerArchiveTool(mcp, st);
+  registerThreadTool(mcp, st);
+  // st_agents (+ st_members deprecated alias) is available in
   // both modes — peer discovery is useful regardless of channel.
-  registerAgentsTool(mcp, coord);
-  // coord_resource_* (brief-009 item 5): add/ls/read/remove. Available
+  registerAgentsTool(mcp, st);
+  // st_resource_* (brief-009 item 5): add/ls/read/remove. Available
   // in both modes; resources are part of the always-on agent surface.
-  registerResourceTools(mcp, coord);
-  // coord_context_* (brief-024): read/write/append the per-agent
+  registerResourceTools(mcp, st);
+  // st_context_* (brief-024): read/write/append the per-agent
   // context/ folder for lossless-restart. Available in both modes; the
-  // Coord's own context/ is the only writer target, but reads across
-  // identities are supported for coordinators inspecting a peer's
+  // St's own context/ is the only writer target, but reads across
+  // identities are supported for stinators inspecting a peer's
   // last-known-state.
-  registerContextTools(mcp, coord);
+  registerContextTools(mcp, st);
   if (channel) {
-    // coord_msg_reply is the channel-mode partner of the inbox watcher.
-    registerReplyTool(mcp, coord);
+    // st_msg_reply is the channel-mode partner of the inbox watcher.
+    registerReplyTool(mcp, st);
   }
 
   // Channel-watcher state — populated lazily on the first
@@ -260,7 +260,7 @@ export function createMcpServer(opts: McpServerOptions): McpServerHandle {
 
   // brief-030: periodic tidy-check tick. Walks inbox for drift; emits
   // a synthetic `notifications/claude/channel` frame (from:
-  // coord-system) when drift turns from false→true since the last
+  // st-system) when drift turns from false→true since the last
   // emit. No emit when status is busy/dnd/unknown — busy/dnd defer
   // until the agent flips back; unknown means we don't know what state
   // they're in and shouldn't pile on. Dedup tracks current state, not
@@ -301,7 +301,7 @@ export function createMcpServer(opts: McpServerOptions): McpServerHandle {
           params: {
             content: drift.body,
             meta: {
-              from: 'coord-system',
+              from: 'st-system',
               kind: 'tidy-check',
               identity: opts.identity,
               messageFilename: null,
@@ -378,7 +378,7 @@ export function createMcpServer(opts: McpServerOptions): McpServerHandle {
 
   return {
     mcp,
-    coord,
+    st: st,
     runWith,
     async run(): Promise<void> {
       await runWith(new StdioServerTransport());

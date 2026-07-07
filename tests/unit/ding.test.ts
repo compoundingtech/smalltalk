@@ -1,6 +1,6 @@
 // tests/unit/ding.test.ts — coord ding daemon state machine.
 //
-// Drives runDing with a fake Coord (controllable watch queue +
+// Drives runDing with a fake St instance (controllable watch queue +
 // settable status) and a fake PtySender so the busy-buffer-flush
 // behavior is testable without a real pty subprocess or filesystem.
 
@@ -25,7 +25,7 @@ import {
   type PtySender,
 } from '../../src/commands/ding.ts';
 import type { CliContext } from '../../src/cli-context.ts';
-import type { Coord, ReadOptions, WatchOptions } from '../../src/lib.ts';
+import type { St, ReadOptions, WatchOptions } from '../../src/lib.ts';
 import {
   asFilename,
   asIdentity,
@@ -38,8 +38,8 @@ import {
 
 // ─── Fakes ──────────────────────────────────────────────────────────────
 
-interface FakeCoord {
-  coord: St;
+interface FakeSt {
+  st: St;
   pushEvent(filename: string, opts?: { folder?: 'inbox' | 'archive' }): void;
   endWatch(): void;
   setStatus(state: State): void;
@@ -52,10 +52,10 @@ interface FakeCoord {
   setStatusError(err: Error): void;
 }
 
-function makeFakeCoord(
+function makeFakeSt(
   identity: Identity = asIdentity('bob'),
   root = '/fake'
-): FakeCoord {
+): FakeSt {
   const queue: WatchEvent[] = [];
   let waiter: ((v: void) => void) | undefined;
   let ended = false;
@@ -99,7 +99,7 @@ function makeFakeCoord(
     };
   };
 
-  const coord: Partial<Coord> = {
+  const st: Partial<St> = {
     root,
     identity,
     configRoot: `${root}/cfg`,
@@ -135,7 +135,7 @@ function makeFakeCoord(
   };
 
   return {
-    coord: coord as Coord,
+    st: st as St,
     pushEvent(filename, opts = {}): void {
       queue.push({
         filename: asFilename(filename),
@@ -235,7 +235,7 @@ interface RunningDing {
 }
 
 function startDing(opts: {
-  coord: St;
+  st: St;
   identity?: Identity;
   ptySession?: string;
   ptySend: PtySender;
@@ -250,7 +250,7 @@ function startDing(opts: {
 }): RunningDing {
   const ac = new AbortController();
   const done = runDing({
-    coord: opts.coord,
+    st: opts.st,
     identity: opts.identity ?? asIdentity('bob'),
     ptySession: opts.ptySession ?? 'codex-foo',
     ptySend: opts.ptySend,
@@ -285,11 +285,11 @@ async function settle(): Promise<void> {
 // ─── runDing — status gating ────────────────────────────────────────────
 
 describe('runDing — status gating', () => {
-  let fake: FakeCoord;
+  let fake: FakeSt;
   let sender: FakeSender;
 
   beforeEach(() => {
-    fake = makeFakeCoord();
+    fake = makeFakeSt();
     sender = makeFakeSender();
   });
   afterEach(() => {
@@ -302,7 +302,7 @@ describe('runDing — status gating', () => {
       from: 'alice',
       subject: 'hello',
     });
-    const r = startDing({ coord: fake.coord, ptySend: sender.send });
+    const r = startDing({ st: fake.st, ptySend: sender.send });
     fake.pushEvent('1714826789010-aaaaaa.md');
     await settle();
     expect(sender.calls()).toHaveLength(1);
@@ -326,7 +326,7 @@ describe('runDing — status gating', () => {
   it('offline status → send fires (offline means "agent might pick it up")', async () => {
     fake.setStatus('offline');
     fake.setMessage('1714826789010-aaaaaa.md', { from: 'alice' });
-    const r = startDing({ coord: fake.coord, ptySend: sender.send });
+    const r = startDing({ st: fake.st, ptySend: sender.send });
     fake.pushEvent('1714826789010-aaaaaa.md');
     await settle();
     expect(sender.calls()).toHaveLength(1);
@@ -337,7 +337,7 @@ describe('runDing — status gating', () => {
   it('busy status → send is suppressed', async () => {
     fake.setStatus('busy');
     fake.setMessage('1714826789010-aaaaaa.md', { from: 'alice' });
-    const r = startDing({ coord: fake.coord, ptySend: sender.send });
+    const r = startDing({ st: fake.st, ptySend: sender.send });
     fake.pushEvent('1714826789010-aaaaaa.md');
     await settle();
     expect(sender.calls()).toHaveLength(0);
@@ -348,7 +348,7 @@ describe('runDing — status gating', () => {
   it('dnd status → send is suppressed', async () => {
     fake.setStatus('dnd');
     fake.setMessage('1714826789010-aaaaaa.md', { from: 'alice' });
-    const r = startDing({ coord: fake.coord, ptySend: sender.send });
+    const r = startDing({ st: fake.st, ptySend: sender.send });
     fake.pushEvent('1714826789010-aaaaaa.md');
     await settle();
     expect(sender.calls()).toHaveLength(0);
@@ -360,11 +360,11 @@ describe('runDing — status gating', () => {
 // ─── runDing — buffering + flush ────────────────────────────────────────
 
 describe('runDing — buffering across busy → available', () => {
-  let fake: FakeCoord;
+  let fake: FakeSt;
   let sender: FakeSender;
 
   beforeEach(() => {
-    fake = makeFakeCoord();
+    fake = makeFakeSt();
     sender = makeFakeSender();
   });
   afterEach(() => {
@@ -376,7 +376,7 @@ describe('runDing — buffering across busy → available', () => {
     fake.setMessage('1714826789010-aaaaaa.md', { from: 'alice', subject: 'one' });
     fake.setMessage('1714826789020-bbbbbb.md', { from: 'alice', subject: 'two' });
     const r = startDing({
-      coord: fake.coord,
+      st: fake.st,
       ptySend: sender.send,
       intervalMs: 30,
     });
@@ -401,7 +401,7 @@ describe('runDing — buffering across busy → available', () => {
     fake.setStatus('busy');
     fake.setMessage('1714826789010-aaaaaa.md', { from: 'alice', subject: 'q' });
     const r = startDing({
-      coord: fake.coord,
+      st: fake.st,
       ptySend: sender.send,
       intervalMs: 25,
     });
@@ -418,7 +418,7 @@ describe('runDing — buffering across busy → available', () => {
   it('events that arrive while available do not enter the buffer', async () => {
     fake.setStatus('available');
     fake.setMessage('1714826789010-aaaaaa.md', { from: 'alice' });
-    const r = startDing({ coord: fake.coord, ptySend: sender.send });
+    const r = startDing({ st: fake.st, ptySend: sender.send });
     fake.pushEvent('1714826789010-aaaaaa.md');
     await settle();
     fake.setStatus('busy'); // shouldn't affect the already-delivered event
@@ -432,12 +432,12 @@ describe('runDing — buffering across busy → available', () => {
 // ─── runDing — pty send failures ────────────────────────────────────────
 
 describe('runDing — pty send failures', () => {
-  let fake: FakeCoord;
+  let fake: FakeSt;
   let sender: FakeSender;
   let stderr: string;
 
   beforeEach(() => {
-    fake = makeFakeCoord();
+    fake = makeFakeSt();
     sender = makeFakeSender();
     stderr = '';
   });
@@ -451,7 +451,7 @@ describe('runDing — pty send failures', () => {
     fake.setMessage('1714826789020-bbbbbb.md', { from: 'alice', subject: 'b' });
     sender.failNext('session not found', 7);
     const r = startDing({
-      coord: fake.coord,
+      st: fake.st,
       ptySend: sender.send,
       stderr: (s) => {
         stderr += s;
@@ -483,7 +483,7 @@ describe('runDing — pty send failures', () => {
       return { status: 0, stderr: '' };
     };
     const r = startDing({
-      coord: fake.coord,
+      st: fake.st,
       ptySend: send,
       stderr: (s) => {
         stderr += s;
@@ -500,12 +500,12 @@ describe('runDing — pty send failures', () => {
 // ─── runDing — read failures ───────────────────────────────────────────
 
 describe('runDing — coord.read failures', () => {
-  let fake: FakeCoord;
+  let fake: FakeSt;
   let sender: FakeSender;
   let stderr: string;
 
   beforeEach(() => {
-    fake = makeFakeCoord();
+    fake = makeFakeSt();
     sender = makeFakeSender();
     stderr = '';
   });
@@ -517,7 +517,7 @@ describe('runDing — coord.read failures', () => {
     fake.setStatus('available');
     fake.setReadError(new Error('disk fell over'));
     const r = startDing({
-      coord: fake.coord,
+      st: fake.st,
       ptySend: sender.send,
       stderr: (s) => {
         stderr += s;
@@ -537,12 +537,12 @@ describe('runDing — coord.read failures', () => {
 
 describe('runDing — abort + signal cleanup', () => {
   it('abort resolves runDing and clears the buffer-flush timer', async () => {
-    const fake = makeFakeCoord();
+    const fake = makeFakeSt();
     const sender = makeFakeSender();
     fake.setStatus('busy');
     fake.setMessage('1714826789010-aaaaaa.md', { from: 'alice' });
     const r = startDing({
-      coord: fake.coord,
+      st: fake.st,
       ptySend: sender.send,
       intervalMs: 25,
     });
@@ -564,9 +564,9 @@ describe('runDing — abort + signal cleanup', () => {
   });
 
   it('drops the AsyncIterable cleanly when the watcher ends', async () => {
-    const fake = makeFakeCoord();
+    const fake = makeFakeSt();
     const sender = makeFakeSender();
-    const r = startDing({ coord: fake.coord, ptySend: sender.send });
+    const r = startDing({ st: fake.st, ptySend: sender.send });
     fake.endWatch();
     await Promise.race([
       r.done,
@@ -656,7 +656,7 @@ describe('cmdDingCli — arg parsing', () => {
 
 // ─── runDing — tidy-check tick (brief-031) ─────────────────────────────
 //
-// These tests point the fake Coord's `root` at a real /tmp scratch
+// These tests point the fake St instance's `root` at a real /tmp scratch
 // dir so `evaluateDrift` (a real filesystem walk) can read planted
 // inbox files. The watch/read/getStatus fakes are unchanged
 // — drift detection doesn't go through those methods.
@@ -665,7 +665,7 @@ describe('runDing — tidy-check tick', () => {
   let scratch: string;
   let stRoot: string;
   let identityRoot: string;
-  let fake: FakeCoord;
+  let fake: FakeSt;
   let sender: FakeSender;
   const IDENTITY = 'bob';
 
@@ -675,7 +675,7 @@ describe('runDing — tidy-check tick', () => {
     mkdirSync(join(stRoot, IDENTITY, 'inbox'), { recursive: true });
     mkdirSync(join(stRoot, IDENTITY, 'archive'), { recursive: true });
     identityRoot = join(stRoot, IDENTITY);
-    fake = makeFakeCoord(asIdentity(IDENTITY), stRoot);
+    fake = makeFakeSt(asIdentity(IDENTITY), stRoot);
     sender = makeFakeSender();
     // brief-035 t2: write a current-mtime status file so the
     // scan-on-startup considers all pre-planted tidy fixtures already
@@ -701,7 +701,7 @@ describe('runDing — tidy-check tick', () => {
     plantInbox('1714826789010-aaaaaa.md', STALE_INBOX_MS + 60_000);
     fake.setStatus('available');
     const r = startDing({
-      coord: fake.coord,
+      st: fake.st,
       ptySend: sender.send,
       tidyIntervalMs: 30,
     });
@@ -727,7 +727,7 @@ describe('runDing — tidy-check tick', () => {
     plantInbox('1714826789010-aaaaaa.md', STALE_INBOX_MS + 60_000);
     fake.setStatus('available');
     const r = startDing({
-      coord: fake.coord,
+      st: fake.st,
       ptySend: sender.send,
       tidyIntervalMs: 30,
     });
@@ -743,7 +743,7 @@ describe('runDing — tidy-check tick', () => {
     plantInbox(filename, STALE_INBOX_MS + 60_000);
     fake.setStatus('available');
     const r = startDing({
-      coord: fake.coord,
+      st: fake.st,
       ptySend: sender.send,
       tidyIntervalMs: 30,
     });
@@ -768,7 +768,7 @@ describe('runDing — tidy-check tick', () => {
     plantInbox('1714826789010-aaaaaa.md', STALE_INBOX_MS + 60_000);
     fake.setStatus('busy');
     const r = startDing({
-      coord: fake.coord,
+      st: fake.st,
       ptySend: sender.send,
       tidyIntervalMs: 30,
     });
@@ -788,7 +788,7 @@ describe('runDing — tidy-check tick', () => {
     plantInbox('1714826789010-aaaaaa.md', STALE_INBOX_MS + 60_000);
     fake.setStatus('dnd');
     const r = startDing({
-      coord: fake.coord,
+      st: fake.st,
       ptySend: sender.send,
       tidyIntervalMs: 30,
     });
@@ -802,7 +802,7 @@ describe('runDing — tidy-check tick', () => {
     plantInbox('1714826789010-aaaaaa.md', STALE_INBOX_MS + 60_000);
     fake.setStatus('unknown');
     const r = startDing({
-      coord: fake.coord,
+      st: fake.st,
       ptySend: sender.send,
       tidyIntervalMs: 30,
     });
@@ -816,7 +816,7 @@ describe('runDing — tidy-check tick', () => {
     plantInbox('1714826789010-aaaaaa.md', STALE_INBOX_MS + 60_000);
     fake.setStatus('away');
     const r = startDing({
-      coord: fake.coord,
+      st: fake.st,
       ptySend: sender.send,
       tidyIntervalMs: 30,
     });
@@ -830,7 +830,7 @@ describe('runDing — tidy-check tick', () => {
     plantInbox('1714826789010-aaaaaa.md', STALE_INBOX_MS + 60_000);
     fake.setStatus('available');
     const r = startDing({
-      coord: fake.coord,
+      st: fake.st,
       ptySend: sender.send,
       tidyIntervalMs: 0,
     });
@@ -848,7 +848,7 @@ describe('runDing — tidy-check tick', () => {
     });
     fake.setStatus('available');
     const r = startDing({
-      coord: fake.coord,
+      st: fake.st,
       ptySend: sender.send,
       tidyIntervalMs: 30,
     });
@@ -883,7 +883,7 @@ describe('runDing — tidy-check tick', () => {
     fake.setStatus('available');
     const fixed = Date.now() + 2 * 60 * 60_000;
     const r = startDing({
-      coord: fake.coord,
+      st: fake.st,
       ptySend: sender.send,
       tidyIntervalMs: 30,
       tidyNow: () => fixed,
@@ -905,11 +905,11 @@ describe('runDing — tidy-check tick', () => {
 // the pid-file probe.
 
 describe('runDing — session-watch (exits when session is gone)', () => {
-  let fake: FakeCoord;
+  let fake: FakeSt;
   let sender: FakeSender;
 
   beforeEach(() => {
-    fake = makeFakeCoord();
+    fake = makeFakeSt();
     sender = makeFakeSender();
   });
   afterEach(() => {
@@ -920,7 +920,7 @@ describe('runDing — session-watch (exits when session is gone)', () => {
     fake.setStatus('available');
     let aliveCallCount = 0;
     const r = startDing({
-      coord: fake.coord,
+      st: fake.st,
       ptySend: sender.send,
       sessionWatchIntervalMs: 30,
       isSessionAlive: () => {
@@ -941,7 +941,7 @@ describe('runDing — session-watch (exits when session is gone)', () => {
     fake.setStatus('available');
     let alive = true;
     const r = startDing({
-      coord: fake.coord,
+      st: fake.st,
       ptySend: sender.send,
       sessionWatchIntervalMs: 30,
       isSessionAlive: () => alive,
@@ -962,7 +962,7 @@ describe('runDing — session-watch (exits when session is gone)', () => {
     fake.setStatus('available');
     let aliveCallCount = 0;
     const r = startDing({
-      coord: fake.coord,
+      st: fake.st,
       ptySend: sender.send,
       sessionWatchIntervalMs: 30,
       exitWhenSessionGone: false,
@@ -986,7 +986,7 @@ describe('runDing — session-watch (exits when session is gone)', () => {
     let probeCallCount = 0;
     const log: string[] = [];
     const r = startDing({
-      coord: fake.coord,
+      st: fake.st,
       ptySend: sender.send,
       sessionWatchIntervalMs: 30,
       isSessionAlive: () => {
@@ -1014,7 +1014,7 @@ describe('runDing — session-watch (exits when session is gone)', () => {
     fake.setStatus('available');
     const log: string[] = [];
     const r = startDing({
-      coord: fake.coord,
+      st: fake.st,
       ptySend: sender.send,
       sessionWatchIntervalMs: 30,
       isSessionAlive: () => false, // dead from launch, never appears
@@ -1055,7 +1055,7 @@ describe('runDing — session-watch (exits when session is gone)', () => {
     fake.setStatus('available');
     let alive = false; // dead from start
     const r = startDing({
-      coord: fake.coord,
+      st: fake.st,
       ptySend: sender.send,
       sessionWatchIntervalMs: 25,
       isSessionAlive: () => alive,
@@ -1081,7 +1081,7 @@ describe('runDing — session-watch (exits when session is gone)', () => {
   it('external AbortController still works (regression)', async () => {
     fake.setStatus('available');
     const r = startDing({
-      coord: fake.coord,
+      st: fake.st,
       ptySend: sender.send,
       sessionWatchIntervalMs: 5_000, // long; not the trigger
       isSessionAlive: () => true,
@@ -1113,7 +1113,7 @@ describe('runDing — session-watch (exits when session is gone)', () => {
 // ─── runDing — status-file refresh (brief-032) ─────────────────────────
 //
 // Mirrors brief-023's MCP-server refresh tick. Points the fake
-// Coord's `root` at a real /tmp scratch dir so the refresh helper
+// instance's `root` at a real /tmp scratch dir so the refresh helper
 // can read/write a real status file; the other fake methods are
 // unchanged.
 
@@ -1122,7 +1122,7 @@ describe('runDing — status refresh tick', () => {
   let stRoot: string;
   let identityRoot: string;
   let statusFile: string;
-  let fake: FakeCoord;
+  let fake: FakeSt;
   let sender: FakeSender;
   const ID = 'bob';
 
@@ -1133,7 +1133,7 @@ describe('runDing — status refresh tick', () => {
     mkdirSync(join(stRoot, ID, 'archive'), { recursive: true });
     identityRoot = join(stRoot, ID);
     statusFile = join(identityRoot, 'status');
-    fake = makeFakeCoord(asIdentity(ID), stRoot);
+    fake = makeFakeSt(asIdentity(ID), stRoot);
     sender = makeFakeSender();
   });
   afterEach(() => {
@@ -1153,7 +1153,7 @@ describe('runDing — status refresh tick', () => {
     const mtimeBefore = statSync(statusFile).mtimeMs;
 
     const r = startDing({
-      coord: fake.coord,
+      st: fake.st,
       ptySend: sender.send,
       statusRefreshIntervalMs: 30,
     });
@@ -1167,7 +1167,7 @@ describe('runDing — status refresh tick', () => {
   it('busy status: tick preserves `busy` (user intent honored)', async () => {
     writeFileSync(statusFile, 'busy\n');
     const r = startDing({
-      coord: fake.coord,
+      st: fake.st,
       ptySend: sender.send,
       statusRefreshIntervalMs: 30,
     });
@@ -1180,7 +1180,7 @@ describe('runDing — status refresh tick', () => {
   it('missing status file: tick writes `available`', async () => {
     // status file doesn't exist (no writeFileSync above)
     const r = startDing({
-      coord: fake.coord,
+      st: fake.st,
       ptySend: sender.send,
       statusRefreshIntervalMs: 30,
     });
@@ -1196,7 +1196,7 @@ describe('runDing — status refresh tick', () => {
     writeFileSync(statusFile, 'garbage-value\n');
     const log: string[] = [];
     const r = startDing({
-      coord: fake.coord,
+      st: fake.st,
       ptySend: sender.send,
       statusRefreshIntervalMs: 30,
       stderr: (s) => log.push(s),
@@ -1212,7 +1212,7 @@ describe('runDing — status refresh tick', () => {
     writeFileSync(statusFile, 'unknown\n');
     const log: string[] = [];
     const r = startDing({
-      coord: fake.coord,
+      st: fake.st,
       ptySend: sender.send,
       statusRefreshIntervalMs: 30,
       stderr: (s) => log.push(s),
@@ -1233,7 +1233,7 @@ describe('runDing — status refresh tick', () => {
     const mtimeBefore = statSync(statusFile).mtimeMs;
 
     const r = startDing({
-      coord: fake.coord,
+      st: fake.st,
       ptySend: sender.send,
       statusRefreshIntervalMs: 0,
     });
@@ -1332,7 +1332,7 @@ describe('runDing — scan-on-startup', () => {
   let scratch: string;
   let stRoot: string;
   let identityRoot: string;
-  let fake: FakeCoord;
+  let fake: FakeSt;
   let sender: FakeSender;
   const IDENTITY = 'bob';
 
@@ -1342,7 +1342,7 @@ describe('runDing — scan-on-startup', () => {
     mkdirSync(join(stRoot, IDENTITY, 'inbox'), { recursive: true });
     mkdirSync(join(stRoot, IDENTITY, 'archive'), { recursive: true });
     identityRoot = join(stRoot, IDENTITY);
-    fake = makeFakeCoord(asIdentity(IDENTITY), stRoot);
+    fake = makeFakeSt(asIdentity(IDENTITY), stRoot);
     sender = makeFakeSender();
   });
   afterEach(() => {
@@ -1382,7 +1382,7 @@ describe('runDing — scan-on-startup', () => {
   it('empty inbox → no startup pushes', async () => {
     setStatusMtime(60_000);
     fake.setStatus('available');
-    const r = startDing({ coord: fake.coord, ptySend: sender.send });
+    const r = startDing({ st: fake.st, ptySend: sender.send });
     await settle();
     expect(sender.calls()).toHaveLength(0);
     r.ac.abort();
@@ -1394,7 +1394,7 @@ describe('runDing — scan-on-startup', () => {
     // file is 10 minutes old, newer than status
     plantInboxFile('1714826789010-aaaaaa.md', 10 * 60_000, 'alice', 'q');
     fake.setStatus('available');
-    const r = startDing({ coord: fake.coord, ptySend: sender.send });
+    const r = startDing({ st: fake.st, ptySend: sender.send });
     await settle();
     expect(sender.calls()).toHaveLength(1);
     const seqs = sender.calls()[0]!.sequences;
@@ -1412,7 +1412,7 @@ describe('runDing — scan-on-startup', () => {
     plantInboxFile('1714826789020-bbbbbb.md', 20 * 60_000, 'alice', 'second');
     plantInboxFile('1714826789030-cccccc.md', 10 * 60_000, 'alice', 'third');
     fake.setStatus('available');
-    const r = startDing({ coord: fake.coord, ptySend: sender.send });
+    const r = startDing({ st: fake.st, ptySend: sender.send });
     await settle();
     expect(sender.calls()).toHaveLength(3);
     expect(sender.calls()[0]!.sequences[0]).toContain('first');
@@ -1429,7 +1429,7 @@ describe('runDing — scan-on-startup', () => {
     setStatusMtime(5 * 60_000);
     plantInboxFile('1714826789010-aaaaaa.md', 60 * 60_000);
     fake.setStatus('available');
-    const r = startDing({ coord: fake.coord, ptySend: sender.send });
+    const r = startDing({ st: fake.st, ptySend: sender.send });
     await settle();
     expect(sender.calls()).toHaveLength(0);
     r.ac.abort();
@@ -1442,7 +1442,7 @@ describe('runDing — scan-on-startup', () => {
     plantInboxFile('1714826789010-aaaaaa.md', 10 * 60_000, 'alice', 'one');
     plantInboxFile('1714826789020-bbbbbb.md', 5 * 60_000, 'alice', 'two');
     fake.setStatus('available');
-    const r = startDing({ coord: fake.coord, ptySend: sender.send });
+    const r = startDing({ st: fake.st, ptySend: sender.send });
     await settle();
     expect(sender.calls()).toHaveLength(2);
     r.ac.abort();
@@ -1453,7 +1453,7 @@ describe('runDing — scan-on-startup', () => {
     setStatusMtime(60 * 60_000);
     plantInboxFile('1714826789010-aaaaaa.md', 10 * 60_000, 'alice', 'q');
     fake.setStatus('busy');
-    const r = startDing({ coord: fake.coord, ptySend: sender.send });
+    const r = startDing({ st: fake.st, ptySend: sender.send });
     await settle();
     // No deliveries while busy.
     expect(sender.calls()).toHaveLength(0);
@@ -1474,7 +1474,7 @@ describe('runDing — scan-on-startup', () => {
     const noisePath2 = join(identityRoot, 'inbox', 'not-a-message.md');
     writeFileSync(noisePath2, 'noise\n');
     fake.setStatus('available');
-    const r = startDing({ coord: fake.coord, ptySend: sender.send });
+    const r = startDing({ st: fake.st, ptySend: sender.send });
     await settle();
     expect(sender.calls()).toHaveLength(1);
     r.ac.abort();
@@ -1489,7 +1489,7 @@ describe('runDing — scan-on-startup', () => {
     setStatusMtime(60 * 60_000);
     plantInboxFile('1714826789010-aaaaaa.md', 10 * 60_000, 'alice', 'q');
     fake.setStatus('available');
-    const r = startDing({ coord: fake.coord, ptySend: sender.send });
+    const r = startDing({ st: fake.st, ptySend: sender.send });
     await settle();
     // Give the watcher a beat to (incorrectly) replay if the scan
     // accidentally double-counted; expect still 1.
@@ -1513,11 +1513,11 @@ describe('runDing — scan-on-startup', () => {
 // ────────────────────────────────────────────────────────────────────
 
 describe('runDing — send serialization (concurrent pty sends never overlap)', () => {
-  let fake: FakeCoord;
+  let fake: FakeSt;
   let sender: FakeSender;
 
   beforeEach(() => {
-    fake = makeFakeCoord();
+    fake = makeFakeSt();
     sender = makeFakeSender();
   });
   afterEach(() => {
@@ -1537,7 +1537,7 @@ describe('runDing — send serialization (concurrent pty sends never overlap)', 
       });
     }
     sender.setDelayMs(40);
-    const r = startDing({ coord: fake.coord, ptySend: sender.send });
+    const r = startDing({ st: fake.st, ptySend: sender.send });
     fake.pushEvent('1714826789010-aaaaaa.md');
     fake.pushEvent('1714826789020-bbbbbb.md');
     fake.pushEvent('1714826789030-cccccc.md');
@@ -1565,7 +1565,7 @@ describe('runDing — send serialization (concurrent pty sends never overlap)', 
     }
     sender.setDelayMs(20);
     const r = startDing({
-      coord: fake.coord,
+      st: fake.st,
       ptySend: sender.send,
       intervalMs: 25,
     });
@@ -1593,11 +1593,11 @@ describe('runDing — send serialization (concurrent pty sends never overlap)', 
 // ────────────────────────────────────────────────────────────────────
 
 describe('runDing — retry semantics (at-least-once on transient failure)', () => {
-  let fake: FakeCoord;
+  let fake: FakeSt;
   let sender: FakeSender;
 
   beforeEach(() => {
-    fake = makeFakeCoord();
+    fake = makeFakeSt();
     sender = makeFakeSender();
   });
   afterEach(() => {
@@ -1612,7 +1612,7 @@ describe('runDing — retry semantics (at-least-once on transient failure)', () 
     });
     sender.failNext('transient pty error', 1);
     const r = startDing({
-      coord: fake.coord,
+      st: fake.st,
       ptySend: sender.send,
       intervalMs: 25,
     });
@@ -1631,7 +1631,7 @@ describe('runDing — retry semantics (at-least-once on transient failure)', () 
     sender.failN(20, 'always fails', 1);
     const logs: string[] = [];
     const r = startDing({
-      coord: fake.coord,
+      st: fake.st,
       ptySend: sender.send,
       intervalMs: 25,
       stderr: (s) => logs.push(s),
@@ -1653,7 +1653,7 @@ describe('runDing — retry semantics (at-least-once on transient failure)', () 
     });
     fake.failReadN(1, new Error('EAGAIN: temporarily unavailable'));
     const r = startDing({
-      coord: fake.coord,
+      st: fake.st,
       ptySend: sender.send,
       intervalMs: 25,
     });
@@ -1670,7 +1670,7 @@ describe('runDing — retry semantics (at-least-once on transient failure)', () 
     fake.setMessage('1714826789010-aaaaaa.md', { from: 'alice' });
     fake.failReadN(3, new Error('partial write'));
     const r = startDing({
-      coord: fake.coord,
+      st: fake.st,
       ptySend: sender.send,
       intervalMs: 25,
     });
@@ -1691,11 +1691,11 @@ describe('runDing — retry semantics (at-least-once on transient failure)', () 
 // ────────────────────────────────────────────────────────────────────
 
 describe('runDing — startup-race dedup (scan + watcher both fire → single delivery)', () => {
-  let fake: FakeCoord;
+  let fake: FakeSt;
   let sender: FakeSender;
 
   beforeEach(() => {
-    fake = makeFakeCoord();
+    fake = makeFakeSt();
     sender = makeFakeSender();
   });
   afterEach(() => {
@@ -1708,7 +1708,7 @@ describe('runDing — startup-race dedup (scan + watcher both fire → single de
       from: 'alice',
       subject: 'once',
     });
-    const r = startDing({ coord: fake.coord, ptySend: sender.send });
+    const r = startDing({ st: fake.st, ptySend: sender.send });
     fake.pushEvent('1714826789010-aaaaaa.md');
     fake.pushEvent('1714826789010-aaaaaa.md');
     fake.pushEvent('1714826789010-aaaaaa.md');
@@ -1729,7 +1729,7 @@ describe('runDing — startup-race dedup (scan + watcher both fire → single de
       from: 'alice',
       subject: 'b',
     });
-    const r = startDing({ coord: fake.coord, ptySend: sender.send });
+    const r = startDing({ st: fake.st, ptySend: sender.send });
     fake.pushEvent('1714826789010-aaaaaa.md');
     fake.pushEvent('1714826789020-bbbbbb.md');
     fake.pushEvent('1714826789010-aaaaaa.md');
@@ -1754,11 +1754,11 @@ describe('runDing — startup-race dedup (scan + watcher both fire → single de
 // ────────────────────────────────────────────────────────────────────
 
 describe('runDing — session-flap debounce (permanent-session respawn)', () => {
-  let fake: FakeCoord;
+  let fake: FakeSt;
   let sender: FakeSender;
 
   beforeEach(() => {
-    fake = makeFakeCoord();
+    fake = makeFakeSt();
     sender = makeFakeSender();
   });
   afterEach(() => {
@@ -1773,7 +1773,7 @@ describe('runDing — session-flap debounce (permanent-session respawn)', () => 
     const aliveSeq = [true, true, false, true, true, true];
     let i = 0;
     const r = startDing({
-      coord: fake.coord,
+      st: fake.st,
       ptySend: sender.send,
       sessionWatchIntervalMs: 25,
       isSessionAlive: () => {
@@ -1802,7 +1802,7 @@ describe('runDing — session-flap debounce (permanent-session respawn)', () => 
     // gone forever. Debounce should trip after N consecutive misses.
     let ticksSeen = 0;
     const r = startDing({
-      coord: fake.coord,
+      st: fake.st,
       ptySend: sender.send,
       sessionWatchIntervalMs: 20,
       isSessionAlive: () => {
@@ -1834,7 +1834,7 @@ describe('runDing — session-flap debounce (permanent-session respawn)', () => 
     fake.setStatus('available');
     let idx = 0;
     const r = startDing({
-      coord: fake.coord,
+      st: fake.st,
       ptySend: sender.send,
       sessionWatchIntervalMs: 15,
       isSessionAlive: () => {
@@ -1867,7 +1867,7 @@ describe('runDing — session-flap debounce (permanent-session respawn)', () => 
     let idx = 0;
     const log: string[] = [];
     const r = startDing({
-      coord: fake.coord,
+      st: fake.st,
       ptySend: sender.send,
       sessionWatchIntervalMs: 20,
       stderr: (s) => log.push(s),

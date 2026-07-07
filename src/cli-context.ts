@@ -27,7 +27,7 @@ export interface CliContext {
 
 /**
  * The name the user typed to invoke this CLI — `st`, `smalltalk`, or
- * `coord`. Set by the bin/ shims via `_ST_INVOKED_AS` before exec'ing
+ * `st`. Set by the bin/ shims via `_ST_INVOKED_AS` before exec'ing
  * into node. Help banners and error prefixes read this so users see
  * the name they typed, not a hard-coded value that goes stale as the
  * rename phases finish.

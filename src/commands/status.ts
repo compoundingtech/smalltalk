@@ -102,7 +102,7 @@ function readState(path: string): State {
 
 /**
  * Read `<id>/status` without going through resolveIdentity (which
- * auto-creates folders). Used by `coord members` and `st overview`
+ * auto-creates folders). Used by `st members` and `st overview`
  * for passive cross-tree enumeration. Same permissive rules as the
  * `st status` getter: missing file → `offline`, malformed
  * contents → `offline`.

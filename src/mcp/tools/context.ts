@@ -47,7 +47,7 @@ const readOutputShape = {
   ),
 };
 
-function registerContextReadTool(mcp: McpServer, coord: St): void {
+function registerContextReadTool(mcp: McpServer, st: St): void {
   mcp.registerTool(
     'st_context_read',
     {
@@ -62,7 +62,7 @@ function registerContextReadTool(mcp: McpServer, coord: St): void {
         const input: Parameters<St['context']['read']>[0] = {};
         if (args.identity !== undefined) input.identity = asIdentity(args.identity);
         if (args.file !== undefined) input.file = args.file;
-        const r = coord.context.read(input);
+        const r = st.context.read(input);
         return buildToolResult({
           summary: r.absent
             ? `context/${r.file} absent for ${r.identity}`
@@ -98,7 +98,7 @@ const writeOutputShape = {
   bytes: z.number(),
 };
 
-function registerContextWriteTool(mcp: McpServer, coord: St): void {
+function registerContextWriteTool(mcp: McpServer, st: St): void {
   mcp.registerTool(
     'st_context_write',
     {
@@ -114,7 +114,7 @@ function registerContextWriteTool(mcp: McpServer, coord: St): void {
           body: args.body,
         };
         if (args.identity !== undefined) input.identity = asIdentity(args.identity);
-        const r = coord.context.write(input);
+        const r = st.context.write(input);
         return buildToolResult({
           summary: `wrote ${r.bytes} bytes to ${r.path}`,
           value: { identity: r.identity, path: r.path, bytes: r.bytes },
@@ -161,7 +161,7 @@ const appendOutputShape = {
   line: z.string().describe('The bulleted line stored in the file.'),
 };
 
-function registerContextAppendTool(mcp: McpServer, coord: St): void {
+function registerContextAppendTool(mcp: McpServer, st: St): void {
   mcp.registerTool(
     'st_context_append',
     {
@@ -179,7 +179,7 @@ function registerContextAppendTool(mcp: McpServer, coord: St): void {
         };
         if (args.timestamp !== undefined) input.timestamp = args.timestamp;
         if (args.identity !== undefined) input.identity = asIdentity(args.identity);
-        const r = coord.context.append(input);
+        const r = st.context.append(input);
         return buildToolResult({
           summary: `appended: ${r.filename}`,
           value: {
@@ -195,8 +195,8 @@ function registerContextAppendTool(mcp: McpServer, coord: St): void {
 
 // ─── Public entry point ──────────────────────────────────────────────────
 
-export function registerContextTools(mcp: McpServer, coord: St): void {
-  registerContextReadTool(mcp, coord);
-  registerContextWriteTool(mcp, coord);
-  registerContextAppendTool(mcp, coord);
+export function registerContextTools(mcp: McpServer, st: St): void {
+  registerContextReadTool(mcp, st);
+  registerContextWriteTool(mcp, st);
+  registerContextAppendTool(mcp, st);
 }

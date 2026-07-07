@@ -6,7 +6,7 @@
 // maps them to user-visible messages + exit codes; embedders pattern-match
 // on `instanceof` or `code`.
 
-/** Base class for every error raised by the coord API or commands. */
+/** Base class for every error raised by the st API or commands. */
 export class StError extends Error {
   readonly code: string;
   readonly details?: unknown;

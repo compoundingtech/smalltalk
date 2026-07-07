@@ -38,11 +38,11 @@ function makeContext(): Capture {
 }
 
 describe('coord completions — dispatch', () => {
-  it('fish → non-empty script with `complete -c coord`, exit 0', async () => {
+  it('fish → non-empty script with `complete -c st`, exit 0', async () => {
     const cap = makeContext();
     const code = await runCli(['completions', 'fish'], cap.ctx);
     expect(code).toBe(0);
-    expect(cap.stdout).toContain('complete -c coord');
+    expect(cap.stdout).toContain('complete -c st');
     expect(cap.stdout.length).toBeGreaterThan(100);
     expect(cap.stderr).toBe('');
   });

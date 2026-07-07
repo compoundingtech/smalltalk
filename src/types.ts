@@ -1,4 +1,4 @@
-// types.ts — public types for the embeddable @myobie/coord API.
+// types.ts — public types for the embeddable @myobie/st API.
 //
 // Branded primitives: Agent and Filename are both nominally `string` but
 // carry phantom brands so a stray un-validated string doesn't compile. Use
@@ -233,7 +233,7 @@ export interface ParsedPeer {
  * resolution behavior of `cmdSyncPush` etc.: `local:<path>` resolves to
  * `<path>/`, `host[:path]` to `<spec>/`, and a bare token is looked up
  * in `<configRoot>/peers.yaml` first (alias) before falling back to a
- * bare-hostname `<host>:.local/state/coord/`.
+ * bare-hostname `<host>:.local/state/smalltalk/`.
  *
  * Async because the alias lookup reads `peers.yaml`. The implementation
  * uses sync fs calls under the hood for simplicity; the Promise wrapper
@@ -274,7 +274,7 @@ export async function parsePeer(
   return {
     spec,
     kind: 'ssh',
-    resolved: `${spec}:.local/state/coord/`,
+    resolved: `${spec}:.local/state/smalltalk/`,
   };
 }
 

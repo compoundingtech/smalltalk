@@ -1,4 +1,4 @@
-// mcp/error-mapping.ts — adapters between coord's typed errors and the
+// mcp/error-mapping.ts — adapters between st's typed errors and the
 // MCP CallToolResult shape.
 //
 // Per brief-009 implementation §"Error response shape" we settled on
@@ -37,7 +37,7 @@ export interface StErrorPayload {
  * Map any thrown value to a CallToolResult. StError instances get
  * their stable code; anything else falls through to INTERNAL_ERROR.
  */
-export function coordErrorToToolResult(err: unknown): CallToolResult {
+export function stErrorToToolResult(err: unknown): CallToolResult {
   const payload = errorPayload(err);
   return {
     isError: true,
@@ -114,6 +114,6 @@ export async function withErrorMapping(
   try {
     return await body();
   } catch (err) {
-    return coordErrorToToolResult(err);
+    return stErrorToToolResult(err);
   }
 }

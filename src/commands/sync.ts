@@ -1,12 +1,12 @@
 // commands/sync.ts — bidirectional rsync + sweep, per LAYOUT "What sync looks like".
 //
 // Surface (mirror of lib/cmd_sync.sh):
-//   coord sync push <peer>      sweep, rsync push, sweep
-//   coord sync pull <peer>      sweep, rsync pull, sweep
-//   coord sync sweep            local-only sweep (verbose)
-//   coord sync push --all       fan out push over peers.yaml
-//   coord sync pull --all       fan out pull (recommended conservative cron)
-//   coord sync --all            push then pull, every peer (aggressive)
+//   st sync push <peer>      sweep, rsync push, sweep
+//   st sync pull <peer>      sweep, rsync pull, sweep
+//   st sync sweep            local-only sweep (verbose)
+//   st sync push --all       fan out push over peers.yaml
+//   st sync pull --all       fan out pull (recommended conservative cron)
+//   st sync --all            push then pull, every peer (aggressive)
 //
 // The actual rsync invocation is injected via `deps.runRsync` so unit
 // tests can mock it. The default uses `child_process.spawnSync('rsync', ...)`.
@@ -73,7 +73,7 @@ export function resolvePeer(spec: string, ctx: SyncContext): string {
   if (aliased !== undefined) {
     return resolvePeer(aliased, ctx);
   }
-  return `${spec}:.local/state/coord/`;
+  return `${spec}:.local/state/smalltalk/`;
 }
 
 function stripTrailingSlash(s: string): string {

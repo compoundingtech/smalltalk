@@ -1,6 +1,6 @@
 // mcp/tidy-check.ts — drift detector for the MCP tidy-check tick.
 //
-// brief-030: operator audited two coord agents and caught a real pattern
+// brief-030: operator audited two st agents and caught a real pattern
 // of execution drifting from the boot-ritual contract — one had 16
 // unarchived inbox messages. The instructions are clear; agents drift
 // anyway. So the MCP server gets a passive correction — a tidy-check

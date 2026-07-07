@@ -1,6 +1,6 @@
 // mcp/tools/archive.ts — registers the `st_msg_archive` MCP tool.
 //
-// Mirrors `coord.archive(identity, filename)`. Returns
+// Mirrors `st.archive(identity, filename)`. Returns
 // { outcome: 'moved' | 'idempotent' } so embedders can distinguish
 // case-4 (clean rename) from case-2/0 (the file is already archived).
 
@@ -41,7 +41,7 @@ const archiveOutputShape = {
     ),
 };
 
-export function registerArchiveTool(mcp: McpServer, coord: St): void {
+export function registerArchiveTool(mcp: McpServer, st: St): void {
   mcp.registerTool(
     'st_msg_archive',
     {
@@ -57,17 +57,17 @@ export function registerArchiveTool(mcp: McpServer, coord: St): void {
         const identity =
           args.identity !== undefined
             ? asIdentity(args.identity)
-            : coord.identity;
-        // The Coord.archive() return type is void; to surface "moved"
+            : st.identity;
+        // The St.archive() return type is void; to surface "moved"
         // vs "idempotent" we re-check the inbox before calling. If the
         // file is already gone (post-sweep idempotent) AND the archive
         // copy is present, that's the idempotent outcome; otherwise a
         // successful call did the move.
-        const ipath = join(inboxDir(identity, coord.root), filename);
-        const apath = join(archiveDir(identity, coord.root), filename);
+        const ipath = join(inboxDir(identity, st.root), filename);
+        const apath = join(archiveDir(identity, st.root), filename);
         const wasPresent = existsSync(ipath);
         const archivePresent = existsSync(apath);
-        await coord.archive(identity, filename);
+        await st.archive(identity, filename);
         const outcome: 'moved' | 'idempotent' =
           wasPresent && !archivePresent ? 'moved' : 'idempotent';
         const summary =

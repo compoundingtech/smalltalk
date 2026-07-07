@@ -106,7 +106,7 @@ export async function startChannelWatcher(
     // Emit to stderr so it never contaminates the JSON-RPC stdout
     // channel. Prefix with a stable tag so an operator can grep it.
     process.stderr.write(
-      `[coord-channel] ${new Date().toISOString()} ${msg}\n`
+      `[st-channel] ${new Date().toISOString()} ${msg}\n`
     );
   }
 
@@ -117,7 +117,7 @@ export async function startChannelWatcher(
   // At-least-once semantic (P5R-F2 fix): the initial `readdirSync`
   // used to seed `seen` with every existing filename — the intent
   // was to avoid replaying "historical files" on restart, with the
-  // boot ritual's `coord_msg_ls` handling backlog. Live repro proved
+  // boot ritual's `st_msg_ls` handling backlog. Live repro proved
   // that policy too aggressive: a mid-session MCP disconnect +
   // reconnect (Claude Code respawns the stdio process) creates a
   // fresh process whose seed suppressed files that arrived DURING
@@ -156,7 +156,7 @@ export async function startChannelWatcher(
     ? chokidar.watch(inboxDir, {
         ignoreInitial: true,
         persistent: true,
-        // No awaitWriteFinish: every coord producer (coord.send,
+        // No awaitWriteFinish: every st producer (st.send,
         // tmp+atomic-rename; rsync, atomic-on-completion) writes a
         // single final file. Polling for write stability just adds
         // latency that makes the watcher flake on heavily-loaded test
@@ -242,7 +242,7 @@ export async function startChannelWatcher(
   // chokidar. The FSEvents backend on macOS can silently stop
   // delivering events on a long-idle process (dispatch source
   // suspension under memory pressure / long inactivity), which
-  // otherwise leaves a delivered coord message wedged in the agent's
+  // otherwise leaves a delivered st message wedged in the agent's
   // inbox with no channel notification ever fired. With this backstop,
   // the worst-case delay from "message hits inbox" to "agent gets
   // channel notification" is bounded by `pollBackstopMs` even when

@@ -1,7 +1,7 @@
 // mcp/tools/reply.ts — registers the `st_msg_reply` MCP tool.
 //
 // Channel-mode-only (Phase 2). Wraps a "find <thread> anywhere on the
-// local tree, then coord.send back to its sender" pattern. The intent
+// local tree, then st.send back to its sender" pattern. The intent
 // is: a Claude Code agent gets pinged via notifications/claude/channel,
 // reads the meta.messageFilename, and calls st_msg_reply({ thread,
 // body }) to write a reply without having to think about identities.
@@ -40,7 +40,7 @@ const replyOutputShape = {
   identity: z.string().describe('Recipient identity (the original `from`).'),
 };
 
-export function registerReplyTool(mcp: McpServer, coord: St): void {
+export function registerReplyTool(mcp: McpServer, st: St): void {
   mcp.registerTool(
     'st_msg_reply',
     {
@@ -56,7 +56,7 @@ export function registerReplyTool(mcp: McpServer, coord: St): void {
         if (args.body.length === 0) {
           throw new EmptyBodyError();
         }
-        const located = locateThread(coord.root, coord.identity, thread);
+        const located = locateThread(st.root, st.identity, thread);
         const subject =
           args.subject !== undefined
             ? args.subject
@@ -68,7 +68,7 @@ export function registerReplyTool(mcp: McpServer, coord: St): void {
         };
         if (subject !== undefined) sendOpts.subject = subject;
         const recipient = asIdentity(located.from);
-        const filename = await coord.send(recipient, args.body, sendOpts);
+        const filename = await st.send(recipient, args.body, sendOpts);
         return buildToolResult({
           summary: `replied: ${recipient}/${filename}`,
           value: { filename, identity: recipient },

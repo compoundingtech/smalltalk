@@ -6,6 +6,76 @@ minor releases until 1.0.
 
 ## Unreleased
 
+### Changed (coord-kill piece (d) — cosmetic scrub: README, comments, log strings, variable names)
+
+Comprehensive scrub of remaining `coord`/`Coord` references across
+source + tests + hook scripts + README.
+
+- **`coord` variable names** renamed to `st` — the parameter
+  `(coord: St)` → `(st: St)` across all MCP tool files, the local
+  `const coord = createSt(...)` → `const st = createSt(...)` in
+  `lib.ts` + `mcp/index.ts` + `ding.ts`, and every downstream
+  `coord.method()` call → `st.method()`.
+- **DingDeps + McpServerHandle interface fields** renamed
+  `coord: St` → `st: St`. Consumers updated.
+- **Test fixture `FakeCoord`** renamed to `FakeSt`; test helper
+  `makeFakeCoord` → `makeFakeSt`. All `handle.coord` /
+  `fake.coord` refs updated to `handle.st` / `fake.st`.
+- **README** — the "Note on the name" dual-alias section reduced
+  to a one-line note; the "Names" section rewritten to describe
+  the post-cutover surface (`st` + `smalltalk` binaries, `st_*`
+  MCP tools, `ST_AGENT`/`ST_ROOT`/`ST_CONFIG` env, no coord
+  fallback). Programmatic-API example updated to
+  `import { createSt, ... } from '@myobie/coord'` (npm scope
+  preserved — it's the package identity, not a personal-brand
+  ref). MCP server section rewritten to describe the `st_*`-only
+  tool surface and `_meta['st/error']` wire key.
+- **Command file header comments** — 17 files' header comments
+  scrubbed of `coord` verb refs.
+- **`coord-web`** in comments → `the web UI` (generic — external
+  product isn't shipped by this repo).
+- **`~/.local/state/st` / `~/.config/st`** stray path segments
+  from an over-aggressive bulk sed corrected back to
+  `~/.local/state/smalltalk` / `~/.config/smalltalk` (the state
+  root name is `smalltalk`, not the CLI-command name `st`).
+- **`createSt` default `configRoot`** — was `~/.config/st`,
+  corrected to `~/.config/smalltalk`.
+- **`parsePeer` default bare-hostname resolution** — was
+  `<host>:.local/state/st/`, corrected to
+  `<host>:.local/state/smalltalk/`.
+- **`sync.ts` resolvePeer** — same correction for the peer
+  fallback path.
+- **`tidy-check` notification `from` field** — was
+  `'coord-system'`, now `'st-system'`. Test updated.
+- **`completions` output** — regenerated from generic scrub;
+  test asserts `complete -c st` (not `-c coord`).
+- **Wire meta key** — `_meta['coord/error']` → `_meta['st/error']`
+  refs in error-mapping module and every consuming test.
+- **`stErrorToToolResult`** function (was `coordErrorToToolResult`)
+  and `readStErrorPayload` (was `readCoordErrorPayload`) — public
+  error-mapping exports renamed.
+
+Test fixture data cosmetic:
+- `myobie` (agent name used as test fixture identity) renamed to
+  `operator` in test-only fixtures. Load-bearing exception: NPM
+  scope refs like `@myobie/coord` and `@myobie/pty` are preserved
+  — they're the actual package identifiers.
+- The 3-segment legacy filename regression test uses `legacy` as
+  the middle segment (was `myobie`) — semantic behavior of the
+  test is unchanged.
+
+Vestigial migration tools removed:
+- `tools/cutover/rewrite-mcp-json.ts` + tests
+- `tools/cutover/rewrite-pty-toml.ts` + tests
+- `tools/cutover/sweep.ts` + tests
+- `tools/cutover/` directory itself
+
+Full suite: 1555 pass, 3 pre-existing integration skipped.
+Pre-push name-hygiene grep: clean (with `@myobie/` npm scope
+excluded per the updated memory'd pattern).
+
+Held on `feat/kill-coord-entirely` until the reboot signal.
+
 ### Changed (coord-kill piece (c) — SDK / wire renames: `CoordError` → `StError`, `createCoord` → `createSt`, `Coord` → `St`, wire meta key flip)
 
 Public SDK surface and wire-format constants renamed to their

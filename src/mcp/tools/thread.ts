@@ -1,6 +1,6 @@
 // mcp/tools/thread.ts — registers the `st_msg_thread` MCP tool.
 //
-// Wraps coord.thread(identity, filename, opts?) which walks the
+// Wraps st.thread(identity, filename, opts?) which walks the
 // in-reply-to graph (both directions, cross-identity) and returns an
 // array of MessageWithLocation. Default = flat chronological;
 // tree=true keeps the bash --tree shape (depth in each line).
@@ -51,7 +51,7 @@ const threadOutputShape = {
   ),
 };
 
-export function registerThreadTool(mcp: McpServer, coord: St): void {
+export function registerThreadTool(mcp: McpServer, st: St): void {
   mcp.registerTool(
     'st_msg_thread',
     {
@@ -67,10 +67,10 @@ export function registerThreadTool(mcp: McpServer, coord: St): void {
         const identity =
           args.identity !== undefined
             ? asIdentity(args.identity)
-            : coord.identity;
+            : st.identity;
         const opts: Parameters<St['thread']>[2] = {};
         if (args.tree !== undefined) opts.tree = args.tree;
-        const messages = await coord.thread(identity, filename, opts);
+        const messages = await st.thread(identity, filename, opts);
         // Strip undefined-valued optional fields from each message so the
         // structuredContent matches what's on disk.
         const messagesOut = messages.map((m) => {

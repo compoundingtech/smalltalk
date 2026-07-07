@@ -205,7 +205,7 @@ export interface LaunchInput {
    * - `null`: explicitly opt out — no `ST_BIN=` prefix injected into
    *   the hook commands. The generator emits bare script paths, and
    *   the hook scripts fall back to their internal
-   *   `command -v st || command -v coord` PATH lookup at runtime.
+   *   `command -v st || command -v st` PATH lookup at runtime.
    * - a string: use that path verbatim. Tests pass a synthetic path
    *   so the generated JSON is stable across dev machines.
    */
@@ -770,9 +770,9 @@ function buildPtyToml(opts: {
   }
   if (opts.addDingSidecar) {
     // Emit `st ding` (post-cutover canonical). The `st ding` form
-    // still works because `coord` is a dual alias, but hardcoding
+    // still works because `st` is a dual alias, but hardcoding
     // the legacy name into every fresh pty.toml perpetuates the
-    // drift — future removal of the coord alias would silently
+    // drift — future removal of the st alias would silently
     // break every `st launch codex` config generated pre-fix. Users
     // regenerate their pty.toml (rm pty.toml && st launch codex …)
     // to pick up the new form.
@@ -833,10 +833,10 @@ function buildPtyToml(opts: {
  * Resolve the absolute path to the shipped Claude Code hooks directory
  * (`<smalltalk-root>/examples/claude-code/hooks/`). Uses the same
  * package-json walk as {@link resolveStShimPath}: we know that path
- * gives `<smalltalk-root>/bin/coord`, so the hooks live at
+ * gives `<smalltalk-root>/bin/st`, so the hooks live at
  * `<smalltalk-root>/examples/claude-code/hooks/`.
  *
- * Returns `null` when either the coord binary path can't be resolved
+ * Returns `null` when either the st binary path can't be resolved
  * (e.g. degenerate PATH), or the derived hooks directory doesn't
  * exist on disk (e.g. an npm install that didn't ship `examples/`).
  * A null return is a soft skip — the launch still succeeds; the
@@ -868,22 +868,22 @@ export function resolveClaudeHooksDirWithHint(): {
   path: string | null;
   hint: string | null;
 } {
-  let coordBin: string;
+  let stBin: string;
   try {
-    coordBin = resolveStShimPath();
+    stBin = resolveStShimPath();
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     return {
       path: null,
       hint:
         `could not resolve the smalltalk shim (bin/st) via package.json ` +
-        `walk from this module + \`which st\` / \`which coord\` PATH ` +
+        `walk from this module + \`which st\` / \`which st\` PATH ` +
         `lookup: ${msg}. Confirm you're launching from within a ` +
-        `checkout that has @myobie/coord in its package.json chain, ` +
+        `checkout that has @myobie/st in its package.json chain, ` +
         `or that \`st\` is on your $PATH.`,
     };
   }
-  const smalltalkRoot = dirname(dirname(coordBin));
+  const smalltalkRoot = dirname(dirname(stBin));
   const hooksDir = join(smalltalkRoot, 'examples', 'claude-code', 'hooks');
   let stat: ReturnType<typeof statSync> | null = null;
   try {
@@ -897,7 +897,7 @@ export function resolveClaudeHooksDirWithHint(): {
   return {
     path: null,
     hint:
-      `resolved the smalltalk shim to ${coordBin} (root: ${smalltalkRoot}) ` +
+      `resolved the smalltalk shim to ${stBin} (root: ${smalltalkRoot}) ` +
       `but ${hooksDir} does not exist on disk. Your install may have ` +
       `skipped \`examples/\` (some npm install flavors do). Fix: from ` +
       `the smalltalk repo checkout, run \`npm install && npm link\` so ` +
@@ -914,9 +914,9 @@ export function resolveClaudeHooksDirWithHint(): {
  * via `sh -c`, so the leading `VAR=value cmd` form is parsed as an
  * assignment-preceded simple command per POSIX.
  *
- * When `stBin` is null (bin/st not found alongside the resolved coord
+ * When `stBin` is null (bin/st not found alongside the resolved st
  * bin — an unusual state), the assignment is omitted and the hook
- * falls back to its own `command -v st || command -v coord` PATH
+ * falls back to its own `command -v st || command -v st` PATH
  * lookup. That keeps the hook usable under hand-wired settings.local
  * files that never went through this generator.
  */
@@ -949,9 +949,9 @@ function hookCommand(hookScript: string, stBin: string | null): string {
  * `stBin` is the absolute path to the `st` CLI. Injected as
  * `ST_BIN=<abs>` in the hook `command:` strings so the hook scripts'
  * shellouts use the same binary the operator launched under —
- * robust to a degenerate PATH or a stale `coord` on PATH. Pass `null`
+ * robust to a degenerate PATH or a stale `st` on PATH. Pass `null`
  * to skip the injection and let the hooks fall back to their internal
- * `command -v st || command -v coord` lookup.
+ * `command -v st || command -v st` lookup.
  */
 export function buildClaudeSettings(
   hooksDir: string,
@@ -1855,7 +1855,7 @@ export async function cmdLaunch(
       const settingsFile = join(settingsDir, 'settings.local.json');
       claudeSettingsPath = settingsFile;
       // Resolve the absolute `st` binary path for ST_BIN injection into
-      // hook `command:` strings. Same package.json walk as the coord
+      // hook `command:` strings. Same package.json walk as the st
       // path (they're siblings in bin/). Null on resolution failure
       // (degenerate PATH + tree not on disk); the hook scripts have
       // their own PATH fallback so the launch still succeeds. Test

@@ -215,7 +215,7 @@ describe('parsePeer', () => {
   it('bare hostname with no peers.yaml → kind=ssh fallback', async () => {
     const r = await parsePeer('bob.example.com', scratch);
     expect(r.kind).toBe('ssh');
-    expect(r.resolved).toBe('bob.example.com:.local/state/coord/');
+    expect(r.resolved).toBe('bob.example.com:.local/state/smalltalk/');
   });
 
   it('bare token resolves through peers.yaml alias', async () => {
@@ -248,7 +248,7 @@ describe('parsePeer', () => {
     );
     const r = await parsePeer('not-an-alias', scratch);
     expect(r.kind).toBe('ssh');
-    expect(r.resolved).toBe('not-an-alias:.local/state/coord/');
+    expect(r.resolved).toBe('not-an-alias:.local/state/smalltalk/');
   });
 
   it('comments and blank lines in peers.yaml are tolerated', async () => {
@@ -258,6 +258,6 @@ describe('parsePeer', () => {
     );
     const r = await parsePeer('bobby', scratch);
     expect(r.kind).toBe('alias');
-    expect(r.resolved).toBe('bob.example.com:.local/state/coord/');
+    expect(r.resolved).toBe('bob.example.com:.local/state/smalltalk/');
   });
 });

@@ -140,7 +140,7 @@ function topLevelUsage(name: string): string {
 /**
  * Set of OLD top-level subcommand names that are now nested under
  * `st message`. The dispatcher detects them and emits a helpful
- * "Did you mean coord message <verb>?" pointer.
+ * "Did you mean st message <verb>?" pointer.
  */
 const NESTED_MESSAGE_VERBS = new Set([
   'send',
@@ -192,8 +192,8 @@ async function dispatchMessage(
  * Reads package.json at runtime relative to this module's on-disk
  * location, so it works under `npm link` (where the source lives
  * elsewhere on the filesystem) without a build-time constant. Follows
- * the same invoked-name convention as the help banners: `coord
- * --version` prints `coord 0.3.0`.
+ * the same invoked-name convention as the help banners: `st
+ * --version` prints `st 0.3.0`.
  */
 function versionString(env: NodeJS.ProcessEnv): string {
   const here = fileURLToPath(import.meta.url);
@@ -297,7 +297,7 @@ export async function runCli(
  * Locate a plugin script on PATH.
  *
  * Tries each prefix in order — `st-`, `smalltalk-` — and returns the
- * absolute path of the first match. Post-coord-cutover the `coord-`
+ * absolute path of the first match. Post-st-cutover the `st-`
  * prefix is no longer scanned. The match must be a regular file with
  * at least one of the user/group/other exec bits set. Per-bucket
  * short-circuit means we won't iterate the full PATH for prefixes

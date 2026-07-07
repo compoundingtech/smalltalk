@@ -144,9 +144,9 @@ describe('resolvePeer', () => {
     );
   });
 
-  it('bare hostname with no peers.yaml → "<host>:.local/state/coord/"', () => {
+  it('bare hostname with no peers.yaml → "<host>:.local/state/smalltalk/"', () => {
     expect(resolvePeer('bob.example.com', ctx())).toBe(
-      'bob.example.com:.local/state/coord/'
+      'bob.example.com:.local/state/smalltalk/'
     );
   });
 
@@ -166,7 +166,7 @@ describe('resolvePeer', () => {
       'other: somewhere.example.com\n'
     );
     expect(resolvePeer('bobby', ctx())).toBe(
-      'bobby:.local/state/coord/'
+      'bobby:.local/state/smalltalk/'
     );
   });
 

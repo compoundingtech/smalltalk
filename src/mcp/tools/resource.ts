@@ -104,7 +104,7 @@ const removeOutputShape = {
 
 // ─── Registrations ─────────────────────────────────────────────────────
 
-export function registerResourceTools(mcp: McpServer, coord: St): void {
+export function registerResourceTools(mcp: McpServer, st: St): void {
   mcp.registerTool(
     'st_resource_add',
     {
@@ -116,7 +116,7 @@ export function registerResourceTools(mcp: McpServer, coord: St): void {
     },
     async (args) =>
       withErrorMapping(async () => {
-        const filename = await coord.resources.add({
+        const filename = await st.resources.add({
           url: args.url,
           ...(args.title !== undefined && { title: args.title }),
           ...(args.tags !== undefined && { tags: args.tags }),
@@ -124,8 +124,8 @@ export function registerResourceTools(mcp: McpServer, coord: St): void {
           ...(args.body !== undefined && { body: args.body }),
         });
         return buildToolResult({
-          summary: `added: ${coord.identity}/${filename}`,
-          value: { filename, identity: coord.identity },
+          summary: `added: ${st.identity}/${filename}`,
+          value: { filename, identity: st.identity },
         });
       })
   );
@@ -144,8 +144,8 @@ export function registerResourceTools(mcp: McpServer, coord: St): void {
         const target =
           args.identity !== undefined
             ? asIdentity(args.identity)
-            : coord.identity;
-        const items = await coord.resources.list(target);
+            : st.identity;
+        const items = await st.resources.list(target);
         const resources = items.map((it) => ({
           filename: it.filename,
           url: it.resource.url,
@@ -177,9 +177,9 @@ export function registerResourceTools(mcp: McpServer, coord: St): void {
         const target =
           args.identity !== undefined
             ? asIdentity(args.identity)
-            : coord.identity;
+            : st.identity;
         const filename = asFilename(args.filename);
-        const r = await coord.resources.read(target, filename);
+        const r = await st.resources.read(target, filename);
         return buildToolResult({
           summary: `${target}/${filename}: ${r.url}`,
           value: {
@@ -207,10 +207,10 @@ export function registerResourceTools(mcp: McpServer, coord: St): void {
     async (args) =>
       withErrorMapping(async () => {
         const filename = asFilename(args.filename);
-        await coord.resources.remove(filename);
+        await st.resources.remove(filename);
         return buildToolResult({
-          summary: `removed: ${coord.identity}/${filename}`,
-          value: { identity: coord.identity, filename, removed: true },
+          summary: `removed: ${st.identity}/${filename}`,
+          value: { identity: st.identity, filename, removed: true },
         });
       })
   );

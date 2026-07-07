@@ -45,7 +45,7 @@ const lsOutputShape = {
   identity: z.string().describe('Resolved identity that was listed.'),
 };
 
-export function registerLsTool(mcp: McpServer, coord: St): void {
+export function registerLsTool(mcp: McpServer, st: St): void {
   mcp.registerTool(
     'st_msg_ls',
     {
@@ -64,8 +64,8 @@ export function registerLsTool(mcp: McpServer, coord: St): void {
           opts.fromFilter = asIdentity(args.fromFilter);
         }
         const target =
-          args.identity !== undefined ? asIdentity(args.identity) : coord.identity;
-        const matches = await coord.ls(target, opts);
+          args.identity !== undefined ? asIdentity(args.identity) : st.identity;
+        const matches = await st.ls(target, opts);
         const summary =
           matches.length === 1
             ? `1 message in ${args.archive === true ? 'archive' : 'inbox'}`

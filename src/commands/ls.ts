@@ -188,7 +188,7 @@ export function cmdLs(input: LsInput): LsResult {
     for (const name of names.sort()) {
       if (validFilename(name)) continue; // it's a real .md, not an orphan
       const pre = prefixOf(name);
-      if (pre === null) continue; // random file, not a coord sibling
+      if (pre === null) continue; // random file, not a st sibling
       if (mdPrefixes.has(pre)) continue; // has a matching .md; not orphaned
       if (since !== undefined) {
         // The 13-digit prefix segment IS the unix-ms timestamp; reuse it
