@@ -130,9 +130,22 @@ describe('cmdLaunch — identity resolution', () => {
 
 // ─── Channel-mode defaults ─────────────────────────────────────────────
 
-describe('cmdLaunch — channel mode defaults', () => {
-  it('claude defaults to channel-mode on', async () => {
+describe('cmdLaunch — channel mode defaults (post-coord-cutover: ding-mode default)', () => {
+  it('claude defaults to ding-mode (channel off)', async () => {
+    // Post-cutover: ding-mode is the default. Channel is a
+    // property of MCP-mode; ding-mode never has channel.
     const r = await cmdLaunch(baseInput({ harness: 'claude' }), ctx);
+    expect(r.channel).toBe(false);
+    expect(r.argv.join(' ')).not.toContain(
+      '--dangerously-load-development-channels'
+    );
+  });
+
+  it('claude --mcp opts INTO channel-mode', async () => {
+    const r = await cmdLaunch(
+      baseInput({ harness: 'claude', mcp: true }),
+      ctx
+    );
     expect(r.channel).toBe(true);
     expect(r.argv.join(' ')).toContain(
       '--dangerously-load-development-channels server:st'
@@ -144,9 +157,9 @@ describe('cmdLaunch — channel mode defaults', () => {
     expect(r.channel).toBe(false);
   });
 
-  it('--no-channel disables channel on claude', async () => {
+  it('--no-channel disables channel on claude --mcp', async () => {
     const r = await cmdLaunch(
-      baseInput({ harness: 'claude', noChannel: true }),
+      baseInput({ harness: 'claude', mcp: true, noChannel: true }),
       ctx
     );
     expect(r.channel).toBe(false);
@@ -756,12 +769,23 @@ describe('cmdLaunch — pty.toml generation', () => {
     expect(r.ptyTomlPreview).not.toContain('COORD_PTY_ROOT');
   });
 
-  it('claude preview has no ding sidecar', async () => {
+  it('claude --mcp preview has no ding sidecar (MCP transport handles delivery)', async () => {
+    const r = await cmdLaunch(
+      baseInput({ harness: 'claude', identity: 'alice', mcp: true }),
+      ctx
+    );
+    expect(r.ptyTomlPreview).not.toContain('[sessions.ding]');
+  });
+
+  it('claude preview HAS ding sidecar by default (post-cutover: ding-mode default)', async () => {
     const r = await cmdLaunch(
       baseInput({ harness: 'claude', identity: 'alice' }),
       ctx
     );
-    expect(r.ptyTomlPreview).not.toContain('[sessions.ding]');
+    expect(r.ptyTomlPreview).toContain('[sessions.ding]');
+    expect(r.ptyTomlPreview).toContain(
+      'st ding alice-claude --identity alice'
+    );
   });
 
   it('codex preview includes the `st ding` sidecar (ephemeral by default; no permanent tag)', async () => {
@@ -901,12 +925,12 @@ describe('cmdLaunch — pty.toml generation', () => {
     expect(r.ptyTomlPreview).toMatch(/"st\.network" = "\/.+"/);
   });
 
-  it('claude launch (no ding) also carries st.network on the agent tag', async () => {
-    // Regression guard: even without a ding sidecar, the agent
-    // block MUST carry the tag. A single-tagged claude launch is
-    // still a network member.
+  it('claude --mcp (no ding) launch also carries st.network on the agent tag', async () => {
+    // Regression guard: without a ding sidecar (MCP mode), the
+    // agent block MUST still carry the tag. A single-tagged claude
+    // launch is still a network member.
     const r = await cmdLaunch(
-      baseInput({ harness: 'claude', identity: 'alice' }),
+      baseInput({ harness: 'claude', identity: 'alice', mcp: true }),
       ctx
     );
     const tagLines = r.ptyTomlPreview!.split('\n').filter((l) =>
@@ -1381,16 +1405,30 @@ describe('cmdLaunch — --fresh mode (skip pinned session, no --resume)', () => 
   });
 });
 
-describe('cmdLaunch — --ding claude ding-mode (no MCP)', () => {
-  // `--ding` is the Johannes-unblock: launch claude codex-style —
-  // no MCP wiring (skip .mcp.json, no --channel flag), add an
-  // `st ding` sidecar for inbox delivery. Load-bearing for
-  // environments where MCP servers can't run at all.
+describe('cmdLaunch — --ding vs --mcp (ding-mode is the default post-cutover)', () => {
+  // Post-cutover: ding-mode is the DEFAULT for claude launches. The
+  // MCP transport is opt-in via `--mcp`. Ding-mode: no MCP wiring
+  // (skip .mcp.json, no --channel flag), add an `st ding` sidecar
+  // for inbox delivery. MCP mode: writes .mcp.json and adds the
+  // --dangerously-load-development-channels claude argv, no ding
+  // sidecar.
 
-  it('default (no --ding) → claude gets .mcp.json + channel flag; no ding sidecar', async () => {
-    // Regression guard: byte-identical to pre-fix behavior.
+  it('default (neither flag) → claude gets ding sidecar, NO .mcp.json, no channel', async () => {
     const r = await cmdLaunch(
       baseInput({ harness: 'claude', identity: 'alice' }),
+      ctx
+    );
+    expect(r.ding).toBe(true);
+    expect(r.channel).toBe(false);
+    expect(r.argv.join(' ')).not.toContain(
+      '--dangerously-load-development-channels'
+    );
+    expect(r.ptyTomlPreview).toContain('[sessions.ding]');
+  });
+
+  it('--mcp on claude → .mcp.json + channel flag; no ding sidecar', async () => {
+    const r = await cmdLaunch(
+      baseInput({ harness: 'claude', identity: 'alice', mcp: true }),
       ctx
     );
     expect(r.ding).toBe(false);
@@ -1401,33 +1439,30 @@ describe('cmdLaunch — --ding claude ding-mode (no MCP)', () => {
     expect(r.ptyTomlPreview).not.toContain('[sessions.ding]');
   });
 
-  it('--ding on claude → no channel flag, ding sidecar added', async () => {
+  it('--ding on claude (explicit, redundant) → same as default: ding sidecar, no channel', async () => {
     const r = await cmdLaunch(
       baseInput({ harness: 'claude', identity: 'alice', ding: true }),
       ctx
     );
     expect(r.ding).toBe(true);
     expect(r.channel).toBe(false);
-    // No --dangerously-load-development-channels in the argv.
     expect(r.argv.join(' ')).not.toContain(
       '--dangerously-load-development-channels'
     );
-    // Ding sidecar in pty.toml, same shape as codex.
     expect(r.ptyTomlPreview).toContain('[sessions.ding]');
     expect(r.ptyTomlPreview).toContain(
       'st ding alice-claude --identity alice'
     );
   });
 
-  it('--ding on claude → cmdInit NOT called (no .mcp.json write on live run)', async () => {
-    // The critical Johannes-blocker: skip MCP wiring entirely.
-    // cmdInit would call statSync + writeFileSync inside the cwd;
-    // its skip is what lets a Johannes-shaped env launch at all.
+  it('default claude → cmdInit NOT called (no .mcp.json write on live run)', async () => {
+    // Ding-mode skips MCP wiring entirely. cmdInit would call
+    // statSync + writeFileSync inside the cwd; its skip is what
+    // lets an MCP-hostile env launch at all.
     await cmdLaunch(
       baseInput({
         harness: 'claude',
         identity: 'alice',
-        ding: true,
         dryRun: false,
         captureOnly: true,
       }),
@@ -1436,13 +1471,14 @@ describe('cmdLaunch — --ding claude ding-mode (no MCP)', () => {
     expect(existsSync(join(cwd, '.mcp.json'))).toBe(false);
   });
 
-  it('--ding on claude WITHOUT --ding → .mcp.json IS written on live run (regression guard)', async () => {
-    // Prove the ding-mode skip is scoped — a non-ding claude launch
-    // still writes .mcp.json as before.
+  it('--mcp on claude → .mcp.json IS written on live run (opt-in)', async () => {
+    // Prove the ding-mode skip is scoped — an --mcp claude launch
+    // still writes .mcp.json.
     await cmdLaunch(
       baseInput({
         harness: 'claude',
         identity: 'alice',
+        mcp: true,
         dryRun: false,
         captureOnly: true,
       }),
@@ -1533,10 +1569,10 @@ describe('cmdLaunch — --ding claude ding-mode (no MCP)', () => {
     expect(stdoutBuf).toContain('mcp.json:       (skipped — ding mode)');
   });
 
-  it('CLI default (no --ding) → dry-run summary reports no', async () => {
+  it('CLI --mcp → dry-run summary reports ding mode: no', async () => {
     const { cmdLaunchCli } = await import('../../src/commands/launch.ts');
     await cmdLaunchCli(
-      ['claude', '--identity', 'alice', '--dry-run'],
+      ['claude', '--identity', 'alice', '--mcp', '--dry-run'],
       ctx
     );
     expect(stdoutBuf).toContain('ding mode:      no');
@@ -1550,11 +1586,9 @@ describe('cmdLaunch — DING-BUS.md install (ding-mode instructions blurb)', () 
   // src/mcp/capabilities.ts:CHANNEL_INSTRUCTIONS. Same mechanism
   // as `--persona`; composes with it.
 
-  it('default (no --ding) → NO DING-BUS.md install; dingBus is null', async () => {
-    // Regression guard: byte-identical to pre-fix behavior on the
-    // MCP path. DING-BUS.md is a --ding-only concept.
+  it('--mcp claude → NO DING-BUS.md install; dingBus is null (MCP transport carries its own instructions)', async () => {
     const r = await cmdLaunch(
-      baseInput({ harness: 'claude', identity: 'alice' }),
+      baseInput({ harness: 'claude', identity: 'alice', mcp: true }),
       ctx
     );
     expect(r.dingBus).toBeNull();
@@ -1930,11 +1964,11 @@ describe('cmdLaunch — claude session id', () => {
 // ─── Dry-run stdout summary ────────────────────────────────────────────
 
 describe('cmdLaunchCli — dry-run summary', () => {
-  it('the CLI wrapper prints the summary block on --dry-run', async () => {
-    // Route through the CLI wrapper for the assertions on stdout.
+  it('the CLI wrapper prints the summary block on --dry-run (--mcp for channel-mode on)', async () => {
+    // Post-cutover: ding is default; --mcp for channel-mode.
     const { cmdLaunchCli } = await import('../../src/commands/launch.ts');
     const rc = await cmdLaunchCli(
-      ['claude', '--identity', 'alice', '--dry-run'],
+      ['claude', '--identity', 'alice', '--mcp', '--dry-run'],
       ctx
     );
     expect(rc).toBe(0);
@@ -2059,10 +2093,12 @@ describe('cmdLaunch — side effects (non-dry-run)', () => {
 // regression here fails the test rather than the live user run.
 
 describe('cmdLaunch — live-path regression (dry-run bypasses this)', () => {
-  it('claude live path: .claude-session-id + mcp.json + pty.toml all land on disk without runtime errors', async () => {
+  it('claude --mcp live path: .claude-session-id + mcp.json + pty.toml all land on disk without runtime errors', async () => {
     // captureOnly: true skips only the harness spawn; every earlier
     // side-effect (session-id gen via randomUUID, cmdInit write,
-    // pty.toml write, ensureIdentityDirs) runs for real.
+    // pty.toml write, ensureIdentityDirs) runs for real. Post-
+    // cutover ding-mode is default → --mcp for the MCP-path
+    // regression guard.
     const fakePty = join(scratch, 'fake-pty');
     writeFileSync(fakePty, '#!/bin/sh\necho ok\n');
     let threw: unknown = null;
@@ -2071,6 +2107,7 @@ describe('cmdLaunch — live-path regression (dry-run bypasses this)', () => {
         baseInput({
           harness: 'claude',
           identity: 'live-alice',
+          mcp: true,
           dryRun: false,
           captureOnly: true,
           ptyBinPath: fakePty,
@@ -2097,7 +2134,9 @@ describe('cmdLaunch — live-path regression (dry-run bypasses this)', () => {
     );
   });
 
-  it('codex live path: mcp.json + pty.toml with ding sidecar land without runtime errors', async () => {
+  it('codex live path: pty.toml with ding sidecar lands without runtime errors', async () => {
+    // Codex is always ding-mode (both pre- and post-cutover); no
+    // .mcp.json written unless --mcp is passed.
     const fakePty = join(scratch, 'fake-pty');
     writeFileSync(fakePty, '#!/bin/sh\necho ok\n');
     let threw: unknown = null;
@@ -2116,14 +2155,14 @@ describe('cmdLaunch — live-path regression (dry-run bypasses this)', () => {
       threw = err;
     }
     expect(threw).toBeNull();
-    expect(existsSync(join(cwd, '.mcp.json'))).toBe(true);
+    expect(existsSync(join(cwd, '.mcp.json'))).toBe(false); // ding-mode default → no .mcp.json
     const pty = readFileSync(join(cwd, 'pty.toml'), 'utf8');
     expect(pty).toContain('[sessions.codex]');
     expect(pty).toContain('[sessions.ding]');
     expect(pty).toContain('st ding live-bob-codex --identity live-bob');
-    // Codex path doesn't touch newUuid(), but the init.ts /
-    // status.ts sibling `require`s in the error paths are compiled
-    // in this run — a regression there would still surface.
+    // The init.ts / status.ts sibling `require`s in the error paths
+    // are compiled in this run — a regression there would still
+    // surface.
   });
 
   it('two live launches in a row generate distinct UUIDs (proves randomUUID is not memoized)', async () => {
@@ -2519,7 +2558,9 @@ describe('cmdLaunch — --persona (brief-022)', () => {
     expect(r.persona).toBeNull();
   });
 
-  it('claude: copies persona to PERSONA.md and creates CLAUDE.md with @PERSONA.md when missing', async () => {
+  it('claude --mcp: copies persona to PERSONA.md and creates CLAUDE.md with @PERSONA.md when missing', async () => {
+    // --mcp because ding-mode default also appends @DING-BUS.md;
+    // this test isolates the persona-only shape.
     makeGitRepo(cwd);
     const src = personaFixture('# You are the test agent\n');
     const r = await cmdLaunch(
@@ -2527,6 +2568,7 @@ describe('cmdLaunch — --persona (brief-022)', () => {
         harness: 'claude',
         identity: 'a',
         persona: src,
+        mcp: true,
         dryRun: false,
         captureOnly: true,
       }),
@@ -2591,7 +2633,7 @@ describe('cmdLaunch — --persona (brief-022)', () => {
     expect(/^@PERSONA\.md$/m.test(entry)).toBe(true);
   });
 
-  it('idempotent: does not re-append @PERSONA.md when already present', async () => {
+  it('idempotent: does not re-append @PERSONA.md when already present (--mcp isolates persona-only)', async () => {
     makeGitRepo(cwd);
     const existing =
       '# Project\n\n@PERSONA.md\n\nMore project content.\n';
@@ -2602,6 +2644,7 @@ describe('cmdLaunch — --persona (brief-022)', () => {
         harness: 'claude',
         identity: 'a',
         persona: src,
+        mcp: true,
         dryRun: false,
         captureOnly: true,
       }),
@@ -2613,7 +2656,7 @@ describe('cmdLaunch — --persona (brief-022)', () => {
     expect(readFileSync(join(cwd, 'CLAUDE.md'), 'utf8')).toBe(existing);
   });
 
-  it('handles an existing CLAUDE.md that does not end in a newline', async () => {
+  it('handles an existing CLAUDE.md that does not end in a newline (--mcp isolates persona-only)', async () => {
     makeGitRepo(cwd);
     const existing = '# Project (no trailing newline)';
     writeFileSync(join(cwd, 'CLAUDE.md'), existing);
@@ -2623,6 +2666,7 @@ describe('cmdLaunch — --persona (brief-022)', () => {
         harness: 'claude',
         identity: 'a',
         persona: src,
+        mcp: true,
         dryRun: false,
         captureOnly: true,
       }),

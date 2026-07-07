@@ -64,16 +64,16 @@ export async function cmdMcpCli(
     throw new Error(`unknown flag: ${a}`);
   }
 
-  // `st mcp` / `st mcp` follows the env contract every other verb
-  // uses: ST_ROOT > COORD_ROOT > default state path via stRootFrom();
-  // ST_AGENT > ST_IDENTITY (warn) > COORD_IDENTITY (warn).
+  // `st mcp` follows the env contract every other verb uses:
+  // ST_ROOT (default state path via stRootFrom()); ST_AGENT >
+  // ST_IDENTITY (warn).
   //
-  // When none of those are set, the previous behavior was a hard exit.
+  // When neither is set, the previous behavior was a hard exit.
   // That broke any MCP host that spawned `st mcp` without an env
-  // identity (Codex hit this in poc-server). Per Nathan's call, we
-  // now fall back to a throwaway `anon-<rand6>` identity with a
-  // single stderr warning — "so we don't just not work." Managed
-  // hosts that DO set an identity are unaffected.
+  // identity (Codex hit this in poc-server). We now fall back to a
+  // throwaway `anon-<rand6>` identity with a single stderr warning
+  // — so managed hosts that DO set an identity are unaffected while
+  // MCP hosts that don't still get a working server.
   const root = stRootFrom(ctx.env);
   let identity = envAgentFrom(ctx.env);
   if (!identity) {

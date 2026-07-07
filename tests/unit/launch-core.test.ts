@@ -55,6 +55,7 @@ describe('cmdLaunchCoreCli — happy path (JSON in → JSON out)', () => {
     stdinPayload = JSON.stringify({
       harness: 'claude',
       identity: 'alice',
+      mcp: true, // post-cutover default is ding; opt into MCP for channel-mode
       dryRun: true,
     });
     const rc = await cmdLaunchCoreCli([], ctx);
@@ -62,7 +63,7 @@ describe('cmdLaunchCoreCli — happy path (JSON in → JSON out)', () => {
     // stdout is valid JSON conforming to LaunchResult shape.
     const parsed = JSON.parse(stdoutBuf);
     expect(parsed.identity).toBe('alice');
-    expect(parsed.channel).toBe(true); // claude default
+    expect(parsed.channel).toBe(true); // claude --mcp
     expect(parsed.ding).toBe(false);
     expect(parsed.fresh).toBe(false);
     // argv includes --resume by default (non-fresh).

@@ -1,7 +1,7 @@
-// @myobie/st — programmatic API.
+// @myobie/coord — programmatic API.
 //
 // Embedders import from this entry point:
-//   import { createSt, asIdentity } from '@myobie/st';
+//   import { createSt, asIdentity } from '@myobie/coord';
 //
 // The CLI entry point (`bin/st` → `src/cli.ts`) is invoked separately;
 // it is not re-exported here.

@@ -6,6 +6,90 @@ minor releases until 1.0.
 
 ## Unreleased
 
+### Changed (coord-kill piece (e) — ding-mode is now the DEFAULT for `st launch`; MCP is `--mcp` opt-in)
+
+Post-cutover the transport preference flips: `st launch` (both
+harnesses) defaults to **ding-mode** delivery via an `st ding`
+sidecar. The MCP transport is now opt-in via `--mcp`.
+
+Rationale: ding-mode works in every environment (no MCP server
+needed), while MCP mode requires a functioning MCP transport. An
+operator no longer needs to know the difference — the default just
+works — and can opt into MCP push delivery when they specifically
+want it.
+
+Behavior changes:
+- `st launch claude` → NO `.mcp.json` write, NO
+  `--dangerously-load-development-channels` argv, `st ding`
+  sidecar added, DING-BUS.md instructions installed via
+  `@DING-BUS.md` CLAUDE.md import.
+- `st launch claude --mcp` → old behavior: `.mcp.json` written,
+  `--dangerously-load-development-channels server:st` in argv, no
+  ding sidecar.
+- `st launch claude --ding` → same as no flag (explicit opt-in;
+  redundant but accepted).
+- `st launch codex` → unchanged (codex has always been ding-mode
+  by default; no `.mcp.json` write unless `--mcp` is passed).
+
+CLI:
+- `--mcp` boolean flag added to the parser + LAUNCH_HELP.
+- `LaunchInput.mcp?: boolean` field added; `LaunchInput.ding`
+  docstring rewritten (redundant post-cutover; explicit opt-in).
+- Ding-mode resolution rule inside `cmdLaunch`:
+    1. Explicit `--ding` → ding
+    2. Explicit `--mcp` → MCP (opt-in)
+    3. Neither → ding (default)
+
+Docs:
+- LAUNCH_HELP rewritten to describe both `--ding` (redundant
+  explicit) and `--mcp` (opt-in) flags.
+- Examples list updated: the default now says "ding-mode
+  (default)", the MCP examples pass `--mcp` explicitly.
+
+Test updates:
+- `channel mode defaults` describe rewritten: claude defaults to
+  ding-mode (channel off); `--mcp` opts into channel-mode; codex
+  unchanged.
+- `pty.toml generation > claude preview has no ding sidecar` →
+  reframed to `claude --mcp preview has no ding sidecar` +
+  companion "claude preview HAS ding sidecar by default" test.
+- `st.network tag on claude launch (no ding)` → reframed to
+  `--mcp (no ding)` — the tag is still present in the agent block.
+- `--ding claude ding-mode` describe → renamed to `--ding vs
+  --mcp (ding-mode is the default post-cutover)`. Test cases
+  rewritten:
+    * `default` → asserts ding sidecar, no .mcp.json, no channel
+    * `--mcp` → asserts .mcp.json + channel + no ding sidecar
+    * `--ding` (explicit) → asserts same as default
+    * `default → cmdInit NOT called` (no .mcp.json write)
+    * `--mcp → .mcp.json IS written` (opt-in write)
+- Persona describe tests (`copies persona to PERSONA.md`,
+  `idempotent`, `not-ending-in-newline`) → pass `mcp: true` to
+  isolate persona-only behavior from the ding-bus append.
+- `dry-run summary` test → pass `--mcp` to expect "channel mode:
+  on" in the summary.
+- `codex live path` → asserts `.mcp.json` does NOT exist by
+  default (codex is ding-mode; MCP is opt-in).
+- `claude live path` → passes `mcp: true` to keep asserting the
+  `.mcp.json` write.
+- `launch-core.test.ts` — the JSON-in/JSON-out test now passes
+  `mcp: true` for the `channel: true` assertion. Optional-bool
+  parser in `launch-core.ts` extended to accept `mcp`.
+
+Also — nested cleanups from earlier pieces that slipped through:
+- `src/index.ts` and `src/types.ts` header docstrings: reverted
+  bad `@myobie/coord` → `@myobie/st` sed (npm scope must stay).
+- `src/commands/init.ts` + `src/commands/launch.ts` reference-
+  message strings: same revert.
+- `src/commands/mcp.ts` docstring: removed a "Per Nathan's call"
+  attribution + a stale `$COORD_ROOT` mention in the identity-
+  fallback chain comment.
+
+Full suite: 1558 pass, 3 pre-existing integration skipped.
+Pre-push name-hygiene grep: clean.
+
+Held on `feat/kill-coord-entirely` until the reboot signal.
+
 ### Changed (coord-kill piece (d) — cosmetic scrub: README, comments, log strings, variable names)
 
 Comprehensive scrub of remaining `coord`/`Coord` references across

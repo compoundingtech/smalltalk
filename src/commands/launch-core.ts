@@ -107,6 +107,7 @@ function toLaunchInput(
     'noChannel',
     'noHooks',
     'ding',
+    'mcp',
     'fresh',
     'permanent',
     'unattended',

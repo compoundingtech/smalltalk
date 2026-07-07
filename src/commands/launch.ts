@@ -64,28 +64,25 @@ export interface LaunchInput {
    *  is channel-on; for codex is channel-off (codex has no channel UI). */
   noChannel?: boolean | undefined;
   /**
-   * Ding-mode: launch claude the way codex launches — WITHOUT MCP
-   * wiring, WITH an `st ding` sidecar for inbox delivery. Skips
-   * `.mcp.json` generation entirely (no `cmdInit` call) and forces
-   * `channel = false` (no `--dangerously-load-development-channels`
-   * flag on the argv). Adds the ding sidecar to the generated
-   * pty.toml so the claude agent gets inbox notifications via
-   * `pty send` instead of MCP `notifications/claude/channel`.
-   *
-   * The load-bearing use case: environments where MCP servers don't
-   * work at all (Johannes's setup, some sandboxes). Without ding-mode,
-   * `st launch claude` requires a functioning MCP transport; with
-   * ding-mode, the same agent joins the network via ding delivery +
-   * the `st` CLI for all bus ops (send, ls, read, archive, reply).
-   *
-   * Hooks (`.claude/settings.local.json`) are still generated — the
-   * boot ritual + PreCompact flush + StopFailure ding are Claude
-   * Code hooks, independent of MCP.
-   *
-   * No-op for codex (codex is already ding-mode by default —
-   * `addDingSidecar` fires unconditionally for that harness).
+   * Explicit `--ding` opt-in. Redundant post-cutover since ding-mode
+   * is the default (see resolution rule inside cmdLaunch); accepted
+   * for shell-history compatibility and to make the intent explicit
+   * in a launch command. Cannot be combined with `mcp: true` — the
+   * two are mutually exclusive.
    */
   ding?: boolean | undefined;
+  /**
+   * Opt into MCP transport instead of the default ding-mode.
+   * Writes `.mcp.json`, adds `--dangerously-load-development-
+   * channels server:st` to the claude argv, skips the ding sidecar
+   * (on claude; codex still gets one because that's its only
+   * transport). Requires a functioning MCP server on the target
+   * machine — use ding-mode (the default) on MCP-hostile
+   * environments.
+   *
+   * When both `ding: true` AND `mcp: true` are passed, `ding` wins.
+   */
+  mcp?: boolean | undefined;
   /** Override the pty session name (default: harness name). */
   sessionName?: string | undefined;
   /**
@@ -879,7 +876,7 @@ export function resolveClaudeHooksDirWithHint(): {
         `could not resolve the smalltalk shim (bin/st) via package.json ` +
         `walk from this module + \`which st\` / \`which st\` PATH ` +
         `lookup: ${msg}. Confirm you're launching from within a ` +
-        `checkout that has @myobie/st in its package.json chain, ` +
+        `checkout that has @myobie/coord in its package.json chain, ` +
         `or that \`st\` is on your $PATH.`,
     };
   }
@@ -1497,14 +1494,24 @@ export async function cmdLaunch(
   }
 
   // ─── .mcp.json bootstrap (via cmdInit) ──────────────────────────────
-  // Ding-mode: skip MCP wiring entirely. The claude agent joins the
-  // network via `st ding` sidecar + `st` CLI, same as codex. Load-
-  // bearing for environments where MCP servers can't run at all
-  // (Johannes's setup, some sandboxes).
-  const ding = input.ding === true;
+  // Ding-mode is the DEFAULT for `st launch` post-cutover — the
+  // agent joins the network via `st ding` sidecar + `st` CLI, same
+  // as codex has always done. `--mcp` opts INTO the MCP transport
+  // (writes `.mcp.json`, adds `--dangerously-load-development-
+  // channels` argv). Rationale: an MCP-hostile environment can't
+  // run the MCP server, and ding-mode works everywhere; making it
+  // the default means an operator doesn't need to know the
+  // difference until they explicitly want MCP push delivery.
+  //
+  // Precedence:
+  //   1. Explicit `--ding` → ding (redundant but accepted)
+  //   2. Explicit `--mcp` → MCP (opt-in)
+  //   3. Neither → ding (post-cutover default)
+  const ding =
+    input.ding === true ? true : input.mcp === true ? false : true;
   // Channel resolution: forced off in ding-mode (there's no MCP to
-  // push through). Otherwise unchanged — claude defaults on, codex
-  // off, `--no-channel` forces off.
+  // push through). In MCP mode, `--no-channel` still forces off;
+  // otherwise MCP-mode claude defaults on, MCP-mode codex off.
   const channel = ding
     ? false
     : input.noChannel === true
@@ -2099,17 +2106,23 @@ const LAUNCH_HELP =
   '                          → both sessions are ephemeral (pty\'s default).\n' +
   '                          Warns if a CoS-shaped launch (--identity cos\n' +
   '                          or chief-of-staff persona) is missing.\n' +
-  '  --ding                  Launch claude codex-style: no MCP wiring\n' +
-  '                          (skip .mcp.json entirely, no --channel flag),\n' +
-  '                          add an `st ding` sidecar for inbox delivery,\n' +
-  '                          agent uses the `st` CLI for all bus ops.\n' +
-  '                          Load-bearing for environments where MCP\n' +
-  '                          servers can\'t run at all. Hooks\n' +
-  '                          (.claude/settings.local.json) are still\n' +
-  '                          generated — the boot ritual + PreCompact\n' +
-  '                          flush + StopFailure ding are Claude Code\n' +
-  '                          hooks, MCP-independent. No-op for codex\n' +
-  '                          (already ding-mode by default).\n' +
+  '  --ding                  Explicit opt-in to ding-mode (the default\n' +
+  '                          post-cutover). Same as omitting both\n' +
+  '                          --ding and --mcp. No MCP wiring: skips\n' +
+  '                          .mcp.json entirely, no --channel flag,\n' +
+  '                          adds an `st ding` sidecar for inbox\n' +
+  '                          delivery. Agent uses the `st` CLI for all\n' +
+  '                          bus ops. Hooks stay generated (they\'re\n' +
+  '                          Claude Code hooks, MCP-independent). No-op\n' +
+  '                          for codex (already ding-mode by default).\n' +
+  '  --mcp                   Opt into MCP transport instead of ding.\n' +
+  '                          Writes .mcp.json + adds --dangerously-\n' +
+  '                          load-development-channels server:st to\n' +
+  '                          the claude argv, skips the ding sidecar.\n' +
+  '                          Requires a working MCP server on the\n' +
+  '                          target machine; use ding-mode (the\n' +
+  '                          default) on MCP-hostile environments.\n' +
+  '                          Mutually exclusive with --ding.\n' +
   '  --fresh                 Skip the pinned-session bootstrap and OMIT\n' +
   '                          `--resume` from the launched argv, so the\n' +
   '                          agent starts with a fresh context and must\n' +
@@ -2125,14 +2138,12 @@ const LAUNCH_HELP =
   '  --dry-run               Print what would happen; touch nothing.\n' +
   '  --print                 Alias for --dry-run.\n\n' +
   '  Examples:\n' +
-  '    st launch claude                              # anon identity, channel mode + boot hooks\n' +
-  '    st launch claude --identity alice             # persistent identity\n' +
+  '    st launch claude                              # anon identity, ding-mode (default) + boot hooks\n' +
+  '    st launch claude --identity alice             # persistent identity, ding-mode\n' +
   '    st launch claude --identity cos --permanent \\\n' +
-  '        --persona ~/src/github.com/operator/personas/chief-of-staff.md\n' +
-  '                                                  # production CoS (MCP mode)\n' +
-  '    st launch claude --identity cos --permanent --ding \\\n' +
-  '        --persona ~/src/github.com/operator/personas/chief-of-staff.md\n' +
-  '                                                  # production CoS (ding-mode; no MCP)\n' +
+  '        --persona <persona-path>/chief-of-staff.md\n' +
+  '                                                  # production CoS (ding-mode default)\n' +
+  '    st launch claude --identity alice --mcp       # opt into MCP transport (writes .mcp.json)\n' +
   '    st launch claude --no-hooks                   # skip .claude/settings.local.json\n' +
   '    st launch codex                               # + st ding sidecar\n' +
   '    st launch claude --model glm-5.2:cloud        # via ollama, unattended\n' +
@@ -2157,6 +2168,7 @@ export async function cmdLaunchCli(
   let unattendedFlag: boolean | undefined;
   let permanent = false;
   let ding = false;
+  let mcp = false;
   let fresh = false;
   let dryRun = false;
   for (let i = 0; i < args.length; i++) {
@@ -2208,6 +2220,9 @@ export async function cmdLaunchCli(
       case '--ding':
         ding = true;
         break;
+      case '--mcp':
+        mcp = true;
+        break;
       case '--fresh':
         fresh = true;
         break;
@@ -2249,6 +2264,7 @@ export async function cmdLaunchCli(
       ...(unattendedFlag !== undefined && { unattended: unattendedFlag }),
       permanent,
       ding,
+      mcp,
       fresh,
       dryRun,
       env: ctx.env,

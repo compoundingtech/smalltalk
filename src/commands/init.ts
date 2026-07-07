@@ -78,7 +78,7 @@ export interface InitResult {
  * Resolve a portable path to the smalltalk shim to embed as the MCP
  * server command in a project's `.mcp.json`. Strategy:
  *   1. Walk up from this module's file location to find the
- *      package.json whose `name === "@myobie/st"` (the package
+ *      package.json whose `name === "@myobie/coord"` (the package
  *      name still says st until the npm publish flips it), then
  *      return `<package-root>/bin/st`. Falls back to
  *      `<package-root>/bin/st` only when `bin/st` isn't present
@@ -137,7 +137,7 @@ export function resolveStShimPath(): string {
     }
   }
   throw new Error(
-    'st init: could not resolve a bin/st path. Install @myobie/st ' +
+    'st init: could not resolve a bin/st path. Install @myobie/coord ' +
       '(via npm) or add `st` to your $PATH and retry.'
   );
 }
