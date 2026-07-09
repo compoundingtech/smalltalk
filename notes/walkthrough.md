@@ -565,7 +565,7 @@ What you get with the hooks: a coord-aware agent at session start, a polite re-c
 
 ### Codex push via `coord ding`
 
-Codex's hooks ([`examples/codex/`](../examples/codex/)) cover boot-time and idle-time inbox snapshots, but neither one fires *during* a turn. For real-time push into a Codex session, run it inside a [`pty`](https://github.com/myobie/pty) session and arm `coord ding`:
+Codex's hooks ([`examples/codex/`](../examples/codex/)) cover boot-time and idle-time inbox snapshots, but neither one fires *during* a turn. For real-time push into a Codex session, run it inside a [`pty`](https://github.com/compoundingtech/pty) session and arm `coord ding`:
 
 ```sh
 pty run --name codex-foo -- codex

@@ -39,9 +39,9 @@ bootstrap (step 2) needs the `personas` repo checked out for its
 
 ```sh
 mkdir -p ~/src/github.com/myobie && cd ~/src/github.com/myobie
-git clone https://github.com/myobie/pty
-git clone https://github.com/myobie/smalltalk
-git clone https://github.com/myobie/personas
+git clone https://github.com/compoundingtech/pty
+git clone https://github.com/compoundingtech/smalltalk
+git clone https://github.com/compoundingtech/personas
 cd smalltalk
 npm install
 npm link
@@ -57,7 +57,7 @@ teaching a workshop, shipping a shared CoS setup for a team so
 everyone launches identically — pin to a specific SHA:
 
 ```sh
-cd ~/src/github.com/myobie/personas
+cd ~/src/github.com/compoundingtech/personas
 git checkout <sha>
 ```
 
@@ -124,7 +124,7 @@ mkdir ~/src/github.com/<you>/cos && cd ~/src/github.com/<you>/cos
 git init
 st launch claude --identity cos --permanent \
   --permission-mode bypassPermissions \
-  --persona ~/src/github.com/myobie/personas/chief-of-staff.md
+  --persona ~/src/github.com/compoundingtech/personas/chief-of-staff.md
 ```
 
 **Three flags are load-bearing**, each closing a specific gap:
@@ -168,7 +168,7 @@ explicitly:
 ```sh
 st launch claude --identity cos --permanent \
   --permission-mode bypassPermissions \
-  --persona ~/src/github.com/myobie/personas/chief-of-staff.md \
+  --persona ~/src/github.com/compoundingtech/personas/chief-of-staff.md \
   --agent cl1
 ```
 
@@ -201,7 +201,7 @@ distributions where MCP is disabled — add `--ding` to the launch:
 ```sh
 st launch claude --identity cos --permanent --ding \
   --permission-mode bypassPermissions \
-  --persona ~/src/github.com/myobie/personas/chief-of-staff.md
+  --persona ~/src/github.com/compoundingtech/personas/chief-of-staff.md
 ```
 
 `--ding` swaps the MCP-based delivery path for the same
@@ -243,7 +243,7 @@ first boot the persona instructs the agent to:
   reads when it spins up a peer agent for you. Same checkout; same
   branch. The CoS is designed against a specific personas commit,
   so pin `myobie/personas` to that SHA when you want reproducible
-  behavior across machines (`cd ~/src/github.com/myobie/personas
+  behavior across machines (`cd ~/src/github.com/compoundingtech/personas
   && git checkout <sha>`); pull main when you want the latest.
 - **Own its own repo** — everything the CoS writes about you and
   your work lives in the cos folder (`context/now.md`, decisions,
@@ -273,7 +273,7 @@ and a few sibling files — so a compaction or fresh session picks
 them back up on the next boot.
 
 Then it runs a **readiness check** via
-[st-evals](https://github.com/myobie/st-evals) — a capability-gated
+[st-evals](https://github.com/compoundingtech/evals) — a capability-gated
 hermetic smoke suite that preflights what tools you have installed
 and then only runs the scenarios your setup can actually support.
 The CoS clones st-evals into a scratch dir and runs, from the cloned
@@ -454,10 +454,10 @@ st sync pull --all
   repo, check that `PERSONA.md` and `CLAUDE.md` exist and that
   `CLAUDE.md` contains an `@PERSONA.md` line. If they're missing,
   re-run the launch with `--persona
-  ~/src/github.com/myobie/personas/chief-of-staff.md`.
+  ~/src/github.com/compoundingtech/personas/chief-of-staff.md`.
 - **The persona path in `--persona` didn't resolve:** verify the
   personas repo was cloned in step 1 (`ls
-  ~/src/github.com/myobie/personas/chief-of-staff.md`). If you
+  ~/src/github.com/compoundingtech/personas/chief-of-staff.md`). If you
   cloned it elsewhere, use that absolute path in `--persona`.
 - **`st launch` warns "launching a CoS without --permanent":** you
   omitted `--permanent` from the launch command. A CoS is your
