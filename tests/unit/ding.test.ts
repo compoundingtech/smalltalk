@@ -24,6 +24,8 @@ import {
   probePtyOnPath,
   runDing,
   type PtySender,
+  type PtyPeeker,
+  type PtyPaster,
 } from '../../src/commands/ding.ts';
 import type { CliContext } from '../../src/cli-context.ts';
 import type { St, ReadOptions, WatchOptions } from '../../src/lib.ts';
@@ -33,6 +35,7 @@ import {
   type Filename,
   type Identity,
   type MessageWithLocation,
+  type Priority,
   type State,
   type WatchEvent,
 } from '../../src/types.ts';
@@ -44,7 +47,10 @@ interface FakeSt {
   pushEvent(filename: string, opts?: { folder?: 'inbox' | 'archive' }): void;
   endWatch(): void;
   setStatus(state: State): void;
-  setMessage(filename: string, msg: { from: string; subject?: string }): void;
+  setMessage(
+    filename: string,
+    msg: { from: string; subject?: string; priority?: string }
+  ): void;
   setReadError(err: Error): void;
   /** Fail the next N `read` calls with the given error; subsequent
    *  calls fall through to the planted message. Enables
@@ -62,7 +68,10 @@ function makeFakeSt(
   let ended = false;
   let status: State = 'available';
   let statusError: Error | undefined;
-  const messages = new Map<string, { from: string; subject?: string }>();
+  const messages = new Map<
+    string,
+    { from: string; subject?: string; priority?: string }
+  >();
   let readError: Error | undefined;
   let readFailQueue: Error[] = [];
 
@@ -127,6 +136,9 @@ function makeFakeSt(
           from: msg.from === '' ? ('' as Identity) : asIdentity(msg.from),
           body: 'body',
           ...(msg.subject !== undefined && { subject: msg.subject }),
+          ...(msg.priority !== undefined && {
+            priority: msg.priority as Priority,
+          }),
         },
         identity: asIdentity('bob'),
         filename,
@@ -249,6 +261,16 @@ function startDing(opts: {
   statusRefreshIntervalMs?: number;
   rescanIntervalMs?: number;
   rescanQuietAfterDeliveryMs?: number;
+  paneGuard?: boolean;
+  ptyPeek?: PtyPeeker;
+  peekDiffMs?: number;
+  holdRetryMs?: number;
+  maxHolds?: number;
+  inputGuard?: boolean;
+  inputPattern?: RegExp;
+  inputStaleMax?: number;
+  ptyPaste?: PtyPaster;
+  debug?: boolean;
   stderr?: (s: string) => void;
 }): RunningDing {
   const ac = new AbortController();
@@ -280,6 +302,22 @@ function startDing(opts: {
     ...(opts.rescanQuietAfterDeliveryMs !== undefined && {
       rescanQuietAfterDeliveryMs: opts.rescanQuietAfterDeliveryMs,
     }),
+    // brief-036: default the typing-aware pane guard OFF so existing
+    // delivery/buffering/retry tests aren't gated by a (fake) pane
+    // peek. The pane-guard describe block opts in with an injected
+    // ptyPeek + small hold timings.
+    paneGuard: opts.paneGuard ?? false,
+    ...(opts.ptyPeek !== undefined && { ptyPeek: opts.ptyPeek }),
+    ...(opts.peekDiffMs !== undefined && { peekDiffMs: opts.peekDiffMs }),
+    ...(opts.holdRetryMs !== undefined && { holdRetryMs: opts.holdRetryMs }),
+    ...(opts.maxHolds !== undefined && { maxHolds: opts.maxHolds }),
+    ...(opts.inputGuard !== undefined && { inputGuard: opts.inputGuard }),
+    ...(opts.inputPattern !== undefined && { inputPattern: opts.inputPattern }),
+    ...(opts.inputStaleMax !== undefined && {
+      inputStaleMax: opts.inputStaleMax,
+    }),
+    ...(opts.ptyPaste !== undefined && { ptyPaste: opts.ptyPaste }),
+    ...(opts.debug !== undefined && { debug: opts.debug }),
     signal: ac.signal,
     ...(opts.stderr !== undefined && { stderr: opts.stderr }),
   });
@@ -882,6 +920,7 @@ describe('runDing — debug: true emits [st ding debug] lines', () => {
       exitWhenSessionGone: true,
       sessionWatchIntervalMs: 10_000,
       isSessionAlive: () => true,
+      paneGuard: false,
       rescanIntervalMs: 50,
       rescanQuietAfterDeliveryMs: 60_000,
       debug: true,
@@ -928,6 +967,7 @@ describe('runDing — debug: true emits [st ding debug] lines', () => {
       exitWhenSessionGone: true,
       sessionWatchIntervalMs: 10_000,
       isSessionAlive: () => true,
+      paneGuard: false,
       rescanIntervalMs: 40,
       // debug omitted → defaults to false
       signal: ac.signal,
@@ -2521,5 +2561,263 @@ describe('cmdDingCli — PATH robustness (pty probe at boot)', () => {
     const r = probePtyOnPath();
     expect(r.available).toBe(true);
     expect(r.reason).toBeUndefined();
+  });
+});
+
+// ─── brief-036: typing-aware pane guard ─────────────────────────────────
+
+describe('runDing — brief-036 typing-aware pane guard', () => {
+  let fake: FakeSt;
+  let sender: FakeSender;
+
+  beforeEach(() => {
+    fake = makeFakeSt();
+    sender = makeFakeSender();
+    fake.setStatus('available');
+  });
+  afterEach(() => {
+    fake.endWatch();
+  });
+
+  // A fake peeker whose screen is produced by `frames()` on each call,
+  // plus a call counter so a test can assert the guard peeked (or was
+  // skipped).
+  function makePeeker(frames: () => string): {
+    peek: PtyPeeker;
+    count: () => number;
+  } {
+    let count = 0;
+    return {
+      peek: async () => {
+        count += 1;
+        return { status: 0, stdout: frames(), stderr: '' };
+      },
+      count: () => count,
+    };
+  }
+
+  // A fake bracketed-paste primitive that records what got pasted, so a
+  // test can assert preserve-and-deliver appended the ding correctly.
+  function makePaster(): {
+    paste: PtyPaster;
+    calls: () => { session: string; text: string }[];
+  } {
+    const calls: { session: string; text: string }[] = [];
+    return {
+      paste: async (session, text) => {
+        calls.push({ session, text });
+        return { status: 0, stderr: '' };
+      },
+      calls: () => calls,
+    };
+  }
+
+  // Poll until `pred` holds (or a generous timeout) — robust to
+  // real-timer drift under full-suite load, unlike a fixed wait.
+  async function waitFor(
+    pred: () => boolean,
+    timeoutMs = 3000
+  ): Promise<void> {
+    const start = Date.now();
+    while (!pred()) {
+      if (Date.now() - start > timeoutMs) return; // give up; assertion reports
+      await new Promise((r) => setTimeout(r, 5));
+    }
+  }
+
+  it('changing frame (active typing/output) → HELD, not delivered', async () => {
+    let n = 0;
+    const peeker = makePeeker(() => `frame ${n++}`); // differs every peek
+    const r = startDing({
+      st: fake.st,
+      ptySend: sender.send,
+      paneGuard: true,
+      ptyPeek: peeker.peek,
+      peekDiffMs: 1,
+      holdRetryMs: 10_000, // large → no retry within the test window
+      maxHolds: 3,
+      intervalMs: 20,
+    });
+    fake.setMessage('1714826789010-aaaaaa.md', { from: 'alice' });
+    fake.pushEvent('1714826789010-aaaaaa.md');
+    await waitFor(() => peeker.count() >= 2);
+    expect(peeker.count()).toBeGreaterThanOrEqual(2); // it peeked
+    expect(sender.calls()).toHaveLength(0); // and held (no poke)
+    r.ac.abort();
+    await r.done;
+  });
+
+  it('static frame (idle pane) → delivered immediately', async () => {
+    const peeker = makePeeker(() => 'some output line\nsecond line'); // constant, no prompt
+    const r = startDing({
+      st: fake.st,
+      ptySend: sender.send,
+      paneGuard: true,
+      ptyPeek: peeker.peek,
+      peekDiffMs: 1,
+      intervalMs: 20,
+    });
+    fake.setMessage('1714826789010-aaaaaa.md', {
+      from: 'alice',
+      subject: 'hi',
+    });
+    fake.pushEvent('1714826789010-aaaaaa.md');
+    await waitFor(() => sender.calls().length > 0);
+    expect(sender.calls()).toHaveLength(1);
+    r.ac.abort();
+    await r.done;
+  });
+
+  it('hold cap reached → force-delivered anyway (never dropped)', async () => {
+    let n = 0;
+    const peeker = makePeeker(() => `frame ${n++}`); // always busy
+    const r = startDing({
+      st: fake.st,
+      ptySend: sender.send,
+      paneGuard: true,
+      ptyPeek: peeker.peek,
+      peekDiffMs: 1,
+      holdRetryMs: 25,
+      maxHolds: 2,
+      intervalMs: 10,
+    });
+    fake.setMessage('1714826789010-aaaaaa.md', { from: 'alice' });
+    fake.pushEvent('1714826789010-aaaaaa.md');
+    // 2 holds at ~25ms each → force-deliver.
+    await waitFor(() => sender.calls().length > 0);
+    expect(sender.calls()).toHaveLength(1); // force-delivered, not dropped
+    r.ac.abort();
+    await r.done;
+  });
+
+  it('urgent (priority: high) → skips the guard, delivers on a busy pane', async () => {
+    let n = 0;
+    const peeker = makePeeker(() => `frame ${n++}`); // busy pane
+    const r = startDing({
+      st: fake.st,
+      ptySend: sender.send,
+      paneGuard: true,
+      ptyPeek: peeker.peek,
+      peekDiffMs: 1,
+      holdRetryMs: 10_000,
+      maxHolds: 3,
+      intervalMs: 20,
+    });
+    fake.setMessage('1714826789010-aaaaaa.md', {
+      from: 'alice',
+      priority: 'high',
+    });
+    fake.pushEvent('1714826789010-aaaaaa.md');
+    await waitFor(() => sender.calls().length > 0);
+    expect(sender.calls()).toHaveLength(1); // delivered despite busy pane
+    expect(peeker.count()).toBe(0); // guard skipped → never peeked
+    r.ac.abort();
+    await r.done;
+  });
+
+  it('input-area heuristic: static frame with un-submitted input → HELD', async () => {
+    // Frames are identical (frame-diff idle) but the last line holds a
+    // prompt with typed-but-unsent text → the input-guard flags busy.
+    const peeker = makePeeker(() => 'output above\n> hello wor');
+    const r = startDing({
+      st: fake.st,
+      ptySend: sender.send,
+      paneGuard: true,
+      inputGuard: true,
+      ptyPeek: peeker.peek,
+      peekDiffMs: 1,
+      holdRetryMs: 10_000,
+      maxHolds: 3,
+      intervalMs: 20,
+    });
+    fake.setMessage('1714826789010-aaaaaa.md', { from: 'alice' });
+    fake.pushEvent('1714826789010-aaaaaa.md');
+    await waitFor(() => peeker.count() >= 2);
+    expect(sender.calls()).toHaveLength(0); // held on un-submitted input
+    r.ac.abort();
+    await r.done;
+  });
+
+  it('failed peek → treated as idle (delivers; never blocks on peek errors)', async () => {
+    const failingPeek: PtyPeeker = async () => ({
+      status: 1,
+      stdout: '',
+      stderr: 'Session not found',
+    });
+    const r = startDing({
+      st: fake.st,
+      ptySend: sender.send,
+      paneGuard: true,
+      ptyPeek: failingPeek,
+      peekDiffMs: 1,
+      intervalMs: 20,
+    });
+    fake.setMessage('1714826789010-aaaaaa.md', { from: 'alice' });
+    fake.pushEvent('1714826789010-aaaaaa.md');
+    await waitFor(() => sender.calls().length > 0);
+    expect(sender.calls()).toHaveLength(1); // peek failure → deliver
+    r.ac.abort();
+    await r.done;
+  });
+
+  it('walked-away mid-type (input UNCHANGED across retries) → preserve-and-deliver, text kept', async () => {
+    // Constant screen with un-submitted input → static frame + input
+    // present + unchanged across retries → walked away.
+    const peeker = makePeeker(() => 'output above\n> half typed msg');
+    const paster = makePaster();
+    const r = startDing({
+      st: fake.st,
+      ptySend: sender.send,
+      paneGuard: true,
+      inputGuard: true,
+      ptyPeek: peeker.peek,
+      ptyPaste: paster.paste,
+      peekDiffMs: 1,
+      holdRetryMs: 20,
+      maxHolds: 20, // high → the stale-detector (not the cap) fires first
+      inputStaleMax: 3,
+      intervalMs: 10,
+    });
+    fake.setMessage('1714826789010-aaaaaa.md', { from: 'alice' });
+    fake.pushEvent('1714826789010-aaaaaa.md');
+    // 3 unchanged observations at ~20ms each → walked-away → preserve.
+    await waitFor(() => paster.calls().length > 0);
+    // Preserve path: bracketed-paste "\n<ding>" (keeps their text), then submit.
+    expect(paster.calls()).toHaveLength(1);
+    expect(paster.calls()[0]!.text).toMatch(
+      /^\n\[DING\] new smalltalk message:/
+    );
+    // The submit is a bare key:return (NOT the normal [dingText, key:return]),
+    // so their typed text + the pasted ding submit together as one turn.
+    expect(sender.calls()).toHaveLength(1);
+    expect(sender.calls()[0]!.sequences).toEqual(['key:return']);
+    r.ac.abort();
+    await r.done;
+  });
+
+  it('actively typing (input CHANGING each retry) → keeps holding, never preserve-delivers', async () => {
+    let n = 0;
+    const peeker = makePeeker(() => `output\n> typing ${n++}`); // changes every peek
+    const paster = makePaster();
+    const r = startDing({
+      st: fake.st,
+      ptySend: sender.send,
+      paneGuard: true,
+      inputGuard: true,
+      ptyPeek: peeker.peek,
+      ptyPaste: paster.paste,
+      peekDiffMs: 1,
+      holdRetryMs: 15,
+      maxHolds: 50, // high → cap can't force within the window
+      inputStaleMax: 3,
+      intervalMs: 10,
+    });
+    fake.setMessage('1714826789010-aaaaaa.md', { from: 'alice' });
+    fake.pushEvent('1714826789010-aaaaaa.md');
+    await waitFor(() => peeker.count() >= 4); // a couple of retries
+    expect(sender.calls()).toHaveLength(0); // never submitted
+    expect(paster.calls()).toHaveLength(0); // never preserve-delivered
+    r.ac.abort();
+    await r.done;
   });
 });
