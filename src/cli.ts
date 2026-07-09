@@ -223,20 +223,47 @@ async function dispatchMessage(
 }
 
 /**
- * `<invokedName> <semver>\n` — the payload for `<name> --version`.
- * Reads package.json at runtime relative to this module's on-disk
- * location, so it works under `npm link` (where the source lives
- * elsewhere on the filesystem) without a build-time constant. Follows
- * the same invoked-name convention as the help banners: `st
- * --version` prints `st 0.3.0`.
+ * Short git SHA of the checkout this module lives in, e.g. `abc1234`,
+ * or null when unavailable (not a git checkout, git not on PATH, a
+ * tarball/npm install with no `.git`). Probes the MODULE's repo dir —
+ * not `process.cwd()` — so the SHA identifies the `st` build itself,
+ * regardless of which repo the user is standing in.
+ */
+function gitShortSha(repoDir: string): string | null {
+  try {
+    const r = spawnSync('git', ['rev-parse', '--short', 'HEAD'], {
+      cwd: repoDir,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    });
+    if (r.status !== 0 || typeof r.stdout !== 'string') return null;
+    const sha = r.stdout.trim();
+    return sha.length > 0 ? sha : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * `<invokedName> <semver>+<short-sha>\n` — the payload for `<name>
+ * --version`. Reads package.json at runtime relative to this module's
+ * on-disk location, so it works under `npm link` (where the source
+ * lives elsewhere on the filesystem) without a build-time constant.
+ * Follows the same invoked-name convention as the help banners: `st
+ * --version` prints e.g. `st 0.3.0+abc1234`. The `+<short-sha>` build
+ * suffix is dropped gracefully when the SHA can't be resolved (not a
+ * git checkout / no git), leaving a plain `st 0.3.0`.
  */
 function versionString(env: NodeJS.ProcessEnv): string {
   const here = fileURLToPath(import.meta.url);
-  const pkgPath = join(dirname(here), '..', 'package.json');
+  const repoDir = join(dirname(here), '..');
+  const pkgPath = join(repoDir, 'package.json');
   const pkg = JSON.parse(readFileSync(pkgPath, 'utf8')) as {
     version: string;
   };
-  return `${invokedName(env)} ${pkg.version}\n`;
+  const sha = gitShortSha(repoDir);
+  const version = sha !== null ? `${pkg.version}+${sha}` : pkg.version;
+  return `${invokedName(env)} ${version}\n`;
 }
 
 export async function runCli(

@@ -106,15 +106,26 @@ describe('runCli — no args / help', () => {
 
 describe('runCli — --version', () => {
   // `st --version` reads package.json at runtime and prints
-  // `<invokedName> <semver>`, following the same brand-per-name
-  // convention as the help banners.
-  it('prints "<name> <semver>" to stdout, exit 0', async () => {
+  // `<invokedName> <semver>+<short-sha>`, following the same
+  // brand-per-name convention as the help banners. The `+<short-sha>`
+  // build suffix is dropped gracefully when not a git checkout.
+  it('prints "<name> <semver>[+<sha>]" to stdout, exit 0', async () => {
     const cap = makeContext();
     const code = await runCli(['--version'], cap.ctx);
     expect(code).toBe(0);
-    // Match `st X.Y.Z` (semver, possibly with pre-release suffix).
-    expect(cap.stdout).toMatch(/^st \d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?\n$/);
+    // `st X.Y.Z` (optional pre-release), optional `+<short-sha>` build.
+    expect(cap.stdout).toMatch(
+      /^st \d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9a-f]+)?\n$/
+    );
     expect(cap.stderr).toBe('');
+  });
+
+  it('includes the +<short-sha> build suffix (running from a git checkout)', async () => {
+    // The test suite runs inside the smalltalk git checkout, so the
+    // build SHA resolves and must be appended as semver build metadata.
+    const cap = makeContext();
+    await runCli(['--version'], cap.ctx);
+    expect(cap.stdout).toMatch(/^st \d+\.\d+\.\d+\+[0-9a-f]{4,}\n$/);
   });
 
   it('reflects _ST_INVOKED_AS in the brand', async () => {
