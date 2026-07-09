@@ -11,7 +11,10 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
-import type { CliContext } from '../../src/cli-context.ts';
+import {
+  type CliContext,
+  StdinReadTimeoutError,
+} from '../../src/cli-context.ts';
 import { parseFrontmatter, validFilename } from '../../src/common.ts';
 import { cmdSend, cmdSendCli, type SendInput } from '../../src/commands/send.ts';
 
@@ -350,6 +353,8 @@ describe('cmdSendCli — -m flag (brief-033)', () => {
   function makeCtx(opts: {
     stdin?: string;
     stdinIsTty?: boolean;
+    /** Simulate the footgun: a stdin read that never EOFs → timeout reject. */
+    stdinTimeout?: boolean;
   } = {}): CliContext & { stdoutBuf: string[] } {
     const stdoutBuf: string[] = [];
     const ctx = {
@@ -358,7 +363,10 @@ describe('cmdSendCli — -m flag (brief-033)', () => {
       stConfig: join(scratch, 'config'),
       stdout: (s: string) => stdoutBuf.push(s),
       stderr: () => {},
-      readStdin: async () => Buffer.from(opts.stdin ?? '', 'utf8'),
+      readStdin: async () => {
+        if (opts.stdinTimeout) throw new StdinReadTimeoutError(10_000);
+        return Buffer.from(opts.stdin ?? '', 'utf8');
+      },
       stdinIsTty: () => opts.stdinIsTty ?? true,
     } as CliContext;
     return Object.assign(ctx, { stdoutBuf });
@@ -410,19 +418,40 @@ describe('cmdSendCli — -m flag (brief-033)', () => {
     expect(parseFrontmatter(content).body).toBe('from stdin\n');
   });
 
-  it('-m AND piped stdin → loud error, no message written', async () => {
+  it('-m wins outright and never reads stdin (even a blocking pipe)', async () => {
     setupIdentity('alice');
     setupIdentity('bob');
-    const ctx = makeCtx({
-      stdin: 'should-not-be-used',
-      stdinIsTty: false,
-    });
-    await expect(
-      cmdSendCli(['bob', '-m', 'inline body'], ctx)
-    ).rejects.toThrow(/-m OR stdin, not both/);
-    const ls = require('node:fs').readdirSync(
-      join(stRoot, 'bob', 'inbox')
+    // stdinTimeout makes readStdin reject — if `-m` wrongly read stdin this
+    // would throw. It must NOT: with `-m`, stdin is never touched (the core
+    // of the footgun fix — an agent's inherited pipe can never hang a send).
+    const ctx = makeCtx({ stdinTimeout: true, stdinIsTty: false });
+    const rc = await cmdSendCli(['bob', '-m', 'inline body'], ctx);
+    expect(rc).toBe(0);
+    const filename = ctx.stdoutBuf.join('').trim();
+    const content = readFileSync(
+      join(stRoot, 'bob', 'inbox', filename),
+      'utf8'
     );
+    expect(parseFrontmatter(content).body).toBe('inline body\n');
+  });
+
+  it('no -m + interactive TTY stdin → clear error, never blocks, no message', async () => {
+    setupIdentity('alice');
+    setupIdentity('bob');
+    const ctx = makeCtx({ stdinIsTty: true });
+    await expect(cmdSendCli(['bob'], ctx)).rejects.toThrow(/no message body/i);
+    const ls = require('node:fs').readdirSync(join(stRoot, 'bob', 'inbox'));
+    expect(ls).toHaveLength(0);
+  });
+
+  it('no -m + piped stdin that never closes → clear timeout error, no message', async () => {
+    setupIdentity('alice');
+    setupIdentity('bob');
+    const ctx = makeCtx({ stdinTimeout: true, stdinIsTty: false });
+    await expect(cmdSendCli(['bob'], ctx)).rejects.toThrow(
+      /timed out reading stdin/i
+    );
+    const ls = require('node:fs').readdirSync(join(stRoot, 'bob', 'inbox'));
     expect(ls).toHaveLength(0);
   });
 
