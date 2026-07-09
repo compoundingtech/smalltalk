@@ -17,9 +17,9 @@ below. That's the right entry point if you're building tooling on
 top of smalltalk rather than being a first-time human user.
 
 > **Naming.** `st` is canonical; `smalltalk` is the long form (same
-> binary); `coord` is a back-compat alias that predates the rename.
-> Older guides and code samples that say `coord` still work. All
-> three names dispatch identically — see `st help` for the surface.
+> binary). The old `coord` CLI alias has been **removed** — older
+> guides and code samples that say `coord` no longer work; use `st`.
+> See `st help` for the surface.
 
 ## Prerequisites
 
@@ -69,8 +69,8 @@ against. Bump the SHA in this doc when the tested set
 advances — a rolling HEAD in these instructions plus a personas
 change means the two can silently drift.
 
-`npm link` publishes the three bin shims — `st`, `smalltalk`, and
-`coord` — as global symlinks. Verify:
+`npm link` publishes the bin shims — `st` and `smalltalk` — as global
+symlinks. Verify:
 
 ```sh
 st --version   # → st X.Y.Z
@@ -100,6 +100,15 @@ need to hand-copy anything unless you're wiring a repo that already
 has a hand-tuned `settings.local.json`.
 
 ## 2. Bring up your CoS
+
+> **⚠️ Being rewritten (convoy migration).** The `st launch` verb this
+> section and sections 3–5 describe has been **removed** — `convoy`
+> now owns agent launch natively (`convoy add <role> --identity <id>
+> [--permanent] [--persona <path>]`, then `convoy up <network>`). The
+> step-by-step below still references `st launch` and its persona-path
+> conventions and is pending a full convoy rewrite; use `convoy add`
+> to spawn a CoS until this section is updated. (The [Bus basics](#bus-basics-hand-wiring-an-identity)
+> section below — the non-CoS, hand-wired path — is current.)
 
 Your Chief of Staff is a Claude Code agent scoped to a private repo
 that holds your identity, priorities, and working state.
@@ -334,7 +343,7 @@ Reserved words are rejected: `inbox`, `archive`, `status`, `name`,
 `overview`.
 
 ```sh
-export ST_AGENT=alice   # or legacy ST_IDENTITY / COORD_IDENTITY
+export ST_AGENT=alice   # or the deprecated ST_IDENTITY
 ```
 
 ### Create the identity folder
@@ -345,7 +354,7 @@ st status --set available
 
 That single command lazy-creates `$ST_ROOT/alice/{inbox,archive}` and
 writes `available` to the status file. You're now visible to peers
-as a member of the network. Verify with `st members`.
+as a member of the network. Verify with `st agents`.
 
 ### Send and receive a message
 
@@ -359,7 +368,7 @@ ST_AGENT=<peer> st message archive <filename>
 ### Wire MCP for an agent
 
 If you're setting up an agent (Claude Code, Codex, or any MCP host)
-and NOT using `st launch`, register smalltalk as an MCP server in
+by hand (not via `convoy`), register smalltalk as an MCP server in
 the agent's working repo:
 
 ```sh
@@ -394,10 +403,10 @@ st sync pull --all
   authenticate to, no broker to configure.
 - **No schema registration.** New message types are just YAML
   frontmatter; readers tolerate fields they don't know.
-- **No identity provisioning ceremony.** `st launch` (with a CoS) or
+- **No identity provisioning ceremony.** `convoy add` (with a CoS) or
   `st status --set available` (bare) is the whole provisioning step.
   No password, no key, no token.
-- **No roster file.** `st members` walks `$ST_ROOT` and enumerates
+- **No roster file.** `st agents` walks `$ST_ROOT` and enumerates
   everyone present.
 
 ## Where to next
@@ -419,8 +428,8 @@ st sync pull --all
 - **`st` isn't on `$PATH` after `npm link`:** run `npm bin -g` to
   find where global npm shims live; add that dir to your `$PATH`
   in `~/.zshrc` / `~/.bashrc` and reopen the shell.
-- **`st members` doesn't show you:** confirm `ST_AGENT` (or legacy
-  `ST_IDENTITY` / `COORD_IDENTITY`) is set, and that you ran `st
+- **`st agents` doesn't show you:** confirm `ST_AGENT` (or the
+  deprecated `ST_IDENTITY`) is set, and that you ran `st
   status --set available` at least once — the identity folder is
   created lazily.
 - **`unknown` status next to your name:** you wrote status more

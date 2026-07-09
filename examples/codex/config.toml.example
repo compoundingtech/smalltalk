@@ -1,8 +1,8 @@
-# ~/.codex/config.toml — coord integration (reference fragment)
+# ~/.codex/config.toml — smalltalk integration (reference fragment)
 #
 # Merge these blocks into your existing ~/.codex/config.toml. The
 # session-start.sh and stop.sh scripts must be on disk somewhere
-# Codex can reach (the snippet below assumes you cloned coord and
+# Codex can reach (the snippet below assumes you cloned smalltalk and
 # kept the scripts in place; copy them anywhere you like and adjust
 # the `command` paths).
 
@@ -10,36 +10,36 @@
 [features]
 codex_hooks = true
 
-# Register `coord mcp` as an MCP server so Codex has the verbs
-# (coord_msg_send, coord_msg_ls, coord_msg_read, coord_msg_archive,
-# coord_msg_thread).
-# COORD_ROOT and COORD_IDENTITY come from the parent shell — Codex
+# Register `st mcp` as an MCP server so Codex has the verbs
+# (st_msg_send, st_msg_ls, st_msg_read, st_msg_archive,
+# st_msg_thread).
+# ST_ROOT and ST_AGENT come from the parent shell — Codex
 # passes them through via env_vars below.
-[mcp_servers.coord]
-command = "coord"
+[mcp_servers.smalltalk]
+command = "st"
 args = ["mcp"]
-env_vars = ["COORD_ROOT", "COORD_IDENTITY"]
+env_vars = ["ST_ROOT", "ST_AGENT"]
 
-# SessionStart hook: inject the unread-coord-inbox snapshot into
+# SessionStart hook: inject the unread-inbox snapshot into
 # context as the agent boots.
 [[hooks.SessionStart]]
 [[hooks.SessionStart.hooks]]
 type = "command"
-command = "/full/path/to/coord/examples/codex/session-start.sh"
+command = "/full/path/to/smalltalk/examples/codex/session-start.sh"
 timeout = 5
 
 # Stop hook: re-check the inbox before the agent goes idle. Only
 # emits if NEW messages arrived since the last Stop (state lives
-# at $XDG_STATE_HOME/coord-codex-hooks/last-checked.txt).
+# at $XDG_STATE_HOME/st-codex-hooks/last-checked.txt).
 [[hooks.Stop]]
 [[hooks.Stop.hooks]]
 type = "command"
-command = "/full/path/to/coord/examples/codex/stop.sh"
+command = "/full/path/to/smalltalk/examples/codex/stop.sh"
 timeout = 5
 
 # Notes:
-#   - Both scripts require `coord` and `jq` on PATH.
-#   - If the script fails (missing env, coord not on PATH), it exits
+#   - Both scripts require `st` and `jq` on PATH.
+#   - If the script fails (missing env, st not on PATH), it exits
 #     non-zero with a stderr message; Codex's hook timeout settings
 #     decide whether the session continues.
 #   - For real-time push (notifications when a peer sends to your

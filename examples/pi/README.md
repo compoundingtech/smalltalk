@@ -6,14 +6,14 @@ A reference TypeScript extension that integrates smalltalk into [pi (badlogic/pi
 > copies (pi discovers by filename). New installs may name the file
 > anything; `smalltalk.ts` is equally fine. The embeddable package it
 > imports is still `@myobie/coord` (npm-package rename pending). Env
-> vars follow the standard three-level chain: `ST_AGENT` → `ST_IDENTITY`
-> → `COORD_IDENTITY` (legacy honored with a one-time stderr notice).
+> vars follow the CLI chain: `ST_AGENT` → `ST_IDENTITY` (the deprecated
+> `ST_IDENTITY` warns once per process).
 
 ## What's in here
 
 - **`coord.ts`** — the extension. Two halves:
   1. **Push** — subscribes to `session_start`, watches `$ST_ROOT/$ST_AGENT/inbox/` (legacy `$COORD_ROOT/$COORD_IDENTITY/` also honored), plus every peer's tree, and surfaces every new arrival via `ctx.ui.notify`. A footer status line shows the watched inbox.
-  2. **Verbs** — registers `st_msg_send` / `coord_msg_send`, `st_msg_ls` / `coord_msg_ls`, `st_msg_read` / `coord_msg_read`, `st_msg_archive` / `coord_msg_archive`, `st_msg_thread` / `coord_msg_thread` via `pi.registerTool()`. Same shape as the MCP-tool surface other harnesses get; pi-native because pi explicitly [does not support MCP](https://github.com/badlogic/pi-mono/blob/main/packages/coding-agent/README.md).
+  2. **Verbs** — registers `st_msg_send`, `st_msg_ls`, `st_msg_read`, `st_msg_archive`, `st_msg_thread` via `pi.registerTool()`. Same shape as the MCP-tool surface other harnesses get; pi-native because pi explicitly [does not support MCP](https://github.com/badlogic/pi-mono/blob/main/packages/coding-agent/README.md).
 - **`settings.example.json`** — optional fragment for `~/.pi/agent/settings.json`. Pi auto-discovers extensions, so this is mostly informational.
 
 ## Install
@@ -40,7 +40,7 @@ The extension imports `@myobie/coord`, so pi needs to resolve it from a `node_mo
    ```
 
    The pi extension docs cover this pattern: <https://github.com/badlogic/pi-mono/blob/main/packages/coding-agent/docs/extensions.md#available-imports>.
-3. Make sure `st` (or the `coord` alias) is on `$PATH`. The extension uses the embeddable library, but the watcher's `st watch` semantics rely on the same on-disk layout the CLI maintains, and you'll likely want the CLI for one-off invocations from pi's bash tool too.
+3. Make sure `st` is on `$PATH`. The extension uses the embeddable library, but the watcher's `st watch` semantics rely on the same on-disk layout the CLI maintains, and you'll likely want the CLI for one-off invocations from pi's bash tool too.
 4. Export `ST_ROOT` and `ST_AGENT` (or the legacy `COORD_ROOT` / `COORD_IDENTITY`) in the shell that launches `pi`. The extension reads them from `process.env` at session start; missing values surface as a `ctx.ui.notify` warning and the extension goes idle without the watcher or the verbs.
 5. Restart pi or run `/reload`.
 
@@ -48,7 +48,7 @@ The extension imports `@myobie/coord`, so pi needs to resolve it from a `node_mo
 
 - **At session start**: a notification telling you which inbox is being watched, plus a footer status line.
 - **On every peer arrival**: another notification with the sender + subject. Self-sends (your own inbox) are suppressed.
-- **Verbs**: `st_msg_send` / `coord_msg_send`, `st_msg_ls` / `coord_msg_ls` (with optional `withMeta` for parsed frontmatter), `st_msg_read` / `coord_msg_read`, `st_msg_archive` / `coord_msg_archive`, `st_msg_thread` / `coord_msg_thread`. The agent calls them like any built-in tool; results render via pi's standard tool-result UI.
+- **Verbs**: `st_msg_send`, `st_msg_ls` (with optional `withMeta` for parsed frontmatter), `st_msg_read`, `st_msg_archive`, `st_msg_thread`. The agent calls them like any built-in tool; results render via pi's standard tool-result UI.
 
 ## What's different vs. Claude Code / Codex
 

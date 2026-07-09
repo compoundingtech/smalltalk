@@ -6,8 +6,8 @@ boot ritual and rehydrates durable working-state on every cold start /
 resume / `/clear` / `/compact`, a `PreCompact` hook that stubs
 `context/now.md` right before compaction so boot-rehydrate has
 something to inject, and a `StopFailure` hook that surfaces API-error
-wedges to myobie via smalltalk so a quiet, wedged session doesn't go
-unnoticed.
+wedges to the operator via smalltalk so a quiet, wedged session doesn't
+go unnoticed.
 
 ## What's in here
 
@@ -35,8 +35,8 @@ unnoticed.
 
 ## brief-024 hook-legs (SessionStart rehydrate + PreCompact flush)
 
-Together with the `coord context read/write/append` verbs and the
-`~/.local/state/coord/<agent>/context/` folder that brief-024 v1
+Together with the `st context read/write/append` verbs and the
+`$ST_ROOT/<agent>/context/` folder that brief-024 v1
 shipped, these two hooks close the **lossless-restart** loop for the
 in-context-state leg:
 
@@ -47,9 +47,9 @@ in-context-state leg:
 
 2. **Just before compaction**, `pre-compact.sh` fires. If the model
    flushed recently (default: within 5 min, tunable via
-   `$COORD_PRECOMPACT_FRESH_S`), it leaves `now.md` alone. Otherwise
+   `$ST_PRECOMPACT_FRESH_S`), it leaves `now.md` alone. Otherwise
    it writes a "compaction fired without a recent flush" stub via
-   `coord context write` — atomic tmp+rename, so a concurrent read
+   `st context write` — atomic tmp+rename, so a concurrent read
    never sees a partial file. **exit 0 always**; errors go to
    `context/.flush-errors.log`, never stderr, because a hook that
    writes to stderr on the `PreCompact` boundary would inject noise
@@ -58,8 +58,8 @@ in-context-state leg:
 3. **On session start** (fresh, `--resume`, `/clear`, `/compact`),
    `session-start.sh` reads `context/now.md`. If present and
    *fresh* (default staleness: 24h, tunable via
-   `$COORD_REHYDRATE_STALE_S`), it injects the file as a `<context
-   source="coord/context/now.md" agent="…">…</context>` block into the
+   `$ST_REHYDRATE_STALE_S`), it injects the file as a `<context
+   source="st/context/now.md" agent="…">…</context>` block into the
    agent's stderr — Claude Code surfaces stderr as a system reminder
    under `asyncRewake: true`, so the injected block lands as the first
    thing the model sees. Then the boot-ritual reminder follows. When
@@ -82,10 +82,8 @@ compaction still leaves a machine-readable trace, not so writing
 
 Channel mode (`st mcp --channel`) handles **new arrivals during a
 session**: the chokidar watcher emits `notifications/claude/channel`
-frames and the SDK surfaces them as `<channel source="coord" …>`
-blocks in the agent's context, triggering a turn. (The `source="coord"`
-attribute is kept through the rename window for back-compat with
-downstream parsers; the Phase 5 cleanup flips it to `source="st"`.)
+frames and the SDK surfaces them as `<channel source="st" …>`
+blocks in the agent's context, triggering a turn.
 
 What it doesn't handle is **start-of-session**. When Claude Code boots
 fresh, or resumes a saved conversation (`--resume`, `--continue`,
@@ -149,11 +147,10 @@ state from the first turn.
 
 3. (If you're using channel mode for push, which you probably are:)
    make sure Claude Code is launched with
-   `--dangerously-load-development-channels server:coord` so the
-   `<channel source="coord">` blocks surface as visible turns. The
-   `server:coord` token is the MCP server's announced name when
-   invoked via `bin/coord`; Phase 5 of the rename flips it to
-   `server:st`. `experimental.channelsEnabled: true` in Claude Code's
+   `--dangerously-load-development-channels server:st` so the
+   `<channel source="st">` blocks surface as visible turns. The
+   `server:st` token is the MCP server's announced name.
+   `experimental.channelsEnabled: true` in Claude Code's
    settings is the durable form of the same opt-in.
 
 ## How it relates to channel mode
@@ -181,22 +178,22 @@ get the "all-quiet-Anthropic-capacity-wedge" failure: nobody notices
 for hours.
 
 `hooks/stop-failure.sh` closes that gap **without** auto-restarting —
-myobie's explicit call is "just visibility, not automation." The hook
+the operator's explicit call is "just visibility, not automation." The hook
 reads the JSON envelope Claude Code pipes on stdin, parses
 `error_type` via jq, and applies a tuned policy:
 
 | `error_type`                                  | What the hook does                                                                                                          |
 | --------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------|
 | `rate_limit`                                  | `st status <id> --set away`. **No** ding (transient — would spam during Anthropic capacity events).                         |
-| `server_error`                                | `st status <id> --set away` + standard-priority `st message send myobie` notice.                                            |
-| `authentication_failed`                       | `st status <id> --set offline` + **high-priority** `st message send myobie` (needs human intervention).                     |
+| `server_error`                                | `st status <id> --set away` + standard-priority `st message send operator` notice.                                          |
+| `authentication_failed`                       | `st status <id> --set offline` + **high-priority** `st message send operator` (needs human intervention).                   |
 | `oauth_org_not_allowed`                       | Same as `authentication_failed`.                                                                                            |
 | `billing_error`                               | `st status <id> --set offline` + high-priority "billing issue" notice.                                                      |
 | `max_output_tokens`, `invalid_request`, `model_not_found` | **Ignored.** Programmer error / long-turn config issue — not infrastructure; the agent owns recovery.           |
 | anything else (incl. literal `unknown`)       | `st status <id> --set away` + standard-priority notice with the `error_type` verbatim, so we extend the table after triage. |
 
 The script reads the agent's identity from `$ST_AGENT` (or the legacy
-`$ST_IDENTITY` / `$COORD_IDENTITY` fallbacks), which should be set in
+`$ST_IDENTITY` fallback), which should be set in
 the session env (e.g. for a pty-supervised Claude Code session, set
 it in `pty.toml`'s `[sessions.claude.env]` block).
 
