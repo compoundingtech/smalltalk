@@ -81,6 +81,28 @@ export interface PtySender {
   ): Promise<{ status: number; stderr: string }>;
 }
 
+/** Test seam: how the typing-aware guard reads the target pane.
+ *  Production binds to `pty peek --plain <session>` (plain text, no
+ *  ANSI). Used to frame-diff the pane before a poke — see
+ *  {@link isPaneBusy}. */
+export interface PtyPeeker {
+  (
+    sessionName: string
+  ): Promise<{ status: number; stdout: string; stderr: string }>;
+}
+
+/** Test seam: bracketed-paste text into the target pane WITHOUT
+ *  submitting. Production binds to `pty send <session> --paste <text>`.
+ *  Used by the walked-away-mid-type path to preserve a human's
+ *  in-progress input (append a newline + the ding, then submit) so no
+ *  typed text is clobbered. See {@link preserveDeliver}. */
+export interface PtyPaster {
+  (
+    sessionName: string,
+    text: string
+  ): Promise<{ status: number; stderr: string }>;
+}
+
 /** Test seam: how the daemon checks whether the target session is
  *  alive. Production reads `<PTY_SESSION_DIR>/<session>.pid` and
  *  probes the PID with `process.kill(pid, 0)`. */
@@ -159,6 +181,66 @@ export interface DingDeps {
    */
   rescanQuietAfterDeliveryMs?: number;
   /**
+   * brief-036 (typing-aware ding): test seam for reading the target
+   * pane. Production binds to `pty peek --plain <session>`. When the
+   * guard is enabled and a message isn't urgent, the daemon peeks the
+   * pane before poking; if it's active (frames differ, or the input
+   * line has un-submitted text) it holds and retries rather than
+   * interrupting a mid-type human.
+   */
+  ptyPeek?: PtyPeeker;
+  /**
+   * brief-036: master toggle for the typing-aware guard. Default true.
+   * When false the daemon delivers on arrival (the pre-brief-036
+   * behavior). Env: `ST_DING_PANE_GUARD=0`.
+   */
+  paneGuard?: boolean;
+  /**
+   * brief-036: gap (ms) between the two `pty peek` frames used to
+   * detect activity. Default {@link DEFAULT_PEEK_DIFF_MS} (300ms).
+   * Env: `ST_DING_PEEK_DIFF_MS`.
+   */
+  peekDiffMs?: number;
+  /**
+   * brief-036: how long (ms) to hold a busy pane before re-checking.
+   * Default {@link DEFAULT_HOLD_RETRY_MS} (20s). Env:
+   * `ST_DING_HOLD_RETRY_MS`.
+   */
+  holdRetryMs?: number;
+  /**
+   * brief-036: max times to hold for a busy pane before force-
+   * delivering anyway (never drop). Default {@link DEFAULT_MAX_HOLDS}
+   * (3) → ~60s worst-case hold. Env: `ST_DING_MAX_HOLDS`.
+   */
+  maxHolds?: number;
+  /**
+   * brief-036: also treat the pane as busy when its last non-blank
+   * line looks like a prompt with un-submitted text (the "typed then
+   * paused" case that frame-diff alone misses). Best-effort +
+   * per-harness-tunable. Default true; env `ST_DING_INPUT_GUARD=0`.
+   */
+  inputGuard?: boolean;
+  /**
+   * brief-036: pattern matched against the pane's last non-blank line
+   * for the input-area check. Default {@link DEFAULT_INPUT_PATTERN}
+   * (a prompt glyph followed by text). Env: `ST_DING_INPUT_PATTERN`
+   * (a regex source string).
+   */
+  inputPattern?: RegExp;
+  /**
+   * brief-036 refinement: consecutive unchanged-input retries before a
+   * non-empty input line is treated as walked-away-mid-type and
+   * preserve-delivered. Default {@link DEFAULT_INPUT_STALE_MAX} (3).
+   * Env: `ST_DING_INPUT_STALE_MAX`.
+   */
+  inputStaleMax?: number;
+  /**
+   * brief-036 refinement: test seam for the bracketed-paste primitive
+   * used by preserve-and-deliver. Production binds to
+   * `pty send <session> --paste <text>`.
+   */
+  ptyPaste?: PtyPaster;
+  /**
    * When true, emit verbose `[st ding debug]` lines to stderr:
    *   - per-rescan-tick summary (inbox / in-flight / quiet-skipped
    *     / attempted counts)
@@ -187,6 +269,38 @@ interface BufferedEvent {
    * loop. Undefined = first attempt.
    */
   retries?: number;
+  /**
+   * brief-036: how many times this event has been HELD for a busy
+   * pane (typing-aware guard). Distinct from {@link retries} (transient
+   * pty failures). At `maxHolds` we force-deliver — a held message is
+   * never dropped. Undefined = never held.
+   */
+  holds?: number;
+  /**
+   * brief-036: don't re-attempt a held event before this `msNow()`
+   * value. Set to `now + holdRetryMs` on each hold so the ~20s retry
+   * cadence rides the existing 1s flush timer without a second timer.
+   */
+  notBefore?: number;
+  /**
+   * brief-036: message priority from frontmatter. `high` = urgent →
+   * skip the pane guard and deliver immediately.
+   */
+  priority?: string;
+  /**
+   * brief-036 refinement: the pane's input-line text observed on the
+   * previous hold, used to tell "actively typing" (text changes across
+   * retries) from "walked away mid-type" (text stays UNCHANGED). Only
+   * set while an un-submitted input line is present.
+   */
+  lastInputText?: string;
+  /**
+   * brief-036 refinement: consecutive retries the input line has been
+   * present AND unchanged. At `inputStaleMax` we treat it as
+   * walked-away and preserve-and-deliver (newlines + ding + submit)
+   * rather than holding forever or clobbering the typed text.
+   */
+  inputStaleCount?: number;
 }
 
 /**
@@ -248,6 +362,34 @@ const DEFAULT_RESCAN_INTERVAL_MS = 60_000;
 const DEFAULT_RESCAN_QUIET_AFTER_DELIVERY_MS = 90_000;
 
 /**
+ * brief-036 (typing-aware ding) defaults. The guard peeks the target
+ * pane twice `DEFAULT_PEEK_DIFF_MS` apart; if the frames differ (active
+ * typing/output) or the input line has un-submitted text, it holds the
+ * poke and retries every `DEFAULT_HOLD_RETRY_MS`, up to
+ * `DEFAULT_MAX_HOLDS` times, then force-delivers (never drops). Urgent
+ * (`priority: high`) messages skip the guard. ~60s worst-case hold at
+ * the defaults. All env-overridable in `cmdDingCli`.
+ */
+const DEFAULT_PEEK_DIFF_MS = 300;
+const DEFAULT_HOLD_RETRY_MS = 20_000;
+const DEFAULT_MAX_HOLDS = 3;
+/**
+ * Input-area busy heuristic: the pane's last non-blank line matches
+ * this when it holds a prompt glyph (`>`/`❯`/`›`/`$`/`#`) followed by
+ * at least one non-space char — i.e. text typed but not yet submitted.
+ * Best-effort + per-harness-tunable via `ST_DING_INPUT_PATTERN`; an
+ * empty prompt (`> `) does not match.
+ */
+const DEFAULT_INPUT_PATTERN = /[>❯›$#][ \t]*\S/;
+/**
+ * brief-036 refinement: how many consecutive retries an un-submitted
+ * input line must stay UNCHANGED before we treat it as "walked away
+ * mid-type" and preserve-and-deliver (rather than holding forever for
+ * a human who isn't coming back). Env: `ST_DING_INPUT_STALE_MAX`.
+ */
+const DEFAULT_INPUT_STALE_MAX = 3;
+
+/**
  * Run the ding daemon. Resolves when the AbortSignal aborts (or
  * when the upstream watcher exits, which only happens on signal in
  * normal operation). Production callers from `cmdDingCli` expect
@@ -293,6 +435,137 @@ export async function runDing(deps: DingDeps): Promise<void> {
     sendChain = p.catch(() => undefined);
     return p;
   };
+
+  // brief-036: typing-aware pane guard config. Env-overridable in
+  // cmdDingCli; deps override for tests.
+  const peek = deps.ptyPeek ?? defaultPtyPeek;
+  const paste = deps.ptyPaste ?? defaultPtyPaste;
+  const paneGuardOn = deps.paneGuard ?? true;
+  const peekDiffMs = deps.peekDiffMs ?? DEFAULT_PEEK_DIFF_MS;
+  const holdRetryMs = deps.holdRetryMs ?? DEFAULT_HOLD_RETRY_MS;
+  const maxHolds = deps.maxHolds ?? DEFAULT_MAX_HOLDS;
+  const inputGuardOn = deps.inputGuard ?? true;
+  const inputPattern = deps.inputPattern ?? DEFAULT_INPUT_PATTERN;
+  const inputStaleMax = deps.inputStaleMax ?? DEFAULT_INPUT_STALE_MAX;
+
+  // Outcome of a guarded delivery attempt. `held` carries the tracking
+  // state the caller must persist on the requeued event so the next
+  // retry can tell "still typing" from "walked away".
+  type GuardOutcome =
+    | { kind: 'delivered' }
+    | { kind: 'failed' }
+    | { kind: 'held'; inputText: string; staleCount: number };
+
+  async function normalDeliver(ev: BufferedEvent): Promise<GuardOutcome> {
+    const ok = await deliver(send, deps.ptySession, ev, log);
+    return ok ? { kind: 'delivered' } : { kind: 'failed' };
+  }
+
+  /**
+   * brief-036 refinement: deliver WITHOUT clobbering the human's
+   * un-submitted input. Bracketed-paste a leading newline + the ding
+   * (appended after their cursor text — nothing submits yet), then
+   * submit, so the turn is "<their text>\n[DING] …" and nothing typed
+   * is lost. (The exact "insert newline without submit" keystrokes are
+   * pending confirmation on a live Claude Code pane — isolated here so
+   * that's a one-function change.)
+   */
+  async function preserveDeliver(ev: BufferedEvent): Promise<GuardOutcome> {
+    const dingText = buildDingText(ev);
+    let pasteRes: { status: number; stderr: string };
+    try {
+      pasteRes = await paste(deps.ptySession, `\n${dingText}`);
+    } catch (err) {
+      log(`st ding: preserve-deliver paste failed: ${errMsg(err)}\n`);
+      return { kind: 'failed' };
+    }
+    if (pasteRes.status !== 0) {
+      const tail = pasteRes.stderr.trim().slice(-200);
+      log(
+        `st ding: preserve-deliver paste to "${deps.ptySession}" exited ${pasteRes.status}${
+          tail ? `: ${tail}` : ''
+        }\n`
+      );
+      return { kind: 'failed' };
+    }
+    // Submit the whole buffer (their text + the pasted ding).
+    let submitRes: { status: number; stderr: string };
+    try {
+      submitRes = await send(deps.ptySession, ['key:return']);
+    } catch (err) {
+      log(`st ding: preserve-deliver submit failed: ${errMsg(err)}\n`);
+      return { kind: 'failed' };
+    }
+    if (submitRes.status !== 0) {
+      log(
+        `st ding: preserve-deliver submit to "${deps.ptySession}" exited ${submitRes.status}\n`
+      );
+      return { kind: 'failed' };
+    }
+    dbg(`preserve-delivered ${ev.filename} (kept un-submitted input)`);
+    return { kind: 'delivered' };
+  }
+
+  /**
+   * brief-036: decide whether to deliver, hold, or preserve-and-deliver.
+   *   - urgent (priority high) or guard off → deliver now, no peek.
+   *   - empty input + frame changing → hold (active output/typing).
+   *   - empty input + static (or hold cap) → deliver.
+   *   - un-submitted input CHANGING across retries → actively typing →
+   *     hold (don't interrupt).
+   *   - un-submitted input UNCHANGED for `inputStaleMax` retries (or at
+   *     the hold cap) → walked-away-mid-type → preserve-and-deliver.
+   * A peek failure → deliver (never block on a peek problem).
+   */
+  async function guardedDeliver(ev: BufferedEvent): Promise<GuardOutcome> {
+    const holds = ev.holds ?? 0;
+    const urgent = ev.priority === 'high';
+    if (urgent || !paneGuardOn) {
+      if (urgent && paneGuardOn) {
+        dbg(`urgent (priority=high) → skipping pane guard for ${ev.filename}`);
+      }
+      return normalDeliver(ev);
+    }
+
+    const forceCap = holds >= maxHolds;
+    const a = await assessPane(peek, deps.ptySession, { diffMs: peekDiffMs });
+    if (!a.ok) return normalDeliver(ev); // peek failed → deliver
+
+    const inputText =
+      inputGuardOn && hasInputText(a.inputLine, inputPattern) ? a.inputLine : '';
+    const hasInput = inputText !== '';
+
+    // No un-submitted text to protect.
+    if (!hasInput) {
+      if (a.frameChanged && !forceCap) {
+        dbg(`frame changing → holding ${ev.filename} (hold ${holds + 1}/${maxHolds})`);
+        return { kind: 'held', inputText: '', staleCount: 0 };
+      }
+      return normalDeliver(ev); // static idle, or hold-cap backstop
+    }
+
+    // Un-submitted input present. Changing across retries → actively
+    // typing (hold); unchanged → the human walked away (preserve).
+    const changed =
+      a.frameChanged ||
+      ev.lastInputText === undefined ||
+      ev.lastInputText !== inputText;
+    if (changed) {
+      if (forceCap) {
+        dbg(`hold cap w/ un-submitted input → preserve-deliver ${ev.filename}`);
+        return preserveDeliver(ev);
+      }
+      dbg(`input changing (typing) → holding ${ev.filename} (hold ${holds + 1}/${maxHolds})`);
+      return { kind: 'held', inputText, staleCount: 1 };
+    }
+    const staleCount = (ev.inputStaleCount ?? 1) + 1;
+    if (forceCap || staleCount >= inputStaleMax) {
+      dbg(`input stale ${staleCount}/${inputStaleMax} → walked away, preserve-deliver ${ev.filename}`);
+      return preserveDeliver(ev);
+    }
+    dbg(`input unchanged ${staleCount}/${inputStaleMax} → holding ${ev.filename}`);
+    return { kind: 'held', inputText, staleCount };
+  }
 
   // brief-031 amendment: an internal AbortController so the
   // session-watch tick can end runDing on its own (target session
@@ -596,11 +869,30 @@ export async function runDing(deps: DingDeps): Promise<void> {
       // Drain in chronological insertion order. On a `deliver` failure,
       // requeue at the HEAD with an incremented retry count so we
       // retry-then-move-on rather than blocking newer arrivals behind
-      // a broken target. Capped by MAX_DELIVER_RETRIES.
+      // a broken target. Capped by MAX_DELIVER_RETRIES. brief-036:
+      // events held for a busy pane carry a `notBefore` — not-yet-due
+      // ones are deferred (re-checked on a later tick), and a fresh
+      // hold is requeued with an incremented `holds` count until the
+      // cap forces delivery (never dropped).
+      const deferred: BufferedEvent[] = [];
       while (buffer.length > 0) {
         const ev = buffer.shift()!;
-        const ok = await deliver(send, deps.ptySession, ev, log);
-        if (!ok) {
+        if (ev.notBefore !== undefined && ev.notBefore > msNow()) {
+          deferred.push(ev); // still inside its hold window
+          continue;
+        }
+        const outcome = await guardedDeliver(ev);
+        if (outcome.kind === 'held') {
+          deferred.push({
+            ...ev,
+            holds: (ev.holds ?? 0) + 1,
+            notBefore: msNow() + holdRetryMs,
+            lastInputText: outcome.inputText,
+            inputStaleCount: outcome.staleCount,
+          });
+          continue;
+        }
+        if (outcome.kind === 'failed') {
           const retries = (ev.retries ?? 0) + 1;
           if (retries >= MAX_DELIVER_RETRIES) {
             log(
@@ -617,6 +909,9 @@ export async function runDing(deps: DingDeps): Promise<void> {
         }
         deliveredAt.set(ev.filename, msNow());
       }
+      // Re-queue any held/not-yet-due events; the flush timer stays
+      // armed while the buffer is non-empty, so they get re-checked.
+      if (deferred.length > 0) buffer.push(...deferred);
       if (buffer.length === 0 && readPending.length === 0) {
         disarmTimer();
       }
@@ -673,11 +968,24 @@ export async function runDing(deps: DingDeps): Promise<void> {
       ensureTimerArmed();
       return;
     }
-    // Direct delivery path — retry on failure by pushing back into
-    // the buffer (arms the flush timer). Same MAX_DELIVER_RETRIES cap
-    // as the flush-loop drain.
-    const ok = await deliver(send, deps.ptySession, event, log);
-    if (!ok) {
+    // Direct delivery path — brief-036: gate through the pane guard.
+    // On 'held' (busy pane) requeue with an incremented hold count + a
+    // notBefore; on 'fail' retry via `retries` (same MAX_DELIVER_RETRIES
+    // cap as the flush-loop drain). Either way the flush timer
+    // re-attempts.
+    const outcome = await guardedDeliver(event);
+    if (outcome.kind === 'held') {
+      buffer.push({
+        ...event,
+        holds: (event.holds ?? 0) + 1,
+        notBefore: msNow() + holdRetryMs,
+        lastInputText: outcome.inputText,
+        inputStaleCount: outcome.staleCount,
+      });
+      ensureTimerArmed();
+      return;
+    }
+    if (outcome.kind === 'failed') {
       const retries = (event.retries ?? 0) + 1;
       if (retries >= MAX_DELIVER_RETRIES) {
         log(
@@ -1000,6 +1308,7 @@ async function buildEvent(
     filename,
     from: r.message.from,
     ...(r.message.subject !== undefined && { subject: r.message.subject }),
+    ...(r.message.priority !== undefined && { priority: r.message.priority }),
   };
 }
 
@@ -1021,11 +1330,14 @@ async function buildEvent(
  * this is user-visible bus traffic and matches the CLI the agent
  * uses to act on it (`st message …`).
  */
-function buildSequences(ev: BufferedEvent): string[] {
+function buildDingText(ev: BufferedEvent): string {
   const subject = ev.subject ?? '(no subject)';
   const from = ev.from === '' ? 'unknown' : ev.from;
-  const text = `[DING] new smalltalk message: ${subject} (from ${from}); check your inbox`;
-  return [text, 'key:return'];
+  return `[DING] new smalltalk message: ${subject} (from ${from}); check your inbox`;
+}
+
+function buildSequences(ev: BufferedEvent): string[] {
+  return [buildDingText(ev), 'key:return'];
 }
 
 async function deliver(
@@ -1106,6 +1418,131 @@ const defaultPtySend: PtySender = (sessionName, sequences) =>
 function errMsg(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
+
+// ─── brief-036: typing-aware pane guard ─────────────────────────────────
+
+/** Sleep helper for the frame-diff gap. */
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Read the target pane as plain text via the injected peeker. Returns
+ * the screen string, or null if the peek failed (non-zero exit or a
+ * throw) — callers treat a failed peek as "not busy" so a peek problem
+ * never blocks (or drops) a delivery.
+ */
+async function peekPlain(
+  peek: PtyPeeker,
+  sessionName: string
+): Promise<string | null> {
+  try {
+    const r = await peek(sessionName);
+    if (r.status !== 0) return null;
+    return r.stdout;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The pane's last non-blank line (trailing whitespace trimmed), or ''
+ * when the screen is entirely blank. This is where a TUI renders its
+ * input/prompt line — the text we track to tell active typing from a
+ * walked-away-mid-type pane.
+ */
+function lastNonBlankLine(screen: string): string {
+  const lines = screen.split('\n');
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const line = lines[i]!.replace(/\s+$/, '');
+    if (line !== '') return line;
+  }
+  return '';
+}
+
+/**
+ * True when `line` looks like a prompt holding un-submitted text (see
+ * {@link DEFAULT_INPUT_PATTERN}) — an empty prompt (`> `) does not
+ * match.
+ */
+function hasInputText(line: string, pattern: RegExp): boolean {
+  return pattern.test(line);
+}
+
+/**
+ * brief-036: sample the pane. Peeks twice `diffMs` apart and reports
+ * whether the whole frame changed (active output/typing) plus the
+ * current input line (last non-blank line). A failed peek → `ok:false`
+ * so callers lean toward delivering (never block on a peek problem).
+ */
+async function assessPane(
+  peek: PtyPeeker,
+  sessionName: string,
+  opts: { diffMs: number }
+): Promise<{ ok: boolean; frameChanged: boolean; inputLine: string }> {
+  const first = await peekPlain(peek, sessionName);
+  if (first === null) return { ok: false, frameChanged: false, inputLine: '' };
+  await sleep(opts.diffMs);
+  const second = await peekPlain(peek, sessionName);
+  if (second === null) {
+    return { ok: false, frameChanged: false, inputLine: '' };
+  }
+  return {
+    ok: true,
+    frameChanged: first !== second,
+    inputLine: lastNonBlankLine(second),
+  };
+}
+
+const defaultPtyPeek: PtyPeeker = (sessionName) =>
+  new Promise((resolve) => {
+    let proc: ReturnType<typeof spawn>;
+    try {
+      proc = spawn('pty', ['peek', '--plain', sessionName], {
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+    } catch (err) {
+      resolve({ status: -1, stdout: '', stderr: errMsg(err) });
+      return;
+    }
+    let stdout = '';
+    let stderr = '';
+    proc.stdout?.on('data', (chunk: Buffer) => {
+      stdout += chunk.toString('utf8');
+    });
+    proc.stderr?.on('data', (chunk: Buffer) => {
+      stderr += chunk.toString('utf8');
+    });
+    proc.once('error', (err) => {
+      resolve({ status: -1, stdout, stderr: err.message });
+    });
+    proc.once('close', (status) => {
+      resolve({ status: status ?? -1, stdout, stderr });
+    });
+  });
+
+const defaultPtyPaste: PtyPaster = (sessionName, text) =>
+  new Promise((resolve) => {
+    let proc: ReturnType<typeof spawn>;
+    try {
+      proc = spawn('pty', ['send', sessionName, '--paste', text], {
+        stdio: ['ignore', 'ignore', 'pipe'],
+      });
+    } catch (err) {
+      resolve({ status: -1, stderr: errMsg(err) });
+      return;
+    }
+    let stderr = '';
+    proc.stderr?.on('data', (chunk: Buffer) => {
+      stderr += chunk.toString('utf8');
+    });
+    proc.once('error', (err) => {
+      resolve({ status: -1, stderr: err.message });
+    });
+    proc.once('close', (status) => {
+      resolve({ status: status ?? -1, stderr });
+    });
+  });
 
 // ─── CLI wrapper ────────────────────────────────────────────────────────
 
@@ -1209,7 +1646,33 @@ export async function cmdDingCli(
             '                                   (inbox / in-flight-skipped / quiet-\n' +
             '                                   skipped / attempted), and every pty send\n' +
             '                                   attempt (session, status, stderr tail).\n' +
-            '                                   Off by default.\n'
+            '                                   Off by default.\n' +
+            '\n' +
+            '  Env overrides for the typing-aware pane guard (holds a poke\n' +
+            '  while the human is actively typing; peeks the pane via\n' +
+            '  `pty peek --plain` before delivering):\n' +
+            '    ST_DING_PANE_GUARD=0           Disable the guard (deliver on arrival,\n' +
+            '                                   the pre-guard behavior). Default on.\n' +
+            '    ST_DING_PEEK_DIFF_MS           Gap between the two peek frames used to\n' +
+            '                                   detect activity. Default 300 (ms).\n' +
+            '    ST_DING_HOLD_RETRY_MS          How long to hold a busy pane before\n' +
+            '                                   re-checking. Default 20000 (20s).\n' +
+            '    ST_DING_MAX_HOLDS              Max holds before force-delivering anyway\n' +
+            '                                   (never dropped). Default 3 (~60s worst\n' +
+            '                                   case). Urgent (priority: high) messages\n' +
+            '                                   skip the guard entirely.\n' +
+            '    ST_DING_INPUT_GUARD=0          Disable the input-line check. Default on.\n' +
+            '                                   With it on: un-submitted input that keeps\n' +
+            '                                   CHANGING across retries = actively typing\n' +
+            '                                   (hold); input that stays UNCHANGED =\n' +
+            '                                   walked-away → deliver WITHOUT clobbering\n' +
+            '                                   it (newline + ding appended, then submit).\n' +
+            '    ST_DING_INPUT_PATTERN          Regex (source) matched against the last\n' +
+            '                                   non-blank line to detect un-submitted\n' +
+            '                                   input. Default a prompt glyph + text.\n' +
+            '    ST_DING_INPUT_STALE_MAX        Consecutive unchanged-input retries before\n' +
+            '                                   a stale input line is treated as\n' +
+            '                                   walked-away. Default 3.\n'
         );
         return 0;
       case '--identity':
@@ -1356,6 +1819,37 @@ export async function cmdDingCli(
   // via ST_DING_DEBUG=1 in the env; any non-'1' value is off.
   const debugMode = ctx.env.ST_DING_DEBUG === '1';
 
+  // brief-036: env-overridable knobs for the typing-aware pane guard.
+  // Malformed numeric/regex values are ignored (warn + default) so an
+  // env-file typo can't crash the daemon.
+  const paneGuard = parseEnvBool(ctx.env.ST_DING_PANE_GUARD);
+  const inputGuard = parseEnvBool(ctx.env.ST_DING_INPUT_GUARD);
+  const peekDiffMs = parseEnvMs(
+    ctx.env.ST_DING_PEEK_DIFF_MS,
+    'ST_DING_PEEK_DIFF_MS',
+    ctx.stderr
+  );
+  const holdRetryMs = parseEnvMs(
+    ctx.env.ST_DING_HOLD_RETRY_MS,
+    'ST_DING_HOLD_RETRY_MS',
+    ctx.stderr
+  );
+  const maxHolds = parseEnvMs(
+    ctx.env.ST_DING_MAX_HOLDS,
+    'ST_DING_MAX_HOLDS',
+    ctx.stderr
+  );
+  const inputPattern = parseEnvRegExp(
+    ctx.env.ST_DING_INPUT_PATTERN,
+    'ST_DING_INPUT_PATTERN',
+    ctx.stderr
+  );
+  const inputStaleMax = parseEnvMs(
+    ctx.env.ST_DING_INPUT_STALE_MAX,
+    'ST_DING_INPUT_STALE_MAX',
+    ctx.stderr
+  );
+
   try {
     await runDing({
       st: st,
@@ -1370,6 +1864,13 @@ export async function cmdDingCli(
       ...(rescanQuietAfterDeliveryMs !== undefined && {
         rescanQuietAfterDeliveryMs,
       }),
+      ...(paneGuard !== undefined && { paneGuard }),
+      ...(inputGuard !== undefined && { inputGuard }),
+      ...(peekDiffMs !== undefined && { peekDiffMs }),
+      ...(holdRetryMs !== undefined && { holdRetryMs }),
+      ...(maxHolds !== undefined && { maxHolds }),
+      ...(inputPattern !== undefined && { inputPattern }),
+      ...(inputStaleMax !== undefined && { inputStaleMax }),
       exitWhenSessionGone,
       debug: debugMode,
       signal: ac.signal,
@@ -1401,4 +1902,39 @@ function parseEnvMs(
     return undefined;
   }
   return Number(raw);
+}
+
+/**
+ * brief-036: parse a boolean env override. Returns undefined for
+ * missing/empty/unrecognized (caller uses the default). Accepts
+ * 1/true/on/yes and 0/false/off/no (case-insensitive).
+ */
+function parseEnvBool(raw: string | undefined): boolean | undefined {
+  if (raw === undefined || raw === '') return undefined;
+  const v = raw.trim().toLowerCase();
+  if (v === '0' || v === 'false' || v === 'off' || v === 'no') return false;
+  if (v === '1' || v === 'true' || v === 'on' || v === 'yes') return true;
+  return undefined;
+}
+
+/**
+ * brief-036: compile a RegExp from an env var (its source). Returns
+ * undefined for missing/empty (caller uses the default) and for an
+ * invalid pattern (warn + default) so a bad regex can't crash the
+ * daemon.
+ */
+function parseEnvRegExp(
+  raw: string | undefined,
+  name: string,
+  stderr: (s: string) => void
+): RegExp | undefined {
+  if (raw === undefined || raw === '') return undefined;
+  try {
+    return new RegExp(raw);
+  } catch (err) {
+    stderr(
+      `st ding: ignoring ${name}=${JSON.stringify(raw)} — invalid regex (${errMsg(err)}); using default\n`
+    );
+    return undefined;
+  }
 }
