@@ -159,7 +159,11 @@ export { cmdSend as cmdSendCore };
 
 // ─── CLI wrapper ────────────────────────────────────────────────────────
 
-import { invokedName, type CliContext } from '../cli-context.ts';
+import {
+  invokedName,
+  resolveMessageBody,
+  type CliContext,
+} from '../cli-context.ts';
 
 export async function cmdSendCli(
   args: readonly string[],
@@ -209,8 +213,11 @@ export async function cmdSendCli(
             `usage: ${name} message send <to> [-m <body> | --message <body>]\n` +
               '                            [--from ID] [--subject S] [--in-reply-to F]\n' +
               '                            [--tags T,T,...] [--priority low|normal|high]\n\n' +
-              '  Body source: pass `-m <body>` for inline, or omit and pipe the body\n' +
-              `  via stdin (e.g. \`echo hi | ${name} message send bob\`). Don't do both.\n`
+              '  Body source: pass `-m <body>` for inline (recommended for scripts\n' +
+              '  and agents — stdin is never read), or omit `-m` and pipe the body\n' +
+              `  via stdin (e.g. \`echo hi | ${name} message send bob\`). With no \`-m\`\n` +
+              '  and no piped stdin, the command errors instead of blocking; a piped\n' +
+              '  stdin that never closes times out ($ST_STDIN_TIMEOUT_MS, default 10s).\n'
           );
         }
         return 0;
@@ -222,26 +229,10 @@ export async function cmdSendCli(
   }
   if (to === undefined) throw new Error('<to> is required');
 
-  let body: string | Buffer;
-  if (inlineBody !== undefined) {
-    // -m given. If stdin is also connected (piped, redirected),
-    // surface the conflict loudly rather than silently dropping
-    // either source. When stdin is a TTY (interactive run) we skip
-    // reading entirely — otherwise readStdin would block waiting
-    // for EOF.
-    const isTty = ctx.stdinIsTty?.() ?? false;
-    if (!isTty) {
-      const piped = await ctx.readStdin();
-      if (piped.length > 0) {
-        throw new Error(
-          'specify body via -m OR stdin, not both'
-        );
-      }
-    }
-    body = inlineBody;
-  } else {
-    body = await ctx.readStdin();
-  }
+  // Resolve the body without ever blocking forever on stdin (see
+  // resolveMessageBody): `-m` wins outright and never reads stdin; a TTY or
+  // a never-closing pipe errors clearly instead of hanging.
+  const body = await resolveMessageBody(ctx, inlineBody);
 
   const r = cmdSend({
     to,

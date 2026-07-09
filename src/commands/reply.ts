@@ -11,7 +11,7 @@
 // this verb has to route through the CLI dispatcher.
 
 import { envAgentFrom } from '../common.ts';
-import { invokedName } from '../cli-context.ts';
+import { invokedName, resolveMessageBody } from '../cli-context.ts';
 import { locateThread } from '../locate-thread.ts';
 import { asFilename, asIdentity } from '../types.ts';
 
@@ -110,9 +110,10 @@ export async function cmdReplyCli(
             '                                     [--subject S] [--from ID]\n\n' +
             '  Reply to <thread-filename>. Recipient is derived from the thread\'s\n' +
             '  `from:` field; default subject is `re: <original-subject>` (or omitted\n' +
-            '  if the original had no subject). Body source: pass `-m <body>` for\n' +
-            `  inline, or omit and pipe the body via stdin (e.g. \`echo ok | ${name} message reply <fn>\`).\n` +
-            '  Don\'t do both.\n'
+            '  if the original had no subject). Body source: pass `-m <body>`\n' +
+            '  for inline (recommended for scripts/agents — stdin is never read),\n' +
+            `  or omit \`-m\` and pipe the body via stdin (e.g. \`echo ok | ${name} message reply <fn>\`).\n` +
+            '  With no `-m` and no piped stdin, the command errors instead of blocking.\n'
         );
         return 0;
       }
@@ -126,22 +127,10 @@ export async function cmdReplyCli(
     throw new Error('<thread-filename> is required');
   }
 
-  let body: string | Buffer;
-  if (inlineBody !== undefined) {
-    // -m given. Guard the same "don't accept both inline + stdin"
-    // rule as `st message send`: silent-drop of either source is
-    // worse than a loud error.
-    const isTty = ctx.stdinIsTty?.() ?? false;
-    if (!isTty) {
-      const piped = await ctx.readStdin();
-      if (piped.length > 0) {
-        throw new Error('specify body via -m OR stdin, not both');
-      }
-    }
-    body = inlineBody;
-  } else {
-    body = await ctx.readStdin();
-  }
+  // Resolve the body without ever blocking forever on stdin (see
+  // resolveMessageBody): `-m` wins outright and never reads stdin; a TTY or
+  // a never-closing pipe errors clearly instead of hanging.
+  const body = await resolveMessageBody(ctx, inlineBody);
 
   const r = cmdReply({
     thread,
