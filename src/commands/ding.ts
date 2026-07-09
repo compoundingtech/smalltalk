@@ -1648,11 +1648,12 @@ export async function cmdDingCli(
             '                                   attempt (session, status, stderr tail).\n' +
             '                                   Off by default.\n' +
             '\n' +
-            '  Env overrides for the typing-aware pane guard (holds a poke\n' +
-            '  while the human is actively typing; peeks the pane via\n' +
-            '  `pty peek --plain` before delivering):\n' +
-            '    ST_DING_PANE_GUARD=0           Disable the guard (deliver on arrival,\n' +
-            '                                   the pre-guard behavior). Default on.\n' +
+            '  Env overrides for the typing-aware pane guard (ON by default —\n' +
+            '  to turn it OFF for this agent, set ST_DING_PANE_GUARD=0). It peeks\n' +
+            '  the pane via `pty peek --plain` and holds a poke while the human\n' +
+            '  is actively typing:\n' +
+            '    ST_DING_PANE_GUARD=0           Disable the guard entirely (deliver on\n' +
+            '                                   arrival, the pre-guard behavior).\n' +
             '    ST_DING_PEEK_DIFF_MS           Gap between the two peek frames used to\n' +
             '                                   detect activity. Default 300 (ms).\n' +
             '    ST_DING_HOLD_RETRY_MS          How long to hold a busy pane before\n' +
