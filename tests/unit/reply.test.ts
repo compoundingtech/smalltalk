@@ -325,10 +325,10 @@ describe('cmdReplyCli — parses <thread> + -m + --subject and delegates', () =>
     );
   });
 
-  it('reply with -m AND piped stdin → throws (no silent drop)', async () => {
-    // Match send.ts's guard: both sources present is a bug, not a
-    // "silently pick one" situation. Set stdinIsTty=false + non-empty
-    // readStdin.
+  it('reply with -m wins outright and never reads stdin (even a blocking pipe)', async () => {
+    // Footgun fix: with `-m`, stdin is NEVER touched — an inherited pipe
+    // that never EOFs can't hang a reply. readStdin throws here to prove it
+    // is never awaited; the reply must still succeed using the inline body.
     plantMessage(
       'bob',
       'inbox',
@@ -336,17 +336,24 @@ describe('cmdReplyCli — parses <thread> + -m + --subject and delegates', () =>
       { from: 'alice' },
       'x'
     );
-    const conflictCtx: CliContext = {
+    const inlineCtx: CliContext = {
       ...ctx,
-      readStdin: async () => Buffer.from('piped body'),
+      readStdin: async () => {
+        throw new Error('stdin must not be read when -m is given');
+      },
       stdinIsTty: () => false,
     } as CliContext;
-    await expect(
-      cmdReplyCli(
-        ['1783400000013-abcdef.md', '-m', 'inline'],
-        conflictCtx
-      )
-    ).rejects.toThrow(/-m OR stdin, not both/);
+    const rc = await cmdReplyCli(
+      ['1783400000013-abcdef.md', '-m', 'inline'],
+      inlineCtx
+    );
+    expect(rc).toBe(0);
+    const files = readdirSync(join(stRoot, 'alice', 'inbox'));
+    const t = readFileSync(
+      join(stRoot, 'alice', 'inbox', files[0]!),
+      'utf8'
+    );
+    expect(t).toContain('inline');
   });
 });
 

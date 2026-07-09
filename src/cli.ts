@@ -14,7 +14,11 @@ import { delimiter, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { stConfigFrom, stRootFrom } from './common.ts';
-import { invokedName, type CliContext } from './cli-context.ts';
+import {
+  invokedName,
+  StdinReadTimeoutError,
+  type CliContext,
+} from './cli-context.ts';
 import { cmdArchiveCli } from './commands/archive.ts';
 import { cmdCompletionsCli } from './commands/completions.ts';
 import { cmdContextCli } from './commands/context.ts';
@@ -42,7 +46,7 @@ export function defaultCliContext(): CliContext {
     stConfig: stConfigFrom(process.env),
     stdout: (s) => process.stdout.write(s),
     stderr: (s) => process.stderr.write(s),
-    readStdin: () => readStdinBuffer(process.stdin),
+    readStdin: (opts) => readStdinBuffer(process.stdin, opts),
     // brief-033: brief checks isTTY === true (a real TTY); anything
     // else (piped stdin, redirected file, non-tty subprocess pipe) is
     // treated as "stdin is connected to something" and the conflict
@@ -52,13 +56,51 @@ export function defaultCliContext(): CliContext {
 }
 
 async function readStdinBuffer(
-  stream: NodeJS.ReadableStream
+  stream: NodeJS.ReadableStream,
+  opts: { timeoutMs?: number } = {}
 ): Promise<Buffer> {
-  const chunks: Buffer[] = [];
-  for await (const chunk of stream) {
-    chunks.push(typeof chunk === 'string' ? Buffer.from(chunk, 'utf8') : chunk);
+  const readAll = async (): Promise<Buffer> => {
+    const chunks: Buffer[] = [];
+    for await (const chunk of stream) {
+      chunks.push(
+        typeof chunk === 'string' ? Buffer.from(chunk, 'utf8') : chunk
+      );
+    }
+    return Buffer.concat(chunks);
+  };
+
+  const timeoutMs = opts.timeoutMs;
+  if (timeoutMs === undefined || timeoutMs <= 0) {
+    return readAll();
   }
-  return Buffer.concat(chunks);
+
+  // Bounded read: race the full drain against a timer. If the stream
+  // produces no EOF in time (an inherited pipe with no writer, or a TTY we
+  // shouldn't have been reading), tear it down so the pending read settles
+  // and the process can exit, then reject — never block forever.
+  let timer: NodeJS.Timeout | undefined;
+  const readPromise = readAll();
+  // Swallow the late rejection the torn-down stream produces after the
+  // timeout has already won the race (avoids an unhandledRejection).
+  readPromise.catch(() => {});
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      const s = stream as Partial<NodeJS.ReadStream>;
+      // unref() so this handle stops holding the event loop open (the
+      // dispatcher exits via `process.exitCode`, i.e. a natural drain);
+      // destroy() settles the pending read. Without unref the process
+      // would print the error but then hang on exit until killed.
+      s.unref?.();
+      s.destroy?.();
+      reject(new StdinReadTimeoutError(timeoutMs));
+    }, timeoutMs);
+  });
+
+  try {
+    return await Promise.race([readPromise, timeout]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
 }
 
 function messageUsage(name: string): string {
