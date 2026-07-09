@@ -325,6 +325,17 @@ respects `st status` (suppress on `busy`/`dnd`, flush on
 `available`/`offline`), and pty-sends a one-line notice into the
 target session on each new arrival.
 
+`st ding` is also **typing-aware**: before poking, it peeks the target
+pane and holds the notice while the user is actively typing (or the pane
+is streaming output), delivering once it goes quiet — and if the user
+typed something and walked away, it preserves that un-submitted text
+rather than clobbering it. This guard is **on by default**. To turn it
+off for an agent, set `ST_DING_PANE_GUARD=0` (or `ST_DING_INPUT_GUARD=0`
+to keep the guard but drop just the typed-and-walked-away preservation).
+Tunables — `ST_DING_PEEK_DIFF_MS`, `ST_DING_HOLD_RETRY_MS`,
+`ST_DING_MAX_HOLDS`, `ST_DING_INPUT_STALE_MAX` — are documented under
+`st ding --help`.
+
 The full integration map — design rationale, links to the briefs that
 shipped each phase — lives at
 [`notes/harness-integrations.md`](notes/harness-integrations.md).
