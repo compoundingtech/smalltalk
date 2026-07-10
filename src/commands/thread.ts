@@ -3,7 +3,7 @@
 // The walk is global: a two-party conversation lives across both
 // identity trees (alice's outbound to bob is under <bob>/inbox|archive,
 // bob's reply to alice is under <alice>/inbox|archive). We scan every
-// $COORD_ROOT/*/{inbox,archive}/ directory.
+// $ST_ROOT/*/{inbox,archive}/ directory.
 
 import { readFileSync, readdirSync, statSync } from 'node:fs';
 import { join } from 'node:path';
