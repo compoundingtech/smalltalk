@@ -116,7 +116,11 @@ fi
 # `st context write` under the timeout wrapper without dealing with
 # the sub-shell / variable-scope headaches of `bash -c "$(declare -f)"`.
 ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-stub_body=$(cat <<EOF
+# bash 3.2 (macOS /bin/bash, which Claude Code uses for hooks) cannot
+# parse a heredoc nested inside `$( … )` — it fail-CLOSES the whole
+# hook with a parse error. Read the heredoc into the var directly
+# instead. `read -d ''` returns non-zero at EOF, hence `|| true`.
+IFS= read -r -d '' stub_body <<EOF || true
 # now — pre-compact stub — $ts
 
 PreCompact fired without a recent flush from the model. Boot-rehydrate
@@ -129,7 +133,6 @@ base-persona rule is to flush \`st context write\` at each
 meaningful state change), not a hook bug. Reconstruct and flush
 proactively going forward.
 EOF
-)
 
 # Run the write under a 500ms cap. `timeout` isn't universally present
 # on darwin — try `timeout`, then `gtimeout`, then unbounded. Any
