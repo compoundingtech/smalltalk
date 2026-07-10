@@ -378,7 +378,11 @@ function contextUsage(name: string): string {
     '           ├── now.md            whole-file, last-write-wins snapshot\n' +
     '           └── decisions/        one file per entry\n' +
     '               └── <unix-ms>-<rand6>.md\n' +
-    '  brief-024 (context/ v1): the in-context-state leg of lossless-restart.\n'
+    '  brief-024 (context/ v1): the in-context-state leg of lossless-restart.\n\n' +
+    '  Examples:\n' +
+    `    ${name} context read                          # my current now.md\n` +
+    `    echo "state..." | ${name} context write       # replace my now.md\n` +
+    `    ${name} context append --decision "chose X" --why "Y is faster"\n`
   );
 }
 

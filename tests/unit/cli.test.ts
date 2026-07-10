@@ -143,6 +143,68 @@ describe('runCli — --version', () => {
   });
 });
 
+// ─── help coverage (no drift) ───────────────────────────────────────────
+
+describe('runCli — help coverage (no drift)', () => {
+  // Every subcommand + verb must ship help: exit 0, mention "usage:", and
+  // carry >=1 concrete example. Fails loudly if a new verb lands without
+  // help or an example — the "--help has no drift" guard from the brief.
+  const HELPABLE: readonly (readonly string[])[] = [
+    ['message'],
+    ['message', 'send'],
+    ['message', 'reply'],
+    ['message', 'ls'],
+    ['message', 'read'],
+    ['message', 'archive'],
+    ['message', 'archive', 'trim'],
+    ['message', 'thread'],
+    ['watch'],
+    ['status'],
+    ['agents'],
+    ['overview'],
+    ['resource'],
+    ['context'],
+    ['sync'],
+    ['mcp'],
+    ['init'],
+    ['ding'],
+    ['completions'],
+  ];
+
+  for (const argv of HELPABLE) {
+    it(`\`${argv.join(' ')} --help\` → exit 0, usage + an example`, async () => {
+      const cap = makeContext();
+      const code = await runCli([...argv, '--help'], cap.ctx);
+      const out = (cap.stdout + cap.stderr).toLowerCase();
+      expect(code).toBe(0);
+      expect(out).toContain('usage:');
+      expect(out).toMatch(/example|e\.g\./);
+    });
+  }
+
+  it('top-level --help lists every subcommand', async () => {
+    const cap = makeContext();
+    await runCli(['--help'], cap.ctx);
+    const out = cap.stdout + cap.stderr;
+    for (const name of [
+      'message',
+      'watch',
+      'status',
+      'agents',
+      'overview',
+      'resource',
+      'context',
+      'sync',
+      'mcp',
+      'init',
+      'ding',
+      'completions',
+    ]) {
+      expect(out).toContain(name);
+    }
+  });
+});
+
 // ─── _ST_INVOKED_AS override ────────────────────────────────────────────
 
 describe('runCli — help banner reflects _ST_INVOKED_AS', () => {

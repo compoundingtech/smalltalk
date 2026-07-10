@@ -116,7 +116,9 @@ function messageUsage(name: string): string {
     `  archive [<identity>] <filename> [--with-attachments]\n` +
     `  archive trim [<identity>] [--older-than DURATION] [--keep-last N] [--dry-run]\n` +
     `                                   [--with-attachments]\n` +
-    `  thread [<identity>] <filename> [--tree]\n`
+    `  thread [<identity>] <filename> [--tree]\n\n` +
+    `  Example: echo 'hi bob' | ${name} message send bob --subject hello\n` +
+    `  Tip: run \`${name} message <verb> --help\` for a verb's flags + examples.\n`
   );
 }
 
@@ -125,16 +127,16 @@ function topLevelUsage(name: string): string {
     `usage: ${name} <subcommand> [args...]\n` +
     `       ${name} --help | --version\n\n` +
   `Messages:\n` +
-  `  message <verb> [args...]   (alias: msg)\n` +
+  `  message <verb> [args...]   (alias: msg) — send/reply/read/archive on the bus\n` +
   `    send | reply | ls | read | archive | thread\n\n` +
   `Live:\n` +
   `  watch [<identity>] [--all] [--with-subject] [--since UNIX_MS | --since-now]\n` +
   `                     [--interval MS] [--once]\n` +
-  `                     default: watch your own inbox; --all is cross-tree\n` +
-  `  status [<identity>] [--set <state>]\n` +
-  `  agents [--status STATE] [--json [--enrich]]    (alias: members)\n` +
-  `  overview [--recent N] [--json]\n\n` +
-  `Resources:\n` +
+  `                     follow inbox arrivals; --all is cross-tree\n` +
+  `  status [<identity>] [--set <state>]            get or set an agent status\n` +
+  `  agents [--status STATE] [--json [--enrich]]    who's around (alias: members)\n` +
+  `  overview [--recent N] [--json]                 at-a-glance dashboard\n\n` +
+  `Resources:  publish + list the URLs an agent cares about\n` +
   `  resource add <url> [--title T] [--tag T,T] [--body-stdin]\n` +
   `  resource ls [<identity>] [--json]\n` +
   `  resource read [<identity>] <filename> [--json]\n` +

@@ -418,7 +418,15 @@ export async function cmdWatchCli(
             '  --all:   watch every identity\'s inbox EXCEPT $ST_AGENT\'s\n' +
             '           (cross-tree supervisor mode; uses --from / $ST_AGENT\n' +
             '           for the suppression id).\n' +
-            '  <identity>: watch THAT identity\'s inbox specifically.\n'
+            '  <identity>: watch THAT identity\'s inbox specifically.\n\n' +
+            '  --with-subject      include each message subject in the line.\n' +
+            '  --since UNIX_MS     only events at/after this ms timestamp.\n' +
+            '  --since-now         only events from now on (skip the backlog).\n' +
+            '  --interval MS       poll interval override.\n' +
+            '  --once              print current matches and exit (no follow).\n\n' +
+            '  Examples:\n' +
+            `    ${invokedName(ctx.env)} watch                     # follow my own inbox\n` +
+            `    ${invokedName(ctx.env)} watch --all --with-subject  # cross-tree, with subjects\n`
         );
         return 0;
       default:

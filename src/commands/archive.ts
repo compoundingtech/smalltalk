@@ -407,7 +407,16 @@ export function cmdArchiveCli(
           const name = invokedName(ctx.env);
           ctx.stderr(
             `usage: ${name} message archive [<identity>] <filename> [--with-attachments]\n` +
-              `       ${name} message archive trim [<identity>] [--older-than DURATION] [--keep-last N] [--dry-run] [--with-attachments]\n`
+              `       ${name} message archive trim [<identity>] [--older-than DURATION]\n` +
+              '                             [--keep-last N] [--dry-run] [--with-attachments]\n\n' +
+              '  Move a message from inbox/ to archive/. Archive the moment you\n' +
+              '  act on a message (the bus contract — a re-scan can re-poke an\n' +
+              '  un-archived item).\n\n' +
+              '  --with-attachments   also move sibling attachment files.\n' +
+              '  trim                 bulk-archive old inbox items.\n\n' +
+              '  Examples:\n' +
+              `    ${name} message archive 1714826789012-x9k4mz.md\n` +
+              `    ${name} message archive trim --older-than 30d --dry-run\n`
           );
         }
         return 0;
@@ -464,9 +473,17 @@ function cmdArchiveTrimCli(args: readonly string[], ctx: CliContext): number {
         break;
       case '-h':
       case '--help':
-        ctx.stderr(
-          `usage: ${invokedName(ctx.env)} message archive trim [<identity>] [--older-than DURATION] [--keep-last N] [--dry-run] [--with-attachments]\n`
-        );
+        {
+          const name = invokedName(ctx.env);
+          ctx.stderr(
+            `usage: ${name} message archive trim [<identity>] [--older-than DURATION]\n` +
+              '                             [--keep-last N] [--dry-run] [--with-attachments]\n\n' +
+              '  Bulk-archive old inbox items. --older-than takes a duration like\n' +
+              '  30d / 12h / 2w; --keep-last N always keeps the newest N.\n\n' +
+              '  Example:\n' +
+              `    ${name} message archive trim --older-than 30d --keep-last 20 --dry-run\n`
+          );
+        }
         return 0;
       default:
         if (a.startsWith('-')) throw new Error(`unknown flag: ${a}`);

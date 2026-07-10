@@ -327,7 +327,13 @@ export function cmdSyncCli(args: readonly string[], ctx: CliContext): number {
             `usage: ${name} sync push|pull <peer>\n` +
               `       ${name} sync push|pull --all\n` +
               `       ${name} sync sweep\n` +
-              `       ${name} sync --all\n`
+              `       ${name} sync --all\n\n` +
+              '  rsync your state tree against peers. push sends yours, pull\n' +
+              '  fetches theirs, --all does every configured peer, sweep enforces\n' +
+              '  the LAYOUT tombstone invariant.\n\n' +
+              '  Examples:\n' +
+              `    ${name} sync pull --all    # conservative cron default (pull-only)\n` +
+              `    ${name} sync --all         # push + pull against every peer\n`
           );
         }
         return 0;

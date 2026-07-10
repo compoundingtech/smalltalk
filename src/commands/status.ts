@@ -225,9 +225,20 @@ export function cmdStatusCli(
         break;
       case '-h':
       case '--help':
-        ctx.stderr(
-          `usage: ${invokedName(ctx.env)} status [<identity>] [--set <state>]\n`
-        );
+        {
+          const name = invokedName(ctx.env);
+          ctx.stderr(
+            `usage: ${name} status [<identity>] [--set <state>]\n\n` +
+              '  Get or set an agent status. No args prints your own\n' +
+              '  ($ST_AGENT) status; <identity> reads another agent\'s.\n' +
+              '  --set <state> writes your own — states: available | busy |\n' +
+              '  away | dnd | offline.\n\n' +
+              '  Examples:\n' +
+              `    ${name} status --set busy      # go heads-down (ding suppresses)\n` +
+              `    ${name} status                 # print my current status\n` +
+              `    ${name} status alice           # read alice's status\n`
+          );
+        }
         return 0;
       default:
         if (a.startsWith('-')) throw new Error(`unknown flag: ${a}`);

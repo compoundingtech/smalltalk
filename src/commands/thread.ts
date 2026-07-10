@@ -281,9 +281,17 @@ export function cmdThreadCli(args: readonly string[], ctx: CliContext): number {
         break;
       case '-h':
       case '--help':
-        ctx.stderr(
-          `usage: ${invokedName(ctx.env)} message thread [<identity>] <filename> [--tree]\n`
-        );
+        {
+          const name = invokedName(ctx.env);
+          ctx.stderr(
+            `usage: ${name} message thread [<identity>] <filename> [--tree]\n\n` +
+              '  Walk the in-reply-to chain for a message and print the thread.\n\n' +
+              '  <identity>   read from THAT agent\'s folder instead of yours.\n' +
+              '  --tree       render the reply structure as a tree.\n\n' +
+              '  Example:\n' +
+              `    ${name} message thread 1714826789012-x9k4mz.md\n`
+          );
+        }
         return 0;
       default:
         if (a.startsWith('-')) throw new Error(`unknown flag: ${a}`);

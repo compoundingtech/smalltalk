@@ -243,6 +243,13 @@ function agentsHelp(name: string): string {
     '  Enumerate every agent under $ST_ROOT — i.e. any sub-folder\n' +
     '  with at least one of inbox/ or archive/. Sorted alphabetically.\n' +
     '  Plain read; does not mutate state.\n\n' +
+    '  --status STATE   only agents in STATE (available|busy|away|dnd|offline).\n' +
+    '  --json           machine-readable array.\n' +
+    '  --enrich         (with --json) add inbox counts + last-activity.\n\n' +
+    '  Examples:\n' +
+    `    ${name} agents                      # id / status / name, tab-separated\n` +
+    `    ${name} agents --status available   # only agents marked available\n` +
+    `    ${name} agents --json --enrich      # rich JSON (inbox + activity)\n\n` +
     `  Note: \`${name} members\` is the deprecated alias of this verb.\n`
   );
 }

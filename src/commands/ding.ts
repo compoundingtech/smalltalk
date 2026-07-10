@@ -1622,6 +1622,9 @@ export async function cmdDingCli(
             "  for Codex agents that don't run an MCP server per identity).\n" +
             '  Exits cleanly when the target pty session is gone.\n' +
             '  Long-running — pair with `pty up` for supervision.\n\n' +
+            '  Examples:\n' +
+            `    ${invokedName(ctx.env)} ding my-claude-session --identity cos\n` +
+            `    ST_DING_PANE_GUARD=0 ${invokedName(ctx.env)} ding my-session   # opt out of typing-aware guard\n\n` +
             '  --identity ID                    Smalltalk identity to watch. Defaults to $ST_AGENT.\n' +
             '  --interval MS                    Status poll interval while buffered. Default 1000ms.\n' +
             '  --tidy-interval-ms MS            Tidy-check tick interval. Default 20 min.\n' +
