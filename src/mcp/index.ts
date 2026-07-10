@@ -58,7 +58,7 @@ export interface McpServerOptions {
    *     scans the inbox for files chokidar missed. Default 15s.
    *   - `chokidarEnabled` — test seam that disables chokidar entirely
    *     so the backstop can be exercised in isolation.
-   *   - `debug` — mirror of `COORD_CHANNEL_DEBUG=1`, forwarded here so
+   *   - `debug` — mirror of `ST_CHANNEL_DEBUG=1`, forwarded here so
    *     library embedders can enable the same instrumentation.
    */
   channelWatcherOptions?:

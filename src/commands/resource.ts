@@ -125,7 +125,7 @@ export interface ResourceAddInput {
   /** Optional body (description). Frontmatter is built from
    *  url/title/tags/relation. */
   body?: string | undefined;
-  /** Override the owning identity. Defaults to env COORD_IDENTITY. */
+  /** Override the owning identity. Defaults to $ST_AGENT. */
   identity?: string | undefined;
   env: NodeJS.ProcessEnv;
   stRoot: string;
@@ -170,7 +170,7 @@ export function cmdResourceAdd(input: ResourceAddInput): ResourceAddResult {
 // ─── st resource ls ──────────────────────────────────────────────────
 
 export interface ResourceLsInput {
-  /** Whose resources to list. Defaults to env COORD_IDENTITY. */
+  /** Whose resources to list. Defaults to $ST_AGENT. */
   identity?: string | undefined;
   env: NodeJS.ProcessEnv;
   stRoot: string;
@@ -234,7 +234,7 @@ export function listResourceRecords(
 // ─── st resource read ────────────────────────────────────────────────
 
 export interface ResourceReadInput {
-  /** Whose resource to read. Defaults to env COORD_IDENTITY. */
+  /** Whose resource to read. Defaults to $ST_AGENT. */
   identity?: string | undefined;
   filename: string;
   env: NodeJS.ProcessEnv;
@@ -266,7 +266,7 @@ export function cmdResourceRead(input: ResourceReadInput): ResourceReadResult {
 // ─── st resource rm ──────────────────────────────────────────────────
 
 export interface ResourceRemoveInput {
-  /** Defaults to env COORD_IDENTITY. rm only operates on the OWNER's
+  /** Defaults to $ST_AGENT. rm only operates on the OWNER's
    * own resources — peers' resources are read-only by the LAYOUT
    * single-writer rule. */
   identity?: string | undefined;

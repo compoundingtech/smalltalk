@@ -36,7 +36,7 @@ import {
 export interface SendInput {
   /** Recipient identity (positional `<to>`). Required. */
   to: string;
-  /** Sender identity. Falls back to env COORD_IDENTITY. */
+  /** Sender identity. Falls back to $ST_AGENT (or the deprecated $ST_IDENTITY). */
   from?: string | undefined;
   /** Optional subject. Will be YAML-quoted. */
   subject?: string | undefined;

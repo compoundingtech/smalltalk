@@ -4,15 +4,14 @@ The minimal invariants every smalltalk implementation must respect.
 Anything not in this file is open for the implementation to decide
 and iterate on.
 
-> Naming note: the project is mid-phase-rename from `coord` to
-> `smalltalk`. The `$COORD_ROOT` env var and `~/.local/state/coord/`
-> default both remain honored as legacy aliases — see [Agent
-> resolution](#agent-resolution) for the dual-honor chain.
+> Naming note: the project was renamed from `coord` to `smalltalk`
+> (`st` short). The `coord` CLI and the `$COORD_ROOT` / `$COORD_IDENTITY`
+> env vars have been removed — use `st` with `$ST_ROOT` / `$ST_AGENT`.
 
 ## The root
 
-`$ST_ROOT` (default `~/.local/state/smalltalk`; legacy `$COORD_ROOT` /
-`~/.local/state/coord` honored) holds one sub-folder per **agent**.
+`$ST_ROOT` (default `~/.local/state/smalltalk`) holds one sub-folder
+per **agent**.
 
 ```
 $ST_ROOT/
@@ -213,14 +212,13 @@ this from on-disk state. Instead, agent resolution is one of:
 
 - The `ST_AGENT` environment variable (preferred), OR
 - The `ST_IDENTITY` env var (deprecated, with a one-time stderr migration notice), OR
-- The `COORD_IDENTITY` env var (legacy, with the same notice), OR
 - An explicit agent argument on the command (e.g. `--from <agent>`).
 
 Implementations should error loudly when none are provided rather than
-guessing. The three-level env-var fallback exists so per-machine
-config (e.g. `pty.toml`) can migrate from `COORD_IDENTITY` →
-`ST_IDENTITY` → `ST_AGENT` at its own pace; the next major release
-drops the legacy honors.
+guessing. The two-level env-var fallback exists so per-machine config
+(e.g. `pty.toml`) can migrate from `ST_IDENTITY` → `ST_AGENT` at its own
+pace; the next major release drops the legacy honor. (The older
+`$COORD_IDENTITY` name is no longer honored.)
 
 ## Archive is the tombstone
 
