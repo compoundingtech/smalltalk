@@ -23,7 +23,13 @@ go unnoticed.
   `context/now.md` if the model hasn't flushed a fresh one recently, so
   the next boot-rehydrate has something to inject. Exit 0 always;
   errors go to a log file, never stderr. See **brief-024 hook-legs**
-  below.
+  below. **It is a thin fail-open shim** — the actual logic lives in the
+  sibling `hooks/pre-compact.impl.sh`, which the shim runs under
+  `|| true` and then exits 0 unconditionally. Compaction runs under
+  macOS `/bin/bash` (3.2), where a hook that fails to *parse* would
+  fail-CLOSE and block compaction; the shim guarantees that can never
+  happen. **Install both files together** — the shim finds
+  `pre-compact.impl.sh` beside itself.
 - `hooks/stop-failure.sh` — Claude Code `StopFailure` hook. Fires when
   a session ends mid-turn due to an Anthropic API error; branches by
   `error_type` and either sets the agent's status (away/offline) and
