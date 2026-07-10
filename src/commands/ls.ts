@@ -293,9 +293,25 @@ export function cmdLsCli(args: readonly string[], ctx: CliContext): number {
         break;
       case '-h':
       case '--help':
-        ctx.stderr(
-          `usage: ${invokedName(ctx.env)} message ls [<recipient>] [--archive] [--count|--json] [--since UNIX_MS] [--from ID] [--orphans]\n`
-        );
+        {
+          const name = invokedName(ctx.env);
+          ctx.stderr(
+            `usage: ${name} message ls [<identity>] [--archive] [--count|--json]\n` +
+              '                          [--since UNIX_MS] [--from ID] [--orphans]\n\n' +
+              '  List inbox filenames (default: your own inbox), oldest first.\n\n' +
+              '  <identity>   list THAT agent\'s inbox instead of yours.\n' +
+              '  --archive    list archive/ instead of inbox/.\n' +
+              '  --count      print just the count.\n' +
+              '  --json       structured output (parsed frontmatter).\n' +
+              '  --since MS   only files at/after this ms timestamp.\n' +
+              '  --from ID    only messages from sender ID.\n' +
+              '  --orphans    list attachment files that have no message frontmatter.\n\n' +
+              '  Examples:\n' +
+              `    ${name} message ls              # my inbox filenames\n` +
+              `    ${name} message ls --count      # how many are waiting\n` +
+              `    ${name} message ls bob --json   # bob's inbox, structured\n`
+          );
+        }
         return 0;
       default:
         if (a.startsWith('-')) throw new Error(`unknown flag: ${a}`);

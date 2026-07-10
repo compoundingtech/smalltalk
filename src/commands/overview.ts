@@ -77,7 +77,7 @@ export interface GetOverviewOpts {
 /**
  * Pure library-shaped overview computation. Takes positional `root` and
  * `identity` (no env resolution) so an embedder can render a dashboard
- * for any identity without going through `$COORD_IDENTITY`. Read-only.
+ * for any identity without going through `$ST_AGENT`. Read-only.
  * Added in brief-028 to back `st.overview(...)` on the smalltalk instance handle.
  */
 export function getOverview(
@@ -343,10 +343,14 @@ function pad(s: string, width: number): string {
 function overviewHelp(name: string): string {
   return (
     `usage: ${name} overview [--recent N] [--json]\n\n` +
-    '  At-a-glance snapshot for $COORD_IDENTITY:\n' +
+    '  At-a-glance snapshot for $ST_AGENT:\n' +
     '    - your inbox unread count + oldest item\n' +
     '    - every identity\'s status + last-activity\n' +
-    '    - top N recent activity entries across the tree\n'
+    '    - top N recent activity entries across the tree\n\n' +
+    '  --recent N   how many recent activity entries to show (default 10).\n' +
+    '  --json       machine-readable output.\n\n' +
+    '  Example:\n' +
+    `    ${name} overview --recent 5\n`
   );
 }
 

@@ -304,9 +304,20 @@ export function cmdReadCli(args: readonly string[], ctx: CliContext): number {
         break;
       case '-h':
       case '--help':
-        ctx.stderr(
-          `usage: ${invokedName(ctx.env)} message read [<identity>] <filename> [--raw|--json] [--archive]\n`
-        );
+        {
+          const name = invokedName(ctx.env);
+          ctx.stderr(
+            `usage: ${name} message read [<identity>] <filename> [--raw|--json] [--archive]\n\n` +
+              '  Print one message: parsed fields + body (default), the raw file\n' +
+              '  (--raw), or structured JSON (--json).\n\n' +
+              '  <identity>   read from THAT agent\'s folder instead of yours.\n' +
+              '  --raw        emit the file verbatim.\n' +
+              '  --json       structured output.\n' +
+              '  --archive    read from archive/ instead of inbox/.\n\n' +
+              '  Example:\n' +
+              `    ${name} message read 1714826789012-x9k4mz.md\n`
+          );
+        }
         return 0;
       default:
         if (a.startsWith('-')) throw new Error(`unknown flag: ${a}`);

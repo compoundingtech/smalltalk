@@ -316,7 +316,10 @@ function resourceHelp(name: string): string {
     '  --relation REL  Optional, free-form. Canonical (non-enforced)\n' +
     '                  values: `owns`, `relates-to`, `depends-on`.\n' +
     '                  Never inferred; absent by default. The bare\n' +
-    '                  URL is first-class with or without it.\n'
+    '                  URL is first-class with or without it.\n\n' +
+    '  Examples:\n' +
+    `    ${name} resource add https://github.com/org/repo/pull/9 --title "the PR" --tag repo\n` +
+    `    ${name} resource ls bob     # what URLs has bob published?\n`
   );
 }
 

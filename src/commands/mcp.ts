@@ -52,7 +52,11 @@ export async function cmdMcpCli(
             '              experimental.claude/channel capability, watch the\n' +
             '              inbox for new files, and register the msg_reply\n' +
             '              tool. Off by default; existing pull-only hosts are\n' +
-            '              unaffected.\n'
+            '              unaffected.\n\n' +
+            '  Examples:\n' +
+            `    ${name} mcp             # pull-only stdio server (Codex, other hosts)\n` +
+            `    ${name} mcp --channel   # Claude Code push mode\n` +
+            `  (usually wired via \`${name} init\`, not run by hand.)\n`
         );
       }
       return 0;

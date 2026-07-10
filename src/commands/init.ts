@@ -332,7 +332,10 @@ function initHelp(name: string): string {
     '  --print        Print the JSON entry to stdout; do not write.\n' +
     '  --force        Overwrite a divergent existing entry without\n' +
     '                 prompting. (A byte-identical entry is always a\n' +
-    '                 no-op; unrelated entries are preserved.)\n'
+    '                 no-op; unrelated entries are preserved.)\n\n' +
+    '  Examples:\n' +
+    `    cd ~/work/some-repo && ${name} init   # wire MCP into this repo\n` +
+    `    ${name} init --print                  # preview the entry, write nothing\n`
   );
 }
 
