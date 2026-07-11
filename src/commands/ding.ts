@@ -366,9 +366,14 @@ const DEFAULT_RESCAN_QUIET_AFTER_DELIVERY_MS = 90_000;
  * pane twice `DEFAULT_PEEK_DIFF_MS` apart; if the frames differ (active
  * typing/output) or the input line has un-submitted text, it holds the
  * poke and retries every `DEFAULT_HOLD_RETRY_MS`, up to
- * `DEFAULT_MAX_HOLDS` times, then force-delivers (never drops). Urgent
- * (`priority: high`) messages skip the guard. ~60s worst-case hold at
- * the defaults. All env-overridable in `cmdDingCli`.
+ * `DEFAULT_MAX_HOLDS` times. At the cap it force-delivers, but ONLY once
+ * the frame is static — a still-changing (mid-turn) frame keeps holding,
+ * because a submit queued into an active Claude Code turn seeds a
+ * queued-input re-poke bug (deferred, never dropped: urgent bypasses and
+ * the re-scan re-pokes an un-archived message once the pane idles).
+ * Urgent (`priority: high`) messages skip the guard. ~60s worst-case
+ * hold for a pane that goes idle; longer while it stays busy. All
+ * env-overridable in `cmdDingCli`.
  */
 const DEFAULT_PEEK_DIFF_MS = 300;
 const DEFAULT_HOLD_RETRY_MS = 20_000;
@@ -509,12 +514,16 @@ export async function runDing(deps: DingDeps): Promise<void> {
   /**
    * brief-036: decide whether to deliver, hold, or preserve-and-deliver.
    *   - urgent (priority high) or guard off → deliver now, no peek.
-   *   - empty input + frame changing → hold (active output/typing).
-   *   - empty input + static (or hold cap) → deliver.
-   *   - un-submitted input CHANGING across retries → actively typing →
-   *     hold (don't interrupt).
-   *   - un-submitted input UNCHANGED for `inputStaleMax` retries (or at
-   *     the hold cap) → walked-away-mid-type → preserve-and-deliver.
+   *   - empty input + frame static → deliver (idle / walked away).
+   *   - empty input + frame changing → hold (mid-turn). The hold cap
+   *     force-delivers ONLY once the frame is static — never into an
+   *     active turn, since a submit queued mid-turn seeds Claude Code's
+   *     queued-input re-poke bug.
+   *   - un-submitted input CHANGING (frame OR text) → active (mid-turn
+   *     or typing) → hold (don't interrupt / don't seed the queue).
+   *   - un-submitted input + frame BOTH static for `inputStaleMax`
+   *     retries (or the hold cap, which is likewise gated on a static
+   *     frame) → walked-away-mid-type → preserve-and-deliver.
    * A peek failure → deliver (never block on a peek problem).
    */
   async function guardedDeliver(ev: BufferedEvent): Promise<GuardOutcome> {
@@ -535,32 +544,44 @@ export async function runDing(deps: DingDeps): Promise<void> {
       inputGuardOn && hasInputText(a.inputLine, inputPattern) ? a.inputLine : '';
     const hasInput = inputText !== '';
 
+    // An actively-changing frame means the pane is mid-turn. NEVER
+    // submit into it — not even at the hold cap. A submit that lands
+    // while Claude Code is processing a turn goes into CC's own
+    // queued-input buffer and (a CC-side bug) is re-submitted on every
+    // subsequent turn, surfacing as the same [DING] re-poking the agent
+    // ~once per turn indefinitely. So the cap force-delivers only once
+    // the frame has gone STATIC (idle prompt / genuinely walked away),
+    // which is exactly when a submit is safe. This defers — never
+    // drops: priority=high bypasses the guard entirely (above), and the
+    // periodic re-scan keeps an undelivered message un-archived until an
+    // idle moment lands it.
+
     // No un-submitted text to protect.
     if (!hasInput) {
-      if (a.frameChanged && !forceCap) {
-        dbg(`frame changing → holding ${ev.filename} (hold ${holds + 1}/${maxHolds})`);
+      if (a.frameChanged) {
+        dbg(`frame changing (mid-turn) → holding ${ev.filename} (hold ${holds + 1}; cap won't force into an active turn)`);
         return { kind: 'held', inputText: '', staleCount: 0 };
       }
-      return normalDeliver(ev); // static idle, or hold-cap backstop
+      return normalDeliver(ev); // frame static (idle / walked away) → safe to submit
     }
 
-    // Un-submitted input present. Changing across retries → actively
-    // typing (hold); unchanged → the human walked away (preserve).
+    // Un-submitted input present. A changing frame OR input text that
+    // changed across retries → the pane is active (mid-turn, or a human
+    // is typing) → hold, regardless of the cap (see above). Only once
+    // BOTH frame and input are static do we treat it as walked-away-
+    // mid-type and preserve-deliver (safe: a static frame is not
+    // mid-turn, so the submit won't be queued).
     const changed =
       a.frameChanged ||
       ev.lastInputText === undefined ||
       ev.lastInputText !== inputText;
     if (changed) {
-      if (forceCap) {
-        dbg(`hold cap w/ un-submitted input → preserve-deliver ${ev.filename}`);
-        return preserveDeliver(ev);
-      }
-      dbg(`input changing (typing) → holding ${ev.filename} (hold ${holds + 1}/${maxHolds})`);
+      dbg(`pane active (frame/input changing) → holding ${ev.filename} (hold ${holds + 1})`);
       return { kind: 'held', inputText, staleCount: 1 };
     }
     const staleCount = (ev.inputStaleCount ?? 1) + 1;
     if (forceCap || staleCount >= inputStaleMax) {
-      dbg(`input stale ${staleCount}/${inputStaleMax} → walked away, preserve-deliver ${ev.filename}`);
+      dbg(`input stale ${staleCount}/${inputStaleMax} + frame static → walked away, preserve-deliver ${ev.filename}`);
       return preserveDeliver(ev);
     }
     dbg(`input unchanged ${staleCount}/${inputStaleMax} → holding ${ev.filename}`);
