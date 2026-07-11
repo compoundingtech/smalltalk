@@ -2668,24 +2668,54 @@ describe('runDing — brief-036 typing-aware pane guard', () => {
     await r.done;
   });
 
-  it('hold cap reached → force-delivered anyway (never dropped)', async () => {
+  it('hold cap with a still-changing (mid-turn) frame → keeps HOLDING, never force-submits', async () => {
+    // Regression guard for the network-wide re-poke bug: a submit that
+    // lands mid-turn seeds Claude Code's own queued-input replay (it
+    // re-submits the [DING] every turn). The hold cap must NOT force-
+    // deliver while the frame is still changing — only once it's static.
     let n = 0;
-    const peeker = makePeeker(() => `frame ${n++}`); // always busy
+    const peeker = makePeeker(() => `frame ${n++}`); // always busy (differs every peek)
     const r = startDing({
       st: fake.st,
       ptySend: sender.send,
       paneGuard: true,
       ptyPeek: peeker.peek,
       peekDiffMs: 1,
-      holdRetryMs: 25,
+      holdRetryMs: 15,
+      maxHolds: 2, // low cap — the OLD behavior force-delivered here
+      intervalMs: 10,
+    });
+    fake.setMessage('1714826789010-aaaaaa.md', { from: 'alice' });
+    fake.pushEvent('1714826789010-aaaaaa.md');
+    await waitFor(() => peeker.count() >= 8); // retried well past the cap
+    expect(sender.calls()).toHaveLength(0); // still held — never forced into the busy pane
+    r.ac.abort();
+    await r.done;
+  });
+
+  it('hold cap, then the frame goes static → force-delivers once idle (deferred, never dropped)', async () => {
+    // Busy past the cap, then the pane goes idle → NOW the cap force-
+    // delivers, because a submit into a static (not mid-turn) frame is safe.
+    let busy = true;
+    let n = 0;
+    const peeker = makePeeker(() => (busy ? `frame ${n++}` : 'idle output line'));
+    const r = startDing({
+      st: fake.st,
+      ptySend: sender.send,
+      paneGuard: true,
+      ptyPeek: peeker.peek,
+      peekDiffMs: 1,
+      holdRetryMs: 15,
       maxHolds: 2,
       intervalMs: 10,
     });
     fake.setMessage('1714826789010-aaaaaa.md', { from: 'alice' });
     fake.pushEvent('1714826789010-aaaaaa.md');
-    // 2 holds at ~25ms each → force-deliver.
+    await waitFor(() => peeker.count() >= 6); // busy well past the cap
+    expect(sender.calls()).toHaveLength(0); // held while busy
+    busy = false; // pane goes idle
     await waitFor(() => sender.calls().length > 0);
-    expect(sender.calls()).toHaveLength(1); // force-delivered, not dropped
+    expect(sender.calls()).toHaveLength(1); // force-delivered once static
     r.ac.abort();
     await r.done;
   });
