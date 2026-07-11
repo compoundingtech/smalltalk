@@ -30,6 +30,17 @@ agents is `convoy`; wrapping a session is `pty` — different tools.)
 4. **Keep restart state** — `st context write` (rewrite `now.md` from stdin) /
    `st context append --decision '...' --why '...'`.
 
+## Message economy
+
+Sending a message wakes the recipient's whole agent loop — a full turn of
+reading, reasoning, and acting, on both ends. Communicate what the work
+needs — a blocker, a question you can't resolve yourself, a decision or
+closure to hand off, info the recipient must have to act — then stop.
+Batch related points into one message instead of a flurry. Skip pure acks
+("got it" / "thanks"), status with no ask, and anything they already know.
+A message that needs no action needs no reply — just archive it. The test:
+would this change what the recipient does? If not, don't send it.
+
 ## Footguns (hard-won — these bite)
 
 - **Backticks in `-m "..."` are shell command-substitution.** A double-quoted

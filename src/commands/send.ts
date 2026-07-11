@@ -217,7 +217,11 @@ export async function cmdSendCli(
               '  and agents — stdin is never read), or omit `-m` and pipe the body\n' +
               `  via stdin (e.g. \`echo hi | ${name} message send bob\`). With no \`-m\`\n` +
               '  and no piped stdin, the command errors instead of blocking; a piped\n' +
-              '  stdin that never closes times out ($ST_STDIN_TIMEOUT_MS, default 10s).\n'
+              '  stdin that never closes times out ($ST_STDIN_TIMEOUT_MS, default 10s).\n\n' +
+              '  Message economy: each send wakes the recipient\'s agent loop (a full\n' +
+              '  turn) — send what the work needs (blocker / question / decision /\n' +
+              '  closure), batch related points, skip pure acks. Would it change what\n' +
+              '  they do? If not, don\'t send it.\n'
           );
         }
         return 0;
