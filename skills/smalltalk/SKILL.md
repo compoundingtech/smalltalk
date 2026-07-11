@@ -41,6 +41,16 @@ Batch related points into one message instead of a flurry. Skip pure acks
 A message that needs no action needs no reply — just archive it. The test:
 would this change what the recipient does? If not, don't send it.
 
+**A message is a pointer + the ask, not a container.** Never inline bulk
+content — logs, large output, long docs, diffs. Write it to a file
+(anywhere the recipient can read) and send the *path* plus the ask:
+
+```sh
+# instead of pasting 500 lines of build output into the message body:
+mybuild > /tmp/build.log 2>&1
+st message send teammate -m 'build failed — full log at /tmp/build.log, error near the bottom (undefined symbol); look when you can.'
+```
+
 ## Footguns (hard-won — these bite)
 
 - **Backticks in `-m "..."` are shell command-substitution.** A double-quoted

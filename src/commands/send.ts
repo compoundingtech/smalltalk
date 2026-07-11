@@ -221,7 +221,9 @@ export async function cmdSendCli(
               '  Message economy: each send wakes the recipient\'s agent loop (a full\n' +
               '  turn) — send what the work needs (blocker / question / decision /\n' +
               '  closure), batch related points, skip pure acks. Would it change what\n' +
-              '  they do? If not, don\'t send it.\n'
+              '  they do? If not, don\'t send it. For bulk content (logs, diffs, long\n' +
+              '  output) write a file and send the PATH — a message is a pointer, not\n' +
+              '  a container.\n'
           );
         }
         return 0;
