@@ -10,7 +10,7 @@
 // pty binary or a real St — see tests/unit/ding.test.ts.
 
 import { spawn, spawnSync } from 'node:child_process';
-import { readdirSync, readFileSync, statSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 
@@ -241,6 +241,13 @@ export interface DingDeps {
    */
   ptyPaste?: PtyPaster;
   /**
+   * Test seam for the "is this message still pending in the inbox?"
+   * check that gates delivery (see `stillInInbox`). Production defaults
+   * to a filesystem `existsSync` of `<inbox>/<filename>`. Tests that use
+   * the in-memory fake `st` (no real files) inject their own predicate.
+   */
+  messagePending?: (filename: Filename) => boolean;
+  /**
    * When true, emit verbose `[st ding debug]` lines to stderr:
    *   - per-rescan-tick summary (inbox / in-flight / quiet-skipped
    *     / attempted counts)
@@ -452,6 +459,12 @@ export async function runDing(deps: DingDeps): Promise<void> {
   const inputGuardOn = deps.inputGuard ?? true;
   const inputPattern = deps.inputPattern ?? DEFAULT_INPUT_PATTERN;
   const inputStaleMax = deps.inputStaleMax ?? DEFAULT_INPUT_STALE_MAX;
+  // "Is this message still pending in the inbox?" — production checks the
+  // filesystem; tests inject a predicate (the fake `st` has no real files).
+  const messagePending =
+    deps.messagePending ??
+    ((filename: Filename): boolean =>
+      existsSync(join(inboxDir(deps.identity, deps.st.root), filename)));
 
   // Outcome of a guarded delivery attempt. `held` carries the tracking
   // state the caller must persist on the requeued event so the next
@@ -898,6 +911,15 @@ export async function runDing(deps: DingDeps): Promise<void> {
       const deferred: BufferedEvent[] = [];
       while (buffer.length > 0) {
         const ev = buffer.shift()!;
+        // Primary stale-poke guard: a buffered event whose message was
+        // archived/handled while it waited (the held-then-archived case:
+        // held on a busy pane, read + archived, now re-delivering as the
+        // pane idles) must be DROPPED — not deferred, not delivered.
+        // Re-check the inbox before every buffered delivery.
+        if (!stillInInbox(ev.filename)) {
+          dbg(`buffered message ${ev.filename} archived while held → dropping stale poke`);
+          continue;
+        }
         if (ev.notBefore !== undefined && ev.notBefore > msNow()) {
           deferred.push(ev); // still inside its hold window
           continue;
@@ -949,6 +971,17 @@ export async function runDing(deps: DingDeps): Promise<void> {
   const startupSeen = new Set<string>();
   let startupPhase = true;
 
+  // A poke is only meaningful while its message is still PENDING in the
+  // inbox. A message that was archived (or otherwise moved out) between
+  // when it was observed/buffered and when we finally deliver has been
+  // handled — poking about it is a stale re-poke. This is the guard that
+  // stops the "held-then-archived" replay: a message held on a busy pane
+  // (brief-036/#82), read + archived while held, then re-delivered when
+  // the pane idles. Cheap check (`messagePending`); the inbox is small.
+  function stillInInbox(filename: Filename): boolean {
+    return messagePending(filename);
+  }
+
   async function onEvent(
     filename: Filename,
     opts: { bypassStartupDedup?: boolean } = {}
@@ -982,6 +1015,13 @@ export async function runDing(deps: DingDeps): Promise<void> {
       log(`st ding: read failed for ${filename}: ${errMsg(err)}\n`);
       readPending.push(filename);
       ensureTimerArmed();
+      return;
+    }
+    // Archived between the watcher/rescan firing and now (read+archived
+    // during buildEvent, or a rescan race) → the message is handled;
+    // don't buffer or poke about it.
+    if (!stillInInbox(filename)) {
+      dbg(`message ${filename} archived before delivery → skipping poke`);
       return;
     }
     if (SUPPRESS_STATES.has(state)) {
