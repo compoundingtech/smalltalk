@@ -270,6 +270,7 @@ function startDing(opts: {
   inputPattern?: RegExp;
   inputStaleMax?: number;
   ptyPaste?: PtyPaster;
+  messagePending?: (filename: Filename) => boolean;
   debug?: boolean;
   stderr?: (s: string) => void;
 }): RunningDing {
@@ -317,6 +318,9 @@ function startDing(opts: {
       inputStaleMax: opts.inputStaleMax,
     }),
     ...(opts.ptyPaste !== undefined && { ptyPaste: opts.ptyPaste }),
+    // Default: every planted message is still pending (the fake never
+    // archives). Tests that exercise mid-flight archival inject their own.
+    messagePending: opts.messagePending ?? ((): boolean => true),
     ...(opts.debug !== undefined && { debug: opts.debug }),
     signal: ac.signal,
     ...(opts.stderr !== undefined && { stderr: opts.stderr }),
@@ -442,6 +446,49 @@ describe('runDing — buffering across busy → available', () => {
     expect(sender.calls()).toHaveLength(2);
     expect(sender.calls()[0]!.sequences[0]).toContain('one');
     expect(sender.calls()[1]!.sequences[0]).toContain('two');
+    r.ac.abort();
+    await r.done;
+  });
+
+  it('buffered message archived before flush → DROPPED, not delivered (held-then-archived stale-poke guard)', async () => {
+    // A message buffered while the agent is busy, then read + archived
+    // before the flush drains it, must NOT be delivered — it is already
+    // handled. This is the held-then-archived stale re-poke that #82
+    // (indefinite hold on a busy pane) amplified.
+    const pending = new Set<string>([
+      '1714826789010-aaaaaa.md',
+      '1714826789020-bbbbbb.md',
+    ]);
+    fake.setStatus('busy');
+    fake.setMessage('1714826789010-aaaaaa.md', {
+      from: 'alice',
+      subject: 'archived-one',
+    });
+    fake.setMessage('1714826789020-bbbbbb.md', {
+      from: 'alice',
+      subject: 'still-here',
+    });
+    const r = startDing({
+      st: fake.st,
+      ptySend: sender.send,
+      intervalMs: 25,
+      messagePending: (fn): boolean => pending.has(fn),
+    });
+    fake.pushEvent('1714826789010-aaaaaa.md');
+    await settle();
+    fake.pushEvent('1714826789020-bbbbbb.md');
+    await settle();
+    expect(sender.calls()).toHaveLength(0); // both buffered under busy
+
+    // Archive the first WHILE it is buffered, then flip available to flush.
+    pending.delete('1714826789010-aaaaaa.md');
+    fake.setStatus('available');
+    await new Promise((res) => setTimeout(res, 80));
+
+    // Only the still-pending message delivers; the archived one is dropped.
+    expect(sender.calls()).toHaveLength(1);
+    expect(sender.calls()[0]!.sequences[0]).toContain('still-here');
+    expect(sender.calls()[0]!.sequences[0]).not.toContain('archived-one');
     r.ac.abort();
     await r.done;
   });
