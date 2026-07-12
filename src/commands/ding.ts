@@ -1390,11 +1390,32 @@ async function buildEvent(
  * Post-rename naming: `smalltalk message`, not `st message` —
  * this is user-visible bus traffic and matches the CLI the agent
  * uses to act on it (`st message …`).
+ *
+ * The `[id:<rand6>]` discriminator lets an agent dedupe a re-poke by
+ * glance: the daemon re-pokes an un-archived message on later scans,
+ * and without a stable id the agent can't tell a re-poke of a message
+ * it already handled from a genuinely new one without an `st message
+ * ls`. The id is placed AFTER the `new smalltalk message:` marker so
+ * that marker (which bus-instructions files pattern-match on) stays
+ * contiguous.
  */
 function buildDingText(ev: BufferedEvent): string {
   const subject = ev.subject ?? '(no subject)';
   const from = ev.from === '' ? 'unknown' : ev.from;
-  return `[DING] new smalltalk message: ${subject} (from ${from}); check your inbox`;
+  return `[DING] new smalltalk message: [id:${dingId(ev.filename)}] ${subject} (from ${from}); check your inbox`;
+}
+
+/**
+ * Short, stable per-message id for the {@link buildDingText} poke line.
+ * For canonical LAYOUT-004 `<unix-ms>-<rand6>.md` filenames it's the
+ * rand6 suffix — unique per message, stable across re-pokes, and
+ * Crockford-Base32 (no ambiguous glyphs). Non-canonical "outside"
+ * filenames have no rand6, so fall back to the basename sans `.md`,
+ * which is still stable per file.
+ */
+function dingId(filename: Filename): string {
+  if (validFilename(filename)) return filename.split('-')[1]!.slice(0, 6);
+  return filename.replace(/\.md$/, '');
 }
 
 function buildSequences(ev: BufferedEvent): string[] {

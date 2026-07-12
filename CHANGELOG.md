@@ -6,6 +6,24 @@ minor releases until 1.0.
 
 ## Unreleased
 
+### Added (`st ding` — stable `[id:<rand6>]` discriminator in the `[DING]` poke line)
+
+The `[DING]` poke now carries a short, stable per-message id:
+
+    [DING] new smalltalk message: [id:jq0d78] <subject> (from <sender>); check your inbox
+
+The id is the rand6 suffix of the message filename (canonical
+LAYOUT-004 `<unix-ms>-<rand6>.md`; outside filenames fall back to the
+basename). It's unique per message and stable across re-pokes, so an
+agent can tell a re-poke of a message it already handled from a
+genuinely new one by glance — without an `st message ls` every time.
+
+Placed AFTER the `new smalltalk message:` marker so that marker (which
+ding-mode bus-instructions files pattern-match on) stays contiguous.
+Purely additive / back-compat: an agent still running older
+bus-instructions parses `<subject> (from <sender>)` unchanged; the
+`[id:…]` is extra.
+
 ### Fixed (coord-kill piece (k) — `st ding` mkdir -p missing agent folder at startup)
 
 Pinned by evals + cos (piece (j)'s debug logs surfaced it,

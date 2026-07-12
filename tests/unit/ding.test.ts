@@ -361,7 +361,7 @@ describe('runDing — status gating', () => {
     expect(sender.calls()).toHaveLength(1);
     expect(sender.calls()[0]!.sessionName).toBe('codex-foo');
     expect(sender.calls()[0]!.sequences).toEqual([
-      '[DING] new smalltalk message: hello (from alice); check your inbox',
+      '[DING] new smalltalk message: [id:aaaaaa] hello (from alice); check your inbox',
       'key:return',
     ]);
     // Regression guards for the [DING] prefix marker + `smalltalk`
@@ -372,6 +372,24 @@ describe('runDing — status gating', () => {
     expect(sender.calls()[0]!.sequences[0]).toMatch(/^\[DING\] /);
     expect(sender.calls()[0]!.sequences[0]).toContain('smalltalk message');
     expect(sender.calls()[0]!.sequences[0]).not.toContain('coord message');
+    r.ac.abort();
+    await r.done;
+  });
+
+  it('poke id: the [id:…] discriminator is the filename rand6 (re-poke dedupe by glance)', async () => {
+    fake.setStatus('available');
+    fake.setMessage('1714826789010-zq7k2p.md', { from: 'bob', subject: 'ping' });
+    const r = startDing({ st: fake.st, ptySend: sender.send });
+    fake.pushEvent('1714826789010-zq7k2p.md');
+    await settle();
+    expect(sender.calls()).toHaveLength(1);
+    // The id is the rand6 suffix of the filename — a DIFFERENT message
+    // (zq7k2p, not aaaaaa) surfaces a DIFFERENT id, so the discriminator
+    // actually discriminates. Stable across re-pokes, so an agent can
+    // tell a re-poke of a handled message from a new one without ls.
+    expect(sender.calls()[0]!.sequences[0]).toBe(
+      '[DING] new smalltalk message: [id:zq7k2p] ping (from bob); check your inbox'
+    );
     r.ac.abort();
     await r.done;
   });
