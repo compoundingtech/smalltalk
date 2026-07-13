@@ -163,6 +163,66 @@ describe.skipIf(!HAS_JQ)('codex hooks — session-start.sh', () => {
     expect(payload.additionalContext).toContain('1714826789010-aaaaaa.md');
     expect(payload.additionalContext).toContain('unknown');
   });
+
+  // brief-024 parity: codex agents restore working-state (context/now.md)
+  // on cold-boot, same as the claude session-start hook.
+  it('fresh now.md is injected as a <context> block before the inbox', () => {
+    mkdirSync(join(stRoot, 'alice', 'context'), { recursive: true });
+    writeFileSync(
+      join(stRoot, 'alice', 'context', 'now.md'),
+      '# now — alice\n\nTask: ship the widget; waiting on PR #7.\n'
+    );
+    plant(
+      'alice',
+      '1714826789010-aaaaaa.md',
+      { from: 'bob', subject: 'deploy question' },
+      'body'
+    );
+    const r = runHook(SESSION_START_SH, { ST_ROOT: stRoot, ST_AGENT: 'alice' });
+    expect(r.exitCode).toBe(0);
+    const payload = JSON.parse(r.stdout) as { additionalContext: string };
+    expect(payload.additionalContext).toContain(
+      '<context source="st/context/now.md" agent="alice">'
+    );
+    expect(payload.additionalContext).toContain('Task: ship the widget');
+    expect(payload.additionalContext).toContain('</context>');
+    expect(payload.additionalContext).toContain('## st inbox (1 unread)');
+    // now.md block comes before the inbox snapshot.
+    expect(payload.additionalContext.indexOf('</context>')).toBeLessThan(
+      payload.additionalContext.indexOf('## st inbox')
+    );
+  });
+
+  it('fresh now.md with an EMPTY inbox still emits (the parity fix)', () => {
+    mkdirSync(join(stRoot, 'alice', 'context'), { recursive: true });
+    writeFileSync(
+      join(stRoot, 'alice', 'context', 'now.md'),
+      '# now — alice\nstill working.\n'
+    );
+    const r = runHook(SESSION_START_SH, { ST_ROOT: stRoot, ST_AGENT: 'alice' });
+    expect(r.exitCode).toBe(0);
+    const payload = JSON.parse(r.stdout) as { additionalContext: string };
+    expect(payload.additionalContext).toContain(
+      '<context source="st/context/now.md" agent="alice">'
+    );
+    expect(payload.additionalContext).toContain('still working.');
+    expect(payload.additionalContext).not.toContain('## st inbox');
+  });
+
+  it('stale now.md (ST_REHYDRATE_STALE_S=0) + empty inbox → silent, exit 0', () => {
+    mkdirSync(join(stRoot, 'alice', 'context'), { recursive: true });
+    writeFileSync(
+      join(stRoot, 'alice', 'context', 'now.md'),
+      '# now — alice\nold.\n'
+    );
+    const r = runHook(SESSION_START_SH, {
+      ST_ROOT: stRoot,
+      ST_AGENT: 'alice',
+      ST_REHYDRATE_STALE_S: '0',
+    });
+    expect(r.exitCode).toBe(0);
+    expect(r.stdout.trim()).toBe('');
+  });
 });
 
 // ─── stop.sh ───────────────────────────────────────────────────────────

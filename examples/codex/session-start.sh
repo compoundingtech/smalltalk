@@ -1,10 +1,15 @@
 #!/usr/bin/env bash
 # examples/codex/session-start.sh — Codex SessionStart hook.
 #
-# Reads $ST_ROOT/$ST_AGENT/inbox/ via `st message ls --json` and
-# emits a Codex hook payload that injects the unread snapshot as
-# additionalContext at the start of the session. Empty inbox → silent
-# exit (no payload). Missing env or `st` / `jq` not on PATH →
+# Emits a Codex hook payload that injects, as additionalContext at the
+# start of the session:
+#   1. the agent's last durable working-state ($ST_ROOT/$ST_AGENT/
+#      context/now.md), staleness-guarded — parity with the claude
+#      session-start hook so codex agents are context-restorable on
+#      cold-boot too; and
+#   2. the unread inbox snapshot via `st message ls --json`.
+# Both absent (no fresh now.md AND empty inbox) → silent exit (no
+# payload). Missing env or `st` / `jq` not on PATH →
 # non-zero exit with a stderr message; the hook is configured in
 # Codex with timeout/continue semantics so the session keeps going.
 # In-band failures (e.g. `st message ls` returns non-zero for a permission
@@ -48,6 +53,38 @@ if ! command -v jq >/dev/null 2>&1; then
   exit 1
 fi
 
+# ─── Restore working-state: context/now.md (parity with claude hook) ───
+#
+# brief-024 hook-legs parity: inject the agent's last durable
+# working-state so a cold-started codex agent picks the task back up
+# instead of reconstructing from scratch. Absent-able + staleness-
+# guarded exactly like examples/claude-code/hooks/session-start.sh:
+# now.md missing, or aged past $ST_REHYDRATE_STALE_S (default 24h), is
+# skipped — stale context is worse than none — leaving the pre-parity
+# behavior (inbox-only, or silent) intact.
+stale_s="${ST_REHYDRATE_STALE_S:-86400}"
+now_md="$ST_ROOT/$ST_AGENT/context/now.md"
+now_block=""
+if [ -f "$now_md" ]; then
+  # BSD (-f %m) + GNU (-c %Y) stat fallback; 0 on failure reads as stale.
+  now_mtime="$(stat -f %m "$now_md" 2>/dev/null || stat -c %Y "$now_md" 2>/dev/null || echo 0)"
+  if [[ "$now_mtime" =~ ^[0-9]+$ ]] && (( now_mtime > 0 )); then
+    age_s=$(( $(date +%s) - now_mtime ))
+    if (( age_s >= 0 && age_s < stale_s )); then
+      # Same <context source=...> envelope the claude hook emits, so
+      # downstream consumers (evals, log analyzers) recognize it. The
+      # trailing-newline dance keeps </context> on its own line whether
+      # or not now.md ends in a newline.
+      now_block="$(
+        printf '<context source="st/context/now.md" agent="%s">\n' "$ST_AGENT"
+        cat "$now_md"
+        [ -n "$(tail -c 1 "$now_md" 2>/dev/null)" ] && printf '\n'
+        printf '</context>'
+      )"
+    fi
+  fi
+fi
+
 # ─── Read inbox ───────────────────────────────────────────────────────
 
 # brief-005-phase0: capture stdout and stderr separately so warnings
@@ -62,28 +99,37 @@ if ! items_json=$(st message ls --json 2>"$err_file"); then
 fi
 
 count=$(printf '%s' "$items_json" | jq 'length')
-if [ "$count" -eq 0 ]; then
-  # Empty inbox: emit nothing, let Codex start without an injected block.
+inbox_text=""
+if [ "$count" -gt 0 ]; then
+  # Render the unread snapshot as a plain string (jq -r) so it composes
+  # with the now.md block before the final JSON envelope is built.
+  header="## st inbox ($count unread)"
+  inbox_text="$(printf '%s' "$items_json" | jq -r \
+    --arg header "$header" \
+    '$header + "\n" + (map(
+      "- " + .filename
+      + "  " + (.from // "unknown")
+      + (if .subject != null then "  Subject: " + .subject else "" end)
+    ) | join("\n"))')"
+fi
+
+# ─── Combine + emit ───────────────────────────────────────────────────
+#
+# additionalContext = now.md block (if fresh) then the inbox snapshot
+# (if any), blank-line-separated. If BOTH are absent — no fresh state
+# AND empty inbox — emit nothing and let codex start clean (unchanged
+# behavior for the no-now.md + empty-inbox case).
+if [ -n "$now_block" ] && [ -n "$inbox_text" ]; then
+  additional="${now_block}"$'\n\n'"${inbox_text}"
+elif [ -n "$now_block" ]; then
+  additional="$now_block"
+elif [ -n "$inbox_text" ]; then
+  additional="$inbox_text"
+else
   exit 0
 fi
 
-# ─── Build payload ────────────────────────────────────────────────────
-
-# additionalContext is a single string with newlines escaped — let jq
-# build it so the final envelope is valid JSON regardless of subject /
-# from field contents.
-header="## st inbox ($count unread)"
-
-printf '%s' "$items_json" | jq \
-  --arg header "$header" \
-  '{
-    additionalContext: (
-      $header + "\n" +
-      (map(
-        "- " + .filename
-        + "  " + (.from // "unknown")
-        + (if .subject != null then "  Subject: " + .subject else "" end)
-      ) | join("\n"))
-    ),
-    continue: true
-  }'
+# jq -Rs turns the raw combined string into a single JSON string,
+# escaping newlines/quotes so the envelope is valid regardless of
+# now.md / subject / from contents.
+printf '%s' "$additional" | jq -Rs '{additionalContext: ., continue: true}'

@@ -6,6 +6,20 @@ minor releases until 1.0.
 
 ## Unreleased
 
+### Fixed (codex session-start hook — restore `context/now.md`, not just the inbox)
+
+`examples/codex/session-start.sh` now injects the agent's last durable
+working-state (`$ST_ROOT/$ST_AGENT/context/now.md`) as a
+`<context source="st/context/now.md">` block, staleness-guarded and
+absent-able — parity with the claude session-start hook. Previously the
+codex hook injected only the unread inbox, so codex agents (vauban, any
+codex worker) cold-booted with no working-state to restore.
+
+The hook now emits when EITHER a fresh now.md OR a non-empty inbox is
+present (previously: only on a non-empty inbox). Both absent → still a
+silent exit, so the no-now.md + empty-inbox case is unchanged. Staleness
+threshold shares the claude hook's `$ST_REHYDRATE_STALE_S` (default 24h).
+
 ### Added (`st ding --root` — pin the state root in the command, plus an unset-root WARN)
 
 `st ding` now accepts `--root PATH` (alias `--st-root`), which overrides
