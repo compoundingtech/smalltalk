@@ -19,19 +19,22 @@
 # What it actually does:
 #   1. Refuses cleanly if $ST_AGENT / $ST_IDENTITY / $ST_AGENT
 #      is unset (nothing meaningful to flush).
-#   2. If `now.md` exists AND was written in the last 5 minutes, we
-#      trust that the model already flushed. No action.
-#   3. Otherwise, writes a "compaction-fired stub" to `now.md` via
-#      `st context write` (atomic tmp+rename). Boot-rehydrate will
-#      inject the stub as a `<context>` block; the model sees "the
-#      last thing that happened was compaction, no fresh state was
+#   2. If `now.md` exists AND holds real (non-whitespace) content, we
+#      trust that captured state and take NO action — we never clobber
+#      it, even if it's stale. Real-but-stale state (decisions, open
+#      threads) restores better than a reconstruct stub, and the read
+#      side already declines to inject a now.md older than
+#      $ST_REHYDRATE_STALE_S (default 24h), so staleness is handled there.
+#   3. Only when now.md is ABSENT or EMPTY (missing, 0-byte, or
+#      whitespace-only) does it write a "compaction-fired stub" via
+#      `st context write` (atomic tmp+rename). Boot-rehydrate injects the
+#      stub as a `<context>` block; the model sees "no fresh state was
 #      captured, reconstruct from git+inbox."
 #
-# The 5-minute freshness threshold is deliberately loose — the model
-# should be flushing at each meaningful state change, but if it's
-# been quietly working for a few minutes without flushing, we don't
-# want to clobber that quiet-but-current work with a stub. Threshold
-# is tunable via $ST_PRECOMPACT_FRESH_S (seconds; default 300).
+# This is the EMPTY-only rule. The prior 5-minute mtime freshness gate
+# stubbed any now.md older than 5 minutes — which CLOBBERED a
+# good-but-6-minute-old now.md on compaction, losing real captured state.
+# The former $ST_PRECOMPACT_FRESH_S threshold no longer applies.
 #
 # Hard cap on the `st context write` call via `timeout` (falls
 # back to `gtimeout` on darwin systems with coreutils installed;
@@ -87,27 +90,25 @@ err_log="$context_dir/.flush-errors.log"
 # log even before `st context write` lazy-creates it on first flush.
 mkdir -p "$context_dir" 2>/dev/null || true
 
-fresh_s="${ST_PRECOMPACT_FRESH_S:-300}"
 timeout_s="${ST_PRECOMPACT_TIMEOUT_S:-5}"
 
-# ─── Freshness check ─────────────────────────────────────────────────────
+# ─── Preserve real state: only stub an ABSENT or EMPTY now.md ─────────────
 
-# Skip the stub write entirely if now.md was written within the last
-# $fresh_s seconds — the model already flushed, don't clobber it.
-if [[ -f "$now_md" ]]; then
-  # BSD stat (darwin): -f %m gives mtime as unix seconds.
-  # GNU stat (linux): -c %Y gives mtime as unix seconds.
-  # Try both and fall back to 0 (which will read as very stale) if
-  # neither works, so a stat failure prompts a stub write instead of
-  # a silent skip.
-  now_mtime="$(stat -f %m "$now_md" 2>/dev/null || stat -c %Y "$now_md" 2>/dev/null || echo 0)"
-  if [[ "$now_mtime" =~ ^[0-9]+$ ]]; then
-    current_s="$(date +%s)"
-    age_s=$(( current_s - now_mtime ))
-    if (( age_s >= 0 && age_s < fresh_s )); then
-      exit 0
-    fi
-  fi
+# The stub is a fallback for when there is NOTHING to restore — it must
+# never CLOBBER captured state. So skip the stub whenever now.md exists
+# AND holds non-whitespace content, regardless of age. Rationale:
+# real-but-stale state (decisions, open threads) is strictly more useful
+# for a cold restore than a "reconstruct from scratch" stub, and staleness
+# is already guarded on the READ side — the session-start hook declines to
+# inject a now.md older than $ST_REHYDRATE_STALE_S (default 24h). Only an
+# absent or effectively-empty now.md (missing, 0-byte, or whitespace-only)
+# falls through to the stub write below.
+#
+# (Previously a 5-minute mtime freshness check, which CLOBBERED a
+# good-but-6-minute-old now.md on compaction — a real data-loss bug. The
+# former $ST_PRECOMPACT_FRESH_S threshold no longer applies.)
+if [[ -f "$now_md" ]] && [[ -n "$(tr -d '[:space:]' < "$now_md" 2>/dev/null)" ]]; then
+  exit 0
 fi
 
 # ─── Stub write ──────────────────────────────────────────────────────────

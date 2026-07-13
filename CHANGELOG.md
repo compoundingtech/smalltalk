@@ -6,6 +6,21 @@ minor releases until 1.0.
 
 ## Unreleased
 
+### Fixed (PreCompact hook — never clobber a present now.md; stub only when absent/empty)
+
+The PreCompact flush hook (`examples/claude-code/hooks/pre-compact.impl.sh`)
+previously wrote a "reconstruct-from-scratch" stub over any now.md older
+than 5 minutes (`$ST_PRECOMPACT_FRESH_S`). That **clobbered real captured
+state** — a good but 6-minute-old now.md was replaced with a stub on
+compaction, losing decisions/open-threads the model had flushed. Data loss.
+
+Now it's EMPTY-only: a present now.md with non-whitespace content is left
+untouched regardless of age (real-but-stale state restores better than a
+stub, and the read-side session-start hook already declines to inject a
+now.md older than `$ST_REHYDRATE_STALE_S`). The stub fires only when now.md
+is absent, 0-byte, or whitespace-only. `$ST_PRECOMPACT_FRESH_S` no longer
+applies.
+
 ### Fixed (codex session-start hook — restore `context/now.md`, not just the inbox)
 
 `examples/codex/session-start.sh` now injects the agent's last durable
