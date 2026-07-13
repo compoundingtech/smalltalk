@@ -1670,6 +1670,37 @@ export function probePtyOnPath(): PtyProbeResult {
   return { available: true };
 }
 
+/**
+ * Best-effort scan of `~/.local/state/*` for directories that look like an
+ * st state-root (contain at least one agent dir with an `inbox/`). Used only
+ * to WARN when `st ding` is about to watch the DEFAULT root with `ST_ROOT`
+ * unset while other roots also exist — the exact setup that silently makes a
+ * daemon watch the wrong inbox. Read-only; swallows all fs errors.
+ */
+function plausibleStateRoots(home: string): string[] {
+  const base = join(home, '.local/state');
+  let entries;
+  try {
+    entries = readdirSync(base, { withFileTypes: true });
+  } catch {
+    return [];
+  }
+  const roots: string[] = [];
+  for (const e of entries) {
+    if (!e.isDirectory()) continue;
+    const rootPath = join(base, e.name);
+    try {
+      const looksLikeRoot = readdirSync(rootPath, { withFileTypes: true }).some(
+        (k) => k.isDirectory() && existsSync(join(rootPath, k.name, 'inbox'))
+      );
+      if (looksLikeRoot) roots.push(rootPath);
+    } catch {
+      // unreadable subdir — skip
+    }
+  }
+  return roots;
+}
+
 export async function cmdDingCli(
   args: readonly string[],
   ctx: CliContext,
@@ -1682,6 +1713,11 @@ export async function cmdDingCli(
   let statusRefreshIntervalMs: number | undefined;
   // brief-031 amendment: default ON. CLI flag flips to false.
   let exitWhenSessionGone = true;
+  // Explicit state-root override. When set, wins over ctx.stRoot / $ST_ROOT.
+  // Lives on the COMMAND LINE (not just env) so a `pty restart` — which
+  // reuses the stored command but can drop/replace env — can't silently
+  // send the daemon back to the default root. See the ST_ROOT-mismatch class.
+  let rootArg: string | undefined;
 
   for (let i = 0; i < args.length; i++) {
     const a = args[i]!;
@@ -1708,6 +1744,12 @@ export async function cmdDingCli(
             `    ${invokedName(ctx.env)} ding my-claude-session --identity cos\n` +
             `    ST_DING_PANE_GUARD=0 ${invokedName(ctx.env)} ding my-session   # opt out of typing-aware guard\n\n` +
             '  --identity ID                    Smalltalk identity to watch. Defaults to $ST_AGENT.\n' +
+            '  --root PATH (alias --st-root)    State root to watch. Overrides $ST_ROOT and the\n' +
+            '                                   install default. Put this in the LAUNCH COMMAND so\n' +
+            '                                   it survives a `pty restart` (which reuses the stored\n' +
+            '                                   command but can drop env) — otherwise an unset root\n' +
+            '                                   silently falls back to the default and may watch the\n' +
+            '                                   wrong inbox.\n' +
             '  --interval MS                    Status poll interval while buffered. Default 1000ms.\n' +
             '  --tidy-interval-ms MS            Tidy-check tick interval. Default 20 min.\n' +
             '                                   Set to 0 to disable tidy-check entirely\n' +
@@ -1798,6 +1840,15 @@ export async function cmdDingCli(
       case '--no-exit-when-session-gone':
         exitWhenSessionGone = false;
         break;
+      case '--root':
+      case '--st-root': {
+        const v = args[++i];
+        if (v === undefined || v.length === 0) {
+          throw new Error(`${a} requires a state-root path`);
+        }
+        rootArg = v;
+        break;
+      }
       default:
         if (a.startsWith('-')) throw new Error(`unknown flag: ${a}`);
         if (ptySession === undefined) {
@@ -1812,9 +1863,30 @@ export async function cmdDingCli(
     throw new Error('st ding requires a <pty-session> name');
   }
 
-  const root = ctx.stRoot;
+  const root = rootArg ?? ctx.stRoot;
   if (!root) {
     throw new Error('ST_ROOT must be set for `st ding`');
+  }
+  // Ambiguous-root guard: if the root was neither passed (--root) nor set
+  // ($ST_ROOT) — i.e. we fell back to the install default — and more than
+  // one state root exists on disk, warn loudly. A ding watching the wrong
+  // root silently re-pokes stranded messages (phantom pokes) and never
+  // delivers the agent's real inbox — the ST_ROOT-mismatch class this flag
+  // exists to prevent. One warning is far cheaper than that diagnosis.
+  const rootWasExplicit =
+    rootArg !== undefined ||
+    (ctx.env.ST_ROOT !== undefined && ctx.env.ST_ROOT.length > 0);
+  if (!rootWasExplicit) {
+    const roots = plausibleStateRoots(ctx.env.HOME ?? homedir());
+    if (roots.length > 1) {
+      ctx.stderr(
+        `[st ding] WARN: ST_ROOT unset — defaulting to ${root}, but ` +
+          `${roots.length} state roots exist on disk: ${roots.join(', ')}. ` +
+          `If this agent's network uses a different root, pass --root <path> ` +
+          `(or set ST_ROOT) — otherwise this ding may watch the wrong inbox ` +
+          `and emit phantom pokes for stranded messages.\n`
+      );
+    }
   }
   const identityValue = identityArg ?? ctx.env.ST_AGENT;
   if (!identityValue) {

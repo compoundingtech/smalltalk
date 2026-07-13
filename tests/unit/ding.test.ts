@@ -767,6 +767,77 @@ describe('cmdDingCli — arg parsing', () => {
     ).rejects.toThrow(/--tidy-interval-ms must be a non-negative integer/);
   });
 
+  it('--root requires a path value', async () => {
+    await expect(
+      cmdDingCli(['session', '--root'], ctx({ ST_AGENT: 'bob' }))
+    ).rejects.toThrow(/--root requires a state-root path/);
+  });
+
+  it('--root <path> is accepted (parses, reaches the identity check)', async () => {
+    // No identity → it must throw the IDENTITY error, NOT "unknown flag",
+    // which proves --root was parsed and consumed its value.
+    await expect(
+      cmdDingCli(['session', '--root', '/custom/root'], ctx())
+    ).rejects.toThrow(/needs --identity ID or \$ST_AGENT/);
+  });
+
+  it('--st-root is an accepted alias for --root', async () => {
+    await expect(
+      cmdDingCli(['session', '--st-root', '/custom/root'], ctx())
+    ).rejects.toThrow(/needs --identity ID or \$ST_AGENT/);
+  });
+
+  it('WARNs when ST_ROOT is unset AND >1 state root exists on disk', async () => {
+    // A temp $HOME with two plausible st-roots (each has an agent/inbox).
+    const home = mkdtempSync(join(tmpdir(), 'ding-root-warn-'));
+    mkdirSync(join(home, '.local/state/smalltalk/alice/inbox'), {
+      recursive: true,
+    });
+    mkdirSync(join(home, '.local/state/convoy/bob/inbox'), { recursive: true });
+    try {
+      const c = ctx({ HOME: home }); // ST_ROOT unset, no ST_AGENT
+      // No identity → throws after the WARN block runs, so we can observe it.
+      await expect(cmdDingCli(['session'], c)).rejects.toThrow(/--identity/);
+      expect(c.stderrBuf.value).toMatch(/WARN: ST_ROOT unset/);
+      expect(c.stderrBuf.value).toContain('/.local/state/smalltalk');
+      expect(c.stderrBuf.value).toContain('/.local/state/convoy');
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('does NOT warn when --root is passed (root is explicit)', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'ding-root-nowarn-'));
+    mkdirSync(join(home, '.local/state/smalltalk/alice/inbox'), {
+      recursive: true,
+    });
+    mkdirSync(join(home, '.local/state/convoy/bob/inbox'), { recursive: true });
+    try {
+      const c = ctx({ HOME: home });
+      await expect(
+        cmdDingCli(['session', '--root', '/x'], c)
+      ).rejects.toThrow(/--identity/);
+      expect(c.stderrBuf.value).not.toMatch(/WARN: ST_ROOT unset/);
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('does NOT warn when ST_ROOT is set (root is explicit)', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'ding-root-envset-'));
+    mkdirSync(join(home, '.local/state/smalltalk/alice/inbox'), {
+      recursive: true,
+    });
+    mkdirSync(join(home, '.local/state/convoy/bob/inbox'), { recursive: true });
+    try {
+      const c = ctx({ HOME: home, ST_ROOT: '/explicit/root' });
+      await expect(cmdDingCli(['session'], c)).rejects.toThrow(/--identity/);
+      expect(c.stderrBuf.value).not.toMatch(/WARN: ST_ROOT unset/);
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
   it('malformed ST_DING_RESCAN_INTERVAL_MS env → warning + fall back to default', async () => {
     // Regression guard: a typo in an env var can't crash the daemon.
     // The warning is emitted, the default kicks in. cmdDingCli would

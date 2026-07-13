@@ -6,6 +6,25 @@ minor releases until 1.0.
 
 ## Unreleased
 
+### Added (`st ding --root` — pin the state root in the command, plus an unset-root WARN)
+
+`st ding` now accepts `--root PATH` (alias `--st-root`), which overrides
+`$ST_ROOT` and the install default for the state root the daemon watches.
+Put it in the launch command so it **survives a `pty restart`** — a restart
+reuses the stored command but can drop/replace env, so a daemon relying only
+on `$ST_ROOT` can silently fall back to the default root (`~/.local/state/smalltalk`)
+and watch the wrong inbox. That mismatch makes a daemon re-poke stranded
+messages from the wrong root forever (phantom pokes) while never delivering
+the agent's real inbox.
+
+Also: on startup, if `$ST_ROOT` is unset (and no `--root`) **and** more than
+one state root exists on disk under `~/.local/state/`, `st ding` now emits a
+loud one-line stderr WARN naming the roots — the exact ambiguity that
+otherwise takes a multi-round investigation to spot.
+
+Both are additive and back-compat: existing `st ding` invocations are
+unchanged (single-root setups never warn).
+
 ### Added (`st ding` — stable `[id:<rand6>]` discriminator in the `[DING]` poke line)
 
 The `[DING]` poke now carries a short, stable per-message id:
