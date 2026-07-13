@@ -377,31 +377,30 @@ describe('claude-code hooks — pre-compact.sh (brief-024)', () => {
     expect(r.stderr).toBe('');
   });
 
-  it('with FRESH now.md (<5 min) → NO write; model already flushed', () => {
+  it('present now.md with content → NO write, even when STALE (never clobbers real state)', () => {
     mkdirSync(join(scratch, 'alice', 'context'), { recursive: true });
     writeFileSync(
       join(scratch, 'alice', 'context', 'now.md'),
-      'model flushed this recently'
+      'real captured state: mid-task, waiting on PR #7'
     );
-    // Age 1 minute — well under the 5-minute default threshold.
-    ageFile(join(scratch, 'alice', 'context', 'now.md'), 60);
+    // Age 10 minutes — old. The former 5-min freshness gate would have
+    // CLOBBERED this with a reconstruct stub (data loss); the empty-only
+    // rule preserves it. Read-side staleness is guarded on injection.
+    ageFile(join(scratch, 'alice', 'context', 'now.md'), 600);
     const r = runPreCompact({
       ST_ROOT: scratch,
       ST_AGENT: 'alice',
     });
     expect(r.status).toBe(0);
-    // No `st context write` — the model's fresh flush wins.
+    // Present real content → no stub, no clobber, regardless of age.
     expect(r.calls).toEqual([]);
   });
 
-  it('with STALE now.md (>5 min) → writes stub via `st context write`', () => {
+  it('EMPTY now.md → writes stub (nothing real to preserve)', () => {
     mkdirSync(join(scratch, 'alice', 'context'), { recursive: true });
-    writeFileSync(
-      join(scratch, 'alice', 'context', 'now.md'),
-      'old state the model forgot to refresh'
-    );
-    // Age 10 minutes — well past the 5-minute default threshold.
-    ageFile(join(scratch, 'alice', 'context', 'now.md'), 600);
+    // Zero-byte now.md — the fallback stub SHOULD fire (nothing to
+    // clobber, and a cold restore needs *something*).
+    writeFileSync(join(scratch, 'alice', 'context', 'now.md'), '');
     const r = runPreCompact({
       ST_ROOT: scratch,
       ST_AGENT: 'alice',
@@ -411,28 +410,21 @@ describe('claude-code hooks — pre-compact.sh (brief-024)', () => {
     expect(r.calls[0]).toEqual(['context', 'write']);
   });
 
-  it('$ST_PRECOMPACT_FRESH_S overrides the freshness threshold', () => {
+  it('whitespace-only now.md → writes stub (treated as empty)', () => {
     mkdirSync(join(scratch, 'alice', 'context'), { recursive: true });
+    // Only whitespace — no real state to preserve, so the stub fires.
+    // (A size check alone would wrongly treat this as content.)
     writeFileSync(
       join(scratch, 'alice', 'context', 'now.md'),
-      '30-second-old flush'
+      '  \n\t\n  \n'
     );
-    ageFile(join(scratch, 'alice', 'context', 'now.md'), 30);
-
-    // Default (300s): 30 s is fresh, skip.
-    const rDefault = runPreCompact({
+    const r = runPreCompact({
       ST_ROOT: scratch,
       ST_AGENT: 'alice',
     });
-    expect(rDefault.calls).toEqual([]);
-
-    // Tighten to 15s: 30 s is stale, must write.
-    const rTight = runPreCompact({
-      ST_ROOT: scratch,
-      ST_AGENT: 'alice',
-      ST_PRECOMPACT_FRESH_S: '15',
-    });
-    expect(rTight.calls.length).toBe(1);
+    expect(r.status).toBe(0);
+    expect(r.calls.length).toBe(1);
+    expect(r.calls[0]).toEqual(['context', 'write']);
   });
 
   it('honors ST_AGENT identity chain (same as session-start.sh)', () => {
