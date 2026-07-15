@@ -301,7 +301,7 @@ export async function runCli(
       case 'overview':
         return cmdOverviewCli(rest, ctx);
       case 'sync':
-        return cmdSyncCli(rest, ctx);
+        return await cmdSyncCli(rest, ctx);
       case 'resource':
         return await cmdResourceCli(rest, ctx);
       case 'context':
