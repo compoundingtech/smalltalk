@@ -208,6 +208,29 @@ describe('fabricSyncCycle', () => {
     }
   });
 
+  it('sets an rsync --timeout on every call (a dead tunnel fails fast, never wedges)', () => {
+    mkId('bob');
+    put('bob', 'inbox', TWIN, 'same');
+    put('bob', 'archive', TWIN, 'same');
+    const state: MockState = { calls: [], status: 0 };
+    // default timeout
+    fabricSyncCycle(root, 'peer::smalltalk/', [], 'inbox-archive', {
+      runRsync: mockRsync(state),
+    });
+    for (const c of state.calls) {
+      expect(c.some((a) => a.startsWith('--timeout='))).toBe(true);
+    }
+    // explicit override flows through, positioned after transport args
+    const s2: MockState = { calls: [], status: 0 };
+    fabricSyncCycle(root, 'peer::smalltalk/', ['-e', '/tmp/rsh.sh'], 'inbox-archive', {
+      runRsync: mockRsync(s2),
+    }, 30);
+    for (const c of s2.calls) {
+      expect(c).toContain('--timeout=30');
+      expect(c.slice(0, 3)).toEqual(['-e', '/tmp/rsh.sh', '--timeout=30']);
+    }
+  });
+
   it('a failed pull throws and does not sweep locally', () => {
     mkId('bob');
     put('bob', 'inbox', TWIN, 'same');

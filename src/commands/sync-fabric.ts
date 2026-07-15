@@ -129,21 +129,31 @@ export interface FabricCycleResult {
  * A file delivered to the remote AFTER step 1 is untwinned, is not in the
  * step-2 plan, and is protected in step 4 — it survives and syncs next cycle.
  */
+/** Default rsync I/O timeout (seconds). Without it, rsync waits forever for a
+ * dead fabric tunnel, wedging a whole cycle (observed: an 8-minute hang on a
+ * silently-dropped dial). With it, a stalled transfer errors out and the run
+ * loop re-dials instead of hanging. */
+export const IO_TIMEOUT_S = 45;
+
 export function fabricSyncCycle(
   localRoot: string,
   remoteRoot: string,
   transportArgs: readonly string[],
   scope: SyncScope,
-  deps: FabricCycleDeps = {}
+  deps: FabricCycleDeps = {},
+  ioTimeoutS: number = IO_TIMEOUT_S
 ): FabricCycleResult {
   const runRsync = deps.runRsync ?? defaultRunRsync;
   const banner = deps.banner ?? (() => {});
   const src = `${stripTrailingSlash(localRoot)}/`;
   const filters = scopeFilters(scope);
+  // Prefix on every rsync: transport (e.g. -e rsh) + an I/O timeout so a dead
+  // fabric tunnel fails the cycle fast instead of hanging it indefinitely.
+  const prefix = [...transportArgs, `--timeout=${ioTimeoutS}`];
 
   // 1. PULL remote -> local.
   banner(`# fabric pull: ${remoteRoot} -> ${src}`);
-  const pull = runRsync([...transportArgs, ...filters, remoteRoot, src]);
+  const pull = runRsync([...prefix, ...filters, remoteRoot, src]);
   if (pull.status !== 0) {
     throw new SyncFailedError(
       'pull',
@@ -162,7 +172,7 @@ export function fabricSyncCycle(
   if (rels.length > 0) {
     banner(`# fabric remote-sweep: delete ${rels.length} twin(s) from ${remoteRoot}`);
     const rs = runRsync([
-      ...transportArgs,
+      ...prefix,
       ...remoteSweepFilters(rels),
       ...SCOPE_INBOX_ONLY,
       src,
@@ -180,7 +190,7 @@ export function fabricSyncCycle(
 
   // 5. PUSH local -> remote (union, no delete).
   banner(`# fabric push: ${src} -> ${remoteRoot}`);
-  const push = runRsync([...transportArgs, ...filters, src, remoteRoot]);
+  const push = runRsync([...prefix, ...filters, src, remoteRoot]);
   if (push.status !== 0) {
     throw new SyncFailedError(
       'push',
@@ -397,6 +407,8 @@ export interface FabricRunOptions {
   scope: SyncScope;
   intervalMs: number;
   once: boolean;
+  /** rsync I/O timeout (seconds) — a dead tunnel fails the cycle fast. */
+  timeoutS: number;
 }
 
 /**
@@ -416,7 +428,9 @@ export async function cmdSyncFabricRun(
 
   if (opts.once) {
     const t = setUpTransport(opts.peer, ctx, sctx);
-    const r = fabricSyncCycle(opts.root, t.remoteRoot, t.transportArgs, opts.scope, deps);
+    const r = fabricSyncCycle(
+      opts.root, t.remoteRoot, t.transportArgs, opts.scope, deps, opts.timeoutS
+    );
     ctx.stderr(
       `# fabric cycle: swept ${r.localRemoved} local, ` +
         `${r.remoteDeleted.length} remote\n`
@@ -428,7 +442,9 @@ export async function cmdSyncFabricRun(
   for (;;) {
     try {
       if (transport === undefined) transport = setUpTransport(opts.peer, ctx, sctx);
-      fabricSyncCycle(opts.root, transport.remoteRoot, transport.transportArgs, opts.scope, deps);
+      fabricSyncCycle(
+        opts.root, transport.remoteRoot, transport.transportArgs, opts.scope, deps, opts.timeoutS
+      );
     } catch (err) {
       ctx.stderr(`# fabric cycle error: ${errMsg(err)} — re-dialing\n`);
       transport = undefined; // force a fresh dial next iteration
@@ -452,7 +468,7 @@ export function cmdSyncFabricCli(
   const name = invokedName(ctx.env);
   const usage =
     `usage: ${name} sync fabric run <peer> [--root PATH] [--scope inbox-archive|all]\n` +
-    `                              [--interval S] [--once]\n` +
+    `                              [--interval S] [--timeout S] [--once]\n` +
     `       ${name} sync fabric serve [--root PATH] [--conf PATH]\n\n` +
     '  run   drive the cross-machine bus: dial <peer> (use fabric:<name> for a\n' +
     '        fabric peer), then loop pull -> sweep both roots -> push. --once\n' +
@@ -487,6 +503,7 @@ function runFromArgs(
   let root = ctx.stRoot;
   let scope: SyncScope = 'inbox-archive';
   let intervalMs = DEFAULT_INTERVAL_S * 1000;
+  let timeoutS = IO_TIMEOUT_S;
   let once = false;
 
   for (let i = 0; i < rest.length; i++) {
@@ -516,6 +533,15 @@ function runFromArgs(
         intervalMs = Math.round(s * 1000);
         break;
       }
+      case '--timeout': {
+        const v = expectValue(rest, ++i, a);
+        const s = Number(v);
+        if (!Number.isFinite(s) || s <= 0) {
+          throw new Error(`--timeout must be a positive number of seconds, got: ${v}`);
+        }
+        timeoutS = Math.round(s);
+        break;
+      }
       case '-h':
       case '--help':
         ctx.stderr(usage);
@@ -527,7 +553,7 @@ function runFromArgs(
     }
   }
   if (peer === undefined) throw new Error('<peer> required for run');
-  return cmdSyncFabricRun({ peer, root, scope, intervalMs, once }, ctx);
+  return cmdSyncFabricRun({ peer, root, scope, intervalMs, timeoutS, once }, ctx);
 }
 
 function serveFromArgs(
