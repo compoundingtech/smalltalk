@@ -21,7 +21,10 @@ import {
   assertModernRsync,
   assertSocketPathOk,
   fabricExposeArgs,
+  fabricHardTimeoutMs,
   fabricSyncCycle,
+  HARD_TIMEOUT_BUFFER_S,
+  IO_TIMEOUT_S,
   MAX_UNIX_SOCKET_PATH,
   remoteSweepFilters,
   rshScriptContent,
@@ -255,6 +258,19 @@ describe('fabricSyncCycle', () => {
       expect(c.some((a) => a.startsWith('--include='))).toBe(false);
       expect(c.some((a) => a.startsWith('--exclude='))).toBe(false);
     }
+  });
+});
+
+// ─── wall-clock backstop (spawnSync timeout) ─────────────────────────────
+
+describe('fabricHardTimeoutMs', () => {
+  it('is the I/O timeout plus the buffer, in ms — a hard kill above rsync --timeout', () => {
+    expect(fabricHardTimeoutMs(IO_TIMEOUT_S)).toBe((IO_TIMEOUT_S + HARD_TIMEOUT_BUFFER_S) * 1000);
+    expect(fabricHardTimeoutMs(20)).toBe((20 + HARD_TIMEOUT_BUFFER_S) * 1000);
+    // Strictly greater than the rsync --timeout it backstops, so rsync's own
+    // I/O timeout wins on a healthy-but-slow transfer and this only fires on a
+    // true hang (e.g. a handshake-wedged connection --timeout can't catch).
+    expect(fabricHardTimeoutMs(20)).toBeGreaterThan(20 * 1000);
   });
 });
 

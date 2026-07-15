@@ -26,7 +26,6 @@ import { invokedName, type CliContext } from '../cli-context.ts';
 import { applySweepPlan, sweepPlan } from '../common.ts';
 import { SyncFailedError } from '../errors.ts';
 import {
-  defaultRunRsync,
   resolvePeer,
   type RsyncResult,
   type SyncContext,
@@ -135,6 +134,42 @@ export interface FabricCycleResult {
  * loop re-dials instead of hanging. */
 export const IO_TIMEOUT_S = 45;
 
+/** Seconds added to the rsync I/O timeout to get the wall-clock backstop.
+ * rsync's own `--timeout` should normally win; this buffer just keeps the hard
+ * kill from racing it on a healthy-but-slow transfer. */
+export const HARD_TIMEOUT_BUFFER_S = 15;
+
+/** The spawnSync wall-clock timeout (ms) for a fabric-cycle rsync. */
+export function fabricHardTimeoutMs(ioTimeoutS: number): number {
+  return (ioTimeoutS + HARD_TIMEOUT_BUFFER_S) * 1000;
+}
+
+/**
+ * The fabric cycle's default rsync runner: `rsync -a <args>` via spawnSync WITH
+ * a wall-clock `timeout`. rsync's own `--timeout` is an I/O-inactivity timeout
+ * that does NOT cover a connection wedged in the pre-transfer handshake — the
+ * exact state an in-flight connection lands in when the serve backend is swapped
+ * or a fabric path transitions mid-transfer. Such an rsync hangs forever, and
+ * because spawnSync blocks, the whole cycle hangs and `cmdSyncFabricRun`'s
+ * re-dial-on-error is never reached. The spawnSync `timeout` force-kills it
+ * (status → null → treated as failure → the loop re-dials). Observed live: a
+ * pull hung 25 min through a serve cutover with `--timeout` set but never firing.
+ */
+export function fabricRunRsync(ioTimeoutS: number): (args: string[]) => RsyncResult {
+  const timeout = fabricHardTimeoutMs(ioTimeoutS);
+  return (args) => {
+    const r = spawnSync('rsync', ['-a', ...args], {
+      stdio: ['inherit', 'inherit', 'pipe'],
+      encoding: 'utf8',
+      timeout,
+    });
+    return {
+      status: r.status ?? -1,
+      stderr: typeof r.stderr === 'string' ? r.stderr : undefined,
+    };
+  };
+}
+
 export function fabricSyncCycle(
   localRoot: string,
   remoteRoot: string,
@@ -143,7 +178,7 @@ export function fabricSyncCycle(
   deps: FabricCycleDeps = {},
   ioTimeoutS: number = IO_TIMEOUT_S
 ): FabricCycleResult {
-  const runRsync = deps.runRsync ?? defaultRunRsync;
+  const runRsync = deps.runRsync ?? fabricRunRsync(ioTimeoutS);
   const banner = deps.banner ?? (() => {});
   const src = `${stripTrailingSlash(localRoot)}/`;
   const filters = scopeFilters(scope);
