@@ -131,7 +131,7 @@ export class InvalidDurationError extends StError {
 
 // ─── Sync / peers ──────────────────────────────────────────────────────
 
-export type SyncStage = 'push' | 'pull';
+export type SyncStage = 'push' | 'pull' | 'remote-sweep';
 
 export class SyncFailedError extends StError {
   readonly stage: SyncStage;

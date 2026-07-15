@@ -140,7 +140,7 @@ function lookupPeerAlias(
 
 // ─── rsync invocation ───────────────────────────────────────────────────
 
-function defaultRunRsync(args: string[]): RsyncResult {
+export function defaultRunRsync(args: string[]): RsyncResult {
   const r = spawnSync('rsync', ['-a', ...args], {
     stdio: ['inherit', 'inherit', 'pipe'],
     encoding: 'utf8',
@@ -308,8 +308,17 @@ export {
 // ─── CLI wrapper ────────────────────────────────────────────────────────
 
 import { invokedName, type CliContext } from '../cli-context.ts';
+import { cmdSyncFabricCli } from './sync-fabric.ts';
 
-export function cmdSyncCli(args: readonly string[], ctx: CliContext): number {
+export function cmdSyncCli(
+  args: readonly string[],
+  ctx: CliContext
+): number | Promise<number> {
+  // `fabric` is a subcommand group with its own arg grammar (run/serve +
+  // flags); hand it the remaining args before the push/pull parser runs.
+  if (args[0] === 'fabric') {
+    return cmdSyncFabricCli(args.slice(1), ctx);
+  }
   let verb: string | undefined;
   let peer: string | undefined;
   let all = false;

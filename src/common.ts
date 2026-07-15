@@ -749,26 +749,52 @@ export interface SweepResult {
 }
 
 /**
- * Enforce the LAYOUT archive-as-tombstone invariant: for every
- * `<id>/archive/X.md` under `stRoot`, remove `<id>/inbox/X.md` if it
- * is byte-identical to the archive copy. Skips divergent pairs (a violated
- * invariant — likely manual edit; surfaced by archive case-3). Idempotent.
+ * One redundant inbox file that {@link sweep} would remove: a byte-identical
+ * archive twin per the LAYOUT tombstone invariant.
+ */
+export interface SweepEntry {
+  /** identity dir, e.g. `"bob"`. */
+  id: string;
+  /** file basename, e.g. `"1714826789010-aaaaaa.md"`. */
+  name: string;
+  /** absolute path of the redundant inbox copy (the one sweep removes). */
+  inboxPath: string;
+  /** absolute path of the archive twin (the tombstone that authorizes it). */
+  archivePath: string;
+  /** POSIX root-relative path, `"<id>/inbox/<name>"` — a stable rsync key. */
+  rel: string;
+}
+
+/**
+ * Compute — WITHOUT removing anything — the set of inbox files that are
+ * byte-identical archive twins per the LAYOUT archive-as-tombstone
+ * invariant: for every `<id>/archive/X.md` under `root`, `<id>/inbox/X.md`
+ * qualifies iff it exists AND is byte-identical to the archive copy.
+ * Divergent pairs (inbox differs from archive — likely a manual edit) are
+ * skipped, exactly as {@link sweep} skips them.
  *
  * Issue #8 extension: the rule also applies to prefix-sibling attachments
  * — `archive/X.options.json` byte-identical to `inbox/X.options.json`
- * is removed from inbox iff a matching `archive/X.md` exists, so the
- * file is recognized as part of a real st message family rather than
- * an unrelated user-dropped file.
+ * qualifies iff a matching `archive/X.md` exists, so the file is recognized
+ * as part of a real st message family rather than an unrelated user-dropped
+ * file.
+ *
+ * This is the planning half of {@link sweep} (which is `sweepPlan` + unlink).
+ * It is exposed so the fabric syncer can compute the SAME twin-verified
+ * delete-set for a *remote* inbox and delete exactly those paths (targeted),
+ * rather than trusting a blanket `rsync --delete` — which would also delete a
+ * fresh, not-yet-reconciled delivery that is legitimately absent from the
+ * source. A fresh delivery has no archive twin, so it never appears here.
  */
-export function sweep(rootArg?: string): SweepResult {
+export function sweepPlan(rootArg?: string): SweepEntry[] {
   const root = rootArg ?? stRoot();
-  let removed = 0;
+  const plan: SweepEntry[] = [];
 
   let topEntries: string[];
   try {
     topEntries = readdirSync(root);
   } catch {
-    return { removed: 0 };
+    return plan;
   }
 
   for (const id of topEntries) {
@@ -803,15 +829,38 @@ export function sweep(rootArg?: string): SweepResult {
         continue;
       }
       if (inboxBuf.equals(archiveBuf)) {
-        try {
-          rmSync(inboxPath);
-          removed++;
-        } catch {
-          // ignore unlink failures — sweep is best-effort
-        }
+        plan.push({ id, name, inboxPath, archivePath, rel: `${id}/inbox/${name}` });
       }
     }
   }
 
-  return { removed };
+  return plan;
+}
+
+/**
+ * Remove every inbox copy named by a pre-computed {@link sweepPlan}, returning
+ * how many were unlinked. Splitting apply from plan lets a caller act on the
+ * SAME snapshot it inspected (e.g. remove locally and mirror the delete to a
+ * remote), instead of re-scanning. Idempotent; unlink failures are ignored
+ * (sweep is best-effort).
+ */
+export function applySweepPlan(plan: readonly SweepEntry[]): number {
+  let removed = 0;
+  for (const entry of plan) {
+    try {
+      rmSync(entry.inboxPath);
+      removed++;
+    } catch {
+      // ignore unlink failures — sweep is best-effort
+    }
+  }
+  return removed;
+}
+
+/**
+ * Enforce the LAYOUT archive-as-tombstone invariant by removing every
+ * redundant inbox file {@link sweepPlan} identifies. Idempotent.
+ */
+export function sweep(rootArg?: string): SweepResult {
+  return { removed: applySweepPlan(sweepPlan(rootArg)) };
 }
