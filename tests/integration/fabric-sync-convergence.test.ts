@@ -14,9 +14,12 @@ import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import { fabricSyncCycle } from '../../src/commands/sync-fabric.ts';
-import { cleanupRoot, mkIdentity, mkRoot, rsyncAvailable } from './helpers.ts';
+import { cleanupRoot, mkIdentity, mkRoot, modernRsyncAvailable } from './helpers.ts';
 
-const d = rsyncAvailable() ? describe : describe.skip;
+// Remote sweep needs daemon-over-rsh + protect/risk `--delete`, which
+// openrsync (macOS's /usr/bin/rsync) can't do — so SKIP (not FAIL) there,
+// mirroring the tool's own runtime openrsync reject.
+const d = modernRsyncAvailable() ? describe : describe.skip;
 
 const X = '1714826789010-aaaaaa.md'; // archived message (the zombie candidate)
 const Y = '1714826789020-bbbbbb.md'; // fresh delivery originating on A

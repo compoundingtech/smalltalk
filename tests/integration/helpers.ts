@@ -225,3 +225,17 @@ export function rsyncAvailable(): boolean {
   const r = spawnSync('rsync', ['--version'], { stdio: 'ignore' });
   return r.status === 0;
 }
+
+/**
+ * Like {@link rsyncAvailable}, but also requires a MODERN rsync. macOS ships
+ * openrsync (Apple's reimplementation) as `/usr/bin/rsync`, which cannot do the
+ * daemon-over-rsh + protect/risk `--delete` that `st sync fabric`'s remote
+ * sweep relies on. Tests exercising remote deletion gate on this so they SKIP
+ * (not FAIL) on a stock Mac — mirroring the tool's own runtime openrsync reject.
+ */
+export function modernRsyncAvailable(): boolean {
+  const r = spawnSync('rsync', ['--version'], { encoding: 'utf8' });
+  if (r.status !== 0) return false;
+  const out = `${typeof r.stdout === 'string' ? r.stdout : ''}${typeof r.stderr === 'string' ? r.stderr : ''}`;
+  return !/openrsync/i.test(out);
+}
