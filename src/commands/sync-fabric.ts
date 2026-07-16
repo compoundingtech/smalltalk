@@ -31,18 +31,29 @@ import {
   type SyncContext,
 } from './sync.ts';
 
-// ─── scope (decision c) ─────────────────────────────────────────────────
+// ─── scope ──────────────────────────────────────────────────────────────
 //
-// Default scope = message traffic only: `*/inbox/**` + `*/archive/**`. Status
-// and context files are owning-machine-authoritative, so they stay
-// machine-local and are never synced unless `--scope all` is given.
+// Default scope = message traffic + cross-machine liveness:
+//   `*/inbox/**` + `*/archive/**`  (messages, decision c)
+//   `*/status` + `*/host`          (the liveness heartbeat + host marker)
+// Each agent's `status` file (mtime = liveness heartbeat) and `host` file
+// (which machine it runs on) sync so a remote reader sees real live/offline
+// + the correct host. This is mtime-PRESERVING (rsync `-a` implies `-t`), so a
+// dead agent's frozen status mtime propagates as dead rather than being
+// refreshed to receive-time — the load-bearing property (see the pin test).
+// Home-host-authoritative union (no `--delete`): each host writes only its own
+// agents' status/host, so no two hosts write the same file → no flap.
+// `context` files stay machine-local and are never synced unless `--scope all`.
 
-/** rsync include/exclude args that limit a transfer to inbox+archive subtrees. */
-export const SCOPE_INBOX_ARCHIVE: readonly string[] = [
+/** rsync include/exclude args for the default scope: inbox+archive subtrees
+ *  plus the per-agent `status` + `host` liveness files. */
+export const SCOPE_DEFAULT: readonly string[] = [
   '--prune-empty-dirs',
   '--include=*/',
   '--include=inbox/**',
   '--include=archive/**',
+  '--include=*/status',
+  '--include=*/host',
   '--exclude=*',
 ];
 
@@ -58,7 +69,7 @@ export const SCOPE_INBOX_ONLY: readonly string[] = [
 export type SyncScope = 'inbox-archive' | 'all';
 
 function scopeFilters(scope: SyncScope): readonly string[] {
-  return scope === 'all' ? [] : SCOPE_INBOX_ARCHIVE;
+  return scope === 'all' ? [] : SCOPE_DEFAULT;
 }
 
 // ─── the safe remote sweep (the crux) ───────────────────────────────────
@@ -145,12 +156,24 @@ export function fabricHardTimeoutMs(ioTimeoutS: number): number {
 }
 
 /**
- * The fabric cycle's default rsync runner: `rsync -a <args>` via spawnSync WITH
- * a wall-clock `timeout`. rsync's own `--timeout` is an I/O-inactivity timeout
- * that does NOT cover a connection wedged in the pre-transfer handshake — the
- * exact state an in-flight connection lands in when the serve backend is swapped
- * or a fabric path transitions mid-transfer. Such an rsync hangs forever, and
- * because spawnSync blocks, the whole cycle hangs and `cmdSyncFabricRun`'s
+ * The fabric cycle's default rsync runner: `rsync -a -u <args>` via spawnSync
+ * WITH a wall-clock `timeout`.
+ *
+ * `-u` (--update): skip any file that is NEWER on the receiver. Messages are
+ * immutable so this is a no-op for them, but the liveness `status` file MUTATES
+ * (its mtime bumps every heartbeat). Without `-u`, the pull leg (remote→local,
+ * a plain `rsync -a`) would overwrite a home host's just-touched status with the
+ * older copy it previously synced OUT — reverting the heartbeat and making a
+ * live agent look stale. With `-u`, the home host (which always holds the newest
+ * status, since only it writes that agent's file) wins, and a dead agent's
+ * frozen mtime is never bumped by anyone. Newer-mtime-wins is exactly the
+ * home-host-authoritative semantics.
+ *
+ * `timeout`: rsync's own `--timeout` is an I/O-inactivity timeout that does NOT
+ * cover a connection wedged in the pre-transfer handshake — the exact state an
+ * in-flight connection lands in when the serve backend is swapped or a fabric
+ * path transitions mid-transfer. Such an rsync hangs forever, and because
+ * spawnSync blocks, the whole cycle hangs and `cmdSyncFabricRun`'s
  * re-dial-on-error is never reached. The spawnSync `timeout` force-kills it
  * (status → null → treated as failure → the loop re-dials). Observed live: a
  * pull hung 25 min through a serve cutover with `--timeout` set but never firing.
@@ -158,7 +181,7 @@ export function fabricHardTimeoutMs(ioTimeoutS: number): number {
 export function fabricRunRsync(ioTimeoutS: number): (args: string[]) => RsyncResult {
   const timeout = fabricHardTimeoutMs(ioTimeoutS);
   return (args) => {
-    const r = spawnSync('rsync', ['-a', ...args], {
+    const r = spawnSync('rsync', ['-a', '-u', ...args], {
       stdio: ['inherit', 'inherit', 'pipe'],
       encoding: 'utf8',
       timeout,
