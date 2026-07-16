@@ -118,3 +118,12 @@ export {
   type OverviewInbox,
   type OverviewInboxOldest,
 } from './commands/overview.ts';
+
+// ─── Read-only bus reader (for tools that import instead of shelling `st`) ─
+
+export {
+  createBusReader,
+  type BusReader,
+  type BusReaderOptions,
+  type BusReaderAgentsOptions,
+} from './bus-reader.ts';

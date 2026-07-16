@@ -71,6 +71,10 @@ describe('root subpath — every documented export is present', () => {
     expect(typeof index.VERSION).toBe('string');
   });
 
+  it('has the read-only bus reader', () => {
+    expect(typeof index.createBusReader).toBe('function');
+  });
+
   it.each([
     'asFilename',
     'asIdentity',
