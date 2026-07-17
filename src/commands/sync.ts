@@ -19,7 +19,7 @@ import {
 } from 'node:fs';
 import { join } from 'node:path';
 
-import { pluralize, sweep } from '../common.ts';
+import { pluralize, rootShapeWarning, sweep } from '../common.ts';
 import {
   PeersConfigInvalidError,
   PeersConfigMissingError,
@@ -357,6 +357,12 @@ export function cmdSyncCli(
     stRoot: ctx.stRoot,
     stConfig: ctx.stConfig,
   };
+  // Loud guard: a sync/sweep pointed at the wrong root (e.g. the convoy
+  // parent instead of the bus root) silently no-ops the tombstone sweep while
+  // still rsyncing the nested tree — the exact shape of the resurrection
+  // incident. Warn before doing any work; never blocks.
+  const rootWarn = rootShapeWarning(ctx.stRoot);
+  if (rootWarn !== null) ctx.stderr(`${rootWarn}\n`);
   if (all) {
     if (peer !== undefined) throw new Error('--all takes no <peer> argument');
     switch (verb) {
