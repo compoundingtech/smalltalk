@@ -313,12 +313,14 @@ describe('transport hardening', () => {
 // ─── serve side (fabric exec-expose registration) ────────────────────────
 
 describe('serve-side config + registration', () => {
-  it('rsyncdConfContent declares a read-write module pointing at the root', () => {
-    const conf = rsyncdConfContent('/home/u/.local/state/convoy');
-    expect(conf).toContain('[smalltalk]');
-    expect(conf).toContain('path = /home/u/.local/state/convoy');
+  it('rsyncdConfContent declares a read-write module on the net dir, excluding local subtrees', () => {
+    const conf = rsyncdConfContent('/home/u/.local/state/convoy/default');
+    expect(conf).toContain('[net]');
+    expect(conf).toContain('path = /home/u/.local/state/convoy/default');
     expect(conf).toContain('read only = false');
     expect(conf).toContain('use chroot = false');
+    // pty/ + worktrees/ stay machine-local — the daemon must not serve them.
+    expect(conf).toContain('exclude = /pty/ /worktrees/');
   });
 
   it('fabricExposeArgs registers the per-dial rsync exec handler', () => {

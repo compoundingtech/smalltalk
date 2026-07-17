@@ -20,6 +20,7 @@
 import { spawnSync } from 'node:child_process';
 import {
   chmodSync,
+  existsSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -274,6 +275,51 @@ function stripTrailingSlash(s: string): string {
   return s.endsWith('/') ? s.slice(0, -1) : s;
 }
 
+/**
+ * The catalog cross-machine union-sync (declarative-convoy piece 2): pull then
+ * push `<net>/catalog/` with the peer. Union-only (no `--delete`), newer-wins
+ * (`-u`), mtime-preserving (`-t`) — the same machinery the liveness status sync
+ * uses. Deliberately SIMPLE relative to the message-bus cycle: NO tombstone
+ * sweep. A catalog `.toml` is not an inbox/archive twin; a decommission is a
+ * `retired = true` EDIT that propagates like any other edit (an `rm` can't be
+ * the removal primitive under no-delete union — a peer just re-propagates the
+ * file). This is content-agnostic: it carries the whole flat catalog to every
+ * machine; convoy's reconcile host-filters and honors `retired`.
+ */
+export function catalogUnionSync(
+  localRoot: string,
+  remoteRoot: string,
+  transportArgs: readonly string[],
+  ioTimeoutS: number,
+  deps: FabricCycleDeps = {}
+): void {
+  const runRsync = deps.runRsync ?? fabricRunRsync(ioTimeoutS);
+  const banner = deps.banner ?? (() => {});
+  const src = `${stripTrailingSlash(localRoot)}/`;
+  const prefix = [...transportArgs, `--timeout=${ioTimeoutS}`];
+
+  banner(`# catalog pull: ${remoteRoot} -> ${src}`);
+  const pull = runRsync([...prefix, remoteRoot, src]);
+  if (pull.status !== 0) {
+    throw new SyncFailedError(
+      'pull',
+      pull.status,
+      pull.stderr,
+      `catalog pull failed: ${remoteRoot} -> ${src}`
+    );
+  }
+  banner(`# catalog push: ${src} -> ${remoteRoot}`);
+  const push = runRsync([...prefix, src, remoteRoot]);
+  if (push.status !== 0) {
+    throw new SyncFailedError(
+      'push',
+      push.status,
+      push.stderr,
+      `catalog push failed: ${src} -> ${remoteRoot}`
+    );
+  }
+}
+
 // ─── transport hardening (decision b) ────────────────────────────────────
 //
 // The gotchas that cost us hours live in the tool, not tribal memory:
@@ -322,14 +368,20 @@ export function rshScriptContent(socketPath: string): string {
 
 // ─── run-side transport setup + loop ─────────────────────────────────────
 
-/** rsync daemon module the serve side exposes (maps to the peer's ST_ROOT). */
-export const RSYNC_MODULE = 'smalltalk';
+/** rsync daemon module the serve side exposes: the whole NETWORK dir
+ *  (`<net>/`), so both the synced subtrees — `smalltalk/` (the message bus)
+ *  and `catalog/` (the declarative-convoy scheduler) — are reachable as
+ *  sub-paths of one module. `pty/` + `worktrees/` live under it too but are
+ *  never synced (the run side never targets them; the serve conf also excludes
+ *  them). */
+export const RSYNC_MODULE = 'net';
 /** fabric protocol name the serve side exposes / the run side dials. */
 export const FABRIC_PROTO = 'st-sync';
 
 interface Transport {
-  /** resolved rsync target, e.g. `"peer::smalltalk/"` or `"/path/"`. */
-  remoteRoot: string;
+  /** The NET-level rsync target base, e.g. `"peer::net/"` or `"/path/net/"`.
+   *  The run side appends `smalltalk/` and `catalog/` to reach each subtree. */
+  remoteBase: string;
   /** rsync transport args: `['-e', <rsh>]` for fabric; `[]` otherwise. */
   transportArgs: string[];
 }
@@ -347,7 +399,7 @@ function setUpTransport(
   sctx: SyncContext
 ): Transport {
   if (!peer.startsWith('fabric:')) {
-    return { remoteRoot: resolvePeer(peer, sctx), transportArgs: [] };
+    return { remoteBase: resolvePeer(peer, sctx), transportArgs: [] };
   }
   const fabricPeer = peer.slice('fabric:'.length);
   if (fabricPeer.length === 0) {
@@ -374,9 +426,16 @@ function setUpTransport(
   writeFileSync(scriptPath, rshScriptContent(socketPath));
   chmodSync(scriptPath, 0o755);
   return {
-    remoteRoot: `${fabricPeer}::${RSYNC_MODULE}/`,
+    remoteBase: `${fabricPeer}::${RSYNC_MODULE}/`,
     transportArgs: ['-e', scriptPath],
   };
+}
+
+/** Append a subtree to a net-level rsync base target, e.g.
+ *  `("peer::net/", "smalltalk")` → `"peer::net/smalltalk/"`. */
+function remoteSubtree(remoteBase: string, subtree: string): string {
+  const base = remoteBase.endsWith('/') ? remoteBase : `${remoteBase}/`;
+  return `${base}${subtree}/`;
 }
 
 // ─── serve side (fabric exec-expose) ─────────────────────────────────────
@@ -391,18 +450,23 @@ function setUpTransport(
 
 /**
  * rsyncd module config served per-dial by `rsync --server --daemon --config`.
- * `read only = false` so the run side can push (and remote-sweep). `use chroot
- * = false` because fabric already isolates the tunnel and we serve a user-owned
- * state tree, not a system path.
+ * The module path is the NETWORK dir (`<net>/`), so both `smalltalk/` and
+ * `catalog/` are reachable sub-paths. `read only = false` so the run side can
+ * push (and remote-sweep). `use chroot = false` because fabric already isolates
+ * the tunnel and we serve a user-owned state tree, not a system path. The
+ * `exclude` keeps `pty/` + `worktrees/` machine-local — the daemon refuses to
+ * serve them even if a client asked (defense-in-depth; the run side never
+ * targets them either).
  */
-export function rsyncdConfContent(root: string, module: string = RSYNC_MODULE): string {
+export function rsyncdConfContent(netRoot: string, module: string = RSYNC_MODULE): string {
   return (
     'use chroot = false\n' +
     'max verbosity = 1\n' +
     `[${module}]\n` +
-    `    path = ${root}\n` +
+    `    path = ${netRoot}\n` +
     '    read only = false\n' +
-    '    munge symlinks = no\n'
+    '    munge symlinks = no\n' +
+    '    exclude = /pty/ /worktrees/\n'
   );
 }
 
@@ -435,8 +499,11 @@ export function cmdSyncFabricServe(
   opts: FabricServeOptions,
   ctx: CliContext
 ): number {
+  // opts.root is ST_ROOT (`<net>/smalltalk/`); expose the NETWORK dir above it
+  // so both smalltalk/ and catalog/ are reachable sub-paths of the module.
+  const netRoot = dirname(stripTrailingSlash(opts.root));
   mkdirSync(dirname(opts.confPath), { recursive: true });
-  writeFileSync(opts.confPath, rsyncdConfContent(opts.root));
+  writeFileSync(opts.confPath, rsyncdConfContent(netRoot));
   const args = fabricExposeArgs(opts.confPath);
   const r = spawnSync('fabric', args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
   if (r.error !== undefined && (r.error as NodeJS.ErrnoException).code === 'ENOENT') {
@@ -449,7 +516,7 @@ export function cmdSyncFabricServe(
     );
   }
   ctx.stderr(
-    `# fabric sync serving ${RSYNC_MODULE} (${opts.root}) via exec-expose ${FABRIC_PROTO}\n` +
+    `# fabric sync serving ${RSYNC_MODULE} (${netRoot}) via exec-expose ${FABRIC_PROTO}\n` +
       `# config: ${opts.confPath} — fabric spawns rsync per dial (no resident proc)\n`
   );
   return 0;
@@ -608,11 +675,38 @@ export async function cmdSyncFabricRun(
   const sctx: SyncContext = { stRoot: opts.root, stConfig: ctx.stConfig };
   const deps: FabricCycleDeps = { banner: (l) => ctx.stderr(`${l}\n`) };
 
+  // opts.root is ST_ROOT (`<net>/smalltalk/`); the catalog subtree is its
+  // sibling `<net>/catalog/`. Each pass targets the matching sub-path of the
+  // peer's `<net>/` module.
+  const catalogRoot = join(dirname(stripTrailingSlash(opts.root)), 'catalog');
+
+  // One cycle = PASS 1, the smalltalk message-bus cycle (unchanged, WITH its
+  // tombstone sweep), then PASS 2, the catalog union-sync (no sweep; only if
+  // catalog/ exists — it doesn't under the pre-redesign layout).
+  const runCycle = (t: Transport): FabricCycleResult => {
+    const r = fabricSyncCycle(
+      opts.root,
+      remoteSubtree(t.remoteBase, 'smalltalk'),
+      t.transportArgs,
+      opts.scope,
+      deps,
+      opts.timeoutS
+    );
+    if (existsSync(catalogRoot)) {
+      catalogUnionSync(
+        catalogRoot,
+        remoteSubtree(t.remoteBase, 'catalog'),
+        t.transportArgs,
+        opts.timeoutS,
+        deps
+      );
+    }
+    return r;
+  };
+
   if (opts.once) {
     const t = setUpTransport(opts.peer, ctx, sctx);
-    const r = fabricSyncCycle(
-      opts.root, t.remoteRoot, t.transportArgs, opts.scope, deps, opts.timeoutS
-    );
+    const r = runCycle(t);
     ctx.stderr(
       `# fabric cycle: swept ${r.localRemoved} local, ` +
         `${r.remoteDeleted.length} remote\n`
@@ -622,14 +716,13 @@ export async function cmdSyncFabricRun(
 
   // push-on-change: wakes the interval early on a real change (new message or
   // a status content flip); heartbeats ride the interval. Best-effort accelerator.
+  // (Catalog changes ride the interval poll — well within scheduler latency.)
   const watcher = createPushWatcher(opts.root);
   let transport: Transport | undefined;
   for (;;) {
     try {
       if (transport === undefined) transport = setUpTransport(opts.peer, ctx, sctx);
-      fabricSyncCycle(
-        opts.root, transport.remoteRoot, transport.transportArgs, opts.scope, deps, opts.timeoutS
-      );
+      runCycle(transport);
     } catch (err) {
       ctx.stderr(`# fabric cycle error: ${errMsg(err)} — re-dialing\n`);
       transport = undefined; // force a fresh dial next iteration
