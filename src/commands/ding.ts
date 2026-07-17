@@ -16,6 +16,7 @@ import { join } from 'node:path';
 
 import { invokedName, type CliContext } from '../cli-context.ts';
 import {
+  hasByteIdenticalArchiveTwin,
   inboxDir,
   msNow,
   statusPath,
@@ -1093,6 +1094,13 @@ export async function runDing(deps: DingDeps): Promise<void> {
     const eligible: { filename: string; mtimeMs: number }[] = [];
     for (const name of entries) {
       if (!validFilename(name)) continue;
+      // Skip a resurrected zombie: an inbox file byte-identical to its
+      // archive twin is already archived (re-added by a union sync); the gc
+      // service will remove it. Don't re-poke on a soon-to-be-swept twin —
+      // a poke-decision only, it does not touch the `ls` show-reality contract.
+      if (hasByteIdenticalArchiveTwin(deps.st.root, deps.identity, name)) {
+        continue;
+      }
       let st: ReturnType<typeof statSync>;
       try {
         st = statSync(join(dir, name));
@@ -1154,7 +1162,15 @@ export async function runDing(deps: DingDeps): Promise<void> {
     }
     const inboxSet = new Set<string>();
     for (const name of entries) {
-      if (validFilename(name)) inboxSet.add(name);
+      if (!validFilename(name)) continue;
+      // Skip a resurrected zombie (byte-identical archive twin): it's already
+      // archived and the gc service will remove it — re-poking it would be a
+      // spurious agent wakeup. Excluding it here also lets its deliveredAt
+      // entry get pruned below, same as a genuinely-archived file.
+      if (hasByteIdenticalArchiveTwin(deps.st.root, deps.identity, name)) {
+        continue;
+      }
+      inboxSet.add(name);
     }
     // Prune deliveredAt: forget files that were archived (no longer
     // in inbox) so the map doesn't grow unbounded. Rare-cost O(map)

@@ -8,6 +8,7 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readFileSync,
   rmSync,
   statSync,
   utimesSync,
@@ -1871,6 +1872,24 @@ describe('runDing — scan-on-startup', () => {
     const seqs = sender.calls()[0]!.sequences;
     expect(seqs[0]).toContain('q');
     expect(seqs[0]).toContain('alice');
+    r.ac.abort();
+    await r.done;
+  });
+
+  it('resurrected zombie (byte-identical archive twin) → NO startup push', async () => {
+    setStatusMtime(60 * 60_000); // status 1h old
+    // Newer-than-status inbox file → would normally poke...
+    plantInboxFile('1714826789010-aaaaaa.md', 10 * 60_000, 'alice', 'q');
+    // ...but a byte-identical archive twin makes it an already-archived
+    // zombie (re-added by a union sync). The gc will sweep it; ding must
+    // not spend a wakeup re-poking it.
+    const inboxPath = join(identityRoot, 'inbox', '1714826789010-aaaaaa.md');
+    const archivePath = join(identityRoot, 'archive', '1714826789010-aaaaaa.md');
+    writeFileSync(archivePath, readFileSync(inboxPath));
+    fake.setStatus('available');
+    const r = startDing({ st: fake.st, ptySend: sender.send });
+    await settle();
+    expect(sender.calls()).toHaveLength(0);
     r.ac.abort();
     await r.done;
   });

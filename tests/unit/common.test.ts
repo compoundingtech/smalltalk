@@ -46,6 +46,8 @@ import {
   STATES,
   statusPath,
   sweep,
+  hasByteIdenticalArchiveTwin,
+  rootShapeWarning,
   validDeliverableFilename,
   validFilename,
   validIdentity,
@@ -1159,5 +1161,89 @@ describe('prefixOf', () => {
     expect(prefixOf('1714826789010-iiiiii.options.json')).toBe(
       '1714826789010-iiiiii'
     );
+  });
+});
+
+describe('hasByteIdenticalArchiveTwin', () => {
+  const f = '1714826789010-aaaaaa.md';
+
+  it('inbox + byte-identical archive twin → true (resurrected zombie)', () => {
+    setupIdentity(stRootDir, 'bob');
+    writeFileSync(join(stRootDir, 'bob', 'inbox', f), 'same');
+    writeFileSync(join(stRootDir, 'bob', 'archive', f), 'same');
+    expect(hasByteIdenticalArchiveTwin(stRootDir, 'bob', f)).toBe(true);
+  });
+
+  it('inbox only, no archive twin → false (fresh delivery)', () => {
+    setupIdentity(stRootDir, 'bob');
+    writeFileSync(join(stRootDir, 'bob', 'inbox', f), 'live');
+    expect(hasByteIdenticalArchiveTwin(stRootDir, 'bob', f)).toBe(false);
+  });
+
+  it('DIVERGENT pair (inbox edited away from archive) → false', () => {
+    setupIdentity(stRootDir, 'bob');
+    writeFileSync(join(stRootDir, 'bob', 'inbox', f), 'inbox-version');
+    writeFileSync(join(stRootDir, 'bob', 'archive', f), 'archive-version');
+    expect(hasByteIdenticalArchiveTwin(stRootDir, 'bob', f)).toBe(false);
+  });
+
+  it('archive twin exists but inbox copy gone → false', () => {
+    setupIdentity(stRootDir, 'bob');
+    writeFileSync(join(stRootDir, 'bob', 'archive', f), 'same');
+    expect(hasByteIdenticalArchiveTwin(stRootDir, 'bob', f)).toBe(false);
+  });
+
+  it('agrees with sweep: exactly the pair sweep removes reports true', () => {
+    setupIdentity(stRootDir, 'bob');
+    const twin = '1714826789010-aaaaaa.md';
+    const fresh = '1714826789020-bbbbbb.md';
+    writeFileSync(join(stRootDir, 'bob', 'inbox', twin), 'x');
+    writeFileSync(join(stRootDir, 'bob', 'archive', twin), 'x');
+    writeFileSync(join(stRootDir, 'bob', 'inbox', fresh), 'x');
+    expect(hasByteIdenticalArchiveTwin(stRootDir, 'bob', twin)).toBe(true);
+    expect(hasByteIdenticalArchiveTwin(stRootDir, 'bob', fresh)).toBe(false);
+    expect(sweep(stRootDir)).toEqual({ removed: 1 });
+  });
+});
+
+describe('rootShapeWarning', () => {
+  it('missing root → null (other errors own that)', () => {
+    expect(rootShapeWarning(join(scratch, 'does-not-exist'))).toBeNull();
+  });
+
+  it('empty (new) root → null (no false alarm)', () => {
+    expect(rootShapeWarning(stRootDir)).toBeNull();
+  });
+
+  it('correct bus root (agent-shaped children, no nesting) → null', () => {
+    setupIdentity(stRootDir, 'alice');
+    setupIdentity(stRootDir, 'bob');
+    writeFileSync(join(stRootDir, 'alice', 'inbox', '1714826789010-aaaaaa.md'), 'x');
+    expect(rootShapeWarning(stRootDir)).toBeNull();
+  });
+
+  it('TOO SHALLOW: a nested bus tree below the root → WARN naming it', () => {
+    // Mimics ST_ROOT=/…/convoy while the bus is /…/convoy/default/smalltalk.
+    const busRoot = join(stRootDir, 'default', 'smalltalk');
+    setupIdentity(busRoot, 'alice');
+    const w = rootShapeWarning(stRootDir);
+    expect(w).toContain('too shallow');
+    expect(w).toContain(busRoot);
+  });
+
+  it('does not false-positive on a real bus root nested under it', () => {
+    // The correct root itself must NOT warn even though its agents have
+    // inbox/archive subdirs (those are not agent-shaped grandchildren).
+    const busRoot = join(stRootDir, 'default', 'smalltalk');
+    setupIdentity(busRoot, 'alice');
+    setupIdentity(busRoot, 'bob');
+    expect(rootShapeWarning(busRoot)).toBeNull();
+  });
+
+  it('NON-AGENT-SHAPED: non-empty root with no agent dirs → WARN', () => {
+    mkdirSync(join(stRootDir, 'notanagent'), { recursive: true });
+    writeFileSync(join(stRootDir, 'stray.txt'), 'x');
+    const w = rootShapeWarning(stRootDir);
+    expect(w).toContain('no agent-shaped children');
   });
 });
