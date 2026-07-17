@@ -34,26 +34,28 @@ import {
 // ─── scope ──────────────────────────────────────────────────────────────
 //
 // Default scope = message traffic + cross-machine liveness:
-//   `*/inbox/**` + `*/archive/**`  (messages, decision c)
-//   `*/status` + `*/host`          (the liveness heartbeat + host marker)
-// Each agent's `status` file (mtime = liveness heartbeat) and `host` file
-// (which machine it runs on) sync so a remote reader sees real live/offline
-// + the correct host. This is mtime-PRESERVING (rsync `-a` implies `-t`), so a
+//   `*/inbox/**` + `*/archive/**`  (messages)
+//   `*/status`                     (the liveness heartbeat: mtime = alive/dead)
+// Each agent's `status` file syncs so a remote reader sees real live/offline
+// from its mtime. This is mtime-PRESERVING (rsync `-a` implies `-t`), so a
 // dead agent's frozen status mtime propagates as dead rather than being
 // refreshed to receive-time — the load-bearing property (see the pin test).
 // Home-host-authoritative union (no `--delete`): each host writes only its own
-// agents' status/host, so no two hosts write the same file → no flap.
-// `context` files stay machine-local and are never synced unless `--scope all`.
+// agents' status, so no two hosts write the same file → no flap.
+//
+// HOST is NOT a synced file: under the convoy redesign the bus folder is named
+// `<host>.<identity>`, so host is derived from the folder-name prefix by the
+// reader (no `<id>/host` marker to write or sync). `context` files stay
+// machine-local and are never synced unless `--scope all`.
 
 /** rsync include/exclude args for the default scope: inbox+archive subtrees
- *  plus the per-agent `status` + `host` liveness files. */
+ *  plus the per-agent `status` liveness file. */
 export const SCOPE_DEFAULT: readonly string[] = [
   '--prune-empty-dirs',
   '--include=*/',
   '--include=inbox/**',
   '--include=archive/**',
   '--include=*/status',
-  '--include=*/host',
   '--exclude=*',
 ];
 

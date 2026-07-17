@@ -1715,6 +1715,41 @@ describe('runDing — status refresh tick', () => {
     await r.done;
   });
 
+  // The liveness crux: when the agent (its pty session) dies, the heartbeat
+  // MUST stop so the mtime freezes and a remote reader reads it as dead.
+  it('death-coupling: session death stops the heartbeat → mtime freezes (reads dead)', async () => {
+    writeFileSync(statusFile, 'available\n');
+    const oldT = new Date(Date.now() - 10_000);
+    utimesSync(statusFile, oldT, oldT);
+    const mtimeBefore = statSync(statusFile).mtimeMs;
+
+    let alive = true;
+    const r = startDing({
+      st: fake.st,
+      ptySend: sender.send,
+      statusRefreshIntervalMs: 20,
+      isSessionAlive: () => alive,
+      sessionWatchIntervalMs: 20,
+      exitWhenSessionGone: true,
+    });
+
+    // While alive, the heartbeat bumps the mtime forward.
+    await new Promise((res) => setTimeout(res, 90));
+    expect(statSync(statusFile).mtimeMs).toBeGreaterThan(mtimeBefore);
+
+    // The agent's harness dies → the session goes away → ding exits. Awaiting
+    // `done` means stop() ran and cleared the refresh timer.
+    alive = false;
+    await r.done;
+
+    // The heartbeat is now silent: snapshot + wait well past several intervals;
+    // the mtime must NOT advance. A frozen mtime is what a remote reader
+    // interprets as dead — the death-coupling holds.
+    const mtimeAtStop = statSync(statusFile).mtimeMs;
+    await new Promise((res) => setTimeout(res, 120));
+    expect(statSync(statusFile).mtimeMs).toBe(mtimeAtStop);
+  });
+
   it('CLI: --status-refresh-interval-ms requires non-negative integer', async () => {
     await expect(
       cmdDingCli(
