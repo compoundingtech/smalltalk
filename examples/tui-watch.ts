@@ -1,4 +1,4 @@
-// examples/tui-watch.ts — minimal interactive consumer of the createCoord API.
+// examples/tui-watch.ts — minimal interactive consumer of the createSt API.
 //
 // Run with: npm run example:tui-watch
 //
@@ -17,8 +17,8 @@
 
 import {
   asIdentity,
-  type CoordError,
-  createCoord,
+  type StError,
+  createSt,
   type Filename,
   type Identity,
   IdentityNotHostedError,
@@ -34,7 +34,7 @@ if (!root || !identityRaw) {
 }
 
 const me: Identity = asIdentity(identityRaw);
-const coord = createCoord({ root, identity: me });
+const coord = createSt({ root, identity: me });
 
 const ac = new AbortController();
 let mostRecent:
@@ -74,7 +74,7 @@ if (process.stdin.isTTY) {
         );
         mostRecent = undefined;
       } catch (err) {
-        const e = err as CoordError;
+        const e = err as StError;
         render(
           `  archive failed (${e.code ?? 'UNKNOWN'}): ${e.message}`
         );
