@@ -18,7 +18,14 @@
 // commands/sync.ts) so the cycle is unit-testable without a live bus.
 
 import { spawnSync } from 'node:child_process';
-import { chmodSync, mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
+import {
+  chmodSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  watch as fsWatch,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 
@@ -457,8 +464,123 @@ function checkRsync(): void {
   assertModernRsync(`${v.stdout ?? ''}${v.stderr ?? ''}`);
 }
 
-function delay(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+// ─── push-on-change (item 4) ─────────────────────────────────────────────
+//
+// A best-effort accelerator on top of the interval poll: wake the loop early
+// when a change genuinely warrants an immediate sync, so a status flip
+// (available→busy) or a new message crosses machines in ~ms instead of waiting
+// the poll interval. CRITICAL (per the fabric-churn constraint): it must NOT
+// fire on the 30s status HEARTBEAT — a heartbeat re-writes the same content
+// (mtime-only bump), and ~20 agents × heartbeats would otherwise turn into a
+// near-continuous sync over the transport. So status events are CONTENT-gated;
+// heartbeats ride the normal interval poll. It never gates correctness: the
+// interval always runs, so a missed/unsupported watch only loses the speedup.
+
+export interface PushGateState {
+  /** Last-seen content per status-file rel-path, for the content gate. */
+  lastStatusContent: Map<string, string>;
+}
+
+export function newPushGateState(): PushGateState {
+  return { lastStatusContent: new Map() };
+}
+
+/**
+ * Decide whether a change at `relPath` (relative to ST_ROOT) warrants an
+ * immediate push-on-change sync. `readStatus(rel)` returns a status file's
+ * current content (or undefined if unreadable); it is only consulted for
+ * status paths. A new inbox/archive file triggers; a status CONTENT flip
+ * triggers; a status heartbeat (same content, mtime-only bump) does NOT;
+ * everything else (context, etc.) is machine-local and ignored.
+ */
+export function shouldPushSync(
+  relPath: string,
+  readStatus: (rel: string) => string | undefined,
+  state: PushGateState
+): boolean {
+  if (/(^|\/)(inbox|archive)\//.test(relPath)) return true;
+  if (/(^|\/)status$/.test(relPath)) {
+    const now = readStatus(relPath);
+    if (now === undefined) return false;
+    const prev = state.lastStatusContent.get(relPath);
+    state.lastStatusContent.set(relPath, now);
+    // First-seen doesn't trigger (it rides the interval); only a real change
+    // to already-tracked content is a state flip worth an immediate sync.
+    return prev !== undefined && prev !== now;
+  }
+  return false;
+}
+
+export interface PushWatcher {
+  /** Resolve after `ms`, OR early when a gated change fires (debounced). */
+  wait(ms: number): Promise<void>;
+  close(): void;
+}
+
+/**
+ * Watch `root` recursively and let {@link PushWatcher.wait} resolve early on a
+ * gated change (see {@link shouldPushSync}). Best-effort: if the OS recursive
+ * watch is unsupported or errors, `wait(ms)` simply times out normally — the
+ * caller's interval poll still runs, so push-on-change only ACCELERATES.
+ */
+export function createPushWatcher(root: string, debounceMs = 200): PushWatcher {
+  const state = newPushGateState();
+  let wake: (() => void) | null = null;
+  let debounce: ReturnType<typeof setTimeout> | null = null;
+  const fire = (): void => {
+    if (debounce) clearTimeout(debounce);
+    debounce = setTimeout(() => {
+      debounce = null;
+      if (wake) {
+        const w = wake;
+        wake = null;
+        w();
+      }
+    }, debounceMs);
+  };
+  let watcher: ReturnType<typeof fsWatch> | undefined;
+  try {
+    watcher = fsWatch(root, { recursive: true }, (_evt, filename) => {
+      if (typeof filename !== 'string') return;
+      const rel = filename;
+      const read = (p: string): string | undefined => {
+        try {
+          return readFileSync(join(root, p), 'utf8');
+        } catch {
+          return undefined;
+        }
+      };
+      if (shouldPushSync(rel, read, state)) fire();
+    });
+    watcher.on('error', () => {
+      /* best-effort — a failed watch just falls back to interval polling */
+    });
+  } catch {
+    /* recursive watch unsupported here → no watcher; wait() times out */
+  }
+  return {
+    wait(ms: number): Promise<void> {
+      return new Promise((resolve) => {
+        const t = setTimeout(() => {
+          wake = null;
+          resolve();
+        }, ms);
+        wake = (): void => {
+          clearTimeout(t);
+          wake = null;
+          resolve();
+        };
+      });
+    },
+    close(): void {
+      if (debounce) clearTimeout(debounce);
+      try {
+        watcher?.close();
+      } catch {
+        /* ignore */
+      }
+    },
+  };
 }
 
 export interface FabricRunOptions {
@@ -498,6 +620,9 @@ export async function cmdSyncFabricRun(
     return 0;
   }
 
+  // push-on-change: wakes the interval early on a real change (new message or
+  // a status content flip); heartbeats ride the interval. Best-effort accelerator.
+  const watcher = createPushWatcher(opts.root);
   let transport: Transport | undefined;
   for (;;) {
     try {
@@ -509,7 +634,7 @@ export async function cmdSyncFabricRun(
       ctx.stderr(`# fabric cycle error: ${errMsg(err)} — re-dialing\n`);
       transport = undefined; // force a fresh dial next iteration
     }
-    await delay(opts.intervalMs);
+    await watcher.wait(opts.intervalMs);
   }
 }
 

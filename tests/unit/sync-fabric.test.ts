@@ -20,15 +20,18 @@ import type { RsyncResult } from '../../src/commands/sync.ts';
 import {
   assertModernRsync,
   assertSocketPathOk,
+  createPushWatcher,
   fabricExposeArgs,
   fabricHardTimeoutMs,
   fabricSyncCycle,
   HARD_TIMEOUT_BUFFER_S,
   IO_TIMEOUT_S,
   MAX_UNIX_SOCKET_PATH,
+  newPushGateState,
   remoteSweepFilters,
   rshScriptContent,
   rsyncdConfContent,
+  shouldPushSync,
 } from '../../src/commands/sync-fabric.ts';
 
 let root: string;
@@ -330,5 +333,59 @@ describe('serve-side config + registration', () => {
       '--config=/etc/st/rsyncd.conf',
       '.',
     ]);
+  });
+});
+
+// ─── push-on-change content gate (item 4) ────────────────────────────────
+
+describe('shouldPushSync — content-gated immediate sync', () => {
+  const read = (map: Record<string, string>) => (p: string): string | undefined =>
+    p in map ? map[p] : undefined;
+
+  it('a new inbox/archive file triggers an immediate sync', () => {
+    const st = newPushGateState();
+    expect(shouldPushSync('bob/inbox/1714826789010-aaaaaa.md', () => undefined, st)).toBe(true);
+    expect(shouldPushSync('bob/archive/1714826789010-aaaaaa.md', () => undefined, st)).toBe(true);
+  });
+
+  it('a status HEARTBEAT (same content, mtime-only bump) does NOT trigger', () => {
+    const st = newPushGateState();
+    const files = { 'bob/status': 'available' };
+    // First event just records; subsequent same-content events are heartbeats.
+    shouldPushSync('bob/status', read(files), st);
+    expect(shouldPushSync('bob/status', read(files), st)).toBe(false);
+    expect(shouldPushSync('bob/status', read(files), st)).toBe(false);
+  });
+
+  it('a status CONTENT flip (available→busy) triggers', () => {
+    const st = newPushGateState();
+    const files: Record<string, string> = { 'bob/status': 'available' };
+    shouldPushSync('bob/status', read(files), st); // record 'available'
+    files['bob/status'] = 'busy'; // the flip
+    expect(shouldPushSync('bob/status', read(files), st)).toBe(true);
+    // ...and a heartbeat after the flip is gated again
+    expect(shouldPushSync('bob/status', read(files), st)).toBe(false);
+  });
+
+  it('context + other paths never trigger (machine-local)', () => {
+    const st = newPushGateState();
+    expect(shouldPushSync('bob/context/now.md', () => 'x', st)).toBe(false);
+    expect(shouldPushSync('bob/context/decisions/1-a.md', () => 'x', st)).toBe(false);
+    expect(shouldPushSync('peers.yaml', () => 'x', st)).toBe(false);
+  });
+
+  it('unreadable status (undefined content) does not trigger', () => {
+    const st = newPushGateState();
+    expect(shouldPushSync('bob/status', () => undefined, st)).toBe(false);
+  });
+});
+
+describe('createPushWatcher', () => {
+  it('wait(ms) times out normally when nothing changes', async () => {
+    const w = createPushWatcher('/nonexistent-root-xyz');
+    const start = Date.now();
+    await w.wait(40);
+    expect(Date.now() - start).toBeGreaterThanOrEqual(30);
+    w.close();
   });
 });
