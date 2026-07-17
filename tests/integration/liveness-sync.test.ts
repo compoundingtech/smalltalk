@@ -1,6 +1,8 @@
-// tests/integration/liveness-sync.test.ts — the GATING test for item 1 of the
-// cross-machine liveness build: the per-agent `status` + `host` files sync over
-// the fabric bus MTIME-PRESERVING, so a remote reader sees real live/offline.
+// tests/integration/liveness-sync.test.ts — the GATING test for the
+// cross-machine liveness build: each agent's `status` file syncs over the
+// fabric bus MTIME-PRESERVING, so a remote reader sees real live/offline from
+// its mtime. (Host is derived from the `<host>.<identity>` folder-name prefix,
+// not a synced file.)
 //
 // The load-bearing property (the whole design hinges on it): rsync `-t`
 // preserves the SOURCE mtime, so a DEAD agent's frozen status mtime propagates
@@ -29,9 +31,6 @@ const DEAD_MTIME_S = 1_600_000_000; // fixed old epoch (2020-09-13) = "agent die
 function statusFile(root: string, id: string): string {
   return join(root, id, 'status');
 }
-function hostFile(root: string, id: string): string {
-  return join(root, id, 'host');
-}
 function mtimeS(p: string): number {
   return Math.floor(statSync(p).mtimeMs / 1000);
 }
@@ -51,12 +50,10 @@ d('liveness sync: status + host mtime-preserving (real rsync)', () => {
     cleanupRoot(remote);
   });
 
-  it('syncs status content + host, and lands them on the remote', () => {
+  it('syncs the status file content to the remote', () => {
     writeFileSync(statusFile(local, 'bob'), 'busy');
-    writeFileSync(hostFile(local, 'bob'), 'macbook');
     fabricSyncCycle(local, `${remote}/`, [], 'inbox-archive');
     expect(readFileSync(statusFile(remote, 'bob'), 'utf8')).toBe('busy');
-    expect(readFileSync(hostFile(remote, 'bob'), 'utf8')).toBe('macbook');
   });
 
   it('PIN: a dead agent’s frozen status mtime propagates FROZEN — never receive-time', () => {

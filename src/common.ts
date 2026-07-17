@@ -90,6 +90,15 @@ export const STATUS_STALE_MS = 15 * 60 * 1000;
  *  STATUS_STALE_MS — two missed refreshes before `unknown` kicks in. */
 export const STATUS_REFRESH_MS = 5 * 60 * 1000;
 
+/** The ding sidecar's status-file heartbeat interval — the R in the
+ *  cross-machine liveness contract (R=30s / reader threshold T~=120s). The
+ *  ding touches its agent's status mtime this often WHILE the agent is alive;
+ *  when the harness (= the pty session process) dies, the ding exits and the
+ *  touch stops, so the frozen mtime reads as dead cross-machine. Much tighter
+ *  than STATUS_REFRESH_MS because liveness wants ~2min death-detection, not
+ *  just anti-`unknown`-drift. See commands/ding.ts + docs/KNOWN-LIMITS.md. */
+export const LIVENESS_HEARTBEAT_MS = 30 * 1000;
+
 /** brief-030: how often the MCP server runs its tidy-check tick (the
  *  drift detector that nudges an agent when their inbox is out of date
  *  relative to the boot ritual). Default 20 minutes — long enough that

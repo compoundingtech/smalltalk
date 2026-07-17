@@ -17,9 +17,9 @@ import { join } from 'node:path';
 import { invokedName, type CliContext } from '../cli-context.ts';
 import {
   inboxDir,
+  LIVENESS_HEARTBEAT_MS,
   msNow,
   statusPath,
-  STATUS_REFRESH_MS,
   TIDY_CHECK_INTERVAL_MS,
   validFilename,
 } from '../common.ts';
@@ -157,11 +157,13 @@ export interface DingDeps {
    */
   isSessionAlive?: IsSessionAlive;
   /**
-   * brief-032: how often (ms) to refresh the watched identity's
-   * status file mtime. Mirrors the MCP server's brief-023 behavior
-   * so Codex agents (no per-identity MCP server) don't drift into
-   * `unknown` over long inactivity. Defaults to STATUS_REFRESH_MS
-   * (5 min). Set to 0 to disable.
+   * How often (ms) to refresh the watched identity's status-file mtime.
+   * This is the cross-machine liveness HEARTBEAT (the R in R/T): while the
+   * agent is alive the ding bumps the mtime this often; when the harness
+   * (= the pty session process) dies, the ding exits and the touch stops, so
+   * the frozen mtime reads as dead cross-machine. Also subsumes brief-032's
+   * anti-`unknown`-drift role. Defaults to LIVENESS_HEARTBEAT_MS (30s). Set
+   * to 0 to disable.
    */
   statusRefreshIntervalMs?: number;
   /**
@@ -825,13 +827,21 @@ export async function runDing(deps: DingDeps): Promise<void> {
     }
   }
 
-  // brief-032: status-file mtime refresh tick. Mirrors the MCP
-  // server's brief-023 behavior so Codex agents (which have no
-  // per-identity MCP server) don't drift into the `unknown` staleness
-  // window. Delegates to the same helper the MCP path uses; the only
-  // logging difference is ding's stderr surface for `error` outcomes.
+  // Status-file mtime heartbeat — the cross-machine liveness signal (R=30s).
+  // The ding IS the toucher: it bumps this agent's status mtime on a timer
+  // WHILE alive, and stopStatusRefresh() (called from stop(), which the
+  // exit-when-session-gone watch triggers) clears the timer when the harness
+  // dies — so the touch ceases, the mtime freezes, and a remote reader reads
+  // it as dead. That death-coupling is the crux; it is verified by the ding
+  // tests (session-gone -> exit -> touches cease).
+  //
+  // KNOWN LIMIT (see docs/KNOWN-LIMITS.md): this catches clean DEATH
+  // (process exit), not a HANG. A harness that is wedged but whose pty
+  // session .pid still exists keeps getting touched here -> reads healthy
+  // while actually stuck. Truly catching that needs the agent to self-touch
+  // to prove responsiveness (a separate, later improvement).
   const statusRefreshIntervalMs =
-    deps.statusRefreshIntervalMs ?? STATUS_REFRESH_MS;
+    deps.statusRefreshIntervalMs ?? LIVENESS_HEARTBEAT_MS;
   let statusRefreshTimer: ReturnType<typeof setInterval> | undefined;
   function runStatusRefreshTick(): void {
     const outcome = refreshIdentityStatus(deps.identity, deps.st.root);
