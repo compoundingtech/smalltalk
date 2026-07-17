@@ -24,7 +24,7 @@
 // (`coord.watch(undefined, ...)`) is "watch your own inbox",
 // matching the `coord watch` CLI default.
 //
-// Errors: each tool throws on failure (CoordError or otherwise); pi
+// Errors: each tool throws on failure (StError or otherwise); pi
 // catches and renders. The push side notifies on errors so the user
 // sees the problem without blocking the session.
 
@@ -38,8 +38,8 @@ import { Type, type Static } from "typebox";
 import {
   asFilename,
   asIdentity,
-  createCoord,
-  type Coord,
+  createSt,
+  type St,
   type Identity,
   type MessageWithLocation,
   type WatchEvent,
@@ -59,10 +59,10 @@ const STATUS_KEY = "coord";
 
 // ─── Lazy coord init ──────────────────────────────────────────────────
 
-let cachedCoord: { coord: Coord; identity: Identity } | undefined;
+let cachedCoord: { coord: St; identity: Identity } | undefined;
 let cachedError: Error | undefined;
 
-function getCoord(): { coord: Coord; identity: Identity } {
+function getCoord(): { coord: St; identity: Identity } {
   if (cachedCoord) return cachedCoord;
   if (cachedError) throw cachedError;
   const root = process.env.COORD_ROOT;
@@ -76,7 +76,7 @@ function getCoord(): { coord: Coord; identity: Identity } {
   try {
     const branded = asIdentity(identity);
     cachedCoord = {
-      coord: createCoord({ root, identity: branded }),
+      coord: createSt({ root, identity: branded }),
       identity: branded,
     };
     return cachedCoord;
@@ -238,7 +238,7 @@ export default function coordExtension(pi: ExtensionAPI): void {
 
   // ─ Push half: watch + notify ─
   pi.on("session_start", async (_event: SessionStartEvent, ctx: ExtensionContext) => {
-    let coord: Coord;
+    let coord: St;
     let identity: Identity;
     try {
       ({ coord, identity } = getCoord());
@@ -354,7 +354,7 @@ export default function coordExtension(pi: ExtensionAPI): void {
     async execute(_id, params: SendParamsT) {
       const { coord } = getCoord();
       const to = asIdentity(params.to);
-      const opts: Parameters<Coord["send"]>[2] = {};
+      const opts: Parameters<St["send"]>[2] = {};
       if (params.from !== undefined) opts.from = asIdentity(params.from);
       if (params.subject !== undefined) opts.subject = params.subject;
       if (params.inReplyTo !== undefined) {
@@ -379,7 +379,7 @@ export default function coordExtension(pi: ExtensionAPI): void {
     async execute(_id, params: LsParamsT) {
       const { coord } = getCoord();
       const id = resolveIdentity(params.identity);
-      const opts: Parameters<Coord["ls"]>[1] = {};
+      const opts: Parameters<St["ls"]>[1] = {};
       if (params.archive !== undefined) opts.archive = params.archive;
       if (params.since !== undefined) opts.since = params.since;
       if (params.from !== undefined) opts.fromFilter = asIdentity(params.from);
@@ -441,7 +441,7 @@ export default function coordExtension(pi: ExtensionAPI): void {
       const { coord } = getCoord();
       const id = resolveIdentity(params.identity);
       const filename = asFilename(params.filename);
-      const opts: Parameters<Coord["read"]>[2] = {};
+      const opts: Parameters<St["read"]>[2] = {};
       if (params.fromArchive !== undefined) opts.fromArchive = params.fromArchive;
       const r = await coord.read(id, filename, opts);
       return {
@@ -479,7 +479,7 @@ export default function coordExtension(pi: ExtensionAPI): void {
       const { coord } = getCoord();
       const id = resolveIdentity(params.identity);
       const filename = asFilename(params.filename);
-      const opts: Parameters<Coord["thread"]>[2] = {};
+      const opts: Parameters<St["thread"]>[2] = {};
       if (params.tree !== undefined) opts.tree = params.tree;
       const messages = await coord.thread(id, filename, opts);
       const summary =
