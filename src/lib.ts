@@ -956,9 +956,23 @@ function sleepWithSignal(
       resolve();
       return;
     }
-    const t = setTimeout(resolve, ms);
+    let onAbort: (() => void) | undefined;
+    const t = setTimeout(() => {
+      // CRITICAL: remove the abort listener on the normal (timeout)
+      // resolve path. `{ once: true }` only self-removes when the event
+      // *fires* — on the timeout path the listener would otherwise leak.
+      // In a long-running poll loop (e.g. `st ding`, every 500ms for
+      // days) that leak accumulates hundreds of thousands of listeners
+      // on the shared AbortSignal; since addEventListener is O(n) in the
+      // existing listeners, each poll gets progressively more expensive
+      // and the process burns CPU that grows with uptime.
+      if (signal !== undefined && onAbort !== undefined) {
+        signal.removeEventListener('abort', onAbort);
+      }
+      resolve();
+    }, ms);
     if (signal !== undefined) {
-      const onAbort = (): void => {
+      onAbort = (): void => {
         clearTimeout(t);
         resolve();
       };
