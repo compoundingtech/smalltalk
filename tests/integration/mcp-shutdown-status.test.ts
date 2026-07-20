@@ -36,7 +36,10 @@ afterEach(() => {
   rmSync(scratch, { recursive: true, force: true });
 });
 
-async function bootAndSignal(signal: 'SIGTERM' | 'SIGINT'): Promise<string> {
+async function attemptShutdown(
+  signal: 'SIGTERM' | 'SIGINT',
+  readyMs: number,
+): Promise<string> {
   // Pre-seed status: this is what peers see right now.
   writeFileSync(join(stRoot, 'alice', 'status'), 'available\n');
 
@@ -49,13 +52,15 @@ async function bootAndSignal(signal: 'SIGTERM' | 'SIGINT'): Promise<string> {
     stdio: ['pipe', 'pipe', 'pipe'],
   });
 
-  // Wait for the server to be alive enough that the signal handlers are
-  // installed (which happens inside runWith, after mcp.connect). A
-  // small fixed delay is robust; the alternative — send an `initialize`
-  // request — would mean dragging the MCP SDK in here just to time a
-  // signal. The shutdown path's correctness doesn't depend on this
-  // delay being precise.
-  await new Promise((r) => setTimeout(r, 300));
+  // Wait for the server to finish booting before signalling. The signal
+  // handlers are installed at the very top of `runWith` (before the
+  // `mcp.connect` / channel-watcher awaits), but reaching `runWith` at
+  // all costs node's strip-types compilation of the whole import graph,
+  // which is ~500ms+ on newer node and varies by machine/load. A single
+  // fixed delay is therefore flaky — the retry wrapper below escalates
+  // this budget instead. Sending an `initialize` handshake would be a
+  // precise ready-signal but would drag the MCP SDK into this test.
+  await new Promise((r) => setTimeout(r, readyMs));
 
   proc.kill(signal);
 
@@ -74,14 +79,28 @@ async function bootAndSignal(signal: 'SIGTERM' | 'SIGINT'): Promise<string> {
   return readFileSync(statusFile, 'utf8').trim();
 }
 
+// Bounded retry over an escalating boot budget instead of one fixed
+// sleep: offline-on-shutdown is deterministic once the handlers are
+// installed, so a correct server lands `offline` on the first attempt
+// whose budget clears its boot cost; a genuinely broken server exhausts
+// every budget and still fails loud (returns the last observed status).
+async function bootAndSignal(signal: 'SIGTERM' | 'SIGINT'): Promise<string> {
+  let last = 'available';
+  for (const readyMs of [700, 1500, 3000]) {
+    last = await attemptShutdown(signal, readyMs);
+    if (last === 'offline') return last;
+  }
+  return last;
+}
+
 describe('st mcp — shutdown writes `offline` to status', () => {
   it('SIGTERM flips status from `available` to `offline`', async () => {
     const finalStatus = await bootAndSignal('SIGTERM');
     expect(finalStatus).toBe('offline');
-  }, 15_000);
+  }, 20_000);
 
   it('SIGINT flips status from `available` to `offline`', async () => {
     const finalStatus = await bootAndSignal('SIGINT');
     expect(finalStatus).toBe('offline');
-  }, 15_000);
+  }, 20_000);
 });

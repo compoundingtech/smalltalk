@@ -333,47 +333,66 @@ export function createMcpServer(opts: McpServerOptions): McpServerHandle {
   };
 
   async function runWith(transport: Transport): Promise<void> {
-    await mcp.connect(transport);
-    await startChannelWatcher();
-    startStatusRefresh();
-    startTidyCheck();
-    process.on('exit', onProcessExit);
-    await new Promise<void>((resolve) => {
-      let resolved = false;
-      const settle = (): void => {
-        if (resolved) return;
-        resolved = true;
-        // Stop the refresh tick *before* writing offline so we don't
-        // race the timer overwriting the offline value back to
-        // `available`. Order matters: stop, then write.
-        stopStatusRefresh();
-        // Same race-avoidance for the tidy-check tick — clear before
-        // teardown so a tick in flight can't fire a synthetic
-        // notification on a transport that's about to close.
-        stopTidyCheck();
-        // Write `offline` before any further teardown so peers see
-        // the right status as quickly as possible. Sync I/O is fine
-        // here; the process is shutting down.
-        writeOfflineSync();
-        process.removeListener('SIGINT', settle);
-        process.removeListener('SIGTERM', settle);
-        // Drop our onclose hook so a later close() doesn't fire it
-        // again. Setting back to undefined is fine — Protocol's _onclose
-        // checks for the presence of the callback before invoking it.
-        mcp.server.onclose = undefined;
-        resolve();
-      };
-      // Three exit paths, all funnel into `settle`:
-      //   - the host closes the transport (stdio EOF, in-memory pair
-      //     teardown, or any other Transport.onclose firing);
-      //   - SIGINT (Ctrl-C);
-      //   - SIGTERM (process manager).
-      // mcp.server.onclose is invoked by Protocol when the transport
-      // closes for any reason — including our own close() call.
-      mcp.server.onclose = settle;
-      process.once('SIGINT', settle);
-      process.once('SIGTERM', settle);
+    // Three exit paths all funnel into `settle`:
+    //   - the host closes the transport (stdio EOF, in-memory pair
+    //     teardown, or any other Transport.onclose firing);
+    //   - SIGINT (Ctrl-C);
+    //   - SIGTERM (process manager).
+    let resolved = false;
+    let resolveExit: () => void = () => {};
+    const exited = new Promise<void>((resolve) => {
+      resolveExit = resolve;
     });
+    const settle = (): void => {
+      if (resolved) return;
+      resolved = true;
+      // Stop the refresh tick *before* writing offline so we don't
+      // race the timer overwriting the offline value back to
+      // `available`. Order matters: stop, then write.
+      stopStatusRefresh();
+      // Same race-avoidance for the tidy-check tick — clear before
+      // teardown so a tick in flight can't fire a synthetic
+      // notification on a transport that's about to close.
+      stopTidyCheck();
+      // Write `offline` before any further teardown so peers see
+      // the right status as quickly as possible. Sync I/O is fine
+      // here; the process is shutting down.
+      writeOfflineSync();
+      process.removeListener('SIGINT', settle);
+      process.removeListener('SIGTERM', settle);
+      // Drop our onclose hook so a later close() doesn't fire it
+      // again. Setting back to undefined is fine — Protocol's _onclose
+      // checks for the presence of the callback before invoking it.
+      mcp.server.onclose = undefined;
+      resolveExit();
+    };
+
+    // Install the shutdown handlers FIRST — before the potentially-slow
+    // `mcp.connect` / `startChannelWatcher` (chokidar) awaits — so a
+    // SIGINT/SIGTERM arriving mid-boot still writes `offline`. Registering
+    // them only after those awaits (the prior behavior) meant a signal
+    // during startup — which on a slower/newer-node box can outlast a
+    // caller's fixed ready-delay — terminated the process by default and
+    // left a stale `available` behind.
+    process.on('exit', onProcessExit);
+    process.once('SIGINT', settle);
+    process.once('SIGTERM', settle);
+
+    await mcp.connect(transport);
+    // Route transport-close through the same settle path, unless a signal
+    // already shut us down mid-connect. Protocol invokes onclose when the
+    // transport closes for any reason — including our own close() call.
+    if (!resolved) mcp.server.onclose = settle;
+
+    await startChannelWatcher();
+    // If a signal already settled us during boot, don't start the ticks —
+    // they'd race the `offline` write settle just made.
+    if (!resolved) {
+      startStatusRefresh();
+      startTidyCheck();
+    }
+
+    await exited;
   }
 
   return {
