@@ -972,8 +972,37 @@ export async function runDing(deps: DingDeps): Promise<void> {
           }
         }
       }
+      // #106 follow-up: prune messages the agent archived while they
+      // were buffered, BEFORE the status gate below. Two reasons this
+      // cannot wait for the drain loop's own `stillInInbox` check:
+      //
+      //   1. The drain never runs while the identity is busy/dnd (the
+      //      SUPPRESS_STATES return below). A busy agent that reads and
+      //      archives its own mail — literally the documented boot
+      //      ritual, "drain your inbox" — would otherwise leave the
+      //      archived event parked in the buffer indefinitely.
+      //   2. `deliveryStalled` is cleared on the drained checkpoints
+      //      below. If archived events are never pruned, the buffer
+      //      never drains, and a stall outlives the message that caused
+      //      it — permanently suspending the heartbeat of a healthy
+      //      agent whose inbox is empty.
+      //
+      // Archived means "no longer needs delivery" regardless of status,
+      // so this prune is status-independent by construction.
+      for (let i = buffer.length - 1; i >= 0; i -= 1) {
+        if (!stillInInbox(buffer[i]!.filename)) {
+          dbg(
+            `buffered message ${buffer[i]!.filename} archived while held → dropping stale poke`
+          );
+          buffer.splice(i, 1);
+        }
+      }
       if (buffer.length === 0 && readPending.length === 0) {
         disarmTimer();
+        // Nothing is awaiting delivery, so nothing is undeliverable:
+        // the stall's cause is gone and the stall must not outlive it.
+        // (No-op unless a stall is actually up.)
+        clearDeliveryStall();
         return;
       }
       let state: State;
@@ -1046,6 +1075,12 @@ export async function runDing(deps: DingDeps): Promise<void> {
       if (deferred.length > 0) buffer.push(...deferred);
       if (buffer.length === 0 && readPending.length === 0) {
         disarmTimer();
+        // Same invariant as the pre-gate checkpoint above: the buffer
+        // drained, so no held message remains undeliverable. Note this
+        // deliberately does NOT fire while a second message is still
+        // deferred — a stall must survive as long as ANY message is
+        // still undeliverable, which is the whole point of #106.
+        clearDeliveryStall();
       }
     } finally {
       flushing = false;

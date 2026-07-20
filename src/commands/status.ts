@@ -155,7 +155,22 @@ export interface StatusLiveness {
 
 /**
  * Read an identity's status once and return the full freshness verdict.
- * Single stat + single read; the shared contract behind `st agents`.
+ *
+ * Exactly one `stat` and (when the file exists) one `read` — every field
+ * below is derived from that single snapshot, deliberately WITHOUT
+ * delegating to `readState`. Delegating would re-`stat` and re-`read`
+ * the same path, and — the reason that matters — `status` and `recorded`
+ * would then be answers about two different points in time: a status
+ * write landing between the two reads could return, say, `status: busy`
+ * alongside `recorded: 'available'`, a pair that never existed on disk.
+ * One snapshot makes every field of the returned verdict mutually
+ * consistent by construction.
+ *
+ * `status` applies exactly the `readState` rules (missing → `offline`,
+ * mtime older than STATUS_STALE_MS → `unknown`, unreadable or malformed
+ * → `offline`), against the caller's `now` rather than a second
+ * `Date.now()`, so an injected `now` governs the whole verdict instead
+ * of only `ageMs` / `live`.
  */
 export function readIdentityLiveness(
   identity: string,
@@ -165,33 +180,55 @@ export function readIdentityLiveness(
   const path = statusPath(identity, root);
   const livenessMs = opts.livenessMs ?? STATUS_LIVENESS_MS;
   const now = opts.now ?? Date.now();
-  const status = readState(path);
 
+  // The single stat. A throw means missing/unreadable — `offline`, and
+  // no age is knowable. (Also collapses the old existsSync + statSync
+  // pair, which was itself a stat-then-stat TOCTOU.)
   let mtimeMs: number | null = null;
   try {
-    if (existsSync(path)) mtimeMs = statSync(path).mtimeMs;
+    mtimeMs = statSync(path).mtimeMs;
   } catch {
     mtimeMs = null;
   }
-  const ageMs = mtimeMs === null ? null : now - mtimeMs;
-
-  let recorded: State | null = null;
-  if (mtimeMs !== null) {
-    try {
-      const first = (readFileSync(path, 'utf8').split('\n')[0] ?? '')
-        .replace(/[\s]/g, '');
-      if (isValidState(first)) recorded = first as State;
-    } catch {
-      recorded = null;
-    }
+  if (mtimeMs === null) {
+    return {
+      status: 'offline',
+      recorded: null,
+      ageMs: null,
+      mtimeMs: null,
+      live: false,
+    };
   }
+  const ageMs = now - mtimeMs;
+
+  // The single read. Its first line is the recorded value; `status` is
+  // that same value put through the trust window.
+  let recorded: State | null = null;
+  let readOk = false;
+  try {
+    const first = (readFileSync(path, 'utf8').split('\n')[0] ?? '').replace(
+      /[\s]/g,
+      ''
+    );
+    readOk = true;
+    if (isValidState(first)) recorded = first as State;
+  } catch {
+    recorded = null;
+  }
+
+  const status: State =
+    ageMs > STATUS_STALE_MS
+      ? 'unknown' // too old to believe, whatever it says
+      : !readOk || recorded === null
+        ? 'offline' // unreadable or malformed never propagates
+        : recorded;
 
   return {
     status,
     recorded,
     ageMs,
     mtimeMs,
-    live: ageMs !== null && ageMs <= livenessMs,
+    live: ageMs <= livenessMs,
   };
 }
 

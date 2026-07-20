@@ -3217,6 +3217,174 @@ describe('ding: delivery stall suspends the status heartbeat (#101)', () => {
     await r.done;
   });
 
+  // #106 follow-up: the stall must not outlive the condition that
+  // caused it. The original fix cleared `deliveryStalled` ONLY on a
+  // successful delivery — but the held message's most likely fate is
+  // never being delivered at all: the agent reads and archives it
+  // itself (the documented boot ritual is literally "drain your
+  // inbox"). The poke is then dropped as a stale poke, no delivery ever
+  // happens, and the stall — hence the suspended heartbeat — became
+  // permanent for a perfectly healthy agent. That turns a transient
+  // "unreachable while busy" into a permanent "reads dead", which is
+  // worse than the defect #106 set out to fix.
+  //
+  // Precondition these tests encode explicitly: the cap must trip
+  // (stall set, heartbeat frozen) BEFORE the agent archives.
+  it('agent archives the held message itself → stall clears, heartbeat resumes', async () => {
+    writeFileSync(statusFile, 'available\n');
+    const oldT = new Date(Date.now() - 60_000);
+    utimesSync(statusFile, oldT, oldT);
+
+    // The pane NEVER goes idle. Recovery must come from the message
+    // ceasing to need delivery, not from a delivery succeeding.
+    let n = 0;
+    const peeker = makePeeker(() => `frame ${n++}`);
+    let pending = true; // message is in the inbox
+    let err = '';
+    const r = startDing({
+      st: fake.st,
+      ptySend: sender.send,
+      identity: asIdentity(ID),
+      paneGuard: true,
+      ptyPeek: peeker.peek,
+      peekDiffMs: 1,
+      holdRetryMs: 15,
+      maxHolds: 1,
+      statusRefreshIntervalMs: 20,
+      intervalMs: 10,
+      messagePending: () => pending,
+      stderr: (s) => {
+        err += s;
+      },
+    });
+    fake.setMessage('1714826789010-aaaaaa.md', { from: 'alice' });
+    fake.pushEvent('1714826789010-aaaaaa.md');
+
+    // Precondition: the cap trips and the heartbeat freezes FIRST.
+    await waitFor(() => err.includes('DELIVERY STALLED'));
+    expect(err).toContain('DELIVERY STALLED');
+    const mtimeAtStall = statSync(statusFile).mtimeMs;
+    await new Promise((res) => setTimeout(res, 100)); // several ticks
+    expect(statSync(statusFile).mtimeMs).toBe(mtimeAtStall); // suspended
+
+    // NOW the agent reads + archives the message itself.
+    pending = false;
+
+    // The stall's cause is gone, so the stall must go with it — even
+    // though the pane is still busy and nothing was ever delivered.
+    await waitFor(() => statSync(statusFile).mtimeMs > mtimeAtStall);
+    expect(statSync(statusFile).mtimeMs).toBeGreaterThan(mtimeAtStall);
+    expect(err).toContain('delivery recovered');
+    expect(sender.calls()).toHaveLength(0); // never delivered — correct
+
+    r.ac.abort();
+    await r.done;
+  });
+
+  it('one of two held messages archived → stall PERSISTS (still undeliverable)', async () => {
+    // Guard against over-clearing: the stall is per-daemon, so clearing
+    // it the moment ANY single message is archived would resume the
+    // heartbeat while a second message is still genuinely undeliverable
+    // — re-introducing exactly the unearned liveness #106 exists to
+    // prevent. The stall must track "no message remains undeliverable",
+    // not "some message stopped needing delivery".
+    writeFileSync(statusFile, 'available\n');
+    const oldT = new Date(Date.now() - 60_000);
+    utimesSync(statusFile, oldT, oldT);
+
+    let n = 0;
+    const peeker = makePeeker(() => `frame ${n++}`); // never static
+    const archived = new Set<string>();
+    let err = '';
+    const r = startDing({
+      st: fake.st,
+      ptySend: sender.send,
+      identity: asIdentity(ID),
+      paneGuard: true,
+      ptyPeek: peeker.peek,
+      peekDiffMs: 1,
+      holdRetryMs: 15,
+      maxHolds: 1,
+      statusRefreshIntervalMs: 20,
+      intervalMs: 10,
+      messagePending: (f) => !archived.has(String(f)),
+      stderr: (s) => {
+        err += s;
+      },
+    });
+    fake.setMessage('1714826789010-aaaaaa.md', { from: 'alice' });
+    fake.pushEvent('1714826789010-aaaaaa.md');
+    fake.setMessage('1714826789011-bbbbbb.md', { from: 'carol' });
+    fake.pushEvent('1714826789011-bbbbbb.md');
+
+    await waitFor(() => err.includes('DELIVERY STALLED'));
+    const mtimeAtStall = statSync(statusFile).mtimeMs;
+
+    // The agent archives only the FIRST message. The second is still
+    // held on a busy pane — still undeliverable.
+    archived.add('1714826789010-aaaaaa.md');
+
+    await new Promise((res) => setTimeout(res, 150)); // many refresh ticks
+    expect(statSync(statusFile).mtimeMs).toBe(mtimeAtStall); // still suspended
+    expect(err).not.toContain('delivery recovered');
+
+    // Archiving the last one clears it.
+    archived.add('1714826789011-bbbbbb.md');
+    await waitFor(() => statSync(statusFile).mtimeMs > mtimeAtStall);
+    expect(statSync(statusFile).mtimeMs).toBeGreaterThan(mtimeAtStall);
+    expect(err).toContain('delivery recovered');
+
+    r.ac.abort();
+    await r.done;
+  });
+
+  it('archived while held on a BUSY identity → stall still clears', async () => {
+    // The residual path: the drain loop's own `stillInInbox` check sits
+    // AFTER the busy/dnd suppress-return, so a busy agent's archived
+    // message would never be pruned and the stall would outlive it.
+    // The prune therefore runs before the status gate.
+    writeFileSync(statusFile, 'available\n');
+    const oldT = new Date(Date.now() - 60_000);
+    utimesSync(statusFile, oldT, oldT);
+
+    let n = 0;
+    const peeker = makePeeker(() => `frame ${n++}`);
+    let pending = true;
+    let err = '';
+    const r = startDing({
+      st: fake.st,
+      ptySend: sender.send,
+      identity: asIdentity(ID),
+      paneGuard: true,
+      ptyPeek: peeker.peek,
+      peekDiffMs: 1,
+      holdRetryMs: 15,
+      maxHolds: 1,
+      statusRefreshIntervalMs: 20,
+      intervalMs: 10,
+      messagePending: () => pending,
+      stderr: (s) => {
+        err += s;
+      },
+    });
+    fake.setMessage('1714826789010-aaaaaa.md', { from: 'alice' });
+    fake.pushEvent('1714826789010-aaaaaa.md');
+
+    await waitFor(() => err.includes('DELIVERY STALLED'));
+    const mtimeAtStall = statSync(statusFile).mtimeMs;
+
+    // Agent marks itself busy AND archives its own mail.
+    fake.setStatus('busy');
+    pending = false;
+
+    await waitFor(() => statSync(statusFile).mtimeMs > mtimeAtStall);
+    expect(statSync(statusFile).mtimeMs).toBeGreaterThan(mtimeAtStall);
+    expect(err).toContain('delivery recovered');
+
+    r.ac.abort();
+    await r.done;
+  });
+
   it('held but still UNDER the cap → heartbeat keeps running', async () => {
     // Guard against over-suppression: a brief hold on a momentarily-busy
     // pane is normal operation, not a stall. Liveness stays earned.
