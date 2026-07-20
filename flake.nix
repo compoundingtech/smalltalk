@@ -50,7 +50,7 @@
 
           # TODO(rust): a Rust rewrite drops npm entirely, and this hash with it.
           # Regenerate with: nix run nixpkgs#prefetch-npm-deps -- package-lock.json
-          npmDepsHash = "sha256-CfgSssHEdSjL9liKjaw9aYKMtCJdaxWKGbFM59PgNwg=";
+          npmDepsHash = "sha256-FsAjO/CYxyMf30F8ESsxFDI30ckYv1uS4+nkvn9Fl+k=";
 
           nodejs = pkgs.nodejs_24;
           npmInstallFlags = [ "--omit=dev" ];
