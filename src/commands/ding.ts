@@ -478,8 +478,64 @@ export async function runDing(deps: DingDeps): Promise<void> {
     | { kind: 'failed' }
     | { kind: 'held'; inputText: string; staleCount: number };
 
+  // ─── Delivery-stall tracking (#101) ───────────────────────────────
+  //
+  // The pane guard deliberately NEVER force-submits into a frame that
+  // is still changing: a submit landing mid-turn seeds Claude Code's
+  // queued-input replay bug (see the comment in `guardedDeliver` and
+  // the "keeps HOLDING, never force-submits" regression test). That
+  // decision stands — but it means a target pane that keeps changing
+  // holds every poke for as long as it keeps changing, with no upper
+  // bound.
+  //
+  // Before this fix that state was INVISIBLE and, worse, DISHONEST:
+  // the hold logged only under ST_DING_DEBUG, while the status-refresh
+  // tick (which is entirely decoupled from delivery) kept bumping the
+  // identity's status mtime. Senders therefore read `available` from an
+  // agent whose mail the sidecar was demonstrably not delivering.
+  //
+  // `deliveryStalled` closes that gap. Once a message has been held
+  // PAST the hold cap, the sidecar has proven it cannot currently
+  // deliver, so it (a) says so loudly, once, on stderr and (b) stops
+  // refreshing the status file. The mtime then freezes and readers
+  // derive staleness through the normal path — the same death-coupling
+  // the session-gone watch already relies on. A successful delivery
+  // clears the stall and the heartbeat resumes.
+  //
+  // Invariant: a sidecar must not write liveness it has not earned.
+  let deliveryStalled = false;
+  /** Loud-log the stall exactly once per stall episode, not per retry. */
+  let loggedStall = false;
+
+  function markDeliveryStalled(ev: BufferedEvent, holds: number): void {
+    deliveryStalled = true;
+    if (loggedStall) return;
+    loggedStall = true;
+    log(
+      `st ding: DELIVERY STALLED — "${ev.filename}" has been held ` +
+        `${holds} times (cap ${maxHolds}) because pty session ` +
+        `"${deps.ptySession}" is never static long enough to submit ` +
+        `into safely. The message is NOT lost — it stays in the inbox ` +
+        `and is retried every ${holdRetryMs}ms — but it will not be ` +
+        `delivered until the pane goes idle. Suspending the status ` +
+        `heartbeat for "${deps.identity}" so peers stop reading this ` +
+        `agent as available while its mail is undeliverable.\n`
+    );
+  }
+
+  function clearDeliveryStall(): void {
+    if (!deliveryStalled) return;
+    deliveryStalled = false;
+    loggedStall = false;
+    log(
+      `st ding: delivery recovered for "${deps.identity}" — resuming ` +
+        `the status heartbeat.\n`
+    );
+  }
+
   async function normalDeliver(ev: BufferedEvent): Promise<GuardOutcome> {
     const ok = await deliver(send, deps.ptySession, ev, log);
+    if (ok) clearDeliveryStall();
     return ok ? { kind: 'delivered' } : { kind: 'failed' };
   }
 
@@ -525,6 +581,7 @@ export async function runDing(deps: DingDeps): Promise<void> {
       return { kind: 'failed' };
     }
     dbg(`preserve-delivered ${ev.filename} (kept un-submitted input)`);
+    clearDeliveryStall();
     return { kind: 'delivered' };
   }
 
@@ -577,6 +634,10 @@ export async function runDing(deps: DingDeps): Promise<void> {
     if (!hasInput) {
       if (a.frameChanged) {
         dbg(`frame changing (mid-turn) → holding ${ev.filename} (hold ${holds + 1}; cap won't force into an active turn)`);
+        // #101: the hold itself is correct (never submit mid-turn), but
+        // past the cap the sidecar has proven it is not delivering —
+        // say so, and stop asserting liveness we have not earned.
+        if (forceCap) markDeliveryStalled(ev, holds + 1);
         return { kind: 'held', inputText: '', staleCount: 0 };
       }
       return normalDeliver(ev); // frame static (idle / walked away) → safe to submit
@@ -594,6 +655,9 @@ export async function runDing(deps: DingDeps): Promise<void> {
       ev.lastInputText !== inputText;
     if (changed) {
       dbg(`pane active (frame/input changing) → holding ${ev.filename} (hold ${holds + 1})`);
+      // #101: same invariant as the no-input branch above — a pane that
+      // stays active past the cap means we are not delivering.
+      if (forceCap) markDeliveryStalled(ev, holds + 1);
       return { kind: 'held', inputText, staleCount: 1 };
     }
     const staleCount = (ev.inputStaleCount ?? 1) + 1;
@@ -846,6 +910,19 @@ export async function runDing(deps: DingDeps): Promise<void> {
     deps.statusRefreshIntervalMs ?? LIVENESS_HEARTBEAT_MS;
   let statusRefreshTimer: ReturnType<typeof setInterval> | undefined;
   function runStatusRefreshTick(): void {
+    // #101 invariant: a sidecar must not write liveness it has not
+    // earned. While delivery is stalled (a message held past the cap on
+    // a pane that never goes static) this sidecar is NOT surfacing the
+    // agent's mail — refreshing the mtime here would advertise an
+    // availability it cannot honor. Skip the touch instead: the mtime
+    // freezes, and every reader derives staleness through the existing
+    // path. `markDeliveryStalled` already logged the reason once.
+    if (deliveryStalled) {
+      dbg(
+        `status refresh suppressed for "${deps.identity}" — delivery stalled`
+      );
+      return;
+    }
     const outcome = refreshIdentityStatus(deps.identity, deps.st.root);
     if (outcome === 'error') {
       log(

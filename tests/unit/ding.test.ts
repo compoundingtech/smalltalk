@@ -3057,3 +3057,200 @@ describe('runDing — brief-036 typing-aware pane guard', () => {
     await r.done;
   });
 });
+
+// ─── #101: delivery-stall must not advertise unearned liveness ─────────
+//
+// Reproduced defect: the pane guard deliberately never force-submits
+// into a still-changing frame (that would seed Claude Code's queued-
+// input replay bug — see the "keeps HOLDING, never force-submits"
+// test above). Correct in isolation, but the status-refresh tick was
+// entirely decoupled from delivery, so a sidecar holding every poke on
+// a perpetually-busy pane kept bumping the identity's status mtime.
+// Senders read `available` from an agent whose mail was not being
+// surfaced — liveness the sidecar had not earned.
+//
+// The fix does NOT change the hold decision. It couples the heartbeat
+// to delivery health: held past the cap → stop touching the status
+// file (and say so once, loudly); delivered → resume.
+describe('ding: delivery stall suspends the status heartbeat (#101)', () => {
+  let scratch: string;
+  let stRoot: string;
+  let statusFile: string;
+  let fake: FakeSt;
+  let sender: FakeSender;
+  const ID = 'bob';
+
+  beforeEach(() => {
+    scratch = mkdtempSync(join(tmpdir(), 'st-ding-stall-'));
+    stRoot = join(scratch, 'smalltalk');
+    mkdirSync(join(stRoot, ID, 'inbox'), { recursive: true });
+    mkdirSync(join(stRoot, ID, 'archive'), { recursive: true });
+    statusFile = join(stRoot, ID, 'status');
+    fake = makeFakeSt(asIdentity(ID), stRoot);
+    sender = makeFakeSender();
+  });
+  afterEach(() => {
+    fake.endWatch();
+    rmSync(scratch, { recursive: true, force: true });
+  });
+
+  function makePeeker(frames: () => string): {
+    peek: PtyPeeker;
+    count: () => number;
+  } {
+    let count = 0;
+    return {
+      peek: async () => {
+        count += 1;
+        return { status: 0, stdout: frames(), stderr: '' };
+      },
+      count: () => count,
+    };
+  }
+
+  async function waitFor(
+    pred: () => boolean,
+    timeoutMs = 3000
+  ): Promise<void> {
+    const start = Date.now();
+    while (!pred()) {
+      if (Date.now() - start > timeoutMs) return;
+      await new Promise((r) => setTimeout(r, 5));
+    }
+  }
+
+  it('held past the cap on a busy pane → stops refreshing status, warns once', async () => {
+    writeFileSync(statusFile, 'available\n');
+    const oldT = new Date(Date.now() - 60_000);
+    utimesSync(statusFile, oldT, oldT);
+    const mtimeBefore = statSync(statusFile).mtimeMs;
+
+    let n = 0;
+    const peeker = makePeeker(() => `frame ${n++}`); // never static
+    let err = '';
+    const r = startDing({
+      st: fake.st,
+      ptySend: sender.send,
+      identity: asIdentity(ID),
+      paneGuard: true,
+      ptyPeek: peeker.peek,
+      peekDiffMs: 1,
+      holdRetryMs: 15,
+      maxHolds: 1, // trip the cap quickly
+      statusRefreshIntervalMs: 20,
+      intervalMs: 10,
+      stderr: (s) => {
+        err += s;
+      },
+    });
+    fake.setMessage('1714826789010-aaaaaa.md', { from: 'alice' });
+    fake.pushEvent('1714826789010-aaaaaa.md');
+
+    // Let it hold well past the cap and let several refresh ticks fire.
+    await waitFor(() => err.includes('DELIVERY STALLED'));
+    const mtimeAtStall = statSync(statusFile).mtimeMs;
+    await new Promise((res) => setTimeout(res, 120)); // ~6 refresh ticks
+
+    expect(sender.calls()).toHaveLength(0); // still held (unchanged behavior)
+    expect(err).toContain('DELIVERY STALLED');
+    // Warned exactly once, not once per retry.
+    expect(err.match(/DELIVERY STALLED/g)).toHaveLength(1);
+    // The heartbeat stopped: mtime did not advance after the stall.
+    // (Ticks that fired BEFORE the cap was reached are legitimate —
+    // suppression starts when the sidecar has proven it can't deliver,
+    // not before. So compare against the stall instant, not the start.)
+    expect(statSync(statusFile).mtimeMs).toBe(mtimeAtStall);
+    void mtimeBefore;
+    // The recorded value is left alone — we suppress the touch, we do
+    // not invent a state.
+    expect(readFileSync(statusFile, 'utf8').trim()).toBe('available');
+
+    r.ac.abort();
+    await r.done;
+  });
+
+  it('pane goes idle → delivers, stall clears, heartbeat resumes', async () => {
+    writeFileSync(statusFile, 'available\n');
+    const oldT = new Date(Date.now() - 60_000);
+    utimesSync(statusFile, oldT, oldT);
+    const mtimeBefore = statSync(statusFile).mtimeMs;
+
+    let busy = true;
+    let n = 0;
+    const peeker = makePeeker(() =>
+      busy ? `frame ${n++}` : 'idle output line'
+    );
+    let err = '';
+    const r = startDing({
+      st: fake.st,
+      ptySend: sender.send,
+      identity: asIdentity(ID),
+      paneGuard: true,
+      ptyPeek: peeker.peek,
+      peekDiffMs: 1,
+      holdRetryMs: 15,
+      maxHolds: 1,
+      statusRefreshIntervalMs: 20,
+      intervalMs: 10,
+      stderr: (s) => {
+        err += s;
+      },
+    });
+    fake.setMessage('1714826789010-aaaaaa.md', { from: 'alice' });
+    fake.pushEvent('1714826789010-aaaaaa.md');
+
+    await waitFor(() => err.includes('DELIVERY STALLED'));
+    const mtimeAtStall = statSync(statusFile).mtimeMs;
+    await new Promise((res) => setTimeout(res, 100)); // several ticks
+    expect(statSync(statusFile).mtimeMs).toBe(mtimeAtStall); // suspended
+    void mtimeBefore;
+
+    busy = false; // agent finishes its turn
+    await waitFor(() => sender.calls().length > 0);
+    expect(sender.calls()).toHaveLength(1); // delivered once static
+
+    await waitFor(() => statSync(statusFile).mtimeMs > mtimeAtStall);
+    expect(statSync(statusFile).mtimeMs).toBeGreaterThan(mtimeAtStall);
+    expect(err).toContain('delivery recovered');
+
+    r.ac.abort();
+    await r.done;
+  });
+
+  it('held but still UNDER the cap → heartbeat keeps running', async () => {
+    // Guard against over-suppression: a brief hold on a momentarily-busy
+    // pane is normal operation, not a stall. Liveness stays earned.
+    writeFileSync(statusFile, 'available\n');
+    const oldT = new Date(Date.now() - 60_000);
+    utimesSync(statusFile, oldT, oldT);
+    const mtimeBefore = statSync(statusFile).mtimeMs;
+
+    let n = 0;
+    const peeker = makePeeker(() => `frame ${n++}`);
+    let err = '';
+    const r = startDing({
+      st: fake.st,
+      ptySend: sender.send,
+      identity: asIdentity(ID),
+      paneGuard: true,
+      ptyPeek: peeker.peek,
+      peekDiffMs: 1,
+      holdRetryMs: 10_000, // no retry inside the window → holds stays 1
+      maxHolds: 50, // cap far away
+      statusRefreshIntervalMs: 20,
+      intervalMs: 10,
+      stderr: (s) => {
+        err += s;
+      },
+    });
+    fake.setMessage('1714826789010-aaaaaa.md', { from: 'alice' });
+    fake.pushEvent('1714826789010-aaaaaa.md');
+
+    await waitFor(() => statSync(statusFile).mtimeMs > mtimeBefore);
+    expect(statSync(statusFile).mtimeMs).toBeGreaterThan(mtimeBefore);
+    expect(err).not.toContain('DELIVERY STALLED');
+
+    r.ac.abort();
+    await r.done;
+  });
+});
