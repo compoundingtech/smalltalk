@@ -23,6 +23,7 @@ import { cmdArchiveCli } from './commands/archive.ts';
 import { cmdCompletionsCli } from './commands/completions.ts';
 import { cmdContextCli } from './commands/context.ts';
 import { cmdDingCli } from './commands/ding.ts';
+import { cmdGcCli } from './commands/gc.ts';
 import { cmdHooksCli } from './commands/hooks.ts';
 import { cmdInitCli } from './commands/init.ts';
 import { cmdLsCli } from './commands/ls.ts';
@@ -155,7 +156,12 @@ function topLevelUsage(name: string): string {
   `  sync pull <peer>\n` +
   `  sync pull --all                  recommended cron default (pull-only)\n` +
   `  sync --all                       push + pull against every peer\n` +
-  `  sync sweep                       enforce the LAYOUT tombstone invariant\n\n` +
+  `  sync sweep                       enforce the LAYOUT tombstone invariant\n` +
+  `  gc serve [--interval S] [--once] long-running tombstone GC: sweep the bus\n` +
+  `                                   root every S seconds (default 2) so a\n` +
+  `                                   resurrected inbox copy is removed within\n` +
+  `                                   one cycle. Standalone, or hosted by\n` +
+  `                                   convoy up as a per-network child\n\n` +
   `Hooks:\n` +
   `  hooks path [--for FAMILY] [--json]\n` +
   `                                   print where st's agent-integration hook\n` +
@@ -309,6 +315,8 @@ export async function runCli(
         return cmdOverviewCli(rest, ctx);
       case 'sync':
         return await cmdSyncCli(rest, ctx);
+      case 'gc':
+        return await cmdGcCli(rest, ctx);
       case 'hooks':
         return cmdHooksCli(rest, ctx);
       case 'resource':

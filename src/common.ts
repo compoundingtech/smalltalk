@@ -13,6 +13,7 @@ import {
   rmSync,
   statSync,
   writeFileSync,
+  type Dirent,
 } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
@@ -872,4 +873,122 @@ export function applySweepPlan(plan: readonly SweepEntry[]): number {
  */
 export function sweep(rootArg?: string): SweepResult {
   return { removed: applySweepPlan(sweepPlan(rootArg)) };
+}
+
+/**
+ * True iff `<id>/inbox/<name>` exists AND is byte-identical to
+ * `<id>/archive/<name>` — i.e. `name` is an already-archived tombstone twin
+ * that has reappeared in the inbox (e.g. re-added by a union sync that lacks
+ * `--delete`). The READ-side counterpart to {@link sweepPlan}: it uses the
+ * exact same byte-identical rule but only ANSWERS the question rather than
+ * removing anything. Used by poke-decision paths (the ding rescan) to avoid
+ * re-poking on a soon-to-be-swept zombie, without touching the `ls`
+ * show-reality contract or mutating on the read path. A divergent pair
+ * returns false, exactly as sweep skips it.
+ */
+export function hasByteIdenticalArchiveTwin(
+  root: string,
+  id: string,
+  name: string
+): boolean {
+  const inboxPath = join(root, id, 'inbox', name);
+  const archivePath = join(root, id, 'archive', name);
+  if (!existsSync(inboxPath) || !existsSync(archivePath)) return false;
+  try {
+    return readFileSync(inboxPath).equals(readFileSync(archivePath));
+  } catch {
+    return false;
+  }
+}
+
+/** Directory entries with file-type info, or [] on any read error. Uses
+ *  `withFileTypes` so `isDirectory()` needs no per-entry `statSync` — cheap
+ *  even over a message folder holding hundreds of `.md` files. */
+function dirents(dir: string): Dirent[] {
+  try {
+    return readdirSync(dir, { withFileTypes: true });
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * True iff `dir` has ≥1 immediate "agent-shaped" child — a subdirectory
+ * holding an `inbox/` or `archive/`. This is the shape of a bus root:
+ * `<root>/<agent>/{inbox,archive}`. Stops at the first hit.
+ */
+function hasAgentShapedChild(dir: string): boolean {
+  for (const e of dirents(dir)) {
+    if (!e.isDirectory()) continue;
+    const p = join(dir, e.name);
+    if (isDir(join(p, 'inbox')) || isDir(join(p, 'archive'))) return true;
+  }
+  return false;
+}
+
+/**
+ * Find the first directory strictly BELOW `root` (within `maxDepth` levels)
+ * that is itself bus-shaped — i.e. has ≥1 agent-shaped child. A nested bus
+ * tree means `root` is pointed too shallow: a sweep/sync rooted at `root`
+ * will never converge the real bus nested under it. Returns its path, or
+ * null if none. Bounded, generic (no layout names hard-coded), so it catches
+ * the convoy case (`ST_ROOT=/…/convoy` while the bus is `/…/convoy/default/
+ * smalltalk`) without knowing about convoy.
+ */
+function findNestedBusRoot(root: string, maxDepth: number): string | null {
+  const queue: { dir: string; depth: number }[] = [{ dir: root, depth: 0 }];
+  while (queue.length > 0) {
+    const { dir, depth } = queue.shift()!;
+    if (depth >= maxDepth) continue;
+    for (const e of dirents(dir)) {
+      if (!e.isDirectory()) continue;
+      const child = join(dir, e.name);
+      if (hasAgentShapedChild(child)) return child;
+      queue.push({ dir: child, depth: depth + 1 });
+    }
+  }
+  return null;
+}
+
+/**
+ * Diagnose whether `root` looks like a WRONG st root, returning a one-line
+ * WARN string or null. Two signatures, both of which the resurrection
+ * incident hit (a stray syncer ran `st sync sweep` against the convoy PARENT
+ * `/…/convoy` while the live bus was `/…/convoy/default/smalltalk`, so its
+ * sweep silently no-oped):
+ *
+ *  1. TOO SHALLOW — a nested bus tree exists strictly below `root`. This is
+ *     the dangerous one: work rooted here silently misses the real bus.
+ *  2. NON-AGENT-SHAPED — `root` is non-empty but has no agent-shaped children
+ *     at all (nothing to sweep; likely a typo/misconfigured ST_ROOT).
+ *
+ * A legitimately empty (new) root returns null — no false alarm. Callers
+ * (`st sync`, `st sync sweep`, the gc service) emit this to stderr at startup
+ * so a mis-rooted invocation is LOUD instead of a silent no-op.
+ */
+export function rootShapeWarning(root: string): string | null {
+  if (!existsSync(root)) return null; // missing root: other errors own that
+  const nested = findNestedBusRoot(root, 2);
+  if (nested !== null) {
+    return (
+      `WARN: st root ${root} looks too shallow — a nested bus tree exists at ` +
+      `${nested}. A sweep/sync rooted at ${root} will NOT converge it. ` +
+      `Did you mean ST_ROOT=${nested}?`
+    );
+  }
+  if (!hasAgentShapedChild(root)) {
+    let entries: string[];
+    try {
+      entries = readdirSync(root);
+    } catch {
+      entries = [];
+    }
+    if (entries.length > 0) {
+      return (
+        `WARN: st root ${root} has no agent-shaped children ` +
+        `(no <id>/inbox or <id>/archive). Is ST_ROOT pointed at the right place?`
+      );
+    }
+  }
+  return null;
 }
