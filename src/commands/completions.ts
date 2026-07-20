@@ -188,6 +188,15 @@ const COMMANDS: readonly CommandSpec[] = [
     ],
     flags: [{ name: 'all', desc: 'Apply against every peer' }],
   },
+  {
+    name: 'hooks',
+    desc: "Print st's agent-integration hook location + install config (read-only)",
+    verbs: [{ name: 'path', desc: 'Print hook scripts dir + install config' }],
+    flags: [
+      { name: 'for', desc: 'Runtime family: claude-code|codex|pi' },
+      { name: 'json', desc: 'Machine-readable output' },
+    ],
+  },
   { name: 'mcp', desc: 'Run as an MCP stdio server' },
   {
     name: 'init',
