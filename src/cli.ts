@@ -23,6 +23,7 @@ import { cmdArchiveCli } from './commands/archive.ts';
 import { cmdCompletionsCli } from './commands/completions.ts';
 import { cmdContextCli } from './commands/context.ts';
 import { cmdDingCli } from './commands/ding.ts';
+import { cmdHooksCli } from './commands/hooks.ts';
 import { cmdInitCli } from './commands/init.ts';
 import { cmdLsCli } from './commands/ls.ts';
 import { cmdMcpCli } from './commands/mcp.ts';
@@ -155,6 +156,12 @@ function topLevelUsage(name: string): string {
   `  sync pull --all                  recommended cron default (pull-only)\n` +
   `  sync --all                       push + pull against every peer\n` +
   `  sync sweep                       enforce the LAYOUT tombstone invariant\n\n` +
+  `Hooks:\n` +
+  `  hooks path [--for FAMILY] [--json]\n` +
+  `                                   print where st's agent-integration hook\n` +
+  `                                   scripts live + the exact install config\n` +
+  `                                   (claude-code|codex|pi). Read-only; prints,\n` +
+  `                                   never installs. --json for tools\n\n` +
   `Embedding:\n` +
   `  mcp                              run as an MCP stdio server\n` +
   `  init [<dir>] [--no-channel] [--print] [--force]\n` +
@@ -302,6 +309,8 @@ export async function runCli(
         return cmdOverviewCli(rest, ctx);
       case 'sync':
         return await cmdSyncCli(rest, ctx);
+      case 'hooks':
+        return cmdHooksCli(rest, ctx);
       case 'resource':
         return await cmdResourceCli(rest, ctx);
       case 'context':
