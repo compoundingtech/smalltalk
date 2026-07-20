@@ -22,6 +22,7 @@ import {
   resolveIdentity,
   SETTABLE_STATES,
   STATES,
+  STATUS_LIVENESS_MS,
   STATUS_STALE_MS,
   type State,
   statusPath,
@@ -109,6 +110,89 @@ function readState(path: string): State {
  */
 export function readIdentityStatus(identity: string, root: string): State {
   return readState(statusPath(identity, root));
+}
+
+/**
+ * The shared freshness verdict for one identity's status file.
+ *
+ * `st agents` said `available` at the same instant `convoy ls --tree`
+ * said `DEAD (status stale 3m ago)`. Both were reading the same file;
+ * they disagreed because each had picked its own window. This is the
+ * one definition every consumer should read through so that stops
+ * happening.
+ *
+ * Note the two fields are answers to two different questions, and a
+ * caller generally wants both:
+ *
+ *   `status`   — what `st status` / `readIdentityStatus` return. Applies
+ *                the TRUST window (STATUS_STALE_MS, 15 min) and so
+ *                collapses to `unknown` only when the value itself is
+ *                no longer believable.
+ *   `live`     — whether the agent is demonstrably alive right now,
+ *                per the LIVENESS window (STATUS_LIVENESS_MS, 2 min).
+ *
+ * `recorded` deliberately survives both windows. An identity that was
+ * `busy` and went stale is NOT the same as one that cleanly went
+ * `offline`, and collapsing them loses the signal that tells you
+ * "something died mid-work" from "something shut down".
+ */
+export interface StatusLiveness {
+  /** Derived state, trust-windowed. Same value `st status` prints. */
+  status: State;
+  /** The literal on-disk value, whatever its age. `null` when the file
+   *  is missing or unreadable — distinct from a recorded `offline`. */
+  recorded: State | null;
+  /** Age of the status file's mtime in ms, relative to the `now` this
+   *  verdict was taken at; `null` when there is no file. Point-in-time
+   *  by nature — persist {@link mtimeMs} instead if you need something
+   *  that compares equal across two reads of an unchanged bus. */
+  ageMs: number | null;
+  /** Absolute mtime of the status file; `null` when there is no file. */
+  mtimeMs: number | null;
+  /** True iff the file exists and is fresher than STATUS_LIVENESS_MS. */
+  live: boolean;
+}
+
+/**
+ * Read an identity's status once and return the full freshness verdict.
+ * Single stat + single read; the shared contract behind `st agents`.
+ */
+export function readIdentityLiveness(
+  identity: string,
+  root: string,
+  opts: { livenessMs?: number; now?: number } = {}
+): StatusLiveness {
+  const path = statusPath(identity, root);
+  const livenessMs = opts.livenessMs ?? STATUS_LIVENESS_MS;
+  const now = opts.now ?? Date.now();
+  const status = readState(path);
+
+  let mtimeMs: number | null = null;
+  try {
+    if (existsSync(path)) mtimeMs = statSync(path).mtimeMs;
+  } catch {
+    mtimeMs = null;
+  }
+  const ageMs = mtimeMs === null ? null : now - mtimeMs;
+
+  let recorded: State | null = null;
+  if (mtimeMs !== null) {
+    try {
+      const first = (readFileSync(path, 'utf8').split('\n')[0] ?? '')
+        .replace(/[\s]/g, '');
+      if (isValidState(first)) recorded = first as State;
+    } catch {
+      recorded = null;
+    }
+  }
+
+  return {
+    status,
+    recorded,
+    ageMs,
+    mtimeMs,
+    live: ageMs !== null && ageMs <= livenessMs,
+  };
 }
 
 export function isValidState(s: string): s is State {
