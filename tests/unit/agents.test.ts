@@ -289,11 +289,11 @@ describe('agents: status freshness (#102)', () => {
     expect(render()).toBe('alice\tavailable\t\n');
   });
 
-  it('the reported case: 3m-old `available` is annotated, not reported live', () => {
+  it('the reported case: 3m-old `available` is annotated with its age', () => {
     setupIdentity('alice');
     setStatus('alice', 'available');
     backdateStatus('alice', 3 * 60_000);
-    expect(render()).toContain('available (stale 3m)');
+    expect(render()).toContain('available (3m ago)');
   });
 
   it('past the trust window: shows `unknown` but keeps what it last claimed', () => {
@@ -301,7 +301,7 @@ describe('agents: status freshness (#102)', () => {
     setStatus('alice', 'busy');
     backdateStatus('alice', 25 * 60_000);
     const out = render();
-    expect(out).toContain('unknown (was busy, 25m)');
+    expect(out).toContain('unknown (was busy, 25m ago)');
   });
 
   it('stale-was-busy is distinguishable from stale-was-offline', () => {

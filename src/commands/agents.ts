@@ -38,7 +38,7 @@ export interface AgentSummary {
    *  embedder destructures; will rename to `agent` in a follow-up. */
   identity: string;
   /** Derived, trust-windowed state — UNCHANGED semantics. Still what
-   *  `--status` filters on. See `live`/`ageMs` for freshness. */
+   *  `--status` filters on. See `live`/`statusMtimeMs` for freshness. */
   status: State;
   name: string | null;
   /** #102: freshness, so a roster reader can't mistake a stale value
@@ -273,14 +273,18 @@ function agentsHelp(name: string): string {
     '  --status STATE   only agents in STATE (available|busy|away|dnd|offline).\n' +
     '  --json           machine-readable array.\n' +
     '  --enrich         (with --json) add inbox counts + last-activity.\n\n' +
-    '  Freshness: a status value is only as good as its mtime. An agent\n' +
-    '  whose status has not been touched inside the liveness window is\n' +
-    '  annotated rather than reported bare:\n' +
-    '    available              touched recently — live\n' +
-    '    available (stale 3m)   last touched 3m ago; not demonstrably live\n' +
-    '    unknown (was busy, 22m)  too old to trust; last claimed `busy`\n' +
-    '  --json carries this as `live` / `ageMs` / `recorded`. The `status`\n' +
-    '  field itself is unchanged, as is what --status filters on.\n\n' +
+    '  Freshness: a status value is only as good as its mtime, so one\n' +
+    '  that has not been touched recently is shown with its age:\n' +
+    '    available                  touched recently\n' +
+    '    available (3m ago)         last touched 3m ago\n' +
+    '    unknown (was busy, 22m ago)  too old to trust; last claimed `busy`\n' +
+    '  The age is a fact, not a verdict: agents have different status\n' +
+    '  writers (a ding heartbeat touches every 30s, an MCP server every\n' +
+    '  5min), so how old is too old depends on the agent. --json carries\n' +
+    '  `live` (per the shared STATUS_LIVENESS_MS window) plus\n' +
+    '  `statusMtimeMs` / `recorded` for consumers that know their own\n' +
+    '  cadence. The `status` field itself is unchanged, as is what\n' +
+    '  --status filters on.\n\n' +
     '  Examples:\n' +
     `    ${name} agents                      # id / status / name, tab-separated\n` +
     `    ${name} agents --status available   # only agents marked available\n` +
@@ -337,34 +341,46 @@ export function cmdAgentsCli(
 }
 
 /**
- * #102: the status cell, annotated with freshness.
+ * #102: the status cell, annotated with the AGE of the value.
  *
  * `st agents` used to print the derived state bare, so a status file
  * last touched minutes ago rendered identically to one touched a second
  * ago. The value was never wrong exactly — it was unqualified, and a
  * roster command is precisely where "as of when?" matters.
  *
+ * Deliberately a FACT ("3m ago"), not a VERDICT ("stale"). `st agents`
+ * enumerates every agent under the root, and different agents have
+ * different status writers with different cadences: the ding heartbeat
+ * touches every 30s, but an MCP-server-backed agent only refreshes
+ * every STATUS_REFRESH_MS (5 min). A single global "this one is stale"
+ * verdict cannot be right for both — calling a healthy MCP agent stale
+ * for 3 of every 5 minutes would just be a new way of being wrong.
+ *
+ * So the roster reports the age and lets the reader judge. A consumer
+ * that KNOWS its agents run a ding (convoy) applies STATUS_LIVENESS_MS
+ * via the exported `live` field / `readIdentityLiveness`, which is
+ * where a verdict can actually be justified.
+ *
  * Shapes:
- *   available                  live, fresh
- *   available (stale 3m)       past the liveness window; the recorded
- *                              value is kept, because "was busy and went
+ *   available                  touched inside the liveness window
+ *   available (3m ago)         older than that — stated, not judged
+ *   unknown (was busy, 22m ago)  past the trust window; derived state is
+ *                              `unknown`, but we still say what it last
+ *                              claimed, because "was busy and went
  *                              quiet" and "cleanly offline" are
  *                              different facts
- *   unknown (was busy, 22m)    past the trust window too — derived state
- *                              is `unknown`, but we still say what it
- *                              last claimed
  *   offline                    no status file at all; nothing to age
  */
 function renderStatusCell(m: AgentSummary, now = Date.now()): string {
   if (m.statusMtimeMs === null) return m.status; // no file → nothing to qualify
   if (m.live) return m.status;
-  const age = formatAge(now - m.statusMtimeMs);
+  const age = `${formatAge(now - m.statusMtimeMs)} ago`;
   // Trust window blew past: `status` is `unknown`, so surface what the
   // file still records rather than dropping the signal entirely.
   if (m.status === 'unknown' && m.recorded !== null) {
     return `unknown (was ${m.recorded}, ${age})`;
   }
-  return `${m.status} (stale ${age})`;
+  return `${m.status} (${age})`;
 }
 
 /** Compact age: `45s`, `3m`, `2h`, `4d`. */
