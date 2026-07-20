@@ -116,6 +116,42 @@
             mainProgram = "st";
           };
         };
+        # Base for checks that need devDependencies (tsc, vitest), which the
+        # shipped package deliberately omits.
+        #
+        # Two things make this awkward enough to be worth explaining. First,
+        # npm cannot resolve the `file:../pty` devDependency from a store
+        # symlink: it chmods the linked `bin/pty`, which is read-only in the
+        # store, and fails EPERM. So the sibling is *copied* to the exact
+        # relative path the lockfile names and made writable. Second,
+        # `--ignore-scripts` keeps node-pty's native build (`hasInstallScript`)
+        # out of the sandbox; nothing gated here needs the native addon.
+        #
+        # These run the check in the build dir and `touch $out` rather than
+        # installing anything, so the store-external `../pty` symlink npm
+        # leaves in node_modules never has to survive into the output.
+        mkDevCheck =
+          name: script:
+          smalltalk.overrideAttrs (old: {
+            pname = "smalltalk-${name}";
+            npmInstallFlags = [ ];
+            npmFlags = [ "--ignore-scripts" ];
+            postPatch = ''
+              cp -r ${pty.packages.${system}.default}/lib/pty ../pty
+              chmod -R u+w ../pty
+            '';
+            installPhase = ''
+              runHook preInstall
+              export HOME=$(mktemp -d)
+              ${script}
+              touch $out
+              runHook postInstall
+            '';
+            postInstall = "";
+            # Nothing is installed, so the fixup hooks (patchelf,
+            # noBrokenSymlinks) have nothing useful to do.
+            dontFixup = true;
+          });
       in
       {
         packages.smalltalk = smalltalk;
@@ -142,6 +178,19 @@
 
           touch $out
         '';
+
+        # `npm run build` is typecheck-only (both tsconfigs set `noEmit`), so
+        # this gates src/ and examples/ against the compiler.
+        checks.typecheck = mkDevCheck "typecheck" "npm run build";
+
+        # The vitest `unit` project is NOT gated here yet. It very nearly works
+        # (1322/1323 pass in the sandbox), but tests/unit/cli.test.ts asserts
+        # `st <semver>+<short-sha>`, and the SHA comes from shelling out to
+        # `git rev-parse` in the source dir — which a hermetic build has no
+        # `.git` for. That is the build-identity question tracked in #103, not
+        # something to paper over here. The `integration` project is a separate
+        # matter: it shells out to rsync and spawns real pty sessions, which the
+        # build sandbox has no business hosting.
 
         devShells.default = pkgs.mkShell {
           packages = [
