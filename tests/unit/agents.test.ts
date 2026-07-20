@@ -58,6 +58,17 @@ describe('cmdMembers / listIdentities', () => {
     expect(listIdentities(stRoot)).toContain('partial');
   });
 
+  it('accepts a status-only folder (message-less cross-machine agent whose empty inbox/archive were pruned by rsync --prune-empty-dirs)', () => {
+    mkdirSync(join(stRoot, 'hetz.bob'), { recursive: true });
+    setStatus('hetz.bob', 'available');
+    expect(listIdentities(stRoot)).toContain('hetz.bob');
+  });
+
+  it('skips a folder with no inbox/archive AND no status (not an agent)', () => {
+    mkdirSync(join(stRoot, 'notanagent'), { recursive: true });
+    expect(listIdentities(stRoot)).not.toContain('notanagent');
+  });
+
   it('skips dotfile entries at the root', () => {
     setupIdentity('alice');
     mkdirSync(join(stRoot, '.hidden'), { recursive: true });

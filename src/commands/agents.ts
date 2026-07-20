@@ -155,9 +155,15 @@ export function listAgents(root: string): string[] {
       continue;
     }
     if (!st.isDirectory()) continue;
+    // An agent is a folder with an inbox/, an archive/, OR a status file.
+    // The status-file case matters for a message-less CROSS-MACHINE agent:
+    // the bus sync's `rsync --prune-empty-dirs` prunes its empty inbox/archive
+    // so only its synced `status` file lands here — requiring inbox/archive
+    // would then hide a live remote agent until it happens to have a message.
     if (
       !isDir(inboxDir(name, root)) &&
-      !isDir(archiveDir(name, root))
+      !isDir(archiveDir(name, root)) &&
+      !existsSync(statusPath(name, root))
     ) {
       continue;
     }

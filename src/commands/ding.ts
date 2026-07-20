@@ -16,6 +16,7 @@ import { join } from 'node:path';
 
 import { invokedName, type CliContext } from '../cli-context.ts';
 import {
+  filenameTimestamp,
   hasByteIdenticalArchiveTwin,
   inboxDir,
   LIVENESS_HEARTBEAT_MS,
@@ -1117,8 +1118,16 @@ export async function runDing(deps: DingDeps): Promise<void> {
       } catch {
         continue;
       }
-      if (st.mtimeMs > statusMtimeMs) {
-        eligible.push({ filename: name, mtimeMs: st.mtimeMs });
+      // Eligibility = "arrived after the agent last addressed its inbox"
+      // (statusMtime proxies last-active). Gate on the LATER of the file mtime
+      // and the LAYOUT-004 filename timestamp: `rsync -a` PRESERVES a peer's
+      // write-mtime, which can skew below statusMtime and silently drop a
+      // synced CROSS-MACHINE message from the startup re-poke; the filename ts
+      // is its machine-consistent write time. max() leaves local behavior
+      // unchanged while rescuing cross-machine arrivals present at start.
+      const effectiveTs = Math.max(st.mtimeMs, filenameTimestamp(name));
+      if (effectiveTs > statusMtimeMs) {
+        eligible.push({ filename: name, mtimeMs: effectiveTs });
       }
     }
     // Chronological by filename (the <unix-ms> prefix sorts correctly

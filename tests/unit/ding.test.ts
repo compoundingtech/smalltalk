@@ -1911,6 +1911,22 @@ describe('runDing — scan-on-startup', () => {
     await r.done;
   });
 
+  it('cross-machine arrival (recent filename ts, OLD rsync-preserved mtime) IS re-poked on startup', async () => {
+    setStatusMtime(30 * 60_000); // status 30 min old
+    // A synced cross-machine message: its LAYOUT-004 filename ts is ~now (its
+    // real write time on the peer), but `rsync -a` preserved an OLD mtime
+    // (2h ago) — below status. The old mtime-only gate dropped it; the
+    // filename-ts (via max) now rescues it.
+    const fn = `${Date.now() - 5_000}-xmxmxm.md`;
+    plantInboxFile(fn, 2 * 60 * 60_000, 'hetz.bob', 'cross'); // mtime 2h ago
+    fake.setStatus('available');
+    const r = startDing({ st: fake.st, ptySend: sender.send });
+    await settle();
+    expect(sender.calls()).toHaveLength(1); // re-poked despite the old mtime
+    r.ac.abort();
+    await r.done;
+  });
+
   it('resurrected zombie (byte-identical archive twin) → NO startup push', async () => {
     setStatusMtime(60 * 60_000); // status 1h old
     // Newer-than-status inbox file → would normally poke...
