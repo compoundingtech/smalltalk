@@ -3,7 +3,10 @@ pty.toml
 .claude/settings.local.json
 .claude/scheduled_tasks.*
 .claude/worktrees/
-node_modules/
+# no trailing slash: also ignores a stray SYMLINK named node_modules. A
+# `node_modules/` (dir-only) pattern let a self-referential symlink get
+# committed once and broke tooling (ELOOP) on every checkout.
+node_modules
 dist/
 .vitest-cache/
 
