@@ -6,9 +6,9 @@ purpose: argument that the sync algorithm doesn't silently lose messages, with e
 
 # smalltalk — no-loss argument
 
-> Originally written when the project was named `coord`. The argument
+> Originally written when the project was named `smalltalk`. The argument
 > is unchanged by the rename; CLI examples below use the current
-> canonical `st` name with `coord` working identically as an alias.
+> canonical `st` name with `smalltalk` working identically as an alias.
 
 The claim of this document: **under a small set of assumptions, every message file ever written into a participating smalltalk folder reaches one of three terminal states — still in some machine's inbox, in some machine's archive, or explicitly trimmed — and never silently disappears.**
 
@@ -38,7 +38,7 @@ Consider an arbitrary message `M` written by sender `S` into `<recipient>/inbox/
 
 By assumption 3, rsync only ever copies `M` from a source that has it to a destination that doesn't. It never removes `M` from any tree. Rsync's checksums (assumption 3) ensure the bytes arrive intact.
 
-So the only way for `M` to disappear from a machine's filesystem after rsync runs is by the explicit action of one of coord's own commands.
+So the only way for `M` to disappear from a machine's filesystem after rsync runs is by the explicit action of one of smalltalk's own commands.
 
 ### What smalltalk commands can do to M
 
@@ -99,7 +99,7 @@ A wildly-wrong clock that produces filenames in the future would cause readers u
 
 ### Trim convergence (the deferred bug)
 
-Trim is local-only. If alice trims `M` and bob hasn't, bob's next sync to alice resurrects `M` on alice's side. The system tends to *over-preserve* under trim disagreement, not under-preserve. Walkthrough §"Trim coordination" describes the operational workaround.
+Trim is local-only. If alice trims `M` and bob hasn't, bob's next sync to alice resurrects `M` on alice's side. The system tends to *over-preserve* under trim disagreement, not under-preserve. Walkthrough §"Trim orchestration" describes the operational workaround.
 
 ### `--delete` accidentally enabled
 

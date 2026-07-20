@@ -1,6 +1,6 @@
 ---
 name: smalltalk
-description: The smalltalk message-bus + agent-status layer, driven by the `st` (long form `smalltalk`) CLI. Reach for it whenever you need to COMMUNICATE with another actor on this machine — send or read a message, reply to a `[DING]` poke, coordinate work, deliver a result, ask a blocker, or check who's around and their status — instead of printing to your own (unattended) terminal. Also covers your lossless-restart working state (context).
+description: The smalltalk message-bus + agent-status layer, driven by the `st` (long form `smalltalk`) CLI. Reach for it whenever you need to COMMUNICATE with another actor on this machine — send or read a message, reply to a `[DING]` poke, orchestrate work, deliver a result, ask a blocker, or check who's around and their status — instead of printing to your own (unattended) terminal. Also covers your lossless-restart working state (context).
 when_to_use: Use when a task involves talking to another agent or human on the bus (send/reply/ls/read/archive a message), reading or setting agent status, or reading/writing your own restart context. NOT for spawning agents (that is convoy) and NOT for wrapping a terminal session (that is pty).
 ---
 
@@ -29,6 +29,24 @@ agents is `convoy`; wrapping a session is `pty` — different tools.)
    `st status --set busy`.
 4. **Keep restart state** — `st context write` (rewrite `now.md` from stdin) /
    `st context append --decision '...' --why '...'`.
+
+## Claude Code hooks
+
+smalltalk ships Claude Code lifecycle hooks so an agent is a good bus citizen
+automatically — set them up once when adopting the tool:
+
+- **SessionStart** — runs the boot ritual (status `available` + inbox drain)
+  on every session boundary (cold start, `--resume`, `/clear`, `/compact`), so
+  a resumed agent never sits silent.
+- **PreCompact** — flushes your working state (`context`) before a compaction.
+- **StopFailure** — surfaces an API-error wedge (rate-limit / auth / billing)
+  to the operator over the bus.
+
+Install with **`st hooks path`** — it *prints* the exact
+`.claude/settings.local.json` block to paste (read-only; never edits your
+settings). See the README's "Adopt smalltalk standalone" section for the
+copy-pasteable steps. The scripts call `st` via `$ST_BIN`, so they work even
+when `st` is not on `$PATH`.
 
 ## Message economy
 

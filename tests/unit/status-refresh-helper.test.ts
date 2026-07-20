@@ -28,8 +28,8 @@ let statusPath: string;
 const ID = 'alice';
 
 beforeEach(() => {
-  scratch = mkdtempSync(join(tmpdir(), 'coord-refresh-helper-'));
-  stRoot = join(scratch, 'coord');
+  scratch = mkdtempSync(join(tmpdir(), 'st-refresh-helper-'));
+  stRoot = join(scratch, 'smalltalk');
   mkdirSync(join(stRoot, ID), { recursive: true });
   statusPath = join(stRoot, ID, 'status');
 });

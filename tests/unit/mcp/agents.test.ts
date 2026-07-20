@@ -35,8 +35,8 @@ async function boot(identity = 'alice'): Promise<void> {
 }
 
 beforeEach(() => {
-  scratch = mkdtempSync(join(tmpdir(), 'coord-mcp-members-'));
-  stRoot = join(scratch, 'coord');
+  scratch = mkdtempSync(join(tmpdir(), 'st-mcp-members-'));
+  stRoot = join(scratch, 'smalltalk');
 });
 
 afterEach(async () => {

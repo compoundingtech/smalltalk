@@ -47,8 +47,8 @@ async function setup(opts: { channel: boolean; identity?: string }): Promise<voi
 }
 
 beforeEach(() => {
-  scratch = mkdtempSync(join(tmpdir(), 'coord-mcp-reply-'));
-  stRoot = join(scratch, 'coord');
+  scratch = mkdtempSync(join(tmpdir(), 'st-mcp-reply-'));
+  stRoot = join(scratch, 'smalltalk');
   for (const id of ['alice', 'bob', 'carol']) {
     mkdirSync(join(stRoot, id, 'inbox'), { recursive: true });
     mkdirSync(join(stRoot, id, 'archive'), { recursive: true });

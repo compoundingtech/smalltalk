@@ -34,8 +34,8 @@ let stRoot: string;
 const chmodRestores: Array<{ path: string; mode: number }> = [];
 
 beforeEach(() => {
-  scratch = mkdtempSync(join(tmpdir(), 'coord-resilience-test-'));
-  stRoot = join(scratch, 'coord');
+  scratch = mkdtempSync(join(tmpdir(), 'st-resilience-test-'));
+  stRoot = join(scratch, 'smalltalk');
   mkdirSync(stRoot, { recursive: true });
 });
 afterEach(() => {

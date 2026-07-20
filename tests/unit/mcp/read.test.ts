@@ -17,8 +17,8 @@ let client: Client;
 let handle: ReturnType<typeof createMcpServer>;
 
 beforeEach(async () => {
-  scratch = mkdtempSync(join(tmpdir(), 'coord-mcp-read-'));
-  stRoot = join(scratch, 'coord');
+  scratch = mkdtempSync(join(tmpdir(), 'st-mcp-read-'));
+  stRoot = join(scratch, 'smalltalk');
   for (const id of ['alice', 'bob']) {
     mkdirSync(join(stRoot, id, 'inbox'), { recursive: true });
     mkdirSync(join(stRoot, id, 'archive'), { recursive: true });

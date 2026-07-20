@@ -78,7 +78,7 @@ export interface InitResult {
  * Resolve a portable path to the smalltalk shim to embed as the MCP
  * server command in a project's `.mcp.json`. Strategy:
  *   1. Walk up from this module's file location to find the
- *      package.json whose `name === "@myobie/coord"` (the package
+ *      package.json whose `name === "@compoundingtech/smalltalk"` (the package
  *      name still says st until the npm publish flips it), then
  *      return `<package-root>/bin/st`. Falls back to
  *      `<package-root>/bin/st` only when `bin/st` isn't present
@@ -109,7 +109,7 @@ export function resolveStShimPath(): string {
       try {
         const raw = readFileSync(pkgPath, 'utf8');
         const parsed = JSON.parse(raw) as { name?: string };
-        if (parsed.name === '@myobie/coord') {
+        if (parsed.name === '@compoundingtech/smalltalk') {
           // Return the canonical bin/st shim.
           const candidate = join(dir, 'bin', 'st');
           if (existsSync(candidate) && statSync(candidate).isFile()) {
@@ -137,14 +137,14 @@ export function resolveStShimPath(): string {
     }
   }
   throw new Error(
-    'st init: could not resolve a bin/st path. Install @myobie/coord ' +
+    'st init: could not resolve a bin/st path. Install @compoundingtech/smalltalk ' +
       '(via npm) or add `st` to your $PATH and retry.'
   );
 }
 
 // ─── Entry shape ────────────────────────────────────────────────────────
 
-function buildCoordEntry(
+function buildStEntry(
   binPath: string,
   noChannel: boolean
 ): McpServerEntry {
@@ -169,7 +169,7 @@ export async function cmdInit(
 ): Promise<InitResult> {
   const binPath =
     input.binPath !== undefined ? input.binPath : resolveStShimPath();
-  const entry = buildCoordEntry(binPath, input.noChannel === true);
+  const entry = buildStEntry(binPath, input.noChannel === true);
   const targetDir = isAbsolute(input.dir) ? input.dir : resolve(input.dir);
   const path = join(targetDir, '.mcp.json');
 

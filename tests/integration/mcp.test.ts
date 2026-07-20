@@ -1,4 +1,4 @@
-// tests/integration/mcp.test.ts — `bin/coord mcp` driven over real
+// tests/integration/mcp.test.ts — `bin/st mcp` driven over real
 // stdio, via the SDK's StdioClientTransport.
 //
 // One subprocess boot per describe block (via beforeAll) for speed;
@@ -28,7 +28,7 @@ import {
 
 import { errorCode, errorPayload } from "../unit/mcp/_helpers.ts";
 import { EXPECTED_TOOL_NAMES } from '../../src/mcp/capabilities.ts';
-import { COORD_BIN, mkRoot, mkScratch } from './helpers.ts';
+import { ST_BIN, mkRoot, mkScratch } from './helpers.ts';
 
 interface CallResult {
   isError?: boolean;
@@ -37,13 +37,13 @@ interface CallResult {
 }
 
 /**
- * Spawn `bin/coord mcp` once per describe. The ST_ROOT env is
+ * Spawn `bin/st mcp` once per describe. The ST_ROOT env is
  * pinned at boot — per-test isolation comes from each test using a
  * fresh subdirectory under that root and asking for it via the
  * `identity` arg in tool calls.
  *
  * One subprocess + N identities is faster than N subprocesses, and
- * coord's MCP server is stateless given a clean root (the Coord
+ * smalltalk's MCP server is stateless given a clean root (the Smalltalk
  * factory has no per-call mutable state beyond the filesystem).
  */
 async function bootSubprocess(stRoot: string): Promise<{
@@ -52,7 +52,7 @@ async function bootSubprocess(stRoot: string): Promise<{
   shutdown: () => Promise<void>;
 }> {
   const transport = new StdioClientTransport({
-    command: COORD_BIN,
+    command: ST_BIN,
     args: ['mcp'],
     env: {
       PATH: process.env.PATH ?? '',
@@ -489,7 +489,7 @@ describe('mcp integration — error response shape over real stdio', () => {
     rmSync(stRoot, { recursive: true, force: true });
   });
 
-  it('StError → isError + content[0].text starts with code + _meta["coord/error"]', async () => {
+  it('StError → isError + content[0].text starts with code + _meta["smalltalk/error"]', async () => {
     const r = await callTool(client, 'st_msg_send', {
       to: 'INVALID',
       body: 'm',

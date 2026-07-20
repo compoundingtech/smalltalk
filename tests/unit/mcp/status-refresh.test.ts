@@ -61,8 +61,8 @@ async function wait(ms: number): Promise<void> {
 }
 
 beforeEach(() => {
-  scratch = mkdtempSync(join(tmpdir(), 'coord-status-refresh-'));
-  stRoot = join(scratch, 'coord');
+  scratch = mkdtempSync(join(tmpdir(), 'st-status-refresh-'));
+  stRoot = join(scratch, 'smalltalk');
   mkdirSync(join(stRoot, 'alice'), { recursive: true });
   statusFile = join(stRoot, 'alice', 'status');
 });

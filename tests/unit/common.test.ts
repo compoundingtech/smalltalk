@@ -61,8 +61,8 @@ let scratch: string;
 let stRootDir: string;
 
 beforeEach(() => {
-  scratch = mkdtempSync(join(tmpdir(), 'coord-common-test-'));
-  stRootDir = join(scratch, 'coord');
+  scratch = mkdtempSync(join(tmpdir(), 'st-common-test-'));
+  stRootDir = join(scratch, 'smalltalk');
   mkdirSync(stRootDir, { recursive: true });
 });
 
@@ -357,7 +357,7 @@ describe('validIdentity', () => {
     // A delegation-path-as-identity wants `<persona>.<26-char-ulid>` or
     // deeper, which blows the old 32-char cap immediately. The cap was
     // defensive, not load-bearing — POSIX paths accept far longer, and
-    // there's no coord invariant that depends on a length bound.
+    // there's no smalltalk invariant that depends on a length bound.
     expect(validIdentity('a'.repeat(64))).toBe(true);
     expect(validIdentity('persona.01arz3ndektsv4rrffq69g5fav')).toBe(true);
     expect(validIdentity('a'.repeat(255))).toBe(true);
@@ -1066,7 +1066,7 @@ describe('sweep', () => {
       ).toBe(false);
     });
 
-    it('sibling without a matching archive .md → preserved (not coord-owned)', () => {
+    it('sibling without a matching archive .md → preserved (not st-owned)', () => {
       setupIdentity(stRootDir, 'bob');
       const att = '1714826789010-aaaaaa.options.json';
       writeFileSync(join(stRootDir, 'bob', 'inbox', att), 'X');
@@ -1144,7 +1144,7 @@ describe('prefixOf', () => {
   });
 
   it('returns null when there is no extension at all', () => {
-    // Bare prefix isn't a coord file — coord names always carry an
+    // Bare prefix isn't a smalltalk file — smalltalk names always carry an
     // extension (`.md` or the attachment suffix).
     expect(prefixOf('1714826789010-aaaaaa')).toBeNull();
   });

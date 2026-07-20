@@ -9,7 +9,7 @@ purpose: name the actor-model framing the system is built on, so design decision
 The project's new name is a nod to the original Smalltalk — Alan Kay's
 language built around objects-that-pass-messages. That framing is also
 the right framing for what this project actually is: **a network of
-agent-actors that coordinate exclusively by passing messages through
+agent-actors that orchestrate exclusively by passing messages through
 each other's mailboxes.** No shared mutable state, no RPC, no remote
 function calls. Just files in folders, observed and rewritten by their
 owners.
@@ -68,7 +68,7 @@ What this buys:
 
 Actors don't synchronize. They send a message, then move on. The
 sender doesn't block on the receiver reading or replying. This system
-inherits that: `coord_msg_send` returns the moment the file is
+inherits that: `st_msg_send` returns the moment the file is
 written; the recipient sees it whenever sync delivers and their
 process notices. There is **no synchronous "wait for reply"** — if
 you want a reply, you send a message and either keep going or pause
@@ -76,11 +76,11 @@ on something else (Claude Code's channel notifications, a tail, a
 human reading) until the reply arrives.
 
 This is why "smalltalk threads stay on smalltalk" matters (the boot
-ritual still calls it "Coord threads stay on coord" verbatim — see
+ritual still calls it "Smalltalk threads stay on smalltalk" verbatim — see
 [`src/mcp/capabilities.ts`](../src/mcp/capabilities.ts) →
 `CHANNEL_INSTRUCTIONS` — preserved for back-compat with existing
 agent context; the underlying rule is the same): replying via
-`st_msg_reply` / `coord_msg_reply` keeps the
+`st_msg_reply` / `st_msg_reply` keeps the
 correspondence in the actor channel. Replying via the REPL (where
 nobody is listening by default) breaks the actor abstraction — you
 shouted into a room with no microphone.

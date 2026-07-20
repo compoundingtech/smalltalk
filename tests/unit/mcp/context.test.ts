@@ -1,7 +1,7 @@
 // tests/unit/mcp/context.test.ts — context/ v1 MCP tools.
 //
-// Post-coord-cutover: every context_* verb is registered under
-// `st_*` only. The historical `coord_*` dual-register and the
+// Post-st-cutover: every context_* verb is registered under
+// `st_*` only. The historical `st_*` dual-register and the
 // alias smoke-test that verified both prefixes have been removed —
 // the tools/list-matches-EXPECTED regression at
 // tests/unit/mcp/shared.test.ts locks in the st-only surface.
@@ -22,8 +22,8 @@ let client: Client;
 let handle: ReturnType<typeof createMcpServer>;
 
 beforeEach(async () => {
-  scratch = mkdtempSync(join(tmpdir(), 'coord-mcp-context-'));
-  stRoot = join(scratch, 'coord');
+  scratch = mkdtempSync(join(tmpdir(), 'st-mcp-context-'));
+  stRoot = join(scratch, 'smalltalk');
   for (const id of ['alice', 'bob']) {
     mkdirSync(join(stRoot, id, 'inbox'), { recursive: true });
     mkdirSync(join(stRoot, id, 'archive'), { recursive: true });
@@ -69,13 +69,11 @@ async function callAppend(args: Record<string, unknown>): Promise<CallResult> {
 // ─── Registration ────────────────────────────────────────────────────────
 
 describe('context_* — tools/list registration', () => {
-  it('registers all three verbs under `st_*` (coord_* alias removed)', async () => {
+  it('registers all three verbs under `st_*`', async () => {
     const r = await client.listTools();
     const names = new Set(r.tools.map((t) => t.name));
     for (const base of ['context_read', 'context_write', 'context_append']) {
       expect(names.has(`st_${base}`)).toBe(true);
-      // Regression guard against the historic dual-register.
-      expect(names.has(`coord_${base}`)).toBe(false);
     }
   });
 

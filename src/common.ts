@@ -361,8 +361,8 @@ export const resolveIdentity = resolveAgent;
 // The resolver honors `ST_AGENT` (preferred) then the deprecated
 // `ST_IDENTITY`; each legacy `ST_IDENTITY` hit emits a one-time stderr
 // notice per process so operators can migrate configs without breakage.
-// The legacy `COORD_*` names are no longer honored — they were removed
-// with the rest of the coord surface. The default state path
+// The legacy `ST_*` names are no longer honored — they were removed
+// with the rest of the smalltalk surface. The default state path
 // prefers `~/.local/state/smalltalk` when it exists, falls back to
 // `~/.local/state/st` when only that exists, and creates
 // `~/.local/state/smalltalk` on a brand-new install. Config dir

@@ -7,37 +7,37 @@ purpose: walk through the v0 bash CLI as a play — what commands exist, what fi
 # smalltalk v0 — a walkthrough in scenes
 
 > **Historical note.** This doc captures the v0 bash CLI shape (the
-> project was named `coord` at the time). Three things have changed
+> project was named `smalltalk` at the time). Three things have changed
 > since:
 >
-> 1. **brief-017:** message verbs are now nested under `coord message
->    <verb>` (alias `coord msg <verb>`). Translation: `coord send` →
->    `coord message send`, `coord ls` → `coord message ls`, etc.
-> 2. **brief-009 item 3:** the project was renamed `coord` →
+> 1. **brief-017:** message verbs are now nested under `st message
+>    <verb>` (alias `st msg <verb>`). Translation: `st send` →
+>    `st message send`, `st ls` → `st message ls`, etc.
+> 2. **brief-009 item 3:** the project was renamed `smalltalk` →
 >    `smalltalk` (long) / `st` (canonical short). All three CLI names
 >    install side-by-side and behave identically; the examples below
->    still using `coord …` work unchanged.
+>    still using `smalltalk …` work unchanged.
 > 3. **brief-009 items 1/2:** the `tasks/` and `journal/` folders + CLI
->    verbs were removed in the slim-down. References to `coord task` /
->    `coord tasks` / `coord journal` below are historical.
+>    verbs were removed in the slim-down. References to `smalltalk task` /
+>    `smalltalk tasks` / `smalltalk journal` below are historical.
 >
 > See [walkthrough.md](walkthrough.md) for the current play.
 
-This is what happens when two agents talk through coord. Every command shown was run for real against `/tmp/coord-dx3/` during DX verification of brief-003. Every file path is exactly what landed on disk.
+This is what happens when two agents talk through smalltalk. Every command shown was run for real against `/tmp/st-dx3/` during DX verification of brief-003. Every file path is exactly what landed on disk.
 
 ## Cast
 
 - **alice** — an agent hosted on machine A
 - **bob** — an agent hosted on machine B
-- **coord** — the CLI
+- **smalltalk** — the CLI
 - **rsync** — the messenger; runs periodically, doesn't think
 
 ## Setting
 
-Two machines, each with `$COORD_ROOT` (default: `~/.local/state/coord`). The folders are conceptually one shared workspace, but each machine has its own copy. `rsync` is the only thing that crosses the wire.
+Two machines, each with `$ST_ROOT` (default: `~/.local/state/smalltalk`). The folders are conceptually one shared workspace, but each machine has its own copy. `rsync` is the only thing that crosses the wire.
 
 ```
-$COORD_ROOT/
+$ST_ROOT/
   <identity>/         # one folder per addressable participant
     .machine-id        # which machine hosts this identity
     inbox/             # messages addressed to <identity>, not yet processed
@@ -50,26 +50,26 @@ LAYOUT.md is the binding spec. It says: append-only writes, rename-only consumer
 ## The command surface
 
 ```
-coord init <identity>                                 # bootstrap a new identity on this machine
-coord send <to> [--from ID] [--subject S]             # write a message (body from stdin)
+st init <identity>                                 # bootstrap a new identity on this machine
+st send <to> [--from ID] [--subject S]             # write a message (body from stdin)
             [--in-reply-to F] [--tags T,T] [--priority low|normal|high]
-coord ls [<identity>] [--archive] [--count] [--since UNIX_MS] [--from ID]
-coord read <identity> <filename> [--raw] [--archive]
-coord archive <identity> <filename>
-coord archive trim [<identity>] [--older-than DURATION] [--keep-last N] [--dry-run]
-coord thread <identity> <filename>
-coord watch <identity> [--with-subject] [--since UNIX_MS] [--interval MS] [--once]
-coord status [<identity>] [<state>]                   # state ∈ {available, busy, dnd}
-coord sync push <peer>
-coord sync pull <peer>
-coord sync sweep                                      # run the archive-as-tombstone sweep manually
-coord sync --all
+st ls [<identity>] [--archive] [--count] [--since UNIX_MS] [--from ID]
+st read <identity> <filename> [--raw] [--archive]
+st archive <identity> <filename>
+st archive trim [<identity>] [--older-than DURATION] [--keep-last N] [--dry-run]
+st thread <identity> <filename>
+st watch <identity> [--with-subject] [--since UNIX_MS] [--interval MS] [--once]
+st status [<identity>] [<state>]                   # state ∈ {available, busy, dnd}
+st sync push <peer>
+st sync pull <peer>
+st sync sweep                                      # run the archive-as-tombstone sweep manually
+st sync --all
 ```
 
 `<peer>` is one of:
 - `local:<path>` (used in tests / single-host setups)
 - `host[:path]` (ssh target)
-- a name from `$COORD_CONFIG/peers.yaml`
+- a name from `$ST_CONFIG/peers.yaml`
 
 Every command except `init` runs an implicit pre-command **sweep** first — if `archive/X.md` exists locally, any matching `inbox/X.md` is removed before the command does its work. That's what keeps reads consistent in the face of asymmetric sync.
 
@@ -77,17 +77,17 @@ Every command except `init` runs an implicit pre-command **sweep** first — if 
 
 ## Act I — Cold start
 
-*Two fresh machines, no coord state on either.*
+*Two fresh machines, no smalltalk state on either.*
 
 **alice (on A):**
 ```
-$ coord init alice
+$ st init alice
 initialized: alice
 ```
 
 **Filesystem on A after Act I:**
 ```
-~/.local/state/coord/
+~/.local/state/smalltalk/
 ├── .machine-id            "machine-a"
 └── alice/
     ├── .machine-id        "machine-a"   ← this is the codex P1 marker that
@@ -95,9 +95,9 @@ initialized: alice
     └── inbox/                              from a synced peer copy
 ```
 
-**bob (on B):** same thing, `coord init bob`. Both machines are now ready.
+**bob (on B):** same thing, `st init bob`. Both machines are now ready.
 
-**Why it matters:** the per-identity `.machine-id` file is small but load-bearing — it's how `coord send --from <X>` knows whether `<X>` is actually hosted here vs. an artifact synced from someone else. Without it, a typo in `--from` would invent a new identity. With it, typos get rejected loudly.
+**Why it matters:** the per-identity `.machine-id` file is small but load-bearing — it's how `st send --from <X>` knows whether `<X>` is actually hosted here vs. an artifact synced from someone else. Without it, a typo in `--from` would invent a new identity. With it, typos get rejected loudly.
 
 ---
 
@@ -105,7 +105,7 @@ initialized: alice
 
 **alice (on A):**
 ```
-$ echo "hey, can you take a look at this?" | coord send bob --from alice --subject "review request"
+$ echo "hey, can you take a look at this?" | st send bob --from alice --subject "review request"
 1777971233168-machine-a-62qzgz.md
 ```
 
@@ -113,7 +113,7 @@ The single line of stdout is the filename, ready to pipe into other commands.
 
 **What just happened on A's disk:**
 ```
-~/.local/state/coord/
+~/.local/state/smalltalk/
 ├── alice/                              (unchanged — alice's identity still empty)
 └── bob/                                ← created on the fly. alice has a local
     └── inbox/                            view of bob's folder, even though
@@ -140,15 +140,15 @@ hey, can you take a look at this?
 
 ## Act III — sync runs
 
-A cron on alice's machine fires `coord sync push local:/tmp/coord-dx3/b` (or in production, an ssh target). What happens:
+A cron on alice's machine fires `st sync push local:/tmp/st-dx3/b` (or in production, an ssh target). What happens:
 
 1. Pre-command sweep on A: walks every `<id>/archive/X.md`, ensures no matching `<id>/inbox/X.md`. Currently no archives, so this is a no-op.
-2. `rsync -a $COORD_ROOT/ <peer>/` copies the whole tree to B.
+2. `rsync -a $ST_ROOT/ <peer>/` copies the whole tree to B.
 3. Post-command sweep on A: same as pre. Still a no-op.
 
 **Filesystem on B after Act III:**
 ```
-~/.local/state/coord/
+~/.local/state/smalltalk/
 ├── .machine-id            "machine-b"
 ├── alice/                 ← brand new on B; synced from A
 │   ├── archive/
@@ -169,7 +169,7 @@ The `.machine-id` exclusion is the key trick: `alice/` exists on B as a synced c
 
 **bob (on B), before reading messages:**
 ```
-$ coord status bob busy
+$ st status bob busy
 status: busy
 ```
 
@@ -181,7 +181,7 @@ bob/.status              "busy"
 Next sync (in either direction) propagates the file. Now A also has `bob/.status = busy`. Alice can:
 
 ```
-$ coord status bob
+$ st status bob
 busy
 ```
 
@@ -195,7 +195,7 @@ She decides to wait. She does nothing.
 
 **bob (on B):**
 ```
-$ coord ls bob
+$ st ls bob
 # 1 message in inbox
 1777971233168-machine-a-62qzgz.md
 ```
@@ -203,7 +203,7 @@ $ coord ls bob
 (Note: pluralization is correct — "1 message" not "1 messages". And the implicit pre-command sweep ran, so even if A had pushed a stale copy of the file, the count would be correct.)
 
 ```
-$ coord read bob 1777971233168-machine-a-62qzgz.md
+$ st read bob 1777971233168-machine-a-62qzgz.md
 # inbox/1777971233168-machine-a-62qzgz.md
 from:    alice
 to:      bob
@@ -216,7 +216,7 @@ hey, can you take a look at this?
 bob writes a reply. Note the `--in-reply-to` for threading:
 
 ```
-$ echo "yes, looking now" | coord send alice --from bob \
+$ echo "yes, looking now" | st send alice --from bob \
       --in-reply-to 1777971233168-machine-a-62qzgz.md \
       --subject "re: review request"
 1777971300094-machine-b-h3kk7v.md
@@ -234,7 +234,7 @@ alice/
 bob then archives alice's original:
 
 ```
-$ coord archive bob 1777971233168-machine-a-62qzgz.md
+$ st archive bob 1777971233168-machine-a-62qzgz.md
 archived
 ```
 
@@ -249,7 +249,7 @@ bob/
 
 bob clears his status:
 ```
-$ coord status bob available
+$ st status bob available
 status: available
 ```
 
@@ -259,14 +259,14 @@ status: available
 
 Now sync runs (let's say B pushes; in practice both machines would push and pull on their own schedules):
 
-**Step by step inside `coord sync push local:A`:**
+**Step by step inside `st sync push local:A`:**
 
 1. **Pre-sweep on B**: B has `archive/1777971233168-...md` and no inbox copy. No-op.
 2. **`rsync -a B/ A/`**: copies B's tree to A. After this:
    - A receives `bob/archive/1777971233168-...md` (new on A)
    - A receives `alice/inbox/1777971300094-...md` (bob's reply)
    - A receives `bob/.status = available`
-3. **Post-sweep on A** (because the sweep is universal, every coord command runs it): A walks every `archive/X.md` and removes the matching `inbox/X.md`. **A's `bob/inbox/1777971233168-...md` (alice's old copy of what she sent) gets removed** because `bob/archive/1777971233168-...md` now exists on A.
+3. **Post-sweep on A** (because the sweep is universal, every smalltalk command runs it): A walks every `archive/X.md` and removes the matching `inbox/X.md`. **A's `bob/inbox/1777971233168-...md` (alice's old copy of what she sent) gets removed** because `bob/archive/1777971233168-...md` now exists on A.
 
 **A's disk after Act VI:**
 ```
@@ -283,7 +283,7 @@ bob/
 
 **This is the load-bearing trick.** Without the sweep, A would still have `bob/inbox/1777971233168-...md` (alice's copy of what she sent). On the *next* sync round, A's inbox copy would push back to B, recreating the file there. Bob would see it again, archive it again, sync, recreate, archive — an infinite tug-of-war.
 
-The sweep breaks the loop: **on every coord command, every machine reconciles "if there's an archive copy, the inbox copy must go."** Idempotent; safe to run anywhere; converges in one round.
+The sweep breaks the loop: **on every smalltalk command, every machine reconciles "if there's an archive copy, the inbox copy must go."** Idempotent; safe to run anywhere; converges in one round.
 
 ---
 
@@ -291,13 +291,13 @@ The sweep breaks the loop: **on every coord command, every machine reconciles "i
 
 **alice (on A):**
 ```
-$ coord ls alice
+$ st ls alice
 # 1 message in inbox
 1777971300094-machine-b-h3kk7v.md
 ```
 
 ```
-$ coord read alice 1777971300094-machine-b-h3kk7v.md
+$ st read alice 1777971300094-machine-b-h3kk7v.md
 # inbox/1777971300094-machine-b-h3kk7v.md
 from:        bob
 to:          alice
@@ -309,21 +309,21 @@ yes, looking now
 ```
 
 ```
-$ coord thread alice 1777971300094-machine-b-h3kk7v.md
+$ st thread alice 1777971300094-machine-b-h3kk7v.md
 1777971233168-machine-a-62qzgz.md  alice  review request
   1777971300094-machine-b-h3kk7v.md  bob  re: review request
 ```
 
-The thread reaches alice's *original message* even though alice never had a separate "sent" log — because after sync, alice's machine has `bob/archive/1777971233168-...md` (the message she sent, which bob has now processed). The thread walker scans every `<id>/{inbox,archive}/` under `$COORD_ROOT`, so it finds the chain across identity sub-folders.
+The thread reaches alice's *original message* even though alice never had a separate "sent" log — because after sync, alice's machine has `bob/archive/1777971233168-...md` (the message she sent, which bob has now processed). The thread walker scans every `<id>/{inbox,archive}/` under `$ST_ROOT`, so it finds the chain across identity sub-folders.
 
-**Alice's "what have I sent recently?" view** is naturally `coord ls bob --archive` (which lists files in bob's archive on alice's machine = messages alice sent that bob has processed) plus `coord ls bob` (messages alice sent that bob hasn't yet processed). No separate "sent" folder is needed.
+**Alice's "what have I sent recently?" view** is naturally `st ls bob --archive` (which lists files in bob's archive on alice's machine = messages alice sent that bob has processed) plus `st ls bob` (messages alice sent that bob hasn't yet processed). No separate "sent" folder is needed.
 
 ---
 
 ## Act VIII — alice archives the conversation
 
 ```
-$ coord archive alice 1777971300094-machine-b-h3kk7v.md
+$ st archive alice 1777971300094-machine-b-h3kk7v.md
 archived
 ```
 
@@ -344,7 +344,7 @@ After the next sync, B's tree will mirror this — alice's archive of bob's repl
 Eventually alice wants to clean up. She does it carefully:
 
 ```
-$ coord archive trim alice --older-than 30d --dry-run
+$ st archive trim alice --older-than 30d --dry-run
 1577836800010-machine-a-old1aa.md
 1577836800020-machine-a-old2aa.md
 1577836800030-machine-a-old3aa.md
@@ -354,7 +354,7 @@ $ coord archive trim alice --older-than 30d --dry-run
 She likes the list. She runs for real:
 
 ```
-$ coord archive trim alice --older-than 30d
+$ st archive trim alice --older-than 30d
 1577836800010-machine-a-old1aa.md
 1577836800020-machine-a-old2aa.md
 1577836800030-machine-a-old3aa.md
@@ -376,11 +376,11 @@ Caveat documented in `lib/cmd_archive.sh`: `archive trim` doesn't yet converge a
 - Init, send, ls, read, archive, sync — six verbs to do everything.
 
 **What I think is wrong or rough:**
-- Reading `--archive` to see "what I sent" is non-obvious. Should be a `coord ls --sent` shortcut.
-- `coord status <id>` returning `unset` when there's no `.status` file is fine for now, but I'm not sure agents will know what to do with it. Maybe `--default available` would be friendlier.
-- `coord watch` defaults to "since now" which means starting a watcher misses files that were already in the inbox. `--once` defaults to the same. The tests work around this with `--since 0`. Real users will trip on it.
-- Filenames are 36+ characters because `<machine-id>` defaults to a UUID. Pinned ids like `machine-a` work but `coord init` doesn't help you set them — you have to `echo machine-a > .machine-id` by hand.
+- Reading `--archive` to see "what I sent" is non-obvious. Should be a `st ls --sent` shortcut.
+- `st status <id>` returning `unset` when there's no `.status` file is fine for now, but I'm not sure agents will know what to do with it. Maybe `--default available` would be friendlier.
+- `st watch` defaults to "since now" which means starting a watcher misses files that were already in the inbox. `--once` defaults to the same. The tests work around this with `--since 0`. Real users will trip on it.
+- Filenames are 36+ characters because `<machine-id>` defaults to a UUID. Pinned ids like `machine-a` work but `st init` doesn't help you set them — you have to `echo machine-a > .machine-id` by hand.
 - `archive trim` cross-machine convergence (the deferred bug). Open question whether to solve in v0 or document and move on.
-- `peers.yaml` aliases work but there's no `coord peer add <name> <spec>` — you edit a YAML file.
+- `peers.yaml` aliases work but there's no `smalltalk peer add <name> <spec>` — you edit a YAML file.
 
 These are the kinds of things I want your eyes on. When you have time, walk through this doc, mark up what bothers you, and we'll bundle a brief-004.

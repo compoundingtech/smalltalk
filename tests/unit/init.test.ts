@@ -24,12 +24,12 @@ import {
   resolveStShimPath,
 } from '../../src/commands/init.ts';
 
-const FAKE_BIN = '/usr/local/bin/coord';
+const FAKE_BIN = '/usr/local/bin/smalltalk';
 
 let scratch: string;
 
 beforeEach(() => {
-  scratch = mkdtempSync(join(tmpdir(), 'coord-init-'));
+  scratch = mkdtempSync(join(tmpdir(), 'st-init-'));
 });
 
 afterEach(() => {
@@ -97,14 +97,14 @@ describe('resolveStShimPath', () => {
     // guard is the source-grep test below.)
     //
     // Post-cutover: prefer `bin/st` (canonical). Falls back to
-    // `bin/coord` only if `bin/st` isn't on disk (very old package).
+    // `bin/smalltalk` only if `bin/st` isn't on disk (very old package).
     // In this repo both shims ship, so the test asserts `bin/st`.
     expect(p.endsWith('/bin/st')).toBe(true);
-    // Rename regression guard: MUST NOT emit `bin/coord`. The old
-    // form still worked because coord is a dual alias, but pinning
+    // Rename regression guard: MUST NOT emit `bin/smalltalk`. The old
+    // form still worked because smalltalk is a dual alias, but pinning
     // to the canonical name in fresh `.mcp.json` files means the
-    // day the coord alias is dropped doesn't break every launch.
-    expect(p.endsWith('/bin/coord')).toBe(false);
+    // day the smalltalk alias is dropped doesn't break every launch.
+    expect(p.endsWith('/bin/smalltalk')).toBe(false);
   });
 });
 
@@ -220,18 +220,18 @@ describe('cmdInit — merge into existing .mcp.json', () => {
     expect(ctx.stderrBuf).toMatch(/already has matching st entry/);
   });
 
-  it('legacy `coord` key is IGNORED — treated as absent (regression guard for the cutover)', async () => {
-    // Post-coord-cutover: init no longer reads the `coord` key from
-    // pre-cutover .mcp.json files. A file with only `coord:` looks
+  it('legacy `smalltalk` key is IGNORED — treated as absent (regression guard for the cutover)', async () => {
+    // Post-st-cutover: init no longer reads the `smalltalk` key from
+    // pre-cutover .mcp.json files. A file with only `smalltalk:` looks
     // "empty" to init, which merges its own `st:` entry alongside.
-    // The `coord:` key is left untouched (users can rm .mcp.json to
+    // The `smalltalk:` key is left untouched (users can rm .mcp.json to
     // re-init a clean file).
     writeFileSync(
       join(scratch, '.mcp.json'),
       JSON.stringify(
         {
           mcpServers: {
-            coord: {
+            smalltalk: {
               type: 'stdio',
               command: FAKE_BIN,
               args: ['mcp', '--channel'],
@@ -248,14 +248,14 @@ describe('cmdInit — merge into existing .mcp.json', () => {
       { dir: scratch, binPath: FAKE_BIN },
       ctx
     );
-    // NOT `already-configured` — the coord entry is invisible.
+    // NOT `already-configured` — the smalltalk entry is invisible.
     expect(r.outcome).toBe('merged-into-existing');
-    // The st entry now exists; coord entry is left alone (not read,
+    // The st entry now exists; smalltalk entry is left alone (not read,
     // not written, not deleted).
     const parsed = readJson(join(scratch, '.mcp.json'));
     const servers = parsed.mcpServers as Record<string, { command: string }>;
     expect(servers.st?.command).toBe(FAKE_BIN);
-    expect(servers.coord).toBeDefined(); // untouched
+    expect(servers.smalltalk).toBeDefined(); // untouched
   });
 });
 

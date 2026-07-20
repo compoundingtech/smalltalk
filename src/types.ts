@@ -1,4 +1,4 @@
-// types.ts — public types for the embeddable @myobie/coord API.
+// types.ts — public types for the embeddable @compoundingtech/smalltalk API.
 //
 // Branded primitives: Agent and Filename are both nominally `string` but
 // carry phantom brands so a stray un-validated string doesn't compile. Use

@@ -22,8 +22,8 @@ let stRoot: string;
 let stConfig: string;
 
 beforeEach(() => {
-  scratch = mkdtempSync(join(tmpdir(), 'coord-cli-test-'));
-  stRoot = join(scratch, 'coord');
+  scratch = mkdtempSync(join(tmpdir(), 'st-cli-test-'));
+  stRoot = join(scratch, 'smalltalk');
   stConfig = join(scratch, 'config');
   mkdirSync(stRoot, { recursive: true });
   mkdirSync(stConfig, { recursive: true });
@@ -129,10 +129,10 @@ describe('runCli — --version', () => {
   });
 
   it('reflects _ST_INVOKED_AS in the brand', async () => {
-    const cap = makeContext('', { _ST_INVOKED_AS: 'coord' });
+    const cap = makeContext('', { _ST_INVOKED_AS: 'smalltalk' });
     const code = await runCli(['--version'], cap.ctx);
     expect(code).toBe(0);
-    expect(cap.stdout).toMatch(/^coord \d+\.\d+\.\d+/);
+    expect(cap.stdout).toMatch(/^smalltalk \d+\.\d+\.\d+/);
   });
 
   it('mentions --version in the top-level help banner', async () => {
@@ -217,14 +217,14 @@ describe('runCli — help banner reflects _ST_INVOKED_AS', () => {
     const code = await runCli(['help'], cap.ctx);
     expect(code).toBe(0);
     expect(cap.stdout).toContain('usage: st ');
-    expect(cap.stdout).not.toContain('usage: coord ');
+    expect(cap.stdout).not.toContain('usage: smalltalk ');
   });
 
-  it('reflects `coord` when the shim exports it', async () => {
-    const cap = makeContext('', { _ST_INVOKED_AS: 'coord' });
+  it('reflects `smalltalk` when the shim exports it', async () => {
+    const cap = makeContext('', { _ST_INVOKED_AS: 'smalltalk' });
     const code = await runCli(['help'], cap.ctx);
     expect(code).toBe(0);
-    expect(cap.stdout).toContain('usage: coord ');
+    expect(cap.stdout).toContain('usage: smalltalk ');
   });
 
   it('reflects `smalltalk` when the shim exports it', async () => {
@@ -235,10 +235,10 @@ describe('runCli — help banner reflects _ST_INVOKED_AS', () => {
   });
 
   it('unknown-subcommand error prefix also reflects the invoked name', async () => {
-    const cap = makeContext('', { _ST_INVOKED_AS: 'coord' });
+    const cap = makeContext('', { _ST_INVOKED_AS: 'smalltalk' });
     const code = await runCli(['bogus'], cap.ctx);
     expect(code).toBe(2);
-    expect(cap.stderr).toContain('coord: unknown subcommand: bogus');
+    expect(cap.stderr).toContain('smalltalk: unknown subcommand: bogus');
   });
 
   it('empty _ST_INVOKED_AS falls back to `st`', async () => {
@@ -318,7 +318,7 @@ describe('runCli — no inline presweep on non-sync commands', () => {
   it('`ls` shows the zombie inbox copy (no inline sweep)', async () => {
     // Per the new sweep-as-convergence policy, ls does not run a
     // presweep — a byte-identical inbox/archive twin will appear in
-    // ls output until lazy-read sweep, `coord sweep`, or a sync runs.
+    // ls output until lazy-read sweep, `smalltalk sweep`, or a sync runs.
     setupIdentity('bob');
     const f = '1714826789010-aaaaaa.md';
     writeFileSync(join(stRoot, 'bob', 'inbox', f), 'same');
@@ -345,10 +345,10 @@ describe('runCli — no inline presweep on non-sync commands', () => {
   });
 });
 
-// ─── Errors are surfaced as `coord: <msg>` on stderr, exit 1 ────────────
+// ─── Errors are surfaced as `smalltalk: <msg>` on stderr, exit 1 ────────────
 
 describe('runCli — error formatting', () => {
-  it('command throw becomes "coord: <message>" on stderr, exit 1', async () => {
+  it('command throw becomes "smalltalk: <message>" on stderr, exit 1', async () => {
     // No identity context = identity-required error from cmdLs.
     const cap = makeContext();
     const code = await runCli(['message', 'ls'], cap.ctx);

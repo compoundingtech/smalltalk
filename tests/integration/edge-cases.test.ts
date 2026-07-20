@@ -17,14 +17,14 @@ import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import {
-  COORD_BIN,
+  ST_BIN,
   cleanupRoot,
   listArchive,
   listInbox,
   mkIdentity,
   mkRoot,
   rsyncAvailable,
-  runCoord,
+  runSt,
 } from './helpers.ts';
 
 let root: string;
@@ -44,16 +44,16 @@ describe('edge-cases — 1MB body', () => {
   it('survives send + read --raw byte-for-byte', () => {
     // Use printable bytes so utf-8 → buffer roundtrip is identity-stable.
     const body = 'a'.repeat(1024 * 1024); // 1 MiB
-    const send = runCoord(['message', 'send', 'bob', '--from', 'alice'], {
+    const send = runSt(['message', 'send', 'bob', '--from', 'alice'], {
       stRoot: root,
-      coordIdentity: 'alice',
+      stIdentity: 'alice',
       stdin: body,
     });
     expect(send.exitCode).toBe(0);
     const filename = send.stdout.trim();
-    const read = runCoord(['message', 'read', 'bob', filename, '--raw'], {
+    const read = runSt(['message', 'read', 'bob', filename, '--raw'], {
       stRoot: root,
-      coordIdentity: 'alice',
+      stIdentity: 'alice',
     });
     expect(read.exitCode).toBe(0);
     // The raw output is the entire file (frontmatter + body + trailing
@@ -70,15 +70,15 @@ describe('edge-cases — 1MB body', () => {
     try {
       mkIdentity(peer, 'bob');
       const body = 'x'.repeat(1024 * 1024);
-      const send = runCoord(['message', 'send', 'bob', '--from', 'alice'], {
+      const send = runSt(['message', 'send', 'bob', '--from', 'alice'], {
         stRoot: root,
-        coordIdentity: 'alice',
+        stIdentity: 'alice',
         stdin: body,
       });
       const filename = send.stdout.trim();
-      runCoord(['sync', 'push', `local:${peer}`], {
+      runSt(['sync', 'push', `local:${peer}`], {
         stRoot: root,
-        coordIdentity: 'alice',
+        stIdentity: 'alice',
       });
       const local = readFileSync(join(root, 'bob', 'inbox', filename));
       const remote = readFileSync(join(peer, 'bob', 'inbox', filename));
@@ -98,7 +98,7 @@ describe('edge-cases — concurrent sends', () => {
     const send = (body: string): Promise<string> =>
       new Promise((resolve, reject) => {
         const proc = spawn(
-          COORD_BIN,
+          ST_BIN,
           ['message', 'send', 'bob', '--from', 'alice'],
           {
             env: {
@@ -135,9 +135,9 @@ describe('edge-cases — concurrent sends', () => {
 
   it('30 rapid serial sends produce 30 distinct files', () => {
     for (let i = 0; i < 30; i++) {
-      const r = runCoord(['message', 'send', 'bob', '--from', 'alice'], {
+      const r = runSt(['message', 'send', 'bob', '--from', 'alice'], {
         stRoot: root,
-        coordIdentity: 'alice',
+        stIdentity: 'alice',
         stdin: `msg ${i}`,
       });
       expect(r.exitCode).toBe(0);
@@ -151,9 +151,9 @@ describe('edge-cases — concurrent sends', () => {
 describe('edge-cases — empty body', () => {
   it('errors with non-zero exit, no file is created', () => {
     const before = listInbox(root, 'bob');
-    const r = runCoord(['message', 'send', 'bob', '--from', 'alice'], {
+    const r = runSt(['message', 'send', 'bob', '--from', 'alice'], {
       stRoot: root,
-      coordIdentity: 'alice',
+      stIdentity: 'alice',
       stdin: '',
     });
     expect(r.exitCode).not.toBe(0);
@@ -169,11 +169,11 @@ describe('edge-cases — --in-reply-to', () => {
     // The send-time validator only checks grammar; thread walker tolerates
     // broken parents. So `--in-reply-to <unseen>.md` succeeds.
     const phantom = '1714826789999-zzzzzz.md';
-    const r = runCoord(
+    const r = runSt(
       ['message', 'send', 'bob', '--from', 'alice', '--in-reply-to', phantom],
       {
         stRoot: root,
-        coordIdentity: 'alice',
+        stIdentity: 'alice',
         stdin: 'reply to nothing',
       }
     );
@@ -184,11 +184,11 @@ describe('edge-cases — --in-reply-to', () => {
   });
 
   it('rejects a value that does not match the filename grammar', () => {
-    const r = runCoord(
+    const r = runSt(
       ['message', 'send', 'bob', '--from', 'alice', '--in-reply-to', 'garbage'],
       {
         stRoot: root,
-        coordIdentity: 'alice',
+        stIdentity: 'alice',
         stdin: 'body',
       }
     );
@@ -200,13 +200,13 @@ describe('edge-cases — --in-reply-to', () => {
 // ─── Half-formed identity (folder exists but lacks inbox/) ─────────────
 
 describe('edge-cases — half-formed sender identity', () => {
-  it('coord send --from <half> errors clearly', () => {
+  it('st send --from <half> errors clearly', () => {
     // alice's folder has inbox/archive but we'll use a different name.
     mkdirSync(join(root, 'half'), { recursive: true });
     // Note: only the parent dir exists — no inbox/archive subdirs.
-    const r = runCoord(['message', 'send', 'bob', '--from', 'half'], {
+    const r = runSt(['message', 'send', 'bob', '--from', 'half'], {
       stRoot: root,
-      coordIdentity: 'alice',
+      stIdentity: 'alice',
       stdin: 'body',
     });
     expect(r.exitCode).not.toBe(0);
@@ -235,9 +235,9 @@ describe('edge-cases — archive trim --dry-run', () => {
     const before = listArchive(root, 'alice');
     expect(before).toHaveLength(5);
 
-    const r = runCoord(
+    const r = runSt(
       ['message', 'archive', 'trim', 'alice', '--keep-last', '2', '--dry-run'],
-      { stRoot: root, coordIdentity: 'alice' }
+      { stRoot: root, stIdentity: 'alice' }
     );
     expect(r.exitCode).toBe(0);
 
@@ -267,9 +267,9 @@ describe('edge-cases — archive trim --dry-run', () => {
         'x'
       );
     }
-    const r = runCoord(
+    const r = runSt(
       ['message', 'archive', 'trim', 'alice', '--keep-last', '2'],
-      { stRoot: root, coordIdentity: 'alice' }
+      { stRoot: root, stIdentity: 'alice' }
     );
     expect(r.exitCode).toBe(0);
     expect(r.stderr).toContain('trimmed 3 files');
@@ -284,19 +284,19 @@ describe('edge-cases — archive trim --dry-run', () => {
 // ─── Corrupted frontmatter on read ────────────────────────────────────
 
 describe('edge-cases — corrupted/missing frontmatter on read', () => {
-  it('coord read on a file with no frontmatter dumps the body, marked untyped', () => {
+  it('st read on a file with no frontmatter dumps the body, marked untyped', () => {
     const filename = '1714826789010-aaaaaa.md';
     writeFileSync(join(root, 'alice', 'inbox', filename), 'just text\n');
-    const r = runCoord(['message', 'read', 'alice', filename], {
+    const r = runSt(['message', 'read', 'alice', filename], {
       stRoot: root,
-      coordIdentity: 'alice',
+      stIdentity: 'alice',
     });
     expect(r.exitCode).toBe(0);
     expect(r.stdout).toBe('just text\n');
     expect(r.stderr).toContain('(untyped: no frontmatter)');
   });
 
-  it('coord ls --from on a file with malformed frontmatter silently excludes it', () => {
+  it('st ls --from on a file with malformed frontmatter silently excludes it', () => {
     const goodFile = '1714826789010-aaaaaa.md';
     writeFileSync(
       join(root, 'alice', 'inbox', goodFile),
@@ -305,9 +305,9 @@ describe('edge-cases — corrupted/missing frontmatter on read', () => {
     const badFile = '1714826789020-bbbbbb.md';
     writeFileSync(join(root, 'alice', 'inbox', badFile), 'no fences\n');
 
-    const r = runCoord(['message', 'ls', 'alice', '--from', 'bob'], {
+    const r = runSt(['message', 'ls', 'alice', '--from', 'bob'], {
       stRoot: root,
-      coordIdentity: 'alice',
+      stIdentity: 'alice',
     });
     expect(r.exitCode).toBe(0);
     expect(r.stdout.trim().split('\n')).toEqual([goodFile]);

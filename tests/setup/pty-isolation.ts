@@ -5,7 +5,7 @@
 // via process.env and the user's real ~/.local/state/pty/ stays clean.
 //
 // Background: brief-020 — operator discovered 120 leaked
-// `coord-ding-it-*` sessions in their real pty session list, all
+// `st-ding-it-*` sessions in their real pty session list, all
 // originating from tests/integration/ding.test.ts spawning real pty
 // sessions without isolating PTY_SESSION_DIR. A one-off test fix
 // would have been hostage to future regressions; this setup makes
@@ -68,7 +68,7 @@ if (
     `PTY_SESSION_DIR must be inside an OS temp dir for tests; got ` +
       `'${process.env.PTY_SESSION_DIR}'. Accepted prefixes: ` +
       `${ACCEPTED_PREFIXES.join(', ')}. This is a safety check to ` +
-      `prevent coord tests from polluting the user's real pty session ` +
+      `prevent smalltalk tests from polluting the user's real pty session ` +
       `dir. See tests/setup/pty-isolation.ts.`
   );
 }

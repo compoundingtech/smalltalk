@@ -24,8 +24,8 @@ let client: Client;
 let handle: ReturnType<typeof createMcpServer>;
 
 beforeEach(async () => {
-  scratch = mkdtempSync(join(tmpdir(), 'coord-mcp-archive-'));
-  stRoot = join(scratch, 'coord');
+  scratch = mkdtempSync(join(tmpdir(), 'st-mcp-archive-'));
+  stRoot = join(scratch, 'smalltalk');
   for (const id of ['alice', 'bob']) {
     mkdirSync(join(stRoot, id, 'inbox'), { recursive: true });
     mkdirSync(join(stRoot, id, 'archive'), { recursive: true });
@@ -108,7 +108,7 @@ describe('st_msg_archive — happy paths', () => {
   });
 
   it('case 2 (byte-identical twin): pre-command sweep removes inbox dup → outcome=idempotent', async () => {
-    // The universal pre-command sweep (which fires before every coord
+    // The universal pre-command sweep (which fires before every smalltalk
     // method) removes the byte-identical inbox copy first; archive then
     // sees inbox-empty + archive-present (case 0).
     const f = '1714826789010-aaaaaa.md';
@@ -235,7 +235,7 @@ describe('st_msg_archive — typed error mapping', () => {
     expect(errorCode(r)).toBe('INVALID_IDENTITY');
   });
 
-  it('every error response carries content + _meta["coord/error"] + isError', async () => {
+  it('every error response carries content + _meta["smalltalk/error"] + isError', async () => {
     const r = await call({ filename: '1714826789010-aaaaaa.md' });
     expect(r.isError).toBe(true);
     expect(r.content?.[0]?.text).toMatch(/^MESSAGE_NOT_FOUND:/);

@@ -15,11 +15,11 @@ import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { Session } from '@myobie/pty/testing';
+import { Session } from '@compoundingtech/pty/testing';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 export const REPO_ROOT = resolve(HERE, '..', '..');
-export const COORD_BIN = join(REPO_ROOT, 'bin', 'st');
+export const ST_BIN = join(REPO_ROOT, 'bin', 'st');
 
 // ─── Auto-cleanup of scratch dirs ───────────────────────────────────────
 
@@ -51,24 +51,24 @@ process.on('SIGTERM', () => {
 });
 
 /**
- * Creates a fresh scratch dir under `/tmp/coord-it-<random>/` and
+ * Creates a fresh scratch dir under `/tmp/st-it-<random>/` and
  * returns its absolute path. The dir is auto-removed on process exit;
  * tests that want immediate cleanup can call `cleanupRoot(path)`.
  */
 export function mkScratch(): string {
-  const path = mkdtempSync(join(tmpdir(), 'coord-it-'));
+  const path = mkdtempSync(join(tmpdir(), 'st-it-'));
   registerCleanup(path);
   return path;
 }
 
 /**
  * Creates a fresh `$ST_ROOT` subdirectory under a scratch dir.
- * Equivalent to mkScratch() + a child `coord/` folder so tests that
+ * Equivalent to mkScratch() + a child `smalltalk/` folder so tests that
  * also want a scratch peer directory can do `mkScratch()` separately.
  */
 export function mkRoot(): string {
   const scratch = mkScratch();
-  const root = join(scratch, 'coord');
+  const root = join(scratch, 'smalltalk');
   mkdirSync(root, { recursive: true });
   return root;
 }
@@ -91,7 +91,7 @@ export function mkIdentity(root: string, id: string): void {
   mkdirSync(join(root, id, 'archive'), { recursive: true });
 }
 
-// ─── runCoord (one-shot child_process) ──────────────────────────────────
+// ─── runSt (one-shot child_process) ──────────────────────────────────
 
 export interface RunStOptions {
   /** $ST_ROOT for this invocation. */
@@ -99,7 +99,7 @@ export interface RunStOptions {
   /** $ST_CONFIG for this invocation. */
   stConfig?: string;
   /** $ST_AGENT for this invocation. */
-  coordIdentity?: string;
+  stIdentity?: string;
   /** Additional env variables (merged on top of the above). */
   env?: NodeJS.ProcessEnv;
   /** stdin content. Falsy = no stdin. */
@@ -110,31 +110,31 @@ export interface RunStOptions {
   timeoutMs?: number;
 }
 
-export interface RunCoordResult {
+export interface RunStResult {
   stdout: string;
   stderr: string;
   exitCode: number;
 }
 
 /**
- * Spawns `bin/coord <args...>` synchronously and returns captured stdout,
+ * Spawns `bin/smalltalk <args...>` synchronously and returns captured stdout,
  * stderr, and exit code. Uses spawnSync so tests stay simple — the only
  * commands that need streaming output are `st watch`, which uses
- * {@link runCoordPty} instead.
+ * {@link runStPty} instead.
  */
-export function runCoord(
+export function runSt(
   args: readonly string[],
   opts: RunStOptions = {}
-): RunCoordResult {
+): RunStResult {
   const env: NodeJS.ProcessEnv = {
-    // Strip parent COORD_* vars so a misconfigured shell can't leak in.
+    // Strip parent ST_* vars so a misconfigured shell can't leak in.
     PATH: process.env.PATH,
     HOME: process.env.HOME,
     ...(opts.env ?? {}),
   };
   if (opts.stRoot !== undefined) env.ST_ROOT = opts.stRoot;
   if (opts.stConfig !== undefined) env.ST_CONFIG = opts.stConfig;
-  if (opts.coordIdentity !== undefined) env.ST_AGENT = opts.coordIdentity;
+  if (opts.stIdentity !== undefined) env.ST_AGENT = opts.stIdentity;
 
   const spawnOpts: SpawnSyncOptions = {
     cwd: opts.cwd ?? REPO_ROOT,
@@ -148,7 +148,7 @@ export function runCoord(
     spawnOpts.input = opts.stdin;
   }
 
-  const r = spawnSync(COORD_BIN, [...args], spawnOpts);
+  const r = spawnSync(ST_BIN, [...args], spawnOpts);
   return {
     stdout: typeof r.stdout === 'string' ? r.stdout : '',
     stderr: typeof r.stderr === 'string' ? r.stderr : '',
@@ -156,35 +156,35 @@ export function runCoord(
   };
 }
 
-// ─── runCoordPty (real PTY via @myobie/pty/testing Session.spawn) ──────
+// ─── runStPty (real PTY via @compoundingtech/pty/testing Session.spawn) ──────
 
-export interface RunCoordPtyOptions {
+export interface RunStPtyOptions {
   stRoot?: string;
   stConfig?: string;
-  coordIdentity?: string;
+  stIdentity?: string;
   env?: Record<string, string>;
   rows?: number;
   cols?: number;
 }
 
 /**
- * Spawn `bin/coord <args...>` inside a PTY via `@myobie/pty/testing`.
+ * Spawn `bin/smalltalk <args...>` inside a PTY via `@compoundingtech/pty/testing`.
  * Returns the {@link Session} so the test can `screenshot()`,
  * `waitForText()`, etc. **The caller MUST call `session.close()` in
  * an afterEach.**
  *
  * Note: Session.spawn merges its `env` opts on top of process.env. We
- * pass through PATH and HOME explicitly and clear COORD_* leakage by
- * setting empty values that {@link runCoord}'s contract avoids.
+ * pass through PATH and HOME explicitly and clear ST_* leakage by
+ * setting empty values that {@link runSt}'s contract avoids.
  */
-export function runCoordPty(
+export function runStPty(
   args: readonly string[],
-  opts: RunCoordPtyOptions = {}
+  opts: RunStPtyOptions = {}
 ): Session {
   const env: Record<string, string> = {};
   if (opts.stRoot !== undefined) env.ST_ROOT = opts.stRoot;
   if (opts.stConfig !== undefined) env.ST_CONFIG = opts.stConfig;
-  if (opts.coordIdentity !== undefined) env.ST_AGENT = opts.coordIdentity;
+  if (opts.stIdentity !== undefined) env.ST_AGENT = opts.stIdentity;
   Object.assign(env, opts.env ?? {});
 
   const spawnOpts: { rows?: number; cols?: number; env: Record<string, string> } = {
@@ -192,7 +192,7 @@ export function runCoordPty(
   };
   if (opts.rows !== undefined) spawnOpts.rows = opts.rows;
   if (opts.cols !== undefined) spawnOpts.cols = opts.cols;
-  return Session.spawn(COORD_BIN, [...args], spawnOpts);
+  return Session.spawn(ST_BIN, [...args], spawnOpts);
 }
 
 // ─── Filesystem assertion helpers ───────────────────────────────────────

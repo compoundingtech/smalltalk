@@ -19,7 +19,7 @@ let stderrBuf: string;
 let ctx: CliContext;
 
 beforeEach(() => {
-  scratch = mkdtempSync(join(tmpdir(), 'coord-gc-test-'));
+  scratch = mkdtempSync(join(tmpdir(), 'st-gc-test-'));
   stRoot = join(scratch, 'bus');
   mkdirSync(stRoot, { recursive: true });
   stdoutBuf = '';

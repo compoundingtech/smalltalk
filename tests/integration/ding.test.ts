@@ -1,4 +1,4 @@
-// tests/integration/ding.test.ts — coord ding daemon end-to-end.
+// tests/integration/ding.test.ts — st ding daemon end-to-end.
 //
 // Spawns a real `pty` session running a passive bash echoer, runs
 // `st ding` against it as a child process, drops files into the
@@ -29,7 +29,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = resolve(HERE, '..', '..');
-const COORD_BIN = join(REPO_ROOT, 'bin', 'st');
+const ST_BIN = join(REPO_ROOT, 'bin', 'st');
 
 function ptyAvailable(): boolean {
   return spawnSync('pty', ['--help'], { stdio: 'ignore' }).status === 0;
@@ -42,7 +42,7 @@ let sessionName: string;
 let dingProc: ReturnType<typeof spawn> | undefined;
 
 function uniqueSessionName(): string {
-  return `coord-ding-it-${Date.now()}-${Math.floor(Math.random() * 1e6)}`;
+  return `st-ding-it-${Date.now()}-${Math.floor(Math.random() * 1e6)}`;
 }
 
 function ptyExec(args: string[]): { stdout: string; stderr: string; status: number } {
@@ -82,8 +82,8 @@ beforeEach(() => {
         "user's real session dir."
     );
   }
-  scratch = mkdtempSync(join(tmpdir(), 'coord-ding-it-'));
-  stRoot = join(scratch, 'coord');
+  scratch = mkdtempSync(join(tmpdir(), 'st-ding-it-'));
+  stRoot = join(scratch, 'smalltalk');
   for (const id of ['alice', 'bob']) {
     mkdirSync(join(stRoot, id, 'inbox'), { recursive: true });
     mkdirSync(join(stRoot, id, 'archive'), { recursive: true });
@@ -149,7 +149,7 @@ function startDing(opts: { interval?: number } = {}): void {
       ? ['--interval', String(opts.interval)]
       : []),
   ];
-  dingProc = spawn(COORD_BIN, args, {
+  dingProc = spawn(ST_BIN, args, {
     env: {
       ...process.env,
       ST_ROOT: stRoot,
@@ -174,7 +174,7 @@ function plant(
   );
 }
 
-describe.skipIf(!HAS_PTY)('coord ding — end-to-end with a real pty session', () => {
+describe.skipIf(!HAS_PTY)('st ding — end-to-end with a real pty session', () => {
   it('available status: a new inbox file pty-sends a notice into the session', async () => {
     startDing({ interval: 200 });
     // Give the daemon a moment to attach to the watcher (sinceNow
@@ -194,7 +194,7 @@ describe.skipIf(!HAS_PTY)('coord ding — end-to-end with a real pty session', (
   it('busy status: notice is buffered; flips to available → buffered notice arrives', async () => {
     // Set status to busy BEFORE starting the daemon so the watcher
     // sees `busy` on the first arrival.
-    spawnSync(COORD_BIN, ['status', 'bob', '--set', 'busy'], {
+    spawnSync(ST_BIN, ['status', 'bob', '--set', 'busy'], {
       env: { ...process.env, ST_ROOT: stRoot },
     });
 
@@ -213,7 +213,7 @@ describe.skipIf(!HAS_PTY)('coord ding — end-to-end with a real pty session', (
     expect(beforeFlip).not.toContain('[DING] new smalltalk message');
 
     // Flip to available.
-    spawnSync(COORD_BIN, ['status', 'bob', '--set', 'available'], {
+    spawnSync(ST_BIN, ['status', 'bob', '--set', 'available'], {
       env: { ...process.env, ST_ROOT: stRoot },
     });
 

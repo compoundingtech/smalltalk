@@ -1,6 +1,6 @@
 // tests/integration/watch.test.ts — `st watch` driven through a real PTY.
 //
-// Uses @myobie/pty/testing's Session.spawn so we exercise the actual long-
+// Uses @compoundingtech/pty/testing's Session.spawn so we exercise the actual long-
 // running polling loop, real filesystem polling, real signal handling.
 
 import { mkdirSync, writeFileSync } from 'node:fs';
@@ -11,9 +11,9 @@ import {
   cleanupRoot,
   mkIdentity,
   mkRoot,
-  runCoordPty,
+  runStPty,
 } from './helpers.ts';
-import type { Session } from '@myobie/pty/testing';
+import type { Session } from '@compoundingtech/pty/testing';
 
 let root: string;
 const sessions: Session[] = [];
@@ -55,13 +55,13 @@ function writeMsg(
 
 // ─── Per-identity watch ─────────────────────────────────────────────────
 
-describe('coord watch <id> — per-identity', () => {
+describe('st watch <id> — per-identity', () => {
   it('emits the filename of a new inbox arrival', async () => {
     mkIdentity(root, 'alice');
     const s = track(
-      runCoordPty(
+      runStPty(
         ['watch', 'alice', '--interval', '100'],
-        { stRoot: root, coordIdentity: 'alice' }
+        { stRoot: root, stIdentity: 'alice' }
       )
     );
     // Give the watcher a moment to start its replay phase against an empty
@@ -74,7 +74,7 @@ describe('coord watch <id> — per-identity', () => {
 
 // ─── Cross-tree watch ──────────────────────────────────────────────────
 
-describe('coord watch --all — cross-tree', () => {
+describe('st watch --all — cross-tree', () => {
   // brief-017a bug 3: cross-tree mode is now opt-in via --all.
   // The pre-017a default ("no positional → cross-tree") was
   // surprising; the test below exercises the new explicit form.
@@ -82,9 +82,9 @@ describe('coord watch --all — cross-tree', () => {
     mkIdentity(root, 'alice');
     mkIdentity(root, 'bob');
     const s = track(
-      runCoordPty(
+      runStPty(
         ['watch', '--all', '--interval', '100'],
-        { stRoot: root, coordIdentity: 'alice' }
+        { stRoot: root, stIdentity: 'alice' }
       )
     );
 
@@ -106,9 +106,9 @@ describe('coord watch --all — cross-tree', () => {
     mkIdentity(root, 'alice');
     mkIdentity(root, 'bob');
     const s = track(
-      runCoordPty(
+      runStPty(
         ['watch', '--interval', '100'],
-        { stRoot: root, coordIdentity: 'alice' }
+        { stRoot: root, stIdentity: 'alice' }
       )
     );
 
@@ -130,16 +130,16 @@ describe('coord watch --all — cross-tree', () => {
 
 // ─── --once ────────────────────────────────────────────────────────────
 
-describe('coord watch --once', () => {
+describe('st watch --once', () => {
   it('does one pass and exits cleanly', async () => {
     mkIdentity(root, 'alice');
     const filename = '1714826789010-aaaaaa.md';
     writeMsg('alice', filename, 'bob');
 
     const s = track(
-      runCoordPty(
+      runStPty(
         ['watch', 'alice', '--once'],
-        { stRoot: root, coordIdentity: 'alice' }
+        { stRoot: root, stIdentity: 'alice' }
       )
     );
     await s.waitForText(filename, 5_000);
@@ -151,16 +151,16 @@ describe('coord watch --once', () => {
 
 // ─── --with-subject ────────────────────────────────────────────────────
 
-describe('coord watch --with-subject', () => {
+describe('st watch --with-subject', () => {
   it('appends a tab + subject to each emitted line', async () => {
     mkIdentity(root, 'alice');
     const filename = '1714826789010-aaaaaa.md';
     writeMsg('alice', filename, 'bob', 'body', 'hello there');
 
     const s = track(
-      runCoordPty(
+      runStPty(
         ['watch', 'alice', '--once', '--with-subject'],
-        { stRoot: root, coordIdentity: 'alice' }
+        { stRoot: root, stIdentity: 'alice' }
       )
     );
     // The line should look like "<filename>\thello there" — and after PTY
@@ -174,7 +174,7 @@ describe('coord watch --with-subject', () => {
 
 // ─── --since-now ───────────────────────────────────────────────────────
 
-describe('coord watch --since-now', () => {
+describe('st watch --since-now', () => {
   it('skips pre-existing files, fires on new arrivals', async () => {
     mkIdentity(root, 'alice');
     // Pre-populate alice's inbox.
@@ -182,9 +182,9 @@ describe('coord watch --since-now', () => {
     writeMsg('alice', preExisting, 'bob');
 
     const s = track(
-      runCoordPty(
+      runStPty(
         ['watch', 'alice', '--since-now', '--interval', '100'],
-        { stRoot: root, coordIdentity: 'alice' }
+        { stRoot: root, stIdentity: 'alice' }
       )
     );
 
@@ -203,12 +203,12 @@ describe('coord watch --since-now', () => {
 
 // ─── SIGTERM / graceful shutdown ───────────────────────────────────────
 
-describe('coord watch — graceful shutdown', () => {
+describe('st watch — graceful shutdown', () => {
   it('Session.close() kills the watcher without leaking the process', async () => {
     mkIdentity(root, 'alice');
-    const s = runCoordPty(
+    const s = runStPty(
       ['watch', 'alice', '--interval', '100'],
-      { stRoot: root, coordIdentity: 'alice' }
+      { stRoot: root, stIdentity: 'alice' }
     );
     // Verify it's actually running before we kill it.
     await new Promise((r) => setTimeout(r, 200));

@@ -2,9 +2,9 @@
 // scripts at examples/claude-code/hooks/{session-start,stop-failure}.sh.
 //
 // Both are bash scripts. The stop-failure script branches by
-// `error_type` and shells out to `coord` for status changes and
-// message sends; we shim `coord` so the tests assert which
-// invocations the script would have made without touching real coord
+// `error_type` and shells out to `smalltalk` for status changes and
+// message sends; we shim `smalltalk` so the tests assert which
+// invocations the script would have made without touching real smalltalk
 // state. Skipped on hosts without `jq` on PATH (stop-failure.sh uses
 // jq to parse the envelope).
 
@@ -57,33 +57,33 @@ let shimDir: string;
 let shimLog: string;
 
 beforeEach(() => {
-  scratch = mkdtempSync(join(tmpdir(), 'coord-it-claude-'));
+  scratch = mkdtempSync(join(tmpdir(), 'st-it-claude-'));
   shimDir = join(scratch, 'bin');
-  shimLog = join(scratch, 'coord-shim.log');
+  shimLog = join(scratch, 'st-shim.log');
   mkdirSync(shimDir, { recursive: true });
 
   // Plant a tiny CLI shim that records every invocation's argv
   // (one line per call, NUL-separated args within a line so bodies
-  // with spaces survive). Both `st` and `coord` names — the hook
+  // with spaces survive). Both `st` and `smalltalk` names — the hook
   // prefers `st` on PATH (post the ST_BIN polish) but falls back to
-  // `coord`, so we plant both. Same script content; same log; either
+  // `smalltalk`, so we plant both. Same script content; same log; either
   // symlink target records the call verbatim.
   const shimContents = [
     '#!/bin/bash',
-    '# Test shim — records argv to $COORD_SHIM_LOG, exit 0.',
+    '# Test shim — records argv to $ST_SHIM_LOG, exit 0.',
     // Use printf with \0 between args so we can split unambiguously
     // even when a body argument contains spaces, quotes, or newlines.
-    'for arg in "$@"; do printf "%s\\0" "$arg" >> "$COORD_SHIM_LOG"; done',
-    'printf "\\n" >> "$COORD_SHIM_LOG"',
+    'for arg in "$@"; do printf "%s\\0" "$arg" >> "$ST_SHIM_LOG"; done',
+    'printf "\\n" >> "$ST_SHIM_LOG"',
     'exit 0',
     '',
   ].join('\n');
   const stShimPath = join(shimDir, 'st');
   writeFileSync(stShimPath, shimContents);
   chmodSync(stShimPath, 0o755);
-  const coordShimPath = join(shimDir, 'coord');
-  writeFileSync(coordShimPath, shimContents);
-  chmodSync(coordShimPath, 0o755);
+  const smalltalkShimPath = join(shimDir, 'smalltalk');
+  writeFileSync(smalltalkShimPath, shimContents);
+  chmodSync(smalltalkShimPath, 0o755);
 });
 
 afterEach(() => {
@@ -116,7 +116,7 @@ function runStopFailure(
   const fullEnv: NodeJS.ProcessEnv = {
     PATH: path,
     HOME: process.env.HOME,
-    COORD_SHIM_LOG: shimLog,
+    ST_SHIM_LOG: shimLog,
     ...env,
   };
   const input =
@@ -301,7 +301,7 @@ describe('claude-code hooks — session-start.sh boot-rehydrate (brief-024)', ()
   });
 
   it('honors the ST_AGENT / ST_IDENTITY fallback chain for the identity resolve', () => {
-    // The hook's identity resolution mirrors coord's: ST_AGENT >
+    // The hook's identity resolution mirrors smalltalk's: ST_AGENT >
     // ST_IDENTITY > ST_AGENT. Prove it by populating alice's
     // context under ST_AGENT and confirming injection.
     mkdirSync(join(scratch, 'alice', 'context'), { recursive: true });
@@ -333,7 +333,7 @@ function runPreCompact(env: NodeJS.ProcessEnv): PreCompactRun {
     timeout: 5_000,
     env: {
       PATH: path,
-      COORD_SHIM_LOG: shimLog,
+      ST_SHIM_LOG: shimLog,
       ...env,
     },
   });
@@ -450,17 +450,17 @@ describe('claude-code hooks — pre-compact.sh (brief-024)', () => {
     // Slow shim: 200ms before writing. Fits well within 5s default
     // and 1s override, but would trip a 0.05s override.
     writeFileSync(
-      join(shimDir, 'coord'),
+      join(shimDir, 'smalltalk'),
       [
         '#!/bin/bash',
         'sleep 0.2',
-        'for arg in "$@"; do printf "%s\\0" "$arg" >> "$COORD_SHIM_LOG"; done',
-        'printf "\\n" >> "$COORD_SHIM_LOG"',
+        'for arg in "$@"; do printf "%s\\0" "$arg" >> "$ST_SHIM_LOG"; done',
+        'printf "\\n" >> "$ST_SHIM_LOG"',
         'exit 0',
         '',
       ].join('\n')
     );
-    chmodSync(join(shimDir, 'coord'), 0o755);
+    chmodSync(join(shimDir, 'smalltalk'), 0o755);
     // Tight override — shim's 200ms sleep exceeds this cap.
     const rTight = runPreCompact({
       ST_ROOT: scratch,
@@ -484,18 +484,18 @@ describe('claude-code hooks — pre-compact.sh (brief-024)', () => {
   it('when the shim exits nonzero, the hook still exits 0 (prime directive)', () => {
     // Replace the shim with a version that always fails.
     writeFileSync(
-      join(shimDir, 'coord'),
+      join(shimDir, 'smalltalk'),
       [
         '#!/bin/bash',
-        '# Test shim — record args to $COORD_SHIM_LOG then FAIL.',
-        'for arg in "$@"; do printf "%s\\0" "$arg" >> "$COORD_SHIM_LOG"; done',
-        'printf "\\n" >> "$COORD_SHIM_LOG"',
-        'echo "coord: simulated failure" >&2',
+        '# Test shim — record args to $ST_SHIM_LOG then FAIL.',
+        'for arg in "$@"; do printf "%s\\0" "$arg" >> "$ST_SHIM_LOG"; done',
+        'printf "\\n" >> "$ST_SHIM_LOG"',
+        'echo "smalltalk: simulated failure" >&2',
         'exit 1',
         '',
       ].join('\n')
     );
-    chmodSync(join(shimDir, 'coord'), 0o755);
+    chmodSync(join(shimDir, 'smalltalk'), 0o755);
     const r = runPreCompact({
       ST_ROOT: scratch,
       ST_AGENT: 'alice',
@@ -514,7 +514,7 @@ describe('claude-code hooks — pre-compact.sh (brief-024)', () => {
 
 describe.skipIf(!HAS_JQ)('claude-code hooks — stop-failure.sh', () => {
   // ── rate_limit: status=away only, no ding ────────────────────────────
-  it('rate_limit → coord status away, no message send', () => {
+  it('rate_limit → st status away, no message send', () => {
     const r = runStopFailure(
       { error_type: 'rate_limit', session_id: 'abc' },
       { ST_AGENT: 'bob' }
@@ -592,13 +592,13 @@ describe.skipIf(!HAS_JQ)('claude-code hooks — stop-failure.sh', () => {
     expect(subject).toContain('billing');
   });
 
-  // ── programmer-error types: no coord calls at all ────────────────────
+  // ── programmer-error types: no smalltalk calls at all ────────────────────
   for (const errType of [
     'max_output_tokens',
     'invalid_request',
     'model_not_found',
   ]) {
-    it(`${errType} → no coord calls (programmer error, not infra)`, () => {
+    it(`${errType} → no smalltalk calls (programmer error, not infra)`, () => {
       const r = runStopFailure(
         { error_type: errType },
         { ST_AGENT: 'bob' }
@@ -644,17 +644,17 @@ describe.skipIf(!HAS_JQ)('claude-code hooks — stop-failure.sh', () => {
   it('uses $ST_AGENT in status target and subject', () => {
     const r = runStopFailure(
       { error_type: 'server_error' },
-      { ST_AGENT: 'coord-claude' }
+      { ST_AGENT: 'st-claude' }
     );
     expect(r.exitCode).toBe(0);
-    expect(r.calls[0]).toEqual(['status', 'coord-claude', '--set', 'away']);
+    expect(r.calls[0]).toEqual(['status', 'st-claude', '--set', 'away']);
     const send = r.calls[1]!;
     const subject = send[send.indexOf('--subject') + 1]!;
-    expect(subject).toContain('coord-claude');
+    expect(subject).toContain('st-claude');
   });
 
-  // ── missing ST_AGENT: silent exit 0, no coord calls ────────────
-  it('missing ST_AGENT → exit 0, no coord calls (silent)', () => {
+  // ── missing ST_AGENT: silent exit 0, no smalltalk calls ────────────
+  it('missing ST_AGENT → exit 0, no smalltalk calls (silent)', () => {
     const r = runStopFailure({ error_type: 'rate_limit' }, {});
     expect(r.exitCode).toBe(0);
     expect(r.calls).toEqual([]);
@@ -686,30 +686,30 @@ describe('claude-code hooks — $ST_BIN takes precedence over PATH', () => {
   // stop-failure.sh is the noisiest hook — most shellouts — so use it
   // as the discriminator for the resolution branch coverage.
 
-  it('honors $ST_BIN even when nothing named `st` or `coord` is on PATH', () => {
+  it('honors $ST_BIN even when nothing named `st` or `smalltalk` is on PATH', () => {
     // Discriminating shim: it records via ST_BIN, and PATH is scrubbed
-    // clean of both `st` and `coord`. Only path a call can travel is
+    // clean of both `st` and `smalltalk`. Only path a call can travel is
     // via the ST_BIN env var.
     const dedicatedShim = join(scratch, 'st-injected.sh');
     writeFileSync(
       dedicatedShim,
       [
         '#!/bin/bash',
-        'for arg in "$@"; do printf "%s\\0" "$arg" >> "$COORD_SHIM_LOG"; done',
-        'printf "\\n" >> "$COORD_SHIM_LOG"',
+        'for arg in "$@"; do printf "%s\\0" "$arg" >> "$ST_SHIM_LOG"; done',
+        'printf "\\n" >> "$ST_SHIM_LOG"',
         'exit 0',
         '',
       ].join('\n')
     );
     chmodSync(dedicatedShim, 0o755);
     // A PATH with /usr/bin + /bin (so bash and jq are findable) but
-    // NEITHER st NOR coord present. Ensures the hook can only reach
+    // NEITHER st NOR smalltalk present. Ensures the hook can only reach
     // the shim via ST_BIN.
     const r = spawnSync('bash', [STOP_FAILURE_SH], {
       env: {
         PATH: '/usr/bin:/bin',
         HOME: process.env.HOME,
-        COORD_SHIM_LOG: shimLog,
+        ST_SHIM_LOG: shimLog,
         ST_AGENT: 'bob',
         ST_BIN: dedicatedShim,
       },
@@ -731,7 +731,7 @@ describe('claude-code hooks — $ST_BIN takes precedence over PATH', () => {
       env: {
         PATH: `${shimDir}:${process.env.PATH ?? ''}`,
         HOME: process.env.HOME,
-        COORD_SHIM_LOG: shimLog,
+        ST_SHIM_LOG: shimLog,
         ST_AGENT: 'bob',
         ST_BIN: '',
       },
@@ -744,22 +744,22 @@ describe('claude-code hooks — $ST_BIN takes precedence over PATH', () => {
     expect(calls).toEqual([['status', 'bob', '--set', 'away']]);
   });
 
-  it('prefers `st` over `coord` when both are on PATH', () => {
-    // Rebuild the shim dir so only one recording target survives on PATH,
-    // but keep BOTH names present — with different bodies. `st` writes
-    // "STCALL", `coord` writes "COORDCALL". Whichever the hook picks
-    // shows up in the log.
+  it('prefers `st` over `smalltalk` when both are on PATH', () => {
+    // Rebuild the shim dir with BOTH names present — different bodies. `st`
+    // writes "STCALL", `smalltalk` writes "SMALLTALKCALL". The hook's
+    // `command -v st || command -v smalltalk` chain prefers `st`, so only
+    // "STCALL" shows up in the log.
     const fresh = join(scratch, 'preference-bin');
     mkdirSync(fresh, { recursive: true });
     for (const [name, tag] of [
       ['st', 'STCALL'],
-      ['coord', 'COORDCALL'],
+      ['smalltalk', 'SMALLTALKCALL'],
     ] as const) {
       writeFileSync(
         join(fresh, name),
         [
           '#!/bin/bash',
-          `printf '%s\\n' '${tag}' >> "$COORD_SHIM_LOG"`,
+          `printf '%s\\n' '${tag}' >> "$ST_SHIM_LOG"`,
           'exit 0',
           '',
         ].join('\n')
@@ -769,13 +769,13 @@ describe('claude-code hooks — $ST_BIN takes precedence over PATH', () => {
     const r = spawnSync('bash', [STOP_FAILURE_SH], {
       env: {
         // /usr/bin:/bin for bash + jq, then the fresh shim dir which
-        // exposes BOTH `st` and `coord`. Order matters — st before
-        // coord alphabetically doesn't affect PATH lookup, but the
-        // hook script's `command -v st || command -v coord` chain
+        // exposes BOTH `st` and `smalltalk`. Order matters — st before
+        // smalltalk alphabetically doesn't affect PATH lookup, but the
+        // hook script's `command -v st || command -v smalltalk` chain
         // does: st wins.
         PATH: `${fresh}:/usr/bin:/bin`,
         HOME: process.env.HOME,
-        COORD_SHIM_LOG: shimLog,
+        ST_SHIM_LOG: shimLog,
         ST_AGENT: 'bob',
       },
       input: JSON.stringify({ error_type: 'rate_limit' }),
@@ -785,6 +785,6 @@ describe('claude-code hooks — $ST_BIN takes precedence over PATH', () => {
     expect(r.status ?? -1).toBe(0);
     const log = existsSync(shimLog) ? readFileSync(shimLog, 'utf8') : '';
     expect(log).toContain('STCALL');
-    expect(log).not.toContain('COORDCALL');
+    expect(log).not.toContain('SMALLTALKCALL');
   });
 });

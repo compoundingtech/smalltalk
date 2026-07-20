@@ -2,7 +2,7 @@
 // Stop hook scripts at examples/codex/{session-start,stop}.sh.
 //
 // The scripts are bash; the tests run them as real subprocesses
-// against a fixture coord root. Skipped on hosts without `jq` on
+// against a fixture smalltalk root. Skipped on hosts without `jq` on
 // PATH (the scripts use jq to construct the JSON envelope).
 
 import { spawnSync } from 'node:child_process';
@@ -21,7 +21,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = resolve(HERE, '..', '..');
-const COORD_BIN = join(REPO_ROOT, 'bin', 'coord');
+const ST_BIN = join(REPO_ROOT, 'bin', 'smalltalk');
 const SESSION_START_SH = join(
   REPO_ROOT,
   'examples',
@@ -40,8 +40,8 @@ let stRoot: string;
 let stateHome: string;
 
 beforeEach(() => {
-  scratch = mkdtempSync(join(tmpdir(), 'coord-it-codex-'));
-  stRoot = join(scratch, 'coord');
+  scratch = mkdtempSync(join(tmpdir(), 'st-it-codex-'));
+  stRoot = join(scratch, 'smalltalk');
   for (const id of ['alice', 'bob']) {
     mkdirSync(join(stRoot, id, 'inbox'), { recursive: true });
     mkdirSync(join(stRoot, id, 'archive'), { recursive: true });
@@ -78,7 +78,7 @@ function runHook(
   script: string,
   env: NodeJS.ProcessEnv
 ): RunResult {
-  // Path-prepend bin/coord and the system PATH so coord + jq are
+  // Path-prepend bin/smalltalk and the system PATH so smalltalk + jq are
   // both reachable from within the hook script.
   const path = `${join(REPO_ROOT, 'bin')}:${process.env.PATH ?? ''}`;
   const fullEnv: NodeJS.ProcessEnv = {
@@ -248,7 +248,7 @@ describe.skipIf(!HAS_JQ)('codex hooks — stop.sh', () => {
     expect(payload.additionalContext).toContain('1714826789010-aaaaaa.md');
 
     // No new files between the two runs. Existing file's filename ts
-    // is < last-checked, so coord ls --since returns empty.
+    // is < last-checked, so st ls --since returns empty.
     const second = runHook(STOP_SH, env);
     expect(second.exitCode).toBe(0);
     expect(second.stdout).toBe('');
@@ -323,7 +323,7 @@ describe.skipIf(!HAS_JQ)('codex hooks — stop.sh', () => {
   });
 });
 
-// Mark COORD_BIN as used (the helper resolution above is purely
+// Mark ST_BIN as used (the helper resolution above is purely
 // pathwork; this silences unused-import warnings if the constant is
 // referenced only via PATH-prepending).
-void COORD_BIN;
+void ST_BIN;

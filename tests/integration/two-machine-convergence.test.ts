@@ -16,7 +16,7 @@ import {
   mkIdentity,
   mkRoot,
   rsyncAvailable,
-  runCoord,
+  runSt,
 } from './helpers.ts';
 
 const skip = !rsyncAvailable();
@@ -52,9 +52,9 @@ d('two-machine convergence (real rsync)', () => {
 
   it('send + sync push delivers the file to the receiver', () => {
     resetAll();
-    const send = runCoord(['message', 'send', 'bob', '--from', 'alice'], {
+    const send = runSt(['message', 'send', 'bob', '--from', 'alice'], {
       stRoot: rootA,
-      coordIdentity: 'alice',
+      stIdentity: 'alice',
       stdin: 'hello bob',
     });
     expect(send.exitCode).toBe(0);
@@ -62,9 +62,9 @@ d('two-machine convergence (real rsync)', () => {
     // Lives on A in alice's view of bob/inbox/.
     expect(existsSync(join(rootA, 'bob', 'inbox', filename))).toBe(true);
 
-    const push = runCoord(['sync', 'push', `local:${rootB}`], {
+    const push = runSt(['sync', 'push', `local:${rootB}`], {
       stRoot: rootA,
-      coordIdentity: 'alice',
+      stIdentity: 'alice',
     });
     expect(push.exitCode).toBe(0);
     // Now exists on B too (rsync -a copies, doesn't move).
@@ -74,42 +74,42 @@ d('two-machine convergence (real rsync)', () => {
 
   it('round trip: receiver archives, bidirectional sync converges', () => {
     resetAll();
-    const send = runCoord(['message', 'send', 'bob', '--from', 'alice'], {
+    const send = runSt(['message', 'send', 'bob', '--from', 'alice'], {
       stRoot: rootA,
-      coordIdentity: 'alice',
+      stIdentity: 'alice',
       stdin: 'core acceptance',
     });
     const filename = send.stdout.trim();
-    runCoord(['sync', 'push', `local:${rootB}`], {
+    runSt(['sync', 'push', `local:${rootB}`], {
       stRoot: rootA,
-      coordIdentity: 'alice',
+      stIdentity: 'alice',
     });
 
     // Bob archives locally.
-    const arch = runCoord(['message', 'archive', 'bob', filename], {
+    const arch = runSt(['message', 'archive', 'bob', filename], {
       stRoot: rootB,
-      coordIdentity: 'bob',
+      stIdentity: 'bob',
     });
     expect(arch.exitCode).toBe(0);
     expect(existsSync(join(rootB, 'bob', 'archive', filename))).toBe(true);
     expect(existsSync(join(rootB, 'bob', 'inbox', filename))).toBe(false);
 
     // One full bidirectional round.
-    runCoord(['sync', 'push', `local:${rootB}`], {
+    runSt(['sync', 'push', `local:${rootB}`], {
       stRoot: rootA,
-      coordIdentity: 'alice',
+      stIdentity: 'alice',
     });
-    runCoord(['sync', 'pull', `local:${rootB}`], {
+    runSt(['sync', 'pull', `local:${rootB}`], {
       stRoot: rootA,
-      coordIdentity: 'alice',
+      stIdentity: 'alice',
     });
-    runCoord(['sync', 'push', `local:${rootA}`], {
+    runSt(['sync', 'push', `local:${rootA}`], {
       stRoot: rootB,
-      coordIdentity: 'bob',
+      stIdentity: 'bob',
     });
-    runCoord(['sync', 'pull', `local:${rootA}`], {
+    runSt(['sync', 'pull', `local:${rootA}`], {
       stRoot: rootB,
-      coordIdentity: 'bob',
+      stIdentity: 'bob',
     });
 
     // Both sides: archive only, inbox empty.
@@ -128,42 +128,42 @@ d('two-machine convergence (real rsync)', () => {
     // (2) `read` triggers lazy-read sweep, which removes the inbox
     //     copy (byte-identical twin) and reads the archive copy.
     resetAll();
-    const send = runCoord(['message', 'send', 'bob', '--from', 'alice'], {
+    const send = runSt(['message', 'send', 'bob', '--from', 'alice'], {
       stRoot: rootA,
-      coordIdentity: 'alice',
+      stIdentity: 'alice',
       stdin: 'z1 repro',
     });
     const filename = send.stdout.trim();
-    runCoord(['sync', 'push', `local:${rootB}`], {
+    runSt(['sync', 'push', `local:${rootB}`], {
       stRoot: rootA,
-      coordIdentity: 'alice',
+      stIdentity: 'alice',
     });
-    runCoord(['message', 'archive', 'bob', filename], {
+    runSt(['message', 'archive', 'bob', filename], {
       stRoot: rootB,
-      coordIdentity: 'bob',
+      stIdentity: 'bob',
     });
     // A pushes again — A still has bob/inbox/X locally because A's sync
     // hasn't pulled bob/archive/X back yet. So A re-deposits inbox on B.
-    runCoord(['sync', 'push', `local:${rootB}`], {
+    runSt(['sync', 'push', `local:${rootB}`], {
       stRoot: rootA,
-      coordIdentity: 'alice',
+      stIdentity: 'alice',
     });
     // (1) Before any read/sweep, the zombie is visible to ls.
-    const lsBefore = runCoord(['message', 'ls', 'bob', '--count'], {
+    const lsBefore = runSt(['message', 'ls', 'bob', '--count'], {
       stRoot: rootB,
-      coordIdentity: 'bob',
+      stIdentity: 'bob',
     });
     expect(lsBefore.exitCode).toBe(0);
     expect(lsBefore.stdout.trim()).toBe('1');
     expect(listInbox(rootB, 'bob')).toEqual([filename]);
     // (2) Reading triggers lazy-read sweep — inbox copy is removed.
-    runCoord(['message', 'read', 'bob', filename], {
+    runSt(['message', 'read', 'bob', filename], {
       stRoot: rootB,
-      coordIdentity: 'bob',
+      stIdentity: 'bob',
     });
-    const lsAfter = runCoord(['message', 'ls', 'bob', '--count'], {
+    const lsAfter = runSt(['message', 'ls', 'bob', '--count'], {
       stRoot: rootB,
-      coordIdentity: 'bob',
+      stIdentity: 'bob',
     });
     expect(lsAfter.exitCode).toBe(0);
     expect(lsAfter.stdout.trim()).toBe('0');
@@ -175,37 +175,37 @@ d('two-machine convergence (real rsync)', () => {
     resetAll();
     const filenames: string[] = [];
     for (let i = 0; i < 5; i++) {
-      const r = runCoord(['message', 'send', 'bob', '--from', 'alice'], {
+      const r = runSt(['message', 'send', 'bob', '--from', 'alice'], {
         stRoot: rootA,
-        coordIdentity: 'alice',
+        stIdentity: 'alice',
         stdin: `msg ${i}`,
       });
       expect(r.exitCode).toBe(0);
       filenames.push(r.stdout.trim());
     }
-    runCoord(['sync', 'push', `local:${rootB}`], {
+    runSt(['sync', 'push', `local:${rootB}`], {
       stRoot: rootA,
-      coordIdentity: 'alice',
+      stIdentity: 'alice',
     });
     // Archive the first three on B (chronological order).
     const sortedNames = [...filenames].sort();
     for (let i = 0; i < 3; i++) {
-      const r = runCoord(['message', 'archive', 'bob', sortedNames[i]!], {
+      const r = runSt(['message', 'archive', 'bob', sortedNames[i]!], {
         stRoot: rootB,
-        coordIdentity: 'bob',
+        stIdentity: 'bob',
       });
       expect(r.exitCode).toBe(0);
     }
 
     // Bidirectional convergence (two rounds to drain peer-side zombies).
     const sync = (root: string, peer: string, identity: string): void => {
-      runCoord(['sync', 'push', `local:${peer}`], {
+      runSt(['sync', 'push', `local:${peer}`], {
         stRoot: root,
-        coordIdentity: identity,
+        stIdentity: identity,
       });
-      runCoord(['sync', 'pull', `local:${peer}`], {
+      runSt(['sync', 'pull', `local:${peer}`], {
         stRoot: root,
-        coordIdentity: identity,
+        stIdentity: identity,
       });
     };
     sync(rootA, rootB, 'alice');
@@ -222,20 +222,20 @@ d('two-machine convergence (real rsync)', () => {
 
   it('idempotent: a second sync push is a no-op (no new files)', () => {
     resetAll();
-    runCoord(['message', 'send', 'bob', '--from', 'alice'], {
+    runSt(['message', 'send', 'bob', '--from', 'alice'], {
       stRoot: rootA,
-      coordIdentity: 'alice',
+      stIdentity: 'alice',
       stdin: 'once',
     });
-    runCoord(['sync', 'push', `local:${rootB}`], {
+    runSt(['sync', 'push', `local:${rootB}`], {
       stRoot: rootA,
-      coordIdentity: 'alice',
+      stIdentity: 'alice',
     });
     const before = listInbox(rootB, 'bob');
 
-    const second = runCoord(['sync', 'push', `local:${rootB}`], {
+    const second = runSt(['sync', 'push', `local:${rootB}`], {
       stRoot: rootA,
-      coordIdentity: 'alice',
+      stIdentity: 'alice',
     });
     expect(second.exitCode).toBe(0);
     expect(listInbox(rootB, 'bob')).toEqual(before);
@@ -243,9 +243,9 @@ d('two-machine convergence (real rsync)', () => {
 
   it('empty trees both sides: sync push is a no-op, exit 0, no stderr', () => {
     resetAll();
-    const r = runCoord(['sync', 'push', `local:${rootB}`], {
+    const r = runSt(['sync', 'push', `local:${rootB}`], {
       stRoot: rootA,
-      coordIdentity: 'alice',
+      stIdentity: 'alice',
     });
     expect(r.exitCode).toBe(0);
     expect(listInbox(rootA, 'alice')).toEqual([]);
@@ -258,14 +258,14 @@ d('two-machine convergence (real rsync)', () => {
     resetAll();
     const body =
       'line one\nline two\n\nline four with: a colon and "quotes"\n';
-    const send = runCoord(
+    const send = runSt(
       ['message', 'send', 'bob', '--from', 'alice', '--subject', 're: hello'],
-      { stRoot: rootA, coordIdentity: 'alice', stdin: body }
+      { stRoot: rootA, stIdentity: 'alice', stdin: body }
     );
     const filename = send.stdout.trim();
-    runCoord(['sync', 'push', `local:${rootB}`], {
+    runSt(['sync', 'push', `local:${rootB}`], {
       stRoot: rootA,
-      coordIdentity: 'alice',
+      stIdentity: 'alice',
     });
 
     const aText = readFileSync(join(rootA, 'bob', 'inbox', filename), 'utf8');

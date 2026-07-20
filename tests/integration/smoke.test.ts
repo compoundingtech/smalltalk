@@ -8,35 +8,35 @@ import { existsSync } from 'node:fs';
 import { afterEach, describe, expect, it } from 'vitest';
 
 import {
-  COORD_BIN,
+  ST_BIN,
   cleanupRoot,
   listInbox,
   mkIdentity,
   mkRoot,
-  runCoord,
-  runCoordPty,
+  runSt,
+  runStPty,
   rsyncAvailable,
 } from './helpers.ts';
 
 describe('integration smoke', () => {
   it('the bin/st shim exists on disk', () => {
-    expect(existsSync(COORD_BIN)).toBe(true);
+    expect(existsSync(ST_BIN)).toBe(true);
   });
 
   it('invokes st with --help and exits 0', () => {
-    const r = runCoord(['--help']);
+    const r = runSt(['--help']);
     expect(r.exitCode).toBe(0);
     expect(r.stdout).toContain('usage: st');
   });
 
   it('st with no args exits 2 and prints usage to stderr', () => {
-    const r = runCoord([]);
+    const r = runSt([]);
     expect(r.exitCode).toBe(2);
     expect(r.stderr).toContain('usage: st');
   });
 
   it('st <unknown> exits 2 with the unknown-subcommand message', () => {
-    const r = runCoord(['bogus-cmd']);
+    const r = runSt(['bogus-cmd']);
     expect(r.exitCode).toBe(2);
     expect(r.stderr).toContain('unknown subcommand: bogus-cmd');
   });
@@ -45,7 +45,7 @@ describe('integration smoke', () => {
     const root = mkRoot();
     try {
       mkIdentity(root, 'alice');
-      const r = runCoord(['message', 'send', 'bob', '--from', 'alice', '--subject', 'hi'], {
+      const r = runSt(['message', 'send', 'bob', '--from', 'alice', '--subject', 'hi'], {
         stRoot: root,
         stdin: 'hello bob',
       });
@@ -64,14 +64,14 @@ describe('integration smoke', () => {
 
   // PTY smoke (closes in afterEach to avoid leaking the spawned process).
   describe('PTY harness', () => {
-    let sessions: Awaited<ReturnType<typeof runCoordPty>>[] = [];
+    let sessions: Awaited<ReturnType<typeof runStPty>>[] = [];
     afterEach(async () => {
       for (const s of sessions) await s.close();
       sessions = [];
     });
 
     it('Session.spawn returns a usable session for `st help`', async () => {
-      const s = runCoordPty(['help']);
+      const s = runStPty(['help']);
       sessions.push(s);
       const ss = await s.waitForText('usage: st');
       expect(ss.text).toContain('usage: st');

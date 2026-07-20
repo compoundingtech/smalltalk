@@ -21,7 +21,7 @@ let stderrBuf: string;
 let ctx: CliContext;
 
 beforeEach(() => {
-  scratch = mkdtempSync(join(tmpdir(), 'coord-hooks-test-'));
+  scratch = mkdtempSync(join(tmpdir(), 'st-hooks-test-'));
   stdoutBuf = '';
   stderrBuf = '';
   ctx = {
@@ -41,12 +41,12 @@ afterEach(() => {
   rmSync(scratch, { recursive: true, force: true });
 });
 
-/** A fake @myobie/coord install root with the claude-code hook scripts. */
+/** A fake @compoundingtech/smalltalk install root with the claude-code hook scripts. */
 function fakeRoot(opts: { missing?: string[]; stBin?: boolean } = {}): string {
   const root = join(scratch, 'install');
   const hooks = join(root, 'examples', 'claude-code', 'hooks');
   mkdirSync(hooks, { recursive: true });
-  writeFileSync(join(root, 'package.json'), JSON.stringify({ name: '@myobie/coord' }));
+  writeFileSync(join(root, 'package.json'), JSON.stringify({ name: '@compoundingtech/smalltalk' }));
   const all = [
     'session-start.sh',
     'pre-compact.sh',
@@ -118,7 +118,7 @@ describe('resolveHooksInfo — codex / pi', () => {
   it('codex → exampleConfig set, no settings block', () => {
     const root = join(scratch, 'install');
     mkdirSync(join(root, 'examples', 'codex'), { recursive: true });
-    writeFileSync(join(root, 'package.json'), JSON.stringify({ name: '@myobie/coord' }));
+    writeFileSync(join(root, 'package.json'), JSON.stringify({ name: '@compoundingtech/smalltalk' }));
     const info = resolveHooksInfo('codex', root)!;
     expect(info.settings).toBeUndefined();
     expect(info.exampleConfig).toBe(
@@ -129,7 +129,7 @@ describe('resolveHooksInfo — codex / pi', () => {
   it('pi → exampleConfig set, no settings block', () => {
     const root = join(scratch, 'install');
     mkdirSync(join(root, 'examples', 'pi'), { recursive: true });
-    writeFileSync(join(root, 'package.json'), JSON.stringify({ name: '@myobie/coord' }));
+    writeFileSync(join(root, 'package.json'), JSON.stringify({ name: '@compoundingtech/smalltalk' }));
     const info = resolveHooksInfo('pi', root)!;
     expect(info.settings).toBeUndefined();
     expect(info.exampleConfig).toBe(

@@ -1,6 +1,6 @@
-// tests/unit/lib-coord-api.test.ts — brief-028 Coord handle additions.
+// tests/unit/lib-st-api.test.ts — brief-028 Smalltalk handle additions.
 //
-// Covers coord.members(), coord.overview(), and coord.createIdentity().
+// Covers smalltalk.members(), smalltalk.overview(), and smalltalk.createIdentity().
 // Existing tests/unit/members.test.ts and overview.test.ts exhaustively
 // cover the underlying computation; this file just verifies the handle
 // wiring + the createIdentity contract.
@@ -27,7 +27,7 @@ import type { Overview } from '../../src/commands/overview.ts';
 
 let scratch: string;
 let stRoot: string;
-let coord: St;
+let smalltalk: St;
 
 function setupIdentity(id: string): void {
   mkdirSync(join(stRoot, id, 'inbox'), { recursive: true });
@@ -39,13 +39,13 @@ function setStatus(id: string, value: string): void {
 }
 
 beforeEach(() => {
-  scratch = mkdtempSync(join(tmpdir(), 'coord-lib-api-'));
-  stRoot = join(scratch, 'coord');
+  scratch = mkdtempSync(join(tmpdir(), 'st-lib-api-'));
+  stRoot = join(scratch, 'smalltalk');
   mkdirSync(stRoot, { recursive: true });
   setupIdentity('alice');
   setupIdentity('bob');
   setupIdentity('carol');
-  coord = createSt({
+  smalltalk = createSt({
     root: stRoot,
     identity: asIdentity('alice'),
     configRoot: join(scratch, 'config'),
@@ -56,11 +56,11 @@ afterEach(() => {
   rmSync(scratch, { recursive: true, force: true });
 });
 
-// ─── coord.members ──────────────────────────────────────────────────────
+// ─── smalltalk.members ──────────────────────────────────────────────────────
 
-describe('coord.members', () => {
+describe('smalltalk.members', () => {
   it('zero-arg returns all identities as MemberSummary[]', () => {
-    const r = coord.members() as MemberSummary[];
+    const r = smalltalk.members() as MemberSummary[];
     expect(r.map((m) => m.identity).sort()).toEqual([
       'alice',
       'bob',
@@ -77,7 +77,7 @@ describe('coord.members', () => {
   });
 
   it('enrich: true returns MemberSummaryEnriched[]', () => {
-    const r = coord.members({ enrich: true }) as MemberSummaryEnriched[];
+    const r = smalltalk.members({ enrich: true }) as MemberSummaryEnriched[];
     expect(r.length).toBeGreaterThan(0);
     for (const m of r) {
       expect(m).toHaveProperty('lastActivity');
@@ -89,22 +89,22 @@ describe('coord.members', () => {
     setStatus('alice', 'available');
     setStatus('bob', 'busy');
     // carol leaves status unset → effective offline
-    const r = coord.members({ status: 'busy' });
+    const r = smalltalk.members({ status: 'busy' });
     expect(r.map((m) => m.identity)).toEqual(['bob']);
   });
 
   it('returns [] when no identities have hosting folders', () => {
     rmSync(stRoot, { recursive: true, force: true });
     mkdirSync(stRoot, { recursive: true });
-    expect(coord.members()).toEqual([]);
+    expect(smalltalk.members()).toEqual([]);
   });
 });
 
-// ─── coord.overview ─────────────────────────────────────────────────────
+// ─── smalltalk.overview ─────────────────────────────────────────────────────
 
-describe('coord.overview', () => {
+describe('smalltalk.overview', () => {
   it('defaults identity to the handle\'s own', () => {
-    const r: Overview = coord.overview();
+    const r: Overview = smalltalk.overview();
     expect(r.identity).toBe('alice');
     expect(r).toHaveProperty('inbox');
     expect(r).toHaveProperty('members');
@@ -112,7 +112,7 @@ describe('coord.overview', () => {
   });
 
   it('opts.identity overrides the default', () => {
-    const r: Overview = coord.overview({
+    const r: Overview = smalltalk.overview({
       identity: asIdentity('bob'),
     });
     expect(r.identity).toBe('bob');
@@ -132,24 +132,24 @@ describe('coord.overview', () => {
       // suppress unused-var warning from the unused `filename` above
       void filename;
     }
-    const full = coord.overview();
-    const limited = coord.overview({ recent: 3 });
+    const full = smalltalk.overview();
+    const limited = smalltalk.overview({ recent: 3 });
     expect(limited.recent.length).toBeLessThanOrEqual(3);
     expect(full.recent.length).toBeGreaterThanOrEqual(limited.recent.length);
   });
 
   it('includes a members section enriched with lastActivity', () => {
-    const r = coord.overview();
+    const r = smalltalk.overview();
     expect(r.members.length).toBeGreaterThan(0);
     expect(r.members[0]).toHaveProperty('lastActivity');
   });
 });
 
-// ─── coord.createIdentity ───────────────────────────────────────────────
+// ─── smalltalk.createIdentity ───────────────────────────────────────────────
 
-describe('coord.createIdentity', () => {
+describe('smalltalk.createIdentity', () => {
   it('new name → { created: true } and both folders exist', async () => {
-    const r = await coord.createIdentity('dave');
+    const r = await smalltalk.createIdentity('dave');
     expect(r).toEqual({ created: true });
     expect(existsSync(join(stRoot, 'dave', 'inbox'))).toBe(true);
     expect(existsSync(join(stRoot, 'dave', 'archive'))).toBe(true);
@@ -157,7 +157,7 @@ describe('coord.createIdentity', () => {
 
   it('existing name → { created: false } (idempotent)', async () => {
     // alice was set up in beforeEach with both folders.
-    const r = await coord.createIdentity('alice');
+    const r = await smalltalk.createIdentity('alice');
     expect(r).toEqual({ created: false });
   });
 
@@ -165,13 +165,13 @@ describe('coord.createIdentity', () => {
     // A sender may have lazily mkdir'd `eve/inbox/` via st_msg_send;
     // archive is missing. createIdentity should backfill.
     mkdirSync(join(stRoot, 'eve', 'inbox'), { recursive: true });
-    const r = await coord.createIdentity('eve');
+    const r = await smalltalk.createIdentity('eve');
     expect(r).toEqual({ created: true });
     expect(existsSync(join(stRoot, 'eve', 'archive'))).toBe(true);
   });
 
   it('rejects an invalid identity grammar', async () => {
-    await expect(coord.createIdentity('INVALID')).rejects.toThrow(
+    await expect(smalltalk.createIdentity('INVALID')).rejects.toThrow(
       InvalidIdentityError
     );
   });
@@ -179,20 +179,20 @@ describe('coord.createIdentity', () => {
   it('rejects a reserved name (e.g. `members`)', async () => {
     // RESERVED_NAMES includes folder/sidecar names + state words +
     // verb names — validIdentity guards them. Sample one.
-    await expect(coord.createIdentity('members')).rejects.toThrow(
+    await expect(smalltalk.createIdentity('members')).rejects.toThrow(
       InvalidIdentityError
     );
   });
 
   it('rejects the brief-022 derived state `unknown` as an identity', async () => {
     // Regression for the brief-024 carry-over reserving `unknown`.
-    await expect(coord.createIdentity('unknown')).rejects.toThrow(
+    await expect(smalltalk.createIdentity('unknown')).rejects.toThrow(
       InvalidIdentityError
     );
   });
 
   it('does NOT set status', async () => {
-    await coord.createIdentity('frank');
+    await smalltalk.createIdentity('frank');
     expect(existsSync(join(stRoot, 'frank', 'status'))).toBe(false);
   });
 });
@@ -200,7 +200,7 @@ describe('coord.createIdentity', () => {
 // ─── public surface (RESERVED_NAMES) ────────────────────────────────────
 
 describe('public surface (brief-028)', () => {
-  it('RESERVED_NAMES is exported from @myobie/coord and includes the canonical names', async () => {
+  it('RESERVED_NAMES is exported from @compoundingtech/smalltalk and includes the canonical names', async () => {
     const mod = (await import('../../src/index.ts')) as {
       RESERVED_NAMES: readonly string[];
     };
@@ -217,15 +217,15 @@ describe('public surface (brief-028)', () => {
   });
 });
 
-// ─── coord.resources (brief-009 item 5) ────────────────────────────────
+// ─── smalltalk.resources (brief-009 item 5) ────────────────────────────────
 
-describe('coord.resources', () => {
+describe('smalltalk.resources', () => {
   it('add returns a Filename, list surfaces it back', async () => {
-    const fn = await coord.resources.add({
+    const fn = await smalltalk.resources.add({
       url: 'https://example.com',
     });
     expect(/^[0-9]{13}-[0-9a-z]{6}\.md$/.test(fn)).toBe(true);
-    const items = await coord.resources.list();
+    const items = await smalltalk.resources.list();
     expect(items).toHaveLength(1);
     expect(items[0]!.filename).toBe(fn);
     expect(items[0]!.identity).toBe('alice');
@@ -233,22 +233,22 @@ describe('coord.resources', () => {
   });
 
   it('list defaults to the handle\'s own identity; explicit arg switches to a peer', async () => {
-    await coord.resources.add({ url: 'https://alice.example/' });
-    const ownItems = await coord.resources.list();
+    await smalltalk.resources.add({ url: 'https://alice.example/' });
+    const ownItems = await smalltalk.resources.list();
     expect(ownItems).toHaveLength(1);
-    const bobItems = await coord.resources.list(asIdentity('bob'));
+    const bobItems = await smalltalk.resources.list(asIdentity('bob'));
     expect(bobItems).toHaveLength(0);
   });
 
   it('read returns the parsed Resource with optional fields populated', async () => {
-    const fn = await coord.resources.add({
+    const fn = await smalltalk.resources.add({
       url: 'https://example.com',
       title: 'eg',
       tags: ['a', 'b'],
       relation: 'owns',
       body: 'desc\n',
     });
-    const r = await coord.resources.read(asIdentity('alice'), fn);
+    const r = await smalltalk.resources.read(asIdentity('alice'), fn);
     expect(r.url).toBe('https://example.com');
     expect(r.title).toBe('eg');
     expect(r.tags).toEqual(['a', 'b']);
@@ -257,32 +257,32 @@ describe('coord.resources', () => {
   });
 
   it('relation is absent on the returned Resource when not set on add', async () => {
-    const fn = await coord.resources.add({
+    const fn = await smalltalk.resources.add({
       url: 'https://example.com',
     });
-    const r = await coord.resources.read(asIdentity('alice'), fn);
+    const r = await smalltalk.resources.read(asIdentity('alice'), fn);
     expect(r.relation).toBeUndefined();
   });
 
   it('remove deletes the file; subsequent list shows it gone', async () => {
-    const fn = await coord.resources.add({
+    const fn = await smalltalk.resources.add({
       url: 'https://example.com',
     });
-    await coord.resources.remove(fn);
-    const items = await coord.resources.list();
+    await smalltalk.resources.remove(fn);
+    const items = await smalltalk.resources.list();
     expect(items).toHaveLength(0);
   });
 
   it('add rejects URLs without a scheme', async () => {
     await expect(
-      coord.resources.add({ url: 'example.com' })
+      smalltalk.resources.add({ url: 'example.com' })
     ).rejects.toThrow();
   });
 });
 
-// ─── coord.archive opts (brief-009 item 4 SDK parity) ──────────────────
+// ─── smalltalk.archive opts (brief-009 item 4 SDK parity) ──────────────────
 
-describe('coord.archive opts.withAttachments', () => {
+describe('smalltalk.archive opts.withAttachments', () => {
   it('without opts, the canonical .md moves and siblings stay (default behavior)', async () => {
     const ts = 1782717800000;
     const fn = `${ts}-test01.md`;
@@ -295,7 +295,7 @@ describe('coord.archive opts.withAttachments', () => {
       join(stRoot, 'alice', 'inbox', sidecar),
       '{"k":1}'
     );
-    await coord.archive(
+    await smalltalk.archive(
       asIdentity('alice'),
       fn as unknown as ReturnType<typeof asFilename>
     );
@@ -317,7 +317,7 @@ describe('coord.archive opts.withAttachments', () => {
       join(stRoot, 'alice', 'inbox', sidecar),
       '{"k":1}'
     );
-    await coord.archive(
+    await smalltalk.archive(
       asIdentity('alice'),
       fn as unknown as ReturnType<typeof asFilename>,
       { withAttachments: true }
@@ -328,9 +328,9 @@ describe('coord.archive opts.withAttachments', () => {
   });
 });
 
-// ─── coord.archiveTrim opts.withAttachments ────────────────────────────
+// ─── smalltalk.archiveTrim opts.withAttachments ────────────────────────────
 
-describe('coord.archiveTrim opts.withAttachments', () => {
+describe('smalltalk.archiveTrim opts.withAttachments', () => {
   it('default leaves prefix-siblings in archive when their .md is trimmed', async () => {
     const ts = 1700000000000;
     const fn = `${ts}-old001.md`;
@@ -343,7 +343,7 @@ describe('coord.archiveTrim opts.withAttachments', () => {
       join(stRoot, 'alice', 'archive', sidecar),
       '{"k":1}'
     );
-    const victims = await coord.archiveTrim(asIdentity('alice'), {
+    const victims = await smalltalk.archiveTrim(asIdentity('alice'), {
       olderThan: '1d',
       now: () => Date.now(),
     });
@@ -364,7 +364,7 @@ describe('coord.archiveTrim opts.withAttachments', () => {
       join(stRoot, 'alice', 'archive', sidecar),
       '{"k":1}'
     );
-    await coord.archiveTrim(asIdentity('alice'), {
+    await smalltalk.archiveTrim(asIdentity('alice'), {
       olderThan: '1d',
       withAttachments: true,
       now: () => Date.now(),
@@ -374,11 +374,11 @@ describe('coord.archiveTrim opts.withAttachments', () => {
   });
 });
 
-// ─── coord.lsOrphans (brief-009 item 4 SDK parity) ─────────────────────
+// ─── smalltalk.lsOrphans (brief-009 item 4 SDK parity) ─────────────────────
 
-describe('coord.lsOrphans', () => {
+describe('smalltalk.lsOrphans', () => {
   it('returns [] when no orphans exist', async () => {
-    const r = await coord.lsOrphans();
+    const r = await smalltalk.lsOrphans();
     expect(r).toEqual([]);
   });
 
@@ -386,7 +386,7 @@ describe('coord.lsOrphans', () => {
     const ts = 1782717820000;
     const orphan = `${ts}-orph01.options.json`;
     writeFileSync(join(stRoot, 'alice', 'inbox', orphan), '{"k":1}');
-    const r = await coord.lsOrphans();
+    const r = await smalltalk.lsOrphans();
     expect(r.map((it) => it.filename)).toContain(orphan);
     const item = r.find((it) => it.filename === orphan)!;
     expect(item.ts).toBe(ts);
@@ -404,7 +404,7 @@ describe('coord.lsOrphans', () => {
       join(stRoot, 'alice', 'inbox', sidecar),
       '{"k":1}'
     );
-    const r = await coord.lsOrphans();
+    const r = await smalltalk.lsOrphans();
     expect(r.map((it) => it.filename)).not.toContain(sidecar);
   });
 
@@ -412,7 +412,7 @@ describe('coord.lsOrphans', () => {
     const ts = 1782717840000;
     const orphan = `${ts}-orph02.options.json`;
     writeFileSync(join(stRoot, 'alice', 'archive', orphan), '{"k":1}');
-    const r = await coord.lsOrphans(undefined, { archive: true });
+    const r = await smalltalk.lsOrphans(undefined, { archive: true });
     expect(r.map((it) => it.filename)).toContain(orphan);
   });
 
@@ -420,16 +420,16 @@ describe('coord.lsOrphans', () => {
     const ts = 1782717850000;
     const orphan = `${ts}-orph03.options.json`;
     writeFileSync(join(stRoot, 'bob', 'inbox', orphan), '{"k":1}');
-    const r = await coord.lsOrphans(asIdentity('bob'));
+    const r = await smalltalk.lsOrphans(asIdentity('bob'));
     expect(r.map((it) => it.filename)).toContain(orphan);
   });
 });
 
-// ─── coord.ding (brief-009 item 4 SDK parity) ──────────────────────────
+// ─── smalltalk.ding (brief-009 item 4 SDK parity) ──────────────────────────
 
-describe('coord.ding (handle wrapper around runDing)', () => {
+describe('smalltalk.ding (handle wrapper around runDing)', () => {
   it('is a function on the handle', () => {
-    expect(typeof coord.ding).toBe('function');
+    expect(typeof smalltalk.ding).toBe('function');
   });
 
   it('exits cleanly when the supplied signal aborts', async () => {
@@ -441,7 +441,7 @@ describe('coord.ding (handle wrapper around runDing)', () => {
     // Use a session-alive probe that always returns true so the
     // session-watch tick doesn't end the daemon on us.
     const isSessionAlive = (): boolean => true;
-    const done = coord.ding({
+    const done = smalltalk.ding({
       ptySession: 'fake-session',
       ptySend,
       isSessionAlive,

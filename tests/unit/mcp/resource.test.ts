@@ -33,8 +33,8 @@ async function boot(identity = 'alice'): Promise<void> {
 }
 
 beforeEach(() => {
-  scratch = mkdtempSync(join(tmpdir(), 'coord-mcp-resource-'));
-  stRoot = join(scratch, 'coord');
+  scratch = mkdtempSync(join(tmpdir(), 'st-mcp-resource-'));
+  stRoot = join(scratch, 'smalltalk');
 });
 
 afterEach(async () => {
@@ -171,7 +171,7 @@ describe('st_resource_ls', () => {
     setupIdentity('bob');
     await boot('alice');
     // Alice can't add to bob's resources via the MCP tool (it always
-    // writes to coord.identity). Plant directly.
+    // writes to smalltalk.identity). Plant directly.
     mkdirSync(join(stRoot, 'bob', 'resources'), { recursive: true });
     const bobFile = join(
       stRoot,

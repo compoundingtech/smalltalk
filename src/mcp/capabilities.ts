@@ -42,14 +42,14 @@ export const SERVER_INFO: Implementation = {
   //         types, MCP tool names (st_members → st_agents
   //         keeping st_members as deprecated alias), CLI verb
   //         (members → agents, members deprecated alias), and env
-  //         vars (ST_AGENT preferred → ST_IDENTITY → COORD_IDENTITY).
+  //         vars (ST_AGENT preferred → ST_IDENTITY → ST_IDENTITY).
   // 0.8.0 — brief-009 item 4: SDK parity gap-fills (st.archive +
   //         st.archiveTrim gain `withAttachments`; new
   //         st.lsOrphans and st.ding on the handle). No CLI
   //         or MCP surface change.
   // 0.8.1 — `st mcp` startup falls back to a throwaway
   //         `anon-<rand6>` agent when no ST_AGENT/ST_IDENTITY/
-  //         COORD_IDENTITY is set, instead of hard-exiting. Unblocks
+  //         ST_IDENTITY is set, instead of hard-exiting. Unblocks
   //         MCP hosts (Codex etc.) that spawn the server without
   //         identity env. One-line stderr warning + lazy-create the
   //         anon agent's inbox/archive folders.
@@ -64,7 +64,7 @@ export const SERVER_INFO: Implementation = {
   //         so idle Claude Code agents don't wedge on unnotified
   //         deliveries. Server surface unchanged; operators can
   //         opt-in to stderr instrumentation via
-  //         COORD_CHANNEL_DEBUG=1.
+  //         ST_CHANNEL_DEBUG=1.
   version: '0.9.1',
 };
 

@@ -1,4 +1,4 @@
-// tests/unit/ding.test.ts — coord ding daemon state machine.
+// tests/unit/ding.test.ts — st ding daemon state machine.
 //
 // Drives runDing with a fake St instance (controllable watch queue +
 // settable status) and a fake PtySender so the busy-buffer-flush
@@ -372,7 +372,7 @@ describe('runDing — status gating', () => {
     // the agent uses to act on the notification.
     expect(sender.calls()[0]!.sequences[0]).toMatch(/^\[DING\] /);
     expect(sender.calls()[0]!.sequences[0]).toContain('smalltalk message');
-    expect(sender.calls()[0]!.sequences[0]).not.toContain('coord message');
+    expect(sender.calls()[0]!.sequences[0]).not.toContain('st message');
     r.ac.abort();
     await r.done;
   });
@@ -614,7 +614,7 @@ describe('runDing — pty send failures', () => {
 
 // ─── runDing — read failures ───────────────────────────────────────────
 
-describe('runDing — coord.read failures', () => {
+describe('runDing — smalltalk.read failures', () => {
   let fake: FakeSt;
   let sender: FakeSender;
   let stderr: string;
@@ -707,7 +707,7 @@ describe('cmdDingCli — arg parsing', () => {
     const stderrBuf = { value: '' };
     return {
       env,
-      stRoot: '/tmp/fake-coord',
+      stRoot: '/tmp/fake-smalltalk',
       stConfig: '/tmp/fake-cfg',
       stdout: () => {},
       stderr: (s) => {
@@ -1142,8 +1142,8 @@ describe('runDing — tidy-check tick', () => {
   const IDENTITY = 'bob';
 
   beforeEach(() => {
-    scratch = mkdtempSync(join(tmpdir(), 'coord-ding-tidy-'));
-    stRoot = join(scratch, 'coord');
+    scratch = mkdtempSync(join(tmpdir(), 'st-ding-tidy-'));
+    stRoot = join(scratch, 'smalltalk');
     mkdirSync(join(stRoot, IDENTITY, 'inbox'), { recursive: true });
     mkdirSync(join(stRoot, IDENTITY, 'archive'), { recursive: true });
     identityRoot = join(stRoot, IDENTITY);
@@ -1186,10 +1186,10 @@ describe('runDing — tidy-check tick', () => {
       /^\[DING\] tidy-check: inbox=1 \(oldest [0-9]+m\)\.$/
     );
     // Regression guard: the [DING] prefix marker is present, and
-    // the historic `coord tidy-check:` form is negated so a future
+    // the historic `smalltalk tidy-check:` form is negated so a future
     // refactor can't revert to it.
     expect(call.sequences[0]).toMatch(/^\[DING\] /);
-    expect(call.sequences[0]).not.toContain('coord tidy-check');
+    expect(call.sequences[0]).not.toContain('smalltalk tidy-check');
     expect(call.sequences[1]).toBe('key:return');
     r.ac.abort();
     await r.done;
@@ -1599,8 +1599,8 @@ describe('runDing — status refresh tick', () => {
   const ID = 'bob';
 
   beforeEach(() => {
-    scratch = mkdtempSync(join(tmpdir(), 'coord-ding-srefresh-'));
-    stRoot = join(scratch, 'coord');
+    scratch = mkdtempSync(join(tmpdir(), 'st-ding-srefresh-'));
+    stRoot = join(scratch, 'smalltalk');
     mkdirSync(join(stRoot, ID, 'inbox'), { recursive: true });
     mkdirSync(join(stRoot, ID, 'archive'), { recursive: true });
     identityRoot = join(stRoot, ID);
@@ -1844,8 +1844,8 @@ describe('runDing — scan-on-startup', () => {
   const IDENTITY = 'bob';
 
   beforeEach(() => {
-    scratch = mkdtempSync(join(tmpdir(), 'coord-ding-scan-'));
-    stRoot = join(scratch, 'coord');
+    scratch = mkdtempSync(join(tmpdir(), 'st-ding-scan-'));
+    stRoot = join(scratch, 'smalltalk');
     mkdirSync(join(stRoot, IDENTITY, 'inbox'), { recursive: true });
     mkdirSync(join(stRoot, IDENTITY, 'archive'), { recursive: true });
     identityRoot = join(stRoot, IDENTITY);
@@ -1878,7 +1878,7 @@ describe('runDing — scan-on-startup', () => {
       const t = new Date(Date.now() - ageMs);
       utimesSync(path, t, t);
     }
-    // The fake's coord.read needs a planted message so buildEvent
+    // The fake's smalltalk.read needs a planted message so buildEvent
     // can extract `from`/`subject` — wire it up:
     fake.setMessage(filename, {
       from,
@@ -2260,7 +2260,7 @@ describe('runDing — periodic backlog re-scan', () => {
 });
 
 // ─── runDing — hardening: send serialization (rock-solid primary
-// transport). With ding-mode as the DEFAULT delivery path (post-coord-
+// transport). With ding-mode as the DEFAULT delivery path (post-st-
 // kill + MCP-hostile deployments), any `pty send` interleaving would
 // garble notices on the receiving terminal. The daemon MUST serialize
 // all sends through a single async queue. Failure mode caught by the
@@ -2404,7 +2404,7 @@ describe('runDing — retry semantics (at-least-once on transient failure)', () 
     await r.done;
   });
 
-  it('coord.read fails once → filename buffered, delivers on next flush tick', async () => {
+  it('smalltalk.read fails once → filename buffered, delivers on next flush tick', async () => {
     fake.setStatus('available');
     fake.setMessage('1714826789010-aaaaaa.md', {
       from: 'alice',
@@ -2424,7 +2424,7 @@ describe('runDing — retry semantics (at-least-once on transient failure)', () 
     await r.done;
   });
 
-  it('coord.read fails 3 times → still delivers on the 4th flush tick', async () => {
+  it('smalltalk.read fails 3 times → still delivers on the 4th flush tick', async () => {
     fake.setStatus('available');
     fake.setMessage('1714826789010-aaaaaa.md', { from: 'alice' });
     fake.failReadN(3, new Error('partial write'));
@@ -2710,7 +2710,7 @@ describe('cmdDingCli — PATH robustness (pty probe at boot)', () => {
 
   it('pty probe returns available → cmdDingCli proceeds past the probe (falls into runDing)', async () => {
     // We can't actually run runDing to completion here (it needs a
-    // real coord root + watcher). But we can prove the probe gate
+    // real smalltalk root + watcher). But we can prove the probe gate
     // opens by making it return available and asserting the CLI
     // proceeds past the probe (would then fail on the missing
     // stRoot's identity dir).

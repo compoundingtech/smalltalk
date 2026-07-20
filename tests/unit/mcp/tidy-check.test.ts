@@ -26,8 +26,8 @@ let identityRoot: string;
 const ID = 'alice';
 
 beforeEach(() => {
-  scratch = mkdtempSync(join(tmpdir(), 'coord-tidy-unit-'));
-  stRoot = join(scratch, 'coord');
+  scratch = mkdtempSync(join(tmpdir(), 'st-tidy-unit-'));
+  stRoot = join(scratch, 'smalltalk');
   mkdirSync(join(stRoot, ID, 'inbox'), { recursive: true });
   mkdirSync(join(stRoot, ID, 'archive'), { recursive: true });
   identityRoot = join(stRoot, ID);

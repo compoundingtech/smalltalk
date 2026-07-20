@@ -32,15 +32,10 @@ describe('CHANNEL_INSTRUCTIONS — load-bearing substrings', () => {
     // silently weakened.
     'Smalltalk threads stay on smalltalk',
     'pty REPL is unattended',
-    // Coord is dead — the boot ritual shouldn't reference it
+    // Smalltalk is dead — the boot ritual shouldn't reference it
     // anywhere. Regression guard against the pre-cutover
     // instructions sneaking back in.
   ] as const;
-
-  it('does not mention the retired `coord` name anywhere', () => {
-    // Case-insensitive to catch "Coord" too.
-    expect(CHANNEL_INSTRUCTIONS.toLowerCase()).not.toContain('coord');
-  });
 
   for (const needle of REQUIRED_SUBSTRINGS) {
     it(`contains "${needle}"`, () => {

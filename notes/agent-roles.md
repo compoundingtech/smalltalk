@@ -175,7 +175,7 @@ Rather than cargo-cult any of these, this repo is keeping enforcement at the pro
 
 What we're using today:
 
-- **Manager**: this doc + the `feedback_manager_not_implementer.md` memory + the standing brief workflow. No tool restrictions. The session it was written in (the one that produced the project, then named `coord`, now `smalltalk`) caught manager drift via human correction; the patterns in those memories are the result.
+- **Manager**: this doc + the `feedback_manager_not_implementer.md` memory + the standing brief workflow. No tool restrictions. The session it was written in (the one that produced the project, then named `smalltalk`, now `smalltalk`) caught manager drift via human correction; the patterns in those memories are the result.
 - **Worker**: prompts via brief + the standing rule that manager-owned docs (`IDEA.md`, `LAYOUT.md`, `notes/`) need permission to edit. Workflow discipline is enough.
 - **`agents.md`** (Claude Code's subagent mechanism): used to define a fresh manager or worker by reference to this doc + their relevant memories, when one is needed.
 
@@ -192,5 +192,5 @@ None of these are needed today. Worth revisiting if prompt-layer enforcement rep
 These are unresolved and worth thinking about as we deploy more roles:
 
 - **How does a manager hand off cleanly to a fresh manager?** Briefs accumulate context that's expensive to re-read. Maybe a "manager-state" doc that's updated as work progresses?
-- **How do workers in different repos coordinate?** Right now smalltalk IS the answer for cross-repo agent coordination — but the manager has to consciously route messages. A "send to whichever worker owns repo X" verb would be cleaner.
+- **How do workers in different repos orchestrate?** Right now smalltalk IS the answer for cross-repo agent orchestration — but the manager has to consciously route messages. A "send to whichever worker owns repo X" verb would be cleaner.
 - **Can a worker promote itself to manager for a sub-task?** Sometimes a worker realizes a piece of their brief needs further delegation. Right now that bounces back to the manager, which is fine but slower. Worth thinking about.

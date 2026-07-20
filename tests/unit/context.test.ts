@@ -32,8 +32,8 @@ let stderrBuf: string;
 let ctx: CliContext;
 
 beforeEach(() => {
-  scratch = mkdtempSync(join(tmpdir(), 'coord-context-test-'));
-  stRoot = join(scratch, 'coord');
+  scratch = mkdtempSync(join(tmpdir(), 'st-context-test-'));
+  stRoot = join(scratch, 'smalltalk');
   mkdirSync(stRoot, { recursive: true });
   // Create alice's identity dirs so resolveIdentity is happy. The
   // context/ folder is intentionally absent — that's the point of the

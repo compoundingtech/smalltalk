@@ -150,7 +150,7 @@ describe('createMcpServer — capability declaration', () => {
 // per-tool tests in tasks 3–7 cover the populated-server case.
 
 describe('createMcpServer — tool name registry', () => {
-  it('EXPECTED_TOOL_NAMES is the canonical non-channel tool set — `st_*` only (coord_* alias removed post-cutover)', () => {
+  it('EXPECTED_TOOL_NAMES is the canonical non-channel tool set — `st_*` only (st_* alias removed post-cutover)', () => {
     expect([...EXPECTED_TOOL_NAMES]).toEqual([
       'st_msg_send',
       'st_msg_ls',

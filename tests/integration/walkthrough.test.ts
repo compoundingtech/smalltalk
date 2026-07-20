@@ -15,7 +15,7 @@ import {
   mkIdentity,
   mkRoot,
   rsyncAvailable,
-  runCoord,
+  runSt,
 } from './helpers.ts';
 
 const skip = !rsyncAvailable();
@@ -45,10 +45,10 @@ d('walkthrough — Acts I–VIII', () => {
   // each side. After this round, every file under either root exists on
   // both — used to fan messages out across the three-machine grid.
   function bidirectional(rootX: string, idX: string, rootY: string, idY: string): void {
-    runCoord(['sync', 'push', `local:${rootY}`], { stRoot: rootX, coordIdentity: idX });
-    runCoord(['sync', 'pull', `local:${rootY}`], { stRoot: rootX, coordIdentity: idX });
-    runCoord(['sync', 'push', `local:${rootX}`], { stRoot: rootY, coordIdentity: idY });
-    runCoord(['sync', 'pull', `local:${rootX}`], { stRoot: rootY, coordIdentity: idY });
+    runSt(['sync', 'push', `local:${rootY}`], { stRoot: rootX, stIdentity: idX });
+    runSt(['sync', 'pull', `local:${rootY}`], { stRoot: rootX, stIdentity: idX });
+    runSt(['sync', 'push', `local:${rootX}`], { stRoot: rootY, stIdentity: idY });
+    runSt(['sync', 'pull', `local:${rootX}`], { stRoot: rootY, stIdentity: idY });
   }
 
   // Full round-robin: each pair syncs bidirectionally.
@@ -60,7 +60,7 @@ d('walkthrough — Acts I–VIII', () => {
 
   it('plays through all eight acts and converges to a five-message thread in archive/ on every machine', () => {
     // ── Act II — alice sends operator a question ─────────────────────────
-    const m1 = runCoord(
+    const m1 = runSt(
       [
         'message',
         'send',
@@ -72,7 +72,7 @@ d('walkthrough — Acts I–VIII', () => {
       ],
       {
         stRoot: A,
-        coordIdentity: 'alice',
+        stIdentity: 'alice',
         stdin:
           'The new auth path replaces the old one cleanly. The legacy session cookie\nis now dead code — should I remove it, or keep it as a compat shim until\nthe next release?\n',
       }
@@ -86,7 +86,7 @@ d('walkthrough — Acts I–VIII', () => {
     syncEveryone();
     expect(existsSync(join(C, 'operator', 'inbox', f1))).toBe(true);
 
-    const m2 = runCoord(
+    const m2 = runSt(
       [
         'message',
         'send',
@@ -100,7 +100,7 @@ d('walkthrough — Acts I–VIII', () => {
       ],
       {
         stRoot: C,
-        coordIdentity: 'operator',
+        stIdentity: 'operator',
         stdin:
           'drop it. nothing depends on it now and the compat shim adds complexity for no users.\n',
       }
@@ -108,9 +108,9 @@ d('walkthrough — Acts I–VIII', () => {
     expect(m2.exitCode).toBe(0);
     const f2 = m2.stdout.trim();
 
-    const arch1 = runCoord(['message', 'archive', 'operator', f1], {
+    const arch1 = runSt(['message', 'archive', 'operator', f1], {
       stRoot: C,
-      coordIdentity: 'operator',
+      stIdentity: 'operator',
     });
     expect(arch1.exitCode).toBe(0);
     expect(listArchive(C, 'operator')).toEqual([f1]);
@@ -125,7 +125,7 @@ d('walkthrough — Acts I–VIII', () => {
     // walkthrough doesn't show --in-reply-to, but to make Act VIII's
     // 5-message thread output true the chain has to be wired up. We thread
     // m3 onto m2 here.
-    const m3 = runCoord(
+    const m3 = runSt(
       [
         'message',
         'send',
@@ -135,13 +135,13 @@ d('walkthrough — Acts I–VIII', () => {
         '--subject',
         'FYI: dropping legacy session cookie path',
         '--tags',
-        'auth,coordination',
+        'auth,orchestration',
         '--in-reply-to',
         f2,
       ],
       {
         stRoot: A,
-        coordIdentity: 'alice',
+        stIdentity: 'alice',
         stdin:
           "operator greenlit dropping the legacy session cookie. you'll want to drop the matching server-side verifier so we don't ship a no-op middleware.\n",
       }
@@ -149,40 +149,40 @@ d('walkthrough — Acts I–VIII', () => {
     expect(m3.exitCode).toBe(0);
     const f3 = m3.stdout.trim();
 
-    const arch2 = runCoord(['message', 'archive', 'alice', f2], {
+    const arch2 = runSt(['message', 'archive', 'alice', f2], {
       stRoot: A,
-      coordIdentity: 'alice',
+      stIdentity: 'alice',
     });
     expect(arch2.exitCode).toBe(0);
 
     // ── Act V — bob is busy ────────────────────────────────────────────
-    const setStatus = runCoord(['status', '--set', 'busy'], {
+    const setStatus = runSt(['status', '--set', 'busy'], {
       stRoot: B,
-      coordIdentity: 'bob',
+      stIdentity: 'bob',
     });
     expect(setStatus.exitCode).toBe(0);
     expect(setStatus.stdout.trim()).toBe('status: busy');
 
     syncEveryone();
     // Alice + operator see bob's status as busy via their synced view.
-    const aliceSeesBob = runCoord(['status', 'bob'], {
+    const aliceSeesBob = runSt(['status', 'bob'], {
       stRoot: A,
-      coordIdentity: 'alice',
+      stIdentity: 'alice',
     });
     expect(aliceSeesBob.stdout.trim()).toBe('busy');
-    const operatorSeesBob = runCoord(['status', 'bob'], {
+    const operatorSeesBob = runSt(['status', 'bob'], {
       stRoot: C,
-      coordIdentity: 'operator',
+      stIdentity: 'operator',
     });
     expect(operatorSeesBob.stdout.trim()).toBe('busy');
 
     // ── Act VI — bob comes available, replies, CCs operator, archives ────
-    runCoord(['status', '--set', 'available'], {
+    runSt(['status', '--set', 'available'], {
       stRoot: B,
-      coordIdentity: 'bob',
+      stIdentity: 'bob',
     });
 
-    const m4 = runCoord(
+    const m4 = runSt(
       [
         'message',
         'send',
@@ -196,7 +196,7 @@ d('walkthrough — Acts I–VIII', () => {
       ],
       {
         stRoot: B,
-        coordIdentity: 'bob',
+        stIdentity: 'bob',
         stdin:
           'done. server-side session-token verifier removed in commit a7f3c21. all auth tests still green.\n',
       }
@@ -208,7 +208,7 @@ d('walkthrough — Acts I–VIII', () => {
     // so Act VIII's flat thread output reaches it from the original f1
     // seed. Walkthrough prose says "FYI alice and I" — that's a
     // continuation of the m3 chain.
-    const m5 = runCoord(
+    const m5 = runSt(
       [
         'message',
         'send',
@@ -224,7 +224,7 @@ d('walkthrough — Acts I–VIII', () => {
       ],
       {
         stRoot: B,
-        coordIdentity: 'bob',
+        stIdentity: 'bob',
         stdin:
           'FYI alice and I dropped the legacy session-cookie path on both ends. nothing breaks; tests green.\n',
       }
@@ -232,9 +232,9 @@ d('walkthrough — Acts I–VIII', () => {
     expect(m5.exitCode).toBe(0);
     const f5 = m5.stdout.trim();
 
-    const arch3 = runCoord(['message', 'archive', 'bob', f3], {
+    const arch3 = runSt(['message', 'archive', 'bob', f3], {
       stRoot: B,
-      coordIdentity: 'bob',
+      stIdentity: 'bob',
     });
     expect(arch3.exitCode).toBe(0);
 
@@ -243,14 +243,14 @@ d('walkthrough — Acts I–VIII', () => {
     syncEveryone(); // second pass to drain cross-machine zombies
 
     // Alice archives bob's reply (m4) on her machine.
-    runCoord(['message', 'archive', 'alice', f4], {
+    runSt(['message', 'archive', 'alice', f4], {
       stRoot: A,
-      coordIdentity: 'alice',
+      stIdentity: 'alice',
     });
     // Myobie archives bob's CC (m5) on his laptop.
-    runCoord(['message', 'archive', 'operator', f5], {
+    runSt(['message', 'archive', 'operator', f5], {
       stRoot: C,
-      coordIdentity: 'operator',
+      stIdentity: 'operator',
     });
     syncEveryone();
     syncEveryone();
@@ -277,9 +277,9 @@ d('walkthrough — Acts I–VIII', () => {
 
     // ── Act VIII — operator pulls the whole thread ───────────────────────
     // Seeded from the original question; flat default = chronological.
-    const thread = runCoord(['message', 'thread', 'operator', f1], {
+    const thread = runSt(['message', 'thread', 'operator', f1], {
       stRoot: C,
-      coordIdentity: 'operator',
+      stIdentity: 'operator',
     });
     expect(thread.exitCode).toBe(0);
     const lines = thread.stdout.trim().split('\n');
@@ -302,9 +302,9 @@ d('walkthrough — Acts I–VIII', () => {
     expect(lines[4]).toBe(`${f5}\tbob\tauth cleanup landed`);
 
     // --tree mode shows the same five messages, depth-indented.
-    const tree = runCoord(['message', 'thread', 'operator', f1, '--tree'], {
+    const tree = runSt(['message', 'thread', 'operator', f1, '--tree'], {
       stRoot: C,
-      coordIdentity: 'operator',
+      stIdentity: 'operator',
     });
     expect(tree.exitCode).toBe(0);
     expect(tree.stdout).toContain(f1); // root

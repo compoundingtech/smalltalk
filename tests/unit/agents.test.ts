@@ -1,4 +1,4 @@
-// tests/unit/members.test.ts — `coord members` enumeration verb.
+// tests/unit/members.test.ts — `st members` enumeration verb.
 
 import {
   mkdirSync,
@@ -22,8 +22,8 @@ let scratch: string;
 let stRoot: string;
 
 beforeEach(() => {
-  scratch = mkdtempSync(join(tmpdir(), 'coord-members-test-'));
-  stRoot = join(scratch, 'coord');
+  scratch = mkdtempSync(join(tmpdir(), 'st-members-test-'));
+  stRoot = join(scratch, 'smalltalk');
   mkdirSync(stRoot, { recursive: true });
 });
 afterEach(() => {

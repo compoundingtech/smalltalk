@@ -5,12 +5,9 @@ file-folder convention. The folder is the API: `<agent>/inbox/` and
 `<agent>/archive/`, plain markdown files with YAML frontmatter, plain
 `rsync` between machines.
 
-> **Note on the name.** The project was originally named `coord` and has
-> been renamed to `smalltalk` (long) / `st` (canonical short). The
-> `coord` CLI, MCP-tool, and env-var aliases have been removed — use
-> `st` or `smalltalk`. The npm package is still published as
-> `@myobie/coord` (package rename pending). See [Names](#names) for what
-> the rename left in place.
+> **Names.** The CLI is `st` (canonical short) or `smalltalk` (long); the
+> package is `@compoundingtech/smalltalk`. See [Names](#names) for the full
+> naming — agents, MCP tools, env vars, and the state directory.
 
 - **Convention:** [LAYOUT.md](LAYOUT.md) — the binding spec.
 - **Philosophy:** [IDEA.md](IDEA.md).
@@ -32,7 +29,7 @@ other folder under an agent — `archive/`, `status` — is single-writer,
 owned by that agent. Peers read but never write. This gives you
 several useful properties for free:
 
-- **Lock-free coordination.** Every new message is a new file with a
+- **Lock-free orchestration.** Every new message is a new file with a
   globally unique `<unix-ms>-<rand6>.md` name. No two writers ever
   contend for the same path, so there's nothing to lock and nothing to
   reconcile. The sender writes; sync moves the bytes; the recipient
@@ -78,29 +75,68 @@ Requires Node 22.6+ (for `node --experimental-strip-types`) and `rsync`
 on `$PATH`. `bin/st` (canonical) and `bin/smalltalk` (symlink) are small
 bash shims that exec Node against `src/cli.ts`.
 
+## Adopt smalltalk standalone
+
+smalltalk needs nothing but this repo, Node, and `rsync` — no services, no
+convoy. End to end for a Claude Code agent:
+
+**1. Install** — clone + `npm install` + put `bin/` on `$PATH` (see
+[Install](#install) above), so `st` resolves. Pick an agent name and export
+it: `export ST_AGENT=my-agent`.
+
+**2. Install the Claude Code hooks.** The hooks run the boot ritual on every
+session boundary, flush working state before a compaction, and surface
+API-error wedges. `st hooks path` *prints* the exact install config — it is
+read-only, it never edits your settings:
+
+```sh
+st hooks path          # human: the hook-scripts dir + the settings block to paste
+st hooks path --json   # machine-readable (what tools like convoy doctor consume)
+```
+
+Paste the printed `hooks` block into your agent repo's
+`.claude/settings.local.json` (create the file if absent). It wires three
+hooks — `SessionStart`, `PreCompact`, `StopFailure` — at absolute script
+paths. The scripts call `st` via `$ST_BIN`, so they work even when `st` is
+not on `$PATH`.
+
+**3. Boot ritual.** On session start the `SessionStart` hook sets your status
+`available` and surfaces your inbox. By hand it's:
+
+```sh
+st status "$ST_AGENT" --set available
+st message ls          # then read + archive each item
+```
+
+**4. Send / reply / archive** — the everyday loop:
+
+```sh
+st message send bob -m "hi bob" --subject hello
+st message ls
+st message read <filename>
+st message reply <filename> -m "got it"
+st message archive <filename>
+```
+
+That's the whole adoption. `st agents` shows who's around; `st sync` moves the
+folders between machines over `rsync`.
+
 ## Names
 
-The project's original name `coord` has been renamed to `smalltalk`
-(long) / `st` (canonical short). The `coord` aliases have been removed
-from the CLI, the MCP surface, and the env-var chain; what remains:
-
-- The CLI ships as `st` (canonical) and `smalltalk`. There is no longer
-  a `coord` binary.
-- The primary noun is **agent** (brief-009 item 3, replacing the older
+- The CLI ships as **`st`** (canonical short) and **`smalltalk`** (long).
+- The package is **`@compoundingtech/smalltalk`**.
+- The primary noun is **agent** (replacing the older
   *identity*). The deprecated alias still works — the `members` CLI verb
   dispatches to `agents`, and the SDK keeps `Identity` / `asIdentity` /
   `IdentityRequiredError` as `@deprecated` type aliases of `Agent` /
   `asAgent` / `AgentRequiredError`.
-- MCP tools are registered under the `st_` prefix (e.g. `st_msg_ls`);
-  the old `coord_<verb>` aliases have been removed.
+- MCP tools are registered under the `st_` prefix (e.g. `st_msg_ls`).
 - The MCP server announces itself as `st`.
 - Environment variables: the CLI honors `ST_AGENT` (preferred) →
-  `ST_IDENTITY` (deprecated, warns once per process). Same two-level
-  shape for `ST_ROOT`. The legacy `COORD_IDENTITY` / `COORD_ROOT` vars
-  are no longer honored.
-- The default state directory is `~/.local/state/smalltalk`. Set
-  `ST_ROOT` to override (e.g. to point at an existing
-  `~/.local/state/coord` tree).
+  `ST_IDENTITY` (deprecated, warns once per process); same two-level
+  shape for `ST_ROOT`.
+- The default state directory is `~/.local/state/smalltalk`; set
+  `ST_ROOT` to override.
 
 ### Plugin proxy
 
@@ -201,7 +237,7 @@ Embed smalltalk into a Node TUI, an Electron main process, or any
 host that wants to drive it without shelling out to `bin/st`:
 
 ```ts
-import { createSt, asAgent } from '@myobie/coord';
+import { createSt, asAgent } from '@compoundingtech/smalltalk';
 
 const st = createSt({
   root: '/Users/me/.local/state/smalltalk',
@@ -232,7 +268,7 @@ Protocol](https://modelcontextprotocol.io) stdio server. Tools are
 registered under the `st_` prefix: `st_msg_send`, `st_msg_ls`,
 `st_msg_read`, `st_msg_archive`, `st_msg_thread`, `st_agents` (with a
 deprecated `st_members` alias), and the `st_resource_*` family. (The
-old `coord_*` tool aliases were removed with the rest of the `coord`
+old `st_*` tool aliases were removed with the rest of the `smalltalk`
 surface.)
 
 The fast path to wire it into a repo is `st init` (described under
@@ -311,7 +347,7 @@ smalltalk plugs into three agent harnesses with reference scripts under
   `SessionStart` + `Stop` bash hooks that inject the inbox snapshot
   via `st message ls --json`, plus an `st ding` recipe for true push
   into a pty-wrapped Codex session.
-- **Pi** — [`examples/pi/coord.ts`](examples/pi/) is a single
+- **Pi** — [`examples/pi/smalltalk.ts`](examples/pi/) is a single
   TypeScript extension that auto-discovers from
   `~/.pi/agent/extensions/`, watches the inbox via the embeddable
   library, and registers the message verbs via `pi.registerTool()`
@@ -349,7 +385,7 @@ npm test                # full vitest run: unit + integration
 Unit tests exercise every module in `src/` against in-memory fixtures.
 Integration tests spawn the actual `bin/st` binary against real
 `$ST_ROOT` directories, real `rsync`, and real PTYs (via
-`@myobie/pty/testing`) — gated by rsync's presence on `$PATH`.
+`@compoundingtech/pty/testing`) — gated by rsync's presence on `$PATH`.
 
 ## Layout reference
 

@@ -22,8 +22,8 @@ let scratch: string;
 let stRoot: string;
 
 beforeEach(() => {
-  scratch = mkdtempSync(join(tmpdir(), 'coord-send-test-'));
-  stRoot = join(scratch, 'coord');
+  scratch = mkdtempSync(join(tmpdir(), 'st-send-test-'));
+  stRoot = join(scratch, 'smalltalk');
   mkdirSync(stRoot, { recursive: true });
 });
 afterEach(() => {

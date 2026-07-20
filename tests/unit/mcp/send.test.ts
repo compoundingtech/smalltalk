@@ -24,8 +24,8 @@ let client: Client;
 let handle: ReturnType<typeof createMcpServer>;
 
 beforeEach(async () => {
-  scratch = mkdtempSync(join(tmpdir(), 'coord-mcp-send-'));
-  stRoot = join(scratch, 'coord');
+  scratch = mkdtempSync(join(tmpdir(), 'st-mcp-send-'));
+  stRoot = join(scratch, 'smalltalk');
   mkdirSync(join(stRoot, 'alice', 'inbox'), { recursive: true });
   mkdirSync(join(stRoot, 'alice', 'archive'), { recursive: true });
   mkdirSync(join(stRoot, 'bob', 'inbox'), { recursive: true });
@@ -96,7 +96,7 @@ describe('st_msg_send — happy paths', () => {
       from: 'alice',
       subject: 're: hi',
       inReplyTo: '1714826789012-abcdef.md',
-      tags: ['auth', 'coordination'],
+      tags: ['auth', 'orchestration'],
       priority: 'high',
     });
     expect(r.isError).toBeUndefined();
@@ -108,11 +108,11 @@ describe('st_msg_send — happy paths', () => {
     expect(text).toContain('from: alice');
     expect(text).toContain('subject: "re: hi"');
     expect(text).toContain('in-reply-to: 1714826789012-abcdef.md');
-    expect(text).toContain('tags: [auth, coordination]');
+    expect(text).toContain('tags: [auth, orchestration]');
     expect(text).toContain('priority: high');
   });
 
-  it('default from is the Coord identity (alice)', async () => {
+  it('default from is the Smalltalk identity (alice)', async () => {
     const r = await call({ to: 'bob', body: 'msg' });
     const filename = r.structuredContent?.filename as string;
     const text = readFileSync(
@@ -223,7 +223,7 @@ describe('st_msg_send — typed error mapping', () => {
     expect(errorCode(r)).toBe('INVALID_FILENAME');
   });
 
-  it('every error response carries content + _meta["coord/error"] + isError', async () => {
+  it('every error response carries content + _meta["smalltalk/error"] + isError', async () => {
     const r = await call({ to: 'INVALID', body: 'm' });
     expect(r.isError).toBe(true);
     expect(r.content?.[0]?.text).toMatch(/^INVALID_IDENTITY:/);

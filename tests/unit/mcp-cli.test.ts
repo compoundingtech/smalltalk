@@ -1,6 +1,6 @@
 // tests/unit/mcp-cli.test.ts — env contract for `st mcp` CLI.
 //
-// The CLI's env handling diverged from every other coord verb until
+// The CLI's env handling diverged from every other smalltalk verb until
 // brief-021 unified it: ST_AGENT (or legacy ST_IDENTITY/ST_AGENT)
 // resolves identity; ST_ROOT/ST_ROOT defaults to
 // ~/.local/state/smalltalk via stRootFrom(). When no env identity
@@ -26,7 +26,7 @@ vi.mock('../../src/mcp/index.ts', () => ({
     createMcpServerSpy(opts);
     return {
       mcp: {},
-      coord: {},
+      smalltalk: {},
       async run() {
         /* no-op */
       },

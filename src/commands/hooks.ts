@@ -24,7 +24,7 @@ const FAMILIES: readonly HookFamily[] = ['claude-code', 'codex', 'pi'];
 const DEFAULT_FAMILY: HookFamily = 'claude-code';
 
 /**
- * Walk up from this module to the `@myobie/coord` package root and return it,
+ * Walk up from this module to the `@compoundingtech/smalltalk` package root and return it,
  * or null if not found. Mirrors {@link resolveStShimPath} in init.ts — robust
  * to symlinks + nesting depth, and never hardcodes a developer-machine path
  * (brief-026 boundary). Because `st` runs from its source checkout, the
@@ -37,7 +37,7 @@ function resolveRepoRoot(): string | null {
     if (existsSync(pkg)) {
       try {
         const parsed = JSON.parse(readFileSync(pkg, 'utf8')) as { name?: string };
-        if (parsed.name === '@myobie/coord') return dir;
+        if (parsed.name === '@compoundingtech/smalltalk') return dir;
       } catch {
         // unreadable/invalid package.json — keep walking up
       }
@@ -149,17 +149,17 @@ const SPECS: Record<HookFamily, FamilySpec> = {
   },
   pi: {
     hooksSubdir: join('examples', 'pi'),
-    scripts: [{ name: 'coord.ts', role: 'pi extension — registers the st verbs + push notifications' }],
-    settingsTarget: '~/.pi/agent/extensions/coord.ts (auto-discovered) or a settings.json "extensions" entry',
+    scripts: [{ name: 'smalltalk.ts', role: 'pi extension — registers the st verbs + push notifications' }],
+    settingsTarget: '~/.pi/agent/extensions/smalltalk.ts (auto-discovered) or a settings.json "extensions" entry',
     exampleConfigName: 'settings.example.json',
-    note: 'Pi auto-discovers ~/.pi/agent/extensions/*.ts. Symlink or copy coord.ts (in hooksDir) there, or reference it via the settings fragment at exampleConfig.',
+    note: 'Pi auto-discovers ~/.pi/agent/extensions/*.ts. Symlink or copy smalltalk.ts (in hooksDir) there, or reference it via the settings fragment at exampleConfig.',
   },
 };
 
 /** Build the {@link HooksInfo} for a family, or null if the repo root (hence
  *  the example scripts) can't be located. Pure read: stats files, no writes.
  *  `rootArg` overrides the resolved package root (used by tests); omit it in
- *  normal use to auto-locate the @myobie/coord install. */
+ *  normal use to auto-locate the @compoundingtech/smalltalk install. */
 export function resolveHooksInfo(
   family: HookFamily,
   rootArg?: string | null
@@ -264,7 +264,7 @@ export function cmdHooksCli(args: readonly string[], ctx: CliContext): number {
   const info = resolveHooksInfo(family);
   if (info === null) {
     ctx.stderr(
-      `${name} hooks: could not locate the st (@myobie/coord) install root from ${import.meta.url}\n`
+      `${name} hooks: could not locate the st (@compoundingtech/smalltalk) install root from ${import.meta.url}\n`
     );
     return 1;
   }

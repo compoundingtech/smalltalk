@@ -43,8 +43,8 @@ let handle: ReturnType<typeof createMcpServer>;
 let received: ChannelNotification[];
 
 beforeEach(async () => {
-  scratch = mkdtempSync(join(tmpdir(), 'coord-mcp-cwatch-'));
-  stRoot = join(scratch, 'coord');
+  scratch = mkdtempSync(join(tmpdir(), 'st-mcp-cwatch-'));
+  stRoot = join(scratch, 'smalltalk');
   for (const id of ['alice', 'bob']) {
     mkdirSync(join(stRoot, id, 'inbox'), { recursive: true });
     mkdirSync(join(stRoot, id, 'archive'), { recursive: true });
@@ -334,8 +334,8 @@ describe('channel-watcher — poll backstop (brief-020 HB-4)', () => {
   let backstopReceived: ChannelNotification[];
 
   beforeEach(async () => {
-    backstopScratch = mkdtempSync(join(tmpdir(), 'coord-mcp-cwatch-bs-'));
-    backstopRoot = join(backstopScratch, 'coord');
+    backstopScratch = mkdtempSync(join(tmpdir(), 'st-mcp-cwatch-bs-'));
+    backstopRoot = join(backstopScratch, 'smalltalk');
     for (const id of ['alice', 'bob']) {
       mkdirSync(join(backstopRoot, id, 'inbox'), { recursive: true });
       mkdirSync(join(backstopRoot, id, 'archive'), { recursive: true });
@@ -544,8 +544,8 @@ describe('channel-watcher — chokidar + backstop dedup (brief-020 HB-4)', () =>
   let dedupReceived: ChannelNotification[];
 
   beforeEach(async () => {
-    dedupScratch = mkdtempSync(join(tmpdir(), 'coord-mcp-cwatch-dd-'));
-    dedupRoot = join(dedupScratch, 'coord');
+    dedupScratch = mkdtempSync(join(tmpdir(), 'st-mcp-cwatch-dd-'));
+    dedupRoot = join(dedupScratch, 'smalltalk');
     for (const id of ['alice', 'bob']) {
       mkdirSync(join(dedupRoot, id, 'inbox'), { recursive: true });
       mkdirSync(join(dedupRoot, id, 'archive'), { recursive: true });
@@ -608,8 +608,8 @@ describe('channel-watcher — runWith lifecycle', () => {
   let stRoot2: string;
 
   beforeEach(() => {
-    scratch2 = mkdtempSync(join(tmpdir(), 'coord-mcp-rw-'));
-    stRoot2 = join(scratch2, 'coord');
+    scratch2 = mkdtempSync(join(tmpdir(), 'st-mcp-rw-'));
+    stRoot2 = join(scratch2, 'smalltalk');
     for (const id of ['alice', 'bob']) {
       mkdirSync(join(stRoot2, id, 'inbox'), { recursive: true });
       mkdirSync(join(stRoot2, id, 'archive'), { recursive: true });

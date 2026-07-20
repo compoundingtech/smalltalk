@@ -32,7 +32,7 @@ describe('package.json exports map', () => {
   });
 
   it('keeps the canonical name', () => {
-    expect(pkg.name).toBe('@myobie/coord');
+    expect(pkg.name).toBe('@compoundingtech/smalltalk');
   });
 
   it('main + types both point at the .ts entry (no build step required)', () => {
@@ -56,7 +56,7 @@ describe('package.json exports map', () => {
     expect(pkg.exports['./types']?.default).toBe('./src/types.ts');
   });
 
-  it('declares only the `st` + `smalltalk` binaries (post-coord-cutover)', () => {
+  it('declares only the `st` + `smalltalk` binaries (post-st-cutover)', () => {
     expect(pkg.bin).toEqual({
       st: './bin/st',
       smalltalk: './bin/smalltalk',
@@ -163,10 +163,10 @@ describe('round-trip smoke — embedder usage', () => {
     // is exercised in lib.test.ts and library-embedding.test.ts.
     const id = index.asIdentity('alice');
     const handle = index.createSt({
-      root: '/tmp/coord-export-test-not-touched',
+      root: '/tmp/st-export-test-not-touched',
       identity: id,
     });
-    expect(handle.root).toBe('/tmp/coord-export-test-not-touched');
+    expect(handle.root).toBe('/tmp/st-export-test-not-touched');
     expect(handle.identity).toBe('alice');
     expect(typeof handle.send).toBe('function');
     expect(typeof handle.watch).toBe('function');

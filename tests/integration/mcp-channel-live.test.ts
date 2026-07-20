@@ -1,21 +1,21 @@
 // tests/integration/mcp-channel-live.test.ts — end-to-end channel demo.
 //
 // Spawns a real Claude Code session pointed at `st mcp --channel`,
-// drops a coord message into the agent's inbox, and waits for the
+// drops a st message into the agent's inbox, and waits for the
 // agent to call `st_msg_reply` so a reply file lands in the sender's
 // inbox.
 //
-// Skip-gated by `COORD_RUN_LIVE_CLAUDE=1`. CI without Claude Code on
+// Skip-gated by `ST_RUN_LIVE_CLAUDE=1`. CI without Claude Code on
 // `$PATH` (or without the `--dangerously-load-development-channels`
 // flag) does not run this. The shape proof is what matters; we are
 // not running this test on every commit.
 //
 // To run locally:
-//   COORD_RUN_LIVE_CLAUDE=1 npx vitest run tests/integration/mcp-channel-live.test.ts
+//   ST_RUN_LIVE_CLAUDE=1 npx vitest run tests/integration/mcp-channel-live.test.ts
 //
 // Requires:
 //   - `claude` on $PATH
-//   - the build of this repo at bin/coord (the test points the channel
+//   - the build of this repo at bin/smalltalk (the test points the channel
 //     server at it)
 
 import {
@@ -32,11 +32,11 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
-import { Session } from '@myobie/pty/testing';
+import { Session } from '@compoundingtech/pty/testing';
 
-import { COORD_BIN } from './helpers.ts';
+import { ST_BIN } from './helpers.ts';
 
-const LIVE = process.env.COORD_RUN_LIVE_CLAUDE === '1';
+const LIVE = process.env.ST_RUN_LIVE_CLAUDE === '1';
 
 let scratch: string;
 let stRoot: string;
@@ -83,8 +83,8 @@ beforeEach(() => {
   ptySessionDir = process.env.PTY_SESSION_DIR;
   mkdirSync(ptySessionDir, { recursive: true });
 
-  scratch = mkdtempSync(join(tmpdir(), 'coord-it-channel-'));
-  stRoot = join(scratch, 'coord');
+  scratch = mkdtempSync(join(tmpdir(), 'st-it-channel-'));
+  stRoot = join(scratch, 'smalltalk');
   for (const id of ['alice', 'bob']) {
     mkdirSync(join(stRoot, id, 'inbox'), { recursive: true });
     mkdirSync(join(stRoot, id, 'archive'), { recursive: true });
@@ -97,7 +97,7 @@ beforeEach(() => {
   //   - whatever feature gate turns channels on (build channel, beta
   //     flags, etc.) is already set on the developer's account.
   // Per-test isolation comes from --mcp-config + --strict-mcp-config
-  // (only our coord server is registered) plus a snapshot+restore of
+  // (only our smalltalk server is registered) plus a snapshot+restore of
   // ~/.claude.json around the run so the developer's normal Claude
   // state isn't mutated.
   homeDir = process.env.HOME;
@@ -146,11 +146,11 @@ beforeEach(() => {
   // Build the inline MCP config string passed via --mcp-config. This
   // bypasses ~/.claude.json's mcpServers entirely (--strict-mcp-config
   // means "only these servers"). The ST_ROOT/ST_AGENT env
-  // is passed to the coord subprocess via the env array.
+  // is passed to the smalltalk subprocess via the env array.
   mcpConfigJson = JSON.stringify({
     mcpServers: {
-      coord: {
-        command: COORD_BIN,
+      smalltalk: {
+        command: ST_BIN,
         args: ['mcp', '--channel'],
         env: {
           ST_ROOT: stRoot,
@@ -189,7 +189,7 @@ afterEach(() => {
 });
 
 /**
- * Parse a coord-style markdown file's frontmatter + body. Returns the
+ * Parse a st-style markdown file's frontmatter + body. Returns the
  * raw frontmatter text (between the `---` fences) and the body after.
  * Returns null when the file isn't a valid frontmatter document.
  */
@@ -237,7 +237,7 @@ describe.skipIf(!LIVE)('mcp channel — live Claude Code agent', () => {
     'agent receives the channel notification and replies via st_msg_reply',
     async () => {
       // Spawn an interactive Claude Code session in a PTY. The
-      // --dangerously-load-development-channels flag turns the coord
+      // --dangerously-load-development-channels flag turns the smalltalk
       // MCP server into a push channel for this session.
       session = Session.spawn(
         'claude',
@@ -246,7 +246,7 @@ describe.skipIf(!LIVE)('mcp channel — live Claude Code agent', () => {
           '--mcp-config',
           mcpConfigJson,
           '--dangerously-load-development-channels',
-          'server:coord',
+          'server:smalltalk',
           '--dangerously-skip-permissions',
         ],
         {
@@ -256,7 +256,7 @@ describe.skipIf(!LIVE)('mcp channel — live Claude Code agent', () => {
             PATH: process.env.PATH ?? '',
             PTY_SESSION_DIR: ptySessionDir,
             // Session.spawn merges opts.env on top of process.env, so
-            // any COORD_/ST_ vars set on the runner leak into the
+            // any ST_/ST_ vars set on the runner leak into the
             // spawned agent's shell. If the agent then shells out to
             // `st message ls`, it reads the runner's real inbox
             // tree instead of the test scratch. Explicitly rebind to
@@ -279,7 +279,7 @@ describe.skipIf(!LIVE)('mcp channel — live Claude Code agent', () => {
       );
       session.press('return');
       // Post-boot settle. Older Claude Code builds surfaced a
-      // "Listening for channel messages from: server:coord" banner we
+      // "Listening for channel messages from: server:smalltalk" banner we
       // could wait on; recent versions (v2.1.x observed 2026-07) don't
       // print it, so the boot marker is unreliable. We just sleep long
       // enough for the MCP handshake + channel-watcher subscribe to
@@ -304,7 +304,7 @@ describe.skipIf(!LIVE)('mcp channel — live Claude Code agent', () => {
       // user input. Nudge the agent with a tiny user prompt so the
       // channel-delivered content participates in the next turn.
       await new Promise((r) => setTimeout(r, 1500));
-      session.type('check your coord channel and respond');
+      session.type('check your smalltalk channel and respond');
       session.press('return');
 
       // Wait for a file to land in alice/inbox/ that is (a) different
@@ -343,7 +343,7 @@ describe.skipIf(!LIVE)('mcp channel — live Claude Code agent', () => {
     240_000
   );
 
-  // brief-020 (HB-4) — the acceptance criterion. A coord message to
+  // brief-020 (HB-4) — the acceptance criterion. A st message to
   // an IDLE agent (no user keystrokes) reliably surfaces and gets
   // processed. If this passes, the channel-watcher's polling backstop
   // + Claude Code's channel notification handling together deliver
@@ -362,7 +362,7 @@ describe.skipIf(!LIVE)('mcp channel — live Claude Code agent', () => {
           '--mcp-config',
           mcpConfigJson,
           '--dangerously-load-development-channels',
-          'server:coord',
+          'server:smalltalk',
           '--dangerously-skip-permissions',
         ],
         {

@@ -23,8 +23,8 @@ let scratch: string;
 let stRoot: string;
 
 beforeEach(() => {
-  scratch = mkdtempSync(join(tmpdir(), 'coord-status-staleness-'));
-  stRoot = join(scratch, 'coord');
+  scratch = mkdtempSync(join(tmpdir(), 'st-status-staleness-'));
+  stRoot = join(scratch, 'smalltalk');
   mkdirSync(join(stRoot, 'alice'), { recursive: true });
 });
 

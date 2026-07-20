@@ -7,14 +7,14 @@ node_modules/
 dist/
 .vitest-cache/
 
-# .mcp.json is per-machine: it points command at the local bin/coord
-# path, which differs from machine to machine. Use `coord init` to
+# .mcp.json is per-machine: it points command at the local bin/smalltalk
+# path, which differs from machine to machine. Use `st init` to
 # generate one for a new checkout.
 .mcp.json
 
 # Development-time artifacts kept on disk for the author's reference
 # but not part of the public repo:
-#   - briefs: agent-to-agent work orders (pty-claude → coord-claude).
+#   - briefs: agent-to-agent work orders (pty-claude → st-claude).
 #     The commit messages already summarize what each brief produced.
 #   - dx-review-*: point-in-time DX walkthroughs.
 #   - switchover.md, agent-onboarding.md: personal runbooks naming
@@ -24,5 +24,5 @@ notes/dx-review-*.md
 notes/switchover.md
 notes/agent-onboarding.md
 # Nathan's rule: execution over planning-docs-in-PRs. Local working
-# reference for the coord→st cutover — never committed.
+# reference for the smalltalk→st cutover — never committed.
 notes/rename-cutover.md

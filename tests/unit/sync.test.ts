@@ -29,8 +29,8 @@ let stRoot: string;
 let stConfig: string;
 
 beforeEach(() => {
-  scratch = mkdtempSync(join(tmpdir(), 'coord-sync-test-'));
-  stRoot = join(scratch, 'coord');
+  scratch = mkdtempSync(join(tmpdir(), 'st-sync-test-'));
+  stRoot = join(scratch, 'smalltalk');
   stConfig = join(scratch, 'config');
   mkdirSync(stRoot, { recursive: true });
   mkdirSync(stConfig, { recursive: true });
@@ -71,10 +71,10 @@ function setupIdentity(id: string): void {
 describe('parsePeersYaml', () => {
   it('parses simple key: value lines', () => {
     expect(
-      parsePeersYaml('bobby: bob.example.com\nlaptop: laptop.example.com:/srv/coord\n')
+      parsePeersYaml('bobby: bob.example.com\nlaptop: laptop.example.com:/srv/smalltalk\n')
     ).toEqual([
       { name: 'bobby', spec: 'bob.example.com' },
-      { name: 'laptop', spec: 'laptop.example.com:/srv/coord' },
+      { name: 'laptop', spec: 'laptop.example.com:/srv/smalltalk' },
     ]);
   });
 
@@ -139,8 +139,8 @@ describe('resolvePeer', () => {
   });
 
   it('host:path → "host:path/"', () => {
-    expect(resolvePeer('bob.example.com:/srv/coord', ctx())).toBe(
-      'bob.example.com:/srv/coord/'
+    expect(resolvePeer('bob.example.com:/srv/smalltalk', ctx())).toBe(
+      'bob.example.com:/srv/smalltalk/'
     );
   });
 
@@ -153,10 +153,10 @@ describe('resolvePeer', () => {
   it('bare token resolves via peers.yaml alias', () => {
     writeFileSync(
       join(stConfig, 'peers.yaml'),
-      'bobby: bob.example.com:/srv/coord\n'
+      'bobby: bob.example.com:/srv/smalltalk\n'
     );
     expect(resolvePeer('bobby', ctx())).toBe(
-      'bob.example.com:/srv/coord/'
+      'bob.example.com:/srv/smalltalk/'
     );
   });
 

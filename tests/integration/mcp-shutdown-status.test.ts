@@ -21,14 +21,14 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = resolve(HERE, '..', '..');
-const COORD_BIN = join(REPO_ROOT, 'bin', 'st');
+const ST_BIN = join(REPO_ROOT, 'bin', 'st');
 
 let scratch: string;
 let stRoot: string;
 
 beforeEach(() => {
-  scratch = mkdtempSync('/tmp/coord-mcp-shutdown-');
-  stRoot = join(scratch, 'coord');
+  scratch = mkdtempSync('/tmp/st-mcp-shutdown-');
+  stRoot = join(scratch, 'smalltalk');
   mkdirSync(join(stRoot, 'alice'), { recursive: true });
 });
 
@@ -40,7 +40,7 @@ async function bootAndSignal(signal: 'SIGTERM' | 'SIGINT'): Promise<string> {
   // Pre-seed status: this is what peers see right now.
   writeFileSync(join(stRoot, 'alice', 'status'), 'available\n');
 
-  const proc = spawn(COORD_BIN, ['mcp'], {
+  const proc = spawn(ST_BIN, ['mcp'], {
     env: {
       ...process.env,
       ST_ROOT: stRoot,
@@ -74,7 +74,7 @@ async function bootAndSignal(signal: 'SIGTERM' | 'SIGINT'): Promise<string> {
   return readFileSync(statusFile, 'utf8').trim();
 }
 
-describe('coord mcp — shutdown writes `offline` to status', () => {
+describe('st mcp — shutdown writes `offline` to status', () => {
   it('SIGTERM flips status from `available` to `offline`', async () => {
     const finalStatus = await bootAndSignal('SIGTERM');
     expect(finalStatus).toBe('offline');

@@ -6,7 +6,7 @@ status: living doc — update as the surface evolves
 
 # Onboarding a new participant
 
-Smalltalk is a coordination bus for humans and agents — the
+Smalltalk is a orchestration bus for humans and agents — the
 filesystem is the API, `st` is the CLI. This guide brings you up on
 the recommended path: install the CLI, launch your Chief of Staff
 (CoS), and let it drive the rest of the setup.
@@ -17,8 +17,8 @@ below. That's the right entry point if you're building tooling on
 top of smalltalk rather than being a first-time human user.
 
 > **Naming.** `st` is canonical; `smalltalk` is the long form (same
-> binary). The old `coord` CLI alias has been **removed** — older
-> guides and code samples that say `coord` no longer work; use `st`.
+> binary). The old `smalltalk` CLI alias has been **removed** — older
+> guides and code samples that say `smalltalk` no longer work; use `st`.
 > See `st help` for the surface.
 
 ## Prerequisites
@@ -33,7 +33,7 @@ top of smalltalk rather than being a first-time human user.
 
 ## 1. Install
 
-Smalltalk depends on `@myobie/pty` via a `file:` link, and the CoS
+Smalltalk depends on `@compoundingtech/pty` via a `file:` link, and the CoS
 bootstrap (step 2) needs the `personas` repo checked out for its
 `--persona` argument. Clone all three side-by-side:
 
@@ -263,9 +263,9 @@ The very first time a CoS boots on a machine (nothing under
 - **Repos** — which projects the CoS is aware of; where they live
   on disk.
 - **Priorities** — what you're working on right now.
-- **Team** — who else you coordinate with (peer humans, other
+- **Team** — who else you orchestrate with (peer humans, other
   agents).
-- **Channels** — how you like to be reached (coord messages,
+- **Channels** — how you like to be reached (smalltalk messages,
   system notifications, terminal drop-ins).
 
 The CoS writes the answers into your private cos repo — `context/now.md`
@@ -300,7 +300,7 @@ of the personas repo instead of re-fetching.
 
 Once first-run finishes, you talk to your CoS. It manages its own
 status, drains its inbox, receives messages from peer agents you
-launch later, and coordinates work back to you. Cross-tree
+launch later, and orchestrates work back to you. Cross-tree
 supervision is via `st watch --all` in a second terminal if you
 want the raw event stream.
 
@@ -335,7 +335,7 @@ periods, 1–32 chars). Conventional shapes:
 - An agent scoped to one repo: `<repo>-claude` (Claude Code) or
   `<repo>-codex` (Codex). See [repo-ownership.md](repo-ownership.md)
   for the why.
-- A cross-cutting coordinator: a bare descriptive name (`cos`,
+- A cross-cutting orchestrator: a bare descriptive name (`cos`,
   `oncall`).
 
 Reserved words are rejected: `inbox`, `archive`, `status`, `name`,

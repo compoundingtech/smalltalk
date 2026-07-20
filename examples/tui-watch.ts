@@ -2,14 +2,14 @@
 //
 // Run with: npm run example:tui-watch
 //
-// Picks COORD_ROOT and COORD_IDENTITY out of the environment, watches the
+// Picks ST_ROOT and ST_IDENTITY out of the environment, watches the
 // caller's own inbox, and renders newly-arriving filenames as they come
 // in. Press `a` to archive the most recently received message; press `q`
 // (or Ctrl+C) to quit.
 //
 // To watch every peer's inbox instead (suppressing the caller's own
 // folder — the brief-005 cross-tree mode), pass `undefined` to
-// `coord.watch()` below. Note: archive on a peer's tree is unusual but
+// `smalltalk.watch()` below. Note: archive on a peer's tree is unusual but
 // technically valid (every machine has every tree via sync).
 //
 // Designed to surface DX issues with the embeddable API. If anything
@@ -24,17 +24,17 @@ import {
   IdentityNotHostedError,
 } from '../src/index.ts';
 
-const root = process.env.COORD_ROOT;
-const identityRaw = process.env.COORD_IDENTITY;
+const root = process.env.ST_ROOT;
+const identityRaw = process.env.ST_IDENTITY;
 if (!root || !identityRaw) {
   process.stderr.write(
-    'usage: COORD_ROOT=<path> COORD_IDENTITY=<id> npm run example:tui-watch\n'
+    'usage: ST_ROOT=<path> ST_IDENTITY=<id> npm run example:tui-watch\n'
   );
   process.exit(2);
 }
 
 const me: Identity = asIdentity(identityRaw);
-const coord = createSt({ root, identity: me });
+const smalltalk = createSt({ root, identity: me });
 
 const ac = new AbortController();
 let mostRecent:
@@ -68,7 +68,7 @@ if (process.stdin.isTTY) {
         return;
       }
       try {
-        await coord.archive(mostRecent.identity, mostRecent.filename);
+        await smalltalk.archive(mostRecent.identity, mostRecent.filename);
         render(
           `  archived: ${mostRecent.identity}/${mostRecent.filename}`
         );
@@ -88,7 +88,7 @@ render(`watching ${me}/inbox — press 'a' to archive most recent, 'q' to quit`)
 try {
   // Per-identity watch on the caller's own inbox: the messages here are
   // ones bob/myobie/etc. sent to ME, so "archive most recent" applies.
-  for await (const ev of coord.watch(me, {
+  for await (const ev of smalltalk.watch(me, {
     withSubject: true,
     intervalMs: 250,
     signal: ac.signal,
@@ -99,7 +99,7 @@ try {
   }
 } catch (err) {
   if (err instanceof IdentityNotHostedError) {
-    process.stderr.write(`coord: ${err.message}\n`);
+    process.stderr.write(`smalltalk: ${err.message}\n`);
     shutdown(1);
   }
   throw err;

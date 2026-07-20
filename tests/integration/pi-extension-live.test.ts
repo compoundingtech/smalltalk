@@ -1,21 +1,21 @@
 // tests/integration/pi-extension-live.test.ts — end-to-end pi
 // extension demo. Spawns a real pi-coding-agent session pointed at
-// examples/pi/coord.ts (auto-loaded from a per-test ~/.pi/agent/),
-// drops a coord message into the agent's inbox, and waits for the
+// examples/pi/smalltalk.ts (auto-loaded from a per-test ~/.pi/agent/),
+// drops a st message into the agent's inbox, and waits for the
 // agent to call `st_msg_reply` so a reply file lands in the sender's
 // inbox.
 //
-// Skip-gated by `COORD_RUN_LIVE_PI=1`. CI without `pi` on $PATH or
-// without the @myobie/coord package resolvable from the per-test
+// Skip-gated by `ST_RUN_LIVE_PI=1`. CI without `pi` on $PATH or
+// without the @compoundingtech/smalltalk package resolvable from the per-test
 // extensions dir does not run this. The shape proof is what matters;
 // we are not running this on every commit.
 //
 // Manual run:
-//   COORD_RUN_LIVE_PI=1 npx vitest run tests/integration/pi-extension-live.test.ts
+//   ST_RUN_LIVE_PI=1 npx vitest run tests/integration/pi-extension-live.test.ts
 //
 // Requires:
 //   - `pi` on $PATH (`npm install -g @mariozechner/pi-coding-agent` works).
-//   - The repo's bin/coord on $PATH so the extension can resolve coord.
+//   - The repo's bin/smalltalk on $PATH so the extension can resolve smalltalk.
 //   - Network reachable for pi's first-run model registration if the host
 //     hasn't run pi before in this $HOME.
 //
@@ -25,7 +25,7 @@
 // `pi -ne -e <scratch-path>` so the developer's real
 // ~/.pi/agent/extensions/ is untouched. The extension's bare imports
 // resolve via a hand-crafted node_modules tree under <scratch> with
-// symlinks to the repo root (which IS the @myobie/coord package).
+// symlinks to the repo root (which IS the @compoundingtech/smalltalk package).
 
 import {
   copyFileSync,
@@ -43,14 +43,14 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
-import { Session } from '@myobie/pty/testing';
+import { Session } from '@compoundingtech/pty/testing';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = resolve(HERE, '..', '..');
-const COORD_BIN_DIR = join(REPO_ROOT, 'bin');
-const EXTENSION_SRC = join(REPO_ROOT, 'examples', 'pi', 'coord.ts');
+const ST_BIN_DIR = join(REPO_ROOT, 'bin');
+const EXTENSION_SRC = join(REPO_ROOT, 'examples', 'pi', 'smalltalk.ts');
 
-const LIVE = process.env.COORD_RUN_LIVE_PI === '1';
+const LIVE = process.env.ST_RUN_LIVE_PI === '1';
 
 let scratch: string;
 let stRoot: string;
@@ -86,8 +86,8 @@ beforeEach(() => {
     mkdtempSync(join(tmpdir(), 'p-'));
   mkdirSync(ptySessionDir, { recursive: true });
 
-  scratch = mkdtempSync(join(tmpdir(), 'coord-pi-it-'));
-  stRoot = join(scratch, 'coord');
+  scratch = mkdtempSync(join(tmpdir(), 'st-pi-it-'));
+  stRoot = join(scratch, 'smalltalk');
   for (const id of ['alice', 'bob']) {
     mkdirSync(join(stRoot, id, 'inbox'), { recursive: true });
     mkdirSync(join(stRoot, id, 'archive'), { recursive: true });
@@ -100,11 +100,11 @@ beforeEach(() => {
   // both of which only work in the developer's actual home.
   extDir = join(scratch, 'extensions');
   mkdirSync(extDir, { recursive: true });
-  copyFileSync(EXTENSION_SRC, join(extDir, 'coord.ts'));
+  copyFileSync(EXTENSION_SRC, join(extDir, 'smalltalk.ts'));
 
   // package.json + node_modules tree so pi's jiti loader can resolve
-  // the extension's bare imports. @myobie/coord points at the repo
-  // root (this IS the coord package); typebox is the only other
+  // the extension's bare imports. @compoundingtech/smalltalk points at the repo
+  // root (this IS the smalltalk package); typebox is the only other
   // runtime dep; @mariozechner/* is type-only but we symlink the
   // whole namespace as cheap insurance against jiti's transform
   // refusing to strip eagerly.
@@ -118,13 +118,13 @@ beforeEach(() => {
     JSON.stringify({
       private: true,
       type: 'module',
-      dependencies: { '@myobie/coord': 'file:' + REPO_ROOT },
+      dependencies: { '@compoundingtech/smalltalk': 'file:' + REPO_ROOT },
     })
   );
   const nm = join(extDir, 'node_modules');
   mkdirSync(join(nm, '@operator'), { recursive: true });
   mkdirSync(join(nm, '@mariozechner'), { recursive: true });
-  symlinkSync(REPO_ROOT, join(nm, '@operator', 'coord'));
+  symlinkSync(REPO_ROOT, join(nm, '@operator', 'smalltalk'));
   symlinkSync(
     join(REPO_ROOT, 'node_modules', 'typebox'),
     join(nm, 'typebox')
@@ -205,9 +205,9 @@ async function pollForReply(
 
 describe.skipIf(!LIVE)('pi extension — live agent end-to-end', () => {
   it(
-    'agent is notified of new coord arrivals and can call st_msg_reply',
+    'agent is notified of new smalltalk arrivals and can call st_msg_reply',
     async () => {
-      const path = `${COORD_BIN_DIR}:${process.env.PATH ?? ''}`;
+      const path = `${ST_BIN_DIR}:${process.env.PATH ?? ''}`;
       // Pass through whichever provider API key the developer has set.
       // pi can ALSO use keychain-based OAuth — that works because we
       // use the real $HOME below (auth files / keychain ACLs are tied
@@ -228,7 +228,7 @@ describe.skipIf(!LIVE)('pi extension — live agent end-to-end', () => {
       // is untouched.
       session = Session.spawn(
         'pi',
-        ['-ne', '-e', join(extDir, 'coord.ts')],
+        ['-ne', '-e', join(extDir, 'smalltalk.ts')],
         {
           env: {
             HOME: process.env.HOME!,
@@ -242,7 +242,7 @@ describe.skipIf(!LIVE)('pi extension — live agent end-to-end', () => {
       );
       // The extension's session_start notify text is the most reliable
       // "watcher is up" marker.
-      await session.waitForText('coord: watching bob/inbox/', 30_000);
+      await session.waitForText('smalltalk: watching bob/inbox/', 30_000);
 
       // Drop a question into bob's inbox from alice. The seed prompts
       // the agent to call `st_msg_send` with `inReplyTo` rather than
@@ -257,13 +257,13 @@ describe.skipIf(!LIVE)('pi extension — live agent end-to-end', () => {
           `inReplyTo=${original}, and your answer as the body.\n`
       );
 
-      // The extension fires `coord: new in bob/inbox` on each arrival
+      // The extension fires `smalltalk: new in bob/inbox` on each arrival
       // before injecting via pi.sendUserMessage; missing the toast is
       // fine (some pi UI modes route notify() to a transient surface
       // we may not capture), but waiting for it speeds up the happy
       // path.
       await session.waitForText(
-        'coord: new in bob/inbox',
+        'smalltalk: new in bob/inbox',
         15_000
       ).catch(() => {
         // best-effort marker

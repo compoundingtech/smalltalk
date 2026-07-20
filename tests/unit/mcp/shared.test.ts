@@ -28,8 +28,8 @@ let client: Client;
 let handle: ReturnType<typeof createMcpServer>;
 
 beforeEach(async () => {
-  scratch = mkdtempSync(join(tmpdir(), 'coord-mcp-shared-'));
-  stRoot = join(scratch, 'coord');
+  scratch = mkdtempSync(join(tmpdir(), 'st-mcp-shared-'));
+  stRoot = join(scratch, 'smalltalk');
   for (const id of ['alice', 'bob']) {
     mkdirSync(join(stRoot, id, 'inbox'), { recursive: true });
     mkdirSync(join(stRoot, id, 'archive'), { recursive: true });
@@ -225,7 +225,7 @@ describe('shared — identity plumbing', () => {
 // ─── Error response shape regression ──────────────────────────────────
 
 describe('shared — error response shape', () => {
-  it('every StError surfaces with isError + content[0].text + _meta["coord/error"]', async () => {
+  it('every StError surfaces with isError + content[0].text + _meta["smalltalk/error"]', async () => {
     // Trigger one of each error class via different tools.
     const r1 = await call('st_msg_send', { to: 'INVALID', body: 'm' });
     expect(r1.isError).toBe(true);

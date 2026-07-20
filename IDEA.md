@@ -1,6 +1,6 @@
 # smalltalk — IDEA
 
-> The project's legacy name `coord` still appears in some historical
+> The project's legacy name `smalltalk` still appears in some historical
 > references below (the directing-agent identity, the implementing-agent
 > identity); those are kept verbatim because they describe how the work
 > got done. The product itself is now **smalltalk**.
@@ -13,13 +13,13 @@
 
 ## What we're trying to do
 
-A file-folder convention for asynchronous coordination between agents and
+A file-folder convention for asynchronous orchestration between agents and
 humans, designed to be small, durable, and **machine-syncable** so it can
 scale across devices without anyone running a service. Producers write,
 consumers read at their own pace. The folder is the API.
 
 The motivating use case: when several AI agents and one human are
-collaborating on related work across multiple projects, today they coordinate
+collaborating on related work across multiple projects, today they orchestrate
 by interrupting each other (one agent calls into another's terminal
 mid-task). That's noisy and lossy. We want a queue-shaped alternative where
 senders drop messages and recipients drain at their own rate, including
@@ -39,7 +39,7 @@ this repo. Lesson learned. From here on:
    built minimally and iterated based on real DX testing.
 3. The directing-agent (in the `pty` repo) drives DX testing in `/tmp` after
    each round and surfaces what's broken or awkward.
-4. smalltalk-claude (formerly `coord-claude`, the implementing agent
+4. smalltalk-claude (formerly `st-claude`, the implementing agent
    here) takes those findings and ships the smallest fix that
    addresses them.
 5. No big PLAN.md. No big README written as a third-party spec. Those are

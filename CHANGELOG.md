@@ -1,6 +1,6 @@
 # Changelog
 
-All notable changes to `@myobie/coord` (renaming → `@myobie/smalltalk`) are
+All notable changes to `@compoundingtech/smalltalk` (renaming → `@compoundingtech/smalltalk`) are
 recorded here. The project is pre-1.0; expect breaking changes in
 minor releases until 1.0.
 
@@ -72,7 +72,7 @@ Purely additive / back-compat: an agent still running older
 bus-instructions parses `<subject> (from <sender>)` unchanged; the
 `[id:…]` is extra.
 
-### Fixed (coord-kill piece (k) — `st ding` mkdir -p missing agent folder at startup)
+### Fixed (st-kill piece (k) — `st ding` mkdir -p missing agent folder at startup)
 
 Pinned by evals + cos (piece (j)'s debug logs surfaced it,
 before I could even ship them): `st ding` was DYING at startup
@@ -127,17 +127,17 @@ startup race, which is the one convoy hits).
 Full suite: 1394 pass (2 new tests), 3 pre-existing integration
 skipped. Pre-push name-hygiene grep: clean.
 
-Held on `feat/kill-coord-entirely` until the reboot signal.
+Held on `feat/kill-st-entirely` until the reboot signal.
 LIVE via the npm link. Evals re-runs the capstone the moment
 this commit lands.
 
-Coordination note: convoy is also adding bus-folder-creation
+Orchestration note: convoy is also adding bus-folder-creation
 to its native-launch wiring as the architectural root — this
 smalltalk-side `mkdir -p` is the defense-in-depth belt so the
 ding doesn't die on ANY future ordering bug from ANY launcher
 (convoy, hand-launch, alternate harnesses).
 
-### Added (coord-kill piece (j) — `ST_DING_DEBUG=1` diagnostic mode)
+### Added (st-kill piece (j) — `ST_DING_DEBUG=1` diagnostic mode)
 
 Piece (i)'s 90s quiet-window did not close the capstone: the
 with-kill capstone re-run still parked the worker for the full
@@ -183,13 +183,13 @@ Test coverage:
 Full suite: 1392 pass (3 new tests), 3 pre-existing integration
 skipped. Pre-push name-hygiene grep: clean.
 
-Held on `feat/kill-coord-entirely` until the reboot signal. LIVE
+Held on `feat/kill-st-entirely` until the reboot signal. LIVE
 via the npm link. Evals will re-run the capstone with
 `ST_DING_DEBUG=1` on both `cap-*-ding` sessions and capture the
 per-filename delivery + rescan trace across the respawn window —
 that's the last mile to pinning the mechanism + owner.
 
-### Changed (coord-kill piece (i) — capstone 6/0 last-tuning: rescanQuietAfterDeliveryMs 5min → 90s, env-overridable)
+### Changed (st-kill piece (i) — capstone 6/0 last-tuning: rescanQuietAfterDeliveryMs 5min → 90s, env-overridable)
 
 Piece (h) covered the **never-delivered** case (down-window backlog,
 re-poked in 60s). Evals traced a real remaining stall: the
@@ -227,12 +227,12 @@ Full suite: 1389 pass (2 new tests + the default-value change),
 3 pre-existing integration skipped. Pre-push name-hygiene grep:
 clean.
 
-Held on `feat/kill-coord-entirely` until the reboot signal. LIVE
+Held on `feat/kill-st-entirely` until the reboot signal. LIVE
 via the npm link (installed `st` = the held-branch working tree)
 so evals re-run against it immediately. Last tuning before
 capstone 6/0.
 
-### Added (coord-kill piece (h) — reboot self-healing: periodic backlog re-scan in `st ding`)
+### Added (st-kill piece (h) — reboot self-healing: periodic backlog re-scan in `st ding`)
 
 Ding now periodically re-scans the inbox and re-pokes for files
 that are unarchived AND not-recently-delivered. Covers the
@@ -311,10 +311,10 @@ Split decision with convoy-claude:
 Full suite: 1387 pass (5 new tests), 3 pre-existing integration
 skipped. Pre-push name-hygiene grep: clean.
 
-Held on `feat/kill-coord-entirely` until the reboot signal. Last
+Held on `feat/kill-st-entirely` until the reboot signal. Last
 piece for capstone 6/0.
 
-### Removed (coord-kill piece (g) — `st launch` + `launch-core` deleted; convoy owns launch natively)
+### Removed (st-kill piece (g) — `st launch` + `launch-core` deleted; convoy owns launch natively)
 
 Architecture decision (Nathan → cos): smalltalk = **pure message
 bus + minimal `st ding` sidecar.** Convoy owns launch natively
@@ -383,12 +383,12 @@ removed launch tests), 3 pre-existing integration skipped.
 
 Pre-push name-hygiene grep: clean.
 
-Held on `feat/kill-coord-entirely` until the reboot signal.
+Held on `feat/kill-st-entirely` until the reboot signal.
 Next: trim `st ding` to minimal per cos's directive (single-
 purpose: inbox-watch + wake the agent; orchestration lives in
 convoy).
 
-### Changed (coord-kill piece (e) — ding-mode is now the DEFAULT for `st launch`; MCP is `--mcp` opt-in)
+### Changed (st-kill piece (e) — ding-mode is now the DEFAULT for `st launch`; MCP is `--mcp` opt-in)
 
 Post-cutover the transport preference flips: `st launch` (both
 harnesses) defaults to **ding-mode** delivery via an `st ding`
@@ -460,45 +460,45 @@ Test updates:
 
 Also — nested cleanups from earlier pieces that slipped through:
 - `src/index.ts` and `src/types.ts` header docstrings: reverted
-  bad `@myobie/coord` → `@myobie/st` sed (npm scope must stay).
+  bad `@compoundingtech/smalltalk` → `@compoundingtech/st` sed (npm scope must stay).
 - `src/commands/init.ts` + `src/commands/launch.ts` reference-
   message strings: same revert.
 - `src/commands/mcp.ts` docstring: removed an attribution to
-  a specific maintainer + a stale `$COORD_ROOT` mention in the
+  a specific maintainer + a stale `$ST_ROOT` mention in the
   identity-fallback chain comment.
 
 Full suite: 1558 pass, 3 pre-existing integration skipped.
 Pre-push name-hygiene grep: clean.
 
-Held on `feat/kill-coord-entirely` until the reboot signal.
+Held on `feat/kill-st-entirely` until the reboot signal.
 
-### Changed (coord-kill piece (d) — cosmetic scrub: README, comments, log strings, variable names)
+### Changed (st-kill piece (d) — cosmetic scrub: README, comments, log strings, variable names)
 
-Comprehensive scrub of remaining `coord`/`Coord` references across
+Comprehensive scrub of remaining `smalltalk`/`Smalltalk` references across
 source + tests + hook scripts + README.
 
-- **`coord` variable names** renamed to `st` — the parameter
-  `(coord: St)` → `(st: St)` across all MCP tool files, the local
-  `const coord = createSt(...)` → `const st = createSt(...)` in
+- **`smalltalk` variable names** renamed to `st` — the parameter
+  `(smalltalk: St)` → `(st: St)` across all MCP tool files, the local
+  `const smalltalk = createSt(...)` → `const st = createSt(...)` in
   `lib.ts` + `mcp/index.ts` + `ding.ts`, and every downstream
-  `coord.method()` call → `st.method()`.
+  `smalltalk.method()` call → `st.method()`.
 - **DingDeps + McpServerHandle interface fields** renamed
-  `coord: St` → `st: St`. Consumers updated.
-- **Test fixture `FakeCoord`** renamed to `FakeSt`; test helper
-  `makeFakeCoord` → `makeFakeSt`. All `handle.coord` /
-  `fake.coord` refs updated to `handle.st` / `fake.st`.
+  `smalltalk: St` → `st: St`. Consumers updated.
+- **Test fixture `FakeSt`** renamed to `FakeSt`; test helper
+  `makeFakeSt` → `makeFakeSt`. All `handle.smalltalk` /
+  `fake.smalltalk` refs updated to `handle.st` / `fake.st`.
 - **README** — the "Note on the name" dual-alias section reduced
   to a one-line note; the "Names" section rewritten to describe
   the post-cutover surface (`st` + `smalltalk` binaries, `st_*`
-  MCP tools, `ST_AGENT`/`ST_ROOT`/`ST_CONFIG` env, no coord
+  MCP tools, `ST_AGENT`/`ST_ROOT`/`ST_CONFIG` env, no smalltalk
   fallback). Programmatic-API example updated to
-  `import { createSt, ... } from '@myobie/coord'` (npm scope
+  `import { createSt, ... } from '@compoundingtech/smalltalk'` (npm scope
   preserved — it's the package identity, not a personal-brand
   ref). MCP server section rewritten to describe the `st_*`-only
   tool surface and `_meta['st/error']` wire key.
 - **Command file header comments** — 17 files' header comments
-  scrubbed of `coord` verb refs.
-- **`coord-web`** in comments → `the web UI` (generic — external
+  scrubbed of `smalltalk` verb refs.
+- **`st-web`** in comments → `the web UI` (generic — external
   product isn't shipped by this repo).
 - **`~/.local/state/st` / `~/.config/st`** stray path segments
   from an over-aggressive bulk sed corrected back to
@@ -512,19 +512,19 @@ source + tests + hook scripts + README.
 - **`sync.ts` resolvePeer** — same correction for the peer
   fallback path.
 - **`tidy-check` notification `from` field** — was
-  `'coord-system'`, now `'st-system'`. Test updated.
+  `'st-system'`, now `'st-system'`. Test updated.
 - **`completions` output** — regenerated from generic scrub;
-  test asserts `complete -c st` (not `-c coord`).
-- **Wire meta key** — `_meta['coord/error']` → `_meta['st/error']`
+  test asserts `complete -c st` (not `-c smalltalk`).
+- **Wire meta key** — `_meta['smalltalk/error']` → `_meta['st/error']`
   refs in error-mapping module and every consuming test.
-- **`stErrorToToolResult`** function (was `coordErrorToToolResult`)
-  and `readStErrorPayload` (was `readCoordErrorPayload`) — public
+- **`stErrorToToolResult`** function (was `stErrorToToolResult`)
+  and `readStErrorPayload` (was `readStErrorPayload`) — public
   error-mapping exports renamed.
 
 Test fixture data cosmetic:
 - A handle used as a test fixture identity renamed to `operator`
   in test-only fixtures. Load-bearing exception: NPM scope refs
-  like `@myobie/coord` and `@myobie/pty` are preserved — they're
+  like `@compoundingtech/smalltalk` and `@compoundingtech/pty` are preserved — they're
   the actual package identifiers.
 - The 3-segment legacy filename regression test uses `legacy` as
   the middle segment — semantic behavior of the test is unchanged.
@@ -536,88 +536,88 @@ Vestigial migration tools removed:
 - `tools/cutover/` directory itself
 
 Full suite: 1555 pass, 3 pre-existing integration skipped.
-Pre-push name-hygiene grep: clean (with `@myobie/` npm scope
+Pre-push name-hygiene grep: clean (with `@compoundingtech/` npm scope
 excluded per the updated memory'd pattern).
 
-Held on `feat/kill-coord-entirely` until the reboot signal.
+Held on `feat/kill-st-entirely` until the reboot signal.
 
-### Changed (coord-kill piece (c) — SDK / wire renames: `CoordError` → `StError`, `createCoord` → `createSt`, `Coord` → `St`, wire meta key flip)
+### Changed (st-kill piece (c) — SDK / wire renames: `StError` → `StError`, `createSt` → `createSt`, `Smalltalk` → `St`, wire meta key flip)
 
 Public SDK surface and wire-format constants renamed to their
 post-cutover canonical shapes:
 
-- **`CoordError`** base class + all 15 subclasses (`AgentRequiredError`, `AgentNotHostedError`, `InvalidAgentError`, `InvalidFilenameError`, `MessageNotFoundError`, `InvalidStateError`, `InvalidPriorityError`, `InvalidDurationError`, `SyncFailedError`, `PeersConfigMissingError`, `PeersConfigInvalidError`, `EmptyBodyError`, `ArchiveConflictError`, `ResourceNotFoundError`, `InvalidResourceUrlError`, plus the legacy `InvalidIdentityError` alias) renamed to **`StError`** + subclasses. Public export from `@myobie/coord/errors`.
-- **`createCoord()`** factory renamed to **`createSt()`**.
-- **`Coord`** interface renamed to **`St`**.
-- **`CoordOptions`** interface renamed to **`StOptions`**.
-- **Wire meta key: `COORD_ERROR_META_KEY = 'coord/error'`** flipped to **`ST_ERROR_META_KEY = 'st/error'`** (silent flip — no external embedder is reading `_meta['coord/error']` today).
-- **`resolveCoordBinPath()`** renamed to **`resolveStShimPath()`**. The redundant sibling helper `resolveStBinPath(coordBin)` (which took an already-resolved bin path and returned its `bin/st` sibling) has been dropped — `resolveStShimPath()` returns `bin/st` directly since #56.
+- **`StError`** base class + all 15 subclasses (`AgentRequiredError`, `AgentNotHostedError`, `InvalidAgentError`, `InvalidFilenameError`, `MessageNotFoundError`, `InvalidStateError`, `InvalidPriorityError`, `InvalidDurationError`, `SyncFailedError`, `PeersConfigMissingError`, `PeersConfigInvalidError`, `EmptyBodyError`, `ArchiveConflictError`, `ResourceNotFoundError`, `InvalidResourceUrlError`, plus the legacy `InvalidIdentityError` alias) renamed to **`StError`** + subclasses. Public export from `@compoundingtech/smalltalk/errors`.
+- **`createSt()`** factory renamed to **`createSt()`**.
+- **`Smalltalk`** interface renamed to **`St`**.
+- **`StOptions`** interface renamed to **`StOptions`**.
+- **Wire meta key: `ST_ERROR_META_KEY = 'smalltalk/error'`** flipped to **`ST_ERROR_META_KEY = 'st/error'`** (silent flip — no external embedder is reading `_meta['smalltalk/error']` today).
+- **`resolveStBinPath()`** renamed to **`resolveStShimPath()`**. The redundant sibling helper `resolveStBinPath(stBin)` (which took an already-resolved bin path and returned its `bin/st` sibling) has been dropped — `resolveStShimPath()` returns `bin/st` directly since #56.
 
 Test refs bulk-updated:
-- `_meta['coord/error']` → `_meta['st/error']` across integration + unit MCP tests.
-- ~30 `Coord`-as-type refs across test files updated to `St`.
-- `createCoord` call sites in embedding tests → `createSt`.
+- `_meta['smalltalk/error']` → `_meta['st/error']` across integration + unit MCP tests.
+- ~30 `Smalltalk`-as-type refs across test files updated to `St`.
+- `createSt` call sites in embedding tests → `createSt`.
 
 Full suite: 1555 pass, 3 pre-existing integration skipped.
-Pre-push name-hygiene grep: clean. Updated the memory'd grep pattern to exclude the `@myobie/` npm scope — that's the actual package identity in `package.json` + import statements, not a personal-brand leak. All other `myobie` references (comments, test fixtures) are still caught.
+Pre-push name-hygiene grep: clean. Updated the memory'd grep pattern to exclude the `@compoundingtech/` npm scope — that's the actual package identity in `package.json` + import statements, not a personal-brand leak. All other `myobie` references (comments, test fixtures) are still caught.
 
-### Changed (coord-kill piece (b) — CLI + env: `bin/coord`, `members`, `coord-` plugin prefix, and `COORD_*` env vars removed)
+### Changed (st-kill piece (b) — CLI + env: `bin/smalltalk`, `members`, `st-` plugin prefix, and `ST_*` env vars removed)
 
 Post-cutover the CLI surface + env fallbacks are `st_*` only.
 
-- **`bin/coord`** — deleted. `package.json:bin` no longer declares
-  the `coord` entry.
+- **`bin/smalltalk`** — deleted. `package.json:bin` no longer declares
+  the `smalltalk` entry.
 - **`case 'members':`** CLI alias in `dispatchTop` removed.
   `st agents` is the sole canonical verb.
-- **`coord-<cmd>`** — dropped from the git-style PATH-plugin scan
+- **`st-<cmd>`** — dropped from the git-style PATH-plugin scan
   in `findPlugin`. Only `st-<cmd>` and `smalltalk-<cmd>` prefixes
   are tried now.
-- **`COORD_ROOT` / `COORD_IDENTITY` / `COORD_CONFIG` /
-  `COORD_CHANNEL_DEBUG`** — no longer honored by any code path.
+- **`ST_ROOT` / `ST_IDENTITY` / `ST_CONFIG` /
+  `ST_CHANNEL_DEBUG`** — no longer honored by any code path.
   `stRootFrom`, `stConfigFrom`, `envAgentFrom`, `resolveAgent`,
   and `cmdMcpCli` all read only `ST_*` env vars now. The
   `ST_IDENTITY → ST_AGENT` legacy alias (a smalltalk-era rename)
   is preserved with a one-time deprecation warning.
-- **`coordRootFrom` / `coordConfigFrom` / `coordRoot` /
-  `coordConfig`** helpers renamed to `stRootFrom` / `stConfigFrom`
+- **`stRootFrom` / `stConfigFrom` / `stRoot` /
+  `stConfig`** helpers renamed to `stRootFrom` / `stConfigFrom`
   / `stRoot` / `stConfig` — ~200 call sites across `src/lib.ts`
-  and every command module. `ResolveAgentOpts.coordRoot` field
-  renamed to `stRoot`. `CliContext.coordRoot` → `stRoot`;
-  `CliContext.coordConfig` → `stConfig`.
-- **`warnCoordFallback`** internal helper renamed to
+  and every command module. `ResolveAgentOpts.stRoot` field
+  renamed to `stRoot`. `CliContext.stRoot` → `stRoot`;
+  `CliContext.stConfig` → `stConfig`.
+- **`warnStFallback`** internal helper renamed to
   `warnLegacyEnvFallback` (now only covers the
   `ST_IDENTITY → ST_AGENT` deprecation).
-- **`invokedAsFrom`** now defaults to `'st'` (not `'coord'`); the
-  `InvokedAs` type narrowed from `'coord' | 'st' | 'smalltalk'`
+- **`invokedAsFrom`** now defaults to `'st'` (not `'smalltalk'`); the
+  `InvokedAs` type narrowed from `'smalltalk' | 'st' | 'smalltalk'`
   to `'st' | 'smalltalk'`. `canonicalServerName` always returns
   `'st'`; `SERVER_INFO.name` is `'st'`; `buildServerInfo` accepts
   only `'st'`.
-- **`~/.local/state/coord`** and **`~/.config/coord`** — no longer
+- **`~/.local/state/smalltalk`** and **`~/.config/smalltalk`** — no longer
   read as fallbacks. `defaultStateRoot` returns
   `~/.local/state/smalltalk`; `defaultConfigDir` returns
   `~/.config/smalltalk`.
-- **`.mcp.json` legacy `coord` key** — no longer read or migrated.
+- **`.mcp.json` legacy `smalltalk` key** — no longer read or migrated.
   `cmdInit` only reads/writes `mcpServers.st`; a pre-cutover file
-  with only a `coord:` entry is treated as absent (the `st` entry
-  gets added; the `coord` entry is left alone).
+  with only a `smalltalk:` entry is treated as absent (the `st` entry
+  gets added; the `smalltalk` entry is left alone).
 - **User-visible verb strings** — bulk-scrubbed across source +
-  hook scripts + tests: `coord ding` → `st ding`, `coord init` →
-  `st init`, `` `coord X` `` in error messages → `` `st X` ``,
-  `<coord-root>` in tool descriptions → `<st-root>`,
-  `<channel source="coord">` phrasing removed from source
+  hook scripts + tests: `st ding` → `st ding`, `st init` →
+  `st init`, `` `smalltalk X` `` in error messages → `` `st X` ``,
+  `<st-root>` in tool descriptions → `<st-root>`,
+  `<channel source="smalltalk">` phrasing removed from source
   comments. Codex hooks (`examples/codex/*.sh`) + Claude Code
   hooks (`examples/claude-code/hooks/*.sh`) rewritten st-only.
 
 Piece (a)'s `EXPECTED_TOOL_NAMES` regression guard extended with
 piece (b)'s reframed alias tests:
 - `env-var resolution (ST_* only)` — regression guards that
-  `$COORD_ROOT`, `$COORD_IDENTITY`, `$COORD_CONFIG` are NOT
+  `$ST_ROOT`, `$ST_IDENTITY`, `$ST_CONFIG` are NOT
   honored (each individually assertion).
 - `state-dir resolution` — always resolves to
-  `~/.local/state/smalltalk` even when `~/.local/state/coord`
+  `~/.local/state/smalltalk` even when `~/.local/state/smalltalk`
   exists (regression guard).
-- `bin/coord is REMOVED` — new source-guard regression assertion.
-- `coord-<cmd>` plugin prefix NOT scanned — new regression
+- `bin/smalltalk is REMOVED` — new source-guard regression assertion.
+- `st-<cmd>` plugin prefix NOT scanned — new regression
   assertion.
 - `package.json bin` — asserts only `st` + `smalltalk` declared.
 
@@ -633,10 +633,10 @@ Regression guard on source-level developer-path leaks in
 generic OS-home-directory prefix catch — any absolute
 developer-machine path fails the check.
 
-Held on `feat/kill-coord-entirely` until the reboot signal
+Held on `feat/kill-st-entirely` until the reboot signal
 (Option B).
 
-### Changed (coord-kill piece (a) — MCP tools registered under `st_*` only; dual-register removed; `members` alias retired)
+### Changed (st-kill piece (a) — MCP tools registered under `st_*` only; dual-register removed; `members` alias retired)
 
 Post-cutover the MCP tool surface is `st_*` only. The historical
 dual-register mechanism has been fully removed:
@@ -647,27 +647,27 @@ dual-register mechanism has been fully removed:
 - **`members` deprecated alias retired.** `st_agents` is the sole
   canonical name.
 - **`CHANNEL_INSTRUCTIONS` fully rewritten st-only** — every
-  `coord_*` tool name, `coord status` verb, `<channel
-  source="coord">` reference, and "Coord threads stay on coord"
+  `st_*` tool name, `st status` verb, `<channel
+  source="smalltalk">` reference, and "Smalltalk threads stay on smalltalk"
   convention line replaced.
 - **`EXPECTED_TOOL_NAMES`** is `st_*` only (was 28-entry
   dual-prefixed; now 13-entry).
-- Tool titles + descriptions scrubbed: no `coord message`,
-  `$COORD_IDENTITY`, or `<coord-root>` phrasing remains.
+- Tool titles + descriptions scrubbed: no `st message`,
+  `$ST_IDENTITY`, or `<st-root>` phrasing remains.
 
 Test coverage:
 - `channel-instructions.test.ts` — st-only load-bearing
-  substrings; added case-insensitive assertion that `coord`
+  substrings; added case-insensitive assertion that `smalltalk`
   doesn't appear anywhere (cutover lock-in).
 - `aliases.test.ts` Item 3 — reframed as "registry is `st_*`
-  only"; asserts st_<base> present AND coord_<base> alias GONE.
+  only"; asserts st_<base> present AND st_<base> alias GONE.
 - `mcp/lifecycle.test.ts` — EXPECTED_TOOL_NAMES array flipped.
 - `mcp/context.test.ts` — dropped dual-register alias smoke.
-- ~250 `coord_*` tool-name refs across 21 test files
+- ~250 `st_*` tool-name refs across 21 test files
   bulk-renamed to `st_*` (mechanical).
 
-Load-bearing: first coord-kill piece touching the MCP wire
-surface. Held on `feat/kill-coord-entirely` until reboot signal
+Load-bearing: first st-kill piece touching the MCP wire
+surface. Held on `feat/kill-st-entirely` until reboot signal
 (Option B).
 
 Full suite: 1595 pass, 4 pre-existing flakes.
@@ -741,12 +741,12 @@ Follow-up hardening findings NOT in this PR (deliberately scoped
 down; documented as known / deferred):
 - `isSessionAlive` false-positive on PID reuse — low-severity,
   documented behavior
-- Cosmetic `coord ding:` log strings + unbounded buffer cap +
-  SIGINT double-tap — fold into coord-kill piece (d)
+- Cosmetic `st ding:` log strings + unbounded buffer cap +
+  SIGINT double-tap — fold into st-kill piece (d)
 
 ### Fixed (CRITICAL — `st ding` hardening pass for primary-transport readiness)
 
-With coord going away entirely and ding-mode becoming the DEFAULT
+With smalltalk going away entirely and ding-mode becoming the DEFAULT
 for `st launch`, `st ding` is now the PRIMARY inbox transport for
 the whole network — not a fallback. On an MCP-hostile machine
 (the operator's cos → supervisor → worker chain), a ding daemon
@@ -823,9 +823,9 @@ the watcher is the sole event source from that point on.
   (retry-on-send-fail).
 - `pty send` fails permanently → gives up after
   MAX_DELIVER_RETRIES with a loud log (retry cap).
-- `coord.read` fails 1 time → filename buffered, delivers on next
+- `smalltalk.read` fails 1 time → filename buffered, delivers on next
   tick (retry-on-read-fail).
-- `coord.read` fails 3 times → still delivers on the 4th tick
+- `smalltalk.read` fails 3 times → still delivers on the 4th tick
   (multi-retry).
 - Watcher fires the same filename twice → delivered exactly once
   (startup dedup, direct).
@@ -844,8 +844,8 @@ Follow-ups (from the same review, not in this PR):
   pre-reboot
 - `isSessionAlive` false-positive on PID reuse — low-severity,
   documented as known behavior
-- Cosmetic `coord ding:` log-string leaks + unbounded buffer +
-  SIGINT double-tap → fold into coord-kill piece (d)
+- Cosmetic `st ding:` log-string leaks + unbounded buffer +
+  SIGINT double-tap → fold into st-kill piece (d)
 
 ### Added (`st __launch-core` — hidden JSON-in/JSON-out entrypoint for the convoy bridge)
 
@@ -857,7 +857,7 @@ absorbs launch, it's a Swift codebase and can't import the TS
 package as a library. Two-step cutover per convoy-claude:
 
 1. **This PR (reboot moment)**: kill the `st launch` user
-   surface (in the coord-kill branch), but keep the write logic
+   surface (in the st-kill branch), but keep the write logic
    in TS behind a stable hidden entrypoint convoy calls via
    subprocess.
 2. **Fast-follow post-reboot**: convoy ports helpers to Swift
@@ -867,7 +867,7 @@ package as a library. Two-step cutover per convoy-claude:
 
 Contract (stable, additive-only):
 - **STDIN**: JSON body matching `LaunchInput` (minus `env` and
-  `coordRoot`, which come from the invoker's process env).
+  `stRoot`, which come from the invoker's process env).
   Unknown fields are IGNORED — forward-compat when older
   smalltalk sees a field a newer convoy sends.
 - **STDOUT**: JSON body of `LaunchResult` on exit 0. Every
@@ -1108,8 +1108,8 @@ Semantics:
 - **Default network unchanged**: no env line emitted; pty.toml
   doesn't freeze today's default into future restarts. Same
   asymmetry-with-`st.network`-tag preserved.
-- **Legacy `COORD_ROOT`**: canonicalized to `ST_ROOT` via the
-  existing input.coordRoot resolution, then flows through the
+- **Legacy `ST_ROOT`**: canonicalized to `ST_ROOT` via the
+  existing input.stRoot resolution, then flows through the
   PTY_ROOT derivation — no separate legacy path; env line name is
   the post-cutover canonical `PTY_ROOT` regardless of which env
   the invoker used.
@@ -1121,8 +1121,8 @@ stev's session-prefixing becomes possible.
 4 new unit tests: default network → no `PTY_ROOT` emitted; explicit
 `ST_ROOT` → both `ST_ROOT` and `PTY_ROOT = <ST_ROOT>/pty` present;
 codex ding sidecar carries `PTY_ROOT` too (matched-pair with
-`ST_ROOT`); legacy `COORD_ROOT` invoker env produces the canonical
-`PTY_ROOT` shape (no `COORD_PTY_ROOT` regression).
+`ST_ROOT`); legacy `ST_ROOT` invoker env produces the canonical
+`PTY_ROOT` shape (no `ST_PTY_ROOT` regression).
 
 Full suite: 1539 pass, only the 4 pre-existing integration flakes.
 
@@ -1249,7 +1249,7 @@ Tests:
   command shape, the "Do NOT run plain `st launch`"
   anti-pattern, and the new "Spawning children" CLI-inventory
   block are all asserted present.
-- Existing negative guards (no `coord` leak, etc.) still fire.
+- Existing negative guards (no `smalltalk` leak, etc.) still fire.
 
 Load-bearing for Johannes's team — this is what makes his
 cos → supervisor → worker chain work end-to-end on the
@@ -1272,8 +1272,8 @@ smol-toml's quoted-key parsing).
 
 Design decisions per pty-claude's steer:
 
-- **Value = the resolved network root** (`input.coordRoot`, which
-  cmdLaunch already computes via `coordRootFrom(ctx.env)` at the
+- **Value = the resolved network root** (`input.stRoot`, which
+  cmdLaunch already computes via `stRootFrom(ctx.env)` at the
   CLI layer). Always a valid path regardless of whether the
   invoker set `ST_ROOT` explicitly or is on the default.
 
@@ -1473,7 +1473,7 @@ Fix (cos-approved option 2):
 
 9 new unit tests cover: no-`--ding` case leaves `dingBus` null;
 `--ding` populates the result on dry-run; live-run writes
-DING-BUS.md with the load-bearing substrings + confirms no `coord`
+DING-BUS.md with the load-bearing substrings + confirms no `smalltalk`
 leak; `@DING-BUS.md` composes with `@PERSONA.md`; git-exclude
 happens; codex + `--ding` is a no-op on the install path;
 missing-git-repo warning fires + DING-BUS.md still installs;
@@ -1484,7 +1484,7 @@ idempotent re-run doesn't duplicate the import line; CLI
 
 Two `st ding` delivery paths — the inbox-arrival notice and the
 tidy-check drift summary — now prepend `[DING] ` and refer to
-"smalltalk message" / "tidy-check" (not "coord message" / "coord
+"smalltalk message" / "tidy-check" (not "st message" / "smalltalk
 tidy-check").
 
 Rationale (per Nathan):
@@ -1497,26 +1497,26 @@ Rationale (per Nathan):
   `DING-BUS.md` blurb) reference an unambiguous string pattern
   in the poke-handling flow ("when you see `[DING] X`, do Y").
 - `smalltalk`/`st` naming aligns with the CLI (`st message …`)
-  the agent uses to act on the notification. `coord` in a
+  the agent uses to act on the notification. `smalltalk` in a
   first-impression, user-visible line was a rename leftover.
 
 Concretely:
 
-- `you have a new coord message: <subject> (from <sender>);
+- `you have a new st message: <subject> (from <sender>);
   check your inbox` → `[DING] new smalltalk message: <subject>
   (from <sender>); check your inbox`
-- `coord tidy-check: inbox=<n> (oldest <age>).` →
+- `smalltalk tidy-check: inbox=<n> (oldest <age>).` →
   `[DING] tidy-check: inbox=<n> (oldest <age>).`
 
 Test coverage:
 - Existing 8 assertion sites updated across `tests/unit/ding.test.ts`
   and `tests/integration/ding.test.ts` to the new form.
 - New positive regression guards: `[DING] ` prefix required,
-  legacy `coord message` / `coord tidy-check` forms negated —
+  legacy `st message` / `smalltalk tidy-check` forms negated —
   so a future refactor can't revert to the un-prefixed +
   legacy-named form.
 
-Internal daemon log lines (`coord ding: pty send failed: …`,
+Internal daemon log lines (`st ding: pty send failed: …`,
 etc.) are unchanged — those are stderr for operators, not user-
 visible bus traffic. Cosmetic rename can happen alongside a
 broader daemon-log cleanup later.
@@ -1531,7 +1531,7 @@ hooks not found on disk; skipping .claude/settings.local.json` —
 and the launch proceeded HOOKLESS. Silent-ish → an operator
 missed it → Johannes's claude came up without the boot ritual,
 PreCompact flush, or StopFailure ding, exactly the silent-install-
-gap class of bug the `bin/coord` rename fix already surfaced.
+gap class of bug the `bin/smalltalk` rename fix already surfaced.
 
 Two changes:
 
@@ -1540,7 +1540,7 @@ Two changes:
   distinct modes and returns a `hint` string quoting the path(s)
   that were inspected and how to fix each mode:
   - bin/shim resolution failure → names the package.json walk +
-    `which st`/`which coord` PATH lookup failure.
+    `which st`/`which smalltalk` PATH lookup failure.
   - `examples/claude-code/hooks/` missing → quotes the walked-to
     root, suggests `npm install && npm link` from the checkout, or
     `--no-hooks` to acknowledge intentionally.
@@ -1663,45 +1663,45 @@ explicit flag overrides the spawner-default, `$CLAUDE_PERMISSION_MODE`
 overrides too, supervisor warning fires + worker doesn't, and
 supervisor + --permanent = no warning but still bypass.
 
-### Fixed (`st init`/`st launch` emit `bin/st` + `st ding`, not the legacy `bin/coord` + `coord ding`)
+### Fixed (`st init`/`st launch` emit `bin/st` + `st ding`, not the legacy `bin/smalltalk` + `st ding`)
 
-Two rename leftovers from the coord→st cutover that were producing
+Two rename leftovers from the smalltalk→st cutover that were producing
 config files pointing at the legacy shim name:
 
 - **`.mcp.json`'s MCP server command**: `st init` (and the `st
   launch` path that fans out through it) had
-  `resolveCoordBinPath()` returning `<package-root>/bin/coord`,
+  `resolveStBinPath()` returning `<package-root>/bin/smalltalk`,
   which then landed as the `.mcp.json` `st` entry's `command:` on
-  every fresh launch. Worked (bin/coord is a dual alias for bin/st)
-  but perpetuated the drift — the day the coord alias is dropped
+  every fresh launch. Worked (bin/smalltalk is a dual alias for bin/st)
+  but perpetuated the drift — the day the smalltalk alias is dropped
   would break every generated `.mcp.json`.
 
 - **`pty.toml`'s ding sidecar command line**: `st launch codex`
-  emitted `command = "coord ding <sess> --identity <id>"` for the
+  emitted `command = "st ding <sess> --identity <id>"` for the
   ding session. Same dual-alias mechanic; same drift risk.
 
 Both fixes:
 
-- `resolveCoordBinPath()` now walks for and prefers `<pkg>/bin/st`,
-  falling back to `<pkg>/bin/coord` only for very-old installs
+- `resolveStBinPath()` now walks for and prefers `<pkg>/bin/st`,
+  falling back to `<pkg>/bin/smalltalk` only for very-old installs
   where the newer shim isn't present. PATH fallback is `which st`
-  first, then `which coord`. Function name kept for now (callers-
+  first, then `which smalltalk`. Function name kept for now (callers-
   are-me-only; a rename is scope-creep on the fix).
 - `buildPtyToml`'s codex-ding line changed to `st ding <sess>
   --identity <id>`.
-- Small doc + comment updates in `launch.ts` (`coord ding sidecar`
+- Small doc + comment updates in `launch.ts` (`st ding sidecar`
   → `st ding sidecar` in LAUNCH_HELP + the module-level comment).
 
 Test regression guards added:
-- init.test.ts asserts `resolveCoordBinPath()` returns
-  `.../bin/st` AND explicitly negates `.../bin/coord`.
+- init.test.ts asserts `resolveStBinPath()` returns
+  `.../bin/st` AND explicitly negates `.../bin/smalltalk`.
 - launch.test.ts asserts the codex ding preview contains `st ding`
-  AND explicitly negates `coord ding`.
+  AND explicitly negates `st ding`.
 
 Users regenerate stale files by removing them (`rm .mcp.json
 pty.toml`) and re-running the corresponding launch. Existing
 `.mcp.json` / `pty.toml` files with the legacy names keep working
-until the coord alias is dropped; no forced migration.
+until the smalltalk alias is dropped; no forced migration.
 
 ### Added (`st launch --permanent` for durable CoS-shaped launches + footgun-guard)
 
@@ -1860,7 +1860,7 @@ eval-cell live proof: an st-launched agent's status write landed
 in the isolated root the first time; a manual restart would have
 landed in the live bus.
 
-Fix: when the invoker had `ST_ROOT` (or legacy `COORD_ROOT`)
+Fix: when the invoker had `ST_ROOT` (or legacy `ST_ROOT`)
 explicitly set, bake the resolved absolute path into every
 `[sessions.*.env]` block as `ST_ROOT` — main session + codex ding
 sidecar. Default-path launches leave the env unset so pty.toml
@@ -1869,13 +1869,13 @@ doesn't freeze today's default into tomorrow's restarts.
 Scope kept minimal:
 - Only `ST_ROOT` propagates; identity is already baked as
   `ST_AGENT`, and both hook scripts and CLI code use the resolution
-  chain that prefers ST_AGENT → ST_IDENTITY → COORD_IDENTITY, so
+  chain that prefers ST_AGENT → ST_IDENTITY → ST_IDENTITY, so
   the legacy aliases don't need explicit baking.
 - No `--env KEY=VAL` passthrough (deferred). Auto-propagate covers
   the flagged isolation case; a generic passthrough is a small
   follow-up if the need surfaces.
 - 4 new unit tests cover: no-invoker-env (nothing baked), ST_ROOT
-  set (baked), legacy COORD_ROOT set (canonicalized to ST_ROOT),
+  set (baked), legacy ST_ROOT set (canonicalized to ST_ROOT),
   codex ding sidecar (both env blocks pinned).
 
 Unblocks eval cells retiring their bespoke launchers for real
@@ -1886,7 +1886,7 @@ Unblocks eval cells retiring their bespoke launchers for real
 Historic behavior: on `startChannelWatcher`, an initial
 `readdirSync(inboxDir)` seeded every existing filename into the
 `seen` dedup set — a suppression policy that assumed the boot
-ritual's `coord_msg_ls` would recover any backlog. Live repro
+ritual's `st_msg_ls` would recover any backlog. Live repro
 during the P5 team-standup re-run showed the policy is too
 aggressive: when Claude Code reconnects the MCP stdio transport
 mid-session (the current server process exits on `mcp.server.
@@ -1920,7 +1920,7 @@ byte-identical inbox twin on the next read.
 Operator-visible: on a mid-session MCP reconnect, expect to see
 `<channel>` blocks for anything that arrived during the down
 window — including messages you may have already read via
-`coord_msg_ls`. The dup is easy to spot (same filename); archive
+`st_msg_ls`. The dup is easy to spot (same filename); archive
 as normal.
 
 ### Fixed (F1 auto-poker was addressing sessions with a slash — pty resolves with a dash)
@@ -1986,9 +1986,9 @@ load-bearing. The folder-trust dialog is handled by F1's
 P5-eval-surfaced unattended-standup fix set.
 
 `st init` (and the `st launch` `.mcp.json` path that fans out
-through it) also renamed the emitted `mcpServers` key from `coord`
+through it) also renamed the emitted `mcpServers` key from `smalltalk`
 to `st`. The on-disk `.mcp.json` state was already `st` across
-swept repos, so launch was drifting: it wrote `coord:` into freshly-
+swept repos, so launch was drifting: it wrote `smalltalk:` into freshly-
 generated `.mcp.json` files while every peer file was `st:`.
 `enabledMcpjsonServers` above matches the new key, so a new agent
 comes up with a consistent `st`-branded MCP wiring end-to-end.
@@ -2089,18 +2089,18 @@ available, `.claude/settings.local.json` commands bake `ST_BIN`.
 
 The three shipped Claude Code hooks (`pre-compact.sh`, `stop-failure.sh`;
 `session-start.sh` doesn't shell out) previously relied on PATH lookup
-of `coord` at hook-execution time. That's fragile: if PATH is degenerate
-in Claude Code's hook-exec env, or if a stale `coord` from a different
+of `smalltalk` at hook-execution time. That's fragile: if PATH is degenerate
+in Claude Code's hook-exec env, or if a stale `smalltalk` from a different
 install is on PATH, the hook silently uses the wrong binary — or none.
 
 Now:
 
 - **Hook scripts** resolve the CLI via `${ST_BIN:-$(command -v st ||
-  command -v coord)}`. Prefers an absolute path injected by `st
-  launch`; falls back to PATH lookup (st-first, coord for back-compat)
+  command -v smalltalk)}`. Prefers an absolute path injected by `st
+  launch`; falls back to PATH lookup (st-first, smalltalk for back-compat)
   for hand-wired settings.local.json files.
 - **`st launch`** bakes the absolute path via
-  `resolveStBinPath(resolveCoordBinPath())` and injects it as
+  `resolveStBinPath(resolveStBinPath())` and injects it as
   `ST_BIN=<abs>` in each hook's `command:` string. Claude Code runs
   shell-form commands via `sh -c`, so the POSIX assignment-preceded
   simple command form applies. Verified against
@@ -2114,13 +2114,13 @@ Now:
   auto-resolution behavior.
 
 Anti-impersonation posture unchanged. No new spawn surface — the
-hook already spawns `coord`, we just bake the exact binary.
+hook already spawns `smalltalk`, we just bake the exact binary.
 
 ### Added (`st --version` prints the CLI version)
 
 `<name> --version` prints `<invokedName> <semver>\n` (e.g. `st 0.3.0`)
 and exits 0. Follows the same brand-per-name convention as the help
-banners — `coord --version` prints `coord 0.3.0`, `smalltalk --version`
+banners — `smalltalk --version` prints `smalltalk 0.3.0`, `smalltalk --version`
 prints `smalltalk 0.3.0`. The semver is read from `package.json` at
 runtime, so it stays in sync without a build-time constant.
 
@@ -2137,9 +2137,9 @@ runtime, so it stays in sync without a build-time constant.
 
 Every `usage: …` banner and every top-level `<name>: <message>` error
 prefix now uses the name the user typed (`st`, `smalltalk`, or the
-back-compat `coord`), sourced from the `_ST_INVOKED_AS` env var that
+back-compat `smalltalk`), sourced from the `_ST_INVOKED_AS` env var that
 the `bin/` shims already export. Previously every banner said
-`usage: coord …`, which read as un-renamed even when the user had
+`usage: smalltalk …`, which read as un-renamed even when the user had
 typed `st`.
 
 - New helper `invokedName(env)` in `src/cli-context.ts` reads
@@ -2149,12 +2149,12 @@ typed `st`.
   banner, every subcommand's `--help` string, and the two top-level
   error prefixes (`unknown subcommand: …`, generic `<name>: <msg>`).
 - No shim or hook changes needed — `bin/st`, `bin/smalltalk`, and
-  `bin/coord` already set `_ST_INVOKED_AS` from `basename $0` before
+  `bin/smalltalk` already set `_ST_INVOKED_AS` from `basename $0` before
   exec'ing into node.
 
-Users who still type `coord …` see `usage: coord …` (their existing
+Users who still type `smalltalk …` see `usage: smalltalk …` (their existing
 behavior). Users who type `st …` see `usage: st …` — closing the
-"still says coord" gap that made the rename feel unfinished.
+"still says smalltalk" gap that made the rename feel unfinished.
 
 ### Fixed (`st status <agent> --set <state>` lazy-creates the agent folder)
 
@@ -2237,25 +2237,25 @@ error, and dry-run planning.
 ### Added (brief-rename-cutover — Phase C sweep scripts under `tools/cutover/`)
 
 Testable rewriters + a directory-walking driver for the per-machine
-step of the coord→st cutover. All pure functions on the file text
+step of the smalltalk→st cutover. All pure functions on the file text
 (idempotent by construction) with a thin CLI driver that walks disk
 and writes back atomically (tmp+rename, `<name>.pre-cutover`
 backups on first change).
 
 - **`tools/cutover/rewrite-mcp-json.ts`** — pure rewriter for
-  `.mcp.json`. Renames `mcpServers.coord` → `mcpServers.st`,
-  flips every legal `coord`-bin path suffix
-  (`myobie/coord/bin/coord`, `myobie/smalltalk/bin/coord`,
-  `myobie/coord/bin/st`, `myobie/coord/bin/smalltalk`) to
-  `myobie/smalltalk/bin/st`, renames `env.COORD_IDENTITY` →
+  `.mcp.json`. Renames `mcpServers.smalltalk` → `mcpServers.st`,
+  flips every legal `smalltalk`-bin path suffix
+  (`myobie/smalltalk/bin/smalltalk`, `myobie/smalltalk/bin/smalltalk`,
+  `myobie/smalltalk/bin/st`, `myobie/smalltalk/bin/smalltalk`) to
+  `myobie/smalltalk/bin/st`, renames `env.ST_IDENTITY` →
   `env.ST_AGENT` (drops when `ST_AGENT` already set), same for
-  `COORD_ROOT` / `COORD_CONFIG`.
+  `ST_ROOT` / `ST_CONFIG`.
 - **`tools/cutover/rewrite-pty-toml.ts`** — pure rewriter for
   `pty.toml`. Line-based sweep (no full TOML round-trip →
   preserves formatting, comments, blank lines) covering
-  `server:coord` → `server:st`, `coord ding` → `st ding` (both
-  with word-boundary guards against `server:coord-web` /
-  `coord dingus` false-matches), and the same env-var
+  `server:smalltalk` → `server:st`, `st ding` → `st ding` (both
+  with word-boundary guards against `server:st-web` /
+  `smalltalk dingus` false-matches), and the same env-var
   rename/drop rules inside `[sessions.<name>.env]` blocks.
 - **`tools/cutover/sweep.ts`** — CLI driver.
   `node --experimental-strip-types tools/cutover/sweep.ts <path>...
@@ -2266,32 +2266,32 @@ backups on first change).
 - **31 new unit tests** at
   `tests/unit/tools/cutover/rewrite-*.test.ts` covering every rule,
   idempotence, word-boundary guards, malformed input, and the
-  belt-and-suspenders "both `ST_AGENT` and `COORD_IDENTITY` set"
+  belt-and-suspenders "both `ST_AGENT` and `ST_IDENTITY` set"
   drop case.
 - **`tools/cutover/README.md`** documents the rules + usage.
 
 ### Added (brief-rename-cutover Phase P1 — `$ST_CONFIG` env var)
 
-Closes the last `COORD_*` env var that had no `ST_*` equivalent, so
-the coord→st cutover's Phase D can drop `$COORD_CONFIG` support
+Closes the last `ST_*` env var that had no `ST_*` equivalent, so
+the smalltalk→st cutover's Phase D can drop `$ST_CONFIG` support
 without a gap. Mirrors the pattern already used for `ST_ROOT` /
-`COORD_ROOT` (brief-005-phase0):
+`ST_ROOT` (brief-005-phase0):
 
-- New `$ST_CONFIG` env var, preferred over `$COORD_CONFIG`. Setting
+- New `$ST_CONFIG` env var, preferred over `$ST_CONFIG`. Setting
   both is fine — `$ST_CONFIG` wins.
 - New `~/.config/smalltalk/` default location, preferred when it
-  exists. Falls back to `~/.config/coord/` when only that exists
+  exists. Falls back to `~/.config/smalltalk/` when only that exists
   (legacy machine); creates `~/.config/smalltalk/` on a brand-new
   install. Same reasoning as the state-root logic: the warning
   belongs on env vars (the actionable signal), not the dir shape.
-- Reading `$COORD_CONFIG` still works and emits the same one-time
-  stderr fallback notice used by `$COORD_ROOT` and
-  `$COORD_IDENTITY`.
+- Reading `$ST_CONFIG` still works and emits the same one-time
+  stderr fallback notice used by `$ST_ROOT` and
+  `$ST_IDENTITY`.
 - `stConfigFrom(env)` is the new canonical resolver;
-  `coordConfigFrom` is a same-signature deprecated alias. Both
-  `stConfig()` and `coordConfig()` — the current-env wrappers —
+  `stConfigFrom` is a same-signature deprecated alias. Both
+  `stConfig()` and `stConfig()` — the current-env wrappers —
   work the same way.
-- **8 new unit tests** cover the ST-preferred / COORD-fallback /
+- **8 new unit tests** cover the ST-preferred / SMALLTALK-fallback /
   dual-dir / brand-new-install / alias-equivalence axes.
 
 ### Added (task #118 — `st launch` generates `.claude/settings.local.json`)
@@ -2309,7 +2309,7 @@ the shipped `examples/claude-code/hooks/` directory:
 - **PreCompact** (task #33 hook-legs) — stubs `context/now.md`
   when the model hasn't flushed recently, so boot-rehydrate has
   something to inject after compaction.
-- **StopFailure** — surfaces API-error wedges to myobie via coord.
+- **StopFailure** — surfaces API-error wedges to myobie via smalltalk.
 
 Every new claude agent gets these hooks automatically on
 `st launch claude`. Behavior:
@@ -2320,7 +2320,7 @@ Every new claude agent gets these hooks automatically on
 - **`--no-hooks` opts out.** For anyone who wants to wire hooks
   by hand, or an eval that doesn't need them.
 - **Codex harness skips.** Claude Code hooks are Claude Code
-  specific; codex has its own path via `coord ding`.
+  specific; codex has its own path via `st ding`.
 - **Missing shipped `examples/`.** Soft-skip with a one-line
   stderr notice — launch still succeeds. `examples/claude-code/`
   is now included in the npm `files` list so installs get the
@@ -2333,7 +2333,7 @@ and the generated JSON body so the operator can audit before spawn.
 
 Before this change, a `.md` file dropped into an agent's `inbox/`
 that didn't match the canonical `<unix-ms>-<rand6>.md` grammar was
-silently ignored: chokidar, the polling backstop, `coord message
+silently ignored: chokidar, the polling backstop, `st message
 ls`, `read`, and `archive` all filtered it out. A collaborator
 unfamiliar with the naming convention could send a message and the
 recipient would never see it. This closes that silent-miss hole.
@@ -2361,9 +2361,9 @@ recipient would never see it. This closes that silent-miss hole.
   coerced off for outside files (no LAYOUT prefix = no sibling
   family). `cmdLs` includes outside files in `matches` with
   `from: "outside"` in `--json`; ts is derived from file mtime.
-- **`src/lib.ts`** — `Coord.ls` maps through `asDeliverableFilename`
+- **`src/lib.ts`** — `Smalltalk.ls` maps through `asDeliverableFilename`
   so an outside filename doesn't throw at the API boundary;
-  `Coord.read` short-circuits outside filenames to a minimal
+  `Smalltalk.read` short-circuits outside filenames to a minimal
   `{message: {from: 'outside', body: <text>}, ...}` shape rather
   than reinterpreting untrusted frontmatter.
 - **9 new unit tests** cover `validOutsideFilename` edge cases
@@ -2375,9 +2375,9 @@ recipient would never see it. This closes that silent-miss hole.
 
 ### Fixed (brief-020 — channel-watcher wake reliability, HB-4)
 
-Idle Claude Code agents sometimes sat on delivered coord messages
+Idle Claude Code agents sometimes sat on delivered smalltalk messages
 without ever surfacing them (evals-claude 56min, smalltalk-claude
-also hit it), even though `coord_msg_ls` would show the file. Root
+also hit it), even though `st_msg_ls` would show the file. Root
 cause: chokidar's FSEvents backend on macOS can silently stop
 delivering `add` events on a long-idle process; the notification
 never fires and the wake never happens. Claude Code agents relied
@@ -2399,7 +2399,7 @@ event meant a wedged inbox.
   exactly one notification regardless of which path observed it
   first. Verified by a new integration test that races both paths
   at aggressive intervals.
-- **`COORD_CHANNEL_DEBUG=1`** flag opts into one-line stderr
+- **`ST_CHANNEL_DEBUG=1`** flag opts into one-line stderr
   instrumentation for each chokidar `add`, each poll-backstop
   discovery, and each notification send. Kept off by default so a
   healthy agent's stderr stays quiet; when it happens again, the
@@ -2417,13 +2417,13 @@ event meant a wedged inbox.
 ### Added (brief-016 — `smalltalk launch <harness>` one-command bootstrap)
 
 New CLI verb: `st launch <claude|codex>` (also `smalltalk launch` /
-`coord launch`) that stands up a harness correctly wired to smalltalk
+`st launch`) that stands up a harness correctly wired to smalltalk
 in a single command. Shaped like `ollama launch`.
 
 - **Identity resolution:** `--identity <name>` explicit → `$ST_AGENT`
-  → legacy `$ST_IDENTITY` → legacy `$COORD_IDENTITY` → throwaway
+  → legacy `$ST_IDENTITY` → legacy `$ST_IDENTITY` → throwaway
   `anon-<rand6>` (with a one-line stderr notice pointing at
-  `ST_AGENT` for persistence). Same fallback chain as `coord mcp` in
+  `ST_AGENT` for persistence). Same fallback chain as `st mcp` in
   0.8.1.
 - **`.mcp.json` bootstrap:** delegates to `cmdInit` — idempotent
   merge, divergent-entry prompt-gate. Channel mode defaults to `on`
@@ -2436,9 +2436,9 @@ in a single command. Shaped like `ollama launch`.
   run.
 - **Codex sidecar:** when the harness is `codex` and `pty` is on
   `$PATH`, the generated `pty.toml` includes a
-  `[sessions.ding]` block running `coord ding <session> --identity
+  `[sessions.ding]` block running `st ding <session> --identity
   <agent>` with `strategy = "permanent"` so it comes back after
-  crashes — codex has no `asyncRewake` equivalent, so `coord ding`
+  crashes — codex has no `asyncRewake` equivalent, so `st ding`
   is the re-wake mechanism.
 - **GLM path:** `--model <spec>` routes through `ollama launch
   <harness> --model <spec>` so ollama does the env injection AND
@@ -2465,29 +2465,29 @@ Scope excluded per brief-016: no changes to pty's launcher itself.
 The `.mcp.json` writer's actual bin-path resolution and the ollama
 CLI shape are treated as external contracts.
 
-### Fixed (`coord mcp` startup — anon-identity fallback)
+### Fixed (`st mcp` startup — anon-identity fallback)
 
-`coord mcp` (and `st mcp` / `smalltalk mcp`) no longer hard-exits when
-no `ST_AGENT` / `ST_IDENTITY` / `COORD_IDENTITY` is set. Instead the
+`st mcp` (and `st mcp` / `smalltalk mcp`) no longer hard-exits when
+no `ST_AGENT` / `ST_IDENTITY` / `ST_IDENTITY` is set. Instead the
 server falls back to a throwaway `anon-<rand6>` agent (e.g.
 `anon-h4k2qm`) and emits a single stderr warning that names the
 throwaway id and points at `ST_AGENT` for persistence. The anon
 agent's `inbox/` + `archive/` folders are lazy-created so the channel
 watcher and status writer have something to point at.
 
-This unblocks MCP hosts that spawn `coord mcp` without identity env
+This unblocks MCP hosts that spawn `st mcp` without identity env
 (Codex hit "cannot start the mcp server" before this fix). Managed
 hosts that set an identity explicitly are unaffected — they keep
 their explicit id and see no warning.
 
-- Scope is `mcp` only. Other CLI verbs (`coord status`, `coord
+- Scope is `mcp` only. Other CLI verbs (`st status`, `smalltalk
   message send`, etc.) still require an explicit identity because
   their behavior is address-sensitive (silently sending FROM a
   fresh random id each invocation would mask user errors).
 - The `anon-` prefix is stable — `st agents` listings and operators
   can spot throwaway sessions at a glance.
 - The fallback honors the existing three-level chain: `ST_AGENT` →
-  `ST_IDENTITY` (deprecation notice) → `COORD_IDENTITY` (deprecation
+  `ST_IDENTITY` (deprecation notice) → `ST_IDENTITY` (deprecation
   notice) → `anon-<rand6>` (this new fallback).
 - **VERSION** bumps to `0.8.1`.
 
@@ -2497,24 +2497,24 @@ The TS SDK already had near-complete parity with the CLI post-brief-009.
 This entry closes the last four gaps surfaced by the audit. No CLI or
 MCP surface change.
 
-- **`coord.archive(id, fn, opts?: ArchiveOptions)`** — now takes an
+- **`smalltalk.archive(id, fn, opts?: ArchiveOptions)`** — now takes an
   opts bag. `opts.withAttachments: true` mirrors the CLI's
   `--with-attachments` and moves prefix-sibling files alongside the
   canonical `.md`. Default unchanged (canonical `.md` only).
-- **`coord.archiveTrim(id, opts)`** — `opts.withAttachments?: boolean`
+- **`smalltalk.archiveTrim(id, opts)`** — `opts.withAttachments?: boolean`
   added to `TrimOptions`. When true, prefix-siblings of trimmed `.md`
   victims are also deleted from archive. Default unchanged.
-- **`coord.lsOrphans(id?, opts?: { archive?: boolean })`** — new method.
+- **`smalltalk.lsOrphans(id?, opts?: { archive?: boolean })`** — new method.
   Returns `OrphanItem[]` (`{filename, ts}[]`) for prefix-sibling files
   whose canonical `.md` is no longer in the same folder. Mirrors
-  `coord message ls --orphans`. Separate method (not an opt on `ls`)
+  `st message ls --orphans`. Separate method (not an opt on `ls`)
   because the return shape differs — orphans have no frontmatter.
-- **`coord.ding(deps)` on the handle** — thin wrapper around the
-  already-exported `runDing`. `deps.identity` defaults to the Coord's
-  own; `coord` is wired automatically. Useful for TUI / supervisor
+- **`smalltalk.ding(deps)` on the handle** — thin wrapper around the
+  already-exported `runDing`. `deps.identity` defaults to the Smalltalk's
+  own; `smalltalk` is wired automatically. Useful for TUI / supervisor
   embedders that want to start a ding inside their own process
   instead of shelling out.
-- **New exports from `@myobie/coord`:** `ArchiveOptions`, `OrphanItem`.
+- **New exports from `@compoundingtech/smalltalk`:** `ArchiveOptions`, `OrphanItem`.
 - **VERSION** bumps to `0.8.0`.
 
 ### Renamed (brief-009 item 3 — identity → agent)
@@ -2523,7 +2523,7 @@ MCP surface change.
 noun changed from `identity` to `agent`. Every old name is kept as a
 deprecated alias for one release cycle, so existing embedders /
 running agents / consuming pty.toml configs all keep working
-unchanged. Cos coordinates the per-machine pty.toml sweep over the
+unchanged. Cos orchestrates the per-machine pty.toml sweep over the
 ~8 downstream repos at her own pace.
 
 - **SDK types:** `Agent` brand (replaces `Identity`); `asAgent` /
@@ -2536,16 +2536,16 @@ unchanged. Cos coordinates the per-machine pty.toml sweep over the
   Error CODE strings (`IDENTITY_REQUIRED`, `IDENTITY_NOT_HOSTED`,
   `INVALID_IDENTITY`) stay stable as wire format. Error MESSAGE
   text changed ("identity required" → "agent required", etc.).
-- **CLI verb:** `coord agents` (canonical) + `coord members`
+- **CLI verb:** `st agents` (canonical) + `st members`
   (deprecated alias) — both dispatch to the same handler.
-- **MCP tool:** `coord_agents` + `st_agents` registered as the
-  canonical names; `coord_members` + `st_members` kept as deprecated
+- **MCP tool:** `st_agents` + `st_agents` registered as the
+  canonical names; `st_members` + `st_members` kept as deprecated
   aliases pointing at the same handler. All four tool names work.
-- **Env vars (cos coordinates):** `ST_AGENT` (preferred) → `ST_IDENTITY`
-  (deprecated, warns once per process) → `COORD_IDENTITY` (legacy,
+- **Env vars (cos orchestrates):** `ST_AGENT` (preferred) → `ST_IDENTITY`
+  (deprecated, warns once per process) → `ST_IDENTITY` (legacy,
   warns once per process). The `[smalltalk] honoring … — migrate to
   ST_AGENT when convenient` notice fires per legacy hit. Per-machine
-  `pty.toml` env blocks should migrate from `COORD_IDENTITY` /
+  `pty.toml` env blocks should migrate from `ST_IDENTITY` /
   `ST_IDENTITY` to `ST_AGENT` at cos's pace; no flag day required.
 - **SDK helpers:** `resolveAgent` / `envAgentFrom` (replace
   `resolveIdentity` / `envIdentityFrom`). Old names aliased.
@@ -2559,17 +2559,17 @@ unchanged. Cos coordinates the per-machine pty.toml sweep over the
   `MessageWithLocation.identity`, `Overview.members`) — KEPT as-is
   for one release for back-compat with embedder destructures. A
   follow-up release will rename them to `.agent` / `.agents`.
-- **`<channel source="coord" from="…">`** — KEPT as-is. Phase 5 of
-  brief-005 (the `coord_*` tool-name drop) owns flipping this to
+- **`<channel source="smalltalk" from="…">`** — KEPT as-is. Phase 5 of
+  brief-005 (the `st_*` tool-name drop) owns flipping this to
   `source="st"`.
 - **VERSION** bumps to `0.7.0`.
 - **Docs:** README, LAYOUT.md updated to lead with "agent" and the
   three-level env-var fallback.
 
-Downstream sweep (cos owns): `[sessions.*.env].COORD_IDENTITY` (or
+Downstream sweep (cos owns): `[sessions.*.env].ST_IDENTITY` (or
 `ST_IDENTITY`) → `ST_AGENT` across ~8 pty.toml repos; agent boot
-rituals referencing `coord_members` / `coord members` →
-`coord_agents` / `coord agents`. Three-level fallback means nothing
+rituals referencing `st_members` / `st members` →
+`st_agents` / `st agents`. Three-level fallback means nothing
 breaks mid-sweep.
 
 ### Added (brief-009 item 5 — `resources/` surface)
@@ -2580,14 +2580,14 @@ frontmatter (required) and optional `title:` / `tags:` / `relation:`
 / body description. Mirrors the inbox-vs-archive single-writer rule:
 `resources/` is owned by its identity; peers read via sync.
 
-- **CLI:** `coord resource add <url> [--title T] [--tag T,T]
-  [--relation REL] [--body-stdin]`, `coord resource ls [<identity>]
-  [--json]`, `coord resource read [<identity>] <filename> [--json]`,
-  `coord resource rm <filename>`.
-- **SDK:** `coord.resources.{add,list,read,remove}` on the Coord
+- **CLI:** `st resource add <url> [--title T] [--tag T,T]
+  [--relation REL] [--body-stdin]`, `st resource ls [<identity>]
+  [--json]`, `st resource read [<identity>] <filename> [--json]`,
+  `st resource rm <filename>`.
+- **SDK:** `smalltalk.resources.{add,list,read,remove}` on the Smalltalk
   handle. New types `Resource` + `ResourceWithLocation` re-exported
-  from `@myobie/coord`.
-- **MCP:** four new tools, dual-prefixed (`coord_resource_*` +
+  from `@compoundingtech/smalltalk`.
+- **MCP:** four new tools, dual-prefixed (`st_resource_*` +
   `st_resource_*`) — `resource_add`, `resource_ls`, `resource_read`,
   `resource_remove`. Available in both channel and non-channel modes.
 - **LAYOUT.md** documents the new folder + frontmatter shape.
@@ -2615,10 +2615,10 @@ name the actor-model framing the system has always implicitly
 assumed:
 
 - **`notes/actor-model.md`** *(new)*: maps actor-model concepts —
-  actor / mailbox / state / encapsulation / asynchrony — to coord's
+  actor / mailbox / state / encapsulation / asynchrony — to smalltalk's
   data shape. Provides the framing that makes the encapsulation rule
   ("across identities, only `inbox/` is writable") and the
-  Coord-threads-stay-on-coord rule fall out as obvious consequences
+  Smalltalk-threads-stay-on-smalltalk rule fall out as obvious consequences
   rather than ad-hoc conventions.
 - **`notes/onboarding.md`** *(new)*: public zero-to-first-message
   recipe for a fresh participant (human or agent). Covers install,
@@ -2641,7 +2641,7 @@ assumed:
 referenced it is removed. Same motivation as the tasks removal: paring
 the surface to what the friend onboarding actually needs.
 
-- **CLI:** `coord journal new/ls/cat/tail` deleted (\`src/commands/journal.ts\`
+- **CLI:** `smalltalk journal new/ls/cat/tail` deleted (\`src/commands/journal.ts\`
   removed).
 - **MCP onboarding text:** the channel-mode instructions no longer
   reference journal entries; the boot ritual is now status + inbox-drain
@@ -2649,12 +2649,12 @@ the surface to what the friend onboarding actually needs.
 - **MCP tidy-check:** the journal-lag drift condition is gone.
   Detection is **inbox staleness only**; \`DriftResult\` and
   \`DriftDetail\` shrank accordingly.
-- **\`coord ding\`:** the tidy-line is now \`coord tidy-check: inbox=N
+- **\`st ding\`:** the tidy-line is now \`smalltalk tidy-check: inbox=N
   (oldest Xm).\` (no journal segment).
 - **RESERVED_NAMES:** \`journal\` is dropped.
 - **Removed constant:** \`STALE_JOURNAL_MS\`.
 - **Removed helper:** \`journalDir()\`.
-- **Downstream impact:** consuming agents that reference \`coord
+- **Downstream impact:** consuming agents that reference \`smalltalk
   journal\` in their boot rituals need to drop those steps. The cos
   agent owns sweeping the consuming agent CLAUDE.md files alongside
   the tasks-removal sweep.
@@ -2666,7 +2666,7 @@ referenced it is removed. Tasks were never widely used outside
 myobie's own agents; the slim-down clears the way for a tighter
 onboarding story.
 
-- **CLI:** `coord task ...` and `coord tasks` subcommands deleted.
+- **CLI:** `smalltalk task ...` and `smalltalk tasks` subcommands deleted.
 - **MCP onboarding text:** the channel-mode instructions no longer
   reference task-file ritual.
 - **MCP tidy-check:** the `doingTask` drift condition is gone; the
@@ -2674,55 +2674,55 @@ onboarding story.
   the next entry, item 2).
 - **SDK:** no task types/methods were exposed (none existed); the
   `MemberTaskCounts` type and the `tasks` field on
-  `MemberSummaryEnriched` / `coord_members` (enriched) are removed.
+  `MemberSummaryEnriched` / `st_members` (enriched) are removed.
 - **Public types:** `TaskState`, `TaskNotFoundError`,
   `TasksSingleWriterError`, `InvalidTaskTitleError`, and
   `InvalidTaskStateError` are no longer exported.
 - **RESERVED_NAMES:** `tasks` is dropped (the name is once again
   available as an identity, though we'd advise against it).
 - **Docs:** README, LAYOUT.md, completions guidance updated.
-- **Downstream impact:** consuming agents that reference `coord task`
-  / `coord tasks` in their boot rituals need to drop those steps. The
+- **Downstream impact:** consuming agents that reference `smalltalk task`
+  / `smalltalk tasks` in their boot rituals need to drop those steps. The
   cos agent owns sweeping the consuming agent CLAUDE.md files.
 
-### Added (alias groundwork for the coord → smalltalk/st rename — Phase 0)
+### Added (alias groundwork for the smalltalk → smalltalk/st rename — Phase 0)
 
 The package is being renamed to `smalltalk` (long) / `st` (canonical
 short). This release lays down the **alias infrastructure** for that
 rename. **Nothing breaks for callers in this release** — the legacy
-`coord` surface continues to work end-to-end. Subsequent phases
+`smalltalk` surface continues to work end-to-end. Subsequent phases
 (directory move, repo rename, per-agent config migration, cleanup) are
 tracked separately.
 
 - **Binary aliases.** Three commands install simultaneously: `st`
-  (canonical), `smalltalk` (long form), `coord` (legacy alias). All
-  three resolve to the same logic; `bin/coord` and `bin/smalltalk`
+  (canonical), `smalltalk` (long form), `smalltalk` (legacy alias). All
+  three resolve to the same logic; `bin/smalltalk` and `bin/smalltalk`
   resolve to `bin/st` via shell exec / symlink.
 - **MCP server name dual-registration.** The server announces itself
-  as `coord` when invoked through `bin/coord`, as `st` otherwise
+  as `smalltalk` when invoked through `bin/smalltalk`, as `st` otherwise
   (`bin/st` and `bin/smalltalk`). Detection is via the bash shim
   capturing `$0` basename before any symlink walk, exported as
   `_ST_INVOKED_AS`.
-- **MCP tool name dual-registration.** Every `coord_<verb>` tool —
-  `coord_msg_send`, `coord_msg_ls`, `coord_msg_read`,
-  `coord_msg_archive`, `coord_msg_thread`, `coord_msg_reply`,
-  `coord_members` — is now ALSO registered as `st_<verb>` with the
+- **MCP tool name dual-registration.** Every `st_<verb>` tool —
+  `st_msg_send`, `st_msg_ls`, `st_msg_read`,
+  `st_msg_archive`, `st_msg_thread`, `st_msg_reply`,
+  `st_members` — is now ALSO registered as `st_<verb>` with the
   same schema and handler. Tools listings show 12 (or 14 in channel
   mode) entries instead of 6 (or 7).
 - **Environment variable dual-honor.** `ST_IDENTITY` is preferred over
-  `COORD_IDENTITY`; same for `ST_ROOT` over `COORD_ROOT`. When the
+  `ST_IDENTITY`; same for `ST_ROOT` over `ST_ROOT`. When the
   legacy name is honored, a one-time-per-process stderr notice
-  flags it: `[smalltalk] honoring COORD_IDENTITY — migrate to
+  flags it: `[smalltalk] honoring ST_IDENTITY — migrate to
   ST_IDENTITY when convenient`.
 - **State directory resolution.** Default state path prefers
   `~/.local/state/smalltalk` when it exists, falls back to
-  `~/.local/state/coord` when only that exists, and creates
+  `~/.local/state/smalltalk` when only that exists, and creates
   `~/.local/state/smalltalk` for brand-new installs. When both
   exist, `smalltalk/` wins silently (the env-var notice is the
-  actionable signal). `ST_ROOT` / `COORD_ROOT` bypass this entirely.
+  actionable signal). `ST_ROOT` / `ST_ROOT` bypass this entirely.
 - **Plugin proxy (git-style PATH dispatch).** Unknown subcommands
   fall back to a PATH lookup: `st-<cmd>` → `smalltalk-<cmd>` →
-  `coord-<cmd>`. First executable match wins; built-in commands
+  `st-<cmd>`. First executable match wins; built-in commands
   always take precedence over plugins of the same name. No `st-*`
   plugins ship with this release — the mechanism is greenfield,
   future-proofing.
@@ -2730,31 +2730,31 @@ tracked separately.
 ### Hook script fixes (back-compat support)
 
 `examples/codex/{session-start,stop}.sh` now capture stdout and stderr
-separately when invoking `coord message ls --json`, so the new
-`[smalltalk] honoring COORD_*` notice doesn't corrupt the captured
+separately when invoking `st message ls --json`, so the new
+`[smalltalk] honoring ST_*` notice doesn't corrupt the captured
 JSON payload. The failure-diagnostic path still surfaces the stderr
 contents.
 
 ### Unchanged (Phase 0 deliberately preserves)
 
-- `<channel source="coord" from="…">` notification frames keep
-  `source="coord"`. Downstream parsers that grep this attribute
+- `<channel source="smalltalk" from="…">` notification frames keep
+  `source="smalltalk"`. Downstream parsers that grep this attribute
   continue to work unchanged. Phase 5 (cleanup) flips this to
-  `source="st"` alongside the `coord_*` tool-name drop.
-- Existing `.mcp.json` files pointing at `bin/coord` keep working.
-- Existing scripts setting only `COORD_IDENTITY` / `COORD_ROOT` keep
+  `source="st"` alongside the `st_*` tool-name drop.
+- Existing `.mcp.json` files pointing at `bin/smalltalk` keep working.
+- Existing scripts setting only `ST_IDENTITY` / `ST_ROOT` keep
   working (with the one-time migration notice).
-- Existing `~/.local/state/coord/` directories keep working.
+- Existing `~/.local/state/smalltalk/` directories keep working.
 
 ### Coming in later phases
 
-- Phase 1: `~/.local/state/coord` → `~/.local/state/smalltalk`
+- Phase 1: `~/.local/state/smalltalk` → `~/.local/state/smalltalk`
   directory move (operational, cos-driven).
 - Phase 2: GitHub repository rename + working-tree directory rename.
-- Phase 3: per-identity rename, including `coord-claude` →
+- Phase 3: per-identity rename, including `st-claude` →
   `smalltalk-claude`.
 - Phase 4: per-agent `.mcp.json` / `settings.local.json` / `pty.toml`
   migrations to point at `bin/st` and use `ST_*` env vars.
-- Phase 5: drop the `coord_*` tool aliases, the `COORD_*` env
-  fallbacks, and the `bin/coord` shim. Flip channel `source` to
+- Phase 5: drop the `st_*` tool aliases, the `ST_*` env
+  fallbacks, and the `bin/smalltalk` shim. Flip channel `source` to
   `"st"`. Bump major version.

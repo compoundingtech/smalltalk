@@ -37,7 +37,7 @@ function makeContext(): Capture {
   return cap;
 }
 
-describe('coord completions — dispatch', () => {
+describe('st completions — dispatch', () => {
   it('fish → non-empty script with `complete -c st`, exit 0', async () => {
     const cap = makeContext();
     const code = await runCli(['completions', 'fish'], cap.ctx);
@@ -87,7 +87,7 @@ describe('coord completions — dispatch', () => {
   });
 });
 
-describe('coord completions fish — surface', () => {
+describe('st completions fish — surface', () => {
   async function fish(): Promise<string> {
     const cap = makeContext();
     await runCli(['completions', 'fish'], cap.ctx);

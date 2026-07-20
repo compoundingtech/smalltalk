@@ -216,9 +216,9 @@ at `st agents`, and decides whether to nudge or wait.
 ## How it pairs with the other harnesses
 
 - **Pi** has an analogous `pi.sendUserMessage` call inside
-  `examples/pi/coord.ts`'s `session_start` handler. Same idea: force
+  `examples/pi/smalltalk.ts`'s `session_start` handler. Same idea: force
   a turn on every session boundary so the boot ritual runs. (The
-  extension filename `coord.ts` is preserved for back-compat with
+  extension filename `smalltalk.ts` is preserved for back-compat with
   installed pi extensions; new installs can use any filename.)
 - **Codex** doesn't have an asyncRewake equivalent. The existing
   `examples/codex/session-start.sh` hook already runs on each new

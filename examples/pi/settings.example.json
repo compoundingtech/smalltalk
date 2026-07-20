@@ -1,11 +1,11 @@
 {
-  "_comment": "Reference fragment for pi's settings.json. Pi has no MCP server config (see pi's README: 'No MCP'); the coord verbs come from the coord.ts extension itself, which registers coord_msg_{send,ls,read,archive,thread} via pi.registerTool(). The push side (notifications on new arrivals) also lives in coord.ts. This file is optional — pi auto-discovers ~/.pi/agent/extensions/*.ts on startup.",
+  "_comment": "Reference fragment for pi's settings.json. Pi has no MCP server config (see pi's README: 'No MCP'); the smalltalk verbs come from the smalltalk.ts extension itself, which registers st_msg_{send,ls,read,archive,thread} via pi.registerTool(). The push side (notifications on new arrivals) also lives in smalltalk.ts. This file is optional — pi auto-discovers ~/.pi/agent/extensions/*.ts on startup.",
 
-  "_comment2": "Drop coord.ts at one of these auto-discovery paths and you don't need anything below: ~/.pi/agent/extensions/coord.ts (global) or .pi/extensions/coord.ts (project-local). The 'extensions' array below is only useful if you want to load coord.ts from somewhere else.",
+  "_comment2": "Drop smalltalk.ts at one of these auto-discovery paths and you don't need anything below: ~/.pi/agent/extensions/smalltalk.ts (global) or .pi/extensions/smalltalk.ts (project-local). The 'extensions' array below is only useful if you want to load smalltalk.ts from somewhere else.",
 
   "extensions": [
-    "/full/path/to/coord/examples/pi/coord.ts"
+    "/full/path/to/smalltalk/examples/pi/smalltalk.ts"
   ],
 
-  "_comment3": "If you want to install @myobie/coord (and @mariozechner/pi-coding-agent for typecheck) into a node_modules pi can resolve, drop a package.json next to coord.ts — see the README in this directory for the recipe."
+  "_comment3": "If you want to install @compoundingtech/smalltalk (and @mariozechner/pi-coding-agent for typecheck) into a node_modules pi can resolve, drop a package.json next to smalltalk.ts — see the README in this directory for the recipe."
 }

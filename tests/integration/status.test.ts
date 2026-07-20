@@ -13,7 +13,7 @@ import {
   mkIdentity,
   mkRoot,
   rsyncAvailable,
-  runCoord,
+  runSt,
 } from './helpers.ts';
 
 const skip = !rsyncAvailable();
@@ -36,33 +36,33 @@ d('status round-trip across machines', () => {
   });
 
   it('A sets status; sync; B reads the new state', () => {
-    const set = runCoord(['status', '--set', 'busy'], {
+    const set = runSt(['status', '--set', 'busy'], {
       stRoot: A,
-      coordIdentity: 'alice',
+      stIdentity: 'alice',
     });
     expect(set.exitCode).toBe(0);
     expect(set.stdout.trim()).toBe('status: busy');
     expect(readFileSync(join(A, 'alice', 'status'), 'utf8')).toBe('busy\n');
 
-    runCoord(['sync', 'push', `local:${B}`], {
+    runSt(['sync', 'push', `local:${B}`], {
       stRoot: A,
-      coordIdentity: 'alice',
+      stIdentity: 'alice',
     });
 
     // B can read alice's status via its synced view of alice's folder.
     expect(existsSync(join(B, 'alice', 'status'))).toBe(true);
-    const get = runCoord(['status', 'alice'], {
+    const get = runSt(['status', 'alice'], {
       stRoot: B,
-      coordIdentity: 'bob',
+      stIdentity: 'bob',
     });
     expect(get.exitCode).toBe(0);
     expect(get.stdout.trim()).toBe('busy');
   });
 
   it('B status defaults to offline when no status file exists', () => {
-    const r = runCoord(['status'], {
+    const r = runSt(['status'], {
       stRoot: B,
-      coordIdentity: 'bob',
+      stIdentity: 'bob',
     });
     expect(r.exitCode).toBe(0);
     expect(r.stdout.trim()).toBe('offline');
@@ -70,50 +70,50 @@ d('status round-trip across machines', () => {
   });
 
   it('A sets offline; sync; B still reads offline (default == explicit)', () => {
-    runCoord(['status', '--set', 'offline'], {
+    runSt(['status', '--set', 'offline'], {
       stRoot: A,
-      coordIdentity: 'alice',
+      stIdentity: 'alice',
     });
     expect(readFileSync(join(A, 'alice', 'status'), 'utf8')).toBe('offline\n');
 
-    runCoord(['sync', 'push', `local:${B}`], {
+    runSt(['sync', 'push', `local:${B}`], {
       stRoot: A,
-      coordIdentity: 'alice',
+      stIdentity: 'alice',
     });
 
-    const get = runCoord(['status', 'alice'], {
+    const get = runSt(['status', 'alice'], {
       stRoot: B,
-      coordIdentity: 'bob',
+      stIdentity: 'bob',
     });
     expect(get.exitCode).toBe(0);
     expect(get.stdout.trim()).toBe('offline');
   });
 
   it('bidirectional: both machines set their own status, both files survive', () => {
-    runCoord(['status', '--set', 'busy'], {
+    runSt(['status', '--set', 'busy'], {
       stRoot: A,
-      coordIdentity: 'alice',
+      stIdentity: 'alice',
     });
-    runCoord(['status', '--set', 'dnd'], {
+    runSt(['status', '--set', 'dnd'], {
       stRoot: B,
-      coordIdentity: 'bob',
+      stIdentity: 'bob',
     });
 
-    runCoord(['sync', 'push', `local:${B}`], {
+    runSt(['sync', 'push', `local:${B}`], {
       stRoot: A,
-      coordIdentity: 'alice',
+      stIdentity: 'alice',
     });
-    runCoord(['sync', 'pull', `local:${B}`], {
+    runSt(['sync', 'pull', `local:${B}`], {
       stRoot: A,
-      coordIdentity: 'alice',
+      stIdentity: 'alice',
     });
-    runCoord(['sync', 'push', `local:${A}`], {
+    runSt(['sync', 'push', `local:${A}`], {
       stRoot: B,
-      coordIdentity: 'bob',
+      stIdentity: 'bob',
     });
-    runCoord(['sync', 'pull', `local:${A}`], {
+    runSt(['sync', 'pull', `local:${A}`], {
       stRoot: B,
-      coordIdentity: 'bob',
+      stIdentity: 'bob',
     });
 
     // Each machine has both status files intact (no conflict possible —
@@ -129,9 +129,9 @@ d('status round-trip across machines', () => {
       join(B, 'bob', 'status'),
       'garbage\n'
     );
-    const r = runCoord(['status'], {
+    const r = runSt(['status'], {
       stRoot: B,
-      coordIdentity: 'bob',
+      stIdentity: 'bob',
     });
     expect(r.exitCode).toBe(0);
     expect(r.stdout.trim()).toBe('offline');
@@ -142,14 +142,14 @@ d('status round-trip across machines', () => {
       join(A, 'alice', 'status'),
       'BUSY\n' // uppercase = not a valid state per LAYOUT
     );
-    runCoord(['sync', 'push', `local:${B}`], {
+    runSt(['sync', 'push', `local:${B}`], {
       stRoot: A,
-      coordIdentity: 'alice',
+      stIdentity: 'alice',
     });
 
-    const r = runCoord(['status', 'alice'], {
+    const r = runSt(['status', 'alice'], {
       stRoot: B,
-      coordIdentity: 'bob',
+      stIdentity: 'bob',
     });
     expect(r.exitCode).toBe(0);
     expect(r.stdout.trim()).toBe('offline');

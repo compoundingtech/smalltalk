@@ -84,8 +84,8 @@ async function boot(opts: { tidyCheckIntervalMs?: number; channel?: boolean } = 
 }
 
 beforeEach(() => {
-  scratch = mkdtempSync(join(tmpdir(), 'coord-mcp-tidy-'));
-  stRoot = join(scratch, 'coord');
+  scratch = mkdtempSync(join(tmpdir(), 'st-mcp-tidy-'));
+  stRoot = join(scratch, 'smalltalk');
   mkdirSync(join(stRoot, ID, 'inbox'), { recursive: true });
   mkdirSync(join(stRoot, ID, 'archive'), { recursive: true });
   // Mark identity as `available` so the gate doesn't suppress emits

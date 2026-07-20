@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# st — primary entry point for smalltalk (a.k.a. coord, pre-rename).
+# st — primary entry point for smalltalk (a.k.a. smalltalk, pre-rename).
 #
-# brief-005-phase0: this is the real binary. `bin/coord` is a back-compat
+# brief-005-phase0: this is the real binary. `bin/smalltalk` is a back-compat
 # alias that captures its own $0 basename and then execs through here;
 # `bin/smalltalk` is a symlink straight to this script. The capture of
 # $0 BEFORE the symlink walk is what tells the node entry which name
@@ -10,13 +10,13 @@
 set -euo pipefail
 
 # Capture the invoked-as name before any symlink resolution. The `:-`
-# form preserves an upstream value if `bin/coord` (or any future
+# form preserves an upstream value if `bin/smalltalk` (or any future
 # alias) already set it before exec'ing here.
 export _ST_INVOKED_AS="${_ST_INVOKED_AS:-$(basename "$0")}"
 
 # Walk the symlink chain to find the real bin so the repo dir resolves
 # correctly under `npm link` (where the global bin is a symlink to
-# node_modules/.bin/st → ../@myobie/coord/bin/st). macOS doesn't ship
+# node_modules/.bin/st → ../@compoundingtech/smalltalk/bin/st). macOS doesn't ship
 # `readlink -f`, so do it the portable way: at each step, treat the
 # readlink target as relative-to-the-symlink-dir unless absolute.
 ST_BIN="${BASH_SOURCE[0]}"

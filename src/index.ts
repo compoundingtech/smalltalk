@@ -1,7 +1,7 @@
-// @myobie/coord — programmatic API.
+// @compoundingtech/smalltalk — programmatic API.
 //
 // Embedders import from this entry point:
-//   import { createSt, asIdentity } from '@myobie/coord';
+//   import { createSt, asIdentity } from '@compoundingtech/smalltalk';
 //
 // The CLI entry point (`bin/st` → `src/cli.ts`) is invoked separately;
 // it is not re-exported here.

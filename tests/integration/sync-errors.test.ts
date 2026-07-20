@@ -17,7 +17,7 @@ import {
   mkRoot,
   mkScratch,
   rsyncAvailable,
-  runCoord,
+  runSt,
 } from './helpers.ts';
 
 const skip = !rsyncAvailable();
@@ -43,11 +43,11 @@ d('sync error paths', () => {
 
   it('push to a bogus ssh host: non-zero exit, "rsync push failed" on stderr', () => {
     // Use a non-resolvable hostname so rsync fails fast at the ssh layer.
-    const r = runCoord(
+    const r = runSt(
       ['sync', 'push', 'this-host-does-not-resolve.invalid.example.com'],
       {
         stRoot: root,
-        coordIdentity: 'alice',
+        stIdentity: 'alice',
         timeoutMs: 20_000,
       }
     );
@@ -57,18 +57,18 @@ d('sync error paths', () => {
 
   it('rsync failure leaves the local tree unchanged', () => {
     // Pre-populate alice's outbound with a message.
-    runCoord(['message', 'send', 'bob', '--from', 'alice'], {
+    runSt(['message', 'send', 'bob', '--from', 'alice'], {
       stRoot: root,
-      coordIdentity: 'alice',
+      stIdentity: 'alice',
       stdin: 'preserved',
     });
     const before = listInbox(root, 'bob');
 
-    runCoord(
+    runSt(
       ['sync', 'push', 'this-host-does-not-resolve.invalid.example.com'],
       {
         stRoot: root,
-        coordIdentity: 'alice',
+        stIdentity: 'alice',
         timeoutMs: 20_000,
       }
     );
@@ -83,15 +83,15 @@ d('sync error paths', () => {
     // Place the target under a parent we mkdir as 0500 (read+execute, no
     // write). The local: resolver's mkdir-recursive call fails with
     // EACCES before rsync even runs — but the failure still propagates
-    // as a non-zero exit with a "coord:" prefix on stderr, which is the
+    // as a non-zero exit with a "smalltalk:" prefix on stderr, which is the
     // documented contract.
     const lockedParent = join(mkScratch(), 'locked');
     mkdirSync(lockedParent, { recursive: true, mode: 0o500 });
     const target = join(lockedParent, 'cannot-create');
 
-    const r = runCoord(['sync', 'push', `local:${target}`], {
+    const r = runSt(['sync', 'push', `local:${target}`], {
       stRoot: root,
-      coordIdentity: 'alice',
+      stIdentity: 'alice',
     });
     expect(r.exitCode).not.toBe(0);
     expect(r.stderr).toMatch(/st:.*(permission denied|rsync push failed)/);
@@ -100,10 +100,10 @@ d('sync error paths', () => {
   // ── peers.yaml missing / empty ─────────────────────────────────────
 
   it('sync --all with no peers.yaml exits non-zero with a clear message', () => {
-    const r = runCoord(['sync', '--all'], {
+    const r = runSt(['sync', '--all'], {
       stRoot: root,
       stConfig,
-      coordIdentity: 'alice',
+      stIdentity: 'alice',
     });
     expect(r.exitCode).not.toBe(0);
     expect(r.stderr).toContain('no peers configured');
@@ -111,30 +111,30 @@ d('sync error paths', () => {
 
   it('sync --all with empty peers.yaml (no entries) exits non-zero', () => {
     writeFileSync(join(stConfig, 'peers.yaml'), '# only comments\n');
-    const r = runCoord(['sync', '--all'], {
+    const r = runSt(['sync', '--all'], {
       stRoot: root,
       stConfig,
-      coordIdentity: 'alice',
+      stIdentity: 'alice',
     });
     expect(r.exitCode).not.toBe(0);
     expect(r.stderr).toContain('no peers found');
   });
 
   it('sync push --all with no peers.yaml errors loudly', () => {
-    const r = runCoord(['sync', 'push', '--all'], {
+    const r = runSt(['sync', 'push', '--all'], {
       stRoot: root,
       stConfig,
-      coordIdentity: 'alice',
+      stIdentity: 'alice',
     });
     expect(r.exitCode).not.toBe(0);
     expect(r.stderr).toContain('no peers configured');
   });
 
   it('sync pull --all with no peers.yaml errors loudly', () => {
-    const r = runCoord(['sync', 'pull', '--all'], {
+    const r = runSt(['sync', 'pull', '--all'], {
       stRoot: root,
       stConfig,
-      coordIdentity: 'alice',
+      stIdentity: 'alice',
     });
     expect(r.exitCode).not.toBe(0);
     expect(r.stderr).toContain('no peers configured');
@@ -151,11 +151,11 @@ d('sync error paths', () => {
     // Trigger a sync that will fail at the rsync stage. The dispatcher's
     // pre-command sweep runs before dispatching to `sync`, so the zombie
     // is cleaned regardless of rsync's exit code.
-    const r = runCoord(
+    const r = runSt(
       ['sync', 'push', 'this-host-does-not-resolve.invalid.example.com'],
       {
         stRoot: root,
-        coordIdentity: 'alice',
+        stIdentity: 'alice',
         timeoutMs: 20_000,
       }
     );
@@ -175,10 +175,10 @@ d('sync error paths', () => {
       join(stConfig, 'peers.yaml'),
       `bobby: local:${join(mkScratch(), 'b')}\n`
     );
-    const r = runCoord(['sync', 'sweep', '--all'], {
+    const r = runSt(['sync', 'sweep', '--all'], {
       stRoot: root,
       stConfig,
-      coordIdentity: 'alice',
+      stIdentity: 'alice',
     });
     expect(r.exitCode).not.toBe(0);
     expect(r.stderr).toContain('sweep is local-only');

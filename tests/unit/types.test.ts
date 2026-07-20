@@ -186,7 +186,7 @@ describe('parsePeer', () => {
   let scratch: string;
 
   beforeEach(() => {
-    scratch = mkdtempSync(join(tmpdir(), 'coord-peer-test-'));
+    scratch = mkdtempSync(join(tmpdir(), 'st-peer-test-'));
   });
   afterEach(() => {
     rmSync(scratch, { recursive: true, force: true });
@@ -207,9 +207,9 @@ describe('parsePeer', () => {
   });
 
   it('host:path → kind=ssh, resolved=<spec>/', async () => {
-    const r = await parsePeer('bob.example.com:/srv/coord', scratch);
+    const r = await parsePeer('bob.example.com:/srv/smalltalk', scratch);
     expect(r.kind).toBe('ssh');
-    expect(r.resolved).toBe('bob.example.com:/srv/coord/');
+    expect(r.resolved).toBe('bob.example.com:/srv/smalltalk/');
   });
 
   it('bare hostname with no peers.yaml → kind=ssh fallback', async () => {
@@ -222,12 +222,12 @@ describe('parsePeer', () => {
     mkdirSync(scratch, { recursive: true });
     writeFileSync(
       join(scratch, 'peers.yaml'),
-      'bobby: bob.example.com:/srv/coord\n'
+      'bobby: bob.example.com:/srv/smalltalk\n'
     );
     const r = await parsePeer('bobby', scratch);
     expect(r.kind).toBe('alias');
     expect(r.alias).toBe('bobby');
-    expect(r.resolved).toBe('bob.example.com:/srv/coord/');
+    expect(r.resolved).toBe('bob.example.com:/srv/smalltalk/');
   });
 
   it('alias targeting local: resolves through to local-style', async () => {

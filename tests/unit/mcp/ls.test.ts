@@ -17,8 +17,8 @@ let client: Client;
 let handle: ReturnType<typeof createMcpServer>;
 
 beforeEach(async () => {
-  scratch = mkdtempSync(join(tmpdir(), 'coord-mcp-ls-'));
-  stRoot = join(scratch, 'coord');
+  scratch = mkdtempSync(join(tmpdir(), 'st-mcp-ls-'));
+  stRoot = join(scratch, 'smalltalk');
   for (const id of ['alice', 'bob']) {
     mkdirSync(join(stRoot, id, 'inbox'), { recursive: true });
     mkdirSync(join(stRoot, id, 'archive'), { recursive: true });
@@ -83,7 +83,7 @@ describe('st_msg_ls — tools/list registration', () => {
 // ─── Happy paths ───────────────────────────────────────────────────────
 
 describe('st_msg_ls — happy paths', () => {
-  it('zero-arg lists the Coord identity\'s inbox', async () => {
+  it('zero-arg lists the Smalltalk identity\'s inbox', async () => {
     writeMsg('alice', '1714826789010-aaaaaa.md', 'bob');
     const r = await call();
     expect(r.isError).toBeUndefined();
@@ -261,7 +261,7 @@ describe('st_msg_ls — no inline presweep', () => {
   it('byte-identical inbox+archive twin is STILL visible after ls', async () => {
     // Per the sweep-as-convergence policy, ls does not presweep — a
     // zombie will surface in ls output until lazy-read sweep,
-    // `coord sweep`, or a sync runs. (Test stays expressive: this
+    // `smalltalk sweep`, or a sync runs. (Test stays expressive: this
     // pins the new contract so a regression to inline presweep
     // would fail this assertion.)
     const f = '1714826789010-aaaaaa.md';

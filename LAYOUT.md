@@ -4,8 +4,8 @@ The minimal invariants every smalltalk implementation must respect.
 Anything not in this file is open for the implementation to decide
 and iterate on.
 
-> Naming note: the project was renamed from `coord` to `smalltalk`
-> (`st` short). The `coord` CLI and the `$COORD_ROOT` / `$COORD_IDENTITY`
+> Naming note: the project was renamed from `smalltalk` to `smalltalk`
+> (`st` short). The `smalltalk` CLI and the `$ST_ROOT` / `$ST_IDENTITY`
 > env vars have been removed — use `st` with `$ST_ROOT` / `$ST_AGENT`.
 
 ## The root
@@ -71,7 +71,7 @@ Every message file in `inbox/` or `archive/` has a globally unique name:
 - `<rand6>` — six characters from Crockford base32 (`0-9a-z` minus `i`,
   `l`, `o`, `u`).
 
-Sortable by time. Effectively unique without coordination — at human-scale
+Sortable by time. Effectively unique without orchestration — at human-scale
 write rates the rand6 namespace (~10⁹) eliminates collisions.
 
 **Outside `.md` files.** A `.md` file that lands in `inbox/` but
@@ -218,7 +218,7 @@ Implementations should error loudly when none are provided rather than
 guessing. The two-level env-var fallback exists so per-machine config
 (e.g. `pty.toml`) can migrate from `ST_IDENTITY` → `ST_AGENT` at its own
 pace; the next major release drops the legacy honor. (The older
-`$COORD_IDENTITY` name is no longer honored.)
+`$ST_IDENTITY` name is no longer honored.)
 
 ## Archive is the tombstone
 

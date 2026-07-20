@@ -8,7 +8,7 @@ purpose: collect "agreed this is interesting, parked for later" ideas so they do
 
 Things we've discussed but decided not to build yet. Listed so the next round of work has a menu to pull from instead of re-discovering each one.
 
-> **Naming note.** Written when the project was named `coord`. Some
+> **Naming note.** Written when the project was named `smalltalk`. Some
 > sections below describe features the `tasks/` and `journal/` folders
 > would have grown — both folders were removed in brief-009 items 1+2,
 > so those specific ideas are now retired (kept for history).
@@ -18,14 +18,14 @@ Things we've discussed but decided not to build yet. Listed so the next round of
 Already documented in `agent-roles.md`. Today we use prompts + memory + `agents.md`. Future options if drift becomes a real problem:
 
 - PreToolUse soft-warning hook when the manager is about to Edit/Write in implementation paths.
-- ~~External task tracker (could be coord's `tasks/` folder once that ships — manager polls `coord tasks worker-claude --status doing` instead of `pty peek`)~~. **Retired** — `tasks/` folder removed in brief-009 item 1.
+- ~~External task tracker (could be smalltalk's `tasks/` folder once that ships — manager polls `smalltalk tasks worker-claude --status doing` instead of `pty peek`)~~. **Retired** — `tasks/` folder removed in brief-009 item 1.
 - Per-role env vars surfaced as session tags.
 
-## ~~`coord_task_*` / `coord_journal_*` / `coord_overview` MCP tools~~ (retired)
+## ~~`st_task_*` / `st_journal_*` / `st_overview` MCP tools~~ (retired)
 
-**Retired in brief-009 items 1+2** (tasks/ and journal/ folders removed). The original idea was to expose those folders' verbs through MCP once they settled; since the folders themselves are gone, this idea is obsolete. The `st_overview` / `coord_overview` MCP tool stayed parked but the underlying `st overview` CLI verb still ships.
+**Retired in brief-009 items 1+2** (tasks/ and journal/ folders removed). The original idea was to expose those folders' verbs through MCP once they settled; since the folders themselves are gone, this idea is obsolete. The `st_overview` / `st_overview` MCP tool stayed parked but the underlying `st overview` CLI verb still ships.
 
-The MCP layer today covers the message tools (`st_msg_send` / `coord_msg_send`, `st_msg_ls` / `coord_msg_ls`, `st_msg_read` / `coord_msg_read`, `st_msg_archive` / `coord_msg_archive`, `st_msg_thread` / `coord_msg_thread`, plus `st_msg_reply` / `coord_msg_reply` in channel mode), peer discovery (`st_agents` / `coord_members`), and the resource surface (`st_resource_*` / `coord_resource_*`).
+The MCP layer today covers the message tools (`st_msg_send` / `st_msg_send`, `st_msg_ls` / `st_msg_ls`, `st_msg_read` / `st_msg_read`, `st_msg_archive` / `st_msg_archive`, `st_msg_thread` / `st_msg_thread`, plus `st_msg_reply` / `st_msg_reply` in channel mode), peer discovery (`st_agents` / `st_members`), and the resource surface (`st_resource_*` / `st_resource_*`).
 
 ## Pi end-to-end agent-to-agent demo (the 5-agent scene running for real)
 

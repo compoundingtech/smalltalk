@@ -1,9 +1,9 @@
 {
-  "name": "@myobie/coord",
+  "name": "@compoundingtech/smalltalk",
   "version": "0.3.0",
   "private": true,
   "type": "module",
-  "description": "Node port of the coord file-folder coordination CLI + embeddable TypeScript API.",
+  "description": "Node port of the smalltalk file-folder orchestration CLI + embeddable TypeScript API.",
   "license": "MIT",
   "main": "./src/index.ts",
   "types": "./src/index.ts",
@@ -44,7 +44,7 @@
   },
   "devDependencies": {
     "@mariozechner/pi-coding-agent": "^0.73.0",
-    "@myobie/pty": "file:../pty",
+    "@compoundingtech/pty": "file:../pty",
     "@types/node": "^22.0.0",
     "typescript": "^5.6.0",
     "vitest": "^2.1.0"
