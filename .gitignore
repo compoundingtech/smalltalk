@@ -29,3 +29,6 @@ notes/agent-onboarding.md
 # Nathan's rule: execution over planning-docs-in-PRs. Local working
 # reference for the smalltalk→st cutover — never committed.
 notes/rename-cutover.md
+
+# `nix build` output symlink
+/result
