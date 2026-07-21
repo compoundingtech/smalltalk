@@ -100,31 +100,6 @@ export const STATUS_REFRESH_MS = 5 * 60 * 1000;
  *  just anti-`unknown`-drift. See commands/ding.ts + docs/KNOWN-LIMITS.md. */
 export const LIVENESS_HEARTBEAT_MS = 30 * 1000;
 
-/** The T in the cross-machine liveness contract: how old a status file's
- *  mtime may get before we stop calling the agent *live*. This is the
- *  READER half of the R=30s/T~=120s pair that LIVENESS_HEARTBEAT_MS is
- *  the writer half of — 4 missed ding heartbeats.
- *
- *  Deliberately distinct from {@link STATUS_STALE_MS}, and much tighter.
- *  The two answer different questions and MUST NOT be collapsed:
- *
- *    STATUS_STALE_MS (15 min) — "do we still trust the recorded value?"
- *      Sized for the SLOWEST writer, the MCP server's 5-min refresh.
- *      Past it the value is untrustworthy and reads as `unknown`.
- *
- *    STATUS_LIVENESS_MS (2 min) — "is this agent live right now?"
- *      Sized for the ding's 30s heartbeat. Past it the agent is not
- *      demonstrably alive, but the recorded value is still the best
- *      information we have about what it was doing.
- *
- *  Tightening STATUS_STALE_MS to this value would be wrong: an agent
- *  kept fresh only by the 5-min MCP refresh would flap into `unknown`
- *  between every refresh. Exported so every consumer (`st agents`,
- *  convoy, any future roster) inherits ONE definition of "live" instead
- *  of each picking its own window — the divergence that made `st agents`
- *  and `convoy ls --tree` disagree about the same identity. */
-export const STATUS_LIVENESS_MS = 2 * 60 * 1000;
-
 /** brief-030: how often the MCP server runs its tidy-check tick (the
  *  drift detector that nudges an agent when their inbox is out of date
  *  relative to the boot ritual). Default 20 minutes — long enough that
