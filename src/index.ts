@@ -102,27 +102,6 @@ export {
   yamlQuote,
 } from './common.ts';
 
-// ─── Status freshness contract (#102) ──────────────────────────────────
-//
-// Exported so every consumer inherits ONE definition of "live" rather
-// than each picking its own window — which is how `st agents` and
-// `convoy ls --tree` ended up disagreeing about the same identity at
-// the same instant. See the doc comments on the two constants: they
-// answer different questions and must not be collapsed into one.
-
-export {
-  LIVENESS_HEARTBEAT_MS,
-  STATUS_LIVENESS_MS,
-  STATUS_REFRESH_MS,
-  STATUS_STALE_MS,
-} from './common.ts';
-
-export {
-  readIdentityLiveness,
-  readIdentityStatus,
-  type StatusLiveness,
-} from './commands/status.ts';
-
 // ─── Agents + overview shapes (brief-028, renamed in brief-009 item 3) ─
 
 export {
