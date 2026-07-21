@@ -16,8 +16,16 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
-import { STATUS_STALE_MS } from '../../src/common.ts';
-import { readIdentityStatus } from '../../src/commands/status.ts';
+import {
+  LIVENESS_HEARTBEAT_MS,
+  STATUS_LIVENESS_MS,
+  STATUS_REFRESH_MS,
+  STATUS_STALE_MS,
+} from '../../src/common.ts';
+import {
+  readIdentityLiveness,
+  readIdentityStatus,
+} from '../../src/commands/status.ts';
 
 let scratch: string;
 let stRoot: string;
@@ -86,5 +94,112 @@ describe('readIdentityStatus — mtime staleness', () => {
     backdate(path, STATUS_STALE_MS + 60_000);
     // mtime is checked before contents — stale is stale regardless.
     expect(readIdentityStatus('alice', stRoot)).toBe('unknown');
+  });
+});
+
+// ─── #102: the shared freshness contract ───────────────────────────────
+//
+// `st agents` said `available` at the same instant `convoy ls --tree`
+// said `DEAD (status stale 3m ago)`. The premise in the issue — that
+// `st agents` had NO freshness window — turned out to be wrong: it has
+// one, STATUS_STALE_MS, but that window answers "do we still trust this
+// value?" (15 min, sized for the MCP server's 5-min refresh), not "is
+// this agent live?" (~2 min, sized for the ding's 30s heartbeat).
+//
+// So the divergence was a threshold mismatch, not a missing check.
+// `readIdentityLiveness` exposes BOTH windows through one reader so
+// consumers stop each inventing their own.
+describe('readIdentityLiveness — shared freshness contract', () => {
+  it('fresh file → live, recorded value preserved, small age', () => {
+    writeStatus('alice', 'available');
+    const l = readIdentityLiveness('alice', stRoot);
+    expect(l.status).toBe('available');
+    expect(l.recorded).toBe('available');
+    expect(l.live).toBe(true);
+    expect(l.ageMs).toBeLessThan(5_000);
+  });
+
+  it('the reported case: 3m old reads NOT live while status stays `available`', () => {
+    // This is exactly the disagreement from the issue. The trust window
+    // (15 min) is untouched, so `status` is still `available` — but
+    // `live` is false, which is what convoy was reporting.
+    const path = writeStatus('alice', 'available');
+    backdate(path, 3 * 60_000);
+    const l = readIdentityLiveness('alice', stRoot);
+    expect(l.status).toBe('available'); // trust window: unchanged
+    expect(l.live).toBe(false); // liveness window: not demonstrably up
+    expect(l.ageMs).toBeGreaterThan(2.5 * 60_000);
+  });
+
+  it('inside the liveness window → live', () => {
+    const path = writeStatus('alice', 'busy');
+    backdate(path, STATUS_LIVENESS_MS - 30_000);
+    expect(readIdentityLiveness('alice', stRoot).live).toBe(true);
+  });
+
+  it('past the liveness window but inside trust → live=false, status kept', () => {
+    const path = writeStatus('alice', 'busy');
+    backdate(path, STATUS_LIVENESS_MS + 30_000);
+    const l = readIdentityLiveness('alice', stRoot);
+    expect(l.live).toBe(false);
+    expect(l.status).toBe('busy');
+  });
+
+  it('stale-but-was-`busy` stays distinguishable from clean `offline`', () => {
+    // The debugging signal the issue asked us not to collapse: an agent
+    // that died mid-work is not the same as one that shut down.
+    const busyPath = writeStatus('alice', 'busy');
+    backdate(busyPath, STATUS_STALE_MS + 60_000);
+    mkdirSync(join(stRoot, 'carol'), { recursive: true });
+    const offPath = writeStatus('carol', 'offline');
+    backdate(offPath, STATUS_STALE_MS + 60_000);
+
+    const wasBusy = readIdentityLiveness('alice', stRoot);
+    const wasOffline = readIdentityLiveness('carol', stRoot);
+
+    // Both derive to `unknown` (the trust window is blown) …
+    expect(wasBusy.status).toBe('unknown');
+    expect(wasOffline.status).toBe('unknown');
+    // … but `recorded` keeps them apart.
+    expect(wasBusy.recorded).toBe('busy');
+    expect(wasOffline.recorded).toBe('offline');
+  });
+
+  it('missing file → not live, no age, no recorded value', () => {
+    // Distinct from a recorded `offline`: nothing was ever claimed.
+    const l = readIdentityLiveness('alice', stRoot);
+    expect(l.status).toBe('offline');
+    expect(l.live).toBe(false);
+    expect(l.ageMs).toBeNull();
+    expect(l.recorded).toBeNull();
+  });
+
+  it('corrupt contents → recorded is null, status falls back to `offline`', () => {
+    writeStatus('alice', 'garbage-value');
+    const l = readIdentityLiveness('alice', stRoot);
+    expect(l.status).toBe('offline');
+    expect(l.recorded).toBeNull();
+    expect(l.live).toBe(true); // the FILE is fresh; its contents are not usable
+  });
+
+  it('livenessMs is overridable so a consumer can be stricter', () => {
+    const path = writeStatus('alice', 'available');
+    backdate(path, 30_000);
+    expect(readIdentityLiveness('alice', stRoot).live).toBe(true);
+    expect(
+      readIdentityLiveness('alice', stRoot, { livenessMs: 10_000 }).live
+    ).toBe(false);
+  });
+
+  it('the two windows are deliberately different (regression guard)', () => {
+    // Tightening STATUS_STALE_MS down to the liveness window would flap
+    // MCP-refreshed agents (5-min refresh) into `unknown` between every
+    // refresh. Keep them apart.
+    expect(STATUS_LIVENESS_MS).toBeLessThan(STATUS_STALE_MS);
+    expect(STATUS_REFRESH_MS).toBeLessThan(STATUS_STALE_MS);
+    // The liveness window must clear several ding heartbeats.
+    expect(STATUS_LIVENESS_MS).toBeGreaterThanOrEqual(
+      3 * LIVENESS_HEARTBEAT_MS
+    );
   });
 });
