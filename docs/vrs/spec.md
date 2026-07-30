@@ -81,7 +81,10 @@ validate ──► materialize ──► host-local st2 scheduler/reconciler
   uniformly to spawn, list, kill, and the bus environment st2 hands to native
   tools, so every reader that can resolve the catalog agrees about where its
   sessions are. A declaration whose field set does not match fails `st2
-  validate` rather than resolving silently back to the default.
+  validate` rather than resolving silently back to the default. Runtime
+  observation has a short outer deadline so a wedged client fails the pass
+  closed instead of hanging reconciliation. The deadline is containment, not
+  the mechanism for admitting a larger fleet.
 
 ## Message lifecycle
 
@@ -176,92 +179,72 @@ the resident supervisor continues to reconcile the complete local catalog.
   plan, and current plan step. Prove that stale state is distinguishable and
   that a supervisor can follow plan progress without inspecting a PTY before
   adding the shape to `AGENT-SPEC.md`.
-- **DQ4 Relaunch boundary (R20-R22):** Implement a generation-aware lifecycle
-  that preserves R11's nondisruptive adoption while making launch-definition
-  drift explicit. The model has three separate identities:
+- **DQ4 Relaunch boundary (R22-R23):** Preserve R11's nondisruptive adoption
+  while making launch drift visible. For each declared task, derive the desired
+  launch fingerprint from a deterministic, versioned encoding of only:
+  backend kind, lowered shell source or direct argv, resolved working directory,
+  and the st2-managed plus declared effective environment. Tags, descriptive
+  metadata, unrelated inherited environment, file contents, and other boot-time
+  snapshots are not part of this fingerprint.
 
-  | Identity | Meaning | Changes when |
+  st2 records the observed fingerprint only as part of its own successful task
+  launch. Inspection compares desired with observed and reports:
+
+  | State | Meaning | Healthy-task action |
   | --- | --- | --- |
-  | declaration revision | the accepted canonical Agent Spec declaration | any declaration content changes |
-  | launch generation | a versioned digest of one lowered effective spawn contract | a value needed to reproduce that task's launch changes |
-  | replacement intent | explicit task-scoped authority to disrupt a live process | an operator requests a compare-and-replace transition |
+  | `converged` | desired and observed fingerprints match | adopt |
+  | `drifted` | both exist and differ | adopt and report drift |
+  | `unknown` | no trustworthy observed fingerprint exists | adopt and report unknown |
 
-  Metadata and Resource binding changes advance the declaration revision. They
-  never imply replacement. If such a change lowers into the effective spawn
-  contract it advances the desired launch generation and reports drift while
-  the healthy task continues unchanged; otherwise the launch generation stays
-  converged. The launch generation covers stable task identity, backend/kind,
-  command or argv, working directory, complete effective environment, and every
-  materialized input consumed at process start. It uses a deterministic,
-  versioned canonical encoding; st2 persists the observed value beside runtime
-  identity when it launches a task.
+  `unknown` includes a healthy legacy or externally adopted runtime. Catalog
+  publication, supervisor restart, metadata edits, and launch-field edits do
+  not implicitly disrupt any healthy task.
 
-  Inspection exposes declaration revision plus desired and observed launch
-  generations. Their relation is a tagged state: `converged`, `drifted`, or
-  `unknown`. `unknown` covers a surviving legacy process without recorded
-  launch identity and remains nondisruptive.
+  Ordinary reconciliation remains sufficient after every interruption:
 
-  Reconciliation follows this matrix:
+  | Declaration | Process | Action |
+  | --- | --- | --- |
+  | active | absent or dead | reap stale state and launch the latest current desired contract |
+  | active | alive | adopt and report `converged`, `drifted`, or `unknown` |
+  | retired | alive | stop; do not relaunch |
+  | retired | absent or dead | do not launch |
 
-  | Declaration | Process | Generation relation | Intent | Action |
-  | --- | --- | --- | --- | --- |
-  | active | absent or dead | any | none | reap stale state and launch the latest desired generation |
-  | active | alive | converged | none | adopt |
-  | active | alive | drifted | none | adopt and report drift |
-  | active | alive | unknown | none | adopt and report unknown |
-  | active | alive | converged, drifted, or unknown | pending replacement matching the exact runtime identity | durably record the stop phase, replace, and persist the terminal receipt |
-  | active | absent or dead | any | replacement whose stop phase names the prior runtime | resume the operation, launch its captured effective contract once, and persist the terminal receipt |
-  | active | alive | any | stale or mismatched replacement | reject without disruption |
-  | retired | alive | any | retirement | tear down and do not relaunch |
-  | retired | absent or dead | any | retirement | retain retired state; do not launch |
+  Replacing live drifted work is a separate explicit operation. Its scope is
+  one selected catalog, pinned host, resolved effective PTY root, and selected
+  task set. A future interface may preview drifted tasks and select one, a
+  subset, or all of them; this contract does not reserve a command name. The
+  operation must re-read the selected task and recheck its exact live runtime
+  identity immediately before each stop. A missing, changed, wrong-host, or
+  wrong-root target refuses without disruption.
 
-  Publication and reconciliation are observational for a healthy process.
-  Automatic relaunch occurs only when an active declared task has no live
-  process. Intentional replacement of a live task is a separate task-scoped
-  one-shot operation with a stable operation identity. It must name the exact
-  expected runtime identity and desired generation; the observed generation is
-  additional drift evidence, never a substitute for runtime identity. The
-  operation captures an immutable, restartable copy of that generation's
-  effective launch contract and content-addressed boot inputs. Before stopping
-  the process, st2 revalidates that the declaration still has that desired
-  generation, then durably advances the operation from `pending` to a stop phase
-  naming the runtime and captured contract. A changed desired generation rejects
-  the still-pending operation without disruption. Once the stop phase is
-  durable, reconciliation resumes from the captured contract rather than the
-  current declaration or a successor that happens to have the same launch
-  generation. A terminal replacement receipt is idempotently keyed by operation
-  identity and records the prior runtime, captured transition, stop result,
-  launch result, and resulting runtime, so a crash after stop or launch neither
-  strands the task nor replaces its successor again.
+  Replacement does not capture an old launch contract or boot inputs. If st2
+  stops after the identity check and is then interrupted, ordinary
+  absent/dead reconciliation launches the latest current desired contract.
+  There is no replay of an older generation, durable operation journal,
+  operation ID, phase machine, terminal receipt, or atomic old-to-new runtime
+  transition. A task rename is the explicit sequence retire old, then add new.
 
-  Changing task identity is not replacement. If the old identity is live, st2
-  must not silently orphan it or launch a duplicate successor. The transition
-  is rejected until explicit retirement, or one atomic old-to-new replacement
-  intent authorizes and receipts both sides. Control-plane replacement never
-  supplies that authority.
+  This entire lifecycle works from an ordinary copied or synchronized catalog
+  folder. CAS may later add publication, history, or storage optimization, but
+  fingerprinting, inspection, reconciliation, replacement, retirement,
+  recovery, and rename must neither require nor become incomplete without it.
 
   Executable acceptance proves:
 
-  1. metadata and Resource-only edits preserve PID and creation identity;
-     spawn-inert edits preserve the desired launch generation while
-     spawn-affecting edits advance it and report drift;
-  2. command, argv, cwd, effective-environment, and boot-input edits preserve a
-     healthy PID while exposing `drifted`;
-  3. normal and forced `st2 up` restart or binary upgrade preserves the live
-     runtime and its observed generation;
-  4. natural exit or death launches exactly one process at the latest desired
-     generation;
-  5. matching replacement changes runtime identity exactly once, including
-     same-generation replacement and replay after a crash before terminal
-     receipt persistence, while a stale request changes nothing;
-  6. retirement tears down and subsequent reconciliation does not relaunch;
-  7. identity transitions cannot leave an unreported orphan or duplicate;
-  8. legacy runtime records are exposed as `unknown` and adopted without
-     disruption; and
-  9. a crash or launch failure after replacement stops the prior runtime resumes
-     the same captured launch contract and terminates with one receipt rather
-     than stranding the task, adopting an intervening declaration revision, or
-     replaying replacement against its successor.
+  1. metadata, tags, and Resource-only edits preserve the fingerprint and live
+     runtime, while kind, launch, resolved-cwd, or effective-environment edits
+     report `drifted` without changing runtime identity;
+  2. a healthy legacy runtime reports `unknown` and remains unchanged;
+  3. natural exit or death launches once from the latest current declaration
+     and records that launch's observed fingerprint;
+  4. explicit replacement refuses stale identity or scope, and affects only
+     the selected drifted tasks;
+  5. interruption after stop heals through ordinary reconciliation to the
+     latest current desired contract, without old-state replay;
+  6. retirement stops and prevents relaunch, while rename works as
+     retire-old/add-new; and
+  7. the same proofs pass using only a plain local catalog folder with no CAS
+     service, CAS metadata, database, or network dependency.
 
   The executable acceptance above resolves this open implementation design.
   See [#40](https://github.com/compoundingtech/st2/issues/40),

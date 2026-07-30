@@ -163,10 +163,15 @@ fn doctor_bounds_a_hung_pty_probe_and_reports_the_runtime_error() {
     )
     .unwrap();
     let escaped_pid = tmp.path().join("escaped.pid");
+    let sleep = std::env::split_paths(&std::env::var_os("PATH").unwrap())
+        .map(|directory| directory.join("sleep"))
+        .find(|candidate| candidate.is_file())
+        .expect("sleep on the test runner's PATH");
     executable(
         &bin.join("pty"),
         &format!(
-            "#!/bin/sh\nset -m\n/bin/sleep 30 &\nprintf '%s\\n' \"$!\" > '{}'\nwait\n",
+            "#!/bin/sh\nset -m\n'{}' 30 &\nprintf '%s\\n' \"$!\" > '{}'\nwait\n",
+            sleep.display(),
             escaped_pid.display()
         ),
     );

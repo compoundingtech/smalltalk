@@ -103,18 +103,15 @@ accepted.
   gates, PTY inspection, and plan execution are limited to the selected
   owner/task; unrelated diagnostics remain visible while unrelated workspaces,
   tasks, and live PTY PID/generation stay unchanged.
-- **R20 Non-disruptive declaration revisions:** Accepting metadata or Resource
-  binding changes is observational for a healthy task and never supplies
-  lifecycle authority. A change to the effective launch contract advances the
-  desired launch generation and exposes its relation to the running generation,
-  but does not implicitly stop, restart, or replace the task.
-- **R21 Explicit relaunch and replacement:** st2 automatically relaunches only
-  an active declared task identity with no live process, using its latest
-  effective launch contract. Replacing a live task is a separate, explicit,
-  task-scoped, generation-checked lifecycle operation that captures the
-  corresponding effective launch contract before disruption. Retirement
-  explicitly tears down the task and prevents automatic relaunch.
-- **R22 Identity-transition safety:** Changing a task identity is not
-  replacement. While the old identity is live, st2 must not silently orphan it
-  or launch a duplicate successor; explicit retirement or an atomic old-to-new
-  replacement must authorize and receipt the transition.
+- **R22 Visible, nondisruptive launch drift:** st2 derives a versioned desired
+  launch fingerprint from the minimal effective fields it already passes to a
+  task and records an observed fingerprint only when st2 launches that runtime.
+  Inspection reports `converged`, `drifted`, or `unknown`; a healthy
+  `drifted` or `unknown` task is adopted without implicit restart.
+- **R23 Explicit replacement boundary:** An absent or dead active task launches
+  from the latest current declaration. Retirement stops live work and prevents
+  relaunch. Replacing live work is a separate, explicitly selected operation
+  fenced by catalog, host, effective PTY root, task set, and an exact runtime
+  identity recheck immediately before disruption. Renaming remains
+  retire-old/add-new. Every behavior remains complete with an ordinary catalog
+  folder and without CAS, captured generations, or replacement journals.
