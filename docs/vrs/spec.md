@@ -210,7 +210,7 @@ the resident supervisor continues to reconcile the complete local catalog.
   | active | alive | drifted | none | adopt and report drift |
   | active | alive | unknown | none | adopt and report unknown |
   | active | alive | converged, drifted, or unknown | pending replacement matching the exact runtime identity | durably record the stop phase, replace, and persist the terminal receipt |
-  | active | absent or dead | any | replacement whose stop phase names the prior runtime | resume the operation, launch the requested desired generation once, and persist the terminal receipt |
+  | active | absent or dead | any | replacement whose stop phase names the prior runtime | resume the operation, launch its captured effective contract once, and persist the terminal receipt |
   | active | alive | any | stale or mismatched replacement | reject without disruption |
   | retired | alive | any | retirement | tear down and do not relaunch |
   | retired | absent or dead | any | retirement | retain retired state; do not launch |
@@ -220,15 +220,19 @@ the resident supervisor continues to reconcile the complete local catalog.
   process. Intentional replacement of a live task is a separate task-scoped
   one-shot operation with a stable operation identity. It must name the exact
   expected runtime identity and desired generation; the observed generation is
-  additional drift evidence, never a substitute for runtime identity. Before
-  stopping the process, st2 durably advances the operation from `pending` to a
-  stop phase naming that runtime. Reconciliation resumes an incomplete
-  operation from its durable phase rather than matching it against a successor
-  that happens to have the same launch generation. A terminal replacement
-  receipt is idempotently keyed by operation identity and records the prior
-  runtime, requested transition, stop result, launch result, and resulting
-  runtime, so a crash after stop or launch neither strands the task nor replaces
-  its successor again.
+  additional drift evidence, never a substitute for runtime identity. The
+  operation captures an immutable, restartable copy of that generation's
+  effective launch contract and content-addressed boot inputs. Before stopping
+  the process, st2 revalidates that the declaration still has that desired
+  generation, then durably advances the operation from `pending` to a stop phase
+  naming the runtime and captured contract. A changed desired generation rejects
+  the still-pending operation without disruption. Once the stop phase is
+  durable, reconciliation resumes from the captured contract rather than the
+  current declaration or a successor that happens to have the same launch
+  generation. A terminal replacement receipt is idempotently keyed by operation
+  identity and records the prior runtime, captured transition, stop result,
+  launch result, and resulting runtime, so a crash after stop or launch neither
+  strands the task nor replaces its successor again.
 
   Changing task identity is not replacement. If the old identity is live, st2
   must not silently orphan it or launch a duplicate successor. The transition
@@ -255,8 +259,9 @@ the resident supervisor continues to reconcile the complete local catalog.
   8. legacy runtime records are exposed as `unknown` and adopted without
      disruption; and
   9. a crash or launch failure after replacement stops the prior runtime resumes
-     the same operation and terminates with one receipt rather than stranding
-     the task or replaying replacement against its successor.
+     the same captured launch contract and terminates with one receipt rather
+     than stranding the task, adopting an intervening declaration revision, or
+     replaying replacement against its successor.
 
   The executable acceptance above resolves this open implementation design.
   See [#40](https://github.com/compoundingtech/st2/issues/40),
