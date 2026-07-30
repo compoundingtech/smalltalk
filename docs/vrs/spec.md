@@ -208,7 +208,8 @@ the resident supervisor continues to reconcile the complete local catalog.
   | active | alive | converged | none | adopt |
   | active | alive | drifted | none | adopt and report drift |
   | active | alive | unknown | none | adopt and report unknown |
-  | active | alive | converged, drifted, or unknown | matching replacement | replace and persist a receipt |
+  | active | alive | converged, drifted, or unknown | pending replacement matching the exact runtime identity | durably record the stop phase, replace, and persist the terminal receipt |
+  | active | absent or dead | any | replacement whose stop phase names the prior runtime | resume the operation, launch the requested desired generation once, and persist the terminal receipt |
   | active | alive | any | stale or mismatched replacement | reject without disruption |
   | retired | alive | any | retirement | tear down and do not relaunch |
   | retired | absent or dead | any | retirement | retain retired state; do not launch |
@@ -216,10 +217,17 @@ the resident supervisor continues to reconcile the complete local catalog.
   Publication and reconciliation are observational for a healthy process.
   Automatic relaunch occurs only when an active declared task has no live
   process. Intentional replacement of a live task is a separate task-scoped
-  action that names the expected runtime identity or observed generation and
-  the desired generation. A replacement receipt records the prior runtime,
-  requested transition, stop result, launch result, and resulting runtime so a
-  partial failure cannot be reported as convergence.
+  one-shot operation with a stable operation identity. It must name the exact
+  expected runtime identity and desired generation; the observed generation is
+  additional drift evidence, never a substitute for runtime identity. Before
+  stopping the process, st2 durably advances the operation from `pending` to a
+  stop phase naming that runtime. Reconciliation resumes an incomplete
+  operation from its durable phase rather than matching it against a successor
+  that happens to have the same launch generation. A terminal replacement
+  receipt is idempotently keyed by operation identity and records the prior
+  runtime, requested transition, stop result, launch result, and resulting
+  runtime, so a crash after stop or launch neither strands the task nor replaces
+  its successor again.
 
   Changing task identity is not replacement. If the old identity is live, st2
   must not silently orphan it or launch a duplicate successor. The transition
@@ -237,12 +245,16 @@ the resident supervisor continues to reconcile the complete local catalog.
      observed generation;
   4. natural exit or death launches exactly one process at the latest desired
      generation;
-  5. matching replacement changes runtime identity exactly once, while a stale
-     request changes nothing;
+  5. matching replacement changes runtime identity exactly once, including
+     same-generation replacement and replay after a crash before terminal
+     receipt persistence, while a stale request changes nothing;
   6. retirement tears down and subsequent reconciliation does not relaunch;
-  7. identity transitions cannot leave an unreported orphan or duplicate; and
+  7. identity transitions cannot leave an unreported orphan or duplicate;
   8. legacy runtime records are exposed as `unknown` and adopted without
-     disruption.
+     disruption; and
+  9. a crash or launch failure after replacement stops the prior runtime resumes
+     the same operation and terminates with one receipt rather than stranding
+     the task or replaying replacement against its successor.
 
   This requires Nathan's approval of the corresponding protected requirements
   before it moves from design question to implementation contract. See
