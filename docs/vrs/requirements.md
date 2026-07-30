@@ -103,3 +103,17 @@ accepted.
   gates, PTY inspection, and plan execution are limited to the selected
   owner/task; unrelated diagnostics remain visible while unrelated workspaces,
   tasks, and live PTY PID/generation stay unchanged.
+- **R20 Non-disruptive declaration revisions:** Accepting metadata or Resource
+  binding changes is observational for a healthy task and never supplies
+  lifecycle authority. A change to the effective launch contract advances the
+  desired launch generation and exposes its relation to the running generation,
+  but does not implicitly stop, restart, or replace the task.
+- **R21 Explicit relaunch and replacement:** st2 automatically relaunches only
+  an active declared task identity with no live process, using its latest
+  effective launch contract. Replacing a live task is a separate, explicit,
+  task-scoped, generation-checked lifecycle operation. Retirement explicitly
+  tears down the task and prevents automatic relaunch.
+- **R22 Identity-transition safety:** Changing a task identity is not
+  replacement. While the old identity is live, st2 must not silently orphan it
+  or launch a duplicate successor; explicit retirement or an atomic old-to-new
+  replacement must authorize and receipt the transition.

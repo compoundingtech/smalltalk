@@ -176,7 +176,7 @@ the resident supervisor continues to reconcile the complete local catalog.
   plan, and current plan step. Prove that stale state is distinguishable and
   that a supervisor can follow plan progress without inspecting a PTY before
   adding the shape to `AGENT-SPEC.md`.
-- **DQ4 Relaunch boundary:** Ratify and implement a generation-aware lifecycle
+- **DQ4 Relaunch boundary (R20-R22):** Implement a generation-aware lifecycle
   that preserves R11's nondisruptive adoption while making launch-definition
   drift explicit. The model has three separate identities:
 
@@ -186,14 +186,15 @@ the resident supervisor continues to reconcile the complete local catalog.
   | launch generation | a versioned digest of one lowered effective spawn contract | a value needed to reproduce that task's launch changes |
   | replacement intent | explicit task-scoped authority to disrupt a live process | an operator requests a compare-and-replace transition |
 
-  Assignment, metadata, and Resource binding changes advance the declaration
-  revision but do not change a task's launch generation unless they lower into
-  its effective spawn contract. They never imply replacement. The launch
-  generation covers stable task identity, backend/kind, command or argv,
-  working directory, complete effective environment, and every materialized
-  input consumed at process start. It uses a deterministic, versioned canonical
-  encoding; st2 persists the observed value beside runtime identity when it
-  launches a task.
+  Metadata and Resource binding changes advance the declaration revision. They
+  never imply replacement. If such a change lowers into the effective spawn
+  contract it advances the desired launch generation and reports drift while
+  the healthy task continues unchanged; otherwise the launch generation stays
+  converged. The launch generation covers stable task identity, backend/kind,
+  command or argv, working directory, complete effective environment, and every
+  materialized input consumed at process start. It uses a deterministic,
+  versioned canonical encoding; st2 persists the observed value beside runtime
+  identity when it launches a task.
 
   Inspection exposes declaration revision plus desired and observed launch
   generations. Their relation is a tagged state: `converged`, `drifted`, or
@@ -237,12 +238,13 @@ the resident supervisor continues to reconcile the complete local catalog.
 
   Executable acceptance proves:
 
-  1. assignment, metadata, and Resource-only edits preserve PID, creation
-     identity, and observed launch generation;
+  1. metadata and Resource-only edits preserve PID and creation identity;
+     spawn-inert edits preserve the desired launch generation while
+     spawn-affecting edits advance it and report drift;
   2. command, argv, cwd, effective-environment, and boot-input edits preserve a
      healthy PID while exposing `drifted`;
-  3. normal and forced `st2 up` replacement preserves the live runtime and its
-     observed generation;
+  3. normal and forced `st2 up` restart or binary upgrade preserves the live
+     runtime and its observed generation;
   4. natural exit or death launches exactly one process at the latest desired
      generation;
   5. matching replacement changes runtime identity exactly once, including
@@ -256,9 +258,8 @@ the resident supervisor continues to reconcile the complete local catalog.
      the same operation and terminates with one receipt rather than stranding
      the task or replaying replacement against its successor.
 
-  This requires Nathan's approval of the corresponding protected requirements
-  before it moves from design question to implementation contract. See
-  [#40](https://github.com/compoundingtech/st2/issues/40),
+  The executable acceptance above resolves this open implementation design.
+  See [#40](https://github.com/compoundingtech/st2/issues/40),
   [#41](https://github.com/compoundingtech/st2/issues/41),
   [#44](https://github.com/compoundingtech/st2/issues/44), and
   [#60](https://github.com/compoundingtech/st2/issues/60).
