@@ -176,3 +176,77 @@ the resident supervisor continues to reconcile the complete local catalog.
   plan, and current plan step. Prove that stale state is distinguishable and
   that a supervisor can follow plan progress without inspecting a PTY before
   adding the shape to `AGENT-SPEC.md`.
+- **DQ4 Relaunch boundary:** Ratify and implement a generation-aware lifecycle
+  that preserves R11's nondisruptive adoption while making launch-definition
+  drift explicit. The model has three separate identities:
+
+  | Identity | Meaning | Changes when |
+  | --- | --- | --- |
+  | declaration revision | the accepted canonical Agent Spec declaration | any declaration content changes |
+  | launch generation | a versioned digest of one lowered effective spawn contract | a value needed to reproduce that task's launch changes |
+  | replacement intent | explicit task-scoped authority to disrupt a live process | an operator requests a compare-and-replace transition |
+
+  Assignment, metadata, and Resource binding changes advance the declaration
+  revision but do not change a task's launch generation unless they lower into
+  its effective spawn contract. They never imply replacement. The launch
+  generation covers stable task identity, backend/kind, command or argv,
+  working directory, complete effective environment, and every materialized
+  input consumed at process start. It uses a deterministic, versioned canonical
+  encoding; st2 persists the observed value beside runtime identity when it
+  launches a task.
+
+  Inspection exposes declaration revision plus desired and observed launch
+  generations. Their relation is a tagged state: `converged`, `drifted`, or
+  `unknown`. `unknown` covers a surviving legacy process without recorded
+  launch identity and remains nondisruptive.
+
+  Reconciliation follows this matrix:
+
+  | Declaration | Process | Generation relation | Intent | Action |
+  | --- | --- | --- | --- | --- |
+  | active | absent or dead | any | none | reap stale state and launch the latest desired generation |
+  | active | alive | converged | none | adopt |
+  | active | alive | drifted | none | adopt and report drift |
+  | active | alive | unknown | none | adopt and report unknown |
+  | active | alive | converged, drifted, or unknown | matching replacement | replace and persist a receipt |
+  | active | alive | any | stale or mismatched replacement | reject without disruption |
+  | retired | alive | any | retirement | tear down and do not relaunch |
+  | retired | absent or dead | any | retirement | retain retired state; do not launch |
+
+  Publication and reconciliation are observational for a healthy process.
+  Automatic relaunch occurs only when an active declared task has no live
+  process. Intentional replacement of a live task is a separate task-scoped
+  action that names the expected runtime identity or observed generation and
+  the desired generation. A replacement receipt records the prior runtime,
+  requested transition, stop result, launch result, and resulting runtime so a
+  partial failure cannot be reported as convergence.
+
+  Changing task identity is not replacement. If the old identity is live, st2
+  must not silently orphan it or launch a duplicate successor. The transition
+  is rejected until explicit retirement, or one atomic old-to-new replacement
+  intent authorizes and receipts both sides. Control-plane replacement never
+  supplies that authority.
+
+  Executable acceptance proves:
+
+  1. assignment, metadata, and Resource-only edits preserve PID, creation
+     identity, and observed launch generation;
+  2. command, argv, cwd, effective-environment, and boot-input edits preserve a
+     healthy PID while exposing `drifted`;
+  3. normal and forced `st2 up` replacement preserves the live runtime and its
+     observed generation;
+  4. natural exit or death launches exactly one process at the latest desired
+     generation;
+  5. matching replacement changes runtime identity exactly once, while a stale
+     request changes nothing;
+  6. retirement tears down and subsequent reconciliation does not relaunch;
+  7. identity transitions cannot leave an unreported orphan or duplicate; and
+  8. legacy runtime records are exposed as `unknown` and adopted without
+     disruption.
+
+  This requires Nathan's approval of the corresponding protected requirements
+  before it moves from design question to implementation contract. See
+  [#40](https://github.com/compoundingtech/st2/issues/40),
+  [#41](https://github.com/compoundingtech/st2/issues/41),
+  [#44](https://github.com/compoundingtech/st2/issues/44), and
+  [#60](https://github.com/compoundingtech/st2/issues/60).
