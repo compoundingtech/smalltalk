@@ -105,9 +105,11 @@ accepted.
   tasks, and live PTY PID/generation stay unchanged.
 - **R22 Visible, nondisruptive launch drift:** st2 derives a versioned desired
   launch fingerprint from the minimal effective fields it already passes to a
-  task and records an observed fingerprint only when st2 launches that runtime.
-  Inspection reports `converged`, `drifted`, or `unknown`; a healthy
-  `drifted` or `unknown` task is adopted without implicit restart.
+  task. Only an st2 launch records an observed fingerprint, bound to that
+  launch's exact runtime identity and creation incarnation. A missing or
+  mismatched binding reports `unknown`; otherwise inspection reports
+  `converged` or `drifted`. Healthy `drifted` and `unknown` tasks are adopted
+  without implicit restart.
 - **R23 Explicit replacement boundary:** An absent or dead active task launches
   from the latest current declaration. Retirement stops live work and prevents
   relaunch. Replacing live work is a separate, explicitly selected operation

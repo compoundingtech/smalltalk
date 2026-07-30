@@ -187,18 +187,23 @@ the resident supervisor continues to reconcile the complete local catalog.
   metadata, unrelated inherited environment, file contents, and other boot-time
   snapshots are not part of this fingerprint.
 
-  st2 records the observed fingerprint only as part of its own successful task
-  launch. Inspection compares desired with observed and reports:
+  As part of its own successful task launch, st2 records the observed
+  fingerprint together with that launch's exact runtime identity and creation
+  incarnation. The observed fingerprint is trustworthy only while the current
+  live runtime exactly matches that binding. Inspection then reports:
 
   | State | Meaning | Healthy-task action |
   | --- | --- | --- |
-  | `converged` | desired and observed fingerprints match | adopt |
-  | `drifted` | both exist and differ | adopt and report drift |
-  | `unknown` | no trustworthy observed fingerprint exists | adopt and report unknown |
+  | `converged` | desired and bound observed fingerprints match | adopt |
+  | `drifted` | desired and bound observed fingerprints differ | adopt and report drift |
+  | `unknown` | the observed binding is missing or does not match the live runtime | adopt and report unknown |
 
-  `unknown` includes a healthy legacy or externally adopted runtime. Catalog
-  publication, supervisor restart, metadata edits, and launch-field edits do
-  not implicitly disrupt any healthy task.
+  `unknown` includes a healthy legacy or externally adopted runtime, as well as
+  a manual PTY restart or external child replacement whose runtime identity or
+  creation incarnation no longer matches st2's launch record. Stale observed
+  metadata is never reused for the new incarnation. Catalog publication,
+  supervisor restart, metadata edits, and launch-field edits do not implicitly
+  disrupt any healthy task.
 
   Ordinary reconciliation remains sufficient after every interruption:
 
@@ -234,7 +239,10 @@ the resident supervisor continues to reconcile the complete local catalog.
   1. metadata, tags, and Resource-only edits preserve the fingerprint and live
      runtime, while kind, launch, resolved-cwd, or effective-environment edits
      report `drifted` without changing runtime identity;
-  2. a healthy legacy runtime reports `unknown` and remains unchanged;
+  2. a healthy legacy runtime reports `unknown` and remains unchanged, and a
+     manual or external restart with a changed runtime identity or creation
+     incarnation cannot reuse the prior observed fingerprint and reports
+     `unknown`;
   3. natural exit or death launches once from the latest current declaration
      and records that launch's observed fingerprint;
   4. explicit replacement refuses stale identity or scope, and affects only
