@@ -2139,6 +2139,62 @@ mod tests {
         }));
     }
 
+    #[test]
+    fn selected_identity_conflict_refuses_before_hook_verification_or_inventory() {
+        let mut spec = AgentSpec {
+            identity: "codex".into(),
+            name: None,
+            description: None,
+            host: None,
+            role: None,
+            job_type: JobType::Service,
+            workspace: None,
+            supervisor: None,
+            retired: false,
+            keep: false,
+            restart: None,
+            resources: vec![],
+            tasks: vec![Task {
+                kind: TaskKind::Pty,
+                derived: false,
+                name: "agent".into(),
+                id: Some("test.codex.agent".into()),
+                command: None,
+                argv: Some(vec!["$CATALOG/bin/codex".into(), "--version".into()]),
+                cwd: None,
+                tags: BTreeMap::new(),
+                env: BTreeMap::new(),
+                keep: false,
+                lifecycle: TaskLifecycle::Service,
+            }],
+            path: "/tmp/spec.kdl".into(),
+        };
+        spec.tasks[0]
+            .env
+            .insert("ST_AGENT".into(), "wrong.actor".into());
+        let runner = GateRunner {
+            list_calls: Cell::new(0),
+        };
+        let verify_calls = Cell::new(0);
+
+        let error = up_once_selected_specs_with_gates(
+            Path::new("/tmp"),
+            &[spec],
+            "test.codex.agent",
+            "test",
+            &runner,
+            || {
+                verify_calls.set(verify_calls.get() + 1);
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("conflicting ST_AGENT"));
+        assert_eq!(verify_calls.get(), 0);
+        assert_eq!(runner.list_calls.get(), 0);
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn idle_supervisor_does_not_spin_on_its_own_catalog_reads() {

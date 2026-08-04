@@ -461,9 +461,7 @@ fn selected_one_shot_wrong_host_refuses_before_runner_list() {
     assert!(error.to_string().contains("did not resolve"));
     assert_refusal(&runner);
 }
-use st2::{
-    FlappingCap, UpReport, discover, down, execute, reconcile as reconcile_result, up_once,
-};
+use st2::{FlappingCap, UpReport, discover, down, execute, reconcile as reconcile_result, up_once};
 
 fn reconcile<'a>(specs: &'a [AgentSpec], sessions: &[Session], host: &str) -> ReconcilePlan<'a> {
     reconcile_result(specs, sessions, host).unwrap()
@@ -665,10 +663,7 @@ agent "demo" {
 #[test]
 fn runner_owned_identity_injects_compact_and_explicit_task_omissions_and_accepts_a_match() {
     for (source, expected_ids) in [
-        (
-            COMPACT_AGENT_WITH_DING,
-            vec!["hetz.demo", "hetz.demo.ding"],
-        ),
+        (COMPACT_AGENT_WITH_DING, vec!["hetz.demo", "hetz.demo.ding"]),
         (
             EXPLICIT_RUNNER_IDENTITY_AGENT,
             vec![
@@ -736,10 +731,7 @@ fn runner_owned_identity_metadata_is_form_equivalent_and_role_scoped() {
         primary_tags.get("agent.actor.path"),
         Some(&Some("hetz.demo".to_owned()))
     );
-    assert_eq!(
-        primary_tags.get("role"),
-        Some(&Some("agent".to_owned()))
-    );
+    assert_eq!(primary_tags.get("role"), Some(&Some("agent".to_owned())));
     assert_eq!(
         primary_tags.get("run.role"),
         Some(&Some("coding-agent".to_owned()))
@@ -795,8 +787,59 @@ fn runner_owned_identity_conflict_refuses_before_materialization_or_runner_acces
     assert!(!workspace.join("IDENTITY").exists());
     assert_eq!(
         report.errors,
-        ["agent 'hetz.demo' task 'agent' declares conflicting ST_AGENT 'wrong.actor'; expected runner-owned value 'hetz.demo'"]
+        [
+            "agent 'hetz.demo' task 'agent' declares conflicting ST_AGENT 'wrong.actor'; expected runner-owned value 'hetz.demo'"
+        ]
     );
+}
+
+#[test]
+fn selected_identity_validation_includes_conflicting_active_siblings() {
+    let selected = task_spec("selected", Some("host"), "host.selected.work");
+    let mut sibling = task_spec("sibling", Some("host"), "host.sibling.work");
+    sibling.tasks[0]
+        .env
+        .insert("ST_AGENT".into(), "wrong.actor".into());
+    let runner = FakeRunner::default();
+
+    let error = up_once_selected_specs(
+        Path::new("/tmp"),
+        &[selected, sibling],
+        "host.selected.work",
+        "host",
+        &runner,
+    )
+    .unwrap_err();
+
+    assert!(error.to_string().contains("conflicting ST_AGENT"));
+    assert_eq!(runner.list_calls.get(), 0);
+    assert!(runner.spawned.borrow().is_empty());
+}
+
+#[test]
+fn retired_identity_conflict_does_not_block_stale_task_cleanup() {
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        "agents/hetz/retired/agent.kdl",
+        r#"agent "retired" {
+  host "hetz"
+  retired #true
+  command "true"
+  env { ST_AGENT "stale.wrong" }
+}"#,
+    );
+    let runner = FakeRunner {
+        sessions: vec![live("hetz.retired")],
+        ..Default::default()
+    };
+
+    let report = up_once(tmp.path(), "hetz", &runner).unwrap();
+
+    assert!(report.errors.is_empty(), "{:?}", report.errors);
+    assert_eq!(runner.list_calls.get(), 1);
+    assert_eq!(runner.killed.borrow().as_slice(), ["hetz.retired"]);
+    assert!(runner.spawned.borrow().is_empty());
 }
 
 #[test]
@@ -817,7 +860,10 @@ fn runner_owned_identity_is_rederived_for_dead_task_replay() {
     let report = up_once(tmp.path(), "hetz", &replay).unwrap();
 
     assert!(report.errors.is_empty(), "{:?}", report.errors);
-    assert_eq!(replay.reaped.borrow().as_slice(), ["hetz.demo", "hetz.demo.ding"]);
+    assert_eq!(
+        replay.reaped.borrow().as_slice(),
+        ["hetz.demo", "hetz.demo.ding"]
+    );
     for target in replay.spawned_targets.borrow().iter() {
         assert_eq!(
             target.env.get("ST_AGENT").map(String::as_str),

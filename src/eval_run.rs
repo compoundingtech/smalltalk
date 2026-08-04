@@ -369,12 +369,32 @@ pub fn boot_team(agent_specs: &[AgentSpec], host: &str, root: &Path) -> Result<U
     // supervise/teardown sweep could reap them (cross-eval corruption + fleet ding-flapping). Rooting it
     // under the catalog makes every eval fully isolated — it can only ever see/reap its OWN sessions.
     let runner = SystemRunner::new(root.to_path_buf(), root.join("exec"));
+    boot_team_with_runner(agent_specs, host, &runner)
+}
+
+fn boot_team_with_runner(
+    agent_specs: &[AgentSpec],
+    host: &str,
+    runner: &dyn Runner,
+) -> Result<UpReport> {
+    crate::reconcile::validate_task_identities(agent_specs, host)?;
     let sessions = runner.list_sessions().context("listing pty sessions")?;
     let plan = reconcile(agent_specs, &sessions, host)?;
     let mut report = UpReport::default();
     let mut cap = FlappingCap::default();
-    execute(&plan, &runner, &mut cap, &mut report);
+    execute(&plan, runner, &mut cap, &mut report);
     Ok(report)
+}
+
+fn supervised_eval_sessions(
+    agent_specs: &[AgentSpec],
+    host: &str,
+    runner: &dyn Runner,
+) -> Result<Vec<crate::reconcile::Session>> {
+    crate::reconcile::validate_task_identities(agent_specs, host)?;
+    runner
+        .list_sessions()
+        .context("listing supervised eval sessions")
 }
 
 /// Resolve a spec argument to `(spec-file, root-dir)`: a `*.kdl` FILE → that file (root = its dir); a
@@ -1165,7 +1185,7 @@ fn run_eval_inner(spec: &Spec, eval: &Eval, spec_dir: &Path, catalog: &Path, hos
                     // that was alive and is now dead non-cleanly (non-zero/killed/vanished) → crash-ding
                     // its supervisor chain. A clean exit (code 0) stays SILENT (a false ding on a routine
                     // finish is as bad as a missed crash).
-                    let report = match supervise_runner.list_sessions() {
+                    let report = match supervised_eval_sessions(&specs, host, &supervise_runner) {
                         Ok(sessions) => {
                             let by_id: std::collections::HashMap<
                                 &str,
@@ -1464,7 +1484,7 @@ fn now_ms() -> u64 {
 mod tests {
     use super::*;
     use crate::reconcile::{Session, TaskTarget};
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
 
     fn write_eval_agent(catalog: &Path, relative: &str, body: &str) {
         let path = catalog.join(relative);
@@ -1755,6 +1775,63 @@ agent "worker" { identity "worker"; host "evalhost"; argv "true" }
         fn spawn(&self, _: &TaskTarget, _: &Path) -> anyhow::Result<()> { Ok(()) }
         fn kill(&self, id: &str) -> anyhow::Result<()> { self.ops.borrow_mut().push(format!("kill:{id}")); anyhow::bail!("already gone") }
         fn remove(&self, id: &str) -> anyhow::Result<()> { self.ops.borrow_mut().push(format!("remove:{id}")); anyhow::bail!("already gone") }
+    }
+
+    struct InventoryRunner {
+        list_calls: Cell<usize>,
+    }
+
+    impl Runner for InventoryRunner {
+        fn list_sessions(&self) -> anyhow::Result<Vec<Session>> {
+            self.list_calls.set(self.list_calls.get() + 1);
+            Ok(Vec::new())
+        }
+
+        fn spawn(&self, _: &TaskTarget, _: &Path) -> anyhow::Result<()> {
+            panic!("identity admission must refuse before spawn")
+        }
+
+        fn kill(&self, _: &str) -> anyhow::Result<()> {
+            panic!("identity admission must refuse before kill")
+        }
+
+        fn remove(&self, _: &str) -> anyhow::Result<()> {
+            panic!("identity admission must refuse before remove")
+        }
+    }
+
+    fn conflicting_eval_specs() -> Vec<AgentSpec> {
+        let parsed = parse_spec(r#"agent "worker" { command "true" }"#).unwrap();
+        let mut specs = spec_to_agent_specs(&parsed.agents, "host", Path::new("/tmp/eval"));
+        specs[0].tasks[0]
+            .env
+            .insert("ST_AGENT".into(), "wrong.actor".into());
+        specs
+    }
+
+    #[test]
+    fn eval_boot_identity_conflict_refuses_before_runner_inventory() {
+        let runner = InventoryRunner {
+            list_calls: Cell::new(0),
+        };
+
+        let error = boot_team_with_runner(&conflicting_eval_specs(), "host", &runner).unwrap_err();
+
+        assert!(error.to_string().contains("conflicting ST_AGENT"));
+        assert_eq!(runner.list_calls.get(), 0);
+    }
+
+    #[test]
+    fn supervised_eval_tick_identity_conflict_refuses_before_runner_inventory() {
+        let runner = InventoryRunner {
+            list_calls: Cell::new(0),
+        };
+
+        let error =
+            supervised_eval_sessions(&conflicting_eval_specs(), "host", &runner).unwrap_err();
+
+        assert!(error.to_string().contains("conflicting ST_AGENT"));
+        assert_eq!(runner.list_calls.get(), 0);
     }
 
     #[test]

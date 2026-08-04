@@ -9,7 +9,11 @@ use st2::reconcile::ObservedPtyPresentation;
 use st2::spec::{AgentSpec, JobType, Resource, Task, TaskKind, TaskLifecycle};
 use st2::{Session, reconcile as reconcile_result};
 
-fn reconcile<'a>(specs: &'a [AgentSpec], sessions: &[Session], host: &str) -> st2::ReconcilePlan<'a> {
+fn reconcile<'a>(
+    specs: &'a [AgentSpec],
+    sessions: &[Session],
+    host: &str,
+) -> st2::ReconcilePlan<'a> {
     reconcile_result(specs, sessions, host).unwrap()
 }
 
@@ -527,7 +531,10 @@ fn live_pty_presentation_is_exact_id_metadata_and_not_lifecycle_drift() {
         secondary.tags,
         BTreeMap::from([
             ("agent.presentation.schema".to_owned(), Some("1".to_owned())),
-            ("agent.actor.path".to_owned(), Some("hetz.worker".to_owned())),
+            (
+                "agent.actor.path".to_owned(),
+                Some("hetz.worker".to_owned()),
+            ),
             (
                 "agent.presentation.description".to_owned(),
                 Some("Owns build delivery".to_owned()),
