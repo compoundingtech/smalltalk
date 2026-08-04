@@ -461,7 +461,13 @@ fn selected_one_shot_wrong_host_refuses_before_runner_list() {
     assert!(error.to_string().contains("did not resolve"));
     assert_refusal(&runner);
 }
-use st2::{FlappingCap, UpReport, discover, down, execute, reconcile, up_once};
+use st2::{
+    FlappingCap, UpReport, discover, down, execute, reconcile as reconcile_result, up_once,
+};
+
+fn reconcile<'a>(specs: &'a [AgentSpec], sessions: &[Session], host: &str) -> ReconcilePlan<'a> {
+    reconcile_result(specs, sessions, host).unwrap()
+}
 
 #[derive(Default)]
 struct FakeRunner {
@@ -471,6 +477,7 @@ struct FakeRunner {
     fail_spawn: Option<String>,
     fail_reap: Option<String>,
     spawned: RefCell<Vec<String>>,
+    spawned_targets: RefCell<Vec<TaskTarget>>,
     spawn_dirs: RefCell<Vec<(String, String)>>,
     killed: RefCell<Vec<String>>,
     reaped: RefCell<Vec<String>>,
@@ -495,6 +502,7 @@ impl Runner for FakeRunner {
             .borrow_mut()
             .push(format!("spawn:{}", target.pty_id));
         self.spawned.borrow_mut().push(target.pty_id.clone());
+        self.spawned_targets.borrow_mut().push(target.clone());
         self.spawn_dirs
             .borrow_mut()
             .push((target.pty_id.clone(), spec_dir.display().to_string()));
@@ -639,6 +647,200 @@ agent "demo" {
   ding
 }
 "#;
+
+const EXPLICIT_RUNNER_IDENTITY_AGENT: &str = r#"
+agent "demo" {
+  host "hetz"
+  pty "agent" { id "hetz.demo"; command "true" }
+  pty "shell" { id "hetz.demo.shell"; command "true" }
+  exec "sidecar" { id "hetz.demo.sidecar"; command "true" }
+  exec "matched" {
+    id "hetz.demo.matched"
+    command "true"
+    env { ST_AGENT "hetz.demo" }
+  }
+}
+"#;
+
+#[test]
+fn runner_owned_identity_injects_compact_and_explicit_task_omissions_and_accepts_a_match() {
+    for (source, expected_ids) in [
+        (
+            COMPACT_AGENT_WITH_DING,
+            vec!["hetz.demo", "hetz.demo.ding"],
+        ),
+        (
+            EXPLICIT_RUNNER_IDENTITY_AGENT,
+            vec![
+                "hetz.demo",
+                "hetz.demo.matched",
+                "hetz.demo.shell",
+                "hetz.demo.sidecar",
+            ],
+        ),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        write(tmp.path(), "agents/hetz/demo/agent.kdl", source);
+        let runner = FakeRunner::default();
+
+        let report = up_once(tmp.path(), "hetz", &runner).unwrap();
+
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert_eq!(runner.spawned.borrow().as_slice(), expected_ids);
+        for target in runner.spawned_targets.borrow().iter() {
+            assert_eq!(
+                target.env.get("ST_AGENT").map(String::as_str),
+                Some("hetz.demo"),
+                "task {}",
+                target.pty_id
+            );
+        }
+    }
+}
+
+#[test]
+fn runner_owned_identity_metadata_is_form_equivalent_and_role_scoped() {
+    let compact = tempfile::tempdir().unwrap();
+    write(
+        compact.path(),
+        "agents/hetz/demo/agent.kdl",
+        COMPACT_AGENT_WITH_DING,
+    );
+    let compact_runner = FakeRunner::default();
+    up_once(compact.path(), "hetz", &compact_runner).unwrap();
+
+    let explicit = tempfile::tempdir().unwrap();
+    write(
+        explicit.path(),
+        "agents/hetz/demo/agent.kdl",
+        EXPLICIT_RUNNER_IDENTITY_AGENT,
+    );
+    let explicit_runner = FakeRunner::default();
+    up_once(explicit.path(), "hetz", &explicit_runner).unwrap();
+
+    let compact_targets = compact_runner.spawned_targets.borrow();
+    let explicit_targets = explicit_runner.spawned_targets.borrow();
+    let compact_agent = compact_targets
+        .iter()
+        .find(|target| target.pty_id == "hetz.demo")
+        .unwrap();
+    let explicit_agent = explicit_targets
+        .iter()
+        .find(|target| target.pty_id == "hetz.demo")
+        .unwrap();
+    assert_eq!(compact_agent.presentation, explicit_agent.presentation);
+    assert_eq!(compact_agent.tags, explicit_agent.tags);
+
+    let primary_tags = &compact_agent.presentation.as_ref().unwrap().tags;
+    assert_eq!(
+        primary_tags.get("agent.actor.path"),
+        Some(&Some("hetz.demo".to_owned()))
+    );
+    assert_eq!(
+        primary_tags.get("role"),
+        Some(&Some("agent".to_owned()))
+    );
+    assert_eq!(
+        primary_tags.get("run.role"),
+        Some(&Some("coding-agent".to_owned()))
+    );
+
+    let secondary = explicit_targets
+        .iter()
+        .find(|target| target.pty_id == "hetz.demo.shell")
+        .unwrap();
+    let secondary_tags = &secondary.presentation.as_ref().unwrap().tags;
+    assert_eq!(
+        secondary_tags.get("agent.actor.path"),
+        Some(&Some("hetz.demo".to_owned()))
+    );
+    assert_eq!(secondary_tags.get("role"), Some(&None));
+    assert_eq!(secondary_tags.get("run.role"), Some(&None));
+
+    let sidecar = explicit_targets
+        .iter()
+        .find(|target| target.pty_id == "hetz.demo.sidecar")
+        .unwrap();
+    assert_eq!(sidecar.kind, TaskKind::Exec);
+    assert!(sidecar.presentation.is_none());
+    assert!(sidecar.tags.is_empty());
+}
+
+#[test]
+fn runner_owned_identity_conflict_refuses_before_materialization_or_runner_access() {
+    let tmp = tempfile::tempdir().unwrap();
+    let workspace = tmp.path().join("workspace");
+    fs::create_dir_all(&workspace).unwrap();
+    write(
+        tmp.path(),
+        "agents/hetz/demo/agent.kdl",
+        &format!(
+            r#"agent "demo" {{
+  host "hetz"
+  workspace "{}"
+  command "true"
+  env {{ ST_AGENT "wrong.actor" }}
+  render {{ file "IDENTITY" "$ST_AGENT" }}
+}}
+"#,
+            workspace.display()
+        ),
+    );
+    let runner = FakeRunner::default();
+
+    let report = up_once(tmp.path(), "hetz", &runner).unwrap();
+
+    assert_eq!(runner.list_calls.get(), 0);
+    assert!(runner.spawned.borrow().is_empty());
+    assert!(!workspace.join("IDENTITY").exists());
+    assert_eq!(
+        report.errors,
+        ["agent 'hetz.demo' task 'agent' declares conflicting ST_AGENT 'wrong.actor'; expected runner-owned value 'hetz.demo'"]
+    );
+}
+
+#[test]
+fn runner_owned_identity_is_rederived_for_dead_task_replay() {
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        "agents/hetz/demo/agent.kdl",
+        COMPACT_AGENT_WITH_DING,
+    );
+    let first = FakeRunner::default();
+    up_once(tmp.path(), "hetz", &first).unwrap();
+    let replay = FakeRunner {
+        sessions: vec![dead("hetz.demo"), dead("hetz.demo.ding")],
+        ..Default::default()
+    };
+
+    let report = up_once(tmp.path(), "hetz", &replay).unwrap();
+
+    assert!(report.errors.is_empty(), "{:?}", report.errors);
+    assert_eq!(replay.reaped.borrow().as_slice(), ["hetz.demo", "hetz.demo.ding"]);
+    for target in replay.spawned_targets.borrow().iter() {
+        assert_eq!(
+            target.env.get("ST_AGENT").map(String::as_str),
+            Some("hetz.demo"),
+            "task {}",
+            target.pty_id
+        );
+    }
+    assert_eq!(
+        first
+            .spawned_targets
+            .borrow()
+            .iter()
+            .map(|target| (&target.pty_id, target.env.get("ST_AGENT")))
+            .collect::<Vec<_>>(),
+        replay
+            .spawned_targets
+            .borrow()
+            .iter()
+            .map(|target| (&target.pty_id, target.env.get("ST_AGENT")))
+            .collect::<Vec<_>>()
+    );
+}
 
 #[test]
 fn up_once_launches_all_tasks_of_a_fresh_agent() {

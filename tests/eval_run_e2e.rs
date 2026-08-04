@@ -61,13 +61,11 @@ env { PTY_ROOT "$CATALOG/pty" }
 team "t" {
   agent "sup" {
     workspace "./sup"
-    env { ST_AGENT "t.sup" }
     command "sh $CATALOG/scripts/sup.sh"
     ding
   }
   agent "worker" {
     workspace "./worker"
-    env { ST_AGENT "t.worker" }
     command "sh $CATALOG/scripts/worker.sh"
     ding
   }
@@ -419,7 +417,6 @@ exec sleep 60
         r#"
 host "evalhost"
 agent "legacy" {
-  env { ST_AGENT "legacy" }
   command "sh $CATALOG/scripts/legacy.sh"
 }
 eval {
@@ -931,7 +928,6 @@ eval {
 const RUNTIME_PEER_SPEC: &str = r#"
 env { ST_ROOT "$CATALOG/custom-bus"; PTY_ROOT "$CATALOG/pty" }
 agent "sup" {
-  env { ST_AGENT "sup" }
   command "sh -c 'pty run -d --id rtpeer -- sleep 100000; for _ in $(seq 1 100); do test -s $PTY_ROOT/rtpeer.pid && break; sleep 0.05; done; cat $PTY_ROOT/rtpeer.pid > $CATALOG/runtime-peer.pid; exec sleep 100000'"
 }
 eval {
@@ -958,7 +954,7 @@ fn supervise_teardown_reaps_a_runtime_spawned_seat_case(judge_command: &str, exp
     // teardown must reap both the declared seat and the runtime peer. The proof below uses only this
     // invocation's root + exact pid; concurrent evals cannot be observed or killed.
     let spec_text = RUNTIME_PEER_SPEC;
-    assert_eq!(spec_text.len(), 459);
+    assert_eq!(spec_text.len(), 434);
     let sentinel = "judge \"trivial\" { exec \"exit 0\" }";
     assert_eq!(spec_text.matches(sentinel).count(), 1);
     std::fs::write(cell.join("cell.kdl"), spec_text.replace(sentinel, &format!("judge \"trivial\" {{ exec \"{judge_command}\" }}"))).unwrap();
@@ -1232,11 +1228,11 @@ fn supervise_crash_dings_up_the_chain_and_is_silent_on_clean_exit() {
         r#"
 env { ST_ROOT "$CATALOG/custom-bus"; PTY_ROOT "$CATALOG/pty" }
 team "cd" {
-  agent "gate"   { supervisor "cd.cos"; env { ST_AGENT "cd.gate" }; command "sh $CATALOG/scripts/gate.sh" }
-  agent "worker" { supervisor "cd.sup"; env { ST_AGENT "cd.worker" }; command "sh $CATALOG/scripts/worker.sh" }
-  agent "clean"  { supervisor "cd.cos"; env { ST_AGENT "cd.clean" }; command "sh $CATALOG/scripts/clean.sh" }
-  agent "sup"    { supervisor "cd.cos"; env { ST_AGENT "cd.sup" }; command "sh $CATALOG/scripts/sup.sh" }
-  agent "cos"    { env { ST_AGENT "cd.cos" }; command "sleep 100000" }
+  agent "gate"   { supervisor "cd.cos"; command "sh $CATALOG/scripts/gate.sh" }
+  agent "worker" { supervisor "cd.sup"; command "sh $CATALOG/scripts/worker.sh" }
+  agent "clean"  { supervisor "cd.cos"; command "sh $CATALOG/scripts/clean.sh" }
+  agent "sup"    { supervisor "cd.cos"; command "sh $CATALOG/scripts/sup.sh" }
+  agent "cos"    { command "sleep 100000" }
 }
 eval {
   copy "./fixture"
@@ -1366,7 +1362,7 @@ fn st2_eval_fails_fast_when_a_seat_exits_at_boot() {
         cell.join("cell.kdl"),
         r#"
 env { ST_ROOT "$CATALOG/custom-bus"; PTY_ROOT "$CATALOG/pty" }
-agent "bad" { env { ST_AGENT "bad" }; command "definitely-not-a-real-binary-xyz123" }
+agent "bad" { command "definitely-not-a-real-binary-xyz123" }
 eval {
   copy "./fixture"
   message { from "requester"; to "bad"; content "go" }

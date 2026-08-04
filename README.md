@@ -157,7 +157,6 @@ agent "<identity>" {
   // supervisor "<supervisor-bus-id>"
   // name "Release worker"
   // description "Owns release preparation and verification."
-  env { ST_AGENT "<host>.<identity>" }
   argv "codex" "--dangerously-bypass-approvals-and-sandbox" "--dangerously-bypass-hook-trust" "<boot prompt>"
   ding
 

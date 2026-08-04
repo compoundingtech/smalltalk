@@ -58,8 +58,6 @@ pub fn spec_to_agent_specs(agents: &[SpecAgent], host: &str, root: &Path) -> Vec
         .iter()
         .map(|a| {
             let mut tasks = Vec::new();
-            let mut ptags = BTreeMap::new();
-            ptags.insert("role".to_string(), "agent".to_string());
             tasks.push(Task {
                 kind: TaskKind::Pty,
                 derived: false,
@@ -68,7 +66,7 @@ pub fn spec_to_agent_specs(agents: &[SpecAgent], host: &str, root: &Path) -> Vec
                 command: Some(a.command.clone()),
                 argv: None,
                 cwd: None, // → the agent's workspace (resolved relative to `root`)
-                tags: ptags,
+                tags: BTreeMap::new(),
                 env: a.env.clone(),
                 keep: false,
                 lifecycle: TaskLifecycle::Service,
@@ -372,7 +370,7 @@ pub fn boot_team(agent_specs: &[AgentSpec], host: &str, root: &Path) -> Result<U
     // under the catalog makes every eval fully isolated — it can only ever see/reap its OWN sessions.
     let runner = SystemRunner::new(root.to_path_buf(), root.join("exec"));
     let sessions = runner.list_sessions().context("listing pty sessions")?;
-    let plan = reconcile(agent_specs, &sessions, host);
+    let plan = reconcile(agent_specs, &sessions, host)?;
     let mut report = UpReport::default();
     let mut cap = FlappingCap::default();
     execute(&plan, &runner, &mut cap, &mut report);
@@ -680,7 +678,8 @@ fn teardown_team_with_runner(
         })
         .collect();
     if let Ok(sessions) = runner.list_sessions() {
-        let plan = reconcile(&retired, &sessions, host);
+        let plan = reconcile(&retired, &sessions, host)
+            .expect("retired specs are excluded from task identity admission");
         let mut report = UpReport::default();
         let mut cap = FlappingCap::default();
         execute(&plan, runner, &mut cap, &mut report);
@@ -1843,7 +1842,6 @@ agent "worker" { identity "worker"; host "evalhost"; argv "true" }
             team "mix" {
               agent "sup" {
                 workspace "./sup"
-                env { ST_AGENT "mix.sup" }
                 command "exec claude 'boot'"
                 exec "mix.sup.ding" { command "st2 ding mix.sup --identity mix.sup --root $CATALOG/custom-bus" }
               }
@@ -1866,12 +1864,12 @@ agent "worker" { identity "worker"; host "evalhost"; argv "true" }
         assert_eq!(a.tasks[0].id.as_deref(), Some("mix.sup"));
         assert_eq!(a.tasks[0].command.as_deref(), Some("exec claude 'boot'"));
         assert_eq!(a.tasks[0].env.get("ST_ROOT").unwrap(), "$CATALOG/custom-bus"); // cascaded
-        assert_eq!(a.tasks[0].env.get("ST_AGENT").unwrap(), "mix.sup");
+        assert!(!a.tasks[0].env.contains_key("ST_AGENT"));
         // Task 1 = the ding exec keyed by its id, inheriting the agent env.
         assert!(matches!(a.tasks[1].kind, TaskKind::Exec));
         assert_eq!(a.tasks[1].id.as_deref(), Some("mix.sup.ding"));
         assert!(a.tasks[1].command.as_deref().unwrap().starts_with("st2 ding mix.sup"));
-        assert_eq!(a.tasks[1].env.get("ST_AGENT").unwrap(), "mix.sup"); // inherited into the exec
+        assert!(!a.tasks[1].env.contains_key("ST_AGENT"));
     }
 
     fn seed_msg(inbox: &Path, ts: u64, rand: &str, from: &str) {

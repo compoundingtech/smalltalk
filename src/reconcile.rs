@@ -10,6 +10,7 @@
 
 use std::collections::BTreeMap;
 use std::collections::HashMap;
+use std::fmt;
 
 use agent_spec::spec::{AgentSpec, TaskKind, TaskLifecycle};
 
@@ -77,6 +78,78 @@ pub struct PtyPresentation {
 pub const AGENT_PRESENTATION_SCHEMA_TAG: &str = "agent.presentation.schema";
 pub const AGENT_ACTOR_PATH_TAG: &str = "agent.actor.path";
 pub const AGENT_DESCRIPTION_TAG: &str = "agent.presentation.description";
+/// Compatibility role owned by st2 only on the canonical agent PTY.
+pub const COMPATIBILITY_ROLE_TAG: &str = "role";
+/// Stable run role owned by st2 only on the canonical agent PTY.
+pub const RUN_ROLE_TAG: &str = "run.role";
+
+/// Fail-closed admission errors for runner-owned task identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TaskIdentityAdmissionError {
+    Conflict {
+        bus_id: String,
+        task: String,
+        declared: String,
+    },
+}
+
+impl fmt::Display for TaskIdentityAdmissionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Conflict {
+                bus_id,
+                task,
+                declared,
+            } => write!(
+                formatter,
+                "agent '{bus_id}' task '{task}' declares conflicting ST_AGENT '{declared}'; expected runner-owned value '{bus_id}'"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for TaskIdentityAdmissionError {}
+
+/// Reject local active tasks whose authored identity conflicts with the runner-derived bus ID.
+pub fn validate_task_identities(
+    specs: &[AgentSpec],
+    this_host: &str,
+) -> Result<(), TaskIdentityAdmissionError> {
+    for spec in specs {
+        if spec.retired || spec.resolved_host(this_host) != this_host {
+            continue;
+        }
+        let bus_id = spec.bus_id(this_host);
+        for task in &spec.tasks {
+            if let Some(declared) = task.env.get("ST_AGENT")
+                && declared != &bus_id
+            {
+                return Err(TaskIdentityAdmissionError::Conflict {
+                    bus_id,
+                    task: task.name.clone(),
+                    declared: declared.clone(),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Project runner-owned identity and the supervisor source of truth into one launch target.
+fn runner_task_env(
+    spec: &AgentSpec,
+    task: &crate::spec::Task,
+    bus_id: &str,
+) -> BTreeMap<String, String> {
+    let mut env = task.env.clone();
+    env.insert("ST_AGENT".to_owned(), bus_id.to_owned());
+    if let Some(supervisor) = &spec.supervisor {
+        env.insert("ST_SUPERVISOR".to_owned(), supervisor.clone());
+    } else {
+        env.remove("ST_SUPERVISOR");
+    }
+    env
+}
 
 fn pty_presentation(
     spec: &AgentSpec,
@@ -87,6 +160,7 @@ fn pty_presentation(
     if task.kind != TaskKind::Pty {
         return None;
     }
+    let canonical_agent = task.name == "agent" && pty_id == bus_id;
     Some(PtyPresentation {
         pty_id: pty_id.to_owned(),
         display_name: (task.name == "agent").then(|| match spec.name.as_ref() {
@@ -100,6 +174,14 @@ fn pty_presentation(
             ),
             (AGENT_ACTOR_PATH_TAG.to_owned(), Some(bus_id.to_owned())),
             (AGENT_DESCRIPTION_TAG.to_owned(), spec.description.clone()),
+            (
+                COMPATIBILITY_ROLE_TAG.to_owned(),
+                canonical_agent.then(|| "agent".to_owned()),
+            ),
+            (
+                RUN_ROLE_TAG.to_owned(),
+                canonical_agent.then(|| "coding-agent".to_owned()),
+            ),
         ]),
     })
 }
@@ -202,6 +284,7 @@ pub fn reconcile_selected<'a>(
     this_host: &str,
     selector: &str,
 ) -> anyhow::Result<ReconcilePlan<'a>> {
+    validate_task_identities(specs, this_host)?;
     let (owner, task, runtime) = resolve_task(specs, selector, this_host)?;
     let mut plan = ReconcilePlan::default();
     let actual = sessions.iter().find(|s| s.pty_id == runtime);
@@ -234,12 +317,7 @@ pub fn reconcile_selected<'a>(
         }
     };
     let bus_id = owner.bus_id(this_host);
-    let mut env = task.env.clone();
-    if let Some(supervisor) = &owner.supervisor {
-        env.insert("ST_SUPERVISOR".into(), supervisor.clone());
-    } else {
-        env.remove("ST_SUPERVISOR");
-    }
+    let env = runner_task_env(owner, task, &bus_id);
     let target = TaskTarget {
         kind: task.kind,
         pty_id: runtime.clone(),
@@ -314,7 +392,8 @@ pub fn reconcile<'a>(
     specs: &'a [AgentSpec],
     sessions: &[Session],
     this_host: &str,
-) -> ReconcilePlan<'a> {
+) -> Result<ReconcilePlan<'a>, TaskIdentityAdmissionError> {
+    validate_task_identities(specs, this_host)?;
     let by_id: HashMap<&str, bool> = sessions
         .iter()
         .map(|s| (s.pty_id.as_str(), s.alive))
@@ -369,15 +448,7 @@ pub fn reconcile<'a>(
                         unreachable!("discovery rejects tasks carrying both command and argv")
                     }
                 };
-                // `supervisor` is the single source of truth. Hooks and harnesses consume the
-                // derived environment variable, but catalog authors/renderers never need to
-                // duplicate the relationship in env{} (and cannot accidentally make it disagree).
-                let mut env = t.env.clone();
-                if let Some(supervisor) = &spec.supervisor {
-                    env.insert("ST_SUPERVISOR".to_string(), supervisor.clone());
-                } else {
-                    env.remove("ST_SUPERVISOR");
-                }
+                let env = runner_task_env(spec, t, &bus_id);
                 let pty_id = resolve_task_id(&bus_id, &t.name, t.id.as_deref());
                 Some((
                     TaskTarget {
@@ -479,5 +550,5 @@ pub fn reconcile<'a>(
             });
         }
     }
-    plan
+    Ok(plan)
 }

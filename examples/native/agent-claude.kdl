@@ -7,9 +7,6 @@ agent "<identity>" {
   // Optional metadata:
   // role "worker"
   // supervisor "<host>.<supervisor-identity>"
-  env {
-    ST_AGENT "<host>.<identity>"
-  }
 
   // The rendered bus contract requires agent-declared status: busy while executing work, available
   // only when yielding/ready, and dnd only for an explicit hold.

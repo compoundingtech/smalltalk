@@ -1347,6 +1347,11 @@ fn reconcile_pass(
         ..Default::default()
     };
 
+    if let Err(error) = crate::reconcile::validate_task_identities(&found.specs, this_host) {
+        report.errors.push(error.to_string());
+        return report;
+    }
+
     // Verify before touching any Codex workspace. A missing/stale/partial hook set must not rewrite
     // an already-live agent's settings to a nonexistent path. Codex specs remain in reconciliation
     // so live sessions can still be adopted; only their materialization and any new launch defer.
@@ -1400,7 +1405,13 @@ fn reconcile_pass(
     };
     let now = Instant::now();
     debounce.observe(&sessions, now);
-    let mut plan = crate::reconcile(&eligible_specs, &sessions, this_host);
+    let mut plan = match crate::reconcile(&eligible_specs, &sessions, this_host) {
+        Ok(plan) => plan,
+        Err(error) => {
+            report.errors.push(error.to_string());
+            return report;
+        }
+    };
     report.deferred = debounce.defer_flickers(&mut plan, now);
     gate_codex_launches_on_hooks(&mut plan, root, &mut report, || match &hook_error {
         Some(error) => anyhow::bail!("{error}"),
@@ -1498,6 +1509,10 @@ pub(crate) fn reconcile_pass_specs_with_cursor(
     presentation_cursor: &mut PresentationPatchCursor,
 ) -> UpReport {
     let mut report = UpReport::default();
+    if let Err(error) = crate::reconcile::validate_task_identities(specs, this_host) {
+        report.errors.push(error.to_string());
+        return report;
+    }
     let sessions = match runner.list_sessions() {
         Ok(s) => s,
         Err(e) => {
@@ -1535,7 +1550,13 @@ pub(crate) fn reconcile_pass_specs_with_sessions(
     let mut report = UpReport::default();
     let now = Instant::now();
     debounce.observe(sessions, now);
-    let mut plan = crate::reconcile(specs, sessions, this_host);
+    let mut plan = match crate::reconcile(specs, sessions, this_host) {
+        Ok(plan) => plan,
+        Err(error) => {
+            report.errors.push(error.to_string());
+            return report;
+        }
+    };
     report.deferred = debounce.defer_flickers(&mut plan, now);
     execute_with_presentation_cursor(&plan, runner, cap, presentation_cursor, &mut report);
     report
@@ -1591,6 +1612,10 @@ pub fn up_once_selected(
             .into_iter()
             .map(|e| format!("{}: {}", e.path.display(), e.message)),
     );
+    if let Err(error) = crate::reconcile::validate_task_identities(&found.specs, this_host) {
+        report.errors.push(error.to_string());
+        return Ok(report);
+    }
     let owner = owner.clone();
     if crate::hooks::required_by_codex_agent(&owner, this_host, catalog_root)
         && let Err(error) = crate::hooks::verify_installed()
@@ -1636,6 +1661,7 @@ where
     V: FnOnce() -> anyhow::Result<()>,
 {
     crate::reconcile::resolve_task(specs, selector, this_host)?;
+    crate::reconcile::validate_task_identities(specs, this_host)?;
     let sessions = runner
         .list_sessions()
         .map_err(|e| anyhow::anyhow!("list sessions: {e}"))?;

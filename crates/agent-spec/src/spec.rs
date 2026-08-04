@@ -743,8 +743,6 @@ impl RawSpec {
         if self.command.is_some() || self.argv.is_some() {
             let lifecycle =
                 parse_task_lifecycle(&identity, "compact task", self.lifecycle.as_deref())?;
-            let mut tags = BTreeMap::new();
-            tags.insert("role".to_string(), "agent".to_string());
             tasks.push(Task {
                 kind: TaskKind::Pty,
                 derived: false,
@@ -754,7 +752,7 @@ impl RawSpec {
                 command: self.command,
                 argv: self.argv,
                 cwd: None,
-                tags,
+                tags: BTreeMap::new(),
                 env: self.env.clone(),
                 keep: false,
                 lifecycle,

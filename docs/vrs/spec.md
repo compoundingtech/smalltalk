@@ -117,13 +117,15 @@ For each healthy managed PTY, reconciliation uses one atomic exact-task-ID
 `pty metadata patch --id <task-id>` request. Every PTY receives the versioned
 st2-owned tags `agent.presentation.schema=1`,
 `agent.actor.path=<host>.<identity>`, and the optional
-`agent.presentation.description`. The primary task named `agent` additionally
-maps `name` to native `displayName`; secondary tasks retain their task-specific
-display convention. Name is not duplicated in tags. Clearing removes only the
-owned native value or tag, and unrelated PTY metadata is preserved. Repeating
-the same projection is a no-op. Failure is reported and retried by the ordinary
-loop, never converted into launch, teardown, garbage collection, replacement,
-or flapping authority.
+`agent.presentation.description`. The canonical PTY whose task is named `agent`
+and whose ID is `<host>.<identity>` additionally receives the compatibility tags
+`role=agent` and `run.role=coding-agent`, and maps `name` to native
+`displayName`. Secondary PTYs retain their task-specific display convention and
+clear those compatibility tags. Exec tasks receive no PTY presentation. Name is
+not duplicated in tags. Clearing removes only the owned native value or tag,
+and unrelated PTY metadata is preserved. Repeating the same projection is a
+no-op. Failure is reported and retried by the ordinary loop, never converted
+into launch, teardown, garbage collection, replacement, or flapping authority.
 
 ## Resource bindings (R20-R21)
 
@@ -443,6 +445,14 @@ validate ──► materialize ──► host-local st2 scheduler/reconciler
   before launch: the command may select an account-specific `CODEX_HOME` only
   after st2 starts it. `st2 pretrust` remains an explicit operator utility for
   commands that intentionally use the ambient Claude and Codex configs.
+
+  st2 owns `ST_AGENT` for every PTY and exec task, deriving the value as
+  `<resolved-host>.<identity>` on every reconciliation. An omitted value is
+  injected, an authored exact match is accepted, and a conflicting authored
+  value refuses the declaration before workspace materialization or runner
+  access. The derived value is part of the persisted launch environment, so
+  initial launch, supervised replay, and manual PTY restart preserve the same
+  identity.
 
   The canonical `agent` task treats a reconciler's ambient `NO_COLOR` as a
   launcher preference rather than agent policy. Unless the Agent Spec declares

@@ -7,8 +7,8 @@
 //! Principles (from the design — do not violate): legible top-to-bottom, everything in one file, st2
 //! self-contained (`st2 ding`, only `pty` on PATH). Ergonomic collapses (review-driven): a bare `ding`
 //! node is the built-in sidecar (auto-prefixed `team.agent.ding`, `--root $ST_ROOT`) — dedicated, so
-//! `exec` reserves no magic name; `exec`/custom labels auto-prefix to `team.agent.<leaf>`. `ST_AGENT`
-//! stays author-set for now (its auto-derive is provided as a unit-tested helper). (`ding` → `ping` later.)
+//! `exec` reserves no magic name; `exec`/custom labels auto-prefix to `team.agent.<leaf>`.
+//! (`ding` → `ping` later.)
 
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -323,8 +323,6 @@ fn cascade(parent: &BTreeMap<String, String>, child: &BTreeMap<String, String>) 
     out
 }
 
-// ── Future-collapse helpers (kept expanded in the spec for now; the collapse is unit-tested) ──────
-
 /// The canonical ding sidecar for an agent — exactly what `exec "ding"` (no command block)
 /// generates, and the long-term `ding {}` collapse. `--root $ST_ROOT` resolves from the cascaded env
 /// at spawn (the exec backend `$CATALOG`-expands env values, so `ST_ROOT` is an absolute path there) —
@@ -338,12 +336,6 @@ pub fn ding_exec(agent_id: &str) -> SpecExec {
         env: BTreeMap::new(),
         derived: true,
     }
-}
-
-/// `ST_AGENT` is author-set for now; it is always the agent id, so this is the future auto-derive.
-/// Kept as a helper + unit-tested so the future collapse (omit `ST_AGENT` → derive it) is provably safe.
-pub fn derive_st_agent(agent_id: &str) -> String {
-    agent_id.to_string()
 }
 
 // ── Parser ───────────────────────────────────────────────────────────────────────────────────────
@@ -693,13 +685,11 @@ env {
 team "mix" {
   agent "sup" {
     workspace "./sup"
-    env { ST_AGENT "mix.sup" }
     command #"exec claude --permission-mode bypassPermissions 'boot: sup'"#
     ding                                 // built-in sidecar (auto-prefixed to mix.sup.ding, --root $ST_ROOT)
   }
   agent "worker" {
     workspace "./worker"
-    env { ST_AGENT "mix.worker" }
     command #"exec claude --permission-mode auto 'boot: worker'"#
     ding
   }
@@ -712,7 +702,6 @@ eval {
 
   agent "judge" {
     workspace "./"
-    env { ST_AGENT "judge" }
     command #"exec codex --model gpt-5.6-sol 'boot: judge'"#
     ding                                 // built-in sidecar (auto-prefixed to judge.ding)
   }
@@ -743,18 +732,18 @@ eval {
         // Team prefixes agent ids.
         let ids: Vec<&str> = s.agents.iter().map(|a| a.id.as_str()).collect();
         assert_eq!(ids, ["mix.sup", "mix.worker"]);
-        // Agent IS its pty (command on the agent) + a cascaded env (top ST_ROOT + agent ST_AGENT).
+        // Agent IS its pty (command on the agent) + cascaded authored env. The runner adds identity.
         let sup = &s.agents[0];
         assert_eq!(sup.workspace.as_deref(), Some("./sup"));
         assert!(sup.command.contains("exec claude --permission-mode bypassPermissions"));
         assert_eq!(sup.env.get("ST_ROOT").unwrap(), "$CATALOG/custom-bus"); // cascaded from top
-        assert_eq!(sup.env.get("ST_AGENT").unwrap(), "mix.sup"); // agent-level
+        assert!(!sup.env.contains_key("ST_AGENT"));
         // The bare `ding` node auto-derives `<agent>.ding` and st2 generates the standard sidecar
         // against the cascaded $ST_ROOT; it inherits the agent env.
         assert_eq!(sup.execs.len(), 1);
         assert_eq!(sup.execs[0].id, "mix.sup.ding");
         assert_eq!(sup.execs[0].command, "st2 ding --identity mix.sup --root $ST_ROOT");
-        assert_eq!(sup.execs[0].env.get("ST_AGENT").unwrap(), "mix.sup"); // inherited
+        assert!(!sup.execs[0].env.contains_key("ST_AGENT"));
 
         // Eval block.
         let ev = s.eval.as_ref().unwrap();
@@ -890,15 +879,6 @@ team "mix" {
         )
         .unwrap_err();
         assert!(err.to_string().contains("needs a command"), "{err}");
-    }
-
-    #[test]
-    fn st_agent_auto_derive_matches_the_author_set_value() {
-        // The future auto-`ST_AGENT` collapse must equal the author-set value (always the agent id).
-        let s = parse_spec(REFERENCE).unwrap();
-        for a in &s.agents {
-            assert_eq!(derive_st_agent(&a.id), *a.env.get("ST_AGENT").unwrap());
-        }
     }
 
     #[test]

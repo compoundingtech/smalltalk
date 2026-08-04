@@ -265,6 +265,7 @@ pub(crate) fn catalog_owned_render_inputs(
 }
 
 fn render_env(root: &Path, spec: &AgentSpec, this_host: &str) -> BTreeMap<String, String> {
+    let bus_id = spec.bus_id(this_host);
     let mut env = BTreeMap::from([
         ("CATALOG".to_string(), root.display().to_string()),
         ("ST_ROOT".to_string(), root.display().to_string()),
@@ -272,7 +273,7 @@ fn render_env(root: &Path, spec: &AgentSpec, this_host: &str) -> BTreeMap<String
             "PTY_ROOT".to_string(),
             crate::run::effective_pty_root(root).display().to_string(),
         ),
-        ("ST_AGENT".to_string(), spec.bus_id(this_host)),
+        ("ST_AGENT".to_string(), bus_id.clone()),
     ]);
     if let Ok(path) = crate::hooks::versioned_hooks_dir() {
         env.insert("ST_HOOKS".to_string(), path.display().to_string());
@@ -285,6 +286,7 @@ fn render_env(root: &Path, spec: &AgentSpec, this_host: &str) -> BTreeMap<String
             env.insert(key.clone(), expanded);
         }
     }
+    env.insert("ST_AGENT".to_string(), bus_id);
     env
 }
 
@@ -615,6 +617,7 @@ pub fn render_ownership_conflicts(
 
 /// Execute one agent's render plan in declaration order.
 pub fn materialize_agent(root: &Path, spec: &AgentSpec, this_host: &str) -> Result<Vec<String>> {
+    crate::reconcile::validate_task_identities(std::slice::from_ref(spec), this_host)?;
     let plan = parse_plan(spec)?;
     if plan.ops.is_empty() {
         return Ok(Vec::new());
@@ -818,6 +821,7 @@ pub fn materialize_agent(root: &Path, spec: &AgentSpec, this_host: &str) -> Resu
 
 /// Validate an agent's render declaration and all catalog-owned inputs without writing its workspace.
 pub fn validate_agent(root: &Path, spec: &AgentSpec, this_host: &str) -> Result<()> {
+    crate::reconcile::validate_task_identities(std::slice::from_ref(spec), this_host)?;
     let plan = parse_plan(spec)?;
     if plan.ops.is_empty() {
         return Ok(());
@@ -877,6 +881,11 @@ pub fn materialize_catalog_against(
         .iter()
         .map(|spec| spec.bus_id(this_host))
         .collect::<HashSet<_>>();
+    if let Err(error) = crate::reconcile::validate_task_identities(ownership_specs, this_host) {
+        report.failed_agents.extend(selected_ids);
+        report.errors.push(error.to_string());
+        return report;
+    }
     for conflict in render_ownership_conflicts(root, ownership_specs, this_host) {
         let affected = conflict
             .owners
