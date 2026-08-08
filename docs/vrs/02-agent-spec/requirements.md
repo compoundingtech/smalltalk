@@ -13,8 +13,8 @@ the Agent Spec. General field-change behavior that the canonical specification
 does not yet define is proposed until a matching evals specification and proof
 change adopts it.
 
-This work supports root [R01, R06, R11, R13 through R19, and R24 through
-R26](../requirements.md).
+This work supports root [R01, R06, R11, R13 through R19, R24 through R26, and
+R31](../requirements.md).
 It applies to every st2 tool that runs an agent or test. A valid local catalog
 and host-local runtime state are sufficient. It requires no compare-and-swap
 (CAS), lock service, cross-host call, or external registry.

@@ -1,18 +1,18 @@
 //! The restart cap (M1b) — st2's crash-loop guard, driven by the job's declared `restart{}` policy
-//! (spec.md §4 / R16), so every conformant runner behaves identically on a flapping task.
+//! (`docs/vrs/requirements.md` R31), so every conformant runner behaves identically on a flapping
+//! task.
 //!
 //! st2 owns liveness (it respawns a dead task on the next reconcile), so it also owns the restart
 //! decision. Per task it enforces `delay` spacing, then applies `mode`: `delay` **rate-limits** using
 //! a sliding `interval` window (keep restarting once the window clears), while `fail` **parks** the
 //! task (give up + surface it) once its failure budget is spent.
 //!
-//! Those two need different counters, because a rate window cannot express a budget. The supervisor
-//! reconciles every 30s by default, so it can start a task at most twice a minute — below the
-//! 3-per-minute that the default `attempts 3 / interval 60s` budgets. Counted in a window, `fail`'s
-//! budget could never accrue and a permanently-broken task relaunched forever. So `fail` counts
-//! launches since the task last *stayed up* for a full `interval`, which is uptime-scoped rather than
-//! wall-clock-scoped and cannot be outrun by a coarse cadence. That makes [`FlappingCap::end_pass`]
-//! load-bearing: it is how the cap learns a task survived.
+//! Those two need different counters, because a rate window cannot express a budget. When a task
+//! stays up longer than roughly `interval / attempts` before dying again, earlier launches can age
+//! out before `attempts` coexist in the window, so a window-scoped `fail` budget never exhausts.
+//! The `fail` counter instead spans launches until the task *stays up* for a full `interval`;
+//! reconcile cadence cannot outrun it. That makes [`FlappingCap::end_pass`] load-bearing: it is how
+//! the cap learns a task survived.
 //!
 //! The clock is injected (`now: Instant`) so every branch is unit-testable without sleeping.
 

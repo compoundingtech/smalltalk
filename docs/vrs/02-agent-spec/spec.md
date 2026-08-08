@@ -318,7 +318,7 @@ Authoring: [pinned tasks][evals-tasks] and [environment][evals-environment]. The
 Current st2 source: [`AgentSpec` and `Task`](../../../crates/agent-spec/src/spec.rs).
 Evidence: [spawn construction](../../../src/run.rs).
 
-<h3 id="f12">F12 Future policy</h3>
+<h3 id="f12">F12 Future policy (R31)</h3>
 
 Agent or task `keep`, restart `attempts`, `interval`, `delay`, and `mode`, and
 task `lifecycle` are future policy. Adopt healthy work. `adopt-only` holds absent
@@ -327,11 +327,24 @@ the canonical agent's effective eligibility: `adopt-only` holds it, and
 exhausting a fail-mode restart policy stops or suppresses it. Invalid policy
 refuses changes to the related agent and tasks.
 
+`delay` is the minimum spacing between launches in either restart mode. In
+`mode = delay`, `attempts` is a rate limit over the sliding `interval` window;
+an exhausted limit defers launch until the window clears and never parks the
+task. In `mode = fail`, `attempts` is a terminal launch budget counted since
+the task was observed alive on every completed accounting pass for a full
+`interval`. The budget remains reachable independent of reconcile cadence: a
+task that repeatedly launches and dies before recovery is parked after its
+declared successful-launch budget is exhausted. A completed accounting pass
+that does not observe the task alive breaks accrued recovery uptime rather than
+forgiving failures through silence.
+
 Authoring: [pinned complete declaration][evals-fields]. The
 [pinned explicit-task list][evals-task-fields] and st2 `9887b28` predate task
 `lifecycle`. Current st2 source:
-[`Restart` and `TaskLifecycle`](../../../crates/agent-spec/src/spec.rs).
-Evidence: [policy planning](../../../src/reconcile.rs).
+[`Restart` and `TaskLifecycle`](../../../crates/agent-spec/src/spec.rs),
+[`FlappingCap`](../../../src/flapping.rs), and
+[`execute`](../../../src/run.rs). Evidence:
+[policy planning](../../../src/reconcile.rs).
 
 <h3 id="f13">F13 <code>retired #true</code></h3>
 

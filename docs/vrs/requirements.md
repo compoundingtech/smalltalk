@@ -52,6 +52,16 @@ accepted.
   deterministic st2 reconciler keeps declared local processes converged; the
   root observes host-local runtime health, diagnoses failures, performs bounded
   recovery, and escalates what it cannot resolve.
+- **R31 Reachable restart bounds:** Within one supervisor run, restart
+  accounting is per task and only successful launches spend the declared
+  budget. `delay` is the minimum launch spacing in either mode. In delay mode,
+  `attempts` limits launches over the sliding `interval` window without parking
+  the task. In fail mode, `attempts` is reachable independent of reconcile
+  cadence: a task that repeatedly launches and dies without being observed
+  alive on every completed accounting pass for a full `interval` is parked for
+  the remainder of the supervisor run after its successful-launch budget is
+  exhausted. A completed pass that does not observe the task alive breaks
+  accrued recovery uptime rather than forgiving failures through silence.
 - **R22 Quiet coordination after events:** A network with minimal or default
   personas stays quiet while useful work continues. Agents coordinate only after
   an inbox DING, a durable failure, a real blocker, a completion or decision

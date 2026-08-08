@@ -463,7 +463,7 @@ validate ──► materialize ──► host-local st2 scheduler/reconciler
   claims fail every conflicting owner before the first workspace write.
   Targeted reconciliation checks the selected owner against the full fleet, so
   selection cannot bypass this ownership boundary.
-- **R04:** Each machine schedules and reconciles only its pinned work. The st2
+- **R04, R31:** Each machine schedules and reconciles only its pinned work. The st2
   loop is deterministic; exactly one declared root agent provides intelligent
   host-local supervision, bounded recovery, and escalation. Filesystem reads
   never wake reconciliation; only create, modify, rename, or remove events may
@@ -473,6 +473,14 @@ validate ──► materialize ──► host-local st2 scheduler/reconciler
   failing to restart the agent, or terminally parking it, suppresses companion
   launch and stops an exact generated companion proved live; explicitly
   authored sibling tasks remain independent.
+
+  Restart accounting is per task and persists across reconcile passes. Only a
+  successful launch spends its declared budget. Each completed pass supplies
+  the exact task IDs it proved alive; uninterrupted observed liveness may
+  forgive a fail-mode budget according to the
+  [restart field contract](./02-agent-spec/spec.md#f12), while an unobserved task
+  loses accrued recovery uptime. A pass that exits before execution neither
+  supplies a liveness observation nor closes the accounting pass.
 - **R06:** st2 passes the complete effective task definition to the underlying
   launcher so manual and supervised restarts are equivalent. Harness readiness
   that depends on a dynamically selected account belongs to that declared
