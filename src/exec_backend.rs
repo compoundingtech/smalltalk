@@ -58,6 +58,7 @@ pub enum ExecGenerationObservation {
         pid: u32,
         created_at: String,
         generation_id: String,
+        start_time_ticks: u64,
     },
     Exited {
         pid: u32,
@@ -258,6 +259,7 @@ impl ExecBackend {
                 pid,
                 created_at,
                 generation_id,
+                ..
             } => (pid, created_at, generation_id),
             ExecGenerationObservation::Exited { .. } => {
                 self.remove(id)?;
@@ -296,6 +298,7 @@ impl ExecBackend {
                 pid,
                 created_at,
                 generation_id,
+                ..
             } if pid == expected.0 && created_at == expected.1 && generation_id == expected.2 => {}
             ExecGenerationObservation::Exited {
                 pid,
@@ -660,6 +663,7 @@ fn observe_open_strict_generation(
             pid: generation.pid,
             created_at: generation.created_at,
             generation_id: generation.generation_id,
+            start_time_ticks: generation.start_time_ticks,
         },
         GenerationProcessState::Exited => ExecGenerationObservation::Exited {
             pid: generation.pid,
@@ -785,6 +789,7 @@ fn observe_open_legacy_generation(
         pid: pid as u32,
         created_at,
         generation_id,
+        start_time_ticks,
     }
 }
 
@@ -1363,6 +1368,7 @@ mod generation_observation_tests {
                 pid: observed,
                 ref created_at,
                 ref generation_id,
+                ..
             }) if observed == pid
                 && crate::task_inventory::is_rfc3339_utc_millis(created_at)
                 && generation_id.starts_with("sha256:")

@@ -11,7 +11,7 @@ the workspace-trust dialog. Codex gets a dedicated app-server daemon, an observe
 before the interactive client, thread-ownership binding, and a hard version pin — 4940 lines.
 Underneath both sits DING, the screen-scraping transport that exists because neither harness offered
 anything better at the time, and whose safety rests on a synchronous adjacent composer proof
-([`0004`](0004-only-a-synchronous-proof-authorizes-a-pty-write.md)).
+([`0001-ding-harness-dispatch-is-positional-and-harness-owned`](0001-ding-harness-dispatch-is-positional-and-harness-owned.md)).
 
 Adding pi asks which of these shapes it should take. pi answers the question itself: it has no MCP,
 no app-server, and no lifecycle-hook mechanism. What it has is an extension API that runs **inside**
@@ -65,7 +65,7 @@ reproducible with no credentials. Full record and captures:
 pi is a natively-delivered harness. It declares `deliver "pi-channel"` or a typed `pi {}` driver,
 and **no pi arm is added to the DING registry**. The existing rule that refuses `ding` together with
 `deliver` (`crates/agent-spec/src/spec.rs`) is what keeps a pi agent off the PTY write path
-entirely, so [`0004`](0004-only-a-synchronous-proof-authorizes-a-pty-write.md) is untouched.
+entirely, so [`0001-ding-harness-dispatch-is-positional-and-harness-owned`](0001-ding-harness-dispatch-is-positional-and-harness-owned.md) is untouched.
 
 Four things follow, each chosen against a specific failure it prevents:
 

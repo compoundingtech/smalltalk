@@ -451,7 +451,7 @@ this spike:
 
 - `tests/eval_run_e2e.rs::canonical_agents_freeze_the_admitted_route_across_post_boot_catalog_mutation`
   — fails identically with the spike stashed.
-- `src/codex_app_server.rs::tests::runtime_owner_lock_is_nonblocking_and_released_on_close`
+- `src/codex_app_server/tests.rs::runtime_owner_lock_is_nonblocking_and_released_on_close`
   — flaky under parallel `cargo test --lib` when the machine is also compiling;
   green in 4/4 subsequent full runs and green in isolation.
 - `tests/native_only.rs::tracked_product_surface_contains_only_native_names` —

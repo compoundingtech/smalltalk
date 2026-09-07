@@ -1,10 +1,10 @@
 # Stable agent identity is separate from mutable presentation
 
-Status: draft
+Status: superseded by 0015-immutable-agent-id-and-mutable-address
 
-Requirements change authorized by Johannes on 2026-07-31.
-
-Merge and acceptance approval required: Nathan
+Johannes authorized the requirements direction on 2026-07-31. The draft
+required Nathan's merge and acceptance approval, which was not recorded.
+Decision 0015-immutable-agent-id-and-mutable-address independently accepted the replacement contract.
 
 ## Context
 
@@ -70,16 +70,51 @@ driver responsibilities; this read interface grants no lifecycle authority.
   the new fields are optional and additive. Adoption begins only after
   compatible PTY and st2 binaries are deployed; Nix-generated declarations
   first add their ownership marker.
-- This decision remains draft and is not accepted or mergeable until Nathan
-  approves it.
+- Decision 0015-immutable-agent-id-and-mutable-address superseded this unaccepted draft and independently accepted the
+  presentation behavior it retained.
 
-## Evidence required for acceptance
+## Options
+
+| Option | Result | Reason |
+| --- | --- | --- |
+| Stable identity plus direct `name` and `description` | Selected | Added mutable presentation without changing routing, task identity, or durable state. |
+| Sibling mutable `name` file | Rejected | Created a second source of truth outside canonical Agent Spec authoring. |
+| Rename the stable identity | Rejected | Disconnected routing and continuity and had no proved state migration. |
+
+## Evidence and Argument
+
+PTY already separated immutable native session ID from mutable display metadata
+and provided one atomic exact-ID metadata patch. The st2 parser, roster,
+source-preserving authoring, authority, and no-restart reconciliation proofs
+listed below established that direct presentation fields compose with the
+existing runtime without changing task incarnation or durable state.
+
+## Amendment 1 — immutable subject ID and mutable address
+
+Accepted decision 0015-immutable-agent-id-and-mutable-address supersedes this draft's routing model and independently
+accepts its bounded presentation and authoring behavior. The target adds an
+explicit immutable `id`; legacy subjects receive their existing host-qualified
+bus identities as IDs during migration. Positional `identity` remains the
+legacy address fallback. Agent ID is catalog-global; agent address is mutable
+and unique per logical host; bus address is `<host>.<address>`. Exact ID
+selection is explicit.
+
+Decision 0015-immutable-agent-id-and-mutable-address also independently accepts nondisruptive PTY presentation
+projection. Its rejection of a stable-ID alias remains: address is a mutable
+route to the subject, not a second stable ID, and old addresses receive no
+redirect or history.
+
+## Evidence proposed by the draft
+
+The unaccepted draft proposed:
 
 - parser and roster tests across KDL, TOML, and JSON;
 - source-preservation, authority, Nix refusal, and stale-writer tests;
 - exact-ID PTY projection tests for set, clear, idempotence, and partial failure;
-- exact qualified roster selection, nullable values, absent-identity refusal,
-  and co-located declaration tests;
+- exact ID roster selection, nullable values, absent-ID refusal, and co-located
+  declaration tests;
 - a live no-restart test preserving stable task ID, PID, creation identity, and
   generation across Agent Spec presentation changes;
 - a genuine lifecycle-change control that still performs ordinary replacement.
+
+Decision 0015-immutable-agent-id-and-mutable-address carries the accepted proof obligations.

@@ -6,1084 +6,16 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use clap::{Args, CommandFactory, Parser, Subcommand};
+use clap::{CommandFactory, Parser};
 
 use st2::{
     HostLock, Runner, SystemRunner, UpReport, detect_host, ding, discover, exec_state_dir, message,
     up_loop, up_once,
 };
 
-#[derive(Parser)]
-#[command(
-    name = "st2",
-    version = st2::version::display_version(),
-    about = "Harness-agnostic runner over a unified catalog+inbox folder"
-)]
-struct Cli {
-    /// Catalog (or single-file fleet spec) to use. Defaults to $CATALOG, then
-    /// ${XDG_STATE_HOME:-$HOME/.local/state}/st2/default/catalog.
-    #[arg(long = "catalog", global = true, value_name = "PATH")]
-    catalog_path: Option<PathBuf>,
-    #[command(subcommand)]
-    command: Command,
-}
+mod cli;
 
-#[derive(Subcommand)]
-enum Command {
-    /// Discover and print every agent spec under a catalog+inbox folder.
-    Ls {
-        /// Legacy positional catalog/spec path. Prefer --catalog; defaults to $CATALOG, then the
-        /// default st2 catalog.
-        #[arg(conflicts_with = "catalog_path")]
-        root: Option<PathBuf>,
-    },
-    /// Supervise a catalog+inbox folder: reconcile on a folder-watch + timer, keeping each agent's
-    /// ptys running. With --once, do a single pass and exit.
-    Up {
-        /// Legacy positional catalog/spec path. Prefer --catalog; defaults to $CATALOG, then the
-        /// default st2 catalog.
-        #[arg(conflicts_with = "catalog_path")]
-        root: Option<PathBuf>,
-        /// Host to filter on (which agents this machine runs). Defaults to the local hostname.
-        #[arg(long)]
-        host: Option<String>,
-        /// Do a single reconcile pass and exit, instead of looping.
-        #[arg(long)]
-        once: bool,
-        /// Materialize every local agent's render block and exit without reconciling or spawning.
-        #[arg(long, conflicts_with = "once")]
-        materialize_only: bool,
-        /// Limit materialization to one declared agent identity.
-        #[arg(long)]
-        agent: Option<String>,
-        /// Select one exact local task. Use with --materialize-only to render only its owner, or
-        /// with --once to render its owner and reconcile only that task.
-        #[arg(long, conflicts_with = "agent")]
-        task: Option<String>,
-        /// Seconds between timer-driven reconcile passes when looping (folder changes reconcile
-        /// immediately regardless).
-        #[arg(long, default_value_t = 30)]
-        interval: u64,
-    },
-    /// Native message bus: send/list/read/archive/reply over agents' `resources/inbox`.
-    /// The stable wire format is a `<unix-ms>-<rand6>.md` Markdown file.
-    #[command(subcommand)]
-    Message(MessageCmd),
-    /// Declared event streams: durable, bounded, idempotent ingress into an agent inbox.
-    #[command(subcommand)]
-    Event(EventCmd),
-    /// Self-author declared event streams through the serialized catalog path.
-    #[command(subcommand)]
-    Stream(StreamCmd),
-    /// Idempotent JSON request/reply transport for declared non-agent service principals.
-    #[command(subcommand)]
-    Request(RequestCmd),
-    /// An agent's working-state context for lossless restart: read/write/append.
-    #[command(subcommand)]
-    Context(ContextCmd),
-    /// An agent's declared Resource bindings (a named, exact URI a peer can resolve):
-    /// ls/read/add/remove/rename.
-    #[command(subcommand)]
-    Resource(ResourceCmd),
-    /// Install `st2 up` as a systemd-user service on headless Linux. macOS stays manual (TCC).
-    /// Subcommands: install / status / uninstall.
-    #[command(subcommand)]
-    Service(ServiceCmd),
-    /// Install and approve the embedded Claude Code channel plugin.
-    #[command(subcommand)]
-    ClaudeChannel(ClaudeChannelCmd),
-    /// Explicit lifecycle-hook management. `up` and materialization only verify; they never install
-    /// or refresh hooks.
-    #[command(subcommand)]
-    Hooks(HooksCmd),
-    /// Provider-native harness drivers and read-only typed-block expansion.
-    #[command(subcommand)]
-    Driver(DriverCmd),
-    /// The ding sidecar: watch an agent's `resources/inbox` and poke its pty (`[DING] …`) on each new
-    /// message. Busy does not suppress delivery; only fresh dnd defers FIFO. A startup backlog is
-    /// coalesced into one recovery notice. Long-running — st2 keeps it alive as a task alongside the
-    /// agent. Exits when the target pty session is gone.
-    /// `st2 ping` is an alias (the maintainer is renaming ding → ping, since dinging is the runner's
-    /// job now); it is the exact same command.
-    #[command(visible_alias = "ping")]
-    Ding {
-        /// The target pty session to poke (a `pty` session ref). Optional — defaults to `--identity`
-        /// (an agent IS its pty, so the session to poke is the identity), so `st2 ding --identity X`
-        /// is the common form.
-        session: Option<String>,
-        /// Whose inbox to watch — bus id or identity. Defaults to `$ST_AGENT`. Also the default poke
-        /// target when no positional session is given.
-        #[arg(long)]
-        identity: Option<String>,
-        /// Catalog root. Defaults to `$CATALOG`.
-        #[arg(long, conflicts_with = "catalog_path")]
-        root: Option<PathBuf>,
-        /// Host used to resolve `<host>.<identity>` bus ids. Defaults to the local hostname.
-        #[arg(long)]
-        host: Option<String>,
-        /// Poll/liveness cadence in milliseconds (folder changes poke immediately regardless).
-        #[arg(long, default_value_t = 1000)]
-        interval: u64,
-    },
-    /// Internal controlled Codex launch. Generated only for `deliver "app-server"` tasks.
-    #[command(hide = true)]
-    CodexAppServer {
-        /// Exact agent bus identity that owns the controlled thread.
-        #[arg(long)]
-        identity: String,
-        /// Exact reconciled PTY task identity for this runtime.
-        #[arg(long)]
-        runtime_id: String,
-        /// Original structured Codex invocation, including its provider executable.
-        #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
-        codex_argv: Vec<String>,
-    },
-    /// Internal Claude MCP channel server started by Claude from its rendered project declaration.
-    #[command(hide = true)]
-    ClaudeMcp {
-        #[arg(long)]
-        identity: String,
-    },
-    /// Get or set an agent's presence status. No `--set` prints the status; no identity means yours
-    /// (`$ST_AGENT`). Settable: offline | available | busy | away | dnd (`unknown` is derived).
-    Status {
-        /// Whose status — bus id or identity. Defaults to you (`--as` / `$ST_AGENT`).
-        identity: Option<String>,
-        /// Set your status to this state instead of printing it.
-        #[arg(long = "set")]
-        set: Option<String>,
-        #[command(flatten)]
-        ctx: MsgCtx,
-    },
-    /// Set or clear an agent's human-facing name without changing stable identity.
-    Rename(PresentationArgs),
-    /// Set or clear an agent's enduring responsibility description.
-    Describe(PresentationArgs),
-    /// Transactionally publish one canonical Agent Spec into the live catalog.
-    #[command(subcommand)]
-    Agent(AgentCmd),
-    /// Canonical declaration snapshots and crash-recoverable whole-catalog application.
-    #[command(subcommand)]
-    Catalog(CatalogCmd),
-    /// Explicit teardown: kill every live task of this host's catalog agents. The ONLY thing that ends
-    /// tasks (stopping/crashing st2 never does). Idempotent.
-    Down {
-        /// Optional positional catalog/spec path. Prefer --catalog; defaults to $CATALOG, then the
-        /// standard st2 catalog.
-        #[arg(conflicts_with = "catalog_path")]
-        root: Option<PathBuf>,
-        /// Host to tear down. Defaults to the local hostname.
-        #[arg(long)]
-        host: Option<String>,
-    },
-    /// Print shell exports for a catalog's bus — `eval "$(st2 env --catalog <catalog>)"` sets `CATALOG`/
-    /// `ST_ROOT`/`PTY_ROOT` so native bus-aware tools target the catalog.
-    Env {
-        /// Optional positional catalog path. Prefer --catalog; defaults to $CATALOG, then the
-        /// standard st2 catalog.
-        #[arg(conflicts_with = "catalog_path")]
-        root: Option<PathBuf>,
-    },
-    /// Explicitly pre-trust workspaces in the ambient Claude and Codex configs. This is an operator
-    /// utility for harnesses that use those ambient configs; `st2 up` never calls it automatically.
-    /// Account-selecting commands should instead declare trust in the selected harness invocation.
-    Pretrust {
-        /// Workspace directories to mark trusted.
-        #[arg(required = true)]
-        dirs: Vec<PathBuf>,
-    },
-    /// Run an st2-spec eval end to end: copy the fixture, boot the team + judges, deliver the
-    /// kickoff, wait for the sup's confirmation, run the judges → verdict. `st2 eval ./cells/<name>/`.
-    Eval {
-        /// The eval folder (or its `.kdl` spec file).
-        folder: PathBuf,
-        /// Host. Defaults to the local hostname.
-        #[arg(long)]
-        host: Option<String>,
-        /// Preserve the run's temp catalog instead of deleting it — for inspecting the worker repo
-        /// (`base..HEAD`), the judge outputs, and the bus after the run (e.g. a gate reproduction).
-        /// Seats are still torn down (no leaks). Also honored via `ST2_EVAL_KEEP`.
-        #[arg(long)]
-        keep: bool,
-        /// Emit the existing eval report as JSON without changing exit semantics.
-        #[arg(long)]
-        json: bool,
-    },
-    /// Run `pty` against this catalog's bus with the env auto-set, so pty subcommands and the
-    /// interactive UI work without `eval "$(st2 env --catalog <catalog>)"` first. Catalog selection follows
-    /// `--catalog`, `$CATALOG`, then the default st2 catalog. `CATALOG`/`ST_ROOT`/`PTY_ROOT` are
-    /// exported for the child exactly as `st2 env` would. No arguments launches the interactive pty
-    /// UI.
-    Pty {
-        /// Arguments passed through to `pty` verbatim (e.g. `ls`, `peek <session>`). None → the UI.
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-        args: Vec<String>,
-    },
-    /// Drop into `$SHELL` with this catalog's bus env set (`CATALOG`/`ST_ROOT`/`PTY_ROOT`), so `pty`,
-    /// bus-aware tools target the catalog for the whole session without `eval "$(st2 env …)"`.
-    /// The general form of `st2 pty`. Catalog selection follows `--catalog`, `$CATALOG`, then the
-    /// default st2 catalog; extra args go to the shell (e.g. `st2 shell -c "pty ls"`).
-    Shell {
-        /// Arguments passed through to `$SHELL` verbatim. None → an interactive shell.
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-        args: Vec<String>,
-    },
-    /// Validate a rendered catalog against the runner contract (spec fields, folder layout, paths)
-    /// so any renderer can confirm it hit the spec before running. One line per issue with
-    /// a stable code; exits non-zero on any ERROR (`--strict` also fails on warnings). `--json` emits
-    /// machine output for a renderer's build gate.
-    Validate {
-        /// Legacy positional catalog path. Prefer --catalog; defaults to $CATALOG, then the default
-        /// st2 catalog.
-        #[arg(conflicts_with = "catalog_path")]
-        root: Option<PathBuf>,
-        /// Host whose external workspace/task paths should be checked. Structural checks always
-        /// cover the whole catalog. Defaults to the local hostname.
-        #[arg(long)]
-        host: Option<String>,
-        /// Validate this one unpublished canonical Agent Spec as an overlay on the live catalog.
-        #[arg(long, value_name = "FILE")]
-        candidate: Option<PathBuf>,
-        /// Fail (non-zero exit) on warnings too, not just errors.
-        #[arg(long)]
-        strict: bool,
-        /// Emit the report as JSON instead of human-readable lines.
-        #[arg(long)]
-        json: bool,
-    },
-    /// Health check for a catalog: active agents alive, suspended agents not live, and retired
-    /// agents fully absent. Exits non-zero on problems.
-    Doctor {
-        /// Legacy positional catalog path. Prefer --catalog; defaults to $CATALOG, then the default
-        /// st2 catalog.
-        #[arg(conflicts_with = "catalog_path")]
-        root: Option<PathBuf>,
-        /// Host to check. Defaults to the local hostname.
-        #[arg(long)]
-        host: Option<String>,
-        /// Require a live long-running `st2 up` host lock. Omit for manual/--once operation.
-        #[arg(long)]
-        require_supervisor: bool,
-    },
-    /// List every agent in the catalog with presence and retirement state. `--json [--enrich]` is
-    /// the stable machine-readable roster.
-    Agents {
-        /// The catalog folder (like `st2 ls`/`up`). Falls back to `--root`/`$CATALOG`.
-        #[arg(conflicts_with = "catalog_path")]
-        catalog: Option<PathBuf>,
-        /// Only agents whose effective status matches (offline|available|busy|away|dnd|unknown).
-        #[arg(long = "status")]
-        status: Option<String>,
-        /// Select one exact Agent Spec by its fully qualified `<host>.<identity>`.
-        #[arg(long, value_name = "HOST.IDENTITY")]
-        identity: Option<String>,
-        /// Machine-readable JSON array, including retirement and declared Resource bindings.
-        #[arg(long)]
-        json: bool,
-        /// With `--json`, add `lastActivity` + `inbox` count per agent.
-        #[arg(long)]
-        enrich: bool,
-        #[command(flatten)]
-        ctx: MsgCtx,
-    },
-    /// Emit one fail-closed desired-task/runtime diagnostic snapshot. This is
-    /// read-only observation, not reconciliation or cutover authority.
-    Tasks {
-        /// Host whose desired tasks and runtime generations to inspect. Defaults to this host.
-        #[arg(long)]
-        host: Option<String>,
-        /// Emit the versioned machine-readable envelope. Required in v1.
-        #[arg(long)]
-        json: bool,
-    },
-    /// Clear one task's park after fixing what crash-looped it. A task parked by its `restart{}`
-    /// policy (mode=fail) stays parked for the rest of the supervisor run, and this is its per-task
-    /// exit: the running supervisor relaunches exactly this task on its next pass, leaving every
-    /// other task on the host untouched. `st2 tasks --json` reports which tasks are parked.
-    Unpark {
-        /// The parked task's runtime id, exactly as `st2 tasks --json` reports it.
-        task: String,
-        /// Host whose selected-catalog supervisor should grant the request. Defaults to this host.
-        #[arg(long)]
-        host: Option<String>,
-    },
-    /// Print a shell completion script for `st2` to stdout (`st2 completions <bash|zsh|fish|…>`).
-    /// Generated from the live command tree, so it never drifts from the actual flags.
-    Completions {
-        /// The shell to generate completions for.
-        shell: clap_complete::Shell,
-    },
-}
-
-#[derive(Subcommand)]
-enum DriverCmd {
-    /// Print one typed driver block as plain Agent Spec KDL without running it.
-    Expand {
-        /// KDL declaration that contains the typed driver block.
-        spec: PathBuf,
-        /// Select one local or fully qualified identity when the file contains multiple agents.
-        #[arg(long)]
-        agent: Option<String>,
-        /// Host fallback when neither the declaration nor its catalog path supplies one.
-        #[arg(long)]
-        host: Option<String>,
-    },
-    /// Run the existing controlled Codex app-server path.
-    Codex {
-        #[arg(long)]
-        identity: String,
-        #[arg(long)]
-        runtime_id: String,
-        #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
-        argv: Vec<String>,
-    },
-    /// Run the Claude session-owned MCP server over stdio.
-    ClaudeMcp {
-        #[arg(long)]
-        identity: Option<String>,
-    },
-    /// Deprecated name for the Claude MCP server.
-    // Keep this hidden command until no rendered configuration uses the old name.
-    #[command(hide = true)]
-    Claude {
-        #[arg(long)]
-        identity: String,
-    },
-    /// Run Claude under the session-owned presence wrapper.
-    ClaudeSession {
-        #[arg(long)]
-        identity: String,
-        #[arg(long)]
-        runtime_id: String,
-        #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
-        argv: Vec<String>,
-    },
-    /// Apply one Claude hook event (payload on stdin) to observed harness state.
-    ClaudeObserve {
-        #[arg(long)]
-        identity: String,
-        /// The wrapper's runtime/task ID; the record's pty session. Defaults to the identity.
-        #[arg(long)]
-        runtime_id: Option<String>,
-        /// The Claude hook event name, e.g. `Stop` or `PermissionRequest`.
-        #[arg(long)]
-        event: String,
-    },
-    /// Tee Claude's status-line payload (stdin JSON) into harness context, then chain to the
-    /// operator's own renderer.
-    ClaudeStatusline {
-        #[arg(long)]
-        identity: String,
-    },
-    /// Run pi under the session-owned presence wrapper.
-    PiSession {
-        #[arg(long)]
-        identity: String,
-        #[arg(long)]
-        runtime_id: String,
-        #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
-        argv: Vec<String>,
-    },
-    /// Run the pi native message channel over stdio, owned by the shipped pi extension.
-    PiChannel {
-        #[arg(long)]
-        identity: String,
-    },
-    /// Run omp under the session-owned presence wrapper with a hard version gate.
-    OmpSession {
-        #[arg(long)]
-        identity: String,
-        #[arg(long)]
-        runtime_id: String,
-        #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
-        argv: Vec<String>,
-    },
-    /// Run the omp native message channel over stdio, owned by the shipped omp extension.
-    OmpChannel {
-        #[arg(long)]
-        identity: String,
-    },
-    /// Run OpenCode under the session-owned wrapper: presence, observed harness state, and native
-    /// server delivery over the wrapper-allocated local port.
-    OpencodeSession {
-        #[arg(long)]
-        identity: String,
-        #[arg(long)]
-        runtime_id: String,
-        #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
-        argv: Vec<String>,
-    },
-}
-
-#[derive(Subcommand)]
-enum AgentCmd {
-    /// Author reversible whole-agent lifecycle intent in one canonical KDL declaration.
-    DesiredState {
-        /// Exact bus identity, or a bare stable identity only when unique.
-        identity: String,
-        /// Desired whole-agent lifecycle state.
-        #[arg(value_parser = ["running", "suspended", "retired"])]
-        state: String,
-        /// Required rationale for suspended/retired; forbidden for running.
-        #[arg(long)]
-        reason: Option<String>,
-        /// Host used only to resolve declarations whose host is omitted.
-        #[arg(long)]
-        host: Option<String>,
-        /// Emit a stable JSON authoring receipt.
-        #[arg(long)]
-        json: bool,
-    },
-    /// Compute the authoritative digest bound by `agent publish --input-sha256`.
-    Digest {
-        /// A canonical KDL file containing exactly one top-level `agent` node.
-        #[arg(
-            long,
-            value_name = "FILE",
-            required_unless_present = "bundle",
-            conflicts_with = "bundle"
-        )]
-        spec: Option<PathBuf>,
-        /// A create-only directory whose root contains exactly one canonical `agent.kdl`.
-        #[arg(
-            long,
-            value_name = "DIR",
-            required_unless_present = "spec",
-            conflicts_with = "spec"
-        )]
-        bundle: Option<PathBuf>,
-        /// Emit the typed source-digest receipt as JSON.
-        #[arg(long)]
-        json: bool,
-    },
-    /// Publish exactly one explicit-host, explicit-identity agent under a catalog-wide CAS lock.
-    Publish {
-        /// A canonical KDL file containing exactly one top-level `agent` node.
-        #[arg(
-            long,
-            value_name = "FILE",
-            required_unless_present = "bundle",
-            conflicts_with = "bundle"
-        )]
-        spec: Option<PathBuf>,
-        /// A create-only directory whose root contains exactly one canonical `agent.kdl`.
-        #[arg(
-            long,
-            value_name = "DIR",
-            required_unless_present = "spec",
-            conflicts_with = "spec"
-        )]
-        bundle: Option<PathBuf>,
-        /// Create only. An identical existing agent.kdl is reported as `unchanged`.
-        #[arg(
-            long,
-            required_unless_present = "expect_sha256",
-            conflicts_with = "expect_sha256"
-        )]
-        expect_absent: bool,
-        /// Replace only when the current agent.kdl has this lowercase SHA-256.
-        #[arg(
-            long,
-            value_name = "HEX",
-            required_unless_present = "expect_absent",
-            conflicts_with = "expect_absent"
-        )]
-        expect_sha256: Option<String>,
-        /// SHA-256 returned by `st2 agent digest` for the exact source capability.
-        #[arg(long, value_name = "HEX")]
-        input_sha256: String,
-        /// Emit the typed publication result as JSON.
-        #[arg(long)]
-        json: bool,
-    },
-}
-
-#[derive(Subcommand)]
-enum CatalogCmd {
-    /// Emit one fail-closed declaration graph plus runtime observation envelope.
-    Graph {
-        /// Host used to resolve declarations with no host and host-local runtime facts.
-        #[arg(long)]
-        host: Option<String>,
-        /// Emit the versioned machine-readable envelope. Required in v1.
-        #[arg(long)]
-        json: bool,
-    },
-    /// Compute the authoritative digest bound by `catalog apply --input-sha256`.
-    Digest {
-        /// Complete prepared declaration directory. Runtime state and control paths are rejected.
-        #[arg(long, value_name = "DIR")]
-        prepared: PathBuf,
-        /// Emit the typed source-digest receipt as JSON.
-        #[arg(long)]
-        json: bool,
-    },
-    /// Compare one prepared declaration directory with the coherent live catalog without writing.
-    Diff {
-        /// Complete prepared declaration directory. Runtime state and control paths are rejected.
-        #[arg(long, value_name = "DIR")]
-        prepared: PathBuf,
-        /// Expected canonical declaration-root SHA-256 of the live catalog.
-        #[arg(long, value_name = "HEX")]
-        expect_sha256: String,
-        /// Emit the versioned semantic-diff receipt. Required in v1.
-        #[arg(long)]
-        json: bool,
-    },
-    /// Publish a complete prepared declaration directory as one absent catalog.
-    Bootstrap {
-        /// Complete prepared declaration directory. Runtime state and control paths are rejected.
-        #[arg(long, value_name = "DIR")]
-        prepared: PathBuf,
-        /// Root SHA-256 of the exact prepared projection being published.
-        #[arg(long, value_name = "HEX")]
-        input_sha256: String,
-        /// Emit the typed bootstrap receipt as JSON.
-        #[arg(long)]
-        json: bool,
-    },
-    /// Capture the coherent declaration plane into a create-only canonical directory.
-    Snapshot {
-        /// Destination directory. It must be outside the live catalog.
-        #[arg(long, value_name = "DIR")]
-        output: PathBuf,
-        /// Hash and capture the declaration plane without parsing it. The captured directory
-        /// remains unvalidated and is suitable only as an exact-byte CAS preimage.
-        #[arg(long)]
-        raw_preimage: bool,
-        /// Emit the typed snapshot receipt as JSON.
-        #[arg(long)]
-        json: bool,
-    },
-    /// Apply a complete canonical declaration directory under declaration-root CAS.
-    Apply {
-        /// Complete prepared declaration directory. Runtime state and control paths are rejected.
-        #[arg(
-            long,
-            value_name = "DIR",
-            required_unless_present = "resume",
-            conflicts_with = "resume"
-        )]
-        prepared: Option<PathBuf>,
-        /// Root SHA-256 of the exact prepared projection being applied.
-        #[arg(
-            long,
-            value_name = "HEX",
-            required_unless_present = "resume",
-            conflicts_with = "resume"
-        )]
-        input_sha256: Option<String>,
-        /// Expected canonical declaration-root SHA-256 of the live catalog.
-        #[arg(
-            long,
-            value_name = "HEX",
-            required_unless_present = "resume",
-            conflicts_with = "resume"
-        )]
-        expect_sha256: Option<String>,
-        /// Match the current declaration plane without parsing it. The prepared catalog is still
-        /// fully validated; use this mode only when the current parser cannot admit the preimage.
-        #[arg(long, conflicts_with = "resume")]
-        raw_preimage: bool,
-        /// Resume the durable incomplete marker and internal stage without the original source.
-        #[arg(long, conflicts_with_all = ["prepared", "input_sha256", "expect_sha256"])]
-        resume: bool,
-        /// Emit the typed application receipt as JSON.
-        #[arg(long)]
-        json: bool,
-    },
-}
-
-/// Shared context for message subcommands: where the catalog is, who "I" am, and the local host.
-/// Defaults come from the same env st2 sets on every task it spawns (`$CATALOG`, `$ST_AGENT`), so a
-/// running agent needs no flags.
-#[derive(Args)]
-struct MsgCtx {
-    /// Legacy catalog/bus root override. Prefer global `--catalog`; defaults to `$CATALOG`, then the
-    /// default st2 catalog.
-    #[arg(long, conflicts_with = "catalog_path")]
-    root: Option<PathBuf>,
-    /// The acting identity — who the message is `from` / whose inbox is "mine". Defaults to
-    /// `$ST_AGENT`.
-    #[arg(long = "as")]
-    as_id: Option<String>,
-    /// Host used to resolve `<host>.<identity>` bus ids. Defaults to the local hostname.
-    #[arg(long)]
-    host: Option<String>,
-}
-
-#[derive(Args)]
-struct PresentationArgs {
-    /// Exact bus identity, or a bare stable identity only when unique in the selected catalog.
-    identity: String,
-    /// Presentation text. Use --clear to remove the field.
-    #[arg(
-        value_name = "TEXT",
-        required_unless_present = "clear",
-        conflicts_with = "clear"
-    )]
-    value: Option<String>,
-    /// Remove the optional field.
-    #[arg(long)]
-    clear: bool,
-    /// Emit a stable JSON receipt or classified refusal.
-    #[arg(long)]
-    json: bool,
-    /// Host used only to resolve declarations whose host is omitted.
-    #[arg(long)]
-    host: Option<String>,
-}
-
-#[derive(Subcommand)]
-enum ServiceCmd {
-    /// Write the `st2.service` systemd-user unit, enable it (start on boot), and start it now.
-    /// Idempotent — safe to re-run. The unit runs `st2 up --catalog <catalog>`; agents spawn in sibling
-    /// scopes, so a service restart never cascades to them.
-    Install {
-        /// Legacy positional catalog/spec path for `st2 up`. Prefer --catalog; defaults to
-        /// `$CATALOG`, then the default st2 catalog. It must exist at install time.
-        #[arg(conflicts_with = "catalog_path")]
-        catalog: Option<PathBuf>,
-        /// Bake `--host <h>` into the unit. Omit to let `st2 up` auto-detect the hostname at runtime.
-        #[arg(long)]
-        host: Option<String>,
-        /// Machine-local pty registry to export as PTY_ROOT in the unit. Omit to use
-        /// `<catalog>/pty`. Useful when adopting live sessions from a legacy runner.
-        #[arg(long)]
-        pty_root: Option<PathBuf>,
-        /// Supervisor memory ceiling (MiB). The agents live in sibling scopes and are NOT bounded.
-        #[arg(long = "memory-max-mb", default_value_t = st2::service::DEFAULT_MEMORY_MAX_MB)]
-        memory_max_mb: u64,
-    },
-    /// Show the `st2.service` systemd status.
-    Status,
-    /// Stop, disable, and remove the `st2.service` unit. Idempotent.
-    Uninstall,
-}
-
-#[derive(Subcommand)]
-enum ClaudeChannelCmd {
-    /// Install or update the user plugin and its machine approval policy.
-    Install {
-        /// Install only the user plugin. An administrator will manage the machine policy.
-        #[arg(long)]
-        no_policy: bool,
-    },
-    /// Verify the embedded files, Claude registration, plugin, and machine policy.
-    Status,
-    /// Remove the user plugin, marketplace, embedded files, and machine policy.
-    Uninstall {
-        /// Keep the machine approval policy in place.
-        #[arg(long)]
-        keep_policy: bool,
-    },
-    /// Write only the machine policy. The main installer runs this through sudo.
-    #[command(hide = true)]
-    InstallPolicy,
-    /// Remove only the st2-owned machine policy fragment.
-    #[command(hide = true)]
-    UninstallPolicy,
-}
-
-#[derive(Subcommand)]
-enum HooksCmd {
-    /// Atomically publish this binary's immutable hook set and select it with a receipt.
-    Install {
-        /// Select this binary's exact hook set even when it is older or cannot be ordered.
-        #[arg(long)]
-        replace: bool,
-        /// Deprecated compatibility alias for `--replace`.
-        #[arg(long, hide = true)]
-        allow_downgrade: bool,
-    },
-    /// Read-only verification of the selected receipt and every embedded hook byte.
-    Verify,
-    /// Verify this binary's immutable hook set without requiring it to be selected.
-    VerifyOwn,
-}
-
-#[derive(Subcommand)]
-enum ResourceCmd {
-    /// List an agent's declared Resource bindings. Defaults to your own.
-    Ls {
-        /// Whose declaration to read — bus id or bare identity. Defaults to you (`$ST_AGENT`).
-        identity: Option<String>,
-        /// Emit the bindings as a JSON array.
-        #[arg(long)]
-        json: bool,
-        #[command(flatten)]
-        ctx: MsgCtx,
-    },
-    /// Read one declared binding. With a leading identity, from that agent; otherwise your own.
-    Read {
-        first: String,
-        second: Option<String>,
-        /// Emit the binding as a JSON object.
-        #[arg(long)]
-        json: bool,
-        #[command(flatten)]
-        ctx: MsgCtx,
-    },
-    /// Ask the resident profile runtime to observe one binding now and wait for exact evidence.
-    Refresh {
-        /// Binding name, or an agent selector when followed by a binding name.
-        first: String,
-        /// Binding name when the first positional selects the agent.
-        second: Option<String>,
-        /// Exact target agent; defaults to --as / $ST_AGENT.
-        #[arg(long, conflicts_with = "second")]
-        agent: Option<String>,
-        /// Client-only wait bound in seconds. Expiry never cancels or retracts queued demand.
-        #[arg(long, default_value_t = 30)]
-        wait: u64,
-        /// Emit the stable receipt (or timeout envelope) as JSON.
-        #[arg(long)]
-        json: bool,
-        #[command(flatten)]
-        ctx: MsgCtx,
-    },
-    /// Declare a Resource binding, or prove the identical binding already exists.
-    Add {
-        /// The agent-local binding name.
-        name: String,
-        /// The exact absolute URI this binding names (any `scheme:` — the identity is verbatim).
-        #[arg(long)]
-        uri: String,
-        /// Why this reference belongs in the declaration.
-        #[arg(long)]
-        reason: String,
-        /// Preserve the binding as no longer active for this agent, and say why.
-        #[arg(long = "inactive-reason", value_name = "TEXT")]
-        inactive_reason: Option<String>,
-        /// Profile-specific observation selector as JSON.
-        #[arg(long = "selector-json", value_name = "JSON")]
-        selector_json: Option<String>,
-        /// Exact target agent; defaults to --as / $ST_AGENT.
-        #[arg(long)]
-        agent: Option<String>,
-        /// Emit a stable JSON receipt.
-        #[arg(long)]
-        json: bool,
-        #[command(flatten)]
-        ctx: MsgCtx,
-    },
-    /// Remove one declared binding, or prove it is already absent.
-    Remove {
-        /// The agent-local binding name.
-        name: String,
-        /// Exact target agent; defaults to --as / $ST_AGENT.
-        #[arg(long)]
-        agent: Option<String>,
-        /// Emit a stable JSON receipt.
-        #[arg(long)]
-        json: bool,
-        #[command(flatten)]
-        ctx: MsgCtx,
-    },
-    /// Rename one declared binding's agent-local label, keeping its uri and reasons.
-    Rename {
-        /// The current binding name.
-        old: String,
-        /// The new binding name.
-        new: String,
-        /// Exact target agent; defaults to --as / $ST_AGENT.
-        #[arg(long)]
-        agent: Option<String>,
-        /// Emit a stable JSON receipt.
-        #[arg(long)]
-        json: bool,
-        #[command(flatten)]
-        ctx: MsgCtx,
-    },
-}
-
-#[derive(Subcommand)]
-enum ContextCmd {
-    /// Print an agent's context. Default = `now.md` (working state); `--decisions` the log; `--full` both.
-    Read {
-        /// Whose context — bus id or identity. Defaults to you (`$ST_AGENT`).
-        identity: Option<String>,
-        /// Print the decision log instead of the working state.
-        #[arg(long)]
-        decisions: bool,
-        /// Print the working state and the decision log.
-        #[arg(long)]
-        full: bool,
-        /// Print `now.md` only when it is newer than this many seconds.
-        #[arg(long, value_name = "SECONDS")]
-        fresh_within: Option<u64>,
-        #[command(flatten)]
-        ctx: MsgCtx,
-    },
-    /// Overwrite an agent's working state (`now.md`) from stdin.
-    Write {
-        identity: Option<String>,
-        #[command(flatten)]
-        ctx: MsgCtx,
-    },
-    /// Append a single decision (with its reasoning) to the log.
-    Append {
-        identity: Option<String>,
-        /// The decision — a single line.
-        #[arg(long)]
-        decision: String,
-        /// Why — a single line.
-        #[arg(long)]
-        why: String,
-        #[command(flatten)]
-        ctx: MsgCtx,
-    },
-}
-
-#[derive(Subcommand)]
-enum MessageCmd {
-    /// Send a new message to a recipient's inbox.
-    Send {
-        /// Recipient: a bus id (`<host>.<identity>`) or a bare identity in the catalog.
-        to: String,
-        /// The message body. Read from stdin when omitted.
-        #[arg(short = 'm', long = "message")]
-        body: Option<String>,
-        #[arg(long)]
-        subject: Option<String>,
-        #[arg(long = "in-reply-to")]
-        in_reply_to: Option<String>,
-        /// Comma-separated tags.
-        #[arg(long, value_delimiter = ',')]
-        tags: Vec<String>,
-        /// Reuse one sender-owned operation result across exact retries.
-        #[arg(long = "idempotency-key")]
-        idempotency_key: Option<String>,
-        #[command(flatten)]
-        ctx: MsgCtx,
-    },
-    /// Reply to a message in your inbox — recipient and threading are derived from it.
-    Reply {
-        /// The message filename in your inbox to reply to.
-        filename: String,
-        /// The reply body. Read from stdin when omitted.
-        #[arg(short = 'm', long = "message")]
-        body: Option<String>,
-        /// Override the subject (defaults to `re: <original subject>`).
-        #[arg(long)]
-        subject: Option<String>,
-        /// Reuse one sender-owned operation result across exact retries.
-        #[arg(long = "idempotency-key")]
-        idempotency_key: Option<String>,
-        #[command(flatten)]
-        ctx: MsgCtx,
-    },
-    /// List an inbox (or `--archive`), sorted by send time. Defaults to your own.
-    Ls {
-        /// Whose inbox — bus id or identity. Defaults to you (`--as` / `$ST_AGENT`).
-        identity: Option<String>,
-        /// List the archive instead of the inbox.
-        #[arg(long)]
-        archive: bool,
-        /// Recovery-only: list the raw flat `<root>/<identity>` box without catalog resolution.
-        #[arg(long)]
-        orphan: bool,
-        /// Print only the message count.
-        #[arg(long)]
-        count: bool,
-        /// Include full message bodies in JSON output (opt-in; default shape is unchanged).
-        #[arg(long)]
-        include_body: bool,
-        /// Show only messages from this sender.
-        #[arg(long = "from")]
-        from: Option<String>,
-        /// Show only messages sent after this unix-millisecond timestamp.
-        #[arg(long)]
-        since: Option<u64>,
-        /// Machine-readable JSON array.
-        #[arg(long)]
-        json: bool,
-        #[command(flatten)]
-        ctx: MsgCtx,
-    },
-    /// List sender-owned durable message history. Defaults to your own index.
-    Sent {
-        /// Whose sent index — bus id or identity. Defaults to you (`--as` / `$ST_AGENT`).
-        identity: Option<String>,
-        /// Print only the indexed message count. Refuses unavailable or partial coverage.
-        #[arg(long)]
-        count: bool,
-        /// Include full message bodies in JSON output.
-        #[arg(long)]
-        include_body: bool,
-        /// Show only messages addressed to this canonical recipient.
-        #[arg(long = "to")]
-        to: Option<String>,
-        /// Show only messages sent after this unix-millisecond timestamp.
-        #[arg(long)]
-        since: Option<u64>,
-        /// Machine-readable coverage envelope and rows.
-        #[arg(long)]
-        json: bool,
-        #[command(flatten)]
-        ctx: MsgCtx,
-    },
-    /// Read one message. With a leading identity, read from that agent's box; otherwise your own.
-    Read {
-        /// Either the message filename, or an identity followed by a filename.
-        first: String,
-        /// The message filename (when `first` is an identity).
-        second: Option<String>,
-        /// Read from the archive instead of the inbox.
-        #[arg(long)]
-        archive: bool,
-        /// Print the file verbatim (frontmatter + body), not a formatted view.
-        #[arg(long)]
-        raw: bool,
-        /// Machine-readable JSON.
-        #[arg(long)]
-        json: bool,
-        #[command(flatten)]
-        ctx: MsgCtx,
-    },
-    /// Archive one message (inbox → archive). Defaults to your own inbox.
-    Archive {
-        /// Either the message filename, or an identity followed by a filename.
-        first: String,
-        /// The message filename (when `first` is an identity).
-        second: Option<String>,
-        #[command(flatten)]
-        ctx: MsgCtx,
-    },
-    /// Show a message's thread — the message + everything replying to it (transitively), across the
-    /// catalog. `--tree` indents by reply depth; otherwise flat chronological.
-    Thread {
-        /// Either the message filename, or an identity followed by a filename.
-        first: String,
-        /// The message filename (when `first` is an identity).
-        second: Option<String>,
-        /// Indented hierarchical output instead of flat chronological.
-        #[arg(long)]
-        tree: bool,
-        #[command(flatten)]
-        ctx: MsgCtx,
-    },
-}
-
-#[derive(Subcommand)]
-enum EventCmd {
-    /// Emit one producer-identified event into a declared agent stream.
-    Emit {
-        /// Owning agent: `<host>.<identity>` or a bare local identity.
-        recipient: String,
-        /// Declared stream name.
-        #[arg(long)]
-        stream: String,
-        /// Stable producer-supplied event identity.
-        #[arg(long = "event-id")]
-        event_id: String,
-        /// Producer grouping key used by --supersede.
-        #[arg(long)]
-        key: Option<String>,
-        /// Archive the unread predecessor for the same key, or the stream-wide head without --key.
-        #[arg(long)]
-        supersede: bool,
-        /// One-line wake-time summary.
-        #[arg(long)]
-        subject: Option<String>,
-        /// Event body. Read from stdin when omitted.
-        #[arg(short = 'm', long = "message")]
-        body: Option<String>,
-        /// Emit the stable machine receipt.
-        #[arg(long)]
-        json: bool,
-        #[command(flatten)]
-        ctx: MsgCtx,
-    },
-}
-
-#[derive(Subcommand)]
-enum StreamCmd {
-    /// Add a stream to your declaration, optionally with a supervised adapter launch.
-    Add {
-        name: String,
-        /// Exact target agent; defaults to --as / $ST_AGENT.
-        #[arg(long)]
-        agent: Option<String>,
-        /// Adapter command run under `sh -c`; omit both launch forms for external ingress.
-        #[arg(long, conflicts_with = "adapter_argv")]
-        command: Option<String>,
-        /// Direct adapter argv after `--`. Element 0 is the program; values are preserved exactly.
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-        adapter_argv: Vec<String>,
-        #[arg(long)]
-        json: bool,
-        #[command(flatten)]
-        ctx: MsgCtx,
-    },
-    /// Remove a stream from your declaration.
-    Rm {
-        name: String,
-        /// Exact target agent; defaults to --as / $ST_AGENT.
-        #[arg(long)]
-        agent: Option<String>,
-        #[arg(long)]
-        json: bool,
-        #[command(flatten)]
-        ctx: MsgCtx,
-    },
-}
-
-#[derive(Subcommand)]
-enum RequestCmd {
-    /// Publish one idempotent JSON request from a declared service principal to an agent.
-    Send {
-        /// Recipient agent: a bus id (`<host>.<identity>`) or a local bare identity.
-        to: String,
-        #[arg(long = "idempotency-key")]
-        idempotency_key: String,
-        /// Typed request tag as `key=value` (repeatable).
-        #[arg(long = "tag")]
-        tags: Vec<String>,
-        /// JSON body. Read from stdin when omitted.
-        #[arg(short = 'm', long = "message")]
-        body: Option<String>,
-        /// Emit the machine receipt as JSON.
-        #[arg(long)]
-        json: bool,
-        #[command(flatten)]
-        ctx: MsgCtx,
-    },
-    /// Decode one typed request from an agent's inbox.
-    Read {
-        request_filename: String,
-        /// Emit the request envelope as JSON.
-        #[arg(long)]
-        json: bool,
-        #[command(flatten)]
-        ctx: MsgCtx,
-    },
-    /// Reply once to a typed request in an agent's inbox.
-    Reply {
-        request_filename: String,
-        /// Typed reply tag as `key=value` (repeatable).
-        #[arg(long = "tag")]
-        tags: Vec<String>,
-        /// JSON body. Read from stdin when omitted.
-        #[arg(short = 'm', long = "message")]
-        body: Option<String>,
-        /// Emit the machine receipt as JSON.
-        #[arg(long)]
-        json: bool,
-        #[command(flatten)]
-        ctx: MsgCtx,
-    },
-    /// Observe the typed reply for one previously published request.
-    Status {
-        #[arg(long = "idempotency-key")]
-        idempotency_key: String,
-        /// Emit the tagged status union as JSON.
-        #[arg(long)]
-        json: bool,
-        #[command(flatten)]
-        ctx: MsgCtx,
-    },
-}
+use cli::*;
 
 fn main() -> Result<()> {
     let Cli {
@@ -1157,10 +89,11 @@ fn dispatch(command: Command, catalog_path: Option<&std::path::Path>) -> Result<
         Command::Ding {
             session,
             identity,
+            agent_id,
             root,
             host,
             interval,
-        } => ding_cmd(session, identity, root, host, interval),
+        } => ding_cmd(session, identity, agent_id, root, host, interval),
         Command::CodexAppServer {
             identity,
             runtime_id,
@@ -1262,24 +195,46 @@ fn dispatch(command: Command, catalog_path: Option<&std::path::Path>) -> Result<
             let catalog = catalog_arg(None)?;
             driver_expand_cmd(&catalog, &spec, agent.as_deref(), host.as_deref())
         }
-        Command::Status { identity, set, ctx } => status_cmd(identity, set, ctx),
+        Command::Status {
+            identity,
+            agent_id,
+            set,
+            ctx,
+        } => status_cmd(identity, agent_id, set, ctx),
         Command::Rename(args) => presentation_cmd(st2::agent_author::PresentationField::Name, args),
         Command::Describe(args) => {
             presentation_cmd(st2::agent_author::PresentationField::Description, args)
         }
+        Command::Agent(AgentCmd::Address(args)) => address_cmd(args),
         Command::Agent(AgentCmd::DesiredState {
-            identity,
-            state,
+            first,
+            second,
+            agent_id,
             reason,
+            managed_by,
             host,
             json,
-        }) => desired_state_cmd(identity, state, reason, host, json),
+        }) => {
+            let (identity, state) = match &agent_id {
+                Some(_) => (None, first),
+                None => (first, second),
+            };
+            let state = state.context(
+                "a desired state is required: `running`, `suspended`, or `retired`",
+            )?;
+            anyhow::ensure!(
+                matches!(state.as_str(), "running" | "suspended" | "retired"),
+                "desired state must be `running`, `suspended`, or `retired`, not '{state}'"
+            );
+            desired_state_cmd(identity, agent_id, state, reason, managed_by, host, json)
+        }
         Command::Agent(AgentCmd::Publish {
             spec,
             bundle,
             expect_absent,
             expect_sha256,
             input_sha256,
+            managed_by,
             json,
         }) => {
             let catalog = catalog_arg(None)?;
@@ -1298,6 +253,7 @@ fn dispatch(command: Command, catalog_path: Option<&std::path::Path>) -> Result<
                 source,
                 expectation,
                 input_sha256,
+                managed_by,
             })?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&result)?);
@@ -1467,14 +423,70 @@ fn dispatch(command: Command, catalog_path: Option<&std::path::Path>) -> Result<
             }
             Ok(())
         }
+        Command::Catalog(CatalogCmd::Archive {
+            identity,
+            all_retired,
+            host,
+            dry_run,
+            json,
+        }) => {
+            let selection = if all_retired {
+                st2::catalog_archive::Selection::AllRetired
+            } else {
+                st2::catalog_archive::Selection::Identities(identity)
+            };
+            let result = st2::catalog_archive::archive(st2::catalog_archive::ArchiveRequest {
+                catalog: catalog_arg(None)?,
+                host: host.unwrap_or_else(detect_host),
+                selection,
+                dry_run,
+            })?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&result)?);
+            } else {
+                let verb = if result.dry_run {
+                    "would-archive"
+                } else {
+                    "archived"
+                };
+                for entry in &result.archived {
+                    println!("{verb} {} {} -> {}", entry.id, entry.from, entry.to);
+                }
+                for refusal in &result.refused {
+                    println!(
+                        "skipped {} [{}] {}",
+                        refusal.id, refusal.code, refusal.message
+                    );
+                }
+            }
+            Ok(())
+        }
+        Command::Catalog(CatalogCmd::Unarchive {
+            identity,
+            host,
+            json,
+        }) => {
+            let result = st2::catalog_archive::unarchive(st2::catalog_archive::UnarchiveRequest {
+                catalog: catalog_arg(None)?,
+                host: host.unwrap_or_else(detect_host),
+                identity,
+            })?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&result)?);
+            } else {
+                println!("unarchived {} {} -> {}", result.id, result.from, result.to);
+            }
+            Ok(())
+        }
         Command::Agents {
             catalog,
             status,
             identity,
+            agent_id,
             json,
             enrich,
             ctx,
-        } => agents_cmd(catalog, status, identity, json, enrich, ctx),
+        } => agents_cmd(catalog, status, identity, agent_id, json, enrich, ctx),
         Command::Tasks { host, json } => {
             if !json {
                 anyhow::bail!("`st2 tasks` v1 requires --json");
@@ -1981,6 +993,30 @@ fn doctor_cmd(root: &Path, host: Option<String>, require_supervisor: bool) -> Re
                 ),
             }
         }
+        // DELTA-006's Resolution Signal, per seat. Silence means both clauses are clear here, so
+        // the `delivery-state.json` boundary arm is removable once every admitted host is silent
+        // for the record's window — a trigger nobody produces resolves on memory instead.
+        // Advisory, not a problem: a carried-forward attempt is correct behaviour today.
+        let delivery_state_dirs = [
+            st2::codex_app_server::state_dir(&catalog, &bus_id),
+            st2::opencode_session::state_dir(&catalog, &bus_id),
+        ];
+        match st2::migrations::delivery_state::resolution_signal(&delivery_state_dirs) {
+            Ok(signal) if signal.is_clear() => {}
+            Ok(signal) => report_advisory(
+                &format!("{bus_id} pre-ledger delivery state (DELTA-006)"),
+                &format!(
+                    "preLedgerRecords={} assertedEntries={}",
+                    signal.pre_ledger_records, signal.asserted_entries
+                ),
+            ),
+            Err(error) => report_check(
+                &mut problems,
+                false,
+                &format!("{bus_id} delivery ledger readable"),
+                &format!("{error:#}"),
+            ),
+        }
         if spec.desired_state.is_retired() {
             let still_present = spec
                 .tasks
@@ -2170,10 +1206,16 @@ fn doctor_cmd(root: &Path, host: Option<String>, require_supervisor: bool) -> Re
                         ),
                         st2::driver_diagnostic::repair_text(&diagnostic),
                     ),
-                    st2::driver_diagnostic::Observed::Absent => report_advisory(
-                        &format!("{bus_id} native driver diagnostic absent"),
-                        st2::driver_diagnostic::repair_text(&diagnostic),
-                    ),
+                    // Absence is only a fault where the driver publishes a boundary result on
+                    // every launch; for Claude and Codex it is the healthy steady state.
+                    st2::driver_diagnostic::Observed::Absent => {
+                        if st2::driver_diagnostic::absence_is_a_fault(spec) {
+                            report_advisory(
+                                &format!("{bus_id} native driver diagnostic absent"),
+                                st2::driver_diagnostic::repair_text(&diagnostic),
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -2308,19 +1350,14 @@ fn presentation_cmd(
     field: st2::agent_author::PresentationField,
     args: PresentationArgs,
 ) -> Result<()> {
-    let PresentationArgs {
-        identity,
-        value,
-        clear,
-        json,
-        host,
-    } = args;
+    let (selector, requested, json, host) = args.selection()?;
     let root = catalog_arg(None)?;
     let host = host.unwrap_or_else(detect_host);
+    let identity = resolve_declaration(&root, &host, selector)?;
     let actor = std::env::var("ST_AGENT")
         .ok()
         .filter(|value| !value.is_empty());
-    let requested = if clear { None } else { value.as_deref() };
+    let requested = requested.as_deref();
     match st2::agent_author::set_presentation(
         &root,
         &identity,
@@ -2367,10 +1404,69 @@ fn presentation_cmd(
     }
 }
 
+/// Assign or clear one agent's mutable address (R25) — the third authoring sibling of `st2 rename`
+/// and `st2 describe`, classified by exactly the same receipt and refusal vocabulary.
+fn address_cmd(args: PresentationArgs) -> Result<()> {
+    let (selected, requested, json, host) = args.selection()?;
+    let root = catalog_arg(None)?;
+    let host = host.unwrap_or_else(detect_host);
+    let selector = resolve_declaration(&root, &host, selected)?;
+    let actor = std::env::var("ST_AGENT")
+        .ok()
+        .filter(|value| !value.is_empty());
+    let requested = requested.as_deref();
+    match st2::agent_author::set_address(&root, &selector, &host, actor.as_deref(), requested) {
+        Ok(receipt) => {
+            if json {
+                println!("{}", serde_json::to_string(&receipt)?);
+            } else {
+                let state = match (receipt.result, receipt.address.as_deref()) {
+                    (st2::agent_author::AuthorOutcome::Changed, Some(value)) => {
+                        format!("set to {value:?}")
+                    }
+                    (st2::agent_author::AuthorOutcome::Changed, None) => "cleared".to_owned(),
+                    (st2::agent_author::AuthorOutcome::Unchanged, Some(value)) => {
+                        format!("already {value:?}")
+                    }
+                    (st2::agent_author::AuthorOutcome::Unchanged, None) => {
+                        "already clear".to_owned()
+                    }
+                };
+                println!(
+                    "{} address: {state} (bus address {})",
+                    receipt.id,
+                    receipt
+                        .bus_address
+                        .as_deref()
+                        .unwrap_or("none — the subject is retired and non-routable")
+                );
+            }
+            Ok(())
+        }
+        Err(error) => {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "result": "error",
+                        "code": error.code(),
+                        "identity": selector,
+                        "field": "address",
+                        "error": error.to_string(),
+                    })
+                );
+            }
+            Err(error.into())
+        }
+    }
+}
+
 fn desired_state_cmd(
-    identity: String,
+    identity: Option<String>,
+    agent_id: Option<String>,
     state: String,
     reason: Option<String>,
+    managed_by: Option<String>,
     host: Option<String>,
     json: bool,
 ) -> Result<()> {
@@ -2382,6 +1478,7 @@ fn desired_state_cmd(
     };
     let root = catalog_arg(None)?;
     let host = host.unwrap_or_else(detect_host);
+    let identity = resolve_declaration(&root, &host, one_selector(identity, agent_id)?)?;
     let actor = std::env::var("ST_AGENT")
         .ok()
         .filter(|value| !value.is_empty());
@@ -2392,19 +1489,25 @@ fn desired_state_cmd(
         actor.as_deref(),
         state,
         reason.as_deref(),
+        managed_by.as_deref(),
     ) {
         Ok(receipt) => {
             if json {
                 println!("{}", serde_json::to_string(&receipt)?);
             } else {
                 println!(
-                    "{} desired-state {}{} ({})",
+                    "{} desired-state {}{}{} ({})",
                     receipt.identity,
                     receipt.desired_state.as_str(),
                     receipt
                         .reason
                         .as_deref()
                         .map(|reason| format!(" reason={reason:?}"))
+                        .unwrap_or_default(),
+                    receipt
+                        .managed_by
+                        .as_deref()
+                        .map(|marker| format!(" managed-by={marker:?}"))
                         .unwrap_or_default(),
                     match receipt.result {
                         st2::agent_author::AuthorOutcome::Changed => "changed",
@@ -2432,11 +1535,16 @@ fn desired_state_cmd(
     }
 }
 
-fn status_cmd(identity: Option<String>, set: Option<String>, ctx: MsgCtx) -> Result<()> {
+fn status_cmd(
+    identity: Option<String>,
+    agent_id: Option<String>,
+    set: Option<String>,
+    ctx: MsgCtx,
+) -> Result<()> {
     let (root, host) = resolve_ctx(&ctx)?;
-    let id = match identity {
-        Some(i) => i,
-        None => acting_id(&ctx)?,
+    let id = match selected_route(&root, &host, identity, agent_id)? {
+        Some(id) => id,
+        None => acting_route(&root, &host, &ctx)?,
     };
     let sp = st2::status::status_path(&agent_dir_of(&root, &id, &host)?);
     match set {
@@ -2445,7 +1553,7 @@ fn status_cmd(identity: Option<String>, set: Option<String>, ctx: MsgCtx) -> Res
             let state = st2::status::State::parse_settable(&word).with_context(|| {
                 format!("invalid state '{word}' (settable: offline|available|busy|away|dnd)")
             })?;
-            message::with_resolved_agent_dir(&root, &id, &host, |agent| {
+            message::with_resolved_agent_dir(&root, &route_selector(&id), &host, |agent| {
                 st2::status::set_state(&st2::status::status_path(agent), state)
             })?;
             println!("status: {}", state.as_str());
@@ -2458,6 +1566,7 @@ fn agents_cmd(
     catalog: Option<PathBuf>,
     status_filter: Option<String>,
     identity: Option<String>,
+    agent_id: Option<String>,
     json: bool,
     enrich: bool,
     mut ctx: MsgCtx,
@@ -2472,12 +1581,13 @@ fn agents_cmd(
     let (root, host) = resolve_ctx(&ctx)?;
     let _catalog_lock = st2::CatalogLock::shared(&root)
         .context("acquire shared catalog-authoring lock for agent roster")?;
-    let found = if identity.is_some() {
+    let selected = identity.is_some() || agent_id.is_some();
+    let found = if selected {
         st2::discover_strict(&root)
     } else {
         st2::discover(&root)
     };
-    if identity.is_some() && !found.errors.is_empty() {
+    if selected && !found.errors.is_empty() {
         let errors = found
             .errors
             .iter()
@@ -2495,6 +1605,16 @@ fn agents_cmd(
         anyhow::ensure!(
             rows.len() == 1,
             "expected exactly one Agent Spec with identity `{identity}`, found {}",
+            rows.len()
+        );
+    }
+    // An exact ID roster query is catalog-global and answers on the appended immutable `id`, not
+    // on the positional declaration key — equal bytes in the two namespaces never collide.
+    if let Some(agent_id) = &agent_id {
+        rows.retain(|row| row.id == *agent_id);
+        anyhow::ensure!(
+            rows.len() == 1,
+            "expected exactly one Agent Spec with agent id `{agent_id}`, found {}",
             rows.len()
         );
     }
@@ -2589,6 +1709,7 @@ fn context_column(context: Option<&st2::harness_context::Observed>) -> String {
 fn ding_cmd(
     session: Option<String>,
     identity: Option<String>,
+    agent_id: Option<String>,
     root: Option<PathBuf>,
     host: Option<String>,
     interval: u64,
@@ -2599,14 +1720,28 @@ fn ding_cmd(
         host,
     };
     let (catalog_root, this_host) = resolve_ctx(&ctx)?;
-    let id = acting_id(&ctx)?;
+    // The poked pty session is a runtime task ID, so it keeps the exact bytes the caller named:
+    // under activation `ST_AGENT` carries the agent ID and the canonical agent task ID equals it.
+    // The inbox and status are declaration-parent state, so they resolve through the route.
+    let named = match &agent_id {
+        Some(id) => id.clone(),
+        None => acting_id(&ctx)?,
+    };
+    let id = match agent_id {
+        Some(id) => resolve_route(
+            &catalog_root,
+            &this_host,
+            st2::identity::AgentSelector::Id(id),
+        )?,
+        None => acting_route(&catalog_root, &this_host, &ctx)?,
+    };
     // The pty to poke defaults to the identity — an agent IS its pty, so the session id == the agent
     // id. So `st2 ding --identity mix.worker` pokes pty `mix.worker` (the redundant positional is now
     // optional). An explicit positional still overrides for the rare non-agent case.
-    let session = session.unwrap_or_else(|| id.clone());
+    let session = session.unwrap_or(named);
     // Flat-bus aware: a native catalog agent → its resources/inbox; a catalog-LESS bus (an eval's
     // ST_ROOT) → the flat <root>/<id>/inbox. Status lives beside it either way.
-    let agent_dir = message::resolve_agent_dir(&catalog_root, &id, &this_host)?
+    let agent_dir = message::resolve_agent_dir(&catalog_root, &route_selector(&id), &this_host)?
         .unwrap_or_else(|| catalog_root.join(&id));
     let inbox = resolve_message_inbox(&catalog_root, &id, &this_host)?;
     let status_path = st2::status::status_path(&agent_dir);
@@ -2649,10 +1784,161 @@ fn acting_id(ctx: &MsgCtx) -> Result<String> {
         .context("no acting identity: pass --as or set $ST_AGENT")
 }
 
+/// The acting subject's route.
+///
+/// `--as` is an ordinary address reference; `$ST_AGENT` carries the exact immutable agent ID
+/// (`docs/vrs/03-message/spec.md`: selection follows one total order, and neither an address nor
+/// `ST_AGENT` is heuristically retyped). So the two are not interchangeable strings once a subject
+/// declares an explicit address. An ID that names no declared subject keeps its raw bytes, which
+/// is what leaves flat, orphan, and `$ST2_EVAL_REQUESTER` mailboxes resolving exactly as they do
+/// today; ambiguity cannot arise for a catalog-global ID, so absence is the only miss.
+fn acting_route(root: &Path, host: &str, ctx: &MsgCtx) -> Result<String> {
+    if let Some(address) = ctx.as_id.clone().filter(|value| !value.is_empty()) {
+        return Ok(address);
+    }
+    let id = acting_id(ctx)?;
+    match resolve_selected(root, host, st2::identity::AgentSelector::Id(id.clone())) {
+        Ok(selected) => Ok(selected.route),
+        Err(_) => Ok(id),
+    }
+}
+
+/// One already-resolved route as the selector every message-plane entry point takes.
+///
+/// A route is an effective address by construction — `resolve_route` produced it from the address
+/// book — so this states that namespace explicitly instead of letting a bare string be retyped.
+fn route_selector(reference: &str) -> st2::identity::AgentSelector {
+    st2::identity::AgentSelector::Address(reference.to_owned())
+}
+
 /// Resolve a recipient/identity to its agent folder in the catalog, or a clear error.
 fn agent_dir_of(root: &Path, id: &str, host: &str) -> Result<PathBuf> {
-    message::resolve_agent_dir(root, id, host)?
+    message::resolve_agent_dir(root, &route_selector(id), host)?
         .with_context(|| format!("no agent '{id}' found in catalog {}", root.display()))
+}
+
+/// The one typed agent selector a CLI reference pair carries (R24).
+///
+/// Every agent-selecting command exposes both forms and clap's `conflicts_with` keeps them
+/// mutually exclusive, so at most one arrives here: an ordinary address reference, or an exact
+/// immutable agent ID.
+fn agent_selector(
+    reference: Option<String>,
+    id: Option<String>,
+) -> Option<st2::identity::AgentSelector> {
+    match (reference, id) {
+        (_, Some(id)) => Some(st2::identity::AgentSelector::Id(id)),
+        (Some(reference), None) => Some(st2::identity::AgentSelector::Address(reference)),
+        (None, None) => None,
+    }
+}
+
+/// [`agent_selector`] for a command that requires a target rather than defaulting to the actor.
+fn one_selector(
+    reference: Option<String>,
+    id: Option<String>,
+) -> Result<st2::identity::AgentSelector> {
+    agent_selector(reference, id)
+        .context("no agent selected: pass an agent reference or the exact `--id` form")
+}
+
+/// The one subject a typed selector names, in both namespaces its consumers accept.
+///
+/// These are two different strings once a subject declares an explicit `address`, and handing the
+/// wrong one onward is exactly the ID-through-a-mutable-address hop decision 0015-immutable-agent-id-and-mutable-address forbids:
+/// declaration-selecting commands match the positional key and never look at `address`, while
+/// reference resolution for inboxes, status, context, and recipients answers on the address.
+struct SelectedAgent {
+    /// `<host>.<identity>` — the positional declaration key, which no address cutover changes.
+    declaration: String,
+    /// `<host>.<effective address>` — the current route.
+    route: String,
+}
+
+/// Resolve one typed selector against the catalog.
+///
+/// The address form stays on st2's existing reference resolution, which DELTA-003 keeps normative
+/// until the identity model activates, so it carries the caller's bytes through unchanged. The ID
+/// form is a catalog-global exact lookup that never falls through to address lookup — that is what
+/// stops a renamed subject's old semantic ID from silently staying alive as a route.
+fn resolve_selected(
+    root: &Path,
+    host: &str,
+    selector: st2::identity::AgentSelector,
+) -> Result<SelectedAgent> {
+    let id = match selector {
+        st2::identity::AgentSelector::Address(reference) => {
+            return Ok(SelectedAgent {
+                declaration: reference.clone(),
+                route: reference,
+            });
+        }
+        st2::identity::AgentSelector::Id(id) => id,
+    };
+    let found = discover(root);
+    // Retired subjects are present here and absent from the routable address book on purpose:
+    // retirement releases the address, never the ID, so an exact-ID selector still names its
+    // subject and `st2 describe` can still edit a retired declaration.
+    let entries = found
+        .specs
+        .iter()
+        .map(|spec| st2::identity::AddressBookEntry::of(spec, host))
+        .collect::<Vec<_>>();
+    let resolved = &st2::identity::resolve_id(&entries, &id)?.id;
+    let spec = found
+        .specs
+        .iter()
+        .find(|spec| &spec.effective_id(host) == resolved)
+        .context("the resolved agent id left the discovery it was resolved against")?;
+    Ok(SelectedAgent {
+        declaration: spec.bus_id(host),
+        route: spec.bus_address(host),
+    })
+}
+
+/// [`resolve_selected`] for a command that selects a declaration to read or author.
+fn resolve_declaration(
+    root: &Path,
+    host: &str,
+    selector: st2::identity::AgentSelector,
+) -> Result<String> {
+    resolve_selected(root, host, selector).map(|selected| selected.declaration)
+}
+
+/// [`resolve_selected`] for a command that resolves a route: an inbox, status, or recipient.
+fn resolve_route(
+    root: &Path,
+    host: &str,
+    selector: st2::identity::AgentSelector,
+) -> Result<String> {
+    resolve_selected(root, host, selector).map(|selected| selected.route)
+}
+
+/// The declaration selector for one CLI reference pair, or `None` when the command must fall back
+/// to the caller's own ambient actor.
+fn selected_declaration(
+    root: &Path,
+    host: &str,
+    reference: Option<String>,
+    id: Option<String>,
+) -> Result<Option<String>> {
+    match agent_selector(reference, id) {
+        None => Ok(None),
+        Some(selector) => resolve_declaration(root, host, selector).map(Some),
+    }
+}
+
+/// [`selected_declaration`] for a command that resolves a route rather than a declaration.
+fn selected_route(
+    root: &Path,
+    host: &str,
+    reference: Option<String>,
+    id: Option<String>,
+) -> Result<Option<String>> {
+    match agent_selector(reference, id) {
+        None => Ok(None),
+        Some(selector) => resolve_route(root, host, selector).map(Some),
+    }
 }
 
 /// Resolve ordinary declared messaging authority plus the exact external requester capability
@@ -2685,11 +1971,17 @@ fn body_or_stdin(body: Option<String>) -> Result<String> {
 }
 
 /// `[identity] <filename>` positionals: if `second` is present, `first` is the identity; otherwise
-/// `first` is the filename and the box belongs to the acting identity.
-fn box_target(first: String, second: Option<String>, ctx: &MsgCtx) -> Result<(String, String)> {
-    match second {
-        Some(filename) => Ok((first, filename)),
-        None => Ok((acting_id(ctx)?, first)),
+/// `first` is the filename and the box belongs to `--id`, else to the acting identity.
+fn box_target(
+    first: String,
+    second: Option<String>,
+    owner: Option<String>,
+    mine: impl FnOnce() -> Result<String>,
+) -> Result<(String, String)> {
+    match (second, owner) {
+        (Some(thing), _) => Ok((first, thing)),
+        (None, Some(owner)) => Ok((owner, first)),
+        (None, None) => Ok((mine()?, first)),
     }
 }
 
@@ -2697,6 +1989,7 @@ fn message_cmd(cmd: MessageCmd) -> Result<()> {
     match cmd {
         MessageCmd::Send {
             to,
+            to_id,
             body,
             subject,
             in_reply_to,
@@ -2705,7 +1998,8 @@ fn message_cmd(cmd: MessageCmd) -> Result<()> {
             ctx,
         } => {
             let (root, host) = resolve_ctx(&ctx)?;
-            let from = acting_id(&ctx)?;
+            let to = resolve_route(&root, &host, one_selector(to, to_id)?)?;
+            let from = acting_route(&root, &host, &ctx)?;
             let body = body_or_stdin(body)?;
             let filename = send_resolved_message(
                 &root,
@@ -2729,7 +2023,7 @@ fn message_cmd(cmd: MessageCmd) -> Result<()> {
             ctx,
         } => {
             let (root, host) = resolve_ctx(&ctx)?;
-            let from = acting_id(&ctx)?;
+            let from = acting_route(&root, &host, &ctx)?;
             let my_inbox = resolve_message_inbox(&root, &from, &host)?;
             let original = message::read_msg(&my_inbox, &filename)
                 .or_else(|inbox_error| {
@@ -2740,6 +2034,8 @@ fn message_cmd(cmd: MessageCmd) -> Result<()> {
                     message::read_msg(&my_archive, &filename)
                 })
                 .with_context(|| format!("no message '{filename}' in {}'s inbox", from))?;
+            // The reply target is the message's own `from`: an ordinary address reference, which
+            // is what every published record carries.
             let to = original
                 .from
                 .clone()
@@ -2762,6 +2058,7 @@ fn message_cmd(cmd: MessageCmd) -> Result<()> {
         }
         MessageCmd::Sent {
             identity,
+            agent_id,
             count,
             include_body,
             to,
@@ -2770,8 +2067,12 @@ fn message_cmd(cmd: MessageCmd) -> Result<()> {
             ctx,
         } => {
             let (root, host) = resolve_ctx(&ctx)?;
-            let id = identity.unwrap_or(acting_id(&ctx)?);
-            let mut view = message::with_resolved_agent_dir(&root, &id, &host, |agent_dir| {
+            let id = match selected_route(&root, &host, identity, agent_id)? {
+                Some(id) => id,
+                None => acting_route(&root, &host, &ctx)?,
+            };
+            let mut view =
+                message::with_resolved_agent_dir(&root, &route_selector(&id), &host, |agent_dir| {
                 message::list_sent(agent_dir, include_body)
             })?;
             if let Some(recipient) = &to {
@@ -2818,6 +2119,7 @@ fn message_cmd(cmd: MessageCmd) -> Result<()> {
         }
         MessageCmd::Ls {
             identity,
+            agent_id,
             archive,
             orphan,
             count,
@@ -2828,9 +2130,9 @@ fn message_cmd(cmd: MessageCmd) -> Result<()> {
             ctx,
         } => {
             let (root, host) = resolve_ctx(&ctx)?;
-            let id = match identity {
+            let id = match selected_route(&root, &host, identity, agent_id)? {
                 Some(id) => id,
-                None => acting_id(&ctx)?,
+                None => acting_route(&root, &host, &ctx)?,
             };
             let dir = message::resolve_list_box(&root, &id, &host, archive, orphan)?;
             let mut msgs = if archive {
@@ -2872,13 +2174,16 @@ fn message_cmd(cmd: MessageCmd) -> Result<()> {
         MessageCmd::Read {
             first,
             second,
+            agent_id,
             archive,
             raw,
             json,
             ctx,
         } => {
             let (root, host) = resolve_ctx(&ctx)?;
-            let (id, filename) = box_target(first, second, &ctx)?;
+            let owner = selected_route(&root, &host, None, agent_id)?;
+            let (id, filename) =
+                box_target(first, second, owner, || acting_route(&root, &host, &ctx))?;
             let dir = if archive {
                 message::resolve_archive(&root, &id, &host)
             } else {
@@ -2907,10 +2212,17 @@ fn message_cmd(cmd: MessageCmd) -> Result<()> {
             print!("{}", m.body);
             Ok(())
         }
-        MessageCmd::Archive { first, second, ctx } => {
+        MessageCmd::Archive {
+            first,
+            second,
+            agent_id,
+            ctx,
+        } => {
             let (root, host) = resolve_ctx(&ctx)?;
-            let (id, filename) = box_target(first, second, &ctx)?;
-            message::archive_resolved_message(&root, &id, &host, &filename)?;
+            let owner = selected_route(&root, &host, None, agent_id)?;
+            let (id, filename) =
+                box_target(first, second, owner, || acting_route(&root, &host, &ctx))?;
+            message::archive_resolved_message(&root, &route_selector(&id), &host, &filename)?;
             println!("archived");
             Ok(())
         }
@@ -2965,9 +2277,9 @@ fn send_resolved_message(
         .transpose()?;
     message::send_to_resolved_inbox(
         root,
-        to,
+        &route_selector(to),
         host,
-        from,
+        &route_selector(from),
         subject,
         in_reply_to,
         tags,
@@ -2981,6 +2293,7 @@ fn event_cmd(cmd: EventCmd) -> Result<()> {
     match cmd {
         EventCmd::Emit {
             recipient,
+            recipient_id,
             stream,
             event_id,
             key,
@@ -2991,6 +2304,8 @@ fn event_cmd(cmd: EventCmd) -> Result<()> {
             ctx,
         } => {
             let (root, host) = resolve_ctx(&ctx)?;
+            let recipient =
+                resolve_route(&root, &host, one_selector(recipient, recipient_id)?)?;
             let body = body_or_stdin(body)?;
             let receipt = st2::event::emit(
                 &root,
@@ -3014,10 +2329,11 @@ fn event_cmd(cmd: EventCmd) -> Result<()> {
 }
 
 fn stream_cmd(cmd: StreamCmd) -> Result<()> {
-    let (name, agent, json, ctx, launch, remove) = match cmd {
+    let (name, agent, agent_id, json, ctx, launch, remove) = match cmd {
         StreamCmd::Add {
             name,
             agent,
+            agent_id,
             command,
             adapter_argv,
             json,
@@ -3029,14 +2345,15 @@ fn stream_cmd(cmd: StreamCmd) -> Result<()> {
                 (None, true) => None,
                 (Some(_), false) => anyhow::bail!("stream add got both --command and adapter argv"),
             };
-            (name, agent, json, ctx, launch, false)
+            (name, agent, agent_id, json, ctx, launch, false)
         }
         StreamCmd::Rm {
             name,
             agent,
+            agent_id,
             json,
             ctx,
-        } => (name, agent, json, ctx, None, true),
+        } => (name, agent, agent_id, json, ctx, None, true),
     };
     let (root, host) = resolve_ctx(&ctx)?;
     let actor = ctx
@@ -3044,9 +2361,12 @@ fn stream_cmd(cmd: StreamCmd) -> Result<()> {
         .clone()
         .or_else(|| std::env::var("ST_AGENT").ok())
         .filter(|value| !value.is_empty());
-    let target = agent
-        .or_else(|| actor.clone())
-        .context("no stream target: pass --agent, --as, or set $ST_AGENT")?;
+    let target = match selected_declaration(&root, &host, agent, agent_id)? {
+        Some(target) => target,
+        None => actor
+            .clone()
+            .context("no stream target: pass --agent, --agent-id, --as, or set $ST_AGENT")?,
+    };
     if remove {
         let receipt =
             st2::agent_author::remove_stream(&root, &target, &host, actor.as_deref(), &name)?;
@@ -3292,12 +2612,13 @@ fn context_cmd(cmd: ContextCmd) -> Result<()> {
     match cmd {
         ContextCmd::Read {
             identity,
+            agent_id,
             decisions,
             full,
             fresh_within,
             ctx,
         } => {
-            let dir = resolve_context_dir(identity, &ctx)?;
+            let dir = resolve_context_dir(identity, agent_id, &ctx)?;
             let view = if full {
                 View::Full
             } else if decisions {
@@ -3315,17 +2636,21 @@ fn context_cmd(cmd: ContextCmd) -> Result<()> {
             print!("{content}");
             Ok(())
         }
-        ContextCmd::Write { identity, ctx } => {
+        ContextCmd::Write {
+            identity,
+            agent_id,
+            ctx,
+        } => {
             let (root, host) = resolve_ctx(&ctx)?;
-            let id = match identity {
+            let id = match selected_route(&root, &host, identity, agent_id)? {
                 Some(identity) => identity,
-                None => acting_id(&ctx)?,
+                None => acting_route(&root, &host, &ctx)?,
             };
             let content =
                 std::io::read_to_string(std::io::stdin()).context("reading context from stdin")?;
             message::with_resolved_state_dir(
                 &root,
-                &id,
+                &route_selector(&id),
                 &host,
                 &["resources", "context"],
                 true,
@@ -3336,18 +2661,19 @@ fn context_cmd(cmd: ContextCmd) -> Result<()> {
         }
         ContextCmd::Append {
             identity,
+            agent_id,
             decision,
             why,
             ctx,
         } => {
             let (root, host) = resolve_ctx(&ctx)?;
-            let id = match identity {
+            let id = match selected_route(&root, &host, identity, agent_id)? {
                 Some(identity) => identity,
-                None => acting_id(&ctx)?,
+                None => acting_route(&root, &host, &ctx)?,
             };
             let filename = message::with_resolved_state_dir(
                 &root,
-                &id,
+                &route_selector(&id),
                 &host,
                 &["resources", "context", "decisions"],
                 true,
@@ -3474,12 +2800,13 @@ fn resource_cmd(cmd: ResourceCmd) -> Result<()> {
     match cmd {
         ResourceCmd::Ls {
             identity,
+            agent_id,
             json,
             ctx,
         } => {
             let (root, host) = resolve_ctx(&ctx)?;
-            let id = match identity {
-                Some(i) => i,
+            let id = match selected_declaration(&root, &host, identity, agent_id)? {
+                Some(id) => id,
                 None => acting_id(&ctx)?,
             };
             let (identity, bindings) = resource_bindings(&root, &id, &host)?;
@@ -3508,11 +2835,13 @@ fn resource_cmd(cmd: ResourceCmd) -> Result<()> {
         ResourceCmd::Read {
             first,
             second,
+            agent_id,
             json,
             ctx,
         } => {
             let (root, host) = resolve_ctx(&ctx)?;
-            let (id, name) = box_target(first, second, &ctx)?;
+            let owner = selected_declaration(&root, &host, None, agent_id)?;
+            let (id, name) = box_target(first, second, owner, || acting_id(&ctx))?;
             let (identity, bindings) = resource_bindings(&root, &id, &host)?;
             let binding = bindings
                 .iter()
@@ -3537,6 +2866,7 @@ fn resource_cmd(cmd: ResourceCmd) -> Result<()> {
             first,
             second,
             agent,
+            agent_id,
             wait,
             json,
             ctx,
@@ -3545,7 +2875,7 @@ fn resource_cmd(cmd: ResourceCmd) -> Result<()> {
             let (selector, name) = match second {
                 Some(name) => (first, name),
                 None => {
-                    let selector = match agent {
+                    let selector = match selected_declaration(&root, &host, agent, agent_id)? {
                         Some(agent) => agent,
                         None => acting_id(&ctx)?,
                     };
@@ -3631,6 +2961,7 @@ fn resource_cmd(cmd: ResourceCmd) -> Result<()> {
             inactive_reason,
             selector_json,
             agent,
+            agent_id,
             json,
             ctx,
         } => {
@@ -3639,7 +2970,7 @@ fn resource_cmd(cmd: ResourceCmd) -> Result<()> {
                 .map(serde_json::from_str)
                 .transpose()
                 .map_err(|error| anyhow::anyhow!("--selector-json is not valid JSON: {error}"))?;
-            let (root, host, actor, target) = resource_author_target(agent, &ctx)?;
+            let (root, host, actor, target) = resource_author_target(agent, agent_id, &ctx)?;
             let receipt = st2::agent_author::add_resource_with_selector(
                 &root,
                 &target,
@@ -3664,10 +2995,11 @@ fn resource_cmd(cmd: ResourceCmd) -> Result<()> {
         ResourceCmd::Remove {
             name,
             agent,
+            agent_id,
             json,
             ctx,
         } => {
-            let (root, host, actor, target) = resource_author_target(agent, &ctx)?;
+            let (root, host, actor, target) = resource_author_target(agent, agent_id, &ctx)?;
             let receipt =
                 st2::agent_author::remove_resource(&root, &target, &host, actor.as_deref(), &name)?;
             if json {
@@ -3684,10 +3016,11 @@ fn resource_cmd(cmd: ResourceCmd) -> Result<()> {
             old,
             new,
             agent,
+            agent_id,
             json,
             ctx,
         } => {
-            let (root, host, actor, target) = resource_author_target(agent, &ctx)?;
+            let (root, host, actor, target) = resource_author_target(agent, agent_id, &ctx)?;
             let receipt = st2::agent_author::rename_resource(
                 &root,
                 &target,
@@ -3712,6 +3045,7 @@ fn resource_cmd(cmd: ResourceCmd) -> Result<()> {
 /// The catalog root, host, acting actor, and authored target for one mediated binding edit.
 fn resource_author_target(
     agent: Option<String>,
+    agent_id: Option<String>,
     ctx: &MsgCtx,
 ) -> Result<(PathBuf, String, Option<String>, String)> {
     let (root, host) = resolve_ctx(ctx)?;
@@ -3720,18 +3054,25 @@ fn resource_author_target(
         .clone()
         .or_else(|| std::env::var("ST_AGENT").ok())
         .filter(|value| !value.is_empty());
-    let target = agent
-        .or_else(|| actor.clone())
-        .context("no resource binding target: pass --agent, --as, or set $ST_AGENT")?;
+    let target = match selected_declaration(&root, &host, agent, agent_id)? {
+        Some(target) => target,
+        None => actor.clone().context(
+            "no resource binding target: pass --agent, --agent-id, --as, or set $ST_AGENT",
+        )?,
+    };
     Ok((root, host, actor, target))
 }
 
 /// Resolve an agent's context dir (`<agent_dir>/resources/context`). Identity defaults to `$ST_AGENT`.
-fn resolve_context_dir(identity: Option<String>, ctx: &MsgCtx) -> Result<PathBuf> {
+fn resolve_context_dir(
+    identity: Option<String>,
+    agent_id: Option<String>,
+    ctx: &MsgCtx,
+) -> Result<PathBuf> {
     let (root, host) = resolve_ctx(ctx)?;
-    let id = match identity {
-        Some(i) => i,
-        None => acting_id(ctx)?,
+    let id = match selected_route(&root, &host, identity, agent_id)? {
+        Some(identity) => identity,
+        None => acting_route(&root, &host, ctx)?,
     };
     Ok(st2::context::context_dir(&agent_dir_of(&root, &id, &host)?))
 }
@@ -3967,6 +3308,7 @@ fn print_report(report: &UpReport) {
     report_line("adopted", &report.adopted);
     report_line("other-host", &report.other_host);
     report_line("unrunnable", &report.unrunnable);
+    report_line("archived", &report.archived);
     for w in &report.warnings {
         eprintln!("warning: {w}");
     }

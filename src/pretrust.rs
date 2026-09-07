@@ -50,13 +50,6 @@ pub fn pretrust_claude(dirs: &[PathBuf]) -> Result<usize> {
     pretrust_at(&config_path()?, dirs)
 }
 
-/// Pre-trust workspaces for Codex only in the caller's ambient config. This remains available to
-/// explicit tooling, but reconciliation does not call it: a provider command may select an
-/// account-specific `CODEX_HOME` only after st2 launches it.
-pub fn pretrust_codex(dirs: &[PathBuf]) -> Result<usize> {
-    pretrust_codex_at(&codex_config_path()?, dirs)
-}
-
 /// The codex config file: `$CODEX_HOME/config.toml` if set, else `~/.codex/config.toml`.
 fn codex_config_path() -> Result<PathBuf> {
     if let Some(dir) = std::env::var_os("CODEX_HOME") {

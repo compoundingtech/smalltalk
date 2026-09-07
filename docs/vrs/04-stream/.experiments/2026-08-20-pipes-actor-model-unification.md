@@ -406,7 +406,7 @@ key still fails per recipient.
 every ambiguity, so no shipped address can be re-pointed) and `an_undeclared_sender_is_still_refused`
 (publication authority unchanged).
 
-**DING.** `src/ding/mod.rs::tests::a_declared_service_actor_renders_its_own_marker_rather_than_unknown`
+**DING.** `src/ding/tests.rs::a_declared_service_actor_renders_its_own_marker_rather_than_unknown`
 renders `[DING] » h.gh-ci: CI failure on PR #42 [id:abc123]` while an undeclared sender still renders
 `?`. `an_invalid_catalog_cannot_promote_a_service_sender_out_of_unknown` is the fail-closed gate: a
 broken declaration anywhere in the catalog forces `?` even for a genuinely declared service actor, so

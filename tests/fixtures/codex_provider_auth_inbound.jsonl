@@ -1,0 +1,14 @@
+{}
+{"method":"remoteControl/status/changed"}
+{}
+{"method":"thread/started","params":{"thread":{"id":"thread-main","status":{"type":"idle"}}}}
+{"method":"warning"}
+{"method":"mcpServer/startupStatus/updated"}
+{}
+{"method":"thread/status/changed","params":{"threadId":"thread-main","status":{"type":"active","activeFlags":[]}}}
+{"method":"turn/started","params":{"threadId":"thread-main","turn":{"id":"turn-rejected"}}}
+{"method":"item/started","params":{"threadId":"thread-main","item":{"type":"userMessage"}}}
+{"method":"item/completed","params":{"threadId":"thread-main","item":{"type":"userMessage"}}}
+{"method":"thread/status/changed","params":{"threadId":"thread-main","status":{"type":"systemError"}}}
+{"method":"error","params":{"error":{"message":"unauthorized","codexErrorInfo":"unauthorized"},"willRetry":false,"threadId":"thread-main","turnId":"turn-rejected"}}
+{"method":"turn/completed","params":{"threadId":"thread-main","turn":{"id":"turn-rejected","status":"failed","error":{"message":"unauthorized","codexErrorInfo":"unauthorized"}}}}

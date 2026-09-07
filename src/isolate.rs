@@ -8,17 +8,18 @@
 //! The fix: spawn each task into its own OS supervision domain, independent of BOTH the spawner and
 //! the transport daemon — one goal, per-OS mechanism.
 //!
-//! - **Linux**: `systemd-run --user --scope --unit=<unit> --collect --quiet -- <task>`. The task runs
-//!   in its own transient scope = its own cgroup, registered with the user manager as a **sibling** of
-//!   the transport unit (a scope created inside a service lands at `app.slice/<unit>`, not nested
-//!   under the service). A cascade kill of the transport unit's cgroup cannot
-//!   reach a sibling. `--scope` (not `--service`) keeps st2 the logical supervisor — systemd provides
-//!   only the cgroup; adoption/teardown/restart stay st2's. `--collect` GCs the scope once it empties.
-//! - **macOS / non-systemd Linux**: `setsid` + reparent to init/launchd is the whole defense — there
-//!   are no cgroups, and launchd does not cascade-kill detached children. Here [`wrap`] is a no-op
-//!   pass-through; the caller's existing `setsid` (exec) or the `pty` daemon (pty) provides detachment.
-//!   If isolation was *wanted* (a Linux box) but systemd is unreachable, we degrade to that same
-//!   pass-through and log a loud WARN — never a silent "isolated" claim.
+//! - **Linux with systemd 254+**: `systemd-run --user --scope --collect --quiet --unit=<unit>`
+//!   `--expand-environment=no -- <task>`. The task runs in its own transient scope = its own cgroup,
+//!   registered with the user manager as a **sibling** of the transport unit (a scope created inside
+//!   a service lands at `app.slice/<unit>`, not nested under the service). A cascade kill of the
+//!   transport unit's cgroup cannot reach a sibling. `--scope` (not `--service`) keeps st2 the logical
+//!   supervisor — systemd provides only the cgroup; adoption/teardown/restart stay st2's. `--collect`
+//!   GCs the scope once it empties.
+//! - **macOS / unsupported Linux**: `setsid` + reparent to init/launchd is the fallback. Here [`wrap`]
+//!   is a no-op pass-through; the caller's existing `setsid` (exec) or the `pty` daemon (pty) provides
+//!   detachment. If isolation was wanted but the systemd user manager or the exact-argv capability
+//!   is unavailable, we degrade to that pass-through and log a loud WARN — never a silent
+//!   "isolated" claim.
 //!
 //! Teardown is unchanged: the scope is for **survival only**. `pty kill` / the exec process-group kill
 //! still tear tasks down; the scope just prevents the transport from taking them as collateral.
@@ -31,14 +32,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// How a task is isolated from its spawner and the transport daemon.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Isolation {
-    /// Linux: own transient systemd `--user` scope (own cgroup, sibling of the transport unit).
+    /// Linux with systemd 254+: own transient `--user` scope with opaque inner argv.
     Scope,
     /// macOS / non-systemd: `setsid` + reparent to init/launchd (no cgroup needed — the transport
     /// cannot cascade-kill a detached process on these platforms).
     Detached,
-    /// Isolation was wanted (a Linux host) but systemd is unreachable — degraded to `Detached` with a
-    /// logged WARN. Distinct from `Detached` so callers/tests can tell an intended pass-through from a
-    /// degraded one.
+    /// Isolation was wanted (a Linux host) but the required systemd user scope capability is
+    /// unavailable — degraded to `Detached` with a logged WARN. Distinct from `Detached` so
+    /// callers/tests can tell an intended pass-through from a degraded one.
     DegradedDetached,
 }
 
@@ -56,10 +57,10 @@ fn detect() -> Isolation {
         } else {
             // The old line embedded a manual "WARN" prefix; the facade carries severity now.
             tracing::warn!(
-                "st2: systemd user scopes unavailable (no `systemd-run --user` / no \
-                 $XDG_RUNTIME_DIR) — spawning tasks WITHOUT cgroup isolation. A transport/supervisor \
-                 restart may cascade-kill them. Enable a user systemd manager (loginctl enable-linger) \
-                 to restore isolation."
+                "st2: systemd user scopes with opaque argv unavailable (`systemd-run` 254+ and \
+                 $XDG_RUNTIME_DIR are required) — spawning tasks WITHOUT cgroup isolation. A \
+                 transport/supervisor restart may cascade-kill them. Upgrade systemd and enable a \
+                 user manager (`loginctl enable-linger`) to restore isolation."
             );
             Isolation::DegradedDetached
         }
@@ -69,18 +70,27 @@ fn detect() -> Isolation {
     }
 }
 
-/// Whether a `--user` systemd scope can be created here.
+/// Whether a `--user` systemd scope can preserve the inner argv exactly.
 fn systemd_user_available() -> bool {
     if std::env::var_os("XDG_RUNTIME_DIR").is_none() {
         return false;
     }
     Command::new("systemd-run")
         .args(["--user", "--version"])
-        .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .status()
-        .map(|s| s.success())
+        .output()
+        .map(|output| {
+            output.status.success() && systemd_version_supports_exact_argv(&output.stdout)
+        })
         .unwrap_or(false)
+}
+
+fn systemd_version_supports_exact_argv(output: &[u8]) -> bool {
+    std::str::from_utf8(output)
+        .ok()
+        .and_then(|output| output.split_ascii_whitespace().nth(1))
+        .and_then(|version| version.parse::<u32>().ok())
+        .is_some_and(|version| version >= 254)
 }
 
 static SCOPE_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -110,17 +120,23 @@ pub fn scope_unit(task_id: &str) -> String {
 
 /// Build the OUTER launch [`Command`] for the inner `program` + `args`, isolated under `unit`.
 ///
-/// In [`Isolation::Scope`] this is `systemd-run --user --scope --unit=<unit> --collect --quiet --
-/// <program> <args>`; otherwise it is `<program> <args>` verbatim. Either way the caller applies
-/// env / cwd / stdio / `pre_exec` to the returned Command and they reach the task — for `--scope`,
-/// scope mode runs the command in the caller's context, so cwd, environment, and stdio fds all
-/// inherit (verified).
+/// In [`Isolation::Scope`] this is `systemd-run --user --scope --collect --quiet --unit=<unit>
+/// --expand-environment=no -- <program> <args>`; otherwise it is `<program> <args>` verbatim.
+/// Disabling systemd's environment expansion keeps every inner argv element opaque, including
+/// dollar-bearing literals. Either way the caller applies env / cwd / stdio / `pre_exec` to the
+/// returned Command and they reach the task — for `--scope`, scope mode runs the command in the
+/// caller's context, so cwd, environment, and stdio fds all inherit (verified).
 pub fn wrap(unit: &str, program: &OsStr, args: &[&OsStr]) -> Command {
-    match mode() {
+    wrap_for_mode(mode(), unit, program, args)
+}
+
+fn wrap_for_mode(isolation: Isolation, unit: &str, program: &OsStr, args: &[&OsStr]) -> Command {
+    match isolation {
         Isolation::Scope => {
             let mut c = Command::new("systemd-run");
             c.args(["--user", "--scope", "--collect", "--quiet"])
                 .arg(format!("--unit={unit}"))
+                .arg("--expand-environment=no")
                 .arg("--")
                 .arg(program)
                 .args(args);
@@ -154,32 +170,79 @@ mod tests {
     }
 
     #[test]
-    fn wrap_scope_prefixes_systemd_run_but_passthrough_does_not() {
-        // We can't force `mode()` per-test (it's process-cached), so assert the shape that matches the
-        // detected mode: on a systemd Linux CI box it's Scope; otherwise pass-through.
-        let cmd = wrap(
+    fn exact_argv_requires_systemd_254_or_newer() {
+        assert!(!systemd_version_supports_exact_argv(
+            b"systemd 249 (249.11)\n"
+        ));
+        assert!(!systemd_version_supports_exact_argv(
+            b"systemd 252 (252.38)\n"
+        ));
+        assert!(systemd_version_supports_exact_argv(
+            b"systemd 254 (254.5)\n"
+        ));
+        assert!(systemd_version_supports_exact_argv(
+            b"systemd 257 (257.7)\n"
+        ));
+        assert!(!systemd_version_supports_exact_argv(b"unexpected output\n"));
+    }
+
+    #[test]
+    fn wrap_scope_disables_expansion_and_preserves_dollar_bearing_argv() {
+        let cmd = wrap_for_mode(
+            Isolation::Scope,
             "st2-x.scope",
-            OsStr::new("sh"),
-            &[OsStr::new("-c"), OsStr::new("true")],
+            OsStr::new("provider"),
+            &[
+                OsStr::new("$HOME"),
+                OsStr::new("${UNSET}"),
+                OsStr::new("$$"),
+            ],
         );
-        let args: Vec<String> = cmd
-            .get_args()
-            .map(|a| a.to_string_lossy().into_owned())
-            .collect();
-        match mode() {
-            Isolation::Scope => {
-                assert_eq!(cmd.get_program(), OsStr::new("systemd-run"));
-                assert!(args.contains(&"--scope".to_string()));
-                assert!(args.contains(&"--unit=st2-x.scope".to_string()));
-                assert!(args.contains(&"--collect".to_string()));
-                // The inner command follows the `--` separator, verbatim.
-                let sep = args.iter().position(|a| a == "--").unwrap();
-                assert_eq!(&args[sep + 1..], &["sh", "-c", "true"]);
-            }
-            Isolation::Detached | Isolation::DegradedDetached => {
-                assert_eq!(cmd.get_program(), OsStr::new("sh"));
-                assert_eq!(args, vec!["-c", "true"]);
-            }
+        let args: Vec<&OsStr> = cmd.get_args().collect();
+
+        assert_eq!(cmd.get_program(), OsStr::new("systemd-run"));
+        assert_eq!(
+            args,
+            vec![
+                OsStr::new("--user"),
+                OsStr::new("--scope"),
+                OsStr::new("--collect"),
+                OsStr::new("--quiet"),
+                OsStr::new("--unit=st2-x.scope"),
+                OsStr::new("--expand-environment=no"),
+                OsStr::new("--"),
+                OsStr::new("provider"),
+                OsStr::new("$HOME"),
+                OsStr::new("${UNSET}"),
+                OsStr::new("$$"),
+            ]
+        );
+    }
+
+    #[test]
+    fn wrap_detached_modes_preserve_exact_program_and_argv() {
+        for isolation in [Isolation::Detached, Isolation::DegradedDetached] {
+            let cmd = wrap_for_mode(
+                isolation,
+                "unused.scope",
+                OsStr::new("provider"),
+                &[
+                    OsStr::new("$HOME"),
+                    OsStr::new("${UNSET}"),
+                    OsStr::new("$$"),
+                ],
+            );
+            let args: Vec<&OsStr> = cmd.get_args().collect();
+
+            assert_eq!(cmd.get_program(), OsStr::new("provider"));
+            assert_eq!(
+                args,
+                vec![
+                    OsStr::new("$HOME"),
+                    OsStr::new("${UNSET}"),
+                    OsStr::new("$$"),
+                ]
+            );
         }
     }
 }

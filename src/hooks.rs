@@ -155,10 +155,20 @@ pub fn claude_settings_registration() -> serde_json::Value {
             // The completion edge. It never increments the count `PreCompact` already made — see
             // `claude_session::observe_compaction` for why the dedupe is positional.
             "PostCompact": observe("PostCompact"),
-            "StopFailure": [{ "hooks": [{
-                "type": "command",
-                "command": "\"$ST_HOOKS/claude-stop-failure.sh\"",
-            }] }],
+            // Two commands again: the wedge reporter moves declared presence and notifies the
+            // supervisor, while the observe hook records the turn's end and, for the credential
+            // class, the native-driver diagnostic. `StopFailure` fires INSTEAD of `Stop`, so
+            // without the observe entry an API-error-ended turn would leave `active` standing.
+            "StopFailure": [{ "hooks": [
+                {
+                    "type": "command",
+                    "command": "\"$ST_HOOKS/claude-stop-failure.sh\"",
+                },
+                {
+                    "type": "command",
+                    "command": "\"$ST_HOOKS/claude-observe.sh\" StopFailure",
+                },
+            ] }],
             "UserPromptSubmit": observe("UserPromptSubmit"),
             "Stop": observe("Stop"),
             "PermissionRequest": observe("PermissionRequest"),
@@ -748,10 +758,6 @@ mod tests {
         assert_eq!(registered, claude_settings_registration());
     }
 
-    /// The gate that holds a pi launch until the set is verified keys on this predicate, so a
-    /// fencepost here silently ungates every pi agent. The `driver pi-session` shape is the one
-    /// expansion actually emits.
-    #[test]
     #[test]
     fn omp_launch_classification_is_exact() {
         let root = Path::new("/catalog");
@@ -797,6 +803,10 @@ mod tests {
         assert!(!argv_invokes_omp(&["/opt/bin/omph".into()], root));
     }
 
+    /// The gate that holds a pi launch until the set is verified keys on this predicate, so a
+    /// fencepost here silently ungates every pi agent. The `driver pi-session` shape is the one
+    /// expansion actually emits.
+    #[test]
     fn pi_launch_classification_is_exact() {
         let root = Path::new("/catalog");
         assert!(command_invokes_pi("exec pi -a 'boot'"));

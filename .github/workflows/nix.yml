@@ -4,27 +4,55 @@ on:
   push:
     branches: [main]
 
-# One in-flight run per ref: a push that supersedes an earlier one should not keep
-# two ~35m Linux checks and two macOS builds competing for the same runner pool.
+# One in-flight run per ref: a superseded PR run should not keep three Linux
+# shards and a macOS build competing for hosted capacity.
 concurrency:
   group: nix-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
-# Both jobs are named for the flake system they prove, not for the runner that hosts them.
-# They are deliberately not the same size — see the comment on the Darwin job.
+# Linux uses four build-graph shards so each remaining cold Rust derivation gets a
+# runner instead of competing with an unrelated compile. The aggregation job
+# preserves the stable `check-x86_64-linux` status used by branch protection.
 jobs:
-  check-x86_64-linux:
+  check-x86_64-linux-shard:
+    name: check-x86_64-linux (${{ matrix.group }})
     runs-on: ubuntu-latest
-    # A healthy full `nix flake check` baseline is ~35m; 90m provides
-    # headroom while still failing boundedly.
-    timeout-minutes: 90
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - group: package
+            targets: >-
+              .#checks.x86_64-linux.st2
+              .#checks.x86_64-linux.debug-assertions
+              .#checks.x86_64-linux.help
+              .#checks.x86_64-linux.completions
+              .#checks.x86_64-linux.hooks-replacement
+              .#checks.x86_64-linux.pty-fleet-contract
+          - group: providers
+            targets: >-
+              .#checks.x86_64-linux.provider-components
+              .#checks.x86_64-linux.wasip2-resource-providers
+          - group: integration
+            targets: >-
+              .#checks.x86_64-linux.release-integration
+              .#checks.x86_64-linux.pi-extension-types
+          - group: wasm
+            targets: >-
+              .#checks.x86_64-linux.wasm-resolver-feature
+              .#checks.x86_64-linux.wasm-resolver-artifact
     steps:
       - uses: actions/checkout@v4
       - uses: DeterminateSystems/determinate-nix-action@v3
-      # `nix flake check` rather than `nix build`: it builds the package *and*
-      # evaluates every `checks.*`, so fmt, clippy, the hermetic test suite, and
-      # the `--help` smoke test all gate the PR from one entrypoint.
-      - run: nix flake check --print-build-logs
+      - run: nix build --no-link --print-build-logs ${{ matrix.targets }}
+
+  check-x86_64-linux:
+    if: always()
+    needs: check-x86_64-linux-shard
+    runs-on: ubuntu-latest
+    steps:
+      - run: test "${{ needs.check-x86_64-linux-shard.result }}" = success
 
   # st2 drives real processes — process groups, signals, pipes, reaping — and those paths
   # are OS behaviour, not portable Rust: #356 and #255 were aarch64-darwin failures no Linux
@@ -34,8 +62,8 @@ jobs:
   #
   # Narrower than its Linux sibling on purpose: `nix build .#st2` builds the package and runs
   # its hermetic suite via `doCheck` — the surface those issues live on — without also
-  # demanding cold aarch64-darwin builds of the `pty` and `otelite` inputs that
-  # `checks.parked-recovery` and `checks.otel-export` pull in. Widen once this is stable.
+  # demanding cold aarch64-darwin builds of the inputs used by
+  # `checks.release-integration` on Linux. Widen once this is stable.
   check-aarch64-darwin:
     runs-on: macos-15
     timeout-minutes: 90

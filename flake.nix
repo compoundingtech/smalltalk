@@ -11,9 +11,8 @@
     pty.url = "github:compoundingtech/pty/504ac7332895fe1fa3767b530dcd99f091f56cda";
     pty.inputs.nixpkgs.follows = "nixpkgs";
     # Shared tooling packages from overengineering: provides the `otelite`
-    # OTLP collector binary that the OTel export integration gate
-    # (`tests/otel_export.rs`, exposed as `checks.otel-export`) drives to
-    # prove real span export end-to-end. Pinned to a full rev (like `pty`)
+    # OTLP collector binary that `checks.release-integration` drives to prove
+    # real span export end-to-end. Pinned to a full rev (like `pty`)
     # so CI is reproducible; bump deliberately via `nix flake lock`.
     effect-utils.url =
       "github:overengineeringstudio/effect-utils/911e2ce0f4ac39d2b54f9ebd6df035234982f721";
@@ -75,6 +74,20 @@
           "fish"
         ];
 
+        # buildRustPackage compiles the workspace once per derivation, so a gate that differs from
+        # an existing derivation only by test selection is folded into that derivation's check
+        # phase instead of paying for a second compile. These extra runs deliberately mirror
+        # `cargoCheckHook`: same source, profile, offline mode and target dir, so they reuse the
+        # artifacts it just built.
+        rustHostTarget = pkgs.stdenv.hostPlatform.rust.rustcTarget;
+        extraCargoTest =
+          { label, flags }:
+          ''
+            echo "--- cargo test: ${label}"
+            cargo test -j "$NIX_BUILD_CORES" --release \
+              --target ${rustHostTarget} --offline ${pkgs.lib.escapeShellArgs flags}
+          '';
+
         st2 = pkgs.rustPlatform.buildRustPackage {
           pname = "st2";
           inherit version;
@@ -119,12 +132,17 @@
               --fish completions-fish
           '';
 
-          # Run the hermetic unit tests plus agent-spec's discovery test, the real
-          # lifecycle-hook integration tests, and the reconcile/execute suite. Most
-          # remaining root integration tests assume facilities the Nix build sandbox
-          # deliberately lacks: `/usr/bin/git` on a hardcoded `PATH`, live PTY
-          # backends, or a systemd `--user` manager. They remain native gates, while
-          # the flake proves that its parser and packaged hooks execute.
+          # Every hermetic test target runs here: the unit tests, agent-spec's discovery test, the
+          # real lifecycle-hook integration tests, the reconcile/execute suite, and the
+          # parser/CLI/doc-ledger targets that need nothing but `tempfile` and the binary this
+          # build just produced. A target belongs in this list iff it is hermetic — an ungated
+          # hermetic target is a test that cannot fail CI, which is how `tests/agent_publish.rs`
+          # stayed red on `main` unnoticed.
+          # The remaining root integration tests assume facilities the Nix build sandbox
+          # deliberately lacks: `/usr/bin/git` on a hardcoded `PATH`, live PTY backends, or a
+          # systemd `--user` manager. They remain native gates, while the flake proves that its
+          # parser and packaged hooks execute. The four sibling derivations below gate the targets
+          # that need a different profile, feature set, or `nativeCheckInputs`.
           # `run` is hermetic despite living alongside them — it drives `reconcile`
           # and `execute` against `FakeRunner` and `tempfile` only — so it is gated
           # here. It covers the restart cap's supervision behaviour, which is
@@ -135,6 +153,10 @@
           # the exact argv every typed harness driver produces. That argv is the
           # whole launch contract, so a silent change to it is the class of defect
           # this build should not ship.
+          # `agent_publish` carries nine `#[ignore]`d cases, quarantined on
+          # https://github.com/compoundingtech/st2/issues/498: their single-agent fixtures are
+          # refused by the root-count rule. Its other 15 cases — CAS staleness, control-directory
+          # swap, ownership markers — gate here.
           # `--workspace` because the root is a real package: without it cargo
           # selects only `st2` and silently skips the `agent-spec` crate.
           cargoTestFlags = [
@@ -161,6 +183,26 @@
             "run"
             "--test"
             "driver_expansion"
+            "--test"
+            "agent_address"
+            "--test"
+            "agent_desired_state"
+            "--test"
+            "claude_hooks"
+            "--test"
+            "agent_publish"
+            "--test"
+            "catalog_graph"
+            "--test"
+            "invariants"
+            "--test"
+            "message"
+            "--test"
+            "status_agents"
+            "--test"
+            "validate"
+            "--test"
+            "vrs_ledger"
             # Lifecycle tests fork while holding temporary sockets and executables.
             # Serial execution prevents sibling tests from inheriting those live handles.
             "--"
@@ -180,6 +222,9 @@
 
         # Production variant for catalogs that declare wasm resource-profile resolvers. Keep the
         # default package lightweight; consumers opt into the wasmtime closure explicitly.
+        #
+        # Doubles as `checks.wasm-resolver-feature`: the default hermetic suite runs with the
+        # production feature set, and the feature-gated targets reuse that same build.
         st2WasmResolver = st2.overrideAttrs (old: {
           pname = "st2-wasm-resolver";
           cargoBuildFeatures = (old.cargoBuildFeatures or [ ]) ++ [ "wasm-resolver" ];
@@ -187,115 +232,96 @@
           # Wasmtime's Cranelift build and the feature-gated resolver tests need the Rust toolchain
           # inherited from buildRustPackage plus an LLVM linker on every supported platform.
           nativeBuildInputs = (old.nativeBuildInputs or [ ]) ++ [ pkgs.lld ];
-        });
-
-        # Non-vacuous feature gate: both the runner's live resync integration and agent-spec's wasm
-        # ABI/containment suite compile and execute with the same features as the production variant.
-        st2WasmResolverCheck = st2WasmResolver.overrideAttrs (_: {
-          pname = "st2-wasm-resolver-check";
-          cargoTestFlags = [
-            "--workspace"
-            "--exclude"
-            "st2-resource-providers"
-            "--exclude"
-            "st2-github-issue-component"
-            "--exclude"
-            "st2-github-pr-component"
-            "--exclude"
-            "st2-pty-stats-component"
-            "--exclude"
-            "st2-vista-component"
-            "--test"
-            "resync"
-            "--test"
-            "resync_notify_chain"
-            "--test"
-            "profile_wasm"
-          ];
-        });
-
-        # The default workspace remains Wasmtime-free; this focused gate opts the Component Model
-        # executor into its runtime feature and drives its fixture and cache trust boundary.
-        st2Wasip2ExecutorCheck = st2.overrideAttrs (old: {
-          pname = "st2-resource-wasip2-check";
-          nativeBuildInputs = (old.nativeBuildInputs or [ ]) ++ [ pkgs.lld ];
-          cargoTestFlags = [
-            "-p"
-            "st2-resource-wasip2"
-            "--features"
-            "runtime"
-            "--lib"
-            "--test"
-            "executor"
-          ];
-        });
-
-        buildProviderComponent =
-          {
-            package,
-            wasmName,
-          }:
-          providerRustPlatform.buildRustPackage {
-            pname = package;
-            inherit version;
-            src = self;
-            cargoLock.lockFile = ./Cargo.lock;
-            buildPhase = ''
-              runHook preBuild
-              cargo build --offline --release -p ${package} --target wasm32-unknown-unknown
-              runHook postBuild
-            '';
-            doCheck = false;
-            nativeBuildInputs = [
-              pkgs.lld
-              pkgs.wasm-tools
+          # Non-vacuous feature gate: both the runner's live resync integration and agent-spec's
+          # wasm ABI/containment suite execute with the same features as the production variant.
+          postCheck = extraCargoTest {
+            label = "wasm-resolver feature suite";
+            flags = [
+              "--features"
+              "wasm-resolver"
+              "--workspace"
+              "--exclude"
+              "st2-resource-providers"
+              "--exclude"
+              "st2-github-issue-component"
+              "--exclude"
+              "st2-github-pr-component"
+              "--exclude"
+              "st2-pty-stats-component"
+              "--exclude"
+              "st2-vista-component"
+              "--test"
+              "resync"
+              "--test"
+              "resync_notify_chain"
+              "--test"
+              "profile_wasm"
             ];
-            installPhase = ''
-              runHook preInstall
-              mkdir -p "$out/share/st2/providers"
+          };
+        });
+
+        providerComponentPackages = {
+          "st2-github-issue-component" = "st2_github_issue_component";
+          "st2-github-pr-component" = "st2_github_pr_component";
+          "st2-pty-stats-component" = "st2_pty_stats_component";
+          "st2-vista-component" = "st2_vista_component";
+        };
+
+        # One cargo invocation builds all four guest crates: they share the same wasm32 dependency
+        # graph, so a derivation per component compiled it four times. Install paths are unchanged
+        # and every component package attr points at this single output.
+        st2ProviderComponents = providerRustPlatform.buildRustPackage {
+          pname = "st2-provider-components";
+          inherit version;
+          src = self;
+          cargoLock.lockFile = ./Cargo.lock;
+          buildPhase = ''
+            runHook preBuild
+            cargo build --offline --release --target wasm32-unknown-unknown \
+              ${
+                pkgs.lib.concatMapStringsSep " " (package: "-p ${package}") (
+                  pkgs.lib.attrNames providerComponentPackages
+                )
+              }
+            runHook postBuild
+          '';
+          doCheck = false;
+          nativeBuildInputs = [
+            pkgs.lld
+            pkgs.wasm-tools
+          ];
+          installPhase = ''
+            runHook preInstall
+            mkdir -p "$out/share/st2/providers"
+            ${pkgs.lib.concatMapStringsSep "\n" (wasmName: ''
               wasm-tools component new \
                 "target/wasm32-unknown-unknown/release/${wasmName}.wasm" \
                 -o "$out/share/st2/providers/${wasmName}.component.wasm"
-              runHook postInstall
-            '';
-          };
-
-        st2GitHubIssueComponent = buildProviderComponent {
-          package = "st2-github-issue-component";
-          wasmName = "st2_github_issue_component";
+            '') (pkgs.lib.attrValues providerComponentPackages)}
+            runHook postInstall
+          '';
         };
 
-        st2GitHubPrComponent = buildProviderComponent {
-          package = "st2-github-pr-component";
-          wasmName = "st2_github_pr_component";
-        };
+        providerComponentPath =
+          wasmName: "${st2ProviderComponents}/share/st2/providers/${wasmName}.component.wasm";
 
-        st2PtyStatsComponent = buildProviderComponent {
-          package = "st2-pty-stats-component";
-          wasmName = "st2_pty_stats_component";
-        };
-
-        st2VistaComponent = buildProviderComponent {
-          package = "st2-vista-component";
-          wasmName = "st2_vista_component";
-        };
-
+        # Production variant for catalogs whose resource profiles are WASIp2 components.
+        #
+        # Doubles as `checks.wasip2-resource-providers`: one compile of the runtime feature serves
+        # the provider/supervisor end-to-end targets and the Component Model executor's fixture and
+        # cache trust boundary. The default workspace remains covered by `checks.st2`.
         st2ProviderRuntime = st2.overrideAttrs (old: {
           pname = "st2-provider-runtime";
           cargoBuildFeatures = (old.cargoBuildFeatures or [ ]) ++ [ "wasip2-provider-runtime" ];
-          cargoCheckFeatures = (old.cargoCheckFeatures or [ ]) ++ [ "wasip2-provider-runtime" ];
+          cargoCheckFeatures = [ ];
           nativeBuildInputs = (old.nativeBuildInputs or [ ]) ++ [
             pkgs.lld
             pty.packages.${system}.default
           ];
-        });
-
-        st2ProviderRuntimeCheck = st2ProviderRuntime.overrideAttrs (_: {
-          pname = "st2-provider-runtime-check";
-          ST2_GITHUB_ISSUE_COMPONENT = "${st2GitHubIssueComponent}/share/st2/providers/st2_github_issue_component.component.wasm";
-          ST2_GITHUB_PR_COMPONENT = "${st2GitHubPrComponent}/share/st2/providers/st2_github_pr_component.component.wasm";
-          ST2_PTY_STATS_COMPONENT = "${st2PtyStatsComponent}/share/st2/providers/st2_pty_stats_component.component.wasm";
-          ST2_VISTA_COMPONENT = "${st2VistaComponent}/share/st2/providers/st2_vista_component.component.wasm";
+          ST2_GITHUB_ISSUE_COMPONENT = providerComponentPath "st2_github_issue_component";
+          ST2_GITHUB_PR_COMPONENT = providerComponentPath "st2_github_pr_component";
+          ST2_PTY_STATS_COMPONENT = providerComponentPath "st2_pty_stats_component";
+          ST2_VISTA_COMPONENT = providerComponentPath "st2_vista_component";
           cargoTestFlags = [
             "-p"
             "st2-resource-providers"
@@ -304,84 +330,52 @@
             "github_issue_component"
             "--test"
             "github_pr_component"
-            "-p"
-            "st2"
-            "--features"
-            "st2/wasip2-provider-runtime"
-            "--test"
-            "resource_profile_supervisor_e2e"
-            "--test"
-            "resource_provider_e2e"
           ];
+          postCheck =
+            extraCargoTest {
+              label = "wasip2 supervisor integration";
+              flags = [
+                "-p"
+                "st2"
+                "--features"
+                "wasip2-provider-runtime"
+                "--test"
+                "resource_profile_supervisor_e2e"
+                "--test"
+                "resource_provider_e2e"
+              ];
+            }
+            + extraCargoTest {
+              label = "wasip2 resource executor";
+              flags = [
+                "-p"
+                "st2-resource-wasip2"
+                "--features"
+                "runtime"
+                "--lib"
+                "--test"
+                "executor"
+              ];
+            };
         });
 
-        # Narrow sandbox-safe integration gate for the atomic snapshot boundary. The main package
-        # deliberately omits the broad doctor suite because some doctor cases exercise facilities
-        # unavailable in the Nix sandbox. A dedicated target containing exactly one test makes the
-        # gate structurally non-vacuous: a missing target is a cargo error, never a zero-match pass.
-        st2AtomicPtySnapshot = st2.overrideAttrs (_: {
-          pname = "st2-atomic-pty-snapshot-check";
-          cargoTestFlags = [
-            "--test"
-            "atomic_pty_snapshot"
-          ];
-        });
-
-        # Bootstrap's crash/race tests use causal barrier hooks compiled only with debug
-        # assertions. Keep the package's release-mode test boundary unchanged and gate this
-        # transaction family in one explicit, non-vacuous derivation.
-        st2CatalogBootstrap = st2.overrideAttrs (_: {
-          pname = "st2-catalog-bootstrap-check";
-          CARGO_PROFILE_RELEASE_DEBUG_ASSERTIONS = "true";
-          cargoTestFlags = [
-            "--test"
-            "catalog_apply"
-            "bootstrap_"
-          ];
-        });
-
-        # Message CLI crash/recovery controls are compiled only with debug assertions. Keep the
-        # package's release-mode test boundary unchanged and gate the complete integration target
-        # in a dedicated derivation.
-        st2MessageCli = st2.overrideAttrs (_: {
-          pname = "st2-message-cli-check";
-          CARGO_PROFILE_RELEASE_DEBUG_ASSERTIONS = "true";
-          cargoTestFlags = [
-            "--test"
-            "message_cli"
-          ];
-        });
-
-        # The parked-task recovery episode against the real binary and real processes. It is a
-        # dedicated derivation because it needs a long-running supervisor: both single-pass entry
-        # points build a fresh `FlappingCap`, so `up --once` can never park anything, and the
-        # package's own test boundary would never reach this path.
-        st2ParkedRecovery = st2.overrideAttrs (old: {
-          pname = "st2-parked-recovery-check";
-          # The supervisor snapshots pty sessions on every pass even for an exec-only catalog, so the
-          # real producer has to be on PATH — without it the pass refuses to reconcile at all and no
-          # task ever reaches the park this check exists to observe.
-          nativeCheckInputs = (old.nativeCheckInputs or [ ]) ++ [
-            pty.packages.${system}.default
-          ];
-          cargoTestFlags = [
-            "--test"
-            "parked_recovery"
-          ];
-        });
-
-        # OTLP export integration gate. `tests/otel_export.rs` is skipped
-        # unless `ST2_OTELITE_BIN` points at a real collector, so the package's
-        # own test boundary never exercises span export — this dedicated
-        # derivation is what makes the contract non-vacuous: it pins the exact
-        # `otelite` build from effect-utils and does NOT set
-        # `ST2_ALLOW_OTEL_SKIP`, so a broken export path fails the gate instead
-        # of silently skipping.
-        st2OtelExport = st2.overrideAttrs (old: {
-          pname = "st2-otel-export-check";
-          # The test drives `st2 up --once`, whose reconcile pass shells out to
-          # `pty list --json` — the same real-producer requirement as
-          # st2ParkedRecovery, so the packaged pty must be on the check's PATH.
+        # Sandbox-safe integration episodes the package's own release-mode boundary cannot reach,
+        # sharing one default-feature build because they differ only by test selection:
+        #   * `atomic_pty_snapshot` — the atomic snapshot boundary, split out of the broad doctor
+        #     suite (some doctor cases need facilities the sandbox lacks). A target holding exactly
+        #     one test makes the gate structurally non-vacuous: a missing target is a cargo error,
+        #     never a zero-match pass.
+        #   * `parked_recovery` — the parked-task recovery episode against real processes. Both
+        #     single-pass entry points build a fresh `FlappingCap`, so `up --once` can never park
+        #     anything and the package's boundary would never reach this path.
+        #   * `otel_export` — OTLP span export. The test skips unless `ST2_OTELITE_BIN` points at a
+        #     real collector; pinning `otelite` here and leaving `ST2_ALLOW_OTEL_SKIP` unset is what
+        #     makes a broken export path fail instead of silently skipping.
+        st2ReleaseIntegration = st2.overrideAttrs (old: {
+          pname = "st2-release-integration-check";
+          # The supervisor snapshots pty sessions on every pass even for an exec-only catalog, and
+          # both `st2 up --once` drivers shell out to `pty list --json`, so the real producer must
+          # be on PATH — without it no pass reconciles and no task ever reaches the park.
           nativeCheckInputs = (old.nativeCheckInputs or [ ]) ++ [
             pty.packages.${system}.default
             effect-utils.packages.${system}.otelite
@@ -389,8 +383,33 @@
           ST2_OTELITE_BIN = "${effect-utils.packages.${system}.otelite}/bin/otelite";
           cargoTestFlags = [
             "--test"
+            "atomic_pty_snapshot"
+            "--test"
+            "parked_recovery"
+            "--test"
             "otel_export"
           ];
+        });
+
+        # Bootstrap's crash/race tests and the message CLI's crash/recovery controls are both
+        # compiled only with debug assertions, so they share one derivation. Keep the package's
+        # release-mode test boundary unchanged. `bootstrap_` is a positional name filter, so it
+        # needs its own invocation — in a shared one it would also filter `message_cli` to nothing.
+        st2DebugAssertions = st2.overrideAttrs (_: {
+          pname = "st2-debug-assertions-check";
+          CARGO_PROFILE_RELEASE_DEBUG_ASSERTIONS = "true";
+          cargoTestFlags = [
+            "--test"
+            "message_cli"
+          ];
+          postCheck = extraCargoTest {
+            label = "catalog bootstrap transactions";
+            flags = [
+              "--test"
+              "catalog_apply"
+              "bootstrap_"
+            ];
+          };
         });
 
         hookSuccessorSource = pkgs.runCommand "st2-hook-successor-source" { } ''
@@ -402,6 +421,10 @@
         st2HookSuccessor = st2.overrideAttrs (_: {
           pname = "st2-hook-successor";
           src = hookSuccessorSource;
+          # This build exists only to supply a second binary with different embedded hook bytes to
+          # `checks.hooks-replacement`. Its test suite is `checks.st2`'s, on source that differs
+          # only by an appended hook comment, so running it again buys nothing.
+          doCheck = false;
           CLI_BUILD_STAMP = builtins.toJSON {
             type = "nix";
             inherit version;
@@ -415,10 +438,11 @@
         packages.st2 = st2;
         packages.st2-wasm-resolver = st2WasmResolver;
         packages.st2-provider-runtime = st2ProviderRuntime;
-        packages.st2-github-issue-component = st2GitHubIssueComponent;
-        packages.st2-github-pr-component = st2GitHubPrComponent;
-        packages.st2-pty-stats-component = st2PtyStatsComponent;
-        packages.st2-vista-component = st2VistaComponent;
+        # All four components come out of one build; the install paths are unchanged.
+        packages.st2-github-issue-component = st2ProviderComponents;
+        packages.st2-github-pr-component = st2ProviderComponents;
+        packages.st2-pty-stats-component = st2ProviderComponents;
+        packages.st2-vista-component = st2ProviderComponents;
         packages.default = st2;
 
         # `nix flake check` is the whole CI: it builds the package — which runs
@@ -431,18 +455,11 @@
         # commits on every rebase. The devShell ships rustfmt + clippy for whoever
         # wants them.
         checks.st2 = st2;
-        checks.atomic-pty-snapshot = st2AtomicPtySnapshot;
-        checks.catalog-bootstrap = st2CatalogBootstrap;
-        checks.message-cli = st2MessageCli;
-        checks.parked-recovery = st2ParkedRecovery;
-        checks.otel-export = st2OtelExport;
-        checks.wasm-resolver-feature = st2WasmResolverCheck;
-        checks.wasip2-resource-executor = st2Wasip2ExecutorCheck;
-        checks.wasip2-resource-providers = st2ProviderRuntimeCheck;
-        checks.github-issue-component = st2GitHubIssueComponent;
-        checks.github-pr-component = st2GitHubPrComponent;
-        checks.pty-stats-component = st2PtyStatsComponent;
-        checks.vista-component = st2VistaComponent;
+        checks.release-integration = st2ReleaseIntegration;
+        checks.debug-assertions = st2DebugAssertions;
+        checks.wasm-resolver-feature = st2WasmResolver;
+        checks.wasip2-resource-providers = st2ProviderRuntime;
+        checks.provider-components = st2ProviderComponents;
         # Exercise the shipped binary, not a cargo-side surrogate: its version entrypoint runs and
         # the same artifact strictly admits a catalog carrying a real wasm profile module.
         checks.wasm-resolver-artifact = pkgs.runCommand "st2-wasm-resolver-artifact-${version}" { } ''

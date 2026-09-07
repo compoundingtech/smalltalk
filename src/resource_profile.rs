@@ -189,10 +189,6 @@ impl SnapshotTarget {
         &self.root
     }
 
-    pub fn relative_path(&self) -> &Path {
-        &self.relative
-    }
-
     pub fn path(&self) -> PathBuf {
         self.root.join(&self.relative)
     }
@@ -843,6 +839,7 @@ impl CatchUpState {
         )
     }
 
+    #[cfg(test)]
     pub fn last_commit(&self) -> Option<PublicationCommit> {
         self.last_intent
             .as_ref()

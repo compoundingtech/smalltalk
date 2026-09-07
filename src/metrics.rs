@@ -17,7 +17,7 @@ use std::time::Duration;
 use opentelemetry::global;
 use opentelemetry::metrics::{Counter, Histogram, Meter};
 
-use crate::driver_diagnostic::{Reason, Source, Stage, Support};
+use crate::driver_diagnostic::{Driver, Reason, Source, Stage, Support};
 static ENABLED: AtomicBool = AtomicBool::new(false);
 
 /// Whether a real meter provider is installed. False → recording is a free no-op.
@@ -188,6 +188,7 @@ pub fn record_crash_loop() {
 /// One native-driver boundary entered failure or recovered. Every label is a closed enum; raw
 /// versions and agent/session/message identity stay on spans and logs.
 pub fn record_driver_diagnostic(
+    driver: Driver,
     stage: Stage,
     reason: Reason,
     source: Source,
@@ -199,7 +200,7 @@ pub fn record_driver_diagnostic(
     }
     DRIVER_DIAGNOSTICS.add(
         1,
-        &driver_diagnostic_attributes(stage, reason, source, support, recovered),
+        &driver_diagnostic_attributes(driver, stage, reason, source, support, recovered),
     );
 }
 pub fn record_resource_observe_request(outcome: &'static str) {
@@ -230,13 +231,15 @@ pub fn record_resource_observe_settle(duration: Duration) {
 }
 
 fn driver_diagnostic_attributes(
+    driver: Driver,
     stage: Stage,
     reason: Reason,
     source: Source,
     support: Support,
     recovered: bool,
-) -> [opentelemetry::KeyValue; 5] {
+) -> [opentelemetry::KeyValue; 6] {
     [
+        opentelemetry::KeyValue::new("driver", driver.as_str()),
         opentelemetry::KeyValue::new("stage", stage.as_str()),
         opentelemetry::KeyValue::new("reason", reason.as_str()),
         opentelemetry::KeyValue::new("source", source.as_str()),
@@ -267,6 +270,7 @@ fn normalize_hook_event(event: &str) -> &'static str {
         "PostToolUse" => "PostToolUse",
         "PermissionRequest" => "PermissionRequest",
         "Stop" => "Stop",
+        "StopFailure" => "StopFailure",
         "SubagentStop" => "SubagentStop",
         "PreCompact" => "PreCompact",
         "PostCompact" => "PostCompact",
@@ -297,6 +301,7 @@ mod tests {
         assert!(!enabled());
 
         record_driver_diagnostic(
+            Driver::OpenCode,
             Stage::Seed,
             Reason::UnknownStatus,
             Source::StatusSnapshot,
@@ -326,17 +331,21 @@ mod tests {
     #[test]
     fn driver_diagnostic_metric_attributes_are_exactly_the_bounded_axes() {
         let attributes = driver_diagnostic_attributes(
-            Stage::ReadBack,
-            Reason::NotDurable,
-            Source::MessageReadBack,
-            Support::Supported,
+            Driver::Claude,
+            Stage::ProviderAuth,
+            Reason::ProviderAuthRejected,
+            Source::TurnResult,
+            Support::Unknown,
             true,
         );
         let keys: Vec<&str> = attributes
             .iter()
             .map(|attribute| attribute.key.as_str())
             .collect();
-        assert_eq!(keys, ["stage", "reason", "source", "support", "outcome"]);
+        assert_eq!(
+            keys,
+            ["driver", "stage", "reason", "source", "support", "outcome"]
+        );
         let rendered = format!("{attributes:?}");
         for forbidden in ["1.18.19", "h.worker", "ses_", "msg_"] {
             assert!(!rendered.contains(forbidden), "{rendered}");

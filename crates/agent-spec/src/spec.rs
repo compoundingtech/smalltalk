@@ -27,6 +27,15 @@ pub const AGENT_NAME_MAX_CHARS: usize = 160;
 pub const AGENT_DESCRIPTION_MAX_CHARS: usize = 1_000;
 /// Maximum UTF-8 byte length for a non-running desired-state rationale.
 pub const AGENT_DESIRED_STATE_REASON_MAX_BYTES: usize = 160;
+/// Maximum ASCII length of an explicit agent address (R24).
+pub const AGENT_ADDRESS_MAX_BYTES: usize = 255;
+/// Maximum length of one dotted agent-address segment (R24).
+pub const AGENT_ADDRESS_SEGMENT_MAX_BYTES: usize = 63;
+/// Maximum ASCII length of an explicit immutable agent ID.
+///
+/// The two admitted producers are UUIDv7 for a new subject and the frozen `<host>.<identity>`
+/// bus identity of a migrated legacy subject, so the ID namespace shares the address budget.
+pub const AGENT_ID_MAX_BYTES: usize = 255;
 
 /// Declarative whole-agent lifecycle intent.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -314,7 +323,13 @@ impl AgentDesiredState {
 /// A rendered agent job, lowered to the shared declaration fields st2 and other readers inspect.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentSpec {
-    /// Unique id; the bus id is `<host>.<identity>`.
+    /// Explicit immutable catalog-global agent ID (R24). `None` on a legacy declaration that
+    /// catalog ID migration has not reached yet; required in the target grammar.
+    pub id: Option<String>,
+    /// Explicit mutable agent address (R24). `None` means the positional `identity` below is the
+    /// effective legacy address.
+    pub address: Option<String>,
+    /// The positional declaration key and legacy address fallback. Not immutable subject identity.
     pub identity: String,
     /// Optional mutable human-facing label. Never used as an automation selector.
     pub name: Option<String>,
@@ -594,6 +609,33 @@ impl AgentSpec {
         )
     }
 
+    /// The effective immutable subject ID during the ID migration window (R24).
+    ///
+    /// The explicit `id` when the declaration carries one, otherwise the legacy
+    /// `<host>.<identity>` bus identity — which is exactly the value catalog ID migration freezes
+    /// as this subject's explicit ID, so a mixed catalog stays coherent while it is migrated.
+    pub fn effective_id(&self, this_host: &str) -> String {
+        self.id
+            .clone()
+            .unwrap_or_else(|| self.bus_id(this_host))
+    }
+
+    /// The effective agent address (R24): the explicit `address` when present, otherwise the
+    /// positional `identity` legacy fallback.
+    pub fn effective_address(&self) -> &str {
+        self.address.as_deref().unwrap_or(&self.identity)
+    }
+
+    /// The human-routable bus address `<host>.<effective address>` (R24), using `this_host` when
+    /// `host` is unset. This is a mutable route, never the immutable subject ID.
+    pub fn bus_address(&self, this_host: &str) -> String {
+        format!(
+            "{}.{}",
+            self.host.as_deref().unwrap_or(this_host),
+            self.effective_address()
+        )
+    }
+
     /// The host that should run this spec, defaulting to `this_host` when unset.
     pub fn resolved_host<'a>(&'a self, this_host: &'a str) -> &'a str {
         self.host.as_deref().unwrap_or(this_host)
@@ -658,6 +700,8 @@ pub fn parse_duration(s: &str) -> Result<Duration, String> {
 /// render-agnostic.
 #[derive(Debug, Default, Deserialize)]
 pub(crate) struct RawSpec {
+    pub id: Option<String>,
+    pub address: Option<String>,
     pub identity: Option<String>,
     pub name: Option<String>,
     pub description: Option<String>,
@@ -1208,6 +1252,12 @@ impl RawSpec {
     /// A parsed file is a *spec candidate* when it carries an agent-shaped signal — an identity,
     /// lifecycle intent, the supported `service` type, or task blocks. Random TOML/JSON in the tree
     /// has none of these and is skipped.
+    ///
+    /// `id` and `address` are deliberately not signals. They are two of the most common keys in
+    /// arbitrary JSON/TOML — a dropped GitHub payload, a task cache, a session record — and a file
+    /// whose only agent-shaped key is one of them cannot be a valid declaration anyway: it carries
+    /// no launch, so it would only ever join the roster as a phantom agent and stop the catalog
+    /// from admitting. Migration adds `id` to declarations that are already candidates.
     pub(crate) fn looks_like_spec(&self) -> bool {
         self.identity.is_some()
             || self.job_type.as_deref() == Some("service")
@@ -1247,6 +1297,12 @@ impl RawSpec {
             self.description.as_deref(),
             AGENT_DESCRIPTION_MAX_CHARS,
         )?;
+        if let Some(id) = self.id.as_deref() {
+            validate_agent_id(id)?;
+        }
+        if let Some(address) = self.address.as_deref() {
+            validate_agent_address(address)?;
+        }
         let retired = reject_explicit_null("retired", self.retired)?;
         let desired_state_value = reject_explicit_null("desired_state", self.desired_state)?;
         let desired_state_reason =
@@ -1444,6 +1500,8 @@ impl RawSpec {
         let resources = self.resource.lower()?;
 
         Ok(AgentSpec {
+            id: self.id,
+            address: self.address,
             identity,
             name: self.name,
             description: self.description,
@@ -1568,6 +1626,82 @@ pub fn validate_presentation(
         value.chars().count() <= max_chars,
         "agent presentation `{field}` exceeds the {max_chars}-character limit"
     );
+    Ok(())
+}
+
+/// Validate an explicit immutable agent ID at the shared parse/authoring boundary (R24).
+///
+/// The ID is opaque, but not arbitrary: R26 reuses it verbatim as the canonical task ID and
+/// therefore as a session socket path component, and IDs travel through shell-adjacent text (bus
+/// messages, notices, journal lines), where a backtick has already executed a command on a live
+/// host (schickling/dotfiles#1614). So the grammar is the closed safe set `[A-Za-z0-9._-]`, which
+/// admits both admitted producers — a new subject's UUIDv7 and a migrated subject's frozen
+/// `<host>.<identity>` bus identity — and refuses every shell metacharacter, path and host
+/// separator, whitespace byte, and non-ASCII byte outright.
+///
+/// It stays wider than the address grammar on purpose: a frozen legacy ID keeps host-looking bytes
+/// and whatever case and underscores its identity carried, so freezing an admissible identity can
+/// never be refused here. Equal bytes in the two namespaces do not collide.
+pub fn validate_agent_id(value: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(!value.is_empty(), "agent `id` cannot be empty");
+    anyhow::ensure!(
+        value.len() <= AGENT_ID_MAX_BYTES,
+        "agent `id` '{value}' exceeds the {AGENT_ID_MAX_BYTES}-byte limit"
+    );
+    anyhow::ensure!(
+        value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-')),
+        "agent `id` '{value}' must match [A-Za-z0-9._-]+"
+    );
+    anyhow::ensure!(
+        !value.starts_with('.') && !value.ends_with('.'),
+        "agent `id` '{value}' cannot begin or end with `.`"
+    );
+    Ok(())
+}
+
+/// Validate an explicit mutable agent address at the shared parse/authoring boundary (R24).
+///
+/// An explicit address is at most [`AGENT_ADDRESS_MAX_BYTES`] ASCII characters and is a dotted
+/// sequence of 1-to-[`AGENT_ADDRESS_SEGMENT_MAX_BYTES`]-character segments. Each segment contains
+/// only lowercase letters, digits, and hyphens and begins and ends with a letter or digit.
+pub fn validate_agent_address(value: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !value.is_empty(),
+        "agent `address` cannot be empty; omit it to fall back to the positional identity"
+    );
+    anyhow::ensure!(
+        value.len() <= AGENT_ADDRESS_MAX_BYTES,
+        "agent `address` '{value}' exceeds the {AGENT_ADDRESS_MAX_BYTES}-character limit"
+    );
+    anyhow::ensure!(
+        value.is_ascii(),
+        "agent `address` '{value}' must be ASCII"
+    );
+    for segment in value.split('.') {
+        anyhow::ensure!(
+            !segment.is_empty(),
+            "agent `address` '{value}' has an empty dotted segment"
+        );
+        anyhow::ensure!(
+            segment.len() <= AGENT_ADDRESS_SEGMENT_MAX_BYTES,
+            "agent `address` '{value}' segment '{segment}' exceeds {AGENT_ADDRESS_SEGMENT_MAX_BYTES} characters"
+        );
+        anyhow::ensure!(
+            segment
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-'),
+            "agent `address` '{value}' segment '{segment}' must match [a-z0-9-]+"
+        );
+        let first = segment.as_bytes()[0];
+        let last = segment.as_bytes()[segment.len() - 1];
+        anyhow::ensure!(
+            (first.is_ascii_lowercase() || first.is_ascii_digit())
+                && (last.is_ascii_lowercase() || last.is_ascii_digit()),
+            "agent `address` '{value}' segment '{segment}' must begin and end with a letter or digit"
+        );
+    }
     Ok(())
 }
 

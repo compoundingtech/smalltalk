@@ -954,7 +954,7 @@ Events earn a distinct record kind on the shared transport: the semantics CI
 actually needs — supersession, bounded retention, mandatory event identity —
 are incoherent inside the append-only sender ledger, while the transport,
 storage location, read commands, and reply path unify. Decision 0004 adopted
-this model; decision 0005 moved the declaration onto the agent and renamed
+this model; decision 0005-streams-are-agent-nested-and-stream-named moved the declaration onto the agent and renamed
 the vocabulary stream-centric (this document's per-emit "stream" axis became
 `key`, and its top-level `source` declaration became the reserved future
 generalization).

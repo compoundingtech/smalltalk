@@ -134,7 +134,7 @@ execution envelope for observable Resource providers. This amendment preserves
 the original decision's closed core-wasm resolver and replaces only the
 observable host-process mechanism described later by
 [decision 0014](./0014-resource-profiles-are-state-first-read-and-observe-capabilities.md).
-Decision 0014's state-first authority, demand semantics, typed `Publication`,
+Decision 0014-resource-profiles-are-state-first-read-and-observe-capabilities's state-first authority, demand semantics, typed `Publication`,
 semantic filtering, and catch-up model remain in force.
 
 ### Context
@@ -216,6 +216,6 @@ claiming exactly-once effects across an external sink.
 - Compiled-code caching is an optimization, not an authority transfer. Any AOT
   deserialize path must authenticate exact host-produced bytes and the complete
   engine-compatibility key before crossing Wasmtime's unsafe boundary.
-- Decision 0014's host-process topology and newline-delimited JSON mechanism
+- Decision 0014-resource-profiles-are-state-first-read-and-observe-capabilities's host-process topology and newline-delimited JSON mechanism
   are superseded. Its publication, demand, delivery, and state-first semantics
   apply to direct component invocations.

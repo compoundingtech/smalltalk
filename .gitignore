@@ -3,6 +3,9 @@
 # Nix build symlink.
 /result
 
+# Agent work state and temporary artifacts.
+/tmp/
+
 # Per-agent runtime overlay (materialized per clone; machine-specific, never product).
 .st2/
 .claude/

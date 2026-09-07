@@ -10,7 +10,7 @@
 //! Unlike pi, the wrapper hard-gates the provider version (OMP-R05): the delivery-critical
 //! surface — event names, the sampled idle edge, the approval events — is versioned behavior, not
 //! an API contract, so an unverified MINOR stays refused until the admission checks are repeated.
-//! Patches inside an admitted minor launch without new evidence (decision 0007).
+//! Patches inside an admitted minor launch without new evidence (decision 0007-omp-is-a-fifth-native-driver-with-its-own-channel-and-a-hard-version-gate).
 
 use std::path::Path;
 use std::process::ExitStatus;
@@ -49,7 +49,7 @@ const OFFLINE_DEFAULTS: [(&str, &str); 2] = [("PI_OFFLINE", "1"), ("PI_SKIP_VERS
 /// 18.0 was measured twice: at 18.0.3 on 2026-08-25 and again at 18.0.9 on 2026-08-28.
 /// 18.1 was measured at 18.1.2 on 2026-09-02.
 ///
-/// Admission is per minor, per decision 0007 ("hard version gate on the minor, 18.x initially")
+/// Admission is per minor, per decision 0007-omp-is-a-fifth-native-driver-with-its-own-channel-and-a-hard-version-gate ("hard version gate on the minor, 18.x initially")
 /// and OMP-R05 ("a later minor stays rejected"). Any patch inside an admitted minor launches
 /// without new evidence: omp releases near-daily, so gating patches blocked the fleet on changes
 /// the capture already covered — 18.0.10 shipped within hours of 18.0.9 being admitted. A new
@@ -78,7 +78,7 @@ pub fn run(
     omp_argv: Vec<String>,
 ) -> Result<()> {
     let agent_dir =
-        message::resolve_agent_dir(catalog_root, &identity, &crate::run::detect_host())?
+        message::resolve_declared_dir(catalog_root, &identity, &crate::run::detect_host())?
             .with_context(|| format!("omp driver agent '{identity}' is not declared"))?;
     anyhow::ensure!(
         !omp_argv.is_empty(),
@@ -422,7 +422,7 @@ mod tests {
     }
 
     /// THE assertion this lane exists for: a patch inside an already-admitted minor must launch
-    /// without a new capture (decision 0007 gates on the minor). Fails against the exact-version
+    /// without a new capture (decision 0007-omp-is-a-fifth-native-driver-with-its-own-channel-and-a-hard-version-gate gates on the minor). Fails against the exact-version
     /// allowlist; passes once the gate keys on MAJOR.MINOR.
     #[test]
     fn a_patch_inside_an_admitted_minor_is_accepted_without_new_evidence() {

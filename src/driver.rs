@@ -367,6 +367,8 @@ mod tests {
 
     fn spec(driver: Driver) -> AgentSpec {
         AgentSpec {
+            id: None,
+            address: None,
             identity: "worker".into(),
             name: None,
             description: None,

@@ -71,9 +71,11 @@ fn agent_node_to_raw(node: &DeclaredNode) -> anyhow::Result<RawSpec> {
 
     for child in &node.children {
         match child.name.as_str() {
+            "id" => parse_single_string_field(child, "id", &mut raw.id)?,
+            "address" => parse_single_string_field(child, "address", &mut raw.address)?,
             "identity" => raw.identity = arg_string(child).or(raw.identity),
-            "name" => parse_presentation(child, "name", &mut raw.name)?,
-            "description" => parse_presentation(child, "description", &mut raw.description)?,
+            "name" => parse_single_string_field(child, "name", &mut raw.name)?,
+            "description" => parse_single_string_field(child, "description", &mut raw.description)?,
             "host" => raw.host = arg_string(child),
             "role" => raw.role = arg_string(child),
             "type" => raw.job_type = arg_string(child),
@@ -406,7 +408,11 @@ fn opencode_driver_node_to_raw(node: &DeclaredNode) -> anyhow::Result<OpenCodeDr
     })
 }
 
-fn parse_presentation(
+/// Parse one direct child declaring exactly one positional string, at most once.
+///
+/// Shared by the presentation fields (`name`, `description`) and the routing fields (`id`,
+/// `address`), which have the same source shape and the same once-only rule.
+fn parse_single_string_field(
     node: &DeclaredNode,
     field: &str,
     destination: &mut Option<String>,

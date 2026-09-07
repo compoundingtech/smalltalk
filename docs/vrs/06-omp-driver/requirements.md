@@ -54,6 +54,17 @@ pi's env fallbacks. Measured integration evidence:
   (initially omp 18.x) using the codex/opencode admission convention: a later minor stays
   rejected until the delivery-critical checks (event names, idle-edge behavior, approval
   events) are repeated against it.
+- **OMP-R06 Provider credential rejection is classified, not guessed.** A turn that ended on a
+  provider error carries omp's own `errorId` classification bitfield to st2 unchanged; st2, not
+  the asset, decides whether it names a rejected credential, and publishes the shared
+  `providerAuth`/`providerAuthRejected` boundary (OHS-R16) when it does. The verdict is
+  `AuthFailed` set with `UsageLimit`, `AccountPolicy`, and `Transient` clear, on a value whose
+  `Class` bit proves it is a classification and not a bare HTTP status: omp sets `AuthFailed`
+  from prose containing `401`, `403`, or `forbidden` as readily as from a status, so that flag
+  alone would report an exhausted allowance as a refused credential. A turn omp will retry
+  (`willContinue`) claims neither edge, and only a turn that reached its ordinary end clears a
+  standing rejection. st2 holds no credential knowledge and no remedy beyond the shared generic
+  repair text.
 
 ## Acceptable Tradeoffs
 

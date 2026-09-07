@@ -122,13 +122,6 @@ fn lock_now(context_dir: &Path) -> anyhow::Result<fs::File> {
         .context("acquire now.md writer lock")
 }
 
-/// Append one decision to the log. `decision` and `why` must be single non-empty lines (the log is a
-/// scannable list; multi-line reasoning belongs in a doc). Renders `- <ISO> <decision>. why: <why>.`
-/// into a fresh `decisions/<unix-ms>-<rand6>.md`. Returns the entry's filename.
-pub fn append_decision(context_dir: &Path, decision: &str, why: &str) -> anyhow::Result<String> {
-    append_decision_to_dir(&decisions_dir(context_dir), decision, why)
-}
-
 pub fn append_decision_to_dir(dir: &Path, decision: &str, why: &str) -> anyhow::Result<String> {
     let decision = decision.trim();
     let why = why.trim();
@@ -285,14 +278,14 @@ mod tests {
     fn append_decisions_are_ordered_bullets() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = context_dir(tmp.path());
-        append_decision(
-            &dir,
+        append_decision_to_dir(
+            &decisions_dir(&dir),
             "use hook-enforced perms",
             "never prompts an autonomous pty",
         )
         .unwrap();
         std::thread::sleep(std::time::Duration::from_millis(2));
-        append_decision(&dir, "defer shims", "scope enforcement is follow-on").unwrap();
+        append_decision_to_dir(&decisions_dir(&dir), "defer shims", "scope enforcement is follow-on").unwrap();
 
         let dec = read(&dir, View::Decisions);
         let lines: Vec<&str> = dec.lines().collect();
@@ -315,8 +308,8 @@ mod tests {
     fn append_rejects_empty_or_multiline() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = context_dir(tmp.path());
-        assert!(append_decision(&dir, "", "why").is_err());
-        assert!(append_decision(&dir, "d", "").is_err());
-        assert!(append_decision(&dir, "line1\nline2", "why").is_err());
+        assert!(append_decision_to_dir(&decisions_dir(&dir), "", "why").is_err());
+        assert!(append_decision_to_dir(&decisions_dir(&dir), "d", "").is_err());
+        assert!(append_decision_to_dir(&decisions_dir(&dir), "line1\nline2", "why").is_err());
     }
 }

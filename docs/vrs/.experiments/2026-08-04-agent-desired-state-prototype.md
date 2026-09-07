@@ -55,7 +55,7 @@ and runtime observation.
 
 ## VRS Impact
 
-The result adds root R27 and R28, Agent Spec field rule F18, Doctor R07, the
+The result adds root R41 and R28, Agent Spec field rule F18, Doctor R07, the
 agent desired state/suspension/retirement/rationale ontology, and corresponding
 wire and acceptance text. It does not change the vision.
 

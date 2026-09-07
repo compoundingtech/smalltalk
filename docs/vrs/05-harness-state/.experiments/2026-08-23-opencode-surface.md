@@ -1,11 +1,13 @@
 # OpenCode's server surface, measured for the driver
 
+## Question
+
 2026-08-23, OpenCode 1.18.19 (`/home/schickling/.nix-profile/bin/opencode`), Linux, isolated
 `XDG_DATA_HOME`/`XDG_CONFIG_HOME`, headless `opencode serve --port 43123 --print-logs`. The free
 anonymous model (`opencode/big-pickle`) answered prompts with no credentials, so every claim below
 is reproducible without an API key.
 
-## What was established
+## Result
 
 **The TUI is a server.** `opencode` (TUI, the default command) starts a server on `--port` /
 `--hostname` exactly like `opencode serve`; `opencode attach <url>` exists for the reverse
@@ -48,7 +50,7 @@ Because the server serves its own OpenAPI document, a live `/doc` subset check a
 covers the shape while a version list covers the semantics — the hybrid of the Codex
 `SUPPORTED_CODEX_CLI_VERSIONS` pattern and the pi type-check pattern.
 
-## Reproduction
+## Method
 
 ```
 XDG_DATA_HOME=$S/data XDG_CONFIG_HOME=$S/config opencode serve --port 43123 --print-logs
@@ -112,7 +114,12 @@ its `parts` again into that message — a resend after a *transiently failed* re
 text inside the message, not the message. The pump's read-back-before-resend rule is therefore
 load-bearing, not just polite.
 
-## Limits
+## Conclusion
+
+The measured server, SSE, receipt, and version-gate surfaces support an
+evented OpenCode driver; the remaining constraints are:
+
+### Limits
 
 - A v2 surface (`/api/event`, `/api/session/{id}/wait`, `permission.v2.*`) coexists with the
   legacy one probed here; the driver pins the legacy arms via the `/doc` check.

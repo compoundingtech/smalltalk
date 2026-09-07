@@ -141,6 +141,17 @@ enum Mode {
     Exclusive,
 }
 
+/// Whether an acquisition may queue behind the current holder.
+#[derive(Debug, Clone, Copy)]
+enum Wait {
+    /// Block until the holder releases. Every authoring verb the operator invokes.
+    Block,
+    /// Report contention instead of queueing. The supervisor's maintenance work uses this: a
+    /// reconcile pass that blocked on `st2 catalog apply` would stall every live agent's
+    /// reconciliation for the length of the apply.
+    Now,
+}
+
 /// An advisory catalog-authoring lock. Dropping the guard releases the kernel lock.
 #[derive(Debug)]
 pub struct CatalogLock {
@@ -151,23 +162,47 @@ pub struct CatalogLock {
 
 impl CatalogLock {
     pub fn shared(catalog: &Path) -> Result<Self> {
-        Self::acquire(catalog, Mode::Shared, false, true)
+        Self::blocking(catalog, Mode::Shared, false, true)
     }
 
     /// Acquire the existing catalog lock without initializing missing control state.
     pub(crate) fn shared_existing(catalog: &Path) -> Result<Self> {
-        Self::acquire(catalog, Mode::Shared, false, false)
+        Self::blocking(catalog, Mode::Shared, false, false)
     }
 
     pub fn exclusive(catalog: &Path) -> Result<Self> {
-        Self::acquire(catalog, Mode::Exclusive, false, true)
+        Self::blocking(catalog, Mode::Exclusive, false, true)
+    }
+
+    /// Acquire the exclusive lock only if it is free right now.
+    ///
+    /// `Ok(None)` means another holder has it, and the caller must skip its work rather than queue.
+    pub fn try_exclusive(catalog: &Path) -> Result<Option<Self>> {
+        Self::acquire(catalog, Mode::Exclusive, false, true, Wait::Now)
     }
 
     /// The whole-catalog transaction is the only operation allowed to inspect and recover an
     /// incomplete apply. Every other declaration reader/writer must keep using `shared` or
     /// `exclusive`, which fail closed while the marker exists.
     pub(crate) fn exclusive_for_catalog_apply(catalog: &Path) -> Result<Self> {
-        Self::acquire(catalog, Mode::Exclusive, true, true)
+        Self::blocking(catalog, Mode::Exclusive, true, true)
+    }
+
+    /// A blocking acquisition returns the guard or an error — never contention.
+    fn blocking(
+        catalog: &Path,
+        mode: Mode,
+        allow_incomplete_apply: bool,
+        initialize: bool,
+    ) -> Result<Self> {
+        Self::acquire(
+            catalog,
+            mode,
+            allow_incomplete_apply,
+            initialize,
+            Wait::Block,
+        )?
+        .context("blocking catalog-authoring acquisition reported contention")
     }
 
     fn acquire(
@@ -175,7 +210,8 @@ impl CatalogLock {
         mode: Mode,
         allow_incomplete_apply: bool,
         initialize: bool,
-    ) -> Result<Self> {
+        wait: Wait,
+    ) -> Result<Option<Self>> {
         let catalog = catalog
             .canonicalize()
             .with_context(|| format!("canonicalize catalog root {}", catalog.display()))?;
@@ -268,6 +304,9 @@ impl CatalogLock {
         let operation = match mode {
             Mode::Shared => libc::LOCK_SH,
             Mode::Exclusive => libc::LOCK_EX,
+        } | match wait {
+            Wait::Block => 0,
+            Wait::Now => libc::LOCK_NB,
         };
         #[cfg(debug_assertions)]
         if let Ok(path) = std::env::var("ST2_TEST_CATALOG_LOCK_ANY_ATTEMPT") {
@@ -287,7 +326,13 @@ impl CatalogLock {
         // guard. flock does not access Rust memory.
         let result = unsafe { libc::flock(file.as_raw_fd(), operation) };
         if result != 0 {
-            return Err(std::io::Error::last_os_error())
+            let error = std::io::Error::last_os_error();
+            // `LOCK_NB` reports a live holder as `EWOULDBLOCK`. That is not a fault: the caller
+            // asked to be told instead of queueing.
+            if matches!(wait, Wait::Now) && error.kind() == std::io::ErrorKind::WouldBlock {
+                return Ok(None);
+            }
+            return Err(error)
                 .with_context(|| format!("lock catalog authoring lock {}", path.display()));
         }
         if !allow_incomplete_apply {
@@ -321,7 +366,7 @@ impl CatalogLock {
             lock.recover_generation_intent()?;
             test_lock_held_checkpoint();
         }
-        Ok(lock)
+        Ok(Some(lock))
     }
 
     pub(crate) fn advance_generation(&self) -> Result<()> {

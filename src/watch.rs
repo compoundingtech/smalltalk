@@ -124,14 +124,19 @@ impl CatalogDeclarationWatcher {
         let callback_root = root.to_path_buf();
         let watched = Arc::new(Mutex::new(BTreeMap::new()));
         let invalidator = Arc::clone(&watched);
-        let watcher = notify::recommended_watcher(move |result: notify::Result<Event>| {
-            if let Ok(event) = result {
-                invalidate_removed_dirs(&invalidator, &event);
-                if should_wake_catalog(&callback_root, &event) {
+        let watcher =
+            notify::recommended_watcher(move |result: notify::Result<Event>| match result {
+                Ok(event) => {
+                    invalidate_removed_dirs(&invalidator, &event);
+                    if should_wake_catalog(&callback_root, &event) {
+                        let _ = tx.send(());
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!("st2: catalog-declaration watcher error: {error}");
                     let _ = tx.send(());
                 }
-            }
-        })?;
+            })?;
         let mut this = Self {
             root: root.to_path_buf(),
             watcher,
@@ -242,6 +247,125 @@ impl CatalogDeclarationWatcher {
     }
 }
 
+/// Independent wake channels for cooperative catalog commits and direct declaration edits.
+///
+/// The generation channel uses its own backend instance and one shallow control-plane watch. A
+/// declaration watcher with many subscriptions can therefore degrade without delaying a completed
+/// st2 publication until the timer fallback.
+pub(crate) struct CatalogReconcileWatcher {
+    root: PathBuf,
+    tx: Sender<()>,
+    generation: Option<RecommendedWatcher>,
+    generation_identity: Option<DirIdentity>,
+    declarations: Option<CatalogDeclarationWatcher>,
+    generation_install_failed: bool,
+    declaration_install_failed: bool,
+}
+
+impl CatalogReconcileWatcher {
+    fn new(root: &Path, tx: Sender<()>) -> Self {
+        let mut this = Self {
+            root: root.to_path_buf(),
+            tx,
+            generation: None,
+            generation_identity: None,
+            declarations: None,
+            generation_install_failed: false,
+            declaration_install_failed: false,
+        };
+        this.refresh();
+        this
+    }
+
+    pub(crate) fn refresh(&mut self) {
+        let control = self.root.join(crate::catalog_lock::CONTROL_DIR);
+        if self.generation.is_some() && dir_identity(&control) != self.generation_identity {
+            self.generation = None;
+            self.generation_identity = None;
+            if !self.generation_install_failed {
+                tracing::warn!(
+                    "st2: catalog control directory was replaced; reinstalling the catalog-generation watcher."
+                );
+            }
+            self.generation_install_failed = true;
+        }
+
+        if self.generation.is_none() {
+            match watch_catalog_generation(&self.root, self.tx.clone()) {
+                Ok(Some((watcher, identity))) => {
+                    self.generation = Some(watcher);
+                    self.generation_identity = Some(identity);
+                    self.generation_install_failed = false;
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    if !self.generation_install_failed {
+                        tracing::warn!(
+                            "st2: cannot watch the catalog generation: {error}; completed catalog transactions depend on declaration watches or timer polling."
+                        );
+                    }
+                    self.generation_install_failed = true;
+                }
+            }
+        }
+
+        match &mut self.declarations {
+            Some(watcher) => watcher.refresh(),
+            None => match watch_catalog_declarations(&self.root, self.tx.clone()) {
+                Ok(watcher) => {
+                    self.declarations = Some(watcher);
+                    self.declaration_install_failed = false;
+                }
+                Err(error) => {
+                    if !self.declaration_install_failed {
+                        tracing::warn!(
+                            "st2: cannot watch catalog declarations: {error}; direct declaration changes depend on catalog-generation wakeups or timer polling."
+                        );
+                    }
+                    self.declaration_install_failed = true;
+                }
+            },
+        }
+    }
+}
+
+fn watch_catalog_generation(
+    root: &Path,
+    tx: Sender<()>,
+) -> notify::Result<Option<(RecommendedWatcher, DirIdentity)>> {
+    let control = root.join(crate::catalog_lock::CONTROL_DIR);
+    if !control.is_dir() {
+        return Ok(None);
+    }
+    let Some(identity) = dir_identity(&control) else {
+        return Ok(None);
+    };
+    let generation = control.join(crate::catalog_lock::GENERATION_FILE);
+    let mut watcher = recommended_watcher(move |result: notify::Result<Event>| match result {
+        Ok(event) if is_mutation(&event) && event.paths.iter().any(|path| *path == generation) => {
+            let _ = tx.send(());
+        }
+        Ok(_) => {}
+        Err(error) => {
+            tracing::warn!("st2: catalog-generation watcher error: {error}");
+            let _ = tx.send(());
+        }
+    })?;
+    watcher.watch(&control, RecursiveMode::NonRecursive)?;
+    if dir_identity(&control) != Some(identity) {
+        let _ = watcher.unwatch(&control);
+        return Ok(None);
+    }
+    Ok(Some((watcher, identity)))
+}
+
+pub(crate) fn watch_catalog_reconcile_inputs(
+    root: &Path,
+    tx: Sender<()>,
+) -> CatalogReconcileWatcher {
+    CatalogReconcileWatcher::new(root, tx)
+}
+
 /// Invalidate a removed subscription without letting its delayed callback erase a replacement
 /// already registered at the same pathname. A live identity equal to the recorded identity proves
 /// the event belongs to an older registration; a `None` value is refresh's in-flight reservation,
@@ -338,6 +462,9 @@ fn is_declaration_path(root: &Path, path: &Path) -> bool {
         return false;
     }
     let rel = path.strip_prefix(root).unwrap_or(path);
+    if rel == Path::new("catalog.kdl") {
+        return true;
+    }
     let mut components = rel.components();
     if matches!(
         components.next().and_then(|c| c.as_os_str().to_str()),
@@ -410,6 +537,7 @@ mod tests {
             root,
             &root.join("agents/resources/project/agent.kdl")
         ));
+        assert!(is_declaration_path(root, &root.join("catalog.kdl")));
         assert!(is_declaration_path(root, &root.join("_templates/base.kdl")));
         assert!(!is_declaration_path(
             root,
@@ -709,6 +837,11 @@ mod tests {
             .expect("declaration update must wake");
         while rx.try_recv().is_ok() {}
 
+        std::fs::write(root.join("catalog.kdl"), "catalog {}\n").unwrap();
+        rx.recv_timeout(Duration::from_secs(1))
+            .expect("root catalog configuration must wake");
+        while rx.try_recv().is_ok() {}
+
         let nested = root.join("teams/new/live");
         std::fs::create_dir_all(&nested).unwrap();
         std::fs::write(
@@ -734,6 +867,85 @@ mod tests {
         std::fs::remove_file(nested.join("agent.kdl")).unwrap();
         rx.recv_timeout(Duration::from_secs(1))
             .expect("declaration removal must wake");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn atomic_agent_bundle_publication_wakes_production_shaped_catalog() {
+        use std::sync::mpsc::channel;
+        use std::time::Duration;
+
+        let catalog = tempfile::tempdir().unwrap();
+        let root = catalog.path();
+        let host = root.join("agents/h");
+        let staged = root.join(".st2/staged");
+        for index in 0..750 {
+            let agent = host.join(format!("existing-{index}"));
+            std::fs::create_dir_all(&agent).unwrap();
+            std::fs::write(
+                agent.join("agent.kdl"),
+                format!(r#"agent "existing-{index}" {{ host "h"; command "x" }}"#),
+            )
+            .unwrap();
+        }
+        std::fs::create_dir_all(&staged).unwrap();
+        std::fs::write(
+            staged.join("agent.kdl"),
+            r#"agent "new" { host "h"; command "x" }"#,
+        )
+        .unwrap();
+
+        let (tx, rx) = channel();
+        let _watcher = watch_catalog_reconcile_inputs(root, tx);
+
+        std::fs::rename(&staged, host.join("new")).unwrap();
+        rx.recv_timeout(Duration::from_secs(1))
+            .expect("atomic bundle publication must wake");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn catalog_generation_commit_wakes_catalog_watch() {
+        use std::sync::mpsc::channel;
+        use std::time::Duration;
+
+        let catalog = tempfile::tempdir().unwrap();
+        let control = catalog.path().join(crate::catalog_lock::CONTROL_DIR);
+        std::fs::create_dir(&control).unwrap();
+        std::fs::write(control.join(crate::catalog_lock::GENERATION_FILE), "1\n").unwrap();
+        let (tx, rx) = channel();
+        let _watcher = watch_catalog_reconcile_inputs(catalog.path(), tx);
+
+        std::fs::write(control.join("next-generation"), "2\n").unwrap();
+        std::fs::rename(
+            control.join("next-generation"),
+            control.join(crate::catalog_lock::GENERATION_FILE),
+        )
+        .unwrap();
+        rx.recv_timeout(Duration::from_secs(1))
+            .expect("catalog generation commit must wake");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn catalog_generation_watch_reinstalls_after_control_directory_replacement() {
+        use std::sync::mpsc::channel;
+
+        let catalog = tempfile::tempdir().unwrap();
+        let control = catalog.path().join(crate::catalog_lock::CONTROL_DIR);
+        std::fs::create_dir(&control).unwrap();
+        std::fs::write(control.join(crate::catalog_lock::GENERATION_FILE), "1\n").unwrap();
+        let (tx, _rx) = channel();
+        let mut watcher = watch_catalog_reconcile_inputs(catalog.path(), tx);
+        let original = watcher.generation_identity.unwrap();
+
+        std::fs::remove_dir_all(&control).unwrap();
+        std::fs::create_dir(&control).unwrap();
+        std::fs::write(control.join(crate::catalog_lock::GENERATION_FILE), "2\n").unwrap();
+        watcher.refresh();
+
+        assert!(watcher.generation.is_some());
+        assert_ne!(watcher.generation_identity, Some(original));
     }
 
     #[cfg(target_os = "linux")]

@@ -26,7 +26,7 @@ fn channel_content(subject: Option<&str>, body: &str) -> String {
 }
 
 pub fn run(catalog_root: &Path, identity: &str) -> Result<()> {
-    let agent_dir = message::resolve_agent_dir(catalog_root, identity, &crate::run::detect_host())?
+    let agent_dir = message::resolve_declared_dir(catalog_root, identity, &crate::run::detect_host())?
         .with_context(|| format!("Claude MCP agent '{identity}' is not declared"))?;
     let inbox = message::inbox_dir(&agent_dir);
     let (input_tx, input_rx) = mpsc::channel();

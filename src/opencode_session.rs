@@ -6,10 +6,13 @@
 //! stream and projects session status, permission asks, and questions into the generic
 //! `harness-state` record — evidence-gated, so a dropped stream stops the heartbeat and the record
 //! ages out rather than restating a state nobody is watching. The delivery pump mirrors the Codex
-//! FIFO discipline: an `Attempted` receipt is persisted before transport, the transport is
-//! `POST /session/<id>/prompt_async` with a caller-derived stable `messageID`, and the only
-//! accepted receipt is the message read back from the server — never the `/tui/*` endpoints, which
-//! acknowledge input even when no TUI is attached.
+//! FIFO discipline through the shared [`crate::delivery_ledger`]: an `attempted` entry is durable
+//! before transport, the transport is `POST /session/<id>/prompt_async` with a caller-derived
+//! stable `messageID`, and the only receipt this transport can produce is the message read back
+//! from the server — never the `/tui/*` endpoints, which acknowledge input even when no TUI is
+//! attached. That read-back is graded as `persisted`, because it proves the server STORED the
+//! message and says nothing about the session scheduler admitting it; persistence therefore holds
+//! the inbox entry rather than releasing it, and is never mistaken for consumption.
 //!
 //! Fail-closed gate: delivery requires both a supported `opencode --version` and a live `/doc`
 //! subset check proving the exact API arms st2 depends on. Observation requires only the `/doc`
@@ -27,7 +30,6 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result};
-use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 
@@ -37,7 +39,7 @@ use crate::driver_diagnostic::{
 };
 use crate::harness_state::{self, Activity, Ask, BlockedOn, InputBuffer, Observation, Writer};
 use crate::provider_session::{PROVIDER_POLL, STOP, install_signal_handler};
-use crate::{ding, harness_context, harness_version, message, status};
+use crate::{delivery_ledger, ding, harness_context, harness_version, message, status};
 
 /// OpenCode MINORS whose `/event`, `/session`, and `prompt_async` surfaces were verified
 /// (1.18, measured at 1.18.19). The live `/doc` check below guards the shape; this list guards
@@ -50,7 +52,6 @@ use crate::{ding, harness_context, harness_version, message, status};
 /// risk this widening accepts. A new MINOR still needs the surfaces re-verified.
 const SUPPORTED_OPENCODE_MINORS: [(u32, u32); 1] = [(1, 18)];
 
-const DELIVERY_STATE_SCHEMA: &str = "st2.opencode-delivery-state.v1";
 const STOP_GRACE: Duration = Duration::from_secs(5);
 const INBOX_REFRESH_FALLBACK: Duration = Duration::from_secs(2);
 const DELIVERY_RETRY: Duration = Duration::from_secs(2);
@@ -85,7 +86,7 @@ pub fn run(
     opencode_argv: Vec<String>,
 ) -> Result<()> {
     let this_host = crate::run::detect_host();
-    let agent_dir = message::resolve_agent_dir(catalog_root, &identity, &this_host)?
+    let agent_dir = message::resolve_declared_dir(catalog_root, &identity, &this_host)?
         .with_context(|| format!("opencode driver agent '{identity}' is not declared"))?;
     anyhow::ensure!(
         !opencode_argv.is_empty(),
@@ -1304,33 +1305,14 @@ fn cumulative_tokens(tokens: &Value) -> Option<u64> {
 
 // ---- native delivery -------------------------------------------------------------------------
 
+/// What `GET /session/{session}/message/{message}` proved. A storage receipt, graded to
+/// [`delivery_ledger::Phase::Persisted`]: it says the server holds the exact client message, never
+/// that anything read it.
 #[derive(Clone, Copy)]
 enum ReadBack {
     Durable,
     Absent,
     Indeterminate,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-enum DeliveryPhase {
-    Attempted,
-    Accepted,
-}
-
-/// One durable FIFO delivery attempt, written before transport (the Codex discipline). The stable
-/// `messageID` makes a replayed attempt reconcilable: the server either shows the message durably
-/// (accepted) or does not (retry the same identity, never a second one).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct DeliveryState {
-    schema: String,
-    agent: String,
-    runtime_id: String,
-    session_id: String,
-    filename: String,
-    message_id: String,
-    phase: DeliveryPhase,
 }
 
 struct Delivery {
@@ -1339,9 +1321,7 @@ struct Delivery {
     status_path: PathBuf,
     this_host: String,
     identity: String,
-    runtime_id: String,
-    state_path: PathBuf,
-    state: Option<DeliveryState>,
+    ledger: delivery_ledger::Ledger,
     /// The session a new delivery binds to: the most recently observed one.
     target_session: Option<String>,
     next_attempt: Instant,
@@ -1355,14 +1335,14 @@ impl Delivery {
         identity: &str,
         runtime_id: &str,
     ) -> Self {
-        let state_path = state_dir(catalog_root, identity).join("delivery-state.json");
+        let ledger_path = state_dir(catalog_root, identity).join(delivery_ledger::LEDGER_FILE);
         Self::with_state_path(
             catalog_root,
             agent_dir,
             this_host,
             identity,
             runtime_id,
-            state_path,
+            ledger_path,
         )
     }
 
@@ -1372,27 +1352,25 @@ impl Delivery {
         this_host: &str,
         identity: &str,
         runtime_id: &str,
-        state_path: PathBuf,
+        ledger_path: PathBuf,
     ) -> Self {
-        let state = std::fs::read(&state_path)
-            .ok()
-            .and_then(|bytes| serde_json::from_slice::<DeliveryState>(&bytes).ok())
-            .filter(|state| {
-                state.schema == DELIVERY_STATE_SCHEMA
-                    && state.agent == identity
-                    && message::is_message_filename(&state.filename)
-                    && state.message_id
-                        == stable_message_id(identity, &state.session_id, &state.filename)
-            });
+        let owner = identity.to_string();
+        // The same derivation the transport uses, so a record whose messageID does not match its
+        // own session and filename is provably not this agent's and fails closed.
+        let ledger = delivery_ledger::Ledger::open(
+            &ledger_path,
+            delivery_ledger::Harness::OpenCode.profile(),
+            identity,
+            runtime_id,
+            |session, filename| stable_message_id(&owner, session, filename),
+        );
         Self {
             catalog_root: catalog_root.to_path_buf(),
             inbox: message::inbox_dir(agent_dir),
             status_path: status::status_path(agent_dir),
             this_host: this_host.to_string(),
             identity: identity.to_string(),
-            runtime_id: runtime_id.to_string(),
-            state_path,
-            state,
+            ledger,
             target_session: None,
             next_attempt: Instant::now(),
         }
@@ -1427,13 +1405,10 @@ impl Delivery {
         mut diagnostics: Option<&mut DiagnosticPublisher>,
     ) -> Result<()> {
         let unread = message::list_inbox(&self.inbox)?;
-        if let Some(state) = self.state.as_ref()
-            && unread
-                .iter()
-                .all(|message| message.filename != state.filename)
-        {
-            self.clear_state()?;
-        }
+        // Archive is the recipient agent's act and the only settlement authority. An entry whose
+        // file left the inbox releases ownership here; this pump never moves a file itself.
+        self.ledger
+            .prune(|filename| unread.iter().any(|entry| entry.filename == filename))?;
         if status::read_state(&self.status_path) == status::State::Dnd {
             return Ok(());
         }
@@ -1458,65 +1433,82 @@ impl Delivery {
                 recovered
             }
         };
-        if let Some(state) = self.state.as_ref()
-            && state.session_id != target
-        {
-            // A newly selected session is a different delivery binding (the Codex thread rule).
-            self.clear_state()?;
+        // A newly selected session is a different delivery binding (the Codex thread rule): the
+        // old binding's receipt may neither suppress nor acknowledge delivery to this one.
+        if self.ledger.binding().is_some_and(|binding| binding != target) {
+            self.ledger.rebind(&target)?;
         }
-
-        if let Some(state) = self.state.clone() {
-            if state.filename != head.filename {
-                return Ok(()); // The bound message is behind the head; archive precedence resolves it.
+        // Fail closed. An unreadable ledger holds and surfaces instead of guessing, and it never
+        // refused to start: a driver that will not start delivers nothing at all. The
+        // operator-visible surface is the existing typed boundary — the transport is unavailable —
+        // and the raw reason stays in tracing, so no unbounded prose reaches the record.
+        if let Some(reason) = self.ledger.quarantined() {
+            tracing::warn!("st2 opencode-session: delivery ledger is quarantined: {reason}");
+            if let Some(diagnostics) = diagnostics.as_deref_mut() {
+                diagnostics.publish(
+                    DiagnosticStage::Delivery,
+                    DiagnosticReason::DeliveryUnavailable,
+                    DiagnosticSource::PromptTransport,
+                );
             }
-            match state.phase {
-                DeliveryPhase::Accepted => {
-                    if let Some(diagnostics) = diagnostics.as_deref_mut() {
-                        diagnostics.clear(DiagnosticStage::Delivery);
-                        diagnostics.clear(DiagnosticStage::ReadBack);
-                    }
-                    return Ok(());
+            return Ok(());
+        }
+        if let Some(entry) = self.ledger.entry(&head.filename).cloned() {
+            // Storage is a receipt, not consumption: it stops the POST loop and holds the inbox
+            // entry, and only prompt admission would release ownership.
+            if entry.phase >= delivery_ledger::Phase::Persisted {
+                if let Some(diagnostics) = diagnostics.as_deref_mut() {
+                    diagnostics.clear(DiagnosticStage::Delivery);
+                    diagnostics.clear(DiagnosticStage::ReadBack);
                 }
-                DeliveryPhase::Attempted => {
-                    return self.reconcile_or_retry(client, state, diagnostics);
-                }
+                return Ok(());
             }
+            return self.reconcile_or_retry(client, entry, diagnostics);
+        }
+        if !self.ledger.entries().is_empty() {
+            return Ok(()); // The bound message is behind the head; archive precedence resolves it.
         }
 
         let message_id = stable_message_id(&self.identity, &target, &head.filename);
-        let state = DeliveryState {
-            schema: DELIVERY_STATE_SCHEMA.to_string(),
-            agent: self.identity.clone(),
-            runtime_id: self.runtime_id.clone(),
-            session_id: target,
+        let entry = self.ledger.begin(delivery_ledger::Begin {
             filename: head.filename.clone(),
-            message_id,
-            phase: DeliveryPhase::Attempted,
-        };
-        self.write_state(state.clone())?;
+            binding: target.clone(),
+            correlation: delivery_ledger::Correlation::native(message_id.clone()),
+            // Read-back is a durable query, not a live frame, so a pre-crash attempt is
+            // reconcilable without an incarnation token.
+            incarnation: None,
+        })?;
         let text = ding::poke_text(&self.catalog_root, &self.this_host, &self.identity, &head);
-        self.send(client, &state, &text, diagnostics)
+        self.send(client, &entry, &text, diagnostics)
     }
 
     fn reconcile_or_retry(
         &mut self,
         client: &Client,
-        state: DeliveryState,
+        entry: delivery_ledger::Entry,
         mut diagnostics: Option<&mut DiagnosticPublisher>,
     ) -> Result<()> {
-        let read_back = self.read_back(client, &state);
+        let read_back = self.read_back(client, &entry);
         report_read_back(read_back, &mut diagnostics);
         match read_back {
             ReadBack::Durable => {
-                let mut accepted = state;
-                accepted.phase = DeliveryPhase::Accepted;
-                return self.write_state(accepted);
+                self.ledger
+                    .record(&entry.filename, delivery_ledger::Evidence::Persisted)?;
+                return Ok(());
             }
             // Measured on 1.18.19: a second POST with the same messageID appends its parts again
             // into the same message, so an indeterminate read-back must never trigger a resend —
             // the read-back itself is retried on a later pass.
             ReadBack::Indeterminate => return Ok(()),
-            ReadBack::Absent => {}
+            // A 404 for the exact client message is an authoritative absence: the only receipt
+            // that may authorize another POST of the same identity.
+            ReadBack::Absent => {
+                self.ledger
+                    .negative(&entry.filename, delivery_ledger::NegativeReceipt::Absent)?;
+            }
+        }
+        if self.ledger.retry(&entry.filename) != delivery_ledger::RetryDecision::Retry {
+            return Ok(());
         }
         if Instant::now() < self.next_attempt {
             return Ok(());
@@ -1524,27 +1516,27 @@ impl Delivery {
         let unread = message::list_inbox(&self.inbox)?;
         let Some(head) = unread
             .into_iter()
-            .find(|message| message.filename == state.filename)
+            .find(|message| message.filename == entry.filename)
         else {
             return Ok(());
         };
         let text = ding::poke_text(&self.catalog_root, &self.this_host, &self.identity, &head);
-        self.send(client, &state, &text, diagnostics)
+        self.send(client, &entry, &text, diagnostics)
     }
 
     fn send(
         &mut self,
         client: &Client,
-        state: &DeliveryState,
+        entry: &delivery_ledger::Entry,
         text: &str,
         mut diagnostics: Option<&mut DiagnosticPublisher>,
     ) -> Result<()> {
         self.next_attempt = Instant::now() + DELIVERY_RETRY;
         let payload = json!({
-            "messageID": state.message_id,
+            "messageID": entry.correlation.value,
             "parts": [{ "type": "text", "text": text }],
         });
-        let path = format!("/session/{}/prompt_async", state.session_id);
+        let path = format!("/session/{}/prompt_async", entry.binding);
         let status = match client.post_json(&path, &payload) {
             Ok(status) => status,
             Err(error) => {
@@ -1568,44 +1560,34 @@ impl Delivery {
             }
             anyhow::bail!("POST {path} returned {status}");
         }
+        // The transport call succeeded. That is a fact about the call, not about the server's
+        // state, so it grades no higher than `transportAccepted`.
+        self.ledger
+            .record(&entry.filename, delivery_ledger::Evidence::TransportAccepted)?;
         if let Some(diagnostics) = diagnostics.as_deref_mut() {
             diagnostics.clear(DiagnosticStage::Delivery);
         }
-        let read_back = self.read_back(client, state);
+        let read_back = self.read_back(client, entry);
         report_read_back(read_back, &mut diagnostics);
         if matches!(read_back, ReadBack::Durable) {
-            let mut accepted = state.clone();
-            accepted.phase = DeliveryPhase::Accepted;
-            self.write_state(accepted)?;
+            self.ledger
+                .record(&entry.filename, delivery_ledger::Evidence::Persisted)?;
         }
         Ok(())
     }
 
     /// The only receipt this transport accepts: the exact client message read back durably.
-    fn read_back(&self, client: &Client, state: &DeliveryState) -> ReadBack {
-        let path = format!("/session/{}/message/{}", state.session_id, state.message_id);
+    fn read_back(&self, client: &Client, entry: &delivery_ledger::Entry) -> ReadBack {
+        let path = format!(
+            "/session/{}/message/{}",
+            entry.binding, entry.correlation.value
+        );
         match client.status_of_get(&path) {
             Ok(200) => ReadBack::Durable,
             Ok(404) => ReadBack::Absent,
             // A 5xx or a transport error proves nothing about the message either way.
             Ok(_) | Err(_) => ReadBack::Indeterminate,
         }
-    }
-
-    fn write_state(&mut self, state: DeliveryState) -> Result<()> {
-        atomic_json(&self.state_path, &state)?;
-        self.state = Some(state);
-        Ok(())
-    }
-
-    fn clear_state(&mut self) -> Result<()> {
-        match std::fs::remove_file(&self.state_path) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
-        }
-        self.state = None;
-        Ok(())
     }
 }
 
@@ -1649,7 +1631,7 @@ fn stable_message_id(recipient: &str, session_id: &str, filename: &str) -> Strin
     format!("msg{:.26}", format!("{:x}", hash.finalize()))
 }
 
-fn state_dir(catalog_root: &Path, identity: &str) -> PathBuf {
+pub fn state_dir(catalog_root: &Path, identity: &str) -> PathBuf {
     let base = std::env::var_os("XDG_STATE_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/state")))
@@ -1664,28 +1646,6 @@ fn state_dir(catalog_root: &Path, identity: &str) -> PathBuf {
     }
     let digest = format!("{:x}", hash.finalize());
     base.join("st2").join("opencode").join(&digest[..24])
-}
-
-fn atomic_json(path: &Path, value: &impl Serialize) -> Result<()> {
-    let parent = path.parent().context("state file has no parent")?;
-    std::fs::create_dir_all(parent)?;
-    let temp = parent.join(format!(".{}.tmp", std::process::id()));
-    // Durability, not just atomicity: a crash between the rename and OpenCode's acceptance of
-    // the prompt_async would lose the Attempted receipt and make the pump re-POST duplicate
-    // parts. The bytes reach disk before the rename and the directory entry afterwards, so
-    // once delivery proceeds the receipt survives.
-    let mut file = std::fs::File::create(&temp)?;
-    file.write_all(&serde_json::to_vec(value)?)?;
-    file.sync_all()?;
-    drop(file);
-    if let Err(error) = std::fs::rename(&temp, path) {
-        let _ = std::fs::remove_file(&temp);
-        return Err(error.into());
-    }
-    if let Ok(dir) = std::fs::File::open(parent) {
-        let _ = dir.sync_all();
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -1945,8 +1905,6 @@ mod tests {
         port: u16,
         /// Every messageID a prompt_async POST carried, accepted or not.
         posts: Arc<Mutex<Vec<String>>>,
-        /// messageIDs the server will report durable.
-        durable: Arc<Mutex<BTreeSet<String>>>,
         accept_posts: Arc<AtomicBool>,
         /// When set, the message read-back answers 500: durable state is unknowable.
         read_back_error: Arc<AtomicBool>,
@@ -2117,7 +2075,6 @@ mod tests {
         FakeServer {
             port,
             posts,
-            durable,
             accept_posts,
             read_back_error,
             status_error,
@@ -2137,15 +2094,17 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let server = spawn_fake_server();
         let client = Client::new(server.port, "pw");
-        let state_path = tmp.path().join("state/delivery-state.json");
-        let (mut delivery, _filename) = delivery_fixture(tmp.path(), state_path.clone());
+        let state_path = tmp.path().join("state/delivery-ledger.json");
+        let (mut delivery, filename) = delivery_fixture(tmp.path(), state_path.clone());
 
         server.read_back_error.store(true, Ordering::SeqCst);
         delivery.pump(&client);
         assert_eq!(server.posts.lock().unwrap().len(), 1, "one POST, attempted");
-        let state: DeliveryState =
-            serde_json::from_slice(&std::fs::read(&state_path).unwrap()).unwrap();
-        assert_eq!(state.phase, DeliveryPhase::Attempted);
+        assert_eq!(
+            ledger_phase(&state_path, &filename),
+            Some(delivery_ledger::Phase::TransportAccepted),
+            "the POST landed; nothing yet proves the server holds it"
+        );
 
         // While the read-back stays indeterminate, no pass may re-POST.
         delivery.pump(&client);
@@ -2155,9 +2114,11 @@ mod tests {
         // The read-back recovering flips the same attempt to Accepted with no second POST.
         server.read_back_error.store(false, Ordering::SeqCst);
         delivery.pump(&client);
-        let state: DeliveryState =
-            serde_json::from_slice(&std::fs::read(&state_path).unwrap()).unwrap();
-        assert_eq!(state.phase, DeliveryPhase::Accepted);
+        assert_eq!(
+            ledger_phase(&state_path, &filename),
+            Some(delivery_ledger::Phase::Persisted),
+            "a recovered read-back proves storage, not consumption"
+        );
         assert_eq!(server.posts.lock().unwrap().len(), 1);
     }
 
@@ -2166,7 +2127,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let server = spawn_fake_server();
         let client = Client::new(server.port, "pw");
-        let state_path = tmp.path().join("state/delivery-state.json");
+        let state_path = tmp.path().join("state/delivery-ledger.json");
         let (mut delivery, _filename) = delivery_fixture(tmp.path(), state_path);
         let agent_dir = tmp.path().join("agents/h/worker");
         let mut diagnostics = DiagnosticPublisher::new(
@@ -2198,7 +2159,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let server = spawn_fake_server();
         let client = Client::new(server.port, "pw");
-        let state_path = tmp.path().join("state/delivery-state.json");
+        let state_path = tmp.path().join("state/delivery-ledger.json");
         let (mut delivery, _filename) = delivery_fixture(tmp.path(), state_path);
         let agent_dir = tmp.path().join("agents/h/worker");
         let mut diagnostics = DiagnosticPublisher::new(
@@ -2299,12 +2260,30 @@ mod tests {
         (delivery, filename)
     }
 
+    /// Read the ledger back through its own loader and the real correlation derivation: a test
+    /// that read the bytes directly would not notice a record the pump itself would refuse.
+    fn reopen_ledger(ledger_path: &Path) -> delivery_ledger::Ledger {
+        delivery_ledger::Ledger::open(
+            ledger_path,
+            delivery_ledger::Harness::OpenCode.profile(),
+            "h.worker",
+            "h.worker",
+            |session, file| stable_message_id("h.worker", session, file),
+        )
+    }
+
+    fn ledger_phase(ledger_path: &Path, filename: &str) -> Option<delivery_ledger::Phase> {
+        reopen_ledger(ledger_path)
+            .entry(filename)
+            .map(|entry| entry.phase)
+    }
+
     #[test]
-    fn delivery_attempts_before_transport_and_accepts_only_the_read_back_receipt() {
+    fn a_durable_read_back_is_persistence_that_never_releases_the_inbox_entry() {
         let tmp = tempfile::tempdir().unwrap();
         let server = spawn_fake_server();
         let client = Client::new(server.port, "pw");
-        let state_path = tmp.path().join("state/delivery-state.json");
+        let state_path = tmp.path().join("state/delivery-ledger.json");
         let (mut delivery, filename) = delivery_fixture(tmp.path(), state_path.clone());
 
         delivery.pump(&client);
@@ -2313,59 +2292,30 @@ mod tests {
             server.posts.lock().unwrap().as_slice(),
             [expected_id.clone()]
         );
-        let state: DeliveryState =
-            serde_json::from_slice(&std::fs::read(&state_path).unwrap()).unwrap();
-        assert_eq!(state.phase, DeliveryPhase::Accepted);
-        assert_eq!(state.message_id, expected_id);
+        // Same server fixture, same single-POST conclusion, honest label: `GET 200` is storage.
+        let entry = reopen_ledger(&state_path).entry(&filename).cloned().unwrap();
+        assert_eq!(entry.phase, delivery_ledger::Phase::Persisted);
+        assert_eq!(entry.correlation.value, expected_id);
+        assert_eq!(
+            reopen_ledger(&state_path).retention(&filename),
+            delivery_ledger::Retention::Hold(delivery_ledger::HoldReason::UnreadReceipt),
+            "storage is not admission: ownership is retained until the scheduler proves it, and \
+             only the recipient's own archive settles the message"
+        );
+        assert!(
+            message::inbox_dir(&tmp.path().join("agents/h/worker"))
+                .join(&filename)
+                .is_file(),
+            "the ledger never archives an inbox file"
+        );
 
-        // Accepted is terminal for this file: further pumps send nothing.
+        // Persistence is terminal for the POST loop: further pumps send nothing.
         delivery.pump(&client);
         delivery.pump(&client);
         assert_eq!(server.posts.lock().unwrap().len(), 1);
     }
 
-    #[test]
-    fn a_stale_attempt_reconciles_by_reading_back_instead_of_resending() {
-        let tmp = tempfile::tempdir().unwrap();
-        let server = spawn_fake_server();
-        let client = Client::new(server.port, "pw");
-        let state_path = tmp.path().join("state/delivery-state.json");
-        let (_, filename) = delivery_fixture(tmp.path(), state_path.clone());
 
-        // A prior incarnation attempted this exact delivery and the server made it durable.
-        let message_id = stable_message_id("h.worker", "ses_target", &filename);
-        server.durable.lock().unwrap().insert(message_id.clone());
-        atomic_json(
-            &state_path,
-            &DeliveryState {
-                schema: DELIVERY_STATE_SCHEMA.to_string(),
-                agent: "h.worker".to_string(),
-                runtime_id: "h.worker".to_string(),
-                session_id: "ses_target".to_string(),
-                filename,
-                message_id: message_id.clone(),
-                phase: DeliveryPhase::Attempted,
-            },
-        )
-        .unwrap();
-
-        let agent_dir = tmp.path().join("agents/h/worker");
-        let mut delivery = Delivery::with_state_path(
-            tmp.path(),
-            &agent_dir,
-            "h",
-            "h.worker",
-            "h.worker",
-            state_path.clone(),
-        );
-        delivery.saw_session("ses_target");
-        delivery.pump(&client);
-
-        assert!(server.posts.lock().unwrap().is_empty(), "must not resend");
-        let state: DeliveryState =
-            serde_json::from_slice(&std::fs::read(&state_path).unwrap()).unwrap();
-        assert_eq!(state.phase, DeliveryPhase::Accepted);
-    }
 
     #[test]
     fn a_failed_transport_retries_the_same_identity_never_a_second_one() {
@@ -2373,13 +2323,15 @@ mod tests {
         let server = spawn_fake_server();
         server.accept_posts.store(false, Ordering::SeqCst);
         let client = Client::new(server.port, "pw");
-        let state_path = tmp.path().join("state/delivery-state.json");
+        let state_path = tmp.path().join("state/delivery-ledger.json");
         let (mut delivery, filename) = delivery_fixture(tmp.path(), state_path.clone());
 
         delivery.pump(&client);
-        let state: DeliveryState =
-            serde_json::from_slice(&std::fs::read(&state_path).unwrap()).unwrap();
-        assert_eq!(state.phase, DeliveryPhase::Attempted);
+        assert_eq!(
+            ledger_phase(&state_path, &filename),
+            Some(delivery_ledger::Phase::Attempted),
+            "a refused POST never reaches transportAccepted"
+        );
 
         server.accept_posts.store(true, Ordering::SeqCst);
         delivery.next_attempt = Instant::now();
@@ -2390,9 +2342,10 @@ mod tests {
             server.posts.lock().unwrap().as_slice(),
             [expected_id.clone(), expected_id]
         );
-        let state: DeliveryState =
-            serde_json::from_slice(&std::fs::read(&state_path).unwrap()).unwrap();
-        assert_eq!(state.phase, DeliveryPhase::Accepted);
+        assert_eq!(
+            ledger_phase(&state_path, &filename),
+            Some(delivery_ledger::Phase::Persisted)
+        );
     }
 
     #[test]
@@ -2400,7 +2353,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let server = spawn_fake_server();
         let client = Client::new(server.port, "pw");
-        let state_path = tmp.path().join("state/delivery-state.json");
+        let state_path = tmp.path().join("state/delivery-ledger.json");
         let (mut delivery, _) = delivery_fixture(tmp.path(), state_path);
 
         let agent_dir = tmp.path().join("agents/h/worker");
@@ -2440,7 +2393,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let server = spawn_fake_server();
         let client = Client::new(server.port, "pw");
-        let state_path = tmp.path().join("state/delivery-state.json");
+        let state_path = tmp.path().join("state/delivery-ledger.json");
         let (mut delivery, _filename) = delivery_fixture(tmp.path(), state_path);
         delivery.target_session = None;
 

@@ -1,11 +1,13 @@
 //! The catalog's own declaration — `<catalog>/catalog.kdl`.
 //!
-//! Every other file in a catalog describes an agent; this one describes the folder. Two things
-//! are declarable today: the session registry and resource profiles —
+//! Every other file in a catalog describes an agent; this one describes the folder. Three things
+//! are declarable today: the session registry, how long a retired seat is kept in the live
+//! catalog, and resource profiles —
 //!
 //! ```kdl
 //! catalog {
 //!   pty-root "/run/agents/pty"
+//!   archive-after "7d"
 //! }
 //!
 //! // One wasm resolver per URI scheme; `class` (optional, default coalesced) decides how
@@ -23,6 +25,7 @@
 
 use std::collections::BTreeSet;
 use std::path::{Component, Path, PathBuf};
+use std::time::Duration;
 
 #[cfg(feature = "wasm-resolver")]
 use agent_spec::profile::ProfileCapability;
@@ -86,8 +89,23 @@ pub struct CatalogConfig {
     /// The `pty` session registry holding this catalog's tasks. Relative values anchor at the
     /// catalog root; `$VAR`/`$CATALOG` are expanded at use.
     pub pty_root: Option<String>,
+    /// How long a retired seat stays in the live catalog before the supervisor archives it.
+    /// Absent means [`DEFAULT_ARCHIVE_AFTER`]; `Duration::ZERO` disables auto-archive.
+    pub archive_after: Option<Duration>,
     /// Resource profiles in declaration order.
     pub profiles: Vec<DeclaredProfile>,
+}
+
+/// The grace period an undeclared `archive-after` means: a week of hindsight before a retired seat
+/// leaves the live catalog, which is long enough that un-retiring stays a normal edit.
+pub const DEFAULT_ARCHIVE_AFTER: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+
+/// The declared retirement grace period, or the default when `catalog.kdl` says nothing.
+///
+/// `Duration::ZERO` is the operator's off switch, so it is preserved rather than defaulted: an
+/// explicit `archive-after "0"` disables auto-archive without disabling `st2 catalog archive`.
+pub fn archive_after(config: &CatalogConfig) -> Duration {
+    config.archive_after.unwrap_or(DEFAULT_ARCHIVE_AFTER)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -124,7 +142,7 @@ pub fn parse(text: &str) -> anyhow::Result<CatalogConfig> {
                     anyhow::bail!("catalog block declared more than once");
                 }
                 seen_catalog = true;
-                config.pty_root = parse_catalog_node(node)?;
+                parse_catalog_node(node, &mut config)?;
             }
             "profile" => {
                 let profile = parse_profile(node)?;
@@ -142,15 +160,17 @@ pub fn parse(text: &str) -> anyhow::Result<CatalogConfig> {
     Ok(config)
 }
 
-fn parse_catalog_node(node: &kdl::KdlNode) -> anyhow::Result<Option<String>> {
+fn parse_catalog_node(node: &kdl::KdlNode, config: &mut CatalogConfig) -> anyhow::Result<()> {
     let Some(children) = node.children() else {
-        return Ok(None);
+        return Ok(());
     };
-    let mut pty_root = None;
     for child in children.nodes() {
         match child.name().value() {
             "pty-root" => {
-                anyhow::ensure!(pty_root.is_none(), "pty-root declared more than once");
+                anyhow::ensure!(
+                    config.pty_root.is_none(),
+                    "pty-root declared more than once"
+                );
                 let value = child
                     .get(0)
                     .and_then(|v| v.as_string())
@@ -160,12 +180,35 @@ fn parse_catalog_node(node: &kdl::KdlNode) -> anyhow::Result<Option<String>> {
                             "pty-root needs a non-empty path, e.g. pty-root \"/run/agents/pty\""
                         )
                     })?;
-                pty_root = Some(value.to_string());
+                config.pty_root = Some(value.to_string());
             }
-            other => anyhow::bail!("unknown catalog field '{other}' (expected pty-root)"),
+            // A malformed grace period refuses the whole declaration rather than falling back to
+            // the default: silently archiving on a 7-day clock the operator did not write is the
+            // one outcome this setting exists to prevent.
+            "archive-after" => {
+                anyhow::ensure!(
+                    config.archive_after.is_none(),
+                    "archive-after declared more than once"
+                );
+                let value = child
+                    .get(0)
+                    .and_then(|v| v.as_string())
+                    .filter(|v| !v.is_empty())
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "archive-after needs a quoted duration, e.g. archive-after \"7d\" (\"0\" disables auto-archive)"
+                        )
+                    })?;
+                let parsed = agent_spec::spec::parse_duration(value)
+                    .map_err(|error| anyhow::anyhow!("archive-after: {error}"))?;
+                config.archive_after = Some(parsed);
+            }
+            other => anyhow::bail!(
+                "unknown catalog field '{other}' (expected pty-root or archive-after)"
+            ),
         }
     }
-    Ok(pty_root)
+    Ok(())
 }
 
 fn parse_profile(node: &kdl::KdlNode) -> anyhow::Result<DeclaredProfile> {

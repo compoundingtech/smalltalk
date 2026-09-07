@@ -6,10 +6,16 @@
 use std::fs;
 use std::path::Path;
 
+use st2::identity::AgentSelector;
 use st2::message::{
     archive_dir, archive_msg, collect_thread, inbox_dir, list_dir, read_msg, reply_subject,
     resolve_agent_dir, send_to_inbox,
 };
+
+/// Every reference in these tests is an ordinary address reference.
+fn address(reference: &str) -> AgentSelector {
+    AgentSelector::Address(reference.to_owned())
+}
 
 fn write(root: &Path, rel: &str, contents: &str) {
     let path = root.join(rel);
@@ -49,10 +55,10 @@ fn send_by_bus_id_lands_in_recipient_inbox() {
     );
 
     // Resolve the recipient's agent folder by its bus id, then by bare identity — both must match.
-    let dir_by_bus = resolve_agent_dir(root, "hetz.st2-claude", "hetz")
+    let dir_by_bus = resolve_agent_dir(root, &address("hetz.st2-claude"), "hetz")
         .unwrap()
         .expect("resolve by bus id");
-    let dir_by_ident = resolve_agent_dir(root, "st2-claude", "hetz")
+    let dir_by_ident = resolve_agent_dir(root, &address("st2-claude"), "hetz")
         .unwrap()
         .expect("resolve by identity");
     assert_eq!(dir_by_bus, dir_by_ident);
@@ -90,7 +96,7 @@ fn unknown_recipient_does_not_resolve() {
         &agent_kdl("st2-claude", "hetz"),
     );
     assert!(
-        resolve_agent_dir(root, "hetz.nobody", "hetz")
+        resolve_agent_dir(root, &address("hetz.nobody"), "hetz")
             .unwrap()
             .is_none()
     );
@@ -127,10 +133,10 @@ fn thread_walks_the_reply_chain_across_both_agents() {
         "h/bob-claude/agent.kdl",
         &agent_kdl("bob-claude", "h"),
     );
-    let alice = resolve_agent_dir(root, "h.alice-claude", "h")
+    let alice = resolve_agent_dir(root, &address("h.alice-claude"), "h")
         .unwrap()
         .unwrap();
-    let bob = resolve_agent_dir(root, "h.bob-claude", "h")
+    let bob = resolve_agent_dir(root, &address("h.bob-claude"), "h")
         .unwrap()
         .unwrap();
 
@@ -206,10 +212,10 @@ fn reply_threads_back_to_the_original_sender() {
         &agent_kdl("cos-claude", "hetz"),
     );
 
-    let me = resolve_agent_dir(root, "hetz.st2-claude", "hetz")
+    let me = resolve_agent_dir(root, &address("hetz.st2-claude"), "hetz")
         .unwrap()
         .unwrap();
-    let cos = resolve_agent_dir(root, "hetz.cos-claude", "hetz")
+    let cos = resolve_agent_dir(root, &address("hetz.cos-claude"), "hetz")
         .unwrap()
         .unwrap();
 

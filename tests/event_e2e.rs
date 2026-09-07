@@ -810,6 +810,7 @@ fn desired_state_authoring_and_emit_linearize_without_deadlock() {
             None,
             st2::agent_author::DesiredStateValue::Suspended,
             Some("maintenance"),
+            None,
         );
         done_tx.send(result).unwrap();
     });

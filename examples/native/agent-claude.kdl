@@ -81,6 +81,10 @@ agent "<identity>" {
           {
             "type": "command",
             "command": "\"$ST_HOOKS/claude-stop-failure.sh\""
+          },
+          {
+            "type": "command",
+            "command": "\"$ST_HOOKS/claude-observe.sh\" StopFailure"
           }
         ]
       }

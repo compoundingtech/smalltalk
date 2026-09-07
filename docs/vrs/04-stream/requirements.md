@@ -8,8 +8,9 @@ waking the agent through the existing delivery transports. It refines root
 requirement [`R05`](../requirements.md) for inbox delivery, [`R22`](../requirements.md)
 for named declared subscriptions ("do not replace the schedule with repeated
 messages or polls" — a stream is the declared name a poll hides behind), and
-inherits stable identity from `R19` and `R24`. Ordinary messages remain owned
-by [`03-message/requirements.md`](../03-message/requirements.md); terminal
+inherits immutable agent ID and mutable address semantics from `R19` and `R24`.
+Ordinary messages remain owned by
+[`03-message/requirements.md`](../03-message/requirements.md); terminal
 delivery remains owned by [`01-ding/requirements.md`](../01-ding/requirements.md).
 The record-kind and locality decisions are recorded in
 [`.decisions/0004`](../.decisions/0004-stream-events-are-a-distinct-record-kind.md)

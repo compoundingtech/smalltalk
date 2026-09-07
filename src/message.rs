@@ -24,6 +24,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use st2_wire::message::{SentCoverage, SentMessageRow, SentMessages};
 
+use crate::identity::{AgentSelector, ResolveError};
+
 const SENT_VERSION: u32 = 1;
 const SENT_DIR: &str = "sent";
 const SENT_HEAD: &str = "index.json";
@@ -959,7 +961,7 @@ pub fn resolve_list_box(
         return Ok(flat());
     }
     if apply_incomplete(root) {
-        return resolve_agent_dir(root, id, host)?
+        return resolve_agent_dir(root, &AgentSelector::Address(id.to_owned()), host)?
             .map(|agent_dir| {
                 if archive {
                     archive_dir(&agent_dir)
@@ -972,17 +974,22 @@ pub fn resolve_list_box(
             });
     }
     let discovered = crate::discover(root);
-    if let Some(agent_dir) = discovered
-        .specs
-        .iter()
-        .find(|spec| spec.bus_id(host) == id || spec.identity == id)
-        .and_then(|spec| spec.path.parent())
-    {
-        return Ok(if archive {
-            archive_dir(agent_dir)
-        } else {
-            inbox_dir(agent_dir)
-        });
+    match select_spec(
+        &discovered.specs,
+        &AgentSelector::Address(id.to_owned()),
+        host,
+    ) {
+        Ok(spec) => {
+            if let Some(agent_dir) = spec.path.parent() {
+                return Ok(if archive {
+                    archive_dir(agent_dir)
+                } else {
+                    inbox_dir(agent_dir)
+                });
+            }
+        }
+        Err(ResolveError::Unknown { .. }) => {}
+        Err(error) => return Err(error.into()),
     }
 
     if discovered.specs.is_empty() && discovered.errors.is_empty() {
@@ -991,35 +998,98 @@ pub fn resolve_list_box(
     anyhow::bail!("no agent '{id}' found in catalog {}", root.display())
 }
 
-/// Resolve a recipient (a bus id `<host>.<id>` or a bare identity) to its agent folder in the
-/// catalog, via content discovery. Returns `None` if no agent matches.
+/// Resolve one selected agent — an ordinary bare or host-qualified address reference, or an exact
+/// immutable agent ID — to its agent folder in the catalog, via content discovery. `None` when no
+/// subject answers; an ambiguous reference is an error, never a silent absence.
 pub fn resolve_agent_dir(
     catalog_root: &Path,
-    recipient: &str,
+    selector: &AgentSelector,
     this_host: &str,
 ) -> anyhow::Result<Option<PathBuf>> {
-    Ok(resolve_agent_handle(catalog_root, recipient, this_host)?.map(|agent| agent.path))
+    Ok(optional_agent_handle(catalog_root, selector, this_host)?.map(|agent| agent.path))
+}
+
+/// The admitted readings of a *declaration-key* reference, in order.
+///
+/// Two kinds of reference are declaration keys rather than routes: a runtime's own
+/// `st2 driver … --identity`, and the `supervisor` value a declaration carries. Both have always
+/// accepted the positional identity as well as the `<host>.<identity>` bus identity, and an
+/// identity may itself contain dots — so rather than guessing which dot is a separator, both
+/// readings are tried in the order today's resolution used: the reference as a whole key first,
+/// then the same reference qualified by this host. That is exactly the pair
+/// [`crate::supervisor_chain::resolve_spec`] matches, so the org chart and the notifications it
+/// carries read one namespace.
+///
+/// Both readings are exact keys. Neither a runtime nor a supervisor edge selects through the
+/// mutable address, so an address cutover cannot disconnect a seat from its own directories,
+/// workspace, or message boxes, and cannot break a parent's notification path.
+fn declaration_readings(reference: &str, this_host: &str) -> Vec<AgentSelector> {
+    let qualified = format!("{this_host}.{reference}");
+    if qualified == reference {
+        return vec![AgentSelector::Id(reference.to_owned())];
+    }
+    vec![
+        AgentSelector::Id(reference.to_owned()),
+        AgentSelector::Id(qualified),
+    ]
+}
+
+/// [`resolve_agent_dir`] for a declaration key: a runtime's own agent, or a declared `supervisor`.
+pub fn resolve_declared_dir(
+    catalog_root: &Path,
+    reference: &str,
+    this_host: &str,
+) -> anyhow::Result<Option<PathBuf>> {
+    for selector in declaration_readings(reference, this_host) {
+        if let Some(agent) = optional_agent_handle(catalog_root, &selector, this_host)? {
+            return Ok(Some(agent.path));
+        }
+    }
+    Ok(None)
+}
+
+/// The exact selector for a declaration key used as a message endpoint — a runtime naming itself
+/// as the sender, or a declared `supervisor` as the recipient.
+///
+/// An unresolvable reference keeps its own bytes, so a caller that is not a declared subject — a
+/// flat compat box, an external requester — still fails with today's diagnostic.
+pub fn declared_selector(
+    catalog_root: &Path,
+    reference: &str,
+    this_host: &str,
+) -> anyhow::Result<AgentSelector> {
+    for selector in declaration_readings(reference, this_host) {
+        if optional_agent_handle(catalog_root, &selector, this_host)?.is_some() {
+            return Ok(selector);
+        }
+    }
+    Ok(AgentSelector::Id(reference.to_owned()))
 }
 
 pub fn with_resolved_agent_dir<T>(
     catalog_root: &Path,
-    identity: &str,
+    selector: &AgentSelector,
     this_host: &str,
     operation: impl FnOnce(&Path) -> anyhow::Result<T>,
 ) -> anyhow::Result<T> {
-    with_resolved_state_dir(catalog_root, identity, this_host, &[], true, operation)
+    with_resolved_state_dir(catalog_root, selector, this_host, &[], true, operation)
 }
 
+/// Run an operation against one selected agent's state directory.
+///
+/// An exact-ID selector performs only ID lookup, so a subject whose address differs from its ID
+/// still reaches its own state; an ordinary reference answers on the current address.
 pub fn with_resolved_state_dir<T>(
     catalog_root: &Path,
-    identity: &str,
+    selector: &AgentSelector,
     this_host: &str,
     components: &[&str],
     create: bool,
     operation: impl FnOnce(&Path) -> anyhow::Result<T>,
 ) -> anyhow::Result<T> {
-    match resolve_agent_handle(catalog_root, identity, this_host)? {
-        Some(agent) => {
+    let identity = selector_reference(selector);
+    match find_agent_handle(catalog_root, selector, this_host)? {
+        Ok(agent) => {
             test_capability_checkpoint();
             let path = match agent.capability.as_ref() {
                 Some(capability) if components.is_empty() => {
@@ -1037,14 +1107,18 @@ pub fn with_resolved_state_dir<T>(
             };
             operation(&path)
         }
-        None => {
+        Err(error) => {
+            // The one caller that reads absence as a decision rather than a fault: a provably
+            // fresh root is the legacy flat bus, whose state directory is created on first use.
+            // Ambiguity is never that decision, so it keeps the address diagnostic.
             let discovered = crate::discover(catalog_root);
             anyhow::ensure!(
-                crate::catalog_transaction::catalog_transition(catalog_root)?.is_none()
+                matches!(error, ResolveError::Unknown { .. })
+                    && crate::catalog_transaction::catalog_transition(catalog_root)?.is_none()
                     && !catalog_root.join(crate::catalog_lock::CONTROL_DIR).exists()
                     && discovered.specs.is_empty()
                     && discovered.errors.is_empty(),
-                "no agent '{identity}' found in catalog {}",
+                "no agent '{identity}' found in catalog {}: {error}",
                 catalog_root.display()
             );
             operation(
@@ -1065,16 +1139,11 @@ pub fn with_resolved_state_dir<T>(
 /// operation outside the catalog after recipient resolution.
 pub(crate) fn with_resolved_message_boxes<T>(
     catalog_root: &Path,
-    identity: &str,
+    selector: &AgentSelector,
     this_host: &str,
     operation: impl FnOnce(&Path, &Path) -> anyhow::Result<T>,
 ) -> anyhow::Result<T> {
-    let agent = resolve_agent_handle(catalog_root, identity, this_host)?.with_context(|| {
-        format!(
-            "no agent '{identity}' found in catalog {}",
-            catalog_root.display()
-        )
-    })?;
+    let agent = require_agent_handle(catalog_root, selector, this_host)?;
     let capability = agent
         .capability
         .as_ref()
@@ -1089,26 +1158,152 @@ pub(crate) fn with_resolved_message_boxes<T>(
     )
 }
 
-fn resolve_agent_handle(
+/// Locate one agent on a single coherent address book, reporting why an ordinary reference did not
+/// name exactly one subject (R24).
+///
+/// The catalog-generation and transition fence is sampled before and after the walk, and the walk
+/// is retried when it moved, so the answer always comes from one before-or-after snapshot of the
+/// address book. That is exactly what an atomic address cutover needs: a lookup sees the old
+/// address book or the new one, never a torn mixture in which a cut-over address resolves twice or
+/// not at all.
+fn find_agent_handle(
     catalog_root: &Path,
-    recipient: &str,
+    selector: &AgentSelector,
     this_host: &str,
-) -> anyhow::Result<Option<AddressableAgent>> {
+) -> anyhow::Result<std::result::Result<AddressableAgent, ResolveError>> {
     for _ in 0..3 {
         let before = address_fence(catalog_root)?;
-        let mut candidates = addressable_agent_dirs(catalog_root, this_host, before.1.as_ref())?
-            .into_iter()
-            .filter(|candidate| candidate.bus_id == recipient || candidate.identity == recipient)
-            .collect::<Vec<_>>();
+        let candidates = addressable_agent_dirs(catalog_root, this_host, before.1.as_ref())?;
         let after = address_fence(catalog_root)?;
         if before != after {
             continue;
         }
-        candidates.sort_by(|left, right| left.path.cmp(&right.path));
-        candidates.dedup_by(|left, right| left.path == right.path);
-        return Ok((candidates.len() == 1).then(|| candidates.remove(0)));
+        return Ok(select_agent(candidates, selector, this_host));
     }
-    anyhow::bail!("catalog address book changed repeatedly while resolving {recipient:?}")
+    anyhow::bail!("catalog address book changed repeatedly while resolving {selector:?}")
+}
+
+/// Resolve or fail with the address-specific diagnostic attached to the caller's own message.
+fn require_agent_handle(
+    catalog_root: &Path,
+    selector: &AgentSelector,
+    this_host: &str,
+) -> anyhow::Result<AddressableAgent> {
+    find_agent_handle(catalog_root, selector, this_host)?
+        .map_err(anyhow::Error::new)
+        .with_context(|| {
+            format!(
+                "no agent '{}' found in catalog {}",
+                selector_reference(selector),
+                catalog_root.display()
+            )
+        })
+}
+
+/// Absence-tolerant lookup for callers whose next step depends on "no such subject" — an external
+/// requester mailbox, a flat compat box. An ambiguous reference is not absence and stays an error.
+fn optional_agent_handle(
+    catalog_root: &Path,
+    selector: &AgentSelector,
+    this_host: &str,
+) -> anyhow::Result<Option<AddressableAgent>> {
+    match find_agent_handle(catalog_root, selector, this_host)? {
+        Ok(agent) => Ok(Some(agent)),
+        Err(ResolveError::Unknown { .. }) => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// The literal bytes a caller named, for diagnostics only.
+fn selector_reference(selector: &AgentSelector) -> &str {
+    match selector {
+        AgentSelector::Id(id) => id,
+        AgentSelector::Address(reference) => reference,
+    }
+}
+
+fn select_agent(
+    candidates: Vec<AddressableAgent>,
+    selector: &AgentSelector,
+    this_host: &str,
+) -> std::result::Result<AddressableAgent, ResolveError> {
+    let index = select_index(
+        &candidates,
+        selector,
+        this_host,
+        AddressableAgent::entry,
+        |candidate| candidate.retired,
+    )?;
+    Ok(candidates.into_iter().nth(index).expect("selected index"))
+}
+
+/// Resolve a selector against a discovered catalog's specs.
+fn select_spec<'a>(
+    specs: &'a [crate::AgentSpec],
+    selector: &AgentSelector,
+    this_host: &str,
+) -> std::result::Result<&'a crate::AgentSpec, ResolveError> {
+    let index = select_index(
+        specs,
+        selector,
+        this_host,
+        |spec| crate::identity::AddressBookEntry::of(spec, this_host),
+        |spec| spec.desired_state.is_retired(),
+    )?;
+    Ok(&specs[index])
+}
+
+/// Pick the one candidate a selector names, through the address algorithm rather than a precedence
+/// rule (R24).
+///
+/// Two books, not a tie-break: retirement releases the address, so a retired subject must not make
+/// a live claimant's reference ambiguous. It answers to its own declaration address only when no
+/// routable subject answers at all, which keeps its retained state — status, context, message
+/// boxes — reachable by name exactly as it is today.
+///
+/// The local host is the pin, so this plane and stream ingress decide one reference identically.
+fn select_index<T>(
+    candidates: &[T],
+    selector: &AgentSelector,
+    this_host: &str,
+    entry: impl Fn(&T) -> crate::identity::AddressBookEntry,
+    retired: impl Fn(&T) -> bool,
+) -> std::result::Result<usize, ResolveError> {
+    let book = candidates.iter().map(&entry).collect::<Vec<_>>();
+    let routable = candidates
+        .iter()
+        .zip(&book)
+        .filter(|(candidate, _)| !retired(candidate))
+        .map(|(_, entry)| entry.clone())
+        .collect::<Vec<_>>();
+    let resolved = match crate::identity::resolve_local_first(&routable, selector, this_host) {
+        Err(ResolveError::Unknown { .. }) if routable.len() != book.len() => {
+            crate::identity::resolve_local_first(&book, selector, this_host)
+        }
+        other => other,
+    };
+    let id = &resolved?.id;
+    // Resolution deduplicates by agent ID, so two declarations sharing one effective ID collapse
+    // into one surviving entry — and then a positional lookup could hand back the other one. Two
+    // candidates under one ID are two subjects, not a first match.
+    let mut positions = book
+        .iter()
+        .enumerate()
+        .filter(|(_, candidate)| &candidate.id == id);
+    let (index, _) = positions
+        .next()
+        .expect("the resolved entry came from this candidate set");
+    if positions.next().is_some() {
+        return Err(ResolveError::Ambiguous {
+            reference: selector_reference(selector).to_owned(),
+            ids: book
+                .iter()
+                .filter(|candidate| &candidate.id == id)
+                .map(|candidate| candidate.bus_identity.clone())
+                .collect(),
+        });
+    }
+    Ok(index)
 }
 
 fn address_fence(
@@ -1154,10 +1349,30 @@ fn test_address_fence_checkpoint() {}
 
 #[derive(Debug)]
 struct AddressableAgent {
+    /// The immutable catalog-global agent ID: the explicit `id`, else the `<host>.<identity>` bus
+    /// identity a later ID migration would freeze.
+    id: String,
+    /// The legacy `<host>.<identity>` bus identity, which is the canonical endpoint of every
+    /// durable record and is never moved by an address cutover.
     bus_id: String,
-    identity: String,
+    host: String,
+    /// The effective mutable address: declared `address`, else the positional identity.
+    address: String,
+    /// A retired subject is non-routable and has released its address.
+    retired: bool,
     path: PathBuf,
     capability: Option<File>,
+}
+
+impl AddressableAgent {
+    fn entry(&self) -> crate::identity::AddressBookEntry {
+        crate::identity::AddressBookEntry {
+            id: self.id.clone(),
+            bus_identity: self.bus_id.clone(),
+            host: self.host.clone(),
+            address: self.address.clone(),
+        }
+    }
 }
 
 fn addressable_agent_dirs(
@@ -1177,8 +1392,11 @@ fn addressable_agent_dirs(
                     .to_path_buf();
                 let capability = crate::catalog_transaction::open_dir_beneath(catalog_root, &path)?;
                 Ok(AddressableAgent {
+                    id: spec.effective_id(this_host),
                     bus_id: spec.bus_id(this_host),
-                    identity: spec.identity,
+                    host: spec.resolved_host(this_host).to_owned(),
+                    address: spec.effective_address().to_owned(),
+                    retired: spec.desired_state.is_retired(),
                     path,
                     capability: Some(capability),
                 })
@@ -1212,9 +1430,18 @@ fn addressable_agent_dirs(
             let retained_state =
                 transition.original_agents.contains(&key) && marker_state_exists(&retained)?;
             if current_spec || retained_state {
+                // Keyed on the legacy `<host>/<identity>` pair, not on a declared address: mid
+                // transition the declaration bytes under this directory are not readable, so the
+                // positional pair is the only coherent key available. This branch locates a
+                // retained *state* directory for a catalog being applied; it is not a route being
+                // resolved, and a subject whose declaration is mid-apply has no observable
+                // desired state to call retired.
                 result.push(AddressableAgent {
+                    id: format!("{}.{}", key.host, key.identity),
                     bus_id: format!("{}.{}", key.host, key.identity),
-                    identity: key.identity,
+                    host: key.host,
+                    address: key.identity,
+                    retired: false,
                     path,
                     capability: Some(capability),
                 });
@@ -1487,13 +1714,14 @@ fn catalogless(root: &Path) -> bool {
 
 fn resolve_delivery_endpoint(
     root: &Path,
-    recipient: &str,
+    recipient: &AgentSelector,
     host: &str,
     external: Option<&ExternalInbox>,
 ) -> anyhow::Result<DeliveryEndpoint> {
-    if let Some(agent) = resolve_agent_handle(root, recipient, host)? {
+    if let Some(agent) = optional_agent_handle(root, recipient, host)? {
         return Ok(DeliveryEndpoint::Agent(agent));
     }
+    let recipient = selector_reference(recipient);
     if let Some(external) = external
         && external.root == root
         && external.identity == recipient
@@ -1515,12 +1743,16 @@ fn resolve_delivery_endpoint(
     anyhow::bail!("no agent '{recipient}' found in catalog {}", root.display())
 }
 
+/// Send one message between two selected endpoints.
+///
+/// Both endpoints are selectors, not bare strings: an exact-ID endpoint is the form an
+/// `ST_AGENT`-defaulted sender uses, and it must not be re-resolved through a mutable address.
 #[allow(clippy::too_many_arguments)]
 pub fn send_to_resolved_inbox(
     catalog_root: &Path,
-    recipient: &str,
+    recipient: &AgentSelector,
     this_host: &str,
-    from: &str,
+    sender: &AgentSelector,
     subject: Option<&str>,
     in_reply_to: Option<&str>,
     tags: &[String],
@@ -1531,8 +1763,9 @@ pub fn send_to_resolved_inbox(
     if let Some(key) = idempotency_key {
         validate_idempotency_key(key)?;
     }
+    let from = selector_reference(sender);
     let recipient = resolve_delivery_endpoint(catalog_root, recipient, this_host, external)?;
-    let sender = resolve_agent_handle(catalog_root, from, this_host)?;
+    let sender = optional_agent_handle(catalog_root, sender, this_host)?;
     let external_sender =
         external.is_some_and(|external| external.root == catalog_root && external.identity == from);
     if matches!(&recipient, DeliveryEndpoint::External { .. }) || external_sender {
@@ -1788,7 +2021,15 @@ fn recover_active(
         (Some(_), []) => anyhow::bail!("active sent intent has no recoverable pending record"),
         _ => unreachable!(),
     };
-    let recipient = resolve_delivery_endpoint(catalog_root, &record.to, this_host, external)?;
+    // A durable record's `to` is the canonical endpoint — the legacy bus identity, which is also
+    // the subject's effective immutable ID — so recovery selects by ID. An address cutover between
+    // the pending write and the retry is a nondisruptive route change, not a changed recipient.
+    let recipient = resolve_delivery_endpoint(
+        catalog_root,
+        &AgentSelector::Id(record.to.clone()),
+        this_host,
+        external,
+    )?;
     anyhow::ensure!(
         recipient.bus_id() == record.to,
         "pending recipient identity changed"
@@ -2189,7 +2430,7 @@ fn test_capability_checkpoint() {}
 
 pub fn archive_resolved_message(
     catalog_root: &Path,
-    identity: &str,
+    selector: &AgentSelector,
     this_host: &str,
     filename: &str,
 ) -> anyhow::Result<()> {
@@ -2197,7 +2438,8 @@ pub fn archive_resolved_message(
         is_message_filename(filename),
         "invalid message filename {filename:?}"
     );
-    let agent = match resolve_agent_handle(catalog_root, identity, this_host)? {
+    let identity = selector_reference(selector);
+    let agent = match optional_agent_handle(catalog_root, selector, this_host)? {
         Some(agent) => agent,
         None => {
             let discovered = crate::discover(catalog_root);

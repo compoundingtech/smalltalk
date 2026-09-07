@@ -8,17 +8,21 @@ use std::time::{Duration, Instant};
 
 use sha2::{Digest as _, Sha256};
 
+mod support;
+
+use support::RETIRED_RESOURCES;
+
 fn executable(path: &Path, body: &str) {
     fs::write(path, body).unwrap();
     fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
 }
 
-fn retired_catalog(root: &Path) -> Child {
+fn retired_catalog(root: &Path, retirement: &str, extra: &str) -> Child {
     let declaration = root.join("agents/h/gone/agent.kdl");
     fs::create_dir_all(declaration.parent().unwrap()).unwrap();
     fs::write(
         declaration,
-        "agent \"gone\" { host \"h\"; retired #true; command \"true\" }\n",
+        format!("agent \"gone\" {{\n  host \"h\"\n  {retirement}\n{extra}  command \"true\"\n}}\n"),
     )
     .unwrap();
     let owner = Command::new("sleep").arg("30").spawn().unwrap();
@@ -302,7 +306,7 @@ fn retired_declaration_is_healthy_when_tasks_and_presence_are_absent() {
         &bin.join("pty"),
         "#!/bin/sh\nif [ \"$1\" = list ]; then printf '[]\\n'; fi\n",
     );
-    let mut owner = retired_catalog(&catalog);
+    let mut owner = retired_catalog(&catalog, "retired #true", "");
 
     let output = doctor(&catalog, &bin, &tmp.path().join("state"));
     let _ = owner.kill();
@@ -324,6 +328,50 @@ fn retired_declaration_is_healthy_when_tasks_and_presence_are_absent() {
     );
 }
 
+/// dotfiles#1535: `st2 doctor` for a retired agent requires runtime-record absence only. Declared
+/// `resource` bindings (including a `work://` URI) are declaration metadata that survive retirement
+/// byte-identical, so they must NOT make retirement incomplete or add any resource-specific check.
+#[test]
+fn retired_declaration_with_resources_is_healthy_when_tasks_are_absent() {
+    let tmp = tempfile::tempdir().unwrap();
+    let catalog = tmp.path().join("catalog");
+    let bin = tmp.path().join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    executable(
+        &bin.join("pty"),
+        "#!/bin/sh\nif [ \"$1\" = list ]; then printf '[]\\n'; fi\n",
+    );
+    let declaration = catalog.join("agents/h/gone/agent.kdl");
+    let mut owner = retired_catalog(
+        &catalog,
+        "desired-state \"retired\" reason=\"Mission complete\"",
+        RETIRED_RESOURCES,
+    );
+    let before = fs::read(&declaration).unwrap();
+
+    let output = doctor(&catalog, &bin, &tmp.path().join("state"));
+    let _ = owner.kill();
+    let _ = owner.wait();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(
+        output.status.success(),
+        "resources must not fail retirement health:\nstdout:\n{stdout}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        stdout.contains("✓ h.gone retirement complete (all declared tasks absent)"),
+        "{stdout}"
+    );
+    // Doctor is read-only and adds no resource-specific line for a retired agent.
+    assert!(
+        !stdout.contains("resource") && !stdout.contains("work://"),
+        "retired doctor must not check resources:\n{stdout}"
+    );
+    // The declaration — including its resources — is untouched by the read-only check.
+    assert_eq!(fs::read(&declaration).unwrap(), before);
+}
+
 #[test]
 fn retired_declaration_is_unhealthy_while_a_declared_task_is_alive() {
     let tmp = tempfile::tempdir().unwrap();
@@ -334,7 +382,7 @@ fn retired_declaration_is_unhealthy_while_a_declared_task_is_alive() {
         &bin.join("pty"),
         "#!/bin/sh\nif [ \"$1\" = list ]; then printf '[{\"name\":\"h.gone\",\"status\":\"running\"}]\\n'; fi\n",
     );
-    let mut owner = retired_catalog(&catalog);
+    let mut owner = retired_catalog(&catalog, "retired #true", "");
 
     let output = doctor(&catalog, &bin, &tmp.path().join("state"));
     let _ = owner.kill();
@@ -372,7 +420,7 @@ fn retired_declaration_is_unhealthy_while_a_dead_task_record_remains() {
         &bin.join("pty"),
         "#!/bin/sh\nif [ \"$1\" = list ]; then printf '[{\"name\":\"h.gone\",\"status\":\"exited\"}]\\n'; fi\n",
     );
-    let mut owner = retired_catalog(&catalog);
+    let mut owner = retired_catalog(&catalog, "retired #true", "");
 
     let output = doctor(&catalog, &bin, &tmp.path().join("state"));
     let _ = owner.kill();
@@ -677,6 +725,93 @@ fn native_driver_diagnostic_roster_and_doctor_agree_and_recovery_clears() {
         stdout.contains("native driver diagnostic indeterminate (malformedRecord)"),
         "{stdout}"
     );
+}
+
+/// A Claude, Codex, or omp seat publishes this record only when its own typed turn result names a
+/// rejected credential, so its two Doctor lines are the failure advisory and NOTHING at all:
+/// absence is the healthy steady state for every such seat in a fleet — and omp is the fleet's
+/// default managed harness — so warning under each of them would bury the one seat that actually
+/// needs a human.
+#[test]
+fn a_rejected_provider_credential_advises_while_absence_stays_silent() {
+    use st2::driver_diagnostic::{Driver, Publisher, Reason, Source, Stage, Support};
+
+    for (block, driver, word) in [
+        ("claude", Driver::Claude, "claude"),
+        ("codex", Driver::Codex, "codex"),
+        ("omp", Driver::Omp, "omp"),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let catalog = tmp.path().join("catalog");
+        let declaration = catalog.join("agents/h/worker/agent.kdl");
+        let bin = tmp.path().join("bin");
+        fs::create_dir_all(declaration.parent().unwrap()).unwrap();
+        fs::create_dir_all(&bin).unwrap();
+        fs::write(
+            &declaration,
+            format!(r#"agent "worker" {{ host "h"; {block} {{ prompt "go" }} }}"#),
+        )
+        .unwrap();
+        let agent_dir = declaration.parent().unwrap();
+        fs::write(agent_dir.join("status"), "available\n").unwrap();
+        executable(
+            &bin.join("pty"),
+            "#!/bin/sh\nif [ \"$1\" = list ]; then printf '[{\"name\":\"h.worker\",\"status\":\"running\"}]\\n'; fi\n",
+        );
+
+        let healthy = doctor(&catalog, &bin, &tmp.path().join("state"));
+        let stdout = String::from_utf8_lossy(&healthy.stdout);
+        assert!(healthy.status.success(), "{block}: {stdout}");
+        assert!(
+            !stdout.contains("native driver diagnostic"),
+            "a {block} seat that never had a credential refused says nothing: {stdout}"
+        );
+
+        let mut publisher = Publisher::new(agent_dir, driver, None, Support::Unknown);
+        publisher.publish(
+            Stage::ProviderAuth,
+            Reason::ProviderAuthRejected,
+            Source::TurnResult,
+        );
+
+        let roster = Command::new(env!("CARGO_BIN_EXE_st2"))
+            .arg("agents")
+            .arg(&catalog)
+            .args(["--host", "h", "--identity", "h.worker", "--json"])
+            .output()
+            .unwrap();
+        assert!(roster.status.success());
+        let wire: serde_json::Value = serde_json::from_slice(&roster.stdout).unwrap();
+        assert_eq!(wire[0]["driverDiagnostic"]["status"], "failure");
+        assert_eq!(wire[0]["driverDiagnostic"]["driver"], word);
+        assert_eq!(wire[0]["driverDiagnostic"]["stage"], "providerAuth");
+        assert_eq!(
+            wire[0]["driverDiagnostic"]["reason"],
+            "providerAuthRejected"
+        );
+        assert_eq!(wire[0]["driverDiagnostic"]["source"], "turnResult");
+
+        let rejected = doctor(&catalog, &bin, &tmp.path().join("state"));
+        let stdout = String::from_utf8_lossy(&rejected.stdout);
+        assert!(rejected.status.success(), "{block}: {stdout}");
+        assert!(
+            stdout.contains("native driver diagnostic: providerAuth/providerAuthRejected"),
+            "{block}: {stdout}"
+        );
+        assert!(
+            stdout.contains("re-login with the account's own client"),
+            "{block}: {stdout}"
+        );
+
+        publisher.clear(Stage::ProviderAuth);
+        let recovered = doctor(&catalog, &bin, &tmp.path().join("state"));
+        let stdout = String::from_utf8_lossy(&recovered.stdout);
+        assert!(recovered.status.success(), "{block}: {stdout}");
+        assert!(
+            !stdout.contains("native driver diagnostic"),
+            "{block}: {stdout}"
+        );
+    }
 }
 
 /// HC-R17: Doctor's harness-context lines are advisory in both directions — a reading at or above

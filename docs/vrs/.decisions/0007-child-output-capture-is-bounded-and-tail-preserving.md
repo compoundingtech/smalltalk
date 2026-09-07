@@ -42,10 +42,19 @@ the bash judge that can deadlock.
 4. **Eval run steps stream to their log files** instead of buffering, and the
    bash judge uses null stdio (only its exit status is consumed).
 
-Rejected alternatives: disk spill references for oversized diagnostics
-(spill-file lifecycle for no demonstrated consumer) and streaming every
-shell-out to log files exec-backend style (changes every error path; revisit
-only if a consumer needs full oversized diagnostics).
+## Options
+
+| Option | Result | Reason |
+| --- | --- | --- |
+| Cap diagnostics; keep named payload capture complete | Selected | Bounds memory while preserving structured payload parsing. |
+| Spill oversized diagnostics to disk | Rejected | Adds spill-file lifecycle without a demonstrated consumer. |
+| Stream every shell-out to log files | Rejected | Changes every error path; revisit only if a consumer needs complete oversized diagnostics. |
+
+## Evidence and Argument
+
+The reproduced 16 MiB and eight-way concurrent probes showed peak RSS scaling
+with child output. The selected cap removes that scaling while retaining the
+tail that carries failure diagnostics.
 
 ## Consequences
 

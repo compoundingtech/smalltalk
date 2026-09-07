@@ -2,6 +2,10 @@ use std::fs;
 use std::path::Path;
 use std::process::{Command, Output};
 
+mod support;
+
+use support::RETIRED_RESOURCES;
+
 fn write(root: &Path, relative: &str, contents: &str) {
     let path = root.join(relative);
     fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -203,6 +207,88 @@ fn cli_canonicalizes_legacy_retirement_and_refuses_nix_owned_declarations() {
     assert_eq!(fs::read(root.join("h/worker/agent.kdl")).unwrap(), before);
 }
 
+/// #473: the Nix projection retires a seat it stopped declaring through the typed verb rather than
+/// republishing the whole declaration under CAS. `--managed-by` is the authority: it must name the
+/// declaration's own marker exactly, and it changes nothing but the lifecycle line.
+#[test]
+fn cli_managed_by_authority_retires_a_projected_seat_and_refuses_every_inexact_claim() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path();
+    write(
+        root,
+        "h/root/agent.kdl",
+        "agent \"root\" { host \"h\"; command \"true\" }\n",
+    );
+    let projected = "agent \"seat\" {\n  host \"h\"\n  supervisor \"h.root\"\n  meta { managed-by \"nix\" }\n  command \"true\"\n}\n";
+    write(root, "h/seat/agent.kdl", projected);
+
+    let run = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_st2"))
+            .args(["--catalog", root.to_str().unwrap(), "agent", "desired-state"])
+            .args(args)
+            .args(["--host", "h", "--json"])
+            .env_remove("ST_AGENT")
+            .output()
+            .unwrap()
+    };
+    let retire: &[&str] = &["h.seat", "retired", "--reason", "nix: no longer declared"];
+
+    let unasserted = run(retire);
+    assert!(!unasserted.status.success());
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&unasserted.stdout).unwrap()["code"],
+        "nix-managed-declaration"
+    );
+
+    let mismatched = run(&[retire, &["--managed-by", "agent-spec-authoring"]].concat());
+    assert!(!mismatched.status.success());
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&mismatched.stdout).unwrap()["code"],
+        "managed-by-mismatch"
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("h/seat/agent.kdl")).unwrap(),
+        projected
+    );
+
+    let retired = run(&[retire, &["--managed-by", "nix"]].concat());
+    assert!(
+        retired.status.success(),
+        "{}",
+        String::from_utf8_lossy(&retired.stderr)
+    );
+    let receipt: serde_json::Value = serde_json::from_slice(&retired.stdout).unwrap();
+    assert_eq!(receipt["result"], "changed");
+    assert_eq!(receipt["managed_by"], "nix");
+    let authored = fs::read_to_string(root.join("h/seat/agent.kdl")).unwrap();
+    assert_eq!(
+        authored.replace(
+            "  desired-state \"retired\" reason=\"nix: no longer declared\"\n",
+            ""
+        ),
+        projected,
+        "the projection's own bytes must survive the transition"
+    );
+
+    // The seat now reads back as retired, which is what the activation leg verifies.
+    let found = st2::discover(root);
+    assert!(found.errors.is_empty(), "{:?}", found.errors);
+    assert!(
+        found
+            .specs
+            .iter()
+            .any(|spec| spec.identity == "seat" && spec.desired_state.is_retired())
+    );
+
+    // Replaying the leg is safe: the activation runs on every switch, not only on the first.
+    let replay = run(&[retire, &["--managed-by", "nix"]].concat());
+    assert!(replay.status.success());
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&replay.stdout).unwrap()["result"],
+        "unchanged"
+    );
+}
+
 #[test]
 fn cli_applies_the_existing_self_or_descendant_authority_guardrail() {
     let temporary = tempfile::tempdir().unwrap();
@@ -240,4 +326,72 @@ fn cli_applies_the_existing_self_or_descendant_authority_guardrail() {
             .iter()
             .any(|spec| spec.identity == "worker" && spec.desired_state.is_running())
     );
+}
+
+/// dotfiles#1535: retirement is runtime teardown only. Legacy `retired #true` keeps reading as
+/// retired, an agent may carry `resource` bindings (including a `work://` URI) while retired, and
+/// authoring across the lifecycle collapses to the canonical `desired-state` form on the write path
+/// while leaving every resource byte-identical — un-retiring restores the exact resources.
+#[test]
+fn legacy_retirement_reads_and_authoring_preserves_resources() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path();
+    let legacy = format!(
+        "agent \"worker\" {{\n  host \"h\"\n  retired #true\n{RETIRED_RESOURCES}  command \"true\"\n}}\n"
+    );
+    write(root, "h/worker/agent.kdl", &legacy);
+
+    // Read compatibility: legacy `retired #true` is retired and its resources parse.
+    let found = st2::discover(root);
+    assert!(found.errors.is_empty(), "{:?}", found.errors);
+    let worker = found
+        .specs
+        .iter()
+        .find(|spec| spec.identity == "worker")
+        .unwrap();
+    assert!(worker.desired_state.is_retired());
+    assert_eq!(worker.resources.len(), 2);
+
+    // Un-retire: the write path drops the legacy node without touching the resources.
+    let running = author(root, "running", None);
+    assert!(
+        running.status.success(),
+        "{}",
+        String::from_utf8_lossy(&running.stderr)
+    );
+    let authored = fs::read_to_string(root.join("h/worker/agent.kdl")).unwrap();
+    assert!(!authored.contains("retired"), "{authored}");
+    assert!(!authored.contains("desired-state"), "{authored}");
+    assert!(authored.contains("resource \"work\" uri=\"work://h/current-task\""));
+    assert!(authored.contains("resource \"issue\" uri=\"github-issue://example/project/41\""));
+    let running_spec = st2::discover(root);
+    let worker = running_spec
+        .specs
+        .iter()
+        .find(|spec| spec.identity == "worker")
+        .unwrap();
+    assert!(worker.desired_state.is_running());
+    assert_eq!(worker.resources.len(), 2);
+
+    // Re-retire: new authoring writes the canonical `desired-state` form, resources still intact.
+    let retired = author(root, "retired", Some("Mission complete"));
+    assert!(
+        retired.status.success(),
+        "{}",
+        String::from_utf8_lossy(&retired.stderr)
+    );
+    let authored = fs::read_to_string(root.join("h/worker/agent.kdl")).unwrap();
+    assert!(authored.contains("desired-state \"retired\" reason=\"Mission complete\""));
+    assert!(!authored.contains("retired #true"), "{authored}");
+    assert!(authored.contains("resource \"work\" uri=\"work://h/current-task\""));
+    assert!(authored.contains("resource \"issue\" uri=\"github-issue://example/project/41\""));
+    let found = st2::discover(root);
+    let worker = found
+        .specs
+        .iter()
+        .find(|spec| spec.identity == "worker")
+        .unwrap();
+    assert!(worker.desired_state.is_retired());
+    assert_eq!(worker.desired_state.reason(), Some("Mission complete"));
+    assert_eq!(worker.resources.len(), 2);
 }

@@ -226,6 +226,8 @@ fn selected_one_shot_unknown_refuses_before_runner_list() {
 
 fn task_spec(identity: &str, host: Option<&str>, id: &str) -> AgentSpec {
     AgentSpec {
+        id: None,
+        address: None,
         identity: identity.into(),
         name: None,
         description: None,

@@ -112,6 +112,8 @@ pub fn spec_to_agent_specs(agents: &[SpecAgent], host: &str, root: &Path) -> Vec
                 });
             }
             AgentSpec {
+                id: None,
+                address: None,
                 identity,
                 name: a.name.clone(),
                 description: a.description.clone(),

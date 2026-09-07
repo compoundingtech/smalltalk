@@ -23,13 +23,24 @@ and host-local runtime state are sufficient. It requires no compare-and-swap
 implementation gaps. The root st2 VRS has authority for st2 behavior; the
 canonical evals Agent Spec remains the authoring authority.
 
-Field lookup: [F01](./spec.md#f01), [F02](./spec.md#f02),
-[F03](./spec.md#f03), [F04](./spec.md#f04), [F05](./spec.md#f05),
-[F06](./spec.md#f06), [F07](./spec.md#f07), [F08](./spec.md#f08),
-[F09](./spec.md#f09), [F10](./spec.md#f10), [F11](./spec.md#f11),
-[F12](./spec.md#f12), [F13](./spec.md#f13), [F14](./spec.md#f14),
-[F15](./spec.md#f15), [F16](./spec.md#f16), [F17](./spec.md#f17), and F18 in
-the same field-rules specification.
+Field lookup: [F01](./spec.md#f01-source-form-or-path),
+[F02](./spec.md#f02-agent-id-and-legacy-identity),
+[F03](./spec.md#f03-host), [F04](./spec.md#f04-type),
+[F05](./spec.md#f05-role), [F06](./spec.md#f06-workspace),
+[F07](./spec.md#f07-resource-name-or-uri),
+[F08](./spec.md#f08-render-operation-template-or-resolved-target),
+[F09](./spec.md#f09-task-set-pty-exec-or-compact-ding),
+[F10](./spec.md#f10-task-name-or-explicit-id),
+[F11](./spec.md#f11-spawn-inputs),
+[F12](./spec.md#f12-future-policy-r31),
+[F13](./spec.md#f13-retired-true),
+[F14](./spec.md#f14-compact-agent-fields),
+[F15](./spec.md#f15-provider-and-ignored-fields),
+[F16](./spec.md#f16-invalid-or-incomplete-state),
+[F17](./spec.md#f17-agent-name-and-description),
+[F18](./spec.md#f18-desired-state-and-reason),
+[F19](./spec.md#f19-agent-stream), and
+[F20](./spec.md#f20-agent-address).
 
 ## Shared invariants
 
@@ -64,14 +75,29 @@ the same field-rules specification.
   Presentation changes use exact-ID metadata projection only; they do not alter
   launch fingerprints or authorize lifecycle work.
 
-- **SPEC-R04 Change membership and lifecycle only for exact IDs.** Add only a
-  missing ID. Remove only an exactly attributed old ID. Retirement stops the
-  declared set and prevents relaunch. An identity, task name, or task ID change
-  is remove-old then add-new, not an inferred rename. Each host acts only on its
-  local projection. A host change is independent removal on the old host and
-  addition on the new host, never process migration. The hosts require no shared
-  order, receipt, or proof. Catalog skew can cause temporary overlap or absence;
-  each host retains its local last-known-good ownership.
+- **SPEC-R04 Preserve immutable subject identity; change runtime membership
+  only for exact IDs.** Agent-declaration addition and removal are keyed by
+  immutable agent ID. Adding a newly generated ID creates a subject;
+  reintroducing an earlier ID denotes the same subject. A declaration-source
+  edit cannot change an ID in place. Legacy migration covers live and
+  structurally archived declarations, resolves archived ID collisions without
+  duplicating a subject ID, and atomically rewrites supervisor references to the
+  referenced subject's migrated ID. Add only a missing task ID.
+  Compact agent lowering assigns its canonical task the explicit ID
+  `<agent-id>`. Any long-form named task without an explicit ID defaults to
+  `<agent-id>.<task-name>`, including a task named `agent`; an explicit authored
+  task ID remains authoritative. Remove only an exactly attributed old task ID.
+  Retirement stops the declared set, prevents relaunch, releases address
+  routing, and preserves the subject ID. Suspension retains address routing.
+  Reactivation from retirement proves effective-address uniqueness against the
+  complete prospective catalog.
+  An address change is metadata and routing projection, not remove-old/add-new; a
+  task name or task ID change remains remove-old then add-new. Each host acts
+  only on its local runtime projection. A host change preserves the logical
+  agent ID but is independent removal on the old host and addition on the new
+  host, never process migration. The hosts require no shared order, receipt, or
+  proof. Catalog skew can cause temporary overlap or absence; each host retains
+  its local last-known-good ownership.
 
   Suspension is reversible desired absence, not a second runtime state
   machine. It tears down the same exact owned task set as retirement, including

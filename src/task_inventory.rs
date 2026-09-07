@@ -4,6 +4,8 @@
 //! expose a reconcile plan and cannot mutate catalog or runtime state.
 
 use std::collections::{BTreeMap, BTreeSet};
+#[cfg(target_os = "linux")]
+use std::fs;
 use std::path::{Path, PathBuf};
 
 use agent_spec::spec::{TaskKind, TaskLifecycle};
@@ -13,7 +15,7 @@ use sha2::{Digest as _, Sha256};
 use crate::Discovered;
 use crate::park::{ParkObserver, ParkState};
 
-pub const TASK_INVENTORY_SCHEMA: &str = "st2.task-inventory.v1";
+pub const TASK_INVENTORY_SCHEMA: &str = "st2.task-inventory.v2";
 
 /// Opaque identity over one backend's stable process-generation evidence.
 pub(crate) fn generation_id(
@@ -78,6 +80,43 @@ pub(crate) fn is_rfc3339_utc_millis(value: &str) -> bool {
     year > 0 && (1..=days).contains(&day) && hour <= 23 && minute <= 59 && second <= 60
 }
 
+/// One sampling locator proven against the observed process generation.
+///
+/// These are observation locators, not task identity. A caller must rediscover
+/// them on every inventory sample rather than retaining them as ownership.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "type", rename_all = "camelCase")]
+pub enum ResourceTarget {
+    LinuxCgroupV2 {
+        path: String,
+    },
+    DarwinProcessTree {
+        #[serde(rename = "rootPid")]
+        root_pid: u32,
+    },
+    Unavailable {
+        reason: ResourceTargetUnavailableReason,
+    },
+}
+
+impl ResourceTarget {
+    pub(crate) fn unavailable(reason: ResourceTargetUnavailableReason) -> Self {
+        Self::Unavailable { reason }
+    }
+}
+
+/// Closed reasons why no truthful resource locator was available.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ResourceTargetUnavailableReason {
+    NotRunning,
+    RuntimeIndeterminate,
+    ProcessUnavailable,
+    GenerationChanged,
+    CgroupV2Unavailable,
+    UnsupportedPlatform,
+}
+
 /// One positively identified live runtime generation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeGeneration {
@@ -86,10 +125,16 @@ pub struct RuntimeGeneration {
     created_at: String,
     /// Opaque generation identity derived from stable backend evidence.
     generation_id: String,
+    resource_target: ResourceTarget,
 }
 
 impl RuntimeGeneration {
-    pub fn new(pid: u32, created_at: String, generation_id: String) -> Result<Self, String> {
+    pub fn new(
+        pid: u32,
+        created_at: String,
+        generation_id: String,
+        resource_target: ResourceTarget,
+    ) -> Result<Self, String> {
         if pid == 0 {
             return Err("runtime pid must be positive".into());
         }
@@ -105,6 +150,7 @@ impl RuntimeGeneration {
             pid,
             created_at,
             generation_id,
+            resource_target,
         })
     }
 
@@ -119,6 +165,111 @@ impl RuntimeGeneration {
     pub fn generation_id(&self) -> &str {
         &self.generation_id
     }
+
+    pub fn resource_target(&self) -> &ResourceTarget {
+        &self.resource_target
+    }
+}
+
+/// Fence a process-derived locator between two reads of the kernel's process
+/// start token. This rejects exit and PID reuse during observation, including
+/// races that happen while the cgroup membership itself is being read.
+fn fence_resource_target<ReadStart, ReadTarget>(
+    expected_start_time_ticks: Option<u64>,
+    mut read_start: ReadStart,
+    read_target: ReadTarget,
+) -> ResourceTarget
+where
+    ReadStart: FnMut() -> Result<u64, ()>,
+    ReadTarget: FnOnce() -> Result<ResourceTarget, ResourceTargetUnavailableReason>,
+{
+    let Ok(initial_start) = read_start() else {
+        return ResourceTarget::unavailable(ResourceTargetUnavailableReason::ProcessUnavailable);
+    };
+    if expected_start_time_ticks.is_some_and(|expected| expected != initial_start) {
+        return ResourceTarget::unavailable(ResourceTargetUnavailableReason::GenerationChanged);
+    }
+
+    let candidate = read_target();
+    let Ok(final_start) = read_start() else {
+        return ResourceTarget::unavailable(ResourceTargetUnavailableReason::ProcessUnavailable);
+    };
+    if final_start != initial_start
+        || expected_start_time_ticks.is_some_and(|expected| expected != final_start)
+    {
+        return ResourceTarget::unavailable(ResourceTargetUnavailableReason::GenerationChanged);
+    }
+    candidate.unwrap_or_else(ResourceTarget::unavailable)
+}
+
+/// Parse the unified hierarchy entry without treating a legacy/hybrid entry as
+/// cgroup v2 and without admitting a path that can escape the cgroup mount.
+#[cfg(any(target_os = "linux", test))]
+fn parse_unified_cgroup_path(raw: &str) -> Result<String, ()> {
+    let mut unified = None;
+    for line in raw.split_terminator('\n') {
+        if line.is_empty() || line.contains('\r') || line.contains('\0') {
+            return Err(());
+        }
+        let mut fields = line.splitn(3, ':');
+        let hierarchy = fields.next().ok_or(())?;
+        let controllers = fields.next().ok_or(())?;
+        let path = fields.next().ok_or(())?;
+        if hierarchy != "0" || !controllers.is_empty() {
+            continue;
+        }
+        if unified.is_some()
+            || !path.starts_with('/')
+            || (path.len() > 1 && path.ends_with('/'))
+            || (path != "/"
+                && path
+                    .split('/')
+                    .skip(1)
+                    .any(|component| component.is_empty() || component == "." || component == ".."))
+        {
+            return Err(());
+        }
+        unified = Some(path.to_owned());
+    }
+    unified.ok_or(())
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn observe_resource_target(
+    pid: u32,
+    expected_start_time_ticks: Option<u64>,
+) -> ResourceTarget {
+    fence_resource_target(
+        expected_start_time_ticks,
+        || crate::exec_backend::process_start_time_ticks(pid as i32).map_err(|_| ()),
+        || {
+            let raw = fs::read_to_string(format!("/proc/{pid}/cgroup"))
+                .map_err(|_| ResourceTargetUnavailableReason::CgroupV2Unavailable)?;
+            parse_unified_cgroup_path(&raw)
+                .map(|path| ResourceTarget::LinuxCgroupV2 { path })
+                .map_err(|()| ResourceTargetUnavailableReason::CgroupV2Unavailable)
+        },
+    )
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn observe_resource_target(
+    pid: u32,
+    expected_start_time_ticks: Option<u64>,
+) -> ResourceTarget {
+    fence_resource_target(
+        expected_start_time_ticks,
+        || crate::exec_backend::process_start_time_ticks(pid as i32).map_err(|_| ()),
+        || Ok(ResourceTarget::DarwinProcessTree { root_pid: pid }),
+    )
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub(crate) fn observe_resource_target(
+    _pid: u32,
+    _expected_start_time_ticks: Option<u64>,
+) -> ResourceTarget {
+    ResourceTarget::unavailable(ResourceTargetUnavailableReason::UnsupportedPlatform)
 }
 
 /// Closed runtime observation. Invalid state/generation/error products are unrepresentable.
@@ -239,6 +390,7 @@ struct RuntimeJson {
     pid: Option<u32>,
     created_at: Option<String>,
     generation_id: Option<String>,
+    resource_target: ResourceTarget,
     error: Option<String>,
 }
 
@@ -427,21 +579,51 @@ pub fn inventory(
                     }
                 }
             });
-            let (state, pid, created_at, generation_id, error) = match observation.state {
-                ObservedState::Running(generation) => (
-                    "running",
-                    Some(generation.pid),
-                    Some(generation.created_at),
-                    Some(generation.generation_id),
-                    None,
-                ),
-                ObservedState::Exited => ("exited", None, None, None, None),
-                ObservedState::Vanished => ("vanished", None, None, None, None),
-                ObservedState::Absent => ("absent", None, None, None, None),
-                ObservedState::Indeterminate(error) => {
-                    ("indeterminate", None, None, None, Some(error))
-                }
-            };
+            let (state, pid, created_at, generation_id, resource_target, error) =
+                match observation.state {
+                    ObservedState::Running(generation) => (
+                        "running",
+                        Some(generation.pid),
+                        Some(generation.created_at),
+                        Some(generation.generation_id),
+                        generation.resource_target,
+                        None,
+                    ),
+                    ObservedState::Exited => (
+                        "exited",
+                        None,
+                        None,
+                        None,
+                        ResourceTarget::unavailable(ResourceTargetUnavailableReason::NotRunning),
+                        None,
+                    ),
+                    ObservedState::Vanished => (
+                        "vanished",
+                        None,
+                        None,
+                        None,
+                        ResourceTarget::unavailable(ResourceTargetUnavailableReason::NotRunning),
+                        None,
+                    ),
+                    ObservedState::Absent => (
+                        "absent",
+                        None,
+                        None,
+                        None,
+                        ResourceTarget::unavailable(ResourceTargetUnavailableReason::NotRunning),
+                        None,
+                    ),
+                    ObservedState::Indeterminate(error) => (
+                        "indeterminate",
+                        None,
+                        None,
+                        None,
+                        ResourceTarget::unavailable(
+                            ResourceTargetUnavailableReason::RuntimeIndeterminate,
+                        ),
+                        Some(error),
+                    ),
+                };
             let parked = match parks.states.remove(&task.runtime_id) {
                 Some(ParkState::Parked(record)) => Some(ParkedJson {
                     since: record.parked_at,
@@ -486,6 +668,7 @@ pub fn inventory(
                     pid,
                     created_at,
                     generation_id,
+                    resource_target,
                     error,
                 },
                 parked,
@@ -585,6 +768,18 @@ mod tests {
     }
 
     fn running(id: &str, pid: u32) -> RuntimeObservation {
+        running_with_target(
+            id,
+            pid,
+            ResourceTarget::unavailable(ResourceTargetUnavailableReason::ProcessUnavailable),
+        )
+    }
+
+    fn running_with_target(
+        id: &str,
+        pid: u32,
+        resource_target: ResourceTarget,
+    ) -> RuntimeObservation {
         RuntimeObservation {
             runtime_id: id.into(),
             state: ObservedState::Running(
@@ -592,6 +787,7 @@ mod tests {
                     pid,
                     "2026-07-31T10:00:00.000Z".into(),
                     format!("sha256:g-{pid}"),
+                    resource_target,
                 )
                 .unwrap(),
             ),
@@ -652,6 +848,10 @@ mod tests {
                     "pid": 11,
                     "createdAt": "2026-07-31T10:00:00.000Z",
                     "generationId": "sha256:g-11",
+                    "resourceTarget": {
+                        "type": "unavailable",
+                        "reason": "processUnavailable"
+                    },
                     "error": null
                 },
                 "parked": null
@@ -896,8 +1096,13 @@ mod tests {
         assert!(!is_rfc3339_utc_millis("2025-02-29T10:00:00.000Z"));
         assert!(is_rfc3339_utc_millis("2024-02-29T10:00:00.000Z"));
         assert!(
-            RuntimeGeneration::new(0, "2026-07-31T10:00:00.000Z".into(), "sha256:g".into())
-                .is_err()
+            RuntimeGeneration::new(
+                0,
+                "2026-07-31T10:00:00.000Z".into(),
+                "sha256:g".into(),
+                ResourceTarget::unavailable(ResourceTargetUnavailableReason::ProcessUnavailable),
+            )
+            .is_err()
         );
 
         let tmp = tempfile::tempdir().unwrap();
@@ -961,6 +1166,125 @@ mod tests {
         assert_eq!(value["tasks"][0]["runtime"]["state"], "exited");
         assert_eq!(value["tasks"][1]["runtime"]["state"], "vanished");
         assert_eq!(value["tasks"][2]["runtime"]["state"], "indeterminate");
+    }
+
+    #[test]
+    fn unified_cgroup_parser_accepts_one_exact_v2_path_and_rejects_ambiguous_or_unsafe_input() {
+        assert_eq!(
+            parse_unified_cgroup_path("9:cpu,cpuacct:/legacy\n0::/user.slice/st2:worker scope\n"),
+            Ok("/user.slice/st2:worker scope".into())
+        );
+        assert_eq!(parse_unified_cgroup_path("0::/\n"), Ok("/".into()));
+
+        for malformed in [
+            "",
+            "9:cpu:/legacy\n",
+            "0:memory:/not-unified\n",
+            "0::relative\n",
+            "0::/a/../b\n",
+            "0::/a//b\n",
+            "0::/a/\n",
+            "0::/first\n0::/second\n",
+            "0::/ok\r\n",
+            "0::/ok\n\n0::/also\n",
+        ] {
+            assert_eq!(
+                parse_unified_cgroup_path(malformed),
+                Err(()),
+                "{malformed:?} was admitted"
+            );
+        }
+    }
+
+    #[test]
+    fn process_fence_accepts_only_the_same_live_generation() {
+        let expected = ResourceTarget::LinuxCgroupV2 {
+            path: "/st2/task".into(),
+        };
+        let mut stable = [Ok(41), Ok(41)].into_iter();
+        assert_eq!(
+            fence_resource_target(Some(41), || stable.next().unwrap(), || Ok(expected.clone())),
+            expected
+        );
+
+        let mut target_read = false;
+        assert_eq!(
+            fence_resource_target(
+                Some(41),
+                || Ok(42),
+                || {
+                    target_read = true;
+                    Ok(ResourceTarget::LinuxCgroupV2 {
+                        path: "/already-recycled".into(),
+                    })
+                }
+            ),
+            ResourceTarget::unavailable(ResourceTargetUnavailableReason::GenerationChanged)
+        );
+        assert!(!target_read, "a mismatched generation read the target");
+
+        let mut recycled = [Ok(41), Ok(42)].into_iter();
+        assert_eq!(
+            fence_resource_target(
+                Some(41),
+                || recycled.next().unwrap(),
+                || Ok(ResourceTarget::LinuxCgroupV2 {
+                    path: "/wrong-generation".into(),
+                })
+            ),
+            ResourceTarget::unavailable(ResourceTargetUnavailableReason::GenerationChanged)
+        );
+
+        let mut exited = [Ok(41), Err(())].into_iter();
+        assert_eq!(
+            fence_resource_target(
+                Some(41),
+                || exited.next().unwrap(),
+                || Ok(ResourceTarget::LinuxCgroupV2 {
+                    path: "/exited".into(),
+                })
+            ),
+            ResourceTarget::unavailable(ResourceTargetUnavailableReason::ProcessUnavailable)
+        );
+    }
+
+    #[test]
+    fn degraded_linux_and_darwin_targets_have_strict_tagged_wire_shapes() {
+        let mut stable = [Ok(7), Ok(7)].into_iter();
+        let degraded = fence_resource_target(
+            Some(7),
+            || stable.next().unwrap(),
+            || Err(ResourceTargetUnavailableReason::CgroupV2Unavailable),
+        );
+        assert_eq!(
+            serde_json::to_value(degraded).unwrap(),
+            serde_json::json!({
+                "type": "unavailable",
+                "reason": "cgroupV2Unavailable"
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(ResourceTarget::DarwinProcessTree { root_pid: 73 }).unwrap(),
+            serde_json::json!({
+                "type": "darwinProcessTree",
+                "rootPid": 73
+            })
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn current_process_resource_target_is_associated_with_its_proven_generation() {
+        let pid = std::process::id();
+        let start_time_ticks = crate::exec_backend::process_start_time_ticks(pid as i32).unwrap();
+        let target = observe_resource_target(pid, Some(start_time_ticks));
+        #[cfg(target_os = "linux")]
+        assert!(matches!(
+            target,
+            ResourceTarget::LinuxCgroupV2 { ref path } if path.starts_with('/')
+        ));
+        #[cfg(target_os = "macos")]
+        assert_eq!(target, ResourceTarget::DarwinProcessTree { root_pid: pid });
     }
 
     #[test]

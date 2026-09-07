@@ -332,6 +332,10 @@ fn unobservable_entry_may_hide_declaration(
 /// gain fields without breaking readers.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Declared {
+    /// `id` as written in the file. `None` on a legacy declaration with no explicit agent ID.
+    pub id: Option<String>,
+    /// `address` as written in the file. `None` when `identity` is the effective legacy address.
+    pub address: Option<String>,
     /// `identity` as written in the file. `None` when the file relies on [`path_defaults`].
     pub identity: Option<String>,
     /// `host` as written in the file. `None` when the file relies on [`path_defaults`].
@@ -343,6 +347,8 @@ pub struct Declared {
 impl From<&RawSpec> for Declared {
     fn from(raw: &RawSpec) -> Self {
         Self {
+            id: raw.id.clone(),
+            address: raw.address.clone(),
             identity: raw.identity.clone(),
             host: raw.host.clone(),
             job_type: raw.job_type.clone(),

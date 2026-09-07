@@ -16,6 +16,13 @@ delivers messages. The agent grammar and harness-facing contract remain
 canonical in
 [`compoundingtech/evals/AGENT-SPEC.md`](https://github.com/compoundingtech/evals/blob/main/AGENT-SPEC.md).
 
+## Decision citations
+
+Decision records are cited by their full filename stem, `NNNN-<slug>`. Bare
+numbers are ambiguous for 0005, 0007, 0014, and 0015; their collisions are
+recorded history, and numbers are never reused under
+[`0006-observed-harness-state-is-a-driver-written-catalog-record`](.decisions/0006-observed-harness-state-is-a-driver-written-catalog-record.md).
+
 ## Canonical Agent Spec eval teams
 
 An eval may opt into `canonical-agents` after its fixture copy and deterministic
@@ -60,97 +67,203 @@ materialization, frozen routing after declaration removal, singleton
 completion, custom task-ID supervision/logging/teardown, and the no-opt-in
 legacy control in `tests/eval_run_e2e.rs`.
 
-## Stable identity and mutable presentation (R02, R08, R11, R13, R19, R24-R26)
+## Immutable agent ID, mutable address, and presentation (R02, R08, R11, R13, R19, R24-R26)
 
-The positional value in `agent "<identity>"` remains the stable Agent Spec ID.
-The supported child/TOML/JSON `identity` spelling and roster JSON `identity`
-field remain unchanged. Host qualification produces the existing
-`<host>.<identity>` bus ID. Only that stable identity controls routing,
-selection, authorization, state paths, task identity, adoption, and lifecycle.
-There is no display-name resolver, stable-ID alias, or stable-ID rename command.
+This section is the accepted target contract. Its mutable-address half is
+implemented: the grammar, host-local address uniqueness, `st2 agent address`,
+and the fail-closed bare-or-qualified reference resolution. Its immutable-ID half
+is not: no writer emits `id`, so the positional `<host>.<identity>` bus identity
+remains the durable key every ownership, task-identity, and record surface uses.
+[`0015-immutable-agent-id-and-mutable-address` Amendment 1](.decisions/0015-immutable-agent-id-and-mutable-address.md)
+stages that half behind named triggers and
+[DELTA-003](.delta/DELTA-003-agent-address-not-implemented.md) records what it
+still requires.
+
+An Agent Spec separates four values that the current implementation overloads:
+
+| Concept | Declaration/runtime form | Mutability | Scope | Use |
+|---|---|---|---|---|
+| agent ID | required target field `id "<agent-id>"` | immutable | catalog-global | logical subject, ownership, automation, durable graph edges |
+| agent address | optional `address "<address>"`; positional `identity` is the legacy fallback | mutable | unique per logical host | human routing |
+| bus address | `<host>.<effective-address>` | derived | catalog | qualified human routing |
+| agent name | optional `name "<name>"` | mutable | non-unique | presentation only |
+
+Before ID-aware routing activates, catalog migration adds an explicit `id` to
+every live and structurally archived declaration. It first assigns each live
+legacy subject its existing host-qualified bus identity, preserving current
+runtime IDs and declaration-anchored state. An archived subject receives those
+same bytes when unused across the combined live-and-archived set; a collision
+receives UUIDv7, recorded in both its declaration and tombstone. Migration also
+durably records each reassigned legacy bus identity with the subject that kept
+it and the archived subject's new ID, so readers of legacy records never retype
+colliding bytes into the wrong subject. Supervisor
+resolution uses the combined pre-migration live-and-archived subject index. In
+the same atomic catalog transition, every reference is rewritten to its
+parent's migrated ID. A missing or ambiguous reference refuses before writes
+with `legacy-supervisor-unresolved`; before activation, the operator must
+unarchive and repair that declaration through the ordinary legacy authoring
+path, then retry migration.
+Unarchive preserves the migrated ID, validates its uniqueness against the
+prospective live-and-archived set, and refuses an unmigrated archive after
+activation. New subjects receive UUIDv7 IDs. A legacy frozen ID's original
+host-looking prefix becomes opaque: a later host move changes current placement
+and bus address, not the ID.
+
+A subject's ID survives address, name, description, supervisor, graph
+placement, host placement, desired state, archival, and runtime-incarnation
+changes. Retirement makes the subject non-routable and releases its address but
+preserves the ID. Reintroducing the same ID denotes the same subject; a
+replacement subject receives a newly generated ID.
+
+`address` is an optional semantic alias. When omitted, positional `identity` is
+the effective legacy address. When present, it is the effective address and the
+legacy fallback no longer resolves as an ordinary reference. An explicit
+address is at most 255 ASCII characters and is a dotted sequence of
+1-to-63-character segments. Each segment contains only lowercase letters,
+digits, and hyphens and begins and ends with a letter or digit.
+
+Host qualification forms the bus address:
 
 ```kdl
-agent "worker" {
-  host "host"
-  name "Release worker"
-  description "Owns release preparation and verification."
+agent "0199b8f4-8d3a-7c21-9a44-6f85b7320ea1" {
+  id "0199b8f4-8d3a-7c21-9a44-6f85b7320ea1"
+  host "dev3"
+  address "dotfiles.fractal.keymap.verifier"
+  name "Keymap verifier"
+  description "Verifies Fractal keyboard behavior and regression evidence."
 }
 ```
 
-`name` is a non-unique human label and `description` is the enduring
+```text
+agent ID       0199b8f4-8d3a-7c21-9a44-6f85b7320ea1
+agent address  dotfiles.fractal.keymap.verifier
+bus address    dev3.dotfiles.fractal.keymap.verifier
+agent name     Keymap verifier
+```
+
+Every admitted effective address is unique within its resolved logical host
+among running and suspended subjects. Retired subjects do not resolve and do
+not occupy the address namespace. The complete prospective catalog enforces
+both explicit-address collisions and collisions involving an addressless
+declaration's identity fallback. The same address may exist on two hosts.
+Address and ID are separate typed namespaces; equal string bytes do not collide.
+
+An explicit ID selector performs only catalog-global ID lookup. An ordinary
+reference uses this fail-closed candidate set:
+
+1. when the caller pins a host, treat the complete input as an address in that
+   host and also try the qualified split whose prefix equals the pinned host;
+2. otherwise, treat the complete input as a bare address across the selected
+   catalog and also try every dotted split whose prefix is an admitted logical
+   host and whose suffix is an effective address in that host;
+3. deduplicate candidates by agent ID and succeed only when exactly one subject
+   remains.
+
+This rule makes a dotted semantic address and a host-qualified bus address
+decidable without guessing which dot is a separator. Absence and multiple
+distinct subjects fail with address-specific diagnostics.
+
+Ordinary CLI references and message recipients use that address algorithm.
+Every agent-selecting command exposes mutually exclusive address and exact-ID
+forms. A command that defaults from `ST_AGENT` consumes it through the typed ID
+path; generated hooks and channels use the exact-ID form rather than passing it
+to an address parser. Exact subject selection never falls through to address
+lookup. Internal ownership, supervisor edges, replies, message provenance,
+authoring authority, and lifecycle plans carry agent IDs, not reparsed
+free-form references.
+
+Assigning or changing `address` is one atomic address-book cutover. The old
+address stops resolving as soon as the new catalog generation is visible and
+may be claimed by another subject. st2 stores no rename history, redirect,
+implicit alias, or time-bounded compatibility route. A stale caller fails
+loudly and refreshes the roster. Catalog-generation and incomplete-transaction
+fences keep each lookup on one coherent before-or-after address book.
+
+Address changes do not alter the subject's declaration-parent state anchor,
+ID-keyed supervisor edges, task IDs, launch fingerprints, workspace, inbox,
+archive, context, Resource state, provider-session binding, or runtime
+ownership. A healthy task keeps its PID, creation identity, and generation.
+Host, graph, task, and launch changes retain the logical subject ID but still
+follow their own field-specific runtime rules; logical-subject continuity does
+not imply process-incarnation continuity.
+
+`name` remains a non-unique human label and `description` remains the enduring
 responsibility boundary. Omission is the only cleared representation. Name is
 limited to 160 Unicode scalars and description to 1,000. Explicit empty,
 surrounding-whitespace, Cc-control, U+2028/U+2029, or over-limit values are
-invalid; slash and backslash remain ordinary printable characters. The Agent
-Spec declaration is the sole source of truth. `<agent-dir>/name` is hard-retired:
-st2 neither reads, writes, migrates, nor interprets it.
+invalid; slash and backslash remain ordinary printable characters. Neither
+field participates in identity, address resolution, authorization, durable
+paths, or lifecycle. The Agent Spec declaration is their sole source of truth.
+`<agent-dir>/name` is hard-retired: st2 neither reads, writes, migrates, nor
+interprets it.
 
-`st2 rename` and `st2 describe` accept one stable selector and either a value or
-`--clear`. They edit canonical KDL only. The operation:
+`st2 agent address`, `st2 rename`, and `st2 describe` accept an explicit agent
+ID and either a value or `--clear`. Address clearing restores the positional
+identity fallback and is admitted only when that effective address remains
+unique. They
+edit canonical KDL only. Each operation:
 
 1. acquires the persistent exclusive
    `<catalog>/.st2/catalog-authoring.lock` before discovery;
-2. resolves exactly one declaration and applies the caller-supplied `ST_AGENT`
-   self/descendant guardrail when present;
+2. resolves exactly one declaration by immutable ID and applies the
+   caller-supplied `ST_AGENT` self/descendant guardrail when present;
 3. refuses declarations explicitly marked `meta { managed-by "nix" }`,
-   unsupported formats, malformed catalogs, and ambiguous targets;
-4. applies one span-bounded edit, reparses and validates the candidate;
+   unsupported formats, malformed catalogs, ambiguous targets, and direct ID
+   mutation;
+4. applies one span-bounded edit, reparses and validates the complete candidate
+   catalog, including effective-address uniqueness and ID uniqueness against the
+   structural archive;
 5. fsyncs a temporary under the reserved `.st2` control plane, rechecks the
    original inode/version and bytes, atomically renames it through retained
    no-follow directory capabilities, then fsyncs the declaration directory.
 
-`ST_AGENT` is a runner-provided convention in this trusted single-operator fleet,
-not an authenticated capability: a same-UID caller can alter or remove it, and
-its absence selects the operator path. Nix generators must emit the ownership
+`ST_AGENT` carries the catalog-global agent ID and remains an exact actor
+selector supplied by reconciliation, not the mutable bus address. Host
+placement comes from the declaration/runtime context rather than being encoded
+into `ST_AGENT`. `ST_AGENT` is a trusted-fleet convention rather than an
+authenticated capability: a same-UID caller can alter or remove it, and its
+absence selects the operator path. Nix generators must emit the ownership
 marker before activating a binary with authoring commands; st2 cannot infer an
 unmarked generator from KDL bytes.
 
-The lock file is a persistent real inode and is never removed or stale-recovered.
-It serializes cooperating st2 declaration readers and writers in one local POSIX
-filesystem/kernel lock domain. Direct same-UID writes and independently
-synchronized hosts do not participate; the source recheck detects observed
-interference but is not a distributed CAS or lock service. The classified
-refusal codes are an operational trusted-fleet boundary, not adversarial OS
-isolation.
+The lock file is a persistent real inode and is never removed or
+stale-recovered. It serializes cooperating st2 declaration readers and writers
+in one local POSIX filesystem/kernel lock domain. Direct same-UID writes and
+independently synchronized hosts do not participate; the source recheck detects
+observed interference but is not a distributed lock service.
 
-Harness drivers consume Agent Spec presentation directly:
-
-```text
-Agent Spec name/description (sole authority)
-          |
-          +--> roster
-          +--> PTY metadata
-          `--> exact roster query --> harness driver --> provider-native name
-```
-
-`st2 agents --identity <host>.<identity> --json` acquires the ordinary shared
-catalog-authoring lock, lowers the current declaration, and returns exactly
-one stable roster row or fails if that qualified identity is absent or
-ambiguous. The row keeps stable identity separate from explicitly nullable
-`name` and `description`. This is a read of the current Agent Spec, not another
-state file or Resource binding. It therefore works for co-located declarations
-without inventing a second path identity or synchronization protocol.
-
-st2 core does not invoke a harness driver. A driver owns provider-native
-translation and must join any application to its independently fenced exact
-runtime and native session. It may consume the lowered `AgentSpec` directly
-in-process or use the exact roster query from an external hook or driver.
-Neither read path gains launch, adoption, restart, teardown, replacement, or
-other lifecycle authority.
+Roster and graph JSON append `id`, `address`, and nullable `busAddress` while
+preserving the existing field order and meanings required by their compatibility
+invariants. A retired non-routable subject has null `busAddress` without making
+the envelope incomplete. The existing `identity` field remains the positional
+declaration key and legacy address fallback; consumers do not treat it as the
+agent ID. `name` and `description` remain separate presentation fields. An
+exact ID roster query returns one subject plus its current host and nullable
+effective address. An ordinary address query fails on absence or ambiguity.
 
 For each healthy managed PTY, reconciliation uses one atomic exact-task-ID
-`pty metadata patch --id <task-id>` request. Every PTY receives the versioned
-st2-owned tags `agent.presentation.schema=1`,
-`agent.actor.path=<host>.<identity>`, and the optional
-`agent.presentation.description`. The canonical PTY whose task is named `agent`
-and whose ID is `<host>.<identity>` additionally receives the compatibility tag
-`role=agent`, and maps `name` to native
-`displayName`. Secondary PTYs retain their task-specific display convention and
-clear that compatibility tag. Exec tasks receive no PTY presentation. Name is
-not duplicated in tags. Clearing removes only the owned native value or tag,
-and unrelated PTY metadata is preserved. Repeating the same projection is a
-no-op. Failure is reported and retried by the ordinary loop, never converted
-into launch, teardown, garbage collection, replacement, or flapping authority.
+`pty metadata patch --id <task-id>` request. Compact agent lowering assigns its
+canonical task the explicit runtime ID `<agent-id>`. Every long-form named task
+without an explicit task ID defaults to `<agent-id>.<task-name>`, including a
+task named `agent`; explicitly authored task IDs remain authoritative. This
+preserves every legacy task ID and socket path because each frozen ID equals its
+former bus identity and the lowering rule itself does not change. Host placement
+is not separately concatenated into a default ID; host-looking bytes inside a
+legacy ID are opaque. Every PTY receives the exact owned tag snapshot
+`agent.presentation.schema=2`, `agent.actor.id=<agent-id>`,
+`agent.actor.address=<bus-address>`, and optional
+`agent.presentation.description=<description>`. Clearing a value removes only
+its owned tag. Unrelated tags remain unchanged. Only the canonical compact agent
+task whose task ID equals the agent ID carries the compatibility tag
+`role=agent` and maps `name` to native `displayName`; other PTYs clear that role
+tag and retain their task-specific display convention. Name is not duplicated
+in tags. Exec tasks receive no PTY metadata.
+
+One effective metadata delta emits one coherent `metadata_change` event, while
+an unchanged patch emits none. Projection failure reports and retries but never
+enters launch, teardown, garbage collection, replacement, or flapping
+accounting.
+
 ## Service-principal request transport
 
 A non-agent service that needs bounded judgment work may declare only its bus
@@ -179,7 +292,7 @@ its own durable waits. st2 provides no wait loop or timer and does not turn the
 request into agent lifecycle authority.
 
 This transport is design-superseded but still normative for the shipped
-implementation: [decision 0004](.decisions/0004-stream-events-are-a-distinct-record-kind.md)
+implementation: [`0004-stream-events-are-a-distinct-record-kind`](.decisions/0004-stream-events-are-a-distinct-record-kind.md)
 absorbs typed requests into stream events plus ordinary replies, staged behind
 a deprecation window ([04-stream DQ-S4](04-stream/open-questions.md)). Until
 that staging completes, this section and its invariant row remain the truth;
@@ -227,11 +340,12 @@ Agent Spec envelope in
 `st2 agent digest (--spec FILE | --bundle DIR)` captures a source through
 retained no-follow file descriptors and returns its authoritative digest.
 `st2 agent publish --catalog ROOT (--spec FILE | --bundle DIR)
---input-sha256 HEX (--expect-absent | --expect-sha256 HEX) --json` binds
-publication to that exact capture. It accepts exactly one canonical KDL `agent` node with an
-explicit, path-safe host and identity. st2 no longer exposes an intent compiler:
-external renderers own the transformation from human intent to exact Agent Spec
-bytes or a create-only publication bundle.
+--input-sha256 HEX (--expect-absent | --expect-sha256 HEX)
+[--managed-by MARKER] --json` binds
+publication to that exact capture. It accepts exactly one canonical KDL `agent`
+node with an explicit ID plus path-safe host and identity. st2 no longer
+exposes an intent compiler: external renderers own the transformation from
+human intent to exact Agent Spec bytes or a create-only publication bundle.
 
 The persistent `<catalog>/.st2/catalog-authoring.lock` defines one cooperative
 read/write transaction domain:
@@ -257,6 +371,17 @@ conservatively advancing the generation before clearing it. A crash after the
 advance but before intent removal may therefore skip a generation on recovery;
 the contract is monotonic change detection, not an exactly-once counter.
 
+The resident supervisor watches the parent of `catalog-generation` through a
+dedicated non-recursive backend instance. Atomic replacement of the generation
+file queues one unit wake only after the transaction has made its declaration
+durable. The shared catalog lock still fences the following pass from an
+in-progress writer. This constant-cost commit channel is independent of the
+declaration-space watcher, so declaration subscription volume or failure cannot
+delay a successful st2 publication until the full-audit timer.
+The supervisor records the control-directory identity for that subscription.
+If the directory is replaced, the next pass diagnoses the stale subscription
+and installs a watcher on the replacement directory.
+
 The lock file is a persistent real inode: replacing or removing it would split
 the lock domain for a process that already has it open. Consequently, the first
 coherent declaration reader may initialize exactly `.st2` and this lock even
@@ -272,6 +397,22 @@ matches. `--expect-absent` is idempotent for identical input.
 stale declaration writer. Full-catalog admission rejects any
 structural validation error before publication. The typed result is
 `published` or `unchanged`.
+
+A hash-authorized update also passes the ownership boundary the lifecycle verb
+applies, because it rewrites the same declaration wholesale. `--managed-by
+MARKER` asserts the ownership marker the caller believes owns the incumbent,
+and the replacement is admitted only when the incumbent's own
+`meta { managed-by "..." }` names exactly that one marker; a mismatched marker,
+an unmarked incumbent, an unresolvable multi-marker incumbent, and an empty or
+padded assertion each refuse before any write, under the same refusal codes the
+authoring verbs use. Without an assertion, only the Nix marker refuses, which
+is what lets each publisher of another marker adopt the assertion on its own
+schedule. Create-only publication has no incumbent to protect and a
+byte-identical republication authors nothing, so neither requires an assertion;
+a candidate that merely claims a marker asserts no authority, and the receipt
+reports `managedBy` only for a marker the incumbent confirmed. Incumbent bytes
+that are not readable as a declaration carry no ownership claim, so repairing
+them stays possible for a writer who could already replace the file directly.
 
 Host-scoped validation rejects a pty task whose session socket path would exceed the
 portable `sun_path` bound. `pty` binds `<PTY_ROOT>/<session-id>.sock` and refuses a
@@ -463,19 +604,21 @@ exists. One-shot and selected reconcile fail explicitly. A resident supervisor
 instead remains alive, reports a skipped/incomplete pass, and performs no
 runtime observation or lifecycle action, avoiding a service restart storm.
 Message, context, Resource, and status operations remain available. While the
-marker exists they resolve canonical state from a validated address book: the
-marker's original canonical agent keys union currently published real specs.
-State-only directories are addressable only for original keys with recognized
-real state; an incomplete or arbitrary new identity does not fall back to a
-flat bus. Every host, identity, and message-box path is opened component by
-component without following symlinks, and state mutations remain relative to
-those retained capabilities.
-A dotted bare identity is tried as
-the complete local identity alongside every possible qualified bus-address
-split; exactly one distinct canonical address must exist. Only real state
-directories and a real regular status file can establish marker-time
-addressability. Only `catalog apply --resume --catalog ROOT --json` may open an
-existing marker. The closed marker and internal content-addressed stage are
+marker exists, exact agent-ID operations resolve canonical state from a
+validated subject book: the marker's original canonical agent IDs union the
+currently published real specs. Ordinary address operations resolve against
+the corresponding coherent original-or-current address binding for that
+subject and fail when the marker cannot prove one unique binding. The marker
+therefore retains or content-addresses enough original declaration evidence to
+recover both ID ownership and effective address; it never guesses from a
+dotted string. State-only directories are addressable only for original IDs
+with recognized real state; an incomplete or arbitrary new ID does not fall
+back to a flat bus. Every host, agent ID, and message-box path is opened
+component by component without following symlinks, and state mutations remain
+relative to those retained capabilities. Only real state directories and a
+real regular status file can establish marker-time addressability. Only
+`catalog apply --resume --catalog ROOT --json` may open an existing marker. The
+closed marker and internal content-addressed stage are
 sufficient recovery authority; the original prepared path, input digest, and incumbent CAS
 precondition are neither required nor consulted. The marker's `preparedRootSha256`
 is the input digest already proven against retained capture before publication.
@@ -576,7 +719,7 @@ validate ──► materialize ──► host-local st2 scheduler/reconciler
   successful launch spends its declared budget. Each completed pass supplies
   the exact task IDs it proved alive; uninterrupted observed liveness may
   forgive a fail-mode budget according to the
-  [restart field contract](./02-agent-spec/spec.md#f12), while an unobserved task
+  [restart field contract](./02-agent-spec/spec.md#f12-future-policy-r31), while an unobserved task
   loses accrued recovery uptime. A pass that exits before execution neither
   supplies a liveness observation nor closes the accounting pass.
   [PR #191](https://github.com/compoundingtech/st2/pull/191) provides cadence,
@@ -638,13 +781,17 @@ validate ──► materialize ──► host-local st2 scheduler/reconciler
   after st2 starts it. `st2 pretrust` remains an explicit operator utility for
   commands that intentionally use the ambient Claude and Codex configs.
 
-  st2 owns `ST_AGENT` for every PTY and exec task, deriving the value as
-  `<resolved-host>.<identity>` on every reconciliation. An omitted value is
-  injected, an authored exact match is accepted, and a conflicting authored
-  value refuses the declaration before workspace materialization or runner
-  access. The derived value is part of the persisted launch environment, so
-  initial launch, supervised replay, and manual PTY restart preserve the same
-  identity.
+  st2 owns `ST_AGENT` for every PTY and exec task, setting it to the
+  catalog-global immutable agent ID on every reconciliation. Compact agent
+  lowering assigns that ID explicitly to its canonical task. Other named tasks
+  without explicit IDs append `.<task-name>`, including a task named `agent`.
+  The resolved host remains a separate declaration and launcher input; it is
+  not separately concatenated into either derivation, and any host-looking bytes
+  inside a legacy ID are opaque. An omitted `ST_AGENT` is injected, an authored
+  exact match is accepted, and a conflicting authored value refuses the
+  declaration before workspace materialization or runner access. The value is
+  part of the persisted launch environment, so initial launch, supervised
+  replay, and manual PTY restart preserve the same actor ID.
 
   The canonical `agent` task treats a reconciler's ambient `NO_COLOR` as a
   launcher preference rather than agent policy. Unless the Agent Spec declares
@@ -654,6 +801,28 @@ validate ──► materialize ──► host-local st2 scheduler/reconciler
   manual PTY restart under a different ambient environment reconstructs the
   same effective color policy. Adoption of an already-live task remains
   non-mutating: this policy is applied only when st2 creates a generation.
+- **R42:** [Launch argv](ontology.md#launch-argv) is opaque at every
+  st2-added wrapper boundary. In Linux systemd scope mode the exact outer
+  command order is:
+
+  ```text
+  systemd-run --user --scope --collect --quiet --unit=<unit> --expand-environment=no -- <program> <arg>...
+  ```
+
+  `--expand-environment=no` is an outer `systemd-run` option immediately before
+  the `--` separator. `<program>` and every `<arg>` are appended as their
+  original OS strings, without shell rendering, dollar escaping, or
+  environment substitution. Detached and degraded-detached modes remain
+  `<program> <arg>...` pass-throughs with no outer command.
+
+  `src/isolate.rs::tests::wrap_scope_disables_expansion_and_preserves_dollar_bearing_argv`
+  fixes the complete wrapper order and proves literal `$HOME`, `${UNSET}`, and
+  `$$` after the separator.
+  `src/isolate.rs::tests::wrap_detached_modes_preserve_exact_program_and_argv`
+  proves both pass-through modes. The live-system distinction and unaffected
+  scope semantics are recorded in the
+  [systemd scope argv experiment](.experiments/2026-09-05-systemd-scope-argv-transparency.md)
+  and [`0016-systemd-scope-wrappers-disable-environment-expansion`](.decisions/0016-systemd-scope-wrappers-disable-environment-expansion.md).
 - **R07:** Hook bundles are explicit, content-addressed, installed separately,
   and verified before materialization references them. Their receipts use the
   same resolved build identity as the binary's version surfaces for both
@@ -688,11 +857,47 @@ validate ──► materialize ──► host-local st2 scheduler/reconciler
   resume or replacement authority.
 
 - **R23:** `st2 tasks --json` is a read-only diagnostic boundary. It emits one
-  `st2.task-inventory.v1` envelope for the selected host. Rows are sorted by
-  agent, task, and runtime id and cover both PTY and terminal-free exec tasks.
-  `complete=false` plus a non-zero exit is a closed result: a consumer must not
-  turn a missing row into absence. A running row always carries a PID, creation
-  time, and opaque generation id derived from stable backend evidence.
+  `st2.task-inventory.v2` envelope for the selected host. Rows are sorted by
+  immutable agent ID, task name, and runtime ID and cover both PTY and
+  terminal-free exec tasks. Each row includes immutable agent ID and nullable
+  current bus address; a proved non-routable retired subject has a null address
+  without weakening completeness. `complete=false` plus a non-zero exit is a
+  closed result: a consumer must not turn a missing row into absence. A running
+  row always carries a PID, creation time, opaque generation ID derived from
+  stable backend evidence, and the required `runtime.resourceTarget`.
+
+  `resourceTarget` is internally tagged by `type` and has exactly these wire
+  shapes:
+
+  | `type` | Fields | Meaning |
+  | --- | --- | --- |
+  | `linuxCgroupV2` | `path` | The slash-prefixed unified-hierarchy path exactly as read from `/proc/<pid>/cgroup`; `/` is the cgroup-v2 mount root. |
+  | `darwinProcessTree` | `rootPid` | The observed generation's PID, used as a best-effort process-tree root. |
+  | `unavailable` | `reason` | No safe target: one of `notRunning`, `runtimeIndeterminate`, `processUnavailable`, `generationChanged`, `cgroupV2Unavailable`, or `unsupportedPlatform`. |
+
+  Linux accepts exactly one `0::<path>` entry. It preserves the path bytes
+  represented by UTF-8 text, including spaces and colons, but rejects a
+  non-absolute path, NUL or carriage return, repeated separators, trailing
+  separators, `.` or `..` components, duplicate unified entries, and input
+  with no unified entry. It does not derive the path from a systemd unit,
+  scope name, runtime ID, or naming convention.
+
+  PTY observation captures each candidate daemon's kernel process-start token
+  after the registry snapshot, then executes `pty stats --json` exactly once
+  without a session argument. The returned array is socket-backed live
+  evidence for every candidate. A token is admitted only when exactly one
+  stats row has the task name, `process.alive=true`, the same `daemon.pid`, and
+  the same `createdAt`, and a second kernel-token read equals the first.
+  Resource observation then reads the token before and after the target. Exec
+  compares those target-fence reads directly to the token already bound into
+  its generation record. A missing process is `processUnavailable`; a stats or
+  token mismatch, or a token that changes across a read, is
+  `generationChanged`. Neither result exposes the candidate path or root PID.
+  Darwin uses the same fence around its root PID. A bounded
+  `unavailable` target is a truthful successful field and does not by itself
+  make the envelope incomplete. Locators are sampled afresh on each command:
+  st2 stores no scope registry, performs no resource sampling, and gives no
+  target continuity guarantee. Runtime ID remains task identity.
 
   Discovery runs before and after runtime observation. A semantic declaration
   change across those passes makes the result incomplete. The reader also
@@ -700,17 +905,18 @@ validate ──► materialize ──► host-local st2 scheduler/reconciler
   discovery and runtime observation. Every successful declaration writer
   advances and fsyncs that monotonic generation after its durable commit; apply
   does so after live verification and before clearing its marker. Even a
-  completed declaration ABA is therefore incomplete. This remains an observational
-  seqlock and does not serialize catalog writers. A runtime root positively absent at admission is
-  empty and is not passed to its backend. An admitted PTY root that is removed
-  or replaced during `pty list` is indeterminate; because the external backend
-  creates an absent registry, concurrent root deletion is not a zero-write
-  boundary. Malformed state, PID reuse, timeouts, duplicate ids, and observer
-  failures are likewise indeterminate. Existing plain-PID exec records are
-  opened read-only without following symlinks and verified by retained file
-  identity, unchanged content and metadata, the final path identity, process
-  start token, and record mtime without rewriting them. If that proof is
-  unavailable on a supported OS, the generation remains indeterminate.
+  completed declaration ABA is therefore incomplete. This remains an
+  observational seqlock and does not serialize catalog writers. A runtime root
+  positively absent at admission is empty and is not passed to its backend. An
+  admitted PTY root that is removed or replaced during `pty list` is
+  indeterminate; because the external backend creates an absent registry,
+  concurrent root deletion is not a zero-write boundary. Malformed state, PID
+  reuse, timeouts, duplicate ids, and observer failures are likewise
+  indeterminate. Existing plain-PID exec records are opened read-only without
+  following symlinks and verified by retained file identity, unchanged content
+  and metadata, the final path identity, process start token, and record mtime
+  without rewriting them. If that proof is unavailable on a supported OS, the
+  generation remains indeterminate.
 
   Each row retains the task-level `desiredState` (`running` or `absent`) and
   appends the declaration-level `agentDesiredState` plus
@@ -729,7 +935,7 @@ validate ──► materialize ──► host-local st2 scheduler/reconciler
   only the marker channel owned by the exact canonical catalog folder and host
   it is observing.
 
-- **R27/R28:** Agent lifecycle intent is one closed declaration state:
+- **R41/R28:** Agent lifecycle intent is one closed declaration state:
   `running`, `suspended`, or `retired`. The KDL form is a direct child such as
   `desired-state "suspended" reason="Waiting for capacity"`. Omission means
   running. New suspended and retired states require a bounded rationale;
@@ -746,10 +952,29 @@ validate ──► materialize ──► host-local st2 scheduler/reconciler
 
   `st2 agent desired-state` performs one source-preserving canonical KDL edit
   under the persistent catalog-authoring lock. The self/descendant trusted-fleet
-  guardrail and Nix-owned refusal match presentation authoring. Running removes
+  guardrail matches presentation authoring. Running removes
   lifecycle syntax; suspended and retired emit the canonical node. A success
   receipt proves authored intent only. Reconciliation and Doctor separately
   prove observed convergence.
+
+  Lifecycle is the one authoring verb a declaration's own generator may use.
+  Without an assertion, a Nix-owned declaration refuses exactly as before.
+  `--managed-by <marker>` asserts the ownership marker the caller believes owns
+  the declaration, and is admitted only when `meta { managed-by "..." }` names
+  exactly that one marker; a mismatched marker, an unmarked declaration, an
+  unresolvable multi-marker declaration, and an empty or padded assertion all
+  refuse. The
+  authority exists because a projection has exactly one transition its own
+  source cannot express: the source change being projected is the seat's
+  removal, so "edit the generated source instead" names an edit the operator
+  already made. A marker-matched edit therefore stands in for the
+  compare-and-swap `agent publish` a projection would otherwise perform, and
+  carries that path's admission: the complete prospective catalog must validate
+  before anything is committed, so a retirement leaving an active agent
+  descended from a retired root refuses rather than landing. The receipt records
+  the confirmed marker. Presentation, address, stream, and Resource authoring
+  keep the unconditional refusal: none of them projects a source the generator
+  cannot itself rewrite.
 
   Inventory performs no reconciliation, launch, teardown, cleanup, lifecycle
   edit, state migration, or catalog write. It does not authorize a staged
@@ -786,7 +1011,7 @@ parses structured output that must be whole, so it uses the explicitly named
 full-stdout variant; that read is intentionally uncapped and visible at its
 call site. Eval run steps and agent log dumps stream child output straight to
 their catalog log files without buffering it. Rationale and rejected
-alternatives: [decision 0007](.decisions/0007-child-output-capture-is-bounded-and-tail-preserving.md).
+alternatives: [`0007-child-output-capture-is-bounded-and-tail-preserving`](.decisions/0007-child-output-capture-is-bounded-and-tail-preserving.md).
 
 ## Catalog graph and native delivery admission (R35–R38)
 
@@ -845,6 +1070,46 @@ Each canonical inbox filename is linked into `resources/archive` and then
 removed from the inbox. An existing archive file wins byte-for-byte, so replay
 and a sync-restored duplicate converge without overwriting the receipt.
 Suspended reconciliation never performs this settlement.
+
+Retirement is where the lifecycle stops being about runtime and starts being
+about catalog size, so `st2 catalog archive` adds one step past it:
+`running → suspended → retired → archived`. Archival moves the whole identity
+directory from `agents/<host>/<identity>` into the catalog control plane at
+`.st2/archive/<host>/<identity>`, under the exclusive authoring lock and inside
+one generation commit, as a same-filesystem rename. `.st2` is excluded from
+catalog space at any depth, so an archived declaration is structurally
+undiscoverable and is never projected by a whole-catalog transaction — it is
+absent from the declaration plane, not filtered out of it. A tombstone file
+beside the moved directory carries `{id, host, identity, archivedAt, reason,
+archiveRoot}` and is published as one additive `archived` row in the
+`st2.catalog-graph.v2` envelope; an ordinary archived identity therefore leaves
+`complete: true` untouched, while an archived directory with no readable
+tombstone is unexplained control-plane state and makes the envelope incomplete.
+Eligibility is fail-closed and local-host only, because another host's runtime
+records are not observable: canonical path, retired in either spelling, no live
+or dead record for any declared task, and no remaining declaration referencing
+the subject's immutable ID as `supervisor`. `st2 catalog unarchive` is the exact
+reverse move; it preserves the archived ID, refuses an unmigrated archive after
+ID-aware activation, and validates ID uniqueness against the prospective
+live-and-archived subject set. A later transition to a routable desired state
+validates prospective effective-address uniqueness.
+
+The supervisor closes the same edge without an operator. Each `st2 up` reconcile
+pass ends by archiving every local seat whose retirement outlived the catalog's
+`archive-after` grace period (default `7d`; `"0"` disables the step), applying
+the same fail-closed eligibility as the verb and archiving at most 25 seats per
+pass so one pass stays bounded. The step runs after the pass releases its shared
+lock and takes the exclusive lock non-blockingly: a contended lock skips the
+step, because a pass queued behind `st2 catalog apply` would stall every live
+agent's reconciliation and a due seat is still due next pass. st2 records no
+timestamp for a desired-state edit, so the grace period is measured from the
+supervisor's first observation of the retirement, kept in
+`.st2/retired-observed.json` (`st2.catalog-retired-observed.v1`) as host →
+identity → epoch millis and never in the spec. That ledger is reconciled to
+exactly the currently retired seats on every pass it runs, so a seat that comes
+back drops its row and a second retirement serves a fresh grace period; an
+absent or unreadable ledger restarts every clock, which errs toward keeping
+seats in the live catalog.
 
 Before starting a Codex provider, st2 asks that binary to generate its
 app-server JSON schemas and fingerprints only the delivery-critical projection:
@@ -1056,9 +1321,10 @@ distinguishable from those cases and propagate durably under R17.
 
 Executable acceptance in `tests/claude_hooks.rs` covers the model-visible
 stdout envelope, empty stderr, missing and stale context, missing dependencies,
-and context larger than a platform argument limit without truncation. The open
-verification delta is recorded in
-[DELTA-001](./.delta/DELTA-001-session-start-hook-evidence.md).
+and context larger than a platform argument limit without truncation. That
+target is gated: it is in `checks.st2`'s `cargoTestFlags` and the derivation
+supplies its `bash` and `jq`, so a regression fails CI. Durable failure
+propagation under R17 is a separate axis and stays open as DQ5.
 
 The owner updates this spec whenever implementation changes.
 Changing [vision.md](./vision.md) or [requirements.md](./requirements.md)
@@ -1144,32 +1410,44 @@ The measured basis for this design, including the runs that fixed `steer` and
 the modal case, is recorded in
 [2026-08-18-pi-harness-integration](./.experiments/2026-08-18-pi-harness-integration.md);
 the ruling is
-[decision 0005](./.decisions/0005-pi-delivers-natively-through-an-injected-extension.md).
+[`0005-pi-delivers-natively-through-an-injected-extension`](./.decisions/0005-pi-delivers-natively-through-an-injected-extension.md).
 
-## Event contracts (R13–R15)
+## Event contracts (R13–R15, R40)
 
-An event is evidence, not permission to run the world. The reconciler retains
-path and kind, maps them to the affected identity or template dependency set,
-and computes the smallest desired-versus-actual delta. One declaration affects
-only that agent; a template affects only its dependents. A no-op performs zero
-PTY queries, launches, teardowns, materialization, or writes.
+An event is evidence, not permission to mutate runtime state. The classifier
+maps each accepted path and kind to one consumer. A resident catalog wake
+starts one serialized full-catalog pass; discovery and runtime observation then
+compute the desired-versus-actual delta, and an empty plan performs no launch,
+teardown, materialization, or catalog write.
 
 Watchers are deny-by-default. The classifier/action contract is:
 
 | Event | Minimal action |
 | --- | --- |
-| declaration-space `**/agent.kdl` create/modify/remove | validate, materialize, and converge that agent and derived tasks |
-| referenced `_templates/**` mutation | converge dependent agents only |
+| `.st2/catalog-generation` create/modify/replace | queue one serialized full-catalog reconcile after a cooperative commit |
+| root `catalog.kdl` create/modify/remove | queue one serialized full-catalog reconcile |
+| declaration-space `**/agent.kdl` create/modify/remove or declaration-directory topology change | queue one serialized full-catalog reconcile |
+| referenced `_templates/**` mutation | queue one serialized full-catalog reconcile |
 | inbox create/archive/remove | DING consumer only; supervisor no-op |
 | plan/resource/status mutation | specialized consumer only; supervisor no-op |
 | PTY/exec/log/PID/socket/lock/temp/backup/read/open/unknown | no-op |
 
-Startup, timer, watcher overflow/loss, and ambiguity are bounded full-audit
-fallbacks. Accepted streams use head/tail coalescing: immediate head response,
-one quiet tail after a burst, and a hard maximum. Executable proof covers
-positive declaration/template wakes, negative runtime/bus events, bounded
-discovery/materialization/PTY queries and writes, continuous-event starvation,
-and no-op desired-equals-actual behavior.
+The catalog-generation watcher owns a separate backend instance and one
+non-recursive control-directory subscription. It revalidates that directory's
+identity after every pass and reinstalls a stale subscription. The declaration
+watcher owns shallow subscriptions only for declaration-space directories; it
+prunes `.git`, `.st2`, PTY state, inboxes, archives, and Resource payloads. Both
+channels forward unit wakes to the same single-threaded loop. A burst is drained
+before one pass, and a pass never overlaps another pass.
+
+Watcher setup or callback failure is diagnosed and queues a conservative audit
+when a callback exists. The independent channel remains live. Startup, timer,
+watcher overflow/loss, and ambiguity are bounded full-audit fallbacks.
+Executable proof covers a post-commit generation replacement, generation-watch
+reinstallation after control-directory replacement, direct atomic bundle
+publication at production catalog scale, root configuration and declaration
+wakes, negative runtime/bus events, disconnected-channel cadence, and an idle
+supervisor that does not wake on its own reads.
 
 ## Quiet coordination after events (R22)
 

@@ -4,7 +4,9 @@
 // diverge where it matters (measured 2026-08-25, omp v18.0.3 — see
 // docs/vrs/06-omp-driver/.experiments/). omp has no `agent_settled` event, so terminal
 // `agent_end` uses a bounded `ctx.isIdle()` poll; structured `ask` tool events and approval events
-// carry the blocked-on-human axis pi cannot express. Like the pi asset this file holds no delivery
+// carry the blocked-on-human axis pi cannot express; and a failed turn carries omp's own typed
+// error classification, which this asset forwards raw because st2 — not the asset — decides what
+// a rejected provider credential is. Like the pi asset this file holds no delivery
 // policy: st2 decides which message is delivered, how, and what a starting session is told. It
 // fails open in both directions — an unmanaged omp session loads this extension and does nothing;
 // a slow channel starts the session
@@ -94,16 +96,36 @@ type AgentEndFrame = {
   messages?: unknown;
 };
 
+/**
+ * omp's own words for the provider error that ended a turn.
+ *
+ * `errorId` is omp's error-classification BITFIELD, assigned onto the assistant message at the
+ * provider-stream boundary beside `errorStatus` and `errorMessage`. It travels raw: st2 owns the
+ * verdict, exactly as it owns delivery policy, so this asset never decides what an auth failure
+ * is. `errorStatus` is deliberately not carried — the status code classifies nothing (three of
+ * the four measured 403s are not credential rejections) and omp already prefixes it to the prose.
+ * Measured on omp 18.1.7; see `docs/vrs/06-omp-driver/.experiments/`.
+ */
+type ProviderError = {
+  reason: string;
+  errorId?: number;
+};
+
 /** A terminal provider error requires operator action; it is not an idle settle. */
-const terminalAssistantError = (event: AgentEndFrame): string | undefined => {
+const terminalProviderError = (event: AgentEndFrame): ProviderError | undefined => {
   if (!Array.isArray(event.messages)) return undefined;
   for (let index = event.messages.length - 1; index >= 0; index -= 1) {
     const message = event.messages[index];
     if (!message || typeof message !== "object") continue;
     if (!("role" in message) || message.role !== "assistant") continue;
     if (!("stopReason" in message) || message.stopReason !== "error") return undefined;
-    return boundedReason("errorMessage" in message ? message.errorMessage : undefined) ??
-      "assistant error";
+    const error: ProviderError = {
+      reason: boundedReason("errorMessage" in message ? message.errorMessage : undefined) ??
+        "assistant error",
+    };
+    const classification = finiteOrNull("errorId" in message ? message.errorId : undefined);
+    if (classification !== null) error.errorId = classification;
+    return error;
   }
   return undefined;
 };
@@ -469,14 +491,22 @@ export default function (pi: ExtensionAPI) {
     captureCost(event);
     sendContext(ctx);
     const end = event as AgentEndFrame;
+    // A retried error does not end a turn: omp fires `agent_end` with `willContinue: true` for
+    // every transient failure it is about to try again (measured: a 429 repeated seven times in
+    // one print-mode run). Nothing is claimed from those — least of all about a credential.
     if (end.willContinue === true) {
       cancelSettle();
       return;
     }
-    const error = terminalAssistantError(end);
+    // The typed turn result, on every turn that ACTUALLY ended and in both directions. It is one
+    // frame rather than two because the credential edge and the categorical state are the same
+    // observation seen from two axes, and correlating them across frames would be a race st2
+    // cannot win. An ordinary end carries no error and asserts no state: the sampled idle below
+    // still owns that edge.
+    const error = terminalProviderError(end);
+    sendFrame(error ? { type: "turn", error } : { type: "turn" });
     if (error) {
       cancelSettle();
-      sendFrame({ type: "state", state: "active", reason: error });
       return;
     }
     watchSettle(ctx);

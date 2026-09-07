@@ -449,7 +449,7 @@ fn predecessor_drains_only_legacy_ding_then_candidate_adopts_provider_and_replac
         .unwrap();
     assert_success(&tasks, "strict post-migration inventory");
     let inventory: Value = serde_json::from_slice(&tasks.stdout).unwrap();
-    assert_eq!(inventory["schema"], "st2.task-inventory.v1");
+    assert_eq!(inventory["schema"], "st2.task-inventory.v2");
     assert_eq!(inventory["complete"], true);
     assert_eq!(inventory["errors"], serde_json::json!([]));
     let rows = inventory["tasks"].as_array().unwrap();

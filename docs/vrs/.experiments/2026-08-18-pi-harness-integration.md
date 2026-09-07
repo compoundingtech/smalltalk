@@ -6,13 +6,15 @@ Subject: `pi` — the pi coding agent CLI, npm `@earendil-works/pi-coding-agent`
 `earendil-works/pi`. The older `@mariozechner/pi-coding-agent` (0.73.1) is npm-deprecated in favour of
 it. `pi` was not on this host's `PATH`; 0.84.2 was installed into a scratch prefix for these runs.
 
+## Method
+
 All runs used a local fake OpenAI-completions server rather than a real provider, so every result is
 reproducible with no credentials and no network. Artifacts are in
 [`2026-08-18-pi-captures/`](2026-08-18-pi-captures/): the prototype extension
 (`st2-channel.ts`), the fake provider registration (`fake-provider.ts`), the fake model server
 (`fake-llm.mjs`), and the two event captures cited below.
 
-## Why this matters for st2
+## Question
 
 st2's two existing harnesses each solve native delivery a different way, and neither is cheap:
 
@@ -26,7 +28,7 @@ pi's extension API changes what is available. An extension runs **inside** the i
 process, can inject a user message, and sees a full lifecycle event stream. The measurements below
 were taken to decide whether that is real.
 
-## Established facts (measured, not asserted)
+## Result
 
 | Fact | Evidence |
 |---|---|
@@ -49,14 +51,14 @@ were taken to decide whether that is real.
 - No app-server daemon, no observer pre-connection, no thread binding, no protocol version pin: the
   channel is in-process and the injection point is a documented API call.
 - No screen scraping on the delivery path. The synchronous-proof rule in
-  [`../.decisions/0004`](../.decisions/0004-only-a-synchronous-proof-authorizes-a-pty-write.md)
+  [`0001-ding-harness-dispatch-is-positional-and-harness-owned`](../.decisions/0001-ding-harness-dispatch-is-positional-and-harness-owned.md)
   governs PTY writes; a natively-delivered agent never enters that path
   (`crates/agent-spec/src/spec.rs:887` refuses `ding` together with `deliver`).
 - No `pretrust.rs` analogue: `-a` is a launch flag, so nothing mutates ambient user config and the
   multi-spawn lost-update race that motivated batching for Claude cannot arise.
 - Presence still needs a liveness owner, because SIGKILL is silent. This is unchanged from Claude.
 
-## The implemented slice
+## Conclusion
 
 The design these measurements support is implemented on this branch and recorded as
 [decision 0005](../.decisions/0005-pi-delivers-natively-through-an-injected-extension.md). One
@@ -139,6 +141,12 @@ Three behaviours were added on review and each was verified, not assumed
   wrong event name, and — the one that matters — using the idle proof as a property instead of
   calling it, which is the silent failure that would turn every mid-turn delivery into a plain
   send.
+
+## VRS Impact
+
+The measurements ground the pi native-delivery specification, its in-process
+idle proof, session-replacement channel ownership, and type-checked extension
+boundary.
 
 ## Host context worth recording
 

@@ -2,8 +2,10 @@
 //!
 //! Presentation is declaration state, not runtime identity. Every edit holds the shared persistent
 //! catalog-authoring lock, rechecks the original bytes, and atomically replaces exactly one
-//! canonical KDL declaration. TOML, JSON, declarations marked Nix-owned, and callers outside the
-//! supplied actor relationship fail closed. `ST_AGENT` is a trusted-fleet guardrail rather than
+//! canonical KDL declaration. TOML, JSON, and callers outside the supplied actor relationship fail
+//! closed. A declaration marked `meta { managed-by "nix" }` fails closed too, except on the
+//! lifecycle verb, where the projection may assert that marker and author the one transition its
+//! own source can no longer express (#473). `ST_AGENT` is a trusted-fleet guardrail rather than
 //! authentication. The lock serializes cooperating local st2 writers; it is not a cross-host lock.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -21,7 +23,21 @@ use kdl::{KdlDocument, KdlNode};
 use serde::Serialize;
 
 use crate::catalog_lock::CatalogLock;
-use crate::run::Runner as _;
+
+mod declared_field;
+mod desired_state;
+mod markers;
+mod resource;
+mod stream;
+
+// Re-exported at each item's own visibility so every existing path — `st2::agent_author::*` for
+// the binary and the integration tests, `crate::agent_author::*` for `agent_publish`, and the
+// inline test module's `use super::*` — resolves unchanged.
+pub use declared_field::*;
+pub use desired_state::*;
+pub(crate) use markers::*;
+pub use resource::*;
+pub use stream::*;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct SourceVersion {
@@ -48,29 +64,6 @@ impl SourceVersion {
     }
 }
 
-/// A mutable presentation field with no routing or lifecycle authority.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub enum PresentationField {
-    Name,
-    Description,
-}
-
-impl PresentationField {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Name => "name",
-            Self::Description => "description",
-        }
-    }
-
-    fn max_chars(self) -> usize {
-        match self {
-            Self::Name => AGENT_NAME_MAX_CHARS,
-            Self::Description => AGENT_DESCRIPTION_MAX_CHARS,
-        }
-    }
-}
 
 /// Whether a request changed declaration bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -80,90 +73,6 @@ pub enum AuthorOutcome {
     Unchanged,
 }
 
-/// Stable machine-readable receipt from one presentation edit.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct PresentationReceipt {
-    pub result: AuthorOutcome,
-    pub identity: String,
-    pub field: PresentationField,
-    pub value: Option<String>,
-    pub retired: bool,
-}
-
-/// Stable authored desired-state selector.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub enum DesiredStateValue {
-    Running,
-    Suspended,
-    Retired,
-}
-
-impl DesiredStateValue {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Running => "running",
-            Self::Suspended => "suspended",
-            Self::Retired => "retired",
-        }
-    }
-}
-
-/// Stable machine-readable receipt from one desired-state edit.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct DesiredStateReceipt {
-    pub result: AuthorOutcome,
-    pub identity: String,
-    pub desired_state: DesiredStateValue,
-    pub reason: Option<String>,
-}
-
-/// Stable machine-readable receipt from adding one agent-owned stream.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct StreamAddReceipt {
-    pub result: AuthorOutcome,
-    pub identity: String,
-    pub name: String,
-    pub launch: Option<StreamLaunch>,
-}
-
-/// Stable machine-readable receipt from removing one agent-owned stream.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct StreamRemoveReceipt {
-    pub result: AuthorOutcome,
-    pub identity: String,
-    pub name: String,
-}
-
-/// Stable machine-readable receipt from adding or updating one Resource binding.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct ResourceAddReceipt {
-    pub result: AuthorOutcome,
-    pub identity: String,
-    pub name: String,
-    pub uri: String,
-    pub reason: String,
-    pub inactive_reason: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub selector: Option<serde_json::Value>,
-}
-
-/// Stable machine-readable receipt from removing one Resource binding.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct ResourceRemoveReceipt {
-    pub result: AuthorOutcome,
-    pub identity: String,
-    pub name: String,
-}
-
-/// Stable machine-readable receipt from relabelling one Resource binding.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct ResourceRenameReceipt {
-    pub result: AuthorOutcome,
-    pub identity: String,
-    pub old: String,
-    pub new: String,
-}
 
 /// A classified authoring refusal. `code` is stable for machine consumers.
 #[derive(Debug)]
@@ -196,485 +105,15 @@ impl std::error::Error for AuthorError {}
 #[derive(Debug)]
 struct AgentTarget {
     identity: String,
+    /// The subject's immutable catalog-global agent ID (R24): the explicit `id`, else the legacy
+    /// `<host>.<identity>` bus identity that migration freezes as this subject's ID.
+    agent_id: String,
     source_host: String,
     source_identity: String,
     declaration: PathBuf,
     retired: bool,
 }
 
-/// Add an agent-owned stream, or prove that the identical declaration already exists.
-pub fn add_stream(
-    catalog_root: &Path,
-    selector: &str,
-    this_host: &str,
-    actor: Option<&str>,
-    name: &str,
-    launch: Option<StreamLaunch>,
-) -> Result<StreamAddReceipt, AuthorError> {
-    author_stream(
-        catalog_root,
-        selector,
-        this_host,
-        actor,
-        name,
-        launch.as_ref(),
-        false,
-    )
-    .map(|(result, identity)| StreamAddReceipt {
-        result,
-        identity,
-        name: name.to_owned(),
-        launch,
-    })
-}
-
-/// Remove one agent-owned stream. An already absent stream is an idempotent success.
-pub fn remove_stream(
-    catalog_root: &Path,
-    selector: &str,
-    this_host: &str,
-    actor: Option<&str>,
-    name: &str,
-) -> Result<StreamRemoveReceipt, AuthorError> {
-    author_stream(catalog_root, selector, this_host, actor, name, None, true).map(
-        |(result, identity)| StreamRemoveReceipt {
-            result,
-            identity,
-            name: name.to_owned(),
-        },
-    )
-}
-
-fn author_stream(
-    catalog_root: &Path,
-    selector: &str,
-    this_host: &str,
-    actor: Option<&str>,
-    name: &str,
-    launch: Option<&StreamLaunch>,
-    remove: bool,
-) -> Result<(AuthorOutcome, String), AuthorError> {
-    let catalog_lock = CatalogLock::exclusive(catalog_root).map_err(|error| {
-        AuthorError::new(
-            "catalog-lock-failed",
-            format!("acquire catalog-authoring lock: {error:#}"),
-        )
-    })?;
-    let found = crate::discover_strict(catalog_root);
-    if let Some(error) = found.errors.first() {
-        return Err(AuthorError::new(
-            "catalog-malformed",
-            format!(
-                "cannot prove an exact stream target while {} is malformed: {}",
-                error.path.display(),
-                error.message
-            ),
-        ));
-    }
-    let target = resolve_target(&found.specs, selector, this_host)?;
-    let actor = actor
-        .map(|actor| resolve_target(&found.specs, actor, this_host).map(|target| target.identity))
-        .transpose()?;
-    authorize_actor(
-        &found.specs,
-        &target.identity,
-        this_host,
-        actor.as_deref(),
-        "stream-not-authorized",
-    )?;
-    if remove {
-        let spec = found
-            .specs
-            .iter()
-            .find(|spec| spec.path == target.declaration)
-            .ok_or_else(|| {
-                AuthorError::new("stream-target-lost", "resolved stream target disappeared")
-            })?;
-        if spec
-            .streams
-            .iter()
-            .find(|stream| stream.name == name)
-            .is_some_and(|stream| stream.launch.is_some())
-        {
-            let task_name = format!("{}{}", agent_spec::STREAM_TASK_PREFIX, name);
-            let task = spec
-                .tasks
-                .iter()
-                .find(|task| task.name == task_name)
-                .ok_or_else(|| {
-                    AuthorError::new("stream-task-missing", "launched stream has no derived task")
-                })?;
-            let runtime_id = task
-                .id
-                .clone()
-                .unwrap_or_else(|| format!("{}.{}", spec.bus_id(this_host), task.name));
-            let runner = crate::run::SystemRunner::new(
-                catalog_root.to_path_buf(),
-                crate::run::exec_state_dir(this_host),
-            );
-            let live = runner
-                .list_sessions()
-                .map_err(|error| {
-                    AuthorError::new("stream-runtime-observation-failed", error.to_string())
-                })?
-                .into_iter()
-                .any(|session| session.alive && session.pty_id == runtime_id);
-            if live {
-                runner.retire(&runtime_id).map_err(|error| {
-                    AuthorError::new(
-                        "stream-runtime-retirement-failed",
-                        format!("retire launched stream runtime {runtime_id}: {error:#}"),
-                    )
-                })?;
-            }
-        }
-    }
-    let result = edit_stream_declaration(
-        &catalog_lock,
-        catalog_root,
-        &crate::catalog_transaction::retained_dir_path(catalog_lock.control())
-            .map_err(|error| AuthorError::new("declaration-write-failed", error.to_string()))?,
-        &target.declaration,
-        &target.identity,
-        &target.source_host,
-        &target.source_identity,
-        name,
-        launch,
-        remove,
-        || {},
-    )?;
-    Ok((result, target.identity))
-}
-
-/// Declare one Resource binding, or update the binding that already carries `name`.
-///
-/// st2 preserves the binding for readers; it resolves nothing and grants nothing. `uri` is the
-/// exact absolute identity and is stored byte for byte with no normalization.
-#[allow(clippy::too_many_arguments)]
-pub fn add_resource(
-    catalog_root: &Path,
-    selector: &str,
-    this_host: &str,
-    actor: Option<&str>,
-    name: &str,
-    uri: &str,
-    reason: &str,
-    inactive_reason: Option<&str>,
-) -> Result<ResourceAddReceipt, AuthorError> {
-    add_resource_with_selector(
-        catalog_root,
-        selector,
-        this_host,
-        actor,
-        name,
-        uri,
-        reason,
-        inactive_reason,
-        None,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-pub fn add_resource_with_selector(
-    catalog_root: &Path,
-    selector: &str,
-    this_host: &str,
-    actor: Option<&str>,
-    name: &str,
-    uri: &str,
-    reason: &str,
-    inactive_reason: Option<&str>,
-    resource_selector: Option<&serde_json::Value>,
-) -> Result<ResourceAddReceipt, AuthorError> {
-    author_resource(
-        catalog_root,
-        selector,
-        this_host,
-        actor,
-        ResourceIntent::Upsert {
-            name,
-            uri,
-            reason,
-            inactive_reason,
-            selector: resource_selector,
-        },
-    )
-    .map(|(result, identity)| ResourceAddReceipt {
-        result,
-        identity,
-        name: name.to_owned(),
-        uri: uri.to_owned(),
-        reason: reason.to_owned(),
-        inactive_reason: inactive_reason.map(str::to_owned),
-        selector: resource_selector.cloned(),
-    })
-}
-
-/// Remove one Resource binding. An already absent binding is an idempotent success.
-pub fn remove_resource(
-    catalog_root: &Path,
-    selector: &str,
-    this_host: &str,
-    actor: Option<&str>,
-    name: &str,
-) -> Result<ResourceRemoveReceipt, AuthorError> {
-    author_resource(
-        catalog_root,
-        selector,
-        this_host,
-        actor,
-        ResourceIntent::Remove { name },
-    )
-    .map(|(result, identity)| ResourceRemoveReceipt {
-        result,
-        identity,
-        name: name.to_owned(),
-    })
-}
-
-/// Relabel one Resource binding, carrying its `uri`, `reason`, and `inactive-reason` unchanged.
-///
-/// An absent `old` and an already declared `new` both refuse: binding names are unique within one
-/// agent, so neither request has an outcome that preserves the caller's intent.
-pub fn rename_resource(
-    catalog_root: &Path,
-    selector: &str,
-    this_host: &str,
-    actor: Option<&str>,
-    old: &str,
-    new: &str,
-) -> Result<ResourceRenameReceipt, AuthorError> {
-    author_resource(
-        catalog_root,
-        selector,
-        this_host,
-        actor,
-        ResourceIntent::Rename { old, new },
-    )
-    .map(|(result, identity)| ResourceRenameReceipt {
-        result,
-        identity,
-        old: old.to_owned(),
-        new: new.to_owned(),
-    })
-}
-
-/// One requested Resource-binding mutation, resolved against the declaration under the lock.
-#[derive(Debug, Clone, Copy)]
-enum ResourceIntent<'a> {
-    Upsert {
-        name: &'a str,
-        uri: &'a str,
-        reason: &'a str,
-        inactive_reason: Option<&'a str>,
-        selector: Option<&'a serde_json::Value>,
-    },
-    Remove {
-        name: &'a str,
-    },
-    Rename {
-        old: &'a str,
-        new: &'a str,
-    },
-}
-
-/// The binding state a candidate must read back as before it may be committed.
-#[derive(Debug)]
-struct ResourceExpectation {
-    absent: Option<String>,
-    present: Option<Resource>,
-}
-
-fn author_resource(
-    catalog_root: &Path,
-    selector: &str,
-    this_host: &str,
-    actor: Option<&str>,
-    intent: ResourceIntent<'_>,
-) -> Result<(AuthorOutcome, String), AuthorError> {
-    let catalog_lock = CatalogLock::exclusive(catalog_root).map_err(|error| {
-        AuthorError::new(
-            "catalog-lock-failed",
-            format!("acquire catalog-authoring lock: {error:#}"),
-        )
-    })?;
-    let found = crate::discover_strict(catalog_root);
-    if let Some(error) = found.errors.first() {
-        return Err(AuthorError::new(
-            "catalog-malformed",
-            format!(
-                "cannot prove an exact resource target while {} is malformed: {}",
-                error.path.display(),
-                error.message
-            ),
-        ));
-    }
-    let target = resolve_target(&found.specs, selector, this_host)?;
-    let actor = actor
-        .map(|actor| resolve_target(&found.specs, actor, this_host).map(|target| target.identity))
-        .transpose()?;
-    authorize_actor(
-        &found.specs,
-        &target.identity,
-        this_host,
-        actor.as_deref(),
-        "resource-not-authorized",
-    )?;
-    let result = edit_resource_declaration(
-        &catalog_lock,
-        catalog_root,
-        &crate::catalog_transaction::retained_dir_path(catalog_lock.control())
-            .map_err(|error| AuthorError::new("declaration-write-failed", error.to_string()))?,
-        &target.declaration,
-        &target.identity,
-        &target.source_host,
-        &target.source_identity,
-        intent,
-        || {},
-    )?;
-    Ok((result, target.identity))
-}
-
-/// Author one whole-agent desired state without claiming runtime convergence.
-pub fn set_desired_state(
-    catalog_root: &Path,
-    selector: &str,
-    this_host: &str,
-    actor: Option<&str>,
-    state: DesiredStateValue,
-    reason: Option<&str>,
-) -> Result<DesiredStateReceipt, AuthorError> {
-    match state {
-        DesiredStateValue::Running if reason.is_some() => {
-            return Err(AuthorError::new(
-                "invalid-desired-state",
-                "running desired state forbids --reason",
-            ));
-        }
-        DesiredStateValue::Suspended | DesiredStateValue::Retired if reason.is_none() => {
-            return Err(AuthorError::new(
-                "invalid-desired-state",
-                format!("{} desired state requires --reason", state.as_str()),
-            ));
-        }
-        _ => {}
-    }
-    if let Some(reason) = reason {
-        validate_desired_state_reason(reason)
-            .map_err(|error| AuthorError::new("invalid-desired-state", error.to_string()))?;
-    }
-    let catalog_lock = CatalogLock::exclusive(catalog_root).map_err(|error| {
-        AuthorError::new(
-            "catalog-lock-failed",
-            format!("acquire catalog-authoring lock: {error:#}"),
-        )
-    })?;
-    let found = crate::discover(catalog_root);
-    if let Some(error) = found.errors.first() {
-        return Err(AuthorError::new(
-            "catalog-malformed",
-            format!(
-                "cannot prove an exact desired-state target while {} is malformed: {}",
-                error.path.display(),
-                error.message
-            ),
-        ));
-    }
-    let target = resolve_target(&found.specs, selector, this_host)?;
-    authorize_actor(
-        &found.specs,
-        &target.identity,
-        this_host,
-        actor,
-        "desired-state-not-authorized",
-    )?;
-    let result = edit_desired_state_declaration(
-        &catalog_lock,
-        catalog_root,
-        &crate::catalog_transaction::retained_dir_path(catalog_lock.control())
-            .map_err(|error| AuthorError::new("declaration-write-failed", error.to_string()))?,
-        &target.declaration,
-        &target.identity,
-        &target.source_host,
-        &target.source_identity,
-        state,
-        reason,
-        || {},
-    )?;
-    Ok(DesiredStateReceipt {
-        result,
-        identity: target.identity,
-        desired_state: state,
-        reason: reason.map(str::to_owned),
-    })
-}
-
-/// Set or clear one presentation field for one stable Agent Spec identity.
-///
-/// `actor` is the caller-supplied `ST_AGENT` identity. An absent actor is the explicit operator
-/// path. Within the trusted-fleet model, the guardrail limits a catalog-managed caller to itself or
-/// a descendant reached through declared supervisor edges; no presentation field expands it.
-pub fn set_presentation(
-    catalog_root: &Path,
-    selector: &str,
-    this_host: &str,
-    actor: Option<&str>,
-    field: PresentationField,
-    requested: Option<&str>,
-) -> Result<PresentationReceipt, AuthorError> {
-    let catalog_lock = CatalogLock::exclusive(catalog_root).map_err(|error| {
-        AuthorError::new(
-            "catalog-lock-failed",
-            format!("acquire catalog-authoring lock: {error:#}"),
-        )
-    })?;
-    let found = crate::discover(catalog_root);
-    if let Some(error) = found.errors.first() {
-        return Err(AuthorError::new(
-            "catalog-malformed",
-            format!(
-                "cannot prove an exact presentation target while {} is malformed: {}",
-                error.path.display(),
-                error.message
-            ),
-        ));
-    }
-    let target = resolve_target(&found.specs, selector, this_host)?;
-    authorize_actor(
-        &found.specs,
-        &target.identity,
-        this_host,
-        actor,
-        "presentation-not-authorized",
-    )?;
-    let requested = requested
-        .map(|value| {
-            validate_presentation(field.as_str(), Some(value), field.max_chars())
-                .map(|()| value.to_owned())
-                .map_err(|error| AuthorError::new("invalid-presentation", error.to_string()))
-        })
-        .transpose()?;
-    let result = edit_declaration(
-        &catalog_lock,
-        catalog_root,
-        &crate::catalog_transaction::retained_dir_path(catalog_lock.control())
-            .map_err(|error| AuthorError::new("declaration-write-failed", error.to_string()))?,
-        &target.declaration,
-        &target.identity,
-        &target.source_host,
-        &target.source_identity,
-        field,
-        requested.as_deref(),
-        || {},
-    )?;
-    Ok(PresentationReceipt {
-        result,
-        identity: target.identity,
-        field,
-        value: requested,
-        retired: target.retired,
-    })
-}
 
 fn resolve_target(
     specs: &[crate::AgentSpec],
@@ -700,6 +139,7 @@ fn resolve_target(
         )),
         [spec] => Ok(AgentTarget {
             identity: spec.bus_id(this_host),
+            agent_id: spec.effective_id(this_host),
             source_host: spec.resolved_host(this_host).to_owned(),
             source_identity: spec.identity.clone(),
             declaration: spec.path.clone(),
@@ -795,7 +235,7 @@ fn edit_declaration_for_test(
         expected_identity,
         expected_host,
         expected_agent,
-        field,
+        field.into(),
         requested,
         before_commit,
     )
@@ -825,900 +265,11 @@ fn edit_desired_state_for_test(
         "worker",
         state,
         reason,
+        None,
         before_commit,
     )
 }
 
-#[allow(clippy::too_many_arguments)]
-fn edit_stream_declaration(
-    catalog_lock: &CatalogLock,
-    catalog: &Path,
-    control: &Path,
-    path: &Path,
-    expected_identity: &str,
-    expected_host: &str,
-    expected_agent: &str,
-    name: &str,
-    launch: Option<&StreamLaunch>,
-    remove: bool,
-    before_commit: impl FnOnce(),
-) -> Result<AuthorOutcome, AuthorError> {
-    if path.extension().and_then(|value| value.to_str()) != Some("kdl") {
-        return Err(AuthorError::new(
-            "unsupported-declaration-format",
-            format!(
-                "stream authoring requires canonical KDL, found {}",
-                path.display()
-            ),
-        ));
-    }
-    let metadata = fs::symlink_metadata(path).map_err(|error| {
-        AuthorError::new(
-            "declaration-read-failed",
-            format!("reading declaration {}: {error}", path.display()),
-        )
-    })?;
-    if !metadata.file_type().is_file() {
-        return Err(AuthorError::new(
-            "unsafe-declaration-path",
-            format!("refusing non-regular declaration path {}", path.display()),
-        ));
-    }
-    let original = fs::read(path).map_err(|error| {
-        AuthorError::new(
-            "declaration-read-failed",
-            format!("reading declaration {}: {error}", path.display()),
-        )
-    })?;
-    let original_version = SourceVersion::from_metadata(&metadata);
-    let text = std::str::from_utf8(&original).map_err(|error| {
-        AuthorError::new(
-            "malformed-declaration",
-            format!("declaration {} is not UTF-8: {error}", path.display()),
-        )
-    })?;
-    let document = KdlDocument::parse(text).map_err(|error| {
-        AuthorError::new(
-            "malformed-declaration",
-            format!("parsing declaration {}: {error}", path.display()),
-        )
-    })?;
-    let target = exact_agent_node(&document, expected_identity, expected_host, expected_agent)?;
-    if is_nix_managed(target) {
-        return Err(AuthorError::new(
-            "nix-managed-declaration",
-            format!(
-                "agent {expected_identity:?} is Nix-owned; edit its Nix source instead of {}",
-                path.display()
-            ),
-        ));
-    }
-    let replacement = stream_edit(text, target, name, launch, remove)?;
-    let Some(replacement) = replacement else {
-        return Ok(AuthorOutcome::Unchanged);
-    };
-    verify_stream_candidate(
-        catalog,
-        path,
-        &replacement,
-        expected_identity,
-        expected_host,
-        expected_agent,
-        name,
-        launch,
-        remove,
-    )?;
-    atomic_replace_checked(
-        catalog_lock,
-        catalog,
-        control,
-        path,
-        &original,
-        original_version,
-        replacement.as_bytes(),
-        metadata.permissions().mode() & 0o7777,
-        before_commit,
-    )?;
-    Ok(AuthorOutcome::Changed)
-}
-
-fn stream_edit(
-    text: &str,
-    target: &KdlNode,
-    name: &str,
-    launch: Option<&StreamLaunch>,
-    remove: bool,
-) -> Result<Option<String>, AuthorError> {
-    let streams = target
-        .children()
-        .into_iter()
-        .flat_map(|children| children.nodes())
-        .filter(|child| {
-            child.name().value() == "stream"
-                && child.get(0).and_then(|entry| entry.as_string()) == Some(name)
-        })
-        .collect::<Vec<_>>();
-    if streams.len() > 1 {
-        return Err(AuthorError::new(
-            "duplicate-stream",
-            format!("target declares stream {name:?} more than once"),
-        ));
-    }
-    if remove {
-        return streams
-            .first()
-            .map(|node| remove_field(text, node).map(Some))
-            .unwrap_or(Ok(None));
-    }
-    if let Some(existing) = streams.first() {
-        if parsed_stream_launch(existing)? == launch.cloned() {
-            return Ok(None);
-        }
-        return Err(AuthorError::new(
-            "stream-already-exists",
-            format!(
-                "stream {name:?} already exists with a different launch; remove it before adding a replacement"
-            ),
-        ));
-    }
-    let authored = match launch {
-        None => format!("stream {} {{}}", quoted(name)?),
-        Some(StreamLaunch::Command(command)) => format!(
-            "stream {} {{ command {} }}",
-            quoted(name)?,
-            quoted(command)?
-        ),
-        Some(StreamLaunch::Argv(argv)) => {
-            let values = argv
-                .iter()
-                .map(|value| quoted(value))
-                .collect::<Result<Vec<_>, _>>()?;
-            format!("stream {} {{ argv {} }}", quoted(name)?, values.join(" "))
-        }
-    };
-    insert_node(text, target, &authored).map(Some)
-}
-
-fn parsed_stream_launch(node: &KdlNode) -> Result<Option<StreamLaunch>, AuthorError> {
-    let children = node
-        .children()
-        .into_iter()
-        .flat_map(|children| children.nodes())
-        .collect::<Vec<_>>();
-    match children.as_slice() {
-        [] => Ok(None),
-        [child] if child.name().value() == "command" => child
-            .get(0)
-            .and_then(|entry| entry.as_string())
-            .map(|value| Some(StreamLaunch::Command(value.to_owned())))
-            .ok_or_else(|| {
-                AuthorError::new("malformed-stream", "stream command must contain one string")
-            }),
-        [child] if child.name().value() == "argv" => {
-            let argv = child
-                .entries()
-                .iter()
-                .map(|entry| entry.value().as_string().map(str::to_owned))
-                .collect::<Option<Vec<_>>>()
-                .ok_or_else(|| {
-                    AuthorError::new("malformed-stream", "stream argv values must be strings")
-                })?;
-            Ok(Some(StreamLaunch::Argv(argv)))
-        }
-        _ => Err(AuthorError::new(
-            "malformed-stream",
-            "stream must contain exactly one command or argv node, or be empty",
-        )),
-    }
-}
-
-fn verify_stream_candidate(
-    catalog: &Path,
-    path: &Path,
-    candidate: &str,
-    expected_identity: &str,
-    expected_host: &str,
-    expected_agent: &str,
-    name: &str,
-    launch: Option<&StreamLaunch>,
-    removed: bool,
-) -> Result<(), AuthorError> {
-    let temporary = tempfile::tempdir()
-        .map_err(|error| AuthorError::new("unsafe-source-edit", error.to_string()))?;
-    let relative = path.strip_prefix(catalog).map_err(|_| {
-        AuthorError::new(
-            "unsafe-declaration-path",
-            format!(
-                "declaration {} is outside catalog {}",
-                path.display(),
-                catalog.display()
-            ),
-        )
-    })?;
-    let candidate_path = temporary.path().join(relative);
-    fs::create_dir_all(
-        candidate_path
-            .parent()
-            .expect("candidate declaration has a parent"),
-    )
-    .and_then(|()| fs::write(&candidate_path, candidate))
-    .map_err(|error| {
-        AuthorError::new(
-            "unsafe-source-edit",
-            format!("stage stream validation: {error}"),
-        )
-    })?;
-    let (specs, _) = agent_spec::discover_file(temporary.path(), &candidate_path)
-        .map_err(|error| AuthorError::new("invalid-stream", error.to_string()))?;
-    let spec = specs
-        .iter()
-        .find(|spec| {
-            spec.identity == expected_agent && spec.bus_id(expected_host) == expected_identity
-        })
-        .ok_or_else(|| {
-            AuthorError::new(
-                "unsafe-source-edit",
-                "stream candidate lost the authored agent",
-            )
-        })?;
-    let observed = spec.streams.iter().find(|stream| stream.name == name);
-    if removed && observed.is_none()
-        || !removed && observed.is_some_and(|stream| stream.launch.as_ref() == launch)
-    {
-        Ok(())
-    } else {
-        Err(AuthorError::new(
-            "unsafe-source-edit",
-            "stream candidate did not read back as the authored intent",
-        ))
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn edit_resource_declaration(
-    catalog_lock: &CatalogLock,
-    catalog: &Path,
-    control: &Path,
-    path: &Path,
-    expected_identity: &str,
-    expected_host: &str,
-    expected_agent: &str,
-    intent: ResourceIntent<'_>,
-    before_commit: impl FnOnce(),
-) -> Result<AuthorOutcome, AuthorError> {
-    if path.extension().and_then(|value| value.to_str()) != Some("kdl") {
-        return Err(AuthorError::new(
-            "unsupported-declaration-format",
-            format!(
-                "resource authoring requires canonical KDL, found {}",
-                path.display()
-            ),
-        ));
-    }
-    let metadata = fs::symlink_metadata(path).map_err(|error| {
-        AuthorError::new(
-            "declaration-read-failed",
-            format!("reading declaration {}: {error}", path.display()),
-        )
-    })?;
-    if !metadata.file_type().is_file() {
-        return Err(AuthorError::new(
-            "unsafe-declaration-path",
-            format!("refusing non-regular declaration path {}", path.display()),
-        ));
-    }
-    let original = fs::read(path).map_err(|error| {
-        AuthorError::new(
-            "declaration-read-failed",
-            format!("reading declaration {}: {error}", path.display()),
-        )
-    })?;
-    let original_version = SourceVersion::from_metadata(&metadata);
-    let text = std::str::from_utf8(&original).map_err(|error| {
-        AuthorError::new(
-            "malformed-declaration",
-            format!("declaration {} is not UTF-8: {error}", path.display()),
-        )
-    })?;
-    let document = KdlDocument::parse(text).map_err(|error| {
-        AuthorError::new(
-            "malformed-declaration",
-            format!("parsing declaration {}: {error}", path.display()),
-        )
-    })?;
-    let target = exact_agent_node(&document, expected_identity, expected_host, expected_agent)?;
-    if is_nix_managed(target) {
-        return Err(AuthorError::new(
-            "nix-managed-declaration",
-            format!(
-                "agent {expected_identity:?} is Nix-owned; edit its Nix source instead of {}",
-                path.display()
-            ),
-        ));
-    }
-    let Some((replacement, expectation)) = resource_edit(text, target, intent)? else {
-        return Ok(AuthorOutcome::Unchanged);
-    };
-    verify_resource_candidate(
-        catalog,
-        path,
-        &replacement,
-        expected_identity,
-        expected_host,
-        expected_agent,
-        &expectation,
-    )?;
-    atomic_replace_checked(
-        catalog_lock,
-        catalog,
-        control,
-        path,
-        &original,
-        original_version,
-        replacement.as_bytes(),
-        metadata.permissions().mode() & 0o7777,
-        before_commit,
-    )?;
-    Ok(AuthorOutcome::Changed)
-}
-
-/// Resolve one intent against the declared bindings, preserving every unrelated byte.
-///
-/// `Ok(None)` is the proven no-op: an unchanged upsert, an absent removal, or a self-rename. A
-/// changed upsert rewrites exactly the one binding node in place, so its position, its leading
-/// trivia, and every sibling binding survive.
-fn resource_edit(
-    text: &str,
-    target: &KdlNode,
-    intent: ResourceIntent<'_>,
-) -> Result<Option<(String, ResourceExpectation)>, AuthorError> {
-    let declared = target
-        .children()
-        .into_iter()
-        .flat_map(|children| children.nodes())
-        .filter(|child| child.name().value() == "resource")
-        .collect::<Vec<_>>();
-    let declaring = |name: &str| -> Result<Option<&KdlNode>, AuthorError> {
-        let matches = declared
-            .iter()
-            .copied()
-            .filter(|child| child.get(0).and_then(|entry| entry.as_string()) == Some(name))
-            .collect::<Vec<_>>();
-        if matches.len() > 1 {
-            return Err(AuthorError::new(
-                "duplicate-resource",
-                format!("target declares resource {name:?} more than once"),
-            ));
-        }
-        Ok(matches.first().copied())
-    };
-    match intent {
-        ResourceIntent::Upsert {
-            name,
-            uri,
-            reason,
-            inactive_reason,
-            selector,
-        } => {
-            let authored = declared_resource(name, uri, reason, inactive_reason, selector)?;
-            let replacement = match declaring(name)? {
-                Some(node) if parsed_resource(node)? == authored => return Ok(None),
-                Some(node) => replace_node(text, node, &render_resource(&authored)?)?,
-                None => insert_node(text, target, &render_resource(&authored)?)?,
-            };
-            Ok(Some((
-                replacement,
-                ResourceExpectation {
-                    absent: None,
-                    present: Some(authored),
-                },
-            )))
-        }
-        ResourceIntent::Remove { name } => {
-            let Some(node) = declaring(name)? else {
-                return Ok(None);
-            };
-            Ok(Some((
-                remove_field(text, node)?,
-                ResourceExpectation {
-                    absent: Some(name.to_owned()),
-                    present: None,
-                },
-            )))
-        }
-        ResourceIntent::Rename { old, new } => {
-            let Some(node) = declaring(old)? else {
-                return Err(AuthorError::new(
-                    "resource-not-found",
-                    format!("target declares no resource {old:?}"),
-                ));
-            };
-            if old == new {
-                return Ok(None);
-            }
-            if declaring(new)?.is_some() {
-                return Err(AuthorError::new(
-                    "resource-already-exists",
-                    format!(
-                        "target already declares resource {new:?}; binding names are unique within one agent"
-                    ),
-                ));
-            }
-            let carried = parsed_resource(node)?;
-            let renamed = declared_resource(
-                new,
-                carried.uri(),
-                carried.reason(),
-                carried.inactive_reason(),
-                carried.selector(),
-            )?;
-            Ok(Some((
-                replace_node(text, node, &render_resource(&renamed)?)?,
-                ResourceExpectation {
-                    absent: Some(old.to_owned()),
-                    present: Some(renamed),
-                },
-            )))
-        }
-    }
-}
-
-/// Enforce the canonical binding invariants — `agent_spec` owns them; this mints no new rule.
-fn declared_resource(
-    name: &str,
-    uri: &str,
-    reason: &str,
-    inactive_reason: Option<&str>,
-    selector: Option<&serde_json::Value>,
-) -> Result<Resource, AuthorError> {
-    let resource = match inactive_reason {
-        None => Resource::new(name.to_owned(), uri.to_owned(), reason.to_owned()),
-        Some(inactive_reason) => Resource::new_inactive(
-            name.to_owned(),
-            uri.to_owned(),
-            reason.to_owned(),
-            inactive_reason.to_owned(),
-        ),
-    }
-    .map_err(|error| AuthorError::new("invalid-resource", error))?;
-    Ok(match selector {
-        Some(selector) => resource.with_selector(selector.clone()),
-        None => resource,
-    })
-}
-
-fn parsed_resource(node: &KdlNode) -> Result<Resource, AuthorError> {
-    let malformed =
-        |detail: &str| AuthorError::new("malformed-resource", format!("resource binding {detail}"));
-    if node.children().is_some() {
-        return Err(malformed("cannot have children"));
-    }
-    let mut name = None;
-    let mut uri = None;
-    let mut reason = None;
-    let mut inactive_reason = None;
-    let mut selector = None;
-    for entry in node.entries() {
-        let value = entry
-            .value()
-            .as_string()
-            .ok_or_else(|| malformed("accepts only string values"))?;
-        match entry.name().map(|name| name.value()) {
-            None => {
-                if name.replace(value).is_some() {
-                    return Err(malformed("declares one of its fields more than once"));
-                }
-            }
-            Some("uri") => {
-                if uri.replace(value).is_some() {
-                    return Err(malformed("declares one of its fields more than once"));
-                }
-            }
-            Some("reason") => {
-                if reason.replace(value).is_some() {
-                    return Err(malformed("declares one of its fields more than once"));
-                }
-            }
-            Some("inactive-reason") => {
-                if inactive_reason.replace(value).is_some() {
-                    return Err(malformed("declares one of its fields more than once"));
-                }
-            }
-            Some("selector") => {
-                if selector.is_some() {
-                    return Err(malformed("declares one of its fields more than once"));
-                }
-                selector = Some(serde_json::from_str(value).map_err(|error| {
-                    malformed(&format!("has invalid JSON `selector`: {error}"))
-                })?);
-            }
-            Some(other) => return Err(malformed(&format!("has unsupported property `{other}`"))),
-        }
-    }
-    let (Some(name), Some(uri), Some(reason)) = (name, uri, reason) else {
-        return Err(malformed("needs a name, a `uri`, and a `reason`"));
-    };
-    declared_resource(name, uri, reason, inactive_reason, selector.as_ref())
-}
-
-fn render_resource(resource: &Resource) -> Result<String, AuthorError> {
-    let mut authored = format!(
-        "resource {} uri={} reason={}",
-        quoted(resource.name())?,
-        quoted(resource.uri())?,
-        quoted(resource.reason())?
-    );
-    if let Some(inactive_reason) = resource.inactive_reason() {
-        authored.push_str(&format!(" inactive-reason={}", quoted(inactive_reason)?));
-    }
-    if let Some(selector) = resource.selector() {
-        authored.push_str(" selector=");
-        authored.push_str(&raw_json(selector)?);
-    }
-    Ok(authored)
-}
-
-fn raw_json(value: &serde_json::Value) -> Result<String, AuthorError> {
-    let json = serde_json::to_string(value).map_err(|error| {
-        AuthorError::new(
-            "invalid-resource",
-            format!("serialize Resource selector as canonical JSON: {error}"),
-        )
-    })?;
-    for hashes in 1..=json.len() + 1 {
-        let fence = "#".repeat(hashes);
-        if !json.contains(&format!("\"{fence}")) {
-            return Ok(format!("{fence}\"{json}\"{fence}"));
-        }
-    }
-    unreachable!("a delimiter longer than the JSON payload cannot occur in the payload")
-}
-
-/// Replace exactly one node's source span. A KDL node span carries neither the leading trivia nor
-/// the trailing terminator, so the surrounding line survives untouched.
-fn replace_node(text: &str, node: &KdlNode, authored: &str) -> Result<String, AuthorError> {
-    let span = node.span();
-    let range = span.offset()..span.offset() + span.len();
-    text.get(range.clone()).ok_or_else(|| {
-        AuthorError::new(
-            "malformed-declaration",
-            "resource binding span falls outside the declaration",
-        )
-    })?;
-    // The span can run to the start of trailing trivia, so replacing it verbatim would glue the
-    // rendered node onto a following `// comment`. Leave that separator in the source.
-    let kept = text[range.clone()].trim_end_matches([' ', '\t']).len();
-    let mut replacement = text.to_owned();
-    replacement.replace_range(range.start..range.start + kept, authored);
-    Ok(replacement)
-}
-
-fn verify_resource_candidate(
-    catalog: &Path,
-    path: &Path,
-    candidate: &str,
-    expected_identity: &str,
-    expected_host: &str,
-    expected_agent: &str,
-    expectation: &ResourceExpectation,
-) -> Result<(), AuthorError> {
-    let temporary = tempfile::tempdir()
-        .map_err(|error| AuthorError::new("unsafe-source-edit", error.to_string()))?;
-    let relative = path.strip_prefix(catalog).map_err(|_| {
-        AuthorError::new(
-            "unsafe-declaration-path",
-            format!(
-                "declaration {} is outside catalog {}",
-                path.display(),
-                catalog.display()
-            ),
-        )
-    })?;
-    let candidate_path = temporary.path().join(relative);
-    fs::create_dir_all(
-        candidate_path
-            .parent()
-            .expect("candidate declaration has a parent"),
-    )
-    .and_then(|()| fs::write(&candidate_path, candidate))
-    .map_err(|error| {
-        AuthorError::new(
-            "unsafe-source-edit",
-            format!("stage resource validation: {error}"),
-        )
-    })?;
-    let (specs, _) = agent_spec::discover_file(temporary.path(), &candidate_path)
-        .map_err(|error| AuthorError::new("invalid-resource", error.to_string()))?;
-    let spec = specs
-        .iter()
-        .find(|spec| {
-            spec.identity == expected_agent && spec.bus_id(expected_host) == expected_identity
-        })
-        .ok_or_else(|| {
-            AuthorError::new(
-                "unsafe-source-edit",
-                "resource candidate lost the authored agent",
-            )
-        })?;
-    let declares = |name: &str| {
-        spec.resources
-            .iter()
-            .find(|resource| resource.name() == name)
-    };
-    if expectation
-        .absent
-        .as_deref()
-        .is_some_and(|name| declares(name).is_some())
-        || expectation
-            .present
-            .as_ref()
-            .is_some_and(|expected| declares(expected.name()) != Some(expected))
-    {
-        return Err(AuthorError::new(
-            "unsafe-source-edit",
-            "resource candidate did not read back as the authored intent",
-        ));
-    }
-    Ok(())
-}
-
-fn edit_declaration(
-    catalog_lock: &CatalogLock,
-    catalog: &Path,
-    control: &Path,
-    path: &Path,
-    expected_identity: &str,
-    expected_host: &str,
-    expected_agent: &str,
-    field: PresentationField,
-    requested: Option<&str>,
-    before_commit: impl FnOnce(),
-) -> Result<AuthorOutcome, AuthorError> {
-    if path.extension().and_then(|value| value.to_str()) != Some("kdl") {
-        return Err(AuthorError::new(
-            "unsupported-declaration-format",
-            format!(
-                "presentation authoring requires canonical KDL, found {}",
-                path.display()
-            ),
-        ));
-    }
-    let metadata = fs::symlink_metadata(path).map_err(|error| {
-        AuthorError::new(
-            "declaration-read-failed",
-            format!("reading declaration {}: {error}", path.display()),
-        )
-    })?;
-    if !metadata.file_type().is_file() {
-        return Err(AuthorError::new(
-            "unsafe-declaration-path",
-            format!("refusing non-regular declaration path {}", path.display()),
-        ));
-    }
-    let original = fs::read(path).map_err(|error| {
-        AuthorError::new(
-            "declaration-read-failed",
-            format!("reading declaration {}: {error}", path.display()),
-        )
-    })?;
-    let original_version = SourceVersion::from_metadata(&metadata);
-    let text = std::str::from_utf8(&original).map_err(|error| {
-        AuthorError::new(
-            "malformed-declaration",
-            format!("declaration {} is not UTF-8: {error}", path.display()),
-        )
-    })?;
-    let document = KdlDocument::parse(text).map_err(|error| {
-        AuthorError::new(
-            "malformed-declaration",
-            format!("parsing declaration {}: {error}", path.display()),
-        )
-    })?;
-    let target = exact_agent_node(&document, expected_identity, expected_host, expected_agent)?;
-    if is_nix_managed(target) {
-        return Err(AuthorError::new(
-            "nix-managed-declaration",
-            format!(
-                "agent {expected_identity:?} is Nix-owned; edit its Nix source instead of {}",
-                path.display()
-            ),
-        ));
-    }
-    let Some(replacement) = presentation_edit(text, target, field, requested)? else {
-        return Ok(AuthorOutcome::Unchanged);
-    };
-    verify_candidate(
-        &replacement,
-        expected_identity,
-        expected_host,
-        expected_agent,
-        field,
-        requested,
-    )?;
-    atomic_replace_checked(
-        catalog_lock,
-        catalog,
-        control,
-        path,
-        &original,
-        original_version,
-        replacement.as_bytes(),
-        metadata.permissions().mode() & 0o7777,
-        before_commit,
-    )?;
-    Ok(AuthorOutcome::Changed)
-}
-
-#[allow(clippy::too_many_arguments)]
-fn edit_desired_state_declaration(
-    catalog_lock: &CatalogLock,
-    catalog: &Path,
-    control: &Path,
-    path: &Path,
-    expected_identity: &str,
-    expected_host: &str,
-    expected_agent: &str,
-    state: DesiredStateValue,
-    reason: Option<&str>,
-    before_commit: impl FnOnce(),
-) -> Result<AuthorOutcome, AuthorError> {
-    if path.extension().and_then(|value| value.to_str()) != Some("kdl") {
-        return Err(AuthorError::new(
-            "unsupported-declaration-format",
-            format!(
-                "desired-state authoring requires canonical KDL, found {}",
-                path.display()
-            ),
-        ));
-    }
-    let metadata = fs::symlink_metadata(path).map_err(|error| {
-        AuthorError::new(
-            "declaration-read-failed",
-            format!("reading declaration {}: {error}", path.display()),
-        )
-    })?;
-    if !metadata.file_type().is_file() {
-        return Err(AuthorError::new(
-            "unsafe-declaration-path",
-            format!("refusing non-regular declaration path {}", path.display()),
-        ));
-    }
-    let original = fs::read(path).map_err(|error| {
-        AuthorError::new(
-            "declaration-read-failed",
-            format!("reading declaration {}: {error}", path.display()),
-        )
-    })?;
-    let original_version = SourceVersion::from_metadata(&metadata);
-    let text = std::str::from_utf8(&original).map_err(|error| {
-        AuthorError::new(
-            "malformed-declaration",
-            format!("declaration {} is not UTF-8: {error}", path.display()),
-        )
-    })?;
-    let document = KdlDocument::parse(text).map_err(|error| {
-        AuthorError::new(
-            "malformed-declaration",
-            format!("parsing declaration {}: {error}", path.display()),
-        )
-    })?;
-    let target = exact_agent_node(&document, expected_identity, expected_host, expected_agent)?;
-    if is_nix_managed(target) {
-        return Err(AuthorError::new(
-            "nix-managed-declaration",
-            format!(
-                "agent {expected_identity:?} is Nix-owned; edit its Nix source instead of {}",
-                path.display()
-            ),
-        ));
-    }
-    let Some(replacement) = desired_state_edit(text, target, state, reason)? else {
-        return Ok(AuthorOutcome::Unchanged);
-    };
-    verify_desired_state_candidate(
-        &replacement,
-        expected_identity,
-        expected_host,
-        expected_agent,
-        state,
-        reason,
-    )?;
-    atomic_replace_checked(
-        catalog_lock,
-        catalog,
-        control,
-        path,
-        &original,
-        original_version,
-        replacement.as_bytes(),
-        metadata.permissions().mode() & 0o7777,
-        before_commit,
-    )?;
-    Ok(AuthorOutcome::Changed)
-}
-
-fn desired_state_edit(
-    text: &str,
-    target: &KdlNode,
-    state: DesiredStateValue,
-    reason: Option<&str>,
-) -> Result<Option<String>, AuthorError> {
-    let lifecycle = target
-        .children()
-        .into_iter()
-        .flat_map(|children| children.nodes())
-        .filter(|child| matches!(child.name().value(), "desired-state" | "retired"))
-        .collect::<Vec<_>>();
-    if lifecycle.len() > 1 {
-        return Err(AuthorError::new(
-            "duplicate-lifecycle-field",
-            "target declares more than one lifecycle field",
-        ));
-    }
-    if state == DesiredStateValue::Running {
-        return lifecycle
-            .first()
-            .map(|node| remove_field(text, node).map(Some))
-            .unwrap_or(Ok(None));
-    }
-    let authored = format!(
-        "desired-state {} reason={}",
-        quoted(state.as_str())?,
-        quoted(reason.expect("validated by set_desired_state"))?
-    );
-    match lifecycle.as_slice() {
-        [] => insert_node(text, target, &authored).map(Some),
-        [node] => {
-            let span = node.span();
-            let range = span.offset()..span.offset() + span.len();
-            if text.get(range.clone()) == Some(authored.as_str()) {
-                return Ok(None);
-            }
-            let mut replacement = text.to_owned();
-            replacement.replace_range(range, &authored);
-            Ok(Some(replacement))
-        }
-        _ => unreachable!(),
-    }
-}
-
-fn verify_desired_state_candidate(
-    candidate: &str,
-    expected_identity: &str,
-    expected_host: &str,
-    expected_agent: &str,
-    state: DesiredStateValue,
-    reason: Option<&str>,
-) -> Result<(), AuthorError> {
-    let document = KdlDocument::parse(candidate).map_err(|error| {
-        AuthorError::new(
-            "unsafe-source-edit",
-            format!("desired-state edit did not produce valid KDL: {error}"),
-        )
-    })?;
-    let target = exact_agent_node(&document, expected_identity, expected_host, expected_agent)?;
-    let lifecycle = target
-        .children()
-        .into_iter()
-        .flat_map(|children| children.nodes())
-        .filter(|child| matches!(child.name().value(), "desired-state" | "retired"))
-        .collect::<Vec<_>>();
-    if state == DesiredStateValue::Running {
-        if lifecycle.is_empty() {
-            return Ok(());
-        }
-    } else if let [node] = lifecycle.as_slice()
-        && node.name().value() == "desired-state"
-        && node.get(0).and_then(|entry| entry.as_string()) == Some(state.as_str())
-        && node.get("reason").and_then(|entry| entry.as_string()) == reason
-    {
-        return Ok(());
-    }
-    Err(AuthorError::new(
-        "unsafe-source-edit",
-        "desired-state candidate did not read back as the authored intent",
-    ))
-}
 
 fn exact_agent_node<'a>(
     document: &'a KdlDocument,
@@ -1793,67 +344,6 @@ fn agent_identity_parts(node: &KdlNode) -> (Option<String>, Option<String>) {
     (host, identity)
 }
 
-fn is_nix_managed(node: &KdlNode) -> bool {
-    node.children().is_some_and(|children| {
-        children
-            .nodes()
-            .iter()
-            .filter(|child| child.name().value() == "meta")
-            .filter_map(KdlNode::children)
-            .flat_map(|meta| meta.nodes())
-            .filter(|child| child.name().value() == "managed-by")
-            .any(|child| child.get(0).and_then(|value| value.as_string()) == Some("nix"))
-    })
-}
-
-fn presentation_edit(
-    text: &str,
-    target: &KdlNode,
-    field: PresentationField,
-    requested: Option<&str>,
-) -> Result<Option<String>, AuthorError> {
-    let fields = target
-        .children()
-        .into_iter()
-        .flat_map(|children| children.nodes())
-        .filter(|child| child.name().value() == field.as_str())
-        .collect::<Vec<_>>();
-    match fields.as_slice() {
-        [] => match requested {
-            Some(value) => insert_field(text, target, field, value).map(Some),
-            None => Ok(None),
-        },
-        [node] => match requested {
-            Some(value) => replace_field(text, node, field, value),
-            None => remove_field(text, node).map(Some),
-        },
-        _ => Err(AuthorError::new(
-            "duplicate-presentation-field",
-            format!("target declares `{}` more than once", field.as_str()),
-        )),
-    }
-}
-
-fn parse_field_value(node: &KdlNode, field: PresentationField) -> Result<&str, AuthorError> {
-    if node.children().is_some() || node.entries().len() != 1 || node.entries()[0].name().is_some()
-    {
-        return Err(AuthorError::new(
-            "malformed-presentation-field",
-            format!(
-                "`{}` must contain exactly one positional string",
-                field.as_str()
-            ),
-        ));
-    }
-    node.get(0)
-        .and_then(|value| value.as_string())
-        .ok_or_else(|| {
-            AuthorError::new(
-                "malformed-presentation-field",
-                format!("`{}` must contain a string", field.as_str()),
-            )
-        })
-}
 
 fn quoted(value: &str) -> Result<String, AuthorError> {
     serde_json::to_string(value).map_err(|error| {
@@ -1864,41 +354,6 @@ fn quoted(value: &str) -> Result<String, AuthorError> {
     })
 }
 
-fn replace_field(
-    text: &str,
-    node: &KdlNode,
-    field: PresentationField,
-    value: &str,
-) -> Result<Option<String>, AuthorError> {
-    if parse_field_value(node, field)? == value {
-        return Ok(None);
-    }
-    let entry = &node.entries()[0];
-    let span = entry.span();
-    let range = span.offset()..span.offset() + span.len();
-    text.get(range.clone()).ok_or_else(|| {
-        AuthorError::new(
-            "malformed-declaration",
-            "presentation value span falls outside the declaration",
-        )
-    })?;
-    let mut replacement = text.to_owned();
-    replacement.replace_range(range, &quoted(value)?);
-    Ok(Some(replacement))
-}
-
-fn insert_field(
-    text: &str,
-    target: &KdlNode,
-    field: PresentationField,
-    value: &str,
-) -> Result<String, AuthorError> {
-    insert_node(
-        text,
-        target,
-        &format!("{} {}", field.as_str(), quoted(value)?),
-    )
-}
 
 fn insert_node(text: &str, target: &KdlNode, authored: &str) -> Result<String, AuthorError> {
     let span = target.span();
@@ -2048,51 +503,6 @@ fn line_indent(text: &str, offset: usize) -> Option<String> {
         .then(|| indent.to_owned())
 }
 
-fn verify_candidate(
-    candidate: &str,
-    expected_identity: &str,
-    expected_host: &str,
-    expected_agent: &str,
-    field: PresentationField,
-    expected: Option<&str>,
-) -> Result<(), AuthorError> {
-    let document = KdlDocument::parse(candidate).map_err(|error| {
-        AuthorError::new(
-            "unsafe-source-edit",
-            format!("presentation edit did not produce valid KDL: {error}"),
-        )
-    })?;
-    let target = exact_agent_node(&document, expected_identity, expected_host, expected_agent)?;
-    let fields = target
-        .children()
-        .into_iter()
-        .flat_map(|children| children.nodes())
-        .filter(|child| child.name().value() == field.as_str())
-        .collect::<Vec<_>>();
-    let observed = match fields.as_slice() {
-        [] => None,
-        [node] => Some(parse_field_value(node, field)?),
-        _ => {
-            return Err(AuthorError::new(
-                "unsafe-source-edit",
-                format!(
-                    "presentation edit produced duplicate `{}` fields",
-                    field.as_str()
-                ),
-            ));
-        }
-    };
-    if observed != expected {
-        return Err(AuthorError::new(
-            "unsafe-source-edit",
-            format!(
-                "presentation edit did not produce the requested `{}`",
-                field.as_str()
-            ),
-        ));
-    }
-    Ok(())
-}
 
 fn atomic_replace_checked(
     catalog_lock: &CatalogLock,
@@ -2495,6 +905,138 @@ mod tests {
         );
     }
 
+    /// #473: a generator-owned declaration refuses ordinary authoring because the generator is the
+    /// writer of those bytes — but the generator has exactly one transition it cannot express in
+    /// its own source, since the source change being projected is the seat's removal. The
+    /// assertion is the authority, and only an exact marker match is one.
+    #[test]
+    fn marker_matched_lifecycle_authority_is_exact_and_source_preserving() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path();
+        write(
+            root,
+            "h/root/agent.kdl",
+            &declaration("root", "h", None, "catalog"),
+        );
+        let projected = write(
+            root,
+            "h/nix/agent.kdl",
+            &declaration("nix", "h", Some("root"), "nix"),
+        );
+        let plain = "agent \"plain\" {\n  host \"h\"\n  supervisor \"root\"\n  command \"sleep 60\"\n}\n";
+        let unmarked = write(root, "h/plain/agent.kdl", plain);
+        let original = fs::read_to_string(&projected).unwrap();
+        let retire = |marker: Option<&str>, selector: &str| {
+            set_desired_state(
+                root,
+                selector,
+                "h",
+                None,
+                DesiredStateValue::Retired,
+                Some("nix: no longer declared"),
+                marker,
+            )
+        };
+
+        // Unasserted authoring still refuses, and now names the assertion that would carry it.
+        let refused = retire(None, "h.nix").unwrap_err();
+        assert_eq!(refused.code(), "nix-managed-declaration");
+        assert!(
+            refused.to_string().contains("--managed-by \"nix\""),
+            "{refused}"
+        );
+
+        // Every inexact assertion fails closed: wrong marker, unmarked subject, unusable marker.
+        assert_eq!(
+            retire(Some("catalog"), "h.nix").unwrap_err().code(),
+            "managed-by-mismatch"
+        );
+        assert_eq!(
+            retire(Some("nix"), "h.root").unwrap_err().code(),
+            "managed-by-mismatch"
+        );
+        assert_eq!(
+            retire(Some("nix"), "h.plain").unwrap_err().code(),
+            "managed-by-unmarked"
+        );
+        assert_eq!(
+            retire(Some(""), "h.nix").unwrap_err().code(),
+            "invalid-managed-by"
+        );
+        assert_eq!(fs::read_to_string(&projected).unwrap(), original);
+
+        // The matched assertion authors exactly the lifecycle line and nothing else.
+        let receipt = retire(Some("nix"), "h.nix").unwrap();
+        assert_eq!(receipt.result, AuthorOutcome::Changed);
+        assert_eq!(receipt.managed_by.as_deref(), Some("nix"));
+        let authored = fs::read_to_string(&projected).unwrap();
+        assert_eq!(
+            authored.replace(
+                "  desired-state \"retired\" reason=\"nix: no longer declared\"\n",
+                ""
+            ),
+            original,
+            "only the lifecycle line may differ"
+        );
+        assert_eq!(
+            retire(Some("nix"), "h.nix").unwrap().result,
+            AuthorOutcome::Unchanged
+        );
+
+        // The same authority reverses it, restoring the projected bytes exactly.
+        assert_eq!(
+            set_desired_state(
+                root,
+                "h.nix",
+                "h",
+                None,
+                DesiredStateValue::Running,
+                None,
+                Some("nix"),
+            )
+            .unwrap()
+            .result,
+            AuthorOutcome::Changed
+        );
+        assert_eq!(fs::read_to_string(&projected).unwrap(), original);
+        assert_eq!(fs::read_to_string(&unmarked).unwrap(), plain);
+    }
+
+    /// The marker-matched arm stands in for the CAS `agent publish` the projection would otherwise
+    /// run, so it refuses what that publication refuses: a retirement leaving an active agent
+    /// descended from a tombstone root is rejected by admission before any byte is written.
+    #[test]
+    fn marker_matched_retirement_refuses_a_candidate_admission_would_reject() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path();
+        let projected = write(
+            root,
+            "h/root/agent.kdl",
+            &declaration("root", "h", None, "nix"),
+        );
+        write(
+            root,
+            "h/worker/agent.kdl",
+            &declaration("worker", "h", Some("root"), "catalog"),
+        );
+        let original = fs::read_to_string(&projected).unwrap();
+
+        let error = set_desired_state(
+            root,
+            "h.root",
+            "h",
+            None,
+            DesiredStateValue::Retired,
+            Some("nix: no longer declared"),
+            Some("nix"),
+        )
+        .unwrap_err();
+
+        assert_eq!(error.code(), "candidate-not-admissible");
+        assert!(error.to_string().contains("[retired-root]"), "{error}");
+        assert_eq!(fs::read_to_string(&projected).unwrap(), original);
+    }
+
     #[test]
     fn stream_add_supports_external_command_and_argv_and_external_remove_is_idempotent() {
         let temporary = tempfile::tempdir().unwrap();
@@ -2721,7 +1263,7 @@ mod tests {
             &declaration("worker", "h", None, "catalog"),
         );
 
-        let added = add_resource(
+        let added = add_resource_with_selector(
             root,
             "h.worker",
             "h",
@@ -2730,13 +1272,14 @@ mod tests {
             "github-issue://example/project/123",
             "release work item",
             None,
+            None,
         )
         .unwrap();
         assert_eq!(added.result, AuthorOutcome::Changed);
         assert_eq!(added.identity, "h.worker");
         assert_eq!(added.inactive_reason, None);
 
-        add_resource(
+        add_resource_with_selector(
             root,
             "h.worker",
             "h",
@@ -2745,13 +1288,14 @@ mod tests {
             "worktree://github.com/example/project/change",
             "primary checkout",
             None,
+            None,
         )
         .unwrap();
         let two_bindings = fs::read_to_string(&path).unwrap();
 
         // An identical request proves the binding rather than rewriting the declaration.
         assert_eq!(
-            add_resource(
+            add_resource_with_selector(
                 root,
                 "h.worker",
                 "h",
@@ -2759,6 +1303,7 @@ mod tests {
                 "work",
                 "github-issue://example/project/123",
                 "release work item",
+                None,
                 None,
             )
             .unwrap()
@@ -2769,7 +1314,7 @@ mod tests {
 
         // Re-declaring an existing name updates it in place, keeping its position and siblings.
         assert_eq!(
-            add_resource(
+            add_resource_with_selector(
                 root,
                 "h.worker",
                 "h",
@@ -2778,6 +1323,7 @@ mod tests {
                 "github-issue://example/project/456",
                 "follow-up work item",
                 Some("superseded by the follow-up"),
+                None,
             )
             .unwrap()
             .result,
@@ -2803,7 +1349,7 @@ mod tests {
 
         // The request declares the complete binding, so an omitted inactive-reason clears it.
         assert_eq!(
-            add_resource(
+            add_resource_with_selector(
                 root,
                 "h.worker",
                 "h",
@@ -2811,6 +1357,7 @@ mod tests {
                 "work",
                 "github-issue://example/project/456",
                 "follow-up work item",
+                None,
                 None,
             )
             .unwrap()
@@ -2837,7 +1384,7 @@ mod tests {
 
         // Hand-authored property order and spacing are proven, not re-rendered.
         assert_eq!(
-            add_resource(
+            add_resource_with_selector(
                 root,
                 "h.worker",
                 "h",
@@ -2845,6 +1392,7 @@ mod tests {
                 "work",
                 "github-issue://example/project/123",
                 "release work item",
+                None,
                 None,
             )
             .unwrap()
@@ -2863,7 +1411,7 @@ mod tests {
             "h/worker/agent.kdl",
             &declaration("worker", "h", None, "catalog"),
         );
-        add_resource(
+        add_resource_with_selector(
             root,
             "h.worker",
             "h",
@@ -2872,9 +1420,10 @@ mod tests {
             "github-issue://example/project/123",
             "release work item",
             None,
+            None,
         )
         .unwrap();
-        add_resource(
+        add_resource_with_selector(
             root,
             "h.worker",
             "h",
@@ -2882,6 +1431,7 @@ mod tests {
             "source",
             "worktree://github.com/example/project/change",
             "primary checkout",
+            None,
             None,
         )
         .unwrap();
@@ -2919,7 +1469,7 @@ mod tests {
             "h/worker/agent.kdl",
             &declaration("worker", "h", None, "catalog"),
         );
-        add_resource(
+        add_resource_with_selector(
             root,
             "h.worker",
             "h",
@@ -2928,9 +1478,10 @@ mod tests {
             "github-issue://example/project/123",
             "release work item",
             Some("merged and retained for traceability"),
+            None,
         )
         .unwrap();
-        add_resource(
+        add_resource_with_selector(
             root,
             "h.worker",
             "h",
@@ -2938,6 +1489,7 @@ mod tests {
             "source",
             "worktree://github.com/example/project/change",
             "primary checkout",
+            None,
             None,
         )
         .unwrap();
@@ -3019,7 +1571,7 @@ mod tests {
         );
         let untouched = fs::read_to_string(&nix_owned).unwrap();
 
-        add_resource(
+        add_resource_with_selector(
             root,
             "h.child",
             "h",
@@ -3028,11 +1580,12 @@ mod tests {
             "github-issue://example/project/1",
             "supervised work item",
             None,
+            None,
         )
         .unwrap();
 
         assert_eq!(
-            add_resource(
+            add_resource_with_selector(
                 root,
                 "h.sibling",
                 "h",
@@ -3040,6 +1593,7 @@ mod tests {
                 "work",
                 "github-issue://example/project/1",
                 "reaching across the fleet",
+                None,
                 None,
             )
             .unwrap_err()
@@ -3053,7 +1607,7 @@ mod tests {
             "resource-not-authorized"
         );
         assert_eq!(
-            add_resource(
+            add_resource_with_selector(
                 root,
                 "h.nix",
                 "h",
@@ -3061,6 +1615,7 @@ mod tests {
                 "work",
                 "github-issue://example/project/1",
                 "Nix owns this declaration",
+                None,
                 None,
             )
             .unwrap_err()
@@ -3083,7 +1638,7 @@ mod tests {
                 Some(""),
             ),
         ] {
-            let error = add_resource(
+            let error = add_resource_with_selector(
                 root,
                 "h.child",
                 "h",
@@ -3092,6 +1647,7 @@ mod tests {
                 uri,
                 reason,
                 inactive_reason,
+                None,
             )
             .unwrap_err();
             assert_eq!(error.code(), "invalid-resource", "{name}: {error}");
@@ -3105,7 +1661,7 @@ mod tests {
         );
 
         // #345 widened the envelope: a catalog-relative carrier path is a valid binding uri.
-        add_resource(
+        add_resource_with_selector(
             root,
             "h.child",
             "h",
@@ -3113,6 +1669,7 @@ mod tests {
             "carrier",
             "carriers/goal.md",
             "Catalog-relative carrier.",
+            None,
             None,
         )
         .expect("a catalog-relative carrier path is admitted");
@@ -3130,7 +1687,7 @@ mod tests {
         );
         let exact = "vendor+Thing://Authority.Example/Exact%20Identity?Query=A%2Fb#Frag%20Ment";
 
-        add_resource(
+        add_resource_with_selector(
             root,
             "h.worker",
             "h",
@@ -3138,6 +1695,7 @@ mod tests {
             "subject",
             exact,
             "exact vendor identity",
+            None,
             None,
         )
         .unwrap();
@@ -3149,7 +1707,7 @@ mod tests {
 
         // A byte-identical re-declaration is a proven no-op, not a rewrite.
         assert_eq!(
-            add_resource(
+            add_resource_with_selector(
                 root,
                 "h.worker",
                 "h",
@@ -3158,10 +1716,63 @@ mod tests {
                 exact,
                 "exact vendor identity",
                 None,
+                None,
             )
             .unwrap()
             .result,
             AuthorOutcome::Unchanged
         );
+    }
+
+    /// Direct ID mutation is the one thing no span-bounded field edit may do. `id` is what makes
+    /// a subject the same subject across an address, name, description, host, or graph change, so
+    /// the read-back gate compares it rather than trusting the edit that produced the candidate.
+    #[test]
+    fn no_field_edit_may_rewrite_the_immutable_agent_id() {
+        let tampered =
+            "agent \"worker\" { id \"b\"; host \"h\"; command \"true\"; name \"Owner\" }\n";
+        let error = verify_candidate(
+            tampered,
+            "h.worker",
+            "h",
+            "worker",
+            DeclaredField::Presentation(PresentationField::Name),
+            Some("Owner"),
+            Some("a"),
+        )
+        .unwrap_err();
+        assert_eq!(error.code(), "agent-id-immutable");
+
+        // Dropping the ID entirely is the same refusal: an unmigrated declaration is not a place
+        // to park a subject whose ID the catalog already froze.
+        let dropped = "agent \"worker\" { host \"h\"; command \"true\"; address \"ops\" }\n";
+        assert_eq!(
+            verify_candidate(
+                dropped,
+                "h.worker",
+                "h",
+                "worker",
+                DeclaredField::Address,
+                Some("ops"),
+                Some("a"),
+            )
+            .unwrap_err()
+            .code(),
+            "agent-id-immutable"
+        );
+
+        // The identical edit with the ID carried through is admitted.
+        let honest =
+            "agent \"worker\" { id \"a\"; host \"h\"; command \"true\"; address \"ops\" }\n";
+        verify_candidate(
+            honest,
+            "h.worker",
+            "h",
+            "worker",
+            DeclaredField::Address,
+            Some("ops"),
+            Some("a"),
+        )
+        .unwrap();
     }
 }

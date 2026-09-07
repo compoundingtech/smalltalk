@@ -157,7 +157,12 @@ The st2 transaction performs these steps in order:
    external lock service, or shared receipt is involved.
 3. Re-read the current target under the lock and require the caller's exact
    absent-or-SHA-256 precondition. Require the staged digest to equal the
-   caller's input digest.
+   caller's input digest. When that incumbent carries an ownership marker and
+   the candidate would replace its bytes, require the caller to assert exactly
+   that marker with `--managed-by`: an unasserted replacement refuses for the
+   Nix marker, and a mismatched, unmarked, unresolvable, or malformed assertion
+   always refuses — here, before any write. Creation and a byte-identical
+   republication replace no owned bytes and need no assertion.
 4. Overlay the staged candidate on the locked catalog snapshot and run shared
    parsing, core admission, and st2 catalog policy over that exact projection.
 5. Publish by an atomic, durable file or bundle transition. Preserve exact
@@ -185,7 +190,7 @@ core publication and do not claim managed admission.
 
 ## Field rules
 
-<h3 id="f01">F01 Source form or path</h3>
+### F01 Source form or path
 
 Formatting, comments, order, and a source path change are `no-op` only when all
 normalized fields, render plans, task IDs, fallback `cwd`, exact resolved paths,
@@ -197,17 +202,48 @@ Authoring: [pinned discovery, identity, and host][evals-discovery]. st2 source:
 [KDL parser](../../../crates/agent-spec/src/kdl_format.rs). Evidence:
 [discovery](../../../crates/agent-spec/src/discovery.rs).
 
-<h3 id="f02">F02 <code>identity</code></h3>
+### F02 Agent `id` and legacy `identity`
 
-Retire the old identity and add the new identity. Do not infer a rename. Prove
-exact old ownership before a conflicting add. Report both actions, or refuse
-when proof is missing.
+The target `id` field is the immutable catalog-global agent ID. IDs are unique
+across live and structurally archived subjects, across hosts and desired states.
+Subject-creation tools generate UUIDv7. Before ID-aware routing activates,
+migration assigns every live legacy declaration its existing
+`<resolved-host>.<identity>` bus identity as an explicit ID without moving
+runtime or declaration-anchored state. An archived declaration receives those
+same bytes when unused in the combined subject set; a collision receives UUIDv7
+in its declaration and tombstone. Migration also records each reassigned legacy
+bus identity with the subject that kept it and the archived subject's new ID so
+readers of legacy records never retype colliding bytes into the wrong subject.
+Supervisor resolution uses the combined
+pre-migration live-and-archived subject index. In the same catalog transition,
+every reference is rewritten to the parent's migrated ID. A missing or ambiguous
+reference refuses before writes with `legacy-supervisor-unresolved`; the
+operator must unarchive and repair that declaration through the pre-activation
+legacy authoring path, then retry. Unarchive preserves and validates the
+migrated ID and refuses an unmigrated archive after activation. A frozen legacy
+ID remains unchanged after host moves.
 
-Authoring: [pinned discovery and identity][evals-discovery]. st2 source:
-[`AgentSpec::identity`](../../../crates/agent-spec/src/spec.rs). Evidence:
+Agent-declaration membership is keyed by ID. Adding a generated ID creates a
+new subject. Reintroducing an earlier ID denotes the same subject and may adopt
+only state proved to belong to that ID; it never denotes a replacement.
+Removing a declaration plans teardown for that exact subject. A candidate that
+changes `id` at one declaration source refuses rather than inferring rename,
+replacement, or state migration. Positional `identity` remains the declaration
+key and address fallback; it is not immutable subject identity.
+
+Authoring: future canonical `id` plus the pinned legacy
+[discovery and identity contract][evals-discovery]. st2 source:
+[`AgentSpec::{id, address, effective_id, effective_address}`](../../../crates/agent-spec/src/spec.rs),
+[selection and reference resolution](../../../src/identity.rs),
+[address authoring](../../../src/agent_author.rs). Evidence:
+[address proof](../../../tests/agent_address.rs),
 [reconciliation](../../../src/reconcile.rs).
+`id` is optional in the shipped grammar, required in the target one, and no
+writer emits it yet; positional `identity` is still the durable key. That gap is
+fenced by
+[DELTA-003](../.delta/DELTA-003-agent-address-not-implemented.md).
 
-<h3 id="f03">F03 <code>host</code></h3>
+### F03 `host`
 
 Each supervisor evaluates only local membership. A complete present-to-absent
 change removes locally; absent-to-present adds locally. This is not migration,
@@ -218,7 +254,7 @@ Authoring: [pinned discovery and host][evals-discovery]. st2 source:
 [`AgentSpec::host`](../../../crates/agent-spec/src/spec.rs). Evidence:
 [host filtering](../../../src/reconcile.rs).
 
-<h3 id="f04">F04 <code>type</code></h3>
+### F04 `type`
 
 An omitted value and `service` have the same effect. Any other value refuses
 changes to the related agent, tasks, and files before launch, write, or teardown.
@@ -227,7 +263,7 @@ Authoring: [pinned complete declaration][evals-fields]. st2 source:
 [`JobType` and `RawSpec::job_type`](../../../crates/agent-spec/src/spec.rs).
 Evidence: [validation](../../../src/validate.rs).
 
-<h3 id="f05">F05 <code>role</code></h3>
+### F05 `role`
 
 Update observable declaration metadata only. Do not change the fingerprint,
 workspace files, notification state, or a healthy task.
@@ -236,7 +272,7 @@ Authoring: [pinned complete declaration][evals-fields]. st2 source:
 [`AgentSpec::role`](../../../crates/agent-spec/src/spec.rs). Evidence:
 [KDL lowering](../../../crates/agent-spec/src/kdl_format.rs).
 
-<h3 id="f06">F06 <code>workspace</code></h3>
+### F06 `workspace`
 
 For a healthy survivor, keep the process and commit the new live context. After
 commit, write one durable event with the old and new paths, then try
@@ -250,7 +286,7 @@ Authoring: [pinned complete declaration][evals-fields]. st2 source:
 [`AgentSpec::workspace`](../../../crates/agent-spec/src/spec.rs). Evidence:
 [`cwd` resolution](../../../src/run.rs).
 
-<h3 id="f07">F07 Resource <code>name</code> or <code>uri</code></h3>
+### F07 Resource `name` or `uri`
 
 Update Resource data without changing the launch fingerprint. Notify a
 survivor once after commit. New or replaced work reads the latest state at boot
@@ -261,7 +297,7 @@ st2 `9887b28` predate Resource bindings. Current st2 source:
 [`Resource`](../../../crates/agent-spec/src/spec.rs). Evidence:
 [declared Resource projection](../../../src/agents.rs).
 
-<h3 id="f08">F08 <code>render {}</code> operation, template, or resolved target</h3>
+### F08 `render {}` operation, template, or resolved target
 
 Prove ownership for every affected local owner before writing. Conflicts refuse
 all affected owners. Write changed bytes and enforce the declared mode. The
@@ -276,7 +312,7 @@ declaration.
 Authoring: [pinned render contract][evals-render]. st2 implementation and
 evidence: [materializer](../../../src/materialize.rs).
 
-<h3 id="f09">F09 Task set: <code>pty</code>, <code>exec</code>, or compact <code>ding</code></h3>
+### F09 Task set: `pty`, `exec`, or compact `ding`
 
 Add only the unique missing child. Remove and clean only an old child with exact
 ownership proof. A compact DING is a derived child: it starts only after its
@@ -288,17 +324,17 @@ change unrelated siblings.
 
 Before compact tasks are compiled, st2 captures its current absolute executable
 once. A generated DING lowers to direct argv using that executable, the agent's
-bus identity, and its effective absolute bus root. The executable and root are
-separate arguments; neither shell parsing nor later `PATH` changes can select a
-different target. A missing captured executable aborts compilation before task
-execution. Authored command and exec source remains unchanged, including source
-that happens to invoke `st2 ding`.
+immutable ID through an exact-ID selector, and its effective absolute bus root.
+The executable and root are separate arguments; neither shell parsing nor later
+`PATH` changes can select a different target. A missing captured executable
+aborts compilation before task execution. Authored command and exec source
+remain unchanged, including source that happens to invoke `st2 ding`.
 
 Authoring: [pinned compact and explicit tasks][evals-tasks]. st2 source:
 [`Task` and `TaskKind`](../../../crates/agent-spec/src/spec.rs). Evidence:
 [task reconciliation](../../../src/reconcile.rs).
 
-<h3 id="f10">F10 Task <code>name</code> or explicit <code>id</code></h3>
+### F10 Task `name` or explicit `id`
 
 Remove the exact old ID and add the new ID. Do not infer one incarnation.
 Report both actions, or `hold` or `refuse` when ownership proof is missing.
@@ -307,7 +343,7 @@ Authoring: [pinned explicit tasks][evals-tasks]. st2 source:
 [`Task::name` and `Task::id`](../../../crates/agent-spec/src/spec.rs). Evidence:
 [task reconciliation](../../../src/reconcile.rs).
 
-<h3 id="f11">F11 Spawn inputs</h3>
+### F11 Spawn inputs
 
 Task `kind`, `command`, `argv`, explicit `cwd`, and task `env`, plus agent
 `env`, `tags`, `supervisor`, and any other start input form the versioned launch
@@ -323,7 +359,7 @@ Authoring: [pinned tasks][evals-tasks] and [environment][evals-environment]. The
 Current st2 source: [`AgentSpec` and `Task`](../../../crates/agent-spec/src/spec.rs).
 Evidence: [spawn construction](../../../src/run.rs).
 
-<h3 id="f12">F12 Future policy (R31)</h3>
+### F12 Future policy (R31)
 
 ```text
 canonical catalog folder + host = supervisor scope
@@ -385,17 +421,20 @@ Authoring: [pinned complete declaration][evals-fields]. The
 [`execute`](../../../src/run.rs). Evidence:
 [policy planning](../../../src/reconcile.rs).
 
-<h3 id="f13">F13 <code>retired #true</code></h3>
+### F13 `retired #true`
 
-Fence, stop, and clean every declared ID with exact ownership proof, and prevent
-relaunch. An agent identity removal in the same change uses F02. A child removal
-uses F09 or F10 proof.
+Fence, stop, and clean every declared task ID with exact ownership proof, and
+prevent relaunch. Retirement preserves the agent ID, removes the subject from
+ordinary address routing, and releases its effective address after the retired
+catalog generation becomes visible. Suspending a subject does not release its
+address. Declaration removal follows F02's exact ID-keyed membership rule; a
+child removal uses F09 or F10 proof.
 
 Authoring: [pinned complete declaration][evals-fields]. st2 source:
 [`AgentDesiredState`](../../../crates/agent-spec/src/spec.rs). Evidence:
 [retirement planning](../../../src/reconcile.rs).
 
-<h3 id="f14">F14 Compact agent fields</h3>
+### F14 Compact agent fields
 
 Compact `command`, `argv`, `env`, `lifecycle`, and `ding` convert to the
 generated agent PTY and derived sidecar. The tasks use F09, F11, and F12;
@@ -407,7 +446,7 @@ predate compact `argv` and `lifecycle`. Current st2 source:
 [KDL fields](../../../crates/agent-spec/src/kdl_format.rs). Evidence:
 [`RawSpec` lowering](../../../crates/agent-spec/src/spec.rs).
 
-<h3 id="f15">F15 Provider and ignored fields</h3>
+### F15 Provider and ignored fields
 
 Core st2 ignores `harness`, `model`, `persona`, `permissions`, `transport`,
 `strategy`, `meta`, and provider extensions. They do not change core equality,
@@ -418,7 +457,7 @@ Authoring: [pinned complete declaration][evals-fields]. st2 source:
 [KDL field boundary](../../../crates/agent-spec/src/kdl_format.rs). Evidence:
 [`RawSpec` lowering](../../../crates/agent-spec/src/spec.rs).
 
-<h3 id="f16">F16 Invalid or incomplete state</h3>
+### F16 Invalid or incomplete state
 
 Refuse changes to an agent, task, or file when its desired or actual state is
 unreadable, invalid, ambiguous, or conflicting. Keep last-known-good ownership
@@ -430,7 +469,7 @@ source: [`RawSpec` and `AgentSpec`](../../../crates/agent-spec/src/spec.rs).
 Evidence: [validation](../../../src/validate.rs) and
 [reconciliation](../../../src/reconcile.rs).
 
-<h3 id="f18">F18 <code>desired-state</code> and <code>reason</code></h3>
+### F18 `desired-state` and `reason`
 
 `desired-state` is one of `running`, `suspended`, or `retired`. Its omission is
 running. A suspended or new-style retired declaration carries exactly one
@@ -446,7 +485,8 @@ task is live and every retained dead record is explicitly keep-pinned. A
 retired declaration is complete only when every declared task record is
 absent. Resume does not override `keep`, `adopt-only`, ownership proof, or
 drift/replacement policy. Inbox, archive, context, resources, and presence files
-are outside task teardown and remain addressable.
+remain addressable through exact agent ID; retirement removes only ordinary
+address routing.
 
 The canonical KDL authoring form is:
 
@@ -455,11 +495,24 @@ desired-state "suspended" reason="Waiting for capacity"
 ```
 
 The safe authoring surface is
-`st2 agent desired-state <identity> <state> [--reason ...]`. It serializes with
-other catalog writers, preserves unrelated
-source bytes, refuses Nix-owned declarations, and returns an authored-intent
-receipt. It does not imply that reconciliation or Doctor has observed
-convergence.
+`st2 agent desired-state --id <agent-id> <state> [--reason ...]
+[--managed-by <marker>]`. It serializes with other catalog writers, preserves
+unrelated source bytes, and returns an authored-intent receipt. A transition
+from retired to running or suspended validates effective-address uniqueness
+against the complete prospective catalog before publication. The receipt does
+not imply that reconciliation or Doctor has observed convergence.
+
+A declaration carrying `meta { managed-by "nix" }` refuses authoring unless the
+caller asserts exactly the marker that declaration carries with `--managed-by`,
+which is how a projection authors the one transition its own generated source
+cannot express — the seat's removal from that source. The asserted arm
+additionally admits the complete prospective catalog, as an `agent publish` of
+the same bytes would, and the receipt records the confirmed marker. Every other
+authoring verb refuses a Nix-owned declaration unconditionally.
+
+The exact-ID selector and reactivation validation are target behavior fenced by
+[DELTA-003](../.delta/DELTA-003-agent-address-not-implemented.md); the linked
+current evidence still exercises the positional legacy selector.
 
 st2 source: [`AgentDesiredState`](../../../crates/agent-spec/src/spec.rs),
 [KDL lowering](../../../crates/agent-spec/src/kdl_format.rs),
@@ -469,25 +522,27 @@ st2 source: [`AgentDesiredState`](../../../crates/agent-spec/src/spec.rs),
 [authoring](../../../tests/agent_desired_state.rs), and
 [planning](../../../tests/reconcile.rs).
 
-<h3 id="f17">F17 Agent <code>name</code> and <code>description</code></h3>
+### F17 Agent `name` and `description`
 
 Update observable declaration and runtime presentation metadata only. Neither
-field participates in identity, routing, selection, authorization, state paths,
-launch fingerprints, workspaces, inbox events, DING, or lifecycle. The roster
-reads the declaration directly; sibling `name` files are ignored.
+field participates in agent ID, address routing, selection, authorization,
+state paths, launch fingerprints, workspaces, inbox events, DING, or
+lifecycle. The roster reads the declaration directly; sibling `name` files are
+ignored.
 
 External harness consumers read the current Agent Spec rather than a duplicate
-derived file. `st2 agents --identity <host>.<identity> --json` returns exactly
-one stable roster row or fails; in-process drivers may consume the same lowered
-`AgentSpec` directly. Both paths preserve explicitly nullable name and
-description and grant no lifecycle authority.
+derived file. `st2 agents --id <agent-id> --json` returns exactly one immutable
+subject or fails; in-process drivers may consume the same lowered `AgentSpec`
+directly. Both paths preserve explicitly nullable name and description and
+grant no lifecycle authority.
 
-For a healthy managed PTY, patch the exact runtime task ID in place. Every owned
-PTY receives the versioned stable-actor and optional-description tag snapshot;
-only the primary task named `agent` maps optional name to native display
-metadata. Clearing removes only the corresponding st2-owned value. Preserve
-unrelated tags and secondary display conventions. An unchanged projection is a
-no-op. Failure reports and retries without stop, reap, restart, replacement, or
+For a healthy managed PTY, patch the exact runtime task ID in place. Every PTY
+receives the schema-2 owned actor-ID, current-bus-address, and
+optional-description tag snapshot. Only the primary task named `agent` carries
+the compatibility role and maps optional name to native display metadata.
+Clearing removes only the corresponding st2-owned value. Preserve unrelated
+tags and secondary display conventions. An unchanged projection is a no-op.
+Failure reports and retries without stop, reap, restart, replacement, or
 flapping accounting. Absent work receives the same projection at spawn.
 
 Authoring: canonical Agent Spec presentation fields after the matching evals
@@ -495,24 +550,24 @@ change lands. st2 source: [`AgentSpec`](../../../crates/agent-spec/src/spec.rs),
 [roster](../../../src/agents.rs), and [reconciliation](../../../src/reconcile.rs).
 Evidence: parser, roster, exact-ID metadata, and no-restart presentation tests.
 
-<h3 id="f19">F19 Agent <code>stream</code></h3>
+
+### F19 Agent `stream`
 
 A `stream "<name>" {}` declares one agent-owned event ingress endpoint. Names
-are 1..=40 characters matching
-`[a-z0-9]([a-z0-9-]*[a-z0-9])?` and cannot collide with an authored task named
+are 1..=40 lowercase alphanumeric characters with optional interior hyphens
+and cannot collide with an authored task named
 `stream-<name>`. The declaration contains at most one launch: `command` is an
 opaque shell command, `argv` is a non-empty structured argument vector, and an
 empty body means external ingress. Unknown children, including the reserved
 `every`, fail admission.
 
-A launched stream adds exactly one derived exec task named `stream-<name>` and
-with runtime ID `<host>.<agent>.stream-<name>`. Its authored `command` or
-`argv` lowers directly to that task; no stream runner or stdout line protocol
-is inserted. An external-ingress stream adds no task. Adding or removing a
-launched stream therefore adds or removes that exact derived companion under
-the owning agent's lifecycle; changing its launch is spawn-input drift under
-F11. It does not change the canonical agent task or select a delivery
-transport.
+A launched stream adds exactly one derived exec task named `stream-<name>` with
+default runtime ID `<agent-id>.stream-<name>`. Its authored `command` or `argv`
+lowers directly to that task; no stream runner or stdout line protocol is
+inserted. An external-ingress stream adds no task. Adding or removing a launched
+stream therefore adds or removes that exact derived companion under the owning
+agent's lifecycle; changing its launch is spawn-input drift under F11. It does
+not change the canonical agent task or select a delivery transport.
 
 Authoring: canonical Agent Spec stream field after the matching evals change
 lands. st2 source: [`Stream`](../../../crates/agent-spec/src/spec.rs),
@@ -521,21 +576,62 @@ lands. st2 source: [`Stream`](../../../crates/agent-spec/src/spec.rs),
 [`streams_are_typed_and_only_launched_streams_lower_to_derived_exec_tasks`](../../../crates/agent-spec/tests/discovery.rs)
 and stream lifecycle tests in [`tests/run.rs`](../../../tests/run.rs).
 
+### F20 Agent `address`
+
+`address` is an optional mutable semantic alias for human routing. Its omission
+uses positional `identity` as the effective legacy address. Its presence
+replaces that fallback immediately; the prior value receives no alias,
+redirect, or history. An explicit address is at most 255 ASCII characters and
+is a dotted sequence of 1-to-63-character segments. Each segment contains only
+lowercase letters, digits, and hyphens and begins and ends with a letter or
+digit.
+
+The complete prospective catalog requires effective addresses to be unique per
+resolved logical host among running and suspended subjects, including
+collisions between explicit addresses and identity fallbacks. Retired subjects
+are non-routable and do not occupy the namespace.
+Address and ID are separate typed namespaces; equal bytes do not collide.
+
+An ordinary unpinned reference tries the complete input as a bare address and
+every dotted split whose prefix is an admitted host and suffix is an effective
+address in that host. A host-pinned reference tries the complete input as an
+address in that host plus the qualified split whose prefix equals the pinned
+host. Candidates are deduplicated by agent ID; exactly one distinct subject
+must remain. An explicit typed ID bypasses this algorithm.
+
+An address-only change updates the catalog address book and runtime metadata
+without changing immutable ownership, ID-keyed supervisor edges, task IDs,
+launch fingerprints, workspaces, declaration-parent state paths,
+inbox/archive/context/Resource data, or a healthy runtime incarnation.
+
+The safe authoring surface is
+`st2 agent address --id <agent-id> (--clear | <address>)`. It uses the same
+source-preserving, authority-scoped, stale-writer-refusing, durable catalog
+transaction as F17. Clearing restores the identity fallback and is refused
+when that fallback conflicts on the resolved host.
+
+Authoring: canonical Agent Spec address after the matching evals change lands.
+st2 source: future `AgentSpec::address`, address-book resolution, and
+`agent_author` integration. Required evidence: parser and validation tests;
+host-local collision tests including legacy fallbacks; atomic cutover and
+stale-reader fencing; explicit-ID versus ordinary-address selection; no-restart
+continuity across task/PTY, bus, provider, and durable-state surfaces; and
+separate host/launch lifecycle controls.
+
 Catalog and PTY roots are host runtime inputs, not Agent Spec fields. Their
 migration contract is outside this VRS. See
 [#85](https://github.com/compoundingtech/st2/issues/85).
 
-## Unsupported moved intent
+## Address cutover and unsupported redirects
 
-A possible future same-host map could bind one exact old address to one exact
-new address. It would need one-to-one, acyclic mapping, exact old-incarnation
-proof, and no destination conflict. It is not an alias, history, global
-authority, or host migration. Only an atomic address change with no
-process-visible or fingerprint change could preserve a process. `identity`,
-`ST_AGENT`, F11, and host changes remove before add. Removing a pending map
-would refuse. The parser and runtime do not support moved intent.
+F20 is an atomic same-subject address-book cutover, not a moved-intent record.
+The old effective address becomes unclaimed when the new catalog generation is
+visible. The model has no alias, redirect, route history, expiry, cycle, or
+pending-map state. An implementation that needs any old-address compatibility
+must return to requirements design rather than adding an inferred fallback.
 
-Source: [KDL parser](../../../crates/agent-spec/src/kdl_format.rs).
+The parser and runtime do not yet support F20. The implementation gap is
+recorded in the root identity delta.
 
 ## Execution order
 
@@ -579,8 +675,9 @@ replacement of drifted work.
   task, and file changes as one operation, and it has no true dry-run;
   `materialize-only` writes. See [#53](https://github.com/compoundingtech/st2/issues/53)
   and [runner](../../../src/run.rs).
-- **G08, moved intent:** parser, status, and executor support are absent; syntax
-  is unspecified. [Parser](../../../crates/agent-spec/src/kdl_format.rs)
+- **G08, F02/F20 identity migration and address routing:** the explicit `id`
+  field, legacy ID migration, address parser, address-book resolver, roster and
+  graph projection, and address authoring are absent.
 - **G09, F17 release ordering:** source authoring requires Nix emitters to mark
   generated declarations before the compatible st2 binary is activated. The
   pinned merged PTY dependency provides the exact-ID atomic metadata-patch API;
@@ -617,8 +714,8 @@ replacement of drifted work.
   failed, rolled-back, periodic, new, replaced, suspended, and retired paths emit none.
 - DING failure retains the event. Replay has no extra effect, and inbox events
   do not cause inbox events.
-- Add, remove, rename, and retirement affect exact IDs, including simultaneous
-  child removal. Legacy or partial proof holds or refuses.
+- Task add, remove, rename, and retirement affect exact runtime IDs, including
+  simultaneous child removal. Legacy or partial proof holds or refuses.
 - Suspension stops the exact live task set, including a derived DING, while an
   unrelated sibling retains its generation and a durable inbox message retains
   its filename. Resume uses ordinary keep/adopt-only/service rules. Doctor
@@ -628,13 +725,14 @@ replacement of drifted work.
   the exact incarnation through fence, quiesce, materialize, and boot.
 - Name and description changes update the exact Agent Spec roster row and PTY
   metadata while task ID, PID, creation identity, and generation remain
-  unchanged. Exact qualified roster selection returns one row or fails without
+  unchanged. Exact agent-ID roster selection returns one row or fails without
   publishing duplicate presentation state. Clearing removes only owned
   presentation values. A genuine retirement still follows ordinary teardown.
-- Host projections converge after overlap, absence, and reconnection without a
-  shared receipt.
-- Moved intent rejects cycles, conflicts, and host changes. It removes before
-  add unless a future atomic address change can preserve the process.
+- Address assignment, change, clearing, and old-address reuse prove one atomic
+  before-or-after address book, fail stale routes immediately, update roster
+  and PTY metadata, and preserve the healthy runtime and durable subject state.
+  Host changes preserve logical agent ID but follow the existing host-placement
+  lifecycle rather than the nondisruptive address rule.
 - A refusal for one related set of agents, tasks, or files does not block
   independent work whose input and ownership proof are complete. Every result
   names the affected IDs, action, and what the proof covers.

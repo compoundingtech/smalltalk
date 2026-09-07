@@ -13,12 +13,13 @@ as tested hypotheses.
 - **DQ-S3 Ring bound and identity horizon.** `K = 128` is the implemented
   deduplication and conflicting-content-detection horizon, not merely a fast
   path: an evicted identity is accepted as new, without scanning inbox or
-  archive history. This conflicts with ratified STREAM-R04/R05 and decision
-  0004; [`DELTA-004`](../.delta/DELTA-004-stream-dedup-horizon.md) records the
-  protected-doc change required. Resolves by: measuring real adapter emit
-  rates and retry/rediscovery windows (CI transitions, builds, timer sources),
-  then approving the bounded identity contract or choosing a different
-  bounded index.
+  archive history. That is no longer a divergence: ratified STREAM-R04/R05 and
+  decision 0004 both say the retained receipt ring is the idempotency boundary
+  and that an archive receipt keeps its authority for a known filename without
+  being an event-identity index. What stays open is only the *value*: `128` is
+  unmeasured. Resolves by: measuring real adapter emit rates and
+  retry/rediscovery windows (CI transitions, builds, timer sources), then
+  keeping the bound, raising it, or choosing a different bounded index.
 - **DQ-S4 Request absorption staging.** The typed request/reply envelopes
   (`request.rs`) are absorbed by events + ordinary replies (decision 0004),
   but its wire types carry `deny_unknown_fields` and its invariant row names

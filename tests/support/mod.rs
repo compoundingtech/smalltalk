@@ -1,3 +1,6 @@
+// Shared by several test binaries; each one uses only the parts it needs.
+#![allow(dead_code)]
+
 use std::io;
 use std::ops::{Deref, DerefMut};
 use std::os::fd::{AsRawFd as _, OwnedFd};
@@ -9,6 +12,12 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 const CLEANUP_DEADLINE: Duration = Duration::from_secs(2);
+
+/// A retired agent's declared `resource` bindings, shared by the desired-state and doctor fixtures.
+pub const RETIRED_RESOURCES: &str = concat!(
+    "  resource \"work\" uri=\"work://h/current-task\" reason=\"Current implementation task.\"\n",
+    "  resource \"issue\" uri=\"github-issue://example/project/41\" reason=\"Tracking issue.\"\n",
+);
 
 /// A subprocess group whose lifetime is bounded by the test process that spawned it.
 ///

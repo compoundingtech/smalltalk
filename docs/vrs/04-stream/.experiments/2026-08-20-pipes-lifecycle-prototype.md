@@ -479,6 +479,6 @@ flapping, park, or task inventory — the hypothesis holds cheaply. The two
 findings that outlived the prototype: a task identity cannot be an idempotent
 bus sender (the self-send workaround renders `↺` for an external event), and
 a producer-supplied event id is the dedup contract (content hashes cannot
-distinguish replay from repeat). Decisions 0004/0005 supersede this
+distinguish replay from repeat). Decisions 0004/0005-streams-are-agent-nested-and-stream-named supersede this
 prototype's `pipe` naming and self-send emit path; its lifecycle proofs and
 KDL shape carry forward into STREAM-R01 and STREAM-R08.

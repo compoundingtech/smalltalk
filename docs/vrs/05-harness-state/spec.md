@@ -16,6 +16,16 @@ unmet residuals: root `DQ3`'s supervisor-following gate (`DQ-H5`) and
 Claude's eventless deny path (the remaining `DQ-H1` window). Open questions
 are tracked in [open-questions.md](./open-questions.md).
 
+The `agent` field's immutable-ID meaning is the accepted target, and it ships
+as a new record version, `st2.harness-state.v2`: this record's version suffix
+is its read contract, so changing an existing field's meaning reserves the next
+version rather than reusing `v1`. Records and producers stay on
+`st2.harness-state.v1`, whose `agent` remains a bus identity, until
+[DELTA-003](../.delta/DELTA-003-agent-address-not-implemented.md) closes.
+Version 2 is otherwise identical to the shape below. The reader-first rollout
+accepts both versions — narrowing the `unsupported-schema` rule below to
+versions outside that pair — before any version-2 writer activates.
+
 ## Scope
 
 This specification defines the observed-state record, its freshness and
@@ -54,7 +64,7 @@ One JSON object, atomically written (tmp sibling + rename), newline-terminated:
 ```json
 {
   "schema": "st2.harness-state.v1",
-  "agent": "<identity>",
+  "agent": "<identity in v1; agent ID in v2>",
   "harness": "codex | claude | pi | opencode",
   "state": "idle | active | child | ended",
   "blockedOn": "none | human",
@@ -159,8 +169,8 @@ What a reader reports, in evaluation order:
 | --- | --- | --- |
 | No record file | no observation (`null`) | never observed ≠ `unknown` |
 | File exists but cannot be read | `unknown` | `unreadable-record`; an IO error is indeterminate, never absence |
-| Unparseable / non-v1-shaped bytes | `unknown` | `malformed-record`; never falls back to mtime |
-| `schema` is not `st2.harness-state.v1` | `unknown` | `unsupported-schema`; a future schema's words may be spelled like this version's while meaning something else |
+| Unparseable bytes, or bytes not shaped like an accepted version | `unknown` | `malformed-record`; never falls back to mtime |
+| `schema` is neither `st2.harness-state.v1` nor, once tolerant readers ship, `st2.harness-state.v2` | `unknown` | `unsupported-schema`; a future schema's words may be spelled like this version's while meaning something else |
 | `writtenAtMs` > now + 60 s | `unknown` | `future-skew` |
 | `writtenAtMs` ≤ now − 15 min | `unknown` | `stale` |
 | Literal `unknown` state (never written by this crate) | `unknown` | `literal-unknown` |
@@ -211,6 +221,7 @@ complement of steerable, a delivery predicate (decision 0001's boundary).
 | `Idle` | `idle` | `none` | `none` | |
 | `Active { turnId }` | `active` | `none` | `none` | |
 | `TerminalError { systemError }` | `ended` | `none` | `none` | `systemError` |
+| `TerminalError { providerAuthRejected }` | `ended` | `none` | `none` | `providerAuth` — a failed turn whose typed error names `unauthorized`; the same word the OpenCode producer publishes |
 | `Held { ActiveWithoutTurn }` | `active` | `none` | `none` | `activeWithoutTurn` — Codex said active; st2 merely cannot name a steerable turn |
 | `Held { ConflictingTurn }` | `active` | `none` | `none` | `conflictingTurn` — two turns believed live is maximally active |
 | `Held { Review }` | `active` | `none` | `none` | `review` — review's enter and exit are model-emitted items inside a running turn; nothing awaits a human |
@@ -246,7 +257,14 @@ observation.
 ## Claude producer (OHS-R05, OHS-R06)
 
 Two cooperating writers. The hook side classifies turn lifecycle: a submitted
-prompt or tool activity writes `active`; `Stop` writes `idle`;
+prompt or tool activity writes `active`; `Stop` writes `idle`; `StopFailure`
+— which Claude fires *instead of* `Stop` when an API error ended the turn —
+also writes `idle`, because the turn is over at the same lifecycle point, with
+reason `providerAuth` for the credential class and `apiError` for every other
+word in that closed vocabulary. It is deliberately not `ended`: the TUI is
+still live, a human can re-login and carry on, and the wrapper owns this seat's
+terminal record (OHS-T04). The event carries a second registered command, the
+pre-existing wedge reporter, so both jobs run on one edge;
 `PermissionRequest` writes `active` + `blockedOn: human` with its ask kind
 classified from the payload's `tool_name` (`AskUserQuestion` → `question`,
 anything else → `permission`) — (its meaning is
@@ -379,11 +397,11 @@ pending. The status seed trusts exactly the pinned words (`busy`, `retry`,
 pre-signal escalation cover with the exit the grace-window reap actually
 observed.
 
-## Native driver diagnostic snapshot (OHS-R11–OHS-R15)
+## Native driver diagnostic snapshot (OHS-R11–OHS-R16)
 
 ```text
-version gate -> API gate -> SSE -> seed -> delivery -> read-back
-      \_____________ typed failure/recovery transitions ____________/
+version gate -> API gate -> SSE -> seed -> provider auth -> delivery -> read-back
+      \______________ typed failure/recovery transitions ______________/
                                 |
                                 v
               <agent-dir>/driver-diagnostic
@@ -429,6 +447,7 @@ The closed stage/reason/source matrix is:
 | `seed` | `statusUnavailable`, `malformedStatus`, `unknownStatus` | `statusSnapshot` |
 | `seed` | `permissionUnavailable`, `malformedPermissions`, `missingAskId` | `permissionSnapshot` |
 | `seed` | `questionUnavailable`, `malformedQuestions`, `missingAskId` | `questionSnapshot` |
+| `providerAuth` | `providerAuthRejected` | `turnResult` |
 | `delivery` | `deliveryUnavailable`, `deliveryRejected` | `promptTransport` |
 | `readBack` | `readBackUnavailable`, `notDurable` | `messageReadBack` |
 
@@ -455,6 +474,37 @@ Diagnostic persistence errors log and do not escape into those operations.
 The existing attempted-before-transport receipt, same-message retry,
 indeterminate-read-back no-resend rule, durable acceptance, and archive
 behavior are unchanged.
+
+Claude, Codex, and omp publish exactly one of those stages — `providerAuth` —
+from their own typed turn-failure signal, and nothing else: every earlier
+boundary is already fail-closed at admission for them (an incompatible Codex
+protocol refuses the launch rather than degrading into an observation, an
+unadmitted omp MINOR refuses it too under OMP-R05, and st2 gates no Claude
+version at all). Every edge comes from the signal that ends a turn, so no
+driver reads provider prose to decide this:
+
+| Driver | Rejection | Recovery | `producerVersion` / `support` |
+| --- | --- | --- | --- |
+| Claude | `StopFailure` hook with `error: authentication_failed` — Claude's own name for every 401/403 provider response, fired *instead of* `Stop` | the next `Stop`, i.e. a turn that reached its ordinary end | omitted / `unknown` — a hook payload names no version and st2 gates none |
+| Codex | `turn/completed` with `turn.status: failed` and `turn.error.codexErrorInfo: unauthorized` | `turn/completed` with `turn.status: completed` | the version the protocol gate admitted / `supported` |
+| omp | a `type: "turn"` channel frame whose error carries omp's own `errorId` classification with `AuthFailed` set and `UsageLimit`, `AccountPolicy`, and `Transient` clear | a `type: "turn"` frame with no error, i.e. an `agent_end` whose last assistant message did not stop on an error | omitted / `unknown` — the wrapper, not the channel, owns the version gate |
+
+No driver borrows the word for a neighbouring class: Claude's `rate_limit`,
+`overloaded`, `oauth_org_not_allowed`, `account_on_hold` and `billing_error`,
+Codex's `usageLimitExceeded` and `rateLimitExceeded`, and omp's `UsageLimit`,
+`AccountPolicy` and `Transient` flags are capacity, policy, or account state
+that a re-login cannot fix. Claude's `StopFailure` still writes `idle` with
+reason `apiError` for them — the turn did end — Codex keeps its `systemError`
+terminal, and omp's frame still writes `active` with omp's own bounded prose,
+which is the only place a reader learns that a 403 was about credits. The Codex
+startup gate pins `unauthorized` and both quota words present in
+`CodexErrorInfo`, so a release that merged them refuses the launch instead of
+letting st2 report an exhausted allowance as a rejected credential; omp needs no
+such gate because its flags are separate bits that cannot merge, but it does
+need the `Class` bit checked, because an unclassified `errorId` is a bare HTTP
+status. Because these three publish only on rejection, an absent record is their
+healthy steady state and Doctor advises nothing for it; OpenCode, which resolves
+its version gate on every launch, still advises on absence.
 
 The roster projection always has one fixed shape. `failure` fills every
 evidence field; `absent` and `indeterminate` preserve the same keys with null

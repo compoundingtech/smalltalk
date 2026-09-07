@@ -112,6 +112,10 @@ fn unnamed_tasks_and_reserved_schedules_are_causal_red_shape_errors() {
 #[test]
 fn duplicate_routing_fields_are_shape_errors() {
     let source = r#"agent "worker" {
+  id "first"
+  id "second"
+  address "first"
+  address "second"
   identity "first"
   identity "second"
   host "first"
@@ -125,7 +129,12 @@ fn duplicate_routing_fields_are_shape_errors() {
             .iter()
             .map(|diagnostic| diagnostic.code.as_str())
             .collect::<Vec<_>>(),
-        ["duplicate-routing-field", "duplicate-routing-field"]
+        [
+            "duplicate-routing-field",
+            "duplicate-routing-field",
+            "duplicate-routing-field",
+            "duplicate-routing-field"
+        ]
     );
     assert!(!parsed.is_valid());
 }

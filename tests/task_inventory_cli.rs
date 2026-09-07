@@ -181,7 +181,7 @@ fn projected_recovery_targets_its_exact_catalog_and_host_despite_ambient_default
 #[test]
 fn tasks_cli_emits_stable_complete_generation_without_mutation() {
     let (tmp, catalog, bin) = fixture(
-        r#"[{"name":"h.worker","status":"running","pid":77,"createdAt":"2026-07-31T10:00:00.000Z"},{"name":"human.scratch","status":"running","pid":88,"createdAt":"2026-07-31T10:00:01.000Z"}]"#,
+        r#"[{"name":"h.worker","status":"running","pid":4000000,"createdAt":"2026-07-31T10:00:00.000Z"},{"name":"human.scratch","status":"running","pid":4000001,"createdAt":"2026-07-31T10:00:01.000Z"}]"#,
     );
     let agent = catalog.join("agents/h/worker/agent.kdl");
     let catalog_config = catalog.join("catalog.kdl");
@@ -197,7 +197,7 @@ fn tasks_cli_emits_stable_complete_generation_without_mutation() {
     );
     assert_eq!(first.stdout, second.stdout, "unchanged generation drifted");
     let value: serde_json::Value = serde_json::from_slice(&first.stdout).unwrap();
-    assert_eq!(value["schema"], "st2.task-inventory.v1");
+    assert_eq!(value["schema"], "st2.task-inventory.v2");
     assert_eq!(value["complete"], true);
     assert_eq!(value["tasks"].as_array().unwrap().len(), 1);
     assert_eq!(value["tasks"][0]["agent"], "h.worker");
@@ -206,7 +206,7 @@ fn tasks_cli_emits_stable_complete_generation_without_mutation() {
     assert_eq!(value["tasks"][0]["desiredState"], "running");
     assert_eq!(value["tasks"][0]["agentDesiredState"], "running");
     assert!(value["tasks"][0]["agentDesiredStateReason"].is_null());
-    assert_eq!(value["tasks"][0]["runtime"]["pid"], 77);
+    assert_eq!(value["tasks"][0]["runtime"]["pid"], 4_000_000);
     assert_eq!(
         value["tasks"][0]["runtime"]["createdAt"],
         "2026-07-31T10:00:00.000Z"
@@ -216,6 +216,13 @@ fn tasks_cli_emits_stable_complete_generation_without_mutation() {
             .as_str()
             .unwrap()
             .starts_with("sha256:")
+    );
+    assert_eq!(
+        value["tasks"][0]["runtime"]["resourceTarget"],
+        serde_json::json!({
+            "type": "unavailable",
+            "reason": "processUnavailable"
+        })
     );
     assert_eq!(fs::read(agent).unwrap(), before_agent);
     assert_eq!(fs::read(catalog_config).unwrap(), before_catalog);
@@ -326,7 +333,7 @@ fn completed_catalog_aba_during_runtime_observation_is_incomplete() {
     let b_spec = prepared_b.join("agents/h/worker/agent.kdl");
     let bytes = fs::read_to_string(&b_spec)
         .unwrap()
-        .replace("agent \"worker\" {", "agent \"worker\" {\n  retired #true");
+        .replace("agent \"worker\" {", "agent \"worker\" {\n  name \"temporary\"");
     fs::write(&b_spec, bytes).unwrap();
 
     let observer_ready = tmp.path().join("observer-ready");
@@ -357,6 +364,9 @@ fn completed_catalog_aba_during_runtime_observation_is_incomplete() {
     }
 
     let apply = |prepared: &Path, expected: &str| {
+        let input_sha256 = st2::catalog_transaction::digest_prepared(&catalog, prepared)
+            .unwrap()
+            .root_sha256;
         Command::new(env!("CARGO_BIN_EXE_st2"))
             .args([
                 "catalog",
@@ -365,6 +375,8 @@ fn completed_catalog_aba_during_runtime_observation_is_incomplete() {
                 catalog.to_str().unwrap(),
                 "--prepared",
                 prepared.to_str().unwrap(),
+                "--input-sha256",
+                &input_sha256,
                 "--expect-sha256",
                 expected,
                 "--json",
@@ -630,6 +642,20 @@ agent "worker" {
         value["tasks"][0]["runtime"]["pid"],
         u64::from(std::process::id())
     );
+    #[cfg(target_os = "macos")]
+    assert_eq!(
+        value["tasks"][0]["runtime"]["resourceTarget"],
+        serde_json::json!({
+            "type": "darwinProcessTree",
+            "rootPid": std::process::id()
+        })
+    );
+    #[cfg(target_os = "linux")]
+    {
+        let target = &value["tasks"][0]["runtime"]["resourceTarget"];
+        assert_eq!(target["type"], "linuxCgroupV2");
+        assert!(target["path"].as_str().unwrap().starts_with('/'));
+    }
     assert_eq!(fs::read_to_string(&pid_file).unwrap(), legacy);
     let after_entries = fs::read_dir(&exec_state)
         .unwrap()
@@ -664,6 +690,13 @@ fn missing_pty_root_is_positive_absence_without_creation_or_invocation() {
     assert!(output.status.success());
     let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(value["tasks"][0]["runtime"]["state"], "absent");
+    assert_eq!(
+        value["tasks"][0]["runtime"]["resourceTarget"],
+        serde_json::json!({
+            "type": "unavailable",
+            "reason": "notRunning"
+        })
+    );
     assert!(!missing.exists());
     assert!(!tmp.path().join("PTY-WAS-CALLED").exists());
 }
@@ -711,7 +744,7 @@ fn missing_catalog_and_missing_json_flag_fail_explicitly() {
         .unwrap();
     assert!(!missing_output.status.success());
     let value: serde_json::Value = serde_json::from_slice(&missing_output.stdout).unwrap();
-    assert_eq!(value["schema"], "st2.task-inventory.v1");
+    assert_eq!(value["schema"], "st2.task-inventory.v2");
     assert_eq!(value["complete"], false);
     assert!(value["tasks"].as_array().unwrap().is_empty());
 
@@ -825,6 +858,20 @@ fn packaged_tasks_tracks_real_pty_generation_replacement() {
         .as_str()
         .unwrap()
         .to_owned();
+    #[cfg(target_os = "macos")]
+    assert_eq!(
+        first_json["tasks"][0]["runtime"]["resourceTarget"],
+        serde_json::json!({
+            "type": "darwinProcessTree",
+            "rootPid": first_json["tasks"][0]["runtime"]["pid"]
+        })
+    );
+    #[cfg(target_os = "linux")]
+    {
+        let target = &first_json["tasks"][0]["runtime"]["resourceTarget"];
+        assert_eq!(target["type"], "linuxCgroupV2");
+        assert!(target["path"].as_str().unwrap().starts_with('/'));
+    }
 
     remove_real_pty(&pty_root, "h.worker");
     let second_launch = launch();

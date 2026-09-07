@@ -51,6 +51,16 @@ pub struct AgentRow {
     /// three. `None` means no record exists; a record past its horizon is still reported, marked
     /// stale and carrying its age, so it survives every `observedState: unknown` derivation.
     pub context: Option<harness_context::Observed>,
+    /// The immutable catalog-global agent ID (R24) — the declaration's explicit `id`, else the
+    /// legacy `<host>.<identity>` bus identity that migration freezes as this subject's ID.
+    /// `identity` above stays the positional declaration key and legacy address fallback;
+    /// consumers must not read it as the agent ID.
+    pub id: String,
+    /// The effective mutable agent address — declared `address`, else positional `identity`.
+    pub address: String,
+    /// `<host>.<effective address>`. `None` for a retired subject, which is non-routable and
+    /// releases its address; that null does not make the row incomplete.
+    pub bus_address: Option<String>,
 }
 
 /// Every agent in the catalog, sorted by bus id, with presence + enrich data computed. Read-only:
@@ -103,6 +113,11 @@ pub fn roster_from_discovered(
                 // Read independently of the state record above: the wedge case this exists for is
                 // an agent whose state has gone indeterminate at 190k of a 200k window.
                 context: harness_context::read(&harness_context::harness_context_path(agent_dir)),
+                id: s.effective_id(this_host),
+                address: s.effective_address().to_owned(),
+                // A retired subject does not resolve and does not occupy the address namespace.
+                bus_address: (!s.desired_state.is_retired())
+                    .then(|| s.bus_address(this_host)),
             })
         })
         .collect();
@@ -324,6 +339,14 @@ struct SummaryJson<'a> {
     #[serde(rename = "driverDiagnostic")]
     driver_diagnostic: DriverDiagnosticJson<'a>,
     context: Option<ContextJson<'a>>,
+    /// Appended (R24): the immutable agent ID. `identity` above keeps its existing meaning as the
+    /// positional declaration key and legacy address fallback — never read it as the agent ID.
+    id: &'a str,
+    /// Appended (R24): the effective mutable address.
+    address: &'a str,
+    /// Appended (R24): `<host>.<address>`; `null` for a retired, non-routable subject.
+    #[serde(rename = "busAddress")]
+    bus_address: Option<&'a str>,
 }
 
 /// `st2 agents --json --enrich` row (adds `lastActivity` and `inbox`).
@@ -347,6 +370,14 @@ struct EnrichedJson<'a> {
     #[serde(rename = "driverDiagnostic")]
     driver_diagnostic: DriverDiagnosticJson<'a>,
     context: Option<ContextJson<'a>>,
+    /// Appended (R24): the immutable agent ID. `identity` above keeps its existing meaning as the
+    /// positional declaration key and legacy address fallback — never read it as the agent ID.
+    id: &'a str,
+    /// Appended (R24): the effective mutable address.
+    address: &'a str,
+    /// Appended (R24): `<host>.<address>`; `null` for a retired, non-routable subject.
+    #[serde(rename = "busAddress")]
+    bus_address: Option<&'a str>,
 }
 
 /// Serialize a roster to the stable JSON emitted by `st2 agents --json [--enrich]`.
@@ -368,6 +399,9 @@ pub fn to_json(rows: &[AgentRow], enrich: bool) -> String {
                 observed_state: ObservedJson::from_row(r.observed.as_ref()),
                 driver_diagnostic: DriverDiagnosticJson::from_row(&r.driver_diagnostic),
                 context: ContextJson::from_row(r.context.as_ref()),
+                id: &r.id,
+                address: &r.address,
+                bus_address: r.bus_address.as_deref(),
             })
             .collect();
         serde_json::to_string(&out).unwrap_or_else(|_| "[]".to_string())
@@ -386,6 +420,9 @@ pub fn to_json(rows: &[AgentRow], enrich: bool) -> String {
                 observed_state: ObservedJson::from_row(r.observed.as_ref()),
                 driver_diagnostic: DriverDiagnosticJson::from_row(&r.driver_diagnostic),
                 context: ContextJson::from_row(r.context.as_ref()),
+                id: &r.id,
+                address: &r.address,
+                bus_address: r.bus_address.as_deref(),
             })
             .collect();
         serde_json::to_string(&out).unwrap_or_else(|_| "[]".to_string())
@@ -467,6 +504,14 @@ mod tests {
             observed: None,
             driver_diagnostic: driver_diagnostic::Observed::Absent,
             context: None,
+            // A legacy declaration: the frozen ID is its bus identity, the effective address is
+            // its positional identity, and a retired subject releases its bus address.
+            id: identity.to_string(),
+            address: identity
+                .split_once('.')
+                .map(|(_, positional)| positional.to_string())
+                .unwrap_or_else(|| identity.to_string()),
+            bus_address: (!retired).then(|| identity.to_string()),
         }
     }
 
@@ -487,11 +532,11 @@ mod tests {
 
         assert_eq!(
             to_json(&rows, false),
-            r#"[{"identity":"hetz.cos-claude","status":"available","name":null,"description":null,"retired":false,"resources":[],"desiredState":"running","desiredStateReason":null,"observedState":null,"driverDiagnostic":{"status":"absent","driver":null,"stage":null,"reason":null,"source":null,"producerVersion":null,"support":"unknown","observedAt":null,"evidenceAgeMs":null,"recovery":"publishFailureOrClearOnStageRecovery"},"context":null},{"identity":"hetz.st2-claude","status":"busy","name":"owner","description":null,"retired":true,"resources":[],"desiredState":"retired","desiredStateReason":null,"observedState":null,"driverDiagnostic":{"status":"absent","driver":null,"stage":null,"reason":null,"source":null,"producerVersion":null,"support":"unknown","observedAt":null,"evidenceAgeMs":null,"recovery":"publishFailureOrClearOnStageRecovery"},"context":null}]"#
+            r#"[{"identity":"hetz.cos-claude","status":"available","name":null,"description":null,"retired":false,"resources":[],"desiredState":"running","desiredStateReason":null,"observedState":null,"driverDiagnostic":{"status":"absent","driver":null,"stage":null,"reason":null,"source":null,"producerVersion":null,"support":"unknown","observedAt":null,"evidenceAgeMs":null,"recovery":"publishFailureOrClearOnStageRecovery"},"context":null,"id":"hetz.cos-claude","address":"cos-claude","busAddress":"hetz.cos-claude"},{"identity":"hetz.st2-claude","status":"busy","name":"owner","description":null,"retired":true,"resources":[],"desiredState":"retired","desiredStateReason":null,"observedState":null,"driverDiagnostic":{"status":"absent","driver":null,"stage":null,"reason":null,"source":null,"producerVersion":null,"support":"unknown","observedAt":null,"evidenceAgeMs":null,"recovery":"publishFailureOrClearOnStageRecovery"},"context":null,"id":"hetz.st2-claude","address":"st2-claude","busAddress":null}]"#
         );
         assert_eq!(
             to_json(&rows, true),
-            r#"[{"identity":"hetz.cos-claude","status":"available","name":null,"description":null,"retired":false,"resources":[],"lastActivity":1784653027733.6138,"inbox":1,"desiredState":"running","desiredStateReason":null,"observedState":null,"driverDiagnostic":{"status":"absent","driver":null,"stage":null,"reason":null,"source":null,"producerVersion":null,"support":"unknown","observedAt":null,"evidenceAgeMs":null,"recovery":"publishFailureOrClearOnStageRecovery"},"context":null},{"identity":"hetz.st2-claude","status":"busy","name":"owner","description":null,"retired":true,"resources":[],"lastActivity":null,"inbox":0,"desiredState":"retired","desiredStateReason":null,"observedState":null,"driverDiagnostic":{"status":"absent","driver":null,"stage":null,"reason":null,"source":null,"producerVersion":null,"support":"unknown","observedAt":null,"evidenceAgeMs":null,"recovery":"publishFailureOrClearOnStageRecovery"},"context":null}]"#
+            r#"[{"identity":"hetz.cos-claude","status":"available","name":null,"description":null,"retired":false,"resources":[],"lastActivity":1784653027733.6138,"inbox":1,"desiredState":"running","desiredStateReason":null,"observedState":null,"driverDiagnostic":{"status":"absent","driver":null,"stage":null,"reason":null,"source":null,"producerVersion":null,"support":"unknown","observedAt":null,"evidenceAgeMs":null,"recovery":"publishFailureOrClearOnStageRecovery"},"context":null,"id":"hetz.cos-claude","address":"cos-claude","busAddress":"hetz.cos-claude"},{"identity":"hetz.st2-claude","status":"busy","name":"owner","description":null,"retired":true,"resources":[],"lastActivity":null,"inbox":0,"desiredState":"retired","desiredStateReason":null,"observedState":null,"driverDiagnostic":{"status":"absent","driver":null,"stage":null,"reason":null,"source":null,"producerVersion":null,"support":"unknown","observedAt":null,"evidenceAgeMs":null,"recovery":"publishFailureOrClearOnStageRecovery"},"context":null,"id":"hetz.st2-claude","address":"st2-claude","busAddress":null}]"#
         );
         // Empty roster is `[]`, not `null`.
         assert_eq!(to_json(&[], true), "[]");
@@ -514,7 +559,7 @@ mod tests {
 
         assert_eq!(
             to_json(&[resource_row], false),
-            r#"[{"identity":"hetz.worker","status":"available","name":null,"description":null,"retired":false,"resources":[{"name":"work","uri":"vendor+thing://authority/exact%20identity","reason":"Current implementation task.","resync":"unsupported"}],"desiredState":"running","desiredStateReason":null,"observedState":null,"driverDiagnostic":{"status":"absent","driver":null,"stage":null,"reason":null,"source":null,"producerVersion":null,"support":"unknown","observedAt":null,"evidenceAgeMs":null,"recovery":"publishFailureOrClearOnStageRecovery"},"context":null}]"#
+            r#"[{"identity":"hetz.worker","status":"available","name":null,"description":null,"retired":false,"resources":[{"name":"work","uri":"vendor+thing://authority/exact%20identity","reason":"Current implementation task.","resync":"unsupported"}],"desiredState":"running","desiredStateReason":null,"observedState":null,"driverDiagnostic":{"status":"absent","driver":null,"stage":null,"reason":null,"source":null,"producerVersion":null,"support":"unknown","observedAt":null,"evidenceAgeMs":null,"recovery":"publishFailureOrClearOnStageRecovery"},"context":null,"id":"hetz.worker","address":"worker","busAddress":"hetz.worker"}]"#
         );
     }
 
@@ -544,11 +589,11 @@ mod tests {
 
         assert_eq!(
             to_json(&[wedged.clone()], false),
-            r#"[{"identity":"hetz.worker","status":"busy","name":null,"description":null,"retired":false,"resources":[],"desiredState":"running","desiredStateReason":null,"observedState":{"state":"idle","blockedOn":"none","inputBuffer":"empty","ask":"none","harness":"codex","since":1784653000000,"reason":null,"exit":null},"driverDiagnostic":{"status":"absent","driver":null,"stage":null,"reason":null,"source":null,"producerVersion":null,"support":"unknown","observedAt":null,"evidenceAgeMs":null,"recovery":"publishFailureOrClearOnStageRecovery"},"context":null}]"#
+            r#"[{"identity":"hetz.worker","status":"busy","name":null,"description":null,"retired":false,"resources":[],"desiredState":"running","desiredStateReason":null,"observedState":{"state":"idle","blockedOn":"none","inputBuffer":"empty","ask":"none","harness":"codex","since":1784653000000,"reason":null,"exit":null},"driverDiagnostic":{"status":"absent","driver":null,"stage":null,"reason":null,"source":null,"producerVersion":null,"support":"unknown","observedAt":null,"evidenceAgeMs":null,"recovery":"publishFailureOrClearOnStageRecovery"},"context":null,"id":"hetz.worker","address":"worker","busAddress":"hetz.worker"}]"#
         );
         assert_eq!(
             to_json(&[wedged], true),
-            r#"[{"identity":"hetz.worker","status":"busy","name":null,"description":null,"retired":false,"resources":[],"lastActivity":1784653027733.6138,"inbox":0,"desiredState":"running","desiredStateReason":null,"observedState":{"state":"idle","blockedOn":"none","inputBuffer":"empty","ask":"none","harness":"codex","since":1784653000000,"reason":null,"exit":null},"driverDiagnostic":{"status":"absent","driver":null,"stage":null,"reason":null,"source":null,"producerVersion":null,"support":"unknown","observedAt":null,"evidenceAgeMs":null,"recovery":"publishFailureOrClearOnStageRecovery"},"context":null}]"#
+            r#"[{"identity":"hetz.worker","status":"busy","name":null,"description":null,"retired":false,"resources":[],"lastActivity":1784653027733.6138,"inbox":0,"desiredState":"running","desiredStateReason":null,"observedState":{"state":"idle","blockedOn":"none","inputBuffer":"empty","ask":"none","harness":"codex","since":1784653000000,"reason":null,"exit":null},"driverDiagnostic":{"status":"absent","driver":null,"stage":null,"reason":null,"source":null,"producerVersion":null,"support":"unknown","observedAt":null,"evidenceAgeMs":null,"recovery":"publishFailureOrClearOnStageRecovery"},"context":null,"id":"hetz.worker","address":"worker","busAddress":"hetz.worker"}]"#
         );
 
         let mut derived = row("hetz.worker", State::Available, None, false, None, 0);
@@ -564,7 +609,7 @@ mod tests {
         });
         assert_eq!(
             to_json(&[derived], false),
-            r#"[{"identity":"hetz.worker","status":"available","name":null,"description":null,"retired":false,"resources":[],"desiredState":"running","desiredStateReason":null,"observedState":{"state":"unknown","blockedOn":"unknown","inputBuffer":"unknown","ask":"unknown","harness":"codex","since":null,"reason":"session-dead","exit":null},"driverDiagnostic":{"status":"absent","driver":null,"stage":null,"reason":null,"source":null,"producerVersion":null,"support":"unknown","observedAt":null,"evidenceAgeMs":null,"recovery":"publishFailureOrClearOnStageRecovery"},"context":null}]"#
+            r#"[{"identity":"hetz.worker","status":"available","name":null,"description":null,"retired":false,"resources":[],"desiredState":"running","desiredStateReason":null,"observedState":{"state":"unknown","blockedOn":"unknown","inputBuffer":"unknown","ask":"unknown","harness":"codex","since":null,"reason":"session-dead","exit":null},"driverDiagnostic":{"status":"absent","driver":null,"stage":null,"reason":null,"source":null,"producerVersion":null,"support":"unknown","observedAt":null,"evidenceAgeMs":null,"recovery":"publishFailureOrClearOnStageRecovery"},"context":null,"id":"hetz.worker","address":"worker","busAddress":"hetz.worker"}]"#
         );
     }
 

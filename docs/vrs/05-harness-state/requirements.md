@@ -178,16 +178,31 @@ authorizes or changes delivery.
   semantics.
 - **OHS-R14 Shared exposure and repair:** `st2 agents --json` carries the
   complete `driverDiagnostic` projection for every row, including explicit
-  absent and indeterminate states. For a declaration whose native driver is
-  expected to publish the record (OpenCode in this version), Doctor reads the
-  same core projection and emits advisory-only stable repair text for every
-  state; the two surfaces cannot independently interpret provider strings.
+  absent and indeterminate states. For a declaration whose native driver
+  publishes the record (OpenCode, Claude, Codex, omp in this version), Doctor
+  reads the same core projection and emits advisory-only stable repair text for
+  every state; the two surfaces cannot independently interpret provider strings.
+  Absence is advised only for a driver that publishes a boundary result on
+  every launch: Claude, Codex, and omp publish only on a credential rejection,
+  so absence is their healthy steady state and earns no advisory.
 - **OHS-R15 Bounded telemetry:** Each failure/recovery transition emits a
   driver-diagnostic span/event and counter. Metric labels and `span.label`
-  are limited to closed `stage`, `reason`, `source`, `support`, and `outcome`
-  vocabularies. Raw versions and any agent/runtime/session/message identity
-  are forbidden from metric labels and `span.label`; raw prompt, message
-  body, and path data are forbidden from the durable record and all labels.
+  are limited to closed `driver`, `stage`, `reason`, `source`, `support`, and
+  `outcome` vocabularies. Raw versions and any agent/runtime/session/message
+  identity are forbidden from metric labels and `span.label`; raw prompt,
+  message body, and path data are forbidden from the durable record and all
+  labels.
+- **OHS-R16 Provider credential boundary:** A `providerAuth` stage carries the
+  single reason `providerAuthRejected` from the single source `turnResult`, and
+  is published by the Claude, Codex, and omp drivers from their own typed
+  turn-failure signal — never from provider prose and never from credential
+  knowledge, which st2 does not hold. It projects between `seed` and
+  `delivery`: the four gates that prove st2 can read the producer at all
+  outrank it, and the delivery and read-back symptoms it causes do not. The
+  same rejection sets `observedState.reason` to `providerAuth`, the word the
+  OpenCode producer already publishes. Only positive evidence — a turn that
+  reached its ordinary end — clears it; an unclassified failure leaves a
+  standing rejection standing. Delivery semantics are unchanged.
 
 ## Evidence
 

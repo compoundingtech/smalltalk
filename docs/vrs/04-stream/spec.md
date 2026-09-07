@@ -12,6 +12,10 @@ prototypes in [`.experiments/`](./.experiments/); field names and on-disk
 layouts may still move during implementation, the open questions are tracked
 in [open-questions.md](./open-questions.md).
 
+Immutable owner IDs, ID-keyed ingress, and derived task IDs are the accepted
+target. The current examples and implementation retain bus-identity ownership
+until [DELTA-003](../.delta/DELTA-003-agent-address-not-implemented.md) closes.
+
 ## Scope
 
 This specification defines the `stream` declaration, its lowering to a derived
@@ -83,15 +87,19 @@ calls `st2 event emit` itself; there is no line-protocol runner in between.
 ## Ingress boundary (STREAM-R03, STREAM-R04)
 
 ```text
-st2 event emit <host>.<agent>
-  --stream <name>            # must be declared on the recipient
-  --event-id <id>            # mandatory, producer-supplied
-  [--key <key>]              # grouping axis for supersession
-  [--supersede]              # archive unread predecessor for (stream, key)
+st2 event emit [<recipient-address>]
+  [--id <recipient-agent-id>] # exact; mutually exclusive with address
+  --stream <name>             # must be declared on the recipient
+  --event-id <id>             # mandatory, producer-supplied
+  [--key <key>]               # grouping axis for supersession
+  [--supersede]               # archive unread predecessor for (stream, key)
   [--subject <line>]
-  [--json]                   # receipt: recipient, filename, created|deduplicated
+  [--json]                    # receipt: recipient ID, filename, created|deduplicated
   [body on stdin]
 ```
+
+The address form uses the root bare-or-qualified algorithm. `--id` uses exact
+immutable-ID lookup and never falls through to address parsing.
 
 Emitting to an undeclared stream or unknown agent is refused before writes,
 and so is a recipient whose desired state is not running — suspension means

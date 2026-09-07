@@ -1,5 +1,7 @@
 # Claude batched tool calls under an open permission prompt
 
+## Question
+
 Date: 2026-08-23. Binary: Claude Code 2.1.237 (Fable 5 bundle), Linux, driven under `pty`.
 Purpose: take the capture DQ-H1 (and #268 §C) said was missing — a batch where one call needs
 permission — and settle whether the shipped blocked-exit rule
@@ -21,7 +23,7 @@ line and always exit 0, for: `PreToolUse`, `PostToolUse`, `PermissionRequest`, `
 
 Four short turns total, ≈$0.61.
 
-## Measured sequences
+## Result
 
 **Run 2, `-p`, batch allowlisted-first** (`echo a` + `touch scratch-file.txt`):
 
@@ -54,7 +56,7 @@ Execution is strictly serial: the first call's `Post` precedes the second call's
 registered): after `PreToolUse` + `PermissionRequest`, denial produced **zero further events** —
 no `PostToolUse`, no `Stop`, no `PermissionDenied`. The turn ends silently.
 
-## Findings
+## Conclusion
 
 1. **Execution serializes around an open permission prompt.** In both orderings no hook event
    fires while a prompt is up — a parallel-batched allowlisted call waits out the grant. The

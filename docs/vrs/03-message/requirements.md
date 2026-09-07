@@ -2,11 +2,12 @@
 
 ## Context
 
-This subsystem defines the native message bus beyond terminal delivery. It refines root requirement
-[`R05`](../requirements.md) for durable message publication and inherits stable identity from `R19`
-and `R24`. DING consumes the recipient inbox under
-[`01-ding/requirements.md`](../01-ding/requirements.md); this subsystem does not redefine terminal
-delivery.
+This subsystem defines the native message bus beyond terminal delivery. It
+refines root requirement [`R05`](../requirements.md) for durable message
+publication and inherits immutable agent ID and mutable address semantics from
+`R19` and `R24`. DING consumes the recipient inbox under
+[`01-ding/requirements.md`](../01-ding/requirements.md); this subsystem does not
+redefine terminal delivery.
 
 ## Assumptions
 
@@ -41,9 +42,19 @@ delivery.
 - **MESSAGE-R01 Sender-owned enumeration:** Every successful ordinary `message send` and `message
   reply` by an indexed sender creates one durable sender-owned row. `message sent` enumerates only
   that sender-owned state; recipient inbox and archive state cannot remove or supply its rows.
-- **MESSAGE-R02 Canonical direction:** Catalog-backed publication resolves and persists canonical
-  sender and recipient bus identities. A sent row carries `to`; it does not repurpose the inbound
-  row's `from` field.
+- **MESSAGE-R02 Canonical direction and readable projection:** Ordinary Agent
+  publication resolves each sender and recipient address to one immutable agent
+  ID and persists those IDs as canonical direction and provenance. It also
+  appends each endpoint's publication-time bus address as display-only snapshot
+  metadata. A sent row carries canonical `to`; it does not repurpose the inbound
+  row's `from` field. Inbox rendering includes canonical sender ID and readable
+  sender address. DING resolves the sender ID to its current bus address at
+  delivery and otherwise falls back to the immutable ID, showing the
+  publication snapshot only when it is explicitly marked historical, because a
+  released address is immediately reusable. Replies and automation always use
+  the persisted ID. A separately admitted principal or external endpoint uses an
+  explicit endpoint-kind discriminator and its canonical principal/external
+  address; it is never represented as an agent ID.
 - **MESSAGE-R03 Explicit coverage:** Machine output distinguishes an unavailable index, coverage
   beginning at one unix-millisecond boundary, and partial coverage with pending intents. An absent
   or interrupted index must never serialize as a complete empty history. Count output refuses
@@ -51,8 +62,16 @@ delivery.
   every completed row. Exact traversal to genesis rejects missing, extra, substituted, corrupt,
   unreadable, or version-mismatched head, node, active-intent, pending, and row state instead of
   weakening the coverage claim.
-- **MESSAGE-R04 Stable shared wire:** The sent envelope and row are serialized through `st2-wire`.
-  Optional metadata and body omission preserve absent versus empty values.
+- **MESSAGE-R04 Stable shared wire:** The sent envelope and row are serialized
+  through `st2-wire`. Optional metadata and body omission preserve absent versus
+  empty values. A durable record version changes whenever an existing field's
+  meaning changes or a strict record gains fields. A reader may reinterpret a
+  version-1 endpoint as an agent ID only for legacy bus identities that
+  migration froze for that same subject. Bytes that migration reassigned away
+  from an archived collision resolve only for the row's own state owner and are
+  otherwise rendered as an unattributed historical address that carries no
+  reply or automation authority; the reader never attributes them to the live
+  subject that kept them.
 
 ### Must survive interruption without a false Sent claim
 
@@ -74,9 +93,12 @@ delivery.
 
 ### Must remain usable as one bounded read
 
-- **MESSAGE-R09 Directional filters:** `message sent [identity]` defaults to the acting identity and
-  supports `--count`, `--include-body`, strict `--since`, JSON, and `--to` as the directional analogue
-  of inbox `--from` wherever coverage can be represented honestly.
+- **MESSAGE-R09 Directional filters:** `message sent [address]` selects the
+  positional address, then `--as`, then the exact acting ID from `ST_AGENT`,
+  and supports an explicit mutually exclusive `--id`. It also supports
+  `--count`, `--include-body`, strict `--since`, JSON, and `--to` as the
+  directional analogue of inbox `--from` wherever coverage can be represented
+  honestly.
 - **MESSAGE-R10 Catalog-scale read:** On one captured real catalog with at least 557 agents and at
   least one real sender row, one warm-up followed by ten timed reads of both `message sent --json`
   and same-sender `message ls --json` records both p95 values and their ratio. Sent p95 is no greater

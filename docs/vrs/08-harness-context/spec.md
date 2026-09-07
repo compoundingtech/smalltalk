@@ -43,6 +43,15 @@ transport runs. Open questions are tracked in
 [open-questions.md](./open-questions.md); the direction this design deliberately
 does not take yet is in [roadmap.md](./roadmap.md).
 
+The `agent` field's immutable-ID meaning is the accepted target, and it ships
+as a new record version, `st2.harness-context.v2`: the version suffix is the
+read contract, so changing an existing field's meaning reserves the next
+version rather than reusing `v1`. Records and producers stay on
+`st2.harness-context.v1`, whose `agent` remains a bus identity, until
+[DELTA-003](../.delta/DELTA-003-agent-address-not-implemented.md) closes.
+Version 2 is otherwise identical to the shape below, and the reader-first
+rollout accepts both versions before any version-2 writer activates.
+
 ## Scope
 
 This specification defines the harness-context record, its freshness and
@@ -92,9 +101,10 @@ namespace is st2's own and is not registered anywhere; st2 core is its steward.
 The version suffix is the read contract, not the field set: additive fields do
 not bump it, and a reader that finds any other schema string refuses the record
 rather than guessing at fields spelled like this version's. Examples: valid
-`st2.harness-context.v1`; a future breaking shape `st2.harness-context.v2`;
-foreign and therefore refused `com.example.harness-context.v1`; invalid (no
-version) `st2.harness-context`.
+`st2.harness-context.v1`; the reserved immutable-ID shape
+`st2.harness-context.v2`, which tolerant readers accept before any producer
+emits it; foreign and therefore refused `com.example.harness-context.v1`;
+invalid (no version) `st2.harness-context`.
 
 ## Record (HC-R01, HC-R04)
 
@@ -107,7 +117,7 @@ replicated subtree (see
 ```json
 {
   "schema": "st2.harness-context.v1",
-  "agent": "<identity>",
+  "agent": "<identity in v1; agent ID in v2>",
   "harness": "claude | codex | pi | omp | opencode",
   "usedTokens": 92283,
   "windowTokens": 258400,
@@ -218,11 +228,14 @@ What a reader projects, in evaluation order:
 | Evidence | Projects as | Reason |
 | --- | --- | --- |
 | No record file | `null` | never observed |
-| Unreadable, unparseable, or non-v1 `schema` | `null`, warning logged | nothing trustworthy to report; `DQ-C5` asks whether this deserves an explicit `indeterminate` the way `driverDiagnostic` has one |
+| Unreadable, unparseable, or a `schema` outside the accepted versions | `null`, warning logged | nothing trustworthy to report; `DQ-C5` asks whether this deserves an explicit `indeterminate` the way `driverDiagnostic` has one |
 | Unrecognized `harness` | `null`, warning logged | the arithmetic is unknown, so the numbers have no meaning |
 | `observedAtMs` > now + `HARNESS_CONTEXT_FUTURE_SKEW` | `null` | a clock this wrong makes the derived age meaningless |
 | `observedAtMs` ≤ now − `HARNESS_CONTEXT_STALE` | the reading, `stale: true`, with `ageMs` | HC-R06: returned with its age, never derived away |
 | Otherwise | the reading, `stale: false`, with `ageMs` | — |
+
+The accepted versions are `st2.harness-context.v1` and, once tolerant readers
+ship, `st2.harness-context.v2`; any other schema string is refused.
 
 `ageMs` is derived by the reader from `observedAtMs`; no read path consults file
 mtime. There is no `unknown` vocabulary on this axis and no path from any
@@ -804,7 +817,7 @@ The producer is otherwise the pi one with two divergences, both measured:
 The version pin (HC-R13, HC-T03) extends the existing launch gate rather than
 adding a mechanism beside it, and the two answer deliberately different
 questions. `SUPPORTED_OMP_MINORS` admits a **minor series**, because a patch
-inside an admitted minor costs no new evidence (decision 0007); the fixture pins
+inside an admitted minor costs no new evidence (decision 0007-omp-is-a-fifth-native-driver-with-its-own-channel-and-a-hard-version-gate); the fixture pins
 the **exact builds** a number's meaning was measured on, because "`tokens` is
 prompt-only input" is a property of a build and not of any documented contract.
 `src/omp_session.rs::the_measured_context_builds_are_admitted_by_this_gate`

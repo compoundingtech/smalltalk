@@ -72,7 +72,7 @@ run natively without a second producer-identity mechanism.
 - Issue #49's "topic" remains a message-side axis; the event-side grouping
   axis is *key*. The two must not be merged by name.
 - Suspension semantics follow locality: the stream task is an owned task, so
-  R27 tears it down with the agent — eyes closed, no accumulation, resume
+  R41 tears it down with the agent — eyes closed, no accumulation, resume
   re-observes; the dedup ring makes re-emission of still-current state safe.
 - Ingress authority follows the same locality: `event emit` runs only when its
   resolved logical owner host and catalog lock match the unsynchronized

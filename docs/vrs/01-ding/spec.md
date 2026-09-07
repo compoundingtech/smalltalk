@@ -10,6 +10,10 @@ specified in [`01-claude/spec.md`](./01-claude/spec.md) and
 Active. A map to the implementation and its evidence, not a replacement for the
 tests.
 
+The sender-projection section is the accepted immutable-ID target. The current
+implementation remains on bus-identity projection until
+[DELTA-003](../.delta/DELTA-003-agent-address-not-implemented.md) closes.
+
 ## Composer states
 
 One inspection of a rendered screen, evaluated against one exact expected
@@ -25,6 +29,22 @@ notice, yields exactly one state:
 
 `Ambiguous` is the default for anything not positively understood, per
 `DING-R03`. It is not an error state and carries no diagnostic obligation.
+
+## Sender projection
+
+For an Agent endpoint, the durable message carries canonical sender ID plus a
+publication-time bus address snapshot. Immediately before constructing the
+notice, DING resolves the ID against one coherent current address book. The
+displayed sender is the current bus address only when that lookup succeeds.
+An absent, unreadable, incomplete, ambiguous, or nonroutable address book
+degrades to the immutable ID, which is always displayable, optionally
+accompanied by the publication-time snapshot explicitly marked as a historical
+address. It never presents that snapshot alone as the current sender: a
+released address is immediately reusable, so the saved bytes may already route
+to a different subject. Cosmetic lookup never blocks delivery.
+A principal or external endpoint displays its canonical typed address
+without Agent lookup. Replies retain the canonical endpoint from the message;
+rendered text is never reparsed as authority.
 
 ## Delivery
 

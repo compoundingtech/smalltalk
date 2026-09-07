@@ -2606,3 +2606,303 @@ fn malformed_stream_kdl_shapes_fail_closed() {
         );
     }
 }
+
+// ---- R24 immutable agent ID and mutable agent address ----------------------------------------
+
+/// A legacy declaration carries neither field, so its effective subject ID is the
+/// `<host>.<identity>` bus identity migration will freeze, and its effective address is the
+/// positional identity fallback.
+#[test]
+fn a_legacy_declaration_falls_back_to_its_bus_identity_and_positional_address() {
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        "agents/dev3/verifier/agent.kdl",
+        "agent \"verifier\" { host \"dev3\"; command \"work\" }\n",
+    );
+
+    let found = discover_strict(tmp.path());
+    assert!(found.errors.is_empty(), "{:?}", found.errors);
+    let spec = find(&found.specs, "verifier");
+    assert_eq!(spec.id, None);
+    assert_eq!(spec.address, None);
+    assert_eq!(spec.effective_id("other"), "dev3.verifier");
+    assert_eq!(spec.effective_address(), "verifier");
+    assert_eq!(spec.bus_address("other"), "dev3.verifier");
+    assert_eq!(spec.bus_id("other"), "dev3.verifier");
+}
+
+/// An explicit `id` is the immutable subject identity and an explicit `address` is the effective
+/// route; the positional `identity` stays the declaration key and stops being the address.
+#[test]
+fn explicit_id_and_address_lower_as_separate_typed_namespaces() {
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        "agents/dev3/verifier/agent.kdl",
+        r#"agent "verifier" {
+  id "0199b8f4-8d3a-7c21-9a44-6f85b7320ea1"
+  address "dotfiles.fractal.keymap.verifier"
+  host "dev3"
+  command "work"
+}
+"#,
+    );
+
+    let found = discover_strict(tmp.path());
+    assert!(found.errors.is_empty(), "{:?}", found.errors);
+    let spec = find(&found.specs, "verifier");
+    assert_eq!(spec.id.as_deref(), Some("0199b8f4-8d3a-7c21-9a44-6f85b7320ea1"));
+    assert_eq!(
+        spec.effective_id("dev3"),
+        "0199b8f4-8d3a-7c21-9a44-6f85b7320ea1"
+    );
+    assert_eq!(spec.address.as_deref(), Some("dotfiles.fractal.keymap.verifier"));
+    assert_eq!(spec.effective_address(), "dotfiles.fractal.keymap.verifier");
+    assert_eq!(
+        spec.bus_address("other"),
+        "dev3.dotfiles.fractal.keymap.verifier"
+    );
+    // The legacy bus identity remains the declaration's positional projection; it is not the ID.
+    assert_eq!(spec.bus_id("other"), "dev3.verifier");
+    assert_eq!(spec.identity, "verifier");
+
+    // Equal bytes across the two namespaces do not collide: the ID may look like an address and
+    // an address may look like a legacy host-qualified identity.
+    write(
+        tmp.path(),
+        "agents/dev3/opaque/agent.kdl",
+        r#"agent "opaque" {
+  id "dev3.frozen.legacy"
+  address "dev3.frozen.legacy"
+  host "dev3"
+  command "work"
+}
+"#,
+    );
+    let found = discover_strict(tmp.path());
+    assert!(found.errors.is_empty(), "{:?}", found.errors);
+    let opaque = find(&found.specs, "opaque");
+    assert_eq!(opaque.id.as_deref(), Some("dev3.frozen.legacy"));
+    assert_eq!(opaque.effective_address(), "dev3.frozen.legacy");
+}
+
+/// A declaration whose *only* agent-shaped signal is an `id` or an `address` is not a candidate.
+/// Both are among the most common keys in arbitrary JSON/TOML, so admitting them turns a stray
+/// file beside a real declaration — a dropped GitHub payload, a task cache, a session record —
+/// into a phantom agent, and because such a file carries no launch it also stops the catalog from
+/// admitting at all. Migration adds `id` to declarations that are candidates for other reasons.
+#[test]
+fn a_lone_id_or_address_is_not_a_spec_candidate() {
+    for (field, value) in [("id", "gh-123"), ("address", "0.0.0.0:8080")] {
+        let tmp = tempfile::tempdir().unwrap();
+        write(
+            tmp.path(),
+            "agents/h/root/agent.kdl",
+            "agent \"root\" { host \"h\"; command \"work\" }",
+        );
+        write(
+            tmp.path(),
+            "agents/h/root/notes.toml",
+            &format!("{field} = \"{value}\"\ntitle = \"notes\"\n"),
+        );
+        let found = discover_strict(tmp.path());
+        assert!(found.errors.is_empty(), "{field}: {:?}", found.errors);
+        assert_eq!(found.specs.len(), 1, "{field} must not be an agent signal");
+        assert_eq!(find(&found.specs, "root").bus_id("h"), "h.root");
+    }
+}
+
+/// The address grammar is R24's: at most 255 ASCII characters, dotted 1..=63-character segments of
+/// lowercase letters, digits, and hyphens, each beginning and ending with a letter or digit.
+#[test]
+fn the_address_grammar_is_bounded_lowercase_dotted_segments() {
+    for accepted in [
+        "worker",
+        "w",
+        "dotfiles.fractal.keymap.verifier",
+        "a-b.c-1.9",
+        "0",
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        write(
+            tmp.path(),
+            "agents/h/worker/agent.kdl",
+            &format!("agent \"worker\" {{ host \"h\"; address \"{accepted}\"; command \"work\" }}"),
+        );
+        let found = discover_strict(tmp.path());
+        assert!(found.errors.is_empty(), "{accepted}: {:?}", found.errors);
+        assert_eq!(
+            find(&found.specs, "worker").effective_address(),
+            accepted,
+            "{accepted}"
+        );
+    }
+
+    let long_segment = "a".repeat(64);
+    // 4x63 characters plus 3 separators is exactly the 255-character budget; one more segment
+    // overruns it while every segment stays legal on its own.
+    let over_budget = format!(
+        "{}.e",
+        ["a".repeat(63), "b".repeat(63), "c".repeat(63), "d".repeat(63)].join(".")
+    );
+    for (rejected, expected) in [
+        ("Worker", "must match [a-z0-9-]+"),
+        ("wor_ker", "must match [a-z0-9-]+"),
+        ("-worker", "must begin and end with a letter or digit"),
+        ("worker-", "must begin and end with a letter or digit"),
+        ("a..b", "empty dotted segment"),
+        (".worker", "empty dotted segment"),
+        ("worker.", "empty dotted segment"),
+        ("wörker", "must be ASCII"),
+        (long_segment.as_str(), "exceeds 63 characters"),
+        (over_budget.as_str(), "exceeds the 255-character limit"),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        write(
+            tmp.path(),
+            "agents/h/worker/agent.kdl",
+            &format!("agent \"worker\" {{ host \"h\"; address \"{rejected}\"; command \"work\" }}"),
+        );
+        let found = discover(tmp.path());
+        assert_eq!(found.errors.len(), 1, "{rejected}: {:?}", found.errors);
+        assert!(
+            found.errors[0].message.contains(expected),
+            "{rejected}: {:?}",
+            found.errors
+        );
+    }
+}
+
+/// The ID is opaque, but it is also the canonical task ID under R26 and it travels through
+/// shell-adjacent text, so the grammar is the closed safe set `[A-Za-z0-9._-]`: every shell
+/// metacharacter, separator, whitespace and non-ASCII byte is refused, while both admitted
+/// producers — UUIDv7 and a frozen `<host>.<identity>` bus identity, case and underscores
+/// included — stay admissible.
+#[test]
+fn the_id_grammar_admits_uuidv7_and_frozen_bus_identities_only() {
+    for accepted in [
+        "0199b8f4-8d3a-7c21-9a44-6f85b7320ea1",
+        "dev3.dotfiles.fractal.help-key.verifier",
+        "hetz.worker",
+        "Legacy_Identity-9",
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        write(
+            tmp.path(),
+            "agents/h/worker/agent.kdl",
+            &format!("agent \"worker\" {{ host \"h\"; id \"{accepted}\"; command \"work\" }}"),
+        );
+        let found = discover_strict(tmp.path());
+        assert!(found.errors.is_empty(), "{accepted}: {:?}", found.errors);
+        assert_eq!(find(&found.specs, "worker").id.as_deref(), Some(accepted));
+    }
+
+    let too_long = "a".repeat(256);
+    for (rejected, expected) in [
+        ("", "cannot be empty"),
+        ("has space", "must match [A-Za-z0-9._-]+"),
+        ("a/b", "must match [A-Za-z0-9._-]+"),
+        ("a\\\\b", "must match [A-Za-z0-9._-]+"),
+        ("host:1", "must match [A-Za-z0-9._-]+"),
+        ("a`id`b", "must match [A-Za-z0-9._-]+"),
+        ("a$(id)b", "must match [A-Za-z0-9._-]+"),
+        ("a;id", "must match [A-Za-z0-9._-]+"),
+        ("a&b", "must match [A-Za-z0-9._-]+"),
+        ("a|b", "must match [A-Za-z0-9._-]+"),
+        ("a*b", "must match [A-Za-z0-9._-]+"),
+        ("a?b", "must match [A-Za-z0-9._-]+"),
+        ("a'b", "must match [A-Za-z0-9._-]+"),
+        ("wörker", "must match [A-Za-z0-9._-]+"),
+        (".leading", "cannot begin or end with `.`"),
+        ("trailing.", "cannot begin or end with `.`"),
+        (too_long.as_str(), "exceeds the 255-byte limit"),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        write(
+            tmp.path(),
+            "agents/h/worker/agent.kdl",
+            &format!("agent \"worker\" {{ host \"h\"; id \"{rejected}\"; command \"work\" }}"),
+        );
+        let found = discover(tmp.path());
+        assert_eq!(found.errors.len(), 1, "'{rejected}': {:?}", found.errors);
+        assert!(
+            found.errors[0].message.contains(expected),
+            "'{rejected}': {:?}",
+            found.errors
+        );
+    }
+}
+
+/// KDL is canonical, but the readable TOML and JSON forms lower the same two fields.
+#[test]
+fn id_and_address_have_equivalent_kdl_toml_and_json_lowering() {
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        "agents/h/kdl/agent.kdl",
+        "agent \"kdl\" { host \"h\"; id \"frozen.kdl\"; address \"kdl.route\"; command \"work\" }",
+    );
+    write(
+        tmp.path(),
+        "agents/h/toml/agent.toml",
+        "id = \"frozen.toml\"\naddress = \"toml.route\"\ncommand = \"work\"\n",
+    );
+    write(
+        tmp.path(),
+        "agents/h/json/agent.json",
+        r#"{"id":"frozen.json","address":"json.route","command":"work"}"#,
+    );
+
+    let found = discover_strict(tmp.path());
+    assert!(found.errors.is_empty(), "{:?}", found.errors);
+    for format in ["kdl", "toml", "json"] {
+        let spec = find(&found.specs, format);
+        assert_eq!(spec.id.as_deref(), Some(format!("frozen.{format}").as_str()));
+        assert_eq!(spec.effective_address(), format!("{format}.route"));
+    }
+}
+
+/// Declaring either routing field twice is a shape refusal at the canonical KDL boundary, not a
+/// first- or last-wins merge — the same rule `identity` and `host` already carry.
+#[test]
+fn a_repeated_id_or_address_declaration_is_refused() {
+    for field in ["id", "address"] {
+        let tmp = tempfile::tempdir().unwrap();
+        write(
+            tmp.path(),
+            "agents/h/worker/agent.kdl",
+            &format!(
+                "agent \"worker\" {{ host \"h\"; {field} \"first\"; {field} \"second\"; command \"work\" }}"
+            ),
+        );
+        let found = discover(tmp.path());
+        assert_eq!(found.errors.len(), 1, "{field}: {:?}", found.errors);
+        assert!(
+            found.errors[0]
+                .message
+                .contains(&format!("agent {field} must be declared exactly once")),
+            "{field}: {:?}",
+            found.errors
+        );
+    }
+}
+
+/// The pre-lowering declared view exposes both fields so a linter can fault what the file says
+/// rather than what lowering resolved.
+#[test]
+fn the_declared_view_exposes_id_and_address_as_written() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("agent.kdl");
+    fs::write(
+        &path,
+        "agent \"worker\" { host \"h\"; id \"frozen.worker\"; address \"worker.route\" }\n",
+    )
+    .unwrap();
+
+    let declared = agent_spec::parse_declared(&path).unwrap();
+    assert_eq!(declared.len(), 1);
+    assert_eq!(declared[0].id.as_deref(), Some("frozen.worker"));
+    assert_eq!(declared[0].address.as_deref(), Some("worker.route"));
+    assert_eq!(declared[0].identity.as_deref(), Some("worker"));
+}

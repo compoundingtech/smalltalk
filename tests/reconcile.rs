@@ -418,6 +418,8 @@ fn spec(
     tasks: Vec<Task>,
 ) -> AgentSpec {
     AgentSpec {
+        id: None,
+        address: None,
         identity: identity.to_string(),
         name: None,
         description: None,
@@ -850,6 +852,67 @@ fn retired_with_live_sessions_is_torn_down() {
     let plan = reconcile(&specs, &[live("hetz.old")], HOST);
     assert_eq!(plan.teardown.len(), 1);
     assert_eq!(plan.teardown[0].pty_ids, vec!["hetz.old"]);
+}
+
+/// dotfiles#1535: retiring an agent that still declares `resource` bindings (including a `work://`
+/// URI) must admit and reconcile to zero live tasks without error — the Resource references are
+/// declaration metadata, not a reason to refuse admission — and flipping back to running must
+/// relaunch the seat. Task-identity admission never consults resources; this pins that contract.
+#[test]
+fn retired_agent_keeps_resources_and_still_reconciles_to_zero_live_tasks() {
+    let with_resources = || {
+        let mut spec = spec(
+            "worker",
+            Some(HOST),
+            JobType::Service,
+            true,
+            vec![task(TaskKind::Pty, "agent", Some("hetz.worker"), Some("x"))],
+        );
+        spec.resources.push(
+            Resource::new(
+                "work".into(),
+                "work://hetz/current-task".into(),
+                "Current implementation task.".into(),
+            )
+            .unwrap(),
+        );
+        spec.resources.push(
+            Resource::new(
+                "issue".into(),
+                "github-issue://example/project/41".into(),
+                "Tracking issue.".into(),
+            )
+            .unwrap(),
+        );
+        spec
+    };
+
+    // Retired with a live seat: admits (no TaskIdentityAdmissionError), tears down the seat,
+    // settles retirement, launches nothing. The declared resources do not block any of this.
+    let retired = [with_resources()];
+    let plan = reconcile_result(&retired, &[live("hetz.worker")], HOST)
+        .expect("retired specs with resources are admitted");
+    assert_eq!(plan.teardown.len(), 1);
+    assert_eq!(plan.teardown[0].pty_ids, vec!["hetz.worker"]);
+    assert_eq!(plan.settle_retirement.len(), 1);
+    assert!(plan.launch.is_empty());
+
+    // Once the seat is gone, retirement is complete: nothing to tear down, gc, or launch.
+    let plan = reconcile_result(&retired, &[], HOST).expect("retired specs with resources admit");
+    assert!(plan.teardown.is_empty());
+    assert!(plan.launch.is_empty());
+    assert!(plan.gc.is_empty());
+
+    // Un-retire (desired-state running): the identical spec, now running, relaunches its seat with
+    // its resources still intact.
+    let mut unretired = with_resources();
+    unretired.desired_state = AgentDesiredState::Running;
+    assert_eq!(unretired.resources.len(), 2);
+    let specs = [unretired];
+    let plan = reconcile_result(&specs, &[], HOST).expect("running specs with resources admit");
+    assert_eq!(plan.launch.len(), 1);
+    assert_eq!(plan.launch[0].tasks[0].pty_id, "hetz.worker");
+    assert!(plan.settle_retirement.is_empty());
 }
 
 #[test]

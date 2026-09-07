@@ -172,6 +172,7 @@ assert.deepStrictEqual(
 
 settleIdle = false;
 beforeSettleCase = readFrames().filter((frame) => frame.type === "state").length;
+let beforeTurns = readFrames().filter((frame) => frame.type === "turn").length;
 await handlers.get("agent_end")(successfulEnd, settleCtx);
 await handlers.get("agent_end")(
   {
@@ -187,25 +188,51 @@ assert.strictEqual(
   beforeSettleCase,
   "willContinue must cancel the older poll and start no new settle",
 );
+// A retried turn has not ended, so it claims neither credential edge: only the ordinary end
+// before it may emit a turn result.
+assert.deepStrictEqual(
+  readFrames().filter((frame) => frame.type === "turn").slice(beforeTurns),
+  [{ type: "turn" }],
+  "willContinue must emit no turn result",
+);
 
 settleIdle = false;
 beforeSettleCase = readFrames().filter((frame) => frame.type === "state").length;
+beforeTurns = readFrames().filter((frame) => frame.type === "turn").length;
 await handlers.get("agent_end")(successfulEnd, settleCtx);
 await handlers.get("agent_end")(
   {
     messages: [
       { role: "user" },
-      { role: "assistant", stopReason: "error", errorMessage: "  credential\n expired  " },
+      {
+        role: "assistant",
+        stopReason: "error",
+        errorMessage: "  credential\n expired  ",
+        errorStatus: 401,
+        errorId: 16781312,
+      },
     ],
   },
   settleCtx,
 );
 settleIdle = true;
 await new Promise((resolve) => setTimeout(resolve, 250));
+// The terminal error's whole observation rides ONE frame: the typed turn result. It cancels the
+// older settle poll, so no stale idle lands, and it carries omp's own classification bitfield
+// verbatim — st2, not this asset, decides whether that names a rejected credential. `errorStatus`
+// stays off the wire on purpose.
+assert.strictEqual(
+  readFrames().filter((frame) => frame.type === "state").length,
+  beforeSettleCase,
+  "terminal error must cancel the older poll without asserting a state word",
+);
 assert.deepStrictEqual(
-  readFrames().filter((frame) => frame.type === "state").slice(beforeSettleCase),
-  [{ type: "state", state: "active", reason: "credential expired" }],
-  "terminal error must cancel the older poll and remain actionable",
+  readFrames().filter((frame) => frame.type === "turn").slice(beforeTurns),
+  [
+    { type: "turn" },
+    { type: "turn", error: { reason: "credential expired", errorId: 16781312 } },
+  ],
+  "terminal error must emit the typed turn result and stay actionable",
 );
 
 // `session_shutdown` has no reason field upstream and always denotes process exit. Closing must

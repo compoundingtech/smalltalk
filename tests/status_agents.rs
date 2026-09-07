@@ -291,6 +291,98 @@ fn roster_json_and_human_output_distinguish_retirement_from_presence() {
     );
 }
 
+/// DELTA-003 (R24/R25): the roster appends the immutable agent ID, the effective mutable address,
+/// and the routable bus address without disturbing `identity`, which stays the positional
+/// declaration key and legacy address fallback. A retired subject is non-routable: its
+/// `busAddress` is null and every other field is still present.
+#[test]
+fn roster_json_appends_agent_id_address_and_nullable_bus_address() {
+    const EXPLICIT_ID: &str = "0193b8f2-7c31-7a4e-9f11-4c2d6b8a35e7";
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    write(root, "h/legacy/agent.kdl", &agent_kdl("legacy", "h"));
+    write(
+        root,
+        "h/migrated/agent.kdl",
+        &agent_kdl("migrated", "h").replace(
+            "  type \"service\"\n",
+            &format!(
+                "  type \"service\"\n  id \"{EXPLICIT_ID}\"\n  address \"delivery-lead\"\n"
+            ),
+        ),
+    );
+    write(
+        root,
+        "h/retired/agent.kdl",
+        &retired_agent_kdl("retired", "h"),
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_st2"))
+        .arg("agents")
+        .arg(root)
+        .args(["--host", "h", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let rows: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let rows = rows.as_array().unwrap();
+    let find = |identity: &str| {
+        rows.iter()
+            .find(|row| row["identity"] == identity)
+            .unwrap_or_else(|| panic!("no roster row for {identity}"))
+            .clone()
+    };
+
+    // A legacy declaration: the ID migration will freeze is exactly its bus identity, and the
+    // effective address is its positional identity.
+    let legacy = find("h.legacy");
+    assert_eq!(legacy["id"], "h.legacy");
+    assert_eq!(legacy["address"], "legacy");
+    assert_eq!(legacy["busAddress"], "h.legacy");
+
+    // An explicitly migrated declaration: all three new fields reflect the declared values and
+    // `identity` is untouched — it is not the agent ID.
+    let migrated = find("h.migrated");
+    assert_eq!(migrated["identity"], "h.migrated");
+    assert_eq!(migrated["id"], EXPLICIT_ID);
+    assert_eq!(migrated["address"], "delivery-lead");
+    assert_eq!(migrated["busAddress"], "h.delivery-lead");
+
+    // A retired subject releases its address: `busAddress` is null, nothing else goes missing.
+    let retired = find("h.retired");
+    assert_eq!(retired["busAddress"], serde_json::Value::Null);
+    assert_eq!(retired["id"], "h.retired");
+    assert_eq!(retired["address"], "retired");
+    assert_eq!(retired["retired"], true);
+    assert_eq!(retired["status"], "offline");
+    assert_eq!(retired["desiredState"], "retired");
+    for field in [
+        "identity",
+        "status",
+        "name",
+        "description",
+        "retired",
+        "resources",
+        "desiredState",
+        "desiredStateReason",
+        "observedState",
+        "driverDiagnostic",
+        "context",
+        "id",
+        "address",
+        "busAddress",
+    ] {
+        assert!(
+            retired.get(field).is_some(),
+            "retired row lost `{field}`: {retired}"
+        );
+    }
+}
+
 #[test]
 fn exact_identity_rejects_duplicates_before_status_filtering() {
     let tmp = tempfile::tempdir().unwrap();
@@ -463,12 +555,16 @@ fn roster_joins_a_real_context_record_independently_of_observed_state() {
 
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
+    // A harness-context write stages under the catalog control plane and validates canonical
+    // `<catalog>/agents/<host>/<identity>` ancestry ("Replicated-path discipline"), so this
+    // fixture must be a real catalog rather than a bare host/identity pair.
+    fs::create_dir_all(root.join(st2::catalog_lock::CONTROL_DIR)).unwrap();
     write(
         root,
-        "hetz/filling/agent.kdl",
+        "agents/hetz/filling/agent.kdl",
         &agent_kdl("filling", "hetz"),
     );
-    let agent_dir = root.join("hetz/filling");
+    let agent_dir = root.join("agents/hetz/filling");
     set_state(&status_path(&agent_dir), State::Busy).unwrap();
 
     // No record: the axis is emitted as `null`, not omitted.

@@ -46,10 +46,12 @@ pub use discovery::{
     parse_declared, path_defaults,
 };
 pub use spec::{
+    AGENT_ADDRESS_MAX_BYTES, AGENT_ADDRESS_SEGMENT_MAX_BYTES, AGENT_ID_MAX_BYTES,
     AgentDesiredState, AgentSpec, ClaudeDriver, CodexDriver, DeliveryReadiness, DeliveryTransport,
     Driver, JobType, OpenCodeDriver, PiDriver, Resource, Restart, RestartMode, STREAM_TASK_PREFIX,
     SessionDriver, Stream, StreamLaunch, Task, TaskKind, TaskLifecycle, parse_duration,
-    stream_name_of_task, validate_desired_state_reason,
+    stream_name_of_task, validate_agent_address, validate_agent_id,
+    validate_desired_state_reason,
 };
 pub use profile::{
     DEFAULT_SELECTOR_LIMIT_BYTES, DescriptorValidationError, PROFILE_DESCRIPTOR_ABI_VERSION,

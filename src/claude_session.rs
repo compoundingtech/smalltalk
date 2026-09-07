@@ -20,7 +20,7 @@ use crate::harness_state::{Activity, Ask, BlockedOn, InputBuffer, Observation};
 use crate::provider_session::{
     PROVIDER_POLL, STOP, SessionObserver, install_signal_handler, run_provider,
 };
-use crate::{harness_state, message, status};
+use crate::{driver_diagnostic, harness_state, message, status};
 
 /// Run one interactive Claude provider and maintain its presence until it exits.
 pub fn run(
@@ -30,7 +30,7 @@ pub fn run(
     claude_argv: Vec<String>,
 ) -> Result<()> {
     let agent_dir =
-        message::resolve_agent_dir(catalog_root, &identity, &crate::run::detect_host())?
+        message::resolve_declared_dir(catalog_root, &identity, &crate::run::detect_host())?
             .with_context(|| format!("Claude driver agent '{identity}' is not declared"))?;
     anyhow::ensure!(
         !claude_argv.is_empty(),
@@ -159,7 +159,7 @@ pub fn run_observe(
     runtime_id: Option<&str>,
     event: &str,
 ) -> Result<()> {
-    let agent_dir = message::resolve_agent_dir(catalog_root, identity, &crate::run::detect_host())?
+    let agent_dir = message::resolve_declared_dir(catalog_root, identity, &crate::run::detect_host())?
         .with_context(|| format!("Claude driver agent '{identity}' is not declared"))?;
     // Counted only once the invocation has its application target: a hook for an undeclared
     // agent errors out before any state is applied and must not inflate `hook_invocations_total`.
@@ -173,6 +173,12 @@ pub fn run_observe(
     // a hook the harness is waiting on, and the numbers authorize nothing (HC-A02).
     if let Err(error) = observe_compaction(&agent_dir, identity, event, &payload) {
         tracing::warn!("st2 claude-observe: harness-context compaction write failed: {error:#}");
+    }
+    // The credential axis is independent of both the numbers and the categorical state, and is
+    // applied before the observation guard below for the same reason the compaction write is:
+    // an edge that carries no top-level state change must still reach its own record.
+    if let Some(edge) = provider_auth_edge(event, &payload) {
+        publish_provider_auth(&agent_dir, edge);
     }
     let Some(observation) = observe_hook_event(event, &payload) else {
         return Ok(());
@@ -458,7 +464,7 @@ pub fn run_statusline(catalog_root: &Path, identity: &str) -> Result<()> {
 
 fn record_statusline(catalog_root: &Path, identity: &str, raw: &[u8]) -> Result<()> {
     let payload: serde_json::Value = serde_json::from_slice(raw).unwrap_or(serde_json::Value::Null);
-    let agent_dir = message::resolve_agent_dir(catalog_root, identity, &crate::run::detect_host())?
+    let agent_dir = message::resolve_declared_dir(catalog_root, identity, &crate::run::detect_host())?
         .with_context(|| format!("Claude driver agent '{identity}' is not declared"))?;
     // Deliberately uncounted. The tee builds no telemetry pipeline at all (`DQ-C13`, see
     // `main`), so a `record_hook_invocation` here could never reach a collector — and a metric
@@ -561,6 +567,19 @@ pub fn observe_hook_event(event: &str, payload: &serde_json::Value) -> Option<Ob
             BlockedOn::None,
             InputBuffer::Unknown,
         )),
+        // `StopFailure` fires INSTEAD of `Stop` when an API error ended the turn (Claude Code's
+        // own words, 2.1.259), at the same lifecycle point — so the categorical truth is the one
+        // `Stop` writes and only the reason differs. Deliberately not `ended`: the TUI is still
+        // live, a human can re-login and carry on, and this seat's terminal record belongs to the
+        // wrapper (OHS-T04). A hook claiming `ended` here would be a false terminal.
+        "StopFailure" => Some(
+            Observation::new(Activity::Idle, BlockedOn::None, InputBuffer::Unknown).with_reason(
+                match stop_failure_error(payload) {
+                    Some(CLAUDE_AUTH_REJECTED_ERROR) => "providerAuth",
+                    _ => "apiError",
+                },
+            ),
+        ),
         "PermissionRequest" => {
             // Driver-side classification (#162): the payload's tool_name distinguishes Claude's
             // question form from an ordinary permission prompt — the DQ-H1 captures show
@@ -579,6 +598,71 @@ pub fn observe_hook_event(event: &str, payload: &serde_json::Value) -> Option<Ob
             )
         }
         _ => None,
+    }
+}
+
+/// The `StopFailure` error word that names a rejected provider credential.
+///
+/// Claude Code classifies every 401/403 provider response as `authentication_failed` (measured on
+/// 2.1.259, which also documents the event as "fires instead of Stop when an API error (rate
+/// limit, auth failure, etc.) ended the turn"), so this one word IS the credential-rejected class.
+/// The siblings in that closed vocabulary are deliberately not it: `rate_limit` and `overloaded`
+/// are capacity, `oauth_org_not_allowed` is an org policy no re-login can satisfy,
+/// `account_on_hold` and `billing_error` are account state, and `invalid_request`,
+/// `model_not_found`, `server_error`, `max_output_tokens` and `unknown` are request or server
+/// faults. Naming any of them a credential rejection would hand an operator the wrong repair.
+const CLAUDE_AUTH_REJECTED_ERROR: &str = "authentication_failed";
+
+/// The closed `StopFailure` error word, as the payload spells it. `error_details` and
+/// `last_assistant_message` ride the same payload and are deliberately untouched: they are prose.
+fn stop_failure_error(payload: &serde_json::Value) -> Option<&str> {
+    payload.get("error").and_then(serde_json::Value::as_str)
+}
+
+/// What one hook event proves about the seat's provider credential.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProviderAuthEdge {
+    Rejected,
+    Accepted,
+}
+
+/// Read the credential edge out of one hook event, or `None` when the event proves nothing about
+/// it — which must leave a standing rejection alone rather than clearing it.
+fn provider_auth_edge(event: &str, payload: &serde_json::Value) -> Option<ProviderAuthEdge> {
+    match event {
+        "StopFailure" => (stop_failure_error(payload) == Some(CLAUDE_AUTH_REJECTED_ERROR))
+            .then_some(ProviderAuthEdge::Rejected),
+        // A turn that reached its ordinary end is positive proof the credential was accepted.
+        // `SessionStart` is not: a fresh session has made no provider call yet.
+        "Stop" => Some(ProviderAuthEdge::Accepted),
+        _ => None,
+    }
+}
+
+/// Record one credential edge on the seat's native-driver diagnostic.
+///
+/// Each hook invocation is its own short-lived writer, so the publisher's stage set starts empty
+/// and its on-disk fallback is what lets a later `Stop` clear a rejection an earlier `StopFailure`
+/// wrote from a different process. Fail-open like every other observation here: the publisher only
+/// warns on a write it cannot land.
+fn publish_provider_auth(agent_dir: &Path, edge: ProviderAuthEdge) {
+    let mut publisher = driver_diagnostic::Publisher::new(
+        agent_dir,
+        driver_diagnostic::Driver::Claude,
+        // A hook payload carries no Claude version — the common hook input is session id,
+        // transcript path, cwd, prompt id, permission mode, agent identity and effort, and
+        // nothing else (2.1.259) — and st2 gates no Claude version, so neither the producer
+        // version nor its support status is knowable from here.
+        None,
+        driver_diagnostic::Support::Unknown,
+    );
+    match edge {
+        ProviderAuthEdge::Rejected => publisher.publish(
+            driver_diagnostic::Stage::ProviderAuth,
+            driver_diagnostic::Reason::ProviderAuthRejected,
+            driver_diagnostic::Source::TurnResult,
+        ),
+        ProviderAuthEdge::Accepted => publisher.clear(driver_diagnostic::Stage::ProviderAuth),
     }
 }
 
@@ -706,6 +790,119 @@ mod tests {
         // Unmapped events say nothing rather than guessing.
         assert_eq!(observe_hook_event("Notification", &none), None);
         assert_eq!(observe_hook_event("SubagentStop", &none), None);
+    }
+
+    /// The measured `StopFailure` payload shape (Claude Code 2.1.259: `hook_event_name`, the
+    /// closed `error` word, optional `error_details` and `last_assistant_message`). It fires
+    /// INSTEAD of `Stop`, so the turn is over whatever the word is — but only the
+    /// credential class earns the `providerAuth` reason, and neither quota nor an org policy may
+    /// borrow it: a re-login fixes exactly one of the three.
+    #[test]
+    fn stop_failure_classifies_only_the_credential_class_as_provider_auth() {
+        let rejected = serde_json::json!({
+            "hook_event_name": "StopFailure",
+            "error": "authentication_failed",
+            "error_details": "Please run /login",
+            "last_assistant_message": "",
+        });
+        let rate_limited = serde_json::json!({
+            "hook_event_name": "StopFailure",
+            "error": "rate_limit",
+        });
+        let org_policy = serde_json::json!({
+            "hook_event_name": "StopFailure",
+            "error": "oauth_org_not_allowed",
+        });
+
+        for (payload, reason) in [
+            (&rejected, "providerAuth"),
+            (&rate_limited, "apiError"),
+            (&org_policy, "apiError"),
+        ] {
+            let observed = observe_hook_event("StopFailure", payload).unwrap();
+            assert_eq!(observed.state, Activity::Idle, "the turn ended: {reason}");
+            assert_eq!(observed.blocked_on, BlockedOn::None);
+            assert_eq!(observed.reason.as_deref(), Some(reason));
+        }
+
+        assert_eq!(
+            provider_auth_edge("StopFailure", &rejected),
+            Some(ProviderAuthEdge::Rejected)
+        );
+        assert_eq!(
+            provider_auth_edge("StopFailure", &rate_limited),
+            None,
+            "an exhausted allowance is not a rejected credential"
+        );
+        assert_eq!(
+            provider_auth_edge("StopFailure", &org_policy),
+            None,
+            "an org policy no re-login can satisfy is not a rejected credential"
+        );
+        assert_eq!(
+            provider_auth_edge("Stop", &serde_json::Value::Null),
+            Some(ProviderAuthEdge::Accepted),
+            "a turn that reached its ordinary end proves the credential worked"
+        );
+        assert_eq!(
+            provider_auth_edge("SessionStart", &serde_json::Value::Null),
+            None,
+            "a fresh session has made no provider call to prove anything with"
+        );
+    }
+
+    /// Each hook invocation is its own process, so the record must survive between them and the
+    /// recovery edge must reach a failure a different process published.
+    #[test]
+    fn a_rejected_claude_credential_stands_until_a_turn_reaches_its_ordinary_end() {
+        let tmp = tempfile::tempdir().unwrap();
+        let record = driver_diagnostic::path(tmp.path());
+        let rejected = serde_json::json!({
+            "hook_event_name": "StopFailure",
+            "error": "authentication_failed",
+        });
+
+        publish_provider_auth(
+            tmp.path(),
+            provider_auth_edge("StopFailure", &rejected).unwrap(),
+        );
+        let driver_diagnostic::Observed::Failure(failure) = driver_diagnostic::read(&record) else {
+            panic!("a rejected credential must publish a native-driver diagnostic")
+        };
+        assert_eq!(failure.driver, driver_diagnostic::Driver::Claude);
+        assert_eq!(failure.stage, driver_diagnostic::Stage::ProviderAuth);
+        assert_eq!(
+            failure.reason,
+            driver_diagnostic::Reason::ProviderAuthRejected
+        );
+        assert_eq!(failure.source, driver_diagnostic::Source::TurnResult);
+        assert_eq!(
+            failure.producer_version, None,
+            "a hook payload names no Claude version"
+        );
+        assert_eq!(
+            failure.support,
+            driver_diagnostic::Support::Unknown,
+            "st2 gates no Claude version, so support is not knowable from a hook"
+        );
+
+        // A later quota failure carries no credential edge, so the rejection stands.
+        let rate_limited = serde_json::json!({
+            "hook_event_name": "StopFailure",
+            "error": "rate_limit",
+        });
+        assert_eq!(provider_auth_edge("StopFailure", &rate_limited), None);
+        assert!(matches!(
+            driver_diagnostic::read(&record),
+            driver_diagnostic::Observed::Failure(_)
+        ));
+
+        publish_provider_auth(tmp.path(), ProviderAuthEdge::Accepted);
+        assert_eq!(
+            driver_diagnostic::read(&record),
+            driver_diagnostic::Observed::Absent,
+            "the next ordinary turn end clears a rejection a sibling hook process published"
+        );
     }
 
     #[test]

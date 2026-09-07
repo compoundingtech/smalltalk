@@ -285,6 +285,22 @@ pub fn parse_declared_document(source_name: &Path, source: &str) -> DeclaredPars
             ));
             continue;
         }
+        for field in node.children_named("id").skip(1) {
+            diagnostics.push(shape_diagnostic(
+                source_name,
+                field.span,
+                DeclaredDiagnosticCode::DuplicateRoutingField,
+                "agent id must be declared exactly once".to_owned(),
+            ));
+        }
+        for field in node.children_named("address").skip(1) {
+            diagnostics.push(shape_diagnostic(
+                source_name,
+                field.span,
+                DeclaredDiagnosticCode::DuplicateRoutingField,
+                "agent address must be declared exactly once".to_owned(),
+            ));
+        }
         for field in node.children_named("identity").skip(1) {
             diagnostics.push(shape_diagnostic(
                 source_name,

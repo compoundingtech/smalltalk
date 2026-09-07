@@ -12,7 +12,9 @@ if [[ -z "$identity" || -z "$root" ]] || ! command -v st2 >/dev/null 2>&1 || ! c
 fi
 
 input="$(cat)"
-error_type="$(printf '%s' "$input" | jq -r '.error_type // "unknown"' 2>/dev/null || printf unknown)"
+# Claude spells the closed error word `error` on the StopFailure payload (`error_type` is not a
+# field it ever emits), and the sibling observe hook reads the same field.
+error_type="$(printf '%s' "$input" | jq -r '.error // "unknown"' 2>/dev/null || printf unknown)"
 status="away"
 notify="yes"
 case "$error_type" in

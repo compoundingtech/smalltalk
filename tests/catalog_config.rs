@@ -183,3 +183,55 @@ fn a_mistyped_declaration_fails_validate() {
     assert_eq!(report["issues"][0]["code"], "catalog-config");
     assert_eq!(report["issues"][0]["severity"], "error");
 }
+
+/// `archive-after` decides when the supervisor archives a retired seat, so a value it cannot parse
+/// must fail the gate rather than silently fall back to the seven-day default.
+#[test]
+fn a_malformed_archive_after_fails_validate() {
+    let tmp = tempfile::tempdir().unwrap();
+    let catalog = tmp.path().join("catalog");
+    write_agent(&catalog, "h", "seat");
+    fs::write(
+        catalog.join("catalog.kdl"),
+        "catalog { archive-after \"7 fortnights\" }\n",
+    )
+    .unwrap();
+
+    let out = st2(
+        &["validate", "--catalog", catalog.to_str().unwrap()],
+        tmp.path(),
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !out.status.success(),
+        "validate passed an unparseable grace period:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("archive-after: unknown duration unit"),
+        "no issue naming the bad duration:\n{stdout}"
+    );
+}
+
+#[test]
+fn a_declared_archive_after_validates_in_every_accepted_form() {
+    for declared in ["\"7d\"", "\"12h\"", "\"0\"", "\"90\""] {
+        let tmp = tempfile::tempdir().unwrap();
+        let catalog = tmp.path().join("catalog");
+        write_agent(&catalog, "h", "seat");
+        fs::write(
+            catalog.join("catalog.kdl"),
+            format!("catalog {{ pty-root \"/run/agents/pty\"; archive-after {declared} }}\n"),
+        )
+        .unwrap();
+
+        let out = st2(
+            &["validate", "--catalog", catalog.to_str().unwrap()],
+            tmp.path(),
+        );
+        assert!(
+            out.status.success(),
+            "archive-after {declared} was rejected:\n{}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+    }
+}

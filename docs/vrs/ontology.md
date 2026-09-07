@@ -15,56 +15,133 @@ Terms without an independent authority are deliberately absent.
 The actor st2 models.
 
 Authority: [Agent Spec overview](https://github.com/compoundingtech/evals/blob/main/AGENT-SPEC.md#canonical-agent-specification);
-[R10 agent-only identity](requirements.md#L98-L99)
+[R10 agent-only identity](requirements.md)
 
 ### agent declaration
 
 The authored KDL representation of one agent.
 
 Authority: [Agent Spec discovery and declaration shape](https://github.com/compoundingtech/evals/blob/main/AGENT-SPEC.md#discovery-identity-and-host);
-[R02 canonical KDL](requirements.md#L36-L45)
+[R02 canonical KDL](requirements.md)
 
 ### agent runtime
 
 A running instance of an agent declaration.
 
-Authority: [declared runtime vision](vision.md#L16-L26);
-[`AgentSpec` runtime model](../../crates/agent-spec/src/spec.rs#L24-L50)
+Authority: [declared runtime vision](vision.md);
+[`AgentSpec` runtime model](../../crates/agent-spec/src/spec.rs)
 
 ### agent task
 
 A terminal-backed or terminal-free unit declared for an agent.
 
 Authority: [Agent Spec task contract](https://github.com/compoundingtech/evals/blob/main/AGENT-SPEC.md#compact-and-explicit-tasks);
-[`Task`](../../crates/agent-spec/src/spec.rs#L121-L148)
+[`Task`](../../crates/agent-spec/src/spec.rs)
 
-### agent identity
+### runtime resource target
 
-The bare `identity` value of an agent declaration. It is not a claim of
-fleet-wide uniqueness.
+A short-lived locator from one task inventory observation that tells an
+external sampler where the observed task's process resources can be read.
+Linux uses the exact unified cgroup-v2 path from the live process's
+`/proc/<pid>/cgroup`; Darwin uses a best-effort process-tree root PID. An
+unavailable target carries one bounded reason instead of a guessed or nullable
+locator.
 
-Authority: [`AgentSpec::identity`](../../crates/agent-spec/src/spec.rs#L24-L50);
-[Agent Spec identity rules](https://github.com/compoundingtech/evals/blob/main/AGENT-SPEC.md#discovery-identity-and-host)
+This target is not task identity, ownership, a declaration, or a retained
+registry entry. Runtime ID identifies the task; PID, process generation,
+cgroup path, and process-tree root locate only the observation that produced
+them.
 
-### bus ID
+Authority: [R23 fail-closed task inventory](requirements.md);
+[`task_inventory`](../../src/task_inventory.rs)
 
-The host-qualified agent address `<host>.<identity>`.
+### observation locator
 
-Authority: [`AgentSpec::bus_id`](../../crates/agent-spec/src/spec.rs#L203-L211);
-[Agent Spec bus identity](https://github.com/compoundingtech/evals/blob/main/AGENT-SPEC.md#discovery-identity-and-host)
+Ephemeral evidence used to find one observed runtime generation, never to
+identify the task across generations. PID, creation time, generation ID,
+runtime resource target, cgroup path, unit name, and incarnation can all be
+locators in their owning contexts; only a contract that explicitly exposes one
+may be used by a consumer. In the task inventory, systemd unit and scope names
+are deliberately not exposed as resource locators.
+
+Authority: [R23 fail-closed task inventory](requirements.md);
+[decision 0017](.decisions/0017-task-resource-targets-are-strict-observations.md)
+
+### launch argv
+
+The ordered, opaque OS-string sequence comprising a task program and each of
+its arguments at the launcher boundary. A platform wrapper may prepend its own
+outer arguments, but it does not parse, expand, escape, or otherwise rewrite
+the launch argv. This is not a shell command line. Use *provider argv* only
+when referring specifically to the canonical agent provider; *launch argv*
+applies to every PTY and exec task.
+
+Authority: [R06 restartable launch definitions and R42 launch argv
+transparency](requirements.md);
+[host-local scheduling and supervision](spec.md#host-local-scheduling-and-supervision)
+
+### agent ID
+
+The explicit catalog-global immutable identifier of one logical agent subject.
+New subjects use UUIDv7. Migration assigns each legacy subject its existing
+host-qualified bus identity as an explicit ID without moving state. The legacy
+ID's original host-looking prefix becomes opaque and does not change on a later
+host move. The ID survives routing, presentation, graph, desired-state, and
+runtime-incarnation changes and is never reassigned.
+
+The declaration spelling is `id`; positional `identity` remains the legacy
+declaration key and address fallback. Avoid: *agent identity* when it could mean
+the subject, address, runtime incarnation, or presentation.
+
+Authority: [R24 immutable agent ID](requirements.md);
+[Agent Spec field rules](02-agent-spec/spec.md)
+
+### agent address
+
+The mutable semantic alias used for human routing. It is unique within one
+logical host among running and suspended subjects. A retired subject is
+non-routable and releases its address. An address does not encode supervisor
+ancestry, filesystem placement, or immutable ownership even when its dotted
+segments resemble a path.
+
+Avoid: *agent path* — graph and filesystem paths are independent concepts;
+*agent handle* — use the routing-specific term.
+
+Authority: [R24 mutable agent address](requirements.md);
+[Agent Spec field rules](02-agent-spec/spec.md)
+
+### bus address
+
+The host-qualified human route `<host>.<agent-address>`. An addressless legacy
+declaration derives its bus address from `<host>.<identity>` until the first
+explicit agent address is assigned.
+
+Avoid: *bus ID* — the value is mutable and does not identify subject
+continuity.
+
+Authority: [R24 mutable agent address](requirements.md);
+[identity and address specification](spec.md#immutable-agent-id-mutable-address-and-presentation-r02-r08-r11-r13-r19-r24-r26)
+
+### agent name
+
+The optional mutable, non-unique human-facing presentation label. It never
+selects, routes, authorizes, or identifies an agent subject.
+
+Authority: [R25 bounded presentation](requirements.md);
+[identity and address specification](spec.md#immutable-agent-id-mutable-address-and-presentation-r02-r08-r11-r13-r19-r24-r26)
 
 ### catalog
 
 The selected folder containing agent declarations and catalog-backed state.
 
 Authority: [Agent Spec catalog boundary](https://github.com/compoundingtech/evals/blob/main/AGENT-SPEC.md#discovery-identity-and-host);
-[catalog selection](../../src/main.rs#L867-L927)
+[catalog selection](../../src/main.rs)
 
 ### catalog root
 
 The filesystem path selected as the catalog for a command.
 
-Authority: [catalog path resolution](../../src/main.rs#L867-L927)
+Authority: [catalog path resolution](../../src/main.rs)
 
 ### supervisor scope
 
@@ -79,15 +156,15 @@ Authority: [R31 reachable restart bounds](requirements.md);
 
 The agent assigned host-local health observation, recovery, and escalation.
 
-Authority: [R04 root supervision](requirements.md#L51-L54);
-[vision](vision.md#L21-L22)
+Authority: [R04 root supervision](requirements.md);
+[vision](vision.md)
 
 ### control plane
 
 The replaceable `st2 up` process that reconciles host-local work.
 
-Authority: [R11 control-plane replacement safety](requirements.md#L83-L88);
-[`up_loop`](../../src/run.rs#L1440-L1452)
+Authority: [R11 control-plane replacement safety](requirements.md);
+[`up_loop`](../../src/run.rs)
 
 ### supervisor run
 
@@ -101,21 +178,21 @@ Authority: [R31 reachable restart bounds](requirements.md);
 
 The agent reference carried by a declaration for supervisory routing.
 
-Authority: [`AgentSpec::supervisor`](../../crates/agent-spec/src/spec.rs#L24-L50);
+Authority: [`AgentSpec::supervisor`](../../crates/agent-spec/src/spec.rs);
 [Agent Spec field](https://github.com/compoundingtech/evals/blob/main/AGENT-SPEC.md#complete-declaration-shape)
 
 ### presence
 
 The agent-authored availability signal read from catalog-backed state.
 
-Authority: [`status::State`](../../src/status.rs#L24-L45);
-[R08 catalog observability](requirements.md#L92-L95)
+Authority: [`status::State`](../../src/status.rs);
+[R08 catalog observability](requirements.md)
 
 ### session state
 
 st2's runtime observation of whether a task record is alive.
 
-Authority: [`reconcile::Session`](../../src/reconcile.rs#L16-L26)
+Authority: [`reconcile::Session`](../../src/reconcile.rs)
 
 ### observed harness state
 
@@ -149,7 +226,7 @@ version gate, API gate, event stream, state seed, delivery, or read-back. A
 stage owns its bounded reasons and sources; a reason paired with another stage
 is unknown evidence rather than a best-effort match.
 
-Authority: [native driver diagnostic snapshot](05-harness-state/spec.md#native-driver-diagnostic-snapshot-ohs-r11ohs-r15)
+Authority: [native driver diagnostic snapshot](05-harness-state/spec.md#native-driver-diagnostic-snapshot-ohs-r11ohs-r16)
 
 ### diagnostic evidence age
 
@@ -157,7 +234,7 @@ Reader-derived elapsed time since the current native driver diagnostic was
 observed. The origin timestamp is durable; age is a projection and never file
 mtime.
 
-Authority: [native driver diagnostic snapshot](05-harness-state/spec.md#native-driver-diagnostic-snapshot-ohs-r11ohs-r15)
+Authority: [native driver diagnostic snapshot](05-harness-state/spec.md#native-driver-diagnostic-snapshot-ohs-r11ohs-r16)
 
 ### harness context record
 
@@ -229,7 +306,7 @@ One concept, one edge: a Resource is reached through a
 [Resource binding](#resource-binding). The [linked record](#linked-record-retired)
 plane that once shared the word is retired.
 
-Authority: [R20 portable Resource bindings](requirements.md#L161-L168);
+Authority: [R20 portable Resource bindings](requirements.md);
 [issue #61 resolution](https://github.com/compoundingtech/st2/issues/61)
 
 ### Resource binding
@@ -244,8 +321,8 @@ healthy work.
 A binding says what an agent *is for* — the work it reads and the durable state
 carriers it owns. It is not a record of what the agent produced.
 
-Authority: [`Resource`](../../crates/agent-spec/src/spec.rs#L239-L245) — the
-live contract; [R20](requirements.md#L161-L168); [R21](requirements.md#L169-L172).
+Authority: [`Resource`](../../crates/agent-spec/src/spec.rs) — the
+live contract; [R20](requirements.md); [R21](requirements.md).
 The canonical [Agent Spec Resource bindings](https://github.com/compoundingtech/evals/blob/main/AGENT-SPEC.md#agent-spec-resource-bindings)
 anchor still describes the pre-#307 envelope of name and `uri` only, and would
 reject the required `reason`; it is pending sync (07-resource DQ-R8).
@@ -318,7 +395,7 @@ for [Resource bindings](#resource-binding): a binding names a carrier by URI and
 the carrier's bytes live here. `dev.schickling.agent-goal://<host>/<identity>`
 realizes as `resources/goal.md`; `decision-tree://<host>/<identity>` realizes as
 `resources/context/decisions/`. Identity is the URI; the path is realization,
-and st2 does not resolve one into the other ([R20](requirements.md#L161-L168)).
+and st2 does not resolve one into the other ([R20](requirements.md)).
 
 Authority: [`message::with_resolved_state_dir`](../../src/message.rs);
 [07-resource spec](07-resource/spec.md)
@@ -335,7 +412,7 @@ Addressed as a [Resource binding](#resource-binding) under the scheme
 `st2 context`; resolving the scheme is a catalog's choice via an optional
 [Resource Profile](07-resource-profile/requirements.md), not something st2 ships.
 
-Authority: [R09 state continuity](requirements.md#L131-L132);
+Authority: [R09 state continuity](requirements.md);
 [`context`](../../src/context.rs);
 [decision 0012](.decisions/0012-working-state-is-a-declared-carrier.md)
 
@@ -386,7 +463,7 @@ Authority: [R31 reachable restart bounds](requirements.md);
 The declaration-owned whole-agent lifecycle intent: `running`, `suspended`, or
 `retired`. It is distinct from presence and session state.
 
-Authority: [R27 typed agent desired state](requirements.md);
+Authority: [R41 typed agent desired state](requirements.md);
 [`AgentDesiredState`](../../crates/agent-spec/src/spec.rs)
 
 ### suspension
@@ -395,7 +472,7 @@ Reversible desired absence of an agent's live tasks while its declaration and
 catalog-backed durable state remain available. Suspension is not process pause
 or checkpointing.
 
-Authority: [R27 typed agent desired state](requirements.md);
+Authority: [R41 typed agent desired state](requirements.md);
 [Agent Spec field rules](02-agent-spec/spec.md)
 
 ### retirement
@@ -403,7 +480,7 @@ Authority: [R27 typed agent desired state](requirements.md);
 Terminal desired absence whose completion additionally requires every declared
 task record to be collected. Legacy `retired #true` is a readable spelling.
 
-Authority: [R27 typed agent desired state](requirements.md);
+Authority: [R41 typed agent desired state](requirements.md);
 [Doctor retired absence](02-doctor/requirements.md)
 
 ### desired-state rationale
@@ -411,21 +488,21 @@ Authority: [R27 typed agent desired state](requirements.md);
 The bounded human explanation required by a new suspended or retired desired
 state. It explains intent and grants no lifecycle authority of its own.
 
-Authority: [R27 typed agent desired state](requirements.md)
+Authority: [R41 typed agent desired state](requirements.md)
 
 ### reconciliation
 
 Comparing declared host-local work with observed runtime state to produce a
 plan.
 
-Authority: [`reconcile`](../../src/reconcile.rs#L1-L10);
-[reconcile pass](../../src/run.rs#L1007-L1017)
+Authority: [`reconcile`](../../src/reconcile.rs);
+[reconcile pass](../../src/run.rs)
 
 ### materialization
 
 Rendering catalog-declared content into an agent workspace.
 
-Authority: [`materialize_catalog`](../../src/materialize.rs#L837-L850)
+Authority: [`materialize_catalog`](../../src/materialize.rs)
 
 ### message
 
@@ -481,7 +558,7 @@ Authority: [MESSAGE-R07 and MESSAGE-R08](03-message/requirements.md);
 
 The terminal notification that makes an agent aware of unread messages.
 
-Authority: [DING module contract](../../src/ding/mod.rs#L1-L14)
+Authority: [DING module contract](../../src/ding/mod.rs)
 
 ### stream
 
@@ -567,16 +644,16 @@ outside this family entirely.
 
 ## Collision rules
 
-- Qualify **root** as [root agent](requirements.md#L51-L54) or
-  [catalog root](../../src/main.rs#L867-L927). Bare *root* does not identify
+- Qualify **root** as [root agent](requirements.md) or
+  [catalog root](../../src/main.rs). Bare *root* does not identify
   which concept is meant.
-- Qualify **supervisor** as [control plane](requirements.md#L83-L88) or
-  [declared supervisor](../../crates/agent-spec/src/spec.rs#L24-L50).
+- Qualify **supervisor** as [control plane](requirements.md) or
+  [declared supervisor](../../crates/agent-spec/src/spec.rs).
 - Use **supervisor run** for one live control-plane incarnation and
   **declared supervisor** for the agent reference used in supervisory routing.
   **Control plane** names the replaceable process concept, not an owning run.
-- Use [presence](../../src/status.rs#L24-L45) for the agent-authored signal and
-  [session state](../../src/reconcile.rs#L16-L26) for runtime liveness. Avoid
+- Use [presence](../../src/status.rs) for the agent-authored signal and
+  [session state](../../src/reconcile.rs) for runtime liveness. Avoid
   bare *agent status* when either could be meant.
 - Use [observed harness state](05-harness-state/requirements.md) for the
   driver-observed activity signal. It is a third axis beside presence and
@@ -598,9 +675,11 @@ outside this family entirely.
   observation with it.
 - Use **recovery action** for the structured argv projected with a parked task;
   it names the exact supervisor scope rather than relying on ambient defaults.
-- Use [agent identity](../../crates/agent-spec/src/spec.rs#L24-L50) for the bare
-  value and [bus ID](../../crates/agent-spec/src/spec.rs#L203-L211) for the
-  host-qualified address.
+- Use [agent ID](#agent-id) for immutable logical-subject identity,
+  [agent address](#agent-address) for the mutable host-local semantic route,
+  and [bus address](#bus-address) for its host-qualified form. Do not use
+  *agent identity*, *agent path*, or *bus ID* when the intended axis is not
+  explicit.
 - **Resource** names one concept: a [Resource binding](#resource-binding) and
   nothing else. The [linked record](#linked-record-retired) plane that once shared the
   word is retired. Do not reintroduce a second sense.
@@ -628,8 +707,8 @@ outside this family entirely.
 - Use [compaction trigger](#compaction-trigger) for the harness's own stated
   reason. `unknown` is a value, not a failure, and st2 never infers a trigger a
   harness did not state.
-- Use [message](../../src/message.rs#L26-L46) for the durable record and
-  [DING](../../src/ding/mod.rs#L1-L14) for its terminal notification.
+- Use [message](../../src/message.rs) for the durable record and
+  [DING](../../src/ding/mod.rs) for its terminal notification.
 - Qualify **event**: a bare *event* in stream context is the durable
   [event](04-stream/requirements.md) record; the R13–R15 filesystem-watcher
   usage is a **watcher event**. New requirements text keeps the qualification.
@@ -645,7 +724,7 @@ outside this family entirely.
 
 **seat** is not canonical st2 language. Choose by meaning: [agent](https://github.com/compoundingtech/evals/blob/main/AGENT-SPEC.md#canonical-agent-specification)
 for the actor, [agent declaration](https://github.com/compoundingtech/evals/blob/main/AGENT-SPEC.md#complete-declaration-shape)
-for the catalog entry, and [agent runtime](vision.md#L16-L24) for a running
+for the catalog entry, and [agent runtime](vision.md) for a running
 instance. For admission, use an already-authoritative admission term only if
 one exists; this index does not canonize one.
 
