@@ -1164,6 +1164,9 @@ impl<R: RuntimeControl> Reconciler<R> {
             .iter()
             .filter(|step| Some(step.subject.as_str()) == next_wake)
         {
+            if defers_inherited_work_wake(step, &work, harness.as_ref()) {
+                continue;
+            }
             let tag_value = format!(
                 "{}@{}@{}@{}",
                 step.subject, step.attempt, step.readiness_epoch, incarnation_key
@@ -7567,6 +7570,19 @@ fn inherits_work_message(
         && ancestor.available_to == step.available_to
         && ancestor.step.len() < step.step.len()
         && step.step.starts_with(&format!("{}/", ancestor.step))
+}
+
+/// Inherited work is woken only after an early parent submission. A turn that is still working can
+/// claim it without another message interrupting that turn; an idle seat gets the wake.
+fn defers_inherited_work_wake(
+    step: &crate::model::StepRunView,
+    work: &[crate::model::StepRunView],
+    harness: Option<&CurrentHarnessView>,
+) -> bool {
+    harness.is_some_and(|harness| harness.state == "working")
+        && work
+            .iter()
+            .any(|ancestor| inherits_work_message(ancestor, step))
 }
 
 /// An agent can submit a parent while its own nested steps are still ready. The parent then waits in
@@ -14689,6 +14705,32 @@ mission "ios-proof-blocked" state="ready" {
             next_work_wake_for_agent("agent/builder", &work),
             Some(inherited.subject.as_str())
         );
+
+        // The wake waits while the turn that submitted the parent is still working.
+        let mut harness: CurrentHarnessView = serde_json::from_value(serde_json::json!({
+            "state": "working",
+            "incarnation_id": "1:turn",
+            "claim": "claim/turn",
+            "observed_at_unix_ms": 1,
+        }))
+        .unwrap();
+        assert!(defers_inherited_work_wake(
+            &inherited,
+            &work,
+            Some(&harness)
+        ));
+        harness.state = "idle".into();
+        assert!(!defers_inherited_work_wake(
+            &inherited,
+            &work,
+            Some(&harness)
+        ));
+        harness.state = "working".into();
+        assert!(!defers_inherited_work_wake(
+            &submitted,
+            &work,
+            Some(&harness)
+        ));
 
         // A parent verifying after its nested work is done still occupies the seat.
         let mut finished = inherited.clone();
