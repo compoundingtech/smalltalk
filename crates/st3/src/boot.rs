@@ -19,7 +19,9 @@ The message ID, not the preview text, identifies the message to read, reply to, 
 
 A notification does not create work. Repeated delivery does not authorize repeated work.
 
-Run `"$ST3_BIN" work ls` to list work that is available to you. Claim one eligible step.
+Run `"$ST3_BIN" work ls --as "$ST_AGENT"` to list work that is available to you. Claim one eligible
+step with `"$ST3_BIN" work claim STEP --as "$ST_AGENT"`. List your mailbox with
+`"$ST3_BIN" conversations ls "$ST_AGENT"`.
 
 Do not keep substantive work only in this conversation or a private todo. Before starting new work
 authorized by a person, make sure the graph exposes it as active work across the fleet, then claim
@@ -30,6 +32,7 @@ If no step is ready, finish this turn. Do not wait for work that is not ready.
 Do its work and finish the step in the same turn when possible.
 
 The claim output contains the step goals and all effective constraints. A parent claim can expose nested mission steps.
+Claim and finish each ready nested step in order before you complete the parent.
 
 Use `"$ST3_BIN" work progress` only for a material update. Finish with `"$ST3_BIN" work complete`, `"$ST3_BIN" work fail`, or `"$ST3_BIN" work release`.
 
@@ -97,6 +100,10 @@ mod tests {
         assert!(BOOT_DOCUMENT.contains("graph exposes it as active work across the fleet"));
         assert!(BOOT_DOCUMENT.contains("Do not keep substantive work only in this conversation"));
         assert!(BOOT_DOCUMENT.contains("trace wait ... --as \"$ST_AGENT\"` only when"));
+        // An unfiltered `work ls` lists agentless and person-gated steps that a seat cannot claim.
+        assert!(BOOT_DOCUMENT.contains("work ls --as \"$ST_AGENT\"` to list work"));
+        assert!(BOOT_DOCUMENT.contains("conversations ls \"$ST_AGENT\""));
+        assert!(BOOT_DOCUMENT.contains("before you complete the parent"));
         assert!(BOOT_DOCUMENT.contains("conversations --help"));
         assert!(!BOOT_DOCUMENT.contains("message --help"));
         assert!(BOOT_DOCUMENT.contains("attention request --help"));

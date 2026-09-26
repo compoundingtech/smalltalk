@@ -43,7 +43,13 @@ async fn run_cli_mode(socket: &Path, json: bool, args: &[&str]) -> Output {
     let args = args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>();
     tokio::task::spawn_blocking(move || {
         let mut command = std::process::Command::new(binary);
-        command.arg("--endpoint").arg(socket);
+        // These are operator commands. A harness running the suite must not lend its own seat
+        // identity, which scopes `work ls` and fences agent actors.
+        command
+            .env_remove("ST_AGENT")
+            .env_remove("ST_MISSION_RUN")
+            .arg("--endpoint")
+            .arg(socket);
         if json {
             command.arg("--json");
         }

@@ -1236,6 +1236,9 @@ struct MessageSendArgs {
 struct MessageListArgs {
     /// Mailbox identity; defaults to the non-empty ST_AGENT value.
     identity: Option<String>,
+    /// The same mailbox identity, spelled like `conversations read --as`.
+    #[arg(long = "as", conflicts_with = "identity")]
+    actor: Option<String>,
     #[arg(long)]
     archive: bool,
     #[arg(long)]
@@ -4770,6 +4773,41 @@ async fn put_document_bytes(
         .await
 }
 
+/// A harness process names its own seat in `ST_AGENT`. The local API trusts the actor a command
+/// names, so a model that inferred the wrong identity could otherwise read and send as a peer seat.
+/// The process may still act as a non-agent subject, such as its exec or a person its work names.
+fn reject_foreign_agent_actor(actor: &str) -> Result<()> {
+    let own = std::env::var("ST_AGENT").ok();
+    let mission_run = std::env::var("ST_MISSION_RUN")
+        .ok()
+        .filter(|value| !value.is_empty());
+    match foreign_agent_actor(actor, own.as_deref(), mission_run.as_deref()) {
+        Some(message) => anyhow::bail!(message),
+        None => Ok(()),
+    }
+}
+
+fn foreign_agent_actor(
+    actor: &str,
+    own: Option<&str>,
+    mission_run: Option<&str>,
+) -> Option<String> {
+    let own = own.map(str::trim).filter(|own| own.starts_with("agent/"))?;
+    let actor = actor.trim();
+    let actor = if actor.starts_with("agent/") {
+        actor.to_owned()
+    } else if actor.contains('/') {
+        return None;
+    } else {
+        normalize_message_subject_in_run(actor, mission_run)
+    };
+    (actor != own).then(|| {
+        format!(
+            "this harness is `{own}` (ST_AGENT) and cannot act as `{actor}`; use `--as \"$ST_AGENT\"` or `--from \"$ST_AGENT\"`"
+        )
+    })
+}
+
 fn normalize_message_subject(value: &str) -> String {
     let mission_run = std::env::var("ST_MISSION_RUN")
         .ok()
@@ -4814,6 +4852,9 @@ fn normalize_agent_subject(identity: &str) -> String {
 }
 
 async fn run_claim(client: &Client, args: ClaimArgs, json_output: bool) -> Result<()> {
+    if let Some(actor) = &args.actor {
+        reject_foreign_agent_actor(actor)?;
+    }
     let response: ClaimRecord = client
         .post(
             "/v1/claims",
@@ -5423,6 +5464,7 @@ async fn post_work(
     json_output: bool,
 ) -> Result<()> {
     let actor = args.actor.context("a work action needs explicit --as")?;
+    reject_foreign_agent_actor(&actor)?;
     let incarnation = match args.incarnation {
         Some(incarnation) => Some(incarnation),
         None => current_agent_incarnation(client, &actor).await?,
@@ -5589,7 +5631,10 @@ async fn run_message(
             }
         }
         MessageCommand::Ls(args) => {
-            let identity = message_list_identity(args.identity, std::env::var("ST_AGENT").ok())?;
+            let identity = message_list_identity(
+                args.identity.or(args.actor),
+                std::env::var("ST_AGENT").ok(),
+            )?;
             let sender = args.sender.map(|sender| normalize_message_subject(&sender));
             let mut count = 0_u64;
             let mut first = true;
@@ -5636,6 +5681,7 @@ async fn run_message(
             let actor = args
                 .actor
                 .context("message read needs explicit --as to record its lifecycle")?;
+            reject_foreign_agent_actor(&actor)?;
             let mut messages = Vec::with_capacity(args.references.len());
             for reference in args.references {
                 messages.push(
@@ -5705,6 +5751,7 @@ async fn run_message(
             let actor = args
                 .actor
                 .context("message archive needs explicit --as to record its lifecycle")?;
+            reject_foreign_agent_actor(&actor)?;
             let mut claims = Vec::with_capacity(args.references.len());
             for reference in args.references {
                 let message = read_message(client, &reference).await?;
@@ -5818,6 +5865,7 @@ async fn run_message(
 async fn send_message(client: &Client, args: MessageSendArgs) -> Result<Option<MessageView>> {
     let id = uuid::Uuid::now_v7().simple().to_string();
     let mission_id = format!("message/{id}");
+    reject_foreign_agent_actor(&args.from)?;
     let from = normalize_message_subject(&args.from);
     let to = normalize_message_subject(&args.to);
     let kdl = message_mission_intent(
@@ -8162,6 +8210,41 @@ fn unique_pairs(values: Vec<(String, String)>, kind: &str) -> Result<BTreeMap<St
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn conversations_ls_accepts_the_read_spelling_of_its_mailbox() {
+        let cli = Cli::try_parse_from(["st3", "conversations", "ls", "--as", "agent/run-1/worker"])
+            .expect("conversations ls --as parses");
+        let Command::Conversations {
+            command: MessageCommand::Ls(args),
+        } = cli.command
+        else {
+            panic!("conversations ls")
+        };
+        assert_eq!(args.actor.as_deref(), Some("agent/run-1/worker"));
+        assert!(
+            Cli::try_parse_from(["st3", "conversations", "ls", "agent/a", "--as", "agent/b"])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn a_harness_cannot_act_as_another_agent() {
+        let own = Some("agent/run-1/wake.omp-2");
+        let run = Some("run-1");
+        let refusal = foreign_agent_actor("agent/run-1/wake.codex", own, run).unwrap();
+        assert!(refusal.contains("this harness is `agent/run-1/wake.omp-2`"));
+        assert!(foreign_agent_actor("wake.codex", own, run).is_some());
+        assert!(foreign_agent_actor("agent/run-1/wake.omp-2", own, run).is_none());
+        assert!(foreign_agent_actor("wake.omp-2", own, run).is_none());
+        // Non-agent actors and processes without a seat identity are not seat impersonation.
+        assert!(foreign_agent_actor("person/eval-requester", own, run).is_none());
+        assert!(foreign_agent_actor("exec/run-1/controller", own, run).is_none());
+        assert!(foreign_agent_actor("agent/run-1/wake.codex", None, run).is_none());
+        assert!(
+            foreign_agent_actor("agent/run-1/wake.codex", Some("person/operator"), run).is_none()
+        );
+    }
 
     #[test]
     fn pi_family_session_ritual_uses_only_the_st3_boot_contract() {
