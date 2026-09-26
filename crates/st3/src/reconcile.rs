@@ -450,7 +450,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             })
             .map(|subject| subject.subject)
             .collect::<BTreeSet<_>>();
-        let run_orders = self.store.seat_run_orders()?;
+        let run_orders = self.wake_run_orders(&local_agents, &work)?;
         let candidates = local_agents
             .iter()
             .filter_map(|agent| {
@@ -465,6 +465,32 @@ impl<R: RuntimeControl> Reconciler<R> {
             }
         }
         Ok(work_wake_deadline(&work, &local_agents, &run_orders, now))
+    }
+
+    /// Seat orders for the local seats whose next wake depends on run order.
+    /// Reading an order replays the seat's moves, so a seat that holds work, has
+    /// ready work in at most one run, or cannot be woken is skipped.
+    fn wake_run_orders(
+        &self,
+        agents: &BTreeSet<String>,
+        work: &[StepRunView],
+    ) -> Result<BTreeMap<String, Vec<String>>> {
+        let mut choosing = BTreeSet::new();
+        for agent in agents {
+            if seat_chooses_between_runs(agent, work)
+                && self.store.current_harness(agent)?.is_some_and(|harness| {
+                    matches!(harness.state.as_str(), "ready" | "working" | "idle")
+                })
+            {
+                choosing.insert(agent.as_str());
+            }
+        }
+        if choosing.is_empty() {
+            return Ok(BTreeMap::new());
+        }
+        let mut orders = self.store.seat_run_orders()?;
+        orders.retain(|agent, _| choosing.contains(agent.as_str()));
+        Ok(orders)
     }
 
     fn next_provider_capacity_retry_deadline(&self) -> Result<Option<u128>> {
@@ -1163,7 +1189,11 @@ impl<R: RuntimeControl> Reconciler<R> {
             self.signal_changed();
         }
 
-        let run_order = self.store.seat_run_order(agent)?;
+        let run_order = if seat_chooses_between_runs(agent, &work) {
+            self.store.seat_run_order(agent)?
+        } else {
+            Vec::new()
+        };
         let next_wake = next_work_wake_for_agent(agent, &work, &run_order);
         for step in work
             .iter()
@@ -7539,6 +7569,25 @@ fn work_wake_deadline(
                 .map_or(now, |last| last.saturating_add(delay))
         })
         .min()
+}
+
+/// True when the seat holds nothing and has ready work in more than one run.
+/// Only then can its run order change what it takes next.
+fn seat_chooses_between_runs(agent: &str, work: &[StepRunView]) -> bool {
+    let steps = work
+        .iter()
+        .map(crate::seat_queue::SeatStep::from)
+        .collect::<Vec<_>>();
+    let selection = crate::seat_queue::select(agent, &steps, &[]);
+    if !selection.held.is_empty() {
+        return false;
+    }
+    let mut runs = steps
+        .iter()
+        .filter(|step| selection.ready.contains(&step.subject))
+        .map(|step| step.run);
+    runs.next()
+        .is_some_and(|first| runs.any(|run| run != first))
 }
 
 /// A maintained harness has one work seat. A claimed step occupies it, while
@@ -15553,6 +15602,51 @@ mission "gated" state="ready" {
             seat.queue().runs[0].run,
             gated.subject,
             "the waiting head keeps its place"
+        );
+    }
+
+    #[test]
+    fn seat_order_is_read_only_when_the_seat_chooses_between_runs() {
+        let seat = SeatQueueFixture::new();
+        let first = seat.start("queued", "seat-choice-first");
+        let work = |seat: &SeatQueueFixture| seat.store.work_for_reconcile(SEAT).unwrap();
+        assert!(
+            !seat_chooses_between_runs(SEAT, &work(&seat)),
+            "one run leaves nothing to order"
+        );
+
+        let second = seat.start("queued", "seat-choice-second");
+        assert!(seat_chooses_between_runs(SEAT, &work(&seat)));
+        assert!(!seat_chooses_between_runs(
+            "agent/node.helper",
+            &work(&seat)
+        ));
+
+        seat.move_run(
+            &second.subject,
+            "top",
+            None,
+            "person/operator",
+            "seat-choice-move",
+        )
+        .unwrap();
+        let promoted = SeatQueueFixture::step(&second, "work");
+        assert_eq!(seat.next().as_deref(), Some(promoted.as_str()));
+        assert!(
+            seat.woken().contains(&promoted),
+            "the reconciler still reads the order when the seat has a choice"
+        );
+
+        seat.work(&promoted, "claim", "seat-choice-claim").unwrap();
+        assert!(
+            !seat_chooses_between_runs(SEAT, &work(&seat)),
+            "a held seat is not woken, so its order is not read"
+        );
+        seat.work(&promoted, "complete", "seat-choice-complete")
+            .unwrap();
+        assert_eq!(
+            seat.next().as_deref(),
+            Some(SeatQueueFixture::step(&first, "work").as_str())
         );
     }
 
