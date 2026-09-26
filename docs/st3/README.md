@@ -10,6 +10,8 @@ Use these documents for implementation details:
 - [Schema registry](schema.md) lists the generated public subject, resource, and claim vocabulary.
 - [Data authority](data-authority.md) separates durable facts from projections and caches.
 - [Fleet replication](replication.md) defines convergence, inspection, and repair.
+- [Agent seat queues](seat-queue.md) explains how each seat orders its mission runs and how moves
+  are recorded and replicated.
 - [Resource subscriptions](resource-subscriptions.md) defines observers and automatic intake.
 - [Agent migration](agent-migration.md) defines isolated rehearsal, cutover, and rollback.
 - [Eval audit](eval-audit.md) records the test intent and prompt boundary for each st3 eval.
