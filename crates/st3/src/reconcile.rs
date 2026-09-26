@@ -2582,7 +2582,8 @@ impl<R: RuntimeControl> Reconciler<R> {
                     }
                 }
             }
-            if !self.products_hold(run, &step, view)? {
+            if let Some(missing) = self.missing_product(run, &step, view)? {
+                changed |= self.notify_missing_product(view, &missing)?;
                 continue;
             }
             let mut gates_pass = true;
@@ -5396,14 +5397,14 @@ impl<R: RuntimeControl> Reconciler<R> {
         Ok(None)
     }
 
-    fn products_hold(
+    fn missing_product(
         &self,
         run: &MissionRunView,
         step: &RuntimeStep<'_>,
         view: &crate::model::StepRunView,
-    ) -> Result<bool> {
+    ) -> Result<Option<MissingProduct>> {
         let variables = run_variables(run, step, view);
-        self.products_hold_with_variables(&step.spec.products, &variables)
+        self.first_missing_product(&step.spec.products, &variables)
     }
 
     fn products_hold_with_variables(
@@ -5411,11 +5412,17 @@ impl<R: RuntimeControl> Reconciler<R> {
         products: &[crate::model::ProductSpec],
         variables: &BTreeMap<String, String>,
     ) -> Result<bool> {
+        Ok(self.first_missing_product(products, variables)?.is_none())
+    }
+
+    fn first_missing_product(
+        &self,
+        products: &[crate::model::ProductSpec],
+        variables: &BTreeMap<String, String>,
+    ) -> Result<Option<MissingProduct>> {
         for product in products {
             let subject = crate::mission::interpolate(&product.subject, variables)?;
-            let Some(actual) = self.subject_value(&subject)? else {
-                return Ok(false);
-            };
+            let mut fields = Vec::with_capacity(product.fields.len());
             for (field, expected) in &product.fields {
                 let expected = match expected {
                     Value::String(value) => {
@@ -5423,11 +5430,104 @@ impl<R: RuntimeControl> Reconciler<R> {
                     }
                     value => value.clone(),
                 };
-                if actual_field(&actual, field) != Some(&expected) {
-                    return Ok(false);
-                }
+                fields.push((field.clone(), expected));
+            }
+            let holds = self.subject_value(&subject)?.is_some_and(|actual| {
+                fields
+                    .iter()
+                    .all(|(field, expected)| actual_field(&actual, field) == Some(expected))
+            });
+            if !holds {
+                return Ok(Some(MissingProduct { subject, fields }));
             }
         }
+        Ok(None)
+    }
+
+    /// A worker that submits before its declared product exists leaves the step verifying with no
+    /// further prompt. Once that turn has ended, tell the worker exactly which subject and fields
+    /// the step waits for. The message is sent once per step attempt and readiness epoch.
+    fn notify_missing_product(
+        &self,
+        view: &crate::model::StepRunView,
+        missing: &MissingProduct,
+    ) -> Result<bool> {
+        if view.agentless || !view.worker_reported || view.status != "verifying" {
+            return Ok(false);
+        }
+        let Some(agent) = view.claimant.as_deref().or(view.assigned_to.as_deref()) else {
+            return Ok(false);
+        };
+        if self
+            .store
+            .current_harness(agent)?
+            .is_some_and(|harness| harness.state == "working")
+        {
+            return Ok(false);
+        }
+        let idempotency_key = format!(
+            "product-wait:{}@{}@{}",
+            view.subject, view.attempt, view.readiness_epoch
+        );
+        let message_id = &hex::encode(sha2::Sha256::digest(idempotency_key.as_bytes()))[..16];
+        let message_subject = format!("message/{message_id}");
+        if self
+            .store
+            .latest_claim(&message_subject, Some("message.sent"))?
+            .is_some()
+        {
+            return Ok(false);
+        }
+        let expected = missing
+            .fields
+            .iter()
+            .map(|(field, value)| match value {
+                Value::String(value) => format!("{field}={value}"),
+                value => format!("{field}={value}"),
+            })
+            .collect::<Vec<_>>();
+        let example = expected
+            .iter()
+            .map(|field| format!(" --field {field}"))
+            .collect::<String>();
+        let content = format!(
+            "`{}` was submitted, but its declared product `{}` has not been observed{}. Record that exact subject, for example `st3 claim {} resource.observed --actor {agent}{example}`, or fail the step with the reason. No action is needed if another actor produces it.",
+            view.subject,
+            missing.subject,
+            if expected.is_empty() {
+                String::new()
+            } else {
+                format!(" with {}", expected.join(", "))
+            },
+            missing.subject,
+        );
+        let title = format!(
+            "Declared product missing: {}",
+            view.title.as_deref().unwrap_or(&view.step)
+        );
+        self.store.append_claim(&ClaimInput {
+            subject: message_subject,
+            kind: "message.sent".into(),
+            actor: Some("daemon/runtime".into()),
+            fields: BTreeMap::from([
+                ("from".into(), Value::String("daemon/runtime".into())),
+                ("to".into(), Value::String(agent.into())),
+                ("content".into(), Value::String(content)),
+                ("status".into(), Value::String("sent".into())),
+                ("title".into(), Value::String(title)),
+                ("in_reply_to".into(), Value::Null),
+                (
+                    "tags".into(),
+                    Value::Array(vec![
+                        Value::String(format!("mission-run:{}", view.run)),
+                        Value::String(format!("st3-product-wait:{}", view.subject)),
+                    ]),
+                ),
+            ]),
+            evidence: Vec::new(),
+            expected_subject: None,
+            idempotency_key: Some(idempotency_key),
+        })?;
         Ok(true)
     }
 
@@ -7324,6 +7424,12 @@ fn harness_incarnation_key(incarnation: &str) -> String {
     hex::encode(sha2::Sha256::digest(incarnation.as_bytes()))[..12].to_owned()
 }
 
+/// A declared product subject and the fields it must carry.
+struct MissingProduct {
+    subject: String,
+    fields: Vec<(String, Value)>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum WorkWakeDecision {
     Wait,
@@ -9137,6 +9243,27 @@ version 2
         assert_eq!(
             store.mission_run(&run.id).unwrap().unwrap().steps[0].status,
             "verifying"
+        );
+        // The idle worker is told once which exact product subject the step waits for.
+        reconciler.reconcile_once().unwrap();
+        let product_waits = store
+            .messages(Some("agent/node.worker"), false)
+            .unwrap()
+            .into_iter()
+            .filter(|message| message.title.as_deref() == Some("Declared product missing: publish"))
+            .collect::<Vec<_>>();
+        assert_eq!(product_waits.len(), 1, "{product_waits:?}");
+        assert!(
+            product_waits[0]
+                .content
+                .contains(&format!("`resource/mission-run/{}/change`", run.id)),
+            "{}",
+            product_waits[0].content
+        );
+        assert!(
+            product_waits[0]
+                .content
+                .contains("kind=custom.st3.product-test")
         );
         store
             .append_claim(&ClaimInput {
