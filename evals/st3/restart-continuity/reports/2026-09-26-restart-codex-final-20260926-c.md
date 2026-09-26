@@ -3,7 +3,7 @@
 - Eval: `restart-continuity` (rc.dev on Codex `gpt-6-luna`, rc.sup on Claude `claude-sonnet-5`)
 - Runtime: `st3`
 - Run ID: `mission-run/restart-codex-final-20260926-c`
-- Candidate commit: st3 binary built from `72c04ce`, the branch's final st3 source; eval files with the fixture fix in `8dd9cbb`
+- Candidate commit: st3 binary built from `72c04ce`, whose boot contract carried the explicit claim, mailbox, and nested-order lines that `21a507e` removed; eval files with the fixture fix in `8dd9cbb`
 - Eval KDL SHA-256: `44e93570e970114795b43c09193b7daea76d00fb193560bf4300c0c6286392bc` (`variants/codex-luna.kdl`)
 - Result: `fail`
 

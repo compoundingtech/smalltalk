@@ -3,7 +3,7 @@
 - Eval: `restart-continuity` (committed eval: rc.dev and rc.sup on Claude `claude-sonnet-5`)
 - Runtime: `st3`
 - Run ID: `mission-run/restart-sonnet-final-20260926-b`
-- Candidate commit: st3 binary built from `72c04ce`, the branch's final st3 source; eval files with the fixture fix in `8dd9cbb`
+- Candidate commit: st3 binary built from `72c04ce`, whose boot contract carried the explicit claim, mailbox, and nested-order lines that `21a507e` removed; eval files with the fixture fix in `8dd9cbb`
 - Eval KDL SHA-256: `0bb121739de7e64385bf37fc6a0bf65dfbbd2c538ce061a668f5f9f743922cb4` (`eval.kdl`)
 - Result: `fail`
 

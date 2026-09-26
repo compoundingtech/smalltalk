@@ -3,7 +3,7 @@
 - Eval: `cross-harness-message-wake` (fixed Codex gpt-6-sol and Claude opus seats, each paired with a Claude `claude-sonnet-5` seat)
 - Runtime: `st3`
 - Run ID: `mission-run/cross-sonnet-final-20260926-b`
-- Candidate commit: st3 binary built from `72c04ce`, the branch's final st3 source
+- Candidate commit: st3 binary built from `72c04ce`, whose boot contract carried the explicit claim, mailbox, and nested-order lines that `21a507e` removed
 - Eval KDL SHA-256: `611ec4fcd987730d2cc6c95ad3d38b34cb9a997c4fac88997d3a2d4bee7bc376` (`variants/claude-sonnet.kdl`)
 - Result: `stopped`
 
