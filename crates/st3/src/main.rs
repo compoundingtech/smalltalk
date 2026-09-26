@@ -4754,8 +4754,8 @@ fn render_agent_queue(queue: &st3_client::AgentQueue) -> String {
                     count => format!("{marker}{first} (+{} ready)", count - 1),
                 }
             }
-            _ if run.waiting_work_ids.is_empty() => "no step ready for this seat".into(),
-            _ => format!("waiting on {}", run.waiting_work_ids.join(", ")),
+            _ if run.waiting_work_ids.is_empty() => "no open step for this seat".into(),
+            _ => format!("{} not ready", run.waiting_work_ids.join(", ")),
         };
         let run_state = if run.run_state == "running" {
             String::new()
