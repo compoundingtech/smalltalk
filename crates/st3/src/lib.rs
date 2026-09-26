@@ -14,6 +14,7 @@ pub mod projection;
 pub mod reconcile;
 pub mod render;
 pub mod resource;
+pub mod seat_queue;
 pub mod service;
 pub mod store;
 

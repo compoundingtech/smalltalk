@@ -3,7 +3,7 @@
 This file is generated from `st3-schema`.
 
 Schema: `st3.v1`
-Digest: `d49966b40954fabd7d348e51e8ba50c93242743f7ce40e683abca7e84dc07def`
+Digest: `07a9374d50b81abb57551eba2e648a46867e8eec25806aa2dc7b8aee8f7c7431`
 
 ## Subject families
 
@@ -58,6 +58,7 @@ Custom subjects use `custom/NAMESPACE/NAME`. Custom claims use `custom.NAMESPACE
 |---|---|---|---|---|---|
 | `agent.account` | `agent` | `same-subject-actor` | `state-transition` | `account!:subject-reference(account)` |  |
 | `agent.presence` | `agent` | `same-subject-actor` | `append` | `presence!:string`, `reachability:string`, `reason:string` |  |
+| `agent.queue.moved` | `agent` | `authorized-requester` | `append` | `anchor:subject-reference(mission-run)`, `placement!:string`, `reason:string`, `run!:subject-reference(mission-run)` |  |
 | `attention.requested` | `attention` | `authorized-participant` | `once` | `reason!:string`, `reviewer!:subject-reference(person)`, `severity!:string`, `targets:array`, `title!:string` |  |
 | `attention.resolved` | `attention` | `authorized-participant` | `once` | `outcome!:string`, `reason:string`, `request!:string` |  |
 | `daemon.diagnostic` | `daemon` | `system-only` | `append` | `code!:string`, `reason!:string`, `severity!:string`, `status:string` |  |

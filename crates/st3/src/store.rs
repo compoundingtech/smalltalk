@@ -34,6 +34,8 @@ use crate::model::{
 };
 #[cfg(test)]
 use crate::model::{ReplicaRange, ReplicationBatch, ReplicationResponse};
+use crate::model::{SeatQueueMoveRequest, SeatQueueMoveView, SeatQueueRunView, SeatQueueView};
+use crate::seat_queue::{self, Placement, QueueJoin, QueueMove, SeatStep};
 
 type StepStateRow = (String, bool, u32, String, String, String, String, String);
 type StepRetryRow = (String, u32, bool, String, String, String, String, String);
@@ -2948,45 +2950,249 @@ impl Store {
     /// history or querying the step table separately for every agent card.
     pub fn agent_work_queues(&self) -> Result<BTreeMap<String, AgentWorkQueue>> {
         let connection = self.readers.get();
+        let orders = seat_run_orders_tx(&connection, None)?;
         let mut statement = connection.prepare(
-            "SELECT subject, status, assignee, lease_owner
+            "SELECT subject, run_id, step_path, status, assignee, lease_owner, available_to,
+                    created_at_unix_ms
              FROM step_runs
              WHERE agentless=0
                AND status IN ('ready', 'claimed', 'working', 'verifying')
                AND generation_id=(SELECT current_generation_id FROM mission_runs WHERE id=step_runs.run_id)
              ORDER BY length(created_at_unix_ms), created_at_unix_ms, subject",
         )?;
-        let rows = statement.query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, Option<String>>(2)?,
-                row.get::<_, Option<String>>(3)?,
-            ))
-        })?;
-        let mut queues = BTreeMap::<String, AgentWorkQueue>::new();
-        for row in rows {
-            let (subject, status, assignee, claimant) = row?;
-            if status == "ready" {
-                if let Some(agent) = assignee {
-                    let queue = queues.entry(agent).or_default();
-                    queue.queued_work_count = queue.queued_work_count.saturating_add(1);
-                    if queue.next_work_id.is_none() {
-                        queue.next_work_id = Some(subject.clone());
-                    }
-                    if queue.upcoming_work_ids.len() < AGENT_WORK_PREVIEW_LIMIT {
-                        queue.upcoming_work_ids.push(subject);
-                    }
-                }
-            } else if let Some(agent) = claimant.or(assignee) {
-                let queue = queues.entry(agent).or_default();
-                queue.active_work_count = queue.active_work_count.saturating_add(1);
-                if queue.current_work_ids.len() < AGENT_WORK_PREVIEW_LIMIT {
-                    queue.current_work_ids.push(subject);
-                }
+        let rows = statement
+            .query_map([], |row| {
+                Ok(RosterStepRow {
+                    subject: row.get(0)?,
+                    run: format!("mission-run/{}", row.get::<_, String>(1)?),
+                    step: row.get(2)?,
+                    status: row.get(3)?,
+                    assignee: row.get(4)?,
+                    claimant: row.get(5)?,
+                    available_to: serde_json::from_str(&row.get::<_, String>(6)?)
+                        .unwrap_or_default(),
+                    created_at_unix_ms: row.get::<_, String>(7)?.parse().unwrap_or_default(),
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut seats = BTreeMap::<&str, Vec<SeatStep<'_>>>::new();
+        for row in &rows {
+            let step = SeatStep {
+                subject: &row.subject,
+                run: &row.run,
+                step: &row.step,
+                status: &row.status,
+                assignee: row.assignee.as_deref(),
+                claimant: row.claimant.as_deref(),
+                available_to: &row.available_to,
+                created_at_unix_ms: row.created_at_unix_ms,
+            };
+            for agent in [row.assignee.as_deref(), row.claimant.as_deref()]
+                .into_iter()
+                .flatten()
+                .collect::<BTreeSet<_>>()
+            {
+                seats.entry(agent).or_default().push(step);
             }
         }
+        let mut queues = BTreeMap::<String, AgentWorkQueue>::new();
+        for (agent, steps) in seats {
+            let order = orders.get(agent).map(Vec::as_slice).unwrap_or_default();
+            let selection = seat_queue::select(agent, &steps, order);
+            if selection.held.is_empty() && selection.ready.is_empty() {
+                continue;
+            }
+            queues.insert(
+                agent.to_owned(),
+                AgentWorkQueue {
+                    current_work_ids: selection
+                        .held
+                        .iter()
+                        .take(AGENT_WORK_PREVIEW_LIMIT)
+                        .map(|subject| (*subject).to_owned())
+                        .collect(),
+                    active_work_count: selection.held.len() as u64,
+                    next_work_id: selection.next().map(str::to_owned),
+                    upcoming_work_ids: selection
+                        .ready
+                        .iter()
+                        .take(AGENT_WORK_PREVIEW_LIMIT)
+                        .map(|subject| (*subject).to_owned())
+                        .collect(),
+                    queued_work_count: selection.ready.len() as u64,
+                },
+            );
+        }
         Ok(queues)
+    }
+
+    /// The live mission runs queued for every seat, in seat-queue order.
+    pub fn seat_run_orders(&self) -> Result<BTreeMap<String, Vec<String>>> {
+        let connection = self.readers.get();
+        seat_run_orders_tx(&connection, None)
+    }
+
+    /// The live mission runs queued for one seat, in seat-queue order.
+    pub fn seat_run_order(&self, agent: &str) -> Result<Vec<String>> {
+        let agent = normalize_seat(agent);
+        let connection = self.readers.get();
+        Ok(seat_run_orders_tx(&connection, Some(&agent))?
+            .remove(&agent)
+            .unwrap_or_default())
+    }
+
+    /// One seat's current claim, its queued runs in order, and its move history.
+    pub fn seat_queue(&self, agent: &str) -> Result<SeatQueueView> {
+        let agent = normalize_seat(agent);
+        let (inputs, order) = {
+            let connection = self.readers.get();
+            let mut inputs = seat_queue_inputs_tx(&connection, Some(&agent))?;
+            let inputs = inputs.remove(&agent).unwrap_or_default();
+            let order = inputs.live_order();
+            (inputs, order)
+        };
+        let work = self
+            .work_at_snapshot_internal(Some(&agent), true, now_ms(), false)?
+            .into_iter()
+            .filter(|step| !matches!(step.status.as_str(), "completed" | "failed" | "cancelled"))
+            .collect::<Vec<_>>();
+        let steps = work.iter().map(SeatStep::from).collect::<Vec<_>>();
+        let selection = seat_queue::select(&agent, &steps, &order);
+        let runs = order
+            .iter()
+            .enumerate()
+            .map(|(index, run)| {
+                let in_run = |step: &&StepRunView| step.run == *run;
+                let claimed_work_ids = work
+                    .iter()
+                    .filter(in_run)
+                    .filter(|step| selection.held.contains(&step.subject.as_str()))
+                    .map(|step| step.subject.clone())
+                    .collect::<Vec<_>>();
+                let ready_work_ids = selection
+                    .ready
+                    .iter()
+                    .filter(|subject| {
+                        work.iter()
+                            .any(|step| step.subject == **subject && step.run == *run)
+                    })
+                    .map(|subject| (*subject).to_owned())
+                    .collect::<Vec<_>>();
+                let waiting_work_ids = work
+                    .iter()
+                    .filter(in_run)
+                    .filter(|step| {
+                        step.assigned_to.as_deref() == Some(agent.as_str())
+                            && matches!(step.status.as_str(), "pending" | "blocked")
+                    })
+                    .map(|step| step.subject.clone())
+                    .collect::<Vec<_>>();
+                let state = if !claimed_work_ids.is_empty() {
+                    "claimed"
+                } else if !ready_work_ids.is_empty() {
+                    "ready"
+                } else {
+                    "waiting"
+                };
+                SeatQueueRunView {
+                    run: run.clone(),
+                    position: u32::try_from(index + 1).unwrap_or(u32::MAX),
+                    state: state.into(),
+                    run_status: inputs.statuses.get(run).cloned().unwrap_or_default(),
+                    joined_at_unix_ms: inputs
+                        .joins
+                        .iter()
+                        .find(|join| join.run == *run)
+                        .map_or(0, |join| join.at_unix_ms),
+                    claimed_work_ids,
+                    ready_work_ids,
+                    waiting_work_ids,
+                }
+            })
+            .collect();
+        let moves = inputs
+            .moves
+            .iter()
+            .rev()
+            .take(SEAT_QUEUE_MOVE_HISTORY_LIMIT)
+            .map(|recorded| recorded.view.clone())
+            .collect();
+        Ok(SeatQueueView {
+            agent: agent.clone(),
+            current_work_ids: selection.held.iter().map(|id| (*id).to_owned()).collect(),
+            next_work_id: selection.next().map(str::to_owned),
+            runs,
+            moves,
+            move_count: inputs.moves.len() as u64,
+        })
+    }
+
+    /// Record one move in a seat's queue. The move never touches a claim: a
+    /// held step stays held, and the new order applies to the next selection.
+    pub fn move_seat_queue_run(
+        &self,
+        request: &SeatQueueMoveRequest,
+    ) -> Result<ClaimRecord, St3Error> {
+        let agent = normalize_seat(&request.agent);
+        let run = normalize_mission_run(&request.run);
+        let placement = Placement::parse(&request.placement).ok_or_else(|| {
+            St3Error::new(
+                "invalid-queue-placement",
+                "a queue move uses top, bottom, before, or after",
+            )
+        })?;
+        let anchor = request.anchor.as_deref().map(normalize_mission_run);
+        match (placement.needs_anchor(), anchor.as_deref()) {
+            (true, None) => {
+                return Err(St3Error::new(
+                    "missing-queue-anchor",
+                    format!("a {} move names another queued run", placement.as_str()),
+                ));
+            }
+            (false, Some(_)) => {
+                return Err(St3Error::new(
+                    "unexpected-queue-anchor",
+                    format!("a {} move does not name another run", placement.as_str()),
+                ));
+            }
+            (true, Some(anchor)) if anchor == run => {
+                return Err(St3Error::new(
+                    "invalid-queue-anchor",
+                    "a run cannot move relative to itself",
+                ));
+            }
+            _ => {}
+        }
+        let order = self.seat_run_order(&agent).map_err(internal)?;
+        for queued in std::iter::once(&run).chain(anchor.as_ref()) {
+            if !order.contains(queued) {
+                return Err(St3Error::new(
+                    "run-not-queued",
+                    format!("`{queued}` is not queued for `{agent}`"),
+                )
+                .with_detail("agent", agent.clone())
+                .with_detail("run", queued.clone()));
+            }
+        }
+        let mut fields = BTreeMap::from([
+            ("run".into(), Value::String(run)),
+            ("placement".into(), Value::String(placement.as_str().into())),
+        ]);
+        if let Some(anchor) = anchor {
+            fields.insert("anchor".into(), Value::String(anchor));
+        }
+        if let Some(reason) = request.reason.as_ref().filter(|reason| !reason.is_empty()) {
+            fields.insert("reason".into(), Value::String(reason.clone()));
+        }
+        self.append_claim(&ClaimInput {
+            subject: agent,
+            kind: seat_queue::MOVED_CLAIM.into(),
+            actor: Some(request.actor.clone()),
+            fields,
+            evidence: Vec::new(),
+            expected_subject: None,
+            idempotency_key: Some(request.idempotency_key.clone()),
+        })
     }
 
     fn work_at_snapshot_internal(
@@ -15951,6 +16157,214 @@ fn normalize_step_run(value: &str) -> String {
     } else {
         format!("step-run/{value}")
     }
+}
+
+fn normalize_seat(value: &str) -> String {
+    if value.starts_with("agent/") {
+        value.to_owned()
+    } else {
+        format!("agent/{value}")
+    }
+}
+
+fn normalize_mission_run(value: &str) -> String {
+    if value.starts_with("mission-run/") {
+        value.to_owned()
+    } else {
+        format!("mission-run/{value}")
+    }
+}
+
+const SEAT_QUEUE_MOVE_HISTORY_LIMIT: usize = 20;
+
+struct RosterStepRow {
+    subject: String,
+    run: String,
+    step: String,
+    status: String,
+    assignee: Option<String>,
+    claimant: Option<String>,
+    available_to: Vec<String>,
+    created_at_unix_ms: u128,
+}
+
+struct RecordedSeatMove {
+    movement: QueueMove,
+    view: SeatQueueMoveView,
+}
+
+/// The durable facts that order one seat's queue: when each run joined, every
+/// recorded move in graph order, and which joined runs are still live.
+#[derive(Default)]
+struct SeatQueueInputs {
+    joins: Vec<QueueJoin>,
+    moves: Vec<RecordedSeatMove>,
+    statuses: BTreeMap<String, String>,
+    live: BTreeSet<String>,
+}
+
+impl SeatQueueInputs {
+    fn live_order(&self) -> Vec<String> {
+        let moves = self
+            .moves
+            .iter()
+            .map(|recorded| recorded.movement.clone())
+            .collect::<Vec<_>>();
+        seat_queue::replay(&self.joins, &moves)
+            .into_iter()
+            .filter(|run| self.live.contains(run))
+            .collect()
+    }
+}
+
+fn seat_run_orders_tx(
+    connection: &Connection,
+    agent: Option<&str>,
+) -> Result<BTreeMap<String, Vec<String>>> {
+    Ok(seat_queue_inputs_tx(connection, agent)?
+        .into_iter()
+        .map(|(agent, inputs)| {
+            let order = inputs.live_order();
+            (agent, order)
+        })
+        .collect())
+}
+
+/// Read seat-queue inputs for one seat or the whole roster. Terminal runs are
+/// read only when a move names them, because a run that never anchors or
+/// receives a move cannot change the relative order of the others.
+fn seat_queue_inputs_tx(
+    connection: &Connection,
+    agent: Option<&str>,
+) -> Result<BTreeMap<String, SeatQueueInputs>> {
+    let mut seats = BTreeMap::<String, SeatQueueInputs>::new();
+    let mut statement = connection.prepare(
+        "SELECT claims.id, claims.subject, claims.actor, claims.body, claims.accepted_at_unix_ms
+         FROM claims JOIN batches ON batches.id=claims.batch_id
+         WHERE claims.kind=?1 AND (?2 IS NULL OR claims.subject=?2)
+           AND NOT EXISTS (
+               SELECT 1 FROM replica_records
+               WHERE replica_records.claim_id=claims.id
+                 AND replica_records.state='repaired'
+           )
+         ORDER BY length(claims.accepted_at_unix_ms), claims.accepted_at_unix_ms,
+                  batches.origin, batches.replica_sequence, claims.store_index",
+    )?;
+    let rows = statement.query_map(params![seat_queue::MOVED_CLAIM, agent], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, Option<String>>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, String>(4)?,
+        ))
+    })?;
+    for row in rows {
+        let (claim_id, subject, actor, body, accepted_at) = row?;
+        let body = serde_json::from_str::<Value>(&body).unwrap_or(Value::Null);
+        let fields = body.get("fields").unwrap_or(&body);
+        let text = |name: &str| fields.get(name).and_then(Value::as_str).map(str::to_owned);
+        let (Some(run), Some(placement)) = (
+            text("run"),
+            text("placement").as_deref().and_then(Placement::parse),
+        ) else {
+            continue;
+        };
+        let anchor = text("anchor");
+        let at_unix_ms = accepted_at.parse().unwrap_or_default();
+        seats
+            .entry(subject)
+            .or_default()
+            .moves
+            .push(RecordedSeatMove {
+                movement: QueueMove {
+                    run: run.clone(),
+                    placement,
+                    anchor: anchor.clone(),
+                    at_unix_ms,
+                },
+                view: SeatQueueMoveView {
+                    claim_id,
+                    run,
+                    placement: placement.as_str().into(),
+                    anchor,
+                    actor,
+                    reason: text("reason"),
+                    moved_at_unix_ms: at_unix_ms,
+                },
+            });
+    }
+    drop(statement);
+
+    let mut statement = connection.prepare(
+        "SELECT step_runs.assignee, step_runs.run_id,
+                MIN(CAST(step_runs.created_at_unix_ms AS INTEGER)), mission_runs.status
+         FROM mission_runs JOIN step_runs ON step_runs.run_id=mission_runs.id
+         WHERE mission_runs.status NOT IN ('completed', 'failed', 'cancelled')
+           AND mission_runs.phase<>'terminal'
+           AND step_runs.agentless=0
+           AND step_runs.assignee IS NOT NULL
+           AND (?1 IS NULL OR step_runs.assignee=?1)
+         GROUP BY step_runs.assignee, step_runs.run_id",
+    )?;
+    let rows = statement.query_map(params![agent], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, i64>(2)?,
+            row.get::<_, String>(3)?,
+        ))
+    })?;
+    for row in rows {
+        let (seat, run_id, joined_at, status) = row?;
+        let run = format!("mission-run/{run_id}");
+        let inputs = seats.entry(seat).or_default();
+        inputs.joins.push(QueueJoin {
+            run: run.clone(),
+            at_unix_ms: u128::try_from(joined_at).unwrap_or_default(),
+        });
+        inputs.statuses.insert(run.clone(), status);
+        inputs.live.insert(run);
+    }
+    drop(statement);
+
+    let mut statement = connection.prepare(
+        "SELECT MIN(CAST(step_runs.created_at_unix_ms AS INTEGER)), mission_runs.status
+         FROM step_runs JOIN mission_runs ON mission_runs.id=step_runs.run_id
+         WHERE step_runs.assignee=?1 AND step_runs.run_id=?2 AND step_runs.agentless=0",
+    )?;
+    for (seat, inputs) in &mut seats {
+        let named = inputs
+            .moves
+            .iter()
+            .flat_map(|recorded| {
+                std::iter::once(recorded.movement.run.clone())
+                    .chain(recorded.movement.anchor.clone())
+            })
+            .filter(|run| !inputs.live.contains(run))
+            .collect::<BTreeSet<_>>();
+        for run in named {
+            let Some(run_id) = run.strip_prefix("mission-run/") else {
+                continue;
+            };
+            let joined = statement
+                .query_row(params![seat, run_id], |row| {
+                    Ok((
+                        row.get::<_, Option<i64>>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                    ))
+                })
+                .optional()?;
+            if let Some((Some(joined_at), status)) = joined {
+                inputs.joins.push(QueueJoin {
+                    run: run.clone(),
+                    at_unix_ms: u128::try_from(joined_at).unwrap_or_default(),
+                });
+                inputs.statuses.insert(run, status.unwrap_or_default());
+            }
+        }
+    }
+    Ok(seats)
 }
 
 fn flatten_steps<'a>(

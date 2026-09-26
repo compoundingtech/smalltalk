@@ -450,9 +450,13 @@ impl<R: RuntimeControl> Reconciler<R> {
             })
             .map(|subject| subject.subject)
             .collect::<BTreeSet<_>>();
+        let run_orders = self.store.seat_run_orders()?;
         let candidates = local_agents
             .iter()
-            .filter_map(|agent| next_work_wake_for_agent(agent, &work).map(str::to_owned))
+            .filter_map(|agent| {
+                let order = run_orders.get(agent).map(Vec::as_slice).unwrap_or_default();
+                next_work_wake_for_agent(agent, &work, order).map(str::to_owned)
+            })
             .collect::<BTreeSet<_>>();
         let now = now_ms();
         for step in &mut work {
@@ -460,7 +464,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                 self.store.populate_work_wake_for_reconcile(step, now)?;
             }
         }
-        Ok(work_wake_deadline(&work, &local_agents, now))
+        Ok(work_wake_deadline(&work, &local_agents, &run_orders, now))
     }
 
     fn next_provider_capacity_retry_deadline(&self) -> Result<Option<u128>> {
@@ -1159,7 +1163,8 @@ impl<R: RuntimeControl> Reconciler<R> {
             self.signal_changed();
         }
 
-        let next_wake = next_work_wake_for_agent(agent, &work);
+        let run_order = self.store.seat_run_order(agent)?;
+        let next_wake = next_work_wake_for_agent(agent, &work, &run_order);
         for step in work
             .iter()
             .filter(|step| Some(step.subject.as_str()) == next_wake)
@@ -7482,19 +7487,23 @@ fn work_wake_attempt_evidence(
 fn work_wake_deadline(
     work: &[StepRunView],
     local_agents: &BTreeSet<String>,
+    run_orders: &BTreeMap<String, Vec<String>>,
     now: u128,
 ) -> Option<u128> {
+    let wakes = local_agents
+        .iter()
+        .filter_map(|agent| {
+            let order = run_orders.get(agent).map(Vec::as_slice).unwrap_or_default();
+            next_work_wake_for_agent(agent, work, order)
+        })
+        .collect::<BTreeSet<_>>();
     work.iter()
         .filter(|step| {
             step.assigned_to
                 .as_ref()
                 .is_some_and(|assignee| local_agents.contains(assignee))
         })
-        .filter(|step| {
-            step.assigned_to.as_deref().is_some_and(|agent| {
-                next_work_wake_for_agent(agent, work) == Some(step.subject.as_str())
-            })
-        })
+        .filter(|step| wakes.contains(step.subject.as_str()))
         .filter_map(|step| step.wake.as_ref())
         .filter(|wake| {
             matches!(wake.assignee_state.as_str(), "ready" | "working" | "idle")
@@ -7517,40 +7526,17 @@ fn work_wake_deadline(
 }
 
 /// A maintained harness has one work seat. A claimed step occupies it, while
-/// ready steps from all runs wait in one stable, oldest-first queue.
-fn next_work_wake_for_agent<'a>(agent: &str, work: &'a [StepRunView]) -> Option<&'a str> {
-    if work.iter().any(|step| {
-        matches!(step.status.as_str(), "claimed" | "working" | "verifying")
-            && (step.claimant.as_deref() == Some(agent)
-                || step.assigned_to.as_deref() == Some(agent))
-    }) {
-        return None;
-    }
-    work.iter()
-        .filter(|step| {
-            step.status == "ready"
-                && step.assigned_to.as_deref() == Some(agent)
-                && should_notify_work_message(step, work)
-        })
-        .min_by(|left, right| {
-            left.created_at_unix_ms
-                .cmp(&right.created_at_unix_ms)
-                .then_with(|| left.subject.cmp(&right.subject))
-        })
-        .map(|step| step.subject.as_str())
-}
-
-fn should_notify_work_message(
-    step: &crate::model::StepRunView,
-    work: &[crate::model::StepRunView],
-) -> bool {
-    !work.iter().any(|candidate| {
-        candidate.run == step.run
-            && candidate.assigned_to == step.assigned_to
-            && candidate.available_to == step.available_to
-            && candidate.step.len() < step.step.len()
-            && step.step.starts_with(&format!("{}/", candidate.step))
-    })
+/// ready steps wait in the seat's ordered queue of mission runs.
+fn next_work_wake_for_agent<'a>(
+    agent: &str,
+    work: &'a [StepRunView],
+    run_order: &[String],
+) -> Option<&'a str> {
+    let steps = work
+        .iter()
+        .map(crate::seat_queue::SeatStep::from)
+        .collect::<Vec<_>>();
+    crate::seat_queue::select(agent, &steps, run_order).wake()
 }
 
 fn work_message_target(message: &crate::model::MessageView) -> Option<(&str, u32, u32, &str)> {
@@ -14632,15 +14618,23 @@ mission "ios-proof-blocked" state="ready" {
         );
         let work = vec![parent.clone(), inherited.clone(), reassigned.clone()];
 
-        assert!(should_notify_work_message(&parent, &work));
-        assert!(!should_notify_work_message(&inherited, &work));
-        assert!(should_notify_work_message(&reassigned, &work));
+        let steps = work
+            .iter()
+            .map(crate::seat_queue::SeatStep::from)
+            .collect::<Vec<_>>();
+        assert!(!crate::seat_queue::reached_through_parent(
+            &steps[0], &steps
+        ));
+        assert!(crate::seat_queue::reached_through_parent(&steps[1], &steps));
+        assert!(!crate::seat_queue::reached_through_parent(
+            &steps[2], &steps
+        ));
         assert_eq!(
-            next_work_wake_for_agent("agent/builder", &work),
+            next_work_wake_for_agent("agent/builder", &work, &[]),
             Some(parent.subject.as_str())
         );
         assert_eq!(
-            next_work_wake_for_agent("agent/reviewer", &work),
+            next_work_wake_for_agent("agent/reviewer", &work, &[]),
             Some(reassigned.subject.as_str())
         );
     }
@@ -14699,21 +14693,40 @@ mission "ios-proof-blocked" state="ready" {
         active.claimant = Some("agent/worker".into());
         active.wake = None;
 
+        let order = vec![
+            "mission-run/active".to_owned(),
+            "mission-run/older".to_owned(),
+            "mission-run/newer".to_owned(),
+        ];
+        let orders = BTreeMap::from([("agent/worker".to_owned(), order.clone())]);
         let ready = vec![second.clone(), first.clone()];
         assert_eq!(
-            next_work_wake_for_agent("agent/worker", &ready),
+            next_work_wake_for_agent("agent/worker", &ready, &order),
             Some(first.subject.as_str())
         );
         assert_eq!(
-            work_wake_deadline(&ready, &BTreeSet::from(["agent/worker".into()]), 2_000),
+            work_wake_deadline(
+                &ready,
+                &BTreeSet::from(["agent/worker".into()]),
+                &orders,
+                2_000
+            ),
             Some(1_000 + WORK_WAKE_RETRY_MS)
         );
 
         first.wake.as_mut().unwrap().assignee_state = "working".into();
         let busy = vec![second, first, active];
-        assert_eq!(next_work_wake_for_agent("agent/worker", &busy), None);
         assert_eq!(
-            work_wake_deadline(&busy, &BTreeSet::from(["agent/worker".into()]), 2_000),
+            next_work_wake_for_agent("agent/worker", &busy, &order),
+            None
+        );
+        assert_eq!(
+            work_wake_deadline(
+                &busy,
+                &BTreeSet::from(["agent/worker".into()]),
+                &orders,
+                2_000
+            ),
             None
         );
     }
@@ -14983,13 +14996,19 @@ agent "worker" { workspace "/tmp"; command "true"; restart "never" }
         let work = [step];
 
         assert_eq!(
-            work_wake_deadline(&work, &BTreeSet::from(["agent/local.worker".into()]), 2_000),
+            work_wake_deadline(
+                &work,
+                &BTreeSet::from(["agent/local.worker".into()]),
+                &BTreeMap::new(),
+                2_000
+            ),
             None
         );
         assert_eq!(
             work_wake_deadline(
                 &work,
                 &BTreeSet::from(["agent/remote.worker".into()]),
+                &BTreeMap::new(),
                 2_000
             ),
             Some(1_000 + WORK_WAKE_RETRY_MS)
@@ -15000,6 +15019,7 @@ agent "worker" { workspace "/tmp"; command "true"; restart "never" }
             work_wake_deadline(
                 &[exhausted.clone()],
                 &BTreeSet::from(["agent/remote.worker".into()]),
+                &BTreeMap::new(),
                 2_000 + WORK_WAKE_RETRY_MS
             ),
             Some(1_000 + WORK_WAKE_EXHAUST_GRACE_MS),
@@ -15010,10 +15030,490 @@ agent "worker" { workspace "/tmp"; command "true"; restart "never" }
             work_wake_deadline(
                 &[exhausted],
                 &BTreeSet::from(["agent/remote.worker".into()]),
+                &BTreeMap::new(),
                 2_000 + WORK_WAKE_EXHAUST_GRACE_MS
             ),
             None,
             "a recorded failure must not keep the daemon in a busy retry loop"
+        );
+    }
+
+    const SEAT: &str = "agent/node.worker";
+
+    const SEAT_QUEUE_SOURCE: &str = r#"
+version 2
+
+agent "worker" { workspace "/tmp"; command "true" }
+mission "queued" state="ready" {
+  concurrent-runs
+  goal "Give the durable seat one step in each run."
+  step "work" { assigned-to "agent/node.worker" }
+}
+mission "gated" state="ready" {
+  concurrent-runs
+  goal "Hold the durable seat's step until another seat finishes."
+  step "prepare" { assigned-to "agent/node.helper" }
+  step "work" {
+    assigned-to "agent/node.worker"
+    depends-on { step "prepare" completed }
+  }
+}
+"#;
+
+    struct SeatQueueFixture {
+        store: Arc<Store>,
+        reconciler: Reconciler<FakeRuntime>,
+    }
+
+    impl SeatQueueFixture {
+        fn new() -> Self {
+            let store = Arc::new(Store::open_memory("node").unwrap());
+            apply_source(&store, SEAT_QUEUE_SOURCE, "seat-queue-missions");
+            let desired = store
+                .desired_subjects()
+                .unwrap()
+                .into_iter()
+                .find(|subject| subject.subject == SEAT)
+                .unwrap();
+            let runtime = Arc::new(FakeRuntime::default());
+            runtime.ptys.lock().unwrap().push(RuntimeObservation {
+                runtime_id: desired.member.as_ref().unwrap().runtime_id.clone(),
+                terminal: true,
+                status: "running".into(),
+                exit_code: None,
+                incarnation_id: Some("seat-one".into()),
+            });
+            let reconciler = Reconciler::new(
+                store.clone(),
+                runtime,
+                "node".into(),
+                Arc::new(Notify::new()),
+            );
+            reconciler.reconcile_once().unwrap();
+            store
+                .append_claim(&ClaimInput {
+                    subject: SEAT.into(),
+                    kind: "harness.observed".into(),
+                    actor: Some(SEAT.into()),
+                    fields: BTreeMap::from([
+                        ("state".into(), Value::String("ready".into())),
+                        ("driver".into(), Value::String("codex".into())),
+                        ("incarnation_id".into(), Value::String("seat-one".into())),
+                    ]),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: Some("seat-one-ready".into()),
+                })
+                .unwrap();
+            Self { store, reconciler }
+        }
+
+        /// Start a run a little later than the last so join times differ.
+        fn start(&self, mission: &str, key: &str) -> crate::model::MissionRunView {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            let run = self
+                .store
+                .create_mission_run(&crate::model::MissionRunRequest {
+                    mission: mission.into(),
+                    revision: None,
+                    workspace: "/tmp".into(),
+                    requester: Some("person/requester".into()),
+                    mode: Some("run".into()),
+                    inputs: BTreeMap::new(),
+                    idempotency_key: key.into(),
+                })
+                .unwrap();
+            self.reconciler.reconcile_once().unwrap();
+            run
+        }
+
+        fn step(run: &crate::model::MissionRunView, path: &str) -> String {
+            run.steps
+                .iter()
+                .find(|step| step.step == path)
+                .unwrap()
+                .subject
+                .clone()
+        }
+
+        fn queue(&self) -> crate::model::SeatQueueView {
+            self.store.seat_queue(SEAT).unwrap()
+        }
+
+        fn order(&self) -> Vec<String> {
+            self.queue().runs.into_iter().map(|run| run.run).collect()
+        }
+
+        fn runs(runs: &[&crate::model::MissionRunView]) -> Vec<String> {
+            runs.iter().map(|run| run.subject.clone()).collect()
+        }
+
+        /// The next work as the queue view, the roster, and the wake selector see
+        /// it. All three come from one selector and must agree.
+        fn next(&self) -> Option<String> {
+            self.reconciler.reconcile_once().unwrap();
+            let queue = self.queue();
+            let roster = self
+                .store
+                .agent_work_queues()
+                .unwrap()
+                .remove(SEAT)
+                .and_then(|queue| queue.next_work_id);
+            assert_eq!(queue.next_work_id, roster, "the roster disagrees");
+            queue.next_work_id
+        }
+
+        /// The step the reconciler wakes now, or none while the seat is held.
+        fn wake(&self) -> Option<String> {
+            let work = self.store.work_for_reconcile(SEAT).unwrap();
+            let order = self.store.seat_run_order(SEAT).unwrap();
+            next_work_wake_for_agent(SEAT, &work, &order).map(str::to_owned)
+        }
+
+        /// Steps named by open wake messages, oldest first.
+        fn woken(&self) -> Vec<String> {
+            self.store
+                .messages(Some(SEAT), false)
+                .unwrap()
+                .into_iter()
+                .filter_map(|message| {
+                    work_message_target(&message).map(|(step, ..)| step.to_owned())
+                })
+                .collect()
+        }
+
+        fn move_run(
+            &self,
+            run: &str,
+            placement: &str,
+            anchor: Option<&str>,
+            actor: &str,
+            key: &str,
+        ) -> Result<crate::model::ClaimRecord, crate::model::St3Error> {
+            self.store
+                .move_seat_queue_run(&crate::model::SeatQueueMoveRequest {
+                    agent: SEAT.into(),
+                    run: run.into(),
+                    placement: placement.into(),
+                    anchor: anchor.map(str::to_owned),
+                    reason: None,
+                    actor: actor.into(),
+                    idempotency_key: key.into(),
+                })
+        }
+
+        fn work(&self, step: &str, action: &str, key: &str) -> Result<(), crate::model::St3Error> {
+            self.store
+                .work_action(
+                    step,
+                    action,
+                    &crate::model::WorkRequest {
+                        actor: Some(SEAT.into()),
+                        incarnation: Some("seat-one".into()),
+                        summary: None,
+                        reason: None,
+                        evidence: Vec::new(),
+                        idempotency_key: key.into(),
+                    },
+                )
+                .map(|_| ())
+        }
+    }
+
+    #[test]
+    fn seat_queue_keeps_three_runs_in_start_order_by_default() {
+        let seat = SeatQueueFixture::new();
+        let first = seat.start("queued", "seat-order-first");
+        let second = seat.start("queued", "seat-order-second");
+        let third = seat.start("queued", "seat-order-third");
+
+        assert_eq!(
+            seat.order(),
+            SeatQueueFixture::runs(&[&first, &second, &third])
+        );
+        let queue = seat.queue();
+        assert!(queue.runs.iter().all(|run| run.state == "ready"));
+        assert_eq!(
+            queue
+                .runs
+                .iter()
+                .map(|run| run.position)
+                .collect::<Vec<_>>(),
+            [1, 2, 3]
+        );
+        let head = SeatQueueFixture::step(&first, "work");
+        assert_eq!(seat.next().as_deref(), Some(head.as_str()));
+        assert_eq!(seat.wake().as_deref(), Some(head.as_str()));
+        assert_eq!(seat.woken(), [head.clone()], "only the head run is woken");
+
+        seat.work(&head, "claim", "seat-order-claim-first").unwrap();
+        seat.work(&head, "complete", "seat-order-complete-first")
+            .unwrap();
+        for _ in 0..8 {
+            seat.reconciler.reconcile_once().unwrap();
+            if seat.store.mission_run(&first.id).unwrap().unwrap().status == "completed" {
+                break;
+            }
+        }
+        assert_eq!(
+            seat.order(),
+            SeatQueueFixture::runs(&[&second, &third]),
+            "a terminal run leaves the queue"
+        );
+        assert_eq!(
+            seat.next().as_deref(),
+            Some(SeatQueueFixture::step(&second, "work").as_str())
+        );
+    }
+
+    #[test]
+    fn seat_queue_move_to_top_changes_the_next_claim() {
+        let seat = SeatQueueFixture::new();
+        let first = seat.start("queued", "seat-top-first");
+        let second = seat.start("queued", "seat-top-second");
+        let third = seat.start("queued", "seat-top-third");
+        let original = SeatQueueFixture::step(&first, "work");
+        assert_eq!(seat.next().as_deref(), Some(original.as_str()));
+
+        seat.move_run(
+            &third.subject,
+            "top",
+            None,
+            "person/operator",
+            "seat-top-move",
+        )
+        .unwrap();
+        assert_eq!(
+            seat.order(),
+            SeatQueueFixture::runs(&[&third, &first, &second])
+        );
+        let promoted = SeatQueueFixture::step(&third, "work");
+        assert_eq!(seat.next().as_deref(), Some(promoted.as_str()));
+        assert_eq!(seat.wake().as_deref(), Some(promoted.as_str()));
+        assert!(
+            seat.woken().contains(&promoted),
+            "the reconciler wakes the moved run's step"
+        );
+
+        seat.work(&promoted, "claim", "seat-top-claim").unwrap();
+        seat.work(&promoted, "complete", "seat-top-complete")
+            .unwrap();
+        assert_eq!(
+            seat.next().as_deref(),
+            Some(original.as_str()),
+            "the rest of the queue keeps its order"
+        );
+    }
+
+    #[test]
+    fn seat_queue_falls_through_a_waiting_head_run_and_returns_when_it_is_ready() {
+        let seat = SeatQueueFixture::new();
+        let gated = seat.start("gated", "seat-fall-gated");
+        let queued = seat.start("queued", "seat-fall-queued");
+        let waiting = SeatQueueFixture::step(&gated, "work");
+        let available = SeatQueueFixture::step(&queued, "work");
+
+        assert_eq!(seat.next().as_deref(), Some(available.as_str()));
+        assert_eq!(seat.wake().as_deref(), Some(available.as_str()));
+        let queue = seat.queue();
+        assert_eq!(
+            queue.runs[0].run, gated.subject,
+            "the gated run keeps its place"
+        );
+        assert_eq!(queue.runs[0].state, "waiting");
+        assert_eq!(queue.runs[0].waiting_work_ids, [waiting.clone()]);
+        assert_eq!(queue.runs[1].state, "ready");
+
+        let prepare = SeatQueueFixture::step(&gated, "prepare");
+        assert!(
+            seat.store
+                .set_step_state(&prepare, "completed", None)
+                .unwrap()
+        );
+        assert_eq!(
+            seat.next().as_deref(),
+            Some(waiting.as_str()),
+            "the head run is next again once it has ready work"
+        );
+        assert_eq!(seat.wake().as_deref(), Some(waiting.as_str()));
+        assert_eq!(seat.queue().runs[0].state, "ready");
+    }
+
+    #[test]
+    fn seat_queue_move_never_preempts_a_held_claim() {
+        let seat = SeatQueueFixture::new();
+        let first = seat.start("queued", "seat-held-first");
+        let second = seat.start("queued", "seat-held-second");
+        let held = SeatQueueFixture::step(&first, "work");
+        let queued = SeatQueueFixture::step(&second, "work");
+        assert_eq!(seat.next().as_deref(), Some(held.as_str()));
+        seat.work(&held, "claim", "seat-held-claim").unwrap();
+
+        seat.move_run(
+            &second.subject,
+            "before",
+            Some(&first.subject),
+            "person/operator",
+            "seat-held-move",
+        )
+        .unwrap();
+        seat.reconciler.reconcile_once().unwrap();
+        let step = seat.store.step_run(&held).unwrap().unwrap();
+        assert_eq!(step.status, "claimed");
+        assert_eq!(step.claimant.as_deref(), Some(SEAT));
+        let queue = seat.queue();
+        assert_eq!(queue.current_work_ids, [held.clone()]);
+        assert_eq!(queue.runs[0].run, second.subject);
+        assert_eq!(queue.runs[1].state, "claimed");
+        assert_eq!(seat.next().as_deref(), Some(queued.as_str()));
+        assert_eq!(seat.wake(), None, "a held seat is not woken for other work");
+        assert!(!seat.woken().contains(&queued));
+        assert_eq!(
+            seat.work(&queued, "claim", "seat-held-second-claim")
+                .unwrap_err()
+                .code,
+            "agent-capacity"
+        );
+
+        seat.work(&held, "complete", "seat-held-complete").unwrap();
+        assert_eq!(seat.next().as_deref(), Some(queued.as_str()));
+        assert_eq!(seat.wake().as_deref(), Some(queued.as_str()));
+    }
+
+    #[test]
+    fn seat_queue_history_names_who_moved_what() {
+        let seat = SeatQueueFixture::new();
+        let first = seat.start("queued", "seat-history-first");
+        let second = seat.start("queued", "seat-history-second");
+        let third = seat.start("queued", "seat-history-third");
+        seat.store
+            .move_seat_queue_run(&crate::model::SeatQueueMoveRequest {
+                agent: SEAT.into(),
+                run: third.subject.clone(),
+                placement: "top".into(),
+                anchor: None,
+                reason: Some("the release needs this first".into()),
+                actor: "person/operator-one".into(),
+                idempotency_key: "seat-history-top".into(),
+            })
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let after = seat
+            .move_run(
+                &first.subject,
+                "after",
+                Some(&second.subject),
+                "person/operator-two",
+                "seat-history-after",
+            )
+            .unwrap();
+        let retry = seat
+            .move_run(
+                &first.subject,
+                "after",
+                Some(&second.subject),
+                "person/operator-two",
+                "seat-history-after",
+            )
+            .unwrap();
+        assert_eq!(retry.id, after.id, "a retried move is one record");
+
+        let queue = seat.queue();
+        assert_eq!(
+            queue.runs.iter().map(|run| &run.run).collect::<Vec<_>>(),
+            [&third.subject, &second.subject, &first.subject]
+        );
+        assert_eq!(queue.move_count, 2);
+        assert_eq!(queue.moves[0].claim_id, after.id);
+        assert_eq!(queue.moves[0].actor.as_deref(), Some("person/operator-two"));
+        assert_eq!(queue.moves[0].run, first.subject);
+        assert_eq!(queue.moves[0].placement, "after");
+        assert_eq!(
+            queue.moves[0].anchor.as_deref(),
+            Some(second.subject.as_str())
+        );
+        assert_eq!(queue.moves[1].actor.as_deref(), Some("person/operator-one"));
+        assert_eq!(queue.moves[1].run, third.subject);
+        assert_eq!(queue.moves[1].placement, "top");
+        assert_eq!(
+            queue.moves[1].reason.as_deref(),
+            Some("the release needs this first")
+        );
+        assert!(queue.moves[0].moved_at_unix_ms >= queue.moves[1].moved_at_unix_ms);
+        let claims = seat
+            .store
+            .claims_for(SEAT, Some(crate::seat_queue::MOVED_CLAIM))
+            .unwrap();
+        assert_eq!(claims.len(), 2);
+        assert_eq!(claims[1].actor.as_deref(), Some("person/operator-two"));
+
+        let replica = Store::open_memory("replica").unwrap();
+        replica
+            .import_replication("node", &seat.store.export_replication(0).unwrap())
+            .unwrap();
+        assert_eq!(
+            replica.seat_run_order(SEAT).unwrap(),
+            seat.store.seat_run_order(SEAT).unwrap(),
+            "a replica rebuilds the same order from the replicated moves"
+        );
+        assert_eq!(replica.seat_queue(SEAT).unwrap().moves, queue.moves);
+    }
+
+    #[test]
+    fn seat_queue_moves_name_queued_runs_only() {
+        let seat = SeatQueueFixture::new();
+        let first = seat.start("queued", "seat-invalid-first");
+        let second = seat.start("queued", "seat-invalid-second");
+        let cases = [
+            ("mission-run/absent", "top", None, "run-not-queued"),
+            (
+                first.subject.as_str(),
+                "before",
+                Some("mission-run/absent"),
+                "run-not-queued",
+            ),
+            (
+                first.subject.as_str(),
+                "after",
+                None,
+                "missing-queue-anchor",
+            ),
+            (
+                first.subject.as_str(),
+                "top",
+                Some(second.subject.as_str()),
+                "unexpected-queue-anchor",
+            ),
+            (
+                first.subject.as_str(),
+                "before",
+                Some(first.subject.as_str()),
+                "invalid-queue-anchor",
+            ),
+            (
+                first.subject.as_str(),
+                "middle",
+                None,
+                "invalid-queue-placement",
+            ),
+        ];
+        for (index, (run, placement, anchor, code)) in cases.into_iter().enumerate() {
+            let error = seat
+                .move_run(
+                    run,
+                    placement,
+                    anchor,
+                    "person/operator",
+                    &format!("seat-invalid-{index}"),
+                )
+                .unwrap_err();
+            assert_eq!(error.code, code, "{run} {placement} {anchor:?}");
+        }
+        assert!(
+            seat.store
+                .claims_for(SEAT, Some(crate::seat_queue::MOVED_CLAIM))
+                .unwrap()
+                .is_empty()
         );
     }
 }

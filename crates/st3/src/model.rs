@@ -1901,6 +1901,56 @@ pub struct WorkWakeView {
     pub failure: Option<String>,
 }
 
+/// One agent seat's current claim and its ordered queue of mission runs.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct SeatQueueView {
+    pub agent: String,
+    pub current_work_ids: Vec<String>,
+    pub next_work_id: Option<String>,
+    pub runs: Vec<SeatQueueRunView>,
+    /// The most recent moves, newest first.
+    pub moves: Vec<SeatQueueMoveView>,
+    pub move_count: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct SeatQueueRunView {
+    pub run: String,
+    pub position: u32,
+    /// `claimed` when the seat holds a step in this run, `ready` when it has a
+    /// ready step for the seat, and `waiting` otherwise.
+    pub state: String,
+    pub run_status: String,
+    pub joined_at_unix_ms: u128,
+    pub claimed_work_ids: Vec<String>,
+    pub ready_work_ids: Vec<String>,
+    pub waiting_work_ids: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct SeatQueueMoveView {
+    pub claim_id: String,
+    pub run: String,
+    pub placement: String,
+    pub anchor: Option<String>,
+    pub actor: Option<String>,
+    pub reason: Option<String>,
+    pub moved_at_unix_ms: u128,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct SeatQueueMoveRequest {
+    pub agent: String,
+    pub run: String,
+    pub placement: String,
+    #[serde(default)]
+    pub anchor: Option<String>,
+    #[serde(default)]
+    pub reason: Option<String>,
+    pub actor: String,
+    pub idempotency_key: String,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct WorkRequest {
     #[serde(default)]
