@@ -176,7 +176,10 @@ others.
   earlier one's intent. There is no fence on the agent subject, because harness claims change it
   constantly.
 - **No projection table.** Reads replay moves on each call. That is cheap while moves are human
-  actions. A seat with thousands of moves would need a cached projection.
+  actions. A seat with thousands of moves would need a cached projection. The reconciler reads a
+  seat's order only when the seat holds nothing, has ready work in more than one run, and can be
+  woken. [Seat queue performance](seat-queue-performance.md) measures the idle cost against the
+  base commit.
 - **The Swift client was not compiled.** The codegen checks that every Swift model field exists.
   The TypeScript client type-checks and its contract test passes.
 - **Generated client drift was fixed.** `messages_list_for_peer` had been added only to the
