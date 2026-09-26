@@ -8392,6 +8392,57 @@ mod tests {
         assert!(card.contains("NEXT WORK    step-run/newer/review"));
     }
 
+    #[test]
+    fn agent_queue_view_lists_the_claim_then_runs_in_order_and_moves() {
+        let queue: st3_client::AgentQueue = serde_json::from_value(serde_json::json!({
+            "kind": "agent-queue", "agent_id": "agent/fleet/worker",
+            "current_work_ids": ["step-run/held/build"],
+            "next_work_id": "step-run/second/review",
+            "runs": [
+                {
+                    "mission_run_id": "mission-run/held", "position": 1, "state": "claimed",
+                    "run_state": "running", "joined_at": "2026-09-24T09:00:00.000Z",
+                    "claimed_work_ids": ["step-run/held/build"], "ready_work_ids": [],
+                    "waiting_work_ids": []
+                },
+                {
+                    "mission_run_id": "mission-run/gated", "position": 2, "state": "waiting",
+                    "run_state": "running", "joined_at": "2026-09-24T09:01:00.000Z",
+                    "claimed_work_ids": [], "ready_work_ids": [],
+                    "waiting_work_ids": ["step-run/gated/ship"]
+                },
+                {
+                    "mission_run_id": "mission-run/second", "position": 3, "state": "ready",
+                    "run_state": "running", "joined_at": "2026-09-24T09:02:00.000Z",
+                    "claimed_work_ids": [],
+                    "ready_work_ids": ["step-run/second/review", "step-run/second/docs"],
+                    "waiting_work_ids": []
+                }
+            ],
+            "moves": [{
+                "claim_id": "claim-one", "mission_run_id": "mission-run/held",
+                "placement": "before", "anchor_run_id": "mission-run/gated",
+                "actor_id": "person/operator", "reason": "finish the build first",
+                "moved_at": "2026-09-24T09:03:00.000Z"
+            }],
+            "move_count": 1
+        }))
+        .unwrap();
+        assert_eq!(
+            render_agent_queue(&queue),
+            "AGENT QUEUE  agent/fleet/worker\n\
+             CURRENT      step-run/held/build\n\
+             NEXT WORK    step-run/second/review\n\
+             RUNS         3\n  \
+             1. mission-run/held  claimed  step-run/held/build\n  \
+             2. mission-run/gated  waiting  step-run/gated/ship not ready\n  \
+             3. mission-run/second  ready  next step-run/second/review (+1 ready)\n\
+             MOVES        1 total\n  \
+             2026-09-24T09:03:00.000Z  person/operator moved mission-run/held before \
+             mission-run/gated: finish the build first\n"
+        );
+    }
+
     #[tokio::test]
     async fn trace_after_index_reads_the_first_bounded_page() {
         let root = tempfile::tempdir().unwrap();
