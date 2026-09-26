@@ -2485,6 +2485,13 @@ fn authority_rules<'a>(desired: &'a Value, block: &str) -> Vec<(&'a str, &'a str
         .collect()
 }
 
+/// Whether a desired agent declaration grants mission or queue authority.
+pub fn declares_authority(desired: &Value) -> bool {
+    ["mission-authority", "queue-authority"]
+        .iter()
+        .any(|block| !authority_rules(desired, block).is_empty())
+}
+
 pub fn agent_mission_authority(desired: &Value) -> crate::model::MissionAuthority {
     let mut authority = crate::model::MissionAuthority::default();
     for (verb, pattern) in authority_rules(desired, "mission-authority") {

@@ -4835,6 +4835,22 @@ async fn apply(
         for mission in crate::mission::top_level_mission_ids(&intent.missions) {
             require_agent_mission_authority(&state, actor, "publish", &mission)?;
         }
+        // Only a person grants authority in a top-level seat declaration. Otherwise an agent
+        // could declare itself, or another seat, with authority nobody gave it.
+        if let Some(granted) = intent.subjects.values().find(|desired| {
+            desired.kind == "agent" && crate::graph::declares_authority(&desired.desired)
+        }) {
+            return Err(ApiError::bad(
+                St3Error::new(
+                    "agent-authority-grant-denied",
+                    format!(
+                        "`{actor}` cannot grant authority in the declaration of `{}`; only a person can",
+                        granted.subject
+                    ),
+                )
+                .with_detail("agent", granted.subject.clone()),
+            ));
+        }
     }
     for declaration in intent.mission_runs.values() {
         if let Some(creation) = &declaration.creation {
@@ -11025,6 +11041,62 @@ mission "queued" state="ready" {
         }
         assert_eq!(order(), [first.clone(), second.clone()]);
         assert_eq!(state.store.seat_queue(SEAT).unwrap().move_count, 0);
+
+        // Only a person grants authority. An agent cannot declare itself or another seat with
+        // queue or mission authority, but it can still declare a seat without any.
+        for (key, declaration) in [
+            (
+                "self-grant",
+                r#"agent "fleet/helper" { workspace "."; command "true"; queue-authority { move "fleet/worker" } }"#,
+            ),
+            (
+                "other-grant",
+                r#"agent "fleet/deputy" { workspace "."; command "true"; queue-authority { move "fleet/*" } }"#,
+            ),
+            (
+                "mission-grant",
+                r#"agent "fleet/helper" { workspace "."; command "true"; mission-authority { publish "queued" } }"#,
+            ),
+        ] {
+            let (status, body) = json_request(
+                app.clone(),
+                "/v1/intent/apply",
+                serde_json::to_value(apply_request(
+                    &state,
+                    &format!("version 2\n{declaration}\n"),
+                    "agent/fleet/helper",
+                    key,
+                ))
+                .unwrap(),
+            )
+            .await;
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{key}: {body}");
+            assert_eq!(
+                body["code"], "agent-authority-grant-denied",
+                "{key}: {body}"
+            );
+        }
+        let (status, body) = json_request(
+            app.clone(),
+            "/v1/intent/apply",
+            serde_json::to_value(apply_request(
+                &state,
+                "version 2\nagent \"fleet/deputy\" { workspace \".\"; command \"true\"; }\n",
+                "agent/fleet/helper",
+                "plain-seat",
+            ))
+            .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let (status, body) = json_request(
+            app.clone(),
+            "/v1/agent-queue-moves",
+            promote("agent/fleet/helper", "still-refused"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        assert_eq!(body["code"], "queue-authority-denied", "{body}");
 
         // A bare identity is an agent, as for other agent actors.
         let (status, body) = json_request(

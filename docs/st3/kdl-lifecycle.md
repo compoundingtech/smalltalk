@@ -270,6 +270,10 @@ recorded with the agent as its actor. The daemon reads the grant from the agent'
 declaration when the move arrives, as it does for mission authority. [Agent seat
 queues](seat-queue.md) describes the queue and the move.
 
+Only a person grants authority in a top-level agent declaration. When an agent publishes a
+top-level agent declaration that carries `mission-authority` or `queue-authority`, for itself or
+for another seat, the daemon refuses it with `agent-authority-grant-denied`.
+
 ## Planning a new mission
 
 Planning uses an immutable request document and a declarative launch.

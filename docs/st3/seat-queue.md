@@ -96,6 +96,9 @@ Each `move` rule names an exact seat identity or a terminal `/*` namespace, with
 seat has no authority over its own queue unless a rule names it. The daemon reads the grant from
 the agent's current desired declaration when the move arrives, and refuses a move outside it with
 `queue-authority-denied`, or `missing-agent-queue-authority` when the agent has no declaration.
+An agent cannot grant itself the authority: a top-level agent declaration that an agent publishes
+is refused with `agent-authority-grant-denied` when it carries `queue-authority` or
+`mission-authority`.
 The agent's move goes to `POST /v1/agent-queue-moves`, because client-v0 actions carry only
 person authority. That route also accepts a person. With `--json`, it prints the move claim.
 
@@ -167,8 +170,10 @@ others.
 - `api::tests::an_agent_moves_a_seat_queue_only_with_queue_authority`: an agent granted the seat
   moves a run and is recorded as the move's actor in the queue view and history. The seat itself,
   an agent without a grant, an agent granted another seat, an undeclared agent, and a daemon actor
-  are refused, and the order does not change. A person can use the same route. A replica rebuilds
-  the same order and history from the agent's and the person's moves.
+  are refused, and the order does not change. An agent cannot publish a top-level declaration that
+  grants queue or mission authority to itself or another seat, and can still publish one without.
+  A person can use the same route. A replica rebuilds the same order and history from the agent's
+  and the person's moves.
 - `mission::tests::agent_queue_authority_uses_exact_and_terminal_seat_rules`: exact and namespace
   rules, `${ST_MISSION_RUN}` in a rule, and refused empty, prefixed, wildcard, duplicate, and
   unknown rules.
@@ -202,6 +207,12 @@ others.
   agents in bounds and is not a security boundary against local processes. Removing a grant stops
   later moves and leaves earlier ones in place. Paired and typed clients have no agent path;
   client-v0 actions stay person-only.
+- **An agent can re-declare its own seat.** In one live eval run an omp seat ran
+  `st3 agents start` for its own identity, as itself. The daemon accepted the declaration, which
+  replaced the eval's: it dropped the model and the audit environment and set `restart always`.
+  Eval cleanup then no longer owned the seat and could not remove its terminal, so the run was
+  void although every judge passed. The declaration carried no authority, so the grant check above
+  does not apply. Who may publish a top-level agent declaration is outside this change.
 - **A reorder does not withdraw a wake that was already sent.** If the old head was woken and not
   yet claimed, the seat also receives a wake for the new head. Withdrawing the old wake would count
   as a closed attempt and could exhaust wakes when moves go back and forth.
