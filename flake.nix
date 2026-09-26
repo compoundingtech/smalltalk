@@ -100,6 +100,13 @@
             };
           };
 
+          # The workspace default members include the st3 crates. This package ships only st2;
+          # st3, `st`, stui, and st3-migrate come from the st3 package, so each has one build.
+          cargoBuildFlags = [
+            "-p"
+            "st2"
+          ];
+
           # This NixStamp is the binary's authoritative build identity; it wins
           # over the LocalStamp `build.rs` bakes from git (which is empty here
           # anyway — a flake source carries no `.git`). Reaches rustc as a plain
@@ -173,6 +180,21 @@
             "st2-pty-stats-component"
             "--exclude"
             "st2-vista-component"
+            # `checks.st3` gates these crates with the runtime inputs their tests need.
+            "--exclude"
+            "st-runtime"
+            "--exclude"
+            "st3"
+            "--exclude"
+            "st3-client"
+            "--exclude"
+            "st3-client-codegen"
+            "--exclude"
+            "st3-migrate"
+            "--exclude"
+            "st3-schema"
+            "--exclude"
+            "stui"
             "--lib"
             "--bins"
             "--test"
@@ -246,6 +268,10 @@
             "-p"
             "st3"
             "-p"
+            "st3-client"
+            "-p"
+            "st3-client-codegen"
+            "-p"
             "st3-migrate"
             "-p"
             "st3-schema"
@@ -289,6 +315,34 @@
           ${st3}/bin/st --help > st.help
           cmp st3.help st.help
           ${st3}/bin/st3-migrate --help > /dev/null
+          touch $out
+        '';
+
+        # Both products from one source: st2, st3, and the st3 package's own `st` symlink.
+        smallTalk = pkgs.symlinkJoin {
+          name = "small-talk-${version}";
+          paths = [
+            st2
+            st3
+          ];
+        };
+
+        # Every install path leaves `st` resolving to the installed st3, never a separate build.
+        installLayout = pkgs.runCommand "small-talk-install-layout-${version}" { } ''
+          export HOME=$(mktemp -d)
+          test "$(readlink -f ${smallTalk}/bin/st)" = "$(readlink -f ${smallTalk}/bin/st3)"
+          test -x ${smallTalk}/bin/st2
+
+          mkdir built
+          ln -s ${st2}/bin/st2 ${st3}/bin/st3 ${st3}/bin/st3-migrate ${st3}/bin/stui built/
+          bash ${self}/scripts/install --from built --bin-dir "$PWD/bin"
+          test "$(readlink bin/st)" = st3
+          bin/st --help > st.help
+          bin/st3 --help > st3.help
+          cmp st.help st3.help
+          bin/st2 --help > /dev/null
+
+          bash ${self}/scripts/install-test
           touch $out
         '';
 
@@ -515,6 +569,7 @@
         packages.st2 = st2;
         packages.st3 = st3;
         packages.st3-migrate = st3;
+        packages.small-talk = smallTalk;
         packages.st2-wasm-resolver = st2WasmResolver;
         packages.st2-provider-runtime = st2ProviderRuntime;
         # All four components come out of one build; the install paths are unchanged.
@@ -536,6 +591,7 @@
         checks.st2 = st2;
         checks.st3 = st3;
         checks.st3-help = st3Help;
+        checks.install-layout = installLayout;
         checks.release-integration = st2ReleaseIntegration;
         checks.debug-assertions = st2DebugAssertions;
         checks.wasm-resolver-feature = st2WasmResolver;

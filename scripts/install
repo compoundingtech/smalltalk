@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+# Install st2 and st3 from one source build. `st` is always a symlink to the installed `st3`,
+# never a separate build, so the two names cannot drift apart.
+#
+# usage: scripts/install [--bin-dir DIR] [--from DIR]
+#
+#   --bin-dir DIR  install destination (default: $HOME/.local/bin)
+#   --from DIR     install already-built binaries from DIR instead of running cargo
+set -Eeuo pipefail
+
+bin_dir="$HOME/.local/bin"
+from=""
+while (($#)); do
+  case $1 in
+    --bin-dir) bin_dir=${2:?--bin-dir needs a directory}; shift 2 ;;
+    --from) from=${2:?--from needs a directory}; shift 2 ;;
+    -h | --help) sed -n '2,8p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) echo "install: unknown argument: $1" >&2; exit 2 ;;
+  esac
+done
+
+binaries=(st2 st3 st3-migrate stui)
+
+if [[ -z $from ]]; then
+  repo=$(cd "$(dirname "$0")/.." && pwd)
+  cargo build --release --locked --manifest-path "$repo/Cargo.toml" \
+    -p st2 -p st3 -p st3-migrate -p stui
+  from=${CARGO_TARGET_DIR:-$repo/target}/release
+fi
+
+for binary in "${binaries[@]}"; do
+  [[ -x $from/$binary && ! -d $from/$binary ]] || {
+    echo "install: $from/$binary is not an executable file" >&2
+    exit 1
+  }
+done
+# `mv` onto a directory (or a link to one) would move the file inside it instead of replacing it.
+for name in "${binaries[@]}" st; do
+  [[ ! -d $bin_dir/$name ]] || {
+    echo "install: $bin_dir/$name is a directory; refusing to replace it" >&2
+    exit 1
+  }
+done
+
+mkdir -p "$bin_dir"
+# Each name is replaced by rename, so a running process keeps its old inode and a concurrent
+# caller sees either the old or the new file, never a partial copy.
+for binary in "${binaries[@]}"; do
+  staged=$(mktemp "$bin_dir/.$binary.install.XXXXXX")
+  cp "$from/$binary" "$staged"
+  chmod 0755 "$staged"
+  mv -f "$staged" "$bin_dir/$binary"
+done
+link=$(mktemp -u "$bin_dir/.st.install.XXXXXX")
+ln -s st3 "$link"
+mv -f "$link" "$bin_dir/st"
+
+[[ $(readlink "$bin_dir/st") == st3 ]] || {
+  echo "install: $bin_dir/st does not link to st3" >&2
+  exit 1
+}
+printf 'installed %s and st -> st3 in %s\n' "${binaries[*]}" "$bin_dir"

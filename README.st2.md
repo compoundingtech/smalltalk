@@ -28,7 +28,7 @@ Prerequisites:
 - Git when a declaration materializes workspace files;
 - Bash and `jq` on `PATH` when lifecycle hooks are enabled.
 
-From a checkout:
+From a checkout (`scripts/install` installs st2 together with st3 and the `st` symlink):
 
 ```sh
 cargo install --path . --locked

@@ -21,6 +21,17 @@ nix profile install .#st3
 st3 --help
 ```
 
+To install st2 beside it, use the `small-talk` package, which carries both products and the same
+`st` symlink:
+
+```sh
+nix profile install .#small-talk
+```
+
+From a checkout without Nix, `scripts/install` builds st2 and st3 once, installs `st2`, `st3`,
+`st3-migrate`, and `stui` into `~/.local/bin` (or `--bin-dir DIR`), and makes `st` a symlink to the
+installed `st3`. `st` is never a separate build.
+
 For repository development:
 
 ```sh
