@@ -402,6 +402,7 @@ fn st3_eval_inventory_has_twenty_two_model_free_and_twenty_one_model_backed_eval
         "restart-continuity",
         "run-generation-revision",
         "seat-mission-work",
+        "seat-queue",
         "signal-rename",
         "test-writing",
         "weird-git-setup",
@@ -569,6 +570,65 @@ fn work_wake_reliability_covers_normal_lifecycle_wakes_without_priming_the_worke
                 !fixture.to_ascii_lowercase().contains(leaked_failure_mode),
                 "worker fixture primes the agent with `{leaked_failure_mode}`"
             );
+        }
+    }
+}
+
+#[test]
+fn seat_queue_moves_one_run_and_gates_the_head_without_priming_the_seat() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join("evals/st3/seat-queue");
+    let source = fs::read_to_string(root.join("eval.kdl")).unwrap();
+    assert_eq!(
+        authored_harness_counts(&source, "seat-queue/eval.kdl"),
+        (1, 0)
+    );
+    for judge in [
+        "judges/queue-order.sh",
+        "judges/no-preemption.sh",
+        "judges/no-terminal-input.sh",
+    ] {
+        assert!(source.contains(judge), "missing held-out `{judge}`");
+    }
+
+    let controller = fs::read_to_string(root.join("controller.sh")).unwrap();
+    assert!(controller.contains(".value.harness_state"));
+    for required in ["missions start", "agents queue move", "attention approve"] {
+        assert!(
+            controller.contains(required),
+            "missing `{required}` scenario"
+        );
+    }
+    for forbidden in ["work claim", "work complete", "work wake", "terminals send"] {
+        assert!(
+            !controller.contains(forbidden),
+            "the controller must leave `{forbidden}` to the seat and the runtime"
+        );
+    }
+
+    for entry in fs::read_dir(root.join("fixtures")).unwrap() {
+        let fixture = fs::read_to_string(entry.unwrap().path())
+            .unwrap()
+            .to_ascii_lowercase();
+        for leaked in ["pty", "terminal", "workaround"] {
+            assert!(
+                !fixture.contains(leaked),
+                "seat fixture primes the agent with `{leaked}`"
+            );
+        }
+        // The mission names carry the eval name. The goals must not hint at
+        // the order the seat is judged on.
+        for goal in fixture
+            .lines()
+            .filter(|line| line.trim_start().starts_with("goal "))
+        {
+            for leaked in ["queue", "order", "before", "after", "first", "next"] {
+                assert!(
+                    !goal.contains(leaked),
+                    "seat fixture goal primes the agent with `{leaked}`"
+                );
+            }
         }
     }
 }

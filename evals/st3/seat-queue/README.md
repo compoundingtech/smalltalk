@@ -1,0 +1,35 @@
+# Seat queue
+
+This paid black-box eval keeps one durable top-level seat, `agent/eval/seat-queue/worker`, on a
+real Claude TUI with `claude-sonnet-5`. Three finite missions assign work to that one seat.
+
+The controller starts the runs in a known order: `alpha`, `bravo`, then `charlie`. Alpha has two
+seat steps with an agentless human sign-off gate between them. Bravo and charlie each have one
+seat step.
+
+While the seat holds alpha's first step, a person moves charlie before bravo with
+`st3 agents queue move`. Alpha then waits on its sign-off gate as the head run. The controller
+approves the gate only after the seat has taken charlie's work, while the seat still holds that
+work.
+
+The controller only starts runs, moves one run, approves one gate, and observes. It never claims,
+completes, or wakes seat work. Every wake comes from the reconciler and reaches the agent through
+native delivery.
+
+The first live runs showed that the wake and the agent's own work list are not enough. One seat
+finished a step, read its work list, and claimed a later run's step before the head run's wake
+arrived. `work claim` now refuses a later run's step while an earlier run has ready work for the
+seat. This eval checks, with a live agent, that the seat ends in queue order.
+
+The held-out judges rebuild the seat queue and each step's state from graph history at every claim.
+They pass only if the seat did all of the following:
+
+- claimed each step when it was the first ready step in queue order;
+- took charlie before bravo because of the move;
+- passed over waiting alpha, and took alpha's second step before bravo once alpha was ready;
+- kept each held claim until it submitted that work, and got no wake for other work while it held a
+  claim;
+- received no terminal input.
+
+If the agent finishes a step before the controller's move or gate approval lands, the controller
+fails and names the timing. That result says nothing about the agent or st3. Run the eval again.

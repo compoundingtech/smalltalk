@@ -35,6 +35,7 @@ The [source eval migration review](./MIGRATION-REVIEW.md) classifies all 58 acti
 | Mixed Worker Pool | Not supported | `st3/mixed-worker-pool` |
 | Cross-harness message wake | Not supported | `st3/cross-harness-message-wake` |
 | Work wake reliability | Not supported | `st3/work-wake-reliability` |
+| Seat queue | Not supported | `st3/seat-queue` |
 | Planning Mode | Not supported | `st3/planning-mode` |
 | Run Generation Revision | Not supported | `st3/run-generation-revision` |
 | Mission Inputs | Not supported | `st3/mission-inputs` |
@@ -56,7 +57,7 @@ Mission Inputs, Local File Refresh, and Constraint Inheritance are also model-fr
 
 Run Generation Revision starts one Codex planner through the launch API.
 
-The st3 corpus has 43 active evals. Twenty-two are model-free, and twenty-one use at least one model.
+The st3 corpus has 44 active evals. Twenty-two are model-free, and twenty-two use at least one model.
 
 Each eval KDL starts with a document version. A missing version means version zero.
 
@@ -91,6 +92,7 @@ The seat counts include every native agent seat. The LLM judge counts are separa
 | st3 | Cross-harness message wake | Claude Opus × 1, Codex × 1, Pi × 1, OMP × 1 | None |
 | st3 | Work wake reliability | Codex × 1 | None |
 | st3 | Seat mission work | Codex × 1 | None |
+| st3 | Seat queue | Claude Sonnet × 1 | None |
 | st3 | Planning Mode | Codex × 1, created by the launch API | None |
 | st3 | Run Generation Revision | Codex × 1, created by the launch API | None |
 | st3 | Continuous Stewardship | Codex × 1 | None |
@@ -99,7 +101,7 @@ The seat counts include every native agent seat. The LLM judge counts are separa
 | st3 | Codex compaction message delivery | Codex × 1 | None |
 | st3 | Native session import | Claude × 1, Codex × 1, Pi × 1, OMP × 1, OpenCode × 1 (raw, then imported) | None |
 
-The paired and st3-only corpus has 13 Claude seats, 43 Codex seats, two Pi seats, two OMP seats,
+The paired and st3-only corpus has 14 Claude seats, 43 Codex seats, two Pi seats, two OMP seats,
 and one OpenCode seat. It also has three Codex LLM judges.
 
 The twenty-two model-free st3 evals add no model seats and no LLM judges.
