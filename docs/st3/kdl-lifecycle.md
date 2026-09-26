@@ -253,6 +253,23 @@ The resource must already have an active observer. Refresh is a declarative miss
 current public CLI does not expose a standalone resource-refresh shortcut. An unchanged observation
 is a successful refresh.
 
+## Agent queue authority
+
+An agent cannot reorder a seat's queue by default. A person grants that in the agent's declaration:
+
+```kdl
+queue-authority {
+  move "fleet/fabric/builder"
+  move "fleet/review/*"
+}
+```
+
+Each rule names an exact seat identity or a terminal `/*` namespace, without the `agent/` prefix.
+The agent then moves runs with `st3 agents queue move SEAT RUN --top --as agent/PATH`. The move is
+recorded with the agent as its actor. The daemon reads the grant from the agent's current desired
+declaration when the move arrives, as it does for mission authority. [Agent seat
+queues](seat-queue.md) describes the queue and the move.
+
 ## Planning a new mission
 
 Planning uses an immutable request document and a declarative launch.

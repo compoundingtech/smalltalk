@@ -14,12 +14,21 @@ agent "eval/seat-queue/worker" {
   }
 }
 
+agent "eval/seat-queue/chief" {
+  workspace "${EVAL_ROOT}"
+  restart "never"
+  command "sleep 3600"
+  queue-authority {
+    move "eval/seat-queue/worker"
+  }
+}
+
 mission "eval/seat-queue" state="ready" timeout="20m" {
-  goal "One durable seat serves three finite mission runs in the order its queue sets."
+  goal "One durable seat serves three finite mission runs in the order its queue sets, and an authorized agent reorders it."
 
   step "exercise-seat-queue" timeout="15m" {
     agentless
-    title "Three runs share one seat while a person reorders them and one waits on a gate"
+    title "Three runs share one seat while an authorized agent reorders them and one waits on a gate"
     exec "seat-queue/controller" {
       host "local"
       workspace "${ST_WORKSPACE}"

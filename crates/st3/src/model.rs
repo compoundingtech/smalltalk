@@ -511,13 +511,34 @@ impl MissionAuthority {
             "revise" => &self.revise,
             _ => return false,
         };
-        patterns.iter().any(|pattern| {
-            pattern == mission
-                || pattern
-                    .strip_suffix("/*")
-                    .is_some_and(|prefix| mission.starts_with(&format!("{prefix}/")))
-        })
+        patterns
+            .iter()
+            .any(|pattern| authority_pattern_matches(pattern, mission))
     }
+}
+
+/// Seats whose queues an agent may reorder, granted by `queue-authority` in its declaration.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct QueueAuthority {
+    pub moves: Vec<String>,
+}
+
+impl QueueAuthority {
+    /// `seat` may carry the `agent/` prefix; patterns never do.
+    pub fn allows_move(&self, seat: &str) -> bool {
+        let seat = seat.strip_prefix("agent/").unwrap_or(seat);
+        self.moves
+            .iter()
+            .any(|pattern| authority_pattern_matches(pattern, seat))
+    }
+}
+
+/// An authority pattern is an exact ID or a terminal `/*` namespace.
+fn authority_pattern_matches(pattern: &str, id: &str) -> bool {
+    pattern == id
+        || pattern
+            .strip_suffix("/*")
+            .is_some_and(|prefix| id.starts_with(&format!("{prefix}/")))
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

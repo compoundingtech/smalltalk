@@ -3597,7 +3597,7 @@ impl Store {
             return Err(St3Error::new(
                 "seat-queue-order",
                 format!(
-                    "`{subject}` is not the next work for `{actor}`; claim `{next}` first. A person can reorder the seat with `st3 agents queue move`"
+                    "`{subject}` is not the next work for `{actor}`; claim `{next}` first. A person, or an agent with queue authority for this seat, can reorder it with `st3 agents queue move`"
                 ),
             )
             .with_detail("next_work_id", next));

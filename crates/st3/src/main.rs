@@ -933,8 +933,9 @@ struct AgentQueueMoveArgs {
     /// Why the order changed; recorded with the move.
     #[arg(long)]
     reason: Option<String>,
-    /// Person making the move; defaults to `person` in the st3 config.
-    #[arg(long = "as", value_parser = parse_person_subject)]
+    /// Person or agent making the move; defaults to `person` in the st3 config. An agent needs
+    /// `queue-authority { move "SEAT" }` for this seat in its declaration.
+    #[arg(long = "as", value_parser = parse_queue_move_actor)]
     actor: Option<String>,
 }
 
@@ -4669,10 +4670,10 @@ async fn run_agent_queue(
         print!("{}", render_agent_queue(&response.value));
         return Ok(());
     };
-    let person = args.actor.as_deref().or(configured_person).context(
-        "st3 agents queue move needs `--as person/NAME` or `person = \"person/NAME\"` in the st3 config",
+    let actor = args.actor.as_deref().or(configured_person).context(
+        "st3 agents queue move needs `--as person/NAME`, `--as agent/PATH`, or `person = \"person/NAME\"` in the st3 config",
     )?;
-    let person = parse_person_subject(person).map_err(anyhow::Error::msg)?;
+    let actor = parse_queue_move_actor(actor).map_err(anyhow::Error::msg)?;
     let agent = seat_subject(&args.agent);
     let (placement, anchor) = if args.top {
         (st3_client::AgentQueuePlacement::Top, None)
@@ -4691,9 +4692,41 @@ async fn run_agent_queue(
     } else {
         anyhow::bail!("choose one of --top, --bottom, --before RUN, or --after RUN");
     };
-    let client = generated_client(endpoint, Some(&person))?;
-    let capabilities = client.capabilities().await?;
     let nonce = uuid::Uuid::now_v7().simple().to_string();
+    if actor.starts_with("agent/") {
+        // Client-v0 actions carry person authority only. The daemon checks an agent's queue
+        // authority on this route.
+        let claim: ClaimRecord = Client::new(endpoint.clone())
+            .post(
+                "/v1/agent-queue-moves",
+                &st3::model::SeatQueueMoveRequest {
+                    agent: agent.clone(),
+                    run: mission_run_subject(&args.run),
+                    placement: match placement {
+                        st3_client::AgentQueuePlacement::Top => "top",
+                        st3_client::AgentQueuePlacement::Bottom => "bottom",
+                        st3_client::AgentQueuePlacement::Before => "before",
+                        st3_client::AgentQueuePlacement::After => "after",
+                    }
+                    .into(),
+                    anchor,
+                    reason: args.reason,
+                    actor,
+                    idempotency_key: format!("agent-queue-move:{nonce}"),
+                },
+            )
+            .await?;
+        if json_output {
+            return print_value(&claim, true);
+        }
+        let queue = generated_client(endpoint, None)?
+            .agent_queue(&agent)
+            .await?;
+        print!("{}", render_agent_queue(&queue.value));
+        return Ok(());
+    }
+    let client = generated_client(endpoint, Some(&actor))?;
+    let capabilities = client.capabilities().await?;
     let response = client
         .agent_queue_move(
             format!("action/{nonce}"),
@@ -6446,6 +6479,15 @@ fn parse_person_subject(actor: &str) -> std::result::Result<String, String> {
         return Err("human authority must be a complete `person/NAME` subject".into());
     }
     Ok(actor.to_owned())
+}
+
+fn parse_queue_move_actor(actor: &str) -> std::result::Result<String, String> {
+    let parsed = if actor.starts_with("agent/") {
+        parse_publication_actor(actor)
+    } else {
+        parse_person_subject(actor)
+    };
+    parsed.map_err(|_| "a queue move needs a complete `person/NAME` or `agent/PATH` subject".into())
 }
 
 fn parse_publication_actor(actor: &str) -> std::result::Result<String, String> {

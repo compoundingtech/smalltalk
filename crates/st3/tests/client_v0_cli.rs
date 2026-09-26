@@ -698,7 +698,7 @@ async fn run_queue_cli(socket: &Path, config_home: &Path, json: bool, args: &[&s
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn agents_queue_cli_shows_seat_order_and_records_person_moves() {
+async fn agents_queue_cli_shows_seat_order_and_records_person_and_agent_moves() {
     let root = tempfile::tempdir().unwrap();
     let socket = root.path().join("st3.sock");
     let config_home = root.path().join("config");
@@ -712,6 +712,11 @@ async fn agents_queue_cli_shows_seat_order_and_records_person_moves() {
     let store = state.store.clone();
     let source = r#"version 2
 agent "queue-seat" { workspace "/tmp"; command "true" }
+agent "queue-chief" {
+  workspace "/tmp"
+  command "true"
+  queue-authority { move "client-v0-cli.queue-seat" }
+}
 mission "queued-work" state="ready" {
   concurrent-runs
   goal "Give the durable seat one step in each run."
@@ -862,6 +867,118 @@ mission "queued-work" state="ready" {
     );
     assert_eq!(queue["value"]["moves"][0]["placement"], "after");
     assert_eq!(queue["value"]["moves"][0]["anchor_run_id"], run(1));
+
+    // An agent with queue authority for the seat moves runs as itself.
+    let chief = "agent/client-v0-cli.queue-chief";
+    let moved = run_queue_cli(
+        &socket,
+        &config_home,
+        false,
+        &[
+            "agents",
+            "queue",
+            "move",
+            &seat,
+            run(1),
+            "--top",
+            "--reason",
+            "the chief needs it first",
+            "--as",
+            chief,
+        ],
+    )
+    .await;
+    assert!(
+        moved.status.success(),
+        "{}",
+        String::from_utf8_lossy(&moved.stderr)
+    );
+    let moved = String::from_utf8(moved.stdout).unwrap();
+    assert!(
+        moved.contains(&format!("  1. {}  ready  next {}\n", run(1), step(1))),
+        "{moved}"
+    );
+    assert!(
+        moved.contains(&format!(
+            "  {chief} moved {} to the top: the chief needs it first\n",
+            run(1)
+        )),
+        "{moved}"
+    );
+    let claim = value(
+        &run_queue_cli(
+            &socket,
+            &config_home,
+            true,
+            &[
+                "agents",
+                "queue",
+                "move",
+                &seat,
+                run(0),
+                "--before",
+                run(1),
+                "--as",
+                chief,
+            ],
+        )
+        .await,
+    );
+    assert_eq!(claim["kind"], "agent.queue.moved");
+    assert_eq!(claim["actor"], chief);
+    assert_eq!(claim["subject"], seat);
+    assert_eq!(claim["body"]["fields"]["anchor"], run(1));
+    let queue =
+        value(&run_queue_cli(&socket, &config_home, true, &["agents", "queue", &seat]).await);
+    assert_eq!(queue["value"]["runs"][0]["mission_run_id"], run(0));
+    assert_eq!(queue["value"]["moves"][0]["actor_id"], chief);
+    assert_eq!(queue["value"]["move_count"], 4);
+
+    // The seat has no grant over its own queue.
+    let refused = run_queue_cli(
+        &socket,
+        &config_home,
+        false,
+        &[
+            "agents",
+            "queue",
+            "move",
+            &seat,
+            run(2),
+            "--top",
+            "--as",
+            &seat,
+        ],
+    )
+    .await;
+    assert!(!refused.status.success());
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("queue-authority-denied"),
+        "{}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    let refused = run_queue_cli(
+        &socket,
+        &config_home,
+        false,
+        &[
+            "agents",
+            "queue",
+            "move",
+            &seat,
+            run(2),
+            "--top",
+            "--as",
+            "operator",
+        ],
+    )
+    .await;
+    assert!(!refused.status.success());
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("`person/NAME` or `agent/PATH`"),
+        "{}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
 
     let refused = run_queue_cli(
         &socket,

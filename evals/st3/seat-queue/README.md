@@ -12,10 +12,14 @@ The controller starts the runs in a known order: `alpha`, `bravo`, then `charlie
 seat steps with an agentless human sign-off gate between them. Bravo and charlie each have one
 seat step.
 
-While the seat holds alpha's first step, a person moves charlie before bravo with
-`st3 agents queue move`. Alpha then waits on its sign-off gate as the head run. The controller
-approves the gate only after the seat has taken charlie's work, while the seat still holds that
-work.
+A second top-level agent, `agent/eval/seat-queue/chief`, is model-free. Its declaration grants
+`queue-authority { move "eval/seat-queue/worker" }`, the way `mission-authority` grants a seat
+named missions. The controller acts as the chief, as the mission-authority eval acts as its
+planner. It first tries the move as the worker, which has no grant, and requires
+`queue-authority-denied`. Then, while the seat holds alpha's first step, the chief moves charlie
+before bravo with `st3 agents queue move --as agent/eval/seat-queue/chief`. Alpha then waits on
+its sign-off gate as the head run. The controller approves the gate only after the seat has taken
+charlie's work, while the seat still holds that work.
 
 The controller only starts runs, moves one run, approves one gate, and observes. It never claims,
 completes, or wakes seat work. Every wake comes from the reconciler and reaches the agent through
@@ -30,7 +34,7 @@ The held-out judges rebuild the seat queue and each step's state from graph hist
 They pass only if the seat did all of the following:
 
 - claimed each step when it was the first ready step in queue order;
-- took charlie before bravo because of the move;
+- took charlie before bravo because of the one move, which the chief made;
 - passed over waiting alpha, and took alpha's second step before bravo once alpha was ready;
 - kept each held claim until it submitted that work, and got no wake for other work while it held a
   claim;

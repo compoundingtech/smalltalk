@@ -69,9 +69,12 @@ jq -se --slurpfile state controller-state.json '
   # Start order is the default queue order.
   $joins == $runs
 
-  # One person moved charlie before bravo.
+  # The authorized agent, not the seat and not a person, moved charlie before
+  # bravo.
+  and ($s.mover | startswith("agent/"))
+  and $s.mover != $worker
   and ($moves | length) == 1
-  and $moves[0].actor == $s.operator
+  and $moves[0].actor == $s.mover
   and $moves[0].body.fields.run == $s.runs.charlie
   and $moves[0].body.fields.placement == "before"
   and $moves[0].body.fields.anchor == $s.runs.bravo

@@ -4,8 +4,10 @@ set -Eeuo pipefail
 : "${ST_MISSION_RUN:?ST_MISSION_RUN must identify the eval mission run}"
 
 readonly REQUESTER=person/eval-requester
-readonly OPERATOR=person/eval-operator
 readonly WORKER=agent/eval/seat-queue/worker
+# The chief's declaration grants it queue authority over the worker's seat. The
+# worker has no such grant, so its own move must be refused.
+readonly MOVER=agent/eval/seat-queue/chief
 readonly GENERATED="$PWD/generated"
 readonly STATE="$PWD/controller-state.json"
 
@@ -24,8 +26,8 @@ trap 'exit 1' HUP INT TERM
 
 mkdir -p "$GENERATED"
 
-state="$(jq -n --arg worker "$WORKER" --arg operator "$OPERATOR" \
-  '{worker: $worker, operator: $operator, runs: {}, steps: {}, claims: [], checkpoints: []}')"
+state="$(jq -n --arg worker "$WORKER" --arg mover "$MOVER" \
+  '{worker: $worker, mover: $mover, runs: {}, steps: {}, claims: [], checkpoints: []}')"
 persist_state() {
   printf '%s\n' "$state" >"$STATE"
 }
@@ -185,6 +187,17 @@ queue_snapshot started
 [[ "$(queue_runs started)" == "$(jq -cn --arg a "$alpha" --arg b "$bravo" --arg c "$charlie" '[$a, $b, $c]')" ]] \
   || fail "the seat queue did not keep start order: $(queue_runs started)"
 
+# An agent without queue authority for the seat cannot reorder it, not even the
+# seat itself.
+if st3 agents queue move "$WORKER" "$charlie" --before "$bravo" \
+  --reason "the seat tries to reorder its own queue" \
+  --as "$WORKER" --json >"$GENERATED/refused-move.json" 2>"$GENERATED/refused-move.err"; then
+  fail "the seat moved a run in its own queue without queue authority"
+fi
+grep -q 'queue-authority-denied' "$GENERATED/refused-move.err" \
+  || fail "the unauthorized move failed for another reason: $(cat "$GENERATED/refused-move.err")"
+checkpoint unauthorized-move-refused
+
 # The seat takes the head run's ready step first.
 expect_next_claim "$alpha_draft"
 checkpoint alpha-draft-claimed
@@ -193,10 +206,13 @@ queue_snapshot before-move
 [[ "$(queue_next before-move)" == "$bravo_work" ]] \
   || fail "before the move the next work was $(queue_next before-move), not $bravo_work"
 
-# A person moves the last run ahead of bravo while the seat holds alpha's draft.
+# The authorized agent moves the last run ahead of bravo while the seat holds
+# alpha's draft.
 st3 agents queue move "$WORKER" "$charlie" --before "$bravo" \
   --reason "charlie's notes are needed before bravo's" \
-  --as "$OPERATOR" --json >"$GENERATED/move.json"
+  --as "$MOVER" --json >"$GENERATED/move.json"
+jq -e --arg mover "$MOVER" '.actor == $mover and .kind == "agent.queue.moved"' "$GENERATED/move.json" >/dev/null \
+  || fail "the move was not recorded as the authorized agent's"
 checkpoint queue-moved
 held_during_move="$(step_state "$alpha_draft")"
 [[ "$held_during_move" =~ ^(claimed|working)$ ]] \

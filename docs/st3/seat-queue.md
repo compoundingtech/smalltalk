@@ -72,10 +72,32 @@ MOVES        1 total
   2026-09-26T10:03:00.000Z  person/operator moved mission-run/build-7 before mission-run/ship-2: finish the build first
 ```
 
-`move` takes exactly one of `--top`, `--bottom`, `--before RUN`, or `--after RUN`. It needs person
-authority from `--as person/NAME` or `person` in the st3 config, like other client-v0 mutations.
-The run and any anchor must be queued for the seat. After a move, the command prints the new
-queue. With `--json`, it prints the action result.
+`move` takes exactly one of `--top`, `--bottom`, `--before RUN`, or `--after RUN`. The run and any
+anchor must be queued for the seat. After a move, the command prints the new queue.
+
+A person moves runs with `--as person/NAME` or `person` in the st3 config, like other client-v0
+mutations. With `--json`, it prints the action result.
+
+An agent moves runs with `--as agent/PATH` when a person has granted it that authority in its
+declaration, the way `mission-authority` grants named missions:
+
+```kdl
+agent "fleet/example/chief" {
+  workspace "."
+  harness "claude" {}
+  queue-authority {
+    move "fleet/example/worker"
+    move "fleet/review/*"
+  }
+}
+```
+
+Each `move` rule names an exact seat identity or a terminal `/*` namespace, without `agent/`. A
+seat has no authority over its own queue unless a rule names it. The daemon reads the grant from
+the agent's current desired declaration when the move arrives, and refuses a move outside it with
+`queue-authority-denied`, or `missing-agent-queue-authority` when the agent has no declaration.
+The agent's move goes to `POST /v1/agent-queue-moves`, because client-v0 actions carry only
+person authority. That route also accepts a person. With `--json`, it prints the move claim.
 
 The typed client exposes the same surface:
 
@@ -97,12 +119,12 @@ A move writes one `agent.queue.moved` claim on the agent subject:
 | `run` | the moved `mission-run/…` subject |
 | `placement` | `top`, `bottom`, `before`, or `after` |
 | `anchor` | the other queued run, only for `before` and `after` |
-| `reason` | optional human reason |
+| `reason` | optional reason |
 
-The claim's actor is the person, and its accepted time is when the move happened. The claim kind
-uses the `authorized-requester` write policy, so the raw public claim endpoint refuses it; the
-dedicated `agent.queue-move` action writes it. A retry with the same idempotency key returns the
-same claim.
+The claim's actor is the person or the agent that moved the run, and its accepted time is when the
+move happened. The claim kind uses the `authorized-requester` write policy, so the raw public claim
+endpoint refuses it; only the `agent.queue-move` action and the agent queue move route write it. A
+retry with the same idempotency key returns the same claim.
 
 No table stores the order. Each read derives it from two inputs:
 
@@ -142,14 +164,26 @@ others.
   - moves must name queued runs and valid anchors.
 - `client_v0_contract::agent_queue_read_and_person_move_share_one_seat_order`: the read, the
   person action, the agent-filtered work list order, validation errors, and an unknown agent.
-- `client_v0_cli::agents_queue_cli_shows_seat_order_and_records_person_moves`: human and JSON
-  output, `--as`, and the configured person fallback against a temporary daemon socket.
+- `api::tests::an_agent_moves_a_seat_queue_only_with_queue_authority`: an agent granted the seat
+  moves a run and is recorded as the move's actor in the queue view and history. The seat itself,
+  an agent without a grant, an agent granted another seat, an undeclared agent, and a daemon actor
+  are refused, and the order does not change. A person can use the same route. A replica rebuilds
+  the same order and history from the agent's and the person's moves.
+- `mission::tests::agent_queue_authority_uses_exact_and_terminal_seat_rules`: exact and namespace
+  rules, `${ST_MISSION_RUN}` in a rule, and refused empty, prefixed, wildcard, duplicate, and
+  unknown rules.
+- `client_v0_cli::agents_queue_cli_shows_seat_order_and_records_person_and_agent_moves`: human
+  and JSON output for person and agent moves, `--as`, the configured person fallback, a refused
+  seat, and a malformed actor, against a temporary daemon socket.
 - `tests::agent_queue_view_lists_the_claim_then_runs_in_order_and_moves`: the exact human view.
-- `evals/st3/seat-queue`: a paid eval with one durable Claude seat and three runs. Held-out judges
-  replay graph history at every claim. They require that a live agent took the first ready step in
-  queue order each time, followed a person's move, passed over a head run waiting on a gate and
-  returned to it once ready, kept each held claim, and got no terminal input. Run reports are in
-  `evals/st3/seat-queue/reports/`.
+- `evals/st3/seat-queue`: a paid eval with one durable seat and three runs. The seat is Claude
+  `claude-sonnet-5` by default; the runner can put Codex `gpt-6-luna` or omp
+  `openai-codex/gpt-5.6-luna` in it instead. A model-free chief agent with queue authority over the
+  seat makes the move, after the seat's own move is refused. Held-out judges replay graph history
+  at every claim. They require that a live agent took the first ready step in queue order each
+  time, followed the chief's move, passed over a head run waiting on a gate and returned to it
+  once ready, kept each held claim, and got no terminal input. Run reports are in
+  `evals/st3/seat-queue/reports/`. Reports before the chief was added used a person's move.
 
 ## Left out or uncertain
 
@@ -157,13 +191,17 @@ others.
   the wake and the agent's work list are not enough. A Claude seat that finished one step checked
   its list, then claimed a later run's step before the wake for the head run arrived. `work claim`
   now refuses that. Inside one run, the mission's dependencies still decide. `available-to` work
-  is not queued, so it is not refused. An agent that wants another run first needs a person to
-  move it.
+  is not queued, so it is not refused. An agent that wants another run first needs a person, or
+  an agent with queue authority for the seat, to move it.
 - **The boot contract lists fleet work.** Agents are told to run `st3 work ls` without `--as`. That
   list is in creation order, not seat order, and it includes steps the agent cannot claim. The
   claim check makes the seat order hold anyway. Changing the boot contract is left to its owner.
-- **Only people can move runs.** Client-v0 mutations require person authority. An agent, such as
-  a chief of staff, cannot reorder a seat without a new authorized path.
+- **Agents move runs only with a declared grant.** A person grants `queue-authority` in the
+  agent's declaration, and the daemon checks it on each move, as it checks `mission-authority`.
+  As there, the local socket trusts the actor named by `--as`, so the grant keeps well-behaved
+  agents in bounds and is not a security boundary against local processes. Removing a grant stops
+  later moves and leaves earlier ones in place. Paired and typed clients have no agent path;
+  client-v0 actions stay person-only.
 - **A reorder does not withdraw a wake that was already sent.** If the old head was woken and not
   yet claimed, the seat also receives a wake for the new head. Withdrawing the old wake would count
   as a closed attempt and could exhaust wakes when moves go back and forth.
@@ -171,8 +209,8 @@ others.
   on its own and is not grouped under its parent run.
 - **Membership follows `assigned-to` only.** An `available-to` step never puts a run in a seat's
   queue, which matches the earlier selector.
-- **Concurrent moves resolve by graph time.** Two people who move runs on different hosts at
-  nearly the same time both take effect, in accepted-time order. The later one can undo the
+- **Concurrent moves resolve by graph time.** Two people or agents who move runs on different hosts
+  at nearly the same time both take effect, in accepted-time order. The later one can undo the
   earlier one's intent. There is no fence on the agent subject, because harness claims change it
   constantly.
 - **No projection table.** Reads replay moves on each call. That is cheap while moves are human

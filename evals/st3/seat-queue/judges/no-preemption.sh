@@ -58,7 +58,7 @@ jq -se --slurpfile state controller-state.json '
   # The seat never held two claims at once.
   and ([ $holds | sort_by(.claimed) | range(1; length) as $i | .[$i].claimed > .[$i - 1].submitted ] | all)
 
-  # The person moved a run while the seat held alpha'"'"'s draft, and the draft
+  # The chief moved a run while the seat held alpha'"'"'s draft, and the draft
   # stayed with the seat until the seat submitted it.
   and ($moves | length) == 1
   and $draft.claimed < $moves[0].store_index
