@@ -883,11 +883,14 @@ incarnation. It is not a messaging or work-wake transport.
 
 When an exactly assigned step becomes ready, the reconciler sends a durable work message for the
 current harness incarnation. Each agent has one work seat across mission runs: a claimed,
-working, or verifying step occupies it. Ready steps wait in creation order, with the subject as a
-stable tie breaker. Only the first ready step is woken when the seat is free. Queued steps do not
-consume wake attempts or arm retry timers while the agent is busy. Delivery is acknowledged by a
-new working turn or by claiming the step. An unacknowledged delivery is retried after 15 seconds,
-at most three times. Exhaustion writes a `work-wake-exhausted` harness diagnostic naming the step,
+working, or verifying step occupies it. A parent that its agent submitted while one of its own
+nested steps is still ready does not occupy the seat; that nested step is woken. Ready steps wait
+in creation order, with the subject as a stable tie breaker. Only the first ready step is woken
+when the seat is free. Queued steps do not consume wake attempts or arm retry timers while the
+agent is busy. Delivery is acknowledged by a new working turn, by a native read or close, by a
+delivery into a turn that is still working, or by claiming the step. Pi and OMP steer a wake into
+the running turn, so a boot turn that started before the wake still acknowledges it. An
+unacknowledged delivery is retried after 15 seconds, at most three times. Exhaustion writes a `work-wake-exhausted` harness diagnostic naming the step,
 incarnation, and attempt count.
 
 `st3 work show STEP` exposes ready age, assignee state, wake attempts, acknowledgement, and failure.

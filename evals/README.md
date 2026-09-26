@@ -130,7 +130,8 @@ Do not disable harness features or reveal held-out gate criteria in agent instru
 
 st3 sends one durable Small Talk message when an assigned parent becomes ready.
 
-Inherited nested steps use the parent message. A nested step sends a new message only when its assignee changes.
+Inherited nested steps use the parent message. A nested step sends a new message only when its assignee changes,
+or when its agent submitted the parent while that nested step was still ready.
 
 The native driver transports a graph message. It does not create a second message source.
 
