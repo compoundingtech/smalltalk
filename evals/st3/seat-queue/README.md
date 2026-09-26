@@ -3,6 +3,11 @@
 This paid black-box eval keeps one durable top-level seat, `agent/eval/seat-queue/worker`, on a
 real Claude TUI with `claude-sonnet-5`. Three finite missions assign work to that one seat.
 
+`scripts/st3-seat-queue-eval/run` repeats the eval on fresh isolated daemons. Each run names its
+seat: `claude` keeps the harness in `eval.kdl`, `codex` swaps in a Codex TUI with `gpt-6-luna`, and
+`omp` swaps in omp with `openai-codex/gpt-5.6-luna`. The controller and judges are the same for
+every seat.
+
 The controller starts the runs in a known order: `alpha`, `bravo`, then `charlie`. Alpha has two
 seat steps with an agentless human sign-off gate between them. Bravo and charlie each have one
 seat step.
