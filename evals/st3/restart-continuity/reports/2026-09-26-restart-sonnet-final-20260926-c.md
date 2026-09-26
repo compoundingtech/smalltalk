@@ -61,7 +61,7 @@
 - Runtime work messages: `16` (`process-before-restart` × 1, `inspect-durable-state` × 1, `process-item-1` × 1, `process-item-2` × 1, `publish-pre-restart-revision` × 1, `process-after-restart` × 1, `inspect-recovered-state` × 1, `process-item-3` × 1, `process-item-4` × 1, `verify-complete-batch` × 1, `publish-batch-revision` × 1, `report-to-supervisor` × 1, `verify-and-confirm` × 1, `inspect-graph-history` × 1, `verify-ledger-read-only` × 1, `confirm-requester` × 1)
 - Direct agent messages: `4`
 - Required sequence: `daemon/runtime` assigns `process-before-restart` to rc.dev → items 1 and 2 and the pre-restart product → injector hangs up rc.dev and sends one duplicate → `daemon/runtime` assigns `process-after-restart` → items 3 and 4, batch product, one report to rc.sup → rc.sup verifies and sends one confirmation
-- Unexpected or duplicate messages: Runtime work messages to rc.dev exceeded the two assignments: both Claude seats submitted every parent before any nested step and ended the turn, so each nested step needed its own wake.
+- Unexpected or duplicate messages: 12 runtime work messages to rc.dev instead of 2: both Claude seats submitted every parent before any nested step and ended the turn, so each nested step needed its own wake.
 
 ## Judges
 
