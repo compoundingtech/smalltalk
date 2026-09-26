@@ -7530,6 +7530,7 @@ fn next_work_wake_for_agent<'a>(agent: &str, work: &'a [StepRunView]) -> Option<
         matches!(step.status.as_str(), "claimed" | "working" | "verifying")
             && (step.claimant.as_deref() == Some(agent)
                 || step.assigned_to.as_deref() == Some(agent))
+            && !submitted_with_ready_inherited_work(step, work)
     }) {
         return None;
     }
@@ -7552,12 +7553,33 @@ fn should_notify_work_message(
     work: &[crate::model::StepRunView],
 ) -> bool {
     !work.iter().any(|candidate| {
-        candidate.run == step.run
-            && candidate.assigned_to == step.assigned_to
-            && candidate.available_to == step.available_to
-            && candidate.step.len() < step.step.len()
-            && step.step.starts_with(&format!("{}/", candidate.step))
+        inherits_work_message(candidate, step) && candidate.status != "verifying"
     })
+}
+
+/// A nested step with the same assignee inherits its ancestor's work message.
+fn inherits_work_message(
+    ancestor: &crate::model::StepRunView,
+    step: &crate::model::StepRunView,
+) -> bool {
+    ancestor.run == step.run
+        && ancestor.assigned_to == step.assigned_to
+        && ancestor.available_to == step.available_to
+        && ancestor.step.len() < step.step.len()
+        && step.step.starts_with(&format!("{}/", ancestor.step))
+}
+
+/// An agent can submit a parent while its own nested steps are still ready. The parent then waits in
+/// `verifying` for work that nothing will prompt: the inherited parent message was consumed, and
+/// the seat looks occupied. Such a parent frees the seat so the ready nested step gets its own wake.
+fn submitted_with_ready_inherited_work(
+    parent: &crate::model::StepRunView,
+    work: &[crate::model::StepRunView],
+) -> bool {
+    parent.status == "verifying"
+        && work
+            .iter()
+            .any(|step| step.status == "ready" && inherits_work_message(parent, step))
 }
 
 fn work_message_target(message: &crate::model::MessageView) -> Option<(&str, u32, u32, &str)> {
@@ -14650,6 +14672,29 @@ mission "ios-proof-blocked" state="ready" {
             next_work_wake_for_agent("agent/reviewer", &work),
             Some(reassigned.subject.as_str())
         );
+
+        // A claimed parent keeps the seat and carries the inherited alert.
+        let mut claimed = parent.clone();
+        claimed.status = "claimed".into();
+        claimed.claimant = Some("agent/builder".into());
+        let work = vec![claimed.clone(), inherited.clone()];
+        assert_eq!(next_work_wake_for_agent("agent/builder", &work), None);
+
+        // A parent submitted before its nested work frees the seat for that nested step.
+        let mut submitted = claimed;
+        submitted.status = "verifying".into();
+        let work = vec![submitted.clone(), inherited.clone()];
+        assert!(should_notify_work_message(&inherited, &work));
+        assert_eq!(
+            next_work_wake_for_agent("agent/builder", &work),
+            Some(inherited.subject.as_str())
+        );
+
+        // A parent verifying after its nested work is done still occupies the seat.
+        let mut finished = inherited.clone();
+        finished.status = "completed".into();
+        let work = vec![submitted, finished];
+        assert_eq!(next_work_wake_for_agent("agent/builder", &work), None);
     }
 
     #[test]
