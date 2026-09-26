@@ -197,19 +197,29 @@ fn the_declarative_gates_dream_fixture_previews_without_rewriting() {
     );
 }
 
+/// An eval's `eval.kdl`, or a seat variant of it in the eval's `variants/` directory.
+fn is_eval_document(path: &std::path::Path) -> bool {
+    path.file_name().is_some_and(|name| name == "eval.kdl")
+        || (path.extension().is_some_and(|extension| extension == "kdl")
+            && path
+                .parent()
+                .and_then(|parent| parent.file_name())
+                .is_some_and(|name| name == "variants"))
+}
+
 #[test]
 fn every_native_st3_eval_uses_the_normative_grammar() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
         .join("evals/st3");
     let mut files = walkdir::WalkDir::new(&root)
-        .max_depth(2)
+        .max_depth(3)
         .follow_links(false)
         .into_iter()
         .collect::<Result<Vec<_>, _>>()
         .expect("walk evals")
         .into_iter()
-        .filter(|entry| entry.file_name() == "eval.kdl")
+        .filter(|entry| is_eval_document(entry.path()))
         .map(|entry| entry.into_path())
         .collect::<Vec<_>>();
     files.sort();
@@ -251,11 +261,11 @@ fn eval_agents_use_the_runtime_boot_contract_without_authored_prompts() {
         .join("../..")
         .join("evals/st3");
     for entry in walkdir::WalkDir::new(root)
-        .max_depth(2)
+        .max_depth(3)
         .follow_links(false)
         .into_iter()
         .filter_map(Result::ok)
-        .filter(|entry| entry.file_name() == "eval.kdl")
+        .filter(|entry| is_eval_document(entry.path()))
     {
         let source = fs::read_to_string(entry.path()).unwrap();
         let document = source.parse::<kdl::KdlDocument>().unwrap();

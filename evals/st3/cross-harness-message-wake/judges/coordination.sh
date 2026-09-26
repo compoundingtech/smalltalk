@@ -5,25 +5,9 @@ set -euo pipefail
 test -s controller-state.json
 
 run_tag="mission-run:$ST_MISSION_RUN"
-names=(codex claude pi omp)
+# shellcheck source=../participants.sh
+source ./participants.sh
 phases=(startup idle)
-declare -A agents peers tokens results
-agents[codex]="agent/$ST_MISSION_RUN/wake.codex"
-agents[claude]="agent/$ST_MISSION_RUN/wake.claude"
-agents[pi]="agent/$ST_MISSION_RUN/wake.pi"
-agents[omp]="agent/$ST_MISSION_RUN/wake.omp"
-peers[codex]="${agents[claude]}"
-peers[claude]="${agents[codex]}"
-peers[pi]="${agents[omp]}"
-peers[omp]="${agents[pi]}"
-tokens[codex]="EMBER"
-tokens[claude]="ORBIT"
-tokens[pi]="QUARTZ"
-tokens[omp]="RIVER"
-results[codex]="EMBER+ORBIT"
-results[claude]="EMBER+ORBIT"
-results[pi]="QUARTZ+RIVER"
-results[omp]="QUARTZ+RIVER"
 
 jq -e '
   def milliseconds:
@@ -83,4 +67,4 @@ for phase in "${phases[@]}"; do
   done
 done
 
-echo "PASS: Codex, Claude, Pi, and OMP consumed startup and idle messages and completed both paired consensus protocols"
+echo "PASS: ${names[*]} consumed startup and idle messages and completed both paired consensus protocols"

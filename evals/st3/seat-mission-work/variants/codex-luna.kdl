@@ -1,10 +1,12 @@
 version 2
 
+// Variant of eval.kdl: only the durable seat changes, to Codex gpt-6-luna.
+
 agent "eval/seat-mission-work/worker" {
   workspace "${EVAL_ROOT}"
   restart "never"
   harness "codex" {
-    model "gpt-6-sol"
+    model "gpt-6-luna"
     effort "medium"
     args "--dangerously-bypass-approvals-and-sandbox" "--dangerously-bypass-hook-trust"
   }

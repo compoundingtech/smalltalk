@@ -1,12 +1,14 @@
 version 2
 
+// Variant of eval.kdl: only the durable seat changes, to Claude claude-sonnet-5.
+
 agent "eval/seat-mission-work/worker" {
   workspace "${EVAL_ROOT}"
   restart "never"
-  harness "codex" {
-    model "gpt-6-sol"
+  harness "claude" {
+    model "claude-sonnet-5"
     effort "medium"
-    args "--dangerously-bypass-approvals-and-sandbox" "--dangerously-bypass-hook-trust"
+    args "--permission-mode" "bypassPermissions"
   }
 }
 
