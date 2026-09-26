@@ -2951,42 +2951,10 @@ impl Store {
     pub fn agent_work_queues(&self) -> Result<BTreeMap<String, AgentWorkQueue>> {
         let connection = self.readers.get();
         let orders = seat_run_orders_tx(&connection, None)?;
-        let mut statement = connection.prepare(
-            "SELECT subject, run_id, step_path, status, assignee, lease_owner, available_to,
-                    created_at_unix_ms
-             FROM step_runs
-             WHERE agentless=0
-               AND status IN ('ready', 'claimed', 'working', 'verifying')
-               AND generation_id=(SELECT current_generation_id FROM mission_runs WHERE id=step_runs.run_id)
-             ORDER BY length(created_at_unix_ms), created_at_unix_ms, subject",
-        )?;
-        let rows = statement
-            .query_map([], |row| {
-                Ok(RosterStepRow {
-                    subject: row.get(0)?,
-                    run: format!("mission-run/{}", row.get::<_, String>(1)?),
-                    step: row.get(2)?,
-                    status: row.get(3)?,
-                    assignee: row.get(4)?,
-                    claimant: row.get(5)?,
-                    available_to: serde_json::from_str(&row.get::<_, String>(6)?)
-                        .unwrap_or_default(),
-                    created_at_unix_ms: row.get::<_, String>(7)?.parse().unwrap_or_default(),
-                })
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
+        let rows = seat_step_rows_tx(&connection, None)?;
         let mut seats = BTreeMap::<&str, Vec<SeatStep<'_>>>::new();
         for row in &rows {
-            let step = SeatStep {
-                subject: &row.subject,
-                run: &row.run,
-                step: &row.step,
-                status: &row.status,
-                assignee: row.assignee.as_deref(),
-                claimant: row.claimant.as_deref(),
-                available_to: &row.available_to,
-                created_at_unix_ms: row.created_at_unix_ms,
-            };
+            let step = row.seat_step();
             for agent in [row.assignee.as_deref(), row.claimant.as_deref()]
                 .into_iter()
                 .flatten()
@@ -3620,6 +3588,19 @@ impl Store {
                 "terminal-step-run",
                 format!("step run `{subject}` is already {}", current.status),
             ));
+        }
+        if action == "claim"
+            && current.status == "ready"
+            && let Some(next) =
+                seat_order_conflict_tx(&transaction, &actor, &subject).map_err(internal)?
+        {
+            return Err(St3Error::new(
+                "seat-queue-order",
+                format!(
+                    "`{subject}` is not the next work for `{actor}`; claim `{next}` first. A person can reorder the seat with `st3 agents queue move`"
+                ),
+            )
+            .with_detail("next_work_id", next));
         }
         let lease_valid = current
             .claim_expires_at_unix_ms
@@ -16186,6 +16167,84 @@ struct RosterStepRow {
     claimant: Option<String>,
     available_to: Vec<String>,
     created_at_unix_ms: u128,
+}
+
+impl RosterStepRow {
+    fn seat_step(&self) -> SeatStep<'_> {
+        SeatStep {
+            subject: &self.subject,
+            run: &self.run,
+            step: &self.step,
+            status: &self.status,
+            assignee: self.assignee.as_deref(),
+            claimant: self.claimant.as_deref(),
+            available_to: &self.available_to,
+            created_at_unix_ms: self.created_at_unix_ms,
+        }
+    }
+}
+
+/// Current held and ready agent steps, for every seat or for one seat.
+fn seat_step_rows_tx(connection: &Connection, agent: Option<&str>) -> Result<Vec<RosterStepRow>> {
+    let mut statement = connection.prepare(
+        "SELECT subject, run_id, step_path, status, assignee, lease_owner, available_to,
+                created_at_unix_ms
+         FROM step_runs
+         WHERE agentless=0
+           AND status IN ('ready', 'claimed', 'working', 'verifying')
+           AND (?1 IS NULL OR assignee=?1 OR lease_owner=?1)
+           AND generation_id=(SELECT current_generation_id FROM mission_runs WHERE id=step_runs.run_id)
+         ORDER BY length(created_at_unix_ms), created_at_unix_ms, subject",
+    )?;
+    let rows = statement
+        .query_map([agent], |row| {
+            Ok(RosterStepRow {
+                subject: row.get(0)?,
+                run: format!("mission-run/{}", row.get::<_, String>(1)?),
+                step: row.get(2)?,
+                status: row.get(3)?,
+                assignee: row.get(4)?,
+                claimant: row.get(5)?,
+                available_to: serde_json::from_str(&row.get::<_, String>(6)?).unwrap_or_default(),
+                created_at_unix_ms: row.get::<_, String>(7)?.parse().unwrap_or_default(),
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// The seat's next work when claiming `subject` would take a later run first.
+///
+/// Only the order of runs is enforced. Inside one run the mission's
+/// dependencies decide, and a nested step reached through its parent is not a
+/// separate queue entry, so neither is refused here.
+fn seat_order_conflict_tx(
+    connection: &Connection,
+    agent: &str,
+    subject: &str,
+) -> Result<Option<String>> {
+    let order = seat_run_orders_tx(connection, Some(agent))?
+        .remove(agent)
+        .unwrap_or_default();
+    let rows = seat_step_rows_tx(connection, Some(agent))?;
+    let steps = rows
+        .iter()
+        .map(RosterStepRow::seat_step)
+        .collect::<Vec<_>>();
+    let selection = seat_queue::select(agent, &steps, &order);
+    let Some(next) = selection.next() else {
+        return Ok(None);
+    };
+    if next == subject || !selection.ready.contains(&subject) {
+        return Ok(None);
+    }
+    let run = |candidate: &str| {
+        steps
+            .iter()
+            .find(|step| step.subject == candidate)
+            .map(|step| step.run)
+    };
+    Ok((run(next) != run(subject)).then(|| next.to_owned()))
 }
 
 struct RecordedSeatMove {

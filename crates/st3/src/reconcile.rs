@@ -2690,8 +2690,17 @@ impl<R: RuntimeControl> Reconciler<R> {
             .map(|subject| format!("  stop {:?}", subject.subject))
             .collect::<Vec<_>>();
         if !running.is_empty() {
+            // Stop each owned subject exactly. Execution parsing would scope a
+            // top-level seat that an eval owns under the run, and that stop
+            // would never reach the seat.
             let source = format!("version 2\n\n{}\n", running.join("\n"));
-            let intent = crate::graph::parse_execution_intent(&source, &self.host, &run.id)?;
+            let mut intent = crate::graph::parse_internal_intent(&source, &self.host)?;
+            for stop in intent.subjects.values_mut() {
+                stop.owner_run = live
+                    .iter()
+                    .find(|subject| subject.subject == stop.subject)
+                    .and_then(|subject| subject.owner_run.clone());
+            }
             let response = self
                 .store
                 .apply_internal(&intent, &format!("cleanup-mission-run:{}", run.generation))?;
@@ -5157,7 +5166,14 @@ impl<R: RuntimeControl> Reconciler<R> {
             .desired_subjects()?
             .into_iter()
             .filter(|subject| subject.owner_run.as_deref() == Some(run.subject.as_str()))
-            .filter(|subject| subject.owner_generation.as_deref() != Some(run.generation.as_str()))
+            // Only a subject materialized by another generation is retired. An
+            // eval owns its top-level seats for the whole run, not one generation.
+            .filter(|subject| {
+                subject
+                    .owner_generation
+                    .as_deref()
+                    .is_some_and(|generation| generation != run.generation)
+            })
             .filter(|subject| subject.member.is_some() && subject.kind != "stop")
             .map(|subject| format!("stop {:?}", subject.subject))
             .collect::<Vec<_>>()
@@ -12966,6 +12982,110 @@ version 2
     }
 
     #[test]
+    fn eval_cleanup_stops_the_exact_top_level_seat_it_owns() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        let source = r#"
+version 2
+
+agent "eval/demo/seat" { workspace "/tmp"; command "true"; restart "never" }
+
+mission "eval/demo" state="ready" timeout="1m" {
+  goal "Finish while the eval owns a top-level seat."
+  step "finish" { agentless }
+}
+"#;
+        let key = "eval-owned-seat";
+        let owner = store.mission_run_subject_for_idempotency_key(key);
+        let mut intent = parse_intent(source, "node").unwrap();
+        for desired in intent.subjects.values_mut() {
+            desired.owner_run = Some(owner.clone());
+        }
+        let mission = store
+            .mission(
+                &intent,
+                crate::model::IntentInput {
+                    kdl: source.into(),
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        store
+            .apply(&intent, &mission.subject_tokens, "eval-owned-seat-apply")
+            .unwrap();
+        let run = store
+            .create_mission_run(&MissionRunRequest {
+                mission: "eval/demo".into(),
+                revision: None,
+                workspace: "/tmp".into(),
+                requester: Some("person/test".into()),
+                mode: Some("eval".into()),
+                inputs: BTreeMap::new(),
+                idempotency_key: key.into(),
+            })
+            .unwrap();
+        assert_eq!(run.subject, owner);
+        let runtime = Arc::new(FakeRuntime::default());
+        let reconciler = Reconciler::new(
+            store.clone(),
+            runtime.clone(),
+            "node".into(),
+            Arc::new(Notify::new()),
+        );
+        reconciler.reconcile_once().unwrap();
+        let runtime_id = runtime.started_members.lock().unwrap()[0]
+            .runtime_id
+            .clone();
+        runtime.ptys.lock().unwrap().push(RuntimeObservation {
+            runtime_id: runtime_id.clone(),
+            terminal: true,
+            status: "running".into(),
+            exit_code: None,
+            incarnation_id: Some("seat-one".into()),
+        });
+        for _ in 0..6 {
+            reconciler.reconcile_once().unwrap();
+        }
+
+        let seat = "agent/eval/demo/seat";
+        assert_eq!(
+            store.mission_run(&run.id).unwrap().unwrap().phase,
+            "cleanup-completed"
+        );
+        let desired = store.desired_subjects().unwrap();
+        assert!(
+            desired
+                .iter()
+                .any(|subject| subject.subject == seat && subject.kind == "stop"),
+            "cleanup stops the exact seat the eval owns"
+        );
+        assert!(
+            desired
+                .iter()
+                .all(|subject| subject.subject != format!("agent/{}/eval/demo/seat", run.id)),
+            "cleanup must not invent a run-scoped copy of the seat"
+        );
+        assert!(runtime.stops.lock().unwrap().contains(&runtime_id));
+
+        runtime.ptys.lock().unwrap().clear();
+        for _ in 0..6 {
+            reconciler.reconcile_once().unwrap();
+        }
+        let run = store.mission_run(&run.id).unwrap().unwrap();
+        assert_eq!(run.status, "completed");
+        assert_eq!(run.phase, "terminal");
+        assert_eq!(
+            store
+                .latest_claim(&run.subject, Some("eval.verdict"))
+                .unwrap()
+                .unwrap()
+                .body
+                .pointer("/fields/verdict")
+                .and_then(Value::as_str),
+            Some("pass")
+        );
+    }
+
+    #[test]
     fn a_remote_reconciler_does_not_observe_a_local_stop_for_another_host() {
         let store = Arc::new(Store::open_memory("Silber").unwrap());
         let subject = "agent/fleet/probe";
@@ -15385,6 +15505,55 @@ mission "gated" state="ready" {
         seat.work(&held, "complete", "seat-held-complete").unwrap();
         assert_eq!(seat.next().as_deref(), Some(queued.as_str()));
         assert_eq!(seat.wake().as_deref(), Some(queued.as_str()));
+    }
+
+    #[test]
+    fn seat_queue_refuses_a_claim_from_a_later_run() {
+        let seat = SeatQueueFixture::new();
+        let first = seat.start("queued", "seat-refuse-first");
+        let second = seat.start("queued", "seat-refuse-second");
+        let head = SeatQueueFixture::step(&first, "work");
+        let later = SeatQueueFixture::step(&second, "work");
+        assert_eq!(seat.next().as_deref(), Some(head.as_str()));
+
+        let refused = seat.work(&later, "claim", "seat-refuse-later").unwrap_err();
+        assert_eq!(refused.code, "seat-queue-order");
+        assert!(
+            refused.message.contains(&head),
+            "the refusal names the next work: {}",
+            refused.message
+        );
+        let step = seat.store.step_run(&later).unwrap().unwrap();
+        assert_eq!(step.status, "ready", "a refused claim changes nothing");
+
+        seat.move_run(
+            &second.subject,
+            "top",
+            None,
+            "person/operator",
+            "seat-refuse-move",
+        )
+        .unwrap();
+        seat.work(&later, "claim", "seat-refuse-later-after-move")
+            .unwrap();
+        seat.work(&later, "complete", "seat-refuse-later-complete")
+            .unwrap();
+        seat.work(&head, "claim", "seat-refuse-head").unwrap();
+    }
+
+    #[test]
+    fn seat_queue_lets_a_claim_pass_over_a_waiting_head_run() {
+        let seat = SeatQueueFixture::new();
+        let gated = seat.start("gated", "seat-pass-gated");
+        let queued = seat.start("queued", "seat-pass-queued");
+        let available = SeatQueueFixture::step(&queued, "work");
+        assert_eq!(seat.next().as_deref(), Some(available.as_str()));
+        seat.work(&available, "claim", "seat-pass-claim").unwrap();
+        assert_eq!(
+            seat.queue().runs[0].run,
+            gated.subject,
+            "the waiting head keeps its place"
+        );
     }
 
     #[test]

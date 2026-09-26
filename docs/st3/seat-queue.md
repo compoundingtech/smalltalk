@@ -23,6 +23,9 @@ Now each seat has one ordered queue of mission runs:
   creation order, then subject.
 - A move never releases, reassigns, or interrupts a held step. It only changes which run is next
   once the seat is free.
+- `work claim` refuses a ready step assigned to the seat when an earlier run in the queue has a
+  ready step for the seat. The error, `seat-queue-order`, names that next work. Claims inside one
+  run, nested steps reached through their parent, and `available-to` work are not refused.
 
 The queue matters most for a durable top-level seat that serves many runs. A mission-scoped seat
 normally serves one run, so its queue has one entry.
@@ -38,7 +41,8 @@ the reconciler's `next_work_wake_for_agent`. It is now used by:
 - the reconciler's work wake and its retry deadline;
 - `Store::seat_queue`, which feeds `st3 agents queue`;
 - the client work list when it is filtered to one agent, so `st3 work ls --as AGENT` lists ready
-  work in the same order.
+  work in the same order;
+- `work claim`, which refuses to let the seat take a later run's step first.
 
 The existing nested-step rule is unchanged. A nested step whose listed parent step has the same
 selector is reached through the parent and is not selected separately.
@@ -130,6 +134,9 @@ others.
     completes;
   - a held claim stays claimed after a move, the seat is not woken for other work, and a second
     claim still fails with `agent-capacity`;
+  - a claim from a later run fails with `seat-queue-order` and names the next work, and succeeds
+    after a person moves that run to the top;
+  - a claim passes over a head run that has no ready step;
   - history names who moved what, why, and when; a retried move is one record; and a replica
     rebuilds the same order and history;
   - moves must name queued runs and valid anchors.
@@ -138,12 +145,23 @@ others.
 - `client_v0_cli::agents_queue_cli_shows_seat_order_and_records_person_moves`: human and JSON
   output, `--as`, and the configured person fallback against a temporary daemon socket.
 - `tests::agent_queue_view_lists_the_claim_then_runs_in_order_and_moves`: the exact human view.
+- `evals/st3/seat-queue`: a paid eval with one durable Claude seat and three runs. Held-out judges
+  replay graph history at every claim. They require that a live agent took the first ready step in
+  queue order each time, followed a person's move, passed over a head run waiting on a gate and
+  returned to it once ready, kept each held claim, and got no terminal input. Run reports are in
+  `evals/st3/seat-queue/reports/`.
 
 ## Left out or uncertain
 
-- **Claims are not refused out of order.** The queue decides the next work, the wake, and the
-  agent's own work list order. `work claim` still accepts any ready step the agent may claim.
-  Enforcing order would also block `available-to` work and deliberate manual picks.
+- **Claims are refused out of run order, not out of step order.** The first live eval showed that
+  the wake and the agent's work list are not enough. A Claude seat that finished one step checked
+  its list, then claimed a later run's step before the wake for the head run arrived. `work claim`
+  now refuses that. Inside one run, the mission's dependencies still decide. `available-to` work
+  is not queued, so it is not refused. An agent that wants another run first needs a person to
+  move it.
+- **The boot contract lists fleet work.** Agents are told to run `st3 work ls` without `--as`. That
+  list is in creation order, not seat order, and it includes steps the agent cannot claim. The
+  claim check makes the seat order hold anyway. Changing the boot contract is left to its owner.
 - **Only people can move runs.** Client-v0 mutations require person authority. An agent, such as
   a chief of staff, cannot reorder a seat without a new authorized path.
 - **A reorder does not withdraw a wake that was already sent.** If the old head was woken and not
