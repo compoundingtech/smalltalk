@@ -31,6 +31,7 @@ use crate::store::Store;
 
 const PROTOCOL: &str = "st3-replication-v1";
 const EXCHANGE_PATH: &str = "/v1/peer/exchange";
+const REPLICATION_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(20);
 const CLIENT_READ_PATH: &str = "/v1/peer/client-read";
 const MAX_CLIENT_READ_BYTES: usize = 1_048_576;
 const HEADER_FLEET: &str = "x-st3-fleet";
@@ -766,7 +767,7 @@ fn start_outbound(
 ) {
     for peer in peers {
         // Retain the connection pool across both phases and later wakeups for this peer.
-        let http = replication_http_client();
+        let mut http = replication_http_client();
         let backend = backend.clone();
         let node = node.clone();
         let auth = auth.clone();
@@ -789,6 +790,10 @@ fn start_outbound(
                         tokio::time::sleep_until(not_before).await;
                     }
                     Err(error) => {
+                        // A peer can leave an HTTP stream open without making progress. Once
+                        // that exchange times out, discard the pooled connection so the next
+                        // attempt opens a fresh stream through the Fabric dial.
+                        http = replication_http_client();
                         let status = if error.to_string().contains("signature")
                             || error.to_string().contains("fleet")
                         {
@@ -811,7 +816,7 @@ fn start_outbound(
 fn replication_http_client() -> reqwest::Client {
     reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(3))
-        .timeout(Duration::from_secs(120))
+        .timeout(REPLICATION_EXCHANGE_TIMEOUT)
         .build()
         .expect("the replication HTTP client configuration is valid")
 }
@@ -1019,6 +1024,7 @@ async fn post_signed(
     let request_digest = FleetAuth::body_digest(&body);
     let headers = auth.request_headers(node, &body)?;
     let endpoint = format!("{}{}", peer.url.trim_end_matches('/'), EXCHANGE_PATH);
+    let started = std::time::Instant::now();
     let response = http
         .post(&endpoint)
         .headers(headers)
@@ -1028,13 +1034,24 @@ async fn post_signed(
         .await
         .with_context(|| {
             format!(
-                "replication endpoint `{endpoint}` failed during its 120 second exchange limit; retry peer {}",
-                peer.name
+                "replication request to peer {} failed before headers within {} seconds at `{endpoint}`",
+                peer.name,
+                REPLICATION_EXCHANGE_TIMEOUT.as_secs()
             )
         })?;
     let status = response.status();
     let headers = response.headers().clone();
-    let bytes = response.bytes().await?.to_vec();
+    let bytes = response
+        .bytes()
+        .await
+        .with_context(|| {
+            format!(
+                "replication response body from peer {} failed after {} ms",
+                peer.name,
+                started.elapsed().as_millis()
+            )
+        })?
+        .to_vec();
     auth.verify(
         &headers,
         "RESPONSE",
@@ -1079,6 +1096,24 @@ mod tests {
     use std::net::SocketAddr;
     use std::sync::Mutex;
     use tower::ServiceExt as _;
+
+    #[tokio::test]
+    async fn stalled_replication_http_stream_is_bounded() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let stalled = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let _socket = socket;
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        });
+
+        let request = replication_http_client()
+            .get(format!("http://{address}/stalled"))
+            .send();
+        let result = tokio::time::timeout(Duration::from_secs(25), request).await;
+        stalled.abort();
+        assert!(matches!(result, Ok(Err(error)) if error.is_timeout()));
+    }
 
     #[tokio::test]
     async fn signed_client_read_returns_an_owner_local_native_timeline() {

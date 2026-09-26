@@ -6,7 +6,7 @@ mailboxes and archived every probe message after inspection.
 
 ## Baseline
 
-- Installed binary: `/home/myobie/.local/bin/st3` 0.1.0, SHA-256
+- Installed binary: `$HOME/.local/bin/st3` 0.1.0, SHA-256
   `db597cbf…`.
 - Isolated parties:
   `agent/e2e-conversations-20260923t1217z-live-e2e/hetz` and
@@ -94,7 +94,7 @@ directions correctly.
 
 ## Post-install network proof
 
-- Installed binary: `/home/myobie/.local/bin/st3` 0.1.0, SHA-256
+- Installed binary: `$HOME/.local/bin/st3` 0.1.0, SHA-256
   `e8605015679ca43f37862b9b564ac1d96e0d49e8c771fd0a982df2f0266bcaab`.
 - Restarting the daemon and replication services did not restart the standing
   st3 harness; it retained incarnation

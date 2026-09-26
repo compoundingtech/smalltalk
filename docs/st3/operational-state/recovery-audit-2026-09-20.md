@@ -29,7 +29,7 @@ immutable.
 
 The required implementation worktree was clean at inspection, on
 `agent/st3-clean-operational-state`, with `fb94602` at `HEAD`. The source worktree
-`/home/myobie/src/github.com/compoundingtech/st2--st3` was not changed. The four required commits
+The st3 working tree was not changed. The four required commits
 exist in order and are reused, not rewritten:
 
 ```

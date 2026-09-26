@@ -1,12 +1,13 @@
 # Friend-ready candidate status — 2026-09-25
 
-**Release hold.** Source `f9b234f` for `st3` and `4be1a21` for `stui` is deployed
+**Release hold.** Source `476aab6` for `st3` and `4be1a21` for `stui` is deployed
 as host-native binaries on Hetz and Silber. The direct-network iOS source is
-merged at `e49c097`. The final OMP tool-role repair required new daemon binaries;
-both hosts restarted at 21:42 UTC. An idle-sampler fault invalidated the first
-idle window. The repaired idle window began at 22:36:14 UTC (`1790375774`);
-the delivery window still begins at 21:42:56 UTC (`1790372576`). The full
-24-hour idle and 72-hour bidirectional delivery reports are still due.
+merged at `e49c097`. A late cross-host reply on September 26 invalidated the
+delivery window, and a peer-down sample invalidated the idle window. After the
+peer recovery fix and bidirectional exact receipts, both evidence windows
+restarted at 10:25:36 UTC (`1790418336`) on September 26. The full 24-hour idle
+and 72-hour bidirectional delivery reports are due September 27 and 29 at
+10:25:36 UTC, respectively.
 Do not describe the friend-ready trial as released until both reports pass and
 their retained evidence is reviewed. The continuously running gate watcher
 notifies the standing st3 operator of post-due transitions; it does not turn a
@@ -25,6 +26,41 @@ not an invitation to start the trial while this hold is active.
 
 These checks are provisional. The 24-hour idle and 72-hour delivery reports remain
 the release gates after the final tested rollout.
+
+## September 26 peer stream recovery and evidence restart
+
+- The Hetz idle sampler recorded a peer-down sample at 09:46:45 UTC. A
+  Hetz-to-Silber delivery probe sent at 09:54:34 UTC failed its 180-second
+  deadline even though Silber replied at 09:56:17 UTC; Hetz received the
+  reply around 09:58:50 UTC. Fabric's direct peer probe remained reachable.
+  ST3's HTTP replication exchange could remain open for its former 120-second
+  limit without completing. The exact cause inside the stalled exchange is
+  still unproven. The failure and late receipt remain in the retained logs.
+- `476aab6` bounds one HTTP exchange at 20 seconds and discards the pooled
+  client after an error, so the next backoff attempt opens a fresh Fabric
+  stream. A stalled local HTTP server reproduced the old behavior: the
+  regression failed before the fix and passed at the new timeout. All 419
+  ST3 library tests, formatting, and whitespace checks passed. The change was
+  pushed to the GitHub `st3` branch and Fabric origin before deployment.
+- The Hetz and Silber release binaries have SHA-256
+  `39c9dff70ae501c3fbeff0c87d19b2862503934215c49ff2378abc3b4f12d8fe`
+  and `a7eb85e836e2bfc4d3f7a63d3577b7249c0b0dec7d2630fd6ca87abffecad3d0`,
+  respectively. Each host retained its previous binary under its local
+  `rollout-backups/476aab6-20260926/` directory. The daemon and replication
+  worker restarted on each host. Both strict doctors passed with peers up and
+  zero unresolved replication records.
+- Post-rollout exact linked receipts passed Silber-to-Hetz at 10:24:36 UTC
+  (23 seconds) and Hetz-to-Silber at 10:25:17 UTC (26 seconds), one matching
+  reply each. Both hosts logged healthy peer samples under their new daemon
+  PIDs. Both complete evidence clocks restarted at Unix `1790418336`
+  (10:25:36 UTC), after those checks. The 24-hour idle and 72-hour delivery
+  gates still need their full retained windows; this short check is not a
+  release verdict.
+- Exact receipts after the new marker passed Silber-to-Hetz at 10:27:16 UTC
+  (12 seconds) and Hetz-to-Silber at 10:27:47 UTC (31 seconds). At 10:28:40
+  UTC the idle preflight passed with three post-marker samples per host, zero
+  errors, one PID each, and maximum gaps of 60 and 61 seconds. The gate watcher
+  reports `idle=waiting`, `preflight=healthy`, and `delivery=waiting`.
 
 ## 22:36 UTC idle evidence repair and reset
 
