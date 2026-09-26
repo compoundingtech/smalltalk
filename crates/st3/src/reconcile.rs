@@ -7367,6 +7367,13 @@ fn work_wake_acknowledged(
                 harness.state == "working" && harness.observed_at_unix_ms >= *requested
             })
         })
+        // Pi-family drivers steer a wake into the turn that is already running, for example the
+        // boot turn, and record delivery when the provider accepts it. That turn has consumed the
+        // wake even though no new `working` edge follows. Another attempt would only interrupt it.
+        || harness.is_some_and(|harness| harness.state == "working")
+            && attempts
+                .iter()
+                .any(|(_, message)| message.status == "delivered")
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -14790,6 +14797,37 @@ mission "ios-proof-blocked" state="ready" {
         assert!(work_wake_acknowledged(&[(1_000, &wake)], None));
         wake.status = "closed".into();
         assert!(work_wake_acknowledged(&[(1_000, &wake)], None));
+    }
+
+    #[test]
+    fn a_wake_delivered_into_an_already_working_turn_is_acknowledged() {
+        let mut wake = crate::model::MessageView {
+            subject: "message/work-wake".into(),
+            from: "daemon/runtime".into(),
+            to: "agent/worker".into(),
+            content: "Claim work".into(),
+            status: "delivered".into(),
+            title: None,
+            in_reply_to: None,
+            tags: vec![],
+            created_index: 1,
+        };
+        let mut harness: CurrentHarnessView = serde_json::from_value(serde_json::json!({
+            "state": "working",
+            "incarnation_id": "1:boot",
+            "claim": "claim/boot-turn",
+            "observed_at_unix_ms": 900,
+        }))
+        .unwrap();
+        // The boot turn was already working before the wake was requested at 1,000.
+        assert!(work_wake_acknowledged(&[(1_000, &wake)], Some(&harness)));
+        // A delivered wake to a harness that has since gone idle was not consumed by a turn.
+        harness.state = "idle".into();
+        assert!(!work_wake_acknowledged(&[(1_000, &wake)], Some(&harness)));
+        // An undelivered wake to a busy harness still needs its retry.
+        harness.state = "working".into();
+        wake.status = "sent".into();
+        assert!(!work_wake_acknowledged(&[(1_000, &wake)], Some(&harness)));
     }
 
     #[test]

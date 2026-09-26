@@ -7057,6 +7057,17 @@ async fn publish_harness_state(
     Ok(())
 }
 
+/// Session-start context for pi-family seats. It restates the st3 boot contract only: st3 has no
+/// availability or busy status, so st2 status vocabulary sends the model searching for commands
+/// that do not exist before it claims ready work. It also names the seat, because omp's Python
+/// tool runs with a filtered environment that drops `ST_AGENT` and `ST3_BIN`; a model that probes
+/// there first must not infer its identity from the fleet listing.
+fn pi_family_session_ritual(subject: &str) -> String {
+    format!(
+        "Follow .st3/boot.md now. You are `{subject}`; your shell tool also has it as `$ST_AGENT` and the st3 executable as `$ST3_BIN`. Read and archive handled graph messages, then list, claim, do, and finish your ready st3 work."
+    )
+}
+
 async fn run_pi_channel(client: &Client, subject: &str, driver: &str) -> Result<()> {
     use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
 
@@ -7066,9 +7077,9 @@ async fn run_pi_channel(client: &Client, subject: &str, driver: &str) -> Result<
     let context = latest_document_text(client, &context_name)
         .await?
         .unwrap_or_default();
-    let ritual = "Run the st3 boot ritual now. Set your status to available. Drain and archive your graph message inbox. Set busy before work.";
+    let ritual = pi_family_session_ritual(subject);
     let session_context = if context.trim().is_empty() {
-        ritual.into()
+        ritual
     } else {
         format!(
             "<context source=\"st3/context/now.md\" agent=\"{identity}\">\n{}\n</context>\n\n{ritual}",
@@ -8151,6 +8162,20 @@ fn unique_pairs(values: Vec<(String, String)>, kind: &str) -> Result<BTreeMap<St
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn pi_family_session_ritual_uses_only_the_st3_boot_contract() {
+        let ritual = pi_family_session_ritual("agent/fleet/example/omp");
+        assert!(ritual.contains("You are `agent/fleet/example/omp`"));
+        let ritual = ritual.to_ascii_lowercase();
+        assert!(ritual.contains(".st3/boot.md"));
+        for st2_vocabulary in ["status", "available", "busy", "st2"] {
+            assert!(
+                !ritual.contains(st2_vocabulary),
+                "the pi-family session ritual mentions `{st2_vocabulary}`"
+            );
+        }
+    }
 
     #[test]
     fn agent_card_shows_current_and_next_work_ids() {
