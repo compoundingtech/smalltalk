@@ -208,6 +208,11 @@ fn rust_operation_methods(
                 out,
                 "    pub async fn terminal_screen(&self, terminal_id: &str) -> Result<Envelope<TerminalScreen>, ClientError> {{ self.terminal_screen_internal(terminal_id).await }}"
             )?;
+        } else if id == "agent-queue.get" {
+            writeln!(
+                out,
+                "    pub async fn agent_queue(&self, agent_id: &str) -> Result<Envelope<AgentQueue>, ClientError> {{ self.agent_queue_internal(agent_id).await }}"
+            )?;
         } else if id.ends_with(".get") {
             let collection = path
                 .trim_start_matches("/v1/client/")
@@ -260,7 +265,11 @@ fn swift_operation_methods(
         let method = lower_camel(&pascal(id));
         if matches!(
             id,
-            "capabilities.get" | "timeline.list" | "events.list" | "terminal.screen"
+            "capabilities.get"
+                | "timeline.list"
+                | "events.list"
+                | "terminal.screen"
+                | "agent-queue.get"
         ) {
             continue;
         } else if id.ends_with(".get") {
@@ -423,6 +432,9 @@ fn validate_surfaces(
         }
     }
     for definition in [
+        "AgentQueue",
+        "AgentQueueRun",
+        "AgentQueueMove",
         "TimelineEntry",
         "TimelinePage",
         "PairingBegin",
@@ -461,6 +473,7 @@ fn validate_surfaces(
         "func completePairing(",
         "func terminalScreen(",
         "func terminalFrames(",
+        "func agentQueue(",
     ] {
         if !swift_client.contains(token) {
             bail!("Swift client surface is missing `{token}`");
@@ -481,6 +494,7 @@ fn validate_surfaces(
             "timeline.list" => "timeline".into(),
             "events.list" => "events".into(),
             "terminal.screen" => "terminal_screen".into(),
+            "agent-queue.get" => "agent_queue".into(),
             id => action_method(id),
         };
         let swift_method = lower_camel(&pascal(read["id"].as_str().unwrap()));
@@ -489,6 +503,7 @@ fn validate_surfaces(
             "timeline.list" => "timeline".into(),
             "events.list" => "events".into(),
             "terminal.screen" => "terminalScreen".into(),
+            "agent-queue.get" => "agentQueue".into(),
             _ => swift_method,
         };
         if !rust_client.contains(&format!("pub async fn {rust_method}("))

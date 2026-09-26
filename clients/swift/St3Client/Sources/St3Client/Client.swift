@@ -71,6 +71,7 @@ public actor St3Client {
     public func historyGet(id: String) async throws -> Envelope<Resource> { try await resource("history", id: id) }
     public func sessionsList(cursor: String? = nil, limit: Int? = nil, history: Bool = false) async throws -> Envelope<ResourcePage> { try await list("sessions", cursor: cursor, limit: limit, history: history) }
     public func sessionsGet(id: String) async throws -> Envelope<Resource> { try await resource("sessions", id: id) }
+    public func agentQueueMove(id: String, idempotencyKey: String, fence: Fence, parameters: AgentQueueMoveParameters) async throws -> Envelope<ActionResult> { try await submit(try .agentQueueMove(id: id, idempotencyKey: idempotencyKey, fence: fence, parameters: parameters)) }
     public func attentionResolve(id: String, idempotencyKey: String, fence: Fence, parameters: AttentionResolveParameters) async throws -> Envelope<ActionResult> { try await submit(try .attentionResolve(id: id, idempotencyKey: idempotencyKey, fence: fence, parameters: parameters)) }
     public func launchApprove(id: String, idempotencyKey: String, fence: Fence, parameters: LaunchVariantParameters) async throws -> Envelope<ActionResult> { try await submit(try .launchApprove(id: id, idempotencyKey: idempotencyKey, fence: fence, parameters: parameters)) }
     public func launchCancel(id: String, idempotencyKey: String, fence: Fence, parameters: TargetParameters) async throws -> Envelope<ActionResult> { try await submit(try .launchCancel(id: id, idempotencyKey: idempotencyKey, fence: fence, parameters: parameters)) }
@@ -108,6 +109,7 @@ public actor St3Client {
     public func beginPairing(deviceName: String, personID: String) async throws -> Envelope<PairingChallenge> { try await post("v1/client/pairings", PairingBegin(apiVersion: st3ClientAPIVersion, deviceName: deviceName, personID: personID)) }
     public func completePairing(pairingID: String, code: String, devicePublicKey: String) async throws -> Envelope<PairedSession> { try await post("v1/client/pairings/\(pairingID.replacingOccurrences(of: "pairing/", with: ""))/complete", PairingComplete(apiVersion: st3ClientAPIVersion, code: code, devicePublicKey: devicePublicKey)) }
     public func terminalScreen(_ id: String) async throws -> Envelope<TerminalScreen> { try await get("v1/client/terminals/\(id.replacingOccurrences(of: "terminal/", with: ""))/screen") }
+    public func agentQueue(_ id: String) async throws -> Envelope<AgentQueue> { try await get("v1/client/agent-queues/\(id)") }
     public func terminalFrames(_ id: String, after: UInt64? = nil, incarnation: String? = nil, streamCapability: String) async throws -> TerminalStreamBatch {
         var components = URLComponents(url: baseURL.appending(path: "v1/client/terminals/\(id.replacingOccurrences(of: "terminal/", with: ""))/stream"), resolvingAgainstBaseURL: false)!
         components.scheme = components.scheme == "https" ? "wss" : "ws"

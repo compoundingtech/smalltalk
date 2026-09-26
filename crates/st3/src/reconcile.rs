@@ -15244,7 +15244,11 @@ mission "gated" state="ready" {
         let head = SeatQueueFixture::step(&first, "work");
         assert_eq!(seat.next().as_deref(), Some(head.as_str()));
         assert_eq!(seat.wake().as_deref(), Some(head.as_str()));
-        assert_eq!(seat.woken(), [head.clone()], "only the head run is woken");
+        assert_eq!(
+            seat.woken(),
+            std::slice::from_ref(&head),
+            "only the head run is woken"
+        );
 
         seat.work(&head, "claim", "seat-order-claim-first").unwrap();
         seat.work(&head, "complete", "seat-order-complete-first")
@@ -15321,7 +15325,10 @@ mission "gated" state="ready" {
             "the gated run keeps its place"
         );
         assert_eq!(queue.runs[0].state, "waiting");
-        assert_eq!(queue.runs[0].waiting_work_ids, [waiting.clone()]);
+        assert_eq!(
+            queue.runs[0].waiting_work_ids,
+            std::slice::from_ref(&waiting)
+        );
         assert_eq!(queue.runs[1].state, "ready");
 
         let prepare = SeatQueueFixture::step(&gated, "prepare");
@@ -15362,7 +15369,7 @@ mission "gated" state="ready" {
         assert_eq!(step.status, "claimed");
         assert_eq!(step.claimant.as_deref(), Some(SEAT));
         let queue = seat.queue();
-        assert_eq!(queue.current_work_ids, [held.clone()]);
+        assert_eq!(queue.current_work_ids, std::slice::from_ref(&held));
         assert_eq!(queue.runs[0].run, second.subject);
         assert_eq!(queue.runs[1].state, "claimed");
         assert_eq!(seat.next().as_deref(), Some(queued.as_str()));

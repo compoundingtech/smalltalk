@@ -274,6 +274,7 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
         .route("/v1/client/work/{*id}", get(client_work_detail))
         .route("/v1/client/agents", get(client_agents))
         .route("/v1/client/agents/{*id}", get(client_agents_detail))
+        .route("/v1/client/agent-queues/{*id}", get(client_v0::agent_queue))
         .route("/v1/client/history", get(client_history))
         .route("/v1/client/history/{*id}", get(client_history_detail))
         .route("/v1/client/sessions", get(client_sessions))
@@ -693,6 +694,11 @@ fn client_error_code(code: Option<&str>) -> String {
         | "remote-unavailable"
         | "internal" => code.unwrap_or("internal").to_owned(),
         "launch-review-not-authorized" | "wrong-message-recipient" => "forbidden".into(),
+        "run-not-queued"
+        | "missing-queue-anchor"
+        | "unexpected-queue-anchor"
+        | "invalid-queue-anchor"
+        | "invalid-queue-placement" => "validation-failed".into(),
         _ => "internal".into(),
     }
 }
@@ -972,6 +978,34 @@ fn client_work_resources(
                 .then_with(|| left.subject.cmp(&right.subject))
         });
     } else {
+        // An agent's own list shows its ready work in the same seat-queue order
+        // that chooses its next work and wake.
+        let seat_ready = match actor {
+            Some(actor) => {
+                let seat = if actor.contains('/') {
+                    actor.to_owned()
+                } else {
+                    format!("agent/{actor}")
+                };
+                let order = store.seat_run_order(&seat)?;
+                let steps = work
+                    .iter()
+                    .map(crate::seat_queue::SeatStep::from)
+                    .collect::<Vec<_>>();
+                crate::seat_queue::select(&seat, &steps, &order)
+                    .ready
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            }
+            None => Vec::new(),
+        };
+        let seat_rank = |subject: &str| {
+            seat_ready
+                .iter()
+                .position(|ready| ready == subject)
+                .unwrap_or(usize::MAX)
+        };
         work.sort_by(|left, right| {
             let priority = |status: &str| match status {
                 "ready" => 0,
@@ -983,6 +1017,7 @@ fn client_work_resources(
             };
             priority(&left.status)
                 .cmp(&priority(&right.status))
+                .then_with(|| seat_rank(&left.subject).cmp(&seat_rank(&right.subject)))
                 .then_with(|| left.readiness_epoch.cmp(&right.readiness_epoch))
                 .then_with(|| left.step.cmp(&right.step))
                 .then_with(|| left.subject.cmp(&right.subject))

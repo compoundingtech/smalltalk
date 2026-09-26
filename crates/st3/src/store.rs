@@ -16230,9 +16230,11 @@ fn seat_run_orders_tx(
         .collect())
 }
 
-/// Read seat-queue inputs for one seat or the whole roster. Terminal runs are
-/// read only when a move names them, because a run that never anchors or
-/// receives a move cannot change the relative order of the others.
+/// Read seat-queue inputs for one seat or the whole roster. A live run is queued
+/// while its current generation has a step for the seat, and it keeps the join
+/// time of its first such step in any generation. Runs that are no longer
+/// queued are read only when a move names them, because a run that never
+/// anchors or receives a move cannot change the relative order of the others.
 fn seat_queue_inputs_tx(
     connection: &Connection,
     agent: Option<&str>,
@@ -16305,7 +16307,8 @@ fn seat_queue_inputs_tx(
            AND step_runs.agentless=0
            AND step_runs.assignee IS NOT NULL
            AND (?1 IS NULL OR step_runs.assignee=?1)
-         GROUP BY step_runs.assignee, step_runs.run_id",
+         GROUP BY step_runs.assignee, step_runs.run_id
+         HAVING MAX(step_runs.generation_id=mission_runs.current_generation_id)=1",
     )?;
     let rows = statement.query_map(params![agent], |row| {
         Ok((
