@@ -7552,9 +7552,9 @@ fn should_notify_work_message(
     step: &crate::model::StepRunView,
     work: &[crate::model::StepRunView],
 ) -> bool {
-    !work.iter().any(|candidate| {
-        inherits_work_message(candidate, step) && candidate.status != "verifying"
-    })
+    !work
+        .iter()
+        .any(|candidate| inherits_work_message(candidate, step) && candidate.status != "verifying")
 }
 
 /// A nested step with the same assignee inherits its ancestor's work message.
