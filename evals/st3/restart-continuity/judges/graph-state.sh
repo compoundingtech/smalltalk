@@ -3,7 +3,7 @@ set -euo pipefail
 
 : "${ST_MISSION_RUN:?ST_MISSION_RUN must identify the judged mission run}"
 run="mission-run/$ST_MISSION_RUN"
-mission="$(env -u ST_AGENT st3 --json mission show "$run")"
+mission="$(env -u ST_AGENT st3 missions show "$run" --json)"
 
 completed_steps=(
   process-before-restart
@@ -40,7 +40,7 @@ while read -r name kind state_name; do
     '.status.subjects[0].actual | (.fields // .)
       | (.kind == $kind) and (.state == $state)' \
     <<<"$status" >/dev/null
-  bindings="$(st3 trace "$subject" --json --limit 20 \
+  bindings="$(st3 trace show "$subject" --json --limit 20 \
     | jq -s '[.[] | select(.kind == "resource.observed")] | length')"
   test "$bindings" -eq 1
 done <<'PRODUCTS'
