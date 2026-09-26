@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+for marker in PACKAGED-FD-GREEN-61e8 INITIAL-SNAPSHOT-GREEN-61e8 RECONNECT-SNAPSHOT-GREEN-61e8 FRAMED-TERMINAL-STREAM-GREEN-61e8 MACHINE-STREAM-CLEANUP-GREEN-61e8; do
+  grep -Fqx "$marker" proof.txt
+done

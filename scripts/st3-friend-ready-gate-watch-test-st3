@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+expected_run="mission-run/friend-ready-final-audit-${ST3_FRIEND_READY_IDLE_START_UNIX:-missing}-${ST3_FRIEND_READY_MESSAGE_START_UNIX:-missing}"
+state="${ST3_GATE_TEST_RUN_STATE_PREFIX:-/nonexistent}-${ST3_FRIEND_READY_IDLE_START_UNIX:-missing}-${ST3_FRIEND_READY_MESSAGE_START_UNIX:-missing}"
+case "${1:-} ${2:-}" in
+  'conversations send')
+    [[ ${ST3_GATE_TEST_SEND_FAIL:-0} != 1 ]] || exit 1
+    /usr/bin/printf '{"subject":"message/test-notice"}\n'
+    ;;
+  'missions show')
+    [[ ${3:-} == "$expected_run" ]] || exit 2
+    [[ -f $state ]] || exit 1
+    /usr/bin/printf '{"subject":"%s"}\n' "$expected_run"
+    ;;
+  'missions start')
+    [[ ${3:-} == mission/fleet/st3/friend-ready-final-audit-20260925 ]] || exit 2
+    [[ -n ${ST3_GATE_TEST_RUN_STATE_PREFIX:-} ]] || exit 2
+    found_id=false
+    while (( $# > 0 )); do
+      if [[ $1 == --id && ${2:-} == "friend-ready-final-audit-$ST3_FRIEND_READY_IDLE_START_UNIX-$ST3_FRIEND_READY_MESSAGE_START_UNIX" ]]; then
+        found_id=true
+      fi
+      shift
+    done
+    [[ $found_id == true ]] || exit 2
+    [[ ${ST3_GATE_TEST_START_FAIL:-0} != 1 ]] || exit 1
+    /usr/bin/touch "$state"
+    [[ ${ST3_GATE_TEST_START_LOST_RESPONSE:-0} != 1 ]] || exit 1
+    /usr/bin/printf '{"subject":"%s"}\n' "$expected_run"
+    ;;
+  *) exit 2 ;;
+esac

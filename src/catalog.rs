@@ -755,7 +755,7 @@ pub fn passive_profiles(
     #[cfg(not(feature = "wasm-resolver"))]
     {
         let _ = config;
-        return Ok(registry.clone());
+        Ok(registry.clone())
     }
     #[cfg(feature = "wasm-resolver")]
     let refresh = registry.begin_refresh();
@@ -805,7 +805,7 @@ fn validate_runtime_contracts(
             );
         }
         let _ = registry;
-        return Ok(());
+        Ok(())
     }
     #[cfg(feature = "wasm-resolver")]
     {

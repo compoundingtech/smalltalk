@@ -351,6 +351,7 @@ fn parsed_stream_launch(node: &KdlNode) -> Result<Option<StreamLaunch>, AuthorEr
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn verify_stream_candidate(
     catalog: &Path,
     path: &Path,

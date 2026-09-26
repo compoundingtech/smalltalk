@@ -361,6 +361,7 @@ fn concurrent_cli_writers_serialize_without_losing_either_field() {
         .read(true)
         .write(true)
         .create(true)
+        .truncate(false)
         .mode(0o600)
         .open(&lock_path)
         .unwrap();
@@ -426,6 +427,7 @@ fn presentation_and_publication_contend_on_the_same_persistent_catalog_lock() {
         .read(true)
         .write(true)
         .create(true)
+        .truncate(false)
         .mode(0o600)
         .open(&lock_path)
         .unwrap();

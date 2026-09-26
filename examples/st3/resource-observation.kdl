@@ -1,0 +1,23 @@
+version 2
+
+resource "example/config" { kind "filesystem.file" }
+
+mission "example/config-check" state="ready" {
+  completion { when "all-steps-exhausted" }
+  goal "Observe one local file and verify its current state."
+
+  observer "config" {
+    resource "resource/example/config"
+    provider "local.file"
+    locator "./config.toml"
+    field "status"
+    field "content_hash"
+  }
+
+  step "check" {
+    agentless
+    gate "the config file is available" {
+      field "status" "resource/example/config" is "ready"
+    }
+  }
+}

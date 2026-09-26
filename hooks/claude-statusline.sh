@@ -29,7 +29,7 @@
 
 set -u
 
-identity="${ST_AGENT:-}"
+identity="${ST2_CLAUDE_IDENTITY:-${ST_AGENT:-}}"
 # CATALOG-first, matching claude-observe.sh: `--catalog` resolves the agent DECLARATION, and with
 # a custom bus root (ST_ROOT != CATALOG) resolution under ST_ROOT would find nothing.
 root="${CATALOG:-${ST_ROOT:-}}"

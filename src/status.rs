@@ -353,7 +353,10 @@ mod tests {
             .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
             .filter(|name| name.starts_with(".status.tmp-"))
             .collect::<Vec<_>>();
-        assert!(residue.is_empty(), "staging residue left behind: {residue:?}");
+        assert!(
+            residue.is_empty(),
+            "staging residue left behind: {residue:?}"
+        );
     }
 
     #[test]

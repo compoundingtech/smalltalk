@@ -1,0 +1,15 @@
+{
+  "id": "superseded-mission-and-readiness-attention",
+  "claims": [
+    {
+      "subject": "attention/revision/old-generation", "kind": "attention.requested", "actor": "daemon/runtime",
+      "fields": { "reviewer": "person/operator", "title": "Approve old revision", "reason": "source generation was superseded", "severity": "warning", "targets": ["run-generation/old"] }
+    },
+    {
+      "subject": "attention/readiness/old-incarnation", "kind": "attention.requested", "actor": "daemon/runtime",
+      "fields": { "reviewer": "person/operator", "title": "Old runtime is not ready", "reason": "runtime incarnation old-incarnation was superseded", "severity": "warning", "targets": ["agent/demo"] }
+    }
+  ],
+  "selected": { "generation": "run-generation/new", "runtime_incarnation": "new-incarnation" },
+  "expected": { "history_count": 2, "actionable_count": 0 }
+}

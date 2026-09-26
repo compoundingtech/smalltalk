@@ -40,6 +40,12 @@ use crate::{harness_state, hooks, message, status};
 /// harmless either way.
 const OFFLINE_DEFAULTS: [(&str, &str); 2] = [("PI_OFFLINE", "1"), ("PI_SKIP_VERSION_CHECK", "1")];
 
+/// A managed omp seat already has an explicit model, credentials, prompt, and policy. Its
+/// interactive first-run wizard would sit in front of that prompt while the channel appeared
+/// alive, so an unattended launch skips the wizard unless the operator explicitly chose another
+/// value.
+const OMP_UNATTENDED_DEFAULTS: [(&str, &str); 1] = [("OMP_SKIP_SETUP", "1")];
+
 /// The harness-specific facts the shared wrapper body needs: the label that goes on records and
 /// errors, the extension asset to inject, the env names the shipped extension reads, and the
 /// launch gate — if any — this harness enforces.
@@ -135,13 +141,31 @@ pub(crate) fn run_for_with_environment(
         )?;
         env.extend_from_slice(additional_env);
         env.extend(offline_defaults(|key| std::env::var_os(key).is_some()));
+        if label == "omp" {
+            env.extend(omp_unattended_defaults(|key| {
+                std::env::var_os(key).is_some()
+            }));
+        }
         let set = hooks::verify_required_set().with_context(|| {
             format!(
                 "{label} driver '{runtime_id}' needs this binary's verified hook set for {}; run `st2 hooks install`",
                 kind.extension
             )
         })?;
-        Ok((env, with_channel_extension(provider_argv, &set, kind.extension)?))
+        // Pi otherwise derives one project directory beneath the global credential profile. Two
+        // supervised seats that start together can then race creation of that directory and one
+        // provider accepts a turn without ever creating its transcript. A seat-owned directory is
+        // deterministic, exists before launch, and is also the right inventory boundary for
+        // listing/importing unmanaged sessions later.
+        let session_dir = agent_dir.join("provider-sessions");
+        std::fs::create_dir_all(&session_dir).with_context(|| {
+            format!(
+                "creating {label} driver session directory {}",
+                session_dir.display()
+            )
+        })?;
+        let provider_argv = with_channel_extension(provider_argv, &set, kind.extension)?;
+        Ok((env, with_managed_session_dir(provider_argv, &session_dir)?))
     })();
     let (env, provider_argv) = match prepared {
         Ok(prepared) => prepared,
@@ -264,9 +288,27 @@ fn with_channel_extension(
     Ok(argv)
 }
 
+/// Pin provider transcripts to the exact managed seat instead of the shared credential profile.
+fn with_managed_session_dir(mut argv: Vec<String>, session_dir: &Path) -> Result<Vec<String>> {
+    let session_dir = session_dir
+        .to_str()
+        .context("managed pi-family session directory is not UTF-8")?
+        .to_owned();
+    argv.splice(1..1, ["--session-dir".to_string(), session_dir]);
+    Ok(argv)
+}
+
 /// The offline defaults this launch should add, skipping any the operator already declared.
 fn offline_defaults(is_set: impl Fn(&str) -> bool) -> Vec<(String, String)> {
     OFFLINE_DEFAULTS
+        .iter()
+        .filter(|(key, _)| !is_set(key))
+        .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+        .collect()
+}
+
+fn omp_unattended_defaults(is_set: impl Fn(&str) -> bool) -> Vec<(String, String)> {
+    OMP_UNATTENDED_DEFAULTS
         .iter()
         .filter(|(key, _)| !is_set(key))
         .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
@@ -412,6 +454,32 @@ mod tests {
         );
     }
 
+    #[test]
+    fn every_managed_seat_gets_an_explicit_session_directory() {
+        let argv = with_managed_session_dir(
+            vec![
+                "pi".into(),
+                "-e".into(),
+                "/hooks/pi-channel.ts".into(),
+                "Start work.".into(),
+            ],
+            &PathBuf::from("/agents/worker/provider-sessions"),
+        )
+        .unwrap();
+
+        assert_eq!(
+            argv,
+            vec![
+                "pi",
+                "--session-dir",
+                "/agents/worker/provider-sessions",
+                "-e",
+                "/hooks/pi-channel.ts",
+                "Start work.",
+            ]
+        );
+    }
+
     /// A supervised seat is offline by default, but an operator who declared otherwise keeps their
     /// value — otherwise the wrapper would silently overrule the declaration.
     #[test]
@@ -428,6 +496,12 @@ mod tests {
             vec![("PI_SKIP_VERSION_CHECK".to_string(), "1".to_string())]
         );
         assert!(offline_defaults(|_| true).is_empty());
+
+        assert_eq!(
+            omp_unattended_defaults(|_| false),
+            vec![("OMP_SKIP_SETUP".to_string(), "1".to_string())]
+        );
+        assert!(omp_unattended_defaults(|key| key == "OMP_SKIP_SETUP").is_empty());
     }
 
     #[test]

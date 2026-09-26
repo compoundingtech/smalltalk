@@ -186,13 +186,21 @@ mod tests {
             .expect("an uncontended blocking acquisition succeeds");
         // `flock` locks the open file description, not the process, so a second open of the same
         // path contends with the guard above without any second thread.
-        let contended =
-            FileLock::hold(open(&path, Open::Create).unwrap(), Mode::Exclusive, Wait::Now).unwrap();
+        let contended = FileLock::hold(
+            open(&path, Open::Create).unwrap(),
+            Mode::Exclusive,
+            Wait::Now,
+        )
+        .unwrap();
         assert!(contended.is_none(), "a live holder must read as contention");
 
         drop(held);
-        let after =
-            FileLock::hold(open(&path, Open::Create).unwrap(), Mode::Exclusive, Wait::Now).unwrap();
+        let after = FileLock::hold(
+            open(&path, Open::Create).unwrap(),
+            Mode::Exclusive,
+            Wait::Now,
+        )
+        .unwrap();
         assert!(after.is_some(), "dropping the guard must release the lock");
     }
 
@@ -210,9 +218,13 @@ mod tests {
             "a shared lock must not exclude another reader"
         );
         assert!(
-            FileLock::hold(open(&path, Open::Create).unwrap(), Mode::Exclusive, Wait::Now)
-                .unwrap()
-                .is_none(),
+            FileLock::hold(
+                open(&path, Open::Create).unwrap(),
+                Mode::Exclusive,
+                Wait::Now
+            )
+            .unwrap()
+            .is_none(),
             "a shared lock must exclude a writer"
         );
     }

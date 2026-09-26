@@ -1,0 +1,16 @@
+version 1
+
+eval {
+  copy "./fixture"
+  max-timeout "90s"
+  run "probe" { command "bash ./probe.sh" }
+  judges {
+    judge "attach exposes the no-restart policy" { exec "grep -Fqx ATTACH-ONLY-SURFACE-GREEN-7ca1 $RUNS_DIR/probe.out" }
+    judge "attach-only connects to a live session" { exec "grep -Fqx LIVE-ATTACH-ROUNDTRIP-GREEN-7ca1 $RUNS_DIR/probe.out" }
+    judge "legacy attach can restart the control" { exec "grep -Fqx LEGACY-RESTART-CONTROL-GREEN-7ca1 $RUNS_DIR/probe.out" }
+    judge "attach-only refuses a dead session" { exec "grep -Fqx DEAD-ATTACH-REFUSAL-GREEN-7ca1 $RUNS_DIR/probe.out" }
+    judge "attach-only creates no new incarnation" { exec "grep -Fqx NO-NEW-INCARNATION-GREEN-7ca1 $RUNS_DIR/probe.out" }
+    judge "the dead state stays unchanged" { exec "grep -Fqx DEAD-STATE-UNCHANGED-GREEN-7ca1 $RUNS_DIR/probe.out" }
+    judge "the synthetic registry is empty" { exec "grep -Fqx SYNTHETIC-ROOT-CLEAN-GREEN-7ca1 $RUNS_DIR/probe.out" }
+  }
+}

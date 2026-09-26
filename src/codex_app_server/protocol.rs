@@ -320,11 +320,7 @@ pub(super) fn verify_codex_protocol_schemas(schemas: &CodexProtocolSchemas) -> R
         "TurnError.codexErrorInfo does not use CodexErrorInfo"
     );
     let error_words = schema_variant_words(definitions, "CodexErrorInfo")?;
-    for word in [
-        CODEX_PROVIDER_AUTH_REJECTED,
-        "rateLimitExceeded",
-        "usageLimitExceeded",
-    ] {
+    for word in [CODEX_PROVIDER_AUTH_REJECTED, "usageLimitExceeded"] {
         anyhow::ensure!(
             error_words.contains(word),
             "CodexErrorInfo has no '{word}' word"

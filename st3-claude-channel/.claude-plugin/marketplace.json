@@ -1,0 +1,15 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "st3",
+  "description": "Provider integration shipped with st3",
+  "owner": {
+    "name": "Compounding"
+  },
+  "plugins": [
+    {
+      "name": "st3-channel",
+      "description": "Deliver st3 messages and work to a running Claude Code session",
+      "source": "./plugins/st3-channel"
+    }
+  ]
+}

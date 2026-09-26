@@ -9,15 +9,18 @@
 //! inbox head and submits typed input only when that state proves an idle or one exact regular
 //! active turn.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read as _, Write};
+use std::io::{BufRead as _, BufReader, Read as _, Seek as _, SeekFrom, Write};
 use std::net::Shutdown;
 use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::{FileTypeExt as _, OpenOptionsExt as _, PermissionsExt as _};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -28,6 +31,9 @@ use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 use tungstenite::{Message as WebSocketMessage, WebSocket};
 
+// Bound unexpected provider frames independently of the size of a saved thread.
+const CODEX_CONTROL_MAX_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
+
 use crate::{
     delivery_ledger, ding, driver_diagnostic, harness_context, harness_state, message, run, status,
 };
@@ -36,6 +42,7 @@ const REQUIRED_CODEX_CLIENT_REQUESTS: &[&str] = &[
     "hooks/list",
     "initialize",
     "thread/loaded/list",
+    "thread/read",
     "thread/resume",
     "turn/start",
     "turn/steer",
@@ -101,8 +108,29 @@ const HOOK_TRUST_PREFLIGHT_REQUEST_ID: u64 = 1;
 const TUI_LOADED_TIMEOUT: Duration = Duration::from_secs(15);
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 const CONTROL_POLL: Duration = Duration::from_millis(100);
+const TRANSCRIPT_TURN_RECOVERY_INTERVAL: Duration = Duration::from_secs(1);
+const TRANSCRIPT_CONTEXT_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
+const SNAPSHOT_REQUEST_TIMEOUT: Duration = Duration::from_secs(1);
+const SNAPSHOT_REQUEST_ATTEMPTS: u8 = 3;
+const TRANSCRIPT_TURN_RECOVERY_BYTES: u64 = 2 * 1024 * 1024;
+const TRANSCRIPT_DISCOVERY_FILE_LIMIT: usize = 10_000;
 const INBOX_REFRESH_FALLBACK: Duration = Duration::from_secs(15);
 const SOCKET_PATH_BUDGET: usize = 96;
+
+#[derive(Debug)]
+struct AppServerExitedBeforeControl(ExitStatus);
+
+impl fmt::Display for AppServerExitedBeforeControl {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "Codex app-server exited before control connected: {}",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for AppServerExitedBeforeControl {}
 
 struct WrapperDiagnostics {
     file: File,
@@ -257,7 +285,7 @@ pub enum CodexObservedState {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) enum CodexHoldReason {
+pub enum CodexHoldReason {
     ActiveWithoutTurn,
     ConflictingTurn,
     Review,
@@ -272,17 +300,20 @@ pub(crate) enum CodexHoldReason {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) enum CodexTerminalError {
+pub enum CodexTerminalError {
     SystemError,
     ProviderAuthRejected,
+    /// A turn was rejected before useful work because its selected model had no capacity.
+    ProviderCapacity,
 }
 
 /// The `CodexErrorInfo` word that names a rejected provider credential.
 ///
 /// It is the 401/invalid-credential arm of Codex's own closed error vocabulary and is distinct
-/// from both quota words (`usageLimitExceeded`, `rateLimitExceeded`) — the protocol gate pins all
-/// three present so a release that merged them refuses the launch instead of silently making st2
-/// call an exhausted allowance a rejected credential.
+/// from `usageLimitExceeded`. Some supported Codex releases do not expose the later
+/// `rateLimitExceeded` word. The protocol gate pins the credential and stable quota words so a
+/// release that merges them refuses the launch instead of reporting an exhausted allowance as a
+/// rejected credential.
 const CODEX_PROVIDER_AUTH_REJECTED: &str = "unauthorized";
 
 /// What one `turn/completed` notification proves about this thread's provider credential.
@@ -295,6 +326,8 @@ enum CodexTurnOutcome {
     Accepted,
     /// `failed` with `error.codexErrorInfo: unauthorized`.
     ProviderAuthRejected,
+    /// A typed allowance rejection or the captured transient model-capacity rejection.
+    ProviderCapacity,
     /// `interrupted`, `inProgress`, or a failure this version does not classify: no evidence
     /// either way, so a standing rejection must stand.
     Indeterminate,
@@ -314,8 +347,26 @@ fn codex_turn_outcome(turn: Option<&Value>) -> CodexTurnOutcome {
         {
             CodexTurnOutcome::ProviderAuthRejected
         }
+        Some("failed")
+            if turn
+                .pointer("/error/codexErrorInfo")
+                .and_then(Value::as_str)
+                == Some("usageLimitExceeded")
+                || turn
+                    .pointer("/error/message")
+                    .and_then(Value::as_str)
+                    .is_some_and(is_provider_capacity_message) =>
+        {
+            CodexTurnOutcome::ProviderCapacity
+        }
         _ => CodexTurnOutcome::Indeterminate,
     }
+}
+
+fn is_provider_capacity_message(message: &str) -> bool {
+    let normalized = message.to_ascii_lowercase();
+    normalized.contains("selected model is at capacity")
+        || normalized.contains("model is at capacity")
 }
 
 impl CodexObservedState {
@@ -333,13 +384,16 @@ impl CodexObservedState {
         match self {
             CodexObservedState::AwaitingStatus => None,
             CodexObservedState::Idle => Some(observation(Activity::Idle, BlockedOn::None)),
-            // Both terminals project to `ended`, exactly as before; the reason is what names the
-            // cause. `providerAuth` is the same word OpenCode's `ProviderAuthError` already
-            // publishes, so one roster consumer classifies the credential class across harnesses.
+            // Capacity is retryable in the same session, while authentication and system errors
+            // end this harness incarnation.
+            CodexObservedState::TerminalError {
+                reason: CodexTerminalError::ProviderCapacity,
+            } => Some(observation(Activity::Idle, BlockedOn::None).with_reason("providerCapacity")),
             CodexObservedState::TerminalError { reason } => Some(
                 observation(Activity::Ended, BlockedOn::None).with_reason(match reason {
                     CodexTerminalError::SystemError => "systemError",
                     CodexTerminalError::ProviderAuthRejected => "providerAuth",
+                    CodexTerminalError::ProviderCapacity => unreachable!(),
                 }),
             ),
             CodexObservedState::Active { .. } => {
@@ -510,6 +564,13 @@ struct PendingCodexDelivery {
     method: CodexDeliveryMethod,
 }
 
+#[derive(Debug, Clone)]
+struct PendingCodexSnapshot {
+    request_id: u64,
+    filename: String,
+    requested_at: Instant,
+}
+
 // One durable FIFO delivery attempt lives in the shared `crate::delivery_ledger`, which grades
 // Codex's two receipts honestly: the JSON-RPC result of `turn/start`/`turn/steer` is
 // `transportAccepted`, and only the exact completed typed user message — live, or found in a
@@ -550,10 +611,15 @@ struct CodexInboxDelivery {
     _watcher: Option<notify::RecommendedWatcher>,
     next_inbox_refresh: Instant,
     next_presence_refresh: Instant,
+    next_context_transcript_refresh: Instant,
     head: Option<message::Message>,
     suppressed: bool,
     ledger: delivery_ledger::Ledger,
     pending: Option<PendingCodexDelivery>,
+    pending_snapshot: Option<PendingCodexSnapshot>,
+    snapshot_attempts: u8,
+    verified_snapshot: Option<(String, CodexObservedState)>,
+    require_snapshot: bool,
     rejected: Option<RejectedCodexDelivery>,
     next_request_id: u64,
     harness_writer: harness_state::Writer,
@@ -567,10 +633,14 @@ struct CodexInboxDelivery {
     /// The numeric axis's producer, beside the categorical one. `None` only where the record has
     /// nowhere safe to stage — observability never blocks a launch.
     context: Option<CodexContextProducer>,
+    /// Crash-safe normalized conversation operations for the client-v0 timeline.
+    timeline: crate::harness_timeline::Writer,
     /// The native-driver boundary record. Codex publishes exactly one stage on it — the provider
     /// credential — because every earlier boundary is already fail-closed at admission: an
     /// incompatible protocol refuses the launch instead of degrading into an observation.
     diagnostics: driver_diagnostic::Publisher,
+    safe_fallback_active: Arc<AtomicBool>,
+    safe_fallback_diagnostic_published: bool,
 }
 
 impl CodexInboxDelivery {
@@ -578,6 +648,7 @@ impl CodexInboxDelivery {
         config: CodexDeliveryConfig,
         ledger_path: PathBuf,
         runtime: CodexRuntime,
+        safe_fallback_active: Arc<AtomicBool>,
     ) -> Result<Self> {
         fs::create_dir_all(&config.inbox).with_context(|| {
             format!(
@@ -649,14 +720,28 @@ impl CodexInboxDelivery {
                 None
             }
         };
+        let timeline =
+            crate::harness_timeline::Writer::new(&config.agent_dir, "codex", runtime.incarnation());
         // The record belongs to this incarnation: the protocol gate already admitted the version
         // it names, so `support` is a measured fact rather than a probe result.
-        let diagnostics = driver_diagnostic::Publisher::new(
+        let mut diagnostics = driver_diagnostic::Publisher::new(
             &config.agent_dir,
             driver_diagnostic::Driver::Codex,
             config.producer_version.clone(),
             driver_diagnostic::Support::Supported,
         );
+        let safe_fallback_diagnostic_published = safe_fallback_active.load(Ordering::SeqCst);
+        if safe_fallback_diagnostic_published {
+            diagnostics.publish(
+                driver_diagnostic::Stage::Launch,
+                driver_diagnostic::Reason::LaunchConfigurationRejected,
+                driver_diagnostic::Source::ProcessExit,
+            );
+        } else {
+            // A later exact-config boot is the recovery boundary for a predecessor that had to
+            // come up degraded. Do not leave that old advisory attached to the healthy session.
+            diagnostics.clear(driver_diagnostic::Stage::Launch);
+        }
         Ok(Self {
             config,
             runtime,
@@ -664,18 +749,40 @@ impl CodexInboxDelivery {
             _watcher: watcher,
             next_inbox_refresh: Instant::now(),
             next_presence_refresh: Instant::now(),
+            next_context_transcript_refresh: Instant::now(),
             head: None,
             suppressed: false,
             ledger,
             pending: None,
+            pending_snapshot: None,
+            snapshot_attempts: 0,
+            verified_snapshot: None,
+            require_snapshot: true,
             rejected: None,
             next_request_id: FIRST_DELIVERY_REQUEST_ID,
             harness_writer,
             harness_evidence: false,
             pending_observation: None,
             context,
+            timeline,
             diagnostics,
+            safe_fallback_active,
+            safe_fallback_diagnostic_published,
         })
+    }
+
+    fn sync_safe_fallback_diagnostic(&mut self) {
+        if self.safe_fallback_diagnostic_published
+            || !self.safe_fallback_active.load(Ordering::SeqCst)
+        {
+            return;
+        }
+        self.diagnostics.publish(
+            driver_diagnostic::Stage::Launch,
+            driver_diagnostic::Reason::LaunchConfigurationRejected,
+            driver_diagnostic::Source::ProcessExit,
+        );
+        self.safe_fallback_diagnostic_published = true;
     }
 
     /// Publish the generic observed-harness-state projection of a control-state change. Best-effort
@@ -703,11 +810,90 @@ impl CodexInboxDelivery {
     /// response carries another reading, and the record ages visibly through `ageMs` until it
     /// lands (HC-R06, HC-T05).
     fn observe_context(&mut self, message: &Value, thread_id: &str) {
+        if let Err(error) =
+            crate::harness_timeline::observe_codex(&mut self.timeline, message, thread_id)
+        {
+            tracing::warn!("st2 codex: harness-timeline write failed: {error:#}");
+        }
         if let Some(context) = self.context.as_mut()
             && let Err(error) = context.observe(message, thread_id)
         {
             tracing::warn!("st2 codex: harness-context write failed: {error:#}");
         }
+    }
+
+    /// Codex 0.151 persists a manual `ContextCompaction` completion even when the secondary
+    /// app-server subscriber receives no matching item notification. Sample the same bounded
+    /// rollout tail used for turn recovery so that omission does not erase the context edge.
+    fn refresh_transcript_context_if_due(&mut self, thread_id: &str) {
+        if Instant::now() < self.next_context_transcript_refresh {
+            return;
+        }
+        self.next_context_transcript_refresh = Instant::now() + TRANSCRIPT_CONTEXT_REFRESH_INTERVAL;
+        let result = latest_codex_transcript(thread_id).and_then(|path| match path {
+            Some(path) => codex_transcript_tail(&path).map(Some),
+            None => Ok(None),
+        });
+        match result {
+            Ok(Some(frames)) => {
+                if let Some(context) = self.context.as_mut()
+                    && let Err(error) = context.observe_transcript(&frames, thread_id)
+                {
+                    tracing::warn!(
+                        "st2 codex: transcript harness-context recovery failed: {error:#}"
+                    );
+                }
+                if let Err(error) = self.accept_transcript_receipts(&frames, thread_id) {
+                    tracing::warn!(
+                        "st2 codex: transcript delivery receipt recovery failed: {error:#}"
+                    );
+                }
+            }
+            Err(error) => {
+                tracing::warn!("st2 codex: bounded transcript context discovery failed: {error:#}")
+            }
+            _ => {}
+        }
+    }
+
+    /// The secondary app-server subscriber can miss a steered user-message notification even
+    /// though Codex has appended it to the owning session. Its exact client ID in the durable
+    /// rollout is the same consumption evidence as the live notification.
+    fn accept_transcript_receipts(&mut self, frames: &[Value], thread_id: &str) -> Result<()> {
+        for frame in frames {
+            if frame.get("type").and_then(Value::as_str) != Some("event_msg")
+                || frame.pointer("/payload/type").and_then(Value::as_str) != Some("item_completed")
+                || frame.pointer("/payload/thread_id").and_then(Value::as_str) != Some(thread_id)
+                || frame.pointer("/payload/item/type").and_then(Value::as_str)
+                    != Some("UserMessage")
+            {
+                continue;
+            }
+            let Some(client_id) = frame
+                .pointer("/payload/item/client_id")
+                .and_then(Value::as_str)
+            else {
+                continue;
+            };
+            let settled = self
+                .ledger
+                .correlated(client_id)
+                .into_iter()
+                .filter(|filename| {
+                    self.ledger.entry(filename).is_some_and(|entry| {
+                        entry.binding == thread_id
+                            && entry.incarnation.as_deref() == Some(self.runtime.incarnation())
+                            && entry.phase < delivery_ledger::Phase::Consumed
+                    })
+                })
+                .collect::<Vec<_>>();
+            for filename in settled {
+                self.ledger
+                    .record(&filename, delivery_ledger::Evidence::Consumed)?;
+                self.next_inbox_refresh = Instant::now();
+            }
+        }
+        Ok(())
     }
 
     /// Record what one inbound frame proves about this thread's provider credential.
@@ -733,6 +919,7 @@ impl CodexInboxDelivery {
             CodexTurnOutcome::Accepted => self
                 .diagnostics
                 .clear(driver_diagnostic::Stage::ProviderAuth),
+            CodexTurnOutcome::ProviderCapacity => {}
             CodexTurnOutcome::Indeterminate => {}
         }
     }
@@ -792,7 +979,18 @@ impl CodexInboxDelivery {
         }) {
             self.rejected = None;
         }
-        self.head = unread.into_iter().next();
+        // A consumed message remains unread until the recipient's normal archive precedence
+        // settles it. It is history, not a FIFO lock: select the earliest unread message that has
+        // not already reached Codex's consumption ceiling.
+        let prior_head = self.head.as_ref().map(|message| message.filename.clone());
+        self.head = unread
+            .into_iter()
+            .find(|message| !self.ledger.settled(&message.filename));
+        if self.head.as_ref().map(|message| &message.filename) != prior_head.as_ref() {
+            self.pending_snapshot = None;
+            self.snapshot_attempts = 0;
+            self.verified_snapshot = None;
+        }
         self.suppressed =
             status::read_state(&status::status_path(&self.config.agent_dir)) == status::State::Dnd;
         self.next_inbox_refresh = Instant::now() + INBOX_REFRESH_FALLBACK;
@@ -801,7 +999,11 @@ impl CodexInboxDelivery {
 
     fn maybe_request(&mut self, state: &CodexControlState) -> Result<Option<Value>> {
         self.refresh_if_due()?;
-        if self.pending.is_some() || !state.subscribed || self.suppressed {
+        if self.pending.is_some()
+            || self.pending_snapshot.is_some()
+            || !state.subscribed
+            || self.suppressed
+        {
             return Ok(None);
         }
         // Fail closed: an unreadable ledger holds and surfaces rather than guessing. It never
@@ -830,6 +1032,14 @@ impl CodexInboxDelivery {
         let Some(head) = self.head.clone() else {
             return Ok(None);
         };
+        if self.require_snapshot
+            && self
+                .verified_snapshot
+                .as_ref()
+                .is_none_or(|(filename, _)| filename != &head.filename)
+        {
+            return Ok(None);
+        }
         if self.rejected.as_ref().is_some_and(|rejected| {
             rejected.filename == head.filename && rejected.observed == state.observed
         }) {
@@ -838,7 +1048,7 @@ impl CodexInboxDelivery {
         // Exactly one delivery is outstanding at a time on this transport: an entry bound to some
         // other file holds the pump until archive precedence resolves it, so a message arriving
         // out of filename order can never open a second concurrent delivery.
-        if !self.ledger.entries().is_empty() && self.ledger.entry(&head.filename).is_none() {
+        if self.ledger.holds_other_than(&head.filename) {
             return Ok(None);
         }
         // An attempt this pump already owns is held until evidence settles or refuses it. Only an
@@ -847,7 +1057,12 @@ impl CodexInboxDelivery {
         if self.ledger.retry(&head.filename) != delivery_ledger::RetryDecision::Retry {
             return Ok(None);
         }
-        let method = match &state.observed {
+        let observed = self
+            .verified_snapshot
+            .as_ref()
+            .map(|(_, observed)| observed)
+            .unwrap_or(&state.observed);
+        let method = match observed {
             CodexObservedState::Idle | CodexObservedState::TerminalError { .. } => {
                 CodexDeliveryMethod::Start
             }
@@ -888,7 +1103,179 @@ impl CodexInboxDelivery {
             filename,
             method,
         });
+        self.snapshot_attempts = 0;
+        self.verified_snapshot = None;
         Ok(Some(request))
+    }
+
+    #[cfg(test)]
+    fn without_snapshot_requirement(mut self) -> Self {
+        self.require_snapshot = false;
+        self
+    }
+
+    fn maybe_snapshot_request(&mut self, state: &CodexControlState) -> Result<Option<Value>> {
+        self.refresh_if_due()?;
+        if self.pending.is_some() || !state.subscribed || self.suppressed {
+            return Ok(None);
+        }
+        if self
+            .pending_snapshot
+            .as_ref()
+            .is_some_and(|pending| pending.requested_at.elapsed() >= SNAPSHOT_REQUEST_TIMEOUT)
+        {
+            let pending = self
+                .pending_snapshot
+                .take()
+                .context("Codex thread snapshot is not pending")?;
+            self.finish_failed_snapshot(pending, state, "timed out");
+        }
+        if self.pending_snapshot.is_some() {
+            return Ok(None);
+        }
+        let Some(head) = self.head.as_ref() else {
+            return Ok(None);
+        };
+        // A successful turn/steer result is only transport acceptance. The live typed
+        // notification or the bounded rollout tail supplies the consumption receipt; reading
+        // all turns here makes each poll grow with the lifetime of the thread.
+        if self
+            .ledger
+            .entry(&head.filename)
+            .is_some_and(|entry| entry.phase == delivery_ledger::Phase::TransportAccepted)
+        {
+            return Ok(None);
+        }
+        if self
+            .verified_snapshot
+            .as_ref()
+            .is_some_and(|(filename, _)| filename == &head.filename)
+        {
+            return Ok(None);
+        }
+        if self.ledger.holds_other_than(&head.filename)
+            || self.ledger.retry(&head.filename) != delivery_ledger::RetryDecision::Retry
+        {
+            return Ok(None);
+        }
+        // A provider that rejects or silently drops thread/read must not hold an otherwise idle
+        // inbox forever. Each head gets a bounded set of fresh requests; after they are exhausted,
+        // fall back to the latest typed observer state. Delivery remains provider-fenced: stale
+        // active state uses expectedTurnId, while a rejected turn request remains retryable.
+        if self.snapshot_attempts >= SNAPSHOT_REQUEST_ATTEMPTS {
+            self.verified_snapshot = Some((head.filename.clone(), state.observed.clone()));
+            self.snapshot_attempts = 0;
+            return Ok(None);
+        }
+        let request_id = self.next_request_id;
+        self.next_request_id = self
+            .next_request_id
+            .checked_add(1)
+            .context("Codex snapshot request ID overflow")?;
+        self.snapshot_attempts += 1;
+        self.pending_snapshot = Some(PendingCodexSnapshot {
+            request_id,
+            filename: head.filename.clone(),
+            requested_at: Instant::now(),
+        });
+        Ok(Some(json!({
+            "method": "thread/read",
+            "id": request_id,
+            "params": {
+                "threadId": state.thread_id(),
+                "includeTurns": false,
+            }
+        })))
+    }
+
+    fn accept_snapshot_response(
+        &mut self,
+        message: &Value,
+        state: &mut CodexControlState,
+    ) -> Result<bool> {
+        let Some(pending) = self.pending_snapshot.as_ref() else {
+            return Ok(false);
+        };
+        if message.get("method").is_some()
+            || message.get("id") != Some(&Value::from(pending.request_id))
+        {
+            return Ok(false);
+        }
+        let pending = self
+            .pending_snapshot
+            .take()
+            .context("Codex thread snapshot is not pending")?;
+        if message.get("error").is_some() {
+            self.finish_failed_snapshot(pending, state, "was rejected");
+            return Ok(true);
+        }
+        let observed =
+            match observed_from_thread_snapshot(message, state.thread_id(), &state.observed) {
+                Ok(observed) => observed,
+                Err(error) => {
+                    tracing::warn!("st2 codex: invalid thread/read response; retrying: {error:#}");
+                    self.finish_failed_snapshot(pending, state, "was invalid");
+                    return Ok(true);
+                }
+            };
+        state.observed = observed.clone();
+        self.verified_snapshot = Some((pending.filename, observed));
+        self.snapshot_attempts = 0;
+        Ok(true)
+    }
+
+    fn finish_failed_snapshot(
+        &mut self,
+        pending: PendingCodexSnapshot,
+        state: &CodexControlState,
+        reason: &str,
+    ) {
+        tracing::warn!(
+            "st2 codex: thread/read request {} {reason} (attempt {}/{}); delivery remains fenced until retry or bounded fallback",
+            pending.request_id,
+            self.snapshot_attempts,
+            SNAPSHOT_REQUEST_ATTEMPTS,
+        );
+        if self.snapshot_attempts < SNAPSHOT_REQUEST_ATTEMPTS {
+            return;
+        }
+        if self
+            .head
+            .as_ref()
+            .is_some_and(|head| head.filename == pending.filename)
+        {
+            self.verified_snapshot = Some((pending.filename, state.observed.clone()));
+        }
+        self.snapshot_attempts = 0;
+    }
+
+    fn transcript_recovery_due(&self) -> bool {
+        self.head.is_some()
+            && (self
+                .verified_snapshot
+                .as_ref()
+                .is_some_and(|(_, observed)| {
+                    matches!(
+                        observed,
+                        CodexObservedState::Held {
+                            reason: CodexHoldReason::ActiveWithoutTurn,
+                            ..
+                        }
+                    )
+                })
+                || (self.verified_snapshot.is_none()
+                    && self.pending_snapshot.as_ref().is_some_and(|pending| {
+                        pending.requested_at.elapsed() >= TRANSCRIPT_TURN_RECOVERY_INTERVAL
+                    })))
+    }
+
+    fn accept_transcript_recovery(&mut self, observed: CodexObservedState) {
+        let Some(head) = self.head.as_ref() else {
+            return;
+        };
+        self.pending_snapshot = None;
+        self.snapshot_attempts = 0;
+        self.verified_snapshot = Some((head.filename.clone(), observed));
     }
 
     fn accept_response(&mut self, message: &Value, observed: &CodexObservedState) -> Result<bool> {
@@ -918,9 +1305,9 @@ impl CodexInboxDelivery {
             });
             return Ok(true);
         }
-        match &pending.method {
+        let accepted_turn_id = match &pending.method {
             CodexDeliveryMethod::Start => {
-                required_string(message, "/result/turn/id", "turn/start response")?;
+                required_string(message, "/result/turn/id", "turn/start response")?
             }
             CodexDeliveryMethod::Steer { turn_id } => {
                 let returned = required_string(message, "/result/turnId", "turn/steer response")?;
@@ -928,14 +1315,15 @@ impl CodexInboxDelivery {
                     returned == turn_id,
                     "Codex turn/steer response returned a different turn"
                 );
+                returned
             }
-        }
-        // The request returned a well-formed result. That is a fact about the call, never about
-        // the model, so it grades no higher than `transportAccepted`.
-        self.ledger.record(
-            &pending.filename,
-            delivery_ledger::Evidence::TransportAccepted,
-        )?;
+        };
+        // The result proves transport acceptance and names the exact turn that accepted the
+        // delivery. Persist both facts atomically so a matching successful turn completion can
+        // settle clients (including Codex 0.146) that omit the correlated user-message receipt.
+        self.ledger
+            .accept_codex_turn(&pending.filename, accepted_turn_id)?;
+        // The live typed notification and bounded rollout tail settle consumption.
         self.rejected = None;
         Ok(true)
     }
@@ -980,20 +1368,66 @@ impl CodexInboxDelivery {
         Ok(true)
     }
 
+    /// Accept the exact successful terminal turn as a fallback receipt.
+    ///
+    /// Some supported Codex app-server releases persist and process a `clientUserMessageId` but do
+    /// not broadcast the corresponding `item/completed{userMessage}` on the control subscription.
+    /// A successful `turn/completed` for the turn returned by `turn/start` or `turn/steer` is the
+    /// next monotone observation: the accepted input's turn ran to its ordinary end. Binding,
+    /// incarnation, and exact turn identity prevent another thread or attempt from settling it.
+    fn accept_turn_completion_receipt(
+        &mut self,
+        message: &Value,
+        state: &CodexControlState,
+    ) -> Result<bool> {
+        if message.get("method").and_then(Value::as_str) != Some("turn/completed")
+            || message.pointer("/params/threadId").and_then(Value::as_str)
+                != Some(state.thread_id())
+            || state.runtime_incarnation != self.runtime.incarnation()
+            || codex_turn_outcome(message.pointer("/params/turn")) != CodexTurnOutcome::Accepted
+        {
+            return Ok(false);
+        }
+        let turn_id = required_string(message, "/params/turn/id", "turn/completed")?;
+        let settled = self
+            .ledger
+            .entries()
+            .iter()
+            .filter(|entry| {
+                entry.binding == state.thread_id()
+                    && entry.incarnation.as_deref() == Some(self.runtime.incarnation())
+                    && entry.accepted_turn_id.as_deref() == Some(turn_id)
+                    && entry.phase < delivery_ledger::Phase::Consumed
+            })
+            .map(|entry| entry.filename.clone())
+            .collect::<Vec<_>>();
+        for filename in &settled {
+            self.ledger
+                .record(filename, delivery_ledger::Evidence::Consumed)?;
+        }
+        Ok(!settled.is_empty())
+    }
+
     /// Reconcile a pre-crash attempt against the typed history returned by `thread/resume` before
     /// the same client ID can be sent again.
     fn reconcile_resume(&mut self, message: &Value, state: &CodexControlState) -> Result<()> {
         if message.get("error").is_some() {
             return Ok(());
         }
-        let unsettled: Vec<(String, String)> = self
+        let unsettled: Vec<(String, String, Option<String>)> = self
             .ledger
             .entries()
             .iter()
             .filter(|entry| {
                 entry.binding == state.thread_id() && entry.phase < delivery_ledger::Phase::Consumed
             })
-            .map(|entry| (entry.filename.clone(), entry.correlation.value.clone()))
+            .map(|entry| {
+                (
+                    entry.filename.clone(),
+                    entry.correlation.value.clone(),
+                    entry.accepted_turn_id.clone(),
+                )
+            })
             .collect();
         if unsettled.is_empty() {
             return Ok(());
@@ -1004,17 +1438,23 @@ impl CodexInboxDelivery {
             .context(
                 "Codex thread/resume response has no typed turn history for delivery recovery",
             )?;
-        for (filename, client_id) in unsettled {
+        for (filename, client_id, accepted_turn_id) in unsettled {
             let accepted = turns.iter().any(|turn| {
-                turn.get("items")
-                    .and_then(Value::as_array)
-                    .is_some_and(|items| {
-                        items.iter().any(|item| {
-                            item.get("type").and_then(Value::as_str) == Some("userMessage")
-                                && item.get("clientId").and_then(Value::as_str)
-                                    == Some(client_id.as_str())
-                        })
-                    })
+                let correlated_item =
+                    turn.get("items")
+                        .and_then(Value::as_array)
+                        .is_some_and(|items| {
+                            items.iter().any(|item| {
+                                item.get("type").and_then(Value::as_str) == Some("userMessage")
+                                    && item.get("clientId").and_then(Value::as_str)
+                                        == Some(client_id.as_str())
+                            })
+                        });
+                let completed_accepted_turn = accepted_turn_id.as_deref().is_some_and(|expected| {
+                    turn.get("id").and_then(Value::as_str) == Some(expected)
+                        && turn.get("status").and_then(Value::as_str) == Some("completed")
+                });
+                correlated_item || completed_accepted_turn
             });
             if accepted {
                 self.ledger
@@ -1043,6 +1483,38 @@ fn stable_client_user_message_id(recipient: &str, thread_id: &str, filename: &st
         hash.update(value);
     }
     format!("st2:{:x}", hash.finalize())
+}
+
+/// Read the exact native inbox filenames whose Codex deliveries reached consumption.
+///
+/// This is the graph bridge's receipt boundary: copying a projected message into the native inbox
+/// is not delivery to a turn. The same ledger loader and correlation derivation used by the pump
+/// validate the record before a graph lifecycle may advance. A missing ledger means no receipts.
+pub fn consumed_delivery_filenames(
+    state_dir: &Path,
+    identity: &str,
+    runtime_id: &str,
+) -> Result<BTreeSet<String>> {
+    let path = state_dir.join(delivery_ledger::LEDGER_FILE);
+    if !path.is_file() {
+        return Ok(BTreeSet::new());
+    }
+    let ledger = delivery_ledger::Ledger::open(
+        &path,
+        delivery_ledger::Harness::Codex.profile(),
+        identity,
+        runtime_id,
+        |thread, filename| stable_client_user_message_id(identity, thread, filename),
+    );
+    if let Some(reason) = ledger.quarantined() {
+        anyhow::bail!("Codex delivery receipt ledger is quarantined: {reason}");
+    }
+    Ok(ledger
+        .entries()
+        .iter()
+        .filter(|entry| entry.phase == delivery_ledger::Phase::Consumed)
+        .map(|entry| entry.filename.clone())
+        .collect())
 }
 
 fn codex_delivery_request(
@@ -1127,6 +1599,24 @@ impl CodexControlState {
         let before = (self.subscribed, self.observed.clone());
         self.subscribed = true;
         self.observe_thread_status(status, blocked);
+        let active_turns = message
+            .pointer("/result/thread/turns")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter(|turn| turn.get("status").and_then(Value::as_str) == Some("inProgress"))
+            .filter_map(|turn| turn.get("id").and_then(Value::as_str))
+            .collect::<Vec<_>>();
+        match active_turns.as_slice() {
+            [turn_id] => self.observe_turn_evidence(turn_id),
+            [_, _, ..] => {
+                self.observed = CodexObservedState::Held {
+                    reason: CodexHoldReason::ConflictingTurn,
+                    turn_id: None,
+                };
+            }
+            [] => {}
+        }
         Ok(SubscriptionAcceptance::Accepted {
             changed: (self.subscribed, self.observed.clone()) != before,
         })
@@ -1179,6 +1669,34 @@ impl CodexControlState {
                     return Ok(false);
                 }
                 let item_type = required_string(message, "/params/item/type", method)?;
+                let reported_turn_id = message
+                    .pointer("/params/turnId")
+                    .and_then(Value::as_str)
+                    .filter(|turn_id| !turn_id.is_empty());
+                // A control subscriber can attach after the owning TUI has already started its
+                // initial turn. Every typed item is exact evidence for that turn, so use it to
+                // recover steerability instead of holding the durable inbox until the turn ends.
+                // An exit marker is evidence only about a hold that already exists; using it as
+                // standalone turn-start evidence would turn a stale review exit into a live turn.
+                if item_type != "exitedReviewMode"
+                    && let Some(turn_id) = reported_turn_id
+                {
+                    self.observe_turn_evidence(turn_id);
+                }
+                // Codex 0.151 omitted `turnId` from ordinary item notifications. A hold item is
+                // still attributable when the turn lifecycle already established one, but an
+                // item without either source must never invent an identity.
+                let turn_id =
+                    reported_turn_id
+                        .map(str::to_owned)
+                        .or_else(|| match &self.observed {
+                            CodexObservedState::Active { turn_id }
+                            | CodexObservedState::Held {
+                                turn_id: Some(turn_id),
+                                ..
+                            } => Some(turn_id.clone()),
+                            _ => None,
+                        });
                 // The admitted `ThreadItem` schema has only three variants that change
                 // steerability. Every other classified item reports work inside a turn that the
                 // turn and thread status already model, so it is ignored on purpose. A later
@@ -1191,13 +1709,16 @@ impl CodexControlState {
                     "enteredReviewMode" => (CodexHoldReason::Review, false),
                     "exitedReviewMode" => (CodexHoldReason::Review, true),
                     "contextCompaction" => (CodexHoldReason::Compaction, false),
-                    _ if CLASSIFIED_CODEX_THREAD_ITEMS.contains(&item_type) => return Ok(false),
+                    _ if CLASSIFIED_CODEX_THREAD_ITEMS.contains(&item_type) => {
+                        return Ok(self.observed != before);
+                    }
                     _ => (CodexHoldReason::UnknownProtocol, false),
                 };
-                let turn_id = required_string(message, "/params/turnId", method)?;
                 if released {
-                    self.observe_hold_released(turn_id, reason);
-                } else {
+                    if let Some(turn_id) = turn_id.as_deref() {
+                        self.observe_hold_released(turn_id, reason);
+                    }
+                } else if let Some(turn_id) = turn_id.as_deref() {
                     self.observe_non_steerable(turn_id, reason);
                 }
             }
@@ -1271,6 +1792,16 @@ impl CodexControlState {
                 reason: CodexHoldReason::NotLoaded,
                 turn_id: None,
             },
+            "systemError"
+                if matches!(
+                    self.observed,
+                    CodexObservedState::TerminalError {
+                        reason: CodexTerminalError::SystemError
+                    }
+                ) =>
+            {
+                self.observed.clone()
+            }
             "systemError" => CodexObservedState::Held {
                 reason: CodexHoldReason::SystemError,
                 turn_id: None,
@@ -1309,6 +1840,27 @@ impl CodexControlState {
         };
     }
 
+    fn observe_turn_evidence(&mut self, turn_id: &str) {
+        self.observed = match &self.observed {
+            CodexObservedState::AwaitingStatus
+            | CodexObservedState::Held {
+                reason: CodexHoldReason::ActiveWithoutTurn,
+                ..
+            } => CodexObservedState::Active {
+                turn_id: turn_id.to_string(),
+            },
+            CodexObservedState::Held {
+                reason:
+                    reason @ (CodexHoldReason::WaitingOnApproval | CodexHoldReason::WaitingOnUserInput),
+                turn_id: None,
+            } => CodexObservedState::Held {
+                reason: *reason,
+                turn_id: Some(turn_id.to_string()),
+            },
+            _ => self.observed.clone(),
+        };
+    }
+
     fn observe_turn_completed(&mut self, turn_id: &str, outcome: CodexTurnOutcome) {
         // A failed turn whose typed error names a rejected credential is a SEAT-level fact: the
         // account was refused, which does not depend on which turn st2 believed live. It is
@@ -1318,6 +1870,12 @@ impl CodexControlState {
         if outcome == CodexTurnOutcome::ProviderAuthRejected {
             self.observed = CodexObservedState::TerminalError {
                 reason: CodexTerminalError::ProviderAuthRejected,
+            };
+            return;
+        }
+        if outcome == CodexTurnOutcome::ProviderCapacity {
+            self.observed = CodexObservedState::TerminalError {
+                reason: CodexTerminalError::ProviderCapacity,
             };
             return;
         }
@@ -1444,6 +2002,101 @@ impl CodexControlState {
             turn_id,
         };
     }
+}
+
+fn observed_from_thread_snapshot(
+    message: &Value,
+    expected_thread_id: &str,
+    previous: &CodexObservedState,
+) -> Result<CodexObservedState> {
+    let thread_id = required_string(message, "/result/thread/id", "thread/read response")?;
+    anyhow::ensure!(
+        thread_id == expected_thread_id,
+        "Codex thread/read returned a different thread"
+    );
+    let status_value = message.pointer("/result/thread/status");
+    let status = required_string(
+        message,
+        "/result/thread/status/type",
+        "thread/read response",
+    )?;
+    let blocked = human_blocking_flag(status_value);
+    if status != "active" {
+        return Ok(match status {
+            "idle" => CodexObservedState::Idle,
+            "notLoaded" => CodexObservedState::Held {
+                reason: CodexHoldReason::NotLoaded,
+                turn_id: None,
+            },
+            "systemError"
+                if matches!(
+                    previous,
+                    CodexObservedState::TerminalError {
+                        reason: CodexTerminalError::SystemError
+                    }
+                ) =>
+            {
+                previous.clone()
+            }
+            "systemError" => CodexObservedState::Held {
+                reason: CodexHoldReason::SystemError,
+                turn_id: None,
+            },
+            _ => CodexObservedState::Held {
+                reason: CodexHoldReason::UnknownStatus,
+                turn_id: None,
+            },
+        });
+    }
+    // includeTurns=false deliberately gives no turn inventory. The subscription and bounded
+    // transcript tail establish the exact turn ID; the status read only confirms its liveness.
+    Ok(match (previous, blocked) {
+        (CodexObservedState::Active { turn_id }, Some(reason)) => CodexObservedState::Held {
+            reason,
+            turn_id: Some(turn_id.clone()),
+        },
+        (CodexObservedState::Active { turn_id }, None) => CodexObservedState::Active {
+            turn_id: turn_id.clone(),
+        },
+        (
+            CodexObservedState::Held {
+                reason: CodexHoldReason::WaitingOnApproval | CodexHoldReason::WaitingOnUserInput,
+                turn_id,
+            },
+            Some(reason),
+        ) => CodexObservedState::Held {
+            reason,
+            turn_id: turn_id.clone(),
+        },
+        (
+            CodexObservedState::Held {
+                reason: CodexHoldReason::WaitingOnApproval | CodexHoldReason::WaitingOnUserInput,
+                turn_id: Some(turn_id),
+            },
+            None,
+        ) => CodexObservedState::Active {
+            turn_id: turn_id.clone(),
+        },
+        (
+            CodexObservedState::Held {
+                reason:
+                    CodexHoldReason::Review
+                    | CodexHoldReason::Compaction
+                    | CodexHoldReason::UnknownProtocol
+                    | CodexHoldReason::ConflictingTurn,
+                ..
+            },
+            _,
+        ) => previous.clone(),
+        (_, Some(reason)) => CodexObservedState::Held {
+            reason,
+            turn_id: None,
+        },
+        (_, None) => CodexObservedState::Held {
+            reason: CodexHoldReason::ActiveWithoutTurn,
+            turn_id: None,
+        },
+    })
 }
 
 /// Read the delivery-relevant part of `ThreadStatus.activeFlags`: the first flag that says this
@@ -1592,6 +2245,70 @@ fn run_controlled_with_required_resume(
     }
 }
 
+/// Run the native Codex driver with explicit private state paths.
+///
+/// The claims-graph runtime uses this entry point without an st2 catalog. The driver keeps the
+/// app-server protocol, delivery receipts, and harness records. Each st3 seat
+/// launch starts a new Codex thread; the graph holds continuity across restarts.
+pub fn run_controlled_paths(
+    driver_root: &Path,
+    state_dir: &Path,
+    agent_dir: &Path,
+    identity: String,
+    runtime_id: String,
+    codex_argv: Vec<String>,
+) -> Result<()> {
+    anyhow::ensure!(
+        !codex_argv.is_empty(),
+        "Codex controlled launch argv is empty"
+    );
+    // Install before any protocol preflight child exists, exactly as the catalog entry point does.
+    crate::provider_session::install_signal_handler();
+    let producer_version = ensure_supported_protocol(&codex_argv[0])?;
+    secure_dir(driver_root)?;
+    secure_dir(state_dir)?;
+    secure_dir(agent_dir)?;
+    let inbox = message::inbox_dir(agent_dir);
+    secure_dir(&inbox)?;
+    secure_dir(&message::archive_dir(agent_dir))?;
+    let delivery = CodexDeliveryConfig {
+        catalog_root: driver_root.to_path_buf(),
+        agent_dir: agent_dir.to_path_buf(),
+        inbox,
+        identity: identity.clone(),
+        this_host: run::detect_host(),
+        supervisor: None,
+        producer_version: Some(producer_version),
+    };
+    let _owner_lock = acquire_owner_lock(state_dir)?;
+    let mut diagnostics = WrapperDiagnostics::open(state_dir, &identity, &runtime_id)?;
+    diagnostics.record("ownerAcquired", json!({ "mode": "explicit-paths" }))?;
+    let resume_thread =
+        select_resume_thread(&state_dir.join("binding.json"), &identity, &runtime_id, false)?;
+    let result = run_controlled_owned(
+        driver_root,
+        state_dir,
+        identity,
+        runtime_id,
+        codex_argv,
+        delivery,
+        resume_thread,
+        None,
+        &mut diagnostics,
+    );
+    match result {
+        Ok(()) => {
+            diagnostics.record("completed", json!({}))?;
+            Ok(())
+        }
+        Err(error) => {
+            let text = format!("{error:#}");
+            let _ = diagnostics.record("failed", json!({ "error": text }));
+            Err(error)
+        }
+    }
+}
+
 fn run_controlled_owned(
     catalog_root: &Path,
     state_dir: &Path,
@@ -1609,6 +2326,19 @@ fn run_controlled_owned(
         .context("Codex app-server socket has no parent")?;
     secure_dir(socket_dir)?;
     prepare_socket_for_launch(&socket_path)?;
+
+    let endpoint = format!("unix://{}", socket_path.display());
+    let prepared =
+        prepare_controlled_launch_args(&endpoint, &codex_argv[1..], resume_thread.as_deref());
+    let safe_fallback_active = Arc::new(AtomicBool::new(false));
+    if prepared.safe_fallback {
+        record_safe_fallback(
+            diagnostics,
+            &safe_fallback_active,
+            "declaredArgumentsRejectedBeforeSpawn",
+            &prepared.declared_options,
+        )?;
+    }
 
     // Publish the host-owned incarnation for a residency attempt only after this process holds
     // the owner lock. Ordinary launches continue to mint their incarnation at this boundary.
@@ -1630,9 +2360,11 @@ fn run_controlled_owned(
         .append(true)
         .mode(0o600)
         .open(state_dir.join("app-server.log"))?;
-    let endpoint = format!("unix://{}", socket_path.display());
-    let mut server_args = controlled_app_server_args(&endpoint, &codex_argv[1..])?;
-    if resume_thread.is_some() && authored_bypasses_hook_trust(&codex_argv[1..])? {
+    let mut server_args = prepared.server_args;
+    if !prepared.safe_fallback
+        && resume_thread.is_some()
+        && authored_bypasses_hook_trust(&codex_argv[1..])?
+    {
         let hook_cwd = controlled_hook_cwd(&codex_argv[1..])?;
         if let Some(projection) = preflight_hook_trust(
             &codex_argv[0],
@@ -1645,28 +2377,75 @@ fn run_controlled_owned(
             insert_app_server_config_override(&mut server_args, projection.override_value)?;
         }
     }
-    diagnostics.record("appServerStarting", json!({}))?;
-    let mut server_command = Command::new(&codex_argv[0]);
-    server_command
-        .args(server_args)
-        .stdin(Stdio::null())
-        .stdout(log.try_clone()?)
-        .stderr(log);
-    let mut server = spawn_process_group(&mut server_command, Some(&socket_path))
-        .with_context(|| format!("starting {} app-server", codex_argv[0]))?;
-    let result = diagnostics
+    diagnostics.record(
+        "appServerStarting",
+        json!({ "safeFallback": prepared.safe_fallback }),
+    )?;
+    let mut server = spawn_controlled_app_server(&codex_argv[0], &server_args, &socket_path, &log)?;
+    let mut result = diagnostics
         .record("appServerStarted", json!({ "pid": server.id() }))
         .and_then(|_| {
             run_connected(
                 server.child_mut(),
                 &socket_path,
+                state_dir,
                 &runtime,
                 &codex_argv,
-                resume_thread.as_deref(),
-                delivery,
+                prepared.tui_args.clone(),
+                prepared.safe_tui_args.clone(),
+                prepared.expected_resume.clone(),
+                prepared.resume_permissions.clone(),
+                safe_fallback_active.clone(),
+                prepared.declared_options.clone(),
+                delivery.clone(),
                 diagnostics,
             )
         });
+    if !prepared.safe_fallback
+        && result.as_ref().is_err_and(|error| {
+            error
+                .downcast_ref::<AppServerExitedBeforeControl>()
+                .is_some()
+        })
+    {
+        server.terminate();
+        prepare_socket_for_launch(&socket_path)?;
+        record_safe_fallback(
+            diagnostics,
+            &safe_fallback_active,
+            "declaredAppServerExitedBeforeControl",
+            &prepared.declared_options,
+        )?;
+        diagnostics.record("safeFallbackAppServerStarting", json!({}))?;
+        server = spawn_controlled_app_server(
+            &codex_argv[0],
+            &safe_controlled_app_server_args(&endpoint),
+            &socket_path,
+            &log,
+        )?;
+        result = diagnostics
+            .record(
+                "safeFallbackAppServerStarted",
+                json!({ "pid": server.id() }),
+            )
+            .and_then(|_| {
+                run_connected(
+                    server.child_mut(),
+                    &socket_path,
+                    state_dir,
+                    &runtime,
+                    &codex_argv,
+                    prepared.safe_tui_args.clone(),
+                    prepared.safe_tui_args.clone(),
+                    resume_thread.clone(),
+                    None,
+                    safe_fallback_active.clone(),
+                    prepared.declared_options.clone(),
+                    delivery,
+                    diagnostics,
+                )
+            });
+    }
     server.terminate();
     result
 }
@@ -1713,23 +2492,57 @@ fn prepare_socket_for_launch(socket_path: &Path) -> Result<()> {
     Ok(())
 }
 
+fn spawn_controlled_app_server(
+    codex: &str,
+    args: &[String],
+    socket_path: &Path,
+    log: &File,
+) -> Result<OwnedProcessGroup> {
+    let mut command = Command::new(codex);
+    command
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(log.try_clone()?)
+        .stderr(log.try_clone()?);
+    spawn_process_group(&mut command, Some(socket_path))
+        .with_context(|| format!("starting {codex} app-server"))
+}
+
+fn spawn_controlled_tui(codex: &str, args: &[String]) -> std::io::Result<Child> {
+    Command::new(codex)
+        .args(args)
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .spawn()
+}
+
+fn claim_safe_fallback_attempt(attempted: &mut bool) -> bool {
+    if *attempted {
+        return false;
+    }
+    *attempted = true;
+    true
+}
+
 fn run_connected(
     server: &mut Child,
     socket_path: &Path,
+    state_dir: &Path,
     runtime: &CodexRuntime,
     codex_argv: &[String],
-    resume_thread: Option<&str>,
+    mut tui_args: Vec<String>,
+    safe_tui_args: Vec<String>,
+    expected_resume: Option<String>,
+    resume_permissions: Option<ResumePermissionOverrides>,
+    safe_fallback_active: Arc<AtomicBool>,
+    declared_options: Vec<String>,
     delivery: CodexDeliveryConfig,
     diagnostics: &mut WrapperDiagnostics,
 ) -> Result<()> {
-    // The stop handler is installed by run_controlled_owned before any spawn (the preflight's
+    // The stop handler is installed by the launch entry point before any spawn (the preflight's
     // detached app-server included); re-installing here would RESET a stop flag raised during
     // startup, so this function only relies on it.
-    let state_dir = state_dir(&delivery.catalog_root, &delivery.identity);
-    let endpoint = format!("unix://{}", socket_path.display());
-    let tui_args = controlled_tui_args(&endpoint, &codex_argv[1..], resume_thread)?;
-    let expected_resume =
-        expected_resume_thread(&codex_argv[1..], resume_thread)?.map(str::to_owned);
     diagnostics.record("waitingForControlSocket", json!({ "pid": server.id() }))?;
     // A stop during startup ends the launch before anything was observed: no TUI exists, the
     // caller reaps the app-server, and this session leaves no record — its predecessor's ages
@@ -1768,8 +2581,16 @@ fn run_connected(
     } else {
         (None, None)
     };
+    let preload_resume = expected_resume.is_some() && resume_permissions.is_some();
+    let (preloaded_tx, preloaded_rx) = if preload_resume {
+        let (tx, rx) = mpsc::channel();
+        (Some(tx), Some(rx))
+    } else {
+        (None, None)
+    };
     let harness_agent_dir = delivery.agent_dir.clone();
     let harness_identity = delivery.identity.clone();
+    let fallback_for_reader = safe_fallback_active.clone();
     let event_thread = thread::spawn(move || {
         let resume = expected_resume
             .as_deref()
@@ -1778,6 +2599,9 @@ fn run_connected(
                 thread_id,
                 ready,
                 tui_loaded_timeout: TUI_LOADED_TIMEOUT,
+                permission_overrides: resume_permissions,
+                preload: preload_resume,
+                preloaded: preloaded_tx,
             });
         pump_control(
             websocket,
@@ -1786,23 +2610,37 @@ fn run_connected(
             &runtime_for_reader,
             resume,
             Some(delivery),
+            fallback_for_reader,
             events_tx,
         )
     });
 
-    // A fresh initialized observer reads before this child can issue thread/start. A resumed
-    // observer waits on the gate below, then proves through thread/loaded/list that the TUI issued
-    // its own resume. Only after that typed observation may control send its redundant resume.
+    // Permission-declared resumes must load through control first. Once a remote TUI loads a saved
+    // thread with the provider's default read-only profile, a later control resume cannot change
+    // that live thread's sandbox. Resumes without declared permissions keep the TUI-first path.
+    if let Some(preloaded) = preloaded_rx {
+        let preload_result = (|| -> Result<()> {
+            resume_ready_tx
+                .take()
+                .context("preloaded Codex resume has no start gate")?
+                .send(())
+                .context("starting preloaded Codex control resume")?;
+            preloaded
+                .recv_timeout(STARTUP_TIMEOUT)
+                .context("Codex control did not preload the declared resume policy")?;
+            Ok(())
+        })();
+        if let Err(error) = preload_result {
+            drop(resume_ready_tx);
+            let _ = shutdown.shutdown(Shutdown::Both);
+            let _ = event_thread.join();
+            return Err(error);
+        }
+    }
+    // A fresh initialized observer reads before this child can issue thread/start.
     // Insert the remote endpoint as a global Codex option and preserve every authored argument
     // after the provider executable.
-    let mut tui_command = Command::new(&codex_argv[0]);
-    tui_command.args(tui_args);
-    let mut tui = match tui_command
-        .stdin(Stdio::inherit())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .spawn()
-    {
+    let mut tui = match spawn_controlled_tui(&codex_argv[0], &tui_args) {
         Ok(tui) => tui,
         Err(error) => {
             drop(resume_ready_tx);
@@ -1833,21 +2671,53 @@ fn run_connected(
         }
     };
     let result = (|| -> Result<TuiEnd> {
-        diagnostics.record("tuiStarted", json!({ "pid": tui.id() }))?;
-        if let Some(ready) = resume_ready_tx.take() {
-            ready
-                .send(())
-                .context("starting Codex control resume after the TUI launched")?;
-        }
-        diagnostics.record("waitingForThreadBinding", json!({ "pid": tui.id() }))?;
-        match wait_for_binding(&mut tui, &events_rx, STARTUP_TIMEOUT, diagnostics)? {
-            BindingWait::Bound => {
-                diagnostics.record("threadBound", json!({ "pid": tui.id() }))?;
-                monitor_bound_tui(&mut tui, &events_rx)
+        let mut fallback_attempted = safe_fallback_active.load(Ordering::SeqCst);
+        loop {
+            diagnostics.record(
+                "tuiStarted",
+                json!({
+                    "pid": tui.id(),
+                    "safeFallback": safe_fallback_active.load(Ordering::SeqCst),
+                }),
+            )?;
+            if let Some(ready) = resume_ready_tx.take() {
+                ready
+                    .send(())
+                    .context("starting Codex control resume after the TUI launched")?;
             }
-            BindingWait::Stopped => {
-                terminate_child(&mut tui);
-                Ok(TuiEnd::Stopped(tui.try_wait().ok().flatten()))
+            diagnostics.record("waitingForThreadBinding", json!({ "pid": tui.id() }))?;
+            match wait_for_binding(&mut tui, &events_rx, STARTUP_TIMEOUT, diagnostics)? {
+                BindingWait::Bound => {
+                    diagnostics.record("threadBound", json!({ "pid": tui.id() }))?;
+                    return monitor_bound_tui(&mut tui, &events_rx);
+                }
+                BindingWait::Stopped => {
+                    terminate_child(&mut tui);
+                    return Ok(TuiEnd::Stopped(tui.try_wait().ok().flatten()));
+                }
+                BindingWait::TuiExited(status)
+                    if claim_safe_fallback_attempt(&mut fallback_attempted) =>
+                {
+                    record_safe_fallback(
+                        diagnostics,
+                        &safe_fallback_active,
+                        "declaredTuiExitedBeforeThreadBinding",
+                        &declared_options,
+                    )?;
+                    diagnostics.record(
+                        "safeFallbackRetryStarting",
+                        json!({ "previousExit": status.to_string() }),
+                    )?;
+                    tui_args.clone_from(&safe_tui_args);
+                    tui = spawn_controlled_tui(&codex_argv[0], &tui_args).with_context(|| {
+                        format!("starting known-safe fallback {} TUI", codex_argv[0])
+                    })?;
+                }
+                BindingWait::TuiExited(status) => {
+                    anyhow::bail!(
+                        "controlled Codex TUI exited before thread binding after known-safe fallback: {status}"
+                    );
+                }
             }
         }
     })();
@@ -1917,6 +2787,336 @@ fn describe_tui_exit(status: Option<ExitStatus>) -> String {
 /// server process. Passing them only to the remote TUI silently creates two different effective
 /// configurations. TUI-only policy, model, workspace, authentication, and prompt arguments stay
 /// on the TUI command.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PreparedControlledLaunch {
+    server_args: Vec<String>,
+    tui_args: Vec<String>,
+    safe_tui_args: Vec<String>,
+    expected_resume: Option<String>,
+    resume_permissions: Option<ResumePermissionOverrides>,
+    declared_options: Vec<String>,
+    safe_fallback: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResumePermissionOverrides {
+    approval_policy: Option<String>,
+    approvals_reviewer: Option<String>,
+    sandbox: Option<String>,
+}
+
+impl ResumePermissionOverrides {
+    fn app_server_config_overrides(&self) -> Vec<String> {
+        let mut overrides = Vec::new();
+        for (key, value) in [
+            ("approval_policy", self.approval_policy.as_deref()),
+            ("approvals_reviewer", self.approvals_reviewer.as_deref()),
+            ("sandbox_mode", self.sandbox.as_deref()),
+        ] {
+            if let Some(value) = value {
+                overrides.push(format!("{key}={}", toml::Value::String(value.into())));
+            }
+        }
+        overrides
+    }
+
+    fn apply_to(&self, params: &mut serde_json::Map<String, Value>) {
+        if let Some(policy) = &self.approval_policy {
+            params.insert("approvalPolicy".into(), Value::String(policy.clone()));
+        }
+        if let Some(reviewer) = &self.approvals_reviewer {
+            params.insert("approvalsReviewer".into(), Value::String(reviewer.clone()));
+        }
+        if let Some(sandbox) = &self.sandbox {
+            params.insert("sandbox".into(), Value::String(sandbox.clone()));
+        }
+    }
+
+    fn diagnostic(&self, requested_policy_applied: bool) -> Value {
+        json!({
+            "approvalPolicy": self.approval_policy,
+            "approvalsReviewer": self.approvals_reviewer,
+            "sandbox": self.sandbox,
+            "requestedPolicyApplied": requested_policy_applied,
+        })
+    }
+}
+
+fn prepare_controlled_launch_args(
+    endpoint: &str,
+    authored_args: &[String],
+    resume_thread: Option<&str>,
+) -> PreparedControlledLaunch {
+    let declared_options = declared_option_names(authored_args);
+    let exact = controlled_app_server_args(endpoint, authored_args).and_then(|mut server_args| {
+        let resume_permissions =
+            automatic_resume_permission_overrides(authored_args, resume_thread)?;
+        if let Some(permissions) = &resume_permissions {
+            // The remote TUI's resume argv cannot contain CLI permission flags. Project the
+            // declaration into app-server defaults before either client loads the saved thread;
+            // a later thread/resume cannot reliably change an already-loaded thread.
+            for override_value in permissions.app_server_config_overrides() {
+                insert_app_server_config_override(&mut server_args, override_value)?;
+            }
+        }
+        Ok((
+            server_args,
+            controlled_tui_args(endpoint, authored_args, resume_thread)?,
+            expected_resume_thread(authored_args, resume_thread)?.map(str::to_owned),
+            resume_permissions,
+        ))
+    });
+    match exact {
+        Ok((server_args, tui_args, expected_resume, resume_permissions)) => {
+            PreparedControlledLaunch {
+                server_args,
+                tui_args,
+                safe_tui_args: safe_controlled_tui_args(endpoint, resume_thread),
+                expected_resume,
+                resume_permissions,
+                declared_options,
+                safe_fallback: false,
+            }
+        }
+        Err(_) => PreparedControlledLaunch {
+            server_args: safe_controlled_app_server_args(endpoint),
+            tui_args: safe_controlled_tui_args(endpoint, resume_thread),
+            safe_tui_args: safe_controlled_tui_args(endpoint, resume_thread),
+            expected_resume: resume_thread.map(str::to_owned),
+            resume_permissions: None,
+            declared_options,
+            safe_fallback: true,
+        },
+    }
+}
+
+fn automatic_resume_permission_overrides(
+    authored_args: &[String],
+    resume_thread: Option<&str>,
+) -> Result<Option<ResumePermissionOverrides>> {
+    if resume_thread.is_none() {
+        return Ok(None);
+    }
+    let Some(insertion) = resume_insertion_index(authored_args)? else {
+        return Ok(None);
+    };
+    let mut overrides = ResumePermissionOverrides {
+        approval_policy: None,
+        approvals_reviewer: None,
+        sandbox: None,
+    };
+    let mut index = 0;
+    while index < insertion {
+        let argument = authored_args[index].as_str();
+        match argument {
+            "--dangerously-bypass-approvals-and-sandbox" => {
+                overrides.approval_policy = Some("never".into());
+                overrides.sandbox = Some("danger-full-access".into());
+                index += 1;
+            }
+            "--approve-for-me" => {
+                overrides.approval_policy = Some("on-request".into());
+                overrides.approvals_reviewer = Some("auto_review".into());
+                overrides.sandbox = Some("workspace-write".into());
+                index += 1;
+            }
+            "-s" | "--sandbox" => {
+                let value = authored_args
+                    .get(index + 1)
+                    .context("Codex sandbox option has no value")?;
+                validate_resume_sandbox(value)?;
+                overrides.sandbox = Some(value.clone());
+                index += 2;
+            }
+            "-a" | "--ask-for-approval" => {
+                let value = authored_args
+                    .get(index + 1)
+                    .context("Codex approval option has no value")?;
+                validate_resume_approval_policy(value)?;
+                overrides.approval_policy = Some(value.clone());
+                index += 2;
+            }
+            _ if argument.starts_with("--sandbox=") => {
+                let value = argument.trim_start_matches("--sandbox=");
+                validate_resume_sandbox(value)?;
+                overrides.sandbox = Some(value.into());
+                index += 1;
+            }
+            _ if argument.starts_with("--ask-for-approval=") => {
+                let value = argument.trim_start_matches("--ask-for-approval=");
+                validate_resume_approval_policy(value)?;
+                overrides.approval_policy = Some(value.into());
+                index += 1;
+            }
+            _ if argument.starts_with("-s") && argument.len() > 2 => {
+                let value = &argument[2..];
+                validate_resume_sandbox(value)?;
+                overrides.sandbox = Some(value.into());
+                index += 1;
+            }
+            _ if argument.starts_with("-a") && argument.len() > 2 => {
+                let value = &argument[2..];
+                validate_resume_approval_policy(value)?;
+                overrides.approval_policy = Some(value.into());
+                index += 1;
+            }
+            _ => {
+                index += if matches!(
+                    argument,
+                    "-c" | "--config"
+                        | "--enable"
+                        | "--disable"
+                        | "--remote-auth-token-env"
+                        | "-m"
+                        | "--model"
+                        | "--local-provider"
+                        | "-p"
+                        | "--profile"
+                        | "-C"
+                        | "--cd"
+                        | "--add-dir"
+                ) {
+                    2
+                } else {
+                    1
+                };
+            }
+        }
+    }
+    Ok((overrides.approval_policy.is_some()
+        || overrides.approvals_reviewer.is_some()
+        || overrides.sandbox.is_some())
+    .then_some(overrides))
+}
+
+fn validate_resume_sandbox(value: &str) -> Result<()> {
+    anyhow::ensure!(
+        matches!(
+            value,
+            "read-only" | "workspace-write" | "danger-full-access"
+        ),
+        "unsupported Codex sandbox mode '{value}'"
+    );
+    Ok(())
+}
+
+fn validate_resume_approval_policy(value: &str) -> Result<()> {
+    anyhow::ensure!(
+        matches!(value, "on-request" | "never"),
+        "unsupported Codex approval policy '{value}'"
+    );
+    Ok(())
+}
+
+fn safe_controlled_app_server_args(endpoint: &str) -> Vec<String> {
+    vec![
+        "app-server".to_string(),
+        "--listen".to_string(),
+        endpoint.to_string(),
+    ]
+}
+
+fn safe_controlled_tui_args(endpoint: &str, resume_thread: Option<&str>) -> Vec<String> {
+    let mut args = vec!["--remote".to_string(), endpoint.to_string()];
+    if let Some(thread_id) = resume_thread {
+        args.extend(["resume".to_string(), thread_id.to_string()]);
+    }
+    args
+}
+
+fn declared_option_names(authored_args: &[String]) -> Vec<String> {
+    let mut options = Vec::new();
+    let mut index = 0;
+    while index < authored_args.len() {
+        let argument = authored_args[index].as_str();
+        if argument == "--" || !argument.starts_with('-') || argument == "-" {
+            break;
+        }
+        let option = diagnostic_option_name(argument);
+        if !options.contains(&option) {
+            options.push(option);
+        }
+        let exact_value_option = matches!(
+            argument,
+            "-c" | "--config"
+                | "--enable"
+                | "--disable"
+                | "--remote-auth-token-env"
+                | "-m"
+                | "--model"
+                | "--local-provider"
+                | "-p"
+                | "--profile"
+                | "-s"
+                | "--sandbox"
+                | "-C"
+                | "--cd"
+                | "--add-dir"
+                | "-a"
+                | "--ask-for-approval"
+        );
+        let known_flag = matches!(
+            argument,
+            "--strict-config"
+                | "--oss"
+                | "--approve-for-me"
+                | "--dangerously-bypass-approvals-and-sandbox"
+                | "--dangerously-bypass-hook-trust"
+                | "--search"
+                | "--no-alt-screen"
+                | "-h"
+                | "--help"
+                | "-V"
+                | "--version"
+        );
+        index += if exact_value_option { 2 } else { 1 };
+        if !exact_value_option
+            && !known_flag
+            && !argument.contains('=')
+            && !argument.starts_with("-c")
+            && !argument.starts_with("-m")
+            && !argument.starts_with("-p")
+            && !argument.starts_with("-s")
+            && !argument.starts_with("-C")
+            && !argument.starts_with("-a")
+        {
+            // This is the rejected unknown option. Stop before a following token that might be
+            // its secret value rather than another option.
+            break;
+        }
+    }
+    options
+}
+
+fn record_safe_fallback(
+    diagnostics: &mut WrapperDiagnostics,
+    active: &AtomicBool,
+    cause: &str,
+    declared_options: &[String],
+) -> Result<()> {
+    if active.swap(true, Ordering::SeqCst) {
+        return Ok(());
+    }
+    diagnostics.record(
+        "safeFallbackActivated",
+        json!({
+            "cause": cause,
+            "declaredOptions": declared_options,
+            "mode": "minimalRemoteTui",
+            "requestedPolicyApplied": false,
+        }),
+    )?;
+    eprintln!(
+        "st2 codex: declared launch arguments were rejected; booting once with known-safe flags (declared options: {})",
+        if declared_options.is_empty() {
+            "none".to_string()
+        } else {
+            declared_options.join(", ")
+        }
+    );
+    Ok(())
+}
+
 fn controlled_app_server_args(endpoint: &str, authored_args: &[String]) -> Result<Vec<String>> {
     let boundary = interactive_root_prefix_end(authored_args)?;
     let mut args = vec!["app-server".to_string()];
@@ -2231,12 +3431,48 @@ fn controlled_tui_args(
         return Ok(args);
     };
     args.push("resume".to_string());
-    // Codex models these flags on the `resume` command as well as the root command. Keep them
-    // before SESSION_ID so clap does not treat a following flag as the optional prompt.
-    args.extend_from_slice(&authored_args[..insertion]);
+    // A remote task owns its permission policy. Codex 0.156 rejects attempts to override that
+    // policy while resuming, so automatic resume preserves every non-permission global option but
+    // omits permission and hook-trust overrides here. Hook trust is projected through the typed
+    // app-server preflight above, while the declared approval/sandbox policy is projected through
+    // this driver's typed control `thread/resume` after the owning TUI loads the thread. Fresh
+    // launches and explicit authored resume/fork commands remain byte-for-byte exact.
+    args.extend(resume_compatible_root_args(&authored_args[..insertion]));
     args.push(thread_id.to_string());
     args.extend_from_slice(&authored_args[insertion..]);
     Ok(args)
+}
+
+fn resume_compatible_root_args(authored_prefix: &[String]) -> Vec<String> {
+    let mut compatible = Vec::with_capacity(authored_prefix.len());
+    let mut index = 0;
+    while index < authored_prefix.len() {
+        let argument = authored_prefix[index].as_str();
+        if matches!(
+            argument,
+            "--approve-for-me"
+                | "--dangerously-bypass-approvals-and-sandbox"
+                | "--dangerously-bypass-hook-trust"
+        ) {
+            index += 1;
+            continue;
+        }
+        if matches!(argument, "-s" | "--sandbox" | "-a" | "--ask-for-approval") {
+            index += 2;
+            continue;
+        }
+        if argument.starts_with("--sandbox=")
+            || argument.starts_with("--ask-for-approval=")
+            || (argument.starts_with("-s") && argument.len() > 2)
+            || (argument.starts_with("-a") && argument.len() > 2)
+        {
+            index += 1;
+            continue;
+        }
+        compatible.push(authored_prefix[index].clone());
+        index += 1;
+    }
+    compatible
 }
 
 /// A saved binding constrains the watcher only when st2 inserted that resume selection.
@@ -2289,6 +3525,7 @@ fn interactive_root_prefix_end(authored_args: &[String]) -> Result<usize> {
             argument,
             "--strict-config"
                 | "--oss"
+                | "--approve-for-me"
                 | "--dangerously-bypass-approvals-and-sandbox"
                 | "--dangerously-bypass-hook-trust"
                 | "--search"
@@ -2393,7 +3630,7 @@ fn connect_control(
             Ok(stream) => return Ok(Some(stream)),
             Err(error) if Instant::now() < deadline => {
                 if let Some(status) = server.try_wait()? {
-                    anyhow::bail!("Codex app-server exited before control connected: {status}");
+                    return Err(AppServerExitedBeforeControl(status).into());
                 }
                 if error.kind() != std::io::ErrorKind::NotFound
                     && error.kind() != std::io::ErrorKind::ConnectionRefused
@@ -2447,6 +3684,10 @@ fn initialize_control(stream: UnixStream) -> Result<Option<WebSocket<UnixStream>
             }
         }
     };
+    websocket.set_config(|config| {
+        config.max_frame_size = Some(CODEX_CONTROL_MAX_MESSAGE_BYTES);
+        config.max_message_size = Some(CODEX_CONTROL_MAX_MESSAGE_BYTES);
+    });
     websocket.get_mut().set_nonblocking(false)?;
     websocket.get_mut().set_read_timeout(Some(CONTROL_POLL))?;
     anyhow::ensure!(
@@ -2581,6 +3822,11 @@ fn wait_for_tui_loaded_thread(
 #[derive(Debug)]
 enum ControlEvent {
     TuiThreadLoaded(Sender<()>),
+    ResumePermissionPolicyApplied(ResumePermissionOverrides),
+    SafeFallbackActivated {
+        cause: &'static str,
+        permissions: ResumePermissionOverrides,
+    },
     Bound,
     Observed,
     Closed,
@@ -2591,6 +3837,57 @@ struct ControlResume<'a> {
     thread_id: &'a str,
     ready: Receiver<()>,
     tui_loaded_timeout: Duration,
+    permission_overrides: Option<ResumePermissionOverrides>,
+    preload: bool,
+    preloaded: Option<Sender<()>>,
+}
+
+fn control_resume_request(
+    thread_id: &str,
+    permission_overrides: Option<&ResumePermissionOverrides>,
+) -> Value {
+    let mut params =
+        serde_json::Map::from_iter([("threadId".into(), Value::String(thread_id.into()))]);
+    if let Some(permission_overrides) = permission_overrides {
+        permission_overrides.apply_to(&mut params);
+    }
+    json!({
+        "method": "thread/resume",
+        "id": CONTROL_SUBSCRIBE_REQUEST_ID,
+        "params": params,
+    })
+}
+
+fn resume_permission_overrides_applied(
+    message: &Value,
+    expected: &ResumePermissionOverrides,
+) -> bool {
+    let sandbox = expected.sandbox.as_deref().map(|sandbox| match sandbox {
+        "read-only" => "readOnly",
+        "workspace-write" => "workspaceWrite",
+        "danger-full-access" => "dangerFullAccess",
+        _ => "",
+    });
+    expected.approval_policy.as_deref().is_none_or(|policy| {
+        message
+            .pointer("/result/approvalPolicy")
+            .and_then(Value::as_str)
+            == Some(policy)
+    }) && expected
+        .approvals_reviewer
+        .as_deref()
+        .is_none_or(|reviewer| {
+            message
+                .pointer("/result/approvalsReviewer")
+                .and_then(Value::as_str)
+                == Some(reviewer)
+        })
+        && sandbox.is_none_or(|sandbox| {
+            message
+                .pointer("/result/sandbox/type")
+                .and_then(Value::as_str)
+                == Some(sandbox)
+        })
 }
 
 fn pump_control(
@@ -2600,24 +3897,41 @@ fn pump_control(
     runtime: &CodexRuntime,
     resume: Option<ControlResume<'_>>,
     delivery: Option<CodexDeliveryConfig>,
+    safe_fallback_active: Arc<AtomicBool>,
     events: Sender<ControlEvent>,
 ) {
     let result = (|| -> Result<()> {
-        let (expected_resume, resume_ready, tui_loaded_timeout) = match resume {
+        let (
+            expected_resume,
+            resume_ready,
+            tui_loaded_timeout,
+            mut resume_permissions,
+            preload,
+            mut preloaded,
+        ) = match resume {
             Some(resume) => (
                 Some(resume.thread_id),
                 Some(resume.ready),
                 resume.tui_loaded_timeout,
+                resume.permission_overrides,
+                resume.preload,
+                resume.preloaded,
             ),
-            None => (None, None, TUI_LOADED_TIMEOUT),
+            None => (None, None, TUI_LOADED_TIMEOUT, None, false, None),
         };
         let mut control_state: Option<CodexControlState> = None;
         let mut subscription_pending = false;
+        let mut last_transcript_turn_recovery = None;
         let mut peer_closed = false;
         let delivery_ledger_path = control_state_path.with_file_name(delivery_ledger::LEDGER_FILE);
         let mut delivery = delivery
             .map(|config| {
-                CodexInboxDelivery::new(config, delivery_ledger_path.clone(), runtime.clone())
+                CodexInboxDelivery::new(
+                    config,
+                    delivery_ledger_path.clone(),
+                    runtime.clone(),
+                    safe_fallback_active.clone(),
+                )
             })
             .transpose()
             .context("initializing Codex inbox delivery")?;
@@ -2626,39 +3940,42 @@ fn pump_control(
                 .context("saved Codex binding has no TUI-start gate")?
                 .recv()
                 .context("controlled Codex TUI ended before control resume")?;
-            wait_for_tui_loaded_thread(&mut websocket, thread_id, tui_loaded_timeout)
-                .context("waiting for Codex TUI thread load")?;
-            let (diagnostic_tx, diagnostic_rx) = mpsc::channel();
-            eprintln!("codex control: emitting TuiThreadLoaded");
-            events
-                .send(ControlEvent::TuiThreadLoaded(diagnostic_tx))
-                .context("recording that the Codex TUI loaded the preserved thread")?;
-            diagnostic_rx
-                .recv()
-                .context("waiting for the Codex TUI-loaded diagnostic before control resume")?;
+            if !preload {
+                wait_for_tui_loaded_thread(&mut websocket, thread_id, tui_loaded_timeout)
+                    .context("waiting for Codex TUI thread load")?;
+                let (diagnostic_tx, diagnostic_rx) = mpsc::channel();
+                events
+                    .send(ControlEvent::TuiThreadLoaded(diagnostic_tx))
+                    .context("recording that the Codex TUI loaded the preserved thread")?;
+                diagnostic_rx
+                    .recv()
+                    .context("waiting for the Codex TUI-loaded diagnostic before control resume")?;
+            }
+            if safe_fallback_active.load(Ordering::SeqCst) {
+                resume_permissions = None;
+            }
             write_json_message(
                 &mut websocket,
-                &json!({
-                    "method": "thread/resume",
-                    "id": CONTROL_SUBSCRIBE_REQUEST_ID,
-                    "params": { "threadId": thread_id }
-                }),
+                &control_resume_request(thread_id, resume_permissions.as_ref()),
             )
             .context("sending Codex thread resume request")?;
             subscription_pending = true;
         }
         loop {
-            if !peer_closed {
-                if let Err(error) = websocket.get_ref().set_read_timeout(Some(CONTROL_POLL)) {
-                    if error.kind() == std::io::ErrorKind::InvalidInput {
-                        // Darwin can reject setsockopt after the peer has closed
-                        // the Unix socket. Keep reading: buffered WebSocket
-                        // frames must be processed before EOF is reported.
-                        peer_closed = true;
-                        let _ = websocket.get_ref().set_read_timeout(None);
-                    } else {
-                        return Err(error).context("setting Codex control poll timeout");
-                    }
+            if let Some(delivery) = delivery.as_mut() {
+                delivery.sync_safe_fallback_diagnostic();
+            }
+            if !peer_closed
+                && let Err(error) = websocket.get_ref().set_read_timeout(Some(CONTROL_POLL))
+            {
+                if error.kind() == std::io::ErrorKind::InvalidInput {
+                    // Darwin can reject setsockopt after the peer has closed
+                    // the Unix socket. Keep reading: buffered WebSocket
+                    // frames must be processed before EOF is reported.
+                    peer_closed = true;
+                    let _ = websocket.get_ref().set_read_timeout(None);
+                } else {
+                    return Err(error).context("setting Codex control poll timeout");
                 }
             }
             let message =
@@ -2671,11 +3988,26 @@ fn pump_control(
                     }
                 };
             let Some(message) = message else {
-                if let (Some(state), Some(delivery)) = (control_state.as_ref(), delivery.as_mut())
-                    && let Some(request) = delivery.maybe_request(state)?
-                {
-                    write_json_message(&mut websocket, &request)
-                        .context("sending Codex delivery request")?;
+                if let Some(state) = control_state.as_mut() {
+                    if let Some(delivery) = delivery.as_mut() {
+                        delivery.refresh_transcript_context_if_due(state.thread_id());
+                    }
+                    recover_transcript_turn_if_due(
+                        state,
+                        &mut delivery,
+                        &mut last_transcript_turn_recovery,
+                        control_state_path,
+                        &events,
+                    )?;
+                    if let Some(delivery) = delivery.as_mut() {
+                        if let Some(request) = delivery.maybe_snapshot_request(state)? {
+                            write_json_message(&mut websocket, &request)
+                                .context("sending Codex on-demand thread/read")?;
+                        } else if let Some(request) = delivery.maybe_request(state)? {
+                            write_json_message(&mut websocket, &request)
+                                .context("sending Codex delivery request")?;
+                        }
+                    }
                 }
                 continue;
             };
@@ -2708,7 +4040,43 @@ fn pump_control(
                         subscription_pending,
                         "Codex control received an unexpected initial thread/resume response"
                     );
+                    if message.get("error").is_some()
+                        && let Some(rejected) = resume_permissions.take()
+                    {
+                        safe_fallback_active.store(true, Ordering::SeqCst);
+                        eprintln!(
+                            "st2 codex: app-server rejected the declared resume permission policy; continuing once with the provider-safe policy"
+                        );
+                        let _ = events.send(ControlEvent::SafeFallbackActivated {
+                            cause: "resumePermissionProjectionRejected",
+                            permissions: rejected,
+                        });
+                        write_json_message(
+                            &mut websocket,
+                            &control_resume_request(thread_id, None),
+                        )
+                        .context(
+                            "retrying Codex thread resume without rejected permission policy",
+                        )?;
+                        continue;
+                    }
                     subscription_pending = false;
+                    if let Some(expected_permissions) = resume_permissions.take() {
+                        if resume_permission_overrides_applied(&message, &expected_permissions) {
+                            let _ = events.send(ControlEvent::ResumePermissionPolicyApplied(
+                                expected_permissions,
+                            ));
+                        } else {
+                            safe_fallback_active.store(true, Ordering::SeqCst);
+                            eprintln!(
+                                "st2 codex: resumed thread did not report the declared permission policy; continuing in degraded provider-safe mode"
+                            );
+                            let _ = events.send(ControlEvent::SafeFallbackActivated {
+                                cause: "resumePermissionProjectionMismatch",
+                                permissions: expected_permissions,
+                            });
+                        }
+                    }
                     let mut bound = CodexControlState::new(runtime, thread_id.to_string());
                     match bound
                         .accept_subscription(&message)
@@ -2736,6 +4104,9 @@ fn pump_control(
                         delivery.observe_harness(&bound.observed);
                     }
                     control_state = Some(bound);
+                    if let Some(preloaded) = preloaded.take() {
+                        let _ = preloaded.send(());
+                    }
                     let _ = events.send(ControlEvent::Bound);
                     continue;
                 }
@@ -2767,6 +4138,12 @@ fn pump_control(
             let state = control_state
                 .as_mut()
                 .context("Codex control state is unbound")?;
+            if let Some(delivery) = delivery.as_mut() {
+                // Some Codex builds keep a secondary subscriber busy with status traffic while
+                // omitting the compaction item itself. Rate-limit this independently of socket
+                // timeouts so a chatty stream cannot starve transcript recovery.
+                delivery.refresh_transcript_context_if_due(state.thread_id());
+            }
             // The context record's whole input, taken before the delivery and state branches
             // because none of them reads a token count and every one of them may `continue`.
             //
@@ -2782,19 +4159,30 @@ fn pump_control(
                 // result no branch below looks at, and every one of them may `continue`.
                 delivery.observe_provider_auth(&message, state.thread_id());
             }
+            let before_delivery_state = state.observed.clone();
             let delivery_response = match delivery.as_mut() {
                 Some(delivery) => {
                     delivery
-                        .accept_response(&message, &state.observed)
-                        .context("accepting Codex delivery response")?
+                        .accept_snapshot_response(&message, state)
+                        .context("accepting Codex on-demand thread/read response")?
+                        || delivery
+                            .accept_response(&message, &state.observed)
+                            .context("accepting Codex delivery response")?
                         || delivery
                             .accept_typed_receipt(&message, state)
                             .context("accepting Codex typed receipt")?
                 }
                 None => false,
             };
+            // Unlike an item receipt, a terminal turn notification still changes the harness
+            // state below. Grade its delivery evidence without consuming the frame.
+            if let Some(delivery) = delivery.as_mut() {
+                delivery
+                    .accept_turn_completion_receipt(&message, state)
+                    .context("accepting Codex turn completion receipt")?;
+            }
             let changed = if delivery_response {
-                false
+                state.observed != before_delivery_state
             } else if message.get("method").is_none()
                 && message.get("id") == Some(&Value::from(CONTROL_SUBSCRIBE_REQUEST_ID))
             {
@@ -2845,17 +4233,257 @@ fn pump_control(
                 .context("sending Codex subscription request")?;
                 subscription_pending = true;
             }
-            if let Some(delivery) = delivery.as_mut()
-                && let Some(request) = delivery.maybe_request(state)?
-            {
-                write_json_message(&mut websocket, &request)
-                    .context("sending Codex delivery request")?;
+            recover_transcript_turn_if_due(
+                state,
+                &mut delivery,
+                &mut last_transcript_turn_recovery,
+                control_state_path,
+                &events,
+            )?;
+            if let Some(delivery) = delivery.as_mut() {
+                if let Some(request) = delivery.maybe_snapshot_request(state)? {
+                    write_json_message(&mut websocket, &request)
+                        .context("sending Codex on-demand thread/read")?;
+                } else if let Some(request) = delivery.maybe_request(state)? {
+                    write_json_message(&mut websocket, &request)
+                        .context("sending Codex delivery request")?;
+                }
             }
         }
     })();
     if let Err(error) = result {
         let _ = events.send(ControlEvent::Failed(format!("{error:#}")));
     }
+}
+
+fn recover_active_codex_turn(thread_id: &str) -> Result<Option<String>> {
+    latest_codex_transcript(thread_id)?
+        .map(|path| active_turn_from_codex_transcript(&path))
+        .transpose()
+        .map(Option::flatten)
+}
+
+fn recover_transcript_turn_if_due(
+    state: &mut CodexControlState,
+    delivery: &mut Option<CodexInboxDelivery>,
+    last_recovery: &mut Option<Instant>,
+    control_state_path: &Path,
+    events: &Sender<ControlEvent>,
+) -> Result<()> {
+    let system_error = matches!(
+        state.observed,
+        CodexObservedState::Held {
+            reason: CodexHoldReason::SystemError,
+            ..
+        }
+    );
+    if last_recovery.is_some_and(|last| last.elapsed() < TRANSCRIPT_TURN_RECOVERY_INTERVAL)
+        || (!system_error
+            && (!delivery
+                .as_ref()
+                .is_some_and(CodexInboxDelivery::transcript_recovery_due)
+                || !matches!(
+                    state.observed,
+                    CodexObservedState::AwaitingStatus
+                        | CodexObservedState::Held {
+                            reason: CodexHoldReason::ActiveWithoutTurn,
+                            ..
+                        }
+                )))
+    {
+        return Ok(());
+    }
+    *last_recovery = Some(Instant::now());
+    if system_error {
+        let Some(path) = latest_codex_transcript(state.thread_id())? else {
+            return Ok(());
+        };
+        if failed_completed_turn_from_codex_frames(&codex_transcript_tail(&path)?).is_none() {
+            return Ok(());
+        }
+        // Some Codex app-server versions report the terminal thread status but
+        // omit turn/completed. The saved task_complete with an error proves the
+        // turn ended, so the next inbox delivery can safely start a new turn.
+        state.observed = CodexObservedState::TerminalError {
+            reason: CodexTerminalError::SystemError,
+        };
+        atomic_json(control_state_path, state)
+            .context("persisting transcript-recovered Codex system error")?;
+        if let Some(delivery) = delivery.as_mut() {
+            delivery.observe_harness(&state.observed);
+            delivery.accept_transcript_recovery(state.observed.clone());
+        }
+        let _ = events.send(ControlEvent::Observed);
+        return Ok(());
+    }
+    let Some(turn_id) = recover_active_codex_turn(state.thread_id())? else {
+        return Ok(());
+    };
+    let before = state.observed.clone();
+    state.observe_turn_evidence(&turn_id);
+    if state.observed != before {
+        atomic_json(control_state_path, state)
+            .context("persisting transcript-recovered Codex turn")?;
+        if let Some(delivery) = delivery.as_mut() {
+            delivery.observe_harness(&state.observed);
+        }
+        let _ = events.send(ControlEvent::Observed);
+    }
+    if let Some(delivery) = delivery.as_mut() {
+        delivery.accept_transcript_recovery(state.observed.clone());
+    }
+    Ok(())
+}
+
+fn latest_codex_transcript(thread_id: &str) -> Result<Option<PathBuf>> {
+    let Some(home) = std::env::var_os("CODEX_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".codex")))
+    else {
+        return Ok(None);
+    };
+    let sessions = home.join("sessions");
+    let mut stack = vec![sessions];
+    let mut inspected = 0_usize;
+    let mut selected: Option<(SystemTime, PathBuf)> = None;
+    while let Some(directory) = stack.pop() {
+        let entries = match fs::read_dir(&directory) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(error).with_context(|| format!("read {}", directory.display()));
+            }
+        };
+        for entry in entries {
+            let entry = entry?;
+            let file_type = entry.file_type()?;
+            if file_type.is_dir() {
+                stack.push(entry.path());
+                continue;
+            }
+            inspected = inspected.saturating_add(1);
+            if inspected > TRANSCRIPT_DISCOVERY_FILE_LIMIT {
+                return Ok(None);
+            }
+            let path = entry.path();
+            if path.extension().and_then(|value| value.to_str()) != Some("jsonl")
+                || !path
+                    .file_name()
+                    .and_then(|value| value.to_str())
+                    .is_some_and(|name| name.contains(thread_id))
+            {
+                continue;
+            }
+            let modified = entry
+                .metadata()?
+                .modified()
+                .unwrap_or(SystemTime::UNIX_EPOCH);
+            if selected
+                .as_ref()
+                .is_none_or(|(current, _)| modified > *current)
+            {
+                selected = Some((modified, path));
+            }
+        }
+    }
+    Ok(selected.map(|(_, path)| path))
+}
+
+fn active_turn_from_codex_transcript(path: &Path) -> Result<Option<String>> {
+    let frames = codex_transcript_tail(path)?;
+    Ok(active_turn_from_codex_frames(&frames))
+}
+
+fn codex_transcript_tail(path: &Path) -> Result<Vec<Value>> {
+    Ok(codex_transcript_tail_with_bytes(path)?.0)
+}
+
+fn codex_transcript_tail_with_bytes(path: &Path) -> Result<(Vec<Value>, u64)> {
+    let mut file =
+        File::open(path).with_context(|| format!("read Codex transcript {}", path.display()))?;
+    let length = file.metadata()?.len();
+    let start = length.saturating_sub(TRANSCRIPT_TURN_RECOVERY_BYTES);
+    file.seek(SeekFrom::Start(start))?;
+    // The rollout can grow while it is being read. Cap the stream itself so a busy writer
+    // cannot make one recovery pass read past this fixed window.
+    let mut reader = BufReader::new(file.take(TRANSCRIPT_TURN_RECOVERY_BYTES));
+    if start != 0 {
+        let mut partial = String::new();
+        reader.read_line(&mut partial)?;
+    }
+    let mut frames = Vec::new();
+    for line in (&mut reader).lines() {
+        if let Ok(value) = serde_json::from_str::<Value>(&line?) {
+            frames.push(value);
+        }
+    }
+    Ok((
+        frames,
+        TRANSCRIPT_TURN_RECOVERY_BYTES - reader.get_ref().limit(),
+    ))
+}
+
+fn active_turn_from_codex_frames(frames: &[Value]) -> Option<String> {
+    let mut active = None;
+    for value in frames {
+        let event = value.pointer("/payload/type").and_then(Value::as_str);
+        let turn_id = value
+            .pointer("/payload/turn_id")
+            .or_else(|| {
+                value.pointer("/payload/internal_chat_message_metadata_passthrough/turn_id")
+            })
+            .and_then(Value::as_str);
+        match (event, turn_id) {
+            (Some("task_started"), Some(turn_id)) => active = Some(turn_id.to_string()),
+            (Some("task_complete" | "turn_aborted"), Some(turn_id))
+                if active.as_deref() == Some(turn_id) =>
+            {
+                active = None;
+            }
+            // A long-running turn can put task_started more than the bounded
+            // transcript tail behind us. Its recent typed tool/response frames
+            // still carry the same turn ID, which turn/steer fences at Codex.
+            (Some("item_completed"), Some(turn_id)) if active.is_none() => {
+                active = Some(turn_id.to_string());
+            }
+            (_, Some(turn_id))
+                if active.is_none()
+                    && value.get("type").and_then(Value::as_str) == Some("response_item") =>
+            {
+                active = Some(turn_id.to_string());
+            }
+            _ => {}
+        }
+    }
+    active
+}
+
+fn failed_completed_turn_from_codex_frames(frames: &[Value]) -> Option<String> {
+    let mut active = None;
+    let mut failed = None;
+    for value in frames {
+        let event = value.pointer("/payload/type").and_then(Value::as_str);
+        let turn_id = value.pointer("/payload/turn_id").and_then(Value::as_str);
+        match (event, turn_id) {
+            (Some("task_started"), Some(turn_id)) => {
+                active = Some(turn_id);
+                failed = None;
+            }
+            (Some("task_complete"), Some(turn_id)) if active == Some(turn_id) => {
+                active = None;
+                failed = value
+                    .pointer("/payload/error")
+                    .filter(|error| !error.is_null())
+                    .map(|_| turn_id.to_string());
+            }
+            (Some("turn_aborted"), Some(turn_id)) if active == Some(turn_id) => {
+                active = None;
+                failed = None;
+            }
+            _ => {}
+        }
+    }
+    failed
 }
 
 fn subscription_candidate(message: &Value, thread_id: &str) -> bool {
@@ -2896,6 +4524,7 @@ fn binding_candidate(message: &Value) -> Result<Option<&str>> {
 enum BindingWait {
     Bound,
     Stopped,
+    TuiExited(ExitStatus),
 }
 
 fn wait_for_binding(
@@ -2910,7 +4539,7 @@ fn wait_for_binding(
             return Ok(BindingWait::Stopped);
         }
         if let Some(status) = tui.try_wait()? {
-            anyhow::bail!("controlled Codex TUI exited before thread binding: {status}");
+            return Ok(BindingWait::TuiExited(status));
         }
         let wait = deadline
             .saturating_duration_since(Instant::now())
@@ -2925,6 +4554,23 @@ fn wait_for_binding(
             Ok(ControlEvent::TuiThreadLoaded(acknowledge)) => {
                 diagnostics.record("tuiThreadLoaded", json!({ "pid": tui.id() }))?;
                 let _ = acknowledge.send(());
+            }
+            Ok(ControlEvent::ResumePermissionPolicyApplied(permissions)) => {
+                diagnostics.record(
+                    "resumePermissionPolicyApplied",
+                    permissions.diagnostic(true),
+                )?;
+            }
+            Ok(ControlEvent::SafeFallbackActivated { cause, permissions }) => {
+                diagnostics.record(
+                    "safeFallbackActivated",
+                    json!({
+                        "cause": cause,
+                        "declaredPermissions": permissions.diagnostic(false),
+                        "mode": "minimalRemoteTui",
+                        "requestedPolicyApplied": false,
+                    }),
+                )?;
             }
             Ok(ControlEvent::Bound) => return Ok(BindingWait::Bound),
             Ok(ControlEvent::Observed) => {}
@@ -2957,6 +4603,8 @@ fn monitor_bound_tui(tui: &mut Child, events: &Receiver<ControlEvent>) -> Result
             Ok(ControlEvent::TuiThreadLoaded(acknowledge)) => {
                 let _ = acknowledge.send(());
             }
+            Ok(ControlEvent::ResumePermissionPolicyApplied(_))
+            | Ok(ControlEvent::SafeFallbackActivated { .. }) => {}
             Ok(ControlEvent::Bound) => {}
             Ok(ControlEvent::Observed) => {}
             Ok(ControlEvent::Closed) => {
@@ -3043,11 +4691,8 @@ fn acquire_owner_lock(state_dir: &Path) -> Result<crate::flock::FileLock> {
         .with_context(|| format!("opening Codex runtime owner lock {}", path.display()))?;
     // Closing the descriptor releases the process-scoped lock, so a crashed owner leaves no stale
     // claim for the next runtime to trip over.
-    match crate::flock::FileLock::hold(
-        file,
-        crate::flock::Mode::Exclusive,
-        crate::flock::Wait::Now,
-    ) {
+    match crate::flock::FileLock::hold(file, crate::flock::Mode::Exclusive, crate::flock::Wait::Now)
+    {
         Ok(Some(lock)) => Ok(lock),
         Ok(None) => Err(anyhow::anyhow!(
             "Codex runtime already has an owner at {}",
@@ -3148,6 +4793,25 @@ fn load_current_control_state(
         "Codex control state belongs to a different runtime binding"
     );
     Ok(Some(state))
+}
+
+fn select_resume_thread(
+    path: &Path,
+    agent: &str,
+    runtime_id: &str,
+    resume_existing: bool,
+) -> Result<Option<String>> {
+    if resume_existing {
+        return load_resume_thread(path, agent, runtime_id);
+    }
+    // This runs under the owner lock. A stale binding must not make the next
+    // incarnation look ready before its new control connection binds.
+    match fs::remove_file(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error).context("retiring the prior Codex thread binding"),
+    }
+    Ok(None)
 }
 
 pub fn checkpoint_residency(

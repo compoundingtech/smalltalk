@@ -1,15 +1,12 @@
 use super::*;
-use std::os::fd::AsRawFd as _;
-use std::process::ChildStdin;
-use agent_spec::spec::{
-    AgentSpec, Driver, JobType, OmpDriver, Task, TaskKind, TaskLifecycle,
-};
+use agent_spec::spec::{AgentSpec, Driver, JobType, OmpDriver, Task, TaskKind, TaskLifecycle};
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
+use std::os::fd::AsRawFd as _;
+use std::process::ChildStdin;
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::mpsc;
-
 
 /// The bound is derived from the resolved pty root, never a fixed maximum identity length.
 ///
@@ -306,9 +303,11 @@ fn selected_codex_gate_suppresses_launch_on_stale_hooks() {
     .unwrap();
     assert_eq!(runner.list_calls.get(), 1);
     assert!(report.launched.is_empty());
-    assert!(report.errors.iter().any(|error| {
-        error.contains("stale receipt") && error.contains("launch suppressed")
-    }));
+    assert!(
+        report.errors.iter().any(|error| {
+            error.contains("stale receipt") && error.contains("launch suppressed")
+        })
+    );
 }
 
 #[test]
@@ -434,7 +433,7 @@ fn failed_watch_installation_keeps_supervisor_on_timer_cadence() {
             "test-host",
             &SpawnCountingRunner::default(),
             Duration::from_millis(100),
-            &stop,
+            stop,
             |_, _| None, // watcher installation fails, as it did on dev3's oversized catalog
             |_| {
                 passes += 1;
@@ -684,11 +683,7 @@ fn resident_loop_reloads_added_changed_removed_and_malformed_profiles() {
             let pass = malformed_reports.len();
             malformed_reports.push((report.warnings.clone(), report.errors.clone()));
             match pass {
-                0 => std::fs::write(
-                    &config,
-                    r#"profiel "alpha" { wasm "missing.wasm" }"#,
-                )
-                .unwrap(),
+                0 => std::fs::write(&config, r#"profiel "alpha" { wasm "missing.wasm" }"#).unwrap(),
                 1 => stop.store(true, Ordering::SeqCst),
                 _ => unreachable!("malformed profile run stops after two passes"),
             }
@@ -896,7 +891,7 @@ fn persistent_advisory_warnings_surface_once_not_per_pass() {
             "test-host",
             &SpawnCountingRunner::default(),
             Duration::from_millis(50),
-            &stop,
+            stop,
             |_, _| None,
             |report| {
                 passes += 1;
@@ -1013,11 +1008,7 @@ fn driver_labels_include_typed_and_argv_omp_but_remain_bounded() {
         live_derived: Vec::new(),
     };
     let mut omp_argv = target("hetz.demo.agent", "unused");
-    omp_argv.launch = TaskLaunch::Argv(vec![
-        "st2".into(),
-        "driver".into(),
-        "omp-session".into(),
-    ]);
+    omp_argv.launch = TaskLaunch::Argv(vec!["st2".into(), "driver".into(), "omp-session".into()]);
     let mut exec = target("hetz.demo.agent", "codex");
     exec.kind = TaskKind::Exec;
     let targets = [
@@ -1357,11 +1348,7 @@ fn wait_for_resync_event_for_key(agent_dir: &Path, key: &str) -> Option<String> 
 }
 
 #[cfg(all(test, feature = "wasm-resolver"))]
-fn wait_for_resync_event_key_change(
-    agent_dir: &Path,
-    key: &str,
-    prior: &str,
-) -> Option<String> {
+fn wait_for_resync_event_key_change(agent_dir: &Path, key: &str, prior: &str) -> Option<String> {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         if let Some(body) = current_resync_event_for_key(agent_dir, key)
@@ -1417,8 +1404,7 @@ fn wait_for_resync_event_change(agent_dir: &Path, prior: &str) -> Option<String>
 fn up_loop_keeps_complete_notify_chain_sets_during_steady_reconcile() {
     let catalog = tempfile::tempdir().unwrap();
     write_notify_chain_profile(catalog.path());
-    let (root_dir, root_goal) =
-        write_notify_chain_agent(catalog.path(), "root", None, false);
+    let (root_dir, root_goal) = write_notify_chain_agent(catalog.path(), "root", None, false);
     let (lead_dir, lead_goal) =
         write_notify_chain_agent(catalog.path(), "lead", Some("hetz.root"), false);
     let (worker_dir, _worker_goal) =
@@ -1454,17 +1440,10 @@ fn up_loop_keeps_complete_notify_chain_sets_during_steady_reconcile() {
 
             std::fs::write(&root_goal, "steady baseline transition\n").unwrap();
             let root_initial = wait_for_resync_event_for_key(&root_dir, "goal");
-            let lead_initial =
-                wait_for_resync_event_for_key(&lead_dir, "goal@hetz.root");
-            let worker_initial =
-                wait_for_resync_event_for_key(&worker_dir, "goal@hetz.root");
+            let lead_initial = wait_for_resync_event_for_key(&lead_dir, "goal@hetz.root");
+            let worker_initial = wait_for_resync_event_for_key(&worker_dir, "goal@hetz.root");
 
-            write_notify_chain_agent(
-                &observer_catalog,
-                "worker",
-                Some("hetz.lead"),
-                true,
-            );
+            write_notify_chain_agent(&observer_catalog, "worker", Some("hetz.lead"), true);
             let entered = entered_rx.recv_timeout(Duration::from_secs(5)).is_ok();
             let root_after_reconcile = root_initial.as_deref().and_then(|prior| {
                 std::fs::write(&root_goal, "transition during steady reconcile\n").unwrap();
@@ -1479,8 +1458,7 @@ fn up_loop_keeps_complete_notify_chain_sets_during_steady_reconcile() {
 
             std::fs::write(&lead_goal, "lead transition during steady reconcile\n").unwrap();
             let lead_own = wait_for_resync_event_for_key(&lead_dir, "goal");
-            let worker_from_lead =
-                wait_for_resync_event_for_key(&worker_dir, "goal@hetz.lead");
+            let worker_from_lead = wait_for_resync_event_for_key(&worker_dir, "goal@hetz.lead");
 
             let _ = release_tx.send(());
             observer_stop.store(true, Ordering::SeqCst);
@@ -1511,7 +1489,10 @@ fn up_loop_keeps_complete_notify_chain_sets_during_steady_reconcile() {
         observer.join().unwrap()
     });
 
-    assert!(evidence.0, "the steady-state reconcile must reach its later task");
+    assert!(
+        evidence.0,
+        "the steady-state reconcile must reach its later task"
+    );
     assert!(evidence.1.is_some(), "root must receive its own transition");
     assert!(
         evidence.2.is_some() && evidence.3.is_some(),
@@ -1536,8 +1517,7 @@ fn assert_up_loop_full_refresh_keeps_a_retired_middle_as_live_child_topology() {
     ] {
         let catalog = tempfile::tempdir().unwrap();
         write_notify_chain_profile(catalog.path());
-        let (root_dir, root_goal) =
-            write_notify_chain_agent(catalog.path(), "root", None, false);
+        let (root_dir, root_goal) = write_notify_chain_agent(catalog.path(), "root", None, false);
         let (middle_dir, _middle_goal) = write_notify_chain_agent_with_state(
             catalog.path(),
             "middle",
@@ -1582,8 +1562,7 @@ fn assert_up_loop_full_refresh_keeps_a_retired_middle_as_live_child_topology() {
                 std::thread::sleep(Duration::from_millis(300));
                 std::fs::write(&root_goal, "root transition after full refresh\n").unwrap();
                 let root_event = wait_for_resync_event_for_key(&root_dir, "goal");
-                let child_event =
-                    wait_for_resync_event_for_key(&child_dir, "goal@hetz.root");
+                let child_event = wait_for_resync_event_for_key(&child_dir, "goal@hetz.root");
                 let middle_event = current_resync_event_for_key(&middle_dir, "goal@hetz.root");
                 observer_stop.store(true, Ordering::SeqCst);
                 (root_event, child_event, middle_event)
@@ -1669,18 +1648,20 @@ fn compile_invalid_seat_does_not_block_existing_live_resync_watch() {
     let mut debounce = LivenessDebounce::new(DEBOUNCE_GRACE);
     let mut presentation_cursor = PresentationPatchCursor::default();
 
-    let first = reconcile_pass(catalog.path(),
-    "hetz",
-    &task_context,
-    &runner,
-    &mut cap,
-    &mut debounce,
-    &mut presentation_cursor,
-    Some(&resync), None);
+    let first = reconcile_pass(
+        catalog.path(),
+        "hetz",
+        &task_context,
+        &runner,
+        &mut cap,
+        &mut debounce,
+        &mut presentation_cursor,
+        Some(&resync),
+        None,
+    );
     assert!(
         first.errors.iter().any(|error| {
-            error.contains("compile generated tasks")
-                && error.contains("non-PTY canonical task")
+            error.contains("compile generated tasks") && error.contains("non-PTY canonical task")
         }),
         "{first:#?}"
     );
@@ -1714,14 +1695,17 @@ fn compile_invalid_seat_does_not_block_existing_live_resync_watch() {
 }"#,
     )
     .unwrap();
-    let corrected = reconcile_pass(catalog.path(),
-    "hetz",
-    &task_context,
-    &runner,
-    &mut cap,
-    &mut debounce,
-    &mut presentation_cursor,
-    Some(&resync), None);
+    let corrected = reconcile_pass(
+        catalog.path(),
+        "hetz",
+        &task_context,
+        &runner,
+        &mut cap,
+        &mut debounce,
+        &mut presentation_cursor,
+        Some(&resync),
+        None,
+    );
     assert!(
         corrected
             .errors
@@ -1731,12 +1715,18 @@ fn compile_invalid_seat_does_not_block_existing_live_resync_watch() {
     );
     assert!(corrected.launched.is_empty(), "{corrected:#?}");
     assert!(
-        corrected.adopted.iter().any(|identity| identity == "broken"),
+        corrected
+            .adopted
+            .iter()
+            .any(|identity| identity == "broken"),
         "the corrected already-live seat should be adopted: {corrected:#?}"
     );
     let corrected_event = wait_for_resync_event_change(&live_dir, &first_event)
         .expect("correcting another declaration must not reseed and hide the live transition");
-    assert!(corrected_event.contains(r#""binding":"goal""#), "{corrected_event}");
+    assert!(
+        corrected_event.contains(r#""binding":"goal""#),
+        "{corrected_event}"
+    );
 }
 
 #[test]
@@ -1779,14 +1769,17 @@ fn materialization_failure_retains_only_the_observed_live_resync_watch() {
     let mut debounce = LivenessDebounce::new(DEBOUNCE_GRACE);
     let mut presentation_cursor = PresentationPatchCursor::default();
 
-    let failed = reconcile_pass(catalog.path(),
-    "hetz",
-    &task_context,
-    &runner,
-    &mut cap,
-    &mut debounce,
-    &mut presentation_cursor,
-    Some(&resync), None);
+    let failed = reconcile_pass(
+        catalog.path(),
+        "hetz",
+        &task_context,
+        &runner,
+        &mut cap,
+        &mut debounce,
+        &mut presentation_cursor,
+        Some(&resync),
+        None,
+    );
     assert!(
         failed
             .errors
@@ -1815,14 +1808,17 @@ fn materialization_failure_retains_only_the_observed_live_resync_watch() {
     std::fs::write(&live_goal, "changed immediately before recovery\n").unwrap();
     std::fs::create_dir_all(catalog.path().join("_templates")).unwrap();
     std::fs::write(catalog.path().join("_templates/live.md"), "rendered\n").unwrap();
-    let recovered = reconcile_pass(catalog.path(),
-    "hetz",
-    &task_context,
-    &runner,
-    &mut cap,
-    &mut debounce,
-    &mut presentation_cursor,
-    Some(&resync), None);
+    let recovered = reconcile_pass(
+        catalog.path(),
+        "hetz",
+        &task_context,
+        &runner,
+        &mut cap,
+        &mut debounce,
+        &mut presentation_cursor,
+        Some(&resync),
+        None,
+    );
     assert!(
         recovered
             .errors
@@ -1878,17 +1874,13 @@ fn execute_resync_plan(
 fn notify_chain_launch_boundary_installs_ancestors_before_a_later_task_finishes() {
     let catalog = tempfile::tempdir().unwrap();
     write_notify_chain_profile(catalog.path());
-    let (_root_dir, root_goal) =
-        write_notify_chain_agent(catalog.path(), "root", None, false);
+    let (_root_dir, root_goal) = write_notify_chain_agent(catalog.path(), "root", None, false);
     write_notify_chain_agent(catalog.path(), "lead", Some("hetz.root"), false);
     let (worker_dir, _worker_goal) =
         write_notify_chain_agent(catalog.path(), "worker", Some("hetz.lead"), false);
     crate::event::publish_owner_binding_for_test(catalog.path(), "hetz").unwrap();
     let specs = crate::discover_strict(catalog.path()).specs;
-    let worker = specs
-        .iter()
-        .find(|spec| spec.identity == "worker")
-        .unwrap();
+    let worker = specs.iter().find(|spec| spec.identity == "worker").unwrap();
     let mut later = target("hetz.worker.later", "later");
     later.name = "later".into();
     later.derived = true;
@@ -1919,16 +1911,12 @@ fn notify_chain_launch_boundary_installs_ancestors_before_a_later_task_finishes(
         let observer = scope.spawn(move || {
             entered_rx.recv().unwrap();
             std::fs::write(&root_goal, "changed while later task launches\n").unwrap();
-            let event =
-                wait_for_resync_event_for_key(&worker_dir, "goal@hetz.root");
+            let event = wait_for_resync_event_for_key(&worker_dir, "goal@hetz.root");
             release_tx.send(()).unwrap();
             event
         });
         let report = execute_resync_plan(&plan, &runner, &specs, &resync);
-        assert_eq!(
-            report.launched,
-            ["hetz.worker.agent", "hetz.worker.later"]
-        );
+        assert_eq!(report.launched, ["hetz.worker.agent", "hetz.worker.later"]);
         observer.join().unwrap()
     })
     .expect("the fresh worker must receive its ancestor transition before full refresh");
@@ -1979,10 +1967,7 @@ fn resync_launch_boundary_seeds_first_seat_before_later_seat_finishes() {
             release_tx.send(()).unwrap();
         });
         let report = execute_resync_plan(&plan, &runner, &specs, &resync);
-        assert_eq!(
-            report.launched,
-            ["hetz.first.agent", "hetz.second.agent"]
-        );
+        assert_eq!(report.launched, ["hetz.first.agent", "hetz.second.agent"]);
     });
 
     let event = wait_for_resync_event(&first_dir)
@@ -2068,14 +2053,17 @@ fn dead_resync_seat_is_deactivated_before_its_relaunch_blocks() {
     let mut debounce = LivenessDebounce::new(Duration::ZERO);
     let mut presentation_cursor = PresentationPatchCursor::default();
 
-    let seeded = reconcile_pass(catalog.path(),
-    "hetz",
-    &task_context,
-    &runner,
-    &mut cap,
-    &mut debounce,
-    &mut presentation_cursor,
-    Some(&resync), None);
+    let seeded = reconcile_pass(
+        catalog.path(),
+        "hetz",
+        &task_context,
+        &runner,
+        &mut cap,
+        &mut debounce,
+        &mut presentation_cursor,
+        Some(&resync),
+        None,
+    );
     assert!(seeded.adopted.iter().any(|identity| identity == "worker"));
     *runner.sessions.borrow_mut() = vec![sess("hetz.worker", false)];
     let blocked_goal = goal.clone();
@@ -2087,14 +2075,17 @@ fn dead_resync_seat_is_deactivated_before_its_relaunch_blocks() {
             std::thread::sleep(Duration::from_secs(1));
             release_tx.send(()).unwrap();
         });
-        reconcile_pass(catalog.path(),
-        "hetz",
-        &task_context,
-        &runner,
-        &mut cap,
-        &mut debounce,
-        &mut presentation_cursor,
-        Some(&resync), None)
+        reconcile_pass(
+            catalog.path(),
+            "hetz",
+            &task_context,
+            &runner,
+            &mut cap,
+            &mut debounce,
+            &mut presentation_cursor,
+            Some(&resync),
+            None,
+        )
     });
     assert_eq!(relaunched.restarted, ["hetz.worker"]);
     std::thread::sleep(Duration::from_millis(750));
@@ -2869,8 +2860,7 @@ fn input_write_obeys_the_child_deadline() {
         |pid| spawned = Some((pid, Instant::now())),
     )
     .unwrap_err();
-    let (pid, started) =
-        spawned.expect("the child was spawned before the input deadline expired");
+    let (pid, started) = spawned.expect("the child was spawned before the input deadline expired");
 
     assert!(
         format!("{error:#}").contains("timed out"),
@@ -3573,8 +3563,8 @@ fn unreadable_pty_root_evidence_is_indeterminate_not_absent() {
         ),
     )
     .unwrap();
-    let batch = PtyCli::new(catalog)
-        .task_observations_at_root(&HashSet::from(["h.worker"]), &loop_path);
+    let batch =
+        PtyCli::new(catalog).task_observations_at_root(&HashSet::from(["h.worker"]), &loop_path);
     assert!(!batch.complete);
     assert!(batch.observations.is_empty());
     assert!(
@@ -3614,11 +3604,7 @@ while [ ! -e "$0.release" ]; do sleep 0.01; done
         bin: fake.display().to_string(),
         catalog_root: tmp.path().join("catalog"),
         on_command_spawn: Some(std::sync::Arc::new(move |pid| {
-            release_ready_fixture(
-                pid,
-                &observed_fake,
-                "fake PTY inventory was not published",
-            );
+            release_ready_fixture(pid, &observed_fake, "fake PTY inventory was not published");
         })),
     }
     .task_observations_at_root(&HashSet::from(["h.worker"]), &root);
@@ -3720,11 +3706,7 @@ esac
         std::fs::read_to_string(invocations).unwrap(),
         "list --json\nstats --json\nlist --json\nstats --json\n"
     );
-    for (before, after) in unavailable
-        .observations
-        .iter()
-        .zip(&available.observations)
-    {
+    for (before, after) in unavailable.observations.iter().zip(&available.observations) {
         let (ObservedState::Running(before), ObservedState::Running(after)) =
             (&before.state, &after.state)
         else {
@@ -3783,11 +3765,7 @@ while [ ! -e "$0.release" ]; do sleep 0.01; done
         bin: fake.display().to_string(),
         catalog_root: catalog,
         on_command_spawn: Some(std::sync::Arc::new(move |pid| {
-            release_ready_fixture(
-                pid,
-                &observed_fake,
-                "fake PTY inventory was not published",
-            );
+            release_ready_fixture(pid, &observed_fake, "fake PTY inventory was not published");
         })),
     };
     let desired = HashSet::from(["h.live", "h.exit", "h.gone"]);
@@ -3860,11 +3838,7 @@ while [ ! -e "$0.release" ]; do sleep 0.01; done
         bin: fake.display().to_string(),
         catalog_root: catalog,
         on_command_spawn: Some(std::sync::Arc::new(move |pid| {
-            release_ready_fixture(
-                pid,
-                &observed_fake,
-                "fake PTY inventory was not published",
-            );
+            release_ready_fixture(pid, &observed_fake, "fake PTY inventory was not published");
         })),
     }
     .task_observations(&HashSet::from(["h.live"]));

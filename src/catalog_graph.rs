@@ -199,7 +199,11 @@ pub fn snapshot(root: &Path, this_host: &str) -> Result<CatalogGraph> {
             )
         })
         .collect::<Vec<_>>();
-    agents.sort_by(|left, right| left.id.cmp(&right.id).then(left.source.path.cmp(&right.source.path)));
+    agents.sort_by(|left, right| {
+        left.id
+            .cmp(&right.id)
+            .then(left.source.path.cmp(&right.source.path))
+    });
 
     let error_paths = report
         .issues
@@ -287,23 +291,23 @@ fn graph_agent(
 ) -> GraphAgent {
     let source_declaration = declarations.iter().find(|entry| entry.path == spec.path);
     let (path_identity, path_host) = path_defaults(root, &spec.path);
-    let raw = source_declaration.and_then(|entry| match_declared(&entry.agents, spec, path_identity.as_deref()));
+    let raw = source_declaration
+        .and_then(|entry| match_declared(&entry.agents, spec, path_identity.as_deref()));
     let id = spec.effective_id(this_host);
     // The runtime roster row is still keyed by the legacy bus identity — that field keeps its
     // meaning, so the join must not follow `id` onto an explicit catalog ID.
     let bus_id = spec.bus_id(this_host);
     let runtime = runtime_by_path
         .get_mut(&spec.path)
-        .and_then(|rows| rows.iter().position(|row| row.identity == bus_id).map(|index| rows.remove(index)))
+        .and_then(|rows| {
+            rows.iter()
+                .position(|row| row.identity == bus_id)
+                .map(|index| rows.remove(index))
+        })
         .map(|row| crate::agents::graph_runtime_value(&row))
         .unwrap_or(serde_json::Value::Null);
     let resolved_workspace = spec.workspace.as_deref().and_then(|workspace| {
-        crate::expand::resolve_spec_path(
-            workspace,
-            root,
-            spec.path.parent().unwrap_or(root),
-        )
-        .ok()
+        crate::expand::resolve_spec_path(workspace, root, spec.path.parent().unwrap_or(root)).ok()
     });
     let effective_session_driver = spec
         .effective_session_driver()
@@ -388,18 +392,6 @@ fn admitted_topology(
     {
         return None;
     }
-    let host = spec.resolved_host(this_host);
-    if specs
-        .iter()
-        .filter(|candidate| {
-            candidate.resolved_host(this_host) == host
-                && crate::supervisor_chain::is_counted_root(candidate)
-        })
-        .count()
-        != 1
-    {
-        return None;
-    }
     let chain = crate::supervisor_chain::chain(specs, spec, this_host).ok()?;
     let ancestor_ids = chain
         .iter()
@@ -430,10 +422,10 @@ fn match_declared<'a>(
         })
 }
 
-fn graph_declaration<'a>(
+fn graph_declaration(
     root: &Path,
     declaration: &DiscoveredDeclaration,
-    error_paths: &BTreeSet<&'a str>,
+    error_paths: &BTreeSet<&str>,
 ) -> GraphDeclaration {
     let path = relative(root, &declaration.path);
     let agents = declaration
@@ -455,7 +447,10 @@ fn graph_declaration<'a>(
                         .and_then(DeclaredValue::as_bool)
                         .unwrap_or(false);
                     PartialAgent {
-                        identity: agent.identity().and_then(DeclaredValue::as_str).map(str::to_owned),
+                        identity: agent
+                            .identity()
+                            .and_then(DeclaredValue::as_str)
+                            .map(str::to_owned),
                         host: declared_field(agent, "host"),
                         supervisor: declared_field(agent, "supervisor"),
                         persona: declared_field(agent, "role"),
@@ -549,5 +544,8 @@ fn duplicate_identity_conflicts(
 }
 
 fn relative(root: &Path, path: &Path) -> String {
-    path.strip_prefix(root).unwrap_or(path).display().to_string()
+    path.strip_prefix(root)
+        .unwrap_or(path)
+        .display()
+        .to_string()
 }

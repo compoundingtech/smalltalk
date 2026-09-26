@@ -1,0 +1,54 @@
+# Deployment summary mission
+
+Read `inventory.json` and produce `RESULT.md`.
+
+The result must contain this information:
+
+- The service count.
+- The total replica count.
+- The public service names in alphabetical order.
+- The owner names in alphabetical order without duplicates.
+
+Use exactly these four line labels. Replace each placeholder with the computed value.
+
+```text
+Services: COUNT
+Total replicas: COUNT
+Public services: NAMES
+Owners: NAMES
+```
+
+Do not add a heading, list markers, or other lines.
+
+Run `bash verify.sh` after you write the result. Correct the result until the verifier passes.
+
+Before you inspect `inventory.json` or write `RESULT.md`, publish the complete execution mission to st3.
+Publish one ready mission with ID `eval/mission-document-lift/work`.
+
+The KDL file must start with `version 2`. It must put the mission inside one untyped `subgraph` root.
+
+The published mission must contain these ordered steps:
+
+1. `inspect-inventory` reads and classifies the input.
+2. `write-result` depends on `inspect-inventory` and writes `RESULT.md`.
+3. `verify-result` depends on `write-result` and runs `bash verify.sh`.
+4. `publish-result` depends on `verify-result` and publishes the result resource.
+
+Give each step a clear title and goal. Keep the work in graph state instead of model memory.
+
+The final step must declare this graph product:
+
+```kdl
+produces {
+  resource "${ROOT_ST_MISSION_RUN}/mission-result" {
+    kind "document.result"
+    state "published"
+  }
+}
+```
+
+Its goal must tell the worker to run this exact command after the verifier passes:
+
+```sh
+st3 claim resource/${ROOT_ST_MISSION_RUN}/mission-result resource.binding --field kind=document.result --field state=published
+```

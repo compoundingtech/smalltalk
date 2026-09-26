@@ -882,6 +882,7 @@ pub struct ExternalInbox {
     root: PathBuf,
     identity: String,
     inbox: PathBuf,
+    sender: Option<String>,
 }
 
 impl ExternalInbox {
@@ -897,7 +898,22 @@ impl ExternalInbox {
             root: root.to_path_buf(),
             identity: identity.to_owned(),
             inbox: root.join(identity).join("inbox"),
+            sender: None,
         })
+    }
+
+    /// Add the exact canonical eval participant that can keep sending after its admitted
+    /// declaration changes. The eval runner owns this authority and injects it per task.
+    pub fn with_sender(mut self, sender: &str) -> anyhow::Result<Self> {
+        let mut components = Path::new(sender).components();
+        let safe = matches!(components.next(), Some(Component::Normal(component)) if component == sender)
+            && components.next().is_none();
+        anyhow::ensure!(
+            safe,
+            "external requester sender must be one non-empty relative path component"
+        );
+        self.sender = Some(sender.to_owned());
+        Ok(self)
     }
 
     pub fn provision(root: &Path, identity: &str) -> anyhow::Result<Self> {
@@ -1768,8 +1784,10 @@ pub fn send_to_resolved_inbox(
     let from = selector_reference(sender);
     let recipient = resolve_delivery_endpoint(catalog_root, recipient, this_host, external)?;
     let sender = optional_agent_handle(catalog_root, sender, this_host)?;
-    let external_sender =
-        external.is_some_and(|external| external.root == catalog_root && external.identity == from);
+    let external_sender = external.is_some_and(|external| {
+        external.root == catalog_root
+            && (external.identity == from || external.sender.as_deref() == Some(from))
+    });
     if matches!(&recipient, DeliveryEndpoint::External { .. }) || external_sender {
         anyhow::ensure!(
             idempotency_key.is_none(),
@@ -2155,7 +2173,10 @@ fn deliver_record(recipient: &DeliveryEndpoint, record: &SentRecord) -> anyhow::
         };
         if !same {
             crate::metrics::record_message_delivery(true);
-            anyhow::bail!("archived message differs from pending send {}", record.filename);
+            anyhow::bail!(
+                "archived message differs from pending send {}",
+                record.filename
+            );
         }
         crate::metrics::record_message_delivery(false);
         return Ok(());
@@ -2570,7 +2591,10 @@ mod tests {
     fn the_staging_prefix_is_the_one_the_inbox_walkers_skip() {
         assert_eq!(TMP_PREFIX, ".message");
         assert_eq!(TMP_STAGING_PREFIX, format!("{TMP_PREFIX}.tmp-"));
-        assert!(!is_message_filename(&tmp_name()), "a staged name must never look like a message");
+        assert!(
+            !is_message_filename(&tmp_name()),
+            "a staged name must never look like a message"
+        );
     }
 
     /// [`atomic_create_file`]'s create-once contract. It is a hardlink, not a rename, and that is
@@ -2602,7 +2626,10 @@ mod tests {
             .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
             .filter(|name| name.starts_with(TMP_STAGING_PREFIX))
             .collect::<Vec<_>>();
-        assert!(residue.is_empty(), "staging residue left behind: {residue:?}");
+        assert!(
+            residue.is_empty(),
+            "staging residue left behind: {residue:?}"
+        );
     }
 
     /// [`atomic_replace_file`]'s contract, pinned for the same fold: replacement is unconditional
@@ -2620,7 +2647,10 @@ mod tests {
             .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
             .filter(|name| name.starts_with(TMP_STAGING_PREFIX))
             .collect::<Vec<_>>();
-        assert!(residue.is_empty(), "staging residue left behind: {residue:?}");
+        assert!(
+            residue.is_empty(),
+            "staging residue left behind: {residue:?}"
+        );
     }
 
     #[test]
@@ -2863,9 +2893,7 @@ mod tests {
     fn transition_addressability_ignores_and_preserves_exact_legacy_staging_files() {
         let root = tempfile::tempdir().unwrap();
         addressable_catalog(root.path());
-        let legacy = root
-            .path()
-            .join("agents/host/.harness-context.tmp-123-456");
+        let legacy = root.path().join("agents/host/.harness-context.tmp-123-456");
         fs::write(&legacy, b"stale legacy staging bytes").unwrap();
         let transition = crate::catalog_transaction::CatalogTransition {
             original_agents: BTreeSet::new(),
@@ -2917,7 +2945,6 @@ mod tests {
         }
     }
 
-
     #[test]
     fn external_inbox_rejects_unsafe_or_nested_identities() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2932,6 +2959,13 @@ mod tests {
             assert!(
                 ExternalInbox::new(tmp.path(), identity).is_err(),
                 "accepted unsafe external identity {identity:?}"
+            );
+            assert!(
+                ExternalInbox::new(tmp.path(), "requester")
+                    .unwrap()
+                    .with_sender(identity)
+                    .is_err(),
+                "accepted unsafe external sender {identity:?}"
             );
         }
     }

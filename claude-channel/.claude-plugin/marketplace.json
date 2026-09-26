@@ -10,6 +10,11 @@
       "name": "st2-channel",
       "description": "Deliver st2 messages to a running Claude Code session",
       "source": "./plugins/st2-channel"
+    },
+    {
+      "name": "st3-channel",
+      "description": "Deliver st3 messages and work to a running Claude Code session",
+      "source": "./plugins/st3-channel"
     }
   ]
 }

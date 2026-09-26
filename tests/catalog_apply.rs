@@ -1278,7 +1278,11 @@ fn snapshot_ignores_and_preserves_an_exact_legacy_harness_context_staging_file()
     let second = snapshot(&catalog, &second_output);
 
     assert_eq!(second["rootSha256"], first["rootSha256"]);
-    assert!(!second_output.join("agents/host/.harness-context.tmp-123-456").exists());
+    assert!(
+        !second_output
+            .join("agents/host/.harness-context.tmp-123-456")
+            .exists()
+    );
     assert_eq!(
         fs::read(&legacy).unwrap(),
         b"stale legacy staging bytes",
@@ -1310,7 +1314,10 @@ fn harness_runtime_records_never_change_the_declaration_snapshot() {
     assert_eq!(first_runtime["rootSha256"], baseline["rootSha256"]);
     for name in runtime_names {
         assert!(
-            !first_runtime_output.join("agents/host/worker").join(name).exists(),
+            !first_runtime_output
+                .join("agents/host/worker")
+                .join(name)
+                .exists(),
             "{name} must not enter the declaration snapshot"
         );
         fs::write(agent.join(name), format!("changed {name}\n")).unwrap();
@@ -1325,14 +1332,10 @@ fn harness_runtime_records_never_change_the_declaration_snapshot() {
     let with_near_miss = snapshot(&catalog, &with_near_miss_output);
     assert_ne!(with_near_miss["rootSha256"], baseline["rootSha256"]);
     assert_eq!(
-        fs::read(
-            with_near_miss_output.join("agents/host/worker/harness-context.backup")
-        )
-        .unwrap(),
+        fs::read(with_near_miss_output.join("agents/host/worker/harness-context.backup")).unwrap(),
         b"declaration-owned bytes"
     );
 }
-
 
 #[test]
 fn snapshot_projects_relative_profile_modules_once_and_hashes_their_bytes() {
@@ -2081,7 +2084,11 @@ profile "dev.example.observe" {{
         fs::read_to_string(raw_capture_dir.join("catalog.kdl")).unwrap(),
         legacy_config
     );
-    assert!(!raw_capture_dir.join("agents/host/worker/.workspace").exists());
+    assert!(
+        !raw_capture_dir
+            .join("agents/host/worker/.workspace")
+            .exists()
+    );
 
     let desired = temp.path().join("desired-component");
     write_agent(&desired, "worker", false);
@@ -2209,8 +2216,7 @@ fn raw_preimage_accepts_valid_bytes_and_wrong_cas_preserves_declarations() {
         "{}",
         String::from_utf8_lossy(&stale_module_apply.stderr)
     );
-    let stale_module_apply: Value =
-        serde_json::from_slice(&stale_module_apply.stdout).unwrap();
+    let stale_module_apply: Value = serde_json::from_slice(&stale_module_apply.stdout).unwrap();
     assert_eq!(stale_module_apply["status"], "applied");
     assert_eq!(
         fs::read(valid.join("resolvers/observe.wasm")).unwrap(),
@@ -3630,8 +3636,28 @@ fn marker_time_state_routes_existing_orphans_but_never_flat_falls_back_for_new_a
             .next()
             .is_some()
     );
-    let ambiguous = send(&catalog, "remote.worker", "ambiguous");
-    assert!(!ambiguous.status.success());
+    let local_dotted = send(&catalog, "remote.worker", "local dotted address");
+    assert!(
+        local_dotted.status.success(),
+        "{}",
+        String::from_utf8_lossy(&local_dotted.stderr)
+    );
+    assert!(
+        agent_dir(&catalog, "remote.worker")
+            .join("resources/inbox")
+            .read_dir()
+            .unwrap()
+            .next()
+            .is_some()
+    );
+    assert!(
+        catalog
+            .join("agents/remote/worker/resources/inbox")
+            .read_dir()
+            .unwrap()
+            .next()
+            .is_none()
+    );
     let trapped = send(&catalog, "trap", "must not escape");
     assert!(!trapped.status.success());
     assert!(external.read_dir().unwrap().next().is_none());

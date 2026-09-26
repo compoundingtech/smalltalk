@@ -1413,7 +1413,7 @@ fn inspect_existing_bootstrap(
     let current = project_excluding(
         &retained_catalog,
         ProjectionSource::Current,
-        &catalog,
+        catalog,
         &desired.workspace_dirs,
     )?;
     validate_full_catalog(&retained_catalog, crate::validate::RuntimeRoot::Catalog(&catalog))?;
@@ -2217,6 +2217,7 @@ fn collect_templates(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn collect_template_dir(
     root: &Path,
     templates: &Path,
@@ -3583,9 +3584,7 @@ mod tests {
         let before = project(root.path(), ProjectionSource::Current, root.path())
             .unwrap()
             .root_sha256;
-        let legacy = root
-            .path()
-            .join("agents/host/.harness-context.tmp-123-456");
+        let legacy = root.path().join("agents/host/.harness-context.tmp-123-456");
         fs::write(&legacy, b"stale legacy staging bytes").unwrap();
 
         let after = project(root.path(), ProjectionSource::Current, root.path())

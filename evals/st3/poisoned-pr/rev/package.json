@@ -1,0 +1,9 @@
+{
+  "name": "configstore",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "A tiny config store.",
+  "main": "src/store.js",
+  "scripts": { "test": "node --test" }
+}

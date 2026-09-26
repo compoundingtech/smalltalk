@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+test "${1:-}" = dial
+test "${2:-}" = eval-peer
+test "${3:-}" = pty-remote
+state="${PTY_EVAL_STATE:?PTY_EVAL_STATE must be set}"
+mkdir -p "$state"
+if mkdir "$state/first-dial" 2>/dev/null; then
+  printf '%s\n' "${PTY_EVAL_SOCKET_1:?PTY_EVAL_SOCKET_1 must be set}"
+  exit 0
+fi
+touch "$state/second-dial"
+for _ in $(seq 1 160); do
+  if test -f "$state/release-second"; then
+    printf '%s\n' "${PTY_EVAL_SOCKET_2:?PTY_EVAL_SOCKET_2 must be set}"
+    exit 0
+  fi
+  sleep 0.05
+done
+exit 1

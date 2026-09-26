@@ -1,0 +1,52 @@
+version 2
+
+mission "fleet/app-web/1445-then-1468" state="ready" {
+  completion { when "all-steps-exhausted" }
+  goal "Run two nested jobs in a strict sequence without requiring a worker to claim their containers."
+
+  agent "worker" {
+    identity "worker"
+    workspace "."
+    harness "codex" { effort "high" }
+    restart "always"
+  }
+
+  queue "jobs" {
+    step "refresh-1445" {
+      goal "Refresh pull request 1445 before starting the later review job."
+      mission "refresh-1445" {
+        assigned-to "agent/${ST_MISSION_RUN}/worker"
+        goal "Merge main, report the result, and verify pull request 1445."
+        step "merge-main" {
+          goal "Merge main and resolve the pull request conflicts."
+          retry { attempts 2 }
+        }
+        step "tell-cos" {
+          goal "Report the completed refresh."
+          depends-on { step "merge-main" completed }
+        }
+        step "green" {
+          goal "Verify the refreshed branch is green."
+          depends-on { step "tell-cos" completed }
+        }
+      }
+    }
+
+    step "copilot-1468" {
+      goal "Address pull request 1468 only after the refresh job completes."
+      mission "copilot-1468" {
+        assigned-to "agent/${ST_MISSION_RUN}/worker"
+        goal "Address review findings, report the result, and verify pull request 1468."
+        step "answer" { goal "Address every valid review finding." }
+        step "tell-cos" {
+          goal "Report the completed review work."
+          depends-on { step "answer" completed }
+        }
+        step "green" {
+          goal "Verify the reviewed branch is green."
+          depends-on { step "tell-cos" completed }
+        }
+      }
+    }
+  }
+}

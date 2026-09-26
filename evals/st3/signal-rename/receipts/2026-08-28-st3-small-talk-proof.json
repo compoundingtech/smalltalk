@@ -1,0 +1,50 @@
+{
+  "schema": "st3-eval-proof.v1",
+  "date": "2026-08-28",
+  "eval": "signal-rename-codex",
+  "run_id": "b1f107cf457acbb718c2c88f48024970",
+  "candidate": {
+    "git_head": "d240d63eed14d8c097914f3b72d47a4b0a87e7f6",
+    "working_tree": "dirty",
+    "st3_version": "0.1.0",
+    "st3_binary_sha256": "88d4b525bb80a4b985f51f3f19b9a882a2a65ff0bc52e8ebda31966a12792e50",
+    "eval_kdl_sha256": "11e04794374b13244360632f3c5c0ba75d5005d172f9680fedfaadf682d5e640",
+    "task_document_sha256": "f12083c4ec4a7b2d6d9af20a5acdd89663a31532f4a3cee10c43fe283f61f1de"
+  },
+  "providers": {
+    "codex_cli": "0.150.0",
+    "pty": "0.12.0+500eab2"
+  },
+  "usage": {
+    "runtime_seconds": 851.42,
+    "agent_tokens": {
+      "base": 1415886,
+      "relay": 1151927,
+      "hub": 814662,
+      "supervisor": 1668819,
+      "total": 5051294
+    },
+    "llm_judge_tokens": 47469,
+    "total_model_tokens": 5098763,
+    "runtime_small_talk_messages": 7,
+    "final_small_talk_messages": 1,
+    "st2_baseline_total_model_tokens": 5020748,
+    "difference_from_st2_baseline_percent": 1.55
+  },
+  "result": {
+    "done": true,
+    "verdict": "pass",
+    "cleanup_complete": true,
+    "integrated_commit": "06778d8b066e91b95cd2ffb4d0b37e5a64a262c0",
+    "judges": [
+      "team completion",
+      "isolation",
+      "visible suite",
+      "complete rename",
+      "primitive preservation",
+      "held-out end-to-end",
+      "Codex sequence and integration review",
+      "final Small Talk report"
+    ]
+  }
+}

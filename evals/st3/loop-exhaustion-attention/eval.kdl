@@ -1,0 +1,33 @@
+version 2
+
+resource "eval/loop-exhaustion-attention/result" {
+  kind "custom.eval.loop-result"
+}
+
+mission "eval/loop-exhaustion-attention" state="ready" timeout="5m" {
+  completion { when "all-steps-exhausted" }
+  goal "Request human attention when a bounded loop cannot satisfy its exit gate."
+
+  loop "review" timeout="1m" {
+    max-rounds 2
+    until {
+      gate "the result is ready" {
+        field "state" "resource/eval/loop-exhaustion-attention/result" "is" "ready"
+      }
+    }
+    round {
+      completion { when "all-steps-exhausted" }
+      step "attempt" {
+        agentless
+        goal "Leave the result unready so the loop reaches its bound."
+      }
+    }
+    on-exhausted {
+      fail
+      attention "The bounded eval loop needs review" {
+        reviewer "person/nathan"
+        severity "error"
+      }
+    }
+  }
+}

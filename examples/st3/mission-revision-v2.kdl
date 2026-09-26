@@ -1,0 +1,36 @@
+version 2
+
+resource "example/revisable-change-output" { kind "filesystem.file" }
+
+mission "example/revisable-change" state="ready" revisions="human-only" revision-reviewer="person/operator" revision-cutover="when-idle" {
+  input "request" kind="text"
+  completion { when "all-steps-exhausted" }
+  goal "Implement one request and accept reviewed generation changes while work is idle."
+
+  step "implement" {
+    available-to "agent/example/repository-owner/standing/repository-owner"
+    goal "Implement this request with focused tests: ${input.request}"
+  }
+
+  step "summarize-index" {
+    available-to "agent/example/repository-owner/standing/repository-owner"
+    depends-on { step "implement" completed }
+    goal "Add a concise summary of the invented archive index and record focused evidence."
+  }
+
+  step "verify" {
+    available-to "agent/example/repository-owner/standing/repository-owner"
+    depends-on { step "summarize-index" completed }
+    goal "Verify the exact implementation and record evidence."
+  }
+
+  step "release" timeout="24h" {
+    agentless
+    depends-on { step "verify" completed }
+    gate "the operator releases the invented archive change" type="human" {
+      reviewer "person/operator"
+      question "Release this verified archive change?"
+      review "resource/example/revisable-change-output"
+    }
+  }
+}

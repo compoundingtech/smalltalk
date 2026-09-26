@@ -1,0 +1,14 @@
+{
+  "id": "cli-release-blockers",
+  "cases": [
+    {
+      "id": "agents-running-enrich", "argv": ["agents", "ls", "--status", "running", "--enrich"],
+      "input": [{ "id": "agent/a", "status": "running", "enriched": { "mission": "mission/demo" } }],
+      "observed_human_ids": ["agent/a"], "observed_json_ids": ["agent/a"], "expected_ids": ["agent/a"]
+    },
+    {
+      "id": "canonical-message-reply-id", "printed_id": "message/abc123", "accepted_input": "message/abc123",
+      "expected_printed_id": "message/abc123", "expected_accepted_input": "message/abc123"
+    }
+  ]
+}

@@ -1,0 +1,14 @@
+[Unit]
+Description=Continuous local st3 idle stability samples
+After=st3.service network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=%h/.config/st3/message-soak.env
+Environment=ST3_SOAK_HOST=hetz
+ExecStart=/usr/bin/bash %h/.local/bin/st3-idle-soak --local-only
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

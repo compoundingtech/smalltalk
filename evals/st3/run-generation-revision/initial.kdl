@@ -1,0 +1,17 @@
+version 2
+
+  mission "generation-proof" state="ready" revisions="human-only" {
+    completion { when "all-steps-exhausted" }
+    goal "Prove a live mission revision."
+
+    step "stable" {
+      goal "Record the stable result."
+      gate "the stable result exists" { field "state" "resource/generation-proof/${ST_MISSION_RUN}/stable" "is" "done" }
+    }
+
+    step "changed" {
+      goal "Use the first work definition."
+      depends-on { step "stable" completed }
+      gate "the changed result exists" { field "state" "resource/generation-proof/${ST_MISSION_RUN}/changed" "is" "done" }
+    }
+  }

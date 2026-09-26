@@ -31,7 +31,7 @@ pipeline as one more producer; it does not invent its own.
 - **O11Y-R02 No-op when unset:** Signals are emitted only when `OTEL_EXPORTER_OTLP_ENDPOINT` is
   set. When unset, telemetry is a zero-overhead no-op: no exporter threads, no network calls, no
   measurable cost on hot loops. Ambient configuration is honored automatically by exporter
-  resolution; st2 adds no proprietary configuration surface beyond standard `OTEL_*` variables.
+  resolution. No proprietary st2 configuration surface exists beyond standard `OTEL_*` variables.
 - **O11Y-R03 CI-proven:** The done-condition is proven in CI, not asserted. Integration tests run
   st2 against an `otelite` capture receiver and assert emitted spans/signals via its inspect
   mode. A build whose telemetry regresses to silence fails CI.

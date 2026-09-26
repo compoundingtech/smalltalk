@@ -60,7 +60,7 @@ to do with them.
 | Write only at turn boundaries | Rejected | 48.8% p95 error, 92% of warnings missed. The wedge scenario is a single long turn, which this policy is silent through. |
 | Name the driver records in the transport's include list, keeping them at the agent-directory root (q11) | Selected | The records matched none of the transport's globs and would silently never replicate, defeating the reason decision 0006 chose a catalog record at all. Naming them fixes the **already-shipped** `harness-state` too, with no migration of a live record, and keeps driver records out of a directory whose meaning is the Resource-binding realization surface. Cost: a cross-repository change, and an include list st2 does not own. |
 | Move the record under `resources/` to match the existing globs | Rejected | Fixes only the new record and leaves `harness-state` unreplicated; puts driver runtime state on the Resource-binding realization surface; and contorts a record's location to fit a glob written for other purposes. |
-| Chain the status-line tee to the operator's renderer (`DQ-C3`, captured) | Selected | Measured precedence is `.claude/settings.local.json` > `.claude/settings.json` > `~/.claude/settings.json`, and the winner *replaces* rather than merges — one slot, one command. Since st2 renders the winning file, not chaining would silently remove the operator's status line on every managed agent. |
+| Chain the status-line tee to the operator's renderer (`DQ-C3`, captured) | Selected | Measured precedence is `.claude/settings.local.json` > `.claude/settings.json` > `~/.claude/settings.json`, and the winner *replaces* rather than merges — one slot, one command. Since the st2 materializer writes the winning file, not chaining would silently remove the operator's status line on every managed agent. |
 | Doctor warns at a named st2 threshold, advisory-only (q10) | Selected | The record's whole purpose is that a human notices a filling window; a roster field nobody reads is not that. Advisory-only keeps it inside HC-A02 — Doctor already treats the categorical axis this way, and an exit-code failure would make an unfenced, advisory number gate a health check. |
 | Doctor threshold set to each harness's own compaction point | Rejected | It would make the warning a prediction st2 cannot make: the point depends on harness, model, and operator settings (Codex's baseline plus a separate auto-compact buffer, pi's `reserveTokens`, omp's idle threshold, Claude's overridable window), and it would silently change meaning on a harness bump. |
 | No Doctor output; roster only (the earlier `DQ-C4` position) | Rejected | Leaves the saturation signal to whoever thinks to read the roster, which is the invisibility this record exists to end. |
@@ -179,7 +179,7 @@ enumerates siblings by name, moves.
   `DQ-C11` closes with it.
 - st2 occupying Claude's status-line slot now carries a hard obligation rather
   than a courtesy: the slot is single-valued, the winner replaces rather than
-  merges, and st2 renders the winning file, so a tee that does not chain removes
+  merges, and the st2 materializer writes the winning file, so a tee that does not chain removes
   the operator's status line on every managed agent (HC-R18). The inverse also
   holds — a human-set renderer in that file is not preserved by st2's merge —
   so an operator's renderer belongs in their own settings.
@@ -203,7 +203,7 @@ enumerates siblings by name, moves.
 - `rateLimits` under an agent-scoped record repeats across every runtime sharing
   an account. tokenlens remains the quota authority and nothing here reconciles
   the two.
-- The Claude producer creates a cross-repo dependency: st2 rendering the
+- The Claude producer creates a cross-repo dependency: the st2 materializer owns the
   `statusLine` slot must not break the operator's own renderer, and the naming
   of that hand-off is unsettled (`DQ-C2`), as is the settings precedence the
   design assumes (`DQ-C3`).

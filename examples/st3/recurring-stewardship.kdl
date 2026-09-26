@@ -1,0 +1,36 @@
+version 2
+
+mission "example/stewardship-cycle" state="ready" {
+  input "owner" kind="text"
+  assigned-to "${input.owner}"
+  completion { when "all-steps-exhausted" }
+  goal "Measure the system, make one supported improvement, and record the result."
+
+  queue "cycle" {
+    step "measure" { goal "Measure the current system and record a baseline." }
+    step "select" { goal "Select one optimization that the measurement supports." }
+    step "ship" { goal "Implement, verify, and publish the selected optimization." }
+  }
+}
+
+mission "example/stewardship" state="ready" {
+  goal "Keep one steward available and start bounded recurring cycles."
+
+  agent "steward" {
+    workspace "."
+    harness "codex" { effort "high" }
+    restart "always"
+  }
+
+  schedule "cycle" {
+    host "local"
+    every "6h"
+    anchor "2026-01-01T00:00:00Z"
+    catch-up "latest"
+    work {
+      mission "example/stewardship-cycle@0000000000000000000000000000000000000000000000000000000000000000"
+      workspace ".st3/runs/stewardship"
+      input "owner" "agent/${ST_MISSION_RUN}/steward"
+    }
+  }
+}

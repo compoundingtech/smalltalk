@@ -1,0 +1,36 @@
+{
+  "api_version": "st3.client.v0",
+  "request_id": "request/events-1",
+  "snapshot": {
+    "id": "snapshot/host-a/1844/44cd", "host_id": "host/host-a", "store_index": 1844,
+    "projection_version": "client-projection.v0", "created_at": "2026-09-20T12:00:02Z"
+  },
+  "value": {
+    "kind": "event-page",
+    "oldest_cursor": "event-cursor/epoch-a/40",
+    "resume_cursor": "event-cursor/epoch-a/93",
+    "items": [
+      {
+        "id": "projection-event/epoch-a/91", "epoch": "epoch-a", "sequence": 91,
+        "previous_cursor": "event-cursor/epoch-a/91", "next_cursor": "event-cursor/epoch-a/92",
+        "timestamp": "2026-09-20T12:00:01Z", "type": "upsert", "resource_ids": ["work/release/1/build"],
+        "snapshot_id": "snapshot/host-a/1843/89ab", "body": { "collection": "work", "revision": "w5" }
+      },
+      {
+        "id": "projection-event/epoch-a/92", "epoch": "epoch-a", "sequence": 92,
+        "previous_cursor": "event-cursor/epoch-a/92", "next_cursor": "event-cursor/epoch-a/93",
+        "timestamp": "2026-09-20T12:00:02Z", "type": "timeline.delta", "resource_ids": ["session/release-agent/9"],
+        "snapshot_id": "snapshot/host-a/1844/44cd",
+        "body": {
+          "operation": "replace", "entry_id": "timeline-entry/release-agent/9/4", "revision": 2,
+          "entry": {
+            "id": "timeline-entry/release-agent/9/4", "sequence": 4, "revision": 2,
+            "timestamp": "2026-09-20T11:06:34Z", "role": "assistant", "type": "content", "final": true,
+            "body": { "media_type": "text/plain", "text": "I will inspect the build." }
+          }
+        }
+      }
+    ],
+    "has_more": false
+  }
+}

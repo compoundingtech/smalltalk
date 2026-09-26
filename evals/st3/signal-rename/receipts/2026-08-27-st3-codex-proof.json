@@ -1,0 +1,39 @@
+{
+  "schema": "st3-eval-proof.v1",
+  "date": "2026-08-27",
+  "eval": "signal-rename-codex",
+  "paid_attempt": 4,
+  "candidate": {
+    "git_head": "5e72de6ff155e23db184ad5630264d43015ed504",
+    "working_tree": "dirty",
+    "st3_version": "0.1.0",
+    "st3_binary_sha256": "8aba663563c5421674bdcee1be31ac4a68b3dacf491c3192ca597122b64892c8",
+    "eval_kdl_sha256": "6cda8ca150d385b4f434119e41cb03cd76d1365fd270732f17ec7d51665f06a2",
+    "task_document_sha256": "f12083c4ec4a7b2d6d9af20a5acdd89663a31532f4a3cee10c43fe283f61f1de"
+  },
+  "providers": {
+    "codex_cli": "0.150.0",
+    "pty": "0.12.0+face607"
+  },
+  "usage": {
+    "weekly_remaining_before_percent": 86,
+    "weekly_remaining_after_percent": 86,
+    "reset_redeemed": false
+  },
+  "result": {
+    "done": true,
+    "verdict": "pass",
+    "cleanup_complete": true,
+    "integrated_commit": "85efa5edd540ed4bd129917fe55ffc25615207d1",
+    "llm_judge_tokens": 52237,
+    "judges": [
+      "team completion",
+      "isolation",
+      "visible suite",
+      "complete rename",
+      "primitive preservation",
+      "held-out end-to-end",
+      "Codex sequence and integration review"
+    ]
+  }
+}

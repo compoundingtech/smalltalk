@@ -25,6 +25,8 @@ jobs:
           - group: package
             targets: >-
               .#checks.x86_64-linux.st2
+              .#checks.x86_64-linux.st3
+              .#checks.x86_64-linux.st3-help
               .#checks.x86_64-linux.debug-assertions
               .#checks.x86_64-linux.help
               .#checks.x86_64-linux.completions
@@ -70,4 +72,4 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: DeterminateSystems/determinate-nix-action@v3
-      - run: nix build .#st2 --no-link --print-build-logs
+      - run: nix build .#st2 .#st3 --no-link --print-build-logs

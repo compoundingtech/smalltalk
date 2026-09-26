@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+report="$(/usr/bin/dirname "$0")/st3-message-soak-report"
+base='2026-09-24T00:00:00Z monitor-started evidence_format=2
+2026-09-24T00:00:03Z ok direction=hetz-to-silber subject=message/a token=a latency_seconds=1 matching_replies=1
+2026-09-24T00:00:12Z ok direction=silber-to-hetz subject=message/b token=b latency_seconds=1 matching_replies=1'
+
+check() {
+  local expected=$1 evidence=$2 result status
+  if result=$(/usr/bin/printf '%s\n' "$evidence" | \
+    ST3_SOAK_REPORT_SKIP_RUNTIME_CHECKS=1 ST3_SOAK_REPORT_LOG=/dev/stdin \
+    ST3_SOAK_REPORT_NOW_UNIX=1790208020 ST3_SOAK_REPORT_MIN_DURATION_SECONDS=20 \
+    ST3_SOAK_REPORT_MAX_GAP_SECONDS=10 ST3_SOAK_REPORT_MIN_EACH_DIRECTION=1 \
+    "$report"); then status=0; else status=$?; fi
+  [[ $status == "$expected" ]] || { /usr/bin/printf 'unexpected report status %s: %s\n' "$status" "$result" >&2; exit 1; }
+}
+
+check 0 "$base"
+check 1 "${base/2026-09-24T00:00:12Z/2026-09-24T00:00:14Z}"
+check 1 "${base/2026-09-24T00:00:12Z/2026-09-24T00:00:12Z FAILED direction=silber-to-hetz stage=send token=x
+2026-09-24T00:00:12Z}"
+check 1 "${base/monitor-started evidence_format=2/monitor-started evidence_format=1}"
+check 1 "${base/silber-to-hetz/hetz-to-silber}"
+/usr/bin/printf 'st3 message soak report tests passed\n'

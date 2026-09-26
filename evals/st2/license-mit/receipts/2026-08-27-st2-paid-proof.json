@@ -1,0 +1,55 @@
+{
+  "schema": "st2-eval-proof.v1",
+  "date": "2026-08-27",
+  "eval": "license-mit",
+  "paid_attempt": 10,
+  "candidate": {
+    "git_head": "5e72de6ff155e23db184ad5630264d43015ed504",
+    "working_tree": "dirty",
+    "st2_version": "0.1.0",
+    "st2_binary_sha256_after_run": "ae9bfda5845f343e2b00d3182209e7f8502ebf925d935c2c4ca1fd6d8c86d3ff",
+    "eval_kdl_sha256": "4f63dfc71dcd211920fbcbcd9b5501efb083c4623cdbc6c49d376b954fdeeb79",
+    "task_document_sha256": "896b947000d50dd76e125b43104caa65c50c7bfb51179293742cd45f74a148fa"
+  },
+  "providers": {
+    "claude_code": "2.1.246",
+    "codex_cli": "0.145.0",
+    "pty": "0.12.0+face607"
+  },
+  "result": {
+    "done": true,
+    "worker_commit": "cdfc7a161765dad5cd07e34555c180ac9cb7aa76",
+    "judges": [
+      {
+        "name": "isolation — supervisor owns no repo; change stays on the license surface",
+        "passed": true,
+        "detail": "exit 0"
+      },
+      {
+        "name": "coordination — delegate->report->verified-confirm visible on the bus",
+        "passed": true,
+        "detail": "exit 0"
+      },
+      {
+        "name": "LICENSE is real MIT",
+        "passed": true,
+        "detail": "3 check(s) passed"
+      },
+      {
+        "name": "package.json declares MIT",
+        "passed": true,
+        "detail": "1 check(s) passed"
+      },
+      {
+        "name": "the change is committed + the worktree is clean",
+        "passed": true,
+        "detail": "exit 0"
+      },
+      {
+        "name": "confirmation is verified, not a rubber-stamp",
+        "passed": true,
+        "detail": "judge replied PASS"
+      }
+    ]
+  }
+}

@@ -1,0 +1,29 @@
+version 2
+
+mission "eval/queue-revision/work" state="ready" {
+  goal "Process one ordered investigation queue."
+  queue "investigations" {
+    agentless
+    step "one" { goal "Complete the first investigation." }
+    step "two" { goal "Complete the second investigation." }
+    step "three" { goal "Complete the third investigation." }
+  }
+}
+
+mission "eval/queue-revision" state="ready" timeout="20m" {
+  completion { when "all-steps-exhausted" }
+  goal "Preserve queue identity and apply normal generation rules after a reorder."
+
+  step "verify" timeout="2m" {
+    agentless
+    exec "queue-revision/controller" {
+      host "local"
+      workspace "${ST_WORKSPACE}"
+      command "bash ./controller.sh"
+      restart "never"
+    }
+    gate "the queue revision controller passed" {
+      field "exit_code" "exec/${ST_MISSION_RUN}/queue-revision/controller" is 0
+    }
+  }
+}

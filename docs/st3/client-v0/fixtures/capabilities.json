@@ -1,0 +1,31 @@
+{
+  "api_version": "st3.client.v0",
+  "request_id": "request/capabilities-1",
+  "snapshot": {
+    "id": "snapshot/host-a/1842/2fc9",
+    "host_id": "host/host-a",
+    "store_index": 1842,
+    "projection_version": "client-projection.v0",
+    "created_at": "2026-09-20T12:00:00Z"
+  },
+  "value": {
+    "kind": "capabilities",
+    "session_actor": "person/alex/session/device-7",
+    "transport": "fabric-loopback",
+    "capabilities": [
+      { "id": "read.projections", "version": 0, "state": "granted" },
+      { "id": "terminal.read", "version": 0, "state": "granted" },
+      { "id": "terminal.control", "version": 0, "state": "ungranted" },
+      { "id": "control.launches", "version": 0, "state": "ungranted" }
+    ],
+    "limits": {
+      "max_page_items": 200,
+      "max_event_items": 500,
+      "max_response_bytes": 1048576,
+      "max_wait_ms": 30000
+    },
+    "event_cursor": "event-cursor/epoch-a/91",
+    "oldest_event_cursor": "event-cursor/epoch-a/40",
+    "schemas": ["../schemas/client-v0.schema.json", "../schemas/operations.json"]
+  }
+}

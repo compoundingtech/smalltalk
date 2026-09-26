@@ -468,10 +468,11 @@ fn protocol_schema_gate_accepts_additive_items_and_server_requests() {
 }
 
 /// The classifier reads one word out of `Turn.error.codexErrorInfo` and depends on it being
-/// distinct from the quota words. A release that dropped or merged it must refuse the launch
-/// rather than let st2 report an exhausted allowance as a rejected credential.
+/// distinct from the stable quota word. A release that dropped or merged it must refuse the
+/// launch rather than let st2 report an exhausted allowance as a rejected credential. Codex
+/// 0.146 does not expose the later `rateLimitExceeded` word, so that word is optional.
 #[test]
-fn protocol_schema_gate_requires_the_distinct_credential_and_quota_error_words() {
+fn protocol_schema_gate_requires_distinct_credential_and_stable_quota_error_words() {
     let mut schemas = compatible_protocol_schemas();
     let words = schemas
         .protocol
@@ -486,6 +487,16 @@ fn protocol_schema_gate_requires_the_distinct_credential_and_quota_error_words()
         "{error:#}"
     );
 
+    let mut no_later_rate_limit_word = compatible_protocol_schemas();
+    no_later_rate_limit_word
+        .protocol
+        .pointer_mut("/definitions/CodexErrorInfo/oneOf/0/enum")
+        .unwrap()
+        .as_array_mut()
+        .unwrap()
+        .retain(|word| word.as_str() != Some("rateLimitExceeded"));
+    verify_codex_protocol_schemas(&no_later_rate_limit_word).unwrap();
+
     let mut merged = compatible_protocol_schemas();
     merged
         .protocol
@@ -493,10 +504,10 @@ fn protocol_schema_gate_requires_the_distinct_credential_and_quota_error_words()
         .unwrap()
         .as_array_mut()
         .unwrap()
-        .retain(|word| word.as_str() != Some("rateLimitExceeded"));
+        .retain(|word| word.as_str() != Some("usageLimitExceeded"));
     let error = verify_codex_protocol_schemas(&merged).unwrap_err();
     assert!(
-        format!("{error:#}").contains("CodexErrorInfo has no 'rateLimitExceeded' word"),
+        format!("{error:#}").contains("CodexErrorInfo has no 'usageLimitExceeded' word"),
         "{error:#}"
     );
 
@@ -967,6 +978,94 @@ fn one_compaction_is_counted_once_across_every_spelling_of_its_edge() {
     assert_eq!(context_record(&agent_dir).unwrap().compactions, 5);
 }
 
+#[test]
+fn rollout_fallback_counts_only_new_context_compaction_completions() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (agent_dir, mut producer) = context_producer(tmp.path());
+    let baseline = vec![json!({
+        "ordinal": 10,
+        "type": "event_msg",
+        "payload": {
+            "type": "task_complete",
+            "thread_id": "thread-main",
+            "turn_id": "turn-before"
+        }
+    })];
+    assert!(
+        !producer
+            .observe_transcript(&baseline, "thread-main")
+            .unwrap()
+    );
+    assert!(context_record(&agent_dir).is_none());
+
+    let completed = vec![
+        baseline[0].clone(),
+        json!({
+            "ordinal": 11,
+            "type": "event_msg",
+            "payload": {
+                "type": "item_completed",
+                "thread_id": "thread-main",
+                "turn_id": "turn-compact",
+                "item": { "id": "compact-1", "type": "ContextCompaction" }
+            }
+        }),
+    ];
+    assert!(
+        producer
+            .observe_transcript(&completed, "thread-main")
+            .unwrap()
+    );
+    let observed = context_record(&agent_dir).unwrap();
+    assert_eq!(observed.compactions, 1);
+    assert_eq!(
+        observed.last_compaction_trigger,
+        Some(harness_context::CompactionTrigger::Unknown)
+    );
+    assert!(
+        !producer
+            .observe_transcript(&completed, "thread-main")
+            .unwrap()
+    );
+
+    let foreign = vec![json!({
+        "ordinal": 12,
+        "type": "event_msg",
+        "payload": {
+            "type": "item_completed",
+            "thread_id": "thread-other",
+            "turn_id": "turn-foreign",
+            "item": { "id": "compact-2", "type": "ContextCompaction" }
+        }
+    })];
+    assert!(
+        !producer
+            .observe_transcript(&foreign, "thread-main")
+            .unwrap()
+    );
+    assert_eq!(context_record(&agent_dir).unwrap().compactions, 1);
+
+    let fresh_tmp = tempfile::tempdir().unwrap();
+    let (fresh_dir, mut fresh) = context_producer(fresh_tmp.path());
+    let first_live_snapshot = vec![json!({
+        "ordinal": 20,
+        "type": "event_msg",
+        "payload": {
+            "type": "item_completed",
+            "thread_id": "thread-main",
+            "turn_id": "turn-live",
+            "completed_at_ms": u64::MAX,
+            "item": { "id": "compact-live", "type": "ContextCompaction" }
+        }
+    })];
+    assert!(
+        fresh
+            .observe_transcript(&first_live_snapshot, "thread-main")
+            .unwrap()
+    );
+    assert_eq!(context_record(&fresh_dir).unwrap().compactions, 1);
+}
+
 /// The producer runs beside a live delivery loop and sees every frame that loop sees. Replaying
 /// the captured #263 session — 23 real inbound frames, none of them a token count — must leave
 /// no record at all: absence here is "never observed", and a producer that manufactured a
@@ -1016,8 +1115,10 @@ fn inbox_delivery(root: &Path, config: CodexDeliveryConfig) -> CodexInboxDeliver
         config,
         root.join("state").join(delivery_ledger::LEDGER_FILE),
         CodexRuntime::fresh("h.worker".into(), "h.worker".into()).unwrap(),
+        Arc::new(AtomicBool::new(false)),
     )
     .unwrap()
+    .without_snapshot_requirement()
 }
 
 /// Read the ledger back through its own loader and the real correlation derivation: a test
@@ -1268,8 +1369,7 @@ fn evidence_loss_marks_the_stream_discontinuous_for_a_restated_state() {
 
 #[test]
 fn delivery_client_id_is_stable_and_binds_every_identity_component() {
-    let id =
-        stable_client_user_message_id("h.worker", "thread-main", "1786380000000-abc123.md");
+    let id = stable_client_user_message_id("h.worker", "thread-main", "1786380000000-abc123.md");
     assert_eq!(
         id,
         stable_client_user_message_id("h.worker", "thread-main", "1786380000000-abc123.md")
@@ -1294,8 +1394,7 @@ fn review_compaction_and_dnd_hold_the_unread_fifo_head() {
     let tmp = tempfile::tempdir().unwrap();
     let config = delivery_config(tmp.path());
     let filename =
-        message::send_to_inbox(&config.inbox, "h.sender", Some("held"), None, &[], "body")
-            .unwrap();
+        message::send_to_inbox(&config.inbox, "h.sender", Some("held"), None, &[], "body").unwrap();
     let mut delivery = inbox_delivery(tmp.path(), config.clone());
     for reason in [CodexHoldReason::Review, CodexHoldReason::Compaction] {
         let state = subscribed_state(CodexObservedState::Held {
@@ -1376,12 +1475,12 @@ fn failed_turn_without_idle_allows_next_native_delivery_and_preserves_system_err
 }
 
 #[test]
-fn captured_usage_limit_boundary_allows_next_native_delivery() {
+fn captured_usage_limit_boundary_is_retryable_capacity_and_allows_next_native_delivery() {
     // This fixture is a payload-minimized projection of all 23 inbound frames from the
     // #263 trivial capture. It preserves their order and methods while removing fields this
     // observer never reads. The second capture has the same method sequence. The recorder
     // stops at turn completion, so this test pins the boundary state only. The provider
-    // source establishes that no later idle notification follows the system error.
+    // source establishes that no later idle notification follows the capacity error.
     let frames = include_str!("../../tests/fixtures/codex_usage_limit_inbound.jsonl")
         .lines()
         .map(|line| serde_json::from_str::<Value>(line).unwrap())
@@ -1416,21 +1515,21 @@ fn captured_usage_limit_boundary_allows_next_native_delivery() {
     assert_eq!(
         state.observed(),
         &CodexObservedState::TerminalError {
-            reason: CodexTerminalError::SystemError,
+            reason: CodexTerminalError::ProviderCapacity,
         }
     );
     let request = delivery
         .maybe_request(&state)
         .unwrap()
-        .expect("a captured terminal system error must permit the next native delivery");
+        .expect("a captured provider-capacity error must permit the next native delivery");
     assert_eq!(request["method"], "turn/start");
 }
 
 /// The credential class and the quota class arrive through the SAME frame sequence, differing
 /// only in one word of `Turn.error.codexErrorInfo`. This replays the auth-rejected shape and
 /// asserts the fork: `providerAuth` on the observed record, a native-driver diagnostic, and
-/// delivery still permitted — while the captured usage-limit fixture beside it keeps reading
-/// `systemError` with no diagnostic at all.
+/// delivery still permitted — while the captured usage-limit fixture beside it is retryable
+/// capacity rather than an authentication failure.
 #[test]
 fn a_rejected_codex_credential_reads_provider_auth_while_a_quota_failure_does_not() {
     let rejected = include_str!("../../tests/fixtures/codex_provider_auth_inbound.jsonl")
@@ -1512,7 +1611,7 @@ fn a_rejected_codex_credential_reads_provider_auth_while_a_quota_failure_does_no
         driver_diagnostic::Observed::Absent
     );
 
-    // The quota capture walks the same methods and must stay unclassified.
+    // The quota capture walks the same methods and must remain distinct from authentication.
     let quota_tmp = tempfile::tempdir().unwrap();
     let quota_config = delivery_config(quota_tmp.path());
     let quota_agent_dir = quota_config.agent_dir.clone();
@@ -1525,14 +1624,77 @@ fn a_rejected_codex_credential_reads_provider_auth_while_a_quota_failure_does_no
     assert_eq!(
         quota_state.observed(),
         &CodexObservedState::TerminalError {
-            reason: CodexTerminalError::SystemError,
+            reason: CodexTerminalError::ProviderCapacity,
         }
+    );
+    let quota_observation = quota_state.observed().harness_observation().unwrap();
+    assert_eq!(quota_observation.state, harness_state::Activity::Idle);
+    assert_eq!(
+        quota_observation.reason.as_deref(),
+        Some("providerCapacity")
     );
     assert_eq!(
         driver_diagnostic::read(&driver_diagnostic::path(&quota_agent_dir)),
         driver_diagnostic::Observed::Absent,
         "an exhausted allowance is not a rejected credential"
     );
+}
+
+#[test]
+fn selected_model_capacity_is_retryable_in_the_same_codex_session() {
+    let runtime = CodexRuntime::fresh("h.worker".into(), "h.worker".into()).unwrap();
+    let mut state = CodexControlState::new(&runtime, "thread-main".into());
+    state.subscribed = true;
+    state
+        .observe(&json!({
+            "method": "turn/started",
+            "params": { "threadId": "thread-main", "turn": { "id": "turn-1" } }
+        }))
+        .unwrap();
+    state
+        .observe(&json!({
+            "method": "turn/completed",
+            "params": {
+                "threadId": "thread-main",
+                "turn": {
+                    "id": "turn-1",
+                    "status": "failed",
+                    "error": {
+                        "message": "⚠ Selected model is at capacity. Please try a different model."
+                    }
+                }
+            }
+        }))
+        .unwrap();
+
+    assert_eq!(
+        state.observed(),
+        &CodexObservedState::TerminalError {
+            reason: CodexTerminalError::ProviderCapacity,
+        }
+    );
+    let observed = state.observed().harness_observation().unwrap();
+    assert_eq!(observed.state, harness_state::Activity::Idle);
+    assert_eq!(observed.reason.as_deref(), Some("providerCapacity"));
+
+    let tmp = tempfile::tempdir().unwrap();
+    let config = delivery_config(tmp.path());
+    message::send_to_inbox(
+        &config.inbox,
+        "daemon/runtime",
+        Some("capacity retry"),
+        None,
+        &[],
+        "resume",
+    )
+    .unwrap();
+    let mut delivery = inbox_delivery(tmp.path(), config);
+    let request = delivery
+        .maybe_request(&state)
+        .unwrap()
+        .expect("capacity backoff may resume the existing session");
+    assert_eq!(request["method"], "turn/start");
+    assert_eq!(request["params"]["threadId"], "thread-main");
 }
 
 #[test]
@@ -1605,12 +1767,14 @@ fn a_rejected_exact_steer_has_no_fallback_and_remains_retryable_after_state_chan
             )
             .unwrap()
     );
-    assert!(delivery
-        .accept_response(
-            &json!({ "id": request_id, "error": { "code": -32600, "message": "stale turn" } }),
-            active.observed(),
-        )
-        .unwrap());
+    assert!(
+        delivery
+            .accept_response(
+                &json!({ "id": request_id, "error": { "code": -32600, "message": "stale turn" } }),
+                active.observed(),
+            )
+            .unwrap()
+    );
     assert_eq!(delivery.maybe_request(&active).unwrap(), None);
     assert!(config.inbox.join(&filename).is_file());
 
@@ -1624,7 +1788,7 @@ fn a_rejected_exact_steer_has_no_fallback_and_remains_retryable_after_state_chan
 }
 
 #[test]
-fn a_success_response_is_only_an_attempt_and_does_not_archive_the_message() {
+fn a_success_response_persists_transport_and_exact_turn_without_archiving() {
     let tmp = tempfile::tempdir().unwrap();
     let config = delivery_config(tmp.path());
     let filename = message::send_to_inbox(
@@ -1657,8 +1821,346 @@ fn a_success_response_is_only_an_attempt_and_does_not_archive_the_message() {
         delivery_ledger::Phase::TransportAccepted,
         "a well-formed JSON result is transport, never typed acceptance"
     );
+    assert_eq!(
+        delivery
+            .ledger
+            .entry(&filename)
+            .unwrap()
+            .accepted_turn_id
+            .as_deref(),
+        Some("turn-new")
+    );
     assert_eq!(delivery.maybe_request(&idle).unwrap(), None);
     assert!(config.inbox.join(&filename).is_file());
+}
+
+#[test]
+fn a_consumed_unarchived_head_releases_the_next_fifo_message_exactly_once() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = delivery_config(tmp.path());
+    let first = message::send_to_inbox(
+        &config.inbox,
+        "h.sender",
+        Some("long-running directive"),
+        None,
+        &[],
+        "first",
+    )
+    .unwrap();
+    let mut delivery = inbox_delivery(tmp.path(), config.clone());
+    let mut state = CodexControlState::new(&delivery.runtime, "thread-main".into());
+    state.subscribed = true;
+    state.observed = CodexObservedState::Idle;
+    let request = delivery.maybe_request(&state).unwrap().unwrap();
+    let first_client_id = request["params"]["clientUserMessageId"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    delivery
+        .accept_response(
+            &json!({ "id": request["id"], "result": { "turn": { "id": "turn-first" } } }),
+            state.observed(),
+        )
+        .unwrap();
+    delivery
+        .accept_typed_receipt(
+            &json!({
+                "method": "item/completed",
+                "params": {
+                    "threadId": "thread-main",
+                    "turnId": "turn-first",
+                    "item": { "type": "userMessage", "clientId": first_client_id }
+                }
+            }),
+            &state,
+        )
+        .unwrap();
+    assert!(config.inbox.join(&first).is_file());
+    assert_eq!(
+        delivery.ledger.entry(&first).unwrap().phase,
+        delivery_ledger::Phase::Consumed
+    );
+
+    let second = message::send_to_inbox(
+        &config.inbox,
+        "h.sender",
+        Some("later message"),
+        None,
+        &[],
+        "second",
+    )
+    .unwrap();
+    delivery.next_inbox_refresh = Instant::now();
+    let next = delivery
+        .maybe_request(&state)
+        .unwrap()
+        .expect("the consumed unarchived head must not hold the later message");
+    assert_eq!(
+        next["params"]["clientUserMessageId"],
+        stable_client_user_message_id("h.worker", "thread-main", &second)
+    );
+    assert_eq!(delivery.maybe_request(&state).unwrap(), None);
+    assert!(config.inbox.join(&first).is_file());
+    assert!(delivery.ledger.entry(&first).is_some());
+    assert_eq!(delivery.ledger.entries().len(), 2);
+}
+
+#[test]
+fn a_working_turn_reconciles_a_missed_steer_receipt_and_delivers_the_next_ping() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = delivery_config(tmp.path());
+    let first = message::send_to_inbox(
+        &config.inbox,
+        "h.sender",
+        Some("first ping"),
+        None,
+        &[],
+        "first",
+    )
+    .unwrap();
+    let mut delivery = inbox_delivery(tmp.path(), config.clone());
+    let state = subscribed_state(CodexObservedState::Active {
+        turn_id: "turn-live".into(),
+    });
+    let steer = delivery.maybe_request(&state).unwrap().unwrap();
+    assert_eq!(steer["method"], "turn/steer");
+    let client_id = steer["params"]["clientUserMessageId"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    delivery
+        .accept_response(
+            &json!({"id": steer["id"], "result": {"turnId": "turn-live"}}),
+            state.observed(),
+        )
+        .unwrap();
+    assert_eq!(
+        delivery.ledger.entry(&first).unwrap().phase,
+        delivery_ledger::Phase::TransportAccepted
+    );
+    let second = message::send_to_inbox(
+        &config.inbox,
+        "h.sender",
+        Some("second ping"),
+        None,
+        &[],
+        "second",
+    )
+    .unwrap();
+
+    assert!(delivery.maybe_snapshot_request(&state).unwrap().is_none());
+    delivery
+        .accept_transcript_receipts(
+            &[json!({
+                "type": "event_msg",
+                "payload": {"type": "item_completed", "thread_id": "thread-main",
+                    "item": {"type": "UserMessage", "client_id": client_id}}
+            })],
+            "thread-main",
+        )
+        .unwrap();
+    assert_eq!(
+        delivery.ledger.entry(&first).unwrap().phase,
+        delivery_ledger::Phase::Consumed
+    );
+    assert_eq!(
+        state.observed(),
+        &CodexObservedState::Active {
+            turn_id: "turn-live".into()
+        }
+    );
+    let next = delivery
+        .maybe_request(&state)
+        .unwrap()
+        .expect("next PING must reach the still-running turn");
+    assert_eq!(next["method"], "turn/steer");
+    assert_eq!(
+        next["params"]["clientUserMessageId"],
+        stable_client_user_message_id("h.worker", "thread-main", &second)
+    );
+}
+
+#[test]
+fn a_delivery_on_a_history_larger_than_the_control_limit_uses_bounded_reads() {
+    let mut request_lengths = Vec::new();
+    let mut transcript_bytes_read = Vec::new();
+    for history_bytes in [
+        0,
+        CODEX_CONTROL_MAX_MESSAGE_BYTES as u64 + 1024,
+        2 * CODEX_CONTROL_MAX_MESSAGE_BYTES as u64 + 1024,
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = delivery_config(tmp.path());
+        let filename =
+            message::send_to_inbox(&config.inbox, "h.sender", None, None, &[], "ping").unwrap();
+        let mut delivery = inbox_delivery(tmp.path(), config);
+        let mut state = subscribed_state(CodexObservedState::Active {
+            turn_id: "turn-live".into(),
+        });
+        let snapshot = delivery.maybe_snapshot_request(&state).unwrap().unwrap();
+        assert_eq!(snapshot["params"]["includeTurns"], false);
+        request_lengths.push(serde_json::to_vec(&snapshot).unwrap().len());
+        delivery
+            .accept_snapshot_response(
+                &json!({"id": snapshot["id"], "result": {"thread": {
+                    "id": "thread-main", "status": {"type": "active"}, "turns": []
+                }}}),
+                &mut state,
+            )
+            .unwrap();
+        let request = delivery.maybe_request(&state).unwrap().unwrap();
+        let client_id = request["params"]["clientUserMessageId"].as_str().unwrap();
+        delivery
+            .accept_response(
+                &json!({"id": request["id"], "result": {"turnId": "turn-live"}}),
+                state.observed(),
+            )
+            .unwrap();
+        assert!(delivery.maybe_snapshot_request(&state).unwrap().is_none());
+
+        let transcript = tmp.path().join("rollout.jsonl");
+        let mut file = File::create(&transcript).unwrap();
+        file.set_len(history_bytes).unwrap();
+        file.seek(SeekFrom::End(0)).unwrap();
+        writeln!(file).unwrap();
+        writeln!(
+            file,
+            "{}",
+            json!({"type": "event_msg", "payload": {
+                "type": "item_completed", "thread_id": "thread-main",
+                "item": {"type": "UserMessage", "client_id": client_id}
+            }})
+        )
+        .unwrap();
+        let (frames, bytes_read) = codex_transcript_tail_with_bytes(&transcript).unwrap();
+        transcript_bytes_read.push(bytes_read);
+        delivery
+            .accept_transcript_receipts(&frames, "thread-main")
+            .unwrap();
+        assert_eq!(
+            delivery.ledger.entry(&filename).unwrap().phase,
+            delivery_ledger::Phase::Consumed
+        );
+        assert!(file.metadata().unwrap().len() > history_bytes);
+    }
+    assert_eq!(request_lengths[0], request_lengths[1]);
+    assert_eq!(request_lengths[1], request_lengths[2]);
+    assert_eq!(transcript_bytes_read[1], TRANSCRIPT_TURN_RECOVERY_BYTES);
+    assert_eq!(transcript_bytes_read[1], transcript_bytes_read[2]);
+}
+
+#[test]
+fn a_transcript_user_message_receipt_is_exact_and_idempotent() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = delivery_config(tmp.path());
+    let filename =
+        message::send_to_inbox(&config.inbox, "h.sender", None, None, &[], "ping").unwrap();
+    let mut delivery = inbox_delivery(tmp.path(), config);
+    let state = subscribed_state(CodexObservedState::Active {
+        turn_id: "turn-live".into(),
+    });
+    let steer = delivery.maybe_request(&state).unwrap().unwrap();
+    let client_id = steer["params"]["clientUserMessageId"].as_str().unwrap();
+    delivery
+        .accept_response(
+            &json!({"id": steer["id"], "result": {"turnId": "turn-live"}}),
+            state.observed(),
+        )
+        .unwrap();
+    let receipt = json!({"type": "event_msg", "payload": {"type": "item_completed", "thread_id": "thread-main", "turn_id": "turn-live", "item": {"type": "UserMessage", "client_id": client_id}}});
+    delivery
+        .accept_transcript_receipts(&[receipt.clone()], "other-thread")
+        .unwrap();
+    assert_eq!(
+        delivery.ledger.entry(&filename).unwrap().phase,
+        delivery_ledger::Phase::TransportAccepted
+    );
+    delivery
+        .accept_transcript_receipts(&[receipt.clone(), receipt], "thread-main")
+        .unwrap();
+    assert_eq!(
+        delivery.ledger.entry(&filename).unwrap().phase,
+        delivery_ledger::Phase::Consumed
+    );
+}
+
+#[test]
+fn a_successful_exact_turn_completion_settles_when_codex_omits_the_item_receipt() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = delivery_config(tmp.path());
+    let first = message::send_to_inbox(
+        &config.inbox,
+        "h.sender",
+        Some("Codex 0.146 sequence"),
+        None,
+        &[],
+        "first",
+    )
+    .unwrap();
+    let mut delivery = inbox_delivery(tmp.path(), config.clone());
+    let mut state = CodexControlState::new(&delivery.runtime, "thread-main".into());
+    state.subscribed = true;
+    state.observed = CodexObservedState::Idle;
+    let request = delivery.maybe_request(&state).unwrap().unwrap();
+    delivery
+        .accept_response(
+            &json!({ "id": request["id"], "result": { "turn": { "id": "turn-first" } } }),
+            state.observed(),
+        )
+        .unwrap();
+    assert!(
+        !delivery
+            .accept_turn_completion_receipt(
+                &json!({
+                    "method": "turn/completed",
+                    "params": {
+                        "threadId": "thread-main",
+                        "turn": { "id": "turn-other", "status": "completed", "items": [] }
+                    }
+                }),
+                &state,
+            )
+            .unwrap()
+    );
+    assert_eq!(
+        delivery.ledger.entry(&first).unwrap().phase,
+        delivery_ledger::Phase::TransportAccepted
+    );
+    assert!(
+        delivery
+            .accept_turn_completion_receipt(
+                &json!({
+                    "method": "turn/completed",
+                    "params": {
+                        "threadId": "thread-main",
+                        "turn": { "id": "turn-first", "status": "completed", "items": [] }
+                    }
+                }),
+                &state,
+            )
+            .unwrap()
+    );
+    assert_eq!(
+        delivery.ledger.entry(&first).unwrap().phase,
+        delivery_ledger::Phase::Consumed
+    );
+
+    let second = message::send_to_inbox(
+        &config.inbox,
+        "h.sender",
+        Some("after successful turn"),
+        None,
+        &[],
+        "second",
+    )
+    .unwrap();
+    delivery.next_inbox_refresh = Instant::now();
+    let next = delivery.maybe_request(&state).unwrap().unwrap();
+    assert_eq!(
+        next["params"]["clientUserMessageId"],
+        stable_client_user_message_id("h.worker", "thread-main", &second)
+    );
+    assert!(config.inbox.join(&first).is_file());
 }
 
 #[test]
@@ -1828,11 +2330,11 @@ fn an_ambiguous_attempt_reconciles_resume_history_before_retry() {
     )
     .unwrap();
     let mut attempted = inbox_delivery(absent_tmp.path(), absent_config.clone());
-    let absent_client_id = attempted.maybe_request(&idle).unwrap().unwrap()
-        ["params"]["clientUserMessageId"]
-        .as_str()
-        .unwrap()
-        .to_string();
+    let absent_client_id =
+        attempted.maybe_request(&idle).unwrap().unwrap()["params"]["clientUserMessageId"]
+            .as_str()
+            .unwrap()
+            .to_string();
     drop(attempted);
 
     let mut replacement = inbox_delivery(absent_tmp.path(), absent_config);
@@ -1851,18 +2353,13 @@ fn an_ambiguous_attempt_reconciles_resume_history_before_retry() {
         )
         .unwrap();
     assert_eq!(
-        replacement
-            .ledger
-            .entry(&absent_filename)
-            .unwrap()
-            .negative,
+        replacement.ledger.entry(&absent_filename).unwrap().negative,
         Some(delivery_ledger::NegativeReceipt::Absent),
         "the absence is retained as evidence, not erased"
     );
     let retry = replacement.maybe_request(&idle).unwrap().unwrap();
     assert_eq!(retry["params"]["clientUserMessageId"], absent_client_id);
 }
-
 
 #[test]
 fn subscribed_control_pump_delivers_a_typed_reference_to_the_real_fifo_head() {
@@ -1904,8 +2401,27 @@ fn subscribed_control_pump_delivers_a_typed_reference_to_the_real_fifo_head() {
             }),
         )
         .unwrap();
+        let snapshot = read_json_message(&mut websocket).unwrap().unwrap();
+        assert_eq!(snapshot["id"], FIRST_DELIVERY_REQUEST_ID);
+        assert_eq!(snapshot["method"], "thread/read");
+        assert_eq!(snapshot["params"]["threadId"], "thread-main");
+        assert_eq!(snapshot["params"]["includeTurns"], false);
+        write_json_message(
+            &mut websocket,
+            &json!({
+                "id": FIRST_DELIVERY_REQUEST_ID,
+                "result": {
+                    "thread": {
+                        "id": "thread-main",
+                        "status": { "type": "idle" },
+                        "turns": []
+                    }
+                }
+            }),
+        )
+        .unwrap();
         let delivery = read_json_message(&mut websocket).unwrap().unwrap();
-        assert_eq!(delivery["id"], FIRST_DELIVERY_REQUEST_ID);
+        assert_eq!(delivery["id"], FIRST_DELIVERY_REQUEST_ID + 1);
         assert_eq!(delivery["method"], "turn/start");
         assert_eq!(delivery["params"]["threadId"], "thread-main");
         let head_id = server_filename
@@ -1931,7 +2447,7 @@ fn subscribed_control_pump_delivers_a_typed_reference_to_the_real_fifo_head() {
         write_json_message(
             &mut websocket,
             &json!({
-                "id": FIRST_DELIVERY_REQUEST_ID,
+                "id": FIRST_DELIVERY_REQUEST_ID + 1,
                 "result": { "turn": { "id": "turn-delivery" } }
             }),
         )
@@ -1975,6 +2491,7 @@ fn subscribed_control_pump_delivers_a_typed_reference_to_the_real_fifo_head() {
             &runtime_for_pump,
             None,
             Some(config),
+            Arc::new(AtomicBool::new(false)),
             tx,
         )
     });
@@ -2036,8 +2553,7 @@ fn the_control_pump_publishes_a_context_reading_from_a_live_token_usage_notifica
         // pump's read of the frame just written. Bounded, so a pump that stopped handing
         // frames to the producer fails this test instead of hanging it.
         let deadline = Instant::now() + Duration::from_secs(10);
-        while harness_context::read(&harness_context::harness_context_path(&agent_dir))
-            .is_none()
+        while harness_context::read(&harness_context::harness_context_path(&agent_dir)).is_none()
             && Instant::now() < deadline
         {
             std::thread::sleep(Duration::from_millis(10));
@@ -2063,6 +2579,7 @@ fn the_control_pump_publishes_a_context_reading_from_a_live_token_usage_notifica
             &runtime,
             None,
             Some(config),
+            Arc::new(AtomicBool::new(false)),
             tx,
         )
     });
@@ -2074,14 +2591,13 @@ fn the_control_pump_publishes_a_context_reading_from_a_live_token_usage_notifica
     let _ = shutdown.shutdown(Shutdown::Both);
     pump.join().unwrap();
 
-    let observed = context_record(&tmp.path().join("agents/h/worker"))
-        .expect("the pump published nothing");
+    let observed =
+        context_record(&tmp.path().join("agents/h/worker")).expect("the pump published nothing");
     assert_eq!(observed.harness, harness_context::Harness::Codex);
     assert_eq!(observed.used_tokens, Some(92_283));
     assert_eq!(observed.window_tokens, Some(258_400));
     assert_eq!(observed.used_percent, Some(33.0));
 }
-
 
 #[test]
 fn control_initializes_before_recording_the_first_thread_only() {
@@ -2168,6 +2684,7 @@ fn control_initializes_before_recording_the_first_thread_only() {
             &runtime_for_pump,
             None,
             None,
+            Arc::new(AtomicBool::new(false)),
             tx,
         )
     });
@@ -2184,10 +2701,9 @@ fn control_initializes_before_recording_the_first_thread_only() {
         .unwrap()
         .unwrap();
     assert_eq!(binding.thread_id(), "thread-main");
-    let state =
-        load_current_control_state(&state.join("control-state.json"), &runtime, &binding)
-            .unwrap()
-            .unwrap();
+    let state = load_current_control_state(&state.join("control-state.json"), &runtime, &binding)
+        .unwrap()
+        .unwrap();
     assert_eq!(
         state.observed(),
         &CodexObservedState::Active {
@@ -2273,12 +2789,16 @@ fn expected_resume_waits_for_tui_loaded_thread_and_binds_from_control_response()
         let subscribe = read_json_message(&mut websocket).unwrap().unwrap();
         assert_eq!(subscribe["method"], "thread/resume");
         assert_eq!(subscribe["params"]["threadId"], "thread-prior");
+        assert_eq!(subscribe["params"]["approvalPolicy"], "never");
+        assert_eq!(subscribe["params"]["sandbox"], "danger-full-access");
         write_json_message(
             &mut websocket,
             &json!({
                 "id": CONTROL_SUBSCRIBE_REQUEST_ID,
                 "result": {
-                    "thread": { "id": "thread-prior", "status": { "type": "idle" } }
+                    "thread": { "id": "thread-prior", "status": { "type": "idle" } },
+                    "approvalPolicy": "never",
+                    "sandbox": { "type": "dangerFullAccess" }
                 }
             }),
         )
@@ -2308,8 +2828,16 @@ fn expected_resume_waits_for_tui_loaded_thread_and_binds_from_control_response()
                 thread_id: "thread-prior",
                 ready: resume_ready_rx,
                 tui_loaded_timeout: TUI_LOADED_TIMEOUT,
+                permission_overrides: Some(ResumePermissionOverrides {
+                    approval_policy: Some("never".into()),
+                    approvals_reviewer: None,
+                    sandbox: Some("danger-full-access".into()),
+                }),
+                preload: false,
+                preloaded: None,
             }),
             None,
+            Arc::new(AtomicBool::new(false)),
             tx,
         )
     });
@@ -2318,6 +2846,14 @@ fn expected_resume_waits_for_tui_loaded_thread_and_binds_from_control_response()
         .unwrap();
     resume_ready_tx.send(()).unwrap();
     acknowledge_tui_thread_loaded(&rx);
+    assert!(matches!(
+        rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+        ControlEvent::ResumePermissionPolicyApplied(ResumePermissionOverrides {
+            approval_policy: Some(policy),
+            approvals_reviewer: None,
+            sandbox: Some(sandbox),
+        }) if policy == "never" && sandbox == "danger-full-access"
+    ));
     assert!(matches!(
         rx.recv_timeout(Duration::from_secs(2)).unwrap(),
         ControlEvent::Bound
@@ -2335,6 +2871,227 @@ fn expected_resume_waits_for_tui_loaded_thread_and_binds_from_control_response()
         .unwrap();
     assert!(state.subscribed());
     assert_eq!(state.observed(), &CodexObservedState::Idle);
+}
+
+#[test]
+fn declared_resume_policy_preloads_before_the_tui_can_load_read_only() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _stop_exclusive = stop_flag_tests();
+    let socket = tmp.path().join("server.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let server = thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let mut websocket = tungstenite::accept(stream).unwrap();
+        assert_eq!(
+            read_json_message(&mut websocket).unwrap().unwrap()["method"],
+            "initialize"
+        );
+        write_json_message(
+            &mut websocket,
+            &json!({ "id": 0, "result": { "userAgent": "fake" } }),
+        )
+        .unwrap();
+        assert_eq!(
+            read_json_message(&mut websocket).unwrap().unwrap()["method"],
+            "initialized"
+        );
+        let request = read_json_message(&mut websocket).unwrap().unwrap();
+        assert_eq!(request["method"], "thread/resume");
+        assert_eq!(request["params"]["threadId"], "thread-prior");
+        assert_eq!(request["params"]["approvalPolicy"], "never");
+        assert_eq!(request["params"]["sandbox"], "danger-full-access");
+        write_json_message(
+            &mut websocket,
+            &json!({
+                "id": CONTROL_SUBSCRIBE_REQUEST_ID,
+                "result": {
+                    "thread": { "id": "thread-prior", "status": { "type": "idle" } },
+                    "approvalPolicy": "never",
+                    "sandbox": { "type": "dangerFullAccess" }
+                }
+            }),
+        )
+        .unwrap();
+    });
+
+    let stream = UnixStream::connect(&socket).unwrap();
+    let shutdown = stream.try_clone().unwrap();
+    let websocket = initialize_control(stream)
+        .unwrap()
+        .expect("no stop raised in tests");
+    let binding_path = tmp.path().join("state/binding.json");
+    let control_state_path = tmp.path().join("state/control-state.json");
+    let runtime = CodexRuntime::fresh("h.worker".into(), "h.worker".into()).unwrap();
+    let (events_tx, events_rx) = mpsc::channel();
+    let (ready_tx, ready_rx) = mpsc::channel();
+    let (preloaded_tx, preloaded_rx) = mpsc::channel();
+    let pump = thread::spawn(move || {
+        pump_control(
+            websocket,
+            &binding_path,
+            &control_state_path,
+            &runtime,
+            Some(ControlResume {
+                thread_id: "thread-prior",
+                ready: ready_rx,
+                tui_loaded_timeout: TUI_LOADED_TIMEOUT,
+                permission_overrides: Some(ResumePermissionOverrides {
+                    approval_policy: Some("never".into()),
+                    approvals_reviewer: None,
+                    sandbox: Some("danger-full-access".into()),
+                }),
+                preload: true,
+                preloaded: Some(preloaded_tx),
+            }),
+            None,
+            Arc::new(AtomicBool::new(false)),
+            events_tx,
+        )
+    });
+    ready_tx.send(()).unwrap();
+    preloaded_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert!(matches!(
+        events_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+        ControlEvent::ResumePermissionPolicyApplied(_)
+    ));
+    assert!(matches!(
+        events_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+        ControlEvent::Bound
+    ));
+    server.join().unwrap();
+    let _ = shutdown.shutdown(Shutdown::Both);
+    pump.join().unwrap();
+}
+
+#[test]
+fn rejected_resume_permission_projection_retries_once_with_provider_safe_policy() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _stop_exclusive = stop_flag_tests();
+    let socket = tmp.path().join("server.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let server = thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_millis(250)))
+            .unwrap();
+        let mut websocket = tungstenite::accept(stream).unwrap();
+        assert_eq!(
+            read_json_message(&mut websocket).unwrap().unwrap()["method"],
+            "initialize"
+        );
+        write_json_message(
+            &mut websocket,
+            &json!({ "id": 0, "result": { "userAgent": "fake" } }),
+        )
+        .unwrap();
+        assert_eq!(
+            read_json_message(&mut websocket).unwrap().unwrap()["method"],
+            "initialized"
+        );
+        let loaded = read_json_message(&mut websocket).unwrap().unwrap();
+        assert_eq!(loaded["method"], "thread/loaded/list");
+        write_json_message(
+            &mut websocket,
+            &json!({
+                "id": CONTROL_TUI_LOADED_REQUEST_ID,
+                "result": { "data": ["thread-prior"] }
+            }),
+        )
+        .unwrap();
+
+        let declared = read_json_message(&mut websocket).unwrap().unwrap();
+        assert_eq!(declared["method"], "thread/resume");
+        assert_eq!(declared["params"]["threadId"], "thread-prior");
+        assert_eq!(declared["params"]["approvalPolicy"], "never");
+        assert_eq!(declared["params"]["sandbox"], "danger-full-access");
+        write_json_message(
+            &mut websocket,
+            &json!({
+                "id": CONTROL_SUBSCRIBE_REQUEST_ID,
+                "error": {
+                    "code": -32602,
+                    "message": "permission override rejected"
+                }
+            }),
+        )
+        .unwrap();
+
+        let fallback = read_json_message(&mut websocket).unwrap().unwrap();
+        assert_eq!(fallback["method"], "thread/resume");
+        assert_eq!(fallback["params"], json!({ "threadId": "thread-prior" }));
+        write_json_message(
+            &mut websocket,
+            &json!({
+                "id": CONTROL_SUBSCRIBE_REQUEST_ID,
+                "result": {
+                    "thread": { "id": "thread-prior", "status": { "type": "idle" } }
+                }
+            }),
+        )
+        .unwrap();
+        assert!(matches!(
+            poll_json_message(&mut websocket).unwrap(),
+            ControlRead::Timeout
+        ));
+    });
+
+    let stream = UnixStream::connect(&socket).unwrap();
+    let shutdown = stream.try_clone().unwrap();
+    let websocket = initialize_control(stream)
+        .unwrap()
+        .expect("no stop raised in tests");
+    let binding_path = tmp.path().join("state/binding.json");
+    let control_state_path = tmp.path().join("state/control-state.json");
+    let runtime = CodexRuntime::fresh("h.worker".into(), "h.worker".into()).unwrap();
+    let (tx, rx) = mpsc::channel();
+    let (resume_ready_tx, resume_ready_rx) = mpsc::channel();
+    let fallback_active = Arc::new(AtomicBool::new(false));
+    let fallback_for_pump = fallback_active.clone();
+    let runtime_for_pump = runtime.clone();
+    let pump = thread::spawn(move || {
+        pump_control(
+            websocket,
+            &binding_path,
+            &control_state_path,
+            &runtime_for_pump,
+            Some(ControlResume {
+                thread_id: "thread-prior",
+                ready: resume_ready_rx,
+                tui_loaded_timeout: TUI_LOADED_TIMEOUT,
+                permission_overrides: Some(ResumePermissionOverrides {
+                    approval_policy: Some("never".into()),
+                    approvals_reviewer: None,
+                    sandbox: Some("danger-full-access".into()),
+                }),
+                preload: false,
+                preloaded: None,
+            }),
+            None,
+            fallback_for_pump,
+            tx,
+        )
+    });
+    resume_ready_tx.send(()).unwrap();
+    acknowledge_tui_thread_loaded(&rx);
+    assert!(matches!(
+        rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+        ControlEvent::SafeFallbackActivated {
+            cause: "resumePermissionProjectionRejected",
+            ..
+        }
+    ));
+    assert!(matches!(
+        rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+        ControlEvent::Bound
+    ));
+    assert!(fallback_active.load(Ordering::SeqCst));
+
+    server.join().unwrap();
+    let _ = shutdown.shutdown(Shutdown::Both);
+    pump.join().unwrap();
 }
 
 /// A resumed thread still holds its context, and the app-server replays
@@ -2444,8 +3201,12 @@ fn a_token_usage_replayed_before_the_resume_response_still_reaches_the_record() 
                 thread_id: "thread-prior",
                 ready: resume_ready_rx,
                 tui_loaded_timeout: TUI_LOADED_TIMEOUT,
+                permission_overrides: None,
+                preload: false,
+                preloaded: None,
             }),
             Some(config),
+            Arc::new(AtomicBool::new(false)),
             tx,
         )
     });
@@ -2521,8 +3282,12 @@ fn tui_loaded_timeout_reports_the_specific_failure_before_outer_binding_timeout(
                 thread_id: "thread-prior",
                 ready: resume_ready_rx,
                 tui_loaded_timeout: Duration::from_millis(50),
+                permission_overrides: None,
+                preload: false,
+                preloaded: None,
             }),
             None,
+            Arc::new(AtomicBool::new(false)),
             tx,
         )
     });
@@ -2617,8 +3382,12 @@ fn missing_saved_rollout_fails_without_rebinding_the_incarnation() {
                 thread_id: "thread-prior",
                 ready: resume_ready_rx,
                 tui_loaded_timeout: TUI_LOADED_TIMEOUT,
+                permission_overrides: None,
+                preload: false,
+                preloaded: None,
             }),
             None,
+            Arc::new(AtomicBool::new(false)),
             tx,
         )
     });
@@ -2633,8 +3402,7 @@ fn missing_saved_rollout_fails_without_rebinding_the_incarnation() {
     let _ = shutdown.shutdown(Shutdown::Both);
     pump.join().unwrap();
     assert_eq!(
-        serde_json::from_slice::<CodexThreadBinding>(&fs::read(&binding_path).unwrap())
-            .unwrap(),
+        serde_json::from_slice::<CodexThreadBinding>(&fs::read(&binding_path).unwrap()).unwrap(),
         prior_binding
     );
     assert!(!control_state_path.exists());
@@ -3029,6 +3797,63 @@ fn mandatory_residency_failure_does_not_spawn_a_provider_child() {
 }
 
 #[test]
+fn a_native_seat_restart_retires_the_old_thread_binding() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("binding.json");
+    let prior = CodexRuntime::fresh("h.worker".into(), "h.worker".into()).unwrap();
+    atomic_json(
+        &path,
+        &CodexThreadBinding::new(&prior, "thread-prior".into()),
+    )
+    .unwrap();
+
+    let selected = select_resume_thread(&path, "h.worker", "h.worker", false).unwrap();
+    assert_eq!(selected, None);
+    assert!(
+        !path.exists(),
+        "the old binding must not make this seat ready"
+    );
+    let prepared = prepare_controlled_launch_args("unix:///server.sock", &[], selected.as_deref());
+    assert!(!prepared.tui_args.iter().any(|arg| arg == "resume"));
+    assert!(prepared.expected_resume.is_none());
+}
+
+#[test]
+fn codex_control_accepts_a_frame_larger_than_sixteen_mib() {
+    let _stop_exclusive = stop_flag_tests();
+    let tmp = tempfile::tempdir().unwrap();
+    let socket = tmp.path().join("server.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let payload = "x".repeat(16 * 1024 * 1024 + 4096);
+    let expected_size = payload.len();
+    let server = thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        let mut websocket = tungstenite::accept(stream).unwrap();
+        let initialize = read_json_message(&mut websocket).unwrap().unwrap();
+        assert_eq!(initialize["method"], "initialize");
+        write_json_message(&mut websocket, &json!({ "id": 0, "result": {} })).unwrap();
+        let initialized = read_json_message(&mut websocket).unwrap().unwrap();
+        assert_eq!(initialized["method"], "initialized");
+        write_json_message(
+            &mut websocket,
+            &json!({ "method": "thread/read", "params": { "payload": payload } }),
+        )
+        .unwrap();
+    });
+
+    let stream = UnixStream::connect(&socket).unwrap();
+    let mut websocket = initialize_control(stream).unwrap().unwrap();
+    let ControlRead::Message(message) = poll_json_message(&mut websocket).unwrap() else {
+        panic!("large control frame was not received");
+    };
+    assert_eq!(
+        message["params"]["payload"].as_str().unwrap().len(),
+        expected_size
+    );
+    server.join().unwrap();
+}
+
+#[test]
 fn watcher_holds_without_an_exact_turn_and_tracks_one_unmatched_lifecycle() {
     let runtime = CodexRuntime::fresh("h.worker".into(), "h.worker".into()).unwrap();
     let mut state = CodexControlState::new(&runtime, "thread-main".into());
@@ -3100,6 +3925,383 @@ fn watcher_holds_without_an_exact_turn_and_tracks_one_unmatched_lifecycle() {
             .unwrap()
     );
     assert_eq!(state.observed(), &CodexObservedState::Idle);
+}
+
+#[test]
+fn a_typed_item_recovers_the_startup_turn_for_immediate_steering() {
+    let runtime = CodexRuntime::fresh("h.worker".into(), "h.worker".into()).unwrap();
+    let mut state = CodexControlState::new(&runtime, "thread-main".into());
+    state.subscribed = true;
+    state
+        .observe(&json!({
+            "method": "thread/status/changed",
+            "params": {
+                "threadId": "thread-main",
+                "status": { "type": "active", "activeFlags": [] }
+            }
+        }))
+        .unwrap();
+    assert!(matches!(
+        state.observed(),
+        CodexObservedState::Held {
+            reason: CodexHoldReason::ActiveWithoutTurn,
+            ..
+        }
+    ));
+
+    assert!(
+        state
+            .observe(&json!({
+                "method": "item/started",
+                "params": {
+                    "threadId": "thread-main",
+                    "turnId": "turn-recovered",
+                    "item": { "type": "commandExecution" }
+                }
+            }))
+            .unwrap()
+    );
+    assert_eq!(
+        state.observed(),
+        &CodexObservedState::Active {
+            turn_id: "turn-recovered".into(),
+        }
+    );
+
+    let tmp = tempfile::tempdir().unwrap();
+    let config = delivery_config(tmp.path());
+    message::send_to_inbox(&config.inbox, "h.sender", None, None, &[], "queued").unwrap();
+    let mut delivery = inbox_delivery(tmp.path(), config);
+    let request = delivery
+        .maybe_request(&state)
+        .unwrap()
+        .expect("the staged message should steer the recovered turn");
+    assert_eq!(request["method"], "turn/steer");
+    assert_eq!(request["params"]["expectedTurnId"], "turn-recovered");
+}
+
+#[test]
+fn delivery_reads_bounded_status_and_fences_the_subscribed_turn_before_steering() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = delivery_config(tmp.path());
+    message::send_to_inbox(&config.inbox, "h.sender", None, None, &[], "queued").unwrap();
+    let runtime = CodexRuntime::fresh("h.worker".into(), "h.worker".into()).unwrap();
+    let mut delivery = CodexInboxDelivery::new(
+        config,
+        tmp.path().join("state").join(delivery_ledger::LEDGER_FILE),
+        runtime.clone(),
+        Arc::new(AtomicBool::new(false)),
+    )
+    .unwrap();
+    let mut state = CodexControlState::new(&runtime, "thread-main".into());
+    state.subscribed = true;
+    state.observed = CodexObservedState::Active {
+        turn_id: "turn-current".into(),
+    };
+
+    let read = delivery
+        .maybe_snapshot_request(&state)
+        .unwrap()
+        .expect("an unread inbox head requires a fresh thread snapshot");
+    assert_eq!(read["method"], "thread/read");
+    assert_eq!(read["params"]["includeTurns"], false);
+    let read_id = read["id"].clone();
+    assert!(
+        delivery
+            .accept_snapshot_response(
+                &json!({
+                    "id": read_id,
+                    "result": {
+                        "thread": {
+                            "id": "thread-main",
+                            "status": { "type": "active", "activeFlags": [] },
+                            "turns": []
+                        }
+                    }
+                }),
+                &mut state,
+            )
+            .unwrap()
+    );
+    let steer = delivery
+        .maybe_request(&state)
+        .unwrap()
+        .expect("the verified current turn is steerable");
+    assert_eq!(steer["method"], "turn/steer");
+    assert_eq!(steer["params"]["expectedTurnId"], "turn-current");
+    assert_eq!(
+        state.observed(),
+        &CodexObservedState::Active {
+            turn_id: "turn-current".into()
+        }
+    );
+}
+
+#[test]
+fn idle_delivery_retries_snapshot_errors_with_fresh_ids_then_falls_back() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = delivery_config(tmp.path());
+    message::send_to_inbox(&config.inbox, "h.sender", None, None, &[], "queued").unwrap();
+    let runtime = CodexRuntime::fresh("h.worker".into(), "h.worker".into()).unwrap();
+    let mut delivery = CodexInboxDelivery::new(
+        config,
+        tmp.path().join("state").join(delivery_ledger::LEDGER_FILE),
+        runtime.clone(),
+        Arc::new(AtomicBool::new(false)),
+    )
+    .unwrap();
+    let mut state = CodexControlState::new(&runtime, "thread-main".into());
+    state.subscribed = true;
+    state.observed = CodexObservedState::Idle;
+
+    for attempt in 0..SNAPSHOT_REQUEST_ATTEMPTS {
+        let read = delivery
+            .maybe_snapshot_request(&state)
+            .unwrap()
+            .expect("each bounded retry issues a request");
+        assert_eq!(
+            read["id"],
+            Value::from(FIRST_DELIVERY_REQUEST_ID + u64::from(attempt)),
+            "every retry must use a fresh JSON-RPC ID"
+        );
+        assert!(
+            delivery
+                .accept_snapshot_response(
+                    &json!({
+                        "id": read["id"],
+                        "error": { "code": -32000, "message": "temporarily unavailable" }
+                    }),
+                    &mut state,
+                )
+                .unwrap()
+        );
+    }
+
+    assert_eq!(delivery.maybe_snapshot_request(&state).unwrap(), None);
+    let request = delivery
+        .maybe_request(&state)
+        .unwrap()
+        .expect("bounded read errors must not permanently fence known-idle delivery");
+    assert_eq!(request["method"], "turn/start");
+    assert_eq!(
+        request["id"],
+        Value::from(FIRST_DELIVERY_REQUEST_ID + u64::from(SNAPSHOT_REQUEST_ATTEMPTS))
+    );
+}
+
+#[test]
+fn idle_delivery_expires_missing_snapshot_responses_and_ignores_late_ids() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = delivery_config(tmp.path());
+    message::send_to_inbox(&config.inbox, "h.sender", None, None, &[], "queued").unwrap();
+    let runtime = CodexRuntime::fresh("h.worker".into(), "h.worker".into()).unwrap();
+    let mut delivery = CodexInboxDelivery::new(
+        config,
+        tmp.path().join("state").join(delivery_ledger::LEDGER_FILE),
+        runtime.clone(),
+        Arc::new(AtomicBool::new(false)),
+    )
+    .unwrap();
+    let mut state = CodexControlState::new(&runtime, "thread-main".into());
+    state.subscribed = true;
+    state.observed = CodexObservedState::Idle;
+
+    let first = delivery
+        .maybe_snapshot_request(&state)
+        .unwrap()
+        .expect("the first snapshot request is issued");
+    for attempt in 1..SNAPSHOT_REQUEST_ATTEMPTS {
+        delivery.pending_snapshot.as_mut().unwrap().requested_at = Instant::now()
+            .checked_sub(SNAPSHOT_REQUEST_TIMEOUT + Duration::from_millis(1))
+            .unwrap();
+        let retry = delivery
+            .maybe_snapshot_request(&state)
+            .unwrap()
+            .expect("an expired request is replaced within the retry bound");
+        assert_eq!(
+            retry["id"],
+            Value::from(FIRST_DELIVERY_REQUEST_ID + u64::from(attempt))
+        );
+        assert_ne!(retry["id"], first["id"]);
+        assert!(
+            !delivery
+                .accept_snapshot_response(
+                    &json!({
+                        "id": first["id"],
+                        "result": {
+                            "thread": {
+                                "id": "thread-main",
+                                "status": { "type": "idle" },
+                                "turns": []
+                            }
+                        }
+                    }),
+                    &mut state,
+                )
+                .unwrap(),
+            "a late response for an expired request cannot satisfy the fresh request"
+        );
+    }
+    delivery.pending_snapshot.as_mut().unwrap().requested_at = Instant::now()
+        .checked_sub(SNAPSHOT_REQUEST_TIMEOUT + Duration::from_millis(1))
+        .unwrap();
+
+    assert_eq!(
+        delivery.maybe_snapshot_request(&state).unwrap(),
+        None,
+        "the final timeout clears the snapshot fence instead of issuing an unbounded retry"
+    );
+    let request = delivery
+        .maybe_request(&state)
+        .unwrap()
+        .expect("missing read responses must not permanently fence known-idle delivery");
+    assert_eq!(request["method"], "turn/start");
+    assert_eq!(
+        request["id"],
+        Value::from(FIRST_DELIVERY_REQUEST_ID + u64::from(SNAPSHOT_REQUEST_ATTEMPTS))
+    );
+}
+
+#[test]
+fn the_transcript_snapshot_recovers_and_clears_the_active_turn() {
+    let tmp = tempfile::tempdir().unwrap();
+    let transcript = tmp.path().join("rollout-thread-main.jsonl");
+    fs::write(
+        &transcript,
+        concat!(
+            r#"{"type":"event_msg","payload":{"type":"task_started","turn_id":"turn-old"}}"#,
+            "\n",
+            r#"{"type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-old"}}"#,
+            "\n",
+            r#"{"type":"event_msg","payload":{"type":"task_started","turn_id":"turn-live"}}"#,
+            "\n",
+            r#"{"type":"response_item","payload":{"type":"reasoning","internal_chat_message_metadata_passthrough":{"turn_id":"turn-live"}}}"#,
+            "\n",
+        ),
+    )
+    .unwrap();
+    assert_eq!(
+        active_turn_from_codex_transcript(&transcript).unwrap(),
+        Some("turn-live".into())
+    );
+
+    fs::OpenOptions::new()
+        .append(true)
+        .open(&transcript)
+        .unwrap()
+        .write_all(
+            b"{\"type\":\"event_msg\",\"payload\":{\"type\":\"turn_aborted\",\"turn_id\":\"turn-live\"}}\n",
+        )
+        .unwrap();
+    assert_eq!(
+        active_turn_from_codex_transcript(&transcript).unwrap(),
+        None
+    );
+}
+
+#[test]
+fn transcript_proves_only_the_latest_matching_failed_completion() {
+    let started = |id| json!({"type":"event_msg","payload":{"type":"task_started","turn_id":id}});
+    let completed = |id, error: Option<&str>| json!({"type":"event_msg","payload":{"type":"task_complete","turn_id":id,"error":error}});
+    assert_eq!(
+        failed_completed_turn_from_codex_frames(&[
+            started("old"),
+            completed("old", Some("unauthorized")),
+        ]),
+        Some("old".into())
+    );
+    assert_eq!(
+        failed_completed_turn_from_codex_frames(&[
+            started("old"),
+            completed("old", Some("unauthorized")),
+            started("new"),
+        ]),
+        None,
+        "a newer live turn cannot be unblocked by an older failed turn"
+    );
+    assert_eq!(
+        failed_completed_turn_from_codex_frames(&[
+            started("one"),
+            completed("other", Some("unauthorized")),
+        ]),
+        None,
+        "the completion must match the started turn"
+    );
+    assert_eq!(
+        failed_completed_turn_from_codex_frames(&[started("one"), completed("one", None),]),
+        None,
+        "a successful completion cannot prove a terminal system error"
+    );
+}
+
+#[test]
+fn a_long_active_turn_recovers_from_recent_typed_transcript_evidence() {
+    let tmp = tempfile::tempdir().unwrap();
+    let transcript = tmp.path().join("rollout-thread-main.jsonl");
+    let mut content = String::from(
+        "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_started\",\"turn_id\":\"turn-live\"}}\n",
+    );
+    content.push_str(&" ".repeat(TRANSCRIPT_TURN_RECOVERY_BYTES as usize));
+    content.push('\n');
+    content.push_str(
+        "{\"type\":\"event_msg\",\"payload\":{\"type\":\"item_completed\",\"turn_id\":\"turn-live\"}}\n",
+    );
+    fs::write(&transcript, content).unwrap();
+    assert_eq!(
+        active_turn_from_codex_transcript(&transcript).unwrap(),
+        Some("turn-live".into()),
+        "the task-start frame is outside the bounded tail"
+    );
+    fs::OpenOptions::new()
+        .append(true)
+        .open(&transcript)
+        .unwrap()
+        .write_all(
+            b"{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_complete\",\"turn_id\":\"turn-live\"}}\n",
+        )
+        .unwrap();
+    assert_eq!(
+        active_turn_from_codex_transcript(&transcript).unwrap(),
+        None
+    );
+}
+
+#[test]
+fn a_successful_snapshot_without_turn_allows_transcript_recovery_and_steer() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = delivery_config(tmp.path());
+    message::send_to_inbox(&config.inbox, "h.sender", None, None, &[], "queued").unwrap();
+    let runtime = CodexRuntime::fresh("h.worker".into(), "h.worker".into()).unwrap();
+    let mut delivery = CodexInboxDelivery::new(
+        config,
+        tmp.path().join("state").join(delivery_ledger::LEDGER_FILE),
+        runtime.clone(),
+        Arc::new(AtomicBool::new(false)),
+    )
+    .unwrap();
+    let mut state = CodexControlState::new(&runtime, "thread-main".into());
+    state.subscribed = true;
+    let read = delivery.maybe_snapshot_request(&state).unwrap().unwrap();
+    delivery
+        .accept_snapshot_response(
+            &json!({
+                "id": read["id"],
+                "result": {"thread": {
+                    "id": "thread-main",
+                    "status": {"type": "active", "activeFlags": []},
+                    "turns": []
+                }}
+            }),
+            &mut state,
+        )
+        .unwrap();
+    assert!(delivery.transcript_recovery_due());
+    assert!(delivery.maybe_request(&state).unwrap().is_none());
+    state.observe_turn_evidence("turn-live");
+    delivery.accept_transcript_recovery(state.observed.clone());
+    let request = delivery.maybe_request(&state).unwrap().unwrap();
+    assert_eq!(request["method"], "turn/steer");
+    assert_eq!(request["params"]["expectedTurnId"], "turn-live");
 }
 
 #[test]
@@ -3300,8 +4502,7 @@ fn exiting_review_mode_mid_turn_restores_the_steerable_turn() {
     let tmp = tempfile::tempdir().unwrap();
     let config = delivery_config(tmp.path());
     let filename =
-        message::send_to_inbox(&config.inbox, "h.sender", Some("held"), None, &[], "body")
-            .unwrap();
+        message::send_to_inbox(&config.inbox, "h.sender", Some("held"), None, &[], "body").unwrap();
     let mut delivery = inbox_delivery(tmp.path(), config.clone());
 
     let runtime = CodexRuntime::fresh("h.worker".into(), "h.worker".into()).unwrap();
@@ -3751,8 +4952,7 @@ fn persisted_control_state_is_bound_to_the_exact_runtime_incarnation() {
 
     let replacement = CodexRuntime::fresh("h.worker".into(), "h.worker".into()).unwrap();
     let replacement_binding = CodexThreadBinding::new(&replacement, "thread-main".into());
-    let error =
-        load_current_control_state(&path, &replacement, &replacement_binding).unwrap_err();
+    let error = load_current_control_state(&path, &replacement, &replacement_binding).unwrap_err();
     assert!(error.to_string().contains("different runtime binding"));
 }
 
@@ -3938,11 +5138,8 @@ fn hook_preflight_uses_the_explicit_controlled_workspace() {
         fs::canonicalize(explicit).unwrap()
     );
     assert!(
-        authored_bypasses_hook_trust(&[
-            "--dangerously-bypass-hook-trust".into(),
-            "boot".into()
-        ])
-        .unwrap()
+        authored_bypasses_hook_trust(&["--dangerously-bypass-hook-trust".into(), "boot".into()])
+            .unwrap()
     );
     assert!(
         !authored_bypasses_hook_trust(&["--".into(), "--dangerously-bypass-hook-trust".into()])
@@ -4212,8 +5409,7 @@ fn a_killed_wrapper_reaps_its_app_server_and_the_next_launch_recovers_its_socket
 
 #[test]
 fn app_server_configuration_extraction_fails_closed_at_ambiguous_boundaries() {
-    let missing =
-        controlled_app_server_args("unix:///server.sock", &["-c".into()]).unwrap_err();
+    let missing = controlled_app_server_args("unix:///server.sock", &["-c".into()]).unwrap_err();
     assert!(missing.to_string().contains("has no value"));
 
     let unknown = controlled_app_server_args(
@@ -4321,6 +5517,166 @@ fn controlled_tui_resumes_a_prior_binding_without_overriding_authored_selection(
         expected_resume_thread(&authored, Some("thread-prior")).unwrap(),
         Some("thread-prior")
     );
+}
+
+#[test]
+fn automatic_remote_resume_omits_permission_overrides_but_fresh_launch_is_exact() {
+    let authored = vec![
+        "--dangerously-bypass-approvals-and-sandbox".into(),
+        "--dangerously-bypass-hook-trust".into(),
+        "--sandbox".into(),
+        "workspace-write".into(),
+        "--ask-for-approval=never".into(),
+        "--model".into(),
+        "gpt-test".into(),
+        "boot".into(),
+    ];
+
+    let mut fresh = vec!["--remote".to_string(), "unix:///server.sock".to_string()];
+    fresh.extend(authored.clone());
+    assert_eq!(
+        controlled_tui_args("unix:///server.sock", &authored, None).unwrap(),
+        fresh,
+        "an ordinary accepted launch must preserve the exact declaration"
+    );
+    assert_eq!(
+        controlled_tui_args("unix:///server.sock", &authored, Some("thread-prior")).unwrap(),
+        [
+            "--remote",
+            "unix:///server.sock",
+            "resume",
+            "--model",
+            "gpt-test",
+            "thread-prior",
+            "boot",
+        ],
+        "remote resume must not send provider-rejected permission overrides"
+    );
+
+    let prepared =
+        prepare_controlled_launch_args("unix:///server.sock", &authored, Some("thread-prior"));
+    assert!(
+        prepared
+            .server_args
+            .windows(2)
+            .any(|pair| { pair == ["-c", "approval_policy=\"never\""] })
+    );
+    assert!(
+        prepared
+            .server_args
+            .windows(2)
+            .any(|pair| { pair == ["-c", "sandbox_mode=\"workspace-write\""] })
+    );
+    let permissions = prepared
+        .resume_permissions
+        .expect("automatic resume projects the declared permission policy through control");
+    assert_eq!(
+        permissions,
+        ResumePermissionOverrides {
+            approval_policy: Some("never".into()),
+            approvals_reviewer: None,
+            sandbox: Some("workspace-write".into()),
+        }
+    );
+    assert_eq!(
+        control_resume_request("thread-prior", Some(&permissions)),
+        json!({
+            "method": "thread/resume",
+            "id": CONTROL_SUBSCRIBE_REQUEST_ID,
+            "params": {
+                "threadId": "thread-prior",
+                "approvalPolicy": "never",
+                "sandbox": "workspace-write",
+            }
+        })
+    );
+    assert!(resume_permission_overrides_applied(
+        &json!({
+            "result": {
+                "approvalPolicy": "never",
+                "sandbox": { "type": "workspaceWrite" }
+            }
+        }),
+        &permissions
+    ));
+    assert!(!resume_permission_overrides_applied(
+        &json!({
+            "result": {
+                "approvalPolicy": "on-request",
+                "sandbox": { "type": "workspaceWrite" }
+            }
+        }),
+        &permissions
+    ));
+
+    // This is the standing st3 seat's exact policy declaration. It is the regression that
+    // originally exposed Codex rejecting permission flags on automatic remote resume: the TUI
+    // argv must be compatible, while the redundant typed resume restores Full Access.
+    let standing_seat = vec![
+        "--model".into(),
+        "gpt-5.6-sol".into(),
+        "-c".into(),
+        "model_reasoning_effort=xhigh".into(),
+        "--dangerously-bypass-approvals-and-sandbox".into(),
+        "--dangerously-bypass-hook-trust".into(),
+        "boot".into(),
+    ];
+    let prepared =
+        prepare_controlled_launch_args("unix:///server.sock", &standing_seat, Some("thread-prior"));
+    assert!(
+        prepared
+            .server_args
+            .windows(2)
+            .any(|pair| { pair == ["-c", "sandbox_mode=\"danger-full-access\""] })
+    );
+    assert_eq!(
+        prepared.tui_args,
+        [
+            "--remote",
+            "unix:///server.sock",
+            "resume",
+            "--model",
+            "gpt-5.6-sol",
+            "-c",
+            "model_reasoning_effort=xhigh",
+            "thread-prior",
+            "boot",
+        ]
+    );
+    assert_eq!(
+        prepared.resume_permissions,
+        Some(ResumePermissionOverrides {
+            approval_policy: Some("never".into()),
+            approvals_reviewer: None,
+            sandbox: Some("danger-full-access".into()),
+        })
+    );
+}
+
+#[test]
+fn rejected_declared_option_selects_one_minimal_safe_fallback_without_leaking_its_value() {
+    let prepared = prepare_controlled_launch_args(
+        "unix:///server.sock",
+        &["--future-token=do-not-log-this".into(), "boot".into()],
+        Some("thread-prior"),
+    );
+
+    assert!(prepared.safe_fallback);
+    assert_eq!(prepared.declared_options, ["--future-token"]);
+    assert!(!format!("{prepared:?}").contains("do-not-log-this"));
+    assert_eq!(
+        prepared.server_args,
+        ["app-server", "--listen", "unix:///server.sock"]
+    );
+    assert_eq!(
+        prepared.tui_args,
+        ["--remote", "unix:///server.sock", "resume", "thread-prior"]
+    );
+    assert_eq!(prepared.expected_resume.as_deref(), Some("thread-prior"));
+
+    let mut attempted = false;
+    assert!(claim_safe_fallback_attempt(&mut attempted));
+    assert!(!claim_safe_fallback_attempt(&mut attempted));
 }
 
 #[test]
@@ -4538,8 +5894,7 @@ fn waiting_on_a_human_holds_the_exact_turn_and_releases_it_when_the_flag_clears(
     let tmp = tempfile::tempdir().unwrap();
     let config = delivery_config(tmp.path());
     let filename =
-        message::send_to_inbox(&config.inbox, "h.sender", Some("held"), None, &[], "body")
-            .unwrap();
+        message::send_to_inbox(&config.inbox, "h.sender", Some("held"), None, &[], "body").unwrap();
     let mut delivery = inbox_delivery(tmp.path(), config.clone());
     for reason in [
         CodexHoldReason::WaitingOnApproval,

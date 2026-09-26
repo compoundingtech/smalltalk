@@ -1,0 +1,27 @@
+# app.toml — deployment config for the signal product stack.
+#
+# This file names the PRODUCT `signal` in several places. A correct rename to
+# `beacon` sweeps this file too: the [signal] section header, the bin, the
+# scheme, and the @acme/signal package reference in the comment all move. None
+# of these is the runtime primitive — this is pure product config.
+
+[app]
+name = "signal-stack"
+env  = "staging"
+
+# The product itself: the @acme/signal base package + its `signal` CLI binary.
+[signal]
+package = "@acme/signal"     # base product package (-> @acme/beacon)
+bin     = "signal"           # product CLI binary name (-> beacon)
+scheme  = "signal://"        # product address scheme (-> beacon://)
+protocol = "signal/1"        # product wire tag (-> beacon/1)
+
+# The consumers, wired to the base by their signal:// addresses.
+[relay]
+package = "@acme/signal-relay"   # (-> @acme/beacon-relay)
+accepts = "signal://"            # must match [signal].scheme after any rename
+
+[hub]
+package = "@acme/signal-hub"     # (-> @acme/beacon-hub)
+host    = "alpha"
+listen  = "signal://alpha"       # hub address root (-> beacon://alpha)

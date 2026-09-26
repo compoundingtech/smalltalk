@@ -1,0 +1,10 @@
+{
+  "id": "eval-message-to-person",
+  "claims": [
+    {
+      "subject": "message/eval/report", "kind": "message.sent", "actor": "agent/eval-run/reporter",
+      "fields": { "from": "agent/eval-run/reporter", "to": "person/eval-requester", "title": "Eval report", "content": "The eval needs review.", "status": "sent", "tags": ["eval:eval-run"] }
+    }
+  ],
+  "expected": { "attention_person": "person/eval-requester", "actionable": ["message/eval/report"] }
+}

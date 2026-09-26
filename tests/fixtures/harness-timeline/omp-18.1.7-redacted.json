@@ -1,0 +1,14 @@
+{
+  "provenance": {
+    "harness": "omp",
+    "version": "18.1.7",
+    "source": "redacted OMP extension event capture after source-side bounding"
+  },
+  "frames": [
+    {"type":"state","state":"active"},
+    {"type":"timeline","event":"tool_call","payload":{"toolCallId":"tool-fixture","toolName":"read","input":{"redacted":true}}},
+    {"type":"timeline","event":"tool_result","payload":{"toolCallId":"tool-fixture","isError":false,"content":{"redacted":true}}},
+    {"type":"turn"},
+    {"type":"state","state":"idle"}
+  ]
+}

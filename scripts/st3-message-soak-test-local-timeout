@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+: "${ST3_SOAK_TEST_REAL_ST3_BIN:?set the real installed st3 executable for this test}"
+if [[ ${1:-} == conversations && ${2:-} == send ]]; then
+  "$ST3_SOAK_TEST_REAL_ST3_BIN" "$@" >/dev/null
+  if [[ ${ST3_SOAK_TEST_RESPONSE_MODE:-lost} == malformed ]]; then
+    /usr/bin/printf '{incomplete-response\n'
+    exit 0
+  fi
+  # Simulate a local client losing its response after an exact durable send.
+  exit 124
+fi
+exec "$ST3_SOAK_TEST_REAL_ST3_BIN" "$@"

@@ -213,12 +213,12 @@ fn validate_delivery_readiness_value(field: &str, value: &str) -> anyhow::Result
         value.trim() == value
             && !value
                 .chars()
-                .any(|character| character.is_control() || matches!(character, '\u{2028}' | '\u{2029}')),
+                .any(|character| character.is_control()
+                    || matches!(character, '\u{2028}' | '\u{2029}')),
         "delivery-readiness {field} must have no surrounding whitespace, controls, or line separators"
     );
     Ok(())
 }
-
 
 /// One typed harness driver declaration.
 ///
@@ -646,9 +646,7 @@ impl AgentSpec {
     /// `<host>.<identity>` bus identity — which is exactly the value catalog ID migration freezes
     /// as this subject's explicit ID, so a mixed catalog stays coherent while it is migrated.
     pub fn effective_id(&self, this_host: &str) -> String {
-        self.id
-            .clone()
-            .unwrap_or_else(|| self.bus_id(this_host))
+        self.id.clone().unwrap_or_else(|| self.bus_id(this_host))
     }
 
     /// The effective agent address (R24): the explicit `address` when present, otherwise the
@@ -775,7 +773,7 @@ pub(crate) struct RawSpec {
     pub session_driver: Option<Option<String>>,
     /// Non-secret facts used to admit the managed delivery path.
     pub delivery_readiness: Option<DeliveryReadiness>,
-    /// Direct typed provider driver block.
+    /// A direct provider block or the equivalent `harness "provider" {}` block.
     #[serde(flatten)]
     pub driver: RawDriver,
     /// Compact catalog form: reconciliation policy for the generated agent PTY.
@@ -1034,7 +1032,7 @@ fn validate_resource_explanation(name: &str, field: &str, value: &str) -> Result
 /// are an st2 extension pending canonical Agent Spec adoption (see 06-resync).
 fn validate_resource_uri(uri: &str) -> Result<(), &'static str> {
     if let Some(colon) = uri.find(':') {
-        let first_separator = uri.find(|character| matches!(character, '/' | '\\'));
+        let first_separator = uri.find(['/', '\\']);
         if first_separator.is_none_or(|separator| colon < separator) {
             return validate_absolute_uri(uri);
         }
@@ -1367,14 +1365,6 @@ impl RawSpec {
             readiness.validate()?;
         }
         anyhow::ensure!(
-            !(self.ding && delivery.is_some()),
-            "agent '{identity}' declares both `ding` and `deliver`; choose one transport"
-        );
-        anyhow::ensure!(
-            !(self.ding && (has_driver || session_driver.is_some() || delivery_readiness.is_some())),
-            "agent '{identity}' declares managed native delivery together with `ding`; generic Ding is only for opaque non-harness PTYs"
-        );
-        anyhow::ensure!(
             !(session_driver.is_some() && has_driver),
             "agent '{identity}' declares both `session-driver` and a typed driver; choose one session owner"
         );
@@ -1393,10 +1383,8 @@ impl RawSpec {
                 effective.as_str()
             );
         }
-        if let (
-            Some(DeliveryReadiness::Anonymous { harness, .. }),
-            Some(effective),
-        ) = (delivery_readiness.as_ref(), effective_session_driver)
+        if let (Some(DeliveryReadiness::Anonymous { harness, .. }), Some(effective)) =
+            (delivery_readiness.as_ref(), effective_session_driver)
         {
             anyhow::ensure!(
                 *harness == effective,
@@ -1405,6 +1393,13 @@ impl RawSpec {
                 effective.as_str()
             );
         }
+        // Native delivery owns the inbox when both forms are present. Treat `ding` as stale
+        // compatibility input and omit its sidecar instead of making the declaration invalid.
+        let ding = self.ding
+            && delivery.is_none()
+            && !has_driver
+            && session_driver.is_none()
+            && delivery_readiness.is_none();
         validate_launch(
             &identity,
             self.command.as_ref(),
@@ -1454,7 +1449,7 @@ impl RawSpec {
                 lifecycle,
             });
         }
-        if self.ding {
+        if ding {
             tasks.push(Task {
                 kind: TaskKind::Exec,
                 derived: true,
@@ -1719,10 +1714,7 @@ pub fn validate_agent_address(value: &str) -> anyhow::Result<()> {
         value.len() <= AGENT_ADDRESS_MAX_BYTES,
         "agent `address` '{value}' exceeds the {AGENT_ADDRESS_MAX_BYTES}-character limit"
     );
-    anyhow::ensure!(
-        value.is_ascii(),
-        "agent `address` '{value}' must be ASCII"
-    );
+    anyhow::ensure!(value.is_ascii(), "agent `address` '{value}' must be ASCII");
     for segment in value.split('.') {
         anyhow::ensure!(
             !segment.is_empty(),

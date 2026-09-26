@@ -1,0 +1,136 @@
+version 2
+
+  mission "eval/test-writing" state="ready" timeout="20m" {
+    completion { when "all-steps-exhausted" }
+    goal "Complete mission eval/test-writing."
+    step "start-team" timeout="10m" {
+      title "The native Codex test team is ready"
+        agent "tw.sup" {
+          workspace "${ST_WORKSPACE}/sup"
+          harness "codex" {
+            model "gpt-5.6-sol"
+            effort "medium"
+            args "--dangerously-bypass-approvals-and-sandbox" "--dangerously-bypass-hook-trust"
+          }
+          restart "never"
+          env {
+            CATALOG "${ST_WORKSPACE}"
+            ST_ROOT "${ST_WORKSPACE}/.st3-messages"
+            ST3_MESSAGE_ROOT "${ST_WORKSPACE}/.st3-messages"
+          }
+        }
+        agent "tw.dev" {
+          workspace "${ST_WORKSPACE}/worker"
+          harness "codex" {
+            model "gpt-5.6-sol"
+            effort "medium"
+            args "--dangerously-bypass-approvals-and-sandbox" "--dangerously-bypass-hook-trust"
+          }
+          restart "never"
+          env {
+            CATALOG "${ST_WORKSPACE}"
+            ST_ROOT "${ST_WORKSPACE}/.st3-messages"
+            ST3_MESSAGE_ROOT "${ST_WORKSPACE}/.st3-messages"
+          }
+        }
+    }
+
+    step "prepare-test-brief" timeout="15m" {
+      title "The supervisor defines the regression contract"
+      goal "Inspect the grades module without edits. Define the exact behavior that a regression-catching suite must preserve. Send the developer one complete brief."
+      assigned-to "agent/${ST_MISSION_RUN}/tw.sup"
+      depends-on { step "start-team" completed }
+      mission "work" {
+        completion { when "all-steps-exhausted" }
+        goal "Complete mission work."
+        step "inspect-module-read-only" {
+          title "The exported behavior and error paths are understood"
+          goal "Read ../worker/src/grades.js and ../worker/README.md without edits. Identify exact values, every cutoff, both range edges, summary calculations, empty input, and invalid inputs."
+        }
+        step "send-test-brief" {
+          title "The developer receives one complete test brief"
+          goal "Send agent/${ST_MISSION_RUN}/tw.dev exactly one Small Talk message. Require tests for exact values, boundaries, range edges, aggregation, empty input, and error paths. State that src must not change. Use tag mission-run:$ST_MISSION_RUN. Save the bare message ID as MID. Run: st3 claim resource/mission-run/$ST_MISSION_RUN/test-brief resource.observed --actor agent/${ST_MISSION_RUN}/tw.sup --field kind=custom.st3.message-receipt --field state=published --field message=message/$MID. Complete this step after the claim."
+          depends-on { step "inspect-module-read-only" completed }
+          produces { resource "mission-run/${ST_MISSION_RUN}/test-brief" { kind "custom.st3.message-receipt"; state "published" } }
+        }
+      }
+    }
+
+    step "write-regression-suite" timeout="25m" {
+      title "The developer commits a regression-catching suite"
+      goal "Write only tests for the grades module. Keep src byte-identical. Make the complete Node suite green and commit the test revision."
+      assigned-to "agent/${ST_MISSION_RUN}/tw.dev"
+      depends-on { step "prepare-test-brief" completed }
+      mission "work" {
+        completion { when "all-steps-exhausted" }
+        goal "Complete mission work."
+        step "read-test-brief" {
+          title "The supervisor test contract is understood"
+          goal "Drain and archive the supervisor brief. Inspect src/grades.js and README.md. Do not edit src."
+        }
+        step "test-letter-boundaries" {
+          title "Letter grades and range boundaries have exact tests"
+          goal "Add exact tests for every letter cutoff, values on both sides, zero, one hundred, and invalid numeric input. Do not change src."
+          depends-on { step "read-test-brief" completed }
+        }
+        step "test-gpa-and-summary" {
+          title "GPA mapping and summary math have exact tests"
+          goal "Add exact tests for every GPA mapping, invalid letters, counts, average, GPA aggregation, and empty input. Do not change src."
+          depends-on { step "read-test-brief" completed }
+        }
+        step "run-complete-suite" {
+          title "The complete suite is green"
+          goal "Run node --test. Correct only test files until all tests pass. Confirm git diff shows no src change."
+          depends-on { step "test-letter-boundaries" completed; step "test-gpa-and-summary" completed }
+        }
+        step "publish-test-revision" {
+          title "The test revision is published"
+          goal "Commit the test-only change. Let SHA be git rev-parse HEAD. Run: st3 claim resource/mission-run/$ST_MISSION_RUN/test-revision resource.observed --actor agent/${ST_MISSION_RUN}/tw.dev --field kind=vcs.commit --field state=published --field sha=SHA. Complete this step after the claim."
+          depends-on { step "run-complete-suite" completed }
+          produces { resource "mission-run/${ST_MISSION_RUN}/test-revision" { kind "vcs.commit"; state "published" } }
+        }
+        step "report-test-result" {
+          title "The supervisor receives the committed test result"
+          goal "Send agent/${ST_MISSION_RUN}/tw.sup exactly one Small Talk message. Include the revision, test count, covered behavior, green command, and unchanged src evidence. Use tag mission-run:$ST_MISSION_RUN. Save the bare message ID as MID. Run: st3 claim resource/mission-run/$ST_MISSION_RUN/developer-report resource.observed --actor agent/${ST_MISSION_RUN}/tw.dev --field kind=custom.st3.message-receipt --field state=published --field message=message/$MID. Complete this step after the claim."
+          depends-on { step "publish-test-revision" completed }
+          produces { resource "mission-run/${ST_MISSION_RUN}/developer-report" { kind "custom.st3.message-receipt"; state "published" } }
+        }
+      }
+    }
+
+    step "verify-test-suite" timeout="15m" {
+      title "The supervisor verifies the suite without edits"
+      goal "Verify the developer result read-only. Confirm strong boundary and error coverage, a green suite, an unchanged src tree, and one committed revision."
+      assigned-to "agent/${ST_MISSION_RUN}/tw.sup"
+      depends-on { step "write-regression-suite" completed }
+      mission "work" {
+        completion { when "all-steps-exhausted" }
+        goal "Complete mission work."
+        step "read-developer-report" {
+          title "The developer report is understood"
+          goal "Drain and archive the one developer report. Record its revision, test count, coverage summary, and commands."
+        }
+        step "verify-read-only" {
+          title "The regression suite passes read-only verification"
+          goal "Inspect ../worker without edits. Run node --test there. Confirm the tests cover all named boundaries and errors. Confirm src is unchanged from the root commit and the tree is clean."
+          depends-on { step "read-developer-report" completed }
+        }
+        step "confirm-requester" {
+          title "The requester receives one verified assessment"
+          goal "Send person/eval-requester exactly one Small Talk message. Include the revision, test count, coverage summary, green command, unchanged src result, and your assessment. Use tag mission-run:$ST_MISSION_RUN. Save the bare message ID as MID. Run: st3 claim resource/mission-run/$ST_MISSION_RUN/final-assessment resource.observed --actor agent/${ST_MISSION_RUN}/tw.sup --field kind=custom.st3.message-receipt --field state=published --field message=message/$MID. Complete this step after the claim."
+          depends-on { step "verify-read-only" completed }
+          produces { resource "mission-run/${ST_MISSION_RUN}/final-assessment" { kind "custom.st3.message-receipt"; state "published" } }
+        }
+      }
+    }
+
+    step "held-out-gates" timeout="10m" {
+      title "All Test Writing gates pass"
+      depends-on { step "verify-test-suite" completed }
+      gate "only the developer authored work and src stayed unchanged" { exec "WORKER_ID=tw.dev bash ./judges/isolation.sh"; host "local"; workspace "${ST_WORKSPACE}"; env { CATALOG "${ST_WORKSPACE}" }; time-limit "120000ms" }
+      gate "a real test suite was added and is green" { exec "bash ./judges/tests-added-green.sh"; host "local"; workspace "${ST_WORKSPACE}"; env { CATALOG "${ST_WORKSPACE}" }; time-limit "120000ms" }
+      gate "the suite kills at least ten of twelve planted mutants" { exec "bash ./judges/mutation-score.sh"; host "local"; workspace "${ST_WORKSPACE}"; env { CATALOG "${ST_WORKSPACE}" }; time-limit "300000ms" }
+      gate "the graph records the brief, test work, revision, reports, and verification" { exec "bash ./judges/graph.sh"; host "local"; workspace "${ST_WORKSPACE}"; env { CATALOG "${ST_WORKSPACE}" }; time-limit "120000ms" }
+    }
+
+  }

@@ -1,0 +1,7 @@
+node_modules/
+.DS_Store
+CLAUDE.md
+AGENTS.md
+PERSONA.md
+.claude-session-id
+.claude/

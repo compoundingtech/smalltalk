@@ -1,0 +1,13 @@
+{
+  "provenance": {
+    "harness": "pi",
+    "version": "0.84.2",
+    "source": "redacted pi extension event capture after source-side bounding"
+  },
+  "frames": [
+    {"type":"state","state":"active"},
+    {"type":"timeline","event":"message_end","payload":{"message":{"id":"message-fixture","role":"assistant","content":"## Result\n\nExact  spacing\ntoken=fixture-secret","usage":{"input":41,"output":7}}}},
+    {"type":"context","reading":{"usedTokens":48,"windowTokens":200000,"usedPercent":0.024,"model":"fixture-model"}},
+    {"type":"state","state":"idle"}
+  ]
+}

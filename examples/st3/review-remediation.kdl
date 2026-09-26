@@ -1,0 +1,20 @@
+version 2
+
+mission "example/review-remediation" state="ready" {
+  completion { when "all-steps-exhausted" }
+  goal "Keep remediation reachable when an independent review finds defects."
+
+  step "report-only-review" {
+    goal "Inspect independently, record durable findings, and complete after the report is published even when findings exist."
+  }
+
+  step "remediate-findings" {
+    goal "Resolve every durable finding from the report and record focused proof."
+    depends-on { step "report-only-review" completed }
+  }
+
+  step "release-review" {
+    goal "Perform the terminal release decision; fail this step if the remediated result is still unacceptable."
+    depends-on { step "remediate-findings" completed }
+  }
+}

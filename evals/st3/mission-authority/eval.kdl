@@ -1,0 +1,42 @@
+version 2
+
+mission "eval/mission-authority" state="ready" timeout="20m" {
+  completion { when "all-steps-exhausted" }
+  goal "Enforce action-specific mission authority from the current desired agent declaration."
+
+  agent "planner" {
+    workspace "${ST_WORKSPACE}"
+    command "sleep 300"
+    restart "never"
+    mission-authority {
+      publish "eval/mission-authority/*"
+      start "eval/mission-authority/*"
+    }
+  }
+
+  step "produce" timeout="2m" {
+    assigned-to "agent/${ST_MISSION_RUN}/planner"
+    goal "Publish the authorized produced mission through this claimed step."
+    produces-mission "eval/mission-authority/produced"
+  }
+
+  step "verify" timeout="3m" {
+    agentless
+    exec "mission-authority/controller" {
+      host "local"
+      workspace "${ST_WORKSPACE}"
+      command "bash ./controller.sh"
+      restart "never"
+    }
+    gate "the mission authority controller passed" {
+      field "exit_code" "exec/${ST_MISSION_RUN}/mission-authority/controller" is 0
+    }
+  }
+
+  finally {
+    step "cleanup" timeout="1m" {
+      agentless
+      stop "agent/${ST_MISSION_RUN}/planner"
+    }
+  }
+}

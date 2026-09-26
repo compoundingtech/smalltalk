@@ -1,0 +1,221 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+umask 077
+
+: "${ST3_BIN:?set ST3_BIN to the installed st3 executable}"
+: "${ST_AGENT:?set ST_AGENT to the authorized st3 operator identity}"
+: "${FABRIC_BIN:?set FABRIC_BIN to the installed Fabric executable}"
+: "${ST3_SOAK_SILBER_BIN:?set ST3_SOAK_SILBER_BIN to the installed st3 executable on Silber}"
+
+MONITOR=agent/fleet/st3/delivery-soak-20260924/monitor
+SILBER_RECIPIENT=agent/fleet/st3/delivery-soak-20260924/recipient
+HETZ_RECIPIENT=agent/fleet/st3/delivery-soak-20260924/hetz-recipient
+SILBER_ST3=$ST3_SOAK_SILBER_BIN
+DEADLINE_SECONDS=${ST3_SOAK_DEADLINE_SECONDS:-180}
+INTERVAL_SECONDS=${ST3_SOAK_INTERVAL_SECONDS:-300}
+STATE_DIR=${ST3_SOAK_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/st3/message-soak}
+/usr/bin/mkdir -p "$STATE_DIR"
+
+log() {
+  /usr/bin/printf '%s %s\n' "$(/usr/bin/date -u +'%Y-%m-%dT%H:%M:%SZ')" "$*" \
+    | /usr/bin/tee -a "$STATE_DIR/events.log"
+}
+
+# Fabric exec can time out after the remote st3 command has committed. Recover
+# only the exact durable request, never infer success from a timed-out client.
+recover_sent_subject() {
+  local recipient=$1 token=$2 deadline=${3:-} mailbox subjects count
+  deadline=${deadline:-$(( $(/usr/bin/date +%s) + 30 ))}
+  while (( $(/usr/bin/date +%s) < deadline )); do
+    if mailbox=$(/usr/bin/timeout 15s "$ST3_BIN" conversations ls "$recipient" \
+      --archive --from "$MONITOR" --json 2>/dev/null); then
+      if subjects=$(/usr/bin/jq -cer --arg recipient "$recipient" --arg monitor "$MONITOR" \
+        --arg content "Reply once with exact receipt token $token." \
+        '[.[] | select(.from == $monitor and .to == $recipient and .content == $content) | .subject]' \
+        <<<"$mailbox"); then
+        count=$(/usr/bin/jq 'length' <<<"$subjects")
+        if (( count == 1 )); then
+          /usr/bin/jq -r '.[0]' <<<"$subjects"
+          return 0
+        fi
+        if (( count > 1 )); then
+          return 2
+        fi
+      fi
+    fi
+    /usr/bin/sleep 2
+  done
+  return 1
+}
+
+probe() {
+  local direction=$1 recipient response subject token started deadline thread count reply_ids reply_id
+  LAST_SUBJECT=
+  LAST_TOKEN=
+  token="probe-$(/usr/bin/date -u +%Y%m%dT%H%M%S)-${RANDOM}-${direction}"
+  LAST_TOKEN=$token
+  started=$(/usr/bin/date +%s)
+  if [[ $direction == hetz-to-silber ]]; then
+    recipient=$SILBER_RECIPIENT
+    if ! response=$(/usr/bin/timeout 30s "$ST3_BIN" conversations send "$recipient" --from "$MONITOR" \
+      --subject 'soak request' --body "Reply once with exact receipt token $token." --json); then
+      if subject=$(recover_sent_subject "$recipient" "$token" "$((started + DEADLINE_SECONDS))"); then
+        response=$(/usr/bin/jq -nc --arg subject "$subject" '{subject:$subject}')
+        log "recovered direction=$direction stage=send-client-timeout subject=$subject token=$token"
+      else
+        log "FAILED direction=$direction stage=send token=$token"
+        return 1
+      fi
+    fi
+  elif [[ $direction == silber-to-hetz ]]; then
+    recipient=$HETZ_RECIPIENT
+    if ! response=$(/usr/bin/timeout 30s "$FABRIC_BIN" exec silber -- "$SILBER_ST3" conversations send "$recipient" \
+      --from "$MONITOR" --subject 'soak request' \
+      --body "Reply once with exact receipt token $token." --json); then
+      if subject=$(recover_sent_subject "$recipient" "$token" "$((started + DEADLINE_SECONDS))"); then
+        response=$(/usr/bin/jq -nc --arg subject "$subject" '{subject:$subject}')
+        log "recovered direction=$direction stage=send-client-timeout subject=$subject token=$token"
+      else
+        log "FAILED direction=$direction stage=send token=$token"
+        return 1
+      fi
+    fi
+  else
+    log "invalid direction=$direction"
+    return 2
+  fi
+  if ! subject=$(/usr/bin/jq -er '.subject' <<<"$response" 2>/dev/null); then
+    if subject=$(recover_sent_subject "$recipient" "$token" "$((started + DEADLINE_SECONDS))"); then
+      log "recovered direction=$direction stage=send-response subject=$subject token=$token"
+    else
+      log "FAILED direction=$direction stage=send-response token=$token"
+      return 1
+    fi
+  fi
+  LAST_SUBJECT=$subject
+  deadline=$((started + DEADLINE_SECONDS))
+  while (( $(/usr/bin/date +%s) < deadline )); do
+    if thread=$(/usr/bin/timeout 15s "$ST3_BIN" conversations thread "$subject" --json 2>/dev/null); then
+      if ! count=$(/usr/bin/jq --arg subject "$subject" --arg token "$token" \
+        --arg recipient "$recipient" --arg monitor "$MONITOR" \
+        '[.[] | select(.in_reply_to == $subject and .from == $recipient and .to == $monitor and .content == $token)] | length' \
+        <<<"$thread"); then
+        log "FAILED direction=$direction subject=$subject token=$token stage=thread-parse"
+        return 1
+      fi
+      if (( count > 1 )); then
+        log "FAILED direction=$direction subject=$subject token=$token duplicate_matching_replies=$count"
+        return 1
+      fi
+      if (( count == 1 )); then
+        if ! reply_ids=$(/usr/bin/jq -r --arg subject "$subject" --arg recipient "$recipient" \
+          --arg monitor "$MONITOR" \
+          '.[] | select(.in_reply_to == $subject and .from == $recipient and .to == $monitor) | .subject' \
+          <<<"$thread"); then
+          log "FAILED direction=$direction subject=$subject token=$token stage=reply-parse"
+          return 1
+        fi
+        while IFS= read -r reply_id; do
+          [[ -z $reply_id ]] && continue
+          if ! /usr/bin/timeout 15s "$ST3_BIN" conversations archive "$reply_id" --as "$MONITOR" --json >/dev/null; then
+            log "FAILED direction=$direction subject=$subject token=$token stage=archive-reply"
+            return 1
+          fi
+        done <<<"$reply_ids"
+        log "ok direction=$direction subject=$subject token=$token latency_seconds=$(( $(/usr/bin/date +%s) - started )) matching_replies=$count"
+        return 0
+      fi
+    fi
+    /usr/bin/sleep 2
+  done
+  log "FAILED direction=$direction subject=$subject token=$token timeout_seconds=$DEADLINE_SECONDS"
+  return 1
+}
+
+state_field() {
+  local direction=$1 field=$2
+  /usr/bin/jq -r --arg field "$field" '.[$field] // empty' "$STATE_DIR/$direction.json" 2>/dev/null || true
+}
+
+save_state() {
+  local direction=$1 streak=$2 episode=$3 attention=$4 pending=$5 temporary
+  temporary=$(/usr/bin/mktemp "$STATE_DIR/$direction.XXXXXX")
+  /usr/bin/jq -nc --argjson streak "$streak" --argjson episode "$episode" \
+    --arg attention "$attention" --arg pending "$pending" \
+    '{streak:$streak,episode:$episode,attention:$attention,pending:$pending}' >"$temporary"
+  /usr/bin/mv "$temporary" "$STATE_DIR/$direction.json"
+}
+
+record_result() {
+  local direction=$1 succeeded=$2 streak episode attention pending response
+  streak=$(state_field "$direction" streak)
+  episode=$(state_field "$direction" episode)
+  attention=$(state_field "$direction" attention)
+  pending=$(state_field "$direction" pending)
+  streak=${streak:-0}
+  episode=${episode:-0}
+  if [[ $succeeded == true ]]; then
+    if [[ -n $attention ]]; then
+      if /usr/bin/timeout 20s "$ST3_BIN" attention withdraw "$attention" --as "$ST_AGENT" \
+        --reason "Cross-host delivery recovered; a fresh exact linked receipt passed." --json >/dev/null; then
+        log "withdrew recovered delivery attention=$attention direction=$direction"
+        attention=
+      else
+        log "warning: could not withdraw recovered delivery attention=$attention direction=$direction"
+      fi
+    fi
+    save_state "$direction" 0 "$episode" "$attention" ''
+    return
+  fi
+  if (( streak == 0 )); then
+    episode=$((episode + 1))
+  fi
+  streak=$((streak + 1))
+  pending=${LAST_SUBJECT:-send-failed}
+  save_state "$direction" "$streak" "$episode" "$attention" "$pending"
+  if (( streak < 3 )) || [[ -n $attention ]]; then
+    return
+  fi
+  local -a target_args=()
+  if [[ $pending == message/* ]]; then
+    target_args=(--target "$pending")
+  fi
+  if response=$(/usr/bin/timeout 20s "$ST3_BIN" attention request --as "$ST_AGENT" --for person/nathan \
+    --title "st3 cross-host delivery failing: $direction" \
+    --reason "Three consecutive exact-receipt probes failed in $direction; latest message $pending, token ${LAST_TOKEN:-unknown}. Inspect the st3-message-soak service journal and both recipient agents." \
+    "${target_args[@]}" --severity error \
+    --idempotency-key "st3-message-soak:$direction:$episode" --json); then
+    attention=$(/usr/bin/jq -er '.subject' <<<"$response") || attention=
+    save_state "$direction" "$streak" "$episode" "$attention" "$pending"
+    log "requested delivery attention=$attention direction=$direction streak=$streak"
+  else
+    log "warning: could not publish delivery attention direction=$direction streak=$streak"
+  fi
+}
+
+if [[ ${1:-} == --recover-sent-subject ]]; then
+  recover_sent_subject "${2:?pass exact recipient}" "${3:?pass exact token}"
+  exit
+fi
+
+if [[ ${1:-} == --once ]]; then
+  probe "${2:?pass hetz-to-silber or silber-to-hetz}"
+  exit
+fi
+
+direction=hetz-to-silber
+log 'monitor-started evidence_format=2'
+while true; do
+  if probe "$direction"; then
+    record_result "$direction" true
+  else
+    record_result "$direction" false
+    log "delivery soak will retry after ${INTERVAL_SECONDS}s"
+  fi
+  if [[ $direction == hetz-to-silber ]]; then
+    direction=silber-to-hetz
+  else
+    direction=hetz-to-silber
+  fi
+  /usr/bin/sleep "$INTERVAL_SECONDS"
+done

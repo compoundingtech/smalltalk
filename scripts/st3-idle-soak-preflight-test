@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+JQ_BIN=${ST3_SOAK_JQ_BIN:-$(command -v jq)}
+preflight="$(/usr/bin/dirname "$0")/st3-idle-soak-preflight"
+
+fixture() {
+  local host at
+  for host in hetz silber; do
+    for at in 0 60 120 180 240; do
+      "$JQ_BIN" -nc --arg host "$host" --argjson at "$at" \
+        '{at:$at,host:$host,pid:(if $host=="hetz" then 1 else 2 end),
+          cpu_seconds:($at / 2),rss_kib:100000,context_switches:$at,
+          graph_index:1,material_index:1,pending:0,peer_status:"up",
+          peer_error:false,peer_last_success_ms:($at*1000)}'
+    done
+  done
+}
+
+check() {
+  local expected=$1 evidence=$2 result status
+  if result=$(/usr/bin/printf '%s\n' "$evidence" | \
+    ST3_IDLE_REPORT_LOG=/dev/stdin ST3_IDLE_REPORT_NOW_UNIX=240 \
+    ST3_IDLE_PREFLIGHT_START_UNIX=0 "$preflight"); then
+    status=0
+  else
+    status=$?
+  fi
+  [[ $status == "$expected" ]] || {
+    /usr/bin/printf 'unexpected preflight status %s: %s\n' "$status" "$result" >&2
+    exit 1
+  }
+}
+
+base=$(fixture)
+# Preflight passes despite the intentionally excessive CPU: the full release
+# report remains the separate authority for its 24-hour CPU and RSS gates.
+check 0 "$base"
+check 1 "$("$JQ_BIN" -c 'select(.host!="silber")' <<<"$base")"
+check 1 "$("$JQ_BIN" -c 'if .host=="hetz" and .at==120 then .peer_error=true else . end' <<<"$base")"
+check 1 "$("$JQ_BIN" -c 'if .host=="silber" and .at==180 then .pid=3 else . end' <<<"$base")"
+check 1 "$("$JQ_BIN" -c 'if .at==60 or .at==120 or .at==180 then empty else . end' <<<"$base")"
+check 1 "$("$JQ_BIN" -c 'if .host=="hetz" and .at>=60 then empty else . end' <<<"$base")"
+/usr/bin/printf 'st3 idle soak preflight tests passed\n'

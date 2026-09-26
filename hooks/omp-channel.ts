@@ -384,6 +384,52 @@ export default function (pi: ExtensionAPI) {
     if (!child || !child.stdin || child.stdin.destroyed) return;
     child.stdin.write(JSON.stringify(frame) + "\n");
   };
+  const boundedTimelineString = (value: unknown, limit = 16_384): string | undefined =>
+    typeof value === "string" ? value.slice(0, limit) : undefined;
+  const normalizedTimelinePayload = (event: string, raw: unknown): Record<string, unknown> => {
+    const value = raw && typeof raw === "object" ? raw as Record<string, unknown> : {};
+    if (event === "tool_call") return {
+      toolCallId: boundedTimelineString(value.toolCallId ?? value.tool_call_id, 256),
+      toolName: boundedTimelineString(value.toolName ?? value.tool_name, 128),
+      input: { redacted: true },
+    };
+    if (event === "tool_result") return {
+      toolCallId: boundedTimelineString(value.toolCallId ?? value.tool_call_id, 256),
+      isError: value.isError === true,
+      content: { redacted: true },
+    };
+    const rawMessage = value.message;
+    const message = rawMessage && typeof rawMessage === "object"
+      ? rawMessage as Record<string, unknown>
+      : value;
+    let content: unknown = boundedTimelineString(message.content);
+    if (Array.isArray(message.content)) {
+      content = message.content.slice(0, 64).map((part) => {
+        if (typeof part === "string") return { text: part.slice(0, 16_384) };
+        if (!part || typeof part !== "object") return {};
+        return { text: boundedTimelineString((part as Record<string, unknown>).text) };
+      });
+    }
+    const usage = message.usage && typeof message.usage === "object"
+      ? message.usage as Record<string, unknown>
+      : undefined;
+    return { message: {
+      id: boundedTimelineString(message.id, 256),
+      role: boundedTimelineString(message.role, 32),
+      content,
+      usage: usage ? {
+        input: finiteOrNull(usage.input ?? usage.inputTokens),
+        output: finiteOrNull(usage.output ?? usage.outputTokens),
+      } : undefined,
+    } };
+  };
+  const sendTimeline = (event: string, payload: unknown) => {
+    try {
+      sendFrame({ type: "timeline", event, payload: normalizedTimelinePayload(event, payload) });
+    } catch {
+      // Observability remains fail-open; Rust applies the durable byte/redaction policy.
+    }
+  };
 
   // The idle edge without `agent_settled`: `ctx.isIdle()` is still false AT `agent_end` and
   // flips true within ~250ms (measured), so idle is the first true sample of a bounded poll
@@ -551,6 +597,7 @@ export default function (pi: ExtensionAPI) {
     onWidened(name, async (event, ctx) => {
       captureCost(event);
       sendContext(ctx);
+      if (name === "message_end") sendTimeline(name, event);
     });
   }
   // omp's `session_compact` carries NO `reason` and no `willRetry` — pi 0.84.2 has both — so the
@@ -596,6 +643,7 @@ export default function (pi: ExtensionAPI) {
   onWidened("tool_call", async (rawEvent) => {
     // Pinned pi declarations do not know OMP's tool events; the handler validates fields below.
     const event = rawEvent as ToolCallFrame;
+    sendTimeline("tool_call", rawEvent);
     const question = firstAskQuestion(event);
     if (!question || typeof event.toolCallId !== "string") return;
     state.pendingAskToolCallId = event.toolCallId;
@@ -610,6 +658,7 @@ export default function (pi: ExtensionAPI) {
   });
   onWidened("tool_result", async (rawEvent, ctx) => {
     const event = rawEvent as ToolResultFrame;
+    sendTimeline("tool_result", rawEvent);
     if (
       typeof event.toolCallId !== "string" ||
       event.toolCallId !== state.pendingAskToolCallId
@@ -662,14 +711,11 @@ export default function (pi: ExtensionAPI) {
     // prompt rather than the turn after it.
     const restored = await open(ctx);
     const opened = state.child;
-    // Seed the observed state with the idle proof's answer at open time, so the record does not
-    // wait for the first turn boundary to exist.
+    // Do not seed an idle state here. `session_start` precedes a positional boot prompt, and an
+    // idle frame would authorize the channel to inject mail before omp has created the transcript
+    // for that prompt. The post-`agent_end` idle proof is the first transcript-ready edge.
     if (opened) {
-      sendFrame({
-        type: "state",
-        state: idleProof(ctx) ? "idle" : "active",
-      });
-      // And seed the context record, so a resumed session publishes the window it resumed INTO
+      // Seed only the context record, so a resumed session publishes the window it resumed INTO
       // rather than waiting for its first turn boundary.
       sendContext(ctx);
     }

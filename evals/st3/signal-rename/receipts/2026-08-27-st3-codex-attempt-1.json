@@ -1,0 +1,39 @@
+{
+  "schema": "st3-eval-proof.v1",
+  "date": "2026-08-27",
+  "eval": "signal-rename-codex",
+  "paid_attempt": 1,
+  "candidate": {
+    "git_head": "5e72de6ff155e23db184ad5630264d43015ed504",
+    "working_tree": "dirty",
+    "st3_version": "0.1.0",
+    "st3_binary_sha256": "4c7f8ff2fc241c1f57c2cc272c33cc1ea28e189ea33c35cb18d79755511f861c",
+    "eval_kdl_sha256": "7c0e5470786fd00e79f7a121db848abc4b3c4da1d0bf8b07bbb7eae08a0319dd",
+    "task_document_sha256": "f12083c4ec4a7b2d6d9af20a5acdd89663a31532f4a3cee10c43fe283f61f1de"
+  },
+  "providers": {
+    "codex_cli": "0.145.0",
+    "pty": "0.12.0+face607"
+  },
+  "usage": {
+    "model_agents_started": 0,
+    "reset_redeemed": false
+  },
+  "result": {
+    "done": false,
+    "materialize_checkpoint_passed": true,
+    "stopped_checkpoint": "The eval team is running",
+    "cause": "An event waiter consumed the shared notification after the next checkpoint became active.",
+    "evidence": [
+      "The materialize command exited successfully.",
+      "The team checkpoint became active.",
+      "No native provider PTY started.",
+      "The store stopped at index 24."
+    ],
+    "fix": {
+      "description": "The API now uses separate reconcile and event notifications.",
+      "test": "api::tests::an_event_waiter_cannot_consume_the_reconciler_signal",
+      "fixed_binary_sha256": "66a55333ab19542e036a7241b7b32cedab7699d91eaba31eb4e5470ffdfd07e6"
+    }
+  }
+}

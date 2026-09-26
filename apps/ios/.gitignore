@@ -1,0 +1,25 @@
+node_modules/
+.expo/
+dist/
+web-build/
+
+# Expo prebuild and local Xcode output. These can contain signing team IDs,
+# provisioning details, absolute paths, and device-specific settings.
+/ios/
+/android/
+/build/
+/.gems/
+
+# Local configuration and signing material must never be committed.
+.env
+.env.*
+!.env.example
+*.mobileprovision
+*.p12
+*.cer
+*.key
+*.pem
+*.ipa
+
+# Local render-proof screenshots (which may include device or account details).
+/*proof*.png

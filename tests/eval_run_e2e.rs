@@ -741,7 +741,7 @@ for _ in $(seq 1 100); do
   set -- "$CATALOG/agents/evalhost/interviewer/resources/inbox/"*.md
   if [ -e "$1" ]; then
     sleep 0.02
-    st2 message send requester --root "$ST_ROOT" --as evalhost.interviewer -m "done" >/dev/null 2>&1
+    st2 message send requester --root "$ST_ROOT" --as evalhost.interviewer -m "done"
     echo "completed through frozen route"
     break
   fi
@@ -800,8 +800,10 @@ eval {
 
 #[test]
 fn canonical_agents_fail_closed_matrix_is_pre_spawn_and_non_vacuous() {
+    type Case<'a> = (&'a str, &'a str, Vec<(&'a str, &'a str)>);
+
     let bin = env!("CARGO_BIN_EXE_st2");
-    let cases: Vec<(&str, &str, Vec<(&str, &str)>)> = vec![
+    let cases: Vec<Case<'_>> = vec![
         (
             "unknown-type",
             "evalhost.worker",
@@ -819,7 +821,7 @@ fn canonical_agents_fail_closed_matrix_is_pre_spawn_and_non_vacuous() {
             )],
         ),
         (
-            "dangling-supervisor",
+            "supervisor-missing",
             "evalhost.worker",
             vec![(
                 "worker",

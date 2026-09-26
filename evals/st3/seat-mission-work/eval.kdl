@@ -1,0 +1,26 @@
+version 2
+
+agent "eval/seat-mission-work/worker" {
+  workspace "${EVAL_ROOT}"
+  restart "never"
+  harness "codex" {
+    model "gpt-6-sol"
+    effort "medium"
+    args "--dangerously-bypass-approvals-and-sandbox" "--dangerously-bypass-hook-trust"
+  }
+}
+
+mission "eval/seat-mission-work" state="ready" timeout="20m" {
+  goal "A first-class durable seat completes ordinary finite mission work."
+
+  step "work" timeout="15m" {
+    assigned-to "agent/eval/seat-mission-work/worker"
+    goal "Create seat-proof.txt and report the work complete."
+    gate "the durable seat produced the requested artifact" {
+      exec "test \"$(cat seat-proof.txt)\" = \"seat completed work\""
+      host "local"
+      workspace "${ST_WORKSPACE}"
+      time-limit "30s"
+    }
+  }
+}

@@ -116,8 +116,7 @@ pub fn roster_from_discovered(
                 id: s.effective_id(this_host),
                 address: s.effective_address().to_owned(),
                 // A retired subject does not resolve and does not occupy the address namespace.
-                bus_address: (!s.desired_state.is_retired())
-                    .then(|| s.bus_address(this_host)),
+                bus_address: (!s.desired_state.is_retired()).then(|| s.bus_address(this_host)),
             })
         })
         .collect();
@@ -583,6 +582,10 @@ mod tests {
             ask: harness_state::Ask::None,
             harness: Some("codex".to_string()),
             since_ms: Some(1784653000000),
+            observed_at_ms: None,
+            ownership_sequence: None,
+            transition_sequence: None,
+            evidence_incarnation: None,
             exit: None,
             reason: None,
         });
@@ -604,6 +607,10 @@ mod tests {
             ask: harness_state::Ask::Unknown,
             harness: Some("codex".to_string()),
             since_ms: None,
+            observed_at_ms: None,
+            ownership_sequence: None,
+            transition_sequence: None,
+            evidence_incarnation: None,
             exit: None,
             reason: Some("session-dead".to_string()),
         });
@@ -627,6 +634,10 @@ mod tests {
             ask: harness_state::Ask::Unknown,
             harness: Some("codex".to_string()),
             since_ms: None,
+            observed_at_ms: None,
+            ownership_sequence: None,
+            transition_sequence: None,
+            evidence_incarnation: None,
             exit: None,
             reason: Some("session-dead".to_string()),
         });
@@ -724,6 +735,10 @@ mod tests {
             ask: harness_state::Ask::None,
             harness: Some("claude".to_string()),
             since_ms: Some(1788000100000),
+            observed_at_ms: None,
+            ownership_sequence: None,
+            transition_sequence: None,
+            evidence_incarnation: None,
             exit: None,
             reason: None,
         });

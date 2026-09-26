@@ -1,0 +1,56 @@
+version 2
+
+  mission "eval/mixed-worker-pool" state="ready" timeout="20m" {
+    completion { when "all-steps-exhausted" }
+    goal "A Codex agent and a Claude agent each claim one step from the same explicit worker pool."
+
+    step "start-pool" timeout="10m" {
+      agentless
+      title "Both pool agents are ready"
+        agent "pool.codex" {
+          workspace "${ST_WORKSPACE}"
+          harness "codex" {
+            args "--dangerously-bypass-approvals-and-sandbox" "--dangerously-bypass-hook-trust"
+          }
+        }
+        agent "pool.claude" {
+          workspace "${ST_WORKSPACE}"
+          under "agent/${ST_MISSION_RUN}/pool.codex" reason="share one bounded work pool"
+          harness "claude" {
+            model "claude-sonnet-5"
+            args "--permission-mode" "bypassPermissions"
+          }
+        }
+      gate "Codex is reachable" { field "reachability" "agent/${ST_MISSION_RUN}/pool.codex" "is" "reachable" }
+      gate "Claude is reachable" { field "reachability" "agent/${ST_MISSION_RUN}/pool.claude" "is" "reachable" }
+    }
+
+    step "pool-a" timeout="10m" {
+      title "One pool member writes marker A"
+      goal "Write your exact ST_AGENT value to pool-a.txt. Complete this step after the file exists."
+      available-to "agent/${ST_MISSION_RUN}/pool.codex"
+      available-to "agent/${ST_MISSION_RUN}/pool.claude"
+      depends-on { step "start-pool" completed }
+      gate "marker A exists" { exec "test -f pool-a.txt"; host "local"; workspace "${ST_WORKSPACE}" }
+    }
+
+    step "pool-b" timeout="10m" {
+      title "The other pool member writes marker B"
+      goal "Write your exact ST_AGENT value to pool-b.txt. Complete this step after the file exists."
+      available-to "agent/${ST_MISSION_RUN}/pool.codex"
+      available-to "agent/${ST_MISSION_RUN}/pool.claude"
+      depends-on { step "start-pool" completed }
+      gate "marker B exists" { exec "test -f pool-b.txt"; host "local"; workspace "${ST_WORKSPACE}" }
+    }
+
+    step "held-out-gate" timeout="2m" {
+      agentless
+      depends-on { step "pool-a" completed; step "pool-b" completed }
+      gate "both harnesses completed distinct pool work" {
+        exec "grep -Fxq agent/${ST_MISSION_RUN}/pool.codex pool-a.txt pool-b.txt && grep -Fxq agent/${ST_MISSION_RUN}/pool.claude pool-a.txt pool-b.txt && ! cmp -s pool-a.txt pool-b.txt"
+        host "local"
+        workspace "${ST_WORKSPACE}"
+        time-limit "1m"
+      }
+    }
+  }

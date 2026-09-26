@@ -1,0 +1,65 @@
+version 2
+
+mission "eval/work-wake-reliability" state="ready" timeout="40m" {
+  completion { when "all-steps-exhausted" }
+  goal "Repeatedly prove that ordinary mission lifecycle changes wake a real worker and reach terminal graph state."
+
+  agent "wake.worker" {
+    workspace "${ST_WORKSPACE}"
+    harness "codex" {
+      model "gpt-5.6-terra"
+      effort "medium"
+      args "--dangerously-bypass-approvals-and-sandbox" "--dangerously-bypass-hook-trust"
+    }
+    restart "always"
+    restart {
+      attempts 4
+      interval "10m"
+      delay "1s"
+      mode "delay"
+    }
+    env {
+      PATH "${ST_WORKSPACE}/audit-bin:${PATH}"
+      PTY_AUDIT_LOG "${ST_WORKSPACE}/pty-audit.log"
+    }
+  }
+
+  step "exercise-work-wakes" timeout="35m" {
+    agentless
+    title "Fresh runs, revisions, replacement, and cancellation all converge"
+    exec "work-wake-reliability/controller" {
+      host "local"
+      workspace "${ST_WORKSPACE}"
+      cwd "${ST_WORKSPACE}"
+      command "bash ./controller.sh"
+      restart "never"
+    }
+    gate "the lifecycle controller completed every scenario" {
+      field "exit_code" "exec/${ST_MISSION_RUN}/work-wake-reliability/controller" is 0
+    }
+  }
+
+  step "held-out-gates" timeout="4m" {
+    agentless
+    depends-on { step "exercise-work-wakes" completed }
+    gate "every lifecycle transition has durable wake evidence" {
+      exec "bash ./judges/lifecycle.sh"
+      host "local"
+      workspace "${ST_WORKSPACE}"
+      time-limit "3m"
+    }
+    gate "no terminal input path participated" {
+      exec "bash ./judges/no-terminal-input.sh"
+      host "local"
+      workspace "${ST_WORKSPACE}"
+      time-limit "1m"
+    }
+  }
+
+  finally {
+    step "cleanup-worker" timeout="2m" {
+      agentless
+      stop "agent/${ST_MISSION_RUN}/wake.worker"
+    }
+  }
+}

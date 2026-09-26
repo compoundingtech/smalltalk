@@ -1,0 +1,43 @@
+version 2
+
+  resource "local-file-refresh/file" {
+    kind "filesystem.file"
+  }
+
+  mission "eval/local-file-refresh" state="ready" timeout="20m" {
+    completion { when "all-steps-exhausted" }
+    goal "Refresh one local file observation without exposing its content."
+
+      observer "file" {
+        resource "resource/local-file-refresh/file"
+        provider "local.file"
+        locator "${ST_WORKSPACE}/watched.txt"
+        field "status"
+        field "content_hash"
+        field "size"
+      }
+
+    step "change-and-refresh" timeout="1m" {
+      agentless
+      title "A manual refresh observes one file change"
+        exec "local-file-refresh/change" {
+          host "local"
+          workspace "${ST_WORKSPACE}"
+          command "bash ./refresh.sh"
+          restart "never"
+        }
+      gate "condition-1" { field "status" "exec/${ST_MISSION_RUN}/local-file-refresh/change" "is" "exited" }
+      gate "condition-2" { field "exit_code" "exec/${ST_MISSION_RUN}/local-file-refresh/change" "is" 0 }
+    }
+
+    step "verify-refresh" timeout="1m" {
+      agentless
+      depends-on { step "change-and-refresh" completed }
+      gate "the refresh completed and kept file content private" {
+        exec "bash ./judge.sh"
+        host "local"
+        workspace "${ST_WORKSPACE}"
+        time-limit "1m"
+      }
+    }
+  }

@@ -1,0 +1,11 @@
+version 2
+
+mission "eval/work-wake-reliability/fresh" state="ready" {
+  completion { when "all-steps-exhausted" }
+  goal "Prove one newly started mission wakes its assigned worker."
+
+  step "respond" timeout="5m" {
+    assigned-to "{{WORKER}}"
+    goal "Claim this ready work, record one concise progress update containing FRESH-WAKE-PROOF, then complete it with a concise summary. Do not modify repository files."
+  }
+}

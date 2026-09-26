@@ -896,7 +896,7 @@ validate ──► materialize ──► host-local st2 scheduler/reconciler
 
   The canonical `agent` task treats a reconciler's ambient `NO_COLOR` as a
   launcher preference rather than agent policy. Unless the Agent Spec declares
-  `NO_COLOR`, st2 removes it from the launch environment and records the removal
+  `NO_COLOR`, the runtime removes it from the launch environment and records the removal
   in the PTY launch definition. An explicit Agent Spec assignment takes
   precedence. Isolation wrappers preserve both assignments and removals, so a
   manual PTY restart under a different ambient environment reconstructs the

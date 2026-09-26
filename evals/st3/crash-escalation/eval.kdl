@@ -1,0 +1,36 @@
+version 2
+
+  mission "eval/crash-escalation" state="ready" timeout="20m" {
+    completion { when "all-steps-exhausted" }
+    goal "Complete mission eval/crash-escalation."
+    step "faults" timeout="1m" {
+      title "The runtime classifies abnormal and clean exits"
+        exec "eval/crash-escalation/crash" {
+          host "local"
+          workspace "${ST_WORKSPACE}"
+          command "exit 17"
+          restart "always"
+          restart { attempts 1; interval "60s"; mode "fail" }
+        }
+        exec "eval/crash-escalation/clean" {
+          host "local"
+          workspace "${ST_WORKSPACE}"
+          command "exit 0"
+          restart "never"
+        }
+      gate "condition-1" { field "reachability" "exec/${ST_MISSION_RUN}/eval/crash-escalation/crash" "is" "unreachable" }
+      gate "condition-2" { field "exit_code" "exec/${ST_MISSION_RUN}/eval/crash-escalation/crash" "is" 17 }
+      gate "condition-3" { field "status" "exec/${ST_MISSION_RUN}/eval/crash-escalation/clean" "is" "exited" }
+      gate "condition-4" { field "exit_code" "exec/${ST_MISSION_RUN}/eval/crash-escalation/clean" "is" 0 }
+    }
+    step "gate" timeout="1m" {
+      depends-on { step "faults" completed }
+      gate "only the abnormal exit has a raised supervision decision" {
+        exec "bash ./judge.sh"
+        host "local"
+        workspace "${ST_WORKSPACE}/fixture"
+
+        time-limit "1m"
+      }
+    }
+  }

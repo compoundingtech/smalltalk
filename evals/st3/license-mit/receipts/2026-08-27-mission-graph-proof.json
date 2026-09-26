@@ -1,0 +1,29 @@
+{
+  "schema": "st3-mission-graph-proof.v1",
+  "date": "2026-08-27",
+  "eval": "license-mit-codex",
+  "mission_run": "a2bc8b2a55fd29d9791d30bb4eca0c9a",
+  "mission_revision": "dc20eb27ab168cc1d45922dae0b39cd8179477eb7789109f6b0c1ed9085670e2",
+  "candidate": {
+    "git_head": "2a8c645b69f7f18acd76746e62b88d357a35234a",
+    "working_tree": "dirty",
+    "st3_version": "0.1.0",
+    "st3_binary_sha256": "3baa605bb9ec4639de6f65881621b9b2a4670e1f9e1481cc4295887f5f108bf7",
+    "eval_kdl_sha256": "fe473240dbe91f34e3036f96eb4bb01a81bfe5969db75ca9ba529b623b65ba80"
+  },
+  "result": {
+    "done": true,
+    "verdict": "pass",
+    "cleanup_complete": true,
+    "worker_commit": "652e340585bf8a545324ac078d2b093b668ff324",
+    "judges": [
+      "team completion",
+      "isolation",
+      "coordination",
+      "canonical MIT license",
+      "MIT package metadata",
+      "committed clean tree",
+      "Codex verification"
+    ]
+  }
+}

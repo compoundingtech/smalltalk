@@ -70,7 +70,10 @@ pub(crate) fn reap_detached(child: std::process::Child) {
 /// after the direct child times out.
 /// The child still gets a fresh process group so the common wrapper-and-descendants case is reaped.
 #[cfg(test)]
-pub(super) fn output_with_timeout(command: &mut Command, timeout: Duration) -> anyhow::Result<Output> {
+pub(super) fn output_with_timeout(
+    command: &mut Command,
+    timeout: Duration,
+) -> anyhow::Result<Output> {
     output_with_input_timeout(command, timeout, None)
 }
 

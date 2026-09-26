@@ -15,8 +15,8 @@
 //! [`WasmResolver::resolve_contained`].
 
 use crate::profile::ProfileDescriptor;
-use serde::de::DeserializeOwned;
 use serde::Deserialize;
+use serde::de::DeserializeOwned;
 use wasmtime::{
     Config, Engine, Instance, Memory, Module, Store, StoreLimits, StoreLimitsBuilder, Trap,
     TypedFunc,
@@ -130,8 +130,8 @@ impl WasmResolver {
     /// Compile an in-memory binary (tests use this with inline WAT).
     pub fn from_wat(wat: &str) -> Result<Self, WasmResolveError> {
         let engine = engine();
-        let module =
-            Module::new(&engine, wat).map_err(|e| WasmResolveError::Instantiation(e.to_string()))?;
+        let module = Module::new(&engine, wat)
+            .map_err(|e| WasmResolveError::Instantiation(e.to_string()))?;
         Ok(Self {
             engine,
             module,
@@ -438,8 +438,8 @@ impl WasmInstance {
 
         // No WASI, no imports: the demo protocol is closed. Import-requiring modules fail here,
         // which is itself containment (an untrusted module cannot reach the host environment).
-        let instance = Instance::new(&mut store, &resolver.module, &[])
-            .map_err(classify_wasmtime_error)?;
+        let instance =
+            Instance::new(&mut store, &resolver.module, &[]).map_err(classify_wasmtime_error)?;
         let alloc = instance
             .get_typed_func::<i32, i32>(&mut store, "alloc")
             .map_err(|_| WasmResolveError::MissingExport("alloc"))?;
@@ -533,10 +533,7 @@ impl WasmInstance {
         }
     }
 
-    fn decode_packed_json<T: DeserializeOwned>(
-        &self,
-        packed: i64,
-    ) -> Result<T, WasmResolveError> {
+    fn decode_packed_json<T: DeserializeOwned>(&self, packed: i64) -> Result<T, WasmResolveError> {
         let ret_ptr = (packed >> 32) as u32 as usize;
         let ret_len = (packed as u32) as usize;
         if ret_len > DEFAULT_OUTPUT_LIMIT_BYTES {
@@ -545,8 +542,9 @@ impl WasmInstance {
             )));
         }
         let bytes = self.read_guest_bytes(ret_ptr, ret_len)?;
-        let text = std::str::from_utf8(bytes)
-            .map_err(|e| WasmResolveError::BadReturn(format!("return payload is not UTF-8: {e}")))?;
+        let text = std::str::from_utf8(bytes).map_err(|e| {
+            WasmResolveError::BadReturn(format!("return payload is not UTF-8: {e}"))
+        })?;
         serde_json::from_str(text).map_err(|e| WasmResolveError::BadReturn(e.to_string()))
     }
 
@@ -566,14 +564,16 @@ impl WasmInstance {
         self.funcs
             .memory
             .write(&mut self.store, ptr as usize, bytes)
-            .map_err(|e| WasmResolveError::BadReturn(format!("host write into guest memory failed: {e}")))?;
+            .map_err(|e| {
+                WasmResolveError::BadReturn(format!("host write into guest memory failed: {e}"))
+            })?;
         Ok(ptr)
     }
 
     fn read_guest_bytes(&self, ptr: usize, len: usize) -> Result<&[u8], WasmResolveError> {
-        let end = ptr.checked_add(len).ok_or_else(|| {
-            WasmResolveError::BadReturn("return length overflows".to_string())
-        })?;
+        let end = ptr
+            .checked_add(len)
+            .ok_or_else(|| WasmResolveError::BadReturn("return length overflows".to_string()))?;
         self.funcs
             .memory
             .data(&self.store)

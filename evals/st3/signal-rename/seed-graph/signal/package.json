@@ -1,0 +1,19 @@
+{
+  "name": "@acme/signal",
+  "version": "1.4.0",
+  "description": "In-process named signal bus — publish and subscribe to product signals.",
+  "type": "module",
+  "license": "MIT",
+  "exports": {
+    ".": "./src/index.js"
+  },
+  "bin": {
+    "signal": "./bin/signal.js"
+  },
+  "scripts": {
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

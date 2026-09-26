@@ -1,0 +1,13 @@
+{
+  "provenance": {
+    "harness": "claude",
+    "version": "hook-contract-2026-09-20",
+    "source": "redacted Claude Code hook payload capture"
+  },
+  "events": [
+    {"event":"UserPromptSubmit","payload":{"session_id":"session-fixture","hook_event_name":"UserPromptSubmit","prompt":"# Release\n\nKeep  two spaces.\nAuthorization: fixture-secret"}},
+    {"event":"PreToolUse","payload":{"session_id":"session-fixture","hook_event_name":"PreToolUse","tool_name":"Bash","tool_use_id":"toolu_fixture","tool_input":{"command":"printf sk-fixture-secret"}}},
+    {"event":"PostToolUse","payload":{"session_id":"session-fixture","hook_event_name":"PostToolUse","tool_name":"Bash","tool_use_id":"toolu_fixture","tool_response":"sk-fixture-secret","error":null}},
+    {"event":"Stop","payload":{"session_id":"session-fixture","hook_event_name":"Stop","stop_hook_active":false}}
+  ]
+}

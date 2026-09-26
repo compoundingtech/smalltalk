@@ -10,9 +10,7 @@
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
-use crate::declared::{
-    DeclaredDiagnosticCode, DeclaredParse, parse_declared_document,
-};
+use crate::declared::{DeclaredDiagnosticCode, DeclaredParse, parse_declared_document};
 use crate::spec::{AgentSpec, RawSpec};
 
 /// The result of walking a catalog folder. Sorted + deterministic.
@@ -83,7 +81,8 @@ pub fn discover_strict(root: &Path) -> Discovered {
 /// `root` supplies the same path defaults as [`discover`]. The returned warnings describe only
 /// this file.
 pub fn discover_file(root: &Path, path: &Path) -> anyhow::Result<(Vec<AgentSpec>, Vec<String>)> {
-    let raws = parse_raw_file(Some(root), path)?;
+    let nested_in_bundle = is_nested_in_declaration_bundle(root, path);
+    let raws = parse_raw_file_with_context(Some(root), path, nested_in_bundle).raws?;
     load_specs(root, path, raws)
 }
 
@@ -94,13 +93,15 @@ fn discover_impl(root: &Path, strict: bool) -> Discovered {
     collect_spec_files(root, root, &mut files, strict, &mut out.errors);
     files.sort();
     for path in files {
+        let nested_in_bundle = is_nested_in_declaration_bundle(root, &path);
         let ParsedRawFile { raws, declaration } =
-            parse_raw_file_with_declaration(Some(root), &path);
+            parse_raw_file_with_context(Some(root), &path, nested_in_bundle);
         let agents = raws
             .as_ref()
             .map(|raws| raws.iter().map(Declared::from).collect())
             .unwrap_or_default();
-        let is_generic_agent = path.file_stem().and_then(|stem| stem.to_str()) == Some("agent");
+        let is_generic_agent =
+            path.file_stem().and_then(|stem| stem.to_str()) == Some("agent") && !nested_in_bundle;
         let is_declaration = is_generic_agent
             || raws
                 .as_ref()
@@ -124,6 +125,24 @@ fn discover_impl(root: &Path, strict: bool) -> Discovered {
         }
     }
     out
+}
+
+/// Whether `path` is static content below an existing declaration directory.
+///
+/// A nested file can itself declare an agent through agent-shaped content. Its generic filename
+/// alone does not reserve a second declaration below the first agent's bundle.
+fn is_nested_in_declaration_bundle(root: &Path, path: &Path) -> bool {
+    let mut ancestor = path.parent().and_then(Path::parent);
+    while let Some(dir) = ancestor {
+        if dir == root {
+            break;
+        }
+        if is_declaration_parent(root, dir) {
+            return true;
+        }
+        ancestor = dir.parent();
+    }
+    false
 }
 
 /// Whether `path` is in catalog declaration space rather than a known control/runtime namespace.
@@ -281,12 +300,13 @@ fn is_canonical_bundle_descendant(root: &Path, path: &Path) -> bool {
     let Ok(relative) = path.strip_prefix(root) else {
         return false;
     };
-    let mut components = relative.components().filter_map(|component| match component {
-        Component::Normal(name) => Some(name),
-        _ => None,
-    });
-    components.next().and_then(|name| name.to_str()) == Some("agents")
-        && components.count() >= 4
+    let mut components = relative
+        .components()
+        .filter_map(|component| match component {
+            Component::Normal(name) => Some(name),
+            _ => None,
+        });
+    components.next().and_then(|name| name.to_str()) == Some("agents") && components.count() >= 4
 }
 
 fn has_spec_extension(path: &Path) -> bool {
@@ -381,6 +401,14 @@ struct ParsedRawFile {
 }
 
 fn parse_raw_file_with_declaration(catalog_root: Option<&Path>, path: &Path) -> ParsedRawFile {
+    parse_raw_file_with_context(catalog_root, path, false)
+}
+
+fn parse_raw_file_with_context(
+    catalog_root: Option<&Path>,
+    path: &Path,
+    nested_in_bundle: bool,
+) -> ParsedRawFile {
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
     let text = match fs::read_to_string(path) {
         Ok(text) => text,
@@ -398,7 +426,8 @@ fn parse_raw_file_with_declaration(catalog_root: Option<&Path>, path: &Path) -> 
             .document
             .as_ref()
             .is_some_and(|document| document.agents.is_empty())
-            && path.file_stem().and_then(|stem| stem.to_str()) != Some("agent");
+            && (path.file_stem().and_then(|stem| stem.to_str()) != Some("agent")
+                || nested_in_bundle);
         let raws = if declaration.is_valid() || is_adjacent_kdl {
             crate::kdl_format::lower_declared_document(
                 declaration

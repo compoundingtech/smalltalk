@@ -1,0 +1,408 @@
+version 2
+
+  mission "eval/signal-rename-codex" state="ready" timeout="20m" {
+    completion { when "all-steps-exhausted" }
+    goal "Complete mission eval/signal-rename-codex."
+    step "materialize" timeout="30m" {
+      title "The isolated workspace exists"
+        exec "eval/signal-rename-codex/materialize" {
+          host "local"
+          workspace "${ST_WORKSPACE}"
+          cwd "${ST_WORKSPACE}"
+          command "bash ./materialize.sh"
+          restart "never"
+          env {
+            CATALOG "${ST_WORKSPACE}"
+            ST_ROOT "${ST_WORKSPACE}/.st3-messages"
+            ST3_MESSAGE_ROOT "${ST_WORKSPACE}/.st3-messages"
+          }
+        }
+      gate "condition-1" { field "status" "exec/${ST_MISSION_RUN}/eval/signal-rename-codex/materialize" "is" "exited" }
+      gate "condition-2" { field "exit_code" "exec/${ST_MISSION_RUN}/eval/signal-rename-codex/materialize" "is" 0 }
+    }
+
+    step "start-team" timeout="10m" {
+      title "The four native Codex agents are ready"
+      depends-on { step "materialize" completed }
+        agent "sig.sup" {
+          workspace "${ST_WORKSPACE}/sup"
+          harness "codex" {
+            model "gpt-5.6-sol"
+            effort "medium"
+            args "--dangerously-bypass-approvals-and-sandbox" "--dangerously-bypass-hook-trust"
+          }
+          restart "never"
+          env {
+            CATALOG "${ST_WORKSPACE}"
+            ST_ROOT "${ST_WORKSPACE}/.st3-messages"
+            ST3_MESSAGE_ROOT "${ST_WORKSPACE}/.st3-messages"
+          }
+        }
+        agent "sig.base" {
+          workspace "${ST_WORKSPACE}/base"
+          harness "codex" {
+            model "gpt-5.6-sol"
+            effort "medium"
+            args "--dangerously-bypass-approvals-and-sandbox" "--dangerously-bypass-hook-trust"
+          }
+          restart "never"
+          env {
+            CATALOG "${ST_WORKSPACE}"
+            ST_ROOT "${ST_WORKSPACE}/.st3-messages"
+            ST3_MESSAGE_ROOT "${ST_WORKSPACE}/.st3-messages"
+          }
+        }
+        agent "sig.relay" {
+          workspace "${ST_WORKSPACE}/relay"
+          harness "codex" {
+            model "gpt-5.6-sol"
+            effort "medium"
+            args "--dangerously-bypass-approvals-and-sandbox" "--dangerously-bypass-hook-trust"
+          }
+          restart "never"
+          env {
+            CATALOG "${ST_WORKSPACE}"
+            ST_ROOT "${ST_WORKSPACE}/.st3-messages"
+            ST3_MESSAGE_ROOT "${ST_WORKSPACE}/.st3-messages"
+          }
+        }
+        agent "sig.hub" {
+          workspace "${ST_WORKSPACE}/hub"
+          harness "codex" {
+            model "gpt-5.6-sol"
+            effort "medium"
+            args "--dangerously-bypass-approvals-and-sandbox" "--dangerously-bypass-hook-trust"
+          }
+          restart "never"
+          env {
+            CATALOG "${ST_WORKSPACE}"
+            ST_ROOT "${ST_WORKSPACE}/.st3-messages"
+            ST3_MESSAGE_ROOT "${ST_WORKSPACE}/.st3-messages"
+          }
+        }
+    }
+
+    step "open-base-compatibility" timeout="30m" {
+      title "The base provides Beacon through a temporary compatibility window"
+      goal "Rename the base package, CLI, and protocol first. Provide the Beacon product while temporarily honoring the old product surface. Preserve only a migration window. Do not close it in this step."
+      assigned-to "agent/${ST_MISSION_RUN}/sig.base"
+      depends-on { step "start-team" completed }
+
+      mission "work" {
+
+        completion { when "all-steps-exhausted" }
+        goal "Complete mission work."
+        step "inspect-product-surface" {
+          title "Classify every base product identifier"
+          goal "Inspect the base package, CLI, protocol, tests, and documentation. Separate product identifiers from unrelated runtime primitives."
+        }
+        step "implement-dual-honor-cutover" {
+          title "Publish the Beacon base with temporary compatibility"
+          goal "Rename the signal/ package directory to beacon/, @acme/signal to @acme/beacon, the signal CLI to beacon, and signal/1 to beacon/1. Keep only the minimum temporary compatibility that lets consumers migrate safely."
+          depends-on { step "inspect-product-surface" completed }
+        }
+        step "test-base-compatibility" {
+          title "The base package tests pass during the compatibility window"
+          goal "Run node --test in the base package. Fix only base-owned files."
+          depends-on { step "implement-dual-honor-cutover" completed }
+        }
+        step "publish-base-compatibility" {
+          title "The base compatibility revision is published"
+          goal "Commit and push the base-only change. Let SHA be git rev-parse HEAD. Run: \"$ST3_BIN\" claim resource/mission-run/$ST_MISSION_RUN/base-compatibility resource.observed --actor agent/${ST_MISSION_RUN}/sig.base --field kind=vcs.commit --field state=published --field sha=SHA. Then complete the step without --evidence."
+          depends-on { step "test-base-compatibility" completed }
+          produces {
+            resource "mission-run/${ST_MISSION_RUN}/base-compatibility" {
+              kind "vcs.commit"
+              state "published"
+            }
+          }
+        }
+      }
+    }
+
+    step "migrate-relay" timeout="30m" {
+      title "The relay uses the Beacon product"
+      goal "Migrate only the relay product surface after the base compatibility revision exists. Preserve AbortSignal, controller.signal, the signal cancellation option, SIGTERM, and all OS signal behavior."
+      assigned-to "agent/${ST_MISSION_RUN}/sig.relay"
+      depends-on { step "open-base-compatibility" completed }
+
+      mission "work" {
+
+        completion { when "all-steps-exhausted" }
+        goal "Complete mission work."
+        step "sync-base-compatibility" {
+          title "The relay clone contains the base compatibility revision"
+          goal "Fetch and fast-forward or rebase onto origin/main. Confirm that the Beacon base surface exists before changing the relay."
+        }
+        step "classify-relay-identifiers" {
+          title "Relay product and primitive identifiers are classified"
+          goal "Find product package, import, scheme, file, test, and documentation names. Separately record AbortSignal, controller.signal, signal options, SIGTERM, and OS signal uses that must remain unchanged."
+          depends-on { step "sync-base-compatibility" completed }
+        }
+        step "rename-relay-product" {
+          title "The relay product surface uses Beacon"
+          goal "Rename the relay package directory, peer dependency, import shim, address scheme, tests, comments, and documentation. Do not rename any runtime primitive."
+          depends-on { step "classify-relay-identifiers" completed }
+        }
+        step "test-relay" {
+          title "The relay product and primitive tests pass"
+          goal "Run node --test in the relay package. Confirm that the product changed and every runtime primitive still works."
+          depends-on { step "rename-relay-product" completed }
+        }
+        step "publish-relay-revision" {
+          title "The relay revision is published"
+          goal "Commit and push the relay-only change. Resolve a concurrent push without editing another lane. Let SHA be git rev-parse HEAD. Run: \"$ST3_BIN\" claim resource/mission-run/$ST_MISSION_RUN/relay-revision resource.observed --actor agent/${ST_MISSION_RUN}/sig.relay --field kind=vcs.commit --field state=published --field sha=SHA. Then complete the step without --evidence."
+          depends-on { step "test-relay" completed }
+          produces {
+            resource "mission-run/${ST_MISSION_RUN}/relay-revision" {
+              kind "vcs.commit"
+              state "published"
+            }
+          }
+        }
+      }
+    }
+
+    step "migrate-hub" timeout="30m" {
+      title "The hub uses the Beacon product"
+      goal "Migrate only the hub product surface after the base compatibility revision exists. Rename the resource scheme consistently with the relay."
+      assigned-to "agent/${ST_MISSION_RUN}/sig.hub"
+      depends-on { step "open-base-compatibility" completed }
+
+      mission "work" {
+
+        completion { when "all-steps-exhausted" }
+        goal "Complete mission work."
+        step "sync-base-compatibility" {
+          title "The hub clone contains the base compatibility revision"
+          goal "Fetch and fast-forward or rebase onto origin/main. Confirm that the Beacon base surface exists before changing the hub."
+        }
+        step "classify-hub-identifiers" {
+          title "Hub product identifiers are classified"
+          goal "Find the product package, import shim, resource scheme, directory, tests, comments, and documentation that must use Beacon."
+          depends-on { step "sync-base-compatibility" completed }
+        }
+        step "rename-hub-product" {
+          title "The hub product surface uses Beacon"
+          goal "Rename the hub package directory, peer dependency, import shim, beacon:// resource scheme, tests, comments, and documentation. Preserve unrelated runtime primitives."
+          depends-on { step "classify-hub-identifiers" completed }
+        }
+        step "test-hub" {
+          title "The hub package tests pass"
+          goal "Run node --test in the hub package. Confirm that it uses the same Beacon scheme as the relay."
+          depends-on { step "rename-hub-product" completed }
+        }
+        step "publish-hub-revision" {
+          title "The hub revision is published"
+          goal "Commit and push the hub-only change. Resolve a concurrent push without editing another lane. Let SHA be git rev-parse HEAD. Run: \"$ST3_BIN\" claim resource/mission-run/$ST_MISSION_RUN/hub-revision resource.observed --actor agent/${ST_MISSION_RUN}/sig.hub --field kind=vcs.commit --field state=published --field sha=SHA. Then complete the step without --evidence."
+          depends-on { step "test-hub" completed }
+          produces {
+            resource "mission-run/${ST_MISSION_RUN}/hub-revision" {
+              kind "vcs.commit"
+              state "published"
+            }
+          }
+        }
+      }
+    }
+
+    step "update-root-and-config" timeout="20m" {
+      title "The workspace root and configuration use Beacon"
+      goal "Update only config/app.toml and the workspace-root files after both consumers publish. Integrate their directory names without editing a package lane."
+      assigned-to "agent/${ST_MISSION_RUN}/sig.sup"
+      depends-on {
+        step "migrate-relay" completed
+        step "migrate-hub" completed
+      }
+
+      mission "work" {
+
+        completion { when "all-steps-exhausted" }
+        goal "Complete mission work."
+        step "sync-consumer-revisions" {
+          title "The supervisor clone contains both consumer revisions"
+          goal "Fetch and integrate origin/main. Confirm that the relay and hub revision resources match changes present in the clone."
+        }
+        step "rename-root-and-config" {
+          title "The root and config product surface uses Beacon"
+          goal "Rename the product section, package, CLI, protocol, scheme, workspace paths, and root documentation. Touch only config/app.toml and allowed root files."
+          depends-on { step "sync-consumer-revisions" completed }
+        }
+        step "publish-config-revision" {
+          title "The root and config revision is published"
+          goal "Commit and push the supervisor-owned change. Let SHA be git rev-parse HEAD. Run: \"$ST3_BIN\" claim resource/mission-run/$ST_MISSION_RUN/config-revision resource.observed --actor agent/${ST_MISSION_RUN}/sig.sup --field kind=vcs.commit --field state=published --field sha=SHA. Then complete the step without --evidence."
+          depends-on { step "rename-root-and-config" completed }
+          produces {
+            resource "mission-run/${ST_MISSION_RUN}/config-revision" {
+              kind "vcs.commit"
+              state "published"
+            }
+          }
+        }
+      }
+    }
+
+    step "close-base-compatibility" timeout="20m" {
+      title "The temporary base compatibility window is closed"
+      goal "After both consumers and the root use Beacon, remove every legacy base product alias. The final base must contain no @acme/signal export, signal CLI, signal/1 protocol, old product test, comment, or documentation reference."
+      assigned-to "agent/${ST_MISSION_RUN}/sig.base"
+      depends-on { step "update-root-and-config" completed }
+
+      mission "work" {
+
+        completion { when "all-steps-exhausted" }
+        goal "Complete mission work."
+        step "sync-complete-consumer-cutover" {
+          title "The base clone contains every consumer and config revision"
+          goal "Fetch and integrate origin/main. Confirm that the relay, hub, root, and config all use Beacon before removing compatibility."
+        }
+        step "remove-legacy-base-products" {
+          title "Every temporary base product alias is removed"
+          goal "Remove the old package export, CLI, protocol, tests, comments, and documentation. Keep unrelated runtime primitive names."
+          depends-on { step "sync-complete-consumer-cutover" completed }
+        }
+        step "test-final-base" {
+          title "The alias-free base tests pass"
+          goal "Run node --test in the final base package. Confirm that Beacon works without a legacy product alias."
+          depends-on { step "remove-legacy-base-products" completed }
+        }
+        step "publish-final-base-revision" {
+          title "The alias-free base revision is published"
+          goal "Commit and push the base-only cleanup. Let SHA be git rev-parse HEAD. Run: \"$ST3_BIN\" claim resource/mission-run/$ST_MISSION_RUN/base-final-revision resource.observed --actor agent/${ST_MISSION_RUN}/sig.base --field kind=vcs.commit --field state=published --field sha=SHA. Then complete the step without --evidence."
+          depends-on { step "test-final-base" completed }
+          produces {
+            resource "mission-run/${ST_MISSION_RUN}/base-final-revision" {
+              kind "vcs.commit"
+              state "published"
+            }
+          }
+        }
+      }
+    }
+
+    step "integrate-and-verify" timeout="20m" {
+      title "The supervisor verifies the complete alias-free cutover"
+      goal "Integrate the final origin/main without editing package lanes. Verify every package test, the complete product rename, the preserved runtime primitives, and the final clean worktree."
+      assigned-to "agent/${ST_MISSION_RUN}/sig.sup"
+      depends-on { step "close-base-compatibility" completed }
+
+      mission "work" {
+
+        completion { when "all-steps-exhausted" }
+        goal "Complete mission work."
+        step "sync-final-origin" {
+          title "The supervisor clone matches final origin/main"
+          goal "Fetch and fast-forward to the final base revision. Confirm that all four published revision resources are represented in history."
+        }
+        step "run-all-package-tests" {
+          title "Every package test suite passes on the integrated revision"
+          goal "Run node --test in the base, relay, and hub packages on the integrated revision."
+          depends-on { step "sync-final-origin" completed }
+        }
+        step "verify-clean-product-cutover" {
+          title "The product rename is complete and primitives remain intact"
+          goal "Verify the Beacon package, CLI, protocol, and schemes. Verify zero legacy product token. Verify AbortSignal, controller.signal, signal cancellation options, and SIGTERM remain intact."
+          depends-on { step "run-all-package-tests" completed }
+        }
+        step "publish-integrated-revision" {
+          title "The integrated revision is published"
+          goal "Confirm a clean worktree. Let SHA be git rev-parse HEAD. Run: \"$ST3_BIN\" claim resource/mission-run/$ST_MISSION_RUN/integrated-revision resource.observed --actor agent/${ST_MISSION_RUN}/sig.sup --field kind=vcs.commit --field state=published --field sha=SHA. Then complete the step without --evidence."
+          depends-on { step "verify-clean-product-cutover" completed }
+          produces {
+            resource "mission-run/${ST_MISSION_RUN}/integrated-revision" {
+              kind "vcs.commit"
+              state "published"
+            }
+          }
+        }
+      }
+    }
+
+    step "held-out-gates" timeout="30m" {
+      title "All held-out gates pass on the integrated revision"
+      depends-on { step "integrate-and-verify" completed }
+      gate "ISOLATION — every commit stayed in its author's package lane" {
+        exec "bash ./judges/isolation.sh"
+        host "local"
+        workspace "${ST_WORKSPACE}"
+
+        time-limit "30m"
+      }
+      gate "SUITE GREEN — node --test passes in every package" {
+        exec "bash ./judges/suite-green.sh"
+        host "local"
+        workspace "${ST_WORKSPACE}"
+
+        time-limit "30m"
+      }
+      gate "RENAME — the product is fully renamed to Beacon" {
+        exec "bash ./judges/rename.sh"
+        host "local"
+        workspace "${ST_WORKSPACE}"
+
+        time-limit "30m"
+      }
+      gate "PRIMITIVE INTACT — runtime signal primitives remain unchanged" {
+        exec "bash ./judges/primitive.sh"
+        host "local"
+        workspace "${ST_WORKSPACE}"
+
+        time-limit "30m"
+      }
+      gate "HELD-OUT E2E — the renamed stack resolves end to end" {
+        exec "bash ./judges/e2e.sh"
+        host "local"
+        workspace "${ST_WORKSPACE}"
+
+        time-limit "30m"
+      }
+      gate "the graph proves the sequence and integrated result" type="llm" {
+        model "gpt-5.6-sol"
+        host "local"
+        workspace "${ST_WORKSPACE}"
+        tools "shell" "git"
+
+        token-budget 98304
+        time-limit "3m"
+        prompt "Run exactly one evidence command before gate result: bash ./judges/semantic-evidence.sh. Do not run another evidence command. PASS only if the mission claims prove the base compatibility revision preceded both consumer revisions, both consumers completed before the root/config revision, the compatibility window closed after that revision, and the integrated revision is green. Also require lane isolation and preserved AbortSignal, controller.signal, signal cancellation options, SIGTERM, and SIGINT."
+      }
+    }
+
+    step "publish-final-report" timeout="10m" {
+      title "The supervisor publishes one final report"
+      goal "Send the base owner exactly one final message after every held-out gate passes. Explain the graph-owned decomposition, the base-first compatibility sequence, both concurrent consumer lanes, the compatibility closure, the integrated revision, tests, and any problems."
+      assigned-to "agent/${ST_MISSION_RUN}/sig.sup"
+      depends-on { step "held-out-gates" completed }
+
+      mission "work" {
+
+        completion { when "all-steps-exhausted" }
+        goal "Complete mission work."
+        step "send-final-report" {
+          title "The base owner receives the final result"
+          goal "Send exactly one Small Talk message with: SHA=$(git rev-parse HEAD); \"$ST3_BIN\" message send sig.base --from sig.sup --subject='Signal rename complete' --tags=mission-run:$ST_MISSION_RUN -m=\"Mission $ST_MISSION_RUN completed the Beacon rename. The graph sequenced base compatibility, concurrent relay and hub lanes, root configuration, compatibility closure, and integration. All tests passed. Integrated revision: $SHA\". Save the printed message ID. Do not send an acknowledgement or an interim message."
+        }
+        step "publish-report-receipt" {
+          title "The final report receipt is published"
+          goal "Let ID be the short ID printed by the final st3 conversations send command. Run: \"$ST3_BIN\" claim resource/mission-run/$ST_MISSION_RUN/final-report resource.observed --actor agent/${ST_MISSION_RUN}/sig.sup --field kind=custom.st3.coordination-report --field state=published --field recipient=agent/${ST_MISSION_RUN}/sig.base --field message=message/ID. Then complete the step without --evidence."
+          depends-on { step "send-final-report" completed }
+          produces {
+            resource "mission-run/${ST_MISSION_RUN}/final-report" {
+              kind "custom.st3.coordination-report"
+              state "published"
+              recipient "agent/${ST_MISSION_RUN}/sig.base"
+            }
+          }
+        }
+      }
+
+      gate "The base owner received exactly one final supervisor report" {
+        exec "bash ./judges/final-report.sh"
+        host "local"
+        workspace "${ST_WORKSPACE}"
+
+        time-limit "2m"
+      }
+    }
+
+  }

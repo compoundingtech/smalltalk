@@ -1,0 +1,28 @@
+version 2
+
+resource "example/change" { kind "vcs.pull-request" }
+
+mission "example/release" state="ready" {
+  completion { when "all-steps-exhausted" }
+  goal "Verify one change and stop at a human decision before publication."
+
+  step "verify" {
+    agentless
+    exec "tests" {
+      workspace "."
+      command "cargo test --workspace"
+      restart "never"
+    }
+    gate "the tests pass" { field "exit_code" "exec/${ST_MISSION_RUN}/tests" is 0 }
+  }
+
+  step "approve" timeout="24h" {
+    agentless
+    depends-on { step "verify" completed }
+    gate "the operator approves the exact change" type="human" {
+      reviewer "person/operator"
+      question "Publish this verified change?"
+      review "resource/example/change"
+    }
+  }
+}

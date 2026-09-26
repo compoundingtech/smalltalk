@@ -1,0 +1,36 @@
+version 2
+
+resource "example/repository" { kind "vcs.repository" }
+
+mission "example/review" state="ready" {
+  concurrent-runs max=2
+  input "source" kind="resource"
+  completion { when "all-steps-exhausted" }
+  goal "Review one immutable repository event in an isolated run."
+
+  step "review" {
+    available-to "agent/example/repository-owner/standing/repository-owner"
+    goal "Inspect ${input.source} and publish an immutable review document."
+  }
+}
+
+mission "example/intake" state="ready" {
+  goal "Observe a repository and start one review run for each selected change."
+
+  observer "repository" {
+    resource "resource/example/repository"
+    provider "github.repository"
+    locator "example/project"
+    field "pull_requests"
+  }
+
+  subscription "pull-request-reviews" {
+    observer "observer/repository"
+    on "pull_requests"
+    delivery "mission" {
+      mission "example/review@0000000000000000000000000000000000000000000000000000000000000000"
+      resource "source"
+      workspace ".st3/runs/reviews"
+    }
+  }
+}

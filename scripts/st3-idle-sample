@@ -1,0 +1,83 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+: "${ST3_BIN:?set ST3_BIN to the installed st3 executable on this host}"
+JQ_BIN=${ST3_SOAK_JQ_BIN:-$(command -v jq)}
+host=${ST3_SOAK_HOST:-$(/bin/hostname)}
+
+if [[ $(/usr/bin/uname -s) == Linux ]]; then
+  pid=$(/usr/bin/systemctl --user show st3.service -p MainPID --value)
+else
+  pid=$(/usr/bin/pgrep -f "^${ST3_BIN} up" | /usr/bin/head -n 1)
+fi
+[[ $pid =~ ^[1-9][0-9]*$ ]] || { echo 'st3 daemon PID is unavailable' >&2; exit 1; }
+read -r cpu_text rss_kib <<<"$(/bin/ps -p "$pid" -o time=,rss=)"
+[[ $rss_kib =~ ^[0-9]+$ ]] || { echo 'st3 daemon RSS is unavailable' >&2; exit 1; }
+cpu_seconds=$(/usr/bin/awk -v time="$cpu_text" 'BEGIN {
+  gsub(/-/, ":", time); n=split(time, p, ":");
+  if (n==2) printf "%.2f", p[1]*60+p[2];
+  else if (n==3) printf "%.2f", p[1]*3600+p[2]*60+p[3];
+  else if (n==4) printf "%.2f", p[1]*86400+p[2]*3600+p[3]*60+p[4];
+  else exit 1;
+}')
+
+switches=null
+if [[ $(/usr/bin/uname -s) == Linux ]]; then
+  switches=$(/usr/bin/awk '/^voluntary_ctxt_switches:|^nonvoluntary_ctxt_switches:/ { total += $2 } END { printf "%.0f", total }' "/proc/$pid/status")
+else
+  raw=$(/usr/bin/top -l 1 -pid "$pid" -stats pid,csw | /usr/bin/awk -v pid="$pid" '$1==pid {print $2}')
+  raw=${raw//+/}
+  [[ $raw =~ ^[0-9]+$ ]] && switches=$raw
+fi
+
+activity_json=$("$ST3_BIN" activity --limit 200 --json)
+# Replication status computes an exact graph digest. A concurrent write can
+# delay one read long enough for the outer sampler alarm to record a false
+# missing sample. Bound each attempt and retry once; a sustained failure still
+# fails this sample and remains visible in the retained evidence.
+replication_json=
+replication_read_attempts=0
+replication_read_ok=0
+for attempt in 1 2; do
+  replication_read_attempts=$attempt
+  if [[ $(/usr/bin/uname -s) == Darwin ]]; then
+    if replication_json=$(/usr/bin/perl -e 'alarm 10; exec @ARGV or die $!' \
+      "$ST3_BIN" replication status --json); then
+      replication_read_ok=1
+      break
+    fi
+  elif replication_json=$(/usr/bin/timeout -k 1s 10s \
+    "$ST3_BIN" replication status --json); then
+    replication_read_ok=1
+    break
+  fi
+done
+[[ $replication_read_ok == 1 && -n $replication_json ]] || {
+  echo 'replication status was unavailable after two bounded reads' >&2
+  exit 1
+}
+graph_index=$("$JQ_BIN" -er '.snapshot.store_index' <<<"$activity_json")
+material_index=$("$JQ_BIN" -er '[.value.items[] |
+  select(.body.change != "harness.usage" and .body.change != "harness.observed"
+    and .body.change != "work.renewed" and .body.change != "replication.heartbeat") |
+  .sequence] | max // 0' <<<"$activity_json")
+pending=$("$JQ_BIN" -er '.pending_records' <<<"$replication_json")
+received=$("$JQ_BIN" -er '.received_envelopes' <<<"$replication_json")
+peer_status=$("$JQ_BIN" -er '.peers[0].status' <<<"$replication_json")
+peer_error=$("$JQ_BIN" -c '.peers[0].last_error != null' <<<"$replication_json")
+peer_last_success_ms=$("$JQ_BIN" -er '.peers[0].last_success_at_unix_ms' <<<"$replication_json")
+"$JQ_BIN" -nc \
+  --arg host "$host" --argjson at "$(/bin/date -u +%s)" --argjson pid "$pid" \
+  --argjson cpu_seconds "$cpu_seconds" --argjson rss_kib "$rss_kib" \
+  --argjson context_switches "$switches" \
+  --argjson graph_index "$graph_index" --argjson material_index "$material_index" \
+  --argjson pending "$pending" \
+  --argjson received "$received" --arg peer_status "$peer_status" \
+  --argjson peer_error "$peer_error" --argjson peer_last_success_ms "$peer_last_success_ms" \
+  --argjson replication_read_attempts "$replication_read_attempts" \
+  '{at:$at,host:$host,pid:$pid,cpu_seconds:$cpu_seconds,rss_kib:$rss_kib,
+    context_switches:$context_switches,graph_index:$graph_index,
+    material_index:$material_index,pending:$pending,
+    received:$received,peer_status:$peer_status,peer_error:$peer_error,
+    peer_last_success_ms:$peer_last_success_ms,
+    replication_read_attempts:$replication_read_attempts}'

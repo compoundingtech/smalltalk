@@ -18,6 +18,27 @@ use agent_spec::{
 };
 
 #[test]
+fn discovery_accepts_st2_version_one_and_rejects_st3_version_two() {
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        "agents/h/one/agent.kdl",
+        "version 1\nagent \"one\" { host \"h\"; command \"true\" }",
+    );
+    write(
+        tmp.path(),
+        "agents/h/two/agent.kdl",
+        "version 2\nagent \"two\" { host \"h\"; command \"true\" }",
+    );
+
+    let found = discover(tmp.path());
+    assert!(found.specs.iter().any(|spec| spec.identity == "one"));
+    assert!(!found.specs.iter().any(|spec| spec.identity == "two"));
+    assert_eq!(found.errors.len(), 1);
+    assert!(found.errors[0].message.contains("version 0 or 1"));
+}
+
+#[test]
 fn root_catalog_envelope_allows_a_profile_beside_an_agent() {
     let tmp = tempfile::tempdir().unwrap();
     write(
@@ -33,8 +54,7 @@ agent "root-agent" { command "true" }
     let found = discover_strict(tmp.path());
     assert!(found.errors.is_empty(), "{:?}", found.errors);
     assert_eq!(find(&found.specs, "root-agent").identity, "root-agent");
-    let (specs, warnings) =
-        discover_file(tmp.path(), &tmp.path().join("catalog.kdl")).unwrap();
+    let (specs, warnings) = discover_file(tmp.path(), &tmp.path().join("catalog.kdl")).unwrap();
     assert!(
         warnings
             .iter()
@@ -487,22 +507,22 @@ agent "cos" {
 }
 
 #[test]
-fn deliver_is_typed_without_lowering_to_the_legacy_ding_task() {
+fn deliver_preempts_the_legacy_ding_task() {
     let tmp = tempfile::tempdir().unwrap();
     write(
         tmp.path(),
         "agents/h/claude/agent.kdl",
-        r#"agent "claude" { host "h"; command "claude"; deliver "mcp" }"#,
+        r#"agent "claude" { host "h"; command "claude"; ding; deliver "mcp" }"#,
     );
     write(
         tmp.path(),
         "agents/h/codex/agent.kdl",
-        r#"agent "codex" { host "h"; command "codex"; deliver "app-server" }"#,
+        r#"agent "codex" { host "h"; command "codex"; ding; deliver "app-server" }"#,
     );
     write(
         tmp.path(),
         "agents/h/pi/agent.kdl",
-        r#"agent "pi" { host "h"; command "pi"; deliver "pi-channel" }"#,
+        r#"agent "pi" { host "h"; command "pi"; ding; deliver "pi-channel" }"#,
     );
 
     let found = discover(tmp.path());
@@ -524,7 +544,36 @@ fn deliver_is_typed_without_lowering_to_the_legacy_ding_task() {
 }
 
 #[test]
-fn deliver_rejects_unknown_duplicate_mixed_and_malformed_declarations() {
+fn typed_drivers_preempt_the_legacy_ding_task() {
+    let tmp = tempfile::tempdir().unwrap();
+    for (name, driver) in [
+        ("claude", r#"claude { prompt "go" }"#),
+        ("codex", r#"codex { prompt "go" }"#),
+        ("pi", r#"pi { prompt "go" }"#),
+        ("opencode", r#"opencode { prompt "go" }"#),
+    ] {
+        write(
+            tmp.path(),
+            &format!("agents/h/{name}/agent.kdl"),
+            &format!(r#"agent "{name}" {{ ding; {driver} }}"#),
+        );
+    }
+
+    let found = discover(tmp.path());
+    assert!(found.errors.is_empty(), "{:?}", found.errors);
+    assert_eq!(found.specs.len(), 4);
+    for spec in &found.specs {
+        assert!(
+            spec.tasks.iter().all(|task| !task.derived),
+            "{} retained a derived Ding task: {:?}",
+            spec.identity,
+            spec.tasks
+        );
+    }
+}
+
+#[test]
+fn deliver_rejects_unknown_duplicate_and_malformed_declarations() {
     for (name, declaration, expected) in [
         (
             "unknown",
@@ -535,11 +584,6 @@ fn deliver_rejects_unknown_duplicate_mixed_and_malformed_declarations() {
             "duplicate",
             r#"agent "worker" { command "true"; deliver "mcp"; deliver "app-server" }"#,
             "declares `deliver` more than once",
-        ),
-        (
-            "mixed",
-            r#"agent "worker" { command "true"; ding; deliver "mcp" }"#,
-            "declares both `ding` and `deliver`",
         ),
         (
             "missing",
@@ -647,13 +691,23 @@ fn delivery_readiness_is_tagged_normalized_and_separate_from_activity() {
 }
 
 #[test]
-fn delivery_readiness_rejects_managed_ding_and_mismatched_native_ownership() {
+fn delivery_readiness_preempts_ding_and_rejects_mismatched_native_ownership() {
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        "agents/h/ding/agent.kdl",
+        r#"agent "worker" { argv "axe"; ding; delivery-readiness "credential" }"#,
+    );
+    let found = discover(tmp.path());
+    assert!(found.errors.is_empty(), "{:?}", found.errors);
+    assert!(
+        find(&found.specs, "worker")
+            .tasks
+            .iter()
+            .all(|task| !task.derived)
+    );
+
     for (name, declaration, expected) in [
-        (
-            "ding",
-            r#"agent "worker" { argv "axe"; ding; delivery-readiness "credential" }"#,
-            "generic Ding is only for opaque non-harness PTYs",
-        ),
         (
             "transport",
             r#"agent "worker" { argv "axe"; session-driver "claude"; deliver "app-server"; delivery-readiness "credential" }"#,
@@ -681,7 +735,6 @@ fn delivery_readiness_rejects_managed_ding_and_mismatched_native_ownership() {
         );
     }
 }
-
 
 #[test]
 fn session_driver_rejects_unknown_duplicate_malformed_and_conflicting_declarations() {
@@ -715,11 +768,6 @@ fn session_driver_rejects_unknown_duplicate_malformed_and_conflicting_declaratio
             "children",
             r#"agent "worker" { argv "axe"; session-driver "claude" { prompt "ignored" } }"#,
             "must contain exactly one positional string",
-        ),
-        (
-            "ding",
-            r#"agent "worker" { argv "axe"; session-driver "claude"; ding }"#,
-            "generic Ding is only for opaque non-harness PTYs",
         ),
         (
             "deliver",
@@ -769,8 +817,14 @@ fn session_driver_lowers_from_toml_and_json_and_rejects_null() {
     );
 
     let found = discover(tmp.path());
-    assert_eq!(find(&found.specs, "toml").session_driver, Some(SessionDriver::Codex));
-    assert_eq!(find(&found.specs, "json").session_driver, Some(SessionDriver::Pi));
+    assert_eq!(
+        find(&found.specs, "toml").session_driver,
+        Some(SessionDriver::Codex)
+    );
+    assert_eq!(
+        find(&found.specs, "json").session_driver,
+        Some(SessionDriver::Pi)
+    );
     assert_eq!(found.errors.len(), 1, "{:?}", found.errors);
     assert!(
         found.errors[0]
@@ -782,7 +836,14 @@ fn session_driver_lowers_from_toml_and_json_and_rejects_null() {
 }
 
 #[test]
-fn typed_driver_blocks_reject_legacy_ding() {
+fn managed_session_owners_preempt_legacy_ding() {
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        "agents/h/session/agent.kdl",
+        r#"agent "session" { argv "axe"; session-driver "claude"; ding }"#,
+    );
+
     for (name, driver) in [
         ("claude", r#"claude { prompt "go" }"#),
         ("codex", r#"codex { prompt "go" }"#),
@@ -790,25 +851,25 @@ fn typed_driver_blocks_reject_legacy_ding() {
         ("opencode", r#"opencode { prompt "go" }"#),
         ("omp", r#"omp { prompt "go" }"#),
     ] {
-        let tmp = tempfile::tempdir().unwrap();
         write(
             tmp.path(),
             &format!("agents/h/{name}/agent.kdl"),
             &format!(r#"agent "{name}" {{ ding; {driver} }}"#),
         );
-        let found = discover(tmp.path());
-        assert!(found.specs.is_empty(), "{name}: {:?}", found.specs);
-        assert_eq!(found.errors.len(), 1, "{name}: {:?}", found.errors);
+    }
+
+    let found = discover(tmp.path());
+    assert!(found.errors.is_empty(), "{:?}", found.errors);
+    assert_eq!(found.specs.len(), 6);
+    for spec in &found.specs {
         assert!(
-            found.errors[0]
-                .message
-                .contains("generic Ding is only for opaque non-harness PTYs"),
-            "{name}: {:?}",
-            found.errors[0]
+            spec.tasks.iter().all(|task| !task.derived),
+            "{} retained a derived Ding task: {:?}",
+            spec.identity,
+            spec.tasks
         );
     }
 }
-
 
 #[test]
 fn compact_adopt_only_lifecycle_lowers_to_the_generated_agent_task() {
@@ -973,6 +1034,19 @@ args = ["--permission-mode", "bypassPermissions"]
     );
     write(
         tmp.path(),
+        "agents/h/claude-harness/agent.kdl",
+        r#"agent "claude-harness" {
+  harness "claude" {
+    model "opus"
+    effort "xhigh"
+    dev-channels #true
+    prompt "Start the assigned work."
+    args "--permission-mode" "bypassPermissions"
+  }
+}"#,
+    );
+    write(
+        tmp.path(),
         "agents/h/claude-json/agent.json",
         r#"{
   "identity": "claude-json",
@@ -1008,6 +1082,18 @@ effort = "xhigh"
 prompt = "Start the assigned work."
 args = ["--dangerously-bypass-approvals-and-sandbox"]
 "#,
+    );
+    write(
+        tmp.path(),
+        "agents/h/codex-harness/agent.kdl",
+        r#"agent "codex-harness" {
+  harness "codex" {
+    model "gpt-5.6-sol"
+    effort "xhigh"
+    prompt "Start the assigned work."
+    args "--dangerously-bypass-approvals-and-sandbox"
+  }
+}"#,
     );
     write(
         tmp.path(),
@@ -1049,6 +1135,18 @@ args = ["--tools", "read,bash,edit,write"]
     );
     write(
         tmp.path(),
+        "agents/h/pi-harness/agent.kdl",
+        r#"agent "pi-harness" {
+  harness "pi" {
+    model "anthropic/claude-opus-5"
+    effort "high"
+    prompt "Start the assigned work."
+    args "--tools" "read,bash,edit,write"
+  }
+}"#,
+    );
+    write(
+        tmp.path(),
         "agents/h/pi-json/agent.json",
         r#"{
   "identity": "pi-json",
@@ -1085,6 +1183,17 @@ args = ["--agent", "build"]
     );
     write(
         tmp.path(),
+        "agents/h/opencode-harness/agent.kdl",
+        r#"agent "opencode-harness" {
+  harness "opencode" {
+    model "anthropic/claude-opus-5"
+    prompt "Start the assigned work."
+    args "--agent" "build"
+  }
+}"#,
+    );
+    write(
+        tmp.path(),
         "agents/h/opencode-json/agent.json",
         r#"{
   "identity": "opencode-json",
@@ -1105,9 +1214,13 @@ args = ["--agent", "build"]
         prompt: "Start the assigned work.".into(),
         args: vec!["--permission-mode".into(), "bypassPermissions".into()],
     });
-    for identity in ["claude-kdl", "claude-toml", "claude-json"] {
+    for identity in ["claude-kdl", "claude-harness", "claude-toml", "claude-json"] {
         let spec = find(&found.specs, identity);
-        assert_eq!(spec.driver.as_ref(), Some(&claude));
+        assert_eq!(
+            spec.driver.as_ref(),
+            Some(&claude),
+            "driver mismatch for {identity}"
+        );
         assert!(!spec.is_runnable());
     }
     let codex = Driver::Codex(CodexDriver {
@@ -1116,7 +1229,7 @@ args = ["--agent", "build"]
         prompt: "Start the assigned work.".into(),
         args: vec!["--dangerously-bypass-approvals-and-sandbox".into()],
     });
-    for identity in ["codex-kdl", "codex-toml", "codex-json"] {
+    for identity in ["codex-kdl", "codex-harness", "codex-toml", "codex-json"] {
         let spec = find(&found.specs, identity);
         assert_eq!(spec.driver.as_ref(), Some(&codex));
         assert!(!spec.is_runnable());
@@ -1127,7 +1240,7 @@ args = ["--agent", "build"]
         prompt: "Start the assigned work.".into(),
         args: vec!["--tools".into(), "read,bash,edit,write".into()],
     });
-    for identity in ["pi-kdl", "pi-toml", "pi-json"] {
+    for identity in ["pi-kdl", "pi-harness", "pi-toml", "pi-json"] {
         let spec = find(&found.specs, identity);
         assert_eq!(spec.driver.as_ref(), Some(&pi));
         assert!(!spec.is_runnable());
@@ -1137,7 +1250,12 @@ args = ["--agent", "build"]
         prompt: "Start the assigned work.".into(),
         args: vec!["--agent".into(), "build".into()],
     });
-    for identity in ["opencode-kdl", "opencode-toml", "opencode-json"] {
+    for identity in [
+        "opencode-kdl",
+        "opencode-harness",
+        "opencode-toml",
+        "opencode-json",
+    ] {
         let spec = find(&found.specs, identity);
         assert_eq!(spec.driver.as_ref(), Some(&opencode));
         assert!(!spec.is_runnable());
@@ -1421,7 +1539,10 @@ reason = "Primary checkout."
     .with_selector(serde_json::Value::Null);
     let json = serde_json::to_string(&explicit_null).unwrap();
     assert!(json.contains(r#""selector":null"#), "{json}");
-    assert_eq!(serde_json::from_str::<Resource>(&json).unwrap(), explicit_null);
+    assert_eq!(
+        serde_json::from_str::<Resource>(&json).unwrap(),
+        explicit_null
+    );
 }
 
 #[test]
@@ -1548,12 +1669,7 @@ fn resource_binding_names_and_scheme_candidates_fail_loudly() {
         );
     }
     assert!(
-        Resource::new(
-            "work".into(),
-            "_github://org/repo".into(),
-            "Task.".into(),
-        )
-        .is_err(),
+        Resource::new("work".into(), "_github://org/repo".into(), "Task.".into(),).is_err(),
         "a malformed scheme prefix must not become a catalog-relative path"
     );
 }
@@ -2114,6 +2230,27 @@ fn malformed_kdl_is_collected_as_error() {
     assert!(found.specs.is_empty());
     assert_eq!(found.errors.len(), 1);
     assert!(found.errors[0].message.contains("KDL parse error"));
+}
+
+#[test]
+fn a_nested_generic_filename_is_static_without_agent_shaped_content() {
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        "agents/hetz/worker/agent.kdl",
+        r#"agent "worker" { host "hetz"; command "true" }"#,
+    );
+    write(
+        tmp.path(),
+        "agents/hetz/worker/docs/agent.kdl",
+        "note \"documentation metadata\"\n",
+    );
+
+    let found = discover_strict(tmp.path());
+    assert!(found.errors.is_empty(), "errors: {:?}", found.errors);
+    assert_eq!(found.specs.len(), 1);
+    assert_eq!(found.declarations.len(), 1);
+    assert_eq!(found.specs[0].identity, "worker");
 }
 
 #[test]
@@ -2744,12 +2881,18 @@ fn explicit_id_and_address_lower_as_separate_typed_namespaces() {
     let found = discover_strict(tmp.path());
     assert!(found.errors.is_empty(), "{:?}", found.errors);
     let spec = find(&found.specs, "verifier");
-    assert_eq!(spec.id.as_deref(), Some("0199b8f4-8d3a-7c21-9a44-6f85b7320ea1"));
+    assert_eq!(
+        spec.id.as_deref(),
+        Some("0199b8f4-8d3a-7c21-9a44-6f85b7320ea1")
+    );
     assert_eq!(
         spec.effective_id("dev3"),
         "0199b8f4-8d3a-7c21-9a44-6f85b7320ea1"
     );
-    assert_eq!(spec.address.as_deref(), Some("dotfiles.fractal.keymap.verifier"));
+    assert_eq!(
+        spec.address.as_deref(),
+        Some("dotfiles.fractal.keymap.verifier")
+    );
     assert_eq!(spec.effective_address(), "dotfiles.fractal.keymap.verifier");
     assert_eq!(
         spec.bus_address("other"),
@@ -2836,7 +2979,13 @@ fn the_address_grammar_is_bounded_lowercase_dotted_segments() {
     // overruns it while every segment stays legal on its own.
     let over_budget = format!(
         "{}.e",
-        ["a".repeat(63), "b".repeat(63), "c".repeat(63), "d".repeat(63)].join(".")
+        [
+            "a".repeat(63),
+            "b".repeat(63),
+            "c".repeat(63),
+            "d".repeat(63)
+        ]
+        .join(".")
     );
     for (rejected, expected) in [
         ("Worker", "must match [a-z0-9-]+"),
@@ -2950,7 +3099,10 @@ fn id_and_address_have_equivalent_kdl_toml_and_json_lowering() {
     assert!(found.errors.is_empty(), "{:?}", found.errors);
     for format in ["kdl", "toml", "json"] {
         let spec = find(&found.specs, format);
-        assert_eq!(spec.id.as_deref(), Some(format!("frozen.{format}").as_str()));
+        assert_eq!(
+            spec.id.as_deref(),
+            Some(format!("frozen.{format}").as_str())
+        );
         assert_eq!(spec.effective_address(), format!("{format}.route"));
     }
 }

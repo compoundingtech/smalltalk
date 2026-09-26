@@ -1087,13 +1087,15 @@ mod generation_observation_tests {
         backend.spawn(&target(id), tmp.path()).unwrap();
         let raw = fs::read_to_string(backend.pid_path(id)).unwrap();
         let value: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let mut keys = value
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        keys.sort_unstable();
         assert_eq!(
-            value
-                .as_object()
-                .unwrap()
-                .keys()
-                .map(String::as_str)
-                .collect::<Vec<_>>(),
+            keys,
             [
                 "createdAt",
                 "generationId",

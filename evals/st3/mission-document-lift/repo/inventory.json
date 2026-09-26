@@ -1,0 +1,7 @@
+{
+  "services": [
+    { "name": "api", "owner": "edge", "replicas": 3, "public": true },
+    { "name": "jobs", "owner": "core", "replicas": 2, "public": false },
+    { "name": "worker", "owner": "core", "replicas": 2, "public": false }
+  ]
+}

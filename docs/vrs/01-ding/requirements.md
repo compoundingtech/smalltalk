@@ -41,12 +41,13 @@ is in [`spec.md`](./spec.md).
 
 ## Requirements
 
-### Must preserve initial transport and gate every retry
+### Must stage initial transport and gate every submission
 
-- **DING-R01 Combined initial transport:** A fresh notice uses one bounded PTY
-  transaction containing the bracketed paste, the accepted 0.5 second delay,
-  and Return. Ownership is recorded before that command starts. Composer
-  heuristics do not split or suppress this initial transport.
+- **DING-R01 Guarded initial transport:** A fresh notice first proves an empty
+  maintained composer and records ownership, then bracketed-pastes without
+  Return. It sends Return only after two adjacent observations prove that the
+  exact notice is still the complete safe composer. Immediately before Return,
+  it rechecks that the immutable message is still unread and unarchived.
 - **DING-R02 Two adjacent retained-safe retry observations:** A later bare
   Return is permitted only for a transport-owned payload whose exact notice is
   still the complete composer and is classified `RetainedSafe` in two
@@ -58,9 +59,10 @@ is in [`spec.md`](./spec.md).
   become `Delivered` and receive no retry input. Anything not positively
   understood retains staged ownership. On an inspect-only staged retry, a
   maintained adapter may positively prove that the exact owned payload is no
-  longer retained; that proof relinquishes ownership only when an archive
-  receipt already removed the notice from the inbox. An unread notice remains
-  staged even after positive absence, so it is never pasted again.
+  longer retained. An archive, read, or close receipt is a hard no-new-delivery
+  fence: it cancels a not-yet-submitted staged notice without waiting for
+  `NotRetained`. An unread notice remains staged after positive absence, so it
+  is never pasted again.
 
 ### Must classify the surface it will actually type into
 
@@ -84,8 +86,9 @@ is in [`spec.md`](./spec.md).
 
 - **DING-R07 Staged ownership:** Once a paste command has started, the payload
   is owned by that attempt. Ambiguity about whether the paste landed is resolved
-  by inspection only; the same notice is never pasted again until the exact
-  staged payload has disappeared or changed.
+  by inspection only; the same notice is never pasted again. Archive, read, or
+  close cancels any Return that has not started and releases the stable
+  message-derived ownership without deleting immutable message history.
 - **DING-R08 Bounded probing:** Deferred delivery retries on a bounded backoff,
   so an indefinitely busy composer cannot make every inbox poll spawn another
   terminal probe.
@@ -97,9 +100,11 @@ is in [`spec.md`](./spec.md).
   empty or an accepted idle placeholder. PTY command success, generic screen
   change, disappearance alone, and ambiguous pixels are not receipts. A
   maintained adapter that successfully parses the live composer may separately
-  prove `NotRetained`; this is never delivery and releases only an already
-  archived staged head. Unread, unreadable, unrecognized, and ambiguous attempts
-  retain staged ownership and retry by inspection without re-pasting.
+  prove `NotRetained`; this is never delivery. Unread, unreadable, unrecognized,
+  and ambiguous attempts retain staged ownership and retry by inspection
+  without re-pasting. Startup and restart adoption rebuild candidates from the
+  current unread inbox immediately before adoption; archive precedence removes
+  replayed archived files, so historical text cannot be adopted as a new DING.
 - **DING-R11 Readable immutable sender:** For an Agent endpoint, a notice
   resolves the message's canonical sender agent ID to the current bus address
   immediately before rendering. If the address book is absent, unreadable,

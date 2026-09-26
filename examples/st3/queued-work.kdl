@@ -1,0 +1,19 @@
+version 2
+
+mission "example/maintenance" state="ready" {
+  goal "Keep one maintainer available and process its explicit queue in order."
+
+  agent "maintainer" {
+    identity "maintainer"
+    workspace "."
+    harness "codex" { effort "high" }
+    restart "always"
+  }
+
+  queue "work" {
+    assigned-to "agent/${ST_MISSION_RUN}/maintainer"
+    step "measure" { goal "Measure the current behavior and record the baseline." }
+    step "improve" { goal "Implement one improvement that the baseline supports." }
+    step "verify" { goal "Run the relevant tests and record the result." }
+  }
+}

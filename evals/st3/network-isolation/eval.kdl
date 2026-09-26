@@ -1,0 +1,26 @@
+version 2
+
+  mission "eval/network-isolation" state="ready" timeout="20m" {
+    completion { when "all-steps-exhausted" }
+    goal "Complete mission eval/network-isolation."
+    step "contract" timeout="2m" {
+      title "Two nested st3 networks remain isolated"
+        exec "eval/network-isolation/contract" {
+          host "local"
+          workspace "${ST_WORKSPACE}/fixture"
+          cwd "${ST_WORKSPACE}/fixture"
+          command "bash ./run.sh"
+          restart "never"
+        }
+      gate "condition-1" { field "status" "exec/${ST_MISSION_RUN}/eval/network-isolation/contract" "is" "exited" }
+      gate "condition-2" { field "exit_code" "exec/${ST_MISSION_RUN}/eval/network-isolation/contract" "is" 0 }
+    }
+    step "gate" timeout="1m" {
+      depends-on { step "contract" completed }
+      gate "both endpoint and state partitions hold" {
+        exec "grep -Fq NETWORK-A-ISOLATED result.txt && grep -Fq NETWORK-B-ISOLATED result.txt"
+        host "local"
+        workspace "${ST_WORKSPACE}/fixture"
+      }
+    }
+  }

@@ -371,9 +371,7 @@ fn create_or_validate_directory(path: &Path, label: &str) -> anyhow::Result<()> 
 /// Current-catalog walkers may overlook only this one compatibility residue. Exact-name
 /// directories, symlinks, and special files are errors; generic dotfiles and near misses remain
 /// ordinary identity candidates and therefore fail the canonical topology checks.
-pub(crate) fn is_legacy_harness_context_staging_file(
-    entry: &fs::DirEntry,
-) -> anyhow::Result<bool> {
+pub(crate) fn is_legacy_harness_context_staging_file(entry: &fs::DirEntry) -> anyhow::Result<bool> {
     let name = entry.file_name();
     let Some(name) = name.to_str() else {
         return Ok(false);
@@ -1308,13 +1306,10 @@ mod tests {
         symlink(&real, &linked).unwrap();
         assert!(staging_dir(&linked).is_err());
         assert!(
-            !tmp.path()
-                .join(crate::catalog_lock::CONTROL_DIR)
-                .exists(),
+            !tmp.path().join(crate::catalog_lock::CONTROL_DIR).exists(),
             "rejected ancestry must not create control state"
         );
     }
-
 
     #[test]
     fn only_the_exact_legacy_regular_file_shape_is_reserved() {

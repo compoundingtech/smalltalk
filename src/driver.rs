@@ -296,7 +296,9 @@ fn expand_opencode(driver: &OpenCodeDriver, bus_id: &str) -> KdlDocument {
 fn expand_claude(driver: &ClaudeDriver, bus_id: &str) -> Result<KdlDocument> {
     // The same registration a hand-authored seat carries: without it a driver-declared
     // seat has no observed-state producer and no lifecycle hooks at all.
-    let settings = serde_json::to_string_pretty(&crate::hooks::claude_settings_registration())?;
+    let settings = serde_json::to_string_pretty(&canonical_json_value(
+        crate::hooks::claude_settings_registration(),
+    ))?;
     let mut render = KdlNode::new("render");
     render.set_children(document([{
         // Hook arrays join whatever the workspace already declares: replacement would clobber
@@ -341,6 +343,25 @@ fn expand_claude(driver: &ClaudeDriver, bus_id: &str) -> Result<KdlDocument> {
     ];
     argv.extend(provider);
     Ok(document([render, node("argv", argv)]))
+}
+
+fn canonical_json_value(value: serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Array(values) => {
+            serde_json::Value::Array(values.into_iter().map(canonical_json_value).collect())
+        }
+        serde_json::Value::Object(object) => {
+            let mut entries = object.into_iter().collect::<Vec<_>>();
+            entries.sort_by(|left, right| left.0.cmp(&right.0));
+            serde_json::Value::Object(
+                entries
+                    .into_iter()
+                    .map(|(key, value)| (key, canonical_json_value(value)))
+                    .collect(),
+            )
+        }
+        scalar => scalar,
+    }
 }
 
 fn node(name: &str, args: Vec<String>) -> KdlNode {
@@ -582,9 +603,10 @@ mod tests {
         assert_eq!(settings[0], ".claude/settings.local.json");
         let settings: serde_json::Value = serde_json::from_str(settings[1]).unwrap();
         assert_eq!(settings, crate::hooks::claude_settings_registration());
+        let argv = strings(output.get("argv").unwrap());
         assert_eq!(
-            strings(output.get("argv").unwrap()),
-            [
+            &argv[..17],
+            &[
                 "st2",
                 "--catalog",
                 "$CATALOG",
@@ -601,11 +623,9 @@ mod tests {
                 "--effort",
                 "xhigh",
                 "--channels",
-                "plugin:st2-channel@st2",
-                "--model",
-                "override",
-                "Start work."
+                "plugin:st2-channel@st2"
             ]
         );
+        assert_eq!(&argv[17..], &["--model", "override", "Start work."]);
     }
 }

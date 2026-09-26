@@ -11,7 +11,9 @@ use std::os::unix::fs::DirBuilderExt as _;
 use std::os::unix::fs::MetadataExt as _;
 use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+#[cfg(debug_assertions)]
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::Context as _;
 use serde::{Deserialize, Serialize};
@@ -284,7 +286,7 @@ pub(crate) struct StreamRefusal {
 }
 
 impl StreamRefusal {
-    fn new(kind: RefusalKind, message: String) -> anyhow::Error {
+    fn error(kind: RefusalKind, message: String) -> anyhow::Error {
         anyhow::Error::new(Self { kind, message })
     }
 }
@@ -354,11 +356,10 @@ fn resolve_stream(
         other => other.map(|entry| (entry.id.clone(), entry.bus_identity.clone())),
     };
     let (agent_id, bus_identity) = selected.map_err(|error| match error {
-        crate::identity::ResolveError::Unknown { .. } => anyhow::anyhow!(
-            "no agent '{reference}' found in catalog {}",
-            root.display()
-        ),
-        error @ crate::identity::ResolveError::Ambiguous { .. } => StreamRefusal::new(
+        crate::identity::ResolveError::Unknown { .. } => {
+            anyhow::anyhow!("no agent '{reference}' found in catalog {}", root.display())
+        }
+        error @ crate::identity::ResolveError::Ambiguous { .. } => StreamRefusal::error(
             RefusalKind::Permanent,
             format!("agent recipient '{reference}' is ambiguous; {error}"),
         ),
@@ -373,7 +374,7 @@ fn resolve_stream(
     // Two declarations under one key answer nothing decidably: the resolved subject and the spec
     // this walk would publish against could be different files.
     if claimants.next().is_some() {
-        return Err(StreamRefusal::new(
+        return Err(StreamRefusal::error(
             RefusalKind::Permanent,
             format!(
                 "agent recipient '{reference}' names more than one declaration of '{bus_identity}'"
@@ -382,7 +383,7 @@ fn resolve_stream(
     }
     let key = bus_identity;
     if spec.resolved_host(this_host) != this_host {
-        return Err(StreamRefusal::new(
+        return Err(StreamRefusal::error(
             RefusalKind::Permanent,
             format!(
                 "agent '{}' is owned by host '{}'; event publication must run on that host",
@@ -394,7 +395,7 @@ fn resolve_stream(
     match admission {
         StreamAdmission::Declared => {
             if !spec.streams.iter().any(|declared| declared.name == stream) {
-                return Err(StreamRefusal::new(
+                return Err(StreamRefusal::error(
                     RefusalKind::Permanent,
                     format!(
                         "agent '{}' does not declare stream '{stream}'",
@@ -409,7 +410,7 @@ fn resolve_stream(
         ),
     }
     if !spec.desired_state.is_running() {
-        return Err(StreamRefusal::new(
+        return Err(StreamRefusal::error(
             RefusalKind::RecipientNotRunning,
             format!(
                 "agent '{}' is {}; refusing event while its eyes are closed",
@@ -1255,10 +1256,7 @@ mod tests {
     #[test]
     fn a_declared_address_routes_an_event_while_ownership_stays_on_the_bus_identity() {
         let root = tempfile::tempdir().unwrap();
-        let agent = declare_worker(
-            root.path(),
-            "  address \"chat\"\n  stream \"gh-ci\" {}\n",
-        );
+        let agent = declare_worker(root.path(), "  address \"chat\"\n  stream \"gh-ci\" {}\n");
 
         for reference in ["hetz.chat", "chat"] {
             let receipt = emit(

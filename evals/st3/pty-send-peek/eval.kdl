@@ -1,0 +1,33 @@
+version 2
+
+  mission "eval/pty-send-peek" state="ready" timeout="20m" {
+    completion { when "all-steps-exhausted" }
+    goal "Complete mission eval/pty-send-peek."
+    step "contract" timeout="1m" {
+      title "PTY send and peek make a real byte round trip"
+        terminal "psp" {
+          host "local"
+          workspace "${ST_WORKSPACE}"
+          command "bash -c 'echo READY; while IFS= read -r line; do echo ACK:$line; done'"
+          restart "never"
+        }
+        exec "eval/pty-send-peek/probe" {
+          host "local"
+          workspace "${ST_WORKSPACE}/fixture"
+          cwd "${ST_WORKSPACE}/fixture"
+          command "bash ./run.sh"
+          restart "never"
+
+        }
+      gate "condition-1" { field "status" "exec/${ST_MISSION_RUN}/eval/pty-send-peek/probe" "is" "exited" }
+      gate "condition-2" { field "exit_code" "exec/${ST_MISSION_RUN}/eval/pty-send-peek/probe" "is" 0 }
+    }
+    step "gate" timeout="1m" {
+      depends-on { step "contract" completed }
+      gate "the acknowledgement appears only after send" {
+        exec "grep -Fq READY pre.txt && ! grep -Fq ACK:PSP-9f3a7c2e pre.txt && grep -Fq ACK:PSP-9f3a7c2e post.txt"
+        host "local"
+        workspace "${ST_WORKSPACE}/fixture"
+      }
+    }
+  }

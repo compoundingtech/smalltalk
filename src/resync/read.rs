@@ -9,7 +9,10 @@ use sha2::{Digest as _, Sha256};
 
 use super::*;
 
-pub(super) fn read_state(path: &Path, containment_root: Option<&Path>) -> std::io::Result<CarrierState> {
+pub(super) fn read_state(
+    path: &Path,
+    containment_root: Option<&Path>,
+) -> std::io::Result<CarrierState> {
     match containment_root {
         Some(root) => read_confined(path, root),
         None => read_regular(path),

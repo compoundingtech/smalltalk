@@ -293,7 +293,7 @@ rather than a missing global. The `both` case establishes the winner
 losing case's marker file was never written. It is a single slot, not a merge or
 a chain.
 
-**Consequence.** `.claude/settings.local.json` is exactly the file st2 renders
+**Consequence.** `.claude/settings.local.json` is exactly the file the st2 materializer writes
 for driver-declared agents, so an st2 `statusLine` entry there wins
 unconditionally. Without chaining it silently removes the operator's status line
 on every managed agent — on this host, one that already displays agent id,

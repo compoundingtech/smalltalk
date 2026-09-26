@@ -96,15 +96,18 @@ fn spawn(catalog: &Path) -> st2::resync::ResyncSupervisor {
         registry,
     );
     let found = st2::discover_strict(catalog);
-    assert!(found.errors.is_empty(), "clean discovery: {:?}", found.errors);
+    assert!(
+        found.errors.is_empty(),
+        "clean discovery: {:?}",
+        found.errors
+    );
     let specs = found.specs;
     let live_subscription_specs = specs
         .iter()
         .filter(|spec| spec.desired_state.is_running())
         .cloned()
         .collect::<Vec<_>>();
-    let diagnostics =
-        supervisor.refresh(&specs, &live_subscription_specs, "hetz", &[], &[]);
+    let diagnostics = supervisor.refresh(&specs, &live_subscription_specs, "hetz", &[], &[]);
     assert!(diagnostics.is_empty(), "clean refresh: {diagnostics:?}");
     std::thread::sleep(Duration::from_millis(300));
     supervisor
@@ -244,10 +247,7 @@ fn a_suspended_ancestor_contributes_its_layer_without_becoming_a_subscription() 
     let worker = write_agent(catalog.path(), "worker", Some("hetz.lead"), None);
     write_layer(&lead, "before\n");
     let specs = st2::discover_strict(catalog.path()).specs;
-    let worker_spec = specs
-        .iter()
-        .find(|spec| spec.identity == "worker")
-        .unwrap();
+    let worker_spec = specs.iter().find(|spec| spec.identity == "worker").unwrap();
     let set = st2::resync::watch_set_for_in_catalog(
         worker_spec,
         &specs,

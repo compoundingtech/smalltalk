@@ -1,0 +1,25 @@
+version 2
+
+mission "eval/loop-until-green" state="ready" timeout="20m" {
+  completion { when "all-steps-exhausted" }
+  goal "Complete a bounded loop on its second round."
+
+  loop "repeat" timeout="1m" {
+    max-rounds 3
+    until {
+      gate "round two passes" {
+        exec "test \"${ST_LOOP_ROUND}\" -eq 2"
+        host "local"
+        workspace "${ST_WORKSPACE}"
+        time-limit "30s"
+      }
+    }
+    round {
+      completion { when "all-steps-exhausted" }
+      step "work" {
+        agentless
+        goal "Complete round ${loop.round}."
+      }
+    }
+  }
+}

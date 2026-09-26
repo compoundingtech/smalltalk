@@ -15,12 +15,7 @@ use std::process::{Command, Output};
 /// not depend on the surrounding process's stdin or on detached pipe-reader threads. For the
 /// no-export case, `env -u` removes the endpoint that otelite injects into its child while leaving
 /// the receiver live to catch any unintended traffic.
-fn run_with_capture(
-    otelite: &Path,
-    out_dir: &Path,
-    catalog: &Path,
-    export: bool,
-) -> Output {
+fn run_with_capture(otelite: &Path, out_dir: &Path, catalog: &Path, export: bool) -> Output {
     let bin = env!("CARGO_BIN_EXE_st2");
     let bin_dir = Path::new(bin).parent().unwrap();
     let path = format!(
@@ -57,8 +52,9 @@ fn metric_records(line: &str) -> Vec<serde_json::Value> {
         return records;
     };
     for resource_metric in resource_metrics {
-        let Some(scope_metrics) =
-            resource_metric.get("scopeMetrics").and_then(|v| v.as_array())
+        let Some(scope_metrics) = resource_metric
+            .get("scopeMetrics")
+            .and_then(|v| v.as_array())
         else {
             continue;
         };
@@ -239,8 +235,7 @@ fn st2_exports_spans_to_otelite_when_endpoint_is_set() {
     // duration histogram sample.
     let metrics =
         std::fs::read_to_string(cap_dir.join("metrics.ndjson")).expect("metrics.ndjson written");
-    let all_metrics: Vec<serde_json::Value> =
-        metrics.lines().flat_map(metric_records).collect();
+    let all_metrics: Vec<serde_json::Value> = metrics.lines().flat_map(metric_records).collect();
 
     let passes: Vec<&serde_json::Value> = all_metrics
         .iter()

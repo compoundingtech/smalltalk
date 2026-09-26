@@ -1,0 +1,52 @@
+{
+  "schema": "st3-eval-graph-proof.v1",
+  "date": "2026-08-30",
+  "eval": "signal-rename-codex",
+  "run_id": "6f71ae66b728550095f2b2faa853162a",
+  "candidate": {
+    "git_head": "e918fa6d1a2f005e57583c2ed850395f7f27d6c7",
+    "st3_version": "0.1.0",
+    "st3_binary_sha256": "d904c55bf78ea4a4c3b83ee94da2620c8bc6ebfe69293bbba86344b8189dcb1a",
+    "eval_kdl_sha256": "a6bebd05fda0cdc6acaf5eeac6322efac2d1a0da447799c07b64bd315793a335",
+    "task_document_sha256": "f12083c4ec4a7b2d6d9af20a5acdd89663a31532f4a3cee10c43fe283f61f1de"
+  },
+  "providers": {
+    "codex_cli": "0.146.0",
+    "pty": "0.12.0+500eab2"
+  },
+  "viewer": {
+    "start_and_watch": "st3 eval PATH --graph",
+    "attach_to_running": "st3 graph SCOPE",
+    "source": "the eval scope and its root mission runs",
+    "eval_specific_configuration": false,
+    "shows": [
+      "current lifecycle, phase, verdict, cleanup, and progress",
+      "root and nested mission work",
+      "active assignees and blocked reasons",
+      "recent semantic state transitions"
+    ],
+    "streams_agent_logs": false
+  },
+  "result": {
+    "lifecycle": "completed",
+    "phase": "terminal",
+    "verdict": "pass",
+    "cleanup": "complete",
+    "completed_steps": 38,
+    "total_steps": 38,
+    "active_steps": 0,
+    "blocked_steps": 0,
+    "viewer_elapsed_seconds": 911,
+    "final_store_index": 340,
+    "judges": [
+      "commit isolation",
+      "package suites",
+      "complete rename",
+      "primitive preservation",
+      "held-out integration",
+      "graph sequence and result",
+      "final report receipt",
+      "scope emptiness"
+    ]
+  }
+}

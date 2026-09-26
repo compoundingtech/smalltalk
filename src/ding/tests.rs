@@ -1,5 +1,6 @@
 use super::*;
 use crate::message::{archive_dir, archive_msg, inbox_dir, send_to_inbox};
+use std::cell::RefCell;
 use std::sync::Mutex;
 use std::sync::atomic::AtomicUsize;
 
@@ -167,6 +168,44 @@ fn poke_id_extracts_rand6() {
 }
 
 #[test]
+fn st3_message_ding_uses_its_canonical_graph_reference() {
+    let mut message = msg(
+        "1785070000000-abc123.md",
+        "daemon/runtime",
+        Some("Mission step ready"),
+    );
+    message
+        .tags
+        .push("st3-message:message/0199abcdef0123456789abcdef012345".into());
+
+    assert_eq!(
+        render_without_catalog(&message),
+        "[PING from st3] message/0199abcdef0123456789abcdef012345 from daemon/runtime: Mission step ready"
+    );
+}
+
+#[test]
+fn st3_notification_has_the_same_bounded_envelope_for_every_driver() {
+    assert_eq!(
+        st3_notification_text(
+            "message/abc123",
+            "agent/fleet/cos\nspoofed",
+            Some("Check\rreceipt"),
+            "Reply once\nwith token.",
+        ),
+        "[PING from st3] message/abc123 from agent/fleet/cos spoofed: Check receipt\n\nReply once with token."
+    );
+    let long = st3_notification_text(
+        "message/abc123",
+        "agent/a",
+        Some("title"),
+        &"x".repeat(ST3_BODY_MAX_CHARS + 1),
+    );
+    assert!(long.ends_with("… [read the full message in st3]"));
+    assert!(!long.contains(&"x".repeat(ST3_BODY_MAX_CHARS + 1)));
+}
+
+#[test]
 fn ancestor_depth_is_encoded_in_the_marker_run() {
     let catalog = tempfile::tempdir().unwrap();
     declare_agent(catalog.path(), "h", "root", None);
@@ -180,7 +219,7 @@ fn ancestor_depth_is_encoded_in_the_marker_run() {
             "h.recipient",
             &msg("1785070000000-abc123.md", "h.middle", Some("direct"))
         ),
-        "[DING] ↓ h.middle: direct [id:abc123]"
+        "[PING] ↓ h.middle: direct [id:abc123]"
     );
     assert_eq!(
         poke_text(
@@ -189,7 +228,7 @@ fn ancestor_depth_is_encoded_in_the_marker_run() {
             "h.recipient",
             &msg("1785070000000-def456.md", "h.root", Some("skip-level"))
         ),
-        "[DING] ↓↓ h.root: skip-level [id:def456]"
+        "[PING] ↓↓ h.root: skip-level [id:def456]"
     );
 }
 
@@ -208,7 +247,7 @@ fn relationship_markers_cover_descendant_peer_and_missing_sender_spec() {
             "h.recipient",
             &msg("1785070000000-abc123.md", "h.child", Some("report"))
         ),
-        "[DING] ↑ h.child: report [id:abc123]"
+        "[PING] ↑ h.child: report [id:abc123]"
     );
     assert_eq!(
         poke_text(
@@ -217,7 +256,7 @@ fn relationship_markers_cover_descendant_peer_and_missing_sender_spec() {
             "h.recipient",
             &msg("1785070000000-def456.md", "h.peer", Some("note"))
         ),
-        "[DING] ← h.peer: note [id:def456]"
+        "[PING] ← h.peer: note [id:def456]"
     );
     assert_eq!(
         poke_text(
@@ -226,7 +265,7 @@ fn relationship_markers_cover_descendant_peer_and_missing_sender_spec() {
             "h.recipient",
             &msg("1785070000000-ghi789.md", "nightly-timer", Some("check"))
         ),
-        "[DING] ? nightly-timer: check [id:ghi789]"
+        "[PING] ? nightly-timer: check [id:ghi789]"
     );
 }
 
@@ -250,7 +289,7 @@ fn dangling_catalog_entry_makes_relationship_unknown() {
             "h.recipient",
             &msg("1785070000000-abc123.md", "h.root", Some("dangling"))
         ),
-        "[DING] ? h.root: dangling [id:abc123]"
+        "[PING] ? h.root: dangling [id:abc123]"
     );
 }
 
@@ -266,7 +305,7 @@ fn self_addressed_message_uses_identity_marker() {
             "h.recipient",
             &msg("1785070000000-abc123.md", "h.recipient", Some("self"))
         ),
-        "[DING] ↺ h.recipient: self [id:abc123]"
+        "[PING] ↺ h.recipient: self [id:abc123]"
     );
 }
 
@@ -276,7 +315,7 @@ fn supervisor_cycle_renders_unknown_and_still_delivers() {
     declare_agent(catalog.path(), "h", "recipient", Some("loop"));
     declare_agent(catalog.path(), "h", "loop", Some("recipient"));
     let message = msg("1785070000000-abc123.md", "h.loop", Some("cycle"));
-    let expected = "[DING] ? h.loop: cycle [id:abc123]";
+    let expected = "[PING] ? h.loop: cycle [id:abc123]";
     let resolver = RelationshipResolver::read(catalog.path());
     let recipient = resolve_spec(&resolver.specs, "h.recipient", "h").unwrap();
 
@@ -321,7 +360,7 @@ fn malformed_catalog_with_resolvable_endpoints_renders_unknown_and_still_deliver
         from: Some("h.root".to_string()),
         ..message
     };
-    let expected = "[DING] ? h.root: fallback [id:abc123]";
+    let expected = "[PING] ? h.root: fallback [id:abc123]";
     let mut pending = VecDeque::from([PendingNotice::message(message)]);
     let poker = RecordingPoker::live();
 
@@ -345,8 +384,7 @@ fn supervisor_depth_limit_fails_soft() {
     let catalog = tempfile::tempdir().unwrap();
     for depth in 0..=SUPERVISOR_CHAIN_LIMIT {
         let identity = format!("agent-{depth}");
-        let supervisor =
-            (depth < SUPERVISOR_CHAIN_LIMIT).then(|| format!("agent-{}", depth + 1));
+        let supervisor = (depth < SUPERVISOR_CHAIN_LIMIT).then(|| format!("agent-{}", depth + 1));
         declare_agent(catalog.path(), "h", &identity, supervisor.as_deref());
     }
 
@@ -357,7 +395,7 @@ fn supervisor_depth_limit_fails_soft() {
             "h.agent-0",
             &msg("1785070000000-abc123.md", "h.agent-64", Some("too deep"))
         ),
-        "[DING] ? h.agent-64: too deep [id:abc123]"
+        "[PING] ? h.agent-64: too deep [id:abc123]"
     );
 }
 
@@ -365,7 +403,7 @@ fn supervisor_depth_limit_fails_soft() {
 fn poke_text_normalizes_and_bounds_untrusted_fields() {
     assert_eq!(
         render_without_catalog(&msg("1785070000000-abc123.md", "alice", Some("deploy?"))),
-        "[DING] ? alice: deploy? [id:abc123]"
+        "[PING] ? alice: deploy? [id:abc123]"
     );
     assert_eq!(
         render_without_catalog(&Message {
@@ -373,7 +411,7 @@ fn poke_text_normalizes_and_bounds_untrusted_fields() {
             subject: None,
             ..msg("1785070000000-def456.md", "", None)
         }),
-        "[DING] ? unknown: (no subject) [id:def456]"
+        "[PING] ? unknown: (no subject) [id:def456]"
     );
 
     let subject = format!("{}\nignored", "s".repeat(SUBJECT_MAX_CHARS + 20));
@@ -477,9 +515,9 @@ fn staged_codex_screen(text: &str) -> String {
 }
 
 fn staged_wrapped_codex_screen() -> (&'static str, String) {
-    let text = "[DING] ↓ supervisor: a deliberately long synthetic notification with enough content to reach another renderer boundary before the final words [id:abc123]";
+    let text = "[PING] ↓ supervisor: a deliberately long synthetic notification with enough content to reach another renderer boundary before the final words [id:abc123]";
     let composer = concat!(
-        "[DING] ↓ supervisor: a deliberately long synthetic notification with enough",
+        "[PING] ↓ supervisor: a deliberately long synthetic notification with enough",
         "\x1b[3X\r\n",
         "  content to reach another renderer boundary before the final words [id:abc123]",
     );
@@ -693,7 +731,7 @@ fn codex_screen_below_claude_transcript(transcript_row: &str, codex: &str) -> St
 /// sits above every genuinely idle composer, so both directions are pinned here.
 #[test]
 fn an_in_flight_turn_blocks_return_but_a_finished_one_does_not() {
-    let expected = "[DING] ? cos: exact observation [id:abc123]";
+    let expected = "[PING] ? cos: exact observation [id:abc123]";
 
     for status in ACTIVE_TURN_STATUS {
         // Empty composer mid-turn: positively empty, but not safe.
@@ -733,7 +771,7 @@ fn an_in_flight_turn_blocks_return_but_a_finished_one_does_not() {
 
 #[test]
 fn claude_question_form_blocks_while_an_ordinary_idle_composer_stays_deliverable() {
-    let expected = "[DING] ? cos: exact observation [id:abc123]";
+    let expected = "[PING] ? cos: exact observation [id:abc123]";
 
     assert!(composer::looks_like_choice_menu(
         CAPTURED_CLAUDE_QUESTION_FORM
@@ -761,7 +799,7 @@ fn claude_question_form_blocks_while_an_ordinary_idle_composer_stays_deliverable
 
 #[test]
 fn codex_trust_selection_blocks_while_an_ordinary_idle_composer_stays_deliverable() {
-    let expected = "[DING] ? cos: exact observation [id:abc123]";
+    let expected = "[PING] ? cos: exact observation [id:abc123]";
 
     assert!(composer::looks_like_choice_menu(
         CAPTURED_CODEX_TRUST_SELECTION
@@ -809,7 +847,7 @@ fn captured_codex_model_picker_is_recognized_as_a_choice_menu() {
 fn fresh_delivery_does_not_return_after_idle_changes_to_model_picker() {
     use std::os::unix::fs::PermissionsExt as _;
 
-    let text = "[DING] unread st2 messages remain; check your inbox";
+    let text = "[PING] unread st2 messages remain; check your inbox";
     let temp = tempfile::tempdir().unwrap();
     let bin = temp.path().join("pty");
     let idle = temp.path().join("idle.bin");
@@ -857,7 +895,7 @@ fn fresh_delivery_does_not_return_after_idle_changes_to_model_picker() {
 
 #[test]
 fn codex_latency_retry_notice_blocks_without_choice_menu_structure() {
-    let expected = "[DING] ? cos: latency control [id:abc123]";
+    let expected = "[PING] ? cos: latency control [id:abc123]";
 
     assert!(!composer::looks_like_choice_menu(
         CODEX_LATENCY_RETRY_NOTICE
@@ -876,7 +914,7 @@ fn codex_latency_retry_notice_blocks_without_choice_menu_structure() {
 
 #[test]
 fn claude_question_form_blocks_after_selection_moves_to_second_or_last_option() {
-    let expected = "[DING] ? cos: exact observation [id:abc123]";
+    let expected = "[PING] ? cos: exact observation [id:abc123]";
 
     for option in [2, 4] {
         let form = captured_claude_question_form_with_selection(option);
@@ -897,7 +935,7 @@ fn claude_question_form_blocks_after_selection_moves_to_second_or_last_option() 
 
 #[test]
 fn two_option_claude_question_form_blocks_return() {
-    let expected = "[DING] ? cos: exact observation [id:abc123]";
+    let expected = "[PING] ? cos: exact observation [id:abc123]";
     let form = captured_two_option_claude_question_form();
 
     assert!(!form.contains("  3."));
@@ -914,7 +952,7 @@ fn two_option_claude_question_form_blocks_return() {
 
 #[test]
 fn legacy_numbered_choice_menu_still_blocks_return() {
-    let expected = "[DING] ? cos: exact observation [id:abc123]";
+    let expected = "[PING] ? cos: exact observation [id:abc123]";
     let legacy_menu = "› 1. Continue\r\n  2. Cancel";
 
     assert!(composer::looks_like_choice_menu(legacy_menu));
@@ -938,7 +976,7 @@ fn legacy_numbered_choice_menu_still_blocks_return() {
 /// classify from a pasted draft instead of the real composer.
 #[test]
 fn composer_positions_are_compared_as_rows_not_raw_byte_offsets() {
-    let expected = "[DING] ? cos: exact observation [id:abc123]";
+    let expected = "[PING] ? cos: exact observation [id:abc123]";
     assert_eq!(
         classify_composer(&live_claude_below_escape_heavy_codex_transcript(), expected),
         ComposerState::EmptySafe
@@ -969,7 +1007,7 @@ fn stripping_preserves_newlines_for_well_formed_sequences_only() {
 /// "idle" or "already staged" is a wrong positive: it can type into, or submit, a human draft.
 #[test]
 fn transcript_composers_never_outrank_the_live_bottom_composer() {
-    let expected = "[DING] ? cos: exact observation [id:abc123]";
+    let expected = "[PING] ? cos: exact observation [id:abc123]";
 
     // The live Codex composer holds a human draft in both cases, so both must stay `Changed`.
     // An empty transcript row would otherwise read as positively-empty and allow the paste.
@@ -1007,7 +1045,7 @@ fn transcript_composers_never_outrank_the_live_bottom_composer() {
 
 #[test]
 fn maintained_composer_classifiers_require_exact_idle_state() {
-    let expected = "[DING] ? cos: exact observation [id:abc123]";
+    let expected = "[PING] ? cos: exact observation [id:abc123]";
     assert_eq!(
         classify_composer(&idle_codex_screen(), expected),
         ComposerState::EmptySafe
@@ -1102,7 +1140,7 @@ fn maintained_composer_classifiers_require_exact_idle_state() {
 
 #[test]
 fn maintained_codex_context_footers_are_narrow_and_position_bound() {
-    let expected = "[DING] ? cos: exact observation [id:abc123]";
+    let expected = "[PING] ? cos: exact observation [id:abc123]";
 
     for footer in [
         "gpt-5.6-sol xhigh · ding-fix · Context 73% left",
@@ -1229,8 +1267,8 @@ fn codex_renderer_wraps_preserve_possible_inter_word_spaces() {
 
 #[test]
 fn codex_word_wraps_preserve_short_rows_before_continuations() {
-    let expected = "[DING] new st2 message: [id:7j8b6n] re: Q97 light-work receipt: VRS/source consistency complete (from dev3.compoundingtech.st2.message-sent.orchestration); check your inbox";
-    let screen = "\x1b[1m›\x1b[1C\x1b[0m[DING] new st2 message: [id:7j8b6n] re: Q97 light-work receipt: VRS/source\r\n  consistency complete (from dev3.compoundingtech.st2.message-\r\n  sent.orchestration); check your inbox\r\n\r\n\x1b[2C\x1b[0mgpt-5.6-sol xhigh · /workspace";
+    let expected = "[PING] new st2 message: [id:7j8b6n] re: Q97 light-work receipt: VRS/source consistency complete (from dev3.compoundingtech.st2.message-sent.orchestration); check your inbox";
+    let screen = "\x1b[1m›\x1b[1C\x1b[0m[PING] new st2 message: [id:7j8b6n] re: Q97 light-work receipt: VRS/source\r\n  consistency complete (from dev3.compoundingtech.st2.message-\r\n  sent.orchestration); check your inbox\r\n\r\n\x1b[2C\x1b[0mgpt-5.6-sol xhigh · /workspace";
 
     assert_eq!(
         classify_composer(screen, expected),
@@ -1264,10 +1302,10 @@ fn codex_word_wraps_preserve_short_rows_before_continuations() {
 
 #[test]
 fn codex_hard_newline_shape_is_knowingly_admitted_until_issue_250() {
-    let expected = "[DING] new st2 message: [id:7j8b6n] re: Q97 light-work receipt: VRS/source consistency complete (from dev3.compoundingtech.st2.message-sent.orchestration); check your inbox";
+    let expected = "[PING] new st2 message: [id:7j8b6n] re: Q97 light-work receipt: VRS/source consistency complete (from dev3.compoundingtech.st2.message-sent.orchestration); check your inbox";
     // A buffer containing hard newlines plus two literal spaces renders identically to this
     // soft wrap. The screen-only ambiguity is accepted until https://github.com/compoundingtech/st2/issues/250.
-    let screen = "\x1b[1m›\x1b[1C\x1b[0m[DING] new st2 message: [id:7j8b6n] re: Q97 light-work receipt: VRS/source\r\n  consistency complete (from dev3.compoundingtech.st2.message-\r\n  sent.orchestration); check your inbox\r\n\r\n\x1b[2C\x1b[0mgpt-5.6-sol xhigh · /workspace";
+    let screen = "\x1b[1m›\x1b[1C\x1b[0m[PING] new st2 message: [id:7j8b6n] re: Q97 light-work receipt: VRS/source\r\n  consistency complete (from dev3.compoundingtech.st2.message-\r\n  sent.orchestration); check your inbox\r\n\r\n\x1b[2C\x1b[0mgpt-5.6-sol xhigh · /workspace";
 
     assert_eq!(
         classify_composer(screen, expected),
@@ -1281,11 +1319,11 @@ fn codex_hard_newline_shape_is_knowingly_admitted_until_issue_250() {
 
 #[test]
 fn claude_word_wraps_preserve_short_rows_before_continuations() {
-    let expected = "[DING] ? dev3.dotfiles.st2.claude-composer.worker: inspect the composer word wrapping behavior (from dev3.dotfiles.st2.main.orchestration); check your inbox [id:abc123]";
+    let expected = "[PING] ? dev3.dotfiles.st2.claude-composer.worker: inspect the composer word wrapping behavior (from dev3.dotfiles.st2.main.orchestration); check your inbox [id:abc123]";
     let rule = claude_rule();
     let screen = format!(
         "Claude Code v2.1.220\r\n{rule}\r\n\
-             ❯\u{00a0}[DING] ? dev3.dotfiles.st2.claude-composer.worker: inspect the\r\n  \
+             ❯\u{00a0}[PING] ? dev3.dotfiles.st2.claude-composer.worker: inspect the\r\n  \
              composer word wrapping behavior (from\r\n  \
              dev3.dotfiles.st2.main.orchestration); check your inbox\r\n  \
              [id:abc123]\r\n{rule}\r\n\
@@ -1355,7 +1393,7 @@ fn strip_ansi_consumes_designate_g0_charset_sequence() {
 #[test]
 fn startup_adopts_only_an_exact_recovery_or_backlog_composer() {
     let recovery = RECOVERY_POKE.to_string();
-    let backlog = "[DING] ? cos: seeded [id:abc123]".to_string();
+    let backlog = "[PING] ? cos: seeded [id:abc123]".to_string();
     let candidates = vec![recovery.clone(), backlog.clone()];
     assert_eq!(
         exact_staged_candidate(&staged_codex_screen(&backlog), &candidates),
@@ -1372,10 +1410,116 @@ fn startup_adopts_only_an_exact_recovery_or_backlog_composer() {
 }
 
 #[test]
+fn archive_between_startup_seed_and_adoption_removes_every_stale_candidate() {
+    let agent = tempfile::tempdir().unwrap();
+    let inbox = inbox_dir(agent.path());
+    let archive = archive_dir(agent.path());
+    let filename = send_to_inbox(&inbox, "oversight", Some("stale"), None, &[], "body").unwrap();
+    let context = DingContext {
+        catalog_root: agent.path(),
+        this_host: "h",
+        recipient: "h.recipient",
+    };
+    let seeded = active_startup_candidates(context, &inbox);
+    let stale_text = seeded
+        .iter()
+        .find_map(|(text, message)| message.as_ref().map(|_| text.clone()))
+        .unwrap();
+    assert!(
+        exact_staged_candidate(
+            &staged_codex_screen(&stale_text),
+            std::slice::from_ref(&stale_text),
+        )
+        .is_some()
+    );
+
+    archive_msg(&inbox, &archive, &filename).unwrap();
+    let candidates = active_startup_candidates(context, &inbox);
+    assert!(candidates.is_empty());
+    assert!(
+        exact_staged_candidate(
+            &staged_codex_screen(&stale_text),
+            &candidates
+                .into_iter()
+                .map(|(text, _)| text)
+                .collect::<Vec<_>>()
+        )
+        .is_none(),
+        "an archive after startup seeding is a hard no-adopt fence"
+    );
+}
+
+#[test]
+fn archive_between_paste_and_submit_cancels_return() {
+    let agent = tempfile::tempdir().unwrap();
+    let inbox = inbox_dir(agent.path());
+    let archive = archive_dir(agent.path());
+    let filename = send_to_inbox(&inbox, "oversight", Some("race"), None, &[], "body").unwrap();
+    let message = message::list_inbox(&inbox).unwrap().pop().unwrap();
+    let text = render_without_catalog(&message);
+    let fence = PendingNotice::message(message).fence();
+    let screens = RefCell::new(VecDeque::from([
+        idle_codex_screen(),
+        staged_codex_screen(&text),
+        staged_codex_screen(&text),
+    ]));
+    let submits = RefCell::new(0);
+    let outcome = observed_poke_with_window(
+        &text,
+        &mut || Ok(screens.borrow_mut().pop_front().unwrap()),
+        &mut || Ok(()),
+        &mut || {
+            *submits.borrow_mut() += 1;
+            Ok(())
+        },
+        &mut || {},
+        &mut || {
+            archive_msg(&inbox, &archive, &filename)?;
+            fence.check(&inbox)
+        },
+        Duration::ZERO,
+    )
+    .unwrap();
+    assert_eq!(outcome, PokeOutcome::Cancelled);
+    assert_eq!(*submits.borrow(), 0, "Return was never sent");
+}
+
+#[test]
+fn archived_notice_is_not_readopted_after_sidecar_restart_or_replay() {
+    let agent = tempfile::tempdir().unwrap();
+    let inbox = inbox_dir(agent.path());
+    let archive = archive_dir(agent.path());
+    let filename = send_to_inbox(&inbox, "oversight", Some("restart"), None, &[], "body").unwrap();
+    let message = message::list_inbox(&inbox).unwrap().pop().unwrap();
+    let stable_text = render_without_catalog(&message);
+    archive_msg(&inbox, &archive, &filename).unwrap();
+    std::fs::copy(archive.join(&filename), inbox.join(&filename)).unwrap();
+
+    let context = DingContext {
+        catalog_root: agent.path(),
+        this_host: "h",
+        recipient: "h.recipient",
+    };
+    let candidates = active_startup_candidates(context, &inbox);
+    assert!(candidates.is_empty());
+    assert!(new_arrivals(&inbox, &mut HashSet::new()).is_empty());
+    assert!(
+        exact_staged_candidate(
+            &staged_codex_screen(&stable_text),
+            &candidates
+                .into_iter()
+                .map(|(text, _)| text)
+                .collect::<Vec<_>>()
+        )
+        .is_none()
+    );
+}
+
+#[test]
 fn paste_then_two_exact_observations_precede_return() {
     use std::cell::RefCell;
 
-    let text = "[DING] ? cos: ordered [id:abc123]";
+    let text = "[PING] ? cos: ordered [id:abc123]";
     let screens = RefCell::new(VecDeque::from([
         idle_codex_screen(),
         staged_codex_screen(text),
@@ -1416,7 +1560,7 @@ fn paste_then_two_exact_observations_precede_return() {
 fn changed_modal_ambiguous_and_bounded_timeout_never_return() {
     use std::cell::RefCell;
 
-    let text = "[DING] ? cos: guarded [id:abc123]";
+    let text = "[PING] ? cos: guarded [id:abc123]";
     for screen in [
         human_codex_screen(),
         format!("Create a plan?\r\n{}", staged_codex_screen(text)),
@@ -1476,7 +1620,7 @@ fn changed_modal_ambiguous_and_bounded_timeout_never_return() {
 fn final_observation_change_and_staged_retry_are_fail_closed() {
     use std::cell::RefCell;
 
-    let text = "[DING] ? cos: final race [id:abc123]";
+    let text = "[PING] ? cos: final race [id:abc123]";
     let screens = RefCell::new(VecDeque::from([
         idle_codex_screen(),
         staged_codex_screen(text),
@@ -1530,7 +1674,7 @@ fn final_observation_change_and_staged_retry_are_fail_closed() {
 fn successful_transport_with_retained_or_unproven_pixels_is_not_delivered() {
     use std::cell::RefCell;
 
-    let text = "[DING] ? cos: receipt truth [id:abc123]";
+    let text = "[PING] ? cos: receipt truth [id:abc123]";
     for screen in [
         staged_codex_screen(text),
         idle_codex_screen(),
@@ -1569,7 +1713,7 @@ fn successful_transport_with_retained_or_unproven_pixels_is_not_delivered() {
 fn ambiguous_transport_receipt_and_retry_errors_retain_staged_ownership() {
     use std::cell::RefCell;
 
-    let text = "[DING] ? cos: error truth [id:abc123]";
+    let text = "[PING] ? cos: error truth [id:abc123]";
 
     let actions = RefCell::new(Vec::new());
     assert_eq!(
@@ -1633,7 +1777,7 @@ fn ambiguous_transport_receipt_and_retry_errors_retain_staged_ownership() {
 
 #[test]
 fn adapter_recognized_notice_with_an_empty_live_composer_is_a_positive_receipt() {
-    let text = "[DING] ? cos: receipt truth [id:abc123]";
+    let text = "[PING] ? cos: receipt truth [id:abc123]";
     assert_eq!(
         classify_receipt(&queued_codex_screen(text), text),
         ReceiptState::Accepted
@@ -1698,7 +1842,7 @@ fn adapter_recognized_notice_with_an_empty_live_composer_is_a_positive_receipt()
 
 #[test]
 fn soft_wrap_proofs_accept_short_known_continuations() {
-    let text = "[DING] ? cos: receipt truth [id:abc123]";
+    let text = "[PING] ? cos: receipt truth [id:abc123]";
     let (first, continuation) = text.split_at(32);
     let codex = format!(
         "\x1b[1m›\x1b[1C\x1b[0m{first}\r\n  {continuation}\r\n\r\n\
@@ -1732,7 +1876,7 @@ fn soft_wrap_proofs_accept_short_known_continuations() {
 fn staged_retry_submits_only_retained_safe_and_requires_a_receipt() {
     use std::cell::RefCell;
 
-    let text = "[DING] ? cos: retry truth [id:abc123]";
+    let text = "[PING] ? cos: retry truth [id:abc123]";
 
     let retained = RefCell::new(VecDeque::from([
         staged_codex_screen(text),
@@ -1809,7 +1953,7 @@ fn staged_retry_submits_only_retained_safe_and_requires_a_receipt() {
 fn staged_retry_keeps_unproven_and_retained_blocked_owned() {
     use std::cell::RefCell;
 
-    let text = "[DING] ? cos: retry truth [id:abc123]";
+    let text = "[PING] ? cos: retry truth [id:abc123]";
     for screen in [
         "unknown renderer".to_string(),
         format!("Create a plan?\r\n{}", staged_codex_screen(text)),
@@ -1900,7 +2044,7 @@ fn new_arrivals_is_fifo_and_archive_receipts_prevent_reding() {
 }
 
 #[test]
-fn staged_ownership_survives_archive_and_never_repastes() {
+fn archive_cancels_staged_ownership_without_submit_or_repaste() {
     let agent = tempfile::tempdir().unwrap();
     let inbox = inbox_dir(agent.path());
     let archive = archive_dir(agent.path());
@@ -1912,10 +2056,7 @@ fn staged_ownership_survives_archive_and_never_repastes() {
         pokes: Mutex::new(Vec::new()),
         retries: Mutex::new(Vec::new()),
         poke_outcomes: Mutex::new(VecDeque::from([PokeOutcome::Staged])),
-        retry_outcomes: Mutex::new(VecDeque::from([
-            PokeOutcome::Staged,
-            PokeOutcome::Delivered,
-        ])),
+        retry_outcomes: Mutex::new(VecDeque::new()),
     };
 
     flush_without_catalog(None, &mut pending, &poker);
@@ -1924,21 +2065,10 @@ fn staged_ownership_survives_archive_and_never_repastes() {
 
     archive_msg(&inbox, &archive, &filename).unwrap();
     prune_archived_pending(&inbox, &mut pending);
-    assert_eq!(
-        pending.len(),
-        1,
-        "an already-started paste remains inspection-owned across archive"
-    );
-
+    assert!(pending.is_empty(), "archive is a hard no-submit fence");
     flush_without_catalog(None, &mut pending, &poker);
-    assert_eq!(pending.len(), 1);
-    flush_without_catalog(None, &mut pending, &poker);
-    assert!(pending.is_empty());
     assert_eq!(poker.pokes.lock().unwrap().as_slice(), [expected.as_str()]);
-    assert_eq!(
-        poker.retries.lock().unwrap().as_slice(),
-        [expected.as_str(), expected.as_str()]
-    );
+    assert!(poker.retries.lock().unwrap().is_empty());
 }
 
 // -----------------------------------------------------------------------------------------
@@ -1997,9 +2127,7 @@ fn flush_in(root: &Path, pending: &mut VecDeque<PendingNotice>, poker: &dyn Poke
 }
 
 /// The race: the producer supersedes event N *while DING owns N's staged payload*. The
-/// existing ownership rules must carry it — N is pasted exactly once and never again, the
-/// archived-and-not-retained head releases FIFO, and N+1 still delivers. Nothing about
-/// `flush_pending` or `prune_archived_pending` changes to make this true.
+/// archive receipt hard-cancels N before Return, N is never pasted again, and N+1 still delivers.
 #[test]
 fn a_producer_supersede_of_a_staged_event_never_repastes_and_the_successor_delivers() {
     let (catalog, inbox) = event_catalog();
@@ -2020,7 +2148,7 @@ fn a_producer_supersede_of_a_staged_event_never_repastes_and_the_successor_deliv
         &mut None,
     );
     assert!(
-        failure_text.starts_with("[DING] » hetz.worker/gh-ci:"),
+        failure_text.starts_with("[PING] » hetz.worker/gh-ci:"),
         "an event announces itself as a world-event: {failure_text}"
     );
 
@@ -2031,7 +2159,7 @@ fn a_producer_supersede_of_a_staged_event_never_repastes_and_the_successor_deliv
             // the successor, once ownership of the superseded head is released
             PokeOutcome::Delivered,
         ])),
-        retry_outcomes: Mutex::new(VecDeque::from([PokeOutcome::NotRetained])),
+        retry_outcomes: Mutex::new(VecDeque::new()),
     };
     // DING stages the failure notice and owns it.
     let stage_only = OwnershipPoker {
@@ -2057,8 +2185,8 @@ fn a_producer_supersede_of_a_staged_event_never_repastes_and_the_successor_deliv
     prune_archived_pending(&inbox, &mut pending);
     assert_eq!(
         pending.len(),
-        2,
-        "the staged-but-archived head keeps ownership; the successor queues behind it"
+        1,
+        "the archived head is cancelled and the successor remains actionable"
     );
 
     flush_in(root, &mut pending, &poker);
@@ -2079,11 +2207,7 @@ fn a_producer_supersede_of_a_staged_event_never_repastes_and_the_successor_deliv
         1,
         "and the only fresh paste after supersede is the successor"
     );
-    assert_eq!(
-        poker.retries.lock().unwrap().as_slice(),
-        [failure_text.as_str()],
-        "the superseded head was released by inspection only, never re-pasted"
-    );
+    assert!(poker.retries.lock().unwrap().is_empty());
 }
 
 /// The pessimistic half of the same race: the adapter still sees the superseded notice in the
@@ -2091,7 +2215,7 @@ fn a_producer_supersede_of_a_staged_event_never_repastes_and_the_successor_deliv
 /// pasted on top of a live payload. Supersede therefore cannot leak a second paste into a
 /// composer that is still holding the first.
 #[test]
-fn a_superseded_but_still_retained_staged_event_keeps_ownership_without_repasting() {
+fn a_superseded_staged_event_is_cancelled_even_if_pixels_remain() {
     let (catalog, inbox) = event_catalog();
     let root = catalog.path();
 
@@ -2113,8 +2237,11 @@ fn a_superseded_but_still_retained_staged_event_keeps_ownership_without_repastin
     let poker = OwnershipPoker {
         pokes: Mutex::new(Vec::new()),
         retries: Mutex::new(Vec::new()),
-        poke_outcomes: Mutex::new(VecDeque::from([PokeOutcome::Staged])),
-        retry_outcomes: Mutex::new(VecDeque::from([PokeOutcome::Staged])),
+        poke_outcomes: Mutex::new(VecDeque::from([
+            PokeOutcome::Staged,
+            PokeOutcome::Delivered,
+        ])),
+        retry_outcomes: Mutex::new(VecDeque::new()),
     };
     flush_in(root, &mut pending, &poker);
 
@@ -2127,17 +2254,15 @@ fn a_superseded_but_still_retained_staged_event_keeps_ownership_without_repastin
     prune_archived_pending(&inbox, &mut pending);
     flush_in(root, &mut pending, &poker);
 
-    assert_eq!(pending.len(), 2, "later FIFO work remains blocked");
-    assert_eq!(
-        poker.pokes.lock().unwrap().as_slice(),
-        [failure_text.as_str()],
-        "the successor is never pasted on top of a retained payload"
+    assert!(
+        pending.is_empty(),
+        "the actionable successor drains normally"
     );
-    assert_eq!(
-        poker.retries.lock().unwrap().as_slice(),
-        [failure_text.as_str()],
-        "the retained superseded notice is retried by inspection only"
-    );
+    let pokes = poker.pokes.lock().unwrap();
+    assert_eq!(pokes.len(), 2);
+    assert_eq!(pokes[0], failure_text);
+    assert!(pokes[1].contains("CI success on PR #42"));
+    assert!(poker.retries.lock().unwrap().is_empty());
 }
 
 /// Platforms that cannot hardlink through the open-file descriptor path (macOS fdescfs
@@ -2168,8 +2293,7 @@ fn archive_copy_fallback_preserves_supersede_ownership_without_staging_leftovers
         .map(PendingNotice::message)
         .collect();
     assert_eq!(pending.len(), 1);
-    let failure_bytes =
-        std::fs::read(inbox.join(&failure_filename)).expect("staged event bytes");
+    let failure_bytes = std::fs::read(inbox.join(&failure_filename)).expect("staged event bytes");
     let failure_text = pending[0].text(
         DingContext {
             catalog_root: root,
@@ -2182,8 +2306,11 @@ fn archive_copy_fallback_preserves_supersede_ownership_without_staging_leftovers
     let poker = OwnershipPoker {
         pokes: Mutex::new(Vec::new()),
         retries: Mutex::new(Vec::new()),
-        poke_outcomes: Mutex::new(VecDeque::from([PokeOutcome::Staged])),
-        retry_outcomes: Mutex::new(VecDeque::from([PokeOutcome::Staged])),
+        poke_outcomes: Mutex::new(VecDeque::from([
+            PokeOutcome::Staged,
+            PokeOutcome::Delivered,
+        ])),
+        retry_outcomes: Mutex::new(VecDeque::new()),
     };
     flush_in(root, &mut pending, &poker);
 
@@ -2196,15 +2323,17 @@ fn archive_copy_fallback_preserves_supersede_ownership_without_staging_leftovers
     prune_archived_pending(&inbox, &mut pending);
     flush_in(root, &mut pending, &poker);
 
-    assert_eq!(pending.len(), 2, "later FIFO work remains blocked");
-    assert_eq!(
-        poker.pokes.lock().unwrap().as_slice(),
-        [failure_text.as_str()],
-        "the successor is never pasted on top of a retained payload"
+    assert!(
+        pending.is_empty(),
+        "the archive fence releases the successor"
     );
+    let pokes = poker.pokes.lock().unwrap();
+    assert_eq!(pokes.len(), 2);
+    assert_eq!(pokes[0], failure_text);
+    assert!(pokes[1].contains("CI success on PR #42"));
     assert!(!inbox.join(&failure_filename).exists(), "head was archived");
-    let receipt = std::fs::read(archive.join(&failure_filename))
-        .expect("byte-copy archive receipt exists");
+    let receipt =
+        std::fs::read(archive.join(&failure_filename)).expect("byte-copy archive receipt exists");
     assert_eq!(
         receipt, failure_bytes,
         "the copy receipt carries exactly the validated bytes"
@@ -2243,7 +2372,7 @@ fn archived_not_retained_releases_fifo_without_repasting_owned_notice() {
             PokeOutcome::Staged,
             PokeOutcome::Delivered,
         ])),
-        retry_outcomes: Mutex::new(VecDeque::from([PokeOutcome::NotRetained])),
+        retry_outcomes: Mutex::new(VecDeque::new()),
     };
 
     flush_without_catalog(None, &mut pending, &poker);
@@ -2256,7 +2385,7 @@ fn archived_not_retained_releases_fifo_without_repasting_owned_notice() {
         poker.pokes.lock().unwrap().as_slice(),
         [first_text.as_str(), second_text.as_str()]
     );
-    assert_eq!(poker.retries.lock().unwrap().as_slice(), [first_text]);
+    assert!(poker.retries.lock().unwrap().is_empty());
     assert!(!inbox.join(first).exists());
     assert!(inbox.join(second).exists());
 }
@@ -2319,7 +2448,7 @@ fn pending_delivery_ignores_busy_but_respects_fresh_dnd_archive_and_retry() {
             .iter()
             .filter_map(|notice| match notice {
                 PendingNotice::Message { message, .. } => Some(message.filename.as_str()),
-                PendingNotice::Recovery { .. } | PendingNotice::Adopted { .. } => None,
+                PendingNotice::Recovery { .. } => None,
             })
             .collect::<Vec<_>>(),
         [second.as_str()]
@@ -2667,7 +2796,7 @@ fn session_liveness_probe_reports_only_positive_evidence() {
 /// understand clears on its own, a pane no harness can locate never will.
 #[test]
 fn a_deferral_names_the_cause_that_produced_it() {
-    let text = "[DING] ? cos: guarded [id:abc123]";
+    let text = "[PING] ? cos: guarded [id:abc123]";
     for (screen, expected) in [
         (
             human_codex_screen(),

@@ -1,0 +1,9 @@
+{
+  "name": "labelkit",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "A tiny label-formatting library.",
+  "main": "src/index.js",
+  "scripts": { "test": "node --test" }
+}

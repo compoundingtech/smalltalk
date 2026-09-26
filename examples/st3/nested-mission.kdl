@@ -1,0 +1,34 @@
+version 2
+
+mission "example/nested-change" state="ready" {
+  completion { when "all-steps-exhausted" }
+  goal "Keep one owner responsible for a complete nested change."
+
+  agent "owner" {
+    workspace "."
+    harness "codex" { effort "high" }
+    restart "always"
+  }
+
+  step "change" {
+    assigned-to "agent/${ST_MISSION_RUN}/owner"
+    goal "Complete the nested implementation mission."
+
+    mission "implementation" {
+      completion { when "all-steps-exhausted" }
+      goal "Implement and verify one bounded change."
+      step "implement" { goal "Implement the requested change with focused tests." }
+      step "verify" {
+        depends-on { step "implement" completed }
+        goal "Run the focused and regression tests."
+      }
+    }
+  }
+
+  finally {
+    step "stop-owner" {
+      agentless
+      stop "agent/${ST_MISSION_RUN}/owner"
+    }
+  }
+}

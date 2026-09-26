@@ -1,0 +1,13 @@
+{
+  "name": "st3-channel",
+  "description": "Deliver st3 messages and work to a running Claude Code session",
+  "version": "0.1.0",
+  "author": {
+    "name": "Compounding"
+  },
+  "keywords": [
+    "st3",
+    "channel",
+    "mcp"
+  ]
+}

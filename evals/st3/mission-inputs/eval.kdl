@@ -1,0 +1,45 @@
+version 2
+
+  resource "mission-inputs/source" {
+    kind "custom.st3.document-source"
+  }
+
+  mission "eval/mission-inputs" state="ready" timeout="20m" {
+    input "message" kind="text"
+    input "source" kind="resource"
+    completion { when "all-steps-exhausted" }
+    goal "Preserve one text input and one exact resource input."
+
+    step "capture-inputs" timeout="1m" {
+      agentless
+      title "The mission run captures both input kinds"
+        exec "eval/mission-inputs/capture" {
+          host "local"
+          workspace "${ST_WORKSPACE}"
+          cwd "${ST_WORKSPACE}"
+          command "bash ./capture.sh"
+          env {
+            MESSAGE "${input.message}"
+            SOURCE "${input.source}"
+          }
+          restart "never"
+        }
+      gate "condition-1" { field "status" "exec/${ST_MISSION_RUN}/eval/mission-inputs/capture" "is" "exited" }
+      gate "condition-2" { field "exit_code" "exec/${ST_MISSION_RUN}/eval/mission-inputs/capture" "is" 0 }
+    }
+
+    step "verify-inputs" timeout="1m" {
+      agentless
+      depends-on { step "capture-inputs" completed }
+      gate "the text and exact resource version survive execution" {
+        exec "bash ./judge.sh"
+        host "local"
+        workspace "${ST_WORKSPACE}"
+        env {
+          EXPECTED_MESSAGE "${input.message}"
+          EXPECTED_SOURCE "${input.source}"
+        }
+        time-limit "1m"
+      }
+    }
+  }

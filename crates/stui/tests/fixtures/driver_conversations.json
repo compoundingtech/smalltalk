@@ -1,0 +1,38 @@
+[
+  {
+    "driver": "codex",
+    "messages": [
+      {"sequence": 20, "role": "assistant", "text": "<|im_start|>assistant<|meta_sep|>analysis<|im_sep|>hidden reasoning<|im_end|><|im_start|>assistant<|meta_sep|>final<|im_sep|># Ship\n- Do **the work**<|im_end|>", "expected": "assistant: ▌ Ship\n• Do the work"},
+      {"sequence": 10, "role": "user", "text": "First message", "expected": "user: First message"}
+    ]
+  },
+  {
+    "driver": "claude",
+    "messages": [
+      {"sequence": 2, "role": "assistant", "text": "<thinking>private\nnotes</thinking>Visible first line\nVisible second line", "expected": "assistant: Visible first line\nVisible second line"},
+      {"sequence": 1, "role": "user", "text": "Please check", "expected": "user: Please check"},
+      {"sequence": 3, "role": "user", "text": "<channel source=\"plugin:st3-channel:st3\" messageFilename=\"123.md\" identity=\"app-apple\">\n[st3-delivery:123.md]\nPlease inspect the fleet.\n</channel>", "expected": "user: Please inspect the fleet."}
+    ]
+  },
+  {
+    "driver": "omp",
+    "messages": [
+      {"sequence": 2, "role": "assistant", "text": "<internal>private</internal>> Decision\n1. Do this", "expected": "assistant: │ Decision\n1. Do this"},
+      {"sequence": 1, "role": "user", "text": "Question", "expected": "user: Question"}
+    ]
+  },
+  {
+    "driver": "pi",
+    "messages": [
+      {"sequence": 2, "role": "assistant", "text": "[PING] ? Here is the answer [id:message/abc]", "expected": "assistant: Here is the answer"},
+      {"sequence": 1, "role": "user", "text": "Question", "expected": "user: Question"}
+    ]
+  },
+  {
+    "driver": "opencode",
+    "messages": [
+      {"sequence": 2, "role": "assistant", "text": "<system-reminder>private</system-reminder>Code:\n```xml\n<analysis>literal XML</analysis>\n```", "expected": "assistant: Code:\n┌─ xml\n  <analysis>literal XML</analysis>\n└─"},
+      {"sequence": 1, "role": "user", "text": "Show code", "expected": "user: Show code"}
+    ]
+  }
+]

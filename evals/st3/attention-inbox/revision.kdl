@@ -1,0 +1,13 @@
+version 2
+
+mission "eval/attention-inbox/revision" state="ready" timeout="5m" revisions="human-only" revision-reviewer="person/eval-attention" {
+  input "owner" kind="text"
+  concurrent-runs
+  completion { when "all-steps-exhausted" }
+  goal "Hold one changed mission revision until the selected person approves it."
+
+  step "work" timeout="4m" {
+    assigned-to "agent/${input.owner}"
+    goal "Prepare and finish one approved revision."
+  }
+}

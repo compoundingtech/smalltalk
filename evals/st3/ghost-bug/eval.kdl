@@ -1,0 +1,118 @@
+version 2
+
+  mission "eval/ghost-bug-codex" state="ready" timeout="20m" {
+    completion { when "all-steps-exhausted" }
+    goal "Complete mission eval/ghost-bug-codex."
+    step "start-team" timeout="10m" {
+      title "The native Codex debugging team is ready"
+        agent "gbx.sup" {
+          workspace "${ST_WORKSPACE}/sup"
+          harness "codex" {
+            model "gpt-5.6-sol"
+            effort "medium"
+            args "--dangerously-bypass-approvals-and-sandbox" "--dangerously-bypass-hook-trust"
+          }
+          restart "never"
+          env { CATALOG "${ST_WORKSPACE}"; ST_ROOT "${ST_WORKSPACE}/.st3-messages"; ST3_MESSAGE_ROOT "${ST_WORKSPACE}/.st3-messages" }
+        }
+        agent "gbx.fix" {
+          workspace "${ST_WORKSPACE}/worker"
+          harness "codex" {
+            model "gpt-5.6-sol"
+            effort "medium"
+            args "--dangerously-bypass-approvals-and-sandbox" "--dangerously-bypass-hook-trust"
+          }
+          restart "never"
+          env { CATALOG "${ST_WORKSPACE}"; ST_ROOT "${ST_WORKSPACE}/.st3-messages"; ST3_MESSAGE_ROOT "${ST_WORKSPACE}/.st3-messages" }
+        }
+    }
+
+    step "delegate-debug-brief" timeout="15m" {
+      title "The specialist receives one complete root-cause brief"
+      goal "Read doc/evals/ghost-bug-codex/task@25c585de3c879e9f4a215ddda598409689bd4dd8340eacb5ff278f9e61663589. Delegate the complete debugging contract to gbx.fix without editing its repository."
+      document "doc/evals/ghost-bug-codex/task@25c585de3c879e9f4a215ddda598409689bd4dd8340eacb5ff278f9e61663589"
+      assigned-to "agent/${ST_MISSION_RUN}/gbx.sup"
+      depends-on { step "start-team" completed }
+      mission "work" {
+        completion { when "all-steps-exhausted" }
+        goal "Complete mission work."
+        step "read-bug-report" { title "The exact immutable bug report is understood"; goal "Read the referenced task document through st3 documents get. Identify the leak reproduction, root-cause requirement, regression-test requirement, and verification contract." }
+        step "send-debug-brief" {
+          title "The specialist receives one bounded debugging brief"
+          goal "Send agent/${ST_MISSION_RUN}/gbx.fix exactly one Small Talk message. Require reproduction, root cause, smallest fix, a mutation-valid regression test, green suite, commit, and evidence report. Use tag mission-run:$ST_MISSION_RUN. Save the bare message ID as MID. Run: st3 claim resource/mission-run/$ST_MISSION_RUN/debug-brief resource.observed --actor agent/${ST_MISSION_RUN}/gbx.sup --field kind=custom.st3.message-receipt --field state=published --field message=message/$MID. Complete this step after the claim."
+          depends-on { step "read-bug-report" completed }
+          produces { resource "mission-run/${ST_MISSION_RUN}/debug-brief" { kind "custom.st3.message-receipt"; state "published" } }
+        }
+      }
+    }
+
+    step "diagnose-and-fix" timeout="25m" {
+      title "The specialist commits the root-cause fix and regression proof"
+      goal "Reproduce the shared-default leak, fix its root cause, add a regression test, keep the suite green, and publish the committed evidence."
+      assigned-to "agent/${ST_MISSION_RUN}/gbx.fix"
+      depends-on { step "delegate-debug-brief" completed }
+      mission "work" {
+        completion { when "all-steps-exhausted" }
+        goal "Complete mission work."
+        step "read-debug-brief" { title "The supervisor debugging contract is understood"; goal "Drain and archive the one gbx.sup delegation. Identify every required proof and repository boundary." }
+        step "reproduce-option-leak" { title "The custom-option leak is reproduced"; goal "Run the supplied custom-then-default reproduction. Confirm that the second format call incorrectly keeps the custom delimiters."; depends-on { step "read-debug-brief" completed } }
+        step "identify-root-cause" { title "The shared-default mutation is identified"; goal "Trace the format option merge. Identify the exact mutation that changes imported defaultOptions across calls. Reject a reset, freeze, or symptom-only workaround."; depends-on { step "reproduce-option-leak" completed } }
+        step "add-red-regression-test" { title "A regression test fails on the original bug"; goal "Add a test that calls format with custom options and then with defaults. Confirm that this test fails before the source fix without weakening existing tests."; depends-on { step "identify-root-cause" completed } }
+        step "implement-smallest-fix" { title "The option merge no longer mutates shared defaults"; goal "Make the smallest source change that creates per-call options without mutating defaultOptions. Do not add reset or freeze logic."; depends-on { step "add-red-regression-test" completed } }
+        step "verify-regression-and-suite" { title "The regression and complete suite are green"; goal "Run node --test and the direct reproduction. Confirm defaultOptions remains byte-equivalent across a custom call. Inspect the final diff."; depends-on { step "implement-smallest-fix" completed } }
+        step "publish-fix-revision" {
+          title "The root-cause fix revision is published"
+          goal "Commit the source and regression test with the configured identity. Confirm a clean tree. Let SHA be git rev-parse HEAD. Run: st3 claim resource/mission-run/$ST_MISSION_RUN/fix-revision resource.observed --actor agent/${ST_MISSION_RUN}/gbx.fix --field kind=vcs.commit --field state=published --field sha=SHA. Complete this step after the claim."
+          depends-on { step "verify-regression-and-suite" completed }
+          produces { resource "mission-run/${ST_MISSION_RUN}/fix-revision" { kind "vcs.commit"; state "published" } }
+        }
+        step "report-fix-evidence" {
+          title "The supervisor receives the complete debugging evidence"
+          goal "Send agent/${ST_MISSION_RUN}/gbx.sup exactly one Small Talk report. Include the root cause, changed files, commit, red-before proof, green suite, direct reproduction, and clean tree. Use tag mission-run:$ST_MISSION_RUN. Save the bare message ID as MID. Run: st3 claim resource/mission-run/$ST_MISSION_RUN/worker-report resource.observed --actor agent/${ST_MISSION_RUN}/gbx.fix --field kind=custom.st3.message-receipt --field state=published --field message=message/$MID. Complete this step after the claim."
+          depends-on { step "publish-fix-revision" completed }
+          produces { resource "mission-run/${ST_MISSION_RUN}/worker-report" { kind "custom.st3.message-receipt"; state "published" } }
+        }
+      }
+    }
+
+    step "verify-and-confirm" timeout="15m" {
+      title "The supervisor verifies the fix and confirms the requester"
+      goal "Verify the worker revision read-only. Send person/eval-requester one final confirmation only after the root-cause and regression proofs pass."
+      assigned-to "agent/${ST_MISSION_RUN}/gbx.sup"
+      depends-on { step "diagnose-and-fix" completed }
+      mission "work" {
+        completion { when "all-steps-exhausted" }
+        goal "Complete mission work."
+        step "read-worker-report" { title "The worker debugging report is understood"; goal "Drain and archive the one gbx.fix report. Record its root cause, revision, test, and verification evidence." }
+        step "verify-fix-read-only" { title "The supervisor independently verifies the root-cause fix"; goal "Without edits, inspect ../worker. Run the complete suite and direct reproduction. Verify the regression test, mutation-free defaultOptions, published HEAD, committed diff, and clean tree."; depends-on { step "read-worker-report" completed } }
+        step "confirm-requester" {
+          title "The requester receives one verified bug-fix confirmation"
+          goal "Send person/eval-requester exactly one Small Talk message. Cite the root cause, real commit, regression test, and read-only verification. Use tag mission-run:$ST_MISSION_RUN. Save the bare message ID as MID. Run: st3 claim resource/mission-run/$ST_MISSION_RUN/final-confirmation resource.observed --actor agent/${ST_MISSION_RUN}/gbx.sup --field kind=custom.st3.message-receipt --field state=published --field message=message/$MID. Complete this step after the claim."
+          depends-on { step "verify-fix-read-only" completed }
+          produces { resource "mission-run/${ST_MISSION_RUN}/final-confirmation" { kind "custom.st3.message-receipt"; state "published" } }
+        }
+      }
+    }
+
+    step "held-out-gates" timeout="20m" {
+      title "All Ghost Bug gates pass"
+      depends-on { step "verify-and-confirm" completed }
+      gate "isolation — only gbx.fix authored the bounded product change" { exec "st3 conversations export \"${ST_WORKSPACE}/.st3-messages\" >/dev/null && bash ./judges/isolation.sh"; host "local"; workspace "${ST_WORKSPACE}"; env { CATALOG "${ST_WORKSPACE}"; ST_ROOT "${ST_WORKSPACE}/.st3-messages" }; time-limit "120000ms" }
+      gate "the visible suite is green on HEAD" { exec "bash ./judges/suite.sh"; host "local"; workspace "${ST_WORKSPACE}"; env { CATALOG "${ST_WORKSPACE}" }; time-limit "120000ms" }
+      gate "the shared-default mutation is gone" { exec "bash ./judges/root-cause.sh"; host "local"; workspace "${ST_WORKSPACE}"; env { CATALOG "${ST_WORKSPACE}" }; time-limit "120000ms" }
+      gate "the regression is red on the buggy base" { exec "bash ./judges/regression.sh"; host "local"; workspace "${ST_WORKSPACE}"; env { CATALOG "${ST_WORKSPACE}" }; time-limit "120000ms" }
+      gate "delegation, worker report, and final confirmation are visible" { exec "bash ./judges/coordination.sh"; host "local"; workspace "${ST_WORKSPACE}"; env { CATALOG "${ST_WORKSPACE}" }; time-limit "120000ms" }
+      gate "the graph records the complete debugging mission and products" { exec "bash ./judges/graph.sh"; host "local"; workspace "${ST_WORKSPACE}"; time-limit "120000ms" }
+      gate "the final report explains the root cause and regression proof" type="llm" {
+        model "gpt-5.6-sol"
+        host "local"
+        workspace "${ST_WORKSPACE}"
+        tools "shell" "git"
+        env { CATALOG "${ST_WORKSPACE}"; ST_ROOT "${ST_WORKSPACE}/.st3-messages" }
+        token-budget 65536
+        time-limit "120000ms"
+        prompt "Run one evidence command before gate result: show the worker HEAD diff for src and test files, show git -C worker status --porcelain, and run st3 conversations ls person/eval-requester --archive --json. Do not run st3 agents, st3 status, help commands, or broad scans. PASS only if the change fixes the shared-default mutation at its root, adds a real regression test, creates a commit with a clean tree, and the supervisor reports this evidence."
+      }
+    }
+
+  }

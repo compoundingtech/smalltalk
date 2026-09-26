@@ -15,7 +15,6 @@ const MANIFEST_LIMIT_BYTES: u64 = 64 * 1024;
 const ARTIFACT_LIMIT_BYTES: u64 = 512 * 1024 * 1024;
 static TEMP_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
-
 #[derive(Debug, Clone)]
 pub struct PrivateArtifactCache {
     root: Arc<PathBuf>,
@@ -182,7 +181,10 @@ impl SecurityMetadataOracle for FilesystemMetadata {
 #[derive(Debug, PartialEq, Eq)]
 enum OwnershipViolation {
     OutsideRoot,
-    Metadata { path: PathBuf, error: String },
+    Metadata {
+        path: PathBuf,
+        error: String,
+    },
     WrongKind {
         path: PathBuf,
         expected: SecuredEntryKind,
@@ -193,7 +195,9 @@ enum OwnershipViolation {
         expected: u32,
         actual: u32,
     },
-    WritableByOther { path: PathBuf },
+    WritableByOther {
+        path: PathBuf,
+    },
 }
 
 #[cfg(unix)]
@@ -241,12 +245,7 @@ fn validate_owned_cache_entry_with(
     let relative = entry
         .strip_prefix(root)
         .map_err(|_| OwnershipViolation::OutsideRoot)?;
-    validate_secured_entry(
-        root,
-        SecuredEntryKind::Directory,
-        effective_uid,
-        oracle,
-    )?;
+    validate_secured_entry(root, SecuredEntryKind::Directory, effective_uid, oracle)?;
     let mut current = root.to_path_buf();
     let mut components = relative.components().peekable();
     while let Some(component) = components.next() {
@@ -455,8 +454,10 @@ fn create_immutable(path: &Path, bytes: &[u8]) -> Result<(), String> {
             .file_name()
             .ok_or_else(|| "cache entry path has no file name".to_owned())?
             .to_string_lossy();
-        let temporary_path =
-            parent.join(format!(".{file_name}.tmp-{}-{sequence}", std::process::id()));
+        let temporary_path = parent.join(format!(
+            ".{file_name}.tmp-{}-{sequence}",
+            std::process::id()
+        ));
         let mut options = OpenOptions::new();
         options.write(true).create_new(true);
         #[cfg(unix)]
@@ -633,9 +634,9 @@ fn is_sha256(value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
     #[cfg(unix)]
     use std::collections::HashMap;
+    use std::collections::HashSet;
     use std::sync::{Arc, Barrier};
 
     use super::*;
@@ -729,12 +730,7 @@ mod tests {
             let (_, _, mut untrusted) = owned_manifest_tree(effective_uid);
             untrusted.entries.get_mut(&path).unwrap().uid = 7;
             assert_eq!(
-                validate_owned_cache_entry_with(
-                    &root,
-                    &manifest,
-                    effective_uid,
-                    &untrusted,
-                ),
+                validate_owned_cache_entry_with(&root, &manifest, effective_uid, &untrusted,),
                 Err(OwnershipViolation::WrongOwner {
                     path,
                     expected: effective_uid,
@@ -743,7 +739,6 @@ mod tests {
             );
         }
     }
-
 
     #[test]
     fn cache_key_covers_every_compatibility_field() {

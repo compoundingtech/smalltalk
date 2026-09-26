@@ -93,10 +93,12 @@
           inherit version;
           src = self;
 
-          # No git or crates.io-yanked deps in the lockfile, so the lockfile
-          # alone pins every input reproducibly — no per-dep outputHashes, and
-          # nothing here to hand-patch when a dep bumps.
-          cargoLock.lockFile = ./Cargo.lock;
+          cargoLock = {
+            lockFile = ./Cargo.lock;
+            outputHashes = {
+              "pty-core-0.13.0-rust" = "sha256-q5Aa7pmAKBakzAyl5pXSfD7d/x9a2mtDC96tLbPPi4w=";
+            };
+          };
 
           # This NixStamp is the binary's authoritative build identity; it wins
           # over the LocalStamp `build.rs` bakes from git (which is empty here
@@ -220,6 +222,76 @@
           };
         };
 
+        st3 = pkgs.rustPlatform.buildRustPackage {
+          pname = "st3";
+          inherit version;
+          src = self;
+          cargoLock = {
+            lockFile = ./Cargo.lock;
+            outputHashes = {
+              "pty-core-0.13.0-rust" = "sha256-q5Aa7pmAKBakzAyl5pXSfD7d/x9a2mtDC96tLbPPi4w=";
+            };
+          };
+          cargoBuildFlags = [
+            "-p"
+            "st3"
+            "-p"
+            "st3-migrate"
+            "-p"
+            "stui"
+          ];
+          cargoTestFlags = [
+            "-p"
+            "st-runtime"
+            "-p"
+            "st3"
+            "-p"
+            "st3-migrate"
+            "-p"
+            "st3-schema"
+            "-p"
+            "stui"
+          ];
+          # Render tests create throwaway repositories and call Git to protect
+          # tracked files. Keep that dependency in the hermetic check sandbox.
+          nativeBuildInputs = [
+            pkgs.git
+            pkgs.installShellFiles
+          ];
+          # The daemon survival suite exercises the packaged PTY boundary.
+          nativeCheckInputs = [
+            pkgs.bashInteractive
+            pkgs.jq
+            pkgs.which
+            pty.packages.${system}.default
+          ];
+          postInstall = ''
+            ln -s st3 $out/bin/st
+            ln -s ${pty.packages.${system}.default}/bin/pty $out/bin/pty
+            $out/bin/st3 completions bash > st3.bash
+            $out/bin/st3 completions zsh > _st3
+            $out/bin/st3 completions fish > st3.fish
+            installShellCompletion --cmd st3 --bash st3.bash --zsh _st3 --fish st3.fish
+          '';
+          meta = {
+            description = "Small Talk claims-graph runtime, terminal UI, and st2 KDL migration tool";
+            homepage = "https://github.com/compoundingtech/st2";
+            license = pkgs.lib.licenses.mit;
+            mainProgram = "st3";
+          };
+        };
+
+        st3Help = pkgs.runCommand "st3-help-${version}" { } ''
+          test "$(readlink ${st3}/bin/st)" = st3
+          test -x ${st3}/bin/stui
+          test -x ${st3}/bin/pty
+          ${st3}/bin/st3 --help > st3.help
+          ${st3}/bin/st --help > st.help
+          cmp st3.help st.help
+          ${st3}/bin/st3-migrate --help > /dev/null
+          touch $out
+        '';
+
         # Production variant for catalogs that declare wasm resource-profile resolvers. Keep the
         # default package lightweight; consumers opt into the wasmtime closure explicitly.
         #
@@ -274,7 +346,12 @@
           pname = "st2-provider-components";
           inherit version;
           src = self;
-          cargoLock.lockFile = ./Cargo.lock;
+          cargoLock = {
+            lockFile = ./Cargo.lock;
+            outputHashes = {
+              "pty-core-0.13.0-rust" = "sha256-q5Aa7pmAKBakzAyl5pXSfD7d/x9a2mtDC96tLbPPi4w=";
+            };
+          };
           buildPhase = ''
             runHook preBuild
             cargo build --offline --release --target wasm32-unknown-unknown \
@@ -436,6 +513,8 @@
       in
       {
         packages.st2 = st2;
+        packages.st3 = st3;
+        packages.st3-migrate = st3;
         packages.st2-wasm-resolver = st2WasmResolver;
         packages.st2-provider-runtime = st2ProviderRuntime;
         # All four components come out of one build; the install paths are unchanged.
@@ -455,6 +534,8 @@
         # commits on every rebase. The devShell ships rustfmt + clippy for whoever
         # wants them.
         checks.st2 = st2;
+        checks.st3 = st3;
+        checks.st3-help = st3Help;
         checks.release-integration = st2ReleaseIntegration;
         checks.debug-assertions = st2DebugAssertions;
         checks.wasm-resolver-feature = st2WasmResolver;

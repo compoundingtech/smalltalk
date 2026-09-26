@@ -176,7 +176,10 @@ fn declaration_parse_failure_retains_a_digest_fact_for_later_delivery() {
     assert_eq!(pending.facts.len(), 1);
     assert_eq!(pending.facts[0].key(), "digest");
     assert_eq!(pending.topics, ["declaration"]);
-    assert_eq!(event_body(&pending.body)["facts"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        event_body(&pending.body)["facts"].as_array().unwrap().len(),
+        1
+    );
     std::fs::write(&declaration, valid).unwrap();
     worker.flush_path_publishing(&declaration, None);
     let delivered = resync_inbox_event(&agent_dir);
@@ -187,7 +190,6 @@ fn declaration_parse_failure_retains_a_digest_fact_for_later_delivery() {
     assert!(!delivered.contains("file:///"));
     assert!(!delivered.contains("Mission."));
 }
-
 
 #[test]
 fn watch_set_covers_declaration_and_local_bindings_only() {
@@ -374,21 +376,20 @@ fn shared_path_refresh_preserves_every_subscription_state() {
         },
     ];
 
-    let rebuilt = rebuild_carriers(previous, refresh_for(sets), &BTreeMap::new(), &mut BTreeMap::new());
+    let rebuilt = rebuild_carriers(
+        previous,
+        refresh_for(sets),
+        &BTreeMap::new(),
+        &mut BTreeMap::new(),
+    );
     let entries = rebuilt.get(&shared).expect("shared path remains watched");
     assert_eq!(entries.len(), 2);
-    for (bus_id, digest) in [
-        ("host.alpha", "alpha-before"),
-        ("host.beta", "beta-before"),
-    ] {
+    for (bus_id, digest) in [("host.alpha", "alpha-before"), ("host.beta", "beta-before")] {
         let entry = entries
             .iter()
             .find(|entry| entry.bus_id == bus_id)
             .expect("subscriber remains present");
-        assert_eq!(
-            entry.state,
-            Some(CarrierState::Present(digest.to_owned()))
-        );
+        assert_eq!(entry.state, Some(CarrierState::Present(digest.to_owned())));
         assert!(entry.dirty, "pending mutation remains pending for {bus_id}");
     }
 }
@@ -436,7 +437,12 @@ fn retained_subscription_uses_current_seat_path_and_class() {
         }],
     )]);
 
-    let rebuilt = rebuild_carriers(previous, refresh_for(vec![current]), &BTreeMap::new(), &mut BTreeMap::new());
+    let rebuilt = rebuild_carriers(
+        previous,
+        refresh_for(vec![current]),
+        &BTreeMap::new(),
+        &mut BTreeMap::new(),
+    );
     assert!(!rebuilt.contains_key(&old_path));
     let entry = rebuilt[&goal]
         .iter()
@@ -468,7 +474,10 @@ fn retained_subscription_uses_current_seat_path_and_class() {
         .iter()
         .find(|entry| entry.label == "goal")
         .unwrap();
-    assert!(!entry.dirty, "the current recipient accepted the transition");
+    assert!(
+        !entry.dirty,
+        "the current recipient accepted the transition"
+    );
     assert!(entry.pending_transition.is_none());
     let events = std::fs::read_dir(agent_dir.join("resources/inbox"))
         .unwrap()
@@ -531,8 +540,11 @@ fn pending_retry_keeps_its_original_snapshot_across_path_rebinding() {
 }"#,
     )
     .unwrap();
-    let current =
-        watch_set_for(&discover(root.path()), "alias", &ResourceProfileRegistry::empty());
+    let current = watch_set_for(
+        &discover(root.path()),
+        "alias",
+        &ResourceProfileRegistry::empty(),
+    );
 
     worker.apply_watch_sets(refresh_for(vec![current]));
     worker.flush_due_publishing(Instant::now() + IMMEDIATE_WINDOW + Duration::from_secs(1));
@@ -542,7 +554,10 @@ fn pending_retry_keeps_its_original_snapshot_across_path_rebinding() {
         .map(|entry| std::fs::read_to_string(entry.unwrap().path()).unwrap())
         .find(|body| body.contains("stream: resync"))
         .expect("the retry routes through the refreshed recipient");
-    assert!(event.contains(&format!("event-id: {}", pending.event_id)), "{event}");
+    assert!(
+        event.contains(&format!("event-id: {}", pending.event_id)),
+        "{event}"
+    );
     assert!(event.contains(&pending.body), "{event}");
     let pending_body: serde_json::Value = serde_json::from_str(&pending.body).unwrap();
     assert_eq!(pending_body["binding"], "goal");
@@ -888,7 +903,10 @@ fn fallback_polling_preserves_the_coalesced_window() {
     worker.flush_due_publishing(now + IMMEDIATE_WINDOW + Duration::from_secs(1));
     let entry = &worker.carriers[&carrier][0];
     assert_eq!(entry.state, baseline);
-    assert!(entry.pending_transition.is_none(), "coalesced emit ran too early");
+    assert!(
+        entry.pending_transition.is_none(),
+        "coalesced emit ran too early"
+    );
 
     worker.flush_due_publishing(now + COALESCED_WINDOW + Duration::from_secs(1));
     assert!(
@@ -989,7 +1007,10 @@ fn registering_another_directory_rediffs_the_untouched_watch_set() {
     let set_for = |identity: &str| {
         let spec = specs
             .iter()
-            .find(|spec| spec.path.starts_with(root.path().join("agents/alias").join(identity)))
+            .find(|spec| {
+                spec.path
+                    .starts_with(root.path().join("agents/alias").join(identity))
+            })
             .expect("both declarations are valid");
         watch_set_for(spec, "alias", &ResourceProfileRegistry::empty())
     };
@@ -1097,7 +1118,10 @@ fn due_flush_only_clears_subscribers_of_the_due_class() {
     worker.flush_due_publishing(now);
     let entries = worker.carriers.values().next().unwrap();
     assert!(!entries[0].dirty);
-    assert!(entries[1].dirty, "coalesced subscriber must wait for its own deadline");
+    assert!(
+        entries[1].dirty,
+        "coalesced subscriber must wait for its own deadline"
+    );
 }
 
 #[cfg(unix)]
@@ -1144,11 +1168,9 @@ fn confined_read_refuses_a_symlinked_confinement_root_ancestor() {
     let temp = tempfile::tempdir().expect("outer directory");
     let real_root = temp.path().join("real/agent");
     std::fs::create_dir_all(&real_root).expect("real agent directory");
-    std::fs::write(real_root.join("goal.md"), "outside admitted ancestry")
-        .expect("carrier bytes");
+    std::fs::write(real_root.join("goal.md"), "outside admitted ancestry").expect("carrier bytes");
     let alias = temp.path().join("alias");
-    std::os::unix::fs::symlink(temp.path().join("real"), &alias)
-        .expect("symlinked root ancestor");
+    std::os::unix::fs::symlink(temp.path().join("real"), &alias).expect("symlinked root ancestor");
     let admitted_root = alias.join("agent");
     assert_eq!(
         read_state(&admitted_root.join("goal.md"), Some(&admitted_root)).unwrap(),
@@ -1263,7 +1285,7 @@ fn transient_permission_error_retries_without_emitting_a_tombstone() {
     let baseline = worker.carriers[&carrier][0].state.clone();
 
     let original_permissions = std::fs::metadata(&carrier).unwrap().permissions();
-    std::fs::set_permissions(&carrier, std::fs::Permissions::from_mode(0)).unwrap();
+    std::fs::set_permissions(&carrier, std::fs::Permissions::from_mode(0o0)).unwrap();
     worker.flush_path_publishing(&carrier, None);
     let entry = &worker.carriers[&carrier][0];
     assert_eq!(entry.state, baseline);
@@ -1299,7 +1321,7 @@ fn initial_transient_read_failure_schedules_a_baseline_retry() {
     let carrier = resources.join("goal.md");
     std::fs::write(&carrier, "baseline").unwrap();
     let original_permissions = std::fs::metadata(&carrier).unwrap().permissions();
-    std::fs::set_permissions(&carrier, std::fs::Permissions::from_mode(0)).unwrap();
+    std::fs::set_permissions(&carrier, std::fs::Permissions::from_mode(0o0)).unwrap();
     let set = watch_set_for(&discover(root.path()), "host", &Default::default());
     let mut worker = Worker {
         root: root.path().to_path_buf(),
@@ -1378,10 +1400,7 @@ fn reinstalled_subscription_keeps_occurrence_identity_without_an_active_watch() 
     worker.apply_watch_sets(refresh_for(Vec::new()));
     assert!(worker.carriers.is_empty());
     assert!(worker.watched.is_empty());
-    assert_eq!(
-        worker.subscription_sequences.len(),
-        seen_subscription_count
-    );
+    assert_eq!(worker.subscription_sequences.len(), seen_subscription_count);
 
     std::fs::write(&carrier, "A").unwrap();
     worker.apply_watch_sets(refresh_for(vec![set]));
@@ -1430,8 +1449,11 @@ fn relocated_subscription_keeps_occurrence_sequence_in_the_recipient_namespace()
     let relocated_carrier = resources.join("relocated-goal.md");
     std::fs::write(&original_carrier, "A").unwrap();
     crate::event::publish_owner_binding_for_test(root.path(), "host").unwrap();
-    let set =
-        watch_set_for(&discover(root.path()), "host", &ResourceProfileRegistry::empty());
+    let set = watch_set_for(
+        &discover(root.path()),
+        "host",
+        &ResourceProfileRegistry::empty(),
+    );
     let mut worker = Worker {
         root: root.path().to_path_buf(),
         this_host: "host".to_owned(),
@@ -1465,15 +1487,18 @@ fn relocated_subscription_keeps_occurrence_sequence_in_the_recipient_namespace()
         .find(|entry| entry.label == "goal")
         .unwrap();
     assert_eq!(rebound.occurrence_sequence, 1);
-    assert_eq!(
-        rebound.state,
-        read_state(&original_carrier, None).ok()
-    );
+    assert_eq!(rebound.state, read_state(&original_carrier, None).ok());
 
     worker.flush_path_publishing(&relocated_carrier, None);
     let back_to_a = resync_inbox_event(&agent_dir);
-    assert_eq!(event_field(&back_to_a, "old"), event_field(&first_a_to_b, "new"));
-    assert_eq!(event_field(&back_to_a, "new"), event_field(&first_a_to_b, "old"));
+    assert_eq!(
+        event_field(&back_to_a, "old"),
+        event_field(&first_a_to_b, "new")
+    );
+    assert_eq!(
+        event_field(&back_to_a, "new"),
+        event_field(&first_a_to_b, "old")
+    );
     assert!(event_field(&back_to_a, "occurrence").ends_with(":2"));
 
     std::fs::write(&relocated_carrier, "B").unwrap();
@@ -1548,8 +1573,14 @@ fn subscribers_advance_occurrence_sequences_independently() {
     assert_eq!(entries[0].occurrence_sequence, 1);
     assert_eq!(entries[1].occurrence_sequence, 1);
     assert_eq!(
-        event_field(&entries[0].pending_transition.as_ref().unwrap().body, "occurrence"),
-        event_field(&entries[1].pending_transition.as_ref().unwrap().body, "occurrence"),
+        event_field(
+            &entries[0].pending_transition.as_ref().unwrap().body,
+            "occurrence"
+        ),
+        event_field(
+            &entries[1].pending_transition.as_ref().unwrap().body,
+            "occurrence"
+        ),
         "one subscriber must not consume sequence numbers from another"
     );
 }
@@ -1919,12 +1950,18 @@ fn refusals_are_classified_by_what_could_admit_them_later() {
         "foreign",
         "agent \"foreign\" {\n  host \"elsewhere\"\n  command \"agent\"\n}",
     );
-    write("plain", "agent \"plain\" {\n  host \"host\"\n  command \"agent\"\n}");
+    write(
+        "plain",
+        "agent \"plain\" {\n  host \"host\"\n  command \"agent\"\n}",
+    );
     write(
         "twin",
         "agent \"plain\" {\n  host \"host\"\n  command \"agent\"\n}",
     );
-    write("solo", "agent \"solo\" {\n  host \"host\"\n  command \"agent\"\n}");
+    write(
+        "solo",
+        "agent \"solo\" {\n  host \"host\"\n  command \"agent\"\n}",
+    );
 
     let suspended = emit("host.suspended");
     assert!(
@@ -1948,7 +1985,10 @@ fn refusals_are_classified_by_what_could_admit_them_later() {
     assert_eq!(refusal_kind(&foreign), Some(RefusalKind::Permanent));
 
     let ambiguous = emit("host.plain");
-    assert!(ambiguous.to_string().contains("is ambiguous"), "{ambiguous:#}");
+    assert!(
+        ambiguous.to_string().contains("is ambiguous"),
+        "{ambiguous:#}"
+    );
     assert_eq!(refusal_kind(&ambiguous), Some(RefusalKind::Permanent));
 
     let undeclared = crate::event::emit(
@@ -2039,8 +2079,7 @@ fn a_refresh_drops_a_queued_publication_for_a_subscription_it_removed() {
 #[test]
 fn transition_identity_covers_every_rendered_transition_dimension() {
     let topics = vec!["content".to_owned()];
-    let facts =
-        vec![ResourceFact::transition("digest", Some("old"), Some("new")).unwrap()];
+    let facts = vec![ResourceFact::transition("digest", Some("old"), Some("new")).unwrap()];
     let baseline = render_body("goal", &topics, &facts, "v1:1:2:42:3:1");
     assert_eq!(
         transition_identity(&baseline),
@@ -2106,10 +2145,7 @@ fn local_path_resolution_parses_supported_file_uris_without_uri_metadata_bytes()
         Some(agent_dir.join("resources/journal.md"))
     );
     assert_eq!(
-        resolve_local_path(
-            agent_dir,
-            "resources/with%20space/%E2%82%AC-journal.md"
-        ),
+        resolve_local_path(agent_dir, "resources/with%20space/%E2%82%AC-journal.md"),
         Some(agent_dir.join("resources/with space/€-journal.md"))
     );
 
@@ -2177,8 +2213,14 @@ fn classification_is_goal_immediate_stores_silent_other_coalesced() {
 
 #[test]
 fn profile_classes_map_onto_carrier_notification() {
-    assert_eq!(carrier_class(ProfileClass::Immediate), Some(CarrierClass::Immediate));
-    assert_eq!(carrier_class(ProfileClass::Coalesced), Some(CarrierClass::Coalesced));
+    assert_eq!(
+        carrier_class(ProfileClass::Immediate),
+        Some(CarrierClass::Immediate)
+    );
+    assert_eq!(
+        carrier_class(ProfileClass::Coalesced),
+        Some(CarrierClass::Coalesced)
+    );
     assert_eq!(
         carrier_class(ProfileClass::Silent),
         None,
@@ -2204,13 +2246,12 @@ fn registered_profile_failures_are_reported_while_other_bindings_survive() {
 
     let broken = tmp.path().join("broken.wasm");
     std::fs::write(&broken, b"not a module").unwrap();
-    let profiles = ResourceProfileRegistry::empty().with_profile(
-        agent_spec::ResourceProfile::wasm(
+    let profiles =
+        ResourceProfileRegistry::empty().with_profile(agent_spec::ResourceProfile::wasm(
             "dev.schickling.agent-goal",
             &broken,
             ProfileClass::Coalesced,
-        ),
-    );
+        ));
     let refresh = profiles.begin_refresh();
     let spec = discover(tmp.path());
     let (set, diagnostics) =
@@ -2242,13 +2283,12 @@ fn silent_profile_skips_its_resolver_entirely() {
     )
     .unwrap();
     let missing = tmp.path().join("must-not-load.wasm");
-    let profiles = ResourceProfileRegistry::empty().with_profile(
-        agent_spec::ResourceProfile::wasm(
+    let profiles =
+        ResourceProfileRegistry::empty().with_profile(agent_spec::ResourceProfile::wasm(
             "dev.schickling.agent-goal",
             missing,
             ProfileClass::Silent,
-        ),
-    );
+        ));
     let refresh = profiles.begin_refresh();
     let spec = discover(tmp.path());
     let (set, diagnostics) =

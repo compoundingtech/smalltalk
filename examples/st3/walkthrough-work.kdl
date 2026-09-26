@@ -1,0 +1,63 @@
+version 2
+
+// This publication-time handshake deliberately references the standing agent. It makes
+// `missions publish` fail clearly if the standing mission was published but never started.
+message "example/garden-work-ready" {
+  from "requester"
+  to "agent/example/garden-owner/standing/owner"
+  title "Garden work is ready"
+  content "The garden work definition is published and ready to start."
+}
+
+mission "example/garden-work" state="ready" {
+  completion { when "all-steps-exhausted" }
+  goal "Create one small project note, checking it for up to three bounded rounds."
+
+  loop "prepare-note" timeout="30m" {
+    max-rounds 3
+    until {
+      gate "the garden note exists and is not empty" {
+        exec "/usr/bin/test -s garden-note.md"
+        host "local"
+        workspace "${ST_WORKSPACE}"
+        time-limit "1m"
+      }
+    }
+    round {
+      completion { when "all-steps-exhausted" }
+      step "write-note" timeout="10m" {
+        assigned-to "agent/example/garden-owner/standing/owner"
+        goal "In round ${loop.round}, create garden-note.md in the work workspace with a short plan for the invented garden project."
+        goal "Read ${loop.feedback}; when it explains why the last check failed, correct that problem before reporting completion."
+      }
+    }
+    on-exhausted {
+      fail
+      attention "The garden note is still missing after three rounds" {
+        reviewer "person/operator"
+        severity "error"
+      }
+    }
+  }
+
+  step "report-completion" timeout="5m" {
+    agentless
+    depends-on { step "prepare-note" completed }
+    message "complete" {
+      to "person/operator"
+      title "Garden work completed"
+      content "The garden note passed its bounded loop."
+    }
+  }
+
+  finally {
+    step "report-outcome" timeout="5m" {
+      agentless
+      message "ended" {
+        to "person/operator"
+        title "Garden work ended"
+        content "The garden work run reached a terminal outcome; inspect the run for its exact status and evidence."
+      }
+    }
+  }
+}

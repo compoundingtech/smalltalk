@@ -120,7 +120,9 @@ fn collided_decision_numbers_are_never_cited_bare() {
     ];
     while let Some(dir) = pending.pop() {
         for entry in fs::read_dir(&dir).expect("citation source directory must be readable") {
-            let path = entry.expect("citation source entry must be readable").path();
+            let path = entry
+                .expect("citation source entry must be readable")
+                .path();
             if path.is_dir() {
                 if path.file_name().is_some_and(|name| name == "target") {
                     continue;

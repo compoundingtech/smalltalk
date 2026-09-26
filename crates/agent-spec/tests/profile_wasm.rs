@@ -37,10 +37,7 @@ const HOSTILE_PRELUDE: &str = r#"
       (func (export "alloc") (param i32) (result i32) (i32.const 1024))
 "#;
 fn wat_bytes(bytes: &[u8]) -> String {
-    bytes
-        .iter()
-        .map(|byte| format!(r"\{byte:02x}"))
-        .collect()
+    bytes.iter().map(|byte| format!(r"\{byte:02x}")).collect()
 }
 
 fn descriptor_wat(payload: &[u8], reported_len: usize, resolution_path: &str) -> String {
@@ -154,10 +151,12 @@ fn refresh_descriptor_lookup_and_resolution_share_one_module_snapshot() {
         ProfileClass::Coalesced,
     ));
     let refresh = registry.begin_refresh();
-    assert!(refresh
-        .try_descriptor("smart")
-        .expect("descriptor validates")
-        .is_some());
+    assert!(
+        refresh
+            .try_descriptor("smart")
+            .expect("descriptor validates")
+            .is_some()
+    );
     std::fs::write(
         &path,
         descriptor_wat(
@@ -571,24 +570,18 @@ fn catalog_relative_module_rejects_symlinked_path_ancestors() {
         .expect("outside module is copied");
     std::os::unix::fs::symlink(outside.path(), catalog.path().join("resolvers"))
         .expect("resolver ancestor symlink is created");
-    let registry = ResourceProfileRegistry::empty().with_profile(
-        ResourceProfile::wasm_contained(
-            "dev.schickling.agent-goal",
-            catalog.path(),
-            "resolvers/demo.wasm",
-            ProfileClass::Immediate,
-        ),
-    );
+    let registry = ResourceProfileRegistry::empty().with_profile(ResourceProfile::wasm_contained(
+        "dev.schickling.agent-goal",
+        catalog.path(),
+        "resolvers/demo.wasm",
+        ProfileClass::Immediate,
+    ));
 
     let error = registry
-        .try_resolve(
-            catalog.path(),
-            "dev.schickling.agent-goal://host/worker",
-        )
+        .try_resolve(catalog.path(), "dev.schickling.agent-goal://host/worker")
         .expect_err("a symlinked module ancestor must be rejected");
     assert!(!error.is_empty());
 }
-
 
 #[cfg(unix)]
 #[test]
@@ -623,7 +616,10 @@ fn registry_folds_every_guest_failure_into_unwatchable_and_keeps_resolving() {
     let reason = doomed
         .try_resolve(Path::new("/a"), "dev.schickling.agent-goal://k")
         .unwrap_err();
-    assert!(!reason.is_empty(), "the failure reason is surfaced, not swallowed");
+    assert!(
+        !reason.is_empty(),
+        "the failure reason is surfaced, not swallowed"
+    );
 
     // Sibling schemes stay unregistered-None and healthy modules keep resolving around the
     // failure, repeatedly (the supervisor's refresh loop calls this on every pass).

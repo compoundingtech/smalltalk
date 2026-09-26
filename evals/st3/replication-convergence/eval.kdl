@@ -1,0 +1,31 @@
+version 2
+
+mission "eval/replication-convergence" state="ready" timeout="20m" {
+  goal "Prove signed fleet replication converges without coupling daemon health to the worker."
+  completion { when "all-steps-exhausted" }
+
+  step "exercise" timeout="3m" {
+    exec "eval/replication-convergence/exercise" {
+      host "local"
+      workspace "${ST_WORKSPACE}/fixture"
+      cwd "${ST_WORKSPACE}/fixture"
+      command "bash ./run.sh"
+      restart "never"
+    }
+    gate "process exited" {
+      field "status" "exec/${ST_MISSION_RUN}/eval/replication-convergence/exercise" "is" "exited"
+    }
+    gate "process passed" {
+      field "exit_code" "exec/${ST_MISSION_RUN}/eval/replication-convergence/exercise" "is" 0
+    }
+  }
+
+  step "verify" timeout="1m" {
+    depends-on { step "exercise" completed }
+    gate "replication survived the partition" {
+      exec "grep -Fq INITIAL-CONVERGENCE result.txt && grep -Fq MAIN-SURVIVED result.txt && grep -Fq PARTITION-HEALED result.txt"
+      host "local"
+      workspace "${ST_WORKSPACE}/fixture"
+    }
+  }
+}

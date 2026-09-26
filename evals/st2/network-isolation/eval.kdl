@@ -1,0 +1,12 @@
+version 1
+
+eval {
+  max-timeout "90s"
+  run "contract" {
+    command #"sh -c 'set -eu; mkdir -p "$CATALOG/net-a/pty" "$CATALOG/net-b/pty"; st2 pty --catalog "$CATALOG/net-a" run -d --id net-a-session -- bash -c "echo A-READY; sleep 300"; st2 pty --catalog "$CATALOG/net-b" run -d --id net-b-session -- bash -c "echo B-READY; sleep 300"; trap "st2 pty --catalog \"$CATALOG/net-a\" kill net-a-session >/dev/null 2>&1 || true; st2 pty --catalog \"$CATALOG/net-b\" kill net-b-session >/dev/null 2>&1 || true" EXIT; st2 message send peer --catalog "$CATALOG/net-a" --as source -m NETA-SECRET; st2 message send peer --catalog "$CATALOG/net-b" --as source -m NETB-SECRET; sleep 1; st2 pty --catalog "$CATALOG/net-a" ls >"$CATALOG/a-pty"; st2 pty --catalog "$CATALOG/net-b" ls >"$CATALOG/b-pty"; grep -rhs SECRET "$CATALOG/net-a" >"$CATALOG/a-msg"; grep -rhs SECRET "$CATALOG/net-b" >"$CATALOG/b-msg"'"#
+  }
+  judges {
+    judge "network A sees only its PTY and message" { exec "grep -Fq net-a-session $CATALOG/a-pty && ! grep -Fq net-b-session $CATALOG/a-pty && grep -Fq NETA-SECRET $CATALOG/a-msg && ! grep -Fq NETB-SECRET $CATALOG/a-msg" }
+    judge "network B sees only its PTY and message" { exec "grep -Fq net-b-session $CATALOG/b-pty && ! grep -Fq net-a-session $CATALOG/b-pty && grep -Fq NETB-SECRET $CATALOG/b-msg && ! grep -Fq NETA-SECRET $CATALOG/b-msg" }
+  }
+}

@@ -109,6 +109,11 @@ fn run_with_required_resume(
         (RUNTIME_ID_ENV.to_string(), runtime_id.clone()),
         (SESSION_ENV.to_string(), observer.session().to_string()),
         (SESSION_SEQ_ENV.to_string(), observer.seq().to_string()),
+        ("ST2_CLAUDE_IDENTITY".to_string(), identity.clone()),
+        (
+            "CATALOG".to_string(),
+            catalog_root.to_string_lossy().into_owned(),
+        ),
     ];
     if let Some(generation) = required_resume_generation {
         env.push((RESUME_GENERATION_ENV.to_string(), generation.0.to_string()));
@@ -130,9 +135,271 @@ fn run_with_required_resume(
     .with_context(|| format!("running Claude driver '{runtime_id}'"))
 }
 
+/// Run one interactive Claude provider for an st3-owned agent directory.
+///
+/// ST3 keeps its native-driver catalog private, so it supplies the resolved paths instead of
+/// asking the legacy catalog resolver to find them. This path is deliberately interactive: it
+/// preserves capabilities such as Claude Remote Control that are incompatible with `--print`.
+pub fn run_controlled_paths(
+    catalog_root: &Path,
+    agent_dir: &Path,
+    identity: String,
+    runtime_id: String,
+    claude_argv: Vec<String>,
+) -> Result<()> {
+    anyhow::ensure!(
+        !claude_argv.is_empty(),
+        "Claude driver '{runtime_id}' has no provider argv"
+    );
+    let claude_argv = prepare_st3_channel_argv(catalog_root, &identity, claude_argv)?;
+    let workspace = std::env::current_dir().context("reading the Claude driver workspace")?;
+    crate::pretrust::pretrust_claude(std::slice::from_ref(&workspace))
+        .with_context(|| format!("admitting Claude driver workspace {}", workspace.display()))?;
+    install_signal_handler();
+    let observer = SessionObserver::new(agent_dir, &identity, "claude", &runtime_id)?;
+    let env = [
+        (RUNTIME_ID_ENV.to_string(), runtime_id.clone()),
+        (SESSION_ENV.to_string(), observer.session().to_string()),
+        (SESSION_SEQ_ENV.to_string(), observer.seq().to_string()),
+        ("ST2_CLAUDE_IDENTITY".to_string(), identity.clone()),
+        (
+            "CATALOG".to_string(),
+            catalog_root.to_string_lossy().into_owned(),
+        ),
+    ];
+    // An st3 seat never carries an st2 residency fence, so an inherited one must not reach hooks.
+    run_provider_with_env_removals(
+        "Claude",
+        &status::status_path(agent_dir),
+        &claude_argv,
+        &env,
+        &[EXPECTED_NATIVE_SESSION_ENV, RESUME_GENERATION_ENV],
+        status::STATUS_REFRESH,
+        PROVIDER_POLL,
+        &STOP,
+        Some(&observer),
+    )
+    .with_context(|| format!("running interactive Claude driver '{runtime_id}'"))
+}
+
 fn requires_st2_channel(argv: &[String]) -> bool {
     argv.windows(2)
         .any(|pair| pair[0] == "--channels" && pair[1] == crate::claude_channel::CHANNEL)
+}
+
+fn requires_st3_channel(argv: &[String]) -> bool {
+    argv.windows(2)
+        .any(|pair| pair[0] == "--channels" && pair[1] == crate::claude_channel::ST3_CHANNEL)
+}
+
+fn prepare_st3_channel_argv(
+    catalog_root: &Path,
+    identity: &str,
+    argv: Vec<String>,
+) -> Result<Vec<String>> {
+    let argv = merge_claude_json_settings(bind_st3_mcp_config_values(argv)?)?;
+    if !requires_st3_channel(&argv) {
+        return Ok(argv);
+    }
+    match crate::claude_channel::verify_st3_installed() {
+        Ok(()) => Ok(argv),
+        Err(error) => {
+            eprintln!(
+                "warning: the approved st3 Claude channel plugin is unavailable: {error:#}\n\
+                 warning: using Claude's interactive st3 development channel"
+            );
+            let executable = std::env::current_exe()
+                .context("resolving the st3 executable for the Claude development channel")?;
+            development_st3_channel_argv(argv, &executable, catalog_root, identity)
+        }
+    }
+}
+
+fn merge_claude_json_settings(argv: Vec<String>) -> Result<Vec<String>> {
+    let mut output = Vec::with_capacity(argv.len());
+    let mut merged = None::<serde_json::Value>;
+    let mut insertion = None::<usize>;
+    let mut index = 0;
+    while index < argv.len() {
+        let (raw, consumed) = if argv[index] == "--settings" {
+            (
+                argv.get(index + 1)
+                    .context("the Claude --settings option has no value")?
+                    .as_str(),
+                2,
+            )
+        } else if let Some(raw) = argv[index].strip_prefix("--settings=") {
+            (raw, 1)
+        } else {
+            output.push(argv[index].clone());
+            index += 1;
+            continue;
+        };
+        if let Ok(value @ serde_json::Value::Object(_)) = serde_json::from_str(raw) {
+            if let Some(existing) = &mut merged {
+                merge_settings_value(existing, value);
+            } else {
+                insertion = Some(output.len());
+                merged = Some(value);
+            }
+        } else {
+            // Claude also accepts settings file paths. Preserve those verbatim;
+            // only JSON sources can be safely consolidated here.
+            output.extend(argv[index..index + consumed].iter().cloned());
+        }
+        index += consumed;
+    }
+    if let (Some(position), Some(value)) = (insertion, merged) {
+        output.splice(position..position, ["--settings".into(), value.to_string()]);
+    }
+    Ok(output)
+}
+
+fn merge_settings_value(base: &mut serde_json::Value, later: serde_json::Value) {
+    match (base, later) {
+        (serde_json::Value::Object(base), serde_json::Value::Object(later)) => {
+            for (key, value) in later {
+                if let Some(existing) = base.get_mut(&key) {
+                    merge_settings_value(existing, value);
+                } else {
+                    base.insert(key, value);
+                }
+            }
+        }
+        (serde_json::Value::Array(base), serde_json::Value::Array(later)) => {
+            for value in later {
+                if !base.contains(&value) {
+                    base.push(value);
+                }
+            }
+        }
+        (base, later) => *base = later,
+    }
+}
+
+/// Bind each authored MCP config to its option so Claude's variadic parser cannot consume the
+/// positional boot prompt as another config path. The joined spelling is accepted by Claude's
+/// option parser and is equivalent for one config; applying this function twice is a no-op.
+fn bind_st3_mcp_config_values(argv: Vec<String>) -> Result<Vec<String>> {
+    let mut output = Vec::with_capacity(argv.len());
+    let mut index = 0;
+    while index < argv.len() {
+        if argv[index] == "--mcp-config" {
+            let raw = argv
+                .get(index + 1)
+                .context("the Claude --mcp-config option has no value")?;
+            output.push(format!("--mcp-config={raw}"));
+            index += 2;
+        } else {
+            output.push(argv[index].clone());
+            index += 1;
+        }
+    }
+    Ok(output)
+}
+
+fn development_st3_channel_argv(
+    argv: Vec<String>,
+    executable: &Path,
+    _catalog_root: &Path,
+    identity: &str,
+) -> Result<Vec<String>> {
+    let argv = bind_st3_mcp_config_values(argv)?;
+    let subject = format!("agent/{identity}");
+    let st3_server = serde_json::json!({
+        "type": "stdio",
+        "command": executable,
+        "args": ["driver", "claude-mcp", "--subject", subject]
+    });
+
+    // Claude accepts one effective MCP configuration. Preserve an authored configuration (for
+    // example Typecase's Xcode bridge) by adding st3 to it instead of appending a second flag,
+    // whose precedence differs across Claude releases and can make the provider reject startup.
+    let mut existing_mcp = None;
+    let mut index = 0;
+    while index < argv.len() {
+        let (joined, raw) = if argv[index] == "--mcp-config" {
+            let raw = argv
+                .get(index + 1)
+                .context("the Claude --mcp-config option has no value")?
+                .clone();
+            (false, raw)
+        } else if let Some(raw) = argv[index].strip_prefix("--mcp-config=") {
+            (true, raw.to_string())
+        } else {
+            index += 1;
+            continue;
+        };
+        anyhow::ensure!(
+            existing_mcp.is_none(),
+            "the Claude arguments contain more than one --mcp-config option"
+        );
+        existing_mcp = Some((index, joined, raw));
+        index += if joined { 1 } else { 2 };
+    }
+
+    let mut mcp = match &existing_mcp {
+        Some((_, _, raw)) => serde_json::from_str::<serde_json::Value>(raw)
+            .context("parsing the authored Claude --mcp-config JSON")?,
+        None => serde_json::json!({"mcpServers": {}}),
+    };
+    let root = mcp
+        .as_object_mut()
+        .context("the authored Claude --mcp-config must be a JSON object")?;
+    let servers = root
+        .entry("mcpServers")
+        .or_insert_with(|| serde_json::json!({}))
+        .as_object_mut()
+        .context("the authored Claude --mcp-config mcpServers value must be a JSON object")?;
+    if let Some(authored) = servers.get("st3") {
+        anyhow::ensure!(
+            authored == &st3_server,
+            "the authored Claude --mcp-config already defines a different st3 server"
+        );
+    } else {
+        servers.insert("st3".to_string(), st3_server);
+    }
+    let mcp =
+        serde_json::to_string(&mcp).context("serializing the Claude st3 development channel")?;
+
+    let channel_count = argv
+        .windows(2)
+        .filter(|pair| pair[0] == "--channels" && pair[1] == crate::claude_channel::ST3_CHANNEL)
+        .count();
+    anyhow::ensure!(
+        channel_count == 1,
+        "the Claude arguments must contain exactly one st3 plugin channel selector"
+    );
+
+    let mut output = Vec::with_capacity(argv.len() + 1);
+    index = 0;
+    while index < argv.len() {
+        if argv[index] == "--channels"
+            && argv.get(index + 1).map(String::as_str) == Some(crate::claude_channel::ST3_CHANNEL)
+        {
+            if existing_mcp.is_none() {
+                output.extend(["--mcp-config".to_string(), mcp.clone()]);
+            }
+            output.push("--dangerously-load-development-channels=server:st3".to_string());
+            index += 2;
+            continue;
+        }
+        if let Some((mcp_index, joined, _)) = &existing_mcp
+            && index == *mcp_index
+        {
+            if *joined {
+                output.push(format!("--mcp-config={mcp}"));
+                index += 1;
+            } else {
+                output.extend(["--mcp-config".to_string(), mcp.clone()]);
+                index += 2;
+            }
+            continue;
+        }
+        output.push(argv[index].clone());
+        index += 1;
+    }
+    Ok(output)
 }
 
 /// Prefer the approved plugin, but preserve an interactive development path when it is absent.
@@ -874,6 +1141,44 @@ pub fn run_observe(
             }
             tracing::warn!("st2 claude-observe: native session binding write failed: {error:#}");
         }
+        // st3 reads this record to bind a managed chat to the wrapper's current native session.
+        if let (Some(incarnation), Some(native_id)) = (
+            exported_session.as_deref(),
+            payload
+                .get("session_id")
+                .and_then(serde_json::Value::as_str),
+        ) {
+            if !native_id.is_empty() {
+                if let Err(error) = write_native_session_binding(&agent_dir, incarnation, native_id)
+                {
+                    tracing::warn!(
+                        "st2 claude-observe: native session binding write failed: {error:#}"
+                    );
+                }
+            }
+        }
+    }
+    let timeline_incarnation = exported_session
+        .clone()
+        .or_else(|| wrapperless_token(&payload))
+        .unwrap_or_else(|| format!("unattributed:{}", runtime_id.unwrap_or(identity)));
+    let mut timeline =
+        crate::harness_timeline::Writer::new(&agent_dir, "claude", timeline_incarnation);
+    if let Err(error) = crate::harness_timeline::observe_claude(&mut timeline, event, &payload) {
+        // Timeline observability is fail-open just like state/context publication: a record fault
+        // must not hold up the hook process Claude is waiting on.
+        tracing::warn!("st2 claude-observe: harness-timeline write failed: {error:#}");
+    }
+    if event == "Stop" {
+        if let Some(home) = std::env::var_os("HOME") {
+            if let Err(error) = crate::harness_timeline::observe_claude_stop_transcript(
+                &mut timeline,
+                &payload,
+                Path::new(&home),
+            ) {
+                tracing::warn!("st2 claude-observe: native answer publication failed: {error:#}");
+            }
+        }
     }
     // The numeric axis is independent of the categorical one and is applied first, because the
     // events that carry a compaction edge say nothing about top-level harness state and would
@@ -913,6 +1218,22 @@ pub fn run_observe(
     // with a live state: the wrapper's `ended` carries this same token and is the session's last
     // word. (`false` = suppressed; the hook has nothing else to do with it.)
     writer.observe_unless_ended(observation).map(|_wrote| ())
+}
+
+fn write_native_session_binding(
+    agent_dir: &Path,
+    incarnation: &str,
+    native_id: &str,
+) -> Result<()> {
+    harness_state::write_json_atomic(
+        &agent_dir.join("claude-native-session"),
+        &serde_json::json!({
+            "incarnation": incarnation,
+            "native_session_id": native_id,
+        }),
+        agent_dir,
+        ".claude-native-session",
+    )
 }
 
 /// Select the ownership a hook write acts under. The wrapper's exported token makes hook writes
@@ -1352,6 +1673,144 @@ mod tests {
     use super::*;
     use crate::harness_state::harness_state_path;
     use crate::provider_session::run_provider;
+
+    #[test]
+    fn duplicate_json_settings_keep_lifecycle_hooks_and_authored_plugins() {
+        let argv = vec![
+            "claude".into(),
+            "--settings".into(),
+            serde_json::json!({"hooks":{"SessionStart":[{"hooks":[{"command":"observe"}]}]}})
+                .to_string(),
+            "--model".into(),
+            "opus".into(),
+            "--settings".into(),
+            serde_json::json!({"enabledPlugins":{"st3-channel@st3":true}}).to_string(),
+        ];
+        let merged = merge_claude_json_settings(argv).unwrap();
+        assert_eq!(merged.iter().filter(|arg| *arg == "--settings").count(), 1);
+        let position = merged.iter().position(|arg| arg == "--settings").unwrap();
+        let settings: serde_json::Value = serde_json::from_str(&merged[position + 1]).unwrap();
+        assert_eq!(
+            settings["hooks"]["SessionStart"][0]["hooks"][0]["command"],
+            "observe"
+        );
+        assert_eq!(settings["enabledPlugins"]["st3-channel@st3"], true);
+        assert_eq!(merge_claude_json_settings(merged.clone()).unwrap(), merged);
+    }
+
+    #[test]
+    fn native_session_binding_is_atomic_and_names_the_exact_provider_incarnation() {
+        let root = tempfile::tempdir().unwrap();
+        write_native_session_binding(root.path(), "wrapper-current", "native-current").unwrap();
+        let binding: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(root.path().join("claude-native-session")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(binding["incarnation"], "wrapper-current");
+        assert_eq!(binding["native_session_id"], "native-current");
+    }
+
+    #[test]
+    fn st3_development_channel_merges_an_authored_mcp_configuration() {
+        let xcode = serde_json::json!({
+            "mcpServers": {
+                "xcode": {
+                    "type": "stdio",
+                    "command": "xcrun",
+                    "args": ["mcpbridge"]
+                }
+            }
+        });
+        let argv = vec![
+            "claude".into(),
+            "--mcp-config".into(),
+            serde_json::to_string(&xcode).unwrap(),
+            "--channels".into(),
+            crate::claude_channel::ST3_CHANNEL.into(),
+            "--remote-control".into(),
+            "prompt".into(),
+        ];
+
+        let output = development_st3_channel_argv(
+            argv,
+            Path::new("/opt/st3/bin/st3"),
+            Path::new("/var/lib/st3"),
+            "fleet/typecase/standing/typecase",
+        )
+        .unwrap();
+
+        let configs = output
+            .iter()
+            .filter_map(|arg| arg.strip_prefix("--mcp-config="))
+            .collect::<Vec<_>>();
+        assert_eq!(configs.len(), 1, "Claude receives one bound MCP config");
+        let mcp: serde_json::Value = serde_json::from_str(configs[0]).unwrap();
+        assert_eq!(mcp["mcpServers"]["xcode"], xcode["mcpServers"]["xcode"]);
+        assert_eq!(mcp["mcpServers"]["st3"]["command"], "/opt/st3/bin/st3");
+        assert_eq!(
+            mcp["mcpServers"]["st3"]["args"],
+            serde_json::json!([
+                "driver",
+                "claude-mcp",
+                "--subject",
+                "agent/fleet/typecase/standing/typecase"
+            ])
+        );
+        assert!(
+            output
+                .iter()
+                .any(|arg| arg == "--dangerously-load-development-channels=server:st3")
+        );
+        assert!(!output.iter().any(|arg| arg == "--channels"));
+        assert!(!output.iter().any(|arg| arg == "--mcp-config"));
+        assert_eq!(output.last().map(String::as_str), Some("prompt"));
+    }
+
+    #[test]
+    fn st3_binds_an_authored_mcp_config_before_the_boot_prompt() {
+        let output = bind_st3_mcp_config_values(vec![
+            "claude".into(),
+            "--mcp-config".into(),
+            r#"{"mcpServers":{"xcode":{"command":"mcpbridge"}}}"#.into(),
+            "boot prompt".into(),
+        ])
+        .unwrap();
+
+        assert_eq!(
+            output,
+            vec![
+                "claude",
+                r#"--mcp-config={"mcpServers":{"xcode":{"command":"mcpbridge"}}}"#,
+                "boot prompt"
+            ]
+        );
+    }
+
+    #[test]
+    fn st3_development_channel_rejects_conflicting_server_ownership() {
+        let argv = vec![
+            "claude".into(),
+            format!(
+                "--mcp-config={}",
+                serde_json::json!({"mcpServers": {"st3": {"command": "other"}}})
+            ),
+            "--channels".into(),
+            crate::claude_channel::ST3_CHANNEL.into(),
+        ];
+
+        let error = development_st3_channel_argv(
+            argv,
+            Path::new("/opt/st3/bin/st3"),
+            Path::new("/var/lib/st3"),
+            "fleet/typecase/standing/typecase",
+        )
+        .unwrap_err();
+
+        assert!(
+            format!("{error:#}").contains("already defines a different st3 server"),
+            "{error:#}"
+        );
+    }
 
     #[test]
     fn only_the_packaged_channel_requests_the_installation_preflight() {

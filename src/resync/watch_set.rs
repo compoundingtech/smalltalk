@@ -13,8 +13,7 @@ pub(super) use agent_spec::profile::ProfileClass;
 use agent_spec::profile::{ResourceProfileRefresh, ResourceProfileRegistry};
 use agent_spec::spec::{AgentSpec, Resource, decode_percent_path};
 
-use crate::resource_profile::{MAX_FACTS, MAX_FACT_KEY_BYTES};
-
+use crate::resource_profile::{MAX_FACT_KEY_BYTES, MAX_FACTS};
 
 /// Provisional coalescing windows (`RESYNC-T02`): tuned by observed notification volume.
 pub(super) const IMMEDIATE_WINDOW: Duration = Duration::from_millis(500);
@@ -66,7 +65,6 @@ impl ResyncCoverage {
     }
 }
 
-
 /// One watchable local carrier: binding label, absolute path, notification class, and an optional
 /// host root that must confine every read of a resolver-selected path.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -116,8 +114,8 @@ fn declaration_resource_digest(resource: &Resource) -> String {
         }
         None => digest.update([0]),
     }
-    let selector = serde_json::to_vec(&resource.selector())
-        .expect("a parsed JSON selector always serializes");
+    let selector =
+        serde_json::to_vec(&resource.selector()).expect("a parsed JSON selector always serializes");
     update_digest_field(&mut digest, &selector);
     format!("{:x}", digest.finalize())
 }
@@ -244,11 +242,15 @@ pub(super) fn resolve_watch_set(
         AgentWatchSet {
             declaration_path,
             bus_id: spec.bus_id(this_host),
-            seat_id: spec.tasks.iter().find(|task| task.name == "agent").map(|task| {
-                task.id
-                    .clone()
-                    .unwrap_or_else(|| format!("{}.{}", spec.bus_id(this_host), task.name))
-            }),
+            seat_id: spec
+                .tasks
+                .iter()
+                .find(|task| task.name == "agent")
+                .map(|task| {
+                    task.id
+                        .clone()
+                        .unwrap_or_else(|| format!("{}.{}", spec.bus_id(this_host), task.name))
+                }),
             carriers,
             declaration_summary: Some(declaration_summary(spec)),
         },
@@ -378,7 +380,10 @@ pub(super) fn resolve_local_path(agent_dir: &Path, uri: &str) -> Option<PathBuf>
     Some(lexical_clean(&agent_dir.join(path)))
 }
 /// Resolve the externally visible resync coverage for one Resource binding.
-pub fn resource_coverage(agent_dir: &Path, resource: &agent_spec::spec::Resource) -> ResyncCoverage {
+pub fn resource_coverage(
+    agent_dir: &Path,
+    resource: &agent_spec::spec::Resource,
+) -> ResyncCoverage {
     if resource.inactive_reason().is_some() {
         return ResyncCoverage::Inactive;
     }
@@ -391,7 +396,6 @@ pub fn resource_coverage(agent_dir: &Path, resource: &agent_spec::spec::Resource
         None => ResyncCoverage::Silent,
     }
 }
-
 
 /// Remove `.` and `..` components lexically. This deliberately does not inspect the filesystem:
 /// classification follows the authored path structure without resolving symlinks.
@@ -420,7 +424,11 @@ pub(super) fn lexical_clean(path: &Path) -> PathBuf {
 /// are immediate; stores the agent itself authors are silent (None); everything else is coalesced.
 /// The declaration carrier is immediate by construction in [`watch_set_for`]. Profile-resolved
 /// carriers skip this sniffing entirely — their class is what the catalog declares.
-pub(super) fn classify(agent_dir: &Path, binding_name: &str, normalized_path: &Path) -> Option<CarrierClass> {
+pub(super) fn classify(
+    agent_dir: &Path,
+    binding_name: &str,
+    normalized_path: &Path,
+) -> Option<CarrierClass> {
     let agent_relative = normalized_path.strip_prefix(agent_dir).ok();
     let authored_store = agent_relative.is_some_and(|rel| {
         rel.starts_with("resources/context")

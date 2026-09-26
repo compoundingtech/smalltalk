@@ -1,8 +1,5 @@
-//! Workspace pre-trust (R12) — mark agent workspaces trusted in the claude config BEFORE any agent
-//! boots, so a kick-driven headless `claude` does not hang on the interactive "Is this a project you
-//! trust?" dialog. This is the blocker an autonomous run hits first: even
-//! `--permission-mode bypassPermissions` still
-//! shows the *workspace-trust* dialog, which is separate from permission prompts).
+//! Workspace pre-trust (R12) for an explicit provider runtime or operator command. The eval runner
+//! and the reconciler never infer a provider from an opaque command.
 //!
 //! The claude config is a JSON object at `$CLAUDE_CONFIG_DIR/.claude.json` (else `$HOME/.claude.json`)
 //! whose `projects` map is keyed by absolute workspace path. A workspace is trusted when its entry has
@@ -10,9 +7,8 @@
 //! onboarding friction. We merge into any existing entry and never clobber the
 //! other per-project fields — and write ALL requested dirs in ONE atomic read-modify-write.
 //!
-//! Why batch + before-boot: a booted claude periodically flushes `.claude.json`, so per-agent trust
-//! writes interleaved with sibling boots lost-update each other — the multi-spawn trust race. Trusting
-//! every workspace in one write *before* the first agent boots closes it.
+//! A booted Claude process periodically flushes `.claude.json`. One explicit batch prevents sibling
+//! trust writes from losing updates.
 
 use std::path::{Path, PathBuf};
 
@@ -33,9 +29,8 @@ fn config_path() -> Result<PathBuf> {
 }
 
 /// Pre-trust `dirs` for BOTH harnesses — claude (`~/.claude.json`) AND codex
-/// (`~/.codex/config.toml`) — so a workspace is trusted whichever harness boots there (the eval
-/// harness pretrusts before spawn, and a matrix mixes both). Writing the other harness's entry is
-/// harmless: each harness reads only its own config. Returns the number of dirs written.
+/// (`~/.codex/config.toml`). Writing the other harness's entry is harmless because each harness
+/// reads only its own config. Returns the number of dirs written.
 pub fn pretrust(dirs: &[PathBuf]) -> Result<usize> {
     let n = pretrust_at(&config_path()?, dirs)?;
     // Codex has its OWN "Do you trust this directory?" prompt (confirmed: bypass-approvals does not
@@ -387,7 +382,10 @@ mod tests {
                 .unwrap()
                 .is_some()
         };
-        assert!(!probe(), "a live trust-lock holder must exclude a second writer");
+        assert!(
+            !probe(),
+            "a live trust-lock holder must exclude a second writer"
+        );
         drop(held);
         assert!(probe(), "dropping the guard must release the trust lock");
     }

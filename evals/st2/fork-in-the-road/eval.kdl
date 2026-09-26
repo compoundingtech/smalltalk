@@ -1,0 +1,68 @@
+version 1
+
+team "fd" {
+  agent "sup" {
+    workspace "./sup"
+    harness "codex" {
+      model "gpt-5.6-sol"
+      effort "medium"
+      prompt "You cold-started in a hermetic st2 eval. Read AGENTS.md. Drain and archive every Small Talk message. If no work remains, end the turn and stay idle. The native driver starts a new turn when a message arrives. Coordinate the design panel, synthesize its result, and send one final requester message."
+      args "--dangerously-bypass-approvals-and-sandbox" "--dangerously-bypass-hook-trust"
+    }
+  }
+  agent "a" {
+    workspace "./a"
+    harness "codex" {
+      model "gpt-5.6-sol"
+      effort "medium"
+      prompt "You cold-started in a hermetic st2 eval. Read AGENTS.md. Drain and archive every Small Talk message. If no work remains, end the turn and stay idle. The native driver starts a new turn when a message arrives. Champion your assigned design, debate it through Small Talk, commit your proposal, and report completion."
+      args "--dangerously-bypass-approvals-and-sandbox" "--dangerously-bypass-hook-trust"
+    }
+  }
+  agent "b" {
+    workspace "./b"
+    harness "codex" {
+      model "gpt-5.6-sol"
+      effort "medium"
+      prompt "You cold-started in a hermetic st2 eval. Read AGENTS.md. Drain and archive every Small Talk message. If no work remains, end the turn and stay idle. The native driver starts a new turn when a message arrives. Champion your assigned design, debate it through Small Talk, commit your proposal, and report completion."
+      args "--dangerously-bypass-approvals-and-sandbox" "--dangerously-bypass-hook-trust"
+    }
+  }
+  agent "c" {
+    workspace "./c"
+    harness "codex" {
+      model "gpt-5.6-sol"
+      effort "medium"
+      prompt "You cold-started in a hermetic st2 eval. Read AGENTS.md. Drain and archive every Small Talk message. If no work remains, end the turn and stay idle. The native driver starts a new turn when a message arrives. Champion your assigned design, debate it through Small Talk, commit your proposal, and report completion."
+      args "--dangerously-bypass-approvals-and-sandbox" "--dangerously-bypass-hook-trust"
+    }
+  }
+}
+
+eval {
+  copy "./fixture"
+  message {
+    from "requester"
+    to "fd.sup"
+    content "./task.md"
+  }
+  max-timeout "1200s"
+
+  judges {
+    judge "each repository has only its owner as an author" {
+      exec "bash ./judges/isolation.sh"
+    }
+    judge "at least two proposals and one recommendation exist" {
+      exec "bash ./judges/deliverables.sh"
+    }
+    judge "the proposals contain distinct designs" {
+      exec "bash ./judges/distinct.sh"
+    }
+    judge "the deliverables treat privacy as a main tradeoff" {
+      exec "bash ./judges/privacy.sh"
+    }
+    judge "the supervisor sent a recommendation to the requester" {
+      exec "bash ./judges/recommendation.sh"
+    }
+  }
+}

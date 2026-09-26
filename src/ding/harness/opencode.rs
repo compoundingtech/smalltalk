@@ -136,7 +136,7 @@ fn preceding_submitted_box(before_composer: &str, expected: &str) -> bool {
 mod tests {
     use super::*;
 
-    const EXPECTED: &str = "[DING] id=abc from=dev3.cos subject=liveness";
+    const EXPECTED: &str = "[PING] id=abc from=dev3.cos subject=liveness";
 
     fn screen(composer: &str, history: &str, status: &str) -> String {
         format!(

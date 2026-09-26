@@ -39,8 +39,8 @@
    The st2 control plane itself can be stopped, killed, reinstalled, and
    restarted without stopping or replacing any running agent; the replacement
    runtime adopts the existing agent processes without duplication.
-3. Every machine has exactly one root agent that observes local health,
-   resolves bounded runtime failures, and escalates what it cannot resolve.
+3. Each supervisor tree has one root agent that observes its runtime health,
+   resolves bounded failures, and escalates what it cannot resolve.
 4. A human, CoS, root, or supervisor can inspect catalog-backed state to
    determine an agent's presence, activity status, current plan, and current
    plan step without opening its PTY or relying on its transcript; stale state

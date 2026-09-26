@@ -1,0 +1,215 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+umask 077
+
+: "${ST3_BIN:?set ST3_BIN to the installed st3 executable}"
+: "${ST_AGENT:?set ST_AGENT to the claimed st3 operator identity}"
+: "${FABRIC_BIN:?set FABRIC_BIN to the installed Fabric executable}"
+: "${ST3_FRIEND_READY_IDLE_START_UNIX:?set the first local Silber sample epoch}"
+: "${ST3_FRIEND_READY_MESSAGE_START_UNIX:?set the complete-logging message monitor epoch}"
+
+for value in "$ST3_FRIEND_READY_IDLE_START_UNIX" "$ST3_FRIEND_READY_MESSAGE_START_UNIX"; do
+  [[ $value =~ ^[0-9]+$ ]] || { echo 'invalid gate start epoch' >&2; exit 2; }
+done
+
+MONITOR=agent/fleet/st3/delivery-soak-20260924/monitor
+STATE_DIR=${ST3_GATE_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/st3/friend-ready-gates}
+REPORT_DIR=$(/usr/bin/dirname "$0")
+IDLE_REPORT="$REPORT_DIR/st3-idle-soak-report"
+IDLE_PREFLIGHT="$REPORT_DIR/st3-idle-soak-preflight"
+MESSAGE_REPORT="$REPORT_DIR/st3-message-soak-report"
+AUDIT_QUEUE="$REPORT_DIR/st3-friend-ready-audit-queue"
+/bin/mkdir -p "$STATE_DIR"
+state="$STATE_DIR/state.json"
+now=$(/bin/date -u +%s)
+
+idle_output=
+if idle_output=$(/usr/bin/env -u ST3_IDLE_REPORT_LOG -u ST3_IDLE_REPORT_NOW_UNIX \
+  -u ST3_IDLE_REPORT_DURATION_SECONDS -u ST3_IDLE_REPORT_MAX_GAP_SECONDS \
+  -u ST3_IDLE_REPORT_MIN_SAMPLES -u ST3_IDLE_REPORT_MIN_QUIET \
+  -u ST3_IDLE_REPORT_MIN_QUIET_SECONDS ST3_IDLE_REPORT_REMOTE=1 \
+  FABRIC_BIN="$FABRIC_BIN" "$IDLE_REPORT" 2>&1); then
+  idle_report_pass=true
+else
+  idle_report_pass=false
+fi
+message_output=
+if message_output=$(/usr/bin/env -u ST3_SOAK_REPORT_LOG -u ST3_SOAK_REPORT_NOW_UNIX \
+  -u ST3_SOAK_REPORT_MIN_DURATION_SECONDS -u ST3_SOAK_REPORT_MAX_GAP_SECONDS \
+  -u ST3_SOAK_REPORT_MIN_EACH_DIRECTION -u ST3_SOAK_REPORT_SKIP_RUNTIME_CHECKS \
+  "$MESSAGE_REPORT" 2>&1); then
+  message_report_pass=true
+else
+  message_report_pass=false
+fi
+
+idle=waiting
+message=waiting
+if (( now >= ST3_FRIEND_READY_IDLE_START_UNIX + 86400 )); then
+  if [[ $idle_report_pass == true ]]; then idle=pass; else idle=fail; fi
+fi
+if (( now >= ST3_FRIEND_READY_MESSAGE_START_UNIX + 259200 )); then
+  if [[ $message_report_pass == true ]]; then message=pass; else message=fail; fi
+fi
+
+# Fail early on a broken evidence stream. This is not the 24-hour release gate:
+# it checks only post-rollout continuity, one PID, and healthy peer samples.
+idle_preflight=waiting
+idle_preflight_output=
+if (( now >= ST3_FRIEND_READY_IDLE_START_UNIX + 180 )); then
+  if idle_preflight_output=$(/usr/bin/env -u ST3_IDLE_REPORT_LOG -u ST3_IDLE_REPORT_NOW_UNIX \
+    -u ST3_IDLE_REPORT_MAX_GAP_SECONDS -u ST3_IDLE_REPORT_MIN_QUIET_SECONDS \
+    ST3_IDLE_PREFLIGHT_START_UNIX="$ST3_FRIEND_READY_IDLE_START_UNIX" \
+    ST3_IDLE_REPORT_REMOTE=1 FABRIC_BIN="$FABRIC_BIN" "$IDLE_PREFLIGHT" 2>&1); then
+    idle_preflight=healthy
+  else
+    idle_preflight=fault
+  fi
+fi
+
+# The final CPU verdict still needs a full day. Once there is enough quiet
+# post-rollout evidence to be informative, wake the operator early if its
+# median is already outside the unchanged release limits.
+idle_risk=waiting
+idle_risk_summary=
+if (( now >= ST3_FRIEND_READY_IDLE_START_UNIX + 7200 )); then
+  idle_risk_output=$(/usr/bin/env -u ST3_IDLE_REPORT_LOG -u ST3_IDLE_REPORT_NOW_UNIX \
+    -u ST3_IDLE_REPORT_MAX_GAP_SECONDS -u ST3_IDLE_REPORT_MIN_QUIET_SECONDS \
+    ST3_IDLE_REPORT_DURATION_SECONDS="$((now - ST3_FRIEND_READY_IDLE_START_UNIX))" \
+    ST3_IDLE_REPORT_MIN_SAMPLES=1 ST3_IDLE_REPORT_MIN_QUIET=1 \
+    ST3_IDLE_REPORT_REMOTE=1 FABRIC_BIN="$FABRIC_BIN" "$IDLE_REPORT" 2>&1) || :
+  if /usr/bin/jq -e '(.hosts | length) == 2 and all(.hosts[]; .quiet_intervals >= 60)' \
+    <<<"$idle_risk_output" >/dev/null 2>&1; then
+    idle_risk_summary=$(/usr/bin/jq -cr \
+      '{hosts:[.hosts[]|{host,quiet_intervals,quiet_cpu_median_pct}]}' \
+      <<<"$idle_risk_output")
+    if /usr/bin/jq -e 'all(.hosts[];
+      .quiet_cpu_median_pct != null and .quiet_cpu_median_pct >= 0 and
+      (if .host == "hetz" then .quiet_cpu_median_pct <= 15
+       elif .host == "silber" then .quiet_cpu_median_pct <= 50 else false end))' \
+      <<<"$idle_risk_output" >/dev/null; then
+      idle_risk=within-limit
+    else
+      idle_risk=high-cpu
+    fi
+  fi
+fi
+
+idle_summary=$(/usr/bin/jq -cr '{pass,hosts:[.hosts[]|{host,samples,errors,pid_count,quiet_cpu_median_pct,rss_growth_kib,pass}]}' \
+  <<<"$idle_output" 2>/dev/null) || idle_summary='idle report unavailable or malformed'
+if [[ $message_output == PASS:* || $message_output == FAIL:* ]]; then
+  message_summary=${message_output//$'\n'/ }
+  message_summary=${message_summary:0:500}
+else
+  message_summary='delivery report unavailable or malformed'
+fi
+
+old_idle=$(/usr/bin/jq -r '.idle_notice // ""' "$state" 2>/dev/null) || old_idle=
+old_idle_preflight=$(/usr/bin/jq -r '.idle_preflight_notice // ""' "$state" 2>/dev/null) || old_idle_preflight=
+old_idle_risk=$(/usr/bin/jq -r '.idle_risk_notice // ""' "$state" 2>/dev/null) || old_idle_risk=
+old_message=$(/usr/bin/jq -r '.message_notice // ""' "$state" 2>/dev/null) || old_message=
+old_release=$(/usr/bin/jq -r '.release_notice // ""' "$state" 2>/dev/null) || old_release=
+failures=0
+
+send_notice() {
+  local subject=$1 body=$2 response
+  if response=$(/usr/bin/timeout -k 5s 30s "$ST3_BIN" conversations send "$ST_AGENT" \
+    --from "$MONITOR" --subject "$subject" --body "$body" --json); then
+    /usr/bin/jq -er '.subject' <<<"$response"
+  else
+    return 1
+  fi
+}
+
+if [[ $idle_preflight == fault ]]; then
+  preflight_notice="$ST3_FRIEND_READY_IDLE_START_UNIX:fault"
+  if [[ $old_idle_preflight != "$preflight_notice" ]]; then
+    if receipt=$(send_notice 'friend-ready idle evidence fault' \
+      "The post-rollout idle evidence has a bad sample, restart, gap, stale host, or unavailable remote log. This is an early integrity alert, not a release-gate result. ${idle_preflight_output:0:600} Inspect and restart the complete 24-hour window after remediation."); then
+      old_idle_preflight=$preflight_notice
+      /usr/bin/printf 'idle preflight fault notified in %s\n' "$receipt"
+    else
+      failures=1
+    fi
+  fi
+else
+  old_idle_preflight=
+fi
+
+if [[ $idle_risk == high-cpu ]]; then
+  risk_notice="$ST3_FRIEND_READY_IDLE_START_UNIX:high-cpu"
+  if [[ $old_idle_risk != "$risk_notice" ]]; then
+    if receipt=$(send_notice 'friend-ready idle CPU at risk' \
+      "The provisional post-rollout quiet CPU median exceeds the unchanged release limit after at least 60 quiet intervals per host. This is an early risk signal, not the 24-hour verdict. $idle_risk_summary Investigate without editing the evidence or thresholds."); then
+      old_idle_risk=$risk_notice
+      /usr/bin/printf 'idle CPU risk notified in %s\n' "$receipt"
+    else
+      failures=1
+    fi
+  fi
+else
+  old_idle_risk=
+fi
+
+idle_notice="$ST3_FRIEND_READY_IDLE_START_UNIX:$idle"
+if [[ $idle != waiting && $idle_notice != "$old_idle" ]]; then
+  if receipt=$(send_notice "friend-ready idle gate: $idle" \
+    "The 24-hour two-host idle gate is $idle. $idle_summary Keep the release held unless it passes; inspect the retained local samples on both hosts."); then
+    old_idle=$idle_notice
+    /usr/bin/printf 'idle gate %s notified in %s\n' "$idle" "$receipt"
+  else
+    failures=1
+  fi
+fi
+message_notice="$ST3_FRIEND_READY_MESSAGE_START_UNIX:$message"
+if [[ $message != waiting && $message_notice != "$old_message" ]]; then
+  if receipt=$(send_notice "friend-ready delivery gate: $message" \
+    "The 72-hour bidirectional exact-receipt gate is $message. $message_summary Keep the release held unless it passes; inspect the retained monitor evidence."); then
+    old_message=$message_notice
+    /usr/bin/printf 'delivery gate %s notified in %s\n' "$message" "$receipt"
+  else
+    failures=1
+  fi
+fi
+if [[ $idle == pass && $message == pass ]]; then
+  release_notice="$ST3_FRIEND_READY_IDLE_START_UNIX:$ST3_FRIEND_READY_MESSAGE_START_UNIX:pass"
+  if [[ $old_release != "$release_notice" ]]; then
+    if receipt=$(send_notice 'friend-ready gates passed' \
+      "Both the 24-hour idle and 72-hour exact-receipt gates pass on their default thresholds. Verify the claimed mission products and final release evidence before marking friend-ready. $idle_summary $message_summary"); then
+      old_release=$release_notice
+      /usr/bin/printf 'combined gates notified in %s\n' "$receipt"
+    else
+      failures=1
+    fi
+  fi
+else
+  old_release=
+fi
+
+# A notification is not work. At the delivery deadline, queue one exact audit
+# run for the pair of due windows whether a report passes or fails, so
+# remediation or release review is
+# claimable even if the operator misses a message. The queue helper reads the
+# exact run before starting it and tolerates a lost response after commit.
+if [[ $idle != waiting && $message != waiting ]]; then
+  if ! "$AUDIT_QUEUE"; then
+    failures=1
+  fi
+fi
+
+temporary=$(/usr/bin/mktemp "$STATE_DIR/state.XXXXXX")
+/usr/bin/jq -nc --argjson checked_at "$now" --arg idle "$idle" --arg message "$message" \
+  --arg idle_preflight "$idle_preflight" \
+  --arg idle_risk "$idle_risk" \
+  --arg idle_notice "$old_idle" --arg idle_preflight_notice "$old_idle_preflight" \
+  --arg idle_risk_notice "$old_idle_risk" \
+  --arg message_notice "$old_message" \
+  --arg release_notice "$old_release" \
+  '{checked_at:$checked_at,idle:$idle,idle_preflight:$idle_preflight,idle_risk:$idle_risk,
+    message:$message,idle_notice:$idle_notice,idle_preflight_notice:$idle_preflight_notice,
+    idle_risk_notice:$idle_risk_notice,
+    message_notice:$message_notice,release_notice:$release_notice}' >"$temporary"
+/usr/bin/mv "$temporary" "$state"
+/usr/bin/printf 'friend-ready gates idle=%s preflight=%s cpu-risk=%s delivery=%s\n' \
+  "$idle" "$idle_preflight" "$idle_risk" "$message"
+exit "$failures"

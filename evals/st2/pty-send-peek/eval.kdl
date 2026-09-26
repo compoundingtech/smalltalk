@@ -1,0 +1,19 @@
+version 1
+
+eval {
+  max-timeout "90s"
+  run "spawn" { command #"st2 pty run -d --id psp -- bash -c 'echo READY; while IFS= read -r line; do echo "ACK:$line"; done'"# }
+  run "settle" { command "sleep 1" }
+  run "peek-pre" { command "st2 pty peek --plain psp" }
+  run "send" { command #"st2 pty send psp --seq "PSP-9f3a7c2e" --seq key:return"# }
+  run "peek-post" { command "sleep 1; st2 pty peek --plain psp" }
+  run "registry-eval" { command #"pty list | grep -q '(psp)' && echo LISTED"# }
+  run "registry-live" { command #"out=$(env -u PTY_ROOT pty list); printf '%s' "$out" | grep -q '(psp)' && exit 1 || echo CLEAN"# }
+  run "cleanup" { command "st2 pty kill psp" }
+  judges {
+    judge "the pre-send screen has READY but no acknowledgement" { exec "grep -Fq READY $RUNS_DIR/peek-pre.out && ! grep -Fq ACK:PSP-9f3a7c2e $RUNS_DIR/peek-pre.out" }
+    judge "the process acknowledges the injected line" { exec "grep -Fq ACK:PSP-9f3a7c2e $RUNS_DIR/peek-post.out" }
+    judge "the eval PTY registry is isolated" { exec "grep -Fqx LISTED $RUNS_DIR/registry-eval.out && grep -Fqx CLEAN $RUNS_DIR/registry-live.out" }
+    judge "cleanup stops the synthetic PTY" { exec #"test "$(st2 pty ls --json | jq '[.[] | select(.name == "psp" and .status == "running")] | length')" -eq 0"# }
+  }
+}

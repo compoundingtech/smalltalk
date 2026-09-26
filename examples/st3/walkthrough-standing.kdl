@@ -1,0 +1,16 @@
+version 2
+
+mission "example/garden-owner" state="ready" {
+  goal "Keep one garden project owner available for current and future work."
+
+  agent "owner" {
+    identity "garden-owner"
+    workspace "."
+    render { git-exclude ".st3/" }
+    harness "codex" {
+      model "gpt-5.6-sol"
+      effort "high"
+    }
+    restart "always"
+  }
+}

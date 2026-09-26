@@ -1,0 +1,14 @@
+{
+  "id": "versioned-reminders",
+  "claims": [
+    {
+      "subject": "message/reminder/v1", "kind": "message.sent", "actor": "daemon/runtime",
+      "fields": { "from": "daemon/runtime", "to": "person/operator", "content": "old reminder", "status": "sent", "tags": ["reminder:work/demo", "version:1"] }
+    },
+    {
+      "subject": "message/reminder/v2", "kind": "message.sent", "actor": "daemon/runtime",
+      "fields": { "from": "daemon/runtime", "to": "person/operator", "content": "current reminder", "status": "sent", "tags": ["reminder:work/demo", "version:2"] }
+    }
+  ],
+  "expected": { "history_count": 2, "actionable": ["message/reminder/v2"] }
+}

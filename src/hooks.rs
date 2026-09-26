@@ -1,8 +1,9 @@
-//! Explicit, receipt-bearing installation of the lifecycle hooks shipped with st2.
+//! Receipt-bearing installation of the lifecycle hooks shipped with st2.
 //!
 //! Hook scripts are published as immutable content-addressed sets. Ordinary supervision resolves
-//! and verifies the set embedded in its own binary, but never writes it. Only `st2 hooks install`
-//! publishes a set and atomically selects it with `current.json`.
+//! and verifies the set embedded in its own binary. A daemon boot also publishes/selects that exact
+//! set when necessary, so a fresh managed node cannot start a harness without its lifecycle
+//! transport. `st2 hooks install` remains the explicit repair and inspection surface.
 
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
@@ -186,6 +187,40 @@ pub fn claude_settings_registration() -> serde_json::Value {
         // terminal edge, and `refreshInterval: 5` re-runs the command every 5 seconds in addition
         // to event-driven updates — which is what makes the record a live reading rather than one
         // frozen between turns, and is well inside the 300-second write heartbeat.
+        "statusLine": {
+            "type": "command",
+            "command": "\"$ST_HOOKS/claude-statusline.sh\"",
+            "padding": 0,
+            "refreshInterval": 5,
+        }
+    })
+}
+
+/// Claude lifecycle observation used by an st3-controlled interactive seat.
+///
+/// Unlike the full st2 registration this does not inject the legacy SessionStart ritual or run
+/// legacy message/context helpers. The st3 boot document and native MCP channel own those jobs;
+/// these hooks only externalize Claude's real turn and context state.
+pub fn claude_st3_settings_registration() -> serde_json::Value {
+    fn observe(event: &str) -> serde_json::Value {
+        serde_json::json!([{ "hooks": [{
+            "type": "command",
+            "command": format!("\"$ST_HOOKS/claude-observe.sh\" {event}"),
+        }] }])
+    }
+    serde_json::json!({
+        "$schema": "https://json.schemastore.org/claude-code-settings.json",
+        "hooks": {
+            "SessionStart": observe("SessionStart"),
+            "PreCompact": observe("PreCompact"),
+            "PostCompact": observe("PostCompact"),
+            "StopFailure": observe("StopFailure"),
+            "UserPromptSubmit": observe("UserPromptSubmit"),
+            "Stop": observe("Stop"),
+            "PermissionRequest": observe("PermissionRequest"),
+            "PreToolUse": observe("PreToolUse"),
+            "PostToolUse": observe("PostToolUse"),
+        },
         "statusLine": {
             "type": "command",
             "command": "\"$ST_HOOKS/claude-statusline.sh\"",
@@ -692,7 +727,21 @@ pub fn install(replace: bool) -> Result<PathBuf> {
     install_at(&hooks_root()?, replace)
 }
 
-/// Explicit installer beneath a provided root. Ordinary `up` and materialization paths never call it.
+/// Ensure a daemon can launch every built-in harness with this binary's exact lifecycle assets.
+///
+/// The ordinary replacement rules still apply: this can initialize a fresh host or advance to a
+/// newer set, but it cannot silently replace a corrupt receipt, overwrite a newer set, or resolve
+/// an ambiguous same-source build. Those cases retain the explicit `hooks install --replace`
+/// recovery boundary.
+pub fn ensure_installed() -> Result<PathBuf> {
+    ensure_installed_at(&hooks_root()?)
+}
+
+fn ensure_installed_at(root: &Path) -> Result<PathBuf> {
+    verify_required_set_at(root).or_else(|_| install_at(root, false))
+}
+
+/// Installer beneath a provided root.
 pub fn install_at(root: &Path, replace: bool) -> Result<PathBuf> {
     fs::create_dir_all(root).with_context(|| format!("creating hook root {}", root.display()))?;
     let candidate = expected_receipt();
@@ -761,6 +810,17 @@ mod tests {
         assert_eq!(registered, claude_settings_registration());
     }
 
+
+    #[test]
+    fn st3_claude_settings_externalize_lifecycle_without_the_legacy_boot_ritual() {
+        let settings = claude_st3_settings_registration();
+        let encoded = settings.to_string();
+        assert!(encoded.contains("claude-observe.sh"));
+        assert!(encoded.contains("UserPromptSubmit"));
+        assert!(encoded.contains("Stop"));
+        assert!(!encoded.contains("claude-session-start.sh"));
+        assert!(!encoded.contains("claude-stop-failure.sh"));
+    }
 
     #[test]
     fn omp_launch_classification_is_exact() {
@@ -1009,6 +1069,14 @@ mod tests {
 
         assert_eq!(install_at(tmp.path(), false).unwrap(), selected);
         assert_eq!(read_receipt(tmp.path()).unwrap(), expected_receipt());
+    }
+
+    #[test]
+    fn daemon_ensure_bootstraps_a_fresh_root_and_is_idempotent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let installed = ensure_installed_at(tmp.path()).unwrap();
+        assert_eq!(installed, verify_required_set_at(tmp.path()).unwrap());
+        assert_eq!(installed, ensure_installed_at(tmp.path()).unwrap());
     }
 
     #[test]

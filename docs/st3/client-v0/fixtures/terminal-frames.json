@@ -1,0 +1,22 @@
+{
+  "api_version": "st3.client.v0",
+  "request_id": "request/terminal-frames-1",
+  "snapshot": {
+    "id": "snapshot/host-a/1845/55de", "host_id": "host/host-a", "store_index": 1845,
+    "projection_version": "client-projection.v0", "created_at": "2026-09-20T12:00:03Z"
+  },
+  "value": {
+    "kind": "terminal-frame-page", "terminal_id": "terminal/release-shell", "runtime_incarnation": "pty-4:2026-09-20T11:10:00Z",
+    "frames": [
+      {
+        "id": "terminal-frame/release-shell/41", "terminal_id": "terminal/release-shell", "runtime_incarnation": "pty-4:2026-09-20T11:10:00Z",
+        "sequence": 41, "type": "output", "timestamp": "2026-09-20T12:00:03Z", "body": { "data_base64": "bHMNCg==", "redacted": false, "truncated": false }
+      },
+      {
+        "id": "terminal-frame/release-shell/42", "terminal_id": "terminal/release-shell", "runtime_incarnation": "pty-4:2026-09-20T11:10:00Z",
+        "sequence": 42, "type": "resize", "timestamp": "2026-09-20T12:00:03Z", "body": { "rows": 40, "columns": 120 }
+      }
+    ],
+    "resume_sequence": 43
+  }
+}

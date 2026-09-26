@@ -1558,7 +1558,7 @@ fn event_emit_cli_returns_a_stable_json_receipt_and_ding_marks_the_record() {
         .remove(0);
     let ding = st2::ding::poke_text(catalog.path(), "hetz", "hetz.worker", &message);
     assert!(
-        ding.starts_with("[DING] » hetz.worker/gh-ci: CLI proof"),
+        ding.starts_with("[PING] » hetz.worker/gh-ci: CLI proof"),
         "{ding}"
     );
 }

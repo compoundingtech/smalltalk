@@ -1,0 +1,55 @@
+[package]
+name = "st3"
+version = "0.1.0"
+edition = "2024"
+description = "Claims-graph agent reconciler"
+license = "MIT"
+
+[dependencies]
+anyhow = "1"
+axum = { version = "0.8", features = ["json", "ws"] }
+base64 = "0.22"
+ciborium = "0.2"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+clap = { version = "4", features = ["derive", "env"] }
+clap_complete = "4"
+futures-util = "0.3"
+getrandom = "0.3"
+hex = "0.4"
+hmac = "0.12"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["client", "http1", "server"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+kdl = "6"
+libc = "0.2"
+notify = "8"
+pty-core = { git = "https://github.com/compoundingtech/pty-rust", rev = "a7c60e5c48bd472b957d952d01e644e2153d8a48" }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+st-runtime = { path = "../st-runtime" }
+st3-client = { path = "../st3-client" }
+st3-schema = { path = "../st3-schema" }
+st2 = { path = "../.." }
+tempfile = "3"
+tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = "0.27"
+toml = "0.9"
+tower = { version = "0.5", features = ["util"] }
+tar = "0.4"
+urlencoding = "2"
+uuid = { version = "1", features = ["v7"] }
+walkdir = "2"
+
+[dev-dependencies]
+agent-spec = { path = "../agent-spec" }
+assert_cmd = "2"
+portable-pty = "0.9"
+predicates = "3"
+proptest = "1"
+
+[[bin]]
+name = "st3"
+path = "src/main.rs"

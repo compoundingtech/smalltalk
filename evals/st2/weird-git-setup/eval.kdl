@@ -1,0 +1,34 @@
+version 1
+
+team "wg" {
+  agent "dev" {
+    workspace "./wt/feature"
+    harness "codex" {
+      model "gpt-5.6-sol"
+      effort "medium"
+      prompt "You cold-started in a hermetic st2 eval inside an unusual Git checkout. Read AGENTS.md. Use only st2 message for Small Talk. Never use st or another message command. Drain and archive every st2 message. Resolve the checkout, fix the failing test, commit on the current branch, and report once. If no work remains, end the turn and stay idle. The native driver starts a new turn when a message arrives."
+      args "--dangerously-bypass-approvals-and-sandbox" "--dangerously-bypass-hook-trust"
+    }
+  }
+}
+
+eval {
+  copy "./fixture"
+  run "materialize" {
+    command "bash ./setup-megarepo.sh"
+  }
+  message {
+    from "morgan"
+    to "wg.dev"
+    content "./task.md"
+  }
+  max-timeout "600s"
+
+  judges {
+    judge "the checkout is a linked feature worktree" { exec "bash ./judges/worktree-resolved.sh" }
+    judge "the complete suite is green" { exec "bash ./judges/suite-green.sh" }
+    judge "the fix is committed on feature" { exec "bash ./judges/fix-on-feature.sh" }
+    judge "main and the sibling worktree are unchanged" { exec "bash ./judges/no-leak.sh" }
+    judge "the seeded regression remains effective" { exec "bash ./judges/regression-test.sh" }
+  }
+}

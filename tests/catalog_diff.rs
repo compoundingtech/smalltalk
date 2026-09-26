@@ -165,6 +165,8 @@ fn declared_delivery_has_one_exact_semantic_address() {
         prepared.join("agents/host/worker/agent.kdl"),
         r#"agent "worker" {
   host "host"
+  session-driver "codex"
+  delivery-readiness "credential"
   deliver "app-server"
   session-driver "codex"
   delivery-readiness "credential"

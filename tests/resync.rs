@@ -25,6 +25,7 @@ fn write_agent(root: &Path) -> PathBuf {
 
 /// Same catalog fixture, but the goal binding is a profile-scheme URI instead of a
 /// catalog-relative path.
+#[cfg(feature = "wasm-resolver")]
 fn write_agent_with_goal_scheme(root: &Path) -> PathBuf {
     let dir = root.join("agents/hetz/worker");
     fs::create_dir_all(&dir).unwrap();
@@ -227,6 +228,7 @@ fn declaring_the_reserved_resync_stream_is_refused() {
 /// The demo resolver guest, built from `crates/demo-resolver-wasm` (see its module docs for the
 /// rebuild recipe). It maps `dev.schickling.agent-goal://<host>/<id>` to
 /// `<agent_dir>/resources/goal.md`.
+#[cfg(feature = "wasm-resolver")]
 const DEMO_WASM_SRC: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/crates/agent-spec/tests/fixtures/demo_resolver.wasm"
@@ -234,6 +236,7 @@ const DEMO_WASM_SRC: &str = concat!(
 
 /// Declare a catalog-level wasm profile for the goal scheme and materialize the fixture module
 /// where the declaration points: `<catalog>/resolvers/goal.wasm` (catalog-root anchored).
+#[cfg(feature = "wasm-resolver")]
 fn catalog_with_profile(catalog: &Path, class: &str) {
     fs::create_dir_all(catalog.join("resolvers")).unwrap();
     fs::copy(DEMO_WASM_SRC, catalog.join("resolvers/goal.wasm")).unwrap();
@@ -320,8 +323,11 @@ fn declared_profile_class_governs_and_resolver_failures_stay_contained() {
     // failure is visible through try_resolve rather than swallowed.
     let broken = tempfile::tempdir().unwrap();
     let broken_dir = write_agent_with_goal_scheme(broken.path());
-    fs::write(st2::catalog::config_path(broken.path()),
-        "profile \"dev.schickling.agent-goal\" { wasm \"broken.wasm\" }\n").unwrap();
+    fs::write(
+        st2::catalog::config_path(broken.path()),
+        "profile \"dev.schickling.agent-goal\" { wasm \"broken.wasm\" }\n",
+    )
+    .unwrap();
     fs::write(broken.path().join("broken.wasm"), b"not a module").unwrap();
     let registry = st2::catalog::declared_profiles(broken.path()).unwrap();
     let spec = &st2::discover_strict(broken.path()).specs[0];
@@ -331,7 +337,12 @@ fn declared_profile_class_governs_and_resolver_failures_stay_contained() {
         "a failing resolver must not produce a carrier"
     );
     assert!(set.carriers.iter().any(|c| c.label == "declaration"));
-    assert!(registry
-        .try_resolve(broken_dir.parent().unwrap(), "dev.schickling.agent-goal://hetz/w")
-        .is_err());
+    assert!(
+        registry
+            .try_resolve(
+                broken_dir.parent().unwrap(),
+                "dev.schickling.agent-goal://hetz/w"
+            )
+            .is_err()
+    );
 }

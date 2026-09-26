@@ -19,6 +19,7 @@ const FUTURE_SKEW_MS: u64 = 60_000;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum Stage {
+    Launch,
     VersionGate,
     ApiGate,
     Sse,
@@ -31,7 +32,8 @@ pub enum Stage {
 }
 
 impl Stage {
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
+        Self::Launch,
         Self::VersionGate,
         Self::ApiGate,
         Self::Sse,
@@ -43,6 +45,7 @@ impl Stage {
 
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::Launch => "launch",
             Self::VersionGate => "versionGate",
             Self::ApiGate => "apiGate",
             Self::Sse => "sse",
@@ -61,13 +64,14 @@ impl Stage {
     /// outrank both rather than hide behind them.
     const fn index(self) -> Option<usize> {
         match self {
-            Self::VersionGate => Some(0),
-            Self::ApiGate => Some(1),
-            Self::Sse => Some(2),
-            Self::Seed => Some(3),
-            Self::ProviderAuth => Some(4),
-            Self::Delivery => Some(5),
-            Self::ReadBack => Some(6),
+            Self::Launch => Some(0),
+            Self::VersionGate => Some(1),
+            Self::ApiGate => Some(2),
+            Self::Sse => Some(3),
+            Self::Seed => Some(4),
+            Self::ProviderAuth => Some(5),
+            Self::Delivery => Some(6),
+            Self::ReadBack => Some(7),
             Self::Unknown => None,
         }
     }
@@ -102,6 +106,7 @@ impl Driver {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum Reason {
+    LaunchConfigurationRejected,
     VersionProbeFailed,
     UnsupportedVersion,
     ApiUnavailable,
@@ -127,7 +132,8 @@ pub enum Reason {
 }
 
 impl Reason {
-    pub const ALL: [Self; 20] = [
+    pub const ALL: [Self; 21] = [
+        Self::LaunchConfigurationRejected,
         Self::VersionProbeFailed,
         Self::UnsupportedVersion,
         Self::ApiUnavailable,
@@ -152,6 +158,7 @@ impl Reason {
 
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::LaunchConfigurationRejected => "launchConfigurationRejected",
             Self::VersionProbeFailed => "versionProbeFailed",
             Self::UnsupportedVersion => "unsupportedVersion",
             Self::ApiUnavailable => "apiUnavailable",
@@ -178,6 +185,7 @@ impl Reason {
 
     pub const fn stage(self) -> Stage {
         match self {
+            Self::LaunchConfigurationRejected => Stage::Launch,
             Self::VersionProbeFailed | Self::UnsupportedVersion => Stage::VersionGate,
             Self::ApiUnavailable | Self::IncompatibleApi => Stage::ApiGate,
             Self::SseConnectFailed | Self::SseDisconnected | Self::UnknownEvent => Stage::Sse,
@@ -198,6 +206,7 @@ impl Reason {
 
     const fn accepts_source(self, source: Source) -> bool {
         match self {
+            Self::LaunchConfigurationRejected => matches!(source, Source::ProcessExit),
             Self::VersionProbeFailed | Self::UnsupportedVersion => {
                 matches!(source, Source::VersionProbe)
             }
@@ -217,7 +226,10 @@ impl Reason {
                 matches!(source, Source::QuestionSnapshot)
             }
             Self::MissingAskId => {
-                matches!(source, Source::PermissionSnapshot | Source::QuestionSnapshot)
+                matches!(
+                    source,
+                    Source::PermissionSnapshot | Source::QuestionSnapshot
+                )
             }
             Self::ProviderAuthRejected => matches!(source, Source::TurnResult),
             Self::DeliveryUnavailable | Self::DeliveryRejected => {
@@ -234,6 +246,7 @@ impl Reason {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum Source {
+    ProcessExit,
     VersionProbe,
     OpenApiDocument,
     EventStream,
@@ -248,7 +261,8 @@ pub enum Source {
 }
 
 impl Source {
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 10] = [
+        Self::ProcessExit,
         Self::VersionProbe,
         Self::OpenApiDocument,
         Self::EventStream,
@@ -262,6 +276,7 @@ impl Source {
 
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::ProcessExit => "processExit",
             Self::VersionProbe => "versionProbe",
             Self::OpenApiDocument => "openApiDocument",
             Self::EventStream => "eventStream",
@@ -380,17 +395,28 @@ pub fn repair_text(observed: &Observed) -> &'static str {
             "correct the writer clock or restart the seat after clock recovery"
         }
         Observed::Failure(failure) => match failure.stage {
+            Stage::Launch => {
+                "repair the rejected declared launch arguments; the seat is running with a known-safe fallback"
+            }
             Stage::VersionGate => "install a supported producer version and restart the seat",
             Stage::ApiGate => "restore the producer API contract, then restart the seat",
             Stage::Sse => "restore the producer event stream; recovery clears this advisory",
-            Stage::Seed => "restore readable producer state snapshots; recovery clears this advisory",
+            Stage::Seed => {
+                "restore readable producer state snapshots; recovery clears this advisory"
+            }
             // The one boundary whose repair is neither an st2-side nor a producer-side restore:
             // nothing in the seat is broken, the account's credential was refused. The text stays
             // generic on purpose — which client owns which credential home is declared outside
             // st2, and no credential knowledge enters this crate (Q12).
-            Stage::ProviderAuth => "the seat's provider credential was rejected; re-login with the account's own client and unpark",
-            Stage::Delivery => "restore the native prompt transport; the queued message remains retryable",
-            Stage::ReadBack => "restore message read-back; st2 will reconcile without duplicating the prompt",
+            Stage::ProviderAuth => {
+                "the seat's provider credential was rejected; re-login with the account's own client and unpark"
+            }
+            Stage::Delivery => {
+                "restore the native prompt transport; the queued message remains retryable"
+            }
+            Stage::ReadBack => {
+                "restore message read-back; st2 will reconcile without duplicating the prompt"
+            }
             Stage::Unknown => "upgrade this st2 reader; an unknown stage is not healthy evidence",
         },
     }
@@ -473,7 +499,7 @@ pub struct Publisher {
     driver: Driver,
     producer_version: Option<String>,
     support: Support,
-    failures: [Option<Record>; 7],
+    failures: [Option<Record>; 8],
 }
 
 impl Publisher {
@@ -529,8 +555,23 @@ impl Publisher {
             recovery: RECOVERY.to_string(),
         };
         self.failures[index] = Some(record);
-        crate::metrics::record_driver_diagnostic(self.driver, stage, reason, source, self.support, false);
-        emit(self.driver, stage, reason, source, self.support, "failure", self.producer_version.as_deref());
+        crate::metrics::record_driver_diagnostic(
+            self.driver,
+            stage,
+            reason,
+            source,
+            self.support,
+            false,
+        );
+        emit(
+            self.driver,
+            stage,
+            reason,
+            source,
+            self.support,
+            "failure",
+            self.producer_version.as_deref(),
+        );
         self.persist();
     }
 
@@ -719,6 +760,33 @@ mod tests {
     }
 
     #[test]
+    fn degraded_launch_is_visible_until_an_exact_launch_clears_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut publisher = Publisher::new(
+            tmp.path(),
+            Driver::Codex,
+            Some("0.156.0".into()),
+            Support::Supported,
+        );
+        publisher.publish(
+            Stage::Launch,
+            Reason::LaunchConfigurationRejected,
+            Source::ProcessExit,
+        );
+
+        let Observed::Failure(failure) = read(&path(tmp.path())) else {
+            panic!("degraded launch did not publish a visible diagnostic")
+        };
+        assert_eq!(failure.stage, Stage::Launch);
+        assert_eq!(failure.reason, Reason::LaunchConfigurationRejected);
+        assert_eq!(failure.source, Source::ProcessExit);
+        assert!(repair_text(&Observed::Failure(failure)).contains("known-safe fallback"));
+
+        publisher.clear(Stage::Launch);
+        assert_eq!(read(&path(tmp.path())), Observed::Absent);
+    }
+
+    #[test]
     fn additive_fields_decode_but_malformed_foreign_and_unknown_records_are_indeterminate() {
         let valid = br#"{
           "schema":"st2.driver-diagnostic.v1","driver":"opencode","stage":"seed",
@@ -731,9 +799,15 @@ mod tests {
         };
         assert_eq!(failure.evidence_age_ms, 25);
         assert_eq!(failure.stage, Stage::Seed);
-        assert_eq!(read_at(b"not json", 0), Observed::Indeterminate(InvalidReason::MalformedRecord));
         assert_eq!(
-            read_at(&valid.replace(b"st2.driver-diagnostic.v1", b"st2.driver-diagnostic.v9"), 0),
+            read_at(b"not json", 0),
+            Observed::Indeterminate(InvalidReason::MalformedRecord)
+        );
+        assert_eq!(
+            read_at(
+                &valid.replace(b"st2.driver-diagnostic.v1", b"st2.driver-diagnostic.v9"),
+                0
+            ),
             Observed::Indeterminate(InvalidReason::UnsupportedSchema)
         );
         assert_eq!(
@@ -818,18 +892,35 @@ mod tests {
             Some("codex-cli 0.153.0".to_string()),
             Support::Supported,
         );
-        publisher.publish(Stage::ReadBack, Reason::ReadBackUnavailable, Source::MessageReadBack);
-        publisher.publish(Stage::Delivery, Reason::DeliveryUnavailable, Source::PromptTransport);
-        publisher.publish(Stage::ProviderAuth, Reason::ProviderAuthRejected, Source::TurnResult);
+        publisher.publish(
+            Stage::ReadBack,
+            Reason::ReadBackUnavailable,
+            Source::MessageReadBack,
+        );
+        publisher.publish(
+            Stage::Delivery,
+            Reason::DeliveryUnavailable,
+            Source::PromptTransport,
+        );
+        publisher.publish(
+            Stage::ProviderAuth,
+            Reason::ProviderAuthRejected,
+            Source::TurnResult,
+        );
         let Observed::Failure(failure) = read(&path(tmp.path())) else {
             panic!("the credential boundary must be the projected failure")
         };
         assert_eq!(failure.stage, Stage::ProviderAuth);
         assert_eq!(failure.driver, Driver::Codex);
-        assert_eq!(failure.producer_version.as_deref(), Some("codex-cli 0.153.0"));
+        assert_eq!(
+            failure.producer_version.as_deref(),
+            Some("codex-cli 0.153.0")
+        );
 
         publisher.publish(Stage::Sse, Reason::SseDisconnected, Source::EventStream);
-        let Observed::Failure(failure) = read(&path(tmp.path())) else { panic!() };
+        let Observed::Failure(failure) = read(&path(tmp.path())) else {
+            panic!()
+        };
         assert_eq!(
             failure.stage,
             Stage::Sse,
@@ -837,11 +928,15 @@ mod tests {
         );
 
         publisher.clear(Stage::Sse);
-        let Observed::Failure(failure) = read(&path(tmp.path())) else { panic!() };
+        let Observed::Failure(failure) = read(&path(tmp.path())) else {
+            panic!()
+        };
         assert_eq!(failure.stage, Stage::ProviderAuth);
 
         publisher.clear(Stage::ProviderAuth);
-        let Observed::Failure(failure) = read(&path(tmp.path())) else { panic!() };
+        let Observed::Failure(failure) = read(&path(tmp.path())) else {
+            panic!()
+        };
         assert_eq!(
             failure.stage,
             Stage::Delivery,
@@ -860,12 +955,20 @@ mod tests {
         );
         publisher.publish(Stage::ReadBack, Reason::NotDurable, Source::MessageReadBack);
         publisher.publish(Stage::Sse, Reason::SseDisconnected, Source::EventStream);
-        let Observed::Failure(failure) = read(&path(tmp.path())) else { panic!() };
+        let Observed::Failure(failure) = read(&path(tmp.path())) else {
+            panic!()
+        };
         assert_eq!(failure.stage, Stage::Sse, "earliest boundary wins");
 
         publisher.clear(Stage::ReadBack);
-        let Observed::Failure(failure) = read(&path(tmp.path())) else { panic!() };
-        assert_eq!(failure.stage, Stage::Sse, "unrelated recovery cannot clear SSE");
+        let Observed::Failure(failure) = read(&path(tmp.path())) else {
+            panic!()
+        };
+        assert_eq!(
+            failure.stage,
+            Stage::Sse,
+            "unrelated recovery cannot clear SSE"
+        );
 
         publisher.clear(Stage::Sse);
         assert_eq!(read(&path(tmp.path())), Observed::Absent);
@@ -894,7 +997,10 @@ mod tests {
 
     impl ReplaceBytes for [u8] {
         fn replace(&self, from: &[u8], to: &[u8]) -> Vec<u8> {
-            let at = self.windows(from.len()).position(|window| window == from).unwrap();
+            let at = self
+                .windows(from.len())
+                .position(|window| window == from)
+                .unwrap();
             let mut out = Vec::with_capacity(self.len() - from.len() + to.len());
             out.extend_from_slice(&self[..at]);
             out.extend_from_slice(to);
@@ -955,10 +1061,14 @@ mod tests {
             .unwrap()
             .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
             .filter(|name| {
-                name.starts_with(".driver-diagnostic.tmp-") && name != ".driver-diagnostic.tmp-planted"
+                name.starts_with(".driver-diagnostic.tmp-")
+                    && name != ".driver-diagnostic.tmp-planted"
             })
             .collect::<Vec<_>>();
-        assert!(residue.is_empty(), "staging residue left behind: {residue:?}");
+        assert!(
+            residue.is_empty(),
+            "staging residue left behind: {residue:?}"
+        );
     }
 
     /// The directory sync is strict since the fold onto `fsatomic`: a parent that cannot be opened

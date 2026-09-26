@@ -6,8 +6,7 @@ fn raw_string_start(line: &str) -> Option<(usize, usize)> {
     let bytes = line.as_bytes();
     for index in 0..bytes.len() {
         if index > 0
-            && (bytes[index - 1].is_ascii_alphanumeric()
-                || matches!(bytes[index - 1], b'_' | b'"'))
+            && (bytes[index - 1].is_ascii_alphanumeric() || matches!(bytes[index - 1], b'_' | b'"'))
         {
             continue;
         }
@@ -29,9 +28,9 @@ fn raw_string_start(line: &str) -> Option<(usize, usize)> {
 }
 
 fn raw_string_closes(line: &str, hashes: usize) -> bool {
-    line.as_bytes().windows(hashes + 1).any(|window| {
-        window.first() == Some(&b'"') && window[1..].iter().all(|byte| *byte == b'#')
-    })
+    line.as_bytes()
+        .windows(hashes + 1)
+        .any(|window| window.first() == Some(&b'"') && window[1..].iter().all(|byte| *byte == b'#'))
 }
 
 fn declared_tests(source: &str) -> BTreeSet<String> {
