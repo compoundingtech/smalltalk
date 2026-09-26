@@ -109,6 +109,11 @@ canary uses Claude Code's `opus` alias and records the concrete model selected b
 
 Model agents must use a native `harness` block. A setup or fixture process can use `command`.
 
+An eval can keep seat variants in `variants/`. A variant is a complete eval KDL that changes only the
+seat under test, so one fixture can compare harnesses. The omp readiness runs use omp on
+`openai-codex/gpt-5.6-luna`, Codex `gpt-6-luna`, and Claude `claude-sonnet-5` variants of
+cross-harness message wake, work wake reliability, seat mission work, and restart continuity.
+
 Codex `gpt-5.6-sol` is the default model judge.
 
 An eval can use a Claude judge for a specific reason. Record the choice in this inventory and the run report.
