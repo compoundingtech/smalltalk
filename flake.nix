@@ -284,10 +284,12 @@
             pkgs.git
             pkgs.installShellFiles
           ];
-          # The daemon survival suite exercises the packaged PTY boundary.
+          # The daemon survival suite exercises the packaged PTY boundary. The client code
+          # generator formats the Rust client it checks with rustfmt.
           nativeCheckInputs = [
             pkgs.bashInteractive
             pkgs.jq
+            pkgs.rustfmt
             pkgs.which
             pty.packages.${system}.default
           ];
