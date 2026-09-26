@@ -184,6 +184,10 @@ st3 conversations thread --help
 st3 conversations timeline --help
 ```
 
+`conversations ls --as MAILBOX` is the same as the positional mailbox, matching `read --as`. A
+harness process with `ST_AGENT` can read, archive, send, reply, claim, and act on work only as that
+agent; a different `agent/...` actor is refused.
+
 Use a returned message ID for `read`/`thread` and a returned session ID for `timeline`. Inspect the
 write paths:
 
