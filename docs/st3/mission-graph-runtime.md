@@ -560,6 +560,11 @@ A step product is intermediate output for that step. A mission product is a fina
 
 The worker creates or observes products. st3 verifies them. The `produces` keyword does not perform the action.
 
+A worker-submitted step stays `verifying` until its products hold. Once the submitting worker's
+turn has ended, st3 sends that worker one message per step attempt. The message names the exact
+product subject and fields the step waits for, so a worker that recorded the wrong subject can
+correct it.
+
 A mission product can refer to output created during any step. Do not duplicate a step product at mission level unless the same graph subject is intentionally both an intermediate and final contract.
 
 ## Gates
@@ -835,6 +840,10 @@ The exact built-in names are reserved in authored `env` maps. st3 rejects an att
 An agent receives its own subject in both `ST3_SUBJECT` and `ST_AGENT`. A nested task receives its task subject in `ST3_SUBJECT` and its parent agent in `ST_AGENT`.
 
 An agentless `exec` or `terminal` receives `ST3_SUBJECT` and no `ST_AGENT`.
+
+A CLI process with `ST_AGENT` acts only as that agent. Work actions, conversation read, archive,
+send, and reply, and `claim --actor` refuse a different `agent/...` actor. They still accept a
+person, exec, or other non-agent actor that the work names.
 
 An unknown variable or a variable that is not available in the current phase is an error.
 
