@@ -1,0 +1,87 @@
+#!/usr/bin/env python3
+"""Check that traffic.py keeps each seat on a fixed one-second schedule.
+
+Usage: traffic-test [TRAFFIC_PY]
+
+One seat driver runs for an hour of fake time in which every sleep returns
+0.8 ms late, every request takes 3 ms, and one request stalls for 2.5 s. Each
+mailbox read must still go within 2 ms of its slot, missed slots must be
+skipped rather than sent in a burst, and the status and work reads must still
+go once a minute.
+"""
+
+import importlib.util
+import os
+import sys
+
+LATE = 0.0008
+FIRST = 0.25
+
+
+class FakeTime:
+    def __init__(self):
+        self.now = 0.0
+
+    def monotonic(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.now += max(0.0, seconds) + LATE
+
+
+def main():
+    sys.dont_write_bytecode = True
+    path = sys.argv[1] if len(sys.argv) > 1 else os.path.join(os.path.dirname(os.path.abspath(__file__)), "traffic.py")
+    spec = importlib.util.spec_from_file_location("traffic", path)
+    traffic = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(traffic)
+
+    clock = FakeTime()
+    mailbox, minutes = [], []
+    stalled = False
+
+    def get(_connection, request):
+        nonlocal stalled
+        if "/v1/messages/page" in request:
+            mailbox.append(clock.now)
+        elif "/v1/status" in request:
+            minutes.append(clock.now)
+        clock.now += 0.003
+        if clock.now > 1800 and not stalled:
+            stalled = True
+            clock.now += 2.5
+        return 200
+
+    traffic.time = clock
+    traffic.get = get
+    traffic.UnixConnection = lambda _path: None
+    failures = []
+    # The seat's first read is due FIRST seconds after a start at zero.
+    traffic.drive("unused.sock", "agent/perf/seat-01", FIRST, 3600.0, failures)
+
+    problems = []
+    if failures:
+        problems.append(f"{len(failures)} failed requests")
+    # How far each read is from the nearest slot, in [-0.5, 0.5) seconds.
+    late = [(at - FIRST + 0.5) % 1.0 - 0.5 for at in mailbox]
+    worst = max(late, key=abs)
+    if not all(0 <= value < 0.002 for value in late):
+        problems.append(
+            f"mailbox reads drifted from their slots: {late[59] * 1000:.1f} ms after a minute, "
+            f"{abs(worst) * 1000:.0f} ms at worst"
+        )
+    gaps = [after - before for before, after in zip(mailbox, mailbox[1:])]
+    if min(gaps) < 0.5:
+        problems.append(f"two mailbox reads went {min(gaps) * 1000:.1f} ms apart")
+    if not 3595 <= len(mailbox) <= 3600:
+        problems.append(f"{len(mailbox)} mailbox reads in an hour")
+    if len(minutes) != 60:
+        problems.append(f"{len(minutes)} status reads in an hour")
+    if problems:
+        print("traffic schedule: " + "; ".join(problems), file=sys.stderr)
+        sys.exit(1)
+    print(f"traffic schedule: {len(mailbox)} reads, worst {worst * 1000:.2f} ms from the slot")
+
+
+if __name__ == "__main__":
+    main()

@@ -2578,19 +2578,23 @@ impl Store {
                 )
                 .map_err(internal)?;
             if let Some(old) = carried {
+                let mut fields = json!({
+                    "source_step_run": old.subject,
+                    "source_generation": predecessor_subject,
+                    "status": status,
+                    "attempt": attempt,
+                    "worker_reported": worker_reported
+                });
+                if let Some(claimant) = dropped_claimant(old, status) {
+                    fields["claimant"] = Value::String(claimant.into());
+                }
                 append_claim_tx(
                     &transaction,
                     &self.origin,
                     &subject,
                     "step-run.carried",
                     Some(&actor),
-                    &json!({"fields": {
-                        "source_step_run": old.subject,
-                        "source_generation": predecessor_subject,
-                        "status": status,
-                        "attempt": attempt,
-                        "worker_reported": worker_reported
-                    }}),
+                    &json!({"fields": fields}),
                     &[],
                     None,
                 )
@@ -3207,6 +3211,13 @@ impl Store {
             step_run_from_row,
         )?;
         let views = rows.collect::<Result<Vec<_>, _>>()?;
+        let carried_claimants = carried_claimants_tx(
+            &connection,
+            views
+                .iter()
+                .filter(|view| view.status == "ready" && view.assigned_to.is_some())
+                .map(|view| view.subject.as_str()),
+        )?;
         let mut visible = Vec::with_capacity(views.len());
         for mut view in views {
             if detailed {
@@ -3214,6 +3225,7 @@ impl Store {
             } else {
                 enrich_step_queue_for_reconcile_at(&connection, &mut view, snapshot_unix_ms)?;
             }
+            view.carried_claimant = carried_claimants.get(&view.subject).cloned();
             let run_phase: String = connection.query_row(
                 "SELECT phase FROM mission_runs WHERE id=?1",
                 [view.run.strip_prefix("mission-run/").unwrap_or(&view.run)],
@@ -10083,19 +10095,23 @@ fn adopt_declared_mission_revision_tx(
             )
             .map_err(internal)?;
         if let Some(old) = carried {
+            let mut fields = json!({
+                "source_step_run": old.subject,
+                "source_generation": predecessor_subject,
+                "status": status,
+                "attempt": attempt,
+                "worker_reported": worker_reported
+            });
+            if let Some(claimant) = dropped_claimant(old, status) {
+                fields["claimant"] = Value::String(claimant.into());
+            }
             let claim = append_claim_tx(
                 transaction,
                 origin,
                 &subject,
                 "step-run.carried",
                 Some(&actor),
-                &json!({"fields": {
-                    "source_step_run": old.subject,
-                    "source_generation": predecessor_subject,
-                    "status": status,
-                    "attempt": attempt,
-                    "worker_reported": worker_reported
-                }}),
+                &json!({"fields": fields}),
                 &[],
                 Some(batch_id),
             )
@@ -16232,6 +16248,7 @@ struct RosterStepRow {
     claimant: Option<String>,
     available_to: Vec<String>,
     created_at_unix_ms: u128,
+    carried_claimant: Option<String>,
 }
 
 impl RosterStepRow {
@@ -16245,6 +16262,7 @@ impl RosterStepRow {
             claimant: self.claimant.as_deref(),
             available_to: &self.available_to,
             created_at_unix_ms: self.created_at_unix_ms,
+            carried_claimant: self.carried_claimant.as_deref(),
         }
     }
 }
@@ -16261,7 +16279,7 @@ fn seat_step_rows_tx(connection: &Connection, agent: Option<&str>) -> Result<Vec
            AND generation_id=(SELECT current_generation_id FROM mission_runs WHERE id=step_runs.run_id)
          ORDER BY length(created_at_unix_ms), created_at_unix_ms, subject",
     )?;
-    let rows = statement
+    let mut rows = statement
         .query_map([agent], |row| {
             Ok(RosterStepRow {
                 subject: row.get(0)?,
@@ -16272,9 +16290,19 @@ fn seat_step_rows_tx(connection: &Connection, agent: Option<&str>) -> Result<Vec
                 claimant: row.get(5)?,
                 available_to: serde_json::from_str(&row.get::<_, String>(6)?).unwrap_or_default(),
                 created_at_unix_ms: row.get::<_, String>(7)?.parse().unwrap_or_default(),
+                carried_claimant: None,
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;
+    let carried_claimants = carried_claimants_tx(
+        connection,
+        rows.iter()
+            .filter(|row| row.status == "ready" && row.assignee.is_some())
+            .map(|row| row.subject.as_str()),
+    )?;
+    for row in &mut rows {
+        row.carried_claimant = carried_claimants.get(&row.subject).cloned();
+    }
     Ok(rows)
 }
 
@@ -16963,6 +16991,46 @@ fn flattened_step_definition_hashes(mission: &MissionSpec) -> BTreeMap<String, S
         .collect()
 }
 
+/// The seat whose claim the carried projection gives up: a claimed, working, or
+/// unreported verifying step becomes ready in the new generation.
+fn dropped_claimant<'a>(old: &'a StepRunView, status: &str) -> Option<&'a str> {
+    (status == "ready" && matches!(old.status.as_str(), "claimed" | "working" | "verifying"))
+        .then_some(old.claimant.as_deref())
+        .flatten()
+}
+
+/// For each named ready step, the seat whose claim a revision dropped when it
+/// carried the step, while that seat has not claimed it since. Its seat queue
+/// keeps the step first, as a reorder never takes a held step's place. The
+/// lookup starts from the named steps, so its cost follows current work rather
+/// than every carried step in history.
+fn carried_claimants_tx<'a>(
+    connection: &Connection,
+    ready: impl IntoIterator<Item = &'a str>,
+) -> Result<HashMap<String, String>> {
+    let ready = ready.into_iter().collect::<Vec<_>>();
+    if ready.is_empty() {
+        return Ok(HashMap::new());
+    }
+    Ok(connection
+        .prepare_cached(
+            "SELECT carried.subject, json_extract(carried.body, '$.fields.claimant')
+             FROM json_each(?1) AS ready
+             CROSS JOIN claims AS carried
+               ON carried.subject=ready.value AND carried.kind='step-run.carried'
+             WHERE json_extract(carried.body, '$.fields.claimant') IS NOT NULL
+               AND NOT EXISTS (
+                   SELECT 1 FROM claims AS later
+                   WHERE later.subject=carried.subject AND later.kind='work.claimed'
+                     AND later.store_index>carried.store_index
+               )",
+        )?
+        .query_map([serde_json::to_string(&ready)?], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })?
+        .collect::<rusqlite::Result<_>>()?)
+}
+
 fn carried_step_projection(step: &StepRunView) -> (&str, bool) {
     match step.status.as_str() {
         "claimed" | "working" => ("ready", false),
@@ -17042,6 +17110,7 @@ fn step_run_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StepRunView> {
         claimant: row.get(12)?,
         claim_incarnation: row.get(13)?,
         claim_expires_at_unix_ms: lease.and_then(|value| value.parse().ok()),
+        carried_claimant: None,
         execution_started_at_unix_ms: None,
         execution_elapsed_ms: 0,
         timeout_ms: None,

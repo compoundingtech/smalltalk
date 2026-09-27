@@ -4,8 +4,13 @@
 Usage: traffic.py SOCKET SECONDS SEAT...
 
 For each seat, a driver reads its mailbox page every second. Once a minute it
-reads the seat's status and work list to renew held claims. The same schedule
-runs against both builds, so it adds the same load to each.
+reads the seat's status and work list to renew held claims. The seats start
+evenly spread over one second and keep those phases: each request goes at a
+fixed time from the start, so late wakeups do not add up and move seats into
+step with each other. Seats that send together make the daemon wake more, on
+any build. The same schedule runs against both builds, so it adds the same load
+to each. Set PERF_SEAT_SPREAD to a fraction of a second to spread the seats over
+less than one second; 0 sends every seat's read at the same moment.
 
 Set PERF_WRITES_PER_MINUTE to also publish that many harness timeline claims a
 minute, spread over the seats, as idle drivers occasionally do. Each write
@@ -14,6 +19,7 @@ wakes the reconciler.
 
 import http.client
 import json
+import math
 import os
 import socket
 import sys
@@ -39,16 +45,32 @@ def get(connection, path):
     return response.status
 
 
-def drive(path, seat, offset, deadline, failures):
+def ticks(first, period, clock, sleep):
+    """Yield slot numbers at first + slot * period, skipping slots already missed.
+
+    Each wait is measured from the start, not from the last wakeup, so the
+    phase does not drift however late each sleep returns.
+    """
+    slot = 0
+    while True:
+        delay = first + slot * period - clock()
+        if delay > 0:
+            sleep(delay)
+        yield slot
+        slot = max(slot + 1, math.floor((clock() - first) / period) + 1)
+
+
+def drive(path, seat, first, deadline, failures):
     connection = UnixConnection(path)
     quoted = urllib.parse.quote(seat, safe="")
-    time.sleep(offset)
-    tick = 0
-    while time.monotonic() < deadline:
-        started = time.monotonic()
+    minute = None
+    for tick in ticks(first, 1.0, time.monotonic, time.sleep):
+        if time.monotonic() >= deadline:
+            return
         try:
             statuses = [get(connection, f"/v1/messages/page?include_closed=false&limit=100&to={quoted}")]
-            if tick % 60 == 0:
+            if tick // 60 != minute:
+                minute = tick // 60
                 statuses.append(get(connection, f"/v1/status?subject={quoted}"))
                 statuses.append(get(connection, f"/v1/work?actor={quoted}"))
             if any(status >= 300 for status in statuses):
@@ -56,8 +78,6 @@ def drive(path, seat, offset, deadline, failures):
         except OSError as error:
             failures.append((seat, str(error)))
             connection = UnixConnection(path)
-        tick += 1
-        time.sleep(max(0.0, 1.0 - (time.monotonic() - started)))
 
 
 def write(path, seats, per_minute, deadline, failures):
@@ -106,10 +126,14 @@ def write(path, seats, per_minute, deadline, failures):
 
 def main():
     path, seconds, seats = sys.argv[1], float(sys.argv[2]), sys.argv[3:]
-    deadline = time.monotonic() + seconds
+    spread = float(os.environ.get("PERF_SEAT_SPREAD", "1"))
+    start = time.monotonic()
+    deadline = start + seconds
     failures = []
     threads = [
-        threading.Thread(target=drive, args=(path, seat, index / len(seats), deadline, failures))
+        threading.Thread(
+            target=drive, args=(path, seat, start + spread * index / len(seats), deadline, failures)
+        )
         for index, seat in enumerate(seats)
     ]
     writes = float(os.environ.get("PERF_WRITES_PER_MINUTE", "0"))

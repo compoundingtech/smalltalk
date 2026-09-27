@@ -1889,6 +1889,10 @@ pub struct StepRunView {
     pub claimant: Option<String>,
     pub claim_incarnation: Option<String>,
     pub claim_expires_at_unix_ms: Option<u128>,
+    /// The seat whose claim a revision dropped when it carried this ready step
+    /// into the current generation, until that seat claims it again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub carried_claimant: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub execution_started_at_unix_ms: Option<u128>,
     #[serde(default)]

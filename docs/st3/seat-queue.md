@@ -23,6 +23,11 @@ Now each seat has one ordered queue of mission runs:
   creation order, then subject.
 - A move never releases, reassigns, or interrupts a held step. It only changes which run is next
   once the seat is free.
+- A revision does not take a held step's place either. A revision carries a claimed step into the
+  new generation as a ready step with a new subject, so the seat must claim it again. Until it
+  does, that step is the seat's next work, ahead of any earlier run's ready step, and the seat is
+  woken for it. If the seat releases the step after claiming it again, the step waits its turn in
+  queue order like any other.
 - `work claim` refuses a ready step assigned to the seat when an earlier run in the queue has a
   ready step for the seat. The error, `seat-queue-order`, names that next work. Claims inside one
   run, nested steps reached through their parent, and `available-to` work are not refused.
@@ -144,6 +149,13 @@ is later, because the writer's clock ran ahead of the mover's, joins that run fi
 could only name a queued run. A move naming a run with no join, or an anchor that is not queued,
 is ignored.
 
+A revision that drops a seat's claim records the seat as `claimant` on the new step's
+`step-run.carried` claim. A ready step is first for that seat while no `work.claimed` claim on the
+step follows the carried claim. Each work read looks this up once for its ready steps, starting
+from those steps, so the cost follows current work rather than every carried step in history. On
+the performance fixture, all current work reads in 1.28 ms against 1.22 ms without the lookup,
+and one seat's work in 0.30 ms against 0.29 ms.
+
 The claims replicate like other agent claims, and the join times come from replicated run
 claims, so every replica computes the same order. Terminal runs are read only when a move names
 them. A run that never receives or anchors a move cannot change the relative order of the
@@ -165,6 +177,10 @@ others.
   - a claim from a later run fails with `seat-queue-order` and names the next work, and succeeds
     after a person moves that run to the top;
   - a claim passes over a head run that has no ready step;
+  - a revision of a later run whose step the seat holds, while an earlier run has ready work,
+    keeps the carried step first: it is the next work and the wake, the seat claims it again
+    without `seat-queue-order`, and the earlier run is next once it is done;
+  - a carried step the seat claims again and then releases waits its turn behind the earlier run;
   - history names who moved what, why, and when; a retried move is one record; and a replica
     rebuilds the same order and history;
   - moves must name queued runs and valid anchors.
