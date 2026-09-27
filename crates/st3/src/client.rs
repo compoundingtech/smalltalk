@@ -43,6 +43,116 @@ pub struct Client {
     http: reqwest::Client,
     deadlines: ClientDeadlines,
     person: Option<String>,
+    outage_wait: Duration,
+    announce_outage_wait: bool,
+}
+
+/// Where a request stood when the daemon went away.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OutagePhase {
+    /// The daemon accepted no connection, so nothing reached it.
+    Connect,
+    /// The daemon closed the connection before it answered, so the request may have applied.
+    Response,
+}
+
+/// The st3 daemon could not be reached, typically because it is restarting.
+///
+/// Every caller sees this one error for an outage, so the CLI, the native drivers, and the
+/// channels can say the same plain thing and decide how to wait. It never tells anyone to start
+/// the daemon: agents cannot do that, and during a deploy the service manager already is.
+#[derive(Clone, Debug)]
+pub struct DaemonUnreachable {
+    endpoint: String,
+    reason: String,
+    phase: OutagePhase,
+    waited: Option<Duration>,
+}
+
+impl DaemonUnreachable {
+    fn connect(endpoint: impl Into<String>, reason: impl Into<String>) -> Self {
+        Self {
+            endpoint: endpoint.into(),
+            reason: reason.into(),
+            phase: OutagePhase::Connect,
+            waited: None,
+        }
+    }
+
+    fn response(endpoint: impl Into<String>, reason: impl Into<String>) -> Self {
+        Self {
+            endpoint: endpoint.into(),
+            reason: reason.into(),
+            phase: OutagePhase::Response,
+            waited: None,
+        }
+    }
+
+    fn connect_io(endpoint: impl Into<String>, error: &std::io::Error) -> Self {
+        let reason = match error.kind() {
+            std::io::ErrorKind::NotFound => "its socket does not exist".to_owned(),
+            std::io::ErrorKind::ConnectionRefused => "connection refused".to_owned(),
+            _ => error.to_string(),
+        };
+        Self::connect(endpoint, reason)
+    }
+
+    fn after(mut self, waited: Duration) -> Self {
+        self.waited = Some(waited);
+        self
+    }
+
+    pub fn phase(&self) -> OutagePhase {
+        self.phase
+    }
+
+    pub fn endpoint(&self) -> &str {
+        &self.endpoint
+    }
+
+    /// A short present-tense summary without advice, for callers that say what they do next.
+    pub fn summary(&self) -> String {
+        match self.phase {
+            OutagePhase::Connect => format!(
+                "the st3 daemon at {} is not reachable ({}); it may be restarting",
+                self.endpoint, self.reason
+            ),
+            OutagePhase::Response => format!(
+                "the st3 daemon at {} closed the connection before it answered ({}); it may be restarting, and the request may or may not have been applied",
+                self.endpoint, self.reason
+            ),
+        }
+    }
+}
+
+impl fmt::Display for DaemonUnreachable {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Some(waited) = self.waited else {
+            return formatter.write_str(&self.summary());
+        };
+        let seconds = waited.as_secs_f64().round() as u64;
+        match self.phase {
+            OutagePhase::Connect => write!(
+                formatter,
+                "the st3 daemon at {} was not reachable for {seconds}s ({}); it may be restarting or stopped. Nothing was sent; run the command again once the daemon is back",
+                self.endpoint, self.reason
+            ),
+            OutagePhase::Response => write!(
+                formatter,
+                "the st3 daemon at {} stopped answering for {seconds}s ({}); it may be restarting or stopped. The last request may or may not have been applied; check its result once the daemon is back",
+                self.endpoint, self.reason
+            ),
+        }
+    }
+}
+
+impl std::error::Error for DaemonUnreachable {}
+
+/// The daemon outage in this error's chain, if any.
+pub fn daemon_unreachable(error: &anyhow::Error) -> Option<&DaemonUnreachable> {
+    error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<DaemonUnreachable>())
 }
 
 #[derive(Clone, Copy)]
@@ -77,7 +187,18 @@ impl Client {
                 .expect("the st3 HTTP client configuration is valid"),
             deadlines,
             person: None,
+            outage_wait: Duration::ZERO,
+            announce_outage_wait: false,
         }
+    }
+
+    /// Keep retrying for up to `wait` while the daemon is unreachable. Only requests that are
+    /// safe to repeat are retried: any request that never reached the daemon, and reads.
+    /// With `announce`, one line on stderr says what is happening while it waits.
+    pub fn with_outage_wait(mut self, wait: Duration, announce: bool) -> Self {
+        self.outage_wait = wait;
+        self.announce_outage_wait = announce;
+        self
     }
 
     pub fn unix(path: impl Into<PathBuf>) -> Self {
@@ -133,6 +254,39 @@ impl Client {
             .map(serde_json::to_vec)
             .transpose()?
             .unwrap_or_default();
+        let started = tokio::time::Instant::now();
+        let mut pause = Duration::from_millis(100);
+        let mut announced = false;
+        loop {
+            let error = match self.request_once(method, path, &bytes).await {
+                Ok(response) => return decode_api_response(&response),
+                Err(error) => error,
+            };
+            let Some(outage) = daemon_unreachable(&error) else {
+                return Err(error);
+            };
+            let repeatable = outage.phase() == OutagePhase::Connect || method == "GET";
+            let waited = started.elapsed();
+            if !repeatable || self.outage_wait.is_zero() {
+                return Err(error);
+            }
+            if waited >= self.outage_wait {
+                return Err(outage.clone().after(waited).into());
+            }
+            if self.announce_outage_wait && !announced {
+                eprintln!(
+                    "st3: {}; retrying for up to {}s",
+                    outage.summary(),
+                    self.outage_wait.as_secs()
+                );
+                announced = true;
+            }
+            tokio::time::sleep(pause.min(self.outage_wait - waited)).await;
+            pause = (pause * 2).min(Duration::from_secs(1));
+        }
+    }
+
+    async fn request_once(&self, method: &str, path: &str, bytes: &[u8]) -> Result<Vec<u8>> {
         let deadline = request_deadline(path, self.deadlines);
         let response = match &self.endpoint {
             Endpoint::Unix(socket) => {
@@ -140,7 +294,7 @@ impl Client {
                     socket,
                     method,
                     path,
-                    &bytes,
+                    bytes,
                     self.deadlines.connect,
                     deadline,
                     self.person.as_deref(),
@@ -152,7 +306,7 @@ impl Client {
                 let url = format!("{base}{path}");
                 let mut request = match method {
                     "GET" => self.http.get(&url),
-                    "POST" => self.http.post(&url).body(bytes),
+                    "POST" => self.http.post(&url).body(bytes.to_vec()),
                     other => anyhow::bail!("unsupported HTTP method {other}"),
                 }
                 .header("content-type", "application/json")
@@ -164,7 +318,7 @@ impl Client {
                 let response = tokio::time::timeout(deadline, request.send())
                     .await
                     .map_err(|_| deadline_error(&endpoint, "request", deadline))?
-                    .with_context(|| format!("connect to the st3 API endpoint {endpoint}"))?;
+                    .map_err(|error| http_send_error(base, &endpoint, error))?;
                 let status = response.status();
                 let remaining = deadline.saturating_sub(started.elapsed());
                 let bytes = tokio::time::timeout(remaining, response.bytes())
@@ -177,7 +331,7 @@ impl Client {
                 bytes
             }
         };
-        decode_api_response(&response)
+        Ok(response)
     }
 
     pub async fn proxy_terminal(&self, name: &str, path: &str) -> Result<i32> {
@@ -210,7 +364,9 @@ impl Client {
         let initial = self
             .open_terminal_bridge(&attachment.websocket_path)
             .await?;
-        let client = self.clone();
+        // The attach loop already retries while the gateway restarts. One reconnect must neither
+        // wait for the daemon nor print into the attached screen.
+        let client = self.clone().with_outage_wait(Duration::ZERO, false);
         let subject = subject.to_owned();
         let name = attachment.runtime_id.clone();
         let handle = tokio::runtime::Handle::current();
@@ -250,8 +406,8 @@ impl Client {
                     tokio::net::UnixStream::connect(socket),
                 )
                 .await
-                .map_err(|_| deadline_error(&endpoint, "connect", self.deadlines.connect))?
-                .with_context(|| format!("connect to the st3 API at {endpoint}"))?;
+                .map_err(|_| connect_deadline_error(&endpoint, self.deadlines.connect))?
+                .map_err(|error| DaemonUnreachable::connect_io(&endpoint, &error))?;
                 let request = terminal_request(&format!("ws://localhost{path}"))?;
                 let (websocket, _) = tokio::time::timeout(
                     self.deadlines.terminal_handshake,
@@ -476,13 +632,8 @@ async fn unix_request(
         tokio::net::UnixStream::connect(socket),
     )
     .await
-    .map_err(|_| deadline_error(&endpoint, "connect", connect_deadline))?
-    .with_context(|| {
-        format!(
-            "connect to the st3 API at {}; run `st3 up` first",
-            socket.display()
-        )
-    })?;
+    .map_err(|_| connect_deadline_error(&endpoint, connect_deadline))?
+    .map_err(|error| DaemonUnreachable::connect_io(&endpoint, &error))?;
     let remaining = deadline.saturating_sub(started.elapsed());
     let response = tokio::time::timeout(remaining, async {
         let person_header = person
@@ -503,7 +654,20 @@ async fn unix_request(
         Ok::<_, std::io::Error>(response)
     })
     .await
-    .map_err(|_| deadline_error(&endpoint, "request and response", deadline))??;
+    .map_err(|_| deadline_error(&endpoint, "request and response", deadline))?
+    .map_err(|error| match error.kind() {
+        std::io::ErrorKind::ConnectionReset
+        | std::io::ErrorKind::ConnectionAborted
+        | std::io::ErrorKind::BrokenPipe
+        | std::io::ErrorKind::UnexpectedEof => {
+            anyhow::Error::from(DaemonUnreachable::response(&endpoint, error.to_string()))
+        }
+        _ => anyhow::Error::from(error),
+    })?;
+    // A daemon that exits between accepting and answering closes the socket without a byte.
+    if response.is_empty() {
+        return Err(DaemonUnreachable::response(&endpoint, "no response").into());
+    }
     let header_end = response
         .windows(4)
         .position(|window| window == b"\r\n\r\n")
@@ -551,6 +715,37 @@ fn request_deadline(path: &str, deadlines: ClientDeadlines) -> Duration {
     } else {
         deadlines.request
     }
+}
+
+/// A connect that times out never delivered the request, so it is an outage, not a slow answer.
+fn connect_deadline_error(endpoint: &str, deadline: Duration) -> anyhow::Error {
+    DaemonUnreachable::connect(
+        endpoint,
+        format!(
+            "it accepted no connection within {} ms",
+            deadline.as_millis()
+        ),
+    )
+    .into()
+}
+
+fn http_send_error(base: &str, url: &str, error: reqwest::Error) -> anyhow::Error {
+    if error.is_connect() {
+        let reason = std::error::Error::source(&error)
+            .and_then(|source| {
+                let mut cause = Some(source);
+                while let Some(current) = cause {
+                    if let Some(io) = current.downcast_ref::<std::io::Error>() {
+                        return Some(DaemonUnreachable::connect_io(base, io).reason);
+                    }
+                    cause = current.source();
+                }
+                None
+            })
+            .unwrap_or_else(|| error.to_string());
+        return DaemonUnreachable::connect(base, reason).into();
+    }
+    anyhow::Error::from(error).context(format!("send the request to the st3 API at {url}"))
 }
 
 fn deadline_error(endpoint: &str, phase: &str, deadline: Duration) -> anyhow::Error {
@@ -746,6 +941,8 @@ mod tests {
                 .unwrap(),
             deadlines,
             person: None,
+            outage_wait: Duration::ZERO,
+            announce_outage_wait: false,
         }
     }
 
@@ -782,6 +979,120 @@ mod tests {
             .to_string();
         assert!(error.contains("request and response"));
         assert!(error.contains("retry the command"));
+        server.abort();
+    }
+
+    fn assert_plain_outage(error: &anyhow::Error, phase: OutagePhase) {
+        let outage = daemon_unreachable(error).expect("the error is a daemon outage");
+        assert_eq!(outage.phase(), phase);
+        let message = format!("{error:#}");
+        assert!(message.contains("st3 daemon"), "{message}");
+        assert!(message.contains("restarting"), "{message}");
+        assert!(!message.contains("st3 up"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn an_absent_or_refusing_daemon_is_one_plain_outage() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("st3.sock");
+        let absent = Client::unix(&socket)
+            .get::<Value>("/v1/status")
+            .await
+            .unwrap_err();
+        assert_plain_outage(&absent, OutagePhase::Connect);
+        assert!(format!("{absent:#}").contains("socket does not exist"));
+
+        // A daemon that exited leaves its socket file behind until the next one binds it.
+        drop(std::os::unix::net::UnixListener::bind(&socket).unwrap());
+        let refused = Client::unix(&socket)
+            .post::<_, Value>("/v1/claims", &json!({}))
+            .await
+            .unwrap_err();
+        assert_plain_outage(&refused, OutagePhase::Connect);
+        assert!(format!("{refused:#}").contains("connection refused"));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let http = fast_client(Endpoint::Http(format!("http://{address}")))
+            .get::<Value>("/v1/status")
+            .await
+            .unwrap_err();
+        assert_plain_outage(&http, OutagePhase::Connect);
+    }
+
+    #[tokio::test]
+    async fn a_request_waits_out_a_daemon_restart() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("st3.sock");
+        drop(std::os::unix::net::UnixListener::bind(&socket).unwrap());
+        let server_socket = socket.clone();
+        let server = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(400)).await;
+            let _ = std::fs::remove_file(&server_socket);
+            crate::api::serve_unix(&server_socket, test_api())
+                .await
+                .unwrap();
+        });
+        let client = Client::unix(&socket).with_outage_wait(Duration::from_secs(10), false);
+        let post: Value = client
+            .post("/v1/test", &json!({"method": "post"}))
+            .await
+            .unwrap();
+        assert_eq!(post, json!({"method": "post"}));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn an_outage_wait_ends_by_saying_how_long_it_waited_and_that_nothing_was_sent() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("st3.sock");
+        let started = tokio::time::Instant::now();
+        let error = Client::unix(&socket)
+            .with_outage_wait(Duration::from_millis(300), false)
+            .post::<_, Value>("/v1/claims", &json!({}))
+            .await
+            .unwrap_err();
+        assert!(started.elapsed() >= Duration::from_millis(300));
+        assert_plain_outage(&error, OutagePhase::Connect);
+        let message = format!("{error:#}");
+        assert!(message.contains("was not reachable for 0s"), "{message}");
+        assert!(message.contains("Nothing was sent"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn a_request_the_daemon_dropped_is_repeated_only_when_it_is_a_read() {
+        use tokio::io::AsyncReadExt as _;
+
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("st3.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let server_accepted = accepted.clone();
+        // Every connection is read and then closed without an answer, as by a daemon that exits.
+        let server = tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                server_accepted.fetch_add(1, Ordering::SeqCst);
+                let mut request = [0_u8; 4096];
+                let _ = stream.read(&mut request).await;
+            }
+        });
+        let client = Client::unix(&socket).with_outage_wait(Duration::from_millis(500), false);
+        let post = client
+            .post::<_, Value>("/v1/claims", &json!({}))
+            .await
+            .unwrap_err();
+        assert_plain_outage(&post, OutagePhase::Response);
+        assert_eq!(accepted.load(Ordering::SeqCst), 1, "a POST was repeated");
+
+        let get = client.get::<Value>("/v1/status").await.unwrap_err();
+        assert_plain_outage(&get, OutagePhase::Response);
+        assert!(format!("{get:#}").contains("may or may not have been applied"));
+        assert!(
+            accepted.load(Ordering::SeqCst) > 2,
+            "a GET was not repeated"
+        );
         server.abort();
     }
 

@@ -68,9 +68,23 @@ struct Cli {
     catalog: Option<PathBuf>,
     #[arg(long, global = true)]
     json: bool,
+    /// Keep retrying for this many seconds while the st3 daemon is unreachable, for example while
+    /// it restarts during a deploy. 0 fails at once.
+    #[arg(
+        long,
+        global = true,
+        env = "ST3_DAEMON_WAIT",
+        value_name = "SECONDS",
+        default_value_t = DEFAULT_DAEMON_WAIT_SECS
+    )]
+    daemon_wait: u64,
     #[command(subcommand)]
     command: Command,
 }
+
+/// A deploy restarts the daemon in seconds; a CLI call made meanwhile waits it out instead of
+/// failing an agent's step.
+const DEFAULT_DAEMON_WAIT_SECS: u64 = 30;
 
 #[derive(Subcommand)]
 enum Command {
@@ -1394,8 +1408,7 @@ async fn main() -> ExitCode {
             }
             eprintln!("st3: {error:#}");
             let message = error.to_string();
-            if message.contains("run `st3 up` first") || message.contains("connect to the st3 API")
-            {
+            if daemon_is_unreachable(&error) {
                 ExitCode::from(5)
             } else if message.contains("stale-subject") {
                 ExitCode::from(3)
@@ -1408,6 +1421,25 @@ async fn main() -> ExitCode {
             }
         }
     }
+}
+
+static DAEMON_WAIT: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+
+/// A command client that waits out a daemon restart for the `--daemon-wait` window.
+fn cli_client(endpoint: &Endpoint) -> Client {
+    Client::new(endpoint.clone())
+        .with_outage_wait(DAEMON_WAIT.get().copied().unwrap_or_default(), true)
+}
+
+/// Exit status 5 means the daemon was unreachable, whichever client made the request.
+fn daemon_is_unreachable(error: &anyhow::Error) -> bool {
+    st3::client::daemon_unreachable(error).is_some()
+        || error.chain().any(|cause| {
+            matches!(
+                cause.downcast_ref::<GeneratedClientError>(),
+                Some(GeneratedClientError::Unreachable(_))
+            )
+        })
 }
 
 async fn run(cli: Cli) -> Result<()> {
@@ -1446,7 +1478,10 @@ async fn run(cli: Cli) -> Result<()> {
         .as_deref()
         .map(Endpoint::parse)
         .unwrap_or_else(|| Endpoint::Unix(config.socket.clone()));
-    let client = Client::new(endpoint.clone());
+    let _ = DAEMON_WAIT.set(Duration::from_secs(cli.daemon_wait));
+    let client = cli_client(&endpoint);
+    // Drivers outlive daemon restarts and handle an outage in their own loops; doctor reports one.
+    let immediate = Client::new(endpoint.clone());
     match cli.command {
         Command::Up(_) => unreachable!(),
         Command::ReplicationWorker(_) => unreachable!(),
@@ -1496,7 +1531,7 @@ async fn run(cli: Cli) -> Result<()> {
             )
             .await
         }
-        Command::Doctor(args) => run_doctor(&client, args, cli.json).await,
+        Command::Doctor(args) => run_doctor(&immediate, args, cli.json).await,
         Command::Repair { command } => run_repair(&client, command, cli.json).await,
         Command::Replication { command } => run_replication(&client, command, cli.json).await,
         Command::Service { command } => run_service(command, cli.json),
@@ -1517,7 +1552,7 @@ async fn run(cli: Cli) -> Result<()> {
             clap_complete::generate(shell, &mut Cli::command(), "st3", &mut std::io::stdout());
             Ok(())
         }
-        Command::Driver(args) => run_driver(&client, args, cli.catalog.as_deref()).await,
+        Command::Driver(args) => run_driver(&immediate, args, cli.catalog.as_deref()).await,
     }
 }
 
@@ -2865,10 +2900,12 @@ fn generated_client(endpoint: &Endpoint, person: Option<&str>) -> Result<Generat
             "client-v0 product commands require the trusted local Unix endpoint; remote clients must use a paired Fabric credential"
         );
     };
-    Ok(person.map_or_else(
-        || GeneratedClient::unix(socket),
-        |person| GeneratedClient::unix_as(socket, person),
-    ))
+    Ok(person
+        .map_or_else(
+            || GeneratedClient::unix(socket),
+            |person| GeneratedClient::unix_as(socket, person),
+        )
+        .with_outage_wait(DAEMON_WAIT.get().copied().unwrap_or_default(), true))
 }
 
 async fn run_now(
@@ -4464,7 +4501,7 @@ async fn run_agents(
             run_agent_queue(endpoint, configured_person, args, json_output).await
         }
         AgentsCommand::Apply(args) => {
-            let client = Client::new(endpoint.clone());
+            let client = cli_client(endpoint);
             let (kdl, source_name) = read_intent(Some(&args.file))?;
             let response = publish_text(
                 &client,
@@ -4482,7 +4519,7 @@ async fn run_agents(
                 return Ok(());
             }
             let response = publish_text(
-                &Client::new(endpoint.clone()),
+                &cli_client(endpoint),
                 kdl,
                 format!("st3 agents start {}", args.identity),
                 args.actor,
@@ -4498,7 +4535,7 @@ async fn run_agents(
                 return Ok(());
             }
             let response = publish_text(
-                &Client::new(endpoint.clone()),
+                &cli_client(endpoint),
                 kdl,
                 format!("st3 agents stop {subject}"),
                 args.actor,
@@ -4699,7 +4736,7 @@ async fn run_agent_queue(
     if actor.starts_with("agent/") {
         // Client-v0 actions carry person authority only. The daemon checks an agent's queue
         // authority on this route.
-        let claim: ClaimRecord = Client::new(endpoint.clone())
+        let claim: ClaimRecord = cli_client(endpoint)
             .post(
                 "/v1/agent-queue-moves",
                 &st3::model::SeatQueueMoveRequest {
@@ -5804,7 +5841,7 @@ fn current_local_pty_incarnation(actor: &str) -> Result<Option<String>> {
 }
 
 async fn wait_for_agent_incarnation(client: &Client, actor: &str) -> Result<String> {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    let mut deadline = tokio::time::Instant::now() + Duration::from_secs(15);
     let has_local_pty_registry =
         std::env::var_os("PTY_ROOT").is_some_and(|value| !value.is_empty());
     loop {
@@ -5816,8 +5853,16 @@ async fn wait_for_agent_incarnation(client: &Client, actor: &str) -> Result<Stri
             if let Some(incarnation) = current_local_pty_incarnation(actor)? {
                 return Ok(incarnation);
             }
-        } else if let Some(incarnation) = current_agent_incarnation(client, actor).await? {
-            return Ok(incarnation);
+        } else {
+            match current_agent_incarnation(client, actor).await {
+                Ok(Some(incarnation)) => return Ok(incarnation),
+                Ok(None) => {}
+                // A restarting daemon cannot answer yet; its outage does not use up the wait.
+                Err(error) if st3::client::daemon_unreachable(&error).is_some() => {
+                    deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+                }
+                Err(error) => return Err(error),
+            }
         }
         if tokio::time::Instant::now() >= deadline {
             anyhow::bail!(
@@ -6615,30 +6660,28 @@ async fn run_driver(client: &Client, args: DriverArgs, catalog: Option<&Path>) -
         use std::os::unix::process::ExitStatusExt as _;
         status.signal()
     };
-    let _: ClaimRecord = client
-        .post(
-            "/v1/claims",
-            &ClaimInput {
-                subject: subject.into(),
-                kind: "runtime.observed".into(),
-                actor: Some(subject.into()),
-                fields: BTreeMap::from([
-                    ("status".into(), Value::String("exited".into())),
-                    (
-                        "exit_code".into(),
-                        status.code().map(Value::from).unwrap_or(Value::Null),
-                    ),
-                    (
-                        "exit_signal".into(),
-                        signal.map(Value::from).unwrap_or(Value::Null),
-                    ),
-                ]),
-                evidence: Vec::new(),
-                expected_subject: None,
-                idempotency_key: None,
-            },
-        )
-        .await?;
+    let exit = ClaimInput {
+        subject: subject.into(),
+        kind: "runtime.observed".into(),
+        actor: Some(subject.into()),
+        fields: BTreeMap::from([
+            ("status".into(), Value::String("exited".into())),
+            (
+                "exit_code".into(),
+                status.code().map(Value::from).unwrap_or(Value::Null),
+            ),
+            (
+                "exit_signal".into(),
+                signal.map(Value::from).unwrap_or(Value::Null),
+            ),
+        ]),
+        evidence: Vec::new(),
+        expected_subject: None,
+        idempotency_key: None,
+    };
+    // A provider that exits while the daemon restarts still reports its own exit status.
+    let _: ClaimRecord =
+        retry_while_daemon_unreachable(subject, || client.post("/v1/claims", &exit)).await?;
     if args.driver == "exec" {
         let code = status
             .code()
@@ -6665,14 +6708,17 @@ async fn run_st2_native_driver(
     }
     let (catalog, agent_dir, identity, runtime_id) = prepare_native_driver(subject)?;
     let incarnation = wait_for_agent_incarnation(client, subject).await?;
-    publish_harness_state(
-        client,
-        subject,
-        driver,
-        "starting",
-        Some(&incarnation),
-        None,
-    )
+    // A driver launched while the daemon restarts waits for it; exiting here would end the seat.
+    retry_while_daemon_unreachable(subject, || {
+        publish_harness_state(
+            client,
+            subject,
+            driver,
+            "starting",
+            Some(&incarnation),
+            None,
+        )
+    })
     .await?;
     let harness_state_path = st2::harness_state::harness_state_path(&agent_dir);
     let predecessor_harness_record = fs::read(&harness_state_path).ok();
@@ -7418,9 +7464,10 @@ async fn run_pi_channel(client: &Client, subject: &str, driver: &str) -> Result<
     let incarnation = wait_for_agent_incarnation(client, subject).await?;
     let identity = subject.strip_prefix("agent/").unwrap_or(subject);
     let context_name = format!("doc/context/{identity}/now");
-    let context = latest_document_text(client, &context_name)
-        .await?
-        .unwrap_or_default();
+    let context =
+        retry_while_daemon_unreachable(subject, || latest_document_text(client, &context_name))
+            .await?
+            .unwrap_or_default();
     let ritual = pi_family_session_ritual(subject);
     let session_context = if context.trim().is_empty() {
         ritual
@@ -7456,6 +7503,10 @@ async fn run_pi_channel(client: &Client, subject: &str, driver: &str) -> Result<
     let mut renewed_minute = None;
     let mut frame_sequence = 0_u64;
     let session = std::env::var("ST2_PI_CHANNEL_SESSION").unwrap_or_else(|_| "unknown".into());
+    // Reports the daemon has not accepted yet. A restart must not end the channel or lose the
+    // harness's latest state, so each waits here and is sent again on the next tick.
+    let mut pending = PiFamilyReports::default();
+    let mut last_outage_warning = None;
     loop {
         tokio::select! {
             line = lines.next_line() => {
@@ -7470,67 +7521,129 @@ async fn run_pi_channel(client: &Client, subject: &str, driver: &str) -> Result<
                             _ => continue,
                         };
                         frame_sequence = frame_sequence.saturating_add(1);
-                        let _: ClaimRecord = client.post("/v1/claims", &ClaimInput {
-                            subject: subject.into(),
-                            kind: "harness.observed".into(),
-                            actor: Some(subject.into()),
-                            fields: BTreeMap::from([
-                                ("state".into(), Value::String(status.into())),
-                                ("driver".into(), Value::String(driver.into())),
-                                ("transport".into(), Value::String(format!("{driver}-channel"))),
-                                ("incarnation_id".into(), Value::String(incarnation.clone())),
-                            ]),
-                            evidence: Vec::new(),
-                            expected_subject: None,
-                            idempotency_key: Some(format!("pi-state:{subject}:{incarnation}:{session}:{frame_sequence}")),
-                        }).await?;
+                        pending.state = Some((status, frame_sequence));
                     }
                     Some("delivered") => {
                         let Some(message) = frame.pointer("/meta/messageId").and_then(Value::as_str) else { continue; };
-                        acknowledge_pi_family_delivery(client, subject, message).await?;
+                        pending.acknowledgements.insert(message.to_owned());
                     }
-                    _ => {}
+                    _ => continue,
+                }
+                if let Err(error) = pending
+                    .publish(client, subject, driver, &incarnation, &session)
+                    .await
+                {
+                    tolerate_driver_api_outage(subject, error, &mut last_outage_warning)?;
                 }
             }
             _ = interval.tick() => {
-                let mut cursor = None;
-                loop {
-                    let page = message_page(client, Some(subject), false, cursor.as_deref()).await?;
-                    for message in page.items.into_iter().filter(|message| matches!(message.status.as_str(), "sent" | "staged")) {
-                    if !delivered.insert(message.subject.clone()) {
-                        continue;
-                    }
-                    let body = message_content(client, &message).await?;
-                    let frame = pi_family_message_frame(&message, &body, identity);
-                    stdout.write_all(serde_json::to_string(&frame)?.as_bytes()).await?;
-                    stdout.write_all(b"\n").await?;
-                    stdout.flush().await?;
-                    if message.status == "sent" {
-                        stage_message(
-                            client,
-                            &message.subject,
-                            subject,
-                            &format!("{driver}-channel"),
-                            None,
-                            format!("native-staged:{driver}-channel:{subject}:{}", message.subject),
-                        )
+                let tick: Result<()> = async {
+                    pending
+                        .publish(client, subject, driver, &incarnation, &session)
                         .await?;
+                    let mut cursor = None;
+                    loop {
+                        let page = message_page(client, Some(subject), false, cursor.as_deref()).await?;
+                        for message in page.items.into_iter().filter(|message| matches!(message.status.as_str(), "sent" | "staged")) {
+                            // Record a handoff only once the frame is written, so an outage
+                            // between listing and writing cannot drop the message.
+                            if !delivered.contains(&message.subject) {
+                                let body = message_content(client, &message).await?;
+                                let frame = pi_family_message_frame(&message, &body, identity);
+                                stdout.write_all(serde_json::to_string(&frame)?.as_bytes()).await?;
+                                stdout.write_all(b"\n").await?;
+                                stdout.flush().await?;
+                                delivered.insert(message.subject.clone());
+                            }
+                            if message.status == "sent" {
+                                stage_message(
+                                    client,
+                                    &message.subject,
+                                    subject,
+                                    &format!("{driver}-channel"),
+                                    None,
+                                    format!("native-staged:{driver}-channel:{subject}:{}", message.subject),
+                                )
+                                .await?;
+                            }
+                        }
+                        match page.next_cursor {
+                            Some(next) => cursor = Some(next),
+                            None => break,
+                        }
                     }
-                    }
-                    match page.next_cursor {
-                        Some(next) => cursor = Some(next),
-                        None => break,
-                    }
+                    Ok(())
+                }.await;
+                if let Err(error) = tick {
+                    tolerate_driver_api_outage(subject, error, &mut last_outage_warning)?;
                 }
             }
             _ = work_interval.tick() => {
-                let minute = unix_minute()?;
-                if renewed_minute != Some(minute) {
-                    renew_claimed_work(client, subject, minute).await?;
-                    renewed_minute = Some(minute);
+                let tick: Result<()> = async {
+                    let minute = unix_minute()?;
+                    if renewed_minute != Some(minute) {
+                        renew_claimed_work(client, subject, minute).await?;
+                        renewed_minute = Some(minute);
+                    }
+                    Ok(())
+                }.await;
+                if let Err(error) = tick {
+                    tolerate_driver_api_outage(subject, error, &mut last_outage_warning)?;
                 }
             }
         }
+    }
+}
+
+/// Harness reports a pi-family channel owes the daemon.
+#[derive(Default)]
+struct PiFamilyReports {
+    /// Only the latest state matters; a newer frame replaces an unsent older one.
+    state: Option<(&'static str, u64)>,
+    acknowledgements: BTreeSet<String>,
+}
+
+impl PiFamilyReports {
+    async fn publish(
+        &mut self,
+        client: &Client,
+        subject: &str,
+        driver: &str,
+        incarnation: &str,
+        session: &str,
+    ) -> Result<()> {
+        if let Some((status, sequence)) = self.state {
+            let _: ClaimRecord = client
+                .post(
+                    "/v1/claims",
+                    &ClaimInput {
+                        subject: subject.into(),
+                        kind: "harness.observed".into(),
+                        actor: Some(subject.into()),
+                        fields: BTreeMap::from([
+                            ("state".into(), Value::String(status.into())),
+                            ("driver".into(), Value::String(driver.into())),
+                            (
+                                "transport".into(),
+                                Value::String(format!("{driver}-channel")),
+                            ),
+                            ("incarnation_id".into(), Value::String(incarnation.into())),
+                        ]),
+                        evidence: Vec::new(),
+                        expected_subject: None,
+                        idempotency_key: Some(format!(
+                            "pi-state:{subject}:{incarnation}:{session}:{sequence}"
+                        )),
+                    },
+                )
+                .await?;
+            self.state = None;
+        }
+        while let Some(message) = self.acknowledgements.first().cloned() {
+            acknowledge_pi_family_delivery(client, subject, &message).await?;
+            self.acknowledgements.remove(&message);
+        }
+        Ok(())
     }
 }
 
@@ -7894,27 +8007,28 @@ fn tolerate_driver_api_outage(
     error: anyhow::Error,
     last_warning: &mut Option<Instant>,
 ) -> Result<()> {
-    let transient = error.chain().any(|cause| {
-        let message = cause.to_string();
-        message.contains("connect to the st3 API")
-            || message.contains("incomplete HTTP response")
-            || message.contains("retry the command")
-            || cause
-                .downcast_ref::<serde_json::Error>()
-                .is_some_and(serde_json::Error::is_eof)
-            || cause.downcast_ref::<std::io::Error>().is_some_and(|error| {
-                matches!(
-                    error.kind(),
-                    std::io::ErrorKind::NotFound
-                        | std::io::ErrorKind::ConnectionRefused
-                        | std::io::ErrorKind::ConnectionReset
-                        | std::io::ErrorKind::ConnectionAborted
-                        | std::io::ErrorKind::BrokenPipe
-                        | std::io::ErrorKind::TimedOut
-                        | std::io::ErrorKind::UnexpectedEof
-                )
-            })
-    });
+    let outage = st3::client::daemon_unreachable(&error).map(|outage| outage.summary());
+    let transient = outage.is_some()
+        || error.chain().any(|cause| {
+            let message = cause.to_string();
+            message.contains("incomplete HTTP response")
+                || message.contains("retry the command")
+                || cause
+                    .downcast_ref::<serde_json::Error>()
+                    .is_some_and(serde_json::Error::is_eof)
+                || cause.downcast_ref::<std::io::Error>().is_some_and(|error| {
+                    matches!(
+                        error.kind(),
+                        std::io::ErrorKind::NotFound
+                            | std::io::ErrorKind::ConnectionRefused
+                            | std::io::ErrorKind::ConnectionReset
+                            | std::io::ErrorKind::ConnectionAborted
+                            | std::io::ErrorKind::BrokenPipe
+                            | std::io::ErrorKind::TimedOut
+                            | std::io::ErrorKind::UnexpectedEof
+                    )
+                })
+        });
     if !transient {
         return Err(error);
     }
@@ -7922,13 +8036,35 @@ fn tolerate_driver_api_outage(
     if last_warning.is_none_or(|prior| now.duration_since(prior) >= Duration::from_secs(10)) {
         // The driver shares a PTY with its provider. Writing to stderr here would
         // corrupt the provider's interactive screen while the API is restarting.
-        let _ = write_driver_api_warning(subject, &error);
+        let line = format!(
+            "{}; the driver keeps running and retries every second until the daemon is back",
+            outage.unwrap_or_else(|| format!("the st3 daemon did not answer ({error:#})"))
+        );
+        let _ = write_driver_log(subject, &line);
         *last_warning = Some(now);
     }
     Ok(())
 }
 
-fn write_driver_api_warning(subject: &str, error: &anyhow::Error) -> Result<()> {
+/// Repeat one driver call until the daemon answers. A driver outlives daemon restarts, so an
+/// outage while it starts delays the seat instead of ending it.
+async fn retry_while_daemon_unreachable<T, F, Fut>(subject: &str, mut call: F) -> Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T>>,
+{
+    let mut last_warning = None;
+    loop {
+        match call().await {
+            Ok(value) => return Ok(value),
+            Err(error) => tolerate_driver_api_outage(subject, error, &mut last_warning)?,
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+}
+
+/// Driver notes go to a private log, never to the terminal the driver shares with its provider.
+fn write_driver_log(subject: &str, line: &str) -> Result<()> {
     #[cfg(unix)]
     use std::os::unix::fs::OpenOptionsExt as _;
 
@@ -7944,11 +8080,7 @@ fn write_driver_api_warning(subject: &str, error: &anyhow::Error) -> Result<()> 
     options.mode(0o600);
     let mut file = options.open(directory.join("driver-api-warnings.log"))?;
     let at = current_unix_ms()?;
-    writeln!(
-        file,
-        "{at} {subject} {}",
-        format!("{error:#}").replace('\n', " ")
-    )?;
+    writeln!(file, "{at} {subject} {}", line.replace('\n', " "))?;
     Ok(())
 }
 
@@ -8022,6 +8154,8 @@ fn current_unix_ms() -> Result<u128> {
 /// Each attempt rereads graph message state, so a failed page or receipt is replayed safely.
 struct NativeDeliverySupervisor {
     episode: u64,
+    /// Whether the current failure episode began with the daemon unreachable.
+    daemon_outage: bool,
     failures: u32,
     retry_after: Option<Instant>,
     degraded_recorded: bool,
@@ -8032,6 +8166,7 @@ impl Default for NativeDeliverySupervisor {
     fn default() -> Self {
         Self {
             episode: 0,
+            daemon_outage: false,
             failures: 0,
             retry_after: None,
             degraded_recorded: false,
@@ -8046,13 +8181,20 @@ impl NativeDeliverySupervisor {
             .is_none_or(|retry_after| Instant::now() >= retry_after)
     }
 
-    fn failed(&mut self) -> Duration {
+    /// Back off a failing delivery, except while the daemon is unreachable: a refused connect
+    /// costs nothing, and delivery should resume within a second of the daemon's return.
+    fn failed(&mut self, daemon_unreachable: bool) -> Duration {
         if self.failures == 0 {
             self.episode = self.episode.saturating_add(1);
+            self.daemon_outage = daemon_unreachable;
         }
         self.failures = self.failures.saturating_add(1);
         let shift = self.failures.saturating_sub(1).min(5);
-        let backoff = Duration::from_secs((1_u64 << shift).min(30));
+        let backoff = if daemon_unreachable {
+            Duration::from_secs(1)
+        } else {
+            Duration::from_secs((1_u64 << shift).min(30))
+        };
         self.retry_after = Some(Instant::now() + backoff);
         backoff
     }
@@ -8071,21 +8213,34 @@ async fn record_native_delivery_diagnostic(
     incarnation: &str,
     transport: &str,
     episode: u64,
+    daemon_outage: bool,
     recovered: bool,
 ) -> Result<()> {
-    let (code, status, severity, reason) = if recovered {
+    // The harness.diagnostic schema admits only warning and error severities and no transport
+    // field; a recovery is a warning whose status is `recovered`, as repairs record it.
+    let (code, status, reason) = if recovered {
         (
             "native-delivery-recovered",
             "recovered",
-            "info",
-            "Native conversation delivery recovered and resumed replay from durable graph state.",
+            format!(
+                "Native conversation delivery over {transport} recovered and resumed replay from durable graph state."
+            ),
+        )
+    } else if daemon_outage {
+        (
+            "native-delivery-degraded",
+            "waiting",
+            format!(
+                "Native conversation delivery over {transport} paused while the st3 daemon was unreachable; the driver stayed online and retried every second."
+            ),
         )
     } else {
         (
             "native-delivery-degraded",
             "waiting",
-            "warning",
-            "Native conversation delivery failed; the driver remains online and will retry with bounded backoff.",
+            format!(
+                "Native conversation delivery over {transport} failed; the driver remains online and will retry with bounded backoff."
+            ),
         )
     };
     let _: ClaimRecord = client
@@ -8096,11 +8251,10 @@ async fn record_native_delivery_diagnostic(
                 kind: "harness.diagnostic".into(),
                 actor: Some(subject.into()),
                 fields: BTreeMap::from([
-                    ("severity".into(), Value::String(severity.into())),
+                    ("severity".into(), Value::String("warning".into())),
                     ("status".into(), Value::String(status.into())),
                     ("code".into(), Value::String(code.into())),
-                    ("reason".into(), Value::String(reason.into())),
-                    ("transport".into(), Value::String(transport.into())),
+                    ("reason".into(), Value::String(reason)),
                     ("incarnation_id".into(), Value::String(incarnation.into())),
                 ]),
                 evidence: Vec::new(),
@@ -8141,6 +8295,7 @@ async fn supervise_native_delivery(
                     incarnation,
                     transport,
                     supervisor.episode,
+                    supervisor.daemon_outage,
                     false,
                 )
                 .await
@@ -8153,26 +8308,36 @@ async fn supervise_native_delivery(
                     incarnation,
                     transport,
                     supervisor.episode,
+                    supervisor.daemon_outage,
                     true,
                 )
                 .await
                 .is_ok()
             {
-                eprintln!("info: `{subject}` native conversation delivery recovered");
+                // The driver shares its provider's terminal; the graph diagnostic is the record.
+                let _ = write_driver_log(subject, "native conversation delivery resumed");
                 supervisor.recovered();
             }
         }
         Err(error) => {
-            let backoff = supervisor.failed();
+            let outage = st3::client::daemon_unreachable(&error).map(|outage| outage.summary());
+            let backoff = supervisor.failed(outage.is_some());
             let now = Instant::now();
             if supervisor
                 .last_warning
                 .is_none_or(|prior| now.duration_since(prior) >= Duration::from_secs(10))
             {
-                eprintln!(
-                    "warning: `{subject}` native conversation delivery failed; retrying in {}s: {error:#}",
-                    backoff.as_secs()
-                );
+                let line = match outage {
+                    Some(outage) => format!(
+                        "native conversation delivery paused: {outage}. Messages stay queued in the graph; retrying every {}s until the daemon is back",
+                        backoff.as_secs()
+                    ),
+                    None => format!(
+                        "native conversation delivery failed; retrying in {}s with backoff up to 30s: {error:#}",
+                        backoff.as_secs()
+                    ),
+                };
+                let _ = write_driver_log(subject, &line);
                 supervisor.last_warning = Some(now);
             }
             if !supervisor.degraded_recorded {
@@ -8182,6 +8347,7 @@ async fn supervise_native_delivery(
                     incarnation,
                     transport,
                     supervisor.episode,
+                    supervisor.daemon_outage,
                     false,
                 )
                 .await

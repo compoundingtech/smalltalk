@@ -54,8 +54,11 @@ On Linux the service is a systemd user unit. It needs a working user manager; en
 agent; run `st3 service permissions` once for the Full Disk Access and Developer Tools steps.
 
 State lives in `~/.local/state/st3` and the local API is a Unix socket. Restarting the daemon
-does not stop running seats; it adopts them. To run the daemon in the foreground instead, use
-`st3 up`.
+does not stop running seats; it adopts them. While it restarts, a command waits up to 30 seconds
+for it (`--daemon-wait SECONDS` or `ST3_DAEMON_WAIT` changes that) and then exits with status 5.
+Seat drivers wait as long as the restart takes, keep their notes out of the seat's terminal in
+`~/.local/state/st3/driver-api-warnings.log`, and resume from the graph. To run the daemon in the
+foreground instead, use `st3 up`.
 
 ## First commands
 
