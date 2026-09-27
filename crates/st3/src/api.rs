@@ -3938,8 +3938,8 @@ async fn fleet_leave_claim(
     Ok(Json(claim))
 }
 
-/// While this node leaves its fleet, it refuses every new local write except the fleet
-/// operations that finish or cancel the leave, so the leave stays its writer's last batch.
+/// While this node leaves its fleet, it refuses every new write except the leave itself and
+/// replication traffic, so the leave stays its writer's last batch.
 async fn refuse_while_leaving(
     State(state): State<AppState>,
     request: Request<Body>,
@@ -3948,11 +3948,19 @@ async fn refuse_while_leaving(
     let path = request.uri().path();
     let mutating =
         request.method() != axum::http::Method::GET && request.method() != axum::http::Method::HEAD;
-    if mutating
-        && !path.starts_with("/v1/internal/")
-        && path != "/v1/health"
-        && state.store.fleet_leaving().unwrap_or(false)
-    {
+    // Replication keeps running so the drain can finish; it writes no local claims while
+    // leaving, because transport observations stop. Everything else that writes waits,
+    // including invite redemption and endpoint announcements.
+    let allowed = path.starts_with("/v1/internal/fleet/leave/")
+        || matches!(
+            path,
+            "/v1/health"
+                | "/v1/internal/replication/export"
+                | "/v1/internal/replication/receive"
+                | "/v1/internal/replication/peer-failure"
+                | "/v1/internal/replication-wake"
+        );
+    if mutating && !allowed && state.store.fleet_leaving().unwrap_or(false) {
         return ApiError::bad(St3Error::new(
             "fleet-leaving",
             "this node is leaving its fleet and accepts no new writes; `st fleet leave --cancel` stops the leave",

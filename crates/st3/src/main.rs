@@ -812,6 +812,9 @@ struct UninstallArgs {
     /// Also required when this machine's graph exists nowhere else.
     #[arg(long)]
     erase_local_graph: bool,
+    /// Never touch service managers; the daemon and worker must already be stopped.
+    #[arg(long)]
+    no_service: bool,
     #[arg(long = "as")]
     actor: Option<String>,
 }
@@ -1037,7 +1040,7 @@ async fn run_uninstall(endpoint: &Endpoint, args: UninstallArgs) -> Result<()> {
         !local_only || args.erase_local_graph,
         "this machine's graph exists nowhere else; pass --erase-local-graph to erase it"
     );
-    if services_installed() {
+    if !args.no_service && services_installed() {
         st3::service::stop_owned_runtimes(&config)?;
         st3::service::uninstall()?;
     } else if client.get::<Value>("/v1/health").await.is_ok() {

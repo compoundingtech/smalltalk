@@ -889,13 +889,20 @@ async fn uninstall_leaves_nothing_behind() {
     .await;
 
     // The dry run lists and removes nothing.
-    let listed = b.st_ok(&["uninstall", "--dry-run", "--keep-binaries"]);
+    let listed = b.st_ok(&["uninstall", "--dry-run", "--keep-binaries", "--no-service"]);
     assert!(listed.contains(&b.state_dir().display().to_string()));
     assert!(b.state_dir().exists());
 
     // With the daemon running, uninstall first leaves the fleet, then asks for the foreground
     // processes to stop, since no service manager stops them.
-    let first = b.st(&["uninstall", "--yes", "--keep-binaries", "--as", PERSON]);
+    let first = b.st(&[
+        "uninstall",
+        "--yes",
+        "--keep-binaries",
+        "--no-service",
+        "--as",
+        PERSON,
+    ]);
     assert!(!first.status.success());
     assert!(
         String::from_utf8_lossy(&first.stderr).contains("stop st3 up"),
@@ -903,7 +910,14 @@ async fn uninstall_leaves_nothing_behind() {
         String::from_utf8_lossy(&first.stderr)
     );
     b.stop();
-    b.st_ok(&["uninstall", "--yes", "--keep-binaries", "--as", PERSON]);
+    b.st_ok(&[
+        "uninstall",
+        "--yes",
+        "--keep-binaries",
+        "--no-service",
+        "--as",
+        PERSON,
+    ]);
 
     // Only what the test itself created remains: empty XDG roots and the stub pty.
     let mut remaining = Vec::new();
@@ -962,4 +976,70 @@ async fn a_flood_of_invalid_join_requests_does_not_block_a_valid_join() {
         "a valid join was blocked: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_leaving_member_writes_nothing_after_it_begins_to_leave() {
+    let root = tempfile::tempdir().unwrap();
+    let a = anchor(root.path(), "a").await;
+    let b = joined(root.path(), &a, "b", &[]).await;
+    b.wait_listening().await;
+    // b sponsors an invite, then begins to leave.
+    let code = b.invite("c", &[]);
+    let _: Value = b
+        .client()
+        .post("/v1/internal/fleet/leave/begin", &json!({"person": PERSON}))
+        .await
+        .unwrap();
+    let before = b.claims().await.len();
+
+    // Redemption, invites, endpoint announcements, and ordinary claims are all refused.
+    let c = Node::new(root.path(), "c");
+    assert!(
+        !c.join(&code, &[]).status.success(),
+        "b admitted c while leaving"
+    );
+    let invite = b.st(&["fleet", "invite", "d", "--code-only", "--as", PERSON]);
+    assert!(!invite.status.success());
+    let announced: Result<Value, _> = b
+        .client()
+        .post(
+            "/v1/internal/fleet/endpoints",
+            &json!({"mode": "listening", "endpoints": []}),
+        )
+        .await;
+    assert!(announced.is_err());
+    let claim: Result<Value, _> = b
+        .client()
+        .post(
+            "/v1/claims",
+            &ClaimInput {
+                subject: "custom/fleet-test/while-leaving".into(),
+                kind: NOTE.into(),
+                actor: Some(PERSON.into()),
+                fields: Default::default(),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            },
+        )
+        .await;
+    assert!(claim.is_err());
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let local_writes = b
+        .claims()
+        .await
+        .into_iter()
+        .skip(before)
+        .filter(|claim| claim["origin"] == "b")
+        .count();
+    assert_eq!(local_writes, 0, "b wrote while leaving");
+
+    // Cancelling the leave restores writes.
+    let _: Value = b
+        .client()
+        .post("/v1/internal/fleet/leave/cancel", &json!({}))
+        .await
+        .unwrap();
+    b.note("after-cancel").await;
 }
