@@ -38,7 +38,8 @@ Restart continuity keeps rc.sup on Claude `claude-sonnet-5` and changes rc.dev.
 
 Failures behind those counts:
 
-- **omp cross-harness message wake.** One seat skipped its agreement (`cross-omp-end-20260926-b`).
+- **omp cross-harness message wake.** One seat overlooked an agreement steered into its running
+  turn and never sent its consensus (`cross-omp-end-20260926-b`).
   One seat sent a fact twice after a steered message backgrounded its send
   (`cross-omp-head-20260926-c`). In one run the fixed Codex partner stopped
   (`cross-omp-head-20260926-b`).
