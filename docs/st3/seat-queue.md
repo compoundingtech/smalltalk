@@ -189,6 +189,8 @@ others.
   time, followed the chief's move, passed over a head run waiting on a gate and returned to it
   once ready, kept each held claim, and got no terminal input. Run reports are in
   `evals/st3/seat-queue/reports/`. Reports before the chief was added used a person's move.
+  Of the eleven person-move runs, ten passed on Claude, Codex, and omp seats. In the other, a
+  Claude seat never reached idle before any work existed.
   With the chief's move, both Claude runs and both Codex runs passed. One omp run passed; the
   other was void after its seat re-declared itself, described below, and its replacement passed.
   `scripts/st3-seat-queue-eval/report` drafts a run's report from the evidence the runner keeps.
