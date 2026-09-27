@@ -791,6 +791,7 @@ impl<R: RuntimeControl> Reconciler<R> {
         self.reconcile_scheduled_work(&desired)?;
         self.reconcile_subscription_missions(&desired)?;
         self.reconcile_provider_capacity_retries(&desired)?;
+        self.resolve_attention_for_retired_agents(&desired)?;
         self.evaluate_mission_runs()?;
         // Mission state is the primary control-plane projection. Evaluate it before
         // wake-message bookkeeping so a large mailbox or work history cannot starve
@@ -945,18 +946,11 @@ impl<R: RuntimeControl> Reconciler<R> {
             if driver == "claude" {
                 self.resolve_superseded_claude_auth_attention(&subject.subject, incarnation)?;
             }
-            if self
-                .store
-                .attention_request(&attention_subject)?
-                .is_some_and(|attention| attention.status == "pending")
-            {
-                self.store.resolve_attention_automatically(
-                    &attention_subject,
-                    "the same runtime incarnation became ready",
-                    &format!("{attention_key}:resolved"),
-                )?;
-                self.signal_changed();
-            }
+            self.resolve_recovered_seat_attention(&subject.subject, incarnation)?;
+            self.resolve_pending_alert(
+                &attention_key,
+                "the same runtime incarnation became ready",
+            )?;
             return Ok(());
         }
 
@@ -1066,21 +1060,107 @@ impl<R: RuntimeControl> Reconciler<R> {
             if old_incarnation == current_incarnation {
                 continue;
             }
-            let key = format!("claude-auth-expired:{subject}:{old_incarnation}");
-            let digest = hex::encode(sha2::Sha256::digest(key.as_bytes()));
-            let attention_subject = format!("attention/{}", &digest[..32]);
-            if self
-                .store
-                .attention_request(&attention_subject)?
-                .is_some_and(|attention| attention.status == "pending")
-            {
-                self.store.resolve_attention_automatically(
-                    &attention_subject,
-                    "a new Claude runtime incarnation became ready",
-                    &format!("{key}:resolved"),
-                )?;
-                self.signal_changed();
+            self.resolve_pending_alert(
+                &format!("claude-auth-expired:{subject}:{old_incarnation}"),
+                "a new Claude runtime incarnation became ready",
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Startup and crash-loop alerts name one incarnation or desired token. Once another
+    /// incarnation of the seat is ready, those alerts describe a runtime that is gone.
+    fn resolve_recovered_seat_attention(
+        &self,
+        subject: &str,
+        current_incarnation: &str,
+    ) -> Result<()> {
+        for claim in self
+            .store
+            .claims_for(subject, Some("runtime.readiness-deadline-reached"))?
+        {
+            let Some(old_incarnation) = claim_incarnation(&claim) else {
+                continue;
+            };
+            if old_incarnation == current_incarnation {
+                continue;
             }
+            self.resolve_pending_alert(
+                &format!("harness-readiness:{subject}:{old_incarnation}"),
+                "a later runtime incarnation became ready",
+            )?;
+        }
+        let token = self
+            .store
+            .selected_desired_token(subject)?
+            .unwrap_or_default();
+        for claim in self
+            .store
+            .claims_for(subject, Some("runtime.reconcile-decision"))?
+        {
+            let Some(old_token) = claim
+                .body
+                .pointer("/fields/key")
+                .and_then(Value::as_str)
+                .and_then(|key| key.strip_prefix("codex-crash-loop:"))
+            else {
+                continue;
+            };
+            if old_token == token {
+                continue;
+            }
+            self.resolve_pending_alert(
+                &format!("codex-crash-loop:{subject}:{old_token}"),
+                "a new desired revision became ready",
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Alerts this host raised about an agent that is no longer desired, or is desired stopped,
+    /// have nothing left to fix. Alerts with any other target stay with their reviewer.
+    fn resolve_attention_for_retired_agents(&self, desired: &[DesiredSubject]) -> Result<()> {
+        let active = desired
+            .iter()
+            .filter(|subject| subject.kind != "stop")
+            .map(|subject| subject.subject.as_str())
+            .collect::<BTreeSet<_>>();
+        for request in self
+            .store
+            .pending_attention_requests_raised_by("agent/st3/reconciler", &self.host)?
+        {
+            if request.targets.is_empty()
+                || !request
+                    .targets
+                    .iter()
+                    .all(|target| target.starts_with("agent/") && !active.contains(target.as_str()))
+            {
+                continue;
+            }
+            self.store.resolve_attention_automatically(
+                &request.subject,
+                "the agent it names was removed or stopped",
+                &format!("{}:agent-retired", request.request),
+            )?;
+            self.signal_changed();
+        }
+        Ok(())
+    }
+
+    fn resolve_pending_alert(&self, key: &str, reason: &str) -> Result<()> {
+        let digest = hex::encode(sha2::Sha256::digest(key.as_bytes()));
+        let attention_subject = format!("attention/{}", &digest[..32]);
+        if self
+            .store
+            .attention_request(&attention_subject)?
+            .is_some_and(|attention| attention.status == "pending")
+        {
+            self.store.resolve_attention_automatically(
+                &attention_subject,
+                reason,
+                &format!("{key}:resolved"),
+            )?;
+            self.signal_changed();
         }
         Ok(())
     }
@@ -15551,6 +15631,263 @@ version 2
         assert_eq!(
             store
                 .claims_for(&attention[0].subject, Some("attention.resolved"))
+                .unwrap()[0]
+                .actor
+                .as_deref(),
+            Some("daemon/runtime")
+        );
+    }
+
+    fn mark_harness_ready(
+        store: &Store,
+        subject: &str,
+        member: &MemberSpec,
+        driver: &str,
+        incarnation: &str,
+    ) {
+        store
+            .append_claim(&ClaimInput {
+                subject: subject.into(),
+                kind: "runtime.observed".into(),
+                actor: None,
+                fields: member_fields(member, "running", Some(incarnation), true),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some(format!("{incarnation}-running")),
+            })
+            .unwrap();
+        store
+            .append_claim(&ClaimInput {
+                subject: subject.into(),
+                kind: "harness.observed".into(),
+                actor: Some(subject.into()),
+                fields: BTreeMap::from([
+                    ("state".into(), Value::String("ready".into())),
+                    ("driver".into(), Value::String(driver.into())),
+                    ("incarnation_id".into(), Value::String(incarnation.into())),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some(format!("{incarnation}-ready")),
+            })
+            .unwrap();
+    }
+
+    fn running_observation(member: &MemberSpec, incarnation: &str) -> RuntimeObservation {
+        RuntimeObservation {
+            runtime_id: member.runtime_id.clone(),
+            terminal: true,
+            status: "running".into(),
+            exit_code: None,
+            incarnation_id: Some(incarnation.into()),
+        }
+    }
+
+    fn alert_resolution_actor(store: &Store, key: &str) -> Option<String> {
+        let digest = hex::encode(sha2::Sha256::digest(key.as_bytes()));
+        let attention = store
+            .attention_request(&format!("attention/{}", &digest[..32]))
+            .unwrap()
+            .expect("the alert was raised");
+        store
+            .claims_for(&attention.subject, Some("attention.resolved"))
+            .unwrap()
+            .last()
+            .and_then(|claim| claim.actor.clone())
+    }
+
+    #[test]
+    fn a_restarted_seat_resolves_the_previous_incarnations_readiness_alert() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        let workspace = tempfile::tempdir().unwrap();
+        let source = format!(
+            "version 2\nagent \"worker\" {{ workspace {:?}; harness \"codex\" {{ prompt \"Wait.\" }} }}\n",
+            workspace.path().display().to_string()
+        );
+        apply_source(&store, &source, "restarted-seat");
+        let desired = store
+            .desired_subjects()
+            .unwrap()
+            .into_iter()
+            .find(|subject| subject.subject == "agent/node.worker")
+            .unwrap();
+        let member = desired.member.as_ref().unwrap();
+        let runtime_claim = store
+            .append_claim(&ClaimInput {
+                subject: desired.subject.clone(),
+                kind: "runtime.observed".into(),
+                actor: None,
+                fields: member_fields(member, "running", Some("worker-one"), true),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some("runtime-worker-one".into()),
+            })
+            .unwrap();
+        let reconciler = Reconciler::new(
+            store.clone(),
+            Arc::new(FakeRuntime::default()),
+            "node".into(),
+            Arc::new(Notify::new()),
+        );
+        let after_deadline = runtime_claim.accepted_at_unix_ms + HARNESS_READINESS_DEADLINE_MS + 1;
+        reconciler
+            .reconcile_driver_readiness(
+                &desired,
+                member,
+                &running_observation(member, "worker-one"),
+                after_deadline,
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .attention_items(Some("person/operator"))
+                .unwrap()
+                .len(),
+            1
+        );
+
+        // The seat restarts as a new incarnation, and that one becomes ready.
+        mark_harness_ready(&store, &desired.subject, member, "codex", "worker-two");
+        reconciler
+            .reconcile_driver_readiness(
+                &desired,
+                member,
+                &running_observation(member, "worker-two"),
+                after_deadline + 1,
+            )
+            .unwrap();
+
+        assert!(
+            store
+                .attention_items(Some("person/operator"))
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            alert_resolution_actor(&store, "harness-readiness:agent/node.worker:worker-one")
+                .as_deref(),
+            Some("daemon/runtime")
+        );
+    }
+
+    #[test]
+    fn a_new_desired_revision_that_becomes_ready_resolves_the_codex_crash_loop_alert() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        let workspace = tempfile::tempdir().unwrap();
+        let source = |prompt: &str| {
+            format!(
+                "version 2\nagent \"worker\" {{ workspace {:?}; harness \"codex\" {{ prompt {prompt:?} }} }}\n",
+                workspace.path().display().to_string()
+            )
+        };
+        apply_source(&store, &source("Wait."), "crash-loop-a");
+        let token_a = store
+            .selected_desired_token("agent/node.worker")
+            .unwrap()
+            .unwrap();
+        let reconciler = Reconciler::new(
+            store.clone(),
+            Arc::new(FakeRuntime::default()),
+            "node".into(),
+            Arc::new(Notify::new()),
+        );
+        reconciler
+            .raise_codex_crash_loop("agent/node.worker", &token_a, "the start failed")
+            .unwrap();
+        let key = format!("codex-crash-loop:agent/node.worker:{token_a}");
+        assert_eq!(alert_resolution_actor(&store, &key), None);
+
+        // A person revises the declaration, and the new revision's incarnation becomes ready.
+        apply_source(&store, &source("Wait for work."), "crash-loop-b");
+        assert_ne!(
+            store.selected_desired_token("agent/node.worker").unwrap(),
+            Some(token_a.clone())
+        );
+        let desired = store
+            .desired_subjects()
+            .unwrap()
+            .into_iter()
+            .find(|subject| subject.subject == "agent/node.worker")
+            .unwrap();
+        let member = desired.member.as_ref().unwrap();
+        mark_harness_ready(&store, &desired.subject, member, "codex", "worker-b");
+        reconciler
+            .reconcile_driver_readiness(
+                &desired,
+                member,
+                &running_observation(member, "worker-b"),
+                now_ms(),
+            )
+            .unwrap();
+
+        assert_eq!(
+            alert_resolution_actor(&store, &key).as_deref(),
+            Some("daemon/runtime")
+        );
+        assert!(
+            store
+                .attention_items(Some("person/nathan"))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn removing_an_agent_resolves_its_reconciler_alerts() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        apply_source(
+            &store,
+            r#"version 2
+agent "worker" { workspace "/tmp"; command "true"; restart "never" }
+agent "keeper" { workspace "/tmp"; command "true"; restart "never" }
+"#,
+            "retired-agent-alerts",
+        );
+        let raise = |agent: &str, actor: &str| {
+            let subject = format!("attention/alert-{}", agent.replace('/', "-"));
+            store
+                .request_attention(
+                    &subject,
+                    &AttentionRequest {
+                        reviewer: "person/operator".into(),
+                        title: "An agent harness did not become ready".into(),
+                        reason: "the harness did not become ready".into(),
+                        severity: "error".into(),
+                        targets: vec![agent.into()],
+                        actor: actor.into(),
+                        idempotency_key: format!("{subject}:requested"),
+                    },
+                )
+                .unwrap();
+            subject
+        };
+        let stopped = raise("agent/node.worker", "agent/st3/reconciler");
+        let gone = raise("agent/node.gone", "agent/st3/reconciler");
+        let kept = raise("agent/node.keeper", "agent/st3/reconciler");
+        let personal = raise("agent/node.elsewhere", "agent/node.keeper");
+        apply_source(
+            &store,
+            "version 2\nstop \"agent/node.worker\"\n",
+            "retired-agent-stop",
+        );
+        let reconciler = Reconciler::new(
+            store.clone(),
+            Arc::new(FakeRuntime::default()),
+            "node".into(),
+            Arc::new(Notify::new()),
+        );
+
+        reconciler.reconcile_once().unwrap();
+
+        let status = |subject: &str| store.attention_request(subject).unwrap().unwrap().status;
+        assert_eq!(status(&stopped), "resolved");
+        assert_eq!(status(&gone), "resolved");
+        assert_eq!(status(&kept), "pending");
+        // Only the reconciler's own alerts close this way; an agent's request stays with it.
+        assert_eq!(status(&personal), "pending");
+        assert_eq!(
+            store
+                .claims_for(&stopped, Some("attention.resolved"))
                 .unwrap()[0]
                 .actor
                 .as_deref(),
