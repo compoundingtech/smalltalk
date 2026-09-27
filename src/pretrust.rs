@@ -8,9 +8,11 @@
 //! other per-project fields — and write ALL requested dirs in ONE atomic read-modify-write.
 //!
 //! A booted Claude process periodically flushes `.claude.json`. One explicit batch prevents sibling
-//! trust writes from losing updates.
+//! trust writes from losing updates. Each Claude process re-reads and replaces the file under its own
+//! lock, so the trust write takes that lock too — see [`ClaudeConfigLock`].
 
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
@@ -103,6 +105,7 @@ fn toml_key(dir: &str) -> String {
 /// the process environment. Idempotent: re-trusting an already-trusted dir is a no-op merge.
 pub fn pretrust_at(config: &Path, dirs: &[PathBuf]) -> Result<usize> {
     let _lock = ConfigLock::acquire(config)?;
+    let _claude = ClaudeConfigLock::acquire(config)?;
     // Read the existing config, or start from an empty object if it is absent/blank.
     let mut root: Value = match std::fs::read_to_string(config) {
         Ok(s) if !s.trim().is_empty() => {
@@ -156,6 +159,90 @@ impl ConfigLock {
             .map_err(|error| anyhow::anyhow!("locking {}: {error}", path.display()))?;
         Ok(Self { _held: held })
     }
+}
+
+/// Claude treats its own config lock as abandoned once the directory's mtime is this old; a live
+/// holder refreshes it at half this interval.
+const CLAUDE_LOCK_STALE: Duration = Duration::from_secs(10);
+
+/// How long a trust write waits for live Claude writers before it fails the seat start.
+const CLAUDE_LOCK_WAIT: Duration = Duration::from_secs(30);
+
+/// Claude's own writer lock for `.claude.json`: the `proper-lockfile` directory `<config>.lock`,
+/// taken with `mkdir` and released with `rmdir`. Every Claude process re-reads, merges, and
+/// replaces the config while it holds this lock.
+///
+/// The st2 trust lock excludes only other st2 writers. A Claude process that read the config under
+/// its lock before a trust write and replaced it afterwards published its older copy and dropped
+/// the new workspace entry. On 2026-09-27 that left two of three seats started together at Claude's
+/// trust prompt. Holding this lock serializes the trust write with every Claude writer.
+struct ClaudeConfigLock {
+    path: PathBuf,
+}
+
+impl ClaudeConfigLock {
+    fn acquire(config: &Path) -> Result<Self> {
+        let mut path = config.as_os_str().to_owned();
+        path.push(".lock");
+        let path = PathBuf::from(path);
+        let deadline = Instant::now() + CLAUDE_LOCK_WAIT;
+        let mut pause = Duration::from_millis(5);
+        loop {
+            match std::fs::create_dir(&path) {
+                Ok(()) => return Ok(Self { path }),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => {
+                    return Err(error).with_context(|| format!("creating {}", path.display()));
+                }
+            }
+            match std::fs::symlink_metadata(&path) {
+                // `mkdir` never creates anything else, so a file or symlink here is not Claude's.
+                Ok(metadata) if !metadata.is_dir() => anyhow::bail!(
+                    "{} is not a directory, so it is not Claude's config lock",
+                    path.display()
+                ),
+                Ok(metadata) if lock_is_stale(&metadata) => {
+                    // Claude's own rule for an abandoned lock: remove it, then try again.
+                    match std::fs::remove_dir(&path) {
+                        Ok(()) => continue,
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                        Err(error) => {
+                            return Err(error)
+                                .with_context(|| format!("removing stale {}", path.display()));
+                        }
+                    }
+                }
+                Ok(_) => {}
+                // Released between the `mkdir` and the `stat`.
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    return Err(error).with_context(|| format!("inspecting {}", path.display()));
+                }
+            }
+            anyhow::ensure!(
+                Instant::now() < deadline,
+                "Claude held its config lock {} for {} seconds; the workspace trust was not written",
+                path.display(),
+                CLAUDE_LOCK_WAIT.as_secs()
+            );
+            std::thread::sleep(pause);
+            pause = (pause * 2).min(Duration::from_millis(100));
+        }
+    }
+}
+
+impl Drop for ClaudeConfigLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir(&self.path);
+    }
+}
+
+fn lock_is_stale(metadata: &std::fs::Metadata) -> bool {
+    metadata
+        .modified()
+        .ok()
+        .and_then(|modified| SystemTime::now().duration_since(modified).ok())
+        .is_some_and(|age| age > CLAUDE_LOCK_STALE)
 }
 
 /// The absolute path claude keys a project by: the canonical (symlink-resolved) path when the dir
@@ -337,6 +424,179 @@ mod tests {
                 .into_owned();
             assert_eq!(v["projects"][&key]["hasTrustDialogAccepted"], json!(true));
         }
+    }
+
+    fn trusted(config: &Path, workspace: &Path) -> bool {
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(config).unwrap()).unwrap();
+        let key = std::fs::canonicalize(workspace)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        v["projects"][&key]["hasTrustDialogAccepted"] == json!(true)
+    }
+
+    /// Replace the config the way a Claude process does after its locked re-read.
+    fn claude_replace(config: &Path, value: &Value) {
+        let staged = config.with_extension("json.claude-save");
+        std::fs::write(&staged, serde_json::to_string(value).unwrap()).unwrap();
+        std::fs::rename(&staged, config).unwrap();
+    }
+
+    /// The 2026-09-27 lost update: a Claude process read the config under its own lock, the trust
+    /// write landed, and Claude's replace published the older copy without the new workspace.
+    #[test]
+    fn a_trust_write_waits_for_claudes_config_lock_instead_of_being_overwritten() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = tmp.path().join(".claude.json");
+        std::fs::write(&config, r#"{"numStartups":1,"projects":{}}"#).unwrap();
+        let workspace = tmp.path().join("ws");
+        std::fs::create_dir_all(&workspace).unwrap();
+
+        let claude_lock = tmp.path().join(".claude.json.lock");
+        std::fs::create_dir(&claude_lock).unwrap();
+        let mut read_under_lock: Value =
+            serde_json::from_str(&std::fs::read_to_string(&config).unwrap()).unwrap();
+
+        let trust = std::thread::spawn({
+            let (config, workspace) = (config.clone(), workspace.clone());
+            move || pretrust_at(&config, &[workspace]).unwrap()
+        });
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(
+            !trust.is_finished(),
+            "the trust write must wait while Claude holds its config lock"
+        );
+
+        read_under_lock["numStartups"] = json!(2);
+        claude_replace(&config, &read_under_lock);
+        std::fs::remove_dir(&claude_lock).unwrap();
+        trust.join().unwrap();
+
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(&config).unwrap()).unwrap();
+        assert_eq!(v["numStartups"], json!(2), "Claude's own save was lost");
+        assert!(trusted(&config, &workspace), "the workspace trust was lost");
+        assert!(
+            !claude_lock.exists(),
+            "the trust write must release Claude's lock"
+        );
+    }
+
+    /// Several seats start at the same moment while a running Claude keeps saving the config under
+    /// its own lock. Every seat's workspace must still be trusted when they have all started.
+    #[test]
+    fn seats_starting_together_keep_every_trust_entry_while_claude_saves_its_config() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, Barrier};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let config = tmp.path().join(".claude.json");
+        std::fs::write(&config, r#"{"projects":{}}"#).unwrap();
+        let claude_lock = tmp.path().join(".claude.json.lock");
+        let workspaces = (0..6)
+            .map(|seat| {
+                let workspace = tmp.path().join(format!("seat-{seat}"));
+                std::fs::create_dir_all(&workspace).unwrap();
+                workspace
+            })
+            .collect::<Vec<_>>();
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let claude = std::thread::spawn({
+            let (config, claude_lock, stop) = (config.clone(), claude_lock.clone(), stop.clone());
+            move || {
+                let mut saves = 0_u64;
+                while !stop.load(Ordering::Relaxed) {
+                    if std::fs::create_dir(&claude_lock).is_err() {
+                        std::thread::sleep(Duration::from_millis(1));
+                        continue;
+                    }
+                    let mut current: Value =
+                        serde_json::from_str(&std::fs::read_to_string(&config).unwrap()).unwrap();
+                    std::thread::sleep(Duration::from_millis(5));
+                    saves += 1;
+                    current["numStartups"] = json!(saves);
+                    claude_replace(&config, &current);
+                    std::fs::remove_dir(&claude_lock).unwrap();
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                saves
+            }
+        });
+
+        let start = Arc::new(Barrier::new(workspaces.len()));
+        let seats = workspaces
+            .iter()
+            .cloned()
+            .map(|workspace| {
+                let (config, start) = (config.clone(), start.clone());
+                std::thread::spawn(move || {
+                    start.wait();
+                    pretrust_at(&config, &[workspace]).unwrap();
+                })
+            })
+            .collect::<Vec<_>>();
+        for seat in seats {
+            seat.join().unwrap();
+        }
+        stop.store(true, Ordering::Relaxed);
+        assert!(claude.join().unwrap() > 0, "the Claude writer never saved");
+
+        let lost = workspaces
+            .iter()
+            .filter(|workspace| !trusted(&config, workspace))
+            .map(|workspace| {
+                workspace
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect::<Vec<_>>();
+        assert!(lost.is_empty(), "Claude's saves dropped trust for {lost:?}");
+    }
+
+    /// A Claude process that died holding its lock leaves the directory behind. Claude takes over a
+    /// lock older than its stale threshold, and a seat start must not hang behind one either.
+    #[test]
+    fn an_abandoned_claude_config_lock_is_taken_over() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = tmp.path().join(".claude.json");
+        let claude_lock = tmp.path().join(".claude.json.lock");
+        std::fs::create_dir(&claude_lock).unwrap();
+        let abandoned = SystemTime::now() - Duration::from_secs(60);
+        std::fs::File::open(&claude_lock)
+            .unwrap()
+            .set_modified(abandoned)
+            .unwrap();
+        let workspace = tmp.path().join("ws");
+        std::fs::create_dir_all(&workspace).unwrap();
+
+        pretrust_at(&config, std::slice::from_ref(&workspace)).unwrap();
+
+        assert!(trusted(&config, &workspace));
+        assert!(!claude_lock.exists());
+    }
+
+    #[test]
+    fn a_symlinked_claude_config_lock_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = tmp.path().join(".claude.json");
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, tmp.path().join(".claude.json.lock")).unwrap();
+        let workspace = tmp.path().join("ws");
+        std::fs::create_dir_all(&workspace).unwrap();
+
+        let error = pretrust_at(&config, std::slice::from_ref(&workspace)).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("not Claude's config lock"),
+            "{error:#}"
+        );
+        assert!(
+            outside.is_dir(),
+            "a refused lock must leave its target alone"
+        );
+        assert!(!config.exists(), "a refused lock must publish nothing");
     }
 
     /// The transport hardened this lock file with `O_NOFOLLOW`; nothing pinned it before.
