@@ -304,6 +304,10 @@ pub struct Reconciler<R = NativeRuntime> {
     observer_deadlines: Arc<Mutex<HashMap<String, u128>>>,
     observer_cursors: Arc<Mutex<HashMap<String, Option<String>>>>,
     delayed_restarts: Arc<Mutex<HashMap<String, u128>>>,
+    materialized_mission_generations: Mutex<BTreeSet<String>>,
+    retired_predecessor_generations: Mutex<BTreeSet<String>>,
+    #[cfg(test)]
+    mission_declaration_parses: std::sync::atomic::AtomicUsize,
     file_watchers: Arc<Mutex<HashMap<String, notify::RecommendedWatcher>>>,
     resource_provider: Arc<dyn ResourceProvider>,
 }
@@ -352,6 +356,10 @@ impl Reconciler<NativeRuntime> {
             observer_deadlines: Arc::new(Mutex::new(HashMap::new())),
             observer_cursors: Arc::new(Mutex::new(HashMap::new())),
             delayed_restarts: Arc::new(Mutex::new(HashMap::new())),
+            materialized_mission_generations: Mutex::new(BTreeSet::new()),
+            retired_predecessor_generations: Mutex::new(BTreeSet::new()),
+            #[cfg(test)]
+            mission_declaration_parses: std::sync::atomic::AtomicUsize::new(0),
             file_watchers: Arc::new(Mutex::new(HashMap::new())),
             resource_provider: Arc::new(RegisteredResourceProvider),
         })
@@ -374,6 +382,10 @@ impl<R: RuntimeControl> Reconciler<R> {
             observer_deadlines: Arc::new(Mutex::new(HashMap::new())),
             observer_cursors: Arc::new(Mutex::new(HashMap::new())),
             delayed_restarts: Arc::new(Mutex::new(HashMap::new())),
+            materialized_mission_generations: Mutex::new(BTreeSet::new()),
+            retired_predecessor_generations: Mutex::new(BTreeSet::new()),
+            #[cfg(test)]
+            mission_declaration_parses: std::sync::atomic::AtomicUsize::new(0),
             file_watchers: Arc::new(Mutex::new(HashMap::new())),
             resource_provider: Arc::new(RegisteredResourceProvider),
         }
@@ -2316,6 +2328,18 @@ impl<R: RuntimeControl> Reconciler<R> {
 
     fn evaluate_mission_runs(&self) -> Result<()> {
         let runs = self.store.active_mission_runs_for_origin(&self.host)?;
+        let active_generations = runs
+            .iter()
+            .map(|run| run.generation.as_str())
+            .collect::<BTreeSet<_>>();
+        self.materialized_mission_generations
+            .lock()
+            .expect("mission materialization mutex poisoned")
+            .retain(|generation| active_generations.contains(generation.as_str()));
+        self.retired_predecessor_generations
+            .lock()
+            .expect("generation retirement mutex poisoned")
+            .retain(|generation| active_generations.contains(generation.as_str()));
         let mut changed = false;
         for run in runs {
             if run
@@ -2453,8 +2477,32 @@ impl<R: RuntimeControl> Reconciler<R> {
                     .set_mission_run_state(&run.id, "running", "normal", None)?;
             }
         }
-        changed |= self.materialize_mission_declarations(run, mission)?;
-        changed |= self.retire_predecessor_generation(run)?;
+        if mission.declarations_kdl.is_some() {
+            let already_materialized = self
+                .materialized_mission_generations
+                .lock()
+                .expect("mission materialization mutex poisoned")
+                .contains(&run.generation);
+            if !already_materialized {
+                changed |= self.materialize_mission_declarations(run, mission)?;
+                self.materialized_mission_generations
+                    .lock()
+                    .expect("mission materialization mutex poisoned")
+                    .insert(run.generation.clone());
+            }
+        }
+        let predecessor_retired = self
+            .retired_predecessor_generations
+            .lock()
+            .expect("generation retirement mutex poisoned")
+            .contains(&run.generation);
+        if !predecessor_retired {
+            changed |= self.retire_predecessor_generation(run)?;
+            self.retired_predecessor_generations
+                .lock()
+                .expect("generation retirement mutex poisoned")
+                .insert(run.generation.clone());
+        }
         let mut normal_failed = flat.iter().any(|step| {
             !step.spec.finally
                 && views.get(step.spec.path.as_str()).is_some_and(|view| {
@@ -2876,16 +2924,12 @@ impl<R: RuntimeControl> Reconciler<R> {
         } else {
             BTreeSet::from([run.subject.clone()])
         };
-        let owned = self
-            .store
-            .desired_subjects()?
+        let owned = owner_runs
+            .iter()
+            .map(|owner| self.store.desired_subjects_for_owner_run(owner))
+            .collect::<Result<Vec<_>>>()?
             .into_iter()
-            .filter(|subject| {
-                subject
-                    .owner_run
-                    .as_ref()
-                    .is_some_and(|owner| owner_runs.contains(owner))
-            })
+            .flatten()
             .filter(|subject| subject.member.is_some() || subject.kind == "stop")
             .collect::<Vec<_>>();
         let mut live = Vec::new();
@@ -5384,7 +5428,7 @@ impl<R: RuntimeControl> Reconciler<R> {
     fn retire_predecessor_generation(&self, run: &MissionRunView) -> Result<bool> {
         let stops = self
             .store
-            .desired_subjects()?
+            .desired_subjects_for_owner_run(&run.subject)?
             .into_iter()
             .filter(|subject| subject.owner_run.as_deref() == Some(run.subject.as_str()))
             // Only a subject materialized by another generation is retired. An
@@ -5423,10 +5467,13 @@ impl<R: RuntimeControl> Reconciler<R> {
         };
         let variables = crate::store::mission_run_variables(run, &mission.revision);
         let source = crate::mission::interpolate_kdl(source, &variables)?;
+        #[cfg(test)]
+        self.mission_declaration_parses
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut intent = crate::graph::parse_execution_intent(&source, &self.host, &run.id)?;
         let selected = self
             .store
-            .desired_subjects()?
+            .desired_subjects_for_owner_run(&run.subject)?
             .into_iter()
             .map(|subject| (subject.subject.clone(), subject))
             .collect::<BTreeMap<_, _>>();
@@ -5484,7 +5531,7 @@ impl<R: RuntimeControl> Reconciler<R> {
     ) -> Result<()> {
         let existing = self
             .store
-            .desired_subjects()?
+            .desired_subjects_for_owner_run(&run.subject)?
             .into_iter()
             .map(|subject| (subject.subject.clone(), subject))
             .collect::<BTreeMap<_, _>>();
@@ -5518,7 +5565,7 @@ impl<R: RuntimeControl> Reconciler<R> {
     fn step_declarations_hold(&self, step_subject: &str) -> Result<bool> {
         for subject in self
             .store
-            .desired_subjects()?
+            .desired_subjects_for_owner_step(step_subject)?
             .into_iter()
             .filter(|subject| subject.owner_step.as_deref() == Some(step_subject))
         {
@@ -5562,7 +5609,7 @@ impl<R: RuntimeControl> Reconciler<R> {
     fn step_declaration_failure(&self, step_subject: &str) -> Result<Option<String>> {
         for subject in self
             .store
-            .desired_subjects()?
+            .desired_subjects_for_owner_step(step_subject)?
             .into_iter()
             .filter(|subject| subject.owner_step.as_deref() == Some(step_subject))
         {
@@ -6163,23 +6210,16 @@ impl<R: RuntimeControl> Reconciler<R> {
     }
 
     fn schedule_has_open_work(&self, schedule: &str) -> Result<bool> {
-        let requests = self
+        let Some(request) = self
             .store
-            .claims_for(schedule, Some("schedule.work-requested"))?;
-        let starts = self
-            .store
-            .claims_for(schedule, Some("schedule.work-started"))?;
-        let Some(request) = requests.into_iter().next_back() else {
+            .latest_claim(schedule, Some("schedule.work-requested"))?
+        else {
             return Ok(false);
         };
-        let started = starts.iter().find(|claim| {
-            claim
-                .body
-                .pointer("/fields/request")
-                .and_then(Value::as_str)
-                == Some(request.id.as_str())
-        });
-        let Some(started) = started else {
+        let Some(started) = self
+            .store
+            .schedule_work_start_for_request(schedule, &request.id)?
+        else {
             return Ok(true);
         };
         let Some(run) = started
@@ -6198,42 +6238,20 @@ impl<R: RuntimeControl> Reconciler<R> {
         for schedule in desired.iter().filter(|item| item.kind == "schedule") {
             let requests = self
                 .store
-                .claims_for(&schedule.subject, Some("schedule.work-requested"))?;
-            let starts = self
-                .store
-                .claims_for(&schedule.subject, Some("schedule.work-started"))?;
+                .pending_schedule_work_requests(&schedule.subject)?;
+            if requests.is_empty()
+                || self
+                    .store
+                    .schedule_has_active_started_run(&schedule.subject)?
+            {
+                continue;
+            }
             for request in requests {
-                if starts.iter().any(|claim| {
-                    claim
-                        .body
-                        .pointer("/fields/request")
-                        .and_then(Value::as_str)
-                        == Some(request.id.as_str())
-                }) {
-                    continue;
-                }
-                if starts
-                    .iter()
-                    .filter_map(|claim| {
-                        claim
-                            .body
-                            .pointer("/fields/mission_run")
-                            .and_then(Value::as_str)
-                    })
-                    .any(|run| {
-                        self.store
-                            .mission_run(run)
-                            .ok()
-                            .flatten()
-                            .is_some_and(|view| {
-                                !matches!(
-                                    view.status.as_str(),
-                                    "completed" | "cancelled" | "failed"
-                                )
-                            })
-                    })
+                if self
+                    .store
+                    .schedule_has_active_started_run(&schedule.subject)?
                 {
-                    continue;
+                    break;
                 }
                 let Some(mission) = request
                     .body
@@ -6322,20 +6340,8 @@ impl<R: RuntimeControl> Reconciler<R> {
             }
             let requests = self
                 .store
-                .claims_for(&item.subject, Some("subscription.mission-requested"))?;
-            let starts = self
-                .store
-                .claims_for(&item.subject, Some("subscription.mission-started"))?;
+                .pending_subscription_mission_requests(&item.subject)?;
             for request in requests {
-                if starts.iter().any(|claim| {
-                    claim
-                        .body
-                        .pointer("/fields/request")
-                        .and_then(Value::as_str)
-                        == Some(request.id.as_str())
-                }) {
-                    continue;
-                }
                 let fields = request.body.get("fields").unwrap_or(&request.body);
                 let Some(mission) = fields.get("mission").and_then(Value::as_str) else {
                     continue;
@@ -9238,6 +9244,13 @@ mission "eval/start-failure" state="ready" timeout="1m" {
         reconciler.reconcile_once().unwrap();
         reconciler.reconcile_once().unwrap();
         let subject = format!("agent/{}/worker", run.id);
+        assert_eq!(
+            reconciler
+                .mission_declaration_parses
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "an unchanged run should parse its mission declarations once"
+        );
         assert_eq!(
             store
                 .latest_actual_value(&subject)
