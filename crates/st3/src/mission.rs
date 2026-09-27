@@ -3145,14 +3145,14 @@ version 2
         assert_eq!(mission.constraints, ["Keep the change small."]);
         assert_eq!(
             mission.agent_constraints,
-            BTreeMap::from([(
+            std::collections::BTreeMap::from([(
                 "agent/${ST_MISSION_RUN}/builder".to_owned(),
                 vec!["Never push the release branch.".to_owned()]
             )])
         );
         assert_eq!(
             mission.steps["build"].agent_constraints,
-            BTreeMap::from([(
+            std::collections::BTreeMap::from([(
                 "agent/${ST_MISSION_RUN}/reviewer".to_owned(),
                 vec!["Report findings without editing files.".to_owned()]
             )])

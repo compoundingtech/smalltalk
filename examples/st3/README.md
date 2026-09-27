@@ -61,7 +61,7 @@ the setup.
 | Run nested jobs one after another | [`queued-nested-work.kdl`](queued-nested-work.kdl) |
 | Delegate a step to an inline child mission with its own agent | [`nested-mission.kdl`](nested-mission.kdl) |
 | Fan work out to parallel mission-scoped seats, each in its own worktree | [`fan-out.kdl`](fan-out.kdl) |
-| Review independently and keep remediation reachable | [`review-remediation.kdl`](review-remediation.kdl) |
+| Review independently, keep remediation reachable, and give one agent its own constraint | [`review-remediation.kdl`](review-remediation.kdl) |
 
 ### Start missions from events and time
 
