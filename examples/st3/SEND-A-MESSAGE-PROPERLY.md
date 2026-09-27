@@ -12,7 +12,7 @@ react to steps, gates, and dependencies, so a result in a message is invisible t
 This command delivers a body, but it supplies neither a visible subject nor a thread parent:
 
 ```sh
-st3 conversations send agent/example/worker \
+st conversations send agent/example/worker \
   --from person/operator \
   --body 'Which catalog edition should I use?'
 ```
@@ -21,7 +21,7 @@ The missing title was not removed in transit; none was authored. Sending a later
 `--in-reply-to` creates another root message, so it cannot appear as a reply in the first thread.
 
 There is a second trap: `--body` is a shell argument. Unquoted command substitutions, dollar signs,
-and backticks in prose can be expanded before st3 sees them.
+and backticks in prose can be expanded before st sees them.
 
 ## Supported recovery: author the subject and parent explicitly
 
@@ -35,7 +35,7 @@ Treat `$edition` and `$(edition-command)` as literal examples.
 BODY
 )"
 
-request_message="$(st3 conversations send \
+request_message="$(st conversations send \
   agent/example/worker \
   --from person/operator \
   --subject 'Choose the catalog edition' \
@@ -50,14 +50,14 @@ Use the invented spring edition. I recorded the choice in the active work eviden
 BODY
 )"
 
-st3 conversations send person/operator \
+st conversations send person/operator \
   --from agent/example/worker \
   --subject 'Re: Choose the catalog edition' \
   --in-reply-to "$request_message" \
   --body "$reply_body"
 ```
 
-`st3 conversations reply "$request_message" ...` is the shorter supported route when the sender
+`st conversations reply "$request_message" ...` is the shorter supported route when the sender
 has the original message: it derives the recipient and `in-reply-to`, and preserves or replaces the
 subject deliberately.
 
@@ -67,8 +67,8 @@ Inline message content cannot exceed 4 KiB. Store a larger UTF-8 body as an immu
 then send its exact `doc/NAME@HASH` reference as the body:
 
 ```sh
-document_ref="$(st3 documents put catalog-context.md --as doc/example/catalog-context)"
-st3 conversations send agent/example/worker \
+document_ref="$(st documents put catalog-context.md --as doc/example/catalog-context)"
+st conversations send agent/example/worker \
   --from person/operator \
   --subject 'Catalog import context' \
   --body "$document_ref"

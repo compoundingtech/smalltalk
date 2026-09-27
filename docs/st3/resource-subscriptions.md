@@ -72,7 +72,7 @@ The returned subjects use `observer/RUN/watch` and `subscription/RUN/watch`.
 
 The subscription stores the selected changes and delivery intent. The agent declaration does not change.
 
-A provider locator is an opaque provider value. st3 does not assign meaning to it outside the registered provider.
+A provider locator is an opaque provider value. st does not assign meaning to it outside the registered provider.
 
 The `github.ref` locator is `OWNER/REPOSITORY@BRANCH`. Branch names can contain `/`. For example:
 
@@ -147,7 +147,7 @@ An unchanged failure creates no new claim. A later success replaces the complete
 
 An observer checks its declared fields. Its effective field set also includes the union of its subscription fields.
 
-st3 does not fetch once for each target. A subscription update can expand or reduce the observer field set.
+st does not fetch once for each target. A subscription update can expand or reduce the observer field set.
 
 ## Change and delivery rules
 

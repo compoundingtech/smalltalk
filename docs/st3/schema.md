@@ -1,4 +1,4 @@
-# st3 schema registry
+# st schema registry
 
 This file is generated from `st3-schema`.
 
@@ -13,7 +13,7 @@ Digest: `07a9374d50b81abb57551eba2e648a46867e8eec25806aa2dc7b8aee8f7c7431`
 | `agent` | `agent/RUN/LOCAL_ID` | no | A mission-run agent runtime. |
 | `attention` | `attention/ID` | yes | An explicit request for human attention. |
 | `custom` | `custom/NAMESPACE/NAME` | yes | An extension subject. |
-| `daemon` | `daemon/NODE` | no | An st3 daemon. |
+| `daemon` | `daemon/NODE` | no | An st daemon. |
 | `doc` | `doc/NAME` | no | A named immutable document lineage. |
 | `exec` | `exec/RUN/LOCAL_ID` | no | A mission-run exec runtime. |
 | `file` | `file/HOST:/ABSOLUTE_PATH` | no | A read-only file gate target. |

@@ -1,6 +1,6 @@
-# st3 architecture
+# st architecture
 
-st3 is the Small Talk claims-graph runtime. KDL declarations are its human authoring surface. Claims
+st is the Small Talk claims-graph runtime. KDL declarations are its human authoring surface. Claims
 are its durable fact surface. Projections, process observations, and caches are derived state.
 
 This document defines the stable system shape. The linked technical documents define the complete
@@ -17,7 +17,7 @@ interfaces and edge cases.
 7. Invalid data remains visible. It cannot halt unrelated reads, writes, or replication.
 8. Every repair adds a replacement fact and retains the invalid source for inspection.
 9. Host placement is explicit. Cross-host replication is optional.
-10. The st2 and st3 control loops remain separate during migration.
+10. The st2 and st control loops remain separate during migration.
 
 ## Durable graph
 
@@ -35,8 +35,8 @@ public subject and claim vocabulary.
 Every document starts with `version 2`. Declarations follow that node directly. There is no wrapper
 that represents a database transaction.
 
-`st3 launch preview` validates and renders a planner-authored launch candidate.
-`st3 missions publish FILE --as ACTOR` previews and then atomically applies exact authored mission
+`st launch preview` validates and renders a planner-authored launch candidate.
+`st missions publish FILE --as ACTOR` previews and then atomically applies exact authored mission
 KDL. Agents must already hold matching `mission-authority { publish ... }`; a declaration cannot
 self-grant that authority. A failed declaration rejects the complete publication.
 
@@ -95,7 +95,7 @@ split lets a ready step survive a daemon outage, a driver outage, and a failed d
 An agent notification only indicates that ready work or a message may exist. It does not authorize
 new work. The work queue and message record remain authoritative.
 
-`st3 attention ls --as person/NAME` combines that person's current human gates, launch approvals,
+`st attention ls --as person/NAME` combines that person's current human gates, launch approvals,
 revision approvals, unread messages, and explicit fault requests. Human identity is required rather
 than inferred. The stable client-v0 attention resource is the machine source for user interfaces.
 
@@ -113,7 +113,7 @@ See [resource subscriptions](resource-subscriptions.md) for provider and intake 
 
 ## Replication
 
-One st3 node is a complete local system. Fleet nodes exchange authenticated claim envelopes and
+One st node is a complete local system. Fleet nodes exchange authenticated claim envelopes and
 document bytes over loopback endpoints carried by Fabric or an equivalent transport.
 
 Replication compares immutable envelope inventories. Receipt order cannot change the deterministic
@@ -145,10 +145,10 @@ future operating-system sandbox.
 
 ## Migration boundary
 
-The st2 catalog remains a searchable archive. st3 does not import st2 inboxes, archived messages,
+The st2 catalog remains a searchable archive. st does not import st2 inboxes, archived messages,
 runtime records, conversation history, or durable context.
 
-Move one agent at a time. Stop the st2 owner before starting an st3 mission that uses the same
-workspace. Keep the old declaration for rollback until the st3 run passes its checks.
+Move one agent at a time. Stop the st2 owner before starting an st mission that uses the same
+workspace. Keep the old declaration for rollback until the st run passes its checks.
 
 See [agent migration](agent-migration.md) for the complete sequence.

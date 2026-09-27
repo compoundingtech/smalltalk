@@ -9,17 +9,17 @@ version 2
 //
 // The run workspace holds a clone of the invented project at `repo/`. The worktrees are created
 // beside it before any worker starts, because a worker's workspace must exist when it starts and
-// st3 writes `.st3/boot.md` into it.
+// st writes `.st3/boot.md` into it.
 //
 //   run_root="$(mktemp -d)"
 //   git clone git@example.invalid:example/app.git "$run_root/repo"
-//   st3 agents apply examples/st3/seats/omp.kdl --as person/operator
-//   st3 missions publish examples/st3/fan-out.kdl --as person/operator
-//   st3 missions start example/fan-out --id example/fan-out/2026-10-01 \
+//   st agents apply examples/st3/seats/omp.kdl --as person/operator
+//   st missions publish examples/st3/fan-out.kdl --as person/operator
+//   st missions start example/fan-out --id example/fan-out/2026-10-01 \
 //     --workspace "$run_root" --as person/operator --follow
 //
 // Commands in `exec` and gates run through `sh -c` with a minimal environment. Use absolute
-// binary paths. `${NAME}` is an st3 variable that st3 substitutes before the command runs; write
+// binary paths. `${NAME}` is an st variable that st substitutes before the command runs; write
 // a shell variable as plain `$NAME`.
 //
 // Preview warns that the three workers are missing eligible agents. The preview looks only at

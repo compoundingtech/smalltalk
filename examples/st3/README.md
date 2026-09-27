@@ -1,7 +1,7 @@
-# st3 examples
+# st examples
 
 Each KDL file here is a complete, runnable example. Its header comment says what it shows and the
-commands that run it. Every file passes the normative st3 parser in the test suite:
+commands that run it. Every file passes the normative st parser in the test suite:
 
 ```sh
 cargo test -p st3 --test examples
@@ -12,8 +12,8 @@ All names, repositories, paths, and people are invented. Replace them before you
 ## How the pieces fit
 
 - **A durable agent is a seat.** Declare it as a top-level `agent` in its own file and apply it with
-  `st3 agents apply FILE --as person/NAME`. A seat has no mission owner, so no mission's end stops
-  it. Stop it with `st3 agents stop`. Do not model a durable agent as a mission with no steps: that
+  `st agents apply FILE --as person/NAME`. A seat has no mission owner, so no mission's end stops
+  it. Stop it with `st agents stop`. Do not model a durable agent as a mission with no steps: that
   run completes at once and stops the agent it owns.
 - **Work reaches a seat as mission steps.** A step `assigned-to` the seat's exact subject waits in
   the seat's queue. The seat holds one step at a time and takes the next ready step in queue order.
@@ -21,15 +21,15 @@ All names, repositories, paths, and people are invented. Replace them before you
 - **Agents react to graph events.** Steps, `depends-on`, gates, observers, subscriptions, and
   schedules move work forward. Nobody polls in a turn.
 - **Results live in the graph.** Complete the step with the result, or store a longer result with
-  `st3 documents put` and cite the reference. A report message is invisible to the graph.
-- **Missions are finite.** Publishing a mission stores an immutable definition; `st3 missions start`
+  `st documents put` and cite the reference. A report message is invisible to the graph.
+- **Missions are finite.** Publishing a mission stores an immutable definition; `st missions start`
   starts a run. A mission that owns an observer, subscription, or schedule needs a step that keeps
   its run open, such as the `retire` gate in [`github-intake.kdl`](github-intake.kdl).
 
-Publish exact hand-authored missions with `st3 missions publish FILE --as ACTOR`. For
-conversational planning, use `st3 launch start`, review the candidate with `st3 launch preview`,
-and approve it with `st3 launch approve-and-launch`. An authorized agent uses
-`st3 work publish-mission` while it owns the declared producing step.
+Publish exact hand-authored missions with `st missions publish FILE --as ACTOR`. For
+conversational planning, use `st launch start`, review the candidate with `st launch preview`,
+and approve it with `st launch approve-and-launch`. An authorized agent uses
+`st work publish-mission` while it owns the declared producing step.
 
 ## Find an example by task
 
@@ -47,7 +47,7 @@ and approve it with `st3 launch approve-and-launch`. An authorized agent uses
 Every harness file declares the same `agent/example/worker` seat, and every mission example
 assigns work to it, so the missions run with whichever harness you apply. The planner, reviewer,
 and chief seat files declare other seats, named for their roles. omp seats run best on
-`openai-codex/gpt-6-astra`; [Running st3 with omp](../../docs/st3/omp.md) explains why and lists
+`openai-codex/gpt-6-astra`; [Running st with omp](../../docs/st3/omp.md) explains why and lists
 the setup.
 
 ### Give a seat work and order it
@@ -102,7 +102,7 @@ the setup.
 Gates run through `sh -c` with a minimal environment and no login shell:
 
 - Use absolute binary paths, such as `/usr/bin/git`.
-- `${NAME}` is an st3 variable; write shell variables as plain `$NAME`.
+- `${NAME}` is an st variable; write shell variables as plain `$NAME`.
 - A gate on files checks the committed, pushed tree, not an agent's working tree.
 - A gate result is cached by its definition. A loop's `until` gate puts `${loop.round}` in its
   command, and a step retried until a time puts `${ST_ATTEMPT}` in its gate.
@@ -119,7 +119,7 @@ the exact subcommand. Keep this failure-first shape when editing them; turning t
 field-by-field reference pages would erase their purpose.
 
 Mission goals and constraints describe the work. The generated `.st3/boot.md` describes how every
-agent uses st3. Do not copy universal boot instructions into a harness prompt or a mission
+agent uses st. Do not copy universal boot instructions into a harness prompt or a mission
 constraint.
 
 Keep durable seat and mission KDL in a Git repository, even when a planner authored it.

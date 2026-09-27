@@ -1,6 +1,6 @@
 # Seat queue performance
 
-This document compares the idle cost of the seat queue branch with the st3 commit it last merged.
+This document compares the idle cost of the seat queue branch with the st commit it last merged.
 It records the method, the fixture, the numbers, one fix made because of them, and what the
 memory numbers do and do not measure.
 
@@ -43,7 +43,7 @@ after the extra wakeups are explained, or accept the cost knowingly.
 - **Under a jemalloc preload the difference is within noise.** Three starts of each read 125.6 to
   129.9 MiB on base and 124.8 to 143.3 MiB on the fixed branch.
 - **The seat queue reads are cheap.** All twelve seat orders take 1.07 ms in process, one seat's
-  order 0.18 ms, and the agent queue read 0.8 ms of daemon CPU. `st3 agents queue` takes about
+  order 0.18 ms, and the agent queue read 0.8 ms of daemon CPU. `st agents queue` takes about
   4 ms from the CLI, mostly process start.
 
 Series 4, a 9-hour side-by-side run, found what a 30-minute window cannot: see the verdict.
@@ -52,7 +52,7 @@ Series 4, a 9-hour side-by-side run, found what a 30-minute window cannot: see t
 
 | Name | Commit | What it is |
 | --- | --- | --- |
-| base | `9b3c0a3` | the st3 commit `agent/seat-queue` last merged |
+| base | `9b3c0a3` | the st commit `agent/seat-queue` last merged |
 | branch | `ec7a3d9` | the seat queue branch as first measured |
 | fixed branch | `d2c4ee8` | the branch after the reconcile fix below |
 
@@ -113,7 +113,7 @@ traffic and reads its memory 5 and 60 seconds after the socket opens. With `PERF
 preloads `trim.c`, which on a signal writes glibc's `malloc_info` and calls `malloc_trim(0)`.
 That separates heap in use from heap that was freed but not returned to the system.
 
-The host has 16 cores. Another st3 daemon ran its own idle soak on the same host during every
+The host has 16 cores. Another st daemon ran its own idle soak on the same host during every
 window, so absolute numbers include that background. Both builds saw the same background, in
 alternating windows. No cargo build ran during a window.
 
@@ -344,18 +344,18 @@ Evidence: `target/seat-queue-overnight/perf/` in the builder's worktree holds `s
 - **Under glibc, a quiet daemon keeps about 510 MiB of freed heap after startup.** On this
   fixture `malloc_trim(0)` takes either build from about 568 MiB to 60 MiB, and the live heap is
   about 38 MiB. Trimming once after `Store::open` would return it on every start. That is an
-  allocator decision for all of st3, and the measuring host's live daemon was already running
+  allocator decision for all of st, and the measuring host's live daemon was already running
   a jemalloc preload to compare retention, so this branch leaves the allocator alone.
 - **The roster read is slow on both builds.** `GET /v1/client/agents` took about 540 ms of CPU per
   read on this graph, with no difference between base and branch. It is unrelated to the seat
   queue, and it is worth its own look.
 - **A reconcile after one write costs about 43 ms of CPU on base.** The branch adds nothing to
   that after the fix.
-- **`st3 agents queue move` can fail with `StaleFence` on a busy graph.** The CLI fences each
+- **`st agents queue move` can fail with `StaleFence` on a busy graph.** The CLI fences each
   action to the snapshot it just read. Any graph write in between rejects the move, and the CLI
   does not retry. One of the first 273 fixture moves failed this way. Other client-v0 mutations
   in the CLI use the same fence.
-- **`st3 agents queue` takes about 4 ms per call from the CLI**, mostly process start. The agent
+- **`st agents queue` takes about 4 ms per call from the CLI**, mostly process start. The agent
   queue read is about 0.8 ms of daemon CPU.
 - **The existing idle soak sampler counts context switches for the main thread only.**
   `/proc/PID/status` reports one thread. `sampler.py` sums every thread.

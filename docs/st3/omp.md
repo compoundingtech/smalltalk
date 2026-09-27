@@ -1,11 +1,11 @@
-# Running st3 with omp
+# Running st with omp
 
 ## Merge verdict
 
 Merge `agent/omp-ready`. It fixes the omp failures that live evals exposed. One omp seat had spoken
 for another agent, and duplicate wakes had interrupted omp's first turn. The branch also closes a
 wake gap that stalled nested work for every harness and repairs three evals. Every fix has a test
-that fails without it, and the `st3` test suites pass. Nothing is deployed by the merge.
+that fails without it, and the `st` test suites pass. Nothing is deployed by the merge.
 
 Expect omp to be reliable for assigned mission work and somewhat less reliable than Claude for
 message-only coordination. On the final source, omp passed every seat-mission-work and
@@ -17,7 +17,7 @@ message wake runs; [Model choice](#model-choice) recommends that model.
 [omp readiness evals](omp-readiness-2026-09-26.md) has the full evidence, and each run has a
 report under `evals/st3/*/reports/`.
 
-`agent/omp-steer-hold` adds a hold for mail that arrives while omp runs a turn, and two st3 fixes it
+`agent/omp-steer-hold` adds a hold for mail that arrives while omp runs a turn, and two st fixes it
 needs. [Holding mail during a running turn](#holding-mail-during-a-running-turn) has its verdict.
 
 ## What works
@@ -36,12 +36,12 @@ needs. [Holding mail during a running turn](#holding-mail-during-a-running-turn)
 ## What this branch fixed for omp
 
 - The pi-family session context no longer tells omp to "set your status to available" and "set busy
-  before work". st3 has no such commands, and omp searched for them before it claimed work. The
-  context now restates the st3 boot contract and names the seat.
+  before work". st has no such commands, and omp searched for them before it claimed work. The
+  context now restates the st boot contract and names the seat.
 - A CLI process whose `ST_AGENT` names a seat can no longer act as a different agent. omp's Python
   tool cannot see `ST_AGENT`. One omp seat probed its identity there, decided that it was the Codex
   seat, and sent protocol messages as that seat.
-- A wake delivered into omp's already-running boot turn now counts as acknowledged. Before, st3
+- A wake delivered into omp's already-running boot turn now counts as acknowledged. Before, st
   sent two more wakes 15 seconds apart, and each one interrupted omp's tool calls.
 - A seat that submits a parent step before its nested steps now receives a wake for the ready nested
   step once its turn ends. Before, the run stalled.
@@ -57,9 +57,9 @@ its seats worked through the message protocol with the fewest actions and tokens
 tested. It is a few seconds slower per protocol stage. If your login does not offer `gpt-6-astra`,
 use `openai-codex/gpt-5.6-sol`.
 
-The comparison uses cross-harness message wake on the final st3 behavior. Each run paired the same
+The comparison uses cross-harness message wake on the final st behavior. Each run paired the same
 fixed Codex `gpt-6-sol` and Claude `opus` seats with two omp seats at effort `medium`. The
-`gpt-5.6-sol` and `gpt-6-astra` runs used a binary built from `f627df7`, whose st3 source is
+`gpt-5.6-sol` and `gpt-6-astra` runs used a binary built from `f627df7`, whose st source is
 identical to `55c777b`. The `gpt-5.6-luna` column counts the six final-behavior runs in
 [omp readiness evals](omp-readiness-2026-09-26.md). In every run, each omp assistant turn in the
 transcript records the named model.
@@ -88,7 +88,7 @@ Why `gpt-6-astra`:
   message backgrounded the first send (`cross-omp-head-20260926-c`). Sol seats also made no slip.
 - **It stays on the protocol.** Astra seats read, sent, and archived their messages with a median
   of 15 tool calls, against 30 for sol and 24 for luna. No astra seat tried to claim or complete the
-  controller's agentless step. Two sol seats and six luna seats did, and st3 refused each attempt.
+  controller's agentless step. Two sol seats and six luna seats did, and st refused each attempt.
   With fewer calls in flight, fewer were backgrounded by incoming mail, which is the path behind
   luna's duplicate send. No backgrounded send was repeated in the sol or astra runs.
 - **It costs less.** Astra seats used 15 to 17 percent fewer total tokens than sol or luna seats and
@@ -112,7 +112,7 @@ are `cross-omp-sol-20260927-a` to `-d` and `cross-omp-astra-20260927-a` to `-c`,
 
 ## Holding mail during a running turn
 
-**Keep it, with the two st3 fixes it needs.** On `agent/omp-steer-hold`, the omp channel extension
+**Keep it, with the two st fixes it needs.** On `agent/omp-steer-hold`, the omp channel extension
 holds a message that arrives while omp runs a turn and hands it to omp as the turn's tool batch
 returns. In the final runs no omp tool call was backgrounded by incoming mail: 0 of 348, against 90
 of 354 in the runs before the hold. No omp seat repeated a send. Pass rates did not change
@@ -128,7 +128,7 @@ runs the phases were no slower, but omp seats read their mail a few seconds late
   boundary. Mail still held when the run ends is handed over at `agent_end`. Mail released together
   is one steer, because omp injects one queued steer per boundary. A message waits at most 10
   seconds behind a running tool call; then it is steered, and omp backgrounds the command as
-  before. Ten seconds was chosen below st3's 15-second work-wake retry. The cap does not bound the
+  before. Ten seconds was chosen below st's 15-second work-wake retry. The cap does not bound the
   wait while the model streams, where omp would not inject the message sooner anyway. Outside a
   running turn, mail is handed over at once, as before.
 - **Why the whole turn, not only in-flight calls.** In the 23 omp cross-harness runs before the
@@ -136,16 +136,16 @@ runs the phases were no slower, but omp seats read their mail a few seconds late
   streaming; none was running when the steer arrived. omp signals every shell and eval call of a
   batch that starts with a steer queued, and each backgrounds itself at once. Holding only while a
   call is in flight would have changed none of those 176 calls.
-- **Hook root** (`src/hooks.rs`, `7e7d8d8`). st3 exports `ST_HOOKS` to its members as its binary's
+- **Hook root** (`src/hooks.rs`, `7e7d8d8`). st exports `ST_HOOKS` to its members as its binary's
   hook set directory, because its Claude settings run `$ST_HOOKS/claude-observe.sh`. The pi-family
   launcher read that directory as the hook root and verified `<set>/sets/<set>/`. omp seats
   launched only because the unchanged hook set held a stray nested copy of itself. Any change to a
-  hook file, this one included, made every omp and pi seat under st3 fail with `launch-error`. The
+  hook file, this one included, made every omp and pi seat under st fail with `launch-error`. The
   hook root now recognizes a set directory and resolves the root it names.
 - **Late delivery acknowledgement** (`crates/st3/src/main.rs`, `7b9d489`). A seat can read a message
   through the CLI, which records delivery and the read, before its channel acknowledges the
-  handoff. st3 refuses that late `read -> delivered` transition, and the pi-family channel exited on
-  the refusal. The seat then had no channel: it received no mail, and st3 never saw it idle again.
+  handoff. st refuses that late `read -> delivered` transition, and the pi-family channel exited on
+  the refusal. The seat then had no channel: it received no mail, and st never saw it idle again.
   The hold widened this race from milliseconds to seconds, and it stalled two astra runs. The
   channel now treats that refusal as settled when the message already stands at delivered, read,
   or closed.
@@ -227,15 +227,15 @@ Limits:
 - The final runs ran eight at a time on one host.
 - The hold was not measured on omp 18.0, or with commands that run longer than 10 seconds.
 
-### Including it in st3
+### Including it in st
 
-The extension is an asset embedded in the st3 binary, so it ships with a binary change and needs no
+The extension is an asset embedded in the st binary, so it ships with a binary change and needs no
 configuration. It must ship with `7e7d8d8` and `7b9d489`. Without the hook-root fix, every omp seat
 fails to launch once the hook set changes. Without the acknowledgement fix, a seat can lose its
 channel whenever the model reads a held message itself.
 
 An isolated eval daemon installs its binary's hook set into the user's
-`~/.local/state/st2/hooks` and selects it in `current.json`. st3 seats use their own binary's set,
+`~/.local/state/st2/hooks` and selects it in `current.json`. st seats use their own binary's set,
 so running seats are unaffected, but `st2 hooks verify` then reports the last eval's set.
 
 Each run has a report in `evals/st3/cross-harness-message-wake/reports/`, named by run ID:
@@ -244,13 +244,13 @@ Each run has a report in `evals/st3/cross-harness-message-wake/reports/`, named 
 
 ## Setting up an omp seat
 
-- **Version.** st3 admits omp 18.0 and 18.1. It runs `omp --version` before each launch and refuses
+- **Version.** st admits omp 18.0 and 18.1. It runs `omp --version` before each launch and refuses
   any other minor release. These evals used 18.1.22.
 - **Runtime.** omp's launcher runs under `bun`, so `bun` must be on the seat's `PATH`. It is not
-  enough for it to be on your interactive `PATH`. st3 starts harnesses from the login shell
+  enough for it to be on your interactive `PATH`. st starts harnesses from the login shell
   environment.
-- **Login.** st3 does not log omp in. The seat uses the credentials in the omp profile of the user
-  who runs the st3 daemon. Log that profile in to the `openai-codex` provider before you start a
+- **Login.** st does not log omp in. The seat uses the credentials in the omp profile of the user
+  who runs the st daemon. Log that profile in to the `openai-codex` provider before you start a
   seat.
 - **Model.** Use `openai-codex/gpt-6-astra`; [Model choice](#model-choice) explains why. Name a
   model that your login offers. The login tested here offered `gpt-5.5`, `gpt-5.6-luna`,
@@ -269,9 +269,9 @@ Each run has a report in `evals/st3/cross-harness-message-wake/reports/`, named 
   }
   ```
 
-  `effort` becomes omp's `--thinking` level. st3 adds the channel extension, the session directory,
+  `effort` becomes omp's `--thinking` level. st adds the channel extension, the session directory,
   and the boot prompt itself; do not pass them in `args`.
-- **Transcripts.** st3 points omp's `--session-dir` into the daemon's driver state for that seat.
+- **Transcripts.** st points omp's `--session-dir` into the daemon's driver state for that seat.
   Look for the session JSONL there, not in omp's default session directory.
 
 ## What an operator should know
@@ -283,7 +283,7 @@ Each run has a report in `evals/st3/cross-harness-message-wake/reports/`, named 
   omp as that batch returns, and no command is backgrounded unless it runs longer than 10 seconds.
   Queueing the message until the turn ended was measured and was worse.
 - omp's Python `eval` tool runs with a filtered environment without `ST_AGENT`, `ST3_BIN`, or
-  `ST3_ENDPOINT`. Run st3 commands from the shell tool. The session context says so, and the CLI
+  `ST3_ENDPOINT`. Run st commands from the shell tool. The session context says so, and the CLI
   refuses another agent's identity.
 - The cross-harness message wake eval hands out work only by message. The boot contract asks for
   claimable graph work, so omp and Codex seats sometimes stop and request person action there. That

@@ -42,8 +42,8 @@ gate_workspace="$(mktemp -d)"
 printf '%s\n' 'catalog version 1' >"$gate_workspace/catalog-index.txt"
 
 /bin/bash -n examples/st3/verify-catalog-index.sh
-st3 missions publish examples/st3/gate-recovery.kdl --as person/operator
-st3 missions start example/catalog-gate \
+st missions publish examples/st3/gate-recovery.kdl --as person/operator
+st missions start example/catalog-gate \
   --id example/catalog-gate/first \
   --workspace "$gate_workspace" \
   --as person/operator \
@@ -55,11 +55,11 @@ absolute, and make the owning step timeout strictly longer than the gate's `time
 
 ## Three more rules that bite later
 
-**`${NAME}` belongs to st3; `$NAME` belongs to the shell.** st3 substitutes `${ST_WORKSPACE}`,
+**`${NAME}` belongs to st; `$NAME` belongs to the shell.** st substitutes `${ST_WORKSPACE}`,
 `${ST_ATTEMPT}`, `${loop.round}`, and the other documented names before the command runs, and it
 rejects a publication that names an unknown one. The command itself runs through `sh -c`, so write
 shell variables and substitutions as `$area` or `$(/usr/bin/date +%s)`. `${area}` would be read as
-an st3 variable and refused.
+an st variable and refused.
 
 **A gate result is cached by the gate's definition.** A mechanical gate runs once for its owner,
 name, and exact command; asking again returns the first result. Two places need a new command each
