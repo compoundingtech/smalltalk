@@ -1,0 +1,60 @@
+version 2
+
+mission "eval/attention-inbox/standing" state="ready" {
+  concurrent-runs
+  goal "Keep one model-free owner available for the revision test."
+
+  agent "owner" {
+    workspace "${ST_WORKSPACE}"
+    command "sleep 1200"
+    mission-authority {
+      start "eval/attention-inbox/revision"
+      revise "eval/attention-inbox/revision"
+    }
+    restart "never"
+  }
+}
+
+mission "eval/attention-inbox/human" state="ready" timeout="5m" {
+  concurrent-runs
+  completion { when "all-steps-exhausted" }
+  goal "Hold one human gate until the selected person decides it."
+
+  step "approve" timeout="4m" {
+    agentless
+    gate "the person accepts the model-free result" type="human" {
+      reviewer "person/eval-attention"
+      question "Accept the attention inbox proof?"
+    }
+  }
+}
+
+mission "eval/attention-inbox/revision" state="ready" timeout="5m" revisions="human-only" revision-reviewer="person/eval-attention" {
+  input "owner" kind="text"
+  concurrent-runs
+  completion { when "all-steps-exhausted" }
+  goal "Hold one mission revision until the selected person approves it."
+
+  step "work" timeout="4m" {
+    assigned-to "agent/${input.owner}"
+    goal "Prepare one revision proposal."
+  }
+}
+
+mission "eval/attention-inbox" state="ready" timeout="20m" {
+  completion { when "all-steps-exhausted" }
+  goal "Prove that one command lists and clears all five human attention kinds."
+
+  step "exercise" timeout="18m" {
+    agentless
+    exec "attention-inbox/controller" {
+      host "local"
+      workspace "${ST_WORKSPACE}"
+      command "bash ./controller.sh"
+      restart "never"
+    }
+    gate "the attention inbox controller passed" {
+      field "exit_code" "exec/${ST_MISSION_RUN}/attention-inbox/controller" is 0
+    }
+  }
+}

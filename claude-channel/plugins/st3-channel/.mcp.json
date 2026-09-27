@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "st3": {
+      "command": "st3",
+      "args": [
+        "driver",
+        "claude-mcp"
+      ]
+    }
+  }
+}

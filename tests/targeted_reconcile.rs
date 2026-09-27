@@ -435,7 +435,7 @@ fn targeted_once_real_pty_preserves_sibling_generation_across_selected_lifecycle
     assert!(!sibling_workspace.join("SIBLING.txt").exists());
     let stdout = String::from_utf8_lossy(&relaunched.stdout);
     assert!(
-        stdout.contains(&format!("launched (1): {OWNER}")),
+        stdout.contains(&format!("restarted (1): {OWNER}")),
         "{stdout}"
     );
     assert!(!stdout.contains(SIBLING), "{stdout}");

@@ -1,4 +1,4 @@
-//! Native inbox-to-terminal DING delivery.
+//! Native inbox-to-terminal PING delivery.
 //!
 //! Fresh delivery first proves an empty maintained composer, bracketed-pastes without Return, then
 //! requires two adjacent adapter observations to prove the exact retained composer is safe before
@@ -6,12 +6,13 @@
 //! ownership. A later retry uses the same adjacent-observation requirement.
 //!
 //! Once a paste command starts, the sidecar owns that payload and retries by inspection only. It
-//! never pastes the same notice again while that transport attempt remains owned.
+//! never pastes the same notice again while that transport attempt remains owned. An archive
+//! receipt cancels ownership before Return and prevents startup re-adoption.
 //! PTY or Return success is not delivery: a harness adapter must positively classify the expected
 //! notice text in its submitted-prompt or queued-message pattern while the live composer is empty.
 //! This preserves FIFO/archive behavior without letting a command timeout create duplicate text.
 //! Startup can adopt an exact staged recovery or backlog notice before coalescing remaining unread
-//! work into one generic recovery DING. `busy` never suppresses a notification; fresh `dnd` does.
+//! work into one generic recovery PING. `busy` never suppresses a notification; fresh `dnd` does.
 
 use std::collections::{HashSet, VecDeque};
 use std::os::unix::process::CommandExt as _;
@@ -28,7 +29,9 @@ mod harness;
 use crate::message::{self, Message};
 use crate::run::{CAPTURE_CAP_BYTES, read_bounded_tail, reap_detached};
 use crate::status;
-use crate::supervisor_chain::{SUPERVISOR_CHAIN_LIMIT, chain_bus_ids, resolve_spec};
+#[cfg(test)]
+use crate::supervisor_chain::SUPERVISOR_CHAIN_LIMIT;
+use crate::supervisor_chain::{chain_bus_ids, resolve_spec};
 
 use composer::{ComposerState, classify_composer, classify_located_composer, classify_receipt};
 use harness::ReceiptState;
@@ -37,10 +40,11 @@ const BRACKETED_PASTE_START: &str = "\x1b[200~";
 const BRACKETED_PASTE_END: &str = "\x1b[201~";
 const SUBJECT_MAX_CHARS: usize = 160;
 const SENDER_MAX_CHARS: usize = 80;
+const ST3_BODY_MAX_CHARS: usize = 2048;
 /// The marker for a declared non-agent event source. A fixed st2-chosen literal — never
 /// producer-supplied text — so the bounded-notice proofs are unaffected.
 const SOURCE_MARKER: &str = "»";
-const RECOVERY_POKE: &str = "[DING] unread st2 messages remain; check your inbox";
+const RECOVERY_POKE: &str = "[PING] unread st2 messages remain; check your inbox";
 // Must exceed face607's bounded 0.5s delivery delay plus PTY/Node startup overhead; otherwise a
 // successful pane write is misreported as a timeout and retried, duplicating the owned payload.
 const PTY_COMMAND_TIMEOUT: Duration = Duration::from_secs(2);
@@ -59,6 +63,43 @@ pub fn poke_id(filename: &str) -> &str {
         &filename[14..20]
     } else {
         filename.strip_suffix(".md").unwrap_or(filename)
+    }
+}
+
+/// Prefer the canonical st3 message subject carried across the compatibility inbox boundary.
+/// Native st2 messages retain their stable filename-derived identifier.
+fn poke_reference(msg: &Message) -> &str {
+    st3_message_reference(msg).unwrap_or_else(|| poke_id(&msg.filename))
+}
+
+pub fn st3_message_reference(msg: &Message) -> Option<&str> {
+    msg.tags
+        .iter()
+        .find_map(|tag| tag.strip_prefix("st3-message:"))
+        .filter(|reference| reference.starts_with("message/") && reference.len() > "message/".len())
+}
+
+/// One recognizable ST3 envelope, shared by native drivers and extension channels.
+/// The graph remains the source of the complete message when the preview is bounded.
+pub fn st3_notification_text(
+    reference: &str,
+    from: &str,
+    subject: Option<&str>,
+    body: &str,
+) -> String {
+    let from = normalize_field(Some(from), "unknown", SENDER_MAX_CHARS);
+    let subject = normalize_field(subject, "(no subject)", SUBJECT_MAX_CHARS);
+    let header = format!("[PING from st3] {reference} from {from}: {subject}");
+    let normalized_body = normalize_line(body);
+    if normalized_body.is_empty() {
+        return header;
+    }
+    let mut characters = normalized_body.chars();
+    let preview: String = characters.by_ref().take(ST3_BODY_MAX_CHARS).collect();
+    if characters.next().is_some() {
+        format!("{header}\n\n{preview}… [read the full message in st3]")
+    } else {
+        format!("{header}\n\n{preview}")
     }
 }
 
@@ -160,7 +201,7 @@ fn relationship_marker(
     "?".to_string()
 }
 
-/// The `[DING] …` line an agent sees for one newly arrived message. Consumers must key on the
+/// The `[PING] …` line an agent sees for one newly arrived message. Consumers must key on the
 /// prefix and stable id rather than descriptive words. Subject and sender are bounded, normalized
 /// untrusted fields. The marker describes the relationship implied by the claimed sender identity;
 /// it does not authenticate that identity.
@@ -179,6 +220,14 @@ fn poke_text_with_resolver(
     recipient: &str,
     msg: &Message,
 ) -> String {
+    if let Some(reference) = st3_message_reference(msg) {
+        return st3_notification_text(
+            reference,
+            msg.from.as_deref().unwrap_or_default(),
+            msg.subject.as_deref(),
+            &msg.body,
+        );
+    }
     let subject = normalize_field(msg.subject.as_deref(), "(no subject)", SUBJECT_MAX_CHARS);
     let from = normalize_field(msg.from.as_deref(), "unknown", SENDER_MAX_CHARS);
     let marker = if msg.stream.is_some() && msg.event_id.is_some() {
@@ -187,8 +236,8 @@ fn poke_text_with_resolver(
         relationship_marker(resolver, this_host, recipient, msg.from.as_deref())
     };
     format!(
-        "[DING] {marker} {from}: {subject} [id:{}]",
-        poke_id(&msg.filename)
+        "[PING] {marker} {from}: {subject} [id:{}]",
+        poke_reference(msg)
     )
 }
 
@@ -240,6 +289,9 @@ pub fn pty_delivery_args(session: &str, text: &str) -> Vec<String> {
 pub enum PokeOutcome {
     Delivered,
     Staged,
+    /// The underlying message was archived after staging but before Return. The exact payload is
+    /// no longer actionable and must never be submitted or re-adopted.
+    Cancelled,
     /// A maintained adapter positively proved that the exact staged notice is absent. Queue state
     /// decides whether an archive receipt makes that proof sufficient to relinquish ownership.
     NotRetained,
@@ -313,12 +365,55 @@ pub struct FlushReport {
     pub deferred: Option<DeferralReason>,
 }
 
-/// How DING delivers a poke and checks liveness, abstracted so the watch loop is testable without a
+#[derive(Debug)]
+struct DeliveryArchived;
+
+impl std::fmt::Display for DeliveryArchived {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("the notice was archived before submission")
+    }
+}
+
+impl std::error::Error for DeliveryArchived {}
+
+fn run_submit_fence(
+    before_submit: &mut dyn FnMut() -> anyhow::Result<()>,
+) -> anyhow::Result<Option<PokeOutcome>> {
+    match before_submit() {
+        Ok(()) => Ok(None),
+        Err(error) if error.downcast_ref::<DeliveryArchived>().is_some() => {
+            Ok(Some(PokeOutcome::Cancelled))
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// How PING delivers a poke and checks liveness, abstracted so the watch loop is testable without a
 /// real `pty`.
 pub trait Poker {
     fn poke(&self, text: &str) -> anyhow::Result<PokeOutcome>;
+    fn poke_guarded(
+        &self,
+        text: &str,
+        before_submit: &mut dyn FnMut() -> anyhow::Result<()>,
+    ) -> anyhow::Result<PokeOutcome> {
+        if let Some(outcome) = run_submit_fence(before_submit)? {
+            return Ok(outcome);
+        }
+        self.poke(text)
+    }
     fn retry_staged(&self, _text: &str) -> anyhow::Result<PokeOutcome> {
         Ok(PokeOutcome::Deferred(DeferralReason::NoInputPerformed))
+    }
+    fn retry_staged_guarded(
+        &self,
+        text: &str,
+        before_submit: &mut dyn FnMut() -> anyhow::Result<()>,
+    ) -> anyhow::Result<PokeOutcome> {
+        if let Some(outcome) = run_submit_fence(before_submit)? {
+            return Ok(outcome);
+        }
+        self.retry_staged(text)
     }
     fn adopt_staged(&self, _candidates: &[String]) -> anyhow::Result<Option<String>> {
         Ok(None)
@@ -396,6 +491,17 @@ impl Poker for PtyPoker {
         self.poke_with(text, &mut || Ok(()))
     }
 
+    fn poke_guarded(
+        &self,
+        text: &str,
+        before_submit: &mut dyn FnMut() -> anyhow::Result<()>,
+    ) -> anyhow::Result<PokeOutcome> {
+        if let Some(outcome) = run_submit_fence(before_submit)? {
+            return Ok(outcome);
+        }
+        self.poke_with(text, before_submit)
+    }
+
     fn retry_staged(&self, text: &str) -> anyhow::Result<PokeOutcome> {
         retry_staged_with_window(
             text,
@@ -403,6 +509,24 @@ impl Poker for PtyPoker {
             &mut || self.run(pty_submit_args(&self.session), "send"),
             &mut || thread::sleep(COMPOSER_OBSERVATION_POLL),
             &mut || Ok(()),
+            COMPOSER_OBSERVATION_WINDOW,
+        )
+    }
+
+    fn retry_staged_guarded(
+        &self,
+        text: &str,
+        before_submit: &mut dyn FnMut() -> anyhow::Result<()>,
+    ) -> anyhow::Result<PokeOutcome> {
+        if let Some(outcome) = run_submit_fence(before_submit)? {
+            return Ok(outcome);
+        }
+        retry_staged_with_window(
+            text,
+            &mut || self.peek(),
+            &mut || self.run(pty_submit_args(&self.session), "send"),
+            &mut || thread::sleep(COMPOSER_OBSERVATION_POLL),
+            before_submit,
             COMPOSER_OBSERVATION_WINDOW,
         )
     }
@@ -492,12 +616,14 @@ fn transport_and_observe_with_window(
     before_submit: &mut dyn FnMut() -> anyhow::Result<()>,
     observation_window: Duration,
 ) -> anyhow::Result<PokeOutcome> {
-    before_submit()?;
+    if let Some(outcome) = run_submit_fence(before_submit)? {
+        return Ok(outcome);
+    }
     // Preserve the accepted transport-first transaction. Once it starts, any command or
     // observation failure is ambiguous: the paste may have landed even if Return did not.
     if let Err(error) = transport() {
         tracing::warn!(
-            "st2 ding: DING transport became ambiguous; retaining staged ownership: {error}"
+            "st2 ping: PING transport became ambiguous; retaining staged ownership: {error}"
         );
         return Ok(PokeOutcome::Staged);
     }
@@ -519,7 +645,7 @@ fn observe_receipt_with_window(
             Ok(screen) => screen,
             Err(error) => {
                 tracing::warn!(
-                    "st2 ding: post-submit receipt observation failed; retaining staged ownership: {error}"
+                    "st2 ping: post-submit receipt observation failed; retaining staged ownership: {error}"
                 );
                 return Ok(PokeOutcome::Staged);
             }
@@ -548,7 +674,7 @@ fn retry_staged_with_window(
         Ok(screen) => screen,
         Err(error) => {
             tracing::warn!(
-                "st2 ding: staged retry observation failed; retaining ownership: {error}"
+                "st2 ping: staged retry observation failed; retaining ownership: {error}"
             );
             return Ok(PokeOutcome::Staged);
         }
@@ -580,7 +706,7 @@ fn submit_retained_after_final_observation(
         Ok(screen) => screen,
         Err(error) => {
             tracing::warn!(
-                "st2 ding: final retained-composer observation failed; retaining ownership: {error}"
+                "st2 ping: final retained-composer observation failed; retaining ownership: {error}"
             );
             return Ok(PokeOutcome::Staged);
         }
@@ -593,13 +719,19 @@ fn submit_retained_after_final_observation(
             return Ok(PokeOutcome::Staged);
         }
     }
-    if let Err(error) = before_submit() {
-        tracing::warn!("st2 ding: pre-submit receipt failed; retaining staged ownership: {error}");
-        return Ok(PokeOutcome::Staged);
+    match run_submit_fence(before_submit) {
+        Ok(Some(outcome)) => return Ok(outcome),
+        Ok(None) => {}
+        Err(error) => {
+            tracing::warn!(
+                "st2 ping: pre-submit receipt failed; retaining staged ownership: {error}"
+            );
+            return Ok(PokeOutcome::Staged);
+        }
     }
     if let Err(error) = submit() {
         tracing::warn!(
-            "st2 ding: Return command became ambiguous; retaining staged ownership: {error}"
+            "st2 ping: Return command became ambiguous; retaining staged ownership: {error}"
         );
         return Ok(PokeOutcome::Staged);
     }
@@ -650,7 +782,7 @@ fn observed_poke_with_window(
     // have reached the TUI. Preserve ownership and let retry_staged inspect instead of re-pasting.
     if let Err(error) = stage() {
         tracing::warn!(
-            "st2 ding: paste command became ambiguous; retaining staged ownership: {error}"
+            "st2 ping: paste command became ambiguous; retaining staged ownership: {error}"
         );
         return Ok(PokeOutcome::Staged);
     }
@@ -661,7 +793,7 @@ fn observed_poke_with_window(
             Ok(screen) => screen,
             Err(error) => {
                 tracing::warn!(
-                    "st2 ding: post-paste observation failed; retaining staged ownership: {error}"
+                    "st2 ping: post-paste observation failed; retaining staged ownership: {error}"
                 );
                 return Ok(PokeOutcome::Staged);
             }
@@ -702,7 +834,7 @@ fn submit_after_final_observation(
         Ok(screen) => screen,
         Err(error) => {
             tracing::warn!(
-                "st2 ding: final composer observation failed; retaining staged ownership: {error}"
+                "st2 ping: final composer observation failed; retaining staged ownership: {error}"
             );
             return Ok(PokeOutcome::Staged);
         }
@@ -716,13 +848,19 @@ fn submit_after_final_observation(
             return Ok(PokeOutcome::Staged);
         }
     }
-    if let Err(error) = before_submit() {
-        tracing::warn!("st2 ding: pre-submit receipt failed; retaining staged ownership: {error}");
-        return Ok(PokeOutcome::Staged);
+    match run_submit_fence(before_submit) {
+        Ok(Some(outcome)) => return Ok(outcome),
+        Ok(None) => {}
+        Err(error) => {
+            tracing::warn!(
+                "st2 ping: pre-submit receipt failed; retaining staged ownership: {error}"
+            );
+            return Ok(PokeOutcome::Staged);
+        }
     }
     if let Err(error) = submit() {
         tracing::warn!(
-            "st2 ding: Return command became ambiguous; retaining staged ownership: {error}"
+            "st2 ping: Return command became ambiguous; retaining staged ownership: {error}"
         );
         return Ok(PokeOutcome::Staged);
     }
@@ -837,9 +975,29 @@ enum PendingNotice {
         in_inbox: bool,
         staged_text: Option<String>,
     },
-    /// Exact composer text adopted on sidecar startup. The ordinary recovery notice remains behind
-    /// it so any other unread backlog is still coalesced after this owned payload resolves.
-    Adopted { staged_text: Option<String> },
+}
+
+#[derive(Clone)]
+enum NoticeFence {
+    Recovery(HashSet<String>),
+    Message(String),
+}
+
+impl NoticeFence {
+    fn check(&self, inbox_dir: &Path) -> anyhow::Result<()> {
+        let current = message::list_inbox(inbox_dir)?;
+        let actionable = match self {
+            Self::Recovery(startup) => current
+                .iter()
+                .any(|message| startup.contains(&message.filename)),
+            Self::Message(filename) => current.iter().any(|message| message.filename == *filename),
+        };
+        if actionable {
+            Ok(())
+        } else {
+            Err(DeliveryArchived.into())
+        }
+    }
 }
 
 impl PendingNotice {
@@ -856,46 +1014,41 @@ impl PendingNotice {
                 context.recipient,
                 message,
             ),
-            Self::Adopted {
-                staged_text: Some(text),
-            } => text.clone(),
-            Self::Adopted { staged_text: None } => String::new(),
         }
     }
 
     fn staged_text(&self) -> Option<&str> {
         match self {
-            Self::Recovery { staged_text, .. }
-            | Self::Message { staged_text, .. }
-            | Self::Adopted { staged_text } => staged_text.as_deref(),
+            Self::Recovery { staged_text, .. } | Self::Message { staged_text, .. } => {
+                staged_text.as_deref()
+            }
         }
     }
 
     fn set_staged_text(&mut self, value: Option<String>) {
         match self {
-            Self::Recovery { staged_text, .. }
-            | Self::Message { staged_text, .. }
-            | Self::Adopted { staged_text } => *staged_text = value,
+            Self::Recovery { staged_text, .. } | Self::Message { staged_text, .. } => {
+                *staged_text = value
+            }
         }
     }
 
     fn in_inbox(&self) -> bool {
         match self {
             Self::Recovery { in_inbox, .. } | Self::Message { in_inbox, .. } => *in_inbox,
-            Self::Adopted { .. } => false,
         }
     }
 
     fn is_archived(&self) -> bool {
         match self {
             Self::Recovery { in_inbox, .. } | Self::Message { in_inbox, .. } => !*in_inbox,
-            Self::Adopted { .. } => false,
         }
     }
 
-    fn adopted(text: String) -> Self {
-        Self::Adopted {
-            staged_text: Some(text),
+    fn fence(&self) -> NoticeFence {
+        match self {
+            Self::Recovery { startup, .. } => NoticeFence::Recovery(startup.clone()),
+            Self::Message { message, .. } => NoticeFence::Message(message.filename.clone()),
         }
     }
 
@@ -962,6 +1115,25 @@ pub struct DingContext<'a> {
     pub recipient: &'a str,
 }
 
+fn active_startup_candidates(
+    context: DingContext<'_>,
+    inbox_dir: &Path,
+) -> Vec<(String, Option<Message>)> {
+    let messages = message::list_inbox(inbox_dir).unwrap_or_default();
+    if messages.is_empty() {
+        return Vec::new();
+    }
+    let resolver = RelationshipResolver::read(context.catalog_root);
+    std::iter::once((RECOVERY_POKE.to_string(), None))
+        .chain(messages.into_iter().map(|message| {
+            (
+                poke_text_with_resolver(&resolver, context.this_host, context.recipient, &message),
+                Some(message),
+            )
+        }))
+        .collect()
+}
+
 impl Default for DingConfig {
     fn default() -> Self {
         Self {
@@ -995,14 +1167,7 @@ pub fn run_ding(
 
     let mut seen = HashSet::new();
     let backlog = new_arrivals(inbox_dir, &mut seen);
-    let mut startup_candidates = (!backlog.is_empty()).then(|| {
-        let resolver = RelationshipResolver::read(context.catalog_root);
-        std::iter::once(RECOVERY_POKE.to_string())
-            .chain(backlog.iter().map(|message| {
-                poke_text_with_resolver(&resolver, context.this_host, context.recipient, message)
-            }))
-            .collect::<Vec<_>>()
-    });
+    let mut startup_adoption_pending = !backlog.is_empty();
     let mut pending = VecDeque::new();
     if !backlog.is_empty() {
         pending.push_back(PendingNotice::Recovery {
@@ -1015,7 +1180,7 @@ pub fn run_ding(
         });
     }
     eprintln!(
-        "st2 ding: ready — found {} existing unread message(s){}; watching for new arrivals.",
+        "st2 ping: ready — found {} existing unread message(s){}; watching for new arrivals.",
         backlog.len(),
         if backlog.is_empty() {
             ""
@@ -1037,7 +1202,7 @@ pub fn run_ding(
 
         let alive = poker.session_alive();
         if watch.step(alive) == WatchStep::Gone {
-            eprintln!("st2 ding: target pty session is gone — exiting.");
+            eprintln!("st2 ping: target pty session is gone — exiting.");
             break;
         }
 
@@ -1059,44 +1224,69 @@ pub fn run_ding(
             let delivery_due =
                 next_delivery_attempt.is_none_or(|deadline| Instant::now() >= deadline);
             if delivery_due && !delivery_suppressed(status_path) {
-                if let Some(candidates) = startup_candidates.as_ref() {
-                    match poker.adopt_staged(candidates) {
-                        Ok(Some(text)) => {
-                            if text == RECOVERY_POKE {
-                                if let Some(recovery) = pending
-                                    .iter_mut()
-                                    .find(|notice| matches!(notice, PendingNotice::Recovery { .. }))
+                if startup_adoption_pending {
+                    let candidates = active_startup_candidates(context, inbox_dir);
+                    let texts = candidates
+                        .iter()
+                        .map(|(text, _)| text.clone())
+                        .collect::<Vec<_>>();
+                    if texts.is_empty() {
+                        startup_adoption_pending = false;
+                    } else {
+                        match poker.adopt_staged(&texts) {
+                            Ok(Some(text)) => {
+                                if text == RECOVERY_POKE {
+                                    if let Some(recovery) = pending.iter_mut().find(|notice| {
+                                        matches!(notice, PendingNotice::Recovery { .. })
+                                    }) {
+                                        recovery.set_staged_text(Some(text));
+                                    }
+                                } else if let Some((_, Some(message))) = candidates
+                                    .into_iter()
+                                    .find(|(candidate, _)| *candidate == text)
                                 {
-                                    recovery.set_staged_text(Some(text));
+                                    let filename = message.filename.clone();
+                                    for notice in &mut pending {
+                                        if let PendingNotice::Recovery {
+                                            startup, in_inbox, ..
+                                        } = notice
+                                        {
+                                            startup.remove(&filename);
+                                            *in_inbox = !startup.is_empty();
+                                        }
+                                    }
+                                    let mut adopted = PendingNotice::message(message);
+                                    adopted.set_staged_text(Some(text));
+                                    pending.push_front(adopted);
                                 }
-                            } else {
-                                pending.push_front(PendingNotice::adopted(text));
+                                startup_adoption_pending = false;
                             }
-                            startup_candidates = None;
-                        }
-                        Ok(None) => startup_candidates = None,
-                        Err(error) => {
-                            tracing::warn!(
-                                "st2 ding: startup staged-notice adoption failed: {error}"
-                            )
+                            Ok(None) => startup_adoption_pending = false,
+                            Err(error) => {
+                                tracing::warn!(
+                                    "st2 ping: startup staged-notice adoption failed: {error}"
+                                )
+                            }
                         }
                     }
                 }
-                let report = flush_pending(context, status_path, &mut pending, poker);
+                prune_archived_pending(inbox_dir, &mut pending);
+                let report =
+                    flush_pending_inbox(context, status_path, &mut pending, poker, Some(inbox_dir));
                 if deferrals.observe(report.deferred)
                     && let Some(reason) = report.deferred
                 {
                     tracing::warn!(
-                        "st2 ding: delivery deferred for '{}', no input performed: {reason}",
+                        "st2 ping: delivery deferred for '{}', no input performed: {reason}",
                         context.recipient
                     );
                 }
-                next_delivery_attempt = (startup_candidates.is_some() || !pending.is_empty())
+                next_delivery_attempt = (startup_adoption_pending || !pending.is_empty())
                     .then(|| Instant::now() + DELIVERY_RETRY_BACKOFF);
             }
         } else if !watch.seen_alive && !logged_waiting {
             eprintln!(
-                "st2 ding: target pty session not yet registered; waiting before enabling exit-when-gone."
+                "st2 ping: target pty session not yet registered; waiting before enabling exit-when-gone."
             );
             logged_waiting = true;
         }
@@ -1135,23 +1325,33 @@ fn prune_archived_pending(inbox_dir: &Path, pending: &mut VecDeque<PendingNotice
             } => {
                 *in_inbox = filenames.contains(message.filename.as_str());
             }
-            PendingNotice::Adopted { .. } => {}
         }
     }
-    // A paste that already started stays owned across an archive race. It is never pasted again;
-    // the inspect-only retry either submits the exact safe payload or proves ownership disappeared.
-    pending.retain(|notice| notice.staged_text().is_some() || notice.in_inbox());
+    // Archive/read/close is a hard no-new-delivery fence. A staged payload may remain visible in
+    // the composer, but this sidecar relinquishes it and never sends Return or re-adopts it.
+    pending.retain(PendingNotice::in_inbox);
 }
 
 fn delivery_suppressed(status_path: Option<&Path>) -> bool {
     status_path.is_some_and(|path| status::read_state(path) == status::State::Dnd)
 }
 
+#[cfg(test)]
 fn flush_pending(
     context: DingContext<'_>,
     status_path: Option<&Path>,
     pending: &mut VecDeque<PendingNotice>,
     poker: &dyn Poker,
+) -> FlushReport {
+    flush_pending_inbox(context, status_path, pending, poker, None)
+}
+
+fn flush_pending_inbox(
+    context: DingContext<'_>,
+    status_path: Option<&Path>,
+    pending: &mut VecDeque<PendingNotice>,
+    poker: &dyn Poker,
+    inbox_dir: Option<&Path>,
 ) -> FlushReport {
     let mut report = FlushReport::default();
     if delivery_suppressed(status_path) {
@@ -1161,16 +1361,24 @@ fn flush_pending(
     let mut resolver = None;
 
     while let Some(notice) = pending.front_mut() {
+        let fence = notice.fence();
         let staged = notice.staged_text().map(str::to_string);
         let was_staged = staged.is_some();
         let text = staged.unwrap_or_else(|| notice.text(context, &mut resolver));
+        let mut before_submit = || {
+            if let Some(inbox_dir) = inbox_dir {
+                fence.check(inbox_dir)
+            } else {
+                Ok(())
+            }
+        };
         let outcome = if was_staged {
-            poker.retry_staged(&text)
+            poker.retry_staged_guarded(&text, &mut before_submit)
         } else {
-            poker.poke(&text)
+            poker.poke_guarded(&text, &mut before_submit)
         };
         match outcome {
-            Ok(PokeOutcome::Delivered) => {
+            Ok(PokeOutcome::Delivered | PokeOutcome::Cancelled) => {
                 pending.pop_front();
             }
             Ok(PokeOutcome::Staged) => {
@@ -1202,7 +1410,7 @@ fn flush_pending(
                 break;
             }
             Err(error) => {
-                tracing::warn!("st2 ding: {error}");
+                tracing::warn!("st2 ping: {error}");
                 break;
             }
         }
@@ -1210,7 +1418,7 @@ fn flush_pending(
     report
 }
 
-/// Set by SIGINT/SIGTERM so `st2 ding` exits cleanly when st2 tears the sidecar down.
+/// Set by SIGINT/SIGTERM so `st2 ping` exits cleanly when st2 tears the sidecar down.
 static STOP: AtomicBool = AtomicBool::new(false);
 
 extern "C" fn on_stop_signal(_signal: libc::c_int) {

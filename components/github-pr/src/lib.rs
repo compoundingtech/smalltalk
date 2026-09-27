@@ -606,9 +606,8 @@ fn topics(previous: Option<&Value>, current: &Value) -> Vec<String> {
         ("terminal", "terminal"),
     ]
     .into_iter()
-    .filter_map(|(facet, topic)| {
-        (facet_value(previous, facet) != facet_value(current, facet)).then(|| topic.to_owned())
-    })
+    .filter(|&(facet, _topic)| facet_value(previous, facet) != facet_value(current, facet))
+    .map(|(_facet, topic)| topic.to_owned())
     .collect()
 }
 

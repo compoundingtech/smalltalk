@@ -1,0 +1,98 @@
+version 2
+
+// A dream version of missions/app-web-one-space-gets-instant-new-items.kdl in myobie/st3-network.
+//
+// Real in st3 when this fixture was authored: the step `message {}` upsert, the named `loop` with
+// `until`, and the github.pull-request observer with its `checks` field.
+//
+// The DREAM annotations are provenance. Every marked declaration shape must continue to preview
+// without being rewritten. The historically commented subscription is active in this fixture.
+
+mission "fleet/app-web/one-space-gets-instant-new-items" state="ready" {
+  completion { when "all-steps-exhausted" }
+  goal "Put the instant-new-items branch into the one-space-at-a-time branch so Nathan can deploy it to staging and test it."
+  constraint "Merge instant-new-items into one-space-at-a-time. Do not rebase, do not force-push, and do not merge pull request 1465 or 1471."
+
+  resource "github/shareup/app-web/pull/1465" { kind "vcs.pull-request" }
+
+  // DREAM: no provider observes a branch, so nothing can see that one-space-at-a-time
+  // contains instant-new-items. Today the providers are github.pull-request,
+  // github.repository and local.file.
+  resource "github/shareup/app-web/ref/one-space-at-a-time" { kind "vcs.ref" }
+
+  observer "one-space-pull-request" {
+    resource "resource/github/shareup/app-web/pull/1465"
+    provider "github.pull-request"
+    locator "shareup/app-web#1465"
+    field "head"
+    field "checks"
+  }
+
+  observer "one-space-branch" {
+    resource "resource/github/shareup/app-web/ref/one-space-at-a-time"
+    provider "github.ref" // DREAM
+    locator "shareup/app-web@one-space-at-a-time"
+    field "head"
+    field "ancestors" // DREAM: the refs merged into this one
+  }
+
+  loop "merge" timeout="4h" {
+    max-rounds 3
+    until {
+      gate "the branch contains instant-new-items" {
+        field "ancestors" "resource/github/shareup/app-web/ref/one-space-at-a-time" "contains" "refs/heads/instant-new-items"
+      }
+      // DREAM: gate and dependency predicates compare one field with is, starts-with or
+      // contains, so "every check finished and passed" cannot be said at all. A quantifier
+      // over an observed list would say it, and the observer's next snapshot would settle it
+      // with no command, no sleep and no --watch.
+      gate "every check passed" {
+        every "checks" "resource/github/shareup/app-web/pull/1465" {
+          field "status" "is" "completed"
+          field "conclusion" "is" "success"
+        }
+      }
+    }
+    round {
+      completion { when "all-steps-exhausted" }
+      step "merge" timeout="1h" {
+        assigned-to "agent/fleet/app-web/standing/app-web"
+        goal "Merge origin/instant-new-items into one-space-at-a-time in the owner worktree and resolve every conflict so the intent of both sides survives. storage.ts, items-store.ts and root-space-store.ts have changes on both branches."
+        goal "Run the checks for the changed areas, then push one-space-at-a-time to origin."
+        goal "Read ${loop.feedback} when it is not empty. It holds the until gates that failed after the last push. Fix what they report and push again."
+        constraint "Do not wait for or poll GitHub checks. Report the step done after the push. The loop waits for the observers."
+      }
+    }
+    on-exhausted {
+      fail
+      attention "The one-space branch is not green after three merge rounds" {
+        reviewer "person/nathan"
+        severity "error"
+      }
+    }
+  }
+
+  // Real when the fixture was authored. This replaces the finally step that ran `st3 message send`
+  // inside a gate command, arrived from person/requester because a command has no identity, and
+  // needed `|| true` so a failed send could not fail the run.
+  finally {
+    step "tell-cos" timeout="5m" {
+      agentless
+      message "finished" {
+        to "agent/fleet/cos/standing/cos"
+        title "fleet/app-web/one-space-gets-instant-new-items finished"
+        content "one-space-at-a-time contains instant-new-items and pull request 1465 is green. Nathan can deploy staging from that branch."
+      }
+    }
+  }
+
+  // DREAM, and an alternative to the step above: delivery on a predicate becoming true would
+  // replace the final step. This block was commented out in the source dream mission.
+  subscription "green-branch" {
+    observer "observer/one-space-pull-request"
+    on "checks"
+    when { every "checks" { field "conclusion" "is" "success" } }
+    to "agent/fleet/cos/standing/cos"
+    delivery "message"
+  }
+}

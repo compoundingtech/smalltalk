@@ -64,7 +64,6 @@ impl SourceVersion {
     }
 }
 
-
 /// Whether a request changed declaration bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -72,7 +71,6 @@ pub enum AuthorOutcome {
     Changed,
     Unchanged,
 }
-
 
 /// A classified authoring refusal. `code` is stable for machine consumers.
 #[derive(Debug)]
@@ -113,7 +111,6 @@ struct AgentTarget {
     declaration: PathBuf,
     retired: bool,
 }
-
 
 fn resolve_target(
     specs: &[crate::AgentSpec],
@@ -270,7 +267,6 @@ fn edit_desired_state_for_test(
     )
 }
 
-
 fn exact_agent_node<'a>(
     document: &'a KdlDocument,
     expected_identity: &str,
@@ -344,7 +340,6 @@ fn agent_identity_parts(node: &KdlNode) -> (Option<String>, Option<String>) {
     (host, identity)
 }
 
-
 fn quoted(value: &str) -> Result<String, AuthorError> {
     serde_json::to_string(value).map_err(|error| {
         AuthorError::new(
@@ -353,7 +348,6 @@ fn quoted(value: &str) -> Result<String, AuthorError> {
         )
     })
 }
-
 
 fn insert_node(text: &str, target: &KdlNode, authored: &str) -> Result<String, AuthorError> {
     let span = target.span();
@@ -503,7 +497,7 @@ fn line_indent(text: &str, offset: usize) -> Option<String> {
         .then(|| indent.to_owned())
 }
 
-
+#[allow(clippy::too_many_arguments)]
 fn atomic_replace_checked(
     catalog_lock: &CatalogLock,
     catalog: &Path,
@@ -923,7 +917,8 @@ mod tests {
             "h/nix/agent.kdl",
             &declaration("nix", "h", Some("root"), "nix"),
         );
-        let plain = "agent \"plain\" {\n  host \"h\"\n  supervisor \"root\"\n  command \"sleep 60\"\n}\n";
+        let plain =
+            "agent \"plain\" {\n  host \"h\"\n  supervisor \"root\"\n  command \"sleep 60\"\n}\n";
         let unmarked = write(root, "h/plain/agent.kdl", plain);
         let original = fs::read_to_string(&projected).unwrap();
         let retire = |marker: Option<&str>, selector: &str| {

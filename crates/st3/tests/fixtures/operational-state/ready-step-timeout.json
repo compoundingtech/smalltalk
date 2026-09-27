@@ -1,0 +1,38 @@
+{
+  "id": "cos-recovery/ready-step-timeout",
+  "source": {
+    "mission_run": "mission-run/fleet/st3/clean-operational-state/01a0bf17928a7b70976f5b30f78c8e9c",
+    "step_run": "step-run/01a0bf17934a7a03b81bd4931c507f1f/clean-cli-defaults"
+  },
+  "timeout_ms": 10800000,
+  "timeline": [
+    {
+      "accepted_at_unix_ms": 1789920739909,
+      "kind": "step-run.state",
+      "status": "ready"
+    },
+    {
+      "accepted_at_unix_ms": 1789931540058,
+      "kind": "step-run.state",
+      "status": "failed",
+      "reason": "the step timeout expired"
+    }
+  ],
+  "elapsed_ms": 10800149,
+  "claim_events": 0,
+  "execution_started_at_unix_ms": null,
+  "observed": {
+    "status": "failed",
+    "reason": "the step timeout expired"
+  },
+  "expected": {
+    "status": "ready",
+    "reason": "the execution timeout has not started"
+  },
+  "root_cause": {
+    "file": "crates/st3/src/reconcile.rs",
+    "function": "step_timed_out",
+    "clock": "latest step-run.state accepted_at_unix_ms",
+    "defect": "ready and blocked time consumes the active execution timeout before any worker claim"
+  }
+}

@@ -1,0 +1,56 @@
+version 2
+
+// Stop finite work at a person's review before anything is published.
+//
+// The seat prepares a change and pushes it. An agentless gate checks the pushed tree, not the
+// seat's working tree. The human gate then waits for one exact person. The seat is free for other
+// runs while it waits, and nothing polls.
+//
+// The review appears in the person's attention inbox with the exact commands to decide it:
+//
+//   st3 attention ls --as person/operator
+//   st3 attention approve step-run/GENERATION/approve \
+//     --as person/operator --reason "the release notes are accurate"
+//
+// Use the exact step-run subject that `attention ls` prints; GENERATION is a placeholder. A
+// rejection fails the gate. Republishing the mission cannot forge a decision.
+//
+//   st3 agents apply examples/st3/seats/omp.kdl --as person/operator
+//   st3 missions publish examples/st3/human-review.kdl --as person/operator
+//   st3 missions start example/release --id example/release/1.4.0 \
+//     --workspace /srv/example/app --as person/operator
+
+mission "example/release" state="ready" {
+  goal "Prepare the invented 1.4.0 release notes, and publish them only after a person approves them."
+
+  step "prepare" timeout="45m" {
+    assigned-to "agent/example/worker"
+    goal "Write RELEASE-NOTES.md for 1.4.0 from the commits since v1.3.0, then commit and push the release-notes branch."
+  }
+
+  step "verify" {
+    agentless
+    depends-on { step "prepare" completed }
+    gate "the pushed branch has release notes" {
+      exec "/usr/bin/git fetch --quiet origin release-notes && /usr/bin/git cat-file -e FETCH_HEAD:RELEASE-NOTES.md"
+      host "local"
+      workspace "${ST_WORKSPACE}"
+      time-limit "2m"
+    }
+  }
+
+  step "approve" {
+    agentless
+    depends-on { step "verify" completed }
+    gate "the operator approves the release notes" type="human" {
+      reviewer "person/operator"
+      question "Publish the release notes on the release-notes branch as 1.4.0?"
+    }
+  }
+
+  step "publish" timeout="30m" {
+    assigned-to "agent/example/worker"
+    depends-on { step "approve" completed }
+    goal "Merge the release-notes branch into main, tag v1.4.0, and push main and the tag."
+  }
+}

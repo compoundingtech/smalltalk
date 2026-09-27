@@ -1,0 +1,27 @@
+version 2
+
+  mission "eval/resource-handoff" state="ready" timeout="20m" {
+    completion { when "all-steps-exhausted" }
+    goal "Complete mission eval/resource-handoff."
+    step "contract" timeout="1m" {
+      title "The resource moves from A to B without overlap"
+        exec "eval/resource-handoff/contract" {
+          host "local"
+          workspace "${ST_WORKSPACE}/fixture"
+          cwd "${ST_WORKSPACE}/fixture"
+          command "bash ./run.sh"
+          restart "never"
+        }
+      gate "condition-1" { field "status" "exec/${ST_MISSION_RUN}/eval/resource-handoff/contract" "is" "exited" }
+      gate "condition-2" { field "exit_code" "exec/${ST_MISSION_RUN}/eval/resource-handoff/contract" "is" 0 }
+    }
+    step "gate" timeout="1m" {
+      depends-on { step "contract" completed }
+      gate "the resource history revokes A before granting B" {
+        exec "bash ./judge.sh"
+        host "local"
+        workspace "${ST_WORKSPACE}/fixture"
+        time-limit "1m"
+      }
+    }
+  }

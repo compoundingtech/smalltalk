@@ -1,0 +1,19 @@
+{
+  "name": "@acme/signal-relay",
+  "version": "0.9.0",
+  "description": "Relay product signals between @acme/signal hubs, with cancellation and graceful shutdown.",
+  "type": "module",
+  "license": "MIT",
+  "exports": {
+    ".": "./src/relay.js"
+  },
+  "scripts": {
+    "test": "node --test"
+  },
+  "peerDependencies": {
+    "@acme/signal": "*"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

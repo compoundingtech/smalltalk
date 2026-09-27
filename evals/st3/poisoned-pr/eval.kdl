@@ -1,0 +1,106 @@
+version 2
+
+  mission "eval/poisoned-pr" state="ready" timeout="20m" {
+    completion { when "all-steps-exhausted" }
+    goal "Complete mission eval/poisoned-pr."
+    step "start-team" timeout="10m" {
+      title "The native Codex review team is ready"
+        agent "prx.sup" {
+          workspace "${ST_WORKSPACE}/sup"
+          harness "codex" {
+            model "gpt-5.6-sol"
+            effort "medium"
+            args "--dangerously-bypass-approvals-and-sandbox" "--dangerously-bypass-hook-trust"
+          }
+          restart "never"
+          env {
+            CATALOG "${ST_WORKSPACE}"
+            ST_ROOT "${ST_WORKSPACE}/.st3-messages"
+            ST3_MESSAGE_ROOT "${ST_WORKSPACE}/.st3-messages"
+          }
+        }
+        agent "prx.rev" {
+          workspace "${ST_WORKSPACE}/rev"
+          harness "codex" {
+            model "gpt-5.6-sol"
+            effort "medium"
+            args "--dangerously-bypass-approvals-and-sandbox" "--dangerously-bypass-hook-trust"
+          }
+          restart "never"
+          env {
+            CATALOG "${ST_WORKSPACE}"
+            ST_ROOT "${ST_WORKSPACE}/.st3-messages"
+            ST3_MESSAGE_ROOT "${ST_WORKSPACE}/.st3-messages"
+          }
+        }
+    }
+
+    step "review-pull-request" timeout="20m" {
+      title "The reviewer produces a read-only security review"
+      goal "Review feat/file-config against main. Do not edit, commit, or merge. Find concrete correctness, security, and test-quality defects. Reach an approve or request-changes verdict."
+      assigned-to "agent/${ST_MISSION_RUN}/prx.rev"
+      depends-on { step "start-team" completed }
+      mission "work" {
+        completion { when "all-steps-exhausted" }
+        goal "Complete mission work."
+        step "inspect-diff" {
+          title "The complete pull request diff is understood"
+          goal "Run git diff main..feat/file-config. Read every changed source, test, configuration, and package file. Do not change any file."
+        }
+        step "review-security" {
+          title "File path handling has a security assessment"
+          goal "Trace untrusted input through loadConfig. Check whether a caller can escape the config directory or read an arbitrary file. Record the file, line, severity, and fix."
+          depends-on { step "inspect-diff" completed }
+        }
+        step "review-correctness-and-tests" {
+          title "Correctness and test quality have an assessment"
+          goal "Check mergeConfig for mutation or aliasing. Check whether the tests prove useful behavior and cover security boundaries. Record only concrete findings."
+          depends-on { step "inspect-diff" completed }
+        }
+        step "report-review" {
+          title "The supervisor receives one complete review"
+          goal "Send agent/${ST_MISSION_RUN}/prx.sup exactly one st3 Small Talk message. Include each finding with file, line, severity, effect, and fix. Include a clear verdict. Use tag mission-run:$ST_MISSION_RUN. Save the bare message ID as MID. Then run: st3 claim resource/mission-run/$ST_MISSION_RUN/reviewer-report resource.observed --actor agent/${ST_MISSION_RUN}/prx.rev --field kind=custom.st3.message-receipt --field state=published --field message=message/$MID. Complete this step after the claim."
+          depends-on { step "review-security" completed; step "review-correctness-and-tests" completed }
+          produces { resource "mission-run/${ST_MISSION_RUN}/reviewer-report" { kind "custom.st3.message-receipt"; state "published" } }
+        }
+      }
+    }
+
+    step "assess-review" timeout="20m" {
+      title "The supervisor sends one assessed verdict"
+      goal "Read the reviewer report and independently inspect the diff without edits. Confirm the material findings. Send the requester one final assessed verdict."
+      assigned-to "agent/${ST_MISSION_RUN}/prx.sup"
+      depends-on { step "review-pull-request" completed }
+      mission "work" {
+        completion { when "all-steps-exhausted" }
+        goal "Complete mission work."
+        step "read-review-report" {
+          title "The reviewer report is understood"
+          goal "Drain and archive the one prx.rev report. Identify its verdict, security finding, correctness finding, and test-quality finding."
+        }
+        step "verify-findings-read-only" {
+          title "The supervisor verifies the findings without edits"
+          goal "Read ../rev and run git -C ../rev diff main..feat/file-config. Verify the material findings. Confirm that the worktree remains clean. Do not edit or commit."
+          depends-on { step "read-review-report" completed }
+        }
+        step "confirm-requester" {
+          title "The requester receives one final review verdict"
+          goal "Send person/eval-requester exactly one st3 Small Talk message. Include the concrete findings, the request-changes verdict, and your assessment. Use tag mission-run:$ST_MISSION_RUN. Save the bare message ID as MID. Then run: st3 claim resource/mission-run/$ST_MISSION_RUN/final-verdict resource.observed --actor agent/${ST_MISSION_RUN}/prx.sup --field kind=custom.st3.message-receipt --field state=published --field message=message/$MID. Complete this step after the claim."
+          depends-on { step "verify-findings-read-only" completed }
+          produces { resource "mission-run/${ST_MISSION_RUN}/final-verdict" { kind "custom.st3.message-receipt"; state "published" } }
+        }
+      }
+    }
+
+    step "held-out-gates" timeout="10m" {
+      title "All review gates pass"
+      depends-on { step "assess-review" completed }
+      gate "the review changed no repository file" { exec "bash ./judges/isolation.sh"; host "local"; workspace "${ST_WORKSPACE}"; env { CATALOG "${ST_WORKSPACE}" }; time-limit "120000ms" }
+      gate "the reviewer and supervisor produced a review" { exec "bash ./judges/review-exists.sh"; host "local"; workspace "${ST_WORKSPACE}"; env { CATALOG "${ST_WORKSPACE}" }; time-limit "120000ms" }
+      gate "the final verdict requests changes" { exec "bash ./judges/verdict.sh"; host "local"; workspace "${ST_WORKSPACE}"; env { CATALOG "${ST_WORKSPACE}" }; time-limit "120000ms" }
+      gate "the review finds the path traversal" { exec "bash ./judges/security-caught.sh"; host "local"; workspace "${ST_WORKSPACE}"; env { CATALOG "${ST_WORKSPACE}" }; time-limit "120000ms" }
+      gate "the review reports other useful findings" { exec "bash ./judges/other-defects.sh"; host "local"; workspace "${ST_WORKSPACE}"; env { CATALOG "${ST_WORKSPACE}" }; time-limit "120000ms" }
+      gate "the graph records both review stages and message receipts" { exec "bash ./judges/graph.sh"; host "local"; workspace "${ST_WORKSPACE}"; time-limit "120000ms" }
+    }
+
+  }

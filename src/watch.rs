@@ -341,7 +341,7 @@ fn watch_catalog_generation(
     };
     let generation = control.join(crate::catalog_lock::GENERATION_FILE);
     let mut watcher = recommended_watcher(move |result: notify::Result<Event>| match result {
-        Ok(event) if is_mutation(&event) && event.paths.iter().any(|path| *path == generation) => {
+        Ok(event) if is_mutation(&event) && event.paths.contains(&generation) => {
             let _ = tx.send(());
         }
         Ok(_) => {}
@@ -631,6 +631,29 @@ mod tests {
     fn delivery_watch_is_bounded_by_inputs_not_payload_depth() {
         use std::sync::mpsc::channel;
 
+        const ISOLATED: &str = "ST2_TEST_ISOLATED_DELIVERY_WATCH_COUNT";
+
+        // Other unit tests create inotify descriptors in this process. Run the descriptor count
+        // in a child test process so their concurrent watches cannot change this measurement.
+        if std::env::var_os(ISOLATED).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "watch::tests::delivery_watch_is_bounded_by_inputs_not_payload_depth",
+                    "--test-threads=1",
+                ])
+                .env(ISOLATED, "1")
+                .output()
+                .expect("start isolated delivery watch test");
+            assert!(
+                output.status.success(),
+                "isolated delivery watch test failed:\n{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
         fn inotify_watch_count() -> usize {
             std::fs::read_dir("/proc/self/fdinfo")
                 .unwrap()
@@ -652,10 +675,8 @@ mod tests {
         let before = inotify_watch_count();
         let (tx, _rx) = channel();
         let _watcher = watch_delivery_inputs(agent_dir, tx).expect("start delivery watcher");
-        // The count is host-wide, so a concurrent process releasing watches can make it fall
-        // between the two reads. That cannot mean this watcher allocated any, so saturate: an
-        // unsigned wrap would panic the assertion below with u64::MAX, blaming the watcher for
-        // another process's teardown.
+        // A watcher teardown can still make the count fall between reads. Saturation keeps that
+        // unrelated teardown from producing an unsigned wrap.
         let delta = inotify_watch_count().saturating_sub(before);
         assert!(
             delta < 32,

@@ -6,7 +6,7 @@ Accepted on 2026-09-05 for R42 launch argv transparency.
 
 ## Context
 
-st2 adds `systemd-run` around every PTY and exec launch when Linux systemd
+The runtime adds `systemd-run` around every PTY and exec launch when Linux systemd
 scope isolation is available. Rust passes the task program and arguments to
 that outer process as opaque OS strings, but `systemd-run` performs its own
 command-line environment expansion by default. A Linux systemd 260 experiment

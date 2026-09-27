@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+catalog=${1:-${CATALOG:-}}
+evals=${2:-../evals/cells}
+if [ -z "$catalog" ] || [ ! -d "$catalog" ]; then
+  echo "usage: check-st3-migration CATALOG [EVALS]" >&2
+  exit 2
+fi
+if [ ! -d "$evals" ]; then
+  echo "eval tree does not exist: $evals" >&2
+  exit 2
+fi
+
+output=$(mktemp -d "${TMPDIR:-/tmp}/st3-migration.XXXXXX")
+trap 'rm -rf -- "$output"' EXIT
+
+cargo build -p st3 -p st3-migrate
+target/debug/st3-migrate catalog "$catalog" \
+  --output "$output/catalog" \
+  --report "$output/catalog-report.json" \
+  --host local
+target/debug/st3-migrate evals "$evals" \
+  --output "$output/evals" \
+  --report "$output/evals-report.json" \
+  --host local
+
+jq -e '.warnings | length == 0' "$output/catalog-report.json" >/dev/null
+jq -e '.warnings | length == 0' "$output/evals-report.json" >/dev/null
+test "$(jq '.files | length' "$output/catalog-report.json")" -gt 0
+test "$(jq '.files | length' "$output/evals-report.json")" -gt 0
+
+echo "catalog files: $(jq '.files | length' "$output/catalog-report.json")"
+echo "catalog documents: $(jq '.documents | length' "$output/catalog-report.json")"
+echo "eval files: $(jq '.files | length' "$output/evals-report.json")"
+echo "eval documents: $(jq '.documents | length' "$output/evals-report.json")"
+echo "migration parity checks passed"

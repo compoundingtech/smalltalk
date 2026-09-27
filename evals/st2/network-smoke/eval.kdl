@@ -1,0 +1,13 @@
+version 1
+
+eval {
+  copy "./fixture"
+  max-timeout "60s"
+  run "host-and-probe" {
+    command #"sh -c 'st2 up --catalog "$CATALOG/net" --host local --interval 1 >/dev/null 2>&1 & up=$!; trap "st2 down --catalog \"$CATALOG/net\" --host local >/dev/null 2>&1; kill $up 2>/dev/null || true" EXIT; for i in $(seq 1 40); do st2 doctor --catalog "$CATALOG/net" --host local >/dev/null 2>&1 && break; sleep 0.2; done; st2 doctor --catalog "$CATALOG/net" --host local; st2 message send local.dev --catalog "$CATALOG/net" --host local --as local.dev -m NETWORK-SMOKE-ROUNDTRIP; sleep 1; grep -rhs NETWORK-SMOKE-ROUNDTRIP "$CATALOG/net/local/dev/resources"'"#
+  }
+  judges {
+    judge "the hosted subject is healthy" { exec "grep -Fq 'all checks passed' $RUNS_DIR/host-and-probe.out" }
+    judge "Small Talk reaches the hosted subject" { exec "grep -Fq NETWORK-SMOKE-ROUNDTRIP $RUNS_DIR/host-and-probe.out" }
+  }
+}

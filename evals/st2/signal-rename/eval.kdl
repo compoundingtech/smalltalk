@@ -1,0 +1,80 @@
+version 1
+
+// signal-rename-codex.kdl — the full Codex twin of signal-rename. `st2 eval ./` runs it.
+//
+// A four-agent tree coordinates the product rename `signal` -> `beacon` across a base package, two
+// consumers, and a config sweep without renaming the AbortSignal/controller.signal/SIGTERM primitive.
+// The synthetic git graph is rebuilt on every run. materialize.sh copies each source persona to the
+// matching clone's AGENTS.md. The native harness drivers own message delivery. All five judges are held out.
+
+// Harness loaders, personas, and hooks are intentionally baked into fixture workspaces;
+// bin/check-harness-contract.sh verifies every current bus-connected model agent.
+team "sig" {
+  agent "sup" {
+    workspace "./sup"
+    harness "codex" {
+      model "gpt-5.6-sol"
+      effort "medium"
+      prompt "You just cold-started in a hermetic st2 eval. Read AGENTS.md. Drain the inbox once with st2 message using $ST_ROOT and $ST_AGENT, then set status available. For each message: read it, act on it, and archive it in the same turn. Never end a turn while a handled inbox message remains. If the drain contains no work, end this turn and stay idle. Do not run a blocking wait, trace, poll, or sleep command. The native driver will start a new turn when a message arrives. Drive the coordinated rename to a verified finish. Report completion or blockers through st2 messages."
+      args "--dangerously-bypass-approvals-and-sandbox" "--dangerously-bypass-hook-trust"
+    }
+  }
+  agent "base" {
+    workspace "./base"
+    harness "codex" {
+      model "gpt-5.6-sol"
+      effort "medium"
+      prompt "You just cold-started in a hermetic st2 eval. Read AGENTS.md. Drain the inbox once with st2 message using $ST_ROOT and $ST_AGENT, then set status available. If the drain contains no work, end this turn and stay idle. Do not run a blocking wait, trace, poll, or sleep command. The native driver will start a new turn when a message arrives. Then drain the inbox again, act on every message, archive each handled item, and execute, push, coordinate, and report end-to-end. Report completion or blockers through st2 messages."
+      args "--dangerously-bypass-approvals-and-sandbox" "--dangerously-bypass-hook-trust"
+    }
+  }
+  agent "relay" {
+    workspace "./relay"
+    harness "codex" {
+      model "gpt-5.6-sol"
+      effort "medium"
+      prompt "You just cold-started in a hermetic st2 eval. Read AGENTS.md. Drain the inbox once with st2 message using $ST_ROOT and $ST_AGENT, then set status available. If the drain contains no work, end this turn and stay idle. Do not run a blocking wait, trace, poll, or sleep command. The native driver will start a new turn when a message arrives. Then drain the inbox again, act on every message, archive each handled item, and execute, push, coordinate, and report end-to-end. Report completion or blockers through st2 messages."
+      args "--dangerously-bypass-approvals-and-sandbox" "--dangerously-bypass-hook-trust"
+    }
+  }
+  agent "hub" {
+    workspace "./hub"
+    harness "codex" {
+      model "gpt-5.6-sol"
+      effort "medium"
+      prompt "You just cold-started in a hermetic st2 eval. Read AGENTS.md. Drain the inbox once with st2 message using $ST_ROOT and $ST_AGENT, then set status available. If the drain contains no work, end this turn and stay idle. Do not run a blocking wait, trace, poll, or sleep command. The native driver will start a new turn when a message arrives. Then drain the inbox again, act on every message, archive each handled item, and execute, push, coordinate, and report end-to-end. Report completion or blockers through st2 messages."
+      args "--dangerously-bypass-approvals-and-sandbox" "--dangerously-bypass-hook-trust"
+    }
+  }
+}
+
+eval {
+  copy "./fixture"
+  run "materialize" {
+    command #"bash ./materialize.sh"#
+  }
+  message {
+    from "morgan"
+    to "sig.sup"
+    content "./task.md"
+  }
+  max-timeout "1800s"
+
+  judges {
+    judge "ISOLATION — every commit stayed in its author's package lane (base/relay/hub/sup); no cross-lane edit" {
+      exec "bash ./judges/isolation.sh"
+    }
+    judge "SUITE GREEN — node --test passes in every package on integrated main" {
+      exec "bash ./judges/suite-green.sh"
+    }
+    judge "RENAME — product fully renamed to beacon (package + scheme + protocol), no lingering product signal" {
+      exec "bash ./judges/rename.sh"
+    }
+    judge "PRIMITIVE INTACT — AbortSignal / controller.signal / SIGTERM survive undamaged in the relay" {
+      exec "bash ./judges/primitive.sh"
+    }
+    judge "HELD-OUT E2E — a rename-agnostic driver resolves the renamed base+relay+hub end-to-end" {
+      exec "bash ./judges/e2e.sh"
+    }
+  }
+}

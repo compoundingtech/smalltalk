@@ -1,0 +1,34 @@
+version 2
+
+mission "example/garden-work" state="ready" {
+  goal "Create one small project note, checking it for up to three bounded rounds."
+
+  loop "prepare-note" timeout="30m" {
+    max-rounds 3
+    until {
+      // A gate result is cached by its definition. `${loop.round}` makes each round's check a
+      // new gate run; without it, every later round would reuse the first round's result.
+      gate "the garden note exists and is not empty" {
+        exec "/usr/bin/test -s garden-note.md # round ${loop.round}"
+        host "local"
+        workspace "${ST_WORKSPACE}"
+        time-limit "1m"
+      }
+    }
+    round {
+      completion { when "all-steps-exhausted" }
+      step "write-note" timeout="10m" {
+        assigned-to "agent/example/worker"
+        goal "In round ${loop.round}, create garden-note.md in ${ST_WORKSPACE} with a short plan for the invented garden project."
+        goal "Read ${loop.feedback}; when it explains why the last check failed, correct that problem before completing this step."
+      }
+    }
+    on-exhausted {
+      fail
+      attention "The garden note is still missing after three rounds" {
+        reviewer "person/operator"
+        severity "error"
+      }
+    }
+  }
+}

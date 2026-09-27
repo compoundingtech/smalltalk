@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+catalog=${1:-${CATALOG:-}}
+evals=${2:-../evals/cells}
+output=${3:-target/st3-migration}
+if [ -z "$catalog" ] || [ ! -d "$catalog" ]; then
+  echo "usage: prepare-st3-migration CATALOG [EVALS] [OUTPUT]" >&2
+  exit 2
+fi
+if [ ! -d "$evals" ]; then
+  echo "eval tree does not exist: $evals" >&2
+  exit 2
+fi
+
+cargo build -p st3 -p st3-migrate
+target/debug/st3-migrate catalog "$catalog" \
+  --output "$output/catalog" \
+  --report "$output/catalog-report.json" \
+  --host local
+target/debug/st3-migrate evals "$evals" \
+  --output "$output/evals" \
+  --report "$output/evals-report.json" \
+  --host local
+
+jq -e '.warnings | length == 0' "$output/catalog-report.json" >/dev/null
+jq -e '.warnings | length == 0' "$output/evals-report.json" >/dev/null
+echo "translated catalog: $output/catalog"
+echo "translated evals: $output/evals"

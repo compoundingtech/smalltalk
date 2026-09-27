@@ -1,0 +1,9 @@
+{
+  "name": "ledger",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "A tiny command-dispatch service processed in an ordered, idempotent batch.",
+  "main": "src/dispatch.js",
+  "scripts": { "test": "node --test" }
+}

@@ -1,0 +1,16 @@
+{
+  "api_version": "st3.client.v0",
+  "id": "action/complete-build-1",
+  "type": "work.complete",
+  "idempotency_key": "device-7:complete-build:1",
+  "fence": {
+    "snapshot_id": "snapshot/host-a/1842/2fc9",
+    "subject_revisions": { "work/release/1/build": "w4" },
+    "mission_generation": "run-generation/release/1/g1",
+    "step_definition": "def-build",
+    "attempt": 1,
+    "readiness_epoch": 3,
+    "runtime_incarnation": "runtime-9:2026-09-20T11:06:30Z"
+  },
+  "parameters": { "target_id": "work/release/1/build", "summary": "Artifacts built", "evidence": ["vcs-commit/example/abc123"] }
+}

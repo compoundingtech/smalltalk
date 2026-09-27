@@ -36,6 +36,7 @@ mod flock;
 mod fsatomic;
 pub mod harness_context;
 pub mod harness_state;
+pub mod harness_timeline;
 pub mod harness_version;
 pub mod hooks;
 pub mod host_lock;
@@ -43,10 +44,10 @@ pub mod identity;
 pub mod isolate;
 pub mod materialize;
 pub mod message;
-/// The stdio framing shared by the native channels; crate-internal.
-mod native_channel;
 pub mod metrics;
 pub mod migrations;
+/// The stdio framing shared by the native channels; crate-internal.
+mod native_channel;
 pub mod omp_session;
 pub mod opencode_session;
 pub mod park;
@@ -78,6 +79,7 @@ mod watch;
 // The declaration model and the catalog walk live in the `agent-spec` crate, so st2 and any other
 // reader of the same catalog share one implementation. Re-exported under their original paths:
 // `st2::spec::…` / `st2::discovery::…` keep working for the binary and the test suite.
+pub use agent_spec::kdl_version;
 pub use agent_spec::{discovery, spec};
 
 pub use agent_spec::discovery::{Discovered, SpecError, discover, discover_file, discover_strict};

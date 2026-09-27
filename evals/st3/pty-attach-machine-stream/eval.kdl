@@ -1,0 +1,27 @@
+version 2
+
+  mission "eval/pty-attach-machine-stream" state="ready" timeout="20m" {
+    completion { when "all-steps-exhausted" }
+    goal "Complete mission eval/pty-attach-machine-stream."
+    step "contract" timeout="2m" {
+      title "The installed PTY machine stream reconnects without framing loss"
+        exec "eval/pty-attach-machine-stream/probe" {
+          host "local"
+          workspace "${ST_WORKSPACE}/fixture"
+          cwd "${ST_WORKSPACE}/fixture"
+          command "bash -o pipefail -c 'bash ./stream.sh | tee proof.txt'"
+          restart "never"
+          env { CATALOG "${ST_WORKSPACE}/fixture" }
+        }
+      gate "condition-1" { field "status" "exec/${ST_MISSION_RUN}/eval/pty-attach-machine-stream/probe" "is" "exited" }
+      gate "condition-2" { field "exit_code" "exec/${ST_MISSION_RUN}/eval/pty-attach-machine-stream/probe" "is" 0 }
+    }
+    step "gate" timeout="1m" {
+      depends-on { step "contract" completed }
+      gate "all machine-stream markers are present" {
+        exec "bash ./judge.sh"
+        host "local"
+        workspace "${ST_WORKSPACE}/fixture"
+      }
+    }
+  }

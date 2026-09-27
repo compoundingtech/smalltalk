@@ -6,7 +6,7 @@
 
 set -u
 
-identity="${ST_AGENT:-}"
+identity="${ST2_CLAUDE_IDENTITY:-${ST_AGENT:-}}"
 root="${ST_ROOT:-${CATALOG:-}}"
 ritual="Run the st2 boot ritual now: set your status to available, then drain your inbox by reading, acting on, replying when useful, and archiving each handled message. Before resuming or starting work, set your status to busy; set available only when yielding or ready for new work."
 

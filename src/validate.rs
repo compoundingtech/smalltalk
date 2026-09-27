@@ -327,9 +327,7 @@ pub(crate) fn validate_discovered(
         let address_host = s.resolved_host(collision_host).to_string();
         let address = s.effective_address().to_string();
         let duplicate_address = (!s.desired_state.is_retired())
-            .then(|| {
-                seen_addresses.insert((address_host.clone(), address.clone()), s.path.clone())
-            })
+            .then(|| seen_addresses.insert((address_host.clone(), address.clone()), s.path.clone()))
             .flatten();
         if let Some(prev) = &duplicate_id {
             issues.push(Issue::error(
@@ -600,30 +598,6 @@ pub(crate) fn validate_discovered(
         };
         if let Err(error) = render_validation {
             issues.push(Issue::error("render-error", rp, ag, format!("{error:#}")));
-        }
-    }
-
-    let mut root_counts: HashMap<String, usize> = HashMap::new();
-    for spec in &d.specs {
-        let host = spec.resolved_host(this_host.unwrap_or_default()).to_owned();
-        root_counts.entry(host).or_default();
-        if crate::supervisor_chain::is_counted_root(spec) {
-            *root_counts
-                .get_mut(spec.resolved_host(this_host.unwrap_or_default()))
-                .expect("root count entry was just inserted") += 1;
-        }
-    }
-    for (host, count) in root_counts {
-        if count != 1 {
-            issues.push(Issue::error(
-                "root-count",
-                ".".to_string(),
-                None,
-                format!(
-                    "host '{}' must declare exactly one root agent; found {count}",
-                    if host.is_empty() { "<default>" } else { &host }
-                ),
-            ));
         }
     }
 

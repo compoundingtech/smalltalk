@@ -1,0 +1,40 @@
+{
+  "schema": "st3-eval-proof.v1",
+  "date": "2026-08-27",
+  "eval": "signal-rename-codex",
+  "paid_attempt": 2,
+  "candidate": {
+    "git_head": "5e72de6ff155e23db184ad5630264d43015ed504",
+    "working_tree": "dirty",
+    "st3_version": "0.1.0",
+    "st3_binary_sha256": "66a55333ab19542e036a7241b7b32cedab7699d91eaba31eb4e5470ffdfd07e6",
+    "eval_kdl_sha256": "7c0e5470786fd00e79f7a121db848abc4b3c4da1d0bf8b07bbb7eae08a0319dd",
+    "task_document_sha256": "f12083c4ec4a7b2d6d9af20a5acdd89663a31532f4a3cee10c43fe283f61f1de"
+  },
+  "providers": {
+    "codex_cli": "0.150.0",
+    "pty": "0.12.0+face607"
+  },
+  "usage": {
+    "weekly_remaining_before_percent": 86,
+    "weekly_remaining_after_percent": 86,
+    "model_agents_started": 0,
+    "reset_redeemed": false
+  },
+  "result": {
+    "done": false,
+    "materialize_checkpoint_passed": true,
+    "stopped_checkpoint": "The eval team is running",
+    "cause": "The installed Codex CLI changed to 0.150.0, which the exact protocol allowlist had not admitted.",
+    "evidence": [
+      "The graph launched all four native driver wrappers.",
+      "Each wrapper rejected the unverified Codex app-server version before provider startup.",
+      "No native agent reached readiness."
+    ],
+    "fix": {
+      "description": "A generated schema comparison and a live graph proof admit only codex-cli 0.150.0.",
+      "test": "codex_app_server::tests::protocol_version_gate_accepts_only_the_exact_allowlist",
+      "fixed_binary_sha256": "8aba663563c5421674bdcee1be31ac4a68b3dacf491c3192ca597122b64892c8"
+    }
+  }
+}

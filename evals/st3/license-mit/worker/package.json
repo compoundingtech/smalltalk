@@ -1,0 +1,8 @@
+{
+  "name": "widget",
+  "version": "0.1.0",
+  "private": true,
+  "description": "A tiny widget library.",
+  "license": "LicenseRef-Proprietary",
+  "main": "src/widget.js"
+}

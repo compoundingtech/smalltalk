@@ -1,0 +1,30 @@
+version 2
+
+mission "eval/review-escalation/work" state="ready" revision-cutover="restart-active" {
+  input "source" kind="resource"
+  completion { when "all-steps-exhausted" }
+  goal "Route one immutable pull request review."
+
+  step "review" {
+    agentless
+    produces {
+      resource "mission-run/${ST_MISSION_RUN}/review" { kind "human.review" }
+    }
+  }
+
+  step "route" {
+    assigned-to "agent/eval/review-escalation/standing/owner"
+    depends-on { step "review" completed }
+    goal "Select the final review route."
+  }
+
+  step "human-review" timeout="2m" {
+    agentless
+    depends-on { step "route" completed }
+    gate "the human accepts the routed review" type="human" {
+      reviewer "person/nathan"
+      review "${input.source}"
+      review "resource/mission-run/${ST_MISSION_RUN}/review"
+    }
+  }
+}

@@ -1,0 +1,69 @@
+version 2
+
+  mission "eval/claude-skill-inheritance" state="ready" timeout="20m" {
+    completion { when "all-steps-exhausted" }
+    goal "Complete mission eval/claude-skill-inheritance."
+    step "start-worker" timeout="10m" {
+      title "The native Claude Sonnet worker is ready"
+        agent "si.agent" {
+          workspace "${ST_WORKSPACE}/repo"
+          harness "claude" {
+            model "claude-sonnet-5"
+            effort "medium"
+            args "--permission-mode" "auto" "--plugin-dir" "../plugin/evalpkg"
+          }
+          restart "never"
+          env {
+            CATALOG "${ST_WORKSPACE}"
+            ST_ROOT "${ST_WORKSPACE}/.st3-messages"
+            ST3_MESSAGE_ROOT "${ST_WORKSPACE}/.st3-messages"
+          }
+        }
+    }
+
+    step "exercise-skill-union" timeout="10m" {
+      title "The worker invokes every eval skill across both scopes"
+      goal "Invoke every available skill whose name contains evalskill. Follow each loaded skill exactly. Do not fabricate a skill effect. Report the invoked skill names when both scopes are complete."
+      assigned-to "agent/${ST_MISSION_RUN}/si.agent"
+      depends-on { step "start-worker" completed }
+      mission "work" {
+        completion { when "all-steps-exhausted" }
+        goal "Complete mission work."
+        step "discover-eval-skills" {
+          title "Every available evalskill is identified"
+          goal "Inspect the available Claude skills. Identify every skill whose name contains evalskill, including project and plugin namespaces. Do not read held-out gates."
+        }
+        step "invoke-project-skill" {
+          title "The project eval skill is invoked"
+          goal "Use the project-scope evalskill through Claude's skill mechanism. Follow its loaded instructions exactly. Do not invent the instruction from this mission."
+          depends-on { step "discover-eval-skills" completed }
+        }
+        step "invoke-plugin-skill" {
+          title "The plugin eval skill is invoked"
+          goal "Use the plugin-scope evalskill through Claude's skill mechanism. Follow its loaded instructions exactly. Do not invent the instruction from this mission."
+          depends-on { step "discover-eval-skills" completed }
+        }
+        step "verify-skill-effects" {
+          title "Both loaded skill effects exist"
+          goal "Verify that both invoked skills produced their requested effects. Do not change or copy either effect."
+          depends-on { step "invoke-project-skill" completed; step "invoke-plugin-skill" completed }
+        }
+        step "report-skill-check" {
+          title "The requester receives the skill union result"
+          goal "Send person/eval-requester exactly one Small Talk message. State which project and plugin skills you invoked. Do not include either secret token. Use tag mission-run:$ST_MISSION_RUN. Save the bare message ID as MID. Run: st3 claim resource/mission-run/$ST_MISSION_RUN/skill-report resource.observed --actor agent/${ST_MISSION_RUN}/si.agent --field kind=custom.st3.message-receipt --field state=published --field message=message/$MID. Complete this step after the claim."
+          depends-on { step "verify-skill-effects" completed }
+          produces { resource "mission-run/${ST_MISSION_RUN}/skill-report" { kind "custom.st3.message-receipt"; state "published" } }
+        }
+      }
+    }
+
+    step "held-out-gates" timeout="5m" {
+      title "All Claude Skill Inheritance gates pass"
+      depends-on { step "exercise-skill-union" completed }
+      gate "the project skill wrote its secret token" { exec "bash ./judges/project-scope.sh"; host "local"; workspace "${ST_WORKSPACE}"; env { CATALOG "${ST_WORKSPACE}" }; time-limit "120000ms" }
+      gate "the plugin skill wrote its secret token" { exec "bash ./judges/plugin-scope.sh"; host "local"; workspace "${ST_WORKSPACE}"; env { CATALOG "${ST_WORKSPACE}" }; time-limit "120000ms" }
+      gate "the session did not pollute personal Claude scope" { exec "bash ./judges/isolation.sh"; host "local"; workspace "${ST_WORKSPACE}"; env { CATALOG "${ST_WORKSPACE}" }; time-limit "120000ms" }
+      gate "the graph records skill discovery, both invocations, verification, and the report" { exec "bash ./judges/graph.sh"; host "local"; workspace "${ST_WORKSPACE}"; time-limit "120000ms" }
+    }
+
+  }

@@ -93,10 +93,19 @@
           inherit version;
           src = self;
 
-          # No git or crates.io-yanked deps in the lockfile, so the lockfile
-          # alone pins every input reproducibly — no per-dep outputHashes, and
-          # nothing here to hand-patch when a dep bumps.
-          cargoLock.lockFile = ./Cargo.lock;
+          cargoLock = {
+            lockFile = ./Cargo.lock;
+            outputHashes = {
+              "pty-core-0.13.0-rust" = "sha256-q5Aa7pmAKBakzAyl5pXSfD7d/x9a2mtDC96tLbPPi4w=";
+            };
+          };
+
+          # The workspace default members include the st3 crates. This package ships only st2;
+          # st3, `st`, stui, and st3-migrate come from the st3 package, so each has one build.
+          cargoBuildFlags = [
+            "-p"
+            "st2"
+          ];
 
           # This NixStamp is the binary's authoritative build identity; it wins
           # over the LocalStamp `build.rs` bakes from git (which is empty here
@@ -171,6 +180,21 @@
             "st2-pty-stats-component"
             "--exclude"
             "st2-vista-component"
+            # `checks.st3` gates these crates with the runtime inputs their tests need.
+            "--exclude"
+            "st-runtime"
+            "--exclude"
+            "st3"
+            "--exclude"
+            "st3-client"
+            "--exclude"
+            "st3-client-codegen"
+            "--exclude"
+            "st3-migrate"
+            "--exclude"
+            "st3-schema"
+            "--exclude"
+            "stui"
             "--lib"
             "--bins"
             "--test"
@@ -219,6 +243,125 @@
             mainProgram = "st2";
           };
         };
+
+        st3 = pkgs.rustPlatform.buildRustPackage {
+          pname = "st3";
+          inherit version;
+          src = self;
+          cargoLock = {
+            lockFile = ./Cargo.lock;
+            outputHashes = {
+              "pty-core-0.13.0-rust" = "sha256-q5Aa7pmAKBakzAyl5pXSfD7d/x9a2mtDC96tLbPPi4w=";
+            };
+          };
+          cargoBuildFlags = [
+            "-p"
+            "st3"
+            "-p"
+            "st3-migrate"
+            "-p"
+            "stui"
+          ];
+          # `--no-fail-fast` reports every failing test target in one run.
+          cargoTestFlags = [
+            "--no-fail-fast"
+            "-p"
+            "st-runtime"
+            "-p"
+            "st3"
+            "-p"
+            "st3-client"
+            "-p"
+            "st3-client-codegen"
+            "-p"
+            "st3-migrate"
+            "-p"
+            "st3-schema"
+            "-p"
+            "stui"
+          ];
+          # These two tests put an openpty(3) terminal into raw mode. In the macOS Nix build one
+          # fails and the other hangs, so they run on Linux only until they pass on macOS.
+          checkFlags = pkgs.lib.optionals pkgs.stdenv.hostPlatform.isDarwin [
+            "--skip"
+            "client::tests::a_terminal_attachment_reconnects_across_a_temporary_gateway_restart"
+            "--skip"
+            "client::tests::terminal_socket_eof_restores_and_sanitizes_the_callers_tty"
+          ];
+          # Render tests create throwaway repositories and call Git to protect
+          # tracked files. Keep that dependency in the hermetic check sandbox.
+          nativeBuildInputs = [
+            pkgs.git
+            pkgs.installShellFiles
+          ];
+          # The daemon survival suite exercises the packaged PTY boundary. The client code
+          # generator formats the Rust client it checks with rustfmt.
+          nativeCheckInputs = [
+            pkgs.bashInteractive
+            pkgs.jq
+            pkgs.rustfmt
+            pkgs.which
+            pty.packages.${system}.default
+          ]
+          # Native session discovery lists processes with ps and lsof on macOS (Linux reads /proc).
+          ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isDarwin [
+            pkgs.ps
+            pkgs.lsof
+          ];
+          postInstall = ''
+            ln -s st3 $out/bin/st
+            ln -s ${pty.packages.${system}.default}/bin/pty $out/bin/pty
+            $out/bin/st3 completions bash > st3.bash
+            $out/bin/st3 completions zsh > _st3
+            $out/bin/st3 completions fish > st3.fish
+            installShellCompletion --cmd st3 --bash st3.bash --zsh _st3 --fish st3.fish
+          '';
+          meta = {
+            description = "Small Talk claims-graph runtime, terminal UI, and st2 KDL migration tool";
+            homepage = "https://github.com/compoundingtech/st2";
+            license = pkgs.lib.licenses.mit;
+            mainProgram = "st3";
+          };
+        };
+
+        st3Help = pkgs.runCommand "st3-help-${version}" { } ''
+          test "$(readlink ${st3}/bin/st)" = st3
+          test -x ${st3}/bin/stui
+          test -x ${st3}/bin/pty
+          ${st3}/bin/st3 --help > st3.help
+          ${st3}/bin/st --help > st.help
+          cmp st3.help st.help
+          ${st3}/bin/st3-migrate --help > /dev/null
+          touch $out
+        '';
+
+        # Both products from one source: st2, st3, and the st3 package's own `st` symlink.
+        smallTalk = pkgs.symlinkJoin {
+          name = "small-talk-${version}";
+          paths = [
+            st2
+            st3
+          ];
+        };
+
+        # Every install path leaves `st` resolving to the installed st3, never a separate build.
+        installLayout = pkgs.runCommand "small-talk-install-layout-${version}" { } ''
+          export HOME=$(mktemp -d)
+          test "$(readlink -f ${smallTalk}/bin/st)" = "$(readlink -f ${smallTalk}/bin/st3)"
+          test -x ${smallTalk}/bin/st2
+
+          mkdir built
+          ln -s ${st2}/bin/st2 ${st3}/bin/st3 ${st3}/bin/st3-migrate ${st3}/bin/stui built/
+          bash ${self}/scripts/install --from built --bin-dir "$PWD/bin"
+          test "$(readlink bin/st)" = st3
+          bin/st --help > st.help
+          bin/st3 --help > st3.help
+          cmp st.help st3.help
+          bin/st2 --help > /dev/null
+
+          bash ${self}/scripts/install-test
+          touch $out
+        '';
 
         # Production variant for catalogs that declare wasm resource-profile resolvers. Keep the
         # default package lightweight; consumers opt into the wasmtime closure explicitly.
@@ -274,7 +417,12 @@
           pname = "st2-provider-components";
           inherit version;
           src = self;
-          cargoLock.lockFile = ./Cargo.lock;
+          cargoLock = {
+            lockFile = ./Cargo.lock;
+            outputHashes = {
+              "pty-core-0.13.0-rust" = "sha256-q5Aa7pmAKBakzAyl5pXSfD7d/x9a2mtDC96tLbPPi4w=";
+            };
+          };
           buildPhase = ''
             runHook preBuild
             cargo build --offline --release --target wasm32-unknown-unknown \
@@ -436,6 +584,9 @@
       in
       {
         packages.st2 = st2;
+        packages.st3 = st3;
+        packages.st3-migrate = st3;
+        packages.small-talk = smallTalk;
         packages.st2-wasm-resolver = st2WasmResolver;
         packages.st2-provider-runtime = st2ProviderRuntime;
         # All four components come out of one build; the install paths are unchanged.
@@ -455,6 +606,9 @@
         # commits on every rebase. The devShell ships rustfmt + clippy for whoever
         # wants them.
         checks.st2 = st2;
+        checks.st3 = st3;
+        checks.st3-help = st3Help;
+        checks.install-layout = installLayout;
         checks.release-integration = st2ReleaseIntegration;
         checks.debug-assertions = st2DebugAssertions;
         checks.wasm-resolver-feature = st2WasmResolver;

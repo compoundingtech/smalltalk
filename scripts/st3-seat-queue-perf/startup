@@ -1,0 +1,94 @@
+#!/usr/bin/env bash
+# Start each build from a fresh copy of the fixture store with no traffic, and
+# read its memory 5 and 60 seconds after the socket opens. Builds alternate.
+#
+# Usage: startup FIXTURE_ROOT OUT ROUNDS SPEC...
+#
+# Each SPEC is LABEL|ST3_BIN|EXTRA_ENV, where EXTRA_ENV is empty or
+# space-separated NAME=VALUE pairs for the daemon, such as
+# GLIBC_TUNABLES=glibc.malloc.trim_threshold=131072.
+#
+# Set PERF_TRIM_SHIM to a build of trim.c to preload it. After the 60-second
+# reading the script signals the daemon, the shim writes malloc_info to OUT and
+# calls malloc_trim(0), and the script reads memory once more.
+set -Eeuo pipefail
+
+here="$(cd "$(dirname "$0")" && pwd)"
+source "$here/daemon.sh"
+fixture=$1
+out=$2
+rounds=$3
+shift 3
+shim=${PERF_TRIM_SHIM:+$(readlink -f "$PERF_TRIM_SHIM")}
+mkdir -p "$out"
+csv="$out/startup.csv"
+
+# memory PID AT LABEL ROUND: VmRSS, VmHWM, the main heap, and other anonymous mappings.
+memory() {
+  local heap anon
+  read -r heap anon < <(awk '/^[0-9a-f]+-[0-9a-f]+ / {name = $6; inode = $5}
+    /^Rss:/ {if (name == "[heap]") h += $2; else if (inode == 0 && name == "") a += $2}
+    END {print h + 0, a + 0}' "/proc/$1/smaps")
+  printf '%s,%s,%s,%s,%s,%s,%s\n' "$3" "$4" "$2" \
+    "$(awk '/^VmRSS:/ {print $2}' "/proc/$1/status")" "$(awk '/^VmHWM:/ {print $2}' "/proc/$1/status")" \
+    "$heap" "$anon" >>"$csv"
+}
+
+echo "label,round,at,rss_kib,hwm_kib,heap_kib,other_anon_kib" >"$csv"
+for round in $(seq 1 "$rounds"); do
+  for spec in "$@"; do
+    IFS='|' read -r label st3_bin extra <<<"$spec"
+    if pgrep -x cargo >/dev/null; then
+      echo "a cargo build is running; stopping" >&2
+      exit 1
+    fi
+    root="$(mktemp -d /tmp/sqp.XXXXXX)"
+    state="$(perf_state_dir "$root")"
+    trap 'perf_stop_daemon "$root" >/dev/null 2>&1; rm -rf "$root" "$state"' EXIT
+    mkdir -p "$root/bin" "$state" "$root/pty"
+    cp "$fixture"/fixture/claims.sqlite3* "$state/"
+    cp "$(readlink -f "$st3_bin")" "$root/bin/st3"
+    cat >"$root/config.toml" <<TOML
+node = "perfnode"
+person = "person/perf-operator"
+state_dir = "$state"
+socket = "$root/st3.sock"
+client_gateway_socket = "$root/client.sock"
+TOML
+    trigger="$out/$label-$round.malloc"
+    preload=()
+    [[ -n $shim ]] && preload=(LD_PRELOAD="$shim" PERF_TRIM_TRIGGER="$trigger")
+    # shellcheck disable=SC2086
+    env -i HOME="$HOME" USER="$USER" LOGNAME="$USER" SHELL="$SHELL" LANG="${LANG:-C.UTF-8}" \
+      PATH="$root/bin:$(perf_login_path)" "${preload[@]}" $extra \
+      setsid nice -n 10 "$root/bin/st3" up --config "$root/config.toml" --pty-root "$root/pty" \
+      >>"$root/daemon.log" 2>&1 </dev/null &
+    echo $! >"$root/daemon.pid"
+    for _ in $(seq 1 300); do
+      [[ -S "$root/st3.sock" ]] && break
+      sleep 0.2
+    done
+    pid="$(cat "$root/daemon.pid")"
+    if [[ -n $shim ]] && ! grep -q "$shim" "/proc/$pid/maps"; then
+      echo "the trim shim did not load into $label" >&2
+      exit 1
+    fi
+    sleep 5
+    memory "$pid" 5 "$label" "$round"
+    sleep 55
+    memory "$pid" 60 "$label" "$round"
+    if [[ -n $shim ]]; then
+      kill -s RTMIN+3 "$pid"
+      for _ in $(seq 1 50); do
+        [[ -e "$trigger.done" ]] && break
+        sleep 0.2
+      done
+      sleep 1
+      memory "$pid" trimmed "$label" "$round"
+    fi
+    perf_stop_daemon "$root" >/dev/null 2>&1
+    rm -rf "$root" "$state"
+    trap - EXIT
+    echo "$(date -u +%FT%TZ) $label $round"
+  done
+done

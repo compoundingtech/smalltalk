@@ -1,0 +1,85 @@
+{
+  "contract": "st3.screens.v0",
+  "common_envelope": {
+    "required": ["api_version", "model_version", "request_id", "snapshot", "cursor", "summary", "items", "freshness", "relationships", "actions", "empty", "errors"],
+    "ordering": "documented sort tuple ending in stable ID",
+    "page_limit": 200,
+    "body_limit_bytes": 1048576,
+    "relationships": ["owns", "member-of-generation", "nested-run", "role", "supervises", "under", "targets", "superseded-by", "related"],
+    "freshness_states": ["fresh", "delayed", "unreachable", "indeterminate"],
+    "action_fields": ["type", "label", "target_id", "authority", "preconditions", "fence", "deep_link"]
+  },
+  "screens": [
+    {
+      "id": "now", "task": "Understand what needs attention now", "model": "now.v0", "cli": "st3 now",
+      "sections": ["attention", "active-missions", "available-work", "fleet-health", "recent-change"],
+      "actions": ["attention.open", "mission.open", "work.claim", "operation.open"]
+    },
+    {
+      "id": "missions.list", "task": "Find active or ready missions", "model": "missions-list.v0", "cli": "st3 missions ls",
+      "sections": ["summary", "missions", "progress"], "actions": ["mission.open", "mission.start", "mission.cancel"]
+    },
+    {
+      "id": "missions.detail", "task": "Understand one mission graph and live progress", "model": "mission-detail.v0", "cli": "st3 missions show ID",
+      "sections": ["card", "visual-graph", "runs", "generations", "work", "resources", "history-link"],
+      "actions": ["mission.start", "mission.revise", "mission.cancel", "work.open"]
+    },
+    {
+      "id": "attention", "task": "Review and resolve person-authorized decisions", "model": "attention.v0", "cli": "st3 attention ls --as person/NAME",
+      "sections": ["counts", "inbox", "detail"], "actions": ["attention.resolve", "review.approve", "review.reject", "message.read"]
+    },
+    {
+      "id": "launch", "task": "Author, compare, approve, and launch a mission", "model": "launch.v0", "cli": "st3 launch show ID",
+      "sections": ["conversation", "questions", "variants", "visualization", "diagnostics", "approvals"],
+      "actions": ["launch.revise", "launch.preview", "launch.approve", "launch.cancel", "mission.start"]
+    },
+    {
+      "id": "machines", "task": "Assess fleet health, capacity, projects, and work placement", "model": "machines.v0", "cli": "st3 machines",
+      "sections": ["fleet", "hosts", "capacity", "projects", "work", "transports"],
+      "actions": ["machine.open", "operation.open", "replication.open"]
+    },
+    {
+      "id": "agents", "task": "Find live agents and understand typed ownership", "model": "agents-tree.v0", "cli": "st3 agents tree",
+      "sections": ["counts", "fleet-tree", "agent-detail", "sessions", "work"],
+      "tree": ["fleet", "mission-run", "nested-run", "agent-role"],
+      "actions": ["agent.open", "conversation.open", "runtime.stop", "work.open"]
+    },
+    {
+      "id": "conversations", "task": "Read, follow, and send harness-neutral conversation turns", "model": "conversations.v0", "cli": "st3 conversations sessions",
+      "sections": ["sessions", "timeline", "usage", "errors", "redactions", "truncations"],
+      "actions": ["conversation.follow", "message.send", "message.reply", "message.read", "message.close"]
+    },
+    {
+      "id": "activity", "task": "See typed changes since an event cursor", "model": "activity.v0", "cli": "st3 activity",
+      "sections": ["cursor", "changes", "resync"], "actions": ["subject.open", "activity.follow", "snapshot.resync"]
+    },
+    {
+      "id": "devices", "task": "Pair, inspect, scope, and revoke remote devices", "model": "devices.v0", "cli": "st3 devices",
+      "sections": ["paired", "sessions", "scopes", "revocations"], "actions": ["device.pair", "device.revoke"]
+    },
+    {
+      "id": "work", "task": "See exactly what work is ready, claimed, blocked, or historical", "model": "work.v0", "cli": "st3 work ls",
+      "sections": ["counts", "ready", "claimed", "blocked", "owner", "lease"], "actions": ["work.open", "work.claim", "work.release", "work.wake"]
+    },
+    {
+      "id": "terminals", "task": "Find and safely attach to terminal runtimes", "model": "runtime.v0", "cli": "st3 terminals ls",
+      "sections": ["terminals", "owner-host", "incarnation", "access", "screen"], "actions": ["terminal.attach", "terminal.peek", "terminal.input", "terminal.signal"]
+    },
+    {
+      "id": "import", "task": "Inspect legacy harness conversations and move one under st3 ownership", "model": "session.v0", "cli": "st3 import ls",
+      "sections": ["running-native-sessions", "saved-history", "normalized-conversation", "process-fence", "importability"], "actions": ["conversation.open", "session.import"]
+    },
+    {
+      "id": "subject", "task": "Inspect any registered subject without exposing storage tables", "model": "subject-explorer.v0", "cli": "st3 subject show ID",
+      "sections": ["typed-card", "kind-detail", "current-projection", "relations", "owner", "run", "generation", "resources", "actions", "history"],
+      "actions": ["subject.related", "subject.history", "typed.available-actions"]
+    }
+  ],
+  "parity": {
+    "human_and_json_same_membership": true,
+    "human_and_json_same_counts": true,
+    "client_side_graph_joins": false,
+    "tui_or_mobile_parses_cli": false,
+    "historical_default": false
+  }
+}

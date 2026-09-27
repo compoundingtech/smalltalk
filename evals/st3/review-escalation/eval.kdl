@@ -1,0 +1,19 @@
+version 2
+
+mission "eval/review-escalation" state="ready" timeout="20m" {
+  completion { when "all-steps-exhausted" }
+  goal "Prove that a repository owner can route one review into an optional human gate."
+
+  step "exercise" timeout="18m" {
+    agentless
+    exec "review-escalation/controller" {
+      host "local"
+      workspace "${ST_WORKSPACE}"
+      command "bash ./controller.sh"
+      restart "never"
+    }
+    gate "the review escalation controller passed" {
+      field "exit_code" "exec/${ST_MISSION_RUN}/review-escalation/controller" is 0
+    }
+  }
+}

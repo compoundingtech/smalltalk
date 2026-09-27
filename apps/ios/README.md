@@ -1,0 +1,23 @@
+# Smalltalk iOS
+
+The four-tab Expo app uses the generated `st3.client.v0` TypeScript client. It connects only to a paired gateway: over HTTPS; over plain HTTP to a Tailscale IPv4 address (100.64.0.0/10), which Tailscale encrypts; or over plain HTTP on the local network to a `*.local` name or an RFC1918 address (10/8, 172.16/12, 192.168/16). LAN HTTP is not encrypted: anyone on that network can read the paired credential and data, and the app says so. App Transport Security allows HTTP only for those ranges and `.local`; any other HTTP gateway URL is rejected. The gateway URL and tab order stay in local app preferences; the paired bearer credential stays in iOS Keychain through `expo-secure-store`. No private endpoint or credential is built into the app.
+
+## Connect
+
+1. On a trusted st3 machine, begin device pairing for the intended person with `st3 devices --as person/... pair --full-control "iPhone"` if this trusted device should use Chat, mission/work, runtime, and terminal controls. Without `--full-control`, pairing intentionally grants a limited read/attention/launch scope set; an existing limited device must be re-paired to gain controls.
+2. On the iPhone, connect Tailscale, enter the **paired-only gateway** URL (HTTPS; `http://100.x.y.z:port` for a paired-only listener bound to the host's Tailscale address; or `http://host.local:port` / a private LAN address for one bound to its LAN address), then enter the pairing ID and code. Never publish the privileged `st3.sock`.
+3. Open Now, Chat, Control, and Fleet. The app shows offline/reconnect state; actions require a live connection. It does not queue offline mutations.
+
+Now shows open actionable attention except transcript unread markers. Chat reads bounded normalized session history, sends messages through typed fenced actions, and can switch to a session terminal screen. A paired person with `terminal.input` capability can send a line or Enter, Tab, Esc, Up, Down, and confirmed Ctrl-C. Each input fetches a fresh terminal fence and refuses a changed runtime incarnation; the screen remains readable without control authority. The iOS view polls the screen while visible and does not open a stream attachment. Control shows bounded mission/work progress and launch creation, revision, preview, and approval. Fleet shows machines, connection identity, devices, and local tab ordering. Lists fetch at most 30 items per resource and refresh while foregrounded; event-driven reloads are coalesced to one per 10 seconds, and nothing follows or polls the gateway while the app is in the background (it resyncs once on return). A collection that fails to load is named in a banner instead of appearing empty.
+
+## Build locally
+
+From this directory run `npm ci`, `npm run typecheck`, then `npx expo prebuild --platform ios --clean --no-install`. Install CocoaPods and open the generated `ios/SmalltalkStarter.xcworkspace` in Xcode. For daily development, build the Debug scheme for an iOS Simulator and run `npm run start` for Metro. Keep normal simulator code signing enabled: building with `CODE_SIGNING_ALLOWED=NO` leaves the app without a usable Keychain, so device pairing fails. A physical device is optional for this development proof.
+
+For an offline device build, run `npm run export:ios` and build Release with local Apple Development signing and provisioning for that device. The Release bundle is embedded and runs without Metro. No Expo account, EAS service, App Store, or Shareup signing is part of this path.
+
+The Debug app accepts a short-lived pairing deep link for headless simulator checks: `com.compoundingtech.smalltalk.starter://pair?gateway=...&id=...&code=...`. The handler is disabled in Release. Treat the link as a temporary credential and do not commit or log its populated form.
+
+For connected Debug smoke tests, `com.compoundingtech.smalltalk.starter://tab/Fleet` opens a tab, `com.compoundingtech.smalltalk.starter://mission?id=mission/...` opens a mission, and `com.compoundingtech.smalltalk.starter://session?id=session/...` opens an exact conversation. Add `&terminal=terminal/...` to the session link to inspect its live terminal screen. `com.compoundingtech.smalltalk.starter://scroll?y=800` scrolls the current tab for screenshots. These links are disabled in Release and carry no authorization: the already-paired client still has to pass the gateway's normal checks.
+
+Generated `ios/`, build output, signing material, local configuration, and proof screenshots are ignored by Git. Do not commit Apple team/device IDs, credentials, machine paths, or private network addresses. Expo SDK 57 needs the `expo-build-properties` scene-lifecycle opt-in for Xcode 27/iOS 27.

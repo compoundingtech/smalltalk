@@ -1,6 +1,6 @@
 # st2 bus instructions
 
-You are connected to the st2 bus. Bus ops go through the `st2` CLI. Inbound messages arrive as `[DING]`
+You are connected to the st2 bus. Bus ops go through the `st2` CLI. Inbound messages arrive as `[PING]`
 pokes in your terminal; confirm the actual message via `st2 message ls` + `st2 message read` before
 acting on a new one (each poke carries a stable `[id:<rand6>]` so you can dedup re-pokes at a glance —
 see below).
@@ -17,7 +17,7 @@ see below).
 
 ## Status discipline
 
-Status tells peers whether you are working or ready. DING deliberately does not inspect terminal
+Status tells peers whether you are working or ready. PING deliberately does not inspect terminal
 pixels and does not suppress notifications merely because you are `busy`:
 
 - Set `busy` immediately before actively executing a unit of work, including its tool calls,
@@ -25,10 +25,10 @@ pixels and does not suppress notifications merely because you are `busy`:
 - Set `available` only while ready to receive new work or when yielding back after a completed or
   blocked unit. Do not leave yourself `available` while working.
 - Set `dnd` only as an explicit operator/agent hold. Fresh `dnd` is the only status that defers
-  DING. The sidecar does not refresh `dnd`, so an abandoned hold ages to `unknown` after 15 minutes.
+  PING. The sidecar does not refresh `dnd`, so an abandoned hold ages to `unknown` after 15 minutes.
 
 Use `st2 status "$ST_AGENT" --set busy` before work and
-`st2 status "$ST_AGENT" --set available` when yielding. The live DING sidecar refreshes non-DND
+`st2 status "$ST_AGENT" --set available` when yielding. The live PING sidecar refreshes non-DND
 presence without changing its value.
 
 ## Resume safety — do NOT double-act (important for hosted/respawned agents)
@@ -43,10 +43,10 @@ Rule: **archive a message the moment you act on it** (not at the end of the task
 never leaves an acted-on item to be reprocessed. On resume, for each un-archived item ask "did I already
 handle this?" first — only act on genuinely new ones.
 
-## Inbound message handling ([DING] pokes)
+## Inbound message handling ([PING] pokes)
 
-New peer messages surface as `[DING] new st2 message: [id:<rand6>] <subject> (from <sender>); check
-your inbox` lines. Key only on the `[DING]` prefix and stable `[id:<rand6>]`; descriptive text is not
+New peer messages surface as `[PING] new st2 message: [id:<rand6>] <subject> (from <sender>); check
+your inbox` lines. Key only on the `[PING]` prefix and stable `[id:<rand6>]`; descriptive text is not
 an API. The id is the message filename's rand6 suffix and is stable across re-pokes of the same
 message. If the id matches one you already handled, skip it without listing the inbox again. Dedup on
 the id, never the subject: terminal pixels can overlap and make a subject look stale. For a new id,
@@ -55,7 +55,7 @@ the id, never the subject: terminal pixels can overlap and make a subject look s
 
 ## Threads stay on the bus
 
-A thread that originated from a `[DING]` poke or an inbox message is conversed ONLY via `st2 message
+A thread that originated from a `[PING]` poke or an inbox message is conversed ONLY via `st2 message
 send` / `st2 message reply` — questions, blockers, "I think I'm done" signals, all of it. Your pty REPL
 is unattended; your correspondent is your interlocutor. If you would pause to ask "should I do X?", send
 it via `st2 message reply` instead. Only address the REPL when a human directly typed there.

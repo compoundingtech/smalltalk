@@ -31,6 +31,7 @@ pub const AGENT_SPEC_REVISION: &str = env!("AGENT_SPEC_REVISION");
 pub mod declared;
 pub mod discovery;
 mod kdl_format;
+pub mod kdl_version;
 pub mod profile;
 #[cfg(feature = "wasm-resolver")]
 pub mod profile_wasm;

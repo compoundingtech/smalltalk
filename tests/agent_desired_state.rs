@@ -555,20 +555,23 @@ fn retired_to_suspended_reacquires_address_and_topology_but_not_readiness() {
         retired
     );
 
+    // A host may hold several unsupervised roots, so topology is re-acquired through the
+    // supervisor chain: reactivating a worker under a retired supervisor would head an active
+    // tree with a tombstone.
     let topology_catalog = tempfile::tempdir().unwrap();
     let root = topology_catalog.path();
-    let retired = "agent \"worker\" { host \"h\"; desired-state \"retired\" reason=\"Done\"; command \"true\" }\n";
+    let retired = "agent \"worker\" { host \"h\"; supervisor \"h.root\"; desired-state \"retired\" reason=\"Done\"; command \"true\" }\n";
     write(root, "h/worker/agent.kdl", retired);
     write(
         root,
         "h/root/agent.kdl",
-        "agent \"root\" { host \"h\"; command \"true\" }\n",
+        "agent \"root\" { host \"h\"; desired-state \"retired\" reason=\"Replaced\"; command \"true\" }\n",
     );
     let suspended = author_target(root, "h.worker", "suspended", Some("Waiting"), None);
     assert!(!suspended.status.success());
     let receipt: serde_json::Value = serde_json::from_slice(&suspended.stdout).unwrap();
     assert!(
-        receipt["error"].as_str().unwrap().contains("root-count"),
+        receipt["error"].as_str().unwrap().contains("retired-root"),
         "{receipt:#}"
     );
     assert_eq!(

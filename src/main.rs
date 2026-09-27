@@ -102,7 +102,7 @@ fn dispatch(command: Command, catalog_path: Option<&std::path::Path>) -> Result<
         Command::Service(cmd) => service_cmd(cmd),
         Command::ClaudeChannel(cmd) => claude_channel_cmd(cmd),
         Command::Hooks(cmd) => hooks_cmd(cmd),
-        Command::Ding {
+        Command::Ping {
             session,
             identity,
             agent_id,
@@ -1211,7 +1211,7 @@ fn doctor_cmd(root: &Path, host: Option<String>, require_supervisor: bool) -> Re
         if !spec.has_delivery_transport() {
             report_advisory(
                 &format!("{bus_id} delivery transport missing"),
-                "declare `ding`, `deliver`, or a driver block; agent receives no DING",
+                "declare `ding`, `deliver`, or a driver block; agent receives no PING",
             );
         }
         for task in &spec.tasks {
@@ -1279,7 +1279,7 @@ fn doctor_cmd(root: &Path, host: Option<String>, require_supervisor: bool) -> Re
                                 // observed systemError writes reason without an exit — and
                                 // discarding it leaves the operator nothing to act on.
                                 .or_else(|| {
-                                    observed.reason.as_deref().map(|reason| format!("{reason}"))
+                                    observed.reason.as_deref().map(|reason| reason.to_string())
                                 })
                                 .unwrap_or_else(|| "exit unstated".to_string())
                         ),
@@ -1880,7 +1880,7 @@ fn ding_cmd(
         None => acting_route(&catalog_root, &this_host, &ctx)?,
     };
     // The pty to poke defaults to the identity — an agent IS its pty, so the session id == the agent
-    // id. So `st2 ding --identity mix.worker` pokes pty `mix.worker` (the redundant positional is now
+    // id. So `st2 ping --identity mix.worker` pokes pty `mix.worker` (the redundant positional is now
     // optional). An explicit positional still overrides for the rare non-agent case.
     let session = session.unwrap_or(named);
     // Flat-bus aware: a native catalog agent → its resources/inbox; a catalog-LESS bus (an eval's
@@ -1890,7 +1890,7 @@ fn ding_cmd(
     let inbox = resolve_message_inbox(&catalog_root, &id, &this_host)?;
     let status_path = st2::status::status_path(&agent_dir);
     eprintln!(
-        "st2 ding: watching {}'s inbox ({}) → poking pty '{session}'",
+        "st2 ping: watching {}'s inbox ({}) → poking pty '{session}'",
         id,
         inbox.display()
     );
@@ -2085,13 +2085,26 @@ fn selected_route(
     }
 }
 
+/// Load the message authority that the eval runner injects into one canonical participant.
+fn eval_message_authority(root: &Path) -> Result<Option<message::ExternalInbox>> {
+    let Some(identity) = std::env::var("ST2_EVAL_REQUESTER").ok() else {
+        anyhow::ensure!(
+            std::env::var_os("ST2_EVAL_SENDER").is_none(),
+            "ST2_EVAL_SENDER requires ST2_EVAL_REQUESTER"
+        );
+        return Ok(None);
+    };
+    let mut external = message::ExternalInbox::new(root, &identity)?;
+    if let Ok(sender) = std::env::var("ST2_EVAL_SENDER") {
+        external = external.with_sender(&sender)?;
+    }
+    Ok(Some(external))
+}
+
 /// Resolve ordinary declared messaging authority plus the exact external requester capability
 /// injected only into canonical eval seats.
 fn resolve_message_inbox(root: &Path, id: &str, host: &str) -> Result<PathBuf> {
-    let external = std::env::var("ST2_EVAL_REQUESTER")
-        .ok()
-        .map(|identity| message::ExternalInbox::new(root, &identity))
-        .transpose()?;
+    let external = eval_message_authority(root)?;
     message::resolve_inbox_with_external(root, id, host, external.as_ref())
 }
 
@@ -2406,6 +2419,7 @@ fn message_cmd(cmd: MessageCmd) -> Result<()> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn send_resolved_message(
     root: &Path,
     to: &str,
@@ -2417,10 +2431,7 @@ fn send_resolved_message(
     body: &str,
     idempotency_key: Option<&str>,
 ) -> Result<String> {
-    let external = std::env::var("ST2_EVAL_REQUESTER")
-        .ok()
-        .map(|identity| message::ExternalInbox::new(root, &identity))
-        .transpose()?;
+    let external = eval_message_authority(root)?;
     message::send_to_resolved_inbox(
         root,
         &route_selector(to),
@@ -3560,7 +3571,10 @@ fn ls(root: &Path) -> Result<()> {
                 a.id,
                 a.workspace.as_deref().unwrap_or("<none>")
             );
-            println!("      command: {}", a.command);
+            println!(
+                "      command: {}",
+                a.command.as_deref().unwrap_or("<none>")
+            );
             for ex in &a.execs {
                 println!("      + exec {}: {}", ex.id, ex.command);
             }

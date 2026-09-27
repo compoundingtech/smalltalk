@@ -1,0 +1,22 @@
+version 2
+
+// Give a seat three steps of one run in a fixed order.
+//
+// `queue {}` makes each step depend on the one before it, so the seat receives them one at a time.
+// It orders steps inside one run. The seat's own queue orders whole runs; seat-queue.kdl shows it.
+//
+//   st3 agents apply examples/st3/seats/omp.kdl --as person/operator
+//   st3 missions publish examples/st3/queued-work.kdl --as person/operator
+//   st3 missions start example/maintenance --id example/maintenance/2026-10-01 \
+//     --workspace /srv/example/app --as person/operator
+
+mission "example/maintenance" state="ready" {
+  goal "Measure, improve, and verify one invented slow endpoint, in that order."
+
+  queue "work" {
+    assigned-to "agent/example/worker"
+    step "measure" timeout="30m" { goal "Measure the /search endpoint's latency and complete this step with the baseline."; }
+    step "improve" timeout="2h" { goal "Implement one improvement that the baseline supports, then commit and push it."; }
+    step "verify" timeout="30m" { goal "Run the relevant tests and measure again. Complete this step with both numbers."; }
+  }
+}

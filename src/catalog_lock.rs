@@ -212,7 +212,7 @@ impl CatalogLock {
             .with_context(|| format!("open catalog root capability {}", catalog.display()))?;
 
         let control = catalog.join(CONTROL_DIR);
-        let control_branch = match fs::symlink_metadata(&control) {
+        let _control_branch = match fs::symlink_metadata(&control) {
             Ok(metadata) => {
                 anyhow::ensure!(
                     metadata.is_dir() && !metadata.file_type().is_symlink(),
@@ -228,7 +228,8 @@ impl CatalogLock {
                     control.display()
                 );
                 test_control_creation_checkpoint();
-                let branch = match fs::create_dir(&control) {
+
+                match fs::create_dir(&control) {
                     Ok(()) => {
                         test_control_created_checkpoint();
                         "created"
@@ -249,8 +250,7 @@ impl CatalogLock {
                             format!("create catalog control dir {}", control.display())
                         });
                     }
-                };
-                branch
+                }
             }
             Err(error) => {
                 return Err(error)
@@ -265,7 +265,7 @@ impl CatalogLock {
             .with_context(|| format!("sync catalog root {}", catalog.display()))?;
         #[cfg(debug_assertions)]
         if let Ok(path) = std::env::var("ST2_TEST_CATALOG_CONTROL_BRANCH") {
-            let _ = fs::write(path, control_branch);
+            let _ = fs::write(path, _control_branch);
         }
 
         let control_file = crate::catalog_transaction::openat_dir_nofollow(

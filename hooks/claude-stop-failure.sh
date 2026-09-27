@@ -4,7 +4,7 @@
 
 set -u
 
-identity="${ST_AGENT:-}"
+identity="${ST2_CLAUDE_IDENTITY:-${ST_AGENT:-}}"
 root="${ST_ROOT:-${CATALOG:-}}"
 supervisor="${ST_SUPERVISOR:-}"
 if [[ -z "$identity" || -z "$root" ]] || ! command -v st2 >/dev/null 2>&1 || ! command -v jq >/dev/null 2>&1; then

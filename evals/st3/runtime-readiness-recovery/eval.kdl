@@ -1,0 +1,20 @@
+version 2
+
+mission "eval/runtime-readiness-recovery" state="ready" timeout="20m" {
+  completion { when "all-steps-exhausted" }
+  goal "Prove incarnation-bound readiness and durable work recovery."
+
+  step "contract" timeout="3m" {
+    agentless
+    exec "runtime-readiness-recovery/controller" {
+      host "local"
+      workspace "${ST_WORKSPACE}/fixture"
+      cwd "${ST_WORKSPACE}/fixture"
+      command "bash ./run.sh"
+      restart "never"
+    }
+    gate "the isolated readiness contract passed" {
+      field "exit_code" "exec/${ST_MISSION_RUN}/runtime-readiness-recovery/controller" is 0
+    }
+  }
+}

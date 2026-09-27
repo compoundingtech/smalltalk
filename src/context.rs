@@ -301,7 +301,6 @@ mod tests {
             [0xff],
             "undecodable state stays byte-for-byte intact"
         );
-
     }
 
     #[test]
@@ -315,7 +314,12 @@ mod tests {
         )
         .unwrap();
         std::thread::sleep(std::time::Duration::from_millis(2));
-        append_decision_to_dir(&decisions_dir(&dir), "defer shims", "scope enforcement is follow-on").unwrap();
+        append_decision_to_dir(
+            &decisions_dir(&dir),
+            "defer shims",
+            "scope enforcement is follow-on",
+        )
+        .unwrap();
 
         let dec = read(&dir, View::Decisions);
         let lines: Vec<&str> = dec.lines().collect();
@@ -363,6 +367,9 @@ mod tests {
             "a symlinked now.md lock must refuse the write, got {error:#}"
         );
         assert_eq!(fs::read_to_string(&outside).unwrap(), "unchanged");
-        assert!(!now_file(&dir).exists(), "a refused lock must publish nothing");
+        assert!(
+            !now_file(&dir).exists(),
+            "a refused lock must publish nothing"
+        );
     }
 }

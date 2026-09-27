@@ -96,6 +96,9 @@ where
     };
     let correlate: &dyn Fn(&str, &str) -> String = correlate;
     match harness {
+        // Claude's native channel starts directly on the canonical receipt path and has no
+        // pre-ledger record to translate.
+        Harness::Claude => Ok(Vec::new()),
         Harness::Codex => translate::<codex_v1::Record>(&bytes, agent, correlate),
         Harness::OpenCode => translate::<opencode_v1::Record>(&bytes, agent, correlate),
     }

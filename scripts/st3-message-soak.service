@@ -1,0 +1,15 @@
+[Unit]
+Description=Continuous cross-host st3 message delivery soak
+After=st3.service st3-replication.service
+Wants=st3.service st3-replication.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+EnvironmentFile=%h/.config/st3/message-soak.env
+ExecStart=/usr/bin/bash %h/.local/bin/st3-message-soak
+Restart=always
+RestartSec=10s
+
+[Install]
+WantedBy=default.target

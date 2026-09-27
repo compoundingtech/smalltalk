@@ -539,7 +539,7 @@ fn missing_delivery_is_advisory_while_an_invalid_delivery_is_a_catalog_problem()
     );
     assert!(
         stdout.contains(
-            "⚠ h.worker delivery transport missing — declare `ding`, `deliver`, or a driver block; agent receives no DING"
+            "⚠ h.worker delivery transport missing — declare `ding`, `deliver`, or a driver block; agent receives no PING"
         ),
         "{stdout}"
     );
@@ -714,7 +714,10 @@ fn native_driver_diagnostic_roster_and_doctor_agree_and_recovery_clears() {
     let recovered = doctor(&catalog, &bin, &tmp.path().join("state"));
     let stdout = String::from_utf8_lossy(&recovered.stdout);
     assert!(recovered.status.success(), "{stdout}");
-    assert!(stdout.contains("native driver diagnostic absent"), "{stdout}");
+    assert!(
+        stdout.contains("native driver diagnostic absent"),
+        "{stdout}"
+    );
     assert!(!stdout.contains("seed/unknownStatus"), "{stdout}");
 
     fs::write(st2::driver_diagnostic::path(agent_dir), b"{bad").unwrap();
@@ -866,8 +869,14 @@ fn harness_context_doctor_lines_are_advisory_and_never_change_the_exit_status() 
     let warned = doctor(&catalog, &bin, &state);
     let stdout = String::from_utf8_lossy(&warned.stdout);
     assert!(warned.status.success(), "{stdout}");
-    assert!(stdout.contains("h.worker harness context at 80%"), "{stdout}");
-    assert!(stdout.starts_with("  ⚠") || stdout.contains("⚠ h.worker harness context"), "{stdout}");
+    assert!(
+        stdout.contains("h.worker harness context at 80%"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.starts_with("  ⚠") || stdout.contains("⚠ h.worker harness context"),
+        "{stdout}"
+    );
     assert!(stdout.contains("all checks passed"), "{stdout}");
 
     // Above the window is carried raw into the advisory rather than clamped away.
@@ -875,13 +884,15 @@ fn harness_context_doctor_lines_are_advisory_and_never_change_the_exit_status() 
     let overrun = doctor(&catalog, &bin, &state);
     let stdout = String::from_utf8_lossy(&overrun.stdout);
     assert!(overrun.status.success(), "{stdout}");
-    assert!(stdout.contains("h.worker harness context at 104%"), "{stdout}");
+    assert!(
+        stdout.contains("h.worker harness context at 104%"),
+        "{stdout}"
+    );
 
     // A stale record beside a running desired state warns on its own axis, still advisory. Backdate
     // the reading past the horizon exactly as the passage of time would.
     let path = harness_context_path(&agent_dir);
-    let mut record: serde_json::Value =
-        serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    let mut record: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
     let aged = st2::message::now_ms()
         - u64::try_from(st2::harness_context::HARNESS_CONTEXT_STALE.as_millis()).unwrap()
         - 60_000;
@@ -892,7 +903,15 @@ fn harness_context_doctor_lines_are_advisory_and_never_change_the_exit_status() 
     let stale = doctor(&catalog, &bin, &state);
     let stdout = String::from_utf8_lossy(&stale.stdout);
     assert!(stale.status.success(), "{stdout}");
-    assert!(stdout.contains("h.worker harness context stale"), "{stdout}");
+    assert!(
+        stdout.contains("h.worker harness context stale"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("context age does not report reader health"),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("is its driver still reading"), "{stdout}");
     assert!(
         stdout.contains("context age does not report reader health"),
         "{stdout}"

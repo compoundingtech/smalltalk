@@ -57,17 +57,28 @@ fn graph_preserves_valid_rows_broken_sources_conflicts_and_incompleteness() {
         "broken/agent.kdl",
         "agent \"broken\" { host \"h\"; pty { command \"true\" } }\n",
     );
-    symlink(root.join("missing-declaration.kdl"), root.join("unreadable.kdl")).unwrap();
+    symlink(
+        root.join("missing-declaration.kdl"),
+        root.join("unreadable.kdl"),
+    )
+    .unwrap();
 
     let output = st2(root, &["catalog", "graph", "--host", "h", "--json"], None);
     assert_eq!(output.status.code(), Some(1));
     let graph = json(&output);
     assert_eq!(graph["schema"], "st2.catalog-graph.v2");
     assert_eq!(graph["complete"], false);
-    assert_eq!(graph["roots"]["ptyRoot"], root.join("pty").display().to_string());
+    assert_eq!(
+        graph["roots"]["ptyRoot"],
+        root.join("pty").display().to_string()
+    );
 
     let rows = graph["agents"].as_array().unwrap();
-    assert_eq!(rows.len(), 2, "valid duplicate rows remain visible: {graph:#}");
+    assert_eq!(
+        rows.len(),
+        2,
+        "valid duplicate rows remain visible: {graph:#}"
+    );
     let lead = rows
         .iter()
         .find(|row| row["source"]["path"] == "agents/h/lead/agent.kdl")
@@ -76,7 +87,10 @@ fn graph_preserves_valid_rows_broken_sources_conflicts_and_incompleteness() {
     assert_eq!(lead["supervisor"], "h.boss");
     assert_eq!(lead["persona"], "worker");
     assert_eq!(lead["workspace"], "./.workspace");
-    assert_eq!(lead["resolvedWorkspace"], root.join("agents/h/lead/.workspace").display().to_string());
+    assert_eq!(
+        lead["resolvedWorkspace"],
+        root.join("agents/h/lead/.workspace").display().to_string()
+    );
     assert_eq!(lead["effectiveSessionDriver"], "claude");
     assert!(lead["parentId"].is_null());
     assert!(lead["rootId"].is_null());
@@ -96,9 +110,15 @@ fn graph_preserves_valid_rows_broken_sources_conflicts_and_incompleteness() {
         .unwrap();
     assert_eq!(broken["status"], "invalid");
     assert_eq!(broken["agents"][0]["identity"], "broken");
-    assert!(graph["conflicts"].as_array().unwrap().iter().any(|conflict| {
-        conflict["kind"] == "duplicateIdentity" && conflict["identity"] == "h.lead"
-    }));
+    assert!(
+        graph["conflicts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|conflict| {
+                conflict["kind"] == "duplicateIdentity" && conflict["identity"] == "h.lead"
+            })
+    );
     let issue_codes = graph["issues"]
         .as_array()
         .unwrap()
@@ -164,9 +184,7 @@ fn graph_exposes_admitted_topology_and_delivery_readiness_facts() {
 
 #[test]
 fn graph_ignores_retired_roots_and_folds_legacy_retirement_into_declarations() {
-    // #402 regression fixture: one active root plus root-shaped retired declarations — legacy
-    // `retired #true` and new-style — must leave the host with exactly one counted root, admit
-    // the active topology, and expose the fold in the declaration view.
+    // The declaration view must fold both retirement spellings without hiding active topology.
     let catalog = tempfile::tempdir().unwrap();
     let root = catalog.path();
     write(
@@ -194,15 +212,6 @@ fn graph_ignores_retired_roots_and_folds_legacy_retirement_into_declarations() {
     assert_eq!(output.status.code(), Some(0));
     let graph = json(&output);
     assert_eq!(graph["complete"], true, "{graph:#}");
-    assert!(
-        !graph["issues"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|issue| issue["code"] == "root-count"),
-        "retired roots must not hold the root slot: {graph:#}"
-    );
-
     let rows = graph["agents"].as_array().unwrap();
     let cos = rows.iter().find(|row| row["id"] == "h.cos").unwrap();
     assert_eq!(cos["rootId"], "h.cos");
@@ -225,12 +234,10 @@ fn graph_ignores_retired_roots_and_folds_legacy_retirement_into_declarations() {
     assert!(active["agents"][0]["desiredState"].is_null());
 }
 
-
 #[test]
 fn graph_is_incomplete_when_an_active_worker_descends_from_a_retired_root() {
-    // #405 review: one counted root satisfies root-count, but a worker supervised by a retired
-    // tombstone forms a second, dead-headed tree — the envelope must say so. The worker's own
-    // row still reports its declared chain fact while the graph is incomplete.
+    // A worker supervised by a retired declaration has no active owner. Its row still reports
+    // the declared chain while the graph envelope reports the validation error.
     let catalog = tempfile::tempdir().unwrap();
     let root = catalog.path();
     write(
@@ -271,7 +278,7 @@ fn graph_is_incomplete_when_an_active_worker_descends_from_a_retired_root() {
 }
 
 #[test]
-fn graph_rejects_missing_cycle_depth_and_per_host_root_count() {
+fn graph_rejects_missing_cycle_and_depth_but_allows_independent_roots() {
     let issue_codes = |root: &Path| {
         let output = st2(root, &["catalog", "graph", "--host", "h", "--json"], None);
         assert_eq!(output.status.code(), Some(1));
@@ -311,7 +318,6 @@ fn graph_rejects_missing_cycle_depth_and_per_host_root_count() {
     );
     let cycle_codes = issue_codes(cycle.path());
     assert!(cycle_codes.contains(&"supervisor-cycle".to_owned()));
-    assert!(cycle_codes.contains(&"root-count".to_owned()));
 
     let deep = tempfile::tempdir().unwrap();
     for index in 0..=64 {
@@ -323,9 +329,7 @@ fn graph_rejects_missing_cycle_depth_and_per_host_root_count() {
         write(
             deep.path(),
             &format!("agents/h/node{index}/agent.kdl"),
-            &format!(
-                "agent \"node{index}\" {{ host \"h\";{supervisor} command \"true\" }}\n"
-            ),
+            &format!("agent \"node{index}\" {{ host \"h\";{supervisor} command \"true\" }}\n"),
         );
     }
     assert!(issue_codes(deep.path()).contains(&"supervisor-depth".to_owned()));
@@ -343,16 +347,14 @@ fn graph_rejects_missing_cycle_depth_and_per_host_root_count() {
         &["catalog", "graph", "--host", "h", "--json"],
         None,
     );
-    assert_eq!(roots_output.status.code(), Some(1));
+    assert_eq!(roots_output.status.code(), Some(0));
     let roots_graph = json(&roots_output);
-    assert!(roots_graph["issues"].as_array().unwrap().iter().any(|issue| {
-        issue["code"] == "root-count"
-    }));
+    assert_eq!(roots_graph["complete"], true, "{roots_graph:#}");
     for row in roots_graph["agents"].as_array().unwrap() {
         assert!(row["parentId"].is_null());
-        assert!(row["rootId"].is_null());
-        assert!(row["depth"].is_null());
-        assert!(row["ancestorIds"].is_null());
+        assert_eq!(row["rootId"], row["id"]);
+        assert_eq!(row["depth"], 0);
+        assert_eq!(row["ancestorIds"], serde_json::json!([]));
     }
 }
 #[test]
@@ -388,9 +390,13 @@ fn candidate_overlay_reports_conflict_on_stdout_and_never_publishes() {
     assert_eq!(output.status.code(), Some(1));
     let receipt = json(&output);
     assert_eq!(receipt["schema"], "st2.validate.v2");
-    assert!(receipt["issues"].as_array().unwrap().iter().any(|issue| {
-        issue["code"] == "dup-id" && issue["agent"] == "worker"
-    }));
+    assert!(
+        receipt["issues"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|issue| { issue["code"] == "dup-id" && issue["agent"] == "worker" })
+    );
     assert!(!root.join("agents/h/worker/agent.kdl").exists());
 }
 
@@ -405,13 +411,23 @@ fn graph_reports_default_relative_absolute_and_ambient_pty_roots() {
     );
 
     let default = st2(root, &["catalog", "graph", "--host", "h", "--json"], None);
-    assert!(default.status.success(), "{}", String::from_utf8_lossy(&default.stderr));
-    assert_eq!(json(&default)["roots"]["ptyRoot"], root.join("pty").display().to_string());
+    assert!(
+        default.status.success(),
+        "{}",
+        String::from_utf8_lossy(&default.stderr)
+    );
+    assert_eq!(
+        json(&default)["roots"]["ptyRoot"],
+        root.join("pty").display().to_string()
+    );
 
     write(root, "catalog.kdl", "catalog { pty-root \"shared\" }\n");
     let relative = st2(root, &["catalog", "graph", "--host", "h", "--json"], None);
     assert!(relative.status.success());
-    assert_eq!(json(&relative)["roots"]["ptyRoot"], root.join("shared").display().to_string());
+    assert_eq!(
+        json(&relative)["roots"]["ptyRoot"],
+        root.join("shared").display().to_string()
+    );
 
     let absolute_root = root.join("absolute-registry");
     write(
@@ -421,7 +437,10 @@ fn graph_reports_default_relative_absolute_and_ambient_pty_roots() {
     );
     let absolute = st2(root, &["catalog", "graph", "--host", "h", "--json"], None);
     assert!(absolute.status.success());
-    assert_eq!(json(&absolute)["roots"]["ptyRoot"], absolute_root.display().to_string());
+    assert_eq!(
+        json(&absolute)["roots"]["ptyRoot"],
+        absolute_root.display().to_string()
+    );
 
     let ambient_root = root.join("ambient-shared-registry");
     let ambient = st2(
@@ -430,7 +449,10 @@ fn graph_reports_default_relative_absolute_and_ambient_pty_roots() {
         Some(&ambient_root),
     );
     assert!(ambient.status.success());
-    assert_eq!(json(&ambient)["roots"]["ptyRoot"], ambient_root.display().to_string());
+    assert_eq!(
+        json(&ambient)["roots"]["ptyRoot"],
+        ambient_root.display().to_string()
+    );
 }
 
 /// DELTA-003 (R24/R35): topology keys on the effective agent ID, so a chain declared with
@@ -526,9 +548,7 @@ fn graph_without_explicit_ids_keeps_its_legacy_wire_shape() {
     // `runtime` is an opaque `Value` whose key order is not this contract.
     let emitted = agents_slice
         .lines()
-        .filter(|line| {
-            line.len() - line.trim_start().len() == 6 && line.starts_with("      \"")
-        })
+        .filter(|line| line.len() - line.trim_start().len() == 6 && line.starts_with("      \""))
         .filter_map(|line| {
             let rest = line.trim_start().strip_prefix('"')?;
             let key = rest.split_once('"')?.0;
@@ -564,10 +584,7 @@ fn graph_without_explicit_ids_keeps_its_legacy_wire_shape() {
     ];
     assert_eq!(
         emitted,
-        row_fields
-            .into_iter()
-            .chain(row_fields)
-            .collect::<Vec<_>>(),
+        row_fields.into_iter().chain(row_fields).collect::<Vec<_>>(),
         "existing fields must keep their order and the new ones must come last:\n{raw}"
     );
 
@@ -612,7 +629,11 @@ fn graph_reports_a_duplicate_explicit_agent_id_with_null_topology() {
         &format!("agent \"two\" {{ id \"{SHARED_ID}\"; host \"h2\"; command \"true\" }}\n"),
     );
 
-    let graph = json(&st2(root, &["catalog", "graph", "--host", "h", "--json"], None));
+    let graph = json(&st2(
+        root,
+        &["catalog", "graph", "--host", "h", "--json"],
+        None,
+    ));
     assert!(
         graph["conflicts"]
             .as_array()

@@ -1,0 +1,56 @@
+version 1
+
+// ghost-bug-codex.kdl — the whole eval in one file. `st2 eval ./` runs it; `st2 up ./` boots the team.
+// The ghost-bug debug loop uses Codex native harness seats. Each fixture workspace pre-seeds AGENTS.md.
+// The native driver owns message delivery. The eval keeps the original held-out judges.
+
+// Harness loaders, personas, and hooks are intentionally baked into fixture workspaces;
+// bin/check-harness-contract.sh verifies every current bus-connected model agent.
+team "gbx" {                             // prefixes the agents it holds -> gbx.sup, gbx.fix
+  agent "sup" {
+    workspace "./sup"                    // coordinate-only cwd (owns no product repo)
+    harness "codex" {
+      model "gpt-5.6-sol"
+      effort "medium"
+      prompt "You just cold-started in a hermetic st2 eval. Read AGENTS.md. Drain the inbox once with st2 message using $ST_ROOT and $ST_AGENT, then set status available. If the drain contains no work, end this turn and stay idle. Do not run a blocking wait, trace, poll, or sleep command. The native driver will start a new turn when a message arrives. Then drain the inbox again, act on every message, archive each handled item, and coordinate and verify the whole task end-to-end. Report completion or blockers through st2 messages."
+      args "--dangerously-bypass-approvals-and-sandbox" "--dangerously-bypass-hook-trust"
+    }
+  }
+  agent "fix" {
+    workspace "./worker"                 // owns the labelkit repo (this dir)
+    harness "codex" {
+      model "gpt-5.6-sol"
+      effort "medium"
+      prompt "You just cold-started in a hermetic st2 eval. Read AGENTS.md. Drain the inbox once with st2 message using $ST_ROOT and $ST_AGENT, then set status available. If the drain contains no work, end this turn and stay idle. Do not run a blocking wait, trace, poll, or sleep command. The native driver will start a new turn when a message arrives. Then drain the inbox again, act on every message, archive each handled item, and execute it end-to-end. Report completion or blockers through st2 messages."
+      args "--dangerously-bypass-approvals-and-sandbox" "--dangerously-bypass-hook-trust"
+    }
+  }
+}
+
+eval {                                   // `st2 eval` = copy the world, boot the team, kick off, then judge
+  copy "./fixture"                       // pre-built starting world, 1:1 (worker/_git -> worker/.git on copy)
+  message {                              // kickoff — same as `st2 message send`
+    from "requester"
+    to "gbx.sup"
+    content "./task.md"
+  }
+  max-timeout "1200s"                    // the whole eval must finish within this
+
+  judges {                               // all must pass; each one visible, nothing magic (all mechanical here)
+    judge "isolation — only gbx.fix authored; supervisor owns no repo; change stays in src/test/package/README" {
+      exec "bash ./judges/isolation.sh"
+    }
+    judge "visible suite is green on HEAD" {
+      exec "bash ./judges/suite.sh"
+    }
+    judge "root cause — the shared-default mutation is gone (behavior + no-mutation probes, blind to how)" {
+      exec "bash ./judges/root-cause.sh"
+    }
+    judge "regression test is mutation-valid — RED on the buggy BASE src" {
+      exec "bash ./judges/regression.sh"
+    }
+    judge "coordination — delegate->report visible on the bus" {
+      exec "bash ./judges/coordination.sh"
+    }
+  }
+}

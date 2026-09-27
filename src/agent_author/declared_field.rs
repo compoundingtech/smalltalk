@@ -299,6 +299,7 @@ fn refuse_address_collision(
     ))
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn edit_declaration(
     catalog_lock: &CatalogLock,
     catalog: &Path,

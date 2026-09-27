@@ -1,0 +1,66 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+umask 077
+
+MODE=${1:-}
+ST3_BIN=${ST3_BIN:-$HOME/.local/bin/st3}
+if [[ $MODE != --local-only && $MODE != --local-once ]]; then
+  : "${FABRIC_BIN:?set FABRIC_BIN to the installed Fabric executable}"
+  : "${ST3_SOAK_SILBER_BIN:?set ST3_SOAK_SILBER_BIN to the remote installed st3 executable}"
+fi
+JQ_BIN=${ST3_SOAK_JQ_BIN:-$(command -v jq)}
+TIMEOUT_BIN=${ST3_SOAK_TIMEOUT_BIN:-/usr/bin/timeout}
+STATE_DIR=${ST3_SOAK_IDLE_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/st3/idle-soak}
+LOCAL_SAMPLE="$(/usr/bin/dirname "$ST3_BIN")/st3-idle-sample"
+if [[ $MODE != --local-only && $MODE != --local-once ]]; then
+  REMOTE_SAMPLE="$(/usr/bin/dirname "$ST3_SOAK_SILBER_BIN")/st3-idle-sample"
+fi
+/bin/mkdir -p "$STATE_DIR"
+
+record() {
+  local host=$1 result failure
+  if [[ $host == hetz ]]; then
+    if result=$(ST3_BIN="$ST3_BIN" ST3_SOAK_HOST=hetz "$TIMEOUT_BIN" -k 5s 30s "$LOCAL_SAMPLE" 2>/dev/null); then
+      failure=invalid-local-sample
+    else
+      failure="local-exit-$?"
+      result=
+    fi
+  elif [[ $MODE == --local-only || $MODE == --local-once ]]; then
+    if result=$(ST3_BIN="$ST3_BIN" ST3_SOAK_HOST="$host" \
+      /usr/bin/perl -e 'alarm 30; exec @ARGV or die $!' \
+      "$LOCAL_SAMPLE" 2>/dev/null); then
+      failure=invalid-local-sample
+    else
+      failure="local-exit-$?"
+      result=
+    fi
+  else
+    if result=$("$TIMEOUT_BIN" -k 5s 45s "$FABRIC_BIN" exec silber -- /usr/bin/env \
+      "ST3_BIN=$ST3_SOAK_SILBER_BIN" ST3_SOAK_HOST=silber "$REMOTE_SAMPLE" 2>/dev/null); then
+      failure=invalid-remote-sample
+    else
+      failure="remote-exit-$?"
+      result=
+    fi
+  fi
+  if [[ -n ${result:-} ]] &&
+    "$JQ_BIN" -e --arg host "$host" '.host == $host and (.peer_status | type == "string")' \
+      <<<"$result" >/dev/null 2>&1; then
+    /usr/bin/printf '%s\n' "$result" >>"$STATE_DIR/events.jsonl"
+    return
+  fi
+  "$JQ_BIN" -nc --arg host "$host" --argjson at "$(/bin/date -u +%s)" --arg error "$failure" \
+    '{at:$at,host:$host,error:$error}' >>"$STATE_DIR/events.jsonl"
+}
+
+while true; do
+  if [[ $MODE == --local-only || $MODE == --local-once ]]; then
+    record "${ST3_SOAK_HOST:?set ST3_SOAK_HOST to the canonical host name}"
+  else
+    record hetz
+    record silber
+  fi
+  [[ $MODE == --once || $MODE == --local-once ]] && exit 0
+  /bin/sleep 60
+done

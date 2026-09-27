@@ -1,0 +1,92 @@
+version 2
+
+  mission "eval/weird-git-setup" state="ready" timeout="20m" {
+    completion { when "all-steps-exhausted" }
+    goal "Complete mission eval/weird-git-setup."
+    step "materialize-megarepo" timeout="5m" {
+      title "The linked worktree fixture exists"
+        exec "eval/weird-git-setup/materialize" {
+          host "local"
+          workspace "${ST_WORKSPACE}"
+          cwd "${ST_WORKSPACE}"
+          command "bash ./setup-megarepo.sh"
+          restart "never"
+          env { CATALOG "${ST_WORKSPACE}" }
+        }
+      gate "condition-1" { field "status" "exec/${ST_MISSION_RUN}/eval/weird-git-setup/materialize" "is" "exited" }
+      gate "condition-2" { field "exit_code" "exec/${ST_MISSION_RUN}/eval/weird-git-setup/materialize" "is" 0 }
+    }
+
+    step "start-worker" timeout="10m" {
+      title "The native Codex worker is ready in the linked worktree"
+      depends-on { step "materialize-megarepo" completed }
+        agent "wg.dev" {
+          workspace "${ST_WORKSPACE}/wt/feature"
+          harness "codex" {
+            model "gpt-5.6-sol"
+            effort "medium"
+            args "--dangerously-bypass-approvals-and-sandbox" "--dangerously-bypass-hook-trust"
+          }
+          restart "never"
+          env {
+            CATALOG "${ST_WORKSPACE}"
+            ST_ROOT "${ST_WORKSPACE}/.st3-messages"
+            ST3_MESSAGE_ROOT "${ST_WORKSPACE}/.st3-messages"
+          }
+        }
+    }
+
+    step "repair-feature-worktree" timeout="20m" {
+      title "The worker commits the clamp fix on the feature worktree"
+      goal "Resolve the unusual Git checkout. Fix the above-range clamp bug without weakening the existing regression. Keep the full suite green and commit on this checkout's branch."
+      assigned-to "agent/${ST_MISSION_RUN}/wg.dev"
+      depends-on { step "start-worker" completed }
+      mission "work" {
+        completion { when "all-steps-exhausted" }
+        goal "Complete mission work."
+        step "resolve-checkout" {
+          title "The linked worktree context is understood"
+          goal "Inspect pwd, git status, git rev-parse --show-toplevel, git rev-parse --git-dir, git branch --show-current, and the .git file. Identify the current branch and shared worktree layout."
+        }
+        step "reproduce-failure" {
+          title "The planted clamp failure is reproduced"
+          goal "Run node --test. Read the implementation and existing regression. Identify why an above-range value returns the lower bound."
+          depends-on { step "resolve-checkout" completed }
+        }
+        step "fix-root-cause" {
+          title "The above-range branch returns the upper bound"
+          goal "Make the smallest source fix. Preserve the existing regression without deletion, skip, or weakening."
+          depends-on { step "reproduce-failure" completed }
+        }
+        step "verify-complete-suite" {
+          title "The complete Node suite is green"
+          goal "Run node --test. Confirm the above-range regression remains and the worktree diff contains only the intended fix."
+          depends-on { step "fix-root-cause" completed }
+        }
+        step "publish-feature-revision" {
+          title "The feature worktree revision is published"
+          goal "Commit on the current feature branch with the configured identity. Let SHA be git rev-parse HEAD. Run: st3 claim resource/mission-run/$ST_MISSION_RUN/feature-revision resource.observed --actor agent/${ST_MISSION_RUN}/wg.dev --field kind=vcs.commit --field state=published --field sha=SHA. Complete this step after the claim."
+          depends-on { step "verify-complete-suite" completed }
+          produces { resource "mission-run/${ST_MISSION_RUN}/feature-revision" { kind "vcs.commit"; state "published" } }
+        }
+        step "report-requester" {
+          title "The requester receives the verified worktree result"
+          goal "Send person/eval-requester exactly one Small Talk message. Include the revision, branch, linked-worktree evidence, and green test command. Use tag mission-run:$ST_MISSION_RUN. Save the bare message ID as MID. Run: st3 claim resource/mission-run/$ST_MISSION_RUN/final-report resource.observed --actor agent/${ST_MISSION_RUN}/wg.dev --field kind=custom.st3.message-receipt --field state=published --field message=message/$MID. Complete this step after the claim."
+          depends-on { step "publish-feature-revision" completed }
+          produces { resource "mission-run/${ST_MISSION_RUN}/final-report" { kind "custom.st3.message-receipt"; state "published" } }
+        }
+      }
+    }
+
+    step "held-out-gates" timeout="10m" {
+      title "All Weird Git Setup gates pass"
+      depends-on { step "repair-feature-worktree" completed }
+      gate "the checkout is a linked feature worktree" { exec "bash ./judges/worktree-resolved.sh"; host "local"; workspace "${ST_WORKSPACE}"; env { CATALOG "${ST_WORKSPACE}" }; time-limit "120000ms" }
+      gate "the complete suite is green" { exec "bash ./judges/suite-green.sh"; host "local"; workspace "${ST_WORKSPACE}"; env { CATALOG "${ST_WORKSPACE}" }; time-limit "120000ms" }
+      gate "the fix is committed on feature" { exec "bash ./judges/fix-on-feature.sh"; host "local"; workspace "${ST_WORKSPACE}"; env { CATALOG "${ST_WORKSPACE}" }; time-limit "120000ms" }
+      gate "main and the sibling worktree are unchanged" { exec "bash ./judges/no-leak.sh"; host "local"; workspace "${ST_WORKSPACE}"; env { CATALOG "${ST_WORKSPACE}" }; time-limit "120000ms" }
+      gate "the seeded regression remains effective" { exec "bash ./judges/regression-test.sh"; host "local"; workspace "${ST_WORKSPACE}"; env { CATALOG "${ST_WORKSPACE}" }; time-limit "120000ms" }
+      gate "the graph records the worktree mission, revision, and report" { exec "bash ./judges/graph.sh"; host "local"; workspace "${ST_WORKSPACE}"; env { CATALOG "${ST_WORKSPACE}" }; time-limit "120000ms" }
+    }
+
+  }

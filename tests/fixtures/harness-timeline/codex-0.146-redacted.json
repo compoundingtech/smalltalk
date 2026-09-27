@@ -1,0 +1,14 @@
+{
+  "provenance": {
+    "harness": "codex",
+    "version": "0.146.0",
+    "source": "redacted app-server notification capture"
+  },
+  "thread_id": "thread-fixture",
+  "events": [
+    {"method":"item/started","params":{"threadId":"thread-fixture","turnId":"turn-fixture","item":{"id":"item-command-fixture","type":"commandExecution","command":"shell","arguments":{"command":"printf sk-fixture-secret"}}}},
+    {"method":"item/completed","params":{"threadId":"thread-fixture","turnId":"turn-fixture","item":{"id":"item-command-fixture","type":"commandExecution","command":"shell","arguments":{"command":"printf sk-fixture-secret"},"output":"sk-fixture-secret","error":null}}},
+    {"method":"thread/tokenUsage/updated","params":{"threadId":"thread-fixture","turnId":"turn-fixture","tokenUsage":{"last":{"inputTokens":32022,"cachedInputTokens":11008,"outputTokens":215,"reasoningOutputTokens":31,"totalTokens":32237},"total":{"inputTokens":32022,"totalTokens":32237},"modelContextWindow":258400}}},
+    {"method":"item/completed","params":{"threadId":"thread-fixture","turnId":"turn-fixture","item":{"id":"item-reasoning-fixture","type":"reasoning","text":"provider-hidden-reasoning-fixture"}}}
+  ]
+}

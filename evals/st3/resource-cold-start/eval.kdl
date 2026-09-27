@@ -1,0 +1,52 @@
+version 2
+
+  mission "eval/resource-cold-start" state="ready" timeout="20m" {
+    completion { when "all-steps-exhausted" }
+    goal "Complete mission eval/resource-cold-start."
+
+    agent "worker" {
+      workspace "${ST_WORKSPACE}"
+      command "sh -c 'while :; do sleep 60; done'"
+      restart "always"
+      exec "ding" { argv "st3" "driver" "ding" }
+    }
+
+    step "contract" timeout="1m" {
+      agentless
+      title "The cold resource becomes ready before delivery"
+      exec "eval/resource-cold-start/contract" {
+        host "local"
+        workspace "${ST_WORKSPACE}/fixture"
+        cwd "${ST_WORKSPACE}/fixture"
+        command "bash ./run.sh"
+        restart "never"
+      }
+      gate "condition-1" { field "status" "exec/${ST_MISSION_RUN}/eval/resource-cold-start/contract" "is" "exited" }
+      gate "condition-2" { field "exit_code" "exec/${ST_MISSION_RUN}/eval/resource-cold-start/contract" "is" 0 }
+    }
+
+    step "delivery" timeout="1m" {
+      agentless
+      title "The resource notification reaches the worker"
+      depends-on { step "contract" completed }
+      message "resource-cold-start-${ST_MISSION_RUN}" {
+        from "person/eval-requester"
+        to "worker"
+        content "work://eval/cold-start is ready"
+        title "Resource ready"
+      }
+    }
+
+    step "gate" timeout="1m" {
+      title "The cold-start transition is valid"
+      agentless
+      depends-on { step "delivery" completed }
+      gate "the resource claim precedes one Small Talk action" {
+        exec "bash ./judge.sh"
+        host "local"
+        workspace "${ST_WORKSPACE}/fixture"
+
+        time-limit "1m"
+      }
+    }
+  }

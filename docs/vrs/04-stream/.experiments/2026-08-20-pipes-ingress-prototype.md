@@ -455,8 +455,8 @@ this spike:
   — flaky under parallel `cargo test --lib` when the machine is also compiling;
   green in 4/4 subsequent full runs and green in isolation.
 - `tests/native_only.rs::tracked_product_surface_contains_only_native_names` —
-  trips on `docs/vrs/spec.md:584` ("st2 removes it from the launch
-  environment"), a file this spike never touched, last changed by e4e9d56.
+  tripped on the old launcher wording in `docs/vrs/spec.md`, a file this spike
+  never touched. The wording is now neutral.
 - `tests/native_only.rs::clean_path_supports_help_validate_env_and_doctor` —
   spawns `/bin/sleep`, which does not exist on this NixOS host.
 - `cargo fmt --check` reports diffs in 43 files this spike never touched, so

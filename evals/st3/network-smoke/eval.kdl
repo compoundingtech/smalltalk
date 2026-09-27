@@ -1,0 +1,26 @@
+version 2
+
+  mission "eval/network-smoke" state="ready" timeout="20m" {
+    completion { when "all-steps-exhausted" }
+    goal "Complete mission eval/network-smoke."
+    step "contract" timeout="2m" {
+      title "An isolated st3 daemon hosts a subject and delivers Small Talk"
+        exec "eval/network-smoke/contract" {
+          host "local"
+          workspace "${ST_WORKSPACE}/fixture"
+          cwd "${ST_WORKSPACE}/fixture"
+          command "bash ./run.sh"
+          restart "never"
+        }
+      gate "condition-1" { field "status" "exec/${ST_MISSION_RUN}/eval/network-smoke/contract" "is" "exited" }
+      gate "condition-2" { field "exit_code" "exec/${ST_MISSION_RUN}/eval/network-smoke/contract" "is" 0 }
+    }
+    step "gate" timeout="1m" {
+      depends-on { step "contract" completed }
+      gate "the nested daemon recorded health and delivery" {
+        exec "grep -Fq NETWORK-SMOKE-HEALTH-GREEN result.txt && grep -Fq NETWORK-SMOKE-DELIVERY-GREEN result.txt"
+        host "local"
+        workspace "${ST_WORKSPACE}/fixture"
+      }
+    }
+  }

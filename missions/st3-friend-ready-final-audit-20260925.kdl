@@ -1,0 +1,28 @@
+version 2
+
+mission "fleet/st3/friend-ready-final-audit-20260925" state="ready" {
+  completion { when "all-steps-exhausted" }
+  goal "Make the final friend-ready decision from retained two-host evidence, not from a monitor notification."
+  constraint "Keep the release on hold until the unmodified 24-hour idle and 72-hour bidirectional delivery reports both pass."
+  constraint "Do not edit or discard soak evidence, lower thresholds, expose the privileged socket, or require a physical iPhone."
+
+  step "audit-and-handoff" timeout="8h" {
+    assigned-to "agent/fleet/st3/standing/st3"
+    goal "Inspect both retained soak logs and service health, exact message receipts, strict doctors, signed replication, daemon PIDs, app/TUI evidence, rollback binaries, and final source/test record."
+    goal "If a gate fails, diagnose and remediate it, retain the failure evidence, and restart the complete affected window. Do not announce a friend-ready release on a short diagnostic."
+    goal "If every requirement passes, update the friend-trial handoff with exact evidence and state the bounded trial decision."
+
+    gate "the full two-host idle report passes" {
+      exec "/usr/bin/bash scripts/st3-friend-ready-release-verify idle"
+      host "local"
+      workspace "${ST_WORKSPACE}"
+      time-limit "5m"
+    }
+    gate "the full bidirectional delivery report passes" {
+      exec "/usr/bin/bash scripts/st3-friend-ready-release-verify delivery"
+      host "local"
+      workspace "${ST_WORKSPACE}"
+      time-limit "2m"
+    }
+  }
+}

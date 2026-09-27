@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+: "${ST3_SOAK_TEST_REAL_FABRIC_BIN:?set the real Fabric binary for this test}"
+"$ST3_SOAK_TEST_REAL_FABRIC_BIN" "$@" >/dev/null
+# Simulate a client that loses the response after the remote send commits.
+exit 124

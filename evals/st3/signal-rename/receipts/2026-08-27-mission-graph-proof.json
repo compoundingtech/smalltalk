@@ -1,0 +1,29 @@
+{
+  "schema": "st3-mission-graph-proof.v1",
+  "date": "2026-08-27",
+  "eval": "signal-rename-codex",
+  "mission_run": "52a0a41d099a72bd825f04b5d7c726ca",
+  "mission_revision": "c29cdfbb452b0987111b964511f06610633dcf5dda79727de26a31ae72799f62",
+  "candidate": {
+    "git_head": "2a8c645b69f7f18acd76746e62b88d357a35234a",
+    "working_tree": "dirty",
+    "st3_version": "0.1.0",
+    "st3_binary_sha256": "3baa605bb9ec4639de6f65881621b9b2a4670e1f9e1481cc4295887f5f108bf7",
+    "eval_kdl_sha256": "b43108ef3de6a0629a3382688fdb7c191f86f1369c8914cf44e0854aaec440d3"
+  },
+  "result": {
+    "done": true,
+    "verdict": "pass",
+    "cleanup_complete": true,
+    "integrated_commit": "2489915d1fd509033a0e1296c55400909a7739d4",
+    "judges": [
+      "team completion",
+      "isolation",
+      "visible suite",
+      "complete rename",
+      "primitive preservation",
+      "held-out end-to-end",
+      "Codex sequence and integration review"
+    ]
+  }
+}

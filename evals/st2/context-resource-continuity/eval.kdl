@@ -1,0 +1,10 @@
+version 1
+
+eval {
+  copy "./fixture"
+  max-timeout "90s"
+  run "contract" { command "bash ./run.sh" }
+  judges {
+    judge "context decisions and resources survive two lifecycle cycles" { exec "bash $CATALOG/judge.sh" }
+  }
+}

@@ -18,7 +18,7 @@
 //! subset check proving the exact API arms st2 depends on. Observation requires only the `/doc`
 //! check — its vocabulary already degrades to indeterminate on anything unrecognized.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufRead as _, BufReader, Read as _, Write as _};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
@@ -143,8 +143,12 @@ pub fn run(
     let mut session = {
         let session = harness_state::session_token();
         let seq = harness_state::claim(&agent_dir, identity.clone(), "opencode", &session)?;
-        let mut diagnostics =
-            DiagnosticPublisher::new(&agent_dir, DiagnosticDriver::OpenCode, producer_version, support);
+        let mut diagnostics = DiagnosticPublisher::new(
+            &agent_dir,
+            DiagnosticDriver::OpenCode,
+            producer_version,
+            support,
+        );
         if let Some(reason) = version_failure {
             diagnostics.publish(
                 DiagnosticStage::VersionGate,
@@ -340,6 +344,7 @@ fn run_session(mut session: Session, child: &mut Child, agent_dir: &Path) -> Res
                     if let Some(sid) = event_session_id(&value) {
                         session.delivery.saw_session(sid);
                     }
+                    session.delivery.observe_event(&value)?;
                     machine.apply(&value);
                     if let Some(context) = session.context.as_mut() {
                         fresh_reading |= context.apply(&value);
@@ -369,11 +374,8 @@ fn run_session(mut session: Session, child: &mut Child, agent_dir: &Path) -> Res
             );
         }
         if sse_connected && !evidence && Instant::now() >= next_seed_attempt {
-            evidence = seed_with_diagnostics(
-                &session.client,
-                &mut machine,
-                &mut session.diagnostics,
-            );
+            evidence =
+                seed_with_diagnostics(&session.client, &mut machine, &mut session.diagnostics);
         }
         if evidence && let Some(observation) = machine.observation() {
             let _ = session.writer.observe(observation);
@@ -764,7 +766,9 @@ fn seed_from_server(
             DiagnosticSource::QuestionSnapshot,
         ),
     ] {
-        let pending = client.get_json(endpoint).map_err(|_| (unavailable, source))?;
+        let pending = client
+            .get_json(endpoint)
+            .map_err(|_| (unavailable, source))?;
         let items = pending.as_array().ok_or((malformed, source))?;
         for item in items {
             // An unreadable id could never be released by its id-matched exit.
@@ -1368,6 +1372,44 @@ impl Delivery {
         self.target_session = Some(session_id.to_string());
     }
 
+    /// An assistant message whose `parentID` is our exact stable client message is the first
+    /// provider-native proof that the model turn consumed that input. Storage read-back alone
+    /// deliberately does not release the graph message.
+    fn observe_event(&mut self, event: &Value) -> Result<()> {
+        if event.get("type").and_then(Value::as_str) != Some("message.updated") {
+            return Ok(());
+        }
+        let Some(info) = event.pointer("/properties/info") else {
+            return Ok(());
+        };
+        if info.get("role").and_then(Value::as_str) != Some("assistant") {
+            return Ok(());
+        }
+        let Some(parent_id) = info.get("parentID").and_then(Value::as_str) else {
+            return Ok(());
+        };
+        let session_id = info.get("sessionID").and_then(Value::as_str).or_else(|| {
+            event
+                .pointer("/properties/sessionID")
+                .and_then(Value::as_str)
+        });
+        let filenames = self
+            .ledger
+            .entries()
+            .iter()
+            .filter(|entry| {
+                entry.correlation.value == parent_id
+                    && session_id.is_none_or(|session_id| entry.binding == session_id)
+            })
+            .map(|entry| entry.filename.clone())
+            .collect::<Vec<_>>();
+        for filename in filenames {
+            self.ledger
+                .record(&filename, delivery_ledger::Evidence::Consumed)?;
+        }
+        Ok(())
+    }
+
     #[cfg(test)]
     fn pump(&mut self, client: &Client) {
         self.pump_with_diagnostics(client, None);
@@ -1423,7 +1465,11 @@ impl Delivery {
         };
         // A newly selected session is a different delivery binding (the Codex thread rule): the
         // old binding's receipt may neither suppress nor acknowledge delivery to this one.
-        if self.ledger.binding().is_some_and(|binding| binding != target) {
+        if self
+            .ledger
+            .binding()
+            .is_some_and(|binding| binding != target)
+        {
             self.ledger.rebind(&target)?;
         }
         // Fail closed. An unreadable ledger holds and surfaces instead of guessing, and it never
@@ -1550,8 +1596,10 @@ impl Delivery {
         }
         // The transport call succeeded. That is a fact about the call, not about the server's
         // state, so it grades no higher than `transportAccepted`.
-        self.ledger
-            .record(&entry.filename, delivery_ledger::Evidence::TransportAccepted)?;
+        self.ledger.record(
+            &entry.filename,
+            delivery_ledger::Evidence::TransportAccepted,
+        )?;
         if let Some(diagnostics) = diagnostics.as_deref_mut() {
             diagnostics.clear(DiagnosticStage::Delivery);
         }
@@ -1579,10 +1627,7 @@ impl Delivery {
     }
 }
 
-fn report_read_back(
-    read_back: ReadBack,
-    diagnostics: &mut Option<&mut DiagnosticPublisher>,
-) {
+fn report_read_back(read_back: ReadBack, diagnostics: &mut Option<&mut DiagnosticPublisher>) {
     let Some(diagnostics) = diagnostics.as_deref_mut() else {
         return;
     };
@@ -1634,6 +1679,35 @@ pub fn state_dir(catalog_root: &Path, identity: &str) -> PathBuf {
     }
     let digest = format!("{:x}", hash.finalize());
     base.join("st2").join("opencode").join(&digest[..24])
+}
+
+/// Read the exact inbox files whose correlated OpenCode assistant turn started.
+pub fn consumed_delivery_filenames(
+    catalog_root: &Path,
+    identity: &str,
+    runtime_id: &str,
+) -> Result<BTreeSet<String>> {
+    let path = state_dir(catalog_root, identity).join(delivery_ledger::LEDGER_FILE);
+    if !path.is_file() {
+        return Ok(BTreeSet::new());
+    }
+    let owner = identity.to_owned();
+    let ledger = delivery_ledger::Ledger::open(
+        &path,
+        delivery_ledger::Harness::OpenCode.profile(),
+        identity,
+        runtime_id,
+        move |session, filename| stable_message_id(&owner, session, filename),
+    );
+    if let Some(reason) = ledger.quarantined() {
+        anyhow::bail!("OpenCode delivery receipt ledger is quarantined: {reason}");
+    }
+    Ok(ledger
+        .entries()
+        .iter()
+        .filter(|entry| entry.phase == delivery_ledger::Phase::Consumed)
+        .map(|entry| entry.filename.clone())
+        .collect())
 }
 
 #[cfg(test)]
@@ -1991,9 +2065,7 @@ mod tests {
                     } else {
                         404
                     }
-                } else if method == "GET" && path == "/session" {
-                    200
-                } else if method == "GET" && path == "/config/providers" {
+                } else if method == "GET" && (path == "/session" || path == "/config/providers") {
                     200
                 } else if method == "GET" && path == "/session/status" {
                     if status_err_t.load(Ordering::SeqCst) {
@@ -2278,10 +2350,13 @@ mod tests {
         let expected_id = stable_message_id("h.worker", "ses_target", &filename);
         assert_eq!(
             server.posts.lock().unwrap().as_slice(),
-            [expected_id.clone()]
+            std::slice::from_ref(&expected_id)
         );
         // Same server fixture, same single-POST conclusion, honest label: `GET 200` is storage.
-        let entry = reopen_ledger(&state_path).entry(&filename).cloned().unwrap();
+        let entry = reopen_ledger(&state_path)
+            .entry(&filename)
+            .cloned()
+            .unwrap();
         assert_eq!(entry.phase, delivery_ledger::Phase::Persisted);
         assert_eq!(entry.correlation.value, expected_id);
         assert_eq!(
@@ -2303,7 +2378,40 @@ mod tests {
         assert_eq!(server.posts.lock().unwrap().len(), 1);
     }
 
+    #[test]
+    fn only_the_correlated_assistant_turn_releases_an_opencode_delivery() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = spawn_fake_server();
+        let client = Client::new(server.port, "pw");
+        let state_path = tmp.path().join("state/delivery-ledger.json");
+        let (mut delivery, filename) = delivery_fixture(tmp.path(), state_path.clone());
+        delivery.pump(&client);
+        let expected_id = stable_message_id("h.worker", "ses_target", &filename);
 
+        delivery
+            .observe_event(&event(&format!(
+                r#"{{"type":"message.updated","properties":{{"sessionID":"ses_target","info":{{"role":"assistant","parentID":"msg_unrelated","sessionID":"ses_target"}}}}}}"#
+            )))
+            .unwrap();
+        assert_eq!(
+            ledger_phase(&state_path, &filename),
+            Some(delivery_ledger::Phase::Persisted)
+        );
+
+        delivery
+            .observe_event(&event(&format!(
+                r#"{{"type":"message.updated","properties":{{"sessionID":"ses_target","info":{{"role":"assistant","parentID":"{expected_id}","sessionID":"ses_target"}}}}}}"#
+            )))
+            .unwrap();
+        assert_eq!(
+            ledger_phase(&state_path, &filename),
+            Some(delivery_ledger::Phase::Consumed)
+        );
+        assert_eq!(
+            reopen_ledger(&state_path).retention(&filename),
+            delivery_ledger::Retention::Release
+        );
+    }
 
     #[test]
     fn a_failed_transport_retries_the_same_identity_never_a_second_one() {

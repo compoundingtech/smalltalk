@@ -700,9 +700,9 @@ replacement of drifted work.
   context. [Runner](../../../src/run.rs)
 - **G05, F03:** host filtering exists, but exact old-projection removal does
   not. No cross-host mechanism is required. [Host filter](../../../src/reconcile.rs)
-- **G06, notifications:** inbox and DING exist, but reconciliation writes no
+- **G06, notifications:** inbox and PING exist, but reconciliation writes no
   stable change event. [Message](../../../src/message.rs) and
-  [DING](../../../src/ding/mod.rs)
+  [PING](../../../src/ding/mod.rs)
 - **G07, planning/reporting:** st2 cannot plan and commit all related agent,
   task, and file changes as one operation, and it has no true dry-run;
   `materialize-only` writes. See [#53](https://github.com/compoundingtech/st2/issues/53)
@@ -721,7 +721,7 @@ replacement of drifted work.
   published view under the lock and bind the policy profile in its receipt.
 - **G11, F19 canonical ownership:** st2 admits, lowers, authors, and runs the
   `stream` field, but the canonical evals `AGENT-SPEC.md` and its maintained
-  acceptance cells do not yet define or prove that capability. Until the
+  acceptance evals do not yet define or prove that capability. Until the
   matching evals change lands, st2's stream implementation is ahead of the
   authoring authority rather than conformant to it.
 

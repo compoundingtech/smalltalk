@@ -1,0 +1,18 @@
+{
+  "api_version": "st3.client.v0",
+  "request_id": "request/terminal-screen-1",
+  "snapshot": {
+    "id": "snapshot/host-a/1844/44cd", "host_id": "host/host-a", "store_index": 1844,
+    "projection_version": "client-projection.v0", "created_at": "2026-09-20T12:00:02Z"
+  },
+  "value": {
+    "kind": "terminal-screen", "terminal_id": "terminal/release-shell", "runtime_incarnation": "pty-4:2026-09-20T11:10:00Z",
+    "rows": 3, "columns": 80, "cursor": { "row": 2, "column": 2, "visible": true }, "title": "release",
+    "lines": [
+      { "row": 0, "text": "$ cargo build", "redacted": false, "truncated": false },
+      { "row": 1, "text": "Finished", "redacted": false, "truncated": false },
+      { "row": 2, "text": "$ ", "redacted": false, "truncated": false }
+    ],
+    "next_sequence": 41, "truncated": false
+  }
+}

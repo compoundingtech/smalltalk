@@ -1,0 +1,30 @@
+version 2
+
+mission "eval/work-wake-reliability/revisable" state="ready" revision-cutover="restart-active" {
+  goal "Prove live mission revisions wake the assigned worker without losing completed work."
+
+  step "initial" timeout="5m" {
+    assigned-to "{{WORKER}}"
+    goal "Claim this ready work, record one concise progress update containing REVISION-INITIAL, then complete it. Do not modify repository files."
+  }
+
+  step "revision-one" timeout="5m" {
+    assigned-to "{{WORKER}}"
+    depends-on { step "initial" completed }
+    goal "Claim this newly revised work, record one concise progress update containing REVISION-ONE, then complete it. Do not modify repository files."
+  }
+
+  step "revision-window" timeout="30m" {
+    agentless
+    gate "the controller closes the explicit revision window" type="human" {
+      reviewer "person/eval-requester"
+    }
+  }
+
+  finally {
+    step "finalize" timeout="1m" {
+      agentless
+      goal "Reach a durable final state when the finite revisable run is cancelled."
+    }
+  }
+}

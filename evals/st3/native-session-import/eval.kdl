@@ -1,0 +1,45 @@
+version 2
+
+mission "eval/native-session-import" state="ready" timeout="45m" {
+  completion { when "all-steps-exhausted" }
+  goal "Every supported interactive harness can start in a raw PTY outside st3, expose a native session, and be fenced into one durable ownerless st3 seat."
+
+  step "import-all-drivers" timeout="40m" {
+    agentless
+    title "Import raw Codex, Claude, Pi, OMP, and OpenCode sessions"
+    exec "native-session-import/controller" {
+      host "local"
+      workspace "${ST_WORKSPACE}"
+      cwd "${ST_WORKSPACE}"
+      command "bash ./controller.sh"
+      restart "never"
+    }
+    gate "the import controller passed" {
+      field "exit_code" "exec/${ST_MISSION_RUN}/native-session-import/controller" is 0
+    }
+  }
+
+  step "held-out-gates" timeout="3m" {
+    agentless
+    depends-on { step "import-all-drivers" completed }
+    gate "all five imports are durable seats with exact takeover evidence" {
+      exec "bash ./judges/imports.sh"
+      host "local"
+      workspace "${ST_WORKSPACE}"
+      time-limit "2m"
+    }
+  }
+
+  finally {
+    step "cleanup-imported-seats" timeout="3m" {
+      agentless
+      exec "native-session-import/cleanup" {
+        host "local"
+        workspace "${ST_WORKSPACE}"
+        cwd "${ST_WORKSPACE}"
+        command "bash ./cleanup.sh"
+        restart "never"
+      }
+    }
+  }
+}

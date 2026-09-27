@@ -1,0 +1,65 @@
+{
+  "api_version": "st3.client.v0",
+  "request_id": "request/timeline-1",
+  "snapshot": {
+    "id": "snapshot/host-a/1842/2fc9", "host_id": "host/host-a", "store_index": 1842,
+    "projection_version": "client-projection.v0", "created_at": "2026-09-20T12:00:00Z"
+  },
+  "value": {
+    "kind": "timeline-page",
+    "session_id": "session/release-agent/9",
+    "items": [
+      {
+        "id": "timeline-entry/release-agent/9/1", "sequence": 1, "revision": 1, "timestamp": "2026-09-20T11:06:31Z",
+        "role": "system", "type": "status", "final": true, "body": { "status": "running" }
+      },
+      {
+        "id": "timeline-entry/release-agent/9/2", "sequence": 2, "revision": 1, "timestamp": "2026-09-20T11:06:32Z",
+        "role": "user", "type": "message", "final": true, "body": { "message_id": "turn/1" }
+      },
+      {
+        "id": "timeline-entry/release-agent/9/3", "sequence": 3, "revision": 1, "timestamp": "2026-09-20T11:06:32Z",
+        "role": "user", "type": "content", "final": true, "body": { "media_type": "text/plain", "text": "Build the release." }
+      },
+      {
+        "id": "timeline-entry/release-agent/9/4", "sequence": 4, "revision": 2, "timestamp": "2026-09-20T11:06:34Z",
+        "role": "assistant", "type": "content", "final": true, "body": { "media_type": "text/plain", "text": "I will inspect the build." }
+      },
+      {
+        "id": "timeline-entry/release-agent/9/5", "sequence": 5, "revision": 1, "timestamp": "2026-09-20T11:06:35Z",
+        "role": "assistant", "type": "tool_call", "final": true,
+        "body": { "call_id": "tool-call/1", "name": "shell", "arguments": { "command": "cargo build" } }
+      },
+      {
+        "id": "timeline-entry/release-agent/9/6", "sequence": 6, "revision": 1, "timestamp": "2026-09-20T11:06:40Z",
+        "role": "tool", "type": "tool_result", "final": true,
+        "body": { "call_id": "tool-call/1", "status": "success", "media_type": "text/plain", "content": "Finished" }
+      },
+      {
+        "id": "timeline-entry/release-agent/9/7", "sequence": 7, "revision": 1, "timestamp": "2026-09-20T11:06:41Z",
+        "role": "system", "type": "usage", "final": true,
+        "body": {
+          "semantics": "response", "driver": "codex",
+          "input_tokens": 420, "output_tokens": 80, "cached_tokens": 100, "total_tokens": 500,
+          "attribution": { "agent_id": "agent/release-agent", "mission_run_id": "mission-run/release", "generation_id": "run-generation/9", "step_id": "build" }
+        }
+      },
+      {
+        "id": "timeline-entry/release-agent/9/8", "sequence": 8, "revision": 1, "timestamp": "2026-09-20T11:06:42Z",
+        "role": "system", "type": "redaction", "final": true,
+        "body": { "reason": "credential", "withheld_bytes": 48 }
+      },
+      {
+        "id": "timeline-entry/release-agent/9/9", "sequence": 9, "revision": 1, "timestamp": "2026-09-20T11:06:43Z",
+        "role": "system", "type": "truncation", "final": true,
+        "body": { "reason": "response-limit", "omitted_from_sequence": 10, "omitted_to_sequence": 12, "continuation_cursor": "timeline-cursor/release-agent/9/10" }
+      },
+      {
+        "id": "timeline-entry/release-agent/9/13", "sequence": 13, "revision": 1, "timestamp": "2026-09-20T11:06:45Z",
+        "role": "system", "type": "error", "final": true,
+        "body": { "code": "tool-timeout", "message": "A tool exceeded its deadline.", "retryable": true, "details": {} }
+      }
+    ],
+    "page": { "limit": 50, "has_more": false, "next_cursor": null, "cursor_expires_at": null }
+  }
+}

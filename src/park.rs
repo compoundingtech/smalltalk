@@ -495,7 +495,10 @@ mod tests {
             .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
             .filter(|name| name.starts_with(".park."))
             .collect::<Vec<_>>();
-        assert!(residue.is_empty(), "staging residue left behind: {residue:?}");
+        assert!(
+            residue.is_empty(),
+            "staging residue left behind: {residue:?}"
+        );
 
         if unsafe { libc::geteuid() } == 0 {
             return;
@@ -503,8 +506,7 @@ mod tests {
         // Write and traverse, but not read: staging and renaming still work, opening the
         // directory to sync it does not.
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o300)).unwrap();
-        let refused =
-            write_json_atomically(&path, &serde_json::json!({"schema": "test"}), ".park");
+        let refused = write_json_atomically(&path, &serde_json::json!({"schema": "test"}), ".park");
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
         assert!(
             refused.is_err(),

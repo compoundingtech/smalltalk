@@ -1,0 +1,39 @@
+{
+  "schema": "st3-eval-proof.v1",
+  "date": "2026-08-27",
+  "eval": "ghost-bug-codex",
+  "paid_attempt": 1,
+  "candidate": {
+    "git_head": "5e72de6ff155e23db184ad5630264d43015ed504",
+    "working_tree": "dirty",
+    "st3_version": "0.1.0",
+    "st3_binary_sha256": "4c7f8ff2fc241c1f57c2cc272c33cc1ea28e189ea33c35cb18d79755511f861c",
+    "eval_kdl_sha256": "eee13d407aa50fa1678e279df5416cc86bc71da27994a2d44690f08a0c3eeeae",
+    "task_document_sha256": "25c585de3c879e9f4a215ddda598409689bd4dd8340eacb5ff278f9e61663589"
+  },
+  "providers": {
+    "codex_cli": "0.145.0",
+    "pty": "0.12.0+face607"
+  },
+  "usage": {
+    "weekly_remaining_before_percent": 87,
+    "weekly_remaining_after_percent": 87,
+    "reset_redeemed": false
+  },
+  "result": {
+    "done": true,
+    "verdict": "pass",
+    "cleanup_complete": true,
+    "worker_commit": "f902f5505fb3f8d00d44b8906d2daed935eca50d",
+    "llm_judge_tokens": 45544,
+    "judges": [
+      "team completion",
+      "isolation",
+      "visible suite",
+      "root cause",
+      "mutation-valid regression",
+      "coordination",
+      "Codex root-cause review"
+    ]
+  }
+}

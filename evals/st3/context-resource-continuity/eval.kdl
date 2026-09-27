@@ -1,0 +1,27 @@
+version 2
+
+  mission "eval/context-resource-continuity" state="ready" timeout="20m" {
+    completion { when "all-steps-exhausted" }
+    goal "Complete mission eval/context-resource-continuity."
+    step "contract" timeout="2m" {
+      title "Context and resources survive two daemon restarts"
+        exec "eval/context-resource-continuity/contract" {
+          host "local"
+          workspace "${ST_WORKSPACE}/fixture"
+          cwd "${ST_WORKSPACE}/fixture"
+          command "bash ./run.sh"
+          restart "never"
+        }
+      gate "condition-1" { field "status" "exec/${ST_MISSION_RUN}/eval/context-resource-continuity/contract" "is" "exited" }
+      gate "condition-2" { field "exit_code" "exec/${ST_MISSION_RUN}/eval/context-resource-continuity/contract" "is" 0 }
+    }
+    step "gate" timeout="1m" {
+      depends-on { step "contract" completed }
+      gate "the exact context decision and resource remain readable" {
+        exec "bash ./judge.sh"
+        host "local"
+        workspace "${ST_WORKSPACE}/fixture"
+        time-limit "1m"
+      }
+    }
+  }

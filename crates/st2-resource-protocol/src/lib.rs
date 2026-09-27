@@ -407,7 +407,7 @@ fn encode_base64(bytes: &[u8]) -> String {
 }
 
 fn decode_base64(encoded: &str) -> Result<Vec<u8>, Base64Error> {
-    if encoded.len() % 4 != 0 {
+    if !encoded.len().is_multiple_of(4) {
         return Err(Base64Error("base64 length is not a multiple of four"));
     }
     let maximum_encoded = MAX_SNAPSHOT_BYTES.div_ceil(3) * 4;
@@ -579,11 +579,7 @@ pub struct ProposalFence {
 }
 
 impl ProposalFence {
-    pub fn new(
-        generation: u64,
-        revision: u64,
-        prior_digest: Option<SnapshotDigest>,
-    ) -> Self {
+    pub fn new(generation: u64, revision: u64, prior_digest: Option<SnapshotDigest>) -> Self {
         Self {
             generation,
             revision,
@@ -874,7 +870,7 @@ impl<'de> Deserialize<'de> for RuntimeMessage {
                     registration,
                     publication,
                 }
-            },
+            }
             RuntimeMessageWire::Health {
                 owner,
                 binding_id,

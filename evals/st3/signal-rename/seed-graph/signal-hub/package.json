@@ -1,0 +1,19 @@
+{
+  "name": "@acme/signal-hub",
+  "version": "0.7.0",
+  "description": "Host @acme/signal product signals at signal:// addresses and resolve them.",
+  "type": "module",
+  "license": "MIT",
+  "exports": {
+    ".": "./src/hub.js"
+  },
+  "scripts": {
+    "test": "node --test"
+  },
+  "peerDependencies": {
+    "@acme/signal": "*"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

@@ -20,7 +20,9 @@ use crate::flapping::FlappingCap;
 use crate::reconcile::compile_generated_ding_tasks;
 use crate::reconcile::{TaskCompileContext, compile_generated_tasks, reconcile};
 use crate::run::{Runner, SystemRunner, UpReport, detect_host, execute};
-use agent_spec::spec::{AgentDesiredState, AgentSpec, JobType, Task, TaskKind, TaskLifecycle};
+use agent_spec::spec::{
+    AgentDesiredState, AgentSpec, Driver, JobType, Task, TaskKind, TaskLifecycle,
+};
 
 macro_rules! eval_log {
     ($($arg:tt)*) => {
@@ -65,7 +67,9 @@ impl Drop for EvalSignalGuard {
 /// the agent id; each `exec` block is an `exec` task keyed by its id. Env is already cascaded.
 pub fn spec_to_agent_specs(agents: &[SpecAgent], host: &str, root: &Path) -> Vec<AgentSpec> {
     // `spec.path.parent()` is the cwd/`$CATALOG` base in reconcile/execute → point it at `root`.
-    let path = root.join("spec.kdl");
+    // This is an in-memory compact declaration, not a KDL file. The non-KDL extension tells the
+    // materializer to use only the typed driver's generated render plan.
+    let path = root.join("spec.eval");
     agents
         .iter()
         .map(|a| {
@@ -77,20 +81,31 @@ pub fn spec_to_agent_specs(agents: &[SpecAgent], host: &str, root: &Path) -> Vec
                 Some(suffix) if suffix.starts_with('.') => format!("{actor_id}{suffix}"),
                 _ => source.to_owned(),
             };
+            let workspace = if a.driver.is_some() {
+                Some(match a.workspace.as_deref() {
+                    Some(value) => root.join(expand_catalog(value, root)),
+                    None => root.to_path_buf(),
+                })
+                .map(|path| path.to_string_lossy().into_owned())
+            } else {
+                a.workspace.clone()
+            };
             let mut tasks = Vec::new();
-            tasks.push(Task {
-                kind: TaskKind::Pty,
-                derived: false,
-                name: "agent".to_string(),
-                id: Some(actor_id.clone()),
-                command: Some(a.command.clone()),
-                argv: None,
-                cwd: None, // → the agent's workspace (resolved relative to `root`)
-                tags: BTreeMap::new(),
-                env: a.env.clone(),
-                keep: false,
-                lifecycle: TaskLifecycle::Service,
-            });
+            if a.command.is_some() || a.driver.is_some() {
+                tasks.push(Task {
+                    kind: TaskKind::Pty,
+                    derived: false,
+                    name: "agent".to_string(),
+                    id: Some(actor_id.clone()),
+                    command: a.command.clone(),
+                    argv: None,
+                    cwd: None, // → the agent's workspace (resolved relative to `root`)
+                    tags: BTreeMap::new(),
+                    env: a.env.clone(),
+                    keep: false,
+                    lifecycle: TaskLifecycle::Service,
+                });
+            }
             for ex in &a.execs {
                 let command = if ex.derived {
                     ding_exec(&actor_id).command
@@ -120,7 +135,7 @@ pub fn spec_to_agent_specs(agents: &[SpecAgent], host: &str, root: &Path) -> Vec
                 host: Some(host.to_string()),
                 role: None,
                 job_type: JobType::Service,
-                workspace: a.workspace.clone(),
+                workspace,
                 supervisor: a.supervisor.as_deref().map(|supervisor| {
                     supervisor
                         .strip_prefix(&host_prefix)
@@ -132,7 +147,7 @@ pub fn spec_to_agent_specs(agents: &[SpecAgent], host: &str, root: &Path) -> Vec
                 restart: None,
                 delivery: None,
                 session_driver: None,
-                driver: None,
+                driver: a.driver.clone(),
                 delivery_readiness: None,
                 resources: Vec::new(),
                 streams: Vec::new(),
@@ -160,6 +175,114 @@ struct EvalRuntimeTask {
 struct CanonicalRoute {
     inbox: PathBuf,
     archive: PathBuf,
+}
+
+fn compact_driver_block(driver: &Driver) -> String {
+    let mut output = String::new();
+    let (name, model, effort, prompt, args, dev_channels) = match driver {
+        Driver::Claude(driver) => (
+            "claude",
+            driver.model.as_deref(),
+            driver.effort.as_deref(),
+            driver.prompt.as_str(),
+            driver.args.as_slice(),
+            Some(driver.dev_channels),
+        ),
+        Driver::Codex(driver) => (
+            "codex",
+            driver.model.as_deref(),
+            driver.effort.as_deref(),
+            driver.prompt.as_str(),
+            driver.args.as_slice(),
+            None,
+        ),
+        Driver::Pi(_) | Driver::OpenCode(_) | Driver::Omp(_) => {
+            unreachable!("the compact eval grammar accepts only Claude and Codex drivers")
+        }
+    };
+    output.push_str(&format!("  {name} {{\n"));
+    if let Some(model) = model {
+        output.push_str(&format!("    model {model:?}\n"));
+    }
+    if let Some(effort) = effort {
+        output.push_str(&format!("    effort {effort:?}\n"));
+    }
+    if dev_channels == Some(true) {
+        output.push_str("    dev-channels #true\n");
+    }
+    output.push_str(&format!("    prompt {prompt:?}\n"));
+    if !args.is_empty() {
+        output.push_str("    args");
+        for argument in args {
+            output.push_str(&format!(" {argument:?}"));
+        }
+        output.push('\n');
+    }
+    output.push_str("  }\n");
+    output
+}
+
+/// Give compact native drivers a real catalog address and run their normal render plans. This is
+/// an internal projection only. The authored eval remains the sole declaration authority.
+fn prepare_compact_native_team(
+    specs: &[AgentSpec],
+    host: &str,
+    catalog: &Path,
+) -> Result<Option<BTreeMap<String, CanonicalRoute>>> {
+    if !specs.iter().any(|spec| spec.driver.is_some()) {
+        return Ok(None);
+    }
+    anyhow::ensure!(
+        specs.iter().all(|spec| spec.driver.is_some()),
+        "a compact eval cannot mix native driver agents with legacy command agents"
+    );
+
+    let mut routes = BTreeMap::new();
+    for spec in specs {
+        let bus_id = spec.bus_id(host);
+        anyhow::ensure!(
+            !bus_id.is_empty()
+                && bus_id
+                    .chars()
+                    .all(|character| character.is_ascii_alphanumeric()
+                        || matches!(character, '.' | '_' | '-')),
+            "compact eval agent id `{bus_id}` is not a safe catalog component"
+        );
+        let agent_dir = catalog.join(&bus_id);
+        std::fs::create_dir_all(&agent_dir)?;
+        let workspace = spec.workspace.as_deref().unwrap_or(".");
+        let driver = spec
+            .driver
+            .as_ref()
+            .expect("the all-native compact team was checked");
+        let declaration = format!(
+            "agent {:?} {{\n  identity {:?}\n  host {host:?}\n  workspace {workspace:?}\n{}}}\n",
+            spec.identity,
+            spec.identity,
+            compact_driver_block(driver),
+        );
+        std::fs::write(agent_dir.join("agent.kdl"), declaration)?;
+        let route = CanonicalRoute {
+            inbox: crate::message::inbox_dir(&agent_dir),
+            archive: crate::message::archive_dir(&agent_dir),
+        };
+        std::fs::create_dir_all(&route.inbox)?;
+        std::fs::create_dir_all(&route.archive)?;
+        for spelling in [bus_id, spec.identity.clone()] {
+            anyhow::ensure!(
+                routes.insert(spelling.clone(), route.clone()).is_none(),
+                "compact eval has duplicate route `{spelling}`"
+            );
+        }
+    }
+
+    let materialized = crate::materialize::materialize_catalog(catalog, specs, host);
+    anyhow::ensure!(
+        materialized.errors.is_empty(),
+        "compact native driver materialization failed: {}",
+        materialized.errors.join("; ")
+    );
+    Ok(Some(routes))
 }
 
 fn admitted_route<'a>(
@@ -273,7 +396,13 @@ fn load_canonical_eval_team(catalog: &Path, host: &str) -> Result<CanonicalEvalT
             );
         }
         for task in &spec.tasks {
-            for root in ["CATALOG", "ST_ROOT", "PTY_ROOT", "ST2_EVAL_REQUESTER"] {
+            for root in [
+                "CATALOG",
+                "ST_ROOT",
+                "PTY_ROOT",
+                "ST2_EVAL_REQUESTER",
+                "ST2_EVAL_SENDER",
+            ] {
                 if task.env.contains_key(root) {
                     anyhow::bail!(
                         "canonical-agents Agent Spec `{bus_id}` must not override eval-owned `{root}`"
@@ -406,6 +535,7 @@ fn sanitize_agent_env() {
             || k.starts_with("CODEX_")
             || k.starts_with("PI_")
             || k.starts_with("ST2_PI_CHANNEL_")
+            || matches!(k, "ST2_EVAL_REQUESTER" | "ST2_EVAL_SENDER")
     };
     let victims: Vec<String> = std::env::vars_os()
         .filter_map(|(k, _)| k.into_string().ok())
@@ -601,6 +731,7 @@ fn from_is(from: Option<&str>, id: &str) -> bool {
 /// singleton instead requires a causally new requester-inbox entry at-or-after the exact kickoff
 /// receipt. Compact singleton semantics remain unchanged. Bounded by `timeout`. Returns whether done
 /// fired.
+#[allow(clippy::too_many_arguments)]
 fn wait_done(
     bus: &Path,
     canonical_routes: Option<&BTreeMap<String, CanonicalRoute>>,
@@ -619,6 +750,11 @@ fn wait_done(
         }
         None => (bus.join(sup).join("inbox"), bus.join(sup).join("archive")),
     };
+    // An eval keeps its admitted routes in memory. A native seat can therefore send through the
+    // catalog's flat compatibility route because no on-disk declaration exists for address lookup.
+    // Read both routes until eval materialization publishes those declarations.
+    let flat_sup_inbox = bus.join(sup).join("inbox");
+    let flat_sup_archive = bus.join(sup).join("archive");
     // The requester is eval-owned, not an admitted Agent Spec, and deliberately keeps one explicit
     // flat mailbox. Every canonical agent route above comes from the frozen admitted vector.
     let req_inbox = bus.join(requester).join("inbox");
@@ -633,8 +769,14 @@ fn wait_done(
         // against the sup's archiving — a fully-closed loop hangs to max-timeout because the report left
         // the inbox. (The confirmation side reads the requester's inbox, which is safe — the requester is
         // a passive eval-runner seed that never archives.)
-        let sup_msgs = crate::message::list_dir(&sup_inbox).unwrap_or_default();
-        let sup_archived = crate::message::list_dir(&sup_archive).unwrap_or_default();
+        let mut sup_msgs = crate::message::list_dir(&sup_inbox).unwrap_or_default();
+        let mut sup_archived = crate::message::list_dir(&sup_archive).unwrap_or_default();
+        if flat_sup_inbox != sup_inbox {
+            sup_msgs.extend(crate::message::list_dir(&flat_sup_inbox).unwrap_or_default());
+        }
+        if flat_sup_archive != sup_archive {
+            sup_archived.extend(crate::message::list_dir(&flat_sup_archive).unwrap_or_default());
+        }
         if workers.is_empty()
             && let Some(kickoff_ts) = kickoff_ts
             && let Some(before) = requester_before_kickoff
@@ -794,7 +936,7 @@ fn teardown_team(specs: &[AgentSpec], host: &str, root: &Path, reap_all: bool) {
 }
 
 /// `st2 eval <folder>` — run the eval end to end: mint a hermetic temp catalog, copy the fixture
-/// (`_git`→`.git`), boot the base team + eval-only agents, pretrust their workspaces, deliver the
+/// (`_git`→`.git`), boot the base team + eval-only agents, deliver the
 /// kickoff, wait for the sup's confirmation (post-dating a worker report) or `max-timeout`, tear down.
 /// (P4 runs the judges after done and returns the verdict.) The temp catalog is removed on the way out.
 pub fn run_eval(spec_file: &Path, host: Option<String>, keep: bool) -> Result<EvalReport> {
@@ -1168,7 +1310,9 @@ fn run_eval_inner(
     let mut compact_agents = spec.agents.clone();
     compact_agents.extend(eval.agents.clone());
 
-    let (done, specs, pty_task_ids) = if compact_agents.is_empty() && !eval.canonical_agents {
+    let (done, specs, pty_task_ids, judge_routes) = if compact_agents.is_empty()
+        && !eval.canonical_agents
+    {
         // TEAM-LESS: nothing to boot, kick off, or wait on — the run steps did the work → straight to judging.
         if !eval.run_steps.is_empty() {
             eval_log!(
@@ -1176,9 +1320,9 @@ fn run_eval_inner(
                 eval.run_steps.len()
             );
         }
-        (true, Vec::new(), Vec::new())
+        (true, Vec::new(), Vec::new(), None)
     } else {
-        let (mut specs, participant_ids, canonical_routes) = if eval.canonical_agents {
+        let (mut specs, participant_ids, mut canonical_routes) = if eval.canonical_agents {
             if bus != catalog {
                 anyhow::bail!(
                     "canonical-agents requires the native flat ST_ROOT `{}`, got `{}`",
@@ -1201,6 +1345,13 @@ fn run_eval_inner(
                 .collect::<Vec<_>>();
             (specs, participants, None)
         };
+        if !eval.canonical_agents && specs.iter().any(|spec| spec.driver.is_some()) {
+            anyhow::ensure!(
+                bus == catalog,
+                "compact native eval agents require the native catalog message root"
+            );
+            canonical_routes = prepare_compact_native_team(&specs, host, catalog)?;
+        }
         compile_generated_tasks(&mut specs, host, task_context)?;
         let runtime_tasks = eval_runtime_tasks(&specs, host);
         let task_ids = runtime_tasks
@@ -1214,18 +1365,6 @@ fn run_eval_inner(
             .collect::<Vec<_>>();
         if eval.supervise && !eval.canonical_agents {
             add_eval_exit_markers(&mut specs, catalog, host);
-        }
-        if !eval.canonical_agents {
-            // Compact legacy agents intentionally retain their historical ambient trust behavior.
-            // Canonical managed Agent Specs own trust inside their declared adapter trajectory.
-            let dirs: Vec<PathBuf> = compact_agents
-                .iter()
-                .filter_map(|a| a.workspace.as_deref())
-                .map(|w| catalog.join(w))
-                .collect();
-            if !dirs.is_empty() {
-                let _ = crate::pretrust::pretrust(&dirs);
-            }
         }
         let msg = eval.message.as_ref().ok_or_else(|| {
             anyhow::anyhow!("a team eval needs a message{{}} kickoff before any agent can launch")
@@ -1257,9 +1396,12 @@ fn run_eval_inner(
             }
             crate::message::ExternalInbox::provision(&bus, &requester)?;
             for spec in &mut specs {
+                let sender = spec.bus_id(host);
                 for task in &mut spec.tasks {
                     task.env
                         .insert("ST2_EVAL_REQUESTER".to_owned(), requester.clone());
+                    task.env
+                        .insert("ST2_EVAL_SENDER".to_owned(), sender.clone());
                 }
             }
         }
@@ -1277,20 +1419,15 @@ fn run_eval_inner(
             Some(routes) => admitted_route(routes, &sup).inbox.clone(),
             None => bus.join(&sup).join("inbox"),
         };
-        let requester_before_kickoff = eval.canonical_agents.then(|| {
-            crate::message::list_dir(&bus.join(&msg.from).join("inbox"))
-                .unwrap_or_default()
-                .into_iter()
-                .map(|message| message.filename)
-                .collect::<HashSet<_>>()
-        });
+        let requester_before_kickoff = crate::message::list_dir(&bus.join(&msg.from).join("inbox"))
+            .unwrap_or_default()
+            .into_iter()
+            .map(|message| message.filename)
+            .collect::<HashSet<_>>();
         let kickoff_receipt =
             crate::message::send_to_inbox(&to_inbox, &msg.from, None, None, &[], &body)
                 .with_context(|| format!("seeding kickoff into {}", to_inbox.display()))?;
-        let kickoff_ts = eval
-            .canonical_agents
-            .then(|| message_timestamp(&kickoff_receipt))
-            .transpose()?;
+        let kickoff_ts = message_timestamp(&kickoff_receipt)?;
         eval_log!("== kickoff → {sup} (from {}) ==", msg.from);
 
         let workers: Vec<String> = participant_ids
@@ -1393,8 +1530,8 @@ fn run_eval_inner(
                 &sup,
                 &msg.from,
                 &workers,
-                kickoff_ts,
-                requester_before_kickoff.as_ref(),
+                Some(kickoff_ts),
+                Some(&requester_before_kickoff),
                 eval.max_timeout,
                 &mut tick,
             )
@@ -1412,7 +1549,7 @@ fn run_eval_inner(
                 eval.max_timeout
             );
         }
-        (done, specs, pty_task_ids)
+        (done, specs, pty_task_ids, canonical_routes)
     };
 
     if eval.canonical_agents {
@@ -1435,13 +1572,14 @@ fn run_eval_inner(
 
     // Judges: the run-step gate results first, then the declared judges (all must pass). Judge BEFORE
     // teardown — an ask-agent judge needs its judge agent still alive to answer.
-    judges.extend(run_judges(
+    judges.extend(run_judges_with_routes(
         &eval.judges,
         spec_dir,
         catalog,
         &bus,
         &requester,
         &run_env,
+        judge_routes.as_ref(),
     ));
     // Under `supervise`, reap runtime-spawned tasks too (team-standup), not just the declared team.
     teardown_team(&specs, host, catalog, eval.supervise);
@@ -1465,6 +1603,18 @@ pub fn run_judges(
     requester: &str,
     run_env: &BTreeMap<String, String>,
 ) -> Vec<JudgeResult> {
+    run_judges_with_routes(judges, spec_dir, catalog, bus, requester, run_env, None)
+}
+
+fn run_judges_with_routes(
+    judges: &[Judge],
+    spec_dir: &Path,
+    catalog: &Path,
+    bus: &Path,
+    requester: &str,
+    run_env: &BTreeMap<String, String>,
+    routes: Option<&BTreeMap<String, CanonicalRoute>>,
+) -> Vec<JudgeResult> {
     let default_timeout = Duration::from_secs(120);
     judges
         .iter()
@@ -1476,7 +1626,7 @@ pub fn run_judges(
                     run_bash_judge(cmd, spec_dir, catalog, bus, timeout, run_env)
                 }
                 JudgeKind::Ask { agent, prompt } => {
-                    run_ask_judge(agent, prompt, bus, requester, timeout)
+                    run_ask_judge(agent, prompt, bus, requester, timeout, routes)
                 }
             };
             JudgeResult {
@@ -1634,9 +1784,13 @@ fn run_ask_judge(
     bus: &Path,
     requester: &str,
     timeout: Duration,
+    routes: Option<&BTreeMap<String, CanonicalRoute>>,
 ) -> (bool, String) {
     let ask_ts = now_ms();
-    let to_inbox = bus.join(agent).join("inbox");
+    let to_inbox = match routes {
+        Some(routes) => admitted_route(routes, agent).inbox.clone(),
+        None => bus.join(agent).join("inbox"),
+    };
     if let Err(e) =
         crate::message::send_to_inbox(&to_inbox, requester, Some("judge"), None, &[], prompt)
     {
@@ -1976,6 +2130,18 @@ agent "worker" { identity "worker"; host "evalhost"; argv "true" }
   identity "worker"
   host "evalhost"
   env { ST2_EVAL_REQUESTER "shadow-requester" }
+  argv "true"
+}"#,
+                )],
+            ),
+            (
+                "ST2_EVAL_SENDER",
+                vec![(
+                    "agents/evalhost/worker/agent.kdl",
+                    r#"agent "worker" {
+  identity "worker"
+  host "evalhost"
+  env { ST2_EVAL_SENDER "shadow-sender" }
   argv "true"
 }"#,
                 )],
@@ -2365,6 +2531,64 @@ agent "worker" { identity "worker"; host "evalhost"; argv "true" }
                 .get("ST_SUPERVISOR")
                 .map(String::as_str),
             Some("evalhost.mix.sup")
+        );
+    }
+
+    #[test]
+    fn compact_native_eval_agents_compile_through_the_shared_driver() {
+        let parsed = parse_spec(
+            r#"
+            agent "worker" {
+              workspace "./worker"
+              codex {
+                model "gpt-5.6-sol"
+                effort "medium"
+                prompt "Do the work."
+                args "--dangerously-bypass-hook-trust"
+              }
+              exec "injector" { command "sleep 60" }
+            }
+            "#,
+        )
+        .unwrap();
+        let catalog = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(catalog.path().join("worker")).unwrap();
+        let mut specs = spec_to_agent_specs(&parsed.agents, "evalhost", catalog.path());
+        assert!(specs[0].driver.is_some());
+        assert!(specs[0].tasks[0].command.is_none());
+        assert_eq!(
+            specs[0].workspace.as_deref(),
+            Some(catalog.path().join("./worker").to_string_lossy().as_ref())
+        );
+
+        let routes = prepare_compact_native_team(&specs, "evalhost", catalog.path())
+            .unwrap()
+            .unwrap();
+        assert!(routes["evalhost.worker"].inbox.is_dir());
+        assert!(catalog.path().join("evalhost.worker/agent.kdl").is_file());
+
+        let executable = std::env::current_exe().unwrap();
+        let context =
+            TaskCompileContext::new(catalog.path().to_path_buf(), executable.clone()).unwrap();
+        compile_generated_tasks(&mut specs, "evalhost", &context).unwrap();
+
+        let argv = specs[0].tasks[0].argv.as_ref().unwrap();
+        assert_eq!(Path::new(&argv[0]), executable);
+        assert!(argv.iter().any(|value| value == "codex"));
+        assert!(specs[0].tasks.iter().all(|task| task.name != "ding"));
+        assert!(specs[0].tasks.iter().any(|task| {
+            task.kind == TaskKind::Exec
+                && task.id.as_deref() == Some("evalhost.worker.injector")
+                && task.command.as_deref() == Some("sleep 60")
+        }));
+
+        let plan = reconcile(&specs, &[], "evalhost").unwrap();
+        assert!(
+            plan.launch
+                .iter()
+                .flat_map(|launch| &launch.tasks)
+                .any(|target| target.pty_id == "evalhost.worker.injector"
+                    && target.kind == TaskKind::Exec)
         );
     }
 
@@ -2760,6 +2984,48 @@ agent "worker" { identity "worker"; host "evalhost"; argv "true" }
     }
 
     #[test]
+    fn canonical_wait_done_reads_a_native_flat_worker_report() {
+        let root = tempfile::tempdir().unwrap();
+        let sup = "h.mix.sup";
+        let requester = "requester";
+        let workers = vec!["h.mix.worker".to_string()];
+        let agent_dir = root.path().join("agents/h/mix.sup");
+        let routes = BTreeMap::from([(
+            sup.to_string(),
+            CanonicalRoute {
+                inbox: crate::message::inbox_dir(&agent_dir),
+                archive: crate::message::archive_dir(&agent_dir),
+            },
+        )]);
+
+        seed_msg(
+            &root.path().join(sup).join("archive"),
+            1_700_000_002_000,
+            "aaaaaa",
+            "h.mix.worker",
+        );
+        seed_msg(
+            &root.path().join(requester).join("inbox"),
+            1_700_000_003_000,
+            "bbbbbb",
+            "h.mix.sup",
+        );
+
+        let noop = &mut (|| {}) as &mut dyn FnMut();
+        assert!(wait_done(
+            root.path(),
+            Some(&routes),
+            sup,
+            requester,
+            &workers,
+            None,
+            None,
+            Duration::from_secs(1),
+            noop,
+        ));
+    }
+
+    #[test]
     fn wait_done_runs_the_supervise_tick_while_waiting() {
         // Under `supervise`, wait_done calls its per-tick hook each poll — that hook is what respawns a
         // dead seat (via up_once_specs, proven separately). Here: no done signal → it times out, and the
@@ -2786,7 +3052,7 @@ agent "worker" { identity "worker"; host "evalhost"; argv "true" }
     }
 
     #[test]
-    fn canonical_singleton_done_is_new_after_kickoff_and_allows_the_same_millisecond() {
+    fn singleton_done_is_new_after_kickoff_and_allows_the_same_millisecond() {
         let root = tempfile::tempdir().unwrap();
         let agent_dir = root.path().join("agents/h/interviewer");
         let routes = BTreeMap::from([(
@@ -2837,6 +3103,28 @@ agent "worker" { identity "worker"; host "evalhost"; argv "true" }
             ),
             "a newly appearing same-ms singleton confirmation should complete promptly"
         );
+    }
+
+    #[test]
+    fn compact_singleton_done_accepts_one_new_requester_reply() {
+        let root = tempfile::tempdir().unwrap();
+        let requester = root.path().join("requester/inbox");
+        let kickoff_ts = 1_700_000_002_000;
+        let before = HashSet::new();
+        seed_msg(&requester, kickoff_ts + 1, "aaaaaa", "h.worker");
+
+        let noop = &mut (|| {}) as &mut dyn FnMut();
+        assert!(wait_done(
+            root.path(),
+            None,
+            "h.worker",
+            "requester",
+            &[],
+            Some(kickoff_ts),
+            Some(&before),
+            Duration::from_secs(1),
+            noop,
+        ));
     }
 
     #[test]

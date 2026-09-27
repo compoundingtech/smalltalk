@@ -340,7 +340,12 @@ mod tests {
             Staging::new(".record"),
             Durability::FsyncFileAndDir,
         );
-        let lenient = replace(&path, b"lenient", Staging::new(".record"), Durability::Rename);
+        let lenient = replace(
+            &path,
+            b"lenient",
+            Staging::new(".record"),
+            Durability::Rename,
+        );
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
 
         assert_eq!(

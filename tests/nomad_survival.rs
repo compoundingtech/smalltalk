@@ -139,9 +139,11 @@ impl Fixture {
             .borrow_mut()
             .push(format!("{HOST}.{identity}"));
         let snapshot = self.catalog.join(format!("{identity}.color-env"));
-        let explicit_env = explicit_no_color
-            .then_some("  env { NO_COLOR \"1\" }\n")
-            .unwrap_or_default();
+        let explicit_env = if explicit_no_color {
+            "  env { NO_COLOR \"1\" }\n"
+        } else {
+            Default::default()
+        };
         let kdl = format!(
             r##"agent "{identity}" {{
   identity "{identity}"

@@ -1,0 +1,10 @@
+version 1
+
+eval {
+  copy "./fixture"
+  max-timeout "60s"
+  run "contract" { command "bash ./run.sh" }
+  judges {
+    judge "A loses the resource before B receives it" { exec "bash $CATALOG/judge.sh" }
+  }
+}

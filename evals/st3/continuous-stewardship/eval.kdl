@@ -1,0 +1,126 @@
+version 2
+
+mission "eval/continuous-stewardship/cycle" state="ready" {
+  completion { when "all-steps-exhausted" }
+  goal "Record one durable scheduled cycle."
+  step "record-occurrence" {
+    agentless
+  }
+}
+
+mission "eval/continuous-stewardship" state="ready" timeout="20m" {
+  completion { when "all-steps-exhausted" }
+  goal "Complete two finite stewardship cycles with one long-lived agent and a recurring wake schedule."
+
+  agent "fabric.steward" {
+    workspace "${ST_WORKSPACE}"
+    harness "codex" {
+      model "gpt-5.6-sol"
+      effort "medium"
+      args "--dangerously-bypass-approvals-and-sandbox" "--dangerously-bypass-hook-trust"
+    }
+    restart "always"
+  }
+
+  schedule "fabric-wake" {
+    host "local"
+    every "2s"
+    anchor "2026-01-01T00:00:00Z"
+    catch-up "latest"
+    work {
+      mission "eval/continuous-stewardship/cycle@5fdeff49ce2d0d0fdbbdff53bab46136d816b94273c1b7ee81c659b8be6ef3f4"
+      workspace "${ST_WORKSPACE}/scheduled-cycles"
+    }
+  }
+
+  step "cycle-one" timeout="10m" {
+    assigned-to "agent/${ST_MISSION_RUN}/fabric.steward"
+    title "The first finite stewardship cycle completes"
+    goal "Inspect the fixture, record one concrete optimization in cycle-one.md, and publish the cycle result."
+
+    mission "cycle" {
+      completion { when "all-steps-exhausted" }
+      goal "Complete the first stewardship cycle."
+      step "inspect" {
+        goal "Inspect README.md and identify one measurable improvement."
+      }
+      step "record" {
+        depends-on { step "inspect" completed }
+        goal "Write cycle-one.md with the measurement, selected improvement, and verification."
+      }
+      step "publish-result" {
+        depends-on { step "record" completed }
+        goal "Run: st3 claim resource/mission-run/$ST_MISSION_RUN/cycle-one resource.observed --actor agent/${ST_MISSION_RUN}/fabric.steward --field kind=custom.st3.stewardship-cycle --field state=published --field record=cycle-one.md. Complete this step after the claim."
+        produces {
+          resource "mission-run/${ST_MISSION_RUN}/cycle-one" {
+            kind "custom.st3.stewardship-cycle"
+            state "published"
+          }
+        }
+      }
+    }
+  }
+
+  step "restart-steward" timeout="2m" {
+    agentless
+    title "The steward restarts between cycles"
+    depends-on { step "cycle-one" completed }
+    stop "agent/${ST_MISSION_RUN}/fabric.steward"
+  }
+
+  step "cycle-two" timeout="10m" {
+    assigned-to "agent/${ST_MISSION_RUN}/fabric.steward"
+    title "The restarted steward completes a second finite cycle"
+    goal "Read the first cycle history, record a different optimization in cycle-two.md, and publish the second result."
+    depends-on { step "restart-steward" completed }
+
+    mission "cycle" {
+      completion { when "all-steps-exhausted" }
+      goal "Complete the second stewardship cycle."
+      step "inspect-history" {
+        goal "Read cycle-one.md and the current fixture. Identify a different measurable improvement."
+      }
+      step "record" {
+        depends-on { step "inspect-history" completed }
+        goal "Write cycle-two.md with the prior result, new measurement, selected improvement, and verification."
+      }
+      step "publish-result" {
+        depends-on { step "record" completed }
+        goal "Run: st3 claim resource/mission-run/$ST_MISSION_RUN/cycle-two resource.observed --actor agent/${ST_MISSION_RUN}/fabric.steward --field kind=custom.st3.stewardship-cycle --field state=published --field record=cycle-two.md. Complete this step after the claim."
+        produces {
+          resource "mission-run/${ST_MISSION_RUN}/cycle-two" {
+            kind "custom.st3.stewardship-cycle"
+            state "published"
+          }
+        }
+      }
+    }
+  }
+
+  step "held-out-gates" timeout="2m" {
+    agentless
+    depends-on { step "cycle-two" completed }
+    gate "both distinct cycle records exist" {
+      exec "test -s cycle-one.md && test -s cycle-two.md && ! cmp -s cycle-one.md cycle-two.md"
+      host "local"
+      workspace "${ST_WORKSPACE}"
+      time-limit "1m"
+    }
+    gate "the recurring schedule reached an occurrence" {
+      exists "schedule/${ST_MISSION_RUN}/fabric-wake"
+    }
+    gate "the first cycle product remains in history" {
+      exists "resource/mission-run/${ST_MISSION_RUN}/cycle-one"
+    }
+    gate "the second cycle product remains in history" {
+      exists "resource/mission-run/${ST_MISSION_RUN}/cycle-two"
+    }
+  }
+
+  finally {
+    step "cleanup-steward" timeout="2m" {
+      agentless
+      stop "agent/${ST_MISSION_RUN}/fabric.steward"
+    }
+  }
+}

@@ -118,16 +118,15 @@ pub(crate) enum Command {
     /// Provider-native harness drivers and read-only typed-block expansion.
     #[command(subcommand)]
     Driver(DriverCmd),
-    /// The ding sidecar: watch an agent's `resources/inbox` and poke its pty (`[DING] …`) on each new
+    /// The ping sidecar: watch an agent's `resources/inbox` and poke its pty (`[PING] …`) on each new
     /// message. Busy does not suppress delivery; only fresh dnd defers FIFO. A startup backlog is
     /// coalesced into one recovery notice. Long-running — st2 keeps it alive as a task alongside the
     /// agent. Exits when the target pty session is gone.
-    /// `st2 ping` is an alias (the maintainer is renaming ding → ping, since dinging is the runner's
-    /// job now); it is the exact same command.
-    #[command(visible_alias = "ping")]
-    Ding {
+    /// `st2 ding` remains an alias for compatibility with existing declarations and processes.
+    #[command(visible_alias = "ding")]
+    Ping {
         /// The target pty session to poke (a `pty` session ref). Optional — defaults to `--identity`
-        /// (an agent IS its pty, so the session to poke is the identity), so `st2 ding --identity X`
+        /// (an agent IS its pty, so the session to poke is the identity), so `st2 ping --identity X`
         /// is the common form.
         session: Option<String>,
         /// Whose inbox to watch — bus id or identity. Defaults to `$ST_AGENT`. Also the default poke
@@ -763,8 +762,14 @@ pub(crate) struct PresentationArgs {
 
 impl PresentationArgs {
     /// The selected subject and the requested value, where `None` is the cleared representation.
-    pub(crate) fn selection(self) -> Result<(st2::identity::AgentSelector, Option<String>, bool, Option<String>)>
-    {
+    pub(crate) fn selection(
+        self,
+    ) -> Result<(
+        st2::identity::AgentSelector,
+        Option<String>,
+        bool,
+        Option<String>,
+    )> {
         let (selector, value) = match self.agent_id {
             Some(id) => (st2::identity::AgentSelector::Id(id), self.first),
             None => (
@@ -1186,7 +1191,10 @@ pub(crate) enum EventCmd {
     /// Emit one producer-identified event into a declared agent stream.
     Emit {
         /// Owning agent: a bus address (`<host>.<address>`) or a bare local address.
-        #[arg(required_unless_present = "recipient_id", conflicts_with = "recipient_id")]
+        #[arg(
+            required_unless_present = "recipient_id",
+            conflicts_with = "recipient_id"
+        )]
         recipient: Option<String>,
         /// Owning agent by exact immutable agent ID (R24).
         #[arg(long = "recipient-id")]

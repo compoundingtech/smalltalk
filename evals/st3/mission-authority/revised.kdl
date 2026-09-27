@@ -1,0 +1,14 @@
+version 2
+
+mission "eval/mission-authority/produced" state="ready" {
+  concurrent-runs max=2
+  goal "Keep one authorized reviser available after revision."
+  agent "reviser" {
+    workspace "${ST_WORKSPACE}"
+    command "sleep 300"
+    restart "never"
+    mission-authority {
+      revise "eval/mission-authority/produced"
+    }
+  }
+}

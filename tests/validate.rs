@@ -90,24 +90,23 @@ fn native_delivery_requires_explicit_matching_driver_and_readiness() {
 }
 
 #[test]
-fn explicit_and_typed_session_drivers_reject_ding() {
+fn explicit_and_typed_session_drivers_preempt_ding() {
     for (name, body) in [
         (
             "opaque",
-            r#"argv "axe" "agent" "launch"; session-driver "claude"; ding"#,
+            r#"argv "axe" "agent" "launch"; session-driver "claude"; delivery-readiness "credential"; ding"#,
         ),
-        ("typed", r#"claude { prompt "Start work." }; ding"#),
+        (
+            "typed",
+            r#"claude { prompt "Start work." }; delivery-readiness "credential"; ding"#,
+        ),
     ] {
         let c = catalog(&[(
             &format!("h/{name}/agent.kdl"),
-            &format!(r#"agent "{name}" {{ host "h"; {body} }}"#),
+            &format!(r#"agent "{name}" {{ host "h"; workspace "/work/{name}"; {body} }}"#),
         )]);
         let report = validate(c.path());
-        assert!(
-            has(&report, "parse-error", Severity::Error),
-            "{name}: {:?}",
-            report.issues
-        );
+        assert_eq!(report.errors(), 0, "{name}: {:?}", report.issues);
     }
 }
 
@@ -807,9 +806,7 @@ fn a_fully_qualified_supervisor_in_the_catalog_is_clean() {
 }
 
 #[test]
-fn retired_roots_do_not_hold_the_root_slot() {
-    // #402: legacy `retired #true` (and new-style retirement) removes a declaration from the org
-    // chart, so root-shaped tombstones must not break the one-root-per-host invariant.
+fn retired_unsupervised_declarations_remain_valid() {
     let c = catalog(&[
         (
             "h/cos/agent.kdl",
@@ -829,39 +826,27 @@ fn retired_roots_do_not_hold_the_root_slot() {
 }
 
 #[test]
-fn a_suspended_root_still_holds_the_root_slot() {
-    // Suspension is a pause inside the org, not an exit: a suspended root keeps the host at
-    // exactly one root, and a second root-shaped declaration is still an error.
-    let suspended_only = catalog(&[(
-        "h/root/agent.kdl",
-        r#"agent "root" { host "h"; desired-state "suspended" reason="maintenance window"; command "x" }"#,
-    )]);
-    assert_eq!(
-        validate(suspended_only.path()).errors(),
-        0,
-        "a suspended root alone must satisfy the invariant"
-    );
-
-    let with_rival = catalog(&[
+fn a_host_may_have_multiple_unsupervised_agents() {
+    let c = catalog(&[
         (
             "h/root/agent.kdl",
             r#"agent "root" { host "h"; desired-state "suspended" reason="maintenance window"; command "x" }"#,
         ),
         (
             "h/rival/agent.kdl",
-            r#"agent "rival" { host "h"; retired #true; command "x" }"#,
+            r#"agent "rival" { host "h"; command "x" }"#,
         ),
     ]);
     assert_eq!(
-        validate(with_rival.path()).errors(),
+        validate(c.path()).errors(),
         0,
-        "a retired tombstone must not rival a suspended root"
+        "independent root trees must validate: {:?}",
+        validate(c.path()).issues
     );
 }
 #[test]
 fn an_active_chain_may_not_terminate_at_a_retired_root() {
-    // One counted root satisfies root-count, but the worker's tree is headed by a retired
-    // tombstone: the active org chart must descend from the counted root (#405 review).
+    // The worker's declared supervisor is retired, so its active tree has no active owner.
     let c = catalog(&[
         (
             "h/live/agent.kdl",
@@ -912,41 +897,13 @@ fn an_active_chain_may_not_terminate_at_a_retired_root() {
 }
 
 #[test]
-fn a_host_without_one_counted_root_still_fails() {
-    // Both zero shapes remain faults: a tombstone-only host, and a headless host whose only
-    // root is retired while workers stay active.
-    for (name, files) in [
-        (
-            "tombstone-only",
-            vec![(
-                "h/ghost/agent.kdl",
-                r#"agent "ghost" { host "h"; retired #true; command "x" }"#,
-            )],
-        ),
-        (
-            "headless",
-            vec![
-                (
-                    "h/root/agent.kdl",
-                    r#"agent "root" { host "h"; retired #true; command "x" }"#,
-                ),
-                (
-                    "h/worker/agent.kdl",
-                    r#"agent "worker" { host "h"; supervisor "h.root"; command "x" }"#,
-                ),
-            ],
-        ),
-    ] {
-        let c = catalog(&files);
-        let r = validate(c.path());
-        assert!(
-            r.issues.iter().any(|i| i.code == "root-count"
-                && i.severity == Severity::Error
-                && i.message.ends_with("found 0")),
-            "{name}: expected root-count found 0, got {:?}",
-            r.issues
-        );
-    }
+fn a_host_may_have_no_active_root() {
+    let c = catalog(&[(
+        "h/ghost/agent.kdl",
+        r#"agent "ghost" { host "h"; retired #true; command "x" }"#,
+    )]);
+    let r = validate(c.path());
+    assert_eq!(r.errors(), 0, "unexpected issues: {:?}", r.issues);
 }
 
 #[test]
@@ -1084,9 +1041,7 @@ fn cli_exits_nonzero_on_an_error_and_strict_promotes_warnings() {
     )]);
     assert!(!run_validate(&[err.path().as_os_str()]).status.success());
 
-    // A warning-only catalog exits 0 normally, 1 under --strict. Under #399's topology rules a
-    // lone agent with a mismatched folder name is still exactly one root, so the folder/identity
-    // mismatch is the only finding — and it is a warning.
+    // A warning-only catalog exits 0 normally and exits 1 under --strict.
     let warn = catalog(&[(
         "hetz/folder-name/agent.kdl",
         r#"agent "content-name" { type "service"; pty "agent" { command "x" } }"#,

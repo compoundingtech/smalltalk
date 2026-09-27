@@ -6,7 +6,7 @@
 set -u
 
 event="${1:-}"
-identity="${ST_AGENT:-}"
+identity="${ST2_CLAUDE_IDENTITY:-${ST_AGENT:-}}"
 # CATALOG-first, deliberately diverging from the sibling hooks' ST_ROOT-first order: their
 # ST_ROOT is a bus root for message writes, while --catalog here resolves the agent DECLARATION —
 # with a custom bus root (ST_ROOT != CATALOG) declaration resolution under ST_ROOT finds nothing

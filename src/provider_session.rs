@@ -35,6 +35,10 @@ pub(crate) fn install_signal_handler() {
     let interrupt = on_interrupt_signal as extern "C" fn(libc::c_int) as libc::sighandler_t;
     unsafe {
         libc::signal(libc::SIGTERM, handler);
+        // PTY control uses hangup for a supported restart. Treat it as the same bounded stop as
+        // SIGTERM so an interactive provider that ignores or escapes terminal hangup cannot be
+        // orphaned behind the wrapper.
+        libc::signal(libc::SIGHUP, handler);
         // The terminal also sends SIGINT to this wrapper. Keep the wrapper alive while the
         // provider handles that interactive interrupt itself.
         libc::signal(libc::SIGINT, interrupt);
@@ -373,7 +377,7 @@ pub(crate) fn completed_provider(provider: &str, exit: ExitStatus) -> Result<()>
     Ok(())
 }
 
-fn stop_provider_group(
+pub(crate) fn stop_provider_group(
     child: &mut Child,
     observed: Option<&SessionObserver>,
 ) -> Result<Option<ExitStatus>> {
@@ -383,6 +387,10 @@ fn stop_provider_group(
         "refusing to signal process group {process_group}"
     );
     unsafe {
+        // Address the owned child as well as the terminal process group. Interactive providers
+        // may create a new process group while enabling remote control; the Child handle keeps
+        // this PID reserved until it is reaped, so this cannot hit a reused process.
+        libc::kill(child.id() as libc::pid_t, libc::SIGTERM);
         libc::kill(-process_group, libc::SIGTERM);
     }
     let deadline = Instant::now() + STOP_GRACE;
@@ -402,6 +410,7 @@ fn stop_provider_group(
         observed.ended("signal 9");
     }
     unsafe {
+        libc::kill(child.id() as libc::pid_t, libc::SIGKILL);
         libc::kill(-process_group, libc::SIGKILL);
     }
     Ok(child.wait().ok())

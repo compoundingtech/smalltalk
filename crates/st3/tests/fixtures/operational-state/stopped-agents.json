@@ -1,0 +1,8 @@
+{
+  "id": "stopped-historical-agents",
+  "claims": [
+    { "subject": "agent/eval-old/worker", "kind": "runtime.observed", "actor": "agent/eval-old/worker", "fields": { "runtime_id": "old-1", "incarnation_id": "old-1:i1", "status": "stopped", "terminal": true } },
+    { "subject": "agent/eval-old/reviewer", "kind": "runtime.observed", "actor": "agent/eval-old/reviewer", "fields": { "runtime_id": "old-2", "incarnation_id": "old-2:i1", "status": "exited", "terminal": true, "exit_code": 0 } }
+  ],
+  "expected": { "history_count": 2, "default_count": 0, "all_count": 2 }
+}

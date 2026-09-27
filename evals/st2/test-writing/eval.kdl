@@ -1,0 +1,45 @@
+version 1
+
+team "tw" {
+  agent "sup" {
+    workspace "./sup"
+    harness "codex" {
+      model "gpt-5.6-sol"
+      effort "medium"
+      prompt "You cold-started in a hermetic st2 eval. Read AGENTS.md. Use only st2 message for Small Talk. Never use st or another message command. Drain and archive every st2 message. Delegate the test work, verify the result without edits, and send one final requester assessment. If no work remains, end the turn and stay idle. The native driver starts a new turn when a message arrives."
+      args "--dangerously-bypass-approvals-and-sandbox" "--dangerously-bypass-hook-trust"
+    }
+  }
+  agent "dev" {
+    workspace "./worker"
+    harness "codex" {
+      model "gpt-5.6-sol"
+      effort "medium"
+      prompt "You cold-started in a hermetic st2 eval. Read AGENTS.md. Use only st2 message for Small Talk. Never use st or another message command. Drain and archive every st2 message. Write only tests, run them, commit them, and report once to the supervisor. If no work remains, end the turn and stay idle. The native driver starts a new turn when a message arrives."
+      args "--dangerously-bypass-approvals-and-sandbox" "--dangerously-bypass-hook-trust"
+    }
+  }
+}
+
+eval {
+  copy "./fixture"
+  message {
+    from "requester"
+    to "tw.sup"
+    content "./task.md"
+  }
+  max-timeout "1200s"
+
+  judges {
+    judge "only the developer authored work and src stayed unchanged" {
+      exec "WORKER_ID=tw.dev bash ./judges/isolation.sh"
+    }
+    judge "a real test suite was added and is green" {
+      exec "bash ./judges/tests-added-green.sh"
+    }
+    judge "the suite kills at least ten of twelve planted mutants" {
+      timeout "300s"
+      exec "bash ./judges/mutation-score.sh"
+    }
+  }
+}

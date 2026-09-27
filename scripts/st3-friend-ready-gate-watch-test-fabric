@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+: "${ST3_GATE_TEST_REMOTE_LOG:?}"
+/bin/cat "$ST3_GATE_TEST_REMOTE_LOG"

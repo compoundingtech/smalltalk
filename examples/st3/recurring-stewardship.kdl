@@ -1,0 +1,43 @@
+version 2
+
+// Start one bounded stewardship cycle every six hours for a durable seat.
+//
+// The schedule creates one run of an exact finite mission revision per occurrence, each with its
+// own workspace below the declared root. It does not start an occurrence while the previous cycle
+// run is still active. `catch-up "latest"` makes a daemon restart start at most one missed cycle.
+//
+// Schedules belong to a mission run. A mission with no step would complete at once and stop its
+// schedule, so `retire` keeps this run open until the operator approves it in
+// `st3 attention ls --as person/operator`, or cancels the run. The seat is durable and belongs to
+// neither mission.
+//
+//   st3 agents apply examples/st3/seats/omp.kdl --as person/operator
+//   st3 missions publish examples/st3/recurring-stewardship-cycle.kdl --as person/operator
+//   # Replace the zero revision below with the hash that recurring-stewardship-cycle.kdl shows how
+//   # to read.
+//   st3 missions publish examples/st3/recurring-stewardship.kdl --as person/operator
+//   st3 missions start example/stewardship --id example/stewardship/main \
+//     --workspace /srv/example/stewardship --as person/operator
+
+mission "example/stewardship" state="ready" {
+  goal "Start one bounded stewardship cycle every six hours until the operator retires it."
+
+  schedule "cycle" {
+    host "local"
+    every "6h"
+    anchor "2026-01-01T00:00:00Z"
+    catch-up "latest"
+    work {
+      mission "example/stewardship-cycle@0000000000000000000000000000000000000000000000000000000000000000"
+      workspace "${ST_WORKSPACE}/cycles"
+    }
+  }
+
+  step "retire" {
+    agentless
+    gate "the operator retires the stewardship schedule" type="human" {
+      reviewer "person/operator"
+      question "Stop starting stewardship cycles?"
+    }
+  }
+}

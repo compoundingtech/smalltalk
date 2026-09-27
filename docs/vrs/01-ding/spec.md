@@ -49,9 +49,11 @@ rendered text is never reparsed as authority.
 ## Delivery
 
 ```text
-record ownership ─► combined transport (paste ─► 0.5s ─► Return) ─► receipt
-                         │ command failure or ambiguity                 │
-                         └──────────────────────────────────────────────► Staged
+prove empty ─► record ownership ─► paste ─► two exact-safe observations
+                                            │
+                                            ├─ current unread fence ─► Return ─► receipt
+                                            ├─ archive/read/close ────────────► Cancelled
+                                            └─ failure or ambiguity ──────────► Staged
 
 receipt ─┬─ Accepted ──────────────────────────────────────────────► Delivered
          └─ RetainedSafe / RetainedBlocked / NotRetained / Unproven ► Staged
@@ -60,16 +62,16 @@ staged retry ─► receipt ─┬─ Accepted ───────────
                          ├─ RetainedSafe ─► final receipt ─┬─ Accepted ─► Delivered
                          │                                 ├─ RetainedSafe ─► Return ─► receipt
                          │                                 └─ other ────────► Staged
-                         ├─ NotRetained + archived ────────────────► release head
+                         ├─ archived/read/closed before Return ────► Cancelled
                          ├─ NotRetained + unread ──────────────────► Staged
                          └─ RetainedBlocked / Unproven ─────────────► Staged
 ```
 
-Fresh delivery preserves the production transport: one bounded PTY transaction
-contains a bracketed paste, a 0.5 second delay, and Return (`DING-R01`).
-Ownership is recorded immediately before that transaction. The production path
-does not inspect the composer first and does not use the separate staging
-helper.
+Fresh delivery first proves the maintained live composer empty, records
+ownership, and bracketed-pastes without Return. Two adjacent exact-safe
+observations are required before a bare Return (`DING-R01`, `DING-R02`). The
+second observation is immediately followed by a current unread-inbox fence. An
+archive, read, or close that wins before Return cancels submission.
 
 Every failure of that terminal command or of the following receipt observation
 resolves to `Staged` (`DING-R07`): the paste and Return may already have reached
@@ -95,8 +97,9 @@ observation timeout never become delivery. `NotRetained` requires successful
 parsing by a maintained adapter; missing or unrecognized composer evidence stays
 `Unproven`. A staged retry completes without input when it observes `Accepted`;
 it may send one bare Return only after two adjacent `RetainedSafe` observations,
-then must obtain the same positive receipt. `NotRetained` releases ownership
-only when the notice is already archived; an unread notice remains staged.
+then must obtain the same positive receipt. `NotRetained` leaves an unread
+notice staged. Archive/read/close releases a not-yet-submitted head immediately,
+without requiring the adapter to rediscover that its text disappeared.
 `RetainedBlocked`, `NotRetained`, and `Unproven` send no input. No retry
 re-pastes.
 
@@ -160,9 +163,12 @@ never positive `NotRetained` evidence.
 
 Deferred notices retain FIFO order and retry on a bounded backoff, so an
 indefinitely occupied composer cannot spawn a terminal probe per inbox poll
-(`DING-R08`). A staged archived head advances FIFO only after a maintained
-adapter positively observes `NotRetained`; an unread head does not release.
-Archive receipts remove pending notices that do not already own a transport.
+(`DING-R08`). Archive, read, and close are hard no-new-delivery fences: they
+remove pending notices, cancel a staged Return that has not begun, and release
+the FIFO head without deleting immutable message history. An unread head does
+not release merely because an adapter reports `NotRetained`. Startup candidate
+sets are rebuilt from the archive-filtered inbox immediately before adoption;
+restart or replay therefore cannot resurrect historical text as a new DING.
 Declared `busy` never suppresses delivery; only fresh `dnd` defers it
 (`DING-R09`).
 

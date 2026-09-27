@@ -1,8 +1,9 @@
-//! Explicit, receipt-bearing installation of the lifecycle hooks shipped with st2.
+//! Receipt-bearing installation of the lifecycle hooks shipped with st2.
 //!
 //! Hook scripts are published as immutable content-addressed sets. Ordinary supervision resolves
-//! and verifies the set embedded in its own binary, but never writes it. Only `st2 hooks install`
-//! publishes a set and atomically selects it with `current.json`.
+//! and verifies the set embedded in its own binary. A daemon boot also publishes/selects that exact
+//! set when necessary, so a fresh managed node cannot start a harness without its lifecycle
+//! transport. `st2 hooks install` remains the explicit repair and inspection surface.
 
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
@@ -195,6 +196,40 @@ pub fn claude_settings_registration() -> serde_json::Value {
     })
 }
 
+/// Claude lifecycle observation used by an st3-controlled interactive seat.
+///
+/// Unlike the full st2 registration this does not inject the legacy SessionStart ritual or run
+/// legacy message/context helpers. The st3 boot document and native MCP channel own those jobs;
+/// these hooks only externalize Claude's real turn and context state.
+pub fn claude_st3_settings_registration() -> serde_json::Value {
+    fn observe(event: &str) -> serde_json::Value {
+        serde_json::json!([{ "hooks": [{
+            "type": "command",
+            "command": format!("\"$ST_HOOKS/claude-observe.sh\" {event}"),
+        }] }])
+    }
+    serde_json::json!({
+        "$schema": "https://json.schemastore.org/claude-code-settings.json",
+        "hooks": {
+            "SessionStart": observe("SessionStart"),
+            "PreCompact": observe("PreCompact"),
+            "PostCompact": observe("PostCompact"),
+            "StopFailure": observe("StopFailure"),
+            "UserPromptSubmit": observe("UserPromptSubmit"),
+            "Stop": observe("Stop"),
+            "PermissionRequest": observe("PermissionRequest"),
+            "PreToolUse": observe("PreToolUse"),
+            "PostToolUse": observe("PostToolUse"),
+        },
+        "statusLine": {
+            "type": "command",
+            "command": "\"$ST_HOOKS/claude-statusline.sh\"",
+            "padding": 0,
+            "refreshInterval": 5,
+        }
+    })
+}
+
 /// Whether one rendered string refers to a file of ANY st2 hook set, structurally — used by the
 /// union merge to supersede st2's own prior registrations without ever touching a foreign entry.
 /// Two spellings are owned: the `$ST_HOOKS` variable at a token boundary (`$ST_HOOKS/...`,
@@ -241,7 +276,7 @@ pub(crate) fn is_managed_hook_reference(text: &str) -> bool {
 /// `$XDG_STATE_HOME/st2/hooks` or `~/.local/state/st2/hooks`.
 pub fn hooks_root() -> Result<PathBuf> {
     if let Some(path) = std::env::var_os("ST_HOOKS").filter(|value| !value.is_empty()) {
-        return Ok(PathBuf::from(path));
+        return Ok(root_of_exported_hooks(PathBuf::from(path)));
     }
     let state = match std::env::var_os("XDG_STATE_HOME").filter(|value| !value.is_empty()) {
         Some(path) => PathBuf::from(path),
@@ -251,6 +286,26 @@ pub fn hooks_root() -> Result<PathBuf> {
         .join(".local/state"),
     };
     Ok(state.join("st2/hooks"))
+}
+
+/// The hook root an exported `$ST_HOOKS` names.
+///
+/// st2 exports the root, but st3 exports its binary's set directory, because st3's Claude settings
+/// run `$ST_HOOKS/claude-observe.sh`. Read as a root, that set directory sends a pi or omp launch
+/// looking for `<set>/sets/<set>/`, so every seat fails with `launch-error` once the set is new. A
+/// set directory is `<root>/sets/sha256-…` and holds its own manifest, so it names its root.
+fn root_of_exported_hooks(path: PathBuf) -> PathBuf {
+    let names_a_set = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.starts_with("sha256-"))
+        && path.join(SET_MANIFEST_FILE).is_file();
+    let root = path
+        .parent()
+        .filter(|sets| names_a_set && sets.file_name() == Some(std::ffi::OsStr::new(SETS_DIR)))
+        .and_then(Path::parent)
+        .map(Path::to_path_buf);
+    root.unwrap_or(path)
 }
 
 /// The immutable, versioned directory this binary expects rendered hook settings to use.
@@ -692,7 +747,21 @@ pub fn install(replace: bool) -> Result<PathBuf> {
     install_at(&hooks_root()?, replace)
 }
 
-/// Explicit installer beneath a provided root. Ordinary `up` and materialization paths never call it.
+/// Ensure a daemon can launch every built-in harness with this binary's exact lifecycle assets.
+///
+/// The ordinary replacement rules still apply: this can initialize a fresh host or advance to a
+/// newer set, but it cannot silently replace a corrupt receipt, overwrite a newer set, or resolve
+/// an ambiguous same-source build. Those cases retain the explicit `hooks install --replace`
+/// recovery boundary.
+pub fn ensure_installed() -> Result<PathBuf> {
+    ensure_installed_at(&hooks_root()?)
+}
+
+fn ensure_installed_at(root: &Path) -> Result<PathBuf> {
+    verify_required_set_at(root).or_else(|_| install_at(root, false))
+}
+
+/// Installer beneath a provided root.
 pub fn install_at(root: &Path, replace: bool) -> Result<PathBuf> {
     fs::create_dir_all(root).with_context(|| format!("creating hook root {}", root.display()))?;
     let candidate = expected_receipt();
@@ -761,6 +830,17 @@ mod tests {
         assert_eq!(registered, claude_settings_registration());
     }
 
+
+    #[test]
+    fn st3_claude_settings_externalize_lifecycle_without_the_legacy_boot_ritual() {
+        let settings = claude_st3_settings_registration();
+        let encoded = settings.to_string();
+        assert!(encoded.contains("claude-observe.sh"));
+        assert!(encoded.contains("UserPromptSubmit"));
+        assert!(encoded.contains("Stop"));
+        assert!(!encoded.contains("claude-session-start.sh"));
+        assert!(!encoded.contains("claude-stop-failure.sh"));
+    }
 
     #[test]
     fn omp_launch_classification_is_exact() {
@@ -1012,6 +1092,14 @@ mod tests {
     }
 
     #[test]
+    fn daemon_ensure_bootstraps_a_fresh_root_and_is_idempotent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let installed = ensure_installed_at(tmp.path()).unwrap();
+        assert_eq!(installed, verify_required_set_at(tmp.path()).unwrap());
+        assert_eq!(installed, ensure_installed_at(tmp.path()).unwrap());
+    }
+
+    #[test]
     fn required_set_verification_survives_selection_by_another_binary() {
         let tmp = tempfile::tempdir().unwrap();
         let required = install_at(tmp.path(), false).unwrap();
@@ -1022,6 +1110,24 @@ mod tests {
 
         assert_eq!(verify_required_set_at(tmp.path()).unwrap(), required);
         assert!(verify_installed_at(tmp.path()).is_err());
+    }
+
+    #[test]
+    fn an_exported_set_directory_names_its_hook_root() {
+        // st3 exports `$ST_HOOKS` as the set directory. Verified as a root, it fails.
+        let tmp = tempfile::tempdir().unwrap();
+        let set = install_at(tmp.path(), false).unwrap();
+        assert!(verify_required_set_at(&set).is_err());
+        assert_eq!(root_of_exported_hooks(set.clone()), tmp.path());
+        assert_eq!(
+            verify_required_set_at(&root_of_exported_hooks(set.clone())).unwrap(),
+            set
+        );
+        // A root, or a lookalike without a manifest, stays exactly what was exported.
+        assert_eq!(root_of_exported_hooks(tmp.path().into()), tmp.path());
+        let lookalike = tmp.path().join("sets/sha256-empty");
+        fs::create_dir_all(&lookalike).unwrap();
+        assert_eq!(root_of_exported_hooks(lookalike.clone()), lookalike);
     }
 
     #[test]

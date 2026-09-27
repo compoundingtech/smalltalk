@@ -183,8 +183,14 @@ authorizes or changes delivery.
   reads the same core projection and emits advisory-only stable repair text for
   every state; the two surfaces cannot independently interpret provider strings.
   Absence is advised only for a driver that publishes a boundary result on
-  every launch: Claude, Codex, and omp publish only on a credential rejection,
-  so absence is their healthy steady state and earns no advisory.
+  every launch: Claude and omp publish only on a credential rejection, and
+  Codex publishes only on a credential rejection or degraded safe-fallback
+  boot. On an automatic Codex remote resume, the driver removes CLI permission
+  flags that the resume subcommand rejects and reapplies their declared policy
+  through typed `thread/resume`. A rejected projection is retried exactly once
+  without overrides so the conversation still boots, and remains visibly
+  degraded. Absence is otherwise their healthy steady state and earns no
+  advisory.
 - **OHS-R15 Bounded telemetry:** Each failure/recovery transition emits a
   driver-diagnostic span/event and counter. Metric labels and `span.label`
   are limited to closed `driver`, `stage`, `reason`, `source`, `support`, and

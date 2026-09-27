@@ -546,11 +546,7 @@ fn refresh_binding_validation_and_generation_share_one_catalog_snapshot() {
     unsafe { std::env::set_var("XDG_STATE_HOME", &state) };
     st2::event::publish_owner_binding_for_test(&root, "h").unwrap();
     let scope = st2::park::SupervisorScope::current(&root, "h").unwrap();
-    let request_dir = scope
-        .park_dir()
-        .parent()
-        .unwrap()
-        .join("observe-requests");
+    let request_dir = scope.park_dir().parent().unwrap().join("observe-requests");
     match previous_state {
         Some(value) => unsafe { std::env::set_var("XDG_STATE_HOME", value) },
         None => unsafe { std::env::remove_var("XDG_STATE_HOME") },

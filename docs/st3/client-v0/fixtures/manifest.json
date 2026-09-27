@@ -1,0 +1,15 @@
+{
+  "contract": "st3.client.v0",
+  "schema": "../schemas/client-v0.schema.json",
+  "fixtures": [
+    { "file": "capabilities.json", "definition": "Envelope" },
+    { "file": "resources.json", "definition": "GoldenResourceSet" },
+    { "file": "timeline.json", "definition": "Envelope" },
+    { "file": "events.json", "definition": "Envelope" },
+    { "file": "action.json", "definition": "ActionRequest" },
+    { "file": "pairing.json", "definition": "Envelope" },
+    { "file": "terminal-screen.json", "definition": "Envelope" },
+    { "file": "terminal-frames.json", "definition": "Envelope" },
+    { "file": "cursor-gap-error.json", "definition": "ErrorEnvelope" }
+  ]
+}

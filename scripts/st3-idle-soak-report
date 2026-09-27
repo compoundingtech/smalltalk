@@ -1,0 +1,74 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+# Defaults gate a complete post-rollout day. Overrides are for fixture tests.
+JQ_BIN=${ST3_SOAK_JQ_BIN:-$(command -v jq)}
+STATE_DIR=${ST3_SOAK_IDLE_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/st3/idle-soak}
+LOG=${ST3_IDLE_REPORT_LOG:-$STATE_DIR/events.jsonl}
+NOW=${ST3_IDLE_REPORT_NOW_UNIX:-$(/bin/date -u +%s)}
+DURATION=${ST3_IDLE_REPORT_DURATION_SECONDS:-86400}
+MAX_GAP=${ST3_IDLE_REPORT_MAX_GAP_SECONDS:-180}
+MIN_SAMPLES=${ST3_IDLE_REPORT_MIN_SAMPLES:-1200}
+MIN_QUIET=${ST3_IDLE_REPORT_MIN_QUIET:-60}
+MIN_QUIET_SECONDS=${ST3_IDLE_REPORT_MIN_QUIET_SECONDS:-45}
+for value in "$NOW" "$DURATION" "$MAX_GAP" "$MIN_SAMPLES" "$MIN_QUIET" "$MIN_QUIET_SECONDS"; do
+  [[ $value =~ ^[0-9]+$ ]] || { echo 'invalid numeric idle report setting' >&2; exit 2; }
+done
+[[ -r $LOG ]] || { echo "idle evidence log is unavailable: $LOG" >&2; exit 1; }
+
+inputs=("$LOG")
+remote_rows=
+if [[ ${ST3_IDLE_REPORT_REMOTE:-0} == 1 ]]; then
+  : "${FABRIC_BIN:?set FABRIC_BIN to the installed Fabric executable}"
+  if ! remote_rows=$(/usr/bin/timeout -k 5s 120s "$FABRIC_BIN" exec silber -- \
+    /bin/sh -c 'exec /bin/cat "$HOME/.local/state/st3/idle-soak/events.jsonl"'); then
+    echo 'Silber idle evidence is unavailable through Fabric' >&2
+    exit 1
+  fi
+  [[ -n $remote_rows ]] || { echo 'Silber idle evidence is empty' >&2; exit 1; }
+  inputs+=(/dev/fd/3)
+fi
+
+report=$("$JQ_BIN" -sc --argjson now "$NOW" --argjson duration "$DURATION" \
+  --argjson max_gap "$MAX_GAP" --argjson min_samples "$MIN_SAMPLES" \
+  --argjson min_quiet "$MIN_QUIET" --argjson min_quiet_seconds "$MIN_QUIET_SECONDS" '
+  def average: if length == 0 then null else add / length end;
+  def median: if length == 0 then null else sort | .[length / 2 | floor] end;
+  . as $all | ($now - $duration) as $start |
+  def analyze($host; $cpu_limit):
+    ([$all[] | select(.host == $host and .at >= $start and .at <= $now)] | sort_by(.at)) as $rows |
+    ([$rows[] | select(.error != null or .peer_status != "up" or .peer_error != false
+      or .pending != 0 or .context_switches == null or .material_index == null
+      or .peer_last_success_ms == null or (.at * 1000 - .peer_last_success_ms) > 120000)]) as $bad |
+    ([$rows[] | select(.error == null)]) as $valid |
+    ([range(1; $valid | length) as $i | $valid[$i - 1] as $a | $valid[$i] as $b |
+      select($a.pid == $b.pid and $a.material_index == $b.material_index
+        and $b.graph_index >= $a.graph_index
+        and ($b.graph_index - $a.graph_index) <= 200
+        and ($b.at - $a.at) >= $min_quiet_seconds and ($b.at - $a.at) <= $max_gap) |
+      {cpu: (100 * ($b.cpu_seconds - $a.cpu_seconds) / ($b.at - $a.at)),
+       wakeups: (($b.context_switches - $a.context_switches) / ($b.at - $a.at))}]) as $quiet |
+    ([$valid[] | select(.at <= $start + 3600) | .rss_kib] | average) as $rss_first |
+    ([$valid[] | select(.at >= $now - 3600) | .rss_kib] | average) as $rss_last |
+    ([$quiet[].cpu] | median) as $quiet_cpu |
+    {host:$host, samples:($rows | length), errors:($bad | length),
+     first_at:($rows[0].at // null), last_at:($rows[-1].at // null),
+     max_sample_gap:([range(1; $rows | length) as $i | $rows[$i].at - $rows[$i - 1].at] | max // null),
+     pid_count:([$valid[].pid] | unique | length), quiet_intervals:($quiet | length),
+     quiet_cpu_median_pct:$quiet_cpu, quiet_wakeups_median_per_s:([$quiet[].wakeups] | median),
+     rss_first_hour_mean_kib:$rss_first, rss_last_hour_mean_kib:$rss_last,
+     rss_growth_kib:(if $rss_first == null or $rss_last == null then null else $rss_last - $rss_first end),
+     pass: (($rows | length) >= $min_samples and ($bad | length) == 0
+       and ($rows[0].at // ($now + 1)) <= $start + $max_gap
+       and ($rows[-1].at // 0) >= $now - $max_gap
+       and ([range(1; $rows | length) as $i | $rows[$i].at - $rows[$i - 1].at] | max // 0) <= $max_gap
+       and ([$valid[].pid] | unique | length) == 1
+       and ($quiet | length) >= $min_quiet
+       and $quiet_cpu != null and $quiet_cpu >= 0 and $quiet_cpu <= $cpu_limit
+       and $rss_first != null and $rss_last != null
+       and ($rss_last - $rss_first) <= ([65536, $rss_first * 0.1] | max))};
+  [analyze("hetz"; 15), analyze("silber"; 50)] as $hosts |
+  {pass:($hosts | all(.pass)), window_seconds:$duration, hosts:$hosts}
+' "${inputs[@]}" 3<<<"$remote_rows")
+/usr/bin/printf '%s\n' "$report"
+"$JQ_BIN" -e '.pass' <<<"$report" >/dev/null

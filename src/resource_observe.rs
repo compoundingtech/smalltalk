@@ -742,33 +742,34 @@ mod tests {
     #[test]
     fn final_basename_filter_prunes_crash_temps_without_starving_requests() {
         let temp = tempfile::tempdir().unwrap();
+        let request_dir = temp.path().join("requests");
         let request = ObserveRequest::new("h.worker".into(), "queue".into(), None, None).unwrap();
-        let path = request_path(temp.path(), &request.request_id).unwrap();
+        let path = request_path(&request_dir, &request.request_id).unwrap();
         write_json_atomically_no_fsync(&path, &request).unwrap();
         for index in 0..MAX_PENDING_OBSERVE_REQUESTS {
             fs::write(
-                temp.path().join(format!(".observe-crash-{index}")),
+                request_dir.join(format!(".observe-crash-{index}")),
                 b"incomplete",
             )
             .unwrap();
         }
-        fs::write(temp.path().join("sibling"), b"not json").unwrap();
+        fs::write(request_dir.join("sibling"), b"not json").unwrap();
 
-        let (records, errors) = scan_requests(temp.path());
+        let (records, errors) = scan_requests(&request_dir);
 
         assert!(errors.is_empty());
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].request, request);
         assert!(
-            fs::read_dir(temp.path())
+            fs::read_dir(&request_dir)
                 .unwrap()
                 .flatten()
                 .all(|entry| !entry.file_name().to_string_lossy().starts_with(".observe-"))
         );
-        assert!(!durable_request_capacity_is_full(temp.path()).unwrap());
+        assert!(!durable_request_capacity_is_full(&request_dir).unwrap());
         for invalid in ["../escape", "a/b", ".hidden", "x.json", "with space"] {
             assert!(
-                request_path(temp.path(), invalid).is_err(),
+                request_path(&request_dir, invalid).is_err(),
                 "accepted {invalid:?}"
             );
         }
@@ -910,15 +911,16 @@ mod tests {
     #[test]
     fn request_scan_is_bounded_to_the_durable_admission_limit() {
         let temp = tempfile::tempdir().unwrap();
+        let request_dir = temp.path().join("requests");
         for index in 0..(MAX_PENDING_OBSERVE_REQUESTS + 44) {
             let mut request =
                 ObserveRequest::new("h.worker".into(), "queue".into(), Some(9), None).unwrap();
             request.request_id = format!("bounded-{index:03}");
-            let path = request_path(temp.path(), &request.request_id).unwrap();
+            let path = request_path(&request_dir, &request.request_id).unwrap();
             write_json_atomically_no_fsync(&path, &request).unwrap();
         }
 
-        let (records, errors) = scan_requests(temp.path());
+        let (records, errors) = scan_requests(&request_dir);
         assert!(errors.is_empty(), "{errors:?}");
         assert_eq!(records.len(), MAX_PENDING_OBSERVE_REQUESTS);
     }
@@ -974,7 +976,10 @@ mod tests {
             .unwrap()
             .is_some()
         };
-        assert!(!probe(), "a live scope-lock holder must exclude a second writer");
+        assert!(
+            !probe(),
+            "a live scope-lock holder must exclude a second writer"
+        );
         drop(held);
         assert!(probe(), "dropping the guard must release the scope lock");
     }

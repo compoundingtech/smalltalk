@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+# The defaults are the friend-ready gate. Overrides exist for synthetic tests only.
+STATE_DIR=${ST3_SOAK_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/st3/message-soak}
+LOG=${ST3_SOAK_REPORT_LOG:-$STATE_DIR/events.log}
+NOW=${ST3_SOAK_REPORT_NOW_UNIX:-$(/usr/bin/date +%s)}
+MIN_DURATION=${ST3_SOAK_REPORT_MIN_DURATION_SECONDS:-259200}
+MAX_GAP=${ST3_SOAK_REPORT_MAX_GAP_SECONDS:-900}
+MIN_EACH=${ST3_SOAK_REPORT_MIN_EACH_DIRECTION:-400}
+
+for value in "$NOW" "$MIN_DURATION" "$MAX_GAP" "$MIN_EACH"; do
+  [[ $value =~ ^[0-9]+$ ]] || { echo 'invalid numeric report setting' >&2; exit 2; }
+done
+[[ -r $LOG ]] || { echo "soak evidence log is unavailable: $LOG" >&2; exit 1; }
+
+if [[ ${ST3_SOAK_REPORT_SKIP_RUNTIME_CHECKS:-0} != 1 ]]; then
+  /usr/bin/systemctl --user is-active --quiet st3-message-soak.service || {
+    echo 'soak monitor service is not active' >&2; exit 1;
+  }
+  for direction in hetz-to-silber silber-to-hetz; do
+    /usr/bin/jq -e '(.streak == 0) and (.attention == "")' "$STATE_DIR/$direction.json" >/dev/null || {
+      echo "soak monitor has unresolved failures: $direction" >&2; exit 1;
+    }
+  done
+fi
+
+TZ=UTC /usr/bin/awk -v now="$NOW" -v duration="$MIN_DURATION" \
+  -v max_gap="$MAX_GAP" -v min_each="$MIN_EACH" '
+  BEGIN { start = now - duration; previous = -1; first = -1; last = -1 }
+  {
+    stamp = substr($1, 1, 19)
+    if (split(stamp, date, /[-T:]/) != 6) { bad = "invalid timestamp"; next }
+    epoch = mktime(date[1] " " date[2] " " date[3] " " date[4] " " date[5] " " date[6])
+    if (epoch < previous || epoch > now + 60) { bad = "non-monotonic or future evidence"; next }
+    previous = epoch
+    if (index($0, "monitor-started evidence_format=2") && epoch <= start) format_ready = 1
+    if (epoch < start) next
+    if (index($0, " FAILED ") || index($0, "delivery soak will retry") || index($0, " warning:")) bad = "a probe or monitor operation failed"
+    if (!index($0, " ok direction=")) next
+    direction = ""
+    for (i = 2; i <= NF; i++) if ($i ~ /^direction=/) { split($i, field, "="); direction = field[2] }
+    if (direction == "hetz-to-silber") hetz++
+    else if (direction == "silber-to-hetz") silber++
+    else { bad = "unknown direction"; next }
+    if (first < 0) first = epoch
+    if (last >= 0 && epoch - last > max_gap) bad = "evidence gap exceeds maximum"
+    last = epoch
+  }
+  END {
+    if (!format_ready) bad = "72-hour window predates complete failure logging"
+    else if (first < 0 || first - start > max_gap || now - last > max_gap) bad = "evidence does not cover the whole window"
+    else if (hetz < min_each || silber < min_each) bad = "too few successful probes in one direction"
+    if (bad != "") {
+      printf "FAIL: %s; hetz-to-silber=%d silber-to-hetz=%d window_seconds=%d\n", bad, hetz, silber, duration
+      exit 1
+    }
+    printf "PASS: continuous bidirectional exact receipts; hetz-to-silber=%d silber-to-hetz=%d window_seconds=%d max_gap_seconds=%d\n", hetz, silber, duration, max_gap
+  }
+' "$LOG"

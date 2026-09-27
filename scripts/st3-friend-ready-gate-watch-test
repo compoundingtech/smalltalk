@@ -1,0 +1,122 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+here=$(/usr/bin/dirname "$0")
+temporary=$(/usr/bin/mktemp -d /tmp/st3-gate-watch-test.XXXXXX)
+trap '[[ $temporary == /tmp/st3-gate-watch-test.* && -d $temporary ]] && /bin/rm -r -- "$temporary"' EXIT
+now=$(/bin/date -u +%s)
+start=$((now - 240))
+
+for host in hetz silber; do
+  if [[ $host == hetz ]]; then output="$temporary/events.jsonl"; else output="$temporary/remote.jsonl"; fi
+  for offset in 0 60 120 180 240; do
+    at=$((start + offset))
+    /usr/bin/jq -nc --arg host "$host" --argjson at "$at" \
+      '{at:$at,host:$host,pid:(if $host=="hetz" then 1 else 2 end),
+        cpu_seconds:($at / 10),rss_kib:100000,context_switches:$at,
+        graph_index:1,material_index:1,pending:0,peer_status:"up",
+        peer_error:false,peer_last_success_ms:($at*1000)}' >>"$output"
+  done
+done
+
+export ST3_BIN="$here/st3-friend-ready-gate-watch-test-st3"
+export ST_AGENT=agent/test
+export FABRIC_BIN="$here/st3-friend-ready-gate-watch-test-fabric"
+export ST3_GATE_TEST_REMOTE_LOG="$temporary/remote.jsonl"
+export ST3_SOAK_IDLE_STATE_DIR="$temporary"
+export ST3_GATE_STATE_DIR="$temporary/state"
+export ST3_FRIEND_READY_IDLE_START_UNIX="$start"
+export ST3_FRIEND_READY_MESSAGE_START_UNIX="$now"
+export ST3_FRIEND_READY_AUDIT_WORKSPACE="$temporary"
+export ST3_GATE_TEST_RUN_STATE_PREFIX="$temporary/audit-run"
+
+first=$(bash "$here/st3-friend-ready-gate-watch")
+[[ $first == *'preflight=healthy'* ]]
+/usr/bin/jq -e '.idle_preflight == "healthy" and .idle_preflight_notice == ""' \
+  "$temporary/state/state.json" >/dev/null
+
+/usr/bin/jq -c 'if .host=="hetz" and .at==($start+120) then .peer_error=true else . end' \
+  --argjson start "$start" "$temporary/events.jsonl" >"$temporary/bad.jsonl"
+/bin/mv "$temporary/bad.jsonl" "$temporary/events.jsonl"
+if ST3_GATE_TEST_SEND_FAIL=1 bash "$here/st3-friend-ready-gate-watch" >/dev/null; then
+  echo 'failed notice send unexpectedly succeeded' >&2
+  exit 1
+fi
+/usr/bin/jq -e '.idle_preflight == "fault" and .idle_preflight_notice == ""' \
+  "$temporary/state/state.json" >/dev/null
+second=$(bash "$here/st3-friend-ready-gate-watch")
+[[ $second == *'idle preflight fault notified'* && $second == *'preflight=fault'* ]]
+/usr/bin/jq -e --arg notice "$start:fault" \
+  '.idle_preflight == "fault" and .idle_preflight_notice == $notice' \
+  "$temporary/state/state.json" >/dev/null
+
+third=$(bash "$here/st3-friend-ready-gate-watch")
+[[ $third != *'idle preflight fault notified'* && $third == *'preflight=fault'* ]]
+
+risk_start=$((now - 7200))
+export ST3_FRIEND_READY_IDLE_START_UNIX="$risk_start"
+for host in hetz silber; do
+  if [[ $host == hetz ]]; then output="$temporary/events.jsonl"; else output="$temporary/remote.jsonl"; fi
+  : >"$output"
+  for minute in {0..120}; do
+    at=$((risk_start + minute * 60))
+    /usr/bin/jq -nc --arg host "$host" --argjson at "$at" \
+      '{at:$at,host:$host,pid:(if $host=="hetz" then 1 else 2 end),
+        cpu_seconds:(if $host=="hetz" then $at / 2 else $at / 10 end),
+        rss_kib:100000,context_switches:$at,graph_index:1,material_index:1,
+        pending:0,peer_status:"up",peer_error:false,peer_last_success_ms:($at*1000)}' >>"$output"
+  done
+done
+if ST3_GATE_TEST_SEND_FAIL=1 bash "$here/st3-friend-ready-gate-watch" >/dev/null; then
+  echo 'failed CPU risk notice unexpectedly succeeded' >&2
+  exit 1
+fi
+/usr/bin/jq -e '.idle_risk == "high-cpu" and .idle_risk_notice == ""' \
+  "$temporary/state/state.json" >/dev/null
+risk_first=$(bash "$here/st3-friend-ready-gate-watch")
+[[ $risk_first == *'idle CPU risk notified'* && $risk_first == *'cpu-risk=high-cpu'* ]]
+/usr/bin/jq -e --arg notice "$risk_start:high-cpu" \
+  '.idle_risk_notice == $notice' "$temporary/state/state.json" >/dev/null
+risk_second=$(bash "$here/st3-friend-ready-gate-watch")
+[[ $risk_second != *'idle CPU risk notified'* && $risk_second == *'cpu-risk=high-cpu'* ]]
+
+# A delivery deadline alone notifies, but does not start the final audit before
+# a separately reset idle window is also due.
+export ST3_FRIEND_READY_MESSAGE_START_UNIX="$((now - 259200))"
+delivery_due=$(bash "$here/st3-friend-ready-gate-watch")
+[[ $delivery_due == *'delivery gate fail notified'* && $delivery_due != *'friend-ready audit run started:'* ]]
+
+# Once both windows are due, a failed report still queues claimable remediation.
+export ST3_FRIEND_READY_IDLE_START_UNIX="$((now - 86400))"
+run_state="$ST3_GATE_TEST_RUN_STATE_PREFIX-$ST3_FRIEND_READY_IDLE_START_UNIX-$ST3_FRIEND_READY_MESSAGE_START_UNIX"
+due_first=$(bash "$here/st3-friend-ready-gate-watch")
+[[ $due_first == *'idle gate fail notified'* && $due_first == *'friend-ready audit run started:'* ]]
+[[ -f $run_state ]]
+due_second=$(bash "$here/st3-friend-ready-gate-watch")
+[[ $due_second == *'friend-ready audit run already exists:'* ]]
+
+# Resetting the window must create a new run and resend the same failure state.
+export ST3_FRIEND_READY_MESSAGE_START_UNIX="$((ST3_FRIEND_READY_MESSAGE_START_UNIX + 1))"
+run_state="$ST3_GATE_TEST_RUN_STATE_PREFIX-$ST3_FRIEND_READY_IDLE_START_UNIX-$ST3_FRIEND_READY_MESSAGE_START_UNIX"
+reset=$(bash "$here/st3-friend-ready-gate-watch")
+[[ $reset == *'delivery gate fail notified'* && $reset == *'friend-ready audit run started:'* ]]
+[[ -f $run_state ]]
+
+export ST3_FRIEND_READY_IDLE_START_UNIX="$((ST3_FRIEND_READY_IDLE_START_UNIX + 1))"
+run_state="$ST3_GATE_TEST_RUN_STATE_PREFIX-$ST3_FRIEND_READY_IDLE_START_UNIX-$ST3_FRIEND_READY_MESSAGE_START_UNIX"
+idle_reset=$(bash "$here/st3-friend-ready-gate-watch")
+[[ $idle_reset == *'idle gate fail notified'* && $idle_reset == *'friend-ready audit run started:'* ]]
+[[ -f $run_state ]]
+
+# A lost response after commit counts only after an exact read proves the run.
+/bin/rm -- "$run_state"
+lost=$(ST3_GATE_TEST_START_LOST_RESPONSE=1 bash "$here/st3-friend-ready-audit-queue")
+[[ $lost == *'exists after ambiguous start:'* && -f $run_state ]]
+/bin/rm -- "$run_state"
+if ST3_GATE_TEST_START_FAIL=1 bash "$here/st3-friend-ready-audit-queue" >/dev/null; then
+  echo 'failed audit start unexpectedly succeeded' >&2
+  exit 1
+fi
+[[ ! -f $run_state ]]
+
+/usr/bin/printf 'st3 friend-ready gate watcher tests passed\n'

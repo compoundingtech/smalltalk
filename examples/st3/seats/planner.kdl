@@ -1,0 +1,18 @@
+version 2
+
+// A durable planning seat for ../many-to-many.kdl.
+//
+// It is a seat like the worker seats beside it, with its own identity and its own checkout of the
+// invented repository. Missions give it planning steps by assigning them to
+// `agent/example/planner`. Apply it with a worker seat and seats/reviewer.kdl:
+//
+//   st3 agents apply examples/st3/seats/planner.kdl --as person/operator
+//   st3 agents queue agent/example/planner
+agent "example/planner" {
+  workspace "/srv/example/planner"
+  restart "always"
+  harness "claude" {
+    model "claude-sonnet-5"
+    effort "medium"
+  }
+}

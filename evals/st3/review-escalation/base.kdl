@@ -1,0 +1,35 @@
+version 2
+
+resource "eval/review-escalation/source" { kind "vcs.pull-request" }
+
+mission "eval/review-escalation/work" state="ready" revision-cutover="restart-active" {
+  input "source" kind="resource"
+  completion { when "all-steps-exhausted" }
+  goal "Route one immutable pull request review."
+
+  step "review" {
+    agentless
+    produces {
+      resource "mission-run/${ST_MISSION_RUN}/review" { kind "human.review" }
+    }
+  }
+
+  step "route" {
+    assigned-to "agent/eval/review-escalation/standing/owner"
+    depends-on { step "review" completed }
+    goal "Select the final review route."
+  }
+}
+
+mission "eval/review-escalation/standing" state="ready" {
+  goal "Keep the model-free review owner available."
+  agent "owner" {
+    workspace "${ST_WORKSPACE}"
+    command "sleep 1200"
+    mission-authority {
+      start "eval/review-escalation/work"
+      revise "eval/review-escalation/work"
+    }
+    restart "never"
+  }
+}

@@ -1,0 +1,14 @@
+version 1
+
+eval {
+  copy "./fixture"
+  max-timeout "60s"
+
+  run "contract" { command "bash ./run.sh" }
+
+  judges {
+    judge "the resource becomes readable before the delivery action" {
+      exec "bash $CATALOG/judge.sh"
+    }
+  }
+}

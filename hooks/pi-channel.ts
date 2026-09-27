@@ -310,6 +310,52 @@ export default function (pi: ExtensionAPI) {
     child.stdin.write(JSON.stringify(frame) + "\n");
   };
   const sendState = (word: "active" | "idle") => sendFrame({ type: "state", state: word });
+  const boundedTimelineString = (value: unknown, limit = 16_384): string | undefined =>
+    typeof value === "string" ? value.slice(0, limit) : undefined;
+  const normalizedTimelinePayload = (event: string, raw: unknown): Record<string, unknown> => {
+    const value = raw && typeof raw === "object" ? raw as Record<string, unknown> : {};
+    if (event === "tool_call") return {
+      toolCallId: boundedTimelineString(value.toolCallId ?? value.tool_call_id, 256),
+      toolName: boundedTimelineString(value.toolName ?? value.tool_name, 128),
+      input: { redacted: true },
+    };
+    if (event === "tool_result") return {
+      toolCallId: boundedTimelineString(value.toolCallId ?? value.tool_call_id, 256),
+      isError: value.isError === true,
+      content: { redacted: true },
+    };
+    const rawMessage = value.message;
+    const message = rawMessage && typeof rawMessage === "object"
+      ? rawMessage as Record<string, unknown>
+      : value;
+    let content: unknown = boundedTimelineString(message.content);
+    if (Array.isArray(message.content)) {
+      content = message.content.slice(0, 64).map((part) => {
+        if (typeof part === "string") return { text: part.slice(0, 16_384) };
+        if (!part || typeof part !== "object") return {};
+        return { text: boundedTimelineString((part as Record<string, unknown>).text) };
+      });
+    }
+    const usage = message.usage && typeof message.usage === "object"
+      ? message.usage as Record<string, unknown>
+      : undefined;
+    return { message: {
+      id: boundedTimelineString(message.id, 256),
+      role: boundedTimelineString(message.role, 32),
+      content,
+      usage: usage ? {
+        input: finiteOrNull(usage.input ?? usage.inputTokens),
+        output: finiteOrNull(usage.output ?? usage.outputTokens),
+      } : undefined,
+    } };
+  };
+  const sendTimeline = (event: string, payload: unknown) => {
+    try {
+      sendFrame({ type: "timeline", event, payload: normalizedTimelinePayload(event, payload) });
+    } catch {
+      // Observability remains fail-open; Rust applies the durable byte/redaction policy.
+    }
+  };
 
   // Harness context, extension side (HC-R02, HC-R03, HC-R11, HC-R12).
   //
@@ -424,10 +470,18 @@ export default function (pi: ExtensionAPI) {
     ) => void)(name, async (event, ctx) => {
       captureCost(event);
       sendContext(ctx);
+      if (name === "message_end") sendTimeline(name, event);
     });
   onContextEvent("message_end");
   onContextEvent("turn_end");
   onContextEvent("agent_end");
+
+  const onTimelineEvent = pi.on.bind(pi) as unknown as (
+    event: string,
+    handler: (event: unknown) => void | Promise<void>,
+  ) => void;
+  onTimelineEvent("tool_call", async (event) => sendTimeline("tool_call", event));
+  onTimelineEvent("tool_result", async (event) => sendTimeline("tool_result", event));
 
   // pi's `session_compact` carries `reason ∈ manual | threshold | overflow` — the only v1 producer
   // that names its trigger at all. Measured in the handler itself: `getContextUsage()` already
@@ -449,12 +503,10 @@ export default function (pi: ExtensionAPI) {
     // prompt rather than the turn after it.
     const restored = await open(ctx);
     const opened = state.child;
-    // Seed the observed state with the idle proof's answer at open time, so the record does not
-    // wait for the first turn boundary to exist.
-    if (opened && typeof ctx.isIdle === "function") {
-      sendState(ctx.isIdle() ? "idle" : "active");
-    }
-    // And seed the context record, so a resumed session publishes the window it resumed INTO
+    // Do not seed an idle state here. `session_start` precedes a positional boot prompt, and an
+    // idle frame would authorize the channel to inject mail before pi has created the transcript
+    // for that prompt. `agent_settled` is the first transcript-ready lifecycle edge. Seed only the
+    // context record, so a resumed session still publishes the window it resumed INTO
     // rather than waiting for its first turn boundary. A fresh session reads `{tokens: 0}` here
     // and a post-compaction restart reads `{tokens: null}` — both are honest answers pi gives.
     if (opened) sendContext(ctx);

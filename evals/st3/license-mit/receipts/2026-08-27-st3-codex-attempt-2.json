@@ -1,0 +1,43 @@
+{
+  "schema": "st3-eval-proof.v1",
+  "date": "2026-08-27",
+  "eval": "license-mit-codex",
+  "paid_attempt": 2,
+  "candidate": {
+    "git_head": "5e72de6ff155e23db184ad5630264d43015ed504",
+    "working_tree": "dirty",
+    "st3_version": "0.1.0",
+    "st3_binary_sha256": "4c7f8ff2fc241c1f57c2cc272c33cc1ea28e189ea33c35cb18d79755511f861c",
+    "eval_kdl_sha256": "05e6454a16dce04acd37c9f0f16bee59db54649eda77a7101311c7830b09dd8e",
+    "coordination_judge_sha256": "1af7bfabf1704e0b6736c5f4c3af6b42edf25f0157c2ebcf587c5d32788b632e",
+    "task_document_sha256": "7ebefe1e115dbfb438ca4da438b3b9d825dcd2cced572393235c70ac070a5e21"
+  },
+  "providers": {
+    "codex_cli": "0.145.0",
+    "pty": "0.12.0+face607"
+  },
+  "usage": {
+    "weekly_remaining_before_percent": 87,
+    "weekly_remaining_after_percent": 87,
+    "reset_redeemed": false
+  },
+  "result": {
+    "done": false,
+    "stopped_checkpoint": "All held-out judges pass",
+    "worker_commit": "98cd5237200b8394764e64cdb47dcbda080e6f6b",
+    "cleanup_complete": true,
+    "cause": "The migrated coordination script did not recognize the canonical agent/ prefix in exported actor identities.",
+    "evidence": [
+      "The graph passed native readiness and explicit team completion.",
+      "The worker committed the correct change with a clean tree.",
+      "The supervisor sent a verified confirmation after the worker report.",
+      "The isolation judge passed.",
+      "The coordination judge reported all three graph messages missing, although the export contained them with agent/ actors."
+    ],
+    "fix": {
+      "description": "The cell judge now accepts the canonical agent/ prefix while it retains old host-prefix tolerance.",
+      "verification": "The changed judge passes against the preserved attempt export.",
+      "fixed_coordination_judge_sha256": "c37269469393a8c3914beb67e3efe3145d48a8dd07cba3c888d964d9d8594488"
+    }
+  }
+}

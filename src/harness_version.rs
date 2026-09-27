@@ -153,7 +153,9 @@ mod tests {
 
     #[test]
     fn only_exactly_three_numeric_components_parse() {
-        for token in ["18", "18.0", "18.0.9.1", "18..9", "18.0.", ".0.9", "", "x.y.z"] {
+        for token in [
+            "18", "18.0", "18.0.9.1", "18..9", "18.0.", ".0.9", "", "x.y.z",
+        ] {
             assert_eq!(parse_release(token), None, "{token} must not parse");
         }
     }
@@ -164,12 +166,24 @@ mod tests {
         assert_eq!(token, "18.0.9");
         assert_eq!(release.series(), (18, 0));
         assert_eq!(
-            find_release("opencode/1.18.25", "opencode").unwrap().1.series(),
+            find_release("opencode/1.18.25", "opencode")
+                .unwrap()
+                .1
+                .series(),
             (1, 18)
         );
-        assert_eq!(find_release("v1.18.25", "opencode").unwrap().1.series(), (1, 18));
+        assert_eq!(
+            find_release("v1.18.25", "opencode").unwrap().1.series(),
+            (1, 18)
+        );
         // The shape omp actually prints for `--version` in the wild.
-        assert_eq!(find_release("omp v18.0.3\n18.0.3\n", "omp").unwrap().1.series(), (18, 0));
+        assert_eq!(
+            find_release("omp v18.0.3\n18.0.3\n", "omp")
+                .unwrap()
+                .1
+                .series(),
+            (18, 0)
+        );
     }
 
     /// The provider naming itself outranks any other version in the banner. Without this, a

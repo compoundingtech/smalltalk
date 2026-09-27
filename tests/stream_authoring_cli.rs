@@ -540,6 +540,7 @@ fn external_stream_removal_performs_no_runtime_operation() {
             "hetz",
         ])
         .env("PATH", "")
+        .env_remove("ST_AGENT")
         .output()
         .unwrap();
 

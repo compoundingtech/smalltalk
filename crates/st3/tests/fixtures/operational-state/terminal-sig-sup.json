@@ -1,0 +1,15 @@
+{
+  "id": "terminal-signal-rename-sig-sup",
+  "claims": [
+    {
+      "subject": "agent/signal-rename-codex/sig.sup",
+      "kind": "runtime.observed",
+      "actor": "agent/signal-rename-codex/sig.sup",
+      "fields": {
+        "runtime_id": "runtime-sig-sup-1", "incarnation_id": "runtime-sig-sup-1:2026-09-20T10:00:00Z",
+        "status": "stopped", "terminal": true, "host": "local", "reachability": "local"
+      }
+    }
+  ],
+  "expected": { "history": ["agent/signal-rename-codex/sig.sup"], "current": [], "actionable": [] }
+}

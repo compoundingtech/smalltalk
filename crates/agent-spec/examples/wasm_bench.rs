@@ -68,12 +68,18 @@ fn main() {
         ))
         .resolve(Path::new(agent_dir), uri)
         .expect("registry resolves demo module");
-    assert_eq!(via_registry.path, path_buf_of(agent_dir, "/resources/goal.md"));
+    assert_eq!(
+        via_registry.path,
+        path_buf_of(agent_dir, "/resources/goal.md")
+    );
     let warm_result = warm_instance.resolve(uri, agent_dir).expect("warm resolve");
     assert_eq!(warm_result.path, format!("{agent_dir}/resources/goal.md"));
 
     println!("wasm resolver plugin benchmark — {N} resolutions per mode");
-    println!("{:<28} {:>10} {:>10} {:>10} {:>12} {:>12}", "mode", "p50µs", "p95µs", "p99µs", "maxµs", "total_ms");
+    println!(
+        "{:<28} {:>10} {:>10} {:>10} {:>12} {:>12}",
+        "mode", "p50µs", "p95µs", "p99µs", "maxµs", "total_ms"
+    );
 
     // Warm: reuse one instance; measures fuel charge + memory copies + guest work + JSON parse.
     let mut warm = Vec::with_capacity(N);
@@ -110,7 +116,10 @@ fn main() {
     let compile_once = t.elapsed();
 
     println!();
-    println!("module compile (once): {:.2} ms", compile_once.as_secs_f64() * 1000.0);
+    println!(
+        "module compile (once): {:.2} ms",
+        compile_once.as_secs_f64() * 1000.0
+    );
 }
 
 fn path_buf_of(a: &str, b: &str) -> std::path::PathBuf {

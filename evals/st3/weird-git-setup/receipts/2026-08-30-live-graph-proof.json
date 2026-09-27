@@ -1,0 +1,68 @@
+{
+  "schema": "st3-eval-graph-proof.v1",
+  "date": "2026-08-30",
+  "eval": "weird-git-setup",
+  "run_id": "332ddd69ce034f9e1fe23088b377a4ea",
+  "candidate": {
+    "git_head": "95ad704d7beb4b2bde4d3c60c9ed68ce9c1d763d",
+    "st3_version": "0.1.0",
+    "st3_binary_sha256": "d904c55bf78ea4a4c3b83ee94da2620c8bc6ebfe69293bbba86344b8189dcb1a",
+    "eval_kdl_sha256": "948dfcceb48ae01f61ec3da84961dc26463c01fb1cd4d1ce7b0c6c836c40d525",
+    "setup_script_sha256": "47fa7f555b1747590ff3a9f7deb0aff15fca1627ee1f711429df2cb237b2343a",
+    "eval_revision": "66b2484aaeaf717191cb1c43a73e37a6813c50abbf83412fe10fdb50f7385cf0"
+  },
+  "providers": {
+    "codex_cli": "0.146.0",
+    "pty": "0.12.0+500eab2"
+  },
+  "isolation": {
+    "node": "viewer-proof",
+    "state": "fresh temporary directory",
+    "socket": "fresh temporary Unix socket",
+    "binary": "immutable copy"
+  },
+  "preflight": {
+    "doctor_strict": "pass",
+    "checks": [
+      "claim-store",
+      "state-directory",
+      "pty-runtime",
+      "process-isolation",
+      "runtime-ownership",
+      "runtime-drift",
+      "driver-readiness"
+    ]
+  },
+  "viewer": {
+    "command": "st3 eval ./evals/st3/weird-git-setup --graph",
+    "interactive_terminal": true,
+    "eval_specific_configuration": false,
+    "first_frame_seconds": 0,
+    "first_agent_ready_seconds": 2,
+    "first_agent_claim_seconds": 27,
+    "final_frame_seconds": 195,
+    "observed_transitions": [
+      "fixture pending to ready to completed",
+      "native Codex worker pending to ready to completed",
+      "assigned parent ready to claimed to completed",
+      "six nested steps pending to ready to claimed to completed",
+      "held-out judges pending to ready to completed",
+      "eval normal to final to terminal",
+      "cleanup pending to ready to completed"
+    ]
+  },
+  "result": {
+    "scope": "scope/eval/weird-git-setup/332ddd69ce034f9e1fe23088b377a4ea",
+    "mission_run": "mission-run/332ddd69ce034f9e1fe23088b377a4ea",
+    "lifecycle": "completed",
+    "phase": "terminal",
+    "verdict": "pass",
+    "cleanup": "complete",
+    "completed_steps": 11,
+    "total_steps": 11,
+    "active_steps": 0,
+    "blocked_steps": 0,
+    "final_store_index": 119,
+    "agent_status_after_cleanup": "stopped"
+  }
+}

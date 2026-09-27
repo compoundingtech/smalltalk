@@ -103,10 +103,11 @@ impl SnapshotCache {
     }
 
     fn insert(&mut self, digest: [u8; SNAPSHOT_DIGEST_BYTES], source: CachedSource) {
-        if !self.sources.contains_key(&digest) && self.sources.len() >= MAX_CACHED_SNAPSHOTS {
-            if let Some(evicted) = self.sources.keys().next().copied() {
-                self.sources.remove(&evicted);
-            }
+        if !self.sources.contains_key(&digest)
+            && self.sources.len() >= MAX_CACHED_SNAPSHOTS
+            && let Some(evicted) = self.sources.keys().next().copied()
+        {
+            self.sources.remove(&evicted);
         }
         self.sources.insert(digest, source);
     }

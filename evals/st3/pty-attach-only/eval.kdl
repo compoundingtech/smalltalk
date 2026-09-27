@@ -1,0 +1,27 @@
+version 2
+
+  mission "eval/pty-attach-only" state="ready" timeout="20m" {
+    completion { when "all-steps-exhausted" }
+    goal "Complete mission eval/pty-attach-only."
+    step "contract" timeout="2m" {
+      title "Attach-only never restarts a dead PTY session"
+        exec "eval/pty-attach-only/probe" {
+          host "local"
+          workspace "${ST_WORKSPACE}/fixture"
+          cwd "${ST_WORKSPACE}/fixture"
+          command "bash -o pipefail -c 'bash ./probe.sh | tee proof.txt'"
+          restart "never"
+          env { CATALOG "${ST_WORKSPACE}/fixture" }
+        }
+      gate "condition-1" { field "status" "exec/${ST_MISSION_RUN}/eval/pty-attach-only/probe" "is" "exited" }
+      gate "condition-2" { field "exit_code" "exec/${ST_MISSION_RUN}/eval/pty-attach-only/probe" "is" 0 }
+    }
+    step "gate" timeout="1m" {
+      depends-on { step "contract" completed }
+      gate "all attach-only markers are present" {
+        exec "bash ./judge.sh"
+        host "local"
+        workspace "${ST_WORKSPACE}/fixture"
+      }
+    }
+  }

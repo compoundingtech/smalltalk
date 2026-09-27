@@ -1,0 +1,42 @@
+version 1
+
+team "ce" {
+  agent "sup" {
+    workspace "./sup"
+    command "exec bash ./sup.sh"
+  }
+  agent "crash" {
+    workspace "./crash"
+    supervisor "ce.sup"
+    command "exec bash -c 'sleep 12; exit 17'"
+  }
+  agent "clean" {
+    workspace "./clean"
+    supervisor "ce.sup"
+    command "exec bash -c 'sleep 12; exit 0'"
+  }
+  agent "reporter" {
+    workspace "./reporter"
+    supervisor "ce.sup"
+    command "exec bash ./reporter.sh"
+  }
+}
+
+eval {
+  copy "./fixture"
+  message {
+    from "requester"
+    to "ce.sup"
+    content "Observe the deterministic crash and clean-exit controls."
+  }
+  max-timeout "18s"
+  supervise
+  judges {
+    judge "an abnormal exit creates a supervisor fault message" {
+      exec "grep -rlq 'worker crash: .*ce.crash' $CATALOG/*ce.sup/inbox $CATALOG/*ce.sup/archive"
+    }
+    judge "a clean exit creates no fault message" {
+      exec "! grep -rlq 'crash: .*ce.clean' $CATALOG/*ce.sup/inbox $CATALOG/*ce.sup/archive 2>/dev/null"
+    }
+  }
+}

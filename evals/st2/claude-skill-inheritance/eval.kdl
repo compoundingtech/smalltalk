@@ -1,0 +1,30 @@
+version 1
+
+team "si" {
+  agent "agent" {
+    workspace "./repo"
+    harness "claude" {
+      model "claude-sonnet-5"
+      effort "medium"
+      dev-channels #true
+      prompt "You cold-started in a hermetic st2 eval. Read CLAUDE.md. Use only st2 message for Small Talk. Never use st, Claude cross-session messaging, SendMessage, teams, subagents, or another message command. Drain and archive every st2 message. Invoke every available skill whose name contains evalskill, follow each skill exactly, and report once. If no work remains, end the turn and stay idle. The native driver starts a new turn when a message arrives."
+      args "--permission-mode" "auto" "--plugin-dir" "../plugin/evalpkg"
+    }
+  }
+}
+
+eval {
+  copy "./fixture"
+  message {
+    from "requester"
+    to "si.agent"
+    content "./task.md"
+  }
+  max-timeout "420s"
+
+  judges {
+    judge "the project skill wrote its secret token" { exec "bash ./judges/project-scope.sh" }
+    judge "the plugin skill wrote its secret token" { exec "bash ./judges/plugin-scope.sh" }
+    judge "the session did not pollute personal Claude scope" { exec "bash ./judges/isolation.sh" }
+  }
+}

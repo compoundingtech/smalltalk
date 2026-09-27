@@ -1,0 +1,59 @@
+version 1
+
+team "rc" {
+  agent "sup" {
+    workspace "./sup"
+    harness "claude" {
+      model "claude-sonnet-5"
+      effort "medium"
+      dev-channels #true
+      prompt #"You cold-started in a hermetic st2 eval. Read CLAUDE.md. Use only the st2 bus for coordination. Never use Claude cross-session messaging, SendMessage, teams, or subagents. Drain and archive every message. Delegate the batch to rc.dev. Verify the final repository before you send requester one final confirmation. End the turn when no message remains."#
+      args "--permission-mode" "bypassPermissions"
+    }
+    exec "injector" {
+      command "exec bash ../inj/restart-injector.sh"
+    }
+  }
+  agent "dev" {
+    workspace "./worker"
+    harness "claude" {
+      model "claude-sonnet-5"
+      effort "medium"
+      dev-channels #true
+      prompt #"You cold-started in a hermetic st2 eval. Read CLAUDE.md. Use only the st2 bus for coordination. Never use Claude cross-session messaging, SendMessage, teams, or subagents. Drain and archive every message. Use PROGRESS.md and git as durable state. Never repeat a completed item. Continue the ordered batch after any restart. End the turn when no message remains."#
+      args "--permission-mode" "auto"
+    }
+  }
+}
+
+eval {
+  copy "./fixture"
+  message {
+    from "requester"
+    to "rc.sup"
+    content "./task.md"
+  }
+  max-timeout "1200s"
+  supervise
+
+  judges {
+    judge "the cold restart and duplicate delivery were injected" {
+      exec "bash ./judges/resumed.sh"
+    }
+    judge "every stable item completed exactly once" {
+      exec "bash ./judges/no-double-act.sh"
+    }
+    judge "every item has a durable progress record and working handler" {
+      exec "bash ./judges/no-skip.sh"
+    }
+    judge "the final artifact is not corrupt" {
+      exec "bash ./judges/no-corruption.sh"
+    }
+    judge "only rc.dev changed the ledger repository" {
+      exec "bash ./judges/isolation.sh"
+    }
+    judge "delegation, report, and confirmation use Small Talk" {
+      exec "bash ./judges/coordination.sh"
+    }
+  }
+}

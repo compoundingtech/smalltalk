@@ -1,0 +1,75 @@
+version 1
+
+// license-mit.kdl — the whole eval in one file.  `st2 eval ./` runs it; `st2 up ./` just boots the team.
+// The smallest real team loop: one request in ("license should be MIT"), a coordinated
+// delegate -> execute -> verify -> confirm loop out, isolation held. Judges are all held-out.
+
+
+// Harness loaders, personas, and hooks are intentionally baked into fixture workspaces;
+// bin/check-harness-contract.sh verifies every current bus-connected model agent.
+team "mix" {                             // prefixes the agents it holds -> mix.sup, mix.worker
+  agent "sup" {
+    workspace "./sup"                    // coordinate-only cwd (owns no product repo)
+    harness "claude" {
+      model "claude-sonnet-5"
+      effort "medium"
+      dev-channels #true
+      prompt "You just cold-started in a hermetic st2 eval. Read CLAUDE.md. Use only the st2 bus for coordination. Never use Claude cross-session messaging, SendMessage, teams, or subagents. Drain the inbox once with st2 message using $ST_ROOT and $ST_AGENT, then set status available; presence is best-effort if this flat eval seat cannot resolve. If the drain contains no work, stand by for an st2 channel message. After a message arrives, drain the inbox again, act on every message, archive each handled item, and report completion or blockers over the st2 bus."
+      args "--permission-mode" "bypassPermissions"
+    }
+  }
+  agent "worker" {
+    workspace "./worker"                 // owns the widget repo (this dir)
+    harness "claude" {
+      model "claude-sonnet-5"
+      effort "medium"
+      dev-channels #true
+      prompt "You just cold-started in a hermetic st2 eval. Read CLAUDE.md. Use only the st2 bus for coordination. Never use Claude cross-session messaging, SendMessage, teams, or subagents. Drain the inbox once with st2 message using $ST_ROOT and $ST_AGENT, then set status available; presence is best-effort if this flat eval seat cannot resolve. If the drain contains no work, stand by for an st2 channel message. After a message arrives, drain the inbox again, act on every message, archive each handled item, and report completion or blockers over the st2 bus."
+      args "--permission-mode" "auto"
+    }
+  }
+}
+
+eval {                                   // `st2 eval` = copy the world, boot team + judge, kick off, then judge
+  copy "./fixture"                       // pre-built starting world, 1:1 (worker/_git -> worker/.git on copy)
+  message {                              // kickoff — same as `st2 message send`
+    from "requester"
+    to "mix.sup"
+    content "./task.md"
+  }
+  max-timeout "1200s"                    // the whole eval must finish within this
+
+  agent "judge" {                        // a real native driver agent, declared in the open
+    workspace "./"                       // sees the whole sandbox + bus, so it can inspect
+    harness "codex" {
+      model "gpt-5.6-sol"
+      effort "medium"
+      prompt "You just cold-started as a hermetic eval judge. Read AGENTS.md. Drain the inbox once with st2 message using $ST_ROOT and $ST_AGENT, then set status available; presence is best-effort if this flat eval seat cannot resolve. If the drain contains no ask, stand by for a message. After a message arrives, drain the inbox again, inspect the sandbox as requested, reply on the existing bus thread in the exact format asked, archive each handled item, and report completion or blockers over the st2 bus."
+      args "--dangerously-bypass-approvals-and-sandbox" "--dangerously-bypass-hook-trust"
+    }
+  }
+
+  judges {                               // all must pass; each one visible, nothing magic
+    judge "isolation — supervisor owns no repo; change stays on the license surface" {
+      exec "bash ./judges/isolation.sh"
+    }
+    judge "coordination — delegate->report->verified-confirm visible on the bus" {
+      exec "bash ./judges/coordination.sh"
+    }
+    judge "LICENSE is real MIT" {
+      file "worker/LICENSE"  has   "Permission is hereby granted, free of charge"
+      file "worker/LICENSE"  has   #"THE SOFTWARE IS PROVIDED "AS IS""#
+      file "worker/LICENSE"  lacks "proprietary"
+    }
+    judge "package.json declares MIT" {
+      json "worker/package.json"  field "license"  is "MIT"
+    }
+    judge "the change is committed + the worktree is clean" {
+      exec "bash ./judges/committed.sh"
+    }
+    judge "confirmation is verified, not a rubber-stamp" {
+      timeout "120s"                     // per-judge cap — a wedged judge can't hang the eval
+      ask "judge" #"Read the mix.sup -> requester confirmation on the bus. PASS if it cites the real commit and the supervisor's verification that LICENSE is MIT, package.json declares MIT, the change is committed, and the tree is clean. FAIL if it is a vague "done!" with no evidence. Reply: PASS or FAIL, then one sentence."#
+    }
+  }
+}

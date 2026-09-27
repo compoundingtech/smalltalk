@@ -1,0 +1,51 @@
+version 1
+
+team "prx" {
+  agent "sup" {
+    workspace "./sup"
+    harness "codex" {
+      model "gpt-5.6-sol"
+      effort "medium"
+      prompt "You cold-started in a hermetic st2 eval. Read AGENTS.md. Drain and archive every Small Talk message. If no work remains, end the turn and stay idle. The native driver starts a new turn when a message arrives. Delegate the review, assess the result without edits, and send one final requester verdict."
+      args "--dangerously-bypass-approvals-and-sandbox" "--dangerously-bypass-hook-trust"
+    }
+  }
+  agent "rev" {
+    workspace "./rev"
+    harness "codex" {
+      model "gpt-5.6-sol"
+      effort "medium"
+      prompt "You cold-started in a hermetic st2 eval. Read AGENTS.md. Drain and archive every Small Talk message. If no work remains, end the turn and stay idle. The native driver starts a new turn when a message arrives. Review the assigned branch without edits and report concrete findings and a verdict."
+      args "--dangerously-bypass-approvals-and-sandbox" "--dangerously-bypass-hook-trust"
+    }
+  }
+}
+
+eval {
+  copy "./fixture"
+  message {
+    from "requester"
+    to "prx.sup"
+    content "./task.md"
+  }
+  max-timeout "1200s"
+
+  judges {
+    judge "the review changed no repository file" {
+      exec "bash ./judges/isolation.sh"
+    }
+    judge "the reviewer and supervisor produced a review" {
+      exec "bash ./judges/review-exists.sh"
+    }
+    judge "the final verdict requests changes" {
+      exec "bash ./judges/verdict.sh"
+    }
+    judge "the review finds the path traversal" {
+      exec "bash ./judges/security-caught.sh"
+    }
+    judge "the review reports other useful findings" {
+      signal
+      exec "bash ./judges/other-defects.sh"
+    }
+  }
+}

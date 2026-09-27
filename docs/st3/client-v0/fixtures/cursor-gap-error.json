@@ -1,0 +1,13 @@
+{
+  "api_version": "st3.client.v0",
+  "error_version": "st3.client.error.v0",
+  "request_id": "request/events-gap-1",
+  "code": "cursor-gap",
+  "message": "The event cursor is older than retained projection events.",
+  "retryable": true,
+  "details": {
+    "full_resync": true,
+    "oldest_cursor": "event-cursor/epoch-b/200",
+    "event_cursor": "event-cursor/epoch-b/248"
+  }
+}

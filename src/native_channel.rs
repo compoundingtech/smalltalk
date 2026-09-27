@@ -53,10 +53,7 @@ mod tests {
         )
         .unwrap();
         let framed = String::from_utf8(out).unwrap();
-        assert_eq!(
-            framed,
-            "{\"a\":1}\n{\"content\":\"line one\\nline two\"}\n"
-        );
+        assert_eq!(framed, "{\"a\":1}\n{\"content\":\"line one\\nline two\"}\n");
         assert_eq!(framed.lines().count(), 2);
     }
 }

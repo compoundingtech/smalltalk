@@ -1,0 +1,14 @@
+version 1
+
+eval {
+  copy "./fixture"
+  max-timeout "90s"
+  run "stream" { command "bash ./stream.sh" }
+  judges {
+    judge "the packaged launcher preserves the inherited descriptor" { exec "grep -Fqx PACKAGED-FD-GREEN-61e8 $RUNS_DIR/stream.out" }
+    judge "the initial stream begins with geometry and screen" { exec "grep -Fqx INITIAL-SNAPSHOT-GREEN-61e8 $RUNS_DIR/stream.out" }
+    judge "reconnect emits a fresh current snapshot" { exec "grep -Fqx RECONNECT-SNAPSHOT-GREEN-61e8 $RUNS_DIR/stream.out" }
+    judge "data and exit stay framed" { exec "grep -Fqx FRAMED-TERMINAL-STREAM-GREEN-61e8 $RUNS_DIR/stream.out" }
+    judge "the synthetic registry is empty" { exec "grep -Fqx MACHINE-STREAM-CLEANUP-GREEN-61e8 $RUNS_DIR/stream.out" }
+  }
+}

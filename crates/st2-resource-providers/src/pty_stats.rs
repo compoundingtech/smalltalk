@@ -115,10 +115,11 @@ impl SnapshotCache {
     }
 
     fn insert(&mut self, digest: [u8; SNAPSHOT_DIGEST_BYTES], source: CachedSource) {
-        if !self.sources.contains_key(&digest) && self.sources.len() >= MAX_CACHED_SNAPSHOTS {
-            if let Some(evicted) = self.sources.keys().next().copied() {
-                self.sources.remove(&evicted);
-            }
+        if !self.sources.contains_key(&digest)
+            && self.sources.len() >= MAX_CACHED_SNAPSHOTS
+            && let Some(evicted) = self.sources.keys().next().copied()
+        {
+            self.sources.remove(&evicted);
         }
         self.sources.insert(digest, source);
     }
@@ -221,10 +222,8 @@ impl ProcessControl {
                 Ordering::Acquire,
             )
             .is_ok();
-        if changed {
-            if let ChildOwnership::Live(process_group) = *self.child.lock() {
-                let _ = kill_process_group(process_group);
-            }
+        if changed && let ChildOwnership::Live(process_group) = *self.child.lock() {
+            let _ = kill_process_group(process_group);
         }
         changed
     }

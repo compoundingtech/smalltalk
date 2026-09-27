@@ -1,0 +1,75 @@
+version 2
+
+// Start one mission run for each new GitHub pull request and each new issue.
+//
+// The observer watches one repository without using an agent turn. Its first observation is a
+// baseline and starts nothing. After that, each newly ready pull request becomes one
+// `vcs.pull-request` resource and one review run, and each new issue becomes one `vcs.issue`
+// resource and one triage run. Draft pull requests start nothing until they are ready. A capacity
+// limit on the child mission leaves a request pending instead of dropping it.
+//
+// The GitHub provider reads GH_TOKEN, then GITHUB_TOKEN, then `gh auth token`, from the daemon's
+// environment.
+//
+//   st3 agents apply examples/st3/seats/omp.kdl --as person/operator
+//   st3 missions publish examples/st3/github-intake-work.kdl --as person/operator
+//   # Replace both zero revisions below with the hashes from `st3 missions ls --all --json`;
+//   # github-intake-work.kdl shows the query.
+//   st3 missions publish examples/st3/github-intake.kdl --as person/operator
+//   st3 missions start example/app/intake --id example/app/intake/main \
+//     --workspace /srv/example/intake --as person/operator
+//
+// The observer and subscriptions belong to the intake run and stop when it ends. A mission with
+// no step would complete at once and stop them, so `retire` keeps the run open until the operator
+// approves it in `st3 attention ls --as person/operator`, or cancels the run:
+//
+//   st3 missions cancel mission-run/example/app/intake/main \
+//     --reason "the project moved to another repository" --as person/operator
+//
+// Inspect what the intake started:
+//
+//   st3 missions show mission-run/example/app/intake/main
+//   st3 missions ls
+//   st3 agents queue agent/example/worker
+
+resource "example/app/repository" { kind "vcs.repository" }
+
+mission "example/app/intake" state="ready" {
+  goal "Start one review run for each newly ready pull request and one triage run for each new issue in example/app."
+
+  observer "repository" {
+    resource "resource/example/app/repository"
+    provider "github.repository"
+    locator "example/app"
+    field "pull_requests"
+    field "issues"
+  }
+
+  subscription "pull-requests" {
+    observer "observer/repository"
+    on "pull_requests"
+    delivery "mission" {
+      mission "example/app/review-pull-request@0000000000000000000000000000000000000000000000000000000000000000"
+      resource "source"
+      workspace "${ST_WORKSPACE}/reviews"
+    }
+  }
+
+  subscription "issues" {
+    observer "observer/repository"
+    on "issues"
+    delivery "mission" {
+      mission "example/app/triage-issue@0000000000000000000000000000000000000000000000000000000000000000"
+      resource "source"
+      workspace "${ST_WORKSPACE}/triage"
+    }
+  }
+
+  step "retire" {
+    agentless
+    gate "the operator retires this intake" type="human" {
+      reviewer "person/operator"
+      question "Stop starting runs for new pull requests and issues in example/app?"
+    }
+  }
+}

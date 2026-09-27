@@ -48,8 +48,8 @@ mod runtime {
 
     use sha2::{Digest as _, Sha256};
     use st2_resource_protocol::{
-        FactError, FactValue, ObservationResult, ProtocolError, Publication, ResourceFact,
-        SnapshotBytes, SnapshotSizeError, MAX_SELECTOR_BYTES, validate_topics,
+        FactError, FactValue, MAX_SELECTOR_BYTES, ObservationResult, ProtocolError, Publication,
+        ResourceFact, SnapshotBytes, SnapshotSizeError, validate_topics,
     };
     use wasmtime::component::{Component, Linker};
     use wasmtime::{Config, Engine, Store, Trap, UpdateDeadline};
@@ -371,15 +371,12 @@ mod runtime {
                 CacheLookup::Miss => {
                     let component = self.compile(bytes)?;
                     let disposition = match &self.cache {
-                        Some(cache) => match cache::store(
-                            cache,
-                            &component,
-                            digest,
-                            &self.cache_identity,
-                        ) {
-                            Ok(()) => CacheDisposition::CompiledAndStored,
-                            Err(error) => CacheDisposition::CompiledButNotStored(error),
-                        },
+                        Some(cache) => {
+                            match cache::store(cache, &component, digest, &self.cache_identity) {
+                                Ok(()) => CacheDisposition::CompiledAndStored,
+                                Err(error) => CacheDisposition::CompiledButNotStored(error),
+                            }
+                        }
                         None => CacheDisposition::CompiledWithoutCache,
                     };
                     (component, disposition)
@@ -416,9 +413,8 @@ mod runtime {
             {
                 return Err(DescribeError::WrongExecutor);
             }
-            let control = interruption.map_or_else(InvocationControl::new, |handle| {
-                handle.control.clone()
-            });
+            let control =
+                interruption.map_or_else(InvocationControl::new, |handle| handle.control.clone());
             if let Some(reason) = control.interruption_reason() {
                 return Err(DescribeError::from(reason));
             }
@@ -483,9 +479,8 @@ mod runtime {
                     .map(|digest| digest.as_bytes().to_vec()),
                 demand_watermark: request.demand_watermark,
             };
-            let control = interruption.map_or_else(InvocationControl::new, |handle| {
-                handle.control.clone()
-            });
+            let control =
+                interruption.map_or_else(InvocationControl::new, |handle| handle.control.clone());
             if let Some(reason) = control.interruption_reason() {
                 return Err(ObserveError::from(reason));
             }
@@ -631,9 +626,15 @@ mod runtime {
     impl fmt::Display for BuildError {
         fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
             match self {
-                Self::InvalidConfig(message) => write!(formatter, "invalid executor config: {message}"),
-                Self::Engine(message) => write!(formatter, "cannot create Wasmtime engine: {message}"),
-                Self::Linker(message) => write!(formatter, "cannot create capability linker: {message}"),
+                Self::InvalidConfig(message) => {
+                    write!(formatter, "invalid executor config: {message}")
+                }
+                Self::Engine(message) => {
+                    write!(formatter, "cannot create Wasmtime engine: {message}")
+                }
+                Self::Linker(message) => {
+                    write!(formatter, "cannot create capability linker: {message}")
+                }
             }
         }
     }
@@ -655,9 +656,15 @@ mod runtime {
                     formatter,
                     "component is {actual} bytes; maximum is {maximum}",
                 ),
-                Self::Compilation(message) => write!(formatter, "component compilation failed: {message}"),
+                Self::Compilation(message) => {
+                    write!(formatter, "component compilation failed: {message}")
+                }
                 Self::ForbiddenImports(imports) => {
-                    write!(formatter, "component imports are not admitted: {}", imports.join(", "))
+                    write!(
+                        formatter,
+                        "component imports are not admitted: {}",
+                        imports.join(", ")
+                    )
                 }
                 Self::Internal(message) => formatter.write_str(message),
             }
@@ -780,7 +787,9 @@ mod runtime {
                 Self::Instantiation(message) => {
                     write!(formatter, "component instantiation failed: {message}")
                 }
-                Self::Invocation(message) => write!(formatter, "typed describe call failed: {message}"),
+                Self::Invocation(message) => {
+                    write!(formatter, "typed describe call failed: {message}")
+                }
                 Self::Trap(trap) => write!(formatter, "guest trapped: {trap}"),
                 Self::FuelExhausted => formatter.write_str("guest exhausted its fuel allowance"),
                 Self::Cancelled => formatter.write_str("descriptor call was cancelled"),
@@ -841,16 +850,25 @@ mod runtime {
     impl fmt::Display for ObserveError {
         fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
             match self {
-                Self::WrongExecutor => formatter.write_str("component or interruption handle belongs to another executor"),
-                Self::InvalidRequest(message) => write!(formatter, "invalid observation request: {message}"),
-                Self::Instantiation(message) => write!(formatter, "component instantiation failed: {message}"),
-                Self::Invocation(message) => write!(formatter, "typed observation call failed: {message}"),
+                Self::WrongExecutor => formatter
+                    .write_str("component or interruption handle belongs to another executor"),
+                Self::InvalidRequest(message) => {
+                    write!(formatter, "invalid observation request: {message}")
+                }
+                Self::Instantiation(message) => {
+                    write!(formatter, "component instantiation failed: {message}")
+                }
+                Self::Invocation(message) => {
+                    write!(formatter, "typed observation call failed: {message}")
+                }
                 Self::Trap(trap) => write!(formatter, "guest trapped: {trap}"),
                 Self::FuelExhausted => formatter.write_str("guest exhausted its fuel allowance"),
                 Self::Cancelled => formatter.write_str("observation was cancelled"),
                 Self::TimedOut => formatter.write_str("observation timed out"),
                 Self::ResourceLimit(kind) => write!(formatter, "guest exceeded its {kind:?} limit"),
-                Self::InvalidProposal(error) => write!(formatter, "guest proposal is invalid: {error}"),
+                Self::InvalidProposal(error) => {
+                    write!(formatter, "guest proposal is invalid: {error}")
+                }
             }
         }
     }
@@ -1084,8 +1102,11 @@ mod runtime {
     }
 
     fn executor_build_identity() -> &'static str {
-        option_env!("ST2_EXECUTOR_BUILD_IDENTITY")
-            .unwrap_or(concat!(env!("CARGO_PKG_NAME"), "@", env!("CARGO_PKG_VERSION")))
+        option_env!("ST2_EXECUTOR_BUILD_IDENTITY").unwrap_or(concat!(
+            env!("CARGO_PKG_NAME"),
+            "@",
+            env!("CARGO_PKG_VERSION")
+        ))
     }
     #[cfg(test)]
     mod tests {
@@ -1120,14 +1141,13 @@ mod runtime {
 
             let module = wasmtime::Module::new(
                 &engine,
-                wat::parse_str(
-                    "(module (func (export \"run\") (loop $spin (br $spin))))",
-                )
-                .unwrap(),
+                wat::parse_str("(module (func (export \"run\") (loop $spin (br $spin))))").unwrap(),
             )
             .unwrap();
             let instance = wasmtime::Instance::new(&mut store, &module, &[]).unwrap();
-            let run = instance.get_typed_func::<(), ()>(&mut store, "run").unwrap();
+            let run = instance
+                .get_typed_func::<(), ()>(&mut store, "run")
+                .unwrap();
             let error = run.call(&mut store, ()).unwrap_err();
             assert_eq!(error.downcast_ref::<Trap>(), Some(&Trap::Interrupt));
         }
@@ -1137,11 +1157,11 @@ mod runtime {
 #[cfg(feature = "runtime")]
 pub use runtime::{
     BuildError, CapabilityContext, CapabilityModule, CapabilityPhase, ComponentDigest,
+    DEFAULT_FUEL_PER_OBSERVATION, DEFAULT_MAX_COMPONENT_BYTES, DEFAULT_MAX_INSTANCES,
+    DEFAULT_MAX_MEMORIES, DEFAULT_MAX_MEMORY_BYTES, DEFAULT_MAX_TABLE_ELEMENTS, DEFAULT_MAX_TABLES,
     DescribeError, DescriptorValidationError, Executor, GuestDescriptorError, InterruptionHandle,
     InterruptionReason, InvocationControl, InvocationStore, LimitKind, LoadError, LoadedComponent,
-    NoCapabilities, ObserveError, ProposalError, RuntimeConfig, DEFAULT_FUEL_PER_OBSERVATION,
-    DEFAULT_MAX_COMPONENT_BYTES, DEFAULT_MAX_INSTANCES, DEFAULT_MAX_MEMORIES,
-    DEFAULT_MAX_MEMORY_BYTES, DEFAULT_MAX_TABLE_ELEMENTS, DEFAULT_MAX_TABLES, WASMTIME_VERSION,
+    NoCapabilities, ObserveError, ProposalError, RuntimeConfig, WASMTIME_VERSION,
 };
 
 #[cfg(feature = "runtime")]

@@ -1,0 +1,1 @@
+agent "b" { host "local"; role "worker"; command "exec sleep 300" }

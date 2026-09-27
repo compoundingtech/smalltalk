@@ -1,0 +1,41 @@
+{
+  "schema": "st3-eval-proof.v1",
+  "date": "2026-08-27",
+  "eval": "license-mit",
+  "paid_attempt": 1,
+  "candidate": {
+    "git_head": "5e72de6ff155e23db184ad5630264d43015ed504",
+    "working_tree": "dirty",
+    "st3_version": "0.1.0",
+    "st3_binary_sha256_before_fix": "55cedcc852758d9ebe318d5bf8b7261621ec7b3443f873da8885e8eeebcbb69a",
+    "eval_kdl_sha256": "76a36208dbe8157ed4f180acd595827bd579e8fb84784404df9b5396fa15c3cc",
+    "task_document_sha256": "896b947000d50dd76e125b43104caa65c50c7bfb51179293742cd45f74a148fa"
+  },
+  "providers": {
+    "claude_code": "2.1.246",
+    "codex_cli": "0.145.0",
+    "pty": "0.12.0+face607"
+  },
+  "result": {
+    "done": false,
+    "stopped_checkpoint": "The team reported completion",
+    "worker_commit": "ec4473fb99ea2f689896e30b0498eac76c96afc1",
+    "held_out_judges_started": false,
+    "cause": "The runtime inherited the daemon ST_AGENT value, and the literal local judge placement did not match the daemon node.",
+    "evidence": [
+      "Both Claude agents published harness.ready claims.",
+      "The supervisor received the pinned task document and delegated through an st3 channel notification.",
+      "The worker committed the correct MIT license change and sent a detailed report.",
+      "The report claim used the daemon's ambient identity instead of agent/mix.worker, so the completion judge correctly did not pass.",
+      "The mechanical judges used host local, but the planner did not resolve local to the receiving daemon node.",
+      "The supervisor sent one verified confirmation and correctly refused a second confirmation during recovery."
+    ],
+    "fix": {
+      "description": "The reconciler sets ST_AGENT to the graph subject, and normalization resolves local placement to the receiving node.",
+      "tests": [
+        "reconcile::tests::a_started_member_gets_its_graph_identity",
+        "graph::tests::local_placement_resolves_to_the_receiving_node"
+      ]
+    }
+  }
+}

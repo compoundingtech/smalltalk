@@ -1,0 +1,72 @@
+version 2
+
+  mission "eval/mission-document-lift" state="ready" timeout="20m" {
+    completion { when "all-steps-exhausted" }
+    goal "Complete mission eval/mission-document-lift."
+    baseline "the exact source mission exists before planning starts" {
+      has "doc/evals/mission-document-lift/mission@5d0b681acbdbafa999eb947d30e1f45d224df6e9b69536cc1dfbd7d8f795bf2e" "# Deployment summary mission"
+    }
+
+    step "start-planner" timeout="10m" {
+      title "The native Codex planner is ready"
+        agent "pdl.agent" {
+          workspace "${ST_WORKSPACE}/repo"
+          harness "codex" {
+            model "gpt-5.6-sol"
+            effort "medium"
+            args "--dangerously-bypass-approvals-and-sandbox" "--dangerously-bypass-hook-trust"
+          }
+          restart "never"
+          env { CATALOG "${ST_WORKSPACE}"; ST_ROOT "${ST_WORKSPACE}/.st3-messages"; ST3_MESSAGE_ROOT "${ST_WORKSPACE}/.st3-messages" }
+        }
+    }
+
+    step "lift-mission-document" timeout="20m" {
+      title "The exact repository mission becomes a complete ready graph mission"
+      goal "Compile doc/evals/mission-document-lift/mission@5d0b681acbdbafa999eb947d30e1f45d224df6e9b69536cc1dfbd7d8f795bf2e into ready mission eval/mission-document-lift/work before doing any project work. Claim each nested step before doing its work. Publish while publish-ready-graph-mission is claimed."
+      document "doc/evals/mission-document-lift/mission@5d0b681acbdbafa999eb947d30e1f45d224df6e9b69536cc1dfbd7d8f795bf2e"
+      assigned-to "agent/${ST_MISSION_RUN}/pdl.agent"
+      depends-on { step "start-planner" completed }
+      produces-mission "eval/mission-document-lift/work"
+      mission "work" {
+        completion { when "all-steps-exhausted" }
+        goal "Complete mission work."
+        step "read-exact-mission-document" {
+          title "The exact immutable mission document is loaded"
+          goal "Run st3 documents get doc/evals/mission-document-lift/mission@5d0b681acbdbafa999eb947d30e1f45d224df6e9b69536cc1dfbd7d8f795bf2e --output SOURCE-MISSION.md. Verify its SHA-256 and read it. Do not inspect inventory.json or create RESULT.md."
+        }
+        step "author-complete-graph-mission" {
+          title "The complete execution mission is encoded as KDL"
+          goal "Create lifted-mission.kdl with version 2 and exactly one ready mission named eval/mission-document-lift/work. Translate all source steps, titles, goals, dependencies, and the declared product. Leave its steps unassigned so they inherit this agent when used. Do not execute project work."
+          depends-on { step "read-exact-mission-document" completed }
+        }
+        step "publish-ready-graph-mission" {
+          title "The generated ready mission revision is bound to this attempt"
+          goal "Run st3 work publish-mission ${ST_PARENT_STEP_RUN} lifted-mission.kdl. Record the printed exact mission revision. Do not inspect inventory.json or create RESULT.md."
+          depends-on { step "author-complete-graph-mission" completed }
+        }
+      }
+    }
+
+    step "execute-lifted-mission" timeout="20m" {
+      title "The exact generated mission revision executes as graph work"
+      goal "Claim and complete this wrapper step. st3 will start the exact mission revision produced by lift-mission-document. Follow every resulting assigned child mission step until that mission completes."
+      assigned-to "agent/${ST_MISSION_RUN}/pdl.agent"
+      depends-on { step "lift-mission-document" completed }
+      uses-mission output-of="lift-mission-document"
+    }
+
+    step "held-out-gates" timeout="10m" {
+      title "All mission-document lifting gates pass"
+      depends-on { step "execute-lifted-mission" completed }
+      gate "the exact pre-published document bytes were used" {
+        exec "set -eu; tmp=$(mktemp); st3 documents get doc/evals/mission-document-lift/mission@5d0b681acbdbafa999eb947d30e1f45d224df6e9b69536cc1dfbd7d8f795bf2e --output \"$tmp\" >/dev/null; cmp repo/MISSION.md \"$tmp\"; rm -f \"$tmp\""
+        host "local"
+        workspace "${ST_WORKSPACE}"
+        time-limit "120000ms"
+      }
+      gate "the generated project result is correct" { exec "cd repo && bash verify.sh"; host "local"; workspace "${ST_WORKSPACE}"; time-limit "120000ms" }
+      gate "the produced mission revision, child run, transitions, and product are exact" { exec "bash ./judges/graph.sh"; host "local"; workspace "${ST_WORKSPACE}"; time-limit "120000ms" }
+    }
+
+  }

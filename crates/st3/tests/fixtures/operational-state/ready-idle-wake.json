@@ -1,0 +1,40 @@
+{
+  "id": "cos-recovery/ready-idle-wake",
+  "source": {
+    "document": "doc/cos/st3-idle-with-ready-work-2026-09-20@4ea5b236c3b5fb8cabee06dba238464c9c8270afcc0211b87407b0d494f238ac",
+    "agent": "agent/fleet/app-web/standing/app-web"
+  },
+  "observed": {
+    "occurrences": 2,
+    "agent_alive": true,
+    "turn_in_progress": false,
+    "active_claims": 0,
+    "ready_steps": 1,
+    "ready_age_minutes_first_occurrence": 26,
+    "automatic_driver_wake": false,
+    "bounded_retry": false,
+    "diagnostic_after_exhaustion": false,
+    "manual_wake_command": false,
+    "attempts": [
+      { "method": "pty-key-enter", "accepted": true, "turn_started": false },
+      { "method": "pty-raw-carriage-return", "accepted": true, "turn_started": false },
+      { "method": "runtime-key-return", "accepted": true, "turn_started": false },
+      { "method": "runtime-space-return", "accepted": true, "turn_started": false },
+      { "method": "full-boot-prompt", "accepted": true, "turn_started": true }
+    ]
+  },
+  "expected": {
+    "automatic_driver_wake": true,
+    "bounded_retry": true,
+    "diagnostic_after_exhaustion": true,
+    "manual_wake_command": true,
+    "pty_input_required": false
+  },
+  "root_cause": {
+    "files": [
+      "crates/st3/src/reconcile.rs",
+      "crates/st3/src/main.rs"
+    ],
+    "defect": "readiness emits a Small Talk message and DING injects terminal line input, but no supported harness-driver wake is acknowledged by a turn or claim, retried within a bound, or escalated as harness.diagnostic"
+  }
+}

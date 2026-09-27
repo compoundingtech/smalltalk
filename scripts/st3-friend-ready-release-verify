@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+here=$(/usr/bin/dirname "$0")
+case ${1:-} in
+  idle)
+    fabric_bin=$(command -v fabric || true)
+    if [[ -z $fabric_bin || ! -x $fabric_bin ]]; then
+      fabric_bin="$HOME/.local/bin/fabric"
+    fi
+    [[ -x $fabric_bin ]] || { echo 'Fabric is unavailable for remote idle evidence' >&2; exit 1; }
+    exec /usr/bin/env -u ST3_IDLE_REPORT_LOG -u ST3_IDLE_REPORT_NOW_UNIX \
+      -u ST3_IDLE_REPORT_DURATION_SECONDS -u ST3_IDLE_REPORT_MAX_GAP_SECONDS \
+      -u ST3_IDLE_REPORT_MIN_SAMPLES -u ST3_IDLE_REPORT_MIN_QUIET \
+      -u ST3_IDLE_REPORT_MIN_QUIET_SECONDS ST3_IDLE_REPORT_REMOTE=1 \
+      FABRIC_BIN="$fabric_bin" "$here/st3-idle-soak-report"
+    ;;
+  delivery)
+    exec /usr/bin/env -u ST3_SOAK_REPORT_LOG -u ST3_SOAK_REPORT_NOW_UNIX \
+      -u ST3_SOAK_REPORT_MIN_DURATION_SECONDS -u ST3_SOAK_REPORT_MAX_GAP_SECONDS \
+      -u ST3_SOAK_REPORT_MIN_EACH_DIRECTION -u ST3_SOAK_REPORT_SKIP_RUNTIME_CHECKS \
+      "$here/st3-message-soak-report"
+    ;;
+  *)
+    echo 'usage: st3-friend-ready-release-verify idle|delivery' >&2
+    exit 2
+    ;;
+esac

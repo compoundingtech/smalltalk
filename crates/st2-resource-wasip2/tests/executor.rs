@@ -157,7 +157,10 @@ impl CapabilityModule for BlockingCapabilities {
     }
 }
 
-fn executor(config: RuntimeConfig, cache: Option<PrivateArtifactCache>) -> Executor<FixtureCapabilities> {
+fn executor(
+    config: RuntimeConfig,
+    cache: Option<PrivateArtifactCache>,
+) -> Executor<FixtureCapabilities> {
     Executor::new(config, cache, FixtureCapabilities).unwrap()
 }
 
@@ -230,7 +233,6 @@ fn request_validation_precedes_capability_begin_and_leaves_no_host_state() {
     assert_eq!(begins.load(Ordering::Relaxed), 0);
 }
 
-
 #[test]
 fn host_rejects_a_semantically_invalid_guest_proposal() {
     let executor = executor(RuntimeConfig::default(), None);
@@ -265,8 +267,10 @@ fn fuel_exhaustion_is_distinct_from_guest_traps() {
            (start $start))\n\
          (core instance $running (instantiate $behavior))",
     );
-    let mut config = RuntimeConfig::default();
-    config.fuel_per_observation = 10_000;
+    let config = RuntimeConfig {
+        fuel_per_observation: 10_000,
+        ..RuntimeConfig::default()
+    };
     let executor = executor(config, None);
     let loaded = executor.load(&bytes).unwrap();
     assert!(matches!(
@@ -281,8 +285,10 @@ fn linear_memory_limit_is_enforced_during_instantiation() {
         "(core module $behavior (memory 2))\n\
          (core instance $running (instantiate $behavior))",
     );
-    let mut config = RuntimeConfig::default();
-    config.max_memory_bytes = 64 * 1024;
+    let config = RuntimeConfig {
+        max_memory_bytes: 64 * 1024,
+        ..RuntimeConfig::default()
+    };
     let executor = executor(config, None);
     let loaded = executor.load(&bytes).unwrap();
     assert!(matches!(
@@ -293,8 +299,10 @@ fn linear_memory_limit_is_enforced_during_instantiation() {
 
 #[test]
 fn instance_count_limit_is_enforced_as_an_instantiation_error() {
-    let mut config = RuntimeConfig::default();
-    config.max_instances = 1;
+    let config = RuntimeConfig {
+        max_instances: 1,
+        ..RuntimeConfig::default()
+    };
     let executor = executor(config, None);
     let loaded = executor.load(&component(NO_EFFECT)).unwrap();
     assert!(matches!(
@@ -311,8 +319,10 @@ fn deterministic_epoch_handle_classifies_timeout_and_cancel() {
            (start $start))\n\
          (core instance $running (instantiate $behavior))",
     );
-    let mut config = RuntimeConfig::default();
-    config.fuel_per_observation = u64::MAX;
+    let config = RuntimeConfig {
+        fuel_per_observation: u64::MAX,
+        ..RuntimeConfig::default()
+    };
     let executor = executor(config, None);
     let loaded = executor.load(&bytes).unwrap();
 
@@ -411,7 +421,10 @@ fn verified_aot_artifact_is_reused_by_a_new_executor() {
     let bytes = component(NO_EFFECT);
     let first = executor(RuntimeConfig::default(), Some(cache.clone()));
     let loaded = first.load(&bytes).unwrap();
-    assert_eq!(loaded.cache_disposition(), &CacheDisposition::CompiledAndStored);
+    assert_eq!(
+        loaded.cache_disposition(),
+        &CacheDisposition::CompiledAndStored
+    );
     drop(first);
 
     let second = executor(RuntimeConfig::default(), Some(cache));

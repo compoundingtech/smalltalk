@@ -16,11 +16,11 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use agent_spec::profile::ResourceProfileRegistry;
+use agent_spec::spec::AgentSpec;
 use notify::Watcher as _;
 use serde::Serialize;
 use sha2::{Digest as _, Sha256};
-use agent_spec::profile::ResourceProfileRegistry;
-use agent_spec::spec::AgentSpec;
 
 use crate::resource_profile::ResourceFact;
 
@@ -242,11 +242,10 @@ impl ResyncSupervisor {
     /// Sequence floors remain retained so a later successful install cannot reuse an occurrence.
     pub fn deactivate(&self, spec: &AgentSpec, this_host: &str) {
         let (ack_tx, ack_rx) = channel();
-        if self
-            .tx
-            .as_ref()
-            .is_some_and(|tx| tx.send(Msg::Deactivate(spec.bus_id(this_host), ack_tx)).is_ok())
-        {
+        if self.tx.as_ref().is_some_and(|tx| {
+            tx.send(Msg::Deactivate(spec.bus_id(this_host), ack_tx))
+                .is_ok()
+        }) {
             let _ = ack_rx.recv();
         }
     }
@@ -310,22 +309,24 @@ fn declaration_transition_facts(
         .collect::<BTreeSet<_>>();
     let facts = labels
         .into_iter()
-        .filter_map(|label| match (old.bindings.get(&label), new.bindings.get(&label)) {
-            (None, Some(_)) => Some(ResourceFact::transition(
-                label,
-                None::<String>,
-                Some("declared".to_owned()),
-            )),
-            (Some(_), None) => Some(ResourceFact::transition(
-                label,
-                Some("declared".to_owned()),
-                None::<String>,
-            )),
-            (Some(before), Some(after)) if before != after => {
-                Some(ResourceFact::current(label, "changed"))
-            }
-            _ => None,
-        })
+        .filter_map(
+            |label| match (old.bindings.get(&label), new.bindings.get(&label)) {
+                (None, Some(_)) => Some(ResourceFact::transition(
+                    label,
+                    None::<String>,
+                    Some("declared".to_owned()),
+                )),
+                (Some(_), None) => Some(ResourceFact::transition(
+                    label,
+                    Some("declared".to_owned()),
+                    None::<String>,
+                )),
+                (Some(before), Some(after)) if before != after => {
+                    Some(ResourceFact::current(label, "changed"))
+                }
+                _ => None,
+            },
+        )
         .collect::<Result<Vec<_>, _>>();
     match facts {
         Ok(facts) if !facts.is_empty() => facts,
@@ -340,7 +341,6 @@ fn current_declaration_summary(root: &Path, path: &Path) -> Option<DeclarationSu
         .find(|spec| lexical_clean(&spec.path) == path)
         .map(|spec| declaration_summary(&spec))
 }
-
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PendingTransition {
@@ -386,12 +386,8 @@ impl PendingTransition {
         incarnation: crate::event::StreamOwnerIncarnation,
         sequence: u64,
     ) -> Self {
-        let facts = declaration_transition_facts(
-            old_summary,
-            new_summary.as_ref(),
-            old_state,
-            new_state,
-        );
+        let facts =
+            declaration_transition_facts(old_summary, new_summary.as_ref(), old_state, new_state);
         Self::capture(
             "declaration",
             path,
@@ -852,20 +848,14 @@ impl Worker {
         previous
             .iter()
             .flat_map(|(path, entries)| {
-                entries.iter().map(|entry| {
-                    (
-                        (entry.bus_id.clone(), entry.label.clone()),
-                        path.clone(),
-                    )
-                })
+                entries
+                    .iter()
+                    .map(|entry| ((entry.bus_id.clone(), entry.label.clone()), path.clone()))
             })
             .collect()
     }
 
-    fn finish_carrier_update(
-        &mut self,
-        previous_paths: &BTreeMap<SubscriptionIdentity, PathBuf>,
-    ) {
+    fn finish_carrier_update(&mut self, previous_paths: &BTreeMap<SubscriptionIdentity, PathBuf>) {
         let rebound_paths = self
             .carriers
             .iter()
@@ -1074,11 +1064,9 @@ impl Worker {
             let wanted = desired.contains(dir);
             let current = dir_identity(dir);
             let stale = !wanted || *identity != current;
-            if stale {
-                if let Some(watcher) = self.watcher.as_mut() {
-                    let _ = watcher.unwatch(dir);
-                    changed = true;
-                }
+            if stale && let Some(watcher) = self.watcher.as_mut() {
+                let _ = watcher.unwatch(dir);
+                changed = true;
             }
             !stale
         });
@@ -1359,10 +1347,7 @@ impl Worker {
                         entry.parked = true;
                         entry.dirty = false;
                         if let Some(reservation) = entry.pending_transition.take() {
-                            parked.push((
-                                (entry.bus_id.clone(), entry.label.clone()),
-                                reservation,
-                            ));
+                            parked.push(((entry.bus_id.clone(), entry.label.clone()), reservation));
                         }
                     }
                 }
@@ -1416,9 +1401,7 @@ fn emit_resync(
                     PublicationOutcome::Parked
                 }
                 Some(crate::event::RefusalKind::Permanent) => {
-                    eprintln!(
-                        "st2: resync for '{path}' dropped; no retry can admit it: {error:#}"
-                    );
+                    eprintln!("st2: resync for '{path}' dropped; no retry can admit it: {error:#}");
                     PublicationOutcome::Refused
                 }
                 None => {
@@ -1429,8 +1412,6 @@ fn emit_resync(
         }
     }
 }
-
-
 
 mod read;
 use read::*;

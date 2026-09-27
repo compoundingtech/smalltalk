@@ -45,6 +45,9 @@ const LOCK_NAME: &str = ".harness-state.lock";
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum Activity {
+    /// The provider child was successfully spawned, but no harness-specific observer has yet
+    /// reported whether it is idle or active. Unlike `Unknown`, this is positive live evidence.
+    Ready,
     Idle,
     Active,
     Child,
@@ -59,6 +62,7 @@ pub enum Activity {
 impl Activity {
     pub fn as_str(self) -> &'static str {
         match self {
+            Activity::Ready => "ready",
             Activity::Idle => "idle",
             Activity::Active => "active",
             Activity::Child => "child",
@@ -451,7 +455,7 @@ impl Writer {
         // record a reader would trust: one already past the future-skew bound is somebody's
         // garbage (or an overflow probe), and inheriting it would poison every later write —
         // the writer's own clock wins instead.
-        let written_at_ms = next_stamp(on_disk.as_ref(), now_ms);
+        let written_at_ms = next_stamp(on_disk.as_deref(), now_ms);
         let (since_ms, transitions) = match (own_record, unchanged) {
             (Some(current), true) => (current.since_ms, current.transitions),
             (Some(current), false) => (written_at_ms, current.transitions.saturating_add(1)),
@@ -540,6 +544,14 @@ pub struct Observed {
     pub ask: Ask,
     pub harness: Option<String>,
     pub since_ms: Option<u64>,
+    /// When the owning driver last refreshed this evidence.
+    pub observed_at_ms: Option<u64>,
+    /// Monotonic ownership fence from the driver record.
+    pub ownership_sequence: Option<u64>,
+    /// Monotonic state-transition counter from the driver record.
+    pub transition_sequence: Option<u64>,
+    /// Driver-session identity that owns the source record.
+    pub evidence_incarnation: Option<String>,
     pub exit: Option<String>,
     pub reason: Option<String>,
 }
@@ -555,9 +567,22 @@ impl Observed {
             ask: Ask::Unknown,
             harness,
             since_ms: None,
+            observed_at_ms: None,
+            ownership_sequence: None,
+            transition_sequence: None,
+            evidence_incarnation: None,
             exit: None,
             reason: Some(reason.to_string()),
         }
+    }
+
+    fn with_record_evidence(mut self, record: &Record) -> Self {
+        self.harness = Some(record.harness.clone());
+        self.observed_at_ms = Some(record.written_at_ms);
+        self.ownership_sequence = Some(record.seq);
+        self.transition_sequence = Some(record.transitions);
+        self.evidence_incarnation = Some(record.incarnation.clone());
+        self
     }
 }
 
@@ -601,14 +626,14 @@ fn read_raw_at(
     }
     if record.written_at_ms > now_ms {
         if record.written_at_ms - now_ms > duration_ms(HARNESS_STATE_FUTURE_SKEW) {
-            return Observed::indeterminate("future-skew", harness);
+            return Observed::indeterminate("future-skew", harness).with_record_evidence(&record);
         }
     } else if now_ms - record.written_at_ms >= duration_ms(HARNESS_STATE_STALE) {
-        return Observed::indeterminate("stale", harness);
+        return Observed::indeterminate("stale", harness).with_record_evidence(&record);
     }
     if record.state == Activity::Unknown {
         // A literal `unknown` is never written by this crate; treat one like malformation.
-        return Observed::indeterminate("literal-unknown", harness);
+        return Observed::indeterminate("literal-unknown", harness).with_record_evidence(&record);
     }
     if record.state == Activity::Ended
         && record.exit.is_none()
@@ -618,7 +643,7 @@ fn read_raw_at(
         // and has observed nothing yet. Reading it as definite `ended` would flip a live seat
         // to dead for every consumer whose harness never publishes its first frame promptly —
         // indeterminate, distinctly, until the first real observation or the ordinary horizon.
-        return Observed::indeterminate("claimed", harness);
+        return Observed::indeterminate("claimed", harness).with_record_evidence(&record);
     }
     if record.state != Activity::Ended
         && let Some(probe) = probe
@@ -630,10 +655,11 @@ fn read_raw_at(
         // (enforced in `observe`); a fenced record whose session is provably dead is downgraded,
         // and an unreadable registry still downgrades nothing.
         let Some(session) = record.pty_session.as_deref() else {
-            return Observed::indeterminate("unfenced-record", harness);
+            return Observed::indeterminate("unfenced-record", harness)
+                .with_record_evidence(&record);
         };
         if probe(session) == SessionLiveness::Dead {
-            return Observed::indeterminate("session-dead", harness);
+            return Observed::indeterminate("session-dead", harness).with_record_evidence(&record);
         }
     }
     Observed {
@@ -643,6 +669,10 @@ fn read_raw_at(
         ask: record.ask,
         harness,
         since_ms: Some(record.since_ms),
+        observed_at_ms: Some(record.written_at_ms),
+        ownership_sequence: Some(record.seq),
+        transition_sequence: Some(record.transitions),
+        evidence_incarnation: Some(record.incarnation),
         exit: record.exit,
         reason: record.reason,
     }
@@ -658,7 +688,7 @@ fn duration_ms(duration: Duration) -> u64 {
 enum StoredRecord {
     Absent,
     Unreadable,
-    Parsed(Record),
+    Parsed(Box<Record>),
 }
 
 fn read_stored(path: &Path) -> StoredRecord {
@@ -669,7 +699,7 @@ fn read_stored(path: &Path) -> StoredRecord {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => StoredRecord::Absent,
         Err(_) => StoredRecord::Unreadable,
         Ok(bytes) => match serde_json::from_slice(&bytes) {
-            Ok(record) => StoredRecord::Parsed(record),
+            Ok(record) => StoredRecord::Parsed(Box::new(record)),
             Err(_) => StoredRecord::Unreadable,
         },
     }
@@ -677,7 +707,7 @@ fn read_stored(path: &Path) -> StoredRecord {
 
 fn read_record(path: &Path) -> Option<Record> {
     match read_stored(path) {
-        StoredRecord::Parsed(record) => Some(record),
+        StoredRecord::Parsed(record) => Some(*record),
         StoredRecord::Absent | StoredRecord::Unreadable => None,
     }
 }
@@ -801,7 +831,7 @@ fn claim_locked(writer: &Writer, token: &str) -> anyhow::Result<u64> {
     );
     let seq = highest.map_or(1, |seq| seq.saturating_add(1));
     let now_ms = crate::message::now_ms();
-    let written_at_ms = next_stamp(on_disk.as_ref(), now_ms);
+    let written_at_ms = next_stamp(on_disk.as_deref(), now_ms);
     let record = Record {
         schema: SCHEMA.to_string(),
         agent: writer.agent.clone(),
@@ -970,7 +1000,10 @@ mod tests {
                 .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
                 .filter(|name| name.starts_with(".harness-state.tmp-"))
                 .collect::<Vec<_>>();
-            assert!(residue.is_empty(), "staging residue in {dir:?}: {residue:?}");
+            assert!(
+                residue.is_empty(),
+                "staging residue in {dir:?}: {residue:?}"
+            );
         }
 
         let blocked = tmp.path().join("blocked");
@@ -2210,7 +2243,10 @@ mod tests {
             .unwrap()
             .is_some()
         };
-        assert!(!probe(), "a live record-lock holder must exclude a second writer");
+        assert!(
+            !probe(),
+            "a live record-lock holder must exclude a second writer"
+        );
         drop(held);
         assert!(probe(), "dropping the guard must release the record lock");
     }

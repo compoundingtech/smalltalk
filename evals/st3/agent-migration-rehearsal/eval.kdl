@@ -1,0 +1,56 @@
+version 2
+
+mission "eval/agent-migration-rehearsal" state="ready" timeout="20m" {
+  completion { when "all-steps-exhausted" }
+  goal "Start one isolated agent with the normal st3 boot contract and complete one assigned mission."
+
+  agent "pilot" {
+    workspace "${ST_WORKSPACE}/agent"
+    render {
+      copy "doc/hosts/migration-rehearsal@7a0773a714975b4563b15638cc5b5b6608849dc6c5b1ea07e2632b0edc6a8665" ".st3/host/migration-rehearsal.md"
+    }
+    harness "codex" {
+      model "gpt-5.6-sol"
+      effort "medium"
+      args "--dangerously-bypass-approvals-and-sandbox" "--dangerously-bypass-hook-trust"
+    }
+    restart "always"
+  }
+
+  step "write-report" timeout="10m" {
+    assigned-to "agent/${ST_MISSION_RUN}/pilot"
+    title "The migrated agent completes normal graph work"
+    goal "Read INPUT.md and .st3/host/migration-rehearsal.md. Write MIGRATION.md with the host boundary and your completed work."
+    document "doc/hosts/migration-rehearsal@7a0773a714975b4563b15638cc5b5b6608849dc6c5b1ea07e2632b0edc6a8665"
+  }
+
+  step "held-out-gates" timeout="2m" {
+    agentless
+    depends-on { step "write-report" completed }
+    gate "the runtime rendered the canonical boot file" {
+      exec "test -s .st3/boot.md && grep -Fqx 'The st3 graph is the authority for current work. This file contains stable runtime guidance only.' .st3/boot.md"
+      host "local"
+      workspace "${ST_WORKSPACE}/agent"
+      time-limit "1m"
+    }
+    gate "the isolated mission produced its report" {
+      exec "test -s MIGRATION.md && grep -Fq 'no production agent state' MIGRATION.md && grep -Eiq 'completed|complete' MIGRATION.md"
+      host "local"
+      workspace "${ST_WORKSPACE}/agent"
+      time-limit "1m"
+    }
+    gate "the runtime rendered the exact migration document" {
+      exec "test -s .st3/host/migration-rehearsal.md && printf '7a0773a714975b4563b15638cc5b5b6608849dc6c5b1ea07e2632b0edc6a8665  .st3/host/migration-rehearsal.md\\n' | sha256sum --check --status"
+      host "local"
+      workspace "${ST_WORKSPACE}/agent"
+      time-limit "1m"
+    }
+  }
+
+  finally {
+    step "cleanup-agent" timeout="2m" {
+      agentless
+      stop "agent/${ST_MISSION_RUN}/pilot"
+    }
+  }
+}

@@ -1,0 +1,88 @@
+version 2
+
+resource "eval/automatic-github-intake/repository" {
+  kind "filesystem.file"
+}
+
+mission "eval/automatic-github-intake/review" state="ready" {
+  concurrent-runs max=2
+  input "source" kind="resource"
+  completion { when "all-steps-exhausted" }
+  goal "Review one automatic repository discovery and keep the result inside the graph workspace."
+
+  agent "reviewer" {
+    identity "reviewer.eval"
+    workspace "${ST_WORKSPACE}" create=#true
+    harness "codex" {
+      model "gpt-5.6-sol"
+      effort "high"
+      args "--dangerously-bypass-approvals-and-sandbox" "--dangerously-bypass-hook-trust"
+    }
+    restart "always"
+  }
+
+  step "review" timeout="10m" {
+    assigned-to "agent/${ST_MISSION_RUN}/reviewer.eval"
+    goal "Inspect ${input.source}. Write REVIEW.md with the observed change. Do not post to GitHub or change source code."
+  }
+
+  finally {
+    step "cleanup" timeout="2m" {
+      agentless
+      stop "agent/${ST_MISSION_RUN}/reviewer.eval"
+    }
+  }
+}
+
+mission "eval/automatic-github-intake" state="ready" timeout="20m" {
+  completion { when "all-steps-exhausted" }
+  goal "Prove that one post-baseline repository event starts one isolated review mission."
+
+  observer "repository" {
+    resource "resource/eval/automatic-github-intake/repository"
+    provider "local.file"
+    locator "${ST_WORKSPACE}/repo/event.txt"
+    field "status"
+    field "content_hash"
+  }
+
+  subscription "reviews" {
+    observer "observer/repository"
+    on "content_hash"
+    delivery "mission" {
+      mission "eval/automatic-github-intake/review@37474d0a14af6b34ca78607a5a9b9676ea399f3192b7743021707be500ddf414"
+      resource "source"
+      workspace "${ST_WORKSPACE}/reviews"
+    }
+  }
+
+  step "baseline" timeout="2m" {
+    agentless
+    gate "the observer established its baseline" {
+      field "status" "observer/${ST_MISSION_RUN}/repository" is "healthy"
+    }
+  }
+
+  step "trigger" timeout="2m" {
+    agentless
+    depends-on { step "baseline" completed }
+    exec "trigger" {
+      host "local"
+      workspace "${ST_WORKSPACE}"
+      command "bash ./trigger.sh"
+      restart "never"
+    }
+    gate "the trigger completed" { field "exit_code" "exec/${ST_MISSION_RUN}/trigger" is 0 }
+  }
+
+  step "verify" timeout="12m" {
+    agentless
+    depends-on { step "trigger" completed }
+    gate "one review mission produced an internal result" {
+      exec "bash ./wait-for-review.sh"
+      host "local"
+      workspace "${ST_WORKSPACE}"
+      time-limit "11m"
+    }
+  }
+}

@@ -1,0 +1,10 @@
+version 2
+
+mission "eval/seat-queue/bravo" state="ready" {
+  goal "Prepare the bravo notes."
+
+  step "work" timeout="5m" {
+    assigned-to "{{WORKER}}"
+    goal "Claim this ready work, record one concise progress update containing BRAVO-WORK, then complete it with a concise summary. Do not modify repository files."
+  }
+}

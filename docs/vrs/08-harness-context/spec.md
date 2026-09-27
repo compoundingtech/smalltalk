@@ -553,7 +553,7 @@ on 2026-08-29 against Claude Code 2.1.250 in four cases through a real pty
 `.claude/settings.local.json` > `.claude/settings.json` >
 `~/.claude/settings.json`, and the winning `statusLine` **replaces** the losing
 object outright — a single slot, one command per render, no merge. Since
-`.claude/settings.local.json` is precisely the file st2 renders for
+`.claude/settings.local.json` is precisely the file the st2 materializer writes for
 driver-declared agents, an st2 entry that does not exec the operator's renderer
 silently and unconditionally removes their status line on every managed agent,
 with no warning. On a host whose global renderer already displays agent id,

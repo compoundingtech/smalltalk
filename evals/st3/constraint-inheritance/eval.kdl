@@ -1,0 +1,50 @@
+version 2
+
+mission "eval/constraint-inheritance" state="ready" timeout="20m" {
+  completion { when "all-steps-exhausted" }
+  goal "Prove that a worker receives each constraint from its complete mission ancestry."
+  constraint "Keep the mission result local."
+
+  step "start-worker" timeout="1m" {
+    agentless
+    title "The model-free worker is ready"
+
+    agent "worker" {
+      workspace "${ST_WORKSPACE}"
+      command "bash ./worker.sh"
+      restart "never"
+    }
+
+    gate "the worker is reachable" {
+      field "reachability" "agent/${ST_MISSION_RUN}/worker" "is" "reachable"
+    }
+  }
+
+  step "outer" timeout="2m" {
+    title "The outer claim receives its inherited constraints"
+    goal "Claim this step and report its effective constraints."
+    assigned-to "agent/${ST_MISSION_RUN}/worker"
+    depends-on { step "start-worker" completed }
+    constraint "Keep the outer result deterministic."
+
+    mission "work" {
+      completion { when "all-steps-exhausted" }
+      goal "Inspect the effective constraints."
+      constraint "Keep the nested mission result readable."
+
+      step "leaf" timeout="1m" {
+        title "The leaf receives all four constraints in declaration order"
+        goal "Claim this step and report its complete constraint ancestry."
+        assigned-to "agent/${ST_MISSION_RUN}/worker"
+        constraint "Keep the leaf result complete."
+
+        gate "the leaf exposes its complete ordered constraint ancestry" {
+          exec "test -f constraint-inheritance.ok"
+          host "local"
+          workspace "${ST_WORKSPACE}"
+          time-limit "1m"
+        }
+      }
+    }
+  }
+}

@@ -7,7 +7,9 @@
 // carry the blocked-on-human axis pi cannot express; and a failed turn carries omp's own typed
 // error classification, which this asset forwards raw because st2 — not the asset — decides what
 // a rejected provider credential is. Like the pi asset this file holds no delivery
-// policy: st2 decides which message is delivered, how, and what a starting session is told. It
+// policy: st2 decides which message is delivered, how, and what a starting session is told. The
+// one omp-specific choice here is timing: a message that arrives during a running turn is handed
+// to omp at the tool-batch boundary where omp would inject it anyway (see `HOLD_MAX_MS`). It
 // fails open in both directions — an unmanaged omp session loads this extension and does nothing;
 // a slow channel starts the session
 // without restored context rather than hanging it.
@@ -32,6 +34,18 @@ const RESUME_GENERATION = "ST2_OMP_CHANNEL_RESUME_GENERATION";
 // and never worth a hung agent.
 const HELLO_TIMEOUT_MS = 5000;
 
+// omp injects a steer only at a tool-batch boundary or where the run would stop, but a steer that
+// is already queued when a batch starts makes every shell and eval call in that batch background
+// itself at once ("Backgrounded early to handle an incoming message"). In 23 cross-harness runs on
+// 2026-09-26/27, all 176 backgrounded calls started after their steer was queued, while the model
+// was still streaming; none was running when the steer arrived. One seat then repeated a send whose
+// result it never saw. So a message that arrives during a running turn is held and steered when
+// the batch's last `tool_call` returns its `tool_result` (omp announces every call of a batch
+// before any runs, and awaits the handler), or when the run ends. Either way it lands where the
+// steer would have. A message never waits longer than this behind a running tool call: a longer
+// command is backgrounded as before. It was chosen below st3's 15-second work-wake retry.
+const HOLD_MAX_MS = 10_000;
+
 type Frame = {
   type?: string;
   protocol?: number;
@@ -39,6 +53,17 @@ type Frame = {
   content?: string;
   deliverAs?: "steer" | "followUp";
   meta?: Record<string, unknown>;
+};
+
+/** A message the channel sent that omp has not been handed yet. */
+type HeldMessage = {
+  content: string;
+  deliverAs: "steer" | "followUp";
+  meta?: Record<string, unknown>;
+  /** The channel that sent it. A retired channel's successor re-sends what it never acknowledged. */
+  channel: childProcess.ChildProcess;
+  ctx: ExtensionContext;
+  reply: (frame: Record<string, unknown>) => void;
 };
 
 /**
@@ -72,6 +97,16 @@ type Stash = {
   pendingAskToolCallId?: string;
   /** Generation fencing every bounded settle poll against newer activity. */
   settleGeneration?: number;
+  /** Between `agent_start` and the `agent_end` that does not continue. */
+  running?: boolean;
+  /** Tool calls announced by `tool_call` and not yet answered by `tool_result`. */
+  toolCallsInFlight?: Set<string>;
+  /** Messages held during a running turn, oldest first. */
+  held?: HeldMessage[];
+  /** Releases held messages after HOLD_MAX_MS behind a running tool call. */
+  holdTimer?: ReturnType<typeof setTimeout>;
+  /** Serializes handoffs so omp receives messages in arrival order. */
+  handoff?: Promise<void>;
 };
 
 /**
@@ -270,6 +305,7 @@ export default function (pi: ExtensionAPI) {
     // session's cost as their own.
     state.lastCostUsd = undefined;
     state.pendingAskToolCallId = undefined;
+    resetHold();
 
     cancelSettle();
     const channelEnv: NodeJS.ProcessEnv = { ...process.env };
@@ -344,20 +380,14 @@ export default function (pi: ExtensionAPI) {
           return;
         }
         if (frame.type !== "message" || typeof frame.content !== "string") return;
-        try {
-          // `deliverAs` is required only while a turn is streaming, and an idle send that carries
-          // one is rejected, so the idle proof selects the call shape. It never selects the
-          // policy. Not optional-chained: reading a missing idle proof as "idle" would silently
-          // turn every mid-turn delivery into a plain send.
-          if (ctx.isIdle()) {
-            await pi.sendUserMessage(frame.content);
-          } else {
-            await pi.sendUserMessage(frame.content, { deliverAs: frame.deliverAs ?? "steer" });
-          }
-          send({ type: "delivered", meta: frame.meta });
-        } catch (error) {
-          send({ type: "failed", meta: frame.meta, error: String(error) });
-        }
+        await receive({
+          content: frame.content,
+          deliverAs: frame.deliverAs ?? "steer",
+          meta: frame.meta,
+          channel: child,
+          ctx,
+          reply: send,
+        });
       };
 
       // Split on LF only. A generic line reader also splits on Unicode separators, which can
@@ -383,6 +413,52 @@ export default function (pi: ExtensionAPI) {
     const child = state.child;
     if (!child || !child.stdin || child.stdin.destroyed) return;
     child.stdin.write(JSON.stringify(frame) + "\n");
+  };
+  const boundedTimelineString = (value: unknown, limit = 16_384): string | undefined =>
+    typeof value === "string" ? value.slice(0, limit) : undefined;
+  const normalizedTimelinePayload = (event: string, raw: unknown): Record<string, unknown> => {
+    const value = raw && typeof raw === "object" ? raw as Record<string, unknown> : {};
+    if (event === "tool_call") return {
+      toolCallId: boundedTimelineString(value.toolCallId ?? value.tool_call_id, 256),
+      toolName: boundedTimelineString(value.toolName ?? value.tool_name, 128),
+      input: { redacted: true },
+    };
+    if (event === "tool_result") return {
+      toolCallId: boundedTimelineString(value.toolCallId ?? value.tool_call_id, 256),
+      isError: value.isError === true,
+      content: { redacted: true },
+    };
+    const rawMessage = value.message;
+    const message = rawMessage && typeof rawMessage === "object"
+      ? rawMessage as Record<string, unknown>
+      : value;
+    let content: unknown = boundedTimelineString(message.content);
+    if (Array.isArray(message.content)) {
+      content = message.content.slice(0, 64).map((part) => {
+        if (typeof part === "string") return { text: part.slice(0, 16_384) };
+        if (!part || typeof part !== "object") return {};
+        return { text: boundedTimelineString((part as Record<string, unknown>).text) };
+      });
+    }
+    const usage = message.usage && typeof message.usage === "object"
+      ? message.usage as Record<string, unknown>
+      : undefined;
+    return { message: {
+      id: boundedTimelineString(message.id, 256),
+      role: boundedTimelineString(message.role, 32),
+      content,
+      usage: usage ? {
+        input: finiteOrNull(usage.input ?? usage.inputTokens),
+        output: finiteOrNull(usage.output ?? usage.outputTokens),
+      } : undefined,
+    } };
+  };
+  const sendTimeline = (event: string, payload: unknown) => {
+    try {
+      sendFrame({ type: "timeline", event, payload: normalizedTimelinePayload(event, payload) });
+    } catch {
+      // Observability remains fail-open; Rust applies the durable byte/redaction policy.
+    }
   };
 
   // The idle edge without `agent_settled`: `ctx.isIdle()` is still false AT `agent_end` and
@@ -416,6 +492,93 @@ export default function (pi: ExtensionAPI) {
       if (idle) sendFrame({ type: "state", state: "idle" });
     }, IDLE_POLL_MS);
     poller.unref?.();
+  };
+
+  // Holding mail during a running turn; `HOLD_MAX_MS` explains why and where it is released.
+  const toolCallsInFlight = () => (state.toolCallsInFlight ??= new Set<string>());
+  const heldMessages = () => (state.held ??= []);
+  const clearHoldTimer = () => {
+    if (state.holdTimer !== undefined) clearTimeout(state.holdTimer);
+    state.holdTimer = undefined;
+  };
+  /** Held mail belongs to the channel that sent it; that channel's successor re-sends it. */
+  const resetHold = () => {
+    clearHoldTimer();
+    state.running = false;
+    state.held = [];
+    toolCallsInFlight().clear();
+  };
+
+  // omp injects one queued steer per boundary (its default steering mode is `one-at-a-time`). A
+  // second steer released at the same boundary waited through the next model turn and then
+  // backgrounded that turn's whole batch (cross-omp-hold-luna-20260927-m), so mail released
+  // together reaches omp as one message.
+  const handOff = async (messages: HeldMessage[]) => {
+    const [first] = messages;
+    const content = messages.map((message) => message.content).join("\n\n");
+    try {
+      // `deliverAs` is required only while a turn is streaming, and an idle send that carries
+      // one is rejected, so the idle proof selects the call shape. It never selects the
+      // policy. Not optional-chained: reading a missing idle proof as "idle" would silently
+      // turn every mid-turn delivery into a plain send.
+      if (first.ctx.isIdle()) {
+        await pi.sendUserMessage(content);
+      } else {
+        await pi.sendUserMessage(content, { deliverAs: first.deliverAs });
+      }
+      for (const message of messages) message.reply({ type: "delivered", meta: message.meta });
+    } catch (error) {
+      for (const message of messages) {
+        message.reply({ type: "failed", meta: message.meta, error: String(error) });
+      }
+    }
+  };
+
+  /** Hand every held message to omp now, in arrival order. */
+  const release = (): Promise<void> => {
+    clearHoldTimer();
+    const batch = heldMessages().splice(0);
+    const deliver = async () => {
+      const current = batch.filter((message) => message.channel === state.child);
+      if (current.length > 0) await handOff(current);
+    };
+    state.handoff = (state.handoff ?? Promise.resolve()).then(deliver, deliver);
+    return state.handoff;
+  };
+
+  /** Bound the wait behind a running tool call, never the wait for the model to finish streaming. */
+  const armHoldCap = () => {
+    if (state.holdTimer !== undefined) return;
+    if (heldMessages().length === 0 || toolCallsInFlight().size === 0) return;
+    state.holdTimer = setTimeout(() => {
+      state.holdTimer = undefined;
+      void release();
+    }, HOLD_MAX_MS);
+    state.holdTimer.unref?.();
+  };
+
+  /** Deliver a message from the channel now, or hold it while omp is running a turn. */
+  const receive = (message: HeldMessage): Promise<void> => {
+    heldMessages().push(message);
+    if (state.running || toolCallsInFlight().size > 0) {
+      armHoldCap();
+      return Promise.resolve();
+    }
+    return release();
+  };
+
+  /** A turn's calls are over when the turn ends, answered or not: a blocked call has no result. */
+  const endTurnToolCalls = (event: unknown) => {
+    const content = (event as { message?: { content?: unknown } })?.message?.content;
+    if (!Array.isArray(content)) return;
+    const calls = toolCallsInFlight();
+    for (const part of content) {
+      if (!part || typeof part !== "object") continue;
+      const { type, id } = part as { type?: unknown; id?: unknown };
+      if (type === "toolCall" && typeof id === "string") calls.delete(id);
+    }
+    // Still held, now behind the model rather than a command: the next batch re-arms the cap.
+    if (calls.size === 0) clearHoldTimer();
   };
 
   // Harness context, extension side (HC-R02, HC-R03, HC-R11, HC-R12).
@@ -514,12 +677,21 @@ export default function (pi: ExtensionAPI) {
   // file is the defect class that once shipped green through the type gate.
   pi.on("agent_start", async () => {
     cancelSettle();
+    state.running = true;
+    toolCallsInFlight().clear();
     sendFrame({ type: "state", state: "active" });
   });
   pi.on("agent_end", async (event, ctx) => {
     captureCost(event);
     sendContext(ctx);
     const end = event as AgentEndFrame;
+    if (end.willContinue !== true) {
+      state.running = false;
+      toolCallsInFlight().clear();
+      // Nothing runs now, so held mail is handed over at once, exactly as a message arriving at
+      // this moment would be. Waiting longer for the idle proof would only delay it.
+      if (heldMessages().length > 0) void release();
+    }
     // A retried error does not end a turn: omp fires `agent_end` with `willContinue: true` for
     // every transient failure it is about to try again (measured: a 429 repeated seven times in
     // one print-mode run). Nothing is claimed from those — least of all about a credential.
@@ -551,6 +723,8 @@ export default function (pi: ExtensionAPI) {
     onWidened(name, async (event, ctx) => {
       captureCost(event);
       sendContext(ctx);
+      if (name === "message_end") sendTimeline(name, event);
+      if (name === "turn_end") endTurnToolCalls(event);
     });
   }
   // omp's `session_compact` carries NO `reason` and no `willRetry` — pi 0.84.2 has both — so the
@@ -596,6 +770,11 @@ export default function (pi: ExtensionAPI) {
   onWidened("tool_call", async (rawEvent) => {
     // Pinned pi declarations do not know OMP's tool events; the handler validates fields below.
     const event = rawEvent as ToolCallFrame;
+    sendTimeline("tool_call", rawEvent);
+    if (typeof event.toolCallId === "string") {
+      toolCallsInFlight().add(event.toolCallId);
+      armHoldCap();
+    }
     const question = firstAskQuestion(event);
     if (!question || typeof event.toolCallId !== "string") return;
     state.pendingAskToolCallId = event.toolCallId;
@@ -610,6 +789,14 @@ export default function (pi: ExtensionAPI) {
   });
   onWidened("tool_result", async (rawEvent, ctx) => {
     const event = rawEvent as ToolResultFrame;
+    sendTimeline("tool_result", rawEvent);
+    if (typeof event.toolCallId === "string") {
+      const calls = toolCallsInFlight();
+      calls.delete(event.toolCallId);
+      // Awaited because omp awaits this handler: the steer is queued before omp looks for one at
+      // this batch boundary, and after the batch's commands have run.
+      if (calls.size === 0 && heldMessages().length > 0) await release();
+    }
     if (
       typeof event.toolCallId !== "string" ||
       event.toolCallId !== state.pendingAskToolCallId
@@ -662,14 +849,11 @@ export default function (pi: ExtensionAPI) {
     // prompt rather than the turn after it.
     const restored = await open(ctx);
     const opened = state.child;
-    // Seed the observed state with the idle proof's answer at open time, so the record does not
-    // wait for the first turn boundary to exist.
+    // Do not seed an idle state here. `session_start` precedes a positional boot prompt, and an
+    // idle frame would authorize the channel to inject mail before omp has created the transcript
+    // for that prompt. The post-`agent_end` idle proof is the first transcript-ready edge.
     if (opened) {
-      sendFrame({
-        type: "state",
-        state: idleProof(ctx) ? "idle" : "active",
-      });
-      // And seed the context record, so a resumed session publishes the window it resumed INTO
+      // Seed only the context record, so a resumed session publishes the window it resumed INTO
       // rather than waiting for its first turn boundary.
       sendContext(ctx);
     }
@@ -687,6 +871,7 @@ export default function (pi: ExtensionAPI) {
   pi.on("session_shutdown", async () => {
     cancelSettle();
     state.pendingAskToolCallId = undefined;
+    resetHold();
     closeChild(state.child);
   });
 }

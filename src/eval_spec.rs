@@ -16,8 +16,8 @@ use std::time::Duration;
 use kdl::{KdlDocument, KdlNode, KdlValue};
 
 use agent_spec::spec::{
-    AGENT_DESCRIPTION_MAX_CHARS, AGENT_NAME_MAX_CHARS, Restart, RestartMode, parse_duration,
-    validate_presentation,
+    AGENT_DESCRIPTION_MAX_CHARS, AGENT_NAME_MAX_CHARS, ClaudeDriver, CodexDriver, Driver, Restart,
+    RestartMode, parse_duration, validate_presentation,
 };
 
 /// A parsed st2 spec: a base team (`st2 up` boots this) plus an optional `eval` (`st2 eval` runs it).
@@ -36,8 +36,9 @@ pub struct Spec {
     pub eval: Option<Eval>,
 }
 
-/// One agent — the label IS the id (no separate identity/host/type). An agent IS one pty (its own
-/// `command`); extra processes (the ding, for now) follow as `exec` blocks.
+/// One agent — the label IS the id (no separate identity/host/type). An agent has one launch source:
+/// a legacy `command`, or one native `harness "claude" {}` / `harness "codex" {}` driver. Extra
+/// processes follow as `exec` blocks. The provider-named driver blocks remain accepted as aliases.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SpecAgent {
     pub id: String,
@@ -49,7 +50,8 @@ pub struct SpecAgent {
     pub supervisor: Option<String>,
     /// Fully-cascaded env for the main pty (top → team(s) → agent).
     pub env: BTreeMap<String, String>,
-    pub command: String,
+    pub command: Option<String>,
+    pub driver: Option<Driver>,
     pub execs: Vec<SpecExec>,
 }
 
@@ -88,7 +90,7 @@ pub struct Eval {
     /// set, a dead team seat is respawned FROM THE SPEC (full env re-applied → it rejoins the bus cold),
     /// so a fault-injector can restart/crash a seat mid-run and the recovery is exercised. Absent →
     /// boot-once (the default; the seats are booted once and not respawned) — unchanged for every other
-    /// cell. Recovery remains respawn-from-spec rather than `pty restart`, so eval supervision stays
+    /// eval. Recovery remains respawn-from-spec rather than `pty restart`, so eval supervision stays
     /// owned by st2 even though PTY metadata can now restore the managed environment manually.
     pub supervise: bool,
     /// Opt-in: after `copy` and `run` finish, discover the eval team from canonical Agent Specs in
@@ -225,10 +227,132 @@ fn parse_agent_presentation(
     Ok(())
 }
 
+fn driver_string(node: &KdlNode, provider: &str, field: &str) -> anyhow::Result<String> {
+    anyhow::ensure!(
+        node.children().is_none()
+            && node.entries().len() == 1
+            && node.entries()[0].name().is_none(),
+        "agent `{provider}.{field}` must contain exactly one positional string"
+    );
+    arg(node).ok_or_else(|| {
+        anyhow::anyhow!("agent `{provider}.{field}` must contain exactly one positional string")
+    })
+}
+
+fn driver_args(node: &KdlNode, provider: &str) -> anyhow::Result<Vec<String>> {
+    anyhow::ensure!(
+        node.children().is_none() && node.entries().iter().all(|entry| entry.name().is_none()),
+        "agent `{provider}.args` must contain only positional strings"
+    );
+    node.entries()
+        .iter()
+        .map(|entry| {
+            entry.value().as_string().map(String::from).ok_or_else(|| {
+                anyhow::anyhow!("agent `{provider}.args` must contain only positional strings")
+            })
+        })
+        .collect()
+}
+
+fn driver_bool(node: &KdlNode, provider: &str, field: &str) -> anyhow::Result<bool> {
+    anyhow::ensure!(
+        node.children().is_none()
+            && node.entries().len() == 1
+            && node.entries()[0].name().is_none(),
+        "agent `{provider}.{field}` must contain exactly one positional bool"
+    );
+    node.get(0)
+        .and_then(|value| value.as_bool())
+        .ok_or_else(|| {
+            anyhow::anyhow!("agent `{provider}.{field}` must contain exactly one positional bool")
+        })
+}
+
+type CommonDriverFields = (Option<String>, Option<String>, bool, String, Vec<String>);
+
+fn parse_driver_fields(
+    node: &KdlNode,
+    provider: &str,
+    allow_dev_channels: bool,
+) -> anyhow::Result<CommonDriverFields> {
+    anyhow::ensure!(
+        node.entries().is_empty() && node.children().is_some(),
+        "agent `{provider}` must be a child block without entries"
+    );
+    let mut model = None;
+    let mut effort = None;
+    let mut dev_channels = None;
+    let mut prompt = None;
+    let mut args = None;
+    for child in node.children().expect("checked above").nodes() {
+        match child.name().value() {
+            "model" => {
+                anyhow::ensure!(model.is_none(), "agent `{provider}` has duplicate `model`");
+                model = Some(driver_string(child, provider, "model")?);
+            }
+            "effort" => {
+                anyhow::ensure!(
+                    effort.is_none(),
+                    "agent `{provider}` has duplicate `effort`"
+                );
+                effort = Some(driver_string(child, provider, "effort")?);
+            }
+            "dev-channels" if allow_dev_channels => {
+                anyhow::ensure!(
+                    dev_channels.is_none(),
+                    "agent `{provider}` has duplicate `dev-channels`"
+                );
+                dev_channels = Some(driver_bool(child, provider, "dev-channels")?);
+            }
+            "prompt" => {
+                anyhow::ensure!(
+                    prompt.is_none(),
+                    "agent `{provider}` has duplicate `prompt`"
+                );
+                prompt = Some(driver_string(child, provider, "prompt")?);
+            }
+            "args" => {
+                anyhow::ensure!(args.is_none(), "agent `{provider}` has duplicate `args`");
+                args = Some(driver_args(child, provider)?);
+            }
+            other => anyhow::bail!("agent `{provider}` has unsupported field `{other}`"),
+        }
+    }
+    Ok((
+        model,
+        effort,
+        dev_channels.unwrap_or(false),
+        prompt.ok_or_else(|| anyhow::anyhow!("agent `{provider}` requires `prompt`"))?,
+        args.unwrap_or_default(),
+    ))
+}
+
+fn parse_native_driver(node: &KdlNode) -> anyhow::Result<Driver> {
+    let provider = node.name().value();
+    let (model, effort, dev_channels, prompt, args) =
+        parse_driver_fields(node, provider, provider == "claude")?;
+    match provider {
+        "claude" => Ok(Driver::Claude(ClaudeDriver {
+            model,
+            effort,
+            dev_channels,
+            prompt,
+            args,
+        })),
+        "codex" => Ok(Driver::Codex(CodexDriver {
+            model,
+            effort,
+            prompt,
+            args,
+        })),
+        _ => unreachable!("the eval grammar only calls this helper for native providers"),
+    }
+}
+
 /// Parse a flat `run "label" { … }` node into one [`RunStep`], appended in order. The `run` node IS
 /// one step: its arg is the label, its body holds the command directly. Multiple `run "label"` nodes in
 /// the eval block run in file order. (The old nested `run { step … }` wrapper was retired once every
-/// cell moved to the flat form — a `run` with no label is now an error.)
+/// eval moved to the flat form — a `run` with no label is now an error.)
 fn parse_run_stage(node: &KdlNode, out: &mut Vec<RunStep>) -> anyhow::Result<()> {
     let label = arg(node).ok_or_else(|| {
         anyhow::anyhow!("run needs a label: write `run \"label\" {{ command … }}`")
@@ -379,6 +503,7 @@ pub fn ding_exec(agent_id: &str) -> SpecExec {
 /// Parse an st2 spec (`.kdl` text) into the [`Spec`] model.
 pub fn parse_spec(text: &str) -> anyhow::Result<Spec> {
     let doc = KdlDocument::parse(text).map_err(|e| anyhow::anyhow!("st2 spec KDL parse: {e}"))?;
+    crate::kdl_version::ensure_st2_version(&doc)?;
 
     let mut host = None;
     let mut top_env = BTreeMap::new();
@@ -387,6 +512,7 @@ pub fn parse_spec(text: &str) -> anyhow::Result<Spec> {
 
     for node in doc.nodes() {
         match node.name().value() {
+            "version" => {}
             "host" => host = arg(node),
             "env" => top_env = parse_env(node),
             "team" => collect_team(node, "", &top_env, &mut agents)?,
@@ -394,7 +520,7 @@ pub fn parse_spec(text: &str) -> anyhow::Result<Spec> {
             "eval" => eval = Some(parse_eval(node, &top_env)?),
             other => {
                 anyhow::bail!(
-                    "st2 spec: unexpected top-level node '{other}' (expected host|env|team|agent|eval)"
+                    "st2 spec: unexpected top-level node '{other}' (expected version|host|env|team|agent|eval)"
                 )
             }
         }
@@ -471,7 +597,9 @@ fn parse_agent(
     let mut supervisor = None;
     let mut agent_env = BTreeMap::new();
     let mut command = None;
+    let mut driver = None;
     let mut execs = Vec::new();
+    let mut has_ding = false;
 
     if let Some(ch) = node.children() {
         // env first so it cascades to execs regardless of source order.
@@ -488,13 +616,50 @@ fn parse_agent(
                 "description" => parse_agent_presentation(c, &id, "description", &mut description)?,
                 "workspace" => workspace = arg(c),
                 "supervisor" => supervisor = arg(c),
-                "command" => command = arg(c),
+                "command" => {
+                    anyhow::ensure!(command.is_none(), "agent '{id}' has duplicate `command`");
+                    command = Some(arg(c).ok_or_else(|| {
+                        anyhow::anyhow!("agent '{id}' `command` must contain a string")
+                    })?);
+                }
+                "claude" | "codex" => {
+                    anyhow::ensure!(
+                        driver.is_none(),
+                        "agent '{id}' declares more than one native driver"
+                    );
+                    driver = Some(parse_native_driver(c)?);
+                }
+                "harness" => {
+                    anyhow::ensure!(
+                        driver.is_none(),
+                        "agent '{id}' declares more than one native driver"
+                    );
+                    let provider = arg(c)
+                        .ok_or_else(|| anyhow::anyhow!("agent '{id}' harness needs a provider"))?;
+                    anyhow::ensure!(
+                        matches!(provider.as_str(), "claude" | "codex"),
+                        "agent '{id}' harness '{provider}' is not supported in evals"
+                    );
+                    anyhow::ensure!(
+                        c.entries()
+                            .iter()
+                            .filter(|entry| entry.name().is_none())
+                            .count()
+                            == 1,
+                        "agent '{id}' harness needs exactly one provider"
+                    );
+                    let mut provider_node = c.clone();
+                    provider_node.set_name(provider);
+                    provider_node.entries_mut().clear();
+                    driver = Some(parse_native_driver(&provider_node)?);
+                }
                 // Feature (a): a DEDICATED built-in sidecar node. Bare `ding` expands to the standard
                 // st2 ding command (identity/label auto-derived as this agent's id, `--root $ST_ROOT`).
                 // It is distinct from `exec` on purpose — `exec` never reserves a magic name, so a
                 // command literally named "ding" stays runnable (`exec "ding" { command … }`).
                 // (Renames to bare `ping` later.)
                 "ding" => {
+                    has_ding = true;
                     let mut d = ding_exec(&id);
                     let mut d_env = BTreeMap::new();
                     if let Some(dc) = c.children() {
@@ -538,10 +703,18 @@ fn parse_agent(
                     });
                 }
                 other => anyhow::bail!(
-                    "agent '{id}': unexpected node '{other}' (expected name|description|workspace|supervisor|env|command|ding|exec)"
+                    "agent '{id}': unexpected node '{other}' (expected name|description|workspace|supervisor|env|command|harness|claude|codex|ding|exec)"
                 ),
             }
         }
+        anyhow::ensure!(
+            command.is_some() ^ driver.is_some(),
+            "agent '{id}' must declare exactly one launch source: `command` or a native `harness`"
+        );
+        anyhow::ensure!(
+            driver.is_none() || !has_ding,
+            "agent '{id}' uses a native driver; remove `ding` because the driver owns message delivery"
+        );
         validate_presentation("name", display_name.as_deref(), AGENT_NAME_MAX_CHARS)?;
         validate_presentation(
             "description",
@@ -556,7 +729,8 @@ fn parse_agent(
             workspace,
             supervisor,
             env,
-            command: command.ok_or_else(|| anyhow::anyhow!("agent '{id}' has no command"))?,
+            command,
+            driver,
             execs,
         });
     }
@@ -842,6 +1016,8 @@ eval {
         assert_eq!(sup.workspace.as_deref(), Some("./sup"));
         assert!(
             sup.command
+                .as_deref()
+                .unwrap()
                 .contains("exec claude --permission-mode bypassPermissions")
         );
         assert_eq!(sup.env.get("ST_ROOT").unwrap(), "$CATALOG/custom-bus"); // cascaded from top
@@ -895,6 +1071,115 @@ eval {
         // Per-judge timeout + ask flavor.
         assert_eq!(ev.judges[4].timeout, Some(Duration::from_secs(120)));
         assert!(matches!(&ev.judges[4].kind, JudgeKind::Ask { agent, .. } if agent == "judge"));
+    }
+
+    #[test]
+    fn parses_native_claude_and_codex_eval_agents() {
+        let spec = parse_spec(
+            r#"
+team "mix" {
+  agent "sup" {
+    workspace "./sup"
+    claude {
+      model "claude-sonnet-5"
+      effort "medium"
+      prompt "Coordinate the task."
+      args "--permission-mode" "bypassPermissions"
+    }
+  }
+}
+eval {
+  message { from "requester"; to "mix.sup"; content "work" }
+  max-timeout "60s"
+  agent "judge" {
+    codex {
+      model "gpt-5.6-sol"
+      effort "medium"
+      prompt "Judge the result."
+    }
+  }
+}
+"#,
+        )
+        .unwrap();
+
+        assert!(spec.agents[0].command.is_none());
+        assert!(matches!(
+            spec.agents[0].driver.as_ref(),
+            Some(Driver::Claude(ClaudeDriver {
+                model: Some(model),
+                effort: Some(effort),
+                prompt,
+                args,
+                ..
+            })) if model == "claude-sonnet-5"
+                && effort == "medium"
+                && prompt == "Coordinate the task."
+                && args == &["--permission-mode", "bypassPermissions"]
+        ));
+        let judge = &spec.eval.unwrap().agents[0];
+        assert!(matches!(
+            judge.driver.as_ref(),
+            Some(Driver::Codex(CodexDriver {
+                model: Some(model),
+                effort: Some(effort),
+                prompt,
+                ..
+            })) if model == "gpt-5.6-sol"
+                && effort == "medium"
+                && prompt == "Judge the result."
+        ));
+    }
+
+    #[test]
+    fn parses_contextual_harness_eval_agents() {
+        let spec = parse_spec(
+            r#"
+agent "worker" {
+  harness "claude" {
+    model "claude-sonnet-5"
+    effort "medium"
+    prompt "Do the work."
+    args "--permission-mode" "bypassPermissions"
+  }
+}
+eval {
+  message { from "requester"; to "worker"; content "work" }
+  max-timeout "60s"
+  agent "judge" {
+    harness "codex" {
+      model "gpt-5.6-sol"
+      effort "medium"
+      prompt "Judge the work."
+    }
+  }
+}
+"#,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            spec.agents[0].driver.as_ref(),
+            Some(Driver::Claude(ClaudeDriver { prompt, .. })) if prompt == "Do the work."
+        ));
+        assert!(matches!(
+            spec.eval.unwrap().agents[0].driver.as_ref(),
+            Some(Driver::Codex(CodexDriver { prompt, .. })) if prompt == "Judge the work."
+        ));
+    }
+
+    #[test]
+    fn native_eval_agents_reject_ambiguous_launch_and_ding() {
+        for source in [
+            r#"agent "a" { command "true"; claude { prompt "work" } }"#,
+            r#"agent "a" { claude { prompt "work" }; codex { prompt "work" } }"#,
+            r#"agent "a" { claude { prompt "work" }; ding }"#,
+        ] {
+            assert!(
+                parse_spec(source).is_err(),
+                "source unexpectedly parsed: {source}"
+            );
+        }
     }
 
     #[test]
@@ -1134,7 +1419,7 @@ team "mix" {
     #[test]
     fn nested_run_step_form_is_rejected() {
         // The old `run { step … }` wrapper was retired: a `run` with no label is now an error
-        // (every cell uses the flat `run "label" { … }` form).
+        // (every eval uses the flat `run "label" { … }` form).
         let err = parse_spec(
             "eval {\n  max-timeout \"2m\"\n  run {\n    step \"render\" { command \"x\" }\n  }\n  \
              judges { judge \"ok\" { exec \"true\" } }\n}\n",
@@ -1183,5 +1468,14 @@ team "mix" {
         .unwrap_err()
         .to_string();
         assert!(err.contains("exactly one"), "got: {err}");
+    }
+
+    #[test]
+    fn st2_accepts_versions_zero_and_one_but_rejects_version_two() {
+        parse_spec("agent \"zero\" { command \"true\" }").unwrap();
+        parse_spec("version 0\nagent \"zero\" { command \"true\" }").unwrap();
+        parse_spec("version 1\nagent \"one\" { command \"true\" }").unwrap();
+        let error = parse_spec("version 2\nagent \"two\" { command \"true\" }").unwrap_err();
+        assert!(error.to_string().contains("st2 accepts KDL version 0 or 1"));
     }
 }

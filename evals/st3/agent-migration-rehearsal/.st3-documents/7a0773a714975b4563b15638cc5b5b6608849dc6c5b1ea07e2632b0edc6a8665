@@ -1,0 +1,3 @@
+# Eval host contract
+
+This host runs one isolated st3 migration rehearsal. The workspace contains no production agent state.

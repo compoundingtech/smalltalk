@@ -1,0 +1,29 @@
+{
+  "schema": "st3-mission-graph-proof.v1",
+  "date": "2026-08-27",
+  "eval": "ghost-bug-codex",
+  "mission_run": "40709a48d7c3c747478e794860bc9656",
+  "mission_revision": "09cfb6bcf1587f9555cc56d299778746030d437c2500efe729fcf576dda55129",
+  "candidate": {
+    "git_head": "2a8c645b69f7f18acd76746e62b88d357a35234a",
+    "working_tree": "dirty",
+    "st3_version": "0.1.0",
+    "st3_binary_sha256": "3baa605bb9ec4639de6f65881621b9b2a4670e1f9e1481cc4295887f5f108bf7",
+    "eval_kdl_sha256": "e09d78e4de126bda345a90d94ba159e73eba9ea176841ad9e8a4adb7a172ede5"
+  },
+  "result": {
+    "done": true,
+    "verdict": "pass",
+    "cleanup_complete": true,
+    "worker_commit": "d94e5056730677a11c5079abb188979446a4c31b",
+    "judges": [
+      "team completion",
+      "isolation",
+      "visible suite",
+      "root cause",
+      "mutation-valid regression",
+      "coordination",
+      "Codex root-cause review"
+    ]
+  }
+}

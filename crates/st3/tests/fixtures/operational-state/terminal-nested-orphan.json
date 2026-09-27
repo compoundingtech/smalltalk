@@ -1,0 +1,30 @@
+{
+  "id": "cos-recovery/terminal-nested-orphan",
+  "source": {
+    "message": "message/b064cecaaf0b3597",
+    "root_run": "mission-run/app-web/switcher-native-search/2026-09-20",
+    "child_run": "mission-run/3c9a75147bc05e883a4f8a5b4f37bdde",
+    "child_generation": "run-generation/04b2a2ed5361530e27af757019d97ff8",
+    "step_run": "step-run/04b2a2ed5361530e27af757019d97ff8/use-the-native-field"
+  },
+  "observed": {
+    "root_run_status": "failed",
+    "root_run_phase": "terminal",
+    "child_run_status": "running",
+    "step_status": "ready",
+    "status_projection_owner_run": null,
+    "work_default_visible": true,
+    "terminal_cancel_reported_changed": true,
+    "step_status_after_cancel": "ready"
+  },
+  "expected": {
+    "child_run_status": "cancelled",
+    "step_status": "cancelled",
+    "work_default_visible": false,
+    "terminal_cancel_result": "reaped-or-explicit-no-op"
+  },
+  "root_cause": {
+    "file": "crates/st3/src/store.rs",
+    "defect": "generic terminal run transitions retire only the run's own generation steps; nested child runs are reaped on selected timeout and revision paths but not on every terminal transition, and cancellation returns early for an already-terminal root"
+  }
+}

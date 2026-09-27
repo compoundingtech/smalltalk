@@ -13,9 +13,9 @@
 //!
 //! The registry is injectable so a catalog can extend or override the built-in set.
 
-use std::collections::{BTreeMap, BTreeSet};
 #[cfg(feature = "wasm-resolver")]
 use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 #[cfg(feature = "wasm-resolver")]
 use std::sync::Arc;
@@ -23,10 +23,10 @@ use std::sync::Arc;
 #[cfg(feature = "wasm-resolver")]
 use parking_lot::Mutex;
 
-#[cfg(feature = "wasm-resolver")]
-use sha2::{Digest as _, Sha256};
 use serde::Deserialize;
 use serde_json::Value;
+#[cfg(feature = "wasm-resolver")]
+use sha2::{Digest as _, Sha256};
 
 /// Scheme of the standing-seat goal carrier: `dev.schickling.agent-goal://<host>/<identity>`.
 /// The authority names a logical host and identity; a resolver module decides what the URI
@@ -150,7 +150,10 @@ impl std::fmt::Display for DescriptorValidationError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::UnsupportedAbiVersion(version) => {
-                write!(formatter, "unsupported profile descriptor ABI version {version}")
+                write!(
+                    formatter,
+                    "unsupported profile descriptor ABI version {version}"
+                )
             }
             Self::MissingResolveCapability => {
                 formatter.write_str("descriptor does not declare the `resolve` capability")
@@ -164,7 +167,10 @@ impl std::fmt::Display for DescriptorValidationError {
                 write!(formatter, "default {error}")
             }
             Self::UnknownDefaultTopic(topic) => {
-                write!(formatter, "default selector names unpublished topic `{topic}`")
+                write!(
+                    formatter,
+                    "default selector names unpublished topic `{topic}`"
+                )
             }
             Self::InvalidSnapshotMediaType => {
                 formatter.write_str("snapshot mediaType must be a non-empty type/subtype")
@@ -219,9 +225,7 @@ impl SelectorSchema {
                         .into_iter()
                         .map(|name| match name {
                             Value::String(name) => Ok(name),
-                            _ => Err(
-                                "object schema `required` entries must be strings".to_owned(),
-                            ),
+                            _ => Err("object schema `required` entries must be strings".to_owned()),
                         })
                         .collect::<Result<_, _>>()?,
                     Some(_) => return Err("object schema `required` must be an array".to_owned()),
@@ -231,7 +235,7 @@ impl SelectorSchema {
                     Some(Value::Bool(value)) => value,
                     Some(_) => {
                         return Err(
-                            "object schema `additionalProperties` must be a boolean".to_owned(),
+                            "object schema `additionalProperties` must be a boolean".to_owned()
                         );
                     }
                 };
@@ -298,11 +302,7 @@ impl SelectorSchema {
             Self::Array { items, .. } => {
                 items.validate_definition(&format!("{path}.items"))?;
             }
-            Self::String
-            | Self::Boolean
-            | Self::Number
-            | Self::Integer
-            | Self::Null => {}
+            Self::String | Self::Boolean | Self::Number | Self::Integer | Self::Null => {}
         }
         Ok(())
     }
@@ -360,9 +360,7 @@ impl SelectorSchema {
                 return Err(fail("must be a boolean".to_owned()));
             }
             Self::Number if !value.is_number() => return Err(fail("must be a number".to_owned())),
-            Self::Integer
-                if !(value.as_i64().is_some() || value.as_u64().is_some()) =>
-            {
+            Self::Integer if !(value.as_i64().is_some() || value.as_u64().is_some()) => {
                 return Err(fail("must be an integer".to_owned()));
             }
             Self::Null if !value.is_null() => return Err(fail("must be null".to_owned())),
@@ -375,8 +373,8 @@ impl SelectorSchema {
 impl ProfileDescriptor {
     /// Decode and fully validate one bounded descriptor JSON document.
     pub fn from_json(bytes: &[u8]) -> Result<Self, String> {
-        let descriptor: Self =
-            serde_json::from_slice(bytes).map_err(|error| format!("invalid descriptor JSON: {error}"))?;
+        let descriptor: Self = serde_json::from_slice(bytes)
+            .map_err(|error| format!("invalid descriptor JSON: {error}"))?;
         descriptor.validate().map_err(|error| error.to_string())?;
         Ok(descriptor)
     }
@@ -473,7 +471,6 @@ impl ProfileDescriptor {
         }
         Ok(())
     }
-
 
     fn validate_selector_schema_only(
         &self,
@@ -798,8 +795,10 @@ impl ResourceProfileRefresh<'_> {
         #[cfg(not(feature = "wasm-resolver"))]
         {
             let _ = (module, containment_root);
-            Err("profile descriptor unavailable: st2 was built without the `wasm-resolver` feature"
-                .to_owned())
+            Err(
+                "profile descriptor unavailable: st2 was built without the `wasm-resolver` feature"
+                    .to_owned(),
+            )
         }
         #[cfg(feature = "wasm-resolver")]
         {
@@ -825,9 +824,7 @@ impl ResourceProfileRefresh<'_> {
         if let Some(result) = modules.get(&key) {
             return result.clone();
         }
-        let result = self
-            .registry
-            .compiled(&key, module, containment_root);
+        let result = self.registry.compiled(&key, module, containment_root);
         modules.insert(key, result.clone());
         result
     }
@@ -852,8 +849,10 @@ impl ResourceProfileRefresh<'_> {
         #[cfg(not(feature = "wasm-resolver"))]
         {
             let _ = (module, class, containment_root, agent_dir);
-            Err("profile resolver unavailable: st2 was built without the `wasm-resolver` feature"
-                .to_owned())
+            Err(
+                "profile resolver unavailable: st2 was built without the `wasm-resolver` feature"
+                    .to_owned(),
+            )
         }
         #[cfg(feature = "wasm-resolver")]
         {
@@ -977,10 +976,7 @@ impl ResourceProfileRegistry {
     }
 
     /// Insert (or replace) many profiles; returns `self` for chaining.
-    pub fn with_profiles(
-        mut self,
-        profiles: impl IntoIterator<Item = ResourceProfile>,
-    ) -> Self {
+    pub fn with_profiles(mut self, profiles: impl IntoIterator<Item = ResourceProfile>) -> Self {
         for profile in profiles {
             self.profiles.insert(profile.scheme.clone(), profile);
         }
@@ -1135,7 +1131,10 @@ mod tests {
     fn demo_profile(class: ProfileClass) -> ResourceProfile {
         ResourceProfile::wasm(
             AGENT_GOAL_SCHEME,
-            concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/demo_resolver.wasm"),
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/demo_resolver.wasm"
+            ),
             class,
         )
     }
@@ -1178,16 +1177,15 @@ mod tests {
                 .contains("unsupported profile descriptor ABI version 9")
         );
 
-        let unknown_capability =
-            VALID_DESCRIPTOR_JSON.replace("\"observe\"", "\"write\"");
+        let unknown_capability = VALID_DESCRIPTOR_JSON.replace("\"observe\"", "\"write\"");
         assert!(
             ProfileDescriptor::from_json(unknown_capability.as_bytes())
                 .unwrap_err()
                 .contains("unknown variant")
         );
 
-        let unknown_field =
-            VALID_DESCRIPTOR_JSON.replace("\"abiVersion\": 3,", "\"abiVersion\": 3, \"extra\": true,");
+        let unknown_field = VALID_DESCRIPTOR_JSON
+            .replace("\"abiVersion\": 3,", "\"abiVersion\": 3, \"extra\": true,");
         assert!(
             ProfileDescriptor::from_json(unknown_field.as_bytes())
                 .unwrap_err()
@@ -1216,10 +1214,8 @@ mod tests {
     fn descriptor_rejects_malformed_json_and_invalid_topic_defaults() {
         assert!(ProfileDescriptor::from_json(br#"{"abiVersion":"#).is_err());
 
-        let duplicate_topic = VALID_DESCRIPTOR_JSON.replace(
-            r#"{ "name": "ci.success" }"#,
-            r#"{ "name": "ci.failure" }"#,
-        );
+        let duplicate_topic = VALID_DESCRIPTOR_JSON
+            .replace(r#"{ "name": "ci.success" }"#, r#"{ "name": "ci.failure" }"#);
         assert!(matches!(
             serde_json::from_str::<ProfileDescriptor>(&duplicate_topic)
                 .expect("descriptor shape decodes")
@@ -1238,20 +1234,16 @@ mod tests {
             Err(DescriptorValidationError::UnknownDefaultTopic(topic)) if topic == "unpublished"
         ));
 
-        let empty_topic = VALID_DESCRIPTOR_JSON.replace(
-            r#"{ "name": "ci.success" }"#,
-            r#"{ "name": "" }"#,
-        );
+        let empty_topic =
+            VALID_DESCRIPTOR_JSON.replace(r#"{ "name": "ci.success" }"#, r#"{ "name": "" }"#);
         assert!(matches!(
             serde_json::from_str::<ProfileDescriptor>(&empty_topic)
                 .expect("descriptor shape decodes")
                 .validate(),
             Err(DescriptorValidationError::EmptyTopic)
         ));
-        let invalid_media_type = VALID_DESCRIPTOR_JSON.replace(
-            r#""mediaType": "application/json""#,
-            r#""mediaType": """#,
-        );
+        let invalid_media_type = VALID_DESCRIPTOR_JSON
+            .replace(r#""mediaType": "application/json""#, r#""mediaType": """#);
         assert!(matches!(
             serde_json::from_str::<ProfileDescriptor>(&invalid_media_type)
                 .expect("descriptor shape decodes")
@@ -1274,29 +1266,37 @@ mod tests {
     #[test]
     fn selector_validation_enforces_schema_topics_uniqueness_and_size() {
         let descriptor = valid_descriptor();
-        assert!(descriptor
-            .validate_selector(&serde_json::json!({ "topics": ["ci.failure"], "extra": true }))
-            .unwrap_err()
-            .message
-            .contains("unknown property"));
-        assert!(descriptor
-            .validate_selector(&serde_json::json!({ "topics": ["ci.failure", "ci.failure"] }))
-            .unwrap_err()
-            .message
-            .contains("duplicates"));
-        assert!(descriptor
-            .validate_selector(&serde_json::json!({ "topics": ["not.published"] }))
-            .unwrap_err()
-            .message
-            .contains("unpublished topic"));
-        assert!(descriptor
-            .validate_selector(&serde_json::json!({
-                "topics": ["ci.failure"],
-                "filter": { "draft": "yes" }
-            }))
-            .unwrap_err()
-            .message
-            .contains("boolean"));
+        assert!(
+            descriptor
+                .validate_selector(&serde_json::json!({ "topics": ["ci.failure"], "extra": true }))
+                .unwrap_err()
+                .message
+                .contains("unknown property")
+        );
+        assert!(
+            descriptor
+                .validate_selector(&serde_json::json!({ "topics": ["ci.failure", "ci.failure"] }))
+                .unwrap_err()
+                .message
+                .contains("duplicates")
+        );
+        assert!(
+            descriptor
+                .validate_selector(&serde_json::json!({ "topics": ["not.published"] }))
+                .unwrap_err()
+                .message
+                .contains("unpublished topic")
+        );
+        assert!(
+            descriptor
+                .validate_selector(&serde_json::json!({
+                    "topics": ["ci.failure"],
+                    "filter": { "draft": "yes" }
+                }))
+                .unwrap_err()
+                .message
+                .contains("boolean")
+        );
 
         let oversized = serde_json::json!({
             "topics": ["ci.failure"],
@@ -1327,9 +1327,13 @@ mod tests {
     #[test]
     #[cfg(feature = "wasm-resolver")]
     fn registered_scheme_resolves_with_the_declared_class() {
-        let registry = ResourceProfileRegistry::empty().with_profile(demo_profile(ProfileClass::Immediate));
+        let registry =
+            ResourceProfileRegistry::empty().with_profile(demo_profile(ProfileClass::Immediate));
         assert_eq!(
-            registry.resolve(Path::new("/cat/agents/dev3/janitor"), "dev.schickling.agent-goal://dev3/janitor"),
+            registry.resolve(
+                Path::new("/cat/agents/dev3/janitor"),
+                "dev.schickling.agent-goal://dev3/janitor"
+            ),
             Some(Resolution {
                 path: PathBuf::from("/cat/agents/dev3/janitor/resources/goal.md"),
                 class: ProfileClass::Immediate,
@@ -1342,16 +1346,26 @@ mod tests {
     #[cfg(feature = "wasm-resolver")]
     fn authority_and_path_are_identity_not_location() {
         // A foreign host's identity still denotes the local seat's own goal carrier.
-        let registry = ResourceProfileRegistry::empty().with_profile(demo_profile(ProfileClass::Coalesced));
-        assert!(registry
-            .resolve(Path::new("/here"), "dev.schickling.agent-goal://elsewhere/x")
-            .is_some());
+        let registry =
+            ResourceProfileRegistry::empty().with_profile(demo_profile(ProfileClass::Coalesced));
+        assert!(
+            registry
+                .resolve(
+                    Path::new("/here"),
+                    "dev.schickling.agent-goal://elsewhere/x"
+                )
+                .is_some()
+        );
     }
 
     #[test]
     fn unknown_schemes_relative_paths_and_file_uris_are_not_registry_business() {
-        let registry = ResourceProfileRegistry::empty().with_profile(demo_profile(ProfileClass::Immediate));
-        assert_eq!(registry.resolve(Path::new("/a"), "worktree://repo/main"), None);
+        let registry =
+            ResourceProfileRegistry::empty().with_profile(demo_profile(ProfileClass::Immediate));
+        assert_eq!(
+            registry.resolve(Path::new("/a"), "worktree://repo/main"),
+            None
+        );
         assert_eq!(registry.resolve(Path::new("/a"), "http://x/y"), None);
         assert_eq!(registry.resolve(Path::new("/a"), "resources/goal.md"), None);
         assert_eq!(registry.resolve(Path::new("/a"), "file:///etc/x"), None);
@@ -1378,13 +1392,21 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let broken = temp.path().join("broken.wasm");
         std::fs::write(&broken, b"this is not a wasm module").unwrap();
-        let registry = ResourceProfileRegistry::empty()
-            .with_profile(ResourceProfile::wasm("doomed", &broken, ProfileClass::Immediate));
+        let registry = ResourceProfileRegistry::empty().with_profile(ResourceProfile::wasm(
+            "doomed",
+            &broken,
+            ProfileClass::Immediate,
+        ));
         assert_eq!(registry.resolve(Path::new("/a"), "doomed://x"), None);
-        let reason = registry.try_resolve(Path::new("/a"), "doomed://x").unwrap_err();
+        let reason = registry
+            .try_resolve(Path::new("/a"), "doomed://x")
+            .unwrap_err();
         assert!(reason.contains("instantiation failed"), "{reason}");
         // Unregistered schemes are `Ok(None)` even in a registry that also holds failures.
-        assert_eq!(registry.try_resolve(Path::new("/a"), "other://x").unwrap(), None);
+        assert_eq!(
+            registry.try_resolve(Path::new("/a"), "other://x").unwrap(),
+            None
+        );
     }
 
     #[test]
@@ -1425,11 +1447,7 @@ mod tests {
             let key = ModuleCacheKey::new(&module, None);
             assert!(cache.modules[&key].result.is_err());
         }
-        assert!(
-            registry
-                .try_resolve(Path::new("/agent"), URI)
-                .is_err()
-        );
+        assert!(registry.try_resolve(Path::new("/agent"), URI).is_err());
         assert_eq!(
             registry.wasm_cache.lock().compile_attempts,
             1,
@@ -1441,11 +1459,7 @@ mod tests {
         let mut changed_permissions = original_permissions.clone();
         changed_permissions.set_readonly(!original_permissions.readonly());
         std::fs::set_permissions(&module, changed_permissions).unwrap();
-        assert!(
-            registry
-                .try_resolve(Path::new("/agent"), URI)
-                .is_err()
-        );
+        assert!(registry.try_resolve(Path::new("/agent"), URI).is_err());
         assert_eq!(
             registry.wasm_cache.lock().compile_attempts,
             2,
@@ -1583,11 +1597,7 @@ mod tests {
         let catalog = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
         std::fs::create_dir(outside.path().join("child")).unwrap();
-        symlink(
-            outside.path().join("child"),
-            catalog.path().join("link"),
-        )
-        .unwrap();
+        symlink(outside.path().join("child"), catalog.path().join("link")).unwrap();
         write_any_uri_resolver(&outside.path().join("resolver.wasm"));
         let indirect_root = catalog.path().join("link/..");
         let registry = ResourceProfileRegistry::empty().with_profiles([
@@ -1761,9 +1771,6 @@ mod tests {
         }
         let cache = registry.wasm_cache.lock();
         assert_eq!(cache.modules.len(), WASM_CACHE_CAPACITY);
-        assert_eq!(
-            cache.compile_attempts as usize,
-            WASM_CACHE_CAPACITY + 4
-        );
+        assert_eq!(cache.compile_attempts as usize, WASM_CACHE_CAPACITY + 4);
     }
 }

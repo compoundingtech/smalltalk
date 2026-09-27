@@ -91,7 +91,7 @@ cgroup path, root PID, unit, and incarnation remain observation locators only.
   existing fail-closed catalog/runtime semantics remain intact.
 - The Linux path is slash-prefixed and relative to the cgroup-v2 mount; `/`
   denotes the mount root.
-- st2 adds no persistent locator registry, metrics server, sampling cadence, or
+- The runtime adds no persistent locator registry, metrics server, sampling cadence, or
   resource history.
 - Version-1 strict consumers must explicitly adopt schema version 2.
 - Evidence is recorded in the [task resource target experiment](../.experiments/2026-09-05-task-resource-target-observation.md).

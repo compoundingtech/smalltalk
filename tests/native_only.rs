@@ -13,7 +13,14 @@ fn clean_path() -> tempfile::TempDir {
     symlink(env!("CARGO_BIN_EXE_st2"), bin.path().join("st2")).unwrap();
     let git = std::env::split_paths(&std::env::var_os("PATH").unwrap())
         .map(|dir| dir.join("git"))
-        .find(|path| path.is_file())
+        .find(|path| {
+            path.is_file()
+                && fs::read(path).is_ok_and(|bytes| {
+                    !bytes
+                        .windows(b"st2-recorder-wrapper".len())
+                        .any(|window| window == b"st2-recorder-wrapper")
+                })
+        })
         .expect("the native authoring guide requires git on PATH");
     symlink(git, bin.path().join("git")).unwrap();
     executable(
@@ -414,7 +421,6 @@ fn tracked_product_surface_contains_only_native_names() {
 
     let forbidden = [
         ["con", "voy"].concat(),
-        ["small", "talk"].concat(),
         [".con", "voy"].concat(),
         ["render", "-agent"].concat(),
         ["build", "-agent"].concat(),

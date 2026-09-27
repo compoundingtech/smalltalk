@@ -1,0 +1,10 @@
+[Unit]
+Description=Recheck st3 friend-ready gates every 15 minutes
+
+[Timer]
+OnCalendar=*:0/15
+Persistent=true
+Unit=st3-friend-ready-gate-watch.service
+
+[Install]
+WantedBy=timers.target

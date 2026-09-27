@@ -54,6 +54,7 @@ pub enum DeclaredSeverity {
 #[serde(rename_all = "kebab-case")]
 pub enum DeclaredDiagnosticCode {
     KdlSyntax,
+    UnsupportedKdlVersion,
     UnexpectedTopLevelNode,
     TaskNameMissing,
     UnsupportedSchedule,
@@ -65,6 +66,7 @@ impl DeclaredDiagnosticCode {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::KdlSyntax => "kdl-syntax",
+            Self::UnsupportedKdlVersion => "unsupported-kdl-version",
             Self::UnexpectedTopLevelNode => "unexpected-top-level-node",
             Self::TaskNameMissing => "task-name-missing",
             Self::UnsupportedSchedule => "unsupported-schedule",
@@ -358,6 +360,7 @@ pub fn parse_declared_document(source_name: &Path, source: &str) -> DeclaredPars
         }
     };
 
+    let version_error = crate::kdl_version::ensure_st2_version(&parsed).err();
     let nodes = parsed
         .nodes()
         .iter()
@@ -377,7 +380,28 @@ pub fn parse_declared_document(source_name: &Path, source: &str) -> DeclaredPars
         })
         .collect::<Vec<_>>();
     let mut diagnostics = Vec::new();
+    if let Some(error) = version_error {
+        let span = nodes
+            .iter()
+            .find(|node| node.name == "version")
+            .map(|node| node.span)
+            .unwrap_or(DeclaredSpan {
+                offset: 0,
+                length: 0,
+                line: 1,
+                column: 1,
+            });
+        diagnostics.push(shape_diagnostic(
+            source_name,
+            span,
+            DeclaredDiagnosticCode::UnsupportedKdlVersion,
+            error.to_string(),
+        ));
+    }
     for node in &nodes {
+        if node.name == "version" {
+            continue;
+        }
         if node.name != "agent" {
             diagnostics.push(shape_diagnostic(
                 source_name,

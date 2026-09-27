@@ -654,20 +654,18 @@ fn keep_after_supersession(element: &mut serde_json::Value) -> bool {
     let mut any_array_content = false;
     match element {
         serde_json::Value::Array(items) => {
-            items.retain_mut(|item| keep_after_supersession(item));
+            items.retain_mut(keep_after_supersession);
             any_array_content = !items.is_empty();
         }
         serde_json::Value::Object(map) => {
             for value in map.values_mut() {
                 if let serde_json::Value::Array(items) = value {
-                    items.retain_mut(|item| keep_after_supersession(item));
+                    items.retain_mut(keep_after_supersession);
                     if !items.is_empty() {
                         any_array_content = true;
                     }
-                } else if has_nested_array(value) {
-                    if keep_after_supersession(value) {
-                        any_array_content = true;
-                    }
+                } else if has_nested_array(value) && keep_after_supersession(value) {
+                    any_array_content = true;
                 }
             }
         }

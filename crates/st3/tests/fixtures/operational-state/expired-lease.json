@@ -1,0 +1,14 @@
+{
+  "id": "live-expired-lease",
+  "snapshot_time_unix_ms": 2000,
+  "mission": "version 2\nmission \"lease-fixture\" state=\"ready\" {\n  goal \"Prove lease projection.\"\n  completion { when \"all-steps-exhausted\" }\n  step \"work\" { assigned-to \"agent/worker\" }\n}\n",
+  "expired_claim": {
+    "kind": "work.claimed",
+    "fields": {
+      "attempt": 1, "status": "claimed", "summary": "fixture", "worker_reported": false,
+      "claimant": "DERIVE_ASSIGNEE", "claim_incarnation": "fixture-incarnation",
+      "claim_expires_at_unix_ms": 1, "readiness_epoch": 1
+    }
+  },
+  "expected": { "history_status": "claimed", "current_lease": "expired", "actionable_status": "ready", "claimant": null }
+}

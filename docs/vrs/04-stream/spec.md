@@ -165,8 +165,8 @@ subject: 'CI: failure on PR #42'
 message; new readers classify on the presence of `stream` + `event-id`. The
 exact `from` grammar for a nested stream's producer identity is DQ-S1.
 
-DING renders events as `[DING] » <from>: <subject> [id:…]` — the `»` marker is
-the only DING change; classification, staged ownership, retries, and presence
+PING renders events as `[PING] » <from>: <subject> [id:…]` — the `»` marker is
+the only PING change; classification, staged ownership, retries, and presence
 gating are inherited.
 
 ## Stream state (STREAM-R05)

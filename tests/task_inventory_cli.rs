@@ -333,9 +333,10 @@ fn completed_catalog_aba_during_runtime_observation_is_incomplete() {
         .to_string();
     snapshot(&prepared_b);
     let b_spec = prepared_b.join("agents/h/worker/agent.kdl");
-    let bytes = fs::read_to_string(&b_spec)
-        .unwrap()
-        .replace("agent \"worker\" {", "agent \"worker\" {\n  name \"temporary\"");
+    let bytes = fs::read_to_string(&b_spec).unwrap().replace(
+        "agent \"worker\" {",
+        "agent \"worker\" {\n  name \"temporary\"",
+    );
     fs::write(&b_spec, bytes).unwrap();
 
     let observer_ready = tmp.path().join("observer-ready");

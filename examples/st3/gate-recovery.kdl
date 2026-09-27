@@ -1,0 +1,19 @@
+version 2
+
+// A complete mechanical gate: an absolute shell path, a checked script, and a step timeout longer
+// than the gate's time limit. WRITE-A-GATE-THAT-WORKS.md runs it.
+
+mission "example/catalog-gate" state="ready" {
+  completion { when "all-steps-exhausted" }
+  goal "Verify the invented catalog index with one bounded mechanical gate."
+
+  step "verify-index" timeout="2m" {
+    agentless
+    gate "the catalog index has the expected heading" {
+      exec "/bin/bash verify-catalog-index.sh"
+      host "local"
+      workspace "${ST_WORKSPACE}"
+      time-limit "1m"
+    }
+  }
+}

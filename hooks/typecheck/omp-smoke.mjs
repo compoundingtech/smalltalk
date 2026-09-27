@@ -11,6 +11,8 @@ import path from "node:path";
 // tell a working producer from one that writes nothing at all.
 const dir = fs.mkdtempSync(path.join(os.tmpdir(), "st2-omp-smoke-"));
 const framesPath = path.join(dir, "frames.jsonl");
+// Lines appended here are what the channel sends the extension, as `message` frames do.
+const outboxPath = path.join(dir, "outbox.jsonl");
 const recorder = path.join(dir, "recorder");
 fs.writeFileSync(
   recorder,
@@ -19,6 +21,20 @@ import fs from "node:fs";
 process.stdout.write(JSON.stringify({ type: "hello", protocol: 1, sessionContext: "" }) + "\\n");
 process.stdin.setEncoding("utf8");
 process.stdin.on("data", (chunk) => fs.appendFileSync(${JSON.stringify(framesPath)}, chunk));
+process.stdin.on("end", () => process.exit(0));
+let sent = 0;
+setInterval(() => {
+  let outbox = "";
+  try {
+    outbox = fs.readFileSync(${JSON.stringify(outboxPath)}, "utf8");
+  } catch {
+    return;
+  }
+  if (outbox.length > sent) {
+    process.stdout.write(outbox.slice(sent));
+    sent = outbox.length;
+  }
+}, 10);
 `,
   { mode: 0o755 },
 );
@@ -39,8 +55,13 @@ const mod = await import("./smoke-out/omp-channel.mjs");
 assert.strictEqual(typeof mod.default, "function", "extension exports its entry point");
 
 const handlers = new Map();
+// Every message the extension hands to omp, with the options it chose.
+const handedOver = [];
 const pi = {
   on: (name, handler) => handlers.set(name, handler),
+  sendUserMessage: (content, options) => {
+    handedOver.push(options === undefined ? { content } : { content, options });
+  },
 };
 mod.default(pi);
 for (const name of [
@@ -242,6 +263,103 @@ assert.deepStrictEqual(
   ],
   "terminal error must emit the typed turn result and stay actionable",
 );
+
+// Mail that arrives while omp runs a turn is held until the tool batch's last result, where omp
+// injects a steer anyway, so omp never backgrounds a command for it (`HOLD_MAX_MS` in
+// omp-channel.ts). Each case sends message frames through the channel and reads what the extension
+// hands to omp and what it acknowledges.
+let holdIdle = false;
+const holdCtx = { ...fullCtx, isIdle: () => holdIdle };
+const pause = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+let mailSequence = 0;
+const sendMail = (content) => {
+  mailSequence += 1;
+  const frame = {
+    type: "message",
+    deliverAs: "steer",
+    content,
+    meta: { messageId: `message/hold-${mailSequence}` },
+  };
+  fs.appendFileSync(outboxPath, JSON.stringify(frame) + "\n");
+};
+const acknowledged = () =>
+  readFrames()
+    .filter((frame) => frame.type === "delivered")
+    .map((frame) => frame.meta?.messageId);
+const toolCall = (id) =>
+  handlers.get("tool_call")({ toolName: "bash", toolCallId: id, input: {} }, holdCtx);
+const toolResult = (id) =>
+  handlers.get("tool_result")({ toolName: "bash", toolCallId: id }, holdCtx);
+await handlers.get("session_start")({}, holdCtx);
+
+// Measured failure: a steer that arrived while the model streamed backgrounded the next batch's
+// commands as they started. Mail now waits for the whole batch and is steered as its last call
+// returns, inside the awaited handler, so omp finds it at that same boundary. omp injects one
+// queued steer per boundary, so mail released together is one steer: a second one would wait
+// through the next model turn and background that turn's batch.
+await handlers.get("agent_start")({}, holdCtx);
+sendMail("while streaming");
+sendMail("also while streaming");
+await pause(200);
+assert.deepStrictEqual(handedOver, [], "mail during a running turn is held, not steered at once");
+await toolCall("batch-a");
+await toolCall("batch-b");
+await toolResult("batch-a");
+await pause(50);
+assert.deepStrictEqual(handedOver, [], "held while any call of the batch is in flight");
+await toolResult("batch-b");
+assert.deepStrictEqual(
+  handedOver,
+  [{ content: "while streaming\n\nalso while streaming", options: { deliverAs: "steer" } }],
+  "one steer by the time the batch's last tool_result handler returns",
+);
+await pause(100);
+assert.deepStrictEqual(
+  acknowledged(),
+  ["message/hold-1", "message/hold-2"],
+  "each message is acknowledged once omp has it",
+);
+
+// Mail held to the end of a run is handed over at `agent_end`, exactly as a message arriving then
+// would be. This context is not yet idle there, so it is a steer.
+sendMail("during the final answer");
+await pause(200);
+assert.strictEqual(handedOver.length, 1, "held while the model writes its final answer");
+await handlers.get("agent_end")(successfulEnd, holdCtx);
+await pause(20);
+assert.deepStrictEqual(handedOver.at(-1), {
+  content: "during the final answer",
+  options: { deliverAs: "steer" },
+});
+
+holdIdle = true;
+sendMail("while idle");
+await pause(200);
+assert.deepStrictEqual(handedOver.at(-1), { content: "while idle" }, "idle mail is not held");
+
+// A long command delays mail by at most the cap. Then it is steered as before, and omp
+// backgrounds the command.
+holdIdle = false;
+await handlers.get("agent_start")({}, holdCtx);
+await toolCall("long-command");
+sendMail("behind a long command");
+await pause(9_000);
+assert.strictEqual(handedOver.length, 3, "held behind a running command until the cap");
+await pause(1_500);
+assert.deepStrictEqual(
+  handedOver.at(-1),
+  { content: "behind a long command", options: { deliverAs: "steer" } },
+  "released by the cap",
+);
+await toolResult("long-command");
+await handlers.get("agent_end")(successfulEnd, holdCtx);
+await pause(100);
+assert.deepStrictEqual(
+  acknowledged(),
+  ["message/hold-1", "message/hold-2", "message/hold-3", "message/hold-4", "message/hold-5"],
+  "every message is acknowledged exactly once",
+);
+fs.rmSync(outboxPath, { force: true });
 
 // `session_shutdown` has no reason field upstream and always denotes process exit. Closing must
 // make a later observational frame a no-op.

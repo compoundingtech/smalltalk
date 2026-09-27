@@ -57,7 +57,11 @@ fn receipt(output: &Output) -> serde_json::Value {
 fn address_is_set_changed_and_cleared_with_a_classified_receipt() {
     let temporary = tempfile::tempdir().unwrap();
     let root = temporary.path();
-    write(root, "h/alpha/agent.kdl", &declaration("alpha", "h", "catalog", ""));
+    write(
+        root,
+        "h/alpha/agent.kdl",
+        &declaration("alpha", "h", "catalog", ""),
+    );
 
     let set = address(
         root,
@@ -71,7 +75,10 @@ fn address_is_set_changed_and_cleared_with_a_classified_receipt() {
     );
     let set = receipt(&set);
     assert_eq!(set["result"], "changed");
-    assert_eq!(set["id"], "h.alpha", "the immutable ID is what did not change");
+    assert_eq!(
+        set["id"], "h.alpha",
+        "the immutable ID is what did not change"
+    );
     assert_eq!(set["identity"], "h.alpha");
     assert_eq!(set["address"], "ops.alpha");
     assert_eq!(set["busAddress"], "h.ops.alpha");
@@ -117,7 +124,12 @@ fn address_is_set_changed_and_cleared_with_a_classified_receipt() {
 fn a_cutover_rewrites_only_the_address_and_preserves_every_other_byte() {
     let temporary = tempfile::tempdir().unwrap();
     let root = temporary.path();
-    let original = declaration("alpha", "h", "catalog", "  id \"0199b8f4-8d3a-7c21-9a44-6f85b7320ea1\"\n");
+    let original = declaration(
+        "alpha",
+        "h",
+        "catalog",
+        "  id \"0199b8f4-8d3a-7c21-9a44-6f85b7320ea1\"\n",
+    );
     write(root, "h/alpha/agent.kdl", &original);
 
     assert!(
@@ -149,17 +161,25 @@ fn a_cutover_rewrites_only_the_address_and_preserves_every_other_byte() {
 fn a_colliding_address_refuses_on_the_same_host_and_is_admitted_on_another() {
     let temporary = tempfile::tempdir().unwrap();
     let root = temporary.path();
-    write(root, "h/alpha/agent.kdl", &declaration("alpha", "h", "catalog", ""));
-    write(root, "h/beta/agent.kdl", &declaration("beta", "h", "catalog", ""));
-    write(root, "g/gamma/agent.kdl", &declaration("gamma", "g", "catalog", ""));
+    write(
+        root,
+        "h/alpha/agent.kdl",
+        &declaration("alpha", "h", "catalog", ""),
+    );
+    write(
+        root,
+        "h/beta/agent.kdl",
+        &declaration("beta", "h", "catalog", ""),
+    );
+    write(
+        root,
+        "g/gamma/agent.kdl",
+        &declaration("gamma", "g", "catalog", ""),
+    );
 
     // `alpha` has no explicit address, so its positional identity is its effective address — an
     // explicit-vs-fallback collision is the same collision.
-    let refused = address(
-        root,
-        &["h.beta", "alpha", "--host", "h", "--json"],
-        None,
-    );
+    let refused = address(root, &["h.beta", "alpha", "--host", "h", "--json"], None);
     assert!(!refused.status.success());
     let refused = receipt(&refused);
     assert_eq!(refused["result"], "error");
@@ -219,7 +239,11 @@ fn clearing_refuses_when_the_identity_fallback_would_collide() {
 fn address_refuses_invalid_grammar_nix_ownership_non_kdl_and_ambiguity() {
     let temporary = tempfile::tempdir().unwrap();
     let root = temporary.path();
-    write(root, "h/alpha/agent.kdl", &declaration("alpha", "h", "catalog", ""));
+    write(
+        root,
+        "h/alpha/agent.kdl",
+        &declaration("alpha", "h", "catalog", ""),
+    );
     write(root, "h/nix/agent.kdl", &declaration("nix", "h", "nix", ""));
     write(
         root,
@@ -227,8 +251,16 @@ fn address_refuses_invalid_grammar_nix_ownership_non_kdl_and_ambiguity() {
         "identity = \"legacy\"\nhost = \"h\"\ncommand = \"sleep 300\"\n",
     );
     // One bare identity declared on two hosts: an ordinary reference cannot name one subject.
-    write(root, "h/twin/agent.kdl", &declaration("twin", "h", "catalog", ""));
-    write(root, "g/twin/agent.kdl", &declaration("twin", "g", "catalog", ""));
+    write(
+        root,
+        "h/twin/agent.kdl",
+        &declaration("twin", "h", "catalog", ""),
+    );
+    write(
+        root,
+        "g/twin/agent.kdl",
+        &declaration("twin", "g", "catalog", ""),
+    );
 
     for (target, value, code) in [
         ("h.alpha", "Ops Alpha", "invalid-address"),
@@ -251,13 +283,21 @@ fn address_refuses_invalid_grammar_nix_ownership_non_kdl_and_ambiguity() {
 fn the_actor_guardrail_admits_a_descendant_and_refuses_a_stranger() {
     let temporary = tempfile::tempdir().unwrap();
     let root = temporary.path();
-    write(root, "h/root/agent.kdl", &declaration("root", "h", "catalog", ""));
+    write(
+        root,
+        "h/root/agent.kdl",
+        &declaration("root", "h", "catalog", ""),
+    );
     write(
         root,
         "h/child/agent.kdl",
         &declaration("child", "h", "catalog", "  supervisor \"h.root\"\n"),
     );
-    write(root, "h/stranger/agent.kdl", &declaration("stranger", "h", "catalog", ""));
+    write(
+        root,
+        "h/stranger/agent.kdl",
+        &declaration("stranger", "h", "catalog", ""),
+    );
 
     let refused = address(
         root,
@@ -301,7 +341,9 @@ fn the_exact_id_form_selects_by_id_and_never_falls_through_to_address_lookup() {
 
     let renamed = run(
         root,
-        &["rename", "--id", "h.two", "Renamed", "--host", "h", "--json"],
+        &[
+            "rename", "--id", "h.two", "Renamed", "--host", "h", "--json",
+        ],
         None,
     );
     assert!(
@@ -384,7 +426,15 @@ fn the_exact_id_form_serves_declaration_and_route_resolution_alike() {
     // Declaration side: the authoring receipt names the declaration, not the address.
     let described = run(
         root,
-        &["describe", "--id", "h.one", "Owns chat", "--host", "h", "--json"],
+        &[
+            "describe",
+            "--id",
+            "h.one",
+            "Owns chat",
+            "--host",
+            "h",
+            "--json",
+        ],
         None,
     );
     assert!(
@@ -407,11 +457,7 @@ fn the_exact_id_form_serves_declaration_and_route_resolution_alike() {
     );
     assert_eq!(String::from_utf8_lossy(&listed.stdout).trim(), "0");
 
-    let status = run(
-        root,
-        &["status", "--id", "h.one", "--host", "h"],
-        None,
-    );
+    let status = run(root, &["status", "--id", "h.one", "--host", "h"], None);
     assert!(
         status.status.success(),
         "stderr:\n{}",

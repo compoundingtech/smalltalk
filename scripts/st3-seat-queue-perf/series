@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# Alternate base and branch measurement windows, one daemon at a time.
+#
+# Usage: series BASE_ST3 BRANCH_ST3 FIXTURE_ROOT OUT [PAIRS] [MINUTES] [WARMUP_MINUTES]
+set -Eeuo pipefail
+
+here="$(cd "$(dirname "$0")" && pwd)"
+source "$here/daemon.sh"
+base=$1
+branch=$2
+fixture=$3
+out=$4
+pairs=${5:-2}
+minutes=${6:-30}
+warmup=${7:-5}
+
+for pair in $(seq 1 "$pairs"); do
+  for label in base branch; do
+    binary=$base
+    [[ $label == branch ]] && binary=$branch
+    root="$(mktemp -d /tmp/sqp.XXXXXX)"
+    echo "$(date -u +%FT%TZ) start $label-$pair"
+    "$here/window" "$label" "$binary" "$fixture" "$root" "$out/$label-$pair" "$minutes" "$warmup"
+    rm -rf "$root" "$(perf_state_dir "$root")"
+    echo "$(date -u +%FT%TZ) end $label-$pair"
+  done
+done
+python3 "$here/summarize.py" "$out"

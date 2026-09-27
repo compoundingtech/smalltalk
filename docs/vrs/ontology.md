@@ -252,7 +252,7 @@ Authority: [05-harness-state requirements OHS-R11–OHS-R15](05-harness-state/re
 
 ### diagnostic stage
 
-One closed native-driver boundary at which a diagnostic is observed:
+One closed native-driver boundary at which a diagnostic is observed: launch,
 version gate, API gate, event stream, state seed, delivery, or read-back. A
 stage owns its bounded reasons and sources; a reason paired with another stage
 is unknown evidence rather than a best-effort match.
@@ -266,6 +266,16 @@ observed. The origin timestamp is durable; age is a projection and never file
 mtime.
 
 Authority: [native driver diagnostic snapshot](05-harness-state/spec.md#native-driver-diagnostic-snapshot-ohs-r11ohs-r16)
+
+### known-safe driver fallback
+
+A single bounded launch or resume retry that deliberately omits a rejected
+provider option so the agent remains reachable. It is degraded mode, not proof
+that the declaration took effect: the wrapper records the cause and the native
+driver diagnostic remains visible until a later exact-policy boot recovers it.
+
+Authority: [05-harness-state requirements OHS-R14](05-harness-state/requirements.md);
+[native driver diagnostic snapshot](05-harness-state/spec.md#native-driver-diagnostic-snapshot-ohs-r11ohs-r16)
 
 ### harness context record
 
@@ -777,7 +787,7 @@ outside this family entirely.
   reason. `unknown` is a value, not a failure, and st2 never infers a trigger a
   harness did not state.
 - Use [message](../../src/message.rs) for the durable record and
-  [DING](../../src/ding/mod.rs) for its terminal notification.
+  [PING](../../src/ding/mod.rs) for its terminal notification.
 - Qualify **event**: a bare *event* in stream context is the durable
   [event](04-stream/requirements.md) record; the R13–R15 filesystem-watcher
   usage is a **watcher event**. New requirements text keeps the qualification.

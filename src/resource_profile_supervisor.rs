@@ -10,7 +10,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant, SystemTime};
+#[cfg(feature = "wasip2-provider-runtime")]
+use std::time::Duration;
+use std::time::{Instant, SystemTime};
 
 use agent_spec::profile::{
     ProfileCapability, ProfileDescriptor, ResourceProfileRegistry, RuntimeTopology,
@@ -43,10 +45,12 @@ use crate::resource_observe::{
 };
 use crate::resource_profile::{
     AcceptedObservation, AcceptedOutput, AcceptedPublication, BindingId, BindingRegistration,
-    CatchUp, OwnerClaim, PublicationContract, PublicationOutcome, RegistrationToken, ResourceFact,
-    RuntimeHealthState, RuntimeIncarnation, RuntimeLifecycle, RuntimeMessage, RuntimeOwner,
-    SnapshotDigest, SnapshotTarget, TopicSelection,
+    CatchUp, PublicationContract, PublicationOutcome, RegistrationToken, ResourceFact,
+    RuntimeHealthState, RuntimeLifecycle, RuntimeMessage, RuntimeOwner, SnapshotDigest,
+    SnapshotTarget, TopicSelection,
 };
+#[cfg(any(test, feature = "wasip2-provider-runtime"))]
+use crate::resource_profile::{OwnerClaim, RuntimeIncarnation};
 
 const MAILBOX_CAPACITY: usize = 64;
 static ID_SEQUENCE: AtomicU64 = AtomicU64::new(1);
@@ -295,6 +299,7 @@ fn catch_observation(
 struct ProviderComponentSnapshot {
     relative: PathBuf,
     identity: String,
+    #[cfg_attr(not(feature = "wasip2-provider-runtime"), allow(dead_code))]
     bytes: Arc<[u8]>,
 }
 
@@ -564,7 +569,8 @@ impl Worker {
         this_host: String,
         request_dir: PathBuf,
         receipt_dir: PathBuf,
-        completion_tx: SyncSender<Msg>,
+        #[cfg(feature = "wasip2-provider-runtime")] completion_tx: SyncSender<Msg>,
+        #[cfg(not(feature = "wasip2-provider-runtime"))] _completion_tx: SyncSender<Msg>,
     ) -> Self {
         Self {
             catalog_root,
@@ -1268,6 +1274,7 @@ struct ActiveBinding {
     catch_up: CatchUp,
     health: ResourceProfileHealth,
     demand: DemandState,
+    #[cfg_attr(not(feature = "wasip2-provider-runtime"), allow(dead_code))]
     revision: u64,
 }
 
@@ -1298,6 +1305,7 @@ struct DemandSettlement {
 struct PendingDemand {
     request: ObserveRequest,
     request_path: PathBuf,
+    #[cfg_attr(not(feature = "wasip2-provider-runtime"), allow(dead_code))]
     queued_at: SystemTime,
     last_status: Option<ObserveReceiptStatus>,
 }
@@ -1805,6 +1813,7 @@ impl RuntimeProcess {
         }
     }
 
+    #[cfg_attr(not(feature = "wasip2-provider-runtime"), allow(dead_code))]
     fn accept(
         &mut self,
         message: RuntimeMessage,
@@ -1922,6 +1931,7 @@ impl RuntimeProcess {
     fn stop(&mut self) {}
 }
 
+#[cfg_attr(not(feature = "wasip2-provider-runtime"), allow(dead_code))]
 fn process_publication(
     bindings: &mut BTreeMap<String, ActiveBinding>,
     publication: AcceptedPublication<'_>,
@@ -2034,6 +2044,7 @@ fn retry_settled_demand(
     errors
 }
 
+#[allow(clippy::too_many_arguments)]
 fn settle_active_demand(
     request_dir: &Path,
     receipt_dir: &Path,
@@ -2174,6 +2185,7 @@ fn profile_generation(
     )
 }
 
+#[cfg_attr(not(feature = "wasip2-provider-runtime"), allow(dead_code))]
 fn emit_pending(
     catalog_root: &Path,
     this_host: &str,

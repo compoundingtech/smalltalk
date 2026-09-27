@@ -71,7 +71,6 @@ impl AddressBookEntry {
             address: spec.effective_address().to_owned(),
         }
     }
-
 }
 
 /// Why an ordinary reference did not name exactly one subject.
@@ -265,7 +264,10 @@ mod tests {
 
     #[test]
     fn a_bare_address_resolves_within_the_selected_catalog() {
-        let entries = vec![entry("id-1", "dev3", "chat"), entry("id-2", "dev4", "notes")];
+        let entries = vec![
+            entry("id-1", "dev3", "chat"),
+            entry("id-2", "dev4", "notes"),
+        ];
         assert_eq!(resolve_address(&entries, "chat", None).unwrap().id, "id-1");
         assert_eq!(resolve_address(&entries, "notes", None).unwrap().id, "id-2");
     }
@@ -424,10 +426,7 @@ mod tests {
             Err(ResolveError::Unknown { .. })
         ));
         // Both immutable keys still name the subject exactly.
-        for key in [
-            "0199b8f4-8d3a-7c21-9a44-6f85b7320ea1",
-            "dev3.verifier",
-        ] {
+        for key in ["0199b8f4-8d3a-7c21-9a44-6f85b7320ea1", "dev3.verifier"] {
             assert_eq!(
                 resolve(&entries, &AgentSelector::Id(key.to_owned()), None)
                     .unwrap()
@@ -461,5 +460,4 @@ mod tests {
         );
         assert!(resolve(&entries, &AgentSelector::Id("chat".to_owned()), None).is_err());
     }
-
 }

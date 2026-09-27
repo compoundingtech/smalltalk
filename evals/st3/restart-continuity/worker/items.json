@@ -1,0 +1,8 @@
+{
+  "items": [
+    { "id": "item-1", "command": "upper",   "input": "hello",   "expect": "HELLO",   "desc": "uppercase the input string" },
+    { "id": "item-2", "command": "reverse", "input": "abc",     "expect": "cba",     "desc": "reverse the input string" },
+    { "id": "item-3", "command": "exclaim", "input": "hi",      "expect": "hi!",     "desc": "append an exclamation mark" },
+    { "id": "item-4", "command": "dashify", "input": "a b c",   "expect": "a-b-c",   "desc": "replace spaces with dashes" }
+  ]
+}
