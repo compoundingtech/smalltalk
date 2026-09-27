@@ -16,7 +16,8 @@ cost is acceptable; if not, the branch's additions to the reconcile loop are whe
 
 - **For merging:** the seat queue works with live agents. 16 of the 18 runs last night on Claude,
   Codex and omp seats passed. One Claude seat never reached idle before any work existed. One omp
-  run is void because the agent re-declared its own seat, and `16aa754` now refuses that. No seat
+  run is void because the agent re-declared its own seat. The later authority fix refuses an
+  agent's seat declaration unless a person granted `seat-authority`. No seat
   claimed out of order, preempted a held claim, or used terminal input. The reads are cheap.
 - **The overnight wakeups are shared, not added.** With every seat's read in step, base and the
   branch head both switch about 19,000 times a minute and use 0.89 to 0.90 s of CPU a minute.

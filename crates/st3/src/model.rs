@@ -533,6 +533,27 @@ impl QueueAuthority {
     }
 }
 
+/// Top-level seats an agent may declare or stop, granted by a person.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct SeatAuthority {
+    pub declare: Vec<String>,
+    pub stop: Vec<String>,
+}
+
+impl SeatAuthority {
+    pub fn allows(&self, action: &str, seat: &str) -> bool {
+        let seat = seat.strip_prefix("agent/").unwrap_or(seat);
+        let patterns = match action {
+            "declare" => &self.declare,
+            "stop" => &self.stop,
+            _ => return false,
+        };
+        patterns
+            .iter()
+            .any(|pattern| authority_pattern_matches(pattern, seat))
+    }
+}
+
 /// An authority pattern is an exact ID or a terminal `/*` namespace.
 fn authority_pattern_matches(pattern: &str, id: &str) -> bool {
     pattern == id
