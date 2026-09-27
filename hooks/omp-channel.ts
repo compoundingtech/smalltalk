@@ -41,8 +41,7 @@ const HELLO_TIMEOUT_MS = 5000;
 // the batch's last `tool_call` returns its `tool_result` (omp announces every call of a batch
 // before any runs, and awaits the handler), or when the run ends. Either way it lands where the
 // steer would have. A message never waits longer than this behind a running tool call: a longer
-// command is backgrounded as before. It is under st3's 15-second work-wake retry, so a held wake
-// is acknowledged before st3 sends another.
+// command is backgrounded as before. It was chosen below st3's 15-second work-wake retry.
 const HOLD_MAX_MS = 10_000;
 
 type Frame = {
