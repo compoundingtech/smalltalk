@@ -81,6 +81,17 @@ recorded inside that runtime epoch.
 A daemon restart observes the PTY and exec registries. It adopts a matching survivor and starts only
 a missing desired member. Final work and explicit cancellation stop owned members.
 
+A Claude harness can stop at a screen that no hook reports: an expired login or the workspace trust
+prompt. The reconciler reads the terminal screen for both. Either one fences that incarnation as not
+ready with its reason (`providerAuth` or `providerTrustPrompt`). A login needs a person. A trust
+prompt does not: the reconciler stops that exact incarnation and starts a replacement, whose driver
+admits the workspace again before Claude starts. Nothing is typed into the terminal. After three
+trust prompts in ten minutes the reconciler stops replacing the seat and asks the operator.
+
+The driver admits a workspace under Claude's own config lock (`.claude.json.lock`). Every Claude
+process re-reads and replaces `.claude.json` under that lock, so no running Claude can publish an
+older copy of the config that lacks the new workspace.
+
 Native harnesses receive the same generated `.st3/boot.md`. A harness prompt can add stable
 repository context. It cannot replace the runtime contract.
 

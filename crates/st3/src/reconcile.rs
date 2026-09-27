@@ -32,10 +32,36 @@ const WORK_WAKE_MAX_ATTEMPTS: u32 = 3;
 const WORK_WAKE_EXHAUST_GRACE_MS: u128 = 5 * 60_000;
 const CODEX_CRASH_LOOP_ATTEMPTS: usize = 3;
 const CODEX_CRASH_LOOP_INTERVAL_MS: u128 = 5 * 60_000;
+// Claude shows its workspace trust prompt within a few seconds of starting. Rechecking the screen
+// on this grid until readiness finds it well before the readiness deadline.
+const CLAUDE_TRUST_SCREEN_RECHECK_MS: u128 = 2_000;
+const CLAUDE_TRUST_RECOVERY_ATTEMPTS: usize = 3;
+const CLAUDE_TRUST_RECOVERY_WINDOW_MS: u128 = 10 * 60_000;
 
 fn claude_login_expired(screen: &str) -> bool {
     screen.contains("Login expired · Please run /login")
         || screen.contains("Not logged in · Run /login")
+}
+
+/// Claude's workspace trust dialog as `pty peek --plain` renders it. Every phrase must be present,
+/// so a transcript that quotes one of them is not mistaken for the dialog. Whitespace is collapsed
+/// because the question wraps with the terminal width.
+fn claude_trust_prompt(screen: &str) -> bool {
+    let screen = screen.split_whitespace().collect::<Vec<_>>().join(" ");
+    [
+        "Accessing workspace:",
+        "Quick safety check: Is this a project you created or one you trust?",
+        "Yes, I trust this folder",
+    ]
+    .iter()
+    .all(|phrase| screen.contains(phrase))
+}
+
+fn claim_incarnation(claim: &crate::model::ClaimRecord) -> Option<&str> {
+    claim
+        .body
+        .pointer("/fields/incarnation_id")
+        .and_then(Value::as_str)
 }
 
 fn provider_capacity_retry_key(claim_id: &str) -> String {
@@ -661,6 +687,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                 Some(observation) if observation.status == "running" => {
                     self.record_member(subject, &observation, true)?;
                     self.reconcile_claude_auth_screen(subject, member, &observation)?;
+                    self.reconcile_claude_trust_screen(subject, member, &observation, now_ms())?;
                     self.reconcile_driver_readiness(subject, member, &observation, now_ms())?;
                     if subject.kind == "agent"
                         && let Some(incarnation) = observation.incarnation_id.as_deref()
@@ -681,7 +708,11 @@ impl<R: RuntimeControl> Reconciler<R> {
                         RestartType::OnFailure => observation.exit_code != Some(0),
                         RestartType::Never => false,
                     };
-                    if restart && member.lifecycle == MemberLifecycle::Service {
+                    // A trust-prompt recovery stopped this incarnation in order to replace it,
+                    // whatever the member's own exit policy says.
+                    let recovering =
+                        self.claude_trust_recovery_stopped(&subject.subject, &observation)?;
+                    if (restart || recovering) && member.lifecycle == MemberLifecycle::Service {
                         self.reconcile_restart(subject, member, &observation)?;
                     }
                 }
@@ -929,21 +960,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             return Ok(());
         }
 
-        let runtime_claim = self
-            .store
-            .claims_for(&subject.subject, Some("runtime.observed"))?
-            .into_iter()
-            .rev()
-            .find(|claim| {
-                claim
-                    .body
-                    .pointer("/fields/incarnation_id")
-                    .and_then(Value::as_str)
-                    == Some(incarnation)
-                    && claim.body.pointer("/fields/status").and_then(Value::as_str)
-                        == Some("running")
-            });
-        let Some(runtime_claim) = runtime_claim else {
+        let Some(runtime_claim) = self.running_runtime_claim(&subject.subject, incarnation)? else {
             return Ok(());
         };
         let deadline = runtime_claim
@@ -1112,6 +1129,176 @@ impl<R: RuntimeControl> Reconciler<R> {
         })?;
         self.signal_changed();
         Ok(())
+    }
+
+    /// Claude's workspace trust prompt appears before any hook or channel can report the session,
+    /// so the terminal screen is the only evidence of it. The prompt fences the incarnation as not
+    /// ready with its reason. Recovery stops that exact incarnation so its replacement's driver
+    /// admits the workspace again; nobody types into the terminal. Repeated prompts go to a person.
+    fn reconcile_claude_trust_screen(
+        &self,
+        subject: &DesiredSubject,
+        member: &MemberSpec,
+        observation: &RuntimeObservation,
+        now: u128,
+    ) -> Result<()> {
+        if subject.kind != "agent" || member.driver.as_deref() != Some("claude") || !member.terminal
+        {
+            return Ok(());
+        }
+        let Some(incarnation) = observation.incarnation_id.as_deref() else {
+            return Ok(());
+        };
+        let mut prompts = self.claude_trust_prompts(&subject.subject)?;
+        if !prompts
+            .iter()
+            .any(|claim| claim_incarnation(claim) == Some(incarnation))
+        {
+            // The prompt precedes readiness, and a ready session may be quoting it.
+            if self
+                .store
+                .harness_was_ready(&subject.subject, incarnation)?
+            {
+                return Ok(());
+            }
+            let Some(runtime_claim) = self.running_runtime_claim(&subject.subject, incarnation)?
+            else {
+                return Ok(());
+            };
+            let Ok(screen) = self.runtime.screen(&member.runtime_id) else {
+                return Ok(());
+            };
+            if !claude_trust_prompt(&screen) {
+                let deadline = runtime_claim
+                    .accepted_at_unix_ms
+                    .saturating_add(HARNESS_READINESS_DEADLINE_MS);
+                if now < deadline {
+                    // One grid point per interval, so repeated passes share a single timer.
+                    let next =
+                        (now / CLAUDE_TRUST_SCREEN_RECHECK_MS + 1) * CLAUDE_TRUST_SCREEN_RECHECK_MS;
+                    self.arm_restart(&format!("trust-screen:{}", subject.subject), next);
+                }
+                return Ok(());
+            }
+            prompts.push(self.store.append_claim(&ClaimInput {
+                subject: subject.subject.clone(),
+                kind: "harness.diagnostic".into(),
+                actor: Some(subject.subject.clone()),
+                fields: BTreeMap::from([
+                    ("severity".into(), Value::String("error".into())),
+                    ("status".into(), Value::String("blocked".into())),
+                    ("code".into(), Value::String("provider-trust-prompt".into())),
+                    ("reason".into(), Value::String("Claude is waiting at its workspace trust prompt and cannot accept work; st3 replaces this incarnation so its driver admits the workspace again".into())),
+                    ("incarnation_id".into(), Value::String(incarnation.into())),
+                ]),
+                evidence: vec![runtime_claim.id],
+                expected_subject: None,
+                idempotency_key: Some(format!(
+                    "claude-trust-prompt:{}:{incarnation}",
+                    subject.subject
+                )),
+            })?);
+            self.signal_changed();
+        }
+        let recent = prompts
+            .iter()
+            .filter(|claim| {
+                now.saturating_sub(claim.accepted_at_unix_ms) < CLAUDE_TRUST_RECOVERY_WINDOW_MS
+            })
+            .count();
+        if recent > CLAUDE_TRUST_RECOVERY_ATTEMPTS {
+            let key = format!(
+                "claude-trust-prompt-repeated:{}:{incarnation}",
+                subject.subject
+            );
+            let digest = hex::encode(sha2::Sha256::digest(key.as_bytes()));
+            let attention_subject = format!("attention/{}", &digest[..32]);
+            if self.store.attention_request(&attention_subject)?.is_none() {
+                self.store.request_attention(
+                    &attention_subject,
+                    &AttentionRequest {
+                        reviewer: "person/operator".into(),
+                        title: "Claude keeps stopping at its workspace trust prompt".into(),
+                        reason: format!(
+                            "{} on {} reached Claude's workspace trust prompt {recent} times in {} minutes, so st3 stopped replacing it. Check that its driver can record the workspace trust in the Claude config, then restart the seat.",
+                            subject.subject,
+                            self.host,
+                            CLAUDE_TRUST_RECOVERY_WINDOW_MS / 60_000
+                        ),
+                        severity: "error".into(),
+                        targets: vec![subject.subject.clone()],
+                        actor: "agent/st3/reconciler".into(),
+                        idempotency_key: format!("{key}:requested"),
+                    },
+                )?;
+                self.signal_changed();
+            }
+            return Ok(());
+        }
+        self.reconcile_runtime_stop(
+            &subject.subject,
+            &member.runtime_id,
+            member.terminal,
+            Some(incarnation),
+            member.shutdown_timeout_ms,
+            Some(observation),
+        )?;
+        Ok(())
+    }
+
+    /// Whether a trust-prompt recovery stopped this exited incarnation.
+    fn claude_trust_recovery_stopped(
+        &self,
+        subject: &str,
+        observation: &RuntimeObservation,
+    ) -> Result<bool> {
+        let Some(incarnation) = observation.incarnation_id.as_deref() else {
+            return Ok(false);
+        };
+        if !self
+            .claude_trust_prompts(subject)?
+            .iter()
+            .any(|claim| claim_incarnation(claim) == Some(incarnation))
+        {
+            return Ok(false);
+        }
+        Ok(self
+            .store
+            .claims_for(subject, Some("runtime.action.requested"))?
+            .iter()
+            .any(|claim| {
+                claim.body.pointer("/fields/action").and_then(Value::as_str) == Some("terminate")
+                    && claim_incarnation(claim) == Some(incarnation)
+            }))
+    }
+
+    fn claude_trust_prompts(&self, subject: &str) -> Result<Vec<crate::model::ClaimRecord>> {
+        Ok(self
+            .store
+            .claims_for(subject, Some("harness.diagnostic"))?
+            .into_iter()
+            .filter(|claim| {
+                claim.body.pointer("/fields/code").and_then(Value::as_str)
+                    == Some("provider-trust-prompt")
+            })
+            .collect())
+    }
+
+    fn running_runtime_claim(
+        &self,
+        subject: &str,
+        incarnation: &str,
+    ) -> Result<Option<crate::model::ClaimRecord>> {
+        Ok(self
+            .store
+            .claims_for(subject, Some("runtime.observed"))?
+            .into_iter()
+            .rev()
+            .find(|claim| {
+                claim_incarnation(claim) == Some(incarnation)
+                    && claim.body.pointer("/fields/status").and_then(Value::as_str)
+                        == Some("running")
+            }))
     }
 
     fn reconcile_work_messages(&self, agent: &str, incarnation: &str) -> Result<()> {
@@ -7973,6 +8160,42 @@ mod tests {
             "Please use /login to switch accounts"
         ));
     }
+
+    /// Claude Code 2.1.283's trust dialog as `pty peek --plain` rendered it at 80 columns.
+    const CLAUDE_TRUST_SCREEN: &str = "\
+────────────────────────────────────────────────────────────────────────────────
+ Accessing workspace:
+
+ /home/example/src/demo-project--feature-branch-with-a-long-worktree-name/nested
+ /workspace
+
+ Quick safety check: Is this a project you created or one you trust? (Like your
+ own code, a well-known open source project, or work from your team). If not,
+ take a moment to review what's in this folder first.
+
+ Claude Code'll be able to read, edit, and execute files here.
+
+ Security guide
+
+ ❯ No, exit
+   Yes, I trust this folder
+
+ Enter to confirm · Esc to cancel
+";
+
+    #[test]
+    fn claude_trust_screen_recognizes_only_the_whole_dialog() {
+        assert!(super::claude_trust_prompt(CLAUDE_TRUST_SCREEN));
+        // The question wraps at a narrower terminal width.
+        assert!(super::claude_trust_prompt(&CLAUDE_TRUST_SCREEN.replace(
+            "one you trust? (Like your\n own code",
+            "one\n you trust? (Like\n your own code"
+        )));
+        assert!(!super::claude_trust_prompt(
+            "> Why did the seat stop at \"Yes, I trust this folder\"?"
+        ));
+        assert!(!super::claude_trust_prompt("╭─ Claude Code ─╮\n> "));
+    }
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -8026,6 +8249,7 @@ mod tests {
         kills: Mutex<Vec<String>>,
         removes: Mutex<Vec<String>>,
         screen: Mutex<String>,
+        screens: Mutex<HashMap<String, String>>,
         keys: Mutex<Vec<String>>,
     }
 
@@ -8085,8 +8309,12 @@ mod tests {
         fn attach(&self, _runtime_id: &str) -> Result<()> {
             Ok(())
         }
-        fn screen(&self, _runtime_id: &str) -> Result<String> {
-            Ok(self.screen.lock().unwrap().clone())
+        fn screen(&self, runtime_id: &str) -> Result<String> {
+            let screens = self.screens.lock().unwrap();
+            Ok(screens
+                .get(runtime_id)
+                .cloned()
+                .unwrap_or_else(|| self.screen.lock().unwrap().clone()))
         }
         fn send_key(&self, _runtime_id: &str, key: &str) -> Result<()> {
             self.keys.lock().unwrap().push(key.into());
@@ -14181,6 +14409,174 @@ version 2
                 .unwrap()["status"],
             "healthy"
         );
+    }
+
+    fn claude_seat_pty(seat: &str, status: &str, incarnation: &str) -> RuntimeObservation {
+        RuntimeObservation {
+            runtime_id: format!("node.{seat}"),
+            terminal: true,
+            status: status.into(),
+            exit_code: (status == "exited").then_some(143),
+            incarnation_id: Some(incarnation.into()),
+        }
+    }
+
+    /// Three Claude seats start at once and two stop at the workspace trust prompt, as on
+    /// 2026-09-27. Each blocked seat is reported not ready with the reason and replaced without
+    /// anyone typing into its terminal, even under `restart "never"`. The seat that started
+    /// normally is left alone.
+    #[test]
+    fn claude_seats_at_the_trust_prompt_are_reported_and_replaced_without_terminal_input() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        let workspace = tempfile::tempdir().unwrap();
+        let workspace = workspace.path().display().to_string();
+        let source = format!(
+            "version 2\n\
+             agent \"seat-a\" {{ workspace {workspace:?}; harness \"claude\" {{ prompt \"Work.\" }} }}\n\
+             agent \"seat-b\" {{ workspace {workspace:?}; harness \"claude\" {{ prompt \"Work.\" }} }}\n\
+             agent \"seat-c\" {{ workspace {workspace:?}; restart \"never\"; harness \"claude\" {{ prompt \"Work.\" }} }}\n"
+        );
+        apply_source(&store, &source, "claude-trust-prompt");
+        let runtime = Arc::new(FakeRuntime::default());
+        *runtime.screen.lock().unwrap() = "╭─ Claude Code ─╮\n> ".into();
+        let reconciler = Reconciler::new(
+            store.clone(),
+            runtime.clone(),
+            "node".into(),
+            Arc::new(Notify::new()),
+        );
+        reconciler.reconcile_once().unwrap();
+        assert_eq!(runtime.starts.lock().unwrap().len(), 3);
+
+        *runtime.ptys.lock().unwrap() = vec![
+            claude_seat_pty("seat-a", "running", "a-one"),
+            claude_seat_pty("seat-b", "running", "b-one"),
+            claude_seat_pty("seat-c", "running", "c-one"),
+        ];
+        runtime.screens.lock().unwrap().extend([
+            ("node.seat-b".to_owned(), CLAUDE_TRUST_SCREEN.to_owned()),
+            ("node.seat-c".to_owned(), CLAUDE_TRUST_SCREEN.to_owned()),
+        ]);
+        reconciler.reconcile_once().unwrap();
+
+        for seat in ["agent/node.seat-b", "agent/node.seat-c"] {
+            let harness = store.current_harness(seat).unwrap().unwrap();
+            assert_eq!(
+                harness.reason.as_deref(),
+                Some("providerTrustPrompt"),
+                "{seat}"
+            );
+            assert!(!harness.is_ready(), "{seat}");
+        }
+        assert!(
+            store
+                .claims_for("agent/node.seat-a", Some("harness.diagnostic"))
+                .unwrap()
+                .is_empty()
+        );
+        let mut stops = runtime.stops.lock().unwrap().clone();
+        stops.sort();
+        assert_eq!(stops, ["node.seat-b", "node.seat-c"]);
+
+        // A pass while the stops are in flight repeats neither the report nor the stop.
+        reconciler.reconcile_once().unwrap();
+        assert_eq!(
+            store
+                .claims_for("agent/node.seat-b", Some("harness.diagnostic"))
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(runtime.stops.lock().unwrap().len(), 2);
+
+        *runtime.ptys.lock().unwrap() = vec![
+            claude_seat_pty("seat-a", "running", "a-one"),
+            claude_seat_pty("seat-b", "exited", "b-one"),
+            claude_seat_pty("seat-c", "exited", "c-one"),
+        ];
+        reconciler.reconcile_once().unwrap();
+        let mut replaced = runtime.starts.lock().unwrap()[3..].to_vec();
+        replaced.sort();
+        assert_eq!(replaced, ["node.seat-b", "node.seat-c"]);
+
+        runtime.screens.lock().unwrap().clear();
+        *runtime.ptys.lock().unwrap() = vec![
+            claude_seat_pty("seat-a", "running", "a-one"),
+            claude_seat_pty("seat-b", "running", "b-two"),
+            claude_seat_pty("seat-c", "running", "c-two"),
+        ];
+        reconciler.reconcile_once().unwrap();
+        store
+            .append_claim(&ClaimInput {
+                subject: "agent/node.seat-b".into(),
+                kind: "harness.observed".into(),
+                actor: Some("agent/node.seat-b".into()),
+                fields: BTreeMap::from([
+                    ("state".into(), Value::String("ready".into())),
+                    ("incarnation_id".into(), Value::String("b-two".into())),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+        assert!(
+            store
+                .current_harness("agent/node.seat-b")
+                .unwrap()
+                .unwrap()
+                .is_ready()
+        );
+        assert_eq!(runtime.stops.lock().unwrap().len(), 2);
+        assert!(
+            runtime.keys.lock().unwrap().is_empty(),
+            "recovery must never type into a terminal"
+        );
+    }
+
+    #[test]
+    fn a_claude_seat_that_keeps_reaching_the_trust_prompt_goes_to_a_person() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        let workspace = tempfile::tempdir().unwrap();
+        let source = format!(
+            "version 2\nagent \"seat\" {{ workspace {:?}; harness \"claude\" {{ prompt \"Work.\" }} }}\n",
+            workspace.path().display().to_string()
+        );
+        apply_source(&store, &source, "claude-trust-prompt-repeated");
+        let runtime = Arc::new(FakeRuntime::default());
+        *runtime.screen.lock().unwrap() = CLAUDE_TRUST_SCREEN.into();
+        let reconciler = Reconciler::new(
+            store.clone(),
+            runtime.clone(),
+            "node".into(),
+            Arc::new(Notify::new()),
+        );
+        reconciler.reconcile_once().unwrap();
+
+        for attempt in 1..=CLAUDE_TRUST_RECOVERY_ATTEMPTS + 1 {
+            let incarnation = format!("seat-{attempt}");
+            *runtime.ptys.lock().unwrap() = vec![claude_seat_pty("seat", "running", &incarnation)];
+            reconciler.reconcile_once().unwrap();
+            if attempt <= CLAUDE_TRUST_RECOVERY_ATTEMPTS {
+                *runtime.ptys.lock().unwrap() =
+                    vec![claude_seat_pty("seat", "exited", &incarnation)];
+                reconciler.reconcile_once().unwrap();
+            }
+        }
+
+        assert_eq!(
+            runtime.stops.lock().unwrap().len(),
+            CLAUDE_TRUST_RECOVERY_ATTEMPTS
+        );
+        let harness = store.current_harness("agent/node.seat").unwrap().unwrap();
+        assert_eq!(harness.reason.as_deref(), Some("providerTrustPrompt"));
+        let attention = store.attention_items(Some("person/operator")).unwrap();
+        assert_eq!(attention.len(), 1);
+        assert_eq!(
+            attention[0].title,
+            "Claude keeps stopping at its workspace trust prompt"
+        );
+        assert_eq!(attention[0].targets, ["agent/node.seat"]);
     }
 
     #[test]
