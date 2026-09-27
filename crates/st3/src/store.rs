@@ -356,6 +356,7 @@ CREATE TABLE IF NOT EXISTS local_observations (
     actor TEXT,
     body TEXT NOT NULL,
     dedupe_key TEXT,
+    request_digest TEXT,
     observed_at_unix_ms INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS local_observations_subject_kind_index
@@ -6074,18 +6075,36 @@ impl Store {
             .idempotency_key
             .as_deref()
             .map(|key| local_observation_dedupe_key(&input.kind, key));
+        let request_digest = claim_operation(input)?.map(|(_, digest)| digest);
         let mut connection = self.connection.lock().expect("store mutex poisoned");
         let transaction = connection.transaction().map_err(internal)?;
         if let Some(key) = &dedupe_key
-            && let Some(existing) = transaction
+            && let Some((existing, stored_digest)) = transaction
                 .query_row(
-                    &format!("{LOCAL_OBSERVATION_COLUMNS} WHERE dedupe_key=?1"),
+                    &format!(
+                        "SELECT id, after_store_index, subject, kind, actor, body, observed_at_unix_ms, request_digest
+                         FROM local_observations WHERE dedupe_key=?1"
+                    ),
                     [key],
-                    |row| local_observation_from_row(&self.origin, row),
+                    |row| {
+                        Ok((
+                            local_observation_from_row(&self.origin, row)?,
+                            row.get::<_, Option<String>>(7)?,
+                        ))
+                    },
                 )
                 .optional()
                 .map_err(internal)?
         {
+            // A retry must repeat the original request exactly, as for a claim.
+            if stored_digest != request_digest {
+                return Err(St3Error::new(
+                    "idempotency-mismatch",
+                    "the idempotency key already identifies a different request",
+                )
+                .with_detail("stored_digest", json!(stored_digest))
+                .with_detail("request_digest", json!(request_digest)));
+            }
             return Ok((existing, false));
         }
         for evidence in &input.evidence {
@@ -6112,8 +6131,9 @@ impl Store {
         transaction
             .execute(
                 "INSERT INTO local_observations(
-                    after_store_index, subject, kind, actor, body, dedupe_key, observed_at_unix_ms
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    after_store_index, subject, kind, actor, body, dedupe_key, request_digest,
+                    observed_at_unix_ms
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                 params![
                     after_store_index,
                     input.subject,
@@ -6121,6 +6141,7 @@ impl Store {
                     input.actor,
                     canonical_json_text(&body).map_err(internal)?,
                     dedupe_key,
+                    request_digest,
                     observed_at as i64,
                 ],
             )
@@ -27927,6 +27948,30 @@ mission "nested-work" state="ready" {
             .unwrap();
         assert!(!appended, "a repeated idempotency key records nothing new");
         assert_eq!(repeated.id, written[1].id);
+        let mut changed = timeline_observation(subject, "inc-1", "second");
+        changed.fields.insert(
+            "body".into(),
+            json!({"media_type": "text/plain", "text": "a different body"}),
+        );
+        assert_eq!(
+            store.append_claim_outcome(&changed).unwrap_err().code,
+            "idempotency-mismatch",
+            "a retry with a changed body is not silently dropped"
+        );
+        let mut elsewhere = timeline_observation("agent/node.other", "inc-1", "second");
+        elsewhere.idempotency_key =
+            timeline_observation(subject, "inc-1", "second").idempotency_key;
+        assert_eq!(
+            store.append_claim_outcome(&elsewhere).unwrap_err().code,
+            "idempotency-mismatch",
+            "a key reused for another subject does not return the first subject's row"
+        );
+        let mut unkeyed = timeline_observation(subject, "inc-1", "second");
+        unkeyed.idempotency_key = None;
+        assert!(
+            store.append_claim_outcome(&unkeyed).unwrap().1,
+            "an observation without a key is always new"
+        );
 
         assert_eq!(store.index().unwrap(), index_before, "no claim was written");
         assert!(
@@ -27943,7 +27988,10 @@ mission "nested-work" state="ready" {
         let page = store
             .timeline_claims_for_incarnation_at(subject, "inc-1", None, false, 10)
             .unwrap();
-        assert_eq!(timeline_entries(&page), ["first", "second", "third"]);
+        assert_eq!(
+            timeline_entries(&page),
+            ["first", "second", "third", "second"]
+        );
         assert_eq!(page.next_cursor, None);
 
         let replica = Store::open_memory("replica").unwrap();
@@ -27963,7 +28011,10 @@ mission "nested-work" state="ready" {
         let page = reopened
             .timeline_claims_for_incarnation_at(subject, "inc-1", None, false, 10)
             .unwrap();
-        assert_eq!(timeline_entries(&page), ["first", "second", "third"]);
+        assert_eq!(
+            timeline_entries(&page),
+            ["first", "second", "third", "second"]
+        );
         let mut with_head = timeline_observation(subject, "inc-1", "fourth");
         with_head.expected_subject = Some(None);
         assert_eq!(
