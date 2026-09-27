@@ -2356,6 +2356,20 @@ fn validate_agent_body(document: &KdlDocument, owner: &str) -> Result<(), St3Err
         "pty",
         "exec",
     ];
+    // The mission parser moves agent constraints onto the steps that select the agent. A
+    // top-level seat has no mission steps to scope them to.
+    if document
+        .nodes()
+        .iter()
+        .any(|child| child.name().value() == "constraint")
+    {
+        return Err(St3Error::new(
+            "agent-constraint-outside-mission",
+            format!(
+                "agent `{owner}` declares a constraint; only an agent declared inside a mission can scope constraints to its steps"
+            ),
+        ));
+    }
     reject_unknown_children(document, ALLOWED, "agent", owner)?;
     for child in [
         "identity",

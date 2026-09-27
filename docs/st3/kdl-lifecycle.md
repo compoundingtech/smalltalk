@@ -54,7 +54,7 @@ st3 refuses to replace a tracked `.st3/boot.md` with different bytes. The comple
 
 ## Mission constraints
 
-`constraint "TEXT"` can repeat on a mission or step. A step receives constraints from every ancestor mission and step, followed by its local constraints.
+`constraint "TEXT"` can repeat on a mission, a step, or an agent block inside a mission. A step receives constraints from every ancestor mission and step, followed by its local constraints, followed by the constraints of each agent it is assigned or available to. A rule written in an agent block binds only the steps that select that agent.
 
 A constraint states a mission-specific invariant. It must not repeat universal st3 behavior or disable harness features merely to make an eval pass.
 

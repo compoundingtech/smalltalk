@@ -465,11 +465,40 @@ Do not use source order or bullet syntax inside one string to create hidden exec
 
 ## Mission constraints
 
-A constraint states a rule that is specific to one mission or step.
+A constraint states a rule that is specific to one mission, step, or agent.
 
-A mission and a step can repeat `constraint`. An exact duplicate in one block is an error.
+A mission, a step, and an agent block inside a mission can repeat `constraint`. An exact duplicate in one block is an error.
 
-The effective order is each outer mission, its parent step, each nested mission, and the leaf step.
+A mission or step constraint binds every step inside it, whichever agent does the work. Write a rule for one agent in that agent's block:
+
+```kdl
+agent "builder" {
+  workspace "${ST_WORKSPACE}/build"
+  harness "claude" { model "claude-sonnet-5" }
+  constraint "Do not push the release branch."
+}
+
+step "build" {
+  assigned-to "agent/${ST_MISSION_RUN}/builder"
+}
+
+step "merge" {
+  assigned-to "agent/${ST_MISSION_RUN}/merger"
+  depends-on { step "build" completed }
+}
+```
+
+The builder's constraint binds `build` and not `merge`.
+
+An agent constraint applies to every step in the run whose selector names that agent: `assigned-to` the agent, or an `available-to` pool that includes it, because any agent in the pool can claim the step. It never applies to an agentless step.
+
+Name the agent by the subject its block declares, `agent/${ST_MISSION_RUN}/NAME`. Preview warns when no step selects an agent that has constraints.
+
+The effective order is each outer mission, its parent step, each nested mission, the leaf step, and then each selected agent. An agent constraint that repeats an earlier entry appears once.
+
+An agent constraint is a work rule, not runtime configuration. It is not part of the agent's runtime declaration. Changing it revises the steps that select the agent, as a step constraint does.
+
+A top-level agent seat has no mission steps, so it cannot declare a constraint. Publication fails with `agent-constraint-outside-mission`.
 
 st3 shows the effective list when an agent shows or claims work.
 
