@@ -318,7 +318,7 @@ must distinguish unavailable, ungranted, and unsupported features.
 Terminal access is a client protocol, not raw PTY ownership. The server sends screens, never PTY
 bytes: each screen is complete and replaces every earlier one, so nothing is replayed and a client
 that falls behind skips to the latest screen. Interactive attach from a terminal (`pty attach`,
-`st3 terminals attach`) is a different, privileged path that passes raw bytes.
+`st terminals attach`) is a different, privileged path that passes raw bytes.
 
 `terminal.attach` returns a short-lived, single-use stream capability and URL bound to the
 authenticated session, terminal, and runtime incarnation; `terminal.detach` idempotently invalidates
