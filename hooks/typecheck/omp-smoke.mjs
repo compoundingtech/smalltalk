@@ -305,18 +305,20 @@ assert.deepStrictEqual(
 await pause(100);
 assert.deepStrictEqual(acknowledged(), ["message/hold-1"], "acknowledged once omp has it");
 
-// Mail held to the end of a run waits for omp's idle proof and starts a turn of its own, because a
-// steer queued after omp's last queue poll would strand.
+// Mail held to the end of a run is steered at `agent_end`, where omp is not yet idle, and omp's
+// queued-message drain continues the session with it. It never waits for the idle proof: a new
+// prompt sent in omp's settle window left a measured seat working forever.
 sendMail("during the final answer");
 await pause(200);
 assert.strictEqual(handedOver.length, 1, "held while the model writes its final answer");
 await handlers.get("agent_end")(successfulEnd, holdCtx);
-await pause(250);
-assert.strictEqual(handedOver.length, 1, "not handed over before omp proves idle");
-holdIdle = true;
-await pause(300);
-assert.deepStrictEqual(handedOver.at(-1), { content: "during the final answer" });
+await pause(20);
+assert.deepStrictEqual(handedOver.at(-1), {
+  content: "during the final answer",
+  options: { deliverAs: "steer" },
+});
 
+holdIdle = true;
 sendMail("while idle");
 await pause(200);
 assert.deepStrictEqual(handedOver.at(-1), { content: "while idle" }, "idle mail is not held");

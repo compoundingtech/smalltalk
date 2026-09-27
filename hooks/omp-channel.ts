@@ -37,12 +37,12 @@ const HELLO_TIMEOUT_MS = 5000;
 // itself at once ("Backgrounded early to handle an incoming message"). In 23 cross-harness runs on
 // 2026-09-26/27, all 176 backgrounded calls started after their steer was queued, while the model
 // was still streaming; none was running when the steer arrived. One seat then repeated a send whose
-// result it never saw. So a message that arrives during a running turn is held and handed to omp
-// when the batch's last `tool_call` returns its `tool_result` (omp announces every call of a batch
-// before any runs, and awaits the handler), or once the run has ended and omp proves idle. Either
-// way it lands where the steer would have. A message never waits longer than this behind a running
-// tool call: a longer command is backgrounded as before. It is under st3's 15-second work-wake
-// retry, so a held wake is acknowledged before st3 sends another.
+// result it never saw. So a message that arrives during a running turn is held and steered when
+// the batch's last `tool_call` returns its `tool_result` (omp announces every call of a batch
+// before any runs, and awaits the handler), or when the run ends. Either way it lands where the
+// steer would have. A message never waits longer than this behind a running tool call: a longer
+// command is backgrounded as before. It is under st3's 15-second work-wake retry, so a held wake
+// is acknowledged before st3 sends another.
 const HOLD_MAX_MS = 10_000;
 
 type Frame = {
@@ -102,8 +102,6 @@ type Stash = {
   held?: HeldMessage[];
   /** Releases held messages after HOLD_MAX_MS behind a running tool call. */
   holdTimer?: ReturnType<typeof setTimeout>;
-  /** Generation fencing the post-run wait for idle against newer activity. */
-  releaseGeneration?: number;
   /** Serializes handoffs so omp receives messages in arrival order. */
   handoff?: Promise<void>;
 };
@@ -475,13 +473,9 @@ export default function (pi: ExtensionAPI) {
     if (state.holdTimer !== undefined) clearTimeout(state.holdTimer);
     state.holdTimer = undefined;
   };
-  const cancelReleaseWait = () => {
-    state.releaseGeneration = (state.releaseGeneration ?? 0) + 1;
-  };
   /** Held mail belongs to the channel that sent it; that channel's successor re-sends it. */
   const resetHold = () => {
     clearHoldTimer();
-    cancelReleaseWait();
     state.running = false;
     state.held = [];
     toolCallsInFlight().clear();
@@ -507,7 +501,6 @@ export default function (pi: ExtensionAPI) {
   /** Hand every held message to omp now, in arrival order. */
   const release = (): Promise<void> => {
     clearHoldTimer();
-    cancelReleaseWait();
     const batch = heldMessages().splice(0);
     const deliver = async () => {
       for (const message of batch) {
@@ -516,26 +509,6 @@ export default function (pi: ExtensionAPI) {
     };
     state.handoff = (state.handoff ?? Promise.resolve()).then(deliver, deliver);
     return state.handoff;
-  };
-
-  // A steer queued after omp's last queue poll of a run can strand until the next prompt, and
-  // `ctx.isIdle()` is still false at `agent_end`. So mail held to the end of a run waits for the
-  // idle proof and then starts a turn of its own. A budget exhausted without that proof releases
-  // it anyway, which is what an unheld message did in that window.
-  const releaseWhenIdle = (ctx: ExtensionContext) => {
-    cancelReleaseWait();
-    const generation = state.releaseGeneration;
-    const startedAt = Date.now();
-    const poller = setInterval(() => {
-      if (state.releaseGeneration !== generation) {
-        clearInterval(poller);
-        return;
-      }
-      if (!idleProof(ctx) && Date.now() - startedAt < IDLE_POLL_BUDGET_MS) return;
-      clearInterval(poller);
-      void release();
-    }, IDLE_POLL_MS);
-    poller.unref?.();
   };
 
   /** Bound the wait behind a running tool call, never the wait for the model to finish streaming. */
@@ -556,9 +529,7 @@ export default function (pi: ExtensionAPI) {
       armHoldCap();
       return Promise.resolve();
     }
-    if (idleProof(message.ctx)) return release();
-    releaseWhenIdle(message.ctx);
-    return Promise.resolve();
+    return release();
   };
 
   /** A turn's calls are over when the turn ends, answered or not: a blocked call has no result. */
@@ -671,8 +642,6 @@ export default function (pi: ExtensionAPI) {
   // file is the defect class that once shipped green through the type gate.
   pi.on("agent_start", async () => {
     cancelSettle();
-    // Mail waiting for the previous run's idle proof now waits for this run's first boundary.
-    cancelReleaseWait();
     state.running = true;
     toolCallsInFlight().clear();
     sendFrame({ type: "state", state: "active" });
@@ -684,8 +653,11 @@ export default function (pi: ExtensionAPI) {
     if (end.willContinue !== true) {
       state.running = false;
       toolCallsInFlight().clear();
-      clearHoldTimer();
-      if (heldMessages().length > 0) releaseWhenIdle(ctx);
+      // `ctx.isIdle()` is still false here, so held mail is steered, and omp's own queued-message
+      // drain continues the session with it once the run settles. Waiting for the idle proof
+      // and sending a new prompt instead left one measured seat working forever
+      // (cross-omp-hold-astra-20260927-a).
+      if (heldMessages().length > 0) void release();
     }
     // A retried error does not end a turn: omp fires `agent_end` with `willContinue: true` for
     // every transient failure it is about to try again (measured: a 429 repeated seven times in
