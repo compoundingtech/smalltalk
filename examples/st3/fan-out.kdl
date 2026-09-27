@@ -6,25 +6,25 @@ version 2
 // `agent/RUN/parser` and so on, and has its own Git worktree, so no two harnesses share a working
 // tree or a seat queue. A durable seat still does the join.
 //
-// Each worker declares a `checkout`. Before a worker starts, st3 fetches origin/main into the
+// Each worker declares a `checkout`. Before a worker starts, st fetches origin/main into the
 // run's clone and creates the worker's workspace as a worktree on the named branch. A branch
 // that already exists is checked out as it is. When the run ends, whether it completes, fails, or
-// is cancelled, st3 stops the workers and removes each clean worktree. A worktree with
+// is cancelled, st stops the workers and removes each clean worktree. A worktree with
 // uncommitted or untracked changes stays, with a warning, and the branches stay in the clone.
-// `git-exclude ".st3/"` keeps the files st3 writes for each harness out of Git, so a finished
+// `git-exclude ".st3/"` keeps the files st writes for each harness out of Git, so a finished
 // worktree is clean.
 //
 // The run workspace holds a clone of the invented project at `repo/`.
 //
 //   run_root="$(mktemp -d)"
 //   git clone git@example.invalid:example/app.git "$run_root/repo"
-//   st3 agents apply examples/st3/seats/omp.kdl --as person/operator
-//   st3 missions publish examples/st3/fan-out.kdl --as person/operator
-//   st3 missions start example/fan-out --id example/fan-out/2026-10-01 \
+//   st agents apply examples/st3/seats/omp.kdl --as person/operator
+//   st missions publish examples/st3/fan-out.kdl --as person/operator
+//   st missions start example/fan-out --id example/fan-out/2026-10-01 \
 //     --workspace "$run_root" --as person/operator --follow
 //
 // Commands in gates run through `sh -c` with a minimal environment. Use absolute binary paths.
-// `${NAME}` is an st3 variable that st3 substitutes before the command runs; write a shell
+// `${NAME}` is an st variable that st substitutes before the command runs; write a shell
 // variable as plain `$NAME`.
 //
 // Preview warns that the three workers are missing eligible agents. The preview looks only at

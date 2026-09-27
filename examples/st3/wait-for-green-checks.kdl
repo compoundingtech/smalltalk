@@ -20,9 +20,9 @@ version 2
 // The GitHub provider reads GH_TOKEN, then GITHUB_TOKEN, then `gh auth token`, from the daemon's
 // environment.
 //
-//   st3 agents apply examples/st3/seats/omp.kdl --as person/operator
-//   st3 missions publish examples/st3/wait-for-green-checks.kdl --as person/operator
-//   st3 missions start example/app/green-pull-request-42 --id example/app/green-pull-request-42/1 \
+//   st agents apply examples/st3/seats/omp.kdl --as person/operator
+//   st missions publish examples/st3/wait-for-green-checks.kdl --as person/operator
+//   st missions start example/app/green-pull-request-42 --id example/app/green-pull-request-42/1 \
 //     --workspace /srv/example/app --as person/operator --follow
 
 resource "example/app/pull/42" { kind "vcs.pull-request" }

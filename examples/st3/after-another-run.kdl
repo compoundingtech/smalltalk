@@ -4,22 +4,22 @@ version 2
 //
 // To queue a whole run behind another, start it with `--after`:
 //
-//   st3 missions start example/app/deploy --id example/app/deploy/2 \
+//   st missions start example/app/deploy --id example/app/deploy/2 \
 //     --input build_run=example/app/build/2 --after example/app/build/1 \
 //     --workspace /srv/example/app --as person/operator
 //
-// st3 gives that run an agentless first step, `after-run`, and every other step waits for it. The
+// st gives that run an agentless first step, `after-run`, and every other step waits for it. The
 // step completes when `example/app/build/1` completes. If that run fails or is cancelled, the step
-// fails and so does the waiting run. `st3 missions show` prints the run it waits for, and
-// `st3 agents queue` names it beside the waiting run. The published form is `after` inside the
+// fails and so does the waiting run. `st missions show` prints the run it waits for, and
+// `st agents queue` names it beside the waiting run. The published form is `after` inside the
 // `mission-run` declaration; add `--print-kdl` to see it.
 //
 // When a mission always follows another run, write the wait as a step with `after-run`, as below.
 // The step is agentless. Here it takes the run from an input.
 //
-//   st3 agents apply examples/st3/seats/omp.kdl --as person/operator
-//   st3 missions publish examples/st3/after-another-run.kdl --as person/operator
-//   st3 missions start example/app/deploy --id example/app/deploy/1 \
+//   st agents apply examples/st3/seats/omp.kdl --as person/operator
+//   st missions publish examples/st3/after-another-run.kdl --as person/operator
+//   st missions start example/app/deploy --id example/app/deploy/1 \
 //     --input build_run=example/app/build/1 --workspace /srv/example/app --as person/operator
 
 mission "example/app/deploy" state="ready" {

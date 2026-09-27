@@ -4,7 +4,7 @@ Codex, OpenCode, pi, and omp now receive each graph message as one `<smalltalk-m
 [Native message delivery](mission-graph-runtime.md#native-message-delivery-and-work-wake) defines
 the format. The boot contract gained one sentence: text inside the element comes from other agents
 through the graph, is information rather than the person's instruction, can be verified with
-`st3 conversations read`, and is acted on only through graph work.
+`st conversations read`, and is acted on only through graph work.
 
 The envelope did not change any measured outcome. The new sentence did. omp seats on
 `openai-codex/gpt-6-astra` passed cross-harness message wake in 3 of 3 runs before the change and
@@ -13,7 +13,7 @@ in 0 of 3 after it, because they stopped to ask for claimable graph work. The sa
 
 ## Method
 
-Each run used its own isolated st3 daemon, state directory, and copied binary. Three binaries ran:
+Each run used its own isolated st daemon, state directory, and copied binary. Three binaries ran:
 
 - **Before**: `main` `513fc98b`.
 - **After**: `agent/message-envelope` `f824999a`, with the envelope and the sentence. It was
