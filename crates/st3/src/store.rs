@@ -99,6 +99,16 @@ WHERE kind='harness.timeline';
 CREATE INDEX IF NOT EXISTS claims_batch_index ON claims(batch_id, store_index);
 CREATE INDEX IF NOT EXISTS claims_accepted_order_index
 ON claims(length(accepted_at_unix_ms), accepted_at_unix_ms, store_index);
+CREATE INDEX IF NOT EXISTS claims_subscription_finished_request_index
+ON claims(subject, json_extract(body, '$.fields.request'))
+WHERE kind IN (
+    'subscription.mission-started',
+    'subscription.mission-failed',
+    'subscription.mission-request-cancelled'
+);
+CREATE INDEX IF NOT EXISTS claims_schedule_started_request_index
+ON claims(subject, json_extract(body, '$.fields.request'))
+WHERE kind='schedule.work-started';
 CREATE INDEX IF NOT EXISTS claims_operation_index
 ON claims(json_extract(body, '$._operation.id'))
 WHERE json_extract(body, '$._operation.id') IS NOT NULL;
@@ -136,6 +146,8 @@ CREATE TABLE IF NOT EXISTS desired (
     owner_generation TEXT,
     owner_step TEXT
 );
+CREATE INDEX IF NOT EXISTS desired_owner_step_index ON desired(owner_step, subject);
+CREATE INDEX IF NOT EXISTS desired_owner_run_index ON desired(owner_run, subject);
 
 CREATE TABLE IF NOT EXISTS idempotency (
     operation_id TEXT PRIMARY KEY,
@@ -6629,21 +6641,27 @@ impl Store {
         let mut statement = connection.prepare(
             "SELECT subject, kind, body, member, owner_run, owner_generation, owner_step FROM desired ORDER BY subject",
         )?;
-        let rows = statement.query_map([], |row| {
-            let subject = row.get::<_, String>(0)?;
-            let kind = row.get::<_, String>(1)?;
-            let desired = row.get::<_, String>(2)?;
-            let member = row.get::<_, Option<String>>(3)?;
-            Ok(DesiredSubject {
-                subject,
-                kind,
-                desired: serde_json::from_str(&desired).unwrap_or(Value::Null),
-                member: member.and_then(|value| serde_json::from_str(&value).ok()),
-                owner_run: row.get(4)?,
-                owner_generation: row.get(5)?,
-                owner_step: row.get(6)?,
-            })
-        })?;
+        let rows = statement.query_map([], desired_from_row)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn desired_subjects_for_owner_step(&self, owner_step: &str) -> Result<Vec<DesiredSubject>> {
+        let connection = self.readers.get();
+        let mut statement = connection.prepare(
+            "SELECT subject, kind, body, member, owner_run, owner_generation, owner_step
+             FROM desired WHERE owner_step=?1 ORDER BY subject",
+        )?;
+        let rows = statement.query_map([owner_step], desired_from_row)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn desired_subjects_for_owner_run(&self, owner_run: &str) -> Result<Vec<DesiredSubject>> {
+        let connection = self.readers.get();
+        let mut statement = connection.prepare(
+            "SELECT subject, kind, body, member, owner_run, owner_generation, owner_step
+             FROM desired WHERE owner_run=?1 ORDER BY subject",
+        )?;
+        let rows = statement.query_map([owner_run], desired_from_row)?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
@@ -8380,6 +8398,90 @@ impl Store {
         let mut statement = connection.prepare(query)?;
         let rows = statement.query_map(params![subject, kind], claim_from_row)?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn pending_subscription_mission_requests(&self, subject: &str) -> Result<Vec<ClaimRecord>> {
+        let connection = self.readers.get();
+        let mut statement = connection.prepare(
+            "SELECT request.id, request.store_index, request.batch_id, request.subject,
+                    request.kind, request.origin, request.actor, request.body,
+                    request.predecessors, request.accepted_at_unix_ms
+             FROM claims AS request
+             WHERE request.subject=?1 AND request.kind='subscription.mission-requested'
+               AND NOT EXISTS (
+                 SELECT 1 FROM claims AS finished
+                 WHERE finished.subject=request.subject
+                   AND finished.kind IN (
+                     'subscription.mission-started',
+                     'subscription.mission-failed',
+                     'subscription.mission-request-cancelled'
+                   )
+                   AND json_extract(finished.body, '$.fields.request')=request.id
+               )
+             ORDER BY request.store_index",
+        )?;
+        statement
+            .query_map([subject], claim_from_row)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    pub fn pending_schedule_work_requests(&self, subject: &str) -> Result<Vec<ClaimRecord>> {
+        let connection = self.readers.get();
+        let mut statement = connection.prepare(
+            "SELECT request.id, request.store_index, request.batch_id, request.subject,
+                    request.kind, request.origin, request.actor, request.body,
+                    request.predecessors, request.accepted_at_unix_ms
+             FROM claims AS request
+             WHERE request.subject=?1 AND request.kind='schedule.work-requested'
+               AND NOT EXISTS (
+                 SELECT 1 FROM claims AS started
+                 WHERE started.subject=request.subject AND started.kind='schedule.work-started'
+                   AND json_extract(started.body, '$.fields.request')=request.id
+               )
+             ORDER BY request.store_index",
+        )?;
+        statement
+            .query_map([subject], claim_from_row)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    pub fn schedule_work_start_for_request(
+        &self,
+        subject: &str,
+        request: &str,
+    ) -> Result<Option<ClaimRecord>> {
+        let connection = self.readers.get();
+        connection
+            .query_row(
+                "SELECT id, store_index, batch_id, subject, kind, origin, actor, body,
+                        predecessors, accepted_at_unix_ms
+                 FROM claims WHERE subject=?1 AND kind='schedule.work-started'
+                   AND json_extract(body, '$.fields.request')=?2
+                 ORDER BY store_index DESC LIMIT 1",
+                params![subject, request],
+                claim_from_row,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn schedule_has_active_started_run(&self, subject: &str) -> Result<bool> {
+        let connection = self.readers.get();
+        connection
+            .query_row(
+                "SELECT EXISTS(
+                   SELECT 1 FROM claims AS started
+                   JOIN mission_runs AS run
+                     ON json_extract(started.body, '$.fields.mission_run')='mission-run/' || run.id
+                   WHERE started.subject=?1 AND started.kind='schedule.work-started'
+                     AND run.status NOT IN ('completed','cancelled','failed')
+                 )",
+                [subject],
+                |row| row.get(0),
+            )
+            .map_err(Into::into)
     }
 
     /// Aggregate durable provider usage without mixing context-window occupancy
@@ -13346,6 +13448,20 @@ fn intent_leaves_at(
         .map(|(id, _)| id)
         .filter(|id| !referenced.contains(id))
         .collect())
+}
+
+fn desired_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<DesiredSubject> {
+    let desired = row.get::<_, String>(2)?;
+    let member = row.get::<_, Option<String>>(3)?;
+    Ok(DesiredSubject {
+        subject: row.get(0)?,
+        kind: row.get(1)?,
+        desired: serde_json::from_str(&desired).unwrap_or(Value::Null),
+        member: member.and_then(|value| serde_json::from_str(&value).ok()),
+        owner_run: row.get(4)?,
+        owner_generation: row.get(5)?,
+        owner_step: row.get(6)?,
+    })
 }
 
 fn claim_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ClaimRecord> {
@@ -20698,6 +20814,109 @@ mod tests {
             )
             .unwrap();
         assert!(store.replication_projection_needs_recovery().unwrap());
+    }
+
+    #[test]
+    fn pending_request_queries_return_only_unstarted_history() {
+        let store = Store::open_memory("node").unwrap();
+        let mut connection = store.connection.lock().unwrap();
+        let transaction = connection.transaction().unwrap();
+        for sequence in 0..100 {
+            for (subject, requested, started) in [
+                (
+                    "subscription/test",
+                    "subscription.mission-requested",
+                    "subscription.mission-started",
+                ),
+                (
+                    "schedule/test",
+                    "schedule.work-requested",
+                    "schedule.work-started",
+                ),
+            ] {
+                let body = if requested == "subscription.mission-requested" {
+                    json!({"fields": {
+                        "mission": "mission/test", "mission_revision": "revision",
+                        "resource": "resource/test", "resource_input": "source",
+                        "workspace": "/tmp/test", "discovery": format!("discovery-{sequence}")
+                    }})
+                } else {
+                    json!({"fields": {
+                        "revision": "revision", "occurrence": sequence,
+                        "mission": "mission/test", "mission_revision": "revision",
+                        "workspace": "/tmp/test", "inputs": {}
+                    }})
+                };
+                let request = append_claim_tx(
+                    &transaction,
+                    &store.origin,
+                    subject,
+                    requested,
+                    None,
+                    &body,
+                    &[],
+                    None,
+                )
+                .unwrap();
+                append_claim_tx(
+                    &transaction,
+                    &store.origin,
+                    subject,
+                    started,
+                    None,
+                    &json!({"fields": {"request": request.id, "mission_run": "mission-run/test"}}),
+                    &[],
+                    None,
+                )
+                .unwrap();
+            }
+        }
+        let subscription = append_claim_tx(
+            &transaction,
+            &store.origin,
+            "subscription/test",
+            "subscription.mission-requested",
+            None,
+            &json!({"fields": {
+                "mission": "mission/test", "mission_revision": "revision",
+                "resource": "resource/test", "resource_input": "source",
+                "workspace": "/tmp/test", "discovery": "discovery-pending"
+            }}),
+            &[],
+            None,
+        )
+        .unwrap();
+        let schedule = append_claim_tx(
+            &transaction,
+            &store.origin,
+            "schedule/test",
+            "schedule.work-requested",
+            None,
+            &json!({"fields": {
+                "revision": "revision", "occurrence": 101,
+                "mission": "mission/test", "mission_revision": "revision",
+                "workspace": "/tmp/test", "inputs": {}
+            }}),
+            &[],
+            None,
+        )
+        .unwrap();
+        transaction.commit().unwrap();
+        drop(connection);
+        let pending = store
+            .pending_subscription_mission_requests("subscription/test")
+            .unwrap();
+        assert_eq!(
+            pending.iter().map(|claim| &claim.id).collect::<Vec<_>>(),
+            vec![&subscription.id]
+        );
+        let pending = store
+            .pending_schedule_work_requests("schedule/test")
+            .unwrap();
+        assert_eq!(
+            pending.iter().map(|claim| &claim.id).collect::<Vec<_>>(),
+            vec![&schedule.id]
+        );
     }
 
     #[test]
