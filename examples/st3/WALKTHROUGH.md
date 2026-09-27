@@ -1,78 +1,85 @@
 # Start a new project from nothing
 
-This walkthrough uses two complete files: a standing mission declares a durable project owner,
-and a finite work mission assigns work to that owner. All names and data are invented. Use a
-disposable ST3 installation with a working Codex login, from the repository root.
+This walkthrough uses two complete files. A seat file declares a durable project worker, and a
+finite work mission assigns work to that worker. All names and data are invented. Use a disposable
+ST3 installation with a working login for one harness, from the repository root.
 
-## Failure first: publication is not materialization
+## Failure first: a mission is not a durable agent
 
-The tempting sequence is to publish `walkthrough-standing.kdl`, see no agent, and conclude that
-there is no route from a definition to a worker. That conclusion confuses durable intent with a
-running instance. Publication creates an immutable mission definition only. The first
-`missions start` on that standing definition materializes its runtime. Until that happens, the
-finite mission's assigned steps have no agent that can claim them.
+The tempting shape for a long-lived worker is a mission that declares an agent and has no steps.
+That was the old standing-mission pattern, and it no longer keeps anything alive. Missions are
+finite. A mission with no steps has exhausted its work as soon as it starts, so the run completes
+and stops the agent it owns. A revision or a second publish of that definition ends the same way.
 
-The four-command sequence below is the supported way out. In particular, do not skip command 2.
+The second tempting mistake is to publish and start work before any worker exists. Publication
+succeeds with a warning, and the step waits with no eligible agent. The warning names the loop's
+generated round mission, which holds the step:
 
-Create an empty workspace and inspect both files before changing graph state:
+```text
+mission `mission/__st3/example/garden-work/loop/prepare-note/round` references missing eligible agent `agent/example/worker`
+```
+
+A durable agent is a top-level seat, applied with `st3 agents apply`. It has no mission owner, so
+no mission's end can stop it. Work reaches it as mission steps assigned to its exact subject.
+
+## Supported way: apply a seat, then run work
+
+Create an empty workspace and inspect both files before changing graph state. Pick the seat file
+for the harness you have logged in; every file in [`seats/`](seats/) declares the same
+`agent/example/worker` seat. Replace its `workspace` with an existing directory first.
 
 ```sh
 walkthrough_workspace="$(mktemp -d)"
-sed -n '1,200p' examples/st3/walkthrough-standing.kdl
-sed -n '1,240p' examples/st3/walkthrough-work.kdl
+sed -n '1,80p' examples/st3/seats/omp.kdl
+sed -n '1,80p' examples/st3/walkthrough-work.kdl
 ```
 
 For a longer mechanical gate, put its shell in a file and check that file with `/bin/bash -n`
 before publication. This example's gate is a single command; its equivalent syntax-only check is:
 
 ```sh
-/bin/bash -n -c '/usr/bin/test -s garden-note.md'
+/bin/bash -n -c '/usr/bin/test -s garden-note.md # round 1'
 ```
 
 Then run these four ST3 commands in order.
 
-1. Publish the standing definition:
+1. Apply the seat:
 
    ```sh
-   st3 missions publish examples/st3/walkthrough-standing.kdl --as person/operator
+   st3 agents apply examples/st3/seats/omp.kdl --as person/operator
    ```
 
-   Publication stores an immutable ready definition; it does not create an agent. At this point,
-   `st3 missions ls --all` lists `mission/example/garden-owner` with zero runs.
-
-2. Start the standing mission and materialize its agent:
+   **This is the step that creates the agent.** Verify it:
 
    ```sh
-   st3 missions start example/garden-owner --id example/garden-owner/standing \
-     --workspace "$walkthrough_workspace" --as person/operator
+   st3 agents show agent/example/worker
    ```
 
-   **This is the step that creates the agent.** Publishing the standing file alone never does.
-   Starting it materializes `agent/example/garden-owner/standing/owner`; the agent remains
-   available after finite work ends. Verify it with:
-
-   ```sh
-   st3 agents show agent/example/garden-owner/standing/owner
-   ```
-
-3. Publish the finite work definition:
+2. Publish the finite work definition:
 
    ```sh
    st3 missions publish examples/st3/walkthrough-work.kdl --as person/operator
    ```
 
-   The file's publication-time handshake names the materialized owner. If command 2 was skipped,
-   command 3 stops with an undeclared-recipient error instead of publishing work no agent can do.
+   Publication stores an immutable ready definition; it does not start a run. The missing-agent
+   warning above does not appear now that the seat exists. `st3 missions ls --all` lists
+   `mission/example/garden-work` with zero runs.
 
-4. Start the work and follow it:
+3. Start the work and follow it:
 
    ```sh
    st3 missions start example/garden-work --id example/garden-work/first-change \
      --workspace "$walkthrough_workspace" --as person/operator --follow
    ```
 
-   If command 3 did not publish the definition, this reports that the mission does not exist. The
-   owner can now claim `write-note`; without command 2 that assigned work would be unclaimable.
+   The run joins the seat's queue, and st3 wakes the seat for `write-note`. `--follow` returns when
+   the run is terminal.
+
+4. Inspect the result:
+
+   ```sh
+   st3 missions show mission-run/example/garden-work/first-change
+   ```
 
 `missions publish FILE --as ACTOR` previews and publishes exact authored KDL. A person actor is an
 explicit trusted local operator. An agent actor is checked against the agent's already-current
@@ -84,17 +91,27 @@ The `loop` owns the overall 30-minute budget. Each `round` creates fresh `write-
 checks the result after a round, `max-rounds` prevents an endless retry, and `on-exhausted` fails
 with explicit human attention after the third miss. `${loop.feedback}` tells the next round which
 until gate failed. Put corrective work inside `round`; put work that should happen once after a
-successful loop, such as `report-completion`, after the loop and depend on the loop step.
+successful loop after the loop and depend on the loop step.
+
+A gate result is cached by the gate's definition, and an `until` gate belongs to the loop rather
+than to one round. The gate command therefore ends with the shell comment `# round ${loop.round}`.
+st3 substitutes the round number, so each round runs the check again. Without it, the first
+round's failure would be reused for every later round.
 
 Mechanical gates have a minimal `PATH` and no login shell. Use an absolute binary path, as the
 example does with `/usr/bin/test`. Keep the owning step or loop timeout longer than the gate's
 `time-limit`; here 30 minutes exceeds one minute. Syntax-check nontrivial shell with
 `/bin/bash -n` before publishing it.
 
-`report-completion` is a declared message step reached only after success. The `finally` block runs
-for every terminal outcome and sends a second message that tells the operator to inspect the exact
-status. Without those notifications, a run can finish correctly and still look abandoned.
+This gate reads a file in a disposable workspace that is not a repository. In a real project, have
+the worker commit and push, and gate on the pushed tree instead of the worker's files;
+[`WRITE-A-GATE-THAT-WORKS.md`](WRITE-A-GATE-THAT-WORKS.md) shows how.
 
-After the run, `garden-note.md` is in the disposable workspace and the standing owner remains
-running for the next mission. Remove the workspace when finished; immutable definitions and the
-completed run remain in graph history by design.
+The run's outcome is graph state. `missions show` gives its status, each step's completion, and
+the gate results. A failed loop also puts an attention item in the operator's inbox, so a failure
+does not depend on anyone reading a message.
+
+After the run, `garden-note.md` is in the disposable workspace and the seat remains running for
+the next mission. Stop it with `st3 agents stop agent/example/worker --as person/operator` when you
+are done. Remove the workspace; immutable definitions and the completed run remain in graph
+history by design.

@@ -1,5 +1,9 @@
 version 2
 
+// A mission prepared for reviewed revisions of a running run. `revisions="human-only"` turns each
+// revision into a proposal for the reviewer, and `when-idle` cuts over only while no work is
+// claimed. CHANGE-A-RUNNING-MISSION.md revises a run of it to mission-revision-v2.kdl.
+
 resource "example/revisable-change-output" { kind "filesystem.file" }
 
 mission "example/revisable-change" state="ready" revisions="human-only" revision-reviewer="person/operator" revision-cutover="when-idle" {
@@ -8,12 +12,12 @@ mission "example/revisable-change" state="ready" revisions="human-only" revision
   goal "Implement one request and accept reviewed generation changes while work is idle."
 
   step "implement" {
-    available-to "agent/example/repository-owner/standing/repository-owner"
+    assigned-to "agent/example/worker"
     goal "Implement this request with focused tests: ${input.request}"
   }
 
   step "verify" {
-    available-to "agent/example/repository-owner/standing/repository-owner"
+    assigned-to "agent/example/worker"
     depends-on { step "implement" completed }
     goal "Verify the exact implementation and record evidence."
   }

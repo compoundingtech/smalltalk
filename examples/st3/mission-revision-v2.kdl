@@ -1,5 +1,9 @@
 version 2
 
+// The successor to mission-revision.kdl. `implement` is unchanged, so its completed work carries
+// into the new generation. `summarize-index` is new, and `verify` runs again because its dependency
+// changed. CHANGE-A-RUNNING-MISSION.md walks through it.
+
 resource "example/revisable-change-output" { kind "filesystem.file" }
 
 mission "example/revisable-change" state="ready" revisions="human-only" revision-reviewer="person/operator" revision-cutover="when-idle" {
@@ -8,18 +12,18 @@ mission "example/revisable-change" state="ready" revisions="human-only" revision
   goal "Implement one request and accept reviewed generation changes while work is idle."
 
   step "implement" {
-    available-to "agent/example/repository-owner/standing/repository-owner"
+    assigned-to "agent/example/worker"
     goal "Implement this request with focused tests: ${input.request}"
   }
 
   step "summarize-index" {
-    available-to "agent/example/repository-owner/standing/repository-owner"
+    assigned-to "agent/example/worker"
     depends-on { step "implement" completed }
     goal "Add a concise summary of the invented archive index and record focused evidence."
   }
 
   step "verify" {
-    available-to "agent/example/repository-owner/standing/repository-owner"
+    assigned-to "agent/example/worker"
     depends-on { step "summarize-index" completed }
     goal "Verify the exact implementation and record evidence."
   }

@@ -1,0 +1,138 @@
+version 2
+
+// Fan one change out to three mission-scoped workers, then join their pushed branches.
+//
+// Parallel work gets its own seats. Each worker below belongs to this run, as
+// `agent/RUN/parser` and so on, and has its own Git worktree, so no two harnesses share a working
+// tree or a seat queue. A durable seat still does the join. The `finally` block stops the workers
+// and removes their worktrees whether the run completes, fails, or is cancelled.
+//
+// The run workspace holds a clone of the invented project at `repo/`. The worktrees are created
+// beside it before any worker starts, because a worker's workspace must exist when it starts and
+// st3 writes `.st3/boot.md` into it.
+//
+//   run_root="$(mktemp -d)"
+//   git clone git@example.invalid:example/app.git "$run_root/repo"
+//   st3 agents apply examples/st3/seats/omp.kdl --as person/operator
+//   st3 missions publish examples/st3/fan-out.kdl --as person/operator
+//   st3 missions start example/fan-out --id example/fan-out/2026-10-01 \
+//     --workspace "$run_root" --as person/operator --follow
+//
+// Commands in `exec` and gates run through `sh -c` with a minimal environment. Use absolute
+// binary paths. `${NAME}` is an st3 variable that st3 substitutes before the command runs; write
+// a shell variable as plain `$NAME`.
+//
+// Preview warns that the three workers are missing eligible agents. The preview looks only at
+// mission-level agents; `start-workers` declares these before any work step can become ready.
+
+mission "example/fan-out" state="ready" timeout="4h" {
+  goal "Split one invented refactor across three parallel workers and join their pushed branches."
+  constraint "Each worker changes only its own area, commits in its own worktree, and pushes only its own branch."
+
+  step "worktrees" {
+    agentless
+    exec "add-worktrees" {
+      host "local"
+      workspace "${ST_WORKSPACE}"
+      command "/usr/bin/git -C repo fetch --quiet origin main && for area in parser cli docs; do /usr/bin/git -C repo worktree add --quiet -B fan-out/$area ../$area origin/main || exit 1; done"
+      restart "never"
+    }
+    gate "the three worktrees exist" {
+      field "exit_code" "exec/${ST_MISSION_RUN}/add-worktrees" is 0
+    }
+  }
+
+  // Declaring the workers in a step starts them only after that step activates. This step
+  // completes when each harness is ready.
+  step "start-workers" {
+    agentless
+    depends-on { step "worktrees" completed }
+    agent "parser" {
+      workspace "${ST_WORKSPACE}/parser"
+      render { git-exclude ".st3/" }
+      harness "omp" {
+        model "openai-codex/gpt-6-astra"
+        effort "medium"
+      }
+    }
+    agent "cli" {
+      workspace "${ST_WORKSPACE}/cli"
+      render { git-exclude ".st3/" }
+      harness "omp" {
+        model "openai-codex/gpt-6-astra"
+        effort "medium"
+      }
+    }
+    agent "docs" {
+      workspace "${ST_WORKSPACE}/docs"
+      render { git-exclude ".st3/" }
+      harness "omp" {
+        model "openai-codex/gpt-6-astra"
+        effort "medium"
+      }
+    }
+  }
+
+  step "parser" timeout="1h" {
+    assigned-to "agent/${ST_MISSION_RUN}/parser"
+    depends-on { step "start-workers" completed }
+    goal "Rename the parser's Token type to Lexeme across src/parser, run its tests, commit, and push the fan-out/parser branch."
+  }
+
+  step "cli" timeout="1h" {
+    assigned-to "agent/${ST_MISSION_RUN}/cli"
+    depends-on { step "start-workers" completed }
+    goal "Update src/cli for the Lexeme rename, run its tests, commit, and push the fan-out/cli branch."
+  }
+
+  step "docs" timeout="1h" {
+    assigned-to "agent/${ST_MISSION_RUN}/docs"
+    depends-on { step "start-workers" completed }
+    goal "Update docs/ for the Lexeme rename, commit, and push the fan-out/docs branch."
+  }
+
+  // A gate on files checks what was pushed, not what a worker left in its worktree.
+  step "branches-pushed" {
+    agentless
+    depends-on {
+      step "parser" completed
+      step "cli" completed
+      step "docs" completed
+    }
+    gate "all three branches are on origin" {
+      exec "for area in parser cli docs; do /usr/bin/git -C repo ls-remote --exit-code origin refs/heads/fan-out/$area >/dev/null || exit 1; done"
+      host "local"
+      workspace "${ST_WORKSPACE}"
+      time-limit "2m"
+    }
+  }
+
+  step "join" timeout="1h" {
+    assigned-to "agent/example/worker"
+    depends-on { step "branches-pushed" completed }
+    goal "Merge fan-out/parser, fan-out/cli, and fan-out/docs into a new fan-out/joined branch, run the full test suite, and push fan-out/joined."
+  }
+
+  finally {
+    step "stop-workers" {
+      agentless
+      stop "agent/${ST_MISSION_RUN}/parser"
+      stop "agent/${ST_MISSION_RUN}/cli"
+      stop "agent/${ST_MISSION_RUN}/docs"
+    }
+
+    step "remove-worktrees" {
+      agentless
+      depends-on { step "stop-workers" completed }
+      exec "remove-worktrees" {
+        host "local"
+        workspace "${ST_WORKSPACE}"
+        command "for area in parser cli docs; do /usr/bin/git -C repo worktree remove --force ../$area 2>/dev/null; done; /usr/bin/git -C repo worktree prune"
+        restart "never"
+      }
+      gate "the worktrees are removed" {
+        field "exit_code" "exec/${ST_MISSION_RUN}/remove-worktrees" is 0
+      }
+    }
+  }
+}

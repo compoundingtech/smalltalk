@@ -1,0 +1,80 @@
+version 2
+
+// Wait on an agent: for its work, for its runtime, and for a run's agents to exit.
+//
+// - To wait until an agent has done something, depend on the step it was assigned. That is the
+//   normal form, and it is what `depends-on { step "review" completed }` does below.
+// - To wait until an agent's runtime is up, read the `status` field of its agent subject:
+//   `starting`, `running`, `stopped`, `exited`, or `absent`. The baseline below keeps the run
+//   blocked until the durable seat is running, and rechecks it when the graph changes.
+// - To wait until every runtime a run owns has stopped, use `empty` on the run subject. The run's
+//   agents, execs, and terminals all count.
+//
+// Whether a harness is idle or in a turn is not a gate input. Model "the agent is finished" as the
+// completion of its step.
+//
+//   st3 agents apply examples/st3/seats/omp.kdl --as person/operator
+//   st3 missions publish examples/st3/wait-for-agent.kdl --as person/operator
+//   st3 missions start example/app/paired-review --id example/app/paired-review/1 \
+//     --workspace "$(mktemp -d)" --as person/operator --follow
+//
+// Preview warns that the reviewer is a missing eligible agent. The preview looks only at
+// mission-level agents; `start-reviewer` declares it before `review` can become ready.
+
+mission "example/app/paired-review" state="ready" timeout="3h" {
+  goal "Have a mission-scoped reviewer check the worker seat's pushed change, then remove the reviewer's checkout after it exits."
+
+  baseline "the worker seat is running" {
+    field "status" "agent/example/worker" "is" "running"
+  }
+
+  step "change" timeout="1h" {
+    assigned-to "agent/example/worker"
+    goal "Add input validation to the invented signup form, run its tests, commit, and push the signup-validation branch."
+  }
+
+  step "start-reviewer" {
+    agentless
+    depends-on { step "change" completed }
+    agent "reviewer" {
+      workspace "${ST_WORKSPACE}/review" create=#true
+      harness "claude" {
+        model "claude-sonnet-5"
+        effort "medium"
+      }
+    }
+  }
+
+  step "review" timeout="45m" {
+    assigned-to "agent/${ST_MISSION_RUN}/reviewer"
+    depends-on { step "start-reviewer" completed }
+    goal "Clone the pushed signup-validation branch into ${ST_WORKSPACE}/review/checkout, review it, and complete this step with every defect you find and its file and line."
+    constraint "Do not push, comment, or merge."
+  }
+
+  step "stop-reviewer" {
+    agentless
+    depends-on { step "review" completed }
+    stop "agent/${ST_MISSION_RUN}/reviewer"
+  }
+
+  step "reviewer-exited" {
+    agentless
+    depends-on { step "stop-reviewer" completed }
+    gate "the run has no live runtime" { empty "mission-run/${ST_MISSION_RUN}" }
+  }
+
+  step "remove-checkout" {
+    agentless
+    depends-on { step "reviewer-exited" completed }
+    exec "remove-checkout" {
+      host "local"
+      workspace "${ST_WORKSPACE}"
+      command "/bin/rm -rf review"
+      restart "never"
+    }
+    gate "the checkout is removed" {
+      field "exit_code" "exec/${ST_MISSION_RUN}/remove-checkout" is 0
+    }
+  }
+}

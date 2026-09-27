@@ -1,20 +1,50 @@
 version 2
 
+// Keep remediation reachable when an independent review finds defects.
+//
+// The reviewer is a mission-scoped seat, so it is independent of the durable worker that fixes the
+// findings. The review step completes once its report is stored, even when it found defects. If
+// finding a defect failed the review step, the remediation step that depends on it could never
+// run. Only the final `release-review` decides whether the result is acceptable.
+//
+//   st3 agents apply examples/st3/seats/omp.kdl --as person/operator
+//   st3 missions publish examples/st3/review-remediation.kdl --as person/operator
+//   st3 missions start example/review-remediation --id example/review-remediation/1 \
+//     --workspace /srv/example/app --as person/operator
+
 mission "example/review-remediation" state="ready" {
-  completion { when "all-steps-exhausted" }
-  goal "Keep remediation reachable when an independent review finds defects."
+  goal "Review the invented payments module independently, fix what the review finds, and decide whether the result is acceptable."
 
-  step "report-only-review" {
-    goal "Inspect independently, record durable findings, and complete after the report is published even when findings exist."
+  agent "reviewer" {
+    workspace "${ST_WORKSPACE}/review" create=#true
+    harness "codex" {
+      model "gpt-6-sol"
+      effort "high"
+    }
   }
 
-  step "remediate-findings" {
-    goal "Resolve every durable finding from the report and record focused proof."
+  step "report-only-review" timeout="1h" {
+    assigned-to "agent/${ST_MISSION_RUN}/reviewer"
+    goal "Review the payments module on main. Store the findings with `st3 documents put` and complete this step with the stored document reference, even when findings exist."
+    constraint "Do not change repository files."
+  }
+
+  step "remediate-findings" timeout="2h" {
+    assigned-to "agent/example/worker"
     depends-on { step "report-only-review" completed }
+    goal "Resolve every finding in the stored report, commit and push the changes, and complete this step with each finding and how it was resolved."
   }
 
-  step "release-review" {
-    goal "Perform the terminal release decision; fail this step if the remediated result is still unacceptable."
+  step "release-review" timeout="1h" {
+    assigned-to "agent/${ST_MISSION_RUN}/reviewer"
     depends-on { step "remediate-findings" completed }
+    goal "Check each change against its finding on the pushed branch. Complete this step if every finding is resolved; fail it with the unresolved findings otherwise."
+  }
+
+  finally {
+    step "stop-reviewer" {
+      agentless
+      stop "agent/${ST_MISSION_RUN}/reviewer"
+    }
   }
 }

@@ -114,8 +114,9 @@ cannot be met. An agent may publish a generated nested mission only from claimed
 `mission-authority` and a matching `produces-mission` contract. Use `queue {}` in mission KDL when
 source order is intentional; do not encode ordering only in prompts.
 
-The versioned examples in [`examples/st3`](examples/st3/README.md) demonstrate queues, nested
-missions, review/remediation, recurring work, observations, revisions, and bounded loops.
+The versioned examples in [`examples/st3`](examples/st3/README.md) are indexed by task. They
+cover durable seats for each harness, seat queues, parallel fan-out, GitHub intake, waiting for
+checks, a time, a person, or an agent, revisions, and bounded loops.
 
 ## Understand the network
 

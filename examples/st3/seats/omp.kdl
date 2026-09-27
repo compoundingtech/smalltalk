@@ -1,0 +1,35 @@
+version 2
+
+// A durable omp seat.
+//
+// A seat is a top-level agent. It has no mission owner, so finishing, revising, or cancelling a
+// mission never stops it. Work reaches it as mission steps assigned to its exact subject,
+// `agent/example/worker`, and waits in its seat queue.
+//
+// Every seat file in this directory declares the same `example/worker` seat with a different
+// harness, so each mission example works with whichever one you apply. Apply one of them. To run
+// several side by side, give each its own identity and change `assigned-to` to match.
+//
+// Before you apply it:
+// - install omp 18.0 or 18.1 and make sure `bun` is on the login-shell PATH of the user who
+//   runs the st3 daemon;
+// - log that user's omp profile in to the `openai-codex` provider;
+// - replace the workspace with an existing checkout on this host.
+//
+// Apply, inspect, and later stop the seat:
+//
+//   st3 agents apply examples/st3/seats/omp.kdl --as person/operator
+//   st3 agents show agent/example/worker
+//   st3 agents stop agent/example/worker --as person/operator
+//
+// `openai-codex/gpt-6-astra` is the recommended omp model (docs/st3/omp.md). omp fuzzy-matches
+// model names, so confirm the model in the seat's session transcript. If your login does not offer
+// astra, use `openai-codex/gpt-5.6-sol`.
+agent "example/worker" {
+  workspace "/srv/example/app"
+  restart "always"
+  harness "omp" {
+    model "openai-codex/gpt-6-astra"
+    effort "medium"
+  }
+}

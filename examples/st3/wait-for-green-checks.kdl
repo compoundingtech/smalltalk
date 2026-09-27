@@ -1,0 +1,84 @@
+version 2
+
+// Push a fix and let the graph wait for the pull request's GitHub checks.
+//
+// The worker never polls CI. It pushes and completes its step. The `checks-finished` step waits on
+// the observer's facts, and the loop's `until` gate decides whether the finished checks passed. A
+// red result starts the next round, and `${loop.feedback}` tells the worker which gate failed.
+//
+// Two behaviors shape the gates:
+// - A predicate gate that is not yet true stays pending; it never fails. That is why the wait is a
+//   step inside the round: a pending `until` predicate would end the round as a failure and start
+//   the next one while CI was still running.
+// - `every` passes on an empty list, and GitHub lists no check runs for a moment after a push.
+//   `not-every` with a value no check has passes only when the list has at least one item.
+//
+// The observer reports checks for the pull request's current head. Just after a push it can still
+// hold the previous head's finished checks until its next observation. If those were red, that
+// round fails its `until` gate and the next round's worker sees the stale head in the feedback.
+//
+// The GitHub provider reads GH_TOKEN, then GITHUB_TOKEN, then `gh auth token`, from the daemon's
+// environment.
+//
+//   st3 agents apply examples/st3/seats/omp.kdl --as person/operator
+//   st3 missions publish examples/st3/wait-for-green-checks.kdl --as person/operator
+//   st3 missions start example/app/green-pull-request-42 --id example/app/green-pull-request-42/1 \
+//     --workspace /srv/example/app --as person/operator --follow
+
+resource "example/app/pull/42" { kind "vcs.pull-request" }
+
+mission "example/app/green-pull-request-42" state="ready" timeout="6h" {
+  goal "Make every GitHub check on invented pull request example/app#42 pass."
+  constraint "Push only to the pull request's branch. Do not merge the pull request."
+
+  observer "pull-request" {
+    resource "resource/example/app/pull/42"
+    provider "github.pull-request"
+    locator "example/app#42"
+    field "head"
+    field "checks"
+  }
+
+  loop "green" timeout="5h" {
+    max-rounds 4
+    until {
+      gate "every check passed" {
+        every "checks" "resource/example/app/pull/42" {
+          field "conclusion" "is" "success"
+        }
+      }
+    }
+    round {
+      completion { when "all-steps-exhausted" }
+
+      step "fix" timeout="1h" {
+        assigned-to "agent/example/worker"
+        goal "Make the failing checks on pull request example/app#42 pass, commit, and push to its branch. Round ${loop.round}."
+        goal "Read ${loop.feedback} when it is not empty; it names the check gate that failed after the last push."
+        constraint "Do not wait for or poll GitHub checks. Complete this step after the push; the mission waits for the checks."
+      }
+
+      step "checks-finished" {
+        agentless
+        depends-on { step "fix" completed }
+        gate "the head has at least one check" {
+          not-every "checks" "resource/example/app/pull/42" {
+            field "status" "is" "no-such-status"
+          }
+        }
+        gate "every check has finished" {
+          every "checks" "resource/example/app/pull/42" {
+            field "status" "is" "completed"
+          }
+        }
+      }
+    }
+    on-exhausted {
+      fail
+      attention "Pull request example/app#42 is still red after four rounds" {
+        reviewer "person/operator"
+        severity "error"
+      }
+    }
+  }
+}

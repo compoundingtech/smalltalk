@@ -1,8 +1,8 @@
 # Change a mission that is already running
 
-This example uses the invented `example/revisable-change` mission and assumes its equally invented
-standing owner already exists. Publish and start the initial definition, then allow its ordinary
-work to complete. The run pauses at the `release` human gate, keeping it live while the completed
+This example uses the invented `example/revisable-change` mission. Its steps are assigned to the
+durable `agent/example/worker` seat; apply one file from [`seats/`](seats/) first. Publish and start
+the initial definition, then allow its ordinary work to complete. The run pauses at the `release` human gate, keeping it live while the completed
 steps have durable state:
 
 ```sh
@@ -27,23 +27,23 @@ st3 missions show mission-run/example/revisable-change/first
 The second command still shows the revision and generation with which the run started. Publication
 does not mutate a run in flight.
 
-An out-of-band request does not mutate it either. If the operator sends the standing owner a
+An out-of-band request does not mutate it either. If the operator sends the worker seat a
 message asking it to perform `summarize-index` now, the correct response is a refusal:
 
 ```sh
 change_message="$(st3 conversations send \
-  agent/example/repository-owner/standing/repository-owner \
+  agent/example/worker \
   --from person/operator \
   --subject 'Add the archive summary' \
   --body 'Please run summarize-index in the active archive run.')"
 
 st3 conversations reply "$change_message" \
-  --from agent/example/repository-owner/standing/repository-owner \
+  --from agent/example/worker \
   --body 'The active generation has no summarize-index work. Apply a graph revision before I act.'
 ```
 
 That refusal protects the durable plan. A message can explain a desired change, but it cannot grant
-new work or authority.
+new work or authority. Work reaches a seat only as mission steps in its seat queue.
 
 ## Supported recovery: revise the exact run
 
