@@ -511,13 +511,34 @@ impl MissionAuthority {
             "revise" => &self.revise,
             _ => return false,
         };
-        patterns.iter().any(|pattern| {
-            pattern == mission
-                || pattern
-                    .strip_suffix("/*")
-                    .is_some_and(|prefix| mission.starts_with(&format!("{prefix}/")))
-        })
+        patterns
+            .iter()
+            .any(|pattern| authority_pattern_matches(pattern, mission))
     }
+}
+
+/// Seats whose queues an agent may reorder, granted by `queue-authority` in its declaration.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct QueueAuthority {
+    pub moves: Vec<String>,
+}
+
+impl QueueAuthority {
+    /// `seat` may carry the `agent/` prefix; patterns never do.
+    pub fn allows_move(&self, seat: &str) -> bool {
+        let seat = seat.strip_prefix("agent/").unwrap_or(seat);
+        self.moves
+            .iter()
+            .any(|pattern| authority_pattern_matches(pattern, seat))
+    }
+}
+
+/// An authority pattern is an exact ID or a terminal `/*` namespace.
+fn authority_pattern_matches(pattern: &str, id: &str) -> bool {
+    pattern == id
+        || pattern
+            .strip_suffix("/*")
+            .is_some_and(|prefix| id.starts_with(&format!("{prefix}/")))
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1899,6 +1920,56 @@ pub struct WorkWakeView {
     pub acknowledged_by: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failure: Option<String>,
+}
+
+/// One agent seat's current claim and its ordered queue of mission runs.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct SeatQueueView {
+    pub agent: String,
+    pub current_work_ids: Vec<String>,
+    pub next_work_id: Option<String>,
+    pub runs: Vec<SeatQueueRunView>,
+    /// The most recent moves, newest first.
+    pub moves: Vec<SeatQueueMoveView>,
+    pub move_count: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct SeatQueueRunView {
+    pub run: String,
+    pub position: u32,
+    /// `claimed` when the seat holds a step in this run, `ready` when it has a
+    /// ready step for the seat, and `waiting` otherwise.
+    pub state: String,
+    pub run_status: String,
+    pub joined_at_unix_ms: u128,
+    pub claimed_work_ids: Vec<String>,
+    pub ready_work_ids: Vec<String>,
+    pub waiting_work_ids: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct SeatQueueMoveView {
+    pub claim_id: String,
+    pub run: String,
+    pub placement: String,
+    pub anchor: Option<String>,
+    pub actor: Option<String>,
+    pub reason: Option<String>,
+    pub moved_at_unix_ms: u128,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct SeatQueueMoveRequest {
+    pub agent: String,
+    pub run: String,
+    pub placement: String,
+    #[serde(default)]
+    pub anchor: Option<String>,
+    #[serde(default)]
+    pub reason: Option<String>,
+    pub actor: String,
+    pub idempotency_key: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

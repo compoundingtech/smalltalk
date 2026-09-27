@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+# Run one measurement window: a fresh copy of the fixture store, one niced
+# daemon, idle driver traffic, a per-minute sampler, then the probes.
+#
+# Usage: window LABEL ST3_BIN FIXTURE_ROOT ROOT OUT [MINUTES] [WARMUP_MINUTES]
+set -Eeuo pipefail
+
+here="$(cd "$(dirname "$0")" && pwd)"
+source "$here/daemon.sh"
+
+label=$1
+st3_bin="$(readlink -f "$2")"
+fixture=$3
+root=$4
+out=$5
+minutes=${6:-30}
+warmup=${7:-5}
+
+mapfile -t seats < <(jq -r '.[].agent_id' "$fixture/fixture-queues.json")
+state="$(perf_state_dir "$root")"
+mkdir -p "$state" "$out"
+cp "$fixture"/fixture/claims.sqlite3* "$state/"
+perf_start_daemon "$st3_bin" "$root"
+trap 'perf_stop_daemon "$root"' EXIT
+pid="$(cat "$root/daemon.pid")"
+[[ "$(cat "/proc/$pid/comm")" == st3 ]] || { echo "PID $pid is not the daemon" >&2; exit 1; }
+
+nice -n 10 python3 "$here/traffic.py" "$root/st3.sock" $(((warmup + minutes) * 60 + 20)) "${seats[@]}" \
+  >"$out/traffic.log" 2>&1 &
+traffic=$!
+# The first WARMUP rows cover startup and settling; the summary skips them.
+nice -n 10 python3 "$here/sampler.py" "$pid" $((warmup + minutes)) "$out/samples.csv"
+wait "$traffic"
+
+# Where the memory is, before the probes add their own claims.
+{
+  grep -E '^(VmRSS|VmHWM|RssAnon|RssFile|RssShmem):' "/proc/$pid/status"
+  ls -l "$state"
+} >"$out/memory.txt"
+
+nice -n 10 python3 "$here/probe.py" "$root/st3.sock" "$pid" "${seats[@]}" >"$out/probe.json"
+if "$root/bin/st3" agents queue --help >/dev/null 2>&1; then
+  export ST3_ENDPOINT="$root/st3.sock"
+  begin=${EPOCHREALTIME/./}
+  for _ in $(seq 1 20); do
+    "$root/bin/st3" agents queue "${seats[0]}" >/dev/null
+  done
+  echo "{\"st3 agents queue\": {\"count\": 20, \"mean_ms\": $(((${EPOCHREALTIME/./} - begin) / 20000))}}" \
+    >"$out/cli.json"
+fi
+cp "$root/daemon.log" "$out/daemon.log"
+jq -n --arg label "$label" --arg binary "$(sha256sum "$st3_bin" | cut -d' ' -f1)" \
+  --argjson minutes "$minutes" --argjson warmup "$warmup" --arg daemon_env "${PERF_DAEMON_ENV:-}" \
+  --arg writes "${PERF_WRITES_PER_MINUTE:-0}" \
+  '{label: $label, binary_sha256: $binary, minutes: $minutes, warmup_minutes: $warmup,
+    daemon_env: $daemon_env, writes_per_minute: $writes}' >"$out/window.json"

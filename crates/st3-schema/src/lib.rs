@@ -1284,6 +1284,15 @@ fn claim_specs() -> BTreeMap<String, ClaimSpec> {
             &[],
         ),
         (
+            "agent.queue.moved",
+            &["agent"],
+            WritePolicy::AuthorizedRequester,
+            Cardinality::Append,
+            Some("agents"),
+            true,
+            &[],
+        ),
+        (
             "harness.observed",
             &["agent"],
             WritePolicy::SameSubjectActor,
@@ -1827,6 +1836,15 @@ fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
             ("blob_hash", string()),
             ("content", string()),
             ("mode", integer()),
+            ("reason", string()),
+        ],
+        "agent.queue.moved" => &[
+            ("run", required_reference_to(&["mission-run"])),
+            (
+                "placement",
+                required_enum(&["top", "bottom", "before", "after"]),
+            ),
+            ("anchor", reference_to(&["mission-run"])),
             ("reason", string()),
         ],
         "agent.presence" => &[
@@ -2502,6 +2520,7 @@ mod tests {
             [
                 "agent.account",
                 "agent.presence",
+                "agent.queue.moved",
                 "attention.requested",
                 "attention.resolved",
                 "daemon.diagnostic",

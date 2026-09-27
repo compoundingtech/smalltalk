@@ -676,3 +676,329 @@ mission "cli/child" state="ready" {
 
     server.abort();
 }
+
+async fn run_queue_cli(socket: &Path, config_home: &Path, json: bool, args: &[&str]) -> Output {
+    let binary = assert_cmd::cargo::cargo_bin!("st3").to_path_buf();
+    let socket = socket.to_path_buf();
+    let config_home = config_home.to_path_buf();
+    let args = args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>();
+    tokio::task::spawn_blocking(move || {
+        let mut command = std::process::Command::new(binary);
+        command
+            .env("XDG_CONFIG_HOME", config_home)
+            .arg("--endpoint")
+            .arg(socket);
+        if json {
+            command.arg("--json");
+        }
+        command.args(args).output().unwrap()
+    })
+    .await
+    .unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn agents_queue_cli_shows_seat_order_and_records_person_and_agent_moves() {
+    let root = tempfile::tempdir().unwrap();
+    let socket = root.path().join("st3.sock");
+    let config_home = root.path().join("config");
+    std::fs::create_dir_all(config_home.join("st3")).unwrap();
+    std::fs::write(
+        config_home.join("st3/config.toml"),
+        "person = \"person/config-operator\"\n",
+    )
+    .unwrap();
+    let state = test_state(root.path());
+    let store = state.store.clone();
+    let source = r#"version 2
+agent "queue-seat" { workspace "/tmp"; command "true" }
+agent "queue-chief" {
+  workspace "/tmp"
+  command "true"
+  queue-authority { move "client-v0-cli.queue-seat" }
+}
+mission "queued-work" state="ready" {
+  concurrent-runs
+  goal "Give the durable seat one step in each run."
+  step "work" { assigned-to "agent/queue-seat" }
+}
+"#;
+    let intent = st3::graph::parse_intent(source, "client-v0-cli").unwrap();
+    let planned = store
+        .mission(
+            &intent,
+            IntentInput {
+                kdl: source.into(),
+                source_name: None,
+            },
+        )
+        .unwrap();
+    store
+        .apply(&intent, &planned.subject_tokens, "cli-queue-missions")
+        .unwrap();
+    let mut runs = Vec::new();
+    for index in 0..3 {
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let run = store
+            .create_mission_run(&MissionRunRequest {
+                mission: "queued-work".into(),
+                revision: None,
+                workspace: "/tmp".into(),
+                requester: Some("person/requester".into()),
+                mode: Some("run".into()),
+                inputs: BTreeMap::new(),
+                idempotency_key: format!("cli-queue-run-{index}"),
+            })
+            .unwrap();
+        store
+            .set_step_state(&run.steps[0].subject, "ready", None)
+            .unwrap();
+        runs.push(run);
+    }
+    let seat = runs[0].steps[0].assigned_to.clone().unwrap();
+    let run = |index: usize| runs[index].subject.as_str();
+    let step = |index: usize| runs[index].steps[0].subject.as_str();
+
+    let server_socket = socket.clone();
+    let server =
+        tokio::spawn(
+            async move { st3::api::serve_unix(&server_socket, st3::api::router(state)).await },
+        );
+    for _ in 0..100 {
+        if socket.exists() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert!(socket.exists(), "client-v0 test socket did not appear");
+
+    let queue =
+        value(&run_queue_cli(&socket, &config_home, true, &["agents", "queue", &seat]).await);
+    assert_eq!(queue["api_version"], "st3.client.v0");
+    assert_eq!(queue["value"]["kind"], "agent-queue");
+    assert_eq!(queue["value"]["next_work_id"], step(0));
+
+    let bare = seat.strip_prefix("agent/").unwrap();
+    let human = run_queue_cli(&socket, &config_home, false, &["agents", "queue", bare]).await;
+    assert!(
+        human.status.success(),
+        "{}",
+        String::from_utf8_lossy(&human.stderr)
+    );
+    let human = String::from_utf8(human.stdout).unwrap();
+    assert!(
+        human.starts_with(&format!("AGENT QUEUE  {seat}\n")),
+        "{human}"
+    );
+    assert!(human.contains("CURRENT      none\n"), "{human}");
+    assert!(
+        human.contains(&format!("NEXT WORK    {}\n", step(0))),
+        "{human}"
+    );
+    assert!(
+        human.contains(&format!("  1. {}  ready  next {}\n", run(0), step(0))),
+        "{human}"
+    );
+    assert!(
+        human.contains(&format!("  3. {}  ready  {}\n", run(2), step(2))),
+        "{human}"
+    );
+    assert!(human.contains("MOVES        0 total\n"), "{human}");
+
+    let moved = run_queue_cli(
+        &socket,
+        &config_home,
+        false,
+        &[
+            "agents",
+            "queue",
+            "move",
+            &seat,
+            run(2),
+            "--top",
+            "--reason",
+            "the release needs it first",
+            "--as",
+            "person/queue-operator",
+        ],
+    )
+    .await;
+    assert!(
+        moved.status.success(),
+        "{}",
+        String::from_utf8_lossy(&moved.stderr)
+    );
+    let moved = String::from_utf8(moved.stdout).unwrap();
+    assert!(
+        moved.contains(&format!("  1. {}  ready  next {}\n", run(2), step(2))),
+        "{moved}"
+    );
+    assert!(moved.contains("MOVES        1 total\n"), "{moved}");
+    assert!(
+        moved.contains(&format!(
+            "  person/queue-operator moved {} to the top: the release needs it first\n",
+            run(2)
+        )),
+        "{moved}"
+    );
+
+    let result = value(
+        &run_queue_cli(
+            &socket,
+            &config_home,
+            true,
+            &["agents", "queue", "move", &seat, run(0), "--after", run(1)],
+        )
+        .await,
+    );
+    assert_eq!(result["value"]["status"], "completed");
+    let queue =
+        value(&run_queue_cli(&socket, &config_home, true, &["agents", "queue", &seat]).await);
+    let order = queue["value"]["runs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|run| run["mission_run_id"].as_str().unwrap().to_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(order, [run(2), run(1), run(0)]);
+    assert_eq!(
+        queue["value"]["moves"][0]["actor_id"],
+        "person/config-operator"
+    );
+    assert_eq!(queue["value"]["moves"][0]["placement"], "after");
+    assert_eq!(queue["value"]["moves"][0]["anchor_run_id"], run(1));
+
+    // An agent with queue authority for the seat moves runs as itself.
+    let chief = "agent/client-v0-cli.queue-chief";
+    let moved = run_queue_cli(
+        &socket,
+        &config_home,
+        false,
+        &[
+            "agents",
+            "queue",
+            "move",
+            &seat,
+            run(1),
+            "--top",
+            "--reason",
+            "the chief needs it first",
+            "--as",
+            chief,
+        ],
+    )
+    .await;
+    assert!(
+        moved.status.success(),
+        "{}",
+        String::from_utf8_lossy(&moved.stderr)
+    );
+    let moved = String::from_utf8(moved.stdout).unwrap();
+    assert!(
+        moved.contains(&format!("  1. {}  ready  next {}\n", run(1), step(1))),
+        "{moved}"
+    );
+    assert!(
+        moved.contains(&format!(
+            "  {chief} moved {} to the top: the chief needs it first\n",
+            run(1)
+        )),
+        "{moved}"
+    );
+    let claim = value(
+        &run_queue_cli(
+            &socket,
+            &config_home,
+            true,
+            &[
+                "agents",
+                "queue",
+                "move",
+                &seat,
+                run(0),
+                "--before",
+                run(1),
+                "--as",
+                chief,
+            ],
+        )
+        .await,
+    );
+    assert_eq!(claim["kind"], "agent.queue.moved");
+    assert_eq!(claim["actor"], chief);
+    assert_eq!(claim["subject"], seat);
+    assert_eq!(claim["body"]["fields"]["anchor"], run(1));
+    let queue =
+        value(&run_queue_cli(&socket, &config_home, true, &["agents", "queue", &seat]).await);
+    assert_eq!(queue["value"]["runs"][0]["mission_run_id"], run(0));
+    assert_eq!(queue["value"]["moves"][0]["actor_id"], chief);
+    assert_eq!(queue["value"]["move_count"], 4);
+
+    // The seat has no grant over its own queue.
+    let refused = run_queue_cli(
+        &socket,
+        &config_home,
+        false,
+        &[
+            "agents",
+            "queue",
+            "move",
+            &seat,
+            run(2),
+            "--top",
+            "--as",
+            &seat,
+        ],
+    )
+    .await;
+    assert!(!refused.status.success());
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("queue-authority-denied"),
+        "{}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    let refused = run_queue_cli(
+        &socket,
+        &config_home,
+        false,
+        &[
+            "agents",
+            "queue",
+            "move",
+            &seat,
+            run(2),
+            "--top",
+            "--as",
+            "operator",
+        ],
+    )
+    .await;
+    assert!(!refused.status.success());
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("`person/NAME` or `agent/PATH`"),
+        "{}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+
+    let refused = run_queue_cli(
+        &socket,
+        &config_home,
+        false,
+        &[
+            "agents",
+            "queue",
+            "move",
+            &seat,
+            "mission-run/absent",
+            "--bottom",
+        ],
+    )
+    .await;
+    assert!(!refused.status.success());
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("is not queued"),
+        "{}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    server.abort();
+}

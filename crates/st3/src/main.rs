@@ -887,6 +887,56 @@ enum AgentsCommand {
     Start(AgentStartArgs),
     /// Stop one exact durable seat.
     Stop(AgentStopArgs),
+    /// Show one seat's current claim and its queued mission runs in order, or move a run.
+    Queue(AgentQueueArgs),
+}
+
+#[derive(Args)]
+#[command(args_conflicts_with_subcommands = true, subcommand_negates_reqs = true)]
+struct AgentQueueArgs {
+    #[command(subcommand)]
+    command: Option<AgentQueueCommand>,
+    /// Exact seat subject or its identity without the `agent/` prefix.
+    #[arg(required = true)]
+    agent: Option<String>,
+}
+
+#[derive(Subcommand)]
+enum AgentQueueCommand {
+    /// Move one queued mission run. A step the seat already holds stays held.
+    Move(AgentQueueMoveArgs),
+}
+
+#[derive(Args)]
+#[command(group(
+    clap::ArgGroup::new("placement")
+        .required(true)
+        .args(["top", "bottom", "before", "after"])
+))]
+struct AgentQueueMoveArgs {
+    /// Exact seat subject or its identity without the `agent/` prefix.
+    agent: String,
+    /// Queued mission run to move.
+    run: String,
+    /// Put the run first in the seat's queue.
+    #[arg(long)]
+    top: bool,
+    /// Put the run last in the seat's queue.
+    #[arg(long)]
+    bottom: bool,
+    /// Put the run directly before another queued run.
+    #[arg(long, value_name = "RUN")]
+    before: Option<String>,
+    /// Put the run directly after another queued run.
+    #[arg(long, value_name = "RUN")]
+    after: Option<String>,
+    /// Why the order changed; recorded with the move.
+    #[arg(long)]
+    reason: Option<String>,
+    /// Person or agent making the move; defaults to `person` in the st3 config. An agent needs
+    /// `queue-authority { move "SEAT" }` for this seat in its declaration.
+    #[arg(long = "as", value_parser = parse_queue_move_actor)]
+    actor: Option<String>,
 }
 
 #[derive(Args)]
@@ -1415,7 +1465,9 @@ async fn run(cli: Cli) -> Result<()> {
             .await
         }
         Command::Machines(args) => run_machines(&endpoint, args, cli.json).await,
-        Command::Agents { command } => run_agents(&endpoint, command, cli.json).await,
+        Command::Agents { command } => {
+            run_agents(&endpoint, config.person.as_deref(), command, cli.json).await
+        }
         Command::Conversations { command } => {
             run_message(
                 &client,
@@ -4398,8 +4450,16 @@ fn render_import_session(session: &st3_client::Session) -> String {
     output
 }
 
-async fn run_agents(endpoint: &Endpoint, command: AgentsCommand, json_output: bool) -> Result<()> {
+async fn run_agents(
+    endpoint: &Endpoint,
+    configured_person: Option<&str>,
+    command: AgentsCommand,
+    json_output: bool,
+) -> Result<()> {
     match command {
+        AgentsCommand::Queue(args) => {
+            run_agent_queue(endpoint, configured_person, args, json_output).await
+        }
         AgentsCommand::Apply(args) => {
             let client = Client::new(endpoint.clone());
             let (kdl, source_name) = read_intent(Some(&args.file))?;
@@ -4532,8 +4592,11 @@ async fn run_agent_inspection(
             print!("{}", render_client_agent(&agent));
             return Ok(());
         }
-        AgentsCommand::Apply(_) | AgentsCommand::Start(_) | AgentsCommand::Stop(_) => {
-            unreachable!("agent mutation commands return before inspection")
+        AgentsCommand::Apply(_)
+        | AgentsCommand::Start(_)
+        | AgentsCommand::Stop(_)
+        | AgentsCommand::Queue(_) => {
+            unreachable!("agent mutation and queue commands return before inspection")
         }
     };
     anyhow::ensure!(
@@ -4572,6 +4635,197 @@ async fn run_agent_inspection(
         render_client_agents(&response.value, tree, args.enrich, &continuation)
     );
     Ok(())
+}
+
+fn seat_subject(value: &str) -> String {
+    if value.starts_with("agent/") {
+        value.to_owned()
+    } else {
+        format!("agent/{value}")
+    }
+}
+
+fn mission_run_subject(value: &str) -> String {
+    if value.starts_with("mission-run/") {
+        value.to_owned()
+    } else {
+        format!("mission-run/{value}")
+    }
+}
+
+async fn run_agent_queue(
+    endpoint: &Endpoint,
+    configured_person: Option<&str>,
+    args: AgentQueueArgs,
+    json_output: bool,
+) -> Result<()> {
+    let Some(AgentQueueCommand::Move(args)) = args.command else {
+        let agent = seat_subject(&args.agent.context("st3 agents queue needs an AGENT")?);
+        let response = generated_client(endpoint, None)?
+            .agent_queue(&agent)
+            .await?;
+        if json_output {
+            return print_value(&response, true);
+        }
+        print!("{}", render_agent_queue(&response.value));
+        return Ok(());
+    };
+    let actor = args.actor.as_deref().or(configured_person).context(
+        "st3 agents queue move needs `--as person/NAME`, `--as agent/PATH`, or `person = \"person/NAME\"` in the st3 config",
+    )?;
+    let actor = parse_queue_move_actor(actor).map_err(anyhow::Error::msg)?;
+    let agent = seat_subject(&args.agent);
+    let (placement, anchor) = if args.top {
+        (st3_client::AgentQueuePlacement::Top, None)
+    } else if args.bottom {
+        (st3_client::AgentQueuePlacement::Bottom, None)
+    } else if let Some(before) = args.before.as_deref() {
+        (
+            st3_client::AgentQueuePlacement::Before,
+            Some(mission_run_subject(before)),
+        )
+    } else if let Some(after) = args.after.as_deref() {
+        (
+            st3_client::AgentQueuePlacement::After,
+            Some(mission_run_subject(after)),
+        )
+    } else {
+        anyhow::bail!("choose one of --top, --bottom, --before RUN, or --after RUN");
+    };
+    let nonce = uuid::Uuid::now_v7().simple().to_string();
+    if actor.starts_with("agent/") {
+        // Client-v0 actions carry person authority only. The daemon checks an agent's queue
+        // authority on this route.
+        let claim: ClaimRecord = Client::new(endpoint.clone())
+            .post(
+                "/v1/agent-queue-moves",
+                &st3::model::SeatQueueMoveRequest {
+                    agent: agent.clone(),
+                    run: mission_run_subject(&args.run),
+                    placement: match placement {
+                        st3_client::AgentQueuePlacement::Top => "top",
+                        st3_client::AgentQueuePlacement::Bottom => "bottom",
+                        st3_client::AgentQueuePlacement::Before => "before",
+                        st3_client::AgentQueuePlacement::After => "after",
+                    }
+                    .into(),
+                    anchor,
+                    reason: args.reason,
+                    actor,
+                    idempotency_key: format!("agent-queue-move:{nonce}"),
+                },
+            )
+            .await?;
+        if json_output {
+            return print_value(&claim, true);
+        }
+        let queue = generated_client(endpoint, None)?
+            .agent_queue(&agent)
+            .await?;
+        print!("{}", render_agent_queue(&queue.value));
+        return Ok(());
+    }
+    let client = generated_client(endpoint, Some(&actor))?;
+    let capabilities = client.capabilities().await?;
+    let response = client
+        .agent_queue_move(
+            format!("action/{nonce}"),
+            format!("agent-queue-move:{nonce}"),
+            ClientFence {
+                snapshot_id: capabilities.snapshot.id,
+                ..ClientFence::default()
+            },
+            st3_client::AgentQueueMoveParameters {
+                agent_id: agent.clone(),
+                mission_run_id: mission_run_subject(&args.run),
+                placement,
+                anchor_run_id: anchor,
+                reason: args.reason,
+            },
+        )
+        .await?;
+    if json_output {
+        return print_value(&response, true);
+    }
+    let queue = client.agent_queue(&agent).await?;
+    print!("{}", render_agent_queue(&queue.value));
+    Ok(())
+}
+
+fn render_agent_queue(queue: &st3_client::AgentQueue) -> String {
+    use std::fmt::Write as _;
+
+    let mut output = String::new();
+    let _ = writeln!(output, "AGENT QUEUE  {}", queue.agent_id);
+    if queue.current_work_ids.is_empty() {
+        let _ = writeln!(output, "CURRENT      none");
+    }
+    for current in &queue.current_work_ids {
+        let _ = writeln!(output, "CURRENT      {current}");
+    }
+    let _ = writeln!(
+        output,
+        "NEXT WORK    {}",
+        queue.next_work_id.as_deref().unwrap_or("none")
+    );
+    let _ = writeln!(output, "RUNS         {}", queue.runs.len());
+    if queue.runs.is_empty() {
+        let _ = writeln!(output, "  No mission runs are queued for this seat.");
+    }
+    for run in &queue.runs {
+        let detail = match run.state.as_str() {
+            "claimed" => run.claimed_work_ids.join(", "),
+            "ready" => {
+                let first = run.ready_work_ids.first().map_or("", String::as_str);
+                let marker = if queue.next_work_id.as_deref() == Some(first) {
+                    "next "
+                } else {
+                    ""
+                };
+                match run.ready_work_ids.len() {
+                    0 | 1 => format!("{marker}{first}"),
+                    count => format!("{marker}{first} (+{} ready)", count - 1),
+                }
+            }
+            _ if run.waiting_work_ids.is_empty() => "no open step for this seat".into(),
+            _ => format!("{} not ready", run.waiting_work_ids.join(", ")),
+        };
+        let run_state = if run.run_state == "running" {
+            String::new()
+        } else {
+            format!(" (run {})", run.run_state)
+        };
+        let _ = writeln!(
+            output,
+            "  {}. {}  {}{}  {}",
+            run.position, run.mission_run_id, run.state, run_state, detail
+        );
+    }
+    let _ = writeln!(output, "MOVES        {} total", queue.move_count);
+    for moved in &queue.moves {
+        let placement = match (moved.placement, moved.anchor_run_id.as_deref()) {
+            (st3_client::AgentQueuePlacement::Top, _) => "to the top".to_owned(),
+            (st3_client::AgentQueuePlacement::Bottom, _) => "to the bottom".to_owned(),
+            (st3_client::AgentQueuePlacement::Before, anchor) => {
+                format!("before {}", anchor.unwrap_or("another run"))
+            }
+            (st3_client::AgentQueuePlacement::After, anchor) => {
+                format!("after {}", anchor.unwrap_or("another run"))
+            }
+        };
+        let _ = write!(
+            output,
+            "  {}  {} moved {} {placement}",
+            moved.moved_at,
+            moved.actor_id.as_deref().unwrap_or("unknown"),
+            moved.mission_run_id
+        );
+        if let Some(reason) = moved.reason.as_deref() {
+            let _ = write!(output, ": {reason}");
+        }
+        let _ = writeln!(output);
+    }
+    output
 }
 
 fn render_client_agent(agent: &st3_client::Agent) -> String {
@@ -6225,6 +6479,15 @@ fn parse_person_subject(actor: &str) -> std::result::Result<String, String> {
         return Err("human authority must be a complete `person/NAME` subject".into());
     }
     Ok(actor.to_owned())
+}
+
+fn parse_queue_move_actor(actor: &str) -> std::result::Result<String, String> {
+    let parsed = if actor.starts_with("agent/") {
+        parse_publication_actor(actor)
+    } else {
+        parse_person_subject(actor)
+    };
+    parsed.map_err(|_| "a queue move needs a complete `person/NAME` or `agent/PATH` subject".into())
 }
 
 fn parse_publication_actor(actor: &str) -> std::result::Result<String, String> {
@@ -8169,6 +8432,57 @@ mod tests {
         let card = render_client_agent(&agent);
         assert!(card.contains("CURRENT WORK step-run/older/work"));
         assert!(card.contains("NEXT WORK    step-run/newer/review"));
+    }
+
+    #[test]
+    fn agent_queue_view_lists_the_claim_then_runs_in_order_and_moves() {
+        let queue: st3_client::AgentQueue = serde_json::from_value(serde_json::json!({
+            "kind": "agent-queue", "agent_id": "agent/fleet/worker",
+            "current_work_ids": ["step-run/held/build"],
+            "next_work_id": "step-run/second/review",
+            "runs": [
+                {
+                    "mission_run_id": "mission-run/held", "position": 1, "state": "claimed",
+                    "run_state": "running", "joined_at": "2026-09-24T09:00:00.000Z",
+                    "claimed_work_ids": ["step-run/held/build"], "ready_work_ids": [],
+                    "waiting_work_ids": []
+                },
+                {
+                    "mission_run_id": "mission-run/gated", "position": 2, "state": "waiting",
+                    "run_state": "running", "joined_at": "2026-09-24T09:01:00.000Z",
+                    "claimed_work_ids": [], "ready_work_ids": [],
+                    "waiting_work_ids": ["step-run/gated/ship"]
+                },
+                {
+                    "mission_run_id": "mission-run/second", "position": 3, "state": "ready",
+                    "run_state": "running", "joined_at": "2026-09-24T09:02:00.000Z",
+                    "claimed_work_ids": [],
+                    "ready_work_ids": ["step-run/second/review", "step-run/second/docs"],
+                    "waiting_work_ids": []
+                }
+            ],
+            "moves": [{
+                "claim_id": "claim-one", "mission_run_id": "mission-run/held",
+                "placement": "before", "anchor_run_id": "mission-run/gated",
+                "actor_id": "person/operator", "reason": "finish the build first",
+                "moved_at": "2026-09-24T09:03:00.000Z"
+            }],
+            "move_count": 1
+        }))
+        .unwrap();
+        assert_eq!(
+            render_agent_queue(&queue),
+            "AGENT QUEUE  agent/fleet/worker\n\
+             CURRENT      step-run/held/build\n\
+             NEXT WORK    step-run/second/review\n\
+             RUNS         3\n  \
+             1. mission-run/held  claimed  step-run/held/build\n  \
+             2. mission-run/gated  waiting  step-run/gated/ship not ready\n  \
+             3. mission-run/second  ready  next step-run/second/review (+1 ready)\n\
+             MOVES        1 total\n  \
+             2026-09-24T09:03:00.000Z  person/operator moved mission-run/held before \
+             mission-run/gated: finish the build first\n"
+        );
     }
 
     #[tokio::test]

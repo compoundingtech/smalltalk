@@ -3375,6 +3375,75 @@ mission "bad" state="ready" { goal "Reject a duplicate rule."; agent "bad" { wor
     }
 
     #[test]
+    fn agent_queue_authority_uses_exact_and_terminal_seat_rules() {
+        let intent = crate::graph::parse_intent(
+            r#"version 2
+mission "standing" state="ready" {
+  goal "Keep the chief of staff available."
+  agent "chief" {
+    workspace "."
+    command "true"
+    queue-authority {
+      move "fleet/fabric/builder"
+      move "fleet/review/*"
+      move "${ST_MISSION_RUN}/worker"
+    }
+  }
+}"#,
+            "node",
+        )
+        .unwrap();
+        // A run interpolates its declarations before it materializes them.
+        let declarations = super::interpolate_kdl(
+            intent.missions["standing"]
+                .declarations_kdl
+                .as_deref()
+                .unwrap(),
+            &std::collections::BTreeMap::from([("ST_MISSION_RUN".into(), "standing".into())]),
+        )
+        .unwrap();
+        let runtime =
+            crate::graph::parse_execution_intent(&declarations, "node", "standing").unwrap();
+        let desired = &runtime.subjects["agent/standing/chief"].desired;
+        let authority = crate::graph::agent_queue_authority(desired);
+        assert!(authority.allows_move("agent/fleet/fabric/builder"));
+        assert!(authority.allows_move("fleet/fabric/builder"));
+        assert!(!authority.allows_move("agent/fleet/fabric/builder-two"));
+        assert!(authority.allows_move("agent/fleet/review/one"));
+        assert!(!authority.allows_move("agent/fleet/reviews/one"));
+        assert!(!authority.allows_move("agent/fleet/review"));
+        assert!(authority.allows_move("agent/standing/worker"));
+        assert!(!authority.allows_move("agent/standing/chief"));
+        assert_eq!(
+            crate::graph::agent_mission_authority(desired),
+            crate::model::MissionAuthority::default(),
+            "queue authority grants no mission authority"
+        );
+
+        for source in [
+            r#"version 2
+mission "bad" state="ready" { goal "Reject empty authority."; agent "bad" { workspace "."; command "true"; queue-authority { } } }"#,
+            r#"version 2
+mission "bad" state="ready" { goal "Reject a prefixed seat."; agent "bad" { workspace "."; command "true"; queue-authority { move "agent/fleet/worker" } } }"#,
+            r#"version 2
+mission "bad" state="ready" { goal "Reject an internal wildcard."; agent "bad" { workspace "."; command "true"; queue-authority { move "fleet/*/worker" } } }"#,
+            r#"version 2
+mission "bad" state="ready" { goal "Reject a bare wildcard."; agent "bad" { workspace "."; command "true"; queue-authority { move "*" } } }"#,
+            r#"version 2
+mission "bad" state="ready" { goal "Reject a duplicate rule."; agent "bad" { workspace "."; command "true"; queue-authority { move "fleet/*"; move "fleet/*" } } }"#,
+            r#"version 2
+mission "bad" state="ready" { goal "Reject an unknown verb."; agent "bad" { workspace "."; command "true"; queue-authority { reorder "fleet/worker" } } }"#,
+            r#"version 2
+mission "bad" state="ready" { goal "Reject a second block."; agent "bad" { workspace "."; command "true"; queue-authority { move "a" }; queue-authority { move "b" } } }"#,
+        ] {
+            assert!(
+                crate::graph::parse_intent(source, "node").is_err(),
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
     fn nested_declarations_are_fully_validated_before_publication() {
         let declarations = [
             r#"agent "worker" { command "true"; unexpected "value" }"#,

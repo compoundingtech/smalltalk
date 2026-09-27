@@ -165,8 +165,17 @@ identity or graph context from prose.
 Each agent resource includes `current_work_ids` and an ordered `upcoming_work_ids` preview across
 mission runs. `next_work_id` is the first ready item, even while another step occupies the agent's
 work seat. `active_work_count` and `queued_work_count` give complete counts; the ID lists include
-at most five items each. Ready work is ordered by step creation time and then subject ID. These
-fields describe the queue and do not imply that an active claim is making progress.
+at most five items each. Ready work follows the agent's seat queue: mission runs in queue order,
+then step creation time and subject ID inside one run. These fields describe the queue and do not
+imply that an active claim is making progress.
+
+`GET /v1/client/agent-queues/{agent_id}` returns one `AgentQueue` value for a seat: its
+`current_work_ids`, its `next_work_id`, each queued mission run in order with `position`, `state`
+(`claimed`, `ready`, or `waiting`), the run's own state, its join time, and its claimed, ready, and
+waiting step IDs, and then the recent moves, newest first, with `move_count` for the full history.
+Each move names its run, placement, optional anchor run, actor, optional reason, and time. A run
+joins the queue when it first has a step assigned to the seat and leaves when it is terminal. An
+unknown agent returns `not-found`.
 
 ## Harness-neutral session timeline
 
@@ -248,9 +257,15 @@ The v0 action discriminators are:
 | Missions | `mission.start`, `mission.revise`, `mission.approve-revision`, `mission.cancel-revision`, `mission.cancel` | mission revision and current generation where applicable |
 | Sessions | `session.import` | exact native-session revision; an exact running-process fingerprint is revalidated server-side |
 | Work | `work.claim`, `work.renew`, `work.progress`, `work.complete`, `work.fail`, `work.release`, `work.publish-mission` | generation, definition, attempt, readiness epoch, and claimant incarnation after claim |
+| Seat queues | `agent.queue-move` | snapshot; the run and any anchor run must be queued for the seat |
 | Runtimes | `runtime.stop`, `runtime.restart`, `runtime.reset`, `runtime.context-clear`, `runtime.signal` | runtime incarnation and desired revision |
 | Terminals | `terminal.input`, `terminal.resize`, `terminal.attach`, `terminal.detach` | runtime incarnation and terminal sequence |
 | Pairing | `pairing.begin`, `pairing.complete`, `pairing.revoke` | pairing/device revision where applicable |
+
+`agent.queue-move` takes `agent_id`, `mission_run_id`, `placement` (`top`, `bottom`, `before`, or
+`after`), `anchor_run_id` for `before` and `after`, and an optional `reason`. It records one
+`agent.queue.moved` claim with the session's person as actor. It never changes a step the seat
+already holds. A run or anchor that is not queued for the seat returns `validation-failed`.
 
 An accepted action returns one stable operation ID and status. `202 accepted` means the command is
 durable, not complete; clients follow operation events or read `/operations/{id}`. Result objects

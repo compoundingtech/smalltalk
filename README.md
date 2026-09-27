@@ -128,6 +128,7 @@ st3 missions ls
 st3 missions show MISSION_OR_RUN
 st3 agents ls
 st3 agents tree
+st3 agents queue AGENT
 st3 work ls
 st3 terminals ls
 st3 activity

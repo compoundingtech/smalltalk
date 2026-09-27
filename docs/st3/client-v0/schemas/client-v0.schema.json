@@ -56,7 +56,8 @@
             { "$ref": "#/$defs/PairingChallenge" },
             { "$ref": "#/$defs/PairedSession" },
             { "$ref": "#/$defs/TerminalScreen" },
-            { "$ref": "#/$defs/TerminalFramePage" }
+            { "$ref": "#/$defs/TerminalFramePage" },
+            { "$ref": "#/$defs/AgentQueue" }
           ]
         }
       }
@@ -481,6 +482,49 @@
         "reason": { "type": ["string", "null"] }
       }
     },
+    "AgentQueue": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "agent_id", "current_work_ids", "next_work_id", "runs", "moves", "move_count"],
+      "properties": {
+        "kind": { "const": "agent-queue" },
+        "agent_id": { "$ref": "#/$defs/Id" },
+        "current_work_ids": { "type": "array", "items": { "$ref": "#/$defs/Id" } },
+        "next_work_id": { "oneOf": [{ "$ref": "#/$defs/Id" }, { "type": "null" }] },
+        "runs": { "type": "array", "items": { "$ref": "#/$defs/AgentQueueRun" } },
+        "moves": { "type": "array", "items": { "$ref": "#/$defs/AgentQueueMove" } },
+        "move_count": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "AgentQueueRun": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mission_run_id", "position", "state", "run_state", "joined_at", "claimed_work_ids", "ready_work_ids", "waiting_work_ids"],
+      "properties": {
+        "mission_run_id": { "$ref": "#/$defs/Id" },
+        "position": { "type": "integer", "minimum": 1 },
+        "state": { "enum": ["claimed", "ready", "waiting"] },
+        "run_state": { "type": "string" },
+        "joined_at": { "$ref": "#/$defs/Timestamp" },
+        "claimed_work_ids": { "type": "array", "items": { "$ref": "#/$defs/Id" } },
+        "ready_work_ids": { "type": "array", "items": { "$ref": "#/$defs/Id" } },
+        "waiting_work_ids": { "type": "array", "items": { "$ref": "#/$defs/Id" } }
+      }
+    },
+    "AgentQueueMove": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["claim_id", "mission_run_id", "placement", "anchor_run_id", "actor_id", "reason", "moved_at"],
+      "properties": {
+        "claim_id": { "type": "string" },
+        "mission_run_id": { "$ref": "#/$defs/Id" },
+        "placement": { "enum": ["top", "bottom", "before", "after"] },
+        "anchor_run_id": { "oneOf": [{ "$ref": "#/$defs/Id" }, { "type": "null" }] },
+        "actor_id": { "oneOf": [{ "$ref": "#/$defs/Id" }, { "type": "null" }] },
+        "reason": { "type": ["string", "null"] },
+        "moved_at": { "$ref": "#/$defs/Timestamp" }
+      }
+    },
     "Runtime": {
       "allOf": [
         { "$ref": "#/$defs/ResourceHeader" },
@@ -839,7 +883,7 @@
         "api_version": { "const": "st3.client.v0" },
         "id": { "$ref": "#/$defs/Id" },
         "type": {
-          "enum": ["attention.resolve", "review.approve", "review.reject", "message.send", "message.read", "message.close", "launch.create", "launch.revise", "launch.preview", "launch.approve", "launch.cancel", "mission.start", "mission.revise", "mission.approve-revision", "mission.cancel-revision", "mission.cancel", "session.import", "work.claim", "work.renew", "work.progress", "work.complete", "work.fail", "work.release", "work.publish-mission", "runtime.stop", "runtime.restart", "runtime.reset", "runtime.context-clear", "runtime.signal", "terminal.input", "terminal.resize", "terminal.attach", "terminal.detach", "pairing.revoke"]
+          "enum": ["attention.resolve", "review.approve", "review.reject", "message.send", "message.read", "message.close", "launch.create", "launch.revise", "launch.preview", "launch.approve", "launch.cancel", "mission.start", "mission.revise", "mission.approve-revision", "mission.cancel-revision", "mission.cancel", "session.import", "work.claim", "work.renew", "work.progress", "work.complete", "work.fail", "work.release", "work.publish-mission", "agent.queue-move", "runtime.stop", "runtime.restart", "runtime.reset", "runtime.context-clear", "runtime.signal", "terminal.input", "terminal.resize", "terminal.attach", "terminal.detach", "pairing.revoke"]
         },
         "idempotency_key": { "type": "string", "minLength": 16, "maxLength": 256 },
         "fence": { "$ref": "#/$defs/Fence" },
@@ -968,6 +1012,21 @@
             "parameters": {
               "type": "object", "additionalProperties": false, "required": ["target_id", "name", "mission"],
               "properties": { "target_id": { "$ref": "#/$defs/Id" }, "name": { "type": "string" }, "mission": { "type": "object" } }
+            }
+          }
+        },
+        {
+          "properties": {
+            "type": { "const": "agent.queue-move" },
+            "parameters": {
+              "type": "object", "additionalProperties": false, "required": ["agent_id", "mission_run_id", "placement"],
+              "properties": {
+                "agent_id": { "$ref": "#/$defs/Id" },
+                "mission_run_id": { "$ref": "#/$defs/Id" },
+                "placement": { "enum": ["top", "bottom", "before", "after"] },
+                "anchor_run_id": { "$ref": "#/$defs/Id" },
+                "reason": { "type": "string" }
+              }
             }
           }
         },

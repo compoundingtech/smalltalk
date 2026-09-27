@@ -883,12 +883,50 @@ incarnation. It is not a messaging or work-wake transport.
 
 When an exactly assigned step becomes ready, the reconciler sends a durable work message for the
 current harness incarnation. Each agent has one work seat across mission runs: a claimed,
-working, or verifying step occupies it. Ready steps wait in creation order, with the subject as a
-stable tie breaker. Only the first ready step is woken when the seat is free. Queued steps do not
-consume wake attempts or arm retry timers while the agent is busy. Delivery is acknowledged by a
-new working turn or by claiming the step. An unacknowledged delivery is retried after 15 seconds,
-at most three times. Exhaustion writes a `work-wake-exhausted` harness diagnostic naming the step,
-incarnation, and attempt count.
+working, or verifying step occupies it. Ready steps wait in the seat queue described below. Only
+the seat's next work is woken when the seat is free. Queued steps do not consume wake attempts or
+arm retry timers while the agent is busy. Delivery is acknowledged by a new working turn or by
+claiming the step. An unacknowledged delivery is retried after 15 seconds, at most three times.
+Exhaustion writes a `work-wake-exhausted` harness diagnostic naming the step, incarnation, and
+attempt count.
+
+## Seat queues
+
+Each agent seat has one ordered queue of the mission runs that have steps assigned to it. A run
+joins the end of the queue when it first has a step for that seat, and it leaves when the run is
+terminal. A new generation from a revision keeps the run's place.
+
+The seat's next work is the first ready step, in queue order, that is assigned to the seat. A run
+whose steps for the seat are waiting on a gate, a dependency, or another seat is passed over, so
+it never blocks the runs behind it. It becomes next again as soon as it has a ready step. Inside
+one run, `depends-on` and `queue {}` still decide which steps are ready, and ready steps of the
+same run keep creation order. `st3 agents show`, `st3 agents ls --enrich`, and the reconciler's
+work wake all use this one selector.
+
+The queue matters most for a durable top-level seat that serves many runs. A mission-scoped seat
+normally serves one run, so its queue has one entry.
+
+```sh
+st3 agents queue agent/fleet/example/worker
+st3 agents queue move agent/fleet/example/worker mission-run/release/2026-09-26 --top \
+  --reason "the release needs this first" --as person/operator
+st3 agents queue move agent/fleet/example/worker mission-run/docs/2026-09-26 \
+  --after mission-run/release/2026-09-26 --as person/operator
+```
+
+`st3 agents queue AGENT` shows the step the seat holds now, its next work, and then each queued
+run in order with its state: `claimed`, `ready`, or `waiting`. A move places one run at the top,
+at the bottom, or directly before or after another queued run. It needs explicit person
+authority, like other client mutations.
+
+Each move writes one `agent.queue.moved` claim on the agent subject with the run, the placement,
+the optional anchor run, the optional reason, the actor, and the graph time. Replicas rebuild the
+same order from the same replicated claims: joins apply in graph time, and each move applies after
+the joins recorded before it. The queue view lists the recent moves, newest first, so every order
+change has an author and a time.
+
+A move changes only which run is next. It never releases, reassigns, or interrupts a step the seat
+already holds; the new order applies when the seat is free again.
 
 `st3 work show STEP` exposes ready age, assignee state, wake attempts, acknowledgement, and failure.
 An operator can request another delivery through the same driver path with:

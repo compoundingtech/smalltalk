@@ -209,12 +209,20 @@ st3 agents ls --status running --enrich
 st3 agents tree --help
 st3 agents tree --status running --enrich
 st3 agents show --help
+st3 agents queue --help
+st3 agents queue move --help
 st3 machines --help
 st3 machines
 ```
 
 Copy an agent ID into `show`. Check tree nesting, durable seats versus mission-owned agents, current
 runtime, host, work, conversation, stale state, and whether stopped history stays out of the default.
+
+Copy a durable seat into `agents queue`. Check that the current claim comes first, then each queued
+mission run in order with `claimed`, `ready`, or `waiting`, and that `NEXT WORK` matches
+`agents show`. `agents queue move AGENT RUN --top`, `--bottom`, `--before RUN`, or `--after RUN`
+is a person-authorized mutation; move only a run we agreed to reorder, then confirm the move is
+listed with its author and time and that a held step stayed held.
 
 ### 8. `terminals` — inspect and attach without shell nesting
 

@@ -1,0 +1,163 @@
+#!/usr/bin/env bash
+# Build the synthetic seat-queue graph once with the branch binary and keep its
+# claim store. Every measurement window starts from a copy of that store.
+#
+# Usage: fixture BRANCH_ST3 ROOT
+#
+# The graph has 12 durable seats, 60 live runs with 120 steps assigned to seats,
+# 300 queue moves, 8 moved runs that were then cancelled, 600 messages, and
+# harness timeline claims up to about 100,000 claims in all.
+set -Eeuo pipefail
+
+here="$(cd "$(dirname "$0")" && pwd)"
+source "$here/daemon.sh"
+
+st3_bin="$(readlink -f "$1")"
+root=$2
+seats=${PERF_SEATS:-12}
+direct_runs=${PERF_DIRECT_RUNS:-3}
+relay_runs=${PERF_RELAY_RUNS:-2}
+moves=${PERF_MOVES:-300}
+cancels=${PERF_CANCELS:-8}
+messages=${PERF_MESSAGES:-600}
+target_claims=${PERF_CLAIMS:-100000}
+operator=person/perf-operator
+
+mkdir -p "$root/workspace" "$root/kdl"
+perf_start_daemon "$st3_bin" "$root"
+trap 'perf_stop_daemon "$root"' EXIT
+export ST3_ENDPOINT="$root/st3.sock"
+st3="$root/bin/st3"
+
+seat() {
+  printf 'agent/perf/seat-%02d' "$1"
+}
+
+# A command seat keeps a real PTY runtime without a model.
+{
+  echo "version 2"
+  for i in $(seq 1 "$seats"); do
+    printf '\nagent "perf/seat-%02d" {\n  workspace "%s"\n  command "sleep 2147483647"\n  restart "always"\n}\n' \
+      "$i" "$root/workspace"
+  done
+} >"$root/kdl/seats.kdl"
+"$st3" agents apply "$root/kdl/seats.kdl" --as "$operator" >/dev/null
+
+# A direct run is ready for its seat. A relay run waits on the next seat first,
+# so every seat has both ready runs and waiting runs to pass over.
+for i in $(seq 1 "$seats"); do
+  next=$((i % seats + 1))
+  cat >"$root/kdl/direct-$i.kdl" <<KDL
+version 2
+
+mission "perf/direct-$(printf %02d "$i")" state="ready" {
+  concurrent-runs
+  goal "Keep synthetic work ready for one seat."
+  step "build" { assigned-to "$(seat "$i")" }
+  step "review" {
+    assigned-to "$(seat "$i")"
+    depends-on { step "build" completed }
+  }
+}
+KDL
+  cat >"$root/kdl/relay-$i.kdl" <<KDL
+version 2
+
+mission "perf/relay-$(printf %02d "$i")" state="ready" {
+  concurrent-runs
+  goal "Keep synthetic work waiting on another seat."
+  step "prepare" { assigned-to "$(seat "$next")" }
+  step "build" {
+    assigned-to "$(seat "$i")"
+    depends-on { step "prepare" completed }
+  }
+}
+KDL
+  "$st3" missions publish "$root/kdl/direct-$i.kdl" --as "$operator" >/dev/null
+  "$st3" missions publish "$root/kdl/relay-$i.kdl" --as "$operator" >/dev/null
+done
+
+for round in $(seq 1 "$((direct_runs > relay_runs ? direct_runs : relay_runs))"); do
+  for i in $(seq 1 "$seats"); do
+    id=$(printf %02d "$i")
+    if (( round <= direct_runs )); then
+      "$st3" missions start "perf/direct-$id" --id "perf-direct-$id-$round" \
+        --workspace "$root/workspace" --as "$operator" >/dev/null
+    fi
+    if (( round <= relay_runs )); then
+      "$st3" missions start "perf/relay-$id" --id "perf-relay-$id-$round" \
+        --workspace "$root/workspace" --as "$operator" >/dev/null
+    fi
+  done
+done
+
+# Deterministic moves over every placement.
+RANDOM=42
+placements=(top bottom before after)
+: >"$root/moved-runs"
+for _ in $(seq 1 "$moves"); do
+  seat_subject="$(seat $((RANDOM % seats + 1)))"
+  mapfile -t queued < <("$st3" agents queue "$seat_subject" --json | jq -r '.value.runs[].mission_run_id')
+  (( ${#queued[@]} >= 2 )) || continue
+  run_index=$((RANDOM % ${#queued[@]}))
+  anchor_index=$(((run_index + 1 + RANDOM % (${#queued[@]} - 1)) % ${#queued[@]}))
+  placement=${placements[$((RANDOM % 4))]}
+  anchor=()
+  if [[ $placement == before || $placement == after ]]; then
+    anchor=("--$placement" "${queued[$anchor_index]}")
+  else
+    anchor=("--$placement")
+  fi
+  # A move is fenced to the client's snapshot. A busy graph can move on
+  # between the snapshot read and the action, so retry a stale fence.
+  for attempt in 1 2 3 4 5; do
+    if "$st3" agents queue move "$seat_subject" "${queued[$run_index]}" "${anchor[@]}" \
+      --reason "synthetic reorder" --as "$operator" --json >/dev/null 2>"$root/move-error"; then
+      echo "${queued[$run_index]}" >>"$root/moved-runs"
+      break
+    fi
+    grep -q StaleFence "$root/move-error" && (( attempt < 5 )) || { cat "$root/move-error" >&2; exit 1; }
+    echo stale >>"$root/stale-fences"
+  done
+done
+
+# Cancelled runs stay named by moves, so replay still reads them.
+sort -u "$root/moved-runs" | head -n "$cancels" | while read -r run; do
+  "$st3" missions cancel "$run" --reason "synthetic cancellation" --as "$operator" >/dev/null
+done
+
+for number in $(seq 1 "$messages"); do
+  recipient="$(seat $((number % seats + 1)))"
+  message="$("$st3" conversations send "$recipient" --from "$operator" \
+    --subject "synthetic note $number" --body "A synthetic note for the performance fixture." --json \
+    | jq -r '.subject // .value.subject // .id')"
+  if (( number % 6 != 0 )); then
+    "$st3" conversations archive "$message" --as "$recipient" >/dev/null
+  fi
+done
+
+index="$("$st3" trace show --json --limit 1 | jq -s 'map(.store_index) | max')"
+filler=$((target_claims - index))
+if (( filler > 0 )); then
+  mapfile -t seat_subjects < <(for i in $(seq 1 "$seats"); do seat "$i"; done)
+  python3 "$here/timeline.py" "$root/st3.sock" "$filler" "${seat_subjects[@]}"
+fi
+
+"$st3" trace show --json --limit 1 | jq -s '{claims: (map(.store_index) | max)}' >"$root/fixture-summary.json"
+jq -n --argjson queues "$(for i in $(seq 1 "$seats"); do "$st3" agents queue "$(seat "$i")" --json | jq '.value | {agent_id, runs: (.runs | length), moves: .move_count}'; done | jq -s .)" \
+  '$queues' >"$root/fixture-queues.json"
+cat "$root/fixture-summary.json"
+
+trap - EXIT
+perf_stop_daemon "$root"
+state="$(perf_state_dir "$root")"
+store="$root/fixture"
+if [[ -n ${PERF_DATA:-} ]]; then
+  store="$PERF_DATA/fixture"
+  ln -sfn "$store" "$root/fixture"
+fi
+mkdir -p "$store"
+for file in claims.sqlite3 claims.sqlite3-wal claims.sqlite3-shm; do
+  [[ -e "$state/$file" ]] && mv "$state/$file" "$store/$file"
+done
+echo "fixture store: $store"

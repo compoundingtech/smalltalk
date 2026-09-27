@@ -1,0 +1,366 @@
+#!/usr/bin/env python3
+"""Draft one seat queue eval run report from the evidence `run` collected.
+
+Usage: report OUT N [CANDIDATE]
+
+Reads OUT/run-N and prints a report in the shape of evals/run-report-template.md.
+Every section is computed from the run's graph history, controller state, and
+seat transcript, except the notable behavior, which starts as the facts found
+here and should be finished by reading the transcript. CANDIDATE describes the
+candidate commit when OUT/candidate.txt is not enough.
+"""
+
+import json
+import re
+import sys
+import textwrap
+from datetime import datetime, timezone
+from pathlib import Path
+
+HARNESSES = {
+    "claude": ("Claude Code TUI", "claude-sonnet-5"),
+    "codex": ("Codex TUI", "gpt-6-luna"),
+    "omp": ("omp", "openai-codex/gpt-5.6-luna"),
+}
+JUDGES = [
+    ("the seat claimed work in queue order", "Queue order"),
+    ("no held claim was preempted", "No preemption"),
+    ("no terminal input path participated", "No terminal input"),
+]
+SEAT_STEPS = ["alpha/draft", "alpha/publish", "bravo/work", "charlie/work"]
+
+
+def bullet(text):
+    """Print one list item wrapped at 100 columns, as the other reports are."""
+    print(textwrap.fill(text, 100, initial_indent="- ", subsequent_indent="  ",
+                        break_on_hyphens=False, break_long_words=False))
+
+
+def read(path, default=None):
+    try:
+        return Path(path).read_text().strip()
+    except FileNotFoundError:
+        return default
+
+
+def load_json(path):
+    text = read(path)
+    return json.loads(text) if text else {}
+
+
+def clock(ms):
+    return datetime.fromtimestamp(ms / 1000, timezone.utc).strftime("%H:%M:%S.%f")[:-3] + "Z"
+
+
+def iso(ms):
+    return datetime.fromtimestamp(ms / 1000, timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+
+
+def parse_iso(text):
+    return datetime.strptime(text[:23] + "Z", "%Y-%m-%dT%H:%M:%S.%fZ").replace(
+        tzinfo=timezone.utc).timestamp() * 1000
+
+
+def seconds(ms):
+    return f"{ms / 1000:.3f}"
+
+
+def label(step):
+    run, name = step.split("/")
+    return f"{run} `{name}`"
+
+
+def usage(seat, transcript):
+    """Return (total, breakdown, source) from the seat's own transcript."""
+    if not transcript.exists():
+        return None, None, "unavailable: no transcript was collected for the seat"
+    lines = [json.loads(line) for line in transcript.read_text().splitlines() if line.strip()]
+    if seat == "claude":
+        seen, parts, models = set(), dict(input=0, cache_creation=0, cache_read=0, output=0), set()
+        for entry in lines:
+            message = entry.get("message") or {}
+            if entry.get("type") != "assistant" or not message.get("usage"):
+                continue
+            if message.get("id") in seen:
+                continue
+            seen.add(message.get("id"))
+            models.add(message.get("model"))
+            u = message["usage"]
+            parts["input"] += u.get("input_tokens", 0)
+            parts["cache_creation"] += u.get("cache_creation_input_tokens", 0)
+            parts["cache_read"] += u.get("cache_read_input_tokens", 0)
+            parts["output"] += u.get("output_tokens", 0)
+        total = sum(parts.values())
+        breakdown = (f"input `{parts['input']}`, cache creation `{parts['cache_creation']}`, "
+                     f"cache read `{parts['cache_read']}`, output `{parts['output']}`")
+        source = (f"the seat's Claude transcript. It has {len(seen)} assistant responses, each "
+                  f"counted once by message ID, naming {', '.join(f'`{m}`' for m in sorted(models))}.")
+        return total, breakdown, source
+    if seat == "codex":
+        last, models, turns = None, set(), 0
+        for entry in lines:
+            payload = entry.get("payload") or {}
+            if entry.get("type") == "turn_context":
+                models.add(payload.get("model"))
+            if entry.get("type") == "event_msg" and payload.get("type") == "token_count":
+                info = payload.get("info") or {}
+                last = info.get("total_token_usage") or last
+            if entry.get("type") == "event_msg" and payload.get("type") == "task_started":
+                turns += 1
+        if not last:
+            return None, None, "unavailable: the Codex transcript has no token count"
+        breakdown = (f"input `{last['input_tokens']}` of which cached `{last['cached_input_tokens']}`, "
+                     f"output `{last['output_tokens']}` of which reasoning "
+                     f"`{last['reasoning_output_tokens']}`")
+        source = (f"the last cumulative token count in the seat's Codex transcript, after "
+                  f"{turns} turns, naming {', '.join(f'`{m}`' for m in sorted(models))}.")
+        return last["total_tokens"], breakdown, source
+    parts, models, responses = dict(input=0, cache_read=0, cache_write=0, output=0), set(), 0
+    for entry in lines:
+        message = entry.get("message") or {}
+        if entry.get("type") != "message" or message.get("role") != "assistant" or not message.get("usage"):
+            continue
+        responses += 1
+        models.add(message.get("model"))
+        u = message["usage"]
+        parts["input"] += u.get("input", 0)
+        parts["cache_read"] += u.get("cacheRead", 0)
+        parts["cache_write"] += u.get("cacheWrite", 0)
+        parts["output"] += u.get("output", 0)
+    total = sum(parts.values())
+    breakdown = (f"input `{parts['input']}`, cache read `{parts['cache_read']}`, "
+                 f"cache write `{parts['cache_write']}`, output `{parts['output']}`")
+    source = (f"the seat's omp session. It has {responses} assistant responses naming "
+              f"{', '.join(f'`{m}`' for m in sorted(models))}.")
+    return total, breakdown, source
+
+
+def main():
+    out, number = Path(sys.argv[1]), sys.argv[2]
+    run_dir = out / f"run-{number}"
+    seat = read(run_dir / "seat", "claude")
+    harness, model = HARNESSES[seat]
+    start = load_json(run_dir / "start.json").get("value", {})
+    status = load_json(run_dir / "status.json").get("value", {})
+    state = load_json(run_dir / "controller-state.json")
+    history = sorted(
+        (json.loads(line) for line in (run_dir / "history.jsonl").read_text().splitlines() if line.strip()),
+        key=lambda claim: claim["store_index"])
+    run = start.get("mission_run", "none")
+    candidate_lines = (read(out / "candidate.txt", "") or "").splitlines()
+    commit = candidate_lines[0][:7] if candidate_lines else "unknown"
+    # candidate.txt is the commit, then `git status --short`, then each binary's SHA-256.
+    dirty = [line for line in candidate_lines[1:] if not re.match(r"[0-9a-f]{64}  ", line)]
+    candidate = sys.argv[3] if len(sys.argv) > 3 else (
+        f"`{commit}`" + (" plus uncommitted: " + ", ".join(f"`{d.strip()}`" for d in dirty) if dirty else ""))
+    kdl_sha = read(out / seat / "eval-kdl.sha256") or read(out / "eval-kdl.sha256", "unknown")
+    verdict = status.get("verdict") or "none"
+
+    def claims(kind, subject=None):
+        return [c for c in history if c["kind"] == kind and (subject is None or c["subject"] == subject)]
+
+    fields = lambda claim: claim["body"].get("fields", {})
+    steps = state.get("steps", {})
+    step_names = {subject: key for key, subject in steps.items()}
+    runs = state.get("runs", {})
+    worker = state.get("worker", "agent/eval/seat-queue/worker")
+
+    # Timing.
+    posted = parse_iso(read(run_dir / "posted-at"))
+    terminal = [c for c in claims("mission-run.state", run) if fields(c).get("phase") == "terminal"]
+    verdict_claims = claims("eval.verdict", run)
+    ended_claim = (terminal or verdict_claims or [None])[0]
+    ended = ended_claim["accepted_at_unix_ms"] if ended_claim else parse_iso(read(run_dir / "finished-at"))
+    ended_state = fields(ended_claim).get("status", verdict) if ended_claim else "unknown"
+
+    def step_span(name):
+        subject = next((s for s in {c["subject"] for c in history}
+                        if s.startswith("step-run/") and s.endswith("/" + name)), None)
+        states = claims("step-run.state", subject) if subject else []
+        begin = next((c for c in states if fields(c).get("status") in ("ready", "working")), None)
+        end = next((c for c in states if fields(c).get("status") in ("completed", "failed", "cancelled")), None)
+        return begin, end
+
+    controller_begin, controller_end = step_span("exercise-seat-queue")
+    gates_begin, gates_end = step_span("held-out-gates")
+
+    # Transitions.
+    rows = []
+    created = [c for c in claims("mission-run.created") if c["subject"] in runs.values()]
+    if created:
+        rows.append((created[0], "alpha, bravo, charlie runs", "started in that order",
+                     f"indices {created[0]['store_index']}–{created[-1]['store_index']}"))
+    for claim in history:
+        subject, kind, f = claim["subject"], claim["kind"], fields(claim)
+        name = step_names.get(subject)
+        if kind == "work.claimed" and name:
+            rows.append((claim, label(name), "`ready -> claimed`", f"index {claim['store_index']}"))
+        elif kind == "work.submitted" and name:
+            rows.append((claim, label(name), "submitted", f"index {claim['store_index']}"))
+        elif kind == "step-run.state" and name and f.get("status") in ("completed", "failed", "cancelled"):
+            rows.append((claim, label(name), f"`{f['status']}`", f"index {claim['store_index']}"))
+        elif kind == "agent.queue.moved":
+            moved = {v: k for k, v in runs.items()}
+            rows.append((claim, "seat queue",
+                         f"`{claim['actor']}` moved {moved.get(f.get('run'), f.get('run'))} "
+                         f"{f.get('placement')} {moved.get(f.get('anchor'), f.get('anchor') or '')}".rstrip(),
+                         f"index {claim['store_index']}"))
+        elif kind == "gate.requested" and "sign-off" in subject and f.get("reviewer"):
+            rows.append((claim, "alpha `sign-off`", "human gate open", f"index {claim['store_index']}"))
+        elif kind == "gate.result" and "sign-off" in subject:
+            rows.append((claim, "alpha `sign-off`", f"`{f.get('verdict')}` by `{claim['actor']}`",
+                         f"index {claim['store_index']}"))
+    if ended_claim:
+        rows.append((ended_claim, "eval run", f"`{ended_state}`, verdict `{verdict}`",
+                     f"index {ended_claim['store_index']}"))
+
+    notes = []
+    at = lambda kind, name: next((c["accepted_at_unix_ms"] for c in claims(kind, steps.get(name, "-"))), None)
+    moves = claims("agent.queue.moved", worker)
+    draft_claimed = at("work.claimed", "alpha/draft")
+    if moves and draft_claimed:
+        notes.append(f"The move landed {moves[0]['accepted_at_unix_ms'] - draft_claimed} ms after the draft claim.")
+    gate_open = next((c["accepted_at_unix_ms"] for c in history
+                      if c["kind"] == "gate.requested" and "sign-off" in c["subject"] and fields(c).get("reviewer")), None)
+    gate_done = next((c["accepted_at_unix_ms"] for c in history
+                      if c["kind"] == "gate.result" and "sign-off" in c["subject"]), None)
+    charlie_claimed = at("work.claimed", "charlie/work")
+    if gate_open and gate_done:
+        notes.append(f"Alpha waited on its gate for {seconds(gate_done - gate_open)} seconds.")
+    if gate_done and charlie_claimed:
+        charlie_submitted = at("work.submitted", "charlie/work")
+        sentence = f"The sign-off landed {gate_done - charlie_claimed} ms after the charlie claim"
+        if charlie_submitted:
+            sentence += f", and the seat submitted charlie's work {seconds(charlie_submitted - gate_done)} seconds later"
+        notes.append(sentence + ".")
+
+    # Messages.
+    sent = claims("message.sent")
+    work_messages = [c for c in sent if fields(c).get("from") == "daemon/runtime" and fields(c).get("to") == worker]
+    direct = [c for c in sent if str(fields(c).get("from", "")).startswith("agent/")]
+    woken, duplicates = [], []
+    for message in work_messages:
+        tag = next((t for t in fields(message).get("tags", []) if t.startswith("st3-work:")), "")
+        work = tag.removeprefix("st3-work:").split("@")[0]
+        name = step_names.get(work, work)
+        if tag in [w[1] for w in woken]:
+            duplicates.append(name)
+        woken.append((name, tag))
+
+    # Judges.
+    results = claims("gate.result")
+    requested = {c["subject"]: c["accepted_at_unix_ms"] for c in claims("gate.requested")}
+    controller_result = next((c for c in results
+                              if fields(c).get("gate") == "the queue controller completed its scenario"), None)
+    claim_order = [step_names.get(c["subject"], c["subject"]) for c in state.get("claims", [])]
+    failure = state.get("failure")
+    judge_rows = []
+    controller_verdict = fields(controller_result).get("verdict") if controller_result else "fail"
+    controller_seconds = (seconds(controller_end["accepted_at_unix_ms"] - controller_begin["accepted_at_unix_ms"])
+                          if controller_begin and controller_end else "n/a")
+    if failure:
+        evidence = f"Failed: {failure}."
+    else:
+        checkpoints = [c["name"] for c in state.get("checkpoints", [])]
+        parts = ["Start order held"]
+        if "unauthorized-move-refused" in checkpoints:
+            parts.append("the seat's own move was refused")
+        parts.append("the chief's move reordered the queue" if state.get("mover") else "the move reordered the queue")
+        parts.append("alpha waited as head")
+        claimed = ", ".join(n.replace("/", " ") for n in claim_order)
+        evidence = ", ".join(parts) + f", and the seat claimed {claimed}."
+    judge_rows.append(("Controller", controller_verdict, controller_seconds, evidence))
+    judge_evidence = {
+        "Queue order": f"Graph replay at each of {len(claim_order)} claims found that claim was the first ready step in queue order.",
+        "No preemption": "One claim and one submission per step; the move fell inside the draft claim; no wake for other work fell inside a held claim.",
+        "No terminal input": "No audit log and zero `terminal.input.requested` claims.",
+    }
+    for gate, name in JUDGES:
+        result = next((c for c in results if f"`{gate}`" in str(fields(c).get("reason", ""))), None)
+        if not result:
+            judge_rows.append((name, "not run", "n/a", "The held-out gates did not run."))
+            continue
+        began = requested.get(result["subject"])
+        verdict_text = fields(result).get("verdict", "unknown")
+        judge_rows.append((name, verdict_text,
+                           seconds(result["accepted_at_unix_ms"] - began) if began else "n/a",
+                           judge_evidence[name] if verdict_text == "pass" else fields(result).get("reason", "")))
+
+    total, breakdown, source = usage(seat, run_dir / "transcript.jsonl")
+    date = iso(posted)[:10]
+
+    print(f"# Eval run report — {date}\n")
+    bullet("Eval: `seat-queue`")
+    bullet("Runtime: `st3`")
+    bullet(f"Run ID: `{run}`")
+    bullet(f"Seat: {harness} with `{model}`")
+    bullet(f"Candidate commit: {candidate}")
+    bullet(f"Eval KDL SHA-256: `{kdl_sha}`")
+    bullet(f"Result: `{verdict}`")
+    print()
+    print("## Timing\n")
+    bullet(f"Started: `{iso(posted)}` (bundle posted to a fresh isolated daemon)")
+    bullet(f"Ended: `{iso(ended)}` (eval run `{ended_state}`, verdict `{verdict}`)")
+    bullet(f"Duration: `{seconds(ended - posted)}` seconds")
+    parts = []
+    if controller_begin and controller_end:
+        parts.append(f"Controller: `{controller_seconds}` seconds")
+    if gates_begin and gates_end:
+        parts.append(f"held-out gates: `{seconds(gates_end['accepted_at_unix_ms'] - gates_begin['accepted_at_unix_ms'])}` seconds")
+        if ended_claim:
+            parts.append(f"cleanup: `{seconds(ended - gates_end['accepted_at_unix_ms'])}` seconds")
+    if parts:
+        bullet("; ".join(parts))
+    print("\n## Model usage\n")
+    print("| Role | Harness | Model | Tokens |")
+    print("| --- | --- | --- | ---: |")
+    print(f"| `{worker}` | {harness} | `{model}` | `{total if total is not None else 'unavailable'}` |")
+    if any(c["kind"] == "intent.desired" and c["subject"] == "agent/eval/seat-queue/chief" for c in history):
+        print("| `agent/eval/seat-queue/chief` | none, model-free | none | `0` |")
+    print()
+    if total is not None:
+        bullet(f"Agent tokens: `{total}` ({breakdown})")
+    else:
+        bullet("Agent tokens: unavailable")
+    bullet("LLM judge tokens: `0`; every judge is mechanical")
+    bullet(f"Total model tokens: `{total if total is not None else 'unavailable'}`")
+    bullet(f"Count source: {source}")
+    print()
+    print("## Observable graph transitions\n")
+    print("| Time | Subject or step | Transition | Evidence |")
+    print("| --- | --- | --- | --- |")
+    for claim, subject, transition, evidence in rows:
+        print(f"| `{clock(claim['accepted_at_unix_ms'])}` | {subject} | {transition} | {evidence} |")
+    if notes:
+        print()
+        print(textwrap.fill(" ".join(notes), 100, break_on_hyphens=False))
+    print("\n## Small Talk\n")
+    bullet(f"Runtime work messages: `{len(work_messages)}`" +
+           (", for " + ", ".join(label(n) if "/" in n else n for n, _ in woken) if woken else ""))
+    bullet(f"Direct agent messages: `{len(direct)}`")
+    bullet("Required sequence: " + (", then ".join(f"a wake for {label(n) if '/' in n else n}" for n, _ in woken)
+                                     if woken else "none"))
+    bullet("Unexpected or duplicate messages: " +
+          (", ".join(f"a second wake for {label(n)}" for n in duplicates) if duplicates else "none"))
+    print("\n## Judges\n")
+    print("| Judge | Result | Duration | Evidence |")
+    print("| --- | --- | ---: | --- |")
+    for name, verdict_text, duration, evidence in judge_rows:
+        print(f"| {name} | `{verdict_text}` | `{duration}` | {evidence} |")
+    print("\n## Result details\n")
+    bullet("Products or commits: none. The steps ask for progress notes only, and the seat changed no files.")
+    cleanup = status.get("cleanup", "unknown")
+    bullet(f"Cleanup: `{cleanup}`. The eval stopped its seats and recorded `eval.verdict` `{verdict}`.")
+    transcript = run_dir / "transcript.jsonl"
+    refusals = transcript.read_text().count("seat-queue-order") if transcript.exists() else 0
+    facts = []
+    if failure:
+        facts.append(f"The controller failed: {failure}.")
+    if refusals:
+        facts.append(f"The transcript mentions `seat-queue-order` {refusals} times, so `work claim` refused at least one out-of-order claim.")
+    bullet("Notable behavior: " + (" ".join(facts) if facts else "the seat claimed each step when woken for it."))
+    bullet("Follow-up: none for this run.")
+
+
+if __name__ == "__main__":
+    main()

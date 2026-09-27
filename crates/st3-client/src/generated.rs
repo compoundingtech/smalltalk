@@ -498,6 +498,52 @@ pub struct Agent {
     #[serde(default)]
     pub under: Vec<AgentRelationship>,
 }
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum AgentQueuePlacement {
+    Top,
+    Bottom,
+    Before,
+    After,
+}
+/// One agent seat's current claim and its ordered queue of mission runs.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct AgentQueue {
+    pub kind: String,
+    pub agent_id: String,
+    #[serde(default)]
+    pub current_work_ids: Vec<String>,
+    pub next_work_id: Option<String>,
+    #[serde(default)]
+    pub runs: Vec<AgentQueueRun>,
+    #[serde(default)]
+    pub moves: Vec<AgentQueueMove>,
+    pub move_count: u64,
+}
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct AgentQueueRun {
+    pub mission_run_id: String,
+    pub position: u32,
+    pub state: String,
+    pub run_state: String,
+    pub joined_at: String,
+    #[serde(default)]
+    pub claimed_work_ids: Vec<String>,
+    #[serde(default)]
+    pub ready_work_ids: Vec<String>,
+    #[serde(default)]
+    pub waiting_work_ids: Vec<String>,
+}
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct AgentQueueMove {
+    pub claim_id: String,
+    pub mission_run_id: String,
+    pub placement: AgentQueuePlacement,
+    pub anchor_run_id: Option<String>,
+    pub actor_id: Option<String>,
+    pub reason: Option<String>,
+    pub moved_at: String,
+}
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct TerminalAccess {
     pub read: String,
@@ -1079,6 +1125,8 @@ pub enum ActionType {
     WorkRelease,
     #[serde(rename = "work.publish-mission")]
     WorkPublishMission,
+    #[serde(rename = "agent.queue-move")]
+    AgentQueueMove,
     #[serde(rename = "runtime.stop")]
     RuntimeStop,
     #[serde(rename = "runtime.restart")]
@@ -1132,6 +1180,20 @@ impl ActionRequest {
             fence,
             parameters: serde_json::to_value(parameters)?,
         })
+    }
+    pub fn agent_queue_move(
+        id: impl Into<String>,
+        idempotency_key: impl Into<String>,
+        fence: Fence,
+        parameters: AgentQueueMoveParameters,
+    ) -> Result<Self, serde_json::Error> {
+        Self::new(
+            id,
+            ActionType::AgentQueueMove,
+            idempotency_key,
+            fence,
+            &parameters,
+        )
     }
     pub fn attention_resolve(
         id: impl Into<String>,
@@ -1700,6 +1762,17 @@ pub struct WorkPublishMissionParameters {
     pub target_id: String,
     pub name: String,
     pub mission: Value,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct AgentQueueMoveParameters {
+    pub agent_id: String,
+    pub mission_run_id: String,
+    pub placement: AgentQueuePlacement,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub anchor_run_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
