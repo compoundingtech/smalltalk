@@ -424,6 +424,7 @@
             "state": { "enum": ["draft", "ready", "running", "standing", "completed", "failed", "cancelled"] },
             "mission_revision": { "$ref": "#/$defs/Revision" },
             "runs": { "type": "array", "items": { "$ref": "#/$defs/Id" } },
+            "active_runs": { "type": "integer", "minimum": 0 },
             "run_generations": { "type": "object", "additionalProperties": { "$ref": "#/$defs/Id" } },
             "visualization": { "$ref": "#/$defs/Visualization" },
             "usage": { "oneOf": [{ "$ref": "#/$defs/UsageSummary" }, { "type": "null" }] }

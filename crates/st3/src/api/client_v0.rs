@@ -422,6 +422,11 @@ fn mission_resources(
     let mut values = missions
         .into_iter()
         .filter(|(mission, _)| selected_id.is_none_or(|selected| mission == selected))
+        // st3 publishes each loop round as an internal definition that no one starts directly;
+        // its runs belong to the parent mission. List them only with history or by ID.
+        .filter(|(mission, _)| {
+            history || selected_id.is_some() || !mission.starts_with("mission/__st3/")
+        })
         .map(|(mission, mut runs)| {
             runs.sort_by_key(|run| run.created_at_unix_ms);
             let definition = definitions.get(&mission);
@@ -461,6 +466,10 @@ fn mission_resources(
                 .iter()
                 .map(|run| run.subject.as_str())
                 .collect::<BTreeSet<_>>();
+            let active_runs = runs
+                .iter()
+                .filter(|run| !matches!(run.status.as_str(), "completed" | "failed" | "cancelled"))
+                .count();
             let usage = aggregate_usage_for_runs(store, &desired, &run_ids, Some(snapshot_index))?;
             let revision = latest
                 .map(|run| run.revision.as_str())
@@ -484,6 +493,7 @@ fn mission_resources(
                 "state": state,
                 "mission_revision": revision,
                 "runs": runs.into_iter().map(|run| run.subject).collect::<Vec<_>>(),
+                "active_runs": active_runs,
                 "run_generations": run_generations,
                 "visualization": visualization,
                 "usage": usage,
@@ -4559,6 +4569,89 @@ mod tests {
             })
             .unwrap();
         assert!(authenticate(&state, &request, "fabric-loopback").is_err());
+    }
+
+    #[test]
+    fn default_mission_list_hides_loop_round_definitions_and_counts_active_runs() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state_named(root.path(), "loop-node");
+        let source = r#"version 2
+mission "example/looped" state="ready" {
+  goal "Repeat a bounded round."
+  concurrent-runs max=2
+  completion { when "all-steps-exhausted" }
+  loop "improve" {
+    max-rounds 2
+    round {
+      completion { when "all-steps-exhausted" }
+      step "work" { agentless; goal "Complete round ${loop.round}." }
+    }
+  }
+}
+"#;
+        let intent = crate::graph::parse_intent(source, "loop-node").unwrap();
+        let preview = state
+            .store
+            .mission(
+                &intent,
+                crate::model::IntentInput {
+                    kdl: source.into(),
+                    source_name: Some("looped.kdl".into()),
+                },
+            )
+            .unwrap();
+        state
+            .store
+            .apply_as(
+                &intent,
+                &preview.subject_tokens,
+                "publish-looped",
+                Some("person/operator"),
+            )
+            .unwrap();
+        let start = |key: &str| {
+            state
+                .store
+                .create_mission_run(&crate::model::MissionRunRequest {
+                    mission: "example/looped".into(),
+                    revision: None,
+                    workspace: "/tmp".into(),
+                    requester: Some("person/operator".into()),
+                    mode: Some("run".into()),
+                    inputs: BTreeMap::new(),
+                    idempotency_key: format!("looped-{key}"),
+                })
+                .unwrap()
+        };
+        let first = start("first");
+        start("second");
+        state
+            .store
+            .set_mission_run_state(&first.id, "cancelled", "terminal", Some("no longer needed"))
+            .unwrap();
+
+        let internal = |resources: &[Value]| {
+            resources
+                .iter()
+                .filter(|value| {
+                    value["id"]
+                        .as_str()
+                        .is_some_and(|id| id.starts_with("mission/__st3/"))
+                })
+                .count()
+        };
+        let history =
+            mission_resources(&state.store, state.store.index().unwrap(), true, None).unwrap();
+        assert!(internal(&history) > 0, "{history:?}");
+        let current =
+            mission_resources(&state.store, state.store.index().unwrap(), false, None).unwrap();
+        assert_eq!(internal(&current), 0, "{current:?}");
+        let looped = current
+            .iter()
+            .find(|value| value["id"] == "mission/example/looped")
+            .unwrap();
+        assert_eq!(looped["runs"].as_array().unwrap().len(), 2);
+        assert_eq!(looped["active_runs"], 1);
     }
 
     #[test]

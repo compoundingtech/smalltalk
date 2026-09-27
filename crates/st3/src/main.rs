@@ -3413,6 +3413,22 @@ fn attention_target_line(target: &st3_client::AttentionTargetState, now_unix_ms:
     format!("target {}: {}{since}", target.id, target.state)
 }
 
+/// Active and finished runs apart, so a mission with one live run and five old ones does not
+/// read as six runs. A daemon that does not report active runs gets the plain total.
+fn render_mission_runs(mission: &st3_client::Mission) -> String {
+    let total = mission.runs.len();
+    let plural = |count: usize| if count == 1 { "" } else { "s" };
+    let Some(active) = mission.active_runs.map(|active| active.min(total)) else {
+        return format!("{total} run{}", plural(total));
+    };
+    match (active, total - active) {
+        (0, 0) => "0 runs".into(),
+        (active, 0) => format!("{active} active run{}", plural(active)),
+        (0, finished) => format!("{finished} finished run{}", plural(finished)),
+        (active, finished) => format!("{active} active · {finished} finished"),
+    }
+}
+
 fn render_product_page(title: &str, page: &ClientPage, continuation_command: &str) -> String {
     use std::fmt::Write as _;
 
@@ -3462,11 +3478,10 @@ fn render_product_page(title: &str, page: &ClientPage, continuation_command: &st
             ClientResource::Mission(item) => {
                 let _ = writeln!(
                     output,
-                    "{}  {}  {} run{}",
+                    "{}  {}  {}",
                     item.header.id,
                     item.state,
-                    item.runs.len(),
-                    if item.runs.len() == 1 { "" } else { "s" }
+                    render_mission_runs(item)
                 );
                 if let Some(usage) = &item.usage {
                     let _ = writeln!(output, "  usage {}", render_usage(usage));
@@ -9674,6 +9689,26 @@ mod tests {
                 cursor_expires_at: None,
             },
         }
+    }
+
+    #[test]
+    fn mission_list_counts_active_and_finished_runs_apart() {
+        let mut page = fixture_product_page(&["mission"], false);
+        let ClientResource::Mission(mission) = &mut page.items[0] else {
+            panic!("expected mission fixture");
+        };
+        mission.runs = (1..=6).map(|run| format!("mission-run/r{run}")).collect();
+        let render = |active: Option<usize>, runs: usize| {
+            let mut mission = mission.clone();
+            mission.runs.truncate(runs);
+            mission.active_runs = active;
+            render_mission_runs(&mission)
+        };
+        assert_eq!(render(Some(1), 6), "1 active · 5 finished");
+        assert_eq!(render(Some(2), 2), "2 active runs");
+        assert_eq!(render(Some(0), 1), "1 finished run");
+        assert_eq!(render(Some(0), 0), "0 runs");
+        assert_eq!(render(None, 6), "6 runs");
     }
 
     #[test]

@@ -437,6 +437,8 @@ pub struct Mission {
     #[serde(default)]
     pub runs: Vec<String>,
     #[serde(default)]
+    pub active_runs: Option<usize>,
+    #[serde(default)]
     pub run_generations: BTreeMap<String, String>,
     #[serde(default)]
     pub visualization: Option<Visualization>,
