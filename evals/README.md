@@ -92,7 +92,7 @@ The seat counts include every native agent seat. The LLM judge counts are separa
 | st3 | Cross-harness message wake | Claude Opus × 1, Codex × 1, Pi × 1, OMP × 1 | None |
 | st3 | Work wake reliability | Codex × 1 | None |
 | st3 | Seat mission work | Codex × 1 | None |
-| st3 | Seat queue | Claude Sonnet × 1 | None |
+| st3 | Seat queue | Claude Sonnet × 1, or Codex × 1 or OMP × 1 chosen by its runner | None |
 | st3 | Planning Mode | Codex × 1, created by the launch API | None |
 | st3 | Run Generation Revision | Codex × 1, created by the launch API | None |
 | st3 | Continuous Stewardship | Codex × 1 | None |
@@ -103,6 +103,10 @@ The seat counts include every native agent seat. The LLM judge counts are separa
 
 The paired and st3-only corpus has 14 Claude seats, 43 Codex seats, two Pi seats, two OMP seats,
 and one OpenCode seat. It also has three Codex LLM judges.
+
+Seat queue is counted with its default Claude seat. `scripts/st3-seat-queue-eval/run` can put Codex
+`gpt-6-luna` or omp `openai-codex/gpt-5.6-luna` in that seat instead. Its chief agent is a
+model-free command, not a native agent seat.
 
 The twenty-two model-free st3 evals add no model seats and no LLM judges.
 

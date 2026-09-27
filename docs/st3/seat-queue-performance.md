@@ -6,23 +6,29 @@ memory numbers do and do not measure.
 
 ## Verdict
 
-**Not yet.** The evals pass, apart from one Claude start failure and one void run, but the 9-hour
-overnight run shows the branch using more idle CPU and waking far more often than base. Merge
-after the extra wakeups are explained, or accept the cost knowingly.
+**Yes, with the soak below still running.** The overnight rise in wakeups is not seat queue work.
+It is mailbox reads waiting on each other inside SQLite, which base does in the same way, and its
+rate follows the timing of the synthetic traffic, which the old generator did not control (series
+5). With that timing fixed, the branch head matches base so far (series 6). The one memory
+difference left is freed startup heap under glibc, not live data.
 
 - **For merging:** the seat queue works with live agents. 16 of the 18 runs last night on Claude,
   Codex and omp seats passed. One Claude seat never reached idle before any work existed. One omp
   run is void because the agent re-declared its own seat, and `16aa754` now refuses that. No seat
   claimed out of order, preempted a held claim, or used terminal input. The reads are cheap.
-- **Against merging now:** after about an hour, the branch daemon's voluntary context switches
-  rose from about 6,000 to 10,000–12,000 a minute and stayed there. Its thread count went from 20
-  to 22, and base peaked at 21. Base stayed at about 6,500 a minute. Idle CPU was 45 s/hour against
-  41 on base (+9%). The 30-minute windows below could not see this, because it starts later. I
-  have not found the cause.
-- **Memory growth is not the branch's.** Resident memory grew 11 to 13 MiB an hour on both builds
-  for the whole night. The branch ended 22 MiB higher (232 against 210 MiB).
-- **The measured build is not the branch head.** The overnight run used `2ee767c`. `37ac4b2` and
-  `16aa754` add agent queue moves and the seat declaration check, and were not measured overnight.
+- **The overnight wakeups are shared, not added.** With every seat's read in step, base and the
+  branch head both switch about 19,000 times a minute and use 0.89 to 0.90 s of CPU a minute.
+  No blocking switch passed through seat queue code. At equal switch rates, the overnight builds
+  used the same CPU. A rerun of the overnight binaries did not rise at the hour.
+- **The branch head, with drift-free traffic:** in the first 30 measured minutes it used
+  0.732 s of CPU a minute against 0.724 on base, and switched 5,996 times a minute against 5,999,
+  with 19 to 20 threads on each. The run continues to 11:20Z, 90 minutes past the point where the
+  overnight branch rose.
+- **Memory:** both builds hold 38.1 MiB of live heap. Under glibc the branch settles 33 MiB
+  higher in most starts, all of it freed startup heap. Overnight, resident memory grew 11 to
+  13 MiB an hour on both builds; that is not the branch's.
+- **Not observed:** which traffic timing held the overnight branch high for eight hours. The
+  generators' timing was not recorded.
 
 ## Result
 
@@ -46,7 +52,9 @@ after the extra wakeups are explained, or accept the cost knowingly.
   order 0.18 ms, and the agent queue read 0.8 ms of daemon CPU. `st3 agents queue` takes about
   4 ms from the CLI, mostly process start.
 
-Series 4, a 9-hour side-by-side run, found what a 30-minute window cannot: see the verdict.
+Series 4, a 9-hour side-by-side run, showed the branch waking far more often after an hour.
+Series 5 traces that to traffic timing that both builds share, and series 6 repeats the side-by-side
+run on the branch head with the timing fixed.
 
 ## Builds
 
@@ -55,6 +63,7 @@ Series 4, a 9-hour side-by-side run, found what a 30-minute window cannot: see t
 | base | `9b3c0a3` | the st3 commit `agent/seat-queue` last merged |
 | branch | `ec7a3d9` | the seat queue branch as first measured |
 | fixed branch | `d2c4ee8` | the branch after the reconcile fix below |
+| branch head | `5fa3487` | the branch with queue moves by agents and the seat declaration check |
 
 Each is a `cargo build --release -p st3 --bin st3`. The base source came from `git archive`, and
 its release artifacts were built before any branch release artifacts existed. Cargo hashes
@@ -95,7 +104,9 @@ Each window:
    its own config, sockets, PTY registry, and state directory, no peers, and a clean login
    environment. It uses the default glibc allocator unless `PERF_DAEMON_ENV` adds a preload;
 2. replays what twelve idle native drivers send (`traffic.py`): one mailbox page per seat each
-   second, and each minute that seat's status and work list;
+   second, and each minute that seat's status and work list. Series 1 to 4 used a generator
+   whose seats drifted in phase; series 5 explains the effect, and later series keep each
+   seat on a fixed schedule;
 3. skips a 5-minute warmup, then samples the daemon once a minute for 30 minutes
    (`sampler.py`): CPU time from `/proc/PID/stat`, context switches summed over every thread,
    RSS, and peak RSS;
@@ -328,16 +339,117 @@ hour, and then grew steadily.
 The divergence is the finding. For the first hour the branch matched base minute by minute at
 about 6,100 voluntary switches. From about 23:04Z the branch rose to 7,800, then 9,900, then
 10,000 to 12,000 a minute, and gained a 21st and then a 22nd thread. Base never did. Something
-on the branch starts about an hour in and then wakes about 70 more times a second. That fits a
-timer or a waiting task added by the seat queue, but I have not confirmed it. The probes at the
-end matched: the roster read, one seat's work list and mailbox, and a claim write with its
-reconcile all cost the same on both builds.
+on the branch starts about an hour in and then wakes about 70 more times a second. The probes at
+the end matched: the roster read, one seat's work list and mailbox, and a claim write with its
+reconcile all cost the same on both builds. Series 5 finds the cause in the traffic generator.
 
 Growth: RSS grew about 88 MiB on base and 105 MiB on the branch over 8.5 hours, still rising
 at the end on both. CPU per hour did not grow on either after the first hour.
 
 Evidence: `target/seat-queue-overnight/perf/` in the builder's worktree holds `samples.csv`,
 `probe.json`, `memory.txt`, and the daemon and traffic logs for each build.
+
+## Series 5: what the overnight rise was
+
+The extra wakeups are not seat queue work. They are mailbox reads waiting on each other inside
+SQLite, the same on both builds, and how often that happens depends on the timing of the
+synthetic traffic, which the generator did not control.
+
+`traffic.py` ran one loop per seat that slept for one second minus the time its requests took.
+Every sleep returns a little late, and the lateness carried into the next second, so each seat's
+phase drifted at its own rate. The twelve seats started 83 ms apart and drifted into and out of
+step with each other. When several seats read their mailboxes at the same moment, the daemon's
+blocking threads wait on each other inside SQLite, and each wait is a voluntary context switch.
+Each daemon had its own generator, so base and the branch saw different timing.
+
+**Seats in step triple the switches on either build.** `PERF_SEAT_SPREAD=0` sends every seat's
+mailbox read at the same moment. Base and branch head `5fa3487` ran side by side that way, with
+six writes a minute, from 08:37Z:
+
+| Minutes | CPU s, base | CPU s, branch | Voluntary switches/min, base | Voluntary switches/min, branch | Threads, base / branch | RSS MiB at end, base | RSS MiB at end, branch |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 6–15 | 9.0 | 8.9 | 18,641 | 18,817 | 38 / 33 | 650.0 | 645.8 |
+| 16–25 | 9.0 | 8.9 | 19,203 | 19,469 | 38 / 33 | 665.6 | 657.4 |
+| 26–35 | 8.9 | 8.9 | 19,998 | 20,318 | 38 / 33 | 674.2 | 663.7 |
+
+Over the 30 measured minutes, base used 0.898 s of CPU a minute and switched 19,281 times, and
+the branch 0.890 s and 19,535 times.
+
+With the seats spread, as in series 6, both read about 6,000 switches and 0.73 s of CPU a
+minute. In step, base and the branch moved together.
+
+**The extra switches are blocking threads waiting in the mailbox read.** Per-thread counts from
+`/proc/PID/task`, over ten minutes:
+
+| Traffic | Runtime workers | Blocking threads |
+| --- | ---: | ---: |
+| spread, base | 4,518/min over 16 threads | 1,499/min over 3 threads |
+| spread, branch | 4,518/min over 16 threads | 1,502/min over 3 threads |
+| in step, base | 3,946/min over 16 threads | 16,053/min over 21 threads |
+| in step, branch | 3,976/min over 16 threads | 16,354/min over 16 threads |
+
+Spread, each mailbox read costs a blocking thread about two switches. In step, it costs about
+twenty. A frame-pointer build of the branch head, in step, recorded 2,887 blocking switches in
+10 seconds with `perf record -e sched:sched_switch -g`. 65% were in `Store::messages_page`,
+waiting on locks inside SQLite's statement preparation and page cache, 3% waited for one of the
+store's four read connections, and 31% were runtime workers parked or waiting for I/O. None
+passed through seat queue code.
+
+**At equal switch rates, the overnight builds used the same CPU.** After the first hour, in the
+minutes that switched 9,000 to 10,999 times, base used 0.75 to 0.76 s of CPU a minute and the
+branch 0.73 to 0.75 s. Base also reached 8,000 to 10,999 switches a minute, for 34 of its 491
+minutes. The branch's extra 4 s of CPU an hour fits the cost of its extra switches.
+
+**The generator drifts.** bpftrace recorded each generator's sends. Each seat's reads came
+70 to 100 µs later every second, and the seats of one generator moved 11 to 26 ms apart from each
+other in 15 minutes. After 36 minutes, the gaps between neighbouring seats, which started at
+83 ms, were 65 to 97 ms on both repro generators.
+
+**The rise did not recur at an hour.** From 07:56Z, base `9b3c0a3` and branch `2ee767c`, the
+overnight binaries, ran side by side again on fresh copies of the same fixture with the old
+generator and six writes a minute. At minute 63 the branch read 6,004 switches a minute and base
+6,015, and every minute until then was within 6,300 on both. Something the branch started an hour
+in would have shown here. The overnight run differed in one way: eval runs shared the host from
+21:50Z to 22:58Z, and the branch's rise began six minutes after they finished.
+
+**The overnight thread count points the same way.** The branch reached 22 threads during its
+rise, and base, which rose less, stayed at 20 to 21. In these runs, extra threads were blocking
+threads started because reads overlapped. A timer or waiting task on the runtime adds no thread.
+
+What I did not observe is the overnight generators' timing, so which traffic state held the
+branch at 10,000 to 12,000 switches a minute for eight hours, while base reached it only in
+short spells, is inferred and not measured.
+
+### Fix
+
+`traffic.py` now sends each seat's reads at fixed times from its start and skips a slot it has
+missed, so late wakeups never add up. `scripts/st3-seat-queue-perf/traffic-test` runs one seat
+for an hour of fake time in which every sleep returns 0.8 ms late, every request takes 3 ms, and
+one stalls for 2.5 s. The old generator fails it: its reads were 48 ms off their slots after a
+minute and up to 500 ms off later. The fixed generator stays within 0.8 ms.
+
+The daemon is unchanged. Concurrent mailbox reads contending inside SQLite is the same on both
+builds; see other findings.
+
+## Series 6: branch head beside base, drift-free
+
+Base `9b3c0a3` and branch head `5fa3487` ran side by side from 08:36Z to 11:20Z with the fixed
+generator, the Series 2 fixture, and six writes a minute. The first 5 minutes are warmup. The
+overnight branch rose about an hour in, so this run goes on for at least 90 minutes past that
+point. Each row covers ten minutes. Threads are the fewest and most seen in any minute.
+
+| Minutes | CPU s, base | CPU s, branch | Voluntary switches/min, base | Voluntary switches/min, branch | Threads, base / branch | RSS MiB at end, base | RSS MiB at end, branch |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 6–15 | 7.3 | 7.4 | 6,015 | 6,011 | 19 / 19 | 591.5 | 588.1 |
+| 16–25 | 7.5 | 7.5 | 5,980 | 5,974 | 19 / 19 | 597.8 | 595.1 |
+| 26–35 | 7.0 | 7.1 | 6,001 | 6,002 | 19–20 / 19 | 599.1 | 595.3 |
+
+This run is still going. At minute 35, base and the branch head had used 0.724 and 0.732 s of
+CPU a minute and switched 5,999 and 5,996 times a minute, with 19 to 20 threads each. This
+section and the verdict get the full run when it ends.
+
+Evidence: `target/seat-queue-wakeups/` in the builder's worktree holds, for each run, the minute
+samples, per-thread samples every 15 seconds, the probes, and the perf and bpftrace captures.
 
 ## Other findings
 
@@ -359,6 +471,12 @@ Evidence: `target/seat-queue-overnight/perf/` in the builder's worktree holds `s
   queue read is about 0.8 ms of daemon CPU.
 - **The existing idle soak sampler counts context switches for the main thread only.**
   `/proc/PID/status` reports one thread. `sampler.py` sums every thread.
+- **Mailbox reads that arrive together wait on each other inside SQLite.** With every seat in
+  step, most of the daemon's blocking switches were in `Store::messages_page`, in SQLite's
+  statement preparation and page cache. The bundled SQLite keeps memory statistics, which takes
+  one process-wide mutex on each allocation, and the store has four read connections. Both are
+  the same on base and the branch. Whether turning memory statistics off helps is not measured
+  here; it would be a change for all of st3.
 
 ## Reproduce
 
@@ -376,7 +494,15 @@ PERF_DATA=$PWD/target/seat-queue-perf PERF_TRIM_SHIM=trim.so \
   scripts/st3-seat-queue-perf/startup /tmp/sqp.fix OUT 3 "base|BASE_ST3|" "branch|BRANCH_ST3|"
 ST3_PERF_STORE=/path/to/copy/claims.sqlite3 \
   cargo test --release -p st3 --test seat_queue_perf -- --ignored --nocapture
+scripts/st3-seat-queue-perf/traffic-test       # the generator keeps each seat on its schedule
+PERF_DATA=$PWD/target/seat-queue-perf PERF_WRITES_PER_MINUTE=6 \
+  scripts/st3-seat-queue-perf/overnight BASE_ST3 BRANCH_ST3 /tmp/sqp.fix OUT 2026-01-01T11:20Z 5
+PERF_SEAT_SPREAD=0 PERF_DATA=$PWD/target/seat-queue-perf PERF_WRITES_PER_MINUTE=6 \
+  scripts/st3-seat-queue-perf/overnight BASE_ST3 BRANCH_ST3 /tmp/sqp.fix OUT "+36 min" 5
 ```
+
+`PERF_SEAT_SPREAD=0` puts every seat's mailbox read at the same moment, which shows the high
+switch rate on either build within a minute instead of after hours of drift.
 
 The root holds Unix sockets, so it must be a short path. `PERF_DATA` keeps the large claim stores
 on disk instead of under that root.
