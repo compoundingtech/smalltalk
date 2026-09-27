@@ -1609,30 +1609,6 @@ fn client_attention_actions(kind: &str) -> Vec<&'static str> {
     }
 }
 
-/// A fault whose requesting seat was stopped, or whose owning run or generation ended, has no
-/// one left to withdraw it. Only its reviewer can close it now.
-fn attention_requester_retired(
-    store: &Store,
-    item: &crate::model::AttentionItemView,
-    retired_seats: &mut Option<std::collections::BTreeSet<String>>,
-) -> anyhow::Result<bool> {
-    let Some(request) = store.attention_request(&item.subject)? else {
-        return Ok(false);
-    };
-    if !request.actor.starts_with("agent/") {
-        return Ok(false);
-    }
-    if store.selected_desired_kind(&request.actor)?.as_deref() == Some("stop") {
-        return Ok(true);
-    }
-    if retired_seats.is_none() {
-        *retired_seats = Some(store.terminal_owned_runtime_subjects()?);
-    }
-    Ok(retired_seats
-        .as_ref()
-        .is_some_and(|seats| seats.contains(&request.actor)))
-}
-
 fn client_attention_resources(
     store: &Store,
     person: Option<&str>,
@@ -1672,6 +1648,9 @@ fn client_attention_resources(
         let object = resource
             .as_object_mut()
             .expect("an attention resource is an object");
+        if item.kind == "fault" && attention_requester_retired(store, item, &mut retired_seats)? {
+            object["operational"]["reasons"] = json!(["requester-retired"]);
+        }
         if let Some(mission) = &item.mission {
             object.insert("mission_id".into(), Value::String(mission.clone()));
         }
@@ -1680,9 +1659,6 @@ fn client_attention_resources(
         }
         if let Some(step) = &item.step {
             object.insert("step_run_id".into(), Value::String(step.clone()));
-        }
-        if item.kind == "fault" && attention_requester_retired(store, item, &mut retired_seats)? {
-            object["operational"]["reasons"] = json!(["requester-retired"]);
         }
         resources.insert(id, resource);
     }
@@ -1736,6 +1712,30 @@ fn client_attention_resources(
             .then_with(|| left["id"].as_str().cmp(&right["id"].as_str()))
     });
     Ok(resources)
+}
+
+/// A fault whose requesting seat was stopped, or whose owning run or generation ended, has no
+/// one left to withdraw it. Only its reviewer can close it now.
+fn attention_requester_retired(
+    store: &Store,
+    item: &crate::model::AttentionItemView,
+    retired_seats: &mut Option<std::collections::BTreeSet<String>>,
+) -> anyhow::Result<bool> {
+    let Some(request) = store.attention_request(&item.subject)? else {
+        return Ok(false);
+    };
+    if !request.actor.starts_with("agent/") {
+        return Ok(false);
+    }
+    if store.selected_desired_kind(&request.actor)?.as_deref() == Some("stop") {
+        return Ok(true);
+    }
+    if retired_seats.is_none() {
+        *retired_seats = Some(store.terminal_owned_runtime_subjects()?);
+    }
+    Ok(retired_seats
+        .as_ref()
+        .is_some_and(|seats| seats.contains(&request.actor)))
 }
 
 fn client_message_resources(
