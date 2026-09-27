@@ -393,10 +393,11 @@ impl<R: RuntimeControl> Reconciler<R> {
 
     pub async fn run(self: Arc<Self>) {
         self.notify.notify_one();
+        let mut unchanged = false;
         loop {
             match self.next_reconcile_deadline() {
                 Ok(Some(deadline)) => {
-                    let delay = deadline.saturating_sub(now_ms()).min(u128::from(u64::MAX)) as u64;
+                    let delay = deadline_sleep_ms(deadline, now_ms(), unchanged);
                     tokio::select! {
                         _ = self.notify.notified() => {}
                         _ = tokio::time::sleep(Duration::from_millis(delay)) => {}
@@ -434,6 +435,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                 self.event_notify
                     .send_modify(|generation| *generation = generation.saturating_add(1));
                 let changed = before != self.store.index().ok();
+                unchanged = !changed;
                 if !changed {
                     break;
                 }
@@ -1455,6 +1457,8 @@ impl<R: RuntimeControl> Reconciler<R> {
                                 ("incarnation_id".into(), Value::String(incarnation.into())),
                                 ("step_run".into(), Value::String(step.subject.clone())),
                                 ("wake_attempts".into(), Value::from(attempt_count)),
+                                ("attempt".into(), Value::from(step.attempt)),
+                                ("readiness_epoch".into(), Value::from(step.readiness_epoch)),
                             ]),
                             evidence,
                             expected_subject: None,
@@ -7785,6 +7789,10 @@ fn work_wake_acknowledged(
             && attempts
                 .iter()
                 .any(|(_, message)| message.status == "delivered")
+        || harness.is_some_and(|harness| {
+            harness.state == "working"
+                && matches!(harness.driver.as_deref(), Some("pi" | "omp"))
+        }) && attempts.iter().any(|(_, message)| message.status == "staged")
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -7917,7 +7925,13 @@ fn work_wake_deadline(
                 .is_some_and(|assignee| local_agents.contains(assignee))
         })
         .filter(|step| wakes.contains(step.subject.as_str()))
-        .filter_map(|step| step.wake.as_ref())
+        .filter_map(|step| {
+            let wake = step.wake.as_ref()?;
+            if wake.assignee_state == "working" && nested_under_work(step, work) {
+                return None;
+            }
+            Some(wake)
+        })
         .filter(|wake| {
             matches!(wake.assignee_state.as_str(), "ready" | "working" | "idle")
                 && wake.acknowledged_by.is_none()
@@ -7936,6 +7950,14 @@ fn work_wake_deadline(
                 .map_or(now, |last| last.saturating_add(delay))
         })
         .min()
+}
+
+fn deadline_sleep_ms(deadline: u128, now: u128, unchanged: bool) -> u64 {
+    if unchanged && deadline <= now {
+        WORK_WAKE_RETRY_MS as u64
+    } else {
+        deadline.saturating_sub(now).min(u128::from(u64::MAX)) as u64
+    }
 }
 
 /// True when the seat holds nothing and has ready work in more than one run.
@@ -7978,11 +8000,14 @@ fn defers_inherited_work_wake(
     work: &[StepRunView],
     harness: Option<&CurrentHarnessView>,
 ) -> bool {
+    harness.is_some_and(|harness| harness.state == "working") && nested_under_work(step, work)
+}
+
+fn nested_under_work(step: &StepRunView, work: &[StepRunView]) -> bool {
     let nested = crate::seat_queue::SeatStep::from(step);
-    harness.is_some_and(|harness| harness.state == "working")
-        && work.iter().any(|ancestor| {
-            crate::seat_queue::nests_under(&crate::seat_queue::SeatStep::from(ancestor), &nested)
-        })
+    work.iter().any(|ancestor| {
+        crate::seat_queue::nests_under(&crate::seat_queue::SeatStep::from(ancestor), &nested)
+    })
 }
 
 fn work_message_target(message: &crate::model::MessageView) -> Option<(&str, u32, u32, &str)> {
@@ -15526,6 +15551,26 @@ mission "ios-proof-blocked" state="ready" {
             &work,
             Some(&harness)
         ));
+        let mut nested_with_wake = inherited.clone();
+        nested_with_wake.wake = Some(crate::model::WorkWakeView {
+            assignee: "agent/builder".into(),
+            assignee_state: "working".into(),
+            incarnation_id: "1:turn".into(),
+            attempts: 0,
+            last_attempt_at_unix_ms: None,
+            acknowledged_by: None,
+            failure: None,
+        });
+        assert_eq!(
+            work_wake_deadline(
+                &[submitted.clone(), nested_with_wake],
+                &BTreeSet::from(["agent/builder".into()]),
+                &BTreeMap::new(),
+                5_000,
+            ),
+            None,
+            "the deadline must defer the same nested wake as the sender",
+        );
         harness.state = "idle".into();
         assert!(!defers_inherited_work_wake(
             &inherited,
@@ -15742,6 +15787,36 @@ mission "ios-proof-blocked" state="ready" {
         harness.state = "working".into();
         wake.status = "sent".into();
         assert!(!work_wake_acknowledged(&[(1_000, &wake)], Some(&harness)));
+    }
+
+    #[test]
+    fn staged_pi_wake_into_a_working_turn_is_not_retried() {
+        let wake = crate::model::MessageView {
+            subject: "message/work-wake".into(),
+            from: "daemon/runtime".into(),
+            to: "agent/worker".into(),
+            content: "Claim work".into(),
+            status: "staged".into(),
+            title: None,
+            in_reply_to: None,
+            tags: vec![],
+            created_index: 1,
+        };
+        let harness: CurrentHarnessView = serde_json::from_value(serde_json::json!({
+            "state": "working", "driver": "omp", "incarnation_id": "1:turn",
+            "claim": "claim/turn", "observed_at_unix_ms": 900,
+        }))
+        .unwrap();
+        assert!(work_wake_acknowledged(&[(1_000, &wake)], Some(&harness)));
+    }
+
+    #[test]
+    fn an_unchanged_pass_floors_a_past_wake_deadline() {
+        assert_eq!(
+            deadline_sleep_ms(1_000, 2_000, true),
+            WORK_WAKE_RETRY_MS as u64
+        );
+        assert_eq!(deadline_sleep_ms(3_000, 2_000, true), 1_000);
     }
 
     #[test]
@@ -16158,6 +16233,85 @@ mission "gated" state="ready" {
                 )
                 .map(|_| ())
         }
+    }
+
+    #[test]
+    fn exhausted_wake_does_not_disarm_a_later_readiness_epoch() {
+        let seat = SeatQueueFixture::new();
+        let run = seat.start("queued", "wake-epoch-run");
+        let subject = SeatQueueFixture::step(&run, "work");
+        let first = seat.store.step_run(&subject).unwrap().unwrap();
+        seat.store
+            .append_claim(&ClaimInput {
+                subject: SEAT.into(),
+                kind: "harness.diagnostic".into(),
+                actor: None,
+                fields: BTreeMap::from([
+                    ("code".into(), Value::String("work-wake-exhausted".into())),
+                    ("status".into(), Value::String("failed".into())),
+                    (
+                        "reason".into(),
+                        Value::String("first epoch exhausted".into()),
+                    ),
+                    ("step_run".into(), Value::String(subject.clone())),
+                    ("incarnation_id".into(), Value::String("seat-one".into())),
+                    ("attempt".into(), Value::from(first.attempt)),
+                    ("readiness_epoch".into(), Value::from(first.readiness_epoch)),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some("wake-epoch-one-exhausted".into()),
+            })
+            .unwrap();
+        seat.work(&subject, "claim", "wake-epoch-claim").unwrap();
+        seat.work(&subject, "release", "wake-epoch-release")
+            .unwrap();
+        let mut next = seat.store.step_run(&subject).unwrap().unwrap();
+        assert!(next.readiness_epoch > first.readiness_epoch);
+        seat.store
+            .populate_work_wake_for_reconcile(&mut next, now_ms())
+            .unwrap();
+        assert!(next.wake.unwrap().failure.is_none());
+    }
+
+    #[test]
+    fn delivered_wake_in_an_existing_turn_has_no_retry_deadline() {
+        let seat = SeatQueueFixture::new();
+        seat.store
+            .append_claim(&ClaimInput {
+                subject: SEAT.into(),
+                kind: "harness.observed".into(),
+                actor: Some(SEAT.into()),
+                fields: BTreeMap::from([
+                    ("state".into(), Value::String("working".into())),
+                    ("driver".into(), Value::String("omp".into())),
+                    ("incarnation_id".into(), Value::String("seat-one".into())),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some("seat-one-working".into()),
+            })
+            .unwrap();
+        seat.start("queued", "delivered-existing-turn-run");
+        let wake = seat
+            .store
+            .messages(Some(SEAT), false)
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        seat.store
+            .append_claim(&ClaimInput {
+                subject: wake.subject,
+                kind: "message.delivered".into(),
+                actor: Some(SEAT.into()),
+                fields: BTreeMap::from([("status".into(), Value::String("delivered".into()))]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some("existing-turn-delivered".into()),
+            })
+            .unwrap();
+        assert_eq!(seat.reconciler.next_work_wake_deadline().unwrap(), None);
     }
 
     #[test]

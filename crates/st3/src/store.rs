@@ -17232,7 +17232,15 @@ fn enrich_step_wake_at(
                 EXISTS(SELECT 1 FROM claims consumed
                        WHERE consumed.subject=claims.subject
                          AND consumed.kind IN ('message.read','message.closed')
-                         AND consumed.accepted_at_unix_ms<=?1)
+                         AND consumed.accepted_at_unix_ms<=?1),
+                EXISTS(SELECT 1 FROM claims delivered
+                       WHERE delivered.subject=claims.subject
+                         AND delivered.kind='message.delivered'
+                         AND delivered.accepted_at_unix_ms<=?1),
+                EXISTS(SELECT 1 FROM claims staged
+                       WHERE staged.subject=claims.subject
+                         AND staged.kind='message.staged'
+                         AND staged.accepted_at_unix_ms<=?1)
          FROM claims INDEXED BY claims_message_to_index
          WHERE claims.kind='message.sent' AND claims.accepted_at_unix_ms<=?1
            AND instr(claims.body, ?2)>0
@@ -17251,11 +17259,13 @@ fn enrich_step_wake_at(
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
                 row.get::<_, bool>(2)?,
+                row.get::<_, bool>(3)?,
+                row.get::<_, bool>(4)?,
             ))
         },
     )?;
     for row in rows {
-        let (body, accepted, consumed) = row?;
+        let (body, accepted, consumed, delivered, staged) = row?;
         let body = serde_json::from_str::<Value>(&body).unwrap_or(Value::Null);
         let fields = body.get("fields").unwrap_or(&body);
         let matching_incarnation = fields
@@ -17269,14 +17279,20 @@ fn enrich_step_wake_at(
                     .map(str::to_owned)
             });
         if let Some(incarnation) = matching_incarnation {
-            attempts.push((accepted.parse::<u128>().unwrap_or(0), incarnation, consumed));
+            attempts.push((
+                accepted.parse::<u128>().unwrap_or(0),
+                incarnation,
+                consumed,
+                delivered,
+                staged,
+            ));
         }
     }
-    let first_attempt = attempts.first().map(|(accepted, _, _)| *accepted);
-    let last_attempt_at_unix_ms = attempts.last().map(|(accepted, _, _)| *accepted);
+    let first_attempt = attempts.first().map(|(accepted, ..)| *accepted);
+    let last_attempt_at_unix_ms = attempts.last().map(|(accepted, ..)| *accepted);
     let wake_incarnation_key = attempts
         .last()
-        .map(|(_, incarnation, _)| incarnation.as_str())
+        .map(|(_, incarnation, ..)| incarnation.as_str())
         .unwrap_or(current_incarnation_key.as_str());
     let wake_incarnation_id = harness_incarnation_for_key_at(
         connection,
@@ -17299,9 +17315,23 @@ fn enrich_step_wake_at(
         Some("claim".into())
     } else if attempts
         .iter()
-        .any(|(_, incarnation, consumed)| *consumed && incarnation == wake_incarnation_key)
+        .any(|(_, incarnation, consumed, _, _)| *consumed && incarnation == wake_incarnation_key)
     {
         Some("consumed".into())
+    } else if harness.as_ref().is_some_and(|harness| {
+        harness.state == "working" && current_incarnation_key == wake_incarnation_key
+    }) && attempts
+        .iter()
+        .any(|(_, incarnation, _, delivered, staged)| {
+            incarnation == wake_incarnation_key
+                && (*delivered
+                    || *staged
+                        && harness.as_ref().is_some_and(|harness| {
+                            matches!(harness.driver.as_deref(), Some("pi" | "omp"))
+                        }))
+        })
+    {
+        Some("delivery".into())
     } else if first_attempt.is_some_and(|requested| {
         harness.as_ref().is_some_and(|harness| {
             current_incarnation_key == wake_incarnation_key
@@ -17320,12 +17350,16 @@ fn enrich_step_wake_at(
                AND json_extract(body, '$.fields.code')='work-wake-exhausted'
                AND json_extract(body, '$.fields.step_run')=?3
                AND json_extract(body, '$.fields.incarnation_id')=?4
+               AND json_extract(body, '$.fields.attempt')=?5
+               AND json_extract(body, '$.fields.readiness_epoch')=?6
              ORDER BY store_index DESC LIMIT 1",
             params![
                 assignee,
                 snapshot_unix_ms.to_string(),
                 view.subject,
-                wake_incarnation_id
+                wake_incarnation_id,
+                view.attempt,
+                view.readiness_epoch
             ],
             |row| row.get::<_, String>(0),
         )
