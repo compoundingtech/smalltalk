@@ -5230,13 +5230,14 @@ async fn list_attention(
 
 async fn request_attention(
     State(state): State<AppState>,
-    Json(request): Json<AttentionRequest>,
+    Json(post): Json<crate::model::AttentionRequestPost>,
 ) -> Result<Json<AttentionRequestView>, ApiError> {
+    let request: &AttentionRequest = &post.request;
     let id = hex::encode(Sha256::digest(request.idempotency_key.as_bytes()));
     let subject = format!("attention/{}", &id[..32]);
     let response = state
         .store
-        .request_attention(&subject, &request)
+        .request_attention_until(&subject, request, post.until.as_deref())
         .map_err(ApiError::bad)?;
     signal_changed(&state);
     Ok(Json(response))

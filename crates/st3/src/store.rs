@@ -6760,6 +6760,34 @@ impl Store {
         subject: &str,
         request: &AttentionRequest,
     ) -> Result<AttentionRequestView, St3Error> {
+        self.request_attention_until(subject, request, None)
+    }
+
+    /// Request attention that the daemon resolves on its own once every target meets `until`,
+    /// one of the `st3 trace wait` status conditions.
+    pub fn request_attention_until(
+        &self,
+        subject: &str,
+        request: &AttentionRequest,
+        until: Option<&str>,
+    ) -> Result<AttentionRequestView, St3Error> {
+        if let Some(until) = until {
+            if !crate::model::STATUS_WAIT_CONDITIONS.contains(&until) {
+                return Err(St3Error::new(
+                    "invalid-attention-until",
+                    format!(
+                        "`{until}` is not a wait condition; use one of {}",
+                        crate::model::STATUS_WAIT_CONDITIONS.join(", ")
+                    ),
+                ));
+            }
+            if request.targets.is_empty() {
+                return Err(St3Error::new(
+                    "invalid-attention-until",
+                    "an until condition needs at least one target to watch",
+                ));
+            }
+        }
         let reviewer = normalize_actor(&request.reviewer, "person");
         if !reviewer.starts_with("person/") {
             return Err(St3Error::new(
@@ -6785,20 +6813,24 @@ impl Store {
                 .map_err(|error| St3Error::new(error.code, error.message))?;
         }
         let actor = normalize_actor(&request.actor, "agent");
+        let mut fields = BTreeMap::from([
+            ("reviewer".into(), Value::String(reviewer)),
+            ("title".into(), Value::String(request.title.clone())),
+            ("reason".into(), Value::String(request.reason.clone())),
+            ("severity".into(), Value::String(request.severity.clone())),
+            (
+                "targets".into(),
+                Value::Array(request.targets.iter().cloned().map(Value::String).collect()),
+            ),
+        ]);
+        if let Some(until) = until {
+            fields.insert("until".into(), Value::String(until.into()));
+        }
         self.append_claim(&ClaimInput {
             subject: subject.to_owned(),
             kind: "attention.requested".into(),
             actor: Some(actor),
-            fields: BTreeMap::from([
-                ("reviewer".into(), Value::String(reviewer)),
-                ("title".into(), Value::String(request.title.clone())),
-                ("reason".into(), Value::String(request.reason.clone())),
-                ("severity".into(), Value::String(request.severity.clone())),
-                (
-                    "targets".into(),
-                    Value::Array(request.targets.iter().cloned().map(Value::String).collect()),
-                ),
-            ]),
+            fields,
             evidence: Vec::new(),
             expected_subject: None,
             idempotency_key: Some(request.idempotency_key.clone()),
@@ -6919,6 +6951,30 @@ impl Store {
         self.attention_request(&subject)
             .map_err(internal)?
             .ok_or_else(|| St3Error::new("internal", "the attention withdrawal was not stored"))
+    }
+
+    /// Pending requests from `origin` that declared an `until` condition.
+    pub fn pending_attention_with_until(&self, origin: &str) -> Result<Vec<AttentionRequestView>> {
+        let connection = self.readers.get();
+        let mut statement = connection.prepare(
+            "SELECT request.subject FROM claims request
+             WHERE request.kind='attention.requested'
+               AND request.origin=?1
+               AND json_extract(request.body, '$.fields.until') IS NOT NULL
+               AND NOT EXISTS (
+                 SELECT 1 FROM claims resolution
+                 WHERE resolution.subject=request.subject
+                   AND resolution.kind='attention.resolved'
+               )
+             ORDER BY request.store_index",
+        )?;
+        let subjects = statement
+            .query_map([origin], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        subjects
+            .iter()
+            .filter_map(|subject| attention_request_view_tx(&connection, subject).transpose())
+            .collect()
     }
 
     pub(crate) fn resolve_attention_automatically(
@@ -12723,6 +12779,10 @@ fn attention_request_view_tx(
             .map(str::to_owned),
         requested_at_unix_ms: requested.accepted_at_unix_ms,
         resolved_at_unix_ms: resolved.map(|claim| claim.accepted_at_unix_ms),
+        until: fields
+            .get("until")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
     }))
 }
 
@@ -26856,6 +26916,56 @@ mission "review-current" state="ready" revision-cutover="restart-active" {{
             .resolve_attention(&first.subject, &resolution)
             .unwrap();
         assert_eq!(retry.resolved_at_unix_ms, closed.resolved_at_unix_ms);
+    }
+
+    #[test]
+    fn attention_until_needs_a_known_condition_and_a_target() {
+        let store = Store::open_memory("node").unwrap();
+        let request = |targets: Vec<String>, key: &str| AttentionRequest {
+            reviewer: "person/nathan".into(),
+            title: "Publish this revision".into(),
+            reason: "Publish the prepared revision as a person.".into(),
+            severity: "warning".into(),
+            targets,
+            actor: "agent/node.requester".into(),
+            idempotency_key: key.into(),
+        };
+        let target = vec!["mission-run/release".to_owned()];
+        let unknown = store
+            .request_attention_until(
+                "attention/unknown",
+                &request(target.clone(), "unknown"),
+                Some("published"),
+            )
+            .unwrap_err();
+        assert_eq!(unknown.code, "invalid-attention-until");
+        let untargeted = store
+            .request_attention_until(
+                "attention/untargeted",
+                &request(Vec::new(), "untargeted"),
+                Some("completed"),
+            )
+            .unwrap_err();
+        assert_eq!(untargeted.code, "invalid-attention-until");
+
+        let stored = store
+            .request_attention_until(
+                "attention/until",
+                &request(target, "until"),
+                Some("completed"),
+            )
+            .unwrap();
+        assert_eq!(stored.until.as_deref(), Some("completed"));
+        assert_eq!(
+            store.pending_attention_with_until("node").unwrap()[0].subject,
+            "attention/until"
+        );
+        assert!(
+            store
+                .pending_attention_with_until("other-host")
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

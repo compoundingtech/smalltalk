@@ -1264,6 +1264,52 @@ pub struct SubjectStatus {
     pub projection: OperationalAnnotation,
 }
 
+/// The status conditions `st3 trace wait --for` accepts, which an attention request can also use
+/// as its `until` condition.
+pub const STATUS_WAIT_CONDITIONS: &[&str] = &[
+    "running",
+    "ready",
+    "standing",
+    "completed",
+    "failed",
+    "cancelled",
+    "delivered",
+    "terminal",
+    "exited",
+    "stopped",
+];
+
+/// The status a subject's actual projection reports.
+pub fn projected_actual_status(actual: Option<&Value>) -> Option<&str> {
+    let fields = actual.map(|actual| actual.get("fields").unwrap_or(actual))?;
+    fields
+        .get("status")
+        .or_else(|| fields.pointer("/facts/status"))
+        .and_then(Value::as_str)
+}
+
+/// Whether a subject's status meets one of [`STATUS_WAIT_CONDITIONS`]. `None` is a subject the
+/// graph does not know.
+pub fn status_wait_condition_holds(condition: &str, status: Option<&SubjectStatus>) -> bool {
+    let actual_status = projected_actual_status(status.and_then(|item| item.actual.as_ref()));
+    match condition {
+        "running" => matches!(actual_status, Some("running" | "ready")),
+        "ready" => actual_status == Some("ready"),
+        "standing" => actual_status == Some("standing"),
+        "completed" => actual_status == Some("completed"),
+        "failed" => actual_status == Some("failed"),
+        "cancelled" => actual_status == Some("cancelled"),
+        "delivered" => actual_status == Some("delivered"),
+        "terminal" => matches!(actual_status, Some("completed" | "failed" | "cancelled")),
+        "exited" => actual_status == Some("exited"),
+        "stopped" => {
+            status.is_none_or(|item| item.actual.is_none())
+                || matches!(actual_status, Some("stopped" | "removed"))
+        }
+        _ => false,
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ClientPageInfo {
     pub limit: usize,
@@ -1447,6 +1493,17 @@ pub struct AttentionRequest {
     pub idempotency_key: String,
 }
 
+/// An attention request as it is posted, with an optional condition that closes it.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct AttentionRequestPost {
+    #[serde(flatten)]
+    pub request: AttentionRequest,
+    /// One of [`STATUS_WAIT_CONDITIONS`]. The daemon resolves the request once every target
+    /// meets it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub until: Option<String>,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct AttentionResolveRequest {
     pub outcome: String,
@@ -1482,6 +1539,8 @@ pub struct AttentionRequestView {
     pub requested_at_unix_ms: u128,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolved_at_unix_ms: Option<u128>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub until: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
