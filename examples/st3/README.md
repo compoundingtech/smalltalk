@@ -60,7 +60,7 @@ the setup.
 | Run steps of one mission in a fixed order | [`queued-work.kdl`](queued-work.kdl) |
 | Run nested jobs one after another | [`queued-nested-work.kdl`](queued-nested-work.kdl) |
 | Delegate a step to an inline child mission with its own agent | [`nested-mission.kdl`](nested-mission.kdl) |
-| Fan work out to parallel mission-scoped seats, each in its own worktree | [`fan-out.kdl`](fan-out.kdl) |
+| Fan work out to parallel mission-scoped seats, each in a worktree that st3 creates and removes (`checkout`) | [`fan-out.kdl`](fan-out.kdl) |
 | Review independently and keep remediation reachable | [`review-remediation.kdl`](review-remediation.kdl) |
 
 ### Start missions from events and time

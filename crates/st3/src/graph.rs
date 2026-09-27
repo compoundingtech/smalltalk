@@ -2268,6 +2268,7 @@ fn validate_agent_body(document: &KdlDocument, owner: &str) -> Result<(), St3Err
         "description",
         "host",
         "workspace",
+        "checkout",
         "under",
         "restart",
         "shutdown-timeout",
@@ -2288,6 +2289,7 @@ fn validate_agent_body(document: &KdlDocument, owner: &str) -> Result<(), St3Err
         "description",
         "host",
         "workspace",
+        "checkout",
         "shutdown-timeout",
         "command",
         "argv",
@@ -2361,6 +2363,9 @@ fn validate_agent_body(document: &KdlDocument, owner: &str) -> Result<(), St3Err
         ));
     }
     parse_workspace(document)?;
+    if let Some(checkout) = unique_child(document, "checkout")? {
+        validate_checkout(checkout, document, owner)?;
+    }
     if let Some(env) = unique_child(document, "env")? {
         validate_string_map(env, true)?;
     }
@@ -2375,6 +2380,54 @@ fn validate_agent_body(document: &KdlDocument, owner: &str) -> Result<(), St3Err
         validate_driver(driver)?;
     }
     Ok(())
+}
+
+/// `checkout "REPOSITORY" base="REF" branch="NAME" remove-at-run-end=#true` creates the agent's
+/// workspace as a Git worktree before the agent starts.
+fn validate_checkout(node: &KdlNode, agent: &KdlDocument, owner: &str) -> Result<(), St3Error> {
+    ensure_only_properties(node, &["base", "branch", "remove-at-run-end"])?;
+    ensure_no_children(node)?;
+    one_string(node)?;
+    if unique_child(agent, "workspace")?.is_none() {
+        return Err(St3Error::new(
+            "invalid-checkout",
+            format!("agent `{owner}` checkout needs a workspace for the worktree"),
+        ));
+    }
+    for property in ["base", "branch"] {
+        let value = property_string(node, property)?.ok_or_else(|| {
+            St3Error::new(
+                "invalid-checkout",
+                format!("agent `{owner}` checkout needs {property}=\"...\""),
+            )
+        })?;
+        if !checkout_ref_is_valid(&value) {
+            return Err(St3Error::new(
+                "invalid-checkout",
+                format!("agent `{owner}` checkout {property} `{value}` is not a Git ref name"),
+            ));
+        }
+    }
+    property_bool(node, "remove-at-run-end")?;
+    Ok(())
+}
+
+/// A conservative subset of `git check-ref-format` that also keeps a ref from reading as a Git
+/// option. `${...}` run variables stay valid before interpolation.
+fn checkout_ref_is_valid(value: &str) -> bool {
+    !value.is_empty()
+        && !value.starts_with(['-', '/', '.'])
+        && !value.ends_with(['/', '.'])
+        && !value.ends_with(".lock")
+        && !value.contains("..")
+        && !value.contains("@{")
+        && !value.contains("//")
+        && !value.split('/').any(|part| part.starts_with(['-', '.']))
+        && !value.chars().any(|character| {
+            character.is_ascii_control()
+                || character.is_whitespace()
+                || matches!(character, '~' | '^' | ':' | '?' | '*' | '[' | '\\')
+        })
 }
 
 fn validate_mission_authority_pattern(pattern: &str) -> Result<(), St3Error> {
@@ -4241,6 +4294,63 @@ fn valid_field_path(path: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_agent_checkout_needs_a_workspace_and_git_ref_names() {
+        let mission = |workspace: &str, checkout: &str| {
+            format!(
+                "version 2\nmission \"example/checkout\" state=\"ready\" {{\n  goal \"Work in a worktree.\"\n  agent \"worker\" {{\n    {workspace}\n    {checkout}\n    command \"true\"\n  }}\n  step \"work\" {{\n    assigned-to \"agent/${{ST_MISSION_RUN}}/worker\"\n    goal \"Work.\"\n  }}\n}}\n"
+            )
+        };
+        let workspace = "workspace \"${ST_WORKSPACE}/worker\"";
+        let valid = mission(
+            workspace,
+            "checkout \"${ST_WORKSPACE}/repo\" base=\"origin/main\" branch=\"example/${ST_MISSION_RUN}\" remove-at-run-end=#true",
+        );
+        parse_intent(&valid, "node").unwrap();
+
+        for (workspace, checkout) in [
+            (
+                "",
+                "checkout \"/work/repo\" base=\"origin/main\" branch=\"example/a\"",
+            ),
+            (workspace, "checkout \"/work/repo\" branch=\"example/a\""),
+            (workspace, "checkout \"/work/repo\" base=\"origin/main\""),
+            (
+                workspace,
+                "checkout \"/work/repo\" base=\"--upload-pack=x\" branch=\"example/a\"",
+            ),
+            (
+                workspace,
+                "checkout \"/work/repo\" base=\"origin/main\" branch=\"example/-a\"",
+            ),
+            (
+                workspace,
+                "checkout \"/work/repo\" base=\"origin/main\" branch=\"example a\"",
+            ),
+            (
+                workspace,
+                "checkout \"/work/repo\" base=\"origin/main\" branch=\"example..a\"",
+            ),
+        ] {
+            let error = parse_intent(&mission(workspace, checkout), "node").unwrap_err();
+            assert_eq!(
+                error.code, "invalid-checkout",
+                "{checkout}: {}",
+                error.message
+            );
+        }
+        let unknown = mission(
+            workspace,
+            "checkout \"/work/repo\" base=\"origin/main\" branch=\"example/a\" depth=1",
+        );
+        assert!(parse_intent(&unknown, "node").is_err());
+        let empty = mission(
+            workspace,
+            "checkout \"\" base=\"origin/main\" branch=\"example/a\"",
+        );
+        assert!(parse_intent(&empty, "node").is_err());
+    }
 
     #[test]
     fn every_st3_eval_uses_the_current_graph_grammar() {
