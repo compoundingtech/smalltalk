@@ -72,8 +72,11 @@ longer selected. Delivery attempts never create another logical reminder.
 
 ### Stopped agents
 
-An agent with no selected desired state and only terminal actual observations is historical. An
-agent whose selected desire is stop/retired is current but non-actionable after it is stopped.
+An agent with no selected desired state and only terminal actual observations is historical. So
+is an agent with no selected desired state that never had a runtime observation, such as one known
+only from its own harness observations; its history reason is `undeclared`. Finished gate runners
+(`gate-operation/…`) follow the same runtime rules as agents and execs. An agent whose selected
+desire is stop/retired is current but non-actionable after it is stopped.
 Default agent and fleet lists exclude both. Detail-by-ID and `--all` retain desired/actual state,
 owner links, stop reason, and timestamps.
 

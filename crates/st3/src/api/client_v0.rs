@@ -422,6 +422,11 @@ fn mission_resources(
     let mut values = missions
         .into_iter()
         .filter(|(mission, _)| selected_id.is_none_or(|selected| mission == selected))
+        // st3 publishes each loop round as an internal definition that no one starts directly;
+        // its runs belong to the parent mission. List them only with history or by ID.
+        .filter(|(mission, _)| {
+            history || selected_id.is_some() || !mission.starts_with("mission/__st3/")
+        })
         .map(|(mission, mut runs)| {
             runs.sort_by_key(|run| run.created_at_unix_ms);
             let definition = definitions.get(&mission);
@@ -461,6 +466,10 @@ fn mission_resources(
                 .iter()
                 .map(|run| run.subject.as_str())
                 .collect::<BTreeSet<_>>();
+            let active_runs = runs
+                .iter()
+                .filter(|run| !matches!(run.status.as_str(), "completed" | "failed" | "cancelled"))
+                .count();
             let usage = aggregate_usage_for_runs(store, &desired, &run_ids, Some(snapshot_index))?;
             let revision = latest
                 .map(|run| run.revision.as_str())
@@ -484,6 +493,7 @@ fn mission_resources(
                 "state": state,
                 "mission_revision": revision,
                 "runs": runs.into_iter().map(|run| run.subject).collect::<Vec<_>>(),
+                "active_runs": active_runs,
                 "run_generations": run_generations,
                 "visualization": visualization,
                 "usage": usage,
@@ -784,12 +794,19 @@ fn machine_resources(
             }
             reasons.sort();
             reasons.dedup();
+            // The transport claim changes only with the peer's status, so its success time
+            // goes stale while the peer stays up. The peer row records every success.
+            let last_success_at = fields
+                .get("last_success_at")
+                .and_then(Value::as_u64)
+                .map(u128::from)
+                .max(state.store.replication_peer_last_success(&name)?);
             (
                 machine_state,
                 vec![json!({
                     "protocol": fields.get("protocol").and_then(Value::as_str).unwrap_or("replication"),
                     "status": if matches!(status, "up" | "down") { status } else { "unknown" },
-                    "last_success_at": fields.get("last_success_at").and_then(Value::as_u64).map(|value| client_timestamp(u128::from(value))),
+                    "last_success_at": last_success_at.map(client_timestamp),
                 })],
                 layer.clone(),
                 layer == "current"
@@ -1183,6 +1200,7 @@ fn agent_queue_value(queue: &crate::model::SeatQueueView) -> Value {
             "claimed_work_ids": run.claimed_work_ids,
             "ready_work_ids": run.ready_work_ids,
             "waiting_work_ids": run.waiting_work_ids,
+            "waiting_for_run_id": run.waiting_for,
         })).collect::<Vec<_>>(),
         "moves": queue.moves.iter().map(|moved| json!({
             "claim_id": moved.claim_id,
@@ -4398,6 +4416,53 @@ mod tests {
     }
 
     #[test]
+    fn machines_report_the_latest_replication_success_while_a_peer_stays_up() {
+        const FLEET: &str = "018f6f0d-4a5d-7b8c-9d0e-123456789abc";
+        let root = tempfile::tempdir().unwrap();
+        let mut state = test_state_named(root.path(), "hub");
+        state.configured_peers = vec!["edge".into()];
+        state.store.bind_fleet(FLEET).unwrap();
+        // The transport comes up once, which records its claim.
+        state
+            .store
+            .record_transport_observation("edge", "up", None, Some(1_000))
+            .unwrap();
+        // A later exchange succeeds. The status is still up, so no new claim is written.
+        let edge = Store::open_memory("edge").unwrap();
+        edge.bind_fleet(FLEET).unwrap();
+        let exchange = edge
+            .export_replication_exchange(FLEET, &crate::model::ReplicationInventory::default())
+            .unwrap();
+        state
+            .store
+            .receive_replication_exchange("edge", FLEET, &exchange)
+            .unwrap();
+        state
+            .store
+            .record_transport_observation("edge", "up", None, None)
+            .unwrap();
+        let peer_success = state
+            .store
+            .replication_peer_last_success("edge")
+            .unwrap()
+            .unwrap();
+        assert!(peer_success > 1_000);
+
+        let session = ClientSession::local(Some("person/nathan")).unwrap();
+        let machines =
+            machine_resources(&state, false, &new_client_snapshot(&state), &session).unwrap();
+        let edge = machines
+            .iter()
+            .find(|machine| machine["host_id"] == "host/edge")
+            .unwrap();
+        assert_eq!(edge["state"], "reachable");
+        assert_eq!(
+            edge["transports"][0]["last_success_at"],
+            client_timestamp(peer_success)
+        );
+    }
+
+    #[test]
     fn device_projection_uses_paired_device_name() {
         let root = tempfile::tempdir().unwrap();
         let state = test_state(root.path());
@@ -4505,6 +4570,89 @@ mod tests {
             })
             .unwrap();
         assert!(authenticate(&state, &request, "fabric-loopback").is_err());
+    }
+
+    #[test]
+    fn default_mission_list_hides_loop_round_definitions_and_counts_active_runs() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state_named(root.path(), "loop-node");
+        let source = r#"version 2
+mission "example/looped" state="ready" {
+  goal "Repeat a bounded round."
+  concurrent-runs max=2
+  completion { when "all-steps-exhausted" }
+  loop "improve" {
+    max-rounds 2
+    round {
+      completion { when "all-steps-exhausted" }
+      step "work" { agentless; goal "Complete round ${loop.round}." }
+    }
+  }
+}
+"#;
+        let intent = crate::graph::parse_intent(source, "loop-node").unwrap();
+        let preview = state
+            .store
+            .mission(
+                &intent,
+                crate::model::IntentInput {
+                    kdl: source.into(),
+                    source_name: Some("looped.kdl".into()),
+                },
+            )
+            .unwrap();
+        state
+            .store
+            .apply_as(
+                &intent,
+                &preview.subject_tokens,
+                "publish-looped",
+                Some("person/operator"),
+            )
+            .unwrap();
+        let start = |key: &str| {
+            state
+                .store
+                .create_mission_run(&crate::model::MissionRunRequest {
+                    mission: "example/looped".into(),
+                    revision: None,
+                    workspace: "/tmp".into(),
+                    requester: Some("person/operator".into()),
+                    mode: Some("run".into()),
+                    inputs: BTreeMap::new(),
+                    idempotency_key: format!("looped-{key}"),
+                })
+                .unwrap()
+        };
+        let first = start("first");
+        start("second");
+        state
+            .store
+            .set_mission_run_state(&first.id, "cancelled", "terminal", Some("no longer needed"))
+            .unwrap();
+
+        let internal = |resources: &[Value]| {
+            resources
+                .iter()
+                .filter(|value| {
+                    value["id"]
+                        .as_str()
+                        .is_some_and(|id| id.starts_with("mission/__st3/"))
+                })
+                .count()
+        };
+        let history =
+            mission_resources(&state.store, state.store.index().unwrap(), true, None).unwrap();
+        assert!(internal(&history) > 0, "{history:?}");
+        let current =
+            mission_resources(&state.store, state.store.index().unwrap(), false, None).unwrap();
+        assert_eq!(internal(&current), 0, "{current:?}");
+        let looped = current
+            .iter()
+            .find(|value| value["id"] == "mission/example/looped")
+            .unwrap();
+        assert_eq!(looped["runs"].as_array().unwrap().len(), 2);
+        assert_eq!(looped["active_runs"], 1);
     }
 
     #[test]

@@ -60,8 +60,8 @@ the setup.
 | Run steps of one mission in a fixed order | [`queued-work.kdl`](queued-work.kdl) |
 | Run nested jobs one after another | [`queued-nested-work.kdl`](queued-nested-work.kdl) |
 | Delegate a step to an inline child mission with its own agent | [`nested-mission.kdl`](nested-mission.kdl) |
-| Fan work out to parallel mission-scoped seats, each in its own worktree | [`fan-out.kdl`](fan-out.kdl) |
-| Review independently and keep remediation reachable | [`review-remediation.kdl`](review-remediation.kdl) |
+| Fan work out to parallel mission-scoped seats, each in a worktree that st3 creates and removes (`checkout`) | [`fan-out.kdl`](fan-out.kdl) |
+| Review independently, keep remediation reachable, and give one agent its own constraint | [`review-remediation.kdl`](review-remediation.kdl) |
 
 ### Start missions from events and time
 
@@ -78,6 +78,7 @@ the setup.
 | Wait for a pull request's GitHub checks to pass | [`wait-for-green-checks.kdl`](wait-for-green-checks.kdl) |
 | Repeat a fix until the pushed branch passes its tests | [`loop-until-green.kdl`](loop-until-green.kdl), [`test-pushed-branch.sh`](test-pushed-branch.sh) |
 | Wait until a time | [`wait-until-time.kdl`](wait-until-time.kdl) |
+| Start work only after another mission run completes | [`after-another-run.kdl`](after-another-run.kdl) |
 | Wait for a person's review | [`human-review.kdl`](human-review.kdl) |
 | Wait on an agent: its work, its runtime, or a run's agents exiting | [`wait-for-agent.kdl`](wait-for-agent.kdl) |
 | Write a mechanical gate that works | [`WRITE-A-GATE-THAT-WORKS.md`](WRITE-A-GATE-THAT-WORKS.md), [`gate-recovery.kdl`](gate-recovery.kdl), [`verify-catalog-index.sh`](verify-catalog-index.sh) |
@@ -102,10 +103,10 @@ the setup.
 Gates run through `sh -c` with a minimal environment and no login shell:
 
 - Use absolute binary paths, such as `/usr/bin/git`.
-- `${NAME}` is an st3 variable; write shell variables as plain `$NAME`.
+- `${NAME}` is an st3 variable; write shell variables as plain `$NAME`, or `$${NAME}` for braces.
 - A gate on files checks the committed, pushed tree, not an agent's working tree.
-- A gate result is cached by its definition. A loop's `until` gate puts `${loop.round}` in its
-  command, and a step retried until a time puts `${ST_ATTEMPT}` in its gate.
+- A gate result is cached by its definition and step attempt. A loop's `until` gate puts
+  `${loop.round}` in its command so each round checks again.
 - A graph predicate that is false stays pending; `every` passes on an empty list.
 
 [`WRITE-A-GATE-THAT-WORKS.md`](WRITE-A-GATE-THAT-WORKS.md) explains each rule.

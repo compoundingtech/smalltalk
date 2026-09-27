@@ -1788,6 +1788,41 @@ fn a_rejected_exact_steer_has_no_fallback_and_remains_retryable_after_state_chan
 }
 
 #[test]
+fn a_hung_delivery_request_fails_instead_of_holding_the_fifo_forever() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = delivery_config(tmp.path());
+    message::send_to_inbox(&config.inbox, "h.sender", Some("hung"), None, &[], "body").unwrap();
+    let mut delivery = inbox_delivery(tmp.path(), config);
+    let idle = subscribed_state(CodexObservedState::Idle);
+    assert!(delivery.maybe_request(&idle).unwrap().is_some());
+    delivery.pending.as_mut().unwrap().requested_at = Instant::now() - Duration::from_secs(31);
+    assert!(delivery.maybe_request(&idle).is_err());
+}
+
+#[test]
+fn a_rejected_delivery_retries_after_backoff_in_the_same_observed_state() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = delivery_config(tmp.path());
+    message::send_to_inbox(&config.inbox, "h.sender", Some("retry"), None, &[], "body").unwrap();
+    let mut delivery = inbox_delivery(tmp.path(), config);
+    let idle = subscribed_state(CodexObservedState::Idle);
+    let request = delivery.maybe_request(&idle).unwrap().unwrap();
+    let client_id = request["params"]["clientUserMessageId"].clone();
+    delivery
+        .accept_response(
+            &json!({
+                "id": request["id"], "error": {"code": -32600, "message": "transient"}
+            }),
+            idle.observed(),
+        )
+        .unwrap();
+    assert!(delivery.maybe_request(&idle).unwrap().is_none());
+    delivery.rejected.as_mut().unwrap().rejected_at = Instant::now() - Duration::from_secs(6);
+    let retry = delivery.maybe_request(&idle).unwrap().unwrap();
+    assert_eq!(retry["params"]["clientUserMessageId"], client_id);
+}
+
+#[test]
 fn a_success_response_persists_transport_and_exact_turn_without_archiving() {
     let tmp = tempfile::tempdir().unwrap();
     let config = delivery_config(tmp.path());
@@ -3604,12 +3639,9 @@ fn residency_readiness_requires_the_exact_thread_under_the_expected_incarnation(
         "a stale prior-attempt binding became ready"
     );
 
-    let replacement = CodexRuntime::with_incarnation(
-        "h.worker".into(),
-        "h.worker".into(),
-        "attempt-next".into(),
-    )
-    .unwrap();
+    let replacement =
+        CodexRuntime::with_incarnation("h.worker".into(), "h.worker".into(), "attempt-next".into())
+            .unwrap();
     atomic_json(
         &state.join("binding.json"),
         &CodexThreadBinding::new(&replacement, "thread-prior".into()),
@@ -5677,6 +5709,20 @@ fn rejected_declared_option_selects_one_minimal_safe_fallback_without_leaking_it
     let mut attempted = false;
     assert!(claim_safe_fallback_attempt(&mut attempted));
     assert!(!claim_safe_fallback_attempt(&mut attempted));
+}
+
+#[test]
+fn st3_controlled_launch_rejects_a_promptless_safe_fallback() {
+    let prepared = prepare_controlled_launch_args(
+        "unix:///server.sock",
+        &["--future-token=secret".into(), "Follow .st3/boot.md".into()],
+        None,
+    );
+    assert!(prepared.safe_fallback);
+    let error = strict_launch_preflight(&prepared, false).unwrap_err();
+    assert!(error.to_string().contains("--future-token"));
+    assert!(!error.to_string().contains("secret"));
+    assert!(strict_launch_preflight(&prepared, true).is_ok());
 }
 
 #[test]

@@ -384,6 +384,9 @@ pub struct StepSpec {
     pub goals: Vec<String>,
     #[serde(default)]
     pub constraints: Vec<String>,
+    /// Constraints from agent blocks declared in this step, keyed by the agent subject template.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub agent_constraints: BTreeMap<String, Vec<String>>,
     pub timeout_ms: Option<u64>,
     pub retry: RetrySpec,
     pub finally: bool,
@@ -406,6 +409,10 @@ pub struct StepSpec {
     pub produces_mission: Option<String>,
     #[serde(default)]
     pub uses_mission: Option<UsedMissionSpec>,
+    /// The mission run this agentless step waits for. The step completes when that run
+    /// completes and fails when it fails or is cancelled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after_run: Option<String>,
     pub gates: Vec<GateSpec>,
     pub nested_mission: Option<Box<MissionSpec>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -442,6 +449,9 @@ pub struct MissionSpec {
     pub goals: Vec<String>,
     #[serde(default)]
     pub constraints: Vec<String>,
+    /// Constraints from agent blocks declared in this mission, keyed by the agent subject template.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub agent_constraints: BTreeMap<String, Vec<String>>,
     #[serde(default)]
     pub baselines: Vec<BaselineSpec>,
     #[serde(default)]
@@ -484,6 +494,9 @@ pub struct GateContext {
     pub subject: String,
     pub name: String,
     pub started_at_unix_ms: u128,
+    /// The owner's attempt. A later attempt gets its own mechanical and LLM gate results.
+    #[serde(default)]
+    pub attempt: u32,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -528,6 +541,27 @@ impl QueueAuthority {
     pub fn allows_move(&self, seat: &str) -> bool {
         let seat = seat.strip_prefix("agent/").unwrap_or(seat);
         self.moves
+            .iter()
+            .any(|pattern| authority_pattern_matches(pattern, seat))
+    }
+}
+
+/// Top-level seats an agent may declare or stop, granted by a person.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct SeatAuthority {
+    pub declare: Vec<String>,
+    pub stop: Vec<String>,
+}
+
+impl SeatAuthority {
+    pub fn allows(&self, action: &str, seat: &str) -> bool {
+        let seat = seat.strip_prefix("agent/").unwrap_or(seat);
+        let patterns = match action {
+            "declare" => &self.declare,
+            "stop" => &self.stop,
+            _ => return false,
+        };
+        patterns
             .iter()
             .any(|pattern| authority_pattern_matches(pattern, seat))
     }
@@ -704,6 +738,9 @@ pub struct MissionRunCreation {
     #[serde(default)]
     pub inputs: BTreeMap<String, String>,
     pub mode: String,
+    /// The mission run that must complete before this run's work starts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1264,6 +1301,52 @@ pub struct SubjectStatus {
     pub projection: OperationalAnnotation,
 }
 
+/// The status conditions `st3 trace wait --for` accepts, which an attention request can also use
+/// as its `until` condition.
+pub const STATUS_WAIT_CONDITIONS: &[&str] = &[
+    "running",
+    "ready",
+    "standing",
+    "completed",
+    "failed",
+    "cancelled",
+    "delivered",
+    "terminal",
+    "exited",
+    "stopped",
+];
+
+/// The status a subject's actual projection reports.
+pub fn projected_actual_status(actual: Option<&Value>) -> Option<&str> {
+    let fields = actual.map(|actual| actual.get("fields").unwrap_or(actual))?;
+    fields
+        .get("status")
+        .or_else(|| fields.pointer("/facts/status"))
+        .and_then(Value::as_str)
+}
+
+/// Whether a subject's status meets one of [`STATUS_WAIT_CONDITIONS`]. `None` is a subject the
+/// graph does not know.
+pub fn status_wait_condition_holds(condition: &str, status: Option<&SubjectStatus>) -> bool {
+    let actual_status = projected_actual_status(status.and_then(|item| item.actual.as_ref()));
+    match condition {
+        "running" => matches!(actual_status, Some("running" | "ready")),
+        "ready" => actual_status == Some("ready"),
+        "standing" => actual_status == Some("standing"),
+        "completed" => actual_status == Some("completed"),
+        "failed" => actual_status == Some("failed"),
+        "cancelled" => actual_status == Some("cancelled"),
+        "delivered" => actual_status == Some("delivered"),
+        "terminal" => matches!(actual_status, Some("completed" | "failed" | "cancelled")),
+        "exited" => actual_status == Some("exited"),
+        "stopped" => {
+            status.is_none_or(|item| item.actual.is_none())
+                || matches!(actual_status, Some("stopped" | "removed"))
+        }
+        _ => false,
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ClientPageInfo {
     pub limit: usize,
@@ -1447,6 +1530,39 @@ pub struct AttentionRequest {
     pub idempotency_key: String,
 }
 
+/// An attention request as it is posted, with an optional condition that closes it.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct AttentionRequestPost {
+    #[serde(flatten)]
+    pub request: AttentionRequest,
+    /// One of [`STATUS_WAIT_CONDITIONS`]. The daemon resolves the request once every target
+    /// meets it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub until: Option<String>,
+}
+
+/// One mission request that a subscription recorded, with its current disposition: `pending`,
+/// `held` for a person, `started`, `cancelled`, or `failed` when its run could not be created.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct SubscriptionRequestView {
+    pub request: String,
+    pub subscription: String,
+    pub resource: String,
+    pub mission: String,
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mission_run: Option<String>,
+    pub requested_at_unix_ms: u128,
+}
+
+/// A person's decision to release or cancel one subscription request.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct SubscriptionRequestDecision {
+    pub actor: String,
+    pub reason: String,
+    pub idempotency_key: String,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct AttentionResolveRequest {
     pub outcome: String,
@@ -1461,6 +1577,15 @@ pub struct AttentionWithdrawRequest {
     pub reason: String,
     pub actor: String,
     pub idempotency_key: String,
+}
+
+/// What one target of a fault is doing now, so a person can recognize a leftover request.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct AttentionTargetState {
+    pub id: String,
+    pub state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub since_unix_ms: Option<u128>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -1482,6 +1607,8 @@ pub struct AttentionRequestView {
     pub requested_at_unix_ms: u128,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolved_at_unix_ms: Option<u128>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub until: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -1799,6 +1926,9 @@ pub struct MissionRunView {
     pub timeout_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deadline_at_unix_ms: Option<u128>,
+    /// The mission run that must complete before this run's work starts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after: Option<String>,
     pub status: String,
     pub phase: String,
     pub created_at_unix_ms: u128,
@@ -1889,6 +2019,10 @@ pub struct StepRunView {
     pub claimant: Option<String>,
     pub claim_incarnation: Option<String>,
     pub claim_expires_at_unix_ms: Option<u128>,
+    /// The seat whose claim a revision dropped when it carried this ready step
+    /// into the current generation, until that seat claims it again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub carried_claimant: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub execution_started_at_unix_ms: Option<u128>,
     #[serde(default)]
@@ -1899,6 +2033,14 @@ pub struct StepRunView {
     pub ready_age_ms: Option<u128>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wake: Option<WorkWakeView>,
+    /// The latest `work progress` summary for the current attempt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub progress_summary: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub progress_at_unix_ms: Option<u128>,
+    /// The `work complete` summary for the current attempt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion_summary: Option<String>,
     pub readiness_epoch: u32,
     pub blocked_reason: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1946,6 +2088,9 @@ pub struct SeatQueueRunView {
     pub claimed_work_ids: Vec<String>,
     pub ready_work_ids: Vec<String>,
     pub waiting_work_ids: Vec<String>,
+    /// The mission run this run waits for before any of its work can start.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub waiting_for: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -1989,6 +2134,13 @@ pub struct WorkRequest {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct WorkWakeRequest {
+    pub actor: String,
+    pub reason: String,
+    pub idempotency_key: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct WorkRetryRequest {
     pub actor: String,
     pub reason: String,
     pub idempotency_key: String,
@@ -2108,6 +2260,20 @@ pub struct ReplicationInventory {
     pub digest: String,
     #[serde(default)]
     pub envelopes: Vec<ReplicaEnvelopeId>,
+    /// A compact inventory: one digest per writer sequence range. When present, `envelopes`
+    /// lists only the identities in ranges that differ from the peer's ranges. Older peers
+    /// ignore this field and exchange the full inventory.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub buckets: Vec<ReplicationInventoryBucket>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ReplicationInventoryBucket {
+    pub writer: String,
+    /// First sequence in this range; ranges are aligned to the bucket width.
+    pub start: u64,
+    pub count: u64,
+    pub digest: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

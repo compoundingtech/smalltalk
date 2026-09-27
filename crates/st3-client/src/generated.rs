@@ -169,7 +169,16 @@ pub struct Attention {
     #[serde(default)]
     pub targets: Vec<String>,
     #[serde(default)]
+    pub target_states: Vec<AttentionTargetState>,
+    #[serde(default)]
     pub actions: Vec<String>,
+}
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct AttentionTargetState {
+    pub id: String,
+    pub state: String,
+    #[serde(default)]
+    pub since: Option<String>,
 }
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct Message {
@@ -428,6 +437,8 @@ pub struct Mission {
     #[serde(default)]
     pub runs: Vec<String>,
     #[serde(default)]
+    pub active_runs: Option<usize>,
+    #[serde(default)]
     pub run_generations: BTreeMap<String, String>,
     #[serde(default)]
     pub visualization: Option<Visualization>,
@@ -482,6 +493,8 @@ pub struct Agent {
     #[serde(default)]
     pub harness_state: Option<String>,
     #[serde(default)]
+    pub fault: Option<String>,
+    #[serde(default)]
     pub incarnation_id: Option<String>,
     #[serde(default)]
     pub current_session_id: Option<String>,
@@ -533,6 +546,8 @@ pub struct AgentQueueRun {
     pub ready_work_ids: Vec<String>,
     #[serde(default)]
     pub waiting_work_ids: Vec<String>,
+    #[serde(default)]
+    pub waiting_for_run_id: Option<String>,
 }
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct AgentQueueMove {

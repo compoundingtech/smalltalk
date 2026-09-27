@@ -3,6 +3,7 @@
 pub mod api;
 pub mod archive;
 pub mod boot;
+pub(crate) mod checkout;
 pub mod client;
 pub mod config;
 pub(crate) mod external_sessions;
