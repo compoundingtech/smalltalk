@@ -1183,6 +1183,7 @@ fn agent_queue_value(queue: &crate::model::SeatQueueView) -> Value {
             "claimed_work_ids": run.claimed_work_ids,
             "ready_work_ids": run.ready_work_ids,
             "waiting_work_ids": run.waiting_work_ids,
+            "waiting_for_run_id": run.waiting_for,
         })).collect::<Vec<_>>(),
         "moves": queue.moves.iter().map(|moved| json!({
             "claim_id": moved.claim_id,

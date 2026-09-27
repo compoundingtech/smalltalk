@@ -1694,6 +1694,7 @@ fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
             ("deadline_at_unix_ms", integer()),
             ("parent_step_run", reference()),
             ("default_selector", object()),
+            ("after", reference()),
         ],
         "mission-run.state" => &[
             ("status", string()),

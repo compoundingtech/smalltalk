@@ -746,6 +746,7 @@ fn parse_loop_group(
         products: Vec::new(),
         produces_mission: None,
         uses_mission: None,
+        after_run: None,
         gates: Vec::new(),
         nested_mission: None,
         loop_spec: Some(Box::new(loop_spec)),
@@ -1199,6 +1200,7 @@ fn parse_step(
     let mut products = Vec::new();
     let mut produces_mission = None;
     let mut uses_mission = None;
+    let mut after_run = None;
     let mut gates = Vec::new();
     let mut nested_mission = None;
     let mut retry = RetrySpec::default();
@@ -1279,6 +1281,7 @@ fn parse_step(
                 "produces" => products = parse_products(child)?,
                 "produces-mission" => produces_mission = Some(parse_produced_mission(child)?),
                 "uses-mission" => uses_mission = Some(parse_used_mission(child)?),
+                "after-run" => after_run = Some(parse_after_run(child)?),
                 "gate" => {
                     let gate = crate::graph::parse_gate(child, default_host)?;
                     if matches!(gate, GateSpec::Deadline { .. }) {
@@ -1324,6 +1327,15 @@ fn parse_step(
         }
     }
     validate_goal_count(&format!("step `{path}`"), &goals, false)?;
+    if after_run.is_some() {
+        if assigned_to.is_some() || !available_to.is_empty() {
+            return Err(St3Error::new(
+                "conflicting-work-selector",
+                format!("step `{path}` waits with `after-run`, so it cannot select an agent"),
+            ));
+        }
+        agentless = true;
+    }
     let work_selector = build_work_selector(
         &format!("step `{path}`"),
         assigned_to,
@@ -1353,6 +1365,7 @@ fn parse_step(
         products,
         produces_mission,
         uses_mission,
+        after_run,
         gates,
         nested_mission,
         loop_spec: None,
@@ -2019,6 +2032,90 @@ fn parse_used_mission(node: &KdlNode) -> Result<UsedMissionSpec, St3Error> {
             "uses-mission needs one exact mission reference or one output-of property",
         )),
     }
+}
+
+fn parse_after_run(node: &KdlNode) -> Result<String, St3Error> {
+    let run = plain_string(node)?;
+    if run.strip_prefix("mission-run/").unwrap_or(&run).is_empty() {
+        return Err(St3Error::new(
+            "invalid-after-run",
+            "after-run needs a mission run",
+        ));
+    }
+    Ok(run)
+}
+
+/// The step that a run started with `--after RUN` waits in before its other work starts.
+pub const AFTER_RUN_STEP: &str = "after-run";
+
+/// Returns the mission that a run started with `--after RUN` follows. It adds an agentless
+/// `after-run` step that waits for RUN, and every root step of the normal phase depends on it.
+/// Existing steps keep their definition hashes, so revision compatibility is unchanged.
+pub fn mission_after_run(mut mission: MissionSpec, run: &str) -> Result<MissionSpec, St3Error> {
+    if mission.steps.contains_key(AFTER_RUN_STEP) {
+        return Err(St3Error::new(
+            "after-run-step-exists",
+            format!(
+                "mission `{}` already has a root step named `{AFTER_RUN_STEP}`",
+                mission.id
+            ),
+        ));
+    }
+    for step in mission.steps.values_mut().filter(|step| !step.finally) {
+        step.dependencies.push(DependencySpec::Step {
+            step: AFTER_RUN_STEP.into(),
+            state: "completed".into(),
+        });
+    }
+    let mut step = StepSpec {
+        id: AFTER_RUN_STEP.into(),
+        path: AFTER_RUN_STEP.into(),
+        queue: None,
+        queue_position: None,
+        title: None,
+        goals: Vec::new(),
+        constraints: Vec::new(),
+        timeout_ms: None,
+        retry: RetrySpec::default(),
+        finally: false,
+        work_selector: Some(WorkSelector::Agentless),
+        revision_owners: Vec::new(),
+        revisions_human_only: false,
+        revision_reviewer: None,
+        dependencies: Vec::new(),
+        baselines: Vec::new(),
+        documents: Vec::new(),
+        declarations_kdl: None,
+        products: Vec::new(),
+        produces_mission: None,
+        uses_mission: None,
+        after_run: Some(after_run_subject(run)),
+        gates: Vec::new(),
+        nested_mission: None,
+        loop_spec: None,
+        definition_hash: String::new(),
+    };
+    step.definition_hash = hash(&step)?;
+    mission.steps.insert(AFTER_RUN_STEP.into(), step);
+    mission.display_order.insert(0, AFTER_RUN_STEP.into());
+    Ok(mission)
+}
+
+/// Returns the mission that one run follows: its revision, with the `after-run` step when the run
+/// was started after another run.
+pub fn run_mission(mission: MissionSpec, after: Option<&str>) -> Result<MissionSpec, St3Error> {
+    match after {
+        Some(after) => mission_after_run(mission, after),
+        None => Ok(mission),
+    }
+}
+
+/// The full subject of the run an `after-run` value names, with or without its prefix.
+pub(crate) fn after_run_subject(run: &str) -> String {
+    format!(
+        "mission-run/{}",
+        run.strip_prefix("mission-run/").unwrap_or(run)
+    )
 }
 
 fn parse_retry(node: &KdlNode) -> Result<RetrySpec, St3Error> {
@@ -3076,6 +3173,88 @@ version 2
         )
         .unwrap_err();
         assert_eq!(duplicate_field.code, "duplicate-product-field");
+    }
+
+    #[test]
+    fn after_run_steps_are_agentless_and_start_before_the_rest_of_a_run() {
+        use super::{AFTER_RUN_STEP, after_run_subject, mission_after_run, run_mission};
+        use crate::model::{DependencySpec, WorkSelector};
+        use std::collections::BTreeMap;
+
+        let intent = crate::graph::parse_intent(
+            r#"version 2
+ mission "ship" state="ready" {
+   goal "Ship after the build run."
+   assigned-to "agent/example/shipper"
+   input "build" kind="text"
+   step "wait" { after-run "${input.build}" }
+   step "ship" { depends-on { step "wait" completed } }
+   finally { step "report" { agentless } }
+ }"#,
+            "node",
+        )
+        .unwrap();
+        let mission = intent.missions["ship"].clone();
+        let wait = &mission.steps["wait"];
+        assert_eq!(wait.after_run.as_deref(), Some("${input.build}"));
+        assert_eq!(wait.work_selector, Some(WorkSelector::Agentless));
+        assert_eq!(after_run_subject("build/1"), "mission-run/build/1");
+        assert_eq!(
+            after_run_subject("mission-run/build/1"),
+            "mission-run/build/1"
+        );
+
+        let selected = crate::graph::parse_intent(
+            r#"version 2
+ mission "bad" state="ready" {
+   goal "Wait with an agent."
+   step "wait" { assigned-to "agent/example/shipper"; after-run "build/1" }
+ }"#,
+            "node",
+        )
+        .unwrap_err();
+        assert_eq!(selected.code, "conflicting-work-selector");
+
+        let hashes = mission
+            .steps
+            .values()
+            .map(|step| (step.id.clone(), step.definition_hash.clone()))
+            .collect::<BTreeMap<_, _>>();
+        let after = mission_after_run(mission.clone(), "build/1").unwrap();
+        assert_eq!(after.display_order[0], AFTER_RUN_STEP);
+        let step = &after.steps[AFTER_RUN_STEP];
+        assert_eq!(step.after_run.as_deref(), Some("mission-run/build/1"));
+        assert_eq!(step.work_selector, Some(WorkSelector::Agentless));
+        let waits = |id: &str| {
+            after.steps[id]
+                .dependencies
+                .contains(&DependencySpec::Step {
+                    step: AFTER_RUN_STEP.into(),
+                    state: "completed".into(),
+                })
+        };
+        assert!(waits("wait") && waits("ship") && !waits("report"));
+        for (id, hash) in hashes {
+            assert_eq!(after.steps[&id].definition_hash, hash);
+        }
+        assert_eq!(run_mission(mission.clone(), None).unwrap(), mission);
+        assert_eq!(
+            mission_after_run(after, "build/2").unwrap_err().code,
+            "after-run-step-exists"
+        );
+
+        let itself = crate::graph::parse_intent(
+            r#"version 2
+ mission-run "ship/1" {
+   mission "mission/ship@0000000000000000000000000000000000000000000000000000000000000000"
+   workspace "/work"
+   requester "person/operator"
+   after "ship/1"
+ }"#,
+            "node",
+        )
+        .unwrap_err();
+        assert_eq!(itself.code, "invalid-mission-run-after");
     }
 
     #[test]

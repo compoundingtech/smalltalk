@@ -123,6 +123,17 @@ pub(crate) fn render_mission_run(
     let _ = writeln!(output, "GENERATION {}", selected.generation);
     let _ = writeln!(output, "WORKSPACE {}", selected.workspace);
     let _ = writeln!(output, "REQUESTER {}", selected.requester);
+    if let Some(after) = &selected.after {
+        let wait = selected
+            .steps
+            .iter()
+            .find(|step| step.step == crate::mission::AFTER_RUN_STEP)
+            .map_or("waiting", |step| match step.status.as_str() {
+                "completed" | "failed" | "cancelled" => step.status.as_str(),
+                _ => "waiting",
+            });
+        let _ = writeln!(output, "AFTER     {after} · {wait}");
+    }
     let _ = writeln!(
         output,
         "UPDATED   {}",
@@ -1255,6 +1266,7 @@ mod tests {
             mode: "run".into(),
             timeout_ms: None,
             deadline_at_unix_ms: None,
+            after: None,
             status: "running".into(),
             phase: "normal".into(),
             created_at_unix_ms: 1_000,

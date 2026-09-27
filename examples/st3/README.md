@@ -78,6 +78,7 @@ the setup.
 | Wait for a pull request's GitHub checks to pass | [`wait-for-green-checks.kdl`](wait-for-green-checks.kdl) |
 | Repeat a fix until the pushed branch passes its tests | [`loop-until-green.kdl`](loop-until-green.kdl), [`test-pushed-branch.sh`](test-pushed-branch.sh) |
 | Wait until a time | [`wait-until-time.kdl`](wait-until-time.kdl) |
+| Start work only after another mission run completes | [`after-another-run.kdl`](after-another-run.kdl) |
 | Wait for a person's review | [`human-review.kdl`](human-review.kdl) |
 | Wait on an agent: its work, its runtime, or a run's agents exiting | [`wait-for-agent.kdl`](wait-for-agent.kdl) |
 | Write a mechanical gate that works | [`WRITE-A-GATE-THAT-WORKS.md`](WRITE-A-GATE-THAT-WORKS.md), [`gate-recovery.kdl`](gate-recovery.kdl), [`verify-catalog-index.sh`](verify-catalog-index.sh) |

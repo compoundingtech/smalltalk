@@ -313,6 +313,9 @@ struct MissionRunStartArgs {
     workspace: PathBuf,
     #[arg(long = "input", value_parser = parse_input)]
     inputs: Vec<(String, String)>,
+    /// Start no work until this mission run completes; fail if it fails or is cancelled.
+    #[arg(long, value_name = "RUN")]
+    after: Option<String>,
     #[arg(long)]
     follow: bool,
     #[arg(long = "as")]
@@ -2216,6 +2219,9 @@ async fn start_mission_run(
     let inputs = unique_pairs(args.inputs, "input")?;
     let actor = args.actor.unwrap_or_else(|| "person/requester".into());
     let requester = normalize_requester_subject(&actor);
+    let after = args
+        .after
+        .map(|after| format!("mission-run/{}", after.trim_start_matches("mission-run/")));
     let kdl = mission_run_intent(
         run_id,
         mission_id,
@@ -2224,6 +2230,7 @@ async fn start_mission_run(
         &requester,
         &inputs,
         "run",
+        after.as_deref(),
     );
     if args.print_kdl {
         print!("{kdl}");
@@ -2328,6 +2335,7 @@ fn mission_run_follow_succeeded(status: &str) -> bool {
     matches!(status, "completed" | "standing")
 }
 
+#[allow(clippy::too_many_arguments)]
 fn mission_run_intent(
     run_id: &str,
     mission_id: &str,
@@ -2336,6 +2344,7 @@ fn mission_run_intent(
     requester: &str,
     inputs: &BTreeMap<String, String>,
     mode: &str,
+    after: Option<&str>,
 ) -> String {
     let mut run = KdlNode::new("mission-run");
     run.entries_mut().push(KdlEntry::new(run_id));
@@ -2354,6 +2363,9 @@ fn mission_run_intent(
     for (name, value) in inputs {
         body.nodes_mut()
             .push(kdl_node("input", [name.as_str(), value.as_str()]));
+    }
+    if let Some(after) = after {
+        body.nodes_mut().push(kdl_node("after", [after]));
     }
     run.set_children(body);
     publication_document(run)
@@ -4792,6 +4804,12 @@ fn render_agent_queue(queue: &st3_client::AgentQueue) -> String {
             }
             _ if run.waiting_work_ids.is_empty() => "no open step for this seat".into(),
             _ => format!("{} not ready", run.waiting_work_ids.join(", ")),
+        };
+        let detail = match &run.waiting_for_run_id {
+            Some(after) if run.state == "waiting" => {
+                format!("{detail}; waiting for {after} to complete")
+            }
+            _ => detail,
         };
         let run_state = if run.run_state == "running" {
             String::new()
@@ -9593,6 +9611,50 @@ mod tests {
         assert_eq!(args.mission, "release/demo");
         assert_eq!(args.id.as_deref(), Some("release/demo/test"));
         assert_eq!(args.actor.as_deref(), Some("agent/operator"));
+    }
+
+    #[test]
+    fn mission_start_after_names_the_run_to_wait_for() {
+        let cli = Cli::try_parse_from([
+            "st3",
+            "missions",
+            "start",
+            "release/demo",
+            "--after",
+            "release/build/1",
+        ])
+        .unwrap();
+        let Command::Missions {
+            command: MissionViewCommand::Start(args),
+        } = cli.command
+        else {
+            panic!("the mission start command did not parse");
+        };
+        assert_eq!(args.after.as_deref(), Some("release/build/1"));
+
+        let kdl = mission_run_intent(
+            "release/demo/2",
+            "release/demo",
+            &"a".repeat(64),
+            Path::new("/work/demo"),
+            "person/operator",
+            &BTreeMap::new(),
+            "run",
+            Some("mission-run/release/build/1"),
+        );
+        assert!(
+            kdl.contains("after \"mission-run/release/build/1\""),
+            "{kdl}"
+        );
+        let intent = st3::graph::parse_intent(&kdl, "node").unwrap();
+        let creation = intent.mission_runs["mission-run/release/demo/2"]
+            .creation
+            .as_ref()
+            .unwrap();
+        assert_eq!(
+            creation.after.as_deref(),
+            Some("mission-run/release/build/1")
+        );
     }
 
     #[test]

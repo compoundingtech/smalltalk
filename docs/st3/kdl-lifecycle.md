@@ -115,6 +115,29 @@ Use `--follow` to wait for a terminal run. Use `--print-kdl` to inspect or save 
 
 The default mission capacity is one active run. `concurrent-runs` removes the limit. `concurrent-runs max=4` sets a limit. A capacity error rejects the full publication.
 
+### Starting after another run
+
+`after` makes a run wait for another mission run before any of its work starts:
+
+```kdl
+version 2
+
+mission-run "release/deploy" {
+  mission "mission/deploy@0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+  workspace "/work/deploy"
+  requester "person/operator"
+  after "mission-run/release/build"
+}
+```
+
+`st3 missions start deploy --after release/build` publishes the same declaration.
+
+st3 gives the run an agentless first step, `after-run`. Every other step of the normal phase depends on it. The step completes when the named run completes. It fails when that run fails or is cancelled, and the waiting run then fails.
+
+The named run must exist when the run is published. A run cannot wait for itself. A mission with a root step named `after-run` cannot start with `after`.
+
+A waiting run counts toward its mission's `concurrent-runs` limit. `st3 missions show` prints an `AFTER` line with the run it waits for and whether the wait is over. `st3 agents queue` names that run beside a waiting entry.
+
 An optional mission `timeout="2h"` becomes one absolute deadline on each run. It is not reset by a mission revision or daemon restart. An eval-mode run requires a timeout of 20 minutes or less.
 
 ## Waiting during claimed work

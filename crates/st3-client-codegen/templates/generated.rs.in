@@ -533,6 +533,8 @@ pub struct AgentQueueRun {
     pub ready_work_ids: Vec<String>,
     #[serde(default)]
     pub waiting_work_ids: Vec<String>,
+    #[serde(default)]
+    pub waiting_for_run_id: Option<String>,
 }
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct AgentQueueMove {

@@ -508,7 +508,8 @@
         "joined_at": { "$ref": "#/$defs/Timestamp" },
         "claimed_work_ids": { "type": "array", "items": { "$ref": "#/$defs/Id" } },
         "ready_work_ids": { "type": "array", "items": { "$ref": "#/$defs/Id" } },
-        "waiting_work_ids": { "type": "array", "items": { "$ref": "#/$defs/Id" } }
+        "waiting_work_ids": { "type": "array", "items": { "$ref": "#/$defs/Id" } },
+        "waiting_for_run_id": { "oneOf": [{ "$ref": "#/$defs/Id" }, { "type": "null" }] }
       }
     },
     "AgentQueueMove": {

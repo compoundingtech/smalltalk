@@ -406,6 +406,10 @@ pub struct StepSpec {
     pub produces_mission: Option<String>,
     #[serde(default)]
     pub uses_mission: Option<UsedMissionSpec>,
+    /// The mission run this agentless step waits for. The step completes when that run
+    /// completes and fails when it fails or is cancelled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after_run: Option<String>,
     pub gates: Vec<GateSpec>,
     pub nested_mission: Option<Box<MissionSpec>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -704,6 +708,9 @@ pub struct MissionRunCreation {
     #[serde(default)]
     pub inputs: BTreeMap<String, String>,
     pub mode: String,
+    /// The mission run that must complete before this run's work starts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1799,6 +1806,9 @@ pub struct MissionRunView {
     pub timeout_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deadline_at_unix_ms: Option<u128>,
+    /// The mission run that must complete before this run's work starts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after: Option<String>,
     pub status: String,
     pub phase: String,
     pub created_at_unix_ms: u128,
@@ -1946,6 +1956,9 @@ pub struct SeatQueueRunView {
     pub claimed_work_ids: Vec<String>,
     pub ready_work_ids: Vec<String>,
     pub waiting_work_ids: Vec<String>,
+    /// The mission run this run waits for before any of its work can start.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub waiting_for: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
