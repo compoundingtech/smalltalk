@@ -162,7 +162,9 @@ impl Node {
             async move { client.get::<Value>("/v1/health").await.is_ok() }
         })
         .await;
-        if self.state_dir().join("fleet/fleet.toml").exists() {
+        let legacy = fs::read_to_string(self.root.join("config/st3/config.toml"))
+            .is_ok_and(|config| config.contains("fleet_id"));
+        if legacy || self.state_dir().join("fleet/fleet.toml").exists() {
             let worker = self
                 .command(&["replication-worker"])
                 .stdin(Stdio::null())
@@ -189,6 +191,35 @@ impl Node {
     async fn restart(&mut self) {
         self.stop();
         self.start().await;
+    }
+
+    /// Configure this node as a config-peer fleet node, the way the running fleet is today.
+    fn legacy_config(&self, fleet_id: &str, secret: &Path, peers: &[(&str, u16)]) {
+        let mut config = format!(
+            "node = \"{}\"\nperson = \"{PERSON}\"\nfleet_id = \"{fleet_id}\"\nshared_secret_file = \"{}\"\npeer_listen = \"127.0.0.1:{}\"\n",
+            self.name,
+            secret.display(),
+            self.port
+        );
+        for (name, port) in peers {
+            config.push_str(&format!(
+                "\n[[peers]]\nname = \"{name}\"\nurl = \"http://127.0.0.1:{port}\"\n"
+            ));
+        }
+        fs::write(self.root.join("config/st3/config.toml"), config).unwrap();
+    }
+
+    fn migrate(&self, arguments: &[&str]) {
+        let mut all = vec![
+            "fleet",
+            "migrate",
+            "--no-service",
+            "--transports",
+            "loopback",
+            "--advertise-loopback",
+        ];
+        all.extend(arguments);
+        self.st_ok(&all);
     }
 
     /// Found a fleet on this node, listening on loopback only.
@@ -962,4 +993,127 @@ async fn a_flood_of_invalid_join_requests_does_not_block_a_valid_join() {
         "a valid join was blocked: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+async fn down_observations(node: &Node, host: &str) -> usize {
+    node.claims()
+        .await
+        .into_iter()
+        .filter(|claim| {
+            claim["subject"] == format!("host/{host}")
+                && claim["kind"] == "transport.observed"
+                && claim["body"]["fields"]["status"] == "down"
+        })
+        .count()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_config_peer_fleet_migrates_to_membership() {
+    let root = tempfile::tempdir().unwrap();
+    let fleet_id = "8f14e45f-ceea-467a-9a2b-5c3d6e7f8091";
+    let secret = root.path().join("fleet.secret");
+    fs::write(&secret, hex::encode([42_u8; 32])).unwrap();
+    fs::set_permissions(&secret, fs::Permissions::from_mode(0o600)).unwrap();
+    let mut a = Node::new(root.path(), "a");
+    let mut b = Node::new(root.path(), "b");
+    let mut l = Node::new(root.path(), "l");
+    let dead = free_port();
+    // The running fleet's shape: a lists b, and lists the laptop at a port nothing serves.
+    a.legacy_config(fleet_id, &secret, &[("b", b.port), ("l", dead)]);
+    b.legacy_config(fleet_id, &secret, &[("a", a.port)]);
+    l.legacy_config(fleet_id, &secret, &[("a", a.port)]);
+    for node in [&mut a, &mut b, &mut l] {
+        node.start().await;
+    }
+    a.note("a-0").await;
+    b.note("b-0").await;
+    l.note("l-0").await;
+    let mut expected = BTreeSet::from([
+        "custom/fleet-test/a-0".to_owned(),
+        "custom/fleet-test/b-0".to_owned(),
+        "custom/fleet-test/l-0".to_owned(),
+    ]);
+    for node in [&a, &b, &l] {
+        wait_for_notes(node, &expected, 60, &[&a, &b, &l]).await;
+    }
+    let digest_before = a.st_json(&["replication", "status"])["fleet_id"].clone();
+
+    // a becomes the anchor; config-peer exchanges keep working throughout.
+    a.stop();
+    a.migrate(&["--anchor"]);
+    a.start().await;
+    a.wait_listening().await;
+    a.note("a-1").await;
+    expected.insert("custom/fleet-test/a-1".into());
+    wait_for_notes(&b, &expected, 60, &[&a, &b]).await;
+
+    // b and the laptop migrate with codes from a.
+    let code = a.invite("b", &["--migrate"]);
+    b.stop();
+    b.migrate(&[&code]);
+    b.start().await;
+    let code = a.invite("l", &["--migrate"]);
+    l.stop();
+    l.migrate(&["--dial-out", &code]);
+    l.start().await;
+    b.note("b-1").await;
+    l.note("l-1").await;
+    expected.insert("custom/fleet-test/b-1".into());
+    expected.insert("custom/fleet-test/l-1".into());
+    for node in [&a, &b, &l] {
+        wait_for_notes(node, &expected, 60, &[&a, &b, &l]).await;
+    }
+    for node in [&a, &b] {
+        let members = node.st_json(&["fleet", "status"])["view"]["members"].clone();
+        for name in ["a", "b", "l"] {
+            assert!(
+                members
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|member| { member["name"] == name && member["state"] == "current" }),
+                "{} does not see {name} as a member: {members}",
+                node.name
+            );
+        }
+        let status = node.st_json(&["replication", "status"]);
+        assert_eq!(
+            status["fleet_id"], digest_before,
+            "the fleet binding changed"
+        );
+        assert_eq!(status["unsigned_envelopes"], 0, "{status}");
+        assert_eq!(status["fenced_envelopes"], 0, "{status}");
+    }
+
+    // Finish everywhere, then replicate with member signatures only.
+    let downs = down_observations(&a, "l").await;
+    for node in [&a, &b, &l] {
+        node.st_ok(&["fleet", "migrate", "--finish", "--no-service"]);
+    }
+    for node in [&mut a, &mut b, &mut l] {
+        node.restart().await;
+    }
+    a.note("a-2").await;
+    b.note("b-2").await;
+    l.note("l-2").await;
+    for text in ["a-2", "b-2", "l-2"] {
+        expected.insert(format!("custom/fleet-test/{text}"));
+    }
+    for node in [&a, &b, &l] {
+        wait_for_notes(node, &expected, 60, &[&a, &b, &l]).await;
+    }
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(
+        down_observations(&a, "l").await,
+        downs,
+        "a still dials the dial-out laptop at its dead config-peer port"
+    );
+    // A machine with the secret but no member key is refused once legacy exchanges end.
+    let stranger = Node::new(root.path(), "stranger");
+    stranger.legacy_config(fleet_id, &secret, &[("a", a.port)]);
+    let mut stranger = stranger;
+    stranger.start().await;
+    stranger.note("from-stranger").await;
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert!(!a.notes().await.contains("custom/fleet-test/from-stranger"));
 }

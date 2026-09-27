@@ -240,6 +240,8 @@ enum FleetCommand {
     Remove(FleetRemoveArgs),
     /// Take this machine out of its fleet after everything it wrote has reached a member.
     Leave(FleetLeaveArgs),
+    /// Move a machine of a config-peer fleet to membership, keeping its history.
+    Migrate(FleetMigrateArgs),
     /// Show this node, the fleet's members, and open invites.
     Status,
 }
@@ -647,6 +649,7 @@ async fn run_fleet(endpoint: &Endpoint, command: FleetCommand, json_output: bool
                 via: args.via.clone(),
                 settings: args.member.settings(),
                 legacy_secret_file: None,
+                fabric_protocol: None,
             })
             .await?;
             if let Some(path) = code_path {
@@ -674,6 +677,7 @@ async fn run_fleet(endpoint: &Endpoint, command: FleetCommand, json_output: bool
             Ok(())
         }
         FleetCommand::Remove(args) => run_fleet_remove(&client, &config, args).await,
+        FleetCommand::Migrate(args) => run_fleet_migrate(&client, &config, args).await,
         FleetCommand::Leave(args) => {
             let person = fleet_person(args.actor.clone(), &config)?;
             if args.cancel {
@@ -1067,6 +1071,172 @@ async fn run_uninstall(endpoint: &Endpoint, args: UninstallArgs) -> Result<()> {
     );
     anyhow::ensure!(remaining.is_empty(), "some st3 files remain");
     println!("uninstalled");
+    Ok(())
+}
+
+#[derive(Args)]
+struct FleetMigrateArgs {
+    /// A migration code from `st fleet invite NAME --migrate`, or - to read it from standard input.
+    code: Option<String>,
+    #[arg(long)]
+    code_file: Option<PathBuf>,
+    #[arg(long)]
+    fabric_inbox: bool,
+    /// Make this machine the anchor: the first machine of the fleet to migrate.
+    #[arg(long, conflicts_with_all = ["code", "code_file", "fabric_inbox", "finish", "unfinish"])]
+    anchor: bool,
+    /// Stop accepting legacy exchanges once every config peer is a member or removed.
+    #[arg(long, conflicts_with = "unfinish")]
+    finish: bool,
+    /// Accept legacy exchanges again, to roll a machine back to an older build.
+    #[arg(long)]
+    unfinish: bool,
+    /// The Fabric exposure name this machine already uses.
+    #[arg(long)]
+    fabric_protocol: Option<String>,
+    #[arg(long)]
+    no_service: bool,
+    #[command(flatten)]
+    member: FleetMemberArgs,
+}
+
+/// Settings for a migrating node: its existing replication port unless one is given.
+fn migration_settings(args: &FleetMemberArgs, config: &Config) -> st3::fleet::join::MemberSettings {
+    let mut settings = args.settings();
+    if settings.port.is_none() {
+        settings.port = config
+            .peer_listen
+            .as_deref()
+            .and_then(|address| address.parse::<std::net::SocketAddr>().ok())
+            .map(|address| address.port());
+    }
+    settings
+}
+
+async fn run_fleet_migrate(client: &Client, config: &Config, args: FleetMigrateArgs) -> Result<()> {
+    if args.finish || args.unfinish {
+        let mut file = st3::config::FleetFile::load(&config.state_dir)?
+            .context("this machine has not migrated yet")?;
+        if args.finish {
+            let status: st3::api::FleetStatus = client.get("/v1/internal/fleet/status").await?;
+            let waiting = config
+                .peers
+                .iter()
+                .filter(|peer| {
+                    let known = status
+                        .view
+                        .members
+                        .iter()
+                        .any(|member| member.name == peer.name)
+                        || status.view.legacy_removed.contains(&peer.name);
+                    !known
+                })
+                .map(|peer| peer.name.clone())
+                .collect::<Vec<_>>();
+            anyhow::ensure!(
+                waiting.is_empty(),
+                "these config peers are neither members nor removed yet: {}",
+                waiting.join(", ")
+            );
+        }
+        file.legacy_peers = args.unfinish;
+        file.save(&config.state_dir)?;
+        if args.finish {
+            println!(
+                "This machine no longer accepts legacy exchanges. Delete these lines from {}:",
+                Config::default_path().display()
+            );
+            println!("  fleet_id, shared_secret_file, peer_listen, and every [[peers]] entry");
+        } else {
+            println!("This machine accepts legacy exchanges from config peers again.");
+        }
+        if !args.no_service && services_installed() {
+            st3::service::install(Config::load_with_fleet(None)?)?;
+        } else {
+            println!("Restart st3 replication-worker for this to take effect.");
+        }
+        return Ok(());
+    }
+    let fleet_id = config
+        .fleet_id
+        .clone()
+        .context("this machine has no config-peer fleet to migrate; use st fleet join")?;
+    let secret_file = config
+        .shared_secret_file
+        .clone()
+        .context("config.toml names no shared_secret_file")?;
+    let use_services = !args.no_service && services_installed();
+    if client.get::<Value>("/v1/health").await.is_ok() {
+        anyhow::ensure!(
+            use_services,
+            "stop the running st3 daemon first: nothing may write while this machine migrates"
+        );
+        st3::service::stop()?;
+    }
+    let settings = migration_settings(&args.member, config);
+    if args.anchor {
+        let founded = st3::fleet::join::migrate_anchor(
+            &config.state_dir,
+            &config.node,
+            &fleet_id,
+            &secret_file,
+            &settings,
+            args.fabric_protocol.clone(),
+        )?;
+        println!(
+            "{} is the anchor of fleet {}. It admits itself and signs its history when st3 starts.",
+            founded.node, founded.fleet_id
+        );
+    } else {
+        let (code, code_path) = if args.fabric_inbox {
+            let path = fabric_inbox_code()?;
+            (fs::read_to_string(&path)?, Some(path))
+        } else if let Some(path) = &args.code_file {
+            (fs::read_to_string(path)?, Some(path.clone()))
+        } else {
+            match args.code.as_deref() {
+                Some("-") => {
+                    let mut text = String::new();
+                    std::io::Read::read_to_string(&mut std::io::stdin(), &mut text)?;
+                    (text, None)
+                }
+                Some(code) => (code.to_owned(), None),
+                None => (read_code_without_echo()?, None),
+            }
+        };
+        let joined = st3::fleet::join::join(&st3::fleet::join::JoinOptions {
+            state_dir: config.state_dir.clone(),
+            configured_node: config.node.clone(),
+            code: code.trim().to_owned(),
+            name: Some(config.node.clone()),
+            via: None,
+            settings,
+            legacy_secret_file: Some(secret_file),
+            fabric_protocol: args.fabric_protocol.clone(),
+        })
+        .await?;
+        anyhow::ensure!(
+            joined.migrate,
+            "that code is a join code; use st fleet join"
+        );
+        if let Some(path) = code_path {
+            let _ = fs::remove_file(path);
+        }
+        println!(
+            "{} migrated to membership in fleet {} through {}.",
+            joined.name, joined.fleet_id, joined.sponsor
+        );
+    }
+    if use_services {
+        st3::service::install(Config::load_with_fleet(None)?)?;
+        println!(
+            "The st3 services now run as a fleet member, with legacy exchanges still accepted."
+        );
+    } else {
+        println!(
+            "Start st3 up and st3 replication-worker; legacy exchanges stay accepted until st fleet migrate --finish."
+        );
+    }
     Ok(())
 }
 
