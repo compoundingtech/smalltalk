@@ -18489,6 +18489,16 @@ fn enrich_step_wake_at(
         let (body, accepted, consumed, delivered, staged) = row?;
         let body = serde_json::from_str::<Value>(&body).unwrap_or(Value::Null);
         let fields = body.get("fields").unwrap_or(&body);
+        if fields
+            .get("tags")
+            .and_then(Value::as_array)
+            .is_some_and(|tags| {
+                tags.iter()
+                    .any(|tag| tag.as_str() == Some("st3-wake-source:manual"))
+            })
+        {
+            continue;
+        }
         let matching_incarnation = fields
             .get("tags")
             .and_then(Value::as_array)
