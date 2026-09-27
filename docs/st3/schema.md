@@ -3,7 +3,7 @@
 This file is generated from `st3-schema`.
 
 Schema: `st3.v1`
-Digest: `e97bc24ed478291b3061b51c6c4fa4fbd3fa686b6ba4d1640f91767393560de9`
+Digest: `2131dba656c5088f72f28c004db4101c699f72a61ffd30f36e04490c370cb7b2`
 
 ## Subject families
 
@@ -102,7 +102,7 @@ Custom subjects use `custom/NAMESPACE/NAME`. Custom claims use `custom.NAMESPACE
 | `publication.operation` | `*` | `system-only` | `append` | `action:string`, `operation:string`, `status!:string` | `revision`, `reset`, `cancellation`, `refresh`, `feedback` |
 | `reconcile.fault` | `daemon`, `mission-run`, `observer`, `schedule`, `subscription` | `system-only` | `append` | `reason:string`, `scope!:string`, `status!:string` |  |
 | `record.repaired` | `repair` | `ordinary-client` | `once` | `reason!:string`, `record!:string`, `replacement!:string` | `repair` |
-| `render.applied` | `agent`, `exec`, `pty` | `system-only` | `append` | `writes:array` |  |
+| `render.applied` | `agent`, `exec`, `pty` | `system-only` | `append` | `warnings:array`, `writes:array` |  |
 | `repair.applied` | `repair` | `system-only` | `once` | `affected_subjects:array`, `item_count:integer`, `reason!:string`, `token!:string` |  |
 | `resource.observed` | `resource` | `ordinary-client` | `append` | `kind:string`, `observed_at:integer`, `state:any` | `resource` |
 | `revision-proposal.applied` | `revision-proposal` | `system-only` | `once` | `reason:string`, `status:string`, `successor_generation:subject-reference` |  |

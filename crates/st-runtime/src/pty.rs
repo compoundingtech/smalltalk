@@ -69,6 +69,34 @@ pub struct PtyObservation {
     pub tags: BTreeMap<String, String>,
 }
 
+/// Parse each PTY record on its own. A record this version cannot read still names its PTY, so
+/// it is reported with the status `unknown` rather than left out, which would read as a PTY that
+/// is gone. Only a record without a name fails the snapshot.
+fn parse_snapshot(bytes: &[u8]) -> Result<Vec<PtyObservation>> {
+    let records: Vec<serde_json::Value> =
+        serde_json::from_slice(bytes).context("parse the atomic PTY snapshot")?;
+    records
+        .into_iter()
+        .map(|record| {
+            serde_json::from_value::<PtyObservation>(record.clone()).or_else(|error| {
+                let name = record
+                    .get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .with_context(|| format!("parse a PTY record without a name: {error}"))?;
+                Ok(PtyObservation {
+                    name: name.into(),
+                    status: "unknown".into(),
+                    exit_code: None,
+                    pid: None,
+                    created_at: None,
+                    display_name: None,
+                    tags: BTreeMap::new(),
+                })
+            })
+        })
+        .collect()
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct PtyStats {
@@ -120,9 +148,7 @@ impl PtyRuntime {
 
     pub fn snapshot(&self) -> Result<Vec<PtyObservation>> {
         let output = self.command().args(["list", "--json"]).output()?;
-        require_success("list PTYs", output).and_then(|bytes| {
-            serde_json::from_slice(&bytes).context("parse the atomic PTY snapshot")
-        })
+        require_success("list PTYs", output).and_then(|bytes| parse_snapshot(&bytes))
     }
 
     pub fn spawn(
@@ -569,6 +595,30 @@ mod tests {
     use std::fs;
     use std::os::unix::process::CommandExt as _;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn one_unreadable_pty_record_is_unknown_instead_of_failing_the_snapshot() {
+        let snapshot = parse_snapshot(
+            br#"[
+                {"name":"healthy","status":"running","pid":10,"createdAt":"one"},
+                {"name":"strange","status":"running","pid":-1},
+                {"name":"exited","status":"exited","exitCode":0}
+            ]"#,
+        )
+        .unwrap();
+        assert_eq!(
+            snapshot
+                .iter()
+                .map(|pty| (pty.name.as_str(), pty.status.as_str()))
+                .collect::<Vec<_>>(),
+            [
+                ("healthy", "running"),
+                ("strange", "unknown"),
+                ("exited", "exited")
+            ]
+        );
+        assert!(parse_snapshot(br#"[{"status":"running"}]"#).is_err());
+    }
 
     fn fake_executable(root: &Path, name: &str, body: &str) -> PathBuf {
         let source = root.join(format!("{name}.source"));

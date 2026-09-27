@@ -117,6 +117,18 @@ on with every other item:
 A fault is recorded again only when its cause changes. The item's next success records its
 recovery.
 
+A running member whose workspace or render fails is still observed, checked, and woken for its
+work. The failure blocks only its start and restart.
+
+Sometimes the PTY registry does not answer, or one PTY's record cannot be read. Terminal members then
+wait for the next readable snapshot: none is started, restarted, or recorded as stopped. Exec
+members and the rest of the pass still run.
+
+A member whose start keeps failing does not spawn again on every pass:
+
+- it waits 15 seconds between attempts;
+- after three failures within five minutes it parks with one attention request.
+
 Cleanup of a cancelled, failed, or finished run reads only the declarations that the run owns. It
 never waits for the run's mission revision or its steps, so a run whose revision is unavailable
 still stops its runtimes.
