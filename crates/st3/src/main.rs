@@ -3120,6 +3120,22 @@ fn print_product_page(
     Ok(())
 }
 
+/// Active and finished runs apart, so a mission with one live run and five old ones does not
+/// read as six runs. A daemon that does not report active runs gets the plain total.
+fn render_mission_runs(mission: &st3_client::Mission) -> String {
+    let total = mission.runs.len();
+    let plural = |count: usize| if count == 1 { "" } else { "s" };
+    let Some(active) = mission.active_runs.map(|active| active.min(total)) else {
+        return format!("{total} run{}", plural(total));
+    };
+    match (active, total - active) {
+        (0, 0) => "0 runs".into(),
+        (active, 0) => format!("{active} active run{}", plural(active)),
+        (0, finished) => format!("{finished} finished run{}", plural(finished)),
+        (active, finished) => format!("{active} active · {finished} finished"),
+    }
+}
+
 fn render_product_page(title: &str, page: &ClientPage, continuation_command: &str) -> String {
     use std::fmt::Write as _;
 
@@ -3305,22 +3321,6 @@ fn render_product_page(title: &str, page: &ClientPage, continuation_command: &st
         );
     }
     output
-}
-
-/// Active and finished runs apart, so a mission with one live run and five old ones does not
-/// read as six runs. A daemon that does not report active runs gets the plain total.
-fn render_mission_runs(mission: &st3_client::Mission) -> String {
-    let total = mission.runs.len();
-    let plural = |count: usize| if count == 1 { "" } else { "s" };
-    let Some(active) = mission.active_runs.map(|active| active.min(total)) else {
-        return format!("{total} run{}", plural(total));
-    };
-    match (active, total - active) {
-        (0, 0) => "0 runs".into(),
-        (active, 0) => format!("{active} active run{}", plural(active)),
-        (0, finished) => format!("{finished} finished run{}", plural(finished)),
-        (active, finished) => format!("{active} active · {finished} finished"),
-    }
 }
 
 fn print_activity_page(
@@ -9116,6 +9116,26 @@ mod tests {
     }
 
     #[test]
+    fn mission_list_counts_active_and_finished_runs_apart() {
+        let mut page = fixture_product_page(&["mission"], false);
+        let ClientResource::Mission(mission) = &mut page.items[0] else {
+            panic!("expected mission fixture");
+        };
+        mission.runs = (1..=6).map(|run| format!("mission-run/r{run}")).collect();
+        let render = |active: Option<usize>, runs: usize| {
+            let mut mission = mission.clone();
+            mission.runs.truncate(runs);
+            mission.active_runs = active;
+            render_mission_runs(&mission)
+        };
+        assert_eq!(render(Some(1), 6), "1 active · 5 finished");
+        assert_eq!(render(Some(2), 2), "2 active runs");
+        assert_eq!(render(Some(0), 1), "1 finished run");
+        assert_eq!(render(Some(0), 0), "0 runs");
+        assert_eq!(render(None, 6), "6 runs");
+    }
+
+    #[test]
     fn terminal_list_shows_a_working_peek_target() {
         let mut page = fixture_product_page(&["runtime"], false);
         if let ClientResource::Runtime(runtime) = &mut page.items[0] {
@@ -9161,26 +9181,6 @@ mod tests {
                 "  recovery: st3 doctor\n",
             )
         );
-    }
-
-    #[test]
-    fn mission_list_counts_active_and_finished_runs_apart() {
-        let mut page = fixture_product_page(&["mission"], false);
-        let ClientResource::Mission(mission) = &mut page.items[0] else {
-            panic!("expected mission fixture");
-        };
-        mission.runs = (1..=6).map(|run| format!("mission-run/r{run}")).collect();
-        let render = |active: Option<usize>, runs: usize| {
-            let mut mission = mission.clone();
-            mission.runs.truncate(runs);
-            mission.active_runs = active;
-            render_mission_runs(&mission)
-        };
-        assert_eq!(render(Some(1), 6), "1 active · 5 finished");
-        assert_eq!(render(Some(2), 2), "2 active runs");
-        assert_eq!(render(Some(0), 1), "1 finished run");
-        assert_eq!(render(Some(0), 0), "0 runs");
-        assert_eq!(render(None, 6), "6 runs");
     }
 
     #[test]
