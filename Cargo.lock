@@ -2373,9 +2373,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "pty-client"
+version = "0.13.0-rust"
+source = "git+https://github.com/compoundingtech/pty-rust?rev=4f6d4daed58e1d29f0cc3c35ab8131f2fc4c323b#4f6d4daed58e1d29f0cc3c35ab8131f2fc4c323b"
+dependencies = [
+ "libc",
+ "pty-core",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "pty-core"
 version = "0.13.0-rust"
-source = "git+https://github.com/compoundingtech/pty-rust?rev=a7c60e5c48bd472b957d952d01e644e2153d8a48#a7c60e5c48bd472b957d952d01e644e2153d8a48"
+source = "git+https://github.com/compoundingtech/pty-rust?rev=4f6d4daed58e1d29f0cc3c35ab8131f2fc4c323b#4f6d4daed58e1d29f0cc3c35ab8131f2fc4c323b"
 dependencies = [
  "indexmap",
  "libc",
@@ -3073,6 +3084,8 @@ dependencies = [
  "anyhow",
  "libc",
  "portable-pty",
+ "pty-client",
+ "pty-core",
  "serde",
  "serde_json",
  "sha2",
@@ -3226,6 +3239,7 @@ dependencies = [
  "portable-pty",
  "predicates",
  "proptest",
+ "pty-client",
  "pty-core",
  "reqwest",
  "rusqlite",

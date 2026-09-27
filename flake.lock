@@ -168,17 +168,17 @@
         ]
       },
       "locked": {
-        "lastModified": 1789262594,
-        "narHash": "sha256-rjTtR0klL1t5P+SgUm7a69+AL+q6DfsU6oJ4Ags3gIk=",
+        "lastModified": 1790550237,
+        "narHash": "sha256-vzDiqgZmT7737k7UTsZtch2VMYLZjJipboli+XSQYug=",
         "owner": "compoundingtech",
         "repo": "pty-rust",
-        "rev": "a93b021743c3c50bf37d66655085149082edd8a4",
+        "rev": "4f6d4daed58e1d29f0cc3c35ab8131f2fc4c323b",
         "type": "github"
       },
       "original": {
         "owner": "compoundingtech",
         "repo": "pty-rust",
-        "rev": "a93b021743c3c50bf37d66655085149082edd8a4",
+        "rev": "4f6d4daed58e1d29f0cc3c35ab8131f2fc4c323b",
         "type": "github"
       }
     },

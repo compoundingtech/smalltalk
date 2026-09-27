@@ -1,7 +1,8 @@
 //! Native process and PTY operations shared by st2 and st3.
 //!
-//! This crate owns process identity and the small `pty` CLI boundary. It has no
-//! catalog, graph, claim, or provider policy.
+//! This crate owns process identity and the `pty` session boundary: it starts a session with the
+//! `pty` binary and reads and controls it through `pty-client`. It has no catalog, graph, claim, or
+//! provider policy.
 
 mod environment;
 mod isolate;
