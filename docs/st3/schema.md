@@ -3,7 +3,7 @@
 This file is generated from `st3-schema`.
 
 Schema: `st3.v1`
-Digest: `07a9374d50b81abb57551eba2e648a46867e8eec25806aa2dc7b8aee8f7c7431`
+Digest: `9c7bf6fb147e28ebce44067798fe43eb33fd61e90c5724ecedc148334aaf6382`
 
 ## Subject families
 
@@ -124,7 +124,7 @@ Custom subjects use `custom/NAMESPACE/NAME`. Custom claims use `custom.NAMESPACE
 | `schedule.occurrence-scheduled` | `schedule` | `system-only` | `append` | `at_unix_ms:integer`, `occurrence:integer`, `revision:string`, `scheduled_at_unix_ms:string` | `schedule` |
 | `schedule.work-requested` | `schedule` | `system-only` | `append` | `inputs!:object`, `mission!:subject-reference(mission)`, `mission_revision!:string`, `occurrence!:integer`, `revision!:string`, `workspace!:string` | `schedule` |
 | `schedule.work-started` | `schedule` | `system-only` | `append` | `mission_run!:subject-reference(mission-run)`, `request!:string` | `schedule` |
-| `step-run.carried` | `step-run` | `system-only` | `once` | `attempt:integer`, `definition_hash:string`, `source:subject-reference`, `source_generation:subject-reference`, `source_step_run:subject-reference`, `status:string`, `worker_reported:boolean` | `step` |
+| `step-run.carried` | `step-run` | `system-only` | `once` | `attempt:integer`, `claimant:subject-reference`, `definition_hash:string`, `source:subject-reference`, `source_generation:subject-reference`, `source_step_run:subject-reference`, `status:string`, `worker_reported:boolean` | `step` |
 | `step-run.retried` | `step-run` | `system-only` | `append` | `attempt:integer`, `not_before_unix_ms:integer`, `reason:string`, `status:string` | `step` |
 | `step-run.state` | `step-run` | `system-only` | `state-transition` | `attempt:integer`, `readiness_epoch:integer`, `reason:string`, `status:string` | `step` |
 | `subscription.mission-requested` | `subscription` | `system-only` | `append` | `discovery!:string`, `mission!:subject-reference(mission)`, `mission_revision!:string`, `requester:subject-reference(agent|person)`, `resource!:subject-reference(resource)`, `resource_input!:string`, `workspace!:string` | `subscription` |

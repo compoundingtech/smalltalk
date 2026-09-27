@@ -1779,6 +1779,7 @@ fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
             ("status", string()),
             ("attempt", integer()),
             ("worker_reported", boolean()),
+            ("claimant", reference()),
         ],
         "work.claimed" | "work.renewed" | "work.progress" | "work.submitted" | "work.failed"
         | "work.released" => &[

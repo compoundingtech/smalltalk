@@ -1213,6 +1213,7 @@ mod tests {
             claimant: None,
             claim_incarnation: None,
             claim_expires_at_unix_ms: None,
+            carried_claimant: None,
             execution_started_at_unix_ms: None,
             execution_elapsed_ms: 0,
             timeout_ms: None,

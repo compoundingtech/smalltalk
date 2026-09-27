@@ -154,6 +154,9 @@ pub struct SeatStep<'a> {
     pub claimant: Option<&'a str>,
     pub available_to: &'a [String],
     pub created_at_unix_ms: u128,
+    /// The seat that held this step before a revision carried it, until that
+    /// seat claims it again.
+    pub carried_claimant: Option<&'a str>,
 }
 
 impl<'a> From<&'a StepRunView> for SeatStep<'a> {
@@ -167,6 +170,7 @@ impl<'a> From<&'a StepRunView> for SeatStep<'a> {
             claimant: view.claimant.as_deref(),
             available_to: &view.available_to,
             created_at_unix_ms: view.created_at_unix_ms,
+            carried_claimant: view.carried_claimant.as_deref(),
         }
     }
 }
@@ -204,7 +208,9 @@ impl<'a> SeatSelection<'a> {
 /// it, and it becomes next again as soon as it has ready work. A nested step
 /// whose listed parent step has the same selector is reached through that
 /// parent and is not selected separately. Reordering never releases a held
-/// step: `held` comes only from claims.
+/// step: `held` comes only from claims. A revision does not take a held step's
+/// place either: a ready step whose claim by this seat a revision dropped comes
+/// first until the seat claims it again.
 pub fn select<'a>(agent: &str, steps: &[SeatStep<'a>], run_order: &[String]) -> SeatSelection<'a> {
     let held = steps
         .iter()
@@ -228,9 +234,11 @@ pub fn select<'a>(agent: &str, steps: &[SeatStep<'a>], run_order: &[String]) -> 
                 && !reached_through_parent(step, steps)
         })
         .collect::<Vec<_>>();
+    let waits_its_turn = |step: &SeatStep<'_>| step.carried_claimant != Some(agent);
     ready.sort_by(|left, right| {
-        rank(left.run)
-            .cmp(&rank(right.run))
+        waits_its_turn(left)
+            .cmp(&waits_its_turn(right))
+            .then_with(|| rank(left.run).cmp(&rank(right.run)))
             .then_with(|| left.created_at_unix_ms.cmp(&right.created_at_unix_ms))
             .then_with(|| left.subject.cmp(right.subject))
     });
@@ -335,6 +343,7 @@ mod tests {
             claimant: None,
             available_to: &none,
             created_at_unix_ms: 1,
+            carried_claimant: None,
         };
         let steps = [
             step("step-run/one/build", "build"),

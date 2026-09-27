@@ -5107,6 +5107,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                         claimant: None,
                         claim_incarnation: None,
                         claim_expires_at_unix_ms: None,
+                        carried_claimant: None,
                         execution_started_at_unix_ms: None,
                         execution_elapsed_ms: 0,
                         timeout_ms: None,
@@ -14762,6 +14763,7 @@ mission "ios-proof-blocked" state="ready" {
             claimant: None,
             claim_incarnation: None,
             claim_expires_at_unix_ms: None,
+            carried_claimant: None,
             execution_started_at_unix_ms: None,
             execution_elapsed_ms: 0,
             timeout_ms: None,
@@ -14831,6 +14833,7 @@ mission "ios-proof-blocked" state="ready" {
             claimant: None,
             claim_incarnation: None,
             claim_expires_at_unix_ms: None,
+            carried_claimant: None,
             execution_started_at_unix_ms: None,
             execution_elapsed_ms: 0,
             timeout_ms: None,
@@ -15142,6 +15145,7 @@ agent "worker" { workspace "/tmp"; command "true"; restart "never" }
             claimant: None,
             claim_incarnation: None,
             claim_expires_at_unix_ms: None,
+            carried_claimant: None,
             execution_started_at_unix_ms: None,
             execution_elapsed_ms: 0,
             timeout_ms: None,
@@ -15602,6 +15606,157 @@ mission "gated" state="ready" {
             seat.queue().runs[0].run,
             gated.subject,
             "the waiting head keeps its place"
+        );
+    }
+
+    #[test]
+    fn a_revision_keeps_the_place_of_work_the_seat_held() {
+        let seat = SeatQueueFixture::new();
+        let gated = seat.start("gated", "seat-revision-gated");
+        let queued = seat.start("queued", "seat-revision-queued");
+        let held = SeatQueueFixture::step(&queued, "work");
+        let earlier = SeatQueueFixture::step(&gated, "work");
+        seat.work(&held, "claim", "seat-revision-claim").unwrap();
+        let prepare = SeatQueueFixture::step(&gated, "prepare");
+        assert!(
+            seat.store
+                .set_step_state(&prepare, "completed", None)
+                .unwrap()
+        );
+        seat.reconciler.reconcile_once().unwrap();
+        assert_eq!(
+            seat.store.step_run(&earlier).unwrap().unwrap().status,
+            "ready",
+            "the earlier run now has ready work for the seat"
+        );
+        assert_eq!(
+            seat.wake(),
+            None,
+            "the seat still holds the later run's step"
+        );
+
+        apply_source(
+            &seat.store,
+            &SEAT_QUEUE_SOURCE.replace(
+                "Give the durable seat one step in each run.",
+                "Give the durable seat one revised step in each run.",
+            ),
+            "seat-revision-publish",
+        );
+        let revision = seat.store.mission_spec("queued", None).unwrap().unwrap();
+        let revised = seat
+            .store
+            .adopt_mission_revision(
+                &queued.id,
+                &revision,
+                "person/requester",
+                "revise the goal while the seat works",
+                "seat-revision-adopt",
+            )
+            .unwrap();
+        let carried = SeatQueueFixture::step(&revised, "work");
+        assert_ne!(
+            carried, held,
+            "the revision carries the step to a new subject"
+        );
+        assert_eq!(
+            seat.store.step_run(&carried).unwrap().unwrap().status,
+            "ready",
+            "the revision drops the seat's claim"
+        );
+        assert_eq!(
+            seat.order(),
+            SeatQueueFixture::runs(&[&gated, &queued]),
+            "the revised run keeps its queue position"
+        );
+
+        assert_eq!(
+            seat.next().as_deref(),
+            Some(carried.as_str()),
+            "the carried step keeps its place ahead of the earlier run"
+        );
+        assert_eq!(seat.wake().as_deref(), Some(carried.as_str()));
+        assert!(
+            seat.woken().contains(&carried),
+            "the reconciler wakes the seat for its carried step"
+        );
+        assert!(!seat.woken().contains(&earlier));
+        assert_eq!(
+            seat.store
+                .work(Some(SEAT), false)
+                .unwrap()
+                .into_iter()
+                .find(|step| step.subject == carried)
+                .and_then(|step| step.carried_claimant)
+                .as_deref(),
+            Some(SEAT),
+            "the seat's work list names it as the carried step's claimant"
+        );
+        seat.work(&carried, "claim", "seat-revision-reclaim")
+            .unwrap();
+        seat.work(&carried, "complete", "seat-revision-complete")
+            .unwrap();
+        assert_eq!(
+            seat.next().as_deref(),
+            Some(earlier.as_str()),
+            "the earlier run is next once the carried step is done"
+        );
+    }
+
+    #[test]
+    fn a_released_carried_step_returns_to_queue_order() {
+        let seat = SeatQueueFixture::new();
+        let gated = seat.start("gated", "seat-release-gated");
+        let queued = seat.start("queued", "seat-release-queued");
+        let held = SeatQueueFixture::step(&queued, "work");
+        let earlier = SeatQueueFixture::step(&gated, "work");
+        seat.work(&held, "claim", "seat-release-claim").unwrap();
+        let prepare = SeatQueueFixture::step(&gated, "prepare");
+        assert!(
+            seat.store
+                .set_step_state(&prepare, "completed", None)
+                .unwrap()
+        );
+        seat.reconciler.reconcile_once().unwrap();
+        assert_eq!(
+            seat.store.step_run(&earlier).unwrap().unwrap().status,
+            "ready",
+            "the earlier run now has ready work for the seat"
+        );
+        apply_source(
+            &seat.store,
+            &SEAT_QUEUE_SOURCE.replace(
+                "Give the durable seat one step in each run.",
+                "Give the durable seat one released step in each run.",
+            ),
+            "seat-release-publish",
+        );
+        let revision = seat.store.mission_spec("queued", None).unwrap().unwrap();
+        let revised = seat
+            .store
+            .adopt_mission_revision(
+                &queued.id,
+                &revision,
+                "person/requester",
+                "revise the goal while the seat works",
+                "seat-release-adopt",
+            )
+            .unwrap();
+        let carried = SeatQueueFixture::step(&revised, "work");
+        seat.work(&carried, "claim", "seat-release-reclaim")
+            .unwrap();
+        seat.work(&carried, "release", "seat-release-release")
+            .unwrap();
+        assert_eq!(
+            seat.next().as_deref(),
+            Some(earlier.as_str()),
+            "a step the seat gave back waits its turn again"
+        );
+        assert_eq!(
+            seat.work(&carried, "claim", "seat-release-claim-again")
+                .unwrap_err()
+                .code,
+            "seat-queue-order"
         );
     }
 
