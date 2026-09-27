@@ -10477,6 +10477,8 @@ mod tests {
             "release/demo",
             "--after",
             "release/build/1",
+            "--as",
+            "person/operator",
         ])
         .unwrap();
         let Command::Missions {
