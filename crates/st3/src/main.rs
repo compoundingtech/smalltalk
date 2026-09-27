@@ -141,6 +141,8 @@ enum Command {
         #[command(subcommand)]
         command: RepairCommand,
     },
+    /// Remove st3 from this machine: leave its fleet, then its services, state, and settings.
+    Uninstall(UninstallArgs),
     /// Join machines into a fleet: create, invite, join, and inspect members.
     Fleet {
         #[command(subcommand)]
@@ -234,6 +236,10 @@ enum FleetCommand {
     },
     /// Join this machine to a fleet with a code from `st fleet invite`.
     Join(FleetJoinArgs),
+    /// Remove another member, or a config peer, from the fleet.
+    Remove(FleetRemoveArgs),
+    /// Take this machine out of its fleet after everything it wrote has reached a member.
+    Leave(FleetLeaveArgs),
     /// Show this node, the fleet's members, and open invites.
     Status,
 }
@@ -667,6 +673,43 @@ async fn run_fleet(endpoint: &Endpoint, command: FleetCommand, json_output: bool
             }
             Ok(())
         }
+        FleetCommand::Remove(args) => run_fleet_remove(&client, &config, args).await,
+        FleetCommand::Leave(args) => {
+            let person = fleet_person(args.actor.clone(), &config)?;
+            if args.cancel {
+                let _: Value = client
+                    .post("/v1/internal/fleet/leave/cancel", &json!({}))
+                    .await?;
+                println!("leave cancelled");
+                return Ok(());
+            }
+            let use_services = !args.no_service && services_installed();
+            let confirmed = fleet_leave(
+                &client,
+                &config,
+                &person,
+                args.offline,
+                args.force,
+                parse_fleet_duration(&args.wait)?,
+            )
+            .await?;
+            match confirmed {
+                Some(member) => println!("{member} holds everything this machine wrote."),
+                None => println!(
+                    "Left without reaching a member. On another member run: st fleet remove {} --reason \"left offline\"",
+                    config.node
+                ),
+            }
+            if use_services {
+                st3::service::install(Config::load_with_fleet(None)?)?;
+                println!("st3 now runs local-only on this machine.");
+            } else {
+                println!(
+                    "Stop st3 replication-worker; st3 up now runs local-only after a restart."
+                );
+            }
+            Ok(())
+        }
         FleetCommand::Status => {
             let status: st3::api::FleetStatus = client.get("/v1/internal/fleet/status").await?;
             if json_output {
@@ -719,6 +762,312 @@ async fn run_fleet(endpoint: &Endpoint, command: FleetCommand, json_output: bool
             Ok(())
         }
     }
+}
+
+#[derive(Args)]
+struct FleetRemoveArgs {
+    /// The member (or config peer) to remove.
+    name: String,
+    #[arg(long)]
+    reason: String,
+    #[arg(long = "as")]
+    actor: Option<String>,
+}
+
+#[derive(Args)]
+struct FleetLeaveArgs {
+    /// Leave without reaching any member; another member must then remove this one.
+    #[arg(long)]
+    offline: bool,
+    /// Leave even while seats run on this machine.
+    #[arg(long)]
+    force: bool,
+    /// Stop a leave that has not written its leave claim yet.
+    #[arg(long)]
+    cancel: bool,
+    /// Do not stop, reinstall, or start services.
+    #[arg(long)]
+    no_service: bool,
+    /// How long to wait for a member to hold everything this machine wrote.
+    #[arg(long, default_value = "10m")]
+    wait: String,
+    #[arg(long = "as")]
+    actor: Option<String>,
+}
+
+#[derive(Args)]
+struct UninstallArgs {
+    /// List what would be removed, and remove nothing.
+    #[arg(long)]
+    dry_run: bool,
+    /// Remove without asking.
+    #[arg(long)]
+    yes: bool,
+    /// Leave the fleet without reaching any member first.
+    #[arg(long)]
+    offline: bool,
+    /// Keep the installed st3, st, stui, st3-migrate, and pty executables.
+    #[arg(long)]
+    keep_binaries: bool,
+    /// Also required when this machine's graph exists nowhere else.
+    #[arg(long)]
+    erase_local_graph: bool,
+    #[arg(long = "as")]
+    actor: Option<String>,
+}
+
+/// Wait until a peer reports the same authority digest as this node: it holds every envelope
+/// this node holds, including everything this node wrote.
+async fn wait_for_peer_agreement(client: &Client, seconds: u64) -> Result<String> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(seconds);
+    loop {
+        let status: ReplicationStatus = client.get("/v1/replication/status").await?;
+        if let Some(peer) = status
+            .peers
+            .iter()
+            .find(|peer| peer.authority_digest.as_deref() == Some(status.authority_digest.as_str()))
+        {
+            return Ok(peer.peer.clone());
+        }
+        anyhow::ensure!(
+            std::time::Instant::now() < deadline,
+            "no member reported holding everything this machine wrote within {seconds} seconds; \
+             run st fleet leave again, or st fleet leave --offline and remove this machine from \
+             another member"
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
+fn running_local_runtimes(machines: &Value, node: &str) -> u64 {
+    machines["items"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|machine| machine["host_id"] == format!("host/{node}"))
+        .and_then(|machine| machine["occupancy"]["running_runtimes"].as_u64())
+        .unwrap_or(0)
+}
+
+/// Leave the fleet: stop local writes, drain, write the leave as the last batch, confirm, and
+/// remove this machine's fleet settings. Returns the member that confirmed, if any.
+async fn fleet_leave(
+    client: &Client,
+    config: &Config,
+    person: &str,
+    offline: bool,
+    force: bool,
+    wait_seconds: u64,
+) -> Result<Option<String>> {
+    let file = st3::config::FleetFile::load(&config.state_dir)?
+        .context("this machine is not a fleet member")?;
+    let mut confirmed = None;
+    if !offline {
+        let machines: Value = client.get("/v1/client/machines").await.unwrap_or_default();
+        let running = running_local_runtimes(&machines, &config.node);
+        anyhow::ensure!(
+            force || running == 0,
+            "{running} runtimes still run on this machine; stop its seats first or pass --force"
+        );
+        let _: Value = client
+            .post(
+                "/v1/internal/fleet/leave/begin",
+                &st3::api::FleetPersonRequest {
+                    person: person.into(),
+                },
+            )
+            .await?;
+        wait_for_peer_agreement(client, wait_seconds).await?;
+        let claim: ClaimRecord = client
+            .post(
+                "/v1/internal/fleet/leave/claim",
+                &st3::api::FleetPersonRequest {
+                    person: person.into(),
+                },
+            )
+            .await?;
+        confirmed = Some(wait_for_peer_agreement(client, wait_seconds).await?);
+        println!("left\t{}", claim.id);
+    }
+    if file
+        .transports
+        .iter()
+        .any(|transport| transport == "fabric")
+        && let Some(fabric) = st3::fleet::transport::resolve_tool(file.fabric.as_deref(), "fabric")
+    {
+        let protocol = file
+            .fabric_protocol
+            .clone()
+            .unwrap_or_else(|| st3::fleet::transport::default_fabric_protocol(&file.fleet_id));
+        let _ = std::process::Command::new(fabric)
+            .args(["unexpose", &protocol])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
+    st3::fleet::join::write_private(
+        &config.state_dir.join("left-fleet.json"),
+        serde_json::to_string(&json!({
+            "fleet_id": file.fleet_id,
+            "offline": offline,
+            "confirmed_by": confirmed,
+        }))?
+        .as_bytes(),
+    )?;
+    fs::remove_dir_all(config.state_dir.join("fleet"))?;
+    // Local writes resume; the store stays bound to the fleet ID.
+    let _: Result<Value> = client
+        .post("/v1/internal/fleet/leave/cancel", &json!({}))
+        .await;
+    Ok(confirmed)
+}
+
+async fn run_fleet_remove(client: &Client, config: &Config, args: FleetRemoveArgs) -> Result<()> {
+    let person = fleet_person(args.actor, config)?;
+    let removal: st3::store::FleetRemoval = client
+        .post(
+            "/v1/internal/fleet/remove",
+            &st3::api::FleetRemoveRequest {
+                name: args.name.clone(),
+                reason: args.reason,
+                person,
+            },
+        )
+        .await?;
+    println!(
+        "Removed {} (high water {}). Each member refuses it once this removal reaches it.",
+        removal.name, removal.high_water
+    );
+    for invite in &removal.revoked_invites {
+        println!("revoked\t{invite}");
+    }
+    println!(
+        "Writes {} made after this node's last exchange with it are not accepted. On {}, if it still runs: st uninstall",
+        removal.name, removal.name
+    );
+    if st3::config::FleetFile::load(&config.state_dir)?.is_some_and(|file| file.legacy_peers) {
+        println!(
+            "This member still accepts legacy exchanges from config peers, so a machine that keeps the fleet secret can pose as one of them until st fleet migrate --finish."
+        );
+    }
+    Ok(())
+}
+
+async fn run_uninstall(endpoint: &Endpoint, args: UninstallArgs) -> Result<()> {
+    let config = Config::load_unvalidated(None)?;
+    let client = Client::new(endpoint.clone());
+    let config_dir = Config::default_path()
+        .parent()
+        .map(Path::to_path_buf)
+        .context("the config path has no directory")?;
+    let data_home = std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/share")))
+        .context("HOME is not set")?;
+    let state_home = config
+        .state_dir
+        .parent()
+        .map(Path::to_path_buf)
+        .context("the state directory has no parent")?;
+    let data_dir = data_home.join("st3");
+    let manifest: Option<Value> = fs::read(data_dir.join("install.json"))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok());
+    let binaries = manifest
+        .as_ref()
+        .and_then(|manifest| manifest["files"].as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|path| path.as_str().map(PathBuf::from))
+        .collect::<Vec<_>>();
+    let st2_state = state_home.join("st2");
+    let st2_only_hooks = fs::read_dir(&st2_state)
+        .is_ok_and(|entries| entries.flatten().all(|entry| entry.file_name() == "hooks"));
+    let mut paths = vec![
+        config.state_dir.clone(),
+        config_dir,
+        data_dir,
+        config.socket.clone(),
+        config.client_gateway_socket.clone(),
+    ];
+    if st2_only_hooks {
+        paths.push(st2_state);
+    }
+    if !args.keep_binaries {
+        paths.extend(binaries.iter().cloned());
+    }
+    paths.sort();
+    paths.dedup();
+    if args.dry_run {
+        for path in &paths {
+            println!("remove\t{}", path.display());
+        }
+        println!("remove\tthe st3 user services, if installed");
+        if manifest.is_none() && !args.keep_binaries {
+            println!(
+                "keep\tthe st3 executables: no release install manifest; remove them the way you installed them"
+            );
+        }
+        return Ok(());
+    }
+    anyhow::ensure!(
+        args.yes,
+        "st uninstall erases this machine's st3 state, settings, and services; run it again with --yes, or --dry-run to list them"
+    );
+    let daemon_running = client.get::<Value>("/v1/health").await.is_ok();
+    if let Some(file) = st3::config::FleetFile::load(&config.state_dir)?
+        && file.removed.is_none()
+    {
+        if args.offline {
+            fleet_leave(&client, &config, "person/uninstall", true, true, 0).await?;
+        } else {
+            anyhow::ensure!(
+                daemon_running,
+                "start st3 so this machine can leave its fleet first, or pass --offline"
+            );
+            let person = fleet_person(args.actor.clone(), &config)?;
+            fleet_leave(&client, &config, &person, false, false, 600).await?;
+        }
+    }
+    let local_only = config.fleet_id.is_none()
+        && !config.state_dir.join("left-fleet.json").exists()
+        && !config.state_dir.join("fleet").exists()
+        && config.state_dir.join("claims.sqlite3").exists();
+    anyhow::ensure!(
+        !local_only || args.erase_local_graph,
+        "this machine's graph exists nowhere else; pass --erase-local-graph to erase it"
+    );
+    if services_installed() {
+        st3::service::stop_owned_runtimes(&config)?;
+        st3::service::uninstall()?;
+    } else if client.get::<Value>("/v1/health").await.is_ok() {
+        anyhow::bail!("stop st3 up and st3 replication-worker, then run st uninstall --yes again");
+    }
+    for path in &paths {
+        let result = if path.is_dir() {
+            fs::remove_dir_all(path)
+        } else {
+            fs::remove_file(path)
+        };
+        if let Err(error) = result
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            eprintln!("could not remove {}: {error}", path.display());
+        }
+    }
+    let remaining = paths
+        .iter()
+        .filter(|path| path.exists())
+        .collect::<Vec<_>>();
+    for path in &remaining {
+        println!("remains\t{}", path.display());
+    }
+    println!(
+        "Nothing else to remove needs this user. If you installed the Claude Code policy, remove it as root: st3 claude-channel uninstall-policy"
+    );
+    anyhow::ensure!(remaining.is_empty(), "some st3 files remain");
+    println!("uninstalled");
+    Ok(())
 }
 
 fn unix_ms() -> u128 {
@@ -2121,6 +2470,7 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Repair { command } => run_repair(&client, command, cli.json).await,
         Command::Replication { command } => run_replication(&client, command, cli.json).await,
         Command::Fleet { command } => run_fleet(&endpoint, command, cli.json).await,
+        Command::Uninstall(args) => run_uninstall(&endpoint, args).await,
         Command::Service { command } => run_service(command, cli.json),
         Command::ClaudeChannel { command } => run_claude_channel(command),
         Command::Subject { command } => run_subject(&client, command, cli.json).await,

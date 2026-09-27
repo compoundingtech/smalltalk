@@ -323,7 +323,8 @@ fn validate_reset_target(config: &Config) -> Result<()> {
     Ok(())
 }
 
-fn stop_owned_runtimes(config: &Config) -> Result<()> {
+/// Stop the PTY runtimes this daemon owns, as `st3 service reset` does.
+pub fn stop_owned_runtimes(config: &Config) -> Result<()> {
     let pty_root = config
         .pty_root
         .clone()

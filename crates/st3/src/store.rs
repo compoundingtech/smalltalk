@@ -5975,7 +5975,21 @@ impl Store {
                 .with_detail("current_head", json!(actual)));
             }
         }
-        let stored_fields = normalize_resource_observation(&transaction, input)?;
+        let mut stored_fields = normalize_resource_observation(&transaction, input)?;
+        // A leave names its own batch as the last sequence of its window. The sequence is only
+        // known here, under the writer lock, so a zero high water stands for "this batch".
+        if input.kind == "fleet.member-left"
+            && input.fields.get("high_water").and_then(Value::as_u64) == Some(0)
+        {
+            let mut fields = stored_fields
+                .clone()
+                .unwrap_or_else(|| input.fields.clone());
+            fields.insert(
+                "high_water".into(),
+                Value::from(next_replica_sequence(&transaction, &self.origin).map_err(internal)?),
+            );
+            stored_fields = Some(fields);
+        }
         if validate_message_transition(&transaction, input)? {
             let latest_id = latest_claim_id_tx(&transaction, &input.subject)
                 .map_err(internal)?
@@ -15683,6 +15697,9 @@ impl Store {
     /// Whether transport observations about `peer` belong in the graph. A dial-out member is
     /// never dialed and never reports on others, so neither side records one.
     pub fn observes_transport_to(&self, peer: &str) -> Result<bool> {
+        if self.fleet_leaving()? {
+            return Ok(false);
+        }
         let membership = self.fleet_membership()?;
         let dial_out = |name: &str| {
             matches!(
@@ -16110,6 +16127,15 @@ fn store_envelope_signature_tx(
     )?)
 }
 
+/// What `st fleet remove` did.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct FleetRemoval {
+    pub name: String,
+    pub keys: Vec<String>,
+    pub high_water: u64,
+    pub revoked_invites: Vec<String>,
+}
+
 /// An invite this node just created. The token is returned once, for the join code.
 #[derive(Clone, Debug)]
 pub struct CreatedFleetInvite {
@@ -16256,6 +16282,148 @@ impl Store {
             token,
             expires_at_unix_ms: expires_at,
         })
+    }
+
+    /// Remove a member, or a config peer that was never one. Ends every current incarnation of
+    /// `name` at the highest sequence this node holds for that writer, and revokes the invites
+    /// it sponsored.
+    pub fn remove_fleet_member(
+        &self,
+        name: &str,
+        reason: &str,
+        person: &str,
+    ) -> Result<FleetRemoval, St3Error> {
+        use crate::fleet::MemberState;
+        if name == self.origin {
+            return Err(St3Error::new(
+                "cannot-remove-self",
+                "a member cannot remove itself; use st fleet leave",
+            ));
+        }
+        let own_key = self.member_public_key().ok_or_else(|| {
+            St3Error::new(
+                "not-a-member",
+                "only a member with a member key can remove; this node has none",
+            )
+        })?;
+        let membership = self.fleet_membership().map_err(internal)?;
+        if !matches!(membership.state(&self.origin), MemberState::Current(own) if own.member_key == own_key)
+        {
+            return Err(St3Error::new(
+                "not-a-member",
+                "this node is not a current fleet member",
+            ));
+        }
+        let keys = match membership.state(name) {
+            MemberState::Current(incarnation) => vec![Some(incarnation.member_key.clone())],
+            MemberState::Conflicted(current) => current
+                .iter()
+                .map(|incarnation| Some(incarnation.member_key.clone()))
+                .collect(),
+            MemberState::Ended(_) | MemberState::LegacyRemoved(_) => {
+                return Err(St3Error::new(
+                    "already-removed",
+                    format!("`{name}` is already out of the fleet"),
+                ));
+            }
+            MemberState::NotMember => vec![None],
+        };
+        let high_water: u64 = {
+            let connection = self.readers.get();
+            connection
+                .query_row(
+                    "SELECT COALESCE(MAX(sequence), 0) FROM replica_envelopes WHERE writer=?1",
+                    [name],
+                    |row| row.get(0),
+                )
+                .map_err(internal)?
+        };
+        if keys == [None] && high_water == 0 {
+            return Err(St3Error::new(
+                "unknown-member",
+                format!("`{name}` has never been a member or written to this fleet"),
+            ));
+        }
+        for key in &keys {
+            let mut fields = BTreeMap::from([
+                ("high_water".into(), Value::from(high_water)),
+                ("reason".into(), Value::String(reason.into())),
+                ("removed_by".into(), Value::String(person.into())),
+            ]);
+            if let Some(key) = key {
+                fields.insert("member_key".into(), Value::String(key.clone()));
+            }
+            self.append_claim(&ClaimInput {
+                subject: format!("host/{name}"),
+                kind: "fleet.member-removed".into(),
+                actor: Some(person.into()),
+                fields,
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            })?;
+        }
+        let sponsored = self
+            .fleet_invites(false)
+            .map_err(internal)?
+            .into_iter()
+            .filter(|invite| invite.state == "open" && invite.sponsor == format!("host/{name}"))
+            .collect::<Vec<_>>();
+        for invite in &sponsored {
+            self.revoke_fleet_invite(
+                invite.invite.trim_start_matches("fleet-invite/"),
+                "sponsor-removed",
+                Some(person),
+            )
+            .map_err(internal)?;
+        }
+        self.replication_snapshot().map_err(internal)?;
+        Ok(FleetRemoval {
+            name: name.into(),
+            keys: keys.into_iter().flatten().collect(),
+            high_water,
+            revoked_invites: sponsored.into_iter().map(|invite| invite.invite).collect(),
+        })
+    }
+
+    /// Append this member's leave as its writer's last batch.
+    pub fn leave_fleet(&self, person: &str) -> Result<ClaimRecord, St3Error> {
+        let key = self
+            .member_public_key()
+            .ok_or_else(|| St3Error::new("not-a-member", "this node has no member key"))?;
+        let record = self.append_claim(&ClaimInput {
+            subject: format!("host/{}", self.origin),
+            kind: "fleet.member-left".into(),
+            actor: Some(person.into()),
+            fields: BTreeMap::from([
+                ("member_key".into(), Value::String(key)),
+                ("high_water".into(), Value::from(0)),
+            ]),
+            evidence: Vec::new(),
+            expected_subject: None,
+            idempotency_key: None,
+        })?;
+        self.replication_snapshot().map_err(internal)?;
+        Ok(record)
+    }
+
+    /// While leaving, this node refuses new local writes, so its leave stays its last.
+    pub fn set_fleet_leaving(&self, leaving: bool) -> Result<()> {
+        let connection = self.connection.lock().expect("store mutex poisoned");
+        if leaving {
+            connection.execute(
+                "INSERT OR REPLACE INTO meta(key, value) VALUES ('fleet_leaving', '1')",
+                [],
+            )?;
+        } else {
+            connection.execute("DELETE FROM meta WHERE key='fleet_leaving'", [])?;
+        }
+        Ok(())
+    }
+
+    pub fn fleet_leaving(&self) -> Result<bool> {
+        let connection = self.readers.get();
+        Ok(fleet_meta(&connection, "fleet_leaving")?.is_some())
     }
 
     /// The anchor admits itself, once.
