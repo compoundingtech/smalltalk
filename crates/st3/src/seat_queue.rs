@@ -396,6 +396,7 @@ mod tests {
                 claimant: None,
                 available_to: &none,
                 created_at_unix_ms: 1,
+                carried_claimant: None,
             };
         let order = ["mission-run/one".to_owned(), "mission-run/two".to_owned()];
         let mut steps = [
