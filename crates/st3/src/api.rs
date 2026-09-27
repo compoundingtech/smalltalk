@@ -47,7 +47,8 @@ use crate::model::{
     ReplicationStatus, ReviewRequest, RevisionApprovalRequest, RevisionCancelRequest,
     RevisionCutover, RevisionProposalView, RevisionSubmissionView, RunGenerationView,
     SessionControlResponse, SessionInputMode, SessionInputRequest, SessionLogChunk, SessionScreen,
-    SessionSignalRequest, St3Error, StatusResponse, StepRunView, WorkRequest, WorkWakeRequest,
+    SessionSignalRequest, St3Error, StatusResponse, StepRunView, WorkRequest, WorkRetryRequest,
+    WorkWakeRequest,
 };
 use crate::store::Store;
 
@@ -413,6 +414,7 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
         .route("/v1/work-items/{*subject}", get(get_work))
         .route("/v1/work/mission/{*subject}", post(publish_work_mission))
         .route("/v1/work/wake/{*subject}", post(wake_work))
+        .route("/v1/work/retry/{*subject}", post(retry_work))
         .route("/v1/work/{action}/{*subject}", post(post_work_action))
         .route("/v1/gate-results", post(post_gate_result))
         .route("/v1/agent-queue-moves", post(move_agent_queue))
@@ -6317,44 +6319,47 @@ async fn revise_mission_run(
             &format!("{}:publish", request.idempotency_key),
         )
         .map_err(ApiError::bad)?;
-    let revised =
-        if reviewers.is_empty() && matches!(old.revision_cutover, RevisionCutover::RestartActive) {
-            let mission_run = state
+    // A failed run has no active work to drain, so it adopts an unreviewed revision now.
+    let reopening = current.status == "failed" && current.phase == "terminal";
+    let revised = if reviewers.is_empty()
+        && (reopening || matches!(old.revision_cutover, RevisionCutover::RestartActive))
+    {
+        let mission_run = state
+            .store
+            .adopt_mission_revision(
+                &run,
+                replacement,
+                &actor,
+                &request.reason,
+                &format!("{}:adopt", request.idempotency_key),
+            )
+            .map_err(ApiError::bad)?;
+        RevisionSubmissionView {
+            status: "applied".into(),
+            mission_run,
+            proposal: None,
+        }
+    } else {
+        let proposal = state
+            .store
+            .create_revision_proposal(
+                &run,
+                replacement,
+                &actor,
+                &request.reason,
+                &format!("{}:propose", request.idempotency_key),
+            )
+            .map_err(ApiError::bad)?;
+        RevisionSubmissionView {
+            status: proposal.status.clone(),
+            mission_run: state
                 .store
-                .adopt_mission_revision(
-                    &run,
-                    replacement,
-                    &actor,
-                    &request.reason,
-                    &format!("{}:adopt", request.idempotency_key),
-                )
-                .map_err(ApiError::bad)?;
-            RevisionSubmissionView {
-                status: "applied".into(),
-                mission_run,
-                proposal: None,
-            }
-        } else {
-            let proposal = state
-                .store
-                .create_revision_proposal(
-                    &run,
-                    replacement,
-                    &actor,
-                    &request.reason,
-                    &format!("{}:propose", request.idempotency_key),
-                )
-                .map_err(ApiError::bad)?;
-            RevisionSubmissionView {
-                status: proposal.status.clone(),
-                mission_run: state
-                    .store
-                    .mission_run(&run)
-                    .map_err(ApiError::internal)?
-                    .expect("the revised mission run exists"),
-                proposal: Some(proposal),
-            }
-        };
+                .mission_run(&run)
+                .map_err(ApiError::internal)?
+                .expect("the revised mission run exists"),
+            proposal: Some(proposal),
+        }
+    };
     signal_changed(&state);
     Ok(Json(revised))
 }
@@ -6617,6 +6622,54 @@ async fn wake_work(
     .map_err(ApiError::internal)?;
     signal_changed(&state);
     Ok(Json(message))
+}
+
+/// Retry one failed step as a person or as an agent that may revise its mission.
+async fn retry_work(
+    State(state): State<AppState>,
+    AxumPath(subject): AxumPath<String>,
+    Json(request): Json<WorkRetryRequest>,
+) -> Result<Json<MissionRunView>, ApiError> {
+    if request.reason.trim().is_empty() {
+        return Err(ApiError::bad(St3Error::new(
+            "missing-retry-reason",
+            "a work retry needs a reason",
+        )));
+    }
+    if let Some(cached) = state
+        .store
+        .cached_idempotency_response::<MissionRunView>(&request.idempotency_key)
+        .map_err(ApiError::internal)?
+    {
+        return Ok(Json(cached));
+    }
+    let actor = match request.actor.as_str() {
+        actor if actor.starts_with("person/") => actor.to_owned(),
+        actor => normalized_agent_actor(actor).ok_or_else(|| {
+            ApiError::bad(St3Error::new(
+                "retry-authority-denied",
+                "a work retry needs a person or an agent with mission revise authority",
+            ))
+        })?,
+    };
+    let step = state
+        .store
+        .step_run(&subject)
+        .map_err(ApiError::internal)?
+        .ok_or_else(|| ApiError::not_found(format!("step run `{subject}` does not exist")))?;
+    let run = state
+        .store
+        .mission_run(&step.run)
+        .map_err(ApiError::internal)?
+        .ok_or_else(|| ApiError::not_found(format!("mission run `{}` does not exist", step.run)))?;
+    require_agent_mission_authority(&state, &actor, "revise", &run.mission)?;
+    let store = state.store.clone();
+    let retried = blocking_action(move || {
+        store.retry_failed_step(&subject, &actor, &request.reason, &request.idempotency_key)
+    })
+    .await?;
+    signal_changed(&state);
+    Ok(Json(retried))
 }
 
 async fn publish_work_mission(
@@ -10849,6 +10902,88 @@ version 2
         assert_eq!(revised["mission_run"]["root_revision"], run.root_revision);
         assert_eq!(revised["mission_run"]["steps"][0]["status"], "pending");
         assert_eq!(state.store.desired_subjects().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_work_retry_needs_a_person_or_mission_revise_authority() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let source = r#"
+version 2
+
+  mission "retry" state="ready" {
+    goal "Retry one failed check."
+    agent "sup" {
+      workspace "."
+      command "true"
+      mission-authority { revise "retry" }
+    }
+    agent "worker" { workspace "."; command "true" }
+    step "check" { goal "Run the check." }
+  }
+
+"#;
+        let intent = parse_intent(source, "node").unwrap();
+        let planned = state
+            .store
+            .mission(
+                &intent,
+                crate::model::IntentInput {
+                    kdl: source.into(),
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        state
+            .store
+            .apply(&intent, &planned.subject_tokens, "retry-mission")
+            .unwrap();
+        let run = state
+            .store
+            .create_mission_run(&MissionRunRequest {
+                mission: "retry".into(),
+                revision: None,
+                workspace: root.path().display().to_string(),
+                requester: Some("person/test".into()),
+                mode: Some("run".into()),
+                inputs: BTreeMap::new(),
+                idempotency_key: "retry-run".into(),
+            })
+            .unwrap();
+        materialize_run_agents(&state, &run);
+        let check = run.steps[0].subject.clone();
+        state
+            .store
+            .set_step_state(&check, "failed", Some("the check failed"))
+            .unwrap();
+        let retry = |actor: String, key: &str| {
+            serde_json::to_value(WorkRetryRequest {
+                actor,
+                reason: "the check host is back".into(),
+                idempotency_key: key.into(),
+            })
+            .unwrap()
+        };
+        let path = format!("/v1/work/retry/{}", urlencoding::encode(&check));
+
+        let (status, denied) = json_request(
+            router(state.clone()),
+            &path,
+            retry(format!("agent/{}/worker", run.id), "retry-worker"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{denied}");
+        assert_eq!(denied["code"], "mission-authority-denied");
+
+        let (status, retried) = json_request(
+            router(state.clone()),
+            &path,
+            retry(format!("agent/{}/sup", run.id), "retry-sup"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{retried}");
+        assert_eq!(retried["steps"][0]["status"], "pending");
+        assert_eq!(retried["steps"][0]["attempt"], 2);
     }
 
     #[tokio::test]

@@ -14303,6 +14303,101 @@ version 2
     }
 
     #[test]
+    fn a_retried_step_reopens_its_failed_run_and_the_run_completes() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        let source = r#"
+version 2
+
+  mission "takeover" state="ready" {
+    goal "Take over one service."
+    agent "watcher" { workspace "/tmp"; command "true"; restart "never" }
+    step "prepare" { agentless }
+    step "deploy-check" { agentless; depends-on { step "prepare" completed } }
+    step "announce" { agentless; depends-on { step "deploy-check" completed } }
+    finally { step "report" { agentless } }
+  }
+
+"#;
+        apply_source(&store, source, "publish-takeover");
+        let run = store
+            .create_mission_run(&MissionRunRequest {
+                mission: "takeover".into(),
+                revision: None,
+                workspace: "/tmp".into(),
+                requester: Some("person/test".into()),
+                mode: None,
+                inputs: BTreeMap::new(),
+                idempotency_key: "run-takeover".into(),
+            })
+            .unwrap();
+        let step = |run: &crate::model::MissionRunView, path: &str| {
+            run.steps
+                .iter()
+                .find(|step| step.step == path)
+                .unwrap()
+                .clone()
+        };
+        store
+            .set_step_state(&step(&run, "prepare").subject, "completed", None)
+            .unwrap();
+        store
+            .set_step_state(
+                &step(&run, "deploy-check").subject,
+                "failed",
+                Some("the deploy check failed"),
+            )
+            .unwrap();
+        let runtime = Arc::new(FakeRuntime::default());
+        let reconciler = Reconciler::new(
+            store.clone(),
+            runtime.clone(),
+            "node".into(),
+            Arc::new(Notify::new()),
+        );
+        let settle = || {
+            for _ in 0..20 {
+                reconciler.reconcile_once().unwrap();
+                if store.mission_run(&run.id).unwrap().unwrap().phase == "terminal" {
+                    break;
+                }
+            }
+            store.mission_run(&run.id).unwrap().unwrap()
+        };
+        let failed = settle();
+        assert_eq!(failed.status, "failed");
+        assert_eq!(step(&failed, "announce").status, "cancelled");
+        assert_eq!(step(&failed, "report").status, "completed");
+        // The watcher is the only member this mission declares.
+        let watcher_starts = || runtime.started_members.lock().unwrap().len();
+        assert_eq!(watcher_starts(), 1);
+
+        let reopened = store
+            .retry_failed_step(
+                &step(&failed, "deploy-check").subject,
+                "person/test",
+                "the deploy check host is back",
+                "retry-deploy-check",
+            )
+            .unwrap();
+        assert_eq!(reopened.status, "running");
+
+        let finished = settle();
+        assert_eq!(finished.status, "completed");
+        assert_eq!(finished.generation, reopened.generation);
+        assert_eq!(step(&finished, "deploy-check").attempt, 2);
+        assert_eq!(
+            watcher_starts(),
+            2,
+            "the reopened run relaunches its mission agent"
+        );
+        assert!(
+            finished.steps.iter().all(|step| step.status == "completed"),
+            "{:?}",
+            finished.steps
+        );
+    }
+
+    #[test]
     fn one_agent_can_claim_only_one_independent_pool_step_and_a_claim_is_exclusive() {
         let store = Arc::new(Store::open_memory("node").unwrap());
         let source = r#"

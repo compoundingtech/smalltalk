@@ -30,7 +30,8 @@ use st3::model::{
     ReplicaRecordView, ReplicationRepairRequest, ReplicationStatus, ReviewRequest,
     RevisionApprovalRequest, RevisionCancelRequest, RevisionProposalView, RevisionSubmissionView,
     RunGenerationView, SessionControlResponse, SessionInputMode, SessionInputRequest,
-    SessionScreen, SessionSignalRequest, StatusResponse, StepRunView, WorkRequest, WorkWakeRequest,
+    SessionScreen, SessionSignalRequest, StatusResponse, StepRunView, WorkRequest,
+    WorkRetryRequest, WorkWakeRequest,
 };
 use st3::reconcile::Reconciler;
 use st3::store::Store;
@@ -1139,6 +1140,8 @@ enum WorkCommand {
     Release(WorkActionArgs),
     /// Wake one ready assignee through its supported harness driver.
     Wake(WorkWakeArgs),
+    /// Retry one failed step; this reopens its failed run when that step was the only failure.
+    Retry(WorkRetryArgs),
     /// Publish the exact ready mission produced by one claimed step.
     PublishMission(WorkPublishMissionArgs),
     /// Propose a fenced revision to the mission that owns this work.
@@ -1156,6 +1159,15 @@ struct WorkWakeArgs {
     #[arg(long = "as")]
     actor: Option<String>,
     #[arg(long, default_value = "manual wake requested")]
+    reason: String,
+}
+
+#[derive(Args)]
+struct WorkRetryArgs {
+    subject: String,
+    #[arg(long = "as")]
+    actor: Option<String>,
+    #[arg(long)]
     reason: String,
 }
 
@@ -5466,6 +5478,21 @@ async fn run_work(
                         actor,
                         reason: args.reason,
                         idempotency_key: format!("manual-work-wake:{}:{nonce}", args.subject),
+                    },
+                )
+                .await?;
+            print_value(&response, json_output)
+        }
+        WorkCommand::Retry(args) => {
+            let actor = args.actor.context("a work retry needs explicit --as")?;
+            let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+            let response: MissionRunView = client
+                .post(
+                    &format!("/v1/work/retry/{}", urlencoding::encode(&args.subject)),
+                    &WorkRetryRequest {
+                        actor,
+                        reason: args.reason,
+                        idempotency_key: format!("manual-work-retry:{}:{nonce}", args.subject),
                     },
                 )
                 .await?;

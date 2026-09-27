@@ -96,6 +96,7 @@ st3 work complete --help
 st3 work fail --help
 st3 work release --help
 st3 work wake --help
+st3 work retry --help
 st3 work publish-mission --help
 st3 work revise --help
 st3 work revision --help
