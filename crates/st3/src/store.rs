@@ -14350,6 +14350,7 @@ fn replica_record_ref(writer: &str, sequence: u64, envelope_hash: &str, position
     format!("record/{}", hex::encode(digest))
 }
 
+#[cfg(test)]
 fn full_replication_inventory_rows(
     connection: &Connection,
 ) -> Result<(Vec<ReplicaEnvelopeId>, i64)> {
