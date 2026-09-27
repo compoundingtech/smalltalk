@@ -307,6 +307,8 @@ struct MissionPublishArgs {
 #[derive(Args)]
 struct MissionRunStartArgs {
     mission: String,
+    /// The full run ID, used as given: `--id release/demo/1` starts `mission-run/release/demo/1`,
+    /// and `--id 1` starts `mission-run/1`. Defaults to MISSION/UUIDv7.
     #[arg(long)]
     id: Option<String>,
     #[arg(long, default_value = ".")]
@@ -2229,14 +2231,15 @@ async fn start_mission_run(
         print!("{kdl}");
         return Ok(());
     }
+    let subject = format!("mission-run/{run_id}");
     let response = publish_text(
         client,
         kdl,
         format!("st3 missions start {mission_id}"),
         actor,
     )
-    .await?;
-    let subject = format!("mission-run/{run_id}");
+    .await
+    .with_context(|| format!("start `{subject}` from mission `mission/{mission_id}`"))?;
     let started: MissionRunView = client
         .get(&format!(
             "/v1/mission-runs/{}",
@@ -9569,6 +9572,20 @@ mod tests {
             normalize_message_subject_in_run("worker", None),
             "agent/worker"
         );
+    }
+
+    #[test]
+    fn mission_start_help_shows_the_run_subject_an_id_names() {
+        use clap::CommandFactory as _;
+        let mut command = Cli::command();
+        let help = command
+            .find_subcommand_mut("missions")
+            .and_then(|missions| missions.find_subcommand_mut("start"))
+            .expect("missions start")
+            .render_help()
+            .to_string();
+        assert!(help.contains("`mission-run/release/demo/1`"), "{help}");
+        assert!(help.contains("`mission-run/1`"), "{help}");
     }
 
     #[test]

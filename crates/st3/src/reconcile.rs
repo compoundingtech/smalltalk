@@ -5827,6 +5827,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                 .iter()
                 .find(|step| step.subject == subject)
                 .map_or(run.created_at_unix_ms, |step| step.created_at_unix_ms),
+            attempt,
         };
         self.evaluate_gate(&stage, &gate)
     }
@@ -6863,7 +6864,7 @@ impl<R: RuntimeControl> Reconciler<R> {
         environment: &BTreeMap<String, String>,
         time_limit_ms: u64,
     ) -> Result<GateOutcome> {
-        let result_subject = gate_operation_subject(
+        let result_subject = gate_result_subject(
             stage,
             name,
             &serde_json::json!({
@@ -7014,7 +7015,7 @@ impl<R: RuntimeControl> Reconciler<R> {
         time_limit_ms: u64,
         prompt: &str,
     ) -> Result<GateOutcome> {
-        let result_subject = gate_operation_subject(
+        let result_subject = gate_result_subject(
             stage,
             name,
             &serde_json::json!({
@@ -8141,6 +8142,17 @@ fn gate_operation_subject(stage: &GateContext, name: &str, definition: &Value) -
     ))
 }
 
+/// A retried attempt runs its mechanical and LLM gates again instead of reusing the first
+/// attempt's result. The first attempt keeps its original key, so recorded results stay valid.
+fn gate_result_subject(stage: &GateContext, name: &str, definition: &Value) -> Result<String> {
+    if stage.attempt <= 1 {
+        return gate_operation_subject(stage, name, definition);
+    }
+    let mut definition = definition.clone();
+    definition["attempt"] = stage.attempt.into();
+    gate_operation_subject(stage, name, &definition)
+}
+
 fn now_ms() -> u128 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -8362,6 +8374,7 @@ mod tests {
             subject: "step-run/test/checks".into(),
             name: "checks".into(),
             started_at_unix_ms: now_ms(),
+            attempt: 1,
         };
 
         assert!(matches!(
@@ -11839,6 +11852,32 @@ mission "scheduled-cycle" state="ready" {
                 .unwrap()
                 .iter()
                 .all(|desired| { desired.owner_run.as_deref() != Some(run.subject.as_str()) })
+        );
+    }
+
+    #[test]
+    fn a_retried_attempt_gets_its_own_gate_result() {
+        let stage = |attempt| GateContext {
+            subject: "step-run/generation/window".into(),
+            name: "window".into(),
+            started_at_unix_ms: 0,
+            attempt,
+        };
+        let definition = serde_json::json!({"type": "mechanical", "command": "/usr/bin/true"});
+        let first = gate_result_subject(&stage(1), "open", &definition).unwrap();
+        // The first attempt keeps the key that earlier releases recorded results under.
+        assert_eq!(
+            first,
+            gate_operation_subject(&stage(1), "open", &definition).unwrap()
+        );
+        let second = gate_result_subject(&stage(2), "open", &definition).unwrap();
+        let third = gate_result_subject(&stage(3), "open", &definition).unwrap();
+        assert_ne!(first, second);
+        assert_ne!(second, third);
+        assert!(second.starts_with("gate-operation/step-run.generation.window/"));
+        assert_eq!(
+            second,
+            gate_result_subject(&stage(2), "open", &definition).unwrap()
         );
     }
 

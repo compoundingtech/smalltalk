@@ -59,17 +59,14 @@ absolute, and make the owning step timeout strictly longer than the gate's `time
 `${ST_ATTEMPT}`, `${loop.round}`, and the other documented names before the command runs, and it
 rejects a publication that names an unknown one. The command itself runs through `sh -c`, so write
 shell variables and substitutions as `$area` or `$(/usr/bin/date +%s)`. `${area}` would be read as
-an st3 variable and refused.
+an st3 variable and refused; write `$${area}` when the shell needs the braces.
 
-**A gate result is cached by the gate's definition.** A mechanical gate runs once for its owner,
-name, and exact command; asking again returns the first result. Two places need a new command each
-time:
-
-- A loop's `until` gate belongs to the loop, not to one round. End its command with
-  `# round ${loop.round}` so each round checks again; see
-  [`walkthrough-work.kdl`](walkthrough-work.kdl) and [`loop-until-green.kdl`](loop-until-green.kdl).
-- A step retried until something becomes true, such as a time, must put `${ST_ATTEMPT}` in its gate
-  command; see [`wait-until-time.kdl`](wait-until-time.kdl).
+**A gate result is cached by the gate's definition and the step attempt.** A mechanical gate runs
+once for its owner, attempt, name, and exact command; asking again returns the first result. A
+retried step attempt runs its gates again, as [`wait-until-time.kdl`](wait-until-time.kdl) relies
+on. A loop's `until` gate belongs to the loop, not to one round, so end its command with
+`# round ${loop.round}` to check again each round; see
+[`walkthrough-work.kdl`](walkthrough-work.kdl) and [`loop-until-green.kdl`](loop-until-green.kdl).
 
 **A gate on files checks the committed, pushed tree.** An agent's working tree can hold
 uncommitted edits, another branch, or nothing at all by the time the gate runs. Check what was

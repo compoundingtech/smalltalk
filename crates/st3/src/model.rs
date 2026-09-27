@@ -484,6 +484,9 @@ pub struct GateContext {
     pub subject: String,
     pub name: String,
     pub started_at_unix_ms: u128,
+    /// The owner's attempt. A later attempt gets its own mechanical and LLM gate results.
+    #[serde(default)]
+    pub attempt: u32,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

@@ -829,6 +829,8 @@ The mission and step values are available for `${NAME}` KDL interpolation when t
 
 Loop KDL can also use `${loop.round}` and `${loop.feedback}`.
 
+Publication rejects an unknown `${NAME}`. Write `$${NAME}` for the literal text `${NAME}`, for example in a goal that quotes a shell variable. st3 removes the first `$`.
+
 `ST3_SUBJECT`, `ST_AGENT`, and `ST3_BIN` are runtime-only values because they depend on the materialized member.
 
 For example, use `${ST_MISSION_RUN}` directly. Do not write a manual mapping such as `env { MISSION_RUN "${ST_MISSION_RUN}" }` only to rename the built-in value.

@@ -102,10 +102,10 @@ the setup.
 Gates run through `sh -c` with a minimal environment and no login shell:
 
 - Use absolute binary paths, such as `/usr/bin/git`.
-- `${NAME}` is an st3 variable; write shell variables as plain `$NAME`.
+- `${NAME}` is an st3 variable; write shell variables as plain `$NAME`, or `$${NAME}` for braces.
 - A gate on files checks the committed, pushed tree, not an agent's working tree.
-- A gate result is cached by its definition. A loop's `until` gate puts `${loop.round}` in its
-  command, and a step retried until a time puts `${ST_ATTEMPT}` in its gate.
+- A gate result is cached by its definition and step attempt. A loop's `until` gate puts
+  `${loop.round}` in its command so each round checks again.
 - A graph predicate that is false stays pending; `every` passes on an empty list.
 
 [`WRITE-A-GATE-THAT-WORKS.md`](WRITE-A-GATE-THAT-WORKS.md) explains each rule.

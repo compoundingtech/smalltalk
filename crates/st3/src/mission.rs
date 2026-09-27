@@ -2164,6 +2164,12 @@ pub fn interpolate(source: &str, variables: &BTreeMap<String, String>) -> Result
     let mut output = String::with_capacity(source.len());
     let mut rest = source;
     while let Some(start) = rest.find("${") {
+        if let Some(literal) = rest[..start].strip_suffix('$') {
+            output.push_str(literal);
+            output.push_str("${");
+            rest = &rest[start + 2..];
+            continue;
+        }
         output.push_str(&rest[..start]);
         let tail = &rest[start + 2..];
         let Some(end) = tail.find('}') else {
@@ -2174,10 +2180,7 @@ pub fn interpolate(source: &str, variables: &BTreeMap<String, String>) -> Result
         };
         let name = &tail[..end];
         if !registered_variable(name) && !name.starts_with("input.") {
-            return Err(St3Error::new(
-                "unknown-variable",
-                format!("variable `{name}` is not registered"),
-            ));
+            return Err(unknown_variable(name));
         }
         let value = variables
             .get(name)
@@ -2236,6 +2239,10 @@ fn validate_variables(value: &Value, input_names: &BTreeSet<String>) -> Result<(
             let mut rest = value.as_str();
             while let Some(start) = rest.find("${") {
                 let tail = &rest[start + 2..];
+                if rest[..start].ends_with('$') {
+                    rest = tail;
+                    continue;
+                }
                 let Some(end) = tail.find('}') else {
                     return Err(St3Error::new(
                         "invalid-variable",
@@ -2247,10 +2254,7 @@ fn validate_variables(value: &Value, input_names: &BTreeSet<String>) -> Result<(
                     .strip_prefix("input.")
                     .is_some_and(|name| input_names.contains(name));
                 if !registered_variable(name) && !declared_input {
-                    return Err(St3Error::new(
-                        "unknown-variable",
-                        format!("variable `{name}` is not registered"),
-                    ));
+                    return Err(unknown_variable(name));
                 }
                 rest = &tail[end + 1..];
             }
@@ -2268,6 +2272,13 @@ fn validate_variables(value: &Value, input_names: &BTreeSet<String>) -> Result<(
         _ => {}
     }
     Ok(())
+}
+
+fn unknown_variable(name: &str) -> St3Error {
+    St3Error::new(
+        "unknown-variable",
+        format!("variable `{name}` is not registered; write `$${{{name}}}` for the literal text"),
+    )
 }
 
 fn registered_variable(name: &str) -> bool {
@@ -3076,6 +3087,48 @@ version 2
         )
         .unwrap_err();
         assert_eq!(duplicate_field.code, "duplicate-product-field");
+    }
+
+    #[test]
+    fn a_doubled_dollar_keeps_literal_variable_text() {
+        let intent = crate::graph::parse_intent(
+            r#"version 2
+ mission "quote" state="ready" {
+   goal "Explain what a shell variable expands to."
+   step "explain" {
+     goal "Print `$${HOME}` for ${ST_MISSION_RUN}."
+     constraint "Keep `$${name}` as written."
+   }
+ }"#,
+            "node",
+        )
+        .unwrap();
+        let step = &intent.missions["quote"].steps["explain"];
+        let variables =
+            std::collections::BTreeMap::from([("ST_MISSION_RUN".to_owned(), "quote/1".to_owned())]);
+        assert_eq!(
+            super::interpolate(&step.goals[0], &variables).unwrap(),
+            "Print `${HOME}` for quote/1."
+        );
+        assert_eq!(
+            super::interpolate(&step.constraints[0], &variables).unwrap(),
+            "Keep `${name}` as written."
+        );
+
+        let error = crate::graph::parse_intent(
+            r#"version 2
+ mission "quote" state="ready" {
+   goal "Explain a shell variable."
+   step "explain" { goal "Print `${HOME}`." }
+ }"#,
+            "node",
+        )
+        .unwrap_err();
+        assert_eq!(error.code, "unknown-variable");
+        assert_eq!(
+            error.message,
+            "variable `HOME` is not registered; write `$${HOME}` for the literal text"
+        );
     }
 
     #[test]
