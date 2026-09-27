@@ -6994,6 +6994,34 @@ impl Store {
             .collect())
     }
 
+    /// Pending requests that `actor` raised from `origin`, so that host can close its own alerts.
+    pub fn pending_attention_requests_raised_by(
+        &self,
+        actor: &str,
+        origin: &str,
+    ) -> Result<Vec<AttentionRequestView>> {
+        let connection = self.readers.get();
+        let mut statement = connection.prepare(
+            "SELECT request.subject FROM claims request
+             WHERE request.kind='attention.requested'
+               AND request.actor=?1
+               AND request.origin=?2
+               AND NOT EXISTS (
+                 SELECT 1 FROM claims resolution
+                 WHERE resolution.subject=request.subject
+                   AND resolution.kind='attention.resolved'
+               )
+             ORDER BY request.store_index",
+        )?;
+        let subjects = statement
+            .query_map([actor, origin], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        subjects
+            .iter()
+            .filter_map(|subject| attention_request_view_tx(&connection, subject).transpose())
+            .collect()
+    }
+
     pub fn attention_items(&self, person: Option<&str>) -> Result<Vec<AttentionItemView>> {
         let mut items = Vec::new();
         let reviews = self.pending_human_reviews(person)?;
