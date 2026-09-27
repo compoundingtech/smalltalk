@@ -2031,6 +2031,8 @@ fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
             ("incarnation_id", string()),
             ("step_run", reference_to(&["step-run"])),
             ("wake_attempts", integer()),
+            ("attempt", integer()),
+            ("readiness_epoch", integer()),
             ("observed_since_ms", integer()),
             ("retry_attempt", integer()),
             ("retry_after_unix_ms", integer()),
