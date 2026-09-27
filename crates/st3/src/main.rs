@@ -283,6 +283,11 @@ enum MissionViewCommand {
     Start(MissionRunStartArgs),
     /// Cancel one exact running mission and stop its owned work and runtimes.
     Cancel(MissionCancelArgs),
+    /// Show one seat's current claim and its queued mission runs in order; same as `st3 agents queue AGENT`.
+    Queued {
+        /// Exact seat subject or its identity without the `agent/` prefix.
+        agent: String,
+    },
 }
 
 #[derive(Args)]
@@ -888,6 +893,7 @@ enum AgentsCommand {
     /// Stop one exact durable seat.
     Stop(AgentStopArgs),
     /// Show one seat's current claim and its queued mission runs in order, or move a run.
+    /// The show form is also available as `st3 missions queued AGENT`.
     Queue(AgentQueueArgs),
 }
 
@@ -2108,6 +2114,9 @@ async fn run_mission_view(
         MissionViewCommand::Start(args) => start_mission_run(client, args, json_output).await,
         MissionViewCommand::Cancel(args) => {
             cancel_mission_run(client, endpoint, args, json_output).await
+        }
+        MissionViewCommand::Queued { agent } => {
+            show_agent_queue(endpoint, &agent, json_output).await
         }
     }
 }
@@ -4656,6 +4665,19 @@ fn mission_run_subject(value: &str) -> String {
     }
 }
 
+/// Shared by `st3 agents queue AGENT` and `st3 missions queued AGENT`.
+async fn show_agent_queue(endpoint: &Endpoint, agent: &str, json_output: bool) -> Result<()> {
+    let agent = seat_subject(agent);
+    let response = generated_client(endpoint, None)?
+        .agent_queue(&agent)
+        .await?;
+    if json_output {
+        return print_value(&response, true);
+    }
+    print!("{}", render_agent_queue(&response.value));
+    Ok(())
+}
+
 async fn run_agent_queue(
     endpoint: &Endpoint,
     configured_person: Option<&str>,
@@ -4663,15 +4685,8 @@ async fn run_agent_queue(
     json_output: bool,
 ) -> Result<()> {
     let Some(AgentQueueCommand::Move(args)) = args.command else {
-        let agent = seat_subject(&args.agent.context("st3 agents queue needs an AGENT")?);
-        let response = generated_client(endpoint, None)?
-            .agent_queue(&agent)
-            .await?;
-        if json_output {
-            return print_value(&response, true);
-        }
-        print!("{}", render_agent_queue(&response.value));
-        return Ok(());
+        let agent = args.agent.context("st3 agents queue needs an AGENT")?;
+        return show_agent_queue(endpoint, &agent, json_output).await;
     };
     let actor = args.actor.as_deref().or(configured_person).context(
         "st3 agents queue move needs `--as person/NAME`, `--as agent/PATH`, or `person = \"person/NAME\"` in the st3 config",

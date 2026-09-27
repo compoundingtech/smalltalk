@@ -929,9 +929,10 @@ st3 agents queue move agent/fleet/example/worker mission-run/docs/2026-09-26 \
 ```
 
 `st3 agents queue AGENT` shows the step the seat holds now, its next work, and then each queued
-run in order with its state: `claimed`, `ready`, or `waiting`. A move places one run at the top,
-at the bottom, or directly before or after another queued run. It needs explicit person
-authority, like other client mutations.
+run in order with its state: `claimed`, `ready`, or `waiting`. `st3 missions queued AGENT` is the
+same show command reached from the `missions` group. A move places one run at the top, at the
+bottom, or directly before or after another queued run. It needs explicit person authority, like
+other client mutations.
 
 Each move writes one `agent.queue.moved` claim on the agent subject with the run, the placement,
 the optional anchor run, the optional reason, the actor, and the graph time. Replicas rebuild the

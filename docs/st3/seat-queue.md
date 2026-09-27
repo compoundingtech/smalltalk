@@ -39,7 +39,7 @@ the reconciler's `next_work_wake_for_agent`. It is now used by:
 - `Store::agent_work_queues`, which feeds `NEXT WORK`, `QUEUED WORK`, and `UPCOMING` in
   `st3 agents show` and the `agents` client resource;
 - the reconciler's work wake and its retry deadline;
-- `Store::seat_queue`, which feeds `st3 agents queue`;
+- `Store::seat_queue`, which feeds `st3 agents queue` and its alias `st3 missions queued`;
 - the client work list when it is filtered to one agent, so `st3 work ls --as AGENT` lists ready
   work in the same order;
 - `work claim`, which refuses to let the seat take a later run's step first.
@@ -61,7 +61,9 @@ st3 agents queue move agent/fleet/example/worker mission-run/docs/2026-09-26 \
 ```
 
 `st3 agents queue AGENT` prints the held step, the next work, each queued run in order with its
-state (`claimed`, `ready`, or `waiting`), and the most recent moves, newest first:
+state (`claimed`, `ready`, or `waiting`), and the most recent moves, newest first. `st3 missions
+queued AGENT` runs the exact same show through the same code and prints the identical output,
+including `--json`; there is no `missions queued move`, only `agents queue move`.
 
 ```text
 AGENT QUEUE  agent/fleet/example/worker
