@@ -1609,6 +1609,16 @@ fn client_attention_actions(kind: &str) -> Vec<&'static str> {
     }
 }
 
+/// Both the default and the history view rank a fault by the severity its requester gave.
+fn attention_priority(severity: &str) -> &'static str {
+    match severity {
+        "critical" => "critical",
+        "error" => "high",
+        "warning" => "normal",
+        _ => "low",
+    }
+}
+
 fn client_attention_resources(
     store: &Store,
     person: Option<&str>,
@@ -1622,6 +1632,13 @@ fn client_attention_resources(
     let mut resources = BTreeMap::new();
     for item in &current {
         let id = attention_resource_id(&item.subject);
+        let priority = if item.kind == "fault" {
+            store
+                .attention_request(&item.subject)?
+                .map_or("high", |request| attention_priority(&request.severity))
+        } else {
+            "normal"
+        };
         let revision = store
             .claims_for(&item.subject, None)?
             .last()
@@ -1637,7 +1654,7 @@ fn client_attention_resources(
             "updated_at": client_timestamp(item.requested_at_unix_ms),
             "title": item.title,
             "detail": item.detail,
-            "priority": if item.kind == "fault" { "high" } else { "normal" },
+            "priority": priority,
             "state": "open",
             "requested_at": client_timestamp(item.requested_at_unix_ms),
             "targets": item.targets,
@@ -1680,7 +1697,7 @@ fn client_attention_resources(
                     "updated_at": client_timestamp(request.resolved_at_unix_ms.unwrap_or(request.requested_at_unix_ms)),
                     "title": request.title,
                     "detail": request.reason,
-                    "priority": match request.severity.as_str() { "critical" => "critical", "error" => "high", "warning" => "normal", _ => "low" },
+                    "priority": attention_priority(&request.severity),
                     "state": if request.status == "pending" { "open" } else { "resolved" },
                     "requested_at": client_timestamp(request.requested_at_unix_ms),
                     "targets": request.targets,
@@ -12286,6 +12303,50 @@ version 2
         assert_eq!(resolved["status"], "resolved");
         let (_, empty) = get_request(app, "/v1/attention?person=nathan").await;
         assert_eq!(empty, json!([]));
+    }
+
+    #[tokio::test]
+    async fn attention_priority_follows_severity_with_and_without_history() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let app = router(state.clone());
+        for (severity, key) in [
+            ("warning", "api-attention-warning"),
+            ("error", "api-attention-error"),
+        ] {
+            let request = serde_json::to_value(AttentionRequest {
+                reviewer: "person/nathan".into(),
+                title: format!("{severity} fault"),
+                reason: "The queue did not recover.".into(),
+                severity: severity.into(),
+                targets: vec!["resource/fabric/queue".into()],
+                actor: "agent/fabric/worker".into(),
+                idempotency_key: key.into(),
+            })
+            .unwrap();
+            let (status, created) = json_request(app.clone(), "/v1/attention", request).await;
+            assert_eq!(status, StatusCode::OK, "{created}");
+        }
+        for history in [false, true] {
+            let resources =
+                client_attention_resources(&state.store, Some("person/nathan"), history).unwrap();
+            let priority = |title: &str| {
+                resources
+                    .iter()
+                    .find(|resource| resource["title"] == title)
+                    .map(|resource| resource["priority"].clone())
+            };
+            assert_eq!(
+                priority("warning fault"),
+                Some(json!("normal")),
+                "history={history}"
+            );
+            assert_eq!(
+                priority("error fault"),
+                Some(json!("high")),
+                "history={history}"
+            );
+        }
     }
 
     #[tokio::test]
