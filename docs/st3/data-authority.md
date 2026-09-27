@@ -1,4 +1,4 @@
-# st3 data authority
+# st data authority
 
 This document classifies each SQLite table in schema version 13.
 
@@ -53,11 +53,11 @@ Admission validates each claim and blob independently. Invalid or unknown record
 
 Projection uses admitted claims and keeps the last good graph when one reduction fails.
 
-`st3 doctor` compares the operation projection with the claim log.
+`st doctor` compares the operation projection with the claim log.
 
 An idempotent claim stores a keyed hash of the caller key in its `_operation` metadata.
 
-`st3 claim --idempotency-key KEY` opts a public claim into this contract.
+`st claim --idempotency-key KEY` opts a public claim into this contract.
 
 The claim stores the canonical request digest and canonical claim ID.
 

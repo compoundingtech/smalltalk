@@ -1,6 +1,6 @@
-# st3 product roadmap
+# st product roadmap
 
-This file records accepted future work. Active fleet work belongs in st3 missions.
+This file records accepted future work. Active fleet work belongs in st missions.
 
 ## Agent continuity
 
@@ -33,16 +33,16 @@ design session follows these delivery gates in order:
    in both apps. The screen inventory includes Now, missions and work, attention, launch and its
    native Codex conversation, machines and agent tree, normalized conversations, native-session
    import, terminals, devices, and settings.
-3. **Prove the network, not a mock.** Exercise the CLI, TUI, and a physical iOS device against st3
+3. **Prove the network, not a mock.** Exercise the CLI, TUI, and a physical iOS device against st
    on another machine. Prove discovery, pairing/revocation, terminal attach and control, input,
    resize, reconnect, daemon restart, cursor resync, and clean terminal restoration. Fabric is the
    preferred carrier and Tailscale is supported; Fabric-on-iOS may require SDK research and on-device
-   iteration. When Fabric carries an st3 network, both apps expose its effective configuration,
+   iteration. When Fabric carries an st network, both apps expose its effective configuration,
    reachability, and topology rather than hiding transport state.
 
 Cross-machine terminal access belongs to this UI program. It must use the paired client gateway and
-terminal protocol; installing st3 on a roaming Mac must not require nesting an interactive
-`fabric shell` merely to discover or attach to remote st3 terminals.
+terminal protocol; installing st on a roaming Mac must not require nesting an interactive
+`fabric shell` merely to discover or attach to remote st terminals.
 
 ## Runtime containment
 
@@ -64,7 +64,7 @@ terminal protocol; installing st3 on a roaming Mac must not require nesting an i
 - [x] Exercise each CLI parser and help path in an automated test.
 - [x] Exercise HTTP and Unix request and WebSocket transports in automated tests.
 - [x] Exercise typing, resize, Kitty Shift+Enter, Kitty Ctrl+\ detach, terminal reset, and session survival in a real pseudo-terminal.
-- [x] Ship the verified attach fix to each active st3 host.
+- [x] Ship the verified attach fix to each active st host.
 
 ## Harness accounts
 

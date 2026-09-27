@@ -10,13 +10,13 @@ version 2
 // harness, so each mission example works with whichever one you apply. Apply one of them. To run
 // several side by side, give each its own identity and change `assigned-to` to match.
 //
-// Log OpenCode in to the model provider as the user who runs the st3 daemon, and replace the
+// Log OpenCode in to the model provider as the user who runs the st daemon, and replace the
 // workspace with an existing checkout on this host. OpenCode names a model as PROVIDER/MODEL and
 // takes no `effort`.
 //
-//   st3 agents apply examples/st3/seats/opencode.kdl --as person/operator
-//   st3 agents show agent/example/worker
-//   st3 agents stop agent/example/worker --as person/operator
+//   st agents apply examples/st3/seats/opencode.kdl --as person/operator
+//   st agents show agent/example/worker
+//   st agents stop agent/example/worker --as person/operator
 agent "example/worker" {
   workspace "/srv/example/app"
   restart "always"
