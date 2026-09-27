@@ -2929,6 +2929,18 @@ impl<R: RuntimeControl> Reconciler<R> {
                 )?;
                 continue;
             };
+            let mission = match crate::mission::run_mission(mission, run.after.as_deref()) {
+                Ok(mission) => mission,
+                Err(error) => {
+                    changed |= self.store.set_mission_run_state(
+                        &run.id,
+                        "blocked",
+                        &run.phase,
+                        Some(&error.message),
+                    )?;
+                    continue;
+                }
+            };
             changed |= self.evaluate_mission_run(&run, &mission)?;
         }
         if changed {
@@ -3304,7 +3316,11 @@ impl<R: RuntimeControl> Reconciler<R> {
             // forever. Nested missions need the persisted parent transition before their children
             // can be evaluated; other agentless work can materialize in this same pass.
             if view.status == "ready" && view.agentless {
-                changed |= self.store.set_step_state(&view.subject, "working", None)?;
+                let reason = awaited_run(run, &step, view)?
+                    .map(|after| format!("waiting for `{after}` to complete"));
+                changed |= self
+                    .store
+                    .set_step_state(&view.subject, "working", reason.as_deref())?;
                 if step.spec.nested_mission.is_some() {
                     continue;
                 }
@@ -3362,6 +3378,20 @@ impl<R: RuntimeControl> Reconciler<R> {
                                 .set_step_state(&view.subject, "failed", Some(&reason))?;
                         continue;
                     }
+                }
+            }
+            if let Some(after) = awaited_run(run, &step, view)? {
+                match self.store.mission_run_status(&after)?.as_deref() {
+                    Some("completed") => {}
+                    Some(status @ ("failed" | "cancelled")) => {
+                        changed |= self.store.set_step_state(
+                            &view.subject,
+                            "failed",
+                            Some(&format!("the awaited mission run `{after}` is {status}")),
+                        )?;
+                        continue;
+                    }
+                    _ => continue,
                 }
             }
             if let Some(missing) = self.missing_product(run, &step, view)? {
@@ -8366,6 +8396,19 @@ fn step_run_selector(view: &crate::model::StepRunView) -> WorkSelector {
     }
 }
 
+/// The full subject of the run that an `after-run` step waits for.
+fn awaited_run(
+    run: &MissionRunView,
+    step: &RuntimeStep<'_>,
+    view: &crate::model::StepRunView,
+) -> Result<Option<String>> {
+    let Some(after) = &step.spec.after_run else {
+        return Ok(None);
+    };
+    let after = crate::mission::interpolate(after, &run_variables(run, step, view))?;
+    Ok(Some(crate::mission::after_run_subject(&after)))
+}
+
 fn run_variables(
     run: &MissionRunView,
     step: &RuntimeStep<'_>,
@@ -12967,6 +13010,141 @@ mission "scheduled-cycle" state="ready" {
                 .unwrap()
                 .iter()
                 .all(|desired| { desired.owner_run.as_deref() != Some(run.subject.as_str()) })
+        );
+    }
+
+    #[tokio::test]
+    async fn a_run_started_after_another_waits_until_that_run_completes() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        let workspace = tempfile::tempdir().unwrap();
+        apply_source(
+            &store,
+            r#"
+            version 2
+
+              agent "example/shipper" { workspace "/tmp"; command "true"; restart "never" }
+              mission "build" state="ready" {
+                goal "Build until the test releases the hold."
+                concurrent-runs
+                step "hold" {
+                  agentless
+                  gate "released" { field "state" "resource/never" is "ready" }
+                }
+              }
+              mission "ship" state="ready" {
+                goal "Ship after the build."
+                concurrent-runs
+                step "ship" { assigned-to "agent/example/shipper" }
+              }
+            "#,
+            "after-missions",
+        );
+        let reconciler = Reconciler::new(
+            store.clone(),
+            Arc::new(FakeRuntime::default()),
+            "node".into(),
+            Arc::new(Notify::new()),
+        );
+        let start = |run: &str, mission: &str, after: Option<&str>| {
+            let revision = store.mission_spec(mission, None).unwrap().unwrap().revision;
+            let after = after.map_or(String::new(), |after| format!("  after {after:?}\n"));
+            let source = format!(
+                "version 2\nmission-run {run:?} {{\n  mission \"mission/{mission}@{revision}\"\n  workspace {:?}\n  requester \"person/operator\"\n{after}}}\n",
+                workspace.path().display().to_string(),
+            );
+            let intent = parse_intent(&source, "node").unwrap();
+            let preview = store
+                .mission(
+                    &intent,
+                    crate::model::IntentInput {
+                        kdl: source.clone(),
+                        source_name: None,
+                    },
+                )
+                .unwrap();
+            assert!(preview.blockers.is_empty(), "{:?}", preview.blockers);
+            store
+                .apply_as(
+                    &intent,
+                    &preview.subject_tokens,
+                    &format!("start-{run}"),
+                    Some("person/operator"),
+                )
+                .unwrap();
+        };
+        let step = |run: &str, path: &str| {
+            store
+                .mission_run(run)
+                .unwrap()
+                .unwrap()
+                .steps
+                .into_iter()
+                .find(|step| step.step == path)
+                .unwrap()
+        };
+
+        start("build/1", "build", None);
+        start("ship/1", "ship", Some("build/1"));
+        let waiting = store.mission_run("ship/1").unwrap().unwrap();
+        assert_eq!(waiting.after.as_deref(), Some("mission-run/build/1"));
+        assert_eq!(waiting.steps[0].step, "after-run");
+        for _ in 0..3 {
+            reconciler.reconcile_once().unwrap();
+        }
+        let after = step("ship/1", "after-run");
+        assert_eq!(after.status, "working");
+        assert_eq!(
+            after.blocked_reason.as_deref(),
+            Some("waiting for `mission-run/build/1` to complete")
+        );
+        assert_eq!(step("ship/1", "ship").status, "pending");
+        let queue = store.seat_queue("agent/example/shipper").unwrap();
+        assert_eq!(queue.runs[0].state, "waiting");
+        assert_eq!(
+            queue.runs[0].waiting_for.as_deref(),
+            Some("mission-run/build/1")
+        );
+
+        store
+            .set_step_state(&step("build/1", "hold").subject, "completed", None)
+            .unwrap();
+        for _ in 0..5 {
+            reconciler.reconcile_once().unwrap();
+        }
+        assert_eq!(
+            store.mission_run("build/1").unwrap().unwrap().status,
+            "completed"
+        );
+        assert_eq!(step("ship/1", "after-run").status, "completed");
+        assert_eq!(step("ship/1", "ship").status, "ready");
+        let queue = store.seat_queue("agent/example/shipper").unwrap();
+        assert_eq!(queue.runs[0].waiting_for, None);
+
+        start("build/2", "build", None);
+        start("ship/2", "ship", Some("mission-run/build/2"));
+        for _ in 0..3 {
+            reconciler.reconcile_once().unwrap();
+        }
+        store
+            .set_step_state(
+                &step("build/2", "hold").subject,
+                "failed",
+                Some("test failure"),
+            )
+            .unwrap();
+        for _ in 0..5 {
+            reconciler.reconcile_once().unwrap();
+        }
+        let after = step("ship/2", "after-run");
+        assert_eq!(after.status, "failed");
+        assert_eq!(
+            after.blocked_reason.as_deref(),
+            Some("the awaited mission run `mission-run/build/2` is failed")
+        );
+        assert_eq!(step("ship/2", "ship").status, "cancelled");
+        assert_eq!(
+            store.mission_run("ship/2").unwrap().unwrap().status,
+            "failed"
         );
     }
 

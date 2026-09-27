@@ -266,11 +266,12 @@ step "STEP_ID" timeout="20m" revisions="human-only" revision-reviewer="person/re
   produces { PRODUCT... }
   produces-mission "generated-mission"
   uses-mission output-of="producer-step"
+  after-run "mission-run/RUN_ID"
   gate "NAME" { GATE_BODY }
 }
 ```
 
-`title`, `assigned-to`, `agentless`, `mission`, `retry`, `produces`, `produces-mission`, and `uses-mission` are single fields.
+`title`, `assigned-to`, `agentless`, `mission`, `retry`, `produces`, `produces-mission`, `uses-mission`, and `after-run` are single fields.
 
 A retry repeats one failed step attempt. It handles a bounded transient failure.
 
@@ -742,6 +743,20 @@ A step dependency can require `completed`, `failed`, or `terminal`. `completed` 
 Graph predicate dependencies accept the same deterministic predicates as baselines. They latch after they pass. A later graph change does not move active work backward.
 
 Dependencies inside a nested mission refer to sibling steps in that nested mission.
+
+### Waiting for another run
+
+`after-run` makes a step wait for another mission run:
+
+```kdl
+step "wait-for-build" {
+  after-run "${input.build_run}"
+}
+```
+
+The step is agentless and cannot name an agent. It completes when the named run completes. It fails when that run fails or is cancelled. Other steps order after it with `depends-on`. The value is a run ID or `mission-run/` subject, and it can use inputs.
+
+To make one run wait without changing its mission, start it with `after`. See [Starting after another run](kdl-lifecycle.md#starting-after-another-run).
 
 ## Runtime sequence
 

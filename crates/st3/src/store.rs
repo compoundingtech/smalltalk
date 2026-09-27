@@ -275,6 +275,11 @@ CREATE TABLE IF NOT EXISTS mission_run_deadlines (
     deadline_at_unix_ms TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS mission_run_after (
+    run_id TEXT PRIMARY KEY REFERENCES mission_runs(id),
+    after_run TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS run_generations (
     id TEXT PRIMARY KEY,
     run_id TEXT NOT NULL REFERENCES mission_runs(id),
@@ -1680,6 +1685,19 @@ impl Store {
         Ok(mission_run_view_tx(&connection, run).optional()?)
     }
 
+    /// Read one run's status without hydrating its step history.
+    pub fn mission_run_status(&self, run: &str) -> Result<Option<String>> {
+        let run = run.strip_prefix("mission-run/").unwrap_or(run);
+        let connection = self.readers.get();
+        Ok(connection
+            .query_row(
+                "SELECT status FROM mission_runs WHERE id=?1",
+                [run],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?)
+    }
+
     /// Resolve the stable mission owner without hydrating the run's step history.
     pub fn mission_for_run(&self, run: &str) -> Result<Option<String>> {
         let run = run.strip_prefix("mission-run/").unwrap_or(run);
@@ -1820,6 +1838,8 @@ impl Store {
             ));
         }
         let actor = normalize_actor(actor, "agent");
+        let old = crate::mission::run_mission(old, current.after.as_deref())?;
+        let mission = &crate::mission::run_mission(mission.clone(), current.after.as_deref())?;
         let variables = mission_run_variables(&current, &mission.revision);
         let (compatible, reviewers) =
             analyze_mission_revision(&old, mission, &actor, &current.requester, &variables)?;
@@ -2623,6 +2643,8 @@ impl Store {
                 "a run revision cannot change its input declarations",
             ));
         }
+        let old = crate::mission::run_mission(old, current.after.as_deref())?;
+        let mission = &crate::mission::run_mission(mission.clone(), current.after.as_deref())?;
 
         let variables = mission_run_variables(&current, &mission.revision);
         // A retry keeps the current revision, so it has no change to analyze or review.
@@ -3244,7 +3266,12 @@ impl Store {
                 } else {
                     "waiting"
                 };
-                SeatQueueRunView {
+                let waiting_for = if state == "waiting" {
+                    awaited_mission_run_tx(&self.readers.get(), run)?
+                } else {
+                    None
+                };
+                Ok(SeatQueueRunView {
                     run: run.clone(),
                     position: u32::try_from(index + 1).unwrap_or(u32::MAX),
                     state: state.into(),
@@ -3257,9 +3284,10 @@ impl Store {
                     claimed_work_ids,
                     ready_work_ids,
                     waiting_work_ids,
-                }
+                    waiting_for,
+                })
             })
-            .collect();
+            .collect::<Result<Vec<_>>>()?;
         let moves = inputs
             .moves
             .iter()
@@ -9874,6 +9902,7 @@ fn prepare_mission_run_declaration(
                 || requester != &creation.requester
                 || stored_values != creation.inputs
                 || mode != &creation.mode
+                || mission_run_after_tx(connection, run_id)? != creation.after
             {
                 blockers.push(format!(
                     "mission run `{}` already exists with different creation fields",
@@ -9908,6 +9937,13 @@ fn prepare_mission_run_declaration(
                         blockers.push(error.message);
                     }
                     if let Err(error) = enforce_mission_run_capacity(connection, &mission) {
+                        blockers.push(error.message);
+                    }
+                    if let Some(after) = &creation.after
+                        && let Err(error) =
+                            ensure_awaited_mission_run_tx(connection, &declaration.subject, after)
+                                .and_then(|()| crate::mission::mission_after_run(mission, after))
+                    {
                         blockers.push(error.message);
                     }
                     actions.push(PlannedAction {
@@ -10232,6 +10268,10 @@ fn create_declared_mission_run_tx(
     validate_mission_run_timeout(&mission, &creation.mode)?;
     let inputs = resolve_mission_run_inputs(transaction, &mission, &creation.inputs)?;
     enforce_mission_run_capacity(transaction, &mission)?;
+    if let Some(after) = &creation.after {
+        ensure_awaited_mission_run_tx(transaction, &declaration.subject, after)?;
+    }
+    let mission = crate::mission::run_mission(mission, creation.after.as_deref())?;
     let generation_id = Uuid::now_v7().simple().to_string();
     let generation_subject = format!("run-generation/{generation_id}");
     let root_mission_run = declaration.subject.clone();
@@ -10276,6 +10316,14 @@ fn create_declared_mission_run_tx(
         .map_err(internal)?;
     let deadline_at_unix_ms =
         insert_mission_deadline_tx(transaction, run_id, mission.timeout_ms, now)?;
+    if let Some(after) = &creation.after {
+        transaction
+            .execute(
+                "INSERT INTO mission_run_after(run_id, after_run) VALUES (?1, ?2)",
+                params![run_id, after],
+            )
+            .map_err(internal)?;
+    }
     transaction
         .execute(
             "INSERT INTO run_generations(id, run_id, revision, predecessor_id, status, actor, reason, created_at_unix_ms, updated_at_unix_ms)
@@ -10333,7 +10381,7 @@ fn create_declared_mission_run_tx(
             )
             .map_err(internal)?;
     }
-    let body = json!({
+    let mut body = json!({
         "fields": {
             "status": "running",
             "mission": mission.subject,
@@ -10352,6 +10400,9 @@ fn create_declared_mission_run_tx(
             "deadline_at_unix_ms": deadline_at_unix_ms,
         }
     });
+    if let Some(after) = &creation.after {
+        body["fields"]["after"] = json!(after);
+    }
     let run_claim = append_claim_tx(
         transaction,
         origin,
@@ -10380,6 +10431,57 @@ fn create_declared_mission_run_tx(
     )
     .map_err(internal)?;
     Ok(vec![run_claim.id, generation_claim.id])
+}
+
+/// A run can wait only for another run that this store already knows.
+fn ensure_awaited_mission_run_tx(
+    connection: &Connection,
+    run: &str,
+    after: &str,
+) -> Result<(), St3Error> {
+    let after_id = after.strip_prefix("mission-run/").unwrap_or(after);
+    let exists = connection
+        .query_row("SELECT 1 FROM mission_runs WHERE id=?1", [after_id], |_| {
+            Ok(())
+        })
+        .optional()
+        .map_err(internal)?
+        .is_some();
+    if !exists {
+        return Err(St3Error::new(
+            "unknown-mission-run",
+            format!("mission run `{run}` waits for `{after}`, which does not exist"),
+        ));
+    }
+    Ok(())
+}
+
+/// The run that one run still waits for: its `after` run, until its `after-run` step completes.
+fn awaited_mission_run_tx(connection: &Connection, run: &str) -> Result<Option<String>> {
+    let run_id = run.strip_prefix("mission-run/").unwrap_or(run);
+    Ok(connection
+        .query_row(
+            "SELECT mission_run_after.after_run
+             FROM mission_run_after
+             JOIN mission_runs ON mission_runs.id=mission_run_after.run_id
+             JOIN step_runs ON step_runs.generation_id=mission_runs.current_generation_id
+               AND step_runs.step_path=?2
+             WHERE mission_run_after.run_id=?1 AND step_runs.status<>'completed'",
+            params![run_id, crate::mission::AFTER_RUN_STEP],
+            |row| row.get(0),
+        )
+        .optional()?)
+}
+
+fn mission_run_after_tx(connection: &Connection, run_id: &str) -> Result<Option<String>, St3Error> {
+    connection
+        .query_row(
+            "SELECT after_run FROM mission_run_after WHERE run_id=?1",
+            [run_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(internal)
 }
 
 fn adopt_declared_mission_revision_tx(
@@ -10462,6 +10564,8 @@ fn adopt_declared_mission_revision_tx(
             "a run revision cannot change its input declarations",
         ));
     }
+    let old = crate::mission::run_mission(old, current.after.as_deref())?;
+    let next = crate::mission::run_mission(next, current.after.as_deref())?;
     let variables = mission_run_variables(&current, &next.revision);
     let (compatible, reviewers) =
         analyze_mission_revision(&old, &next, &actor, &current.requester, &variables)?;
@@ -16578,6 +16682,8 @@ fn project_mission_run_created(
             )
         })?;
     let generation_id = generation_id_from_subject(generation_subject);
+    let after = fields.get("after").and_then(Value::as_str);
+    let mission = crate::mission::run_mission(mission, after)?;
     transaction
         .execute(
             "INSERT OR IGNORE INTO mission_runs(id, mission_id, initial_revision, current_generation_id, root_revision, root_run_id, parent_step_run, workspace, requester, inputs, mode, status, phase, created_at_unix_ms, updated_at_unix_ms)
@@ -16585,6 +16691,14 @@ fn project_mission_run_created(
             params![run_id, mission_id, revision, generation_id, root_revision, root_run_id, parent_step_run, workspace, requester, serde_json::to_string(&inputs).map_err(internal)?, mode, claim.accepted_at_unix_ms.to_string()],
         )
         .map_err(internal)?;
+    if let Some(after) = after {
+        transaction
+            .execute(
+                "INSERT OR IGNORE INTO mission_run_after(run_id, after_run) VALUES (?1, ?2)",
+                params![run_id, after],
+            )
+            .map_err(internal)?;
+    }
     if let (Some(timeout_ms), Some(deadline_at_unix_ms)) = (
         fields.get("timeout_ms").and_then(Value::as_u64),
         fields.get("deadline_at_unix_ms").and_then(Value::as_u64),
@@ -17087,7 +17201,10 @@ fn project_run_generation_created(
     let Some(body) = body else {
         return Ok(());
     };
-    let mission = serde_json::from_str::<MissionSpec>(&body).map_err(internal)?;
+    let mission = crate::mission::run_mission(
+        serde_json::from_str::<MissionSpec>(&body).map_err(internal)?,
+        current.after.as_deref(),
+    )?;
     let mut variables = mission_run_variables(&current, revision);
     variables.insert("ST_RUN_GENERATION".into(), generation_id.to_owned());
     let compatible = fields
@@ -19865,10 +19982,11 @@ fn mission_run_header_tx(
                 mission_runs.workspace, mission_runs.requester, mission_runs.inputs, mission_runs.mode,
                 mission_run_deadlines.timeout_ms, mission_run_deadlines.deadline_at_unix_ms,
                 mission_runs.status, mission_runs.phase, mission_runs.created_at_unix_ms,
-                mission_runs.updated_at_unix_ms
+                mission_runs.updated_at_unix_ms, mission_run_after.after_run
          FROM mission_runs JOIN run_generations
            ON run_generations.id=mission_runs.current_generation_id
          LEFT JOIN mission_run_deadlines ON mission_run_deadlines.run_id=mission_runs.id
+         LEFT JOIN mission_run_after ON mission_run_after.run_id=mission_runs.id
          WHERE mission_runs.id=?1",
         [run_id],
         |row| {
@@ -19894,6 +20012,7 @@ fn mission_run_header_tx(
                 mode: row.get(11)?,
                 timeout_ms: row.get(12)?,
                 deadline_at_unix_ms: deadline.and_then(|value| value.parse().ok()),
+                after: row.get(18)?,
                 status: row.get(14)?,
                 phase: row.get(15)?,
                 created_at_unix_ms: created.parse().unwrap_or(0),
@@ -23073,6 +23192,94 @@ version 2
             controller.step_run(&step).unwrap().unwrap().status,
             "verifying"
         );
+    }
+
+    #[test]
+    fn a_run_declared_after_another_keeps_its_wait_through_preview_and_replication() {
+        let controller = Store::open_memory("controller").unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let build = publish_mission(
+            &controller,
+            "version 2\nmission \"build\" state=\"ready\" { goal \"Build.\"; step \"build\" { agentless } }",
+            "publish-build",
+        );
+        let ship = publish_mission(
+            &controller,
+            "version 2\nmission \"ship\" state=\"ready\" { goal \"Ship.\"; step \"ship\" { agentless } }",
+            "publish-ship",
+        );
+        let declare = |run: &str, mission: &MissionSpec, after: Option<&str>| {
+            let after = after.map_or(String::new(), |after| format!("  after {after:?}\n"));
+            let source = format!(
+                "version 2\nmission-run {run:?} {{\n  mission \"mission/{}@{}\"\n  workspace {:?}\n  requester \"person/operator\"\n{after}}}\n",
+                mission.id,
+                mission.revision,
+                workspace.path().display().to_string(),
+            );
+            let intent = crate::graph::parse_intent(&source, "node").unwrap();
+            let preview = controller
+                .mission(
+                    &intent,
+                    IntentInput {
+                        kdl: source,
+                        source_name: None,
+                    },
+                )
+                .unwrap();
+            (intent, preview)
+        };
+
+        let (_, early) = declare("ship/1", &ship, Some("build/1"));
+        assert_eq!(
+            early.blockers,
+            [
+                "mission run `mission-run/ship/1` waits for `mission-run/build/1`, which does not exist"
+            ]
+        );
+        for (run, mission, after) in [
+            ("build/1", &build, None),
+            ("ship/1", &ship, Some("build/1")),
+        ] {
+            let (intent, preview) = declare(run, mission, after);
+            assert!(preview.blockers.is_empty(), "{:?}", preview.blockers);
+            controller
+                .apply_as(
+                    &intent,
+                    &preview.subject_tokens,
+                    &format!("start-{run}"),
+                    Some("person/operator"),
+                )
+                .unwrap();
+        }
+        let (_, changed) = declare("ship/1", &ship, Some("build/2"));
+        assert_eq!(
+            changed.blockers,
+            ["mission run `mission-run/ship/1` already exists with different creation fields"]
+        );
+
+        let local = controller.mission_run("ship/1").unwrap().unwrap();
+        assert_eq!(local.after.as_deref(), Some("mission-run/build/1"));
+        let worker = Store::open_memory("worker").unwrap();
+        receive_and_project(
+            &worker,
+            "controller",
+            &exchange_from(&controller, &ReplicationInventory::default()),
+        );
+        let remote = worker.mission_run("ship/1").unwrap().unwrap();
+        assert_eq!(remote.after, local.after);
+        assert_eq!(
+            remote
+                .steps
+                .iter()
+                .map(|step| (step.subject.as_str(), step.agentless))
+                .collect::<Vec<_>>(),
+            local
+                .steps
+                .iter()
+                .map(|step| (step.subject.as_str(), step.agentless))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(remote.steps[0].step, "after-run");
     }
 
     #[test]

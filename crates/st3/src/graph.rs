@@ -468,6 +468,7 @@ fn parse_mission_run_declaration(
             "requester",
             "mode",
             "input",
+            "after",
             "revision",
             "reset",
             "cancellation",
@@ -478,7 +479,7 @@ fn parse_mission_run_declaration(
     let has_creation = body.nodes().iter().any(|child| {
         matches!(
             child.name().value(),
-            "mission" | "workspace" | "requester" | "mode" | "input"
+            "mission" | "workspace" | "requester" | "mode" | "input" | "after"
         )
     });
     let creation = if has_creation {
@@ -530,6 +531,16 @@ fn parse_mission_run_declaration(
                 ));
             }
         }
+        let after = child_string(body, "after")?.map(|after| namespaced("mission-run", &after));
+        if let Some(after) = &after {
+            validate_full_subject(after)?;
+            if after == &subject {
+                return Err(St3Error::new(
+                    "invalid-mission-run-after",
+                    format!("mission run `{subject}` cannot wait for itself"),
+                ));
+            }
+        }
         Some(MissionRunCreation {
             mission,
             revision,
@@ -537,6 +548,7 @@ fn parse_mission_run_declaration(
             requester,
             inputs,
             mode,
+            after,
         })
     } else {
         None
