@@ -261,8 +261,9 @@ On a machine that is not in a fleet yet, `st fleet invite` first founds one; see
 
 ### Code contents
 
-A code is `stj1-` followed by lowercase RFC 4648 base32, without padding, of this CBOR map and a
-4-byte checksum (the first 4 bytes of the SHA-256 of the map):
+A code is `stj1-` followed by lowercase RFC 4648 base32, without padding, of a compact binary
+record of these fields (fixed-width fields, then length-prefixed strings) and a 4-byte checksum
+(the first 4 bytes of the SHA-256 of the record):
 
 | Key | Bytes | Meaning | Secret |
 |---|---|---|---|
@@ -382,7 +383,7 @@ What this gives:
 - The joiner proves it holds `Kj`, so nobody can register another machine's public key.
 
 `ring` provides Ed25519, X25519, HKDF, and ChaCha20-Poly1305. It is already in the build through
-`rustls`, so this adds no new crate. `ciborium` and `data-encoding` are already in `Cargo.lock`.
+`rustls`, so this adds no new crate. `data-encoding` is already in `Cargo.lock`.
 
 The design does not add timestamps or nonces to requests. Every peer operation is idempotent or
 fenced, and a replay would first have to break Tailscale or Fabric encryption. Leaving time out
@@ -891,11 +892,11 @@ in use for each member.
   and every 60 seconds. The exposure is not persisted in Fabric's configuration, so a crash leaves
   nothing behind after Fabric restarts. `st fleet leave`, `st fleet mode dial-out`, and
   `st uninstall` run `fabric unexpose PROTOCOL`.
-- **Outbound.** Before an exchange, when it has no working socket for a member, the worker runs
-  `fabric dial NODE_ID PROTOCOL`. Fabric's daemon creates or reuses a local Unix socket and the
-  command prints its path. The worker sends the exchange as HTTP over that socket, with the same
-  hyper Unix-socket client the local API uses. After a connection failure, it discards the socket
-  and dials again.
+- **Outbound.** Before an exchange over Fabric, the worker runs
+  `fabric dial NODE_ID PROTOCOL --tcp 127.0.0.1:0`. Fabric's daemon creates or reuses a loopback
+  TCP tunnel to that peer's exposure and the command prints its address. The worker sends the
+  exchange as HTTP to that address, as it does over any loopback route. After a connection
+  failure, it moves to the next route and asks Fabric again.
 - **Trust and grants.** Fabric trust and grants are Fabric's business; st never edits
   `peers.toml`. The exposing machine must list the dialer's NodeID with the protocol in its
   `allow` list. When the grant is missing, `fabric probe` answers `unsupported`, and
