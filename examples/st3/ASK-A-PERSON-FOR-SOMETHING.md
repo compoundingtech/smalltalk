@@ -18,7 +18,7 @@ The agent names what it needs, what the answer unblocks, and what it did instead
 
 ```sh
 blocked_step=step-run/GENERATION_ID/publish
-st3 attention request \
+st attention request \
   --for person/operator \
   --title 'Choose the catalog export format' \
   --reason 'CSV or JSON is needed to unblock the publish step. Input validation is complete, and I am continuing the independent checksum report meanwhile.' \
@@ -28,7 +28,7 @@ st3 attention request \
   --idempotency-key example-catalog-export-format
 ```
 
-Replace `GENERATION_ID` with the exact value printed by `st3 work ls`; it is a placeholder, not a
+Replace `GENERATION_ID` with the exact value printed by `st work ls`; it is a placeholder, not a
 literal graph ID.
 
 The stable idempotency key makes retries return the same attention request instead of creating a
@@ -38,10 +38,10 @@ prompt and it does not automatically block other graph work.
 Record the material status and continue everything that does not depend on the choice:
 
 ```sh
-st3 work progress "$blocked_step" \
+st work progress "$blocked_step" \
   --as agent/example/worker \
   --summary 'Requested the export-format decision; validation is complete and checksum work continues.'
-st3 work ls --as agent/example/worker
+st work ls --as agent/example/worker
 ```
 
 When the person resolves the request, the agent reads the durable outcome and resumes only the

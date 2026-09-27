@@ -1,6 +1,6 @@
 # omp readiness evals — 2026-09-26
 
-On this branch's final st3 behavior (`55c777b`, restored by `46fe831`), omp passes seat mission work
+On this branch's final st behavior (`55c777b`, restored by `46fe831`), omp passes seat mission work
 and work wake reliability on every run. It passes restart continuity in two of three runs and
 cross-harness message wake in three of six. The remaining omp failures are model protocol slips,
 plus one duplicate send when a steered message backgrounded a tool call. Codex fails
@@ -10,10 +10,10 @@ On the baseline `9b3c0a3`, omp failed cross-harness message wake by speaking as 
 needed three wakes to claim seat mission work. Restart continuity could not pass for any harness
 until its eval and a runtime wake gap were repaired.
 
-These live runs measured omp 18.1.22 seats on `openai-codex/gpt-5.6-luna`. They used four st3
+These live runs measured omp 18.1.22 seats on `openai-codex/gpt-5.6-luna`. They used four st
 evals: cross-harness message wake, work wake reliability, seat mission work, and restart
 continuity. The same evals ran with Codex `gpt-6-luna` and Claude `claude-sonnet-5` in the seat
-under test. Each run used its own isolated st3 daemon, state directory, and copied binary. All 113
+under test. Each run used its own isolated st daemon, state directory, and copied binary. All 113
 runs that created a mission run have a report in their eval's `reports/` directory, dated by the
 run's start in UTC. The model in each report is counted from
 that seat's provider transcript. Every omp assistant turn shows the `openai-codex` provider and the
@@ -65,8 +65,8 @@ Failures behind those counts:
 ## omp failures and their status
 
 1. **Fixed: the session start used st2 vocabulary.** The pi-family channel opened every omp session
-   with "Set your status to available ... Set busy before work". st3 has no status command, so omp
-   seats searched for one before they claimed work. `93a515a` replaced it with the st3 boot
+   with "Set your status to available ... Set busy before work". st has no status command, so omp
+   seats searched for one before they claimed work. `93a515a` replaced it with the st boot
    contract and the seat's own identity.
 2. **Fixed: one omp seat spoke as another agent.** omp runs its Python `eval` tool with an
    allowlisted environment that drops `ST_AGENT`, `ST3_BIN`, and `ST3_ENDPOINT`. In
@@ -79,7 +79,7 @@ Failures behind those counts:
    a close, or a new `working` edge. It sent two more wakes, each of which interrupted the turn.
    `93a515a` acknowledges delivery into a working turn. Every later omp assignment needed one wake.
 4. **Fixed: nested work after an early parent submission.** An agent could submit a parent step
-   before its nested steps. st3 then held the parent `verifying` and never woke the idle seat for
+   before its nested steps. st then held the parent `verifying` and never woke the idle seat for
    the nested work. `ed38d1f` wakes that nested step. `0e0358e` first waits until the submitting
    turn has ended, so an omp seat that continues in the same turn draws no extra message.
 5. **Fixed: a missing declared product left no trace.** In `restart-ompfix-20260926-a`, omp recorded
@@ -105,7 +105,7 @@ that its test failed, and restored the source.
 
 | Commit | Change | Test that fails without it |
 | --- | --- | --- |
-| `93a515a` | pi-family session context uses the st3 boot contract and names the seat | `pi_family_session_ritual_uses_only_the_st3_boot_contract` |
+| `93a515a` | pi-family session context uses the st boot contract and names the seat | `pi_family_session_ritual_uses_only_the_st3_boot_contract` |
 | `93a515a` | a wake delivered into a working turn is acknowledged | `a_wake_delivered_into_an_already_working_turn_is_acknowledged` |
 | `ed38d1f` | an early parent submission frees the seat for ready nested work | `inherited_nested_work_keeps_one_parent_alert` |
 | `0e0358e` | that nested wake waits for the working turn to end | `inherited_nested_work_keeps_one_parent_alert` |
@@ -117,7 +117,7 @@ that its test failed, and restored the source.
 
 The evals were repaired as well. `22158cd` states the seat-mission-work artifact content that its
 held-out gate checks. `3eaf957` fixes the restart injector and graph judge for the current CLI.
-`8dd9cbb` excludes st3's `.st3/` boot directory from the ledger's clean-worktree check. `22158cd`
+`8dd9cbb` excludes st's `.st3/` boot directory from the ledger's clean-worktree check. `22158cd`
 adds `variants/` and `WAKE_PAIRS`.
 
 `cargo test -p st3` passes: 420 library, 93 CLI, 5 client CLI, 21 client contract, 27 example and
@@ -152,7 +152,7 @@ subject and body does not describe this branch.
 - **An exec exit-code gate waits for its step timeout.** A `field "exit_code" ... is 0` gate stays
   pending after the exec exits non-zero. The exec observation does not carry its restart policy, so
   failing at once needs the desired exec spec.
-- **omp's Python tool still lacks `ST_AGENT` and `ST3_ENDPOINT`.** A Python call to `st3` without
+- **omp's Python tool still lacks `ST_AGENT` and `ST3_ENDPOINT`.** A Python call to `st` without
   `ST3_ENDPOINT` would reach the default local socket.
 - **Claude sonnet submits restart parents early.** The Claude worker submitted a parent before its
   nested steps in every attempt that reached one. The restart coordination gate counts every runtime

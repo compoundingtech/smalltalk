@@ -6,8 +6,8 @@ version 2
 // Then read each mission's revision hash and copy it into github-intake.kdl in place of its zero
 // placeholder:
 //
-//   st3 missions publish examples/st3/github-intake-work.kdl --as person/operator
-//   st3 missions ls --all --json | jq -r '.value.items[]
+//   st missions publish examples/st3/github-intake-work.kdl --as person/operator
+//   st missions ls --all --json | jq -r '.value.items[]
 //     | select(.id == "mission/example/app/review-pull-request") | .mission_revision'
 //
 // A later change to this file needs a new publish and a new intake revision.
@@ -24,7 +24,7 @@ mission "example/app/review-pull-request" state="ready" {
   step "review" timeout="1h" {
     assigned-to "agent/example/worker"
     goal "Review the pull request in ${input.source}: read the diff, run the affected tests, and note every defect with its file and line."
-    goal "Store the full review with `st3 documents put`, and complete this step with a short verdict and the stored document reference."
+    goal "Store the full review with `st documents put`, and complete this step with a short verdict and the stored document reference."
     constraint "Do not comment on, approve, merge, or push to the pull request."
   }
 }
