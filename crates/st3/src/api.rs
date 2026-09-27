@@ -1192,10 +1192,11 @@ fn client_agent_resources(
                     Some("ended" | "failed"),
                     _,
                 ) => "failed",
+                // A harness fenced at a login or trust prompt waits on a person.
                 (
                     Some("running" | "ready" | "working" | "idle"),
                     Some(_),
-                    Some("indeterminate" | "unknown"),
+                    Some("indeterminate" | "unknown" | "unauthenticated" | "blocked"),
                     _,
                 ) => "waiting",
                 (Some("running" | "ready" | "working" | "idle"), Some(_), _, _) => "starting",
@@ -10649,6 +10650,88 @@ mission "agent-health" state="ready" {
         );
         assert_eq!(resources[0]["state"], "failed");
         assert_eq!(resources[0]["operational"]["layer"], "current");
+    }
+
+    #[test]
+    fn an_unauthenticated_harness_is_waiting_not_starting() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let store = state.store.clone();
+        let source = r#"
+version 2
+mission "agent-auth" state="ready" {
+  goal "Exercise an unauthenticated harness."
+  agent "worker" { workspace "/tmp"; harness "claude" {} }
+  step "queued" { assigned-to "agent/${ST_MISSION_RUN}/worker" }
+}
+"#;
+        let intent = parse_intent(source, "node").unwrap();
+        let planned = store
+            .mission(
+                &intent,
+                crate::model::IntentInput {
+                    kdl: source.into(),
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        store
+            .apply(&intent, &planned.subject_tokens, "agent-auth-source")
+            .unwrap();
+        let run = store
+            .create_mission_run(&MissionRunRequest {
+                mission: "agent-auth".into(),
+                revision: None,
+                workspace: "/tmp".into(),
+                requester: Some("person/test".into()),
+                mode: Some("run".into()),
+                inputs: BTreeMap::new(),
+                idempotency_key: "agent-auth-run".into(),
+            })
+            .unwrap();
+        materialize_run_agents(&state, &run);
+        let subject = format!("agent/{}/worker", run.id);
+        for (kind, fields, key) in [
+            (
+                "runtime.observed",
+                BTreeMap::from([
+                    ("status".into(), Value::String("running".into())),
+                    ("runtime_id".into(), Value::String("node.worker".into())),
+                    ("incarnation_id".into(), Value::String("worker-1".into())),
+                ]),
+                "agent-auth-runtime",
+            ),
+            (
+                "harness.diagnostic",
+                BTreeMap::from([
+                    ("severity".into(), Value::String("error".into())),
+                    ("status".into(), Value::String("unauthenticated".into())),
+                    ("code".into(), Value::String("provider-auth-expired".into())),
+                    (
+                        "reason".into(),
+                        Value::String("Claude reports an expired login".into()),
+                    ),
+                    ("incarnation_id".into(), Value::String("worker-1".into())),
+                ]),
+                "agent-auth-expired",
+            ),
+        ] {
+            store
+                .append_claim(&ClaimInput {
+                    subject: subject.clone(),
+                    kind: kind.into(),
+                    actor: (kind == "harness.diagnostic").then(|| subject.clone()),
+                    fields,
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: Some(key.into()),
+                })
+                .unwrap();
+        }
+        let resources =
+            client_agent_resources(&store, false, "snapshot", store.index().unwrap()).unwrap();
+        assert_eq!(resources[0]["harness_state"], "unauthenticated");
+        assert_eq!(resources[0]["state"], "waiting");
     }
 
     #[tokio::test]
