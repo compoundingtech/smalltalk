@@ -16363,6 +16363,53 @@ mission "gated" state="ready" {
     }
 
     #[test]
+    fn a_queue_move_retry_returns_its_claim_after_the_run_ends() {
+        let seat = SeatQueueFixture::new();
+        let run = seat.start("queued", "queue-retry-run");
+        let first = seat
+            .move_run(
+                &run.subject,
+                "top",
+                None,
+                "person/operator",
+                "queue-retry-move",
+            )
+            .unwrap();
+        assert!(
+            seat.store
+                .set_mission_run_state(&run.subject, "cancelled", "terminal", Some("finished"))
+                .unwrap()
+        );
+        assert!(
+            !seat
+                .store
+                .seat_run_order(SEAT)
+                .unwrap()
+                .contains(&run.subject)
+        );
+        let replay = seat
+            .move_run(
+                &run.subject,
+                "top",
+                None,
+                "person/operator",
+                "queue-retry-move",
+            )
+            .expect("an exact retry returns the recorded move even after the run leaves the queue");
+        assert_eq!(replay.id, first.id);
+        let changed = seat
+            .move_run(
+                &run.subject,
+                "bottom",
+                None,
+                "person/operator",
+                "queue-retry-move",
+            )
+            .unwrap_err();
+        assert_eq!(changed.code, "idempotency-mismatch");
+    }
+
+    #[test]
     fn seat_queue_moves_name_queued_runs_only() {
         let seat = SeatQueueFixture::new();
         let first = seat.start("queued", "seat-invalid-first");
