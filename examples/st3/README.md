@@ -45,7 +45,8 @@ and approve it with `st3 launch approve-and-launch`. An authorized agent uses
 | Start from nothing: a seat, then finite work | [`WALKTHROUGH.md`](WALKTHROUGH.md), [`walkthrough-work.kdl`](walkthrough-work.kdl) |
 
 Every harness file declares the same `agent/example/worker` seat, and every mission example
-assigns work to it, so the missions run with whichever harness you apply. omp seats run best on
+assigns work to it, so the missions run with whichever harness you apply. The planner, reviewer,
+and chief seat files declare other seats, named for their roles. omp seats run best on
 `openai-codex/gpt-6-astra`; [Running st3 with omp](../../docs/st3/omp.md) explains why and lists
 the setup.
 
@@ -53,6 +54,7 @@ the setup.
 
 | Task | Example |
 | --- | --- |
+| Send one mission's steps to several seats, and share a seat between missions | [`many-to-many.kdl`](many-to-many.kdl), [`seats/planner.kdl`](seats/planner.kdl), [`seats/reviewer.kdl`](seats/reviewer.kdl) |
 | Serve several missions from one seat, and reorder its queue | [`seat-queue.kdl`](seat-queue.kdl) |
 | Let an agent reorder another seat's queue (`queue-authority`) | [`seats/chief.kdl`](seats/chief.kdl) |
 | Run steps of one mission in a fixed order | [`queued-work.kdl`](queued-work.kdl) |

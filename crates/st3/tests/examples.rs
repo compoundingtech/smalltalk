@@ -224,8 +224,10 @@ fn every_harness_seat_example_declares_the_shared_worker_seat() {
             .and_then(|entry| entry.value().as_string())
             .expect("a harness names its provider");
         let stem = file.file_stem().and_then(|stem| stem.to_str()).unwrap();
-        if stem == "chief" {
-            assert_eq!(identity, "example/chief");
+        // The chief reorders the worker's queue; the planner and reviewer share missions with the
+        // worker in many-to-many.kdl. Each is named for its role, not its harness.
+        if matches!(stem, "chief" | "planner" | "reviewer") {
+            assert_eq!(identity, format!("example/{stem}"), "{}", file.display());
             continue;
         }
         assert_eq!(identity, "example/worker", "{}", file.display());
@@ -1570,7 +1572,12 @@ fn new_paid_eval_fixtures_match_their_native_harnesses() {
 fn every_example_previews_cleanly_once_its_seats_exist() {
     let store = st3::store::Store::open_memory("local").unwrap();
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
-    for seat in ["examples/st3/seats/omp.kdl", "examples/st3/seats/chief.kdl"] {
+    for seat in [
+        "examples/st3/seats/omp.kdl",
+        "examples/st3/seats/chief.kdl",
+        "examples/st3/seats/planner.kdl",
+        "examples/st3/seats/reviewer.kdl",
+    ] {
         let source = fs::read_to_string(root.join(seat)).expect("read seat example");
         let intent = st3::parse_intent(&source, "local").expect("parse seat example");
         let preview = store
