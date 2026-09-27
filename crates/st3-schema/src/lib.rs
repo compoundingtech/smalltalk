@@ -1878,9 +1878,10 @@ fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
         "observer.state" => &[
             (
                 "state",
-                required_enum(&["healthy", "unreachable", "stopped"]),
+                required_enum(&["healthy", "degraded", "unreachable", "stopped"]),
             ),
             ("reason", string()),
+            ("error_code", string()),
             ("revision", string()),
             ("attempt", string()),
             ("next_check_unix_ms", string()),

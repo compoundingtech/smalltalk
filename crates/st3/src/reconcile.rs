@@ -6284,6 +6284,16 @@ impl<R: RuntimeControl> Reconciler<R> {
                 continue;
             };
             let observer_actual = self.store.latest_actual_value(&observer.subject)?;
+            if observer_actual.as_ref().is_some_and(|actual| {
+                actual.get("state").and_then(Value::as_str) == Some("degraded")
+                    && actual.get("revision").and_then(Value::as_str) == Some(revision.as_str())
+                    && actual
+                        .get("error_code")
+                        .and_then(Value::as_str)
+                        .is_some_and(permanent_observation_error)
+            }) {
+                continue;
+            }
             let refresh_attempt = self
                 .store
                 .pending_observer_refresh_attempt(&observer.subject)?;
@@ -6364,7 +6374,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                     };
                     match provider.observe(request).await {
                         Ok(observation) => {
-                            let _ = store.record_resource_observation(
+                            match store.record_resource_observation(
                                 &observer_subject,
                                 &revision,
                                 refresh_attempt.as_deref(),
@@ -6373,15 +6383,56 @@ impl<R: RuntimeControl> Reconciler<R> {
                                 &observation.facts,
                                 observation.next_check_unix_ms,
                                 &selected,
-                            );
-                            deadlines
-                                .lock()
-                                .expect("observer deadline mutex poisoned")
-                                .insert(deadline_key.clone(), observation.next_check_unix_ms);
-                            cursors
-                                .lock()
-                                .expect("observer cursor mutex poisoned")
-                                .insert(deadline_key.clone(), observation.cursor);
+                            ) {
+                                Ok(_) => {
+                                    deadlines
+                                        .lock()
+                                        .expect("observer deadline mutex poisoned")
+                                        .insert(
+                                            deadline_key.clone(),
+                                            observation.next_check_unix_ms,
+                                        );
+                                    cursors
+                                        .lock()
+                                        .expect("observer cursor mutex poisoned")
+                                        .insert(deadline_key.clone(), observation.cursor);
+                                }
+                                Err(error) => {
+                                    let retry_at = now_ms().saturating_add(60_000);
+                                    deadlines
+                                        .lock()
+                                        .expect("observer deadline mutex poisoned")
+                                        .insert(deadline_key.clone(), retry_at);
+                                    let reason = error.to_string();
+                                    let failure_hash = hex::encode(sha2::Sha256::digest(
+                                        format!("{revision}:{}:{reason}", error.code).as_bytes(),
+                                    ));
+                                    let mut fields = BTreeMap::from([
+                                        ("state".into(), Value::String("degraded".into())),
+                                        ("reason".into(), Value::String(reason)),
+                                        ("error_code".into(), Value::String(error.code.into())),
+                                        ("revision".into(), Value::String(revision.clone())),
+                                    ]);
+                                    if let Some(attempt) = &refresh_attempt {
+                                        fields.insert(
+                                            "attempt".into(),
+                                            Value::String(attempt.clone()),
+                                        );
+                                    }
+                                    let _ = store.append_claim(&ClaimInput {
+                                        subject: observer_subject.clone(),
+                                        kind: "observer.state".into(),
+                                        actor: None,
+                                        fields,
+                                        evidence: Vec::new(),
+                                        expected_subject: None,
+                                        idempotency_key: Some(format!(
+                                            "observer-rejected:{}",
+                                            &failure_hash[..20]
+                                        )),
+                                    });
+                                }
+                            }
                         }
                         Err(error) => {
                             let retry_at = now_ms().saturating_add(60_000);
@@ -7225,6 +7276,18 @@ impl<R: RuntimeControl> Reconciler<R> {
         watchers.insert(subject.into(), watcher);
         Ok(())
     }
+}
+
+fn permanent_observation_error(code: &str) -> bool {
+    matches!(
+        code,
+        "stale-observer-revision"
+            | "invalid-resource-observation"
+            | "invalid-claim-field"
+            | "unknown-resource-field"
+            | "immutable-resource-field"
+            | "claim-cardinality"
+    )
 }
 
 struct RuntimeStep<'a> {
@@ -13673,6 +13736,77 @@ version 2
     }
 
     struct FakeResourceProvider;
+
+    struct InvalidRepositoryProvider {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl ResourceProvider for InvalidRepositoryProvider {
+        fn observe(
+            &self,
+            _request: ObservationRequest,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<crate::resource::ProviderObservation>>
+                    + Send
+                    + '_,
+            >,
+        > {
+            Box::pin(async {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                Ok(crate::resource::ProviderObservation {
+                    facts: serde_json::json!({"issues": "not-an-array"}),
+                    cursor: Some("invalid-cursor".into()),
+                    next_check_unix_ms: now_ms().saturating_add(60_000),
+                })
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn a_rejected_observation_degrades_and_pauses_its_revision() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        apply_source(
+            &store,
+            r#"version 2
+resource "repo" { kind "vcs.repository" }
+observer "repo" {
+  resource "resource/repo"
+  provider "github.repository"
+  locator "owner/repo"
+  field "issues"
+}"#,
+            "rejected-observation",
+        );
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (event_notify, mut event_changed) = watch::channel(0_u64);
+        let reconciler = Reconciler::new(
+            store.clone(),
+            Arc::new(FakeRuntime::default()),
+            "node".into(),
+            Arc::new(Notify::new()),
+        )
+        .with_resource_provider(Arc::new(InvalidRepositoryProvider {
+            calls: calls.clone(),
+        }))
+        .with_event_notify(event_notify);
+        reconciler.reconcile_once().unwrap();
+        tokio::time::timeout(Duration::from_secs(1), event_changed.changed())
+            .await
+            .unwrap()
+            .unwrap();
+        let state = store.latest_actual_value("observer/repo").unwrap().unwrap();
+        assert_eq!(state["state"], "degraded");
+        assert!(state["reason"].as_str().unwrap().contains("issues"));
+        assert!(
+            store
+                .claims_for("resource/repo", Some("resource.observed"))
+                .unwrap()
+                .is_empty()
+        );
+        reconciler.reconcile_once().unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
 
     struct BlockingResourceProvider {
         calls: Arc<AtomicUsize>,
