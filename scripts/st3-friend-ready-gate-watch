@@ -113,7 +113,7 @@ failures=0
 
 send_notice() {
   local subject=$1 body=$2 response
-  if response=$(/usr/bin/timeout -k 5s 30s "$ST3_BIN" conversations send "$ST_AGENT" \
+  if response=$(/usr/bin/timeout -k 5s 30s /usr/bin/env -u ST_AGENT "$ST3_BIN" conversations send "$ST_AGENT" \
     --from "$MONITOR" --subject "$subject" --body "$body" --json); then
     /usr/bin/jq -er '.subject' <<<"$response"
   else

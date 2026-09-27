@@ -8309,7 +8309,7 @@ impl Store {
             .replication_snapshot
             .lock()
             .expect("replication snapshot mutex poisoned")
-            .clone();
+            .take();
         let envelope_count: usize =
             connection.query_row("SELECT COUNT(*) FROM replica_envelopes", [], |row| {
                 row.get(0)
@@ -8332,8 +8332,15 @@ impl Store {
                 })?
                 .collect::<Result<Vec<_>, _>>()?;
             if envelope_count == previous.inventory.envelopes.len() + additions.len() {
-                let mut envelopes = previous.inventory.envelopes.clone();
                 let mut max_rowid = previous.max_envelope_rowid;
+                // Most snapshots are owned only by this cache. Move their inventory
+                // into the successor so a graph write does not allocate and free
+                // every envelope ID. Keep the old snapshot intact for concurrent
+                // callers that still hold it.
+                let mut envelopes = match Arc::try_unwrap(previous) {
+                    Ok(snapshot) => snapshot.inventory.envelopes,
+                    Err(shared) => shared.inventory.envelopes.clone(),
+                };
                 for (rowid, identity) in additions {
                     max_rowid = max_rowid.max(rowid);
                     let position = envelopes.binary_search(&identity).unwrap_or_else(|at| at);
@@ -8400,7 +8407,9 @@ impl Store {
         let missing = if same || !remote_is_complete {
             Vec::new()
         } else {
-            let known = remote.envelopes.iter().cloned().collect::<BTreeSet<_>>();
+            // Only membership is needed. Borrow IDs from the request instead of
+            // duplicating the remote's entire inventory on every divergent sync.
+            let known = remote.envelopes.iter().collect::<BTreeSet<_>>();
             snapshot
                 .inventory
                 .envelopes
@@ -14327,6 +14336,49 @@ fn unchanged_replication_snapshot_reuses_inventory() {
         first_hash, second_hash,
         "the inventory must commit payload bytes"
     );
+}
+
+#[cfg(test)]
+#[test]
+fn replication_snapshot_moves_an_exclusive_inventory_into_its_successor() {
+    let store = Store::open_memory("node").unwrap();
+    for index in 0..5 {
+        store
+            .append_client_claim(&ClaimInput {
+                subject: format!("resource/envelope-{index}"),
+                kind: "resource.observed".into(),
+                actor: None,
+                fields: BTreeMap::from([(
+                    "kind".into(),
+                    Value::String("custom.test.replication".into()),
+                )]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+    }
+    let first = store.replication_snapshot().unwrap();
+    assert!(first.inventory.envelopes.capacity() > first.inventory.envelopes.len());
+    let buffer = first.inventory.envelopes.as_ptr();
+    drop(first);
+    store
+        .append_client_claim(&ClaimInput {
+            subject: "resource/last-envelope".into(),
+            kind: "resource.observed".into(),
+            actor: None,
+            fields: BTreeMap::from([(
+                "kind".into(),
+                Value::String("custom.test.replication".into()),
+            )]),
+            evidence: Vec::new(),
+            expected_subject: None,
+            idempotency_key: None,
+        })
+        .unwrap();
+    let successor = store.replication_snapshot().unwrap();
+    assert_eq!(successor.inventory.envelopes.len(), 6);
+    assert_eq!(successor.inventory.envelopes.as_ptr(), buffer);
 }
 
 #[cfg(test)]
