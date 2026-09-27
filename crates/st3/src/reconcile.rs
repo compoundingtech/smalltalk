@@ -20,7 +20,10 @@ use crate::model::{
     MissionRunView, MissionSpec, MissionState, RestartIntensity, RestartType, StepRunView,
     StepSpec, UsedMissionSpec, WorkSelector,
 };
-use crate::resource::{ObservationRequest, RegisteredResourceProvider, ResourceProvider};
+use crate::resource::{
+    ObservationRequest, ProviderRateLimit, ProviderUnauthenticated, RegisteredResourceProvider,
+    ResourceProvider,
+};
 use crate::store::Store;
 
 const HARNESS_READINESS_DEADLINE_MS: u128 = 60_000;
@@ -6484,6 +6487,13 @@ impl<R: RuntimeControl> Reconciler<R> {
                         .expect("observer deadline mutex poisoned")
                         .get(&deadline_key)
                         .copied()
+                        .or_else(|| {
+                            observer_actual
+                                .as_ref()
+                                .and_then(|actual| actual.get("next_check_unix_ms"))
+                                .and_then(Value::as_str)
+                                .and_then(|value| value.parse().ok())
+                        })
                         .unwrap_or_else(now_ms)
                 });
             let operation = format!(
@@ -6507,6 +6517,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             let deadlines = self.observer_deadlines.clone();
             let cursors = self.observer_cursors.clone();
             let observer_subject = observer.subject.clone();
+            let observer_owner_run = observer.owner_run.clone();
             let previous_facts = self
                 .store
                 .latest_actual_value(&spec.resource)?
@@ -6571,12 +6582,33 @@ impl<R: RuntimeControl> Reconciler<R> {
                                 .insert(deadline_key.clone(), observation.cursor);
                         }
                         Err(error) => {
-                            let retry_at = now_ms().saturating_add(60_000);
+                            let rate_limit = error.downcast_ref::<ProviderRateLimit>();
+                            let retry_at = rate_limit.map_or_else(
+                                || now_ms().saturating_add(60_000),
+                                |limit| limit.retry_at_unix_ms.max(now_ms().saturating_add(1_000)),
+                            );
                             let reason = error.to_string();
                             deadlines
                                 .lock()
                                 .expect("observer deadline mutex poisoned")
                                 .insert(deadline_key.clone(), retry_at);
+                            if rate_limit.is_some_and(|limit| limit.unauthenticated)
+                                || error.downcast_ref::<ProviderUnauthenticated>().is_some()
+                                || observer_unreachable_since(&store, &observer_subject)
+                                    .ok()
+                                    .flatten()
+                                    .is_some_and(|since| {
+                                        now_ms().saturating_sub(since) >= 3_600_000
+                                    })
+                            {
+                                let _ = request_observer_attention(
+                                    &store,
+                                    &observer_subject,
+                                    observer_owner_run.as_deref(),
+                                    &revision,
+                                    &reason,
+                                );
+                            }
                             let unchanged_failure = store
                                 .latest_actual_value(&observer_subject)
                                 .ok()
@@ -6602,6 +6634,10 @@ impl<R: RuntimeControl> Reconciler<R> {
                                 ("state".into(), Value::String("unreachable".into())),
                                 ("reason".into(), Value::String(reason)),
                                 ("revision".into(), Value::String(revision.clone())),
+                                (
+                                    "next_check_unix_ms".into(),
+                                    Value::String(retry_at.to_string()),
+                                ),
                             ]);
                             if let Some(attempt) = &refresh_attempt {
                                 fields.insert("attempt".into(), Value::String(attempt.clone()));
@@ -7412,6 +7448,49 @@ impl<R: RuntimeControl> Reconciler<R> {
         watchers.insert(subject.into(), watcher);
         Ok(())
     }
+}
+
+fn observer_unreachable_since(store: &Store, subject: &str) -> Result<Option<u128>> {
+    let mut since = None;
+    for claim in store.claims_for(subject, Some("observer.state"))? {
+        let state = claim.body.pointer("/fields/state").and_then(Value::as_str);
+        if state == Some("unreachable") {
+            since.get_or_insert(claim.accepted_at_unix_ms);
+        } else {
+            since = None;
+        }
+    }
+    Ok(since)
+}
+
+fn request_observer_attention(
+    store: &Store,
+    subject: &str,
+    owner_run: Option<&str>,
+    revision: &str,
+    reason: &str,
+) -> Result<()> {
+    let reviewer = owner_run
+        .and_then(|owner| store.mission_run(owner).ok().flatten())
+        .map(|run| run.requester)
+        .filter(|requester| requester.starts_with("person/"))
+        .unwrap_or_else(|| "person/operator".into());
+    let hash = hex::encode(sha2::Sha256::digest(
+        format!("{subject}:{revision}").as_bytes(),
+    ));
+    store.request_attention(
+        &format!("attention/github-observer-{}", &hash[..20]),
+        &AttentionRequest {
+            reviewer,
+            title: "GitHub observer needs attention".into(),
+            reason: format!("{subject} cannot observe its repository: {reason}"),
+            severity: "error".into(),
+            targets: vec![subject.into()],
+            actor: "agent/st3/reconciler".into(),
+            idempotency_key: format!("github-observer-attention:{hash}"),
+        },
+    )?;
+    Ok(())
 }
 
 struct RuntimeStep<'a> {
@@ -13901,6 +13980,170 @@ version 2
     }
 
     struct FakeResourceProvider;
+
+    struct RateLimitedResourceProvider {
+        calls: Arc<AtomicUsize>,
+        retry_at_unix_ms: u128,
+    }
+
+    impl ResourceProvider for RateLimitedResourceProvider {
+        fn observe(
+            &self,
+            _request: ObservationRequest,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<crate::resource::ProviderObservation>>
+                    + Send
+                    + '_,
+            >,
+        > {
+            Box::pin(async {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                Err(anyhow::Error::new(crate::resource::ProviderRateLimit {
+                    retry_at_unix_ms: self.retry_at_unix_ms,
+                    unauthenticated: false,
+                    status: 429,
+                }))
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn a_rate_limited_observer_waits_until_the_provider_reset() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        apply_source(
+            &store,
+            r#"version 2
+resource "repo" { kind "vcs.repository" }
+observer "repo" {
+  resource "resource/repo"
+  provider "github.repository"
+  locator "example/repo"
+  field "issues"
+}"#,
+            "rate-limited-observer",
+        );
+        let revision = store
+            .selected_desired_revision("observer/repo")
+            .unwrap()
+            .unwrap();
+        let deadline_key = format!("observer/repo:{revision}");
+        let reset = now_ms() + 180_000;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (event_notify, mut event_changed) = watch::channel(0_u64);
+        let reconciler = Reconciler::new(
+            store,
+            Arc::new(FakeRuntime::default()),
+            "node".into(),
+            Arc::new(Notify::new()),
+        )
+        .with_resource_provider(Arc::new(RateLimitedResourceProvider {
+            calls: calls.clone(),
+            retry_at_unix_ms: reset,
+        }))
+        .with_event_notify(event_notify);
+        reconciler.reconcile_once().unwrap();
+        tokio::time::timeout(Duration::from_secs(1), event_changed.changed())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            reconciler.observer_deadlines.lock().unwrap()[&deadline_key],
+            reset
+        );
+        reconciler.reconcile_once().unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn an_observer_unreachable_for_an_hour_requests_attention_once() {
+        let root = tempfile::tempdir().unwrap();
+        let database = root.path().join("observer.sqlite");
+        let store = Arc::new(Store::open(&database, "node").unwrap());
+        apply_source(
+            &store,
+            r#"version 2
+resource "repo" { kind "vcs.repository" }
+observer "repo" {
+  resource "resource/repo"
+  provider "github.repository"
+  locator "example/repo"
+  field "issues"
+}"#,
+            "prolonged-unreachable-observer",
+        );
+        let revision = store
+            .selected_desired_revision("observer/repo")
+            .unwrap()
+            .unwrap();
+        let old = store
+            .append_claim(&ClaimInput {
+                subject: "observer/repo".into(),
+                kind: "observer.state".into(),
+                actor: None,
+                fields: BTreeMap::from([
+                    ("state".into(), Value::String("unreachable".into())),
+                    ("reason".into(), Value::String("old failure".into())),
+                    ("revision".into(), Value::String(revision)),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+        rusqlite::Connection::open(&database)
+            .unwrap()
+            .execute(
+                "UPDATE claims SET accepted_at_unix_ms=?1 WHERE id=?2",
+                rusqlite::params![(now_ms() - 3_600_001).to_string(), old.id],
+            )
+            .unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (event_notify, mut event_changed) = watch::channel(0_u64);
+        let reconciler = Reconciler::new(
+            store.clone(),
+            Arc::new(FakeRuntime::default()),
+            "node".into(),
+            Arc::new(Notify::new()),
+        )
+        .with_resource_provider(Arc::new(RateLimitedResourceProvider {
+            calls,
+            retry_at_unix_ms: now_ms() + 180_000,
+        }))
+        .with_event_notify(event_notify);
+        reconciler.reconcile_once().unwrap();
+        tokio::time::timeout(Duration::from_secs(1), event_changed.changed())
+            .await
+            .unwrap()
+            .unwrap();
+        let attention = store.attention_items(None).unwrap();
+        assert_eq!(
+            attention
+                .iter()
+                .filter(|item| item.title == "GitHub observer needs attention")
+                .count(),
+            1
+        );
+        assert_eq!(
+            attention
+                .iter()
+                .find(|item| item.title == "GitHub observer needs attention")
+                .unwrap()
+                .person,
+            "person/operator"
+        );
+        reconciler.reconcile_once().unwrap();
+        assert_eq!(
+            store
+                .attention_items(None)
+                .unwrap()
+                .iter()
+                .filter(|item| item.title == "GitHub observer needs attention")
+                .count(),
+            1
+        );
+    }
 
     struct BlockingResourceProvider {
         calls: Arc<AtomicUsize>,

@@ -24,6 +24,90 @@ pub struct ProviderObservation {
     pub next_check_unix_ms: u128,
 }
 
+#[derive(Debug)]
+pub struct ProviderRateLimit {
+    pub retry_at_unix_ms: u128,
+    pub unauthenticated: bool,
+    pub status: u16,
+}
+
+impl std::fmt::Display for ProviderRateLimit {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "GitHub HTTP {} rate limit", self.status)
+    }
+}
+
+impl std::error::Error for ProviderRateLimit {}
+
+#[derive(Debug)]
+pub struct ProviderUnauthenticated {
+    pub status: u16,
+}
+
+impl std::fmt::Display for ProviderUnauthenticated {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "GitHub HTTP {} without authentication",
+            self.status
+        )
+    }
+}
+
+impl std::error::Error for ProviderUnauthenticated {}
+
+fn github_retry_at(headers: &reqwest::header::HeaderMap, now: u128) -> u128 {
+    let retry_after = headers
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| {
+            value
+                .parse::<u128>()
+                .ok()
+                .map(|seconds| now.saturating_add(seconds.saturating_mul(1_000)))
+                .or_else(|| {
+                    chrono::DateTime::parse_from_rfc2822(value)
+                        .ok()
+                        .map(|date| date.timestamp_millis().max(0) as u128)
+                })
+        });
+    let rate_reset = headers
+        .get("x-ratelimit-reset")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u128>().ok())
+        .map(|seconds| seconds.saturating_mul(1_000));
+    retry_after
+        .into_iter()
+        .chain(rate_reset)
+        .max()
+        .unwrap_or_else(|| now.saturating_add(15 * 60_000))
+}
+
+fn github_response(
+    response: reqwest::Response,
+    unauthenticated: bool,
+) -> Result<reqwest::Response> {
+    let status = response.status();
+    if status == reqwest::StatusCode::FORBIDDEN || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+    {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+        bail!(ProviderRateLimit {
+            retry_at_unix_ms: github_retry_at(response.headers(), now),
+            unauthenticated,
+            status: status.as_u16(),
+        });
+    }
+    if unauthenticated && status == reqwest::StatusCode::NOT_FOUND {
+        bail!(ProviderUnauthenticated {
+            status: status.as_u16()
+        });
+    }
+    Ok(response.error_for_status()?)
+}
+
 pub trait ResourceProvider: Send + Sync + 'static {
     fn observe(
         &self,
@@ -204,6 +288,15 @@ fn normalize_github_ref(
 }
 
 async fn observe_github_repository(request: ObservationRequest) -> Result<ProviderObservation> {
+    let token = github_token().await;
+    observe_github_repository_at(request, "https://api.github.com", token.as_deref()).await
+}
+
+async fn observe_github_repository_at(
+    request: ObservationRequest,
+    api_base: &str,
+    token: Option<&str>,
+) -> Result<ProviderObservation> {
     let (owner, repository) = request
         .locator
         .split_once('/')
@@ -215,38 +308,89 @@ async fn observe_github_repository(request: ObservationRequest) -> Result<Provid
     let client = reqwest::Client::builder()
         .user_agent("st3-resource-observer/0.1")
         .build()?;
-    let token = github_token().await;
-    let request_json = |url: String| {
-        let request = client
+    let request_json = |url: String, etag: Option<&str>| {
+        let mut request = client
             .get(url)
             .header("Accept", "application/vnd.github+json")
             .header("X-GitHub-Api-Version", "2022-11-28");
-        if let Some(token) = &token {
-            request.bearer_auth(token)
-        } else {
-            request
+        if let Some(etag) = etag {
+            request = request.header(reqwest::header::IF_NONE_MATCH, etag);
         }
+        if let Some(token) = token {
+            request = request.bearer_auth(token);
+        }
+        request
     };
-    let base = format!("https://api.github.com/repos/{owner}/{repository}");
-    let pulls: Vec<Value> = request_json(format!("{base}/pulls?state=open&per_page=100"))
-        .send()
-        .await?
-        .error_for_status()?
-        .json()
-        .await?;
-    let issues: Vec<Value> = request_json(format!("{base}/issues?state=open&per_page=100"))
-        .send()
-        .await?
-        .error_for_status()?
-        .json()
-        .await?;
+    let base = format!("{api_base}/repos/{owner}/{repository}");
+    let previous_cursor: Value = request
+        .cursor
+        .as_deref()
+        .and_then(|cursor| serde_json::from_str(cursor).ok())
+        .unwrap_or(Value::Null);
+    let previous_etag = |name: &str| {
+        request
+            .previous_facts
+            .as_ref()
+            .and_then(|_| previous_cursor.get(name))
+            .and_then(Value::as_str)
+    };
+    let mut pulls_etag = previous_etag("pulls").map(str::to_owned);
+    let pulls: Vec<Value> = if request.fields.contains("pull_requests") {
+        let response = github_response(
+            request_json(
+                format!("{base}/pulls?state=open&per_page=100"),
+                pulls_etag.as_deref(),
+            )
+            .send()
+            .await?,
+            token.is_none(),
+        )?;
+        if response.status() == reqwest::StatusCode::NOT_MODIFIED {
+            Vec::new()
+        } else {
+            pulls_etag = response
+                .headers()
+                .get(reqwest::header::ETAG)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned);
+            response.json().await?
+        }
+    } else {
+        Vec::new()
+    };
+    let mut issues_etag = previous_etag("issues").map(str::to_owned);
+    let issues: Vec<Value> = if request.fields.contains("issues") {
+        let response = github_response(
+            request_json(
+                format!("{base}/issues?state=open&per_page=100"),
+                issues_etag.as_deref(),
+            )
+            .send()
+            .await?,
+            token.is_none(),
+        )?;
+        if response.status() == reqwest::StatusCode::NOT_MODIFIED {
+            Vec::new()
+        } else {
+            issues_etag = response
+                .headers()
+                .get(reqwest::header::ETAG)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned);
+            response.json().await?
+        }
+    } else {
+        Vec::new()
+    };
     let facts = normalize_github_repository(
         request.previous_facts.as_ref(),
         &pulls,
         &issues,
         &request.fields,
     );
-    let cursor = Some(hex::encode(Sha256::digest(serde_json::to_vec(&facts)?)));
+    let cursor = Some(serde_json::to_string(
+        &json!({"pulls": pulls_etag, "issues": issues_etag}),
+    )?);
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -259,6 +403,11 @@ async fn observe_github_repository(request: ObservationRequest) -> Result<Provid
 }
 
 async fn github_token() -> Option<String> {
+    static TOKEN: tokio::sync::OnceCell<Option<String>> = tokio::sync::OnceCell::const_new();
+    TOKEN.get_or_init(lookup_github_token).await.clone()
+}
+
+async fn lookup_github_token() -> Option<String> {
     if let Some(token) = std::env::var("GH_TOKEN")
         .ok()
         .filter(|value| !value.trim().is_empty())
@@ -503,6 +652,7 @@ async fn observe_github_pull_request(request: ObservationRequest) -> Result<Prov
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
     struct FakeProvider;
 
@@ -663,5 +813,77 @@ mod tests {
         assert_eq!(facts["pull_requests"].as_array().unwrap().len(), 2);
         let repeated = normalize_github_repository(Some(&facts), &[], &[], &fields);
         assert_eq!(repeated, facts);
+    }
+
+    #[tokio::test]
+    async fn repository_observer_reuses_facts_after_an_etag_not_modified_response() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            for index in 0..2 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                loop {
+                    let mut chunk = [0_u8; 1024];
+                    let size = stream.read(&mut chunk).await.unwrap();
+                    request.extend_from_slice(&chunk[..size]);
+                    if size == 0 || request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                requests.push(String::from_utf8(request).unwrap());
+                let body = r#"[{"number":7,"title":"An invented issue"}]"#;
+                let response = if index == 0 {
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nETag: \"issues-v1\"\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                } else {
+                    "HTTP/1.1 304 Not Modified\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        .into()
+                };
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+            requests
+        });
+        let request = ObservationRequest {
+            provider: "github.repository".into(),
+            locator: "example/repo".into(),
+            fields: BTreeSet::from(["issues".into()]),
+            cursor: None,
+            previous_facts: None,
+        };
+        let first = observe_github_repository_at(request.clone(), &base, None)
+            .await
+            .unwrap();
+        let second = observe_github_repository_at(
+            ObservationRequest {
+                cursor: first.cursor.clone(),
+                previous_facts: Some(first.facts.clone()),
+                ..request
+            },
+            &base,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(second.facts, first.facts);
+        let requests = server.await.unwrap();
+        assert!(!requests[0].to_ascii_lowercase().contains("if-none-match"));
+        assert!(
+            requests[1]
+                .to_ascii_lowercase()
+                .contains("if-none-match: \"issues-v1\"")
+        );
+    }
+
+    #[test]
+    fn github_rate_limit_headers_set_the_later_retry_deadline() {
+        let now = 1_000_000_u128;
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(reqwest::header::RETRY_AFTER, "120".parse().unwrap());
+        headers.insert("x-ratelimit-reset", "1050".parse().unwrap());
+        assert_eq!(github_retry_at(&headers, now), now + 120_000);
     }
 }
