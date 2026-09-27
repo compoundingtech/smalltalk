@@ -1268,7 +1268,7 @@ mod tests {
             }
         }
 
-        let client = st3_client::Client::unix_as(&gateway_socket, "person/nathan");
+        let client = st3_client::Client::unix_as(&gateway_socket, "person/avery");
         let capabilities = client.capabilities().await.unwrap();
         let attachment = client
             .terminal_attach(

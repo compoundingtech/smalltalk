@@ -216,7 +216,7 @@ async fn serve_terminal_state(
         root,
         state,
         pty,
-        Client::unix_as(&socket, "person/nathan"),
+        Client::unix_as(&socket, "person/avery"),
         server.abort_handle(),
     )
 }
