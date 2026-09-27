@@ -3313,6 +3313,34 @@ impl Store {
             }
             _ => {}
         }
+        let mut fields = BTreeMap::from([
+            ("run".into(), Value::String(run.clone())),
+            ("placement".into(), Value::String(placement.as_str().into())),
+        ]);
+        if let Some(anchor) = anchor.as_ref() {
+            fields.insert("anchor".into(), Value::String(anchor.clone()));
+        }
+        if let Some(reason) = request.reason.as_ref().filter(|reason| !reason.is_empty()) {
+            fields.insert("reason".into(), Value::String(reason.clone()));
+        }
+        let input = ClaimInput {
+            subject: agent.clone(),
+            kind: seat_queue::MOVED_CLAIM.into(),
+            actor: Some(request.actor.clone()),
+            fields,
+            evidence: Vec::new(),
+            expected_subject: None,
+            idempotency_key: Some(request.idempotency_key.clone()),
+        };
+        // A completed run leaves the queue, but a retry still names the earlier operation.
+        // Reappend to verify the full request digest before returning its canonical claim.
+        if self
+            .operation_claim(&request.idempotency_key)
+            .map_err(internal)?
+            .is_some()
+        {
+            return self.append_claim(&input);
+        }
         let order = self.seat_run_order(&agent).map_err(internal)?;
         for queued in std::iter::once(&run).chain(anchor.as_ref()) {
             if !order.contains(queued) {
@@ -3324,25 +3352,7 @@ impl Store {
                 .with_detail("run", queued.clone()));
             }
         }
-        let mut fields = BTreeMap::from([
-            ("run".into(), Value::String(run)),
-            ("placement".into(), Value::String(placement.as_str().into())),
-        ]);
-        if let Some(anchor) = anchor {
-            fields.insert("anchor".into(), Value::String(anchor));
-        }
-        if let Some(reason) = request.reason.as_ref().filter(|reason| !reason.is_empty()) {
-            fields.insert("reason".into(), Value::String(reason.clone()));
-        }
-        self.append_claim(&ClaimInput {
-            subject: agent,
-            kind: seat_queue::MOVED_CLAIM.into(),
-            actor: Some(request.actor.clone()),
-            fields,
-            evidence: Vec::new(),
-            expected_subject: None,
-            idempotency_key: Some(request.idempotency_key.clone()),
-        })
+        self.append_claim(&input)
     }
 
     fn work_at_snapshot_internal(
