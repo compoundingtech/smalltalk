@@ -3151,6 +3151,18 @@ fn render_product_page(title: &str, page: &ClientPage, continuation_command: &st
                     "  action: st3 attention show {} --as {}",
                     item.source_id, item.person_id
                 );
+                if item.header.operational.as_ref().is_some_and(|operational| {
+                    operational
+                        .reasons
+                        .iter()
+                        .any(|reason| reason == "requester-retired")
+                }) {
+                    let _ = writeln!(
+                        output,
+                        "  requester retired: only {} can close it",
+                        item.person_id
+                    );
+                }
             }
             ClientResource::Work(item) => {
                 let _ = writeln!(
@@ -9111,6 +9123,28 @@ mod tests {
         let rendered = render_product_page("TERMINALS", &page, "st3 terminals");
         assert!(
             rendered.contains("peek: st3 terminals peek agent/release"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn attention_from_a_retired_requester_says_who_can_close_it() {
+        let mut page = fixture_product_page(&["attention"], false);
+        let before = render_product_page("NOW", &page, "st3 now");
+        assert!(!before.contains("requester retired"), "{before}");
+        let ClientResource::Attention(attention) = &mut page.items[0] else {
+            panic!("expected attention fixture");
+        };
+        attention.header.operational = Some(st3_client::Operational {
+            layer: "current".into(),
+            actionable: true,
+            reasons: vec!["requester-retired".into()],
+            owner_generation: None,
+            runtime_incarnation: None,
+        });
+        let rendered = render_product_page("NOW", &page, "st3 now");
+        assert!(
+            rendered.contains("  requester retired: only person/nathan can close it\n"),
             "{rendered}"
         );
     }
