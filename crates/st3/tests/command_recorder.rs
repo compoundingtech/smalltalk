@@ -442,7 +442,9 @@ fn a_terminal_interrupt_ends_the_call_and_is_still_recorded() {
     use std::os::fd::FromRawFd as _;
     use std::os::unix::process::CommandExt as _;
 
-    let fixture = fixture("#!/bin/sh\necho ready\nsleep 5\necho finished\n");
+    // A shell that takes the interrupt while it starts a child acts on it when that child
+    // exits, so the child sleeps briefly.
+    let fixture = fixture("#!/bin/sh\necho ready\nwhile :; do sleep 0.05; done\n");
     let (mut master, slave) = unsafe {
         let mut master = -1;
         let mut slave = -1;
@@ -456,6 +458,9 @@ fn a_terminal_interrupt_ends_the_call_and_is_still_recorded() {
             ),
             0
         );
+        // Children that other tests start at the same time must not hold this terminal open.
+        libc::fcntl(master, libc::F_SETFD, libc::FD_CLOEXEC);
+        libc::fcntl(slave, libc::F_SETFD, libc::FD_CLOEXEC);
         (fs::File::from_raw_fd(master), fs::File::from_raw_fd(slave))
     };
     let mut command = fixture.recorded("git");
@@ -465,6 +470,8 @@ fn a_terminal_interrupt_ends_the_call_and_is_still_recorded() {
         .stderr(slave.try_clone().unwrap());
     unsafe {
         command.pre_exec(|| {
+            // A shell starts a background job with SIGINT ignored; a terminal session does not.
+            libc::signal(libc::SIGINT, libc::SIG_DFL);
             if libc::setsid() == -1 || libc::ioctl(0, libc::TIOCSCTTY, 0) == -1 {
                 return Err(std::io::Error::last_os_error());
             }
@@ -497,6 +504,68 @@ fn a_terminal_interrupt_ends_the_call_and_is_still_recorded() {
     let records = fixture.records();
     assert_eq!(records.len(), 1);
     assert_eq!(records[0]["signal"], libc::SIGINT);
+}
+
+/// The recorder handles signals while it waits, but the real program starts with the caller's
+/// ignored and blocked signals, as it would without the recorder.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_real_program_keeps_the_callers_ignored_and_blocked_signals() {
+    use std::os::unix::process::CommandExt as _;
+
+    // GNU grep reads its own status without changing its signals first, as a shell would, and
+    // it ignores the `git` name it runs under.
+    let fixture = fixture("");
+    let grep = std::env::split_paths(&std::env::var_os("PATH").unwrap())
+        .map(|directory| directory.join("grep"))
+        .find(|candidate| candidate.is_file())
+        .expect("grep is on PATH");
+    fs::remove_file(fixture.real.join("git")).unwrap();
+    std::os::unix::fs::symlink(grep, fixture.real.join("git")).unwrap();
+    let run = |mut command: Command| {
+        unsafe {
+            command.pre_exec(|| {
+                libc::signal(libc::SIGHUP, libc::SIG_IGN);
+                libc::signal(libc::SIGINT, libc::SIG_IGN);
+                libc::signal(libc::SIGTERM, libc::SIG_DFL);
+                let mut blocked = std::mem::zeroed::<libc::sigset_t>();
+                libc::sigemptyset(&mut blocked);
+                libc::sigaddset(&mut blocked, libc::SIGUSR1);
+                libc::sigprocmask(libc::SIG_BLOCK, &blocked, std::ptr::null_mut());
+                Ok(())
+            });
+        }
+        command
+            .args(["^Sig", "/proc/self/status"])
+            .stdin(Stdio::null())
+            .output()
+            .unwrap()
+    };
+    let recorded = run(fixture.recorded("git"));
+    let direct = run(fixture.direct("git"));
+    let signals = |output: &Output| {
+        String::from_utf8(output.stdout.clone())
+            .unwrap()
+            .lines()
+            .filter(|line| {
+                ["SigBlk:", "SigIgn:", "SigCgt:"]
+                    .iter()
+                    .any(|name| line.starts_with(name))
+            })
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+    };
+    let text = String::from_utf8(direct.stdout.clone()).unwrap();
+    let mask = |name: &str| {
+        let line = text.lines().find(|line| line.starts_with(name)).unwrap();
+        u64::from_str_radix(line.split_whitespace().nth(1).unwrap(), 16).unwrap()
+    };
+    let bit = |signal: libc::c_int| 1_u64 << (signal - 1);
+    assert_ne!(mask("SigIgn:") & bit(libc::SIGHUP), 0);
+    assert_ne!(mask("SigIgn:") & bit(libc::SIGINT), 0);
+    assert_eq!(mask("SigIgn:") & bit(libc::SIGTERM), 0);
+    assert_ne!(mask("SigBlk:") & bit(libc::SIGUSR1), 0);
+    assert_eq!(signals(&recorded), signals(&direct));
 }
 
 /// Killing the recorder outright ends the real program, as killing the real program would have.
