@@ -10,7 +10,7 @@ concurrency:
   group: nix-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
-# Linux uses four build-graph shards so each remaining cold Rust derivation gets a
+# Linux uses five build-graph shards so each remaining cold Rust derivation gets a
 # runner instead of competing with an unrelated compile. The aggregation job
 # preserves the stable `check-x86_64-linux` status used by branch protection.
 jobs:
@@ -25,14 +25,17 @@ jobs:
           - group: package
             targets: >-
               .#checks.x86_64-linux.st2
-              .#checks.x86_64-linux.st3
-              .#checks.x86_64-linux.st3-help
-              .#checks.x86_64-linux.install-layout
               .#checks.x86_64-linux.debug-assertions
               .#checks.x86_64-linux.help
               .#checks.x86_64-linux.completions
               .#checks.x86_64-linux.hooks-replacement
               .#checks.x86_64-linux.pty-fleet-contract
+          # install-layout also needs the st2 package, so this shard builds its own st2.
+          - group: st3
+            targets: >-
+              .#checks.x86_64-linux.st3
+              .#checks.x86_64-linux.st3-help
+              .#checks.x86_64-linux.install-layout
           - group: providers
             targets: >-
               .#checks.x86_64-linux.provider-components
