@@ -50,9 +50,9 @@ use tokio::sync::{Notify, watch};
 mod presentation;
 
 use presentation::{
-    OutputStyle, follow_snapshot, mission_run_signature, render_attention_show, render_generation,
-    render_generations, render_human_value, render_mission_run, render_revision_proposal,
-    render_step_run, shell_argument,
+    OutputStyle, follow_snapshot, mission_run_signature, relative_time, render_attention_show,
+    render_generation, render_generations, render_human_value, render_mission_run,
+    render_revision_proposal, render_step_run, shell_argument,
 };
 
 #[derive(Parser)]
@@ -3397,6 +3397,22 @@ fn print_product_page(
     Ok(())
 }
 
+/// `target mission/fleet/typecase: cancelled 4h ago`
+fn attention_target_line(target: &st3_client::AttentionTargetState, now_unix_ms: u128) -> String {
+    let since = target
+        .since
+        .as_deref()
+        .and_then(|since| chrono::DateTime::parse_from_rfc3339(since).ok())
+        .map(|since| {
+            format!(
+                " {}",
+                relative_time(since.timestamp_millis().max(0) as u128, now_unix_ms)
+            )
+        })
+        .unwrap_or_default();
+    format!("target {}: {}{since}", target.id, target.state)
+}
+
 fn render_product_page(title: &str, page: &ClientPage, continuation_command: &str) -> String {
     use std::fmt::Write as _;
 
@@ -3423,6 +3439,9 @@ fn render_product_page(title: &str, page: &ClientPage, continuation_command: &st
                     "{}  attention  {}  {}  {}",
                     item.header.id, item.priority, item.state, item.title
                 );
+                for target in &item.target_states {
+                    let _ = writeln!(output, "  {}", attention_target_line(target, now_ms()));
+                }
                 let _ = writeln!(
                     output,
                     "  action: st3 attention show {} --as {}",

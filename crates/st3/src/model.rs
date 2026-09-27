@@ -1490,6 +1490,15 @@ pub struct AttentionWithdrawRequest {
     pub idempotency_key: String,
 }
 
+/// What one target of a fault is doing now, so a person can recognize a leftover request.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct AttentionTargetState {
+    pub id: String,
+    pub state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub since_unix_ms: Option<u128>,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct AttentionRequestView {
     pub subject: String,

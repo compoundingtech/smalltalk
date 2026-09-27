@@ -1160,7 +1160,7 @@ fn work_actor(step: &StepRunView) -> Option<&str> {
         .or_else(|| (step.available_to.len() == 1).then(|| step.available_to[0].as_str()))
 }
 
-fn relative_time(value: u128, now: u128) -> String {
+pub(crate) fn relative_time(value: u128, now: u128) -> String {
     let (future, delta) = if value >= now {
         (true, value - now)
     } else {

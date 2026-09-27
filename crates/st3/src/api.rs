@@ -1622,6 +1622,30 @@ fn attention_priority(severity: &str) -> &'static str {
     }
 }
 
+/// Beside each fault target, what that target is doing now, so a leftover request is
+/// recognizable without opening every target.
+fn insert_attention_target_states(
+    store: &Store,
+    resource: &mut serde_json::Map<String, Value>,
+    targets: &[String],
+) -> anyhow::Result<()> {
+    let states = store
+        .attention_target_states(targets)?
+        .into_iter()
+        .map(|state| {
+            let mut value = json!({ "id": state.id, "state": state.state });
+            if let Some(since) = state.since_unix_ms {
+                value["since"] = Value::String(client_timestamp(since));
+            }
+            value
+        })
+        .collect::<Vec<_>>();
+    if !states.is_empty() {
+        resource.insert("target_states".into(), Value::Array(states));
+    }
+    Ok(())
+}
+
 fn client_attention_resources(
     store: &Store,
     person: Option<&str>,
@@ -1676,6 +1700,9 @@ fn client_attention_resources(
         if let Some(step) = &item.step {
             object.insert("step_run_id".into(), Value::String(step.clone()));
         }
+        if item.kind == "fault" {
+            insert_attention_target_states(store, object, &item.targets)?;
+        }
         resources.insert(id, resource);
     }
     if history {
@@ -1688,9 +1715,7 @@ fn client_attention_resources(
                 reasons.push("superseded");
             }
             let id = attention_resource_id(&request.subject);
-            resources.insert(
-                id.clone(),
-                json!({
+            let mut resource = json!({
                     "id": id,
                     "kind": "attention",
                     "attention_kind": "fault",
@@ -1706,8 +1731,15 @@ fn client_attention_resources(
                     "targets": request.targets,
                     "actions": if current { client_attention_actions("fault") } else { Vec::<&str>::new() },
                     "operational": { "layer": if current { "current" } else { "history" }, "actionable": current, "reasons": reasons }
-                }),
-            );
+            });
+            insert_attention_target_states(
+                store,
+                resource
+                    .as_object_mut()
+                    .expect("an attention resource is an object"),
+                &request.targets,
+            )?;
+            resources.insert(id, resource);
         }
     }
     let mut resources = resources.into_values().collect::<Vec<_>>();
