@@ -7112,6 +7112,29 @@ async fn publish_harness_state(
     Ok(())
 }
 
+/// Mail that this pi-family session delivered into a turn and that is still unread when the seat
+/// reports idle. omp can end a turn without acting on a message that was steered into it; one live
+/// seat waited for an agreement it had already received. Such mail is delivered once more at the
+/// next idle edge. A message delivered within two seconds of that edge may still be starting a
+/// turn, so it waits for a later edge.
+fn unread_mail_reminders(
+    messages: &[st3::model::MessageView],
+    delivered_at: &BTreeMap<String, std::time::Instant>,
+    reminded: &BTreeSet<String>,
+    idle_at: std::time::Instant,
+) -> Vec<String> {
+    messages
+        .iter()
+        .filter(|message| message.status == "delivered" && !reminded.contains(&message.subject))
+        .filter(|message| {
+            delivered_at.get(&message.subject).is_some_and(|at| {
+                idle_at.saturating_duration_since(*at) >= std::time::Duration::from_secs(2)
+            })
+        })
+        .map(|message| message.subject.clone())
+        .collect()
+}
+
 /// One pi-family message frame. The content is the shared st3 envelope that Codex and Claude also
 /// receive, steered into a running turn at its next tool boundary. omp backgrounds an in-flight
 /// shell or eval call when a steer arrives, and one live omp seat then repeated a send whose
@@ -7188,6 +7211,9 @@ async fn run_pi_channel(client: &Client, subject: &str, driver: &str) -> Result<
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut delivered = BTreeSet::new();
+    let mut delivered_at = BTreeMap::<String, std::time::Instant>::new();
+    let mut reminded = BTreeSet::new();
+    let mut idle_edge = None;
     let mut work_interval = tokio::time::interval(std::time::Duration::from_secs(1));
     work_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut renewed_minute = None;
@@ -7206,6 +7232,7 @@ async fn run_pi_channel(client: &Client, subject: &str, driver: &str) -> Result<
                             "idle" => "idle",
                             _ => continue,
                         };
+                        idle_edge = (status == "idle").then(std::time::Instant::now);
                         frame_sequence = frame_sequence.saturating_add(1);
                         let _: ClaimRecord = client.post("/v1/claims", &ClaimInput {
                             subject: subject.into(),
@@ -7236,13 +7263,26 @@ async fn run_pi_channel(client: &Client, subject: &str, driver: &str) -> Result<
                 }
             }
             _ = interval.tick() => {
+                let idle_at = idle_edge.take();
                 let mut cursor = None;
                 loop {
                     let page = message_page(client, Some(subject), false, cursor.as_deref()).await?;
-                    for message in page.items.into_iter().filter(|message| matches!(message.status.as_str(), "sent" | "staged")) {
-                    if !delivered.insert(message.subject.clone()) {
+                    let reminders = idle_at
+                        .map(|idle_at| unread_mail_reminders(&page.items, &delivered_at, &reminded, idle_at))
+                        .unwrap_or_default();
+                    for message in page.items.into_iter() {
+                    let fresh = matches!(message.status.as_str(), "sent" | "staged")
+                        && delivered.insert(message.subject.clone());
+                    let reminder = reminders.contains(&message.subject);
+                    if !fresh && !reminder {
                         continue;
                     }
+                    if reminder {
+                        reminded.insert(message.subject.clone());
+                    }
+                    delivered_at
+                        .entry(message.subject.clone())
+                        .or_insert_with(std::time::Instant::now);
                     let body = message_content(client, &message).await?;
                     let frame = pi_family_message_frame(&message, &body, identity);
                     stdout.write_all(serde_json::to_string(&frame)?.as_bytes()).await?;
@@ -8242,6 +8282,44 @@ mod tests {
         assert!(
             Cli::try_parse_from(["st3", "conversations", "ls", "agent/a", "--as", "agent/b"])
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn an_idle_pi_family_seat_is_reminded_once_of_unread_mail() {
+        let message = |subject: &str, status: &str| st3::model::MessageView {
+            subject: subject.into(),
+            from: "agent/run-1/wake.codex".into(),
+            to: "agent/run-1/wake.omp".into(),
+            content: "AGREEMENT EMBER+ORBIT".into(),
+            status: status.into(),
+            title: None,
+            in_reply_to: None,
+            tags: vec![],
+            created_index: 1,
+        };
+        let start = std::time::Instant::now();
+        let idle_at = start + std::time::Duration::from_secs(10);
+        let messages = vec![
+            message("message/unread", "delivered"),
+            message("message/read", "read"),
+            message("message/just-delivered", "delivered"),
+            message("message/other-session", "delivered"),
+            message("message/already-reminded", "delivered"),
+        ];
+        let delivered_at = BTreeMap::from([
+            ("message/unread".to_owned(), start),
+            ("message/read".to_owned(), start),
+            (
+                "message/just-delivered".to_owned(),
+                idle_at - std::time::Duration::from_secs(1),
+            ),
+            ("message/already-reminded".to_owned(), start),
+        ]);
+        let reminded = BTreeSet::from(["message/already-reminded".to_owned()]);
+        assert_eq!(
+            unread_mail_reminders(&messages, &delivered_at, &reminded, idle_at),
+            vec!["message/unread".to_owned()]
         );
     }
 
