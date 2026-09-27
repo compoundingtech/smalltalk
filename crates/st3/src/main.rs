@@ -321,8 +321,8 @@ struct MissionRunStartArgs {
     inputs: Vec<(String, String)>,
     #[arg(long)]
     follow: bool,
-    #[arg(long = "as")]
-    actor: Option<String>,
+    #[arg(long = "as", value_parser = parse_publication_actor)]
+    actor: String,
     /// Print the exact mission-run KDL without publishing it.
     #[arg(long)]
     print_kdl: bool,
@@ -1429,6 +1429,9 @@ async fn main() -> ExitCode {
 }
 
 async fn run(cli: Cli) -> Result<()> {
+    let own = std::env::var("ST_AGENT").ok();
+    let mission_run = std::env::var("ST_MISSION_RUN").ok();
+    guard_mutating_cli_actor(&cli.command, own.as_deref(), mission_run.as_deref())?;
     if let Command::Up(args) = cli.command {
         return run_up(args).await;
     }
@@ -1537,6 +1540,84 @@ async fn run(cli: Cli) -> Result<()> {
         }
         Command::Driver(args) => run_driver(&client, args, cli.catalog.as_deref()).await,
     }
+}
+
+/// Guard every explicit actor on commands that change graph state before any request is sent.
+/// A harness may use its own agent identity, but cannot borrow a peer or person identity.
+fn guard_mutating_cli_actor(
+    command: &Command,
+    own: Option<&str>,
+    mission_run: Option<&str>,
+) -> Result<()> {
+    let Some(own) = own.filter(|own| own.starts_with("agent/")) else {
+        return Ok(());
+    };
+    let actor = match command {
+        Command::Missions { command } => match command {
+            MissionViewCommand::Publish(args) => Some(args.actor.as_str()),
+            MissionViewCommand::Start(args) => Some(args.actor.as_str()),
+            MissionViewCommand::Cancel(args) => Some(args.actor.as_str()),
+            _ => None,
+        },
+        Command::Agents { command } => match command {
+            AgentsCommand::Apply(args) => Some(args.actor.as_str()),
+            AgentsCommand::Start(args) => Some(args.actor.as_str()),
+            AgentsCommand::Stop(args) => Some(args.actor.as_str()),
+            AgentsCommand::Queue(args) => match &args.command {
+                Some(AgentQueueCommand::Move(args)) => Some(args.actor.as_deref().ok_or_else(|| {
+                    anyhow::anyhow!("a harness queue move needs explicit --as {own}; it cannot use the configured person")
+                })?),
+                None => None,
+            },
+            _ => None,
+        },
+        Command::Work { command } => match command {
+            WorkCommand::Claim(args) | WorkCommand::Renew(args) | WorkCommand::Progress(args)
+            | WorkCommand::Complete(args) | WorkCommand::Fail(args) | WorkCommand::Release(args) => args.actor.as_deref(),
+            WorkCommand::Wake(args) => args.actor.as_deref(),
+            WorkCommand::PublishMission(args) => args.actor.as_deref(),
+            WorkCommand::Revise(args) => args.actor.as_deref(),
+            WorkCommand::Revision { command } => match command {
+                WorkRevisionCommand::Approve { actor, .. } | WorkRevisionCommand::Cancel { actor, .. } => actor.as_deref(),
+                _ => None,
+            },
+            _ => None,
+        },
+        Command::Attention { command } => match command {
+            AttentionCommand::Request(args) => args.actor.as_deref(),
+            AttentionCommand::Resolve(args) => Some(args.actor.as_str()),
+            AttentionCommand::Withdraw(args) => Some(args.actor.as_str()),
+            AttentionCommand::Approve(args) | AttentionCommand::Reject(args) => Some(args.actor.as_str()),
+            _ => None,
+        },
+        Command::Launch { command } => match command {
+            LaunchCommand::Start(args) => Some(args.requester.as_str()),
+            LaunchCommand::Submit(args) => Some(args.actor.as_str()),
+            LaunchCommand::Revise(args) => Some(args.actor.as_str()),
+            LaunchCommand::Approve(args) => Some(args.actor.as_str()),
+            LaunchCommand::ApproveAndLaunch(args) => Some(args.actor.as_str()),
+            LaunchCommand::Run(args) => Some(args.actor.as_str()),
+            LaunchCommand::Question(args) => Some(args.actor.as_str()),
+            LaunchCommand::Answer(args) => Some(args.actor.as_str()),
+            LaunchCommand::Cancel(args) => Some(args.actor.as_str()),
+            LaunchCommand::Propose(args) => args.actor.as_deref(),
+            _ => None,
+        },
+        Command::Claim(args) => args.actor.as_deref(),
+        Command::Diagnostic(args) => Some(args.actor.as_str()),
+        _ => None,
+    };
+    if let Some(actor) = actor {
+        if actor.starts_with("person/") || actor == "requester" {
+            anyhow::bail!(
+                "this harness is `{own}` (ST_AGENT) and cannot act as `{actor}` on a mutating command; request a person through `st3 attention request --as \"$ST_AGENT\"`"
+            );
+        }
+        if let Some(message) = foreign_agent_actor(actor, Some(own), mission_run) {
+            anyhow::bail!(message);
+        }
+    }
+    Ok(())
 }
 
 fn run_claude_channel(command: ClaudeChannelCommand) -> Result<()> {
@@ -1691,7 +1772,7 @@ async fn run_up(args: UpArgs) -> Result<()> {
     let local_socket = config.socket.clone();
     let client_gateway_socket = config.client_gateway_socket.clone();
     tokio::try_join!(
-        serve_unix(&local_socket, router(state.clone())),
+        st3::api::serve_unix_bound(&local_socket, router(state.clone())),
         serve_unix(&client_gateway_socket, fabric_router(state)),
     )?;
     Ok(())
@@ -2235,7 +2316,7 @@ async fn start_mission_run(
         .canonicalize()
         .with_context(|| format!("resolve workspace {}", args.workspace.display()))?;
     let inputs = unique_pairs(args.inputs, "input")?;
-    let actor = args.actor.unwrap_or_else(|| "person/requester".into());
+    let actor = args.actor;
     let requester = normalize_requester_subject(&actor);
     let kdl = mission_run_intent(
         run_id,
@@ -2867,6 +2948,9 @@ fn trace_scalar(value: &Value) -> String {
 
 async fn run_wait(client: &Client, args: WaitArgs, json_output: bool) -> Result<()> {
     validate_wait_condition(&args.condition)?;
+    if let Some(actor) = args.actor.as_deref() {
+        reject_foreign_agent_actor(actor)?;
+    }
     let timeout = parse_timeout(&args.timeout)?;
     let actor = args.actor.as_deref().map(normalize_agent_subject);
     let wait = wait_for_condition(client, &args.subject, &args.condition, actor.as_deref());
@@ -5083,7 +5167,7 @@ fn foreign_agent_actor(
     } else {
         normalize_message_subject_in_run(actor, mission_run)
     };
-    (actor != own).then(|| {
+    (actor.starts_with("agent/") && actor != own).then(|| {
         format!(
             "this harness is `{own}` (ST_AGENT) and cannot act as `{actor}`; use `--as \"$ST_AGENT\"` or `--from \"$ST_AGENT\"`"
         )
@@ -5418,6 +5502,9 @@ async fn run_work(
             cursor,
             limit,
         } => {
+            if let Some(actor) = actor.as_deref() {
+                reject_foreign_agent_actor(actor)?;
+            }
             anyhow::ensure!(
                 limit > 0 && limit <= 200,
                 "the work limit must be 1 through 200"
@@ -5932,6 +6019,7 @@ async fn run_message(
                 args.identity.or(args.actor),
                 std::env::var("ST_AGENT").ok(),
             )?;
+            reject_foreign_agent_actor(&identity)?;
             let sender = args.sender.map(|sender| normalize_message_subject(&sender));
             let mut count = 0_u64;
             let mut first = true;
@@ -8743,11 +8831,82 @@ mod tests {
         assert!(foreign_agent_actor("wake.omp-2", own, run).is_none());
         // Non-agent actors and processes without a seat identity are not seat impersonation.
         assert!(foreign_agent_actor("person/eval-requester", own, run).is_none());
+        assert!(foreign_agent_actor("requester", own, run).is_none());
         assert!(foreign_agent_actor("exec/run-1/controller", own, run).is_none());
         assert!(foreign_agent_actor("agent/run-1/wake.codex", None, run).is_none());
         assert!(
             foreign_agent_actor("agent/run-1/wake.codex", Some("person/operator"), run).is_none()
         );
+    }
+
+    #[test]
+    fn mission_start_requires_an_explicit_actor() {
+        assert!(Cli::try_parse_from(["st3", "missions", "start", "mission/demo"]).is_err());
+    }
+
+    #[test]
+    fn a_harness_cannot_mutate_as_a_peer_or_person() {
+        let cases: &[&[&str]] = &[
+            &[
+                "st3",
+                "missions",
+                "publish",
+                "mission.kdl",
+                "--as",
+                "agent/peer",
+            ],
+            &[
+                "st3",
+                "missions",
+                "start",
+                "mission/demo",
+                "--as",
+                "person/operator",
+            ],
+            &[
+                "st3",
+                "agents",
+                "queue",
+                "move",
+                "agent/worker",
+                "mission-run/demo/one",
+                "--top",
+                "--as",
+                "agent/peer",
+            ],
+            &[
+                "st3",
+                "work",
+                "revision",
+                "approve",
+                "revision-proposal/x",
+                "hash",
+                "--as",
+                "person/operator",
+            ],
+            &["st3", "work", "wake", "step-run/x/y", "--as", "agent/peer"],
+            &[
+                "st3",
+                "diagnostic",
+                "--as",
+                "person/operator",
+                "--code",
+                "test",
+                "--reason",
+                "test",
+            ],
+        ];
+        for arguments in cases {
+            let cli = Cli::try_parse_from(*arguments).unwrap();
+            assert!(
+                guard_mutating_cli_actor(&cli.command, Some("agent/own"), None).is_err(),
+                "accepted {arguments:?}"
+            );
+        }
+        let own = Cli::try_parse_from(["st3", "work", "wake", "step-run/x/y", "--as", "agent/own"])
+            .unwrap();
+        assert!(guard_mutating_cli_actor(&own.command, Some("agent/own"), None).is_ok());
+        assert!(guard_mutating_cli_actor(&own.command, None, None).is_ok());
     }
 
     #[test]
@@ -9792,7 +9951,7 @@ mod tests {
         };
         assert_eq!(args.mission, "release/demo");
         assert_eq!(args.id.as_deref(), Some("release/demo/test"));
-        assert_eq!(args.actor.as_deref(), Some("agent/operator"));
+        assert_eq!(args.actor, "agent/operator");
     }
 
     #[test]

@@ -2710,6 +2710,16 @@ where
 }
 
 pub async fn serve_unix(socket: &Path, app: Router) -> anyhow::Result<()> {
+    serve_unix_inner(socket, app, false).await
+}
+
+/// The local daemon binds a Unix peer to the harness identity inherited by that peer or one of
+/// its parents. Test servers and the paired gateway use the ordinary unbound listener.
+pub async fn serve_unix_bound(socket: &Path, app: Router) -> anyhow::Result<()> {
+    serve_unix_inner(socket, app, true).await
+}
+
+async fn serve_unix_inner(socket: &Path, app: Router, bind_harness: bool) -> anyhow::Result<()> {
     if let Some(parent) = socket.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -2722,11 +2732,31 @@ pub async fn serve_unix(socket: &Path, app: Router) -> anyhow::Result<()> {
     fs::set_permissions(socket, fs::Permissions::from_mode(0o600))?;
     loop {
         let (stream, _) = listener.accept().await?;
+        let bound_agent = if bind_harness {
+            stream
+                .peer_cred()
+                .ok()
+                .and_then(|cred| cred.pid())
+                .and_then(|pid| u32::try_from(pid).ok())
+                .and_then(harness_ancestor)
+        } else {
+            None
+        };
         let app = app.clone();
         tokio::spawn(async move {
             let service = hyper::service::service_fn(move |request: Request<Incoming>| {
                 let app = app.clone();
-                async move { app.oneshot(request.map(Body::new)).await }
+                let bound_agent = bound_agent.clone();
+                async move {
+                    let request = request.map(Body::new);
+                    let request = match guard_bound_request(request, bound_agent.as_deref()).await {
+                        Ok(request) => request,
+                        Err(error) => {
+                            return Ok::<_, std::convert::Infallible>(error.into_response());
+                        }
+                    };
+                    app.oneshot(request).await
+                }
             });
             let _ = http1::Builder::new()
                 .serve_connection(TokioIo::new(stream), service)
@@ -2734,6 +2764,83 @@ pub async fn serve_unix(socket: &Path, app: Router) -> anyhow::Result<()> {
                 .await;
         });
     }
+}
+
+#[cfg(target_os = "linux")]
+fn harness_ancestor(mut pid: u32) -> Option<String> {
+    use std::collections::BTreeSet;
+    let mut seen = BTreeSet::new();
+    while pid > 1 && pid != std::process::id() && seen.insert(pid) {
+        let environment = fs::read(format!("/proc/{pid}/environ")).ok()?;
+        if let Some(agent) = environment.split(|byte| *byte == 0).find_map(|entry| {
+            std::str::from_utf8(entry)
+                .ok()?
+                .strip_prefix("ST_AGENT=")
+                .filter(|value| value.starts_with("agent/"))
+                .map(str::to_owned)
+        }) {
+            return Some(agent);
+        }
+        let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        pid = stat
+            .rsplit_once(") ")?
+            .1
+            .split_whitespace()
+            .nth(1)?
+            .parse()
+            .ok()?;
+    }
+    None
+}
+
+#[cfg(not(target_os = "linux"))]
+fn harness_ancestor(_pid: u32) -> Option<String> {
+    None
+}
+
+async fn guard_bound_request(
+    request: Request<Body>,
+    bound_agent: Option<&str>,
+) -> Result<Request<Body>, ApiError> {
+    let Some(bound_agent) = bound_agent else {
+        return Ok(request);
+    };
+    if request.method() == axum::http::Method::GET {
+        return Ok(request);
+    }
+    let path = request.uri().path();
+    if ![
+        "/v1/intent/apply",
+        "/v1/agent-queue-moves",
+        "/v1/work/",
+        "/v1/attention",
+        "/v1/launches",
+        "/v1/mission-runs/start",
+        "/v1/claims",
+        "/v1/diagnostic",
+    ]
+    .iter()
+    .any(|prefix| path.starts_with(prefix))
+    {
+        return Ok(request);
+    }
+    let (parts, body) = request.into_parts();
+    let bytes = axum::body::to_bytes(body, 16 * 1024 * 1024)
+        .await
+        .map_err(ApiError::internal)?;
+    if let Ok(value) = serde_json::from_slice::<Value>(&bytes) {
+        for key in ["actor", "requester"] {
+            if let Some(actor) = value.get(key).and_then(Value::as_str)
+                && actor != bound_agent
+            {
+                return Err(ApiError::bad(St3Error::new(
+                    "foreign-agent-actor",
+                    format!("this harness is `{bound_agent}` and cannot act as `{actor}`"),
+                )));
+            }
+        }
+    }
+    Ok(Request::from_parts(parts, Body::from(bytes)))
 }
 
 pub async fn serve_tcp(address: &str, app: Router) -> anyhow::Result<()> {
@@ -4891,6 +4998,23 @@ async fn apply(
     }
     for declaration in intent.mission_runs.values() {
         if let Some(creation) = &declaration.creation {
+            if creation.requester == "person/requester" {
+                return Err(ApiError::bad(St3Error::new(
+                    "placeholder-run-requester",
+                    "a mission run needs a concrete requester, not `person/requester`",
+                )));
+            }
+            if let Some(agent) = normalized_agent_actor(actor)
+                && creation.requester != agent
+            {
+                return Err(ApiError::bad(St3Error::new(
+                    "run-requester-actor-mismatch",
+                    format!(
+                        "`{actor}` cannot create a run for requester `{}`",
+                        creation.requester
+                    ),
+                )));
+            }
             require_agent_mission_authority(&state, actor, "start", &creation.mission)?;
         }
         for revision in declaration.revisions.values() {
@@ -6165,7 +6289,18 @@ async fn start_mission_run_action(
     State(state): State<AppState>,
     Json(request): Json<MissionRunRequest>,
 ) -> Result<Json<MissionRunView>, ApiError> {
-    let requester = request.requester.as_deref().unwrap_or("person/requester");
+    let requester = request.requester.as_deref().ok_or_else(|| {
+        ApiError::bad(St3Error::new(
+            "missing-run-requester",
+            "a mission run needs an explicit requester",
+        ))
+    })?;
+    if requester == "person/requester" {
+        return Err(ApiError::bad(St3Error::new(
+            "placeholder-run-requester",
+            "a mission run needs a concrete requester, not `person/requester`",
+        )));
+    }
     require_agent_mission_authority(&state, requester, "start", &request.mission)?;
     let response = state
         .store
@@ -8001,6 +8136,85 @@ mod tests {
     use axum::body::to_bytes;
     use axum::http::Request;
     use std::path::PathBuf;
+
+    #[tokio::test]
+    async fn a_bound_harness_cannot_post_a_queue_move_as_another_actor() {
+        for path in [
+            "/v1/agent-queue-moves",
+            "/v1/work/revision/approve/proposal",
+        ] {
+            for actor in ["agent/peer", "person/operator"] {
+                let request = Request::builder()
+                    .method("POST")
+                    .uri(path)
+                    .body(Body::from(
+                        json!({"actor": actor, "agent": "agent/worker"}).to_string(),
+                    ))
+                    .unwrap();
+                let error = match guard_bound_request(request, Some("agent/own")).await {
+                    Ok(_) => panic!("bound harness acted as {actor} at {path}"),
+                    Err(error) => error,
+                };
+                assert_eq!(error.code, "foreign-agent-actor");
+            }
+        }
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/agent-queue-moves")
+            .body(Body::from(json!({"actor": "agent/own"}).to_string()))
+            .unwrap();
+        assert!(
+            guard_bound_request(request, Some("agent/own"))
+                .await
+                .is_ok()
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_unix_peer_is_bound_to_its_harness_environment() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("10")
+            .env("ST_AGENT", "agent/fixture/worker")
+            .spawn()
+            .unwrap();
+        let mut bound = None;
+        for _ in 0..50 {
+            bound = harness_ancestor(child.id());
+            if bound.is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(bound.as_deref(), Some("agent/fixture/worker"));
+        child.kill().unwrap();
+        child.wait().unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_run_start_api_refuses_placeholder_requesters() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        for requester in [None, Some("person/requester".to_owned())] {
+            let request = MissionRunRequest {
+                mission: "demo".into(),
+                revision: None,
+                workspace: root.path().display().to_string(),
+                requester,
+                mode: Some("run".into()),
+                inputs: BTreeMap::new(),
+                idempotency_key: "placeholder-run".into(),
+            };
+            let error = match start_mission_run_action(State(state.clone()), Json(request)).await {
+                Ok(_) => panic!("placeholder requester created a run"),
+                Err(error) => error,
+            };
+            assert!(matches!(
+                error.code.as_str(),
+                "missing-run-requester" | "placeholder-run-requester"
+            ));
+        }
+    }
 
     #[test]
     fn owner_cursor_expiry_remains_a_typed_retryable_gateway_error() {

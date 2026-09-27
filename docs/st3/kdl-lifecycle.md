@@ -219,7 +219,11 @@ Use `st3 missions publish FILE --as ACTOR` for exact authored KDL. Agent actors 
 authority in their current desired declaration; a candidate definition cannot grant authority to
 its own publisher. Explicit person actors remain the trusted local-operator boundary.
 
-Persons and internal system actions are unchanged. The identity check assumes a trusted local runtime because `--as` can name another actor.
+Mission starts require an explicit `--as`; the placeholder `person/requester` is not a valid run
+requester. A harness with `ST_AGENT` can mutate only as its own seat. On Linux, the local Unix API
+also binds a connection from a harness process or its descendants to that seat and refuses a
+different actor in mutation requests. Persons and internal system actions remain on the trusted
+local runtime boundary.
 
 ### Runtime reset
 
