@@ -6,11 +6,13 @@ memory numbers do and do not measure.
 
 ## Verdict
 
-**Yes, with the soak below still running.** The overnight rise in wakeups is not seat queue work.
-It is mailbox reads waiting on each other inside SQLite, which base does in the same way, and its
-rate follows the timing of the synthetic traffic, which the old generator did not control (series
-5). With that timing fixed, the branch head matches base so far (series 6). The one memory
-difference left is freed startup heap under glibc, not live data.
+**Yes on wakeups and memory; a small idle CPU cost remains.** The overnight rise in wakeups was not
+seat queue work. It was mailbox reads waiting on each other inside SQLite, which base does the
+same way, and its rate followed the timing of the old synthetic traffic (series 5). With that
+timing fixed, the branch head ran 158 minutes beside base with the same switches, threads, and
+memory, and 1.5% more CPU: 0.695 against 0.685 s a minute, about 0.6 s an hour (series 6). A
+reconcile after each write costing about 1 ms more explains half or more of that. Merge if that
+cost is acceptable; if not, the branch's additions to the reconcile loop are where to look.
 
 - **For merging:** the seat queue works with live agents. 16 of the 18 runs last night on Claude,
   Codex and omp seats passed. One Claude seat never reached idle before any work existed. One omp
@@ -20,13 +22,13 @@ difference left is freed startup heap under glibc, not live data.
   branch head both switch about 19,000 times a minute and use 0.89 to 0.90 s of CPU a minute.
   No blocking switch passed through seat queue code. At equal switch rates, the overnight builds
   used the same CPU.
-- **The branch head, with drift-free traffic:** in the first 30 measured minutes it used
-  0.732 s of CPU a minute against 0.724 on base, and switched 5,996 times a minute against 5,999,
-  with 19 to 20 threads on each. The run continues to 11:20Z, 90 minutes past the point where the
-  overnight branch rose.
+- **The branch head, with drift-free traffic, for 158 minutes:** 6,002 switches a minute
+  against 5,999, 19 to 20 threads on both, and no rise after the hour. CPU was 0.695 against
+  0.685 s a minute, higher in 14 of 15 ten-minute blocks.
 - **Memory:** both builds hold 38.1 MiB of live heap. Under glibc the branch settles 33 MiB
-  higher in most starts, all of it freed startup heap. Overnight, resident memory grew 11 to
-  13 MiB an hour on both builds; that is not the branch's.
+  higher in most starts, all of it freed startup heap; in the drift-free run it ended 9 MiB
+  lower. Resident memory grew 9 to 13 MiB an hour on both builds, overnight and in that run;
+  that is not the branch's.
 - **The rise is in the traffic, not the daemon.** A rerun of the overnight binaries with the old
   generator began the same rise on the branch at minute 140, all of it on blocking threads.
   Restarting only the generator, against the same daemon, took the branch back to base's rate
@@ -44,6 +46,8 @@ difference left is freed startup heap under glibc, not live data.
   After it, idle CPU is 0.357 against 0.354 s/min with read-only traffic and 0.622 against
   0.623 s/min with writes. A reconcile after one write costs 43.7 to 44.3 ms of CPU against 43.3
   to 44.4 ms on base.
+- **The branch head uses about 1.5% more idle CPU over 158 minutes.** With six writes a minute
+  and drift-free traffic it used 0.695 against 0.685 s/min (series 6).
 - **Live memory is the same.** Both builds hold 38.1 MiB of heap in use after startup.
 - **Resident memory under glibc is higher in most starts.** The fixed branch settled 33 MiB
   (about 6%) above base in 18 of 26 starts, and base never did (0 of 28). The extra is freed
@@ -381,7 +385,7 @@ Over the 30 measured minutes, base used 0.898 s of CPU a minute and switched 19,
 the branch 0.890 s and 19,535 times. The probes after the window matched: a claim write and the
 reconcile it wakes cost 44.2 ms of CPU on base and 45.0 ms on the branch.
 
-With the seats spread, as in series 6, both read about 6,000 switches and 0.73 s of CPU a
+With the seats spread, as in series 6, both read about 6,000 switches and 0.69 s of CPU a
 minute. In step, base and the branch moved together.
 
 **The extra switches are blocking threads waiting in the mailbox read.** Per-thread counts from
@@ -637,7 +641,7 @@ Over the 30 measured minutes, base used 0.898 s of CPU a minute and switched 19,
 the branch 0.890 s and 19,535 times. The probes after the window matched: a claim write and the
 reconcile it wakes cost 44.2 ms of CPU on base and 45.0 ms on the branch.
 
-With the seats spread, as in series 6, both read about 6,000 switches and 0.73 s of CPU a
+With the seats spread, as in series 6, both read about 6,000 switches and 0.69 s of CPU a
 minute. In step, base and the branch moved together.
 
 **The extra switches are blocking threads waiting in the mailbox read.** Per-thread counts from
@@ -705,10 +709,41 @@ point. Each row covers ten minutes. Threads are the fewest and most seen in any 
 | 6–15 | 7.3 | 7.4 | 6,015 | 6,011 | 19 / 19 | 591.5 | 588.1 |
 | 16–25 | 7.5 | 7.5 | 5,980 | 5,974 | 19 / 19 | 597.8 | 595.1 |
 | 26–35 | 7.0 | 7.1 | 6,001 | 6,002 | 19–20 / 19 | 599.1 | 595.3 |
+| 36–45 | 7.1 | 7.2 | 6,034 | 6,040 | 20 / 20 | 603.8 | 596.7 |
+| 46–55 | 6.7 | 6.8 | 5,993 | 6,007 | 20 / 20 | 608.3 | 602.9 |
+| 56–65 | 6.6 | 6.7 | 6,012 | 6,024 | 20 / 20 | 608.8 | 603.2 |
+| 66–75 | 6.5 | 6.6 | 5,985 | 5,989 | 20 / 20 | 611.7 | 603.5 |
+| 76–85 | 6.7 | 6.8 | 6,027 | 6,029 | 20 / 20 | 611.9 | 603.7 |
+| 86–95 | 7.0 | 7.2 | 5,960 | 5,958 | 20 / 20 | 612.6 | 605.7 |
+| 96–105 | 6.8 | 6.9 | 6,010 | 6,009 | 20 / 20 | 613.0 | 605.9 |
+| 106–115 | 7.0 | 7.1 | 6,037 | 6,038 | 20 / 20 | 613.5 | 606.3 |
+| 116–125 | 7.1 | 7.2 | 5,958 | 5,969 | 20 / 20 | 616.0 | 608.3 |
+| 126–135 | 6.8 | 6.9 | 6,007 | 6,014 | 20 / 20 | 618.2 | 609.7 |
+| 136–145 | 6.5 | 6.6 | 5,985 | 5,990 | 20 / 20 | 618.8 | 610.0 |
+| 146–155 | 6.4 | 6.5 | 5,979 | 5,983 | 20 / 20 | 619.5 | 610.3 |
 
-This run is still going. At minute 35, base and the branch head had used 0.724 and 0.732 s of
-CPU a minute and switched 5,999 and 5,996 times a minute, with 19 to 20 threads each. This
-section and the verdict get the full run when it ends.
+Over all 158 measured minutes:
+
+| Build | CPU s/min mean (sd, max) | Voluntary switches/min | Threads | RSS MiB, minute 6 / end |
+| --- | ---: | ---: | ---: | ---: |
+| base | 0.685 (0.050, 0.87) | 5,999 | 19 to 20 | 590.4 / 619.5 |
+| branch head | 0.695 (0.049, 0.88) | 6,002 | 19 to 20 | 587.6 / 610.3 |
+
+**No rise on either build.** Switches stayed within 60 of 6,000 a minute on both in every
+ten-minute block, from before the hour at which the overnight branch rose to 95 minutes after
+it. Threads stayed at 19 or 20 on both.
+
+**The branch used about 1.5% more CPU.** Minute by minute, the branch used 10.5 ms more CPU a
+minute than base (standard error 0.8 ms), and it was higher in 14 of the 15 blocks and equal in
+the other. That is about 0.6 s an hour. The probes point to part of it: a claim write and the
+reconcile it wakes cost 44.6 ms of CPU on the branch against 43.6 ms on base here, and 0.8 to
+1.3 ms more on the branch in each of the last three side-by-side runs. At six writes a minute
+that is 5 to 8 ms a minute. The rest is not attributed. It may not all be code: with seats in
+step, the branch used 0.9% less CPU than base, and in series 2 the fixed branch matched base.
+
+**Memory stayed level with base.** Resident memory grew about 12 MiB an hour on base and 9 on
+the branch, as both did overnight, and the branch ended 9 MiB lower. The other probes matched: the
+roster read, one seat's work list and mailbox page, and the quiet daemon.
 
 Evidence: `target/seat-queue-wakeups/` in the builder's worktree holds, for each run, the minute
 samples, per-thread samples every 15 seconds, the probes, and the perf and bpftrace captures.
