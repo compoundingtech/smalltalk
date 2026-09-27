@@ -2951,24 +2951,25 @@ fn render_now_page(page: &ClientPage, continuation_command: &str) -> String {
                     || matches!(agent.state.as_str(), "failed" | "waiting" | "stopped"))
             && !matches!(item, ClientResource::Runtime(runtime) if runtime.state != "running")
     });
+    working.page.next_cursor = None;
     let mut output = String::new();
     output.push_str(&render_product_page(
         "NEEDS YOU",
         &needs_you,
         continuation_command,
     ));
-    output.push('\n');
-    output.push_str(&render_product_page(
-        "WORKING",
-        &working,
-        continuation_command,
-    ));
-    output.push('\n');
-    output.push_str(&render_product_page(
-        "UNHEALTHY",
-        &unhealthy,
-        continuation_command,
-    ));
+    // The server fills Now with attention, and adds work only for an explicit work
+    // filter. Print a section only when the page holds its items, so a section the
+    // server never filled does not read as zero.
+    for (title, section) in [("WORKING", &working), ("UNHEALTHY", &unhealthy)] {
+        if !section.items.is_empty() {
+            output.push('\n');
+            output.push_str(&render_product_page(title, section, continuation_command));
+        }
+    }
+    if working.items.is_empty() && unhealthy.items.is_empty() {
+        output.push_str("\nWork: st3 work ls · Health: st3 doctor\n");
+    }
     if let Some(cursor) = page.page.next_cursor.as_deref() {
         use std::fmt::Write as _;
         let _ = writeln!(
@@ -9174,6 +9175,32 @@ mod tests {
                 "  recovery: st3 doctor\n",
             )
         );
+    }
+
+    #[test]
+    fn now_page_without_work_does_not_claim_zero_working() {
+        let attention_only = render_now_page(
+            &fixture_product_page(&["attention"], false),
+            "st3 now --as person/nathan",
+        );
+        assert!(
+            attention_only.starts_with("NEEDS YOU  1\n"),
+            "{attention_only}"
+        );
+        assert!(!attention_only.contains("WORKING"), "{attention_only}");
+        assert!(!attention_only.contains("UNHEALTHY"), "{attention_only}");
+        assert!(
+            attention_only.ends_with("\nWork: st3 work ls · Health: st3 doctor\n"),
+            "{attention_only}"
+        );
+
+        let with_work = render_now_page(
+            &fixture_product_page(&["attention", "work"], false),
+            "st3 now --as person/nathan --owner-run mission-run/release/1",
+        );
+        assert!(with_work.contains("\nWORKING  1\n"), "{with_work}");
+        assert!(!with_work.contains("UNHEALTHY"), "{with_work}");
+        assert!(!with_work.contains("Work: st3 work ls"), "{with_work}");
     }
 
     #[test]
