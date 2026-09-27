@@ -24843,7 +24843,10 @@ mission "summaries" state="ready" {
             "progress_at_unix_ms",
             "completion_summary",
         ] {
-            assert!(fresh.get(field).is_none(), "{field} is absent until reported");
+            assert!(
+                fresh.get(field).is_none(),
+                "{field} is absent until reported"
+            );
         }
         for (key, summary) in [
             ("progress-1", Some("Reading the renderer")),
@@ -24860,7 +24863,11 @@ mission "summaries" state="ready" {
         assert_eq!(working.completion_summary, None);
 
         store
-            .work_action(subject, "complete", &request("complete-1", Some("Opened the pull request")))
+            .work_action(
+                subject,
+                "complete",
+                &request("complete-1", Some("Opened the pull request")),
+            )
             .unwrap();
         let shown = store.mission_run(&run.subject).unwrap().unwrap();
         let submitted = &shown.steps[0];
@@ -24877,7 +24884,10 @@ mission "summaries" state="ready" {
         store.retry_step(subject, "retry attempt 2", 0).unwrap();
         let retried = store.step_run(subject).unwrap().unwrap();
         assert_eq!(retried.attempt, 2);
-        assert_eq!(retried.progress_summary, None, "attempt 1 progress is stale");
+        assert_eq!(
+            retried.progress_summary, None,
+            "attempt 1 progress is stale"
+        );
         assert_eq!(retried.completion_summary, None);
     }
 

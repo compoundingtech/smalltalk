@@ -4597,10 +4597,7 @@ async fn run_agent_inspection(
             for work in &agent.current_work_ids {
                 // The card stays useful when one step cannot be read.
                 if let Ok(step) = client
-                    .get::<StepRunView>(&format!(
-                        "/v1/work-items/{}",
-                        urlencoding::encode(work)
-                    ))
+                    .get::<StepRunView>(&format!("/v1/work-items/{}", urlencoding::encode(work)))
                     .await
                 {
                     current.push(step);
@@ -8711,7 +8708,11 @@ mod tests {
             StepRunView {
                 status: "verifying".into(),
                 completion_summary: Some("Published the guide".into()),
-                ..step("step-run/two/docs", "Write the guide", Some(("Drafting", 0)))
+                ..step(
+                    "step-run/two/docs",
+                    "Write the guide",
+                    Some(("Drafting", 0)),
+                )
             },
         ];
 

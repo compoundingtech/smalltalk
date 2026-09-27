@@ -1069,10 +1069,25 @@ mission "reported-work" state="ready" {
     };
     for (subject, action, key, summary) in [
         (&docs.subject, "claim", "docs-claim", "Starting the docs"),
-        (&docs.subject, "progress", "docs-progress", "Drafting the guide"),
-        (&docs.subject, "complete", "docs-complete", "Published the guide"),
+        (
+            &docs.subject,
+            "progress",
+            "docs-progress",
+            "Drafting the guide",
+        ),
+        (
+            &docs.subject,
+            "complete",
+            "docs-complete",
+            "Published the guide",
+        ),
         (&build.subject, "claim", "build-claim", "Starting the build"),
-        (&build.subject, "progress", "build-progress", "Tests pass; opening the pull request"),
+        (
+            &build.subject,
+            "progress",
+            "build-progress",
+            "Tests pass; opening the pull request",
+        ),
     ] {
         if action == "claim" {
             store.set_step_state(subject, "ready", None).unwrap();
@@ -1132,7 +1147,10 @@ mission "reported-work" state="ready" {
         mission.contains("  progress: Tests pass; opening the pull request\n"),
         "{mission}"
     );
-    assert!(mission.contains("  done: Published the guide\n"), "{mission}");
+    assert!(
+        mission.contains("  done: Published the guide\n"),
+        "{mission}"
+    );
     assert!(!mission.contains("Drafting the guide"), "{mission}");
 
     let json = value(&run_cli(&socket, &["missions", "show", &run.subject]).await);
@@ -1144,7 +1162,10 @@ mission "reported-work" state="ready" {
     );
     assert!(reported("build")["progress_at_unix_ms"].is_u64());
     assert!(reported("build").get("completion_summary").is_none());
-    assert_eq!(reported("docs")["completion_summary"], "Published the guide");
+    assert_eq!(
+        reported("docs")["completion_summary"],
+        "Published the guide"
+    );
 
     server.abort();
 }

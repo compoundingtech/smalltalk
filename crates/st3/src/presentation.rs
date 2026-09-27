@@ -1550,8 +1550,8 @@ mod tests {
         let mut completed = reported.clone();
         completed.steps[0].completion_summary = Some("Done".into());
 
-        let signatures = [first, reported, completed]
-            .map(|run| mission_run_signature(&[run]).unwrap());
+        let signatures =
+            [first, reported, completed].map(|run| mission_run_signature(&[run]).unwrap());
         assert_ne!(signatures[0], signatures[1]);
         assert_ne!(signatures[1], signatures[2]);
     }
