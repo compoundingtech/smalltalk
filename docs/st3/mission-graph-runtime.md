@@ -1273,6 +1273,8 @@ An authorized agent uses `st3 work publish-mission`, fenced to its claimed produ
 
 `st3 missions start MISSION --as ACTOR` publishes one mission-run declaration for the current ready revision. Add `--follow` to follow the run until it becomes terminal.
 
+`missions publish` prints each revision it created. Pass that value to `missions start --revision REVISION` to start exactly that revision. A mission published on another host reaches this host by replication. When the mission or the requested revision is not here yet, `start` waits up to 60 seconds with a plain message instead of failing. When a later revision already replaced the requested one, `start` names the replacement and stops. After a run starts, `start` names its revision on standard error and says whether other revisions share the mission name.
+
 `st3 missions show MISSION_RUN` reads one exact run. `st3 missions show MISSION` works only when that mission has exactly one nonterminal run.
 
 The default mission view shows the complete run summary and its active graph branch. Add `--follow` to watch an existing run.

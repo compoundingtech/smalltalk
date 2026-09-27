@@ -307,6 +307,10 @@ struct MissionPublishArgs {
 #[derive(Args)]
 struct MissionRunStartArgs {
     mission: String,
+    /// Start exactly this published revision, as printed by `missions publish`. A revision
+    /// published on another host is awaited briefly while it replicates here.
+    #[arg(long)]
+    revision: Option<String>,
     #[arg(long)]
     id: Option<String>,
     #[arg(long, default_value = ".")]
@@ -2145,7 +2149,14 @@ async fn publish_mission_file(
             },
         )
         .await?;
-    print_value(&response, json_output)
+    // Name each exact revision so `missions start --revision` can require it on any host.
+    let mut value = serde_json::to_value(&response)?;
+    value["published_missions"] = mission
+        .mission_revisions
+        .iter()
+        .map(|(subject, revision)| json!({"subject": subject, "revision": revision}))
+        .collect();
+    print_value(&value, json_output)
 }
 
 async fn cancel_mission_run(
@@ -2198,9 +2209,13 @@ async fn start_mission_run(
         .mission
         .strip_prefix("mission/")
         .unwrap_or(&args.mission);
-    let mission: st3::model::MissionSpec = client
-        .get(&format!("/v1/missions/{}", urlencoding::encode(mission_id)))
-        .await?;
+    let mission = startable_mission(
+        client,
+        mission_id,
+        args.revision.as_deref(),
+        MISSION_ARRIVAL_WAIT,
+    )
+    .await?;
     anyhow::ensure!(
         mission.state == MissionState::Ready,
         "mission `mission/{mission_id}` is not ready"
@@ -2243,10 +2258,20 @@ async fn start_mission_run(
             urlencoding::encode(&subject)
         ))
         .await?;
+    let publications = mission_publications(client, mission_id).await?;
+    let started_revision = started_revision_note(mission_id, &mission.revision, &publications);
+    if !json_output {
+        eprintln!("{started_revision}");
+    }
     if !args.follow {
         return if json_output {
             print_value(
-                &json!({"publication": response, "mission_run": started}),
+                &json!({
+                    "publication": response,
+                    "mission_run": started,
+                    "mission_revision": mission.revision,
+                    "started_revision": started_revision,
+                }),
                 true,
             )
         } else {
@@ -2255,6 +2280,138 @@ async fn start_mission_run(
         };
     }
     follow_mission_run(client, started, response.store_index, json_output).await
+}
+
+/// How long `missions start` waits for a mission published on another host to arrive here.
+const MISSION_ARRIVAL_WAIT: Duration = Duration::from_secs(60);
+
+/// Read the mission that `missions start` will run. A publish on another host reaches this
+/// host by replication, so a mission or requested revision that has not arrived yet waits
+/// briefly with a plain message instead of failing.
+async fn startable_mission(
+    client: &Client,
+    mission_id: &str,
+    revision: Option<&str>,
+    wait: Duration,
+) -> Result<st3::model::MissionSpec> {
+    let deadline = Instant::now() + wait;
+    let mut announced = false;
+    loop {
+        let absent = match client
+            .get::<st3::model::MissionSpec>(&format!(
+                "/v1/missions/{}",
+                urlencoding::encode(mission_id)
+            ))
+            .await
+        {
+            Ok(mission) if revision.is_none_or(|wanted| wanted == mission.revision) => {
+                return Ok(mission);
+            }
+            Ok(mission) => {
+                let wanted = revision.unwrap_or_default();
+                let publications = mission_publications(client, mission_id).await?;
+                anyhow::ensure!(
+                    !publications
+                        .iter()
+                        .any(|publication| publication.revision == wanted),
+                    "mission/{mission_id} revision {wanted} was replaced by revision {}. \
+                     Start that revision, or publish again.",
+                    mission.revision
+                );
+                format!("mission/{mission_id} revision {wanted} has not reached this host yet")
+            }
+            Err(error) if st3::client::is_not_found(&error) => {
+                format!("mission/{mission_id} has not reached this host yet")
+            }
+            Err(error) => return Err(error),
+        };
+        let now = Instant::now();
+        anyhow::ensure!(
+            now < deadline,
+            "{absent} after {}s. A mission published on another host arrives by replication; \
+             check `st3 replication status`.",
+            wait.as_secs()
+        );
+        if !announced {
+            eprintln!(
+                "{absent}. Waiting up to {}s for it to replicate here.",
+                wait.as_secs()
+            );
+            announced = true;
+        }
+        tokio::time::sleep(Duration::from_millis(500).min(deadline - now)).await;
+    }
+}
+
+struct MissionPublication {
+    revision: String,
+    origin: String,
+    accepted_at_unix_ms: u128,
+}
+
+/// The mission's publications on this host, newest first.
+async fn mission_publications(
+    client: &Client,
+    mission_id: &str,
+) -> Result<Vec<MissionPublication>> {
+    let page: ClaimsPage = client
+        .get(&format!(
+            "/v1/claims?subject={}&order=desc&limit=100",
+            urlencoding::encode(&format!("mission/{mission_id}"))
+        ))
+        .await?;
+    Ok(page
+        .claims
+        .into_iter()
+        .filter(|claim| claim.kind == "mission.published")
+        .filter_map(|claim| {
+            Some(MissionPublication {
+                revision: claim.body.get("revision")?.as_str()?.to_owned(),
+                origin: claim.origin,
+                accepted_at_unix_ms: claim.accepted_at_unix_ms,
+            })
+        })
+        .collect())
+}
+
+/// Say which revision a run started, and whether other revisions share the mission name.
+fn started_revision_note(
+    mission_id: &str,
+    revision: &str,
+    publications: &[MissionPublication],
+) -> String {
+    let started = publications
+        .iter()
+        .find(|publication| publication.revision == revision);
+    let others = publications
+        .iter()
+        .filter(|publication| publication.revision != revision)
+        .map(|publication| publication.revision.as_str())
+        .collect::<BTreeSet<_>>();
+    let Some(started) = started.filter(|_| !others.is_empty()) else {
+        return format!("Started mission/{mission_id} revision {revision}.");
+    };
+    let newer = publications
+        .iter()
+        .filter(|publication| {
+            publication.revision != revision
+                && publication.accepted_at_unix_ms > started.accepted_at_unix_ms
+        })
+        .count();
+    let published = i64::try_from(started.accepted_at_unix_ms)
+        .ok()
+        .and_then(chrono::DateTime::from_timestamp_millis)
+        .map(|value| value.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+        .unwrap_or_else(|| "at an unknown time".into());
+    let count = others.len();
+    let plural = if count == 1 { "" } else { "s" };
+    let relation = if newer == 0 { "older" } else { "other" };
+    format!(
+        "Started mission/{mission_id} revision {revision}, published {published} on {}. \
+         {count} {relation} revision{plural} share{} this mission name.",
+        started.origin,
+        if count == 1 { "s" } else { "" }
+    )
 }
 
 async fn follow_mission_run(
@@ -10798,5 +10955,208 @@ mission "review" state="ready" {
         .unwrap_err();
         assert!(error.to_string().contains("work claim is stale"));
         assert!(last_warning.is_none());
+    }
+
+    async fn serve_test_store(
+        store: Arc<Store>,
+        root: &Path,
+        node: &str,
+    ) -> (Client, tokio::task::JoinHandle<()>) {
+        let socket = root.join("st3.sock");
+        let state = AppState {
+            store,
+            notify: Arc::new(Notify::new()),
+            event_notify: watch::channel(0_u64).0,
+            node: node.into(),
+            state_dir: root.to_path_buf(),
+            pty_root: root.join("pty"),
+            pty_binary: PathBuf::from("pty"),
+            fleet_id: None,
+            configured_peers: Vec::new(),
+            client_relay: None,
+            native_session_home: None,
+            planner_default: PlannerSpec::default(),
+        };
+        let server_socket = socket.clone();
+        let server = tokio::spawn(async move {
+            serve_unix(&server_socket, router(state)).await.unwrap();
+        });
+        for _ in 0..100 {
+            if socket.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        assert!(socket.exists(), "the test API socket did not start");
+        (Client::unix(&socket), server)
+    }
+
+    async fn publish_test_mission(client: &Client, root: &Path, goal: &str) {
+        let file = root.join("mission.kdl");
+        fs::write(
+            &file,
+            format!(
+                "version 2\nmission \"arrival\" state=\"ready\" {{\n  goal \"{goal}\"\n  step \"work\" {{ }}\n}}\n"
+            ),
+        )
+        .unwrap();
+        publish_mission_file(
+            client,
+            MissionPublishArgs {
+                file,
+                at_index: None,
+                actor: "person/test".into(),
+            },
+            true,
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn missions_start_waits_for_a_revision_published_on_another_host() {
+        const FLEET: &str = "5d0c1c52-3f7a-4b0e-9b61-1f2d3c4b5a69";
+        let publisher_root = tempfile::tempdir().unwrap();
+        let starter_root = tempfile::tempdir().unwrap();
+        let publisher = Arc::new(Store::open_memory("publisher").unwrap());
+        let starter = Arc::new(Store::open_memory("starter").unwrap());
+        publisher.bind_fleet(FLEET).unwrap();
+        starter.bind_fleet(FLEET).unwrap();
+        let (publisher_client, publisher_server) =
+            serve_test_store(publisher.clone(), publisher_root.path(), "publisher").await;
+        let (starter_client, starter_server) =
+            serve_test_store(starter.clone(), starter_root.path(), "starter").await;
+        publish_test_mission(
+            &publisher_client,
+            publisher_root.path(),
+            "Start after replication.",
+        )
+        .await;
+        let revision = publisher
+            .mission_spec("arrival", None)
+            .unwrap()
+            .unwrap()
+            .revision;
+
+        let replicate = tokio::spawn({
+            let publisher = publisher.clone();
+            let starter = starter.clone();
+            async move {
+                tokio::time::sleep(Duration::from_millis(600)).await;
+                let exchange = publisher
+                    .export_replication_exchange(
+                        FLEET,
+                        &st3::model::ReplicationInventory::default(),
+                    )
+                    .unwrap();
+                starter
+                    .receive_replication_exchange("publisher", FLEET, &exchange)
+                    .unwrap();
+                starter.validate_replication_backlog().unwrap();
+                starter.apply_replication_repairs().unwrap();
+                starter.project_replication_backlog().unwrap();
+            }
+        });
+        let waited = Instant::now();
+        start_mission_run(
+            &starter_client,
+            MissionRunStartArgs {
+                mission: "arrival".into(),
+                revision: Some(revision.clone()),
+                id: Some("arrival/after-replication".into()),
+                workspace: starter_root.path().to_path_buf(),
+                inputs: Vec::new(),
+                follow: false,
+                actor: Some("person/test".into()),
+                print_kdl: false,
+            },
+            true,
+        )
+        .await
+        .unwrap();
+        assert!(
+            waited.elapsed() >= Duration::from_millis(500),
+            "start waited for the publish to replicate instead of failing"
+        );
+        replicate.await.unwrap();
+        let run: MissionRunView = starter_client
+            .get("/v1/mission-runs/mission-run%2Farrival%2Fafter-replication")
+            .await
+            .unwrap();
+        assert_eq!(run.revision, revision);
+        publisher_server.abort();
+        starter_server.abort();
+    }
+
+    #[tokio::test]
+    async fn missions_start_names_a_replaced_or_missing_revision() {
+        let root = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open_memory("single").unwrap());
+        let (client, server) = serve_test_store(store.clone(), root.path(), "single").await;
+        publish_test_mission(&client, root.path(), "First revision.").await;
+        let first = store
+            .mission_spec("arrival", None)
+            .unwrap()
+            .unwrap()
+            .revision;
+        publish_test_mission(&client, root.path(), "Second revision.").await;
+        let second = store
+            .mission_spec("arrival", None)
+            .unwrap()
+            .unwrap()
+            .revision;
+        assert_ne!(first, second);
+
+        let replaced = Instant::now();
+        let error = startable_mission(&client, "arrival", Some(&first), Duration::from_secs(10))
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains(&format!(
+                "revision {first} was replaced by revision {second}"
+            )),
+            "{error}"
+        );
+        assert!(replaced.elapsed() < Duration::from_secs(5));
+
+        let error = startable_mission(
+            &client,
+            "arrival",
+            Some(&"0".repeat(64)),
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("has not reached this host yet after 1s"),
+            "{error}"
+        );
+        let error = startable_mission(&client, "absent", None, Duration::from_secs(1))
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .starts_with("mission/absent has not reached this host yet after 1s"),
+            "{error}"
+        );
+
+        let publications = mission_publications(&client, "arrival").await.unwrap();
+        assert_eq!(publications.len(), 2);
+        assert!(
+            started_revision_note("arrival", &second, &publications)
+                .ends_with("on single. 1 older revision shares this mission name.")
+        );
+        assert!(
+            started_revision_note("arrival", &first, &publications)
+                .ends_with("on single. 1 other revision shares this mission name.")
+        );
+        assert_eq!(
+            started_revision_note("arrival", &second, &publications[..1]),
+            format!("Started mission/arrival revision {second}.")
+        );
+        server.abort();
     }
 }
