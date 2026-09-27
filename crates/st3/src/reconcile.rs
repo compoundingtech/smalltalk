@@ -1479,7 +1479,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                     ("severity".into(), Value::String("error".into())),
                     ("status".into(), Value::String("blocked".into())),
                     ("code".into(), Value::String("provider-trust-prompt".into())),
-                    ("reason".into(), Value::String("Claude is waiting at its workspace trust prompt and cannot accept work; st3 replaces this incarnation so its driver admits the workspace again".into())),
+                    ("reason".into(), Value::String("Claude is waiting at its workspace trust prompt and cannot accept work; st replaces this incarnation so its driver admits the workspace again".into())),
                     ("incarnation_id".into(), Value::String(incarnation.into())),
                 ]),
                 evidence: vec![runtime_claim.id],
@@ -1511,7 +1511,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                         reviewer: "person/operator".into(),
                         title: "Claude keeps stopping at its workspace trust prompt".into(),
                         reason: format!(
-                            "{} on {} reached Claude's workspace trust prompt {recent} times in {} minutes, so st3 stopped replacing it. Check that its driver can record the workspace trust in the Claude config, then restart the seat.",
+                            "{} on {} reached Claude's workspace trust prompt {recent} times in {} minutes, so st stopped replacing it. Check that its driver can record the workspace trust in the Claude config, then restart the seat.",
                             subject.subject,
                             self.host,
                             CLAUDE_TRUST_RECOVERY_WINDOW_MS / 60_000
@@ -6574,7 +6574,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             .map(|field| format!(" --field {field}"))
             .collect::<String>();
         let content = format!(
-            "`{}` was submitted, but its declared product `{}` has not been observed{}. Record that exact subject, for example `st3 claim {} resource.observed --actor {agent}{example}`, or fail the step with the reason. No action is needed if another actor produces it.",
+            "`{}` was submitted, but its declared product `{}` has not been observed{}. Record that exact subject, for example `st claim {} resource.observed --actor {agent}{example}`, or fail the step with the reason. No action is needed if another actor produces it.",
             view.subject,
             missing.subject,
             if expected.is_empty() {
@@ -7380,7 +7380,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                 reviewer: "person/operator".into(),
                 title: "A subscription is holding mission requests".into(),
                 reason: format!(
-                    "One observation for {subscription} requested more than {} mission runs, so {count} wait for a person. List them with `st3 missions requests {subscription}`, then release or cancel each one.",
+                    "One observation for {subscription} requested more than {} mission runs, so {count} wait for a person. List them with `st missions requests {subscription}`, then release or cancel each one.",
                     crate::store::MAX_OBSERVATION_DELIVERIES
                 ),
                 severity: "warning".into(),
@@ -8251,7 +8251,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             ]),
         )?;
         let instruction = format!(
-            "{prompt}\n\nYou are a held-out st3 gate. Inspect only the declared workspace and tools. When you decide, run exactly one of these commands:\n  \"$ST3_BIN\" gate-result pass --reason 'REASON'\n  \"$ST3_BIN\" gate-result fail --reason 'REASON'\nDo not finish without posting a gate-result."
+            "{prompt}\n\nYou are a held-out st gate. Inspect only the declared workspace and tools. When you decide, run exactly one of these commands:\n  \"$ST3_BIN\" gate-result pass --reason 'REASON'\n  \"$ST3_BIN\" gate-result fail --reason 'REASON'\nDo not finish without posting a gate-result."
         );
         let argv = if model.starts_with("claude") {
             vec![
@@ -8983,7 +8983,7 @@ pub(crate) fn append_work_wake_message(
         format!("{source} attempt {wake_attempt} ({reason})")
     };
     let content = format!(
-        "A mission step is ready: {0}. Run `st3 work claim {0}` to read and claim it.\n\nTitle: {1}{queue}\nWake: {wake_description}",
+        "A mission step is ready: {0}. Run `st work claim {0}` to read and claim it.\n\nTitle: {1}{queue}\nWake: {wake_description}",
         step.subject,
         step.title.as_deref().unwrap_or(&step.step),
     );
@@ -9302,7 +9302,7 @@ enum UsedMissionOutcome {
     Failed(String),
 }
 
-/// The st3 executable members launch with. A deploy installs the new binary before it restarts
+/// The st executable members launch with. A deploy installs the new binary before it restarts
 /// the daemon, and in between Linux names this process's image `PATH (deleted)`. Launching that
 /// name fails every start in the window and can hold a seat in a crash loop, so use the
 /// replacement installed at the original path.
@@ -14015,7 +14015,7 @@ mission "scheduled-cycle" state="ready" {
             version 2
 
               mission "checkout-lifecycle" state="ready" timeout="1m" {{
-                goal "Work in a worktree that st3 creates and removes."
+                goal "Work in a worktree that st creates and removes."
                 agent "worker" {{
                   workspace {workspace:?}
                   checkout {repository:?} base="origin/main" branch="example/${{ST_MISSION_RUN}}" remove-at-run-end=#true

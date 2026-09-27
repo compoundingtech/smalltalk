@@ -32,7 +32,7 @@ const STREAM_HANDSHAKE_DEADLINE: Duration = Duration::from_secs(10);
 /// Resolve the local daemon socket in the same order as the `st3` CLI.
 ///
 /// An explicit endpoint (including `ST3_ENDPOINT`, when the caller exposes it through clap) wins,
-/// followed by the normal st3 config file and then the XDG runtime/state defaults.
+/// followed by the normal st config file and then the XDG runtime/state defaults.
 pub fn discover_unix_endpoint(explicit: Option<PathBuf>) -> Result<PathBuf, ClientError> {
     if let Some(path) = explicit {
         return Ok(path);
@@ -50,7 +50,7 @@ pub fn discover_unix_endpoint(explicit: Option<PathBuf>) -> Result<PathBuf, Clie
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => {
             return Err(ClientError::Transport(format!(
-                "read st3 config {}: {error}",
+                "read st config {}: {error}",
                 config_path.display()
             )));
         }
@@ -67,13 +67,13 @@ pub fn discover_unix_endpoint(explicit: Option<PathBuf>) -> Result<PathBuf, Clie
 
 fn configured_socket(document: &str) -> Result<Option<PathBuf>, ClientError> {
     let config: toml::Value = toml::from_str(document)
-        .map_err(|error| ClientError::Protocol(format!("parse st3 config: {error}")))?;
+        .map_err(|error| ClientError::Protocol(format!("parse st config: {error}")))?;
     match config.get("socket") {
         None => Ok(None),
         Some(toml::Value::String(socket)) if socket.is_empty() => Ok(None),
         Some(toml::Value::String(socket)) => Ok(Some(PathBuf::from(socket))),
         Some(_) => Err(ClientError::Protocol(
-            "parse st3 config: `socket` must be a path string".into(),
+            "parse st config: `socket` must be a path string".into(),
         )),
     }
 }
@@ -87,7 +87,7 @@ fn xdg_path(variable: &str, home_suffix: &str) -> Result<PathBuf, ClientError> {
         .map(|home| home.join(home_suffix))
         .ok_or_else(|| {
             ClientError::Transport(format!(
-                "cannot discover the st3 socket because neither {variable} nor HOME is set"
+                "cannot discover the st socket because neither {variable} nor HOME is set"
             ))
         })
 }
@@ -117,17 +117,17 @@ pub struct TerminalStreamBatch {
 
 #[derive(Debug, thiserror::Error)]
 pub enum ClientError {
-    #[error("st3 client API error {0:?}: {1}")]
+    #[error("st client API error {0:?}: {1}")]
     Api(ErrorCode, String, Box<ErrorEnvelope>),
-    #[error("st3 client transport error: {0}")]
+    #[error("st client transport error: {0}")]
     Transport(String),
     #[error(transparent)]
     Unreachable(DaemonUnreachable),
-    #[error("st3 client protocol error: {0}")]
+    #[error("st client protocol error: {0}")]
     Protocol(String),
 }
 
-/// The st3 daemon accepted no connection, typically because it is restarting. Nothing was sent,
+/// The st daemon accepted no connection, typically because it is restarting. Nothing was sent,
 /// so the request is always safe to repeat.
 #[derive(Clone, Debug)]
 pub struct DaemonUnreachable {
@@ -141,7 +141,7 @@ impl DaemonUnreachable {
     /// A short present-tense summary without advice.
     pub fn summary(&self) -> String {
         format!(
-            "the st3 daemon at {} is not reachable ({}); it may be restarting",
+            "the st daemon at {} is not reachable ({}); it may be restarting",
             self.endpoint, self.reason
         )
     }
@@ -153,7 +153,7 @@ impl std::fmt::Display for DaemonUnreachable {
             None => formatter.write_str(&self.summary()),
             Some(waited) => write!(
                 formatter,
-                "the st3 daemon at {} was not reachable for {}s ({}); it may be restarting or stopped. Nothing was sent; run the command again once the daemon is back",
+                "the st daemon at {} was not reachable for {}s ({}); it may be restarting or stopped. Nothing was sent; run the command again once the daemon is back",
                 self.endpoint,
                 waited.as_secs_f64().round() as u64,
                 self.reason
@@ -685,7 +685,7 @@ impl Client {
                     }
                     if self.announce_outage_wait && !announced {
                         eprintln!(
-                            "st3: {}; retrying for up to {}s",
+                            "st: {}; retrying for up to {}s",
                             outage.summary(),
                             self.outage_wait.as_secs()
                         );

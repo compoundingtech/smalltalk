@@ -311,10 +311,10 @@
           postInstall = ''
             ln -s st3 $out/bin/st
             ln -s ${pty.packages.${system}.default}/bin/pty $out/bin/pty
-            $out/bin/st3 completions bash > st3.bash
-            $out/bin/st3 completions zsh > _st3
-            $out/bin/st3 completions fish > st3.fish
-            installShellCompletion --cmd st3 --bash st3.bash --zsh _st3 --fish st3.fish
+            $out/bin/st completions bash > st.bash
+            $out/bin/st completions zsh > _st
+            $out/bin/st completions fish > st.fish
+            installShellCompletion --cmd st --bash st.bash --zsh _st --fish st.fish
           '';
           meta = {
             description = "Small Talk claims-graph runtime, terminal UI, and st2 KDL migration tool";
@@ -331,6 +331,10 @@
           ${st3}/bin/st3 --help > st3.help
           ${st3}/bin/st --help > st.help
           cmp st3.help st.help
+          grep -F "Usage: st [" st.help
+          test -s ${st3}/share/bash-completion/completions/st
+          test -s ${st3}/share/zsh/site-functions/_st
+          test -s ${st3}/share/fish/vendor_completions.d/st.fish
           ${st3}/bin/st3-migrate --help > /dev/null
           touch $out
         '';
