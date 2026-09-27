@@ -7113,19 +7113,16 @@ async fn publish_harness_state(
 }
 
 /// One pi-family message frame. The content is the shared st3 envelope that Codex and Claude also
-/// receive. omp backgrounds an in-flight shell or eval call whenever a steering message arrives,
-/// and the model then repeats commands whose results it never saw; a live omp seat sent one
-/// protocol message twice that way. omp therefore receives mail after its current turn, as
-/// Codex does. pi keeps the measured steer boundary.
-fn pi_family_message_frame(
-    driver: &str,
-    message: &st3::model::MessageView,
-    body: &str,
-    identity: &str,
-) -> Value {
+/// receive, steered into a running turn at its next tool boundary. omp backgrounds an in-flight
+/// shell or eval call when a steer arrives, and one live omp seat then repeated a send whose
+/// result it had not seen. Queueing mail with `followUp` instead was measured and was worse: omp
+/// read the queued messages during its turn, the queue then re-delivered them as new prompts, and
+/// seats that answered those stale prompts declined the next real task in three of six
+/// cross-harness runs.
+fn pi_family_message_frame(message: &st3::model::MessageView, body: &str, identity: &str) -> Value {
     json!({
         "type": "message",
-        "deliverAs": if driver == "omp" { "followUp" } else { "steer" },
+        "deliverAs": "steer",
         "content": st2::ding::st3_notification_text(
             &message.subject,
             &message.from,
@@ -7247,7 +7244,7 @@ async fn run_pi_channel(client: &Client, subject: &str, driver: &str) -> Result<
                         continue;
                     }
                     let body = message_content(client, &message).await?;
-                    let frame = pi_family_message_frame(driver, &message, &body, identity);
+                    let frame = pi_family_message_frame(&message, &body, identity);
                     stdout.write_all(serde_json::to_string(&frame)?.as_bytes()).await?;
                     stdout.write_all(b"\n").await?;
                     stdout.flush().await?;
@@ -8249,7 +8246,7 @@ mod tests {
     }
 
     #[test]
-    fn omp_receives_the_shared_envelope_after_its_current_turn() {
+    fn pi_family_mail_uses_the_shared_envelope_and_the_steer_boundary() {
         let message = st3::model::MessageView {
             subject: "message/0123456789abcdef".into(),
             from: "agent/run-1/wake.claude".into(),
@@ -8261,8 +8258,8 @@ mod tests {
             tags: vec![],
             created_index: 1,
         };
-        let omp = pi_family_message_frame("omp", &message, "FACT QUARTZ", "run-1/wake.omp-2");
-        assert_eq!(omp["deliverAs"], "followUp");
+        let omp = pi_family_message_frame(&message, "FACT QUARTZ", "run-1/wake.omp-2");
+        assert_eq!(omp["deliverAs"], "steer");
         assert_eq!(
             omp["content"],
             st2::ding::st3_notification_text(
@@ -8278,9 +8275,6 @@ mod tests {
             )
         );
         assert_eq!(omp["meta"]["messageId"], "message/0123456789abcdef");
-        let pi = pi_family_message_frame("pi", &message, "FACT QUARTZ", "run-1/wake.pi");
-        assert_eq!(pi["deliverAs"], "steer");
-        assert_eq!(pi["content"], omp["content"]);
     }
 
     #[test]
