@@ -2365,7 +2365,18 @@ impl<R: RuntimeControl> Reconciler<R> {
                 )?;
                 continue;
             };
-            let mission = crate::mission::run_mission(mission, run.after.as_deref())?;
+            let mission = match crate::mission::run_mission(mission, run.after.as_deref()) {
+                Ok(mission) => mission,
+                Err(error) => {
+                    changed |= self.store.set_mission_run_state(
+                        &run.id,
+                        "blocked",
+                        &run.phase,
+                        Some(&error.message),
+                    )?;
+                    continue;
+                }
+            };
             changed |= self.evaluate_mission_run(&run, &mission)?;
         }
         if changed {

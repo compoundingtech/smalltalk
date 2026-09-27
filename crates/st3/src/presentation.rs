@@ -127,7 +127,7 @@ pub(crate) fn render_mission_run(
         let wait = selected
             .steps
             .iter()
-            .find(|step| step.step == crate::mission::AFTER_RUN_STEP)
+            .find(|step| step.step == st3::mission::AFTER_RUN_STEP)
             .map_or("waiting", |step| match step.status.as_str() {
                 "completed" | "failed" | "cancelled" => step.status.as_str(),
                 _ => "waiting",
@@ -1498,6 +1498,26 @@ mod tests {
         assert!(rendered.contains("loop best-of-n · running · round 2/5"));
         assert!(rendered.contains("2 parallel · 3 candidates · winner 2"));
         assert!(rendered.contains("best quality=0.75"));
+    }
+
+    #[test]
+    fn mission_run_shows_the_run_it_waits_for() {
+        let mut after = step("step-run/demo-generation/after-run", "after-run", "working");
+        after.agentless = true;
+        after.blocked_reason = Some("waiting for `mission-run/demo/build` to complete".into());
+        let later = step("step-run/demo-generation/ship", "ship", "pending");
+        let mut waiting = run("mission-run/demo/run", None, vec![after.clone(), later]);
+        waiting.after = Some("mission-run/demo/build".into());
+
+        let rendered =
+            render_mission_run(&waiting, &[waiting.clone()], OutputStyle::plain(), 3_000);
+        assert!(rendered.contains("AFTER     mission-run/demo/build · waiting"));
+        assert!(rendered.contains("waiting for `mission-run/demo/build` to complete"));
+
+        waiting.steps[0].status = "completed".into();
+        let rendered =
+            render_mission_run(&waiting, &[waiting.clone()], OutputStyle::plain(), 3_000);
+        assert!(rendered.contains("AFTER     mission-run/demo/build · completed"));
     }
 
     #[test]

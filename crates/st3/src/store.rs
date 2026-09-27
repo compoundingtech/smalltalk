@@ -9400,13 +9400,12 @@ fn prepare_mission_run_declaration(
                     if let Err(error) = enforce_mission_run_capacity(connection, &mission) {
                         blockers.push(error.message);
                     }
-                    if let Some(after) = &creation.after {
-                        if let Err(error) =
+                    if let Some(after) = &creation.after
+                        && let Err(error) =
                             ensure_awaited_mission_run_tx(connection, &declaration.subject, after)
                                 .and_then(|()| crate::mission::mission_after_run(mission, after))
-                        {
-                            blockers.push(error.message);
-                        }
+                    {
+                        blockers.push(error.message);
                     }
                     actions.push(PlannedAction {
                         subject: declaration.subject.clone(),
