@@ -91,7 +91,9 @@ Failures behind those counts:
 7. **Not fixed: a steered message can background a running command.** omp backgrounds an in-flight
    shell or eval call when a steered message arrives. In `cross-omp-head-20260926-c` the model then
    repeated the send whose result it had not seen. Two alternatives made omp worse and were reverted
-   (see below).
+   (see below). `agent/omp-steer-hold` later found that the steer is queued while the model is still
+   streaming, not while a call runs, and holds it until the tool batch returns; see
+   [Holding mail during a running turn](omp.md#holding-mail-during-a-running-turn).
 8. **Model behavior, not a runtime fault.** Some omp runs skipped a protocol step, dropped required
    tags, did restart items from the parent goal, or left the injected duplicate unarchived. Codex
    `gpt-6-luna` made the same kinds of slip. Each report lists its evidence.
@@ -145,8 +147,8 @@ subject and body does not describe this branch.
   and otherwise the agent should request person action. Codex seats, and sometimes omp seats, stop
   on that rule. The eval could expose each participant's work as a claimable step, or the boot
   contract could treat explicit message-only coordination as authorized.
-- **A steered message backgrounds omp's running command.** See failure 7. A fix probably belongs in
-  the omp channel extension, which could hold a steer until the in-flight tool call returns.
+- **A steered message backgrounds omp's running command.** See failure 7. `agent/omp-steer-hold`
+  holds the message in the omp channel extension until the tool batch returns.
 - **An exec exit-code gate waits for its step timeout.** A `field "exit_code" ... is 0` gate stays
   pending after the exec exits non-zero. The exec observation does not carry its restart policy, so
   failing at once needs the desired exec spec.

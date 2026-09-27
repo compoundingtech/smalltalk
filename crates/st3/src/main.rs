@@ -7487,13 +7487,7 @@ async fn run_pi_channel(client: &Client, subject: &str, driver: &str) -> Result<
                     }
                     Some("delivered") => {
                         let Some(message) = frame.pointer("/meta/messageId").and_then(Value::as_str) else { continue; };
-                        deliver_message(
-                            client,
-                            message,
-                            subject,
-                            format!("pi-delivered:{subject}:{message}"),
-                        )
-                        .await?;
+                        acknowledge_pi_family_delivery(client, subject, message).await?;
                     }
                     _ => {}
                 }
@@ -7537,6 +7531,34 @@ async fn run_pi_channel(client: &Client, subject: &str, driver: &str) -> Result<
                 }
             }
         }
+    }
+}
+
+/// Record that a pi-family harness took one message.
+///
+/// The recipient can read a message through the CLI before its channel acknowledges the handoff,
+/// and the omp channel holds mail until a tool batch returns, so the acknowledgement can arrive
+/// after the message has moved past delivery. Such a message needs no acknowledgement. Failing
+/// here would end the channel and leave the seat with no mail or state
+/// (cross-omp-hold-astra-20260927-a).
+async fn acknowledge_pi_family_delivery(
+    client: &Client,
+    subject: &str,
+    message: &str,
+) -> Result<()> {
+    let Err(error) = deliver_message(
+        client,
+        message,
+        subject,
+        format!("pi-delivered:{subject}:{message}"),
+    )
+    .await
+    else {
+        return Ok(());
+    };
+    match read_message(client, message).await {
+        Ok(view) if matches!(view.status.as_str(), "delivered" | "read" | "closed") => Ok(()),
+        _ => Err(error),
     }
 }
 
@@ -8652,6 +8674,108 @@ mod tests {
              2026-09-24T09:03:00.000Z  person/operator moved mission-run/held before \
              mission-run/gated: finish the build first\n"
         );
+    }
+
+    #[tokio::test]
+    async fn a_pi_family_delivery_after_the_recipient_read_the_message_keeps_the_channel() {
+        let root = tempfile::tempdir().unwrap();
+        let socket = root.path().join("st3.sock");
+        let store = Arc::new(Store::open_memory("pi-delivery-test").unwrap());
+        let seat = "agent/run-1/wake.omp";
+        let claim =
+            |subject: &str, kind: &str, actor: &str, fields: Vec<(&str, &str)>| ClaimInput {
+                subject: subject.into(),
+                kind: kind.into(),
+                actor: Some(actor.into()),
+                fields: fields
+                    .into_iter()
+                    .map(|(key, value)| (key.to_owned(), Value::String(value.into())))
+                    .collect(),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            };
+        for subject in ["message/held", "message/pending"] {
+            store
+                .append_claim(&claim(
+                    subject,
+                    "message.sent",
+                    "agent/run-1/wake.codex",
+                    vec![
+                        ("from", "agent/run-1/wake.codex"),
+                        ("to", seat),
+                        ("content", "AGREEMENT EMBER+ORBIT"),
+                        ("status", "sent"),
+                    ],
+                ))
+                .unwrap();
+        }
+        // The seat read the held message through the CLI, which records delivery and the read.
+        for lifecycle in ["delivered", "read"] {
+            store
+                .append_claim(&claim(
+                    "message/held",
+                    &format!("message.{lifecycle}"),
+                    seat,
+                    vec![("status", lifecycle)],
+                ))
+                .unwrap();
+        }
+        let state = AppState {
+            store: store.clone(),
+            notify: Arc::new(Notify::new()),
+            event_notify: watch::channel(0_u64).0,
+            node: "pi-delivery-test".into(),
+            state_dir: root.path().to_path_buf(),
+            pty_root: root.path().join("pty"),
+            pty_binary: PathBuf::from("pty"),
+            fleet_id: None,
+            configured_peers: Vec::new(),
+            client_relay: None,
+            native_session_home: None,
+            planner_default: PlannerSpec::default(),
+        };
+        let server_socket = socket.clone();
+        let server = tokio::spawn(async move {
+            serve_unix(&server_socket, router(state)).await.unwrap();
+        });
+        for _ in 0..100 {
+            if socket.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        assert!(socket.exists(), "the test API socket did not start");
+        let client = Client::unix(&socket);
+
+        // The late acknowledgement itself is still an invalid transition...
+        assert!(
+            deliver_message(&client, "message/held", seat, "late".into())
+                .await
+                .is_err()
+        );
+        // ...but it must not end the channel.
+        acknowledge_pi_family_delivery(&client, seat, "message/held")
+            .await
+            .unwrap();
+        assert_eq!(
+            store.message("message/held").unwrap().unwrap().status,
+            "read"
+        );
+        acknowledge_pi_family_delivery(&client, seat, "message/pending")
+            .await
+            .unwrap();
+        assert_eq!(
+            store.message("message/pending").unwrap().unwrap().status,
+            "delivered"
+        );
+        // A message that does not exist is still an error.
+        assert!(
+            acknowledge_pi_family_delivery(&client, seat, "message/absent")
+                .await
+                .is_err()
+        );
+        server.abort();
     }
 
     #[tokio::test]
