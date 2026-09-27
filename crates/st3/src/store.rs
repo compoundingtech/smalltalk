@@ -2794,6 +2794,19 @@ impl Store {
             .min())
     }
 
+    pub fn next_subscription_mission_retry_deadline(&self) -> Result<Option<u128>> {
+        let connection = self.readers.get();
+        let now = now_ms() as i64;
+        let deadline: Option<i64> = connection.query_row(
+            "SELECT MIN(CAST(json_extract(body, '$.fields.not_before_unix_ms') AS INTEGER))
+             FROM claims WHERE kind='subscription.mission-deferred'
+               AND CAST(json_extract(body, '$.fields.not_before_unix_ms') AS INTEGER)>?1",
+            [now],
+            |row| row.get(0),
+        )?;
+        Ok(deadline.map(|value| value as u128))
+    }
+
     pub fn request_mission_run_cancellation(
         &self,
         run: &str,
@@ -4215,6 +4228,48 @@ impl Store {
                         desired.subject, subscription.to
                     ));
                 }
+                if subscription.delivery == "mission"
+                    && let (Some(mission_id), Some(revision), Some(input)) = (
+                        subscription.mission.as_deref(),
+                        subscription.revision.as_deref(),
+                        subscription.resource_input.as_deref(),
+                    )
+                {
+                    let local = connection
+                        .query_row(
+                            "SELECT body FROM mission_revisions
+                             WHERE mission_id=?1 AND revision=?2 AND created_index<=?3",
+                            params![mission_id, revision, store_index],
+                            |row| row.get::<_, String>(0),
+                        )
+                        .optional()
+                        .map_err(internal)?
+                        .map(|body| serde_json::from_str::<MissionSpec>(&body).map_err(internal))
+                        .transpose()?;
+                    let published = intent
+                        .missions
+                        .get(mission_id)
+                        .filter(|mission| mission.revision == revision)
+                        .cloned()
+                        .or(local);
+                    match published {
+                        Some(mission)
+                            if mission
+                                .inputs
+                                .get(input)
+                                .is_none_or(|declaration| declaration.kind != MissionInputKind::Resource) => blockers.push(
+                            format!(
+                                "subscription `{}` uses undeclared resource input `{input}` in mission/{}@{revision}",
+                                desired.subject, mission_id
+                            ),
+                        ),
+                        None => blockers.push(format!(
+                            "subscription `{}` references unpublished mission/{}@{revision}",
+                            desired.subject, mission_id
+                        )),
+                        _ => {}
+                    }
+                }
             }
         }
         for mission in intent.missions.values() {
@@ -4498,6 +4553,63 @@ impl Store {
         }
         let transaction = connection.transaction().map_err(internal)?;
         validate_documents(&transaction, &intent.document_refs)?;
+        for desired in intent
+            .subjects
+            .values()
+            .filter(|subject| subject.kind == "subscription")
+        {
+            let Some(spec) = crate::graph::subscription_spec(&desired.desired) else {
+                continue;
+            };
+            if spec.stopped || spec.delivery != "mission" {
+                continue;
+            }
+            let (Some(mission_id), Some(revision), Some(input)) = (
+                spec.mission.as_deref(),
+                spec.revision.as_deref(),
+                spec.resource_input.as_deref(),
+            ) else {
+                continue;
+            };
+            let local = transaction
+                .query_row(
+                    "SELECT body FROM mission_revisions WHERE mission_id=?1 AND revision=?2",
+                    params![mission_id, revision],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+                .map_err(internal)?
+                .map(|body| serde_json::from_str::<MissionSpec>(&body).map_err(internal))
+                .transpose()?;
+            let published = intent
+                .missions
+                .get(mission_id)
+                .filter(|mission| mission.revision == revision)
+                .cloned()
+                .or(local);
+            let Some(mission) = published else {
+                return Err(St3Error::new(
+                    "missing-mission",
+                    format!(
+                        "subscription `{}` references unpublished mission/{}@{revision}",
+                        desired.subject, mission_id
+                    ),
+                ));
+            };
+            if mission
+                .inputs
+                .get(input)
+                .is_none_or(|declaration| declaration.kind != MissionInputKind::Resource)
+            {
+                return Err(St3Error::new(
+                    "invalid-subscription-resource-input",
+                    format!(
+                        "subscription `{}` uses undeclared resource input `{input}` in mission/{}@{revision}",
+                        desired.subject, mission_id
+                    ),
+                ));
+            }
+        }
         for subject in intent.subjects.keys() {
             let actual = intent_leaves_tx(&transaction, subject).map_err(internal)?;
             let expected = expected.get(subject).ok_or_else(|| {
@@ -7119,6 +7231,62 @@ impl Store {
                 if attention_request_is_current_tx(&connection, &request)? {
                     items.push(attention_item_from_request(request));
                 }
+            }
+        }
+        {
+            let connection = self.readers.get();
+            let mut statement = connection.prepare(
+                "SELECT id, store_index, batch_id, subject, kind, origin, actor, body,
+                        predecessors, accepted_at_unix_ms
+                 FROM claims WHERE kind='subscription.mission-failed' ORDER BY store_index",
+            )?;
+            let failures = statement
+                .query_map([], claim_from_row)?
+                .collect::<Result<Vec<_>, _>>()?;
+            for failure in failures {
+                let fields = failure.body.get("fields").unwrap_or(&failure.body);
+                let request = fields
+                    .get("request")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let requester: Option<String> = connection
+                    .query_row(
+                        "SELECT json_extract(body, '$.fields.requester') FROM claims WHERE id=?1",
+                        [request],
+                        |row| row.get(0),
+                    )
+                    .optional()?
+                    .flatten();
+                let reviewer = requester
+                    .filter(|value| value.starts_with("person/"))
+                    .unwrap_or_default();
+                if person.is_some_and(|person| person != reviewer) {
+                    continue;
+                }
+                let code = fields
+                    .get("code")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let reason = fields
+                    .get("reason")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                items.push(AttentionItemView {
+                    kind: "fault".into(),
+                    subject: failure.id,
+                    person: reviewer,
+                    title: "Subscription mission failed".into(),
+                    detail: format!("{code}: {reason}"),
+                    mission: None,
+                    mission_run: None,
+                    step: None,
+                    targets: vec![failure.subject.clone()],
+                    requested_at_unix_ms: failure.accepted_at_unix_ms,
+                    actions: vec![attention_action(
+                        "inspect subscription",
+                        &["st3", "subject", &failure.subject],
+                    )],
+                });
             }
         }
         items.sort_by(|left, right| {
