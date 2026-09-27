@@ -3,7 +3,7 @@
 This file is generated from `st3-schema`.
 
 Schema: `st3.v1`
-Digest: `f4b0844d27787a585ff3b40d885ab182d15cc7c302d013397647be3b66c92f9a`
+Digest: `b9b0e5b72223a1303f26e5eeb5fcb69447a84156c1ce2f538a7e35eaad6f35f1`
 
 ## Subject families
 
@@ -101,7 +101,7 @@ Custom subjects use `custom/NAMESPACE/NAME`. Custom claims use `custom.NAMESPACE
 | `planning-session.started` | `planning-session` | `authorized-requester` | `once` | `durable` | `mission:subject-reference`, `planner:subject-reference`, `planner_config:object`, `request:subject-reference`, `requester:subject-reference`, `target_generation:subject-reference`, `target_run:subject-reference`, `workspace:string` | `planning-session` |
 | `publication.operation` | `*` | `system-only` | `append` | `durable` | `action:string`, `operation:string`, `status!:string` | `revision`, `reset`, `cancellation`, `refresh`, `feedback` |
 | `record.repaired` | `repair` | `ordinary-client` | `once` | `durable` | `reason!:string`, `record!:string`, `replacement!:string` | `repair` |
-| `render.applied` | `agent`, `exec`, `pty` | `system-only` | `append` | `durable` | `writes:array` |  |
+| `render.applied` | `agent`, `exec`, `pty` | `system-only` | `append` | `local` | `writes:array` |  |
 | `repair.applied` | `repair` | `system-only` | `once` | `durable` | `affected_subjects:array`, `item_count:integer`, `reason!:string`, `token!:string` |  |
 | `resource.observed` | `resource` | `ordinary-client` | `append` | `durable` | `kind:string`, `observed_at:integer`, `state:any` | `resource` |
 | `revision-proposal.applied` | `revision-proposal` | `system-only` | `once` | `durable` | `reason:string`, `status:string`, `successor_generation:subject-reference` |  |
@@ -116,7 +116,7 @@ Custom subjects use `custom/NAMESPACE/NAME`. Custom claims use `custom.NAMESPACE
 | `runtime.action.requested` | `agent`, `exec`, `pty`, `gate-operation` | `authorized-requester` | `append` | `durable` | `action:string`, `deadline_unix_ms:string`, `incarnation_id:string`, `operation:string`, `runtime_id:string`, `signal:string`, `terminal:boolean` | `stop`, `gate` |
 | `runtime.action.succeeded` | `agent`, `exec`, `pty`, `gate-operation` | `system-only` | `append` | `durable` | `action:string`, `deadline_key:string`, `desired_token:string`, `incarnation_id:string`, `operation:string`, `operation_status:string`, `reason:string`, `runtime_id:string`, `signal:string`, `terminal:boolean` | `stop`, `gate` |
 | `runtime.observed` | `agent`, `exec`, `pty`, `gate-operation` | `same-subject-actor` | `append` | `durable` | `adopted:boolean`, `driver:string`, `exit_code:integer`, `exit_signal:integer`, `host:string`, `incarnation_id:string`, `reachability:string`, `reason:string`, `runtime_id:string`, `shutdown_timeout_ms:integer`, `status:string`, `terminal:boolean` |  |
-| `runtime.readiness-deadline-reached` | `agent` | `system-only` | `append` | `durable` | `deadline_unix_ms!:string`, `driver!:string`, `incarnation_id!:string`, `reason!:string`, `runtime_id!:string` |  |
+| `runtime.readiness-deadline-reached` | `agent` | `system-only` | `append` | `local` | `deadline_unix_ms!:string`, `driver!:string`, `incarnation_id!:string`, `reason!:string`, `runtime_id!:string` |  |
 | `runtime.reconcile-decision` | `agent`, `exec`, `pty`, `schedule` | `system-only` | `append` | `durable` | `decision:string`, `gate:string`, `input_number:integer`, `key:string`, `reachability:string`, `reason:string`, `restart_at_unix_ms:string` |  |
 | `runtime.restart-window-reset` | `agent`, `exec`, `pty` | `system-only` | `append` | `durable` | `desired_token:string`, `incarnation_id!:string`, `reason!:string` | `reset` |
 | `schedule.occurrence-cancelled` | `schedule` | `system-only` | `append` | `durable` | `occurrence:integer`, `reason:string`, `revision:string` | `schedule` |

@@ -1707,6 +1707,9 @@ fn claim_retention(kind: &str) -> Retention {
         // The owner reads a transcript from the harness's own session file, or from this log
         // when there is none. Other nodes relay timeline reads to the owner.
         "harness.timeline" => Retention::Local,
+        // Only the node that made them reads these: render receipts and the readiness
+        // deadline, whose attention request replicates.
+        "render.applied" | "runtime.readiness-deadline-reached" => Retention::Local,
         // Other nodes read the current harness state and usage: step readiness is judged on
         // the mission's node and fleet views run anywhere. Nothing reads a heartbeat.
         "harness.observed" | "harness.usage" => Retention::Latest,

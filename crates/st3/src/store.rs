@@ -7440,6 +7440,39 @@ impl Store {
             .map_err(Into::into)
     }
 
+    /// Every claim and local observation of `kind` for `subject`, in log order.
+    pub fn observations_for(&self, subject: &str, kind: &str) -> Result<Vec<ClaimRecord>> {
+        let mut records = self.claims_for(subject, Some(kind))?;
+        let connection = self.readers.get();
+        let mut statement = connection.prepare(&format!(
+            "{LOCAL_OBSERVATION_COLUMNS} WHERE subject=?1 AND kind=?2 ORDER BY id"
+        ))?;
+        let rows = statement.query_map(params![subject, kind], |row| {
+            local_observation_from_row(&self.origin, row)
+        })?;
+        records.extend(rows.collect::<rusqlite::Result<Vec<_>>>()?);
+        records.sort_by_key(claim_log_order);
+        Ok(records)
+    }
+
+    /// The newest claim or local observation of `kind` for `subject`.
+    pub fn latest_observation(&self, subject: &str, kind: &str) -> Result<Option<ClaimRecord>> {
+        let claim = self.latest_claim(subject, Some(kind))?;
+        let local = {
+            let connection = self.readers.get();
+            connection
+                .query_row(
+                    &format!(
+                        "{LOCAL_OBSERVATION_COLUMNS} WHERE subject=?1 AND kind=?2 ORDER BY id DESC LIMIT 1"
+                    ),
+                    params![subject, kind],
+                    |row| local_observation_from_row(&self.origin, row),
+                )
+                .optional()?
+        };
+        Ok(claim.into_iter().chain(local).max_by_key(claim_log_order))
+    }
+
     pub fn pending_observer_refresh_attempt(&self, observer: &str) -> Result<Option<String>> {
         let connection = self.readers.get();
         connection
