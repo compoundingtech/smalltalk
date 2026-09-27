@@ -1,13 +1,16 @@
 # Friend-ready candidate status — 2026-09-25
 
-**Release hold.** Source `476aab6` for `st3` and `4be1a21` for `stui` is deployed
+**Release hold.** Source `8fa5be9` for `st3` and `4be1a21` for `stui` is deployed
 as host-native binaries on Hetz and Silber. The direct-network iOS source is
 merged at `e49c097`. A late cross-host reply on September 26 invalidated the
 delivery window, and a peer-down sample invalidated the idle window. After the
 peer recovery fix and bidirectional exact receipts, both evidence windows
-restarted at 10:25:36 UTC (`1790418336`) on September 26. The full 24-hour idle
-and 72-hour bidirectional delivery reports are due September 27 and 29 at
-10:25:36 UTC, respectively.
+restarted at 10:25:36 UTC (`1790418336`) on September 26. The September 27 idle
+report failed its RSS gate. The September 27 `st3` rollout invalidated both old
+windows. Both complete evidence clocks restarted at 10:55:55 UTC
+(`1790506555`) on September 27, after post-rollout linked receipts in both
+directions. The new idle and delivery windows are due September 28 and 30 at
+10:55:55 UTC, respectively. The failed samples and report remain retained.
 Do not describe the friend-ready trial as released until both reports pass and
 their retained evidence is reviewed. The continuously running gate watcher
 notifies the standing st3 operator of post-due transitions; it does not turn a
@@ -26,6 +29,56 @@ not an invitation to start the trial while this hold is active.
 
 These checks are provisional. The 24-hour idle and 72-hour delivery reports remain
 the release gates after the final tested rollout.
+
+## September 27 idle RSS failure and recovery rollout
+
+- At the September 27 10:25:36 UTC due time, the retained 24-hour report found
+  one daemon PID per host, zero errors, and quiet CPU medians within limits
+  (Hetz 8.2%, Silber 13.0%). First-to-last-hour mean RSS grew 105,806 KiB on
+  Hetz and 296,499 KiB on Silber, exceeding the unchanged 65,536 KiB and
+  67,803 KiB limits. The old logs and gate start `1790418336` are preserved.
+  Two later Hetz sampler errors do not change the due-time failure.
+- The Hetz store held about 117,000 replication envelope IDs. Each changed
+  graph snapshot copied the whole inventory, and divergent peer exports also
+  cloned the remote inventory into a search tree. Silber's live `vmmap` showed
+  about 73 MiB allocated in its malloc zone but about 867 MiB resident there;
+  retained freed pages explain why reducing these large temporary allocations
+  is the first remedy. This is a causal hypothesis until the new full gate
+  measures its effect.
+- `8fa5be9` moves the previous inventory buffer into its successor when no
+  concurrent caller holds it, preserving copy-on-write behavior when one does.
+  Divergent peer exports now borrow remote IDs for membership checks. A new
+  regression verifies buffer reuse; the existing shared-snapshot and canonical
+  order tests pass. The full Linux `st3` test suite, focused macOS snapshot
+  tests, release builds on both hosts, formatting, and the Nix pi/OMP extension
+  check passed.
+- Hetz and Silber installed `st3` SHA-256
+  `baa39f82d533e8166cf2e1b99c82d65e013438ad1a1cae712b76e044ab5d2601`
+  and `0edda69973aaaafe2285e3f383acfd14d21cdc1dc40a5ff81fe78c3f20949993`,
+  respectively. Both saved the prior executable in local
+  `rollout-backups/8fa5be9-20260927/st3-before`. Daemon and replication worker
+  were restarted one host at a time. Both strict doctors pass, signed peers
+  report up, and pending records are zero. ST3, pty-rust, OMP, and CoS seats
+  remain reachable.
+- The first post-restart Hetz-to-Silber monitor send failed: the newly enforced
+  harness guard saw the monitor service's operator `ST_AGENT` while the probe
+  sent as its separate monitor identity. `e6b00fa` clears that guard only for
+  the probe's send and archive commands, preserving it for operator attention
+  actions. The installed monitor restarted at 10:54:11 UTC. Exact linked
+  receipts then passed Hetz-to-Silber at 10:54:39 UTC (28 seconds) and
+  Silber-to-Hetz at 10:55:20 UTC (20 seconds), with one matching reply each.
+  The pre-repair failure remains in `message-soak/events.log`.
+- `1d023da` applies the same identity separation to gate watcher notifications.
+  Its focused watcher test passed, and the repaired installed script recorded
+  `idle=waiting`, `idle_preflight=healthy`, and `message=waiting`.
+- Both evidence markers are now `1790506555` (10:55:55 UTC), the first healthy
+  Silber sample after both linked receipts. The new 24-hour idle due time is
+  September 28 10:55:55 UTC; the 72-hour delivery due time is September 30
+  10:55:55 UTC. The prior marker is saved in each old report and in Hetz's
+  local `rollout-backups/8fa5be9-20260927/friend-ready-gates-before.env`.
+  The three-minute idle preflight passed with three Hetz and four Silber
+  samples, zero errors, one PID each, and maximum gaps of 60 and 61 seconds.
+  The full gates remain pending.
 
 ## September 26 peer stream recovery and evidence restart
 
