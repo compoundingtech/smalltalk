@@ -1008,3 +1008,87 @@ mission "queued-work" state="ready" {
     );
     server.abort();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn missions_queued_cli_matches_agents_queue_show() {
+    let root = tempfile::tempdir().unwrap();
+    let socket = root.path().join("st3.sock");
+    let config_home = root.path().join("config");
+    std::fs::create_dir_all(config_home.join("st3")).unwrap();
+    std::fs::write(
+        config_home.join("st3/config.toml"),
+        "person = \"person/config-operator\"\n",
+    )
+    .unwrap();
+    let state = test_state(root.path());
+    let store = state.store.clone();
+    let source = r#"version 2
+agent "queued-alias-seat" { workspace "/tmp"; command "true" }
+mission "queued-alias-work" state="ready" {
+  concurrent-runs
+  goal "Give the durable seat one step."
+  step "work" { assigned-to "agent/queued-alias-seat" }
+}
+"#;
+    let intent = st3::graph::parse_intent(source, "client-v0-cli").unwrap();
+    let planned = store
+        .mission(
+            &intent,
+            IntentInput {
+                kdl: source.into(),
+                source_name: None,
+            },
+        )
+        .unwrap();
+    store
+        .apply(&intent, &planned.subject_tokens, "cli-queued-alias")
+        .unwrap();
+    let run = store
+        .create_mission_run(&MissionRunRequest {
+            mission: "queued-alias-work".into(),
+            revision: None,
+            workspace: "/tmp".into(),
+            requester: Some("person/requester".into()),
+            mode: Some("run".into()),
+            inputs: BTreeMap::new(),
+            idempotency_key: "cli-queued-alias-run-0".into(),
+        })
+        .unwrap();
+    store
+        .set_step_state(&run.steps[0].subject, "ready", None)
+        .unwrap();
+    let seat = run.steps[0].assigned_to.clone().unwrap();
+
+    let server_socket = socket.clone();
+    let server =
+        tokio::spawn(
+            async move { st3::api::serve_unix(&server_socket, st3::api::router(state)).await },
+        );
+    for _ in 0..100 {
+        if socket.exists() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert!(socket.exists(), "client-v0 test socket did not appear");
+
+    let via_agents =
+        value(&run_queue_cli(&socket, &config_home, true, &["agents", "queue", &seat]).await);
+    let via_missions =
+        value(&run_queue_cli(&socket, &config_home, true, &["missions", "queued", &seat]).await);
+    // `request_id` is minted fresh per call; every other field must match exactly.
+    assert_eq!(via_agents["value"], via_missions["value"]);
+    assert_eq!(via_agents["snapshot"], via_missions["snapshot"]);
+    assert_eq!(via_missions["value"]["kind"], "agent-queue");
+    assert_eq!(via_missions["value"]["next_work_id"], run.steps[0].subject);
+
+    let human_agents =
+        run_queue_cli(&socket, &config_home, false, &["agents", "queue", &seat]).await;
+    let human_missions =
+        run_queue_cli(&socket, &config_home, false, &["missions", "queued", &seat]).await;
+    assert!(human_agents.status.success());
+    assert!(human_missions.status.success());
+    assert_eq!(human_agents.stdout, human_missions.stdout);
+
+    server.abort();
+}

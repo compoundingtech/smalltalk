@@ -224,9 +224,11 @@ runtime, host, work, conversation, stale state, and whether stopped history stay
 
 Copy a durable seat into `agents queue`. Check that the current claim comes first, then each queued
 mission run in order with `claimed`, `ready`, or `waiting`, and that `NEXT WORK` matches
-`agents show`. `agents queue move AGENT RUN --top`, `--bottom`, `--before RUN`, or `--after RUN`
-is a person-authorized mutation; move only a run we agreed to reorder, then confirm the move is
-listed with its author and time and that a held step stayed held.
+`agents show`. `st3 missions queued AGENT` prints the exact same view for someone who thinks of
+this as a mission question rather than an agent one. `agents queue move AGENT RUN --top`,
+`--bottom`, `--before RUN`, or `--after RUN` is a person-authorized mutation; move only a run we
+agreed to reorder, then confirm the move is listed with its author and time and that a held step
+stayed held.
 
 ### 8. `terminals` — inspect and attach without shell nesting
 
