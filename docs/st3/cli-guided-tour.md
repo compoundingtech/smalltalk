@@ -134,6 +134,15 @@ st3 attention reject --help
 Every row should say why Nathan is involved, what happens if he does nothing, whether it is stale,
 and the exact actions available now.
 
+A subscription that holds mission requests for a person raises one attention item. Inspect the
+subscription request commands without changing live state:
+
+```sh
+st3 missions requests --help
+st3 missions release --help
+st3 missions cancel-request --help
+```
+
 ### 5. `launch` — chat, shape, approve, and launch a mission
 
 Why: `launch` is the human product workflow for turning intent into a durable mission. “Planning” is

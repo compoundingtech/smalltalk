@@ -334,63 +334,73 @@ async fn observe_github_repository_at(
             .and_then(|_| previous_cursor.get(name))
             .and_then(Value::as_str)
     };
+    let previous_repository_id = request
+        .previous_facts
+        .as_ref()
+        .and_then(|facts| facts.get("repository_id"))
+        .and_then(Value::as_u64);
+    // A renamed repository answers through a redirect. Its numeric ID proves that the locator
+    // still names the repository whose items were observed before.
+    let mut repository_etag = previous_repository_id
+        .and(previous_etag("repository"))
+        .map(str::to_owned);
+    let response = github_response(
+        request_json(base.clone(), repository_etag.as_deref())
+            .send()
+            .await?,
+        token.is_none(),
+    )?;
+    let repository_id = match previous_repository_id {
+        Some(previous) if response.status() == reqwest::StatusCode::NOT_MODIFIED => previous,
+        _ => {
+            repository_etag = response_etag(&response);
+            let metadata: Value = response.json().await?;
+            metadata
+                .get("id")
+                .and_then(Value::as_u64)
+                .context("the GitHub repository response has no numeric ID")?
+        }
+    };
     let mut pulls_etag = previous_etag("pulls").map(str::to_owned);
-    let pulls: Vec<Value> = if request.fields.contains("pull_requests") {
-        let response = github_response(
-            request_json(
-                format!("{base}/pulls?state=open&per_page=100"),
-                pulls_etag.as_deref(),
-            )
-            .send()
-            .await?,
+    let mut pulls = Vec::new();
+    if request.fields.contains("pull_requests")
+        && let Some((items, etag)) = github_list(
+            &request_json,
+            format!("{base}/pulls?state=open&per_page=100"),
+            pulls_etag.as_deref(),
             token.is_none(),
-        )?;
-        if response.status() == reqwest::StatusCode::NOT_MODIFIED {
-            Vec::new()
-        } else {
-            pulls_etag = response
-                .headers()
-                .get(reqwest::header::ETAG)
-                .and_then(|value| value.to_str().ok())
-                .map(str::to_owned);
-            response.json().await?
-        }
-    } else {
-        Vec::new()
-    };
+        )
+        .await?
+    {
+        pulls = items;
+        pulls_etag = etag;
+    }
     let mut issues_etag = previous_etag("issues").map(str::to_owned);
-    let issues: Vec<Value> = if request.fields.contains("issues") {
-        let response = github_response(
-            request_json(
-                format!("{base}/issues?state=open&per_page=100"),
-                issues_etag.as_deref(),
-            )
-            .send()
-            .await?,
+    let mut issues = Vec::new();
+    if request.fields.contains("issues")
+        && let Some((items, etag)) = github_list(
+            &request_json,
+            format!("{base}/issues?state=open&per_page=100"),
+            issues_etag.as_deref(),
             token.is_none(),
-        )?;
-        if response.status() == reqwest::StatusCode::NOT_MODIFIED {
-            Vec::new()
-        } else {
-            issues_etag = response
-                .headers()
-                .get(reqwest::header::ETAG)
-                .and_then(|value| value.to_str().ok())
-                .map(str::to_owned);
-            response.json().await?
-        }
-    } else {
-        Vec::new()
-    };
+        )
+        .await?
+    {
+        issues = items;
+        issues_etag = etag;
+    }
     let facts = normalize_github_repository(
         request.previous_facts.as_ref(),
+        repository_id,
         &pulls,
         &issues,
         &request.fields,
-    );
-    let cursor = Some(serde_json::to_string(
-        &json!({"pulls": pulls_etag, "issues": issues_etag}),
-    )?);
+    )?;
+    let cursor = Some(serde_json::to_string(&json!({
+        "repository": repository_etag,
+        "pulls": pulls_etag,
+        "issues": issues_etag
+    }))?);
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -399,6 +409,76 @@ async fn observe_github_repository_at(
         facts,
         cursor,
         next_check_unix_ms: now.saturating_add(60_000),
+    })
+}
+
+/// The most pages one GitHub listing reads. A larger listing fails the observation instead of
+/// recording a partial one, because a partial listing makes older items look new later.
+const GITHUB_LIST_PAGES: usize = 10;
+
+/// Read every page of one GitHub list endpoint. `None` means the first page answered
+/// `304 Not Modified` for `etag`. The listing's ETag is returned only for a single page, because
+/// the first page's ETag says nothing about the pages after it.
+async fn github_list(
+    request_json: &impl Fn(String, Option<&str>) -> reqwest::RequestBuilder,
+    url: String,
+    etag: Option<&str>,
+    unauthenticated: bool,
+) -> Result<Option<(Vec<Value>, Option<String>)>> {
+    let mut items = Vec::new();
+    let mut next = Some(url);
+    let mut pages = 0;
+    let mut first_etag = None;
+    while let Some(url) = next {
+        anyhow::ensure!(
+            pages < GITHUB_LIST_PAGES,
+            "the GitHub listing has more than {GITHUB_LIST_PAGES} pages"
+        );
+        let response = github_response(
+            request_json(url, etag.filter(|_| pages == 0))
+                .send()
+                .await?,
+            unauthenticated,
+        )?;
+        if pages == 0 {
+            if response.status() == reqwest::StatusCode::NOT_MODIFIED {
+                return Ok(None);
+            }
+            first_etag = response_etag(&response);
+        }
+        pages += 1;
+        next = response
+            .headers()
+            .get(reqwest::header::LINK)
+            .and_then(|value| value.to_str().ok())
+            .and_then(github_next_page);
+        items.extend(response.json::<Vec<Value>>().await?);
+    }
+    Ok(Some((items, first_etag.filter(|_| pages == 1))))
+}
+
+fn response_etag(response: &reqwest::Response) -> Option<String> {
+    response
+        .headers()
+        .get(reqwest::header::ETAG)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned)
+}
+
+/// Return the `rel="next"` target of a GitHub `Link` header.
+fn github_next_page(link: &str) -> Option<String> {
+    link.split(',').find_map(|part| {
+        let (target, parameters) = part.split_once(';')?;
+        parameters
+            .split(';')
+            .any(|parameter| parameter.trim() == r#"rel="next""#)
+            .then(|| {
+                target
+                    .trim()
+                    .trim_start_matches('<')
+                    .trim_end_matches('>')
+                    .to_owned()
+            })
     })
 }
 
@@ -434,13 +514,36 @@ async fn lookup_github_token() -> Option<String> {
         .filter(|token| !token.is_empty())
 }
 
-fn normalize_github_repository(
+/// Merge one complete repository listing into the previous facts. Items are identified by
+/// their number within the observed repository, so a rename keeps every identity. A listing
+/// never removes a previous item or a field that this observation did not request.
+pub(crate) fn normalize_github_repository(
     previous: Option<&Value>,
+    repository_id: u64,
     pulls: &[Value],
     issues: &[Value],
     fields: &BTreeSet<String>,
-) -> Value {
-    let mut facts = serde_json::Map::new();
+) -> Result<Value> {
+    if let Some(previous_id) = previous
+        .and_then(|value| value.get("repository_id"))
+        .and_then(Value::as_u64)
+    {
+        anyhow::ensure!(
+            previous_id == repository_id,
+            "the locator now names GitHub repository {repository_id}, not the observed repository {previous_id}"
+        );
+    }
+    let mut facts = previous
+        .and_then(Value::as_object)
+        .map(|previous| {
+            previous
+                .iter()
+                .filter(|(field, _)| matches!(field.as_str(), "pull_requests" | "issues"))
+                .map(|(field, value)| (field.clone(), value.clone()))
+                .collect::<serde_json::Map<_, _>>()
+        })
+        .unwrap_or_default();
+    facts.insert("repository_id".into(), Value::from(repository_id));
     if fields.contains("pull_requests") {
         let mut values = previous
             .and_then(|value| value.get("pull_requests"))
@@ -488,7 +591,7 @@ fn normalize_github_repository(
         values.sort_by_key(|value| value.get("number").and_then(Value::as_u64));
         facts.insert("issues".into(), Value::Array(values));
     }
-    Value::Object(facts)
+    Ok(Value::Object(facts))
 }
 
 fn observe_local_file(request: ObservationRequest) -> Result<ProviderObservation> {
@@ -784,6 +887,7 @@ mod tests {
         let fields = BTreeSet::from(["pull_requests".into(), "issues".into()]);
         let facts = normalize_github_repository(
             None,
+            7,
             &[
                 json!({"number": 1, "draft": true, "title": "draft"}),
                 json!({"number": 2, "draft": false, "title": "ready", "head": {"sha": "abc"}}),
@@ -793,7 +897,8 @@ mod tests {
                 json!({"number": 3, "title": "Issue"}),
             ],
             &fields,
-        );
+        )
+        .unwrap();
         assert_eq!(facts["pull_requests"].as_array().unwrap().len(), 1);
         assert_eq!(facts["pull_requests"][0]["number"], 2);
         assert_eq!(facts["issues"].as_array().unwrap().len(), 1);
@@ -806,12 +911,14 @@ mod tests {
         let previous = json!({"pull_requests": [{"number": 1, "title": "old"}]});
         let facts = normalize_github_repository(
             Some(&previous),
+            7,
             &[json!({"number": 2, "draft": false, "title": "now ready"})],
             &[],
             &fields,
-        );
+        )
+        .unwrap();
         assert_eq!(facts["pull_requests"].as_array().unwrap().len(), 2);
-        let repeated = normalize_github_repository(Some(&facts), &[], &[], &fields);
+        let repeated = normalize_github_repository(Some(&facts), 7, &[], &[], &fields).unwrap();
         assert_eq!(repeated, facts);
     }
 
@@ -821,7 +928,8 @@ mod tests {
         let base = format!("http://{}", listener.local_addr().unwrap());
         let server = tokio::spawn(async move {
             let mut requests = Vec::new();
-            for index in 0..2 {
+            // Each observation reads the repository, then its issues.
+            for index in 0..4 {
                 let (mut stream, _) = listener.accept().await.unwrap();
                 let mut request = Vec::new();
                 loop {
@@ -833,10 +941,17 @@ mod tests {
                     }
                 }
                 requests.push(String::from_utf8(request).unwrap());
-                let body = r#"[{"number":7,"title":"An invented issue"}]"#;
-                let response = if index == 0 {
+                let (etag, body) = if index % 2 == 0 {
+                    ("\"repo-v1\"", r#"{"id":7}"#)
+                } else {
+                    (
+                        "\"issues-v1\"",
+                        r#"[{"number":7,"title":"An invented issue"}]"#,
+                    )
+                };
+                let response = if index < 2 {
                     format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nETag: \"issues-v1\"\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nETag: {etag}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                         body.len()
                     )
                 } else {
@@ -869,13 +984,19 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(second.facts, first.facts);
-        let requests = server.await.unwrap();
-        assert!(!requests[0].to_ascii_lowercase().contains("if-none-match"));
-        assert!(
-            requests[1]
-                .to_ascii_lowercase()
-                .contains("if-none-match: \"issues-v1\"")
-        );
+        assert_eq!(second.facts["repository_id"], 7);
+        let requests = server
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|request| request.to_ascii_lowercase())
+            .collect::<Vec<_>>();
+        assert!(requests[0].starts_with("get /repos/example/repo "));
+        assert!(requests[1].starts_with("get /repos/example/repo/issues?"));
+        assert!(!requests[0].contains("if-none-match"));
+        assert!(!requests[1].contains("if-none-match"));
+        assert!(requests[2].contains("if-none-match: \"repo-v1\""));
+        assert!(requests[3].contains("if-none-match: \"issues-v1\""));
     }
 
     #[test]
@@ -885,5 +1006,56 @@ mod tests {
         headers.insert(reqwest::header::RETRY_AFTER, "120".parse().unwrap());
         headers.insert("x-ratelimit-reset", "1050".parse().unwrap());
         assert_eq!(github_retry_at(&headers, now), now + 120_000);
+    }
+
+    #[test]
+    fn a_renamed_repository_keeps_its_items_and_a_narrower_read_keeps_other_fields() {
+        let fields = BTreeSet::from(["pull_requests".into(), "issues".into()]);
+        let before = normalize_github_repository(
+            None,
+            7,
+            &[json!({"number": 4, "draft": false, "title": "PR", "html_url": "https://github.com/acme/old/pull/4"})],
+            &[json!({"number": 5, "title": "Issue", "html_url": "https://github.com/acme/old/issues/5"})],
+            &fields,
+        )
+        .unwrap();
+
+        let renamed = normalize_github_repository(
+            Some(&before),
+            7,
+            &[json!({"number": 4, "draft": false, "title": "PR", "html_url": "https://github.com/acme/new/pull/4"})],
+            &[json!({"number": 5, "title": "Issue", "html_url": "https://github.com/acme/new/issues/5"})],
+            &fields,
+        )
+        .unwrap();
+        assert_eq!(renamed, before);
+
+        let narrower = normalize_github_repository(
+            Some(&before),
+            7,
+            &[],
+            &[],
+            &BTreeSet::from(["pull_requests".into()]),
+        )
+        .unwrap();
+        assert_eq!(narrower, before);
+
+        let error = normalize_github_repository(Some(&before), 8, &[], &[], &fields).unwrap_err();
+        assert!(error.to_string().contains("repository 8"), "{error}");
+    }
+
+    #[test]
+    fn a_github_link_header_names_its_next_page() {
+        let link = r#"<https://api.github.com/repositories/7/issues?state=open&page=2>; rel="next", <https://api.github.com/repositories/7/issues?state=open&page=4>; rel="last""#;
+        assert_eq!(
+            github_next_page(link).as_deref(),
+            Some("https://api.github.com/repositories/7/issues?state=open&page=2")
+        );
+        assert_eq!(
+            github_next_page(
+                r#"<https://api.github.com/repositories/7/issues?page=1>; rel="prev""#
+            ),
+            None
+        );
     }
 }

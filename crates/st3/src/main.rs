@@ -30,8 +30,8 @@ use st3::model::{
     ReplicaRecordView, ReplicationRepairRequest, ReplicationStatus, ReviewRequest,
     RevisionApprovalRequest, RevisionCancelRequest, RevisionProposalView, RevisionSubmissionView,
     RunGenerationView, SessionControlResponse, SessionInputMode, SessionInputRequest,
-    SessionScreen, SessionSignalRequest, StatusResponse, StepRunView, WorkRequest,
-    WorkRetryRequest, WorkWakeRequest,
+    SessionScreen, SessionSignalRequest, StatusResponse, StepRunView, SubscriptionRequestDecision,
+    SubscriptionRequestView, WorkRequest, WorkRetryRequest, WorkWakeRequest,
 };
 use st3::reconcile::Reconciler;
 use st3::store::Store;
@@ -289,6 +289,17 @@ enum MissionViewCommand {
         /// Exact seat subject or its identity without the `agent/` prefix.
         agent: String,
     },
+    /// List the open mission requests that one subscription recorded.
+    Requests {
+        subscription: String,
+        /// Include started, cancelled, and failed requests.
+        #[arg(long)]
+        all: bool,
+    },
+    /// Start one mission request that an observation held for a person.
+    Release(SubscriptionRequestArgs),
+    /// Close one pending or held mission request without starting it.
+    CancelRequest(SubscriptionRequestArgs),
 }
 
 #[derive(Args)]
@@ -1046,6 +1057,15 @@ enum SchemaCommand {
     Show { kind: String },
     /// Export the complete registry.
     Export,
+}
+
+#[derive(Args)]
+struct SubscriptionRequestArgs {
+    request: String,
+    #[arg(long = "as", value_parser = parse_person_subject)]
+    actor: String,
+    #[arg(long)]
+    reason: String,
 }
 
 #[derive(Subcommand)]
@@ -2237,6 +2257,15 @@ async fn run_mission_view(
         }
         MissionViewCommand::Queued { agent } => {
             show_agent_queue(endpoint, &agent, json_output).await
+        }
+        MissionViewCommand::Requests { subscription, all } => {
+            list_subscription_requests(client, subscription, all, json_output).await
+        }
+        MissionViewCommand::Release(args) => {
+            decide_subscription_request(client, "release", args, json_output).await
+        }
+        MissionViewCommand::CancelRequest(args) => {
+            decide_subscription_request(client, "cancel", args, json_output).await
         }
     }
 }
@@ -8934,6 +8963,73 @@ fn read_intent(path: Option<&Path>) -> Result<(String, Option<String>)> {
     }
 }
 
+async fn list_subscription_requests(
+    client: &Client,
+    subscription: String,
+    all: bool,
+    json_output: bool,
+) -> Result<()> {
+    let subscription = if subscription.starts_with("subscription/") {
+        subscription
+    } else {
+        format!("subscription/{subscription}")
+    };
+    let mut requests: Vec<SubscriptionRequestView> = client
+        .get(&format!(
+            "/v1/subscription-requests?subscription={}",
+            urlencoding::encode(&subscription)
+        ))
+        .await?;
+    if !all {
+        requests.retain(|request| matches!(request.status.as_str(), "pending" | "held"));
+    }
+    if json_output {
+        return print_value(&requests, true);
+    }
+    println!("REQUESTS  {}", requests.len());
+    println!("SUBSCRIPTION  {subscription}");
+    for request in &requests {
+        println!(
+            "{}  {}  {}{}",
+            request.request,
+            request.status,
+            request.resource,
+            request
+                .mission_run
+                .as_deref()
+                .map(|run| format!("  {run}"))
+                .unwrap_or_default()
+        );
+    }
+    Ok(())
+}
+
+async fn decide_subscription_request(
+    client: &Client,
+    decision: &str,
+    args: SubscriptionRequestArgs,
+    json_output: bool,
+) -> Result<()> {
+    let response: SubscriptionRequestView = client
+        .post(
+            &format!(
+                "/v1/subscription-requests/{decision}/{}",
+                urlencoding::encode(&args.request)
+            ),
+            &SubscriptionRequestDecision {
+                actor: args.actor,
+                reason: args.reason,
+                idempotency_key: format!(
+                    "subscription-request-{decision}:{}:{}",
+                    args.request,
+                    uuid::Uuid::now_v7().simple()
+                ),
+            },
+        )
+        .await?;
+    print_value(&response, json_output)
+}
+
 fn print_value(value: &impl serde::Serialize, json_output: bool) -> Result<()> {
     if json_output {
         println!("{}", serde_json::to_string_pretty(value)?);
@@ -11142,6 +11238,41 @@ mod tests {
         );
         let planning = st3::parse_intent(&planning, "node").unwrap();
         assert_eq!(planning.planning_sessions.len(), 1);
+    }
+
+    #[test]
+    fn subscription_request_decisions_need_a_person() {
+        let cli = Cli::try_parse_from([
+            "st3",
+            "missions",
+            "release",
+            "request-id",
+            "--as",
+            "person/operator",
+            "--reason",
+            "the held review is real",
+        ])
+        .unwrap();
+        let Command::Missions {
+            command: MissionViewCommand::Release(args),
+        } = cli.command
+        else {
+            panic!("the missions release command did not parse");
+        };
+        assert_eq!(args.actor, "person/operator");
+        assert!(
+            Cli::try_parse_from([
+                "st3",
+                "missions",
+                "cancel-request",
+                "request-id",
+                "--as",
+                "agent/node.triage",
+                "--reason",
+                "an agent cannot decide",
+            ])
+            .is_err()
+        );
     }
 
     #[test]

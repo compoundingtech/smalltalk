@@ -133,6 +133,14 @@ A registered provider converts one locator into normalized resource fields.
 
 The provider returns an unchanged result or one complete observation. A partial response cannot replace the last good observation.
 
+The GitHub repository provider reads every page of the open pull request and issue listings, up to
+10 pages each. A larger listing fails the observation instead of recording part of it, because a
+partial listing makes older items look new later. The provider also records the repository's
+numeric ID. A renamed repository answers its old locator through a redirect with the same ID, so
+every item keeps its identity. A different ID fails the observation. An item is identified by its
+number within the observed resource. A listing never removes a previous item or a field that the
+observation did not request.
+
 The provider can use a webhook, a stream, or a conditional request. A conditional provider returns one next-check deadline.
 
 The daemon records that deadline as a one-shot wake. It does not run a periodic discovery sweep.
@@ -169,6 +177,21 @@ subscription "new-ready-pull-requests" {
 ```
 
 The repository provider creates one mission request for each newly discovered item. The run input pins that item's exact discovery claim.
+
+The first listing that records a repository ID is a baseline for its collections. Earlier facts
+came from a first-page read, so the older items it adds were missed, not opened.
+
+One observation requests at most five mission runs for one subscription. It records the rest as
+held requests and asks `person/operator` once to decide them. A person lists, releases, or cancels
+requests:
+
+```sh
+st3 missions requests subscription/NAME
+st3 missions release REQUEST --as person/operator --reason "the review is needed"
+st3 missions cancel-request REQUEST --as person/operator --reason "an old issue resurfaced"
+```
+
+A released request starts like any pending request. A cancelled request never starts.
 
 An optional `requester` assigns run revision authority to one exact agent or person. The requester still needs its matching `mission-authority` rule.
 
@@ -246,6 +269,8 @@ mission cancellation to stop it.
 - An unchanged provider result creates no claim and no message.
 - A selected scalar field change creates one observation claim and one message.
 - Each new repository collection item creates one resource and one mission request.
+- A renamed locator and a first complete listing create no mission request.
+- One observation holds each request beyond its first five for a person.
 - A draft-to-ready transition creates one pull request resource and one mission request.
 - Pull requests from the GitHub issues endpoint do not create issue resources.
 - An unselected field change creates an observation claim and no message for that subscription.

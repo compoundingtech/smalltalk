@@ -675,6 +675,7 @@ fn resource_specs() -> BTreeMap<String, ResourceSpec> {
                 ("state", string()),
                 ("pull_requests", array()),
                 ("issues", array()),
+                ("repository_id", integer()),
             ],
         ),
     );
@@ -1583,7 +1584,16 @@ fn claim_specs() -> BTreeMap<String, ClaimSpec> {
         (
             "subscription.mission-request-cancelled",
             &["subscription"],
-            WritePolicy::SystemOnly,
+            WritePolicy::AuthorizedParticipant,
+            Cardinality::Append,
+            Some("subscriptions"),
+            true,
+            &["subscription"],
+        ),
+        (
+            "subscription.mission-request-released",
+            &["subscription"],
+            WritePolicy::AuthorizedParticipant,
             Cardinality::Append,
             Some("subscriptions"),
             true,
@@ -2306,8 +2316,9 @@ fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
             ("workspace", required_string()),
             ("discovery", required_string()),
             ("requester", reference_to(&["agent", "person"])),
+            ("held", boolean()),
         ],
-        "subscription.mission-request-cancelled" => {
+        "subscription.mission-request-cancelled" | "subscription.mission-request-released" => {
             &[("request", required_string()), ("reason", string())]
         }
         "subscription.mission-started" => &[
@@ -2640,6 +2651,7 @@ mod tests {
                 "subscription.mission-deferred",
                 "subscription.mission-failed",
                 "subscription.mission-request-cancelled",
+                "subscription.mission-request-released",
                 "subscription.mission-requested",
                 "subscription.mission-started",
                 "subscription.state",
@@ -2810,6 +2822,8 @@ mod tests {
                 "message.read",
                 "planning-session.candidate-submitted",
                 "planning-session.question-requested",
+                "subscription.mission-request-cancelled",
+                "subscription.mission-request-released",
                 "work.claimed",
                 "work.failed",
                 "work.progress",
