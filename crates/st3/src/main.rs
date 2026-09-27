@@ -5671,7 +5671,14 @@ fn render_client_work_detail(work: &st3_client::Work) -> String {
         let _ = writeln!(output, "Incarnation: {incarnation}");
     }
     if let Some(reason) = &work.blocked_reason {
-        let _ = writeln!(output, "Blocked: {reason}");
+        // The store keeps the reason for any state change here, such as a failure or an
+        // expired lease; only blocked work is blocked by it.
+        let label = if work.state == "blocked" {
+            "Blocked"
+        } else {
+            "Reason"
+        };
+        let _ = writeln!(output, "{label}: {reason}");
     }
     for blocker in &work.blockers {
         let _ = writeln!(output, "Blocker: {blocker}");
@@ -9445,6 +9452,29 @@ mod tests {
         assert!(
             rendered.contains("peek: st3 terminals peek agent/release"),
             "{rendered}"
+        );
+    }
+
+    #[test]
+    fn work_detail_labels_a_reason_blocked_only_for_blocked_work() {
+        let page = fixture_product_page(&["work"], false);
+        let ClientResource::Work(work) = &page.items[0] else {
+            panic!("expected work fixture");
+        };
+        let mut work = work.clone();
+        work.blocked_reason = Some("the step's lease expired".into());
+        work.state = "claimed".into();
+        let claimed = render_client_work_detail(&work);
+        assert!(!claimed.contains("Blocked:"), "{claimed}");
+        assert!(
+            claimed.contains("\nReason: the step's lease expired\n"),
+            "{claimed}"
+        );
+        work.state = "blocked".into();
+        let blocked = render_client_work_detail(&work);
+        assert!(
+            blocked.contains("\nBlocked: the step's lease expired\n"),
+            "{blocked}"
         );
     }
 
