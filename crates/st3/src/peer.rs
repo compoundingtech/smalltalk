@@ -43,7 +43,6 @@ const REPLICATION_WAKE_COALESCE: Duration = Duration::from_secs(1);
 const CLIENT_READ_PATH: &str = "/v1/peer/client-read";
 const JOIN_PATH: &str = "/v1/fleet/join";
 const MAX_JOIN_BYTES: usize = 4096;
-const JOIN_ATTEMPTS_PER_MINUTE: usize = 10;
 const MAX_CLIENT_READ_BYTES: usize = 1_048_576;
 const HEADER_FLEET: &str = "x-st3-fleet";
 const HEADER_NODE: &str = "x-st3-node";
@@ -1613,32 +1612,13 @@ async fn receive_exchange(
     }
 }
 
-/// At most ten join attempts a minute across all invites, so the unauthenticated route cannot
-/// be used to grind at a token.
-fn join_attempt_allowed() -> bool {
-    static ATTEMPTS: std::sync::OnceLock<
-        std::sync::Mutex<std::collections::VecDeque<std::time::Instant>>,
-    > = std::sync::OnceLock::new();
-    let mut attempts = ATTEMPTS
-        .get_or_init(Default::default)
-        .lock()
-        .expect("join attempt lock poisoned");
-    let now = std::time::Instant::now();
-    while attempts
-        .front()
-        .is_some_and(|attempt| now.duration_since(*attempt) > Duration::from_secs(60))
-    {
-        attempts.pop_front();
-    }
-    if attempts.len() >= JOIN_ATTEMPTS_PER_MINUTE {
-        return false;
-    }
-    attempts.push_back(now);
-    true
-}
-
 /// The join route. It exists only while this node sponsors an open invite; otherwise it answers
 /// 404 like any unknown path. Every refusal looks the same to the caller.
+///
+/// There is no request quota: one spent before the proof is checked would let any caller block
+/// real joins. A request is cheap to refuse (a bounded body, one lookup, one HMAC), a 128-bit
+/// token cannot be guessed, and five bad proofs naming one invite burn that invite, which only
+/// someone holding the code can name.
 async fn receive_join(State(state): State<PeerState>, body: Bytes) -> Response {
     let refused = || {
         (
@@ -1650,9 +1630,6 @@ async fn receive_join(State(state): State<PeerState>, body: Bytes) -> Response {
     let Ok(request) = serde_json::from_slice::<crate::fleet::handshake::JoinRequest>(&body) else {
         return refused();
     };
-    if !join_attempt_allowed() {
-        return StatusCode::TOO_MANY_REQUESTS.into_response();
-    }
     let Some(member) = state.auth.member.clone() else {
         return StatusCode::NOT_FOUND.into_response();
     };
