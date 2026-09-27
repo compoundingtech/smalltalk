@@ -18,10 +18,11 @@ permissions:
 
 concurrency:
   group: smalltalk-release-${{ github.ref }}
-  cancel-in-progress: false
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   build:
+    if: github.event_name != 'push' || github.event.deleted == false
     name: release-build (${{ matrix.target }})
     strategy:
       fail-fast: false

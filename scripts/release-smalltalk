@@ -11,6 +11,7 @@ case "$target:$(uname -sm)" in
 esac
 repo=$(cd "$(dirname "$0")/.." && pwd)
 cd "$repo"
+test -z "$(git status --porcelain --untracked-files=no)"
 mkdir -p "$out"
 out=$(cd "$out" && pwd)
 work=$(mktemp -d)
@@ -28,10 +29,10 @@ json.dump(pin, open(sys.argv[1], 'w'))
 PY
 pty_rev=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["rev"])' "$work/pin.json")
 pty_url=$(python3 -c 'import json,sys; p=json.load(open(sys.argv[1])); print("https://github.com/"+p["owner"]+"/"+p["repo"]+".git")' "$work/pin.json")
-cargo build --release --locked -p st3 -p st3-migrate -p stui
+cargo build --release --locked --target "$target" -p st3 -p st3-migrate -p stui
 build_dir=$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])')
 for binary in st3 st3-migrate stui; do
-  install -m 0755 "$build_dir/release/$binary" "$work/$package/bin/$binary"
+  install -m 0755 "$build_dir/$target/release/$binary" "$work/$package/bin/$binary"
 done
 
 git init -q "$work/pty"
@@ -40,8 +41,8 @@ git -C "$work/pty" fetch --depth 1 origin "$pty_rev"
 git -C "$work/pty" checkout -q --detach FETCH_HEAD
 test "$(git -C "$work/pty" rev-parse HEAD)" = "$pty_rev"
 cargo build --release --locked --manifest-path "$work/pty/Cargo.toml" \
-  --target-dir "$work/pty-target" -p pty --bin pty
-install -m 0755 "$work/pty-target/release/pty" "$work/$package/bin/pty"
+  --target-dir "$work/pty-target" --target "$target" -p pty --bin pty
+install -m 0755 "$work/pty-target/$target/release/pty" "$work/$package/bin/pty"
 ln -s st3 "$work/$package/bin/st"
 install -m 0755 scripts/install-release "$work/$package/install.sh"
 cp docs/st3/binary-releases.md "$work/$package/README.md"
@@ -51,13 +52,13 @@ for binary in st3 stui st3-migrate pty; do
   file "$path"
   if [[ $target == *linux* ]]; then
     readelf --program-headers "$path" > "$work/headers"
-    ! grep -F '/nix/store/' "$work/headers"
+    if grep -F '/nix/store/' "$work/headers"; then exit 1; fi
     ldd "$path" > "$work/links"
-    ! grep -E 'not found|/nix/store/' "$work/links"
+    if grep -E 'not found|/nix/store/' "$work/links"; then exit 1; fi
   else
     otool -L "$path" > "$work/links"
     # Standalone archives may link only Apple's system libraries.
-    ! tail -n +2 "$work/links" | grep -Ev '^[[:space:]]+(/usr/lib/|/System/Library/)'
+    if tail -n +2 "$work/links" | grep -Ev '^[[:space:]]+(/usr/lib/|/System/Library/)'; then exit 1; fi
     codesign --force --sign - "$path"
     codesign --verify "$path"
   fi
