@@ -404,6 +404,13 @@ PRAGMA user_version = 13;
 
 const READ_CONNECTIONS: usize = 4;
 
+const CLAIMS_FOR_SUBJECT: &str =
+    "SELECT id, store_index, batch_id, subject, kind, origin, actor, body, predecessors, accepted_at_unix_ms
+     FROM claims WHERE subject=?1 ORDER BY store_index";
+const CLAIMS_FOR_SUBJECT_KIND: &str =
+    "SELECT id, store_index, batch_id, subject, kind, origin, actor, body, predecessors, accepted_at_unix_ms
+     FROM claims WHERE subject=?1 AND kind=?2 ORDER BY store_index";
+
 struct WriterConnection {
     connection: Mutex<Connection>,
     committed_index: Arc<AtomicU64>,
@@ -8481,11 +8488,20 @@ impl Store {
 
     pub fn claims_for(&self, subject: &str, kind: Option<&str>) -> Result<Vec<ClaimRecord>> {
         let connection = self.readers.get();
-        let query = "SELECT id, store_index, batch_id, subject, kind, origin, actor, body, predecessors, accepted_at_unix_ms
-                     FROM claims WHERE subject=?1 AND (?2 IS NULL OR kind=?2) ORDER BY store_index";
-        let mut statement = connection.prepare(query)?;
-        let rows = statement.query_map(params![subject, kind], claim_from_row)?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+        // One statement with `(?2 IS NULL OR kind=?2)` hides the kind from the planner, which then
+        // reads every claim of the subject to test it. A busy agent holds thousands of observations,
+        // and the reconciler asks for one kind of each agent's claims on every pass.
+        let rows = match kind {
+            Some(kind) => connection
+                .prepare(CLAIMS_FOR_SUBJECT_KIND)?
+                .query_map(params![subject, kind], claim_from_row)?
+                .collect::<Result<Vec<_>, _>>(),
+            None => connection
+                .prepare(CLAIMS_FOR_SUBJECT)?
+                .query_map([subject], claim_from_row)?
+                .collect::<Result<Vec<_>, _>>(),
+        };
+        rows.map_err(Into::into)
     }
 
     pub fn pending_subscription_mission_requests(&self, subject: &str) -> Result<Vec<ClaimRecord>> {
@@ -25898,6 +25914,59 @@ version 2
             plan.contains("replica_records_claim"),
             "the projection query must use the claim position index:\n{plan}"
         );
+    }
+
+    #[test]
+    fn claims_of_one_kind_use_the_subject_kind_index() {
+        let store = Store::open_memory("node").unwrap();
+        let connection = store.connection.lock().unwrap();
+        let mut statement = connection
+            .prepare(&format!("EXPLAIN QUERY PLAN {CLAIMS_FOR_SUBJECT_KIND}"))
+            .unwrap();
+        let plan = statement
+            .query_map(params!["agent/example", "harness.diagnostic"], |row| {
+                row.get::<_, String>(3)
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+            .join("\n");
+        assert!(
+            plan.contains("claims_subject_kind_index (subject=? AND kind=?)"),
+            "one kind of a subject's claims must not read every claim of the subject:\n{plan}"
+        );
+        drop(statement);
+        drop(connection);
+
+        let mut connection = store.connection.lock().unwrap();
+        let transaction = connection.transaction().unwrap();
+        for (kind, fields) in (0..20)
+            .map(|sequence| ("harness.observed", json!({"state": "working", "observed_at_ms": sequence})))
+            .chain([(
+                "harness.diagnostic",
+                json!({"code": "provider-capacity", "status": "waiting"}),
+            )])
+        {
+            append_claim_tx(
+                &transaction,
+                &store.origin,
+                "agent/example",
+                kind,
+                None,
+                &json!({ "fields": fields }),
+                &[],
+                None,
+            )
+            .unwrap();
+        }
+        transaction.commit().unwrap();
+        drop(connection);
+        let diagnostics = store
+            .claims_for("agent/example", Some("harness.diagnostic"))
+            .unwrap();
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].kind, "harness.diagnostic");
+        assert_eq!(store.claims_for("agent/example", None).unwrap().len(), 21);
     }
 
     #[test]
