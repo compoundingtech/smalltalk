@@ -784,12 +784,19 @@ fn machine_resources(
             }
             reasons.sort();
             reasons.dedup();
+            // The transport claim changes only with the peer's status, so its success time
+            // goes stale while the peer stays up. The peer row records every success.
+            let last_success_at = fields
+                .get("last_success_at")
+                .and_then(Value::as_u64)
+                .map(u128::from)
+                .max(state.store.replication_peer_last_success(&name)?);
             (
                 machine_state,
                 vec![json!({
                     "protocol": fields.get("protocol").and_then(Value::as_str).unwrap_or("replication"),
                     "status": if matches!(status, "up" | "down") { status } else { "unknown" },
-                    "last_success_at": fields.get("last_success_at").and_then(Value::as_u64).map(|value| client_timestamp(u128::from(value))),
+                    "last_success_at": last_success_at.map(client_timestamp),
                 })],
                 layer.clone(),
                 layer == "current"
@@ -4395,6 +4402,53 @@ mod tests {
             native_session_home: None,
             planner_default: crate::model::PlannerSpec::default(),
         }
+    }
+
+    #[test]
+    fn machines_report_the_latest_replication_success_while_a_peer_stays_up() {
+        const FLEET: &str = "018f6f0d-4a5d-7b8c-9d0e-123456789abc";
+        let root = tempfile::tempdir().unwrap();
+        let mut state = test_state_named(root.path(), "hub");
+        state.configured_peers = vec!["edge".into()];
+        state.store.bind_fleet(FLEET).unwrap();
+        // The transport comes up once, which records its claim.
+        state
+            .store
+            .record_transport_observation("edge", "up", None, Some(1_000))
+            .unwrap();
+        // A later exchange succeeds. The status is still up, so no new claim is written.
+        let edge = Store::open_memory("edge").unwrap();
+        edge.bind_fleet(FLEET).unwrap();
+        let exchange = edge
+            .export_replication_exchange(FLEET, &crate::model::ReplicationInventory::default())
+            .unwrap();
+        state
+            .store
+            .receive_replication_exchange("edge", FLEET, &exchange)
+            .unwrap();
+        state
+            .store
+            .record_transport_observation("edge", "up", None, None)
+            .unwrap();
+        let peer_success = state
+            .store
+            .replication_peer_last_success("edge")
+            .unwrap()
+            .unwrap();
+        assert!(peer_success > 1_000);
+
+        let session = ClientSession::local(Some("person/nathan")).unwrap();
+        let machines =
+            machine_resources(&state, false, &new_client_snapshot(&state), &session).unwrap();
+        let edge = machines
+            .iter()
+            .find(|machine| machine["host_id"] == "host/edge")
+            .unwrap();
+        assert_eq!(edge["state"], "reachable");
+        assert_eq!(
+            edge["transports"][0]["last_success_at"],
+            client_timestamp(peer_success)
+        );
     }
 
     #[test]

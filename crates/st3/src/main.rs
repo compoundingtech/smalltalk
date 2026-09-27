@@ -3173,7 +3173,7 @@ fn render_product_page(title: &str, page: &ClientPage, continuation_command: &st
                     if item.runs.len() == 1 { "" } else { "s" }
                 );
                 if let Some(usage) = &item.usage {
-                    let _ = writeln!(output, "  usage {} tokens", usage.total_tokens);
+                    let _ = writeln!(output, "  usage {}", render_usage(usage));
                 }
                 if let Some(run) = item.runs.last() {
                     let _ = writeln!(output, "  inspect: st3 missions show {run}");
@@ -3285,7 +3285,7 @@ fn render_product_page(title: &str, page: &ClientPage, continuation_command: &st
                     item.header.id, item.state, item.owner_id, item.started_at
                 );
                 if let Some(usage) = &item.usage {
-                    let _ = writeln!(output, "  usage {} tokens", usage.total_tokens);
+                    let _ = writeln!(output, "  usage {}", render_usage(usage));
                 }
                 let _ = writeln!(
                     output,
@@ -3306,6 +3306,46 @@ fn render_product_page(title: &str, page: &ClientPage, continuation_command: &st
         );
     }
     output
+}
+
+/// A mailbox listing with the same heading, filters, and empty line as the other lists. Each row
+/// stays one tab-separated message.
+fn render_mailbox(identity: &str, sender: Option<&str>, archive: bool, rows: &[String]) -> String {
+    use std::fmt::Write as _;
+
+    let mut output = String::new();
+    let _ = writeln!(output, "MESSAGES  {}", rows.len());
+    let mut filters = vec![format!("mailbox={identity}")];
+    if let Some(sender) = sender {
+        filters.push(format!("from={sender}"));
+    }
+    if archive {
+        filters.push("archived=included".into());
+    }
+    let _ = writeln!(output, "FILTERS  {}", filters.join(" · "));
+    if rows.is_empty() {
+        let _ = writeln!(output, "No current items.");
+    }
+    for row in rows {
+        let _ = writeln!(output, "{row}");
+    }
+    output
+}
+
+/// Token spend, or that none was reported. Some drivers report only context occupancy, which
+/// counts no spend, so a summary without a spending incarnation is unknown, not zero.
+fn render_usage(usage: &st3_client::UsageSummary) -> String {
+    if usage.incarnation_count > 0 {
+        return format!("{} tokens", usage.total_tokens);
+    }
+    match usage
+        .context
+        .as_ref()
+        .and_then(|context| context.used_tokens)
+    {
+        Some(used) => format!("not reported · context {used} tokens"),
+        None => "not reported".into(),
+    }
 }
 
 fn print_activity_page(
@@ -5553,7 +5593,7 @@ fn render_client_work_detail(work: &st3_client::Work) -> String {
         let _ = writeln!(output, "Constraint: {constraint}");
     }
     if let Some(usage) = &work.usage {
-        let _ = writeln!(output, "Usage: {} tokens", usage.total_tokens);
+        let _ = writeln!(output, "Usage: {}", render_usage(usage));
     }
     if let Some(operational) = &work.header.operational {
         let reasons = if operational.reasons.is_empty() {
@@ -5892,6 +5932,7 @@ async fn run_message(
             let sender = args.sender.map(|sender| normalize_message_subject(&sender));
             let mut count = 0_u64;
             let mut first = true;
+            let mut rows = Vec::new();
             if json_output && !args.count {
                 print!("[");
             }
@@ -5913,13 +5954,13 @@ async fn run_message(
                     print!("{}", serde_json::to_string(&message)?);
                     first = false;
                 } else {
-                    println!(
+                    rows.push(format!(
                         "{}\t{}\t{}\t{}",
                         message.subject,
                         message.status,
                         message.from,
                         message.title.as_deref().unwrap_or("message")
-                    );
+                    ));
                 }
                 Ok(())
             })
@@ -5928,6 +5969,11 @@ async fn run_message(
                 println!("{count}");
             } else if json_output {
                 println!("]");
+            } else {
+                print!(
+                    "{}",
+                    render_mailbox(&identity, sender.as_deref(), args.archive, &rows)
+                );
             }
             Ok(())
         }
@@ -9144,6 +9190,62 @@ mod tests {
                 "  action: st3 work show work/release/1/build\n",
                 "operation/transport-host-b  operation  warning  degraded  Peer is retrying\n",
                 "  recovery: st3 doctor\n",
+            )
+        );
+    }
+
+    #[test]
+    fn context_occupancy_alone_is_not_reported_as_zero_tokens() {
+        let mut page = fixture_product_page(&["session"], false);
+        let ClientResource::Session(session) = &mut page.items[0] else {
+            panic!("expected session fixture");
+        };
+        session.usage = Some(
+            serde_json::from_value(json!({
+                "total_tokens": 0,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "cached_tokens": 0,
+                "incarnation_count": 0,
+                "aggregation": "cumulative-per-incarnation-else-response-deltas",
+                "context": { "used_tokens": 319465, "observed_at_unix_ms": 1 }
+            }))
+            .unwrap(),
+        );
+        let rendered = render_product_page("SESSIONS", &page, "st3 conversations sessions");
+        assert!(!rendered.contains("0 tokens"), "{rendered}");
+        assert!(
+            rendered.contains("  usage not reported · context 319465 tokens\n"),
+            "{rendered}"
+        );
+
+        let ClientResource::Session(session) = &mut page.items[0] else {
+            unreachable!();
+        };
+        let usage = session.usage.as_mut().unwrap();
+        usage.incarnation_count = 1;
+        usage.total_tokens = 1200;
+        let rendered = render_product_page("SESSIONS", &page, "st3 conversations sessions");
+        assert!(rendered.contains("  usage 1200 tokens\n"), "{rendered}");
+    }
+
+    #[test]
+    fn an_empty_mailbox_prints_a_heading_and_no_current_items() {
+        assert_eq!(
+            render_mailbox("person/nathan", None, false, &[]),
+            "MESSAGES  0\nFILTERS  mailbox=person/nathan\nNo current items.\n"
+        );
+        assert_eq!(
+            render_mailbox(
+                "agent/worker",
+                Some("person/nathan"),
+                true,
+                &["message/one\tread\tperson/nathan\tHello".into()]
+            ),
+            concat!(
+                "MESSAGES  1\n",
+                "FILTERS  mailbox=agent/worker · from=person/nathan · archived=included\n",
+                "message/one\tread\tperson/nathan\tHello\n",
             )
         );
     }

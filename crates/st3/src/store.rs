@@ -5992,7 +5992,9 @@ impl Store {
                         } else if desired.is_some() {
                             "indeterminate"
                         } else {
-                            "reachable"
+                            // Nothing declares or observes this subject, so nothing says it
+                            // can be reached.
+                            "unknown"
                         }
                     })
                     .to_owned()
@@ -8941,6 +8943,21 @@ impl Store {
             )),
         })?;
         Ok(())
+    }
+
+    /// When this replica last exchanged records with `peer`. The peer row records every
+    /// success, while the `transport.observed` claim changes only with the peer's status.
+    pub fn replication_peer_last_success(&self, peer: &str) -> Result<Option<u128>> {
+        let connection = self.readers.get();
+        Ok(connection
+            .query_row(
+                "SELECT last_success_at_unix_ms FROM replication_peers WHERE peer=?1",
+                [peer],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten()
+            .and_then(|value| value.parse().ok()))
     }
 
     pub fn replication_status(
@@ -19836,6 +19853,27 @@ observer "ordered/file" {
         assert_eq!(first_snapshot.store_index, first_index);
         assert_eq!(first_snapshot.subjects.len(), 1);
         assert_eq!(first_snapshot.subjects[0].subject, "agent/selected");
+    }
+
+    #[test]
+    fn a_subject_with_no_actual_or_desired_state_has_unknown_reachability() {
+        let store = Store::open_memory("node").unwrap();
+        let subject = "agent/diagnostic-run/sig.hub";
+        store
+            .append_claim(&ClaimInput {
+                subject: subject.into(),
+                kind: "harness.observed".into(),
+                actor: Some(subject.into()),
+                fields: BTreeMap::from([("state".into(), Value::String("idle".into()))]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+        let status = store.status(Some(subject)).unwrap();
+        assert!(status.subjects[0].actual.is_none());
+        assert!(status.subjects[0].desired.is_none());
+        assert_eq!(status.subjects[0].reachability, "unknown");
     }
 
     #[test]
