@@ -7105,6 +7105,35 @@ async fn publish_harness_state(
     Ok(())
 }
 
+/// One pi-family message frame. The content is the shared st3 envelope that Codex and Claude also
+/// receive. omp backgrounds an in-flight shell or eval call whenever a steering message arrives,
+/// and the model then repeats commands whose results it never saw; a live omp seat sent one
+/// protocol message twice that way. omp therefore receives mail after its current turn, as
+/// Codex does. pi keeps the measured steer boundary.
+fn pi_family_message_frame(
+    driver: &str,
+    message: &st3::model::MessageView,
+    body: &str,
+    identity: &str,
+) -> Value {
+    json!({
+        "type": "message",
+        "deliverAs": if driver == "omp" { "followUp" } else { "steer" },
+        "content": st2::ding::st3_notification_text(
+            &message.subject,
+            &message.from,
+            message.title.as_deref(),
+            body,
+        ),
+        "meta": {
+            "from": message.from,
+            "messageId": message.subject,
+            "threadId": message.in_reply_to.clone().unwrap_or_else(|| message.subject.clone()),
+            "identity": identity,
+        },
+    })
+}
+
 /// Session-start context for pi-family seats. It restates the st3 boot contract only: st3 has no
 /// availability or busy status, so st2 status vocabulary sends the model searching for commands
 /// that do not exist before it claims ready work. It also names the seat, because omp's Python
@@ -7211,23 +7240,7 @@ async fn run_pi_channel(client: &Client, subject: &str, driver: &str) -> Result<
                         continue;
                     }
                     let body = message_content(client, &message).await?;
-                    let content = st2::ding::st3_notification_text(
-                        &message.subject,
-                        &message.from,
-                        message.title.as_deref(),
-                        &body,
-                    );
-                    let frame = json!({
-                        "type": "message",
-                        "deliverAs": "steer",
-                        "content": content,
-                        "meta": {
-                            "from": message.from,
-                            "messageId": message.subject,
-                            "threadId": message.in_reply_to.unwrap_or_else(|| message.subject.clone()),
-                            "identity": identity,
-                        },
-                    });
+                    let frame = pi_family_message_frame(driver, &message, &body, identity);
                     stdout.write_all(serde_json::to_string(&frame)?.as_bytes()).await?;
                     stdout.write_all(b"\n").await?;
                     stdout.flush().await?;
@@ -8226,6 +8239,41 @@ mod tests {
             Cli::try_parse_from(["st3", "conversations", "ls", "agent/a", "--as", "agent/b"])
                 .is_err()
         );
+    }
+
+    #[test]
+    fn omp_receives_the_shared_envelope_after_its_current_turn() {
+        let message = st3::model::MessageView {
+            subject: "message/0123456789abcdef".into(),
+            from: "agent/run-1/wake.claude".into(),
+            to: "agent/run-1/wake.omp-2".into(),
+            content: "FACT QUARTZ".into(),
+            status: "sent".into(),
+            title: Some("Cross-harness consensus: idle".into()),
+            in_reply_to: None,
+            tags: vec![],
+            created_index: 1,
+        };
+        let omp = pi_family_message_frame("omp", &message, "FACT QUARTZ", "run-1/wake.omp-2");
+        assert_eq!(omp["deliverAs"], "followUp");
+        assert_eq!(
+            omp["content"],
+            st2::ding::st3_notification_text(
+                "message/0123456789abcdef",
+                "agent/run-1/wake.claude",
+                Some("Cross-harness consensus: idle"),
+                "FACT QUARTZ",
+            )
+        );
+        assert!(
+            omp["content"].as_str().unwrap().starts_with(
+                "[PING from st3] message/0123456789abcdef from agent/run-1/wake.claude:"
+            )
+        );
+        assert_eq!(omp["meta"]["messageId"], "message/0123456789abcdef");
+        let pi = pi_family_message_frame("pi", &message, "FACT QUARTZ", "run-1/wake.pi");
+        assert_eq!(pi["deliverAs"], "steer");
+        assert_eq!(pi["content"], omp["content"]);
     }
 
     #[test]

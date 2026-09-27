@@ -881,7 +881,11 @@ The default refusal prevents a spelling error from creating an unintended direct
 
 Maintained harnesses receive graph messages through their native driver boundary. Codex uses typed
 app-server turn requests. Claude uses one persistent stream-JSON process and acknowledges the
-exact replayed user turn. Pi and OMP acknowledge through their loaded native extensions. OpenCode
+exact replayed user turn. Pi and OMP acknowledge through their loaded native extensions. Pi
+steers a message into a running turn. OMP queues it until its current turn ends, because a
+steer makes OMP background its in-flight shell call and the model then repeats commands whose
+results it did not see. Every harness receives the same `[PING from st3] message/ID from SENDER:
+TITLE` envelope. OpenCode
 acknowledges the assistant turn whose `parentID` is the exact stable user-message ID. Copying a
 message into an inbox or successfully writing transport bytes is not delivery. st3 advances the
 graph only from the durable provider receipt and never injects text or Enter into a terminal
