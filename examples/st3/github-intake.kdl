@@ -11,26 +11,26 @@ version 2
 // The GitHub provider reads GH_TOKEN, then GITHUB_TOKEN, then `gh auth token`, from the daemon's
 // environment.
 //
-//   st3 agents apply examples/st3/seats/omp.kdl --as person/operator
-//   st3 missions publish examples/st3/github-intake-work.kdl --as person/operator
-//   # Replace both zero revisions below with the hashes from `st3 missions ls --all --json`;
+//   st agents apply examples/st3/seats/omp.kdl --as person/operator
+//   st missions publish examples/st3/github-intake-work.kdl --as person/operator
+//   # Replace both zero revisions below with the hashes from `st missions ls --all --json`;
 //   # github-intake-work.kdl shows the query.
-//   st3 missions publish examples/st3/github-intake.kdl --as person/operator
-//   st3 missions start example/app/intake --id example/app/intake/main \
+//   st missions publish examples/st3/github-intake.kdl --as person/operator
+//   st missions start example/app/intake --id example/app/intake/main \
 //     --workspace /srv/example/intake --as person/operator
 //
 // The observer and subscriptions belong to the intake run and stop when it ends. A mission with
 // no step would complete at once and stop them, so `retire` keeps the run open until the operator
-// approves it in `st3 attention ls --as person/operator`, or cancels the run:
+// approves it in `st attention ls --as person/operator`, or cancels the run:
 //
-//   st3 missions cancel mission-run/example/app/intake/main \
+//   st missions cancel mission-run/example/app/intake/main \
 //     --reason "the project moved to another repository" --as person/operator
 //
 // Inspect what the intake started:
 //
-//   st3 missions show mission-run/example/app/intake/main
-//   st3 missions ls
-//   st3 agents queue agent/example/worker
+//   st missions show mission-run/example/app/intake/main
+//   st missions ls
+//   st agents queue agent/example/worker
 
 resource "example/app/repository" { kind "vcs.repository" }
 
