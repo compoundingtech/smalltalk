@@ -15,3 +15,9 @@ For each phase, every participant must consume a kickoff, send a private fact, w
 The participant prompt describes only the coordination task. It does not mention historical failures, terminal workarounds, or the held-out checks.
 
 Held-out gates prove exact message lifecycle, one canonical message per participant per stage, both paired results, exact idle preconditions for the idle phase, and absence of graph or executable terminal input.
+
+`WAKE_PAIRS` selects the participant pairs for the controller and both judges; each name is the
+agent `wake.<name>`. Its default is the committed `codex:claude pi:omp`. The files in `variants/`
+pair the fixed Codex `gpt-6-sol` and Claude `opus` seats with two seats of one harness under test:
+omp on `openai-codex/gpt-5.6-luna`, `openai-codex/gpt-5.6-sol`, or `openai-codex/gpt-6-astra`,
+Codex `gpt-6-luna`, or Claude `claude-sonnet-5`. They need no Pi installation.

@@ -9,7 +9,7 @@ subject="agent/${ST_MISSION_RUN}/rc.dev"
 mkdir -p "$state"
 
 actual() {
-  st3 subject show "$subject" --json | jq -c '.status.subjects[0].actual | .fields // .'
+  st3 agents show "$subject" --all --json | jq -c '.value'
 }
 
 old_actual="$(actual)"
@@ -23,7 +23,7 @@ new_incarnation=""
 for _ in $(seq 1 1200); do
   current="$(actual 2>/dev/null || true)"
   incarnation="$(jq -r '.incarnation_id // empty' <<<"${current:-{}}" 2>/dev/null || true)"
-  harness_state="$(jq -r '.state // empty' <<<"${current:-{}}" 2>/dev/null || true)"
+  harness_state="$(jq -r '.harness_state // empty' <<<"${current:-{}}" 2>/dev/null || true)"
   if [ -n "$incarnation" ] && [ "$incarnation" != "$old_incarnation" ]; then
     case "$harness_state" in
       ready|idle|working)
@@ -36,11 +36,12 @@ for _ in $(seq 1 1200); do
 done
 [ -n "$new_incarnation" ]
 
-duplicate_id="$(st3 conversations send "$subject" \
+duplicate_message="$(st3 conversations send "$subject" \
   --from "$ST3_SUBJECT" \
   --subject "Repeated pre-restart work" \
   --tags "mission-run:$ST_MISSION_RUN,duplicate-work:process-before-restart" \
-  -m "DUPLICATE-BATCH-RC-7B9D: This repeats work assigned before the cold restart. Read the durable st3 missions, PROGRESS.md, and git history. Do not redo items 1 or 2. Continue only ready assigned work.")"
+  -m "DUPLICATE-BATCH-RC-7B9D: This repeats work assigned before the cold restart. Read the durable st3 missions, PROGRESS.md, and git history. Do not redo items 1 or 2. Continue only ready assigned work." \
+  --json | jq -er .subject)"
 
 st3 claim "resource/mission-run/$ST_MISSION_RUN/restart" resource.observed \
   --actor "$ST3_SUBJECT" \
@@ -48,14 +49,14 @@ st3 claim "resource/mission-run/$ST_MISSION_RUN/restart" resource.observed \
   --field state=injected \
   --field old_incarnation="$old_incarnation" \
   --field new_incarnation="$new_incarnation" \
-  --field duplicate_message="message/$duplicate_id" >/dev/null
+  --field duplicate_message="$duplicate_message" >/dev/null
 
 {
   printf 'restart_epoch=%s\n' "$(date +%s)"
   printf 'pre_restart_head=%s\n' "$pre_head"
   printf 'old_incarnation=%s\n' "$old_incarnation"
   printf 'new_incarnation=%s\n' "$new_incarnation"
-  printf 'duplicate_message=message/%s\n' "$duplicate_id"
+  printf 'duplicate_message=%s\n' "$duplicate_message"
   printf 'action=cold_restart\n'
 } >"$log"
 touch "$stamp"

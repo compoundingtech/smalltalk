@@ -15,6 +15,8 @@ Use these documents for implementation details:
 - [Resource subscriptions](resource-subscriptions.md) defines observers and automatic intake.
 - [Agent migration](agent-migration.md) defines isolated rehearsal, cutover, and rollback.
 - [Eval audit](eval-audit.md) records the test intent and prompt boundary for each st3 eval.
+- [Running st3 with omp](omp.md) covers omp seat setup, behavior, and known limits;
+  [omp readiness evals](omp-readiness-2026-09-26.md) holds the evidence.
 - [Product roadmap](roadmap.md) records accepted future work.
 - [Guided CLI tour](cli-guided-tour.md) is the complete human walkthrough for every public command
   and subcommand.

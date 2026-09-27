@@ -211,6 +211,7 @@ pub fn select<'a>(agent: &str, steps: &[SeatStep<'a>], run_order: &[String]) -> 
         .filter(|step| {
             matches!(step.status, "claimed" | "working" | "verifying")
                 && (step.claimant == Some(agent) || step.assignee == Some(agent))
+                && !submitted_with_ready_nested_work(step, steps)
         })
         .map(|step| step.subject)
         .collect();
@@ -240,16 +241,35 @@ pub fn select<'a>(agent: &str, steps: &[SeatStep<'a>], run_order: &[String]) -> 
     }
 }
 
-/// True when a listed ancestor step in the same run has the same selector.
+/// True when a listed ancestor step in the same run has the same selector and
+/// has not been submitted. A submitted parent's work message was consumed, so
+/// its nested work is no longer reached through it.
 pub fn reached_through_parent(step: &SeatStep<'_>, steps: &[SeatStep<'_>]) -> bool {
-    steps.iter().any(|candidate| {
-        candidate.run == step.run
-            && candidate.assignee == step.assignee
-            && candidate.available_to == step.available_to
-            && candidate.step.len() < step.step.len()
-            && step.step.starts_with(candidate.step)
-            && step.step.as_bytes().get(candidate.step.len()) == Some(&b'/')
-    })
+    steps
+        .iter()
+        .any(|candidate| nests_under(candidate, step) && candidate.status != "verifying")
+}
+
+/// True when `step` is nested under the listed `ancestor` in the same run and
+/// both have the same selector.
+pub fn nests_under(ancestor: &SeatStep<'_>, step: &SeatStep<'_>) -> bool {
+    ancestor.run == step.run
+        && ancestor.assignee == step.assignee
+        && ancestor.available_to == step.available_to
+        && ancestor.step.len() < step.step.len()
+        && step.step.starts_with(ancestor.step)
+        && step.step.as_bytes().get(ancestor.step.len()) == Some(&b'/')
+}
+
+/// An agent can submit a parent while its own nested steps are still ready.
+/// The parent then waits in `verifying` for work that nothing will prompt: the
+/// inherited parent message was consumed, and the seat looks occupied. Such a
+/// parent frees the seat so the ready nested step gets its own wake.
+pub fn submitted_with_ready_nested_work(parent: &SeatStep<'_>, steps: &[SeatStep<'_>]) -> bool {
+    parent.status == "verifying"
+        && steps
+            .iter()
+            .any(|step| step.status == "ready" && nests_under(parent, step))
 }
 
 #[cfg(test)]

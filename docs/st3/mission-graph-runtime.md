@@ -560,6 +560,11 @@ A step product is intermediate output for that step. A mission product is a fina
 
 The worker creates or observes products. st3 verifies them. The `produces` keyword does not perform the action.
 
+A worker-submitted step stays `verifying` until its products hold. Once the submitting worker's
+turn has ended, st3 sends that worker one message per step attempt. The message names the exact
+product subject and fields the step waits for, so a worker that recorded the wrong subject can
+correct it.
+
 A mission product can refer to output created during any step. Do not duplicate a step product at mission level unless the same graph subject is intentionally both an intermediate and final contract.
 
 ## Gates
@@ -836,6 +841,10 @@ An agent receives its own subject in both `ST3_SUBJECT` and `ST_AGENT`. A nested
 
 An agentless `exec` or `terminal` receives `ST3_SUBJECT` and no `ST_AGENT`.
 
+A CLI process with `ST_AGENT` acts only as that agent. Work actions, conversation read, archive,
+send, and reply, and `claim --actor` refuse a different `agent/...` actor. They still accept a
+person, exec, or other non-agent actor that the work names.
+
 An unknown variable or a variable that is not available in the current phase is an error.
 
 ## Agent boot contract
@@ -872,7 +881,9 @@ The default refusal prevents a spelling error from creating an unintended direct
 
 Maintained harnesses receive graph messages through their native driver boundary. Codex uses typed
 app-server turn requests. Claude uses one persistent stream-JSON process and acknowledges the
-exact replayed user turn. Pi and OMP acknowledge through their loaded native extensions. OpenCode
+exact replayed user turn. Pi and OMP acknowledge through their loaded native extensions and
+steer a message into a running turn at its next tool boundary. Every harness receives the same
+`[PING from st3] message/ID from SENDER: TITLE` envelope. OpenCode
 acknowledges the assistant turn whose `parentID` is the exact stable user-message ID. Copying a
 message into an inbox or successfully writing transport bytes is not delivery. st3 advances the
 graph only from the durable provider receipt and never injects text or Enter into a terminal
@@ -883,12 +894,15 @@ incarnation. It is not a messaging or work-wake transport.
 
 When an exactly assigned step becomes ready, the reconciler sends a durable work message for the
 current harness incarnation. Each agent has one work seat across mission runs: a claimed,
-working, or verifying step occupies it. Ready steps wait in the seat queue described below. Only
-the seat's next work is woken when the seat is free. Queued steps do not consume wake attempts or
-arm retry timers while the agent is busy. Delivery is acknowledged by a new working turn or by
-claiming the step. An unacknowledged delivery is retried after 15 seconds, at most three times.
-Exhaustion writes a `work-wake-exhausted` harness diagnostic naming the step, incarnation, and
-attempt count.
+working, or verifying step occupies it. A parent that its agent submitted while one of its own
+nested steps is still ready does not occupy the seat; that nested step is woken. Ready steps wait
+in the seat queue described below. Only the seat's next work is woken when the seat is free.
+Queued steps do not consume wake attempts or arm retry timers while the agent is busy. Delivery is
+acknowledged by a new working turn, by a native read or close, by a delivery into a turn that is
+still working, or by claiming the step. Pi and OMP steer a wake into the running turn, so a boot
+turn that started before the wake still acknowledges it. An unacknowledged delivery is retried
+after 15 seconds, at most three times. Exhaustion writes a `work-wake-exhausted` harness
+diagnostic naming the step, incarnation, and attempt count.
 
 ## Seat queues
 
