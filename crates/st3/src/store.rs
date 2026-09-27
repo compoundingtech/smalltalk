@@ -522,9 +522,111 @@ struct ReplicationSnapshot {
     store_index: u64,
     replica_generation: u64,
     max_envelope_rowid: i64,
-    inventory: ReplicationInventory,
+    inventory: CompactReplicationInventory,
     authority_digest: String,
     graph_digest: String,
+}
+
+#[derive(Clone)]
+struct CompactReplicationInventory {
+    digest: String,
+    buckets: Vec<ReplicationBucketDigest>,
+    writers: Vec<String>,
+    envelopes: Vec<CompactEnvelopeId>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct CompactEnvelopeId {
+    writer_index: u32,
+    sequence: u64,
+    hash: [u8; 32],
+}
+
+impl CompactReplicationInventory {
+    fn new(writers: Vec<String>, envelopes: Vec<CompactEnvelopeId>) -> Self {
+        let digest = compact_replication_inventory_digest(&writers, &envelopes);
+        let buckets = compact_replication_bucket_digests(&writers, &envelopes);
+        Self {
+            digest,
+            buckets,
+            writers,
+            envelopes,
+        }
+    }
+
+    fn insert(&mut self, identity: ReplicaEnvelopeId) -> Result<()> {
+        let writer_index = match self.writers.binary_search(&identity.writer) {
+            Ok(index) => index,
+            Err(index) => {
+                self.writers.insert(index, identity.writer);
+                for envelope in &mut self.envelopes {
+                    if envelope.writer_index as usize >= index {
+                        envelope.writer_index += 1;
+                    }
+                }
+                index
+            }
+        };
+        let mut hash = [0_u8; 32];
+        hex::decode_to_slice(&identity.hash, &mut hash)?;
+        let compact = CompactEnvelopeId {
+            writer_index: writer_index as u32,
+            sequence: identity.sequence,
+            hash,
+        };
+        let position = self
+            .envelopes
+            .binary_search(&compact)
+            .unwrap_or_else(|at| at);
+        self.envelopes.insert(position, compact);
+        Ok(())
+    }
+
+    fn public_id(&self, identity: &CompactEnvelopeId) -> ReplicaEnvelopeId {
+        ReplicaEnvelopeId {
+            writer: self.writers[identity.writer_index as usize].clone(),
+            sequence: identity.sequence,
+            hash: hex::encode(identity.hash),
+        }
+    }
+
+    fn public_inventory(&self) -> ReplicationInventory {
+        ReplicationInventory {
+            digest: self.digest.clone(),
+            envelopes: self
+                .envelopes
+                .iter()
+                .map(|identity| self.public_id(identity))
+                .collect(),
+            bucketed: false,
+            buckets: Vec::new(),
+            envelope_bucket: None,
+        }
+    }
+
+    fn bucket_ids(&self, bucket: &ReplicationBucketKey) -> Vec<ReplicaEnvelopeId> {
+        let Ok(writer_index) = self.writers.binary_search(&bucket.writer) else {
+            return Vec::new();
+        };
+        let start = self.envelopes.partition_point(|identity| {
+            (identity.writer_index as usize) < writer_index
+                || ((identity.writer_index as usize) == writer_index
+                    && identity.sequence < bucket.start_sequence)
+        });
+        self.envelopes
+            .iter()
+            .skip(start)
+            .take_while(|identity| {
+                identity.writer_index as usize == writer_index
+                    && identity.sequence
+                        < bucket
+                            .start_sequence
+                            .saturating_add(REPLICATION_BUCKET_SEQUENCES)
+            })
+            .take(512)
+            .map(|identity| self.public_id(identity))
+            .collect()
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -8275,7 +8377,7 @@ impl Store {
     }
 
     pub fn replication_inventory(&self) -> Result<ReplicationInventory> {
-        Ok(self.replication_snapshot()?.inventory.clone())
+        Ok(self.replication_snapshot()?.inventory.public_inventory())
     }
 
     fn replication_snapshot(&self) -> Result<Arc<ReplicationSnapshot>> {
@@ -8314,7 +8416,7 @@ impl Store {
             connection.query_row("SELECT COUNT(*) FROM replica_envelopes", [], |row| {
                 row.get(0)
             })?;
-        let (envelopes, max_envelope_rowid) = if let Some(previous) = previous {
+        let (inventory, max_envelope_rowid) = if let Some(previous) = previous {
             let mut statement = connection.prepare(
                 "SELECT rowid, writer, sequence, envelope_hash FROM replica_envelopes
                  WHERE rowid>?1 ORDER BY rowid",
@@ -8337,28 +8439,23 @@ impl Store {
                 // into the successor so a graph write does not allocate and free
                 // every envelope ID. Keep the old snapshot intact for concurrent
                 // callers that still hold it.
-                let mut envelopes = match Arc::try_unwrap(previous) {
-                    Ok(snapshot) => snapshot.inventory.envelopes,
-                    Err(shared) => shared.inventory.envelopes.clone(),
+                let mut inventory = match Arc::try_unwrap(previous) {
+                    Ok(snapshot) => snapshot.inventory,
+                    Err(shared) => shared.inventory.clone(),
                 };
                 for (rowid, identity) in additions {
                     max_rowid = max_rowid.max(rowid);
-                    let position = envelopes.binary_search(&identity).unwrap_or_else(|at| at);
-                    envelopes.insert(position, identity);
+                    inventory.insert(identity)?;
                 }
-                (envelopes, max_rowid)
+                (
+                    CompactReplicationInventory::new(inventory.writers, inventory.envelopes),
+                    max_rowid,
+                )
             } else {
-                full_replication_inventory_rows(&connection)?
+                full_compact_replication_inventory_rows(&connection)?
             }
         } else {
-            full_replication_inventory_rows(&connection)?
-        };
-        let inventory = ReplicationInventory {
-            digest: replication_inventory_digest(&envelopes),
-            buckets: replication_bucket_digests(&envelopes),
-            envelopes,
-            bucketed: false,
-            envelope_bucket: None,
+            full_compact_replication_inventory_rows(&connection)?
         };
         // Envelope hashes already commit the complete payload (and chain metadata). The
         // inventory digest therefore commits the authority log without hex-encoding and hashing
@@ -8427,12 +8524,10 @@ impl Store {
                 let known = remote.envelopes.iter().collect::<BTreeSet<_>>();
                 snapshot
                     .inventory
-                    .envelopes
-                    .iter()
-                    .filter(|identity| replication_bucket_contains(bucket, identity))
-                    .filter(|identity| !known.contains(*identity))
+                    .bucket_ids(bucket)
+                    .into_iter()
+                    .filter(|identity| !known.contains(identity))
                     .take(512)
-                    .cloned()
                     .collect::<Vec<_>>()
             } else {
                 Vec::new()
@@ -8445,11 +8540,11 @@ impl Store {
             let known = remote.envelopes.iter().collect::<BTreeSet<_>>();
             snapshot
                 .inventory
+                .public_inventory()
                 .envelopes
-                .iter()
-                .filter(|identity| !known.contains(*identity))
+                .into_iter()
+                .filter(|identity| !known.contains(identity))
                 .take(512)
-                .cloned()
                 .collect::<Vec<_>>()
         };
         let connection = self.readers.get();
@@ -8483,16 +8578,9 @@ impl Store {
             inventory: if remote.bucketed {
                 ReplicationInventory {
                     digest: snapshot.inventory.digest.clone(),
-                    envelopes: selected_bucket.as_ref().map_or_else(Vec::new, |bucket| {
-                        snapshot
-                            .inventory
-                            .envelopes
-                            .iter()
-                            .filter(|identity| replication_bucket_contains(bucket, identity))
-                            .take(512)
-                            .cloned()
-                            .collect()
-                    }),
+                    envelopes: selected_bucket
+                        .as_ref()
+                        .map_or_else(Vec::new, |bucket| snapshot.inventory.bucket_ids(bucket)),
                     bucketed: true,
                     buckets: snapshot.inventory.buckets.clone(),
                     envelope_bucket: selected_bucket,
@@ -8506,7 +8594,7 @@ impl Store {
                     envelope_bucket: None,
                 }
             } else {
-                snapshot.inventory.clone()
+                snapshot.inventory.public_inventory()
             },
             envelopes,
         })
@@ -14290,6 +14378,88 @@ fn full_replication_inventory_rows(
     Ok((envelopes, max_rowid))
 }
 
+fn full_compact_replication_inventory_rows(
+    connection: &Connection,
+) -> Result<(CompactReplicationInventory, i64)> {
+    let mut statement = connection.prepare(
+        "SELECT rowid, writer, sequence, envelope_hash FROM replica_envelopes
+         ORDER BY writer, sequence, envelope_hash",
+    )?;
+    let mut rows = statement.query([])?;
+    let mut writers = Vec::<String>::new();
+    let mut envelopes = Vec::new();
+    let mut max_rowid = 0;
+    while let Some(row) = rows.next()? {
+        max_rowid = max_rowid.max(row.get::<_, i64>(0)?);
+        let writer: String = row.get(1)?;
+        if writers.last() != Some(&writer) {
+            writers.push(writer);
+        }
+        let mut hash = [0_u8; 32];
+        hex::decode_to_slice(row.get::<_, String>(3)?, &mut hash)?;
+        envelopes.push(CompactEnvelopeId {
+            writer_index: (writers.len() - 1) as u32,
+            sequence: row.get(2)?,
+            hash,
+        });
+    }
+    Ok((
+        CompactReplicationInventory::new(writers, envelopes),
+        max_rowid,
+    ))
+}
+
+fn compact_replication_inventory_digest(
+    writers: &[String],
+    envelopes: &[CompactEnvelopeId],
+) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"st3-replication-inventory-v1\0");
+    for envelope in envelopes {
+        let writer = writers[envelope.writer_index as usize].as_bytes();
+        digest.update((writer.len() as u64).to_be_bytes());
+        digest.update(writer);
+        let sequence = envelope.sequence.to_string();
+        digest.update((sequence.len() as u64).to_be_bytes());
+        digest.update(sequence.as_bytes());
+        let mut hash = [0_u8; 64];
+        hex::encode_to_slice(envelope.hash, &mut hash).expect("a SHA-256 hash has 64 hex bytes");
+        digest.update(64_u64.to_be_bytes());
+        digest.update(hash);
+    }
+    hex::encode(digest.finalize())
+}
+
+fn compact_replication_bucket_digests(
+    writers: &[String],
+    envelopes: &[CompactEnvelopeId],
+) -> Vec<ReplicationBucketDigest> {
+    let mut buckets = Vec::new();
+    let mut start = 0;
+    while start < envelopes.len() {
+        let first = &envelopes[start];
+        let start_sequence = first.sequence.saturating_sub(1) / REPLICATION_BUCKET_SEQUENCES
+            * REPLICATION_BUCKET_SEQUENCES
+            + 1;
+        let mut end = start + 1;
+        while end < envelopes.len()
+            && envelopes[end].writer_index == first.writer_index
+            && envelopes[end].sequence < start_sequence.saturating_add(REPLICATION_BUCKET_SEQUENCES)
+        {
+            end += 1;
+        }
+        buckets.push(ReplicationBucketDigest {
+            key: ReplicationBucketKey {
+                writer: writers[first.writer_index as usize].clone(),
+                start_sequence,
+            },
+            digest: compact_replication_inventory_digest(writers, &envelopes[start..end]),
+        });
+        start = end;
+    }
+    buckets
+}
+
 fn replication_inventory_digest(envelopes: &[ReplicaEnvelopeId]) -> String {
     let mut digest = Sha256::new();
     digest.update(b"st3-replication-inventory-v1\0");
@@ -14307,42 +14477,6 @@ fn replication_inventory_digest(envelopes: &[ReplicaEnvelopeId]) -> String {
 }
 
 const REPLICATION_BUCKET_SEQUENCES: u64 = 512;
-
-fn replication_bucket_key(envelope: &ReplicaEnvelopeId) -> ReplicationBucketKey {
-    ReplicationBucketKey {
-        writer: envelope.writer.clone(),
-        start_sequence: envelope.sequence.saturating_sub(1) / REPLICATION_BUCKET_SEQUENCES
-            * REPLICATION_BUCKET_SEQUENCES
-            + 1,
-    }
-}
-
-fn replication_bucket_contains(key: &ReplicationBucketKey, envelope: &ReplicaEnvelopeId) -> bool {
-    envelope.writer == key.writer
-        && envelope.sequence >= key.start_sequence
-        && envelope.sequence
-            < key
-                .start_sequence
-                .saturating_add(REPLICATION_BUCKET_SEQUENCES)
-}
-
-fn replication_bucket_digests(envelopes: &[ReplicaEnvelopeId]) -> Vec<ReplicationBucketDigest> {
-    let mut buckets = Vec::new();
-    let mut start = 0;
-    while start < envelopes.len() {
-        let key = replication_bucket_key(&envelopes[start]);
-        let mut end = start + 1;
-        while end < envelopes.len() && replication_bucket_contains(&key, &envelopes[end]) {
-            end += 1;
-        }
-        buckets.push(ReplicationBucketDigest {
-            key,
-            digest: replication_inventory_digest(&envelopes[start..end]),
-        });
-        start = end;
-    }
-    buckets
-}
 
 fn first_differing_bucket(
     local: &[ReplicationBucketDigest],
@@ -14511,6 +14645,34 @@ fn replication_snapshot_moves_an_exclusive_inventory_into_its_successor() {
 
 #[cfg(test)]
 #[test]
+fn replication_snapshot_keeps_compact_envelope_identifiers() {
+    let store = Store::open_memory("node").unwrap();
+    for index in 0..100 {
+        store
+            .append_client_claim(&ClaimInput {
+                subject: format!("resource/compact-envelope-{index}"),
+                kind: "resource.observed".into(),
+                actor: None,
+                fields: BTreeMap::from([(
+                    "kind".into(),
+                    Value::String("custom.test.replication".into()),
+                )]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+    }
+    let snapshot = store.replication_snapshot().unwrap();
+    assert_eq!(snapshot.inventory.envelopes.len(), 100);
+    assert!(
+        std::mem::size_of_val(snapshot.inventory.envelopes.as_slice()) <= 100 * 48,
+        "the permanent inventory must store compact envelope identifiers"
+    );
+}
+
+#[cfg(test)]
+#[test]
 fn replication_snapshot_inserts_new_envelopes_in_canonical_order() {
     const FLEET: &str = "018f6f0d-4a5d-7b8c-9d0e-123456789abc";
     let target = Store::open_memory("z").unwrap();
@@ -14561,7 +14723,7 @@ fn replication_snapshot_inserts_new_envelopes_in_canonical_order() {
     let incremental = target.replication_snapshot().unwrap();
     let connection = target.connection.lock().unwrap();
     let (full, max_rowid) = full_replication_inventory_rows(&connection).unwrap();
-    assert_eq!(incremental.inventory.envelopes, full);
+    assert_eq!(incremental.inventory.public_inventory().envelopes, full);
     assert_eq!(incremental.max_envelope_rowid, max_rowid);
     assert_eq!(
         incremental.inventory.digest,
