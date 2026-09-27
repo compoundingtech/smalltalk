@@ -3400,9 +3400,9 @@ impl<R: RuntimeControl> Reconciler<R> {
             if view.status == "ready" && view.agentless {
                 let reason = awaited_run(run, &step, view)?
                     .map(|after| format!("waiting for `{after}` to complete"));
-                changed |= self
-                    .store
-                    .set_step_state(&view.subject, "working", reason.as_deref())?;
+                changed |=
+                    self.store
+                        .set_step_state(&view.subject, "working", reason.as_deref())?;
                 if step.spec.nested_mission.is_some() {
                     continue;
                 }
@@ -7074,14 +7074,15 @@ impl<R: RuntimeControl> Reconciler<R> {
                 continue;
             }
             let is_held = |request: &crate::model::ClaimRecord| {
-                request.body.pointer("/fields/held").and_then(Value::as_bool) == Some(true)
+                request
+                    .body
+                    .pointer("/fields/held")
+                    .and_then(Value::as_bool)
+                    == Some(true)
             };
             let released = if requests.iter().any(is_held) {
                 self.store
-                    .claims_for(
-                        &item.subject,
-                        Some("subscription.mission-request-released"),
-                    )?
+                    .claims_for(&item.subject, Some("subscription.mission-request-released"))?
                     .into_iter()
                     .filter_map(|claim| {
                         claim
@@ -8785,16 +8786,6 @@ fn intake_is_stopped(subject: &DesiredSubject, host: &str) -> bool {
         }
         _ => false,
     }
-}
-
-fn claims_name_request(claims: &[crate::model::ClaimRecord], request: &str) -> bool {
-    claims.iter().any(|claim| {
-        claim
-            .body
-            .pointer("/fields/request")
-            .and_then(Value::as_str)
-            == Some(request)
-    })
 }
 
 /// Return the step path of a `step-run/GENERATION/PATH` subject.
@@ -19895,8 +19886,14 @@ mission "draining" state="ready" revision-cutover="when-idle" {
                 },
             )
             .unwrap();
-        apply_source(&seat.store, REVIEW_DRAINING_REVISED, "review-draining-revised");
-        let revised = parse_intent(REVIEW_DRAINING_REVISED, "node").unwrap().missions["draining"]
+        apply_source(
+            &seat.store,
+            REVIEW_DRAINING_REVISED,
+            "review-draining-revised",
+        );
+        let revised = parse_intent(REVIEW_DRAINING_REVISED, "node")
+            .unwrap()
+            .missions["draining"]
             .clone();
         let proposal = seat
             .store
@@ -19922,7 +19919,10 @@ mission "draining" state="ready" revision-cutover="when-idle" {
             .into_iter()
             .map(|step| step.subject)
             .collect::<Vec<_>>();
-        assert!(!listed.contains(&head_work), "the draining step is hidden: {listed:?}");
+        assert!(
+            !listed.contains(&head_work),
+            "the draining step is hidden: {listed:?}"
+        );
         seat.reconciler.reconcile_once().unwrap();
         let queue_next = seat.queue().next_work_id;
         let roster_next = seat
@@ -19938,7 +19938,9 @@ mission "draining" state="ready" revision-cutover="when-idle" {
             Some(later_work.as_str()),
             "the roster names the hidden draining step as next work"
         );
-        let head_claim = seat.work(&head_work, "claim", "review-head-claim").unwrap_err();
+        let head_claim = seat
+            .work(&head_work, "claim", "review-head-claim")
+            .unwrap_err();
         assert_eq!(head_claim.code, "run-generation-draining");
 
         // The claim check must agree with the wake it was sent.

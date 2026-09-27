@@ -2114,6 +2114,7 @@ pub fn mission_after_run(mut mission: MissionSpec, run: &str) -> Result<MissionS
         title: None,
         goals: Vec::new(),
         constraints: Vec::new(),
+        agent_constraints: BTreeMap::new(),
         timeout_ms: None,
         retry: RetrySpec::default(),
         finally: false,
