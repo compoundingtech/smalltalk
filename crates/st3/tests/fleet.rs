@@ -799,3 +799,38 @@ async fn the_secret_never_leaves_its_file() {
     }
     let _ = json!({});
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_flood_of_invalid_join_requests_does_not_block_a_valid_join() {
+    let root = tempfile::tempdir().unwrap();
+    let a = anchor(root.path(), "a").await;
+    let code = a.invite("b", &[]);
+    let url = format!("http://127.0.0.1:{}/v1/fleet/join", a.port);
+    let http = reqwest::Client::new();
+    let well_formed = |invite: String| {
+        json!({
+            "protocol": "st3-join-v1", "invite": invite, "name": "b", "mode": "listening",
+            "member_key": "AAAA", "ephemeral": "AAAA", "build": "flood",
+            "proof": "AAAA", "signature": "AAAA"
+        })
+    };
+    for index in 0..40 {
+        let response = if index % 2 == 0 {
+            http.post(&url).body("not json").send().await.unwrap()
+        } else {
+            http.post(&url)
+                .json(&well_formed(format!("{index:032x}")))
+                .send()
+                .await
+                .unwrap()
+        };
+        assert_eq!(response.status().as_u16(), 403, "request {index}");
+    }
+    let b = Node::new(root.path(), "b");
+    let output = b.join(&code, &[]);
+    assert!(
+        output.status.success(),
+        "a valid join was blocked: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
