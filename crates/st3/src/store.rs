@@ -19164,6 +19164,9 @@ fn step_run_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StepRunView> {
         timeout_ms: None,
         ready_age_ms: None,
         wake: None,
+        progress_summary: None,
+        progress_at_unix_ms: None,
+        completion_summary: None,
         readiness_epoch: row.get(19)?,
         blocked_reason: row.get(15)?,
         blockers: Vec::new(),
@@ -19192,8 +19195,61 @@ fn enrich_step_queue_at(
     )?;
     view.execution_started_at_unix_ms = execution_started_at_unix_ms;
     view.execution_elapsed_ms = execution_elapsed_ms;
+    enrich_step_summaries_at(connection, view, snapshot_unix_ms)?;
     enrich_step_wake_at(connection, view, snapshot_unix_ms)?;
     enrich_step_definition(connection, view)
+}
+
+/// Copies the worker's latest progress summary and its completion summary for the
+/// current attempt from the work claims, so views can show them without a history read.
+fn enrich_step_summaries_at(
+    connection: &Connection,
+    view: &mut StepRunView,
+    snapshot_unix_ms: u128,
+) -> rusqlite::Result<()> {
+    let mut statement = connection.prepare_cached(
+        "SELECT kind, body, accepted_at_unix_ms FROM claims
+         WHERE subject=?1 AND kind IN ('work.progress','work.submitted')
+         ORDER BY length(accepted_at_unix_ms), accepted_at_unix_ms, store_index",
+    )?;
+    let events = statement
+        .query_map([&view.subject], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    view.progress_summary = None;
+    view.progress_at_unix_ms = None;
+    view.completion_summary = None;
+    for (kind, body, accepted) in events {
+        let accepted = accepted.parse::<u128>().unwrap_or(0);
+        if accepted > snapshot_unix_ms {
+            break;
+        }
+        let body = serde_json::from_str::<Value>(&body).unwrap_or(Value::Null);
+        let fields = body.get("fields").unwrap_or(&body);
+        if fields.get("attempt").and_then(Value::as_u64) != Some(u64::from(view.attempt)) {
+            continue;
+        }
+        let Some(summary) = fields
+            .get("summary")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|summary| !summary.is_empty())
+        else {
+            continue;
+        };
+        if kind == "work.progress" {
+            view.progress_summary = Some(summary.to_owned());
+            view.progress_at_unix_ms = Some(accepted);
+        } else {
+            view.completion_summary = Some(summary.to_owned());
+        }
+    }
+    Ok(())
 }
 
 fn enrich_step_queue_for_reconcile_at(
@@ -27884,6 +27940,115 @@ mission "takeover" state="ready" {
                 .collect::<Vec<_>>()
         };
         assert_eq!(states(&replicated), states(&reopened));
+    }
+
+    #[test]
+    fn step_views_carry_the_current_attempts_progress_and_completion_summaries() {
+        let store = Store::open_memory("node").unwrap();
+        let source = r#"version 2
+
+agent "worker" { workspace "/tmp"; command "true" }
+
+mission "summaries" state="ready" {
+  goal "Show what the worker reported."
+  step "work" {
+    assigned-to "agent/worker"
+    retry { attempts 2 }
+    gate "the result is ready" { exists "resource/result" }
+  }
+}
+"#;
+        let intent = crate::graph::parse_test_intent(source, "node").unwrap();
+        let planned = store
+            .mission(
+                &intent,
+                IntentInput {
+                    kdl: source.into(),
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        store
+            .apply(&intent, &planned.subject_tokens, "summaries-mission")
+            .unwrap();
+        let run = store
+            .create_mission_run(&MissionRunRequest {
+                mission: "summaries".into(),
+                revision: None,
+                workspace: "/tmp".into(),
+                requester: Some("person/test".into()),
+                mode: Some("run".into()),
+                inputs: BTreeMap::new(),
+                idempotency_key: "summaries-run".into(),
+            })
+            .unwrap();
+        let subject = &run.steps[0].subject;
+        let request = |key: &str, summary: Option<&str>| WorkRequest {
+            actor: Some("agent/node.worker".into()),
+            incarnation: Some("current".into()),
+            summary: summary.map(str::to_owned),
+            reason: None,
+            evidence: Vec::new(),
+            idempotency_key: key.into(),
+        };
+
+        store.set_step_state(subject, "ready", None).unwrap();
+        let claimed = store
+            .work_action(subject, "claim", &request("claim-1", Some("Starting")))
+            .unwrap();
+        assert_eq!(claimed.progress_summary, None, "a claim is not progress");
+        let fresh = serde_json::to_value(&claimed).unwrap();
+        for field in [
+            "progress_summary",
+            "progress_at_unix_ms",
+            "completion_summary",
+        ] {
+            assert!(
+                fresh.get(field).is_none(),
+                "{field} is absent until reported"
+            );
+        }
+        for (key, summary) in [
+            ("progress-1", Some("Reading the renderer")),
+            ("progress-2", Some("  Tests pass\n")),
+            ("progress-3", None),
+        ] {
+            store
+                .work_action(subject, "progress", &request(key, summary))
+                .unwrap();
+        }
+        let working = store.step_run(subject).unwrap().unwrap();
+        assert_eq!(working.progress_summary.as_deref(), Some("Tests pass"));
+        assert!(working.progress_at_unix_ms.is_some());
+        assert_eq!(working.completion_summary, None);
+
+        store
+            .work_action(
+                subject,
+                "complete",
+                &request("complete-1", Some("Opened the pull request")),
+            )
+            .unwrap();
+        let shown = store.mission_run(&run.subject).unwrap().unwrap();
+        let submitted = &shown.steps[0];
+        assert_eq!(submitted.status, "verifying");
+        assert_eq!(submitted.progress_summary.as_deref(), Some("Tests pass"));
+        assert_eq!(
+            submitted.completion_summary.as_deref(),
+            Some("Opened the pull request")
+        );
+
+        store
+            .set_step_state(subject, "failed", Some("the gate failed"))
+            .unwrap();
+        store.retry_step(subject, "retry attempt 2", 0).unwrap();
+        let retried = store.step_run(subject).unwrap().unwrap();
+        assert_eq!(retried.attempt, 2);
+        assert_eq!(
+            retried.progress_summary, None,
+            "attempt 1 progress is stale"
+        );
+        assert_eq!(retried.completion_summary, None);
     }
 
     #[test]

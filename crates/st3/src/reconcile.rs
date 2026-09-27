@@ -208,7 +208,7 @@ impl RuntimeControl for NativeRuntime {
     }
 
     fn start(&self, member: &MemberSpec) -> Result<()> {
-        let executable = std::env::current_exe()?;
+        let executable = launch_executable()?;
         let environment = st_runtime::materialize_environment(&member.environment, &executable)?;
         let mut launch = st_runtime::Launch::from(&member.launch);
         match &mut launch {
@@ -2209,7 +2209,7 @@ impl<R: RuntimeControl> Reconciler<R> {
         } else {
             launch_member.environment.remove("ST_AGENT");
         }
-        let executable = std::env::current_exe()?;
+        let executable = launch_executable()?;
         launch_member
             .environment
             .insert("ST3_BIN".into(), executable.to_string_lossy().into_owned());
@@ -5980,6 +5980,9 @@ impl<R: RuntimeControl> Reconciler<R> {
                         timeout_ms: None,
                         ready_age_ms: None,
                         wake: None,
+                        progress_summary: None,
+                        progress_at_unix_ms: None,
+                        completion_summary: None,
                         readiness_epoch: 0,
                         blocked_reason: None,
                         blockers: Vec::new(),
@@ -9214,6 +9217,20 @@ enum UsedMissionOutcome {
     Pending,
     Completed,
     Failed(String),
+}
+
+/// The st3 executable members launch with. A deploy installs the new binary before it restarts
+/// the daemon, and in between Linux names this process's image `PATH (deleted)`. Launching that
+/// name fails every start in the window and can hold a seat in a crash loop, so use the
+/// replacement installed at the original path.
+fn launch_executable() -> Result<PathBuf> {
+    let current = std::env::current_exe()?;
+    Ok(replaced_executable(&current).unwrap_or(current))
+}
+
+fn replaced_executable(current: &Path) -> Option<PathBuf> {
+    let original = PathBuf::from(current.to_str()?.strip_suffix(" (deleted)")?);
+    original.is_file().then_some(original)
 }
 
 fn member_fields(
@@ -17743,6 +17760,246 @@ version 2
         assert_eq!(attention[0].targets, ["agent/node.seat"]);
     }
 
+    fn harness_claim(subject: &str, state: &str, incarnation: &str) -> ClaimInput {
+        ClaimInput {
+            subject: subject.into(),
+            kind: "harness.observed".into(),
+            actor: Some(subject.into()),
+            fields: BTreeMap::from([
+                ("state".into(), Value::String(state.into())),
+                ("driver".into(), Value::String("codex".into())),
+                ("incarnation_id".into(), Value::String(incarnation.into())),
+            ]),
+            evidence: Vec::new(),
+            expected_subject: None,
+            idempotency_key: Some(format!("{subject}:{state}:{incarnation}")),
+        }
+    }
+
+    #[test]
+    fn a_daemon_restart_adopts_running_and_starting_seats_and_restarts_one_that_vanished() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("state.sqlite3");
+        let workspace = tempfile::tempdir().unwrap();
+        let source = ["running", "starting", "vanished"]
+            .iter()
+            .fold(String::from("version 2\n"), |source, name| {
+                format!(
+                    "{source}agent {name:?} {{ workspace {:?}; harness \"codex\" {{ prompt \"Wait.\" }} }}\n",
+                    workspace.path().display().to_string()
+                )
+            });
+        let pty = |name: &str| RuntimeObservation {
+            runtime_id: format!("node.{name}"),
+            terminal: true,
+            status: "running".into(),
+            exit_code: None,
+            incarnation_id: Some(format!("{name}-one")),
+        };
+        let latest_runtime = |store: &Store, name: &str| {
+            let actual = store
+                .latest_actual_value(&format!("agent/node.{name}"))
+                .unwrap()
+                .unwrap();
+            let fields = actual.get("fields").unwrap_or(&actual).clone();
+            (
+                fields["status"].as_str().unwrap_or_default().to_owned(),
+                fields["incarnation_id"].as_str().map(str::to_owned),
+            )
+        };
+
+        // Before the deploy: all three seats launched, and only one driver has reported ready.
+        {
+            let store = Arc::new(Store::open(&database, "node").unwrap());
+            apply_source(&store, &source, "restart-seats");
+            let runtime = Arc::new(FakeRuntime::default());
+            let reconciler = Reconciler::new(
+                store.clone(),
+                runtime.clone(),
+                "node".into(),
+                Arc::new(Notify::new()),
+            );
+            reconciler.reconcile_once().unwrap();
+            assert_eq!(runtime.starts.lock().unwrap().len(), 3);
+            runtime
+                .ptys
+                .lock()
+                .unwrap()
+                .extend(["running", "starting", "vanished"].map(pty));
+            reconciler.reconcile_once().unwrap();
+            store
+                .append_claim(&harness_claim("agent/node.running", "ready", "running-one"))
+                .unwrap();
+            for name in ["starting", "vanished"] {
+                store
+                    .append_claim(&harness_claim(
+                        &format!("agent/node.{name}"),
+                        "starting",
+                        &format!("{name}-one"),
+                    ))
+                    .unwrap();
+            }
+        }
+
+        // The daemon restarts over the same graph. PTYs outlive it, except one that exited
+        // while it was down.
+        let store = Arc::new(Store::open(&database, "node").unwrap());
+        let runtime = Arc::new(FakeRuntime::default());
+        runtime
+            .ptys
+            .lock()
+            .unwrap()
+            .extend(["running", "starting"].map(pty));
+        let reconciler = Reconciler::new(
+            store.clone(),
+            runtime.clone(),
+            "node".into(),
+            Arc::new(Notify::new()),
+        );
+        reconciler.reconcile_once().unwrap();
+
+        // Live seats are adopted as they are: nothing is stopped, killed, or started twice.
+        assert_eq!(*runtime.starts.lock().unwrap(), ["node.vanished"]);
+        assert!(runtime.stops.lock().unwrap().is_empty());
+        assert!(runtime.kills.lock().unwrap().is_empty());
+        for name in ["running", "starting"] {
+            assert_eq!(
+                latest_runtime(&store, name),
+                ("running".into(), Some(format!("{name}-one")))
+            );
+        }
+        assert_eq!(latest_runtime(&store, "vanished").0, "starting");
+
+        // The starting seat's driver reports ready after the restart; no seat is left waiting.
+        store
+            .append_claim(&harness_claim(
+                "agent/node.starting",
+                "ready",
+                "starting-one",
+            ))
+            .unwrap();
+        runtime.ptys.lock().unwrap().push(RuntimeObservation {
+            incarnation_id: Some("vanished-two".into()),
+            ..pty("vanished")
+        });
+        store
+            .append_claim(&harness_claim(
+                "agent/node.vanished",
+                "ready",
+                "vanished-two",
+            ))
+            .unwrap();
+        reconciler.reconcile_once().unwrap();
+        for (name, incarnation) in [
+            ("running", "running-one"),
+            ("starting", "starting-one"),
+            ("vanished", "vanished-two"),
+        ] {
+            let harness = store
+                .current_harness(&format!("agent/node.{name}"))
+                .unwrap()
+                .unwrap();
+            assert_eq!(harness.incarnation_id, incarnation, "{name}");
+            assert!(harness.is_ready(), "{name}");
+            assert_eq!(
+                latest_runtime(&store, name),
+                ("running".into(), Some(incarnation.into()))
+            );
+        }
+        assert_eq!(runtime.starts.lock().unwrap().len(), 1);
+        assert!(
+            store
+                .attention_items(Some("person/operator"))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_later_ready_incarnation_resolves_the_readiness_attention_of_the_one_it_replaced() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        let workspace = tempfile::tempdir().unwrap();
+        let source = format!(
+            "version 2\nagent \"worker\" {{ workspace {:?}; harness \"codex\" {{ prompt \"Wait.\" }} }}\n",
+            workspace.path().display().to_string()
+        );
+        apply_source(&store, &source, "superseded-readiness");
+        let desired = store
+            .desired_subjects()
+            .unwrap()
+            .into_iter()
+            .find(|subject| subject.subject == "agent/node.worker")
+            .unwrap();
+        let member = desired.member.as_ref().unwrap();
+        let observe = |incarnation: &str| {
+            let claim = store
+                .append_claim(&ClaimInput {
+                    subject: desired.subject.clone(),
+                    kind: "runtime.observed".into(),
+                    actor: None,
+                    fields: member_fields(member, "running", Some(incarnation), true),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: Some(format!("runtime-{incarnation}")),
+                })
+                .unwrap();
+            let observation = RuntimeObservation {
+                runtime_id: member.runtime_id.clone(),
+                terminal: true,
+                status: "running".into(),
+                exit_code: None,
+                incarnation_id: Some(incarnation.into()),
+            };
+            (claim, observation)
+        };
+        let reconciler = Reconciler::new(
+            store.clone(),
+            Arc::new(FakeRuntime::default()),
+            "node".into(),
+            Arc::new(Notify::new()),
+        );
+
+        // The first incarnation never became ready, for example behind a prompt.
+        let (claim, stuck) = observe("worker-one");
+        let late = claim.accepted_at_unix_ms + HARNESS_READINESS_DEADLINE_MS + 1;
+        reconciler
+            .reconcile_driver_readiness(&desired, member, &stuck, late)
+            .unwrap();
+        assert_eq!(
+            store
+                .attention_items(Some("person/operator"))
+                .unwrap()
+                .len(),
+            1
+        );
+
+        // An operator restarts the seat and its next incarnation becomes ready.
+        let (_, replacement) = observe("worker-two");
+        store
+            .append_claim(&harness_claim(&desired.subject, "ready", "worker-two"))
+            .unwrap();
+        reconciler
+            .reconcile_driver_readiness(&desired, member, &replacement, late + 1)
+            .unwrap();
+        assert!(
+            store
+                .attention_items(Some("person/operator"))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_replaced_executable_launches_from_its_installed_path() {
+        let directory = tempfile::tempdir().unwrap();
+        let installed = directory.path().join("st3");
+        let deleted = directory.path().join("st3 (deleted)");
+        assert_eq!(replaced_executable(&deleted), None);
+        std::fs::write(&installed, b"").unwrap();
+        assert_eq!(replaced_executable(&deleted), Some(installed.clone()));
+        assert_eq!(replaced_executable(&installed), None);
+    }
+
     #[test]
     fn a_readiness_deadline_alerts_once_without_restarting_and_then_resolves() {
         let store = Arc::new(Store::open_memory("node").unwrap());
@@ -18736,6 +18993,9 @@ mission "ios-proof-blocked" state="ready" {
             timeout_ms: None,
             ready_age_ms: None,
             wake: None,
+            progress_summary: None,
+            progress_at_unix_ms: None,
+            completion_summary: None,
             readiness_epoch: 1,
             blocked_reason: None,
             blockers: Vec::new(),
@@ -18889,6 +19149,9 @@ mission "ios-proof-blocked" state="ready" {
                 acknowledged_by: None,
                 failure: None,
             }),
+            progress_summary: None,
+            progress_at_unix_ms: None,
+            completion_summary: None,
             readiness_epoch: 1,
             blocked_reason: None,
             blockers: Vec::new(),
@@ -19262,6 +19525,9 @@ agent "worker" { workspace "/tmp"; command "true"; restart "never" }
                 acknowledged_by: None,
                 failure: None,
             }),
+            progress_summary: None,
+            progress_at_unix_ms: None,
+            completion_summary: None,
             readiness_epoch: 1,
             blocked_reason: None,
             blockers: Vec::new(),
