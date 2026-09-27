@@ -6266,6 +6266,13 @@ fn planning_cancellation_intent(session_id: &str, operation_id: &str, reason: &s
 }
 
 fn parse_person_subject(actor: &str) -> std::result::Result<String, String> {
+    if actor.starts_with("agent/") {
+        // Agents reached for `now --as "$ST_AGENT"` and read the person-authority refusal as a
+        // refusal of their own identity everywhere; name the agent commands instead.
+        return Err(format!(
+            "this option takes a person, not the agent `{actor}`; an agent lists its work with `st3 work ls --as \"$ST_AGENT\"` and its mail with `st3 conversations ls \"$ST_AGENT\"`"
+        ));
+    }
     let name = actor.strip_prefix("person/").ok_or_else(|| {
         "human authority must be explicit as a complete `person/NAME` subject".to_owned()
     })?;
@@ -8274,6 +8281,18 @@ mod tests {
         let pi = pi_family_message_frame("pi", &message, "FACT QUARTZ", "run-1/wake.pi");
         assert_eq!(pi["deliverAs"], "steer");
         assert_eq!(pi["content"], omp["content"]);
+    }
+
+    #[test]
+    fn a_person_option_points_an_agent_to_its_own_commands() {
+        let refusal = parse_person_subject("agent/run-1/worker").unwrap_err();
+        assert!(refusal.contains("takes a person, not the agent `agent/run-1/worker`"));
+        assert!(refusal.contains("work ls --as"));
+        assert_eq!(
+            parse_person_subject("person/operator").as_deref(),
+            Ok("person/operator")
+        );
+        assert!(parse_person_subject("operator").is_err());
     }
 
     #[test]
