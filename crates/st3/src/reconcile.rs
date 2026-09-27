@@ -458,6 +458,12 @@ impl<R: RuntimeControl> Reconciler<R> {
             self.next_work_wake_deadline()?,
             self.next_provider_capacity_retry_deadline()?,
             self.store.next_subscription_mission_retry_deadline()?,
+            self.delayed_restarts
+                .lock()
+                .expect("restart mutex poisoned")
+                .values()
+                .copied()
+                .min(),
         ]
         .into_iter()
         .flatten()
@@ -1738,6 +1744,13 @@ impl<R: RuntimeControl> Reconciler<R> {
         member: &MemberSpec,
         reason: &str,
     ) -> Result<()> {
+        if subject.kind == "agent"
+            && member.lifecycle == MemberLifecycle::Service
+            && member.driver.as_deref() != Some("codex")
+            && self.defer_or_park_failed_start(subject)?
+        {
+            return Ok(());
+        }
         if member.driver.as_deref() == Some("codex") {
             let token = self
                 .store
@@ -1866,6 +1879,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                 .store
                 .selected_desired_token(&subject.subject)?
                 .unwrap_or_default();
+            let prior_failures = self.start_failures(&subject.subject, &desired_token)?;
             self.store.append_claim(&ClaimInput {
                 subject: subject.subject.clone(),
                 kind: "runtime.action.failed".into(),
@@ -1874,11 +1888,15 @@ impl<R: RuntimeControl> Reconciler<R> {
                     ("action".into(), Value::String("start".into())),
                     ("operation".into(), Value::String(operation)),
                     ("reason".into(), Value::String(reason)),
-                    ("desired_token".into(), Value::String(desired_token)),
+                    ("desired_token".into(), Value::String(desired_token.clone())),
                 ]),
                 evidence: Vec::new(),
                 expected_subject: None,
-                idempotency_key: None,
+                idempotency_key: Some(format!(
+                    "start-failed:{}:{desired_token}:{}",
+                    subject.subject,
+                    prior_failures.len() + 1
+                )),
             })?;
             self.record_once(
                 &subject.subject,
@@ -1933,6 +1951,14 @@ impl<R: RuntimeControl> Reconciler<R> {
         member: &MemberSpec,
         observation: &RuntimeObservation,
     ) -> Result<()> {
+        if subject.kind == "agent"
+            && member.lifecycle == MemberLifecycle::Service
+            && member.driver.as_deref() != Some("codex")
+            && !self.claude_trust_recovery_stopped(&subject.subject, observation)?
+            && self.park_unready_crash_loop(subject)?
+        {
+            return Ok(());
+        }
         if member.driver.as_deref() == Some("codex") {
             let token = self
                 .store
@@ -2032,6 +2058,201 @@ impl<R: RuntimeControl> Reconciler<R> {
                 claim.body.pointer("/fields/key").and_then(Value::as_str)
                     == Some(decision_key.as_str())
             }))
+    }
+
+    fn start_failures(&self, subject: &str, token: &str) -> Result<Vec<crate::model::ClaimRecord>> {
+        Ok(self
+            .store
+            .claims_for(subject, Some("runtime.action.failed"))?
+            .into_iter()
+            .filter(|claim| {
+                claim.body.pointer("/fields/action").and_then(Value::as_str) == Some("start")
+                    && claim
+                        .body
+                        .pointer("/fields/desired_token")
+                        .and_then(Value::as_str)
+                        == Some(token)
+            })
+            .collect())
+    }
+
+    /// Keep a failed durable launch from turning each graph write into another PTY spawn.
+    fn defer_or_park_failed_start(&self, subject: &DesiredSubject) -> Result<bool> {
+        let token = self
+            .store
+            .selected_desired_token(&subject.subject)?
+            .unwrap_or_default();
+        if self.runtime_crash_loop_raised(&subject.subject, &token)? {
+            return Ok(true);
+        }
+        let last_success_index = self
+            .store
+            .claims_for(&subject.subject, Some("runtime.action.succeeded"))?
+            .into_iter()
+            .filter(|claim| {
+                claim
+                    .body
+                    .pointer("/fields/desired_token")
+                    .and_then(Value::as_str)
+                    == Some(token.as_str())
+            })
+            .map(|claim| claim.store_index)
+            .max()
+            .unwrap_or(0);
+        let now = now_ms();
+        let recent = self
+            .start_failures(&subject.subject, &token)?
+            .into_iter()
+            .filter(|claim| {
+                claim.store_index > last_success_index
+                    && now.saturating_sub(claim.accepted_at_unix_ms) < CODEX_CRASH_LOOP_INTERVAL_MS
+            })
+            .collect::<Vec<_>>();
+        if recent.len() >= CODEX_CRASH_LOOP_ATTEMPTS {
+            let detail = recent
+                .last()
+                .and_then(|claim| claim.body.pointer("/fields/reason"))
+                .and_then(Value::as_str)
+                .unwrap_or("the runtime start failed");
+            self.raise_runtime_crash_loop(
+                &subject.subject,
+                &token,
+                &format!("the runtime failed to start three times: {detail}"),
+            )?;
+            return Ok(true);
+        }
+        if let Some(last) = recent.last() {
+            let until = last.accepted_at_unix_ms.saturating_add(15_000);
+            if until > now {
+                self.arm_restart(&subject.subject, until);
+                return Ok(true);
+            }
+        }
+        self.delayed_restarts
+            .lock()
+            .expect("restart mutex poisoned")
+            .remove(&subject.subject);
+        Ok(false)
+    }
+
+    fn park_unready_crash_loop(&self, subject: &DesiredSubject) -> Result<bool> {
+        let token = self
+            .store
+            .selected_desired_token(&subject.subject)?
+            .unwrap_or_default();
+        if self.runtime_crash_loop_raised(&subject.subject, &token)? {
+            return Ok(true);
+        }
+        let first_launch = self
+            .store
+            .claims_for(&subject.subject, Some("runtime.action.succeeded"))?
+            .into_iter()
+            .filter(|claim| {
+                claim
+                    .body
+                    .pointer("/fields/desired_token")
+                    .and_then(Value::as_str)
+                    == Some(token.as_str())
+            })
+            .map(|claim| claim.accepted_at_unix_ms)
+            .min();
+        let Some(first_launch) = first_launch else {
+            return Ok(false);
+        };
+        let ready = self
+            .store
+            .claims_for(&subject.subject, Some("harness.observed"))?
+            .into_iter()
+            .filter(|claim| {
+                matches!(
+                    claim.body.pointer("/fields/state").and_then(Value::as_str),
+                    Some("ready" | "idle" | "working")
+                )
+            })
+            .filter_map(|claim| claim_incarnation(&claim).map(str::to_owned))
+            .collect::<BTreeSet<_>>();
+        let trust_recovery = self
+            .claude_trust_prompts(&subject.subject)?
+            .iter()
+            .filter_map(|claim| claim_incarnation(claim).map(str::to_owned))
+            .collect::<BTreeSet<_>>();
+        let now = now_ms();
+        let exits = self
+            .store
+            .claims_for(&subject.subject, Some("runtime.observed"))?
+            .into_iter()
+            .filter(|claim| {
+                matches!(
+                    claim.body.pointer("/fields/status").and_then(Value::as_str),
+                    Some("exited" | "vanished")
+                ) && claim.accepted_at_unix_ms >= first_launch
+                    && now.saturating_sub(claim.accepted_at_unix_ms) < CODEX_CRASH_LOOP_INTERVAL_MS
+            })
+            .filter_map(|claim| claim_incarnation(&claim).map(str::to_owned))
+            .filter(|incarnation| {
+                !ready.contains(incarnation) && !trust_recovery.contains(incarnation)
+            })
+            .collect::<BTreeSet<_>>();
+        if exits.len() >= CODEX_CRASH_LOOP_ATTEMPTS {
+            self.raise_runtime_crash_loop(
+                &subject.subject,
+                &token,
+                "the runtime exited three times before the harness became ready",
+            )?;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    fn runtime_crash_loop_raised(&self, subject: &str, token: &str) -> Result<bool> {
+        let key = format!("runtime-crash-loop:{token}");
+        Ok(self
+            .store
+            .claims_for(subject, Some("runtime.reconcile-decision"))?
+            .iter()
+            .any(|claim| {
+                claim.body.pointer("/fields/key").and_then(Value::as_str) == Some(key.as_str())
+            }))
+    }
+
+    fn raise_runtime_crash_loop(&self, subject: &str, token: &str, reason: &str) -> Result<()> {
+        let key = format!("runtime-crash-loop:{subject}:{token}");
+        let decision_key = format!("runtime-crash-loop:{token}");
+        let digest = hex::encode(sha2::Sha256::digest(key.as_bytes()));
+        let attention_subject = format!("attention/{}", &digest[..32]);
+        let mut changed = false;
+        if !self.runtime_crash_loop_raised(subject, token)? {
+            self.store.append_claim(&ClaimInput {
+                subject: subject.into(),
+                kind: "runtime.reconcile-decision".into(),
+                actor: None,
+                fields: BTreeMap::from([
+                    ("decision".into(), Value::String("raise".into())),
+                    ("reachability".into(), Value::String("unreachable".into())),
+                    ("key".into(), Value::String(decision_key)),
+                    ("reason".into(), Value::String(reason.into())),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some(format!("{key}:raised")),
+            })?;
+            changed = true;
+        }
+        if self.store.attention_request(&attention_subject)?.is_none() {
+            self.store.request_attention(&attention_subject, &AttentionRequest {
+                reviewer: "person/operator".into(),
+                title: "An agent stopped after repeated runtime failures".into(),
+                reason: format!("{subject}: {reason}. Inspect the seat and revise its desired declaration before restarting."),
+                severity: "error".into(), targets: vec![subject.into()],
+                actor: "agent/st3/reconciler".into(),
+                idempotency_key: format!("{key}:attention"),
+            })?;
+            changed = true;
+        }
+        if changed {
+            self.signal_changed();
+        }
+        Ok(())
     }
 
     fn raise_codex_crash_loop(&self, subject: &str, token: &str, reason: &str) -> Result<()> {
@@ -2145,7 +2366,16 @@ impl<R: RuntimeControl> Reconciler<R> {
             .map(|claim| claim.store_index)
             .max()
             .unwrap_or(0);
-        launches.retain(|claim| claim.store_index > reset_index);
+        launches.retain(|claim| {
+            launch_in_restart_window(
+                claim.store_index,
+                claim.accepted_at_unix_ms,
+                reset_index,
+                now,
+                intensity.interval_ms,
+                &intensity.mode,
+            )
+        });
 
         if intensity.mode == "fail" {
             if let Some(last) = launches.last()
@@ -8243,6 +8473,18 @@ enum RestartDecision {
     Fail { reason: String },
 }
 
+fn launch_in_restart_window(
+    store_index: u64,
+    accepted_at_unix_ms: u128,
+    reset_index: u64,
+    now: u128,
+    interval_ms: u64,
+    mode: &str,
+) -> bool {
+    store_index > reset_index
+        && (mode != "fail" || accepted_at_unix_ms > now.saturating_sub(interval_ms as u128))
+}
+
 fn actual_field<'a>(actual: &'a Value, path: &str) -> Option<&'a Value> {
     let mut value = actual.get("fields").unwrap_or(actual);
     for segment in path.split('.') {
@@ -9310,6 +9552,7 @@ version 2
         agent "good" { workspace "/tmp"; command "true"; restart "never" }
 
     }
+
   }
 
 "#;
@@ -9353,6 +9596,38 @@ version 2
                 .latest_claim(&bad_subject, Some("runtime.action.failed"))
                 .unwrap()
                 .is_some()
+        );
+    }
+
+    #[test]
+    fn failed_durable_start_waits_instead_of_relaunching_each_pass() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        apply_source(
+            &store,
+            "version 2\nagent \"bad\" { workspace \"/tmp\"; command \"true\"; restart \"always\" }\n",
+            "failed-durable-start",
+        );
+        let runtime = Arc::new(FakeRuntime::default());
+        runtime
+            .failed_starts
+            .lock()
+            .unwrap()
+            .insert("node.bad".into());
+        let reconciler = Reconciler::new(
+            store.clone(),
+            runtime.clone(),
+            "node".into(),
+            Arc::new(Notify::new()),
+        );
+        for _ in 0..5 {
+            reconciler.reconcile_once().unwrap();
+        }
+        assert_eq!(runtime.starts.lock().unwrap().len(), 1);
+        assert!(
+            reconciler
+                .next_reconcile_deadline()
+                .unwrap()
+                .is_some_and(|deadline| deadline > now_ms())
         );
     }
 
@@ -11391,6 +11666,80 @@ agent "worker" {
             .unwrap();
         reconciler.reconcile_once().unwrap();
         assert_eq!(runtime.starts.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn fail_restart_window_excludes_old_generations_even_without_a_matching_reset() {
+        let now = 1_000_000_u128;
+        let interval = 300_000_u64;
+        assert!(!launch_in_restart_window(
+            1,
+            now - 700_000,
+            0,
+            now,
+            interval,
+            "fail"
+        ));
+        assert!(!launch_in_restart_window(
+            2,
+            now - 400_000,
+            0,
+            now,
+            interval,
+            "fail"
+        ));
+        assert!(launch_in_restart_window(
+            3,
+            now - 30_000,
+            0,
+            now,
+            interval,
+            "fail"
+        ));
+        assert!(!launch_in_restart_window(
+            3,
+            now - 30_000,
+            3,
+            now,
+            interval,
+            "fail"
+        ));
+    }
+
+    #[test]
+    fn three_exits_before_readiness_park_a_native_seat() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        apply_source(
+            &store,
+            "version 2\nagent \"worker\" { workspace \"/tmp\"; command \"true\"; restart \"always\" }\n",
+            "unready-exits",
+        );
+        let runtime = Arc::new(FakeRuntime::default());
+        let reconciler = Reconciler::new(
+            store.clone(),
+            runtime.clone(),
+            "node".into(),
+            Arc::new(Notify::new()),
+        );
+        reconciler.reconcile_once().unwrap();
+        for number in 1..=3 {
+            *runtime.ptys.lock().unwrap() = vec![RuntimeObservation {
+                runtime_id: "node.worker".into(),
+                terminal: true,
+                status: "exited".into(),
+                exit_code: Some(1),
+                incarnation_id: Some(format!("crash-{number}")),
+            }];
+            reconciler.reconcile_once().unwrap();
+        }
+        assert_eq!(runtime.starts.lock().unwrap().len(), 3);
+        assert!(
+            store
+                .attention_requests(None, false)
+                .unwrap()
+                .iter()
+                .any(|attention| { attention.targets.contains(&"agent/node.worker".to_owned()) })
+        );
     }
 
     #[test]
