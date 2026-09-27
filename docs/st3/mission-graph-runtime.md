@@ -969,8 +969,20 @@ agent "parser" {
 Maintained harnesses receive graph messages through their native driver boundary. Codex uses typed
 app-server turn requests. Claude uses one persistent stream-JSON process and acknowledges the
 exact replayed user turn. Pi and OMP acknowledge through their loaded native extensions and
-steer a message into a running turn at its next tool boundary. Every harness receives the same
-`[PING from st3] message/ID from SENDER: TITLE` envelope. OpenCode
+steer a message into a running turn at its next tool boundary. Codex, OpenCode, Pi, and OMP
+receive one `<smalltalk-message>` element per message:
+
+```text
+<smalltalk-message id="ID" from="SENDER" to="RECIPIENT" subject="TITLE" sha256="BODY-SHA256" graph="message/ID">
+bounded one-line body preview
+</smalltalk-message>
+```
+
+`sha256` is the lowercase hex SHA-256 of the complete message body in the graph, and
+`st3 conversations read message/ID` shows that body. Every attribute value and the preview are
+XML-escaped, so sender text cannot close the element or add an attribute. A truncated preview ends
+with `…`, and a note after the closing tag says so. Claude receives the plain
+`[PING from st3] message/ID from SENDER: TITLE` notice and preview inside its own channel tag. OpenCode
 acknowledges the assistant turn whose `parentID` is the exact stable user-message ID. Copying a
 message into an inbox or successfully writing transport bytes is not delivery. st3 advances the
 graph only from the durable provider receipt and never injects text or Enter into a terminal
