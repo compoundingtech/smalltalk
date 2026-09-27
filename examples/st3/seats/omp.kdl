@@ -12,15 +12,15 @@ version 2
 //
 // Before you apply it:
 // - install omp 18.0 or 18.1 and make sure `bun` is on the login-shell PATH of the user who
-//   runs the st3 daemon;
+//   runs the st daemon;
 // - log that user's omp profile in to the `openai-codex` provider;
 // - replace the workspace with an existing checkout on this host.
 //
 // Apply, inspect, and later stop the seat:
 //
-//   st3 agents apply examples/st3/seats/omp.kdl --as person/operator
-//   st3 agents show agent/example/worker
-//   st3 agents stop agent/example/worker --as person/operator
+//   st agents apply examples/st3/seats/omp.kdl --as person/operator
+//   st agents show agent/example/worker
+//   st agents stop agent/example/worker --as person/operator
 //
 // `openai-codex/gpt-6-astra` is the recommended omp model (docs/st3/omp.md). omp fuzzy-matches
 // model names, so confirm the model in the seat's session transcript. If your login does not offer
