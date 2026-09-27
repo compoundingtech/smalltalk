@@ -52,11 +52,12 @@ st fleet join --dial-out
 new machine has the fleet's full history. `--dial-out` is for a machine that is often asleep or
 offline, such as a laptop. Leave it out for a machine that stays on.
 
-When both machines are Fabric peers, the code never has to appear on a screen. `fabric exec`
-gives the remote command no standard input, so the code goes in as an argument:
+When both machines are Fabric peers, the code never has to appear on a screen or in a command
+line. `st` sends it as a file to the new machine's Fabric inbox, and `join` reads and deletes it:
 
 ```sh
-fabric exec laptop -- st fleet join --dial-out "$(st fleet invite laptop --code-only)"
+st fleet invite laptop --send-fabric
+fabric exec laptop -- st fleet join --dial-out --fabric-inbox
 ```
 
 To take a machine out:
@@ -65,6 +66,20 @@ To take a machine out:
 st fleet remove laptop --reason "wiped for reinstall"   # on any other member
 st uninstall                                            # on the machine itself, if it still runs
 ```
+
+## Design review responses
+
+The design review of the first version of this document raised seven findings. Each is resolved in this revision:
+
+| Finding | Resolution |
+|---|---|
+| 1. Critical: removal bypassable through an uninformed relay | Every keyed writer signs its envelopes, and admission checks the signature wherever the envelope came from ([Signed envelopes](#signed-envelopes)). Membership claims count only when signed by a current member or the pinned anchor. [What removal guarantees](#what-removal-guarantees) and [what it does not](#what-removal-does-not-guarantee) state the promise and the partition interval exactly. Test 4 forges and relays envelopes and a membership claim through an uninformed member. |
+| 2. High: invite deletion contradicts retry | The sponsor keeps the token, bound to one key and name, until expiry; each retry gets a freshly sealed answer and appends nothing ([Expiry and single use](#expiry-and-single-use)). Test 6 covers a lost answer, an immediate retry, a retry after a sponsor restart, and a retry after expiry. |
+| 3. High: leave can fence writes it promises to drain | `leave` stops local writes, drains to an exact condition, and only then appends the leave claim as the last envelope ([`st fleet leave`](#st-fleet-leave)). Test 10 drains 1,500 envelopes across sparse ranges with an interrupted confirmation and a peer restart. |
+| 4. High: CI filter skips core fleet changes | `fleet-compat` and `fleet-e2e` have no path filter and run on every pull request once added; a test fails if a filter appears; publication needs both platform legs of `fleet-e2e` ([CI](#ci)). |
+| 5. Medium: the v0.3.0 baseline may not exist | The baseline is pinned by checksum in `.github/fleet-compat-baseline.json`; the pull request that adds `fleet-compat` waits for the release and nothing skips or falls back. |
+| 6. Medium: the Fabric command exposes the code | `st fleet invite --send-fabric` and `st fleet join --fabric-inbox` move the code as a Fabric file, never in argv. The argv form remains, with its exposure stated. Test 8 checks that a leaked code is visible and revocable; tests 12 and 13 check argument lists. |
+| 7. Medium: rejoin separation is bounded | Incarnations are told apart by the key that signed each envelope, not by a sequence gap, so the floor is `H` and the separation is exact ([Reusing a name](#reusing-a-name)). Test 9 covers envelopes at and above the floor and relays after the new incarnation is admitted. |
 
 ## Terms
 
@@ -84,22 +99,65 @@ st uninstall                                            # on the machine itself,
   how the running fleet is configured today. It stays supported.
 - **Writer**: the node name that authored a replicated batch (`origin`). A node's writer name is
   its node name.
+- **Anchor**: the member whose key every member pins as the root of membership: the machine that
+  founded the fleet, or the first machine of an existing fleet to migrate.
 
 ## Trust model
 
-- Members are fully trusted, as they are today. A member can write any claim, and it runs agents
-  with shell access on its machine. Membership decides who may exchange; it does not limit what a
-  member may write.
-- The fleet secret authenticates fleet traffic (HMAC-SHA256, unchanged). A member key identifies
-  one member. After migration, a peer must prove both.
-- A removed machine keeps its copy of the fleet secret. The member key is what makes removal
-  enforceable: other members refuse a removed key, and the removed machine cannot sign as any
-  other member.
+- Members are fully trusted while they are members, as they are today. A member can write any
+  claim, and it runs agents with shell access on its machine.
+- The fleet secret authenticates fleet traffic (HMAC-SHA256, unchanged). A removed machine keeps
+  its copy, so the secret alone cannot enforce a removal.
+- Each member has its own member key. It signs every connection (request and response) and every
+  envelope the member writes, including envelopes written before it had the key. A signature binds
+  an envelope to one incarnation, wherever the envelope travels afterwards. See
+  [Signed envelopes](#signed-envelopes).
+- Membership claims count only when they are in an envelope signed by a current member, or by the
+  fleet's anchor (the founder, or the first migrated member). Every member pins the anchor's key
+  when it joins, from the authenticated handshake.
 - The fleet secret is never in a join code, a claim, a document, a log line, an error message,
   a command line, or a service file. It exists only in the secret file on each member and, during
   a join, inside one sealed handshake response.
 - Tailscale or Fabric encrypts traffic between machines. The replication protocol is plain HTTP
   and is never exposed on another network interface.
+
+### What removal guarantees
+
+Once a member has received the removal of an incarnation, it:
+
+- refuses every connection from that incarnation;
+- refuses every envelope signed by that incarnation's key with a sequence above the removal's
+  `high_water`, whichever member relays it;
+- refuses every envelope under any keyed writer that is not signed by that writer's key, so a
+  removed machine cannot write as another member.
+
+A holder of the fleet secret can therefore get nothing past a member that has the removal and the
+admissions of the writers involved.
+
+### What removal does not guarantee
+
+These gaps are deliberate and have tests that pin down their exact extent:
+
+- **The partition interval.** A member that has not yet received a removal still treats the
+  removed incarnation as a member. It accepts that machine's connections and admits its new signed
+  envelopes, and it relays them. Every member that has the removal refuses them. The uninformed
+  member keeps what it admitted before it learned; `st doctor` on that member reports each such
+  envelope as `admitted beyond high water`, so the difference is visible. Removing those envelopes
+  from its graph after the fact is not in this design.
+- **Writers a member does not yet know are keyed.** Until a member has a writer's admission, it
+  admits that writer's unsigned envelopes as today. After it has the admission, it refuses them.
+  `st doctor` reports unsigned envelopes it admitted earlier from a writer it now knows is keyed.
+- **Legacy writers.** A writer that never had a member key cannot be authenticated. Anyone with
+  the secret can inject envelopes under a legacy writer's name at a member that accepts the
+  connection. For a legacy writer that was removed, members refuse its envelopes above the
+  removal's `high_water`, but still accept unsigned candidates at or below it. Migration closes
+  this gap for each writer as it gets a key.
+- **Old builds** authenticate nothing beyond the secret.
+
+For a machine that was lost or stolen: remove it on every member you can reach, and finish
+migration (`st fleet migrate --finish`) on every member, so that no member accepts a legacy
+exchange. Rotating the secret is not in this design; once every writer is keyed, the secret is no
+longer what keeps anyone out.
 
 ## Files on each machine
 
@@ -148,8 +206,8 @@ the same meaning as `st fleet leave`.
 ### Command
 
 ```text
-st fleet invite [NAME] [--expires DURATION] [--via auto|tailscale|fabric|loopback]
-                [--code-only] [--code-file PATH] [--as PERSON]
+st fleet invite [NAME] [--expires DURATION] [--via auto|tailscale|fabric|loopback] [--migrate]
+                [--send-fabric | --code-only | --code-file PATH] [--as PERSON]
 st fleet invites [--all]
 st fleet invites revoke fleet-invite/ID --reason TEXT
 ```
@@ -159,6 +217,10 @@ st fleet invites revoke fleet-invite/ID --reason TEXT
 - `--via` chooses which of the sponsor's endpoints go into the code. `auto` includes every
   endpoint the sponsor advertises. `loopback` adds the loopback endpoint, for tests on one machine
   and for operator tunnels.
+- `--send-fabric` writes the code to a new `0600` temporary file, sends it with
+  `fabric send-file NAME FILE --as st-fleet-join-ID.code`, and deletes the local file. The code
+  is never printed and never on a command line. `st fleet join --fabric-inbox` on the other
+  machine finds the one `st-fleet-join-*.code` file in its Fabric inbox, reads it, and deletes it.
 - `--code-only` prints only the code, for command substitution or a pipe. `--code-file` writes
   it to a new `0600` file instead of standard output.
 - Invites are person operations. The CLI uses the configured person, and refuses inside an agent
@@ -172,8 +234,9 @@ On laptop, run this and paste the code when asked:
   st fleet join
 Code:
   stj1-...
-Or, if laptop is a Fabric peer of this machine:
-  fabric exec laptop -- st fleet join "$(st fleet invite laptop --code-only)"
+Or, if laptop is a Fabric peer of this machine, send the code instead of showing it:
+  st fleet invite laptop --send-fabric
+  fabric exec laptop -- st fleet join --fabric-inbox
 ```
 
 A dial-out member cannot sponsor, because nothing can connect to it. `st fleet invite` there
@@ -188,9 +251,13 @@ On a machine that is not in a fleet yet, `st fleet invite` first founds one; see
   expiry, transports, and person. It contains no token and no verifier. Every member sees it, so
   `st fleet invites` works anywhere.
 - The token lives only in the sponsor's local table `fleet_invite_tokens`: invite ID, token,
-  expiry, bound member key, and failed-attempt count. This table does not replicate. It is the
-  same class as the local `capabilities` table in [data authority](st3/data-authority.md). The
-  sponsor deletes a row when the invite is redeemed, revoked, or expired.
+  expiry, bound member key, bound name, failed-attempt count, and the admission claim once there
+  is one. This table does not replicate and survives a sponsor restart. It is the same class as
+  the local `capabilities` table in [data authority](st3/data-authority.md).
+- The row keeps the token until the invite expires or is revoked, even after redemption, so that
+  the bound key can redeem again (see below). Then the sponsor erases the token and keeps the row
+  with the token column cleared, so a late request still gets `invite-invalid`. The sponsor sweeps
+  expired rows at startup and every minute.
 
 ### Code contents
 
@@ -219,16 +286,25 @@ private key (below).
 
 - The sponsor's clock alone decides expiry. The joiner reports the code's `x` in messages but
   does not refuse on it, so a joiner with a skewed clock still works.
-- An invite binds to the first member key that proves the token. After that, only the same key
-  can redeem it again, and only until it expires. A retry by the same key is how an interrupted
-  join resumes. Any other key is refused.
+- An invite binds to the first member key that proves the token, together with the name it asked
+  for. Until the invite expires, that key can redeem it again with the same name, as often as it
+  needs to. Each redemption returns a freshly sealed answer. Only the first appends claims; later
+  ones append nothing. Any other key is refused. This is how an interrupted join resumes.
+- After expiry, nothing can redeem the invite. A joiner that never received its answer is then an
+  admitted member that is never seen. `st fleet status` shows it as `admitted, never seen`, and
+  the recovery is `st fleet remove NAME` followed by a new invite.
 - Five failed proofs burn the invite. The sponsor records `fleet.invite-revoked` with reason
-  `too-many-failures`.
+  `too-many-failures` and erases the token.
 - `st fleet invites revoke` works on any member. It takes effect when the claim reaches the
-  sponsor, which then deletes the token. `st fleet invites` shows whether the sponsor has
+  sponsor, which then erases the token. `st fleet invites` shows whether the sponsor has
   acknowledged it.
+- `st fleet invites` shows, for each invite, whether it was redeemed, when, by which name and key
+  fingerprint, and whether that member has been seen since. A redemption appears on the sponsor
+  at once and everywhere else within one exchange.
 - The join route answers with one generic refusal, `invite-invalid`, for every failure: unknown
-  invite, expired, revoked, wrong proof, or bound to another key. It never says which.
+  invite, expired, revoked, wrong proof, or bound to another key. It never says which. The joiner
+  then prints: "If you did not use this code before, someone else may have. Check
+  `st fleet invites` on a member."
 - The join route exists only while the sponsor holds at least one unexpired invite. Otherwise it
   returns 404 like any unknown path. Its body is limited to 4 KiB, and it accepts at most 10
   requests a minute across all invites.
@@ -266,8 +342,8 @@ The sponsor checks, in this order: body size and protocol; an unexpired, unrevok
 row for `i`; `proof` in constant time; `signature` against `Kj`; the pinned name; the name rules
 in [Reusing a name](#reusing-a-name); and last the bind (`member_key IS NULL OR member_key = Kj`,
 in one statement). The first successful bind appends `fleet.invite-redeemed` and
-`fleet.member-admitted` in the same store transaction. A retry by the same key reuses those
-claims.
+`fleet.member-admitted` in the same store transaction. A retry by the same key and name appends
+nothing and gets a freshly sealed answer.
 
 The worker serves the route. It passes the proof to the main daemon
 (`POST /v1/internal/fleet/redeem`), which holds the token table and writes the claims. The worker
@@ -282,7 +358,7 @@ The sponsor answers:
   "sponsor_key": "Ks.public",
   "ephemeral": "es.public",
   "nonce": "12 random bytes",
-  "sealed": "ChaCha20-Poly1305(k, nonce, aad, {fleet_id, secret, writer_floor, fabric_protocol, admitted_claim})",
+  "sealed": "ChaCha20-Poly1305(k, nonce, aad, {fleet_id, secret, anchor_key, writer_floor, fabric_protocol, admitted_claim})",
   "signature": "Ed25519(Ks, T1 || proof || sponsor_key || ephemeral || nonce || sealed)"
 }
 ```
@@ -315,12 +391,18 @@ keeps clock skew out of authentication.
 ### What join does on the new machine
 
 ```text
-st fleet join [CODE | -] [--name NAME] [--dial-out] [--via auto|tailscale|fabric|URL]
-              [--no-service] [--wait DURATION] [--as PERSON]
+st fleet join [CODE | - | --code-file PATH | --fabric-inbox] [--name NAME] [--dial-out]
+              [--via auto|tailscale|fabric|URL] [--no-service] [--wait DURATION] [--as PERSON]
 ```
 
-With no `CODE`, `join` prompts for it without echo. `-` reads it from standard input. A code on
-the command line works too; it is short-lived and single-use, and `join` does not log it.
+With no `CODE`, `join` prompts for it without echo. `-` reads it from standard input.
+`--code-file PATH` and `--fabric-inbox` read it from a file and delete the file after a successful
+redemption.
+
+A code on the command line works too, but then it is visible in the process list of that machine
+while `join` runs, and it may be kept by whatever ran the command, such as shell history or an
+agent transcript. It is a bearer credential until it expires or is redeemed, though not the fleet
+secret. Prefer the prompt, a file, or `--fabric-inbox`. `join` never logs it.
 
 Each step records a checkpoint in `STATE/fleet/join.json`, so running `st fleet join` again
 continues from the last completed step:
@@ -351,7 +433,9 @@ continues from the last completed step:
    Checkpoint `synced`.
 
 Until its first exchange brings the membership claims, the new member knows only the sponsor. It
-checks the sponsor's responses against the key from the handshake, which `join.json` keeps.
+checks the sponsor's responses against the key from the handshake, which `join.json` keeps. It
+writes the anchor key from the handshake to `fleet.toml` as `anchor_key`, and it signs every
+envelope it already holds under its own name (see [Signed envelopes](#signed-envelopes)).
 
 The new member then dials every listening member it can route to. A member that has not yet
 received the admission claim refuses with `not-a-member`; the new member treats that as transient
@@ -362,20 +446,21 @@ for 10 minutes after its admission and does not record it as a failure.
 | Interrupted after | State | Recovery |
 |---|---|---|
 | Step 1 to 3 | Nothing on the sponsor | Run `join` again with the same code |
-| Step 5, before the answer arrives | Invite bound to this key; member admitted | Run `join` again with the same code; the same key redeems again |
+| Step 5, the answer lost | Invite bound to this key; member admitted | Run `join` again with the same code before it expires; the same key redeems again, also after a sponsor restart |
+| Step 5, the answer lost, then the code expired | Member admitted, never seen | `st fleet remove NAME` on a member, then a new invite |
 | Step 5, after `redeemed` | Secret stored | Run `join` again without a code |
 | Step 6 or 7 | Member, services may be down | Run `join` again; it starts the services and waits |
 
 If the machine loses its key before `redeemed` (for example, it is wiped), the invite is bound to
-a key that no longer exists. The admitted member never appears. `st fleet status` on any member
-shows it as `admitted, never seen`. Remove it with `st fleet remove` and issue a new invite.
+a key that no longer exists. It is the same as an expired, lost answer: remove the stranded member
+and issue a new invite.
 
 ### Reusing a name
 
-A machine that is wiped and joins again under its old name must not reuse writer sequence
-numbers the fleet already holds. The fleet must also be able to tell its new batches from
-anything the old incarnation wrote after it was removed, which another member may hold and the
-sponsor may never have seen.
+A machine that is wiped and joins again under its old name is a new incarnation with a new key.
+The fleet tells its envelopes from the old incarnation's by the key that signed them, not by
+their sequence numbers (see [Writer fence](#writer-fence)). The floor only keeps the new
+incarnation from reusing a sequence number that an admitted envelope already has.
 
 A name has **history** when the sponsor holds any envelope from that writer or any membership
 claim for that name. At redemption, the sponsor applies these rules:
@@ -384,8 +469,9 @@ claim for that name. At redemption, the sponsor applies these rules:
   was never removed): refuse. Remove it first.
 - The name has no history: admit with no floor. The new incarnation's window starts at 1.
 - The name has history, and the joiner's `writer_head` is empty: admit with
-  `writer_floor = H + 2^32`, where `H` is the highest of every sequence the sponsor holds for that
-  writer, admitted or fenced, and every `high_water` in the name's removal and leave claims.
+  `writer_floor = H`, where `H` is the highest of every sequence the sponsor holds for that
+  writer, admitted or not, and every `high_water` in the name's removal and leave claims. The new
+  incarnation's window starts at `H + 1`.
 - The name has history, and the joiner's `writer_head` is not empty: refuse. This store has
   already written as that name; reset it or choose another name.
 
@@ -393,12 +479,10 @@ The joiner's daemon stores the floor in `meta` before its first batch, and
 `next_replica_sequence` uses the larger of the floor and its local maximum. The joiner stops its
 daemon before it reads its head (step 4), so no batch is written between the check and the floor.
 
-The gap of 2^32 sequences separates the two incarnations. Everything the old incarnation wrote
-after its `high_water` falls in the gap and is fenced (see [Writer fence](#writer-fence)), unless
-it wrote more than four billion batches beyond `H`. A proof that each new envelope chains back to
-the new incarnation's first batch would remove even that bound, but envelopes arrive sparsely, so
-admission would have to hold each one until its predecessors arrived. Inventory ranges are built
-only from envelopes that exist, so the gap costs nothing in an exchange.
+Another member may hold envelopes the old incarnation wrote after its removal, with sequences
+above `H`. They are signed with the old key, or not signed at all if the old incarnation was a
+legacy writer. Either way they fall outside the old incarnation's window and are not signed by the
+new key, so no member admits them, even where their sequence numbers equal the new incarnation's.
 
 The same store rejoining after its removal is refused on purpose. Its writes after the removal
 were not accepted, and resetting it or choosing a new name keeps one rule for every rejoin.
@@ -412,8 +496,9 @@ seats first.
 `st fleet invite` on a machine that is not in a fleet founds one, and says so:
 
 1. Generate a random fleet ID (UUID v4), a 32-byte secret, and the member key.
-2. Write `STATE/fleet/`, bind the store to the fleet ID, and append `fleet.member-admitted` with
-   `via = founder` for this node, then its `fleet.member-endpoints`.
+2. Write `STATE/fleet/` with `anchor_key` set to this node's own key, bind the store to the fleet
+   ID, sign every envelope this store already holds under its own name, and append
+   `fleet.member-admitted` with `via = anchor` for this node, then its `fleet.member-endpoints`.
 3. Detect the transports. Tailscale is used if `tailscale ip` works. Fabric is used if `fabric id`
    works. Pick port 31313, or the next free port.
 4. Install or refresh the replication service if the daemon runs as a service. Otherwise print
@@ -433,7 +518,7 @@ Membership lives on the existing `host/NAME` subjects. Invites use a new subject
 
 | Kind | Subject | Written by | Main fields |
 |---|---|---|---|
-| `fleet.member-admitted` | `host/NAME` | The sponsor during a join; the member itself when founding or migrating | `fleet_id`, `member_key`, `via` (`invite`, `founder`, `migration`), `sponsor`, `invite`, `mode`, `writer_floor`, `admitted_by` |
+| `fleet.member-admitted` | `host/NAME` | The sponsor during a join or a migration; the anchor itself, once | `fleet_id`, `member_key`, `via` (`anchor`, `invite`, `migration`), `sponsor`, `invite`, `mode`, `writer_floor`, `admitted_by` |
 | `fleet.member-endpoints` | `host/NAME` | The member's own daemon when its endpoints or mode change | `member_key`, `mode`, `endpoints`, `build` |
 | `fleet.member-removed` | `host/NAME` | Any member, for a person, through `st fleet remove` | `member_key` (absent for a config peer that was never a member), `high_water`, `reason`, `removed_by` |
 | `fleet.member-left` | `host/NAME` | The member itself, through `st fleet leave` | `member_key`, `high_water` |
@@ -458,23 +543,38 @@ after it is upgraded, as [Fleet replication](st3/replication.md) already describ
 ### Reducer
 
 A new projection, `fleet_members`, folds these claims per node name. The fold must give the same
-answer in any receipt order, so it uses sets and writer sequences, never timestamps:
+answer in any receipt order, so it uses sets, keys, and writer sequences, never timestamps:
 
-- An incarnation is `(name, member_key)`. It exists once any `fleet.member-admitted` names it.
-- An incarnation is **ended** once any `fleet.member-removed` or `fleet.member-left` names its key.
-  Ending is permanent. A stale admission from a partitioned member cannot undo it, because it
-  names the same key. Joining again means a new key, which is a new incarnation.
-- `fleet.member-endpoints` counts only when the claim's origin is `name`. The latest one by that
+- An incarnation is `(name, member_key)`. It exists once an authorized `fleet.member-admitted`
+  names it.
+- An incarnation is **ended** once an authorized `fleet.member-removed` or `fleet.member-left`
+  names its key. Ending is permanent. A stale admission from a partitioned member cannot undo it,
+  because it names the same key. Joining again means a new key, which is a new incarnation.
+- `fleet.member-endpoints` counts only when the claim's writer is `name`. The latest one by that
   writer's sequence wins. Only a member can say where it listens.
-- `fleet.member-left` counts only when the claim's origin is `name`.
+- `fleet.member-left` counts only when the claim's writer is `name`.
 - A removal without `member_key` ends the name's legacy incarnation: the config peer that was
   never a member.
 - The **current member** for a name is its one incarnation that has not ended. Two such
   incarnations mean the name is **conflicted**; every member refuses both keys until a person
   removes one. This happens only if two machines are joined or migrated under one name.
 
-The data authority table gains `fleet_members` (projection of `fleet.*` claims) and
-`fleet_invite_tokens` (local short-lived authority).
+A membership claim is **authorized** when the envelope that carries it was admitted as signed by
+an incarnation whose window contains that envelope's sequence (see
+[Signed envelopes](#signed-envelopes)). The one exception is the anchor's own admission: a
+`fleet.member-admitted` with `via = anchor` is authorized only when its `member_key` equals this
+node's pinned `anchor_key` and the envelope is signed by that key. Every other anchor claim is
+ignored.
+
+Admission and the fold depend on each other: which envelopes are admitted depends on the known
+keys, and the known keys come from admitted claims. Each node computes both to a fixed point,
+starting from its pinned anchor. It repeats admission and the fold until neither changes, which
+takes at most one round per member. A node recomputes only when a new `fleet.*` claim or a new
+signature arrives, and the fleet has a handful of such claims, so this is cheap.
+
+The data authority table gains `fleet_members` (projection of `fleet.*` claims),
+`fleet_invite_tokens` (local short-lived authority), and `replica_envelope_signatures`
+(replicated authority; see below).
 
 ### Who may exchange
 
@@ -492,7 +592,7 @@ Old builds ignore these headers. After the HMAC check passes, the receiver decid
 | Current member | Valid for its current key | Accept |
 | Current member | Missing or invalid, `legacy_peers = true`, and the name is a local config peer | Accept, counted as a legacy exchange in status |
 | Current member | Missing or invalid, otherwise | Refuse, 401 `member-signature-required` |
-| Ended incarnation | The ended key, or no key for an ended legacy name | Refuse, 403 `member-removed` |
+| Ended incarnation | The ended key, or no key for an ended legacy name | Refuse, 403 `member-removed` (or `member-left`) |
 | Conflicted | Any | Refuse, 409 `member-conflicted` |
 | Not a member, listed in local `[[peers]]`, on a node with no `fleet.toml` or with `legacy_peers = true` | Not checked | Accept (today's behavior) |
 | Anything else, including a key this node has not seen admitted | Any | Refuse, 403 `not-a-member` |
@@ -508,33 +608,76 @@ store. A refusal that names an older key reaches a machine that joined again und
 from a member that has not yet received the new admission; the node treats it as transient, like
 `not-a-member`.
 
-### Writer fence
+### Signed envelopes
 
-A removed machine that still holds the secret cannot connect to a member that knows about the
-removal. But a member that has not received the removal yet, because it is partitioned, would
-still accept the removed machine and relay its new envelopes to the rest of the fleet. The writer
-fence stops that relay.
+Connection signatures prove who is on the other end of one exchange. They say nothing about who
+wrote the envelopes inside it, because every exchange relays every writer's envelopes. A member
+that has not yet heard of a removal would otherwise relay forged envelopes from a removed
+machine to members that have. So each keyed writer signs its own envelopes, and admission checks
+those signatures wherever the envelope came from.
+
+**Signing.** A member signs each envelope of its own writer:
+
+```text
+signature = Ed25519(member key, "st3-envelope-v1\n" || fleet_id || "\n" || writer || "\n" ||
+                    sequence || "\n" || envelope_hash)
+```
+
+The envelope hash already covers the writer, sequence, previous hash, accept time, and payload.
+The main daemon holds the member key and signs when it appends a batch. When a node gets its key
+(founding, joining, migrating), it also signs every envelope it already holds under its own name,
+so its whole history is signed. At every start it signs any envelope of its own writer that has no
+signature, which covers batches written while it ran an older build. Ed25519 signing and checking take tens of microseconds, and one
+exchange carries at most 512 envelopes.
+
+**Storage.** A new table, `replica_envelope_signatures(writer, sequence, envelope_hash,
+member_key, signature)`, holds each signature beside its envelope. It is replicated authority:
+receipt stores a signature, admission checks it, and nothing rewrites it.
+
+**On the wire.** `ReplicaEnvelope` gains two optional fields, `member_key` and `signature`.
+`ReplicationExchange` gains `signature_requests` (identities of envelopes the sender holds but
+cannot admit for want of a signature) and `signatures` (signatures for envelopes the other side
+already holds). Old builds ignore unknown fields, and when an old build relays an envelope, the
+signature is lost. The receiver then holds the envelope unsigned, and asks for the signature in
+its next exchange with a new build. Every new build answers with the signatures it has, and the
+writer itself has all of its own.
+
+**Admission.** For each envelope from writer `W` at sequence `s`:
+
+1. If this node knows no keyed incarnation of `W`, admit it as today (legacy), unless a removal
+   without a key ended `W`'s legacy window below `s`; then it is fenced.
+2. Otherwise, find the incarnation of `W` whose window contains `s`. If it is `W`'s legacy window
+   (from before `W` had any key), admit the envelope as in rule 1. If it is a keyed incarnation,
+   admit the envelope only when it carries a valid signature by that incarnation's key. Without a
+   signature it waits in the new admission state `unsigned`. With a wrong signature it is
+   `invalid`.
+3. If no window contains `s`, the envelope is `fenced`.
+
+`unsigned` and `fenced` records are retried whenever a signature arrives or membership changes,
+as `unknown` records already are. Local writes are signed as they are written and never wait.
+
+A decision to admit is not revisited. An envelope admitted under rule 1 before this node learned
+that `W` is keyed stays admitted. So does an envelope from an incarnation this node still thought
+current. `st doctor` reports both kinds (see [What removal does not guarantee](#what-removal-does-not-guarantee)).
+
+### Writer fence
 
 Each incarnation of a name owns a window of that writer's sequences:
 
-- An incarnation admitted with `writer_floor = F` starts after `F`. Otherwise it starts at 1.
+- An incarnation admitted with `writer_floor = F` starts at `F + 1`. Otherwise it starts at 1.
 - An ended incarnation stops at the `high_water` in its removal or leave claim: the highest
-  sequence of that writer that the author of the claim held. A current incarnation has no end.
+  sequence of that writer that the claim's author held. A current incarnation has no end.
 - A config peer that was never a member has one legacy window from 1 with no end, until a removal
   without a key sets its end.
 
-Admission refuses an envelope whose writer has at least one ended incarnation and whose sequence
-is in no window. The envelope stays in `replica_envelopes`, and its record gets the new state
-`fenced`. Admission reconsiders fenced records whenever membership changes, as it already
-reconsiders `unknown` records. Fence evaluation uses membership from unfenced claims only, so a
-writer's own claims cannot lift its fence. Local writes are never fenced.
+Windows of one name never overlap, because a new incarnation's floor is at or above every earlier
+incarnation's end (see [Reusing a name](#reusing-a-name)). And because a keyed window admits only
+envelopes signed by its own key, an old incarnation's late envelopes are refused even where their
+sequence numbers fall inside the new incarnation's window.
 
-Removal therefore means: the fleet stops accepting new authority from that incarnation. Writes it
-made before the removal but had not synced are not accepted either. `st fleet remove` says so.
-
-A wiped machine that joins again under the old name starts its window 2^32 sequences above
-everything the sponsor knows for that writer (see [Reusing a name](#reusing-a-name)), so the old
-incarnation's late envelopes fall in the gap and stay fenced.
+Removal therefore means: from the moment a member has the removal, it admits nothing more from
+that incarnation, from any relay. Writes the machine made before the removal but had not synced
+are not accepted either. `st fleet remove` says so.
 
 ### Peers derived from membership
 
@@ -614,7 +757,8 @@ is meant to stay on.
 st fleet remove NAME --reason TEXT [--stop-seats] [--force] [--as PERSON]
 ```
 
-Run on any member, for another member or a config peer.
+Run on any member that has a member key, for another member or a config peer. The removal claim
+counts only because a current member signed it, so a node that has not migrated cannot remove.
 
 1. Refuse to remove this node. Use `st fleet leave`.
 2. List the seats whose desired state is running on host `NAME`, and the active mission runs whose
@@ -637,18 +781,33 @@ members that still have `legacy_peers = true`.
 st fleet leave [--offline] [--stop-seats] [--force]
 ```
 
-Run on the member that is leaving.
+Run on the member that is leaving. The leave claim must be the last thing this member writes, and
+it must reach the fleet after everything else, because a member that admits it refuses this
+incarnation from then on.
 
-1. Refuse while local seats run, unless `--stop-seats` or `--force`, for the same reason as remove.
-2. Append `fleet.member-left` with `high_water` set to the sequence of the batch that holds the
-   claim itself.
-3. Exchange until a listening member reports that it holds this writer through `high_water`:
-   the range digests covering those sequences match.
-4. Stop the worker, remove the Fabric exposure, and delete `STATE/fleet/`.
-5. Restart the daemon local-only. The store keeps its history and stays bound to the fleet ID.
+1. **Quiesce.** Refuse while local seats run, unless `--stop-seats` or `--force`, for the same
+   reason as remove. Then put the daemon in `leaving` mode: it refuses every mutating API request
+   with `fleet-leaving`, and it stops its own background writes (transport observations, daemon
+   heartbeats, lease renewals). From here the local writer's head does not move.
+2. **Drain.** Exchange with a listening member, as many rounds as it takes, until that member
+   holds every envelope of this writer. The condition is exact: the member's inventory, returned
+   in the last exchange, has range digests for this writer equal to ours, and every one of our
+   envelopes is admitted there (its response lists none of them in `signature_requests`).
+3. **Leave.** Append `fleet.member-left` with `high_water` set to the sequence of the batch that
+   holds it. This is the writer's last envelope.
+4. **Confirm.** Exchange that envelope. It is confirmed when the member's inventory lists it with
+   the same hash, or when the member refuses the next exchange with a signed `member-left` that
+   names this key. Either one is proof that the member admitted it. If the exchange is cut off,
+   repeat step 4; the drain in step 2 means there is nothing else left to lose.
+5. **Clean up.** Stop the worker, remove the Fabric exposure, and delete `STATE/fleet/`.
+6. **Restart** the daemon local-only. The store keeps its history and stays bound to the fleet ID.
    Joining the same fleet later works. Joining another fleet needs `st service reset` first.
 
-`--offline` skips steps 2 and 3 when no listening member is reachable, and prints the
+`leave` keeps a checkpoint in `STATE/fleet/leave.json`, so running it again after an interruption
+resumes at the same step. If `leaving` mode is interrupted before step 3, `st fleet leave --cancel`
+returns the daemon to normal.
+
+`--offline` skips steps 2 to 4 when no listening member is reachable, and prints the
 `st fleet remove` command to run on another member.
 
 ### `st uninstall`
@@ -778,24 +937,41 @@ new machines.
 ### Migrating a config-peer fleet
 
 An existing fleet moves to membership without joining again. It keeps its fleet ID, secret, store,
-and history. On each machine, after installing the new build:
+and history. Every node keeps replicating throughout. After installing the new build everywhere
+and restarting the services:
 
 ```sh
-st service restart
-st fleet migrate                    # on a machine that stays on
-st fleet migrate --dial-out         # on a laptop
+# On one machine that stays on. It becomes the anchor.
+st fleet migrate --anchor
+
+# For each other machine, on any migrated member:
+st fleet invite server --migrate --send-fabric
+# and on that machine:
+st fleet migrate --fabric-inbox          # add --dial-out on a laptop
 ```
 
-`st fleet migrate`:
+A migration code works like a join code, and it can be pasted or read from a file the same ways.
+The handshake is the same, except that the sealed answer carries no secret, because the node
+already has it.
+
+`st fleet migrate`, on every node:
 
 1. Refuses if the store is not bound to the configured fleet ID, or the name has a removal.
 2. Creates the member key.
 3. Writes `fleet.toml` from the legacy values, with `legacy_peers = true` and `port` taken from
-   `peer_listen`. The secret file stays where it is; `secret_file` points at it. `--fabric-protocol NAME` records an existing Fabric
-   exposure name, so the worker keeps using it.
-4. Appends `fleet.member-admitted` with `via = migration` for this node, and its endpoints. No floor
-   is set: the incarnation continues its own writer chain.
-5. Rewrites the service units without peer arguments and restarts them.
+   `peer_listen`. The secret file stays where it is; `secret_file` points at it.
+   `--fabric-protocol NAME` records an existing Fabric exposure name, so the worker keeps using it.
+4. Pins the anchor key. With `--anchor`, that is its own key. Otherwise it comes from the
+   handshake.
+5. Signs every envelope it holds under its own name.
+6. With `--anchor`, appends `fleet.member-admitted` with `via = anchor` for itself. Otherwise the
+   sponsor has already appended `fleet.member-admitted` with `via = migration` during the
+   handshake. Either way there is no floor: the incarnation's window starts at 1 and covers the
+   node's whole history, which it has just signed.
+7. Publishes its endpoints, rewrites the service units without peer arguments, and restarts them.
+
+A node must be migrated by a code from an existing member, except the anchor. Otherwise anyone
+with the secret could mint a member key for any name.
 
 Now every migrated machine exchanges with member signatures, and legacy exchanges still work, so
 old and new builds keep replicating. When `st fleet status` shows that every config peer is
@@ -807,21 +983,26 @@ st fleet migrate --finish
 
 It checks that condition, sets `legacy_peers = false`, and prints the `[[peers]]`,
 `peer_listen`, `fleet_id`, and `shared_secret_file` lines to delete from `config.toml`. After
-`--finish` on every member, removal is enforced by member keys alone.
+`--finish` on every member, no member accepts a legacy exchange.
 
 A hand-written Fabric dial helper and its launchd agent or systemd unit are no longer needed once
 `st fleet status` shows the Fabric route in use for that member. Remove them then.
 
-A config peer that is a laptop listed at an unused port becomes a dial-out member with
-`st fleet migrate --dial-out` on the laptop. Every other member then stops dialing it, and the
-`[[peers]]` entry is ignored until it is deleted.
+A config peer that is a laptop listed at an unused port becomes a dial-out member when it migrates
+with `--dial-out`. Every other member then stops dialing it, and the `[[peers]]` entry is ignored
+until it is deleted.
+
+A config peer that will be wiped does not need to migrate. Remove it with `st fleet remove NAME`
+on a migrated member, wipe it, and join it again with a normal invite.
 
 ### Rollback
 
-Until `--finish`, a migrated machine can go back to the old build: the old build ignores
-`fleet.toml`, uses the legacy fields that are still in `config.toml`, and other members accept its
-HMAC-only exchanges because `legacy_peers` is still true. After `--finish`, rolling one machine
-back requires `legacy_peers = true` on the others again (`st fleet migrate --unfinish`).
+Until `--finish`, a migrated machine can go back to the old build. The old build ignores
+`fleet.toml` and uses the legacy fields still in `config.toml`, and the other members accept its
+HMAC-only exchanges because `legacy_peers` is still true. Its new envelopes are unsigned, so
+members that know its key hold them as `unsigned` until it runs a new build again and signs them.
+Nothing is lost. After `--finish`, rolling one machine back requires `legacy_peers = true` on the
+others again (`st fleet migrate --unfinish`).
 
 ## Status and diagnostics
 
@@ -853,10 +1034,10 @@ New `st doctor` checks:
 
 - **A leaked code.** Whoever redeems it first, before it expires, becomes a member. The person
   sees the unexpected `fleet.member-admitted` in `st fleet status` and `st fleet invites`, and the
-  rightful joiner gets `invite-invalid`. `st fleet remove` ends it. To keep codes off screens and
-  out of transcripts, pass them by command substitution
-  (`fabric exec laptop -- st fleet join "$(st fleet invite laptop --code-only)"`) or write them to
-  a `0600` file with `--code-file`.
+  rightful joiner gets `invite-invalid` and a hint to check `st fleet invites`, which shows the
+  redeeming name, key fingerprint, and time. `st fleet remove` ends the stray member, and
+  `st fleet invites revoke` kills a code that leaked before use. To keep codes off screens,
+  command lines, and transcripts, use `--send-fabric` with `--fabric-inbox`, or `--code-file`.
 - **A replayed code or request.** A code is bound to one member key at first use. A replayed
   request gets an answer only the original joiner can open.
 - **A fake sponsor.** It cannot sign with the fingerprinted key, so the joiner refuses its answer.
@@ -869,9 +1050,11 @@ New `st doctor` checks:
 - **Clock skew.** Only the sponsor's clock decides invite expiry. Membership, the writer fence, and
   authentication use keys and writer sequences, never time. Skew affects only displayed times.
 - **A removed member comes back.** It gets `member-removed` from every member that has the
-  removal. A partitioned member may accept it and relay its envelopes, but the writer fence makes
-  every other member refuse them, and the partitioned member refuses them too once it has the
-  removal. Joining again needs a new invite and gets a new incarnation.
+  removal. A partitioned member may accept it and relay its new envelopes, but they are signed by
+  an ended incarnation above its `high_water`, so every member that has the removal refuses them.
+  It cannot write as anyone else, because it lacks their keys. The partitioned member refuses it
+  too once it has the removal, and `st doctor` there reports what it admitted in between. Joining
+  again needs a new invite and gets a new incarnation.
 - **Two machines under one name.** The name becomes conflicted, and every member refuses both keys
   until a person removes one.
 - **The sponsor is removed while its invite is open.** `st fleet remove` revokes the invite. The
@@ -906,6 +1089,7 @@ The worker gains hidden settings for tests: `--anti-entropy-interval-ms` and
 - `an_unknown_code_version_is_refused`
 - `a_join_code_never_contains_the_fleet_secret` (property test: the secret's raw, hex, base32,
   and base64 forms never occur in any code)
+- `send_fabric_leaves_no_local_code_file_and_fabric_inbox_deletes_the_received_one` (shim)
 
 `crates/st3/src/fleet/handshake.rs`
 
@@ -914,16 +1098,39 @@ The worker gains hidden settings for tests: `--anti-entropy-interval-ms` and
 - `a_replayed_request_gets_an_answer_the_replayer_cannot_open`
 - `the_joiner_refuses_a_sponsor_key_that_does_not_match_the_fingerprint`
 - `a_second_member_key_cannot_redeem_a_bound_invite`
-- `the_same_member_key_can_redeem_again_until_expiry`
+- `the_same_member_key_can_redeem_again_until_expiry_without_new_claims`
+- `a_bound_invite_survives_a_sponsor_restart`
+- `an_expired_bound_invite_erases_its_token_and_refuses_the_bound_key`
+- `a_bound_key_cannot_redeem_under_another_name`
+- `the_sealed_answer_carries_the_anchor_key`
 - `the_sponsor_clock_decides_expiry`
 - `five_failed_proofs_burn_the_invite`
 - `a_request_signed_with_another_key_is_refused`
+
+`crates/st3/src/store.rs` (signed envelopes)
+
+- `local_batches_are_signed_with_the_member_key`
+- `keying_signs_every_envelope_already_held_under_the_own_writer`
+- `startup_signs_own_envelopes_written_without_a_signature`
+- `a_keyed_writers_envelope_needs_the_signature_of_the_incarnation_whose_window_holds_it`
+- `an_unsigned_envelope_of_a_keyed_writer_waits_as_unsigned_and_is_admitted_when_its_signature_arrives`
+- `a_wrong_signature_is_invalid`
+- `an_envelope_signed_by_another_members_key_is_invalid`
+- `an_envelope_outside_every_window_is_fenced`
+- `an_old_incarnations_envelope_at_a_new_incarnation_sequence_is_refused`
+- `envelopes_at_the_floor_and_just_above_it_are_placed_in_the_right_window`
+- `a_legacy_writer_is_admitted_unsigned_until_a_keyless_removal_ends_its_window`
+- `signature_requests_are_answered_with_held_signatures`
+- `admitted_envelopes_are_not_revisited_and_doctor_reports_them`
 
 `crates/st3/src/store.rs` (membership and fence)
 
 - `membership_folds_admission_endpoints_removal_and_leave_per_incarnation`
 - `the_fold_is_the_same_in_every_receipt_order` (property test over permutations)
 - `a_stale_admission_cannot_undo_a_removal_of_the_same_key`
+- `membership_claims_count_only_when_signed_by_a_current_incarnation_in_its_window`
+- `only_the_pinned_anchor_key_can_self_admit`
+- `admission_and_membership_reach_the_same_fixed_point_in_every_order` (property test)
 - `joining_again_with_a_new_key_is_a_new_incarnation`
 - `endpoints_and_leave_count_only_from_the_members_own_writer`
 - `two_current_keys_for_one_name_are_conflicted`
@@ -932,7 +1139,7 @@ The worker gains hidden settings for tests: `--anti-entropy-interval-ms` and
 - `fenced_records_are_reconsidered_when_membership_changes`
 - `the_writer_floor_puts_a_rejoined_writer_above_its_old_chain`
 - `a_used_name_can_be_joined_again_only_by_an_empty_store_after_removal`
-- `the_floor_counts_fenced_envelopes_and_every_high_water`
+- `the_floor_counts_every_held_envelope_and_every_high_water`
 - `fleet_claims_are_refused_on_the_public_claim_api`
 - `an_old_build_keeps_fleet_claims_as_unknown_records` (the unknown-kind admission path)
 
@@ -970,6 +1177,10 @@ The worker gains hidden settings for tests: `--anti-entropy-interval-ms` and
 - `fleet_commands_refuse_inside_a_seat_without_an_explicit_person`
 - `fleet_join_reads_a_code_from_standard_input`
 - `uninstall_requires_erase_local_graph_for_a_local_only_store`
+- `leaving_mode_refuses_mutating_requests_and_stops_background_writes`
+- `leave_appends_the_leave_claim_only_after_the_drain_condition_holds`
+- `leave_resumes_from_its_checkpoint_and_cancel_restores_normal_mode`
+- `a_signed_member_left_refusal_confirms_the_leave`
 
 `crates/st3/src/api/client_v0.rs`
 
@@ -979,59 +1190,82 @@ The worker gains hidden settings for tests: `--anti-entropy-interval-ms` and
 ### Integration tests: `crates/st3/tests/fleet.rs`
 
 Each test starts real `st3 up` and `st3 replication-worker` processes from `CARGO_BIN_EXE_st3`,
-in the foreground, and drives them with the `st` CLI. For each test, the line after "fails if"
-is the assertion that would catch a broken feature.
+in the foreground, and drives them with the `st` CLI. Tests that need a forged or replayed message
+use a small harness client that signs with keys and the secret taken from the isolated nodes'
+files. For each test, the "fails if" clause is the assertion that would catch a broken feature.
 
 1. `invite_and_join_sync_full_history`: A holds 2,000 claims and a blob-backed document. B joins
    with a code from A over loopback; then C joins with a code from B. Fails if the three
-   authority digests differ, a write on any node is missing on another, or any node has a
-   `[[peers]]` entry or `--peer` argument.
+   authority digests differ, a write on any node is missing on another, any node has a
+   `[[peers]]` entry or `--peer` argument, or any admitted envelope of A, B, or C lacks a valid
+   signature on any node.
 2. `a_dial_out_member_is_caught_up_and_never_reported_down`: A listens, L joins with `--dial-out`.
    Stop L, write 600 claims on A (more than one exchange carries), wait three anti-entropy
    periods, start L. Fails if L lacks any of them, if any node has a `transport.observed` claim
    with status `down` for `host/L`, or if A's status shows an outbound attempt to L.
 3. `a_removed_member_is_refused`: remove B on A. Fails if B's next exchange is accepted, if B keeps
    dialing, or if a claim B writes after the removal reaches A.
-4. `a_partitioned_member_cannot_relay_a_removed_writer`: C cannot reach A. Remove B on A. B
-   exchanges with C and writes. Reconnect C. Fails if B's new envelopes are admitted on A, if
-   they are not kept on A as `fenced`, or if C still admits new ones after it has the removal.
-5. `a_removed_member_cannot_pose_as_another_member`: B, removed, signs an HMAC-valid exchange as
-   C with its own key, and with no member key. Fails if A accepts either.
-6. `an_interrupted_join_resumes_with_the_same_code`: the joiner exits after the sponsor binds
-   the invite and before it stores the secret (a test-only fault point). Fails if running `join`
-   again with the same code does not complete, or if a different machine can redeem that code.
+4. `a_forged_envelope_relayed_by_an_uninformed_member_is_refused`: A, B, C, and R are members; C is
+   cut off from A. Remove R on A. R then gives C three things: an envelope under writer A signed
+   with R's key, the same envelope unsigned, and an envelope under its own name above its
+   `high_water`, signed with its own key. R also gives C a `fleet.member-admitted` claim that
+   admits a fresh key under the name `ghost`. Reconnect C to A and B. Fails if A or B admits any
+   of them, if `ghost` is a member anywhere, or if C admits the first two. C admits the third,
+   since it did not know of the removal; fails if `st doctor` on C does not report it as
+   `admitted beyond high water`, or if C admits anything more from R after it has the removal.
+5. `a_removed_member_cannot_pose_as_another_member`: R, removed, sends A an HMAC-valid exchange
+   signed as C with R's key, and one with no member key. Fails if A accepts either.
+6. `an_interrupted_join_resumes_with_the_same_code`: a test-only fault point drops the sponsor's
+   answer after it binds the invite. Fails unless: an immediate retry completes; a retry after
+   the sponsor restarts completes; a second retry appends no claims; a different key with the
+   same code is refused; and after expiry the bound key is refused and `st fleet status` shows
+   the member as `admitted, never seen`.
 7. `expired_revoked_and_used_codes_are_refused`: a 10-second invite after it expires, a revoked
    invite, and a used invite. Fails if any is redeemed, or if the refusals differ.
-8. `a_wiped_member_joins_again_under_its_old_name`: B joins and writes; C is cut off from A. A
-   removes B. B keeps writing and exchanges only with C. B's state is deleted, and it joins again
-   as B through A; then C reconnects. Fails if any two admitted batches share `(origin B,
-   sequence)`, if B's history from before the removal is missing, or if anything the old B wrote
-   after the removal is admitted on any node. A second store that has already written as B must
-   be refused.
-9. `leave_drains_local_writes_first`: B writes while A is stopped, starts A, and runs
-   `st fleet leave`. Fails if leave finishes before A holds B's writes and the leave claim, or if
-   B's secret or key remains.
-10. `uninstall_leaves_nothing_behind`: snapshot the isolated home before B is installed; join,
+8. `a_leaked_code_is_visible_and_can_be_revoked`: a stranger redeems a code first. Fails if
+   `st fleet invites` on the sponsor and on another member does not show the stranger's name, key
+   fingerprint, and time within one exchange, if the rightful joiner's error does not point at
+   `st fleet invites`, or if the stranger still exchanges after `st fleet remove`. A second
+   leaked code is revoked before use; fails if it can be redeemed.
+9. `a_wiped_member_joins_again_under_its_old_name`: B joins and writes; C is cut off from A. A
+   removes B. B keeps writing and exchanges only with C, so C holds envelopes of the old B above
+   A's `H`. B's state is deleted, and it joins again as B through A, writing at `H + 1` and above;
+   then C reconnects. Fails if any node admits an old-B envelope above its `high_water`, if any two
+   admitted batches share `(origin B, sequence)`, if a new-B envelope at `H + 1` is refused, or if
+   B's history from before the removal is missing. A second store that has already written as B
+   must be refused.
+10. `leave_drains_everything_before_it_leaves`: B writes 1,500 claims while A is stopped, so the
+    drain needs at least three exchanges and several sparse ranges; then A starts and B runs
+    `st fleet leave`. The first confirming exchange is cut off by a fault point, and A restarts
+    once during the drain. Fails if the leave claim reaches A before every other B envelope, if
+    any B envelope is missing on A afterwards, if leave does not complete, or if B's secret or key
+    remains.
+11. `uninstall_leaves_nothing_behind`: snapshot the isolated home before B is installed; join,
     write, `st uninstall --yes --keep-binaries`. Fails if the tree differs from the snapshot, if
     the Fabric shim still has an exposure, or if A does not show B as left.
-11. `the_fabric_transport_works_through_the_worker_alone`: nodes advertise only Fabric endpoints
+12. `the_fabric_transport_works_through_the_worker_alone`: nodes advertise only Fabric endpoints
     through the shim, which records `expose` calls and prints harness-owned Unix sockets that proxy
-    to each node's loopback port. Fails if sync does not converge, or if any process other than
-    the worker invoked the shim.
-12. `the_secret_never_leaves_its_file`: run a join and a dial-out catch-up as in tests 1 and 2,
-    then search every file under every isolated home except the secret files, every process's
-    arguments, every claim, and every document for the secret's raw, hex, base32, and base64
-    forms. Fails on any match.
-13. `a_config_peer_fleet_migrates_to_membership`: A and B start with legacy `[[peers]]` and baked
-    arguments, as the running fleet does, and exchange data. Migrate both and finish. Fails if the
-    store's fleet binding or history changes, if replication pauses during the migration, or if
-    exchanges after `--finish` lack member signatures. A third node L, listed on A at a port
-    nothing serves, migrates with `--dial-out`; fails if A dials L afterwards or records it down.
-14. `an_old_build_config_peer_replicates_with_new_members` (ignored unless `ST3_COMPAT_BIN` is set):
-    O runs the v0.3.0 release binary and lists N1 as a config peer. N1 is a new-build member that
-    lists O as a config peer. N2 joins N1 through an invite, so its writes reach O only through
-    N1. Fails if a write on any node is missing on another, or if O holds any `invalid` record
-    (its `fleet.*` records must be `unknown`).
+    to each node's loopback port. The code travels with `--send-fabric` and `--fabric-inbox`.
+    Fails if sync does not converge, if any process other than the worker and `st fleet` invoked
+    the shim, or if the code appears in any recorded argument list.
+13. `the_secret_never_leaves_its_file`: run a join and a dial-out catch-up as in tests 1 and 2,
+    recording every process's arguments throughout. Then search those arguments, every file under
+    every isolated home except the secret files, every claim, and every document for the secret's
+    raw, hex, base32, and base64 forms. Fails on any match.
+14. `a_config_peer_fleet_migrates_to_membership`: A and B start with legacy `[[peers]]` and baked
+    arguments, as the running fleet does, and exchange data. A migrates with `--anchor`; B
+    migrates with a code from A; both finish. Fails if the store's fleet binding or history
+    changes, if replication pauses during the migration, if any envelope of A or B lacks a valid
+    signature afterwards, or if exchanges after `--finish` lack member signatures. A third node L,
+    listed on A at a port nothing serves, migrates with `--dial-out`; fails if A dials L afterwards
+    or records it down. A fourth node that self-admits without a code must not become a member.
+15. `an_old_build_config_peer_replicates_with_new_members` (ignored unless `ST3_COMPAT_BIN` is set):
+    O runs the baseline release binary and lists N1 and N3 as config peers. N1 and N3 are
+    new-build members that list O. N2 joins N1 through an invite. N3 is cut off from N1, so N1's
+    and N2's writes reach N3 only through O, which drops their signatures. Fails if a write on any
+    node is missing on another, if N3 does not end up admitting N1's and N2's envelopes through
+    signature requests, or if O holds any `invalid` record (its `fleet.*` records must be
+    `unknown`).
 
 The docs step adds `readme_multi_machine_section_runs` to this file. It extracts the commands from
 the README section on running st on more than one machine and runs them against isolated nodes.
@@ -1039,23 +1273,32 @@ the README section on running st on more than one machine and runs them against 
 ### CI
 
 - **Nix** (existing `check-x86_64-linux (st3)` and `check-aarch64-darwin`): runs every unit test
-  and every `fleet.rs` test except 14, on Linux and macOS, on every pull request.
+  and every `fleet.rs` test except 15, on Linux and macOS, on every pull request.
 - **`fleet-compat`** (new workflow `.github/workflows/fleet.yml`, on `ubuntu-22.04` and
-  `macos-15`, for pull requests that touch fleet code): downloads the v0.3.0 bundle for the runner,
-  verifies its checksum, sets `ST3_COMPAT_BIN`, and runs test 14 with `--ignored --exact`. It fails
-  if the variable is empty or the output does not report exactly one test passed.
-- **`fleet-e2e`** (new job in the tag release workflow, also run on pull requests that touch fleet
-  code, on `ubuntu-22.04` x86_64 and `macos-15` arm64): installs from the bundle the same run just
+  `macos-15`, on every pull request with no path filter): downloads the baseline bundle for the
+  runner, verifies it against the pinned checksum, sets `ST3_COMPAT_BIN`, and runs test 15 with
+  `--ignored --exact`. It fails if the download or checksum fails, if the variable is empty, or if
+  the output does not report exactly one test passed. It never skips.
+- **`fleet-e2e`** (new job in the tag release workflow, also run on every pull request with no path
+  filter, on `ubuntu-22.04` x86_64 and `macos-15` arm64): installs from the bundle the same run just
   built, never from cargo, and runs `scripts/fleet-e2e --bin-dir DIR`. The script runs node A as a
   user service (launchd on macOS; systemd with lingering enabled on Linux) and node B in the
   foreground, both isolated. It invites, joins, writes on each, waits until both writes are on
   both, removes B, uninstalls both, and checks that no unit, plist, state, config, or socket
   remains. If the runner cannot provide a user service manager, the job fails; it never skips.
-  Publication `needs` this job.
+  The publish job `needs` both platform legs of this job, so no release is published unless the
+  installed-bundle join passed on macOS and on Linux.
 
-"Fleet code" is `crates/st3/src/{peer,config,service}.rs`, `crates/st3/src/fleet/**`,
-`crates/st3/tests/fleet.rs`, `crates/st3-schema/**`, `scripts/fleet-*`, and the workflow files
-themselves.
+Neither job has a path filter, so no change in this series can skip them. A unit test in
+`crates/st3/tests/fleet.rs`, `fleet_workflows_have_no_path_filter`, parses both workflow files
+and fails if a `paths` or `paths-ignore` key appears on the jobs' pull request triggers, or if the
+publish job stops needing `fleet-e2e`.
+
+**The compatibility baseline.** The old build is the `v0.3.0` release bundle, the first release
+the tag workflow publishes. `.github/fleet-compat-baseline.json` pins its tag, source commit, and
+the SHA-256 of each platform's archive. The pull request that adds `fleet-compat` (the last one in
+this series) cannot merge until that release exists; if it does not exist yet, that pull request
+waits for it. Nothing falls back to building from source or to skipping.
 
 ### Live test: `scripts/fleet-live-test`
 
@@ -1091,7 +1334,8 @@ Phases:
    attempt to B.
 3. **Remove and uninstall.** Remove B on A; B's next exchange must be refused and B must stop
    dialing. `st uninstall --yes --keep-binaries` on B; nothing of B's may remain.
-4. **Fabric.** A new B joins with `--via fabric`, and phases 1 to 3 repeat over Fabric.
+4. **Fabric.** A new B joins with `--via fabric`, its code delivered with `--send-fabric` and
+   `--fabric-inbox`, and phases 1 to 3 repeat over Fabric.
 5. **Teardown.** Stop every process, run `st uninstall` on A, restore the Fabric files, delete both
    temporary roots, compare the recorded hashes, and check that the real st3 services still run.
    Any difference fails.
@@ -1101,8 +1345,9 @@ The script traps every exit to tear down and exits non-zero on any failure.
 ### Gates per pull request
 
 Merge `origin/main` in before testing and again before merging. A pull request merges when every
-check passes: the Nix checks, `fleet-compat` and `fleet-e2e` when fleet code changed, and the
-existing checks. The live test runs before v0.3.1 is announced, not per pull request.
+check passes: the Nix checks, and `fleet-compat` and `fleet-e2e` from the pull requests that add
+them onward, on every pull request. The live test runs before v0.3.1 is announced, not per pull
+request.
 
 ## README section
 
@@ -1112,8 +1357,8 @@ names:
 1. Install from a release on each machine.
 2. Join over Tailscale: `st fleet invite NAME` on a machine that stays on, `st fleet join` on the
    new one, and `st fleet status` on both. Include the tailnet ACL note.
-3. Join over Fabric: the one-time Fabric trust and the per-fleet grant, then the same two commands,
-   with the `fabric exec ... "$(...)"` form.
+3. Join over Fabric: the one-time Fabric trust and the per-fleet grant, then
+   `st fleet invite NAME --send-fabric` and `fabric exec NAME -- st fleet join --fabric-inbox`.
 4. A laptop that is often offline: `--dial-out`, what `dial-out` means in `st machines`, and
    `st fleet mode`.
 5. Removing a machine: `st fleet remove` on another member, then `st uninstall` on the machine.
@@ -1123,34 +1368,43 @@ names:
 
 Small pull requests, in order, each from a branch off `origin/main`:
 
-1. **Membership in the graph.** Schema kinds and the `fleet-invite` family, the `fleet_members`
-   projection, the writer fence and `fenced` state, the data authority rows, regenerated schema
-   docs and clients. Nothing writes the claims yet.
-2. **Member keys on the wire.** Node key files, the member headers on requests and responses, and
-   the acceptance table with legacy acceptance.
-3. **Peers from membership.** `fleet.toml`, config validation, the membership endpoint, the dial
+1. **This design**, revised for the design review.
+2. **Membership and admission.** Schema kinds and the `fleet-invite` family, the `fleet_members`
+   projection with anchor authorization, `replica_envelope_signatures`, and the admission rules:
+   windows, signature checks, and the `unsigned` and `fenced` states. The data authority rows,
+   regenerated schema docs and clients. Nothing writes keys or claims yet, so every node behaves as
+   before.
+3. **Member keys.** Key files, signing local batches and a node's own history, connection
+   signatures, the acceptance table with legacy acceptance, and signature sync in the exchange.
+   This pull request also adds the `fleet-compat` workflow, with test 15 in the form the code
+   supports so far, so every later pull request runs it. It waits for the `v0.3.0` baseline.
+4. **Peers from membership.** `fleet.toml`, config validation, the membership endpoint, the dial
    and accept sets, dial-out mode and its observation rules, units without peer arguments, and
    the status, doctor, and machines views.
-4. **Transports.** The tailnet listener and discovery, Fabric expose and dial through the CLI,
+5. **Transports.** The tailnet listener and discovery, Fabric expose and dial through the CLI,
    advertised loopback endpoints, and route order.
-5. **Invite and join.** The code, the handshake, founding, `st fleet invite`, `invites`, and `join`,
-   the integration harness, and `fleet.rs` tests 1, 2, 6, 7, 11, and 12.
-6. **Remove, leave, and uninstall.** Those commands, the installer manifest, and tests 3, 4, 5,
-   8, 9, and 10.
-7. **Migration.** `st fleet migrate`, `--finish`, `--unfinish`, test 13, test 14, and the
-   `fleet-compat` workflow.
+6. **Invite and join.** The code, the handshake, founding and the anchor, `st fleet invite`,
+   `invites`, and `join`, code delivery through the Fabric inbox, the integration harness,
+   `fleet.rs` tests 1, 2, 6, 7, 8, 12, and 13, and `scripts/fleet-e2e` with the `fleet-e2e` job
+   (this needs the tag workflow from pull request 585 on `main`).
+7. **Remove, leave, and uninstall.** Those commands, leaving mode, the installer manifest, and
+   tests 3, 4, 5, 9, 10, and 11.
+8. **Migration.** `st fleet migrate` with `--anchor`, `--migrate` codes, `--finish`, `--unfinish`,
+   test 14, and test 15 in full.
 
-The docs, release-e2e, and live steps follow with the README section, `fleet-e2e`, and
+The docs, release-e2e, and live steps follow with the README section, the `v0.3.1` tag, and
 `scripts/fleet-live-test`.
 
 ## Not in this design
 
-- **Rotating the fleet secret.** Member keys already make removal enforceable, so the secret is a
-  second factor. Rotation can later deliver a new secret sealed to each member key.
+- **Rotating the fleet secret.** Once every writer is keyed and every member has finished
+  migration, the secret no longer keeps anyone out on its own. Rotation can later deliver a new
+  secret sealed to each member key.
+- **Removing envelopes that a member admitted during a partition interval.** `st doctor` reports
+  them; excluding admitted claims from a graph after the fact is a separate design.
 - **Confirming a join on the sponsor** with a short code shown on both screens. Expiry, single use,
-  pinned names, and delivery by command substitution cover the cases this design targets, and a
-  second interactive step would work against scripted joins.
-- **Signing envelopes per writer.** Members are fully trusted.
+  pinned names, delivery through the Fabric inbox, and prompt visibility of redemptions cover the
+  cases this design targets, and a second interactive step would work against scripted joins.
 - **Hubs** for fleets much larger than ten machines.
 - **Prefix grants in Fabric** (`st3/fleet/*`), which would make the per-fleet grant a one-time
   step. That is a Fabric change.
