@@ -1581,6 +1581,15 @@ fn claim_specs() -> BTreeMap<String, ClaimSpec> {
             &["subscription"],
         ),
         (
+            "subscription.mission-request-cancelled",
+            &["subscription"],
+            WritePolicy::SystemOnly,
+            Cardinality::Append,
+            Some("subscriptions"),
+            true,
+            &["subscription"],
+        ),
+        (
             "subscription.mission-started",
             &["subscription"],
             WritePolicy::SystemOnly,
@@ -1798,6 +1807,8 @@ fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
             ("attempt", integer()),
             ("worker_reported", boolean()),
             ("claimant", reference()),
+            ("claim_incarnation", string()),
+            ("claim_expires_at_unix_ms", integer()),
         ],
         "work.claimed" | "work.renewed" | "work.progress" | "work.submitted" | "work.failed"
         | "work.released" => &[
@@ -2294,6 +2305,9 @@ fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
             ("discovery", required_string()),
             ("requester", reference_to(&["agent", "person"])),
         ],
+        "subscription.mission-request-cancelled" => {
+            &[("request", required_string()), ("reason", string())]
+        }
         "subscription.mission-started" => &[
             ("request", required_string()),
             ("mission_run", required_reference_to(&["mission-run"])),
@@ -2623,6 +2637,7 @@ mod tests {
                 "step-run.state",
                 "subscription.mission-deferred",
                 "subscription.mission-failed",
+                "subscription.mission-request-cancelled",
                 "subscription.mission-requested",
                 "subscription.mission-started",
                 "subscription.state",
