@@ -687,6 +687,9 @@ Registered tools are `shell`, `git`, `gh`, and `network`.
 
 The gate fails if its structured usage exceeds the declared token budget.
 
+The gate also fails if it outlasts its time limit. This holds even after the runner has posted a
+verdict: a runner that never exits is stopped at the limit.
+
 ### Human gates
 
 ```kdl

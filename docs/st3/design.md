@@ -101,7 +101,7 @@ The reconciler takes up each item of a pass on its own. The items are:
 
 - each member;
 - each observer, schedule, and subscription;
-- each mission run;
+- each mission run, and each step within it;
 - each later stage of the pass: intake, observers, schedules, scheduled work, subscriptions,
   provider-capacity retries, retired-agent attention, mission evaluation, and attention `until`
   conditions.
@@ -110,8 +110,8 @@ When an item fails or panics, the reconciler records the fault on that item's su
 on with every other item:
 
 - a member fault is a `runtime.reconcile-decision` claim;
-- an observer, schedule, subscription, or mission-run fault is a `reconcile.fault` claim on that
-  subject;
+- an observer, schedule, subscription, mission-run, or step-run fault is a `reconcile.fault`
+  claim on that subject;
 - a stage fault is a `reconcile.fault` claim on `daemon/HOST`, naming the stage.
 
 A fault is recorded again only when its cause changes. The item's next success records its
@@ -132,6 +132,11 @@ A member whose start keeps failing does not spawn again on every pass:
 Cleanup of a cancelled, failed, or finished run reads only the declarations that the run owns. It
 never waits for the run's mission revision or its steps, so a run whose revision is unavailable
 still stops its runtimes.
+
+Cleanup waits at most 15 minutes for the run's runtimes to report stopped. A runtime on a host that
+never answers, or one that cannot be killed, would otherwise hold the run and its active-run slot
+forever. At the deadline the run ends, with a reason naming each runtime still live. Their stop
+declarations stay, so stopping continues after the run ends.
 
 A panic that escapes a pass restarts the reconciler with backoff and records `daemon.diagnostic`
 with the code `reconciler-panicked`.
