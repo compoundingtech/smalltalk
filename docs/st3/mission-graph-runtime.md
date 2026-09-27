@@ -925,6 +925,28 @@ workspace "${ST_WORKSPACE}/generated" create=#true
 
 The default refusal prevents a spelling error from creating an unintended directory.
 
+An agent can declare a Git checkout instead. st3 then creates the agent's workspace as a worktree of an existing repository before the agent starts:
+
+```kdl
+agent "parser" {
+  workspace "${ST_WORKSPACE}/parser"
+  checkout "${ST_WORKSPACE}/repo" base="origin/main" branch="fan-out/parser" remove-at-run-end=#true
+  render { git-exclude ".st3/" }
+  harness "omp" {}
+}
+```
+
+- The repository and the workspace must be absolute paths after variable substitution.
+- When `base` names a remote branch, such as `origin/main`, st3 fetches it first. When the fetch fails, st3 uses the repository's current ref and records a `checkout-fetch-failed` warning.
+- A new `branch` starts at `base` without upstream tracking. A branch that already exists is checked out as it is.
+- A workspace that already exists is used as it is.
+- When the checkout fails, the agent does not start. st3 records a `workspace-unavailable` diagnostic and retries after 30 seconds.
+- With `remove-at-run-end=#true`, st3 removes the worktree after the agent's run ends and its runtime stops. The branch stays in the repository.
+- st3 keeps a worktree that has uncommitted or untracked changes, and records a `checkout-kept` warning. It also keeps a worktree whose workspace a current member still uses.
+- `render { git-exclude ".st3/" }` keeps the files st3 writes for each harness out of Git, so a finished worktree is clean.
+
+[`fan-out.kdl`](../../examples/st3/fan-out.kdl) gives three parallel workers one checkout each.
+
 ## Native message delivery and work wake
 
 Maintained harnesses receive graph messages through their native driver boundary. Codex uses typed

@@ -10,6 +10,7 @@ use serde_json::Value;
 use sha2::Digest as _;
 use tokio::sync::{Notify, watch};
 
+use crate::checkout::Checkout;
 use crate::mission::{
     CANDIDATE_INDEX_INPUT, LOOP_FEEDBACK_INPUT, LOOP_ITEM_INPUT, LOOP_ROUND_INPUT,
 };
@@ -37,6 +38,8 @@ const CODEX_CRASH_LOOP_INTERVAL_MS: u128 = 5 * 60_000;
 const CLAUDE_TRUST_SCREEN_RECHECK_MS: u128 = 2_000;
 const CLAUDE_TRUST_RECOVERY_ATTEMPTS: usize = 3;
 const CLAUDE_TRUST_RECOVERY_WINDOW_MS: u128 = 10 * 60_000;
+// A failed checkout fetch or worktree command waits this long before Git runs again.
+const CHECKOUT_RETRY_MS: u128 = 30_000;
 
 /// The screen line on which Claude asks for /login. Claude prints the prompt as its own line,
 /// at most after a status glyph, so a line that only quotes the phrase, such as source code or
@@ -310,6 +313,8 @@ pub struct Reconciler<R = NativeRuntime> {
     observer_deadlines: Arc<Mutex<HashMap<String, u128>>>,
     observer_cursors: Arc<Mutex<HashMap<String, Option<String>>>>,
     delayed_restarts: Arc<Mutex<HashMap<String, u128>>>,
+    /// When a failed `checkout` may run Git again, and why it failed, by agent subject.
+    checkout_retries: Arc<Mutex<HashMap<String, (u128, String)>>>,
     file_watchers: Arc<Mutex<HashMap<String, notify::RecommendedWatcher>>>,
     file_watchers_used: Arc<Mutex<HashSet<String>>>,
     file_observations: Arc<Mutex<HashMap<String, FileStamp>>>,
@@ -379,6 +384,7 @@ impl Reconciler<NativeRuntime> {
             observer_deadlines: Arc::new(Mutex::new(HashMap::new())),
             observer_cursors: Arc::new(Mutex::new(HashMap::new())),
             delayed_restarts: Arc::new(Mutex::new(HashMap::new())),
+            checkout_retries: Arc::new(Mutex::new(HashMap::new())),
             file_watchers: Arc::new(Mutex::new(HashMap::new())),
             file_watchers_used: Arc::new(Mutex::new(HashSet::new())),
             file_observations: Arc::new(Mutex::new(HashMap::new())),
@@ -403,6 +409,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             observer_deadlines: Arc::new(Mutex::new(HashMap::new())),
             observer_cursors: Arc::new(Mutex::new(HashMap::new())),
             delayed_restarts: Arc::new(Mutex::new(HashMap::new())),
+            checkout_retries: Arc::new(Mutex::new(HashMap::new())),
             file_watchers: Arc::new(Mutex::new(HashMap::new())),
             file_watchers_used: Arc::new(Mutex::new(HashSet::new())),
             file_observations: Arc::new(Mutex::new(HashMap::new())),
@@ -654,7 +661,12 @@ impl<R: RuntimeControl> Reconciler<R> {
             if workspace.is_dir() {
                 continue;
             }
-            let failure = if member.workspace_create {
+            let checkout = (subject.kind == "agent")
+                .then(|| Checkout::from_desired(&subject.desired))
+                .flatten();
+            let failure = if let Some(checkout) = checkout {
+                self.create_checkout(&subject.subject, &checkout, workspace)?
+            } else if member.workspace_create {
                 fs::create_dir_all(workspace)
                     .err()
                     .map(|error| error.to_string())
@@ -703,6 +715,15 @@ impl<R: RuntimeControl> Reconciler<R> {
                 )?;
             }
         }
+        // A later run can declare the same workspace, so a finished run never removes a
+        // checkout that a current member on this host still uses.
+        let live_workspaces = active
+            .iter()
+            .filter(|subject| subject.kind != "stop")
+            .filter_map(|subject| subject.member.as_ref())
+            .filter(|member| member.host == self.host)
+            .map(|member| member.workspace.as_str())
+            .collect::<BTreeSet<_>>();
         let mut work_message_agents = Vec::new();
         for subject in &active {
             if unavailable_workspaces.contains(&subject.subject) {
@@ -710,6 +731,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             }
             if subject.kind == "stop" {
                 self.reconcile_stop(subject, &ptys)?;
+                self.remove_checkout_after_run(subject, &live_workspaces)?;
                 continue;
             }
             let Some(member) = &subject.member else {
@@ -1714,6 +1736,173 @@ impl<R: RuntimeControl> Reconciler<R> {
             timeout,
             observation.as_ref(),
         )?;
+        Ok(())
+    }
+
+    /// Create a declared checkout before its agent starts. Returns why the workspace is still
+    /// unavailable. After a failure, Git runs again only after `CHECKOUT_RETRY_MS`.
+    fn create_checkout(
+        &self,
+        subject: &str,
+        checkout: &Checkout,
+        workspace: &Path,
+    ) -> Result<Option<String>> {
+        let now = now_ms();
+        if let Some((_, failure)) = self
+            .checkout_retries
+            .lock()
+            .expect("checkout retry mutex poisoned")
+            .get(subject)
+            .filter(|(retry_at, _)| *retry_at > now)
+        {
+            return Ok(Some(failure.clone()));
+        }
+        match checkout.create(workspace) {
+            Ok(warnings) => {
+                self.checkout_retries
+                    .lock()
+                    .expect("checkout retry mutex poisoned")
+                    .remove(subject);
+                for warning in warnings {
+                    self.record_once(
+                        subject,
+                        "harness.diagnostic",
+                        BTreeMap::from([
+                            ("severity".into(), Value::String("warning".into())),
+                            ("status".into(), Value::String("warning".into())),
+                            ("code".into(), Value::String("checkout-fetch-failed".into())),
+                            ("reason".into(), Value::String(warning)),
+                        ]),
+                    )?;
+                }
+                Ok(None)
+            }
+            Err(error) => {
+                let failure = format!(
+                    "checkout of {} failed: {error:#}",
+                    checkout.repository.display()
+                );
+                let retry_at = now.saturating_add(CHECKOUT_RETRY_MS);
+                self.checkout_retries
+                    .lock()
+                    .expect("checkout retry mutex poisoned")
+                    .insert(subject.into(), (retry_at, failure.clone()));
+                self.arm_restart(&format!("checkout:{subject}"), retry_at);
+                Ok(Some(failure))
+            }
+        }
+    }
+
+    /// Remove a finished run's checkout once its runtime has stopped, when the agent asked for
+    /// `remove-at-run-end`.
+    fn remove_checkout_after_run(
+        &self,
+        subject: &DesiredSubject,
+        live_workspaces: &BTreeSet<&str>,
+    ) -> Result<()> {
+        let Some((checkout, workspace)) = self.finished_run_checkout(subject)? else {
+            return Ok(());
+        };
+        self.remove_finished_checkout(
+            &subject.subject,
+            &checkout,
+            Path::new(&workspace),
+            live_workspaces,
+        )
+    }
+
+    /// The checkout and workspace of a stopped agent whose owning run has ended. A run's cleanup
+    /// replaces the agent's declaration with a stop, so the checkout comes from the last agent
+    /// declaration.
+    fn finished_run_checkout(
+        &self,
+        subject: &DesiredSubject,
+    ) -> Result<Option<(Checkout, String)>> {
+        let Some(run) = subject.owner_run.as_deref() else {
+            return Ok(None);
+        };
+        let Some(declaration) = self
+            .store
+            .claims_for(&subject.subject, Some("intent.desired"))?
+            .into_iter()
+            .rev()
+            .find(|claim| claim.body.get("kind").and_then(Value::as_str) == Some("agent"))
+        else {
+            return Ok(None);
+        };
+        let Some(checkout) = declaration
+            .body
+            .get("desired")
+            .and_then(Checkout::from_desired)
+            .filter(|checkout| checkout.remove_at_run_end)
+        else {
+            return Ok(None);
+        };
+        let Some(member) = declaration
+            .body
+            .get("member")
+            .and_then(|member| serde_json::from_value::<MemberSpec>(member.clone()).ok())
+            .filter(|member| member.host == self.host)
+        else {
+            return Ok(None);
+        };
+        // A run stops its owned agents in its cleanup phase, before it becomes terminal.
+        let run_ended = self.store.mission_run(run)?.is_some_and(|run| {
+            matches!(run.status.as_str(), "completed" | "failed" | "cancelled")
+                || run.phase == "terminal"
+                || run.phase.starts_with("cleanup-")
+        });
+        let stopped = self
+            .store
+            .latest_actual_value(&subject.subject)?
+            .is_some_and(|actual| {
+                actual_field(&actual, "status").and_then(Value::as_str) == Some("stopped")
+            });
+        Ok((run_ended && stopped).then_some((checkout, member.workspace)))
+    }
+
+    /// Remove a finished checkout unless a current member uses its workspace. A worktree with
+    /// changes stays, with one warning, and is tried again after `CHECKOUT_RETRY_MS`.
+    fn remove_finished_checkout(
+        &self,
+        subject: &str,
+        checkout: &Checkout,
+        workspace: &Path,
+        live_workspaces: &BTreeSet<&str>,
+    ) -> Result<()> {
+        if live_workspaces.contains(workspace.to_string_lossy().as_ref()) || !workspace.exists() {
+            return Ok(());
+        }
+        let now = now_ms();
+        if self
+            .checkout_retries
+            .lock()
+            .expect("checkout retry mutex poisoned")
+            .get(subject)
+            .is_some_and(|(retry_at, _)| *retry_at > now)
+        {
+            return Ok(());
+        }
+        if let Err(error) = checkout.remove(workspace) {
+            let reason = format!("kept worktree {}: {error:#}", workspace.display());
+            self.checkout_retries
+                .lock()
+                .expect("checkout retry mutex poisoned")
+                .insert(
+                    subject.into(),
+                    (now.saturating_add(CHECKOUT_RETRY_MS), reason.clone()),
+                );
+            self.record_once(
+                subject,
+                "harness.diagnostic",
+                BTreeMap::from([
+                    ("severity".into(), Value::String("warning".into())),
+                    ("status".into(), Value::String("warning".into())),
+                    ("code".into(), Value::String("checkout-kept".into())),
+                    ("reason".into(), Value::String(reason)),
+                ]),
+            )?;
+        }
         Ok(())
     }
 
@@ -12746,6 +12935,233 @@ mission "scheduled-cycle" state="ready" {
                 .unwrap()
                 .iter()
                 .all(|desired| desired.owner_run.as_deref() != Some(run.subject.as_str()))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_declared_checkout_exists_before_its_agent_starts_and_leaves_with_its_run() {
+        let root = tempfile::tempdir().unwrap();
+        let repository = crate::checkout::test_support::repository(root.path());
+        let workspace = root.path().join("worker");
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        let source = format!(
+            r#"
+            version 2
+
+              mission "checkout-lifecycle" state="ready" timeout="1m" {{
+                goal "Work in a worktree that st3 creates and removes."
+                agent "worker" {{
+                  workspace {workspace:?}
+                  checkout {repository:?} base="origin/main" branch="example/${{ST_MISSION_RUN}}" remove-at-run-end=#true
+                  command "true"
+                  restart "never"
+                }}
+                step "wait" {{
+                  assigned-to "agent/${{ST_MISSION_RUN}}/worker"
+                  goal "Wait for cancellation."
+                }}
+              }}
+            "#,
+            workspace = workspace.display().to_string(),
+            repository = repository.display().to_string(),
+        );
+        apply_source(&store, &source, "checkout-lifecycle-source");
+        let run = store
+            .create_mission_run(&crate::model::MissionRunRequest {
+                mission: "checkout-lifecycle".into(),
+                revision: None,
+                workspace: root.path().display().to_string(),
+                requester: Some("person/test".into()),
+                mode: Some("eval".into()),
+                inputs: BTreeMap::new(),
+                idempotency_key: "checkout-lifecycle-run".into(),
+            })
+            .unwrap();
+        let notify = Arc::new(Notify::new());
+        let runtime = Arc::new(FakeRuntime::default());
+        let reconciler = Arc::new(Reconciler::new(
+            store.clone(),
+            runtime.clone(),
+            "node".into(),
+            notify.clone(),
+        ));
+        let task = tokio::spawn(reconciler.run());
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if runtime
+                    .started_members
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|member| member.runtime_id.ends_with(".worker"))
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("the worker did not start");
+        let branch = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&workspace)
+            .args(["branch", "--show-current"])
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&branch.stdout).trim(),
+            format!("example/{}", run.id),
+            "the worktree existed on its branch when the worker started"
+        );
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("README")).unwrap(),
+            "second\n",
+            "the checkout started from the fetched base"
+        );
+
+        let cancellation = format!(
+            "version 2\nmission-run {:?} {{ cancellation \"operator-stop\" {{ reason \"the test ended\" }} }}\n",
+            run.id
+        );
+        apply_source(&store, &cancellation, "checkout-lifecycle-stop");
+        notify.notify_one();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while workspace.exists() {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("the finished run did not remove its checkout");
+        task.abort();
+        crate::checkout::test_support::git(
+            &repository,
+            &[
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                &format!("refs/heads/example/{}", run.id),
+            ],
+        );
+    }
+
+    #[test]
+    fn a_finished_checkout_stays_while_in_use_or_changed() {
+        let root = tempfile::tempdir().unwrap();
+        let repository = crate::checkout::test_support::repository(root.path());
+        let workspace = root.path().join("shared");
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        let source = format!(
+            "version 2\nagent \"worker\" {{ workspace {:?}; checkout {:?} base=\"main\" branch=\"example/shared\" remove-at-run-end=#true; command \"true\"; restart \"never\" }}\n",
+            workspace.display().to_string(),
+            repository.display().to_string(),
+        );
+        apply_source(&store, &source, "checkout-shared");
+        let runtime = Arc::new(FakeRuntime::default());
+        let reconciler = Reconciler::new(
+            store.clone(),
+            runtime.clone(),
+            "node".into(),
+            Arc::new(Notify::new()),
+        );
+        reconciler.reconcile_once().unwrap();
+        assert!(workspace.join("README").is_file());
+        assert_eq!(runtime.started_members.lock().unwrap().len(), 1);
+
+        let agent = store
+            .desired_subjects()
+            .unwrap()
+            .into_iter()
+            .find(|subject| subject.kind == "agent")
+            .unwrap();
+        let checkout = Checkout::from_desired(&agent.desired).unwrap();
+        let path = workspace.display().to_string();
+        reconciler
+            .remove_finished_checkout(
+                &agent.subject,
+                &checkout,
+                &workspace,
+                &BTreeSet::from([path.as_str()]),
+            )
+            .unwrap();
+        assert!(
+            workspace.is_dir(),
+            "a current member still uses the workspace"
+        );
+
+        std::fs::write(workspace.join("notes.txt"), "unfinished\n").unwrap();
+        reconciler
+            .remove_finished_checkout(&agent.subject, &checkout, &workspace, &BTreeSet::new())
+            .unwrap();
+        assert!(workspace.join("notes.txt").is_file(), "changed work stays");
+        let kept = store
+            .latest_claim(&agent.subject, Some("harness.diagnostic"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            kept.body.pointer("/fields/code").and_then(Value::as_str),
+            Some("checkout-kept")
+        );
+
+        std::fs::remove_file(workspace.join("notes.txt")).unwrap();
+        reconciler.checkout_retries.lock().unwrap().clear();
+        reconciler
+            .remove_finished_checkout(&agent.subject, &checkout, &workspace, &BTreeSet::new())
+            .unwrap();
+        assert!(!workspace.exists());
+    }
+
+    #[test]
+    fn a_failed_checkout_keeps_its_agent_from_starting() {
+        let root = tempfile::tempdir().unwrap();
+        let repository = crate::checkout::test_support::repository(root.path());
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        let source = format!(
+            "version 2\nagent \"worker\" {{ workspace {:?}; checkout {:?} base=\"no-such-base\" branch=\"example/missing\"; command \"true\" }}\n",
+            root.path().join("missing").display().to_string(),
+            repository.display().to_string(),
+        );
+        apply_source(&store, &source, "checkout-missing-base");
+        let runtime = Arc::new(FakeRuntime::default());
+        let reconciler = Reconciler::new(
+            store.clone(),
+            runtime.clone(),
+            "node".into(),
+            Arc::new(Notify::new()),
+        );
+        reconciler.reconcile_once().unwrap();
+        reconciler.reconcile_once().unwrap();
+
+        assert!(runtime.started_members.lock().unwrap().is_empty());
+        let subject = store
+            .desired_subjects()
+            .unwrap()
+            .into_iter()
+            .find(|subject| subject.kind == "agent")
+            .unwrap()
+            .subject;
+        let diagnostics = store
+            .claims_for(&subject, Some("harness.diagnostic"))
+            .unwrap();
+        assert_eq!(
+            diagnostics.len(),
+            1,
+            "a retry within the backoff adds nothing"
+        );
+        assert_eq!(
+            diagnostics[0]
+                .body
+                .pointer("/fields/code")
+                .and_then(Value::as_str),
+            Some("workspace-unavailable")
+        );
+        assert!(
+            diagnostics[0]
+                .body
+                .pointer("/fields/reason")
+                .and_then(Value::as_str)
+                .is_some_and(|reason| reason.contains("checkout of")),
+            "{diagnostics:?}"
         );
     }
 
