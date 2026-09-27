@@ -148,8 +148,10 @@ The session can pause on one machine and continue on another after replication.
 The local API uses a Unix socket. Peer HTTP listeners and peer URLs must use loopback addresses.
 Fleet messages use a shared secret and request-bound signatures.
 
-The render transaction refuses symbolic-link escapes and conflicting ownership. It refuses to
-replace a tracked `.st3/boot.md` with different bytes.
+Each member’s render transaction refuses symbolic-link escapes and conflicting file ownership.
+It refuses to replace a tracked `.st3/boot.md` with different bytes. Additive Git excludes combine
+across operations and worktrees sharing an exclude file. A failed member pass records a fault
+without blocking other members; stopping a member does not require its render to succeed.
 
 Mission constraints describe required outcomes. They do not disable harness features or replace a
 future operating-system sandbox.

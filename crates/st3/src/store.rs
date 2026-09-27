@@ -7230,6 +7230,38 @@ impl Store {
         })
     }
 
+    /// Latest member-pass fault, independently of runtime observations and unrelated diagnostics.
+    pub fn member_reconcile_fault(
+        &self,
+        subject: &str,
+        at_index: Option<u64>,
+    ) -> Result<Option<String>> {
+        let connection = self.readers.get();
+        let body: Option<String> = connection
+            .query_row(
+                "SELECT body FROM claims WHERE subject=?1 AND kind='runtime.reconcile-decision'
+             AND store_index<=?2 AND json_extract(body, '$.fields.key')='member-reconcile'
+             ORDER BY store_index DESC LIMIT 1",
+                params![subject, at_index.unwrap_or(i64::MAX as u64)],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(body) = body else {
+            return Ok(None);
+        };
+        let body: Value = serde_json::from_str(&body)?;
+        let fields = body.get("fields").unwrap_or(&body);
+        Ok(
+            (fields.get("decision").and_then(Value::as_str) == Some("member-fault")).then(|| {
+                fields
+                    .get("reason")
+                    .and_then(Value::as_str)
+                    .unwrap_or("member reconciliation failed")
+                    .to_owned()
+            }),
+        )
+    }
+
     pub fn latest_claim(&self, subject: &str, kind: Option<&str>) -> Result<Option<ClaimRecord>> {
         let connection = self.readers.get();
         let query = "SELECT id, store_index, batch_id, subject, kind, origin, actor, body, predecessors, accepted_at_unix_ms

@@ -687,7 +687,7 @@ impl<R: RuntimeControl> Reconciler<R> {
         };
 
         let active = desired.iter().collect::<Vec<_>>();
-        let mut unavailable_workspaces = BTreeSet::new();
+        let mut member_errors = BTreeMap::new();
         for subject in &active {
             if subject.kind == "stop" {
                 continue;
@@ -706,55 +706,52 @@ impl<R: RuntimeControl> Reconciler<R> {
             let checkout = (subject.kind == "agent")
                 .then(|| Checkout::from_desired(&subject.desired))
                 .flatten();
-            let failure = if let Some(checkout) = checkout {
-                self.create_checkout(&subject.subject, &checkout, workspace)?
+            let result = if let Some(checkout) = checkout {
+                self.create_checkout(&subject.subject, &checkout, workspace)
+                    .and_then(|failure| match failure {
+                        Some(reason) => Err(anyhow::anyhow!(reason)),
+                        None => Ok(()),
+                    })
             } else if member.workspace_create {
-                fs::create_dir_all(workspace)
-                    .err()
-                    .map(|error| error.to_string())
+                fs::create_dir_all(workspace).map_err(anyhow::Error::from)
             } else {
-                Some("the workspace does not exist and create was not requested".into())
+                Err(anyhow::anyhow!(
+                    "the workspace does not exist and create was not requested"
+                ))
             };
-            if let Some(failure) = failure {
-                unavailable_workspaces.insert(subject.subject.clone());
-                self.record_once(
-                    &subject.subject,
-                    "harness.diagnostic",
-                    BTreeMap::from([
-                        ("severity".into(), Value::String("error".into())),
-                        ("status".into(), Value::String("unavailable".into())),
-                        ("code".into(), Value::String("workspace-unavailable".into())),
-                        (
-                            "reason".into(),
-                            Value::String(format!("workspace {}: {failure}", workspace.display())),
-                        ),
-                    ]),
-                )?;
+            if let Err(error) = result.with_context(|| format!("workspace {}", workspace.display()))
+            {
+                member_errors.insert(subject.subject.clone(), error);
             }
         }
         let renderable = active
             .iter()
             .copied()
-            .filter(|subject| !unavailable_workspaces.contains(&subject.subject))
+            .filter(|subject| !member_errors.contains_key(&subject.subject))
             .collect::<Vec<_>>();
-        let rendered = crate::render::apply_all(&self.store, &renderable, &self.host)?;
-        for (subject, result) in rendered {
-            for warning in result.warnings {
-                self.record_once(
-                    &subject,
-                    "harness.diagnostic",
-                    BTreeMap::from([
-                        ("status".into(), Value::String("warning".into())),
-                        ("reason".into(), Value::String(warning)),
-                    ]),
-                )?;
-            }
-            if !result.receipts.is_empty() {
-                self.record_once(
-                    &subject,
-                    "render.applied",
-                    BTreeMap::from([("writes".into(), serde_json::to_value(result.receipts)?)]),
-                )?;
+        for (subject, result) in crate::render::apply_all(&self.store, &renderable, &self.host) {
+            let result = result.and_then(|result| {
+                for warning in result.warnings {
+                    self.record_once(
+                        &subject,
+                        "harness.diagnostic",
+                        BTreeMap::from([
+                            ("status".into(), Value::String("warning".into())),
+                            ("reason".into(), Value::String(warning)),
+                        ]),
+                    )?;
+                }
+                if !result.receipts.is_empty() {
+                    self.record_once(
+                        &subject,
+                        "render.applied",
+                        BTreeMap::from([("writes".into(), serde_json::to_value(result.receipts)?)]),
+                    )?;
+                }
+                Ok(())
+            });
+            if let Err(error) = result {
+                member_errors.insert(subject, error);
             }
         }
         // A later run can declare the same workspace, so a finished run never removes a
@@ -767,118 +764,168 @@ impl<R: RuntimeControl> Reconciler<R> {
             .map(|member| member.workspace.as_str())
             .collect::<BTreeSet<_>>();
         let mut work_message_agents = Vec::new();
+        let mut diagnostic_errors = Vec::new();
         for subject in &active {
-            if unavailable_workspaces.contains(&subject.subject) {
-                continue;
-            }
-            if subject.kind == "stop" {
-                self.reconcile_stop(subject, &ptys)?;
-                self.remove_checkout_after_run(subject, &live_workspaces)?;
-                continue;
-            }
-            let Some(member) = &subject.member else {
-                continue;
-            };
-            if member.host != self.host {
-                continue;
-            }
-            let observed = if member.terminal {
-                ptys.get(&member.runtime_id).cloned()
+            let owner = if let Some(member) = &subject.member {
+                Ok(Some(member.host.clone()))
+            } else if subject.kind == "stop" {
+                self.store
+                    .selected_actual_origin(&subject.subject)
+                    .and_then(|origin| {
+                        Ok(origin.or(self.store.selected_desired_origin(&subject.subject)?))
+                    })
             } else {
-                self.runtime.observe_exec(&member.runtime_id)?
+                Ok(None)
             };
-            match observed {
-                Some(observation) if observation.status == "running" => {
-                    self.record_member(subject, &observation, true)?;
-                    self.reconcile_claude_auth_screen(subject, member, &observation)?;
-                    self.reconcile_claude_trust_screen(subject, member, &observation, now_ms())?;
-                    self.reconcile_driver_readiness(subject, member, &observation, now_ms())?;
-                    if subject.kind == "agent"
-                        && let Some(incarnation) = observation.incarnation_id.as_deref()
+            match owner {
+                Ok(Some(owner)) if owner == self.host => {}
+                Ok(_) => continue,
+                Err(error) => {
+                    diagnostic_errors.push(format!(
+                        "{}: determine member owner: {error:#}",
+                        subject.subject
+                    ));
+                    continue;
+                }
+            }
+            let result = (|| -> Result<()> {
+                if let Some(error) = member_errors.remove(&subject.subject) {
+                    return Err(error);
+                }
+                if subject.kind == "stop" {
+                    self.reconcile_stop(subject, &ptys)?;
+                    self.remove_checkout_after_run(subject, &live_workspaces)?;
+                    return Ok(());
+                }
+                let Some(member) = &subject.member else {
+                    return Ok(());
+                };
+                if member.host != self.host {
+                    return Ok(());
+                }
+                let observed = if member.terminal {
+                    ptys.get(&member.runtime_id).cloned()
+                } else {
+                    self.runtime.observe_exec(&member.runtime_id)?
+                };
+                match observed {
+                    Some(observation) if observation.status == "running" => {
+                        self.record_member(subject, &observation, true)?;
+                        self.reconcile_claude_auth_screen(subject, member, &observation)?;
+                        self.reconcile_claude_trust_screen(
+                            subject,
+                            member,
+                            &observation,
+                            now_ms(),
+                        )?;
+                        self.reconcile_driver_readiness(subject, member, &observation, now_ms())?;
+                        if subject.kind == "agent"
+                            && let Some(incarnation) = observation.incarnation_id.as_deref()
+                        {
+                            work_message_agents
+                                .push((subject.subject.clone(), incarnation.to_owned()));
+                        }
+                    }
+                    Some(observation)
+                        if matches!(observation.status.as_str(), "exited" | "vanished") =>
                     {
-                        work_message_agents.push((subject.subject.clone(), incarnation.to_owned()));
-                    }
-                }
-                Some(observation)
-                    if matches!(observation.status.as_str(), "exited" | "vanished") =>
-                {
-                    self.record_member(subject, &observation, false)?;
-                    if !self.member_was_launched_for_selected_desired(&subject.subject)? {
-                        self.perform_start(subject, member, "the desired member revision changed")?;
-                        continue;
-                    }
-                    let restart = match member.restart {
-                        RestartType::Always => true,
-                        RestartType::OnFailure => observation.exit_code != Some(0),
-                        RestartType::Never => false,
-                    };
-                    // A trust-prompt recovery stopped this incarnation in order to replace it,
-                    // whatever the member's own exit policy says.
-                    let recovering =
-                        self.claude_trust_recovery_stopped(&subject.subject, &observation)?;
-                    if (restart || recovering) && member.lifecycle == MemberLifecycle::Service {
-                        self.reconcile_restart(subject, member, &observation)?;
-                    }
-                }
-                Some(observation) => {
-                    self.record_member(subject, &observation, false)?;
-                }
-                None if member.lifecycle == MemberLifecycle::AdoptOnly => {
-                    self.record_once(
-                        &subject.subject,
-                        "runtime.observed",
-                        member_fields(member, "absent", None, false),
-                    )?;
-                }
-                None => {
-                    let prior = self.store.latest_actual_value(&subject.subject)?;
-                    if prior.is_some()
-                        && !self.member_was_launched_for_selected_desired(&subject.subject)?
-                    {
-                        self.perform_start(subject, member, "the desired member revision changed")?;
-                        continue;
-                    }
-                    if prior.as_ref().is_some_and(|actual| {
-                        matches!(
-                            actual_field(actual, "status").and_then(Value::as_str),
-                            Some(
-                                "running"
-                                    | "ready"
-                                    | "working"
-                                    | "idle"
-                                    | "starting"
-                                    | "exited"
-                                    | "vanished"
-                            )
-                        )
-                    }) {
-                        let observation = RuntimeObservation {
-                            runtime_id: member.runtime_id.clone(),
-                            terminal: member.terminal,
-                            status: "vanished".into(),
-                            exit_code: prior
-                                .as_ref()
-                                .and_then(|actual| actual_field(actual, "exit_code"))
-                                .and_then(Value::as_i64),
-                            incarnation_id: prior
-                                .as_ref()
-                                .and_then(|actual| actual_field(actual, "incarnation_id"))
-                                .and_then(Value::as_str)
-                                .map(str::to_owned),
-                        };
                         self.record_member(subject, &observation, false)?;
+                        if !self.member_was_launched_for_selected_desired(&subject.subject)? {
+                            self.perform_start(
+                                subject,
+                                member,
+                                "the desired member revision changed",
+                            )?;
+                            return Ok(());
+                        }
                         let restart = match member.restart {
                             RestartType::Always => true,
                             RestartType::OnFailure => observation.exit_code != Some(0),
                             RestartType::Never => false,
                         };
-                        if restart {
+                        // A trust-prompt recovery stopped this incarnation in order to replace it,
+                        // whatever the member's own exit policy says.
+                        let recovering =
+                            self.claude_trust_recovery_stopped(&subject.subject, &observation)?;
+                        if (restart || recovering) && member.lifecycle == MemberLifecycle::Service {
                             self.reconcile_restart(subject, member, &observation)?;
                         }
-                    } else {
-                        self.perform_start(subject, member, "the desired member is absent")?;
+                    }
+                    Some(observation) => {
+                        self.record_member(subject, &observation, false)?;
+                    }
+                    None if member.lifecycle == MemberLifecycle::AdoptOnly => {
+                        self.record_once(
+                            &subject.subject,
+                            "runtime.observed",
+                            member_fields(member, "absent", None, false),
+                        )?;
+                    }
+                    None => {
+                        let prior = self.store.latest_actual_value(&subject.subject)?;
+                        if prior.is_some()
+                            && !self.member_was_launched_for_selected_desired(&subject.subject)?
+                        {
+                            self.perform_start(
+                                subject,
+                                member,
+                                "the desired member revision changed",
+                            )?;
+                            return Ok(());
+                        }
+                        if prior.as_ref().is_some_and(|actual| {
+                            matches!(
+                                actual_field(actual, "status").and_then(Value::as_str),
+                                Some(
+                                    "running"
+                                        | "ready"
+                                        | "working"
+                                        | "idle"
+                                        | "starting"
+                                        | "exited"
+                                        | "vanished"
+                                )
+                            )
+                        }) {
+                            let observation = RuntimeObservation {
+                                runtime_id: member.runtime_id.clone(),
+                                terminal: member.terminal,
+                                status: "vanished".into(),
+                                exit_code: prior
+                                    .as_ref()
+                                    .and_then(|actual| actual_field(actual, "exit_code"))
+                                    .and_then(Value::as_i64),
+                                incarnation_id: prior
+                                    .as_ref()
+                                    .and_then(|actual| actual_field(actual, "incarnation_id"))
+                                    .and_then(Value::as_str)
+                                    .map(str::to_owned),
+                            };
+                            self.record_member(subject, &observation, false)?;
+                            let restart = match member.restart {
+                                RestartType::Always => true,
+                                RestartType::OnFailure => observation.exit_code != Some(0),
+                                RestartType::Never => false,
+                            };
+                            if restart {
+                                self.reconcile_restart(subject, member, &observation)?;
+                            }
+                        } else {
+                            self.perform_start(subject, member, "the desired member is absent")?;
+                        }
                     }
                 }
+                Ok(())
+            })();
+            // A running agent's member pass also includes deferred work delivery.
+            let deferred = result.is_ok()
+                && work_message_agents
+                    .last()
+                    .is_some_and(|(agent, _)| agent == &subject.subject);
+            if !deferred
+                && let Err(error) = self.record_member_reconcile_result(&subject.subject, result)
+            {
+                diagnostic_errors.push(format!("{}: {error:#}", subject.subject));
             }
         }
         // Intake left by a terminal owner or a superseded generation must not observe, deliver,
@@ -915,8 +962,44 @@ impl<R: RuntimeControl> Reconciler<R> {
         // wake-message bookkeeping so a large mailbox or work history cannot starve
         // newly-created runs of their first readiness pass.
         for (agent, incarnation) in work_message_agents {
-            self.reconcile_work_messages(&agent, &incarnation)?;
+            let result = self.reconcile_work_messages(&agent, &incarnation);
+            if let Err(error) = self.record_member_reconcile_result(&agent, result) {
+                diagnostic_errors.push(format!("{agent}: {error:#}"));
+            }
         }
+        anyhow::ensure!(
+            diagnostic_errors.is_empty(),
+            "record member faults: {}",
+            diagnostic_errors.join("; ")
+        );
+        Ok(())
+    }
+
+    fn record_member_reconcile_result(&self, subject: &str, result: Result<()>) -> Result<()> {
+        let previous = self.store.member_reconcile_fault(subject, None)?;
+        let (decision, reason) = match result {
+            Err(error) => {
+                let reason = format!("{error:#}");
+                if previous.as_deref() == Some(reason.as_str()) {
+                    return Ok(());
+                }
+                ("member-fault", reason)
+            }
+            Ok(()) if previous.is_some() => (
+                "member-recovered",
+                "the member reconciled successfully".to_owned(),
+            ),
+            Ok(()) => return Ok(()),
+        };
+        self.record_once(
+            subject,
+            "runtime.reconcile-decision",
+            BTreeMap::from([
+                ("key".into(), Value::String("member-reconcile".into())),
+                ("decision".into(), Value::String(decision.into())),
+                ("reason".into(), Value::String(reason)),
+            ]),
+        )?;
         Ok(())
     }
 
@@ -2275,7 +2358,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                 "runtime.observed",
                 member_fields(member, "absent", None, false),
             )?;
-            return Ok(());
+            return Err(error).context("start member runtime");
         }
         let desired_token = self
             .store
@@ -9453,6 +9536,8 @@ mod tests {
         logs: Mutex<HashMap<String, String>>,
         starts: Mutex<Vec<String>>,
         failed_starts: Mutex<std::collections::HashSet<String>>,
+        failed_observes: Mutex<std::collections::HashSet<String>>,
+        failed_stops: Mutex<std::collections::HashSet<String>>,
         started_members: Mutex<Vec<MemberSpec>>,
         stops: Mutex<Vec<String>>,
         kills: Mutex<Vec<String>>,
@@ -9470,6 +9555,10 @@ mod tests {
             Ok(self.ptys.lock().unwrap().clone())
         }
         fn observe_exec(&self, runtime_id: &str) -> Result<Option<RuntimeObservation>> {
+            anyhow::ensure!(
+                !self.failed_observes.lock().unwrap().contains(runtime_id),
+                "fake observe failed"
+            );
             Ok(self.execs.lock().unwrap().get(runtime_id).cloned())
         }
         fn start(&self, member: &MemberSpec) -> Result<()> {
@@ -9492,6 +9581,10 @@ mod tests {
             _expected_incarnation: Option<&str>,
         ) -> Result<()> {
             self.stops.lock().unwrap().push(runtime_id.into());
+            anyhow::ensure!(
+                !self.failed_stops.lock().unwrap().contains(runtime_id),
+                "fake stop failed"
+            );
             Ok(())
         }
         fn kill(
@@ -11413,15 +11506,15 @@ version 2
         assert_eq!(started.len(), 1);
         assert_eq!(started[0].runtime_id, "node.good");
         let diagnostic = store
-            .claims_for("agent/node.bad", Some("harness.diagnostic"))
+            .claims_for("agent/node.bad", Some("runtime.reconcile-decision"))
             .unwrap();
         assert_eq!(diagnostic.len(), 1);
         assert_eq!(
             diagnostic[0]
                 .body
-                .pointer("/fields/code")
+                .pointer("/fields/decision")
                 .and_then(Value::as_str),
-            Some("workspace-unavailable")
+            Some("member-fault")
         );
     }
 
@@ -11452,15 +11545,313 @@ version 2
         apply_source(&store, &source, "boot-render-refusal");
         let runtime = Arc::new(FakeRuntime::default());
         let reconciler = Reconciler::new(
-            store,
+            store.clone(),
             runtime.clone(),
             "node".into(),
             Arc::new(Notify::new()),
         );
 
-        let error = reconciler.reconcile_once().unwrap_err();
-        assert!(error.to_string().contains("tracked file"));
+        reconciler.reconcile_once().unwrap();
+        assert!(
+            store
+                .member_reconcile_fault("agent/node.worker", None)
+                .unwrap()
+                .unwrap()
+                .contains("tracked file")
+        );
         assert!(runtime.starts.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_failed_render_isolated_from_healthy_members_and_clears_on_recovery() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        let workspace = tempfile::tempdir().unwrap();
+        std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(workspace.path())
+            .status()
+            .unwrap();
+        fs::create_dir(workspace.path().join(".claude")).unwrap();
+        fs::write(workspace.path().join(".claude/settings.local.json"), "{}\n").unwrap();
+        std::process::Command::new("git")
+            .args(["add", ".claude/settings.local.json"])
+            .current_dir(workspace.path())
+            .status()
+            .unwrap();
+        let source = format!(
+            r#"version 2
+agent "bad" {{ workspace {:?}; command "true"; render {{ file ".claude/settings.local.json" "changed" }} }}
+agent "good" {{ workspace {:?}; command "true"; render {{ file "healthy" "rendered" }} }}
+"#,
+            workspace.path().display().to_string(),
+            workspace.path().display().to_string()
+        );
+        apply_source(&store, &source, "render-isolation");
+        let runtime = Arc::new(FakeRuntime::default());
+        let reconciler = Reconciler::new(
+            store.clone(),
+            runtime.clone(),
+            "node".into(),
+            Arc::new(Notify::new()),
+        );
+        reconciler.reconcile_once().unwrap();
+        assert_eq!(&*runtime.starts.lock().unwrap(), &["node.good"]);
+        assert_eq!(
+            fs::read_to_string(workspace.path().join("healthy")).unwrap(),
+            "rendered"
+        );
+        let reason = store
+            .member_reconcile_fault("agent/node.bad", None)
+            .unwrap()
+            .unwrap();
+        assert!(reason.contains("tracked file") && reason.contains("settings.local.json"));
+        assert!(
+            store
+                .member_reconcile_fault("agent/node.good", None)
+                .unwrap()
+                .is_none()
+        );
+        let failed_at = store.index().unwrap();
+        // Removing the bad render also clears its fault, even with no remaining render writes.
+        let fixed = format!(
+            r#"version 2
+agent "bad" {{ workspace {:?}; command "true" }}
+"#,
+            workspace.path().display().to_string()
+        );
+        apply_source(&store, &fixed, "render-recovered");
+        reconciler.reconcile_once().unwrap();
+        assert!(
+            runtime
+                .starts
+                .lock()
+                .unwrap()
+                .contains(&"node.bad".to_owned())
+        );
+        assert!(
+            store
+                .member_reconcile_fault("agent/node.bad", None)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .member_reconcile_fault("agent/node.bad", Some(failed_at))
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn a_failed_start_isolated_from_healthy_members() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        apply_source(
+            &store,
+            r#"version 2
+agent "bad" { workspace "/tmp"; command "true" }
+agent "good" { workspace "/tmp"; command "true" }
+"#,
+            "start-isolation",
+        );
+        let runtime = Arc::new(FakeRuntime::default());
+        runtime
+            .failed_starts
+            .lock()
+            .unwrap()
+            .insert("node.bad".into());
+        let reconciler = Reconciler::new(
+            store.clone(),
+            runtime.clone(),
+            "node".into(),
+            Arc::new(Notify::new()),
+        );
+        reconciler.reconcile_once().unwrap();
+        assert_eq!(
+            runtime.started_members.lock().unwrap()[0].runtime_id,
+            "node.good"
+        );
+        assert!(
+            store
+                .member_reconcile_fault("agent/node.bad", None)
+                .unwrap()
+                .unwrap()
+                .contains("fake runtime rejected")
+        );
+        assert!(
+            store
+                .member_reconcile_fault("agent/node.good", None)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn a_failed_observation_does_not_starve_a_healthy_member() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        apply_source(
+            &store,
+            r#"version 2
+exec "bad" { workspace "/tmp"; command "true" }
+exec "good" { workspace "/tmp"; command "true" }
+"#,
+            "observe-isolation",
+        );
+        let runtime = Arc::new(FakeRuntime::default());
+        runtime
+            .failed_observes
+            .lock()
+            .unwrap()
+            .insert("exec.bad".into());
+        let reconciler = Reconciler::new(
+            store.clone(),
+            runtime.clone(),
+            "node".into(),
+            Arc::new(Notify::new()),
+        );
+        reconciler.reconcile_once().unwrap();
+        assert_eq!(&*runtime.starts.lock().unwrap(), &["exec.good"]);
+        assert!(
+            store
+                .member_reconcile_fault("exec/bad", None)
+                .unwrap()
+                .unwrap()
+                .contains("fake observe failed")
+        );
+    }
+
+    #[test]
+    fn a_failed_stop_does_not_starve_a_healthy_member() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        apply_source(
+            &store,
+            r#"version 2
+agent "bad" { workspace "/tmp"; command "true" }
+"#,
+            "stop-isolation-start",
+        );
+        let runtime = Arc::new(FakeRuntime::default());
+        let reconciler = Reconciler::new(
+            store.clone(),
+            runtime.clone(),
+            "node".into(),
+            Arc::new(Notify::new()),
+        );
+        reconciler.reconcile_once().unwrap();
+        runtime.ptys.lock().unwrap().push(RuntimeObservation {
+            runtime_id: "node.bad".into(),
+            terminal: true,
+            status: "running".into(),
+            exit_code: None,
+            incarnation_id: Some("bad-one".into()),
+        });
+        runtime
+            .failed_stops
+            .lock()
+            .unwrap()
+            .insert("node.bad".into());
+        apply_source(
+            &store,
+            r#"version 2
+stop "agent/node.bad"
+agent "good" { workspace "/tmp"; command "true" }
+"#,
+            "stop-isolation-stop",
+        );
+        reconciler.reconcile_once().unwrap();
+        assert!(
+            runtime
+                .starts
+                .lock()
+                .unwrap()
+                .contains(&"node.good".to_owned())
+        );
+        assert!(
+            store
+                .member_reconcile_fault("agent/node.bad", None)
+                .unwrap()
+                .unwrap()
+                .contains("fake stop failed")
+        );
+    }
+
+    #[test]
+    fn a_superseded_member_stops_even_when_its_render_now_fails() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        let workspace = tempfile::tempdir().unwrap();
+        let first = format!(
+            r#"version 2
+mission "render-retire" state="ready" {{
+ goal "Retire a broken renderer."
+ agent "worker" {{ workspace {:?}; command "true"; render {{ file "output" "ready" }} }}
+ step "wait" {{ goal "Wait for replacement."; gate "hold" {{ field "state" "resource/not-ready" is "ready" }} }}
+}}
+"#,
+            workspace.path().display().to_string()
+        );
+        apply_source(&store, &first, "render-retire-first");
+        let run = store
+            .create_mission_run(&MissionRunRequest {
+                mission: "render-retire".into(),
+                revision: None,
+                workspace: workspace.path().display().to_string(),
+                requester: Some("person/test".into()),
+                mode: None,
+                inputs: BTreeMap::new(),
+                idempotency_key: "render-retire-run".into(),
+            })
+            .unwrap();
+        let runtime = Arc::new(FakeRuntime::default());
+        let reconciler = Reconciler::new(
+            store.clone(),
+            runtime.clone(),
+            "node".into(),
+            Arc::new(Notify::new()),
+        );
+        for _ in 0..3 {
+            reconciler.reconcile_once().unwrap();
+        }
+        let member = store
+            .desired_subjects()
+            .unwrap()
+            .into_iter()
+            .find(|s| s.subject == format!("agent/{}/worker", run.id))
+            .unwrap();
+        let runtime_id = member.member.as_ref().unwrap().runtime_id.clone();
+        runtime.ptys.lock().unwrap().push(RuntimeObservation {
+            runtime_id: runtime_id.clone(),
+            terminal: true,
+            status: "running".into(),
+            exit_code: None,
+            incarnation_id: Some("retired-one".into()),
+        });
+        fs::remove_file(workspace.path().join("output")).unwrap();
+        fs::create_dir(workspace.path().join("output")).unwrap();
+        assert!(crate::render::apply(&store, &member.desired, workspace.path()).is_err());
+        let second = r#"version 2
+mission "render-retire" state="ready" { goal "Retire a broken renderer."; step "wait" { goal "Replacement without the worker." } }
+"#;
+        apply_source(&store, second, "render-retire-second");
+        let intent = parse_intent(second, "node").unwrap();
+        store
+            .adopt_mission_revision(
+                &run.id,
+                intent.missions.values().next().unwrap(),
+                "person/test",
+                "replace broken renderer",
+                "render-retire-adopt",
+            )
+            .unwrap();
+        for _ in 0..3 {
+            reconciler.reconcile_once().unwrap();
+        }
+        assert!(runtime.stops.lock().unwrap().contains(&runtime_id));
+        assert!(workspace.path().join("output").is_dir());
+        assert!(
+            store
+                .member_reconcile_fault(&member.subject, None)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -13799,7 +14190,7 @@ mission "scheduled-cycle" state="ready" {
             .unwrap()
             .subject;
         let diagnostics = store
-            .claims_for(&subject, Some("harness.diagnostic"))
+            .claims_for(&subject, Some("runtime.reconcile-decision"))
             .unwrap();
         assert_eq!(
             diagnostics.len(),
@@ -13809,9 +14200,9 @@ mission "scheduled-cycle" state="ready" {
         assert_eq!(
             diagnostics[0]
                 .body
-                .pointer("/fields/code")
+                .pointer("/fields/decision")
                 .and_then(Value::as_str),
-            Some("workspace-unavailable")
+            Some("member-fault")
         );
         assert!(
             diagnostics[0]

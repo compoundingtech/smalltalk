@@ -18,6 +18,7 @@ struct PlannedWrite {
     destination: PathBuf,
     bytes: Vec<u8>,
     mode: u32,
+    append_lines: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
@@ -179,10 +180,16 @@ fn prepare_render(
                     ));
                     continue;
                 };
-                let mut current = match fs::read_to_string(&destination) {
-                    Ok(value) => value,
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
-                    Err(error) => return Err(error.into()),
+                let mut current = match writes
+                    .iter()
+                    .find(|write: &&PlannedWrite| write.destination == destination)
+                {
+                    Some(write) => String::from_utf8(write.bytes.clone())?,
+                    None => match fs::read_to_string(&destination) {
+                        Ok(value) => value,
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+                        Err(error) => return Err(error.into()),
+                    },
                 };
                 for value in arguments {
                     let line = value.as_str().context("render line is not text")?;
@@ -203,9 +210,12 @@ fn prepare_render(
             ensure_tracked_file_is_unchanged(workspace, &destination, &bytes)?;
         }
         if let Some(existing) = writes
-            .iter()
-            .find(|write: &&PlannedWrite| write.destination == destination)
+            .iter_mut()
+            .find(|write: &&mut PlannedWrite| write.destination == destination)
         {
+            if operation_name == "git-exclude" && existing.append_lines {
+                existing.bytes = bytes.clone();
+            }
             anyhow::ensure!(
                 existing.bytes == bytes && existing.mode == mode,
                 "render operations disagree about {}",
@@ -217,6 +227,7 @@ fn prepare_render(
             destination,
             bytes,
             mode,
+            append_lines: operation_name == "git-exclude",
         });
     }
     Ok((writes, warnings))
@@ -230,7 +241,7 @@ fn git_exclude_destination(workspace: &Path) -> Result<Option<PathBuf>> {
         Err(error) => return Err(error.into()),
     };
     if metadata.is_dir() {
-        return Ok(Some(dot_git.join("info/exclude")));
+        return Ok(Some(fs::canonicalize(&dot_git)?.join("info/exclude")));
     }
     if !metadata.is_file() {
         return Ok(None);
@@ -282,11 +293,13 @@ fn resolve_git_metadata_path(base: &Path, value: &str) -> Result<PathBuf> {
     fs::canonicalize(&path).with_context(|| format!("resolve Git metadata path {}", path.display()))
 }
 
+/// Prepare every member before writing, so conflicting owners cannot win by iteration order.
+/// Preparation and commit failures belong to their member; unrelated members still render.
 pub fn apply_all(
     store: &Store,
     desired: &[&DesiredSubject],
     host: &str,
-) -> Result<BTreeMap<String, RenderResult>> {
+) -> BTreeMap<String, Result<RenderResult>> {
     let host_documents = desired
         .iter()
         .filter(|subject| subject.kind == "host")
@@ -297,131 +310,206 @@ pub fn apply_all(
             )
         })
         .collect::<BTreeMap<_, _>>();
-    let mut owners = BTreeMap::<PathBuf, (String, PlannedWrite)>::new();
+    let mut plans = BTreeMap::new();
     let mut results = BTreeMap::new();
     for subject in desired {
-        let Some(member) = subject.member.as_ref().filter(|member| member.host == host) else {
-            continue;
-        };
-        let native_harness = subject.kind == "agent"
-            && children(&subject.desired)
-                .iter()
-                .any(|child| name(child) == Some("harness"));
-        let render = children(&subject.desired)
-            .iter()
-            .find(|child| name(child) == Some("render"));
-        if render.is_none() && !native_harness {
+        if subject.kind == "stop"
+            || !subject
+                .member
+                .as_ref()
+                .is_some_and(|member| member.host == host)
+        {
             continue;
         }
-        let workspace = Path::new(&member.workspace);
-        if !workspace.exists() && !member.workspace_create {
-            anyhow::bail!("workspace {} does not exist", workspace.display());
-        }
-        let (mut writes, warnings) = match render {
-            Some(render) => prepare_render(store, render, workspace).with_context(|| {
-                format!(
-                    "prepare render for {} in {}",
-                    subject.subject,
-                    workspace.display()
-                )
-            })?,
-            None => (Vec::new(), Vec::new()),
-        };
-        if native_harness {
-            let documents = host_documents
-                .get(&member.host)
-                .cloned()
-                .unwrap_or_default();
-            let mut links = Vec::new();
-            for reference in documents {
-                let (name, hash) = reference
-                    .rsplit_once('@')
-                    .with_context(|| format!("host document `{reference}` has no hash"))?;
-                let bytes = store
-                    .get_document(name, hash)?
-                    .with_context(|| format!("host document `{reference}` is missing"))?;
-                std::str::from_utf8(&bytes)
-                    .with_context(|| format!("host document `{reference}` is not UTF-8 text"))?;
-                let leaf = name.rsplit('/').next().unwrap_or("host");
-                let leaf = leaf
-                    .chars()
-                    .map(|character| {
-                        if character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '-')
-                        {
-                            character
-                        } else {
-                            '-'
-                        }
-                    })
-                    .collect::<String>();
-                let filename = if leaf.contains('.') {
-                    leaf
-                } else {
-                    format!("{leaf}.md")
-                };
-                let relative = format!(".st3/host/{filename}");
-                let destination = destination(workspace, &relative)?;
-                if let Some(existing) = writes.iter().find(|write| write.destination == destination)
-                {
-                    anyhow::ensure!(
-                        existing.bytes == bytes,
-                        "host documents disagree about {}",
-                        destination.display()
-                    );
-                } else {
-                    ensure_tracked_file_is_unchanged(workspace, &destination, &bytes)?;
-                    writes.push(PlannedWrite {
-                        destination,
-                        bytes,
-                        mode: 0o644,
-                    });
-                }
-                links.push((reference, relative));
+        let documents = host_documents
+            .get(host)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        match prepare_member(store, subject, documents)
+            .with_context(|| format!("render for {}", subject.subject))
+        {
+            Ok(plan) => {
+                plans.insert(subject.subject.clone(), plan);
             }
-            let destination = destination(workspace, ".st3/boot.md")?;
-            let mut boot = crate::boot::BOOT_DOCUMENT.to_owned();
-            if !links.is_empty() {
-                boot.push_str("\n## Host documents\n\n");
-                for (reference, path) in links {
-                    boot.push_str(&format!("- `{reference}` is rendered at `{path}`.\n"));
-                }
-            }
-            let bytes = boot.into_bytes();
-            ensure_tracked_file_is_unchanged(workspace, &destination, &bytes)?;
-            writes.push(PlannedWrite {
-                destination,
-                bytes,
-                mode: 0o644,
-            });
-        }
-        let receipts = writes
-            .iter()
-            .map(|write| RenderReceipt {
-                destination: write.destination.to_string_lossy().into_owned(),
-                sha256: hex::encode(sha2::Sha256::digest(&write.bytes)),
-                mode: write.mode,
-            })
-            .collect();
-        results.insert(subject.subject.clone(), RenderResult { warnings, receipts });
-        for write in writes {
-            if let Some((owner, existing)) = owners.get(&write.destination) {
-                anyhow::ensure!(
-                    existing.bytes == write.bytes && existing.mode == write.mode,
-                    "render owners `{owner}` and `{}` disagree about {}",
-                    subject.subject,
-                    write.destination.display()
-                );
-            } else {
-                owners.insert(write.destination.clone(), (subject.subject.clone(), write));
+            Err(error) => {
+                results.insert(subject.subject.clone(), Err(error));
             }
         }
     }
-    let writes = owners
-        .into_values()
-        .map(|(_, write)| write)
-        .collect::<Vec<_>>();
-    commit_transaction(&writes)?;
-    Ok(results)
+    // Linked worktrees share the repository's exclude file. Union only additive
+    // git-exclude operations; ordinary file owners must still agree exactly.
+    let mut excludes = BTreeMap::<PathBuf, Vec<u8>>::new();
+    for (writes, _) in plans.values() {
+        for write in writes.iter().filter(|write| write.append_lines) {
+            let current = excludes
+                .entry(write.destination.clone())
+                .or_insert_with(|| write.bytes.clone());
+            let mut text =
+                String::from_utf8(current.clone()).expect("git-exclude was validated as UTF-8");
+            for line in std::str::from_utf8(&write.bytes)
+                .expect("git-exclude was validated as UTF-8")
+                .lines()
+            {
+                if !text.lines().any(|existing| existing == line) {
+                    if !text.is_empty() && !text.ends_with('\n') {
+                        text.push('\n');
+                    }
+                    text.push_str(line);
+                    text.push('\n');
+                }
+            }
+            *current = text.into_bytes();
+        }
+    }
+    for (writes, _) in plans.values_mut() {
+        for write in writes.iter_mut().filter(|write| write.append_lines) {
+            write.bytes = excludes[&write.destination].clone();
+        }
+    }
+    let mut owners = BTreeMap::<&Path, Vec<(&str, &PlannedWrite)>>::new();
+    for (subject, (writes, _)) in &plans {
+        for write in writes {
+            owners
+                .entry(&write.destination)
+                .or_default()
+                .push((subject, write));
+        }
+    }
+    for (destination, owners) in owners {
+        if owners
+            .iter()
+            .any(|(_, write)| write.bytes != owners[0].1.bytes || write.mode != owners[0].1.mode)
+        {
+            let names = owners
+                .iter()
+                .map(|(name, _)| *name)
+                .collect::<Vec<_>>()
+                .join(", ");
+            for (subject, _) in owners {
+                results.insert(
+                    subject.to_owned(),
+                    Err(anyhow::anyhow!(
+                        "render owners {names} disagree about {}",
+                        destination.display()
+                    )),
+                );
+            }
+        }
+    }
+    for (subject, (writes, warnings)) in plans {
+        if results.contains_key(&subject) {
+            continue;
+        }
+        let result = commit_transaction(&writes)
+            .with_context(|| format!("commit render for {subject}"))
+            .map(|()| RenderResult {
+                warnings,
+                receipts: writes
+                    .into_iter()
+                    .map(|write| RenderReceipt {
+                        destination: write.destination.to_string_lossy().into_owned(),
+                        sha256: hex::encode(sha2::Sha256::digest(&write.bytes)),
+                        mode: write.mode,
+                    })
+                    .collect(),
+            });
+        results.insert(subject, result);
+    }
+    results
+}
+
+fn prepare_member(
+    store: &Store,
+    subject: &DesiredSubject,
+    host_documents: &[String],
+) -> Result<(Vec<PlannedWrite>, Vec<String>)> {
+    let member = subject.member.as_ref().context("render member missing")?;
+    let native_harness = subject.kind == "agent"
+        && children(&subject.desired)
+            .iter()
+            .any(|child| name(child) == Some("harness"));
+    let render = children(&subject.desired)
+        .iter()
+        .find(|child| name(child) == Some("render"));
+    let workspace = Path::new(&member.workspace);
+    if !workspace.exists() && !member.workspace_create {
+        anyhow::bail!("workspace {} does not exist", workspace.display());
+    }
+    let (mut writes, warnings) = match render {
+        Some(render) => prepare_render(store, render, workspace).with_context(|| {
+            format!(
+                "prepare render for {} in {}",
+                subject.subject,
+                workspace.display()
+            )
+        })?,
+        None => (Vec::new(), Vec::new()),
+    };
+    if native_harness {
+        let documents = host_documents.to_vec();
+        let mut links = Vec::new();
+        for reference in documents {
+            let (name, hash) = reference
+                .rsplit_once('@')
+                .with_context(|| format!("host document `{reference}` has no hash"))?;
+            let bytes = store
+                .get_document(name, hash)?
+                .with_context(|| format!("host document `{reference}` is missing"))?;
+            std::str::from_utf8(&bytes)
+                .with_context(|| format!("host document `{reference}` is not UTF-8 text"))?;
+            let leaf = name.rsplit('/').next().unwrap_or("host");
+            let leaf = leaf
+                .chars()
+                .map(|character| {
+                    if character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '-') {
+                        character
+                    } else {
+                        '-'
+                    }
+                })
+                .collect::<String>();
+            let filename = if leaf.contains('.') {
+                leaf
+            } else {
+                format!("{leaf}.md")
+            };
+            let relative = format!(".st3/host/{filename}");
+            let destination = destination(workspace, &relative)?;
+            if let Some(existing) = writes.iter().find(|write| write.destination == destination) {
+                anyhow::ensure!(
+                    existing.bytes == bytes,
+                    "host documents disagree about {}",
+                    destination.display()
+                );
+            } else {
+                ensure_tracked_file_is_unchanged(workspace, &destination, &bytes)?;
+                writes.push(PlannedWrite {
+                    destination,
+                    bytes,
+                    mode: 0o644,
+                    append_lines: false,
+                });
+            }
+            links.push((reference, relative));
+        }
+        let destination = destination(workspace, ".st3/boot.md")?;
+        let mut boot = crate::boot::BOOT_DOCUMENT.to_owned();
+        if !links.is_empty() {
+            boot.push_str("\n## Host documents\n\n");
+            for (reference, path) in links {
+                boot.push_str(&format!("- `{reference}` is rendered at `{path}`.\n"));
+            }
+        }
+        let bytes = boot.into_bytes();
+        ensure_tracked_file_is_unchanged(workspace, &destination, &bytes)?;
+        writes.push(PlannedWrite {
+            destination,
+            bytes,
+            mode: 0o644,
+            append_lines: false,
+        });
+    }
+    Ok((writes, warnings))
 }
 
 fn host_document_refs(desired: &Value) -> Vec<String> {
@@ -716,16 +804,25 @@ mod tests {
 
   agent "one" {{ workspace {:?}; command "true"; render {{ file "shared" "one" }} }}
   agent "two" {{ workspace {:?}; command "true"; render {{ file "shared" "two" }} }}
+  agent "healthy" {{ workspace {:?}; command "true"; render {{ file "independent" "healthy" }} }}
 "#,
+            workspace.path().display().to_string(),
             workspace.path().display().to_string(),
             workspace.path().display().to_string(),
         );
         let intent = crate::graph::parse_test_intent(&source, "node").unwrap();
         let desired = intent.subjects.values().collect::<Vec<_>>();
 
-        let error = apply_all(&store, &desired, "node").unwrap_err();
-        assert!(error.to_string().contains("disagree"));
+        let mut results = apply_all(&store, &desired, "node");
+        let error = results.remove("agent/node.one").unwrap().unwrap_err();
+        assert!(format!("{error:#}").contains("disagree"));
         assert!(!workspace.path().join("shared").exists());
+        assert!(results["agent/node.two"].is_err());
+        assert!(results["agent/node.healthy"].is_ok());
+        assert_eq!(
+            fs::read_to_string(workspace.path().join("independent")).unwrap(),
+            "healthy"
+        );
     }
 
     #[test]
@@ -744,9 +841,13 @@ mod tests {
         let intent = crate::graph::parse_test_intent(&source, "node").unwrap();
         let desired = intent.subjects.values().collect::<Vec<_>>();
 
-        let result = apply_all(&store, &desired, "node").unwrap();
+        let result = apply_all(&store, &desired, "node");
         assert_eq!(result.len(), 2);
-        assert!(result.values().all(|value| value.receipts.len() == 1));
+        assert!(
+            result
+                .values()
+                .all(|value| value.as_ref().unwrap().receipts.len() == 1)
+        );
         assert_eq!(
             fs::read_to_string(workspace.path().join(".st3/boot.md")).unwrap(),
             crate::boot::BOOT_DOCUMENT
@@ -780,7 +881,7 @@ mod tests {
         let intent = crate::graph::parse_test_intent(&source, "node").unwrap();
         let desired = intent.subjects.values().collect::<Vec<_>>();
 
-        apply_all(&store, &desired, "node").unwrap();
+        apply_all(&store, &desired, "node");
         assert_eq!(
             fs::read_to_string(workspace.path().join(".st3/host/node.md")).unwrap(),
             "Host facts.\n"
@@ -809,7 +910,10 @@ host "node" {{
         let desired = intent.subjects.values().collect::<Vec<_>>();
         assert!(
             apply_all(&store, &desired, "node")
+                .remove("agent/node.one")
+                .unwrap()
                 .unwrap_err()
+                .root_cause()
                 .to_string()
                 .contains("is missing")
         );
@@ -840,7 +944,10 @@ host "node" {{
         let desired = intent.subjects.values().collect::<Vec<_>>();
         assert!(
             apply_all(&store, &desired, "node")
+                .remove("agent/node.one")
+                .unwrap()
                 .unwrap_err()
+                .root_cause()
                 .to_string()
                 .contains("disagree")
         );
@@ -857,8 +964,12 @@ host "node" {{
         let intent = crate::graph::parse_test_intent(&source, "node").unwrap();
         let desired = intent.subjects.values().collect::<Vec<_>>();
 
-        let result = apply_all(&store, &desired, "node").unwrap();
-        assert!(result.is_empty());
+        let result = apply_all(&store, &desired, "node");
+        assert!(
+            result
+                .values()
+                .all(|value| value.as_ref().unwrap().receipts.is_empty())
+        );
         assert!(!workspace.path().join(".st3/boot.md").exists());
     }
 
@@ -885,8 +996,9 @@ host "node" {{
         let intent = crate::graph::parse_test_intent(&source, "node").unwrap();
         let desired = intent.subjects.values().collect::<Vec<_>>();
 
-        let error = apply_all(&store, &desired, "node").unwrap_err();
-        assert!(error.to_string().contains("tracked file"));
+        let mut results = apply_all(&store, &desired, "node");
+        let error = results.remove("agent/node.one").unwrap().unwrap_err();
+        assert!(format!("{error:#}").contains("tracked file"));
         assert_eq!(
             fs::read_to_string(workspace.path().join(".st3/boot.md")).unwrap(),
             "repository policy\n"
@@ -916,7 +1028,7 @@ host "node" {{
         });
 
         let error = apply(&store, &desired, workspace.path()).unwrap_err();
-        assert!(error.to_string().contains("tracked file"));
+        assert!(format!("{error:#}").contains("tracked file"));
         assert_eq!(
             fs::read_to_string(workspace.path().join("tracked")).unwrap(),
             "original\n"
@@ -935,15 +1047,34 @@ host "node" {{
         let desired = serde_json::json!({
             "children": [{
                 "name": "render",
-                "children": [{ "name": "git-exclude", "arguments": [".st3/"] }]
+                "children": [
+                    { "name": "git-exclude", "arguments": [".st3/"] },
+                    { "name": "git-exclude", "arguments": [".claude/"] }
+                ]
             }]
         });
 
-        apply(&store, &desired, workspace.path()).unwrap();
-        apply(&store, &desired, workspace.path()).unwrap();
+        assert_eq!(
+            apply(&store, &desired, workspace.path())
+                .unwrap()
+                .receipts
+                .len(),
+            1
+        );
+        assert_eq!(
+            apply(&store, &desired, workspace.path())
+                .unwrap()
+                .receipts
+                .len(),
+            1
+        );
 
         let exclude = fs::read_to_string(workspace.path().join(".git/info/exclude")).unwrap();
         assert_eq!(exclude.lines().filter(|line| *line == ".st3/").count(), 1);
+        assert_eq!(
+            exclude.lines().filter(|line| *line == ".claude/").count(),
+            1
+        );
     }
 
     #[test]
@@ -987,6 +1118,76 @@ host "node" {{
     }
 
     #[test]
+    fn two_worktrees_merge_their_shared_excludes() {
+        let store = Store::open_memory("node").unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let common = root.path().join("repo/.git");
+        fs::create_dir_all(common.join("info")).unwrap();
+        fs::write(common.join("info/exclude"), "existing\n").unwrap();
+        for seat in ["one", "two"] {
+            let workspace = root.path().join(seat);
+            let git_dir = common.join("worktrees").join(seat);
+            fs::create_dir_all(&workspace).unwrap();
+            fs::create_dir_all(&git_dir).unwrap();
+            fs::write(
+                workspace.join(".git"),
+                format!("gitdir: {}\n", git_dir.display()),
+            )
+            .unwrap();
+            fs::write(git_dir.join("commondir"), "../..\n").unwrap();
+        }
+        let source = format!(
+            r#"version 2
+agent "one" {{ workspace {:?}; command "true"; render {{ git-exclude ".one/" }} }}
+agent "two" {{ workspace {:?}; command "true"; render {{ git-exclude ".two/" }} }}
+"#,
+            root.path().join("one").display().to_string(),
+            root.path().join("two").display().to_string()
+        );
+        let intent = crate::graph::parse_test_intent(&source, "node").unwrap();
+        let desired = intent.subjects.values().collect::<Vec<_>>();
+        for _ in 0..2 {
+            let result = apply_all(&store, &desired, "node");
+            let one = result["agent/node.one"].as_ref().unwrap();
+            let two = result["agent/node.two"].as_ref().unwrap();
+            assert_eq!(one.receipts, two.receipts);
+            assert_eq!(one.receipts.len(), 1);
+            assert_eq!(
+                fs::read_to_string(common.join("info/exclude")).unwrap(),
+                "existing\n.one/\n.two/\n"
+            );
+        }
+    }
+
+    #[test]
+    fn a_commit_failure_does_not_undo_another_members_render() {
+        let store = Store::open_memory("node").unwrap();
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir(root.path().join("directory")).unwrap();
+        let source = format!(
+            r#"version 2
+agent "z-bad" {{ workspace {:?}; command "true"; render {{ file "directory" "bad" }} }}
+agent "good" {{ workspace {:?}; command "true"; render {{ file "healthy" "good" }} }}
+"#,
+            root.path().display().to_string(),
+            root.path().display().to_string()
+        );
+        let intent = crate::graph::parse_test_intent(&source, "node").unwrap();
+        let result = apply_all(
+            &store,
+            &intent.subjects.values().collect::<Vec<_>>(),
+            "node",
+        );
+        assert!(result["agent/node.z-bad"].is_err());
+        assert!(result["agent/node.good"].is_ok());
+        assert_eq!(
+            fs::read_to_string(root.path().join("healthy")).unwrap(),
+            "good"
+        );
+        assert!(root.path().join("directory").is_dir());
+    }
+
+    #[test]
     fn git_exclude_warns_for_a_malformed_git_directory_pointer() {
         let store = Store::open_memory("node").unwrap();
         let workspace = tempfile::tempdir().unwrap();
@@ -1021,7 +1222,7 @@ host "node" {{
         });
 
         let error = apply(&store, &desired, workspace.path()).unwrap_err();
-        assert!(error.to_string().contains("crosses symbolic link"));
+        assert!(format!("{error:#}").contains("crosses symbolic link"));
         assert!(!outside.path().join("file").exists());
     }
 

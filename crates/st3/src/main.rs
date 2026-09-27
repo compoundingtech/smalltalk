@@ -5232,6 +5232,9 @@ fn render_client_agent(agent: &st3_client::Agent) -> String {
         agent.driver.as_deref().unwrap_or("none"),
         agent.harness_state.as_deref().unwrap_or("unobserved")
     );
+    if let Some(fault) = &agent.fault {
+        let _ = writeln!(output, "FAULT        {fault}");
+    }
     if let Some(incarnation) = &agent.incarnation_id {
         let _ = writeln!(output, "INCARNATION  {incarnation}");
     }
@@ -9282,6 +9285,22 @@ mod tests {
                 "the pi-family session ritual mentions `{st2_vocabulary}`"
             );
         }
+    }
+
+    #[test]
+    fn agent_card_shows_the_member_reconcile_fault() {
+        let agent: st3_client::Agent = serde_json::from_value(serde_json::json!({
+            "kind": "agent", "id": "agent/bad", "revision": "one",
+            "updated_at": "2026-09-27T20:04:00Z", "name": "Bad",
+            "state": "failed", "reachability": "local", "runtime_ids": [],
+            "fault": "render refuses to change tracked file .claude/settings.local.json"
+        }))
+        .unwrap();
+        let card = render_client_agent(&agent);
+        assert!(card.contains("STATE        failed"));
+        assert!(card.contains(
+            "FAULT        render refuses to change tracked file .claude/settings.local.json"
+        ));
     }
 
     #[test]
