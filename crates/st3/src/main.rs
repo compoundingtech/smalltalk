@@ -9123,6 +9123,29 @@ mod tests {
     }
 
     #[test]
+    fn work_detail_labels_a_reason_blocked_only_for_blocked_work() {
+        let page = fixture_product_page(&["work"], false);
+        let ClientResource::Work(work) = &page.items[0] else {
+            panic!("expected work fixture");
+        };
+        let mut work = work.clone();
+        work.blocked_reason = Some("the step's lease expired".into());
+        work.state = "claimed".into();
+        let claimed = render_client_work_detail(&work);
+        assert!(!claimed.contains("Blocked:"), "{claimed}");
+        assert!(
+            claimed.contains("\nReason: the step's lease expired\n"),
+            "{claimed}"
+        );
+        work.state = "blocked".into();
+        let blocked = render_client_work_detail(&work);
+        assert!(
+            blocked.contains("\nBlocked: the step's lease expired\n"),
+            "{blocked}"
+        );
+    }
+
+    #[test]
     fn document_continuation_preserves_prefix_and_history() {
         assert_eq!(
             document_continuation_command(Some("doc/type case"), true, 1, "document/abc"),
@@ -9152,29 +9175,6 @@ mod tests {
                 "operation/transport-host-b  operation  warning  degraded  Peer is retrying\n",
                 "  recovery: st3 doctor\n",
             )
-        );
-    }
-
-    #[test]
-    fn work_detail_labels_a_reason_blocked_only_for_blocked_work() {
-        let page = fixture_product_page(&["work"], false);
-        let ClientResource::Work(work) = &page.items[0] else {
-            panic!("expected work fixture");
-        };
-        let mut work = work.clone();
-        work.blocked_reason = Some("the step's lease expired".into());
-        work.state = "claimed".into();
-        let claimed = render_client_work_detail(&work);
-        assert!(!claimed.contains("Blocked:"), "{claimed}");
-        assert!(
-            claimed.contains("\nReason: the step's lease expired\n"),
-            "{claimed}"
-        );
-        work.state = "blocked".into();
-        let blocked = render_client_work_detail(&work);
-        assert!(
-            blocked.contains("\nBlocked: the step's lease expired\n"),
-            "{blocked}"
         );
     }
 
