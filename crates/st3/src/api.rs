@@ -10651,6 +10651,39 @@ mission "agent-health" state="ready" {
         assert_eq!(resources[0]["operational"]["layer"], "current");
     }
 
+    #[test]
+    fn an_agent_known_only_from_its_own_harness_observations_is_history() {
+        let root = tempfile::tempdir().unwrap();
+        let store = state(root.path()).store;
+        let subject = "agent/diagnostic-run/sig.base";
+        store
+            .append_claim(&ClaimInput {
+                subject: subject.into(),
+                kind: "harness.observed".into(),
+                actor: Some(subject.into()),
+                fields: BTreeMap::from([
+                    ("state".into(), Value::String("idle".into())),
+                    ("driver".into(), Value::String("codex".into())),
+                    ("incarnation_id".into(), Value::String("sig-1".into())),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some("sig-base-observed".into()),
+            })
+            .unwrap();
+        let current =
+            client_agent_resources(&store, false, "snapshot", store.index().unwrap()).unwrap();
+        assert!(
+            current.iter().all(|agent| agent["id"] != subject),
+            "{current:?}"
+        );
+        let history =
+            client_agent_resources(&store, true, "snapshot", store.index().unwrap()).unwrap();
+        let agent = history.iter().find(|agent| agent["id"] == subject).unwrap();
+        assert_eq!(agent["operational"]["layer"], "history");
+        assert_eq!(agent["operational"]["reasons"], json!(["undeclared"]));
+    }
+
     #[tokio::test]
     async fn a_mission_revision_requires_current_agent_authority() {
         let root = tempfile::tempdir().unwrap();
