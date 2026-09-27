@@ -29,13 +29,13 @@ immutable.
 
 The required implementation worktree was clean at inspection, on
 `agent/st3-clean-operational-state`, with `fb94602` at `HEAD`. The source worktree
-The st3 working tree was not changed. The four required commits
+The st working tree was not changed. The four required commits
 exist in order and are reused, not rewritten:
 
 ```
-f28da55 docs(st3): define client v0 contract
-9c2e7a2 docs(st3): define operational state layers
-5b6e78c fix(st3): fence terminal work ownership
+f28da55 docs(st): define client v0 contract
+9c2e7a2 docs(st): define operational state layers
+5b6e78c fix(st): fence terminal work ownership
 fb94602 Expose truthful operational projections
 ```
 
@@ -228,7 +228,7 @@ variants.
 Resolution: automatic and manual work wake now create incarnation-bound durable messages consumed
 by the maintained native drivers. A working-turn observation or work claim acknowledges delivery;
 the reconciler schedules bounded retries and publishes `work-wake-exhausted` after the third
-unacknowledged attempt. The legacy st3 DING driver and terminal-line injection path were removed.
+unacknowledged attempt. The legacy st DING driver and terminal-line injection path were removed.
 
 ## Preserved validation
 

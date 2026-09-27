@@ -1,18 +1,18 @@
-# st3-next: seat queues and omp readiness on st3
+# st3-next: seat queues and omp readiness on st
 
 `agent/st3-next` is what `st3` becomes if it takes both `agent/seat-queue` and `agent/omp-ready`.
 It starts at `st3` `9b3c0a3` and merges `agent/seat-queue` at `5fa3487` and `agent/omp-ready` at
-`b6d172e`, the final heads of both branches. The merged code passes the st3 test suites, adds no
+`b6d172e`, the final heads of both branches. The merged code passes the st test suites, adds no
 new lint, and passed the seat queue eval twice and the omp versions of cross-harness message wake
 and work wake reliability once each.
 
 Fast-forward `st3` to `agent/st3-next` to take both branches. The seat queue branch's own verdict
 is "not yet" because of an idle wakeup cost that
-[Choosing what st3 takes](#choosing-what-st3-takes) weighs; the recommendation is to take both and
+[Choosing what st takes](#choosing-what-st-takes) weighs; the recommendation is to take both and
 fix that cost on `st3`. [Fast-forward steps](#fast-forward-steps) has the exact commands for both
 choices. Nothing is deployed by the fast-forward.
 
-## Choosing what st3 takes
+## Choosing what st takes
 
 The seat queue branch ran a 9-hour side-by-side idle run of base and branch overnight. It found no
 correctness problem. After about an hour the branch daemon woke about 70 more times a second than
@@ -44,12 +44,12 @@ The other commits add only this document and eval reports, so the head's code eq
 
 - **Seat queues** (`agent/seat-queue`) give each agent seat one ordered queue of mission runs. A
   person, or an agent with `queue-authority` for the seat, can move a run with
-  `st3 agents queue move`. `work claim` refuses a later run's step while an earlier run has ready
+  `st agents queue move`. `work claim` refuses a later run's step while an earlier run has ready
   work for the seat. [Agent seat queues](seat-queue.md) explains the model and its tests.
 - **omp readiness** (`agent/omp-ready`) fixes the omp failures that live evals exposed. A harness
   process can no longer act as another agent. A wake delivered into a working turn counts as
   acknowledged. A parent submitted before its nested step no longer stalls that step. An idle worker
-  learns which declared product its step waits for. [Running st3 with omp](omp.md) covers setup and
+  learns which declared product its step waits for. [Running st with omp](omp.md) covers setup and
   the model choice.
 
 No `Cargo.toml` or `Cargo.lock` changed, so the Nix vendoring hash is unaffected.
@@ -57,7 +57,7 @@ No `Cargo.toml` or `Cargo.lock` changed, so the Nix vendoring hash is unaffected
 ## Merge resolution
 
 `agent/seat-queue` moved the seat's next-work choice out of the reconciler into
-`seat_queue::select`. The reconciler wake, `st3 agents show`, the queue view, and the `work claim`
+`seat_queue::select`. The reconciler wake, `st agents show`, the queue view, and the `work claim`
 order check all use that one selector. `agent/omp-ready` changed the reconciler's old inline copy
 of the same choice:
 
@@ -79,7 +79,7 @@ lease, so the seat can claim the earlier run's step. `2a96d51` pins this with
 ## Checks
 
 All commands ran on `2549baa`, the final merge, in a scrubbed environment: `env -i`, a scratch
-`HOME`, and no live st3 endpoint, PTY registry, or hooks. The same checks on `a058499` and
+`HOME`, and no live st endpoint, PTY registry, or hooks. The same checks on `a058499` and
 `2a96d51` gave the same results.
 
 | Check | Result |
@@ -109,7 +109,7 @@ The Nix flake checks did not run locally. They run in CI on the draft pull reque
 
 ## Evals
 
-Each run used its own isolated st3 daemon, state directory, and copies of the `st3` and `st2`
+Each run used its own isolated st daemon, state directory, and copies of the `st3` and `st2`
 binaries built from the commit in the table. The eval files came from the same commit. Every judge
 is mechanical.
 
