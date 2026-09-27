@@ -80,4 +80,3 @@ disposable run workspace that no agent edits, so it can read the file directly.
 
 A graph predicate gate such as `field`, `every`, or `exists` has no command. It stays pending
 while it is false and passes once the graph makes it true; it never fails on its own.
-
