@@ -12189,27 +12189,40 @@ fn current_harness_at(
         return Ok(None);
     };
 
-    // A login prompt is positive evidence that the current Claude incarnation cannot accept
-    // work. It has no hook edge, and channel initialization or work activity can otherwise
-    // overwrite a one-off blocked observation. Fence the entire incarnation instead.
-    let auth_rejection = connection
+    // A login prompt or a workspace trust prompt is positive evidence that the current Claude
+    // incarnation cannot accept work. Neither has a hook edge, and channel initialization or work
+    // activity can otherwise overwrite a one-off blocked observation. Fence the entire incarnation
+    // instead.
+    let prompt_rejection = connection
         .query_row(
-            "SELECT id, accepted_at_unix_ms FROM claims
+            "SELECT id, accepted_at_unix_ms, json_extract(body, '$.fields.code') FROM claims
              WHERE subject=?1 AND kind='harness.diagnostic' AND store_index<=?2
-               AND json_extract(body, '$.fields.code')='provider-auth-expired'
+               AND json_extract(body, '$.fields.code')
+                   IN ('provider-auth-expired', 'provider-trust-prompt')
                AND json_extract(body, '$.fields.incarnation_id')=?3
              ORDER BY store_index DESC LIMIT 1",
             params![subject, at_index, incarnation_id],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
         )
         .optional()?;
-    if let Some((claim, observed_at_unix_ms)) = auth_rejection {
+    if let Some((claim, observed_at_unix_ms, code)) = prompt_rejection {
+        let (state, reason) = if code == "provider-trust-prompt" {
+            ("blocked", "providerTrustPrompt")
+        } else {
+            ("unauthenticated", "providerAuth")
+        };
         return Ok(Some(crate::model::CurrentHarnessView {
-            state: "unauthenticated".into(),
+            state: state.into(),
             driver: Some("claude".into()),
             incarnation_id: incarnation_id.to_owned(),
             transport: Some("claude-channel".into()),
-            reason: Some("providerAuth".into()),
+            reason: Some(reason.into()),
             blocked_on: Some("human".into()),
             ask: None,
             input_buffer: None,
@@ -27465,6 +27478,58 @@ message "human-attention" {
                 ("incarnation_id".into(), Value::String("second".into())),
             ]),
         );
+        assert!(store.current_harness(subject).unwrap().unwrap().is_ready());
+    }
+
+    #[test]
+    fn a_claude_trust_prompt_fences_its_incarnation_as_not_ready_with_the_reason() {
+        let store = Store::open_memory("node").unwrap();
+        let subject = "agent/node.claude";
+        let append = |kind: &str, actor: Option<&str>, fields: BTreeMap<String, Value>| {
+            store
+                .append_claim(&ClaimInput {
+                    subject: subject.into(),
+                    kind: kind.into(),
+                    actor: actor.map(str::to_owned),
+                    fields,
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: None,
+                })
+                .unwrap();
+        };
+        let running = |incarnation: &str| {
+            BTreeMap::from([
+                ("status".into(), Value::String("running".into())),
+                ("runtime_id".into(), Value::String("node.claude".into())),
+                ("incarnation_id".into(), Value::String(incarnation.into())),
+            ])
+        };
+        let ready = |incarnation: &str| {
+            BTreeMap::from([
+                ("state".into(), Value::String("ready".into())),
+                ("incarnation_id".into(), Value::String(incarnation.into())),
+            ])
+        };
+        append("runtime.observed", None, running("first"));
+        append(
+            "harness.diagnostic",
+            Some(subject),
+            BTreeMap::from([
+                ("status".into(), Value::String("blocked".into())),
+                ("code".into(), Value::String("provider-trust-prompt".into())),
+                ("incarnation_id".into(), Value::String("first".into())),
+            ]),
+        );
+        // A channel that initializes behind the prompt must not make the seat look ready.
+        append("harness.observed", Some(subject), ready("first"));
+        let blocked = store.current_harness(subject).unwrap().unwrap();
+        assert_eq!(blocked.state, "blocked");
+        assert_eq!(blocked.reason.as_deref(), Some("providerTrustPrompt"));
+        assert!(!blocked.is_ready());
+
+        append("runtime.observed", None, running("second"));
+        append("harness.observed", Some(subject), ready("second"));
         assert!(store.current_harness(subject).unwrap().unwrap().is_ready());
     }
 }
