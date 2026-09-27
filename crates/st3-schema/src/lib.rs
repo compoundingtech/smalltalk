@@ -1590,6 +1590,15 @@ fn claim_specs() -> BTreeMap<String, ClaimSpec> {
             &["subscription"],
         ),
         (
+            "subscription.mission-failed",
+            &["subscription"],
+            WritePolicy::SystemOnly,
+            Cardinality::Append,
+            Some("subscriptions"),
+            true,
+            &["subscription"],
+        ),
+        (
             "transport.observed",
             &["host"],
             WritePolicy::SystemOnly,
@@ -2275,6 +2284,11 @@ fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
             ("request", required_string()),
             ("mission_run", required_reference_to(&["mission-run"])),
         ],
+        "subscription.mission-failed" => &[
+            ("request", required_string()),
+            ("code", required_string()),
+            ("reason", required_string()),
+        ],
         "resource.observed" => &[
             ("kind", string()),
             ("state", any()),
@@ -2589,6 +2603,7 @@ mod tests {
                 "step-run.carried",
                 "step-run.retried",
                 "step-run.state",
+                "subscription.mission-failed",
                 "subscription.mission-requested",
                 "subscription.mission-started",
                 "subscription.state",

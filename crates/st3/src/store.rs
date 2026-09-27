@@ -7109,6 +7109,62 @@ impl Store {
                 }
             }
         }
+        {
+            let connection = self.readers.get();
+            let mut statement = connection.prepare(
+                "SELECT id, store_index, batch_id, subject, kind, origin, actor, body,
+                        predecessors, accepted_at_unix_ms
+                 FROM claims WHERE kind='subscription.mission-failed' ORDER BY store_index",
+            )?;
+            let failures = statement
+                .query_map([], claim_from_row)?
+                .collect::<Result<Vec<_>, _>>()?;
+            for failure in failures {
+                let fields = failure.body.get("fields").unwrap_or(&failure.body);
+                let request = fields
+                    .get("request")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let requester: Option<String> = connection
+                    .query_row(
+                        "SELECT json_extract(body, '$.fields.requester') FROM claims WHERE id=?1",
+                        [request],
+                        |row| row.get(0),
+                    )
+                    .optional()?
+                    .flatten();
+                let reviewer = requester
+                    .filter(|value| value.starts_with("person/"))
+                    .unwrap_or_default();
+                if person.is_some_and(|person| person != reviewer) {
+                    continue;
+                }
+                let code = fields
+                    .get("code")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let reason = fields
+                    .get("reason")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                items.push(AttentionItemView {
+                    kind: "fault".into(),
+                    subject: failure.id,
+                    person: reviewer,
+                    title: "Subscription mission failed".into(),
+                    detail: format!("{code}: {reason}"),
+                    mission: None,
+                    mission_run: None,
+                    step: None,
+                    targets: vec![failure.subject.clone()],
+                    requested_at_unix_ms: failure.accepted_at_unix_ms,
+                    actions: vec![attention_action(
+                        "inspect subscription",
+                        &["st3", "subject", &failure.subject],
+                    )],
+                });
+            }
+        }
         items.sort_by(|left, right| {
             left.requested_at_unix_ms
                 .cmp(&right.requested_at_unix_ms)

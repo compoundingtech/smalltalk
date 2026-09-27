@@ -3,7 +3,7 @@
 This file is generated from `st3-schema`.
 
 Schema: `st3.v1`
-Digest: `07a9374d50b81abb57551eba2e648a46867e8eec25806aa2dc7b8aee8f7c7431`
+Digest: `ee67b2e180f6e13893e40d97f2110033818fd79e6febb41cf3d19a7e3c73c525`
 
 ## Subject families
 
@@ -127,6 +127,7 @@ Custom subjects use `custom/NAMESPACE/NAME`. Custom claims use `custom.NAMESPACE
 | `step-run.carried` | `step-run` | `system-only` | `once` | `attempt:integer`, `definition_hash:string`, `source:subject-reference`, `source_generation:subject-reference`, `source_step_run:subject-reference`, `status:string`, `worker_reported:boolean` | `step` |
 | `step-run.retried` | `step-run` | `system-only` | `append` | `attempt:integer`, `not_before_unix_ms:integer`, `reason:string`, `status:string` | `step` |
 | `step-run.state` | `step-run` | `system-only` | `state-transition` | `attempt:integer`, `readiness_epoch:integer`, `reason:string`, `status:string` | `step` |
+| `subscription.mission-failed` | `subscription` | `system-only` | `append` | `code!:string`, `reason!:string`, `request!:string` | `subscription` |
 | `subscription.mission-requested` | `subscription` | `system-only` | `append` | `discovery!:string`, `mission!:subject-reference(mission)`, `mission_revision!:string`, `requester:subject-reference(agent|person)`, `resource!:subject-reference(resource)`, `resource_input!:string`, `workspace!:string` | `subscription` |
 | `subscription.mission-started` | `subscription` | `system-only` | `append` | `mission_run!:subject-reference(mission-run)`, `request!:string` | `subscription` |
 | `subscription.state` | `subscription` | `system-only` | `state-transition` | `fields:array`, `observer:subject-reference`, `reason:string`, `state!:string`, `to:subject-reference` | `subscription` |

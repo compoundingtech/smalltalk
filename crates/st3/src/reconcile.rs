@@ -6326,8 +6326,11 @@ impl<R: RuntimeControl> Reconciler<R> {
             let starts = self
                 .store
                 .claims_for(&item.subject, Some("subscription.mission-started"))?;
+            let failures = self
+                .store
+                .claims_for(&item.subject, Some("subscription.mission-failed"))?;
             for request in requests {
-                if starts.iter().any(|claim| {
+                if starts.iter().chain(&failures).any(|claim| {
                     claim
                         .body
                         .pointer("/fields/request")
@@ -6389,7 +6392,25 @@ impl<R: RuntimeControl> Reconciler<R> {
                 let run = match created {
                     Ok(run) => run,
                     Err(error) if error.code == "mission-run-capacity" => continue,
-                    Err(error) => return Err(anyhow::anyhow!(error.to_string())),
+                    Err(error) => {
+                        self.store.append_claim(&ClaimInput {
+                            subject: item.subject.clone(),
+                            kind: "subscription.mission-failed".into(),
+                            actor: None,
+                            fields: BTreeMap::from([
+                                ("request".into(), Value::String(request.id.clone())),
+                                ("code".into(), Value::String(error.code.into())),
+                                ("reason".into(), Value::String(error.to_string())),
+                            ]),
+                            evidence: vec![request.id.clone()],
+                            expected_subject: None,
+                            idempotency_key: Some(format!(
+                                "subscription-mission-failed:{}",
+                                request.id
+                            )),
+                        })?;
+                        continue;
+                    }
                 };
                 self.store.append_claim(&ClaimInput {
                     subject: item.subject.clone(),
@@ -13970,6 +13991,128 @@ observer "one" {
         tokio::time::sleep(Duration::from_millis(10)).await;
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         release.notify_waiters();
+    }
+
+    #[test]
+    fn an_invalid_subscription_request_is_recorded_and_does_not_block_reconciliation() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        apply_source(
+            &store,
+            r#"version 2
+mission "review" state="ready" {
+  input "source" kind="resource"
+  completion { when "all-steps-exhausted" }
+  goal "Review a discovered item."
+  step "review" { agentless }
+}"#,
+            "subscription-request-mission",
+        );
+        let revision = store
+            .mission_spec("review", None)
+            .unwrap()
+            .unwrap()
+            .revision;
+        apply_source(
+            &store,
+            &format!(
+                r#"version 2
+resource "repo" {{ kind "vcs.repository" }}
+observer "repo" {{
+  resource "resource/repo"
+  provider "github.repository"
+  locator "example/repo"
+  field "issues"
+}}
+subscription "reviews" {{
+  observer "observer/repo"
+  on "issues"
+  delivery "mission" {{
+    mission "review@{revision}"
+    resource "source"
+    workspace "/tmp/st3-review"
+  }}
+}}"#
+            ),
+            "subscription-request-failure",
+        );
+        let discovery = store
+            .append_claim(&ClaimInput {
+                subject: "resource/repo".into(),
+                kind: "resource.observed".into(),
+                actor: None,
+                fields: BTreeMap::from([("kind".into(), Value::String("vcs.repository".into()))]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+        let bad = store
+            .append_claim(&ClaimInput {
+                subject: "subscription/reviews".into(),
+                kind: "subscription.mission-requested".into(),
+                actor: None,
+                fields: BTreeMap::from([
+                    ("mission".into(), Value::String("mission/review".into())),
+                    ("mission_revision".into(), Value::String(revision.clone())),
+                    ("resource".into(), Value::String("resource/repo".into())),
+                    ("resource_input".into(), Value::String("item".into())),
+                    ("workspace".into(), Value::String("/tmp/st3-review".into())),
+                    ("discovery".into(), Value::String(discovery.id.clone())),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+        let good = store
+            .append_claim(&ClaimInput {
+                subject: "subscription/reviews".into(),
+                kind: "subscription.mission-requested".into(),
+                actor: None,
+                fields: BTreeMap::from([
+                    ("mission".into(), Value::String("mission/review".into())),
+                    ("mission_revision".into(), Value::String(revision)),
+                    ("resource".into(), Value::String("resource/repo".into())),
+                    ("resource_input".into(), Value::String("source".into())),
+                    ("workspace".into(), Value::String("/tmp/st3-review".into())),
+                    ("discovery".into(), Value::String(discovery.id)),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+        let reconciler = Reconciler::new(
+            store.clone(),
+            Arc::new(FakeRuntime::default()),
+            "node".into(),
+            Arc::new(Notify::new()),
+        );
+        let desired = store.desired_subjects().unwrap();
+        reconciler
+            .reconcile_subscription_missions(&desired)
+            .unwrap();
+        reconciler
+            .reconcile_subscription_missions(&desired)
+            .unwrap();
+        let failures = store
+            .claims_for("subscription/reviews", Some("subscription.mission-failed"))
+            .unwrap();
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].body["fields"]["request"], bad.id);
+        assert_eq!(failures[0].body["fields"]["code"], "invalid-mission-inputs");
+        let starts = store
+            .claims_for("subscription/reviews", Some("subscription.mission-started"))
+            .unwrap();
+        assert_eq!(starts.len(), 1);
+        assert_eq!(starts[0].body["fields"]["request"], good.id);
+        assert!(
+            store
+                .attention_items(None)
+                .unwrap()
+                .iter()
+                .any(|item| { item.kind == "fault" && item.targets == ["subscription/reviews"] })
+        );
     }
 
     #[test]
