@@ -1,4 +1,4 @@
-# st3 constructed spawn environment design
+# st constructed spawn environment design
 
 This document records a design. It does not change runtime behavior.
 
@@ -125,7 +125,7 @@ It should expose a typed `SpawnEnvironment` with the final map and per-name prov
 
 The builder validates names, rejects NUL bytes, resolves expansion, and protects runtime-owned names.
 
-st2 and st3 must use the same builder and the same PTY protocol.
+st2 and st must use the same builder and the same PTY protocol.
 
 ### Exec members
 
@@ -149,7 +149,7 @@ The PTY metadata must retain replace mode. A later `pty restart` must not inheri
 
 Repeated `--unset-env` options cannot provide this guarantee. A later caller can introduce a previously unseen name.
 
-The st2 PTY adapter and the st3 PTY runtime must both require replace mode.
+The st2 PTY adapter and the st PTY runtime must both require replace mode.
 
 ## PTY capability proof
 
@@ -214,9 +214,9 @@ Each launch receipt records these facts:
 
 Receipts never record secret values. The digest key stays in owner-only local state.
 
-`st3 subject show` should show names, sources, redacted value classes, the profile revision, and the digest.
+`st subject show` should show names, sources, redacted value classes, the profile revision, and the digest.
 
-`st3 doctor environment` should run disposable exec and PTY poison probes.
+`st doctor environment` should run disposable exec and PTY poison probes.
 
 The doctor report must show expected, observed, missing, and unexpected name counts.
 
@@ -236,7 +236,7 @@ The implementation is complete only when these tests pass:
 6. An unknown expansion variable fails before launch.
 7. Runtime-owned values replace conflicting authored values.
 8. Credential sockets stay absent unless declared.
-9. st2 and st3 produce the same final map from the same inputs.
+9. st2 and st produce the same final map from the same inputs.
 10. An adopted old member remains running and reports unknown convergence.
 11. The doctor detects a PTY binary that ignores replace mode.
 12. A real Codex launch and a real Claude launch save normal transcripts without inherited provider markers.
@@ -247,7 +247,7 @@ Every absence test prints the examined environment-name count. An empty observat
 
 1. Add and prove PTY replace mode.
 2. Add `SpawnEnvironment` and the behavioral probe to `st-runtime`.
-3. Move st3 execution and terminal launches to the shared contract.
+3. Move st execution and terminal launches to the shared contract.
 4. Move st2 exec and PTY launches to the same contract.
 5. Add receipts, inspection, and doctor checks.
 6. Migrate host profiles and explicit declaration dependencies.
@@ -261,6 +261,6 @@ The implementation needs three product decisions before code starts:
 
 1. The durable KDL surface and storage location for a selected host profile.
 2. Whether an explicit socket binding is sufficient for credentials before typed secret bindings exist.
-3. Whether foreground `st3 up` refuses a missing profile or uses a small built-in platform profile.
+3. Whether foreground `st up` refuses a missing profile or uses a small built-in platform profile.
 
 The no-inheritance rule is not one of these decisions. It is the fixed requirement.

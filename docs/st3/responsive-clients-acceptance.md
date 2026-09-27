@@ -1,11 +1,11 @@
-# Responsive ST3 clients — acceptance criteria
+# Responsive ST clients — acceptance criteria
 
 This record extends the active `product-and-idle-recovery` remediation work after live TUI and iOS feedback on 2026-09-24. The typed `st3.client.v0` API is the shared data boundary for CLI, TUI, and iOS. The clients must not parse each other's presentation output or read graph internals.
 
 ## Interaction and information architecture
 
 - TUI starts drawing its shell before any daemon read completes. Tab, selection, sidebar, scrolling, and quit keys do not wait on an API call. Target: first frame under 250 ms and local navigation under 100 ms on the development host, with a test server that intentionally delays reads.
-- Now, Chat, Control, and Fleet use a clear list/detail hierarchy, breathing room, and boxed sections. A selected row changes the detail pane immediately; asynchronous detail content may then arrive. Use the earlier ST3 TUI experiments as visual reference, without reintroducing fixture-only data.
+- Now, Chat, Control, and Fleet use a clear list/detail hierarchy, breathing room, and boxed sections. A selected row changes the detail pane immediately; asynchronous detail content may then arrive. Use the earlier ST TUI experiments as visual reference, without reintroducing fixture-only data.
 - Chat shows the selected agent's exact running session when available, recent normalized conversation text, mission/run/current-step context, and a composer. A missing `Agent.current_session_id` must not hide a running session discoverable by owner ID. Undeclared sessions remain in their own section and are read-only.
 - Fleet groups by machine and separates people/devices and undeclared local sessions. Control communicates mission progress and current step, not just IDs in a flat text dump.
 
