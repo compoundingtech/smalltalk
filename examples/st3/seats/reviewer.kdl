@@ -7,8 +7,8 @@ version 2
 // Missions give it review steps by assigning them to `agent/example/reviewer`. Apply it with a
 // worker seat and seats/planner.kdl:
 //
-//   st3 agents apply examples/st3/seats/reviewer.kdl --as person/operator
-//   st3 agents queue agent/example/reviewer
+//   st agents apply examples/st3/seats/reviewer.kdl --as person/operator
+//   st agents queue agent/example/reviewer
 agent "example/reviewer" {
   workspace "/srv/example/reviewer"
   restart "always"

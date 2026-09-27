@@ -11,9 +11,9 @@ version 2
 // the remediation step, whose worker must change files. A mission-level constraint would bind
 // every step.
 //
-//   st3 agents apply examples/st3/seats/omp.kdl --as person/operator
-//   st3 missions publish examples/st3/review-remediation.kdl --as person/operator
-//   st3 missions start example/review-remediation --id example/review-remediation/1 \
+//   st agents apply examples/st3/seats/omp.kdl --as person/operator
+//   st missions publish examples/st3/review-remediation.kdl --as person/operator
+//   st missions start example/review-remediation --id example/review-remediation/1 \
 //     --workspace /srv/example/app --as person/operator
 
 mission "example/review-remediation" state="ready" {
@@ -30,7 +30,7 @@ mission "example/review-remediation" state="ready" {
 
   step "report-only-review" timeout="1h" {
     assigned-to "agent/${ST_MISSION_RUN}/reviewer"
-    goal "Review the payments module on main. Store the findings with `st3 documents put` and complete this step with the stored document reference, even when findings exist."
+    goal "Review the payments module on main. Store the findings with `st documents put` and complete this step with the stored document reference, even when findings exist."
   }
 
   step "remediate-findings" timeout="2h" {

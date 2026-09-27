@@ -1,4 +1,4 @@
-# st3 idle stability sample — 2026-09-23
+# st idle stability sample — 2026-09-23
 
 The samples below used the installed, pre-fix daemons on Hetz and Silber. Process CPU is the change in cumulative process time divided by wall time; values above 100% mean more than one core. RSS is the observed range, not a heap measurement. Graph writes are changes in the client snapshot store index. Context switches are a wakeup proxy, not a count of application timer firings. Both hosts were sampled through their ordinary local API; Silber commands ran through Fabric.
 

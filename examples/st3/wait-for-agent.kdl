@@ -13,9 +13,9 @@ version 2
 // Whether a harness is idle or in a turn is not a gate input. Model "the agent is finished" as the
 // completion of its step.
 //
-//   st3 agents apply examples/st3/seats/omp.kdl --as person/operator
-//   st3 missions publish examples/st3/wait-for-agent.kdl --as person/operator
-//   st3 missions start example/app/paired-review --id example/app/paired-review/1 \
+//   st agents apply examples/st3/seats/omp.kdl --as person/operator
+//   st missions publish examples/st3/wait-for-agent.kdl --as person/operator
+//   st missions start example/app/paired-review --id example/app/paired-review/1 \
 //     --workspace "$(mktemp -d)" --as person/operator --follow
 //
 // Preview warns that the reviewer is a missing eligible agent. The preview looks only at
