@@ -1156,7 +1156,8 @@ fn client_agent_resources(
             subject.subject.starts_with("agent/") || subject.kind.as_deref() == Some("agent")
         })
         .filter(|subject| history || subject.projection.layer == "current")
-        .map(|subject| {
+        .map(|subject| -> anyhow::Result<(String, Value)> {
+            let fault = store.member_reconcile_fault(&subject.subject, Some(snapshot_index))?;
             let fields = subject
                 .actual
                 .as_ref()
@@ -1216,6 +1217,7 @@ fn client_agent_resources(
                 _ if subject.desired.is_some() => "desired",
                 _ => "stopped",
             };
+            let state = if fault.is_some() { "failed" } else { state };
             let runtime_id = fields
                 .and_then(|fields| fields.get("runtime_id"))
                 .and_then(Value::as_str);
@@ -1277,6 +1279,7 @@ fn client_agent_resources(
                 "owner_run_id": subject.owner_run,
                 "driver": driver,
                 "harness_state": harness_state,
+                "fault": fault,
                 "incarnation_id": incarnation_id,
                 "current_session_id": current_session_id,
                 "current_work_ids": queue.current_work_ids,
@@ -1290,9 +1293,9 @@ fn client_agent_resources(
                 })).collect::<Vec<_>>(),
                 "operational": subject.projection
             });
-            (name, value)
+            Ok((name, value))
         })
-        .collect::<Vec<_>>();
+        .collect::<anyhow::Result<Vec<_>>>()?;
     agents.sort_by(|(left_name, left), (right_name, right)| {
         left_name
             .cmp(right_name)
@@ -3013,6 +3016,27 @@ fn doctor_report(state: &AppState) -> Result<Json<DoctorReport>, ApiError> {
         }),
     }
     let desired = state.store.desired_subjects().map_err(ApiError::internal)?;
+    for subject in &desired {
+        if subject.kind != "stop"
+            && !subject
+                .member
+                .as_ref()
+                .is_some_and(|member| member.host == state.store.origin())
+        {
+            continue;
+        }
+        if let Some(fault) = state
+            .store
+            .member_reconcile_fault(&subject.subject, None)
+            .map_err(ApiError::internal)?
+        {
+            checks.push(DoctorCheck {
+                name: format!("member-reconcile/{}", subject.subject),
+                status: "fail".into(),
+                message: fault,
+            });
+        }
+    }
     let terminal_required = desired.iter().any(|subject| {
         subject
             .member
@@ -8857,6 +8881,99 @@ mod tests {
             .unwrap();
         assert_eq!(observed.len(), 1);
         assert_eq!(observed[0].kind, "custom.test.recorded");
+    }
+
+    #[test]
+    fn member_faults_are_visible_in_agents_and_doctor_until_recovery() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let source = format!(
+            r#"version 2
+agent "bad" {{ workspace {:?}; command "true" }}
+agent "good" {{ workspace {:?}; command "true" }}
+"#,
+            root.path().display().to_string(),
+            root.path().display().to_string()
+        );
+        let intent = crate::graph::parse_test_intent(&source, "node").unwrap();
+        let planned = state
+            .store
+            .mission(
+                &intent,
+                crate::model::IntentInput {
+                    kdl: source,
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        state
+            .store
+            .apply(&intent, &planned.subject_tokens, "fault-surface")
+            .unwrap();
+        for status in ["failed", "resolved"] {
+            state
+                .store
+                .append_claim(&ClaimInput {
+                    subject: "agent/node.bad".into(),
+                    kind: "runtime.reconcile-decision".into(),
+                    actor: None,
+                    fields: BTreeMap::from([
+                        ("key".into(), Value::String("member-reconcile".into())),
+                        (
+                            "decision".into(),
+                            Value::String(
+                                if status == "failed" {
+                                    "member-fault"
+                                } else {
+                                    "member-recovered"
+                                }
+                                .into(),
+                            ),
+                        ),
+                        (
+                            "reason".into(),
+                            Value::String(
+                                "render refuses to change tracked file .claude/settings.local.json"
+                                    .into(),
+                            ),
+                        ),
+                    ]),
+                    evidence: vec![],
+                    expected_subject: None,
+                    idempotency_key: None,
+                })
+                .unwrap();
+            let agents =
+                client_agent_resources(&state.store, false, "now", state.store.index().unwrap())
+                    .unwrap();
+            let bad = agents.iter().find(|a| a["id"] == "agent/node.bad").unwrap();
+            let good = agents
+                .iter()
+                .find(|a| a["id"] == "agent/node.good")
+                .unwrap();
+            assert!(good["fault"].is_null());
+            assert_ne!(good["state"], "failed");
+            let report = doctor_report(&state).unwrap().0;
+            let check = report
+                .checks
+                .iter()
+                .find(|c| c.name == "member-reconcile/agent/node.bad");
+            if status == "failed" {
+                assert_eq!(bad["state"], "failed");
+                assert!(
+                    bad["fault"]
+                        .as_str()
+                        .unwrap()
+                        .contains("settings.local.json")
+                );
+                assert_eq!(check.unwrap().status, "fail");
+                assert!(check.unwrap().message.contains("settings.local.json"));
+            } else {
+                assert!(bad["fault"].is_null());
+                assert_ne!(bad["state"], "failed");
+                assert!(check.is_none());
+            }
+        }
     }
 
     #[tokio::test]

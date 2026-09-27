@@ -493,6 +493,8 @@ pub struct Agent {
     #[serde(default)]
     pub harness_state: Option<String>,
     #[serde(default)]
+    pub fault: Option<String>,
+    #[serde(default)]
     pub incarnation_id: Option<String>,
     #[serde(default)]
     pub current_session_id: Option<String>,

@@ -922,13 +922,15 @@ st3 appends this exact text once to every agent launch:
 Read @.st3/boot.md completely. Then list, claim, do, and finish your current st3 work.
 ```
 
-The shared render transaction writes the canonical `.st3/boot.md` before a native harness starts.
+Each member’s render transaction writes the canonical `.st3/boot.md` before its native harness starts.
 
 The file explains graph work, Small Talk, wait behavior, and diagnostics. It does not contain a mission goal.
 
 An authored prompt can add stable harness context. It cannot replace or duplicate the boot contract.
 
-A tracked file at `.st3/boot.md` causes the complete render transaction to fail before any runtime starts.
+A tracked `.st3/boot.md` with different bytes fails that member’s render transaction and prevents its runtime from starting. Other members continue rendering and reconciling. Render, start, observation, and stop failures appear as the member’s fault in `st3 agents show` and `st3 doctor`; a successful pass clears the fault. Stopped and superseded members bypass rendering.
+
+Repeated `git-exclude` operations build on one another. Seats in worktrees sharing a repository’s exclude file contribute their paths to one combined update. Conflicting ordinary file owners are still rejected, without blocking unrelated members.
 
 ## Workspace existence
 
@@ -1398,6 +1400,8 @@ An authorized agent uses `st3 work publish-mission`, fenced to its claimed produ
 `st3 missions show MISSION_RUN` reads one exact run. `st3 missions show MISSION` works only when that mission has exactly one nonterminal run.
 
 The default mission view shows the complete run summary and its active graph branch. Add `--follow` to watch an existing run.
+
+Each step shows one line from its worker: the `work complete` summary once submitted, otherwise the latest `work progress` summary. Both come from the current attempt, and `--json` carries them as `completion_summary`, `progress_summary`, and `progress_at_unix_ms`. `st3 agents show` prints each current step with its latest progress summary and age.
 
 Follow mode redraws one screen on a terminal. It appends each changed snapshot when another program reads the output.
 
