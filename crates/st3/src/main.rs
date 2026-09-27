@@ -1061,6 +1061,18 @@ enum AttentionCommand {
         actor: Option<String>,
     },
     /// Request attention after an explicit fault.
+    ///
+    /// The item stays in `st3 now` until its reviewer resolves it or you withdraw it with
+    /// `st3 attention withdraw` once the condition clears. It also leaves `now` on its own:
+    ///
+    /// - at once, when a `step-run/` or `run-generation/` target is no longer current;
+    /// - otherwise, once every other target has ended after the request: a `mission/` retired or
+    ///   cancelled, a `mission-run/` terminal, an `attention/` item resolved or its gate no
+    ///   longer pending, or an `agent/` stopped or ready on a later incarnation.
+    ///
+    /// `resource/` and `doc/` targets are context and never end an item. A target of any other
+    /// kind, or one that had already ended when you made the request, keeps it open.
+    #[command(verbatim_doc_comment)]
     Request(AttentionRequestArgs),
     /// Resolve or dismiss an explicit attention request.
     Resolve(AttentionResolveArgs),
@@ -1082,6 +1094,8 @@ struct AttentionRequestArgs {
     reason: String,
     #[arg(long, value_parser = ["warning", "error"], default_value = "error")]
     severity: String,
+    /// A subject this fault is about; repeat for several. Its kind decides whether it can end the
+    /// item on its own.
     #[arg(long = "target")]
     targets: Vec<String>,
     #[arg(long = "as")]
@@ -9613,6 +9627,27 @@ mod tests {
             "agent/node.worker",
             Some(&replacement)
         ));
+    }
+
+    #[test]
+    fn attention_request_help_says_which_targets_end_an_item() {
+        let mut command = Cli::command();
+        let help = command
+            .find_subcommand_mut("attention")
+            .unwrap()
+            .find_subcommand_mut("request")
+            .unwrap()
+            .render_long_help()
+            .to_string();
+        for expected in [
+            "st3 attention withdraw",
+            "`step-run/` or `run-generation/` target is no longer current",
+            "a `mission/` retired or\n  cancelled",
+            "`resource/` and `doc/` targets are context",
+            "had already ended when you made the request, keeps it open",
+        ] {
+            assert!(help.contains(expected), "missing {expected:?} in:\n{help}");
+        }
     }
 
     #[test]

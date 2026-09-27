@@ -13233,6 +13233,11 @@ fn selected_actionable_messages(messages: Vec<MessageView>) -> Vec<MessageView> 
     selected
 }
 
+/// A fault request stays current until a target that owns its lifecycle ends it. A stale
+/// `run-generation/` or `step-run/` target ends it at once. Otherwise it ends once every target
+/// that is not context has moved on after the request was accepted. `resource/` and `doc/`
+/// targets are context. A target that had already moved on when the request was made keeps it
+/// current, because the request is then about that outcome.
 fn attention_request_is_current_tx(
     connection: &Connection,
     request: &AttentionRequestView,
@@ -13240,8 +13245,10 @@ fn attention_request_is_current_tx(
     if request.reason.to_ascii_lowercase().contains("superseded") {
         return Ok(false);
     }
+    let mut runtime_targets = false;
     for target in &request.targets {
         if let Some(generation) = target.strip_prefix("run-generation/") {
+            runtime_targets = true;
             let current = connection
                 .query_row(
                     "SELECT mission_runs.current_generation_id=run_generations.id
@@ -13257,6 +13264,7 @@ fn attention_request_is_current_tx(
                 return Ok(false);
             }
         } else if target.starts_with("step-run/") {
+            runtime_targets = true;
             let current = connection
                 .query_row(
                     "SELECT step_runs.generation_id=mission_runs.current_generation_id
@@ -13273,7 +13281,200 @@ fn attention_request_is_current_tx(
             }
         }
     }
-    Ok(true)
+    if runtime_targets {
+        return Ok(true);
+    }
+    let since = connection.query_row(
+        "SELECT accepted_at_unix_ms, store_index FROM claims WHERE id=?1",
+        [&request.request],
+        claim_moment,
+    )?;
+    let mut moved_on = false;
+    for target in &request.targets {
+        match attention_target_moved_on_tx(connection, target, since)? {
+            Some(true) => moved_on = true,
+            Some(false) => return Ok(true),
+            None => {}
+        }
+    }
+    Ok(!moved_on)
+}
+
+/// When a claim was accepted, ordered by time and then by store order for claims accepted in
+/// the same millisecond.
+type ClaimMoment = (u128, u64);
+
+fn claim_moment(row: &rusqlite::Row<'_>) -> rusqlite::Result<ClaimMoment> {
+    let accepted_at = row.get::<_, String>(0)?;
+    Ok((accepted_at.parse().unwrap_or_default(), row.get(1)?))
+}
+
+/// Whether `target` reached an ending state after `since`: `None` when the target is context
+/// that could never end a request.
+fn attention_target_moved_on_tx(
+    connection: &Connection,
+    target: &str,
+    since: ClaimMoment,
+) -> Result<Option<bool>> {
+    let after = |moment: Option<ClaimMoment>| Some(moment.is_some_and(|moment| moment > since));
+    if let Some(mission) = target.strip_prefix("mission/") {
+        let retired = connection
+            .query_row(
+                "SELECT claims.accepted_at_unix_ms, claims.store_index
+                 FROM mission_definitions
+                 JOIN claims ON claims.id=mission_definitions.claim_id
+                 WHERE mission_definitions.mission_id=?1
+                   AND mission_definitions.state='retired'",
+                [mission],
+                claim_moment,
+            )
+            .optional()?;
+        if retired.is_some() {
+            return Ok(after(retired));
+        }
+        // A mission is cancelled when no run is active and its latest run was cancelled.
+        let mut statement = connection.prepare(
+            "SELECT id, status FROM mission_runs WHERE mission_id=?1
+             ORDER BY CAST(created_at_unix_ms AS INTEGER) DESC, id DESC",
+        )?;
+        let runs = statement
+            .query_map([mission], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        if runs
+            .iter()
+            .any(|(_, status)| !is_terminal_run_state(status))
+        {
+            return Ok(Some(false));
+        }
+        return match runs.first() {
+            Some((run, status)) if status == "cancelled" => {
+                Ok(after(mission_run_ended_tx(connection, run)?))
+            }
+            _ => Ok(Some(false)),
+        };
+    }
+    if let Some(run) = target.strip_prefix("mission-run/") {
+        return Ok(after(mission_run_ended_tx(connection, run)?));
+    }
+    if target.starts_with("attention/") {
+        if attention_request_view_tx(connection, target)?.is_some() {
+            let resolved = connection
+                .query_row(
+                    "SELECT accepted_at_unix_ms, store_index FROM claims
+                     WHERE subject=?1 AND kind='attention.resolved'
+                     ORDER BY store_index DESC LIMIT 1",
+                    [target],
+                    claim_moment,
+                )
+                .optional()?;
+            return Ok(after(resolved));
+        }
+        // Otherwise the target is a client attention ID, a digest of a human gate's owner
+        // (`attention_resource_id` in the API). It moved on when that gate, requested before
+        // this request, is no longer pending.
+        let gate_id = |owner: &str| {
+            let digest = hex::encode(Sha256::digest(owner.as_bytes()));
+            format!("attention/{}", &digest[..24])
+        };
+        if pending_human_reviews_tx(connection, None)?
+            .iter()
+            .any(|review| gate_id(&review.owner) == target)
+        {
+            return Ok(Some(false));
+        }
+        let mut statement = connection.prepare(
+            "SELECT json_extract(body, '$.fields.owner'), accepted_at_unix_ms, store_index
+             FROM claims
+             WHERE kind='gate.requested'
+               AND json_extract(body, '$.fields.reviewer') IS NOT NULL",
+        )?;
+        let requested_before = statement
+            .query_map([], |row| {
+                let owner = row.get::<_, Option<String>>(0)?;
+                let accepted_at = row.get::<_, String>(1)?;
+                Ok((
+                    owner,
+                    (
+                        accepted_at.parse().unwrap_or_default(),
+                        row.get::<_, u64>(2)?,
+                    ),
+                ))
+            })?
+            .collect::<Result<Vec<(Option<String>, ClaimMoment)>, _>>()?
+            .into_iter()
+            .any(|(owner, moment)| {
+                moment < since && owner.is_some_and(|owner| gate_id(&owner) == target)
+            });
+        return Ok(Some(requested_before));
+    }
+    if target.starts_with("agent/") {
+        let stopped = connection
+            .query_row(
+                "SELECT claims.accepted_at_unix_ms, claims.store_index
+                 FROM desired JOIN claims ON claims.id=desired.claim_id
+                 WHERE desired.subject=?1 AND desired.kind='stop'",
+                [target],
+                claim_moment,
+            )
+            .optional()?;
+        if stopped.is_some() {
+            return Ok(after(stopped));
+        }
+        // An agent that is ready on an incarnation that started after the request has
+        // recovered from whatever the request described.
+        let Some(harness) = current_harness_at(connection, target, None)? else {
+            return Ok(Some(false));
+        };
+        if !harness.is_ready() {
+            return Ok(Some(false));
+        }
+        let started = connection
+            .query_row(
+                "SELECT accepted_at_unix_ms, store_index FROM claims
+                 WHERE subject=?1 AND kind='runtime.observed'
+                   AND json_extract(body, '$.fields.incarnation_id')=?2
+                 ORDER BY store_index LIMIT 1",
+                params![target, harness.incarnation_id],
+                claim_moment,
+            )
+            .optional()?;
+        return Ok(after(started));
+    }
+    // Resources and documents are context. A target of any other kind, such as a loop, has no
+    // rule here, so it keeps the request current.
+    if target.starts_with("resource/") || target.starts_with("doc/") {
+        return Ok(None);
+    }
+    Ok(Some(false))
+}
+
+/// When a terminal run first reached a terminal status, from its own state history.
+fn mission_run_ended_tx(connection: &Connection, run: &str) -> Result<Option<ClaimMoment>> {
+    let run = run.strip_prefix("mission-run/").unwrap_or(run);
+    let terminal = connection
+        .query_row(
+            "SELECT status FROM mission_runs WHERE id=?1",
+            [run],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .is_some_and(|status| is_terminal_run_state(&status));
+    if !terminal {
+        return Ok(None);
+    }
+    connection
+        .query_row(
+            "SELECT accepted_at_unix_ms, store_index FROM claims
+             WHERE subject=?1 AND kind='mission-run.state'
+               AND json_extract(body, '$.fields.status') IN ('completed','failed','cancelled')
+             ORDER BY store_index LIMIT 1",
+            [format!("mission-run/{run}")],
+            claim_moment,
+        )
+        .optional()
+        .map_err(Into::into)
 }
 
 fn attention_action(label: &str, argv: &[&str]) -> AttentionActionView {
@@ -25282,6 +25483,17 @@ version 2
                 },
             )
             .unwrap();
+        // The Typecase shape: the mission it names was cancelled after the request.
+        let typecase = start_agentless_run(&store, "typecase");
+        request_fault(&store, "attention/typecase", &["mission/typecase"]);
+        store
+            .set_mission_run_state(
+                &typecase.id,
+                "cancelled",
+                "terminal",
+                Some("moved to a seat"),
+            )
+            .unwrap();
 
         store
             .append_claim(&ClaimInput {
@@ -25346,6 +25558,12 @@ version 2
         assert!(classes.contains("expired-claim"));
         assert!(classes.contains("superseded-attention"));
         assert!(classes.contains("wake-contradiction"));
+        assert!(plan.items.iter().any(|item| {
+            item.class == "superseded-attention"
+                && item
+                    .affected_subjects
+                    .contains(&"attention/typecase".to_owned())
+        }));
         let wake = plan
             .items
             .iter()
@@ -28292,6 +28510,229 @@ mission "review-current" state="ready" revision-cutover="restart-active" {{
             .set_mission_run_state(&revised.id, "cancelled", "normal", None)
             .unwrap();
         assert!(store.pending_human_reviews(None).unwrap().is_empty());
+    }
+
+    fn request_fault(store: &Store, subject: &str, targets: &[&str]) {
+        store
+            .request_attention(
+                subject,
+                &AttentionRequest {
+                    reviewer: "person/nathan".into(),
+                    title: format!("Fault {subject}"),
+                    reason: "a person must decide".into(),
+                    severity: "warning".into(),
+                    targets: targets.iter().map(|target| (*target).to_owned()).collect(),
+                    actor: "agent/node.requester".into(),
+                    idempotency_key: format!("{subject}:requested"),
+                },
+            )
+            .unwrap();
+    }
+
+    fn fault_is_current(store: &Store, subject: &str) -> bool {
+        store
+            .attention_items(Some("person/nathan"))
+            .unwrap()
+            .iter()
+            .any(|item| item.kind == "fault" && item.subject == subject)
+    }
+
+    fn start_agentless_run(store: &Store, mission: &str) -> MissionRunView {
+        publish_mission(
+            store,
+            &format!(
+                r#"version 2
+mission "{mission}" state="ready" {{
+  goal "Hold a gate."
+  step "approval" {{ goal "Approve it."; agentless }}
+}}"#
+            ),
+            &format!("{mission}-publish"),
+        );
+        store
+            .create_mission_run(&MissionRunRequest {
+                mission: mission.into(),
+                revision: None,
+                workspace: ".".into(),
+                requester: Some("person/nathan".into()),
+                mode: Some("run".into()),
+                inputs: BTreeMap::new(),
+                idempotency_key: format!("{mission}-run"),
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn attention_whose_mission_target_is_cancelled_after_the_request_is_not_current() {
+        let store = Store::open_memory("node").unwrap();
+        let run = start_agentless_run(&store, "typecase");
+        request_fault(&store, "attention/typecase", &["mission/typecase"]);
+        assert!(fault_is_current(&store, "attention/typecase"));
+
+        store
+            .set_mission_run_state(&run.id, "cancelled", "terminal", Some("moved to a seat"))
+            .unwrap();
+
+        assert!(!fault_is_current(&store, "attention/typecase"));
+        assert_eq!(
+            store
+                .attention_request("attention/typecase")
+                .unwrap()
+                .unwrap()
+                .status,
+            "pending",
+            "a request that is no longer current is not resolved on its own"
+        );
+    }
+
+    #[test]
+    fn attention_whose_attention_targets_are_all_closed_is_not_current() {
+        let store = Store::open_memory("node").unwrap();
+        let run = start_agentless_run(&store, "pull-request-review");
+        let step = run.steps[0].clone();
+        store
+            .append_claim(&ClaimInput {
+                subject: "gate-operation/pull-request-review/approval".into(),
+                kind: "gate.requested".into(),
+                actor: None,
+                fields: BTreeMap::from([
+                    ("owner".into(), Value::String(step.subject.clone())),
+                    ("reviewer".into(), Value::String("person/nathan".into())),
+                    ("question".into(), Value::String("Approve it?".into())),
+                    ("review_targets".into(), Value::Array(Vec::new())),
+                    (
+                        "operation".into(),
+                        Value::String("gate-operation/pull-request-review/approval".into()),
+                    ),
+                    (
+                        "mission_revision".into(),
+                        Value::String(run.revision.clone()),
+                    ),
+                    (
+                        "step_definition".into(),
+                        Value::String(step.definition_hash.clone()),
+                    ),
+                    ("attempt".into(), Value::from(step.attempt)),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some("pull-request-review-gate".into()),
+            })
+            .unwrap();
+        // The client names a human gate by a digest of its owner.
+        let gate = format!(
+            "attention/{}",
+            &hex::encode(Sha256::digest(step.subject.as_bytes()))[..24]
+        );
+        request_fault(&store, "attention/other-review", &["resource/review"]);
+        request_fault(
+            &store,
+            "attention/shared-review",
+            &[&gate, "attention/other-review", "resource/review"],
+        );
+        assert!(fault_is_current(&store, "attention/shared-review"));
+
+        store
+            .resolve_attention(
+                "attention/other-review",
+                &AttentionResolveRequest {
+                    outcome: "resolved".into(),
+                    reason: None,
+                    actor: "person/nathan".into(),
+                    idempotency_key: "other-review-resolved".into(),
+                },
+            )
+            .unwrap();
+        assert!(
+            fault_is_current(&store, "attention/shared-review"),
+            "the gate it names is still pending"
+        );
+
+        store
+            .set_step_state(&step.subject, "completed", None)
+            .unwrap();
+        assert!(!fault_is_current(&store, "attention/shared-review"));
+    }
+
+    #[test]
+    fn attention_raised_after_its_run_failed_stays_current() {
+        let store = Store::open_memory("node").unwrap();
+        let run = start_agentless_run(&store, "crate-experiments");
+        store
+            .set_mission_run_state(&run.id, "failed", "terminal", Some("the gate failed"))
+            .unwrap();
+        request_fault(&store, "attention/post-mortem", &[&run.subject]);
+
+        assert!(fault_is_current(&store, "attention/post-mortem"));
+        assert!(
+            !store
+                .operational_repair_plan()
+                .unwrap()
+                .items
+                .iter()
+                .any(|item| item.class == "superseded-attention")
+        );
+    }
+
+    #[test]
+    fn attention_whose_agent_target_moved_on_is_not_current() {
+        let store = Store::open_memory("node").unwrap();
+        let observe = |agent: &str, incarnation: &str| {
+            store
+                .append_claim(&ClaimInput {
+                    subject: agent.into(),
+                    kind: "runtime.observed".into(),
+                    actor: None,
+                    fields: BTreeMap::from([
+                        ("status".into(), Value::String("running".into())),
+                        ("incarnation_id".into(), Value::String(incarnation.into())),
+                    ]),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: Some(format!("{incarnation}-running")),
+                })
+                .unwrap();
+            store
+                .append_claim(&ClaimInput {
+                    subject: agent.into(),
+                    kind: "harness.observed".into(),
+                    actor: Some(agent.into()),
+                    fields: BTreeMap::from([
+                        ("state".into(), Value::String("idle".into())),
+                        ("incarnation_id".into(), Value::String(incarnation.into())),
+                    ]),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: Some(format!("{incarnation}-idle")),
+                })
+                .unwrap();
+        };
+        observe("agent/node.seat", "seat-one");
+        request_fault(&store, "attention/seat", &["agent/node.seat"]);
+        request_fault(&store, "attention/retired", &["agent/node.retired"]);
+        assert!(
+            fault_is_current(&store, "attention/seat"),
+            "the incarnation that was ready at the request is not a recovery"
+        );
+
+        observe("agent/node.seat", "seat-two");
+        let source = "version 2\nstop \"agent/node.retired\"\n";
+        let intent = crate::graph::parse_intent(source, "node").unwrap();
+        let planned = store
+            .mission(
+                &intent,
+                IntentInput {
+                    kdl: source.into(),
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        store
+            .apply(&intent, &planned.subject_tokens, "retired-stop")
+            .unwrap();
+
+        assert!(!fault_is_current(&store, "attention/seat"));
+        assert!(!fault_is_current(&store, "attention/retired"));
     }
 
     #[test]
