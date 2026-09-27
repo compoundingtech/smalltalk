@@ -18,7 +18,7 @@ use crate::model::{
     GateSpec, LaunchSpec, LoopCandidateSelector, LoopExhaustionSpec, LoopSpec, MemberKind,
     MemberLifecycle, MemberSpec, MessageView, MetricSource, MissionInputKind, MissionRunRequest,
     MissionRunView, MissionSpec, MissionState, RestartIntensity, RestartType, StepRunView,
-    StepSpec, UsedMissionSpec, WorkSelector,
+    StepSpec, SubscriptionSpec, UsedMissionSpec, WorkSelector,
 };
 use crate::resource::{ObservationRequest, RegisteredResourceProvider, ResourceProvider};
 use crate::store::Store;
@@ -6797,7 +6797,18 @@ impl<R: RuntimeControl> Reconciler<R> {
     }
 
     fn reconcile_resource_observers(&self, desired: &[DesiredSubject]) -> Result<()> {
-        let subscriptions = desired
+        let observer_resources = desired
+            .iter()
+            .filter(|item| item.kind == "observer")
+            .filter_map(|item| {
+                crate::graph::observer_spec(&item.desired)
+                    .filter(|spec| !spec.stopped)
+                    .map(|spec| (item.subject.clone(), spec.resource))
+            })
+            .collect::<HashMap<_, _>>();
+        let mut subscriptions_by_resource =
+            HashMap::<String, Vec<(String, SubscriptionSpec)>>::new();
+        for (subject, subscription) in desired
             .iter()
             .filter(|item| item.kind == "subscription")
             .filter_map(|item| {
@@ -6805,16 +6816,22 @@ impl<R: RuntimeControl> Reconciler<R> {
                     .filter(|spec| !spec.stopped)
                     .map(|spec| (item.subject.clone(), spec))
             })
-            .collect::<Vec<_>>();
+        {
+            if let Some(resource) = observer_resources.get(&subscription.observer) {
+                subscriptions_by_resource
+                    .entry(resource.clone())
+                    .or_default()
+                    .push((subject, subscription));
+            }
+        }
         for observer in desired.iter().filter(|item| item.kind == "observer") {
             let Some(mut spec) = crate::graph::observer_spec(&observer.desired) else {
                 continue;
             };
-            let selected = subscriptions
-                .iter()
-                .filter(|(_, subscription)| subscription.observer == observer.subject)
+            let selected = subscriptions_by_resource
+                .get(&spec.resource)
                 .cloned()
-                .collect::<Vec<_>>();
+                .unwrap_or_default();
             if spec.stopped {
                 let is_stopped = self
                     .store
@@ -6851,6 +6868,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             spec.fields.extend(
                 selected
                     .iter()
+                    .filter(|(_, subscription)| subscription.observer == observer.subject)
                     .flat_map(|(_, subscription)| subscription.fields.iter().cloned()),
             );
             spec.fields.sort();
@@ -14676,6 +14694,116 @@ observer "repo" {
         );
         reconciler.reconcile_once().unwrap();
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    struct SharedDiscoveryProvider {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl ResourceProvider for SharedDiscoveryProvider {
+        fn observe(
+            &self,
+            _request: ObservationRequest,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<crate::resource::ProviderObservation>>
+                    + Send
+                    + '_,
+            >,
+        > {
+            Box::pin(async {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                Ok(crate::resource::ProviderObservation {
+                    facts: serde_json::json!({"issues": [{"number": 7}]}),
+                    cursor: Some("issue-seven".into()),
+                    next_check_unix_ms: now_ms().saturating_add(60_000),
+                })
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn observers_on_one_resource_deliver_to_both_subscriptions() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        apply_source(
+            &store,
+            r#"version 2
+mission "review" state="ready" {
+  input "source" kind="resource"
+  goal "Review a discovered issue."
+  step "review" { agentless }
+}"#,
+            "shared-discovery-mission",
+        );
+        let revision = store
+            .mission_spec("review", None)
+            .unwrap()
+            .unwrap()
+            .revision;
+        let source = format!(
+            r#"version 2
+resource "repo" {{ kind "vcs.repository" }}
+observer "a" {{ resource "resource/repo"; provider "github.repository"; locator "example/repo"; field "issues" }}
+observer "b" {{ resource "resource/repo"; provider "github.repository"; locator "example/repo"; field "issues" }}
+subscription "a" {{
+  observer "observer/a"
+  on "issues"
+  delivery "mission" {{ mission "review@{revision}"; resource "source"; workspace "/tmp/st3-review" }}
+}}
+subscription "b" {{
+  observer "observer/b"
+  on "issues"
+  delivery "mission" {{ mission "review@{revision}"; resource "source"; workspace "/tmp/st3-review" }}
+}}"#
+        );
+        apply_source(&store, &source, "shared-discovery-watch");
+        store
+            .record_resource_observation(
+                "observer/a",
+                &store
+                    .selected_desired_revision("observer/a")
+                    .unwrap()
+                    .unwrap(),
+                None,
+                "resource/repo",
+                Some("baseline"),
+                &serde_json::json!({"issues": []}),
+                now_ms() + 60_000,
+                &[],
+            )
+            .unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let reconciler = Reconciler::new(
+            store.clone(),
+            Arc::new(FakeRuntime::default()),
+            "node".into(),
+            Arc::new(Notify::new()),
+        )
+        .with_resource_provider(Arc::new(SharedDiscoveryProvider {
+            calls: calls.clone(),
+        }));
+        reconciler
+            .reconcile_resource_observers(&store.desired_subjects().unwrap())
+            .unwrap();
+        for _ in 0..100 {
+            if calls.load(Ordering::SeqCst) == 2
+                && reconciler.armed_observers.lock().unwrap().is_empty()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        for subscription in ["subscription/a", "subscription/b"] {
+            assert_eq!(
+                store
+                    .claims_for(subscription, Some("subscription.mission-requested"))
+                    .unwrap()
+                    .len(),
+                1,
+                "{subscription} did not receive issue 7"
+            );
+        }
     }
 
     struct BlockingResourceProvider {
