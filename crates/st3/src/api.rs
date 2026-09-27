@@ -4851,6 +4851,23 @@ async fn apply(
                 .with_detail("agent", granted.subject.clone()),
             ));
         }
+        for desired in intent.subjects.values() {
+            if desired.subject.starts_with("agent/")
+                && matches!(desired.kind.as_str(), "agent" | "stop")
+            {
+                require_agent_seat_authority(
+                    &state,
+                    actor,
+                    if desired.kind == "stop" {
+                        "stop"
+                    } else {
+                        "declare"
+                    },
+                    &desired.subject,
+                )?;
+            }
+        }
+        refuse_agent_granted_mission_authority(&state, &intent, actor)?;
     }
     for declaration in intent.mission_runs.values() {
         if let Some(creation) = &declaration.creation {
@@ -6246,6 +6263,9 @@ async fn revise_mission_run(
         format!("agent/{}", request.actor)
     };
     require_agent_mission_authority(&state, &actor, "revise", mission_id)?;
+    if normalized_agent_actor(&actor).is_some() {
+        refuse_agent_widened_mission_authority(&state, &actor, replacement, Some(&old))?;
+    }
     let (_, reviewers) = crate::store::analyze_mission_revision(
         &old,
         replacement,
@@ -6662,6 +6682,7 @@ async fn publish_work_mission(
     let resolved_kdl =
         resolve_document_references(&request.intent.kdl, &bindings).map_err(ApiError::bad)?;
     let intent = parse_intent(&resolved_kdl, &state.node).map_err(ApiError::bad)?;
+    refuse_agent_granted_mission_authority(&state, &intent, &actor)?;
     let mission = intent
         .missions
         .values()
@@ -6715,6 +6736,62 @@ async fn publish_work_mission(
         .map_err(ApiError::bad)?;
     signal_changed(&state);
     Ok(Json(output))
+}
+
+/// Only a person grants authority. A mission an agent publishes or revises may not declare an
+/// agent, at any depth, whose `mission-authority` or `queue-authority` differs from the grant
+/// already published for that agent; otherwise a narrow `publish` and `start` grant becomes any
+/// authority the agent writes into a run's seat.
+fn refuse_agent_widened_mission_authority(
+    state: &AppState,
+    actor: &str,
+    mission: &crate::model::MissionSpec,
+    current: Option<&crate::model::MissionSpec>,
+) -> Result<(), ApiError> {
+    let proposed = crate::graph::mission_declared_authority_grants(mission, &state.node)
+        .map_err(ApiError::bad)?;
+    if proposed.is_empty() {
+        return Ok(());
+    }
+    let published = current
+        .map(|current| crate::graph::mission_declared_authority_grants(current, &state.node))
+        .transpose()
+        .map_err(ApiError::bad)?
+        .unwrap_or_default();
+    for (subject, grant) in &proposed {
+        if published.get(subject) != Some(grant) {
+            return Err(ApiError::bad(
+                St3Error::new(
+                    "agent-authority-grant-denied",
+                    format!(
+                        "`{actor}` cannot grant authority in the declaration of `{subject}`; only a person can"
+                    ),
+                )
+                .with_detail("agent", subject.clone()),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// `refuse_agent_widened_mission_authority` for every top-level mission of one publication,
+/// against the mission revision currently published under the same ID.
+fn refuse_agent_granted_mission_authority(
+    state: &AppState,
+    intent: &crate::model::NormalizedIntent,
+    actor: &str,
+) -> Result<(), ApiError> {
+    for id in crate::mission::top_level_mission_ids(&intent.missions) {
+        let Some(mission) = intent.missions.get(&id) else {
+            continue;
+        };
+        let current = state
+            .store
+            .mission_spec(&id, None)
+            .map_err(ApiError::internal)?;
+        refuse_agent_widened_mission_authority(state, actor, mission, current.as_ref())?;
+    }
+    Ok(())
 }
 
 /// The actor's current desired agent declaration, which is where a person grants it authority.
@@ -6780,6 +6857,27 @@ fn require_agent_queue_authority(
                 format!("`{actor}` cannot move runs in the queue of `{seat}`"),
             )
             .with_detail("actor", actor.clone())
+            .with_detail("agent", seat.to_owned()),
+        ))
+    }
+}
+
+fn require_agent_seat_authority(
+    state: &AppState,
+    actor: &str,
+    action: &str,
+    seat: &str,
+) -> Result<(), ApiError> {
+    let desired = current_agent_declaration(state, actor, "missing-agent-seat-authority")?;
+    if crate::graph::agent_seat_authority(&desired).allows(action, seat) {
+        Ok(())
+    } else {
+        Err(ApiError::bad(
+            St3Error::new(
+                "agent-seat-publication-denied",
+                format!("`{actor}` cannot {action} seat `{seat}`"),
+            )
+            .with_detail("actor", actor.to_owned())
             .with_detail("agent", seat.to_owned()),
         ))
     }
@@ -10951,6 +11049,406 @@ mission "authority-self-grant" state="ready" {
         assert_eq!(body["code"], "mission-authority-denied");
     }
 
+    /// Review 2026-09-27 area 1: any agent can replace another seat's top-level declaration.
+    /// The replacement cannot carry authority, so it silently strips the grant a person gave.
+    #[tokio::test]
+    async fn review_an_agent_redeclares_another_seat_and_strips_its_grant() {
+        const SEAT: &str = "agent/fleet/worker";
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let source = r#"
+version 2
+
+agent "fleet/worker" { workspace "."; command "true"; }
+agent "fleet/chief" {
+  workspace "."
+  command "true"
+  queue-authority { move "fleet/worker" }
+}
+agent "fleet/helper" { workspace "."; command "true"; }
+mission "queued" state="ready" {
+  concurrent-runs
+  goal "Give the durable seat one step in each run."
+  step "work" { assigned-to "agent/fleet/worker" }
+}
+"#;
+        let intent = parse_intent(source, "node").unwrap();
+        let preview = state
+            .store
+            .mission(
+                &intent,
+                crate::model::IntentInput {
+                    kdl: source.into(),
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        state
+            .store
+            .apply(&intent, &preview.subject_tokens, "seat-redeclare")
+            .unwrap();
+        let start = |key: &str| {
+            std::thread::sleep(Duration::from_millis(2));
+            state
+                .store
+                .create_mission_run(&MissionRunRequest {
+                    mission: "queued".into(),
+                    revision: None,
+                    workspace: root.path().display().to_string(),
+                    requester: Some("person/test".into()),
+                    mode: Some("run".into()),
+                    inputs: BTreeMap::new(),
+                    idempotency_key: key.into(),
+                })
+                .unwrap()
+        };
+        let first = start("seat-redeclare-first").subject;
+        let second = start("seat-redeclare-second").subject;
+        let app = router(state.clone());
+        let promote = |actor: &str, key: &str| {
+            json!({
+                "agent": SEAT,
+                "run": second,
+                "placement": "top",
+                "actor": actor,
+                "idempotency_key": key,
+            })
+        };
+
+        // The helper, a seat with no grant of any kind, replaces the chief's declaration with
+        // one that changes its command and drops its queue authority.
+        let (status, body) = json_request(
+            app.clone(),
+            "/v1/intent/apply",
+            serde_json::to_value(apply_request(
+                &state,
+                "version 2\nagent \"fleet/chief\" { workspace \".\"; command \"sh -c 'echo replaced'\"; }\n",
+                "agent/fleet/helper",
+                "helper-redeclares-chief",
+            ))
+            .unwrap(),
+        )
+        .await;
+        eprintln!("REVIEW helper redeclares chief: {status} {body}");
+        // And stops the worker seat outright.
+        let (stop_status, stop_body) = json_request(
+            app.clone(),
+            "/v1/intent/apply",
+            serde_json::to_value(apply_request(
+                &state,
+                "version 2\nstop \"agent/fleet/worker\"\n",
+                "agent/fleet/helper",
+                "helper-stops-worker",
+            ))
+            .unwrap(),
+        )
+        .await;
+        eprintln!("REVIEW helper stops worker: {stop_status} {stop_body}");
+        let (move_status, move_body) = json_request(
+            app,
+            "/v1/agent-queue-moves",
+            promote("agent/fleet/chief", "chief-after-redeclare"),
+        )
+        .await;
+        eprintln!("REVIEW chief move after redeclare: {move_status} {move_body}");
+        assert_eq!(
+            status,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "an agent must not replace another seat's declaration: {body}"
+        );
+        assert_eq!(body["code"], "agent-seat-publication-denied");
+        assert_eq!(stop_status, StatusCode::UNPROCESSABLE_ENTITY, "{stop_body}");
+        assert_eq!(stop_body["code"], "agent-seat-publication-denied");
+        assert_eq!(
+            move_status,
+            StatusCode::OK,
+            "the chief keeps its grant: {move_body}"
+        );
+        let _ = first;
+    }
+
+    #[tokio::test]
+    async fn agent_with_seat_authority_can_declare_and_stop_only_granted_seats() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let source = r#"
+version 2
+agent "fleet/builder" {
+  workspace "."
+  command "true"
+  seat-authority { declare "fleet/workers/*"; stop "fleet/workers/*" }
+}
+"#;
+        let intent = parse_intent(source, "node").unwrap();
+        let preview = state
+            .store
+            .mission(
+                &intent,
+                crate::model::IntentInput {
+                    kdl: source.into(),
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        state
+            .store
+            .apply(&intent, &preview.subject_tokens, "seat-grant")
+            .unwrap();
+        let app = router(state.clone());
+        let actor = "agent/fleet/builder";
+        for (source, key) in [
+            (
+                "version 2\nagent \"fleet/workers/one\" { workspace \".\"; command \"true\" }\n",
+                "declare-granted",
+            ),
+            (
+                "version 2\nstop \"agent/fleet/workers/one\"\n",
+                "stop-granted",
+            ),
+        ] {
+            let (status, body) = json_request(
+                app.clone(),
+                "/v1/intent/apply",
+                serde_json::to_value(apply_request(&state, source, actor, key)).unwrap(),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+        }
+        let (status, body) = json_request(
+            app,
+            "/v1/intent/apply",
+            serde_json::to_value(apply_request(
+                &state,
+                "version 2\nagent \"fleet/chief\" { workspace \".\"; command \"true\" }\n",
+                actor,
+                "declare-ungranted",
+            ))
+            .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        assert_eq!(body["code"], "agent-seat-publication-denied");
+    }
+
+    /// Review 2026-09-27 area 1: an agent with a namespace publish grant must not be able to
+    /// publish a mission whose own agent declaration carries authority nobody granted.
+    #[tokio::test]
+    async fn review_an_agent_cannot_grant_authority_through_a_published_mission() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let source = r#"
+version 2
+
+mission "grant-host" state="ready" {
+  goal "Hold one planner with a narrow publish and start grant."
+  agent "planner" {
+    workspace "."
+    command "true"
+    mission-authority { publish "gen/*"; start "gen/*" }
+  }
+}
+"#;
+        let intent = parse_intent(source, "node").unwrap();
+        let preview = state
+            .store
+            .mission(
+                &intent,
+                crate::model::IntentInput {
+                    kdl: source.into(),
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        state
+            .store
+            .apply(&intent, &preview.subject_tokens, "grant-host")
+            .unwrap();
+        let host = state
+            .store
+            .create_mission_run(&MissionRunRequest {
+                mission: "grant-host".into(),
+                revision: None,
+                workspace: root.path().display().to_string(),
+                requester: Some("person/test".into()),
+                mode: Some("run".into()),
+                inputs: BTreeMap::new(),
+                idempotency_key: "grant-host-run".into(),
+            })
+            .unwrap();
+        materialize_run_agents(&state, &host);
+        let planner = format!("agent/{}/planner", host.id);
+        let app = router(state.clone());
+
+        // The planner publishes a mission inside its namespace. The mission's own agent
+        // declaration grants fleet-wide authority the planner does not hold.
+        let escalate = r#"version 2
+mission "gen/escalate" state="ready" {
+  goal "Carry authority the publisher does not hold."
+  agent "boss" {
+    workspace "."
+    command "true"
+    mission-authority { publish "victim"; start "victim"; revise "victim" }
+    queue-authority { move "fleet/*" }
+  }
+  step "work" { assigned-to "agent/${ST_MISSION_RUN}/boss" }
+}
+"#;
+        let (status, body) = json_request(
+            app.clone(),
+            "/v1/intent/apply",
+            serde_json::to_value(apply_request(
+                &state,
+                escalate,
+                &planner,
+                "escalate-publish",
+            ))
+            .unwrap(),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "an agent publication must not grant authority: {body}"
+        );
+        assert_eq!(body["code"], "agent-authority-grant-denied", "{body}");
+    }
+
+    /// Review 2026-09-27 area 1: the consequence of the accepted publication above. The
+    /// planner starts the run with its own `start` grant, and the run's agent holds the
+    /// escalated authority.
+    #[tokio::test]
+    async fn review_escalated_run_agent_holds_authority_nobody_granted() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let source = r#"
+version 2
+
+mission "grant-host" state="ready" {
+  goal "Hold one planner with a narrow publish and start grant."
+  agent "planner" {
+    workspace "."
+    command "true"
+    mission-authority { publish "gen/*"; start "gen/*" }
+  }
+}
+"#;
+        let intent = parse_intent(source, "node").unwrap();
+        let preview = state
+            .store
+            .mission(
+                &intent,
+                crate::model::IntentInput {
+                    kdl: source.into(),
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        state
+            .store
+            .apply(&intent, &preview.subject_tokens, "grant-host")
+            .unwrap();
+        let host = state
+            .store
+            .create_mission_run(&MissionRunRequest {
+                mission: "grant-host".into(),
+                revision: None,
+                workspace: root.path().display().to_string(),
+                requester: Some("person/test".into()),
+                mode: Some("run".into()),
+                inputs: BTreeMap::new(),
+                idempotency_key: "grant-host-run".into(),
+            })
+            .unwrap();
+        materialize_run_agents(&state, &host);
+        let planner = format!("agent/{}/planner", host.id);
+        let app = router(state.clone());
+        let escalate = r#"version 2
+mission "gen/escalate" state="ready" {
+  goal "Carry authority the publisher does not hold."
+  agent "boss" {
+    workspace "."
+    command "true"
+    mission-authority { publish "victim"; start "victim"; revise "victim" }
+    queue-authority { move "fleet/*" }
+  }
+  step "work" { assigned-to "agent/${ST_MISSION_RUN}/boss" }
+}
+"#;
+        let (status, body) = json_request(
+            app.clone(),
+            "/v1/intent/apply",
+            serde_json::to_value(apply_request(
+                &state,
+                escalate,
+                &planner,
+                "escalate-publish",
+            ))
+            .unwrap(),
+        )
+        .await;
+        eprintln!("REVIEW publish by planner: {status} {body}");
+        if status != StatusCode::OK {
+            return;
+        }
+        let revision = state
+            .store
+            .mission_spec("gen/escalate", None)
+            .unwrap()
+            .unwrap()
+            .revision;
+        let start = format!(
+            "version 2\nmission-run \"gen/escalate/one\" {{\n  mission {:?}\n  workspace {:?}\n  requester {planner:?}\n}}\n",
+            format!("mission/gen/escalate@{revision}"),
+            root.path().display().to_string(),
+        );
+        let (status, body) = json_request(
+            app.clone(),
+            "/v1/intent/apply",
+            serde_json::to_value(apply_request(&state, &start, &planner, "escalate-start"))
+                .unwrap(),
+        )
+        .await;
+        eprintln!("REVIEW start by planner: {status} {body}");
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let run = state
+            .store
+            .mission_run("gen/escalate/one")
+            .unwrap()
+            .unwrap();
+        materialize_run_agents(&state, &run);
+        let boss = format!("agent/{}/boss", run.id);
+        let desired = state
+            .store
+            .desired_subjects()
+            .unwrap()
+            .into_iter()
+            .find(|desired| desired.kind == "agent" && desired.subject == boss)
+            .expect("the run agent is declared");
+        let mission_authority = crate::graph::agent_mission_authority(&desired.desired);
+        let queue_authority = crate::graph::agent_queue_authority(&desired.desired);
+        eprintln!(
+            "REVIEW {boss} publish victim={} start victim={} revise victim={} move fleet/worker={}",
+            mission_authority.allows("publish", "victim"),
+            mission_authority.allows("start", "victim"),
+            mission_authority.allows("revise", "victim"),
+            queue_authority.allows_move("agent/fleet/worker"),
+        );
+        // The boss now publishes a mission outside the planner's namespace.
+        let victim = "version 2\nmission \"victim\" state=\"ready\" {\n  goal \"Published with escalated authority.\"\n}\n";
+        let (status, body) = json_request(
+            app,
+            "/v1/intent/apply",
+            serde_json::to_value(apply_request(&state, victim, &boss, "victim-publish")).unwrap(),
+        )
+        .await;
+        eprintln!("REVIEW publish victim by boss: {status} {body}");
+        assert_ne!(
+            status,
+            StatusCode::OK,
+            "the boss published outside every person-granted namespace: {body}"
+        );
+    }
+
     #[tokio::test]
     async fn an_agent_moves_a_seat_queue_only_with_queue_authority() {
         const SEAT: &str = "agent/fleet/worker";
@@ -11043,7 +11541,7 @@ mission "queued" state="ready" {
         assert_eq!(state.store.seat_queue(SEAT).unwrap().move_count, 0);
 
         // Only a person grants authority. An agent cannot declare itself or another seat with
-        // queue or mission authority, but it can still declare a seat without any.
+        // queue or mission authority.
         for (key, declaration) in [
             (
                 "self-grant",
@@ -11088,7 +11586,8 @@ mission "queued" state="ready" {
             .unwrap(),
         )
         .await;
-        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        assert_eq!(body["code"], "agent-seat-publication-denied", "{body}");
         let (status, body) = json_request(
             app.clone(),
             "/v1/agent-queue-moves",

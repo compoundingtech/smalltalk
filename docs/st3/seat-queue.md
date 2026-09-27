@@ -100,8 +100,11 @@ seat has no authority over its own queue unless a rule names it. The daemon read
 the agent's current desired declaration when the move arrives, and refuses a move outside it with
 `queue-authority-denied`, or `missing-agent-queue-authority` when the agent has no declaration.
 An agent cannot grant itself the authority: a top-level agent declaration that an agent publishes
-is refused with `agent-authority-grant-denied` when it carries `queue-authority` or
-`mission-authority`.
+is refused with `agent-authority-grant-denied` when it carries `queue-authority`,
+`mission-authority`, or `seat-authority`. Agents may declare or stop a top-level seat only when a
+person grants `seat-authority { declare "NAMESPACE/*"; stop "NAMESPACE/*" }` in the agent's
+current declaration. A seat with authority cannot be re-declared by an agent, because that would
+remove its person's grant.
 The agent's move goes to `POST /v1/agent-queue-moves`, because client-v0 actions carry only
 person authority. That route also accepts a person. With `--json`, it prints the move claim.
 
@@ -215,12 +218,12 @@ others.
   agents in bounds and is not a security boundary against local processes. Removing a grant stops
   later moves and leaves earlier ones in place. Paired and typed clients have no agent path;
   client-v0 actions stay person-only.
-- **An agent can re-declare its own seat.** In one live eval run an omp seat ran
+- **An agent once re-declared its own seat.** In one live eval run an omp seat ran
   `st3 agents start` for its own identity, as itself. The daemon accepted the declaration, which
   replaced the eval's: it dropped the model and the audit environment and set `restart always`.
   Eval cleanup then no longer owned the seat and could not remove its terminal, so the run was
-  void although every judge passed. The declaration carried no authority, so the grant check above
-  does not apply. Who may publish a top-level agent declaration is outside this change.
+  void although every judge passed. The later `seat-authority` check refuses this unless a person
+  grants the agent permission to declare that seat.
 - **A reorder does not withdraw a wake that was already sent.** If the old head was woken and not
   yet claimed, the seat also receives a wake for the new head. Withdrawing the old wake would count
   as a closed attempt and could exhaust wakes when moves go back and forth.

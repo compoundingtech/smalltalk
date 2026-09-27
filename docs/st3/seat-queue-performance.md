@@ -12,7 +12,8 @@ after the extra wakeups are explained, or accept the cost knowingly.
 
 - **For merging:** the seat queue works with live agents. 16 of the 18 runs last night on Claude,
   Codex and omp seats passed. One Claude seat never reached idle before any work existed. One omp
-  run is void because the agent re-declared its own seat, and `16aa754` now refuses that. No seat
+  run is void because the agent re-declared its own seat. The later authority fix refuses an
+  agent's seat declaration unless a person granted `seat-authority`. No seat
   claimed out of order, preempted a held claim, or used terminal input. The reads are cheap.
 - **Against merging now:** after about an hour, the branch daemon's voluntary context switches
   rose from about 6,000 to 10,000–12,000 a minute and stayed there. Its thread count went from 20
@@ -22,7 +23,7 @@ after the extra wakeups are explained, or accept the cost knowingly.
 - **Memory growth is not the branch's.** Resident memory grew 11 to 13 MiB an hour on both builds
   for the whole night. The branch ended 22 MiB higher (232 against 210 MiB).
 - **The measured build is not the branch head.** The overnight run used `2ee767c`. `37ac4b2` and
-  `16aa754` add agent queue moves and the seat declaration check, and were not measured overnight.
+  `16aa754` added agent queue moves. The later seat authority fix was not measured overnight.
 
 ## Result
 

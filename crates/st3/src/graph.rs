@@ -96,6 +96,118 @@ pub(crate) fn parse_execution_intent(
     parse_intent_with_owner(source, default_host, Some(&owner), true)
 }
 
+/// The placeholder variables a mission's declarations are interpolated with when they are
+/// checked without a run.
+pub(crate) fn runtime_proof_variables(
+    mission: &crate::model::MissionSpec,
+) -> BTreeMap<String, String> {
+    let mut variables = BTreeMap::from([
+        ("ST_MISSION".into(), mission.id.clone()),
+        ("ST_MISSION_REVISION".into(), mission.revision.clone()),
+        ("ST_MISSION_RUN".into(), "migration-proof".into()),
+        ("ST_RUN_GENERATION".into(), "migration-generation".into()),
+        ("ST_ROOT_MISSION_RUN".into(), "migration-proof".into()),
+        ("ST_ROOT_MISSION_RUN_ID".into(), "migration-proof".into()),
+        ("ST_WORKSPACE".into(), "/tmp/st3-migration-workspace".into()),
+        ("ST_REQUESTER".into(), "person/migration-reviewer".into()),
+        ("ST_STEP".into(), "migration-step".into()),
+        (
+            "ST_STEP_RUN".into(),
+            "step-run/migration-generation/migration-step".into(),
+        ),
+        ("ST_ATTEMPT".into(), "1".into()),
+        ("ST_ASSIGNEE".into(), "agent/migration-proof/worker".into()),
+        ("ST_PARENT_STEP_RUN".into(), String::new()),
+        ("ST_GATE".into(), "migration-gate".into()),
+        ("ST_AGENT".into(), "agent/migration-proof/worker".into()),
+        ("ST_LOOP_ROUND".into(), "1".into()),
+        ("ST_LOOP_FEEDBACK".into(), String::new()),
+        ("ST_LOOP_ITEM_ID".into(), "migration-item".into()),
+        ("ST_CANDIDATE_INDEX".into(), "1".into()),
+        ("loop.round".into(), "1".into()),
+        ("loop.feedback".into(), String::new()),
+        ("loop.item.id".into(), "migration-item".into()),
+        ("loop.item.*".into(), "migration-value".into()),
+        ("candidate.index".into(), "1".into()),
+        ("PATH".into(), "/usr/local/bin:/usr/bin:/bin".into()),
+    ]);
+    variables.extend(mission.inputs.iter().map(|(name, input)| {
+        let value = match input.kind {
+            crate::model::MissionInputKind::Text => format!("migration-{name}"),
+            crate::model::MissionInputKind::Resource => {
+                format!("resource/migration-{name}")
+            }
+        };
+        (format!("input.{name}"), value)
+    }));
+    variables
+}
+
+/// The authority granted to agents declared inside a mission, in its own declarations, its
+/// steps' declarations, or any nested mission, keyed by the agent subject of a proof run. Only a
+/// person grants authority, so an agent may not publish or revise a mission whose grants exceed
+/// the ones already published.
+pub fn mission_declared_authority_grants(
+    mission: &crate::model::MissionSpec,
+    default_host: &str,
+) -> Result<
+    BTreeMap<
+        String,
+        (
+            crate::model::MissionAuthority,
+            crate::model::QueueAuthority,
+            crate::model::SeatAuthority,
+        ),
+    >,
+    St3Error,
+> {
+    fn visit(
+        mission: &crate::model::MissionSpec,
+        default_host: &str,
+        grants: &mut BTreeMap<
+            String,
+            (
+                crate::model::MissionAuthority,
+                crate::model::QueueAuthority,
+                crate::model::SeatAuthority,
+            ),
+        >,
+    ) -> Result<(), St3Error> {
+        let variables = runtime_proof_variables(mission);
+        let sources = mission.declarations_kdl.iter().chain(
+            mission
+                .steps
+                .values()
+                .filter_map(|step| step.declarations_kdl.as_ref()),
+        );
+        for source in sources {
+            let source = crate::mission::interpolate_kdl(source, &variables)?;
+            let runtime = parse_execution_intent(&source, default_host, "migration-proof")?;
+            for (subject, desired) in &runtime.subjects {
+                if desired.kind == "agent" && declares_authority(&desired.desired) {
+                    grants.insert(
+                        subject.clone(),
+                        (
+                            agent_mission_authority(&desired.desired),
+                            agent_queue_authority(&desired.desired),
+                            agent_seat_authority(&desired.desired),
+                        ),
+                    );
+                }
+            }
+        }
+        for step in mission.steps.values() {
+            if let Some(nested) = &step.nested_mission {
+                visit(nested, default_host, grants)?;
+            }
+        }
+        Ok(())
+    }
+    let mut grants = BTreeMap::new();
+    visit(mission, default_host, &mut grants)?;
+    Ok(grants)
+}
+
 pub fn validate_mission_runtimes(
     intent: &NormalizedIntent,
     default_host: &str,
@@ -117,45 +229,7 @@ pub fn validate_mission_runtimes(
             Ok(())
         }
 
-        let mut variables = BTreeMap::from([
-            ("ST_MISSION".into(), mission.id.clone()),
-            ("ST_MISSION_REVISION".into(), mission.revision.clone()),
-            ("ST_MISSION_RUN".into(), "migration-proof".into()),
-            ("ST_RUN_GENERATION".into(), "migration-generation".into()),
-            ("ST_ROOT_MISSION_RUN".into(), "migration-proof".into()),
-            ("ST_ROOT_MISSION_RUN_ID".into(), "migration-proof".into()),
-            ("ST_WORKSPACE".into(), "/tmp/st3-migration-workspace".into()),
-            ("ST_REQUESTER".into(), "person/migration-reviewer".into()),
-            ("ST_STEP".into(), "migration-step".into()),
-            (
-                "ST_STEP_RUN".into(),
-                "step-run/migration-generation/migration-step".into(),
-            ),
-            ("ST_ATTEMPT".into(), "1".into()),
-            ("ST_ASSIGNEE".into(), "agent/migration-proof/worker".into()),
-            ("ST_PARENT_STEP_RUN".into(), String::new()),
-            ("ST_GATE".into(), "migration-gate".into()),
-            ("ST_AGENT".into(), "agent/migration-proof/worker".into()),
-            ("ST_LOOP_ROUND".into(), "1".into()),
-            ("ST_LOOP_FEEDBACK".into(), String::new()),
-            ("ST_LOOP_ITEM_ID".into(), "migration-item".into()),
-            ("ST_CANDIDATE_INDEX".into(), "1".into()),
-            ("loop.round".into(), "1".into()),
-            ("loop.feedback".into(), String::new()),
-            ("loop.item.id".into(), "migration-item".into()),
-            ("loop.item.*".into(), "migration-value".into()),
-            ("candidate.index".into(), "1".into()),
-            ("PATH".into(), "/usr/local/bin:/usr/bin:/bin".into()),
-        ]);
-        variables.extend(mission.inputs.iter().map(|(name, input)| {
-            let value = match input.kind {
-                crate::model::MissionInputKind::Text => format!("migration-{name}"),
-                crate::model::MissionInputKind::Resource => {
-                    format!("resource/migration-{name}")
-                }
-            };
-            (format!("input.{name}"), value)
-        }));
+        let variables = runtime_proof_variables(mission);
         if let Some(source) = &mission.declarations_kdl {
             validate_source(source, &variables, default_host, subjects)?;
         }
@@ -2278,6 +2352,7 @@ fn validate_agent_body(document: &KdlDocument, owner: &str) -> Result<(), St3Err
         "harness",
         "mission-authority",
         "queue-authority",
+        "seat-authority",
         "pty",
         "exec",
     ];
@@ -2296,6 +2371,7 @@ fn validate_agent_body(document: &KdlDocument, owner: &str) -> Result<(), St3Err
         "harness",
         "mission-authority",
         "queue-authority",
+        "seat-authority",
     ] {
         unique_child(document, child)?;
     }
@@ -2320,6 +2396,19 @@ fn validate_agent_body(document: &KdlDocument, owner: &str) -> Result<(), St3Err
                 verbs: &["move"],
                 empty: "empty-queue-authority",
                 duplicate: "duplicate-queue-authority",
+                pattern: validate_queue_authority_pattern,
+            },
+            owner,
+        )?;
+    }
+    if let Some(authority) = unique_child(document, "seat-authority")? {
+        validate_authority_block(
+            authority,
+            AuthorityBlock {
+                name: "seat-authority",
+                verbs: &["declare", "stop"],
+                empty: "empty-seat-authority",
+                duplicate: "duplicate-seat-authority",
                 pattern: validate_queue_authority_pattern,
             },
             owner,
@@ -2485,9 +2574,9 @@ fn authority_rules<'a>(desired: &'a Value, block: &str) -> Vec<(&'a str, &'a str
         .collect()
 }
 
-/// Whether a desired agent declaration grants mission or queue authority.
+/// Whether a desired agent declaration grants authority.
 pub fn declares_authority(desired: &Value) -> bool {
-    ["mission-authority", "queue-authority"]
+    ["mission-authority", "queue-authority", "seat-authority"]
         .iter()
         .any(|block| !authority_rules(desired, block).is_empty())
 }
@@ -2513,6 +2602,18 @@ pub fn agent_queue_authority(desired: &Value) -> crate::model::QueueAuthority {
             .map(|(_, pattern)| pattern.to_owned())
             .collect(),
     }
+}
+
+pub fn agent_seat_authority(desired: &Value) -> crate::model::SeatAuthority {
+    let mut authority = crate::model::SeatAuthority::default();
+    for (verb, pattern) in authority_rules(desired, "seat-authority") {
+        match verb {
+            "declare" => authority.declare.push(pattern.to_owned()),
+            "stop" => authority.stop.push(pattern.to_owned()),
+            _ => {}
+        }
+    }
+    authority
 }
 
 fn validate_task_body(
