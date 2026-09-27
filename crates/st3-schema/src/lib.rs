@@ -675,6 +675,7 @@ fn resource_specs() -> BTreeMap<String, ResourceSpec> {
                 ("state", string()),
                 ("pull_requests", array()),
                 ("issues", array()),
+                ("repository_id", integer()),
             ],
         ),
     );
@@ -1581,6 +1582,24 @@ fn claim_specs() -> BTreeMap<String, ClaimSpec> {
             &["subscription"],
         ),
         (
+            "subscription.mission-request-cancelled",
+            &["subscription"],
+            WritePolicy::AuthorizedParticipant,
+            Cardinality::Append,
+            Some("subscriptions"),
+            true,
+            &["subscription"],
+        ),
+        (
+            "subscription.mission-request-released",
+            &["subscription"],
+            WritePolicy::AuthorizedParticipant,
+            Cardinality::Append,
+            Some("subscriptions"),
+            true,
+            &["subscription"],
+        ),
+        (
             "subscription.mission-started",
             &["subscription"],
             WritePolicy::SystemOnly,
@@ -2270,7 +2289,11 @@ fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
             ("workspace", required_string()),
             ("discovery", required_string()),
             ("requester", reference_to(&["agent", "person"])),
+            ("held", boolean()),
         ],
+        "subscription.mission-request-cancelled" | "subscription.mission-request-released" => {
+            &[("request", required_string()), ("reason", string())]
+        }
         "subscription.mission-started" => &[
             ("request", required_string()),
             ("mission_run", required_reference_to(&["mission-run"])),
@@ -2589,6 +2612,8 @@ mod tests {
                 "step-run.carried",
                 "step-run.retried",
                 "step-run.state",
+                "subscription.mission-request-cancelled",
+                "subscription.mission-request-released",
                 "subscription.mission-requested",
                 "subscription.mission-started",
                 "subscription.state",
@@ -2759,6 +2784,8 @@ mod tests {
                 "message.read",
                 "planning-session.candidate-submitted",
                 "planning-session.question-requested",
+                "subscription.mission-request-cancelled",
+                "subscription.mission-request-released",
                 "work.claimed",
                 "work.failed",
                 "work.progress",

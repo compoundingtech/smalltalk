@@ -1447,6 +1447,28 @@ pub struct AttentionRequest {
     pub idempotency_key: String,
 }
 
+/// One mission request that a subscription recorded, with its current disposition: `pending`,
+/// `held` for a person, `started`, or `cancelled`.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct SubscriptionRequestView {
+    pub request: String,
+    pub subscription: String,
+    pub resource: String,
+    pub mission: String,
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mission_run: Option<String>,
+    pub requested_at_unix_ms: u128,
+}
+
+/// A person's decision to release or cancel one subscription request.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct SubscriptionRequestDecision {
+    pub actor: String,
+    pub reason: String,
+    pub idempotency_key: String,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct AttentionResolveRequest {
     pub outcome: String,

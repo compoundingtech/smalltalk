@@ -6323,18 +6323,27 @@ impl<R: RuntimeControl> Reconciler<R> {
             let requests = self
                 .store
                 .claims_for(&item.subject, Some("subscription.mission-requested"))?;
-            let starts = self
+            let dispositions = self
                 .store
-                .claims_for(&item.subject, Some("subscription.mission-started"))?;
+                .subscription_requests(&item.subject)?
+                .into_iter()
+                .map(|view| (view.request, view.status))
+                .collect::<BTreeMap<_, _>>();
+            let mut held = BTreeMap::<String, usize>::new();
             for request in requests {
-                if starts.iter().any(|claim| {
-                    claim
-                        .body
-                        .pointer("/fields/request")
-                        .and_then(Value::as_str)
-                        == Some(request.id.as_str())
-                }) {
-                    continue;
+                match dispositions.get(&request.id).map(String::as_str) {
+                    Some("pending") => {}
+                    Some("held") => {
+                        let observation = request
+                            .body
+                            .pointer("/evidence/0")
+                            .and_then(Value::as_str)
+                            .unwrap_or(request.id.as_str())
+                            .to_owned();
+                        *held.entry(observation).or_default() += 1;
+                        continue;
+                    }
+                    _ => continue,
                 }
                 let fields = request.body.get("fields").unwrap_or(&request.body);
                 let Some(mission) = fields.get("mission").and_then(Value::as_str) else {
@@ -6404,7 +6413,43 @@ impl<R: RuntimeControl> Reconciler<R> {
                     idempotency_key: Some(format!("subscription-mission-started:{}", run.id)),
                 })?;
             }
+            for (observation, count) in held {
+                self.request_held_subscription_attention(&item.subject, &observation, count)?;
+            }
         }
+        Ok(())
+    }
+
+    /// Ask a person once per observation to release or cancel the requests it held.
+    fn request_held_subscription_attention(
+        &self,
+        subscription: &str,
+        observation: &str,
+        count: usize,
+    ) -> Result<()> {
+        let digest = hex::encode(sha2::Sha256::digest(
+            format!("held-subscription-requests:{subscription}:{observation}").as_bytes(),
+        ));
+        let attention_subject = format!("attention/{}", &digest[..32]);
+        if self.store.attention_request(&attention_subject)?.is_some() {
+            return Ok(());
+        }
+        self.store.request_attention(
+            &attention_subject,
+            &AttentionRequest {
+                reviewer: "person/operator".into(),
+                title: "A subscription is holding mission requests".into(),
+                reason: format!(
+                    "One observation for {subscription} requested more than {} mission runs, so {count} wait for a person. List them with `st3 missions requests {subscription}`, then release or cancel each one.",
+                    crate::store::MAX_OBSERVATION_DELIVERIES
+                ),
+                severity: "warning".into(),
+                targets: vec![subscription.into()],
+                actor: "agent/st3/reconciler".into(),
+                idempotency_key: format!("held-subscription-requests:{}", &digest[..32]),
+            },
+        )?;
+        self.signal_changed();
         Ok(())
     }
 
@@ -14115,6 +14160,265 @@ subscription "reviews" {{
                 .active_mission_runs_for_mission("review")
                 .unwrap()
                 .len(),
+            1
+        );
+    }
+
+    const REDELIVERY_REVIEW_SOURCE: &str = r#"version 2
+mission "review" state="ready" {
+  concurrent-runs max=10
+  input "source" kind="resource"
+  goal "Review one discovered item."
+  step "review" { agentless }
+}"#;
+
+    /// Declare one repository observer at `locator` and one issue-triage subscription.
+    fn watch_repository(
+        store: &Store,
+        locator: &str,
+        review: &str,
+        key: &str,
+    ) -> Vec<(String, crate::model::SubscriptionSpec)> {
+        apply_source(
+            store,
+            &format!(
+                r#"version 2
+resource "repo" {{ kind "vcs.repository" }}
+observer "repo" {{ resource "resource/repo"; provider "github.repository"; locator "{locator}"; field "issues" }}
+subscription "triage" {{
+  observer "observer/repo"
+  on "issues"
+  delivery "mission" {{
+    mission "review@{review}"
+    resource "source"
+    workspace "/tmp/st3-triage"
+  }}
+}}"#
+            ),
+            key,
+        );
+        let desired = store.desired_subjects().unwrap();
+        let subscription = desired
+            .iter()
+            .find(|item| item.subject == "subscription/triage")
+            .unwrap();
+        vec![(
+            subscription.subject.clone(),
+            crate::graph::subscription_spec(&subscription.desired).unwrap(),
+        )]
+    }
+
+    fn record_issues(
+        store: &Store,
+        facts: &Value,
+        subscriptions: &[(String, crate::model::SubscriptionSpec)],
+    ) {
+        store
+            .record_resource_observation(
+                "observer/repo",
+                &store
+                    .selected_desired_revision("observer/repo")
+                    .unwrap()
+                    .unwrap(),
+                None,
+                "resource/repo",
+                None,
+                facts,
+                now_ms() + 60_000,
+                subscriptions,
+            )
+            .unwrap();
+    }
+
+    /// List open issues the way the GitHub repository provider does and record the observation.
+    fn observe_issues(
+        store: &Store,
+        locator: &str,
+        numbers: impl IntoIterator<Item = u64>,
+        subscriptions: &[(String, crate::model::SubscriptionSpec)],
+    ) {
+        let previous = store
+            .latest_actual_value("resource/repo")
+            .unwrap()
+            .and_then(|actual| actual.get("facts").cloned());
+        let issues = numbers
+            .into_iter()
+            .map(|number| {
+                serde_json::json!({
+                    "number": number,
+                    "title": format!("Issue {number}"),
+                    "html_url": format!("https://github.com/{locator}/issues/{number}"),
+                })
+            })
+            .collect::<Vec<_>>();
+        let facts = crate::resource::normalize_github_repository(
+            previous.as_ref(),
+            7,
+            &[],
+            &issues,
+            &BTreeSet::from(["issues".into()]),
+        )
+        .unwrap();
+        record_issues(store, &facts, subscriptions);
+    }
+
+    #[test]
+    fn a_renamed_locator_and_a_first_complete_listing_deliver_nothing() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        apply_source(&store, REDELIVERY_REVIEW_SOURCE, "review-mission");
+        let review = store
+            .mission_spec("review", None)
+            .unwrap()
+            .unwrap()
+            .revision;
+        let subscriptions = watch_repository(&store, "acme/old", &review, "watch-old");
+        // Facts from the first-page reader: it only ever saw the newest issues.
+        let first_page = (145..=150)
+            .map(|number| serde_json::json!({"number": number, "title": format!("Issue {number}")}))
+            .collect::<Vec<_>>();
+        record_issues(
+            &store,
+            &serde_json::json!({"issues": first_page}),
+            &subscriptions,
+        );
+        let requests = || {
+            store
+                .claims_for(
+                    "subscription/triage",
+                    Some("subscription.mission-requested"),
+                )
+                .unwrap()
+        };
+
+        observe_issues(&store, "acme/old", 20..=150, &subscriptions);
+        assert!(
+            requests().is_empty(),
+            "a first complete listing finds missed issues, not new ones"
+        );
+
+        let subscriptions = watch_repository(&store, "acme/new", &review, "watch-renamed");
+        observe_issues(&store, "acme/new", 20..=150, &subscriptions);
+        assert!(
+            requests().is_empty(),
+            "a renamed locator keeps every item identity"
+        );
+
+        observe_issues(&store, "acme/new", (20..=150).chain([151]), &subscriptions);
+        let requests = requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0].body["fields"]["resource"],
+            "resource/repo/issue/151"
+        );
+    }
+
+    #[test]
+    fn one_observation_holds_excess_deliveries_for_a_person() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        apply_source(&store, REDELIVERY_REVIEW_SOURCE, "review-mission");
+        let review = store
+            .mission_spec("review", None)
+            .unwrap()
+            .unwrap()
+            .revision;
+        let subscriptions = watch_repository(&store, "acme/repo", &review, "watch");
+        observe_issues(&store, "acme/repo", [1], &subscriptions);
+        observe_issues(&store, "acme/repo", 1..=8, &subscriptions);
+        let statuses = || {
+            store
+                .subscription_requests("subscription/triage")
+                .unwrap()
+                .into_iter()
+                .map(|request| (request.request, request.status))
+                .collect::<Vec<_>>()
+        };
+        let requested = statuses();
+        assert_eq!(requested.len(), 7);
+        let held = requested
+            .iter()
+            .filter(|(_, status)| status == "held")
+            .map(|(request, _)| request.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(held.len(), 7 - crate::store::MAX_OBSERVATION_DELIVERIES);
+
+        let reconciler = Reconciler::new(
+            store.clone(),
+            Arc::new(FakeRuntime::default()),
+            "node".into(),
+            Arc::new(Notify::new()),
+        );
+        let desired = store.desired_subjects().unwrap();
+        reconciler
+            .reconcile_subscription_missions(&desired)
+            .unwrap();
+        let runs = || {
+            store
+                .active_mission_runs_for_mission("review")
+                .unwrap()
+                .len()
+        };
+        assert_eq!(runs(), crate::store::MAX_OBSERVATION_DELIVERIES);
+        let attention = store.attention_items(Some("person/operator")).unwrap();
+        assert_eq!(
+            attention
+                .iter()
+                .filter(|item| item.title == "A subscription is holding mission requests")
+                .count(),
+            1
+        );
+
+        let decide = |request: &str, decision: &str, actor: &str, key: &str| {
+            store.decide_subscription_request(
+                request,
+                decision,
+                &crate::model::SubscriptionRequestDecision {
+                    actor: actor.into(),
+                    reason: "a person reviewed the held request".into(),
+                    idempotency_key: key.into(),
+                },
+            )
+        };
+        let agent = decide(&held[0], "release", "agent/node.triage", "agent-release").unwrap_err();
+        assert_eq!(agent.code, "subscription-request-person-only");
+        assert_eq!(
+            decide(&held[0], "release", "person/operator", "release")
+                .unwrap()
+                .status,
+            "pending"
+        );
+        assert_eq!(
+            decide(&held[1], "cancel", "person/operator", "cancel")
+                .unwrap()
+                .status,
+            "cancelled"
+        );
+        assert_eq!(
+            decide(&held[1], "cancel", "person/operator", "cancel")
+                .unwrap()
+                .status,
+            "cancelled",
+            "an exact retry returns the recorded decision"
+        );
+        let closed = decide(&held[1], "release", "person/operator", "late-release").unwrap_err();
+        assert_eq!(closed.code, "subscription-request-not-open");
+
+        reconciler
+            .reconcile_subscription_missions(&desired)
+            .unwrap();
+        assert_eq!(runs(), crate::store::MAX_OBSERVATION_DELIVERIES + 1);
+        let final_statuses = statuses();
+        assert_eq!(
+            final_statuses
+                .iter()
+                .filter(|(_, status)| status == "started")
+                .count(),
+            crate::store::MAX_OBSERVATION_DELIVERIES + 1
+        );
+        assert_eq!(
+            final_statuses
+                .iter()
+                .filter(|(_, status)| status == "cancelled")
+                .count(),
             1
         );
     }

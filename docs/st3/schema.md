@@ -3,7 +3,7 @@
 This file is generated from `st3-schema`.
 
 Schema: `st3.v1`
-Digest: `07a9374d50b81abb57551eba2e648a46867e8eec25806aa2dc7b8aee8f7c7431`
+Digest: `bfafca1a738e5ee295c88ea943a5dd0789dd7232a34cc8aa7cc1b92f5e55bf35`
 
 ## Subject families
 
@@ -49,7 +49,7 @@ Custom subjects use `custom/NAMESPACE/NAME`. Custom claims use `custom.NAMESPACE
 | `vcs.issue` | `author:string`, `created_at:string`, `labels:array`, `number:integer`, `repository:subject-reference`, `state:string`, `title:string`, `updated_at:string`, `url:string` | A version control issue. |
 | `vcs.pull-request` | `author:string`, `base:subject-reference`, `checks:array`, `created_at:string`, `draft:boolean`, `head:subject-reference`, `merged:boolean`, `number:integer`, `repository:subject-reference`, `reviews:array`, `state:string`, `title:string`, `updated_at:string`, `url:string` | A version control pull request. |
 | `vcs.ref` | `ancestors:array`, `head:string`, `name:string immutable`, `ref_type:string`, `repository:subject-reference immutable`, `target:subject-reference`, `url:string` | A named version control reference. |
-| `vcs.repository` | `default_ref:subject-reference`, `head:subject-reference`, `issues:array`, `pull_requests:array`, `state:string`, `url:string`, `vcs:string` | A version control repository. |
+| `vcs.repository` | `default_ref:subject-reference`, `head:subject-reference`, `issues:array`, `pull_requests:array`, `repository_id:integer`, `state:string`, `url:string`, `vcs:string` | A version control repository. |
 | `custom.NAMESPACE.NAME` | open fact bag | A namespaced custom resource. |
 
 ## Claim kinds
@@ -127,7 +127,9 @@ Custom subjects use `custom/NAMESPACE/NAME`. Custom claims use `custom.NAMESPACE
 | `step-run.carried` | `step-run` | `system-only` | `once` | `attempt:integer`, `definition_hash:string`, `source:subject-reference`, `source_generation:subject-reference`, `source_step_run:subject-reference`, `status:string`, `worker_reported:boolean` | `step` |
 | `step-run.retried` | `step-run` | `system-only` | `append` | `attempt:integer`, `not_before_unix_ms:integer`, `reason:string`, `status:string` | `step` |
 | `step-run.state` | `step-run` | `system-only` | `state-transition` | `attempt:integer`, `readiness_epoch:integer`, `reason:string`, `status:string` | `step` |
-| `subscription.mission-requested` | `subscription` | `system-only` | `append` | `discovery!:string`, `mission!:subject-reference(mission)`, `mission_revision!:string`, `requester:subject-reference(agent|person)`, `resource!:subject-reference(resource)`, `resource_input!:string`, `workspace!:string` | `subscription` |
+| `subscription.mission-request-cancelled` | `subscription` | `authorized-participant` | `append` | `reason:string`, `request!:string` | `subscription` |
+| `subscription.mission-request-released` | `subscription` | `authorized-participant` | `append` | `reason:string`, `request!:string` | `subscription` |
+| `subscription.mission-requested` | `subscription` | `system-only` | `append` | `discovery!:string`, `held:boolean`, `mission!:subject-reference(mission)`, `mission_revision!:string`, `requester:subject-reference(agent|person)`, `resource!:subject-reference(resource)`, `resource_input!:string`, `workspace!:string` | `subscription` |
 | `subscription.mission-started` | `subscription` | `system-only` | `append` | `mission_run!:subject-reference(mission-run)`, `request!:string` | `subscription` |
 | `subscription.state` | `subscription` | `system-only` | `state-transition` | `fields:array`, `observer:subject-reference`, `reason:string`, `state!:string`, `to:subject-reference` | `subscription` |
 | `terminal.input.requested` | `agent`, `pty` | `authorized-requester` | `append` | `byte_count:integer`, `incarnation_id:string`, `intent:string`, `mode:string`, `runtime_id:string`, `sequence:integer`, `sha256:string` |  |

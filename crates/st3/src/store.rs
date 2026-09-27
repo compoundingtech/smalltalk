@@ -29,8 +29,8 @@ use crate::model::{
     ReplicationPeerStatus, ReplicationReceipt, ReplicationStatus, ResourceObservationOutcome,
     ResourceRefreshOperation, RevisionCutover, RevisionProposalView, RevisionSubmissionView,
     RunGenerationView, RuntimeResetOperation, St3Error, StatusResponse, StepRunView, SubjectChange,
-    SubjectStatus, SubscriptionConditionSpec, SubscriptionSpec, UsageSummary, WorkRequest,
-    WorkSelector, WorkWakeView,
+    SubjectStatus, SubscriptionConditionSpec, SubscriptionRequestDecision, SubscriptionRequestView,
+    SubscriptionSpec, UsageSummary, WorkRequest, WorkSelector, WorkWakeView,
 };
 #[cfg(test)]
 use crate::model::{ReplicaRange, ReplicationBatch, ReplicationResponse};
@@ -649,12 +649,74 @@ fn migrate_schema(connection: &Connection) -> Result<()> {
     Ok(())
 }
 
+fn subscription_request_view(
+    request: &ClaimRecord,
+    decisions: &[ClaimRecord],
+) -> SubscriptionRequestView {
+    let fields = request.body.get("fields").unwrap_or(&request.body);
+    let field = |name: &str| {
+        fields
+            .get(name)
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned()
+    };
+    let decision = |kind: &str| {
+        decisions.iter().find(|claim| {
+            claim.kind == kind
+                && claim
+                    .body
+                    .pointer("/fields/request")
+                    .and_then(Value::as_str)
+                    == Some(request.id.as_str())
+        })
+    };
+    let started = decision("subscription.mission-started");
+    let status = if started.is_some() {
+        "started"
+    } else if decision("subscription.mission-request-cancelled").is_some() {
+        "cancelled"
+    } else if fields.get("held").and_then(Value::as_bool) == Some(true)
+        && decision("subscription.mission-request-released").is_none()
+    {
+        "held"
+    } else {
+        "pending"
+    };
+    SubscriptionRequestView {
+        request: request.id.clone(),
+        subscription: request.subject.clone(),
+        resource: field("resource"),
+        mission: field("mission"),
+        status: status.into(),
+        mission_run: started
+            .and_then(|claim| claim.body.pointer("/fields/mission_run"))
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        requested_at_unix_ms: request.accepted_at_unix_ms,
+    }
+}
+
+/// The most mission runs one resource observation requests at once for one subscription. The
+/// remaining requests wait for a person.
+pub const MAX_OBSERVATION_DELIVERIES: usize = 5;
+
 fn discovered_collection_items(
     repository: &str,
     field: &str,
     previous: Option<&Value>,
     current: &Value,
 ) -> Vec<(String, String, Value)> {
+    // The first listing that names its repository ID is also the first complete listing. The
+    // earlier facts came from a first-page read, so the items this listing adds were missed, not
+    // opened. They become known without a delivery.
+    if current.get("repository_id").is_some()
+        && previous
+            .and_then(|value| value.get("repository_id"))
+            .is_none()
+    {
+        return Vec::new();
+    }
     let Some(previous_items) = previous
         .and_then(|value| value.get(field))
         .and_then(Value::as_array)
@@ -7575,7 +7637,9 @@ impl Store {
                             .map(|claim| vec![(resource.to_owned(), claim.id.clone())])
                             .unwrap_or_default()
                     };
-                    for (delivery_resource, discovery) in discoveries {
+                    for (index, (delivery_resource, discovery)) in
+                        discoveries.into_iter().enumerate()
+                    {
                         let mut request_fields = json!({
                             "mission": format!("mission/{mission}"),
                             "mission_revision": revision,
@@ -7584,6 +7648,14 @@ impl Store {
                             "workspace": workspace,
                             "discovery": discovery,
                         });
+                        // One observation starts a bounded number of runs. A person releases or
+                        // cancels the rest.
+                        if index >= MAX_OBSERVATION_DELIVERIES {
+                            request_fields
+                                .as_object_mut()
+                                .expect("subscription request fields are an object")
+                                .insert("held".into(), Value::Bool(true));
+                        }
                         if let Some(requester) = subscription.requester.as_deref() {
                             request_fields
                                 .as_object_mut()
@@ -7650,6 +7722,101 @@ impl Store {
             .map_err(internal)?;
         transaction.commit().map_err(internal)?;
         Ok(outcome)
+    }
+
+    /// Every mission request that a subscription recorded, oldest first, with its disposition.
+    pub fn subscription_requests(
+        &self,
+        subscription: &str,
+    ) -> Result<Vec<SubscriptionRequestView>> {
+        let mut decisions = self.claims_for(subscription, Some("subscription.mission-started"))?;
+        for kind in [
+            "subscription.mission-request-cancelled",
+            "subscription.mission-request-released",
+        ] {
+            decisions.extend(self.claims_for(subscription, Some(kind))?);
+        }
+        Ok(self
+            .claims_for(subscription, Some("subscription.mission-requested"))?
+            .into_iter()
+            .map(|request| subscription_request_view(&request, &decisions))
+            .collect())
+    }
+
+    /// Release a held subscription request, or cancel a pending or held one, as a person.
+    pub fn decide_subscription_request(
+        &self,
+        request: &str,
+        decision: &str,
+        input: &SubscriptionRequestDecision,
+    ) -> Result<SubscriptionRequestView, St3Error> {
+        if !input.actor.starts_with("person/") {
+            return Err(St3Error::new(
+                "subscription-request-person-only",
+                "only a person may release or cancel a subscription request",
+            ));
+        }
+        if input.reason.trim().is_empty() {
+            return Err(St3Error::new(
+                "missing-subscription-request-reason",
+                "a subscription request decision needs a reason",
+            ));
+        }
+        let claim = self
+            .claim_by_id(request)
+            .map_err(internal)?
+            .filter(|claim| claim.kind == "subscription.mission-requested")
+            .ok_or_else(|| {
+                St3Error::new(
+                    "missing-subscription-request",
+                    format!("subscription request `{request}` does not exist"),
+                )
+            })?;
+        let view = |store: &Self| -> Result<SubscriptionRequestView, St3Error> {
+            store
+                .subscription_requests(&claim.subject)
+                .map_err(internal)?
+                .into_iter()
+                .find(|view| view.request == claim.id)
+                .ok_or_else(|| St3Error::new("internal", "the subscription request vanished"))
+        };
+        if self
+            .operation_claim(&input.idempotency_key)
+            .map_err(internal)?
+            .is_some()
+        {
+            return view(self);
+        }
+        let current = view(self)?;
+        let kind = match (decision, current.status.as_str()) {
+            ("cancel", "pending" | "held") => "subscription.mission-request-cancelled",
+            ("release", "held") => "subscription.mission-request-released",
+            ("cancel" | "release", status) => {
+                return Err(St3Error::new(
+                    "subscription-request-not-open",
+                    format!("subscription request `{request}` is {status}"),
+                ));
+            }
+            (decision, _) => {
+                return Err(St3Error::new(
+                    "invalid-subscription-request-decision",
+                    format!("`{decision}` is not a subscription request decision"),
+                ));
+            }
+        };
+        self.append_claim(&ClaimInput {
+            subject: claim.subject.clone(),
+            kind: kind.into(),
+            actor: Some(input.actor.clone()),
+            fields: BTreeMap::from([
+                ("request".into(), Value::String(claim.id.clone())),
+                ("reason".into(), Value::String(input.reason.clone())),
+            ]),
+            evidence: vec![claim.id.clone()],
+            expected_subject: None,
+            idempotency_key: Some(input.idempotency_key.clone()),
+        })?;
+        view(self)
     }
 
     pub fn claims_for(&self, subject: &str, kind: Option<&str>) -> Result<Vec<ClaimRecord>> {

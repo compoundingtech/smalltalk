@@ -353,6 +353,11 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
         .route("/v1/reviews/{*subject}", post(post_review))
         .route("/v1/attention", get(list_attention).post(request_attention))
         .route("/v1/attention/resolve/{*subject}", post(resolve_attention))
+        .route("/v1/subscription-requests", get(list_subscription_requests))
+        .route(
+            "/v1/subscription-requests/{decision}/{request}",
+            post(decide_subscription_request),
+        )
         .route(
             "/v1/attention/withdraw/{*subject}",
             post(withdraw_attention),
@@ -5251,6 +5256,40 @@ async fn resolve_attention(
         .store
         .resolve_attention(&subject, &request)
         .map_err(ApiError::bad)?;
+    signal_changed(&state);
+    Ok(Json(response))
+}
+
+#[derive(Deserialize)]
+struct SubscriptionRequestQuery {
+    subscription: String,
+}
+
+async fn list_subscription_requests(
+    State(state): State<AppState>,
+    Query(query): Query<SubscriptionRequestQuery>,
+) -> Result<Json<Vec<crate::model::SubscriptionRequestView>>, ApiError> {
+    let subscription = if query.subscription.starts_with("subscription/") {
+        query.subscription
+    } else {
+        format!("subscription/{}", query.subscription)
+    };
+    let store = state.store.clone();
+    blocking_store(move || store.subscription_requests(&subscription))
+        .await
+        .map(Json)
+}
+
+/// Release a held subscription request or cancel an open one as a person.
+async fn decide_subscription_request(
+    State(state): State<AppState>,
+    AxumPath((decision, request)): AxumPath<(String, String)>,
+    Json(input): Json<crate::model::SubscriptionRequestDecision>,
+) -> Result<Json<crate::model::SubscriptionRequestView>, ApiError> {
+    let store = state.store.clone();
+    let response =
+        blocking_action(move || store.decide_subscription_request(&request, &decision, &input))
+            .await?;
     signal_changed(&state);
     Ok(Json(response))
 }
