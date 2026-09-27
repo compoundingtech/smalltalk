@@ -1241,6 +1241,11 @@ The runtime gives each occurrence a deterministic mission run and a unique works
 
 The mission steps are normal claimable work. A schedule does not start another occurrence while its prior mission run remains active.
 
+Only the host that requested an occurrence's work starts it. The request can name a mission revision
+or owner run that has not reached that host yet. Then it stays pending, and the schedule records a
+`reconcile.fault` naming the cause. A request that cannot start for any other reason records
+`schedule.work-failed`, and the schedule fires again at its next occurrence.
+
 Each finite cycle can be a nested mission. The parent mission keeps the stable agent and the cycle history.
 
 Use `catch-up "latest"` when a restart must create at most one missed wake occurrence.

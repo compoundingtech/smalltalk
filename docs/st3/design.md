@@ -100,6 +100,7 @@ repository context. It cannot replace the runtime contract.
 The reconciler takes up each item of a pass on its own. The items are:
 
 - each member;
+- each observer, schedule, and subscription;
 - each mission run;
 - each later stage of the pass: intake, observers, schedules, scheduled work, subscriptions,
   provider-capacity retries, retired-agent attention, mission evaluation, and attention `until`
@@ -109,7 +110,8 @@ When an item fails or panics, the reconciler records the fault on that item's su
 on with every other item:
 
 - a member fault is a `runtime.reconcile-decision` claim;
-- a mission-run fault is a `reconcile.fault` claim on the run;
+- an observer, schedule, subscription, or mission-run fault is a `reconcile.fault` claim on that
+  subject;
 - a stage fault is a `reconcile.fault` claim on `daemon/HOST`, naming the stage.
 
 A fault is recorded again only when its cause changes. The item's next success records its

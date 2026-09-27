@@ -3,7 +3,7 @@
 This file is generated from `st3-schema`.
 
 Schema: `st3.v1`
-Digest: `73615123b36ff4735c8c2450c70596094bd7f6164829f06cdf6959dc6db056eb`
+Digest: `e97bc24ed478291b3061b51c6c4fa4fbd3fa686b6ba4d1640f91767393560de9`
 
 ## Subject families
 
@@ -100,7 +100,7 @@ Custom subjects use `custom/NAMESPACE/NAME`. Custom claims use `custom.NAMESPACE
 | `planning-session.revision-requested` | `planning-session` | `authorized-requester` | `append` | `candidate_revision:integer`, `feedback:subject-reference`, `requester:subject-reference`, `variant:string` | `feedback` |
 | `planning-session.started` | `planning-session` | `authorized-requester` | `once` | `mission:subject-reference`, `planner:subject-reference`, `planner_config:object`, `request:subject-reference`, `requester:subject-reference`, `target_generation:subject-reference`, `target_run:subject-reference`, `workspace:string` | `planning-session` |
 | `publication.operation` | `*` | `system-only` | `append` | `action:string`, `operation:string`, `status!:string` | `revision`, `reset`, `cancellation`, `refresh`, `feedback` |
-| `reconcile.fault` | `daemon`, `mission-run` | `system-only` | `append` | `reason:string`, `scope!:string`, `status!:string` |  |
+| `reconcile.fault` | `daemon`, `mission-run`, `observer`, `schedule`, `subscription` | `system-only` | `append` | `reason:string`, `scope!:string`, `status!:string` |  |
 | `record.repaired` | `repair` | `ordinary-client` | `once` | `reason!:string`, `record!:string`, `replacement!:string` | `repair` |
 | `render.applied` | `agent`, `exec`, `pty` | `system-only` | `append` | `writes:array` |  |
 | `repair.applied` | `repair` | `system-only` | `once` | `affected_subjects:array`, `item_count:integer`, `reason!:string`, `token!:string` |  |
@@ -123,6 +123,7 @@ Custom subjects use `custom/NAMESPACE/NAME`. Custom claims use `custom.NAMESPACE
 | `schedule.occurrence-cancelled` | `schedule` | `system-only` | `append` | `occurrence:integer`, `reason:string`, `revision:string` | `schedule` |
 | `schedule.occurrence-reached` | `schedule` | `system-only` | `append` | `at_unix_ms:integer`, `occurrence:integer`, `revision:string`, `scheduled:subject-reference`, `scheduled_at_unix_ms:string` | `schedule` |
 | `schedule.occurrence-scheduled` | `schedule` | `system-only` | `append` | `at_unix_ms:integer`, `occurrence:integer`, `revision:string`, `scheduled_at_unix_ms:string` | `schedule` |
+| `schedule.work-failed` | `schedule` | `system-only` | `append` | `code!:string`, `reason!:string`, `request!:string` | `schedule` |
 | `schedule.work-requested` | `schedule` | `system-only` | `append` | `inputs!:object`, `mission!:subject-reference(mission)`, `mission_revision!:string`, `occurrence!:integer`, `revision!:string`, `workspace!:string` | `schedule` |
 | `schedule.work-started` | `schedule` | `system-only` | `append` | `mission_run!:subject-reference(mission-run)`, `request!:string` | `schedule` |
 | `step-run.carried` | `step-run` | `system-only` | `once` | `attempt:integer`, `claim_expires_at_unix_ms:integer`, `claim_incarnation:string`, `claimant:subject-reference`, `definition_hash:string`, `source:subject-reference`, `source_generation:subject-reference`, `source_step_run:subject-reference`, `status:string`, `worker_reported:boolean` | `step` |

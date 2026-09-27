@@ -1573,6 +1573,15 @@ fn claim_specs() -> BTreeMap<String, ClaimSpec> {
             &["schedule"],
         ),
         (
+            "schedule.work-failed",
+            &["schedule"],
+            WritePolicy::SystemOnly,
+            Cardinality::Append,
+            Some("schedules"),
+            true,
+            &["schedule"],
+        ),
+        (
             "subscription.mission-requested",
             &["subscription"],
             WritePolicy::SystemOnly,
@@ -1637,7 +1646,13 @@ fn claim_specs() -> BTreeMap<String, ClaimSpec> {
         ),
         (
             "reconcile.fault",
-            &["daemon", "mission-run"],
+            &[
+                "daemon",
+                "mission-run",
+                "observer",
+                "schedule",
+                "subscription",
+            ],
             WritePolicy::SystemOnly,
             Cardinality::Append,
             Some("daemons"),
@@ -2318,6 +2333,11 @@ fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
             ("workspace", required_string()),
             ("inputs", required_object()),
         ],
+        "schedule.work-failed" => &[
+            ("request", required_string()),
+            ("code", required_string()),
+            ("reason", required_string()),
+        ],
         "schedule.work-started" => &[
             ("request", required_string()),
             ("mission_run", required_reference_to(&["mission-run"])),
@@ -2658,6 +2678,7 @@ mod tests {
                 "schedule.occurrence-cancelled",
                 "schedule.occurrence-reached",
                 "schedule.occurrence-scheduled",
+                "schedule.work-failed",
                 "schedule.work-requested",
                 "schedule.work-started",
                 "step-run.carried",
