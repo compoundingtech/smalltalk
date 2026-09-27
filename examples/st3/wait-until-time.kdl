@@ -4,7 +4,7 @@ version 2
 //
 // The `window` step is agentless. Its gate passes once the time has come. Before then the gate
 // fails, the attempt fails, and `retry` starts a new attempt after the backoff. The dependent
-// step becomes ready only after the gate passes, and st3 then wakes the seat for it.
+// step becomes ready only after the gate passes, and st then wakes the seat for it.
 //
 // Each attempt runs the gate again, so each retry checks the clock. `$(...)` is ordinary shell,
 // run through `sh -c` with a minimal environment.
@@ -13,9 +13,9 @@ version 2
 // longest wait: 100 attempts ten minutes apart cover about 16 hours. For a repeating time, use a
 // `schedule` instead (recurring-stewardship.kdl).
 //
-//   st3 agents apply examples/st3/seats/omp.kdl --as person/operator
-//   st3 missions publish examples/st3/wait-until-time.kdl --as person/operator
-//   st3 missions start example/app/release-at-window --id example/app/release-at-window/2026-10-01 \
+//   st agents apply examples/st3/seats/omp.kdl --as person/operator
+//   st missions publish examples/st3/wait-until-time.kdl --as person/operator
+//   st missions start example/app/release-at-window --id example/app/release-at-window/2026-10-01 \
 //     --workspace /srv/example/app --as person/operator
 
 mission "example/app/release-at-window" state="ready" {

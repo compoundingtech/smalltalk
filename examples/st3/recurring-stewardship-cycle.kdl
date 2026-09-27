@@ -5,8 +5,8 @@ version 2
 // Publish it first, then copy its revision hash into the schedule in place of the zero
 // placeholder:
 //
-//   st3 missions publish examples/st3/recurring-stewardship-cycle.kdl --as person/operator
-//   st3 missions ls --all --json | jq -r '.value.items[]
+//   st missions publish examples/st3/recurring-stewardship-cycle.kdl --as person/operator
+//   st missions ls --all --json | jq -r '.value.items[]
 //     | select(.id == "mission/example/stewardship-cycle") | .mission_revision'
 //
 // Each cycle is ordinary claimable work for the durable seat. The step completions hold the
