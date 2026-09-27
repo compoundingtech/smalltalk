@@ -112,6 +112,7 @@ fn operation_manifest_is_launch_only_and_covers_v0_resources_and_actions() {
         "missions.list",
         "work.list",
         "agents.list",
+        "agent-queue.get",
         "runtimes.list",
         "operations.list",
         "history.list",
@@ -151,6 +152,7 @@ fn operation_manifest_is_launch_only_and_covers_v0_resources_and_actions() {
         "work.fail",
         "work.release",
         "work.publish-mission",
+        "agent.queue-move",
         "runtime.stop",
         "runtime.restart",
         "runtime.reset",
@@ -1774,4 +1776,173 @@ async fn client_v0_action_route_accepts_the_golden_fenced_action() {
         .await
         .unwrap();
     assert_ne!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn agent_queue_read_and_person_move_share_one_seat_order() {
+    let root = tempfile::tempdir().unwrap();
+    let state = test_state(root.path());
+    let source = r#"
+version 2
+agent "queue-seat" { workspace "/tmp"; command "true" }
+mission "queued-work" state="ready" {
+  concurrent-runs
+  goal "Give the durable seat one step in each run."
+  step "work" { assigned-to "agent/queue-seat" }
+}
+"#;
+    let intent = st3::graph::parse_intent(source, "client-v0-baseline").unwrap();
+    let planned = state
+        .store
+        .mission(
+            &intent,
+            st3::model::IntentInput {
+                kdl: source.into(),
+                source_name: None,
+            },
+        )
+        .unwrap();
+    state
+        .store
+        .apply(&intent, &planned.subject_tokens, "agent-queue-missions")
+        .unwrap();
+    let mut runs = Vec::new();
+    for index in 0..3 {
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let run = state
+            .store
+            .create_mission_run(&st3::model::MissionRunRequest {
+                mission: "queued-work".into(),
+                revision: None,
+                workspace: root.path().display().to_string(),
+                requester: Some("person/requester".into()),
+                mode: Some("run".into()),
+                inputs: std::collections::BTreeMap::new(),
+                idempotency_key: format!("agent-queue-run-{index}"),
+            })
+            .unwrap();
+        state
+            .store
+            .set_step_state(&run.steps[0].subject, "ready", None)
+            .unwrap();
+        runs.push(run);
+    }
+    let seat = runs[0].steps[0].assigned_to.clone().unwrap();
+    let app = st3::api::router(state.clone());
+    let queue_path = format!("/v1/client/agent-queues/{seat}");
+    let order = |queue: &Value| {
+        queue["value"]["runs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|run| run["mission_run_id"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>()
+    };
+
+    let (status, queue) = client_json(app.clone(), &queue_path).await;
+    assert_eq!(status, StatusCode::OK, "{queue}");
+    assert_eq!(queue["value"]["kind"], "agent-queue");
+    assert_eq!(queue["value"]["agent_id"], seat.as_str());
+    assert_eq!(
+        order(&queue),
+        [
+            runs[0].subject.clone(),
+            runs[1].subject.clone(),
+            runs[2].subject.clone()
+        ]
+    );
+    assert_eq!(
+        queue["value"]["next_work_id"],
+        runs[0].steps[0].subject.as_str()
+    );
+    assert_eq!(queue["value"]["runs"][0]["state"], "ready");
+    assert_eq!(queue["value"]["move_count"], 0);
+
+    let (_, capabilities) =
+        client_json_person(app.clone(), "/v1/client/capabilities", "person/operator").await;
+    assert!(
+        capabilities["value"]["capabilities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|capability| capability["id"] == "agent.queue-move"
+                && capability["state"] == "granted")
+    );
+    let snapshot = capabilities["snapshot"]["id"].as_str().unwrap();
+    let move_to_top = serde_json::json!({
+        "api_version": "st3.client.v0", "id": "action/agent-queue-top", "type": "agent.queue-move",
+        "idempotency_key": "agent-queue-move-top-0001",
+        "fence": { "snapshot_id": snapshot, "subject_revisions": {} },
+        "parameters": {
+            "agent_id": seat, "mission_run_id": runs[2].subject, "placement": "top",
+            "reason": "the release needs it first"
+        }
+    });
+    let (status, result) = client_post_json_person(
+        app.clone(),
+        "/v1/client/actions",
+        "person/operator",
+        move_to_top,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{result}");
+    assert_eq!(result["value"]["affected_ids"], serde_json::json!([seat]));
+
+    let (_, queue) = client_json(app.clone(), &queue_path).await;
+    assert_eq!(
+        order(&queue),
+        [
+            runs[2].subject.clone(),
+            runs[0].subject.clone(),
+            runs[1].subject.clone()
+        ]
+    );
+    assert_eq!(
+        queue["value"]["next_work_id"],
+        runs[2].steps[0].subject.as_str()
+    );
+    let (status, listed) = client_json(app.clone(), &format!("/v1/client/work?actor={seat}")).await;
+    assert_eq!(status, StatusCode::OK, "{listed}");
+    let listed = listed["value"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|item| item["id"].as_str().unwrap().to_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        listed,
+        [
+            runs[2].steps[0].subject.clone(),
+            runs[0].steps[0].subject.clone(),
+            runs[1].steps[0].subject.clone()
+        ],
+        "the seat's own work list follows its queue"
+    );
+    let moved = &queue["value"]["moves"][0];
+    assert_eq!(queue["value"]["move_count"], 1);
+    assert_eq!(moved["actor_id"], "person/operator");
+    assert_eq!(moved["mission_run_id"], runs[2].subject.as_str());
+    assert_eq!(moved["placement"], "top");
+    assert_eq!(moved["anchor_run_id"], Value::Null);
+    assert_eq!(moved["reason"], "the release needs it first");
+
+    let (_, capabilities) = client_json(app.clone(), "/v1/client/capabilities").await;
+    let snapshot = capabilities["snapshot"]["id"].as_str().unwrap();
+    let absent = serde_json::json!({
+        "api_version": "st3.client.v0", "id": "action/agent-queue-absent", "type": "agent.queue-move",
+        "idempotency_key": "agent-queue-move-absent-01",
+        "fence": { "snapshot_id": snapshot, "subject_revisions": {} },
+        "parameters": {
+            "agent_id": seat, "mission_run_id": "mission-run/absent", "placement": "after",
+            "anchor_run_id": runs[0].subject
+        }
+    });
+    let (status, error) =
+        client_post_json_person(app.clone(), "/v1/client/actions", "person/operator", absent).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{error}");
+    assert_eq!(error["code"], "validation-failed", "{error}");
+    assert_eq!(error["details"]["run"], "mission-run/absent");
+
+    let (status, missing) = client_json(app, "/v1/client/agent-queues/agent/absent-seat").await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{missing}");
 }

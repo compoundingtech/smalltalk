@@ -276,7 +276,7 @@ pub(crate) fn is_managed_hook_reference(text: &str) -> bool {
 /// `$XDG_STATE_HOME/st2/hooks` or `~/.local/state/st2/hooks`.
 pub fn hooks_root() -> Result<PathBuf> {
     if let Some(path) = std::env::var_os("ST_HOOKS").filter(|value| !value.is_empty()) {
-        return Ok(PathBuf::from(path));
+        return Ok(root_of_exported_hooks(PathBuf::from(path)));
     }
     let state = match std::env::var_os("XDG_STATE_HOME").filter(|value| !value.is_empty()) {
         Some(path) => PathBuf::from(path),
@@ -286,6 +286,26 @@ pub fn hooks_root() -> Result<PathBuf> {
         .join(".local/state"),
     };
     Ok(state.join("st2/hooks"))
+}
+
+/// The hook root an exported `$ST_HOOKS` names.
+///
+/// st2 exports the root, but st3 exports its binary's set directory, because st3's Claude settings
+/// run `$ST_HOOKS/claude-observe.sh`. Read as a root, that set directory sends a pi or omp launch
+/// looking for `<set>/sets/<set>/`, so every seat fails with `launch-error` once the set is new. A
+/// set directory is `<root>/sets/sha256-…` and holds its own manifest, so it names its root.
+fn root_of_exported_hooks(path: PathBuf) -> PathBuf {
+    let names_a_set = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.starts_with("sha256-"))
+        && path.join(SET_MANIFEST_FILE).is_file();
+    let root = path
+        .parent()
+        .filter(|sets| names_a_set && sets.file_name() == Some(std::ffi::OsStr::new(SETS_DIR)))
+        .and_then(Path::parent)
+        .map(Path::to_path_buf);
+    root.unwrap_or(path)
 }
 
 /// The immutable, versioned directory this binary expects rendered hook settings to use.
@@ -1090,6 +1110,24 @@ mod tests {
 
         assert_eq!(verify_required_set_at(tmp.path()).unwrap(), required);
         assert!(verify_installed_at(tmp.path()).is_err());
+    }
+
+    #[test]
+    fn an_exported_set_directory_names_its_hook_root() {
+        // st3 exports `$ST_HOOKS` as the set directory. Verified as a root, it fails.
+        let tmp = tempfile::tempdir().unwrap();
+        let set = install_at(tmp.path(), false).unwrap();
+        assert!(verify_required_set_at(&set).is_err());
+        assert_eq!(root_of_exported_hooks(set.clone()), tmp.path());
+        assert_eq!(
+            verify_required_set_at(&root_of_exported_hooks(set.clone())).unwrap(),
+            set
+        );
+        // A root, or a lookalike without a manifest, stays exactly what was exported.
+        assert_eq!(root_of_exported_hooks(tmp.path().into()), tmp.path());
+        let lookalike = tmp.path().join("sets/sha256-empty");
+        fs::create_dir_all(&lookalike).unwrap();
+        assert_eq!(root_of_exported_hooks(lookalike.clone()), lookalike);
     }
 
     #[test]

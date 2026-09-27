@@ -1,26 +1,26 @@
 version 2
 
-mission "example/stewardship-cycle" state="ready" {
-  input "owner" kind="text"
-  assigned-to "${input.owner}"
-  completion { when "all-steps-exhausted" }
-  goal "Measure the system, make one supported improvement, and record the result."
-
-  queue "cycle" {
-    step "measure" { goal "Measure the current system and record a baseline." }
-    step "select" { goal "Select one optimization that the measurement supports." }
-    step "ship" { goal "Implement, verify, and publish the selected optimization." }
-  }
-}
+// Start one bounded stewardship cycle every six hours for a durable seat.
+//
+// The schedule creates one run of an exact finite mission revision per occurrence, each with its
+// own workspace below the declared root. It does not start an occurrence while the previous cycle
+// run is still active. `catch-up "latest"` makes a daemon restart start at most one missed cycle.
+//
+// Schedules belong to a mission run. A mission with no step would complete at once and stop its
+// schedule, so `retire` keeps this run open until the operator approves it in
+// `st3 attention ls --as person/operator`, or cancels the run. The seat is durable and belongs to
+// neither mission.
+//
+//   st3 agents apply examples/st3/seats/omp.kdl --as person/operator
+//   st3 missions publish examples/st3/recurring-stewardship-cycle.kdl --as person/operator
+//   # Replace the zero revision below with the hash that recurring-stewardship-cycle.kdl shows how
+//   # to read.
+//   st3 missions publish examples/st3/recurring-stewardship.kdl --as person/operator
+//   st3 missions start example/stewardship --id example/stewardship/main \
+//     --workspace /srv/example/stewardship --as person/operator
 
 mission "example/stewardship" state="ready" {
-  goal "Keep one steward available and start bounded recurring cycles."
-
-  agent "steward" {
-    workspace "."
-    harness "codex" { effort "high" }
-    restart "always"
-  }
+  goal "Start one bounded stewardship cycle every six hours until the operator retires it."
 
   schedule "cycle" {
     host "local"
@@ -29,8 +29,15 @@ mission "example/stewardship" state="ready" {
     catch-up "latest"
     work {
       mission "example/stewardship-cycle@0000000000000000000000000000000000000000000000000000000000000000"
-      workspace ".st3/runs/stewardship"
-      input "owner" "agent/${ST_MISSION_RUN}/steward"
+      workspace "${ST_WORKSPACE}/cycles"
+    }
+  }
+
+  step "retire" {
+    agentless
+    gate "the operator retires the stewardship schedule" type="human" {
+      reviewer "person/operator"
+      question "Stop starting stewardship cycles?"
     }
   }
 }

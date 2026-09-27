@@ -146,8 +146,25 @@ fn every_tracked_st3_example_uses_the_normative_grammar() {
     }
 }
 
+fn example_files(directory: &str) -> Vec<PathBuf> {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join(directory);
+    let mut files = walkdir::WalkDir::new(&root)
+        .follow_links(false)
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()
+        .expect("walk examples")
+        .into_iter()
+        .filter(|entry| entry.path().extension().and_then(|value| value.to_str()) == Some("kdl"))
+        .map(|entry| entry.into_path())
+        .collect::<Vec<_>>();
+    files.sort();
+    files
+}
+
 #[test]
-fn walkthrough_work_fails_fast_before_the_standing_agent_exists() {
+fn walkthrough_work_warns_before_the_worker_seat_exists() {
     let file = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
         .join("examples/st3/walkthrough-work.kdl");
@@ -164,12 +181,95 @@ fn walkthrough_work_fails_fast_before_the_standing_agent_exists() {
         )
         .unwrap();
 
+    assert!(preview.blockers.is_empty(), "{:?}", preview.blockers);
     assert_eq!(
-        preview.blockers,
+        preview.warnings,
         [
-            "message `message/example/garden-work-ready` references undeclared recipient `agent/example/garden-owner/standing/owner`"
+            "mission `mission/__st3/example/garden-work/loop/prepare-note/round` references missing eligible agent `agent/example/worker`"
         ]
     );
+}
+
+#[test]
+fn every_harness_seat_example_declares_the_shared_worker_seat() {
+    let mut providers = Vec::new();
+    for file in example_files("examples/st3/seats") {
+        let source = fs::read_to_string(&file).expect("read seat example");
+        let intent = st3::parse_intent(&source, "local")
+            .unwrap_or_else(|error| panic!("{}: {error}", file.display()));
+        assert!(
+            intent.missions.is_empty(),
+            "{} must declare a seat, not a mission",
+            file.display()
+        );
+        let document: kdl::KdlDocument = source.parse().expect("parse seat KDL");
+        let agents = document
+            .nodes()
+            .iter()
+            .filter(|node| node.name().value() == "agent")
+            .collect::<Vec<_>>();
+        assert_eq!(agents.len(), 1, "{} declares one seat", file.display());
+        let identity = agents[0]
+            .entries()
+            .first()
+            .and_then(|entry| entry.value().as_string())
+            .expect("a seat names its identity");
+        let harness = agents[0]
+            .children()
+            .and_then(|body| body.get("harness"))
+            .expect("a seat declares a harness");
+        let provider = harness
+            .entries()
+            .first()
+            .and_then(|entry| entry.value().as_string())
+            .expect("a harness names its provider");
+        let stem = file.file_stem().and_then(|stem| stem.to_str()).unwrap();
+        // The chief reorders the worker's queue; the planner and reviewer share missions with the
+        // worker in many-to-many.kdl. Each is named for its role, not its harness.
+        if matches!(stem, "chief" | "planner" | "reviewer") {
+            assert_eq!(identity, format!("example/{stem}"), "{}", file.display());
+            continue;
+        }
+        assert_eq!(identity, "example/worker", "{}", file.display());
+        assert_eq!(
+            provider,
+            stem,
+            "{} is named for its harness",
+            file.display()
+        );
+        if provider == "omp" {
+            let model = harness
+                .children()
+                .and_then(|body| body.get("model"))
+                .and_then(|model| model.entries().first())
+                .and_then(|entry| entry.value().as_string());
+            assert_eq!(model, Some("openai-codex/gpt-6-astra"), "docs/st3/omp.md");
+        }
+        providers.push(provider.to_owned());
+    }
+    providers.sort();
+    assert_eq!(providers, ["claude", "codex", "omp", "opencode", "pi"]);
+}
+
+#[test]
+fn no_example_mission_owns_runtimes_without_work() {
+    // A mission with no steps completes as soon as it starts and stops everything it owns, so a
+    // step-less mission can never be a standing agent, observer, subscription, or schedule.
+    for file in example_files("examples/st3") {
+        let source = fs::read_to_string(&file).expect("read example");
+        let intent = st3::parse_intent(&source, "local")
+            .unwrap_or_else(|error| panic!("{}: {error}", file.display()));
+        for mission in intent.missions.values() {
+            if mission.declarations_kdl.is_some() {
+                assert!(
+                    !mission.steps.is_empty(),
+                    "{}: `{}` owns runtimes but has no steps",
+                    file.display(),
+                    mission.id
+                );
+            }
+        }
+    }
 }
 
 #[test]
@@ -197,19 +297,29 @@ fn the_declarative_gates_dream_fixture_previews_without_rewriting() {
     );
 }
 
+/// An eval's `eval.kdl`, or a seat variant of it in the eval's `variants/` directory.
+fn is_eval_document(path: &std::path::Path) -> bool {
+    path.file_name().is_some_and(|name| name == "eval.kdl")
+        || (path.extension().is_some_and(|extension| extension == "kdl")
+            && path
+                .parent()
+                .and_then(|parent| parent.file_name())
+                .is_some_and(|name| name == "variants"))
+}
+
 #[test]
 fn every_native_st3_eval_uses_the_normative_grammar() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
         .join("evals/st3");
     let mut files = walkdir::WalkDir::new(&root)
-        .max_depth(2)
+        .max_depth(3)
         .follow_links(false)
         .into_iter()
         .collect::<Result<Vec<_>, _>>()
         .expect("walk evals")
         .into_iter()
-        .filter(|entry| entry.file_name() == "eval.kdl")
+        .filter(|entry| is_eval_document(entry.path()))
         .map(|entry| entry.into_path())
         .collect::<Vec<_>>();
     files.sort();
@@ -251,11 +361,11 @@ fn eval_agents_use_the_runtime_boot_contract_without_authored_prompts() {
         .join("../..")
         .join("evals/st3");
     for entry in walkdir::WalkDir::new(root)
-        .max_depth(2)
+        .max_depth(3)
         .follow_links(false)
         .into_iter()
         .filter_map(Result::ok)
-        .filter(|entry| entry.file_name() == "eval.kdl")
+        .filter(|entry| is_eval_document(entry.path()))
     {
         let source = fs::read_to_string(entry.path()).unwrap();
         let document = source.parse::<kdl::KdlDocument>().unwrap();
@@ -402,6 +512,7 @@ fn st3_eval_inventory_has_twenty_two_model_free_and_twenty_one_model_backed_eval
         "restart-continuity",
         "run-generation-revision",
         "seat-mission-work",
+        "seat-queue",
         "signal-rename",
         "test-writing",
         "weird-git-setup",
@@ -569,6 +680,65 @@ fn work_wake_reliability_covers_normal_lifecycle_wakes_without_priming_the_worke
                 !fixture.to_ascii_lowercase().contains(leaked_failure_mode),
                 "worker fixture primes the agent with `{leaked_failure_mode}`"
             );
+        }
+    }
+}
+
+#[test]
+fn seat_queue_moves_one_run_and_gates_the_head_without_priming_the_seat() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join("evals/st3/seat-queue");
+    let source = fs::read_to_string(root.join("eval.kdl")).unwrap();
+    assert_eq!(
+        authored_harness_counts(&source, "seat-queue/eval.kdl"),
+        (1, 0)
+    );
+    for judge in [
+        "judges/queue-order.sh",
+        "judges/no-preemption.sh",
+        "judges/no-terminal-input.sh",
+    ] {
+        assert!(source.contains(judge), "missing held-out `{judge}`");
+    }
+
+    let controller = fs::read_to_string(root.join("controller.sh")).unwrap();
+    assert!(controller.contains(".value.harness_state"));
+    for required in ["missions start", "agents queue move", "attention approve"] {
+        assert!(
+            controller.contains(required),
+            "missing `{required}` scenario"
+        );
+    }
+    for forbidden in ["work claim", "work complete", "work wake", "terminals send"] {
+        assert!(
+            !controller.contains(forbidden),
+            "the controller must leave `{forbidden}` to the seat and the runtime"
+        );
+    }
+
+    for entry in fs::read_dir(root.join("fixtures")).unwrap() {
+        let fixture = fs::read_to_string(entry.unwrap().path())
+            .unwrap()
+            .to_ascii_lowercase();
+        for leaked in ["pty", "terminal", "workaround"] {
+            assert!(
+                !fixture.contains(leaked),
+                "seat fixture primes the agent with `{leaked}`"
+            );
+        }
+        // The mission names carry the eval name. The goals must not hint at
+        // the order the seat is judged on.
+        for goal in fixture
+            .lines()
+            .filter(|line| line.trim_start().starts_with("goal "))
+        {
+            for leaked in ["queue", "order", "before", "after", "first", "next"] {
+                assert!(
+                    !goal.contains(leaked),
+                    "seat fixture goal primes the agent with `{leaked}`"
+                );
+            }
         }
     }
 }
@@ -1395,5 +1565,77 @@ fn new_paid_eval_fixtures_match_their_native_harnesses() {
                 .join("plugin/evalpkg/skills/evalskill-plugin/SKILL.md")
                 .is_file()
         );
+    }
+}
+
+#[test]
+fn every_example_previews_cleanly_once_its_seats_exist() {
+    let store = st3::store::Store::open_memory("local").unwrap();
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    for seat in [
+        "examples/st3/seats/omp.kdl",
+        "examples/st3/seats/chief.kdl",
+        "examples/st3/seats/planner.kdl",
+        "examples/st3/seats/reviewer.kdl",
+    ] {
+        let source = fs::read_to_string(root.join(seat)).expect("read seat example");
+        let intent = st3::parse_intent(&source, "local").expect("parse seat example");
+        let preview = store
+            .mission(
+                &intent,
+                st3::model::IntentInput {
+                    kdl: source,
+                    source_name: Some(seat.into()),
+                },
+            )
+            .unwrap();
+        assert!(
+            preview.blockers.is_empty(),
+            "{seat}: {:?}",
+            preview.blockers
+        );
+        assert!(
+            preview.warnings.is_empty(),
+            "{seat}: {:?}",
+            preview.warnings
+        );
+        store
+            .apply(&intent, &preview.subject_tokens, seat)
+            .unwrap_or_else(|error| panic!("{seat}: {error}"));
+    }
+    for file in example_files("examples/st3") {
+        if file
+            .parent()
+            .is_some_and(|parent| parent.ends_with("seats"))
+        {
+            continue;
+        }
+        let source = fs::read_to_string(&file).expect("read example");
+        let intent = st3::parse_intent(&source, "local")
+            .unwrap_or_else(|error| panic!("{}: {error}", file.display()));
+        let preview = store
+            .mission(
+                &intent,
+                st3::model::IntentInput {
+                    kdl: source,
+                    source_name: Some(file.display().to_string()),
+                },
+            )
+            .unwrap();
+        assert!(
+            preview.blockers.is_empty(),
+            "{}: {:?}",
+            file.display(),
+            preview.blockers
+        );
+        // Preview resolves mission-level run agents only. A run agent declared in an earlier
+        // step exists before its work is ready, so that one warning is expected.
+        for warning in &preview.warnings {
+            assert!(
+                warning.contains("references missing eligible agent `agent/${ST_MISSION_RUN}/"),
+                "{}: {warning}",
+                file.display()
+            );
+        }
     }
 }

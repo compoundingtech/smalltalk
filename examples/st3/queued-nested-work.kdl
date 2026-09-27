@@ -1,50 +1,50 @@
 version 2
 
-mission "fleet/app-web/1445-then-1468" state="ready" {
-  completion { when "all-steps-exhausted" }
-  goal "Run two nested jobs in a strict sequence without requiring a worker to claim their containers."
+// Run two nested jobs for one seat in a strict sequence.
+//
+// Each queue item is a container step with a nested mission. A container step has no work of its
+// own, so it is agentless: it starts automatically and completes when its nested steps complete.
+// No worker claims it. The nested steps name the seat. The second job starts only after the whole
+// first job completes.
+//
+// Each step's completion holds its result. There is no separate reporting step.
+//
+//   st3 agents apply examples/st3/seats/omp.kdl --as person/operator
+//   st3 missions publish examples/st3/queued-nested-work.kdl --as person/operator
+//   st3 missions start example/app/refresh-then-review --id example/app/refresh-then-review/1 \
+//     --workspace /srv/example/app --as person/operator
 
-  agent "worker" {
-    identity "worker"
-    workspace "."
-    harness "codex" { effort "high" }
-    restart "always"
-  }
+mission "example/app/refresh-then-review" state="ready" {
+  goal "Refresh invented pull request 12, then address the review findings on invented pull request 15."
 
   queue "jobs" {
-    step "refresh-1445" {
-      goal "Refresh pull request 1445 before starting the later review job."
-      mission "refresh-1445" {
-        assigned-to "agent/${ST_MISSION_RUN}/worker"
-        goal "Merge main, report the result, and verify pull request 1445."
-        step "merge-main" {
-          goal "Merge main and resolve the pull request conflicts."
-          retry { attempts 2 }
+    step "refresh-12" {
+      goal "Refresh pull request 12 before the review job starts."
+      mission "refresh-12" {
+        assigned-to "agent/example/worker"
+        goal "Merge main into pull request 12 and verify it."
+        step "merge-main" timeout="45m" {
+          goal "Merge main into pull request 12's branch, resolve the conflicts, and push."
+          retry { attempts 2; }
         }
-        step "tell-cos" {
-          goal "Report the completed refresh."
+        step "verify" timeout="30m" {
           depends-on { step "merge-main" completed }
-        }
-        step "green" {
-          goal "Verify the refreshed branch is green."
-          depends-on { step "tell-cos" completed }
+          goal "Run the full test suite on the pushed branch and complete this step with the result."
         }
       }
     }
 
-    step "copilot-1468" {
-      goal "Address pull request 1468 only after the refresh job completes."
-      mission "copilot-1468" {
-        assigned-to "agent/${ST_MISSION_RUN}/worker"
-        goal "Address review findings, report the result, and verify pull request 1468."
-        step "answer" { goal "Address every valid review finding." }
-        step "tell-cos" {
-          goal "Report the completed review work."
-          depends-on { step "answer" completed }
+    step "review-15" {
+      goal "Address pull request 15's review only after the refresh job completes."
+      mission "review-15" {
+        assigned-to "agent/example/worker"
+        goal "Address every valid review finding on pull request 15 and verify it."
+        step "answer" timeout="1h" {
+          goal "Fix every valid review finding on pull request 15, and push. Complete this step with each finding and how it was resolved."
         }
-        step "green" {
-          goal "Verify the reviewed branch is green."
-          depends-on { step "tell-cos" completed }
+        step "verify" timeout="30m" {
+          depends-on { step "answer" completed }
+          goal "Run the full test suite on the pushed branch and complete this step with the result."
         }
       }
     }

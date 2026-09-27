@@ -274,6 +274,7 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
         .route("/v1/client/work/{*id}", get(client_work_detail))
         .route("/v1/client/agents", get(client_agents))
         .route("/v1/client/agents/{*id}", get(client_agents_detail))
+        .route("/v1/client/agent-queues/{*id}", get(client_v0::agent_queue))
         .route("/v1/client/history", get(client_history))
         .route("/v1/client/history/{*id}", get(client_history_detail))
         .route("/v1/client/sessions", get(client_sessions))
@@ -414,6 +415,7 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
         .route("/v1/work/wake/{*subject}", post(wake_work))
         .route("/v1/work/{action}/{*subject}", post(post_work_action))
         .route("/v1/gate-results", post(post_gate_result))
+        .route("/v1/agent-queue-moves", post(move_agent_queue))
         .route("/v1/sessions", get(list_sessions))
         .route("/v1/sessions/{subject}/context/clear", post(clear_context))
         .route("/v1/sessions/{subject}/signal", post(signal_session))
@@ -693,6 +695,11 @@ fn client_error_code(code: Option<&str>) -> String {
         | "remote-unavailable"
         | "internal" => code.unwrap_or("internal").to_owned(),
         "launch-review-not-authorized" | "wrong-message-recipient" => "forbidden".into(),
+        "run-not-queued"
+        | "missing-queue-anchor"
+        | "unexpected-queue-anchor"
+        | "invalid-queue-anchor"
+        | "invalid-queue-placement" => "validation-failed".into(),
         _ => "internal".into(),
     }
 }
@@ -972,6 +979,34 @@ fn client_work_resources(
                 .then_with(|| left.subject.cmp(&right.subject))
         });
     } else {
+        // An agent's own list shows its ready work in the same seat-queue order
+        // that chooses its next work and wake.
+        let seat_ready = match actor {
+            Some(actor) => {
+                let seat = if actor.contains('/') {
+                    actor.to_owned()
+                } else {
+                    format!("agent/{actor}")
+                };
+                let order = store.seat_run_order(&seat)?;
+                let steps = work
+                    .iter()
+                    .map(crate::seat_queue::SeatStep::from)
+                    .collect::<Vec<_>>();
+                crate::seat_queue::select(&seat, &steps, &order)
+                    .ready
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            }
+            None => Vec::new(),
+        };
+        let seat_rank = |subject: &str| {
+            seat_ready
+                .iter()
+                .position(|ready| ready == subject)
+                .unwrap_or(usize::MAX)
+        };
         work.sort_by(|left, right| {
             let priority = |status: &str| match status {
                 "ready" => 0,
@@ -983,6 +1018,7 @@ fn client_work_resources(
             };
             priority(&left.status)
                 .cmp(&priority(&right.status))
+                .then_with(|| seat_rank(&left.subject).cmp(&seat_rank(&right.subject)))
                 .then_with(|| left.readiness_epoch.cmp(&right.readiness_epoch))
                 .then_with(|| left.step.cmp(&right.step))
                 .then_with(|| left.subject.cmp(&right.subject))
@@ -4799,6 +4835,22 @@ async fn apply(
         for mission in crate::mission::top_level_mission_ids(&intent.missions) {
             require_agent_mission_authority(&state, actor, "publish", &mission)?;
         }
+        // Only a person grants authority in a top-level seat declaration. Otherwise an agent
+        // could declare itself, or another seat, with authority nobody gave it.
+        if let Some(granted) = intent.subjects.values().find(|desired| {
+            desired.kind == "agent" && crate::graph::declares_authority(&desired.desired)
+        }) {
+            return Err(ApiError::bad(
+                St3Error::new(
+                    "agent-authority-grant-denied",
+                    format!(
+                        "`{actor}` cannot grant authority in the declaration of `{}`; only a person can",
+                        granted.subject
+                    ),
+                )
+                .with_detail("agent", granted.subject.clone()),
+            ));
+        }
     }
     for declaration in intent.mission_runs.values() {
         if let Some(creation) = &declaration.creation {
@@ -6665,6 +6717,27 @@ async fn publish_work_mission(
     Ok(Json(output))
 }
 
+/// The actor's current desired agent declaration, which is where a person grants it authority.
+fn current_agent_declaration(
+    state: &AppState,
+    actor: &str,
+    missing: &'static str,
+) -> Result<Value, ApiError> {
+    state
+        .store
+        .desired_subjects()
+        .map_err(ApiError::internal)?
+        .into_iter()
+        .find(|desired| desired.kind == "agent" && desired.subject == actor)
+        .map(|desired| desired.desired)
+        .ok_or_else(|| {
+            ApiError::bad(St3Error::new(
+                missing,
+                format!("`{actor}` has no current desired agent declaration"),
+            ))
+        })
+}
+
 fn require_agent_mission_authority(
     state: &AppState,
     actor: &str,
@@ -6675,19 +6748,8 @@ fn require_agent_mission_authority(
         return Ok(());
     };
     let mission = mission.strip_prefix("mission/").unwrap_or(mission);
-    let desired = state
-        .store
-        .desired_subjects()
-        .map_err(ApiError::internal)?
-        .into_iter()
-        .find(|desired| desired.kind == "agent" && desired.subject == actor)
-        .ok_or_else(|| {
-            ApiError::bad(St3Error::new(
-                "missing-agent-mission-authority",
-                format!("`{actor}` has no current desired agent declaration"),
-            ))
-        })?;
-    let authority = crate::graph::agent_mission_authority(&desired.desired);
+    let desired = current_agent_declaration(state, &actor, "missing-agent-mission-authority")?;
+    let authority = crate::graph::agent_mission_authority(&desired);
     if authority.allows(action, mission) {
         Ok(())
     } else {
@@ -6696,6 +6758,58 @@ fn require_agent_mission_authority(
             format!("`{actor}` cannot {action} mission `{mission}`"),
         )))
     }
+}
+
+/// An agent may reorder a seat's queue only when its current declaration grants
+/// `queue-authority { move SEAT }`. People need no grant.
+fn require_agent_queue_authority(
+    state: &AppState,
+    actor: &str,
+    seat: &str,
+) -> Result<(), ApiError> {
+    let Some(actor) = normalized_agent_actor(actor) else {
+        return Ok(());
+    };
+    let desired = current_agent_declaration(state, &actor, "missing-agent-queue-authority")?;
+    if crate::graph::agent_queue_authority(&desired).allows_move(seat) {
+        Ok(())
+    } else {
+        Err(ApiError::bad(
+            St3Error::new(
+                "queue-authority-denied",
+                format!("`{actor}` cannot move runs in the queue of `{seat}`"),
+            )
+            .with_detail("actor", actor.clone())
+            .with_detail("agent", seat.to_owned()),
+        ))
+    }
+}
+
+/// Move one run in a seat's queue as a person or as an agent with queue authority. Paired and
+/// typed clients use the person-only `agent.queue-move` client action instead.
+async fn move_agent_queue(
+    State(state): State<AppState>,
+    Json(mut request): Json<crate::model::SeatQueueMoveRequest>,
+) -> Result<Json<ClaimRecord>, ApiError> {
+    request.agent = if request.agent.starts_with("agent/") {
+        request.agent
+    } else {
+        format!("agent/{}", request.agent)
+    };
+    request.actor = match request.actor.as_str() {
+        actor if actor.starts_with("person/") => actor.to_owned(),
+        actor => normalized_agent_actor(actor).ok_or_else(|| {
+            ApiError::bad(St3Error::new(
+                "invalid-queue-move-actor",
+                "a queue move needs a person or agent actor",
+            ))
+        })?,
+    };
+    require_agent_queue_authority(&state, &request.actor, &request.agent)?;
+    let store = state.store.clone();
+    let claim = blocking_action(move || store.move_seat_queue_run(&request)).await?;
+    signal_changed(&state);
+    Ok(Json(claim))
 }
 
 fn normalized_agent_actor(actor: &str) -> Option<String> {
@@ -10835,6 +10949,205 @@ mission "authority-self-grant" state="ready" {
         .await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
         assert_eq!(body["code"], "mission-authority-denied");
+    }
+
+    #[tokio::test]
+    async fn an_agent_moves_a_seat_queue_only_with_queue_authority() {
+        const SEAT: &str = "agent/fleet/worker";
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let source = r#"
+version 2
+
+agent "fleet/worker" { workspace "."; command "true"; }
+agent "fleet/chief" {
+  workspace "."
+  command "true"
+  queue-authority { move "fleet/worker" }
+}
+agent "fleet/other-chief" {
+  workspace "."
+  command "true"
+  queue-authority { move "fleet/other-worker" }
+}
+agent "fleet/helper" { workspace "."; command "true"; }
+mission "queued" state="ready" {
+  concurrent-runs
+  goal "Give the durable seat one step in each run."
+  step "work" { assigned-to "agent/fleet/worker" }
+}
+"#;
+        let intent = parse_intent(source, "node").unwrap();
+        let preview = state
+            .store
+            .mission(
+                &intent,
+                crate::model::IntentInput {
+                    kdl: source.into(),
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        state
+            .store
+            .apply(&intent, &preview.subject_tokens, "queue-authority")
+            .unwrap();
+        let start = |key: &str| {
+            std::thread::sleep(Duration::from_millis(2));
+            state
+                .store
+                .create_mission_run(&MissionRunRequest {
+                    mission: "queued".into(),
+                    revision: None,
+                    workspace: root.path().display().to_string(),
+                    requester: Some("person/test".into()),
+                    mode: Some("run".into()),
+                    inputs: BTreeMap::new(),
+                    idempotency_key: key.into(),
+                })
+                .unwrap()
+        };
+        let first = start("queue-authority-first").subject;
+        let second = start("queue-authority-second").subject;
+        let order = || state.store.seat_run_order(SEAT).unwrap();
+        assert_eq!(order(), [first.clone(), second.clone()]);
+        let app = router(state.clone());
+        let promote = |actor: &str, key: &str| {
+            json!({
+                "agent": SEAT,
+                "run": second,
+                "placement": "top",
+                "reason": "the second run's notes are needed first",
+                "actor": actor,
+                "idempotency_key": key,
+            })
+        };
+
+        for (actor, code) in [
+            ("agent/fleet/helper", "queue-authority-denied"),
+            ("agent/fleet/other-chief", "queue-authority-denied"),
+            ("agent/fleet/worker", "queue-authority-denied"),
+            ("agent/fleet/undeclared", "missing-agent-queue-authority"),
+            ("daemon/runtime", "invalid-queue-move-actor"),
+        ] {
+            let (status, body) = json_request(
+                app.clone(),
+                "/v1/agent-queue-moves",
+                promote(actor, &format!("refused:{actor}")),
+            )
+            .await;
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{actor}: {body}");
+            assert_eq!(body["code"], code, "{actor}: {body}");
+        }
+        assert_eq!(order(), [first.clone(), second.clone()]);
+        assert_eq!(state.store.seat_queue(SEAT).unwrap().move_count, 0);
+
+        // Only a person grants authority. An agent cannot declare itself or another seat with
+        // queue or mission authority, but it can still declare a seat without any.
+        for (key, declaration) in [
+            (
+                "self-grant",
+                r#"agent "fleet/helper" { workspace "."; command "true"; queue-authority { move "fleet/worker" } }"#,
+            ),
+            (
+                "other-grant",
+                r#"agent "fleet/deputy" { workspace "."; command "true"; queue-authority { move "fleet/*" } }"#,
+            ),
+            (
+                "mission-grant",
+                r#"agent "fleet/helper" { workspace "."; command "true"; mission-authority { publish "queued" } }"#,
+            ),
+        ] {
+            let (status, body) = json_request(
+                app.clone(),
+                "/v1/intent/apply",
+                serde_json::to_value(apply_request(
+                    &state,
+                    &format!("version 2\n{declaration}\n"),
+                    "agent/fleet/helper",
+                    key,
+                ))
+                .unwrap(),
+            )
+            .await;
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{key}: {body}");
+            assert_eq!(
+                body["code"], "agent-authority-grant-denied",
+                "{key}: {body}"
+            );
+        }
+        let (status, body) = json_request(
+            app.clone(),
+            "/v1/intent/apply",
+            serde_json::to_value(apply_request(
+                &state,
+                "version 2\nagent \"fleet/deputy\" { workspace \".\"; command \"true\"; }\n",
+                "agent/fleet/helper",
+                "plain-seat",
+            ))
+            .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let (status, body) = json_request(
+            app.clone(),
+            "/v1/agent-queue-moves",
+            promote("agent/fleet/helper", "still-refused"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        assert_eq!(body["code"], "queue-authority-denied", "{body}");
+
+        // A bare identity is an agent, as for other agent actors.
+        let (status, body) = json_request(
+            app.clone(),
+            "/v1/agent-queue-moves",
+            promote("fleet/chief", "authorized"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["actor"], "agent/fleet/chief");
+        assert_eq!(body["subject"], SEAT);
+        assert_eq!(order(), [second.clone(), first.clone()]);
+        let queue = state.store.seat_queue(SEAT).unwrap();
+        assert_eq!(queue.move_count, 1);
+        assert_eq!(queue.moves[0].actor.as_deref(), Some("agent/fleet/chief"));
+        assert_eq!(queue.moves[0].run, second);
+        assert_eq!(
+            queue.moves[0].reason.as_deref(),
+            Some("the second run's notes are needed first")
+        );
+
+        // People need no grant on this route either.
+        let (status, body) = json_request(
+            app,
+            "/v1/agent-queue-moves",
+            json!({
+                "agent": SEAT,
+                "run": first,
+                "placement": "before",
+                "anchor": second,
+                "actor": "person/operator",
+                "idempotency_key": "person",
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(order(), [first.clone(), second.clone()]);
+
+        let replica = Store::open_memory("replica").unwrap();
+        replica
+            .import_replication("node", &state.store.export_replication(0).unwrap())
+            .unwrap();
+        assert_eq!(
+            replica.seat_run_order(SEAT).unwrap(),
+            order(),
+            "a replica rebuilds the same order from the agent's and the person's moves"
+        );
+        assert_eq!(
+            replica.seat_queue(SEAT).unwrap().moves,
+            state.store.seat_queue(SEAT).unwrap().moves
+        );
     }
 
     #[tokio::test]

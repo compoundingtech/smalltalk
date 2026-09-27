@@ -15,7 +15,7 @@ mission "eval/seat-mission-work" state="ready" timeout="20m" {
 
   step "work" timeout="15m" {
     assigned-to "agent/eval/seat-mission-work/worker"
-    goal "Create seat-proof.txt and report the work complete."
+    goal "Create seat-proof.txt containing exactly the text seat completed work, then report the work complete."
     gate "the durable seat produced the requested artifact" {
       exec "test \"$(cat seat-proof.txt)\" = \"seat completed work\""
       host "local"

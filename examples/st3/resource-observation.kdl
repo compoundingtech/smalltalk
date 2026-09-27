@@ -1,5 +1,13 @@
 version 2
 
+// Observe one local file and gate work on its state. The observer belongs to the run; its facts
+// are `status` (`ready`, `missing`, or `unreadable`), `path`, `content_hash`, `size`, and `mode`,
+// never the content.
+//
+//   st3 missions publish examples/st3/resource-observation.kdl --as person/operator
+//   st3 missions start example/config-check --id example/config-check/1 \
+//     --workspace /srv/example/app --as person/operator
+
 resource "example/config" { kind "filesystem.file" }
 
 mission "example/config-check" state="ready" {
@@ -9,7 +17,7 @@ mission "example/config-check" state="ready" {
   observer "config" {
     resource "resource/example/config"
     provider "local.file"
-    locator "./config.toml"
+    locator "${ST_WORKSPACE}/config.toml"
     field "status"
     field "content_hash"
   }

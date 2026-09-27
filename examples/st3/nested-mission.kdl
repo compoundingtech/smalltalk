@@ -1,5 +1,14 @@
 version 2
 
+// Delegate one step to an inline child mission with its own mission-scoped agent.
+//
+// The `change` step is assigned to the run's own `owner` agent. Its nested steps inherit that
+// selector, and the step completes when they do. `finally` stops the owner whatever the outcome.
+//
+//   st3 missions publish examples/st3/nested-mission.kdl --as person/operator
+//   st3 missions start example/nested-change --id example/nested-change/1 \
+//     --workspace /srv/example/app --as person/operator
+
 mission "example/nested-change" state="ready" {
   completion { when "all-steps-exhausted" }
   goal "Keep one owner responsible for a complete nested change."

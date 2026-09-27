@@ -1,0 +1,24 @@
+version 2
+
+mission "eval/seat-queue/alpha" state="ready" {
+  goal "Draft the alpha notes, wait for the requester's sign-off, then publish them."
+
+  step "draft" timeout="5m" {
+    assigned-to "{{WORKER}}"
+    goal "Claim this ready work, record one concise progress update containing ALPHA-DRAFT, then complete it with a concise summary. Do not modify repository files."
+  }
+
+  step "sign-off" timeout="15m" {
+    agentless
+    depends-on { step "draft" completed }
+    gate "the requester signs off the alpha draft" type="human" {
+      reviewer "person/eval-requester"
+    }
+  }
+
+  step "publish" timeout="5m" {
+    assigned-to "{{WORKER}}"
+    depends-on { step "sign-off" completed }
+    goal "Claim this ready work, record one concise progress update containing ALPHA-PUBLISH, then complete it with a concise summary. Do not modify repository files."
+  }
+}

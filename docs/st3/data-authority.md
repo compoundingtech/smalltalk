@@ -11,6 +11,10 @@ runtime fields in `actual` and the current incarnation's harness fields in `harn
 
 All other tables are indexes, projections, local capabilities, or transport recovery state.
 
+A seat queue has no table. Each read derives the order from the `step_runs` projection and the
+replicated `agent.queue.moved` claims on the agent subject, so every replica computes the same
+order from the same admitted claims.
+
 | Table | Class | Rebuild or recovery source |
 |---|---|---|
 | `meta` | Local store metadata | Store initialization and configured node identity |

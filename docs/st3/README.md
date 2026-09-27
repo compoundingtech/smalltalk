@@ -10,9 +10,15 @@ Use these documents for implementation details:
 - [Schema registry](schema.md) lists the generated public subject, resource, and claim vocabulary.
 - [Data authority](data-authority.md) separates durable facts from projections and caches.
 - [Fleet replication](replication.md) defines convergence, inspection, and repair.
+- [Agent seat queues](seat-queue.md) explains how each seat orders its mission runs and how moves
+  are recorded and replicated.
 - [Resource subscriptions](resource-subscriptions.md) defines observers and automatic intake.
 - [Agent migration](agent-migration.md) defines isolated rehearsal, cutover, and rollback.
 - [Eval audit](eval-audit.md) records the test intent and prompt boundary for each st3 eval.
+- [Running st3 with omp](omp.md) covers omp seat setup, behavior, and known limits;
+  [omp readiness evals](omp-readiness-2026-09-26.md) holds the evidence.
+- [st3-next](st3-next.md) records the merge of seat queues and omp readiness into st3, its checks
+  and evals, and the steps to fast-forward `st3`.
 - [Product roadmap](roadmap.md) records accepted future work.
 - [Guided CLI tour](cli-guided-tour.md) is the complete human walkthrough for every public command
   and subcommand.

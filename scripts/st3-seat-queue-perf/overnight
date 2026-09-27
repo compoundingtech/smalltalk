@@ -1,0 +1,106 @@
+#!/usr/bin/env bash
+# Run base and branch side by side until a set time: one niced daemon each on
+# its own fresh copy of the fixture store, the same idle traffic to each, and a
+# sample of each once a minute. Then probe each daemon in turn and stop both.
+#
+# Usage: overnight BASE_ST3 BRANCH_ST3 FIXTURE_ROOT OUT UNTIL [WARMUP_MINUTES]
+#
+# UNTIL is any time `date -d` reads, such as 2026-01-01T07:15Z. Set
+# PERF_WRITES_PER_MINUTE as for `window`. OUT/context.csv records, each minute,
+# how many cargo and rustc processes were running and the host's load average,
+# so minutes that overlap other work can be told apart.
+set -Eeuo pipefail
+
+here="$(cd "$(dirname "$0")" && pwd)"
+source "$here/daemon.sh"
+
+base="$(readlink -f "$1")"
+branch="$(readlink -f "$2")"
+fixture=$3
+out=$4
+end="$(date -d "$5" +%s)"
+warmup=${6:-5}
+
+if pgrep -x cargo >/dev/null; then
+  echo "a cargo build is running; not starting" >&2
+  exit 1
+fi
+mapfile -t seats < <(jq -r '.[].agent_id' "$fixture/fixture-queues.json")
+mkdir -p "$out"
+
+declare -A roots=() binaries=([base]=$base [branch]=$branch)
+background=()
+stop_all() {
+  local label job
+  for job in "${background[@]}"; do kill "$job" 2>/dev/null || true; done
+  for label in "${!roots[@]}"; do
+    perf_stop_daemon "${roots[$label]}" >/dev/null 2>&1 || true
+    rm -rf "${roots[$label]}" "$(perf_state_dir "${roots[$label]}")"
+  done
+}
+trap stop_all EXIT
+
+for label in base branch; do
+  root="$(mktemp -d /tmp/sqp.XXXXXX)"
+  roots[$label]=$root
+  state="$(perf_state_dir "$root")"
+  mkdir -p "$state" "$out/$label"
+  cp "$fixture"/fixture/claims.sqlite3* "$state/"
+  perf_start_daemon "${binaries[$label]}" "$root"
+  pid="$(cat "$root/daemon.pid")"
+  [[ "$(cat "/proc/$pid/comm")" == st3 ]] || { echo "PID $pid is not the $label daemon" >&2; exit 1; }
+  echo "$(date -u +%FT%TZ) started $label, PID $pid"
+done
+
+minutes=$(((end - $(date +%s)) / 60))
+(( minutes > warmup )) || { echo "UNTIL leaves no measured minutes" >&2; exit 1; }
+declare -A samplers=() traffic=()
+for label in base branch; do
+  root=${roots[$label]}
+  nice -n 10 python3 "$here/traffic.py" "$root/st3.sock" $((minutes * 60 + 20)) "${seats[@]}" \
+    >"$out/$label/traffic.log" 2>&1 &
+  traffic[$label]=$!
+  background+=("$!")
+  nice -n 10 python3 "$here/sampler.py" "$(cat "$root/daemon.pid")" "$minutes" "$out/$label/samples.csv" \
+    >"$out/$label/sampler.log" 2>&1 &
+  samplers[$label]=$!
+  background+=("$!")
+done
+
+(
+  echo "unix_ms,cargo,rustc,load1"
+  while (($(date +%s) < end)); do
+    micros=${EPOCHREALTIME/./}
+    printf '%s,%s,%s,%s\n' "${micros:0:-3}" "$(pgrep -xc cargo || true)" "$(pgrep -xc rustc || true)" \
+      "$(cut -d' ' -f1 /proc/loadavg)"
+    sleep 60
+  done
+) >"$out/context.csv" &
+background+=("$!")
+
+for label in base branch; do
+  wait "${samplers[$label]}" || echo "$(date -u +%FT%TZ) the $label sampler exited $?" >&2
+done
+for label in base branch; do
+  wait "${traffic[$label]}" || echo "$(date -u +%FT%TZ) $label traffic exited $?" >&2
+done
+echo "$(date -u +%FT%TZ) sampling done"
+
+for label in base branch; do
+  root=${roots[$label]}
+  pid="$(cat "$root/daemon.pid")"
+  {
+    grep -E '^(VmRSS|VmHWM|RssAnon|RssFile|RssShmem):' "/proc/$pid/status"
+    ls -l "$(perf_state_dir "$root")"
+  } >"$out/$label/memory.txt" || echo "the $label daemon is gone" >&2
+  nice -n 10 python3 "$here/probe.py" "$root/st3.sock" "$pid" "${seats[@]}" >"$out/$label/probe.json" \
+    || echo "the $label probes failed" >&2
+  cp "$root/daemon.log" "$out/$label/daemon.log"
+  jq -n --arg label "$label" --arg binary "$(sha256sum "${binaries[$label]}" | cut -d' ' -f1)" \
+    --argjson minutes "$((minutes - warmup))" --argjson warmup "$warmup" \
+    --arg daemon_env "${PERF_DAEMON_ENV:-}" --arg writes "${PERF_WRITES_PER_MINUTE:-0}" \
+    '{label: $label, binary_sha256: $binary, minutes: $minutes, warmup_minutes: $warmup,
+      daemon_env: $daemon_env, writes_per_minute: $writes, side_by_side: true}' >"$out/$label/window.json"
+done
+python3 "$here/summarize.py" "$out" >"$out/summary.md" || echo "summarize failed" >&2
+echo "$(date -u +%FT%TZ) done"

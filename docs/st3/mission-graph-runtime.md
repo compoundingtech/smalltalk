@@ -560,6 +560,11 @@ A step product is intermediate output for that step. A mission product is a fina
 
 The worker creates or observes products. st3 verifies them. The `produces` keyword does not perform the action.
 
+A worker-submitted step stays `verifying` until its products hold. Once the submitting worker's
+turn has ended, st3 sends that worker one message per step attempt. The message names the exact
+product subject and fields the step waits for, so a worker that recorded the wrong subject can
+correct it.
+
 A mission product can refer to output created during any step. Do not duplicate a step product at mission level unless the same graph subject is intentionally both an intermediate and final contract.
 
 ## Gates
@@ -836,6 +841,10 @@ An agent receives its own subject in both `ST3_SUBJECT` and `ST_AGENT`. A nested
 
 An agentless `exec` or `terminal` receives `ST3_SUBJECT` and no `ST_AGENT`.
 
+A CLI process with `ST_AGENT` acts only as that agent. Work actions, conversation read, archive,
+send, and reply, and `claim --actor` refuse a different `agent/...` actor. They still accept a
+person, exec, or other non-agent actor that the work names.
+
 An unknown variable or a variable that is not available in the current phase is an error.
 
 ## Agent boot contract
@@ -872,7 +881,9 @@ The default refusal prevents a spelling error from creating an unintended direct
 
 Maintained harnesses receive graph messages through their native driver boundary. Codex uses typed
 app-server turn requests. Claude uses one persistent stream-JSON process and acknowledges the
-exact replayed user turn. Pi and OMP acknowledge through their loaded native extensions. OpenCode
+exact replayed user turn. Pi and OMP acknowledge through their loaded native extensions and
+steer a message into a running turn at its next tool boundary. Every harness receives the same
+`[PING from st3] message/ID from SENDER: TITLE` envelope. OpenCode
 acknowledges the assistant turn whose `parentID` is the exact stable user-message ID. Copying a
 message into an inbox or successfully writing transport bytes is not delivery. st3 advances the
 graph only from the durable provider receipt and never injects text or Enter into a terminal
@@ -883,12 +894,53 @@ incarnation. It is not a messaging or work-wake transport.
 
 When an exactly assigned step becomes ready, the reconciler sends a durable work message for the
 current harness incarnation. Each agent has one work seat across mission runs: a claimed,
-working, or verifying step occupies it. Ready steps wait in creation order, with the subject as a
-stable tie breaker. Only the first ready step is woken when the seat is free. Queued steps do not
-consume wake attempts or arm retry timers while the agent is busy. Delivery is acknowledged by a
-new working turn or by claiming the step. An unacknowledged delivery is retried after 15 seconds,
-at most three times. Exhaustion writes a `work-wake-exhausted` harness diagnostic naming the step,
-incarnation, and attempt count.
+working, or verifying step occupies it. A parent that its agent submitted while one of its own
+nested steps is still ready does not occupy the seat; that nested step is woken. Ready steps wait
+in the seat queue described below. Only the seat's next work is woken when the seat is free.
+Queued steps do not consume wake attempts or arm retry timers while the agent is busy. Delivery is
+acknowledged by a new working turn, by a native read or close, by a delivery into a turn that is
+still working, or by claiming the step. Pi and OMP steer a wake into the running turn, so a boot
+turn that started before the wake still acknowledges it. An unacknowledged delivery is retried
+after 15 seconds, at most three times. Exhaustion writes a `work-wake-exhausted` harness
+diagnostic naming the step, incarnation, and attempt count.
+
+## Seat queues
+
+Each agent seat has one ordered queue of the mission runs that have steps assigned to it. A run
+joins the end of the queue when it first has a step for that seat, and it leaves when the run is
+terminal. A new generation from a revision keeps the run's place.
+
+The seat's next work is the first ready step, in queue order, that is assigned to the seat. A run
+whose steps for the seat are waiting on a gate, a dependency, or another seat is passed over, so
+it never blocks the runs behind it. It becomes next again as soon as it has a ready step. Inside
+one run, `depends-on` and `queue {}` still decide which steps are ready, and ready steps of the
+same run keep creation order. `st3 agents show`, `st3 agents ls --enrich`, and the reconciler's
+work wake all use this one selector.
+
+The queue matters most for a durable top-level seat that serves many runs. A mission-scoped seat
+normally serves one run, so its queue has one entry.
+
+```sh
+st3 agents queue agent/fleet/example/worker
+st3 agents queue move agent/fleet/example/worker mission-run/release/2026-09-26 --top \
+  --reason "the release needs this first" --as person/operator
+st3 agents queue move agent/fleet/example/worker mission-run/docs/2026-09-26 \
+  --after mission-run/release/2026-09-26 --as person/operator
+```
+
+`st3 agents queue AGENT` shows the step the seat holds now, its next work, and then each queued
+run in order with its state: `claimed`, `ready`, or `waiting`. A move places one run at the top,
+at the bottom, or directly before or after another queued run. It needs explicit person
+authority, like other client mutations.
+
+Each move writes one `agent.queue.moved` claim on the agent subject with the run, the placement,
+the optional anchor run, the optional reason, the actor, and the graph time. Replicas rebuild the
+same order from the same replicated claims: joins apply in graph time, and each move applies after
+the joins recorded before it. The queue view lists the recent moves, newest first, so every order
+change has an author and a time.
+
+A move changes only which run is next. It never releases, reassigns, or interrupts a step the seat
+already holds; the new order applies when the seat is free again.
 
 `st3 work show STEP` exposes ready age, assignee state, wake attempts, acknowledgement, and failure.
 An operator can request another delivery through the same driver path with:

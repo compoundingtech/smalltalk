@@ -52,6 +52,7 @@ const ACTIONS: &[&str] = &[
     "work.fail",
     "work.release",
     "work.publish-mission",
+    "agent.queue-move",
     "runtime.stop",
     "runtime.restart",
     "runtime.reset",
@@ -86,6 +87,7 @@ const AVAILABLE_ACTIONS: &[&str] = &[
     "work.complete",
     "work.fail",
     "work.release",
+    "agent.queue-move",
     "runtime.context-clear",
     "runtime.signal",
     "terminal.input",
@@ -1145,6 +1147,54 @@ pub(super) async fn devices(
         items.retain(|item| item["state"] == "active");
     }
     client_page(&state, &snapshot, "devices", items, &effective_query).map(Json)
+}
+
+/// One seat's current claim, its queued mission runs in order, and recent moves.
+pub(super) async fn agent_queue(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<Value>, ApiError> {
+    let agent = client_detail_id("agent", &id);
+    let store = state.store.clone();
+    let lookup = agent.clone();
+    let queue = blocking_store(move || {
+        if store.latest_claim(&lookup, None)?.is_none() {
+            return Ok(None);
+        }
+        store.seat_queue(&lookup).map(Some)
+    })
+    .await?
+    .ok_or_else(|| ApiError::not_found(format!("agent `{agent}` does not exist")))?;
+    Ok(Json(agent_queue_value(&queue)))
+}
+
+fn agent_queue_value(queue: &crate::model::SeatQueueView) -> Value {
+    json!({
+        "kind": "agent-queue",
+        "agent_id": queue.agent,
+        "current_work_ids": queue.current_work_ids,
+        "next_work_id": queue.next_work_id,
+        "runs": queue.runs.iter().map(|run| json!({
+            "mission_run_id": run.run,
+            "position": run.position,
+            "state": run.state,
+            "run_state": run.run_status,
+            "joined_at": client_timestamp(run.joined_at_unix_ms),
+            "claimed_work_ids": run.claimed_work_ids,
+            "ready_work_ids": run.ready_work_ids,
+            "waiting_work_ids": run.waiting_work_ids,
+        })).collect::<Vec<_>>(),
+        "moves": queue.moves.iter().map(|moved| json!({
+            "claim_id": moved.claim_id,
+            "mission_run_id": moved.run,
+            "placement": moved.placement,
+            "anchor_run_id": moved.anchor,
+            "actor_id": moved.actor,
+            "reason": moved.reason,
+            "moved_at": client_timestamp(moved.moved_at_unix_ms),
+        })).collect::<Vec<_>>(),
+        "move_count": queue.move_count,
+    })
 }
 
 pub(super) async fn operation_detail(
@@ -3207,6 +3257,7 @@ fn action_scope(action: &str) -> Option<&'static str> {
         "mission" => "control.missions",
         "session" => "control.missions",
         "work" => "control.work",
+        "agent" => "control.work",
         "runtime" => "control.runtimes",
         "terminal" => {
             if matches!(action, "terminal.attach" | "terminal.detach") {
@@ -3951,6 +4002,26 @@ async fn dispatch_action(
             )])
         }
         "terminal.detach" => Ok(vec![detach_terminal_attachment(state, session, request)?]),
+        "agent.queue-move" => {
+            let agent = client_detail_id("agent", &parameter_string(p, "agent_id")?);
+            let move_request = crate::model::SeatQueueMoveRequest {
+                agent: agent.clone(),
+                run: client_detail_id("mission-run", &parameter_string(p, "mission_run_id")?),
+                placement: parameter_string(p, "placement")?,
+                anchor: p
+                    .get("anchor_run_id")
+                    .map(|_| parameter_string(p, "anchor_run_id"))
+                    .transpose()?
+                    .map(|anchor| client_detail_id("mission-run", &anchor)),
+                reason: p.get("reason").and_then(Value::as_str).map(str::to_owned),
+                actor: authority_actor.clone(),
+                idempotency_key: request.idempotency_key.clone(),
+            };
+            let store = state.store.clone();
+            blocking_action(move || store.move_seat_queue_run(&move_request)).await?;
+            signal_changed(state);
+            Ok(vec![agent])
+        }
         "runtime.context-clear" => {
             let target = terminal_subject(&parameter_string(p, "target_id")?);
             let result = clear_context(

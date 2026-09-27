@@ -1,0 +1,42 @@
+version 2
+
+// Hold work until a wall-clock time, without an agent waiting in a turn.
+//
+// The `window` step is agentless. Its gate passes once the time has come. Before then the gate
+// fails, the attempt fails, and `retry` starts a new attempt after the backoff. The dependent
+// step becomes ready only after the gate passes, and st3 then wakes the seat for it.
+//
+// A gate result is cached by the gate's definition within the step run, so a retry of an
+// unchanged gate would reuse the first failure. The shell comment `# attempt ${ST_ATTEMPT}` makes
+// each attempt's command different, so each attempt checks the clock again. st3 substitutes
+// `${ST_ATTEMPT}`; `$(...)` is ordinary shell, run through `sh -c` with a minimal environment.
+//
+// The wait ends up to one backoff after the time. `attempts` times `backoff` must cover the
+// longest wait: 100 attempts ten minutes apart cover about 16 hours. For a repeating time, use a
+// `schedule` instead (recurring-stewardship.kdl).
+//
+//   st3 agents apply examples/st3/seats/omp.kdl --as person/operator
+//   st3 missions publish examples/st3/wait-until-time.kdl --as person/operator
+//   st3 missions start example/app/release-at-window --id example/app/release-at-window/2026-10-01 \
+//     --workspace /srv/example/app --as person/operator
+
+mission "example/app/release-at-window" state="ready" {
+  goal "Tag the invented release only after its announced release window opens."
+
+  step "window" {
+    agentless
+    retry { attempts 100; backoff "10m"; }
+    gate "the release window has opened" {
+      exec "test \"$(/usr/bin/date -u +%s)\" -ge \"$(/usr/bin/date -u -d 2026-10-01T18:00:00Z +%s)\" # attempt ${ST_ATTEMPT}"
+      host "local"
+      workspace "${ST_WORKSPACE}"
+      time-limit "30s"
+    }
+  }
+
+  step "tag" timeout="30m" {
+    assigned-to "agent/example/worker"
+    depends-on { step "window" completed }
+    goal "Tag the current main commit as v1.4.0 and push the tag."
+  }
+}

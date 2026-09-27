@@ -565,6 +565,9 @@ impl Client {
     pub async fn agents_get(&self, id: &str) -> Result<Envelope<Resource>, ClientError> {
         self.resource_internal("agents", id).await
     }
+    pub async fn agent_queue(&self, agent_id: &str) -> Result<Envelope<AgentQueue>, ClientError> {
+        self.agent_queue_internal(agent_id).await
+    }
     pub async fn runtimes_list(
         &self,
         cursor: Option<&str>,
@@ -640,6 +643,17 @@ impl Client {
         terminal_id: &str,
     ) -> Result<Envelope<TerminalScreen>, ClientError> {
         self.terminal_screen_internal(terminal_id).await
+    }
+    pub async fn agent_queue_move(
+        &self,
+        id: impl Into<String>,
+        idempotency_key: impl Into<String>,
+        fence: Fence,
+        parameters: AgentQueueMoveParameters,
+    ) -> Result<Envelope<ActionResult>, ClientError> {
+        let request = ActionRequest::agent_queue_move(id, idempotency_key, fence, parameters)
+            .map_err(|error| ClientError::Protocol(error.to_string()))?;
+        self.action_internal(&request).await
     }
     pub async fn attention_resolve(
         &self,
@@ -1036,6 +1050,13 @@ impl Client {
             request,
         )
         .await
+    }
+    async fn agent_queue_internal(
+        &self,
+        agent_id: &str,
+    ) -> Result<Envelope<AgentQueue>, ClientError> {
+        self.get(&format!("/v1/client/agent-queues/{agent_id}"))
+            .await
     }
     async fn terminal_screen_internal(
         &self,

@@ -2,12 +2,17 @@
 
 This example sends a question about an invented catalog project.
 
+Messages are for conversation: questions, answers, and context. They do not hand out work, and they
+are not where results go. To give a seat work, start a mission whose step is assigned to it. To
+report a result, complete the step with it or store it as a document and cite the reference. Agents
+react to steps, gates, and dependencies, so a result in a message is invisible to the graph.
+
 ## Failure first: a delivered message can still lose its context
 
 This command delivers a body, but it supplies neither a visible subject nor a thread parent:
 
 ```sh
-st3 conversations send agent/example/catalog/standing/owner \
+st3 conversations send agent/example/worker \
   --from person/operator \
   --body 'Which catalog edition should I use?'
 ```
@@ -31,7 +36,7 @@ BODY
 )"
 
 request_message="$(st3 conversations send \
-  agent/example/catalog/standing/owner \
+  agent/example/worker \
   --from person/operator \
   --subject 'Choose the catalog edition' \
   --body "$message_body")"
@@ -46,7 +51,7 @@ BODY
 )"
 
 st3 conversations send person/operator \
-  --from agent/example/catalog/standing/owner \
+  --from agent/example/worker \
   --subject 'Re: Choose the catalog edition' \
   --in-reply-to "$request_message" \
   --body "$reply_body"
@@ -63,7 +68,7 @@ then send its exact `doc/NAME@HASH` reference as the body:
 
 ```sh
 document_ref="$(st3 documents put catalog-context.md --as doc/example/catalog-context)"
-st3 conversations send agent/example/catalog/standing/owner \
+st3 conversations send agent/example/worker \
   --from person/operator \
   --subject 'Catalog import context' \
   --body "$document_ref"

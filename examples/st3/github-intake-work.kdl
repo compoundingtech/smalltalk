@@ -1,0 +1,43 @@
+version 2
+
+// The finite missions that github-intake.kdl starts, one run for each new pull request or issue.
+//
+// Publish this file before github-intake.kdl, because a subscription names an exact revision.
+// Then read each mission's revision hash and copy it into github-intake.kdl in place of its zero
+// placeholder:
+//
+//   st3 missions publish examples/st3/github-intake-work.kdl --as person/operator
+//   st3 missions ls --all --json | jq -r '.value.items[]
+//     | select(.id == "mission/example/app/review-pull-request") | .mission_revision'
+//
+// A later change to this file needs a new publish and a new intake revision.
+//
+// Each run receives the discovered item as its `source` input, pinned to the exact discovery
+// claim, so later changes to the pull request or issue do not change what the run reviews.
+// Results go in the step completion or a stored document, not in a message.
+
+mission "example/app/review-pull-request" state="ready" {
+  concurrent-runs max=3
+  input "source" kind="resource"
+  goal "Review one newly ready pull request and record the review in the graph."
+
+  step "review" timeout="1h" {
+    assigned-to "agent/example/worker"
+    goal "Review the pull request in ${input.source}: read the diff, run the affected tests, and note every defect with its file and line."
+    goal "Store the full review with `st3 documents put`, and complete this step with a short verdict and the stored document reference."
+    constraint "Do not comment on, approve, merge, or push to the pull request."
+  }
+}
+
+mission "example/app/triage-issue" state="ready" {
+  concurrent-runs max=3
+  input "source" kind="resource"
+  goal "Triage one new issue and record the result in the graph."
+
+  step "triage" timeout="45m" {
+    assigned-to "agent/example/worker"
+    goal "Try to reproduce the issue in ${input.source} on main, and find the code that is most likely responsible."
+    goal "Complete this step with whether it reproduced, the exact steps, and the suspected files."
+    constraint "Do not comment on, label, or close the issue."
+  }
+}

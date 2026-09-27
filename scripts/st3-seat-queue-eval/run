@@ -1,0 +1,231 @@
+#!/usr/bin/env bash
+# Run the paid seat queue eval several times, one after another. Each run gets a
+# fresh isolated daemon started from BIN_DIR's st3 and st2. SEAT names the
+# harness of that run's seat: claude, codex or omp. Each harness gets its own
+# eval bundle, built once from evals/st3/seat-queue with the seat's harness
+# block swapped in. Each run's evidence goes to OUT/run-N for its report.
+#
+# Usage: run BIN_DIR OUT SEAT...
+#
+# OUT/runs.tsv gets one line per run: number, seat, posted, finished, mission
+# run, verdict, cleanup. A run that fails to start or times out still gets a line.
+set -Eeuo pipefail
+
+here="$(cd "$(dirname "$0")" && pwd)"
+repo="$(cd "$here/../.." && pwd)"
+source "$repo/scripts/st3-seat-queue-perf/daemon.sh"
+bin_dir="$(readlink -f "$1")"
+mkdir -p "$2"
+out="$(cd "$2" && pwd)"
+shift 2
+seats=("$@")
+((${#seats[@]} > 0)) || { echo "name at least one seat: claude, codex or omp" >&2; exit 2; }
+
+# The seat's harness block, indented as in eval.kdl.
+harness_block() {
+  case $1 in
+    claude) cat <<'KDL' ;;
+  harness "claude" {
+    model "claude-sonnet-5"
+    effort "medium"
+    args "--permission-mode" "bypassPermissions"
+  }
+KDL
+    codex) cat <<'KDL' ;;
+  harness "codex" {
+    model "gpt-6-luna"
+    effort "medium"
+    args "--dangerously-bypass-approvals-and-sandbox" "--dangerously-bypass-hook-trust"
+  }
+KDL
+    omp) cat <<'KDL' ;;
+  harness "omp" {
+    model "openai-codex/gpt-5.6-luna"
+    effort "medium"
+  }
+KDL
+    *) echo "unknown seat $1: use claude, codex or omp" >&2; return 2 ;;
+  esac
+}
+
+# Some date implementations ignore the width in %3N, so build milliseconds here.
+now() {
+  local micros=${EPOCHREALTIME/./}
+  printf '%s.%03dZ\n' "$(date -u -d "@${micros:0:-6}" +%Y-%m-%dT%H:%M:%S)" "$((10#${micros: -6} / 1000))"
+}
+
+# bundle SEAT: build OUT/SEAT/bundle.tar and OUT/SEAT/request.json once. Every
+# run on that seat posts the same request.
+bundle() {
+  local seat=$1 dir="$out/$1" stage
+  [[ -f $dir/request.json ]] && return 0
+  mkdir -p "$dir"
+  stage="$(mktemp -d)"
+  cp -r "$repo/evals/st3/seat-queue/." "$stage/"
+  rm -rf "$stage/reports" "$stage/generated"
+  harness_block "$seat" >"$stage/harness.kdl"
+  python3 - "$stage/eval.kdl" "$stage/harness.kdl" <<'PY'
+import re, sys
+path, block = sys.argv[1], open(sys.argv[2]).read()
+text = open(path).read()
+text, count = re.subn(r'^  harness "claude" \{\n.*?^  \}\n', lambda _: block, text, flags=re.S | re.M)
+if count != 1:
+    sys.exit(f"expected one claude harness block in eval.kdl, found {count}")
+open(path, "w").write(text)
+PY
+  rm "$stage/harness.kdl"
+  (
+    cd "$stage"
+    mapfile -t files < <(find . -type f | sed 's|^\./||' | sort)
+    tar --format=ustar --owner=0 --group=0 --numeric-owner --mtime=@0 -cf "$dir/bundle.tar" "${files[@]}"
+    cp eval.kdl "$dir/eval.kdl"
+    sha256sum eval.kdl | cut -d' ' -f1 >"$dir/eval-kdl.sha256"
+  )
+  rm -rf "$stage"
+  python3 - "$dir/bundle.tar" >"$dir/request.json" <<'PY'
+import hashlib, json, sys
+data = open(sys.argv[1], "rb").read()
+print(json.dumps({"name": "seat-queue", "bundle_hash": hashlib.sha256(data).hexdigest(),
+                  "bundle": list(data), "inputs": {}}))
+PY
+}
+
+for seat in "${seats[@]}"; do
+  harness_block "$seat" >/dev/null
+  bundle "$seat"
+done
+{
+  git -C "$repo" rev-parse HEAD
+  git -C "$repo" status --short
+  sha256sum "$bin_dir/st3" "$bin_dir/st2"
+} >"$out/candidate.txt"
+
+start_daemon() {
+  local root=$1 login_path
+  mkdir -p "$root/bin" "$root/state" "$root/pty"
+  cp "$bin_dir/st3" "$bin_dir/st2" "$root/bin/"
+  cat >"$root/config.toml" <<TOML
+node = "evalnode"
+person = "person/eval-operator"
+state_dir = "$root/state"
+socket = "$root/st3.sock"
+client_gateway_socket = "$root/client.sock"
+TOML
+  login_path="$(perf_login_path)"
+  env -i HOME="$HOME" USER="$USER" LOGNAME="$USER" SHELL="$SHELL" LANG="${LANG:-C.UTF-8}" \
+    PATH="$root/bin:$login_path" \
+    setsid "$root/bin/st3" up --config "$root/config.toml" --pty-root "$root/pty" \
+    >"$root/daemon.log" 2>&1 </dev/null &
+  echo $! >"$root/daemon.pid"
+  for _ in $(seq 1 150); do
+    [[ -S "$root/st3.sock" ]] && return 0
+    sleep 0.2
+  done
+  echo "the eval daemon under $root did not open its socket" >&2
+  return 1
+}
+
+# transcript SEAT ROOT WORKSPACE DEST: copy the seat's native transcript. The
+# daemon root is removed after the run, so this is the only copy of an omp
+# session and of each harness's binding to its session.
+transcript() {
+  local seat=$1 root=$2 workspace=$3 dest=$4 session project thread file
+  case $seat in
+    claude)
+      session="$(find "$root/state/drivers" -name claude-native-session -exec cat {} \; 2>/dev/null \
+        | jq -r '.native_session_id' | head -1)"
+      [[ -n $session && -n $workspace ]] || return 0
+      project="$HOME/.claude/projects/$(printf '%s' "$workspace" | sed 's|[^A-Za-z0-9]|-|g')"
+      file="$project/$session.jsonl"
+      ;;
+    codex)
+      thread="$(find "$root/state/drivers" -path '*/state/binding.json' -exec cat {} \; 2>/dev/null \
+        | jq -r '.threadId // empty' | head -1)"
+      [[ -n $thread ]] || return 0
+      file="$(find "$HOME/.codex/sessions" -type f -name "*$thread*.jsonl" 2>/dev/null | head -1)"
+      ;;
+    omp)
+      file="$(find "$root/state/drivers" -path '*/provider-sessions/*.jsonl' -type f 2>/dev/null | sort | tail -1)"
+      ;;
+  esac
+  if [[ -n ${file:-} && -f $file ]]; then
+    cp "$file" "$dest/transcript.jsonl"
+  else
+    echo "no $seat transcript" >&2
+  fi
+}
+
+# collect SEAT ROOT RUN_OUT: copy what a report needs out of the isolated daemon.
+collect() {
+  local seat=$1 root=$2 dest=$3 st3="$2/bin/st3" workspace after page last run
+  export ST3_ENDPOINT="$root/st3.sock"
+  workspace="$(ls -d "$root"/state/evals/*/* 2>/dev/null | head -1)"
+  if [[ -n $workspace ]]; then
+    cp -r "$workspace/controller-state.json" "$workspace/generated" "$dest/" 2>/dev/null || true
+    cp "$workspace/pty-audit.log" "$dest/" 2>/dev/null || true
+  fi
+  after=0
+  : >"$dest/history.jsonl"
+  while :; do
+    page="$("$st3" trace show --json --after-index "$after" --limit 500)" || break
+    [[ -n $page ]] || break
+    printf '%s\n' "$page" >>"$dest/history.jsonl"
+    last="$(jq -s 'map(.store_index) | max' <<<"$page")"
+    ((last > after)) || break
+    after=$last
+  done
+  run="$(jq -r '.value.mission_run // empty' "$dest/start.json" 2>/dev/null || true)"
+  [[ -n $run ]] && "$st3" missions show "$run" --json >"$dest/eval-run.json" 2>/dev/null || true
+  "$st3" agents show agent/eval/seat-queue/worker --all --json >"$dest/seat.json" 2>/dev/null || true
+  transcript "$seat" "$root" "$workspace" "$dest"
+  cp "$root/daemon.log" "$dest/" 2>/dev/null || true
+  unset ST3_ENDPOINT
+}
+
+# one_run N SEAT: run the eval once and record it. Call it in its own subshell,
+# which stops the daemon and removes its root when it exits.
+one_run() {
+  local n=$1 seat=$2 dest="$out/run-$1" root socket run deadline
+  mkdir -p "$dest"
+  echo "$seat" >"$dest/seat"
+  root="$(mktemp -d /tmp/sqe.XXXXXX)"
+  socket="$root/st3.sock"
+  # shellcheck disable=SC2064
+  trap "perf_stop_daemon '$root' >/dev/null 2>&1 || true; rm -rf '$root'" EXIT
+  start_daemon "$root"
+  now >"$dest/posted-at"
+  curl -sS --fail-with-body --unix-socket "$socket" -H 'content-type: application/json' \
+    --data-binary @"$out/$seat/request.json" http://localhost/v1/evals >"$dest/start.json"
+  run="$(jq -er .value.mission_run "$dest/start.json")"
+  deadline=$((SECONDS + 1500))
+  while ((SECONDS < deadline)); do
+    curl -sS --unix-socket "$socket" "http://localhost/v1/evals/$(jq -rn --arg r "$run" '$r|@uri')" \
+      >"$dest/status.json" 2>/dev/null || true
+    jq -e '.value.verdict != null and .value.cleanup == "complete"' "$dest/status.json" >/dev/null 2>&1 && break
+    sleep 5
+  done
+  now >"$dest/finished-at"
+  collect "$seat" "$root" "$dest"
+}
+
+n=0
+for seat in "${seats[@]}"; do
+  n=$((n + 1))
+  echo "$(now) start run $n on a $seat seat"
+  # A tested subshell would ignore errexit, so test its status afterwards.
+  set +e
+  (
+    set -e
+    one_run "$n" "$seat"
+  )
+  status=$?
+  set -e
+  ((status == 0)) || echo "$(now) run $n did not finish cleanly: exit $status" >&2
+  dest="$out/run-$n"
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$n" "$seat" "$(cat "$dest/posted-at" 2>/dev/null)" \
+    "$(cat "$dest/finished-at" 2>/dev/null)" \
+    "$(jq -r '.value.mission_run // "none"' "$dest/start.json" 2>/dev/null || echo none)" \
+    "$(jq -r '.value.verdict // "none"' "$dest/status.json" 2>/dev/null || echo none)" \
+    "$(jq -r '.value.cleanup // "none"' "$dest/status.json" 2>/dev/null || echo none)" >>"$out/runs.tsv"
+  echo "$(now) end run $n: $(tail -1 "$out/runs.tsv" | cut -f6,7)"
+done

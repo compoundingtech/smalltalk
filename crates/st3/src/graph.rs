@@ -2277,6 +2277,7 @@ fn validate_agent_body(document: &KdlDocument, owner: &str) -> Result<(), St3Err
         "render",
         "harness",
         "mission-authority",
+        "queue-authority",
         "pty",
         "exec",
     ];
@@ -2294,45 +2295,35 @@ fn validate_agent_body(document: &KdlDocument, owner: &str) -> Result<(), St3Err
         "render",
         "harness",
         "mission-authority",
+        "queue-authority",
     ] {
         unique_child(document, child)?;
     }
     if let Some(authority) = unique_child(document, "mission-authority")? {
-        ensure_bare(authority)?;
-        let body = authority.children().ok_or_else(|| {
-            St3Error::new(
-                "empty-mission-authority",
-                "mission-authority needs at least one rule",
-            )
-        })?;
-        reject_unknown_children(
-            body,
-            &["publish", "start", "revise"],
-            "mission-authority",
+        validate_authority_block(
+            authority,
+            AuthorityBlock {
+                name: "mission-authority",
+                verbs: &["publish", "start", "revise"],
+                empty: "empty-mission-authority",
+                duplicate: "duplicate-mission-authority",
+                pattern: validate_mission_authority_pattern,
+            },
             owner,
         )?;
-        let mut rules = BTreeSet::new();
-        for rule in body.nodes() {
-            ensure_no_properties(rule)?;
-            ensure_no_children(rule)?;
-            let pattern = one_string(rule)?;
-            validate_mission_authority_pattern(&pattern)?;
-            if !rules.insert((rule.name().value().to_owned(), pattern.clone())) {
-                return Err(St3Error::new(
-                    "duplicate-mission-authority",
-                    format!(
-                        "agent `{owner}` repeats mission authority `{} {pattern}`",
-                        rule.name().value()
-                    ),
-                ));
-            }
-        }
-        if rules.is_empty() {
-            return Err(St3Error::new(
-                "empty-mission-authority",
-                "mission-authority needs at least one rule",
-            ));
-        }
+    }
+    if let Some(authority) = unique_child(document, "queue-authority")? {
+        validate_authority_block(
+            authority,
+            AuthorityBlock {
+                name: "queue-authority",
+                verbs: &["move"],
+                empty: "empty-queue-authority",
+                duplicate: "duplicate-queue-authority",
+                pattern: validate_queue_authority_pattern,
+            },
+            owner,
+        )?;
     }
     for under in document
         .nodes()
@@ -2403,35 +2394,108 @@ fn validate_mission_authority_pattern(pattern: &str) -> Result<(), St3Error> {
     crate::mission::validate_mission_id(mission)
 }
 
-pub fn agent_mission_authority(desired: &Value) -> crate::model::MissionAuthority {
-    let mut authority = crate::model::MissionAuthority::default();
+fn validate_queue_authority_pattern(pattern: &str) -> Result<(), St3Error> {
+    let invalid = || {
+        St3Error::new(
+            "invalid-queue-authority-pattern",
+            "queue authority needs an exact seat identity or a terminal `/*` namespace, without `agent/`",
+        )
+    };
+    if pattern.starts_with("agent/") || pattern.contains('*') && !pattern.ends_with("/*") {
+        return Err(invalid());
+    }
+    let seat = pattern.strip_suffix("/*").unwrap_or(pattern);
+    if seat.contains('*') {
+        return Err(invalid());
+    }
+    validate_name(seat, false).map_err(|_| invalid())
+}
+
+/// One kind of authority an agent declaration can grant: a block of `VERB "PATTERN"` rules.
+struct AuthorityBlock {
+    name: &'static str,
+    verbs: &'static [&'static str],
+    empty: &'static str,
+    duplicate: &'static str,
+    pattern: fn(&str) -> Result<(), St3Error>,
+}
+
+fn validate_authority_block(
+    authority: &KdlNode,
+    block: AuthorityBlock,
+    owner: &str,
+) -> Result<(), St3Error> {
+    ensure_bare(authority)?;
+    let empty = || {
+        St3Error::new(
+            block.empty,
+            format!("{} needs at least one rule", block.name),
+        )
+    };
+    let body = authority.children().ok_or_else(empty)?;
+    reject_unknown_children(body, block.verbs, block.name, owner)?;
+    let mut rules = BTreeSet::new();
+    for rule in body.nodes() {
+        ensure_no_properties(rule)?;
+        ensure_no_children(rule)?;
+        let pattern = one_string(rule)?;
+        (block.pattern)(&pattern)?;
+        if !rules.insert((rule.name().value().to_owned(), pattern.clone())) {
+            return Err(St3Error::new(
+                block.duplicate,
+                format!(
+                    "agent `{owner}` repeats {} `{} {pattern}`",
+                    block.name.replace('-', " "),
+                    rule.name().value()
+                ),
+            ));
+        }
+    }
+    if rules.is_empty() {
+        return Err(empty());
+    }
+    Ok(())
+}
+
+/// The `VERB "PATTERN"` rules of one authority block in a desired agent declaration.
+fn authority_rules<'a>(desired: &'a Value, block: &str) -> Vec<(&'a str, &'a str)> {
     let Some(children) = desired.get("children").and_then(Value::as_array) else {
-        return authority;
+        return Vec::new();
     };
     let Some(block) = children
         .iter()
-        .find(|child| child.get("name").and_then(Value::as_str) == Some("mission-authority"))
+        .find(|child| child.get("name").and_then(Value::as_str) == Some(block))
     else {
-        return authority;
+        return Vec::new();
     };
-    for rule in block
+    block
         .get("children")
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
-    {
-        let Some(action) = rule.get("name").and_then(Value::as_str) else {
-            continue;
-        };
-        let Some(pattern) = rule
-            .get("arguments")
-            .and_then(Value::as_array)
-            .and_then(|arguments| arguments.first())
-            .and_then(Value::as_str)
-        else {
-            continue;
-        };
-        match action {
+        .filter_map(|rule| {
+            let verb = rule.get("name").and_then(Value::as_str)?;
+            let pattern = rule
+                .get("arguments")
+                .and_then(Value::as_array)
+                .and_then(|arguments| arguments.first())
+                .and_then(Value::as_str)?;
+            Some((verb, pattern))
+        })
+        .collect()
+}
+
+/// Whether a desired agent declaration grants mission or queue authority.
+pub fn declares_authority(desired: &Value) -> bool {
+    ["mission-authority", "queue-authority"]
+        .iter()
+        .any(|block| !authority_rules(desired, block).is_empty())
+}
+
+pub fn agent_mission_authority(desired: &Value) -> crate::model::MissionAuthority {
+    let mut authority = crate::model::MissionAuthority::default();
+    for (verb, pattern) in authority_rules(desired, "mission-authority") {
+        match verb {
             "publish" => authority.publish.push(pattern.to_owned()),
             "start" => authority.start.push(pattern.to_owned()),
             "revise" => authority.revise.push(pattern.to_owned()),
@@ -2439,6 +2503,16 @@ pub fn agent_mission_authority(desired: &Value) -> crate::model::MissionAuthorit
         }
     }
     authority
+}
+
+pub fn agent_queue_authority(desired: &Value) -> crate::model::QueueAuthority {
+    crate::model::QueueAuthority {
+        moves: authority_rules(desired, "queue-authority")
+            .into_iter()
+            .filter(|(verb, _)| *verb == "move")
+            .map(|(_, pattern)| pattern.to_owned())
+            .collect(),
+    }
 }
 
 fn validate_task_body(

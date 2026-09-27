@@ -24,7 +24,7 @@ st3 attention request \
   --reason 'CSV or JSON is needed to unblock the publish step. Input validation is complete, and I am continuing the independent checksum report meanwhile.' \
   --severity warning \
   --target "$blocked_step" \
-  --as agent/example/catalog/standing/owner \
+  --as agent/example/worker \
   --idempotency-key example-catalog-export-format
 ```
 
@@ -39,10 +39,15 @@ Record the material status and continue everything that does not depend on the c
 
 ```sh
 st3 work progress "$blocked_step" \
-  --as agent/example/catalog/standing/owner \
+  --as agent/example/worker \
   --summary 'Requested the export-format decision; validation is complete and checksum work continues.'
-st3 work ls --as agent/example/catalog/standing/owner
+st3 work ls --as agent/example/worker
 ```
 
 When the person resolves the request, the agent reads the durable outcome and resumes only the
 dependent publish work. The attention item, its target, and its resolution remain graph history.
+
+When the mission author already knows a person must decide, declare a human gate in the mission
+instead, as [`human-review.kdl`](human-review.kdl) does. The decision then appears in the same
+attention inbox without any agent asking for it. An attention request is for a need that the plan
+did not foresee.
