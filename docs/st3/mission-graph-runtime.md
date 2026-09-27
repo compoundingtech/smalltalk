@@ -282,7 +282,7 @@ If a step produces a native harness driver, the step waits for a ready, working,
 
 A driver declared with `restart "never"` that exits, vanishes, or fails to start before readiness fails the step immediately. A restartable driver remains pending while its restart policy can still recover it. It fails when that policy raises an unrecoverable decision. Driver readiness is lifecycle state and does not consume the step's claimed-execution budget.
 
-Terminal ownership is recursive. When a root mission run becomes completed, failed, or cancelled, every nested run is terminalized and every nonterminal descendant step is cancelled. Repeating the terminal transition repairs any orphaned descendant left by an interrupted older daemon; once the tree is clean, the same operation is an explicit no-op. Current work queries and work actions also fence on the root owner, so stale readiness or replicated work claims cannot reopen a terminal tree. `work ls --all` retains the history with the exact owner run and non-actionable reason.
+Terminal ownership is recursive. When a root mission run becomes completed, failed, or cancelled, every nested run is terminalized and every nonterminal descendant step is cancelled. Repeating the terminal transition repairs any orphaned descendant left by an interrupted older daemon; once the tree is clean, the same operation is an explicit no-op. Current work queries and work actions also fence on the root owner, so stale readiness or replicated work claims cannot reopen a terminal tree. Only an explicit step retry or run revision reopens a failed run, and it does so in a new generation. `work ls --all` retains the history with the exact owner run and non-actionable reason.
 
 The daemon gives a running native harness 60 seconds to become ready. At the deadline, the daemon preserves the PTY and records `runtime.readiness-deadline-reached`. It requests attention from `person/operator` once. It does not restart the runtime or send input. A later ready observation from the same incarnation resolves that attention item as `daemon/runtime`.
 
@@ -743,6 +743,25 @@ Each attempt can submit or fail its work once. A failed gate can return the step
 
 A retryable failure does not terminate the mission before the next attempt.
 
+A step has one attempt by default. st3 does not repeat a failure automatically: a failed attempt is
+usually an agent's judgment or a false gate, and a repeated attempt repeats its side effects. Declare
+`retry` on a step whose failure is known to be transient.
+
+A person, or an agent with `revise` authority for the mission, can retry one failed step:
+
+```sh
+st3 work retry STEP_RUN --as person/operator --reason "the deploy check host is back"
+```
+
+While its run is active, the step starts its next attempt in place. When that step is the only
+reason its root run failed, the retry reopens the run in a successor generation of the same
+revision. Completed normal work carries forward. The failed step starts its next attempt. Work that
+the failure cancelled and every final step start again. The old generation becomes superseded.
+
+A failed run does not reopen when several steps failed, when work was cancelled for a reason other
+than the failure, when a mission gate or the mission timeout failed it, when it is a nested or eval
+run, or when its mission deadline has passed. Revise the run instead to restart several failed steps.
+
 The `completion` frontier selects when st3 checks mission products and gates. st3 then enters the final phase when one exists.
 
 The run reaches `completed` after successful final work. A final failure makes the run failed.
@@ -1198,6 +1217,12 @@ st3 work revision cancel PROPOSAL --as person/reviewer --reason "The request cha
 ```
 
 A run can have one pending proposal. A second proposal fails until the first proposal is applied or cancelled.
+
+A failed root run can be revised when its failed steps are the only reason it failed. It has no
+active work to drain, so an unreviewed revision cuts over immediately and an approved proposal cuts
+over on its final approval. The successor generation reopens the run: compatible completed normal
+work carries forward, each unchanged failed step starts its next attempt, and changed, cancelled,
+and final work starts again.
 
 ### Deferred declarative revision intent
 

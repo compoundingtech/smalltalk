@@ -1779,7 +1779,10 @@ impl Store {
                 format!("mission run `{run}` does not exist"),
             )
         })?;
-        if !matches!(current.status.as_str(), "running" | "standing" | "blocked")
+        let reopening = is_failed_terminal(&current.status, &current.phase);
+        if reopening {
+            failed_run_reopen_blocker(&current).map_err(|reason| not_reopenable(run, &reason))?;
+        } else if !matches!(current.status.as_str(), "running" | "standing" | "blocked")
             || current.phase != "normal"
         {
             return Err(St3Error::new(
@@ -1822,15 +1825,14 @@ impl Store {
         let compatible = carried_revision_step_paths(&old, mission, &current.steps, compatible);
         let cutover = old.revision_cutover.clone();
         let status = if reviewers.is_empty() {
-            match &cutover {
-                RevisionCutover::RestartActive => {
-                    return Err(St3Error::new(
-                        "revision-does-not-need-proposal",
-                        "this revision can cut over immediately",
-                    ));
-                }
-                RevisionCutover::WhenIdle => "draining",
+            // A failed run has no active work to drain.
+            if reopening || matches!(cutover, RevisionCutover::RestartActive) {
+                return Err(St3Error::new(
+                    "revision-does-not-need-proposal",
+                    "this revision can cut over immediately",
+                ));
             }
+            "draining"
         } else {
             "pending-approval"
         };
@@ -2022,7 +2024,22 @@ impl Store {
             .reviewers
             .iter()
             .all(|reviewer| proposal.approvals.contains(reviewer));
-        let status = if all_approved && matches!(proposal.cutover, RevisionCutover::WhenIdle) {
+        // A failed run has no active work to drain, so its approved revision cuts over now.
+        let (run_status, run_phase) = transaction
+            .query_row(
+                "SELECT status, phase FROM mission_runs WHERE id=?1",
+                [proposal
+                    .run
+                    .strip_prefix("mission-run/")
+                    .unwrap_or(&proposal.run)],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .map_err(internal)?;
+        let reopening = is_failed_terminal(&run_status, &run_phase);
+        let status = if all_approved
+            && !reopening
+            && matches!(proposal.cutover, RevisionCutover::WhenIdle)
+        {
             "draining"
         } else {
             "pending-approval"
@@ -2061,7 +2078,8 @@ impl Store {
         transaction.commit().map_err(internal)?;
         drop(connection);
 
-        if all_approved && matches!(proposal.cutover, RevisionCutover::RestartActive) {
+        if all_approved && (reopening || matches!(proposal.cutover, RevisionCutover::RestartActive))
+        {
             let run = self.finish_proposal_cutover(proposal_id, &actor, idempotency_key)?;
             let applied = self
                 .revision_proposal(proposal_id)
@@ -2371,6 +2389,7 @@ impl Store {
             None,
             false,
             None,
+            false,
         )
     }
 
@@ -2394,7 +2413,127 @@ impl Store {
             Some(source_generation),
             true,
             Some(proposal),
+            false,
         )
+    }
+
+    /// Retry one failed step. While its run is active, the step retries in place. A failed run
+    /// reopens in a successor generation of its current revision when this step is the only
+    /// reason it failed.
+    pub fn retry_failed_step(
+        &self,
+        subject: &str,
+        actor: &str,
+        reason: &str,
+        idempotency_key: &str,
+    ) -> Result<MissionRunView, St3Error> {
+        if let Some(response) = self
+            .cached_idempotency_response(idempotency_key)
+            .map_err(internal)?
+        {
+            return Ok(response);
+        }
+        let subject = normalize_step_run(subject);
+        let step = self.step_run(&subject).map_err(internal)?.ok_or_else(|| {
+            St3Error::new(
+                "missing-step-run",
+                format!("step run `{subject}` does not exist"),
+            )
+        })?;
+        let current = self
+            .mission_run(&step.run)
+            .map_err(internal)?
+            .ok_or_else(|| {
+                St3Error::new(
+                    "missing-mission-run",
+                    format!("mission run `{}` does not exist", step.run),
+                )
+            })?;
+        if generation_id_from_subject(&step.generation)
+            != generation_id_from_subject(&current.generation)
+        {
+            return Err(St3Error::new(
+                "stale-run-generation",
+                format!("step run `{subject}` belongs to a superseded generation"),
+            ));
+        }
+        if step.status != "failed" {
+            return Err(St3Error::new(
+                "work-not-failed",
+                format!("step run `{subject}` is `{}`, not failed", step.status),
+            ));
+        }
+        let mission_id = current
+            .mission
+            .strip_prefix("mission/")
+            .unwrap_or(&current.mission);
+        let mission = self
+            .mission_spec(mission_id, Some(&current.revision))
+            .map_err(internal)?
+            .ok_or_else(|| {
+                St3Error::new(
+                    "missing-mission-revision",
+                    "the current mission revision is unavailable",
+                )
+            })?;
+        if is_failed_terminal(&current.status, &current.phase) {
+            let failed = failed_run_reopen_blocker(&current)
+                .map_err(|reason| not_reopenable(&current.subject, &reason))?;
+            if let Some(other) = failed.iter().find(|path| **path != step.step) {
+                return Err(not_reopenable(
+                    &current.subject,
+                    &format!(
+                        "step `{other}` also failed; revise the run to restart every failed step"
+                    ),
+                ));
+            }
+            return self.adopt_mission_revision_inner(
+                &current.id,
+                &mission,
+                actor,
+                reason,
+                idempotency_key,
+                Some(&current.generation),
+                false,
+                None,
+                true,
+            );
+        }
+        let finally = flatten_mission_step_specs(&mission)
+            .into_iter()
+            .any(|spec| spec.path == step.step && spec.finally);
+        let phase_runs_step = if finally {
+            matches!(current.phase.as_str(), "final" | "final-cancelled")
+        } else {
+            current.phase == "normal"
+        };
+        if !matches!(current.status.as_str(), "running" | "standing" | "blocked")
+            || !phase_runs_step
+        {
+            return Err(St3Error::new(
+                "mission-run-not-retryable",
+                format!(
+                    "mission run `{}` is {} in its {} phase; retry the step after the run fails",
+                    current.subject, current.status, current.phase
+                ),
+            ));
+        }
+        if !self
+            .retry_step_as(&subject, Some(actor), reason, 0)
+            .map_err(internal)?
+        {
+            return Err(St3Error::new(
+                "work-not-retryable",
+                format!("step run `{subject}` changed before the retry"),
+            ));
+        }
+        let view = self
+            .mission_run(&current.id)
+            .map_err(internal)?
+            .expect("the retried mission run exists");
+        self.cache_idempotency_response(idempotency_key, &view)
+            .map_err(internal)?;
+        Ok(view)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2408,6 +2547,7 @@ impl Store {
         expected_generation: Option<&str>,
         protected_approved: bool,
         proposal: Option<&RevisionProposalView>,
+        retry: bool,
     ) -> Result<MissionRunView, St3Error> {
         if let Some(response) = self
             .cached_idempotency_response(idempotency_key)
@@ -2431,9 +2571,13 @@ impl Store {
                 "the revision proposal does not target the current generation",
             ));
         }
+        let reopening = is_failed_terminal(&current.status, &current.phase);
         let phase_allows_cutover = current.phase == "normal"
             || (proposal.is_some() && current.phase == "revision-draining");
-        if !matches!(current.status.as_str(), "running" | "standing" | "blocked")
+        if reopening {
+            failed_run_reopen_blocker(&current).map_err(|reason| not_reopenable(run, &reason))?;
+        } else if retry
+            || !matches!(current.status.as_str(), "running" | "standing" | "blocked")
             || !phase_allows_cutover
         {
             return Err(St3Error::new(
@@ -2480,13 +2624,20 @@ impl Store {
         }
 
         let variables = mission_run_variables(&current, &mission.revision);
-        let (compatible, reviewers) = if protected_approved {
+        // A retry keeps the current revision, so it has no change to analyze or review.
+        let (compatible, reviewers) = if protected_approved || retry {
             (compatible_step_paths(&old, mission), BTreeSet::new())
         } else {
             analyze_mission_revision(&old, mission, &actor, &current.requester, &variables)?
         };
-        let compatible = carried_revision_step_paths(&old, mission, &current.steps, compatible);
-        if !protected_approved && matches!(old.revision_cutover, RevisionCutover::WhenIdle) {
+        let mut compatible = carried_revision_step_paths(&old, mission, &current.steps, compatible);
+        if reopening {
+            retain_reopened_step_paths(mission, &current.steps, &mut compatible);
+        }
+        if !protected_approved
+            && !reopening
+            && matches!(old.revision_cutover, RevisionCutover::WhenIdle)
+        {
             return Err(St3Error::new(
                 "revision-needs-drained-cutover",
                 "the current mission revision requires a drained cutover",
@@ -2518,6 +2669,9 @@ impl Store {
             return serde_json::from_str(&response).map_err(internal);
         }
         let transaction = connection.transaction().map_err(internal)?;
+        if reopening {
+            enforce_mission_run_capacity(&transaction, mission)?;
+        }
         let now = now_ms();
         let predecessor_id = generation_id_from_subject(&current.generation).to_owned();
         let generation_id = hex::encode(Sha256::digest(
@@ -2554,7 +2708,11 @@ impl Store {
                 .contains(&step.path)
                 .then(|| current.steps.iter().find(|old| old.step == step.path))
                 .flatten();
-            let attempt = carried.map(|old| old.attempt).unwrap_or(1);
+            // Reopening a failed run starts each carried failed step at its next attempt.
+            let retried = carried.filter(|old| reopening && old.status == "failed");
+            let attempt = carried
+                .map(|old| old.attempt + u32::from(retried.is_some()))
+                .unwrap_or(1);
             step_variables.insert("ST_ATTEMPT".into(), attempt.to_string());
             let title = step
                 .title
@@ -2563,11 +2721,12 @@ impl Store {
                 .transpose()?;
             let goals = interpolate_goals(&step.goals, &step_variables)?;
             let constraints = interpolate_goals(&constraints, &step_variables)?;
-            let (status, worker_reported) = carried
+            let carried_state = carried.filter(|_| retried.is_none());
+            let (status, worker_reported) = carried_state
                 .map(carried_step_projection)
                 .unwrap_or(("pending", false));
-            let blocked_reason = carried.and_then(|old| old.blocked_reason.as_deref());
-            let not_before = carried
+            let blocked_reason = carried_state.and_then(|old| old.blocked_reason.as_deref());
+            let not_before = carried_state
                 .and_then(|old| old.not_before_unix_ms)
                 .map(|value| value.to_string());
             transaction
@@ -3826,6 +3985,16 @@ impl Store {
     }
 
     pub fn retry_step(&self, subject: &str, reason: &str, backoff_ms: u64) -> Result<bool> {
+        self.retry_step_as(subject, None, reason, backoff_ms)
+    }
+
+    fn retry_step_as(
+        &self,
+        subject: &str,
+        actor: Option<&str>,
+        reason: &str,
+        backoff_ms: u64,
+    ) -> Result<bool> {
         let subject = normalize_step_run(subject);
         let mut connection = self.connection.lock().expect("store mutex poisoned");
         let transaction = connection.transaction()?;
@@ -3890,7 +4059,7 @@ impl Store {
             &self.origin,
             &subject,
             "step-run.retried",
-            None,
+            actor,
             &body,
             &[],
             None,
@@ -16963,6 +17132,89 @@ fn flattened_step_definition_hashes(mission: &MissionSpec) -> BTreeMap<String, S
         .collect()
 }
 
+fn is_failed_terminal(status: &str, phase: &str) -> bool {
+    status == "failed" && phase == "terminal"
+}
+
+/// Step cancellations that only follow from another step's failure.
+const FAILURE_CANCELLATION_REASONS: &[&str] = &[
+    "another step failed",
+    "a normal step failed",
+    "one or more mission steps failed",
+    "the mission run entered cleanup",
+    "the owning mission run is terminal",
+];
+
+/// Return the failed steps of a failed root run when they are the only reason it failed, or
+/// explain why the run cannot reopen.
+fn failed_run_reopen_blocker(run: &MissionRunView) -> Result<Vec<&str>, String> {
+    if run.parent_step_run.is_some() {
+        return Err("a child run reopens only through its parent step".into());
+    }
+    if run.mode == "eval" {
+        return Err("an eval run keeps its verdict".into());
+    }
+    if run
+        .deadline_at_unix_ms
+        .is_some_and(|deadline| deadline <= now_ms())
+    {
+        return Err("its mission timeout has expired".into());
+    }
+    if let Some(step) = run.steps.iter().find(|step| {
+        step.status == "cancelled"
+            && !step
+                .blocked_reason
+                .as_deref()
+                .is_some_and(|reason| FAILURE_CANCELLATION_REASONS.contains(&reason))
+    }) {
+        return Err(format!(
+            "step `{}` was cancelled: {}",
+            step.step,
+            step.blocked_reason
+                .as_deref()
+                .unwrap_or("no reason recorded")
+        ));
+    }
+    let failed = run
+        .steps
+        .iter()
+        .filter(|step| step.status == "failed")
+        .map(|step| step.step.as_str())
+        .collect::<Vec<_>>();
+    if failed.is_empty() {
+        return Err("no step failed, so the run failed for another reason".into());
+    }
+    Ok(failed)
+}
+
+fn not_reopenable(run: &str, reason: &str) -> St3Error {
+    St3Error::new(
+        "mission-run-not-reopenable",
+        format!("mission run `{run}` cannot reopen: {reason}"),
+    )
+}
+
+/// A reopened run keeps its completed normal work and retries its failed steps. Work that the
+/// failure cancelled and every final step start again.
+fn retain_reopened_step_paths(
+    mission: &MissionSpec,
+    current: &[StepRunView],
+    compatible: &mut BTreeSet<String>,
+) {
+    let finals = flatten_mission_step_specs(mission)
+        .into_iter()
+        .filter(|step| step.finally)
+        .map(|step| step.path.as_str())
+        .collect::<BTreeSet<_>>();
+    compatible.retain(|path| {
+        current.iter().any(|step| {
+            &step.step == path
+                && (step.status == "failed"
+                    || (step.status == "completed" && !finals.contains(path.as_str())))
+        })
+    });
+}
+
 fn carried_step_projection(step: &StepRunView) -> (&str, bool) {
     match step.status.as_str() {
         "claimed" | "working" => ("ready", false),
@@ -24724,6 +24976,354 @@ mission "retry" state="ready" {
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
         assert_eq!(attempts, [1, 2]);
+    }
+
+    const TAKEOVER_SOURCE: &str = r#"version 2
+
+mission "takeover" state="ready" {
+  goal "Take over one service."
+  step "prepare" { }
+  step "deploy-check" { depends-on { step "prepare" completed } }
+  step "smoke-check" { depends-on { step "prepare" completed } }
+  step "announce" { depends-on { step "deploy-check" completed } }
+  finally { step "report" { agentless } }
+}
+"#;
+
+    fn publish_takeover(store: &Store, source: &str, key: &str) -> MissionSpec {
+        let intent = parse_intent(source, "node").unwrap();
+        let planned = store
+            .mission(
+                &intent,
+                IntentInput {
+                    kdl: source.into(),
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        store.apply(&intent, &planned.subject_tokens, key).unwrap();
+        intent.missions["takeover"].clone()
+    }
+
+    fn takeover_step<'a>(run: &'a MissionRunView, path: &str) -> &'a StepRunView {
+        run.steps.iter().find(|step| step.step == path).unwrap()
+    }
+
+    /// Fail the takeover run the way the reconciler does: the failed steps cancel the rest of the
+    /// normal work, the final step runs, and cleanup makes the run terminal.
+    fn failed_takeover_run(store: &Store, failed: &[&str]) -> MissionRunView {
+        publish_takeover(store, TAKEOVER_SOURCE, "takeover-mission");
+        let run = store
+            .create_mission_run(&MissionRunRequest {
+                mission: "takeover".into(),
+                revision: None,
+                workspace: "/tmp".into(),
+                requester: Some("person/requester".into()),
+                mode: Some("run".into()),
+                inputs: BTreeMap::new(),
+                idempotency_key: "takeover-run".into(),
+            })
+            .unwrap();
+        store
+            .set_step_state(&takeover_step(&run, "prepare").subject, "completed", None)
+            .unwrap();
+        for path in failed {
+            store
+                .set_step_state(
+                    &takeover_step(&run, path).subject,
+                    "failed",
+                    Some("the check failed"),
+                )
+                .unwrap();
+        }
+        for path in ["deploy-check", "smoke-check", "announce"] {
+            if !failed.contains(&path) {
+                store
+                    .set_step_state(
+                        &takeover_step(&run, path).subject,
+                        "cancelled",
+                        Some("another step failed"),
+                    )
+                    .unwrap();
+            }
+        }
+        store
+            .set_mission_run_state(&run.id, "running", "final", Some("a normal step failed"))
+            .unwrap();
+        store
+            .set_step_state(&takeover_step(&run, "report").subject, "completed", None)
+            .unwrap();
+        store
+            .set_mission_run_state(
+                &run.id,
+                "running",
+                "cleanup-failed",
+                Some("one or more mission steps failed"),
+            )
+            .unwrap();
+        store
+            .set_mission_run_state(&run.id, "failed", "terminal", None)
+            .unwrap();
+        let run = store.mission_run(&run.id).unwrap().unwrap();
+        assert_eq!(
+            (run.status.as_str(), run.phase.as_str()),
+            ("failed", "terminal")
+        );
+        run
+    }
+
+    #[test]
+    fn retrying_the_only_failed_step_reopens_its_failed_run() {
+        let store = Store::open_memory("node").unwrap();
+        let failed = failed_takeover_run(&store, &["deploy-check"]);
+        let old_check = takeover_step(&failed, "deploy-check").subject.clone();
+
+        let reopened = store
+            .retry_failed_step(
+                &old_check,
+                "person/operator",
+                "the deploy check host is back",
+                "retry-deploy-check",
+            )
+            .unwrap();
+
+        assert_eq!(
+            (reopened.status.as_str(), reopened.phase.as_str()),
+            ("running", "normal")
+        );
+        assert_ne!(reopened.generation, failed.generation);
+        assert_eq!(reopened.revision, failed.revision);
+        let state = |path| {
+            let step = takeover_step(&reopened, path);
+            (step.status.as_str(), step.attempt)
+        };
+        assert_eq!(state("prepare"), ("completed", 1));
+        assert_eq!(state("deploy-check"), ("pending", 2));
+        assert_eq!(state("smoke-check"), ("pending", 1));
+        assert_eq!(state("announce"), ("pending", 1));
+        assert_eq!(state("report"), ("pending", 1));
+        let generations = store.run_generations(&failed.id).unwrap();
+        assert_eq!(
+            generations
+                .iter()
+                .find(|generation| generation.subject == failed.generation)
+                .unwrap()
+                .status,
+            "superseded"
+        );
+
+        let repeated = store
+            .retry_failed_step(
+                &old_check,
+                "person/operator",
+                "the deploy check host is back",
+                "retry-deploy-check",
+            )
+            .unwrap();
+        assert_eq!(repeated.generation, reopened.generation);
+        let stale = store
+            .retry_failed_step(&old_check, "person/operator", "again", "retry-stale")
+            .unwrap_err();
+        assert_eq!(stale.code, "stale-run-generation");
+    }
+
+    #[test]
+    fn a_failed_run_does_not_reopen_for_one_of_several_failures() {
+        let store = Store::open_memory("node").unwrap();
+        let failed = failed_takeover_run(&store, &["deploy-check", "smoke-check"]);
+
+        let error = store
+            .retry_failed_step(
+                &takeover_step(&failed, "deploy-check").subject,
+                "person/operator",
+                "retry one check",
+                "retry-one-of-two",
+            )
+            .unwrap_err();
+
+        assert_eq!(error.code, "mission-run-not-reopenable");
+        assert!(
+            error.message.contains("step `smoke-check` also failed"),
+            "{}",
+            error.message
+        );
+        let run = store.mission_run(&failed.id).unwrap().unwrap();
+        assert_eq!(
+            (run.status.as_str(), run.generation.as_str()),
+            ("failed", failed.generation.as_str())
+        );
+    }
+
+    #[test]
+    fn a_failed_run_with_work_cancelled_for_another_reason_does_not_reopen() {
+        let store = Store::open_memory("node").unwrap();
+        publish_takeover(&store, TAKEOVER_SOURCE, "takeover-mission");
+        let run = store
+            .create_mission_run(&MissionRunRequest {
+                mission: "takeover".into(),
+                revision: None,
+                workspace: "/tmp".into(),
+                requester: Some("person/requester".into()),
+                mode: Some("run".into()),
+                inputs: BTreeMap::new(),
+                idempotency_key: "takeover-run".into(),
+            })
+            .unwrap();
+        let check = takeover_step(&run, "deploy-check").subject.clone();
+        store
+            .set_step_state(&check, "failed", Some("the check failed"))
+            .unwrap();
+        store
+            .set_mission_run_state(
+                &run.id,
+                "running",
+                "cleanup-failed",
+                Some("the mission timeout expired after 50ms"),
+            )
+            .unwrap();
+        store
+            .set_mission_run_state(&run.id, "failed", "terminal", None)
+            .unwrap();
+
+        let error = store
+            .retry_failed_step(&check, "person/operator", "retry", "retry-timeout")
+            .unwrap_err();
+
+        assert_eq!(error.code, "mission-run-not-reopenable");
+        assert!(
+            error
+                .message
+                .contains("was cancelled: the mission timeout expired"),
+            "{}",
+            error.message
+        );
+    }
+
+    #[test]
+    fn an_active_run_retries_a_failed_step_in_place() {
+        let store = Store::open_memory("node").unwrap();
+        publish_takeover(&store, TAKEOVER_SOURCE, "takeover-mission");
+        let run = store
+            .create_mission_run(&MissionRunRequest {
+                mission: "takeover".into(),
+                revision: None,
+                workspace: "/tmp".into(),
+                requester: Some("person/requester".into()),
+                mode: Some("run".into()),
+                inputs: BTreeMap::new(),
+                idempotency_key: "takeover-run".into(),
+            })
+            .unwrap();
+        let check = takeover_step(&run, "deploy-check").subject.clone();
+        store
+            .set_step_state(&check, "failed", Some("the check failed"))
+            .unwrap();
+
+        let retried = store
+            .retry_failed_step(
+                &check,
+                "person/operator",
+                "retry the check",
+                "retry-in-place",
+            )
+            .unwrap();
+
+        assert_eq!(retried.generation, run.generation);
+        let step = takeover_step(&retried, "deploy-check");
+        assert_eq!((step.status.as_str(), step.attempt), ("pending", 2));
+        let claim = store
+            .latest_claim(&check, Some("step-run.retried"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(claim.actor.as_deref(), Some("person/operator"));
+        let error = store
+            .retry_failed_step(&check, "person/operator", "again", "retry-pending")
+            .unwrap_err();
+        assert_eq!(error.code, "work-not-failed");
+    }
+
+    #[test]
+    fn revising_a_failed_run_reopens_it_and_retries_each_failed_step() {
+        let store = Store::open_memory("node").unwrap();
+        let failed = failed_takeover_run(&store, &["deploy-check", "smoke-check"]);
+        let revised = publish_takeover(
+            &store,
+            &TAKEOVER_SOURCE.replace(
+                r#"step "smoke-check" { depends-on"#,
+                r#"step "smoke-check" { goal "Probe the new health endpoint."; depends-on"#,
+            ),
+            "takeover-revision",
+        );
+
+        let reopened = store
+            .adopt_mission_revision(
+                &failed.id,
+                &revised,
+                "person/requester",
+                "the smoke check probes the new endpoint",
+                "revise-failed-takeover",
+            )
+            .unwrap();
+
+        assert_eq!(
+            (reopened.status.as_str(), reopened.phase.as_str()),
+            ("running", "normal")
+        );
+        assert_eq!(reopened.revision, revised.revision);
+        let state = |path| {
+            let step = takeover_step(&reopened, path);
+            (step.status.as_str(), step.attempt)
+        };
+        assert_eq!(state("prepare"), ("completed", 1));
+        assert_eq!(state("deploy-check"), ("pending", 2));
+        assert_eq!(state("smoke-check"), ("pending", 1));
+        assert_eq!(state("announce"), ("pending", 1));
+        assert_eq!(state("report"), ("pending", 1));
+    }
+
+    #[test]
+    fn replication_carries_a_reopened_failed_run() {
+        let source = Store::open_memory("source").unwrap();
+        let failed = failed_takeover_run(&source, &["deploy-check"]);
+        let target = Store::open_memory("target").unwrap();
+        target
+            .import_replication("source", &source.export_replication(0).unwrap())
+            .unwrap();
+        assert_eq!(
+            target.mission_run(&failed.id).unwrap().unwrap().status,
+            "failed"
+        );
+
+        let reopened = source
+            .retry_failed_step(
+                &takeover_step(&failed, "deploy-check").subject,
+                "person/operator",
+                "the deploy check host is back",
+                "retry-replicated",
+            )
+            .unwrap();
+        target
+            .import_replication(
+                "source",
+                &source
+                    .export_replication_for_heads(&target.replica_heads().unwrap())
+                    .unwrap(),
+            )
+            .unwrap();
+
+        let replicated = target.mission_run(&failed.id).unwrap().unwrap();
+        assert_eq!(
+            (replicated.status.as_str(), replicated.phase.as_str()),
+            ("running", "normal")
+        );
+        assert_eq!(replicated.generation, reopened.generation);
+        let states = |run: &MissionRunView| {
+            run.steps
+                .iter()
+                .map(|step| (step.step.clone(), step.status.clone(), step.attempt))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(states(&replicated), states(&reopened));
     }
 
     #[test]

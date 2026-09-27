@@ -1995,6 +1995,13 @@ pub struct WorkWakeRequest {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct WorkRetryRequest {
+    pub actor: String,
+    pub reason: String,
+    pub idempotency_key: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct MissionRevisionRequest {
     pub intent: IntentInput,
     pub actor: String,
