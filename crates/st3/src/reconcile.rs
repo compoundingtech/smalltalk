@@ -569,6 +569,33 @@ impl<R: RuntimeControl> Reconciler<R> {
         Ok(orders)
     }
 
+    /// A request that declared `until` closes on its own once every target meets that `trace
+    /// wait` condition. The host that accepted the request evaluates it, so it closes once.
+    fn resolve_attention_whose_until_holds(&self) -> Result<()> {
+        for request in self.store.pending_attention_with_until(&self.host)? {
+            let Some(until) = request.until.as_deref() else {
+                continue;
+            };
+            let mut holds = !request.targets.is_empty();
+            for target in &request.targets {
+                let status = self.store.status_at(Some(target), None, None)?;
+                if !crate::model::status_wait_condition_holds(until, status.subjects.first()) {
+                    holds = false;
+                    break;
+                }
+            }
+            if holds {
+                self.store.resolve_attention_automatically(
+                    &request.subject,
+                    &format!("every target is {until}"),
+                    &format!("{}:until", request.request),
+                )?;
+                self.signal_changed();
+            }
+        }
+        Ok(())
+    }
+
     fn next_provider_capacity_retry_deadline(&self) -> Result<Option<u128>> {
         let mut deadline = None;
         for subject in self
@@ -871,6 +898,7 @@ impl<R: RuntimeControl> Reconciler<R> {
         let mission_result = self.evaluate_mission_runs();
         self.release_unused_file_watchers();
         mission_result?;
+        self.resolve_attention_whose_until_holds()?;
         // Mission state is the primary control-plane projection. Evaluate it before
         // wake-message bookkeeping so a large mailbox or work history cannot starve
         // newly-created runs of their first readiness pass.
@@ -12204,6 +12232,86 @@ version 2
                 .unwrap()
                 .iter()
                 .any(|member| member.runtime_id == "exec.node.worker.ding")
+        );
+    }
+
+    #[test]
+    fn an_attention_request_closes_when_its_until_condition_holds_and_not_before() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        apply_source(
+            &store,
+            r#"version 2
+mission "publish" state="ready" {
+  goal "Publish a revision."
+  step "approve" { agentless }
+}
+"#,
+            "until-mission",
+        );
+        let run = store
+            .create_mission_run(&MissionRunRequest {
+                mission: "publish".into(),
+                revision: None,
+                workspace: "/tmp".into(),
+                requester: Some("person/nathan".into()),
+                mode: Some("run".into()),
+                inputs: BTreeMap::new(),
+                idempotency_key: "until-run".into(),
+            })
+            .unwrap();
+        let request = |subject: &str, until: Option<&str>| {
+            store
+                .request_attention_until(
+                    subject,
+                    &AttentionRequest {
+                        reviewer: "person/nathan".into(),
+                        title: "Publish this revision".into(),
+                        reason: "Publish the prepared revision as a person.".into(),
+                        severity: "warning".into(),
+                        targets: vec![run.subject.clone()],
+                        actor: "agent/node.requester".into(),
+                        idempotency_key: format!("{subject}:requested"),
+                    },
+                    until,
+                )
+                .unwrap()
+        };
+        let until = request("attention/until-completed", Some("completed"));
+        let plain = request("attention/plain", None);
+        let reconciler = Reconciler::new(
+            store.clone(),
+            Arc::new(FakeRuntime::default()),
+            "node".into(),
+            Arc::new(Notify::new()),
+        );
+        let status = |subject: &str| store.attention_request(subject).unwrap().unwrap().status;
+
+        reconciler.reconcile_once().unwrap();
+        assert_eq!(status(&until.subject), "pending");
+
+        store
+            .set_mission_run_state(&run.id, "completed", "terminal", None)
+            .unwrap();
+        reconciler.reconcile_once().unwrap();
+
+        let resolved = store.attention_request(&until.subject).unwrap().unwrap();
+        assert_eq!(resolved.status, "resolved");
+        assert_eq!(
+            resolved.resolution_reason.as_deref(),
+            Some("every target is completed")
+        );
+        assert_eq!(
+            store
+                .claims_for(&until.subject, Some("attention.resolved"))
+                .unwrap()[0]
+                .actor
+                .as_deref(),
+            Some("daemon/runtime")
+        );
+        assert_eq!(
+            status(&plain.subject),
+            "pending",
+            "a request without until waits for a person"
         );
     }
 

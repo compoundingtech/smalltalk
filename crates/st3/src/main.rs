@@ -1111,6 +1111,10 @@ struct AttentionRequestArgs {
     actor: Option<String>,
     #[arg(long)]
     idempotency_key: Option<String>,
+    /// Resolve the item on its own once every target meets this `st3 trace wait` condition,
+    /// such as `completed` or `stopped`; it needs at least one --target.
+    #[arg(long, value_name = "CONDITION")]
+    until: Option<String>,
 }
 
 #[derive(Args)]
@@ -4093,53 +4097,17 @@ async fn condition_value(client: &Client, subject: &str, condition: &str) -> Res
         return Ok((eval.verdict.as_deref() == Some(expected)).then(|| json!(eval)));
     }
     let status = status_for(client, subject).await?;
-    let item = status.subjects.first();
-    let actual_status = projected_actual_status(item.and_then(|item| item.actual.as_ref()));
-    let matches = match condition {
-        "running" => matches!(actual_status, Some("running" | "ready")),
-        "ready" => actual_status == Some("ready"),
-        "standing" => actual_status == Some("standing"),
-        "completed" => actual_status == Some("completed"),
-        "failed" => actual_status == Some("failed"),
-        "cancelled" => actual_status == Some("cancelled"),
-        "delivered" => actual_status == Some("delivered"),
-        "terminal" => matches!(actual_status, Some("completed" | "failed" | "cancelled")),
-        "exited" => actual_status == Some("exited"),
-        "stopped" => {
-            item.is_none_or(|item| item.actual.is_none())
-                || matches!(actual_status, Some("stopped" | "removed"))
-        }
-        _ => false,
-    };
+    let matches = st3::model::status_wait_condition_holds(condition, status.subjects.first());
     Ok(matches.then(|| json!(status)))
-}
-
-fn projected_actual_status(actual: Option<&Value>) -> Option<&str> {
-    let fields = actual.map(|actual| actual.get("fields").unwrap_or(actual))?;
-    fields
-        .get("status")
-        .or_else(|| fields.pointer("/facts/status"))
-        .and_then(Value::as_str)
 }
 
 fn validate_wait_condition(condition: &str) -> Result<()> {
     anyhow::ensure!(
-        matches!(
-            condition,
-            "running"
-                | "ready"
-                | "standing"
-                | "completed"
-                | "failed"
-                | "cancelled"
-                | "delivered"
-                | "terminal"
-                | "exited"
-                | "stopped"
-        ) || matches!(
-            condition.strip_prefix("verdict="),
-            Some("pass" | "fail" | "void")
-        ),
+        st3::model::STATUS_WAIT_CONDITIONS.contains(&condition)
+            || matches!(
+                condition.strip_prefix("verdict="),
+                Some("pass" | "fail" | "void")
+            ),
         "unknown wait condition `{condition}`"
     );
     Ok(())
@@ -5695,14 +5663,17 @@ async fn run_attention(
             let response: AttentionRequestView = client
                 .post(
                     "/v1/attention",
-                    &AttentionRequest {
-                        reviewer: args.reviewer,
-                        title: args.title,
-                        reason: args.reason,
-                        severity: args.severity,
-                        targets: args.targets,
-                        actor,
-                        idempotency_key,
+                    &st3::model::AttentionRequestPost {
+                        request: AttentionRequest {
+                            reviewer: args.reviewer,
+                            title: args.title,
+                            reason: args.reason,
+                            severity: args.severity,
+                            targets: args.targets,
+                            actor,
+                            idempotency_key,
+                        },
+                        until: args.until,
                     },
                 )
                 .await?;
@@ -10549,24 +10520,36 @@ mod tests {
             "facts": {"status": "ready"},
             "kind": "filesystem.file"
         });
-        assert_eq!(projected_actual_status(Some(&resource)), Some("ready"));
+        assert_eq!(
+            st3::model::projected_actual_status(Some(&resource)),
+            Some("ready")
+        );
 
         let runtime = json!({"fields": {"status": "running"}});
-        assert_eq!(projected_actual_status(Some(&runtime)), Some("running"));
+        assert_eq!(
+            st3::model::projected_actual_status(Some(&runtime)),
+            Some("running")
+        );
     }
 
     #[test]
     fn wait_accepts_message_delivery() {
         validate_wait_condition("delivered").unwrap();
         let message = serde_json::json!({ "status": "delivered" });
-        assert_eq!(projected_actual_status(Some(&message)), Some("delivered"));
+        assert_eq!(
+            st3::model::projected_actual_status(Some(&message)),
+            Some("delivered")
+        );
     }
 
     #[test]
     fn wait_accepts_a_standing_mission_run() {
         validate_wait_condition("standing").unwrap();
         let run = serde_json::json!({ "status": "standing" });
-        assert_eq!(projected_actual_status(Some(&run)), Some("standing"));
+        assert_eq!(
+            st3::model::projected_actual_status(Some(&run)),
+            Some("standing")
+        );
     }
 
     #[test]
@@ -11302,6 +11285,33 @@ mission "review" state="ready" {
         };
         assert_eq!(args.severity, "error");
         assert_eq!(args.targets, ["mission-run/fabric"]);
+        assert_eq!(args.until, None);
+
+        let until = Cli::try_parse_from([
+            "st3",
+            "attention",
+            "request",
+            "--for",
+            "person/nathan",
+            "--title",
+            "Publish this revision",
+            "--reason",
+            "Publish the prepared revision as a person.",
+            "--target",
+            "mission-run/release/one",
+            "--until",
+            "completed",
+            "--as",
+            "agent/release/worker",
+        ])
+        .unwrap();
+        let Command::Attention {
+            command: AttentionCommand::Request(args),
+        } = until.command
+        else {
+            panic!("the attention request with until did not parse");
+        };
+        assert_eq!(args.until.as_deref(), Some("completed"));
 
         let resolve = Cli::try_parse_from([
             "st3",
