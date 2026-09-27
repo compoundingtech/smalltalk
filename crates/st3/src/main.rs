@@ -10520,7 +10520,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             render_terminal_screen(&response.value),
-            "$ cargo build\nFinished\n$ \n"
+            "$ cargo build\nFinished\n$\n"
         );
     }
 
