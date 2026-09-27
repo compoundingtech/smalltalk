@@ -312,9 +312,8 @@ assert.deepStrictEqual(
   "each message is acknowledged once omp has it",
 );
 
-// Mail held to the end of a run is steered at `agent_end`, where omp is not yet idle, and omp's
-// queued-message drain continues the session with it. It never waits for the idle proof: a new
-// prompt sent in omp's settle window left a measured seat working forever.
+// Mail held to the end of a run is handed over at `agent_end`, exactly as a message arriving then
+// would be. This context is not yet idle there, so it is a steer.
 sendMail("during the final answer");
 await pause(200);
 assert.strictEqual(handedOver.length, 1, "held while the model writes its final answer");

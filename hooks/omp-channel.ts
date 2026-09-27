@@ -660,10 +660,8 @@ export default function (pi: ExtensionAPI) {
     if (end.willContinue !== true) {
       state.running = false;
       toolCallsInFlight().clear();
-      // `ctx.isIdle()` is still false here, so held mail is steered, and omp's own queued-message
-      // drain continues the session with it once the run settles. Waiting for the idle proof
-      // and sending a new prompt instead left one measured seat working forever
-      // (cross-omp-hold-astra-20260927-a).
+      // Nothing runs now, so held mail is handed over at once, exactly as a message arriving at
+      // this moment would be. Waiting longer for the idle proof would only delay it.
       if (heldMessages().length > 0) void release();
     }
     // A retried error does not end a turn: omp fires `agent_end` with `willContinue: true` for
