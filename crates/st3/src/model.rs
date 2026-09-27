@@ -2146,6 +2146,20 @@ pub struct ReplicationInventory {
     pub digest: String,
     #[serde(default)]
     pub envelopes: Vec<ReplicaEnvelopeId>,
+    /// A compact inventory: one digest per writer sequence range. When present, `envelopes`
+    /// lists only the identities in ranges that differ from the peer's ranges. Older peers
+    /// ignore this field and exchange the full inventory.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub buckets: Vec<ReplicationInventoryBucket>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ReplicationInventoryBucket {
+    pub writer: String,
+    /// First sequence in this range; ranges are aligned to the bucket width.
+    pub start: u64,
+    pub count: u64,
+    pub digest: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
