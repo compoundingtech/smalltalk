@@ -2049,6 +2049,7 @@ fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
             ("code", string()),
             ("reason", string()),
             ("incarnation_id", string()),
+            ("matched_line", string()),
             ("step_run", reference_to(&["step-run"])),
             ("wake_attempts", integer()),
             ("attempt", integer()),
