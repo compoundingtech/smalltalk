@@ -96,6 +96,8 @@ CREATE INDEX IF NOT EXISTS claims_timeline_incarnation_index
 ON claims(subject, kind, json_extract(body, '$.fields.incarnation_id'), store_index)
 WHERE kind='harness.timeline';
 CREATE INDEX IF NOT EXISTS claims_batch_index ON claims(batch_id, store_index);
+CREATE INDEX IF NOT EXISTS claims_accepted_order_index
+ON claims(length(accepted_at_unix_ms), accepted_at_unix_ms, store_index);
 CREATE INDEX IF NOT EXISTS claims_operation_index
 ON claims(json_extract(body, '$._operation.id'))
 WHERE json_extract(body, '$._operation.id') IS NOT NULL;
@@ -8650,9 +8652,8 @@ impl Store {
         }
     }
 
-    /// Common heartbeat, conversation, and lease-renewal envelopes do not require replaying
-    /// every historical mission and claim. Keep the full replay for all other kinds, stale
-    /// projections, operation metadata, and ambiguous renewal ordering.
+    /// These event-only kinds do not change the structural graph. The incremental
+    /// projector also handles selected structural and run claims from a healthy frontier.
     fn simple_replication_kind(kind: &str) -> bool {
         matches!(
             kind,
@@ -14940,8 +14941,8 @@ fn validate_replicated_claim(
     Ok(ReplicatedClaimAdmission::Valid)
 }
 
-/// The graph projection normally replays all accepted claims. For event-only envelopes and
-/// strictly newer lease renewals, advance from the recorded healthy frontier instead.
+/// Advance from a healthy frontier when the new claims have unambiguous operation IDs and
+/// structural claims are strictly newer than the previously projected accepted-time order.
 fn try_project_simple_replication_tx(transaction: &Transaction<'_>) -> Result<bool, St3Error> {
     let health: Option<(String, u64)> = transaction
         .query_row(
@@ -14976,13 +14977,110 @@ fn try_project_simple_replication_tx(transaction: &Transaction<'_>) -> Result<bo
         .filter(|claim| claim.kind.starts_with("work."))
         .collect::<Vec<_>>();
     work_claims.sort_by_key(|claim| claim.accepted_at_unix_ms);
+    let mut last_accepted: Option<u128> = None;
+    if claims
+        .iter()
+        .any(|claim| !Store::simple_replication_kind(&claim.kind))
+    {
+        last_accepted = transaction
+            .query_row(
+                "SELECT accepted_at_unix_ms FROM claims WHERE store_index<=?1
+                 ORDER BY length(accepted_at_unix_ms) DESC, accepted_at_unix_ms DESC LIMIT 1",
+                [frontier],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(internal)?
+            .and_then(|value| value.parse::<u128>().ok());
+    }
     for claim in &claims {
         let has_operation = claim.body.get("_operation").is_some();
         if !Store::simple_replication_kind(&claim.kind)
+            && !matches!(
+                claim.kind.as_str(),
+                "intent.desired"
+                    | "doc.bound"
+                    | "mission.published"
+                    | "mission-run.created"
+                    | "mission-run.state"
+                    | "run-generation.created"
+                    | "run-generation.state"
+                    | "run-generation.superseded"
+                    | "revision-proposal.created"
+                    | "revision-proposal.approved"
+                    | "revision-proposal.cancelled"
+                    | "revision-proposal.applied"
+                    | "step-run.carried"
+                    | "step-run.state"
+                    | "step-run.retried"
+            )
             || (has_operation
                 && (claim.kind.starts_with("work.") || operation_parts(&claim.body).is_none()))
         {
             return Ok(false);
+        }
+        if !Store::simple_replication_kind(&claim.kind) {
+            if last_accepted.is_some_and(|previous| claim.accepted_at_unix_ms <= previous) {
+                return Ok(false);
+            }
+            last_accepted = Some(claim.accepted_at_unix_ms);
+            let repaired: bool = transaction
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM replica_records WHERE claim_id=?1 AND state='repaired')",
+                    [&claim.id],
+                    |row| row.get(0),
+                )
+                .map_err(internal)?;
+            if repaired {
+                return Ok(false);
+            }
+            if claim.kind == "mission-run.created" {
+                let generation = claim
+                    .body
+                    .get("fields")
+                    .unwrap_or(&claim.body)
+                    .get("current_generation")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                let prior_dependents: bool = transaction
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM claims WHERE store_index<=?1
+                         AND (subject=?2 OR subject=?3 OR subject LIKE ?4))",
+                        params![
+                            frontier,
+                            claim.subject,
+                            generation,
+                            format!("step-run/{}/%", generation_id_from_subject(generation))
+                        ],
+                        |row| row.get(0),
+                    )
+                    .map_err(internal)?;
+                if prior_dependents {
+                    return Ok(false);
+                }
+            }
+            if claim.kind == "mission.published" {
+                let revision = claim
+                    .body
+                    .get("revision")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                let waiting_run: bool = transaction
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM claims AS pending
+                         WHERE pending.kind='mission-run.created'
+                           AND json_extract(pending.body, '$.fields.mission')=?1
+                           AND json_extract(pending.body, '$.fields.revision')=?2
+                           AND NOT EXISTS(SELECT 1 FROM mission_runs AS projected
+                                          WHERE projected.id=substr(pending.subject, 13)))",
+                        params![claim.subject, revision],
+                        |row| row.get(0),
+                    )
+                    .map_err(internal)?;
+                if waiting_run {
+                    return Ok(false);
+                }
+            }
         }
     }
     // Event-only claims do not change the structural graph. Their operation
@@ -15030,8 +15128,50 @@ fn try_project_simple_replication_tx(transaction: &Transaction<'_>) -> Result<bo
         )
         .map_err(internal)?;
     }
-    for claim in work_claims {
+    for claim in &claims {
+        match claim.kind.as_str() {
+            "intent.desired" => {
+                let desired = serde_json::from_value::<DesiredSubject>(claim.body.clone())
+                    .map_err(internal)?;
+                select_replicated_desired(transaction, claim, &desired)?;
+            }
+            "doc.bound" => select_replicated_document(transaction, claim, claim.store_index)?,
+            "mission.published" => {
+                select_replicated_mission(transaction, claim, claim.store_index)?;
+            }
+            "mission-run.created" => project_mission_run_created(transaction, claim)?,
+            _ => {}
+        }
+    }
+    let mut run_updates = claims
+        .iter()
+        .filter(|claim| {
+            claim.kind.starts_with("work.")
+                || matches!(
+                    claim.kind.as_str(),
+                    "mission-run.state"
+                        | "run-generation.created"
+                        | "run-generation.state"
+                        | "run-generation.superseded"
+                        | "revision-proposal.created"
+                        | "revision-proposal.approved"
+                        | "revision-proposal.cancelled"
+                        | "revision-proposal.applied"
+                        | "step-run.carried"
+                        | "step-run.state"
+                        | "step-run.retried"
+                )
+        })
+        .collect::<Vec<_>>();
+    run_updates.sort_by_key(|claim| claim.accepted_at_unix_ms);
+    for claim in run_updates {
         project_mission_run_update(transaction, claim)?;
+    }
+    for claim in claims
+        .iter()
+        .filter(|claim| claim.kind == "step-run.carried")
+    {
+        reconcile_carried_step_tx(transaction, claim)?;
     }
     Ok(true)
 }
@@ -15054,13 +15194,9 @@ fn project_replicated_base_claims(transaction: &Transaction<'_>) -> Result<(), S
                                 WHERE replica_records.claim_id=claims.id), 0), claims.id",
         )
         .map_err(internal)?;
-    let claims = statement
-        .query_map([], claim_from_row)
-        .map_err(internal)?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(internal)?;
-    drop(statement);
+    let claims = statement.query_map([], claim_from_row).map_err(internal)?;
     for claim in claims {
+        let claim = claim.map_err(internal)?;
         insert_event(
             transaction,
             claim.store_index,
@@ -15246,97 +15382,87 @@ fn select_desired_repair_tx(
 }
 
 fn project_replicated_mission_runs(transaction: &Transaction<'_>) -> Result<(), St3Error> {
-    let mut statement = transaction
-        .prepare(
-            "SELECT claims.id, claims.store_index, claims.batch_id, claims.subject, claims.kind,
-                    claims.origin, claims.actor, claims.body, claims.predecessors,
-                    claims.accepted_at_unix_ms
-             FROM claims JOIN batches ON batches.id=claims.batch_id
-             WHERE kind IN ('mission-run.created','mission-run.state','run-generation.created','run-generation.state','run-generation.superseded',
-                            'revision-proposal.created','revision-proposal.approved','revision-proposal.cancelled','revision-proposal.applied',
-                            'step-run.carried','step-run.state','step-run.retried',
-                            'work.claimed','work.renewed','work.progress','work.submitted','work.failed','work.released')
-             ORDER BY length(claims.accepted_at_unix_ms), claims.accepted_at_unix_ms,
-                      batches.origin, batches.replica_sequence,
-                      COALESCE((SELECT MIN(position) FROM replica_records
-                                WHERE replica_records.claim_id=claims.id), 0), claims.id",
-        )
-        .map_err(internal)?;
-    let claims = statement
-        .query_map([], claim_from_row)
-        .map_err(internal)?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(internal)?;
-    drop(statement);
-
-    for claim in claims
-        .iter()
-        .filter(|claim| claim.kind == "mission-run.created")
-    {
-        project_mission_run_created(transaction, claim)?;
+    for pass in 0..3 {
+        let filter = match pass {
+            0 => "claims.kind='mission-run.created'",
+            1 => "claims.kind IN ('mission-run.state','run-generation.created','run-generation.state','run-generation.superseded',
+                  'revision-proposal.created','revision-proposal.approved','revision-proposal.cancelled','revision-proposal.applied',
+                  'step-run.carried','step-run.state','step-run.retried',
+                  'work.claimed','work.renewed','work.progress','work.submitted','work.failed','work.released')",
+            _ => "claims.kind='step-run.carried'",
+        };
+        let mut statement = transaction
+            .prepare(&format!(
+                "SELECT claims.id, claims.store_index, claims.batch_id, claims.subject, claims.kind,
+                        claims.origin, claims.actor, claims.body, claims.predecessors,
+                        claims.accepted_at_unix_ms
+                 FROM claims JOIN batches ON batches.id=claims.batch_id WHERE {filter}
+                 ORDER BY length(claims.accepted_at_unix_ms), claims.accepted_at_unix_ms,
+                          batches.origin, batches.replica_sequence,
+                          COALESCE((SELECT MIN(position) FROM replica_records
+                                    WHERE replica_records.claim_id=claims.id), 0), claims.id"
+            ))
+            .map_err(internal)?;
+        let claims = statement.query_map([], claim_from_row).map_err(internal)?;
+        for claim in claims {
+            let claim = claim.map_err(internal)?;
+            match pass {
+                0 => project_mission_run_created(transaction, &claim)?,
+                1 => project_mission_run_update(transaction, &claim)?,
+                _ => reconcile_carried_step_tx(transaction, &claim)?,
+            }
+        }
     }
-    for claim in claims
-        .iter()
-        .filter(|claim| claim.kind != "mission-run.created")
-    {
-        project_mission_run_update(transaction, claim)?;
-    }
-    reconcile_carried_steps_tx(transaction, &claims)?;
     Ok(())
 }
 
-fn reconcile_carried_steps_tx(
+fn reconcile_carried_step_tx(
     transaction: &Transaction<'_>,
-    claims: &[ClaimRecord],
+    claim: &ClaimRecord,
 ) -> Result<(), St3Error> {
-    for claim in claims
-        .iter()
-        .filter(|claim| claim.kind == "step-run.carried")
-    {
-        // A replay may be repairing an existing projection. A later step claim
-        // owns its state; otherwise the carried claim is the last direct state
-        // observation for this successor step.
-        let later_step_claim = transaction
-            .query_row(
-                "SELECT 1 FROM claims WHERE subject=?1 AND kind<>'step-run.carried' LIMIT 1",
-                [&claim.subject],
-                |_| Ok(()),
-            )
-            .optional()
-            .map_err(internal)?
-            .is_some();
-        if later_step_claim || step_owner_is_terminal_tx(transaction, &claim.subject)? {
-            continue;
-        }
-        let fields = claim.body.get("fields").unwrap_or(&claim.body);
-        let Some(status) = fields.get("status").and_then(Value::as_str) else {
-            continue;
-        };
-        let Some(attempt) = fields.get("attempt").and_then(Value::as_u64) else {
-            continue;
-        };
-        let worker_reported = fields
-            .get("worker_reported")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        transaction
-            .execute(
-                "UPDATE step_runs SET status=?2, attempt=?3, worker_reported=?4,
+    // A replay may be repairing an existing projection. A later step claim
+    // owns its state; otherwise the carried claim is the last direct state
+    // observation for this successor step.
+    let later_step_claim = transaction
+        .query_row(
+            "SELECT 1 FROM claims WHERE subject=?1 AND kind<>'step-run.carried' LIMIT 1",
+            [&claim.subject],
+            |_| Ok(()),
+        )
+        .optional()
+        .map_err(internal)?
+        .is_some();
+    if later_step_claim || step_owner_is_terminal_tx(transaction, &claim.subject)? {
+        return Ok(());
+    }
+    let fields = claim.body.get("fields").unwrap_or(&claim.body);
+    let Some(status) = fields.get("status").and_then(Value::as_str) else {
+        return Ok(());
+    };
+    let Some(attempt) = fields.get("attempt").and_then(Value::as_u64) else {
+        return Ok(());
+    };
+    let worker_reported = fields
+        .get("worker_reported")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    transaction
+        .execute(
+            "UPDATE step_runs SET status=?2, attempt=?3, worker_reported=?4,
                     blocked_reason=CASE WHEN status=?2 THEN blocked_reason ELSE NULL END,
                     not_before_unix_ms=CASE WHEN status=?2 THEN not_before_unix_ms ELSE NULL END,
                     lease_owner=NULL, lease_incarnation=NULL, lease_expires_at_unix_ms=NULL,
                     updated_at_unix_ms=?5
                  WHERE subject=?1 AND status<>?2",
-                params![
-                    claim.subject,
-                    status,
-                    attempt,
-                    worker_reported,
-                    claim.accepted_at_unix_ms.to_string()
-                ],
-            )
-            .map_err(internal)?;
-    }
+            params![
+                claim.subject,
+                status,
+                attempt,
+                worker_reported,
+                claim.accepted_at_unix_ms.to_string()
+            ],
+        )
+        .map_err(internal)?;
     Ok(())
 }
 
@@ -18774,6 +18900,87 @@ mod tests {
             )
             .unwrap();
         assert_eq!(event_count, 1);
+    }
+
+    #[test]
+    fn structural_replication_advances_from_healthy_frontier() {
+        let store = Store::open_memory("node").unwrap();
+        assert!(store.project_replication_backlog().unwrap());
+        {
+            let mut connection = store.connection.lock().unwrap();
+            let transaction = connection.transaction().unwrap();
+            for id in 0..20 {
+                append_claim_tx(
+                    &transaction,
+                    &store.origin,
+                    "agent/node.test",
+                    "harness.observed",
+                    Some("agent/node.test"),
+                    &json!({"fields": {"state": "ready"}, "_operation": {
+                        "id": format!("op/structural-test/{id}"),
+                        "request_digest": format!("digest-{id}")
+                    }}),
+                    &[],
+                    None,
+                )
+                .unwrap();
+            }
+            transaction.commit().unwrap();
+        }
+        assert!(store.project_replication_backlog().unwrap());
+        store
+            .connection
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE claims SET accepted_at_unix_ms='1' WHERE kind='harness.observed'",
+                [],
+            )
+            .unwrap();
+        {
+            let mut connection = store.connection.lock().unwrap();
+            let transaction = connection.transaction().unwrap();
+            transaction
+                .execute(
+                    "INSERT INTO blobs(hash, bytes, size) VALUES ('sha256:abc', x'01', 1)",
+                    [],
+                )
+                .unwrap();
+            append_claim_tx(
+                &transaction,
+                &store.origin,
+                "doc/test/incremental",
+                "doc.bound",
+                Some("agent/node.test"),
+                &json!({"name": "doc/test/incremental", "hash": "sha256:abc"}),
+                &[],
+                None,
+            )
+            .unwrap();
+            transaction.commit().unwrap();
+        }
+        {
+            let mut connection = store.connection.lock().unwrap();
+            let transaction = connection.transaction().unwrap();
+            assert!(try_project_simple_replication_tx(&transaction).unwrap());
+            transaction.rollback().unwrap();
+        }
+        let before = store.connection.lock().unwrap().total_changes();
+        assert!(store.project_replication_backlog().unwrap());
+        let connection = store.connection.lock().unwrap();
+        let changes = connection.total_changes() - before;
+        assert!(
+            changes < 10,
+            "incremental projection changed {changes} rows"
+        );
+        let hash: String = connection
+            .query_row(
+                "SELECT hash FROM documents WHERE name='doc/test/incremental'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(hash, "sha256:abc");
     }
 
     #[test]
