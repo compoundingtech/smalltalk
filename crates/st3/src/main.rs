@@ -6747,7 +6747,7 @@ async fn run_st2_native_driver(
                         ]),
                         evidence: Vec::new(),
                         expected_subject: None,
-                        idempotency_key: Some(format!("native-exit:{subject}:{runtime_id}")),
+                        idempotency_key: Some(native_exit_key(subject, &runtime_id, &incarnation)),
                     }).await;
                     match result {
                         Ok(_) => break,
@@ -6879,7 +6879,7 @@ async fn run_st2_native_driver(
                             "claude-channel",
                             NativeDeliveryReceipts::ClaudeChannel {
                                 agent_dir: &agent_dir,
-                                incarnation: &incarnation,
+                                incarnation: claude_receipt_incarnation(&incarnation, provider_incarnation.as_deref()),
                             },
                             &incarnation,
                             &mut delivery,
@@ -8383,6 +8383,19 @@ fn claude_channel_consumed_delivery_filenames(
         .collect())
 }
 
+fn native_exit_key(subject: &str, runtime_id: &str, incarnation: &str) -> String {
+    format!("native-exit:{subject}:{runtime_id}:{incarnation}")
+}
+
+fn claude_receipt_incarnation<'a>(
+    _runtime_incarnation: &str,
+    provider_incarnation: Option<&'a str>,
+) -> &'a str {
+    // Claude's hook timeline is fenced by its provider session token, which differs from
+    // the PTY runtime incarnation used for st3 claims.
+    provider_incarnation.unwrap_or_default()
+}
+
 fn native_delivery_receipted(consumed: &BTreeSet<String>, filename: &str) -> bool {
     consumed.contains(filename)
 }
@@ -9821,6 +9834,40 @@ mod tests {
         assert_eq!(
             claude_channel_consumed_delivery_filenames(root.path(), "inc-2").unwrap(),
             BTreeSet::from(["1784649988123-abc23z.md".to_owned()])
+        );
+    }
+
+    #[test]
+    fn native_exit_claims_are_unique_per_incarnation() {
+        assert_eq!(
+            native_exit_key("agent/node.worker", "node.worker", "one"),
+            native_exit_key("agent/node.worker", "node.worker", "one"),
+        );
+        assert_ne!(
+            native_exit_key("agent/node.worker", "node.worker", "one"),
+            native_exit_key("agent/node.worker", "node.worker", "two"),
+        );
+    }
+
+    #[test]
+    fn claude_receipts_use_provider_session_not_runtime_incarnation() {
+        let root = tempfile::tempdir().unwrap();
+        let mut writer =
+            st2::harness_timeline::Writer::new(root.path(), "claude", "provider-current");
+        writer
+            .append(
+                "prompt-1",
+                st2::harness_timeline::Role::User,
+                st2::harness_timeline::EntryType::Content,
+                serde_json::json!({"text": "[st3-delivery:1784649988123-abc23z.md] hello"}),
+                true,
+            )
+            .unwrap();
+        let receipt_incarnation =
+            claude_receipt_incarnation("runtime-current", Some("provider-current"));
+        assert_eq!(
+            claude_channel_consumed_delivery_filenames(root.path(), receipt_incarnation).unwrap(),
+            BTreeSet::from(["1784649988123-abc23z.md".to_owned()]),
         );
     }
 
