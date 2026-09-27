@@ -384,6 +384,9 @@ pub struct StepSpec {
     pub goals: Vec<String>,
     #[serde(default)]
     pub constraints: Vec<String>,
+    /// Constraints from agent blocks declared in this step, keyed by the agent subject template.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub agent_constraints: BTreeMap<String, Vec<String>>,
     pub timeout_ms: Option<u64>,
     pub retry: RetrySpec,
     pub finally: bool,
@@ -442,6 +445,9 @@ pub struct MissionSpec {
     pub goals: Vec<String>,
     #[serde(default)]
     pub constraints: Vec<String>,
+    /// Constraints from agent blocks declared in this mission, keyed by the agent subject template.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub agent_constraints: BTreeMap<String, Vec<String>>,
     #[serde(default)]
     pub baselines: Vec<BaselineSpec>,
     #[serde(default)]

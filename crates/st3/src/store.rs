@@ -4213,13 +4213,20 @@ impl Store {
                     .into_iter()
                     .filter_map(|step| step.work_selector.clone()),
             );
+            let selected = selectors
+                .iter()
+                .flat_map(selector_agents)
+                .collect::<BTreeSet<_>>();
+            for agent in run_agent_constraints(mission).keys() {
+                if !selected.contains(agent) {
+                    warnings.push(format!(
+                        "mission `{}` gives agent `{agent}` constraints, but no step selects that agent",
+                        mission.subject
+                    ));
+                }
+            }
             for selector in &selectors {
-                let agents: &[String] = match selector {
-                    WorkSelector::Assigned { agent } => std::slice::from_ref(agent),
-                    WorkSelector::Available { agents } => agents.as_slice(),
-                    WorkSelector::Agentless => &[],
-                };
-                for agent in agents {
+                for agent in selector_agents(selector) {
                     let owned_runtime =
                         agent
                             .strip_prefix("agent/${ST_MISSION_RUN}/")
@@ -16487,6 +16494,23 @@ fn flatten_steps<'a>(
     inherited_constraints: &[String],
     output: &mut Vec<(&'a crate::model::StepSpec, WorkSelector, Vec<String>)>,
 ) {
+    let agent_constraints = run_agent_constraints(mission);
+    flatten_run_steps(
+        mission,
+        inherited_selector,
+        inherited_constraints,
+        &agent_constraints,
+        output,
+    );
+}
+
+fn flatten_run_steps<'a>(
+    mission: &'a MissionSpec,
+    inherited_selector: Option<WorkSelector>,
+    inherited_constraints: &[String],
+    agent_constraints: &BTreeMap<String, Vec<String>>,
+    output: &mut Vec<(&'a crate::model::StepSpec, WorkSelector, Vec<String>)>,
+) {
     let mut mission_constraints = inherited_constraints.to_vec();
     mission_constraints.extend(mission.constraints.clone());
     let mission_selector = mission
@@ -16502,10 +16526,63 @@ fn flatten_steps<'a>(
             .unwrap_or_else(|| mission_selector.clone());
         let mut constraints = mission_constraints.clone();
         constraints.extend(step.constraints.clone());
-        output.push((step, selector.clone(), constraints.clone()));
-        if let Some(nested) = &step.nested_mission {
-            flatten_steps(nested, Some(selector), &constraints, output);
+        let mut effective = constraints.clone();
+        for agent in selector_agents(&selector) {
+            for constraint in agent_constraints.get(agent).into_iter().flatten() {
+                if !effective.contains(constraint) {
+                    effective.push(constraint.clone());
+                }
+            }
         }
+        output.push((step, selector.clone(), effective));
+        if let Some(nested) = &step.nested_mission {
+            flatten_run_steps(
+                nested,
+                Some(selector),
+                &constraints,
+                agent_constraints,
+                output,
+            );
+        }
+    }
+}
+
+/// Agent blocks anywhere in one run declare run-scoped agents, so their constraints apply to every
+/// step of that run that selects the agent. Loop rounds are separate runs and keep their own.
+fn run_agent_constraints(mission: &MissionSpec) -> BTreeMap<String, Vec<String>> {
+    fn collect(
+        agent_constraints: &BTreeMap<String, Vec<String>>,
+        output: &mut BTreeMap<String, Vec<String>>,
+    ) {
+        for (agent, constraints) in agent_constraints {
+            let entry = output.entry(agent.clone()).or_default();
+            for constraint in constraints {
+                if !entry.contains(constraint) {
+                    entry.push(constraint.clone());
+                }
+            }
+        }
+    }
+    fn append(mission: &MissionSpec, output: &mut BTreeMap<String, Vec<String>>) {
+        collect(&mission.agent_constraints, output);
+        for id in &mission.display_order {
+            let step = &mission.steps[id];
+            collect(&step.agent_constraints, output);
+            if let Some(nested) = &step.nested_mission {
+                append(nested, output);
+            }
+        }
+    }
+    let mut output = BTreeMap::new();
+    append(mission, &mut output);
+    output
+}
+
+fn selector_agents(selector: &WorkSelector) -> &[String] {
+    match selector {
+        WorkSelector::Assigned { agent } => std::slice::from_ref(agent),
+        WorkSelector::Available { agents } => agents,
+        WorkSelector::Agentless => &[],
     }
 }
 
@@ -16857,6 +16934,7 @@ fn mission_header_hash(mission: &MissionSpec) -> Result<String, St3Error> {
         "completion": mission.completion,
         "goals": mission.goals,
         "constraints": mission.constraints,
+        "agent_constraints": mission.agent_constraints,
         "baselines": mission.baselines,
         "products": mission.products,
         "gates": mission.gates,
@@ -20025,6 +20103,106 @@ mission "guarded" state="ready" {
                 "Do not edit files."
             ]
         );
+    }
+
+    #[test]
+    fn agent_block_constraints_bind_only_steps_that_select_the_agent() {
+        let store = Store::open_memory("node").unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let source = r#"version 2
+mission "handoff" state="ready" {
+  goal "Build and merge one change."
+  constraint "Keep the change small."
+  agent "builder" {
+    workspace "."
+    command "true"
+    constraint "Never push the release branch."
+    constraint "Keep the change small."
+  }
+  agent "merger" { workspace "."; command "true" }
+  agent "idle" {
+    workspace "."
+    command "true"
+    constraint "Rest."
+  }
+  step "build" {
+    assigned-to "agent/${ST_MISSION_RUN}/builder"
+    constraint "Add a test."
+    mission "follow-up" {
+      goal "Check the build."
+      step "check" {}
+    }
+  }
+  step "either" {
+    available-to "agent/${ST_MISSION_RUN}/merger"
+    available-to "agent/${ST_MISSION_RUN}/builder"
+  }
+  step "merge" {
+    assigned-to "agent/${ST_MISSION_RUN}/merger"
+    depends-on { step "build" completed }
+  }
+  step "record" { agentless }
+}
+"#;
+        let intent = crate::graph::parse_intent(source, "node").unwrap();
+        let planned = store
+            .mission(
+                &intent,
+                IntentInput {
+                    kdl: source.into(),
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        assert!(planned.warnings.contains(
+            &"mission `mission/handoff` gives agent `agent/${ST_MISSION_RUN}/idle` constraints, but no step selects that agent"
+                .to_owned()
+        ));
+        store
+            .apply(&intent, &planned.subject_tokens, "publish-handoff")
+            .unwrap();
+        let mission = intent.missions["handoff"].clone();
+        let run = store
+            .create_mission_run(&MissionRunRequest {
+                mission: mission.id,
+                revision: Some(mission.revision),
+                workspace: workspace.path().display().to_string(),
+                requester: Some("person/operator".into()),
+                mode: None,
+                inputs: BTreeMap::new(),
+                idempotency_key: "run-handoff".into(),
+            })
+            .unwrap();
+        let constraints = |path: &str| {
+            run.steps
+                .iter()
+                .find(|step| step.step == path)
+                .unwrap()
+                .constraints
+                .clone()
+        };
+        assert_eq!(
+            constraints("build"),
+            [
+                "Keep the change small.",
+                "Add a test.",
+                "Never push the release branch."
+            ]
+        );
+        assert_eq!(
+            constraints("build/follow-up/check"),
+            [
+                "Keep the change small.",
+                "Add a test.",
+                "Never push the release branch."
+            ]
+        );
+        assert_eq!(
+            constraints("either"),
+            ["Keep the change small.", "Never push the release branch."]
+        );
+        assert_eq!(constraints("merge"), ["Keep the change small."]);
+        assert_eq!(constraints("record"), ["Keep the change small."]);
     }
 
     #[test]

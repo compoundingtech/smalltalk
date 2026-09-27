@@ -262,6 +262,7 @@ fn parse_mission(
     let input_names = inputs.keys().cloned().collect::<BTreeSet<_>>();
     let mut goals = Vec::new();
     let mut constraints = Vec::new();
+    let mut agent_constraints = BTreeMap::new();
     let mut baselines = Vec::new();
     let mut products = Vec::new();
     let mut gates = Vec::new();
@@ -434,12 +435,13 @@ fn parse_mission(
             }
             name if crate::graph::is_mission_declaration(name) => {
                 crate::graph::validate_deferred_declaration(child)?;
+                let child = take_agent_constraints(child, default_host, &mut agent_constraints)?;
                 let mut declaration = KdlDocument::new();
                 declaration.nodes_mut().push(child.clone());
                 revision_owners.extend(direct_agent_owners(&declaration, default_host)?);
                 revision_owners.sort();
                 revision_owners.dedup();
-                declarations.push(child.clone());
+                declarations.push(child);
             }
             other => {
                 return Err(St3Error::new(
@@ -491,6 +493,7 @@ fn parse_mission(
         completion,
         goals,
         constraints,
+        agent_constraints,
         baselines,
         products,
         gates,
@@ -729,6 +732,7 @@ fn parse_loop_group(
         title: None,
         goals: Vec::new(),
         constraints: Vec::new(),
+        agent_constraints: BTreeMap::new(),
         timeout_ms: None,
         retry: RetrySpec {
             attempts: rounds as u32,
@@ -1189,6 +1193,7 @@ fn parse_step(
     let mut title = None;
     let mut goals = Vec::new();
     let mut constraints = Vec::new();
+    let mut agent_constraints = BTreeMap::new();
     let mut assigned_to = None;
     let mut available_to = Vec::new();
     let mut agentless = false;
@@ -1269,12 +1274,13 @@ fn parse_step(
                 }
                 name if crate::graph::is_mission_declaration(name) => {
                     crate::graph::validate_deferred_declaration(child)?;
+                    let child = take_agent_constraints(child, default_host, &mut agent_constraints)?;
                     let mut declaration = KdlDocument::new();
                     declaration.nodes_mut().push(child.clone());
                     revision_owners.extend(direct_agent_owners(&declaration, default_host)?);
                     revision_owners.sort();
                     revision_owners.dedup();
-                    declarations.push(child.clone());
+                    declarations.push(child);
                 }
                 "produces" => products = parse_products(child)?,
                 "produces-mission" => produces_mission = Some(parse_produced_mission(child)?),
@@ -1339,6 +1345,7 @@ fn parse_step(
         title,
         goals,
         constraints,
+        agent_constraints,
         timeout_ms,
         retry,
         finally,
@@ -1705,6 +1712,37 @@ fn validate_goal_count(context: &str, goals: &[String], required: bool) -> Resul
         ));
     }
     Ok(())
+}
+
+/// Moves the constraints of an agent block into `agent_constraints`. They are work rules for the
+/// steps that select the agent, so they stay out of the declaration that starts the agent.
+fn take_agent_constraints(
+    node: &KdlNode,
+    default_host: &str,
+    agent_constraints: &mut BTreeMap<String, Vec<String>>,
+) -> Result<KdlNode, St3Error> {
+    let mut node = node.clone();
+    if node.name().value() != "agent" {
+        return Ok(node);
+    }
+    let Some(children) = node.children_mut() else {
+        return Ok(node);
+    };
+    let (constraint_nodes, other_nodes): (Vec<_>, Vec<_>) = children
+        .nodes()
+        .iter()
+        .cloned()
+        .partition(|child| child.name().value() == "constraint");
+    if constraint_nodes.is_empty() {
+        return Ok(node);
+    }
+    *children.nodes_mut() = other_nodes;
+    let agent = agent_owner(&node, default_host)?;
+    let constraints = agent_constraints.entry(agent.clone()).or_default();
+    for child in &constraint_nodes {
+        push_constraint(constraints, child, &format!("agent `{agent}`"))?;
+    }
+    Ok(node)
 }
 
 fn push_constraint(
@@ -3076,6 +3114,102 @@ version 2
         )
         .unwrap_err();
         assert_eq!(duplicate_field.code, "duplicate-product-field");
+    }
+
+    #[test]
+    fn agent_block_constraints_leave_the_runtime_declaration() {
+        let intent = crate::graph::parse_intent(
+            r#"version 2
+ mission "handoff" state="ready" {
+   goal "Build and merge one change."
+   constraint "Keep the change small."
+   agent "builder" {
+     workspace "."
+     command "true"
+     constraint "Never push the release branch."
+   }
+   step "build" {
+     assigned-to "agent/${ST_MISSION_RUN}/builder"
+     agent "checker" {
+       identity "reviewer"
+       workspace "."
+       command "true"
+       constraint "Report findings without editing files."
+     }
+   }
+ }"#,
+            "node",
+        )
+        .unwrap();
+        let mission = &intent.missions["handoff"];
+        assert_eq!(mission.constraints, ["Keep the change small."]);
+        assert_eq!(
+            mission.agent_constraints,
+            BTreeMap::from([(
+                "agent/${ST_MISSION_RUN}/builder".to_owned(),
+                vec!["Never push the release branch.".to_owned()]
+            )])
+        );
+        assert_eq!(
+            mission.steps["build"].agent_constraints,
+            BTreeMap::from([(
+                "agent/${ST_MISSION_RUN}/reviewer".to_owned(),
+                vec!["Report findings without editing files.".to_owned()]
+            )])
+        );
+        assert!(mission.steps["build"].constraints.is_empty());
+        for declarations in [
+            mission.declarations_kdl.as_deref().unwrap(),
+            mission.steps["build"].declarations_kdl.as_deref().unwrap(),
+        ] {
+            assert!(declarations.contains("command"));
+            assert!(!declarations.contains("constraint"));
+        }
+
+        let duplicate = crate::graph::parse_intent(
+            r#"version 2
+ mission "duplicate" state="ready" {
+   goal "Reject duplicate agent text."
+   agent "builder" {
+     workspace "."
+     command "true"
+     constraint "Do not push."
+     constraint "Do not push."
+   }
+ }"#,
+            "node",
+        )
+        .unwrap_err();
+        assert_eq!(duplicate.code, "duplicate-constraint");
+
+        let seat = crate::graph::parse_intent(
+            r#"version 2
+ agent "fleet/example/builder" {
+   workspace "."
+   command "true"
+   constraint "Do not push."
+ }"#,
+            "node",
+        )
+        .unwrap_err();
+        assert_eq!(seat.code, "agent-constraint-outside-mission");
+    }
+
+    #[test]
+    fn missions_without_agent_constraints_keep_their_serialized_shape() {
+        let intent = crate::graph::parse_intent(
+            r#"version 2
+ mission "plain" state="ready" {
+   goal "Keep the revision hash stable."
+   agent "builder" { workspace "."; command "true" }
+   step "build" { assigned-to "agent/${ST_MISSION_RUN}/builder" }
+ }"#,
+            "node",
+        )
+        .unwrap();
+        let value = serde_json::to_value(&intent.missions["plain"]).unwrap();
+        assert!(value.get("agent_constraints").is_none());
+        assert!(value["steps"]["build"].get("agent_constraints").is_none());
     }
 
     #[test]
