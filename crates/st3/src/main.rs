@@ -1838,6 +1838,14 @@ async fn run_up(args: UpArgs) -> Result<()> {
         store.clone(),
         config.observations.clone(),
     ));
+    if let Some(otlp) = &config.observations.otlp {
+        let exporter = st3::otlp::OtlpExporter::new(otlp, &config.node)?;
+        eprintln!(
+            "st3: exporting local observations to OpenTelemetry at {}",
+            otlp.endpoint
+        );
+        tokio::spawn(st3::otlp::run(store.clone(), exporter));
+    }
     #[cfg(target_os = "macos")]
     tokio::spawn(async {
         // Startup and replication can leave large, empty malloc zones resident on macOS.
