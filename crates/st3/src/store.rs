@@ -4213,9 +4213,11 @@ impl Store {
                     .into_iter()
                     .filter_map(|step| step.work_selector.clone()),
             );
-            let selected = selectors
+            let mut flat = Vec::new();
+            flatten_steps(mission, None, &[], &mut flat);
+            let selected = flat
                 .iter()
-                .flat_map(selector_agents)
+                .flat_map(|(_, selector, _)| selector_agents(selector))
                 .collect::<BTreeSet<_>>();
             for agent in run_agent_constraints(mission).keys() {
                 if !selected.contains(agent) {
@@ -20155,6 +20157,18 @@ mission "handoff" state="ready" {
     depends-on { step "build" completed }
   }
   step "record" { agentless }
+  agent "checker" {
+    workspace "."
+    command "true"
+    constraint "Report without editing files."
+  }
+  step "audit" {
+    mission "inspection" {
+      goal "Inspect the build."
+      assigned-to "agent/${ST_MISSION_RUN}/checker"
+      step "look" {}
+    }
+  }
 }
 "#;
         let intent = crate::graph::parse_intent(source, "node").unwrap();
@@ -20171,6 +20185,14 @@ mission "handoff" state="ready" {
             &"mission `mission/handoff` gives agent `agent/${ST_MISSION_RUN}/idle` constraints, but no step selects that agent"
                 .to_owned()
         ));
+        assert!(
+            !planned
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("checker")),
+            "{:?}",
+            planned.warnings
+        );
         store
             .apply(&intent, &planned.subject_tokens, "publish-handoff")
             .unwrap();
@@ -20216,6 +20238,11 @@ mission "handoff" state="ready" {
         );
         assert_eq!(constraints("merge"), ["Keep the change small."]);
         assert_eq!(constraints("record"), ["Keep the change small."]);
+        assert_eq!(constraints("audit"), ["Keep the change small."]);
+        assert_eq!(
+            constraints("audit/inspection/look"),
+            ["Keep the change small.", "Report without editing files."]
+        );
     }
 
     #[test]

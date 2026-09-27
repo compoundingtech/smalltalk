@@ -1274,7 +1274,8 @@ fn parse_step(
                 }
                 name if crate::graph::is_mission_declaration(name) => {
                     crate::graph::validate_deferred_declaration(child)?;
-                    let child = take_agent_constraints(child, default_host, &mut agent_constraints)?;
+                    let child =
+                        take_agent_constraints(child, default_host, &mut agent_constraints)?;
                     let mut declaration = KdlDocument::new();
                     declaration.nodes_mut().push(child.clone());
                     revision_owners.extend(direct_agent_owners(&declaration, default_host)?);
