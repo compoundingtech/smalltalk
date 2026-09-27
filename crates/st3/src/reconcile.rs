@@ -43,6 +43,12 @@ const CLAUDE_TRUST_RECOVERY_ATTEMPTS: usize = 3;
 const CLAUDE_TRUST_RECOVERY_WINDOW_MS: u128 = 10 * 60_000;
 // A failed checkout fetch or worktree command waits this long before Git runs again.
 const CHECKOUT_RETRY_MS: u128 = 30_000;
+const DECLARED_CHECKOUT_LIMIT: usize = 4096;
+
+#[cfg(test)]
+thread_local! {
+    static DECLARATION_PARSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
 /// The screen line on which Claude asks for /login. Claude prints the prompt as its own line,
 /// at most after a status glyph, so a line that only quotes the phrase, such as source code or
@@ -318,6 +324,9 @@ pub struct Reconciler<R = NativeRuntime> {
     delayed_restarts: Arc<Mutex<HashMap<String, u128>>>,
     /// When a failed `checkout` may run Git again, and why it failed, by agent subject.
     checkout_retries: Arc<Mutex<HashMap<String, (u128, String)>>>,
+    /// The last agent declaration's run-end checkout and workspace, by subject, with the store
+    /// index of the subject's newest declaration it was read from.
+    declared_checkouts: Mutex<HashMap<String, (u64, Option<(Checkout, String)>)>>,
     materialized_mission_generations: Mutex<BTreeSet<String>>,
     retired_predecessor_generations: Mutex<BTreeSet<String>>,
     #[cfg(test)]
@@ -392,6 +401,7 @@ impl Reconciler<NativeRuntime> {
             observer_cursors: Arc::new(Mutex::new(HashMap::new())),
             delayed_restarts: Arc::new(Mutex::new(HashMap::new())),
             checkout_retries: Arc::new(Mutex::new(HashMap::new())),
+            declared_checkouts: Mutex::new(HashMap::new()),
             materialized_mission_generations: Mutex::new(BTreeSet::new()),
             retired_predecessor_generations: Mutex::new(BTreeSet::new()),
             #[cfg(test)]
@@ -421,6 +431,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             observer_cursors: Arc::new(Mutex::new(HashMap::new())),
             delayed_restarts: Arc::new(Mutex::new(HashMap::new())),
             checkout_retries: Arc::new(Mutex::new(HashMap::new())),
+            declared_checkouts: Mutex::new(HashMap::new()),
             materialized_mission_generations: Mutex::new(BTreeSet::new()),
             retired_predecessor_generations: Mutex::new(BTreeSet::new()),
             #[cfg(test)]
@@ -1963,29 +1974,7 @@ impl<R: RuntimeControl> Reconciler<R> {
         let Some(run) = subject.owner_run.as_deref() else {
             return Ok(None);
         };
-        let Some(declaration) = self
-            .store
-            .claims_for(&subject.subject, Some("intent.desired"))?
-            .into_iter()
-            .rev()
-            .find(|claim| claim.body.get("kind").and_then(Value::as_str) == Some("agent"))
-        else {
-            return Ok(None);
-        };
-        let Some(checkout) = declaration
-            .body
-            .get("desired")
-            .and_then(Checkout::from_desired)
-            .filter(|checkout| checkout.remove_at_run_end)
-        else {
-            return Ok(None);
-        };
-        let Some(member) = declaration
-            .body
-            .get("member")
-            .and_then(|member| serde_json::from_value::<MemberSpec>(member.clone()).ok())
-            .filter(|member| member.host == self.host)
-        else {
+        let Some((checkout, workspace)) = self.declared_run_end_checkout(&subject.subject)? else {
             return Ok(None);
         };
         // A run stops its owned agents in its cleanup phase, before it becomes terminal.
@@ -2000,7 +1989,55 @@ impl<R: RuntimeControl> Reconciler<R> {
             .is_some_and(|actual| {
                 actual_field(&actual, "status").and_then(Value::as_str) == Some("stopped")
             });
-        Ok((run_ended && stopped).then_some((checkout, member.workspace)))
+        Ok((run_ended && stopped).then_some((checkout, workspace)))
+    }
+
+    /// The run-end checkout and workspace of the subject's last agent declaration for this host.
+    /// Every stop subject asks on every pass. Declarations are append-only claims, so the parsed
+    /// answer holds until another `intent.desired` claim arrives for the subject.
+    fn declared_run_end_checkout(&self, subject: &str) -> Result<Option<(Checkout, String)>> {
+        let newest = self.store.newest_claim_index(subject, "intent.desired")?;
+        if let Some((index, declared)) = self
+            .declared_checkouts
+            .lock()
+            .expect("declared checkout mutex poisoned")
+            .get(subject)
+            && *index == newest
+        {
+            return Ok(declared.clone());
+        }
+        #[cfg(test)]
+        DECLARATION_PARSES.with(|parses| parses.set(parses.get() + 1));
+        let declared = self
+            .store
+            .claims_for(subject, Some("intent.desired"))?
+            .into_iter()
+            .rev()
+            .find(|claim| claim.body.get("kind").and_then(Value::as_str) == Some("agent"))
+            .and_then(|declaration| {
+                let checkout = declaration
+                    .body
+                    .get("desired")
+                    .and_then(Checkout::from_desired)
+                    .filter(|checkout| checkout.remove_at_run_end)?;
+                let member = declaration
+                    .body
+                    .get("member")
+                    .and_then(|member| serde_json::from_value::<MemberSpec>(member.clone()).ok())
+                    .filter(|member| member.host == self.host)?;
+                Some((checkout, member.workspace))
+            });
+        let mut declared_checkouts = self
+            .declared_checkouts
+            .lock()
+            .expect("declared checkout mutex poisoned");
+        if declared_checkouts.len() >= DECLARED_CHECKOUT_LIMIT
+            && !declared_checkouts.contains_key(subject)
+        {
+            declared_checkouts.clear();
+        }
+        declared_checkouts.insert(subject.to_owned(), (newest, declared.clone()));
+        Ok(declared)
     }
 
     /// Remove a finished checkout unless a current member uses its workspace. A worktree with
@@ -13177,6 +13214,69 @@ agent "worker" {
         std::thread::sleep(Duration::from_millis(25));
         reconciler.reconcile_once().unwrap();
         assert_eq!(runtime.starts.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn a_stopped_agents_declared_checkout_is_read_once_per_declaration() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        let declare = |command: &str| {
+            let source =
+                format!("version 2\n  agent \"worker\" {{\n    command \"{command}\"\n  }}\n");
+            let intent = parse_intent(&source, "node").unwrap();
+            let mission = store
+                .mission(
+                    &intent,
+                    crate::model::IntentInput {
+                        kdl: source.clone(),
+                        source_name: None,
+                    },
+                )
+                .unwrap();
+            store
+                .apply(
+                    &intent,
+                    &mission.subject_tokens,
+                    &format!("declare {command}"),
+                )
+                .unwrap();
+        };
+        declare("sleep 60");
+        let reconciler = Reconciler::new(
+            store.clone(),
+            Arc::new(FakeRuntime::default()),
+            "node".into(),
+            Arc::new(Notify::new()),
+        );
+        let parses = || DECLARATION_PARSES.with(std::cell::Cell::get);
+        let before = parses();
+        reconciler
+            .declared_run_end_checkout("agent/node.worker")
+            .unwrap();
+        store
+            .append_claim(&ClaimInput {
+                subject: "agent/node.other".into(),
+                kind: "runtime.observed".into(),
+                actor: None,
+                fields: BTreeMap::from([("status".into(), Value::String("running".into()))]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+        reconciler
+            .declared_run_end_checkout("agent/node.worker")
+            .unwrap();
+        assert_eq!(
+            parses() - before,
+            1,
+            "an unrelated write must not re-read a stopped agent's declarations"
+        );
+
+        declare("sleep 61");
+        reconciler
+            .declared_run_end_checkout("agent/node.worker")
+            .unwrap();
+        assert_eq!(parses() - before, 2);
     }
 
     #[test]
