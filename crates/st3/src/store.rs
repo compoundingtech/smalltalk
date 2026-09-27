@@ -8650,13 +8650,21 @@ impl Store {
         }
     }
 
-    /// Common heartbeat, conversation, and lease-renewal envelopes do not require replaying
-    /// every historical mission and claim. Keep the full replay for all other kinds, stale
-    /// projections, operation metadata, and ambiguous renewal ordering.
+    /// Event-only envelopes do not change the structural graph and can advance from a healthy
+    /// frontier. Keep the full replay for structural kinds, stale projections, and ambiguous
+    /// operation or renewal ordering.
     fn simple_replication_kind(kind: &str) -> bool {
         matches!(
             kind,
-            "message.closed"
+            "attention.requested"
+                | "gate.requested"
+                | "gate.result"
+                | "loop.state"
+                | "observer.observed"
+                | "observer.state"
+                | "resource.observed"
+                | "subscription.state"
+                | "message.closed"
                 | "message.delivered"
                 | "message.read"
                 | "message.sent"
@@ -18774,6 +18782,52 @@ mod tests {
             )
             .unwrap();
         assert_eq!(event_count, 1);
+    }
+
+    #[test]
+    fn resource_observation_projection_does_not_rebuild_operation_history() {
+        let store = Store::open_memory("node").unwrap();
+        assert!(store.project_replication_backlog().unwrap());
+        {
+            let mut connection = store.connection.lock().unwrap();
+            let transaction = connection.transaction().unwrap();
+            append_claim_tx(
+                &transaction,
+                &store.origin,
+                "agent/node.test",
+                "harness.observed",
+                Some("agent/node.test"),
+                &json!({"fields": {"state": "ready"}, "_operation": {
+                    "id": "op/existing", "request_digest": "digest-one"
+                }}),
+                &[],
+                None,
+            )
+            .unwrap();
+            transaction.commit().unwrap();
+        }
+        assert!(store.project_replication_backlog().unwrap());
+        {
+            let mut connection = store.connection.lock().unwrap();
+            let transaction = connection.transaction().unwrap();
+            append_claim_tx(
+                &transaction,
+                &store.origin,
+                "resource/repo",
+                "resource.observed",
+                None,
+                &json!({"fields": {"kind": "vcs.repository", "state": "active"}}),
+                &[],
+                None,
+            )
+            .unwrap();
+            transaction.commit().unwrap();
+        }
+        let before = store.connection.lock().unwrap().total_changes();
+        assert!(store.project_replication_backlog().unwrap());
+        let connection = store.connection.lock().unwrap();
+        assert!(connection.total_changes() - before <= 2);
+        assert!(operation_tx(&connection, "op/existing").unwrap().is_some());
     }
 
     #[test]
