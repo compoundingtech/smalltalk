@@ -105,6 +105,8 @@ pub struct Client {
     local_person: Option<String>,
     http: reqwest::Client,
     max_response_bytes: Arc<AtomicUsize>,
+    outage_wait: Duration,
+    announce_outage_wait: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -119,18 +121,68 @@ pub enum ClientError {
     Api(ErrorCode, String, Box<ErrorEnvelope>),
     #[error("st3 client transport error: {0}")]
     Transport(String),
+    #[error(transparent)]
+    Unreachable(DaemonUnreachable),
     #[error("st3 client protocol error: {0}")]
     Protocol(String),
 }
+
+/// The st3 daemon accepted no connection, typically because it is restarting. Nothing was sent,
+/// so the request is always safe to repeat.
+#[derive(Clone, Debug)]
+pub struct DaemonUnreachable {
+    pub endpoint: String,
+    pub reason: String,
+    /// How long the client kept retrying before it gave up, if it retried.
+    pub waited: Option<Duration>,
+}
+
+impl DaemonUnreachable {
+    /// A short present-tense summary without advice.
+    pub fn summary(&self) -> String {
+        format!(
+            "the st3 daemon at {} is not reachable ({}); it may be restarting",
+            self.endpoint, self.reason
+        )
+    }
+}
+
+impl std::fmt::Display for DaemonUnreachable {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.waited {
+            None => formatter.write_str(&self.summary()),
+            Some(waited) => write!(
+                formatter,
+                "the st3 daemon at {} was not reachable for {}s ({}); it may be restarting or stopped. Nothing was sent; run the command again once the daemon is back",
+                self.endpoint,
+                waited.as_secs_f64().round() as u64,
+                self.reason
+            ),
+        }
+    }
+}
+
+impl std::error::Error for DaemonUnreachable {}
 
 impl Client {
     /// An unscoped read on the trusted local Unix socket. Paired transports
     /// retain their credential and authority; only local clients can use this.
     pub fn trusted_unscoped_read(&self) -> Self {
         match &self.endpoint {
-            Endpoint::Unix(path) if self.credential.is_none() => Self::unix(path),
+            Endpoint::Unix(path) if self.credential.is_none() => {
+                Self::unix(path).with_outage_wait(self.outage_wait, self.announce_outage_wait)
+            }
             _ => self.clone(),
         }
+    }
+
+    /// Keep retrying for up to `wait` while the daemon accepts no connection, for example while
+    /// it restarts. Such a request never reached the daemon, so repeating it is always safe.
+    /// With `announce`, one line on stderr says what is happening while it waits.
+    pub fn with_outage_wait(mut self, wait: Duration, announce: bool) -> Self {
+        self.outage_wait = wait;
+        self.announce_outage_wait = announce;
+        self
     }
     pub fn unix(path: impl AsRef<Path>) -> Self {
         Self {
@@ -139,6 +191,8 @@ impl Client {
             local_person: None,
             http: reqwest::Client::new(),
             max_response_bytes: Arc::new(AtomicUsize::new(HARD_MAX_RESPONSE_BYTES)),
+            outage_wait: Duration::ZERO,
+            announce_outage_wait: false,
         }
     }
 
@@ -149,6 +203,8 @@ impl Client {
             local_person: Some(person_id.into()),
             http: reqwest::Client::new(),
             max_response_bytes: Arc::new(AtomicUsize::new(HARD_MAX_RESPONSE_BYTES)),
+            outage_wait: Duration::ZERO,
+            announce_outage_wait: false,
         }
     }
 
@@ -162,6 +218,8 @@ impl Client {
             local_person: None,
             http: reqwest::Client::new(),
             max_response_bytes: Arc::new(AtomicUsize::new(HARD_MAX_RESPONSE_BYTES)),
+            outage_wait: Duration::ZERO,
+            announce_outage_wait: false,
         }
     }
 
@@ -174,6 +232,8 @@ impl Client {
             local_person: None,
             http: reqwest::Client::new(),
             max_response_bytes: Arc::new(AtomicUsize::new(HARD_MAX_RESPONSE_BYTES)),
+            outage_wait: Duration::ZERO,
+            announce_outage_wait: false,
         }
     }
 
@@ -184,6 +244,8 @@ impl Client {
             local_person: None,
             http: reqwest::Client::new(),
             max_response_bytes: Arc::new(AtomicUsize::new(HARD_MAX_RESPONSE_BYTES)),
+            outage_wait: Duration::ZERO,
+            announce_outage_wait: false,
         }
     }
 
@@ -1103,7 +1165,7 @@ impl Client {
                 .map_err(|_| {
                     ClientError::Transport("terminal stream connect deadline exceeded".into())
                 })?
-                .map_err(|error| ClientError::Transport(error.to_string()))?;
+                .map_err(|error| unreachable_error(&socket.display().to_string(), &error))?;
                 let request = websocket_request(
                     &format!("ws://localhost{path}"),
                     self.credential.as_deref(),
@@ -1187,6 +1249,38 @@ impl Client {
         path: &str,
         body: Option<Vec<u8>>,
     ) -> Result<T, ClientError> {
+        let started = tokio::time::Instant::now();
+        let mut pause = Duration::from_millis(100);
+        let mut announced = false;
+        loop {
+            match self.request_once(method.clone(), path, body.clone()).await {
+                Err(ClientError::Unreachable(mut outage)) if !self.outage_wait.is_zero() => {
+                    let waited = started.elapsed();
+                    if waited >= self.outage_wait {
+                        outage.waited = Some(waited);
+                        return Err(ClientError::Unreachable(outage));
+                    }
+                    if self.announce_outage_wait && !announced {
+                        eprintln!(
+                            "st3: {}; retrying for up to {}s",
+                            outage.summary(),
+                            self.outage_wait.as_secs()
+                        );
+                        announced = true;
+                    }
+                    tokio::time::sleep(pause.min(self.outage_wait - waited)).await;
+                    pause = (pause * 2).min(Duration::from_secs(1));
+                }
+                outcome => return outcome,
+            }
+        }
+    }
+    async fn request_once<T: DeserializeOwned>(
+        &self,
+        method: Method,
+        path: &str,
+        body: Option<Vec<u8>>,
+    ) -> Result<T, ClientError> {
         let limit = self.response_limit();
         let request = async {
             match &self.endpoint {
@@ -1212,10 +1306,13 @@ impl Client {
                             .header("content-type", "application/json")
                             .body(body);
                     }
-                    let mut response = request
-                        .send()
-                        .await
-                        .map_err(|error| ClientError::Transport(error.to_string()))?;
+                    let mut response = request.send().await.map_err(|error| {
+                        if error.is_connect() {
+                            unreachable_error(base, &error)
+                        } else {
+                            ClientError::Transport(error.to_string())
+                        }
+                    })?;
                     reject_large_content_length(response.content_length(), limit)?;
                     let status = response.status().as_u16();
                     let mut bytes = Vec::new();
@@ -1246,6 +1343,27 @@ impl Client {
     }
 }
 
+fn unreachable_error(endpoint: &str, error: &(dyn std::error::Error + 'static)) -> ClientError {
+    let mut cause = Some(error);
+    let mut reason = error.to_string();
+    while let Some(current) = cause {
+        if let Some(io) = current.downcast_ref::<std::io::Error>() {
+            reason = match io.kind() {
+                std::io::ErrorKind::NotFound => "its socket does not exist".into(),
+                std::io::ErrorKind::ConnectionRefused => "connection refused".into(),
+                _ => io.to_string(),
+            };
+            break;
+        }
+        cause = current.source();
+    }
+    ClientError::Unreachable(DaemonUnreachable {
+        endpoint: endpoint.to_owned(),
+        reason,
+        waited: None,
+    })
+}
+
 fn request_has_page_cursor(path: &str) -> bool {
     path.split_once('?').is_some_and(|(_, query)| {
         query
@@ -1266,7 +1384,7 @@ async fn unix_request(
 ) -> Result<(u16, Vec<u8>), ClientError> {
     let stream = tokio::net::UnixStream::connect(socket)
         .await
-        .map_err(|error| ClientError::Transport(error.to_string()))?;
+        .map_err(|error| unreachable_error(&socket.display().to_string(), &error))?;
     let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
         .await
         .map_err(|error| ClientError::Transport(error.to_string()))?;

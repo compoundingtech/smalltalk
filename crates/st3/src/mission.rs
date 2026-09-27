@@ -262,6 +262,7 @@ fn parse_mission(
     let input_names = inputs.keys().cloned().collect::<BTreeSet<_>>();
     let mut goals = Vec::new();
     let mut constraints = Vec::new();
+    let mut agent_constraints = BTreeMap::new();
     let mut baselines = Vec::new();
     let mut products = Vec::new();
     let mut gates = Vec::new();
@@ -434,12 +435,13 @@ fn parse_mission(
             }
             name if crate::graph::is_mission_declaration(name) => {
                 crate::graph::validate_deferred_declaration(child)?;
+                let child = take_agent_constraints(child, default_host, &mut agent_constraints)?;
                 let mut declaration = KdlDocument::new();
                 declaration.nodes_mut().push(child.clone());
                 revision_owners.extend(direct_agent_owners(&declaration, default_host)?);
                 revision_owners.sort();
                 revision_owners.dedup();
-                declarations.push(child.clone());
+                declarations.push(child);
             }
             other => {
                 return Err(St3Error::new(
@@ -491,6 +493,7 @@ fn parse_mission(
         completion,
         goals,
         constraints,
+        agent_constraints,
         baselines,
         products,
         gates,
@@ -729,6 +732,7 @@ fn parse_loop_group(
         title: None,
         goals: Vec::new(),
         constraints: Vec::new(),
+        agent_constraints: BTreeMap::new(),
         timeout_ms: None,
         retry: RetrySpec {
             attempts: rounds as u32,
@@ -746,6 +750,7 @@ fn parse_loop_group(
         products: Vec::new(),
         produces_mission: None,
         uses_mission: None,
+        after_run: None,
         gates: Vec::new(),
         nested_mission: None,
         loop_spec: Some(Box::new(loop_spec)),
@@ -1189,6 +1194,7 @@ fn parse_step(
     let mut title = None;
     let mut goals = Vec::new();
     let mut constraints = Vec::new();
+    let mut agent_constraints = BTreeMap::new();
     let mut assigned_to = None;
     let mut available_to = Vec::new();
     let mut agentless = false;
@@ -1199,6 +1205,7 @@ fn parse_step(
     let mut products = Vec::new();
     let mut produces_mission = None;
     let mut uses_mission = None;
+    let mut after_run = None;
     let mut gates = Vec::new();
     let mut nested_mission = None;
     let mut retry = RetrySpec::default();
@@ -1269,16 +1276,19 @@ fn parse_step(
                 }
                 name if crate::graph::is_mission_declaration(name) => {
                     crate::graph::validate_deferred_declaration(child)?;
+                    let child =
+                        take_agent_constraints(child, default_host, &mut agent_constraints)?;
                     let mut declaration = KdlDocument::new();
                     declaration.nodes_mut().push(child.clone());
                     revision_owners.extend(direct_agent_owners(&declaration, default_host)?);
                     revision_owners.sort();
                     revision_owners.dedup();
-                    declarations.push(child.clone());
+                    declarations.push(child);
                 }
                 "produces" => products = parse_products(child)?,
                 "produces-mission" => produces_mission = Some(parse_produced_mission(child)?),
                 "uses-mission" => uses_mission = Some(parse_used_mission(child)?),
+                "after-run" => after_run = Some(parse_after_run(child)?),
                 "gate" => {
                     let gate = crate::graph::parse_gate(child, default_host)?;
                     if matches!(gate, GateSpec::Deadline { .. }) {
@@ -1324,6 +1334,15 @@ fn parse_step(
         }
     }
     validate_goal_count(&format!("step `{path}`"), &goals, false)?;
+    if after_run.is_some() {
+        if assigned_to.is_some() || !available_to.is_empty() {
+            return Err(St3Error::new(
+                "conflicting-work-selector",
+                format!("step `{path}` waits with `after-run`, so it cannot select an agent"),
+            ));
+        }
+        agentless = true;
+    }
     let work_selector = build_work_selector(
         &format!("step `{path}`"),
         assigned_to,
@@ -1339,6 +1358,7 @@ fn parse_step(
         title,
         goals,
         constraints,
+        agent_constraints,
         timeout_ms,
         retry,
         finally,
@@ -1353,6 +1373,7 @@ fn parse_step(
         products,
         produces_mission,
         uses_mission,
+        after_run,
         gates,
         nested_mission,
         loop_spec: None,
@@ -1707,6 +1728,37 @@ fn validate_goal_count(context: &str, goals: &[String], required: bool) -> Resul
     Ok(())
 }
 
+/// Moves the constraints of an agent block into `agent_constraints`. They are work rules for the
+/// steps that select the agent, so they stay out of the declaration that starts the agent.
+fn take_agent_constraints(
+    node: &KdlNode,
+    default_host: &str,
+    agent_constraints: &mut BTreeMap<String, Vec<String>>,
+) -> Result<KdlNode, St3Error> {
+    let mut node = node.clone();
+    if node.name().value() != "agent" {
+        return Ok(node);
+    }
+    let Some(children) = node.children_mut() else {
+        return Ok(node);
+    };
+    let (constraint_nodes, other_nodes): (Vec<_>, Vec<_>) = children
+        .nodes()
+        .iter()
+        .cloned()
+        .partition(|child| child.name().value() == "constraint");
+    if constraint_nodes.is_empty() {
+        return Ok(node);
+    }
+    *children.nodes_mut() = other_nodes;
+    let agent = agent_owner(&node, default_host)?;
+    let constraints = agent_constraints.entry(agent.clone()).or_default();
+    for child in &constraint_nodes {
+        push_constraint(constraints, child, &format!("agent `{agent}`"))?;
+    }
+    Ok(node)
+}
+
 fn push_constraint(
     constraints: &mut Vec<String>,
     node: &KdlNode,
@@ -2021,6 +2073,91 @@ fn parse_used_mission(node: &KdlNode) -> Result<UsedMissionSpec, St3Error> {
     }
 }
 
+fn parse_after_run(node: &KdlNode) -> Result<String, St3Error> {
+    let run = plain_string(node)?;
+    if run.strip_prefix("mission-run/").unwrap_or(&run).is_empty() {
+        return Err(St3Error::new(
+            "invalid-after-run",
+            "after-run needs a mission run",
+        ));
+    }
+    Ok(run)
+}
+
+/// The step that a run started with `--after RUN` waits in before its other work starts.
+pub const AFTER_RUN_STEP: &str = "after-run";
+
+/// Returns the mission that a run started with `--after RUN` follows. It adds an agentless
+/// `after-run` step that waits for RUN, and every root step of the normal phase depends on it.
+/// Existing steps keep their definition hashes, so revision compatibility is unchanged.
+pub fn mission_after_run(mut mission: MissionSpec, run: &str) -> Result<MissionSpec, St3Error> {
+    if mission.steps.contains_key(AFTER_RUN_STEP) {
+        return Err(St3Error::new(
+            "after-run-step-exists",
+            format!(
+                "mission `{}` already has a root step named `{AFTER_RUN_STEP}`",
+                mission.id
+            ),
+        ));
+    }
+    for step in mission.steps.values_mut().filter(|step| !step.finally) {
+        step.dependencies.push(DependencySpec::Step {
+            step: AFTER_RUN_STEP.into(),
+            state: "completed".into(),
+        });
+    }
+    let mut step = StepSpec {
+        id: AFTER_RUN_STEP.into(),
+        path: AFTER_RUN_STEP.into(),
+        queue: None,
+        queue_position: None,
+        title: None,
+        goals: Vec::new(),
+        constraints: Vec::new(),
+        agent_constraints: BTreeMap::new(),
+        timeout_ms: None,
+        retry: RetrySpec::default(),
+        finally: false,
+        work_selector: Some(WorkSelector::Agentless),
+        revision_owners: Vec::new(),
+        revisions_human_only: false,
+        revision_reviewer: None,
+        dependencies: Vec::new(),
+        baselines: Vec::new(),
+        documents: Vec::new(),
+        declarations_kdl: None,
+        products: Vec::new(),
+        produces_mission: None,
+        uses_mission: None,
+        after_run: Some(after_run_subject(run)),
+        gates: Vec::new(),
+        nested_mission: None,
+        loop_spec: None,
+        definition_hash: String::new(),
+    };
+    step.definition_hash = hash(&step)?;
+    mission.steps.insert(AFTER_RUN_STEP.into(), step);
+    mission.display_order.insert(0, AFTER_RUN_STEP.into());
+    Ok(mission)
+}
+
+/// Returns the mission that one run follows: its revision, with the `after-run` step when the run
+/// was started after another run.
+pub fn run_mission(mission: MissionSpec, after: Option<&str>) -> Result<MissionSpec, St3Error> {
+    match after {
+        Some(after) => mission_after_run(mission, after),
+        None => Ok(mission),
+    }
+}
+
+/// The full subject of the run an `after-run` value names, with or without its prefix.
+pub(crate) fn after_run_subject(run: &str) -> String {
+    format!(
+        "mission-run/{}",
+        run.strip_prefix("mission-run/").unwrap_or(run)
+    )
+}
+
 fn parse_retry(node: &KdlNode) -> Result<RetrySpec, St3Error> {
     ensure_bare(node)?;
     let body = node
@@ -2164,6 +2301,12 @@ pub fn interpolate(source: &str, variables: &BTreeMap<String, String>) -> Result
     let mut output = String::with_capacity(source.len());
     let mut rest = source;
     while let Some(start) = rest.find("${") {
+        if let Some(literal) = rest[..start].strip_suffix('$') {
+            output.push_str(literal);
+            output.push_str("${");
+            rest = &rest[start + 2..];
+            continue;
+        }
         output.push_str(&rest[..start]);
         let tail = &rest[start + 2..];
         let Some(end) = tail.find('}') else {
@@ -2174,10 +2317,7 @@ pub fn interpolate(source: &str, variables: &BTreeMap<String, String>) -> Result
         };
         let name = &tail[..end];
         if !registered_variable(name) && !name.starts_with("input.") {
-            return Err(St3Error::new(
-                "unknown-variable",
-                format!("variable `{name}` is not registered"),
-            ));
+            return Err(unknown_variable(name));
         }
         let value = variables
             .get(name)
@@ -2236,6 +2376,10 @@ fn validate_variables(value: &Value, input_names: &BTreeSet<String>) -> Result<(
             let mut rest = value.as_str();
             while let Some(start) = rest.find("${") {
                 let tail = &rest[start + 2..];
+                if rest[..start].ends_with('$') {
+                    rest = tail;
+                    continue;
+                }
                 let Some(end) = tail.find('}') else {
                     return Err(St3Error::new(
                         "invalid-variable",
@@ -2247,10 +2391,7 @@ fn validate_variables(value: &Value, input_names: &BTreeSet<String>) -> Result<(
                     .strip_prefix("input.")
                     .is_some_and(|name| input_names.contains(name));
                 if !registered_variable(name) && !declared_input {
-                    return Err(St3Error::new(
-                        "unknown-variable",
-                        format!("variable `{name}` is not registered"),
-                    ));
+                    return Err(unknown_variable(name));
                 }
                 rest = &tail[end + 1..];
             }
@@ -2268,6 +2409,13 @@ fn validate_variables(value: &Value, input_names: &BTreeSet<String>) -> Result<(
         _ => {}
     }
     Ok(())
+}
+
+fn unknown_variable(name: &str) -> St3Error {
+    St3Error::new(
+        "unknown-variable",
+        format!("variable `{name}` is not registered; write `$${{{name}}}` for the literal text"),
+    )
 }
 
 fn registered_variable(name: &str) -> bool {
@@ -3076,6 +3224,226 @@ version 2
         )
         .unwrap_err();
         assert_eq!(duplicate_field.code, "duplicate-product-field");
+    }
+
+    #[test]
+    fn a_doubled_dollar_keeps_literal_variable_text() {
+        let intent = crate::graph::parse_intent(
+            r#"version 2
+ mission "quote" state="ready" {
+   goal "Explain what a shell variable expands to."
+   step "explain" {
+     goal "Print `$${HOME}` for ${ST_MISSION_RUN}."
+     constraint "Keep `$${name}` as written."
+   }
+ }"#,
+            "node",
+        )
+        .unwrap();
+        let step = &intent.missions["quote"].steps["explain"];
+        let variables =
+            std::collections::BTreeMap::from([("ST_MISSION_RUN".to_owned(), "quote/1".to_owned())]);
+        assert_eq!(
+            super::interpolate(&step.goals[0], &variables).unwrap(),
+            "Print `${HOME}` for quote/1."
+        );
+        assert_eq!(
+            super::interpolate(&step.constraints[0], &variables).unwrap(),
+            "Keep `${name}` as written."
+        );
+
+        let error = crate::graph::parse_intent(
+            r#"version 2
+ mission "quote" state="ready" {
+   goal "Explain a shell variable."
+   step "explain" { goal "Print `${HOME}`." }
+ }"#,
+            "node",
+        )
+        .unwrap_err();
+        assert_eq!(error.code, "unknown-variable");
+        assert_eq!(
+            error.message,
+            "variable `HOME` is not registered; write `$${HOME}` for the literal text"
+        );
+    }
+
+    #[test]
+    fn after_run_steps_are_agentless_and_start_before_the_rest_of_a_run() {
+        use super::{AFTER_RUN_STEP, after_run_subject, mission_after_run, run_mission};
+        use crate::model::{DependencySpec, WorkSelector};
+        use std::collections::BTreeMap;
+
+        let intent = crate::graph::parse_intent(
+            r#"version 2
+ mission "ship" state="ready" {
+   goal "Ship after the build run."
+   assigned-to "agent/example/shipper"
+   input "build" kind="text"
+   step "wait" { after-run "${input.build}" }
+   step "ship" { depends-on { step "wait" completed } }
+   finally { step "report" { agentless } }
+ }"#,
+            "node",
+        )
+        .unwrap();
+        let mission = intent.missions["ship"].clone();
+        let wait = &mission.steps["wait"];
+        assert_eq!(wait.after_run.as_deref(), Some("${input.build}"));
+        assert_eq!(wait.work_selector, Some(WorkSelector::Agentless));
+        assert_eq!(after_run_subject("build/1"), "mission-run/build/1");
+        assert_eq!(
+            after_run_subject("mission-run/build/1"),
+            "mission-run/build/1"
+        );
+
+        let selected = crate::graph::parse_intent(
+            r#"version 2
+ mission "bad" state="ready" {
+   goal "Wait with an agent."
+   step "wait" { assigned-to "agent/example/shipper"; after-run "build/1" }
+ }"#,
+            "node",
+        )
+        .unwrap_err();
+        assert_eq!(selected.code, "conflicting-work-selector");
+
+        let hashes = mission
+            .steps
+            .values()
+            .map(|step| (step.id.clone(), step.definition_hash.clone()))
+            .collect::<BTreeMap<_, _>>();
+        let after = mission_after_run(mission.clone(), "build/1").unwrap();
+        assert_eq!(after.display_order[0], AFTER_RUN_STEP);
+        let step = &after.steps[AFTER_RUN_STEP];
+        assert_eq!(step.after_run.as_deref(), Some("mission-run/build/1"));
+        assert_eq!(step.work_selector, Some(WorkSelector::Agentless));
+        let waits = |id: &str| {
+            after.steps[id]
+                .dependencies
+                .contains(&DependencySpec::Step {
+                    step: AFTER_RUN_STEP.into(),
+                    state: "completed".into(),
+                })
+        };
+        assert!(waits("wait") && waits("ship") && !waits("report"));
+        for (id, hash) in hashes {
+            assert_eq!(after.steps[&id].definition_hash, hash);
+        }
+        assert_eq!(run_mission(mission.clone(), None).unwrap(), mission);
+        assert_eq!(
+            mission_after_run(after, "build/2").unwrap_err().code,
+            "after-run-step-exists"
+        );
+
+        let itself = crate::graph::parse_intent(
+            r#"version 2
+ mission-run "ship/1" {
+   mission "mission/ship@0000000000000000000000000000000000000000000000000000000000000000"
+   workspace "/work"
+   requester "person/operator"
+   after "ship/1"
+ }"#,
+            "node",
+        )
+        .unwrap_err();
+        assert_eq!(itself.code, "invalid-mission-run-after");
+    }
+
+    #[test]
+    fn agent_block_constraints_leave_the_runtime_declaration() {
+        let intent = crate::graph::parse_intent(
+            r#"version 2
+ mission "handoff" state="ready" {
+   goal "Build and merge one change."
+   constraint "Keep the change small."
+   agent "builder" {
+     workspace "."
+     command "true"
+     constraint "Never push the release branch."
+   }
+   step "build" {
+     assigned-to "agent/${ST_MISSION_RUN}/builder"
+     agent "checker" {
+       identity "reviewer"
+       workspace "."
+       command "true"
+       constraint "Report findings without editing files."
+     }
+   }
+ }"#,
+            "node",
+        )
+        .unwrap();
+        let mission = &intent.missions["handoff"];
+        assert_eq!(mission.constraints, ["Keep the change small."]);
+        assert_eq!(
+            mission.agent_constraints,
+            std::collections::BTreeMap::from([(
+                "agent/${ST_MISSION_RUN}/builder".to_owned(),
+                vec!["Never push the release branch.".to_owned()]
+            )])
+        );
+        assert_eq!(
+            mission.steps["build"].agent_constraints,
+            std::collections::BTreeMap::from([(
+                "agent/${ST_MISSION_RUN}/reviewer".to_owned(),
+                vec!["Report findings without editing files.".to_owned()]
+            )])
+        );
+        assert!(mission.steps["build"].constraints.is_empty());
+        for declarations in [
+            mission.declarations_kdl.as_deref().unwrap(),
+            mission.steps["build"].declarations_kdl.as_deref().unwrap(),
+        ] {
+            assert!(declarations.contains("command"));
+            assert!(!declarations.contains("constraint"));
+        }
+
+        let duplicate = crate::graph::parse_intent(
+            r#"version 2
+ mission "duplicate" state="ready" {
+   goal "Reject duplicate agent text."
+   agent "builder" {
+     workspace "."
+     command "true"
+     constraint "Do not push."
+     constraint "Do not push."
+   }
+ }"#,
+            "node",
+        )
+        .unwrap_err();
+        assert_eq!(duplicate.code, "duplicate-constraint");
+
+        let seat = crate::graph::parse_intent(
+            r#"version 2
+ agent "fleet/example/builder" {
+   workspace "."
+   command "true"
+   constraint "Do not push."
+ }"#,
+            "node",
+        )
+        .unwrap_err();
+        assert_eq!(seat.code, "agent-constraint-outside-mission");
+    }
+
+    #[test]
+    fn missions_without_agent_constraints_keep_their_serialized_shape() {
+        let intent = crate::graph::parse_intent(
+            r#"version 2
+ mission "plain" state="ready" {
+   goal "Keep the revision hash stable."
+   agent "builder" { workspace "."; command "true" }
+   step "build" { assigned-to "agent/${ST_MISSION_RUN}/builder" }
+ }"#,
+            "node",
+        )
+        .unwrap();
+        let value = serde_json::to_value(&intent.missions["plain"]).unwrap();
+        assert!(value.get("agent_constraints").is_none());
+        assert!(value["steps"]["build"].get("agent_constraints").is_none());
     }
 
     #[test]

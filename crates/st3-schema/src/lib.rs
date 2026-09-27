@@ -675,6 +675,7 @@ fn resource_specs() -> BTreeMap<String, ResourceSpec> {
                 ("state", string()),
                 ("pull_requests", array()),
                 ("issues", array()),
+                ("repository_id", integer()),
             ],
         ),
     );
@@ -1581,7 +1582,43 @@ fn claim_specs() -> BTreeMap<String, ClaimSpec> {
             &["subscription"],
         ),
         (
+            "subscription.mission-request-cancelled",
+            &["subscription"],
+            WritePolicy::AuthorizedParticipant,
+            Cardinality::Append,
+            Some("subscriptions"),
+            true,
+            &["subscription"],
+        ),
+        (
+            "subscription.mission-request-released",
+            &["subscription"],
+            WritePolicy::AuthorizedParticipant,
+            Cardinality::Append,
+            Some("subscriptions"),
+            true,
+            &["subscription"],
+        ),
+        (
             "subscription.mission-started",
+            &["subscription"],
+            WritePolicy::SystemOnly,
+            Cardinality::Append,
+            Some("subscriptions"),
+            true,
+            &["subscription"],
+        ),
+        (
+            "subscription.mission-deferred",
+            &["subscription"],
+            WritePolicy::SystemOnly,
+            Cardinality::Append,
+            Some("subscriptions"),
+            true,
+            &["subscription"],
+        ),
+        (
+            "subscription.mission-failed",
             &["subscription"],
             WritePolicy::SystemOnly,
             Cardinality::Append,
@@ -1645,6 +1682,7 @@ fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
             ("reason", required_string()),
             ("severity", required_enum(&["warning", "error"])),
             ("targets", array()),
+            ("until", string()),
         ],
         "attention.resolved" => &[
             ("request", required_string()),
@@ -1694,6 +1732,7 @@ fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
             ("deadline_at_unix_ms", integer()),
             ("parent_step_run", reference()),
             ("default_selector", object()),
+            ("after", reference()),
         ],
         "mission-run.state" => &[
             ("status", string()),
@@ -1779,6 +1818,9 @@ fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
             ("status", string()),
             ("attempt", integer()),
             ("worker_reported", boolean()),
+            ("claimant", reference()),
+            ("claim_incarnation", string()),
+            ("claim_expires_at_unix_ms", integer()),
         ],
         "work.claimed" | "work.renewed" | "work.progress" | "work.submitted" | "work.failed"
         | "work.released" => &[
@@ -1878,9 +1920,10 @@ fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
         "observer.state" => &[
             (
                 "state",
-                required_enum(&["healthy", "unreachable", "stopped"]),
+                required_enum(&["healthy", "degraded", "unreachable", "stopped"]),
             ),
             ("reason", string()),
+            ("error_code", string()),
             ("revision", string()),
             ("attempt", string()),
             ("next_check_unix_ms", string()),
@@ -2029,8 +2072,11 @@ fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
             ("code", string()),
             ("reason", string()),
             ("incarnation_id", string()),
+            ("matched_line", string()),
             ("step_run", reference_to(&["step-run"])),
             ("wake_attempts", integer()),
+            ("attempt", integer()),
+            ("readiness_epoch", integer()),
             ("observed_since_ms", integer()),
             ("retry_attempt", integer()),
             ("retry_after_unix_ms", integer()),
@@ -2270,10 +2316,23 @@ fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
             ("workspace", required_string()),
             ("discovery", required_string()),
             ("requester", reference_to(&["agent", "person"])),
+            ("held", boolean()),
         ],
+        "subscription.mission-request-cancelled" | "subscription.mission-request-released" => {
+            &[("request", required_string()), ("reason", string())]
+        }
         "subscription.mission-started" => &[
             ("request", required_string()),
             ("mission_run", required_reference_to(&["mission-run"])),
+        ],
+        "subscription.mission-deferred" => &[
+            ("request", required_string()),
+            ("not_before_unix_ms", required_integer()),
+        ],
+        "subscription.mission-failed" => &[
+            ("request", required_string()),
+            ("code", required_string()),
+            ("reason", required_string()),
         ],
         "resource.observed" => &[
             ("kind", string()),
@@ -2589,6 +2648,10 @@ mod tests {
                 "step-run.carried",
                 "step-run.retried",
                 "step-run.state",
+                "subscription.mission-deferred",
+                "subscription.mission-failed",
+                "subscription.mission-request-cancelled",
+                "subscription.mission-request-released",
                 "subscription.mission-requested",
                 "subscription.mission-started",
                 "subscription.state",
@@ -2759,6 +2822,8 @@ mod tests {
                 "message.read",
                 "planning-session.candidate-submitted",
                 "planning-session.question-requested",
+                "subscription.mission-request-cancelled",
+                "subscription.mission-request-released",
                 "work.claimed",
                 "work.failed",
                 "work.progress",

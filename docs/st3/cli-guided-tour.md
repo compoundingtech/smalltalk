@@ -96,6 +96,7 @@ st work complete --help
 st work fail --help
 st work release --help
 st work wake --help
+st work retry --help
 st work publish-mission --help
 st work revise --help
 st work revision --help
@@ -132,6 +133,15 @@ st attention reject --help
 
 Every row should say why Nathan is involved, what happens if he does nothing, whether it is stale,
 and the exact actions available now.
+
+A subscription that holds mission requests for a person raises one attention item. Inspect the
+subscription request commands without changing live state:
+
+```sh
+st missions requests --help
+st missions release --help
+st missions cancel-request --help
+```
 
 ### 5. `launch` — chat, shape, approve, and launch a mission
 
@@ -221,12 +231,15 @@ st machines
 
 Copy an agent ID into `show`. Check tree nesting, durable seats versus mission-owned agents, current
 runtime, host, work, conversation, stale state, and whether stopped history stays out of the default.
+For a working agent, check that `show` names its current step and its last progress summary.
 
 Copy a durable seat into `agents queue`. Check that the current claim comes first, then each queued
 mission run in order with `claimed`, `ready`, or `waiting`, and that `NEXT WORK` matches
-`agents show`. `agents queue move AGENT RUN --top`, `--bottom`, `--before RUN`, or `--after RUN`
-is a person-authorized mutation; move only a run we agreed to reorder, then confirm the move is
-listed with its author and time and that a held step stayed held.
+`agents show`. `st missions queued AGENT` prints the exact same view for someone who thinks of
+this as a mission question rather than an agent one. `agents queue move AGENT RUN --top`,
+`--bottom`, `--before RUN`, or `--after RUN` is a person-authorized mutation; move only a run we
+agreed to reorder, then confirm the move is listed with its author and time and that a held step
+stayed held.
 
 ### 8. `terminals` — inspect and attach without shell nesting
 

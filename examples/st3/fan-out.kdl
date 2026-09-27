@@ -4,12 +4,17 @@ version 2
 //
 // Parallel work gets its own seats. Each worker below belongs to this run, as
 // `agent/RUN/parser` and so on, and has its own Git worktree, so no two harnesses share a working
-// tree or a seat queue. A durable seat still does the join. The `finally` block stops the workers
-// and removes their worktrees whether the run completes, fails, or is cancelled.
+// tree or a seat queue. A durable seat still does the join.
 //
-// The run workspace holds a clone of the invented project at `repo/`. The worktrees are created
-// beside it before any worker starts, because a worker's workspace must exist when it starts and
-// st writes `.st3/boot.md` into it.
+// Each worker declares a `checkout`. Before a worker starts, st fetches origin/main into the
+// run's clone and creates the worker's workspace as a worktree on the named branch. A branch
+// that already exists is checked out as it is. When the run ends, whether it completes, fails, or
+// is cancelled, st stops the workers and removes each clean worktree. A worktree with
+// uncommitted or untracked changes stays, with a warning, and the branches stay in the clone.
+// `git-exclude ".st3/"` keeps the files st writes for each harness out of Git, so a finished
+// worktree is clean.
+//
+// The run workspace holds a clone of the invented project at `repo/`.
 //
 //   run_root="$(mktemp -d)"
 //   git clone git@example.invalid:example/app.git "$run_root/repo"
@@ -18,9 +23,9 @@ version 2
 //   st missions start example/fan-out --id example/fan-out/2026-10-01 \
 //     --workspace "$run_root" --as person/operator --follow
 //
-// Commands in `exec` and gates run through `sh -c` with a minimal environment. Use absolute
-// binary paths. `${NAME}` is an st variable that st substitutes before the command runs; write
-// a shell variable as plain `$NAME`.
+// Commands in gates run through `sh -c` with a minimal environment. Use absolute binary paths.
+// `${NAME}` is an st variable that st substitutes before the command runs; write a shell
+// variable as plain `$NAME`.
 //
 // Preview warns that the three workers are missing eligible agents. The preview looks only at
 // mission-level agents; `start-workers` declares these before any work step can become ready.
@@ -29,26 +34,13 @@ mission "example/fan-out" state="ready" timeout="4h" {
   goal "Split one invented refactor across three parallel workers and join their pushed branches."
   constraint "Each worker changes only its own area, commits in its own worktree, and pushes only its own branch."
 
-  step "worktrees" {
-    agentless
-    exec "add-worktrees" {
-      host "local"
-      workspace "${ST_WORKSPACE}"
-      command "/usr/bin/git -C repo fetch --quiet origin main && for area in parser cli docs; do /usr/bin/git -C repo worktree add --quiet -B fan-out/$area ../$area origin/main || exit 1; done"
-      restart "never"
-    }
-    gate "the three worktrees exist" {
-      field "exit_code" "exec/${ST_MISSION_RUN}/add-worktrees" is 0
-    }
-  }
-
   // Declaring the workers in a step starts them only after that step activates. This step
   // completes when each harness is ready.
   step "start-workers" {
     agentless
-    depends-on { step "worktrees" completed }
     agent "parser" {
       workspace "${ST_WORKSPACE}/parser"
+      checkout "${ST_WORKSPACE}/repo" base="origin/main" branch="fan-out/parser" remove-at-run-end=#true
       render { git-exclude ".st3/" }
       harness "omp" {
         model "openai-codex/gpt-6-astra"
@@ -57,6 +49,7 @@ mission "example/fan-out" state="ready" timeout="4h" {
     }
     agent "cli" {
       workspace "${ST_WORKSPACE}/cli"
+      checkout "${ST_WORKSPACE}/repo" base="origin/main" branch="fan-out/cli" remove-at-run-end=#true
       render { git-exclude ".st3/" }
       harness "omp" {
         model "openai-codex/gpt-6-astra"
@@ -65,6 +58,7 @@ mission "example/fan-out" state="ready" timeout="4h" {
     }
     agent "docs" {
       workspace "${ST_WORKSPACE}/docs"
+      checkout "${ST_WORKSPACE}/repo" base="origin/main" branch="fan-out/docs" remove-at-run-end=#true
       render { git-exclude ".st3/" }
       harness "omp" {
         model "openai-codex/gpt-6-astra"
@@ -111,28 +105,5 @@ mission "example/fan-out" state="ready" timeout="4h" {
     assigned-to "agent/example/worker"
     depends-on { step "branches-pushed" completed }
     goal "Merge fan-out/parser, fan-out/cli, and fan-out/docs into a new fan-out/joined branch, run the full test suite, and push fan-out/joined."
-  }
-
-  finally {
-    step "stop-workers" {
-      agentless
-      stop "agent/${ST_MISSION_RUN}/parser"
-      stop "agent/${ST_MISSION_RUN}/cli"
-      stop "agent/${ST_MISSION_RUN}/docs"
-    }
-
-    step "remove-worktrees" {
-      agentless
-      depends-on { step "stop-workers" completed }
-      exec "remove-worktrees" {
-        host "local"
-        workspace "${ST_WORKSPACE}"
-        command "for area in parser cli docs; do /usr/bin/git -C repo worktree remove --force ../$area 2>/dev/null; done; /usr/bin/git -C repo worktree prune"
-        restart "never"
-      }
-      gate "the worktrees are removed" {
-        field "exit_code" "exec/${ST_MISSION_RUN}/remove-worktrees" is 0
-      }
-    }
   }
 }

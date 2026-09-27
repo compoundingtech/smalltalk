@@ -276,8 +276,8 @@ Each run has a report in `evals/st3/cross-harness-message-wake/reports/`, named 
 
 ## What an operator should know
 
-- omp receives the same `[PING from st3] message/ID from SENDER: TITLE` envelope as Codex and
-  Claude. Without the hold, a message is steered into omp's running turn, and omp backgrounds every
+- omp receives the same `<smalltalk-message>` envelope as Codex; Claude receives the plain
+  `[PING from st3] message/ID from SENDER: TITLE` notice inside its channel tag. Without the hold, a message is steered into omp's running turn, and omp backgrounds every
   shell or eval call of the next tool batch and tells the model the command keeps running. Rarely,
   the model then repeats that command. With the hold on `agent/omp-steer-hold`, the message reaches
   omp as that batch returns, and no command is backgrounded unless it runs longer than 10 seconds.

@@ -37,7 +37,7 @@ This table records the purpose and the prompt boundary for every st eval.
 | `restart-continuity` | Keep. It proves work continuity after harness replacement. |
 | `run-generation-revision` | Keep. It proves compatible progress across a run revision. |
 | `seat-mission-work` | Keep. It proves a slash-qualified top-level seat with a real TUI claims and completes finite mission work. |
-| `seat-queue` | Keep. It proves one durable Claude seat follows a person's queue move, passes over a head run waiting on a gate, returns to it once ready, keeps held claims, and gets no terminal input. |
+| `seat-queue` | Keep. It proves one durable seat, Claude by default or Codex or omp through its runner, follows a queue move by an agent with queue authority, refuses the same move from the seat itself, passes over a head run waiting on a gate, returns to it once ready, keeps held claims, and gets no terminal input. |
 | `signal-rename` | Repair. Personas now contain product facts only and rely on the generated boot contract. |
 | `test-writing` | Keep. It proves a direct coding mission with held-out gates. |
 | `weird-git-setup` | Keep. It proves work in a nonstandard repository layout. |

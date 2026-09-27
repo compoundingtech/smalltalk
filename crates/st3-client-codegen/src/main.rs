@@ -432,6 +432,7 @@ fn validate_surfaces(
         }
     }
     for definition in [
+        "AttentionTargetState",
         "AgentQueue",
         "AgentQueueRun",
         "AgentQueueMove",

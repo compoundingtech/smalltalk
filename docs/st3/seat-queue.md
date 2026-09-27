@@ -23,6 +23,11 @@ Now each seat has one ordered queue of mission runs:
   creation order, then subject.
 - A move never releases, reassigns, or interrupts a held step. It only changes which run is next
   once the seat is free.
+- A revision does not take a held step's place either. A revision carries a claimed step into the
+  new generation as a ready step with a new subject, so the seat must claim it again. Until it
+  does, that step is the seat's next work, ahead of any earlier run's ready step, and the seat is
+  woken for it. If the seat releases the step after claiming it again, the step waits its turn in
+  queue order like any other.
 - `work claim` refuses a ready step assigned to the seat when an earlier run in the queue has a
   ready step for the seat. The error, `seat-queue-order`, names that next work. Claims inside one
   run, nested steps reached through their parent, and `available-to` work are not refused.
@@ -39,7 +44,7 @@ the reconciler's `next_work_wake_for_agent`. It is now used by:
 - `Store::agent_work_queues`, which feeds `NEXT WORK`, `QUEUED WORK`, and `UPCOMING` in
   `st agents show` and the `agents` client resource;
 - the reconciler's work wake and its retry deadline;
-- `Store::seat_queue`, which feeds `st agents queue`;
+- `Store::seat_queue`, which feeds `st agents queue` and its alias `st missions queued`;
 - the client work list when it is filtered to one agent, so `st work ls --as AGENT` lists ready
   work in the same order;
 - `work claim`, which refuses to let the seat take a later run's step first.
@@ -61,7 +66,9 @@ st agents queue move agent/fleet/example/worker mission-run/docs/2026-09-26 \
 ```
 
 `st agents queue AGENT` prints the held step, the next work, each queued run in order with its
-state (`claimed`, `ready`, or `waiting`), and the most recent moves, newest first:
+state (`claimed`, `ready`, or `waiting`), and the most recent moves, newest first. `st missions
+queued AGENT` runs the exact same show through the same code and prints the identical output,
+including `--json`; there is no `missions queued move`, only `agents queue move`.
 
 ```text
 AGENT QUEUE  agent/fleet/example/worker
@@ -100,8 +107,11 @@ seat has no authority over its own queue unless a rule names it. The daemon read
 the agent's current desired declaration when the move arrives, and refuses a move outside it with
 `queue-authority-denied`, or `missing-agent-queue-authority` when the agent has no declaration.
 An agent cannot grant itself the authority: a top-level agent declaration that an agent publishes
-is refused with `agent-authority-grant-denied` when it carries `queue-authority` or
-`mission-authority`.
+is refused with `agent-authority-grant-denied` when it carries `queue-authority`,
+`mission-authority`, or `seat-authority`. Agents may declare or stop a top-level seat only when a
+person grants `seat-authority { declare "NAMESPACE/*"; stop "NAMESPACE/*" }` in the agent's
+current declaration. A seat with authority cannot be re-declared by an agent, because that would
+remove its person's grant.
 The agent's move goes to `POST /v1/agent-queue-moves`, because client-v0 actions carry only
 person authority. That route also accepts a person. With `--json`, it prints the move claim.
 
@@ -144,6 +154,13 @@ is later, because the writer's clock ran ahead of the mover's, joins that run fi
 could only name a queued run. A move naming a run with no join, or an anchor that is not queued,
 is ignored.
 
+A revision that drops a seat's claim records the seat as `claimant` on the new step's
+`step-run.carried` claim. A ready step is first for that seat while no `work.claimed` claim on the
+step follows the carried claim. Each work read looks this up once for its ready steps, starting
+from those steps, so the cost follows current work rather than every carried step in history. On
+the performance fixture, all current work reads in 1.28 ms against 1.22 ms without the lookup,
+and one seat's work in 0.30 ms against 0.29 ms.
+
 The claims replicate like other agent claims, and the join times come from replicated run
 claims, so every replica computes the same order. Terminal runs are read only when a move names
 them. A run that never receives or anchors a move cannot change the relative order of the
@@ -165,6 +182,10 @@ others.
   - a claim from a later run fails with `seat-queue-order` and names the next work, and succeeds
     after a person moves that run to the top;
   - a claim passes over a head run that has no ready step;
+  - a revision of a later run whose step the seat holds, while an earlier run has ready work,
+    keeps the carried step first: it is the next work and the wake, the seat claims it again
+    without `seat-queue-order`, and the earlier run is next once it is done;
+  - a carried step the seat claims again and then releases waits its turn behind the earlier run;
   - history names who moved what, why, and when; a retried move is one record; and a replica
     rebuilds the same order and history;
   - moves must name queued runs and valid anchors.
@@ -215,12 +236,12 @@ others.
   agents in bounds and is not a security boundary against local processes. Removing a grant stops
   later moves and leaves earlier ones in place. Paired and typed clients have no agent path;
   client-v0 actions stay person-only.
-- **An agent can re-declare its own seat.** In one live eval run an omp seat ran
+- **An agent once re-declared its own seat.** In one live eval run an omp seat ran
   `st agents start` for its own identity, as itself. The daemon accepted the declaration, which
   replaced the eval's: it dropped the model and the audit environment and set `restart always`.
   Eval cleanup then no longer owned the seat and could not remove its terminal, so the run was
-  void although every judge passed. The declaration carried no authority, so the grant check above
-  does not apply. Who may publish a top-level agent declaration is outside this change.
+  void although every judge passed. The later `seat-authority` check refuses this unless a person
+  grants the agent permission to declare that seat.
 - **A reorder does not withdraw a wake that was already sent.** If the old head was woken and not
   yet claimed, the seat also receives a wake for the new head. Withdrawing the old wake would count
   as a closed attempt and could exhaust wakes when moves go back and forth.

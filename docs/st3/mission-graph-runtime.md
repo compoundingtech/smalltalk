@@ -266,11 +266,12 @@ step "STEP_ID" timeout="20m" revisions="human-only" revision-reviewer="person/re
   produces { PRODUCT... }
   produces-mission "generated-mission"
   uses-mission output-of="producer-step"
+  after-run "mission-run/RUN_ID"
   gate "NAME" { GATE_BODY }
 }
 ```
 
-`title`, `assigned-to`, `agentless`, `mission`, `retry`, `produces`, `produces-mission`, and `uses-mission` are single fields.
+`title`, `assigned-to`, `agentless`, `mission`, `retry`, `produces`, `produces-mission`, `uses-mission`, and `after-run` are single fields.
 
 A retry repeats one failed step attempt. It handles a bounded transient failure.
 
@@ -282,7 +283,7 @@ If a step produces a native harness driver, the step waits for a ready, working,
 
 A driver declared with `restart "never"` that exits, vanishes, or fails to start before readiness fails the step immediately. A restartable driver remains pending while its restart policy can still recover it. It fails when that policy raises an unrecoverable decision. Driver readiness is lifecycle state and does not consume the step's claimed-execution budget.
 
-Terminal ownership is recursive. When a root mission run becomes completed, failed, or cancelled, every nested run is terminalized and every nonterminal descendant step is cancelled. Repeating the terminal transition repairs any orphaned descendant left by an interrupted older daemon; once the tree is clean, the same operation is an explicit no-op. Current work queries and work actions also fence on the root owner, so stale readiness or replicated work claims cannot reopen a terminal tree. `work ls --all` retains the history with the exact owner run and non-actionable reason.
+Terminal ownership is recursive. When a root mission run becomes completed, failed, or cancelled, every nested run is terminalized and every nonterminal descendant step is cancelled. Repeating the terminal transition repairs any orphaned descendant left by an interrupted older daemon; once the tree is clean, the same operation is an explicit no-op. Current work queries and work actions also fence on the root owner, so stale readiness or replicated work claims cannot reopen a terminal tree. Only an explicit step retry or run revision reopens a failed run, and it does so in a new generation. `work ls --all` retains the history with the exact owner run and non-actionable reason.
 
 The daemon gives a running native harness 60 seconds to become ready. At the deadline, the daemon preserves the PTY and records `runtime.readiness-deadline-reached`. It requests attention from `person/operator` once. It does not restart the runtime or send input. A later ready observation from the same incarnation resolves that attention item as `daemon/runtime`.
 
@@ -465,11 +466,40 @@ Do not use source order or bullet syntax inside one string to create hidden exec
 
 ## Mission constraints
 
-A constraint states a rule that is specific to one mission or step.
+A constraint states a rule that is specific to one mission, step, or agent.
 
-A mission and a step can repeat `constraint`. An exact duplicate in one block is an error.
+A mission, a step, and an agent block inside a mission can repeat `constraint`. An exact duplicate in one block is an error.
 
-The effective order is each outer mission, its parent step, each nested mission, and the leaf step.
+A mission or step constraint binds every step inside it, whichever agent does the work. Write a rule for one agent in that agent's block:
+
+```kdl
+agent "builder" {
+  workspace "${ST_WORKSPACE}/build"
+  harness "claude" { model "claude-sonnet-5" }
+  constraint "Do not push the release branch."
+}
+
+step "build" {
+  assigned-to "agent/${ST_MISSION_RUN}/builder"
+}
+
+step "merge" {
+  assigned-to "agent/${ST_MISSION_RUN}/merger"
+  depends-on { step "build" completed }
+}
+```
+
+The builder's constraint binds `build` and not `merge`.
+
+An agent constraint applies to every step in the run whose selector names that agent: `assigned-to` the agent, or an `available-to` pool that includes it, because any agent in the pool can claim the step. It never applies to an agentless step.
+
+Name the agent by the subject its block declares, `agent/${ST_MISSION_RUN}/NAME`. Preview warns when no step selects an agent that has constraints.
+
+The effective order is each outer mission, its parent step, each nested mission, the leaf step, and then each selected agent. An agent constraint that repeats an earlier entry appears once.
+
+An agent constraint is a work rule, not runtime configuration. It is not part of the agent's runtime declaration. Changing it revises the steps that select the agent, as a step constraint does.
+
+A top-level agent seat has no mission steps, so it cannot declare a constraint. Publication fails with `agent-constraint-outside-mission`.
 
 st shows the effective list when an agent shows or claims work.
 
@@ -714,6 +744,20 @@ Graph predicate dependencies accept the same deterministic predicates as baselin
 
 Dependencies inside a nested mission refer to sibling steps in that nested mission.
 
+### Waiting for another run
+
+`after-run` makes a step wait for another mission run:
+
+```kdl
+step "wait-for-build" {
+  after-run "${input.build_run}"
+}
+```
+
+The step is agentless and cannot name an agent. It completes when the named run completes. It fails when that run fails or is cancelled. Other steps order after it with `depends-on`. The value is a run ID or `mission-run/` subject, and it can use inputs.
+
+To make one run wait without changing its mission, start it with `after`. See [Starting after another run](kdl-lifecycle.md#starting-after-another-run).
+
 ## Runtime sequence
 
 Each run starts with all steps in pending state.
@@ -742,6 +786,25 @@ Each attempt can submit or fail its work once. A failed gate can return the step
 `ST_ATTEMPT` contains the current step attempt. The step subject stays stable across all attempts.
 
 A retryable failure does not terminate the mission before the next attempt.
+
+A step has one attempt by default. st does not repeat a failure automatically: a failed attempt is
+usually an agent's judgment or a false gate, and a repeated attempt repeats its side effects. Declare
+`retry` on a step whose failure is known to be transient.
+
+A person, or an agent with `revise` authority for the mission, can retry one failed step:
+
+```sh
+st work retry STEP_RUN --as person/operator --reason "the deploy check host is back"
+```
+
+While its run is active, the step starts its next attempt in place. When that step is the only
+reason its root run failed, the retry reopens the run in a successor generation of the same
+revision. Completed normal work carries forward. The failed step starts its next attempt. Work that
+the failure cancelled and every final step start again. The old generation becomes superseded.
+
+A failed run does not reopen when several steps failed, when work was cancelled for a reason other
+than the failure, when a mission gate or the mission timeout failed it, when it is a nested or eval
+run, or when its mission deadline has passed. Revise the run instead to restart several failed steps.
 
 The `completion` frontier selects when st checks mission products and gates. st then enters the final phase when one exists.
 
@@ -829,6 +892,8 @@ The mission and step values are available for `${NAME}` KDL interpolation when t
 
 Loop KDL can also use `${loop.round}` and `${loop.feedback}`.
 
+Publication rejects an unknown `${NAME}`. Write `$${NAME}` for the literal text `${NAME}`, for example in a goal that quotes a shell variable. st removes the first `$`.
+
 `ST3_SUBJECT`, `ST_AGENT`, and `ST3_BIN` are runtime-only values because they depend on the materialized member.
 
 For example, use `${ST_MISSION_RUN}` directly. Do not write a manual mapping such as `env { MISSION_RUN "${ST_MISSION_RUN}" }` only to rename the built-in value.
@@ -857,13 +922,15 @@ st appends this exact text once to every agent launch:
 Read @.st3/boot.md completely. Then list, claim, do, and finish your current st work.
 ```
 
-The shared render transaction writes the canonical `.st3/boot.md` before a native harness starts.
+Each member’s render transaction writes the canonical `.st3/boot.md` before its native harness starts.
 
 The file explains graph work, Small Talk, wait behavior, and diagnostics. It does not contain a mission goal.
 
 An authored prompt can add stable harness context. It cannot replace or duplicate the boot contract.
 
-A tracked file at `.st3/boot.md` causes the complete render transaction to fail before any runtime starts.
+A tracked `.st3/boot.md` with different bytes fails that member’s render transaction and prevents its runtime from starting. Other members continue rendering and reconciling. Render, start, observation, and stop failures appear as the member’s fault in `st agents show` and `st doctor`; a successful pass clears the fault. Stopped and superseded members bypass rendering.
+
+Repeated `git-exclude` operations build on one another. Seats in worktrees sharing a repository’s exclude file contribute their paths to one combined update. Conflicting ordinary file owners are still rejected, without blocking unrelated members.
 
 ## Workspace existence
 
@@ -877,13 +944,47 @@ workspace "${ST_WORKSPACE}/generated" create=#true
 
 The default refusal prevents a spelling error from creating an unintended directory.
 
+An agent can declare a Git checkout instead. st then creates the agent's workspace as a worktree of an existing repository before the agent starts:
+
+```kdl
+agent "parser" {
+  workspace "${ST_WORKSPACE}/parser"
+  checkout "${ST_WORKSPACE}/repo" base="origin/main" branch="fan-out/parser" remove-at-run-end=#true
+  render { git-exclude ".st3/" }
+  harness "omp" {}
+}
+```
+
+- The repository and the workspace must be absolute paths after variable substitution.
+- When `base` names a remote branch, such as `origin/main`, st fetches it first. When the fetch fails, st uses the repository's current ref and records a `checkout-fetch-failed` warning.
+- A new `branch` starts at `base` without upstream tracking. A branch that already exists is checked out as it is.
+- A workspace that already exists is used as it is.
+- When the checkout fails, the agent does not start. st records a `workspace-unavailable` diagnostic and retries after 30 seconds.
+- With `remove-at-run-end=#true`, st removes the worktree after the agent's run ends and its runtime stops. The branch stays in the repository.
+- st keeps a worktree that has uncommitted or untracked changes, and records a `checkout-kept` warning. It also keeps a worktree whose workspace a current member still uses.
+- `render { git-exclude ".st3/" }` keeps the files st writes for each harness out of Git, so a finished worktree is clean.
+
+[`fan-out.kdl`](../../examples/st3/fan-out.kdl) gives three parallel workers one checkout each.
+
 ## Native message delivery and work wake
 
 Maintained harnesses receive graph messages through their native driver boundary. Codex uses typed
 app-server turn requests. Claude uses one persistent stream-JSON process and acknowledges the
 exact replayed user turn. Pi and OMP acknowledge through their loaded native extensions and
-steer a message into a running turn at its next tool boundary. Every harness receives the same
-`[PING from st3] message/ID from SENDER: TITLE` envelope. OpenCode
+steer a message into a running turn at its next tool boundary. Codex, OpenCode, Pi, and OMP
+receive one `<smalltalk-message>` element per message:
+
+```text
+<smalltalk-message id="ID" from="SENDER" to="RECIPIENT" subject="TITLE" sha256="BODY-SHA256" graph="message/ID">
+bounded one-line body preview
+</smalltalk-message>
+```
+
+`sha256` is the lowercase hex SHA-256 of the complete message body in the graph, and
+`st conversations read message/ID` shows that body. Every attribute value and the preview are
+XML-escaped, so sender text cannot close the element or add an attribute. A truncated preview ends
+with `…`, and a note after the closing tag says so. Claude receives the plain
+`[PING from st3] message/ID from SENDER: TITLE` notice and preview inside its own channel tag. OpenCode
 acknowledges the assistant turn whose `parentID` is the exact stable user-message ID. Copying a
 message into an inbox or successfully writing transport bytes is not delivery. st advances the
 graph only from the durable provider receipt and never injects text or Enter into a terminal
@@ -929,9 +1030,10 @@ st agents queue move agent/fleet/example/worker mission-run/docs/2026-09-26 \
 ```
 
 `st agents queue AGENT` shows the step the seat holds now, its next work, and then each queued
-run in order with its state: `claimed`, `ready`, or `waiting`. A move places one run at the top,
-at the bottom, or directly before or after another queued run. It needs explicit person
-authority, like other client mutations.
+run in order with its state: `claimed`, `ready`, or `waiting`. `st missions queued AGENT` is the
+same show command reached from the `missions` group. A move places one run at the top, at the
+bottom, or directly before or after another queued run. It needs explicit person authority, like
+other client mutations.
 
 Each move writes one `agent.queue.moved` claim on the agent subject with the run, the placement,
 the optional anchor run, the optional reason, the actor, and the graph time. Replicas rebuild the
@@ -948,6 +1050,10 @@ An operator can request another delivery through the same driver path with:
 ```sh
 st work wake STEP --as person/operator --reason "retry native delivery"
 ```
+
+The assignee may also wake its own step. Another agent needs `queue-authority` for the assignee's
+seat. Manual wakes are recorded in the inbox but do not consume the three automatic retry
+attempts shown by `st work show`.
 
 Generic terminal programs without a maintained native driver do not have an automatic wake path.
 
@@ -1149,7 +1255,7 @@ Revision authority comes from agent placement in the current generation.
 - A direct agent in a mission can revise the complete mission.
 - A direct agent adjacent to missions can revise those missions.
 
-The run requester can propose any revision. A work selector does not grant revision authority.
+The run requester and any person can propose any revision. A work selector does not grant revision authority.
 
 An agent also needs explicit mission operation authority in its current desired declaration:
 
@@ -1199,6 +1305,12 @@ st work revision cancel PROPOSAL --as person/reviewer --reason "The request chan
 
 A run can have one pending proposal. A second proposal fails until the first proposal is applied or cancelled.
 
+A failed root run can be revised when its failed steps are the only reason it failed. It has no
+active work to drain, so an unreviewed revision cuts over immediately and an approved proposal cuts
+over on its final approval. The successor generation reopens the run: compatible completed normal
+work carries forward, each unchanged failed step starts its next attempt, and changed, cancelled,
+and final work starts again.
+
 ### Deferred declarative revision intent
 
 A future KDL operation can propose a produced mission revision against one live mission run.
@@ -1228,11 +1340,21 @@ st work revision generation RUN_GENERATION
 
 st compares normalized step definition hashes. A changed step and every transitive dependent start without prior completion.
 
-Every compatible state carries to the successor. Compatible claimed, working, or verifying work restarts in ready state.
+Every compatible state carries to the successor. Compatible claimed, working, or blocked work keeps its
+worker lease, so the worker continues without claiming again. Compatible verifying work that its
+worker has not submitted restarts in ready state.
 
-The old generation remains readable. A late work action against it fails with `stale-run-generation`.
+The old generation remains readable. A late work action against it fails with `stale-run-generation`,
+except that the holder of a carried lease reaches the successor step through the old subject.
 
 Mission and step members record their owner run and generation. The reconciler stops members left only in the superseded generation lineage.
+It first re-owns each member that the successor still declares, so a revision does not restart a
+member it keeps.
+
+Observers, subscriptions, and schedules that the successor no longer declares become stopped
+declarations at cutover, as they do at run cleanup. Until then they observe, deliver, and start
+nothing. A stopped subscription cancels each request it recorded but never started. Runs it already
+started continue.
 
 A compatible member keeps the same run-local subject in the successor. A mission revision cannot move it to another mission run.
 
@@ -1273,9 +1395,13 @@ An authorized agent uses `st work publish-mission`, fenced to its claimed produc
 
 `st missions start MISSION --as ACTOR` publishes one mission-run declaration for the current ready revision. Add `--follow` to follow the run until it becomes terminal.
 
+`missions publish` prints each revision it created. Pass that value to `missions start --revision REVISION` to start exactly that revision. A mission published on another host reaches this host by replication. When the mission or the requested revision is not here yet, `start` waits up to 60 seconds with a plain message instead of failing. When a later revision already replaced the requested one, `start` names the replacement and stops. After a run starts, `start` names its revision on standard error and says whether other revisions share the mission name.
+
 `st missions show MISSION_RUN` reads one exact run. `st missions show MISSION` works only when that mission has exactly one nonterminal run.
 
 The default mission view shows the complete run summary and its active graph branch. Add `--follow` to watch an existing run.
+
+Each step shows one line from its worker: the `work complete` summary once submitted, otherwise the latest `work progress` summary. Both come from the current attempt, and `--json` carries them as `completion_summary`, `progress_summary`, and `progress_at_unix_ms`. `st agents show` prints each current step with its latest progress summary and age.
 
 Follow mode redraws one screen on a terminal. It appends each changed snapshot when another program reads the output.
 

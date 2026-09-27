@@ -30,6 +30,7 @@ order from the same admitted claims.
 | `mission_runs` | Projection | `mission-run.*` claims |
 | `run_generations` | Projection | `run-generation.*` claims |
 | `step_runs` | Projection | `step-run.*` and `work.*` claims |
+| `local_work_lease_renewals` | Local operational fact | Recent quiet lease renewals; replayed over replicated claim projections and bounded by periodic `work.renewed` anchors |
 | `revision_proposals` | Projection | `revision-proposal.*` claims |
 | `planning_sessions` | Projection | `planning-session.*` claims |
 | `planning_candidates` | Projection | `planning-session.candidate-submitted` claims |

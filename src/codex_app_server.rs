@@ -111,6 +111,8 @@ const CONTROL_POLL: Duration = Duration::from_millis(100);
 const TRANSCRIPT_TURN_RECOVERY_INTERVAL: Duration = Duration::from_secs(1);
 const TRANSCRIPT_CONTEXT_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 const SNAPSHOT_REQUEST_TIMEOUT: Duration = Duration::from_secs(1);
+const DELIVERY_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const REJECTED_DELIVERY_BACKOFF: Duration = Duration::from_secs(5);
 const SNAPSHOT_REQUEST_ATTEMPTS: u8 = 3;
 const TRANSCRIPT_TURN_RECOVERY_BYTES: u64 = 2 * 1024 * 1024;
 const TRANSCRIPT_DISCOVERY_FILE_LIMIT: usize = 10_000;
@@ -562,6 +564,7 @@ struct PendingCodexDelivery {
     request_id: u64,
     filename: String,
     method: CodexDeliveryMethod,
+    requested_at: Instant,
 }
 
 #[derive(Debug, Clone)]
@@ -602,6 +605,7 @@ use self::context::*;
 struct RejectedCodexDelivery {
     filename: String,
     observed: CodexObservedState,
+    rejected_at: Instant,
 }
 
 struct CodexInboxDelivery {
@@ -999,6 +1003,13 @@ impl CodexInboxDelivery {
 
     fn maybe_request(&mut self, state: &CodexControlState) -> Result<Option<Value>> {
         self.refresh_if_due()?;
+        if self
+            .pending
+            .as_ref()
+            .is_some_and(|pending| pending.requested_at.elapsed() >= DELIVERY_REQUEST_TIMEOUT)
+        {
+            anyhow::bail!("Codex delivery request received no response within 30 seconds");
+        }
         if self.pending.is_some()
             || self.pending_snapshot.is_some()
             || !state.subscribed
@@ -1041,7 +1052,9 @@ impl CodexInboxDelivery {
             return Ok(None);
         }
         if self.rejected.as_ref().is_some_and(|rejected| {
-            rejected.filename == head.filename && rejected.observed == state.observed
+            rejected.filename == head.filename
+                && rejected.observed == state.observed
+                && rejected.rejected_at.elapsed() < REJECTED_DELIVERY_BACKOFF
         }) {
             return Ok(None);
         }
@@ -1102,6 +1115,7 @@ impl CodexInboxDelivery {
             request_id,
             filename,
             method,
+            requested_at: Instant::now(),
         });
         self.snapshot_attempts = 0;
         self.verified_snapshot = None;
@@ -1302,6 +1316,7 @@ impl CodexInboxDelivery {
             self.rejected = Some(RejectedCodexDelivery {
                 filename: pending.filename,
                 observed: observed.clone(),
+                rejected_at: Instant::now(),
             });
             return Ok(true);
         }
@@ -2133,14 +2148,7 @@ pub fn run_controlled(
     runtime_id: String,
     codex_argv: Vec<String>,
 ) -> Result<()> {
-    run_controlled_with_required_resume(
-        catalog_root,
-        identity,
-        runtime_id,
-        codex_argv,
-        None,
-        None,
-    )
+    run_controlled_with_required_resume(catalog_root, identity, runtime_id, codex_argv, None, None)
 }
 
 /// Run one host-owned cold-residency attempt under its exact incarnation.
@@ -2152,7 +2160,6 @@ pub fn run_controlled_residency_attempt(
     resume_generation: crate::residency::Generation,
     required_incarnation: String,
 ) -> Result<()> {
-
     anyhow::ensure!(
         !required_incarnation.is_empty(),
         "Codex required runtime incarnation is empty"
@@ -2224,6 +2231,7 @@ fn run_controlled_with_required_resume(
         delivery,
         resume_thread,
         required_incarnation,
+        true,
         &mut diagnostics,
     );
     match result {
@@ -2283,8 +2291,12 @@ pub fn run_controlled_paths(
     let _owner_lock = acquire_owner_lock(state_dir)?;
     let mut diagnostics = WrapperDiagnostics::open(state_dir, &identity, &runtime_id)?;
     diagnostics.record("ownerAcquired", json!({ "mode": "explicit-paths" }))?;
-    let resume_thread =
-        select_resume_thread(&state_dir.join("binding.json"), &identity, &runtime_id, false)?;
+    let resume_thread = select_resume_thread(
+        &state_dir.join("binding.json"),
+        &identity,
+        &runtime_id,
+        false,
+    )?;
     let result = run_controlled_owned(
         driver_root,
         state_dir,
@@ -2294,6 +2306,7 @@ pub fn run_controlled_paths(
         delivery,
         resume_thread,
         None,
+        false,
         &mut diagnostics,
     );
     match result {
@@ -2318,6 +2331,7 @@ fn run_controlled_owned(
     delivery: CodexDeliveryConfig,
     resume_thread: Option<String>,
     required_incarnation: Option<String>,
+    allow_safe_fallback: bool,
     diagnostics: &mut WrapperDiagnostics,
 ) -> Result<()> {
     let socket_path = socket_path(catalog_root, &identity)?;
@@ -2330,6 +2344,7 @@ fn run_controlled_owned(
     let endpoint = format!("unix://{}", socket_path.display());
     let prepared =
         prepare_controlled_launch_args(&endpoint, &codex_argv[1..], resume_thread.as_deref());
+    strict_launch_preflight(&prepared, allow_safe_fallback)?;
     let safe_fallback_active = Arc::new(AtomicBool::new(false));
     if prepared.safe_fallback {
         record_safe_fallback(
@@ -2398,10 +2413,12 @@ fn run_controlled_owned(
                 safe_fallback_active.clone(),
                 prepared.declared_options.clone(),
                 delivery.clone(),
+                allow_safe_fallback,
                 diagnostics,
             )
         });
-    if !prepared.safe_fallback
+    if allow_safe_fallback
+        && !prepared.safe_fallback
         && result.as_ref().is_err_and(|error| {
             error
                 .downcast_ref::<AppServerExitedBeforeControl>()
@@ -2442,6 +2459,7 @@ fn run_controlled_owned(
                     safe_fallback_active.clone(),
                     prepared.declared_options.clone(),
                     delivery,
+                    allow_safe_fallback,
                     diagnostics,
                 )
             });
@@ -2538,6 +2556,7 @@ fn run_connected(
     safe_fallback_active: Arc<AtomicBool>,
     declared_options: Vec<String>,
     delivery: CodexDeliveryConfig,
+    allow_safe_fallback: bool,
     diagnostics: &mut WrapperDiagnostics,
 ) -> Result<()> {
     // The stop handler is installed by the launch entry point before any spawn (the preflight's
@@ -2696,7 +2715,8 @@ fn run_connected(
                     return Ok(TuiEnd::Stopped(tui.try_wait().ok().flatten()));
                 }
                 BindingWait::TuiExited(status)
-                    if claim_safe_fallback_attempt(&mut fallback_attempted) =>
+                    if allow_safe_fallback
+                        && claim_safe_fallback_attempt(&mut fallback_attempted) =>
                 {
                     record_safe_fallback(
                         diagnostics,
@@ -2714,9 +2734,7 @@ fn run_connected(
                     })?;
                 }
                 BindingWait::TuiExited(status) => {
-                    anyhow::bail!(
-                        "controlled Codex TUI exited before thread binding after known-safe fallback: {status}"
-                    );
+                    anyhow::bail!("controlled Codex TUI exited before thread binding: {status}");
                 }
             }
         }
@@ -2888,6 +2906,18 @@ fn prepare_controlled_launch_args(
             safe_fallback: true,
         },
     }
+}
+
+fn strict_launch_preflight(
+    prepared: &PreparedControlledLaunch,
+    allow_safe_fallback: bool,
+) -> Result<()> {
+    anyhow::ensure!(
+        allow_safe_fallback || !prepared.safe_fallback,
+        "declared Codex options were rejected before launch: {}",
+        prepared.declared_options.join(", ")
+    );
+    Ok(())
 }
 
 fn automatic_resume_permission_overrides(

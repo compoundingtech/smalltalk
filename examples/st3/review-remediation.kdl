@@ -7,6 +7,10 @@ version 2
 // finding a defect failed the review step, the remediation step that depends on it could never
 // run. Only the final `release-review` decides whether the result is acceptable.
 //
+// The reviewer's constraint is written in its agent block, so it binds both review steps and not
+// the remediation step, whose worker must change files. A mission-level constraint would bind
+// every step.
+//
 //   st agents apply examples/st3/seats/omp.kdl --as person/operator
 //   st missions publish examples/st3/review-remediation.kdl --as person/operator
 //   st missions start example/review-remediation --id example/review-remediation/1 \
@@ -21,12 +25,12 @@ mission "example/review-remediation" state="ready" {
       model "gpt-6-sol"
       effort "high"
     }
+    constraint "Do not change repository files."
   }
 
   step "report-only-review" timeout="1h" {
     assigned-to "agent/${ST_MISSION_RUN}/reviewer"
     goal "Review the payments module on main. Store the findings with `st documents put` and complete this step with the stored document reference, even when findings exist."
-    constraint "Do not change repository files."
   }
 
   step "remediate-findings" timeout="2h" {
