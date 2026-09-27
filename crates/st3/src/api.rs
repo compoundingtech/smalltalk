@@ -1656,6 +1656,7 @@ fn client_attention_resources(
         .iter()
         .map(|item| item.subject.as_str())
         .collect::<std::collections::BTreeSet<_>>();
+    let mut retired_seats = None;
     let mut resources = BTreeMap::new();
     for item in &current {
         let id = attention_resource_id(&item.subject);
@@ -1691,6 +1692,9 @@ fn client_attention_resources(
         let object = resource
             .as_object_mut()
             .expect("an attention resource is an object");
+        if item.kind == "fault" && attention_requester_retired(store, item, &mut retired_seats)? {
+            object["operational"]["reasons"] = json!(["requester-retired"]);
+        }
         if let Some(mission) = &item.mission {
             object.insert("mission_id".into(), Value::String(mission.clone()));
         }
@@ -1760,6 +1764,30 @@ fn client_attention_resources(
             .then_with(|| left["id"].as_str().cmp(&right["id"].as_str()))
     });
     Ok(resources)
+}
+
+/// A fault whose requesting seat was stopped, or whose owning run or generation ended, has no
+/// one left to withdraw it. Only its reviewer can close it now.
+fn attention_requester_retired(
+    store: &Store,
+    item: &crate::model::AttentionItemView,
+    retired_seats: &mut Option<std::collections::BTreeSet<String>>,
+) -> anyhow::Result<bool> {
+    let Some(request) = store.attention_request(&item.subject)? else {
+        return Ok(false);
+    };
+    if !request.actor.starts_with("agent/") {
+        return Ok(false);
+    }
+    if store.selected_desired_kind(&request.actor)?.as_deref() == Some("stop") {
+        return Ok(true);
+    }
+    if retired_seats.is_none() {
+        *retired_seats = Some(store.terminal_owned_runtime_subjects()?);
+    }
+    Ok(retired_seats
+        .as_ref()
+        .is_some_and(|seats| seats.contains(&request.actor)))
 }
 
 fn client_message_resources(
@@ -12849,6 +12877,112 @@ version 2
         assert_eq!(resolved["status"], "resolved");
         let (_, empty) = get_request(app, "/v1/attention?person=nathan").await;
         assert_eq!(empty, json!([]));
+    }
+
+    #[test]
+    fn a_fault_from_a_retired_requester_seat_is_labelled() {
+        let store = Store::open_memory("node").unwrap();
+        let apply = |intent: &crate::model::NormalizedIntent, key: &str| {
+            let planned = store
+                .mission(
+                    intent,
+                    crate::model::IntentInput {
+                        kdl: key.into(),
+                        source_name: None,
+                    },
+                )
+                .unwrap();
+            store.apply(intent, &planned.subject_tokens, key).unwrap();
+        };
+        let parse = |source: &str| crate::graph::parse_intent(source, "node").unwrap();
+        apply(
+            &parse(
+                r#"version 2
+agent "stopped" { workspace "/tmp"; command "true" }
+agent "live" { workspace "/tmp"; command "true" }
+mission "standing" state="ready" {
+  goal "Keep a seat."
+  step "hold" { agentless }
+}
+"#,
+            ),
+            "requesters",
+        );
+        let run = store
+            .create_mission_run(&crate::model::MissionRunRequest {
+                mission: "standing".into(),
+                revision: None,
+                workspace: "/tmp".into(),
+                requester: Some("person/nathan".into()),
+                mode: Some("run".into()),
+                inputs: BTreeMap::new(),
+                idempotency_key: "standing-run".into(),
+            })
+            .unwrap();
+        // The run owns this seat, as a standing mission owns its agents.
+        let mut owned = parse(
+            r#"version 2
+agent "seat" { workspace "/tmp"; command "true" }
+"#,
+        );
+        let desired = owned.subjects.get_mut("agent/node.seat").unwrap();
+        desired.owner_run = Some(run.subject.clone());
+        desired.owner_generation = Some(run.generation.clone());
+        apply(&owned, "owned-seat");
+        let seat = "agent/node.seat".to_owned();
+        for (subject, actor) in [
+            ("attention/from-stopped", "agent/node.stopped"),
+            ("attention/from-live", "agent/node.live"),
+            ("attention/from-seat", seat.as_str()),
+        ] {
+            store
+                .request_attention(
+                    subject,
+                    &AttentionRequest {
+                        reviewer: "person/nathan".into(),
+                        title: format!("Fault from {actor}"),
+                        reason: "a person must decide".into(),
+                        severity: "warning".into(),
+                        targets: Vec::new(),
+                        actor: actor.into(),
+                        idempotency_key: format!("{subject}:requested"),
+                    },
+                )
+                .unwrap();
+        }
+        let reasons = |store: &Store| {
+            client_attention_resources(store, Some("person/nathan"), false)
+                .unwrap()
+                .into_iter()
+                .map(|resource| {
+                    (
+                        resource["source_id"].as_str().unwrap().to_owned(),
+                        resource["operational"]["reasons"].clone(),
+                    )
+                })
+                .collect::<BTreeMap<_, _>>()
+        };
+        assert!(
+            reasons(&store)
+                .values()
+                .all(|reasons| reasons == &json!([]))
+        );
+
+        apply(
+            &parse("version 2\nstop \"agent/node.stopped\"\n"),
+            "stop-requester",
+        );
+        store
+            .set_mission_run_state(&run.id, "cancelled", "terminal", Some("moved to a seat"))
+            .unwrap();
+
+        let reasons = reasons(&store);
+        assert_eq!(
+            reasons["attention/from-stopped"],
+            json!(["requester-retired"])
+        );
+        assert_eq!(reasons["attention/from-seat"], json!(["requester-retired"]));
+        assert_eq!(reasons["attention/from-live"], json!([]));
     }
 
     #[tokio::test]
