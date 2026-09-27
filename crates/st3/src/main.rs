@@ -7451,6 +7451,11 @@ async fn run_pi_channel(client: &Client, subject: &str, driver: &str) -> Result<
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut delivered = BTreeSet::new();
+    let mut pending_acks = BTreeSet::new();
+    let mut failed_handoffs = BTreeMap::<String, u32>::new();
+    let mut failed_diagnostics = BTreeSet::new();
+    let mut first_idle_seen = false;
+    let mut last_warning = None;
     let mut work_interval = tokio::time::interval(std::time::Duration::from_secs(1));
     work_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut renewed_minute = None;
@@ -7466,11 +7471,11 @@ async fn run_pi_channel(client: &Client, subject: &str, driver: &str) -> Result<
                         let Some(state) = frame.get("state").and_then(Value::as_str) else { continue; };
                         let status = match state {
                             "active" => "working",
-                            "idle" => "idle",
+                            "idle" => { first_idle_seen = true; "idle" },
                             _ => continue,
                         };
                         frame_sequence = frame_sequence.saturating_add(1);
-                        let _: ClaimRecord = client.post("/v1/claims", &ClaimInput {
+                        let result: Result<ClaimRecord> = client.post("/v1/claims", &ClaimInput {
                             subject: subject.into(),
                             kind: "harness.observed".into(),
                             actor: Some(subject.into()),
@@ -7483,39 +7488,95 @@ async fn run_pi_channel(client: &Client, subject: &str, driver: &str) -> Result<
                             evidence: Vec::new(),
                             expected_subject: None,
                             idempotency_key: Some(format!("pi-state:{subject}:{incarnation}:{session}:{frame_sequence}")),
-                        }).await?;
+                        }).await;
+                        if let Err(error) = result {
+                            warn_pi_channel(subject, &error, &mut last_warning);
+                        }
                     }
                     Some("delivered") => {
                         let Some(message) = frame.pointer("/meta/messageId").and_then(Value::as_str) else { continue; };
-                        acknowledge_pi_family_delivery(client, subject, message).await?;
+                        pending_acks.insert(message.to_owned());
+                        if let Err(error) = acknowledge_pi_family_delivery(client, subject, message).await {
+                            warn_pi_channel(subject, &error, &mut last_warning);
+                        } else {
+                            pending_acks.remove(message);
+                        }
+                    }
+                    Some("failed") => {
+                        let Some(message) = frame.pointer("/meta/messageId").and_then(Value::as_str) else { continue; };
+                        let failures = failed_handoffs.entry(message.to_owned()).or_default();
+                        *failures += 1;
+                        if *failures < 3 {
+                            delivered.remove(message);
+                        } else {
+                            failed_diagnostics.insert(message.to_owned());
+                        }
                     }
                     _ => {}
                 }
             }
             _ = interval.tick() => {
+                for message in failed_diagnostics.clone() {
+                    let result: Result<ClaimRecord> = client.post("/v1/claims", &ClaimInput {
+                        subject: subject.into(),
+                        kind: "harness.diagnostic".into(),
+                        actor: Some(subject.into()),
+                        fields: BTreeMap::from([
+                            ("severity".into(), Value::String("error".into())),
+                            ("status".into(), Value::String("failed".into())),
+                            ("code".into(), Value::String("pi-handoff-failed".into())),
+                            ("reason".into(), Value::String(format!("the {driver} channel could not hand off {message} after three attempts"))),
+                            ("incarnation_id".into(), Value::String(incarnation.clone())),
+                        ]),
+                        evidence: Vec::new(),
+                        expected_subject: None,
+                        idempotency_key: Some(format!("pi-handoff-failed:{subject}:{incarnation}:{message}")),
+                    }).await;
+                    match result {
+                        Ok(_) => { failed_diagnostics.remove(&message); },
+                        Err(error) => warn_pi_channel(subject, &error, &mut last_warning),
+                    }
+                }
+                for message in pending_acks.clone() {
+                    match acknowledge_pi_family_delivery(client, subject, &message).await {
+                        Ok(()) => { pending_acks.remove(&message); }
+                        Err(error) => warn_pi_channel(subject, &error, &mut last_warning),
+                    }
+                }
+                if !first_idle_seen { continue; }
                 let mut cursor = None;
                 loop {
-                    let page = message_page(client, Some(subject), false, cursor.as_deref()).await?;
+                    let page = match message_page(client, Some(subject), false, cursor.as_deref()).await {
+                        Ok(page) => page,
+                        Err(error) => { warn_pi_channel(subject, &error, &mut last_warning); break; }
+                    };
                     for message in page.items.into_iter().filter(|message| matches!(message.status.as_str(), "sent" | "staged")) {
                     if !delivered.insert(message.subject.clone()) {
                         continue;
                     }
-                    let body = message_content(client, &message).await?;
+                    let body = match message_content(client, &message).await {
+                        Ok(body) => body,
+                        Err(error) => {
+                            delivered.remove(&message.subject);
+                            warn_pi_channel(subject, &error, &mut last_warning);
+                            continue;
+                        }
+                    };
+                    if message.status == "sent" {
+                        match stage_pi_family_message(client, &message.subject, subject, driver).await {
+                            Ok(true) => {},
+                            Ok(false) => { delivered.remove(&message.subject); continue; },
+                            Err(error) => {
+                                delivered.remove(&message.subject);
+                                warn_pi_channel(subject, &error, &mut last_warning);
+                                continue;
+                            }
+                        }
+                    }
                     let frame = pi_family_message_frame(&message, &body, identity);
                     stdout.write_all(serde_json::to_string(&frame)?.as_bytes()).await?;
                     stdout.write_all(b"\n").await?;
                     stdout.flush().await?;
-                    if message.status == "sent" {
-                        stage_message(
-                            client,
-                            &message.subject,
-                            subject,
-                            &format!("{driver}-channel"),
-                            None,
-                            format!("native-staged:{driver}-channel:{subject}:{}", message.subject),
-                        )
-                        .await?;
-                    }
                     }
                     match page.next_cursor {
                         Some(next) => cursor = Some(next),
@@ -7526,11 +7587,52 @@ async fn run_pi_channel(client: &Client, subject: &str, driver: &str) -> Result<
             _ = work_interval.tick() => {
                 let minute = unix_minute()?;
                 if renewed_minute != Some(minute) {
-                    renew_claimed_work(client, subject, minute).await?;
-                    renewed_minute = Some(minute);
+                    match renew_claimed_work(client, subject, minute).await {
+                        Ok(()) => renewed_minute = Some(minute),
+                        Err(error) => warn_pi_channel(subject, &error, &mut last_warning),
+                    }
                 }
             }
         }
+    }
+}
+
+fn warn_pi_channel(
+    subject: &str,
+    error: &anyhow::Error,
+    last_warning: &mut Option<std::time::Instant>,
+) {
+    let now = std::time::Instant::now();
+    if last_warning.is_none_or(|last| now.duration_since(last) >= Duration::from_secs(10)) {
+        eprintln!("warning: `{subject}` pi-family channel request failed; retrying: {error:#}");
+        *last_warning = Some(now);
+    }
+}
+
+async fn stage_pi_family_message(
+    client: &Client,
+    message: &str,
+    subject: &str,
+    driver: &str,
+) -> Result<bool> {
+    match stage_message(
+        client,
+        message,
+        subject,
+        &format!("{driver}-channel"),
+        None,
+        format!("native-staged:{driver}-channel:{subject}:{message}"),
+    )
+    .await
+    {
+        Ok(_) => Ok(true),
+        Err(error) => match read_message(client, message).await {
+            Ok(view) if view.status == "staged" => Ok(true),
+            Ok(view) if matches!(view.status.as_str(), "delivered" | "read" | "closed") => {
+                Ok(false)
+            }
+            _ => Err(error),
+        },
     }
 }
 
@@ -8747,6 +8849,22 @@ mod tests {
         }
         assert!(socket.exists(), "the test API socket did not start");
         let client = Client::unix(&socket);
+
+        // The channel can lose a race to the recipient's CLI read without ending its loop.
+        assert!(
+            !stage_pi_family_message(&client, "message/held", seat, "omp")
+                .await
+                .unwrap()
+        );
+        assert!(
+            stage_pi_family_message(&client, "message/pending", seat, "omp")
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            store.message("message/pending").unwrap().unwrap().status,
+            "staged"
+        );
 
         // The late acknowledgement itself is still an invalid transition...
         assert!(
