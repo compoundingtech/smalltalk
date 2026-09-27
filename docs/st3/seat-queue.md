@@ -44,8 +44,11 @@ the reconciler's `next_work_wake_for_agent`. It is now used by:
   work in the same order;
 - `work claim`, which refuses to let the seat take a later run's step first.
 
-The existing nested-step rule is unchanged. A nested step whose listed parent step has the same
-selector is reached through the parent and is not selected separately.
+A nested step whose listed parent step has the same selector is reached through the parent and is
+not selected separately. The exception is a parent that the seat submitted while that nested step
+was still ready. That parent no longer holds the seat, and the nested step is selected as its own
+run's ready work, in queue order. `work claim` then refuses it while an earlier run has ready work
+for the seat, like any other step of its run.
 
 ## Commands
 

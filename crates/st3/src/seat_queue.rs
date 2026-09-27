@@ -373,4 +373,48 @@ mod tests {
             ["step-run/one/build", "step-run/one/builder"]
         );
     }
+
+    #[test]
+    fn a_submitted_parent_frees_the_seat_and_its_nested_step_keeps_queue_order() {
+        let none = Vec::new();
+        let step =
+            |subject: &'static str, run: &'static str, path: &'static str, status| SeatStep {
+                subject,
+                run,
+                step: path,
+                status,
+                assignee: Some("agent/worker"),
+                claimant: None,
+                available_to: &none,
+                created_at_unix_ms: 1,
+            };
+        let order = ["mission-run/one".to_owned(), "mission-run/two".to_owned()];
+        let mut steps = [
+            step("step-run/one/build", "mission-run/one", "build", "ready"),
+            step("step-run/two/fix", "mission-run/two", "fix", "verifying"),
+            step(
+                "step-run/two/fix/check",
+                "mission-run/two",
+                "fix/check",
+                "ready",
+            ),
+        ];
+        let selection = select("agent/worker", &steps, &order);
+        assert!(selection.held.is_empty());
+        assert_eq!(
+            selection.ready,
+            ["step-run/one/build", "step-run/two/fix/check"],
+            "the nested step is selected as its own run's ready work"
+        );
+        assert_eq!(selection.wake(), Some("step-run/one/build"));
+
+        steps[2].status = "completed";
+        let selection = select("agent/worker", &steps, &order);
+        assert_eq!(
+            selection.held,
+            ["step-run/two/fix"],
+            "a submitted parent with no ready nested step still holds the seat"
+        );
+        assert_eq!(selection.wake(), None);
+    }
 }
