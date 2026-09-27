@@ -9195,6 +9195,23 @@ mod tests {
     }
 
     #[test]
+    fn provider_capacity_backoff_is_bounded_deterministic_and_increases() {
+        let first = provider_capacity_backoff_ms("agent/node.worker", "one", 1);
+        let second = provider_capacity_backoff_ms("agent/node.worker", "one", 2);
+        assert_eq!(
+            first,
+            provider_capacity_backoff_ms("agent/node.worker", "one", 1)
+        );
+        assert!(first >= PROVIDER_CAPACITY_BASE_BACKOFF_MS);
+        assert!(second > first);
+        assert!(
+            provider_capacity_backoff_ms("agent/node.worker", "one", u32::MAX)
+                <= PROVIDER_CAPACITY_MAX_BACKOFF_MS
+                    + PROVIDER_CAPACITY_MAX_BACKOFF_MS.saturating_div(4)
+        );
+    }
+
+    #[test]
     fn context_occupancy_alone_is_not_reported_as_zero_tokens() {
         let mut page = fixture_product_page(&["session"], false);
         let ClientResource::Session(session) = &mut page.items[0] else {
@@ -9247,23 +9264,6 @@ mod tests {
                 "FILTERS  mailbox=agent/worker · from=person/nathan · archived=included\n",
                 "message/one\tread\tperson/nathan\tHello\n",
             )
-        );
-    }
-
-    #[test]
-    fn provider_capacity_backoff_is_bounded_deterministic_and_increases() {
-        let first = provider_capacity_backoff_ms("agent/node.worker", "one", 1);
-        let second = provider_capacity_backoff_ms("agent/node.worker", "one", 2);
-        assert_eq!(
-            first,
-            provider_capacity_backoff_ms("agent/node.worker", "one", 1)
-        );
-        assert!(first >= PROVIDER_CAPACITY_BASE_BACKOFF_MS);
-        assert!(second > first);
-        assert!(
-            provider_capacity_backoff_ms("agent/node.worker", "one", u32::MAX)
-                <= PROVIDER_CAPACITY_MAX_BACKOFF_MS
-                    + PROVIDER_CAPACITY_MAX_BACKOFF_MS.saturating_div(4)
         );
     }
 
