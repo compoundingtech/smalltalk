@@ -1,13 +1,35 @@
 # st3-next: seat queues and omp readiness on st3
 
 `agent/st3-next` is what `st3` becomes if it takes both `agent/seat-queue` and `agent/omp-ready`.
-It starts at `st3` `9b3c0a3` and merges `agent/seat-queue` at `bdf4bb2` and `agent/omp-ready` at
-`b6d172e`. The merged code passes the st3 test suites, adds no new lint, and passed the seat queue
-eval and the omp versions of cross-harness message wake and work wake reliability, one run each.
+It starts at `st3` `9b3c0a3` and merges `agent/seat-queue` at `5fa3487` and `agent/omp-ready` at
+`b6d172e`, the final heads of both branches. The merged code passes the st3 test suites, adds no
+new lint, and passed the seat queue eval twice and the omp versions of cross-harness message wake
+and work wake reliability once each.
 
-Fast-forward `st3` to `agent/st3-next` to take both branches.
-[Fast-forward steps](#fast-forward-steps) has the exact commands. Nothing is deployed by the
-fast-forward.
+Fast-forward `st3` to `agent/st3-next` to take both branches. The seat queue branch's own verdict
+is "not yet" because of an idle wakeup cost that
+[Choosing what st3 takes](#choosing-what-st3-takes) weighs; the recommendation is to take both and
+fix that cost on `st3`. [Fast-forward steps](#fast-forward-steps) has the exact commands for both
+choices. Nothing is deployed by the fast-forward.
+
+## Choosing what st3 takes
+
+The seat queue branch ran a 9-hour side-by-side idle run of base and branch overnight. It found no
+correctness problem. After about an hour the branch daemon woke about 70 more times a second than
+base: 10,000 to 12,000 voluntary context switches a minute against about 6,500. It held 22
+threads against base's 21, and it used 0.765 against 0.704 s of CPU a minute, about 4 seconds more
+an hour. The extra wakeups stopped growing after the second hour. Resident memory grew 11 to 13 MiB
+an hour on both builds. The branch's builder has not found the cause, and the measured build,
+`2ee767c`, predates the two commits that add agent queue moves and the seat declaration check.
+[Seat queue performance](seat-queue-performance.md#verdict) has the numbers.
+
+- **Take both (recommended).** Fast-forward `st3` to `agent/st3-next` and find the wakeup source on
+  `st3`. The cost is small and bounded. The feature works: 16 of 18 live seat queue runs on
+  Claude, Codex, and omp seats passed, one failed before any work existed, one was void and led
+  to the fix in `16aa754`, and both runs on this branch passed.
+- **Take omp readiness only.** Fast-forward `st3` to `agent/omp-ready`. It starts at `st3`
+  `9b3c0a3`, so this is also a fast-forward, and it carries none of the seat queue. Seat queues
+  then wait until the wakeup source is found.
 
 ## What the branch holds
 
@@ -16,8 +38,9 @@ fast-forward.
 | `a47f55d` | Merges `agent/seat-queue`. `st3` had not moved since that branch's last merge from it, so the tree equals `bdf4bb2`. |
 | `a058499` | Merges `agent/omp-ready`. Two files conflicted; [Merge resolution](#merge-resolution) explains them. |
 | `2a96d51` | Adds a seat queue test and one paragraph in [Agent seat queues](seat-queue.md) for the rule the two branches produce together. |
+| `2549baa` | Merges `agent/seat-queue` again at `5fa3487`. Its three new commits add only the overnight performance results and eleven eval reports; no code changed. `agent/omp-ready` had no new commits. |
 
-Later commits add only this document and the three eval reports.
+The other commits add only this document and eval reports, so the head's code equals `2a96d51`'s.
 
 - **Seat queues** (`agent/seat-queue`) give each agent seat one ordered queue of mission runs. A
   person, or an agent with `queue-authority` for the seat, can move a run with
@@ -55,44 +78,54 @@ lease, so the seat can claim the earlier run's step. `2a96d51` pins this with
 
 ## Checks
 
-All commands ran in a scrubbed environment: `env -i`, a scratch `HOME`, and no live st3 endpoint,
-PTY registry, or hooks.
+All commands ran on `2549baa`, the final merge, in a scrubbed environment: `env -i`, a scratch
+`HOME`, and no live st3 endpoint, PTY registry, or hooks. The same checks on `a058499` and
+`2a96d51` gave the same results.
 
-| Check | Commit | Result |
-| --- | --- | --- |
-| `cargo fmt --all -- --check` | `2a96d51` | pass |
-| `git diff --check` | `2a96d51` | pass |
-| `cargo test -p st3` | `2a96d51` | pass: 438 library, 94 CLI, 6 client CLI, 22 client contract, 28 example and eval, 12 operational-state; the seat queue performance test is ignored by design |
-| `cargo test --workspace --no-fail-fast` | `a058499` | 2,359 passed, 16 ignored, 12 failed; every failure is an environment gate in unchanged code (below) |
-| `cargo clippy --workspace --all-targets -- -D warnings` | `a058499` | fails on existing lints in `st2`, `stui`, and `st-runtime`, none of which changed |
-| `cargo clippy -p st3 --all-targets` | `2a96d51` | five warnings, each on a line already in `st3` `9b3c0a3`; none new |
+| Check | Result |
+| --- | --- |
+| `cargo fmt --all -- --check` | pass |
+| `git diff --check` | pass |
+| `cargo test -p st3` | pass: 438 library, 94 CLI, 6 client CLI, 22 client contract, 28 example and eval, 12 operational-state; the seat queue performance test is ignored by design |
+| `cargo test --workspace --no-fail-fast` | 2,360 passed, 16 ignored, 12 failed; every failure is in code identical to `st3` `9b3c0a3` (below) |
+| `cargo clippy --workspace --all-targets -- -D warnings` | fails on an existing lint in `st-runtime`, which did not change, and stops there; the `a058499` run also listed existing lints in `st2` and `stui` |
+| `cargo clippy -p st3 --all-targets` | five warnings, each on a line already in `st3` `9b3c0a3`; none new |
 
-The 12 workspace failures are all in `st2` and `st2-resource-providers`, whose sources are identical
-to `st3` `9b3c0a3`. Each test stops at a precondition that the scrubbed shell does not meet:
+The 12 workspace failures are in `st2`, `st2-resource-providers`, and `st-runtime`, whose sources
+are identical to `st3` `9b3c0a3`. Eleven stop at a precondition that the scrubbed shell does not
+meet:
 
 - 3 need a systemd user manager (`nomad_survival`, `transport_isolation`). They are native gates;
   the Nix sandbox has no user manager either.
 - 2 need the OTLP collector binary that the Nix check pins (`otel_export`).
 - 6 need the GitHub issue and pull request components that the Nix provider check builds.
-- 1 needs a live PTY statistics source (`pty_stats`).
+
+The twelfth, `st-runtime`'s `terminal_signal_targets_the_terminal_process_group_not_the_daemon`,
+waits 2 seconds for a signalled process group to exit. It failed once in this run, passed alone in
+0.02 seconds, and passed in the `a058499` run. The `pty_stats` failure from the `a058499` run did
+not recur.
 
 The Nix flake checks did not run locally. They run in CI on the draft pull request into `main`.
 
 ## Evals
 
 Each run used its own isolated st3 daemon, state directory, and copies of the `st3` and `st2`
-binaries built from `a058499`. The eval files came from the same commit. Every judge is mechanical.
+binaries built from the commit in the table. The eval files came from the same commit. Every judge
+is mechanical.
 
-| Eval | Seats | Run | Result | Duration |
-| --- | --- | --- | --- | ---: |
-| Seat queue | Claude `claude-sonnet-5` seat and a model-free chief | `6bd0949c` | pass | 41.4 s |
-| Cross-harness message wake | two omp seats on `openai-codex/gpt-6-astra`, paired with fixed Codex `gpt-6-sol` and Claude `opus` seats | `cross-omp-astra-next-20260927-a` | pass | 180.4 s |
-| Work wake reliability | omp worker on `openai-codex/gpt-5.6-luna` | `wake-omp-next-20260927-a` | pass | 154.7 s |
+| Eval | Seats | Commit | Run | Result | Duration |
+| --- | --- | --- | --- | --- | ---: |
+| Seat queue | Claude `claude-sonnet-5` seat and a model-free chief | `2549baa` | `598f86e7` | pass | 88.9 s |
+| Seat queue | Claude `claude-sonnet-5` seat and a model-free chief | `a058499` | `6bd0949c` | pass | 41.4 s |
+| Cross-harness message wake | two omp seats on `openai-codex/gpt-6-astra`, paired with fixed Codex `gpt-6-sol` and Claude `opus` seats | `a058499` | `cross-omp-astra-next-20260927-a` | pass | 180.4 s |
+| Work wake reliability | omp worker on `openai-codex/gpt-5.6-luna` | `a058499` | `wake-omp-next-20260927-a` | pass | 154.7 s |
 
-- **Seat queue.** The chief moved charlie before bravo while the seat held alpha's first step. The
-  seat then took alpha draft, charlie, alpha publish, and bravo, each on its first wake, which is
-  queue order. No held claim was preempted. The seat read the controller's step but did not claim
-  it.
+- **Seat queue.** In both runs the chief moved charlie before bravo while the seat held alpha's
+  first step. The seat then took alpha draft, charlie, alpha publish, and bravo, each on its first
+  wake, which is queue order. No held claim was preempted, and the seat did not claim the
+  controller's step. In the final run the seat also tried to claim bravo before its wake, and
+  `work claim` refused it and named alpha publish, the step ahead of it in the queue. That run
+  shared the host with this branch's test builds, which likely explains its longer duration.
 - **Cross-harness message wake.** Both phases completed with 8 kickoffs and exactly 24 protocol
   messages, each sent by its real seat. Incoming mail backgrounded 7 omp tool calls, 6 of them
   sends; no send was repeated. No omp seat claimed the controller's step. The startup phase took
@@ -102,11 +135,13 @@ binaries built from `a058499`. The eval files came from the same commit. Every j
 - **Work wake reliability.** Six assigned steps across fresh runs, two live revisions, and a
   replacement incarnation each needed one wake. Wake to claim was 3.6 s median and 6.8 s maximum.
 
-The cross-harness run uses `gpt-6-astra` because [Model choice](omp.md#model-choice) recommends it
-for omp seats. Work wake reliability has only the `gpt-5.6-luna` omp variant. Each eval ran once, so
-these results show that the merged code works end to end, not how reliable it is. The per-run
-reports hold the timelines, token counts, and transcript observations:
+The cross-harness and work wake runs used `a058499`, which differs from the head only by one unit
+test. The cross-harness run uses `gpt-6-astra` because [Model choice](omp.md#model-choice)
+recommends it for omp seats. Work wake reliability has only the `gpt-5.6-luna` omp variant. Each
+eval ran once or twice, so these results show that the merged code works end to end, not how
+reliable it is. The per-run reports hold the timelines, token counts, and transcript observations:
 
+- [seat queue `598f86e7`](../../evals/st3/seat-queue/reports/2026-09-27-598f86e7.md)
 - [seat queue `6bd0949c`](../../evals/st3/seat-queue/reports/2026-09-27-6bd0949c.md)
 - [cross-harness message wake](../../evals/st3/cross-harness-message-wake/reports/2026-09-27-cross-omp-astra-next-20260927-a.md)
 - [work wake reliability](../../evals/st3/work-wake-reliability/reports/2026-09-27-wake-omp-next-20260927-a.md)
@@ -124,8 +159,8 @@ Run these in the checkout that has `st3` checked out, with a clean working tree.
    git log --oneline --first-parent st3..origin/agent/st3-next
    ```
 
-   The last command lists the commits that add this document and the eval reports, `2a96d51`,
-   `a058499`, and `a47f55d`.
+   The last command lists the commit that adds this document's final results, `2549baa`,
+   `389eb50`, `2a96d51`, `a058499`, and `a47f55d`.
 
 2. Fast-forward and publish:
 
@@ -137,6 +172,10 @@ Run these in the checkout that has `st3` checked out, with a clean working tree.
    ```
 
    `github-public` is the GitHub remote; use that remote's name in your clone.
+
+To take omp readiness only, fetch `agent/omp-ready` in step 1, confirm
+`git merge-base --is-ancestor st3 origin/agent/omp-ready`, and fast-forward to
+`origin/agent/omp-ready` at `b6d172e` in step 2 instead. `agent/seat-queue` then stays open.
 
 If `st3` has moved since `9b3c0a3`, do not force it. Merge the new `st3` into `agent/st3-next`,
 run `cargo test -p st3` again, and fast-forward from there.
