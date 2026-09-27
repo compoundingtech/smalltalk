@@ -666,6 +666,7 @@ mission "cli/child" state="ready" {
         (vec!["agents", "tree"], "AGENT TREE"),
         (vec!["work", "ls"], "WORK"),
         (vec!["terminals", "ls"], "TERMINALS"),
+        (vec!["conversations", "ls", "person/nathan"], "MESSAGES"),
     ] {
         let output = run_cli_human(&socket, &arguments).await;
         assert!(
