@@ -230,6 +230,10 @@ watch runs.
 
 Cleanup stops the owned observer and subscription before the watch run becomes cancelled.
 
+A run revision that no longer declares an owned observer or subscription stops it the same way.
+A stopped subscription records `subscription.mission-request-cancelled` for each request it has not
+started. Runs it already started continue. Only the host that declared a subscription starts its runs.
+
 The GitHub pull request provider observes the final merge or closure change. The subscription remains active until an explicit unwatch in the MVP.
 
 A `when` condition gates delivery; it does not stop the subscription. Use an explicit unwatch or

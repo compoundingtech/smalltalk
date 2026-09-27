@@ -2566,15 +2566,17 @@ impl Store {
             let (status, worker_reported) = carried
                 .map(carried_step_projection)
                 .unwrap_or(("pending", false));
+            let (lease_owner, lease_incarnation, lease_expires) =
+                carried_step_lease(carried, status);
             let blocked_reason = carried.and_then(|old| old.blocked_reason.as_deref());
             let not_before = carried
                 .and_then(|old| old.not_before_unix_ms)
                 .map(|value| value.to_string());
             transaction
                 .execute(
-                    "INSERT INTO step_runs(subject, run_id, generation_id, step_path, definition_hash, status, attempt, assignee, available_to, agentless, title, goals, worker_reported, blocked_reason, not_before_unix_ms, readiness_epoch, created_at_unix_ms, updated_at_unix_ms, constraints)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?17, ?18)",
-                    params![subject, run_id, generation_id, step.path, step.definition_hash, status, attempt, assignee, serde_json::to_string(&available_to).map_err(internal)?, agentless, title, goals, worker_reported, blocked_reason, not_before, carried.map(|old| old.readiness_epoch).unwrap_or(0), now.to_string(), constraints],
+                    "INSERT INTO step_runs(subject, run_id, generation_id, step_path, definition_hash, status, attempt, assignee, available_to, agentless, title, goals, worker_reported, blocked_reason, not_before_unix_ms, readiness_epoch, created_at_unix_ms, updated_at_unix_ms, constraints, lease_owner, lease_incarnation, lease_expires_at_unix_ms)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?17, ?18, ?19, ?20, ?21)",
+                    params![subject, run_id, generation_id, step.path, step.definition_hash, status, attempt, assignee, serde_json::to_string(&available_to).map_err(internal)?, agentless, title, goals, worker_reported, blocked_reason, not_before, carried.map(|old| old.readiness_epoch).unwrap_or(0), now.to_string(), constraints, lease_owner, lease_incarnation, lease_expires.map(|expiry| expiry.to_string())],
                 )
                 .map_err(internal)?;
             if let Some(old) = carried {
@@ -2589,7 +2591,10 @@ impl Store {
                         "source_generation": predecessor_subject,
                         "status": status,
                         "attempt": attempt,
-                        "worker_reported": worker_reported
+                        "worker_reported": worker_reported,
+                        "claimant": lease_owner,
+                        "claim_incarnation": lease_incarnation,
+                        "claim_expires_at_unix_ms": lease_expires
                     }}),
                     &[],
                     None,
@@ -3460,6 +3465,17 @@ impl Store {
             .optional()
             .map_err(internal)?
             .ok_or_else(|| St3Error::new("missing-step-run", format!("step run `{subject}` does not exist")))?;
+        // A revision carries a claim into the successor generation. Its worker may still name the
+        // step by the predecessor subject.
+        let (subject, current) = match (action != "claim")
+            .then(|| carried_claim_successor_tx(&transaction, &current, &actor))
+            .transpose()
+            .map_err(internal)?
+            .flatten()
+        {
+            Some(successor) => (successor.subject.clone(), successor),
+            None => (subject, current),
+        };
         let (run_status, run_phase, current_generation, generation_status, root_status, root_phase): (
             String,
             String,
@@ -6221,11 +6237,15 @@ impl Store {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
-    /// Runtime members whose owning run or generation can no longer keep them alive.
+    /// Runtime members whose owning run or generation is terminal.
     ///
     /// This is deliberately derived from the mission tables instead of relying on a
     /// cleanup-authored `stop` declaration. A terminal state may arrive through
     /// replication or an older client, and runtime cleanup must still converge.
+    ///
+    /// A member left in a superseded generation is not included. The successor generation
+    /// re-owns each member it still declares and then retires the rest durably, so a member that
+    /// survives a revision keeps running.
     pub fn terminal_owned_runtime_subjects(&self) -> Result<BTreeSet<String>> {
         let connection = self.readers.get();
         let mut statement = connection.prepare(
@@ -6242,11 +6262,36 @@ impl Store {
                  OR owner.phase='terminal'
                  OR root.status IN ('completed','failed','cancelled')
                  OR root.phase='terminal'
+                 OR generation.status IN ('completed','failed','cancelled')
+               )
+             ORDER BY desired.subject",
+        )?;
+        statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<Result<BTreeSet<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    /// Observers, subscriptions, and schedules whose owner run is terminal or whose owner
+    /// generation is no longer current. They must not observe, deliver, or start work.
+    pub fn retired_owned_intake_subjects(&self) -> Result<BTreeSet<String>> {
+        let connection = self.readers.get();
+        let mut statement = connection.prepare(
+            "SELECT desired.subject
+             FROM desired
+             JOIN mission_runs owner
+               ON desired.owner_run='mission-run/' || owner.id
+             JOIN mission_runs root ON root.id=owner.root_run_id
+             WHERE desired.kind IN ('observer','subscription','schedule')
+               AND (
+                 owner.status IN ('completed','failed','cancelled')
+                 OR owner.phase='terminal'
+                 OR root.status IN ('completed','failed','cancelled')
+                 OR root.phase='terminal'
                  OR (
                    desired.owner_generation IS NOT NULL
                    AND desired.owner_generation != ('run-generation/' || owner.current_generation_id)
                  )
-                 OR generation.status IN ('superseded','completed','failed','cancelled')
                )
              ORDER BY desired.subject",
         )?;
@@ -10071,15 +10116,16 @@ fn adopt_declared_mission_revision_tx(
         let (status, worker_reported) = carried
             .map(carried_step_projection)
             .unwrap_or(("pending", false));
+        let (lease_owner, lease_incarnation, lease_expires) = carried_step_lease(carried, status);
         let blocked_reason = carried.and_then(|old| old.blocked_reason.as_deref());
         let not_before = carried
             .and_then(|old| old.not_before_unix_ms)
             .map(|value| value.to_string());
         transaction
             .execute(
-                "INSERT INTO step_runs(subject, run_id, generation_id, step_path, definition_hash, status, attempt, assignee, available_to, agentless, title, goals, worker_reported, blocked_reason, not_before_unix_ms, readiness_epoch, created_at_unix_ms, updated_at_unix_ms, constraints)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?17, ?18)",
-                params![subject, run_id, generation_id, step.path, step.definition_hash, status, attempt, assignee, serde_json::to_string(&available_to).map_err(internal)?, agentless, title, goals, worker_reported, blocked_reason, not_before, carried.map(|old| old.readiness_epoch).unwrap_or(0), now.to_string(), constraints],
+                "INSERT INTO step_runs(subject, run_id, generation_id, step_path, definition_hash, status, attempt, assignee, available_to, agentless, title, goals, worker_reported, blocked_reason, not_before_unix_ms, readiness_epoch, created_at_unix_ms, updated_at_unix_ms, constraints, lease_owner, lease_incarnation, lease_expires_at_unix_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?17, ?18, ?19, ?20, ?21)",
+                params![subject, run_id, generation_id, step.path, step.definition_hash, status, attempt, assignee, serde_json::to_string(&available_to).map_err(internal)?, agentless, title, goals, worker_reported, blocked_reason, not_before, carried.map(|old| old.readiness_epoch).unwrap_or(0), now.to_string(), constraints, lease_owner, lease_incarnation, lease_expires.map(|expiry| expiry.to_string())],
             )
             .map_err(internal)?;
         if let Some(old) = carried {
@@ -10094,7 +10140,10 @@ fn adopt_declared_mission_revision_tx(
                     "source_generation": predecessor_subject,
                     "status": status,
                     "attempt": attempt,
-                    "worker_reported": worker_reported
+                    "worker_reported": worker_reported,
+                    "claimant": lease_owner,
+                    "claim_incarnation": lease_incarnation,
+                    "claim_expires_at_unix_ms": lease_expires
                 }}),
                 &[],
                 Some(batch_id),
@@ -15319,12 +15368,13 @@ fn reconcile_carried_steps_tx(
             .get("worker_reported")
             .and_then(Value::as_bool)
             .unwrap_or(false);
+        // A carried claim keeps the worker lease it records.
         transaction
             .execute(
                 "UPDATE step_runs SET status=?2, attempt=?3, worker_reported=?4,
                     blocked_reason=CASE WHEN status=?2 THEN blocked_reason ELSE NULL END,
                     not_before_unix_ms=CASE WHEN status=?2 THEN not_before_unix_ms ELSE NULL END,
-                    lease_owner=NULL, lease_incarnation=NULL, lease_expires_at_unix_ms=NULL,
+                    lease_owner=?6, lease_incarnation=?7, lease_expires_at_unix_ms=?8,
                     updated_at_unix_ms=?5
                  WHERE subject=?1 AND status<>?2",
                 params![
@@ -15332,7 +15382,13 @@ fn reconcile_carried_steps_tx(
                     status,
                     attempt,
                     worker_reported,
-                    claim.accepted_at_unix_ms.to_string()
+                    claim.accepted_at_unix_ms.to_string(),
+                    fields.get("claimant").and_then(Value::as_str),
+                    fields.get("claim_incarnation").and_then(Value::as_str),
+                    fields
+                        .get("claim_expires_at_unix_ms")
+                        .and_then(Value::as_u64)
+                        .map(|expiry| expiry.to_string()),
                 ],
             )
             .map_err(internal)?;
@@ -16001,6 +16057,15 @@ fn project_run_generation_created(
             .and_then(Value::as_bool)
             .unwrap_or_else(|| carried.is_some_and(|old| old.worker_reported && status != "ready"));
         let matching_predecessor = carried.filter(|old| old.status == status);
+        let carried_lease = |name: &str| {
+            carried_fields
+                .and_then(|fields| fields.get(name))
+                .and_then(|value| match value {
+                    Value::String(value) => Some(value.clone()),
+                    Value::Number(value) => Some(value.to_string()),
+                    _ => None,
+                })
+        };
         let mut step_variables = variables.clone();
         step_variables.insert("ST_STEP".into(), step.path.clone());
         step_variables.insert("ST_STEP_RUN".into(), subject.clone());
@@ -16022,9 +16087,9 @@ fn project_run_generation_created(
         let constraints = interpolate_goals(&constraints, &step_variables)?;
         transaction
             .execute(
-                "INSERT INTO step_runs(subject, run_id, generation_id, step_path, definition_hash, status, attempt, assignee, available_to, agentless, title, goals, worker_reported, blocked_reason, not_before_unix_ms, readiness_epoch, created_at_unix_ms, updated_at_unix_ms, constraints)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?17, ?18)",
-                params![subject, run_id, generation_id, step.path, step.definition_hash, status, attempt, assignee, serde_json::to_string(&available_to).map_err(internal)?, agentless, title, goals, worker_reported, matching_predecessor.and_then(|old| old.blocked_reason.as_deref()), matching_predecessor.and_then(|old| old.not_before_unix_ms).map(|value| value.to_string()), carried.map(|old| old.readiness_epoch).unwrap_or(0), claim.accepted_at_unix_ms.to_string(), constraints],
+                "INSERT INTO step_runs(subject, run_id, generation_id, step_path, definition_hash, status, attempt, assignee, available_to, agentless, title, goals, worker_reported, blocked_reason, not_before_unix_ms, readiness_epoch, created_at_unix_ms, updated_at_unix_ms, constraints, lease_owner, lease_incarnation, lease_expires_at_unix_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?17, ?18, ?19, ?20, ?21)",
+                params![subject, run_id, generation_id, step.path, step.definition_hash, status, attempt, assignee, serde_json::to_string(&available_to).map_err(internal)?, agentless, title, goals, worker_reported, matching_predecessor.and_then(|old| old.blocked_reason.as_deref()), matching_predecessor.and_then(|old| old.not_before_unix_ms).map(|value| value.to_string()), carried.map(|old| old.readiness_epoch).unwrap_or(0), claim.accepted_at_unix_ms.to_string(), constraints, carried_lease("claimant"), carried_lease("claim_incarnation"), carried_lease("claim_expires_at_unix_ms")],
             )
             .map_err(internal)?;
     }
@@ -16723,7 +16788,8 @@ pub(crate) fn analyze_mission_revision(
     );
     let requester = normalize_actor(requester, "person");
     let metadata = revision_metadata(old, &requester, variables)?;
-    if actor != requester {
+    // A person may revise any part of a run. Human-only protection still selects its reviewers.
+    if actor != requester && !actor.starts_with("person/") {
         for path in &changed {
             let meta = metadata_for_changed_path(&metadata, path);
             if !meta.owners.contains(&actor) {
@@ -16965,11 +17031,50 @@ fn flattened_step_definition_hashes(mission: &MissionSpec) -> BTreeMap<String, S
 
 fn carried_step_projection(step: &StepRunView) -> (&str, bool) {
     match step.status.as_str() {
-        "claimed" | "working" => ("ready", false),
         "verifying" if step.worker_reported => ("verifying", true),
         "verifying" => ("ready", false),
         status => (status, step.worker_reported),
     }
+}
+
+/// Return the current-generation successor of a superseded step when it carries this actor's claim.
+fn carried_claim_successor_tx(
+    connection: &Connection,
+    step: &StepRunView,
+    actor: &str,
+) -> rusqlite::Result<Option<StepRunView>> {
+    let run_id = step.run.strip_prefix("mission-run/").unwrap_or(&step.run);
+    connection
+        .query_row(
+            "SELECT subject, run_id, step_path, definition_hash, status, attempt, assignee, available_to, agentless, title, goals, worker_reported,
+                    lease_owner, lease_incarnation, lease_expires_at_unix_ms, blocked_reason, not_before_unix_ms, created_at_unix_ms, updated_at_unix_ms, readiness_epoch, constraints
+             FROM step_runs
+             WHERE run_id=?1 AND step_path=?2 AND lease_owner=?3 AND generation_id<>?4
+               AND generation_id=(SELECT current_generation_id FROM mission_runs WHERE id=?1)",
+            params![run_id, step.step, actor, generation_id_from_subject(&step.generation)],
+            step_run_from_row,
+        )
+        .optional()
+}
+
+/// A carried step keeps the worker lease of the status it carries, so its worker continues in
+/// the successor generation without claiming again.
+fn carried_step_lease(
+    carried: Option<&StepRunView>,
+    status: &str,
+) -> (Option<String>, Option<String>, Option<u128>) {
+    let Some(old) = carried.filter(|old| {
+        old.status == status
+            && old.claimant.is_some()
+            && matches!(status, "claimed" | "working" | "verifying" | "blocked")
+    }) else {
+        return (None, None, None);
+    };
+    (
+        old.claimant.clone(),
+        old.claim_incarnation.clone(),
+        old.claim_expires_at_unix_ms,
+    )
 }
 
 fn flattened_dependencies(mission: &MissionSpec) -> BTreeMap<String, BTreeSet<String>> {
@@ -17339,8 +17444,8 @@ fn step_execution_timing_at(
         "SELECT claims.kind, claims.body, claims.accepted_at_unix_ms
          FROM claims JOIN batches ON batches.id=claims.batch_id
          WHERE claims.subject=?1
-           AND claims.kind IN ('step-run.state','work.claimed','work.renewed','work.progress',
-                               'work.submitted','work.failed','work.released')
+           AND claims.kind IN ('step-run.state','step-run.carried','work.claimed','work.renewed',
+                               'work.progress','work.submitted','work.failed','work.released')
          ORDER BY length(claims.accepted_at_unix_ms), claims.accepted_at_unix_ms,
                   batches.origin, batches.replica_sequence,
                   COALESCE((SELECT MIN(position) FROM replica_records
@@ -17396,6 +17501,24 @@ fn step_execution_timing_at(
                 }
             }
             "work.claimed" => {
+                if started.is_none() {
+                    started = Some(accepted);
+                }
+                lease_expires = fields
+                    .get("claim_expires_at_unix_ms")
+                    .and_then(Value::as_u64)
+                    .map(u128::from);
+            }
+            // A claim carried into a successor generation opens its interval at the cutover.
+            "step-run.carried"
+                if fields
+                    .get("status")
+                    .and_then(Value::as_str)
+                    .is_some_and(|status| matches!(status, "claimed" | "working"))
+                    && fields
+                        .get("claimant")
+                        .is_some_and(|claimant| !claimant.is_null()) =>
+            {
                 if started.is_none() {
                     started = Some(accepted);
                 }
@@ -25070,7 +25193,7 @@ version 2
             .iter()
             .map(|step| (step.step.as_str(), step.status.as_str()))
             .collect::<BTreeMap<_, _>>();
-        assert_eq!(states["active"], "ready");
+        assert_eq!(states["active"], "working");
         assert_eq!(states["stable"], "completed");
         assert_eq!(states["changed"], "pending");
         assert_eq!(states["dependent"], "pending");
@@ -25080,8 +25203,19 @@ version 2
                 .iter()
                 .all(|step| step.generation == revised.generation)
         );
+        let carried = revised
+            .steps
+            .iter()
+            .find(|step| step.step == "active")
+            .unwrap();
+        assert_eq!(carried.claimant.as_deref(), Some(worker.as_str()));
+        assert_eq!(carried.claim_incarnation.as_deref(), Some("worker-one"));
+        let stranger = WorkRequest {
+            actor: Some(format!("agent/{}/stranger", run.id)),
+            ..request("stale-generation-complete")
+        };
         let error = store
-            .work_action(&active, "complete", &request("stale-generation-complete"))
+            .work_action(&active, "complete", &stranger)
             .unwrap_err();
         assert_eq!(error.code, "stale-run-generation");
         assert!(!store.set_step_state(&active, "completed", None).unwrap());
@@ -25089,6 +25223,11 @@ version 2
             store.step_run(&active).unwrap().unwrap().status,
             "cancelled"
         );
+        let submitted = store
+            .work_action(&active, "complete", &request("carried-complete"))
+            .unwrap();
+        assert_eq!(submitted.subject, carried.subject);
+        assert_eq!(submitted.status, "verifying");
         let retried = store
             .adopt_mission_revision(
                 &run.id,
@@ -25168,6 +25307,177 @@ version 2
             )
             .unwrap_err();
         assert_eq!(error.code, "revision-outside-graph-location");
+    }
+
+    const CARRY_SOURCE: &str = r#"
+version 2
+
+  mission "carry" state="ready" {
+    goal "Keep claimed work across a revision."
+    step "work" { assigned-to "agent/worker"; goal "Do the claimed work." }
+    step "other" { assigned-to "agent/worker"; goal "Use the first goal." }
+  }
+
+"#;
+
+    fn publish_carry(store: &Store, source: &str, key: &str) -> MissionSpec {
+        let intent = crate::graph::parse_test_intent(source, "node").unwrap();
+        let planned = store
+            .mission(
+                &intent,
+                IntentInput {
+                    kdl: source.into(),
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        store.apply(&intent, &planned.subject_tokens, key).unwrap();
+        intent.missions["carry"].clone()
+    }
+
+    fn carry_request(incarnation: &str, key: &str) -> WorkRequest {
+        WorkRequest {
+            actor: Some("agent/node.worker".into()),
+            incarnation: Some(incarnation.into()),
+            summary: None,
+            reason: None,
+            evidence: Vec::new(),
+            idempotency_key: key.into(),
+        }
+    }
+
+    #[test]
+    fn a_person_can_revise_a_run_from_outside_its_graph_location() {
+        let store = Store::open_memory("node").unwrap();
+        publish_carry(&store, CARRY_SOURCE, "carry-one");
+        let run = store
+            .create_mission_run(&MissionRunRequest {
+                mission: "carry".into(),
+                revision: None,
+                workspace: "/tmp".into(),
+                requester: Some("person/requester".into()),
+                mode: Some("run".into()),
+                inputs: BTreeMap::new(),
+                idempotency_key: "carry-run".into(),
+            })
+            .unwrap();
+        let revised = publish_carry(
+            &store,
+            &CARRY_SOURCE.replace("Use the first goal.", "Use the second goal."),
+            "carry-two",
+        );
+
+        let agent = store
+            .adopt_mission_revision(
+                &run.id,
+                &revised,
+                "agent/node.worker",
+                "an assigned agent does not own the mission",
+                "agent-revision",
+            )
+            .unwrap_err();
+        assert_eq!(agent.code, "revision-outside-graph-location");
+        let adopted = store
+            .adopt_mission_revision(
+                &run.id,
+                &revised,
+                "person/operator",
+                "an operator corrects the goal",
+                "person-revision",
+            )
+            .unwrap();
+        assert_eq!(adopted.revision, revised.revision);
+    }
+
+    #[test]
+    fn a_revision_keeps_the_claim_on_a_carried_step() {
+        let store = Store::open_memory("node").unwrap();
+        publish_carry(&store, CARRY_SOURCE, "carry-one");
+        let run = store
+            .create_mission_run(&MissionRunRequest {
+                mission: "carry".into(),
+                revision: None,
+                workspace: "/tmp".into(),
+                requester: Some("person/requester".into()),
+                mode: Some("run".into()),
+                inputs: BTreeMap::new(),
+                idempotency_key: "carry-run".into(),
+            })
+            .unwrap();
+        let step = |run: &MissionRunView, path: &str| {
+            run.steps
+                .iter()
+                .find(|step| step.step == path)
+                .unwrap()
+                .clone()
+        };
+        let old = step(&run, "work").subject;
+        store.set_step_state(&old, "ready", None).unwrap();
+        store
+            .work_action(&old, "claim", &carry_request("one", "carry-claim"))
+            .unwrap();
+        let revised = publish_carry(
+            &store,
+            &CARRY_SOURCE.replace("Use the first goal.", "Use the second goal."),
+            "carry-two",
+        );
+
+        let adopted = store
+            .adopt_mission_revision(
+                &run.id,
+                &revised,
+                "person/requester",
+                "the other step needs a second goal",
+                "carry-revision",
+            )
+            .unwrap();
+
+        let carried = step(&adopted, "work");
+        assert_ne!(carried.subject, old);
+        assert_eq!(
+            (
+                carried.status.as_str(),
+                carried.claimant.as_deref(),
+                carried.claim_incarnation.as_deref()
+            ),
+            ("claimed", Some("agent/node.worker"), Some("one"))
+        );
+        assert!(carried.claim_expires_at_unix_ms.is_some());
+        assert_eq!(step(&adopted, "other").status, "pending");
+
+        let target = Store::open_memory("target").unwrap();
+        target
+            .import_replication("node", &store.export_replication(0).unwrap())
+            .unwrap();
+        let replicated = target.step_run(&carried.subject).unwrap().unwrap();
+        assert_eq!(
+            (
+                replicated.status.as_str(),
+                replicated.claimant.as_deref(),
+                replicated.claim_incarnation.as_deref(),
+                replicated.claim_expires_at_unix_ms
+            ),
+            (
+                "claimed",
+                Some("agent/node.worker"),
+                Some("one"),
+                carried.claim_expires_at_unix_ms
+            )
+        );
+
+        let other_incarnation = store
+            .work_action(&old, "progress", &carry_request("two", "carry-other"))
+            .unwrap_err();
+        assert_eq!(other_incarnation.code, "wrong-work-incarnation");
+        let reclaim = store
+            .work_action(&old, "claim", &carry_request("one", "carry-reclaim"))
+            .unwrap_err();
+        assert_eq!(reclaim.code, "stale-run-generation");
+        let submitted = store
+            .work_action(&old, "complete", &carry_request("one", "carry-complete"))
+            .unwrap();
+        assert_eq!(submitted.subject, carried.subject);
+        assert_eq!(submitted.status, "verifying");
     }
 
     #[test]

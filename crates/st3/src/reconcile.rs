@@ -777,10 +777,26 @@ impl<R: RuntimeControl> Reconciler<R> {
                 }
             }
         }
-        self.reconcile_resource_observers(&desired)?;
-        self.reconcile_schedules(&desired)?;
-        self.reconcile_scheduled_work(&desired)?;
-        self.reconcile_subscription_missions(&desired)?;
+        // Intake left by a terminal owner or a superseded generation must not observe, deliver,
+        // or start work. A stopped declaration still runs so it can settle its own state.
+        let retired_intake = self.store.retired_owned_intake_subjects()?;
+        let intake = desired
+            .iter()
+            .filter(|subject| {
+                matches!(
+                    subject.kind.as_str(),
+                    "observer" | "subscription" | "schedule"
+                )
+            })
+            .filter(|subject| {
+                !retired_intake.contains(&subject.subject) || intake_is_stopped(subject, &self.host)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        self.reconcile_resource_observers(&intake)?;
+        self.reconcile_schedules(&intake)?;
+        self.reconcile_scheduled_work(&intake)?;
+        self.reconcile_subscription_missions(&intake)?;
         self.reconcile_provider_capacity_retries(&desired)?;
         self.evaluate_mission_runs()?;
         // Mission state is the primary control-plane projection. Evaluate it before
@@ -2886,6 +2902,14 @@ impl<R: RuntimeControl> Reconciler<R> {
                     .as_ref()
                     .is_some_and(|owner| owner_runs.contains(owner))
             })
+            .collect::<Vec<_>>();
+        let intake_stopped = self.stop_owned_intake(
+            &owned.iter().collect::<Vec<_>>(),
+            None,
+            &format!("cleanup-mission-run-intake:{}", run.generation),
+        )?;
+        let owned = owned
+            .into_iter()
             .filter(|subject| subject.member.is_some() || subject.kind == "stop")
             .collect::<Vec<_>>();
         let mut live = Vec::new();
@@ -2925,13 +2949,13 @@ impl<R: RuntimeControl> Reconciler<R> {
             let response = self
                 .store
                 .apply_internal(&intent, &format!("cleanup-mission-run:{}", run.generation))?;
-            return Ok(response.changed);
+            return Ok(response.changed || intake_stopped);
         }
         if !live.is_empty() {
-            return Ok(false);
+            return Ok(intake_stopped);
         }
         let mut status = run.phase.strip_prefix("cleanup-").unwrap_or("failed");
-        let mut changed = false;
+        let mut changed = intake_stopped;
         if run.mode == "eval" {
             let run_failure_reason = self
                 .store
@@ -5382,7 +5406,20 @@ impl<R: RuntimeControl> Reconciler<R> {
     }
 
     fn retire_predecessor_generation(&self, run: &MissionRunView) -> Result<bool> {
-        let stops = self
+        // An active step re-owns its own declarations when it next materializes them, so a
+        // claim carried into this generation keeps its step's members.
+        let active_steps = run
+            .steps
+            .iter()
+            .filter(|step| {
+                matches!(
+                    step.status.as_str(),
+                    "ready" | "claimed" | "working" | "verifying" | "blocked"
+                )
+            })
+            .map(|step| step.step.as_str())
+            .collect::<BTreeSet<_>>();
+        let retired = self
             .store
             .desired_subjects()?
             .into_iter()
@@ -5395,12 +5432,27 @@ impl<R: RuntimeControl> Reconciler<R> {
                     .as_deref()
                     .is_some_and(|generation| generation != run.generation)
             })
+            .filter(|subject| {
+                !subject
+                    .owner_step
+                    .as_deref()
+                    .and_then(step_path_of_subject)
+                    .is_some_and(|path| active_steps.contains(path))
+            })
+            .collect::<Vec<_>>();
+        let mut changed = self.stop_owned_intake(
+            &retired.iter().collect::<Vec<_>>(),
+            Some(&run.generation),
+            &format!("retire-generation-intake:{}", run.generation),
+        )?;
+        let stops = retired
+            .iter()
             .filter(|subject| subject.member.is_some() && subject.kind != "stop")
             .map(|subject| format!("stop {:?}", subject.subject))
             .collect::<Vec<_>>()
             .join("\n");
         if stops.is_empty() {
-            return Ok(false);
+            return Ok(changed);
         }
         let source = format!("version 2\n\n{stops}\n");
         let mut intent = crate::graph::parse_execution_intent(&source, &self.host, &run.id)?;
@@ -5410,7 +5462,55 @@ impl<R: RuntimeControl> Reconciler<R> {
         let response = self
             .store
             .apply_internal(&intent, &format!("retire-generation:{}", run.generation))?;
-        Ok(response.changed)
+        changed |= response.changed;
+        Ok(changed)
+    }
+
+    /// Stop owned observers, subscriptions, and schedules durably. Each one remains a stopped
+    /// declaration of its own kind, so it settles its state and starts no more work.
+    fn stop_owned_intake(
+        &self,
+        subjects: &[&DesiredSubject],
+        generation: Option<&str>,
+        key: &str,
+    ) -> Result<bool> {
+        let mut by_owner = BTreeMap::<&str, Vec<String>>::new();
+        for subject in subjects {
+            if !matches!(
+                subject.kind.as_str(),
+                "observer" | "subscription" | "schedule"
+            ) || intake_is_stopped(subject, &self.host)
+            {
+                continue;
+            }
+            let Some(owner) = subject.owner_run.as_deref() else {
+                continue;
+            };
+            let owner_id = owner.strip_prefix("mission-run/").unwrap_or(owner);
+            let Some(name) = subject
+                .subject
+                .strip_prefix(&format!("{}/{owner_id}/", subject.kind))
+            else {
+                continue;
+            };
+            by_owner
+                .entry(owner_id)
+                .or_default()
+                .push(format!("{} {name:?} {{ stop }}", subject.kind));
+        }
+        let mut changed = false;
+        for (owner_id, stops) in by_owner {
+            let source = format!("version 2\n\n{}\n", stops.join("\n"));
+            let mut intent = crate::graph::parse_execution_intent(&source, &self.host, owner_id)?;
+            for subject in intent.subjects.values_mut() {
+                subject.owner_generation = generation.map(str::to_owned);
+            }
+            changed |= self
+                .store
+                .apply_internal(&intent, &format!("{key}:{owner_id}"))?
+                .changed;
+        }
+        Ok(changed)
     }
 
     fn materialize_mission_declarations(
@@ -6196,6 +6296,9 @@ impl<R: RuntimeControl> Reconciler<R> {
 
     fn reconcile_scheduled_work(&self, desired: &[DesiredSubject]) -> Result<()> {
         for schedule in desired.iter().filter(|item| item.kind == "schedule") {
+            if intake_is_stopped(schedule, &self.host) {
+                continue;
+            }
             let requests = self
                 .store
                 .claims_for(&schedule.subject, Some("schedule.work-requested"))?;
@@ -6317,23 +6420,34 @@ impl<R: RuntimeControl> Reconciler<R> {
             let Some(spec) = crate::graph::subscription_spec(&item.desired) else {
                 continue;
             };
-            if spec.stopped || spec.delivery != "mission" {
+            // Every peer replicates the same requests. Only the declaring host starts their runs.
+            if self
+                .store
+                .selected_desired_origin(&item.subject)?
+                .as_deref()
+                != Some(self.host.as_str())
+            {
+                continue;
+            }
+            if spec.stopped {
+                self.cancel_unstarted_subscription_requests(&item.subject)?;
+                continue;
+            }
+            if spec.delivery != "mission" {
                 continue;
             }
             let requests = self
                 .store
                 .claims_for(&item.subject, Some("subscription.mission-requested"))?;
-            let starts = self
+            let mut closed = self
                 .store
                 .claims_for(&item.subject, Some("subscription.mission-started"))?;
+            closed.extend(self.store.claims_for(
+                &item.subject,
+                Some("subscription.mission-request-cancelled"),
+            )?);
             for request in requests {
-                if starts.iter().any(|claim| {
-                    claim
-                        .body
-                        .pointer("/fields/request")
-                        .and_then(Value::as_str)
-                        == Some(request.id.as_str())
-                }) {
+                if claims_name_request(&closed, &request.id) {
                     continue;
                 }
                 let fields = request.body.get("fields").unwrap_or(&request.body);
@@ -6404,6 +6518,45 @@ impl<R: RuntimeControl> Reconciler<R> {
                     idempotency_key: Some(format!("subscription-mission-started:{}", run.id)),
                 })?;
             }
+        }
+        Ok(())
+    }
+
+    /// Close each request that a stopped subscription recorded but never started, so a later
+    /// declaration of the same subscription cannot start it.
+    fn cancel_unstarted_subscription_requests(&self, subscription: &str) -> Result<()> {
+        let requests = self
+            .store
+            .claims_for(subscription, Some("subscription.mission-requested"))?;
+        if requests.is_empty() {
+            return Ok(());
+        }
+        let mut closed = self
+            .store
+            .claims_for(subscription, Some("subscription.mission-started"))?;
+        closed.extend(
+            self.store
+                .claims_for(subscription, Some("subscription.mission-request-cancelled"))?,
+        );
+        for request in requests {
+            if claims_name_request(&closed, &request.id) {
+                continue;
+            }
+            self.store.append_claim(&ClaimInput {
+                subject: subscription.into(),
+                kind: "subscription.mission-request-cancelled".into(),
+                actor: None,
+                fields: BTreeMap::from([
+                    ("request".into(), Value::String(request.id.clone())),
+                    (
+                        "reason".into(),
+                        Value::String("the subscription stopped".into()),
+                    ),
+                ]),
+                evidence: vec![request.id.clone()],
+                expected_subject: None,
+                idempotency_key: Some(format!("subscription-request-cancelled:{}", request.id)),
+            })?;
         }
         Ok(())
     }
@@ -7651,6 +7804,40 @@ fn expand_gate(
         GateSpec::Deadline { .. } => {}
     }
     Ok(())
+}
+
+/// Report whether an observer, subscription, or schedule declaration is a stop.
+fn intake_is_stopped(subject: &DesiredSubject, host: &str) -> bool {
+    match subject.kind.as_str() {
+        "observer" => {
+            crate::graph::observer_spec(&subject.desired).is_some_and(|spec| spec.stopped)
+        }
+        "subscription" => {
+            crate::graph::subscription_spec(&subject.desired).is_some_and(|spec| spec.stopped)
+        }
+        "schedule" => {
+            crate::graph::schedule_spec(&subject.desired, host).is_some_and(|spec| spec.stopped)
+        }
+        _ => false,
+    }
+}
+
+fn claims_name_request(claims: &[crate::model::ClaimRecord], request: &str) -> bool {
+    claims.iter().any(|claim| {
+        claim
+            .body
+            .pointer("/fields/request")
+            .and_then(Value::as_str)
+            == Some(request)
+    })
+}
+
+/// Return the step path of a `step-run/GENERATION/PATH` subject.
+fn step_path_of_subject(subject: &str) -> Option<&str> {
+    subject
+        .strip_prefix("step-run/")?
+        .split_once('/')
+        .map(|(_, path)| path)
 }
 
 fn signal_changed(reconcile_notify: &Notify, event_notify: &watch::Sender<u64>) {
@@ -14116,6 +14303,378 @@ subscription "reviews" {{
                 .unwrap()
                 .len(),
             1
+        );
+    }
+
+    const INTAKE_REVIEW_SOURCE: &str = r#"version 2
+mission "review" state="ready" {
+  input "source" kind="resource"
+  goal "Review one discovered item."
+  step "review" { agentless }
+}"#;
+
+    /// A standing mission whose seat keeps the run open while it declares `intake`.
+    fn standing_intake_source(intake: &str) -> String {
+        format!(
+            r#"version 2
+resource "repo" {{ kind "vcs.repository" }}
+mission "standing" state="ready" {{
+  goal "Watch one repository."
+  agent "seat" {{ workspace "/tmp"; command "true"; restart "never" }}
+  step "watch" {{ assigned-to "agent/${{ST_MISSION_RUN}}/seat"; goal "Keep watching." }}
+{intake}
+}}"#
+        )
+    }
+
+    fn standing_intake(review_revision: &str) -> String {
+        format!(
+            r#"  observer "repo" {{ resource "resource/repo"; provider "github.repository"; locator "owner/repo"; field "pull_requests" }}
+  subscription "reviews" {{
+    observer "observer/repo"
+    on "pull_requests"
+    delivery "mission" {{
+      mission "review@{review_revision}"
+      resource "source"
+      workspace "/tmp/st3-review"
+    }}
+  }}"#
+        )
+    }
+
+    fn request_review(store: &Store, subscription: &str, review_revision: &str, key: &str) {
+        store
+            .append_claim(&ClaimInput {
+                subject: subscription.into(),
+                kind: "subscription.mission-requested".into(),
+                actor: None,
+                fields: BTreeMap::from([
+                    ("mission".into(), Value::String("mission/review".into())),
+                    (
+                        "mission_revision".into(),
+                        Value::String(review_revision.into()),
+                    ),
+                    (
+                        "resource".into(),
+                        Value::String("resource/repo/pull-request/7".into()),
+                    ),
+                    ("resource_input".into(), Value::String("source".into())),
+                    ("workspace".into(), Value::String("/tmp/st3-review".into())),
+                    ("discovery".into(), Value::String("discovery-claim".into())),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some(key.into()),
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn a_revision_keeps_a_still_declared_member_and_its_claim() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        let source = r#"
+version 2
+
+  mission "keep" state="ready" {
+    goal "Keep the seat through a revision."
+    agent "worker" { workspace "/tmp"; command "true"; restart "never" }
+    step "work" { assigned-to "agent/${ST_MISSION_RUN}/worker"; goal "Do the work." }
+    step "other" { assigned-to "agent/${ST_MISSION_RUN}/worker"; goal "Use the first goal." }
+  }
+
+"#;
+        apply_source(&store, source, "publish-keep");
+        let run = store
+            .create_mission_run(&MissionRunRequest {
+                mission: "keep".into(),
+                revision: None,
+                workspace: "/tmp".into(),
+                requester: Some("person/test".into()),
+                mode: None,
+                inputs: BTreeMap::new(),
+                idempotency_key: "run-keep".into(),
+            })
+            .unwrap();
+        let runtime = Arc::new(FakeRuntime::default());
+        let reconciler = Reconciler::new(
+            store.clone(),
+            runtime.clone(),
+            "node".into(),
+            Arc::new(Notify::new()),
+        );
+        for _ in 0..3 {
+            if !runtime.started_members.lock().unwrap().is_empty() {
+                break;
+            }
+            reconciler.reconcile_once().unwrap();
+        }
+        let worker = format!("agent/{}/worker", run.id);
+        let member = runtime.started_members.lock().unwrap()[0].clone();
+        runtime.ptys.lock().unwrap().push(RuntimeObservation {
+            runtime_id: member.runtime_id.clone(),
+            terminal: true,
+            status: "running".into(),
+            exit_code: None,
+            incarnation_id: Some("keep-incarnation".into()),
+        });
+        for _ in 0..3 {
+            reconciler.reconcile_once().unwrap();
+        }
+        let work = |run: &crate::model::MissionRunView| {
+            run.steps
+                .iter()
+                .find(|step| step.step == "work")
+                .unwrap()
+                .clone()
+        };
+        let old = work(&store.mission_run(&run.id).unwrap().unwrap());
+        assert_eq!(old.status, "ready");
+        store
+            .work_action(
+                &old.subject,
+                "claim",
+                &crate::model::WorkRequest {
+                    actor: Some(worker.clone()),
+                    incarnation: Some("keep-incarnation".into()),
+                    summary: None,
+                    reason: None,
+                    evidence: Vec::new(),
+                    idempotency_key: "keep-claim".into(),
+                },
+            )
+            .unwrap();
+        apply_source(
+            &store,
+            &source.replace("Use the first goal.", "Use the second goal."),
+            "publish-keep-two",
+        );
+        let revised = store.mission_spec("keep", None).unwrap().unwrap();
+        let adopted = store
+            .adopt_mission_revision(
+                &run.id,
+                &revised,
+                "person/test",
+                "the other step needs a second goal",
+                "keep-revision",
+            )
+            .unwrap();
+
+        for _ in 0..3 {
+            reconciler.reconcile_once().unwrap();
+        }
+
+        assert!(
+            runtime.stops.lock().unwrap().is_empty(),
+            "a revision must not stop a member that its successor still declares"
+        );
+        assert_eq!(runtime.started_members.lock().unwrap().len(), 1);
+        let desired = store
+            .desired_subjects()
+            .unwrap()
+            .into_iter()
+            .find(|desired| desired.subject == worker)
+            .unwrap();
+        assert_eq!(desired.kind, "agent");
+        assert_eq!(
+            desired.owner_generation.as_deref(),
+            Some(adopted.generation.as_str())
+        );
+        let carried = work(&store.mission_run(&run.id).unwrap().unwrap());
+        assert_ne!(carried.subject, old.subject);
+        assert_eq!(
+            (
+                carried.status.as_str(),
+                carried.claimant.as_deref(),
+                carried.claim_incarnation.as_deref()
+            ),
+            ("claimed", Some(worker.as_str()), Some("keep-incarnation"))
+        );
+    }
+
+    #[test]
+    fn a_revision_that_removes_intake_retires_it_and_cancels_unstarted_requests() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        apply_source(&store, INTAKE_REVIEW_SOURCE, "review-mission");
+        let review = store
+            .mission_spec("review", None)
+            .unwrap()
+            .unwrap()
+            .revision;
+        apply_source(
+            &store,
+            &standing_intake_source(&standing_intake(&review)),
+            "standing-with-intake",
+        );
+        let run = store
+            .create_mission_run(&MissionRunRequest {
+                mission: "standing".into(),
+                revision: None,
+                workspace: "/tmp".into(),
+                requester: Some("person/test".into()),
+                mode: None,
+                inputs: BTreeMap::new(),
+                idempotency_key: "run-standing".into(),
+            })
+            .unwrap();
+        let reconciler = Reconciler::new(
+            store.clone(),
+            Arc::new(FakeRuntime::default()),
+            "node".into(),
+            Arc::new(Notify::new()),
+        );
+        for _ in 0..3 {
+            reconciler.reconcile_once().unwrap();
+        }
+        let observer = format!("observer/{}/repo", run.id);
+        let subscription = format!("subscription/{}/reviews", run.id);
+        let desired = |subject: &str| {
+            store
+                .desired_subjects()
+                .unwrap()
+                .into_iter()
+                .find(|desired| desired.subject == subject)
+                .unwrap_or_else(|| panic!("`{subject}` is desired"))
+        };
+        assert!(!intake_is_stopped(&desired(&subscription), "node"));
+        apply_source(
+            &store,
+            &standing_intake_source(""),
+            "standing-without-intake",
+        );
+        let revised = store.mission_spec("standing", None).unwrap().unwrap();
+        store
+            .adopt_mission_revision(
+                &run.id,
+                &revised,
+                "person/test",
+                "stop the old intake",
+                "drop-intake",
+            )
+            .unwrap();
+        request_review(&store, &subscription, &review, "pending-review");
+
+        for _ in 0..3 {
+            reconciler.reconcile_once().unwrap();
+        }
+
+        assert!(
+            store
+                .claims_for(&subscription, Some("subscription.mission-started"))
+                .unwrap()
+                .is_empty(),
+            "a removed subscription must not start its pending request"
+        );
+        assert!(
+            store
+                .active_mission_runs_for_mission("review")
+                .unwrap()
+                .is_empty()
+        );
+        let cancelled = store
+            .claims_for(
+                &subscription,
+                Some("subscription.mission-request-cancelled"),
+            )
+            .unwrap();
+        assert_eq!(cancelled.len(), 1);
+        assert!(intake_is_stopped(&desired(&subscription), "node"));
+        assert!(intake_is_stopped(&desired(&observer), "node"));
+        assert_eq!(
+            store
+                .latest_actual_value(&observer)
+                .unwrap()
+                .and_then(|actual| actual.get("state").cloned()),
+            Some(Value::String("stopped".into()))
+        );
+
+        request_review(&store, &subscription, &review, "late-review");
+        reconciler.reconcile_once().unwrap();
+        assert_eq!(
+            store
+                .claims_for(
+                    &subscription,
+                    Some("subscription.mission-request-cancelled")
+                )
+                .unwrap()
+                .len(),
+            2,
+            "a request recorded after the stop is closed too"
+        );
+    }
+
+    #[test]
+    fn a_terminal_owner_or_another_host_starts_no_subscription_run() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        apply_source(&store, INTAKE_REVIEW_SOURCE, "review-mission");
+        let review = store
+            .mission_spec("review", None)
+            .unwrap()
+            .unwrap()
+            .revision;
+        apply_source(
+            &store,
+            &standing_intake_source(&standing_intake(&review)),
+            "standing-with-intake",
+        );
+        let run = store
+            .create_mission_run(&MissionRunRequest {
+                mission: "standing".into(),
+                revision: None,
+                workspace: "/tmp".into(),
+                requester: Some("person/test".into()),
+                mode: None,
+                inputs: BTreeMap::new(),
+                idempotency_key: "run-standing".into(),
+            })
+            .unwrap();
+        let reconciler = Reconciler::new(
+            store.clone(),
+            Arc::new(FakeRuntime::default()),
+            "node".into(),
+            Arc::new(Notify::new()),
+        );
+        for _ in 0..3 {
+            reconciler.reconcile_once().unwrap();
+        }
+        let owned = format!("subscription/{}/reviews", run.id);
+        assert!(
+            store
+                .set_mission_run_state(&run.id, "completed", "terminal", None)
+                .unwrap()
+        );
+        request_review(&store, &owned, &review, "after-completion");
+        reconciler.reconcile_once().unwrap();
+        assert!(
+            store
+                .claims_for(&owned, Some("subscription.mission-started"))
+                .unwrap()
+                .is_empty(),
+            "a completed owner's subscription must not start work"
+        );
+
+        apply_source(
+            &store,
+            &format!(
+                "version 2\nresource \"repo\" {{ kind \"vcs.repository\" }}\n{}",
+                standing_intake(&review)
+            ),
+            "top-level-intake",
+        );
+        request_review(&store, "subscription/reviews", &review, "foreign-review");
+        let peer = Reconciler::new(
+            store.clone(),
+            Arc::new(FakeRuntime::default()),
+            "other".into(),
+            Arc::new(Notify::new()),
+        );
+        peer.reconcile_subscription_missions(&store.desired_subjects().unwrap())
+            .unwrap();
+        assert!(
+            store
+                .claims_for("subscription/reviews", Some("subscription.mission-started"))
+                .unwrap()
+                .is_empty(),
+            "only the declaring host starts subscription runs"
         );
     }
 

@@ -1149,7 +1149,7 @@ Revision authority comes from agent placement in the current generation.
 - A direct agent in a mission can revise the complete mission.
 - A direct agent adjacent to missions can revise those missions.
 
-The run requester can propose any revision. A work selector does not grant revision authority.
+The run requester and any person can propose any revision. A work selector does not grant revision authority.
 
 An agent also needs explicit mission operation authority in its current desired declaration:
 
@@ -1228,11 +1228,21 @@ st3 work revision generation RUN_GENERATION
 
 st3 compares normalized step definition hashes. A changed step and every transitive dependent start without prior completion.
 
-Every compatible state carries to the successor. Compatible claimed, working, or verifying work restarts in ready state.
+Every compatible state carries to the successor. Compatible claimed, working, or blocked work keeps its
+worker lease, so the worker continues without claiming again. Compatible verifying work that its
+worker has not submitted restarts in ready state.
 
-The old generation remains readable. A late work action against it fails with `stale-run-generation`.
+The old generation remains readable. A late work action against it fails with `stale-run-generation`,
+except that the holder of a carried lease reaches the successor step through the old subject.
 
 Mission and step members record their owner run and generation. The reconciler stops members left only in the superseded generation lineage.
+It first re-owns each member that the successor still declares, so a revision does not restart a
+member it keeps.
+
+Observers, subscriptions, and schedules that the successor no longer declares become stopped
+declarations at cutover, as they do at run cleanup. Until then they observe, deliver, and start
+nothing. A stopped subscription cancels each request it recorded but never started. Runs it already
+started continue.
 
 A compatible member keeps the same run-local subject in the successor. A mission revision cannot move it to another mission run.
 
