@@ -296,6 +296,13 @@ impl Client {
     }
 }
 
+/// Whether an API call failed because the requested subject does not exist on this host.
+pub fn is_not_found(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<ApiResponseError>()
+        .is_some_and(|error| error.status == 404 || error.code == "not-found")
+}
+
 fn terminal_reconnect_is_refused(error: &anyhow::Error) -> bool {
     error
         .downcast_ref::<ApiResponseError>()

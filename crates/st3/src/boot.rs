@@ -52,6 +52,9 @@ and what happened.
 When the harness itself fails, run `"$ST3_BIN" diagnostic --help` and report it through that dedicated authorized operation.
 
 When a person must act, run `"$ST3_BIN" attention request --help` and publish one explicit request for the responsible person.
+
+You own each request you publish. When its condition clears, or a person no longer needs to act,
+withdraw it with `"$ST3_BIN" attention withdraw ATTENTION --reason "..." --as "$ST_AGENT"`.
 "#;
 
 pub fn compose_prompt(authored: Option<&str>) -> String {
@@ -108,6 +111,8 @@ mod tests {
         assert!(BOOT_DOCUMENT.contains("conversations --help"));
         assert!(!BOOT_DOCUMENT.contains("message --help"));
         assert!(BOOT_DOCUMENT.contains("attention request --help"));
+        assert!(BOOT_DOCUMENT.contains("You own each request you publish."));
+        assert!(BOOT_DOCUMENT.contains("attention withdraw ATTENTION --reason"));
         assert!(BOOT_DOCUMENT.contains("diagnostic --help"));
         assert!(BOOT_DOCUMENT.contains("Never type\ninto, attach to, or send synthetic keys"));
         assert!(BOOT_DOCUMENT.contains("Terminal control is an emergency recovery path only"));

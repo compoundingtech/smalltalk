@@ -319,6 +319,97 @@ async fn attention_withdraw_removes_an_obsolete_request_from_now() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn now_shows_the_state_of_each_fault_target() {
+    let root = tempfile::tempdir().unwrap();
+    let socket = root.path().join("st3.sock");
+    let state = test_state(root.path());
+    let store = state.store.clone();
+    let source = r#"version 2
+mission "typecase" state="ready" {
+  goal "Publish a revision."
+  step "publish" { agentless }
+}
+"#;
+    let intent = st3::graph::parse_intent(source, "client-v0-cli").unwrap();
+    let planned = store
+        .mission(
+            &intent,
+            IntentInput {
+                kdl: source.into(),
+                source_name: None,
+            },
+        )
+        .unwrap();
+    store
+        .apply(&intent, &planned.subject_tokens, "typecase-source")
+        .unwrap();
+    let run = store
+        .create_mission_run(&MissionRunRequest {
+            mission: "typecase".into(),
+            revision: None,
+            workspace: "/tmp".into(),
+            requester: Some("person/nathan".into()),
+            mode: Some("run".into()),
+            inputs: BTreeMap::new(),
+            idempotency_key: "typecase-run".into(),
+        })
+        .unwrap();
+    store
+        .set_mission_run_state(&run.id, "cancelled", "terminal", Some("moved to a seat"))
+        .unwrap();
+    store
+        .request_attention(
+            "attention/typecase-remote-control",
+            &AttentionRequest {
+                reviewer: "person/nathan".into(),
+                title: "Publish Typecase without remote control".into(),
+                reason: "Publish the prepared revision as a person.".into(),
+                severity: "warning".into(),
+                targets: vec!["mission/typecase".into(), "resource/typecase/kdl".into()],
+                actor: "agent/fleet/st3".into(),
+                idempotency_key: "typecase-remote-control".into(),
+            },
+        )
+        .unwrap();
+    let server_socket = socket.clone();
+    let server =
+        tokio::spawn(
+            async move { st3::api::serve_unix(&server_socket, st3::api::router(state)).await },
+        );
+    for _ in 0..100 {
+        if socket.exists() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert!(socket.exists());
+
+    let now = run_cli_human(&socket, &["now", "--as", "person/nathan"]).await;
+    assert!(
+        now.status.success(),
+        "{}",
+        String::from_utf8_lossy(&now.stderr)
+    );
+    let now = String::from_utf8(now.stdout).unwrap();
+    assert!(
+        now.contains("  target mission/typecase: cancelled "),
+        "now did not show the target state:\n{now}"
+    );
+    assert!(
+        !now.contains("target resource/"),
+        "a resource has no state to show:\n{now}"
+    );
+
+    let listed = value(&run_cli(&socket, &["attention", "ls", "--as", "person/nathan"]).await);
+    let states = &listed["value"]["items"][0]["target_states"];
+    assert_eq!(states[0]["id"], "mission/typecase");
+    assert_eq!(states[0]["state"], "cancelled");
+    assert!(states[0]["since"].is_string());
+    assert_eq!(states.as_array().unwrap().len(), 1);
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn canonical_product_cli_uses_real_client_v0_envelopes_and_fences() {
     let root = tempfile::tempdir().unwrap();
     let socket = root.path().join("st3.sock");
@@ -666,6 +757,7 @@ mission "cli/child" state="ready" {
         (vec!["agents", "tree"], "AGENT TREE"),
         (vec!["work", "ls"], "WORK"),
         (vec!["terminals", "ls"], "TERMINALS"),
+        (vec!["conversations", "ls", "person/nathan"], "MESSAGES"),
     ] {
         let output = run_cli_human(&socket, &arguments).await;
         assert!(
@@ -1006,5 +1098,89 @@ mission "queued-work" state="ready" {
         "{}",
         String::from_utf8_lossy(&refused.stderr)
     );
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn missions_queued_cli_matches_agents_queue_show() {
+    let root = tempfile::tempdir().unwrap();
+    let socket = root.path().join("st3.sock");
+    let config_home = root.path().join("config");
+    std::fs::create_dir_all(config_home.join("st3")).unwrap();
+    std::fs::write(
+        config_home.join("st3/config.toml"),
+        "person = \"person/config-operator\"\n",
+    )
+    .unwrap();
+    let state = test_state(root.path());
+    let store = state.store.clone();
+    let source = r#"version 2
+agent "queued-alias-seat" { workspace "/tmp"; command "true" }
+mission "queued-alias-work" state="ready" {
+  concurrent-runs
+  goal "Give the durable seat one step."
+  step "work" { assigned-to "agent/queued-alias-seat" }
+}
+"#;
+    let intent = st3::graph::parse_intent(source, "client-v0-cli").unwrap();
+    let planned = store
+        .mission(
+            &intent,
+            IntentInput {
+                kdl: source.into(),
+                source_name: None,
+            },
+        )
+        .unwrap();
+    store
+        .apply(&intent, &planned.subject_tokens, "cli-queued-alias")
+        .unwrap();
+    let run = store
+        .create_mission_run(&MissionRunRequest {
+            mission: "queued-alias-work".into(),
+            revision: None,
+            workspace: "/tmp".into(),
+            requester: Some("person/requester".into()),
+            mode: Some("run".into()),
+            inputs: BTreeMap::new(),
+            idempotency_key: "cli-queued-alias-run-0".into(),
+        })
+        .unwrap();
+    store
+        .set_step_state(&run.steps[0].subject, "ready", None)
+        .unwrap();
+    let seat = run.steps[0].assigned_to.clone().unwrap();
+
+    let server_socket = socket.clone();
+    let server =
+        tokio::spawn(
+            async move { st3::api::serve_unix(&server_socket, st3::api::router(state)).await },
+        );
+    for _ in 0..100 {
+        if socket.exists() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert!(socket.exists(), "client-v0 test socket did not appear");
+
+    let via_agents =
+        value(&run_queue_cli(&socket, &config_home, true, &["agents", "queue", &seat]).await);
+    let via_missions =
+        value(&run_queue_cli(&socket, &config_home, true, &["missions", "queued", &seat]).await);
+    // `request_id` is minted fresh per call; every other field must match exactly.
+    assert_eq!(via_agents["value"], via_missions["value"]);
+    assert_eq!(via_agents["snapshot"], via_missions["snapshot"]);
+    assert_eq!(via_missions["value"]["kind"], "agent-queue");
+    assert_eq!(via_missions["value"]["next_work_id"], run.steps[0].subject);
+
+    let human_agents =
+        run_queue_cli(&socket, &config_home, false, &["agents", "queue", &seat]).await;
+    let human_missions =
+        run_queue_cli(&socket, &config_home, false, &["missions", "queued", &seat]).await;
+    assert!(human_agents.status.success());
+    assert!(human_missions.status.success());
+    assert_eq!(human_agents.stdout, human_missions.stdout);
+
     server.abort();
 }

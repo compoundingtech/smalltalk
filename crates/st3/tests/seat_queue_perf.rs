@@ -54,4 +54,10 @@ fn seat_queue_reads_on_the_performance_fixture() {
     time("agent_work_queues (roster)", 200, || {
         store.agent_work_queues().unwrap();
     });
+    time("work_for_reconcile_all", 200, || {
+        store.work_for_reconcile_all().unwrap();
+    });
+    time("work_for_reconcile (one seat)", 200, || {
+        store.work_for_reconcile(&seats[0]).unwrap();
+    });
 }

@@ -54,7 +54,7 @@ st3 refuses to replace a tracked `.st3/boot.md` with different bytes. The comple
 
 ## Mission constraints
 
-`constraint "TEXT"` can repeat on a mission or step. A step receives constraints from every ancestor mission and step, followed by its local constraints.
+`constraint "TEXT"` can repeat on a mission, a step, or an agent block inside a mission. A step receives constraints from every ancestor mission and step, followed by its local constraints, followed by the constraints of each agent it is assigned or available to. A rule written in an agent block binds only the steps that select that agent.
 
 A constraint states a mission-specific invariant. It must not repeat universal st3 behavior or disable harness features merely to make an eval pass.
 
@@ -114,6 +114,29 @@ st3 missions start release \
 Use `--follow` to wait for a terminal run. Use `--print-kdl` to inspect or save the generated declaration without publishing it.
 
 The default mission capacity is one active run. `concurrent-runs` removes the limit. `concurrent-runs max=4` sets a limit. A capacity error rejects the full publication.
+
+### Starting after another run
+
+`after` makes a run wait for another mission run before any of its work starts:
+
+```kdl
+version 2
+
+mission-run "release/deploy" {
+  mission "mission/deploy@0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+  workspace "/work/deploy"
+  requester "person/operator"
+  after "mission-run/release/build"
+}
+```
+
+`st3 missions start deploy --after release/build` publishes the same declaration.
+
+st3 gives the run an agentless first step, `after-run`. Every other step of the normal phase depends on it. The step completes when the named run completes. It fails when that run fails or is cancelled, and the waiting run then fails.
+
+The named run must exist when the run is published. A run cannot wait for itself. A mission with a root step named `after-run` cannot start with `after`.
+
+A waiting run counts toward its mission's `concurrent-runs` limit. `st3 missions show` prints an `AFTER` line with the run it waits for and whether the wait is over. `st3 agents queue` names that run beside a waiting entry.
 
 An optional mission `timeout="2h"` becomes one absolute deadline on each run. It is not reset by a mission revision or daemon restart. An eval-mode run requires a timeout of 20 minutes or less.
 
@@ -219,7 +242,11 @@ Use `st3 missions publish FILE --as ACTOR` for exact authored KDL. Agent actors 
 authority in their current desired declaration; a candidate definition cannot grant authority to
 its own publisher. Explicit person actors remain the trusted local-operator boundary.
 
-Persons and internal system actions are unchanged. The identity check assumes a trusted local runtime because `--as` can name another actor.
+Mission starts require an explicit `--as`; the placeholder `person/requester` is not a valid run
+requester. A harness with `ST_AGENT` can mutate only as its own seat. On Linux, the local Unix API
+also binds a connection from a harness process or its descendants to that seat and refuses a
+different actor in mutation requests. Persons and internal system actions remain on the trusted
+local runtime boundary.
 
 ### Runtime reset
 

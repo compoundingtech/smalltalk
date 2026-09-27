@@ -30,7 +30,8 @@ use st3::model::{
     ReplicaRecordView, ReplicationRepairRequest, ReplicationStatus, ReviewRequest,
     RevisionApprovalRequest, RevisionCancelRequest, RevisionProposalView, RevisionSubmissionView,
     RunGenerationView, SessionControlResponse, SessionInputMode, SessionInputRequest,
-    SessionScreen, SessionSignalRequest, StatusResponse, StepRunView, WorkRequest, WorkWakeRequest,
+    SessionScreen, SessionSignalRequest, StatusResponse, StepRunView, SubscriptionRequestDecision,
+    SubscriptionRequestView, WorkRequest, WorkRetryRequest, WorkWakeRequest,
 };
 use st3::reconcile::Reconciler;
 use st3::store::Store;
@@ -49,9 +50,9 @@ use tokio::sync::{Notify, watch};
 mod presentation;
 
 use presentation::{
-    OutputStyle, follow_snapshot, mission_run_signature, render_attention_show, render_generation,
-    render_generations, render_human_value, render_mission_run, render_revision_proposal,
-    render_step_run, shell_argument,
+    OutputStyle, follow_snapshot, mission_run_signature, relative_time, render_attention_show,
+    render_generation, render_generations, render_human_value, render_mission_run,
+    render_revision_proposal, render_step_run, shell_argument,
 };
 
 #[derive(Parser)]
@@ -283,6 +284,22 @@ enum MissionViewCommand {
     Start(MissionRunStartArgs),
     /// Cancel one exact running mission and stop its owned work and runtimes.
     Cancel(MissionCancelArgs),
+    /// Show one seat's current claim and its queued mission runs in order; same as `st3 agents queue AGENT`.
+    Queued {
+        /// Exact seat subject or its identity without the `agent/` prefix.
+        agent: String,
+    },
+    /// List the open mission requests that one subscription recorded.
+    Requests {
+        subscription: String,
+        /// Include started, cancelled, and failed requests.
+        #[arg(long)]
+        all: bool,
+    },
+    /// Start one mission request that an observation held for a person.
+    Release(SubscriptionRequestArgs),
+    /// Close one pending or held mission request without starting it.
+    CancelRequest(SubscriptionRequestArgs),
 }
 
 #[derive(Args)]
@@ -307,16 +324,25 @@ struct MissionPublishArgs {
 #[derive(Args)]
 struct MissionRunStartArgs {
     mission: String,
+    /// Start exactly this published revision, as printed by `missions publish`. A revision
+    /// published on another host is awaited briefly while it replicates here.
+    #[arg(long)]
+    revision: Option<String>,
+    /// The full run ID, used as given: `--id release/demo/1` starts `mission-run/release/demo/1`,
+    /// and `--id 1` starts `mission-run/1`. Defaults to MISSION/UUIDv7.
     #[arg(long)]
     id: Option<String>,
     #[arg(long, default_value = ".")]
     workspace: PathBuf,
     #[arg(long = "input", value_parser = parse_input)]
     inputs: Vec<(String, String)>,
+    /// Start no work until this mission run completes; fail if it fails or is cancelled.
+    #[arg(long, value_name = "RUN")]
+    after: Option<String>,
     #[arg(long)]
     follow: bool,
-    #[arg(long = "as")]
-    actor: Option<String>,
+    #[arg(long = "as", value_parser = parse_publication_actor)]
+    actor: String,
     /// Print the exact mission-run KDL without publishing it.
     #[arg(long)]
     print_kdl: bool,
@@ -888,6 +914,7 @@ enum AgentsCommand {
     /// Stop one exact durable seat.
     Stop(AgentStopArgs),
     /// Show one seat's current claim and its queued mission runs in order, or move a run.
+    /// The show form is also available as `st3 missions queued AGENT`.
     Queue(AgentQueueArgs),
 }
 
@@ -1032,6 +1059,15 @@ enum SchemaCommand {
     Export,
 }
 
+#[derive(Args)]
+struct SubscriptionRequestArgs {
+    request: String,
+    #[arg(long = "as", value_parser = parse_person_subject)]
+    actor: String,
+    #[arg(long)]
+    reason: String,
+}
+
 #[derive(Subcommand)]
 enum AttentionCommand {
     /// List all current human attention items.
@@ -1054,6 +1090,18 @@ enum AttentionCommand {
         actor: Option<String>,
     },
     /// Request attention after an explicit fault.
+    ///
+    /// The item stays in `st3 now` until its reviewer resolves it or you withdraw it with
+    /// `st3 attention withdraw` once the condition clears. It also leaves `now` on its own:
+    ///
+    /// - at once, when a `step-run/` or `run-generation/` target is no longer current;
+    /// - otherwise, once every other target has ended after the request: a `mission/` retired or
+    ///   cancelled, a `mission-run/` terminal, an `attention/` item resolved or its gate no
+    ///   longer pending, or an `agent/` stopped or ready on a later incarnation.
+    ///
+    /// `resource/` and `doc/` targets are context and never end an item. A target of any other
+    /// kind, or one that had already ended when you made the request, keeps it open.
+    #[command(verbatim_doc_comment)]
     Request(AttentionRequestArgs),
     /// Resolve or dismiss an explicit attention request.
     Resolve(AttentionResolveArgs),
@@ -1075,12 +1123,18 @@ struct AttentionRequestArgs {
     reason: String,
     #[arg(long, value_parser = ["warning", "error"], default_value = "error")]
     severity: String,
+    /// A subject this fault is about; repeat for several. Its kind decides whether it can end the
+    /// item on its own.
     #[arg(long = "target")]
     targets: Vec<String>,
     #[arg(long = "as")]
     actor: Option<String>,
     #[arg(long)]
     idempotency_key: Option<String>,
+    /// Resolve the item on its own once every target meets this `st3 trace wait` condition,
+    /// such as `completed` or `stopped`; it needs at least one --target.
+    #[arg(long, value_name = "CONDITION")]
+    until: Option<String>,
 }
 
 #[derive(Args)]
@@ -1133,6 +1187,8 @@ enum WorkCommand {
     Release(WorkActionArgs),
     /// Wake one ready assignee through its supported harness driver.
     Wake(WorkWakeArgs),
+    /// Retry one failed step; this reopens its failed run when that step was the only failure.
+    Retry(WorkRetryArgs),
     /// Publish the exact ready mission produced by one claimed step.
     PublishMission(WorkPublishMissionArgs),
     /// Propose a fenced revision to the mission that owns this work.
@@ -1150,6 +1206,15 @@ struct WorkWakeArgs {
     #[arg(long = "as")]
     actor: Option<String>,
     #[arg(long, default_value = "manual wake requested")]
+    reason: String,
+}
+
+#[derive(Args)]
+struct WorkRetryArgs {
+    subject: String,
+    #[arg(long = "as")]
+    actor: Option<String>,
+    #[arg(long)]
     reason: String,
 }
 
@@ -1411,6 +1476,9 @@ async fn main() -> ExitCode {
 }
 
 async fn run(cli: Cli) -> Result<()> {
+    let own = std::env::var("ST_AGENT").ok();
+    let mission_run = std::env::var("ST_MISSION_RUN").ok();
+    guard_mutating_cli_actor(&cli.command, own.as_deref(), mission_run.as_deref())?;
     if let Command::Up(args) = cli.command {
         return run_up(args).await;
     }
@@ -1519,6 +1587,84 @@ async fn run(cli: Cli) -> Result<()> {
         }
         Command::Driver(args) => run_driver(&client, args, cli.catalog.as_deref()).await,
     }
+}
+
+/// Guard every explicit actor on commands that change graph state before any request is sent.
+/// A harness may use its own agent identity, but cannot borrow a peer or person identity.
+fn guard_mutating_cli_actor(
+    command: &Command,
+    own: Option<&str>,
+    mission_run: Option<&str>,
+) -> Result<()> {
+    let Some(own) = own.filter(|own| own.starts_with("agent/")) else {
+        return Ok(());
+    };
+    let actor = match command {
+        Command::Missions { command } => match command {
+            MissionViewCommand::Publish(args) => Some(args.actor.as_str()),
+            MissionViewCommand::Start(args) => Some(args.actor.as_str()),
+            MissionViewCommand::Cancel(args) => Some(args.actor.as_str()),
+            _ => None,
+        },
+        Command::Agents { command } => match command {
+            AgentsCommand::Apply(args) => Some(args.actor.as_str()),
+            AgentsCommand::Start(args) => Some(args.actor.as_str()),
+            AgentsCommand::Stop(args) => Some(args.actor.as_str()),
+            AgentsCommand::Queue(args) => match &args.command {
+                Some(AgentQueueCommand::Move(args)) => Some(args.actor.as_deref().ok_or_else(|| {
+                    anyhow::anyhow!("a harness queue move needs explicit --as {own}; it cannot use the configured person")
+                })?),
+                None => None,
+            },
+            _ => None,
+        },
+        Command::Work { command } => match command {
+            WorkCommand::Claim(args) | WorkCommand::Renew(args) | WorkCommand::Progress(args)
+            | WorkCommand::Complete(args) | WorkCommand::Fail(args) | WorkCommand::Release(args) => args.actor.as_deref(),
+            WorkCommand::Wake(args) => args.actor.as_deref(),
+            WorkCommand::PublishMission(args) => args.actor.as_deref(),
+            WorkCommand::Revise(args) => args.actor.as_deref(),
+            WorkCommand::Revision { command } => match command {
+                WorkRevisionCommand::Approve { actor, .. } | WorkRevisionCommand::Cancel { actor, .. } => actor.as_deref(),
+                _ => None,
+            },
+            _ => None,
+        },
+        Command::Attention { command } => match command {
+            AttentionCommand::Request(args) => args.actor.as_deref(),
+            AttentionCommand::Resolve(args) => Some(args.actor.as_str()),
+            AttentionCommand::Withdraw(args) => Some(args.actor.as_str()),
+            AttentionCommand::Approve(args) | AttentionCommand::Reject(args) => Some(args.actor.as_str()),
+            _ => None,
+        },
+        Command::Launch { command } => match command {
+            LaunchCommand::Start(args) => Some(args.requester.as_str()),
+            LaunchCommand::Submit(args) => Some(args.actor.as_str()),
+            LaunchCommand::Revise(args) => Some(args.actor.as_str()),
+            LaunchCommand::Approve(args) => Some(args.actor.as_str()),
+            LaunchCommand::ApproveAndLaunch(args) => Some(args.actor.as_str()),
+            LaunchCommand::Run(args) => Some(args.actor.as_str()),
+            LaunchCommand::Question(args) => Some(args.actor.as_str()),
+            LaunchCommand::Answer(args) => Some(args.actor.as_str()),
+            LaunchCommand::Cancel(args) => Some(args.actor.as_str()),
+            LaunchCommand::Propose(args) => args.actor.as_deref(),
+            _ => None,
+        },
+        Command::Claim(args) => args.actor.as_deref(),
+        Command::Diagnostic(args) => Some(args.actor.as_str()),
+        _ => None,
+    };
+    if let Some(actor) = actor {
+        if actor.starts_with("person/") || actor == "requester" {
+            anyhow::bail!(
+                "this harness is `{own}` (ST_AGENT) and cannot act as `{actor}` on a mutating command; request a person through `st3 attention request --as \"$ST_AGENT\"`"
+            );
+        }
+        if let Some(message) = foreign_agent_actor(actor, Some(own), mission_run) {
+            anyhow::bail!(message);
+        }
+    }
+    Ok(())
 }
 
 fn run_claude_channel(command: ClaudeChannelCommand) -> Result<()> {
@@ -1673,7 +1819,7 @@ async fn run_up(args: UpArgs) -> Result<()> {
     let local_socket = config.socket.clone();
     let client_gateway_socket = config.client_gateway_socket.clone();
     tokio::try_join!(
-        serve_unix(&local_socket, router(state.clone())),
+        st3::api::serve_unix_bound(&local_socket, router(state.clone())),
         serve_unix(&client_gateway_socket, fabric_router(state)),
     )?;
     Ok(())
@@ -2109,6 +2255,18 @@ async fn run_mission_view(
         MissionViewCommand::Cancel(args) => {
             cancel_mission_run(client, endpoint, args, json_output).await
         }
+        MissionViewCommand::Queued { agent } => {
+            show_agent_queue(endpoint, &agent, json_output).await
+        }
+        MissionViewCommand::Requests { subscription, all } => {
+            list_subscription_requests(client, subscription, all, json_output).await
+        }
+        MissionViewCommand::Release(args) => {
+            decide_subscription_request(client, "release", args, json_output).await
+        }
+        MissionViewCommand::CancelRequest(args) => {
+            decide_subscription_request(client, "cancel", args, json_output).await
+        }
     }
 }
 
@@ -2145,7 +2303,14 @@ async fn publish_mission_file(
             },
         )
         .await?;
-    print_value(&response, json_output)
+    // Name each exact revision so `missions start --revision` can require it on any host.
+    let mut value = serde_json::to_value(&response)?;
+    value["published_missions"] = mission
+        .mission_revisions
+        .iter()
+        .map(|(subject, revision)| json!({"subject": subject, "revision": revision}))
+        .collect();
+    print_value(&value, json_output)
 }
 
 async fn cancel_mission_run(
@@ -2198,9 +2363,13 @@ async fn start_mission_run(
         .mission
         .strip_prefix("mission/")
         .unwrap_or(&args.mission);
-    let mission: st3::model::MissionSpec = client
-        .get(&format!("/v1/missions/{}", urlencoding::encode(mission_id)))
-        .await?;
+    let mission = startable_mission(
+        client,
+        mission_id,
+        args.revision.as_deref(),
+        MISSION_ARRIVAL_WAIT,
+    )
+    .await?;
     anyhow::ensure!(
         mission.state == MissionState::Ready,
         "mission `mission/{mission_id}` is not ready"
@@ -2214,8 +2383,11 @@ async fn start_mission_run(
         .canonicalize()
         .with_context(|| format!("resolve workspace {}", args.workspace.display()))?;
     let inputs = unique_pairs(args.inputs, "input")?;
-    let actor = args.actor.unwrap_or_else(|| "person/requester".into());
+    let actor = args.actor;
     let requester = normalize_requester_subject(&actor);
+    let after = args
+        .after
+        .map(|after| format!("mission-run/{}", after.trim_start_matches("mission-run/")));
     let kdl = mission_run_intent(
         run_id,
         mission_id,
@@ -2224,29 +2396,41 @@ async fn start_mission_run(
         &requester,
         &inputs,
         "run",
+        after.as_deref(),
     );
     if args.print_kdl {
         print!("{kdl}");
         return Ok(());
     }
+    let subject = format!("mission-run/{run_id}");
     let response = publish_text(
         client,
         kdl,
         format!("st3 missions start {mission_id}"),
         actor,
     )
-    .await?;
-    let subject = format!("mission-run/{run_id}");
+    .await
+    .with_context(|| format!("start `{subject}` from mission `mission/{mission_id}`"))?;
     let started: MissionRunView = client
         .get(&format!(
             "/v1/mission-runs/{}",
             urlencoding::encode(&subject)
         ))
         .await?;
+    let publications = mission_publications(client, mission_id).await?;
+    let started_revision = started_revision_note(mission_id, &mission.revision, &publications);
+    if !json_output {
+        eprintln!("{started_revision}");
+    }
     if !args.follow {
         return if json_output {
             print_value(
-                &json!({"publication": response, "mission_run": started}),
+                &json!({
+                    "publication": response,
+                    "mission_run": started,
+                    "mission_revision": mission.revision,
+                    "started_revision": started_revision,
+                }),
                 true,
             )
         } else {
@@ -2255,6 +2439,138 @@ async fn start_mission_run(
         };
     }
     follow_mission_run(client, started, response.store_index, json_output).await
+}
+
+/// How long `missions start` waits for a mission published on another host to arrive here.
+const MISSION_ARRIVAL_WAIT: Duration = Duration::from_secs(60);
+
+/// Read the mission that `missions start` will run. A publish on another host reaches this
+/// host by replication, so a mission or requested revision that has not arrived yet waits
+/// briefly with a plain message instead of failing.
+async fn startable_mission(
+    client: &Client,
+    mission_id: &str,
+    revision: Option<&str>,
+    wait: Duration,
+) -> Result<st3::model::MissionSpec> {
+    let deadline = Instant::now() + wait;
+    let mut announced = false;
+    loop {
+        let absent = match client
+            .get::<st3::model::MissionSpec>(&format!(
+                "/v1/missions/{}",
+                urlencoding::encode(mission_id)
+            ))
+            .await
+        {
+            Ok(mission) if revision.is_none_or(|wanted| wanted == mission.revision) => {
+                return Ok(mission);
+            }
+            Ok(mission) => {
+                let wanted = revision.unwrap_or_default();
+                let publications = mission_publications(client, mission_id).await?;
+                anyhow::ensure!(
+                    !publications
+                        .iter()
+                        .any(|publication| publication.revision == wanted),
+                    "mission/{mission_id} revision {wanted} was replaced by revision {}. \
+                     Start that revision, or publish again.",
+                    mission.revision
+                );
+                format!("mission/{mission_id} revision {wanted} has not reached this host yet")
+            }
+            Err(error) if st3::client::is_not_found(&error) => {
+                format!("mission/{mission_id} has not reached this host yet")
+            }
+            Err(error) => return Err(error),
+        };
+        let now = Instant::now();
+        anyhow::ensure!(
+            now < deadline,
+            "{absent} after {}s. A mission published on another host arrives by replication; \
+             check `st3 replication status`.",
+            wait.as_secs()
+        );
+        if !announced {
+            eprintln!(
+                "{absent}. Waiting up to {}s for it to replicate here.",
+                wait.as_secs()
+            );
+            announced = true;
+        }
+        tokio::time::sleep(Duration::from_millis(500).min(deadline - now)).await;
+    }
+}
+
+struct MissionPublication {
+    revision: String,
+    origin: String,
+    accepted_at_unix_ms: u128,
+}
+
+/// The mission's publications on this host, newest first.
+async fn mission_publications(
+    client: &Client,
+    mission_id: &str,
+) -> Result<Vec<MissionPublication>> {
+    let page: ClaimsPage = client
+        .get(&format!(
+            "/v1/claims?subject={}&order=desc&limit=100",
+            urlencoding::encode(&format!("mission/{mission_id}"))
+        ))
+        .await?;
+    Ok(page
+        .claims
+        .into_iter()
+        .filter(|claim| claim.kind == "mission.published")
+        .filter_map(|claim| {
+            Some(MissionPublication {
+                revision: claim.body.get("revision")?.as_str()?.to_owned(),
+                origin: claim.origin,
+                accepted_at_unix_ms: claim.accepted_at_unix_ms,
+            })
+        })
+        .collect())
+}
+
+/// Say which revision a run started, and whether other revisions share the mission name.
+fn started_revision_note(
+    mission_id: &str,
+    revision: &str,
+    publications: &[MissionPublication],
+) -> String {
+    let started = publications
+        .iter()
+        .find(|publication| publication.revision == revision);
+    let others = publications
+        .iter()
+        .filter(|publication| publication.revision != revision)
+        .map(|publication| publication.revision.as_str())
+        .collect::<BTreeSet<_>>();
+    let Some(started) = started.filter(|_| !others.is_empty()) else {
+        return format!("Started mission/{mission_id} revision {revision}.");
+    };
+    let newer = publications
+        .iter()
+        .filter(|publication| {
+            publication.revision != revision
+                && publication.accepted_at_unix_ms > started.accepted_at_unix_ms
+        })
+        .count();
+    let published = i64::try_from(started.accepted_at_unix_ms)
+        .ok()
+        .and_then(chrono::DateTime::from_timestamp_millis)
+        .map(|value| value.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+        .unwrap_or_else(|| "at an unknown time".into());
+    let count = others.len();
+    let plural = if count == 1 { "" } else { "s" };
+    let relation = if newer == 0 { "older" } else { "other" };
+    format!(
+        "Started mission/{mission_id} revision {revision}, published {published} on {}. \
+         {count} {relation} revision{plural} share{} this mission name.",
+        started.origin,
+        if count == 1 { "s" } else { "" }
+    )
 }
 
 async fn follow_mission_run(
@@ -2328,6 +2644,7 @@ fn mission_run_follow_succeeded(status: &str) -> bool {
     matches!(status, "completed" | "standing")
 }
 
+#[allow(clippy::too_many_arguments)]
 fn mission_run_intent(
     run_id: &str,
     mission_id: &str,
@@ -2336,6 +2653,7 @@ fn mission_run_intent(
     requester: &str,
     inputs: &BTreeMap<String, String>,
     mode: &str,
+    after: Option<&str>,
 ) -> String {
     let mut run = KdlNode::new("mission-run");
     run.entries_mut().push(KdlEntry::new(run_id));
@@ -2354,6 +2672,9 @@ fn mission_run_intent(
     for (name, value) in inputs {
         body.nodes_mut()
             .push(kdl_node("input", [name.as_str(), value.as_str()]));
+    }
+    if let Some(after) = after {
+        body.nodes_mut().push(kdl_node("after", [after]));
     }
     run.set_children(body);
     publication_document(run)
@@ -2846,6 +3167,9 @@ fn trace_scalar(value: &Value) -> String {
 
 async fn run_wait(client: &Client, args: WaitArgs, json_output: bool) -> Result<()> {
     validate_wait_condition(&args.condition)?;
+    if let Some(actor) = args.actor.as_deref() {
+        reject_foreign_agent_actor(actor)?;
+    }
     let timeout = parse_timeout(&args.timeout)?;
     let actor = args.actor.as_deref().map(normalize_agent_subject);
     let wait = wait_for_condition(client, &args.subject, &args.condition, actor.as_deref());
@@ -2942,24 +3266,25 @@ fn render_now_page(page: &ClientPage, continuation_command: &str) -> String {
                     || matches!(agent.state.as_str(), "failed" | "waiting" | "stopped"))
             && !matches!(item, ClientResource::Runtime(runtime) if runtime.state != "running")
     });
+    working.page.next_cursor = None;
     let mut output = String::new();
     output.push_str(&render_product_page(
         "NEEDS YOU",
         &needs_you,
         continuation_command,
     ));
-    output.push('\n');
-    output.push_str(&render_product_page(
-        "WORKING",
-        &working,
-        continuation_command,
-    ));
-    output.push('\n');
-    output.push_str(&render_product_page(
-        "UNHEALTHY",
-        &unhealthy,
-        continuation_command,
-    ));
+    // The server fills Now with attention, and adds work only for an explicit work
+    // filter. Print a section only when the page holds its items, so a section the
+    // server never filled does not read as zero.
+    for (title, section) in [("WORKING", &working), ("UNHEALTHY", &unhealthy)] {
+        if !section.items.is_empty() {
+            output.push('\n');
+            output.push_str(&render_product_page(title, section, continuation_command));
+        }
+    }
+    if working.items.is_empty() && unhealthy.items.is_empty() {
+        output.push_str("\nWork: st3 work ls · Health: st3 doctor\n");
+    }
     if let Some(cursor) = page.page.next_cursor.as_deref() {
         use std::fmt::Write as _;
         let _ = writeln!(
@@ -3120,6 +3445,38 @@ fn print_product_page(
     Ok(())
 }
 
+/// `target mission/fleet/typecase: cancelled 4h ago`
+fn attention_target_line(target: &st3_client::AttentionTargetState, now_unix_ms: u128) -> String {
+    let since = target
+        .since
+        .as_deref()
+        .and_then(|since| chrono::DateTime::parse_from_rfc3339(since).ok())
+        .map(|since| {
+            format!(
+                " {}",
+                relative_time(since.timestamp_millis().max(0) as u128, now_unix_ms)
+            )
+        })
+        .unwrap_or_default();
+    format!("target {}: {}{since}", target.id, target.state)
+}
+
+/// Active and finished runs apart, so a mission with one live run and five old ones does not
+/// read as six runs. A daemon that does not report active runs gets the plain total.
+fn render_mission_runs(mission: &st3_client::Mission) -> String {
+    let total = mission.runs.len();
+    let plural = |count: usize| if count == 1 { "" } else { "s" };
+    let Some(active) = mission.active_runs.map(|active| active.min(total)) else {
+        return format!("{total} run{}", plural(total));
+    };
+    match (active, total - active) {
+        (0, 0) => "0 runs".into(),
+        (active, 0) => format!("{active} active run{}", plural(active)),
+        (0, finished) => format!("{finished} finished run{}", plural(finished)),
+        (active, finished) => format!("{active} active · {finished} finished"),
+    }
+}
+
 fn render_product_page(title: &str, page: &ClientPage, continuation_command: &str) -> String {
     use std::fmt::Write as _;
 
@@ -3146,11 +3503,26 @@ fn render_product_page(title: &str, page: &ClientPage, continuation_command: &st
                     "{}  attention  {}  {}  {}",
                     item.header.id, item.priority, item.state, item.title
                 );
+                for target in &item.target_states {
+                    let _ = writeln!(output, "  {}", attention_target_line(target, now_ms()));
+                }
                 let _ = writeln!(
                     output,
                     "  action: st3 attention show {} --as {}",
                     item.source_id, item.person_id
                 );
+                if item.header.operational.as_ref().is_some_and(|operational| {
+                    operational
+                        .reasons
+                        .iter()
+                        .any(|reason| reason == "requester-retired")
+                }) {
+                    let _ = writeln!(
+                        output,
+                        "  requester retired: only {} can close it",
+                        item.person_id
+                    );
+                }
             }
             ClientResource::Work(item) => {
                 let _ = writeln!(
@@ -3166,14 +3538,13 @@ fn render_product_page(title: &str, page: &ClientPage, continuation_command: &st
             ClientResource::Mission(item) => {
                 let _ = writeln!(
                     output,
-                    "{}  {}  {} run{}",
+                    "{}  {}  {}",
                     item.header.id,
                     item.state,
-                    item.runs.len(),
-                    if item.runs.len() == 1 { "" } else { "s" }
+                    render_mission_runs(item)
                 );
                 if let Some(usage) = &item.usage {
-                    let _ = writeln!(output, "  usage {} tokens", usage.total_tokens);
+                    let _ = writeln!(output, "  usage {}", render_usage(usage));
                 }
                 if let Some(run) = item.runs.last() {
                     let _ = writeln!(output, "  inspect: st3 missions show {run}");
@@ -3285,7 +3656,7 @@ fn render_product_page(title: &str, page: &ClientPage, continuation_command: &st
                     item.header.id, item.state, item.owner_id, item.started_at
                 );
                 if let Some(usage) = &item.usage {
-                    let _ = writeln!(output, "  usage {} tokens", usage.total_tokens);
+                    let _ = writeln!(output, "  usage {}", render_usage(usage));
                 }
                 let _ = writeln!(
                     output,
@@ -3306,6 +3677,46 @@ fn render_product_page(title: &str, page: &ClientPage, continuation_command: &st
         );
     }
     output
+}
+
+/// A mailbox listing with the same heading, filters, and empty line as the other lists. Each row
+/// stays one tab-separated message.
+fn render_mailbox(identity: &str, sender: Option<&str>, archive: bool, rows: &[String]) -> String {
+    use std::fmt::Write as _;
+
+    let mut output = String::new();
+    let _ = writeln!(output, "MESSAGES  {}", rows.len());
+    let mut filters = vec![format!("mailbox={identity}")];
+    if let Some(sender) = sender {
+        filters.push(format!("from={sender}"));
+    }
+    if archive {
+        filters.push("archived=included".into());
+    }
+    let _ = writeln!(output, "FILTERS  {}", filters.join(" · "));
+    if rows.is_empty() {
+        let _ = writeln!(output, "No current items.");
+    }
+    for row in rows {
+        let _ = writeln!(output, "{row}");
+    }
+    output
+}
+
+/// Token spend, or that none was reported. Some drivers report only context occupancy, which
+/// counts no spend, so a summary without a spending incarnation is unknown, not zero.
+fn render_usage(usage: &st3_client::UsageSummary) -> String {
+    if usage.incarnation_count > 0 {
+        return format!("{} tokens", usage.total_tokens);
+    }
+    match usage
+        .context
+        .as_ref()
+        .and_then(|context| context.used_tokens)
+    {
+        Some(used) => format!("not reported · context {used} tokens"),
+        None => "not reported".into(),
+    }
 }
 
 fn print_activity_page(
@@ -3715,53 +4126,17 @@ async fn condition_value(client: &Client, subject: &str, condition: &str) -> Res
         return Ok((eval.verdict.as_deref() == Some(expected)).then(|| json!(eval)));
     }
     let status = status_for(client, subject).await?;
-    let item = status.subjects.first();
-    let actual_status = projected_actual_status(item.and_then(|item| item.actual.as_ref()));
-    let matches = match condition {
-        "running" => matches!(actual_status, Some("running" | "ready")),
-        "ready" => actual_status == Some("ready"),
-        "standing" => actual_status == Some("standing"),
-        "completed" => actual_status == Some("completed"),
-        "failed" => actual_status == Some("failed"),
-        "cancelled" => actual_status == Some("cancelled"),
-        "delivered" => actual_status == Some("delivered"),
-        "terminal" => matches!(actual_status, Some("completed" | "failed" | "cancelled")),
-        "exited" => actual_status == Some("exited"),
-        "stopped" => {
-            item.is_none_or(|item| item.actual.is_none())
-                || matches!(actual_status, Some("stopped" | "removed"))
-        }
-        _ => false,
-    };
+    let matches = st3::model::status_wait_condition_holds(condition, status.subjects.first());
     Ok(matches.then(|| json!(status)))
-}
-
-fn projected_actual_status(actual: Option<&Value>) -> Option<&str> {
-    let fields = actual.map(|actual| actual.get("fields").unwrap_or(actual))?;
-    fields
-        .get("status")
-        .or_else(|| fields.pointer("/facts/status"))
-        .and_then(Value::as_str)
 }
 
 fn validate_wait_condition(condition: &str) -> Result<()> {
     anyhow::ensure!(
-        matches!(
-            condition,
-            "running"
-                | "ready"
-                | "standing"
-                | "completed"
-                | "failed"
-                | "cancelled"
-                | "delivered"
-                | "terminal"
-                | "exited"
-                | "stopped"
-        ) || matches!(
-            condition.strip_prefix("verdict="),
-            Some("pass" | "fail" | "void")
-        ),
+        st3::model::STATUS_WAIT_CONDITIONS.contains(&condition)
+            || matches!(
+                condition.strip_prefix("verdict="),
+                Some("pass" | "fail" | "void")
+            ),
         "unknown wait condition `{condition}`"
     );
     Ok(())
@@ -4656,6 +5031,19 @@ fn mission_run_subject(value: &str) -> String {
     }
 }
 
+/// Shared by `st3 agents queue AGENT` and `st3 missions queued AGENT`.
+async fn show_agent_queue(endpoint: &Endpoint, agent: &str, json_output: bool) -> Result<()> {
+    let agent = seat_subject(agent);
+    let response = generated_client(endpoint, None)?
+        .agent_queue(&agent)
+        .await?;
+    if json_output {
+        return print_value(&response, true);
+    }
+    print!("{}", render_agent_queue(&response.value));
+    Ok(())
+}
+
 async fn run_agent_queue(
     endpoint: &Endpoint,
     configured_person: Option<&str>,
@@ -4663,15 +5051,8 @@ async fn run_agent_queue(
     json_output: bool,
 ) -> Result<()> {
     let Some(AgentQueueCommand::Move(args)) = args.command else {
-        let agent = seat_subject(&args.agent.context("st3 agents queue needs an AGENT")?);
-        let response = generated_client(endpoint, None)?
-            .agent_queue(&agent)
-            .await?;
-        if json_output {
-            return print_value(&response, true);
-        }
-        print!("{}", render_agent_queue(&response.value));
-        return Ok(());
+        let agent = args.agent.context("st3 agents queue needs an AGENT")?;
+        return show_agent_queue(endpoint, &agent, json_output).await;
     };
     let actor = args.actor.as_deref().or(configured_person).context(
         "st3 agents queue move needs `--as person/NAME`, `--as agent/PATH`, or `person = \"person/NAME\"` in the st3 config",
@@ -4792,6 +5173,12 @@ fn render_agent_queue(queue: &st3_client::AgentQueue) -> String {
             }
             _ if run.waiting_work_ids.is_empty() => "no open step for this seat".into(),
             _ => format!("{} not ready", run.waiting_work_ids.join(", ")),
+        };
+        let detail = match &run.waiting_for_run_id {
+            Some(after) if run.state == "waiting" => {
+                format!("{detail}; waiting for {after} to complete")
+            }
+            _ => detail,
         };
         let run_state = if run.run_state == "running" {
             String::new()
@@ -5055,7 +5442,7 @@ fn foreign_agent_actor(
     } else {
         normalize_message_subject_in_run(actor, mission_run)
     };
-    (actor != own).then(|| {
+    (actor.starts_with("agent/") && actor != own).then(|| {
         format!(
             "this harness is `{own}` (ST_AGENT) and cannot act as `{actor}`; use `--as \"$ST_AGENT\"` or `--from \"$ST_AGENT\"`"
         )
@@ -5305,14 +5692,17 @@ async fn run_attention(
             let response: AttentionRequestView = client
                 .post(
                     "/v1/attention",
-                    &AttentionRequest {
-                        reviewer: args.reviewer,
-                        title: args.title,
-                        reason: args.reason,
-                        severity: args.severity,
-                        targets: args.targets,
-                        actor,
-                        idempotency_key,
+                    &st3::model::AttentionRequestPost {
+                        request: AttentionRequest {
+                            reviewer: args.reviewer,
+                            title: args.title,
+                            reason: args.reason,
+                            severity: args.severity,
+                            targets: args.targets,
+                            actor,
+                            idempotency_key,
+                        },
+                        until: args.until,
                     },
                 )
                 .await?;
@@ -5390,6 +5780,9 @@ async fn run_work(
             cursor,
             limit,
         } => {
+            if let Some(actor) = actor.as_deref() {
+                reject_foreign_agent_actor(actor)?;
+            }
             anyhow::ensure!(
                 limit > 0 && limit <= 200,
                 "the work limit must be 1 through 200"
@@ -5450,6 +5843,21 @@ async fn run_work(
                         actor,
                         reason: args.reason,
                         idempotency_key: format!("manual-work-wake:{}:{nonce}", args.subject),
+                    },
+                )
+                .await?;
+            print_value(&response, json_output)
+        }
+        WorkCommand::Retry(args) => {
+            let actor = args.actor.context("a work retry needs explicit --as")?;
+            let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+            let response: MissionRunView = client
+                .post(
+                    &format!("/v1/work/retry/{}", urlencoding::encode(&args.subject)),
+                    &WorkRetryRequest {
+                        actor,
+                        reason: args.reason,
+                        idempotency_key: format!("manual-work-retry:{}:{nonce}", args.subject),
                     },
                 )
                 .await?;
@@ -5541,7 +5949,14 @@ fn render_client_work_detail(work: &st3_client::Work) -> String {
         let _ = writeln!(output, "Incarnation: {incarnation}");
     }
     if let Some(reason) = &work.blocked_reason {
-        let _ = writeln!(output, "Blocked: {reason}");
+        // The store keeps the reason for any state change here, such as a failure or an
+        // expired lease; only blocked work is blocked by it.
+        let label = if work.state == "blocked" {
+            "Blocked"
+        } else {
+            "Reason"
+        };
+        let _ = writeln!(output, "{label}: {reason}");
     }
     for blocker in &work.blockers {
         let _ = writeln!(output, "Blocker: {blocker}");
@@ -5553,7 +5968,7 @@ fn render_client_work_detail(work: &st3_client::Work) -> String {
         let _ = writeln!(output, "Constraint: {constraint}");
     }
     if let Some(usage) = &work.usage {
-        let _ = writeln!(output, "Usage: {} tokens", usage.total_tokens);
+        let _ = writeln!(output, "Usage: {}", render_usage(usage));
     }
     if let Some(operational) = &work.header.operational {
         let reasons = if operational.reasons.is_empty() {
@@ -5889,9 +6304,11 @@ async fn run_message(
                 args.identity.or(args.actor),
                 std::env::var("ST_AGENT").ok(),
             )?;
+            reject_foreign_agent_actor(&identity)?;
             let sender = args.sender.map(|sender| normalize_message_subject(&sender));
             let mut count = 0_u64;
             let mut first = true;
+            let mut rows = Vec::new();
             if json_output && !args.count {
                 print!("[");
             }
@@ -5913,13 +6330,13 @@ async fn run_message(
                     print!("{}", serde_json::to_string(&message)?);
                     first = false;
                 } else {
-                    println!(
+                    rows.push(format!(
                         "{}\t{}\t{}\t{}",
                         message.subject,
                         message.status,
                         message.from,
                         message.title.as_deref().unwrap_or("message")
-                    );
+                    ));
                 }
                 Ok(())
             })
@@ -5928,6 +6345,11 @@ async fn run_message(
                 println!("{count}");
             } else if json_output {
                 println!("]");
+            } else {
+                print!(
+                    "{}",
+                    render_mailbox(&identity, sender.as_deref(), args.archive, &rows)
+                );
             }
             Ok(())
         }
@@ -6732,7 +7154,7 @@ async fn run_st2_native_driver(
                         ]),
                         evidence: Vec::new(),
                         expected_subject: None,
-                        idempotency_key: Some(format!("native-exit:{subject}:{runtime_id}")),
+                        idempotency_key: Some(native_exit_key(subject, &runtime_id, &incarnation)),
                     }).await;
                     match result {
                         Ok(_) => break,
@@ -6864,7 +7286,7 @@ async fn run_st2_native_driver(
                             "claude-channel",
                             NativeDeliveryReceipts::ClaudeChannel {
                                 agent_dir: &agent_dir,
-                                incarnation: &incarnation,
+                                incarnation: claude_receipt_incarnation(&incarnation, provider_incarnation.as_deref()),
                             },
                             &incarnation,
                             &mut delivery,
@@ -7453,6 +7875,11 @@ async fn run_pi_channel(client: &Client, subject: &str, driver: &str) -> Result<
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut delivered = BTreeSet::new();
+    let mut pending_acks = BTreeSet::new();
+    let mut failed_handoffs = BTreeMap::<String, u32>::new();
+    let mut failed_diagnostics = BTreeSet::new();
+    let mut first_idle_seen = false;
+    let mut last_warning = None;
     let mut work_interval = tokio::time::interval(std::time::Duration::from_secs(1));
     work_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut renewed_minute = None;
@@ -7468,11 +7895,11 @@ async fn run_pi_channel(client: &Client, subject: &str, driver: &str) -> Result<
                         let Some(state) = frame.get("state").and_then(Value::as_str) else { continue; };
                         let status = match state {
                             "active" => "working",
-                            "idle" => "idle",
+                            "idle" => { first_idle_seen = true; "idle" },
                             _ => continue,
                         };
                         frame_sequence = frame_sequence.saturating_add(1);
-                        let _: ClaimRecord = client.post("/v1/claims", &ClaimInput {
+                        let result: Result<ClaimRecord> = client.post("/v1/claims", &ClaimInput {
                             subject: subject.into(),
                             kind: "harness.observed".into(),
                             actor: Some(subject.into()),
@@ -7485,39 +7912,95 @@ async fn run_pi_channel(client: &Client, subject: &str, driver: &str) -> Result<
                             evidence: Vec::new(),
                             expected_subject: None,
                             idempotency_key: Some(format!("pi-state:{subject}:{incarnation}:{session}:{frame_sequence}")),
-                        }).await?;
+                        }).await;
+                        if let Err(error) = result {
+                            warn_pi_channel(subject, &error, &mut last_warning);
+                        }
                     }
                     Some("delivered") => {
                         let Some(message) = frame.pointer("/meta/messageId").and_then(Value::as_str) else { continue; };
-                        acknowledge_pi_family_delivery(client, subject, message).await?;
+                        pending_acks.insert(message.to_owned());
+                        if let Err(error) = acknowledge_pi_family_delivery(client, subject, message).await {
+                            warn_pi_channel(subject, &error, &mut last_warning);
+                        } else {
+                            pending_acks.remove(message);
+                        }
+                    }
+                    Some("failed") => {
+                        let Some(message) = frame.pointer("/meta/messageId").and_then(Value::as_str) else { continue; };
+                        let failures = failed_handoffs.entry(message.to_owned()).or_default();
+                        *failures += 1;
+                        if *failures < 3 {
+                            delivered.remove(message);
+                        } else {
+                            failed_diagnostics.insert(message.to_owned());
+                        }
                     }
                     _ => {}
                 }
             }
             _ = interval.tick() => {
+                for message in failed_diagnostics.clone() {
+                    let result: Result<ClaimRecord> = client.post("/v1/claims", &ClaimInput {
+                        subject: subject.into(),
+                        kind: "harness.diagnostic".into(),
+                        actor: Some(subject.into()),
+                        fields: BTreeMap::from([
+                            ("severity".into(), Value::String("error".into())),
+                            ("status".into(), Value::String("failed".into())),
+                            ("code".into(), Value::String("pi-handoff-failed".into())),
+                            ("reason".into(), Value::String(format!("the {driver} channel could not hand off {message} after three attempts"))),
+                            ("incarnation_id".into(), Value::String(incarnation.clone())),
+                        ]),
+                        evidence: Vec::new(),
+                        expected_subject: None,
+                        idempotency_key: Some(format!("pi-handoff-failed:{subject}:{incarnation}:{message}")),
+                    }).await;
+                    match result {
+                        Ok(_) => { failed_diagnostics.remove(&message); },
+                        Err(error) => warn_pi_channel(subject, &error, &mut last_warning),
+                    }
+                }
+                for message in pending_acks.clone() {
+                    match acknowledge_pi_family_delivery(client, subject, &message).await {
+                        Ok(()) => { pending_acks.remove(&message); }
+                        Err(error) => warn_pi_channel(subject, &error, &mut last_warning),
+                    }
+                }
+                if !first_idle_seen { continue; }
                 let mut cursor = None;
                 loop {
-                    let page = message_page(client, Some(subject), false, cursor.as_deref()).await?;
+                    let page = match message_page(client, Some(subject), false, cursor.as_deref()).await {
+                        Ok(page) => page,
+                        Err(error) => { warn_pi_channel(subject, &error, &mut last_warning); break; }
+                    };
                     for message in page.items.into_iter().filter(|message| matches!(message.status.as_str(), "sent" | "staged")) {
                     if !delivered.insert(message.subject.clone()) {
                         continue;
                     }
-                    let body = message_content(client, &message).await?;
+                    let body = match message_content(client, &message).await {
+                        Ok(body) => body,
+                        Err(error) => {
+                            delivered.remove(&message.subject);
+                            warn_pi_channel(subject, &error, &mut last_warning);
+                            continue;
+                        }
+                    };
+                    if message.status == "sent" {
+                        match stage_pi_family_message(client, &message.subject, subject, driver).await {
+                            Ok(true) => {},
+                            Ok(false) => { delivered.remove(&message.subject); continue; },
+                            Err(error) => {
+                                delivered.remove(&message.subject);
+                                warn_pi_channel(subject, &error, &mut last_warning);
+                                continue;
+                            }
+                        }
+                    }
                     let frame = pi_family_message_frame(&message, &body, identity);
                     stdout.write_all(serde_json::to_string(&frame)?.as_bytes()).await?;
                     stdout.write_all(b"\n").await?;
                     stdout.flush().await?;
-                    if message.status == "sent" {
-                        stage_message(
-                            client,
-                            &message.subject,
-                            subject,
-                            &format!("{driver}-channel"),
-                            None,
-                            format!("native-staged:{driver}-channel:{subject}:{}", message.subject),
-                        )
-                        .await?;
-                    }
                     }
                     match page.next_cursor {
                         Some(next) => cursor = Some(next),
@@ -7528,11 +8011,52 @@ async fn run_pi_channel(client: &Client, subject: &str, driver: &str) -> Result<
             _ = work_interval.tick() => {
                 let minute = unix_minute()?;
                 if renewed_minute != Some(minute) {
-                    renew_claimed_work(client, subject, minute).await?;
-                    renewed_minute = Some(minute);
+                    match renew_claimed_work(client, subject, minute).await {
+                        Ok(()) => renewed_minute = Some(minute),
+                        Err(error) => warn_pi_channel(subject, &error, &mut last_warning),
+                    }
                 }
             }
         }
+    }
+}
+
+fn warn_pi_channel(
+    subject: &str,
+    error: &anyhow::Error,
+    last_warning: &mut Option<std::time::Instant>,
+) {
+    let now = std::time::Instant::now();
+    if last_warning.is_none_or(|last| now.duration_since(last) >= Duration::from_secs(10)) {
+        eprintln!("warning: `{subject}` pi-family channel request failed; retrying: {error:#}");
+        *last_warning = Some(now);
+    }
+}
+
+async fn stage_pi_family_message(
+    client: &Client,
+    message: &str,
+    subject: &str,
+    driver: &str,
+) -> Result<bool> {
+    match stage_message(
+        client,
+        message,
+        subject,
+        &format!("{driver}-channel"),
+        None,
+        format!("native-staged:{driver}-channel:{subject}:{message}"),
+    )
+    .await
+    {
+        Ok(_) => Ok(true),
+        Err(error) => match read_message(client, message).await {
+            Ok(view) if view.status == "staged" => Ok(true),
+            Ok(view) if matches!(view.status.as_str(), "delivered" | "read" | "closed") => {
+                Ok(false)
+            }
+            _ => Err(error),
+        },
     }
 }
 
@@ -8376,6 +8900,19 @@ fn claude_channel_consumed_delivery_filenames(
         .collect())
 }
 
+fn native_exit_key(subject: &str, runtime_id: &str, incarnation: &str) -> String {
+    format!("native-exit:{subject}:{runtime_id}:{incarnation}")
+}
+
+fn claude_receipt_incarnation<'a>(
+    _runtime_incarnation: &str,
+    provider_incarnation: Option<&'a str>,
+) -> &'a str {
+    // Claude's hook timeline is fenced by its provider session token, which differs from
+    // the PTY runtime incarnation used for st3 claims.
+    provider_incarnation.unwrap_or_default()
+}
+
 fn native_delivery_receipted(consumed: &BTreeSet<String>, filename: &str) -> bool {
     consumed.contains(filename)
 }
@@ -8432,6 +8969,73 @@ fn read_intent(path: Option<&Path>) -> Result<(String, Option<String>)> {
             Ok((source, None))
         }
     }
+}
+
+async fn list_subscription_requests(
+    client: &Client,
+    subscription: String,
+    all: bool,
+    json_output: bool,
+) -> Result<()> {
+    let subscription = if subscription.starts_with("subscription/") {
+        subscription
+    } else {
+        format!("subscription/{subscription}")
+    };
+    let mut requests: Vec<SubscriptionRequestView> = client
+        .get(&format!(
+            "/v1/subscription-requests?subscription={}",
+            urlencoding::encode(&subscription)
+        ))
+        .await?;
+    if !all {
+        requests.retain(|request| matches!(request.status.as_str(), "pending" | "held"));
+    }
+    if json_output {
+        return print_value(&requests, true);
+    }
+    println!("REQUESTS  {}", requests.len());
+    println!("SUBSCRIPTION  {subscription}");
+    for request in &requests {
+        println!(
+            "{}  {}  {}{}",
+            request.request,
+            request.status,
+            request.resource,
+            request
+                .mission_run
+                .as_deref()
+                .map(|run| format!("  {run}"))
+                .unwrap_or_default()
+        );
+    }
+    Ok(())
+}
+
+async fn decide_subscription_request(
+    client: &Client,
+    decision: &str,
+    args: SubscriptionRequestArgs,
+    json_output: bool,
+) -> Result<()> {
+    let response: SubscriptionRequestView = client
+        .post(
+            &format!(
+                "/v1/subscription-requests/{decision}/{}",
+                urlencoding::encode(&args.request)
+            ),
+            &SubscriptionRequestDecision {
+                actor: args.actor,
+                reason: args.reason,
+                idempotency_key: format!(
+                    "subscription-request-{decision}:{}:{}",
+                    args.request,
+                    uuid::Uuid::now_v7().simple()
+                ),
+            },
+        )
+        .await?;
+    print_value(&response, json_output)
 }
 
 fn print_value(value: &impl serde::Serialize, json_output: bool) -> Result<()> {
@@ -8588,11 +9192,82 @@ mod tests {
         assert!(foreign_agent_actor("wake.omp-2", own, run).is_none());
         // Non-agent actors and processes without a seat identity are not seat impersonation.
         assert!(foreign_agent_actor("person/eval-requester", own, run).is_none());
+        assert!(foreign_agent_actor("requester", own, run).is_none());
         assert!(foreign_agent_actor("exec/run-1/controller", own, run).is_none());
         assert!(foreign_agent_actor("agent/run-1/wake.codex", None, run).is_none());
         assert!(
             foreign_agent_actor("agent/run-1/wake.codex", Some("person/operator"), run).is_none()
         );
+    }
+
+    #[test]
+    fn mission_start_requires_an_explicit_actor() {
+        assert!(Cli::try_parse_from(["st3", "missions", "start", "mission/demo"]).is_err());
+    }
+
+    #[test]
+    fn a_harness_cannot_mutate_as_a_peer_or_person() {
+        let cases: &[&[&str]] = &[
+            &[
+                "st3",
+                "missions",
+                "publish",
+                "mission.kdl",
+                "--as",
+                "agent/peer",
+            ],
+            &[
+                "st3",
+                "missions",
+                "start",
+                "mission/demo",
+                "--as",
+                "person/operator",
+            ],
+            &[
+                "st3",
+                "agents",
+                "queue",
+                "move",
+                "agent/worker",
+                "mission-run/demo/one",
+                "--top",
+                "--as",
+                "agent/peer",
+            ],
+            &[
+                "st3",
+                "work",
+                "revision",
+                "approve",
+                "revision-proposal/x",
+                "hash",
+                "--as",
+                "person/operator",
+            ],
+            &["st3", "work", "wake", "step-run/x/y", "--as", "agent/peer"],
+            &[
+                "st3",
+                "diagnostic",
+                "--as",
+                "person/operator",
+                "--code",
+                "test",
+                "--reason",
+                "test",
+            ],
+        ];
+        for arguments in cases {
+            let cli = Cli::try_parse_from(*arguments).unwrap();
+            assert!(
+                guard_mutating_cli_actor(&cli.command, Some("agent/own"), None).is_err(),
+                "accepted {arguments:?}"
+            );
+        }
+        let own = Cli::try_parse_from(["st3", "work", "wake", "step-run/x/y", "--as", "agent/own"])
+            .unwrap();
+        assert!(guard_mutating_cli_actor(&own.command, Some("agent/own"), None).is_ok());
+        assert!(guard_mutating_cli_actor(&own.command, None, None).is_ok());
     }
 
     #[test]
@@ -8750,6 +9425,22 @@ mod tests {
         }
         assert!(socket.exists(), "the test API socket did not start");
         let client = Client::unix(&socket);
+
+        // The channel can lose a race to the recipient's CLI read without ending its loop.
+        assert!(
+            !stage_pi_family_message(&client, "message/held", seat, "omp")
+                .await
+                .unwrap()
+        );
+        assert!(
+            stage_pi_family_message(&client, "message/pending", seat, "omp")
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            store.message("message/pending").unwrap().unwrap().status,
+            "staged"
+        );
 
         // The late acknowledgement itself is still an invalid transition...
         assert!(
@@ -9104,6 +9795,26 @@ mod tests {
     }
 
     #[test]
+    fn mission_list_counts_active_and_finished_runs_apart() {
+        let mut page = fixture_product_page(&["mission"], false);
+        let ClientResource::Mission(mission) = &mut page.items[0] else {
+            panic!("expected mission fixture");
+        };
+        mission.runs = (1..=6).map(|run| format!("mission-run/r{run}")).collect();
+        let render = |active: Option<usize>, runs: usize| {
+            let mut mission = mission.clone();
+            mission.runs.truncate(runs);
+            mission.active_runs = active;
+            render_mission_runs(&mission)
+        };
+        assert_eq!(render(Some(1), 6), "1 active · 5 finished");
+        assert_eq!(render(Some(2), 2), "2 active runs");
+        assert_eq!(render(Some(0), 1), "1 finished run");
+        assert_eq!(render(Some(0), 0), "0 runs");
+        assert_eq!(render(None, 6), "6 runs");
+    }
+
+    #[test]
     fn terminal_list_shows_a_working_peek_target() {
         let mut page = fixture_product_page(&["runtime"], false);
         if let ClientResource::Runtime(runtime) = &mut page.items[0] {
@@ -9114,6 +9825,51 @@ mod tests {
         let rendered = render_product_page("TERMINALS", &page, "st3 terminals");
         assert!(
             rendered.contains("peek: st3 terminals peek agent/release"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn work_detail_labels_a_reason_blocked_only_for_blocked_work() {
+        let page = fixture_product_page(&["work"], false);
+        let ClientResource::Work(work) = &page.items[0] else {
+            panic!("expected work fixture");
+        };
+        let mut work = work.clone();
+        work.blocked_reason = Some("the step's lease expired".into());
+        work.state = "claimed".into();
+        let claimed = render_client_work_detail(&work);
+        assert!(!claimed.contains("Blocked:"), "{claimed}");
+        assert!(
+            claimed.contains("\nReason: the step's lease expired\n"),
+            "{claimed}"
+        );
+        work.state = "blocked".into();
+        let blocked = render_client_work_detail(&work);
+        assert!(
+            blocked.contains("\nBlocked: the step's lease expired\n"),
+            "{blocked}"
+        );
+    }
+
+    #[test]
+    fn attention_from_a_retired_requester_says_who_can_close_it() {
+        let mut page = fixture_product_page(&["attention"], false);
+        let before = render_product_page("NOW", &page, "st3 now");
+        assert!(!before.contains("requester retired"), "{before}");
+        let ClientResource::Attention(attention) = &mut page.items[0] else {
+            panic!("expected attention fixture");
+        };
+        attention.header.operational = Some(st3_client::Operational {
+            layer: "current".into(),
+            actionable: true,
+            reasons: vec!["requester-retired".into()],
+            owner_generation: None,
+            runtime_incarnation: None,
+        });
+        let rendered = render_product_page("NOW", &page, "st3 now");
+        assert!(
+            rendered.contains("  requester retired: only person/nathan can close it\n"),
             "{rendered}"
         );
     }
@@ -9152,6 +9908,32 @@ mod tests {
     }
 
     #[test]
+    fn now_page_without_work_does_not_claim_zero_working() {
+        let attention_only = render_now_page(
+            &fixture_product_page(&["attention"], false),
+            "st3 now --as person/nathan",
+        );
+        assert!(
+            attention_only.starts_with("NEEDS YOU  1\n"),
+            "{attention_only}"
+        );
+        assert!(!attention_only.contains("WORKING"), "{attention_only}");
+        assert!(!attention_only.contains("UNHEALTHY"), "{attention_only}");
+        assert!(
+            attention_only.ends_with("\nWork: st3 work ls · Health: st3 doctor\n"),
+            "{attention_only}"
+        );
+
+        let with_work = render_now_page(
+            &fixture_product_page(&["attention", "work"], false),
+            "st3 now --as person/nathan --owner-run mission-run/release/1",
+        );
+        assert!(with_work.contains("\nWORKING  1\n"), "{with_work}");
+        assert!(!with_work.contains("UNHEALTHY"), "{with_work}");
+        assert!(!with_work.contains("Work: st3 work ls"), "{with_work}");
+    }
+
+    #[test]
     fn provider_capacity_backoff_is_bounded_deterministic_and_increases() {
         let first = provider_capacity_backoff_ms("agent/node.worker", "one", 1);
         let second = provider_capacity_backoff_ms("agent/node.worker", "one", 2);
@@ -9165,6 +9947,62 @@ mod tests {
             provider_capacity_backoff_ms("agent/node.worker", "one", u32::MAX)
                 <= PROVIDER_CAPACITY_MAX_BACKOFF_MS
                     + PROVIDER_CAPACITY_MAX_BACKOFF_MS.saturating_div(4)
+        );
+    }
+
+    #[test]
+    fn context_occupancy_alone_is_not_reported_as_zero_tokens() {
+        let mut page = fixture_product_page(&["session"], false);
+        let ClientResource::Session(session) = &mut page.items[0] else {
+            panic!("expected session fixture");
+        };
+        session.usage = Some(
+            serde_json::from_value(json!({
+                "total_tokens": 0,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "cached_tokens": 0,
+                "incarnation_count": 0,
+                "aggregation": "cumulative-per-incarnation-else-response-deltas",
+                "context": { "used_tokens": 319465, "observed_at_unix_ms": 1 }
+            }))
+            .unwrap(),
+        );
+        let rendered = render_product_page("SESSIONS", &page, "st3 conversations sessions");
+        assert!(!rendered.contains("0 tokens"), "{rendered}");
+        assert!(
+            rendered.contains("  usage not reported · context 319465 tokens\n"),
+            "{rendered}"
+        );
+
+        let ClientResource::Session(session) = &mut page.items[0] else {
+            unreachable!();
+        };
+        let usage = session.usage.as_mut().unwrap();
+        usage.incarnation_count = 1;
+        usage.total_tokens = 1200;
+        let rendered = render_product_page("SESSIONS", &page, "st3 conversations sessions");
+        assert!(rendered.contains("  usage 1200 tokens\n"), "{rendered}");
+    }
+
+    #[test]
+    fn an_empty_mailbox_prints_a_heading_and_no_current_items() {
+        assert_eq!(
+            render_mailbox("person/nathan", None, false, &[]),
+            "MESSAGES  0\nFILTERS  mailbox=person/nathan\nNo current items.\n"
+        );
+        assert_eq!(
+            render_mailbox(
+                "agent/worker",
+                Some("person/nathan"),
+                true,
+                &["message/one\tread\tperson/nathan\tHello".into()]
+            ),
+            concat!(
+                "MESSAGES  1\n",
+                "FILTERS  mailbox=agent/worker · from=person/nathan · archived=included\n",
+                "message/one\tread\tperson/nathan\tHello\n",
+            )
         );
     }
 
@@ -9227,6 +10065,27 @@ mod tests {
             "agent/node.worker",
             Some(&replacement)
         ));
+    }
+
+    #[test]
+    fn attention_request_help_says_which_targets_end_an_item() {
+        let mut command = Cli::command();
+        let help = command
+            .find_subcommand_mut("attention")
+            .unwrap()
+            .find_subcommand_mut("request")
+            .unwrap()
+            .render_long_help()
+            .to_string();
+        for expected in [
+            "st3 attention withdraw",
+            "`step-run/` or `run-generation/` target is no longer current",
+            "a `mission/` retired or\n  cancelled",
+            "`resource/` and `doc/` targets are context",
+            "had already ended when you made the request, keeps it open",
+        ] {
+            assert!(help.contains(expected), "missing {expected:?} in:\n{help}");
+        }
     }
 
     #[test]
@@ -9575,6 +10434,20 @@ mod tests {
     }
 
     #[test]
+    fn mission_start_help_shows_the_run_subject_an_id_names() {
+        use clap::CommandFactory as _;
+        let mut command = Cli::command();
+        let help = command
+            .find_subcommand_mut("missions")
+            .and_then(|missions| missions.find_subcommand_mut("start"))
+            .expect("missions start")
+            .render_help()
+            .to_string();
+        assert!(help.contains("`mission-run/release/demo/1`"), "{help}");
+        assert!(help.contains("`mission-run/1`"), "{help}");
+    }
+
+    #[test]
     fn mission_start_accepts_an_explicit_run_id() {
         let cli = Cli::try_parse_from([
             "st3",
@@ -9595,7 +10468,53 @@ mod tests {
         };
         assert_eq!(args.mission, "release/demo");
         assert_eq!(args.id.as_deref(), Some("release/demo/test"));
-        assert_eq!(args.actor.as_deref(), Some("agent/operator"));
+        assert_eq!(args.actor, "agent/operator");
+    }
+
+    #[test]
+    fn mission_start_after_names_the_run_to_wait_for() {
+        let cli = Cli::try_parse_from([
+            "st3",
+            "missions",
+            "start",
+            "release/demo",
+            "--after",
+            "release/build/1",
+            "--as",
+            "person/operator",
+        ])
+        .unwrap();
+        let Command::Missions {
+            command: MissionViewCommand::Start(args),
+        } = cli.command
+        else {
+            panic!("the mission start command did not parse");
+        };
+        assert_eq!(args.after.as_deref(), Some("release/build/1"));
+
+        let kdl = mission_run_intent(
+            "release/demo/2",
+            "release/demo",
+            &"a".repeat(64),
+            Path::new("/work/demo"),
+            "person/operator",
+            &BTreeMap::new(),
+            "run",
+            Some("mission-run/release/build/1"),
+        );
+        assert!(
+            kdl.contains("after \"mission-run/release/build/1\""),
+            "{kdl}"
+        );
+        let intent = st3::graph::parse_intent(&kdl, "node").unwrap();
+        let creation = intent.mission_runs["mission-run/release/demo/2"]
+            .creation
+            .as_ref()
+            .unwrap();
+        assert_eq!(
+            creation.after.as_deref(),
+            Some("mission-run/release/build/1")
+        );
     }
 
     #[test]
@@ -9702,24 +10621,36 @@ mod tests {
             "facts": {"status": "ready"},
             "kind": "filesystem.file"
         });
-        assert_eq!(projected_actual_status(Some(&resource)), Some("ready"));
+        assert_eq!(
+            st3::model::projected_actual_status(Some(&resource)),
+            Some("ready")
+        );
 
         let runtime = json!({"fields": {"status": "running"}});
-        assert_eq!(projected_actual_status(Some(&runtime)), Some("running"));
+        assert_eq!(
+            st3::model::projected_actual_status(Some(&runtime)),
+            Some("running")
+        );
     }
 
     #[test]
     fn wait_accepts_message_delivery() {
         validate_wait_condition("delivered").unwrap();
         let message = serde_json::json!({ "status": "delivered" });
-        assert_eq!(projected_actual_status(Some(&message)), Some("delivered"));
+        assert_eq!(
+            st3::model::projected_actual_status(Some(&message)),
+            Some("delivered")
+        );
     }
 
     #[test]
     fn wait_accepts_a_standing_mission_run() {
         validate_wait_condition("standing").unwrap();
         let run = serde_json::json!({ "status": "standing" });
-        assert_eq!(projected_actual_status(Some(&run)), Some("standing"));
+        assert_eq!(
+            st3::model::projected_actual_status(Some(&run)),
+            Some("standing")
+        );
     }
 
     #[test]
@@ -9809,6 +10740,40 @@ mod tests {
         assert_eq!(
             claude_channel_consumed_delivery_filenames(root.path(), "inc-2").unwrap(),
             BTreeSet::from(["1784649988123-abc23z.md".to_owned()])
+        );
+    }
+
+    #[test]
+    fn native_exit_claims_are_unique_per_incarnation() {
+        assert_eq!(
+            native_exit_key("agent/node.worker", "node.worker", "one"),
+            native_exit_key("agent/node.worker", "node.worker", "one"),
+        );
+        assert_ne!(
+            native_exit_key("agent/node.worker", "node.worker", "one"),
+            native_exit_key("agent/node.worker", "node.worker", "two"),
+        );
+    }
+
+    #[test]
+    fn claude_receipts_use_provider_session_not_runtime_incarnation() {
+        let root = tempfile::tempdir().unwrap();
+        let mut writer =
+            st2::harness_timeline::Writer::new(root.path(), "claude", "provider-current");
+        writer
+            .append(
+                "prompt-1",
+                st2::harness_timeline::Role::User,
+                st2::harness_timeline::EntryType::Content,
+                serde_json::json!({"text": "[st3-delivery:1784649988123-abc23z.md] hello"}),
+                true,
+            )
+            .unwrap();
+        let receipt_incarnation =
+            claude_receipt_incarnation("runtime-current", Some("provider-current"));
+        assert_eq!(
+            claude_channel_consumed_delivery_filenames(root.path(), receipt_incarnation).unwrap(),
+            BTreeSet::from(["1784649988123-abc23z.md".to_owned()]),
         );
     }
 
@@ -10281,6 +11246,41 @@ mod tests {
     }
 
     #[test]
+    fn subscription_request_decisions_need_a_person() {
+        let cli = Cli::try_parse_from([
+            "st3",
+            "missions",
+            "release",
+            "request-id",
+            "--as",
+            "person/operator",
+            "--reason",
+            "the held review is real",
+        ])
+        .unwrap();
+        let Command::Missions {
+            command: MissionViewCommand::Release(args),
+        } = cli.command
+        else {
+            panic!("the missions release command did not parse");
+        };
+        assert_eq!(args.actor, "person/operator");
+        assert!(
+            Cli::try_parse_from([
+                "st3",
+                "missions",
+                "cancel-request",
+                "request-id",
+                "--as",
+                "agent/node.triage",
+                "--reason",
+                "an agent cannot decide",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
     fn work_revise_accepts_print_only_mode() {
         let cli = Cli::try_parse_from([
             "st3",
@@ -10421,6 +11421,33 @@ mission "review" state="ready" {
         };
         assert_eq!(args.severity, "error");
         assert_eq!(args.targets, ["mission-run/fabric"]);
+        assert_eq!(args.until, None);
+
+        let until = Cli::try_parse_from([
+            "st3",
+            "attention",
+            "request",
+            "--for",
+            "person/nathan",
+            "--title",
+            "Publish this revision",
+            "--reason",
+            "Publish the prepared revision as a person.",
+            "--target",
+            "mission-run/release/one",
+            "--until",
+            "completed",
+            "--as",
+            "agent/release/worker",
+        ])
+        .unwrap();
+        let Command::Attention {
+            command: AttentionCommand::Request(args),
+        } = until.command
+        else {
+            panic!("the attention request with until did not parse");
+        };
+        assert_eq!(args.until.as_deref(), Some("completed"));
 
         let resolve = Cli::try_parse_from([
             "st3",
@@ -10860,5 +11887,209 @@ mission "review" state="ready" {
         .unwrap_err();
         assert!(error.to_string().contains("work claim is stale"));
         assert!(last_warning.is_none());
+    }
+
+    async fn serve_test_store(
+        store: Arc<Store>,
+        root: &Path,
+        node: &str,
+    ) -> (Client, tokio::task::JoinHandle<()>) {
+        let socket = root.join("st3.sock");
+        let state = AppState {
+            store,
+            notify: Arc::new(Notify::new()),
+            event_notify: watch::channel(0_u64).0,
+            node: node.into(),
+            state_dir: root.to_path_buf(),
+            pty_root: root.join("pty"),
+            pty_binary: PathBuf::from("pty"),
+            fleet_id: None,
+            configured_peers: Vec::new(),
+            client_relay: None,
+            native_session_home: None,
+            planner_default: PlannerSpec::default(),
+        };
+        let server_socket = socket.clone();
+        let server = tokio::spawn(async move {
+            serve_unix(&server_socket, router(state)).await.unwrap();
+        });
+        for _ in 0..100 {
+            if socket.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        assert!(socket.exists(), "the test API socket did not start");
+        (Client::unix(&socket), server)
+    }
+
+    async fn publish_test_mission(client: &Client, root: &Path, goal: &str) {
+        let file = root.join("mission.kdl");
+        fs::write(
+            &file,
+            format!(
+                "version 2\nmission \"arrival\" state=\"ready\" {{\n  goal \"{goal}\"\n  step \"work\" {{ }}\n}}\n"
+            ),
+        )
+        .unwrap();
+        publish_mission_file(
+            client,
+            MissionPublishArgs {
+                file,
+                at_index: None,
+                actor: "person/test".into(),
+            },
+            true,
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn missions_start_waits_for_a_revision_published_on_another_host() {
+        const FLEET: &str = "5d0c1c52-3f7a-4b0e-9b61-1f2d3c4b5a69";
+        let publisher_root = tempfile::tempdir().unwrap();
+        let starter_root = tempfile::tempdir().unwrap();
+        let publisher = Arc::new(Store::open_memory("publisher").unwrap());
+        let starter = Arc::new(Store::open_memory("starter").unwrap());
+        publisher.bind_fleet(FLEET).unwrap();
+        starter.bind_fleet(FLEET).unwrap();
+        let (publisher_client, publisher_server) =
+            serve_test_store(publisher.clone(), publisher_root.path(), "publisher").await;
+        let (starter_client, starter_server) =
+            serve_test_store(starter.clone(), starter_root.path(), "starter").await;
+        publish_test_mission(
+            &publisher_client,
+            publisher_root.path(),
+            "Start after replication.",
+        )
+        .await;
+        let revision = publisher
+            .mission_spec("arrival", None)
+            .unwrap()
+            .unwrap()
+            .revision;
+
+        let replicate = tokio::spawn({
+            let publisher = publisher.clone();
+            let starter = starter.clone();
+            async move {
+                tokio::time::sleep(Duration::from_millis(600)).await;
+                let exchange = publisher
+                    .export_replication_exchange(
+                        FLEET,
+                        &st3::model::ReplicationInventory::default(),
+                    )
+                    .unwrap();
+                starter
+                    .receive_replication_exchange("publisher", FLEET, &exchange)
+                    .unwrap();
+                starter.validate_replication_backlog().unwrap();
+                starter.apply_replication_repairs().unwrap();
+                starter.project_replication_backlog().unwrap();
+            }
+        });
+        let waited = Instant::now();
+        start_mission_run(
+            &starter_client,
+            MissionRunStartArgs {
+                mission: "arrival".into(),
+                revision: Some(revision.clone()),
+                id: Some("arrival/after-replication".into()),
+                workspace: starter_root.path().to_path_buf(),
+                inputs: Vec::new(),
+                after: None,
+                follow: false,
+                actor: "person/test".into(),
+                print_kdl: false,
+            },
+            true,
+        )
+        .await
+        .unwrap();
+        assert!(
+            waited.elapsed() >= Duration::from_millis(500),
+            "start waited for the publish to replicate instead of failing"
+        );
+        replicate.await.unwrap();
+        let run: MissionRunView = starter_client
+            .get("/v1/mission-runs/mission-run%2Farrival%2Fafter-replication")
+            .await
+            .unwrap();
+        assert_eq!(run.revision, revision);
+        publisher_server.abort();
+        starter_server.abort();
+    }
+
+    #[tokio::test]
+    async fn missions_start_names_a_replaced_or_missing_revision() {
+        let root = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open_memory("single").unwrap());
+        let (client, server) = serve_test_store(store.clone(), root.path(), "single").await;
+        publish_test_mission(&client, root.path(), "First revision.").await;
+        let first = store
+            .mission_spec("arrival", None)
+            .unwrap()
+            .unwrap()
+            .revision;
+        publish_test_mission(&client, root.path(), "Second revision.").await;
+        let second = store
+            .mission_spec("arrival", None)
+            .unwrap()
+            .unwrap()
+            .revision;
+        assert_ne!(first, second);
+
+        let replaced = Instant::now();
+        let error = startable_mission(&client, "arrival", Some(&first), Duration::from_secs(10))
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains(&format!(
+                "revision {first} was replaced by revision {second}"
+            )),
+            "{error}"
+        );
+        assert!(replaced.elapsed() < Duration::from_secs(5));
+
+        let error = startable_mission(
+            &client,
+            "arrival",
+            Some(&"0".repeat(64)),
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("has not reached this host yet after 1s"),
+            "{error}"
+        );
+        let error = startable_mission(&client, "absent", None, Duration::from_secs(1))
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .starts_with("mission/absent has not reached this host yet after 1s"),
+            "{error}"
+        );
+
+        let publications = mission_publications(&client, "arrival").await.unwrap();
+        assert_eq!(publications.len(), 2);
+        assert!(
+            started_revision_note("arrival", &second, &publications)
+                .ends_with("on single. 1 older revision shares this mission name.")
+        );
+        assert!(
+            started_revision_note("arrival", &first, &publications)
+                .ends_with("on single. 1 other revision shares this mission name.")
+        );
+        assert_eq!(
+            started_revision_note("arrival", &second, &publications[..1]),
+            format!("Started mission/arrival revision {second}.")
+        );
+        server.abort();
     }
 }

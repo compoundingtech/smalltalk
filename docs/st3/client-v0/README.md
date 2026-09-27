@@ -162,6 +162,12 @@ Every attention resource carries its concrete `person_id`, original `source_id`,
 client can therefore render a mixed inbox, navigate to the source, and act without recovering
 identity or graph context from prose.
 
+A `fault` also carries `target_states`: for each target with a lifecycle (a mission, run,
+generation, step, attention item, or agent), its current `state` and, when known, the `since`
+time it entered that state. Resource and document targets have none. A person can recognize a
+request whose targets have all moved on, such as `mission/fleet/typecase: cancelled 4h ago`,
+without opening each target.
+
 Each agent resource includes `current_work_ids` and an ordered `upcoming_work_ids` preview across
 mission runs. `next_work_id` is the first ready item, even while another step occupies the agent's
 work seat. `active_work_count` and `queued_work_count` give complete counts; the ID lists include

@@ -96,6 +96,118 @@ pub(crate) fn parse_execution_intent(
     parse_intent_with_owner(source, default_host, Some(&owner), true)
 }
 
+/// The placeholder variables a mission's declarations are interpolated with when they are
+/// checked without a run.
+pub(crate) fn runtime_proof_variables(
+    mission: &crate::model::MissionSpec,
+) -> BTreeMap<String, String> {
+    let mut variables = BTreeMap::from([
+        ("ST_MISSION".into(), mission.id.clone()),
+        ("ST_MISSION_REVISION".into(), mission.revision.clone()),
+        ("ST_MISSION_RUN".into(), "migration-proof".into()),
+        ("ST_RUN_GENERATION".into(), "migration-generation".into()),
+        ("ST_ROOT_MISSION_RUN".into(), "migration-proof".into()),
+        ("ST_ROOT_MISSION_RUN_ID".into(), "migration-proof".into()),
+        ("ST_WORKSPACE".into(), "/tmp/st3-migration-workspace".into()),
+        ("ST_REQUESTER".into(), "person/migration-reviewer".into()),
+        ("ST_STEP".into(), "migration-step".into()),
+        (
+            "ST_STEP_RUN".into(),
+            "step-run/migration-generation/migration-step".into(),
+        ),
+        ("ST_ATTEMPT".into(), "1".into()),
+        ("ST_ASSIGNEE".into(), "agent/migration-proof/worker".into()),
+        ("ST_PARENT_STEP_RUN".into(), String::new()),
+        ("ST_GATE".into(), "migration-gate".into()),
+        ("ST_AGENT".into(), "agent/migration-proof/worker".into()),
+        ("ST_LOOP_ROUND".into(), "1".into()),
+        ("ST_LOOP_FEEDBACK".into(), String::new()),
+        ("ST_LOOP_ITEM_ID".into(), "migration-item".into()),
+        ("ST_CANDIDATE_INDEX".into(), "1".into()),
+        ("loop.round".into(), "1".into()),
+        ("loop.feedback".into(), String::new()),
+        ("loop.item.id".into(), "migration-item".into()),
+        ("loop.item.*".into(), "migration-value".into()),
+        ("candidate.index".into(), "1".into()),
+        ("PATH".into(), "/usr/local/bin:/usr/bin:/bin".into()),
+    ]);
+    variables.extend(mission.inputs.iter().map(|(name, input)| {
+        let value = match input.kind {
+            crate::model::MissionInputKind::Text => format!("migration-{name}"),
+            crate::model::MissionInputKind::Resource => {
+                format!("resource/migration-{name}")
+            }
+        };
+        (format!("input.{name}"), value)
+    }));
+    variables
+}
+
+/// The authority granted to agents declared inside a mission, in its own declarations, its
+/// steps' declarations, or any nested mission, keyed by the agent subject of a proof run. Only a
+/// person grants authority, so an agent may not publish or revise a mission whose grants exceed
+/// the ones already published.
+pub fn mission_declared_authority_grants(
+    mission: &crate::model::MissionSpec,
+    default_host: &str,
+) -> Result<
+    BTreeMap<
+        String,
+        (
+            crate::model::MissionAuthority,
+            crate::model::QueueAuthority,
+            crate::model::SeatAuthority,
+        ),
+    >,
+    St3Error,
+> {
+    fn visit(
+        mission: &crate::model::MissionSpec,
+        default_host: &str,
+        grants: &mut BTreeMap<
+            String,
+            (
+                crate::model::MissionAuthority,
+                crate::model::QueueAuthority,
+                crate::model::SeatAuthority,
+            ),
+        >,
+    ) -> Result<(), St3Error> {
+        let variables = runtime_proof_variables(mission);
+        let sources = mission.declarations_kdl.iter().chain(
+            mission
+                .steps
+                .values()
+                .filter_map(|step| step.declarations_kdl.as_ref()),
+        );
+        for source in sources {
+            let source = crate::mission::interpolate_kdl(source, &variables)?;
+            let runtime = parse_execution_intent(&source, default_host, "migration-proof")?;
+            for (subject, desired) in &runtime.subjects {
+                if desired.kind == "agent" && declares_authority(&desired.desired) {
+                    grants.insert(
+                        subject.clone(),
+                        (
+                            agent_mission_authority(&desired.desired),
+                            agent_queue_authority(&desired.desired),
+                            agent_seat_authority(&desired.desired),
+                        ),
+                    );
+                }
+            }
+        }
+        for step in mission.steps.values() {
+            if let Some(nested) = &step.nested_mission {
+                visit(nested, default_host, grants)?;
+            }
+        }
+        Ok(())
+    }
+    let mut grants = BTreeMap::new();
+    visit(mission, default_host, &mut grants)?;
+    Ok(grants)
+}
+
 pub fn validate_mission_runtimes(
     intent: &NormalizedIntent,
     default_host: &str,
@@ -117,45 +229,7 @@ pub fn validate_mission_runtimes(
             Ok(())
         }
 
-        let mut variables = BTreeMap::from([
-            ("ST_MISSION".into(), mission.id.clone()),
-            ("ST_MISSION_REVISION".into(), mission.revision.clone()),
-            ("ST_MISSION_RUN".into(), "migration-proof".into()),
-            ("ST_RUN_GENERATION".into(), "migration-generation".into()),
-            ("ST_ROOT_MISSION_RUN".into(), "migration-proof".into()),
-            ("ST_ROOT_MISSION_RUN_ID".into(), "migration-proof".into()),
-            ("ST_WORKSPACE".into(), "/tmp/st3-migration-workspace".into()),
-            ("ST_REQUESTER".into(), "person/migration-reviewer".into()),
-            ("ST_STEP".into(), "migration-step".into()),
-            (
-                "ST_STEP_RUN".into(),
-                "step-run/migration-generation/migration-step".into(),
-            ),
-            ("ST_ATTEMPT".into(), "1".into()),
-            ("ST_ASSIGNEE".into(), "agent/migration-proof/worker".into()),
-            ("ST_PARENT_STEP_RUN".into(), String::new()),
-            ("ST_GATE".into(), "migration-gate".into()),
-            ("ST_AGENT".into(), "agent/migration-proof/worker".into()),
-            ("ST_LOOP_ROUND".into(), "1".into()),
-            ("ST_LOOP_FEEDBACK".into(), String::new()),
-            ("ST_LOOP_ITEM_ID".into(), "migration-item".into()),
-            ("ST_CANDIDATE_INDEX".into(), "1".into()),
-            ("loop.round".into(), "1".into()),
-            ("loop.feedback".into(), String::new()),
-            ("loop.item.id".into(), "migration-item".into()),
-            ("loop.item.*".into(), "migration-value".into()),
-            ("candidate.index".into(), "1".into()),
-            ("PATH".into(), "/usr/local/bin:/usr/bin:/bin".into()),
-        ]);
-        variables.extend(mission.inputs.iter().map(|(name, input)| {
-            let value = match input.kind {
-                crate::model::MissionInputKind::Text => format!("migration-{name}"),
-                crate::model::MissionInputKind::Resource => {
-                    format!("resource/migration-{name}")
-                }
-            };
-            (format!("input.{name}"), value)
-        }));
+        let variables = runtime_proof_variables(mission);
         if let Some(source) = &mission.declarations_kdl {
             validate_source(source, &variables, default_host, subjects)?;
         }
@@ -394,6 +468,7 @@ fn parse_mission_run_declaration(
             "requester",
             "mode",
             "input",
+            "after",
             "revision",
             "reset",
             "cancellation",
@@ -404,7 +479,7 @@ fn parse_mission_run_declaration(
     let has_creation = body.nodes().iter().any(|child| {
         matches!(
             child.name().value(),
-            "mission" | "workspace" | "requester" | "mode" | "input"
+            "mission" | "workspace" | "requester" | "mode" | "input" | "after"
         )
     });
     let creation = if has_creation {
@@ -456,6 +531,16 @@ fn parse_mission_run_declaration(
                 ));
             }
         }
+        let after = child_string(body, "after")?.map(|after| namespaced("mission-run", &after));
+        if let Some(after) = &after {
+            validate_full_subject(after)?;
+            if after == &subject {
+                return Err(St3Error::new(
+                    "invalid-mission-run-after",
+                    format!("mission run `{subject}` cannot wait for itself"),
+                ));
+            }
+        }
         Some(MissionRunCreation {
             mission,
             revision,
@@ -463,6 +548,7 @@ fn parse_mission_run_declaration(
             requester,
             inputs,
             mode,
+            after,
         })
     } else {
         None
@@ -2268,6 +2354,7 @@ fn validate_agent_body(document: &KdlDocument, owner: &str) -> Result<(), St3Err
         "description",
         "host",
         "workspace",
+        "checkout",
         "under",
         "restart",
         "shutdown-timeout",
@@ -2278,9 +2365,24 @@ fn validate_agent_body(document: &KdlDocument, owner: &str) -> Result<(), St3Err
         "harness",
         "mission-authority",
         "queue-authority",
+        "seat-authority",
         "pty",
         "exec",
     ];
+    // The mission parser moves agent constraints onto the steps that select the agent. A
+    // top-level seat has no mission steps to scope them to.
+    if document
+        .nodes()
+        .iter()
+        .any(|child| child.name().value() == "constraint")
+    {
+        return Err(St3Error::new(
+            "agent-constraint-outside-mission",
+            format!(
+                "agent `{owner}` declares a constraint; only an agent declared inside a mission can scope constraints to its steps"
+            ),
+        ));
+    }
     reject_unknown_children(document, ALLOWED, "agent", owner)?;
     for child in [
         "identity",
@@ -2288,6 +2390,7 @@ fn validate_agent_body(document: &KdlDocument, owner: &str) -> Result<(), St3Err
         "description",
         "host",
         "workspace",
+        "checkout",
         "shutdown-timeout",
         "command",
         "argv",
@@ -2296,6 +2399,7 @@ fn validate_agent_body(document: &KdlDocument, owner: &str) -> Result<(), St3Err
         "harness",
         "mission-authority",
         "queue-authority",
+        "seat-authority",
     ] {
         unique_child(document, child)?;
     }
@@ -2320,6 +2424,19 @@ fn validate_agent_body(document: &KdlDocument, owner: &str) -> Result<(), St3Err
                 verbs: &["move"],
                 empty: "empty-queue-authority",
                 duplicate: "duplicate-queue-authority",
+                pattern: validate_queue_authority_pattern,
+            },
+            owner,
+        )?;
+    }
+    if let Some(authority) = unique_child(document, "seat-authority")? {
+        validate_authority_block(
+            authority,
+            AuthorityBlock {
+                name: "seat-authority",
+                verbs: &["declare", "stop"],
+                empty: "empty-seat-authority",
+                duplicate: "duplicate-seat-authority",
                 pattern: validate_queue_authority_pattern,
             },
             owner,
@@ -2361,6 +2478,9 @@ fn validate_agent_body(document: &KdlDocument, owner: &str) -> Result<(), St3Err
         ));
     }
     parse_workspace(document)?;
+    if let Some(checkout) = unique_child(document, "checkout")? {
+        validate_checkout(checkout, document, owner)?;
+    }
     if let Some(env) = unique_child(document, "env")? {
         validate_string_map(env, true)?;
     }
@@ -2375,6 +2495,54 @@ fn validate_agent_body(document: &KdlDocument, owner: &str) -> Result<(), St3Err
         validate_driver(driver)?;
     }
     Ok(())
+}
+
+/// `checkout "REPOSITORY" base="REF" branch="NAME" remove-at-run-end=#true` creates the agent's
+/// workspace as a Git worktree before the agent starts.
+fn validate_checkout(node: &KdlNode, agent: &KdlDocument, owner: &str) -> Result<(), St3Error> {
+    ensure_only_properties(node, &["base", "branch", "remove-at-run-end"])?;
+    ensure_no_children(node)?;
+    one_string(node)?;
+    if unique_child(agent, "workspace")?.is_none() {
+        return Err(St3Error::new(
+            "invalid-checkout",
+            format!("agent `{owner}` checkout needs a workspace for the worktree"),
+        ));
+    }
+    for property in ["base", "branch"] {
+        let value = property_string(node, property)?.ok_or_else(|| {
+            St3Error::new(
+                "invalid-checkout",
+                format!("agent `{owner}` checkout needs {property}=\"...\""),
+            )
+        })?;
+        if !checkout_ref_is_valid(&value) {
+            return Err(St3Error::new(
+                "invalid-checkout",
+                format!("agent `{owner}` checkout {property} `{value}` is not a Git ref name"),
+            ));
+        }
+    }
+    property_bool(node, "remove-at-run-end")?;
+    Ok(())
+}
+
+/// A conservative subset of `git check-ref-format` that also keeps a ref from reading as a Git
+/// option. `${...}` run variables stay valid before interpolation.
+fn checkout_ref_is_valid(value: &str) -> bool {
+    !value.is_empty()
+        && !value.starts_with(['-', '/', '.'])
+        && !value.ends_with(['/', '.'])
+        && !value.ends_with(".lock")
+        && !value.contains("..")
+        && !value.contains("@{")
+        && !value.contains("//")
+        && !value.split('/').any(|part| part.starts_with(['-', '.']))
+        && !value.chars().any(|character| {
+            character.is_ascii_control()
+                || character.is_whitespace()
+                || matches!(character, '~' | '^' | ':' | '?' | '*' | '[' | '\\')
+        })
 }
 
 fn validate_mission_authority_pattern(pattern: &str) -> Result<(), St3Error> {
@@ -2485,9 +2653,9 @@ fn authority_rules<'a>(desired: &'a Value, block: &str) -> Vec<(&'a str, &'a str
         .collect()
 }
 
-/// Whether a desired agent declaration grants mission or queue authority.
+/// Whether a desired agent declaration grants authority.
 pub fn declares_authority(desired: &Value) -> bool {
-    ["mission-authority", "queue-authority"]
+    ["mission-authority", "queue-authority", "seat-authority"]
         .iter()
         .any(|block| !authority_rules(desired, block).is_empty())
 }
@@ -2513,6 +2681,18 @@ pub fn agent_queue_authority(desired: &Value) -> crate::model::QueueAuthority {
             .map(|(_, pattern)| pattern.to_owned())
             .collect(),
     }
+}
+
+pub fn agent_seat_authority(desired: &Value) -> crate::model::SeatAuthority {
+    let mut authority = crate::model::SeatAuthority::default();
+    for (verb, pattern) in authority_rules(desired, "seat-authority") {
+        match verb {
+            "declare" => authority.declare.push(pattern.to_owned()),
+            "stop" => authority.stop.push(pattern.to_owned()),
+            _ => {}
+        }
+    }
+    authority
 }
 
 fn validate_task_body(
@@ -4241,6 +4421,63 @@ fn valid_field_path(path: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_agent_checkout_needs_a_workspace_and_git_ref_names() {
+        let mission = |workspace: &str, checkout: &str| {
+            format!(
+                "version 2\nmission \"example/checkout\" state=\"ready\" {{\n  goal \"Work in a worktree.\"\n  agent \"worker\" {{\n    {workspace}\n    {checkout}\n    command \"true\"\n  }}\n  step \"work\" {{\n    assigned-to \"agent/${{ST_MISSION_RUN}}/worker\"\n    goal \"Work.\"\n  }}\n}}\n"
+            )
+        };
+        let workspace = "workspace \"${ST_WORKSPACE}/worker\"";
+        let valid = mission(
+            workspace,
+            "checkout \"${ST_WORKSPACE}/repo\" base=\"origin/main\" branch=\"example/${ST_MISSION_RUN}\" remove-at-run-end=#true",
+        );
+        parse_intent(&valid, "node").unwrap();
+
+        for (workspace, checkout) in [
+            (
+                "",
+                "checkout \"/work/repo\" base=\"origin/main\" branch=\"example/a\"",
+            ),
+            (workspace, "checkout \"/work/repo\" branch=\"example/a\""),
+            (workspace, "checkout \"/work/repo\" base=\"origin/main\""),
+            (
+                workspace,
+                "checkout \"/work/repo\" base=\"--upload-pack=x\" branch=\"example/a\"",
+            ),
+            (
+                workspace,
+                "checkout \"/work/repo\" base=\"origin/main\" branch=\"example/-a\"",
+            ),
+            (
+                workspace,
+                "checkout \"/work/repo\" base=\"origin/main\" branch=\"example a\"",
+            ),
+            (
+                workspace,
+                "checkout \"/work/repo\" base=\"origin/main\" branch=\"example..a\"",
+            ),
+        ] {
+            let error = parse_intent(&mission(workspace, checkout), "node").unwrap_err();
+            assert_eq!(
+                error.code, "invalid-checkout",
+                "{checkout}: {}",
+                error.message
+            );
+        }
+        let unknown = mission(
+            workspace,
+            "checkout \"/work/repo\" base=\"origin/main\" branch=\"example/a\" depth=1",
+        );
+        assert!(parse_intent(&unknown, "node").is_err());
+        let empty = mission(
+            workspace,
+            "checkout \"\" base=\"origin/main\" branch=\"example/a\"",
+        );
+        assert!(parse_intent(&empty, "node").is_err());
+    }
 
     #[test]
     fn every_st3_eval_uses_the_current_graph_grammar() {

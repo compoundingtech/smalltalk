@@ -60,7 +60,7 @@ does not stop running seats; it adopts them. To run the daemon in the foreground
 ## First commands
 
 ```sh
-st3 now                  # what needs you, what is working, what is unhealthy
+st3 now                  # what needs you right now
 st3 agents ls            # seats and other running agents
 st3 missions ls          # missions with current runs
 st3 work ls              # steps that are ready or in progress

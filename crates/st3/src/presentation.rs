@@ -123,6 +123,17 @@ pub(crate) fn render_mission_run(
     let _ = writeln!(output, "GENERATION {}", selected.generation);
     let _ = writeln!(output, "WORKSPACE {}", selected.workspace);
     let _ = writeln!(output, "REQUESTER {}", selected.requester);
+    if let Some(after) = &selected.after {
+        let wait = selected
+            .steps
+            .iter()
+            .find(|step| step.step == st3::mission::AFTER_RUN_STEP)
+            .map_or("waiting", |step| match step.status.as_str() {
+                "completed" | "failed" | "cancelled" => step.status.as_str(),
+                _ => "waiting",
+            });
+        let _ = writeln!(output, "AFTER     {after} · {wait}");
+    }
     let _ = writeln!(
         output,
         "UPDATED   {}",
@@ -1160,7 +1171,7 @@ fn work_actor(step: &StepRunView) -> Option<&str> {
         .or_else(|| (step.available_to.len() == 1).then(|| step.available_to[0].as_str()))
 }
 
-fn relative_time(value: u128, now: u128) -> String {
+pub(crate) fn relative_time(value: u128, now: u128) -> String {
     let (future, delta) = if value >= now {
         (true, value - now)
     } else {
@@ -1213,6 +1224,7 @@ mod tests {
             claimant: None,
             claim_incarnation: None,
             claim_expires_at_unix_ms: None,
+            carried_claimant: None,
             execution_started_at_unix_ms: None,
             execution_elapsed_ms: 0,
             timeout_ms: None,
@@ -1255,6 +1267,7 @@ mod tests {
             mode: "run".into(),
             timeout_ms: None,
             deadline_at_unix_ms: None,
+            after: None,
             status: "running".into(),
             phase: "normal".into(),
             created_at_unix_ms: 1_000,
@@ -1486,6 +1499,26 @@ mod tests {
         assert!(rendered.contains("loop best-of-n · running · round 2/5"));
         assert!(rendered.contains("2 parallel · 3 candidates · winner 2"));
         assert!(rendered.contains("best quality=0.75"));
+    }
+
+    #[test]
+    fn mission_run_shows_the_run_it_waits_for() {
+        let mut after = step("step-run/demo-generation/after-run", "after-run", "working");
+        after.agentless = true;
+        after.blocked_reason = Some("waiting for `mission-run/demo/build` to complete".into());
+        let later = step("step-run/demo-generation/ship", "ship", "pending");
+        let mut waiting = run("mission-run/demo/run", None, vec![after.clone(), later]);
+        waiting.after = Some("mission-run/demo/build".into());
+
+        let rendered =
+            render_mission_run(&waiting, &[waiting.clone()], OutputStyle::plain(), 3_000);
+        assert!(rendered.contains("AFTER     mission-run/demo/build · waiting"));
+        assert!(rendered.contains("waiting for `mission-run/demo/build` to complete"));
+
+        waiting.steps[0].status = "completed".into();
+        let rendered =
+            render_mission_run(&waiting, &[waiting.clone()], OutputStyle::plain(), 3_000);
+        assert!(rendered.contains("AFTER     mission-run/demo/build · completed"));
     }
 
     #[test]
