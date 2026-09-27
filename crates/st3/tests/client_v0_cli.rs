@@ -1008,3 +1008,143 @@ mission "queued-work" state="ready" {
     );
     server.abort();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn agents_and_missions_show_print_what_the_worker_last_reported() {
+    let root = tempfile::tempdir().unwrap();
+    let socket = root.path().join("st3.sock");
+    let state = test_state(root.path());
+    let store = state.store.clone();
+    let source = r#"version 2
+agent "reporter" { workspace "/tmp"; command "true" }
+mission "reported-work" state="ready" {
+  goal "Show what the worker said."
+  step "docs" { assigned-to "agent/reporter" }
+  step "build" {
+    title "Build the parser"
+    assigned-to "agent/reporter"
+  }
+}
+"#;
+    let intent = st3::graph::parse_intent(source, "client-v0-cli").unwrap();
+    let planned = store
+        .mission(
+            &intent,
+            IntentInput {
+                kdl: source.into(),
+                source_name: None,
+            },
+        )
+        .unwrap();
+    store
+        .apply(&intent, &planned.subject_tokens, "cli-reported-mission")
+        .unwrap();
+    let run = store
+        .create_mission_run(&MissionRunRequest {
+            mission: "reported-work".into(),
+            revision: None,
+            workspace: "/tmp".into(),
+            requester: Some("person/requester".into()),
+            mode: Some("run".into()),
+            inputs: BTreeMap::new(),
+            idempotency_key: "cli-reported-run".into(),
+        })
+        .unwrap();
+    let step = |path: &str| {
+        run.steps
+            .iter()
+            .find(|step| step.step == path)
+            .unwrap()
+            .clone()
+    };
+    let (docs, build) = (step("docs"), step("build"));
+    let seat = build.assigned_to.clone().unwrap();
+    let request = |key: &str, summary: &str| st3::model::WorkRequest {
+        actor: Some(seat.clone()),
+        incarnation: Some("reporter:1".into()),
+        summary: Some(summary.into()),
+        reason: None,
+        evidence: Vec::new(),
+        idempotency_key: key.into(),
+    };
+    for (subject, action, key, summary) in [
+        (&docs.subject, "claim", "docs-claim", "Starting the docs"),
+        (&docs.subject, "progress", "docs-progress", "Drafting the guide"),
+        (&docs.subject, "complete", "docs-complete", "Published the guide"),
+        (&build.subject, "claim", "build-claim", "Starting the build"),
+        (&build.subject, "progress", "build-progress", "Tests pass; opening the pull request"),
+    ] {
+        if action == "claim" {
+            store.set_step_state(subject, "ready", None).unwrap();
+        }
+        store
+            .work_action(subject, action, &request(key, summary))
+            .unwrap();
+    }
+
+    let server_socket = socket.clone();
+    let server =
+        tokio::spawn(
+            async move { st3::api::serve_unix(&server_socket, st3::api::router(state)).await },
+        );
+    for _ in 0..100 {
+        if socket.exists() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert!(socket.exists(), "client-v0 test socket did not appear");
+
+    let agent = run_cli_human(&socket, &["agents", "show", &seat]).await;
+    assert!(
+        agent.status.success(),
+        "{}",
+        String::from_utf8_lossy(&agent.stderr)
+    );
+    let agent = String::from_utf8(agent.stdout).unwrap();
+    assert!(
+        agent.contains(&format!(
+            "CURRENT WORK {}\nCURRENT STEP Build the parser · working\n",
+            build.subject
+        )),
+        "{agent}"
+    );
+    assert!(
+        agent.contains("PROGRESS     Tests pass; opening the pull request · "),
+        "{agent}"
+    );
+    assert!(
+        agent.contains(&format!(
+            "CURRENT WORK {}\nCURRENT STEP docs · verifying\nDONE         Published the guide\n",
+            docs.subject
+        )),
+        "a submitted step awaiting verification shows its completion summary: {agent}"
+    );
+
+    let mission = run_cli_human(&socket, &["missions", "show", &run.subject]).await;
+    assert!(
+        mission.status.success(),
+        "{}",
+        String::from_utf8_lossy(&mission.stderr)
+    );
+    let mission = String::from_utf8(mission.stdout).unwrap();
+    assert!(
+        mission.contains("  progress: Tests pass; opening the pull request\n"),
+        "{mission}"
+    );
+    assert!(mission.contains("  done: Published the guide\n"), "{mission}");
+    assert!(!mission.contains("Drafting the guide"), "{mission}");
+
+    let json = value(&run_cli(&socket, &["missions", "show", &run.subject]).await);
+    let steps = json["steps"].as_array().unwrap();
+    let reported = |path: &str| steps.iter().find(|step| step["step"] == path).unwrap();
+    assert_eq!(
+        reported("build")["progress_summary"],
+        "Tests pass; opening the pull request"
+    );
+    assert!(reported("build")["progress_at_unix_ms"].is_u64());
+    assert!(reported("build").get("completion_summary").is_none());
+    assert_eq!(reported("docs")["completion_summary"], "Published the guide");
+
+    server.abort();
+}

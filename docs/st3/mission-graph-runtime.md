@@ -1277,6 +1277,8 @@ An authorized agent uses `st3 work publish-mission`, fenced to its claimed produ
 
 The default mission view shows the complete run summary and its active graph branch. Add `--follow` to watch an existing run.
 
+Each step shows one line from its worker: the `work complete` summary once submitted, otherwise the latest `work progress` summary. Both come from the current attempt, and `--json` carries them as `completion_summary`, `progress_summary`, and `progress_at_unix_ms`. `st3 agents show` prints each current step with its latest progress summary and age.
+
 Follow mode redraws one screen on a terminal. It appends each changed snapshot when another program reads the output.
 
 Add `--json` to any mission or work view when a program needs the stable data shape.

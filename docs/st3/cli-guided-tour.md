@@ -221,6 +221,7 @@ st3 machines
 
 Copy an agent ID into `show`. Check tree nesting, durable seats versus mission-owned agents, current
 runtime, host, work, conversation, stale state, and whether stopped history stays out of the default.
+For a working agent, check that `show` names its current step and its last progress summary.
 
 Copy a durable seat into `agents queue`. Check that the current claim comes first, then each queued
 mission run in order with `claimed`, `ready`, or `waiting`, and that `NEXT WORK` matches

@@ -848,6 +848,8 @@ pub(crate) fn mission_run_signature(runs: &[MissionRunView]) -> anyhow::Result<S
                     "attempt": step.attempt,
                     "claimant": step.claimant,
                     "blocked_reason": step.blocked_reason,
+                    "progress_summary": step.progress_summary,
+                    "completion_summary": step.completion_summary,
                 })).collect::<Vec<_>>(),
             })
         })
@@ -1055,6 +1057,24 @@ fn render_graph_step(output: &mut String, step: &StepRunView, indent: &str, styl
     if let Some(reason) = &step.blocked_reason {
         let _ = writeln!(output, "{indent}  reason: {reason}");
     }
+    // The completion summary supersedes progress, so each step adds at most one line.
+    if let Some(summary) = &step.completion_summary {
+        let _ = writeln!(output, "{indent}  done: {}", glance(summary));
+    } else if let Some(summary) = &step.progress_summary {
+        let _ = writeln!(output, "{indent}  progress: {}", glance(summary));
+    }
+}
+
+/// The first line of a worker summary, cut to fit one terminal line.
+pub(crate) fn glance(text: &str) -> String {
+    const LIMIT: usize = 120;
+    let mut lines = text.trim().lines();
+    let line = lines.next().unwrap_or_default().trim_end();
+    let mut shown = line.chars().take(LIMIT).collect::<String>();
+    if line.chars().count() > LIMIT || lines.next().is_some() {
+        shown.push('…');
+    }
+    shown
 }
 
 #[cfg(test)]
@@ -1160,7 +1180,7 @@ fn work_actor(step: &StepRunView) -> Option<&str> {
         .or_else(|| (step.available_to.len() == 1).then(|| step.available_to[0].as_str()))
 }
 
-fn relative_time(value: u128, now: u128) -> String {
+pub(crate) fn relative_time(value: u128, now: u128) -> String {
     let (future, delta) = if value >= now {
         (true, value - now)
     } else {
@@ -1218,6 +1238,9 @@ mod tests {
             timeout_ms: None,
             ready_age_ms: None,
             wake: None,
+            progress_summary: None,
+            progress_at_unix_ms: None,
+            completion_summary: None,
             readiness_epoch: 1,
             blocked_reason: None,
             blockers: Vec::new(),
@@ -1486,6 +1509,51 @@ mod tests {
         assert!(rendered.contains("loop best-of-n · running · round 2/5"));
         assert!(rendered.contains("2 parallel · 3 candidates · winner 2"));
         assert!(rendered.contains("best quality=0.75"));
+    }
+
+    #[test]
+    fn mission_view_shows_one_summary_line_per_reporting_step() {
+        let mut working = step("step-run/demo-generation/build", "build", "working");
+        working.progress_summary = Some("Tests pass; opening the pull request".into());
+        let mut submitted = step("step-run/demo-generation/docs", "docs", "completed");
+        submitted.progress_summary = Some("Drafting the guide".into());
+        submitted.completion_summary = Some(format!("{}\nsecond line", "x".repeat(130)));
+        let quiet = step("step-run/demo-generation/ship", "ship", "ready");
+        let root = run(
+            "mission-run/demo/run",
+            None,
+            vec![working, submitted, quiet],
+        );
+
+        let rendered = render_mission_run(&root, &[root.clone()], OutputStyle::plain(), 3_000);
+
+        assert!(rendered.contains("  progress: Tests pass; opening the pull request\n"));
+        assert!(rendered.contains(&format!("  done: {}…\n", "x".repeat(120))));
+        assert!(
+            !rendered.contains("Drafting the guide"),
+            "the completion summary supersedes progress"
+        );
+        assert_eq!(rendered.matches("progress:").count(), 1);
+        assert_eq!(glance("  one\n\n"), "one");
+        assert_eq!(glance("one\ntwo"), "one…");
+    }
+
+    #[test]
+    fn mission_signature_changes_when_a_worker_reports() {
+        let first = run(
+            "mission-run/demo/run",
+            None,
+            vec![step("step-run/demo-generation/work", "work", "working")],
+        );
+        let mut reported = first.clone();
+        reported.steps[0].progress_summary = Some("Halfway".into());
+        let mut completed = reported.clone();
+        completed.steps[0].completion_summary = Some("Done".into());
+
+        let signatures = [first, reported, completed]
+            .map(|run| mission_run_signature(&[run]).unwrap());
+        assert_ne!(signatures[0], signatures[1]);
+        assert_ne!(signatures[1], signatures[2]);
     }
 
     #[test]
