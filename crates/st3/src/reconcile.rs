@@ -20017,41 +20017,20 @@ mission "draining" state="ready" revision-cutover="when-idle" {
             carried, held,
             "the revision carries the step to a new subject"
         );
+        let step = seat.store.step_run(&carried).unwrap().unwrap();
         assert_eq!(
-            seat.store.step_run(&carried).unwrap().unwrap().status,
-            "ready",
-            "the revision drops the seat's claim"
+            step.status, "claimed",
+            "the revision keeps the seat's claim"
         );
+        assert_eq!(step.claimant.as_deref(), Some(SEAT));
         assert_eq!(
             seat.order(),
             SeatQueueFixture::runs(&[&gated, &queued]),
             "the revised run keeps its queue position"
         );
-
-        assert_eq!(
-            seat.next().as_deref(),
-            Some(carried.as_str()),
-            "the carried step keeps its place ahead of the earlier run"
-        );
-        assert_eq!(seat.wake().as_deref(), Some(carried.as_str()));
-        assert!(
-            seat.woken().contains(&carried),
-            "the reconciler wakes the seat for its carried step"
-        );
+        seat.reconciler.reconcile_once().unwrap();
+        assert_eq!(seat.wake(), None, "the seat still holds the carried step");
         assert!(!seat.woken().contains(&earlier));
-        assert_eq!(
-            seat.store
-                .work(Some(SEAT), false)
-                .unwrap()
-                .into_iter()
-                .find(|step| step.subject == carried)
-                .and_then(|step| step.carried_claimant)
-                .as_deref(),
-            Some(SEAT),
-            "the seat's work list names it as the carried step's claimant"
-        );
-        seat.work(&carried, "claim", "seat-revision-reclaim")
-            .unwrap();
         seat.work(&carried, "complete", "seat-revision-complete")
             .unwrap();
         assert_eq!(
