@@ -473,6 +473,7 @@
             "owner_run_id": { "oneOf": [{ "$ref": "#/$defs/Id" }, { "type": "null" }] },
             "driver": { "type": ["string", "null"] },
             "harness_state": { "type": ["string", "null"] },
+            "fault": { "type": ["string", "null"], "description": "Current member reconcile failure; cleared by a successful pass." },
             "incarnation_id": { "type": ["string", "null"] },
             "current_session_id": { "type": ["string", "null"] },
             "current_work_ids": { "type": "array", "items": { "$ref": "#/$defs/Id" } },

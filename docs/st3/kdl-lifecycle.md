@@ -50,7 +50,7 @@ Read @.st3/boot.md completely. Then list, claim, do, and finish your current st3
 
 A harness `prompt` is optional. An authored prompt supplies stable repository context only. Mission goals and constraints remain in the graph.
 
-st3 refuses to replace a tracked `.st3/boot.md` with different bytes. The complete render transaction fails, and the agent does not start.
+st3 refuses to replace a tracked `.st3/boot.md` with different bytes. That member’s complete render transaction fails, and the agent does not start. Other members continue reconciling; `st3 agents show` and `st3 doctor` report the fault.
 
 ## Mission constraints
 
