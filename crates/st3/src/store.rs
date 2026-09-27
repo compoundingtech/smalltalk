@@ -6969,6 +6969,26 @@ impl Store {
         attention_request_view_tx(&connection, &subject)
     }
 
+    /// The current state of each fault target that has one. Resources, documents and unknown
+    /// kinds have no state to show and are left out.
+    pub fn attention_target_states(
+        &self,
+        targets: &[String],
+    ) -> Result<Vec<crate::model::AttentionTargetState>> {
+        let connection = self.readers.get();
+        let mut states = Vec::new();
+        for target in targets {
+            if let Some((state, since_unix_ms)) = attention_target_state_tx(&connection, target)? {
+                states.push(crate::model::AttentionTargetState {
+                    id: target.clone(),
+                    state,
+                    since_unix_ms,
+                });
+            }
+        }
+        Ok(states)
+    }
+
     pub fn attention_requests(
         &self,
         person: Option<&str>,
@@ -6992,26 +7012,6 @@ impl Store {
             .into_iter()
             .filter(|request| include_resolved || request.status == "pending")
             .collect())
-    }
-
-    /// The current state of each fault target that has one. Resources, documents and unknown
-    /// kinds have no state to show and are left out.
-    pub fn attention_target_states(
-        &self,
-        targets: &[String],
-    ) -> Result<Vec<crate::model::AttentionTargetState>> {
-        let connection = self.readers.get();
-        let mut states = Vec::new();
-        for target in targets {
-            if let Some((state, since_unix_ms)) = attention_target_state_tx(&connection, target)? {
-                states.push(crate::model::AttentionTargetState {
-                    id: target.clone(),
-                    state,
-                    since_unix_ms,
-                });
-            }
-        }
-        Ok(states)
     }
 
     pub fn attention_items(&self, person: Option<&str>) -> Result<Vec<AttentionItemView>> {
