@@ -7,8 +7,8 @@ memory numbers do and do not measure.
 ## Verdict
 
 **Not yet.** The evals pass, apart from one Claude start failure and one void run, but the 9-hour
-overnight run shows the branch using more idle CPU and waking far more often than base. Merge after the extra wakeups
-are explained, or accept the cost knowingly.
+overnight run shows the branch using more idle CPU and waking far more often than base. Merge
+after the extra wakeups are explained, or accept the cost knowingly.
 
 - **For merging:** the seat queue works with live agents. 16 of the 18 runs last night on Claude,
   Codex and omp seats passed. One Claude seat never reached idle before any work existed. One omp
@@ -26,8 +26,9 @@ are explained, or accept the cost knowingly.
 
 ## Result
 
-- **Idle CPU is not higher in 30-minute windows after one fix.** The branch as first measured used 3.3% more idle CPU
-  than base when the graph took six writes a minute, because the reconciler read every seat's
+- **Idle CPU is not higher in 30-minute windows after one fix.** The branch as first measured
+  used 3.3% more idle CPU than base when the graph took six writes a minute, because the
+  reconciler read every seat's
   order on each loop. `d2c4ee8` reads a seat's order only when the seat must choose between runs.
   After it, idle CPU is 0.357 against 0.354 s/min with read-only traffic and 0.622 against
   0.623 s/min with writes. A reconcile after one write costs 43.7 to 44.3 ms of CPU against 43.3
