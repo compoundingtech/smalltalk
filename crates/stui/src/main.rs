@@ -84,6 +84,20 @@ struct Attached {
     attachment_id: String,
     screen: TerminalScreen,
 }
+struct PendingTerminalInput {
+    key: KeyCode,
+    pressed_at: Instant,
+    terminal_id: String,
+    incarnation: String,
+}
+impl PendingTerminalInput {
+    fn is_confirmation(&self, key: KeyEvent, now: Instant) -> bool {
+        key.kind == KeyEventKind::Press
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+            && key.code == self.key
+            && now.duration_since(self.pressed_at) < Duration::from_secs(2)
+    }
+}
 enum Update {
     Partial(Box<Model>),
     Model(Box<Model>),
@@ -104,6 +118,7 @@ struct App {
     input: String,
     launch: [String; 4],
     attached: Option<Attached>,
+    pending_terminal_input: Option<PendingTerminalInput>,
     selection_mode: bool,
     selection_frame_drawn: bool,
     history_open: bool,
@@ -146,6 +161,7 @@ impl App {
             input: String::new(),
             launch: Default::default(),
             attached: None,
+            pending_terminal_input: None,
             selection_mode: false,
             selection_frame_drawn: false,
             history_open: false,
@@ -174,6 +190,21 @@ impl App {
             messages_requested: None,
             last_messages: Instant::now(),
             last_terminal: Instant::now(),
+        }
+    }
+    fn cancel_terminal_input(&mut self) {
+        if self.pending_terminal_input.take().is_some() {
+            self.notice = None;
+            self.dirty = true;
+        }
+    }
+    fn expire_terminal_input(&mut self, now: Instant) {
+        if self
+            .pending_terminal_input
+            .as_ref()
+            .is_some_and(|pending| now.duration_since(pending.pressed_at) >= Duration::from_secs(2))
+        {
+            self.cancel_terminal_input();
         }
     }
     fn remember_chat_scroll(&mut self) {
@@ -512,7 +543,9 @@ impl App {
                 columns[1],
             );
             frame.render_widget(
-                Paragraph::new("Interactive terminal · Ctrl+\\ or click Return to detach"),
+                Paragraph::new(
+                    "Ctrl+C/D: return · same key again within 2s: send to agent · Ctrl+\\: detach",
+                ),
                 chunks[2],
             );
             return;
@@ -1943,43 +1976,82 @@ async fn import_session(app: &mut App, client: &Client, target: &str) -> Result<
     }
 }
 
+async fn send_terminal_key(
+    client: &Client,
+    terminal_id: &str,
+    incarnation: &str,
+    key: KeyEvent,
+) -> Result<()> {
+    if let Some(value) = key_input(key) {
+        for attempt in 0..3 {
+            let fence = terminal_fence(client, terminal_id, incarnation).await?;
+            let (id, idem) = action_pair();
+            match client
+                .terminal_input(
+                    id,
+                    idem,
+                    fence,
+                    TerminalInputParameters {
+                        terminal_id: terminal_id.to_owned(),
+                        mode: TerminalInputMode::Key,
+                        value: value.clone(),
+                    },
+                )
+                .await
+            {
+                Ok(_) => break,
+                Err(ClientError::Api(ErrorCode::StaleFence, _, _)) if attempt < 2 => continue,
+                Err(error) => return Err(error.into()),
+            }
+        }
+    }
+    Ok(())
+}
+
 async fn handle_key(app: &mut App, client: &Client, key: KeyEvent) -> Result<bool> {
     if key.kind != KeyEventKind::Press {
         return Ok(false);
     }
+    let now = Instant::now();
+    app.expire_terminal_input(now);
+    if let Some(pending) = app.pending_terminal_input.take() {
+        app.notice = None;
+        app.dirty = true;
+        if pending.is_confirmation(key, now) {
+            send_terminal_key(client, &pending.terminal_id, &pending.incarnation, key).await?;
+            app.notice = Some("Key sent to the terminal you left".into());
+            return Ok(false);
+        }
+    }
     if let Some(attached) = &app.attached {
+        if key.modifiers.contains(KeyModifiers::CONTROL)
+            && let KeyCode::Char(c @ ('c' | 'd')) = key.code
+        {
+            let pending = PendingTerminalInput {
+                key: key.code,
+                pressed_at: now,
+                terminal_id: attached.terminal_id.clone(),
+                incarnation: attached.screen.runtime_incarnation.clone(),
+            };
+            detach(app, client).await?;
+            app.notice = Some(format!(
+                "Returned to list · press Ctrl+{} again within 2s to send to the agent",
+                c.to_ascii_uppercase()
+            ));
+            app.pending_terminal_input = Some(pending);
+            return Ok(false);
+        }
         if is_detach_key(key) {
             detach(app, client).await?;
             return Ok(false);
         }
-        if let Some(value) = key_input(key) {
-            for attempt in 0..3 {
-                let fence = terminal_fence(
-                    client,
-                    &attached.terminal_id,
-                    &attached.screen.runtime_incarnation,
-                )
-                .await?;
-                let (id, idem) = action_pair();
-                match client
-                    .terminal_input(
-                        id,
-                        idem,
-                        fence,
-                        TerminalInputParameters {
-                            terminal_id: attached.terminal_id.clone(),
-                            mode: TerminalInputMode::Key,
-                            value: value.clone(),
-                        },
-                    )
-                    .await
-                {
-                    Ok(_) => break,
-                    Err(ClientError::Api(ErrorCode::StaleFence, _, _)) if attempt < 2 => continue,
-                    Err(error) => return Err(error.into()),
-                }
-            }
-        }
+        send_terminal_key(
+            client,
+            &attached.terminal_id,
+            &attached.screen.runtime_incarnation,
+            key,
+        )
+        .await?;
         return Ok(false);
     }
     if app.selection_mode {
@@ -2664,6 +2736,7 @@ fn main() -> Result<()> {
                 }
             }
         }
+        app.expire_terminal_input(Instant::now());
         if app.dirty && (!app.selection_mode || !app.selection_frame_drawn) {
             guard.terminal.draw(|frame| app.render(frame))?;
             app.dirty = false;
@@ -2673,7 +2746,11 @@ fn main() -> Result<()> {
             break;
         }
         if event::poll(Duration::ZERO)? && !stopping.load(Ordering::Relaxed) && !stdin_hung_up() {
-            match event::read()? {
+            let event = event::read()?;
+            if matches!(event, Event::Mouse(_) | Event::Paste(_)) {
+                app.cancel_terminal_input();
+            }
+            match event {
                 Event::Key(key) => match runtime.block_on(handle_key(&mut app, &client, key)) {
                     Ok(true) => break,
                     Ok(false) => {}
@@ -2997,6 +3074,168 @@ mod tests {
             key_input(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL)).as_deref(),
             Some("C-x")
         );
+    }
+
+    // Exercise the real key handler and inspect the actions sent to a fake daemon.
+    fn terminal_test_client() -> (Client, std::thread::JoinHandle<serde_json::Value>) {
+        use std::io::{BufRead, BufReader, Read, Write};
+        use std::os::unix::net::UnixListener;
+
+        let path = std::env::temp_dir().join(format!("stui-{}.sock", uuid::Uuid::now_v7()));
+        let listener = UnixListener::bind(&path).unwrap();
+        let client = Client::unix_as(&path, "person/test");
+        let server = std::thread::spawn(move || {
+            let mut action = serde_json::Value::Null;
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut reader = BufReader::new(&mut stream);
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                let post = line.starts_with("POST ");
+                let mut length = 0;
+                loop {
+                    line.clear();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" {
+                        break;
+                    }
+                    if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                        length = value.trim().parse().unwrap();
+                    }
+                }
+                let mut body = vec![0; length];
+                reader.read_exact(&mut body).unwrap();
+                let mut response: serde_json::Value = serde_json::from_str(include_str!(
+                    "../../../docs/st3/client-v0/fixtures/terminal-screen.json"
+                ))
+                .unwrap();
+                if post {
+                    action = serde_json::from_slice(&body).unwrap();
+                    response["value"] = serde_json::json!({
+                        "kind": "action-result", "action_id": action["id"],
+                        "operation_id": "operation/test", "status": "completed",
+                        "affected_ids": [], "snapshot_id": response["snapshot"]["id"]
+                    });
+                }
+                let body = response.to_string();
+                write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+            }
+            std::fs::remove_file(path).unwrap();
+            action
+        });
+        (client, server)
+    }
+
+    #[tokio::test]
+    async fn terminal_ctrl_c_and_d_detach_before_deliberate_second_press() {
+        for c in ['c', 'd'] {
+            let screen: st3_client::Envelope<TerminalScreen> = serde_json::from_str(include_str!(
+                "../../../docs/st3/client-v0/fixtures/terminal-screen.json"
+            ))
+            .unwrap();
+            let mut app = App::new(Model::default());
+            app.tab = 1;
+            app.attached = Some(Attached {
+                terminal_id: screen.value.terminal_id.clone(),
+                attachment_id: "attachment/test".into(),
+                screen: screen.value,
+            });
+            let key = KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL);
+            let (client, server) = terminal_test_client();
+            let quit = handle_key(&mut app, &client, key).await.unwrap();
+            let action = server.join().unwrap();
+            assert_eq!(
+                action["type"], "terminal.detach",
+                "first press must not reach the agent"
+            );
+            assert!(!quit);
+            assert!(app.attached.is_none());
+            assert_eq!(app.tab, 1);
+            let mut terminal = Terminal::new(TestBackend::new(120, 24)).unwrap();
+            terminal.draw(|frame| app.render(frame)).unwrap();
+            let content = terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>();
+            assert!(content.contains(&format!("Ctrl+{}", c.to_ascii_uppercase())));
+            assert!(content.contains("within 2s"));
+
+            let (client, server) = terminal_test_client();
+            assert!(!handle_key(&mut app, &client, key).await.unwrap());
+            let action = server.join().unwrap();
+            assert_eq!(action["type"], "terminal.input");
+            assert_eq!(action["parameters"]["value"], format!("C-{c}"));
+            assert_eq!(
+                action["parameters"]["terminal_id"],
+                "terminal/release-shell"
+            );
+            assert_eq!(
+                action["fence"]["runtime_incarnation"],
+                "pty-4:2026-09-20T11:10:00Z"
+            );
+            assert!(app.attached.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn terminal_confirmation_expires_and_other_input_cancels_it() {
+        let client = Client::unix("/nonexistent-stui-test.sock");
+        let now = Instant::now();
+        for c in ['c', 'd'] {
+            let key = KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL);
+            let pending = || PendingTerminalInput {
+                key: key.code,
+                pressed_at: now,
+                terminal_id: "terminal/original".into(),
+                incarnation: "original-incarnation".into(),
+            };
+            assert!(pending().is_confirmation(key, now + Duration::from_millis(1999)));
+            assert!(!pending().is_confirmation(key, now + Duration::from_secs(2)));
+            assert!(
+                !pending()
+                    .is_confirmation(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE), now)
+            );
+            let other = KeyEvent::new(
+                KeyCode::Char(if c == 'c' { 'd' } else { 'c' }),
+                KeyModifiers::CONTROL,
+            );
+            assert!(!pending().is_confirmation(other, now));
+
+            let mut app = App::new(Model::default());
+            app.pending_terminal_input = Some(pending());
+            app.notice = Some("confirmation".into());
+            let repeat = KeyEvent::new_with_kind(key.code, key.modifiers, KeyEventKind::Repeat);
+            assert!(!handle_key(&mut app, &client, repeat).await.unwrap());
+            assert!(app.pending_terminal_input.is_some());
+            // Navigation cancels confirmation before the next protected key.
+            assert!(
+                !handle_key(
+                    &mut app,
+                    &client,
+                    KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)
+                )
+                .await
+                .unwrap()
+            );
+            assert!(app.pending_terminal_input.is_none());
+            assert!(app.notice.is_none());
+
+            app.pending_terminal_input = Some(pending());
+            app.notice = Some("confirmation".into());
+            app.dirty = false;
+            app.expire_terminal_input(now + Duration::from_secs(2));
+            assert!(app.pending_terminal_input.is_none());
+            assert!(app.notice.is_none());
+            assert!(app.dirty);
+            // The list's normal behavior resumes, without any network input.
+            assert_eq!(handle_key(&mut app, &client, key).await.unwrap(), c == 'c');
+        }
     }
 
     #[test]
