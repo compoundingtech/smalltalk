@@ -1590,6 +1590,15 @@ fn claim_specs() -> BTreeMap<String, ClaimSpec> {
             &["subscription"],
         ),
         (
+            "subscription.mission-deferred",
+            &["subscription"],
+            WritePolicy::SystemOnly,
+            Cardinality::Append,
+            Some("subscriptions"),
+            true,
+            &["subscription"],
+        ),
+        (
             "subscription.mission-failed",
             &["subscription"],
             WritePolicy::SystemOnly,
@@ -2284,6 +2293,10 @@ fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
             ("request", required_string()),
             ("mission_run", required_reference_to(&["mission-run"])),
         ],
+        "subscription.mission-deferred" => &[
+            ("request", required_string()),
+            ("not_before_unix_ms", required_integer()),
+        ],
         "subscription.mission-failed" => &[
             ("request", required_string()),
             ("code", required_string()),
@@ -2603,6 +2616,7 @@ mod tests {
                 "step-run.carried",
                 "step-run.retried",
                 "step-run.state",
+                "subscription.mission-deferred",
                 "subscription.mission-failed",
                 "subscription.mission-requested",
                 "subscription.mission-started",

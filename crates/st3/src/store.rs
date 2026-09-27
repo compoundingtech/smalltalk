@@ -2790,6 +2790,19 @@ impl Store {
             .min())
     }
 
+    pub fn next_subscription_mission_retry_deadline(&self) -> Result<Option<u128>> {
+        let connection = self.readers.get();
+        let now = now_ms() as i64;
+        let deadline: Option<i64> = connection.query_row(
+            "SELECT MIN(CAST(json_extract(body, '$.fields.not_before_unix_ms') AS INTEGER))
+             FROM claims WHERE kind='subscription.mission-deferred'
+               AND CAST(json_extract(body, '$.fields.not_before_unix_ms') AS INTEGER)>?1",
+            [now],
+            |row| row.get(0),
+        )?;
+        Ok(deadline.map(|value| value as u128))
+    }
+
     pub fn request_mission_run_cancellation(
         &self,
         run: &str,
@@ -4203,6 +4216,48 @@ impl Store {
                         desired.subject, subscription.to
                     ));
                 }
+                if subscription.delivery == "mission"
+                    && let (Some(mission_id), Some(revision), Some(input)) = (
+                        subscription.mission.as_deref(),
+                        subscription.revision.as_deref(),
+                        subscription.resource_input.as_deref(),
+                    )
+                {
+                    let local = connection
+                        .query_row(
+                            "SELECT body FROM mission_revisions
+                             WHERE mission_id=?1 AND revision=?2 AND created_index<=?3",
+                            params![mission_id, revision, store_index],
+                            |row| row.get::<_, String>(0),
+                        )
+                        .optional()
+                        .map_err(internal)?
+                        .map(|body| serde_json::from_str::<MissionSpec>(&body).map_err(internal))
+                        .transpose()?;
+                    let published = intent
+                        .missions
+                        .get(mission_id)
+                        .filter(|mission| mission.revision == revision)
+                        .cloned()
+                        .or(local);
+                    match published {
+                        Some(mission)
+                            if mission
+                                .inputs
+                                .get(input)
+                                .is_none_or(|declaration| declaration.kind != MissionInputKind::Resource) => blockers.push(
+                            format!(
+                                "subscription `{}` uses undeclared resource input `{input}` in mission/{}@{revision}",
+                                desired.subject, mission_id
+                            ),
+                        ),
+                        None => blockers.push(format!(
+                            "subscription `{}` references unpublished mission/{}@{revision}",
+                            desired.subject, mission_id
+                        )),
+                        _ => {}
+                    }
+                }
             }
         }
         for mission in intent.missions.values() {
@@ -4486,6 +4541,63 @@ impl Store {
         }
         let transaction = connection.transaction().map_err(internal)?;
         validate_documents(&transaction, &intent.document_refs)?;
+        for desired in intent
+            .subjects
+            .values()
+            .filter(|subject| subject.kind == "subscription")
+        {
+            let Some(spec) = crate::graph::subscription_spec(&desired.desired) else {
+                continue;
+            };
+            if spec.stopped || spec.delivery != "mission" {
+                continue;
+            }
+            let (Some(mission_id), Some(revision), Some(input)) = (
+                spec.mission.as_deref(),
+                spec.revision.as_deref(),
+                spec.resource_input.as_deref(),
+            ) else {
+                continue;
+            };
+            let local = transaction
+                .query_row(
+                    "SELECT body FROM mission_revisions WHERE mission_id=?1 AND revision=?2",
+                    params![mission_id, revision],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+                .map_err(internal)?
+                .map(|body| serde_json::from_str::<MissionSpec>(&body).map_err(internal))
+                .transpose()?;
+            let published = intent
+                .missions
+                .get(mission_id)
+                .filter(|mission| mission.revision == revision)
+                .cloned()
+                .or(local);
+            let Some(mission) = published else {
+                return Err(St3Error::new(
+                    "missing-mission",
+                    format!(
+                        "subscription `{}` references unpublished mission/{}@{revision}",
+                        desired.subject, mission_id
+                    ),
+                ));
+            };
+            if mission
+                .inputs
+                .get(input)
+                .is_none_or(|declaration| declaration.kind != MissionInputKind::Resource)
+            {
+                return Err(St3Error::new(
+                    "invalid-subscription-resource-input",
+                    format!(
+                        "subscription `{}` uses undeclared resource input `{input}` in mission/{}@{revision}",
+                        desired.subject, mission_id
+                    ),
+                ));
+            }
+        }
         for subject in intent.subjects.keys() {
             let actual = intent_leaves_tx(&transaction, subject).map_err(internal)?;
             let expected = expected.get(subject).ok_or_else(|| {

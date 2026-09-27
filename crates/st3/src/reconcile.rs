@@ -455,6 +455,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             self.store.next_active_mission_deadline(&self.host)?,
             self.next_work_wake_deadline()?,
             self.next_provider_capacity_retry_deadline()?,
+            self.store.next_subscription_mission_retry_deadline()?,
         ]
         .into_iter()
         .flatten()
@@ -6329,6 +6330,25 @@ impl<R: RuntimeControl> Reconciler<R> {
             let failures = self
                 .store
                 .claims_for(&item.subject, Some("subscription.mission-failed"))?;
+            let mut deferrals = BTreeMap::new();
+            for claim in self
+                .store
+                .claims_for(&item.subject, Some("subscription.mission-deferred"))?
+            {
+                if let (Some(request), Some(deadline)) = (
+                    claim
+                        .body
+                        .pointer("/fields/request")
+                        .and_then(Value::as_str),
+                    claim
+                        .body
+                        .pointer("/fields/not_before_unix_ms")
+                        .and_then(Value::as_u64),
+                ) {
+                    let entry = deferrals.entry(request.to_owned()).or_insert((0, 0));
+                    *entry = (deadline, entry.1 + 1);
+                }
+            }
             for request in requests {
                 if starts.iter().chain(&failures).any(|claim| {
                     claim
@@ -6337,6 +6357,12 @@ impl<R: RuntimeControl> Reconciler<R> {
                         .and_then(Value::as_str)
                         == Some(request.id.as_str())
                 }) {
+                    continue;
+                }
+                if deferrals
+                    .get(&request.id)
+                    .is_some_and(|(deadline, _)| u128::from(*deadline) > now_ms())
+                {
                     continue;
                 }
                 let fields = request.body.get("fields").unwrap_or(&request.body);
@@ -6391,7 +6417,30 @@ impl<R: RuntimeControl> Reconciler<R> {
                     );
                 let run = match created {
                     Ok(run) => run,
-                    Err(error) if error.code == "mission-run-capacity" => continue,
+                    Err(error) if error.code == "mission-run-capacity" => {
+                        let attempt = deferrals
+                            .get(&request.id)
+                            .map_or(1_u32, |(_, attempts)| attempts + 1);
+                        let delay_ms =
+                            1_000_u128.saturating_mul(1_u128 << attempt.saturating_sub(1).min(6));
+                        let not_before = now_ms().saturating_add(delay_ms);
+                        self.store.append_claim(&ClaimInput {
+                            subject: item.subject.clone(),
+                            kind: "subscription.mission-deferred".into(),
+                            actor: None,
+                            fields: BTreeMap::from([
+                                ("request".into(), Value::String(request.id.clone())),
+                                ("not_before_unix_ms".into(), Value::from(not_before as u64)),
+                            ]),
+                            evidence: vec![request.id.clone()],
+                            expected_subject: None,
+                            idempotency_key: Some(format!(
+                                "subscription-mission-deferred:{}:{attempt}",
+                                request.id
+                            )),
+                        })?;
+                        continue;
+                    }
                     Err(error) => {
                         self.store.append_claim(&ClaimInput {
                             subject: item.subject.clone(),
@@ -14116,6 +14165,59 @@ subscription "reviews" {{
     }
 
     #[test]
+    fn subscription_publish_rejects_an_undeclared_mission_resource_input() {
+        let store = Store::open_memory("node").unwrap();
+        apply_source(
+            &store,
+            r#"version 2
+mission "review" state="ready" {
+  input "source" kind="resource"
+  goal "Review."
+  step "review" { agentless }
+}"#,
+            "subscription-publish-mission",
+        );
+        let revision = store
+            .mission_spec("review", None)
+            .unwrap()
+            .unwrap()
+            .revision;
+        let source = format!(
+            r#"version 2
+resource "repo" {{ kind "vcs.repository" }}
+observer "repo" {{ resource "resource/repo"; provider "github.repository"; locator "example/repo"; field "issues" }}
+subscription "reviews" {{
+  observer "observer/repo"
+  on "issues"
+  delivery "mission" {{ mission "review@{revision}"; resource "item"; workspace "/tmp/st3-review" }}
+}}"#
+        );
+        let intent = parse_intent(&source, "node").unwrap();
+        let plan = store
+            .mission(
+                &intent,
+                crate::model::IntentInput {
+                    kdl: source,
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        assert!(
+            plan.blockers
+                .iter()
+                .any(|blocker| blocker.contains("undeclared resource input"))
+        );
+        let error = store
+            .apply(
+                &intent,
+                &plan.subject_tokens,
+                "invalid-subscription-publish",
+            )
+            .unwrap_err();
+        assert_eq!(error.code, "invalid-subscription-resource-input");
+    }
+
+    #[test]
     fn a_changed_subscription_starts_one_exact_resource_input_mission() {
         let store = Arc::new(Store::open_memory("node").unwrap());
         apply_source(
@@ -14231,6 +14333,32 @@ subscription "reviews" {{
                 .is_empty(),
             "capacity must leave the event pending"
         );
+        let deferred = store
+            .claims_for(
+                "subscription/reviews",
+                Some("subscription.mission-deferred"),
+            )
+            .unwrap();
+        assert_eq!(deferred.len(), 1);
+        assert!(
+            deferred[0].body["fields"]["not_before_unix_ms"]
+                .as_u64()
+                .unwrap()
+                > now_ms() as u64
+        );
+        reconciler
+            .reconcile_subscription_missions(&desired)
+            .unwrap();
+        assert_eq!(
+            store
+                .claims_for(
+                    "subscription/reviews",
+                    Some("subscription.mission-deferred")
+                )
+                .unwrap()
+                .len(),
+            1
+        );
         for _ in 0..5 {
             reconciler.evaluate_mission_runs().unwrap();
         }
@@ -14238,6 +14366,7 @@ subscription "reviews" {{
             store.mission_run(&occupied.id).unwrap().unwrap().status,
             "completed"
         );
+        std::thread::sleep(Duration::from_millis(1_100));
         reconciler
             .reconcile_subscription_missions(&desired)
             .unwrap();
