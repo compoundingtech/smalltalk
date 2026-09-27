@@ -25,12 +25,12 @@ use crate::model::{
     OperationalRepairItem, OperationalRepairPlan, OperationalRepairResult, PlannedAction,
     PlannerSpec, PlanningCandidateView, PlanningPreviewView, PlanningSessionDeclaration,
     PlanningSessionView, PlanningVariantView, ReplicaBatch, ReplicaEnvelope, ReplicaEnvelopeId,
-    ReplicaRecordView, ReplicaRepairDeclaration, ReplicationExchange, ReplicationInventory,
-    ReplicationPeerStatus, ReplicationReceipt, ReplicationStatus, ResourceObservationOutcome,
-    ResourceRefreshOperation, RevisionCutover, RevisionProposalView, RevisionSubmissionView,
-    RunGenerationView, RuntimeResetOperation, St3Error, StatusResponse, StepRunView, SubjectChange,
-    SubjectStatus, SubscriptionConditionSpec, SubscriptionSpec, UsageSummary, WorkRequest,
-    WorkSelector, WorkWakeView,
+    ReplicaRecordView, ReplicaRepairDeclaration, ReplicationBucketDigest, ReplicationBucketKey,
+    ReplicationExchange, ReplicationInventory, ReplicationPeerStatus, ReplicationReceipt,
+    ReplicationStatus, ResourceObservationOutcome, ResourceRefreshOperation, RevisionCutover,
+    RevisionProposalView, RevisionSubmissionView, RunGenerationView, RuntimeResetOperation,
+    St3Error, StatusResponse, StepRunView, SubjectChange, SubjectStatus, SubscriptionConditionSpec,
+    SubscriptionSpec, UsageSummary, WorkRequest, WorkSelector, WorkWakeView,
 };
 #[cfg(test)]
 use crate::model::{ReplicaRange, ReplicationBatch, ReplicationResponse};
@@ -8355,7 +8355,10 @@ impl Store {
         };
         let inventory = ReplicationInventory {
             digest: replication_inventory_digest(&envelopes),
+            buckets: replication_bucket_digests(&envelopes),
             envelopes,
+            bucketed: false,
+            envelope_bucket: None,
         };
         // Envelope hashes already commit the complete payload (and chain metadata). The
         // inventory digest therefore commits the authority log without hex-encoding and hashing
@@ -8387,6 +8390,9 @@ impl Store {
             inventory: ReplicationInventory {
                 digest: snapshot.inventory.digest.clone(),
                 envelopes: Vec::new(),
+                bucketed: true,
+                buckets: snapshot.inventory.buckets.clone(),
+                envelope_bucket: None,
             },
             envelopes: Vec::new(),
         })
@@ -8399,12 +8405,39 @@ impl Store {
     ) -> Result<ReplicationExchange> {
         let snapshot = self.replication_snapshot()?;
         let same = !remote.digest.is_empty() && remote.digest == snapshot.inventory.digest;
+        let selected_bucket = if remote.bucketed && !same {
+            remote
+                .envelope_bucket
+                .clone()
+                .or_else(|| first_differing_bucket(&snapshot.inventory.buckets, &remote.buckets))
+        } else {
+            None
+        };
         let remote_is_complete = if remote.digest.is_empty() {
             true
         } else {
             remote.digest == replication_inventory_digest(&remote.envelopes)
         };
-        let missing = if same || !remote_is_complete {
+        let missing = if same {
+            Vec::new()
+        } else if remote.bucketed {
+            if remote.envelope_bucket.as_ref() != selected_bucket.as_ref() {
+                Vec::new()
+            } else if let Some(bucket) = &selected_bucket {
+                let known = remote.envelopes.iter().collect::<BTreeSet<_>>();
+                snapshot
+                    .inventory
+                    .envelopes
+                    .iter()
+                    .filter(|identity| replication_bucket_contains(bucket, identity))
+                    .filter(|identity| !known.contains(*identity))
+                    .take(512)
+                    .cloned()
+                    .collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            }
+        } else if !remote_is_complete {
             Vec::new()
         } else {
             // Only membership is needed. Borrow IDs from the request instead of
@@ -8447,10 +8480,30 @@ impl Store {
             schema_digest: st3_schema::registry().digest(),
             authority_digest: snapshot.authority_digest.clone(),
             graph_digest: snapshot.graph_digest.clone(),
-            inventory: if same {
+            inventory: if remote.bucketed {
+                ReplicationInventory {
+                    digest: snapshot.inventory.digest.clone(),
+                    envelopes: selected_bucket.as_ref().map_or_else(Vec::new, |bucket| {
+                        snapshot
+                            .inventory
+                            .envelopes
+                            .iter()
+                            .filter(|identity| replication_bucket_contains(bucket, identity))
+                            .take(512)
+                            .cloned()
+                            .collect()
+                    }),
+                    bucketed: true,
+                    buckets: snapshot.inventory.buckets.clone(),
+                    envelope_bucket: selected_bucket,
+                }
+            } else if same {
                 ReplicationInventory {
                     digest: snapshot.inventory.digest.clone(),
                     envelopes: Vec::new(),
+                    bucketed: false,
+                    buckets: Vec::new(),
+                    envelope_bucket: None,
                 }
             } else {
                 snapshot.inventory.clone()
@@ -8531,6 +8584,9 @@ impl Store {
             inventory: ReplicationInventory {
                 digest: snapshot.inventory.digest.clone(),
                 envelopes: Vec::new(),
+                bucketed: true,
+                buckets: snapshot.inventory.buckets.clone(),
+                envelope_bucket: None,
             },
         })
     }
@@ -14250,6 +14306,65 @@ fn replication_inventory_digest(envelopes: &[ReplicaEnvelopeId]) -> String {
     hex::encode(digest.finalize())
 }
 
+const REPLICATION_BUCKET_SEQUENCES: u64 = 512;
+
+fn replication_bucket_key(envelope: &ReplicaEnvelopeId) -> ReplicationBucketKey {
+    ReplicationBucketKey {
+        writer: envelope.writer.clone(),
+        start_sequence: envelope.sequence.saturating_sub(1) / REPLICATION_BUCKET_SEQUENCES
+            * REPLICATION_BUCKET_SEQUENCES
+            + 1,
+    }
+}
+
+fn replication_bucket_contains(key: &ReplicationBucketKey, envelope: &ReplicaEnvelopeId) -> bool {
+    envelope.writer == key.writer
+        && envelope.sequence >= key.start_sequence
+        && envelope.sequence
+            < key
+                .start_sequence
+                .saturating_add(REPLICATION_BUCKET_SEQUENCES)
+}
+
+fn replication_bucket_digests(envelopes: &[ReplicaEnvelopeId]) -> Vec<ReplicationBucketDigest> {
+    let mut buckets = Vec::new();
+    let mut start = 0;
+    while start < envelopes.len() {
+        let key = replication_bucket_key(&envelopes[start]);
+        let mut end = start + 1;
+        while end < envelopes.len() && replication_bucket_contains(&key, &envelopes[end]) {
+            end += 1;
+        }
+        buckets.push(ReplicationBucketDigest {
+            key,
+            digest: replication_inventory_digest(&envelopes[start..end]),
+        });
+        start = end;
+    }
+    buckets
+}
+
+fn first_differing_bucket(
+    local: &[ReplicationBucketDigest],
+    remote: &[ReplicationBucketDigest],
+) -> Option<ReplicationBucketKey> {
+    let local = local
+        .iter()
+        .map(|bucket| (bucket.key.clone(), bucket.digest.as_str()))
+        .collect::<BTreeMap<_, _>>();
+    let remote = remote
+        .iter()
+        .map(|bucket| (bucket.key.clone(), bucket.digest.as_str()))
+        .collect::<BTreeMap<_, _>>();
+    local
+        .keys()
+        .chain(remote.keys())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .find(|key| local.get(*key) != remote.get(*key))
+        .cloned()
+}
+
 fn graph_digest(connection: &Connection) -> Result<String> {
     digest_queries(
         connection,
@@ -18777,6 +18892,76 @@ mod tests {
     }
 
     #[test]
+    fn one_divergent_envelope_exchanges_only_its_inventory_bucket() {
+        let remote = Store::open_memory("remote").unwrap();
+        for number in 0..1_100 {
+            remote
+                .append_claim(&ClaimInput {
+                    subject: "host/remote".into(),
+                    kind: "transport.observed".into(),
+                    actor: None,
+                    fields: BTreeMap::from([
+                        ("status".into(), Value::String("up".into())),
+                        ("reason".into(), Value::String(format!("sample {number}"))),
+                    ]),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: None,
+                })
+                .unwrap();
+        }
+        let local = Store::open_memory("local").unwrap();
+        for after in [0, 512, 1_024] {
+            local
+                .import_replication("remote", &remote.export_replication(after).unwrap())
+                .unwrap();
+        }
+        local
+            .append_claim(&ClaimInput {
+                subject: "host/local".into(),
+                kind: "transport.observed".into(),
+                actor: None,
+                fields: BTreeMap::from([("status".into(), Value::String("up".into()))]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+        let summary = remote.export_replication_summary(TEST_FLEET).unwrap();
+        let response = local
+            .export_replication_exchange(TEST_FLEET, &summary.inventory)
+            .unwrap();
+        assert!(response.inventory.envelopes.len() <= 512);
+        assert!(serde_json::to_vec(&response).unwrap().len() < 65_536);
+        let remote_bucket = remote
+            .export_replication_exchange(TEST_FLEET, &response.inventory)
+            .unwrap();
+        let push = local
+            .export_replication_exchange(TEST_FLEET, &remote_bucket.inventory)
+            .unwrap();
+        assert_eq!(push.envelopes.len(), 1);
+        remote
+            .receive_replication_exchange("local", TEST_FLEET, &push)
+            .unwrap();
+        assert_eq!(
+            remote
+                .export_replication_summary(TEST_FLEET)
+                .unwrap()
+                .inventory
+                .digest,
+            local
+                .export_replication_summary(TEST_FLEET)
+                .unwrap()
+                .inventory
+                .digest
+        );
+        let explicit = local
+            .export_replication_exchange(TEST_FLEET, &ReplicationInventory::default())
+            .unwrap();
+        assert!(explicit.inventory.envelopes.len() > 512);
+    }
+
+    #[test]
     fn quiet_claim_detection_requires_only_usage_or_renewal_since_cursor() {
         let store = Store::open_memory("node").unwrap();
         let before = store.index().unwrap();
@@ -21936,6 +22121,7 @@ mission "proposal-replay" state="ready" revisions="human-only" revision-reviewer
                     sequence: candidate.sequence,
                     hash: candidate.hash.clone(),
                 }],
+                ..ReplicationInventory::default()
             },
             envelopes: vec![candidate],
         };
@@ -22004,6 +22190,7 @@ mission "proposal-replay" state="ready" revisions="human-only" revision-reviewer
                         hash: envelope.hash.clone(),
                     })
                     .collect(),
+                ..ReplicationInventory::default()
             },
             envelopes,
         };

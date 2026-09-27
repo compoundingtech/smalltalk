@@ -2108,6 +2108,24 @@ pub struct ReplicationInventory {
     pub digest: String,
     #[serde(default)]
     pub envelopes: Vec<ReplicaEnvelopeId>,
+    #[serde(default)]
+    pub bucketed: bool,
+    #[serde(default)]
+    pub buckets: Vec<ReplicationBucketDigest>,
+    #[serde(default)]
+    pub envelope_bucket: Option<ReplicationBucketKey>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+pub struct ReplicationBucketKey {
+    pub writer: String,
+    pub start_sequence: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ReplicationBucketDigest {
+    pub key: ReplicationBucketKey,
+    pub digest: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
