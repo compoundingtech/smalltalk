@@ -337,6 +337,14 @@ CREATE TABLE IF NOT EXISTS step_runs (
 );
 CREATE INDEX IF NOT EXISTS step_runs_run_index ON step_runs(run_id, generation_id, step_path);
 CREATE INDEX IF NOT EXISTS step_runs_assignee_index ON step_runs(assignee, status);
+CREATE TABLE IF NOT EXISTS local_work_lease_renewals (
+    subject TEXT PRIMARY KEY,
+    attempt INTEGER NOT NULL,
+    lease_owner TEXT NOT NULL,
+    lease_incarnation TEXT NOT NULL,
+    lease_expires_at_unix_ms TEXT NOT NULL,
+    updated_at_unix_ms TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS revision_proposals (
     id TEXT PRIMARY KEY,
     run_id TEXT NOT NULL REFERENCES mission_runs(id),
@@ -4030,17 +4038,65 @@ impl Store {
             "release" => "work.released",
             _ => unreachable!("the work action was validated above"),
         };
-        append_claim_tx(
-            &transaction,
-            &self.origin,
-            &subject,
-            claim_kind,
-            Some(&actor),
-            &body,
-            &request.evidence,
-            None,
-        )
-        .map_err(claim_append_error)?;
+        // Most renewals only extend the local operational lease. Publish an
+        // anchor before the last replicated expiry is within five minutes, so
+        // another replica never sees a normally renewed lease as expired.
+        let quiet_renewal = action == "renew"
+            && request.summary.is_none()
+            && request.reason.is_none()
+            && request.evidence.is_empty();
+        let last_replicated_expiry = if quiet_renewal {
+            transaction
+                .query_row(
+                    "SELECT json_extract(body, '$.fields.claim_expires_at_unix_ms')
+                     FROM claims WHERE subject=?1
+                       AND kind IN ('work.claimed','work.renewed','work.progress')
+                     ORDER BY store_index DESC LIMIT 1",
+                    [&subject],
+                    |row| row.get::<_, Option<u64>>(0),
+                )
+                .optional()
+                .map_err(internal)?
+                .flatten()
+                .map(u128::from)
+        } else {
+            None
+        };
+        let publish = !quiet_renewal
+            || last_replicated_expiry.is_none_or(|expiry| expiry <= now.saturating_add(300_000));
+        if publish {
+            append_claim_tx(
+                &transaction,
+                &self.origin,
+                &subject,
+                claim_kind,
+                Some(&actor),
+                &body,
+                &request.evidence,
+                None,
+            )
+            .map_err(claim_append_error)?;
+            transaction
+                .execute(
+                    "DELETE FROM local_work_lease_renewals WHERE subject=?1",
+                    [&subject],
+                )
+                .map_err(internal)?;
+        } else {
+            transaction
+                .execute(
+                    "INSERT INTO local_work_lease_renewals
+                     (subject, attempt, lease_owner, lease_incarnation, lease_expires_at_unix_ms, updated_at_unix_ms)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                     ON CONFLICT(subject) DO UPDATE SET attempt=excluded.attempt,
+                       lease_owner=excluded.lease_owner, lease_incarnation=excluded.lease_incarnation,
+                       lease_expires_at_unix_ms=excluded.lease_expires_at_unix_ms,
+                       updated_at_unix_ms=excluded.updated_at_unix_ms",
+                    params![subject, current.attempt, actor, requested_incarnation,
+                            claim_expiry.expect("a renewal has a lease expiry").to_string(), now.to_string()],
+                )
+                .map_err(internal)?;
+        }
         let mut view = transaction.query_row(
             "SELECT subject, run_id, step_path, definition_hash, status, attempt, assignee, available_to, agentless, title, goals, worker_reported,
                     lease_owner, lease_incarnation, lease_expires_at_unix_ms, blocked_reason, not_before_unix_ms, created_at_unix_ms, updated_at_unix_ms, readiness_epoch, constraints
@@ -9497,6 +9553,7 @@ impl Store {
                 project_replicated_mission_runs(&transaction)?;
                 rebuild_planning_tx(&transaction).map_err(internal)?;
             }
+            reapply_local_work_lease_renewals_tx(&transaction)?;
             Ok(())
         })();
         match result {
@@ -16534,6 +16591,57 @@ fn validate_replicated_claim(
     }
     ensure_claim_blobs(transaction, claim)?;
     Ok(ReplicatedClaimAdmission::Valid)
+}
+
+/// Reapply this host's lease renewals that have not replicated yet after a projection replay,
+/// and forget each one whose lease has ended.
+fn reapply_local_work_lease_renewals_tx(transaction: &Transaction<'_>) -> Result<(), St3Error> {
+    let mut statement = transaction
+        .prepare(
+            "SELECT subject, attempt, lease_owner, lease_incarnation,
+                    lease_expires_at_unix_ms, updated_at_unix_ms
+             FROM local_work_lease_renewals",
+        )
+        .map_err(internal)?;
+    let renewals = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, u32>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+            ))
+        })
+        .map_err(internal)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(internal)?;
+    drop(statement);
+    for (subject, attempt, owner, incarnation, expires, updated) in renewals {
+        transaction
+            .execute(
+                "UPDATE step_runs SET lease_expires_at_unix_ms=?5, updated_at_unix_ms=?6
+                 WHERE subject=?1 AND attempt=?2 AND lease_owner=?3 AND lease_incarnation=?4
+                   AND status NOT IN ('completed','failed','cancelled')
+                   AND COALESCE(CAST(lease_expires_at_unix_ms AS INTEGER), 0) < CAST(?5 AS INTEGER)",
+                params![subject, attempt, owner, incarnation, expires, updated],
+            )
+            .map_err(internal)?;
+    }
+    transaction
+        .execute(
+            "DELETE FROM local_work_lease_renewals WHERE NOT EXISTS (
+               SELECT 1 FROM step_runs WHERE step_runs.subject=local_work_lease_renewals.subject
+                 AND step_runs.attempt=local_work_lease_renewals.attempt
+                 AND step_runs.lease_owner=local_work_lease_renewals.lease_owner
+                 AND step_runs.lease_incarnation=local_work_lease_renewals.lease_incarnation
+                 AND step_runs.status NOT IN ('completed','failed','cancelled')
+             )",
+            [],
+        )
+        .map_err(internal)?;
+    Ok(())
 }
 
 /// Advance from a healthy frontier when the new claims have unambiguous operation IDs and
@@ -27121,6 +27229,7 @@ mission "nested-work" state="ready" {
       step "first" { }
       step "second" { depends-on { step "first" completed } }
     }
+
   }
 }
 "#;
@@ -27194,6 +27303,110 @@ mission "nested-work" state="ready" {
         assert_eq!(parent.claimant.as_deref(), Some("agent/node.worker"));
         assert_eq!(parent.claim_incarnation.as_deref(), Some("current"));
         assert!(parent.claim_expires_at_unix_ms.unwrap() > now_ms());
+    }
+
+    #[test]
+    fn routine_lease_renewal_updates_local_projection_without_replica_envelope() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("renewal.sqlite3");
+        let store = Store::open(&path, "node").unwrap();
+        let source = "version 2\nmission \"renewal\" state=\"ready\" { goal \"Hold work.\"; step \"work\" { assigned-to \"agent/node.worker\" } }";
+        let intent = crate::graph::parse_test_intent(source, "node").unwrap();
+        let plan = store
+            .mission(
+                &intent,
+                IntentInput {
+                    kdl: source.into(),
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        store
+            .apply(&intent, &plan.subject_tokens, "renewal-mission")
+            .unwrap();
+        let run = store
+            .create_mission_run(&MissionRunRequest {
+                mission: "renewal".into(),
+                revision: None,
+                workspace: "/tmp".into(),
+                requester: Some("person/test".into()),
+                mode: Some("run".into()),
+                inputs: BTreeMap::new(),
+                idempotency_key: "renewal-run".into(),
+            })
+            .unwrap();
+        let subject = &run.steps[0].subject;
+        store.set_step_state(subject, "ready", None).unwrap();
+        let request = |key: &str| WorkRequest {
+            actor: Some("agent/node.worker".into()),
+            incarnation: Some("current".into()),
+            summary: None,
+            reason: None,
+            evidence: Vec::new(),
+            idempotency_key: key.into(),
+        };
+        let claimed = store
+            .work_action(subject, "claim", &request("renewal-claim"))
+            .unwrap();
+        let inventory_before = store.replication_inventory().unwrap().envelopes.len();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let renewed = store
+            .work_action(subject, "renew", &request("renewal-first"))
+            .unwrap();
+        assert!(renewed.claim_expires_at_unix_ms > claimed.claim_expires_at_unix_ms);
+        assert_eq!(
+            store.replication_inventory().unwrap().envelopes.len(),
+            inventory_before
+        );
+        assert!(
+            store
+                .claims_for(subject, Some("work.renewed"))
+                .unwrap()
+                .is_empty()
+        );
+        let replica = Store::open_memory("replica").unwrap();
+        let exchange = exchange_from(&store, &ReplicationInventory::default());
+        receive_and_project(&replica, "node", &exchange);
+        let remote_expiry = replica
+            .step_run(subject)
+            .unwrap()
+            .unwrap()
+            .claim_expires_at_unix_ms
+            .unwrap();
+        assert_eq!(Some(remote_expiry), claimed.claim_expires_at_unix_ms);
+        assert!(remote_expiry > now_ms() + 300_000);
+        assert!(store.project_replication_backlog().unwrap());
+        assert_eq!(
+            store
+                .step_run(subject)
+                .unwrap()
+                .unwrap()
+                .claim_expires_at_unix_ms,
+            renewed.claim_expires_at_unix_ms,
+            "a projection replay must retain the local renewal"
+        );
+        drop(store);
+        let reopened = Store::open(&path, "node").unwrap();
+        assert_eq!(
+            reopened
+                .step_run(subject)
+                .unwrap()
+                .unwrap()
+                .claim_expires_at_unix_ms,
+            renewed.claim_expires_at_unix_ms
+        );
+        let before_material = reopened.replication_inventory().unwrap().envelopes.len();
+        let mut material = request("renewal-material");
+        material.summary = Some("Made progress on the review".into());
+        reopened.work_action(subject, "renew", &material).unwrap();
+        assert_eq!(
+            reopened.replication_inventory().unwrap().envelopes.len(),
+            before_material + 1
+        );
+        assert_eq!(
+            reopened.claims_for(subject, Some("work.renewed")).unwrap()[0].body["fields"]["summary"],
+            "Made progress on the review"
+        );
     }
 
     #[test]
