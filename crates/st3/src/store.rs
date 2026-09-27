@@ -25,12 +25,13 @@ use crate::model::{
     OperationalRepairItem, OperationalRepairPlan, OperationalRepairResult, PlannedAction,
     PlannerSpec, PlanningCandidateView, PlanningPreviewView, PlanningSessionDeclaration,
     PlanningSessionView, PlanningVariantView, ReplicaBatch, ReplicaEnvelope, ReplicaEnvelopeId,
-    ReplicaRecordView, ReplicaRepairDeclaration, ReplicationBucketDigest, ReplicationBucketKey,
-    ReplicationExchange, ReplicationInventory, ReplicationPeerStatus, ReplicationReceipt,
-    ReplicationStatus, ResourceObservationOutcome, ResourceRefreshOperation, RevisionCutover,
-    RevisionProposalView, RevisionSubmissionView, RunGenerationView, RuntimeResetOperation,
-    St3Error, StatusResponse, StepRunView, SubjectChange, SubjectStatus, SubscriptionConditionSpec,
-    SubscriptionSpec, UsageSummary, WorkRequest, WorkSelector, WorkWakeView,
+    ReplicaRecordView, ReplicaRepairDeclaration, ReplicationExchange, ReplicationInventory,
+    ReplicationInventoryBucket, ReplicationPeerStatus, ReplicationReceipt, ReplicationStatus,
+    ResourceObservationOutcome, ResourceRefreshOperation, RevisionCutover, RevisionProposalView,
+    RevisionSubmissionView, RunGenerationView, RuntimeResetOperation, St3Error, StatusResponse,
+    StepRunView, SubjectChange, SubjectStatus, SubscriptionConditionSpec,
+    SubscriptionRequestDecision, SubscriptionRequestView, SubscriptionSpec, UsageSummary,
+    WorkRequest, WorkSelector, WorkWakeView,
 };
 #[cfg(test)]
 use crate::model::{ReplicaRange, ReplicationBatch, ReplicationResponse};
@@ -96,6 +97,18 @@ CREATE INDEX IF NOT EXISTS claims_timeline_incarnation_index
 ON claims(subject, kind, json_extract(body, '$.fields.incarnation_id'), store_index)
 WHERE kind='harness.timeline';
 CREATE INDEX IF NOT EXISTS claims_batch_index ON claims(batch_id, store_index);
+CREATE INDEX IF NOT EXISTS claims_accepted_order_index
+ON claims(length(accepted_at_unix_ms), accepted_at_unix_ms, store_index);
+CREATE INDEX IF NOT EXISTS claims_subscription_finished_request_index
+ON claims(subject, json_extract(body, '$.fields.request'))
+WHERE kind IN (
+    'subscription.mission-started',
+    'subscription.mission-failed',
+    'subscription.mission-request-cancelled'
+);
+CREATE INDEX IF NOT EXISTS claims_schedule_started_request_index
+ON claims(subject, json_extract(body, '$.fields.request'))
+WHERE kind='schedule.work-started';
 CREATE INDEX IF NOT EXISTS claims_operation_index
 ON claims(json_extract(body, '$._operation.id'))
 WHERE json_extract(body, '$._operation.id') IS NOT NULL;
@@ -133,6 +146,8 @@ CREATE TABLE IF NOT EXISTS desired (
     owner_generation TEXT,
     owner_step TEXT
 );
+CREATE INDEX IF NOT EXISTS desired_owner_step_index ON desired(owner_step, subject);
+CREATE INDEX IF NOT EXISTS desired_owner_run_index ON desired(owner_run, subject);
 
 CREATE TABLE IF NOT EXISTS idempotency (
     operation_id TEXT PRIMARY KEY,
@@ -275,6 +290,11 @@ CREATE TABLE IF NOT EXISTS mission_run_deadlines (
     deadline_at_unix_ms TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS mission_run_after (
+    run_id TEXT PRIMARY KEY REFERENCES mission_runs(id),
+    after_run TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS run_generations (
     id TEXT PRIMARY KEY,
     run_id TEXT NOT NULL REFERENCES mission_runs(id),
@@ -317,6 +337,14 @@ CREATE TABLE IF NOT EXISTS step_runs (
 );
 CREATE INDEX IF NOT EXISTS step_runs_run_index ON step_runs(run_id, generation_id, step_path);
 CREATE INDEX IF NOT EXISTS step_runs_assignee_index ON step_runs(assignee, status);
+CREATE TABLE IF NOT EXISTS local_work_lease_renewals (
+    subject TEXT PRIMARY KEY,
+    attempt INTEGER NOT NULL,
+    lease_owner TEXT NOT NULL,
+    lease_incarnation TEXT NOT NULL,
+    lease_expires_at_unix_ms TEXT NOT NULL,
+    updated_at_unix_ms TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS revision_proposals (
     id TEXT PRIMARY KEY,
     run_id TEXT NOT NULL REFERENCES mission_runs(id),
@@ -522,111 +550,10 @@ struct ReplicationSnapshot {
     store_index: u64,
     replica_generation: u64,
     max_envelope_rowid: i64,
-    inventory: CompactReplicationInventory,
+    inventory: ReplicationInventory,
+    buckets: Vec<ReplicationInventoryBucket>,
     authority_digest: String,
     graph_digest: String,
-}
-
-#[derive(Clone)]
-struct CompactReplicationInventory {
-    digest: String,
-    buckets: Vec<ReplicationBucketDigest>,
-    writers: Vec<String>,
-    envelopes: Vec<CompactEnvelopeId>,
-}
-
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-struct CompactEnvelopeId {
-    writer_index: u32,
-    sequence: u64,
-    hash: [u8; 32],
-}
-
-impl CompactReplicationInventory {
-    fn new(writers: Vec<String>, envelopes: Vec<CompactEnvelopeId>) -> Self {
-        let digest = compact_replication_inventory_digest(&writers, &envelopes);
-        let buckets = compact_replication_bucket_digests(&writers, &envelopes);
-        Self {
-            digest,
-            buckets,
-            writers,
-            envelopes,
-        }
-    }
-
-    fn insert(&mut self, identity: ReplicaEnvelopeId) -> Result<()> {
-        let writer_index = match self.writers.binary_search(&identity.writer) {
-            Ok(index) => index,
-            Err(index) => {
-                self.writers.insert(index, identity.writer);
-                for envelope in &mut self.envelopes {
-                    if envelope.writer_index as usize >= index {
-                        envelope.writer_index += 1;
-                    }
-                }
-                index
-            }
-        };
-        let mut hash = [0_u8; 32];
-        hex::decode_to_slice(&identity.hash, &mut hash)?;
-        let compact = CompactEnvelopeId {
-            writer_index: writer_index as u32,
-            sequence: identity.sequence,
-            hash,
-        };
-        let position = self
-            .envelopes
-            .binary_search(&compact)
-            .unwrap_or_else(|at| at);
-        self.envelopes.insert(position, compact);
-        Ok(())
-    }
-
-    fn public_id(&self, identity: &CompactEnvelopeId) -> ReplicaEnvelopeId {
-        ReplicaEnvelopeId {
-            writer: self.writers[identity.writer_index as usize].clone(),
-            sequence: identity.sequence,
-            hash: hex::encode(identity.hash),
-        }
-    }
-
-    fn public_inventory(&self) -> ReplicationInventory {
-        ReplicationInventory {
-            digest: self.digest.clone(),
-            envelopes: self
-                .envelopes
-                .iter()
-                .map(|identity| self.public_id(identity))
-                .collect(),
-            bucketed: false,
-            buckets: Vec::new(),
-            envelope_bucket: None,
-        }
-    }
-
-    fn bucket_ids(&self, bucket: &ReplicationBucketKey) -> Vec<ReplicaEnvelopeId> {
-        let Ok(writer_index) = self.writers.binary_search(&bucket.writer) else {
-            return Vec::new();
-        };
-        let start = self.envelopes.partition_point(|identity| {
-            (identity.writer_index as usize) < writer_index
-                || ((identity.writer_index as usize) == writer_index
-                    && identity.sequence < bucket.start_sequence)
-        });
-        self.envelopes
-            .iter()
-            .skip(start)
-            .take_while(|identity| {
-                identity.writer_index as usize == writer_index
-                    && identity.sequence
-                        < bucket
-                            .start_sequence
-                            .saturating_add(REPLICATION_BUCKET_SEQUENCES)
-            })
-            .take(512)
-            .map(|identity| self.public_id(identity))
-            .collect()
-    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -751,12 +678,76 @@ fn migrate_schema(connection: &Connection) -> Result<()> {
     Ok(())
 }
 
+fn subscription_request_view(
+    request: &ClaimRecord,
+    decisions: &[ClaimRecord],
+) -> SubscriptionRequestView {
+    let fields = request.body.get("fields").unwrap_or(&request.body);
+    let field = |name: &str| {
+        fields
+            .get(name)
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned()
+    };
+    let decision = |kind: &str| {
+        decisions.iter().find(|claim| {
+            claim.kind == kind
+                && claim
+                    .body
+                    .pointer("/fields/request")
+                    .and_then(Value::as_str)
+                    == Some(request.id.as_str())
+        })
+    };
+    let started = decision("subscription.mission-started");
+    let status = if started.is_some() {
+        "started"
+    } else if decision("subscription.mission-request-cancelled").is_some() {
+        "cancelled"
+    } else if decision("subscription.mission-failed").is_some() {
+        "failed"
+    } else if fields.get("held").and_then(Value::as_bool) == Some(true)
+        && decision("subscription.mission-request-released").is_none()
+    {
+        "held"
+    } else {
+        "pending"
+    };
+    SubscriptionRequestView {
+        request: request.id.clone(),
+        subscription: request.subject.clone(),
+        resource: field("resource"),
+        mission: field("mission"),
+        status: status.into(),
+        mission_run: started
+            .and_then(|claim| claim.body.pointer("/fields/mission_run"))
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        requested_at_unix_ms: request.accepted_at_unix_ms,
+    }
+}
+
+/// The most mission runs one resource observation requests at once for one subscription. The
+/// remaining requests wait for a person.
+pub const MAX_OBSERVATION_DELIVERIES: usize = 5;
+
 fn discovered_collection_items(
     repository: &str,
     field: &str,
     previous: Option<&Value>,
     current: &Value,
 ) -> Vec<(String, String, Value)> {
+    // The first listing that names its repository ID is also the first complete listing. The
+    // earlier facts came from a first-page read, so the items this listing adds were missed, not
+    // opened. They become known without a delivery.
+    if current.get("repository_id").is_some()
+        && previous
+            .and_then(|value| value.get("repository_id"))
+            .is_none()
+    {
+        return Vec::new();
+    }
     let Some(previous_items) = previous
         .and_then(|value| value.get(field))
         .and_then(Value::as_array)
@@ -1781,6 +1772,19 @@ impl Store {
         Ok(mission_run_view_tx(&connection, run).optional()?)
     }
 
+    /// Read one run's status without hydrating its step history.
+    pub fn mission_run_status(&self, run: &str) -> Result<Option<String>> {
+        let run = run.strip_prefix("mission-run/").unwrap_or(run);
+        let connection = self.readers.get();
+        Ok(connection
+            .query_row(
+                "SELECT status FROM mission_runs WHERE id=?1",
+                [run],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?)
+    }
+
     /// Resolve the stable mission owner without hydrating the run's step history.
     pub fn mission_for_run(&self, run: &str) -> Result<Option<String>> {
         let run = run.strip_prefix("mission-run/").unwrap_or(run);
@@ -1881,7 +1885,10 @@ impl Store {
                 format!("mission run `{run}` does not exist"),
             )
         })?;
-        if !matches!(current.status.as_str(), "running" | "standing" | "blocked")
+        let reopening = is_failed_terminal(&current.status, &current.phase);
+        if reopening {
+            failed_run_reopen_blocker(&current).map_err(|reason| not_reopenable(run, &reason))?;
+        } else if !matches!(current.status.as_str(), "running" | "standing" | "blocked")
             || current.phase != "normal"
         {
             return Err(St3Error::new(
@@ -1918,21 +1925,22 @@ impl Store {
             ));
         }
         let actor = normalize_actor(actor, "agent");
+        let old = crate::mission::run_mission(old, current.after.as_deref())?;
+        let mission = &crate::mission::run_mission(mission.clone(), current.after.as_deref())?;
         let variables = mission_run_variables(&current, &mission.revision);
         let (compatible, reviewers) =
             analyze_mission_revision(&old, mission, &actor, &current.requester, &variables)?;
         let compatible = carried_revision_step_paths(&old, mission, &current.steps, compatible);
         let cutover = old.revision_cutover.clone();
         let status = if reviewers.is_empty() {
-            match &cutover {
-                RevisionCutover::RestartActive => {
-                    return Err(St3Error::new(
-                        "revision-does-not-need-proposal",
-                        "this revision can cut over immediately",
-                    ));
-                }
-                RevisionCutover::WhenIdle => "draining",
+            // A failed run has no active work to drain.
+            if reopening || matches!(cutover, RevisionCutover::RestartActive) {
+                return Err(St3Error::new(
+                    "revision-does-not-need-proposal",
+                    "this revision can cut over immediately",
+                ));
             }
+            "draining"
         } else {
             "pending-approval"
         };
@@ -2124,7 +2132,22 @@ impl Store {
             .reviewers
             .iter()
             .all(|reviewer| proposal.approvals.contains(reviewer));
-        let status = if all_approved && matches!(proposal.cutover, RevisionCutover::WhenIdle) {
+        // A failed run has no active work to drain, so its approved revision cuts over now.
+        let (run_status, run_phase) = transaction
+            .query_row(
+                "SELECT status, phase FROM mission_runs WHERE id=?1",
+                [proposal
+                    .run
+                    .strip_prefix("mission-run/")
+                    .unwrap_or(&proposal.run)],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .map_err(internal)?;
+        let reopening = is_failed_terminal(&run_status, &run_phase);
+        let status = if all_approved
+            && !reopening
+            && matches!(proposal.cutover, RevisionCutover::WhenIdle)
+        {
             "draining"
         } else {
             "pending-approval"
@@ -2163,7 +2186,8 @@ impl Store {
         transaction.commit().map_err(internal)?;
         drop(connection);
 
-        if all_approved && matches!(proposal.cutover, RevisionCutover::RestartActive) {
+        if all_approved && (reopening || matches!(proposal.cutover, RevisionCutover::RestartActive))
+        {
             let run = self.finish_proposal_cutover(proposal_id, &actor, idempotency_key)?;
             let applied = self
                 .revision_proposal(proposal_id)
@@ -2473,6 +2497,7 @@ impl Store {
             None,
             false,
             None,
+            false,
         )
     }
 
@@ -2496,7 +2521,127 @@ impl Store {
             Some(source_generation),
             true,
             Some(proposal),
+            false,
         )
+    }
+
+    /// Retry one failed step. While its run is active, the step retries in place. A failed run
+    /// reopens in a successor generation of its current revision when this step is the only
+    /// reason it failed.
+    pub fn retry_failed_step(
+        &self,
+        subject: &str,
+        actor: &str,
+        reason: &str,
+        idempotency_key: &str,
+    ) -> Result<MissionRunView, St3Error> {
+        if let Some(response) = self
+            .cached_idempotency_response(idempotency_key)
+            .map_err(internal)?
+        {
+            return Ok(response);
+        }
+        let subject = normalize_step_run(subject);
+        let step = self.step_run(&subject).map_err(internal)?.ok_or_else(|| {
+            St3Error::new(
+                "missing-step-run",
+                format!("step run `{subject}` does not exist"),
+            )
+        })?;
+        let current = self
+            .mission_run(&step.run)
+            .map_err(internal)?
+            .ok_or_else(|| {
+                St3Error::new(
+                    "missing-mission-run",
+                    format!("mission run `{}` does not exist", step.run),
+                )
+            })?;
+        if generation_id_from_subject(&step.generation)
+            != generation_id_from_subject(&current.generation)
+        {
+            return Err(St3Error::new(
+                "stale-run-generation",
+                format!("step run `{subject}` belongs to a superseded generation"),
+            ));
+        }
+        if step.status != "failed" {
+            return Err(St3Error::new(
+                "work-not-failed",
+                format!("step run `{subject}` is `{}`, not failed", step.status),
+            ));
+        }
+        let mission_id = current
+            .mission
+            .strip_prefix("mission/")
+            .unwrap_or(&current.mission);
+        let mission = self
+            .mission_spec(mission_id, Some(&current.revision))
+            .map_err(internal)?
+            .ok_or_else(|| {
+                St3Error::new(
+                    "missing-mission-revision",
+                    "the current mission revision is unavailable",
+                )
+            })?;
+        if is_failed_terminal(&current.status, &current.phase) {
+            let failed = failed_run_reopen_blocker(&current)
+                .map_err(|reason| not_reopenable(&current.subject, &reason))?;
+            if let Some(other) = failed.iter().find(|path| **path != step.step) {
+                return Err(not_reopenable(
+                    &current.subject,
+                    &format!(
+                        "step `{other}` also failed; revise the run to restart every failed step"
+                    ),
+                ));
+            }
+            return self.adopt_mission_revision_inner(
+                &current.id,
+                &mission,
+                actor,
+                reason,
+                idempotency_key,
+                Some(&current.generation),
+                false,
+                None,
+                true,
+            );
+        }
+        let finally = flatten_mission_step_specs(&mission)
+            .into_iter()
+            .any(|spec| spec.path == step.step && spec.finally);
+        let phase_runs_step = if finally {
+            matches!(current.phase.as_str(), "final" | "final-cancelled")
+        } else {
+            current.phase == "normal"
+        };
+        if !matches!(current.status.as_str(), "running" | "standing" | "blocked")
+            || !phase_runs_step
+        {
+            return Err(St3Error::new(
+                "mission-run-not-retryable",
+                format!(
+                    "mission run `{}` is {} in its {} phase; retry the step after the run fails",
+                    current.subject, current.status, current.phase
+                ),
+            ));
+        }
+        if !self
+            .retry_step_as(&subject, Some(actor), reason, 0)
+            .map_err(internal)?
+        {
+            return Err(St3Error::new(
+                "work-not-retryable",
+                format!("step run `{subject}` changed before the retry"),
+            ));
+        }
+        let view = self
+            .mission_run(&current.id)
+            .map_err(internal)?
+            .expect("the retried mission run exists");
+        self.cache_idempotency_response(idempotency_key, &view)
+            .map_err(internal)?;
+        Ok(view)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2510,6 +2655,7 @@ impl Store {
         expected_generation: Option<&str>,
         protected_approved: bool,
         proposal: Option<&RevisionProposalView>,
+        retry: bool,
     ) -> Result<MissionRunView, St3Error> {
         if let Some(response) = self
             .cached_idempotency_response(idempotency_key)
@@ -2533,9 +2679,13 @@ impl Store {
                 "the revision proposal does not target the current generation",
             ));
         }
+        let reopening = is_failed_terminal(&current.status, &current.phase);
         let phase_allows_cutover = current.phase == "normal"
             || (proposal.is_some() && current.phase == "revision-draining");
-        if !matches!(current.status.as_str(), "running" | "standing" | "blocked")
+        if reopening {
+            failed_run_reopen_blocker(&current).map_err(|reason| not_reopenable(run, &reason))?;
+        } else if retry
+            || !matches!(current.status.as_str(), "running" | "standing" | "blocked")
             || !phase_allows_cutover
         {
             return Err(St3Error::new(
@@ -2580,15 +2730,24 @@ impl Store {
                 "a run revision cannot change its input declarations",
             ));
         }
+        let old = crate::mission::run_mission(old, current.after.as_deref())?;
+        let mission = &crate::mission::run_mission(mission.clone(), current.after.as_deref())?;
 
         let variables = mission_run_variables(&current, &mission.revision);
-        let (compatible, reviewers) = if protected_approved {
+        // A retry keeps the current revision, so it has no change to analyze or review.
+        let (compatible, reviewers) = if protected_approved || retry {
             (compatible_step_paths(&old, mission), BTreeSet::new())
         } else {
             analyze_mission_revision(&old, mission, &actor, &current.requester, &variables)?
         };
-        let compatible = carried_revision_step_paths(&old, mission, &current.steps, compatible);
-        if !protected_approved && matches!(old.revision_cutover, RevisionCutover::WhenIdle) {
+        let mut compatible = carried_revision_step_paths(&old, mission, &current.steps, compatible);
+        if reopening {
+            retain_reopened_step_paths(mission, &current.steps, &mut compatible);
+        }
+        if !protected_approved
+            && !reopening
+            && matches!(old.revision_cutover, RevisionCutover::WhenIdle)
+        {
             return Err(St3Error::new(
                 "revision-needs-drained-cutover",
                 "the current mission revision requires a drained cutover",
@@ -2620,6 +2779,9 @@ impl Store {
             return serde_json::from_str(&response).map_err(internal);
         }
         let transaction = connection.transaction().map_err(internal)?;
+        if reopening {
+            enforce_mission_run_capacity(&transaction, mission)?;
+        }
         let now = now_ms();
         let predecessor_id = generation_id_from_subject(&current.generation).to_owned();
         let generation_id = hex::encode(Sha256::digest(
@@ -2656,7 +2818,11 @@ impl Store {
                 .contains(&step.path)
                 .then(|| current.steps.iter().find(|old| old.step == step.path))
                 .flatten();
-            let attempt = carried.map(|old| old.attempt).unwrap_or(1);
+            // Reopening a failed run starts each carried failed step at its next attempt.
+            let retried = carried.filter(|old| reopening && old.status == "failed");
+            let attempt = carried
+                .map(|old| old.attempt + u32::from(retried.is_some()))
+                .unwrap_or(1);
             step_variables.insert("ST_ATTEMPT".into(), attempt.to_string());
             let title = step
                 .title
@@ -2665,34 +2831,44 @@ impl Store {
                 .transpose()?;
             let goals = interpolate_goals(&step.goals, &step_variables)?;
             let constraints = interpolate_goals(&constraints, &step_variables)?;
-            let (status, worker_reported) = carried
+            let carried_state = carried.filter(|_| retried.is_none());
+            let (status, worker_reported) = carried_state
                 .map(carried_step_projection)
                 .unwrap_or(("pending", false));
-            let blocked_reason = carried.and_then(|old| old.blocked_reason.as_deref());
-            let not_before = carried
+            let (lease_owner, lease_incarnation, lease_expires) =
+                carried_step_lease(carried_state, status);
+            let blocked_reason = carried_state.and_then(|old| old.blocked_reason.as_deref());
+            let not_before = carried_state
                 .and_then(|old| old.not_before_unix_ms)
                 .map(|value| value.to_string());
             transaction
                 .execute(
-                    "INSERT INTO step_runs(subject, run_id, generation_id, step_path, definition_hash, status, attempt, assignee, available_to, agentless, title, goals, worker_reported, blocked_reason, not_before_unix_ms, readiness_epoch, created_at_unix_ms, updated_at_unix_ms, constraints)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?17, ?18)",
-                    params![subject, run_id, generation_id, step.path, step.definition_hash, status, attempt, assignee, serde_json::to_string(&available_to).map_err(internal)?, agentless, title, goals, worker_reported, blocked_reason, not_before, carried.map(|old| old.readiness_epoch).unwrap_or(0), now.to_string(), constraints],
+                    "INSERT INTO step_runs(subject, run_id, generation_id, step_path, definition_hash, status, attempt, assignee, available_to, agentless, title, goals, worker_reported, blocked_reason, not_before_unix_ms, readiness_epoch, created_at_unix_ms, updated_at_unix_ms, constraints, lease_owner, lease_incarnation, lease_expires_at_unix_ms)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?17, ?18, ?19, ?20, ?21)",
+                    params![subject, run_id, generation_id, step.path, step.definition_hash, status, attempt, assignee, serde_json::to_string(&available_to).map_err(internal)?, agentless, title, goals, worker_reported, blocked_reason, not_before, carried.map(|old| old.readiness_epoch).unwrap_or(0), now.to_string(), constraints, lease_owner, lease_incarnation, lease_expires.map(|expiry| expiry.to_string())],
                 )
                 .map_err(internal)?;
             if let Some(old) = carried {
+                let mut fields = json!({
+                    "source_step_run": old.subject,
+                    "source_generation": predecessor_subject,
+                    "status": status,
+                    "attempt": attempt,
+                    "worker_reported": worker_reported,
+                    "claimant": lease_owner,
+                    "claim_incarnation": lease_incarnation,
+                    "claim_expires_at_unix_ms": lease_expires
+                });
+                if let Some(claimant) = dropped_claimant(old, status) {
+                    fields["claimant"] = Value::String(claimant.into());
+                }
                 append_claim_tx(
                     &transaction,
                     &self.origin,
                     &subject,
                     "step-run.carried",
                     Some(&actor),
-                    &json!({"fields": {
-                        "source_step_run": old.subject,
-                        "source_generation": predecessor_subject,
-                        "status": status,
-                        "attempt": attempt,
-                        "worker_reported": worker_reported
-                    }}),
+                    &json!({"fields": fields}),
                     &[],
                     None,
                 )
@@ -2890,6 +3066,19 @@ impl Store {
             .into_iter()
             .filter_map(|value| value.parse::<u128>().ok())
             .min())
+    }
+
+    pub fn next_subscription_mission_retry_deadline(&self) -> Result<Option<u128>> {
+        let connection = self.readers.get();
+        let now = now_ms() as i64;
+        let deadline: Option<i64> = connection.query_row(
+            "SELECT MIN(CAST(json_extract(body, '$.fields.not_before_unix_ms') AS INTEGER))
+             FROM claims WHERE kind='subscription.mission-deferred'
+               AND CAST(json_extract(body, '$.fields.not_before_unix_ms') AS INTEGER)>?1",
+            [now],
+            |row| row.get(0),
+        )?;
+        Ok(deadline.map(|value| value as u128))
     }
 
     pub fn request_mission_run_cancellation(
@@ -3164,7 +3353,12 @@ impl Store {
                 } else {
                     "waiting"
                 };
-                SeatQueueRunView {
+                let waiting_for = if state == "waiting" {
+                    awaited_mission_run_tx(&self.readers.get(), run)?
+                } else {
+                    None
+                };
+                Ok(SeatQueueRunView {
                     run: run.clone(),
                     position: u32::try_from(index + 1).unwrap_or(u32::MAX),
                     state: state.into(),
@@ -3177,9 +3371,10 @@ impl Store {
                     claimed_work_ids,
                     ready_work_ids,
                     waiting_work_ids,
-                }
+                    waiting_for,
+                })
             })
-            .collect();
+            .collect::<Result<Vec<_>>>()?;
         let moves = inputs
             .moves
             .iter()
@@ -3233,6 +3428,34 @@ impl Store {
             }
             _ => {}
         }
+        let mut fields = BTreeMap::from([
+            ("run".into(), Value::String(run.clone())),
+            ("placement".into(), Value::String(placement.as_str().into())),
+        ]);
+        if let Some(anchor) = anchor.as_ref() {
+            fields.insert("anchor".into(), Value::String(anchor.clone()));
+        }
+        if let Some(reason) = request.reason.as_ref().filter(|reason| !reason.is_empty()) {
+            fields.insert("reason".into(), Value::String(reason.clone()));
+        }
+        let input = ClaimInput {
+            subject: agent.clone(),
+            kind: seat_queue::MOVED_CLAIM.into(),
+            actor: Some(request.actor.clone()),
+            fields,
+            evidence: Vec::new(),
+            expected_subject: None,
+            idempotency_key: Some(request.idempotency_key.clone()),
+        };
+        // A completed run leaves the queue, but a retry still names the earlier operation.
+        // Reappend to verify the full request digest before returning its canonical claim.
+        if self
+            .operation_claim(&request.idempotency_key)
+            .map_err(internal)?
+            .is_some()
+        {
+            return self.append_claim(&input);
+        }
         let order = self.seat_run_order(&agent).map_err(internal)?;
         for queued in std::iter::once(&run).chain(anchor.as_ref()) {
             if !order.contains(queued) {
@@ -3244,25 +3467,7 @@ impl Store {
                 .with_detail("run", queued.clone()));
             }
         }
-        let mut fields = BTreeMap::from([
-            ("run".into(), Value::String(run)),
-            ("placement".into(), Value::String(placement.as_str().into())),
-        ]);
-        if let Some(anchor) = anchor {
-            fields.insert("anchor".into(), Value::String(anchor));
-        }
-        if let Some(reason) = request.reason.as_ref().filter(|reason| !reason.is_empty()) {
-            fields.insert("reason".into(), Value::String(reason.clone()));
-        }
-        self.append_claim(&ClaimInput {
-            subject: agent,
-            kind: seat_queue::MOVED_CLAIM.into(),
-            actor: Some(request.actor.clone()),
-            fields,
-            evidence: Vec::new(),
-            expected_subject: None,
-            idempotency_key: Some(request.idempotency_key.clone()),
-        })
+        self.append_claim(&input)
     }
 
     fn work_at_snapshot_internal(
@@ -3309,6 +3514,13 @@ impl Store {
             step_run_from_row,
         )?;
         let views = rows.collect::<Result<Vec<_>, _>>()?;
+        let carried_claimants = carried_claimants_tx(
+            &connection,
+            views
+                .iter()
+                .filter(|view| view.status == "ready" && view.assigned_to.is_some())
+                .map(|view| view.subject.as_str()),
+        )?;
         let mut visible = Vec::with_capacity(views.len());
         for mut view in views {
             if detailed {
@@ -3316,6 +3528,7 @@ impl Store {
             } else {
                 enrich_step_queue_for_reconcile_at(&connection, &mut view, snapshot_unix_ms)?;
             }
+            view.carried_claimant = carried_claimants.get(&view.subject).cloned();
             let run_phase: String = connection.query_row(
                 "SELECT phase FROM mission_runs WHERE id=?1",
                 [view.run.strip_prefix("mission-run/").unwrap_or(&view.run)],
@@ -3562,6 +3775,17 @@ impl Store {
             .optional()
             .map_err(internal)?
             .ok_or_else(|| St3Error::new("missing-step-run", format!("step run `{subject}` does not exist")))?;
+        // A revision carries a claim into the successor generation. Its worker may still name the
+        // step by the predecessor subject.
+        let (subject, current) = match (action != "claim")
+            .then(|| carried_claim_successor_tx(&transaction, &current, &actor))
+            .transpose()
+            .map_err(internal)?
+            .flatten()
+        {
+            Some(successor) => (successor.subject.clone(), successor),
+            None => (subject, current),
+        };
         let (run_status, run_phase, current_generation, generation_status, root_status, root_phase): (
             String,
             String,
@@ -3814,17 +4038,65 @@ impl Store {
             "release" => "work.released",
             _ => unreachable!("the work action was validated above"),
         };
-        append_claim_tx(
-            &transaction,
-            &self.origin,
-            &subject,
-            claim_kind,
-            Some(&actor),
-            &body,
-            &request.evidence,
-            None,
-        )
-        .map_err(claim_append_error)?;
+        // Most renewals only extend the local operational lease. Publish an
+        // anchor before the last replicated expiry is within five minutes, so
+        // another replica never sees a normally renewed lease as expired.
+        let quiet_renewal = action == "renew"
+            && request.summary.is_none()
+            && request.reason.is_none()
+            && request.evidence.is_empty();
+        let last_replicated_expiry = if quiet_renewal {
+            transaction
+                .query_row(
+                    "SELECT json_extract(body, '$.fields.claim_expires_at_unix_ms')
+                     FROM claims WHERE subject=?1
+                       AND kind IN ('work.claimed','work.renewed','work.progress')
+                     ORDER BY store_index DESC LIMIT 1",
+                    [&subject],
+                    |row| row.get::<_, Option<u64>>(0),
+                )
+                .optional()
+                .map_err(internal)?
+                .flatten()
+                .map(u128::from)
+        } else {
+            None
+        };
+        let publish = !quiet_renewal
+            || last_replicated_expiry.is_none_or(|expiry| expiry <= now.saturating_add(300_000));
+        if publish {
+            append_claim_tx(
+                &transaction,
+                &self.origin,
+                &subject,
+                claim_kind,
+                Some(&actor),
+                &body,
+                &request.evidence,
+                None,
+            )
+            .map_err(claim_append_error)?;
+            transaction
+                .execute(
+                    "DELETE FROM local_work_lease_renewals WHERE subject=?1",
+                    [&subject],
+                )
+                .map_err(internal)?;
+        } else {
+            transaction
+                .execute(
+                    "INSERT INTO local_work_lease_renewals
+                     (subject, attempt, lease_owner, lease_incarnation, lease_expires_at_unix_ms, updated_at_unix_ms)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                     ON CONFLICT(subject) DO UPDATE SET attempt=excluded.attempt,
+                       lease_owner=excluded.lease_owner, lease_incarnation=excluded.lease_incarnation,
+                       lease_expires_at_unix_ms=excluded.lease_expires_at_unix_ms,
+                       updated_at_unix_ms=excluded.updated_at_unix_ms",
+                    params![subject, current.attempt, actor, requested_incarnation,
+                            claim_expiry.expect("a renewal has a lease expiry").to_string(), now.to_string()],
+                )
+                .map_err(internal)?;
+        }
         let mut view = transaction.query_row(
             "SELECT subject, run_id, step_path, definition_hash, status, attempt, assignee, available_to, agentless, title, goals, worker_reported,
                     lease_owner, lease_incarnation, lease_expires_at_unix_ms, blocked_reason, not_before_unix_ms, created_at_unix_ms, updated_at_unix_ms, readiness_epoch, constraints
@@ -3928,6 +4200,16 @@ impl Store {
     }
 
     pub fn retry_step(&self, subject: &str, reason: &str, backoff_ms: u64) -> Result<bool> {
+        self.retry_step_as(subject, None, reason, backoff_ms)
+    }
+
+    fn retry_step_as(
+        &self,
+        subject: &str,
+        actor: Option<&str>,
+        reason: &str,
+        backoff_ms: u64,
+    ) -> Result<bool> {
         let subject = normalize_step_run(subject);
         let mut connection = self.connection.lock().expect("store mutex poisoned");
         let transaction = connection.transaction()?;
@@ -3992,7 +4274,7 @@ impl Store {
             &self.origin,
             &subject,
             "step-run.retried",
-            None,
+            actor,
             &body,
             &[],
             None,
@@ -4305,6 +4587,48 @@ impl Store {
                         desired.subject, subscription.to
                     ));
                 }
+                if subscription.delivery == "mission"
+                    && let (Some(mission_id), Some(revision), Some(input)) = (
+                        subscription.mission.as_deref(),
+                        subscription.revision.as_deref(),
+                        subscription.resource_input.as_deref(),
+                    )
+                {
+                    let local = connection
+                        .query_row(
+                            "SELECT body FROM mission_revisions
+                             WHERE mission_id=?1 AND revision=?2 AND created_index<=?3",
+                            params![mission_id, revision, store_index],
+                            |row| row.get::<_, String>(0),
+                        )
+                        .optional()
+                        .map_err(internal)?
+                        .map(|body| serde_json::from_str::<MissionSpec>(&body).map_err(internal))
+                        .transpose()?;
+                    let published = intent
+                        .missions
+                        .get(mission_id)
+                        .filter(|mission| mission.revision == revision)
+                        .cloned()
+                        .or(local);
+                    match published {
+                        Some(mission)
+                            if mission
+                                .inputs
+                                .get(input)
+                                .is_none_or(|declaration| declaration.kind != MissionInputKind::Resource) => blockers.push(
+                            format!(
+                                "subscription `{}` uses undeclared resource input `{input}` in mission/{}@{revision}",
+                                desired.subject, mission_id
+                            ),
+                        ),
+                        None => blockers.push(format!(
+                            "subscription `{}` references unpublished mission/{}@{revision}",
+                            desired.subject, mission_id
+                        )),
+                        _ => {}
+                    }
+                }
             }
         }
         for mission in intent.missions.values() {
@@ -4315,13 +4639,22 @@ impl Store {
                     .into_iter()
                     .filter_map(|step| step.work_selector.clone()),
             );
+            let mut flat = Vec::new();
+            flatten_steps(mission, None, &[], &mut flat);
+            let selected = flat
+                .iter()
+                .flat_map(|(_, selector, _)| selector_agents(selector))
+                .collect::<BTreeSet<_>>();
+            for agent in run_agent_constraints(mission).keys() {
+                if !selected.contains(agent) {
+                    warnings.push(format!(
+                        "mission `{}` gives agent `{agent}` constraints, but no step selects that agent",
+                        mission.subject
+                    ));
+                }
+            }
             for selector in &selectors {
-                let agents: &[String] = match selector {
-                    WorkSelector::Assigned { agent } => std::slice::from_ref(agent),
-                    WorkSelector::Available { agents } => agents.as_slice(),
-                    WorkSelector::Agentless => &[],
-                };
-                for agent in agents {
+                for agent in selector_agents(selector) {
                     let owned_runtime =
                         agent
                             .strip_prefix("agent/${ST_MISSION_RUN}/")
@@ -4588,6 +4921,63 @@ impl Store {
         }
         let transaction = connection.transaction().map_err(internal)?;
         validate_documents(&transaction, &intent.document_refs)?;
+        for desired in intent
+            .subjects
+            .values()
+            .filter(|subject| subject.kind == "subscription")
+        {
+            let Some(spec) = crate::graph::subscription_spec(&desired.desired) else {
+                continue;
+            };
+            if spec.stopped || spec.delivery != "mission" {
+                continue;
+            }
+            let (Some(mission_id), Some(revision), Some(input)) = (
+                spec.mission.as_deref(),
+                spec.revision.as_deref(),
+                spec.resource_input.as_deref(),
+            ) else {
+                continue;
+            };
+            let local = transaction
+                .query_row(
+                    "SELECT body FROM mission_revisions WHERE mission_id=?1 AND revision=?2",
+                    params![mission_id, revision],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+                .map_err(internal)?
+                .map(|body| serde_json::from_str::<MissionSpec>(&body).map_err(internal))
+                .transpose()?;
+            let published = intent
+                .missions
+                .get(mission_id)
+                .filter(|mission| mission.revision == revision)
+                .cloned()
+                .or(local);
+            let Some(mission) = published else {
+                return Err(St3Error::new(
+                    "missing-mission",
+                    format!(
+                        "subscription `{}` references unpublished mission/{}@{revision}",
+                        desired.subject, mission_id
+                    ),
+                ));
+            };
+            if mission
+                .inputs
+                .get(input)
+                .is_none_or(|declaration| declaration.kind != MissionInputKind::Resource)
+            {
+                return Err(St3Error::new(
+                    "invalid-subscription-resource-input",
+                    format!(
+                        "subscription `{}` uses undeclared resource input `{input}` in mission/{}@{revision}",
+                        desired.subject, mission_id
+                    ),
+                ));
+            }
+        }
         for subject in intent.subjects.keys() {
             let actual = intent_leaves_tx(&transaction, subject).map_err(internal)?;
             let expected = expected.get(subject).ok_or_else(|| {
@@ -6094,7 +6484,9 @@ impl Store {
                         } else if desired.is_some() {
                             "indeterminate"
                         } else {
-                            "reachable"
+                            // Nothing declares or observes this subject, so nothing says it
+                            // can be reached.
+                            "unknown"
                         }
                     })
                     .to_owned()
@@ -6305,29 +6697,39 @@ impl Store {
         let mut statement = connection.prepare(
             "SELECT subject, kind, body, member, owner_run, owner_generation, owner_step FROM desired ORDER BY subject",
         )?;
-        let rows = statement.query_map([], |row| {
-            let subject = row.get::<_, String>(0)?;
-            let kind = row.get::<_, String>(1)?;
-            let desired = row.get::<_, String>(2)?;
-            let member = row.get::<_, Option<String>>(3)?;
-            Ok(DesiredSubject {
-                subject,
-                kind,
-                desired: serde_json::from_str(&desired).unwrap_or(Value::Null),
-                member: member.and_then(|value| serde_json::from_str(&value).ok()),
-                owner_run: row.get(4)?,
-                owner_generation: row.get(5)?,
-                owner_step: row.get(6)?,
-            })
-        })?;
+        let rows = statement.query_map([], desired_from_row)?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
-    /// Runtime members whose owning run or generation can no longer keep them alive.
+    pub fn desired_subjects_for_owner_step(&self, owner_step: &str) -> Result<Vec<DesiredSubject>> {
+        let connection = self.readers.get();
+        let mut statement = connection.prepare(
+            "SELECT subject, kind, body, member, owner_run, owner_generation, owner_step
+             FROM desired WHERE owner_step=?1 ORDER BY subject",
+        )?;
+        let rows = statement.query_map([owner_step], desired_from_row)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn desired_subjects_for_owner_run(&self, owner_run: &str) -> Result<Vec<DesiredSubject>> {
+        let connection = self.readers.get();
+        let mut statement = connection.prepare(
+            "SELECT subject, kind, body, member, owner_run, owner_generation, owner_step
+             FROM desired WHERE owner_run=?1 ORDER BY subject",
+        )?;
+        let rows = statement.query_map([owner_run], desired_from_row)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// Runtime members whose owning run or generation is terminal.
     ///
     /// This is deliberately derived from the mission tables instead of relying on a
     /// cleanup-authored `stop` declaration. A terminal state may arrive through
     /// replication or an older client, and runtime cleanup must still converge.
+    ///
+    /// A member left in a superseded generation is not included. The successor generation
+    /// re-owns each member it still declares and then retires the rest durably, so a member that
+    /// survives a revision keeps running.
     pub fn terminal_owned_runtime_subjects(&self) -> Result<BTreeSet<String>> {
         let connection = self.readers.get();
         let mut statement = connection.prepare(
@@ -6344,11 +6746,36 @@ impl Store {
                  OR owner.phase='terminal'
                  OR root.status IN ('completed','failed','cancelled')
                  OR root.phase='terminal'
+                 OR generation.status IN ('completed','failed','cancelled')
+               )
+             ORDER BY desired.subject",
+        )?;
+        statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<Result<BTreeSet<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    /// Observers, subscriptions, and schedules whose owner run is terminal or whose owner
+    /// generation is no longer current. They must not observe, deliver, or start work.
+    pub fn retired_owned_intake_subjects(&self) -> Result<BTreeSet<String>> {
+        let connection = self.readers.get();
+        let mut statement = connection.prepare(
+            "SELECT desired.subject
+             FROM desired
+             JOIN mission_runs owner
+               ON desired.owner_run='mission-run/' || owner.id
+             JOIN mission_runs root ON root.id=owner.root_run_id
+             WHERE desired.kind IN ('observer','subscription','schedule')
+               AND (
+                 owner.status IN ('completed','failed','cancelled')
+                 OR owner.phase='terminal'
+                 OR root.status IN ('completed','failed','cancelled')
+                 OR root.phase='terminal'
                  OR (
                    desired.owner_generation IS NOT NULL
                    AND desired.owner_generation != ('run-generation/' || owner.current_generation_id)
                  )
-                 OR generation.status IN ('superseded','completed','failed','cancelled')
                )
              ORDER BY desired.subject",
         )?;
@@ -6803,6 +7230,38 @@ impl Store {
         })
     }
 
+    /// Latest member-pass fault, independently of runtime observations and unrelated diagnostics.
+    pub fn member_reconcile_fault(
+        &self,
+        subject: &str,
+        at_index: Option<u64>,
+    ) -> Result<Option<String>> {
+        let connection = self.readers.get();
+        let body: Option<String> = connection
+            .query_row(
+                "SELECT body FROM claims WHERE subject=?1 AND kind='runtime.reconcile-decision'
+             AND store_index<=?2 AND json_extract(body, '$.fields.key')='member-reconcile'
+             ORDER BY store_index DESC LIMIT 1",
+                params![subject, at_index.unwrap_or(i64::MAX as u64)],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(body) = body else {
+            return Ok(None);
+        };
+        let body: Value = serde_json::from_str(&body)?;
+        let fields = body.get("fields").unwrap_or(&body);
+        Ok(
+            (fields.get("decision").and_then(Value::as_str) == Some("member-fault")).then(|| {
+                fields
+                    .get("reason")
+                    .and_then(Value::as_str)
+                    .unwrap_or("member reconciliation failed")
+                    .to_owned()
+            }),
+        )
+    }
+
     pub fn latest_claim(&self, subject: &str, kind: Option<&str>) -> Result<Option<ClaimRecord>> {
         let connection = self.readers.get();
         let query = "SELECT id, store_index, batch_id, subject, kind, origin, actor, body, predecessors, accepted_at_unix_ms
@@ -6862,6 +7321,34 @@ impl Store {
         subject: &str,
         request: &AttentionRequest,
     ) -> Result<AttentionRequestView, St3Error> {
+        self.request_attention_until(subject, request, None)
+    }
+
+    /// Request attention that the daemon resolves on its own once every target meets `until`,
+    /// one of the `st3 trace wait` status conditions.
+    pub fn request_attention_until(
+        &self,
+        subject: &str,
+        request: &AttentionRequest,
+        until: Option<&str>,
+    ) -> Result<AttentionRequestView, St3Error> {
+        if let Some(until) = until {
+            if !crate::model::STATUS_WAIT_CONDITIONS.contains(&until) {
+                return Err(St3Error::new(
+                    "invalid-attention-until",
+                    format!(
+                        "`{until}` is not a wait condition; use one of {}",
+                        crate::model::STATUS_WAIT_CONDITIONS.join(", ")
+                    ),
+                ));
+            }
+            if request.targets.is_empty() {
+                return Err(St3Error::new(
+                    "invalid-attention-until",
+                    "an until condition needs at least one target to watch",
+                ));
+            }
+        }
         let reviewer = normalize_actor(&request.reviewer, "person");
         if !reviewer.starts_with("person/") {
             return Err(St3Error::new(
@@ -6887,20 +7374,24 @@ impl Store {
                 .map_err(|error| St3Error::new(error.code, error.message))?;
         }
         let actor = normalize_actor(&request.actor, "agent");
+        let mut fields = BTreeMap::from([
+            ("reviewer".into(), Value::String(reviewer)),
+            ("title".into(), Value::String(request.title.clone())),
+            ("reason".into(), Value::String(request.reason.clone())),
+            ("severity".into(), Value::String(request.severity.clone())),
+            (
+                "targets".into(),
+                Value::Array(request.targets.iter().cloned().map(Value::String).collect()),
+            ),
+        ]);
+        if let Some(until) = until {
+            fields.insert("until".into(), Value::String(until.into()));
+        }
         self.append_claim(&ClaimInput {
             subject: subject.to_owned(),
             kind: "attention.requested".into(),
             actor: Some(actor),
-            fields: BTreeMap::from([
-                ("reviewer".into(), Value::String(reviewer)),
-                ("title".into(), Value::String(request.title.clone())),
-                ("reason".into(), Value::String(request.reason.clone())),
-                ("severity".into(), Value::String(request.severity.clone())),
-                (
-                    "targets".into(),
-                    Value::Array(request.targets.iter().cloned().map(Value::String).collect()),
-                ),
-            ]),
+            fields,
             evidence: Vec::new(),
             expected_subject: None,
             idempotency_key: Some(request.idempotency_key.clone()),
@@ -7023,6 +7514,30 @@ impl Store {
             .ok_or_else(|| St3Error::new("internal", "the attention withdrawal was not stored"))
     }
 
+    /// Pending requests from `origin` that declared an `until` condition.
+    pub fn pending_attention_with_until(&self, origin: &str) -> Result<Vec<AttentionRequestView>> {
+        let connection = self.readers.get();
+        let mut statement = connection.prepare(
+            "SELECT request.subject FROM claims request
+             WHERE request.kind='attention.requested'
+               AND request.origin=?1
+               AND json_extract(request.body, '$.fields.until') IS NOT NULL
+               AND NOT EXISTS (
+                 SELECT 1 FROM claims resolution
+                 WHERE resolution.subject=request.subject
+                   AND resolution.kind='attention.resolved'
+               )
+             ORDER BY request.store_index",
+        )?;
+        let subjects = statement
+            .query_map([origin], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        subjects
+            .iter()
+            .filter_map(|subject| attention_request_view_tx(&connection, subject).transpose())
+            .collect()
+    }
+
     pub(crate) fn resolve_attention_automatically(
         &self,
         subject: &str,
@@ -7071,6 +7586,26 @@ impl Store {
         attention_request_view_tx(&connection, &subject)
     }
 
+    /// The current state of each fault target that has one. Resources, documents and unknown
+    /// kinds have no state to show and are left out.
+    pub fn attention_target_states(
+        &self,
+        targets: &[String],
+    ) -> Result<Vec<crate::model::AttentionTargetState>> {
+        let connection = self.readers.get();
+        let mut states = Vec::new();
+        for target in targets {
+            if let Some((state, since_unix_ms)) = attention_target_state_tx(&connection, target)? {
+                states.push(crate::model::AttentionTargetState {
+                    id: target.clone(),
+                    state,
+                    since_unix_ms,
+                });
+            }
+        }
+        Ok(states)
+    }
+
     pub fn attention_requests(
         &self,
         person: Option<&str>,
@@ -7094,6 +7629,34 @@ impl Store {
             .into_iter()
             .filter(|request| include_resolved || request.status == "pending")
             .collect())
+    }
+
+    /// Pending requests that `actor` raised from `origin`, so that host can close its own alerts.
+    pub fn pending_attention_requests_raised_by(
+        &self,
+        actor: &str,
+        origin: &str,
+    ) -> Result<Vec<AttentionRequestView>> {
+        let connection = self.readers.get();
+        let mut statement = connection.prepare(
+            "SELECT request.subject FROM claims request
+             WHERE request.kind='attention.requested'
+               AND request.actor=?1
+               AND request.origin=?2
+               AND NOT EXISTS (
+                 SELECT 1 FROM claims resolution
+                 WHERE resolution.subject=request.subject
+                   AND resolution.kind='attention.resolved'
+               )
+             ORDER BY request.store_index",
+        )?;
+        let subjects = statement
+            .query_map([actor, origin], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        subjects
+            .iter()
+            .filter_map(|subject| attention_request_view_tx(&connection, subject).transpose())
+            .collect()
     }
 
     pub fn attention_items(&self, person: Option<&str>) -> Result<Vec<AttentionItemView>> {
@@ -7209,6 +7772,62 @@ impl Store {
                 if attention_request_is_current_tx(&connection, &request)? {
                     items.push(attention_item_from_request(request));
                 }
+            }
+        }
+        {
+            let connection = self.readers.get();
+            let mut statement = connection.prepare(
+                "SELECT id, store_index, batch_id, subject, kind, origin, actor, body,
+                        predecessors, accepted_at_unix_ms
+                 FROM claims WHERE kind='subscription.mission-failed' ORDER BY store_index",
+            )?;
+            let failures = statement
+                .query_map([], claim_from_row)?
+                .collect::<Result<Vec<_>, _>>()?;
+            for failure in failures {
+                let fields = failure.body.get("fields").unwrap_or(&failure.body);
+                let request = fields
+                    .get("request")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let requester: Option<String> = connection
+                    .query_row(
+                        "SELECT json_extract(body, '$.fields.requester') FROM claims WHERE id=?1",
+                        [request],
+                        |row| row.get(0),
+                    )
+                    .optional()?
+                    .flatten();
+                let reviewer = requester
+                    .filter(|value| value.starts_with("person/"))
+                    .unwrap_or_default();
+                if person.is_some_and(|person| person != reviewer) {
+                    continue;
+                }
+                let code = fields
+                    .get("code")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let reason = fields
+                    .get("reason")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                items.push(AttentionItemView {
+                    kind: "fault".into(),
+                    subject: failure.id,
+                    person: reviewer,
+                    title: "Subscription mission failed".into(),
+                    detail: format!("{code}: {reason}"),
+                    mission: None,
+                    mission_run: None,
+                    step: None,
+                    targets: vec![failure.subject.clone()],
+                    requested_at_unix_ms: failure.accepted_at_unix_ms,
+                    actions: vec![attention_action(
+                        "inspect subscription",
+                        &["st3", "subject", &failure.subject],
+                    )],
+                });
             }
         }
         items.sort_by(|left, right| {
@@ -7677,7 +8296,9 @@ impl Store {
                             .map(|claim| vec![(resource.to_owned(), claim.id.clone())])
                             .unwrap_or_default()
                     };
-                    for (delivery_resource, discovery) in discoveries {
+                    for (index, (delivery_resource, discovery)) in
+                        discoveries.into_iter().enumerate()
+                    {
                         let mut request_fields = json!({
                             "mission": format!("mission/{mission}"),
                             "mission_revision": revision,
@@ -7686,6 +8307,14 @@ impl Store {
                             "workspace": workspace,
                             "discovery": discovery,
                         });
+                        // One observation starts a bounded number of runs. A person releases or
+                        // cancels the rest.
+                        if index >= MAX_OBSERVATION_DELIVERIES {
+                            request_fields
+                                .as_object_mut()
+                                .expect("subscription request fields are an object")
+                                .insert("held".into(), Value::Bool(true));
+                        }
                         if let Some(requester) = subscription.requester.as_deref() {
                             request_fields
                                 .as_object_mut()
@@ -7754,6 +8383,102 @@ impl Store {
         Ok(outcome)
     }
 
+    /// Every mission request that a subscription recorded, oldest first, with its disposition.
+    pub fn subscription_requests(
+        &self,
+        subscription: &str,
+    ) -> Result<Vec<SubscriptionRequestView>> {
+        let mut decisions = self.claims_for(subscription, Some("subscription.mission-started"))?;
+        for kind in [
+            "subscription.mission-request-cancelled",
+            "subscription.mission-request-released",
+            "subscription.mission-failed",
+        ] {
+            decisions.extend(self.claims_for(subscription, Some(kind))?);
+        }
+        Ok(self
+            .claims_for(subscription, Some("subscription.mission-requested"))?
+            .into_iter()
+            .map(|request| subscription_request_view(&request, &decisions))
+            .collect())
+    }
+
+    /// Release a held subscription request, or cancel a pending or held one, as a person.
+    pub fn decide_subscription_request(
+        &self,
+        request: &str,
+        decision: &str,
+        input: &SubscriptionRequestDecision,
+    ) -> Result<SubscriptionRequestView, St3Error> {
+        if !input.actor.starts_with("person/") {
+            return Err(St3Error::new(
+                "subscription-request-person-only",
+                "only a person may release or cancel a subscription request",
+            ));
+        }
+        if input.reason.trim().is_empty() {
+            return Err(St3Error::new(
+                "missing-subscription-request-reason",
+                "a subscription request decision needs a reason",
+            ));
+        }
+        let claim = self
+            .claim_by_id(request)
+            .map_err(internal)?
+            .filter(|claim| claim.kind == "subscription.mission-requested")
+            .ok_or_else(|| {
+                St3Error::new(
+                    "missing-subscription-request",
+                    format!("subscription request `{request}` does not exist"),
+                )
+            })?;
+        let view = |store: &Self| -> Result<SubscriptionRequestView, St3Error> {
+            store
+                .subscription_requests(&claim.subject)
+                .map_err(internal)?
+                .into_iter()
+                .find(|view| view.request == claim.id)
+                .ok_or_else(|| St3Error::new("internal", "the subscription request vanished"))
+        };
+        if self
+            .operation_claim(&input.idempotency_key)
+            .map_err(internal)?
+            .is_some()
+        {
+            return view(self);
+        }
+        let current = view(self)?;
+        let kind = match (decision, current.status.as_str()) {
+            ("cancel", "pending" | "held") => "subscription.mission-request-cancelled",
+            ("release", "held") => "subscription.mission-request-released",
+            ("cancel" | "release", status) => {
+                return Err(St3Error::new(
+                    "subscription-request-not-open",
+                    format!("subscription request `{request}` is {status}"),
+                ));
+            }
+            (decision, _) => {
+                return Err(St3Error::new(
+                    "invalid-subscription-request-decision",
+                    format!("`{decision}` is not a subscription request decision"),
+                ));
+            }
+        };
+        self.append_claim(&ClaimInput {
+            subject: claim.subject.clone(),
+            kind: kind.into(),
+            actor: Some(input.actor.clone()),
+            fields: BTreeMap::from([
+                ("request".into(), Value::String(claim.id.clone())),
+                ("reason".into(), Value::String(input.reason.clone())),
+            ]),
+            evidence: vec![claim.id.clone()],
+            expected_subject: None,
+            idempotency_key: Some(input.idempotency_key.clone()),
+        })?;
+        view(self)
+    }
+
     pub fn claims_for(&self, subject: &str, kind: Option<&str>) -> Result<Vec<ClaimRecord>> {
         let connection = self.readers.get();
         let query = "SELECT id, store_index, batch_id, subject, kind, origin, actor, body, predecessors, accepted_at_unix_ms
@@ -7761,6 +8486,90 @@ impl Store {
         let mut statement = connection.prepare(query)?;
         let rows = statement.query_map(params![subject, kind], claim_from_row)?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn pending_subscription_mission_requests(&self, subject: &str) -> Result<Vec<ClaimRecord>> {
+        let connection = self.readers.get();
+        let mut statement = connection.prepare(
+            "SELECT request.id, request.store_index, request.batch_id, request.subject,
+                    request.kind, request.origin, request.actor, request.body,
+                    request.predecessors, request.accepted_at_unix_ms
+             FROM claims AS request
+             WHERE request.subject=?1 AND request.kind='subscription.mission-requested'
+               AND NOT EXISTS (
+                 SELECT 1 FROM claims AS finished
+                 WHERE finished.subject=request.subject
+                   AND finished.kind IN (
+                     'subscription.mission-started',
+                     'subscription.mission-failed',
+                     'subscription.mission-request-cancelled'
+                   )
+                   AND json_extract(finished.body, '$.fields.request')=request.id
+               )
+             ORDER BY request.store_index",
+        )?;
+        statement
+            .query_map([subject], claim_from_row)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    pub fn pending_schedule_work_requests(&self, subject: &str) -> Result<Vec<ClaimRecord>> {
+        let connection = self.readers.get();
+        let mut statement = connection.prepare(
+            "SELECT request.id, request.store_index, request.batch_id, request.subject,
+                    request.kind, request.origin, request.actor, request.body,
+                    request.predecessors, request.accepted_at_unix_ms
+             FROM claims AS request
+             WHERE request.subject=?1 AND request.kind='schedule.work-requested'
+               AND NOT EXISTS (
+                 SELECT 1 FROM claims AS started
+                 WHERE started.subject=request.subject AND started.kind='schedule.work-started'
+                   AND json_extract(started.body, '$.fields.request')=request.id
+               )
+             ORDER BY request.store_index",
+        )?;
+        statement
+            .query_map([subject], claim_from_row)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    pub fn schedule_work_start_for_request(
+        &self,
+        subject: &str,
+        request: &str,
+    ) -> Result<Option<ClaimRecord>> {
+        let connection = self.readers.get();
+        connection
+            .query_row(
+                "SELECT id, store_index, batch_id, subject, kind, origin, actor, body,
+                        predecessors, accepted_at_unix_ms
+                 FROM claims WHERE subject=?1 AND kind='schedule.work-started'
+                   AND json_extract(body, '$.fields.request')=?2
+                 ORDER BY store_index DESC LIMIT 1",
+                params![subject, request],
+                claim_from_row,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn schedule_has_active_started_run(&self, subject: &str) -> Result<bool> {
+        let connection = self.readers.get();
+        connection
+            .query_row(
+                "SELECT EXISTS(
+                   SELECT 1 FROM claims AS started
+                   JOIN mission_runs AS run
+                     ON json_extract(started.body, '$.fields.mission_run')='mission-run/' || run.id
+                   WHERE started.subject=?1 AND started.kind='schedule.work-started'
+                     AND run.status NOT IN ('completed','cancelled','failed')
+                 )",
+                [subject],
+                |row| row.get(0),
+            )
+            .map_err(Into::into)
     }
 
     /// Aggregate durable provider usage without mixing context-window occupancy
@@ -8377,7 +9186,7 @@ impl Store {
     }
 
     pub fn replication_inventory(&self) -> Result<ReplicationInventory> {
-        Ok(self.replication_snapshot()?.inventory.public_inventory())
+        Ok(self.replication_snapshot()?.inventory.clone())
     }
 
     fn replication_snapshot(&self) -> Result<Arc<ReplicationSnapshot>> {
@@ -8416,7 +9225,12 @@ impl Store {
             connection.query_row("SELECT COUNT(*) FROM replica_envelopes", [], |row| {
                 row.get(0)
             })?;
-        let (inventory, max_envelope_rowid) = if let Some(previous) = previous {
+        let full = |connection: &Connection| -> Result<_> {
+            let (envelopes, max_rowid) = full_replication_inventory_rows(connection)?;
+            let buckets = replication_inventory_buckets(&envelopes);
+            Ok((envelopes, max_rowid, buckets))
+        };
+        let (envelopes, max_envelope_rowid, buckets) = if let Some(previous) = previous {
             let mut statement = connection.prepare(
                 "SELECT rowid, writer, sequence, envelope_hash FROM replica_envelopes
                  WHERE rowid>?1 ORDER BY rowid",
@@ -8439,23 +9253,43 @@ impl Store {
                 // into the successor so a graph write does not allocate and free
                 // every envelope ID. Keep the old snapshot intact for concurrent
                 // callers that still hold it.
-                let mut inventory = match Arc::try_unwrap(previous) {
-                    Ok(snapshot) => snapshot.inventory,
-                    Err(shared) => shared.inventory.clone(),
+                let (mut envelopes, mut buckets) = match Arc::try_unwrap(previous) {
+                    Ok(snapshot) => (snapshot.inventory.envelopes, snapshot.buckets),
+                    Err(shared) => (shared.inventory.envelopes.clone(), shared.buckets.clone()),
                 };
+                let mut touched = BTreeSet::new();
                 for (rowid, identity) in additions {
                     max_rowid = max_rowid.max(rowid);
-                    inventory.insert(identity)?;
+                    touched.insert((
+                        identity.writer.clone(),
+                        replication_bucket_start(identity.sequence),
+                    ));
+                    let position = envelopes.binary_search(&identity).unwrap_or_else(|at| at);
+                    envelopes.insert(position, identity);
                 }
-                (
-                    CompactReplicationInventory::new(inventory.writers, inventory.envelopes),
-                    max_rowid,
-                )
+                // Only the ranges that gained an envelope need a new digest.
+                for (writer, start) in touched {
+                    let bucket = replication_inventory_bucket(replication_bucket_slice(
+                        &envelopes, &writer, start,
+                    ));
+                    match buckets.binary_search_by(|existing| {
+                        (existing.writer.as_str(), existing.start).cmp(&(writer.as_str(), start))
+                    }) {
+                        Ok(position) => buckets[position] = bucket,
+                        Err(position) => buckets.insert(position, bucket),
+                    }
+                }
+                (envelopes, max_rowid, buckets)
             } else {
-                full_compact_replication_inventory_rows(&connection)?
+                full(&connection)?
             }
         } else {
-            full_compact_replication_inventory_rows(&connection)?
+            full(&connection)?
+        };
+        let inventory = ReplicationInventory {
+            digest: replication_inventory_digest(&envelopes),
+            envelopes,
+            buckets: Vec::new(),
         };
         // Envelope hashes already commit the complete payload (and chain metadata). The
         // inventory digest therefore commits the authority log without hex-encoding and hashing
@@ -8466,6 +9300,7 @@ impl Store {
             replica_generation: self.replica_generation.load(Ordering::Acquire),
             max_envelope_rowid,
             inventory,
+            buckets,
             authority_digest,
             graph_digest: graph_digest(&connection)?,
         });
@@ -8487,9 +9322,7 @@ impl Store {
             inventory: ReplicationInventory {
                 digest: snapshot.inventory.digest.clone(),
                 envelopes: Vec::new(),
-                bucketed: true,
-                buckets: snapshot.inventory.buckets.clone(),
-                envelope_bucket: None,
+                buckets: snapshot.buckets.clone(),
             },
             envelopes: Vec::new(),
         })
@@ -8502,37 +9335,33 @@ impl Store {
     ) -> Result<ReplicationExchange> {
         let snapshot = self.replication_snapshot()?;
         let same = !remote.digest.is_empty() && remote.digest == snapshot.inventory.digest;
-        let selected_bucket = if remote.bucketed && !same {
-            remote
-                .envelope_bucket
-                .clone()
-                .or_else(|| first_differing_bucket(&snapshot.inventory.buckets, &remote.buckets))
-        } else {
-            None
-        };
+        if !same && !remote.buckets.is_empty() {
+            // The peer sent range digests, so only differing ranges need identities.
+            let (missing, listed) = compact_replication_difference(
+                &snapshot.inventory.envelopes,
+                &snapshot.buckets,
+                remote,
+            );
+            return Ok(ReplicationExchange {
+                peer: self.origin.clone(),
+                fleet_id: fleet_id.to_owned(),
+                schema_digest: st3_schema::registry().digest(),
+                authority_digest: snapshot.authority_digest.clone(),
+                graph_digest: snapshot.graph_digest.clone(),
+                inventory: ReplicationInventory {
+                    digest: snapshot.inventory.digest.clone(),
+                    envelopes: listed,
+                    buckets: snapshot.buckets.clone(),
+                },
+                envelopes: self.replica_envelopes(missing)?,
+            });
+        }
         let remote_is_complete = if remote.digest.is_empty() {
             true
         } else {
             remote.digest == replication_inventory_digest(&remote.envelopes)
         };
-        let missing = if same {
-            Vec::new()
-        } else if remote.bucketed {
-            if remote.envelope_bucket.as_ref() != selected_bucket.as_ref() {
-                Vec::new()
-            } else if let Some(bucket) = &selected_bucket {
-                let known = remote.envelopes.iter().collect::<BTreeSet<_>>();
-                snapshot
-                    .inventory
-                    .bucket_ids(bucket)
-                    .into_iter()
-                    .filter(|identity| !known.contains(identity))
-                    .take(512)
-                    .collect::<Vec<_>>()
-            } else {
-                Vec::new()
-            }
-        } else if !remote_is_complete {
+        let missing = if same || !remote_is_complete {
             Vec::new()
         } else {
             // Only membership is needed. Borrow IDs from the request instead of
@@ -8540,13 +9369,33 @@ impl Store {
             let known = remote.envelopes.iter().collect::<BTreeSet<_>>();
             snapshot
                 .inventory
-                .public_inventory()
                 .envelopes
-                .into_iter()
-                .filter(|identity| !known.contains(identity))
-                .take(512)
+                .iter()
+                .filter(|identity| !known.contains(*identity))
+                .take(REPLICATION_EXCHANGE_ENVELOPE_LIMIT)
+                .cloned()
                 .collect::<Vec<_>>()
         };
+        Ok(ReplicationExchange {
+            peer: self.origin.clone(),
+            fleet_id: fleet_id.to_owned(),
+            schema_digest: st3_schema::registry().digest(),
+            authority_digest: snapshot.authority_digest.clone(),
+            graph_digest: snapshot.graph_digest.clone(),
+            inventory: if same {
+                ReplicationInventory {
+                    digest: snapshot.inventory.digest.clone(),
+                    envelopes: Vec::new(),
+                    buckets: Vec::new(),
+                }
+            } else {
+                snapshot.inventory.clone()
+            },
+            envelopes: self.replica_envelopes(missing)?,
+        })
+    }
+
+    fn replica_envelopes(&self, missing: Vec<ReplicaEnvelopeId>) -> Result<Vec<ReplicaEnvelope>> {
         let connection = self.readers.get();
         let mut envelopes = Vec::with_capacity(missing.len());
         for identity in missing {
@@ -8569,35 +9418,7 @@ impl Store {
             )?;
             envelopes.push(envelope);
         }
-        Ok(ReplicationExchange {
-            peer: self.origin.clone(),
-            fleet_id: fleet_id.to_owned(),
-            schema_digest: st3_schema::registry().digest(),
-            authority_digest: snapshot.authority_digest.clone(),
-            graph_digest: snapshot.graph_digest.clone(),
-            inventory: if remote.bucketed {
-                ReplicationInventory {
-                    digest: snapshot.inventory.digest.clone(),
-                    envelopes: selected_bucket
-                        .as_ref()
-                        .map_or_else(Vec::new, |bucket| snapshot.inventory.bucket_ids(bucket)),
-                    bucketed: true,
-                    buckets: snapshot.inventory.buckets.clone(),
-                    envelope_bucket: selected_bucket,
-                }
-            } else if same {
-                ReplicationInventory {
-                    digest: snapshot.inventory.digest.clone(),
-                    envelopes: Vec::new(),
-                    bucketed: false,
-                    buckets: Vec::new(),
-                    envelope_bucket: None,
-                }
-            } else {
-                snapshot.inventory.public_inventory()
-            },
-            envelopes,
-        })
+        Ok(envelopes)
     }
 
     pub fn receive_replication_exchange(
@@ -8672,9 +9493,7 @@ impl Store {
             inventory: ReplicationInventory {
                 digest: snapshot.inventory.digest.clone(),
                 envelopes: Vec::new(),
-                bucketed: true,
-                buckets: snapshot.inventory.buckets.clone(),
-                envelope_bucket: None,
+                buckets: Vec::new(),
             },
         })
     }
@@ -8766,6 +9585,7 @@ impl Store {
                 project_replicated_mission_runs(&transaction)?;
                 rebuild_planning_tx(&transaction).map_err(internal)?;
             }
+            reapply_local_work_lease_renewals_tx(&transaction)?;
             Ok(())
         })();
         match result {
@@ -8794,13 +9614,22 @@ impl Store {
         }
     }
 
-    /// Common heartbeat, conversation, and lease-renewal envelopes do not require replaying
-    /// every historical mission and claim. Keep the full replay for all other kinds, stale
-    /// projections, operation metadata, and ambiguous renewal ordering.
+    /// Event-only envelopes do not change the structural graph and can advance from a healthy
+    /// frontier. The incremental projector also handles selected structural and run claims from
+    /// a healthy frontier. Keep the full replay for stale projections and ambiguous operation or
+    /// renewal ordering.
     fn simple_replication_kind(kind: &str) -> bool {
         matches!(
             kind,
-            "message.closed"
+            "attention.requested"
+                | "gate.requested"
+                | "gate.result"
+                | "loop.state"
+                | "observer.observed"
+                | "observer.state"
+                | "resource.observed"
+                | "subscription.state"
+                | "message.closed"
                 | "message.delivered"
                 | "message.read"
                 | "message.sent"
@@ -9085,6 +9914,21 @@ impl Store {
             )),
         })?;
         Ok(())
+    }
+
+    /// When this replica last exchanged records with `peer`. The peer row records every
+    /// success, while the `transport.observed` claim changes only with the peer's status.
+    pub fn replication_peer_last_success(&self, peer: &str) -> Result<Option<u128>> {
+        let connection = self.readers.get();
+        Ok(connection
+            .query_row(
+                "SELECT last_success_at_unix_ms FROM replication_peers WHERE peer=?1",
+                [peer],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten()
+            .and_then(|value| value.parse().ok()))
     }
 
     pub fn replication_status(
@@ -9479,6 +10323,7 @@ fn prepare_mission_run_declaration(
                 || requester != &creation.requester
                 || stored_values != creation.inputs
                 || mode != &creation.mode
+                || mission_run_after_tx(connection, run_id)? != creation.after
             {
                 blockers.push(format!(
                     "mission run `{}` already exists with different creation fields",
@@ -9513,6 +10358,13 @@ fn prepare_mission_run_declaration(
                         blockers.push(error.message);
                     }
                     if let Err(error) = enforce_mission_run_capacity(connection, &mission) {
+                        blockers.push(error.message);
+                    }
+                    if let Some(after) = &creation.after
+                        && let Err(error) =
+                            ensure_awaited_mission_run_tx(connection, &declaration.subject, after)
+                                .and_then(|()| crate::mission::mission_after_run(mission, after))
+                    {
                         blockers.push(error.message);
                     }
                     actions.push(PlannedAction {
@@ -9837,6 +10689,10 @@ fn create_declared_mission_run_tx(
     validate_mission_run_timeout(&mission, &creation.mode)?;
     let inputs = resolve_mission_run_inputs(transaction, &mission, &creation.inputs)?;
     enforce_mission_run_capacity(transaction, &mission)?;
+    if let Some(after) = &creation.after {
+        ensure_awaited_mission_run_tx(transaction, &declaration.subject, after)?;
+    }
+    let mission = crate::mission::run_mission(mission, creation.after.as_deref())?;
     let generation_id = Uuid::now_v7().simple().to_string();
     let generation_subject = format!("run-generation/{generation_id}");
     let root_mission_run = declaration.subject.clone();
@@ -9881,6 +10737,14 @@ fn create_declared_mission_run_tx(
         .map_err(internal)?;
     let deadline_at_unix_ms =
         insert_mission_deadline_tx(transaction, run_id, mission.timeout_ms, now)?;
+    if let Some(after) = &creation.after {
+        transaction
+            .execute(
+                "INSERT INTO mission_run_after(run_id, after_run) VALUES (?1, ?2)",
+                params![run_id, after],
+            )
+            .map_err(internal)?;
+    }
     transaction
         .execute(
             "INSERT INTO run_generations(id, run_id, revision, predecessor_id, status, actor, reason, created_at_unix_ms, updated_at_unix_ms)
@@ -9938,7 +10802,7 @@ fn create_declared_mission_run_tx(
             )
             .map_err(internal)?;
     }
-    let body = json!({
+    let mut body = json!({
         "fields": {
             "status": "running",
             "mission": mission.subject,
@@ -9957,6 +10821,9 @@ fn create_declared_mission_run_tx(
             "deadline_at_unix_ms": deadline_at_unix_ms,
         }
     });
+    if let Some(after) = &creation.after {
+        body["fields"]["after"] = json!(after);
+    }
     let run_claim = append_claim_tx(
         transaction,
         origin,
@@ -9985,6 +10852,57 @@ fn create_declared_mission_run_tx(
     )
     .map_err(internal)?;
     Ok(vec![run_claim.id, generation_claim.id])
+}
+
+/// A run can wait only for another run that this store already knows.
+fn ensure_awaited_mission_run_tx(
+    connection: &Connection,
+    run: &str,
+    after: &str,
+) -> Result<(), St3Error> {
+    let after_id = after.strip_prefix("mission-run/").unwrap_or(after);
+    let exists = connection
+        .query_row("SELECT 1 FROM mission_runs WHERE id=?1", [after_id], |_| {
+            Ok(())
+        })
+        .optional()
+        .map_err(internal)?
+        .is_some();
+    if !exists {
+        return Err(St3Error::new(
+            "unknown-mission-run",
+            format!("mission run `{run}` waits for `{after}`, which does not exist"),
+        ));
+    }
+    Ok(())
+}
+
+/// The run that one run still waits for: its `after` run, until its `after-run` step completes.
+fn awaited_mission_run_tx(connection: &Connection, run: &str) -> Result<Option<String>> {
+    let run_id = run.strip_prefix("mission-run/").unwrap_or(run);
+    Ok(connection
+        .query_row(
+            "SELECT mission_run_after.after_run
+             FROM mission_run_after
+             JOIN mission_runs ON mission_runs.id=mission_run_after.run_id
+             JOIN step_runs ON step_runs.generation_id=mission_runs.current_generation_id
+               AND step_runs.step_path=?2
+             WHERE mission_run_after.run_id=?1 AND step_runs.status<>'completed'",
+            params![run_id, crate::mission::AFTER_RUN_STEP],
+            |row| row.get(0),
+        )
+        .optional()?)
+}
+
+fn mission_run_after_tx(connection: &Connection, run_id: &str) -> Result<Option<String>, St3Error> {
+    connection
+        .query_row(
+            "SELECT after_run FROM mission_run_after WHERE run_id=?1",
+            [run_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(internal)
 }
 
 fn adopt_declared_mission_revision_tx(
@@ -10067,6 +10985,8 @@ fn adopt_declared_mission_revision_tx(
             "a run revision cannot change its input declarations",
         ));
     }
+    let old = crate::mission::run_mission(old, current.after.as_deref())?;
+    let next = crate::mission::run_mission(next, current.after.as_deref())?;
     let variables = mission_run_variables(&current, &next.revision);
     let (compatible, reviewers) =
         analyze_mission_revision(&old, &next, &actor, &current.requester, &variables)?;
@@ -10215,31 +11135,39 @@ fn adopt_declared_mission_revision_tx(
         let (status, worker_reported) = carried
             .map(carried_step_projection)
             .unwrap_or(("pending", false));
+        let (lease_owner, lease_incarnation, lease_expires) = carried_step_lease(carried, status);
         let blocked_reason = carried.and_then(|old| old.blocked_reason.as_deref());
         let not_before = carried
             .and_then(|old| old.not_before_unix_ms)
             .map(|value| value.to_string());
         transaction
             .execute(
-                "INSERT INTO step_runs(subject, run_id, generation_id, step_path, definition_hash, status, attempt, assignee, available_to, agentless, title, goals, worker_reported, blocked_reason, not_before_unix_ms, readiness_epoch, created_at_unix_ms, updated_at_unix_ms, constraints)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?17, ?18)",
-                params![subject, run_id, generation_id, step.path, step.definition_hash, status, attempt, assignee, serde_json::to_string(&available_to).map_err(internal)?, agentless, title, goals, worker_reported, blocked_reason, not_before, carried.map(|old| old.readiness_epoch).unwrap_or(0), now.to_string(), constraints],
+                "INSERT INTO step_runs(subject, run_id, generation_id, step_path, definition_hash, status, attempt, assignee, available_to, agentless, title, goals, worker_reported, blocked_reason, not_before_unix_ms, readiness_epoch, created_at_unix_ms, updated_at_unix_ms, constraints, lease_owner, lease_incarnation, lease_expires_at_unix_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?17, ?18, ?19, ?20, ?21)",
+                params![subject, run_id, generation_id, step.path, step.definition_hash, status, attempt, assignee, serde_json::to_string(&available_to).map_err(internal)?, agentless, title, goals, worker_reported, blocked_reason, not_before, carried.map(|old| old.readiness_epoch).unwrap_or(0), now.to_string(), constraints, lease_owner, lease_incarnation, lease_expires.map(|expiry| expiry.to_string())],
             )
             .map_err(internal)?;
         if let Some(old) = carried {
+            let mut fields = json!({
+                "source_step_run": old.subject,
+                "source_generation": predecessor_subject,
+                "status": status,
+                "attempt": attempt,
+                "worker_reported": worker_reported,
+                "claimant": lease_owner,
+                "claim_incarnation": lease_incarnation,
+                "claim_expires_at_unix_ms": lease_expires
+            });
+            if let Some(claimant) = dropped_claimant(old, status) {
+                fields["claimant"] = Value::String(claimant.into());
+            }
             let claim = append_claim_tx(
                 transaction,
                 origin,
                 &subject,
                 "step-run.carried",
                 Some(&actor),
-                &json!({"fields": {
-                    "source_step_run": old.subject,
-                    "source_generation": predecessor_subject,
-                    "status": status,
-                    "attempt": attempt,
-                    "worker_reported": worker_reported
-                }}),
+                &json!({"fields": fields}),
                 &[],
                 Some(batch_id),
             )
@@ -12611,6 +13539,20 @@ fn intent_leaves_at(
         .collect())
 }
 
+fn desired_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<DesiredSubject> {
+    let desired = row.get::<_, String>(2)?;
+    let member = row.get::<_, Option<String>>(3)?;
+    Ok(DesiredSubject {
+        subject: row.get(0)?,
+        kind: row.get(1)?,
+        desired: serde_json::from_str(&desired).unwrap_or(Value::Null),
+        member: member.and_then(|value| serde_json::from_str(&value).ok()),
+        owner_run: row.get(4)?,
+        owner_generation: row.get(5)?,
+        owner_step: row.get(6)?,
+    })
+}
+
 fn claim_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ClaimRecord> {
     let body = row.get::<_, String>(7)?;
     let predecessors = row.get::<_, String>(8)?;
@@ -12867,6 +13809,10 @@ fn attention_request_view_tx(
             .map(str::to_owned),
         requested_at_unix_ms: requested.accepted_at_unix_ms,
         resolved_at_unix_ms: resolved.map(|claim| claim.accepted_at_unix_ms),
+        until: fields
+            .get("until")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
     }))
 }
 
@@ -12926,6 +13872,11 @@ fn selected_actionable_messages(messages: Vec<MessageView>) -> Vec<MessageView> 
     selected
 }
 
+/// A fault request stays current until a target that owns its lifecycle ends it. A stale
+/// `run-generation/` or `step-run/` target ends it at once. Otherwise it ends once every target
+/// that is not context has moved on after the request was accepted. `resource/` and `doc/`
+/// targets are context. A target that had already moved on when the request was made keeps it
+/// current, because the request is then about that outcome.
 fn attention_request_is_current_tx(
     connection: &Connection,
     request: &AttentionRequestView,
@@ -12933,8 +13884,10 @@ fn attention_request_is_current_tx(
     if request.reason.to_ascii_lowercase().contains("superseded") {
         return Ok(false);
     }
+    let mut runtime_targets = false;
     for target in &request.targets {
         if let Some(generation) = target.strip_prefix("run-generation/") {
+            runtime_targets = true;
             let current = connection
                 .query_row(
                     "SELECT mission_runs.current_generation_id=run_generations.id
@@ -12950,6 +13903,7 @@ fn attention_request_is_current_tx(
                 return Ok(false);
             }
         } else if target.starts_with("step-run/") {
+            runtime_targets = true;
             let current = connection
                 .query_row(
                     "SELECT step_runs.generation_id=mission_runs.current_generation_id
@@ -12966,7 +13920,304 @@ fn attention_request_is_current_tx(
             }
         }
     }
-    Ok(true)
+    if runtime_targets {
+        return Ok(true);
+    }
+    let since = connection.query_row(
+        "SELECT accepted_at_unix_ms, store_index FROM claims WHERE id=?1",
+        [&request.request],
+        claim_moment,
+    )?;
+    let mut moved_on = false;
+    for target in &request.targets {
+        match attention_target_moved_on_tx(connection, target, since)? {
+            Some(true) => moved_on = true,
+            Some(false) => return Ok(true),
+            None => {}
+        }
+    }
+    Ok(!moved_on)
+}
+
+/// When a claim was accepted, ordered by time and then by store order for claims accepted in
+/// the same millisecond.
+type ClaimMoment = (u128, u64);
+
+fn claim_moment(row: &rusqlite::Row<'_>) -> rusqlite::Result<ClaimMoment> {
+    let accepted_at = row.get::<_, String>(0)?;
+    Ok((accepted_at.parse().unwrap_or_default(), row.get(1)?))
+}
+
+/// Whether `target` reached an ending state after `since`: `None` when the target is context
+/// that could never end a request.
+fn attention_target_moved_on_tx(
+    connection: &Connection,
+    target: &str,
+    since: ClaimMoment,
+) -> Result<Option<bool>> {
+    let after = |moment: Option<ClaimMoment>| Some(moment.is_some_and(|moment| moment > since));
+    if let Some(mission) = target.strip_prefix("mission/") {
+        let retired = connection
+            .query_row(
+                "SELECT claims.accepted_at_unix_ms, claims.store_index
+                 FROM mission_definitions
+                 JOIN claims ON claims.id=mission_definitions.claim_id
+                 WHERE mission_definitions.mission_id=?1
+                   AND mission_definitions.state='retired'",
+                [mission],
+                claim_moment,
+            )
+            .optional()?;
+        if retired.is_some() {
+            return Ok(after(retired));
+        }
+        // A mission is cancelled when no run is active and its latest run was cancelled.
+        let mut statement = connection.prepare(
+            "SELECT id, status FROM mission_runs WHERE mission_id=?1
+             ORDER BY CAST(created_at_unix_ms AS INTEGER) DESC, id DESC",
+        )?;
+        let runs = statement
+            .query_map([mission], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        if runs
+            .iter()
+            .any(|(_, status)| !is_terminal_run_state(status))
+        {
+            return Ok(Some(false));
+        }
+        return match runs.first() {
+            Some((run, status)) if status == "cancelled" => {
+                Ok(after(mission_run_ended_tx(connection, run)?))
+            }
+            _ => Ok(Some(false)),
+        };
+    }
+    if let Some(run) = target.strip_prefix("mission-run/") {
+        return Ok(after(mission_run_ended_tx(connection, run)?));
+    }
+    if target.starts_with("attention/") {
+        if attention_request_view_tx(connection, target)?.is_some() {
+            let resolved = connection
+                .query_row(
+                    "SELECT accepted_at_unix_ms, store_index FROM claims
+                     WHERE subject=?1 AND kind='attention.resolved'
+                     ORDER BY store_index DESC LIMIT 1",
+                    [target],
+                    claim_moment,
+                )
+                .optional()?;
+            return Ok(after(resolved));
+        }
+        // Otherwise the target is a client attention ID, a digest of a human gate's owner
+        // (`attention_resource_id` in the API). It moved on when that gate, requested before
+        // this request, is no longer pending.
+        let gate_id = |owner: &str| {
+            let digest = hex::encode(Sha256::digest(owner.as_bytes()));
+            format!("attention/{}", &digest[..24])
+        };
+        if pending_human_reviews_tx(connection, None)?
+            .iter()
+            .any(|review| gate_id(&review.owner) == target)
+        {
+            return Ok(Some(false));
+        }
+        let mut statement = connection.prepare(
+            "SELECT json_extract(body, '$.fields.owner'), accepted_at_unix_ms, store_index
+             FROM claims
+             WHERE kind='gate.requested'
+               AND json_extract(body, '$.fields.reviewer') IS NOT NULL",
+        )?;
+        let requested_before = statement
+            .query_map([], |row| {
+                let owner = row.get::<_, Option<String>>(0)?;
+                let accepted_at = row.get::<_, String>(1)?;
+                Ok((
+                    owner,
+                    (
+                        accepted_at.parse().unwrap_or_default(),
+                        row.get::<_, u64>(2)?,
+                    ),
+                ))
+            })?
+            .collect::<Result<Vec<(Option<String>, ClaimMoment)>, _>>()?
+            .into_iter()
+            .any(|(owner, moment)| {
+                moment < since && owner.is_some_and(|owner| gate_id(&owner) == target)
+            });
+        return Ok(Some(requested_before));
+    }
+    if target.starts_with("agent/") {
+        let stopped = connection
+            .query_row(
+                "SELECT claims.accepted_at_unix_ms, claims.store_index
+                 FROM desired JOIN claims ON claims.id=desired.claim_id
+                 WHERE desired.subject=?1 AND desired.kind='stop'",
+                [target],
+                claim_moment,
+            )
+            .optional()?;
+        if stopped.is_some() {
+            return Ok(after(stopped));
+        }
+        // An agent that is ready on an incarnation that started after the request has
+        // recovered from whatever the request described.
+        let Some(harness) = current_harness_at(connection, target, None)? else {
+            return Ok(Some(false));
+        };
+        if !harness.is_ready() {
+            return Ok(Some(false));
+        }
+        let started = connection
+            .query_row(
+                "SELECT accepted_at_unix_ms, store_index FROM claims
+                 WHERE subject=?1 AND kind='runtime.observed'
+                   AND json_extract(body, '$.fields.incarnation_id')=?2
+                 ORDER BY store_index LIMIT 1",
+                params![target, harness.incarnation_id],
+                claim_moment,
+            )
+            .optional()?;
+        return Ok(after(started));
+    }
+    // Resources and documents are context. A target of any other kind, such as a loop, has no
+    // rule here, so it keeps the request current.
+    if target.starts_with("resource/") || target.starts_with("doc/") {
+        return Ok(None);
+    }
+    Ok(Some(false))
+}
+
+/// When a terminal run first reached a terminal status, from its own state history.
+fn mission_run_ended_tx(connection: &Connection, run: &str) -> Result<Option<ClaimMoment>> {
+    let run = run.strip_prefix("mission-run/").unwrap_or(run);
+    let terminal = connection
+        .query_row(
+            "SELECT status FROM mission_runs WHERE id=?1",
+            [run],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .is_some_and(|status| is_terminal_run_state(&status));
+    if !terminal {
+        return Ok(None);
+    }
+    connection
+        .query_row(
+            "SELECT accepted_at_unix_ms, store_index FROM claims
+             WHERE subject=?1 AND kind='mission-run.state'
+               AND json_extract(body, '$.fields.status') IN ('completed','failed','cancelled')
+             ORDER BY store_index LIMIT 1",
+            [format!("mission-run/{run}")],
+            claim_moment,
+        )
+        .optional()
+        .map_err(Into::into)
+}
+
+type TargetState = (String, Option<u128>);
+
+fn attention_target_state_tx(connection: &Connection, target: &str) -> Result<Option<TargetState>> {
+    let row = |sql: &str, id: &str| -> Result<Option<TargetState>> {
+        connection
+            .query_row(sql, [id], |row| {
+                let since = row.get::<_, String>(1)?;
+                Ok((row.get::<_, String>(0)?, since.parse().ok()))
+            })
+            .optional()
+            .map_err(Into::into)
+    };
+    if let Some(mission) = target.strip_prefix("mission/") {
+        // The same summary `missions ls` shows: an active run wins, then the latest run.
+        let mut statement = connection.prepare(
+            "SELECT status, updated_at_unix_ms FROM mission_runs WHERE mission_id=?1
+             ORDER BY CAST(created_at_unix_ms AS INTEGER) DESC, id DESC",
+        )?;
+        let runs = statement
+            .query_map([mission], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        let definition = row(
+            "SELECT mission_definitions.state, claims.accepted_at_unix_ms
+             FROM mission_definitions JOIN claims ON claims.id=mission_definitions.claim_id
+             WHERE mission_definitions.mission_id=?1",
+            mission,
+        )?;
+        if let Some((state, since)) = &definition
+            && state == "retired"
+        {
+            return Ok(Some((state.clone(), *since)));
+        }
+        let run = ["running", "standing"]
+            .iter()
+            .find_map(|active| runs.iter().find(|(status, _)| status == active))
+            .or(runs.first());
+        return Ok(match run {
+            Some((status, since)) => Some((status.clone(), since.parse().ok())),
+            None => definition.map(|(state, _)| (state, None)),
+        });
+    }
+    if let Some(run) = target.strip_prefix("mission-run/") {
+        return row(
+            "SELECT status, updated_at_unix_ms FROM mission_runs WHERE id=?1",
+            run,
+        );
+    }
+    if let Some(generation) = target.strip_prefix("run-generation/") {
+        return row(
+            "SELECT status, updated_at_unix_ms FROM run_generations WHERE id=?1",
+            generation,
+        );
+    }
+    if target.starts_with("step-run/") {
+        return row(
+            "SELECT status, updated_at_unix_ms FROM step_runs WHERE subject=?1",
+            target,
+        );
+    }
+    if target.starts_with("attention/") {
+        if let Some(request) = attention_request_view_tx(connection, target)? {
+            return Ok(Some(match request.resolved_at_unix_ms {
+                Some(resolved_at) => (request.status, Some(resolved_at)),
+                None => ("open".into(), Some(request.requested_at_unix_ms)),
+            }));
+        }
+        // A client attention ID names a human gate by a digest of its owner, as
+        // `attention_resource_id` in the API does.
+        let pending = pending_human_reviews_tx(connection, None)?
+            .into_iter()
+            .find(|review| {
+                let digest = hex::encode(Sha256::digest(review.owner.as_bytes()));
+                format!("attention/{}", &digest[..24]) == target
+            });
+        return Ok(Some(match pending {
+            Some(review) => ("open".into(), Some(review.requested_at_unix_ms)),
+            None => ("not pending".into(), None),
+        }));
+    }
+    if target.starts_with("agent/") {
+        let stopped = row(
+            "SELECT desired.kind, claims.accepted_at_unix_ms
+             FROM desired JOIN claims ON claims.id=desired.claim_id
+             WHERE desired.subject=?1 AND desired.kind='stop'",
+            target,
+        )?;
+        if let Some((_, since)) = stopped {
+            return Ok(Some(("stopped".into(), since)));
+        }
+        if let Some(harness) = current_harness_at(connection, target, None)? {
+            return Ok(Some((harness.state, Some(harness.observed_at_unix_ms))));
+        }
+        return row(
+            "SELECT coalesce(json_extract(body, '$.fields.status'), 'unknown'), accepted_at_unix_ms
+             FROM claims WHERE subject=?1 AND kind='runtime.observed'
+             ORDER BY store_index DESC LIMIT 1",
+            target,
+        );
+    }
+    Ok(None)
 }
 
 fn attention_action(label: &str, argv: &[&str]) -> AttentionActionView {
@@ -13906,11 +15157,17 @@ fn operational_annotation(
         .map(str::to_owned);
     let runtime_subject = subject.starts_with("agent/")
         || subject.starts_with("exec/")
-        || subject.starts_with("pty/");
+        || subject.starts_with("pty/")
+        || subject.starts_with("gate-operation/");
     let stopped = matches!(status, Some("stopped" | "absent" | "exited"));
     let mut historical = Vec::new();
     if runtime_subject && stopped && (!has_desired || desired_kind == Some("stop")) {
         historical.push("stopped".to_owned());
+    }
+    // Nothing declares this runtime and no runtime status was ever observed for it, such as an
+    // agent known only from its own harness observations. It is a leftover, not a live runtime.
+    if runtime_subject && !has_desired && status.is_none() {
+        historical.push("undeclared".to_owned());
     }
 
     if let Some(owner_run) = owner_run {
@@ -14350,7 +15607,6 @@ fn replica_record_ref(writer: &str, sequence: u64, envelope_hash: &str, position
     format!("record/{}", hex::encode(digest))
 }
 
-#[cfg(test)]
 fn full_replication_inventory_rows(
     connection: &Connection,
 ) -> Result<(Vec<ReplicaEnvelopeId>, i64)> {
@@ -14379,91 +15635,129 @@ fn full_replication_inventory_rows(
     Ok((envelopes, max_rowid))
 }
 
-fn full_compact_replication_inventory_rows(
-    connection: &Connection,
-) -> Result<(CompactReplicationInventory, i64)> {
-    let mut statement = connection.prepare(
-        "SELECT rowid, writer, sequence, envelope_hash FROM replica_envelopes
-         ORDER BY writer, sequence, envelope_hash",
-    )?;
-    let mut rows = statement.query([])?;
-    let mut writers = Vec::<String>::new();
-    let mut envelopes = Vec::new();
-    let mut max_rowid = 0;
-    while let Some(row) = rows.next()? {
-        max_rowid = max_rowid.max(row.get::<_, i64>(0)?);
-        let writer: String = row.get(1)?;
-        if writers.last() != Some(&writer) {
-            writers.push(writer);
-        }
-        let mut hash = [0_u8; 32];
-        hex::decode_to_slice(row.get::<_, String>(3)?, &mut hash)?;
-        envelopes.push(CompactEnvelopeId {
-            writer_index: (writers.len() - 1) as u32,
-            sequence: row.get(2)?,
-            hash,
-        });
-    }
-    Ok((
-        CompactReplicationInventory::new(writers, envelopes),
-        max_rowid,
-    ))
-}
+/// The most envelopes one exchange response or request carries.
+const REPLICATION_EXCHANGE_ENVELOPE_LIMIT: usize = 512;
 
-fn compact_replication_inventory_digest(
-    writers: &[String],
-    envelopes: &[CompactEnvelopeId],
-) -> String {
-    let mut digest = Sha256::new();
-    digest.update(b"st3-replication-inventory-v1\0");
-    for envelope in envelopes {
-        let writer = writers[envelope.writer_index as usize].as_bytes();
-        digest.update((writer.len() as u64).to_be_bytes());
-        digest.update(writer);
-        let sequence = envelope.sequence.to_string();
-        digest.update((sequence.len() as u64).to_be_bytes());
-        digest.update(sequence.as_bytes());
-        let mut hash = [0_u8; 64];
-        hex::encode_to_slice(envelope.hash, &mut hash).expect("a SHA-256 hash has 64 hex bytes");
-        digest.update(64_u64.to_be_bytes());
-        digest.update(hash);
-    }
-    hex::encode(digest.finalize())
-}
-
-fn compact_replication_bucket_digests(
-    writers: &[String],
-    envelopes: &[CompactEnvelopeId],
-) -> Vec<ReplicationBucketDigest> {
-    let mut buckets = Vec::new();
-    let mut start = 0;
-    while start < envelopes.len() {
-        let first = &envelopes[start];
-        let start_sequence = first.sequence.saturating_sub(1) / REPLICATION_BUCKET_SEQUENCES
-            * REPLICATION_BUCKET_SEQUENCES
-            + 1;
-        let mut end = start + 1;
-        while end < envelopes.len()
-            && envelopes[end].writer_index == first.writer_index
-            && envelopes[end].sequence < start_sequence.saturating_add(REPLICATION_BUCKET_SEQUENCES)
-        {
-            end += 1;
-        }
-        buckets.push(ReplicationBucketDigest {
-            key: ReplicationBucketKey {
-                writer: writers[first.writer_index as usize].clone(),
-                start_sequence,
-            },
-            digest: compact_replication_inventory_digest(writers, &envelopes[start..end]),
-        });
-        start = end;
-    }
-    buckets
-}
+/// Sequences per compact inventory range. A range digest lets two peers skip every range they
+/// already share, so an exchange lists only the identities in ranges that differ.
+const REPLICATION_BUCKET_WIDTH: u64 = 256;
 
 fn replication_inventory_digest(envelopes: &[ReplicaEnvelopeId]) -> String {
+    replication_identity_digest(b"st3-replication-inventory-v1\0", envelopes)
+}
+
+fn replication_bucket_digest<'a>(
+    envelopes: impl IntoIterator<Item = &'a ReplicaEnvelopeId>,
+) -> String {
+    replication_identity_digest(b"st3-replication-bucket-v1\0", envelopes)
+}
+
+fn replication_bucket_start(sequence: u64) -> u64 {
+    sequence - sequence % REPLICATION_BUCKET_WIDTH
+}
+
+/// Summarize a canonically ordered inventory as one digest per writer sequence range.
+fn replication_inventory_buckets(
+    envelopes: &[ReplicaEnvelopeId],
+) -> Vec<ReplicationInventoryBucket> {
+    envelopes
+        .chunk_by(|left, right| {
+            left.writer == right.writer
+                && replication_bucket_start(left.sequence)
+                    == replication_bucket_start(right.sequence)
+        })
+        .map(replication_inventory_bucket)
+        .collect()
+}
+
+/// Summarize one non-empty range of a single writer.
+fn replication_inventory_bucket(range: &[ReplicaEnvelopeId]) -> ReplicationInventoryBucket {
+    ReplicationInventoryBucket {
+        writer: range[0].writer.clone(),
+        start: replication_bucket_start(range[0].sequence),
+        count: range.len() as u64,
+        digest: replication_bucket_digest(range),
+    }
+}
+
+fn replication_bucket_slice<'a>(
+    envelopes: &'a [ReplicaEnvelopeId],
+    writer: &str,
+    start: u64,
+) -> &'a [ReplicaEnvelopeId] {
+    let end = start.saturating_add(REPLICATION_BUCKET_WIDTH);
+    let from = envelopes.partition_point(|id| (id.writer.as_str(), id.sequence) < (writer, start));
+    let to = envelopes.partition_point(|id| (id.writer.as_str(), id.sequence) < (writer, end));
+    &envelopes[from..to]
+}
+
+/// Compare a local inventory with a peer's compact inventory. Returns the local envelopes the
+/// peer provably lacks, bounded per exchange, and the local identities in every range both
+/// sides hold with different digests so the peer can compute the reverse difference.
+fn compact_replication_difference(
+    envelopes: &[ReplicaEnvelopeId],
+    buckets: &[ReplicationInventoryBucket],
+    remote: &ReplicationInventory,
+) -> (Vec<ReplicaEnvelopeId>, Vec<ReplicaEnvelopeId>) {
+    let remote_buckets = remote
+        .buckets
+        .iter()
+        .map(|bucket| ((bucket.writer.as_str(), bucket.start), bucket))
+        .collect::<BTreeMap<_, _>>();
+    let mut remote_listed = BTreeMap::<(&str, u64), Vec<&ReplicaEnvelopeId>>::new();
+    for identity in &remote.envelopes {
+        remote_listed
+            .entry((
+                identity.writer.as_str(),
+                replication_bucket_start(identity.sequence),
+            ))
+            .or_default()
+            .push(identity);
+    }
+    let mut missing = Vec::new();
+    let mut listed = Vec::new();
+    for bucket in buckets {
+        let key = (bucket.writer.as_str(), bucket.start);
+        let local = replication_bucket_slice(envelopes, &bucket.writer, bucket.start);
+        let room = REPLICATION_EXCHANGE_ENVELOPE_LIMIT.saturating_sub(missing.len());
+        let Some(theirs) = remote_buckets.get(&key) else {
+            // The peer holds nothing in this range.
+            missing.extend(local.iter().take(room).cloned());
+            continue;
+        };
+        if theirs.digest == bucket.digest {
+            continue;
+        }
+        listed.extend_from_slice(local);
+        // Only the peer's complete listing of this range proves which identities it lacks. A
+        // range that changed after the peer chose what to list waits for the next exchange.
+        let Some(known) = remote_listed.get_mut(&key) else {
+            continue;
+        };
+        known.sort_unstable();
+        known.dedup();
+        if known.len() as u64 != theirs.count
+            || replication_bucket_digest(known.iter().copied()) != theirs.digest
+        {
+            continue;
+        }
+        missing.extend(
+            local
+                .iter()
+                .filter(|identity| known.binary_search(identity).is_err())
+                .take(room)
+                .cloned(),
+        );
+    }
+    (missing, listed)
+}
+
+fn replication_identity_digest<'a>(
+    domain: &[u8],
+    envelopes: impl IntoIterator<Item = &'a ReplicaEnvelopeId>,
+) -> String {
     let mut digest = Sha256::new();
-    digest.update(b"st3-replication-inventory-v1\0");
+    digest.update(domain);
     for envelope in envelopes {
         for field in [
             envelope.writer.as_str(),
@@ -14475,29 +15769,6 @@ fn replication_inventory_digest(envelopes: &[ReplicaEnvelopeId]) -> String {
         }
     }
     hex::encode(digest.finalize())
-}
-
-const REPLICATION_BUCKET_SEQUENCES: u64 = 512;
-
-fn first_differing_bucket(
-    local: &[ReplicationBucketDigest],
-    remote: &[ReplicationBucketDigest],
-) -> Option<ReplicationBucketKey> {
-    let local = local
-        .iter()
-        .map(|bucket| (bucket.key.clone(), bucket.digest.as_str()))
-        .collect::<BTreeMap<_, _>>();
-    let remote = remote
-        .iter()
-        .map(|bucket| (bucket.key.clone(), bucket.digest.as_str()))
-        .collect::<BTreeMap<_, _>>();
-    local
-        .keys()
-        .chain(remote.keys())
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .find(|key| local.get(*key) != remote.get(*key))
-        .cloned()
 }
 
 fn graph_digest(connection: &Connection) -> Result<String> {
@@ -14646,34 +15917,6 @@ fn replication_snapshot_moves_an_exclusive_inventory_into_its_successor() {
 
 #[cfg(test)]
 #[test]
-fn replication_snapshot_keeps_compact_envelope_identifiers() {
-    let store = Store::open_memory("node").unwrap();
-    for index in 0..100 {
-        store
-            .append_client_claim(&ClaimInput {
-                subject: format!("resource/compact-envelope-{index}"),
-                kind: "resource.observed".into(),
-                actor: None,
-                fields: BTreeMap::from([(
-                    "kind".into(),
-                    Value::String("custom.test.replication".into()),
-                )]),
-                evidence: Vec::new(),
-                expected_subject: None,
-                idempotency_key: None,
-            })
-            .unwrap();
-    }
-    let snapshot = store.replication_snapshot().unwrap();
-    assert_eq!(snapshot.inventory.envelopes.len(), 100);
-    assert!(
-        std::mem::size_of_val(snapshot.inventory.envelopes.as_slice()) <= 100 * 48,
-        "the permanent inventory must store compact envelope identifiers"
-    );
-}
-
-#[cfg(test)]
-#[test]
 fn replication_snapshot_inserts_new_envelopes_in_canonical_order() {
     const FLEET: &str = "018f6f0d-4a5d-7b8c-9d0e-123456789abc";
     let target = Store::open_memory("z").unwrap();
@@ -14724,12 +15967,176 @@ fn replication_snapshot_inserts_new_envelopes_in_canonical_order() {
     let incremental = target.replication_snapshot().unwrap();
     let connection = target.connection.lock().unwrap();
     let (full, max_rowid) = full_replication_inventory_rows(&connection).unwrap();
-    assert_eq!(incremental.inventory.public_inventory().envelopes, full);
+    assert_eq!(incremental.inventory.envelopes, full);
     assert_eq!(incremental.max_envelope_rowid, max_rowid);
     assert_eq!(
         incremental.inventory.digest,
         replication_inventory_digest(&full)
     );
+    assert_eq!(incremental.buckets, replication_inventory_buckets(&full));
+}
+
+#[cfg(test)]
+fn test_envelope_ids(
+    writer: &str,
+    sequences: impl IntoIterator<Item = u64>,
+    fork: &str,
+) -> Vec<ReplicaEnvelopeId> {
+    sequences
+        .into_iter()
+        .map(|sequence| ReplicaEnvelopeId {
+            writer: writer.into(),
+            sequence,
+            hash: format!("{fork}-{writer}-{sequence}"),
+        })
+        .collect()
+}
+
+#[cfg(test)]
+struct TestReplica(BTreeSet<ReplicaEnvelopeId>);
+
+#[cfg(test)]
+impl TestReplica {
+    fn inventory(&self) -> (Vec<ReplicaEnvelopeId>, Vec<ReplicationInventoryBucket>) {
+        let envelopes = self.0.iter().cloned().collect::<Vec<_>>();
+        let buckets = replication_inventory_buckets(&envelopes);
+        (envelopes, buckets)
+    }
+
+    fn summary(&self) -> ReplicationInventory {
+        let (envelopes, buckets) = self.inventory();
+        ReplicationInventory {
+            digest: replication_inventory_digest(&envelopes),
+            envelopes: Vec::new(),
+            buckets,
+        }
+    }
+
+    /// Answer a peer inventory the way `export_replication_exchange` does and return the
+    /// envelopes sent plus the compact inventory the peer receives.
+    fn answer(
+        &self,
+        remote: &ReplicationInventory,
+    ) -> (Vec<ReplicaEnvelopeId>, ReplicationInventory) {
+        let (envelopes, buckets) = self.inventory();
+        let (missing, listed) = compact_replication_difference(&envelopes, &buckets, remote);
+        let inventory = ReplicationInventory {
+            digest: replication_inventory_digest(&envelopes),
+            envelopes: listed,
+            buckets,
+        };
+        (missing, inventory)
+    }
+
+    /// Run one two-phase outbound exchange from `self` to `peer`, as `peer::exchange` does.
+    fn exchange(&mut self, peer: &mut Self) -> usize {
+        let (pulled, response) = peer.answer(&self.summary());
+        let mut listed = response.envelopes.len();
+        self.0.extend(pulled);
+        let (pushed, push) = self.answer(&response);
+        listed = listed.max(push.envelopes.len());
+        peer.0.extend(pushed);
+        let (pulled, _) = peer.answer(&push);
+        self.0.extend(pulled);
+        listed
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn compact_replication_exchange_lists_only_ranges_that_differ() {
+    let shared = [
+        test_envelope_ids("hetz-like", 1..=20_000, "a"),
+        test_envelope_ids("silber-like", 1..=20_000, "a"),
+    ]
+    .concat();
+    let mut left = TestReplica(shared.iter().cloned().collect());
+    let mut right = TestReplica(shared.iter().cloned().collect());
+    // A new publish on one side, a sparse gap relayed around the other, and two candidates
+    // at one writer sequence all fall inside ranges both peers already hold.
+    left.0
+        .extend(test_envelope_ids("silber-like", [20_001], "a"));
+    right
+        .0
+        .extend(test_envelope_ids("hetz-like", 20_001..=20_003, "a"));
+    left.0
+        .remove(&test_envelope_ids("hetz-like", [19_990], "a")[0]);
+    right
+        .0
+        .extend(test_envelope_ids("silber-like", [20_000], "b"));
+
+    let listed = left.exchange(&mut right);
+    assert_eq!(left.0, right.0, "one exchange converges both peers");
+    assert!(
+        listed <= 2 * REPLICATION_BUCKET_WIDTH as usize,
+        "only the differing ranges are listed, not all {} identities: {listed}",
+        shared.len()
+    );
+
+    let full = serde_json::to_vec(&ReplicationInventory {
+        digest: String::new(),
+        envelopes: left.inventory().0,
+        buckets: Vec::new(),
+    })
+    .unwrap()
+    .len();
+    let compact = serde_json::to_vec(&left.summary()).unwrap().len();
+    assert!(
+        compact * 50 < full,
+        "the compact inventory ({compact} bytes) must be far smaller than the full one ({full} bytes)"
+    );
+}
+
+#[cfg(test)]
+#[test]
+fn compact_replication_exchange_drains_a_backlog_in_bounded_batches() {
+    let mut fresh = TestReplica(BTreeSet::new());
+    let mut source = TestReplica(
+        test_envelope_ids("origin", 1..=2_000, "a")
+            .into_iter()
+            .collect(),
+    );
+    let mut exchanges = 0;
+    while fresh.0 != source.0 {
+        exchanges += 1;
+        assert!(exchanges <= 4, "each exchange moves a full bounded batch");
+        let (pulled, _) = source.answer(&fresh.summary());
+        assert!(pulled.len() <= REPLICATION_EXCHANGE_ENVELOPE_LIMIT);
+        fresh.exchange(&mut source);
+    }
+    assert!(
+        exchanges >= 2,
+        "one exchange must not exceed the batch limit"
+    );
+}
+
+#[cfg(test)]
+#[test]
+fn compact_replication_exchange_waits_for_a_complete_listing() {
+    let (envelopes, buckets) = TestReplica(
+        test_envelope_ids("origin", 1..=10, "a")
+            .into_iter()
+            .collect(),
+    )
+    .inventory();
+    let peer = TestReplica(
+        test_envelope_ids("origin", 1..=8, "a")
+            .into_iter()
+            .collect(),
+    );
+    let mut listing = ReplicationInventory {
+        digest: String::new(),
+        envelopes: test_envelope_ids("origin", 1..=8, "a"),
+        buckets: peer.summary().buckets,
+    };
+    let (missing, _) = compact_replication_difference(&envelopes, &buckets, &listing);
+    assert_eq!(missing, test_envelope_ids("origin", 9..=10, "a"));
+
+    // A truncated listing cannot prove what the peer lacks, so nothing is resent blindly.
+    listing.envelopes.truncate(4);
+    let (missing, listed) = compact_replication_difference(&envelopes, &buckets, &listing);
+    assert!(missing.is_empty());
+    assert_eq!(listed, envelopes);
 }
 
 fn collect_referenced_blobs(
@@ -15218,8 +16625,59 @@ fn validate_replicated_claim(
     Ok(ReplicatedClaimAdmission::Valid)
 }
 
-/// The graph projection normally replays all accepted claims. For event-only envelopes and
-/// strictly newer lease renewals, advance from the recorded healthy frontier instead.
+/// Reapply this host's lease renewals that have not replicated yet after a projection replay,
+/// and forget each one whose lease has ended.
+fn reapply_local_work_lease_renewals_tx(transaction: &Transaction<'_>) -> Result<(), St3Error> {
+    let mut statement = transaction
+        .prepare(
+            "SELECT subject, attempt, lease_owner, lease_incarnation,
+                    lease_expires_at_unix_ms, updated_at_unix_ms
+             FROM local_work_lease_renewals",
+        )
+        .map_err(internal)?;
+    let renewals = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, u32>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+            ))
+        })
+        .map_err(internal)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(internal)?;
+    drop(statement);
+    for (subject, attempt, owner, incarnation, expires, updated) in renewals {
+        transaction
+            .execute(
+                "UPDATE step_runs SET lease_expires_at_unix_ms=?5, updated_at_unix_ms=?6
+                 WHERE subject=?1 AND attempt=?2 AND lease_owner=?3 AND lease_incarnation=?4
+                   AND status NOT IN ('completed','failed','cancelled')
+                   AND COALESCE(CAST(lease_expires_at_unix_ms AS INTEGER), 0) < CAST(?5 AS INTEGER)",
+                params![subject, attempt, owner, incarnation, expires, updated],
+            )
+            .map_err(internal)?;
+    }
+    transaction
+        .execute(
+            "DELETE FROM local_work_lease_renewals WHERE NOT EXISTS (
+               SELECT 1 FROM step_runs WHERE step_runs.subject=local_work_lease_renewals.subject
+                 AND step_runs.attempt=local_work_lease_renewals.attempt
+                 AND step_runs.lease_owner=local_work_lease_renewals.lease_owner
+                 AND step_runs.lease_incarnation=local_work_lease_renewals.lease_incarnation
+                 AND step_runs.status NOT IN ('completed','failed','cancelled')
+             )",
+            [],
+        )
+        .map_err(internal)?;
+    Ok(())
+}
+
+/// Advance from a healthy frontier when the new claims have unambiguous operation IDs and
+/// structural claims are strictly newer than the previously projected accepted-time order.
 fn try_project_simple_replication_tx(transaction: &Transaction<'_>) -> Result<bool, St3Error> {
     let health: Option<(String, u64)> = transaction
         .query_row(
@@ -15254,13 +16712,110 @@ fn try_project_simple_replication_tx(transaction: &Transaction<'_>) -> Result<bo
         .filter(|claim| claim.kind.starts_with("work."))
         .collect::<Vec<_>>();
     work_claims.sort_by_key(|claim| claim.accepted_at_unix_ms);
+    let mut last_accepted: Option<u128> = None;
+    if claims
+        .iter()
+        .any(|claim| !Store::simple_replication_kind(&claim.kind))
+    {
+        last_accepted = transaction
+            .query_row(
+                "SELECT accepted_at_unix_ms FROM claims WHERE store_index<=?1
+                 ORDER BY length(accepted_at_unix_ms) DESC, accepted_at_unix_ms DESC LIMIT 1",
+                [frontier],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(internal)?
+            .and_then(|value| value.parse::<u128>().ok());
+    }
     for claim in &claims {
         let has_operation = claim.body.get("_operation").is_some();
         if !Store::simple_replication_kind(&claim.kind)
+            && !matches!(
+                claim.kind.as_str(),
+                "intent.desired"
+                    | "doc.bound"
+                    | "mission.published"
+                    | "mission-run.created"
+                    | "mission-run.state"
+                    | "run-generation.created"
+                    | "run-generation.state"
+                    | "run-generation.superseded"
+                    | "revision-proposal.created"
+                    | "revision-proposal.approved"
+                    | "revision-proposal.cancelled"
+                    | "revision-proposal.applied"
+                    | "step-run.carried"
+                    | "step-run.state"
+                    | "step-run.retried"
+            )
             || (has_operation
                 && (claim.kind.starts_with("work.") || operation_parts(&claim.body).is_none()))
         {
             return Ok(false);
+        }
+        if !Store::simple_replication_kind(&claim.kind) {
+            if last_accepted.is_some_and(|previous| claim.accepted_at_unix_ms <= previous) {
+                return Ok(false);
+            }
+            last_accepted = Some(claim.accepted_at_unix_ms);
+            let repaired: bool = transaction
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM replica_records WHERE claim_id=?1 AND state='repaired')",
+                    [&claim.id],
+                    |row| row.get(0),
+                )
+                .map_err(internal)?;
+            if repaired {
+                return Ok(false);
+            }
+            if claim.kind == "mission-run.created" {
+                let generation = claim
+                    .body
+                    .get("fields")
+                    .unwrap_or(&claim.body)
+                    .get("current_generation")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                let prior_dependents: bool = transaction
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM claims WHERE store_index<=?1
+                         AND (subject=?2 OR subject=?3 OR subject LIKE ?4))",
+                        params![
+                            frontier,
+                            claim.subject,
+                            generation,
+                            format!("step-run/{}/%", generation_id_from_subject(generation))
+                        ],
+                        |row| row.get(0),
+                    )
+                    .map_err(internal)?;
+                if prior_dependents {
+                    return Ok(false);
+                }
+            }
+            if claim.kind == "mission.published" {
+                let revision = claim
+                    .body
+                    .get("revision")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                let waiting_run: bool = transaction
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM claims AS pending
+                         WHERE pending.kind='mission-run.created'
+                           AND json_extract(pending.body, '$.fields.mission')=?1
+                           AND json_extract(pending.body, '$.fields.revision')=?2
+                           AND NOT EXISTS(SELECT 1 FROM mission_runs AS projected
+                                          WHERE projected.id=substr(pending.subject, 13)))",
+                        params![claim.subject, revision],
+                        |row| row.get(0),
+                    )
+                    .map_err(internal)?;
+                if waiting_run {
+                    return Ok(false);
+                }
+            }
         }
     }
     // Event-only claims do not change the structural graph. Their operation
@@ -15308,8 +16863,50 @@ fn try_project_simple_replication_tx(transaction: &Transaction<'_>) -> Result<bo
         )
         .map_err(internal)?;
     }
-    for claim in work_claims {
+    for claim in &claims {
+        match claim.kind.as_str() {
+            "intent.desired" => {
+                let desired = serde_json::from_value::<DesiredSubject>(claim.body.clone())
+                    .map_err(internal)?;
+                select_replicated_desired(transaction, claim, &desired)?;
+            }
+            "doc.bound" => select_replicated_document(transaction, claim, claim.store_index)?,
+            "mission.published" => {
+                select_replicated_mission(transaction, claim, claim.store_index)?;
+            }
+            "mission-run.created" => project_mission_run_created(transaction, claim)?,
+            _ => {}
+        }
+    }
+    let mut run_updates = claims
+        .iter()
+        .filter(|claim| {
+            claim.kind.starts_with("work.")
+                || matches!(
+                    claim.kind.as_str(),
+                    "mission-run.state"
+                        | "run-generation.created"
+                        | "run-generation.state"
+                        | "run-generation.superseded"
+                        | "revision-proposal.created"
+                        | "revision-proposal.approved"
+                        | "revision-proposal.cancelled"
+                        | "revision-proposal.applied"
+                        | "step-run.carried"
+                        | "step-run.state"
+                        | "step-run.retried"
+                )
+        })
+        .collect::<Vec<_>>();
+    run_updates.sort_by_key(|claim| claim.accepted_at_unix_ms);
+    for claim in run_updates {
         project_mission_run_update(transaction, claim)?;
+    }
+    for claim in claims
+        .iter()
+        .filter(|claim| claim.kind == "step-run.carried")
+    {
+        reconcile_carried_step_tx(transaction, claim)?;
     }
     Ok(true)
 }
@@ -15332,13 +16929,9 @@ fn project_replicated_base_claims(transaction: &Transaction<'_>) -> Result<(), S
                                 WHERE replica_records.claim_id=claims.id), 0), claims.id",
         )
         .map_err(internal)?;
-    let claims = statement
-        .query_map([], claim_from_row)
-        .map_err(internal)?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(internal)?;
-    drop(statement);
+    let claims = statement.query_map([], claim_from_row).map_err(internal)?;
     for claim in claims {
+        let claim = claim.map_err(internal)?;
         insert_event(
             transaction,
             claim.store_index,
@@ -15524,97 +17117,99 @@ fn select_desired_repair_tx(
 }
 
 fn project_replicated_mission_runs(transaction: &Transaction<'_>) -> Result<(), St3Error> {
-    let mut statement = transaction
-        .prepare(
-            "SELECT claims.id, claims.store_index, claims.batch_id, claims.subject, claims.kind,
-                    claims.origin, claims.actor, claims.body, claims.predecessors,
-                    claims.accepted_at_unix_ms
-             FROM claims JOIN batches ON batches.id=claims.batch_id
-             WHERE kind IN ('mission-run.created','mission-run.state','run-generation.created','run-generation.state','run-generation.superseded',
-                            'revision-proposal.created','revision-proposal.approved','revision-proposal.cancelled','revision-proposal.applied',
-                            'step-run.carried','step-run.state','step-run.retried',
-                            'work.claimed','work.renewed','work.progress','work.submitted','work.failed','work.released')
-             ORDER BY length(claims.accepted_at_unix_ms), claims.accepted_at_unix_ms,
-                      batches.origin, batches.replica_sequence,
-                      COALESCE((SELECT MIN(position) FROM replica_records
-                                WHERE replica_records.claim_id=claims.id), 0), claims.id",
-        )
-        .map_err(internal)?;
-    let claims = statement
-        .query_map([], claim_from_row)
-        .map_err(internal)?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(internal)?;
-    drop(statement);
-
-    for claim in claims
-        .iter()
-        .filter(|claim| claim.kind == "mission-run.created")
-    {
-        project_mission_run_created(transaction, claim)?;
+    for pass in 0..3 {
+        let filter = match pass {
+            0 => "claims.kind='mission-run.created'",
+            1 => "claims.kind IN ('mission-run.state','run-generation.created','run-generation.state','run-generation.superseded',
+                  'revision-proposal.created','revision-proposal.approved','revision-proposal.cancelled','revision-proposal.applied',
+                  'step-run.carried','step-run.state','step-run.retried',
+                  'work.claimed','work.renewed','work.progress','work.submitted','work.failed','work.released')",
+            _ => "claims.kind='step-run.carried'",
+        };
+        let mut statement = transaction
+            .prepare(&format!(
+                "SELECT claims.id, claims.store_index, claims.batch_id, claims.subject, claims.kind,
+                        claims.origin, claims.actor, claims.body, claims.predecessors,
+                        claims.accepted_at_unix_ms
+                 FROM claims JOIN batches ON batches.id=claims.batch_id WHERE {filter}
+                 ORDER BY length(claims.accepted_at_unix_ms), claims.accepted_at_unix_ms,
+                          batches.origin, batches.replica_sequence,
+                          COALESCE((SELECT MIN(position) FROM replica_records
+                                    WHERE replica_records.claim_id=claims.id), 0), claims.id"
+            ))
+            .map_err(internal)?;
+        let claims = statement.query_map([], claim_from_row).map_err(internal)?;
+        for claim in claims {
+            let claim = claim.map_err(internal)?;
+            match pass {
+                0 => project_mission_run_created(transaction, &claim)?,
+                1 => project_mission_run_update(transaction, &claim)?,
+                _ => reconcile_carried_step_tx(transaction, &claim)?,
+            }
+        }
     }
-    for claim in claims
-        .iter()
-        .filter(|claim| claim.kind != "mission-run.created")
-    {
-        project_mission_run_update(transaction, claim)?;
-    }
-    reconcile_carried_steps_tx(transaction, &claims)?;
     Ok(())
 }
 
-fn reconcile_carried_steps_tx(
+fn reconcile_carried_step_tx(
     transaction: &Transaction<'_>,
-    claims: &[ClaimRecord],
+    claim: &ClaimRecord,
 ) -> Result<(), St3Error> {
-    for claim in claims
-        .iter()
-        .filter(|claim| claim.kind == "step-run.carried")
-    {
-        // A replay may be repairing an existing projection. A later step claim
-        // owns its state; otherwise the carried claim is the last direct state
-        // observation for this successor step.
-        let later_step_claim = transaction
-            .query_row(
-                "SELECT 1 FROM claims WHERE subject=?1 AND kind<>'step-run.carried' LIMIT 1",
-                [&claim.subject],
-                |_| Ok(()),
-            )
-            .optional()
-            .map_err(internal)?
-            .is_some();
-        if later_step_claim || step_owner_is_terminal_tx(transaction, &claim.subject)? {
-            continue;
-        }
-        let fields = claim.body.get("fields").unwrap_or(&claim.body);
-        let Some(status) = fields.get("status").and_then(Value::as_str) else {
-            continue;
-        };
-        let Some(attempt) = fields.get("attempt").and_then(Value::as_u64) else {
-            continue;
-        };
-        let worker_reported = fields
-            .get("worker_reported")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        transaction
-            .execute(
-                "UPDATE step_runs SET status=?2, attempt=?3, worker_reported=?4,
+    // A replay may be repairing an existing projection. A later step claim
+    // owns its state; otherwise the carried claim is the last direct state
+    // observation for this successor step.
+    let later_step_claim = transaction
+        .query_row(
+            "SELECT 1 FROM claims WHERE subject=?1 AND kind<>'step-run.carried' LIMIT 1",
+            [&claim.subject],
+            |_| Ok(()),
+        )
+        .optional()
+        .map_err(internal)?
+        .is_some();
+    if later_step_claim || step_owner_is_terminal_tx(transaction, &claim.subject)? {
+        return Ok(());
+    }
+    let fields = claim.body.get("fields").unwrap_or(&claim.body);
+    let Some(status) = fields.get("status").and_then(Value::as_str) else {
+        return Ok(());
+    };
+    let Some(attempt) = fields.get("attempt").and_then(Value::as_u64) else {
+        return Ok(());
+    };
+    let worker_reported = fields
+        .get("worker_reported")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    // A carried claim keeps the worker lease it records. A carried `ready` step names the seat
+    // whose claim the revision dropped, which is not a lease.
+    let lease = |name: &str| {
+        fields
+            .get(name)
+            .filter(|_| matches!(status, "claimed" | "working" | "verifying" | "blocked"))
+    };
+    transaction
+        .execute(
+            "UPDATE step_runs SET status=?2, attempt=?3, worker_reported=?4,
                     blocked_reason=CASE WHEN status=?2 THEN blocked_reason ELSE NULL END,
                     not_before_unix_ms=CASE WHEN status=?2 THEN not_before_unix_ms ELSE NULL END,
-                    lease_owner=NULL, lease_incarnation=NULL, lease_expires_at_unix_ms=NULL,
+                    lease_owner=?6, lease_incarnation=?7, lease_expires_at_unix_ms=?8,
                     updated_at_unix_ms=?5
                  WHERE subject=?1 AND status<>?2",
-                params![
-                    claim.subject,
-                    status,
-                    attempt,
-                    worker_reported,
-                    claim.accepted_at_unix_ms.to_string()
-                ],
-            )
-            .map_err(internal)?;
-    }
+            params![
+                claim.subject,
+                status,
+                attempt,
+                worker_reported,
+                claim.accepted_at_unix_ms.to_string(),
+                lease("claimant").and_then(Value::as_str),
+                lease("claim_incarnation").and_then(Value::as_str),
+                lease("claim_expires_at_unix_ms")
+                    .and_then(Value::as_u64)
+                    .map(|expiry| expiry.to_string()),
+            ],
+        )
+        .map_err(internal)?;
     Ok(())
 }
 
@@ -15707,6 +17302,8 @@ fn project_mission_run_created(
             )
         })?;
     let generation_id = generation_id_from_subject(generation_subject);
+    let after = fields.get("after").and_then(Value::as_str);
+    let mission = crate::mission::run_mission(mission, after)?;
     transaction
         .execute(
             "INSERT OR IGNORE INTO mission_runs(id, mission_id, initial_revision, current_generation_id, root_revision, root_run_id, parent_step_run, workspace, requester, inputs, mode, status, phase, created_at_unix_ms, updated_at_unix_ms)
@@ -15714,6 +17311,14 @@ fn project_mission_run_created(
             params![run_id, mission_id, revision, generation_id, root_revision, root_run_id, parent_step_run, workspace, requester, serde_json::to_string(&inputs).map_err(internal)?, mode, claim.accepted_at_unix_ms.to_string()],
         )
         .map_err(internal)?;
+    if let Some(after) = after {
+        transaction
+            .execute(
+                "INSERT OR IGNORE INTO mission_run_after(run_id, after_run) VALUES (?1, ?2)",
+                params![run_id, after],
+            )
+            .map_err(internal)?;
+    }
     if let (Some(timeout_ms), Some(deadline_at_unix_ms)) = (
         fields.get("timeout_ms").and_then(Value::as_u64),
         fields.get("deadline_at_unix_ms").and_then(Value::as_u64),
@@ -16216,7 +17821,10 @@ fn project_run_generation_created(
     let Some(body) = body else {
         return Ok(());
     };
-    let mission = serde_json::from_str::<MissionSpec>(&body).map_err(internal)?;
+    let mission = crate::mission::run_mission(
+        serde_json::from_str::<MissionSpec>(&body).map_err(internal)?,
+        current.after.as_deref(),
+    )?;
     let mut variables = mission_run_variables(&current, revision);
     variables.insert("ST_RUN_GENERATION".into(), generation_id.to_owned());
     let compatible = fields
@@ -16279,6 +17887,18 @@ fn project_run_generation_created(
             .and_then(Value::as_bool)
             .unwrap_or_else(|| carried.is_some_and(|old| old.worker_reported && status != "ready"));
         let matching_predecessor = carried.filter(|old| old.status == status);
+        // A carried `ready` step names the seat whose claim the revision dropped, not a lease.
+        let leased = matches!(status, "claimed" | "working" | "verifying" | "blocked");
+        let carried_lease = |name: &str| {
+            carried_fields
+                .filter(|_| leased)
+                .and_then(|fields| fields.get(name))
+                .and_then(|value| match value {
+                    Value::String(value) => Some(value.clone()),
+                    Value::Number(value) => Some(value.to_string()),
+                    _ => None,
+                })
+        };
         let mut step_variables = variables.clone();
         step_variables.insert("ST_STEP".into(), step.path.clone());
         step_variables.insert("ST_STEP_RUN".into(), subject.clone());
@@ -16300,9 +17920,9 @@ fn project_run_generation_created(
         let constraints = interpolate_goals(&constraints, &step_variables)?;
         transaction
             .execute(
-                "INSERT INTO step_runs(subject, run_id, generation_id, step_path, definition_hash, status, attempt, assignee, available_to, agentless, title, goals, worker_reported, blocked_reason, not_before_unix_ms, readiness_epoch, created_at_unix_ms, updated_at_unix_ms, constraints)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?17, ?18)",
-                params![subject, run_id, generation_id, step.path, step.definition_hash, status, attempt, assignee, serde_json::to_string(&available_to).map_err(internal)?, agentless, title, goals, worker_reported, matching_predecessor.and_then(|old| old.blocked_reason.as_deref()), matching_predecessor.and_then(|old| old.not_before_unix_ms).map(|value| value.to_string()), carried.map(|old| old.readiness_epoch).unwrap_or(0), claim.accepted_at_unix_ms.to_string(), constraints],
+                "INSERT INTO step_runs(subject, run_id, generation_id, step_path, definition_hash, status, attempt, assignee, available_to, agentless, title, goals, worker_reported, blocked_reason, not_before_unix_ms, readiness_epoch, created_at_unix_ms, updated_at_unix_ms, constraints, lease_owner, lease_incarnation, lease_expires_at_unix_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?17, ?18, ?19, ?20, ?21)",
+                params![subject, run_id, generation_id, step.path, step.definition_hash, status, attempt, assignee, serde_json::to_string(&available_to).map_err(internal)?, agentless, title, goals, worker_reported, matching_predecessor.and_then(|old| old.blocked_reason.as_deref()), matching_predecessor.and_then(|old| old.not_before_unix_ms).map(|value| value.to_string()), carried.map(|old| old.readiness_epoch).unwrap_or(0), claim.accepted_at_unix_ms.to_string(), constraints, carried_lease("claimant"), carried_lease("claim_incarnation"), carried_lease("claim_expires_at_unix_ms")],
             )
             .map_err(internal)?;
     }
@@ -16510,6 +18130,7 @@ struct RosterStepRow {
     claimant: Option<String>,
     available_to: Vec<String>,
     created_at_unix_ms: u128,
+    carried_claimant: Option<String>,
 }
 
 impl RosterStepRow {
@@ -16523,6 +18144,7 @@ impl RosterStepRow {
             claimant: self.claimant.as_deref(),
             available_to: &self.available_to,
             created_at_unix_ms: self.created_at_unix_ms,
+            carried_claimant: self.carried_claimant.as_deref(),
         }
     }
 }
@@ -16537,9 +18159,11 @@ fn seat_step_rows_tx(connection: &Connection, agent: Option<&str>) -> Result<Vec
            AND status IN ('ready', 'claimed', 'working', 'verifying')
            AND (?1 IS NULL OR assignee=?1 OR lease_owner=?1)
            AND generation_id=(SELECT current_generation_id FROM mission_runs WHERE id=step_runs.run_id)
+           AND NOT (status='ready'
+                    AND (SELECT phase FROM mission_runs WHERE id=step_runs.run_id)='revision-draining')
          ORDER BY length(created_at_unix_ms), created_at_unix_ms, subject",
     )?;
-    let rows = statement
+    let mut rows = statement
         .query_map([agent], |row| {
             Ok(RosterStepRow {
                 subject: row.get(0)?,
@@ -16550,9 +18174,19 @@ fn seat_step_rows_tx(connection: &Connection, agent: Option<&str>) -> Result<Vec
                 claimant: row.get(5)?,
                 available_to: serde_json::from_str(&row.get::<_, String>(6)?).unwrap_or_default(),
                 created_at_unix_ms: row.get::<_, String>(7)?.parse().unwrap_or_default(),
+                carried_claimant: None,
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;
+    let carried_claimants = carried_claimants_tx(
+        connection,
+        rows.iter()
+            .filter(|row| row.status == "ready" && row.assignee.is_some())
+            .map(|row| row.subject.as_str()),
+    )?;
+    for row in &mut rows {
+        row.carried_claimant = carried_claimants.get(&row.subject).cloned();
+    }
     Ok(rows)
 }
 
@@ -16778,6 +18412,23 @@ fn flatten_steps<'a>(
     inherited_constraints: &[String],
     output: &mut Vec<(&'a crate::model::StepSpec, WorkSelector, Vec<String>)>,
 ) {
+    let agent_constraints = run_agent_constraints(mission);
+    flatten_run_steps(
+        mission,
+        inherited_selector,
+        inherited_constraints,
+        &agent_constraints,
+        output,
+    );
+}
+
+fn flatten_run_steps<'a>(
+    mission: &'a MissionSpec,
+    inherited_selector: Option<WorkSelector>,
+    inherited_constraints: &[String],
+    agent_constraints: &BTreeMap<String, Vec<String>>,
+    output: &mut Vec<(&'a crate::model::StepSpec, WorkSelector, Vec<String>)>,
+) {
     let mut mission_constraints = inherited_constraints.to_vec();
     mission_constraints.extend(mission.constraints.clone());
     let mission_selector = mission
@@ -16793,10 +18444,63 @@ fn flatten_steps<'a>(
             .unwrap_or_else(|| mission_selector.clone());
         let mut constraints = mission_constraints.clone();
         constraints.extend(step.constraints.clone());
-        output.push((step, selector.clone(), constraints.clone()));
-        if let Some(nested) = &step.nested_mission {
-            flatten_steps(nested, Some(selector), &constraints, output);
+        let mut effective = constraints.clone();
+        for agent in selector_agents(&selector) {
+            for constraint in agent_constraints.get(agent).into_iter().flatten() {
+                if !effective.contains(constraint) {
+                    effective.push(constraint.clone());
+                }
+            }
         }
+        output.push((step, selector.clone(), effective));
+        if let Some(nested) = &step.nested_mission {
+            flatten_run_steps(
+                nested,
+                Some(selector),
+                &constraints,
+                agent_constraints,
+                output,
+            );
+        }
+    }
+}
+
+/// Agent blocks anywhere in one run declare run-scoped agents, so their constraints apply to every
+/// step of that run that selects the agent. Loop rounds are separate runs and keep their own.
+fn run_agent_constraints(mission: &MissionSpec) -> BTreeMap<String, Vec<String>> {
+    fn collect(
+        agent_constraints: &BTreeMap<String, Vec<String>>,
+        output: &mut BTreeMap<String, Vec<String>>,
+    ) {
+        for (agent, constraints) in agent_constraints {
+            let entry = output.entry(agent.clone()).or_default();
+            for constraint in constraints {
+                if !entry.contains(constraint) {
+                    entry.push(constraint.clone());
+                }
+            }
+        }
+    }
+    fn append(mission: &MissionSpec, output: &mut BTreeMap<String, Vec<String>>) {
+        collect(&mission.agent_constraints, output);
+        for id in &mission.display_order {
+            let step = &mission.steps[id];
+            collect(&step.agent_constraints, output);
+            if let Some(nested) = &step.nested_mission {
+                append(nested, output);
+            }
+        }
+    }
+    let mut output = BTreeMap::new();
+    append(mission, &mut output);
+    output
+}
+
+fn selector_agents(selector: &WorkSelector) -> &[String] {
+    match selector {
+        WorkSelector::Assigned { agent } => std::slice::from_ref(agent),
+        WorkSelector::Available { agents } => agents,
+        WorkSelector::Agentless => &[],
     }
 }
 
@@ -17001,7 +18705,8 @@ pub(crate) fn analyze_mission_revision(
     );
     let requester = normalize_actor(requester, "person");
     let metadata = revision_metadata(old, &requester, variables)?;
-    if actor != requester {
+    // A person may revise any part of a run. Human-only protection still selects its reviewers.
+    if actor != requester && !actor.starts_with("person/") {
         for path in &changed {
             let meta = metadata_for_changed_path(&metadata, path);
             if !meta.owners.contains(&actor) {
@@ -17148,6 +18853,7 @@ fn mission_header_hash(mission: &MissionSpec) -> Result<String, St3Error> {
         "completion": mission.completion,
         "goals": mission.goals,
         "constraints": mission.constraints,
+        "agent_constraints": mission.agent_constraints,
         "baselines": mission.baselines,
         "products": mission.products,
         "gates": mission.gates,
@@ -17241,13 +18947,177 @@ fn flattened_step_definition_hashes(mission: &MissionSpec) -> BTreeMap<String, S
         .collect()
 }
 
+/// The seat whose claim the carried projection gives up: an unreported verifying step
+/// becomes ready in the new generation. A carried `ready` claim records it as `claimant`;
+/// other carried statuses record the lease they keep under the same field.
+fn dropped_claimant<'a>(old: &'a StepRunView, status: &str) -> Option<&'a str> {
+    (status == "ready" && matches!(old.status.as_str(), "claimed" | "working" | "verifying"))
+        .then_some(old.claimant.as_deref())
+        .flatten()
+}
+
+/// For each named ready step, the seat whose claim a revision dropped when it
+/// carried the step, while that seat has not claimed it since. Its seat queue
+/// keeps the step first, as a reorder never takes a held step's place. The
+/// lookup starts from the named steps, so its cost follows current work rather
+/// than every carried step in history.
+fn carried_claimants_tx<'a>(
+    connection: &Connection,
+    ready: impl IntoIterator<Item = &'a str>,
+) -> Result<HashMap<String, String>> {
+    let ready = ready.into_iter().collect::<Vec<_>>();
+    if ready.is_empty() {
+        return Ok(HashMap::new());
+    }
+    Ok(connection
+        .prepare_cached(
+            "SELECT carried.subject, json_extract(carried.body, '$.fields.claimant')
+             FROM json_each(?1) AS ready
+             CROSS JOIN claims AS carried
+               ON carried.subject=ready.value AND carried.kind='step-run.carried'
+             WHERE json_extract(carried.body, '$.fields.status')='ready'
+               AND json_extract(carried.body, '$.fields.claimant') IS NOT NULL
+               AND NOT EXISTS (
+                   SELECT 1 FROM claims AS later
+                   WHERE later.subject=carried.subject AND later.kind='work.claimed'
+                     AND later.store_index>carried.store_index
+               )",
+        )?
+        .query_map([serde_json::to_string(&ready)?], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })?
+        .collect::<rusqlite::Result<_>>()?)
+}
+
+fn is_failed_terminal(status: &str, phase: &str) -> bool {
+    status == "failed" && phase == "terminal"
+}
+
+/// Step cancellations that only follow from another step's failure.
+const FAILURE_CANCELLATION_REASONS: &[&str] = &[
+    "another step failed",
+    "a normal step failed",
+    "one or more mission steps failed",
+    "the mission run entered cleanup",
+    "the owning mission run is terminal",
+];
+
+/// Return the failed steps of a failed root run when they are the only reason it failed, or
+/// explain why the run cannot reopen.
+fn failed_run_reopen_blocker(run: &MissionRunView) -> Result<Vec<&str>, String> {
+    if run.parent_step_run.is_some() {
+        return Err("a child run reopens only through its parent step".into());
+    }
+    if run.mode == "eval" {
+        return Err("an eval run keeps its verdict".into());
+    }
+    if run
+        .deadline_at_unix_ms
+        .is_some_and(|deadline| deadline <= now_ms())
+    {
+        return Err("its mission timeout has expired".into());
+    }
+    if let Some(step) = run.steps.iter().find(|step| {
+        step.status == "cancelled"
+            && !step
+                .blocked_reason
+                .as_deref()
+                .is_some_and(|reason| FAILURE_CANCELLATION_REASONS.contains(&reason))
+    }) {
+        return Err(format!(
+            "step `{}` was cancelled: {}",
+            step.step,
+            step.blocked_reason
+                .as_deref()
+                .unwrap_or("no reason recorded")
+        ));
+    }
+    let failed = run
+        .steps
+        .iter()
+        .filter(|step| step.status == "failed")
+        .map(|step| step.step.as_str())
+        .collect::<Vec<_>>();
+    if failed.is_empty() {
+        return Err("no step failed, so the run failed for another reason".into());
+    }
+    Ok(failed)
+}
+
+fn not_reopenable(run: &str, reason: &str) -> St3Error {
+    St3Error::new(
+        "mission-run-not-reopenable",
+        format!("mission run `{run}` cannot reopen: {reason}"),
+    )
+}
+
+/// A reopened run keeps its completed normal work and retries its failed steps. Work that the
+/// failure cancelled and every final step start again.
+fn retain_reopened_step_paths(
+    mission: &MissionSpec,
+    current: &[StepRunView],
+    compatible: &mut BTreeSet<String>,
+) {
+    let finals = flatten_mission_step_specs(mission)
+        .into_iter()
+        .filter(|step| step.finally)
+        .map(|step| step.path.as_str())
+        .collect::<BTreeSet<_>>();
+    compatible.retain(|path| {
+        current.iter().any(|step| {
+            &step.step == path
+                && (step.status == "failed"
+                    || (step.status == "completed" && !finals.contains(path.as_str())))
+        })
+    });
+}
+
 fn carried_step_projection(step: &StepRunView) -> (&str, bool) {
     match step.status.as_str() {
-        "claimed" | "working" => ("ready", false),
         "verifying" if step.worker_reported => ("verifying", true),
         "verifying" => ("ready", false),
         status => (status, step.worker_reported),
     }
+}
+
+/// Return the current-generation successor of a superseded step when it carries this actor's claim.
+fn carried_claim_successor_tx(
+    connection: &Connection,
+    step: &StepRunView,
+    actor: &str,
+) -> rusqlite::Result<Option<StepRunView>> {
+    let run_id = step.run.strip_prefix("mission-run/").unwrap_or(&step.run);
+    connection
+        .query_row(
+            "SELECT subject, run_id, step_path, definition_hash, status, attempt, assignee, available_to, agentless, title, goals, worker_reported,
+                    lease_owner, lease_incarnation, lease_expires_at_unix_ms, blocked_reason, not_before_unix_ms, created_at_unix_ms, updated_at_unix_ms, readiness_epoch, constraints
+             FROM step_runs
+             WHERE run_id=?1 AND step_path=?2 AND lease_owner=?3 AND generation_id<>?4
+               AND generation_id=(SELECT current_generation_id FROM mission_runs WHERE id=?1)",
+            params![run_id, step.step, actor, generation_id_from_subject(&step.generation)],
+            step_run_from_row,
+        )
+        .optional()
+}
+
+/// A carried step keeps the worker lease of the status it carries, so its worker continues in
+/// the successor generation without claiming again.
+fn carried_step_lease(
+    carried: Option<&StepRunView>,
+    status: &str,
+) -> (Option<String>, Option<String>, Option<u128>) {
+    let Some(old) = carried.filter(|old| {
+        old.status == status
+            && old.claimant.is_some()
+            && matches!(status, "claimed" | "working" | "verifying" | "blocked")
+    }) else {
+        return (None, None, None);
+    };
+    (
+        old.claimant.clone(),
+        old.claim_incarnation.clone(),
+        old.claim_expires_at_unix_ms,
+    )
 }
 
 fn flattened_dependencies(mission: &MissionSpec) -> BTreeMap<String, BTreeSet<String>> {
@@ -17320,11 +19190,15 @@ fn step_run_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StepRunView> {
         claimant: row.get(12)?,
         claim_incarnation: row.get(13)?,
         claim_expires_at_unix_ms: lease.and_then(|value| value.parse().ok()),
+        carried_claimant: None,
         execution_started_at_unix_ms: None,
         execution_elapsed_ms: 0,
         timeout_ms: None,
         ready_age_ms: None,
         wake: None,
+        progress_summary: None,
+        progress_at_unix_ms: None,
+        completion_summary: None,
         readiness_epoch: row.get(19)?,
         blocked_reason: row.get(15)?,
         blockers: Vec::new(),
@@ -17353,8 +19227,61 @@ fn enrich_step_queue_at(
     )?;
     view.execution_started_at_unix_ms = execution_started_at_unix_ms;
     view.execution_elapsed_ms = execution_elapsed_ms;
+    enrich_step_summaries_at(connection, view, snapshot_unix_ms)?;
     enrich_step_wake_at(connection, view, snapshot_unix_ms)?;
     enrich_step_definition(connection, view)
+}
+
+/// Copies the worker's latest progress summary and its completion summary for the
+/// current attempt from the work claims, so views can show them without a history read.
+fn enrich_step_summaries_at(
+    connection: &Connection,
+    view: &mut StepRunView,
+    snapshot_unix_ms: u128,
+) -> rusqlite::Result<()> {
+    let mut statement = connection.prepare_cached(
+        "SELECT kind, body, accepted_at_unix_ms FROM claims
+         WHERE subject=?1 AND kind IN ('work.progress','work.submitted')
+         ORDER BY length(accepted_at_unix_ms), accepted_at_unix_ms, store_index",
+    )?;
+    let events = statement
+        .query_map([&view.subject], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    view.progress_summary = None;
+    view.progress_at_unix_ms = None;
+    view.completion_summary = None;
+    for (kind, body, accepted) in events {
+        let accepted = accepted.parse::<u128>().unwrap_or(0);
+        if accepted > snapshot_unix_ms {
+            break;
+        }
+        let body = serde_json::from_str::<Value>(&body).unwrap_or(Value::Null);
+        let fields = body.get("fields").unwrap_or(&body);
+        if fields.get("attempt").and_then(Value::as_u64) != Some(u64::from(view.attempt)) {
+            continue;
+        }
+        let Some(summary) = fields
+            .get("summary")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|summary| !summary.is_empty())
+        else {
+            continue;
+        };
+        if kind == "work.progress" {
+            view.progress_summary = Some(summary.to_owned());
+            view.progress_at_unix_ms = Some(accepted);
+        } else {
+            view.completion_summary = Some(summary.to_owned());
+        }
+    }
+    Ok(())
 }
 
 fn enrich_step_queue_for_reconcile_at(
@@ -17439,7 +19366,15 @@ fn enrich_step_wake_at(
                 EXISTS(SELECT 1 FROM claims consumed
                        WHERE consumed.subject=claims.subject
                          AND consumed.kind IN ('message.read','message.closed')
-                         AND consumed.accepted_at_unix_ms<=?1)
+                         AND consumed.accepted_at_unix_ms<=?1),
+                EXISTS(SELECT 1 FROM claims delivered
+                       WHERE delivered.subject=claims.subject
+                         AND delivered.kind='message.delivered'
+                         AND delivered.accepted_at_unix_ms<=?1),
+                EXISTS(SELECT 1 FROM claims staged
+                       WHERE staged.subject=claims.subject
+                         AND staged.kind='message.staged'
+                         AND staged.accepted_at_unix_ms<=?1)
          FROM claims INDEXED BY claims_message_to_index
          WHERE claims.kind='message.sent' AND claims.accepted_at_unix_ms<=?1
            AND instr(claims.body, ?2)>0
@@ -17458,13 +19393,25 @@ fn enrich_step_wake_at(
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
                 row.get::<_, bool>(2)?,
+                row.get::<_, bool>(3)?,
+                row.get::<_, bool>(4)?,
             ))
         },
     )?;
     for row in rows {
-        let (body, accepted, consumed) = row?;
+        let (body, accepted, consumed, delivered, staged) = row?;
         let body = serde_json::from_str::<Value>(&body).unwrap_or(Value::Null);
         let fields = body.get("fields").unwrap_or(&body);
+        if fields
+            .get("tags")
+            .and_then(Value::as_array)
+            .is_some_and(|tags| {
+                tags.iter()
+                    .any(|tag| tag.as_str() == Some("st3-wake-source:manual"))
+            })
+        {
+            continue;
+        }
         let matching_incarnation = fields
             .get("tags")
             .and_then(Value::as_array)
@@ -17476,14 +19423,20 @@ fn enrich_step_wake_at(
                     .map(str::to_owned)
             });
         if let Some(incarnation) = matching_incarnation {
-            attempts.push((accepted.parse::<u128>().unwrap_or(0), incarnation, consumed));
+            attempts.push((
+                accepted.parse::<u128>().unwrap_or(0),
+                incarnation,
+                consumed,
+                delivered,
+                staged,
+            ));
         }
     }
-    let first_attempt = attempts.first().map(|(accepted, _, _)| *accepted);
-    let last_attempt_at_unix_ms = attempts.last().map(|(accepted, _, _)| *accepted);
+    let first_attempt = attempts.first().map(|(accepted, ..)| *accepted);
+    let last_attempt_at_unix_ms = attempts.last().map(|(accepted, ..)| *accepted);
     let wake_incarnation_key = attempts
         .last()
-        .map(|(_, incarnation, _)| incarnation.as_str())
+        .map(|(_, incarnation, ..)| incarnation.as_str())
         .unwrap_or(current_incarnation_key.as_str());
     let wake_incarnation_id = harness_incarnation_for_key_at(
         connection,
@@ -17506,9 +19459,23 @@ fn enrich_step_wake_at(
         Some("claim".into())
     } else if attempts
         .iter()
-        .any(|(_, incarnation, consumed)| *consumed && incarnation == wake_incarnation_key)
+        .any(|(_, incarnation, consumed, _, _)| *consumed && incarnation == wake_incarnation_key)
     {
         Some("consumed".into())
+    } else if harness.as_ref().is_some_and(|harness| {
+        harness.state == "working" && current_incarnation_key == wake_incarnation_key
+    }) && attempts
+        .iter()
+        .any(|(_, incarnation, _, delivered, staged)| {
+            incarnation == wake_incarnation_key
+                && (*delivered
+                    || *staged
+                        && harness.as_ref().is_some_and(|harness| {
+                            matches!(harness.driver.as_deref(), Some("pi" | "omp"))
+                        }))
+        })
+    {
+        Some("delivery".into())
     } else if first_attempt.is_some_and(|requested| {
         harness.as_ref().is_some_and(|harness| {
             current_incarnation_key == wake_incarnation_key
@@ -17527,12 +19494,16 @@ fn enrich_step_wake_at(
                AND json_extract(body, '$.fields.code')='work-wake-exhausted'
                AND json_extract(body, '$.fields.step_run')=?3
                AND json_extract(body, '$.fields.incarnation_id')=?4
+               AND json_extract(body, '$.fields.attempt')=?5
+               AND json_extract(body, '$.fields.readiness_epoch')=?6
              ORDER BY store_index DESC LIMIT 1",
             params![
                 assignee,
                 snapshot_unix_ms.to_string(),
                 view.subject,
-                wake_incarnation_id
+                wake_incarnation_id,
+                view.attempt,
+                view.readiness_epoch
             ],
             |row| row.get::<_, String>(0),
         )
@@ -17617,8 +19588,8 @@ fn step_execution_timing_at(
         "SELECT claims.kind, claims.body, claims.accepted_at_unix_ms
          FROM claims JOIN batches ON batches.id=claims.batch_id
          WHERE claims.subject=?1
-           AND claims.kind IN ('step-run.state','work.claimed','work.renewed','work.progress',
-                               'work.submitted','work.failed','work.released')
+           AND claims.kind IN ('step-run.state','step-run.carried','work.claimed','work.renewed',
+                               'work.progress','work.submitted','work.failed','work.released')
          ORDER BY length(claims.accepted_at_unix_ms), claims.accepted_at_unix_ms,
                   batches.origin, batches.replica_sequence,
                   COALESCE((SELECT MIN(position) FROM replica_records
@@ -17674,6 +19645,24 @@ fn step_execution_timing_at(
                 }
             }
             "work.claimed" => {
+                if started.is_none() {
+                    started = Some(accepted);
+                }
+                lease_expires = fields
+                    .get("claim_expires_at_unix_ms")
+                    .and_then(Value::as_u64)
+                    .map(u128::from);
+            }
+            // A claim carried into a successor generation opens its interval at the cutover.
+            "step-run.carried"
+                if fields
+                    .get("status")
+                    .and_then(Value::as_str)
+                    .is_some_and(|status| matches!(status, "claimed" | "working"))
+                    && fields
+                        .get("claimant")
+                        .is_some_and(|claimant| !claimant.is_null()) =>
+            {
                 if started.is_none() {
                     started = Some(accepted);
                 }
@@ -18669,10 +20658,11 @@ fn mission_run_header_tx(
                 mission_runs.workspace, mission_runs.requester, mission_runs.inputs, mission_runs.mode,
                 mission_run_deadlines.timeout_ms, mission_run_deadlines.deadline_at_unix_ms,
                 mission_runs.status, mission_runs.phase, mission_runs.created_at_unix_ms,
-                mission_runs.updated_at_unix_ms
+                mission_runs.updated_at_unix_ms, mission_run_after.after_run
          FROM mission_runs JOIN run_generations
            ON run_generations.id=mission_runs.current_generation_id
          LEFT JOIN mission_run_deadlines ON mission_run_deadlines.run_id=mission_runs.id
+         LEFT JOIN mission_run_after ON mission_run_after.run_id=mission_runs.id
          WHERE mission_runs.id=?1",
         [run_id],
         |row| {
@@ -18698,6 +20688,7 @@ fn mission_run_header_tx(
                 mode: row.get(11)?,
                 timeout_ms: row.get(12)?,
                 deadline_at_unix_ms: deadline.and_then(|value| value.parse().ok()),
+                after: row.get(18)?,
                 status: row.get(14)?,
                 phase: row.get(15)?,
                 created_at_unix_ms: created.parse().unwrap_or(0),
@@ -19022,6 +21013,109 @@ mod tests {
     }
 
     #[test]
+    fn pending_request_queries_return_only_unstarted_history() {
+        let store = Store::open_memory("node").unwrap();
+        let mut connection = store.connection.lock().unwrap();
+        let transaction = connection.transaction().unwrap();
+        for sequence in 0..100 {
+            for (subject, requested, started) in [
+                (
+                    "subscription/test",
+                    "subscription.mission-requested",
+                    "subscription.mission-started",
+                ),
+                (
+                    "schedule/test",
+                    "schedule.work-requested",
+                    "schedule.work-started",
+                ),
+            ] {
+                let body = if requested == "subscription.mission-requested" {
+                    json!({"fields": {
+                        "mission": "mission/test", "mission_revision": "revision",
+                        "resource": "resource/test", "resource_input": "source",
+                        "workspace": "/tmp/test", "discovery": format!("discovery-{sequence}")
+                    }})
+                } else {
+                    json!({"fields": {
+                        "revision": "revision", "occurrence": sequence,
+                        "mission": "mission/test", "mission_revision": "revision",
+                        "workspace": "/tmp/test", "inputs": {}
+                    }})
+                };
+                let request = append_claim_tx(
+                    &transaction,
+                    &store.origin,
+                    subject,
+                    requested,
+                    None,
+                    &body,
+                    &[],
+                    None,
+                )
+                .unwrap();
+                append_claim_tx(
+                    &transaction,
+                    &store.origin,
+                    subject,
+                    started,
+                    None,
+                    &json!({"fields": {"request": request.id, "mission_run": "mission-run/test"}}),
+                    &[],
+                    None,
+                )
+                .unwrap();
+            }
+        }
+        let subscription = append_claim_tx(
+            &transaction,
+            &store.origin,
+            "subscription/test",
+            "subscription.mission-requested",
+            None,
+            &json!({"fields": {
+                "mission": "mission/test", "mission_revision": "revision",
+                "resource": "resource/test", "resource_input": "source",
+                "workspace": "/tmp/test", "discovery": "discovery-pending"
+            }}),
+            &[],
+            None,
+        )
+        .unwrap();
+        let schedule = append_claim_tx(
+            &transaction,
+            &store.origin,
+            "schedule/test",
+            "schedule.work-requested",
+            None,
+            &json!({"fields": {
+                "revision": "revision", "occurrence": 101,
+                "mission": "mission/test", "mission_revision": "revision",
+                "workspace": "/tmp/test", "inputs": {}
+            }}),
+            &[],
+            None,
+        )
+        .unwrap();
+        transaction.commit().unwrap();
+        drop(connection);
+        let pending = store
+            .pending_subscription_mission_requests("subscription/test")
+            .unwrap();
+        assert_eq!(
+            pending.iter().map(|claim| &claim.id).collect::<Vec<_>>(),
+            vec![&subscription.id]
+        );
+        let pending = store
+            .pending_schedule_work_requests("schedule/test")
+            .unwrap();
+        assert_eq!(
+            pending.iter().map(|claim| &claim.id).collect::<Vec<_>>(),
+            vec![&schedule.id]
+        );
+    }
+
+    #[test]
     fn simple_replication_advances_events_without_full_replay() {
         let store = Store::open_memory("node").unwrap();
         assert!(store.project_replication_backlog().unwrap());
@@ -19055,73 +21149,130 @@ mod tests {
     }
 
     #[test]
-    fn one_divergent_envelope_exchanges_only_its_inventory_bucket() {
-        let remote = Store::open_memory("remote").unwrap();
-        for number in 0..1_100 {
-            remote
-                .append_claim(&ClaimInput {
-                    subject: "host/remote".into(),
-                    kind: "transport.observed".into(),
-                    actor: None,
-                    fields: BTreeMap::from([
-                        ("status".into(), Value::String("up".into())),
-                        ("reason".into(), Value::String(format!("sample {number}"))),
-                    ]),
-                    evidence: Vec::new(),
-                    expected_subject: None,
-                    idempotency_key: None,
-                })
-                .unwrap();
+    fn resource_observation_projection_does_not_rebuild_operation_history() {
+        let store = Store::open_memory("node").unwrap();
+        assert!(store.project_replication_backlog().unwrap());
+        {
+            let mut connection = store.connection.lock().unwrap();
+            let transaction = connection.transaction().unwrap();
+            append_claim_tx(
+                &transaction,
+                &store.origin,
+                "agent/node.test",
+                "harness.observed",
+                Some("agent/node.test"),
+                &json!({"fields": {"state": "ready"}, "_operation": {
+                    "id": "op/existing", "request_digest": "digest-one"
+                }}),
+                &[],
+                None,
+            )
+            .unwrap();
+            transaction.commit().unwrap();
         }
-        let local = Store::open_memory("local").unwrap();
-        for after in [0, 512, 1_024] {
-            local
-                .import_replication("remote", &remote.export_replication(after).unwrap())
-                .unwrap();
+        assert!(store.project_replication_backlog().unwrap());
+        {
+            let mut connection = store.connection.lock().unwrap();
+            let transaction = connection.transaction().unwrap();
+            append_claim_tx(
+                &transaction,
+                &store.origin,
+                "resource/repo",
+                "resource.observed",
+                None,
+                &json!({"fields": {"kind": "vcs.repository", "state": "active"}}),
+                &[],
+                None,
+            )
+            .unwrap();
+            transaction.commit().unwrap();
         }
-        local
-            .append_claim(&ClaimInput {
-                subject: "host/local".into(),
-                kind: "transport.observed".into(),
-                actor: None,
-                fields: BTreeMap::from([("status".into(), Value::String("up".into()))]),
-                evidence: Vec::new(),
-                expected_subject: None,
-                idempotency_key: None,
-            })
+        let before = store.connection.lock().unwrap().total_changes();
+        assert!(store.project_replication_backlog().unwrap());
+        let connection = store.connection.lock().unwrap();
+        assert!(connection.total_changes() - before <= 2);
+        assert!(operation_tx(&connection, "op/existing").unwrap().is_some());
+    }
+
+    #[test]
+    fn structural_replication_advances_from_healthy_frontier() {
+        let store = Store::open_memory("node").unwrap();
+        assert!(store.project_replication_backlog().unwrap());
+        {
+            let mut connection = store.connection.lock().unwrap();
+            let transaction = connection.transaction().unwrap();
+            for id in 0..20 {
+                append_claim_tx(
+                    &transaction,
+                    &store.origin,
+                    "agent/node.test",
+                    "harness.observed",
+                    Some("agent/node.test"),
+                    &json!({"fields": {"state": "ready"}, "_operation": {
+                        "id": format!("op/structural-test/{id}"),
+                        "request_digest": format!("digest-{id}")
+                    }}),
+                    &[],
+                    None,
+                )
+                .unwrap();
+            }
+            transaction.commit().unwrap();
+        }
+        assert!(store.project_replication_backlog().unwrap());
+        store
+            .connection
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE claims SET accepted_at_unix_ms='1' WHERE kind='harness.observed'",
+                [],
+            )
             .unwrap();
-        let summary = remote.export_replication_summary(TEST_FLEET).unwrap();
-        let response = local
-            .export_replication_exchange(TEST_FLEET, &summary.inventory)
+        {
+            let mut connection = store.connection.lock().unwrap();
+            let transaction = connection.transaction().unwrap();
+            transaction
+                .execute(
+                    "INSERT INTO blobs(hash, bytes, size) VALUES ('sha256:abc', x'01', 1)",
+                    [],
+                )
+                .unwrap();
+            append_claim_tx(
+                &transaction,
+                &store.origin,
+                "doc/test/incremental",
+                "doc.bound",
+                Some("agent/node.test"),
+                &json!({"name": "doc/test/incremental", "hash": "sha256:abc"}),
+                &[],
+                None,
+            )
             .unwrap();
-        assert!(response.inventory.envelopes.len() <= 512);
-        assert!(serde_json::to_vec(&response).unwrap().len() < 65_536);
-        let remote_bucket = remote
-            .export_replication_exchange(TEST_FLEET, &response.inventory)
-            .unwrap();
-        let push = local
-            .export_replication_exchange(TEST_FLEET, &remote_bucket.inventory)
-            .unwrap();
-        assert_eq!(push.envelopes.len(), 1);
-        remote
-            .receive_replication_exchange("local", TEST_FLEET, &push)
-            .unwrap();
-        assert_eq!(
-            remote
-                .export_replication_summary(TEST_FLEET)
-                .unwrap()
-                .inventory
-                .digest,
-            local
-                .export_replication_summary(TEST_FLEET)
-                .unwrap()
-                .inventory
-                .digest
+            transaction.commit().unwrap();
+        }
+        {
+            let mut connection = store.connection.lock().unwrap();
+            let transaction = connection.transaction().unwrap();
+            assert!(try_project_simple_replication_tx(&transaction).unwrap());
+            transaction.rollback().unwrap();
+        }
+        let before = store.connection.lock().unwrap().total_changes();
+        assert!(store.project_replication_backlog().unwrap());
+        let connection = store.connection.lock().unwrap();
+        let changes = connection.total_changes() - before;
+        assert!(
+            changes < 10,
+            "incremental projection changed {changes} rows"
         );
-        let explicit = local
-            .export_replication_exchange(TEST_FLEET, &ReplicationInventory::default())
+        let hash: String = connection
+            .query_row(
+                "SELECT hash FROM documents WHERE name='doc/test/incremental'",
+                [],
+                |row| row.get(0),
+            )
             .unwrap();
-        assert!(explicit.inventory.envelopes.len() > 512);
+        assert_eq!(hash, "sha256:abc");
     }
 
     #[test]
@@ -20187,6 +22338,49 @@ observer "ordered/file" {
     }
 
     #[test]
+    fn an_exited_gate_runtime_leaves_the_current_runtime_list() {
+        let store = Store::open_memory("node").unwrap();
+        let subject = "gate-operation/step-run.run.check/0123456789abcdef01234567";
+        for status in ["running", "exited"] {
+            store
+                .append_claim(&ClaimInput {
+                    subject: subject.into(),
+                    kind: "runtime.observed".into(),
+                    actor: None,
+                    fields: BTreeMap::from([
+                        ("status".into(), Value::String(status.into())),
+                        (
+                            "runtime_id".into(),
+                            Value::String(subject.replace('/', ".")),
+                        ),
+                    ]),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: None,
+                })
+                .unwrap();
+        }
+        let current = store
+            .status_for_claim_kind_at("runtime.observed", None, false)
+            .unwrap();
+        assert!(
+            current.subjects.iter().all(|item| item.subject != subject),
+            "{:?}",
+            current.subjects
+        );
+        let history = store
+            .status_for_claim_kind_at("runtime.observed", None, true)
+            .unwrap();
+        let gate = history
+            .subjects
+            .iter()
+            .find(|item| item.subject == subject)
+            .unwrap();
+        assert_eq!(gate.projection.layer, "history");
+        assert_eq!(gate.projection.reasons, ["stopped"]);
+    }
+
+    #[test]
     fn the_current_actual_cache_follows_the_store_index() {
         let store = Store::open_memory("node").unwrap();
         let subject = "agent/run/worker";
@@ -20223,6 +22417,27 @@ observer "ordered/file" {
         let cache = store.actual_cache.lock().unwrap();
         assert!(cache.get(subject).unwrap().0 > first_index);
         assert!(!cache.contains_key("agent/old"));
+    }
+
+    #[test]
+    fn a_subject_with_no_actual_or_desired_state_has_unknown_reachability() {
+        let store = Store::open_memory("node").unwrap();
+        let subject = "agent/diagnostic-run/sig.hub";
+        store
+            .append_claim(&ClaimInput {
+                subject: subject.into(),
+                kind: "harness.observed".into(),
+                actor: Some(subject.into()),
+                fields: BTreeMap::from([("state".into(), Value::String("idle".into()))]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+        let status = store.status(Some(subject)).unwrap();
+        assert!(status.subjects[0].actual.is_none());
+        assert!(status.subjects[0].desired.is_none());
+        assert_eq!(status.subjects[0].reachability, "unknown");
     }
 
     #[test]
@@ -20385,6 +22600,131 @@ mission "guarded" state="ready" {
                 "Keep the workspace clean.",
                 "Do not edit files."
             ]
+        );
+    }
+
+    #[test]
+    fn agent_block_constraints_bind_only_steps_that_select_the_agent() {
+        let store = Store::open_memory("node").unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let source = r#"version 2
+mission "handoff" state="ready" {
+  goal "Build and merge one change."
+  constraint "Keep the change small."
+  agent "builder" {
+    workspace "."
+    command "true"
+    constraint "Never push the release branch."
+    constraint "Keep the change small."
+  }
+  agent "merger" { workspace "."; command "true" }
+  agent "idle" {
+    workspace "."
+    command "true"
+    constraint "Rest."
+  }
+  step "build" {
+    assigned-to "agent/${ST_MISSION_RUN}/builder"
+    constraint "Add a test."
+    mission "follow-up" {
+      goal "Check the build."
+      step "check" {}
+    }
+  }
+  step "either" {
+    available-to "agent/${ST_MISSION_RUN}/merger"
+    available-to "agent/${ST_MISSION_RUN}/builder"
+  }
+  step "merge" {
+    assigned-to "agent/${ST_MISSION_RUN}/merger"
+    depends-on { step "build" completed }
+  }
+  step "record" { agentless }
+  agent "checker" {
+    workspace "."
+    command "true"
+    constraint "Report without editing files."
+  }
+  step "audit" {
+    mission "inspection" {
+      goal "Inspect the build."
+      assigned-to "agent/${ST_MISSION_RUN}/checker"
+      step "look" {}
+    }
+  }
+}
+"#;
+        let intent = crate::graph::parse_intent(source, "node").unwrap();
+        let planned = store
+            .mission(
+                &intent,
+                IntentInput {
+                    kdl: source.into(),
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        assert!(planned.warnings.contains(
+            &"mission `mission/handoff` gives agent `agent/${ST_MISSION_RUN}/idle` constraints, but no step selects that agent"
+                .to_owned()
+        ));
+        assert!(
+            !planned
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("checker")),
+            "{:?}",
+            planned.warnings
+        );
+        store
+            .apply(&intent, &planned.subject_tokens, "publish-handoff")
+            .unwrap();
+        let mission = intent.missions["handoff"].clone();
+        let run = store
+            .create_mission_run(&MissionRunRequest {
+                mission: mission.id,
+                revision: Some(mission.revision),
+                workspace: workspace.path().display().to_string(),
+                requester: Some("person/operator".into()),
+                mode: None,
+                inputs: BTreeMap::new(),
+                idempotency_key: "run-handoff".into(),
+            })
+            .unwrap();
+        let constraints = |path: &str| {
+            run.steps
+                .iter()
+                .find(|step| step.step == path)
+                .unwrap()
+                .constraints
+                .clone()
+        };
+        assert_eq!(
+            constraints("build"),
+            [
+                "Keep the change small.",
+                "Add a test.",
+                "Never push the release branch."
+            ]
+        );
+        assert_eq!(
+            constraints("build/follow-up/check"),
+            [
+                "Keep the change small.",
+                "Add a test.",
+                "Never push the release branch."
+            ]
+        );
+        assert_eq!(
+            constraints("either"),
+            ["Keep the change small.", "Never push the release branch."]
+        );
+        assert_eq!(constraints("merge"), ["Keep the change small."]);
+        assert_eq!(constraints("record"), ["Keep the change small."]);
+        assert_eq!(constraints("audit"), ["Keep the change small."]);
+        assert_eq!(
+            constraints("audit/inspection/look"),
+            ["Keep the change small.", "Report without editing files."]
         );
     }
 
@@ -21715,6 +24055,94 @@ version 2
     }
 
     #[test]
+    fn a_run_declared_after_another_keeps_its_wait_through_preview_and_replication() {
+        let controller = Store::open_memory("controller").unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let build = publish_mission(
+            &controller,
+            "version 2\nmission \"build\" state=\"ready\" { goal \"Build.\"; step \"build\" { agentless } }",
+            "publish-build",
+        );
+        let ship = publish_mission(
+            &controller,
+            "version 2\nmission \"ship\" state=\"ready\" { goal \"Ship.\"; step \"ship\" { agentless } }",
+            "publish-ship",
+        );
+        let declare = |run: &str, mission: &MissionSpec, after: Option<&str>| {
+            let after = after.map_or(String::new(), |after| format!("  after {after:?}\n"));
+            let source = format!(
+                "version 2\nmission-run {run:?} {{\n  mission \"mission/{}@{}\"\n  workspace {:?}\n  requester \"person/operator\"\n{after}}}\n",
+                mission.id,
+                mission.revision,
+                workspace.path().display().to_string(),
+            );
+            let intent = crate::graph::parse_intent(&source, "node").unwrap();
+            let preview = controller
+                .mission(
+                    &intent,
+                    IntentInput {
+                        kdl: source,
+                        source_name: None,
+                    },
+                )
+                .unwrap();
+            (intent, preview)
+        };
+
+        let (_, early) = declare("ship/1", &ship, Some("build/1"));
+        assert_eq!(
+            early.blockers,
+            [
+                "mission run `mission-run/ship/1` waits for `mission-run/build/1`, which does not exist"
+            ]
+        );
+        for (run, mission, after) in [
+            ("build/1", &build, None),
+            ("ship/1", &ship, Some("build/1")),
+        ] {
+            let (intent, preview) = declare(run, mission, after);
+            assert!(preview.blockers.is_empty(), "{:?}", preview.blockers);
+            controller
+                .apply_as(
+                    &intent,
+                    &preview.subject_tokens,
+                    &format!("start-{run}"),
+                    Some("person/operator"),
+                )
+                .unwrap();
+        }
+        let (_, changed) = declare("ship/1", &ship, Some("build/2"));
+        assert_eq!(
+            changed.blockers,
+            ["mission run `mission-run/ship/1` already exists with different creation fields"]
+        );
+
+        let local = controller.mission_run("ship/1").unwrap().unwrap();
+        assert_eq!(local.after.as_deref(), Some("mission-run/build/1"));
+        let worker = Store::open_memory("worker").unwrap();
+        receive_and_project(
+            &worker,
+            "controller",
+            &exchange_from(&controller, &ReplicationInventory::default()),
+        );
+        let remote = worker.mission_run("ship/1").unwrap().unwrap();
+        assert_eq!(remote.after, local.after);
+        assert_eq!(
+            remote
+                .steps
+                .iter()
+                .map(|step| (step.subject.as_str(), step.agentless))
+                .collect::<Vec<_>>(),
+            local
+                .steps
+                .iter()
+                .map(|step| (step.subject.as_str(), step.agentless))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(remote.steps[0].step, "after-run");
+    }
+
+    #[test]
     fn replication_carries_run_generation_lineage() {
         let source = Store::open_memory("source").unwrap();
         let publish = |goal: &str, key: &str| {
@@ -22284,7 +24712,7 @@ mission "proposal-replay" state="ready" revisions="human-only" revision-reviewer
                     sequence: candidate.sequence,
                     hash: candidate.hash.clone(),
                 }],
-                ..ReplicationInventory::default()
+                buckets: Vec::new(),
             },
             envelopes: vec![candidate],
         };
@@ -22353,7 +24781,7 @@ mission "proposal-replay" state="ready" revisions="human-only" revision-reviewer
                         hash: envelope.hash.clone(),
                     })
                     .collect(),
-                ..ReplicationInventory::default()
+                buckets: Vec::new(),
             },
             envelopes,
         };
@@ -24481,6 +26909,17 @@ version 2
                 },
             )
             .unwrap();
+        // The Typecase shape: the mission it names was cancelled after the request.
+        let typecase = start_agentless_run(&store, "typecase");
+        request_fault(&store, "attention/typecase", &["mission/typecase"]);
+        store
+            .set_mission_run_state(
+                &typecase.id,
+                "cancelled",
+                "terminal",
+                Some("moved to a seat"),
+            )
+            .unwrap();
 
         store
             .append_claim(&ClaimInput {
@@ -24545,6 +26984,12 @@ version 2
         assert!(classes.contains("expired-claim"));
         assert!(classes.contains("superseded-attention"));
         assert!(classes.contains("wake-contradiction"));
+        assert!(plan.items.iter().any(|item| {
+            item.class == "superseded-attention"
+                && item
+                    .affected_subjects
+                    .contains(&"attention/typecase".to_owned())
+        }));
         let wake = plan
             .items
             .iter()
@@ -24872,6 +27317,7 @@ mission "nested-work" state="ready" {
       step "first" { }
       step "second" { depends-on { step "first" completed } }
     }
+
   }
 }
 "#;
@@ -24945,6 +27391,110 @@ mission "nested-work" state="ready" {
         assert_eq!(parent.claimant.as_deref(), Some("agent/node.worker"));
         assert_eq!(parent.claim_incarnation.as_deref(), Some("current"));
         assert!(parent.claim_expires_at_unix_ms.unwrap() > now_ms());
+    }
+
+    #[test]
+    fn routine_lease_renewal_updates_local_projection_without_replica_envelope() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("renewal.sqlite3");
+        let store = Store::open(&path, "node").unwrap();
+        let source = "version 2\nmission \"renewal\" state=\"ready\" { goal \"Hold work.\"; step \"work\" { assigned-to \"agent/node.worker\" } }";
+        let intent = crate::graph::parse_test_intent(source, "node").unwrap();
+        let plan = store
+            .mission(
+                &intent,
+                IntentInput {
+                    kdl: source.into(),
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        store
+            .apply(&intent, &plan.subject_tokens, "renewal-mission")
+            .unwrap();
+        let run = store
+            .create_mission_run(&MissionRunRequest {
+                mission: "renewal".into(),
+                revision: None,
+                workspace: "/tmp".into(),
+                requester: Some("person/test".into()),
+                mode: Some("run".into()),
+                inputs: BTreeMap::new(),
+                idempotency_key: "renewal-run".into(),
+            })
+            .unwrap();
+        let subject = &run.steps[0].subject;
+        store.set_step_state(subject, "ready", None).unwrap();
+        let request = |key: &str| WorkRequest {
+            actor: Some("agent/node.worker".into()),
+            incarnation: Some("current".into()),
+            summary: None,
+            reason: None,
+            evidence: Vec::new(),
+            idempotency_key: key.into(),
+        };
+        let claimed = store
+            .work_action(subject, "claim", &request("renewal-claim"))
+            .unwrap();
+        let inventory_before = store.replication_inventory().unwrap().envelopes.len();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let renewed = store
+            .work_action(subject, "renew", &request("renewal-first"))
+            .unwrap();
+        assert!(renewed.claim_expires_at_unix_ms > claimed.claim_expires_at_unix_ms);
+        assert_eq!(
+            store.replication_inventory().unwrap().envelopes.len(),
+            inventory_before
+        );
+        assert!(
+            store
+                .claims_for(subject, Some("work.renewed"))
+                .unwrap()
+                .is_empty()
+        );
+        let replica = Store::open_memory("replica").unwrap();
+        let exchange = exchange_from(&store, &ReplicationInventory::default());
+        receive_and_project(&replica, "node", &exchange);
+        let remote_expiry = replica
+            .step_run(subject)
+            .unwrap()
+            .unwrap()
+            .claim_expires_at_unix_ms
+            .unwrap();
+        assert_eq!(Some(remote_expiry), claimed.claim_expires_at_unix_ms);
+        assert!(remote_expiry > now_ms() + 300_000);
+        assert!(store.project_replication_backlog().unwrap());
+        assert_eq!(
+            store
+                .step_run(subject)
+                .unwrap()
+                .unwrap()
+                .claim_expires_at_unix_ms,
+            renewed.claim_expires_at_unix_ms,
+            "a projection replay must retain the local renewal"
+        );
+        drop(store);
+        let reopened = Store::open(&path, "node").unwrap();
+        assert_eq!(
+            reopened
+                .step_run(subject)
+                .unwrap()
+                .unwrap()
+                .claim_expires_at_unix_ms,
+            renewed.claim_expires_at_unix_ms
+        );
+        let before_material = reopened.replication_inventory().unwrap().envelopes.len();
+        let mut material = request("renewal-material");
+        material.summary = Some("Made progress on the review".into());
+        reopened.work_action(subject, "renew", &material).unwrap();
+        assert_eq!(
+            reopened.replication_inventory().unwrap().envelopes.len(),
+            before_material + 1
+        );
+        assert_eq!(
+            reopened.claims_for(subject, Some("work.renewed")).unwrap()[0].body["fields"]["summary"],
+            "Made progress on the review"
+        );
     }
 
     #[test]
@@ -25074,6 +27624,463 @@ mission "retry" state="ready" {
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
         assert_eq!(attempts, [1, 2]);
+    }
+
+    const TAKEOVER_SOURCE: &str = r#"version 2
+
+mission "takeover" state="ready" {
+  goal "Take over one service."
+  step "prepare" { }
+  step "deploy-check" { depends-on { step "prepare" completed } }
+  step "smoke-check" { depends-on { step "prepare" completed } }
+  step "announce" { depends-on { step "deploy-check" completed } }
+  finally { step "report" { agentless } }
+}
+"#;
+
+    fn publish_takeover(store: &Store, source: &str, key: &str) -> MissionSpec {
+        let intent = parse_intent(source, "node").unwrap();
+        let planned = store
+            .mission(
+                &intent,
+                IntentInput {
+                    kdl: source.into(),
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        store.apply(&intent, &planned.subject_tokens, key).unwrap();
+        intent.missions["takeover"].clone()
+    }
+
+    fn takeover_step<'a>(run: &'a MissionRunView, path: &str) -> &'a StepRunView {
+        run.steps.iter().find(|step| step.step == path).unwrap()
+    }
+
+    /// Fail the takeover run the way the reconciler does: the failed steps cancel the rest of the
+    /// normal work, the final step runs, and cleanup makes the run terminal.
+    fn failed_takeover_run(store: &Store, failed: &[&str]) -> MissionRunView {
+        publish_takeover(store, TAKEOVER_SOURCE, "takeover-mission");
+        let run = store
+            .create_mission_run(&MissionRunRequest {
+                mission: "takeover".into(),
+                revision: None,
+                workspace: "/tmp".into(),
+                requester: Some("person/requester".into()),
+                mode: Some("run".into()),
+                inputs: BTreeMap::new(),
+                idempotency_key: "takeover-run".into(),
+            })
+            .unwrap();
+        store
+            .set_step_state(&takeover_step(&run, "prepare").subject, "completed", None)
+            .unwrap();
+        for path in failed {
+            store
+                .set_step_state(
+                    &takeover_step(&run, path).subject,
+                    "failed",
+                    Some("the check failed"),
+                )
+                .unwrap();
+        }
+        for path in ["deploy-check", "smoke-check", "announce"] {
+            if !failed.contains(&path) {
+                store
+                    .set_step_state(
+                        &takeover_step(&run, path).subject,
+                        "cancelled",
+                        Some("another step failed"),
+                    )
+                    .unwrap();
+            }
+        }
+        store
+            .set_mission_run_state(&run.id, "running", "final", Some("a normal step failed"))
+            .unwrap();
+        store
+            .set_step_state(&takeover_step(&run, "report").subject, "completed", None)
+            .unwrap();
+        store
+            .set_mission_run_state(
+                &run.id,
+                "running",
+                "cleanup-failed",
+                Some("one or more mission steps failed"),
+            )
+            .unwrap();
+        store
+            .set_mission_run_state(&run.id, "failed", "terminal", None)
+            .unwrap();
+        let run = store.mission_run(&run.id).unwrap().unwrap();
+        assert_eq!(
+            (run.status.as_str(), run.phase.as_str()),
+            ("failed", "terminal")
+        );
+        run
+    }
+
+    #[test]
+    fn retrying_the_only_failed_step_reopens_its_failed_run() {
+        let store = Store::open_memory("node").unwrap();
+        let failed = failed_takeover_run(&store, &["deploy-check"]);
+        let old_check = takeover_step(&failed, "deploy-check").subject.clone();
+
+        let reopened = store
+            .retry_failed_step(
+                &old_check,
+                "person/operator",
+                "the deploy check host is back",
+                "retry-deploy-check",
+            )
+            .unwrap();
+
+        assert_eq!(
+            (reopened.status.as_str(), reopened.phase.as_str()),
+            ("running", "normal")
+        );
+        assert_ne!(reopened.generation, failed.generation);
+        assert_eq!(reopened.revision, failed.revision);
+        let state = |path| {
+            let step = takeover_step(&reopened, path);
+            (step.status.as_str(), step.attempt)
+        };
+        assert_eq!(state("prepare"), ("completed", 1));
+        assert_eq!(state("deploy-check"), ("pending", 2));
+        assert_eq!(state("smoke-check"), ("pending", 1));
+        assert_eq!(state("announce"), ("pending", 1));
+        assert_eq!(state("report"), ("pending", 1));
+        let generations = store.run_generations(&failed.id).unwrap();
+        assert_eq!(
+            generations
+                .iter()
+                .find(|generation| generation.subject == failed.generation)
+                .unwrap()
+                .status,
+            "superseded"
+        );
+
+        let repeated = store
+            .retry_failed_step(
+                &old_check,
+                "person/operator",
+                "the deploy check host is back",
+                "retry-deploy-check",
+            )
+            .unwrap();
+        assert_eq!(repeated.generation, reopened.generation);
+        let stale = store
+            .retry_failed_step(&old_check, "person/operator", "again", "retry-stale")
+            .unwrap_err();
+        assert_eq!(stale.code, "stale-run-generation");
+    }
+
+    #[test]
+    fn a_failed_run_does_not_reopen_for_one_of_several_failures() {
+        let store = Store::open_memory("node").unwrap();
+        let failed = failed_takeover_run(&store, &["deploy-check", "smoke-check"]);
+
+        let error = store
+            .retry_failed_step(
+                &takeover_step(&failed, "deploy-check").subject,
+                "person/operator",
+                "retry one check",
+                "retry-one-of-two",
+            )
+            .unwrap_err();
+
+        assert_eq!(error.code, "mission-run-not-reopenable");
+        assert!(
+            error.message.contains("step `smoke-check` also failed"),
+            "{}",
+            error.message
+        );
+        let run = store.mission_run(&failed.id).unwrap().unwrap();
+        assert_eq!(
+            (run.status.as_str(), run.generation.as_str()),
+            ("failed", failed.generation.as_str())
+        );
+    }
+
+    #[test]
+    fn a_failed_run_with_work_cancelled_for_another_reason_does_not_reopen() {
+        let store = Store::open_memory("node").unwrap();
+        publish_takeover(&store, TAKEOVER_SOURCE, "takeover-mission");
+        let run = store
+            .create_mission_run(&MissionRunRequest {
+                mission: "takeover".into(),
+                revision: None,
+                workspace: "/tmp".into(),
+                requester: Some("person/requester".into()),
+                mode: Some("run".into()),
+                inputs: BTreeMap::new(),
+                idempotency_key: "takeover-run".into(),
+            })
+            .unwrap();
+        let check = takeover_step(&run, "deploy-check").subject.clone();
+        store
+            .set_step_state(&check, "failed", Some("the check failed"))
+            .unwrap();
+        store
+            .set_mission_run_state(
+                &run.id,
+                "running",
+                "cleanup-failed",
+                Some("the mission timeout expired after 50ms"),
+            )
+            .unwrap();
+        store
+            .set_mission_run_state(&run.id, "failed", "terminal", None)
+            .unwrap();
+
+        let error = store
+            .retry_failed_step(&check, "person/operator", "retry", "retry-timeout")
+            .unwrap_err();
+
+        assert_eq!(error.code, "mission-run-not-reopenable");
+        assert!(
+            error
+                .message
+                .contains("was cancelled: the mission timeout expired"),
+            "{}",
+            error.message
+        );
+    }
+
+    #[test]
+    fn an_active_run_retries_a_failed_step_in_place() {
+        let store = Store::open_memory("node").unwrap();
+        publish_takeover(&store, TAKEOVER_SOURCE, "takeover-mission");
+        let run = store
+            .create_mission_run(&MissionRunRequest {
+                mission: "takeover".into(),
+                revision: None,
+                workspace: "/tmp".into(),
+                requester: Some("person/requester".into()),
+                mode: Some("run".into()),
+                inputs: BTreeMap::new(),
+                idempotency_key: "takeover-run".into(),
+            })
+            .unwrap();
+        let check = takeover_step(&run, "deploy-check").subject.clone();
+        store
+            .set_step_state(&check, "failed", Some("the check failed"))
+            .unwrap();
+
+        let retried = store
+            .retry_failed_step(
+                &check,
+                "person/operator",
+                "retry the check",
+                "retry-in-place",
+            )
+            .unwrap();
+
+        assert_eq!(retried.generation, run.generation);
+        let step = takeover_step(&retried, "deploy-check");
+        assert_eq!((step.status.as_str(), step.attempt), ("pending", 2));
+        let claim = store
+            .latest_claim(&check, Some("step-run.retried"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(claim.actor.as_deref(), Some("person/operator"));
+        let error = store
+            .retry_failed_step(&check, "person/operator", "again", "retry-pending")
+            .unwrap_err();
+        assert_eq!(error.code, "work-not-failed");
+    }
+
+    #[test]
+    fn revising_a_failed_run_reopens_it_and_retries_each_failed_step() {
+        let store = Store::open_memory("node").unwrap();
+        let failed = failed_takeover_run(&store, &["deploy-check", "smoke-check"]);
+        let revised = publish_takeover(
+            &store,
+            &TAKEOVER_SOURCE.replace(
+                r#"step "smoke-check" { depends-on"#,
+                r#"step "smoke-check" { goal "Probe the new health endpoint."; depends-on"#,
+            ),
+            "takeover-revision",
+        );
+
+        let reopened = store
+            .adopt_mission_revision(
+                &failed.id,
+                &revised,
+                "person/requester",
+                "the smoke check probes the new endpoint",
+                "revise-failed-takeover",
+            )
+            .unwrap();
+
+        assert_eq!(
+            (reopened.status.as_str(), reopened.phase.as_str()),
+            ("running", "normal")
+        );
+        assert_eq!(reopened.revision, revised.revision);
+        let state = |path| {
+            let step = takeover_step(&reopened, path);
+            (step.status.as_str(), step.attempt)
+        };
+        assert_eq!(state("prepare"), ("completed", 1));
+        assert_eq!(state("deploy-check"), ("pending", 2));
+        assert_eq!(state("smoke-check"), ("pending", 1));
+        assert_eq!(state("announce"), ("pending", 1));
+        assert_eq!(state("report"), ("pending", 1));
+    }
+
+    #[test]
+    fn replication_carries_a_reopened_failed_run() {
+        let source = Store::open_memory("source").unwrap();
+        let failed = failed_takeover_run(&source, &["deploy-check"]);
+        let target = Store::open_memory("target").unwrap();
+        target
+            .import_replication("source", &source.export_replication(0).unwrap())
+            .unwrap();
+        assert_eq!(
+            target.mission_run(&failed.id).unwrap().unwrap().status,
+            "failed"
+        );
+
+        let reopened = source
+            .retry_failed_step(
+                &takeover_step(&failed, "deploy-check").subject,
+                "person/operator",
+                "the deploy check host is back",
+                "retry-replicated",
+            )
+            .unwrap();
+        target
+            .import_replication(
+                "source",
+                &source
+                    .export_replication_for_heads(&target.replica_heads().unwrap())
+                    .unwrap(),
+            )
+            .unwrap();
+
+        let replicated = target.mission_run(&failed.id).unwrap().unwrap();
+        assert_eq!(
+            (replicated.status.as_str(), replicated.phase.as_str()),
+            ("running", "normal")
+        );
+        assert_eq!(replicated.generation, reopened.generation);
+        let states = |run: &MissionRunView| {
+            run.steps
+                .iter()
+                .map(|step| (step.step.clone(), step.status.clone(), step.attempt))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(states(&replicated), states(&reopened));
+    }
+
+    #[test]
+    fn step_views_carry_the_current_attempts_progress_and_completion_summaries() {
+        let store = Store::open_memory("node").unwrap();
+        let source = r#"version 2
+
+agent "worker" { workspace "/tmp"; command "true" }
+
+mission "summaries" state="ready" {
+  goal "Show what the worker reported."
+  step "work" {
+    assigned-to "agent/worker"
+    retry { attempts 2 }
+    gate "the result is ready" { exists "resource/result" }
+  }
+}
+"#;
+        let intent = crate::graph::parse_test_intent(source, "node").unwrap();
+        let planned = store
+            .mission(
+                &intent,
+                IntentInput {
+                    kdl: source.into(),
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        store
+            .apply(&intent, &planned.subject_tokens, "summaries-mission")
+            .unwrap();
+        let run = store
+            .create_mission_run(&MissionRunRequest {
+                mission: "summaries".into(),
+                revision: None,
+                workspace: "/tmp".into(),
+                requester: Some("person/test".into()),
+                mode: Some("run".into()),
+                inputs: BTreeMap::new(),
+                idempotency_key: "summaries-run".into(),
+            })
+            .unwrap();
+        let subject = &run.steps[0].subject;
+        let request = |key: &str, summary: Option<&str>| WorkRequest {
+            actor: Some("agent/node.worker".into()),
+            incarnation: Some("current".into()),
+            summary: summary.map(str::to_owned),
+            reason: None,
+            evidence: Vec::new(),
+            idempotency_key: key.into(),
+        };
+
+        store.set_step_state(subject, "ready", None).unwrap();
+        let claimed = store
+            .work_action(subject, "claim", &request("claim-1", Some("Starting")))
+            .unwrap();
+        assert_eq!(claimed.progress_summary, None, "a claim is not progress");
+        let fresh = serde_json::to_value(&claimed).unwrap();
+        for field in [
+            "progress_summary",
+            "progress_at_unix_ms",
+            "completion_summary",
+        ] {
+            assert!(
+                fresh.get(field).is_none(),
+                "{field} is absent until reported"
+            );
+        }
+        for (key, summary) in [
+            ("progress-1", Some("Reading the renderer")),
+            ("progress-2", Some("  Tests pass\n")),
+            ("progress-3", None),
+        ] {
+            store
+                .work_action(subject, "progress", &request(key, summary))
+                .unwrap();
+        }
+        let working = store.step_run(subject).unwrap().unwrap();
+        assert_eq!(working.progress_summary.as_deref(), Some("Tests pass"));
+        assert!(working.progress_at_unix_ms.is_some());
+        assert_eq!(working.completion_summary, None);
+
+        store
+            .work_action(
+                subject,
+                "complete",
+                &request("complete-1", Some("Opened the pull request")),
+            )
+            .unwrap();
+        let shown = store.mission_run(&run.subject).unwrap().unwrap();
+        let submitted = &shown.steps[0];
+        assert_eq!(submitted.status, "verifying");
+        assert_eq!(submitted.progress_summary.as_deref(), Some("Tests pass"));
+        assert_eq!(
+            submitted.completion_summary.as_deref(),
+            Some("Opened the pull request")
+        );
+
+        store
+            .set_step_state(subject, "failed", Some("the gate failed"))
+            .unwrap();
+        store.retry_step(subject, "retry attempt 2", 0).unwrap();
+        let retried = store.step_run(subject).unwrap().unwrap();
+        assert_eq!(retried.attempt, 2);
+        assert_eq!(
+            retried.progress_summary, None,
+            "attempt 1 progress is stale"
+        );
+        assert_eq!(retried.completion_summary, None);
     }
 
     #[test]
@@ -25420,7 +28427,7 @@ version 2
             .iter()
             .map(|step| (step.step.as_str(), step.status.as_str()))
             .collect::<BTreeMap<_, _>>();
-        assert_eq!(states["active"], "ready");
+        assert_eq!(states["active"], "working");
         assert_eq!(states["stable"], "completed");
         assert_eq!(states["changed"], "pending");
         assert_eq!(states["dependent"], "pending");
@@ -25430,8 +28437,19 @@ version 2
                 .iter()
                 .all(|step| step.generation == revised.generation)
         );
+        let carried = revised
+            .steps
+            .iter()
+            .find(|step| step.step == "active")
+            .unwrap();
+        assert_eq!(carried.claimant.as_deref(), Some(worker.as_str()));
+        assert_eq!(carried.claim_incarnation.as_deref(), Some("worker-one"));
+        let stranger = WorkRequest {
+            actor: Some(format!("agent/{}/stranger", run.id)),
+            ..request("stale-generation-complete")
+        };
         let error = store
-            .work_action(&active, "complete", &request("stale-generation-complete"))
+            .work_action(&active, "complete", &stranger)
             .unwrap_err();
         assert_eq!(error.code, "stale-run-generation");
         assert!(!store.set_step_state(&active, "completed", None).unwrap());
@@ -25439,6 +28457,11 @@ version 2
             store.step_run(&active).unwrap().unwrap().status,
             "cancelled"
         );
+        let submitted = store
+            .work_action(&active, "complete", &request("carried-complete"))
+            .unwrap();
+        assert_eq!(submitted.subject, carried.subject);
+        assert_eq!(submitted.status, "verifying");
         let retried = store
             .adopt_mission_revision(
                 &run.id,
@@ -25518,6 +28541,177 @@ version 2
             )
             .unwrap_err();
         assert_eq!(error.code, "revision-outside-graph-location");
+    }
+
+    const CARRY_SOURCE: &str = r#"
+version 2
+
+  mission "carry" state="ready" {
+    goal "Keep claimed work across a revision."
+    step "work" { assigned-to "agent/worker"; goal "Do the claimed work." }
+    step "other" { assigned-to "agent/worker"; goal "Use the first goal." }
+  }
+
+"#;
+
+    fn publish_carry(store: &Store, source: &str, key: &str) -> MissionSpec {
+        let intent = crate::graph::parse_test_intent(source, "node").unwrap();
+        let planned = store
+            .mission(
+                &intent,
+                IntentInput {
+                    kdl: source.into(),
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        store.apply(&intent, &planned.subject_tokens, key).unwrap();
+        intent.missions["carry"].clone()
+    }
+
+    fn carry_request(incarnation: &str, key: &str) -> WorkRequest {
+        WorkRequest {
+            actor: Some("agent/node.worker".into()),
+            incarnation: Some(incarnation.into()),
+            summary: None,
+            reason: None,
+            evidence: Vec::new(),
+            idempotency_key: key.into(),
+        }
+    }
+
+    #[test]
+    fn a_person_can_revise_a_run_from_outside_its_graph_location() {
+        let store = Store::open_memory("node").unwrap();
+        publish_carry(&store, CARRY_SOURCE, "carry-one");
+        let run = store
+            .create_mission_run(&MissionRunRequest {
+                mission: "carry".into(),
+                revision: None,
+                workspace: "/tmp".into(),
+                requester: Some("person/requester".into()),
+                mode: Some("run".into()),
+                inputs: BTreeMap::new(),
+                idempotency_key: "carry-run".into(),
+            })
+            .unwrap();
+        let revised = publish_carry(
+            &store,
+            &CARRY_SOURCE.replace("Use the first goal.", "Use the second goal."),
+            "carry-two",
+        );
+
+        let agent = store
+            .adopt_mission_revision(
+                &run.id,
+                &revised,
+                "agent/node.worker",
+                "an assigned agent does not own the mission",
+                "agent-revision",
+            )
+            .unwrap_err();
+        assert_eq!(agent.code, "revision-outside-graph-location");
+        let adopted = store
+            .adopt_mission_revision(
+                &run.id,
+                &revised,
+                "person/operator",
+                "an operator corrects the goal",
+                "person-revision",
+            )
+            .unwrap();
+        assert_eq!(adopted.revision, revised.revision);
+    }
+
+    #[test]
+    fn a_revision_keeps_the_claim_on_a_carried_step() {
+        let store = Store::open_memory("node").unwrap();
+        publish_carry(&store, CARRY_SOURCE, "carry-one");
+        let run = store
+            .create_mission_run(&MissionRunRequest {
+                mission: "carry".into(),
+                revision: None,
+                workspace: "/tmp".into(),
+                requester: Some("person/requester".into()),
+                mode: Some("run".into()),
+                inputs: BTreeMap::new(),
+                idempotency_key: "carry-run".into(),
+            })
+            .unwrap();
+        let step = |run: &MissionRunView, path: &str| {
+            run.steps
+                .iter()
+                .find(|step| step.step == path)
+                .unwrap()
+                .clone()
+        };
+        let old = step(&run, "work").subject;
+        store.set_step_state(&old, "ready", None).unwrap();
+        store
+            .work_action(&old, "claim", &carry_request("one", "carry-claim"))
+            .unwrap();
+        let revised = publish_carry(
+            &store,
+            &CARRY_SOURCE.replace("Use the first goal.", "Use the second goal."),
+            "carry-two",
+        );
+
+        let adopted = store
+            .adopt_mission_revision(
+                &run.id,
+                &revised,
+                "person/requester",
+                "the other step needs a second goal",
+                "carry-revision",
+            )
+            .unwrap();
+
+        let carried = step(&adopted, "work");
+        assert_ne!(carried.subject, old);
+        assert_eq!(
+            (
+                carried.status.as_str(),
+                carried.claimant.as_deref(),
+                carried.claim_incarnation.as_deref()
+            ),
+            ("claimed", Some("agent/node.worker"), Some("one"))
+        );
+        assert!(carried.claim_expires_at_unix_ms.is_some());
+        assert_eq!(step(&adopted, "other").status, "pending");
+
+        let target = Store::open_memory("target").unwrap();
+        target
+            .import_replication("node", &store.export_replication(0).unwrap())
+            .unwrap();
+        let replicated = target.step_run(&carried.subject).unwrap().unwrap();
+        assert_eq!(
+            (
+                replicated.status.as_str(),
+                replicated.claimant.as_deref(),
+                replicated.claim_incarnation.as_deref(),
+                replicated.claim_expires_at_unix_ms
+            ),
+            (
+                "claimed",
+                Some("agent/node.worker"),
+                Some("one"),
+                carried.claim_expires_at_unix_ms
+            )
+        );
+
+        let other_incarnation = store
+            .work_action(&old, "progress", &carry_request("two", "carry-other"))
+            .unwrap_err();
+        assert_eq!(other_incarnation.code, "wrong-work-incarnation");
+        let reclaim = store
+            .work_action(&old, "claim", &carry_request("one", "carry-reclaim"))
+            .unwrap_err();
+        assert_eq!(reclaim.code, "stale-run-generation");
+        let submitted = store
+            .work_action(&old, "complete", &carry_request("one", "carry-complete"))
+            .unwrap();
+        assert_eq!(submitted.subject, carried.subject);
+        assert_eq!(submitted.status, "verifying");
     }
 
     #[test]
@@ -27145,6 +30339,335 @@ mission "review-current" state="ready" revision-cutover="restart-active" {{
         assert!(store.pending_human_reviews(None).unwrap().is_empty());
     }
 
+    fn request_fault(store: &Store, subject: &str, targets: &[&str]) {
+        store
+            .request_attention(
+                subject,
+                &AttentionRequest {
+                    reviewer: "person/nathan".into(),
+                    title: format!("Fault {subject}"),
+                    reason: "a person must decide".into(),
+                    severity: "warning".into(),
+                    targets: targets.iter().map(|target| (*target).to_owned()).collect(),
+                    actor: "agent/node.requester".into(),
+                    idempotency_key: format!("{subject}:requested"),
+                },
+            )
+            .unwrap();
+    }
+
+    fn fault_is_current(store: &Store, subject: &str) -> bool {
+        store
+            .attention_items(Some("person/nathan"))
+            .unwrap()
+            .iter()
+            .any(|item| item.kind == "fault" && item.subject == subject)
+    }
+
+    fn start_agentless_run(store: &Store, mission: &str) -> MissionRunView {
+        publish_mission(
+            store,
+            &format!(
+                r#"version 2
+mission "{mission}" state="ready" {{
+  goal "Hold a gate."
+  step "approval" {{ goal "Approve it."; agentless }}
+}}"#
+            ),
+            &format!("{mission}-publish"),
+        );
+        store
+            .create_mission_run(&MissionRunRequest {
+                mission: mission.into(),
+                revision: None,
+                workspace: ".".into(),
+                requester: Some("person/nathan".into()),
+                mode: Some("run".into()),
+                inputs: BTreeMap::new(),
+                idempotency_key: format!("{mission}-run"),
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn attention_whose_mission_target_is_cancelled_after_the_request_is_not_current() {
+        let store = Store::open_memory("node").unwrap();
+        let run = start_agentless_run(&store, "typecase");
+        request_fault(&store, "attention/typecase", &["mission/typecase"]);
+        assert!(fault_is_current(&store, "attention/typecase"));
+
+        store
+            .set_mission_run_state(&run.id, "cancelled", "terminal", Some("moved to a seat"))
+            .unwrap();
+
+        assert!(!fault_is_current(&store, "attention/typecase"));
+        assert_eq!(
+            store
+                .attention_request("attention/typecase")
+                .unwrap()
+                .unwrap()
+                .status,
+            "pending",
+            "a request that is no longer current is not resolved on its own"
+        );
+    }
+
+    #[test]
+    fn attention_whose_attention_targets_are_all_closed_is_not_current() {
+        let store = Store::open_memory("node").unwrap();
+        let run = start_agentless_run(&store, "pull-request-review");
+        let step = run.steps[0].clone();
+        store
+            .append_claim(&ClaimInput {
+                subject: "gate-operation/pull-request-review/approval".into(),
+                kind: "gate.requested".into(),
+                actor: None,
+                fields: BTreeMap::from([
+                    ("owner".into(), Value::String(step.subject.clone())),
+                    ("reviewer".into(), Value::String("person/nathan".into())),
+                    ("question".into(), Value::String("Approve it?".into())),
+                    ("review_targets".into(), Value::Array(Vec::new())),
+                    (
+                        "operation".into(),
+                        Value::String("gate-operation/pull-request-review/approval".into()),
+                    ),
+                    (
+                        "mission_revision".into(),
+                        Value::String(run.revision.clone()),
+                    ),
+                    (
+                        "step_definition".into(),
+                        Value::String(step.definition_hash.clone()),
+                    ),
+                    ("attempt".into(), Value::from(step.attempt)),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some("pull-request-review-gate".into()),
+            })
+            .unwrap();
+        // The client names a human gate by a digest of its owner.
+        let gate = format!(
+            "attention/{}",
+            &hex::encode(Sha256::digest(step.subject.as_bytes()))[..24]
+        );
+        request_fault(&store, "attention/other-review", &["resource/review"]);
+        request_fault(
+            &store,
+            "attention/shared-review",
+            &[&gate, "attention/other-review", "resource/review"],
+        );
+        assert!(fault_is_current(&store, "attention/shared-review"));
+
+        store
+            .resolve_attention(
+                "attention/other-review",
+                &AttentionResolveRequest {
+                    outcome: "resolved".into(),
+                    reason: None,
+                    actor: "person/nathan".into(),
+                    idempotency_key: "other-review-resolved".into(),
+                },
+            )
+            .unwrap();
+        assert!(
+            fault_is_current(&store, "attention/shared-review"),
+            "the gate it names is still pending"
+        );
+
+        store
+            .set_step_state(&step.subject, "completed", None)
+            .unwrap();
+        assert!(!fault_is_current(&store, "attention/shared-review"));
+    }
+
+    #[test]
+    fn attention_raised_after_its_run_failed_stays_current() {
+        let store = Store::open_memory("node").unwrap();
+        let run = start_agentless_run(&store, "crate-experiments");
+        store
+            .set_mission_run_state(&run.id, "failed", "terminal", Some("the gate failed"))
+            .unwrap();
+        request_fault(&store, "attention/post-mortem", &[&run.subject]);
+
+        assert!(fault_is_current(&store, "attention/post-mortem"));
+        assert!(
+            !store
+                .operational_repair_plan()
+                .unwrap()
+                .items
+                .iter()
+                .any(|item| item.class == "superseded-attention")
+        );
+    }
+
+    #[test]
+    fn attention_whose_agent_target_moved_on_is_not_current() {
+        let store = Store::open_memory("node").unwrap();
+        let observe = |agent: &str, incarnation: &str| {
+            store
+                .append_claim(&ClaimInput {
+                    subject: agent.into(),
+                    kind: "runtime.observed".into(),
+                    actor: None,
+                    fields: BTreeMap::from([
+                        ("status".into(), Value::String("running".into())),
+                        ("incarnation_id".into(), Value::String(incarnation.into())),
+                    ]),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: Some(format!("{incarnation}-running")),
+                })
+                .unwrap();
+            store
+                .append_claim(&ClaimInput {
+                    subject: agent.into(),
+                    kind: "harness.observed".into(),
+                    actor: Some(agent.into()),
+                    fields: BTreeMap::from([
+                        ("state".into(), Value::String("idle".into())),
+                        ("incarnation_id".into(), Value::String(incarnation.into())),
+                    ]),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: Some(format!("{incarnation}-idle")),
+                })
+                .unwrap();
+        };
+        observe("agent/node.seat", "seat-one");
+        request_fault(&store, "attention/seat", &["agent/node.seat"]);
+        request_fault(&store, "attention/retired", &["agent/node.retired"]);
+        assert!(
+            fault_is_current(&store, "attention/seat"),
+            "the incarnation that was ready at the request is not a recovery"
+        );
+
+        observe("agent/node.seat", "seat-two");
+        let source = "version 2\nstop \"agent/node.retired\"\n";
+        let intent = crate::graph::parse_intent(source, "node").unwrap();
+        let planned = store
+            .mission(
+                &intent,
+                IntentInput {
+                    kdl: source.into(),
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        store
+            .apply(&intent, &planned.subject_tokens, "retired-stop")
+            .unwrap();
+
+        assert!(!fault_is_current(&store, "attention/seat"));
+        assert!(!fault_is_current(&store, "attention/retired"));
+    }
+
+    #[test]
+    fn attention_target_states_describe_each_target_with_a_lifecycle() {
+        let store = Store::open_memory("node").unwrap();
+        publish_mission(
+            &store,
+            r#"version 2
+mission "typecase" state="ready" {
+  goal "Publish a revision."
+  step "publish" { goal "Publish it."; agentless }
+}"#,
+            "typecase-publish",
+        );
+        let run = store
+            .create_mission_run(&MissionRunRequest {
+                mission: "typecase".into(),
+                revision: None,
+                workspace: ".".into(),
+                requester: Some("person/nathan".into()),
+                mode: Some("run".into()),
+                inputs: BTreeMap::new(),
+                idempotency_key: "typecase-run".into(),
+            })
+            .unwrap();
+        let request = AttentionRequest {
+            reviewer: "person/nathan".into(),
+            title: "Another fault".into(),
+            reason: "a person must decide".into(),
+            severity: "warning".into(),
+            targets: Vec::new(),
+            actor: "agent/node.requester".into(),
+            idempotency_key: "other-fault".into(),
+        };
+        store
+            .request_attention("attention/other-fault", &request)
+            .unwrap();
+        let targets = [
+            "mission/typecase",
+            run.subject.as_str(),
+            "attention/other-fault",
+            "resource/typecase/kdl",
+            "agent/node.stopped",
+        ]
+        .map(str::to_owned);
+        let states = |store: &Store| {
+            store
+                .attention_target_states(&targets)
+                .unwrap()
+                .into_iter()
+                .map(|state| (state.id, state.state))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            states(&store),
+            [
+                ("mission/typecase".into(), "running".into()),
+                (run.subject.clone(), "running".into()),
+                ("attention/other-fault".into(), "open".into()),
+            ]
+        );
+
+        store
+            .set_mission_run_state(&run.id, "cancelled", "terminal", Some("moved to a seat"))
+            .unwrap();
+        store
+            .withdraw_attention(
+                "attention/other-fault",
+                &AttentionWithdrawRequest {
+                    reason: "cleared".into(),
+                    actor: "agent/node.requester".into(),
+                    idempotency_key: "other-fault-withdrawn".into(),
+                },
+            )
+            .unwrap();
+        let source = "version 2\nstop \"agent/node.stopped\"\n";
+        let intent = crate::graph::parse_intent(source, "node").unwrap();
+        let planned = store
+            .mission(
+                &intent,
+                IntentInput {
+                    kdl: source.into(),
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        store
+            .apply(&intent, &planned.subject_tokens, "stopped-agent")
+            .unwrap();
+
+        assert_eq!(
+            states(&store),
+            [
+                ("mission/typecase".into(), "cancelled".into()),
+                (run.subject.clone(), "cancelled".into()),
+                ("attention/other-fault".into(), "withdrawn".into()),
+                ("agent/node.stopped".into(), "stopped".into()),
+            ]
+        );
+        assert!(
+            store
+                .attention_target_states(&targets)
+                .unwrap()
+                .iter()
+                .all(|state| state.since_unix_ms.is_some())
+        );
+    }
+
     #[test]
     fn explicit_attention_is_idempotent_authorized_and_terminal() {
         let store = Store::open_memory("node").unwrap();
@@ -27206,6 +30729,56 @@ mission "review-current" state="ready" revision-cutover="restart-active" {{
             .resolve_attention(&first.subject, &resolution)
             .unwrap();
         assert_eq!(retry.resolved_at_unix_ms, closed.resolved_at_unix_ms);
+    }
+
+    #[test]
+    fn attention_until_needs_a_known_condition_and_a_target() {
+        let store = Store::open_memory("node").unwrap();
+        let request = |targets: Vec<String>, key: &str| AttentionRequest {
+            reviewer: "person/nathan".into(),
+            title: "Publish this revision".into(),
+            reason: "Publish the prepared revision as a person.".into(),
+            severity: "warning".into(),
+            targets,
+            actor: "agent/node.requester".into(),
+            idempotency_key: key.into(),
+        };
+        let target = vec!["mission-run/release".to_owned()];
+        let unknown = store
+            .request_attention_until(
+                "attention/unknown",
+                &request(target.clone(), "unknown"),
+                Some("published"),
+            )
+            .unwrap_err();
+        assert_eq!(unknown.code, "invalid-attention-until");
+        let untargeted = store
+            .request_attention_until(
+                "attention/untargeted",
+                &request(Vec::new(), "untargeted"),
+                Some("completed"),
+            )
+            .unwrap_err();
+        assert_eq!(untargeted.code, "invalid-attention-until");
+
+        let stored = store
+            .request_attention_until(
+                "attention/until",
+                &request(target, "until"),
+                Some("completed"),
+            )
+            .unwrap();
+        assert_eq!(stored.until.as_deref(), Some("completed"));
+        assert_eq!(
+            store.pending_attention_with_until("node").unwrap()[0].subject,
+            "attention/until"
+        );
+        assert!(
+            store
+                .pending_attention_with_until("other-host")
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

@@ -127,10 +127,21 @@
             "state": { "enum": ["open", "resolved"] },
             "requested_at": { "$ref": "#/$defs/Timestamp" },
             "targets": { "type": "array", "items": { "$ref": "#/$defs/Id" } },
+            "target_states": { "type": "array", "items": { "$ref": "#/$defs/AttentionTargetState" } },
             "actions": { "type": "array", "items": { "type": "string", "enum": ["attention.resolve", "review.approve", "review.reject", "launch.approve", "launch.cancel", "mission.approve-revision", "mission.cancel-revision", "message.read"] } }
           }
         }
       ]
+    },
+    "AttentionTargetState": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "state"],
+      "properties": {
+        "id": { "$ref": "#/$defs/Id" },
+        "state": { "type": "string" },
+        "since": { "$ref": "#/$defs/Timestamp" }
+      }
     },
     "Message": {
       "allOf": [
@@ -413,6 +424,7 @@
             "state": { "enum": ["draft", "ready", "running", "standing", "completed", "failed", "cancelled"] },
             "mission_revision": { "$ref": "#/$defs/Revision" },
             "runs": { "type": "array", "items": { "$ref": "#/$defs/Id" } },
+            "active_runs": { "type": "integer", "minimum": 0 },
             "run_generations": { "type": "object", "additionalProperties": { "$ref": "#/$defs/Id" } },
             "visualization": { "$ref": "#/$defs/Visualization" },
             "usage": { "oneOf": [{ "$ref": "#/$defs/UsageSummary" }, { "type": "null" }] }
@@ -461,6 +473,7 @@
             "owner_run_id": { "oneOf": [{ "$ref": "#/$defs/Id" }, { "type": "null" }] },
             "driver": { "type": ["string", "null"] },
             "harness_state": { "type": ["string", "null"] },
+            "fault": { "type": ["string", "null"], "description": "Current member reconcile failure; cleared by a successful pass." },
             "incarnation_id": { "type": ["string", "null"] },
             "current_session_id": { "type": ["string", "null"] },
             "current_work_ids": { "type": "array", "items": { "$ref": "#/$defs/Id" } },
@@ -508,7 +521,8 @@
         "joined_at": { "$ref": "#/$defs/Timestamp" },
         "claimed_work_ids": { "type": "array", "items": { "$ref": "#/$defs/Id" } },
         "ready_work_ids": { "type": "array", "items": { "$ref": "#/$defs/Id" } },
-        "waiting_work_ids": { "type": "array", "items": { "$ref": "#/$defs/Id" } }
+        "waiting_work_ids": { "type": "array", "items": { "$ref": "#/$defs/Id" } },
+        "waiting_for_run_id": { "oneOf": [{ "$ref": "#/$defs/Id" }, { "type": "null" }] }
       }
     },
     "AgentQueueMove": {

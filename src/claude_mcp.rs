@@ -123,7 +123,7 @@ fn run_named(
                     // driver correlates this exact immutable inbox filename before publishing
                     // `message.delivered`; writing MCP bytes alone is not a receipt.
                     let notice = match crate::ding::st3_message_reference(&msg) {
-                        Some(reference) => crate::ding::st3_notification_text(
+                        Some(reference) => crate::ding::st3_ping_text(
                             reference,
                             msg.from.as_deref().unwrap_or_default(),
                             msg.subject.as_deref(),
