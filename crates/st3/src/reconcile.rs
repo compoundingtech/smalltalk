@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -311,7 +311,28 @@ pub struct Reconciler<R = NativeRuntime> {
     observer_cursors: Arc<Mutex<HashMap<String, Option<String>>>>,
     delayed_restarts: Arc<Mutex<HashMap<String, u128>>>,
     file_watchers: Arc<Mutex<HashMap<String, notify::RecommendedWatcher>>>,
+    file_watchers_used: Arc<Mutex<HashSet<String>>>,
+    file_observations: Arc<Mutex<HashMap<String, FileStamp>>>,
     resource_provider: Arc<dyn ResourceProvider>,
+}
+
+#[derive(Clone, Eq, PartialEq)]
+struct FileStamp {
+    modified: Option<std::time::SystemTime>,
+    size: u64,
+    mode: u32,
+}
+
+impl FileStamp {
+    fn read(path: &Path) -> Option<Self> {
+        use std::os::unix::fs::PermissionsExt as _;
+        let metadata = std::fs::metadata(path).ok()?;
+        Some(Self {
+            modified: metadata.modified().ok(),
+            size: metadata.len(),
+            mode: metadata.permissions().mode() & 0o7777,
+        })
+    }
 }
 
 impl Reconciler<NativeRuntime> {
@@ -359,6 +380,8 @@ impl Reconciler<NativeRuntime> {
             observer_cursors: Arc::new(Mutex::new(HashMap::new())),
             delayed_restarts: Arc::new(Mutex::new(HashMap::new())),
             file_watchers: Arc::new(Mutex::new(HashMap::new())),
+            file_watchers_used: Arc::new(Mutex::new(HashSet::new())),
+            file_observations: Arc::new(Mutex::new(HashMap::new())),
             resource_provider: Arc::new(RegisteredResourceProvider),
         })
     }
@@ -381,6 +404,8 @@ impl<R: RuntimeControl> Reconciler<R> {
             observer_cursors: Arc::new(Mutex::new(HashMap::new())),
             delayed_restarts: Arc::new(Mutex::new(HashMap::new())),
             file_watchers: Arc::new(Mutex::new(HashMap::new())),
+            file_watchers_used: Arc::new(Mutex::new(HashSet::new())),
+            file_observations: Arc::new(Mutex::new(HashMap::new())),
             resource_provider: Arc::new(RegisteredResourceProvider),
         }
     }
@@ -798,7 +823,13 @@ impl<R: RuntimeControl> Reconciler<R> {
         self.reconcile_subscription_missions(&desired)?;
         self.reconcile_provider_capacity_retries(&desired)?;
         self.resolve_attention_for_retired_agents(&desired)?;
-        self.evaluate_mission_runs()?;
+        self.file_watchers_used
+            .lock()
+            .expect("file watcher mutex poisoned")
+            .clear();
+        let mission_result = self.evaluate_mission_runs();
+        self.release_unused_file_watchers();
+        mission_result?;
         // Mission state is the primary control-plane projection. Evaluate it before
         // wake-message bookkeeping so a large mailbox or work history cannot starve
         // newly-created runs of their first readiness pass.
@@ -7814,14 +7845,22 @@ impl<R: RuntimeControl> Reconciler<R> {
             return Ok(());
         }
         self.ensure_file_watch(subject, Path::new(path))?;
+        let before = FileStamp::read(Path::new(path));
+        if before.as_ref().is_some_and(|stamp| {
+            self.file_observations
+                .lock()
+                .expect("file observation mutex poisoned")
+                .get(subject)
+                == Some(stamp)
+        }) {
+            return Ok(());
+        }
         match std::fs::read(path) {
             Ok(bytes) => {
                 let blob_hash = self.store.put_blob(&bytes)?;
                 let content_hash = hex::encode(sha2::Sha256::digest(&bytes));
-                let mode = std::fs::metadata(path).ok().map(|metadata| {
-                    use std::os::unix::fs::PermissionsExt as _;
-                    metadata.permissions().mode() & 0o7777
-                });
+                let after = FileStamp::read(Path::new(path));
+                let mode = after.as_ref().map(|stamp| stamp.mode);
                 let mut fields = BTreeMap::from([
                     ("status".into(), Value::String("observed".into())),
                     ("path".into(), Value::String(path.into())),
@@ -7836,8 +7875,23 @@ impl<R: RuntimeControl> Reconciler<R> {
                     fields.insert("mode".into(), Value::from(mode));
                 }
                 self.record_once(subject, "file.observed", fields)?;
+                let mut observations = self
+                    .file_observations
+                    .lock()
+                    .expect("file observation mutex poisoned");
+                if before == after {
+                    if let Some(stamp) = after {
+                        observations.insert(subject.into(), stamp);
+                    }
+                } else {
+                    observations.remove(subject);
+                }
             }
             Err(error) => {
+                self.file_observations
+                    .lock()
+                    .expect("file observation mutex poisoned")
+                    .remove(subject);
                 self.record_once(
                     subject,
                     "file.observed",
@@ -7853,6 +7907,10 @@ impl<R: RuntimeControl> Reconciler<R> {
     }
 
     fn ensure_file_watch(&self, subject: &str, path: &Path) -> Result<()> {
+        self.file_watchers_used
+            .lock()
+            .expect("file watcher mutex poisoned")
+            .insert(subject.into());
         let mut watchers = self
             .file_watchers
             .lock()
@@ -7861,9 +7919,15 @@ impl<R: RuntimeControl> Reconciler<R> {
             return Ok(());
         }
         let notify = self.notify.clone();
+        let observations = self.file_observations.clone();
+        let watched_subject = subject.to_owned();
         let mut watcher =
             notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
                 if event.is_ok() {
+                    observations
+                        .lock()
+                        .expect("file observation mutex poisoned")
+                        .remove(&watched_subject);
                     notify.notify_one();
                 }
             })?;
@@ -7874,6 +7938,23 @@ impl<R: RuntimeControl> Reconciler<R> {
         watcher.watch(watched, notify::RecursiveMode::NonRecursive)?;
         watchers.insert(subject.into(), watcher);
         Ok(())
+    }
+
+    fn release_unused_file_watchers(&self) {
+        let used = std::mem::take(
+            &mut *self
+                .file_watchers_used
+                .lock()
+                .expect("file watcher mutex poisoned"),
+        );
+        self.file_watchers
+            .lock()
+            .expect("file watcher mutex poisoned")
+            .retain(|subject, _| used.contains(subject));
+        self.file_observations
+            .lock()
+            .expect("file observation mutex poisoned")
+            .retain(|subject, _| used.contains(subject));
     }
 }
 
@@ -10670,6 +10751,35 @@ version 2
             argv.first().map(Path::new),
             Some(std::env::current_exe().unwrap().as_path())
         );
+    }
+
+    #[test]
+    fn file_gate_watchers_are_released_without_active_gates() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("gate.txt");
+        std::fs::write(&path, "ready").unwrap();
+        let subject = format!("file/node:{}", path.display());
+        let reconciler = Reconciler::new(
+            store,
+            Arc::new(FakeRuntime::default()),
+            "node".into(),
+            Arc::new(Notify::new()),
+        );
+        reconciler.ensure_file_observation(&subject).unwrap();
+        assert_eq!(reconciler.file_watchers.lock().unwrap().len(), 1);
+        std::fs::write(&path, "updated and ready").unwrap();
+        reconciler.ensure_file_observation(&subject).unwrap();
+        assert_eq!(
+            reconciler
+                .store
+                .latest_actual_value(&subject)
+                .unwrap()
+                .unwrap()["content"],
+            "updated and ready"
+        );
+        reconciler.reconcile_once().unwrap();
+        assert!(reconciler.file_watchers.lock().unwrap().is_empty());
     }
 
     #[test]
