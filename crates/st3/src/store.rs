@@ -19856,27 +19856,6 @@ observer "ordered/file" {
     }
 
     #[test]
-    fn a_subject_with_no_actual_or_desired_state_has_unknown_reachability() {
-        let store = Store::open_memory("node").unwrap();
-        let subject = "agent/diagnostic-run/sig.hub";
-        store
-            .append_claim(&ClaimInput {
-                subject: subject.into(),
-                kind: "harness.observed".into(),
-                actor: Some(subject.into()),
-                fields: BTreeMap::from([("state".into(), Value::String("idle".into()))]),
-                evidence: Vec::new(),
-                expected_subject: None,
-                idempotency_key: None,
-            })
-            .unwrap();
-        let status = store.status(Some(subject)).unwrap();
-        assert!(status.subjects[0].actual.is_none());
-        assert!(status.subjects[0].desired.is_none());
-        assert_eq!(status.subjects[0].reachability, "unknown");
-    }
-
-    #[test]
     fn the_current_actual_cache_follows_the_store_index() {
         let store = Store::open_memory("node").unwrap();
         let subject = "agent/run/worker";
@@ -19913,6 +19892,27 @@ observer "ordered/file" {
         let cache = store.actual_cache.lock().unwrap();
         assert!(cache.get(subject).unwrap().0 > first_index);
         assert!(!cache.contains_key("agent/old"));
+    }
+
+    #[test]
+    fn a_subject_with_no_actual_or_desired_state_has_unknown_reachability() {
+        let store = Store::open_memory("node").unwrap();
+        let subject = "agent/diagnostic-run/sig.hub";
+        store
+            .append_claim(&ClaimInput {
+                subject: subject.into(),
+                kind: "harness.observed".into(),
+                actor: Some(subject.into()),
+                fields: BTreeMap::from([("state".into(), Value::String("idle".into()))]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+        let status = store.status(Some(subject)).unwrap();
+        assert!(status.subjects[0].actual.is_none());
+        assert!(status.subjects[0].desired.is_none());
+        assert_eq!(status.subjects[0].reachability, "unknown");
     }
 
     #[test]
