@@ -2033,6 +2033,14 @@ pub struct StepRunView {
     pub ready_age_ms: Option<u128>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wake: Option<WorkWakeView>,
+    /// The latest `work progress` summary for the current attempt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub progress_summary: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub progress_at_unix_ms: Option<u128>,
+    /// The `work complete` summary for the current attempt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion_summary: Option<String>,
     pub readiness_epoch: u32,
     pub blocked_reason: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

@@ -50,9 +50,9 @@ use tokio::sync::{Notify, watch};
 mod presentation;
 
 use presentation::{
-    OutputStyle, follow_snapshot, mission_run_signature, relative_time, render_attention_show,
-    render_generation, render_generations, render_human_value, render_mission_run,
-    render_revision_proposal, render_step_run, shell_argument,
+    OutputStyle, follow_snapshot, glance, mission_run_signature, relative_time,
+    render_attention_show, render_generation, render_generations, render_human_value,
+    render_mission_run, render_revision_proposal, render_step_run, shell_argument,
 };
 
 #[derive(Parser)]
@@ -5004,7 +5004,21 @@ async fn run_agent_inspection(
             let ClientResource::Agent(agent) = response.value else {
                 anyhow::bail!("`{subject}` is not an agent resource");
             };
-            print!("{}", render_client_agent(&agent));
+            let client = Client::new(endpoint.clone());
+            let mut current = Vec::new();
+            for work in &agent.current_work_ids {
+                // The card stays useful when one step cannot be read.
+                if let Ok(step) = client
+                    .get::<StepRunView>(&format!("/v1/work-items/{}", urlencoding::encode(work)))
+                    .await
+                {
+                    current.push(step);
+                }
+            }
+            print!(
+                "{}",
+                render_client_agent(&agent, &current, current_unix_ms()?)
+            );
             return Ok(());
         }
         AgentsCommand::Apply(_)
@@ -5255,7 +5269,11 @@ fn render_agent_queue(queue: &st3_client::AgentQueue) -> String {
     output
 }
 
-fn render_client_agent(agent: &st3_client::Agent) -> String {
+fn render_client_agent(
+    agent: &st3_client::Agent,
+    current_steps: &[StepRunView],
+    now_unix_ms: u128,
+) -> String {
     use std::fmt::Write as _;
 
     let mut output = String::new();
@@ -5277,6 +5295,29 @@ fn render_client_agent(agent: &st3_client::Agent) -> String {
     }
     for current in &agent.current_work_ids {
         let _ = writeln!(output, "CURRENT WORK {current}");
+        let Some(step) = current_steps.iter().find(|step| step.subject == *current) else {
+            continue;
+        };
+        let _ = writeln!(
+            output,
+            "CURRENT STEP {} · {}",
+            step.title.as_deref().unwrap_or(&step.step),
+            step.status
+        );
+        // A submitted step awaiting verification is still held by its worker.
+        if let Some(summary) = &step.completion_summary {
+            let _ = writeln!(output, "DONE         {}", glance(summary));
+        } else if let (Some(summary), Some(at)) = (&step.progress_summary, step.progress_at_unix_ms)
+        {
+            let _ = writeln!(
+                output,
+                "PROGRESS     {} · {}",
+                glance(summary),
+                relative_time(at, now_unix_ms)
+            );
+        } else {
+            let _ = writeln!(output, "PROGRESS     none reported");
+        }
     }
     if agent.active_work_count > agent.current_work_ids.len() as u64 {
         let _ = writeln!(output, "ACTIVE WORK  {} total", agent.active_work_count);
@@ -9447,9 +9488,74 @@ mod tests {
         let st3_client::Resource::Agent(agent) = resource else {
             panic!("agent resource")
         };
-        let card = render_client_agent(&agent);
+        let card = render_client_agent(&agent, &[], 0);
         assert!(card.contains("CURRENT WORK step-run/older/work"));
         assert!(card.contains("NEXT WORK    step-run/newer/review"));
+        assert!(
+            !card.contains("PROGRESS"),
+            "an unreadable step leaves only its id"
+        );
+    }
+
+    #[test]
+    fn agent_card_shows_the_current_step_and_its_last_progress() {
+        let resource: st3_client::Resource = serde_json::from_value(serde_json::json!({
+            "kind": "agent", "id": "agent/worker", "revision": "one",
+            "updated_at": "2026-09-24T09:00:00Z", "name": "Worker",
+            "state": "running", "reachability": "local", "runtime_ids": [],
+            "current_work_ids": ["step-run/one/build", "step-run/two/review", "step-run/two/docs"],
+            "active_work_count": 3
+        }))
+        .unwrap();
+        let st3_client::Resource::Agent(agent) = resource else {
+            panic!("agent resource")
+        };
+        let step = |subject: &str, title: &str, progress: Option<(&str, u128)>| {
+            serde_json::from_value::<StepRunView>(serde_json::json!({
+                "subject": subject, "run": "mission-run/demo", "generation": "run-generation/one",
+                "step": subject.rsplit('/').next().unwrap(), "definition_hash": "hash",
+                "status": "working", "attempt": 1, "assigned_to": "agent/worker",
+                "agentless": false, "title": title, "worker_reported": false,
+                "claimant": "agent/worker", "claim_incarnation": "worker:1",
+                "claim_expires_at_unix_ms": 900_000, "readiness_epoch": 1,
+                "blocked_reason": null, "not_before_unix_ms": null,
+                "created_at_unix_ms": 0, "updated_at_unix_ms": 0,
+                "progress_summary": progress.map(|(summary, _)| summary),
+                "progress_at_unix_ms": progress.map(|(_, at)| at),
+            }))
+            .unwrap()
+        };
+        let current = [
+            step(
+                "step-run/one/build",
+                "Build the parser",
+                Some(("Tests pass\nnext: docs", 60_000)),
+            ),
+            step("step-run/two/review", "Review the parser", None),
+            StepRunView {
+                status: "verifying".into(),
+                completion_summary: Some("Published the guide".into()),
+                ..step(
+                    "step-run/two/docs",
+                    "Write the guide",
+                    Some(("Drafting", 0)),
+                )
+            },
+        ];
+
+        let card = render_client_agent(&agent, &current, 360_000);
+
+        assert!(card.contains(
+            "CURRENT WORK step-run/one/build\n\
+             CURRENT STEP Build the parser · working\n\
+             PROGRESS     Tests pass… · 5m ago\n\
+             CURRENT WORK step-run/two/review\n\
+             CURRENT STEP Review the parser · working\n\
+             PROGRESS     none reported\n\
+             CURRENT WORK step-run/two/docs\n\
+             CURRENT STEP Write the guide · verifying\n\
+             DONE         Published the guide\n"
+        ));
     }
 
     #[test]
