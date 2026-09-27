@@ -14414,11 +14414,17 @@ fn operational_annotation(
         .map(str::to_owned);
     let runtime_subject = subject.starts_with("agent/")
         || subject.starts_with("exec/")
-        || subject.starts_with("pty/");
+        || subject.starts_with("pty/")
+        || subject.starts_with("gate-operation/");
     let stopped = matches!(status, Some("stopped" | "absent" | "exited"));
     let mut historical = Vec::new();
     if runtime_subject && stopped && (!has_desired || desired_kind == Some("stop")) {
         historical.push("stopped".to_owned());
+    }
+    // Nothing declares this runtime and no runtime status was ever observed for it, such as an
+    // agent known only from its own harness observations. It is a leftover, not a live runtime.
+    if runtime_subject && !has_desired && status.is_none() {
+        historical.push("undeclared".to_owned());
     }
 
     if let Some(owner_run) = owner_run {
@@ -21061,6 +21067,49 @@ observer "ordered/file" {
         assert_eq!(first_snapshot.store_index, first_index);
         assert_eq!(first_snapshot.subjects.len(), 1);
         assert_eq!(first_snapshot.subjects[0].subject, "agent/selected");
+    }
+
+    #[test]
+    fn an_exited_gate_runtime_leaves_the_current_runtime_list() {
+        let store = Store::open_memory("node").unwrap();
+        let subject = "gate-operation/step-run.run.check/0123456789abcdef01234567";
+        for status in ["running", "exited"] {
+            store
+                .append_claim(&ClaimInput {
+                    subject: subject.into(),
+                    kind: "runtime.observed".into(),
+                    actor: None,
+                    fields: BTreeMap::from([
+                        ("status".into(), Value::String(status.into())),
+                        (
+                            "runtime_id".into(),
+                            Value::String(subject.replace('/', ".")),
+                        ),
+                    ]),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: None,
+                })
+                .unwrap();
+        }
+        let current = store
+            .status_for_claim_kind_at("runtime.observed", None, false)
+            .unwrap();
+        assert!(
+            current.subjects.iter().all(|item| item.subject != subject),
+            "{:?}",
+            current.subjects
+        );
+        let history = store
+            .status_for_claim_kind_at("runtime.observed", None, true)
+            .unwrap();
+        let gate = history
+            .subjects
+            .iter()
+            .find(|item| item.subject == subject)
+            .unwrap();
+        assert_eq!(gate.projection.layer, "history");
+        assert_eq!(gate.projection.reasons, ["stopped"]);
     }
 
     #[test]
