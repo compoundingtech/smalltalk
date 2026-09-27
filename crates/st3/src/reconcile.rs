@@ -2740,11 +2740,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             // forever. Nested missions need the persisted parent transition before their children
             // can be evaluated; other agentless work can materialize in this same pass.
             if view.status == "ready" && view.agentless {
-                changed |= self.store.set_step_state(
-                    &view.subject,
-                    "working",
-                    Some("the eligible agentless execution started"),
-                )?;
+                changed |= self.store.set_step_state(&view.subject, "working", None)?;
                 if step.spec.nested_mission.is_some() {
                     continue;
                 }
@@ -11889,6 +11885,8 @@ mission "scheduled-cycle" state="ready" {
             .unwrap();
         assert_eq!(wait.status, "working");
         assert!(wait.execution_started_at_unix_ms.is_some());
+        // Starting agentless execution is not a blocker, so it records no reason.
+        assert_eq!(wait.blocked_reason, None);
 
         tokio::time::sleep(Duration::from_millis(5)).await;
         for _ in 0..5 {
