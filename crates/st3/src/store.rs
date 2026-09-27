@@ -16246,6 +16246,8 @@ fn seat_step_rows_tx(connection: &Connection, agent: Option<&str>) -> Result<Vec
            AND status IN ('ready', 'claimed', 'working', 'verifying')
            AND (?1 IS NULL OR assignee=?1 OR lease_owner=?1)
            AND generation_id=(SELECT current_generation_id FROM mission_runs WHERE id=step_runs.run_id)
+           AND NOT (status='ready'
+                    AND (SELECT phase FROM mission_runs WHERE id=step_runs.run_id)='revision-draining')
          ORDER BY length(created_at_unix_ms), created_at_unix_ms, subject",
     )?;
     let rows = statement
