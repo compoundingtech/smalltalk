@@ -67,6 +67,8 @@ fn dispatch(command: Command, catalog_path: Option<&std::path::Path>) -> Result<
             interval,
             agent,
             task,
+            residency_idle_after,
+            residency_warm_capacity,
         } => {
             let root = catalog_arg(root)?;
             if task.is_some() && !materialize_only && !once {
@@ -75,9 +77,23 @@ fn dispatch(command: Command, catalog_path: Option<&std::path::Path>) -> Result<
             if agent.is_some() && !materialize_only {
                 anyhow::bail!("--agent requires --materialize-only");
             }
-            up(&root, host, once, materialize_only, interval, agent, task)
+            up(
+                &root,
+                host,
+                once,
+                materialize_only,
+                interval,
+                agent,
+                task,
+                residency_idle_after.zip(residency_warm_capacity),
+            )
         }
         Command::Message(cmd) => message_cmd(cmd),
+        Command::Wake {
+            identity,
+            agent_id,
+            host,
+        } => wake_cmd(identity, agent_id, host),
         Command::Event(cmd) => event_cmd(cmd),
         Command::Stream(cmd) => stream_cmd(cmd),
         Command::Request(cmd) => request_cmd(cmd),
@@ -97,11 +113,31 @@ fn dispatch(command: Command, catalog_path: Option<&std::path::Path>) -> Result<
         Command::CodexAppServer {
             identity,
             runtime_id,
+            required_resume_generation,
+            required_resume_incarnation,
             codex_argv,
         } => {
             let catalog = catalog_arg(None)?;
             let catalog = catalog.canonicalize().unwrap_or(catalog);
-            st2::codex_app_server::run_controlled(&catalog, identity, runtime_id, codex_argv)
+            match (required_resume_generation, required_resume_incarnation) {
+                (Some(generation), Some(incarnation)) => {
+                    st2::codex_app_server::run_controlled_residency_attempt(
+                        &catalog,
+                        identity,
+                        runtime_id,
+                        codex_argv,
+                        st2::residency::Generation(generation),
+                        incarnation,
+                    )
+                }
+                (None, None) => st2::codex_app_server::run_controlled(
+                    &catalog,
+                    identity,
+                    runtime_id,
+                    codex_argv,
+                ),
+                _ => unreachable!("clap requires the complete residency launch fence"),
+            }
         }
         Command::ClaudeMcp { identity } => {
             let catalog = catalog_arg(None)?;
@@ -111,11 +147,28 @@ fn dispatch(command: Command, catalog_path: Option<&std::path::Path>) -> Result<
         Command::Driver(DriverCmd::Codex {
             identity,
             runtime_id,
+            required_resume_generation,
+            required_resume_incarnation,
             argv,
         }) => {
             let catalog = catalog_arg(None)?;
             let catalog = catalog.canonicalize().unwrap_or(catalog);
-            st2::codex_app_server::run_controlled(&catalog, identity, runtime_id, argv)
+            match (required_resume_generation, required_resume_incarnation) {
+                (Some(generation), Some(incarnation)) => {
+                    st2::codex_app_server::run_controlled_residency_attempt(
+                        &catalog,
+                        identity,
+                        runtime_id,
+                        argv,
+                        st2::residency::Generation(generation),
+                        incarnation,
+                    )
+                }
+                (None, None) => {
+                    st2::codex_app_server::run_controlled(&catalog, identity, runtime_id, argv)
+                }
+                _ => unreachable!("clap requires the complete residency launch fence"),
+            }
         }
         Command::Driver(DriverCmd::PiChannel { identity }) => {
             let catalog = catalog_arg(None)?;
@@ -147,11 +200,24 @@ fn dispatch(command: Command, catalog_path: Option<&std::path::Path>) -> Result<
         Command::Driver(DriverCmd::OmpSession {
             identity,
             runtime_id,
+            required_resume_generation,
+            required_resume_incarnation,
             argv,
         }) => {
             let catalog = catalog_arg(None)?;
             let catalog = catalog.canonicalize().unwrap_or(catalog);
-            st2::omp_session::run(&catalog, identity, runtime_id, argv)
+            match (required_resume_generation, required_resume_incarnation) {
+                (Some(generation), Some(incarnation)) => st2::omp_session::run_residency_attempt(
+                    &catalog,
+                    identity,
+                    runtime_id,
+                    argv,
+                    st2::residency::Generation(generation),
+                    incarnation,
+                ),
+                (None, None) => st2::omp_session::run(&catalog, identity, runtime_id, argv),
+                _ => unreachable!("clap requires the complete residency launch fence"),
+            }
         }
         Command::Driver(DriverCmd::Claude { identity }) => {
             eprintln!("warning: `st2 driver claude` is deprecated; use `st2 driver claude-mcp`");
@@ -162,11 +228,26 @@ fn dispatch(command: Command, catalog_path: Option<&std::path::Path>) -> Result<
         Command::Driver(DriverCmd::ClaudeSession {
             identity,
             runtime_id,
+            required_resume_generation,
+            required_resume_incarnation,
             argv,
         }) => {
             let catalog = catalog_arg(None)?;
             let catalog = catalog.canonicalize().unwrap_or(catalog);
-            st2::claude_session::run(&catalog, identity, runtime_id, argv)
+            match (required_resume_generation, required_resume_incarnation) {
+                (Some(generation), Some(incarnation)) => {
+                    st2::claude_session::run_residency_attempt(
+                        &catalog,
+                        identity,
+                        runtime_id,
+                        argv,
+                        st2::residency::Generation(generation),
+                        incarnation,
+                    )
+                }
+                (None, None) => st2::claude_session::run(&catalog, identity, runtime_id, argv),
+                _ => unreachable!("clap requires the complete residency launch fence"),
+            }
         }
         Command::Driver(DriverCmd::ClaudeObserve {
             identity,
@@ -834,6 +915,65 @@ fn catalog_root_for_env() -> Result<PathBuf> {
         )?;
     absolute_catalog_path(&root)
 }
+fn resolve_wake_target<'a>(
+    specs: &'a [st2::AgentSpec],
+    host: &str,
+    selector: &st2::identity::AgentSelector,
+) -> Result<Option<&'a st2::AgentSpec>> {
+    let entries = st2::identity::address_book(specs, host);
+    let resolved = match st2::identity::resolve_local_first(&entries, selector, host) {
+        Ok(resolved) => resolved,
+        Err(st2::identity::ResolveError::Unknown { .. }) => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    if resolved.host != host {
+        return Ok(None);
+    }
+    Ok(specs
+        .iter()
+        .find(|spec| spec.resolved_host(host) == host && spec.effective_id(host) == resolved.id))
+}
+
+fn wake_cmd(
+    identity: Option<String>,
+    agent_id: Option<String>,
+    host: Option<String>,
+) -> Result<()> {
+    let root = catalog_root_for_env()?;
+    let host = host.unwrap_or_else(detect_host);
+    let selector =
+        agent_selector(identity, agent_id).context("wake requires an agent reference")?;
+    let found = discover(&root);
+    let spec = resolve_wake_target(&found.specs, &host, &selector)?
+        .context("wake reference does not name an agent owned by this host")?;
+    anyhow::ensure!(
+        spec.residency_policy == st2::ResidencyPolicy::OnDemand && spec.desired_state.is_running(),
+        "wake target is not a running on-demand agent"
+    );
+    let agent_id = spec.effective_id(&host);
+    let path = st2::residency_host::request_wake(&root, &host, &agent_id)?;
+    println!(
+        "wake requested for '{}' on {host}; request {}",
+        spec.bus_id(&host),
+        path.display()
+    );
+    Ok(())
+}
+
+fn request_attach_wake(root: &Path, target: &str) -> Result<()> {
+    let host = detect_host();
+    let found = discover(root);
+    if let Some(spec) = resolve_wake_target(
+        &found.specs,
+        &host,
+        &st2::identity::AgentSelector::Address(target.to_owned()),
+    )? && spec.residency_policy == st2::ResidencyPolicy::OnDemand
+        && spec.desired_state.is_running()
+    {
+        st2::residency_host::request_wake(root, &host, &spec.effective_id(&host))?;
+    }
+    Ok(())
+}
 
 /// Set the same native catalog environment that `st2 env` prints. The catalog's own declared session
 /// registry is used, not the caller's ambient one: these hand `pty` the roots of the *catalog*.
@@ -850,6 +990,11 @@ fn pty_cmd(args: &[String]) -> Result<()> {
     use std::os::unix::process::CommandExt;
 
     let root = catalog_root_for_env()?;
+    if args.first().is_some_and(|argument| argument == "attach")
+        && let Some(target) = args.get(1)
+    {
+        request_attach_wake(&root, target)?;
+    }
     let mut cmd = std::process::Command::new("pty");
     cmd.args(args);
     with_bus_env(&mut cmd, &root);
@@ -2697,21 +2842,54 @@ fn context_cmd(cmd: ContextCmd) -> Result<()> {
 }
 
 fn service_cmd(cmd: ServiceCmd) -> Result<()> {
-    match cmd {
-        ServiceCmd::Install {
-            catalog,
-            host,
-            pty_root,
-            memory_max_mb,
-        } => {
-            let catalog = match catalog {
-                Some(c) => c,
-                None => catalog_root_for_env()?,
-            };
-            st2::service::install(&catalog, host, pty_root, memory_max_mb)
+    enum UnitAction {
+        Install,
+        Render,
+    }
+
+    let (action, args) = match cmd {
+        ServiceCmd::Install(args) => (UnitAction::Install, args),
+        ServiceCmd::RenderUnit(args) => (UnitAction::Render, args),
+        ServiceCmd::Status => return st2::service::status(),
+        ServiceCmd::Uninstall => return st2::service::uninstall(),
+    };
+    let ServiceUnitArgs {
+        catalog,
+        host,
+        pty_root,
+        residency_idle_after,
+        residency_warm_capacity,
+        memory_max_mb,
+    } = args;
+    let catalog = match catalog {
+        Some(catalog) => catalog,
+        None => catalog_root_for_env()?,
+    };
+    let residency_policy =
+        residency_idle_after
+            .zip(residency_warm_capacity)
+            .map(
+                |(idle_after, warm_capacity)| st2::residency_host::HostPolicy {
+                    idle_after,
+                    warm_capacity,
+                },
+            );
+
+    match action {
+        UnitAction::Install => {
+            st2::service::install(&catalog, host, pty_root, residency_policy, memory_max_mb)
         }
-        ServiceCmd::Status => st2::service::status(),
-        ServiceCmd::Uninstall => st2::service::uninstall(),
+        UnitAction::Render => {
+            let unit = st2::service::render_unit(
+                &catalog,
+                host,
+                pty_root,
+                residency_policy,
+                memory_max_mb,
+            )?;
+            print!("{unit}");
+            Ok(())
+        }
     }
 }
 
@@ -3176,12 +3354,16 @@ fn up(
     interval: u64,
     agent: Option<String>,
     task: Option<String>,
+    residency_policy: Option<(Duration, usize)>,
 ) -> Result<()> {
     // An st2-SPEC path (a `*.kdl` file, or a folder with one top-level spec `*.kdl`) supervises its
     // top-level team directly — no catalog discovery. Otherwise, the classic catalog reconcile loop.
     if let Some(spec_file) = st2::eval_run::resolve_spec_path(root) {
         if task.is_some() {
             anyhow::bail!("--task is for folder catalogs, not single-file specs");
+        }
+        if residency_policy.is_some() {
+            anyhow::bail!("host residency policy is supported only for folder catalogs");
         }
         if materialize_only {
             anyhow::bail!(
@@ -3264,11 +3446,23 @@ fn up(
 
     if once {
         let targeted = task.is_some();
-        let report = match task.as_deref() {
-            Some(selector) => {
+        let report = match (task.as_deref(), residency_policy) {
+            (Some(_), Some(_)) => {
+                anyhow::bail!("--task cannot be combined with host residency policy")
+            }
+            (Some(selector), None) => {
                 st2::run::up_once_selected(&catalog_root, selector, &this_host, &runner)?
             }
-            None => up_once(&catalog_root, &this_host, &runner)?,
+            (None, Some((idle_after, warm_capacity))) => st2::up_once_with_residency(
+                &catalog_root,
+                &this_host,
+                &runner,
+                st2::residency_host::HostPolicy {
+                    idle_after,
+                    warm_capacity,
+                },
+            )?,
+            (None, None) => up_once(&catalog_root, &this_host, &runner)?,
         };
         println!("reconcile pass on host '{this_host}':");
         print_report(&report);
@@ -3293,17 +3487,31 @@ fn up(
         "st2: supervising {} on host '{this_host}' (reconcile every {interval}s + on change; Ctrl-C to stop)",
         root.display()
     );
-    let result = up_loop(
-        &catalog_root,
-        &this_host,
-        &runner,
-        Duration::from_secs(interval),
-        |report| {
-            if report.is_noteworthy() {
-                print_report(report);
-            }
-        },
-    );
+    let on_report = |report: &UpReport| {
+        if report.is_noteworthy() {
+            print_report(report);
+        }
+    };
+    let result = match residency_policy {
+        Some((idle_after, warm_capacity)) => st2::up_loop_with_residency(
+            &catalog_root,
+            &this_host,
+            &runner,
+            Duration::from_secs(interval),
+            st2::residency_host::HostPolicy {
+                idle_after,
+                warm_capacity,
+            },
+            on_report,
+        ),
+        None => up_loop(
+            &catalog_root,
+            &this_host,
+            &runner,
+            Duration::from_secs(interval),
+            on_report,
+        ),
+    };
     lock.release();
     result
 }
@@ -3435,4 +3643,79 @@ fn ls(root: &Path) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn addressed_spec() -> st2::AgentSpec {
+        st2::AgentSpec {
+            id: Some("immutable-worker-id".to_owned()),
+            address: Some("chat".to_owned()),
+            identity: "worker".to_owned(),
+            name: None,
+            description: None,
+            host: Some("host-a".to_owned()),
+            role: None,
+            job_type: st2::JobType::Service,
+            workspace: None,
+            supervisor: None,
+            desired_state: st2::AgentDesiredState::Running,
+            residency_policy: st2::ResidencyPolicy::OnDemand,
+            keep: false,
+            restart: None,
+            delivery: None,
+            session_driver: Some(st2::SessionDriver::Omp),
+            driver: None,
+            delivery_readiness: None,
+            resources: Vec::new(),
+            streams: Vec::new(),
+            tasks: Vec::new(),
+            path: PathBuf::from("/catalog/agents/host-a/worker/agent.kdl"),
+        }
+    }
+
+    #[test]
+    fn wake_target_resolves_bare_and_qualified_mutable_addresses() {
+        let specs = vec![addressed_spec()];
+
+        for reference in ["chat", "host-a.chat"] {
+            let target = resolve_wake_target(
+                &specs,
+                "host-a",
+                &st2::identity::AgentSelector::Address(reference.to_owned()),
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(target.bus_id("host-a"), "host-a.worker");
+            assert_eq!(target.effective_id("host-a"), "immutable-worker-id");
+        }
+    }
+
+    #[test]
+    fn wake_target_does_not_route_by_the_old_identity_after_an_address_override() {
+        let specs = vec![addressed_spec()];
+
+        assert!(
+            resolve_wake_target(
+                &specs,
+                "host-a",
+                &st2::identity::AgentSelector::Address("worker".to_owned()),
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert_eq!(
+            resolve_wake_target(
+                &specs,
+                "host-a",
+                &st2::identity::AgentSelector::Id("immutable-worker-id".to_owned()),
+            )
+            .unwrap()
+            .unwrap()
+            .bus_id("host-a"),
+            "host-a.worker"
+        );
+    }
 }

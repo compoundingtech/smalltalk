@@ -1163,7 +1163,7 @@ pub fn run_ding(
     // created up front so the watch anchors on it directly (senders create it on demand anyway).
     let _ = std::fs::create_dir_all(inbox_dir);
     let (tx, rx) = channel::<()>();
-    let _watcher = crate::watch::watch_recursive_mutations(inbox_dir, tx);
+    let _watcher = crate::watch::watch_recursive_mutations(inbox_dir, tx).ok();
 
     let mut seen = HashSet::new();
     let backlog = new_arrivals(inbox_dir, &mut seen);

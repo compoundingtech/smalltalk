@@ -579,6 +579,8 @@ fn graph_without_explicit_ids_keeps_its_legacy_wire_shape() {
         // Appended by DELTA-003, strictly after every pre-existing field.
         "address",
         "busAddress",
+        // Appended after DELTA-003's fields.
+        "resourceRoot",
     ];
     assert_eq!(
         emitted,
@@ -653,4 +655,65 @@ fn graph_reports_a_duplicate_explicit_agent_id_with_null_topology() {
     // The addresses do not collide: separate hosts, and each keeps its own legacy fallback.
     assert_eq!(rows[0]["busAddress"], "h.one");
     assert_eq!(rows[1]["busAddress"], "h2.two");
+}
+
+/// Every actor has a published resource root: declared rows carry it, and undeclared direct OMP
+/// actor directories are listed with the exact PTY session ID their identity decodes to.
+#[test]
+fn graph_publishes_a_resource_root_for_declared_and_direct_actors() {
+    let catalog = tempfile::tempdir().unwrap();
+    let root = catalog.path();
+    write(
+        root,
+        "agents/h/lead/agent.kdl",
+        "agent \"lead\" { host \"h\"; command \"true\" }\n",
+    );
+    write(
+        root,
+        "teams/ops/worker/agent.kdl",
+        "agent \"worker\" { host \"h\"; supervisor \"h.lead\"; command \"true\" }\n",
+    );
+    write(root, "agents/h/direct.omp.e2jcd9pf/resources/tmp/note", "x");
+    write(root, "agents/other/direct.omp.x-776562/resources/tmp/note", "x");
+    // Neither a canonical PTY segment nor a declared identity: not an actor st2 can vouch for.
+    write(root, "agents/h/direct.omp.NOPE/resources/tmp/note", "x");
+
+    let output = st2(root, &["catalog", "graph", "--host", "h", "--json"], None);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let graph = json(&output);
+
+    let roots = graph["agents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| (row["id"].as_str().unwrap(), row["resourceRoot"].as_str().unwrap()))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        roots,
+        [("h.lead", "agents/h/lead"), ("h.worker", "teams/ops/worker")],
+        "{graph:#}"
+    );
+    assert_eq!(
+        graph["directActors"],
+        serde_json::json!([
+            {
+                "id": "h.direct.omp.e2jcd9pf",
+                "host": "h",
+                "identity": "direct.omp.e2jcd9pf",
+                "ptyId": "e2jcd9pf",
+                "resourceRoot": "agents/h/direct.omp.e2jcd9pf"
+            },
+            {
+                "id": "other.direct.omp.x-776562",
+                "host": "other",
+                "identity": "direct.omp.x-776562",
+                "ptyId": "web",
+                "resourceRoot": "agents/other/direct.omp.x-776562"
+            }
+        ])
+    );
 }

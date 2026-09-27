@@ -9,6 +9,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use crate::spec::{AgentDesiredState, lower_desired_state};
 use kdl::{KdlDocument, KdlNode, KdlValue};
 use serde::Serialize;
 
@@ -20,6 +21,24 @@ pub struct DeclaredSpan {
     pub length: usize,
     pub line: usize,
     pub column: usize,
+}
+
+/// The lifecycle spelling retained from a canonical KDL declaration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeclaredLifecycleSource {
+    /// No lifecycle field was written; the declaration defaults to running.
+    Implicit,
+    /// The canonical `desired-state` node was written.
+    DesiredState,
+    /// The legacy `retired` node was written, including its exact boolean value.
+    Retired(bool),
+}
+
+/// A validated, normalized lifecycle projection from a canonical KDL declaration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeclaredLifecycle {
+    pub desired_state: AgentDesiredState,
+    pub source: DeclaredLifecycleSource,
 }
 
 /// Severity of a declaration-parser diagnostic.
@@ -198,6 +217,92 @@ impl DeclaredAgent {
     pub fn source(&self) -> &str {
         &self.source
     }
+
+    /// Validate and normalize this declaration's whole-agent lifecycle.
+    ///
+    /// Duplicate, mixed, malformed, and semantically invalid lifecycle forms fail closed.
+    pub fn lifecycle(&self) -> anyhow::Result<DeclaredLifecycle> {
+        let mut desired_states = self.fields_named("desired-state");
+        let desired_state = desired_states.next();
+        anyhow::ensure!(
+            desired_states.next().is_none(),
+            "agent declares `desired-state` more than once"
+        );
+        let mut retired_fields = self.fields_named("retired");
+        let retired = retired_fields.next();
+        anyhow::ensure!(
+            retired_fields.next().is_none(),
+            "agent declares `retired` more than once"
+        );
+        anyhow::ensure!(
+            desired_state.is_none() || retired.is_none(),
+            "agent declares both legacy `retired` and `desired-state`; choose one lifecycle form"
+        );
+
+        if let Some(node) = desired_state {
+            return desired_state_lifecycle(node);
+        }
+        if let Some(node) = retired {
+            return retired_lifecycle(node);
+        }
+        Ok(DeclaredLifecycle {
+            desired_state: AgentDesiredState::Running,
+            source: DeclaredLifecycleSource::Implicit,
+        })
+    }
+}
+
+fn desired_state_lifecycle(node: &DeclaredNode) -> anyhow::Result<DeclaredLifecycle> {
+    anyhow::ensure!(
+        node.type_name.is_none()
+            && node.children.is_empty()
+            && node.arguments().count() == 1
+            && node.properties_named("reason").count() <= 1
+            && node.entries.len() <= 2,
+        "agent `desired-state` must contain one state string and at most one `reason` property"
+    );
+    anyhow::ensure!(
+        node.entries
+            .iter()
+            .all(|entry| entry.name.is_none() || entry.name.as_deref() == Some("reason")),
+        "agent `desired-state` accepts only the `reason` property"
+    );
+    let state = node
+        .argument(0)
+        .and_then(DeclaredValue::as_str)
+        .ok_or_else(|| anyhow::anyhow!("agent desired-state value must be a string"))?;
+    let reason = node
+        .property("reason")
+        .map(|value| {
+            value
+                .as_str()
+                .map(String::from)
+                .ok_or_else(|| anyhow::anyhow!("agent desired-state `reason` must be a string"))
+        })
+        .transpose()?;
+    let desired_state = lower_desired_state(None, Some(state), reason)?;
+    Ok(DeclaredLifecycle {
+        desired_state,
+        source: DeclaredLifecycleSource::DesiredState,
+    })
+}
+
+fn retired_lifecycle(node: &DeclaredNode) -> anyhow::Result<DeclaredLifecycle> {
+    anyhow::ensure!(
+        node.type_name.is_none()
+            && node.children.is_empty()
+            && node.entries.len() == 1
+            && node.arguments().count() == 1,
+        "legacy agent `retired` must contain exactly one boolean"
+    );
+    let retired = node
+        .argument(0)
+        .and_then(DeclaredValue::as_bool)
+        .ok_or_else(|| anyhow::anyhow!("legacy agent `retired` value must be a boolean"))?;
+    Ok(DeclaredLifecycle {
+        desired_state: lower_desired_state(Some(retired), None, None)?,
+        source: DeclaredLifecycleSource::Retired(retired),
+    })
 }
 
 /// A canonical KDL document and every declared agent in source order.

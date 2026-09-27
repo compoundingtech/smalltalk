@@ -1,0 +1,26 @@
+version 2
+
+// A durable OpenCode seat.
+//
+// A seat is a top-level agent. It has no mission owner, so finishing, revising, or cancelling a
+// mission never stops it. Work reaches it as mission steps assigned to its exact subject,
+// `agent/example/worker`, and waits in its seat queue.
+//
+// Every seat file in this directory declares the same `example/worker` seat with a different
+// harness, so each mission example works with whichever one you apply. Apply one of them. To run
+// several side by side, give each its own identity and change `assigned-to` to match.
+//
+// Log OpenCode in to the model provider as the user who runs the st3 daemon, and replace the
+// workspace with an existing checkout on this host. OpenCode names a model as PROVIDER/MODEL and
+// takes no `effort`.
+//
+//   st3 agents apply examples/st3/seats/opencode.kdl --as person/operator
+//   st3 agents show agent/example/worker
+//   st3 agents stop agent/example/worker --as person/operator
+agent "example/worker" {
+  workspace "/srv/example/app"
+  restart "always"
+  harness "opencode" {
+    model "anthropic/claude-sonnet-5"
+  }
+}

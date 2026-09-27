@@ -3510,6 +3510,11 @@ fn validate_fence(
                 .planning_session(id)
                 .map_err(ApiError::internal)?
                 .map(|launch| format!("launch/{}", launch.updated_at_unix_ms))
+        } else if subject.starts_with("session/external-") {
+            // A native session st3 does not own has no claims; its revision is its discovery.
+            crate::external_sessions::find_fresh(state.native_session_home.as_deref(), subject)
+                .map_err(ApiError::internal)?
+                .map(|session| session.revision)
         } else {
             state
                 .store
@@ -4654,9 +4659,38 @@ mission "example/zero-run" state="ready" {
             parameters: json!({"target_id": external.id}),
         };
 
-        let affected = import_external_session_action(&state, &session, &request)
-            .await
-            .unwrap();
+        // `st3 import run` submits through the action handler, so the generic fence check must
+        // read a native session's revision from discovery rather than from the claim store.
+        let mut changed = request.clone();
+        changed.idempotency_key = "session-import-test-stale".into();
+        changed
+            .fence
+            .subject_revisions
+            .insert(external.id.clone(), "an-older-discovery".into());
+        let error = action(
+            State(state.clone()),
+            Extension(new_client_snapshot(&state)),
+            Extension(session.clone()),
+            Json(changed),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code, "stale-fence");
+
+        let response = action(
+            State(state.clone()),
+            Extension(new_client_snapshot(&state)),
+            Extension(session.clone()),
+            Json(request),
+        )
+        .await
+        .expect("a current native session revision passes the action fence");
+        let affected = response.0["affected_ids"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|id| id.as_str().unwrap().to_owned())
+            .collect::<Vec<_>>();
         assert_eq!(affected.len(), 2);
         assert!(affected[1].starts_with("agent/import/codex/"));
         assert!(state.store.active_mission_runs().unwrap().is_empty());

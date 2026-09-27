@@ -276,7 +276,7 @@ pub(crate) fn is_managed_hook_reference(text: &str) -> bool {
 /// `$XDG_STATE_HOME/st2/hooks` or `~/.local/state/st2/hooks`.
 pub fn hooks_root() -> Result<PathBuf> {
     if let Some(path) = std::env::var_os("ST_HOOKS").filter(|value| !value.is_empty()) {
-        return Ok(PathBuf::from(path));
+        return Ok(root_of_exported_hooks(PathBuf::from(path)));
     }
     let state = match std::env::var_os("XDG_STATE_HOME").filter(|value| !value.is_empty()) {
         Some(path) => PathBuf::from(path),
@@ -286,6 +286,26 @@ pub fn hooks_root() -> Result<PathBuf> {
         .join(".local/state"),
     };
     Ok(state.join("st2/hooks"))
+}
+
+/// The hook root an exported `$ST_HOOKS` names.
+///
+/// st2 exports the root, but st3 exports its binary's set directory, because st3's Claude settings
+/// run `$ST_HOOKS/claude-observe.sh`. Read as a root, that set directory sends a pi or omp launch
+/// looking for `<set>/sets/<set>/`, so every seat fails with `launch-error` once the set is new. A
+/// set directory is `<root>/sets/sha256-…` and holds its own manifest, so it names its root.
+fn root_of_exported_hooks(path: PathBuf) -> PathBuf {
+    let names_a_set = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.starts_with("sha256-"))
+        && path.join(SET_MANIFEST_FILE).is_file();
+    let root = path
+        .parent()
+        .filter(|sets| names_a_set && sets.file_name() == Some(std::ffi::OsStr::new(SETS_DIR)))
+        .and_then(Path::parent)
+        .map(Path::to_path_buf);
+    root.unwrap_or(path)
 }
 
 /// The immutable, versioned directory this binary expects rendered hook settings to use.
@@ -317,7 +337,8 @@ pub fn required_by_codex_agent(
     this_host: &str,
     catalog_root: &Path,
 ) -> bool {
-    spec.host.as_deref().is_none_or(|host| host == this_host)
+    spec.desired_state.is_running()
+        && spec.host.as_deref().is_none_or(|host| host == this_host)
         && (matches!(
             spec.driver.as_ref(),
             Some(agent_spec::spec::Driver::Codex(_))
@@ -352,7 +373,8 @@ pub fn required_by_pi_agent(
     this_host: &str,
     catalog_root: &Path,
 ) -> bool {
-    spec.host.as_deref().is_none_or(|host| host == this_host)
+    spec.desired_state.is_running()
+        && spec.host.as_deref().is_none_or(|host| host == this_host)
         && (matches!(spec.driver.as_ref(), Some(agent_spec::spec::Driver::Pi(_)))
             || spec.tasks.iter().any(|task| {
                 task.name == "agent"
@@ -393,7 +415,8 @@ pub fn required_by_omp_agent(
     this_host: &str,
     catalog_root: &Path,
 ) -> bool {
-    spec.host.as_deref().is_none_or(|host| host == this_host)
+    spec.desired_state.is_running()
+        && spec.host.as_deref().is_none_or(|host| host == this_host)
         && (matches!(spec.driver.as_ref(), Some(agent_spec::spec::Driver::Omp(_)))
             || spec.tasks.iter().any(|task| {
                 task.name == "agent"
@@ -807,6 +830,7 @@ mod tests {
         assert_eq!(registered, claude_settings_registration());
     }
 
+
     #[test]
     fn st3_claude_settings_externalize_lifecycle_without_the_legacy_boot_ritual() {
         let settings = claude_st3_settings_registration();
@@ -978,6 +1002,52 @@ mod tests {
     }
 
     #[test]
+    fn hook_demand_is_running_only_across_every_lifecycle_spelling() {
+        for (name, lifecycle, expected) in [
+            ("running", "", true),
+            (
+                "suspended",
+                r#"desired-state "suspended" reason="Waiting""#,
+                false,
+            ),
+            (
+                "canonical-retired",
+                r#"desired-state "retired" reason="Finished""#,
+                false,
+            ),
+            ("legacy-retired", "retired #true", false),
+        ] {
+            for provider in ["codex", "pi", "omp"] {
+                let root = tempfile::tempdir().unwrap();
+                let identity = format!("{name}-{provider}");
+                let path = root.path().join(format!("agents/h/{identity}/agent.kdl"));
+                fs::create_dir_all(path.parent().unwrap()).unwrap();
+                fs::write(
+                    path,
+                    format!(
+                        r#"agent "{identity}" {{
+  host "h"
+  {lifecycle}
+  command "{provider}"
+}}"#
+                    ),
+                )
+                .unwrap();
+                let found = crate::discover(root.path());
+                assert!(found.errors.is_empty(), "{identity}: {:?}", found.errors);
+                let spec = &found.specs[0];
+                let demanded = match provider {
+                    "codex" => required_by_codex_agent(spec, "h", root.path()),
+                    "pi" => required_by_pi_agent(spec, "h", root.path()),
+                    "omp" => required_by_omp_agent(spec, "h", root.path()),
+                    _ => unreachable!(),
+                };
+                assert_eq!(demanded, expected, "{identity}");
+            }
+        }
+    }
+
+    #[test]
     fn explicit_install_is_idempotent_receipted_and_executable() {
         let tmp = tempfile::tempdir().unwrap();
         let first = install_at(tmp.path(), false).unwrap();
@@ -1040,6 +1110,24 @@ mod tests {
 
         assert_eq!(verify_required_set_at(tmp.path()).unwrap(), required);
         assert!(verify_installed_at(tmp.path()).is_err());
+    }
+
+    #[test]
+    fn an_exported_set_directory_names_its_hook_root() {
+        // st3 exports `$ST_HOOKS` as the set directory. Verified as a root, it fails.
+        let tmp = tempfile::tempdir().unwrap();
+        let set = install_at(tmp.path(), false).unwrap();
+        assert!(verify_required_set_at(&set).is_err());
+        assert_eq!(root_of_exported_hooks(set.clone()), tmp.path());
+        assert_eq!(
+            verify_required_set_at(&root_of_exported_hooks(set.clone())).unwrap(),
+            set
+        );
+        // A root, or a lookalike without a manifest, stays exactly what was exported.
+        assert_eq!(root_of_exported_hooks(tmp.path().into()), tmp.path());
+        let lookalike = tmp.path().join("sets/sha256-empty");
+        fs::create_dir_all(&lookalike).unwrap();
+        assert_eq!(root_of_exported_hooks(lookalike.clone()), lookalike);
     }
 
     #[test]
@@ -1115,5 +1203,43 @@ mod tests {
             b"partial\n",
             "the explicit installer must not rewrite a partial content-addressed set"
         );
+    }
+
+    #[test]
+    fn claude_observer_propagates_only_mandatory_resume_failures() {
+        use std::os::unix::fs::PermissionsExt as _;
+        use std::process::Command;
+
+        let temp = tempfile::tempdir().unwrap();
+        let hook = temp.path().join("claude-observe.sh");
+        let fake_st2 = temp.path().join("st2");
+        fs::write(&hook, CLAUDE_OBSERVE).unwrap();
+        fs::write(&fake_st2, "#!/bin/sh\nexit 7\n").unwrap();
+        for path in [&hook, &fake_st2] {
+            let mut permissions = fs::metadata(path).unwrap().permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(path, permissions).unwrap();
+        }
+        let path = format!(
+            "{}:{}",
+            temp.path().display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let run = |mandatory: bool, event: &str| {
+            let mut command = Command::new("bash");
+            command
+                .arg(&hook)
+                .arg(event)
+                .env("PATH", &path)
+                .env("ST_AGENT", "h.worker")
+                .env("CATALOG", temp.path());
+            if mandatory {
+                command.env("ST2_CLAUDE_RESUME_GENERATION", "2");
+            }
+            command.status().unwrap()
+        };
+        assert!(run(false, "SessionStart").success());
+        assert!(run(true, "PreToolUse").success());
+        assert_eq!(run(true, "SessionStart").code(), Some(7));
     }
 }

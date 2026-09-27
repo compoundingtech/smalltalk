@@ -434,7 +434,7 @@ pub(crate) fn catalog_owned_render_inputs(
         else {
             continue;
         };
-        let resolved = source(root, spec_dir, &raw_source, &env)?;
+        let resolved = source(root, spec_dir, &raw_source, &env, true)?;
         if resolved.strip_prefix(root).is_ok() {
             inputs.insert(resolved);
         }
@@ -496,10 +496,14 @@ fn source(
     spec_dir: &Path,
     raw: &str,
     env: &BTreeMap<String, String>,
+    require_presence: bool,
 ) -> Result<PathBuf> {
     let raw = expand(raw, env);
     let path = Path::new(&raw);
     if path.is_absolute() {
+        if require_presence && path.starts_with(root) && !path.exists() {
+            anyhow::bail!("copy source '{raw}' does not exist");
+        }
         return Ok(path.to_path_buf());
     }
     // Canonical format uses catalog-rooted `_templates/...`; the already-blessed COS prototype uses
@@ -512,6 +516,9 @@ fn source(
     let spec_relative = spec_dir.join(path);
     if spec_relative.exists() {
         return Ok(spec_relative);
+    }
+    if !require_presence {
+        return Ok(catalog_relative);
     }
     anyhow::bail!(
         "copy source '{raw}' does not exist (tried {} and {})",
@@ -899,7 +906,7 @@ fn claims_for_agent(
                 destination: raw_destination,
                 executable,
             } => {
-                let source = source(root, spec_dir, &raw_source, &env)?;
+                let source = source(root, spec_dir, &raw_source, &env, true)?;
                 let bytes = fs::read(&source)
                     .with_context(|| format!("reading copy source {}", source.display()))?;
                 (
@@ -1045,7 +1052,7 @@ pub fn materialize_agent(root: &Path, spec: &AgentSpec, this_host: &str) -> Resu
                 destination: raw_destination,
                 executable,
             } => {
-                let source = source(root, spec_dir, &raw_source, &env)?;
+                let source = source(root, spec_dir, &raw_source, &env, true)?;
                 let destination = destination(&workspace, &raw_destination, &env)?;
                 let bytes = fs::read(&source)
                     .with_context(|| format!("reading copy source {}", source.display()))?;
@@ -1200,8 +1207,26 @@ pub fn materialize_agent(root: &Path, spec: &AgentSpec, this_host: &str) -> Resu
     Ok(notes)
 }
 
-/// Validate an agent's render declaration and all catalog-owned inputs without writing its workspace.
+/// Validate an agent's complete running render readiness without writing its workspace.
 pub fn validate_agent(root: &Path, spec: &AgentSpec, this_host: &str) -> Result<()> {
+    validate_agent_with_source_presence(root, spec, this_host, true)
+}
+
+/// Validate lifecycle-independent render declaration structure without consulting source presence.
+pub(crate) fn validate_agent_structure(
+    root: &Path,
+    spec: &AgentSpec,
+    this_host: &str,
+) -> Result<()> {
+    validate_agent_with_source_presence(root, spec, this_host, false)
+}
+
+fn validate_agent_with_source_presence(
+    root: &Path,
+    spec: &AgentSpec,
+    this_host: &str,
+    require_source_presence: bool,
+) -> Result<()> {
     crate::reconcile::validate_task_identities(std::slice::from_ref(spec), this_host)?;
     let plan = parse_plan_with_driver(spec, this_host)?;
     if plan.ops.is_empty() {
@@ -1221,7 +1246,7 @@ pub fn validate_agent(root: &Path, spec: &AgentSpec, this_host: &str) -> Result<
                 destination: raw_destination,
                 ..
             } => {
-                source(root, spec_dir, &raw_source, &env)?;
+                source(root, spec_dir, &raw_source, &env, require_source_presence)?;
                 destination(&workspace, &raw_destination, &env)?;
             }
             RenderOp::File {
@@ -1546,5 +1571,38 @@ mod tests {
         assert_eq!(*settings.1, ArrayMerge::Union);
         let rendered: serde_json::Value = serde_json::from_str(settings.0).unwrap();
         assert_eq!(rendered, crate::hooks::claude_settings_registration());
+    }
+
+    #[test]
+    fn source_presence_does_not_require_an_external_absolute_path() {
+        let catalog = tempfile::tempdir().unwrap();
+        let external = catalog
+            .path()
+            .parent()
+            .unwrap()
+            .join(format!("missing-external-{}", std::process::id()));
+        let env = BTreeMap::new();
+
+        assert_eq!(
+            source(
+                catalog.path(),
+                catalog.path(),
+                external.to_str().unwrap(),
+                &env,
+                true,
+            )
+            .unwrap(),
+            external
+        );
+        assert!(
+            source(
+                catalog.path(),
+                catalog.path(),
+                catalog.path().join("missing").to_str().unwrap(),
+                &env,
+                true,
+            )
+            .is_err()
+        );
     }
 }

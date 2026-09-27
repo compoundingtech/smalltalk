@@ -31,6 +31,37 @@ A running instance of an agent declaration.
 Authority: [declared runtime vision](vision.md);
 [`AgentSpec` runtime model](../../crates/agent-spec/src/spec.rs)
 
+### residency policy
+
+The Agent Spec choice `always | on-demand`. `always` requires a
+desired-running agent to remain resident. `on-demand` permits host policy to
+make it cold. The policy never changes desired state.
+
+The declaration field is `residency-policy`. Avoid using *suspended* for the
+cold runtime state; suspended is explicit desired lifecycle.
+
+Authority: [R44 declared residency policy](requirements.md);
+[on-demand residency](spec.md#on-demand-residency-r44-r46)
+
+### runtime residency
+
+The host-local on-demand lifecycle state `active | quiescing | stopping | cold
+| starting | refused`. Runtime residency is distinct from desired state,
+[session state](#session-state), [observed harness state](#observed-harness-state),
+and delivery evidence.
+
+Authority: [R45 lossless on-demand transition](requirements.md);
+[`residency`](../../src/residency.rs)
+
+### wake demand
+
+Durable work that requires a cold agent to become active. The initial sources
+are an unread inbox message and an explicit operator wake or attach request.
+Observation alone is not wake demand.
+
+Authority: [R46 durable wake demand](requirements.md);
+[on-demand residency](spec.md#on-demand-residency-r44-r46)
+
 ### agent task
 
 A terminal-backed or terminal-free unit declared for an agent.
@@ -409,6 +440,44 @@ and st2 does not resolve one into the other ([R20](requirements.md)).
 
 Authority: [`message::with_resolved_state_dir`](../../src/message.rs);
 [07-resource spec](07-resource/spec.md)
+
+### resource root
+
+The catalog-relative directory that bounds one actor: the parent of an agent's
+`resources/` directory. For a declared agent it is the declaration's parent
+directory; for a [direct OMP actor](#direct-omp-actor) it is
+`agents/<host>/direct.omp.<encoded-pty-id>`. `st2 catalog graph --json`
+publishes it as `resourceRoot`, so consumers bound per-actor views without
+inferring subject boundaries. Not a Resource binding and not the
+[agent resource directory](#agent-resource-directory) itself.
+
+Authority: [R47](requirements.md); [`catalog_graph`](../../src/catalog_graph.rs)
+
+### direct OMP actor
+
+One stable PTY session running OMP without a declaration, addressed as
+`<host>.direct.omp.<encoded-pty-id>`. The identity decodes strictly to the
+exact PTY session ID, which is the only join to its runtime: the actor is dead
+when the catalog's PTY registry holds no running record for that ID. Its live
+directory is archived once that death, measured from the supervisor's first
+observation of it, outlives the `archive-after` grace period, like a retired
+seat's. Never an `agents` row: a directory holding a declaration is a declared
+agent whatever its name looks like.
+
+Authority: [R47](requirements.md), [R48](requirements.md);
+[`direct_actor`](../../src/direct_actor.rs)
+
+### death observation
+
+The supervisor's record of when it first saw a [direct OMP
+actor](#direct-omp-actor) without a running PTY record, kept in
+`.st2/direct-dead-observed.json`. It is dropped when the PTY runs again and
+when the actor is archived, so each death serves a fresh grace period. The
+direct-actor counterpart of the retirement observation.
+
+Authority: [R48](requirements.md); [`direct_actor`](../../src/direct_actor.rs);
+[`catalog_archive`](../../src/catalog_archive.rs);
+[`0018-st2-owns-direct-actor-lifecycle`](.decisions/0018-st2-owns-direct-actor-lifecycle.md)
 
 ### working state
 

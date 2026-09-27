@@ -85,7 +85,24 @@ impl SessionObserver {
         harness: &'static str,
         pty_session: &str,
     ) -> anyhow::Result<Self> {
-        let session = harness_state::session_token();
+        Self::with_session(
+            agent_dir,
+            identity,
+            harness,
+            pty_session,
+            harness_state::session_token(),
+        )
+    }
+
+    /// Claim an explicitly supplied session incarnation for a host-owned launch attempt.
+    pub(crate) fn with_session(
+        agent_dir: &Path,
+        identity: &str,
+        harness: &'static str,
+        pty_session: &str,
+        session: String,
+    ) -> anyhow::Result<Self> {
+        anyhow::ensure!(!session.is_empty(), "provider session incarnation is empty");
         let seq = harness_state::claim(agent_dir, identity, harness, &session)?;
         Ok(Self {
             seq,
@@ -188,6 +205,7 @@ pub(crate) fn describe_exit(exit: ExitStatus) -> String {
 /// `refresh_interval` for exactly as long as the spawned child lives. Fails on a nonzero exit;
 /// wrappers that need the exit itself use [`run_provider_observed`]. With an observer, the
 /// terminal record lands on every exit path this process survives.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_provider(
     provider: &str,
@@ -199,11 +217,37 @@ pub(crate) fn run_provider(
     stop: &AtomicBool,
     observed: Option<&SessionObserver>,
 ) -> Result<()> {
-    match run_provider_observed(
+    run_provider_with_env_removals(
         provider,
         status_path,
         argv,
         env,
+        &[],
+        refresh_interval,
+        poll,
+        stop,
+        observed,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_provider_with_env_removals(
+    provider: &str,
+    status_path: &Path,
+    argv: &[String],
+    env: &[(String, String)],
+    removed_env: &[&str],
+    refresh_interval: Duration,
+    poll: Duration,
+    stop: &AtomicBool,
+    observed: Option<&SessionObserver>,
+) -> Result<()> {
+    match run_provider_observed_with_env_removals(
+        provider,
+        status_path,
+        argv,
+        env,
+        removed_env,
         refresh_interval,
         poll,
         stop,
@@ -234,11 +278,12 @@ pub(crate) fn run_provider_observed(
     stop: &AtomicBool,
     observed: Option<&SessionObserver>,
 ) -> Result<ProviderOutcome> {
-    run_provider_observed_inner(
+    run_provider_observed_with_env_removals(
         provider,
         status_path,
         argv,
         env,
+        &[],
         refresh_interval,
         poll,
         stop,
@@ -247,11 +292,12 @@ pub(crate) fn run_provider_observed(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn run_provider_observed_inner(
+pub(crate) fn run_provider_observed_with_env_removals(
     provider: &str,
     status_path: &Path,
     argv: &[String],
     env: &[(String, String)],
+    removed_env: &[&str],
     refresh_interval: Duration,
     poll: Duration,
     stop: &AtomicBool,
@@ -266,9 +312,7 @@ fn run_provider_observed_inner(
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
-    for (key, value) in env {
-        command.env(key, value);
-    }
+    apply_provider_environment(&mut command, env, removed_env);
     unsafe {
         command.pre_exec(|| {
             libc::signal(libc::SIGINT, libc::SIG_DFL);
@@ -312,6 +356,19 @@ fn run_provider_observed_inner(
             next_refresh = now + refresh_interval;
         }
         thread::sleep(poll.min(next_refresh.saturating_duration_since(Instant::now())));
+    }
+}
+
+fn apply_provider_environment(
+    command: &mut Command,
+    env: &[(String, String)],
+    removed_env: &[&str],
+) {
+    for key in removed_env {
+        command.env_remove(key);
+    }
+    for (key, value) in env {
+        command.env(key, value);
     }
 }
 
@@ -418,5 +475,61 @@ mod tests {
         // The arm the label calls unknown really is the one neither half of the pair answers.
         let stopped = ExitStatus::from_raw(0x7f);
         assert_eq!((stopped.code(), stopped.signal()), (None, None));
+    }
+    #[test]
+    fn an_explicit_session_incarnation_is_claimed_exactly() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _observer = SessionObserver::with_session(
+            tmp.path(),
+            "hetz.worker",
+            "claude",
+            "hetz.worker",
+            "attempt-exact".into(),
+        )
+        .unwrap();
+        let record: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(harness_state::harness_state_path(tmp.path())).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(record["incarnation"], "attempt-exact");
+
+        let error = SessionObserver::with_session(
+            tmp.path(),
+            "hetz.worker",
+            "claude",
+            "hetz.worker",
+            String::new(),
+        )
+        .err()
+        .unwrap();
+        assert!(error.to_string().contains("incarnation is empty"));
+    }
+
+    #[test]
+    fn explicit_environment_removal_precedes_managed_values() {
+        const FENCE: &str = "ST2_TEST_PROVIDER_FENCE";
+        let value_for = |command: &Command| {
+            command
+                .get_envs()
+                .find(|(key, _)| *key == std::ffi::OsStr::new(FENCE))
+                .map(|(_, value)| value.map(|value| value.to_owned()))
+        };
+
+        let mut ordinary = Command::new("true");
+        ordinary.env(FENCE, "ambient");
+        apply_provider_environment(&mut ordinary, &[], &[FENCE]);
+        assert_eq!(value_for(&ordinary), Some(None));
+
+        let mut required = Command::new("true");
+        required.env(FENCE, "ambient");
+        apply_provider_environment(
+            &mut required,
+            &[(FENCE.to_string(), "required".to_string())],
+            &[FENCE],
+        );
+        assert_eq!(
+            value_for(&required),
+            Some(Some(std::ffi::OsString::from("required")))
+        );
     }
 }

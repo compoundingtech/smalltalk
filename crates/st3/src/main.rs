@@ -1286,6 +1286,9 @@ struct MessageSendArgs {
 struct MessageListArgs {
     /// Mailbox identity; defaults to the non-empty ST_AGENT value.
     identity: Option<String>,
+    /// The same mailbox identity, spelled like `conversations read --as`.
+    #[arg(long = "as", conflicts_with = "identity")]
+    actor: Option<String>,
     #[arg(long)]
     archive: bool,
     #[arg(long)]
@@ -5024,6 +5027,41 @@ async fn put_document_bytes(
         .await
 }
 
+/// A harness process names its own seat in `ST_AGENT`. The local API trusts the actor a command
+/// names, so a model that inferred the wrong identity could otherwise read and send as a peer seat.
+/// The process may still act as a non-agent subject, such as its exec or a person its work names.
+fn reject_foreign_agent_actor(actor: &str) -> Result<()> {
+    let own = std::env::var("ST_AGENT").ok();
+    let mission_run = std::env::var("ST_MISSION_RUN")
+        .ok()
+        .filter(|value| !value.is_empty());
+    match foreign_agent_actor(actor, own.as_deref(), mission_run.as_deref()) {
+        Some(message) => anyhow::bail!(message),
+        None => Ok(()),
+    }
+}
+
+fn foreign_agent_actor(
+    actor: &str,
+    own: Option<&str>,
+    mission_run: Option<&str>,
+) -> Option<String> {
+    let own = own.map(str::trim).filter(|own| own.starts_with("agent/"))?;
+    let actor = actor.trim();
+    let actor = if actor.starts_with("agent/") {
+        actor.to_owned()
+    } else if actor.contains('/') {
+        return None;
+    } else {
+        normalize_message_subject_in_run(actor, mission_run)
+    };
+    (actor != own).then(|| {
+        format!(
+            "this harness is `{own}` (ST_AGENT) and cannot act as `{actor}`; use `--as \"$ST_AGENT\"` or `--from \"$ST_AGENT\"`"
+        )
+    })
+}
+
 fn normalize_message_subject(value: &str) -> String {
     let mission_run = std::env::var("ST_MISSION_RUN")
         .ok()
@@ -5068,6 +5106,9 @@ fn normalize_agent_subject(identity: &str) -> String {
 }
 
 async fn run_claim(client: &Client, args: ClaimArgs, json_output: bool) -> Result<()> {
+    if let Some(actor) = &args.actor {
+        reject_foreign_agent_actor(actor)?;
+    }
     let response: ClaimRecord = client
         .post(
             "/v1/claims",
@@ -5677,6 +5718,7 @@ async fn post_work(
     json_output: bool,
 ) -> Result<()> {
     let actor = args.actor.context("a work action needs explicit --as")?;
+    reject_foreign_agent_actor(&actor)?;
     let incarnation = match args.incarnation {
         Some(incarnation) => Some(incarnation),
         None => current_agent_incarnation(client, &actor).await?,
@@ -5843,7 +5885,10 @@ async fn run_message(
             }
         }
         MessageCommand::Ls(args) => {
-            let identity = message_list_identity(args.identity, std::env::var("ST_AGENT").ok())?;
+            let identity = message_list_identity(
+                args.identity.or(args.actor),
+                std::env::var("ST_AGENT").ok(),
+            )?;
             let sender = args.sender.map(|sender| normalize_message_subject(&sender));
             let mut count = 0_u64;
             let mut first = true;
@@ -5890,6 +5935,7 @@ async fn run_message(
             let actor = args
                 .actor
                 .context("message read needs explicit --as to record its lifecycle")?;
+            reject_foreign_agent_actor(&actor)?;
             let mut messages = Vec::with_capacity(args.references.len());
             for reference in args.references {
                 messages.push(
@@ -5959,6 +6005,7 @@ async fn run_message(
             let actor = args
                 .actor
                 .context("message archive needs explicit --as to record its lifecycle")?;
+            reject_foreign_agent_actor(&actor)?;
             let mut claims = Vec::with_capacity(args.references.len());
             for reference in args.references {
                 let message = read_message(client, &reference).await?;
@@ -6072,6 +6119,7 @@ async fn run_message(
 async fn send_message(client: &Client, args: MessageSendArgs) -> Result<Option<MessageView>> {
     let id = uuid::Uuid::now_v7().simple().to_string();
     let mission_id = format!("message/{id}");
+    reject_foreign_agent_actor(&args.from)?;
     let from = normalize_message_subject(&args.from);
     let to = normalize_message_subject(&args.to);
     let kdl = message_mission_intent(
@@ -6472,6 +6520,13 @@ fn planning_cancellation_intent(session_id: &str, operation_id: &str, reason: &s
 }
 
 fn parse_person_subject(actor: &str) -> std::result::Result<String, String> {
+    if actor.starts_with("agent/") {
+        // Agents reached for `now --as "$ST_AGENT"` and read the person-authority refusal as a
+        // refusal of their own identity everywhere; name the agent commands instead.
+        return Err(format!(
+            "this option takes a person, not the agent `{actor}`; an agent lists its work with `st3 work ls --as \"$ST_AGENT\"` and its mail with `st3 conversations ls \"$ST_AGENT\"`"
+        ));
+    }
     let name = actor.strip_prefix("person/").ok_or_else(|| {
         "human authority must be explicit as a complete `person/NAME` subject".to_owned()
     })?;
@@ -7320,6 +7375,43 @@ async fn publish_harness_state(
     Ok(())
 }
 
+/// One pi-family message frame. The content is the shared st3 envelope that Codex and Claude also
+/// receive, steered into a running turn at its next tool boundary. omp backgrounds an in-flight
+/// shell or eval call when a steer arrives, and one live omp seat then repeated a send whose
+/// result it had not seen. Queueing mail with `followUp` instead was measured and was worse: omp
+/// read the queued messages during its turn, the queue then re-delivered them as new prompts, and
+/// seats that answered those stale prompts declined the next real task in three of six
+/// cross-harness runs.
+fn pi_family_message_frame(message: &st3::model::MessageView, body: &str, identity: &str) -> Value {
+    json!({
+        "type": "message",
+        "deliverAs": "steer",
+        "content": st2::ding::st3_notification_text(
+            &message.subject,
+            &message.from,
+            message.title.as_deref(),
+            body,
+        ),
+        "meta": {
+            "from": message.from,
+            "messageId": message.subject,
+            "threadId": message.in_reply_to.clone().unwrap_or_else(|| message.subject.clone()),
+            "identity": identity,
+        },
+    })
+}
+
+/// Session-start context for pi-family seats. It restates the st3 boot contract only: st3 has no
+/// availability or busy status, so st2 status vocabulary sends the model searching for commands
+/// that do not exist before it claims ready work. It also names the seat, because omp's Python
+/// tool runs with a filtered environment that drops `ST_AGENT` and `ST3_BIN`; a model that probes
+/// there first must not infer its identity from the fleet listing.
+fn pi_family_session_ritual(subject: &str) -> String {
+    format!(
+        "Follow .st3/boot.md now. You are `{subject}`; your shell tool also has it as `$ST_AGENT` and the st3 executable as `$ST3_BIN`. Read and archive handled graph messages, then list, claim, do, and finish your ready st3 work."
+    )
+}
+
 async fn run_pi_channel(client: &Client, subject: &str, driver: &str) -> Result<()> {
     use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
 
@@ -7329,9 +7421,9 @@ async fn run_pi_channel(client: &Client, subject: &str, driver: &str) -> Result<
     let context = latest_document_text(client, &context_name)
         .await?
         .unwrap_or_default();
-    let ritual = "Run the st3 boot ritual now. Set your status to available. Drain and archive your graph message inbox. Set busy before work.";
+    let ritual = pi_family_session_ritual(subject);
     let session_context = if context.trim().is_empty() {
-        ritual.into()
+        ritual
     } else {
         format!(
             "<context source=\"st3/context/now.md\" agent=\"{identity}\">\n{}\n</context>\n\n{ritual}",
@@ -7395,13 +7487,7 @@ async fn run_pi_channel(client: &Client, subject: &str, driver: &str) -> Result<
                     }
                     Some("delivered") => {
                         let Some(message) = frame.pointer("/meta/messageId").and_then(Value::as_str) else { continue; };
-                        deliver_message(
-                            client,
-                            message,
-                            subject,
-                            format!("pi-delivered:{subject}:{message}"),
-                        )
-                        .await?;
+                        acknowledge_pi_family_delivery(client, subject, message).await?;
                     }
                     _ => {}
                 }
@@ -7415,23 +7501,7 @@ async fn run_pi_channel(client: &Client, subject: &str, driver: &str) -> Result<
                         continue;
                     }
                     let body = message_content(client, &message).await?;
-                    let content = st2::ding::st3_notification_text(
-                        &message.subject,
-                        &message.from,
-                        message.title.as_deref(),
-                        &body,
-                    );
-                    let frame = json!({
-                        "type": "message",
-                        "deliverAs": "steer",
-                        "content": content,
-                        "meta": {
-                            "from": message.from,
-                            "messageId": message.subject,
-                            "threadId": message.in_reply_to.unwrap_or_else(|| message.subject.clone()),
-                            "identity": identity,
-                        },
-                    });
+                    let frame = pi_family_message_frame(&message, &body, identity);
                     stdout.write_all(serde_json::to_string(&frame)?.as_bytes()).await?;
                     stdout.write_all(b"\n").await?;
                     stdout.flush().await?;
@@ -7461,6 +7531,34 @@ async fn run_pi_channel(client: &Client, subject: &str, driver: &str) -> Result<
                 }
             }
         }
+    }
+}
+
+/// Record that a pi-family harness took one message.
+///
+/// The recipient can read a message through the CLI before its channel acknowledges the handoff,
+/// and the omp channel holds mail until a tool batch returns, so the acknowledgement can arrive
+/// after the message has moved past delivery. Such a message needs no acknowledgement. Failing
+/// here would end the channel and leave the seat with no mail or state
+/// (cross-omp-hold-astra-20260927-a).
+async fn acknowledge_pi_family_delivery(
+    client: &Client,
+    subject: &str,
+    message: &str,
+) -> Result<()> {
+    let Err(error) = deliver_message(
+        client,
+        message,
+        subject,
+        format!("pi-delivered:{subject}:{message}"),
+    )
+    .await
+    else {
+        return Ok(());
+    };
+    match read_message(client, message).await {
+        Ok(view) if matches!(view.status.as_str(), "delivered" | "read" | "closed") => Ok(()),
+        _ => Err(error),
     }
 }
 
@@ -8416,6 +8514,99 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
+    fn conversations_ls_accepts_the_read_spelling_of_its_mailbox() {
+        let cli = Cli::try_parse_from(["st3", "conversations", "ls", "--as", "agent/run-1/worker"])
+            .expect("conversations ls --as parses");
+        let Command::Conversations {
+            command: MessageCommand::Ls(args),
+        } = cli.command
+        else {
+            panic!("conversations ls")
+        };
+        assert_eq!(args.actor.as_deref(), Some("agent/run-1/worker"));
+        assert!(
+            Cli::try_parse_from(["st3", "conversations", "ls", "agent/a", "--as", "agent/b"])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn pi_family_mail_uses_the_shared_envelope_and_the_steer_boundary() {
+        let message = st3::model::MessageView {
+            subject: "message/0123456789abcdef".into(),
+            from: "agent/run-1/wake.claude".into(),
+            to: "agent/run-1/wake.omp-2".into(),
+            content: "FACT QUARTZ".into(),
+            status: "sent".into(),
+            title: Some("Cross-harness consensus: idle".into()),
+            in_reply_to: None,
+            tags: vec![],
+            created_index: 1,
+        };
+        let omp = pi_family_message_frame(&message, "FACT QUARTZ", "run-1/wake.omp-2");
+        assert_eq!(omp["deliverAs"], "steer");
+        assert_eq!(
+            omp["content"],
+            st2::ding::st3_notification_text(
+                "message/0123456789abcdef",
+                "agent/run-1/wake.claude",
+                Some("Cross-harness consensus: idle"),
+                "FACT QUARTZ",
+            )
+        );
+        assert!(
+            omp["content"].as_str().unwrap().starts_with(
+                "[PING from st3] message/0123456789abcdef from agent/run-1/wake.claude:"
+            )
+        );
+        assert_eq!(omp["meta"]["messageId"], "message/0123456789abcdef");
+    }
+
+    #[test]
+    fn a_person_option_points_an_agent_to_its_own_commands() {
+        let refusal = parse_person_subject("agent/run-1/worker").unwrap_err();
+        assert!(refusal.contains("takes a person, not the agent `agent/run-1/worker`"));
+        assert!(refusal.contains("work ls --as"));
+        assert_eq!(
+            parse_person_subject("person/operator").as_deref(),
+            Ok("person/operator")
+        );
+        assert!(parse_person_subject("operator").is_err());
+    }
+
+    #[test]
+    fn a_harness_cannot_act_as_another_agent() {
+        let own = Some("agent/run-1/wake.omp-2");
+        let run = Some("run-1");
+        let refusal = foreign_agent_actor("agent/run-1/wake.codex", own, run).unwrap();
+        assert!(refusal.contains("this harness is `agent/run-1/wake.omp-2`"));
+        assert!(foreign_agent_actor("wake.codex", own, run).is_some());
+        assert!(foreign_agent_actor("agent/run-1/wake.omp-2", own, run).is_none());
+        assert!(foreign_agent_actor("wake.omp-2", own, run).is_none());
+        // Non-agent actors and processes without a seat identity are not seat impersonation.
+        assert!(foreign_agent_actor("person/eval-requester", own, run).is_none());
+        assert!(foreign_agent_actor("exec/run-1/controller", own, run).is_none());
+        assert!(foreign_agent_actor("agent/run-1/wake.codex", None, run).is_none());
+        assert!(
+            foreign_agent_actor("agent/run-1/wake.codex", Some("person/operator"), run).is_none()
+        );
+    }
+
+    #[test]
+    fn pi_family_session_ritual_uses_only_the_st3_boot_contract() {
+        let ritual = pi_family_session_ritual("agent/fleet/example/omp");
+        assert!(ritual.contains("You are `agent/fleet/example/omp`"));
+        let ritual = ritual.to_ascii_lowercase();
+        assert!(ritual.contains(".st3/boot.md"));
+        for st2_vocabulary in ["status", "available", "busy", "st2"] {
+            assert!(
+                !ritual.contains(st2_vocabulary),
+                "the pi-family session ritual mentions `{st2_vocabulary}`"
+            );
+        }
+    }
+
+    #[test]
     fn agent_card_shows_current_and_next_work_ids() {
         let resource: st3_client::Resource = serde_json::from_value(serde_json::json!({
             "kind": "agent", "id": "agent/worker", "revision": "one",
@@ -8483,6 +8674,108 @@ mod tests {
              2026-09-24T09:03:00.000Z  person/operator moved mission-run/held before \
              mission-run/gated: finish the build first\n"
         );
+    }
+
+    #[tokio::test]
+    async fn a_pi_family_delivery_after_the_recipient_read_the_message_keeps_the_channel() {
+        let root = tempfile::tempdir().unwrap();
+        let socket = root.path().join("st3.sock");
+        let store = Arc::new(Store::open_memory("pi-delivery-test").unwrap());
+        let seat = "agent/run-1/wake.omp";
+        let claim =
+            |subject: &str, kind: &str, actor: &str, fields: Vec<(&str, &str)>| ClaimInput {
+                subject: subject.into(),
+                kind: kind.into(),
+                actor: Some(actor.into()),
+                fields: fields
+                    .into_iter()
+                    .map(|(key, value)| (key.to_owned(), Value::String(value.into())))
+                    .collect(),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            };
+        for subject in ["message/held", "message/pending"] {
+            store
+                .append_claim(&claim(
+                    subject,
+                    "message.sent",
+                    "agent/run-1/wake.codex",
+                    vec![
+                        ("from", "agent/run-1/wake.codex"),
+                        ("to", seat),
+                        ("content", "AGREEMENT EMBER+ORBIT"),
+                        ("status", "sent"),
+                    ],
+                ))
+                .unwrap();
+        }
+        // The seat read the held message through the CLI, which records delivery and the read.
+        for lifecycle in ["delivered", "read"] {
+            store
+                .append_claim(&claim(
+                    "message/held",
+                    &format!("message.{lifecycle}"),
+                    seat,
+                    vec![("status", lifecycle)],
+                ))
+                .unwrap();
+        }
+        let state = AppState {
+            store: store.clone(),
+            notify: Arc::new(Notify::new()),
+            event_notify: watch::channel(0_u64).0,
+            node: "pi-delivery-test".into(),
+            state_dir: root.path().to_path_buf(),
+            pty_root: root.path().join("pty"),
+            pty_binary: PathBuf::from("pty"),
+            fleet_id: None,
+            configured_peers: Vec::new(),
+            client_relay: None,
+            native_session_home: None,
+            planner_default: PlannerSpec::default(),
+        };
+        let server_socket = socket.clone();
+        let server = tokio::spawn(async move {
+            serve_unix(&server_socket, router(state)).await.unwrap();
+        });
+        for _ in 0..100 {
+            if socket.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        assert!(socket.exists(), "the test API socket did not start");
+        let client = Client::unix(&socket);
+
+        // The late acknowledgement itself is still an invalid transition...
+        assert!(
+            deliver_message(&client, "message/held", seat, "late".into())
+                .await
+                .is_err()
+        );
+        // ...but it must not end the channel.
+        acknowledge_pi_family_delivery(&client, seat, "message/held")
+            .await
+            .unwrap();
+        assert_eq!(
+            store.message("message/held").unwrap().unwrap().status,
+            "read"
+        );
+        acknowledge_pi_family_delivery(&client, seat, "message/pending")
+            .await
+            .unwrap();
+        assert_eq!(
+            store.message("message/pending").unwrap().unwrap().status,
+            "delivered"
+        );
+        // A message that does not exist is still an error.
+        assert!(
+            acknowledge_pi_family_delivery(&client, seat, "message/absent")
+                .await
+                .is_err()
+        );
+        server.abort();
     }
 
     #[tokio::test]

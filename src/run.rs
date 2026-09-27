@@ -11,7 +11,7 @@
 //! pty sessions and keep running; only a `retired` spec tears an agent down.
 
 use std::cell::RefCell;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::os::unix::fs::MetadataExt as _;
@@ -106,6 +106,13 @@ pub trait Runner {
     }
     /// Finally remove an exited session's files (retirement/final garbage collection).
     fn remove(&self, pty_id: &str) -> anyhow::Result<()>;
+    /// The ids the PTY backend alone reported running in the last `list_sessions`. Direct OMP
+    /// actor liveness is PTY evidence only, so a running `exec` task that shares the id must not
+    /// count. `None` means the runner has no separate PTY backend: every running row of its
+    /// snapshot is PTY evidence.
+    fn running_pty_ids(&self) -> Option<BTreeSet<String>> {
+        None
+    }
 }
 
 /// Production [`Runner`]. Shells out to the `pty` CLI for tasks. (M1a routes both `pty` and `exec`
@@ -713,6 +720,58 @@ impl PtyCli {
         serde_json::from_slice(&out.stdout)
             .map_err(|error| anyhow::anyhow!("parsing `pty stats --json`: {error}"))
     }
+
+    fn stats_entry_at(&self, root: &Path, pty_id: &str) -> anyhow::Result<PtyStatsEntry> {
+        let out = output_full_stdout_with_timeout(
+            Command::new(&self.bin)
+                .args(["stats", "--json", pty_id])
+                .env("PTY_ROOT", root),
+            PTY_LIST_TIMEOUT,
+        )
+        .map_err(|error| anyhow::anyhow!("`pty stats --json {pty_id}` failed: {error}"))?;
+        if !out.status.success() {
+            anyhow::bail!(
+                "`pty stats --json {pty_id}` failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        serde_json::from_slice(&out.stdout)
+            .map_err(|error| anyhow::anyhow!("parsing `pty stats --json {pty_id}`: {error}"))
+    }
+
+    /// Prove that a successful detached launch produced one live generation.
+    ///
+    /// `pty list` is registry state and can briefly retain `running` after the
+    /// process exits. The socket-backed stats reply is the linearization point:
+    /// it must report a live process for the same daemon PID and `createdAt`
+    /// generation that the registry named.
+    fn confirm_spawned_session(&self, pty_id: &str, root: &Path) -> anyhow::Result<()> {
+        let entries = self.list_entries_at(root)?;
+        let mut matching = entries.iter().filter(|entry| entry.name == pty_id);
+        let Some(initial) = matching.next() else {
+            anyhow::bail!("spawned pty '{pty_id}' is absent from `pty list --json`");
+        };
+        anyhow::ensure!(
+            matching.next().is_none(),
+            "spawned pty '{pty_id}' has duplicate `pty list --json` entries"
+        );
+        anyhow::ensure!(
+            initial.status == "running",
+            "spawned pty '{pty_id}' is not running (`pty list --json` reported {:?})",
+            initial.status
+        );
+        anyhow::ensure!(
+            initial.pid.is_some() && initial.created_at.is_some(),
+            "spawned pty '{pty_id}' lacks daemon generation evidence"
+        );
+
+        let stats = self.stats_entry_at(root, pty_id)?;
+        confirm_pty_generation(initial, std::slice::from_ref(&stats)).map_err(|reason| {
+            anyhow::anyhow!(
+                "spawned pty '{pty_id}' failed identity-bound liveness confirmation: {reason:?}"
+            )
+        })
+    }
 }
 
 /// Apply both assignments and removals from an inner command to its isolation wrapper.
@@ -758,6 +817,7 @@ impl Runner for PtyCli {
         let args: Vec<OsString> = inner.get_args().map(|a| a.to_os_string()).collect();
         let arg_refs: Vec<&std::ffi::OsStr> = args.iter().map(|a| a.as_os_str()).collect();
         let unit = crate::isolate::scope_unit(&target.pty_id);
+        let pty_root = effective_pty_root(&self.catalog_root);
 
         // Atomic reap-then-respawn: a session id JUST reaped in this same pass (execute's
         // reap-then-respawn after a hard-kill) can linger microseconds in the per-session pty daemon —
@@ -773,7 +833,7 @@ impl Runner for PtyCli {
             apply_command_env(&inner, &mut cmd);
             let out = cmd.output()?;
             if out.status.success() {
-                return Ok(());
+                return self.confirm_spawned_session(&target.pty_id, &pty_root);
             }
             last_err = String::from_utf8_lossy(&out.stderr).trim().to_string();
             let corpse_race = last_err.contains("already in use");
@@ -784,7 +844,7 @@ impl Runner for PtyCli {
             let _ = Command::new(&self.bin)
                 .arg("rm")
                 .arg(&target.pty_id)
-                .env("PTY_ROOT", effective_pty_root(&self.catalog_root))
+                .env("PTY_ROOT", &pty_root)
                 .output();
             std::thread::sleep(Duration::from_millis(100 * u64::from(attempt + 1)));
         }
@@ -870,6 +930,9 @@ pub struct SystemRunner {
     exec: ExecBackend,
     /// id → kind, refreshed each `list_sessions`, so kill/remove hit the right backend.
     index: RefCell<HashMap<String, TaskKind>>,
+    /// Ids the PTY backend reported running in the last `list_sessions`. Kept apart from `index`,
+    /// which an `exec` record with the same id overwrites.
+    running_pty: RefCell<BTreeSet<String>>,
 }
 
 impl SystemRunner {
@@ -879,6 +942,7 @@ impl SystemRunner {
             pty: PtyCli::new(catalog_root.clone()),
             exec: ExecBackend::new(exec_state_dir, catalog_root),
             index: RefCell::new(HashMap::new()),
+            running_pty: RefCell::new(BTreeSet::new()),
         }
     }
 
@@ -982,12 +1046,21 @@ impl Runner for SystemRunner {
         for s in &all {
             idx.insert(s.pty_id.clone(), TaskKind::Pty);
         }
+        *self.running_pty.borrow_mut() = all
+            .iter()
+            .filter(|s| s.alive)
+            .map(|s| s.pty_id.clone())
+            .collect();
         let ex = self.exec.list()?;
         for s in &ex {
             idx.insert(s.pty_id.clone(), TaskKind::Exec);
         }
         all.extend(ex);
         Ok(all)
+    }
+
+    fn running_pty_ids(&self) -> Option<BTreeSet<String>> {
+        Some(self.running_pty.borrow().clone())
     }
 
     fn spawn(&self, target: &TaskTarget, spec_dir: &Path) -> anyhow::Result<()> {
@@ -1105,8 +1178,8 @@ pub struct UpReport {
     pub other_host: Vec<String>,
     /// identities with no runnable task (unrendered).
     pub unrunnable: Vec<String>,
-    /// bus ids archived out of the live catalog this pass because their retirement outlived
-    /// `archive-after`.
+    /// bus ids archived out of the live catalog this pass because their retirement, or a direct
+    /// OMP actor's PTY death, outlived `archive-after`.
     pub archived: Vec<String>,
     /// discovery warnings (mismatches, …).
     pub warnings: Vec<String>,
@@ -1545,7 +1618,7 @@ impl LivenessDebounce {
 
     /// Record which ids are alive as of `now`, and forget ids not seen alive within the grace (bounds
     /// memory; a long-dead id past the grace is no longer debounced anyway).
-    fn observe(&mut self, sessions: &[Session], now: Instant) {
+    pub(crate) fn observe(&mut self, sessions: &[Session], now: Instant) {
         for s in sessions {
             if s.alive {
                 self.last_alive.insert(s.pty_id.clone(), now);
@@ -1556,7 +1629,7 @@ impl LivenessDebounce {
     }
 
     /// True if `id` was seen alive within the grace ending at `now` — a recent flicker, defer it.
-    fn recently_alive(&self, id: &str, now: Instant) -> bool {
+    pub(crate) fn recently_alive(&self, id: &str, now: Instant) -> bool {
         self.last_alive
             .get(id)
             .is_some_and(|&t| now.duration_since(t) < self.grace)
@@ -1633,6 +1706,7 @@ fn live_resync_specs(
 /// pass is SKIPPED (the error is recorded but nothing is reconciled) — treating a transient list
 /// failure as "no sessions" would double-spawn everything. `cap` carries flapping state across passes;
 /// `debounce` carries per-id liveness so a transient not-alive flicker isn't destructively reaped.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn reconcile_pass(
     root: &Path,
@@ -1644,6 +1718,32 @@ fn reconcile_pass(
     presentation_cursor: &mut PresentationPatchCursor,
     resync: Option<&crate::resync::ResyncSupervisor>,
     resource_profiles: Option<&crate::resource_profile_supervisor::ResourceProfileSupervisor>,
+) -> UpReport {
+    reconcile_pass_with_residency(
+        root,
+        this_host,
+        task_context,
+        runner,
+        cap,
+        debounce,
+        presentation_cursor,
+        resync,
+        resource_profiles,
+        None,
+    )
+}
+
+fn reconcile_pass_with_residency(
+    root: &Path,
+    this_host: &str,
+    task_context: &TaskCompileContext,
+    runner: &dyn Runner,
+    cap: &mut FlappingCap,
+    debounce: &mut LivenessDebounce,
+    presentation_cursor: &mut PresentationPatchCursor,
+    resync: Option<&crate::resync::ResyncSupervisor>,
+    resource_profiles: Option<&crate::resource_profile_supervisor::ResourceProfileSupervisor>,
+    residency_policy: Option<crate::residency_host::HostPolicy>,
 ) -> UpReport {
     let catalog_lock = {
         let span = catalog_lock_span();
@@ -1796,7 +1896,7 @@ fn reconcile_pass(
         }
         compiled_specs.push(spec);
     }
-    let eligible_specs = compiled_specs
+    let mut eligible_specs = compiled_specs
         .iter()
         .filter(|spec| !materialized.failed_agents.contains(&spec.bus_id(this_host)))
         .cloned()
@@ -1824,6 +1924,39 @@ fn reconcile_pass(
     };
     let now = Instant::now();
     debounce.observe(&sessions, now);
+    if residency_policy.is_none() {
+        let mut gated = Vec::new();
+        for spec in &mut eligible_specs {
+            if spec.residency_policy == crate::ResidencyPolicy::OnDemand
+                && spec.desired_state.is_running()
+                && spec.resolved_host(this_host) == this_host
+            {
+                for task in &mut spec.tasks {
+                    task.lifecycle = crate::TaskLifecycle::AdoptOnly;
+                }
+                gated.push(spec.bus_id(this_host));
+            }
+        }
+        if !gated.is_empty() {
+            report.errors.push(format!(
+                "on-demand agents require host --residency-idle-after and --residency-warm-capacity: {}; launches suppressed",
+                gated.join(", ")
+            ));
+        }
+    }
+    let residency_pass = residency_policy.map(|policy| {
+        crate::residency_host::before_reconcile(
+            root,
+            this_host,
+            &mut eligible_specs,
+            &sessions,
+            debounce,
+            now,
+            runner,
+            policy,
+            &mut report,
+        )
+    });
     let mut plan = match crate::reconcile(&eligible_specs, &sessions, this_host) {
         Ok(plan) => plan,
         Err(error) => {
@@ -1875,6 +2008,9 @@ fn reconcile_pass(
         &mut report,
         &mut install_new_live_seat,
     );
+    if let Some(pass) = residency_pass {
+        crate::residency_host::after_reconcile(runner, pass, &mut report);
+    }
     report.warnings.extend(boundary_warnings);
     if resync.is_some() || resource_profiles.is_some() {
         let loaded = crate::catalog::declared_profile_catalog(root)
@@ -1939,7 +2075,7 @@ fn reconcile_pass(
     // exclusive lock, which is what makes its eligibility decision current rather than a snapshot
     // this pass took before it launched anything.
     drop(catalog_lock);
-    archive_expired_retirements(root, this_host, &found.specs, &mut report);
+    archive_expired_retirements(root, this_host, &found, runner, &sessions, &mut report);
     report
 }
 
@@ -1948,8 +2084,8 @@ fn reconcile_pass(
 /// them — the same bound `MAX_PRESENTATION_PATCHES_PER_PASS` puts on presentation repair.
 const MAX_AUTO_ARCHIVED_PER_PASS: usize = 25;
 
-/// Archive retired seats whose grace period expired — the supervisor's half of
-/// `st2 catalog archive` (dotfiles#2411, Q11).
+/// Archive retired seats and dead direct OMP actors whose grace period expired — the supervisor's
+/// half of `st2 catalog archive` (dotfiles#2411, Q11).
 ///
 /// `archive-after "0"` in `catalog.kdl` disables the step entirely. It never queues for the
 /// exclusive lock: a pass blocked behind `st2 catalog apply` would stall every live agent's
@@ -1958,7 +2094,9 @@ const MAX_AUTO_ARCHIVED_PER_PASS: usize = 25;
 fn archive_expired_retirements(
     root: &Path,
     this_host: &str,
-    specs: &[agent_spec::spec::AgentSpec],
+    found: &crate::Discovered,
+    runner: &dyn Runner,
+    sessions: &[Session],
     report: &mut UpReport,
 ) {
     let grace = match crate::catalog::load(root) {
@@ -1970,7 +2108,19 @@ fn archive_expired_retirements(
             return;
         }
     };
-    if grace.is_zero() || !crate::catalog_archive::pass_has_work(root, this_host, specs, grace) {
+    if grace.is_zero() {
+        return;
+    }
+    // Direct actor liveness is PTY evidence only: an `exec` task sharing a dead actor's PTY id
+    // must not keep the actor live.
+    let running_pty = runner.running_pty_ids().unwrap_or_else(|| {
+        sessions
+            .iter()
+            .filter(|session| session.alive)
+            .map(|session| session.pty_id.clone())
+            .collect()
+    });
+    if !crate::catalog_archive::pass_has_work(root, this_host, found, &running_pty, grace) {
         return;
     }
 
@@ -1984,20 +2134,32 @@ fn archive_expired_retirements(
     match attempt {
         // Contended: someone is authoring the catalog right now, and the seats stay due.
         Ok(None) => {}
-        Ok(Some(result)) => {
-            for entry in result.archived {
+        Ok(Some(pass)) => {
+            for entry in pass.archive.archived {
                 tracing::info!(
                     target: "st2",
                     id = %entry.id,
                     to = %entry.to,
-                    "archived a retired agent out of the live catalog"
+                    "archived an agent out of the live catalog"
                 );
                 report.archived.push(entry.id);
             }
-            for refusal in result.refused {
+            for refusal in pass.archive.refused {
                 report.warnings.push(format!(
                     "auto-archive skipped {} [{}] {}",
                     refusal.id, refusal.code, refusal.message
+                ));
+            }
+            if pass.deferred > 0 {
+                report.warnings.push(format!(
+                    "auto-archive examined {} due retired seats and deferred {} to the next pass",
+                    pass.scanned, pass.deferred
+                ));
+            }
+            if pass.direct_deferred > 0 {
+                report.warnings.push(format!(
+                    "auto-archive examined {} due dead direct actors and deferred {} to the next pass",
+                    pass.direct_scanned, pass.direct_deferred
                 ));
             }
         }
@@ -2244,13 +2406,31 @@ fn finish_failed_reconcile_pass(span: &tracing::Span) {
 /// never `Err` — all failures are collected in `report.errors`. The debounce is throwaway too: a
 /// single pass has no prior liveness history, so it defers nothing (correct — one-shot has no flicker).
 pub fn up_once(root: &Path, this_host: &str, runner: &dyn Runner) -> anyhow::Result<UpReport> {
+    up_once_with_optional_residency(root, this_host, runner, None)
+}
+
+pub fn up_once_with_residency(
+    root: &Path,
+    this_host: &str,
+    runner: &dyn Runner,
+    policy: crate::residency_host::HostPolicy,
+) -> anyhow::Result<UpReport> {
+    up_once_with_optional_residency(root, this_host, runner, Some(policy))
+}
+
+fn up_once_with_optional_residency(
+    root: &Path,
+    this_host: &str,
+    runner: &dyn Runner,
+    policy: Option<crate::residency_host::HostPolicy>,
+) -> anyhow::Result<UpReport> {
     let task_context = TaskCompileContext::current(root.to_path_buf())?;
     let mut debounce = LivenessDebounce::new(DEBOUNCE_GRACE);
     let started = Instant::now();
     let span = reconcile_span(this_host, "catalog");
     let report = {
         let _entered = span.enter();
-        let report = reconcile_pass(
+        let report = reconcile_pass_with_residency(
             root,
             this_host,
             &task_context,
@@ -2260,6 +2440,7 @@ pub fn up_once(root: &Path, this_host: &str, runner: &dyn Runner) -> anyhow::Res
             &mut PresentationPatchCursor::default(),
             None,
             None,
+            policy,
         );
         finish_reconcile_pass(&span, &report);
         report
@@ -2853,6 +3034,27 @@ pub fn up_loop(
     )
 }
 
+pub fn up_loop_with_residency(
+    root: &Path,
+    this_host: &str,
+    runner: &dyn Runner,
+    interval: Duration,
+    policy: crate::residency_host::HostPolicy,
+    on_report: impl FnMut(&UpReport),
+) -> anyhow::Result<()> {
+    install_signal_handler();
+    up_loop_until_with_residency(
+        root,
+        this_host,
+        runner,
+        interval,
+        &STOP,
+        best_effort_catalog_watcher,
+        Some(policy),
+        on_report,
+    )
+}
+
 fn up_loop_until(
     root: &Path,
     this_host: &str,
@@ -2860,10 +3062,43 @@ fn up_loop_until(
     interval: Duration,
     stop: &AtomicBool,
     install_watcher: impl FnOnce(&Path, Sender<()>) -> Option<crate::watch::CatalogReconcileWatcher>,
+    on_report: impl FnMut(&UpReport),
+) -> anyhow::Result<()> {
+    up_loop_until_with_residency(
+        root,
+        this_host,
+        runner,
+        interval,
+        stop,
+        install_watcher,
+        None,
+        on_report,
+    )
+}
+
+fn up_loop_until_with_residency(
+    root: &Path,
+    this_host: &str,
+    runner: &dyn Runner,
+    interval: Duration,
+    stop: &AtomicBool,
+    install_watcher: impl FnOnce(&Path, Sender<()>) -> Option<crate::watch::CatalogReconcileWatcher>,
+    residency_policy: Option<crate::residency_host::HostPolicy>,
     mut on_report: impl FnMut(&UpReport),
 ) -> anyhow::Result<()> {
     let task_context = TaskCompileContext::current(root.to_path_buf())?;
     let (tx, rx) = channel::<()>();
+    // Residency wake requests live under `.st2`, which declaration watching deliberately prunes.
+    // Create the bounded control directory durably before subscribing to it with an independent
+    // watcher so a request wakes this loop immediately without expanding declaration authority.
+    let _residency_watcher = residency_policy
+        .map(|_| {
+            let dir = crate::residency_host::prepare_wake_dir(root)
+                .context("prepare residency wake control directory")?;
+            crate::watch::watch_recursive_mutations(&dir, tx.clone())
+                .context("install residency wake control watcher")
+        })
+        .transpose()?;
     let mut watcher = install_watcher(root, tx);
     let mut cap = FlappingCap::default();
     // Carries per-id liveness across passes so a transient `pty list` flicker under load isn't
@@ -2928,7 +3163,7 @@ fn up_loop_until(
             let span = reconcile_span(this_host, "catalog");
             let pass = {
                 let _entered = span.enter();
-                let pass = reconcile_pass(
+                let pass = reconcile_pass_with_residency(
                     root,
                     this_host,
                     &task_context,
@@ -2938,6 +3173,7 @@ fn up_loop_until(
                     &mut presentation_cursor,
                     resync.as_ref(),
                     resource_profiles.as_ref(),
+                    residency_policy,
                 );
                 finish_reconcile_pass(&span, &pass);
                 pass

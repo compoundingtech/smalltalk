@@ -31,6 +31,34 @@ fn author(root: &Path, state: &str, reason: Option<&str>) -> Output {
     command.env_remove("ST_AGENT").output().unwrap()
 }
 
+fn author_target(
+    root: &Path,
+    selector: &str,
+    state: &str,
+    reason: Option<&str>,
+    managed_by: Option<&str>,
+) -> Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_st2"));
+    command.args([
+        "--catalog",
+        root.to_str().unwrap(),
+        "agent",
+        "desired-state",
+        selector,
+        state,
+        "--host",
+        "h",
+        "--json",
+    ]);
+    if let Some(reason) = reason {
+        command.args(["--reason", reason]);
+    }
+    if let Some(managed_by) = managed_by {
+        command.args(["--managed-by", managed_by]);
+    }
+    command.env_remove("ST_AGENT").output().unwrap()
+}
+
 fn author_as(root: &Path, actor: &str) -> Output {
     Command::new(env!("CARGO_BIN_EXE_st2"))
         .args([
@@ -55,9 +83,13 @@ fn author_as(root: &Path, actor: &str) -> Output {
 fn cli_suspends_resumes_and_retires_without_rewriting_unrelated_source() {
     let temporary = tempfile::tempdir().unwrap();
     let root = temporary.path();
-    let initial = "// keep this comment\nagent \"worker\" {\n  host \"h\"\n  command \"sleep 300\"\n  meta { owner \"ops\" }\n}\n";
+    let initial = "// keep this comment\nagent \"worker\" {\n  host \"h\"\n  supervisor \"h.root\"\n  command \"sleep 300\"\n  meta { owner \"ops\" }\n}\n";
+    write(
+        root,
+        "h/root/agent.kdl",
+        "agent \"root\" { host \"h\"; command \"true\" }\n",
+    );
     write(root, "h/worker/agent.kdl", initial);
-
     let suspended = author(root, "suspended", Some("Waiting for capacity"));
     assert!(
         suspended.status.success(),
@@ -95,11 +127,13 @@ fn cli_suspends_resumes_and_retires_without_rewriting_unrelated_source() {
     assert!(retired.status.success());
     let found = st2::discover(root);
     assert!(found.errors.is_empty(), "{:?}", found.errors);
-    assert!(found.specs[0].desired_state.is_retired());
-    assert_eq!(
-        found.specs[0].desired_state.reason(),
-        Some("Mission complete")
-    );
+    let worker = found
+        .specs
+        .iter()
+        .find(|spec| spec.identity == "worker")
+        .unwrap();
+    assert!(worker.desired_state.is_retired());
+    assert_eq!(worker.desired_state.reason(), Some("Mission complete"));
 }
 
 #[test]
@@ -342,7 +376,12 @@ fn legacy_retirement_reads_and_authoring_preserves_resources() {
     let temporary = tempfile::tempdir().unwrap();
     let root = temporary.path();
     let legacy = format!(
-        "agent \"worker\" {{\n  host \"h\"\n  retired #true\n{RETIRED_RESOURCES}  command \"true\"\n}}\n"
+        "agent \"worker\" {{\n  host \"h\"\n  supervisor \"h.root\"\n  retired #true\n{RETIRED_RESOURCES}  command \"true\"\n}}\n"
+    );
+    write(
+        root,
+        "h/root/agent.kdl",
+        "agent \"root\" { host \"h\"; command \"true\" }\n",
     );
     write(root, "h/worker/agent.kdl", &legacy);
 
@@ -399,4 +438,251 @@ fn legacy_retirement_reads_and_authoring_preserves_resources() {
     assert!(worker.desired_state.is_retired());
     assert_eq!(worker.desired_state.reason(), Some("Mission complete"));
     assert_eq!(worker.resources.len(), 2);
+}
+
+#[test]
+fn retirement_refuses_a_new_retired_root_for_ordinary_and_managed_declarations() {
+    for managed_by in [None, Some("nix")] {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path();
+        let marker = managed_by
+            .map(|marker| format!("; meta {{ managed-by \"{marker}\" }}"))
+            .unwrap_or_default();
+        let original = format!("agent \"root\" {{ host \"h\"; command \"true\"{marker} }}\n");
+        write(root, "h/root/agent.kdl", &original);
+        write(
+            root,
+            "h/child/agent.kdl",
+            "agent \"child\" { host \"h\"; supervisor \"h.root\"; command \"true\" }\n",
+        );
+
+        let retired = author_target(
+            root,
+            "h.root",
+            "retired",
+            Some("Mission complete"),
+            managed_by,
+        );
+        assert!(!retired.status.success());
+        let receipt: serde_json::Value = serde_json::from_slice(&retired.stdout).unwrap();
+        assert_eq!(receipt["code"], "candidate-not-admissible");
+        assert!(
+            receipt["error"].as_str().unwrap().contains("retired-root"),
+            "{receipt:#}"
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("h/root/agent.kdl")).unwrap(),
+            original
+        );
+    }
+}
+
+#[test]
+fn entering_running_refuses_new_readiness_and_address_errors_without_mutation() {
+    let readiness_catalog = tempfile::tempdir().unwrap();
+    let root = readiness_catalog.path();
+    write(
+        root,
+        "h/root/agent.kdl",
+        "agent \"root\" { host \"h\"; command \"true\" }\n",
+    );
+    let suspended = "agent \"worker\" { host \"h\"; supervisor \"h.root\"; session-driver \"codex\"; desired-state \"suspended\" reason=\"Waiting\"; command \"true\" }\n";
+    write(root, "h/worker/agent.kdl", suspended);
+    let running = author_target(root, "h.worker", "running", None, None);
+    assert!(!running.status.success());
+    let receipt: serde_json::Value = serde_json::from_slice(&running.stdout).unwrap();
+    assert!(
+        receipt["error"]
+            .as_str()
+            .unwrap()
+            .contains("delivery-readiness-missing"),
+        "{receipt:#}"
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("h/worker/agent.kdl")).unwrap(),
+        suspended
+    );
+
+    let address_catalog = tempfile::tempdir().unwrap();
+    let root = address_catalog.path();
+    write(
+        root,
+        "h/root/agent.kdl",
+        "agent \"root\" { host \"h\"; address \"shared\"; command \"true\" }\n",
+    );
+    let retired = "agent \"worker\" { host \"h\"; address \"shared\"; supervisor \"h.root\"; desired-state \"retired\" reason=\"Done\"; command \"true\" }\n";
+    write(root, "h/worker/agent.kdl", retired);
+    let running = author_target(root, "h.worker", "running", None, None);
+    assert!(!running.status.success());
+    let receipt: serde_json::Value = serde_json::from_slice(&running.stdout).unwrap();
+    assert!(
+        receipt["error"].as_str().unwrap().contains("dup-address"),
+        "{receipt:#}"
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("h/worker/agent.kdl")).unwrap(),
+        retired
+    );
+}
+
+#[test]
+fn retired_to_suspended_reacquires_address_and_topology_but_not_readiness() {
+    let address_catalog = tempfile::tempdir().unwrap();
+    let root = address_catalog.path();
+    write(
+        root,
+        "h/root/agent.kdl",
+        "agent \"root\" { host \"h\"; address \"shared\"; command \"true\" }\n",
+    );
+    let retired = "agent \"worker\" { host \"h\"; address \"shared\"; supervisor \"h.root\"; session-driver \"codex\"; desired-state \"retired\" reason=\"Done\"; command \"true\" }\n";
+    write(root, "h/worker/agent.kdl", retired);
+    let suspended = author_target(root, "h.worker", "suspended", Some("Waiting"), None);
+    assert!(!suspended.status.success());
+    let receipt: serde_json::Value = serde_json::from_slice(&suspended.stdout).unwrap();
+    assert!(
+        receipt["error"].as_str().unwrap().contains("dup-address"),
+        "{receipt:#}"
+    );
+    assert!(
+        !receipt["error"]
+            .as_str()
+            .unwrap()
+            .contains("delivery-readiness-missing"),
+        "{receipt:#}"
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("h/worker/agent.kdl")).unwrap(),
+        retired
+    );
+
+    // A host may hold several unsupervised roots, so topology is re-acquired through the
+    // supervisor chain: reactivating a worker under a retired supervisor would head an active
+    // tree with a tombstone.
+    let topology_catalog = tempfile::tempdir().unwrap();
+    let root = topology_catalog.path();
+    let retired = "agent \"worker\" { host \"h\"; supervisor \"h.root\"; desired-state \"retired\" reason=\"Done\"; command \"true\" }\n";
+    write(root, "h/worker/agent.kdl", retired);
+    write(
+        root,
+        "h/root/agent.kdl",
+        "agent \"root\" { host \"h\"; desired-state \"retired\" reason=\"Replaced\"; command \"true\" }\n",
+    );
+    let suspended = author_target(root, "h.worker", "suspended", Some("Waiting"), None);
+    assert!(!suspended.status.success());
+    let receipt: serde_json::Value = serde_json::from_slice(&suspended.stdout).unwrap();
+    assert!(
+        receipt["error"].as_str().unwrap().contains("retired-root"),
+        "{receipt:#}"
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("h/worker/agent.kdl")).unwrap(),
+        retired
+    );
+    let retired = "agent \"worker\" { host \"h\"; supervisor \"h.root\"; session-driver \"codex\"; desired-state \"retired\" reason=\"Done\"; command \"true\" }\n";
+    let readiness_catalog = tempfile::tempdir().unwrap();
+    let root = readiness_catalog.path();
+    write(
+        root,
+        "h/root/agent.kdl",
+        "agent \"root\" { host \"h\"; command \"true\" }\n",
+    );
+    write(root, "h/worker/agent.kdl", retired);
+    let suspended = author_target(root, "h.worker", "suspended", Some("Waiting"), None);
+    assert!(
+        suspended.status.success(),
+        "{}",
+        String::from_utf8_lossy(&suspended.stderr)
+    );
+}
+
+#[test]
+fn valid_retirement_ignores_an_unrelated_preexisting_core_error() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path();
+    write(
+        root,
+        "h/root/agent.kdl",
+        "agent \"root\" { host \"h\"; session-driver \"codex\"; command \"true\" }\n",
+    );
+    write(
+        root,
+        "h/worker/agent.kdl",
+        "agent \"worker\" { host \"h\"; supervisor \"h.root\"; command \"true\" }\n",
+    );
+
+    let retired = author_target(root, "h.worker", "retired", Some("Mission complete"), None);
+    assert!(
+        retired.status.success(),
+        "{}",
+        String::from_utf8_lossy(&retired.stderr)
+    );
+    let receipt: serde_json::Value = serde_json::from_slice(&retired.stdout).unwrap();
+    assert_eq!(receipt["result"], "changed");
+    assert_eq!(receipt["desired_state"], "retired");
+    let report = st2::validate::validate_for_host(root, "h");
+    assert!(
+        report
+            .issues
+            .iter()
+            .any(|issue| issue.code == "delivery-readiness-missing"),
+        "{:?}",
+        report.issues
+    );
+}
+
+#[test]
+fn lifecycle_delta_compares_the_same_filtered_catalog_on_both_sides() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path();
+    write(
+        root,
+        "h/root/agent.kdl",
+        "agent \"root\" { host \"h\"; workspace \"$CATALOG/h/root/.workspace\"; command \"true\"; render { copy \"resources/goal.md\" \"goal.md\" } }\n",
+    );
+    write(
+        root,
+        "h/root/resources/goal.md",
+        "Ship the lifecycle model.\n",
+    );
+    write(root, "h/root/.workspace/.keep", "");
+    write(
+        root,
+        "h/worker/agent.kdl",
+        "agent \"worker\" { host \"h\"; supervisor \"h.root\"; command \"true\" }\n",
+    );
+
+    let retired = author_target(root, "h.worker", "retired", Some("Mission complete"), None);
+    assert!(
+        retired.status.success(),
+        "{}",
+        String::from_utf8_lossy(&retired.stderr)
+    );
+}
+
+#[test]
+fn lifecycle_delta_tolerates_an_unrelated_declaration_without_an_explicit_host() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path();
+    write(
+        root,
+        "h/root/agent.kdl",
+        "agent \"root\" { host \"h\"; command \"true\" }\n",
+    );
+    write(
+        root,
+        "h/legacy/agent.kdl",
+        "agent \"legacy\" { supervisor \"h.root\"; command \"true\" }\n",
+    );
+    write(
+        root,
+        "h/worker/agent.kdl",
+        "agent \"worker\" { host \"h\"; supervisor \"h.root\"; command \"true\" }\n",
+    );
+
+    let retired = author_target(root, "h.worker", "retired", Some("Mission complete"), None);
+    assert!(
+        retired.status.success(),
+        "{}",
+        String::from_utf8_lossy(&retired.stderr)
+    );
 }

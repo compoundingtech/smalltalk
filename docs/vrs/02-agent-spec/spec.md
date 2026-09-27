@@ -497,17 +497,24 @@ desired-state "suspended" reason="Waiting for capacity"
 The safe authoring surface is
 `st2 agent desired-state --id <agent-id> <state> [--reason ...]
 [--managed-by <marker>]`. It serializes with other catalog writers, preserves
-unrelated source bytes, and returns an authored-intent receipt. A transition
-from retired to running or suspended validates effective-address uniqueness
-against the complete prospective catalog before publication. The receipt does
-not imply that reconciliation or Doctor has observed convergence.
+unrelated source bytes, and returns an authored-intent receipt. While holding
+the catalog-authoring lock, every lifecycle mutation constructs one prospective
+shadow and compares incumbent and prospective core `ERROR` identities as
+`(code, catalog-relative path, agent)` multisets. A positive delta refuses
+before publication; messages are not identities because they may contain the
+shadow path. This admits repair and teardown despite unrelated pre-existing
+errors while preventing a transition from introducing an error. Entering
+running activates launch-readiness and address checks. Entering suspended
+reacquires address and topology checks without launch readiness. Entering
+retired applies retirement topology checks. The receipt does not imply that
+reconciliation or Doctor has observed convergence.
 
 A declaration carrying `meta { managed-by "nix" }` refuses authoring unless the
 caller asserts exactly the marker that declaration carries with `--managed-by`,
 which is how a projection authors the one transition its own generated source
-cannot express — the seat's removal from that source. The asserted arm
-additionally admits the complete prospective catalog, as an `agent publish` of
-the same bytes would, and the receipt records the confirmed marker. Every other
+cannot express — the seat's removal from that source. The asserted arm uses the
+same lifecycle-delta admission as ordinary authoring, and the receipt records
+the confirmed marker. Every other
 authoring verb refuses a Nix-owned declaration unconditionally.
 
 The exact-ID selector and reactivation validation are target behavior fenced by
@@ -521,6 +528,31 @@ st2 source: [`AgentDesiredState`](../../../crates/agent-spec/src/spec.rs),
 [parser](../../../crates/agent-spec/tests/discovery.rs),
 [authoring](../../../tests/agent_desired_state.rs), and
 [planning](../../../tests/reconcile.rs).
+
+### F21 Agent `residency-policy`
+
+`residency-policy` is one positional string: `always` or `on-demand`. Omission
+means `always`, and explicit `always` is semantically equal to omission.
+Duplicate nodes, annotations, properties, children, non-string values, and
+unknown values are invalid. TOML and JSON use `residency_policy`; explicit null
+is invalid.
+
+`on-demand` requires a native session driver, either through `session-driver`
+or a typed driver block. The field grants residency eligibility only while
+`desired-state` is running. It does not change desired state, task lifecycle,
+restart policy, delivery ownership, or provider state. Suspended and retired
+declarations continue to use F18 exclusively.
+
+Changing this field is a semantic catalog change. `st2 tasks --json` exposes
+the declared policy separately from the nullable host-local runtime-residency
+record. Host policy owns timing and warm capacity; neither belongs in the Agent
+Spec.
+
+st2 source: [`ResidencyPolicy`](../../../crates/agent-spec/src/spec.rs),
+[KDL lowering](../../../crates/agent-spec/src/kdl_format.rs), and
+[`residency`](../../../src/residency.rs). Evidence:
+[parser](../../../crates/agent-spec/tests/discovery.rs) and
+[inventory](../../../src/task_inventory.rs).
 
 ### F17 Agent `name` and `description`
 

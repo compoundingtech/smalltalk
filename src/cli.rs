@@ -5,6 +5,7 @@
 //! binary crate: nothing here is part of any public API.
 
 use std::path::PathBuf;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
@@ -60,6 +61,28 @@ pub(crate) enum Command {
         /// immediately regardless).
         #[arg(long, default_value_t = 30)]
         interval: u64,
+        /// Host idle threshold before an eligible on-demand agent may become cold.
+        #[arg(
+            long,
+            value_parser = st2::parse_duration,
+            requires = "residency_warm_capacity"
+        )]
+        residency_idle_after: Option<Duration>,
+        /// Minimum number of eligible on-demand agents that this host keeps warm.
+        #[arg(long, requires = "residency_idle_after")]
+        residency_warm_capacity: Option<usize>,
+    },
+    /// Durably request that the host supervisor wake one on-demand agent.
+    Wake {
+        /// Agent bus address or unique local identity.
+        #[arg(required_unless_present = "agent_id")]
+        identity: Option<String>,
+        /// Exact immutable agent ID.
+        #[arg(long = "agent-id", conflicts_with = "identity")]
+        agent_id: Option<String>,
+        /// Host whose supervisor owns residency. Defaults to this host.
+        #[arg(long)]
+        host: Option<String>,
     },
     /// Native message bus: send/list/read/archive/reply over agents' `resources/inbox`.
     /// The stable wire format is a `<unix-ms>-<rand6>.md` Markdown file.
@@ -81,8 +104,8 @@ pub(crate) enum Command {
     /// ls/read/add/remove/rename.
     #[command(subcommand)]
     Resource(ResourceCmd),
-    /// Install `st2 up` as a systemd-user service on headless Linux. macOS stays manual (TCC).
-    /// Subcommands: install / status / uninstall.
+    /// Manage or render `st2 up` as a systemd-user service. Lifecycle commands stay Linux-only.
+    /// Subcommands: install / render-unit / status / uninstall.
     #[command(subcommand)]
     Service(ServiceCmd),
     /// Install and approve the embedded Claude Code channel plugin.
@@ -132,6 +155,12 @@ pub(crate) enum Command {
         /// Exact reconciled PTY task identity for this runtime.
         #[arg(long)]
         runtime_id: String,
+        /// Internal cold-residency generation that must resume its exact checkpointed thread.
+        #[arg(long, hide = true, requires = "required_resume_incarnation")]
+        required_resume_generation: Option<u64>,
+        /// Host-minted incarnation that fences this exact launch attempt.
+        #[arg(long, hide = true, requires = "required_resume_generation")]
+        required_resume_incarnation: Option<String>,
         /// Original structured Codex invocation, including its provider executable.
         #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
         codex_argv: Vec<String>,
@@ -338,6 +367,12 @@ pub(crate) enum DriverCmd {
         identity: String,
         #[arg(long)]
         runtime_id: String,
+        /// Internal cold-residency generation that must resume its exact checkpointed thread.
+        #[arg(long, hide = true, requires = "required_resume_incarnation")]
+        required_resume_generation: Option<u64>,
+        /// Host-minted incarnation that fences this exact launch attempt.
+        #[arg(long, hide = true, requires = "required_resume_generation")]
+        required_resume_incarnation: Option<String>,
         #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
         argv: Vec<String>,
     },
@@ -359,6 +394,12 @@ pub(crate) enum DriverCmd {
         identity: String,
         #[arg(long)]
         runtime_id: String,
+        /// Internal cold-residency generation that must resume its exact checkpointed session.
+        #[arg(long, hide = true, requires = "required_resume_incarnation")]
+        required_resume_generation: Option<u64>,
+        /// Host-minted incarnation that fences this exact launch attempt.
+        #[arg(long, hide = true, requires = "required_resume_generation")]
+        required_resume_incarnation: Option<String>,
         #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
         argv: Vec<String>,
     },
@@ -399,6 +440,12 @@ pub(crate) enum DriverCmd {
         identity: String,
         #[arg(long)]
         runtime_id: String,
+        /// Internal cold-residency generation that must resume its exact checkpointed session.
+        #[arg(long, hide = true, requires = "required_resume_incarnation")]
+        required_resume_generation: Option<u64>,
+        /// Host-minted incarnation that fences this exact launch attempt.
+        #[arg(long, hide = true, requires = "required_resume_generation")]
+        required_resume_incarnation: Option<String>,
         #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
         argv: Vec<String>,
     },
@@ -750,27 +797,42 @@ impl PresentationArgs {
     }
 }
 
+#[derive(Args)]
+pub(crate) struct ServiceUnitArgs {
+    /// Legacy positional catalog/spec path for `st2 up`. Prefer --catalog; defaults to
+    /// `$CATALOG`, then the default st2 catalog. It must exist.
+    #[arg(conflicts_with = "catalog_path")]
+    pub(crate) catalog: Option<PathBuf>,
+    /// Bake `--host <h>` into the unit. Omit to let `st2 up` auto-detect the hostname at runtime.
+    #[arg(long)]
+    pub(crate) host: Option<String>,
+    /// Machine-local pty registry to export as PTY_ROOT in the unit. Omit to use
+    /// `<catalog>/pty`. Useful when adopting live sessions from a legacy runner.
+    #[arg(long)]
+    pub(crate) pty_root: Option<PathBuf>,
+    /// Host idle threshold before an eligible on-demand agent may become cold.
+    #[arg(
+        long,
+        value_parser = st2::parse_duration,
+        requires = "residency_warm_capacity"
+    )]
+    pub(crate) residency_idle_after: Option<Duration>,
+    /// Minimum number of eligible on-demand agents that this host keeps warm.
+    #[arg(long, requires = "residency_idle_after")]
+    pub(crate) residency_warm_capacity: Option<usize>,
+    /// Supervisor memory ceiling (MiB). The agents live in sibling scopes and are NOT bounded.
+    #[arg(long = "memory-max-mb", default_value_t = st2::service::DEFAULT_MEMORY_MAX_MB)]
+    pub(crate) memory_max_mb: u64,
+}
+
 #[derive(Subcommand)]
 pub(crate) enum ServiceCmd {
     /// Write the `st2.service` systemd-user unit, enable it (start on boot), and start it now.
     /// Idempotent — safe to re-run. The unit runs `st2 up --catalog <catalog>`; agents spawn in sibling
     /// scopes, so a service restart never cascades to them.
-    Install {
-        /// Legacy positional catalog/spec path for `st2 up`. Prefer --catalog; defaults to
-        /// `$CATALOG`, then the default st2 catalog. It must exist at install time.
-        #[arg(conflicts_with = "catalog_path")]
-        catalog: Option<PathBuf>,
-        /// Bake `--host <h>` into the unit. Omit to let `st2 up` auto-detect the hostname at runtime.
-        #[arg(long)]
-        host: Option<String>,
-        /// Machine-local pty registry to export as PTY_ROOT in the unit. Omit to use
-        /// `<catalog>/pty`. Useful when adopting live sessions from a legacy runner.
-        #[arg(long)]
-        pty_root: Option<PathBuf>,
-        /// Supervisor memory ceiling (MiB). The agents live in sibling scopes and are NOT bounded.
-        #[arg(long = "memory-max-mb", default_value_t = st2::service::DEFAULT_MEMORY_MAX_MB)]
-        memory_max_mb: u64,
-    },
+    Install(ServiceUnitArgs),
+    /// Render the install-equivalent `st2.service` systemd-user unit to stdout without mutating it.
+    RenderUnit(ServiceUnitArgs),
     /// Show the `st2.service` systemd status.
     Status,
     /// Stop, disable, and remove the `st2.service` unit. Idempotent.
@@ -1255,4 +1317,48 @@ pub(crate) enum RequestCmd {
         #[command(flatten)]
         ctx: MsgCtx,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn service_install_accepts_only_a_complete_residency_policy() {
+        let parsed = Cli::try_parse_from([
+            "st2",
+            "service",
+            "install",
+            "--residency-idle-after",
+            "5m",
+            "--residency-warm-capacity",
+            "2",
+        ])
+        .unwrap();
+        let Command::Service(ServiceCmd::Install(ServiceUnitArgs {
+            residency_idle_after,
+            residency_warm_capacity,
+            ..
+        })) = parsed.command
+        else {
+            panic!("expected service install");
+        };
+        assert_eq!(residency_idle_after, Some(Duration::from_secs(300)));
+        assert_eq!(residency_warm_capacity, Some(2));
+
+        assert!(
+            Cli::try_parse_from(["st2", "service", "install", "--residency-idle-after", "5m",])
+                .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "st2",
+                "service",
+                "install",
+                "--residency-warm-capacity",
+                "2",
+            ])
+            .is_err()
+        );
+    }
 }

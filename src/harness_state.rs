@@ -785,6 +785,25 @@ pub fn claim(
     claim_locked(&writer, token)
 }
 
+/// Run `action` only while `incarnation` and `seq` are the exact current owner of an agent's
+/// harness record. The record lock stays held through the action so a successor cannot claim
+/// between the ownership check and the caller's related publication.
+pub(crate) fn with_current_ownership<T>(
+    agent_dir: &Path,
+    incarnation: &str,
+    seq: u64,
+    action: impl FnOnce() -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    let path = harness_state_path(agent_dir);
+    let _lock = lock_exclusive(&agent_dir.join(LOCK_NAME))?;
+    let current = read_record(&path).context("current harness ownership record is unavailable")?;
+    anyhow::ensure!(
+        current.schema == SCHEMA && current.incarnation == incarnation && current.seq == seq,
+        "harness ownership was superseded"
+    );
+    action()
+}
+
 /// The claim's body, under an already-held record lock.
 fn claim_locked(writer: &Writer, token: &str) -> anyhow::Result<u64> {
     // Unreadable bytes are superseded like anything else — that is exactly what the claim is

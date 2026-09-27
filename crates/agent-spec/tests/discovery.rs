@@ -9,8 +9,8 @@ use std::path::Path;
 use std::time::Duration;
 
 use agent_spec::spec::{
-    ClaudeDriver, CodexDriver, DeliveryTransport, Driver, OpenCodeDriver, PiDriver, TaskKind,
-    TaskLifecycle,
+    ClaudeDriver, CodexDriver, DeliveryTransport, Driver, OpenCodeDriver, PiDriver,
+    ResidencyPolicy, TaskKind, TaskLifecycle,
 };
 use agent_spec::{
     AgentDesiredState, AgentSpec, DeliveryReadiness, JobType, Resource, SessionDriver, Task,
@@ -183,6 +183,98 @@ fn desired_state_has_equivalent_toml_and_json_lowering() {
         &find(&found.specs, "json").desired_state,
         AgentDesiredState::Retired { reason: Some(reason) } if reason == "Mission complete"
     ));
+}
+
+#[test]
+fn residency_policy_defaults_and_has_equivalent_format_lowering() {
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        "agents/h/default/agent.kdl",
+        r#"agent "default" { argv "true" }"#,
+    );
+    write(
+        tmp.path(),
+        "agents/h/kdl/agent.kdl",
+        r#"agent "kdl" { residency-policy "on-demand"; session-driver "codex"; argv "true" }"#,
+    );
+    write(
+        tmp.path(),
+        "agents/h/toml/agent.toml",
+        "identity = \"toml\"\nhost = \"h\"\nresidency_policy = \"on-demand\"\nsession_driver = \"codex\"\nargv = [\"true\"]\n",
+    );
+    write(
+        tmp.path(),
+        "agents/h/json/agent.json",
+        r#"{"identity":"json","host":"h","residency_policy":"on-demand","session_driver":"codex","argv":["true"]}"#,
+    );
+
+    let found = discover(tmp.path());
+    assert!(found.errors.is_empty(), "{:?}", found.errors);
+    assert_eq!(
+        find(&found.specs, "default").residency_policy,
+        ResidencyPolicy::Always
+    );
+    for identity in ["kdl", "toml", "json"] {
+        assert_eq!(
+            find(&found.specs, identity).residency_policy,
+            ResidencyPolicy::OnDemand
+        );
+    }
+}
+
+#[test]
+fn residency_policy_rejects_unknown_or_malformed_values() {
+    for (name, residency) in [
+        ("unknown", r#"residency-policy "sometimes""#),
+        ("non-string", "residency-policy #true"),
+        (
+            "duplicate",
+            r#"residency-policy "always"; residency-policy "on-demand""#,
+        ),
+        ("property", r#"residency-policy "on-demand" threshold="5m""#),
+        (
+            "children",
+            r#"residency-policy "on-demand" { threshold "5m" }"#,
+        ),
+        ("typed", r#"(policy)residency-policy "on-demand""#),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        write(
+            tmp.path(),
+            &format!("agents/h/{name}/agent.kdl"),
+            &format!("agent \"{name}\" {{ {residency}; argv \"true\" }}"),
+        );
+        let found = discover(tmp.path());
+        assert_eq!(found.errors.len(), 1, "{name}: {:?}", found.errors);
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        "agents/h/null/agent.json",
+        r#"{"identity":"null","host":"h","residency_policy":null,"argv":["true"]}"#,
+    );
+    assert_eq!(discover(tmp.path()).errors.len(), 1);
+}
+
+#[test]
+fn on_demand_residency_requires_a_native_session_driver() {
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        "agents/h/worker/agent.kdl",
+        r#"agent "worker" { residency-policy "on-demand"; argv "true" }"#,
+    );
+
+    let found = discover(tmp.path());
+    assert!(found.specs.is_empty());
+    assert_eq!(found.errors.len(), 1, "{:?}", found.errors);
+    assert!(
+        found.errors[0]
+            .message
+            .contains("on-demand residency requires a native session driver")
+    );
 }
 
 #[test]

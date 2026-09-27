@@ -197,7 +197,7 @@ fn tasks_cli_emits_stable_complete_generation_without_mutation() {
     );
     assert_eq!(first.stdout, second.stdout, "unchanged generation drifted");
     let value: serde_json::Value = serde_json::from_slice(&first.stdout).unwrap();
-    assert_eq!(value["schema"], "st2.task-inventory.v2");
+    assert_eq!(value["schema"], "st2.task-inventory.v3");
     assert_eq!(value["complete"], true);
     assert_eq!(value["tasks"].as_array().unwrap().len(), 1);
     assert_eq!(value["tasks"][0]["agent"], "h.worker");
@@ -206,6 +206,8 @@ fn tasks_cli_emits_stable_complete_generation_without_mutation() {
     assert_eq!(value["tasks"][0]["desiredState"], "running");
     assert_eq!(value["tasks"][0]["agentDesiredState"], "running");
     assert!(value["tasks"][0]["agentDesiredStateReason"].is_null());
+    assert_eq!(value["tasks"][0]["residencyPolicy"], "always");
+    assert!(value["tasks"][0]["runtimeResidency"].is_null());
     assert_eq!(value["tasks"][0]["runtime"]["pid"], 4_000_000);
     assert_eq!(
         value["tasks"][0]["runtime"]["createdAt"],
@@ -745,7 +747,7 @@ fn missing_catalog_and_missing_json_flag_fail_explicitly() {
         .unwrap();
     assert!(!missing_output.status.success());
     let value: serde_json::Value = serde_json::from_slice(&missing_output.stdout).unwrap();
-    assert_eq!(value["schema"], "st2.task-inventory.v2");
+    assert_eq!(value["schema"], "st2.task-inventory.v3");
     assert_eq!(value["complete"], false);
     assert!(value["tasks"].as_array().unwrap().is_empty());
 

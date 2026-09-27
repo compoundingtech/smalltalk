@@ -1,9 +1,10 @@
-//! `st2 service install|status|uninstall` — install `st2 up` as a **systemd-user** unit so the
-//! supervisor comes back on boot and on crash.
+//! `st2 service install|render-unit|status|uninstall` — manage or render `st2 up` as a
+//! **systemd-user** unit so the supervisor comes back on boot and on crash.
 //!
-//! **Linux-only, by design (the maintainer).** The Mac stays MANUAL — the maintainer runs `st2 up` themselves there
-//! (TCC: a launchd-owned process can't inherit his GUI/keychain trust), so we deliberately do NOT
-//! ship a launchd path like fabric does. On macOS (or anything non-systemd) this bails loud.
+//! **Lifecycle commands are Linux-only, by design (the maintainer).** The Mac stays MANUAL — the
+//! maintainer runs `st2 up` themselves there (TCC: a launchd-owned process can't inherit their
+//! GUI/keychain trust), so we deliberately do NOT ship a launchd path. Read-only rendering works
+//! anywhere because it performs no service-manager operation.
 //!
 //! A service restart is safe because st2 spawns each task in its own transient scope
 //! (`systemd-run --user --scope`, see `isolate.rs`) —
@@ -31,7 +32,7 @@ pub const DEFAULT_MEMORY_MAX_MB: u64 = 1024;
 /// Everything the unit's `ExecStart` needs, resolved from the invoking environment.
 #[derive(Debug, Clone)]
 pub struct ServiceSpec {
-    /// Absolute path to the `st2` binary (`env::current_exe()` at install time).
+    /// Absolute path to the invoking `st2` binary (`env::current_exe()`).
     exe: PathBuf,
     /// Absolute catalog (or spec-file) path handed to `st2 up`.
     catalog: PathBuf,
@@ -43,6 +44,8 @@ pub struct ServiceSpec {
     /// Optional machine-local pty registry. This is deliberately independent of the synced catalog:
     /// an explicit adoption can use an existing registry without syncing pid/socket state.
     pty_root: Option<PathBuf>,
+    /// Optional host residency policy baked into the supervised `st2 up` command.
+    residency_policy: Option<crate::residency_host::HostPolicy>,
     memory_max_mb: u64,
     /// Ambient `OTEL_*` environment captured at install time and re-serialized into the unit, so
     /// the supervised supervisor reaches the same OTLP endpoint as an interactive `st2 up`.
@@ -56,6 +59,7 @@ impl ServiceSpec {
         host: Option<String>,
         path: impl Into<String>,
         pty_root: Option<PathBuf>,
+        residency_policy: Option<crate::residency_host::HostPolicy>,
         memory_max_mb: u64,
         otel_env: Vec<(String, String)>,
     ) -> Result<Self> {
@@ -75,12 +79,13 @@ impl ServiceSpec {
             host,
             path,
             pty_root,
+            residency_policy,
             memory_max_mb,
             otel_env,
         })
     }
 
-    /// The `ExecStart` argv: `<st2> up --catalog <catalog> [--host <h>]`.
+    /// The `ExecStart` argv: `<st2> up --catalog <catalog> [--host <h>] [residency policy]`.
     fn program_arguments(&self) -> Vec<String> {
         let mut args = vec![
             self.exe.display().to_string(),
@@ -92,33 +97,39 @@ impl ServiceSpec {
             args.push("--host".to_string());
             args.push(host.clone());
         }
+        if let Some(policy) = self.residency_policy {
+            args.push("--residency-idle-after".to_string());
+            args.push(format!("{}ms", policy.idle_after.as_millis()));
+            args.push("--residency-warm-capacity".to_string());
+            args.push(policy.warm_capacity.to_string());
+        }
         args
     }
 }
 
-/// Ambient `OTEL_*` variables worth carrying into a unit. Captured at install time because the
-/// systemd user manager has no shell to expand them from.
+/// Ambient `OTEL_*` variables worth carrying into a unit. Captured from the invoking environment
+/// because the systemd user manager has no shell to expand them from.
 pub(crate) fn collect_otel_env() -> Vec<(String, String)> {
     std::env::vars()
         .filter(|(key, _)| key.starts_with("OTEL_"))
         .collect()
 }
 
-/// `st2 service install [--catalog <catalog>] [--host H] [--pty-root PATH]
-/// [--memory-max-mb N]`.
-pub fn install(
+fn resolve_service_spec(
     catalog: &Path,
     host: Option<String>,
     pty_root: Option<PathBuf>,
+    residency_policy: Option<crate::residency_host::HostPolicy>,
     memory_max_mb: u64,
-) -> Result<()> {
+    catalog_action: &str,
+) -> Result<ServiceSpec> {
     let exe = env::current_exe().context("failed to resolve the current st2 executable")?;
     let path = service_path(&exe)?;
-    // A systemd unit runs from no shell and no cwd — the catalog MUST be absolute, and it must exist
-    // now (you install the service against an existing catalog, not a future one).
+    // A systemd unit runs from no shell and no cwd — the catalog MUST be absolute, and it must
+    // exist when the unit is rendered.
     let catalog = catalog.canonicalize().with_context(|| {
         format!(
-            "catalog {} does not exist — create it before installing the service",
+            "catalog {} does not exist — create it before {catalog_action}",
             catalog.display()
         )
     })?;
@@ -128,30 +139,69 @@ pub fn install(
                 .with_context(|| format!("pty root {} does not exist", root.display()))
         })
         .transpose()?;
-    let spec = ServiceSpec::new(
+    ServiceSpec::new(
         exe,
-        &catalog,
+        catalog,
         host,
         path,
         pty_root,
+        residency_policy,
         memory_max_mb,
         collect_otel_env(),
+    )
+}
+
+/// `st2 service install [--catalog <catalog>] [--host H] [--pty-root PATH]
+/// [--residency-idle-after DURATION --residency-warm-capacity N] [--memory-max-mb N]`.
+pub fn install(
+    catalog: &Path,
+    host: Option<String>,
+    pty_root: Option<PathBuf>,
+    residency_policy: Option<crate::residency_host::HostPolicy>,
+    memory_max_mb: u64,
+) -> Result<()> {
+    let spec = resolve_service_spec(
+        catalog,
+        host,
+        pty_root,
+        residency_policy,
+        memory_max_mb,
+        "installing the service",
     )?;
 
     install_systemd_user(&spec)?;
 
     println!("installed");
-    println!("catalog\t{}", catalog.display());
+    println!("catalog\t{}", spec.catalog.display());
     match &spec.host {
         Some(h) => println!("host\t{h}"),
         None => println!("host\t(auto-detected at runtime)"),
     }
     match &spec.pty_root {
         Some(root) => println!("pty-root\t{}", root.display()),
-        None => println!("pty-root\t{}/pty (catalog default)", catalog.display()),
+        None => println!("pty-root\t{}/pty (catalog default)", spec.catalog.display()),
     }
     println!("memory-max-mb\t{memory_max_mb}");
     Ok(())
+}
+
+/// Render exactly the unit `install` would write for the same invoking environment and options.
+pub fn render_unit(
+    catalog: &Path,
+    host: Option<String>,
+    pty_root: Option<PathBuf>,
+    residency_policy: Option<crate::residency_host::HostPolicy>,
+    memory_max_mb: u64,
+) -> Result<String> {
+    let spec = resolve_service_spec(
+        catalog,
+        host,
+        pty_root,
+        residency_policy,
+        memory_max_mb,
+        "rendering the service unit",
+    )?;
+    Ok(render_systemd_user_unit(&spec))
 }
 
 /// Build a stable service PATH without reading the caller's PATH. Reinstalling from an agent must
@@ -420,6 +470,8 @@ fn systemd_quote_arg(arg: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
 
     #[test]
@@ -429,6 +481,7 @@ mod tests {
             "/home/user/catalog",
             None,
             "/home/user/.cargo/bin:/home/user/.local/bin:/usr/bin",
+            None,
             None,
             DEFAULT_MEMORY_MAX_MB,
             Vec::new(),
@@ -462,15 +515,20 @@ mod tests {
             Some("hetz".to_string()),
             "/usr/local/bin:/usr/bin",
             Some(PathBuf::from("/srv/legacy-pty")),
+            Some(crate::residency_host::HostPolicy {
+                idle_after: Duration::from_secs(300),
+                warm_capacity: 2,
+            }),
             512,
             Vec::new(),
         )?;
 
         let unit = render_systemd_user_unit(&spec);
 
-        assert!(
-            unit.contains("ExecStart=/usr/local/bin/st2 up --catalog /srv/catalog --host hetz")
-        );
+        assert!(unit.contains(
+            "ExecStart=/usr/local/bin/st2 up --catalog /srv/catalog --host hetz \
+             --residency-idle-after 300000ms --residency-warm-capacity 2"
+        ));
         assert!(unit.contains("MemoryMax=512M"));
         assert!(unit.contains("Environment=PTY_ROOT=/srv/legacy-pty"));
         Ok(())
@@ -484,6 +542,7 @@ mod tests {
             None,
             "/opt/st2 tools:/usr/bin",
             Some(PathBuf::from("/srv/pty 100%")),
+            None,
             256,
             Vec::new(),
         )?;
@@ -499,14 +558,15 @@ mod tests {
 
     #[test]
     fn zero_memory_max_is_rejected() {
-        let err =
-            ServiceSpec::new("/bin/st2", "/cat", None, "/bin", None, 0, Vec::new()).unwrap_err();
+        let err = ServiceSpec::new("/bin/st2", "/cat", None, "/bin", None, None, 0, Vec::new())
+            .unwrap_err();
         assert!(err.to_string().contains("greater than zero"));
     }
 
     #[test]
     fn empty_path_and_relative_pty_root_are_rejected() {
-        let err = ServiceSpec::new("/bin/st2", "/cat", None, "", None, 1, Vec::new()).unwrap_err();
+        let err =
+            ServiceSpec::new("/bin/st2", "/cat", None, "", None, None, 1, Vec::new()).unwrap_err();
         assert!(err.to_string().contains("PATH cannot be empty"));
 
         let err = ServiceSpec::new(
@@ -515,6 +575,7 @@ mod tests {
             None,
             "/bin",
             Some(PathBuf::from("relative")),
+            None,
             1,
             Vec::new(),
         )
@@ -610,6 +671,7 @@ mod tests {
             None,
             "/usr/local/bin:/usr/bin",
             Some(PathBuf::from("/srv/pty")),
+            None,
             DEFAULT_MEMORY_MAX_MB,
             vec![
                 (
@@ -648,6 +710,7 @@ mod tests {
             "/srv/catalog",
             None,
             "/usr/local/bin:/usr/bin",
+            None,
             None,
             DEFAULT_MEMORY_MAX_MB,
             Vec::new(),

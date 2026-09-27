@@ -1,0 +1,24 @@
+version 2
+
+// The finite cycle that recurring-stewardship.kdl starts every six hours.
+//
+// Publish it first, then copy its revision hash into the schedule in place of the zero
+// placeholder:
+//
+//   st3 missions publish examples/st3/recurring-stewardship-cycle.kdl --as person/operator
+//   st3 missions ls --all --json | jq -r '.value.items[]
+//     | select(.id == "mission/example/stewardship-cycle") | .mission_revision'
+//
+// Each cycle is ordinary claimable work for the durable seat. The step completions hold the
+// measurements and results.
+
+mission "example/stewardship-cycle" state="ready" {
+  goal "Measure the invented service, ship one improvement the measurement supports, and record the result."
+
+  queue "cycle" {
+    assigned-to "agent/example/worker"
+    step "measure" timeout="30m" { goal "Measure the current request latency and complete this step with the baseline numbers."; }
+    step "select" timeout="15m" { goal "Select one optimization that the baseline supports and complete this step with the reason."; }
+    step "ship" timeout="2h" { goal "Implement, test, commit, and push the selected optimization, then complete this step with the new numbers."; }
+  }
+}

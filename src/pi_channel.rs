@@ -114,6 +114,80 @@ pub fn run_omp(catalog_root: &Path, identity: &str) -> Result<()> {
     run_for(catalog_root, identity, &OMP_KIND)
 }
 
+fn bind_omp_channel_session(
+    input: &Receiver<io::Result<String>>,
+    state_dir: &Path,
+    identity: &str,
+    runtime_id: &str,
+    runtime_incarnation: Option<&str>,
+    resume_generation: Option<crate::residency::Generation>,
+    expected_native_session: Option<&str>,
+) -> Result<String> {
+    let runtime_incarnation =
+        runtime_incarnation.context("OMP channel has no wrapper runtime incarnation")?;
+    let line = input
+        .recv()
+        .context("OMP channel ended before reporting its native session")?
+        .context("reading OMP native session frame")?;
+    let frame: Value = serde_json::from_str(&line).context("decoding OMP native session frame")?;
+    anyhow::ensure!(
+        frame.get("type").and_then(Value::as_str) == Some("session"),
+        "OMP channel first frame is not a native session binding"
+    );
+    let native_session_id = frame
+        .get("sessionId")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .context("OMP native session binding has no sessionId")?;
+    crate::omp_session::record_channel_binding(
+        state_dir,
+        identity,
+        runtime_id,
+        runtime_incarnation,
+        native_session_id,
+        resume_generation,
+        expected_native_session,
+    )?;
+    Ok(native_session_id.to_string())
+}
+
+fn confirm_omp_channel_session(
+    input: &Receiver<io::Result<String>>,
+    state_dir: &Path,
+    agent_dir: &Path,
+    identity: &str,
+    runtime_id: &str,
+    runtime_incarnation: Option<&str>,
+    ownership_seq: u64,
+    native_session_id: &str,
+    resume_generation: Option<crate::residency::Generation>,
+) -> Result<()> {
+    let runtime_incarnation =
+        runtime_incarnation.context("OMP channel has no wrapper runtime incarnation")?;
+    let line = input
+        .recv()
+        .context("OMP channel ended before acknowledging readiness")?
+        .context("reading OMP channel readiness frame")?;
+    let frame: Value =
+        serde_json::from_str(&line).context("decoding OMP channel readiness frame")?;
+    anyhow::ensure!(
+        frame.get("type").and_then(Value::as_str) == Some("ready")
+            && frame.get("sessionId").and_then(Value::as_str) == Some(native_session_id),
+        "OMP channel readiness does not match its native session binding"
+    );
+    crate::omp_session::confirm_channel_binding(
+        state_dir,
+        agent_dir,
+        identity,
+        runtime_id,
+        runtime_incarnation,
+        ownership_seq,
+        native_session_id,
+        resume_generation,
+    )?;
+    Ok(())
+}
+
 fn run_for(catalog_root: &Path, identity: &str, kind: &ChannelKind) -> Result<()> {
     let agent_dir =
         message::resolve_declared_dir(catalog_root, identity, &crate::run::detect_host())?
@@ -124,6 +198,32 @@ fn run_for(catalog_root: &Path, identity: &str, kind: &ChannelKind) -> Result<()
     // Composed here rather than in the extension: what a restarted agent is told is st2's contract,
     // not the asset's, and the Codex and Claude hooks compose the same three blocks in bash.
     let session_context = session_context(&agent_dir, identity);
+    // The pty session vouching for the record is the wrapper's task: its runtime ID arrives in
+    // the channel environment, and only aliases the identity on driver-expanded seats.
+    let pty_session = std::env::var(kind.runtime_id_env)
+        .ok()
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| identity.to_string());
+    // The wrapper mints the session token; adopting it makes the wrapper's terminal record own
+    // this channel's live records and fences a predecessor incarnation.
+    let wrapper_session = std::env::var(kind.session_env)
+        .ok()
+        .filter(|value| !value.is_empty());
+    let wrapper_seq = if kind.harness == harness_context::Harness::Omp {
+        Some(
+            std::env::var(kind.seq_env)
+                .context("OMP channel has no wrapper ownership sequence")?
+                .parse::<u64>()
+                .context("OMP channel wrapper ownership sequence is invalid")?,
+        )
+    } else {
+        std::env::var(kind.seq_env)
+            .ok()
+            .and_then(|seq| seq.parse::<u64>().ok())
+    };
+    let context_session = wrapper_session
+        .clone()
+        .unwrap_or_else(harness_state::session_token);
     let (input_tx, input_rx) = mpsc::channel();
     thread::spawn(move || {
         let mut stdin = io::stdin().lock();
@@ -142,6 +242,40 @@ fn run_for(catalog_root: &Path, identity: &str, kind: &ChannelKind) -> Result<()
             }
         }
     });
+    let omp_binding = if kind.harness == harness_context::Harness::Omp {
+        let resume_generation = std::env::var(crate::omp_session::CHANNEL_RESUME_GENERATION)
+            .ok()
+            .map(|value| {
+                value
+                    .parse::<u64>()
+                    .map(crate::residency::Generation)
+                    .context("OMP channel resume generation is invalid")
+            })
+            .transpose()?;
+        let expected_native_session =
+            std::env::var(crate::omp_session::CHANNEL_EXPECTED_NATIVE_SESSION)
+                .ok()
+                .filter(|value| !value.is_empty());
+        let state_dir = crate::omp_session::state_dir(catalog_root, identity);
+        let native_session_id = bind_omp_channel_session(
+            &input_rx,
+            &state_dir,
+            identity,
+            &pty_session,
+            wrapper_session.as_deref(),
+            resume_generation,
+            expected_native_session.as_deref(),
+        )?;
+        let ownership_seq = wrapper_seq.context("OMP channel has no wrapper ownership sequence")?;
+        Some((
+            state_dir,
+            native_session_id,
+            resume_generation,
+            ownership_seq,
+        ))
+    } else {
+        None
+    };
     let mut stdout = io::BufWriter::new(io::stdout().lock());
     write_json(
         &mut stdout,
@@ -153,41 +287,25 @@ fn run_for(catalog_root: &Path, identity: &str, kind: &ChannelKind) -> Result<()
         }),
     )?;
     stdout.flush()?;
-    // The channel owns the live half of observed harness state: it is the one process that sees
-    // the harness's own turn events, and its stdio connection to the extension is the evidence
-    // that those events are still being watched. The terminal half belongs to the outer session
-    // wrapper, which alone sees the provider die.
-    // The pty session vouching for the record is the wrapper's task: its runtime ID arrives in
-    // the channel environment, and only aliases the identity on driver-expanded seats.
-    let pty_session = std::env::var(kind.runtime_id_env)
-        .ok()
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| identity.to_string());
-    // The wrapper mints the session token; adopting it makes the wrapper's terminal record own
-    // this channel's live records (so a queued frame after `ended` is suppressed) while a
-    // predecessor incarnation's records are foreign: the first frame opens a fresh transition
-    // and a predecessor's terminal record never silences this session.
-    let wrapper_session = std::env::var(kind.session_env)
-        .ok()
-        .filter(|value| !value.is_empty());
-    // The context record carries the same incarnation as the state record beside it, so a reader
-    // can tell "this number came from the session currently running" from "this number predates
-    // it". On this record the token is provenance only: nothing is fenced on it, a straggler's
-    // write lands, and the next real reading overwrites it (HC-T04). Falling back to this
-    // process's own token when the wrapper exported none keeps the field populated rather than
-    // claiming a session it cannot name.
-    let context_session = wrapper_session
-        .clone()
-        .unwrap_or_else(harness_state::session_token);
+    if let Some((state_dir, native_session_id, resume_generation, ownership_seq)) = omp_binding {
+        confirm_omp_channel_session(
+            &input_rx,
+            &state_dir,
+            &agent_dir,
+            identity,
+            &pty_session,
+            wrapper_session.as_deref(),
+            ownership_seq,
+            &native_session_id,
+            resume_generation,
+        )?;
+    }
     let mut writer =
         harness_state::Writer::new(&agent_dir, identity, kind.label, Some(pty_session));
     if let Some(session) = wrapper_session {
         // Full adopted ownership when the wrapper exported it: the claimed sequence gives the
         // token a direction, so a straggler channel from a superseded session is refused.
-        writer = match std::env::var(kind.seq_env)
-            .ok()
-            .and_then(|seq| seq.parse::<u64>().ok())
-        {
+        writer = match wrapper_seq {
             Some(seq) => writer.with_ownership(session, seq),
             None => writer.with_session(session),
         };
@@ -728,6 +846,86 @@ fn message_frame(msg: message::Message, identity: &str) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn omp_channel_binds_native_session_before_readiness() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = temp.path().join("state");
+        let (tx, rx) = mpsc::channel();
+        tx.send(Ok(
+            r#"{"type":"session","sessionId":"session-exact"}"#.to_string()
+        ))
+        .unwrap();
+        let agent_dir = temp.path().join("agent");
+        let ownership_seq =
+            harness_state::claim(&agent_dir, "h.worker", "omp", "runtime-next").unwrap();
+        let native_session_id = bind_omp_channel_session(
+            &rx,
+            &state,
+            "h.worker",
+            "h.worker",
+            Some("runtime-next"),
+            Some(crate::residency::Generation(2)),
+            Some("session-exact"),
+        )
+        .unwrap();
+
+        let binding: Value = serde_json::from_slice(
+            &std::fs::read(state.join("binding.pending.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(binding["nativeSessionId"], "session-exact");
+        assert_eq!(binding["runtimeIncarnation"], "runtime-next");
+        assert_eq!(binding["resumeGeneration"], 2);
+        assert_eq!(binding["ready"], false);
+        assert!(!state.join("binding.json").exists());
+
+        tx.send(Ok(
+            r#"{"type":"ready","sessionId":"session-exact"}"#.to_string()
+        ))
+        .unwrap();
+        confirm_omp_channel_session(
+            &rx,
+            &state,
+            &agent_dir,
+            "h.worker",
+            "h.worker",
+            Some("runtime-next"),
+            ownership_seq,
+            &native_session_id,
+            Some(crate::residency::Generation(2)),
+        )
+        .unwrap();
+        let binding: Value =
+            serde_json::from_slice(&std::fs::read(state.join("binding.json")).unwrap()).unwrap();
+        assert_eq!(binding["ready"], true);
+        assert!(!state.join("binding.pending.json").exists());
+    }
+
+    #[test]
+    fn omp_channel_refuses_a_different_resumed_native_session() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = temp.path().join("state");
+        let (tx, rx) = mpsc::channel();
+        tx.send(Ok(
+            r#"{"type":"session","sessionId":"session-other"}"#.to_string()
+        ))
+        .unwrap();
+        let error = bind_omp_channel_session(
+            &rx,
+            &state,
+            "h.worker",
+            "h.worker",
+            Some("runtime-next"),
+            Some(crate::residency::Generation(2)),
+            Some("session-exact"),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("does not match required resume"));
+        assert!(!state.join("binding.json").exists());
+        assert!(!state.join("binding.pending.json").exists());
+    }
 
     #[test]
     fn oversized_channel_lines_are_drained_without_allocating_or_losing_the_next_frame() {

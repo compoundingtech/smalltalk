@@ -341,11 +341,12 @@ Agent Spec envelope in
 retained no-follow file descriptors and returns its authoritative digest.
 `st2 agent publish --catalog ROOT (--spec FILE | --bundle DIR)
 --input-sha256 HEX (--expect-absent | --expect-sha256 HEX)
-[--managed-by MARKER] --json` binds
-publication to that exact capture. It accepts exactly one canonical KDL `agent`
-node with an explicit ID plus path-safe host and identity. st2 no longer
-exposes an intent compiler: external renderers own the transformation from
-human intent to exact Agent Spec bytes or a create-only publication bundle.
+[--managed-by MARKER] --json` binds publication to that exact capture.
+`--expect-sha256` is the target Agent Spec leaf CAS. Publication accepts exactly
+one canonical KDL `agent` node with an explicit ID plus path-safe host and identity.
+st2 no longer exposes an intent compiler: external
+renderers own the transformation from human intent to exact Agent Spec bytes or
+a create-only publication bundle.
 
 The persistent `<catalog>/.st2/catalog-authoring.lock` defines one cooperative
 read/write transaction domain:
@@ -393,10 +394,6 @@ only `agent.kdl` for a hash-authorized update, and preserves all sibling runtime
 state. A bundle is create-only and is renamed from a hidden same-filesystem
 stage; retry reports `unchanged` only when every projected bundle file already
 matches. `--expect-absent` is idempotent for identical input.
-`--input-sha256` rejects a caller/source swap and `--expect-sha256` rejects a
-stale declaration writer. Full-catalog admission rejects any
-structural validation error before publication. The typed result is
-`published` or `unchanged`.
 
 A hash-authorized update also passes the ownership boundary the lifecycle verb
 applies, because it rewrites the same declaration wholesale. `--managed-by
@@ -414,29 +411,48 @@ reports `managedBy` only for a marker the incumbent confirmed. Incumbent bytes
 that are not readable as a declaration carry no ownership claim, so repairing
 them stays possible for a writer who could already replace the file directly.
 
-Host-scoped validation rejects a pty task whose session socket path would exceed the
+Admission separates declaration structure from ambient launch readiness. Parsing, identity and
+topology checks, path expansion and authority, render grammar and workspace-relative destination
+safety, and delivery shape/coherence are lifecycle-independent. Running and suspended subjects
+occupy their effective host-local address; retired subjects do not. Only a running subject requires
+resolved paths and copy sources to exist, a service to have runnable work, provider overlays and
+hook sets to be available, delivery readiness to be present, and its prospective PTY socket to fit
+the host's portable bind limit. Suspended and retired subjects do not resolve Resource bindings or
+Resource Profiles and do not project render-input existence as an ambient fact. Transitioning one
+of those declarations to running restores every readiness check before materialization or launch.
+
+Host-scoped validation rejects a running pty task whose session socket path would exceed the
 portable `sun_path` bound. `pty` binds `<PTY_ROOT>/<session-id>.sock` and refuses a
-bind over the limit, so such a task can never spawn and fails identically on every
+bind over the limit, so such a running task can never spawn and fails identically on every
 reconcile pass, which also makes the pass result useless as a health signal for that
-host. The bound is derived from the pty root resolved for the selected host, never a
-fixed maximum identity length: the usable identity length is what remains of the limit
-after that root. The portable 104-byte bound applies so a declaration admitted on Linux
-does not fail on Darwin, and the diagnostic states the resolved path and the byte
-overage so the author can shorten the identity rather than discover the failure as a
-spawn error later.
+host. The bound is derived from the pty root resolved for the RUNTIME catalog — the
+one the supervisor will bind sockets from — and never from the tree under inspection,
+which is frequently a different tree: publication admits a candidate through a
+disposable projection nested in the catalog, transactions validate captures and stages,
+and a retained catalog is addressed through a file-descriptor path that canonicalizes
+back to the real one. A caller that knows where sockets will be bound supplies that
+root; only a deliberately context-free validation omits the guard. Measuring the
+inspected tree instead charges every identity for the depth of whichever temporary tree
+is being validated and refuses declarations whose real socket is bindable. The bound is
+never a fixed maximum identity length either: the usable identity length is what
+remains of the limit after the runtime root. The portable 104-byte bound applies so a
+declaration admitted on Linux does not fail on Darwin, and the diagnostic states the
+resolved path and the byte overage so the author can shorten the identity rather than
+discover the failure as a spawn error later. Suspended and retired PTY declarations
+bind nothing and are accepted regardless of prospective socket length; activation
+re-runs the bound before launch.
 
 A park notice whose cause is structurally unrecoverable says so instead of offering
 `st2 unpark`, which would relaunch into the identical failure. The test is the same
 predicate admission uses, not the wording of a spawn error.
 
-Before returning success, publication reads the exact live declaration back
-under the catalog lock, verifies its digest and bytes, and re-admits the live
-catalog. `st2 validate --json` emits `st2.validate.v2`; successful JSON
-publication emits `st2.agent-publish.v2`. Both identify the
-`st2.core+catalog.v1` policy profile and the same `agentSpecRevision`. A clean
-hermetic build uses the complete 40-hex source revision; dirty or revisionless
-local builds use explicit identities that cannot compare equal to a clean
-hermetic receipt. The byte-only `st2 agent digest --json` contract remains
+Before returning success, publication reads the exact live declaration back under the catalog
+lock, verifies its digest and bytes, and re-admits the live catalog. `st2 validate --candidate
+FILE --json` emits the ordinary `st2.validate.v2` Report semantics. Successful JSON publication
+emits `st2.agent-publish.v2`. Both identify the `st2.core+catalog.v1` policy profile and the same
+`agentSpecRevision`. A clean hermetic build uses the complete 40-hex source revision; dirty or
+revisionless local builds use explicit identities that cannot compare equal to a clean hermetic
+receipt. The byte-only `st2 agent digest --json` contract remains
 `st2.agent-source-digest.v1` because it makes no parser or policy claim.
 
 `st2 catalog snapshot --catalog ROOT --output DIR --json` holds SH while it
@@ -528,7 +544,8 @@ modified path has both sides. Each present side classifies the fact as
 File content remains private and only the existing aggregate declaration roots
 are hashed in the receipt.
 `render` means a catalog-owned bundle file consumed by a normalized render
-operation, while `_templates` remains `template` even when referenced.
+operation of a running declaration, while `_templates` remains `template` even when referenced.
+An inactive declaration's existing bundle input remains `static`; its missing input is not resolved.
 
 Agent fields lower through the shared Agent Spec model and ordered render-plan
 parser. This is model-field normalization, not resolved effect normalization:
@@ -669,6 +686,90 @@ Bootstrap performs zero reads or writes below the declared PTY root. The PTY
 registry has independent producers which catalog EX cannot reserve, so atomic
 process adoption, continuity, or PTY-root migration requires a separate PTY
 registry protocol. Bootstrap claims only atomic declaration publication.
+
+## On-demand residency (R44-R46)
+
+Desired lifecycle and runtime residency are independent:
+
+```text
+desired state:      running | suspended | retired
+residency policy:   always | on-demand
+runtime residency:  active -> quiescing -> stopping -> cold
+                                 demand waits |          |
+                                              `-> starting -> active
+```
+
+The canonical declaration is `residency-policy "on-demand"`; omission and
+`"always"` are semantically equal. On-demand policy requires a native session
+driver. It grants eligibility only while desired state is running. A transition
+to suspended or retired hands ownership back to ordinary desired-state
+reconciliation rather than adding a second desired lifecycle.
+
+Runtime residency is recorded in one
+`st2.residency-ledger.v1` host-local record keyed by the immutable agent ID and
+host. The record carries the native driver, a positive generation, the closed
+runtime-residency state, and whether external demand was observed during a
+transition. It does not carry message filenames, delivery attempts, native
+session identifiers, or process observations. Those remain authoritative in
+the inbox and delivery ledger, provider binding, and task inventory.
+
+Every transition is generation-fenced. After idle confirmation, the monotonic
+order is checkpoint native session, stop the complete owned task group, verify
+absence, and become cold. Demand observed after checkpointing sets a durable
+wake-pending fact but does not cancel teardown. A cold or newly absent runtime
+then prepares exact native resume, launches the owned group, verifies the saved
+native session, and becomes active. A mismatch, unsupported driver capability,
+indeterminate presence, malformed ledger, or foreign ownership becomes a
+fail-closed refusal. No path substitutes a fresh session.
+
+For Claude, the provider binding owns the exact native UUID, wrapper incarnation,
+canonical workspace, transcript path, and optional resume generation. Checkpointing
+first resolves the UUID to exactly one file in the active managed Claude
+transcript store, rejects a matching Codex transcript, opens the file with
+`O_NOFOLLOW`, requires a regular `<uuid>.jsonl` file, validates every recorded
+`sessionId`, derives one rooted workspace lineage, and stores the SHA-256 of
+the exact bytes. Resume revalidates that lineage and digest before any provider
+child starts, rejects authored
+session selectors, and lowers to `claude <options> --resume <uuid> -- <prompt>`.
+Ordinary launches also use the option terminator and explicitly remove inherited
+residency fence variables.
+
+The synchronous `SessionStart` observer is Claude's native identity proof.
+Ordinary observation remains fail-open. During mandatory resume, observer setup,
+payload validation, transcript validation, and durable candidate publication
+propagate failure. The hook stores the candidate under the new wrapper
+incarnation and resume generation without replacing the checkpoint binding.
+After complete-group presence establishes the current wrapper incarnation,
+exact native-session verification promotes only that incarnation's candidate.
+A failed start therefore leaves the checkpoint
+retryable. A later explicit in-process session switch becomes the next
+authoritative binding and does not inherit the consumed resume fence.
+
+`st2 tasks --json` uses schema `st2.task-inventory.v3`. Each task row appends
+`residencyPolicy` and nullable `runtimeResidency` beside the existing process
+`runtime` observation. A missing ledger is `null`, never inferred as active or
+cold. A malformed, unsupported, or wrongly owned ledger makes the inventory
+incomplete and reports the error without mutating state.
+
+The first wake authorities are an unread durable inbox message and an explicit
+operator wake or attach request. Passive CPU, filesystem access, PTY attachment
+state, and Resource observation are not demand. Host policy owns idle thresholds
+and warm capacity. Telemetry measures resume-to-ready and demand-to-delivery
+latency before the project assigns a latency objective.
+
+The folder-catalog supervisor enables this policy only when `st2 up` receives
+both `--residency-idle-after <duration>` and
+`--residency-warm-capacity <count>`. If a catalog contains a running on-demand
+agent and the host omits this policy, reconciliation holds that agent
+`adopt-only` and reports an error instead of launching it. `st2 wake` writes an
+explicit durable wake request. `st2 pty attach <agent-address>` writes the same
+request before attaching. Each launch attempt has a host-minted incarnation
+fence. A retry after a missing provider rotates this fence. A live provider
+retains the fence while reconciliation completes its sidecars. Provider
+readiness must match the independent fence, so a binding left by an earlier
+failed attempt cannot make a later attempt active. A wake request that races
+with checkpoint or stop remains pending until the complete task group is absent
+and exact native resume can start.
 
 ## Host-local scheduling and supervision
 
@@ -857,14 +958,16 @@ validate ──► materialize ──► host-local st2 scheduler/reconciler
   resume or replacement authority.
 
 - **R23:** `st2 tasks --json` is a read-only diagnostic boundary. It emits one
-  `st2.task-inventory.v2` envelope for the selected host. Rows are sorted by
+  `st2.task-inventory.v3` envelope for the selected host. Rows are sorted by
   immutable agent ID, task name, and runtime ID and cover both PTY and
-  terminal-free exec tasks. Each row includes immutable agent ID and nullable
-  current bus address; a proved non-routable retired subject has a null address
+  terminal-free exec tasks. Each row includes immutable agent ID, nullable
+  current bus address, declared residency policy, and nullable host-local
+  runtime residency; a proved non-routable retired subject has a null address
   without weakening completeness. `complete=false` plus a non-zero exit is a
-  closed result: a consumer must not turn a missing row into absence. A running
-  row always carries a PID, creation time, opaque generation ID derived from
-  stable backend evidence, and the required `runtime.resourceTarget`.
+  closed result: a consumer must not turn a missing row or residency record
+  into absence. A running row always carries a PID, creation time, opaque
+  generation ID derived from stable backend evidence, and the required
+  `runtime.resourceTarget`.
 
   `resourceTarget` is internally tagged by `type` and has exactly these wire
   shapes:
@@ -968,11 +1071,19 @@ validate ──► materialize ──► host-local st2 scheduler/reconciler
   source cannot express: the source change being projected is the seat's
   removal, so "edit the generated source instead" names an edit the operator
   already made. A marker-matched edit therefore stands in for the
-  compare-and-swap `agent publish` a projection would otherwise perform, and
-  carries that path's admission: the complete prospective catalog must validate
-  before anything is committed, so a retirement leaving an active agent
-  descended from a retired root refuses rather than landing. The receipt records
-  the confirmed marker. Presentation, address, stream, and Resource authoring
+  compare-and-swap `agent publish` a projection would otherwise perform.
+  Independently of marker authority, every desired-state mutation builds one
+  prospective shadow while holding the catalog-authoring lock. Admission
+  compares incumbent and prospective core `ERROR` identities as stable
+  `(code, catalog-relative path, agent)` multisets and refuses only positive
+  deltas; diagnostic messages are excluded because shadow paths make them
+  unstable. Thus retirement leaving an active agent descended from a retired
+  root refuses, entering running activates launch-readiness and address checks,
+  and entering suspended reacquires address and topology checks without
+  activating readiness. An unrelated pre-existing catalog error remains
+  admissible and can be repaired or torn down incrementally. The receipt records
+  the confirmed marker when marker authority was used. Presentation, address,
+  stream, and Resource authoring
   keep the unconditional refusal: none of them projects a source the generator
   cannot itself rewrite.
 
@@ -1062,6 +1173,58 @@ these admitted facts rather than walking supervisor edges themselves. The
 `desiredState: "retired"`; an absent lifecycle stays null, which lowers to
 running.
 
+The same envelope publishes every actor's resource root (R47) as a
+catalog-relative directory, the subject boundary under which the actor's
+declaration-anchored state, driver records, and `resources/` live. Both fields
+are appended to `st2.catalog-graph.v2` without a schema bump: a reader that
+ignores unknown fields reads the envelope unchanged, and neither field affects
+`complete`.
+
+```json
+{
+  "agents": [{ "id": "dev3.worker", "resourceRoot": "agents/dev3/worker" }],
+  "directActors": [
+    {
+      "id": "dev3.direct.omp.e2jcd9pf",
+      "host": "dev3",
+      "identity": "direct.omp.e2jcd9pf",
+      "ptyId": "e2jcd9pf",
+      "resourceRoot": "agents/dev3/direct.omp.e2jcd9pf"
+    }
+  ]
+}
+```
+
+Each `agents` row carries `resourceRoot`, its declaration's parent directory —
+the directory st2 itself resolves for that agent's inbox and context. A direct
+OMP actor has no declaration: its entrypoint derives
+`ST_AGENT=<host>.direct.omp.<encoded-pty-id>` from `PTY_SESSION`, and writers
+create `agents/<host>/direct.omp.<encoded-pty-id>/` lazily under that identity.
+`id` is byte-identical to that `ST_AGENT`. The `directActors` array lists every
+such directory across all hosts, sorted by host then identity. Direct actors
+never enter `agents`, and an archived one is an `archived` row like any other
+identity. Consumers fold per-actor views at these roots and never infer
+subject boundaries themselves.
+
+The PTY segment codec is shared with the dotfiles `agent-identity
+encode-pty`/`decode-pty` contract and is strict and reversible:
+
+| PTY session ID | Segment | Example |
+| --- | --- | --- |
+| PTY-generated: 8 characters from `23456789abcdefghjkmnpqrstuvwxyz` | the ID itself | `e2jcd9pf` → `e2jcd9pf` |
+| any other valid ID: 1–255 bytes of `[A-Za-z0-9._-]`, not `.` or `..` | `x-` plus its lowercase hex bytes | `web` → `x-776562` |
+| invalid ID | none; no identity exists | `a/b` |
+
+Decoding accepts only the canonical encoding of a valid ID: `x-` over a
+generated ID, uppercase or odd-length hex, and non-UTF-8 bytes all fail, so two
+segments never name the same PTY session and `ptyId` is exact. Discovery reads
+exactly two directory levels, `agents/<host>/<identity>`, and never descends
+into an actor's contents. An entry is a direct actor only when it is a real
+directory (a symlink is not), its name is `direct.omp.` plus a segment that
+decodes, and no declaration — parsed or failed — lives beneath it; a declared
+identity is a declared actor whatever its name looks like. Nothing reads names
+beyond the codec, cwd, process ancestry, activity, or mtimes.
+
 Retired reconciliation first attempts every live task teardown for the agent.
 Only when all of those attempts succeed does it settle the declaration's whole
 inbox; one failure leaves every inbox file untouched and the next pass retries
@@ -1098,18 +1261,116 @@ The supervisor closes the same edge without an operator. Each `st2 up` reconcile
 pass ends by archiving every local seat whose retirement outlived the catalog's
 `archive-after` grace period (default `7d`; `"0"` disables the step), applying
 the same fail-closed eligibility as the verb and archiving at most 25 seats per
-pass so one pass stays bounded. The step runs after the pass releases its shared
-lock and takes the exclusive lock non-blockingly: a contended lock skips the
-step, because a pass queued behind `st2 catalog apply` would stall every live
-agent's reconciliation and a due seat is still due next pass. st2 records no
+pass so one pass stays bounded. The bound counts only seats that pass
+eligibility: a due seat the step refuses is reported and does not consume it,
+so refusals that recur every pass never starve the seats behind them. The step
+builds its batch incrementally: due seats are walked in identity order and
+each is judged against the seats already accepted this pass, which are the
+only ones counted as leaving. A supervisor whose retired dependent is not yet
+in the batch is refused as `supervisor-referenced` and leaves on a later pass,
+after the dependent, so the 25-seat cutoff never separates a supervisor from a
+dependent that still names it. The batch is re-checked against that rule
+before any move. The scan is bounded too: one pass examines at most 100 due
+seats (four times the archive bound), stops early once 25 are accepted, and
+reports the unexamined remainder as `auto-archive examined <n> due retired
+seats and deferred <m> to the next pass`. The next pass resumes the walk after
+the last seat examined, wrapping around, so a run of permanently refused seats
+cannot hold every pass's window. The step
+runs after the pass releases its shared lock and takes the exclusive lock
+non-blockingly: a contended lock skips the step, because a pass queued behind
+`st2 catalog apply` would stall every live agent's reconciliation and a due
+seat is still due next pass. st2 records no
 timestamp for a desired-state edit, so the grace period is measured from the
 supervisor's first observation of the retirement, kept in
 `.st2/retired-observed.json` (`st2.catalog-retired-observed.v1`) as host →
-identity → epoch millis and never in the spec. That ledger is reconciled to
+identity → epoch millis and never in the spec. The same ledger keeps the
+resume point under `resumeAfter` (host → identity) only while the last pass
+left due seats unexamined. That ledger is reconciled to
 exactly the currently retired seats on every pass it runs, so a seat that comes
 back drops its row and a second retirement serves a fresh grace period; an
-absent or unreadable ledger restarts every clock, which errs toward keeping
-seats in the live catalog.
+absent or unreadable ledger restarts every clock and the scan, which errs
+toward keeping seats in the live catalog.
+
+The same supervisor step archives dead direct OMP actors (R48), because nothing
+else retires them: they have no declaration to retire. st2 owns this lifecycle
+([`0018-st2-owns-direct-actor-lifecycle`](.decisions/0018-st2-owns-direct-actor-lifecycle.md)).
+
+```mermaid
+stateDiagram-v2
+    [*] --> live: writer creates agents/<host>/direct.omp.<segment>
+    live --> deadObserved: no running record (row written)
+    deadObserved --> live: running record for ptyId (row dropped)
+    deadObserved --> archived: dead for archive-after (row dropped, rename + tombstone)
+    archived --> live: st2 catalog unarchive (fresh clock)
+```
+
+Liveness is exact PTY registry evidence. On the local host only, a direct
+actor is dead when the catalog's effective PTY registry — the one the pass
+already lists — holds no `running` record whose session ID equals its decoded
+`ptyId` byte for byte; an exited record, a vanished record, and an absent one
+are the same fact, and a running session whose ID merely contains the actor's
+does not keep it alive. Only the PTY backend counts: a running `exec` task
+whose runtime ID equals the `ptyId` is not the actor's session and does not
+keep it alive. Another host's registry is not observable, so its direct actors
+are never judged.
+
+Deaths are observed in `.st2/direct-dead-observed.json`, the same shape as the
+retirement ledger:
+
+```json
+{
+  "schema": "st2.catalog-direct-dead-observed.v1",
+  "hosts": { "dev3": { "direct.omp.2ahzpbs3": 1790000000000 } }
+}
+```
+
+Each value is the epoch millis of the supervisor's first observation of that
+death. Every pass that runs the step reconciles the local host's map to
+exactly the currently dead actors: a PTY that runs again drops its row, so a
+later death serves a fresh grace period. The ledger also keeps the direct scan's
+resume point under `resumeAfter` (host → identity) only while the last pass
+left due actors unexamined. An absent, unreadable, or foreign-schema ledger
+reads as empty and restarts every clock and the scan, which errs toward keeping
+actors live.
+
+The step obeys the same gates as retired-seat archival: `archive-after "0"`
+disables it, a contended exclusive lock skips it, and an incomplete strict
+discovery refuses it. The pass decides whether the step has work from its own
+discovery and the PTY backend's part of its registry snapshot; the step then
+re-reads the PTY registry alone under the exclusive lock, only when a local
+direct actor exists, and moves bytes only on that fresh read. Ordering within
+one pass:
+
+1. Eligible retired seats due under the retirement ledger fill the
+   25-per-pass bound first, within the 100-seat scan window above; due seats
+   the step refuses do not count, and a supervisor never takes a slot ahead of
+   a retired dependent that is not in the batch.
+2. Direct actors dead for at least `archive-after` fill what remains, in
+   identity order, starting after the ledger's resume point and wrapping
+   around. The scan is bounded like the retired-seat scan: it examines at most
+   four times the remaining bound (100 when no retired seat was accepted),
+   stops early once the remaining bound is filled, and reports the unexamined
+   remainder as `auto-archive examined <n> due dead direct actors and deferred
+   <m> to the next pass`; the next pass resumes after the last actor examined.
+3. A due actor whose `.st2/archive/<host>/<identity>` slot already exists is a
+   reported `archive-occupied` refusal. It does not consume the bound but does
+   consume the scan window, and keeps its ledger row, so it is retried whenever
+   the scan reaches it again until the slot is cleared.
+4. The rows of the selected actors are dropped in the same ledger write,
+   before the moves.
+5. Each selected actor is archived exactly like a retired seat, inside the same
+   generation commit: whole-directory rename to `.st2/archive/<host>/<identity>`
+   plus a tombstone whose `reason` is
+   `direct OMP actor: PTY session <ptyId> has no running record`.
+
+Dropping rows before the move means a failed move keeps the actor live for
+another full grace period, and `st2 catalog unarchive` restores the directory
+with no row, so the restored actor serves a fresh grace period instead of
+leaving again on the next pass. `st2 catalog archive` selects declarations only
+and refuses a direct actor as `unknown-identity`; the supervisor step is the
+only way a direct actor leaves. Nothing is deleted: the directory's bytes,
+`resources/tmp` included, move whole. How long an archived identity is
+retained is open ([DQ6](#open-design-questions)).
 
 Before starting a Codex provider, st2 asks that binary to generate its
 app-server JSON schemas and fingerprints only the delivery-critical projection:
@@ -1617,3 +1878,12 @@ the resident supervisor continues to reconcile the complete local catalog.
   a failure signal that does not block provider startup, is distinguishable
   from an ordinary cold start, and reaches the responsible supervisor under
   R17.
+- **DQ6 Archive retention (R48):** Archival moves whole identity
+  directories, `resources/tmp` included, and nothing ever prunes
+  `.st2/archive`, so the archive grows without bound and can dominate a
+  long-lived catalog's tree. Any retention rule is irreversible, unlike
+  archival itself. Resolve by choosing what an archived identity keeps
+  (declaration, decisions, notes, tombstone) versus what may be dropped or
+  packed, naming the owner of that deletion, and deciding whether the
+  per-seat `resources/tmp` budget is enforced before archival. See
+  [#530](https://github.com/compoundingtech/st2/issues/530).

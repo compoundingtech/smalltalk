@@ -1,0 +1,84 @@
+version 2
+
+// One mission uses three durable seats, and one of those seats also serves a second mission.
+//
+// Missions and seats are many to many. A mission does not own a seat. Each step names the seat that
+// does it with `assigned-to`, and any number of missions can name the same seat. The seat outlives
+// every mission that uses it. Here `example/greeting-option` sends its ordered steps to a planner,
+// the worker, and a reviewer, and `example/usage-typo` gives the same worker a second job:
+//
+//   example/greeting-option   plan: planner  ->  build: worker  ->  review: reviewer
+//   example/usage-typo                           fix:   worker
+//
+// `depends-on` orders the steps inside one run. Each seat orders its work across runs with its own
+// queue. A run joins the end of a seat's queue when it first has a step for that seat, which is
+// when the run starts, and leaves when the run ends. A seat holds one step at a time. When it is
+// free, st3 wakes it for the first ready step in its queue. A run whose step for the seat still
+// waits on a dependency is passed over until that step is ready. So the worker fixes the typo while
+// the planner plans, and builds the option once the plan is complete and the worker is free. To
+// reorder a queue, use `st3 agents queue move`, as seat-queue.kdl shows.
+//
+// Each seat has its own checkout of the invented repository, so one seat's branch never disturbs
+// another's. Apply the three seats, publish both missions, and start one run of each:
+//
+//   st3 agents apply examples/st3/seats/planner.kdl --as person/operator
+//   st3 agents apply examples/st3/seats/claude.kdl --as person/operator
+//   st3 agents apply examples/st3/seats/reviewer.kdl --as person/operator
+//   st3 missions publish examples/st3/many-to-many.kdl --as person/operator
+//   st3 missions start example/greeting-option --id example/greeting-option/2026-10-01 \
+//     --workspace /srv/example/app --as person/operator
+//   st3 missions start example/usage-typo --id example/usage-typo/2026-10-01 \
+//     --workspace /srv/example/app --as person/operator
+//
+// Each seat's queue lists the runs it serves. The worker's lists both runs:
+//
+//   st3 agents queue agent/example/planner
+//   st3 agents queue agent/example/worker
+//   st3 agents queue agent/example/reviewer
+//
+// This example ran live on 2026-09-27 on an isolated daemon, with Claude claude-sonnet-5 on all
+// three seats. For that run the seats also passed `args "--permission-mode" "bypassPermissions"`
+// so Claude could work unattended. Right after both runs started, the worker's queue was:
+//
+//   AGENT QUEUE  agent/example/worker
+//   CURRENT      none
+//   NEXT WORK    step-run/…/fix
+//   RUNS         2
+//     1. mission-run/example/greeting-option/2026-09-27  waiting  step-run/…/build not ready
+//     2. mission-run/example/usage-typo/2026-09-27  ready  next step-run/…/fix
+//
+// The worker fixed the typo while the planner planned. When the plan completed, the build became
+// ready and the worker, already free, took it. The reviewer took the review when the build
+// completed. Each step needed one wake, and both runs completed in just over two minutes.
+
+mission "example/greeting-option" state="ready" {
+  goal "Add a `--name NAME` option to the invented greet.sh command. One seat plans it, another builds it, and a third reviews it."
+
+  step "plan" timeout="30m" {
+    assigned-to "agent/example/planner"
+    goal "Read greet.sh on main and write a short plan for a `--name NAME` option that changes who is greeted. Store the plan with `st3 documents put` and complete this step with the stored document reference."
+    constraint "Do not change repository files."
+  }
+
+  step "build" timeout="45m" {
+    assigned-to "agent/example/worker"
+    depends-on { step "plan" completed }
+    goal "Implement the plan that this run's plan step stored, on a new greeting-option branch from main. Commit and push the branch, and complete this step with the pushed commit."
+  }
+
+  step "review" timeout="30m" {
+    assigned-to "agent/example/reviewer"
+    depends-on { step "build" completed }
+    goal "Review the pushed greeting-option branch against the stored plan, and run greet.sh with and without `--name`. Complete this step with your findings if the branch does what the plan says; fail it with the defects otherwise."
+    constraint "Do not change repository files."
+  }
+}
+
+mission "example/usage-typo" state="ready" {
+  goal "Fix the misspelled word in the invented greet.sh command's usage text."
+
+  step "fix" timeout="20m" {
+    assigned-to "agent/example/worker"
+    goal "Fix the misspelled word in greet.sh's usage text on a new usage-typo branch from main. Commit and push the branch, and complete this step with the pushed commit."
+  }
+}

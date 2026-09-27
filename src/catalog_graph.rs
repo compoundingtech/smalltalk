@@ -22,6 +22,9 @@ pub struct CatalogGraph {
     /// Identities moved out of the live catalog by `st2 catalog archive`, newest field in the
     /// envelope and additive: an archived identity is a tombstone row, never an `agents` member.
     pub archived: Vec<GraphArchived>,
+    /// Appended: live-catalog identity directories owned by one direct OMP PTY session rather
+    /// than a declaration. Never `agents` members; published so every actor has a resource root.
+    pub direct_actors: Vec<GraphDirectActor>,
     pub declarations: Vec<GraphDeclaration>,
     pub conflicts: Vec<GraphConflict>,
     pub issues: Vec<GraphIssue>,
@@ -37,6 +40,20 @@ pub struct GraphArchived {
     pub reason: Option<String>,
     /// Catalog-relative location of the moved identity directory.
     pub archive_root: String,
+}
+
+/// One direct OMP actor: `agents/<host>/direct.omp.<encoded-pty-id>` with no declaration.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GraphDirectActor {
+    /// `<host>.<identity>`, byte-identical to the actor's `ST_AGENT`.
+    pub id: String,
+    pub host: String,
+    pub identity: String,
+    /// The exact PTY session ID the identity decodes to — the join key into the PTY registry.
+    pub pty_id: String,
+    /// Catalog-relative actor directory.
+    pub resource_root: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -79,6 +96,9 @@ pub struct GraphAgent {
     /// Appended (R24): `<host>.<address>`; `None` for a retired subject, which is non-routable
     /// and releases its address without making the envelope incomplete.
     pub bus_address: Option<String>,
+    /// Appended: the catalog-relative actor directory — the subject boundary holding this agent's
+    /// declaration-anchored state, driver records, and `resources/`.
+    pub resource_root: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -149,7 +169,13 @@ pub fn snapshot(root: &Path, this_host: &str) -> Result<CatalogGraph> {
     let _lock = crate::CatalogLock::shared(&root)
         .context("acquire shared catalog-authoring lock for catalog graph")?;
     let found = crate::discover_strict(&root);
-    let report = crate::validate::validate_discovered(&root, Some(this_host), &found);
+    // The graph reads the live catalog in place, so the tree under inspection is the runtime root.
+    let report = crate::validate::validate_discovered(
+        &root,
+        Some(this_host),
+        crate::validate::RuntimeRoot::Catalog(&root),
+        &found,
+    );
 
     let mut runtime_by_path: BTreeMap<PathBuf, Vec<crate::agents::AgentRow>> = BTreeMap::new();
     for row in crate::agents::roster_from_discovered(&found, &root, this_host) {
@@ -193,6 +219,16 @@ pub fn snapshot(root: &Path, this_host: &str) -> Result<CatalogGraph> {
 
     let conflicts = duplicate_identity_conflicts(&root, this_host, &found.specs);
     let observation = crate::catalog_archive::observe(&root)?;
+    let direct_actors = crate::direct_actor::discover(&root, &found, None)?
+        .into_iter()
+        .map(|actor| GraphDirectActor {
+            id: actor.id(),
+            resource_root: relative(&root, &actor.dir),
+            host: actor.host,
+            identity: actor.identity,
+            pty_id: actor.pty_id,
+        })
+        .collect();
     let complete = report.errors() == 0 && observation.issues.is_empty();
     let mut issues = report
         .issues
@@ -238,6 +274,7 @@ pub fn snapshot(root: &Path, this_host: &str) -> Result<CatalogGraph> {
         },
         agents,
         archived,
+        direct_actors,
         declarations,
         conflicts,
         issues,
@@ -327,6 +364,7 @@ fn graph_agent(
         address: spec.effective_address().to_owned(),
         // A retired subject does not resolve and does not occupy the address namespace.
         bus_address: (!spec.desired_state.is_retired()).then(|| spec.bus_address(this_host)),
+        resource_root: relative(root, spec.path.parent().unwrap_or(root)),
     }
 }
 

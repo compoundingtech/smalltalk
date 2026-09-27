@@ -1,0 +1,66 @@
+#!/usr/bin/env bash
+# Prove scripts/install leaves `st` as a symlink to the installed `st3` in every starting state.
+set -Eeuo pipefail
+
+install="$(cd "$(dirname "$0")" && pwd)/install"
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
+
+fail() {
+  echo "install-test: $*" >&2
+  exit 1
+}
+
+build() {
+  local dir=$1 version=$2 binary
+  mkdir -p "$dir"
+  for binary in st2 st3 st3-migrate stui; do
+    printf '#!/bin/sh\necho "%s %s"\n' "$binary" "$version" > "$dir/$binary"
+    chmod 0755 "$dir/$binary"
+  done
+}
+
+check() {
+  local bin=$1 version=$2 binary
+  [[ -L $bin/st && $(readlink "$bin/st") == st3 ]] || fail "$bin/st is not a symlink to st3"
+  [[ $("$bin/st") == "st3 $version" ]] || fail "st does not run st3 $version"
+  for binary in st2 st3 st3-migrate stui; do
+    [[ -f $bin/$binary && ! -L $bin/$binary ]] || fail "$bin/$binary is not a regular file"
+    [[ $("$bin/$binary") == "$binary $version" ]] || fail "$bin/$binary is not version $version"
+  done
+  [[ -z $(find "$bin" -name '.*.install.*') ]] || fail "staged files were left in $bin"
+}
+
+build "$work/one" 1
+build "$work/two" 2
+
+# A fresh destination.
+bash "$install" --from "$work/one" --bin-dir "$work/fresh" > /dev/null
+check "$work/fresh" 1
+
+# A stale `st` copied from an older st3 build is replaced by the link.
+mkdir -p "$work/stale"
+cp "$work/one/st3" "$work/stale/st"
+bash "$install" --from "$work/two" --bin-dir "$work/stale" > /dev/null
+check "$work/stale" 2
+
+# A reinstall over a previous install, and over a link to a foreign binary.
+ln -sfn "$work/one/st3" "$work/stale/st"
+bash "$install" --from "$work/one" --bin-dir "$work/stale" > /dev/null
+check "$work/stale" 1
+
+# A directory in the way is refused before anything is replaced.
+mkdir -p "$work/blocked/st"
+if bash "$install" --from "$work/two" --bin-dir "$work/blocked" 2> /dev/null; then
+  fail "installing over a directory named st succeeded"
+fi
+[[ ! -e $work/blocked/st3 ]] || fail "a refused install still replaced st3"
+
+# Missing binaries are refused.
+rm "$work/two/stui"
+if bash "$install" --from "$work/two" --bin-dir "$work/fresh" 2> /dev/null; then
+  fail "installing without stui succeeded"
+fi
+check "$work/fresh" 1
+
+echo 'install tests passed'

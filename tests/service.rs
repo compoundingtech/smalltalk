@@ -1,4 +1,4 @@
-//! `st2 service` (install/status/uninstall) CLI wiring + the legacy `st2 ding` alias for `st2 ping`.
+//! `st2 service` CLI wiring + the legacy `st2 ding` alias for `st2 ping`.
 //!
 //! We deliberately do NOT exercise a real `service install` here: it would write a real
 //! `st2.service` systemd-user unit and enable+start it on the test host. So these tests cover the
@@ -29,11 +29,56 @@ fn install_rejects_a_missing_catalog_before_touching_systemd() {
 }
 
 #[test]
-fn service_exposes_install_status_uninstall() {
+fn render_unit_uses_invoked_executable_and_residency_without_installing() {
+    let sandbox = tempfile::tempdir().unwrap();
+    let catalog = sandbox.path().join("catalog");
+    let config_home = sandbox.path().join("config");
+    std::fs::create_dir(&catalog).unwrap();
+
+    let out = st2()
+        .args(["service", "render-unit"])
+        .arg(&catalog)
+        .args([
+            "--residency-idle-after",
+            "5m",
+            "--residency-warm-capacity",
+            "2",
+        ])
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("PATH", sandbox.path().join("empty-bin"))
+        .output()
+        .unwrap();
+
+    assert!(
+        out.status.success(),
+        "render-unit failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let exe = std::fs::canonicalize(env!("CARGO_BIN_EXE_st2")).unwrap();
+    let catalog = catalog.canonicalize().unwrap();
+    assert!(
+        stdout.contains(&format!(
+            "ExecStart={} up --catalog {} --residency-idle-after 300000ms \
+             --residency-warm-capacity 2",
+            exe.display(),
+            catalog.display()
+        )),
+        "{stdout}"
+    );
+    assert!(
+        !config_home.join("systemd/user/st2.service").exists(),
+        "render-unit must not write the systemd unit"
+    );
+}
+
+#[test]
+fn service_exposes_install_render_status_uninstall() {
     let out = st2().args(["service", "--help"]).output().unwrap();
     assert!(out.status.success());
     let help = String::from_utf8_lossy(&out.stdout);
     assert!(help.contains("install"), "{help}");
+    assert!(help.contains("render-unit"), "{help}");
     assert!(help.contains("status"), "{help}");
     assert!(help.contains("uninstall"), "{help}");
 }

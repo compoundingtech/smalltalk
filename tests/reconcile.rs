@@ -433,6 +433,7 @@ fn spec(
         } else {
             AgentDesiredState::Running
         },
+        residency_policy: st2::ResidencyPolicy::Always,
         keep: false,
         restart: None,
         delivery: None,

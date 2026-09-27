@@ -86,7 +86,8 @@ impl ResourceProfileSupervisor {
         let request_dir = scope.observe_request_dir();
         let receipt_dir = scope.observe_receipt_dir();
         let (watch_tx, watch_rx) = mpsc::channel();
-        let observe_watcher = crate::watch::watch_recursive_mutations(&request_dir, watch_tx);
+        let observe_watcher =
+            crate::watch::watch_recursive_mutations(&request_dir, watch_tx).ok();
         if observe_watcher.is_none() {
             tracing::warn!(
                 "Resource observation request watcher is unavailable; \

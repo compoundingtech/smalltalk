@@ -913,6 +913,11 @@ fn harness_context_doctor_lines_are_advisory_and_never_change_the_exit_status() 
     );
     assert!(!stdout.contains("is its driver still reading"), "{stdout}");
     assert!(
+        stdout.contains("context age does not report reader health"),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("is its driver still reading"), "{stdout}");
+    assert!(
         !stdout.contains("harness context at"),
         "a low stale reading warns about its age, not its level: {stdout}"
     );

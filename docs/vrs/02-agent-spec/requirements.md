@@ -39,8 +39,9 @@ Field lookup: [F01](./spec.md#f01-source-form-or-path),
 [F16](./spec.md#f16-invalid-or-incomplete-state),
 [F17](./spec.md#f17-agent-name-and-description),
 [F18](./spec.md#f18-desired-state-and-reason),
-[F19](./spec.md#f19-agent-stream), and
-[F20](./spec.md#f20-agent-address).
+[F19](./spec.md#f19-agent-stream),
+[F20](./spec.md#f20-agent-address), and
+[F21](./spec.md#f21-agent-residency-policy).
 
 ## Shared invariants
 

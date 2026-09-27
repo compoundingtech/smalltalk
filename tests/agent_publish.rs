@@ -1,5 +1,6 @@
 use std::fs;
 use std::io::Write as _;
+use std::os::unix::net::UnixListener;
 use std::os::unix::process::ExitStatusExt as _;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -718,6 +719,73 @@ fn bundle_is_atomic_create_only_and_retry_checks_the_full_payload() {
         .output()
         .unwrap();
     assert!(!mismatch.status.success());
+}
+
+#[test]
+fn publication_does_not_traverse_unrelated_runtime_state() {
+    let temp = tempfile::tempdir().unwrap();
+    let catalog = temp.path().join("c");
+    let runtime = catalog.join("agents/h/d/resources");
+    fs::create_dir_all(&runtime).unwrap();
+    let socket = runtime.join("s");
+    let _listener = UnixListener::bind(&socket).unwrap();
+    let spec = temp.path().join("candidate.kdl");
+    fs::write(&spec, valid_spec(false)).unwrap();
+
+    let output = publish(&catalog, &spec, &["--expect-absent"]);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(socket.exists());
+}
+
+#[test]
+fn bundle_workspace_descendants_are_not_publication_input() {
+    let temp = tempfile::tempdir().unwrap();
+    let catalog = temp.path().join("catalog");
+    let bundle = temp.path().join("bundle");
+    let workspace = bundle.join(".workspace/deep");
+    fs::create_dir(&catalog).unwrap();
+    fs::create_dir_all(&workspace).unwrap();
+    fs::write(
+        bundle.join("agent.kdl"),
+        "agent \"worker\" {\n  host \"host\"\n  workspace \".workspace\"\n  argv \"true\"\n}\n",
+    )
+    .unwrap();
+    let sentinel = workspace.join("sentinel");
+    fs::write(&sentinel, "before").unwrap();
+    let socket = workspace.join("session.sock");
+    let _listener = UnixListener::bind(&socket).unwrap();
+
+    let before = source_digest("--bundle", &bundle);
+    fs::write(&sentinel, "after").unwrap();
+    let after = source_digest("--bundle", &bundle);
+    assert_eq!(before, after);
+
+    let output = st2()
+        .args([
+            "agent",
+            "publish",
+            "--catalog",
+            catalog.to_str().unwrap(),
+            "--bundle",
+            bundle.to_str().unwrap(),
+            "--input-sha256",
+            &after,
+            "--expect-absent",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let published_workspace = catalog.join("agents/host/worker/.workspace");
+    assert!(published_workspace.is_dir());
+    assert!(fs::read_dir(published_workspace).unwrap().next().is_none());
 }
 
 #[test]
@@ -1570,4 +1638,137 @@ fn wait_for_path(path: &Path) {
         );
         thread::sleep(Duration::from_millis(10));
     }
+}
+
+/// `publish` with the pty-root environment pinned OFF, so the guard resolves the catalog-relative
+/// default rather than whatever `PTY_ROOT` the invoking shell exports.
+///
+/// Without this the socket-bound tests are vacuous wherever `PTY_ROOT` is set — an ambient root
+/// wins over the catalog-relative one, so no catalog depth can reach the limit and the wiring under
+/// test is unobservable. The Nix builder exports neither variable, which is why the regression this
+/// repairs was visible in CI and invisible locally.
+fn publish_with_catalog_relative_pty_root(
+    catalog: &Path,
+    spec: &Path,
+    expectation: &[&str],
+) -> Output {
+    let input_sha256 = sha256(&fs::read(spec).unwrap());
+    st2()
+        .env_remove("PTY_ROOT")
+        .env_remove("PTY_SESSION_DIR")
+        .args([
+            "agent",
+            "publish",
+            "--catalog",
+            catalog.to_str().unwrap(),
+            "--spec",
+            spec.to_str().unwrap(),
+        ])
+        .args(["--input-sha256", &input_sha256])
+        .args(expectation)
+        .arg("--json")
+        .output()
+        .unwrap()
+}
+
+/// A catalog root padded to exactly `target_len` bytes, so a test can place the canonical session
+/// socket path at a chosen distance from the platform limit.
+fn catalog_root_of_length(temp: &Path, target_len: usize) -> PathBuf {
+    let mut root = temp.join("catalog");
+    let mut guard = 0;
+    while root.as_os_str().len() < target_len {
+        let missing = target_len - root.as_os_str().len();
+        // One path component per pass; `/x` is the smallest step, so any remainder is reachable.
+        let name = "p".repeat(missing.saturating_sub(1).max(1));
+        root = root.join(&name[..name.len().min(missing.saturating_sub(1)).max(1)]);
+        guard += 1;
+        assert!(guard < 64, "could not pad a catalog root to {target_len} bytes");
+    }
+    assert_eq!(
+        root.as_os_str().len(),
+        target_len,
+        "padding overshot: {}",
+        root.display()
+    );
+    fs::create_dir_all(&root).unwrap();
+    root
+}
+
+/// Publication must judge the socket-path bound against the catalog that will RUN, not against the
+/// disposable admission projection it validates.
+///
+/// `st2 agent publish` validates a shadow catalog nested inside the live one, so measuring the tree
+/// under inspection charged every identity for the projection's own depth and rejected
+/// declarations whose real socket is bindable. On the pre-fix implementation this fails with
+/// `socket-path-too-long` naming a `catalog-admission-*` path.
+///
+/// The fixture is deliberately sensitive to ANY staging depth rather than to the current layout:
+/// the canonical socket path is placed within a few bytes of the limit, so any nesting deeper than
+/// that headroom — whatever it is called and however deep it happens to be — would trip the bound
+/// if the implementation measured it again.
+#[test]
+fn publication_judges_the_socket_bound_against_the_runtime_catalog_not_the_projection() {
+    for headroom in [0_usize, 4, 8] {
+        let temp = tempfile::tempdir().unwrap();
+        let socket_len = st2::run::PORTABLE_SOCKET_PATH_LIMIT - headroom;
+        // Everything the canonical socket path adds after the catalog root: the pty directory, the
+        // separators and the `.sock` suffix. Probed through the shipped path construction rather
+        // than spelled out, so the fixture cannot drift from it.
+        let suffix = st2::run::session_socket_path(&Path::new("x").join("pty"), "host.worker")
+            .as_os_str()
+            .len()
+            - 1;
+        let catalog = catalog_root_of_length(temp.path(), socket_len - suffix);
+
+        let canonical = st2::run::session_socket_path(&catalog.join("pty"), "host.worker");
+        assert_eq!(
+            canonical.as_os_str().len(),
+            socket_len,
+            "fixture must place the canonical socket {headroom} bytes under the limit"
+        );
+        assert!(
+            st2::run::session_socket_overage(&catalog.join("pty"), "host.worker").is_none(),
+            "fixture precondition: the canonical socket must be bindable"
+        );
+
+        let spec = temp.path().join("candidate.kdl");
+        fs::write(&spec, "agent \"worker\" {\n  host \"host\"\n  argv \"true\"\n}\n").unwrap();
+        let output = publish_with_catalog_relative_pty_root(&catalog, &spec, &["--expect-absent"]);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !stderr.contains("socket-path-too-long"),
+            "headroom {headroom}: a bindable canonical socket must not be refused: {stderr}"
+        );
+        assert!(output.status.success(), "headroom {headroom}: {stderr}");
+    }
+}
+
+/// The guard still rejects a declaration whose CANONICAL socket path exceeds the limit, through the
+/// same publish path. Without this, the repair above could be satisfied by disabling the check.
+#[test]
+fn publication_still_refuses_an_unbindable_canonical_socket_path() {
+    let temp = tempfile::tempdir().unwrap();
+    let catalog = temp.path().join("catalog");
+    fs::create_dir(&catalog).unwrap();
+    let identity = "w".repeat(200);
+    let spec = temp.path().join("candidate.kdl");
+    fs::write(
+        &spec,
+        format!("agent \"{identity}\" {{\n  host \"host\"\n  argv \"true\"\n}}\n"),
+    )
+    .unwrap();
+
+    assert!(
+        st2::run::session_socket_overage(&catalog.join("pty"), &format!("host.{identity}"))
+            .is_some(),
+        "fixture precondition: this canonical socket must exceed the limit"
+    );
+
+    let output = publish_with_catalog_relative_pty_root(&catalog, &spec, &["--expect-absent"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "stdout: {}", String::from_utf8_lossy(&output.stdout));
+    assert!(
+        stderr.contains("socket-path-too-long"),
+        "an unbindable canonical socket must still be refused: {stderr}"
+    );
 }

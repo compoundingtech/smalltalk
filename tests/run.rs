@@ -237,6 +237,7 @@ fn task_spec(identity: &str, host: Option<&str>, id: &str) -> AgentSpec {
         workspace: None,
         supervisor: None,
         desired_state: AgentDesiredState::Running,
+        residency_policy: st2::ResidencyPolicy::Always,
         keep: false,
         restart: None,
         delivery: None,

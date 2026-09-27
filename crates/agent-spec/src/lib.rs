@@ -39,13 +39,14 @@ pub mod spec;
 
 pub use declared::{
     DeclaredAgent, DeclaredDiagnostic, DeclaredDiagnosticCode, DeclaredDocument, DeclaredEntry,
-    DeclaredNode, DeclaredParse, DeclaredSeverity, DeclaredSpan, DeclaredValue,
-    parse_declared_document, parse_declared_file,
+    DeclaredLifecycle, DeclaredLifecycleSource, DeclaredNode, DeclaredParse, DeclaredSeverity,
+    DeclaredSpan, DeclaredValue, parse_declared_document, parse_declared_file,
 };
 pub use discovery::{
     Declared, Discovered, SpecError, discover, discover_file, discover_strict, is_catalog_path,
     parse_declared, path_defaults,
 };
+
 pub use profile::{
     DEFAULT_SELECTOR_LIMIT_BYTES, DescriptorValidationError, PROFILE_DESCRIPTOR_ABI_VERSION,
     ProfileCapability, ProfileClass, ProfileDescriptor, ProfileRuntime, ProfileSnapshot,
@@ -55,7 +56,8 @@ pub use profile::{
 pub use spec::{
     AGENT_ADDRESS_MAX_BYTES, AGENT_ADDRESS_SEGMENT_MAX_BYTES, AGENT_ID_MAX_BYTES,
     AgentDesiredState, AgentSpec, ClaudeDriver, CodexDriver, DeliveryReadiness, DeliveryTransport,
-    Driver, JobType, OpenCodeDriver, PiDriver, Resource, Restart, RestartMode, STREAM_TASK_PREFIX,
+    Driver, JobType, OpenCodeDriver, PiDriver, ResidencyPolicy, Resource, Restart, RestartMode,
+    STREAM_TASK_PREFIX,
     SessionDriver, Stream, StreamLaunch, Task, TaskKind, TaskLifecycle, parse_duration,
     stream_name_of_task, validate_agent_address, validate_agent_id, validate_desired_state_reason,
 };

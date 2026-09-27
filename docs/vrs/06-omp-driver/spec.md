@@ -45,9 +45,14 @@ Shape of `pi_session.rs`:
 
 - Resolves the agent dir, installs the signal handler, claims the observed-state record under
   a freshly minted session token.
-- Version gate first: runs `<omp> --version`, parses a strict `MAJOR.MINOR.PATCH` release, and
-  admits only a MINOR already measured (`SUPPORTED_OMP_MINORS`); outside that set the launch
-  fails loudly with the measured-checks message, per OMP-R05 and decision 0007-omp-is-a-fifth-native-driver-with-its-own-channel-and-a-hard-version-gate. Admission is per
+- For an ordinary launch, runs `<omp> --version` first. For a residency wake, validates the
+  provider checkpoint and rejects every authored session selector before starting even that
+  diagnostic child. A missing, corrupt, foreign, stale, or changed binding fails closed. The
+  validated native session ID is injected as `omp --resume <id>`; there is no fresh-session
+  fallback. The version gate parses a strict `MAJOR.MINOR.PATCH` release, admits only a MINOR
+  already measured (`SUPPORTED_OMP_MINORS`), and fails loudly with the measured-checks message,
+  per OMP-R05 and decision
+  0007-omp-is-a-fifth-native-driver-with-its-own-channel-and-a-hard-version-gate. Admission is per
   minor: a patch inside an admitted minor launches without new evidence, and a later *minor*
   stays rejected until the checks are repeated against it. The parse is what keeps "per minor"
   from decaying into "starts with 18" — minors are compared numerically (`18.10` is not `18.1`),
@@ -63,8 +68,10 @@ Shape of `pi_session.rs`:
   resolved from this binary's immutable asset, never a catalog-pinned path).
 - Applies offline defaults (`PI_OFFLINE=1`, `PI_SKIP_VERSION_CHECK=1`) unless the operator's
   declaration already set them; suppression of the update banner itself is DQ-OMP-5.
-- Exports the channel env (`ST2_OMP_CHANNEL_{BIN,CATALOG,IDENTITY,RUNTIME_ID,SESSION,SEQ}`)
-  using fresh names — an omp seat must never adopt a stray pi channel env.
+- Exports the channel env (`ST2_OMP_CHANNEL_{BIN,CATALOG,IDENTITY,RUNTIME_ID,SESSION,SEQ}`).
+  A residency wake also exports `EXPECTED_NATIVE_SESSION` and `RESUME_GENERATION`; ordinary
+  launches explicitly remove both fence variables from the inherited provider environment.
+  Fresh names ensure that an omp seat never adopts a stray pi channel env.
 - On provider exit writes the terminal observed record; presence decays by staleness as for
   pi (SIGKILL produces no terminal event).
 
@@ -98,8 +105,13 @@ message / delivered / failed / state / context frames, PROTOCOL constant). Diffe
   activity proved by `isIdle()`. Approval frames do not overwrite a tracked structured ask.
 - **Pre-compaction edge:** `session_before_compact` emits `{type:"pre_compact"}`. The extension
   carries no durable path and writes no context itself.
-- **Session lifecycle:** `session_start` opens the channel and seeds state from `isIdle()`;
-  replacement sessions close their named predecessor in `open()`. Upstream defines
+- **Session lifecycle and native binding:** `session_start` requires
+  `ctx.sessionManager.getSessionId()`, opens the channel, and sends that native OMP session ID
+  before accepting Rust's hello. After the hello passes the protocol gate, the extension returns
+  a matching ready frame. Only this two-way exchange makes the binding ready. The mandatory
+  generation and expected-ID fence applies to the first restored session of a cold launch; an
+  explicit later in-process session switch becomes the current binding instead of inheriting the
+  old fence. Replacement sessions close their named predecessor in `open()`. Upstream defines
   `session_shutdown` without a `reason` field and fires it on process exit, so every such event
   closes the current channel.
 - **Restored context:** seeding uses
@@ -108,13 +120,22 @@ message / delivered / failed / state / context frames, PROTOCOL constant). Diffe
 ## Rust channel process
 
 `st2 driver omp-channel` reuses the pi channel's loop (`pi_channel.rs`) parameterized by the
-`ChannelKind` for `"omp"`; the state frame parser accepts the blocked fields. On `pre_compact`, Rust
-resolves `<agent>/resources/context/now.md` through the canonical context API. The blank predicate
-and atomic replacement execute under the same lock used by every `now.md` writer, so an authored
-write cannot land between them. Only `NotFound` or successfully decoded whitespace-only content
-permits the recovery stub; nonblank content is preserved, and every other read failure leaves the
-entry untouched and publishes a deterministic actionable error state. The ding side gains no omp
-adapter (OMP-T03): delivery is channel-only, failing closed when absent.
+`ChannelKind` for `"omp"`; the state frame parser accepts the blocked fields. Before publishing
+hello, the OMP endpoint stores a separate not-ready candidate and validates its wrapper
+incarnation, residency generation, and required native ID. The checkpoint binding remains
+authoritative and retryable if the channel exits before the exchange completes. Only a matching
+ready frame promotes the candidate to the authoritative binding. Residency readiness therefore
+proves the new wrapper incarnation, exact native session, exact generation, and completed
+two-way channel handshake; a binding from before the checkpoint remains starting rather than
+becoming a false positive.
+
+On `pre_compact`, Rust resolves `<agent>/resources/context/now.md` through the canonical context
+API. The blank predicate and atomic replacement execute under the same lock used by every
+`now.md` writer, so an authored write cannot land between them. Only `NotFound` or successfully
+decoded whitespace-only content permits the recovery stub; nonblank content is preserved, and
+every other read failure leaves the entry untouched and publishes a deterministic actionable
+error state. The ding side gains no omp adapter (OMP-T03): delivery is channel-only, failing
+closed when absent.
 
 The `{type:"turn"}` frame lands on two independent records. Categorically, a provider error is
 `active` — nothing is running, but a record saying `idle` would read as a healthy yield — with
@@ -146,6 +167,10 @@ Captures, per measured release:
 - 18.0.3 — [`2026-08-25-omp-harness-integration.md`](./.experiments/2026-08-25-omp-harness-integration.md)
   (also the original port evidence).
 - 18.0.9 — [`2026-08-28-omp-18-0-9-admission.md`](./.experiments/2026-08-28-omp-18-0-9-admission.md).
+- 18.1.2 — [`2026-09-02-omp-18-1-2-admission.md`](./.experiments/2026-09-02-omp-18-1-2-admission.md).
+- 18.3.0 — [`2026-09-24-omp-18-3-0-admission.md`](./.experiments/2026-09-24-omp-18-3-0-admission.md).
+
+The `18.2` minor is not admitted: no release in that minor has been measured.
 
 Behavioral captures that are not minor admissions:
 

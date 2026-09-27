@@ -2,6 +2,8 @@
 set -euo pipefail
 
 : "${ST_MISSION_RUN:?ST_MISSION_RUN must identify the judged mission run}"
+# shellcheck source=../participants.sh
+source ./participants.sh
 
 if [ -s pty-audit.log ]; then
   printf 'direct terminal interaction was observed:\n' >&2
@@ -9,8 +11,8 @@ if [ -s pty-audit.log ]; then
   exit 1
 fi
 
-for name in codex claude pi omp; do
-  agent="agent/$ST_MISSION_RUN/wake.$name"
+for name in "${names[@]}"; do
+  agent="${agents[$name]}"
   count="$(st3 trace show "$agent" --json --limit 200 \
     | jq -s '[.[] | select(.kind == "terminal.input.requested")] | length')"
   test "$count" -eq 0

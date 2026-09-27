@@ -997,11 +997,11 @@ mod tests {
         assert_eq!(fs::read_to_string(&unmarked).unwrap(), plain);
     }
 
-    /// The marker-matched arm stands in for the CAS `agent publish` the projection would otherwise
-    /// run, so it refuses what that publication refuses: a retirement leaving an active agent
-    /// descended from a tombstone root is rejected by admission before any byte is written.
+    /// A marker-matched lifecycle edit uses the same delta admission as an unmarked edit: retiring
+    /// a root introduces an active descendant of a tombstone and is rejected before any byte is
+    /// written.
     #[test]
-    fn marker_matched_retirement_refuses_a_candidate_admission_would_reject() {
+    fn marker_matched_lifecycle_delta_refuses_a_new_error() {
         let temporary = tempfile::tempdir().unwrap();
         let root = temporary.path();
         let projected = write(

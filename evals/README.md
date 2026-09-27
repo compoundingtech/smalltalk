@@ -115,6 +115,13 @@ canary uses Claude Code's `opus` alias and records the concrete model selected b
 
 Model agents must use a native `harness` block. A setup or fixture process can use `command`.
 
+An eval can keep seat variants in `variants/`. A variant is a complete eval KDL that changes only the
+seat under test, so one fixture can compare harnesses. The omp readiness runs use omp on
+`openai-codex/gpt-5.6-luna`, Codex `gpt-6-luna`, and Claude `claude-sonnet-5` variants of
+cross-harness message wake, work wake reliability, seat mission work, and restart continuity.
+Cross-harness message wake also has omp `openai-codex/gpt-5.6-sol` and `openai-codex/gpt-6-astra`
+variants for the omp model comparison.
+
 Codex `gpt-5.6-sol` is the default model judge.
 
 An eval can use a Claude judge for a specific reason. Record the choice in this inventory and the run report.
@@ -131,7 +138,8 @@ Do not disable harness features or reveal held-out gate criteria in agent instru
 
 st3 sends one durable Small Talk message when an assigned parent becomes ready.
 
-Inherited nested steps use the parent message. A nested step sends a new message only when its assignee changes.
+Inherited nested steps use the parent message. A nested step sends a new message only when its assignee changes,
+or when its agent submitted the parent while that nested step was still ready.
 
 The native driver transports a graph message. It does not create a second message source.
 

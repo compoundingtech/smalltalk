@@ -246,7 +246,14 @@ fn refuse_address_collision(
             spec.address = requested.map(str::to_owned);
         }
     }
-    let report = crate::validate::validate_discovered(catalog_root, Some(this_host), &prospective);
+    // The prospective catalog is an in-memory edit of the live one, which is where sockets
+    // will be bound, so the live root is the runtime root.
+    let report = crate::validate::validate_discovered(
+        catalog_root,
+        Some(this_host),
+        crate::validate::RuntimeRoot::Catalog(catalog_root),
+        &prospective,
+    );
     if !report
         .issues
         .iter()

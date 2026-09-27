@@ -398,7 +398,8 @@ pub fn diff(request: DiffRequest) -> Result<DiffResult> {
     let before = project(&retained_catalog, ProjectionSource::Current, &catalog)?;
     validate_projection_link_counts(&retained_catalog, &before, "live catalog")?;
     validate_live_workspace_facts(&catalog, &before.workspace_dirs)?;
-    validate_full_catalog(&retained_catalog).context("validate live catalog for diff")?;
+    validate_full_catalog(&retained_catalog, crate::validate::RuntimeRoot::Catalog(&catalog))
+        .context("validate live catalog for diff")?;
     anyhow::ensure!(
         before.root_sha256 == request.expect_sha256,
         "catalog diff precondition failed: expected root sha256 {}, found {}",
@@ -409,7 +410,8 @@ pub fn diff(request: DiffRequest) -> Result<DiffResult> {
     let captured = tempfile::tempdir().context("create prepared diff capture root")?;
     capture_prepared_catalog(&prepared, captured.path())?;
     let after = project(captured.path(), ProjectionSource::Prepared, &catalog)?;
-    validate_full_catalog(captured.path()).context("validate prepared catalog for diff")?;
+    validate_full_catalog(captured.path(), crate::validate::RuntimeRoot::Catalog(&catalog))
+        .context("validate prepared catalog for diff")?;
 
     let before_specs = canonical_semantic_specs(&retained_catalog)?;
     let after_specs = canonical_semantic_specs(captured.path())?;
@@ -462,7 +464,10 @@ fn render_input_paths(
     specs: &BTreeMap<AgentKey, agent_spec::AgentSpec>,
 ) -> Result<BTreeSet<String>> {
     let mut paths = BTreeSet::new();
-    for spec in specs.values() {
+    for spec in specs
+        .values()
+        .filter(|spec| spec.desired_state.is_running())
+    {
         let host = spec
             .host
             .as_deref()
@@ -703,6 +708,13 @@ fn normalize_agent(spec: &agent_spec::AgentSpec) -> Result<BTreeMap<String, Sema
         &format!("{base}/desired-state/reason"),
         SemanticType::String,
         spec.desired_state.reason(),
+    );
+    insert_default_value(
+        &mut fields,
+        &format!("{base}/residency-policy"),
+        SemanticType::String,
+        spec.residency_policy.as_str().to_owned(),
+        spec.residency_policy == agent_spec::ResidencyPolicy::Always,
     );
     insert_default_bool(&mut fields, &format!("{base}/keep"), spec.keep, false);
     insert_optional(
@@ -1296,7 +1308,7 @@ pub fn bootstrap(request: BootstrapRequest) -> Result<BootstrapResult> {
 
     let admission = tempfile::tempdir().context("create prepared-catalog admission root")?;
     materialize_projection(&desired, admission.path())?;
-    validate_full_catalog(admission.path())?;
+    validate_full_catalog(admission.path(), crate::validate::RuntimeRoot::Catalog(&catalog))?;
     let desired_config = crate::catalog::load(admission.path())?;
     validate_external_pty_root(
         &catalog,
@@ -1336,7 +1348,7 @@ pub fn bootstrap(request: BootstrapRequest) -> Result<BootstrapResult> {
             desired.root_sha256,
             staged.root_sha256
         );
-        validate_full_catalog(&stage)?;
+        validate_full_catalog(&stage, crate::validate::RuntimeRoot::Catalog(&catalog))?;
         let lock = initialize_bootstrap_control(&stage)?;
         sync_tree_dirs(&stage)?;
         Ok(lock)
@@ -1404,7 +1416,7 @@ fn inspect_existing_bootstrap(
         catalog,
         &desired.workspace_dirs,
     )?;
-    validate_full_catalog(&retained_catalog)?;
+    validate_full_catalog(&retained_catalog, crate::validate::RuntimeRoot::Catalog(&catalog))?;
     anyhow::ensure!(
         current.root_sha256 == desired.root_sha256,
         "catalog bootstrap target already exists with root sha256 {}, expected {}",
@@ -1607,7 +1619,7 @@ pub fn apply(request: ApplyRequest) -> Result<ApplyResult> {
     // are mirrored as empty directories; their live content is never copied or hashed.
     let admission = tempfile::tempdir().context("create prepared-catalog admission root")?;
     materialize_projection(&desired, admission.path())?;
-    validate_full_catalog(admission.path())?;
+    validate_full_catalog(admission.path(), crate::validate::RuntimeRoot::Catalog(&catalog))?;
     let desired_config = crate::catalog::load(admission.path())?;
     validate_external_pty_root(
         &catalog,
@@ -1719,7 +1731,8 @@ pub fn apply(request: ApplyRequest) -> Result<ApplyResult> {
         staged.root_sha256,
         verified.root_sha256
     );
-    validate_full_catalog(&catalog).context("validate applied live catalog")?;
+    validate_full_catalog(&catalog, crate::validate::RuntimeRoot::Catalog(&catalog))
+        .context("validate applied live catalog")?;
     sync_dir(&catalog)?;
     generation.commit()?;
     test_checkpoint("before-clear");
@@ -1745,40 +1758,102 @@ pub fn apply(request: ApplyRequest) -> Result<ApplyResult> {
     })
 }
 
-/// Full structural and host-scoped validation for a complete prospective catalog.
-pub(crate) fn validate_full_catalog(root: &Path) -> Result<()> {
-    let found = crate::discover(root);
+/// Stable identities for all core validation errors across structural and per-host passes.
+///
+/// Lifecycle authoring compares these rather than diagnostic prose because projection paths make
+/// messages unstable. The coverage matches [`validate_full_catalog`], including its runtime root.
+pub(crate) struct FullCatalogErrors {
+    pub identities: BTreeMap<(&'static str, String, Option<String>), usize>,
+    issues: Vec<crate::validate::Issue>,
+}
+
+pub(crate) fn collect_full_catalog_errors(
+    root: &Path,
+    runtime: crate::validate::RuntimeRoot<'_>,
+) -> Result<FullCatalogErrors> {
+    collect_full_catalog_errors_with_host_policy(root, runtime, false)
+}
+
+fn collect_full_catalog_errors_with_host_policy(
+    root: &Path,
+    runtime: crate::validate::RuntimeRoot<'_>,
+    require_explicit_host: bool,
+) -> Result<FullCatalogErrors> {
+    let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let found = crate::discover(&root);
     let mut hosts = BTreeSet::new();
     for spec in &found.specs {
-        let host = spec
-            .host
-            .as_deref()
-            .context("canonical declaration is missing explicit host")?;
-        hosts.insert(host.to_string());
+        let host = match spec.host.as_deref() {
+            Some(host) => host,
+            None if require_explicit_host => {
+                anyhow::bail!("canonical declaration is missing explicit host")
+            }
+            None => spec.resolved_host(""),
+        };
+        hosts.insert(host.to_owned());
     }
-    let mut errors = BTreeSet::new();
-    let report = crate::validate::validate(root);
-    errors.extend(
-        report
-            .issues
-            .iter()
-            .filter(|issue| issue.severity == crate::validate::Severity::Error)
-            .map(format_issue),
+    let mut identities = BTreeMap::new();
+    let mut issues = Vec::new();
+    collect_error_identities(
+        &mut identities,
+        &mut issues,
+        crate::validate::validate_discovered(
+            &root,
+            None,
+            crate::validate::RuntimeRoot::Unknown,
+            &found,
+        ),
     );
     for host in hosts {
-        let report = crate::validate::validate_for_host(root, &host);
-        errors.extend(
-            report
-                .issues
-                .iter()
-                .filter(|issue| issue.severity == crate::validate::Severity::Error)
-                .map(format_issue),
+        collect_error_identities(
+            &mut identities,
+            &mut issues,
+            crate::validate::validate_discovered(&root, Some(&host), runtime, &found),
         );
     }
+    Ok(FullCatalogErrors { identities, issues })
+}
+
+fn collect_error_identities(
+    identities: &mut BTreeMap<(&'static str, String, Option<String>), usize>,
+    errors: &mut Vec<crate::validate::Issue>,
+    report: crate::validate::Report,
+) {
+    for issue in report
+        .issues
+        .into_iter()
+        .filter(|issue| issue.severity == crate::validate::Severity::Error)
+    {
+        *identities
+            .entry((issue.code, issue.path.clone(), issue.agent.clone()))
+            .or_default() += 1;
+        errors.push(issue);
+    }
+}
+
+/// Full structural and host-scoped validation for a complete prospective catalog.
+///
+/// `runtime` names the catalog whose resolved pty root bounds session sockets. It is a separate
+/// argument because `root` is frequently NOT that catalog: admission validates a projection, diff
+/// validates a capture, bootstrap validates a stage, and a retained live catalog is addressed
+/// through a file-descriptor path. Reading the bound off `root` charged declarations for the depth
+/// of whichever temporary tree happened to be under inspection.
+pub(crate) fn validate_full_catalog(
+    root: &Path,
+    runtime: crate::validate::RuntimeRoot<'_>,
+) -> Result<()> {
+    let errors = collect_full_catalog_errors_with_host_policy(root, runtime, true)?;
     anyhow::ensure!(
-        errors.is_empty(),
+        errors.issues.is_empty(),
         "catalog fails full validation:\n{}",
-        errors.into_iter().collect::<Vec<_>>().join("\n")
+        errors
+            .issues
+            .iter()
+            .map(format_issue)
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>()
+            .join("\n")
     );
     Ok(())
 }
@@ -1898,7 +1973,9 @@ fn project_excluding(
     }
     collect_templates(root, source, &mut files)?;
 
-    for spec in &specs {
+    // Render-input existence is a running launch-readiness fact. Inactive declarations remain
+    // structurally projected without resolving their ambient copy sources.
+    for spec in specs.iter().filter(|spec| spec.desired_state.is_running()) {
         let host = spec.host.as_deref().context("explicit host disappeared")?;
         for input in crate::materialize::catalog_owned_render_inputs(root, spec, host)? {
             let relative = normalized_relative(root, &input)?;
@@ -3167,9 +3244,9 @@ fn collect_dirs(root: &Path, dirs: &mut Vec<PathBuf>) -> Result<()> {
     Ok(())
 }
 
-/// Copy an exact directory capability without following a source symlink at any depth.
-pub(crate) fn capture_real_tree(source: &Path, destination: &Path) -> Result<()> {
-    capture_tree(source, destination, CaptureMode::General)
+/// Capture a publication bundle while retaining `.workspace` only as an empty directory fact.
+pub(crate) fn capture_agent_bundle(source: &Path, destination: &Path) -> Result<()> {
+    capture_tree(source, destination, CaptureMode::AgentBundle)
 }
 
 fn capture_prepared_catalog(source: &Path, destination: &Path) -> Result<()> {
@@ -3178,7 +3255,7 @@ fn capture_prepared_catalog(source: &Path, destination: &Path) -> Result<()> {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum CaptureMode {
-    General,
+    AgentBundle,
     PreparedCatalog,
 }
 
@@ -3278,12 +3355,18 @@ fn capture_dir_capability(
         let target = destination.join(&name);
         if metadata.is_dir() {
             let relative = target.strip_prefix(capture_root)?;
-            if mode == CaptureMode::PreparedCatalog && is_canonical_workspace_fact(relative) {
-                anyhow::ensure!(
-                    capability_dir_entries(&input)?.is_empty(),
-                    "prepared workspace fact must be empty: {}",
-                    relative.display()
-                );
+            let workspace_fact = match mode {
+                CaptureMode::AgentBundle => relative == Path::new(".workspace"),
+                CaptureMode::PreparedCatalog => is_canonical_workspace_fact(relative),
+            };
+            if workspace_fact {
+                if mode == CaptureMode::PreparedCatalog {
+                    anyhow::ensure!(
+                        capability_dir_entries(&input)?.is_empty(),
+                        "prepared workspace fact must be empty: {}",
+                        relative.display()
+                    );
+                }
                 fs::create_dir(&target)?;
                 fs::set_permissions(&target, fs::Permissions::from_mode(0o755))?;
                 continue;
@@ -3417,6 +3500,38 @@ mod tests {
             .get("/agents/host/worker/streams/webhook/launch")
             .expect("external stream must affect semantic projection");
         assert_eq!(atom, &present_atom(SemanticType::String, "external"));
+    }
+
+    #[test]
+    fn residency_policy_participates_in_semantic_catalog_projection() {
+        let root = tempfile::tempdir().unwrap();
+        let agent = root.path().join("agents/host/worker");
+        std::fs::create_dir_all(&agent).unwrap();
+        let path = agent.join("agent.kdl");
+        std::fs::write(
+            &path,
+            "agent \"worker\" {\n  host \"host\"\n  command \"worker\"\n}\n",
+        )
+        .unwrap();
+        let discovered = agent_spec::discover_strict(root.path());
+        assert!(discovered.errors.is_empty(), "{:?}", discovered.errors);
+        let address = "/agents/host/worker/residency-policy";
+        assert_eq!(
+            normalize_agent(&discovered.specs[0]).unwrap()[address],
+            default_atom(SemanticType::String)
+        );
+
+        std::fs::write(
+            path,
+            "agent \"worker\" {\n  host \"host\"\n  command \"worker\"\n  session-driver \"codex\"\n  residency-policy \"on-demand\"\n}\n",
+        )
+        .unwrap();
+        let discovered = agent_spec::discover_strict(root.path());
+        assert!(discovered.errors.is_empty(), "{:?}", discovered.errors);
+        assert_eq!(
+            normalize_agent(&discovered.specs[0]).unwrap()[address],
+            present_atom(SemanticType::String, "on-demand")
+        );
     }
 
     #[test]

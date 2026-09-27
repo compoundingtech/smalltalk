@@ -177,7 +177,7 @@ pub(super) fn edit_desired_state_declaration(
         )
     })?;
     let target = exact_agent_node(&document, expected_identity, expected_host, expected_agent)?;
-    let marker_matched = authorize_marker(target, expected_identity, path, managed_by)?;
+    authorize_marker(target, expected_identity, path, managed_by)?;
     let Some(replacement) = desired_state_edit(text, target, state, reason)? else {
         return Ok(AuthorOutcome::Unchanged);
     };
@@ -189,19 +189,16 @@ pub(super) fn edit_desired_state_declaration(
         state,
         reason,
     )?;
-    // A marker-matched edit stands in for the CAS `agent publish` the projection would otherwise
-    // have to perform, so it inherits that path's admission gate rather than only the local
-    // candidate reparse: the whole prospective catalog must still be admissible. That is what
-    // makes retiring a supervisor with a live descendant refuse (`retired-root`) instead of
-    // committing bytes the next reconcile pass rejects (#434).
-    if marker_matched
-        && let Err(error) = crate::agent_publish::admit_declaration_rewrite(
-            catalog,
-            control,
-            path,
-            replacement.as_bytes(),
-        )
-    {
+    // Every lifecycle mutation is admitted as a delta against the locked incumbent catalog.
+    // Refusing only newly introduced core ERROR identities preserves repair and teardown when an
+    // unrelated declaration is already invalid, while running, suspended, and retired still
+    // cannot acquire lifecycle-specific readiness, address, or topology errors (#434).
+    if let Err(error) = crate::agent_publish::admit_lifecycle_rewrite(
+        catalog,
+        control,
+        path,
+        replacement.as_bytes(),
+    ) {
         return Err(AuthorError::new(
             "candidate-not-admissible",
             format!("{error:#}"),
@@ -310,6 +307,7 @@ fn authorize_marker(
     expected_identity: &str,
     path: &Path,
     asserted: Option<&str>,
-) -> Result<bool, AuthorError> {
+) -> Result<(), AuthorError> {
     authorize_asserted_marker(&declared_markers(target), expected_identity, path, asserted)
+        .map(drop)
 }

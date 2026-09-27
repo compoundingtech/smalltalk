@@ -168,6 +168,8 @@ fn declared_delivery_has_one_exact_semantic_address() {
   session-driver "codex"
   delivery-readiness "credential"
   deliver "app-server"
+  session-driver "codex"
+  delivery-readiness "credential"
   argv "tool" "arg"
 }
 "#,
@@ -329,6 +331,57 @@ fn render_template_static_and_workspace_paths_remain_distinct() {
 }
 
 #[test]
+fn inactive_render_inputs_do_not_require_ambient_source_existence_for_projection_or_diff() {
+    for (name, lifecycle) in [
+        ("suspended", r#"desired-state "suspended" reason="Waiting""#),
+        (
+            "canonical-retired",
+            r#"desired-state "retired" reason="Finished""#,
+        ),
+        ("legacy-retired", "retired #true"),
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let catalog = temp.path().join("catalog");
+        let prepared = temp.path().join("prepared");
+        fs::create_dir_all(catalog.join("agents/host/root")).unwrap();
+        fs::create_dir_all(catalog.join(format!("agents/host/{name}/.workspace"))).unwrap();
+        fs::write(
+            catalog.join("catalog.kdl"),
+            "catalog { pty-root \"/tmp/ext-pty\" }\n",
+        )
+        .unwrap();
+        fs::write(
+            catalog.join("agents/host/root/agent.kdl"),
+            r#"agent "root" { host "host"; argv "true" }"#,
+        )
+        .unwrap();
+        fs::write(
+            catalog.join(format!("agents/host/{name}/agent.kdl")),
+            format!(
+                r#"agent "{name}" {{
+  host "host"
+  supervisor "host.root"
+  {lifecycle}
+  workspace ".workspace"
+  render {{ copy "missing-source" "safe" }}
+}}
+"#
+            ),
+        )
+        .unwrap();
+
+        let receipt = snapshot(&catalog, &prepared);
+        let root = receipt["rootSha256"].as_str().unwrap();
+        let output = diff(&catalog, &prepared, root);
+        assert!(
+            output.status.success(),
+            "{name}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+#[test]
 fn classification_only_and_nested_agent_filename_changes_are_exact() {
     let temp = tempfile::tempdir().unwrap();
     let catalog = temp.path().join("catalog");
@@ -384,7 +437,7 @@ fn explicit_multi_path_and_agent_sets_report_add_remove_and_modify() {
     fs::create_dir_all(catalog.join("agents/host/gone")).unwrap();
     fs::write(
         catalog.join("agents/host/gone/agent.kdl"),
-        "agent \"gone\" { host \"host\"; argv \"gone\" }\n",
+        "agent \"gone\" { host \"host\"; supervisor \"host.worker\"; argv \"gone\" }\n",
     )
     .unwrap();
     let snap = snapshot(&catalog, &prepared);
@@ -400,7 +453,7 @@ fn explicit_multi_path_and_agent_sets_report_add_remove_and_modify() {
     fs::create_dir_all(prepared.join("agents/host/new")).unwrap();
     fs::write(
         prepared.join("agents/host/new/agent.kdl"),
-        "agent \"new\" { host \"host\"; argv \"new\" }\n",
+        "agent \"new\" { host \"host\"; supervisor \"host.worker\"; argv \"new\" }\n",
     )
     .unwrap();
     fs::create_dir_all(prepared.join("_templates")).unwrap();

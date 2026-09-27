@@ -142,6 +142,7 @@ pub fn spec_to_agent_specs(agents: &[SpecAgent], host: &str, root: &Path) -> Vec
                         .map_or_else(|| format!("{host}.{supervisor}"), |_| supervisor.to_owned())
                 }),
                 desired_state: AgentDesiredState::Running,
+                residency_policy: agent_spec::ResidencyPolicy::Always,
                 keep: false,
                 restart: None,
                 delivery: None,

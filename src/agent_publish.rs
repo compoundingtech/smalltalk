@@ -148,7 +148,7 @@ impl Candidate {
                 CandidateKind::Spec
             }
             PublishSource::Bundle(path) => {
-                crate::catalog_transaction::capture_real_tree(path, stage.path())
+                crate::catalog_transaction::capture_agent_bundle(path, stage.path())
                     .with_context(|| format!("capture bundle {}", path.display()))?;
                 File::open(stage.path())?.sync_all()?;
                 CandidateKind::Bundle
@@ -243,6 +243,7 @@ pub fn digest_source(source: PublishSource) -> Result<SourceDigest> {
         sha256: candidate.input_sha256,
     })
 }
+
 /// Strictly validate one unpublished candidate as an overlay on the selected live catalog.
 ///
 /// The live declaration plane is held under its shared authoring fence and never modified. The
@@ -494,8 +495,12 @@ fn verify_published_spec(
         observed_sha256 == expected_sha256 && observed == expected_bytes,
         "published Agent Spec readback mismatch: expected sha256 {expected_sha256}, found {observed_sha256}"
     );
-    crate::catalog_transaction::validate_full_catalog(catalog)
-        .context("published catalog fails locked core/catalog re-admission")?;
+    // The live catalog is validated in place, so it is its own runtime root.
+    crate::catalog_transaction::validate_full_catalog(
+        catalog,
+        crate::validate::RuntimeRoot::Catalog(catalog),
+    )
+    .context("published catalog fails locked core/catalog re-admission")?;
     Ok(observed_sha256)
 }
 
@@ -576,8 +581,13 @@ fn read_regular_optional(path: &Path) -> Result<Option<Vec<u8>>> {
 
 fn validate_overlay(catalog: &Path, control: &Path, candidate: &Candidate) -> Result<()> {
     let shadow = build_overlay(catalog, control, candidate)?;
-    crate::catalog_transaction::validate_full_catalog(shadow.path())
-        .context("candidate fails full-catalog validation")
+    // The shadow is a disposable projection nested under the catalog; sockets will be bound from
+    // the real catalog, so that is the runtime root the candidate must satisfy.
+    crate::catalog_transaction::validate_full_catalog(
+        shadow.path(),
+        crate::validate::RuntimeRoot::Catalog(catalog),
+    )
+    .context("candidate fails full-catalog validation")
 }
 
 fn build_overlay(
@@ -609,15 +619,14 @@ fn build_overlay(
     Ok(shadow)
 }
 
-/// Admit one prospective in-place rewrite of `declaration` against the live catalog.
+/// Admit one prospective lifecycle rewrite of `declaration` against the live catalog.
 ///
-/// This is the admission half of `publish` without its transaction: the live plane is copied into
-/// a shadow with exactly this declaration's bytes replaced, and the result must pass the same
-/// full-catalog gate a publication passes. A source-preserving authoring verb that stands in for a
-/// CAS publication uses it so the two paths refuse the same candidates — a retirement that would
-/// leave an active descendant under a retired root (`retired-root`) is refused before any commit,
-/// rather than written and discovered later.
-pub(crate) fn admit_declaration_rewrite(
+/// The live plane is copied once into a shadow with exactly this declaration's bytes replaced.
+/// Incumbent and prospective core ERROR identities are compared as multisets, so the lifecycle
+/// edit refuses every error it introduces without requiring an already-invalid foreign
+/// declaration to become clean. Messages are deliberately excluded: they can contain the
+/// temporary shadow path and are not stable diagnostic identity.
+pub(crate) fn admit_lifecycle_rewrite(
     catalog: &Path,
     staging_parent: &Path,
     declaration: &Path,
@@ -647,14 +656,51 @@ pub(crate) fn admit_declaration_rewrite(
         .tempdir_in(staging_parent)
         .with_context(|| format!("create validation shadow in {}", staging_parent.display()))?;
     copy_filtered_catalog(&catalog, shadow.path(), &catalog, live_target)?;
+    let incumbent_errors = crate::catalog_transaction::collect_full_catalog_errors(
+        shadow.path(),
+        crate::validate::RuntimeRoot::Catalog(&catalog),
+    )?;
     let target = shadow.path().join(&relative);
     if let Some(parent) = target.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("create validation overlay {}", parent.display()))?;
     }
     fs::write(&target, bytes).context("write candidate into validation shadow")?;
-    crate::catalog_transaction::validate_full_catalog(shadow.path())
-        .context("candidate fails full-catalog validation")
+    let prospective_errors = crate::catalog_transaction::collect_full_catalog_errors(
+        shadow.path(),
+        crate::validate::RuntimeRoot::Catalog(&catalog),
+    )?;
+    let introduced = prospective_errors
+        .identities
+        .into_iter()
+        .filter_map(|(key, prospective_count)| {
+            let incumbent_count = incumbent_errors
+                .identities
+                .get(&key)
+                .copied()
+                .unwrap_or_default();
+            (prospective_count > incumbent_count)
+                .then_some((key, prospective_count - incumbent_count))
+        })
+        .collect::<Vec<_>>();
+    anyhow::ensure!(
+        introduced.is_empty(),
+        "candidate introduces core validation errors:\n{}",
+        introduced
+            .into_iter()
+            .map(|((code, path, agent), count)| {
+                let agent = agent
+                    .map(|agent| format!(" agent={agent}"))
+                    .unwrap_or_default();
+                let multiplicity = (count > 1)
+                    .then(|| format!(" ({count} new occurrences)"))
+                    .unwrap_or_default();
+                format!("{path} [{code}]{agent}{multiplicity}")
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+    Ok(())
 }
 
 fn copy_filtered_catalog(
@@ -663,7 +709,8 @@ fn copy_filtered_catalog(
     catalog: &Path,
     prospective_target: &Path,
 ) -> Result<()> {
-    let declaration_parent = source == prospective_target || is_declaration_parent(source)?;
+    let state_parent = source == prospective_target || is_agent_state_parent(source, catalog);
+    let declaration_parent = state_parent || is_declaration_parent(source)?;
     for entry in fs::read_dir(source).with_context(|| format!("read {}", source.display()))? {
         let entry = entry?;
         let from = entry.path();
@@ -680,9 +727,11 @@ fn copy_filtered_catalog(
         {
             continue;
         }
-        let to = destination.join(name);
+        let to = destination.join(&name);
         let metadata = fs::symlink_metadata(&from)?;
-        if metadata.is_dir() {
+        if state_parent && name_text == ".workspace" && metadata.is_dir() {
+            fs::create_dir(&to)?;
+        } else if metadata.is_dir() {
             fs::create_dir(&to)?;
             copy_filtered_catalog(&from, &to, catalog, prospective_target)?;
         } else if metadata.is_file() {
@@ -694,6 +743,17 @@ fn copy_filtered_catalog(
         }
     }
     Ok(())
+}
+
+fn is_agent_state_parent(path: &Path, catalog: &Path) -> bool {
+    let Ok(relative) = path.strip_prefix(catalog) else {
+        return false;
+    };
+    let mut components = relative.components();
+    matches!(components.next(), Some(Component::Normal(name)) if name == "agents")
+        && matches!(components.next(), Some(Component::Normal(_)))
+        && matches!(components.next(), Some(Component::Normal(_)))
+        && components.next().is_none()
 }
 
 fn is_declaration_parent(path: &Path) -> Result<bool> {

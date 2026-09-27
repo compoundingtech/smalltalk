@@ -25,7 +25,7 @@ use anyhow::{Context as _, Result};
 
 use crate::provider_session::{
     PROVIDER_POLL, ProviderOutcome, STOP, describe_exit, install_signal_handler,
-    run_provider_observed,
+    run_provider_observed_with_env_removals,
 };
 use crate::{harness_state, hooks, message, status};
 
@@ -76,13 +76,36 @@ pub(crate) struct HarnessKind {
 /// the channel extension spliced in.
 type PreparedLaunch = (Vec<(String, String)>, Vec<String>);
 
-/// Run one interactive pi-family provider and maintain its presence until it exits.
+/// Run one ordinary interactive pi-family provider.
 pub(crate) fn run_for(
     catalog_root: &Path,
     identity: String,
     runtime_id: String,
     provider_argv: Vec<String>,
     kind: &HarnessKind,
+) -> Result<()> {
+    run_for_with_environment(
+        catalog_root,
+        identity,
+        runtime_id,
+        provider_argv,
+        kind,
+        &[],
+        &[],
+        None,
+    )
+}
+
+/// Run one interactive pi-family provider and maintain its presence until it exits.
+pub(crate) fn run_for_with_environment(
+    catalog_root: &Path,
+    identity: String,
+    runtime_id: String,
+    provider_argv: Vec<String>,
+    kind: &HarnessKind,
+    additional_env: &[(String, String)],
+    removed_env: &[&str],
+    required_incarnation: Option<String>,
 ) -> Result<()> {
     let label = kind.label;
     let agent_dir =
@@ -99,7 +122,7 @@ pub(crate) fn run_for(
     }
     let executable = std::env::current_exe()
         .with_context(|| format!("resolving st2 executable for the {label} channel"))?;
-    let session = harness_state::session_token();
+    let session = required_incarnation.unwrap_or_else(harness_state::session_token);
     // The claim is written: it supersedes whatever the predecessor left — including a
     // still-fresh live record — before the channel or terminal writer act under it.
     let seq = harness_state::claim(&agent_dir, identity.clone(), label, &session)?;
@@ -116,6 +139,7 @@ pub(crate) fn run_for(
             &session,
             seq,
         )?;
+        env.extend_from_slice(additional_env);
         env.extend(offline_defaults(|key| std::env::var_os(key).is_some()));
         if label == "omp" {
             env.extend(omp_unattended_defaults(|key| {
@@ -178,11 +202,12 @@ pub(crate) fn run_for(
         &session,
         seq,
     );
-    let outcome = run_provider_observed(
+    let outcome = run_provider_observed_with_env_removals(
         label,
         &status::status_path(&agent_dir),
         &provider_argv,
         &env,
+        removed_env,
         status::STATUS_REFRESH,
         PROVIDER_POLL,
         &STOP,

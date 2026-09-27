@@ -10,16 +10,21 @@
 //! loop re-stamps and terminates the record through [`SessionObserver`] without ever overwriting a
 //! state a hook wrote in between.
 
-use std::io::{Read as _, Write as _};
-use std::path::Path;
+use std::collections::BTreeSet;
+use std::fs::{self, OpenOptions};
+use std::io::{BufRead as _, BufReader, Read as _, Write as _};
+use std::os::unix::fs::OpenOptionsExt as _;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, Result};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
 
 use crate::driver_diagnostic::ProviderAuthEdge;
 use crate::harness_context::{self, Compaction, CompactionTrigger, Harness, RateLimits, Reading};
 use crate::harness_state::{Activity, Ask, BlockedOn, InputBuffer, Observation};
 use crate::provider_session::{
-    PROVIDER_POLL, STOP, SessionObserver, install_signal_handler, run_provider,
+    PROVIDER_POLL, STOP, SessionObserver, install_signal_handler, run_provider_with_env_removals,
 };
 use crate::{driver_diagnostic, harness_state, message, status};
 
@@ -30,25 +35,78 @@ pub fn run(
     runtime_id: String,
     claude_argv: Vec<String>,
 ) -> Result<()> {
-    let agent_dir =
-        message::resolve_declared_dir(catalog_root, &identity, &crate::run::detect_host())?
-            .with_context(|| format!("Claude driver agent '{identity}' is not declared"))?;
+    run_with_required_resume(catalog_root, identity, runtime_id, claude_argv, None, None)
+}
+
+/// Run one host-owned cold-residency attempt under its exact incarnation.
+pub fn run_residency_attempt(
+    catalog_root: &Path,
+    identity: String,
+    runtime_id: String,
+    claude_argv: Vec<String>,
+    resume_generation: crate::residency::Generation,
+    required_incarnation: String,
+) -> Result<()> {
+
+    anyhow::ensure!(
+        !required_incarnation.is_empty(),
+        "Claude required runtime incarnation is empty"
+    );
+    run_with_required_resume(
+        catalog_root,
+        identity,
+        runtime_id,
+        claude_argv,
+        Some(resume_generation),
+        Some(required_incarnation),
+    )
+}
+
+fn run_with_required_resume(
+    catalog_root: &Path,
+    identity: String,
+    runtime_id: String,
+    claude_argv: Vec<String>,
+    required_resume_generation: Option<crate::residency::Generation>,
+    required_incarnation: Option<String>,
+) -> Result<()> {
     anyhow::ensure!(
         !claude_argv.is_empty(),
         "Claude driver '{runtime_id}' has no provider argv"
     );
-    let claude_argv = prepare_channel_argv(catalog_root, &identity, claude_argv)?;
+    anyhow::ensure!(
+        required_resume_generation.is_some() == required_incarnation.is_some(),
+        "Claude residency launch has an incomplete attempt fence"
+    );
     let workspace = std::env::current_dir().context("reading the Claude driver workspace")?;
+    let required_native_session = match required_resume_generation {
+        Some(generation) => Some(required_residency_resume(
+            &state_dir(catalog_root, &identity),
+            &identity,
+            &runtime_id,
+            &workspace,
+            generation,
+            &claude_argv,
+        )?),
+        None => None,
+    };
+    let claude_argv =
+        with_resume_and_option_terminator(claude_argv, required_native_session.as_deref())?;
+    let agent_dir =
+        message::resolve_declared_dir(catalog_root, &identity, &crate::run::detect_host())?
+            .with_context(|| format!("Claude driver agent '{identity}' is not declared"))?;
+    let claude_argv = prepare_channel_argv(catalog_root, &identity, claude_argv)?;
     crate::pretrust::pretrust_claude(std::slice::from_ref(&workspace))
         .with_context(|| format!("admitting Claude driver workspace {}", workspace.display()))?;
     install_signal_handler();
-    let observer = SessionObserver::new(&agent_dir, &identity, "claude", &runtime_id)?;
-    // The runtime ID reaches hook subprocesses through the provider environment, so their
-    // transitions carry the same pty session the wrapper's records do.
-    let env = [
+    let observer = match required_incarnation {
+        Some(session) => {
+            SessionObserver::with_session(&agent_dir, &identity, "claude", &runtime_id, session)?
+        }
+        None => SessionObserver::new(&agent_dir, &identity, "claude", &runtime_id)?,
+    };
+    let mut env = vec![
         (RUNTIME_ID_ENV.to_string(), runtime_id.clone()),
-        // Hook subprocesses adopt the wrapper's incarnation token, so their transitions are this
-        // session's records: the wrapper can re-stamp them, and its terminal record fences them.
         (SESSION_ENV.to_string(), observer.session().to_string()),
         (SESSION_SEQ_ENV.to_string(), observer.seq().to_string()),
         ("ST2_CLAUDE_IDENTITY".to_string(), identity.clone()),
@@ -57,11 +115,18 @@ pub fn run(
             catalog_root.to_string_lossy().into_owned(),
         ),
     ];
-    run_provider(
+    if let Some(generation) = required_resume_generation {
+        env.push((RESUME_GENERATION_ENV.to_string(), generation.0.to_string()));
+    }
+    if let Some(native_session) = required_native_session {
+        env.push((EXPECTED_NATIVE_SESSION_ENV.to_string(), native_session));
+    }
+    run_provider_with_env_removals(
         "Claude",
         &status::status_path(&agent_dir),
         &claude_argv,
         &env,
+        &[EXPECTED_NATIVE_SESSION_ENV, RESUME_GENERATION_ENV],
         status::STATUS_REFRESH,
         PROVIDER_POLL,
         &STOP,
@@ -102,11 +167,13 @@ pub fn run_controlled_paths(
             catalog_root.to_string_lossy().into_owned(),
         ),
     ];
-    run_provider(
+    // An st3 seat never carries an st2 residency fence, so an inherited one must not reach hooks.
+    run_provider_with_env_removals(
         "Claude",
         &status::status_path(agent_dir),
         &claude_argv,
         &env,
+        &[EXPECTED_NATIVE_SESSION_ENV, RESUME_GENERATION_ENV],
         status::STATUS_REFRESH,
         PROVIDER_POLL,
         &STOP,
@@ -418,6 +485,602 @@ pub const RUNTIME_ID_ENV: &str = "ST2_CLAUDE_RUNTIME_ID";
 pub const SESSION_ENV: &str = "ST2_CLAUDE_SESSION";
 /// The env var carrying the wrapper's claimed ownership sequence beside the token.
 pub const SESSION_SEQ_ENV: &str = "ST2_CLAUDE_SESSION_SEQ";
+/// The exact native session that a cold residency launch must resume.
+pub const EXPECTED_NATIVE_SESSION_ENV: &str = "ST2_CLAUDE_EXPECTED_NATIVE_SESSION";
+/// The cold residency generation whose SessionStart must prove the exact native session.
+pub const RESUME_GENERATION_ENV: &str = "ST2_CLAUDE_RESUME_GENERATION";
+
+const BINDING_SCHEMA: &str = "st2.claude-session-binding.v1";
+const CHECKPOINT_SCHEMA: &str = "st2.claude-residency-checkpoint.v1";
+const BINDING_FILE: &str = "binding.json";
+const PENDING_BINDING_FILE: &str = "binding.pending.json";
+const CHECKPOINT_FILE: &str = "residency-checkpoint.json";
+const TRANSCRIPT_RECORD_LIMIT: usize = 1024 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ClaudeSessionBinding {
+    schema: String,
+    agent: String,
+    runtime_id: String,
+    runtime_incarnation: String,
+    native_session_id: String,
+    canonical_workspace: PathBuf,
+    transcript_path: PathBuf,
+    resume_generation: Option<crate::residency::Generation>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ClaudeResidencyCheckpoint {
+    schema: String,
+    source_generation: crate::residency::Generation,
+    resume_generation: crate::residency::Generation,
+    binding: ClaudeSessionBinding,
+    transcript_sha256: String,
+}
+
+pub fn state_dir(catalog_root: &Path, identity: &str) -> PathBuf {
+    let mut hash = Sha256::new();
+    for value in [
+        catalog_root.as_os_str().as_encoded_bytes(),
+        identity.as_bytes(),
+    ] {
+        hash.update((value.len() as u64).to_be_bytes());
+        hash.update(value);
+    }
+    let digest = format!("{:x}", hash.finalize());
+    crate::run::state_root()
+        .join("st2")
+        .join("claude")
+        .join(&digest[..24])
+}
+
+fn valid_uuid(value: &str) -> bool {
+    value.len() == 36
+        && value.bytes().enumerate().all(|(index, byte)| {
+            if matches!(index, 8 | 13 | 18 | 23) {
+                byte == b'-'
+            } else {
+                byte.is_ascii_hexdigit()
+            }
+        })
+}
+
+fn ensure_no_authored_session_selection(argv: &[String]) -> Result<()> {
+    anyhow::ensure!(argv.len() >= 2, "Claude provider argv has no boot prompt");
+    let options_end = argv
+        .iter()
+        .position(|argument| argument == "--")
+        .unwrap_or(argv.len() - 1);
+    anyhow::ensure!(
+        !argv[1..options_end].iter().any(|argument| {
+            matches!(
+                argument.as_str(),
+                "-c" | "--continue"
+                    | "-r"
+                    | "--resume"
+                    | "--fork-session"
+                    | "--from-pr"
+                    | "--session-id"
+                    | "--teleport"
+            ) || argument.starts_with("--resume=")
+                || argument.starts_with("-r=")
+                || argument.starts_with("--session-id=")
+                || argument.starts_with("--from-pr=")
+                || argument.starts_with("--teleport=")
+        }),
+        "authored Claude session selection conflicts with mandatory residency resume"
+    );
+    Ok(())
+}
+
+fn with_resume_and_option_terminator(
+    mut argv: Vec<String>,
+    native_session_id: Option<&str>,
+) -> Result<Vec<String>> {
+    anyhow::ensure!(argv.len() >= 2, "Claude provider argv has no boot prompt");
+    if native_session_id.is_some() {
+        ensure_no_authored_session_selection(&argv)?;
+    }
+    let prompt = argv
+        .pop()
+        .context("Claude provider argv has no boot prompt")?;
+    let terminator = argv.iter().position(|argument| argument == "--");
+    if let Some(native_session_id) = native_session_id {
+        match terminator {
+            Some(index) => {
+                argv.splice(
+                    index..index,
+                    ["--resume".to_string(), native_session_id.to_string()],
+                );
+            }
+            None => argv.extend(["--resume".to_string(), native_session_id.to_string()]),
+        }
+    }
+    if terminator.is_none() {
+        argv.push("--".to_string());
+    }
+    argv.push(prompt);
+    Ok(argv)
+}
+
+fn transcript_matches(root: &Path, native_session_id: &str, codex: bool) -> Result<Vec<PathBuf>> {
+    let root = fs::canonicalize(root)
+        .with_context(|| format!("opening managed transcript store {}", root.display()))?;
+    let expected = format!("{native_session_id}.jsonl");
+    let mut pending = vec![root];
+    let mut matches = Vec::new();
+    while let Some(directory) = pending.pop() {
+        for entry in fs::read_dir(&directory).with_context(|| {
+            format!(
+                "reading managed transcript directory {}",
+                directory.display()
+            )
+        })? {
+            let entry = entry.with_context(|| {
+                format!(
+                    "reading managed transcript entry in {}",
+                    directory.display()
+                )
+            })?;
+            let file_type = entry
+                .file_type()
+                .with_context(|| format!("inspecting {}", entry.path().display()))?;
+            if file_type.is_dir() {
+                pending.push(entry.path());
+            } else if file_type.is_file()
+                && entry.file_name().to_str().is_some_and(|name| {
+                    name == expected || (codex && name.ends_with(&format!("-{expected}")))
+                })
+            {
+                matches.push(entry.path());
+            }
+        }
+    }
+    matches.sort();
+    Ok(matches)
+}
+
+fn resolve_managed_transcript(
+    transcript_path: &Path,
+    native_session_id: &str,
+    claude_root: &Path,
+    codex_root: &Path,
+) -> Result<PathBuf> {
+    let claude_matches = transcript_matches(claude_root, native_session_id, false)?;
+    let codex_matches = transcript_matches(codex_root, native_session_id, true)?;
+    let selected = match claude_matches.as_slice() {
+        [path] if codex_matches.is_empty() => path,
+        [..] if !codex_matches.is_empty() => {
+            anyhow::bail!(
+                "Claude transcript {native_session_id} is ambiguous across managed harness stores"
+            )
+        }
+        [] => anyhow::bail!(
+            "Claude transcript {native_session_id} is unavailable in the managed Claude transcript store"
+        ),
+        paths => anyhow::bail!(
+            "Claude transcript {native_session_id} is ambiguous: {} managed Claude files",
+            paths.len()
+        ),
+    };
+    let transcript_parent = transcript_path
+        .parent()
+        .context("Claude SessionStart transcript path has no parent")?;
+    let transcript_name = transcript_path
+        .file_name()
+        .context("Claude SessionStart transcript path has no file name")?;
+    let normalized_transcript = fs::canonicalize(transcript_parent)?.join(transcript_name);
+    anyhow::ensure!(
+        normalized_transcript == *selected,
+        "Claude SessionStart transcript path does not identify the managed transcript"
+    );
+    Ok(selected.clone())
+}
+
+fn managed_transcript_roots() -> Result<(PathBuf, PathBuf)> {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .context("HOME is required to resolve managed transcript stores")?;
+    let claude_config = std::env::var_os("CLAUDE_CONFIG_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join(".claude"));
+    let codex_home = std::env::var_os("CODEX_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join(".codex"));
+    Ok((claude_config.join("projects"), codex_home.join("sessions")))
+}
+
+fn validate_transcript(
+    transcript_path: &Path,
+    native_session_id: &str,
+    expected_workspace: &Path,
+) -> Result<String> {
+    anyhow::ensure!(
+        valid_uuid(native_session_id),
+        "Claude native session id is not UUID-form"
+    );
+    let expected_name = format!("{native_session_id}.jsonl");
+    anyhow::ensure!(
+        transcript_path.is_absolute()
+            && transcript_path.file_name().and_then(|name| name.to_str())
+                == Some(expected_name.as_str()),
+        "Claude transcript path does not name the exact native session"
+    );
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(transcript_path)
+        .with_context(|| format!("opening Claude transcript {}", transcript_path.display()))?;
+    anyhow::ensure!(
+        file.metadata()?.is_file(),
+        "Claude transcript {} is not a regular file",
+        transcript_path.display()
+    );
+    let mut reader = BufReader::new(file);
+    let mut line = Vec::new();
+    let mut digest = Sha256::new();
+    let mut workspaces = BTreeSet::new();
+    let mut identity_seen = false;
+    loop {
+        line.clear();
+        let read = reader
+            .read_until(b'\n', &mut line)
+            .with_context(|| format!("reading Claude transcript {}", transcript_path.display()))?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&line);
+        anyhow::ensure!(
+            line.len() <= TRANSCRIPT_RECORD_LIMIT,
+            "Claude transcript {} contains an oversized JSONL record",
+            transcript_path.display()
+        );
+        if line.iter().all(u8::is_ascii_whitespace) {
+            continue;
+        }
+        let value: serde_json::Value = serde_json::from_slice(&line)
+            .with_context(|| format!("parsing Claude transcript {}", transcript_path.display()))?;
+        if let Some(session_id) = value.get("sessionId").and_then(serde_json::Value::as_str) {
+            anyhow::ensure!(
+                session_id == native_session_id,
+                "Claude transcript {} carries a different native session id",
+                transcript_path.display()
+            );
+            identity_seen = true;
+        }
+        if let Some(cwd) = value.get("cwd").and_then(serde_json::Value::as_str) {
+            workspaces.insert(PathBuf::from(cwd));
+        }
+    }
+    let mut roots = workspaces
+        .iter()
+        .filter(|candidate| {
+            workspaces
+                .iter()
+                .all(|workspace| workspace.starts_with(candidate))
+        })
+        .cloned();
+    let recorded_workspace = roots.next();
+    anyhow::ensure!(
+        identity_seen && recorded_workspace.is_some() && roots.next().is_none(),
+        "Claude transcript {} has malformed or ambiguous session lineage",
+        transcript_path.display()
+    );
+    let recorded_workspace = fs::canonicalize(recorded_workspace.unwrap()).with_context(|| {
+        format!(
+            "canonicalizing Claude transcript workspace {}",
+            transcript_path.display()
+        )
+    })?;
+    let expected_workspace = fs::canonicalize(expected_workspace).with_context(|| {
+        format!(
+            "canonicalizing Claude driver workspace {}",
+            expected_workspace.display()
+        )
+    })?;
+    anyhow::ensure!(
+        recorded_workspace == expected_workspace,
+        "Claude transcript workspace {} does not equal driver workspace {}",
+        recorded_workspace.display(),
+        expected_workspace.display()
+    );
+    Ok(format!("{:x}", digest.finalize()))
+}
+
+fn load_binding_file(
+    path: &Path,
+    agent: &str,
+    runtime_id: &str,
+) -> Result<Option<ClaudeSessionBinding>> {
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let binding: ClaudeSessionBinding = serde_json::from_slice(&bytes)?;
+    anyhow::ensure!(
+        binding.schema == BINDING_SCHEMA,
+        "unsupported Claude native session binding schema"
+    );
+    anyhow::ensure!(
+        binding.agent == agent && binding.runtime_id == runtime_id,
+        "Claude native session binding belongs to a different agent runtime"
+    );
+    anyhow::ensure!(
+        !binding.runtime_incarnation.is_empty()
+            && valid_uuid(&binding.native_session_id)
+            && binding.canonical_workspace.is_absolute()
+            && binding.transcript_path.is_absolute(),
+        "Claude native session binding is incomplete"
+    );
+    Ok(Some(binding))
+}
+
+fn load_binding(
+    state_dir: &Path,
+    agent: &str,
+    runtime_id: &str,
+) -> Result<Option<ClaudeSessionBinding>> {
+    load_binding_file(&state_dir.join(BINDING_FILE), agent, runtime_id)
+}
+
+fn load_pending_binding(
+    state_dir: &Path,
+    agent: &str,
+    runtime_id: &str,
+) -> Result<Option<ClaudeSessionBinding>> {
+    load_binding_file(&state_dir.join(PENDING_BINDING_FILE), agent, runtime_id)
+}
+
+fn record_session_start_binding(
+    catalog_root: &Path,
+    identity: &str,
+    runtime_id: &str,
+    runtime_incarnation: &str,
+    payload: &serde_json::Value,
+    resume_generation: Option<crate::residency::Generation>,
+    expected_native_session: Option<&str>,
+) -> Result<ClaudeSessionBinding> {
+    anyhow::ensure!(
+        resume_generation.is_some() == expected_native_session.is_some(),
+        "Claude SessionStart has an incomplete mandatory resume fence"
+    );
+    anyhow::ensure!(
+        !runtime_incarnation.is_empty(),
+        "Claude SessionStart has no wrapper runtime incarnation"
+    );
+    let native_session_id = payload
+        .get("session_id")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.is_empty())
+        .context("Claude SessionStart has no session_id")?;
+    let transcript_path = payload
+        .get("transcript_path")
+        .and_then(serde_json::Value::as_str)
+        .map(PathBuf::from)
+        .context("Claude SessionStart has no transcript_path")?;
+    let (claude_root, codex_root) = managed_transcript_roots()?;
+    let transcript_path = resolve_managed_transcript(
+        &transcript_path,
+        native_session_id,
+        &claude_root,
+        &codex_root,
+    )?;
+    let workspace = std::env::current_dir().context("reading Claude hook workspace")?;
+    let canonical_workspace = fs::canonicalize(&workspace).with_context(|| {
+        format!(
+            "canonicalizing Claude hook workspace {}",
+            workspace.display()
+        )
+    })?;
+    validate_transcript(&transcript_path, native_session_id, &canonical_workspace)?;
+    let state_dir = state_dir(catalog_root, identity);
+
+    let mut effective_generation = resume_generation;
+    if let Some(generation) = resume_generation {
+        if let Some(current) = load_binding(&state_dir, identity, runtime_id)? {
+            if current.resume_generation == Some(generation)
+                && current.runtime_incarnation == runtime_incarnation
+            {
+                if current.native_session_id == native_session_id {
+                    let _ = fs::remove_file(state_dir.join(PENDING_BINDING_FILE));
+                    return Ok(current);
+                }
+                effective_generation = None;
+            }
+        }
+        if effective_generation.is_some() {
+            anyhow::ensure!(
+                expected_native_session == Some(native_session_id),
+                "Claude resumed native session {native_session_id:?} instead of the required session"
+            );
+        }
+    }
+    let binding = ClaudeSessionBinding {
+        schema: BINDING_SCHEMA.to_string(),
+        agent: identity.to_string(),
+        runtime_id: runtime_id.to_string(),
+        runtime_incarnation: runtime_incarnation.to_string(),
+        native_session_id: native_session_id.to_string(),
+        canonical_workspace,
+        transcript_path,
+        resume_generation: effective_generation,
+    };
+    let pending = effective_generation.is_some();
+    let path = state_dir.join(if pending {
+        PENDING_BINDING_FILE
+    } else {
+        BINDING_FILE
+    });
+    crate::residency::atomic_json(&path, &binding)?;
+    if !pending {
+        let _ = fs::remove_file(state_dir.join(PENDING_BINDING_FILE));
+    }
+    Ok(binding)
+}
+
+pub fn checkpoint_residency(
+    state_dir: &Path,
+    agent: &str,
+    runtime_id: &str,
+    source_generation: crate::residency::Generation,
+    resume_generation: crate::residency::Generation,
+) -> Result<ClaudeResidencyCheckpoint> {
+    anyhow::ensure!(
+        source_generation.0.checked_add(1) == Some(resume_generation.0),
+        "Claude residency checkpoint generation is not monotonic"
+    );
+    let binding = load_binding(state_dir, agent, runtime_id)?
+        .with_context(|| format!("Claude runtime {runtime_id:?} has no native session binding"))?;
+    let transcript_sha256 = validate_transcript(
+        &binding.transcript_path,
+        &binding.native_session_id,
+        &binding.canonical_workspace,
+    )?;
+    let checkpoint = ClaudeResidencyCheckpoint {
+        schema: CHECKPOINT_SCHEMA.to_string(),
+        source_generation,
+        resume_generation,
+        binding,
+        transcript_sha256,
+    };
+    crate::residency::atomic_json(&state_dir.join(CHECKPOINT_FILE), &checkpoint)?;
+    Ok(checkpoint)
+}
+
+fn load_checkpoint(
+    state_dir: &Path,
+    agent: &str,
+    runtime_id: &str,
+    resume_generation: crate::residency::Generation,
+) -> Result<ClaudeResidencyCheckpoint> {
+    let path = state_dir.join(CHECKPOINT_FILE);
+    let bytes = fs::read(&path)
+        .with_context(|| format!("reading Claude residency checkpoint {}", path.display()))?;
+    let checkpoint: ClaudeResidencyCheckpoint = serde_json::from_slice(&bytes)?;
+    anyhow::ensure!(
+        checkpoint.schema == CHECKPOINT_SCHEMA,
+        "unsupported Claude residency checkpoint schema"
+    );
+    anyhow::ensure!(
+        checkpoint.resume_generation == resume_generation
+            && checkpoint.source_generation.0.checked_add(1) == Some(resume_generation.0),
+        "Claude residency checkpoint belongs to a different generation"
+    );
+    anyhow::ensure!(
+        checkpoint.binding.schema == BINDING_SCHEMA
+            && checkpoint.binding.agent == agent
+            && checkpoint.binding.runtime_id == runtime_id,
+        "Claude residency checkpoint belongs to a different agent runtime"
+    );
+    anyhow::ensure!(
+        !checkpoint.binding.runtime_incarnation.is_empty()
+            && valid_uuid(&checkpoint.binding.native_session_id)
+            && checkpoint.binding.canonical_workspace.is_absolute()
+            && checkpoint.binding.transcript_path.is_absolute(),
+        "Claude residency checkpoint has an incomplete native session binding"
+    );
+    anyhow::ensure!(
+        checkpoint.transcript_sha256.len() == 64
+            && checkpoint
+                .transcript_sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()),
+        "Claude residency checkpoint has an invalid transcript digest"
+    );
+    Ok(checkpoint)
+}
+
+fn validate_residency_candidate(
+    checkpoint: &ClaudeResidencyCheckpoint,
+    candidate: &ClaudeSessionBinding,
+    resume_generation: crate::residency::Generation,
+) -> Result<()> {
+    anyhow::ensure!(
+        candidate.resume_generation == Some(resume_generation)
+            && candidate.runtime_incarnation != checkpoint.binding.runtime_incarnation,
+        "Claude SessionStart does not prove the required residency generation and a new wrapper incarnation"
+    );
+    anyhow::ensure!(
+        candidate.native_session_id == checkpoint.binding.native_session_id
+            && candidate.canonical_workspace == checkpoint.binding.canonical_workspace
+            && candidate.transcript_path == checkpoint.binding.transcript_path,
+        "Claude resumed a different native session than the residency checkpoint"
+    );
+    Ok(())
+}
+
+pub fn required_residency_resume(
+    state_dir: &Path,
+    agent: &str,
+    runtime_id: &str,
+    workspace: &Path,
+    resume_generation: crate::residency::Generation,
+    authored_argv: &[String],
+) -> Result<String> {
+    ensure_no_authored_session_selection(authored_argv)?;
+    let checkpoint = load_checkpoint(state_dir, agent, runtime_id, resume_generation)?;
+    let current = load_binding(state_dir, agent, runtime_id)?
+        .with_context(|| format!("Claude runtime {runtime_id:?} has no native session binding"))?;
+    anyhow::ensure!(
+        current == checkpoint.binding,
+        "Claude native session binding changed after residency checkpoint"
+    );
+    let digest = validate_transcript(
+        &current.transcript_path,
+        &current.native_session_id,
+        workspace,
+    )?;
+    anyhow::ensure!(
+        digest == checkpoint.transcript_sha256,
+        "Claude transcript changed after residency checkpoint"
+    );
+    Ok(current.native_session_id)
+}
+
+pub fn residency_ready(
+    state_dir: &Path,
+    agent: &str,
+    runtime_id: &str,
+    resume_generation: crate::residency::Generation,
+    expected_runtime_incarnation: &str,
+) -> Result<bool> {
+    let checkpoint = load_checkpoint(state_dir, agent, runtime_id, resume_generation)?;
+    let current = load_binding(state_dir, agent, runtime_id)?;
+    if let Some(current) = &current
+        && current.resume_generation == Some(resume_generation)
+    {
+        validate_residency_candidate(&checkpoint, current, resume_generation)?;
+        if current.runtime_incarnation == expected_runtime_incarnation {
+            return Ok(true);
+        }
+    }
+    let Some(candidate) = load_pending_binding(state_dir, agent, runtime_id)? else {
+        return Ok(false);
+    };
+    if let Some(current) = &current {
+        anyhow::ensure!(
+            current == &checkpoint.binding
+                || current.runtime_incarnation != candidate.runtime_incarnation,
+            "Claude native session changed after this residency generation became ready"
+        );
+    }
+    validate_residency_candidate(&checkpoint, &candidate, resume_generation)?;
+    anyhow::ensure!(
+        candidate.runtime_incarnation == expected_runtime_incarnation,
+        "Claude SessionStart does not prove the expected wrapper incarnation"
+    );
+    validate_transcript(
+        &candidate.transcript_path,
+        &candidate.native_session_id,
+        &candidate.canonical_workspace,
+    )?;
+    crate::residency::atomic_json(&state_dir.join(BINDING_FILE), &candidate)?;
+    let _ = fs::remove_file(state_dir.join(PENDING_BINDING_FILE));
+    Ok(true)
+}
 
 pub fn run_observe(
     catalog_root: &Path,
@@ -434,16 +1097,59 @@ pub fn run_observe(
     let mut raw = String::new();
     let _ = std::io::stdin().read_to_string(&mut raw);
     let payload = serde_json::from_str(&raw).unwrap_or(serde_json::Value::Null);
+    let exported_session = std::env::var(SESSION_ENV)
+        .ok()
+        .filter(|value| !value.is_empty());
+    let exported_seq = std::env::var(SESSION_SEQ_ENV)
+        .ok()
+        .and_then(|seq| seq.parse::<u64>().ok());
+    let resume_generation_raw = std::env::var(RESUME_GENERATION_ENV)
+        .ok()
+        .filter(|value| !value.is_empty());
+    let expected_native_session = std::env::var(EXPECTED_NATIVE_SESSION_ENV)
+        .ok()
+        .filter(|value| !value.is_empty());
+    let mandatory_resume = resume_generation_raw.is_some() || expected_native_session.is_some();
+    let resume_generation = resume_generation_raw
+        .map(|value| {
+            value
+                .parse::<u64>()
+                .map(crate::residency::Generation)
+                .context("Claude hook resume generation is invalid")
+        })
+        .transpose()?;
     if event == "SessionStart" {
-        if let (Ok(incarnation), Some(native_id)) = (
-            std::env::var(SESSION_ENV),
+        let binding = match (runtime_id, exported_session.as_deref()) {
+            (Some(runtime_id), Some(runtime_incarnation)) => Some(record_session_start_binding(
+                catalog_root,
+                identity,
+                runtime_id,
+                runtime_incarnation,
+                &payload,
+                resume_generation,
+                expected_native_session.as_deref(),
+            )),
+            _ => None,
+        };
+        anyhow::ensure!(
+            !mandatory_resume || binding.is_some(),
+            "mandatory Claude SessionStart has no wrapper runtime binding"
+        );
+        if let Some(Err(error)) = binding {
+            if mandatory_resume {
+                return Err(error);
+            }
+            tracing::warn!("st2 claude-observe: native session binding write failed: {error:#}");
+        }
+        // st3 reads this record to bind a managed chat to the wrapper's current native session.
+        if let (Some(incarnation), Some(native_id)) = (
+            exported_session.as_deref(),
             payload
                 .get("session_id")
                 .and_then(serde_json::Value::as_str),
         ) {
-            if !incarnation.is_empty() && !native_id.is_empty() {
-                if let Err(error) =
-                    write_native_session_binding(&agent_dir, &incarnation, native_id)
+            if !native_id.is_empty() {
+                if let Err(error) = write_native_session_binding(&agent_dir, incarnation, native_id)
                 {
                     tracing::warn!(
                         "st2 claude-observe: native session binding write failed: {error:#}"
@@ -452,9 +1158,8 @@ pub fn run_observe(
             }
         }
     }
-    let timeline_incarnation = std::env::var(SESSION_ENV)
-        .ok()
-        .filter(|token| !token.is_empty())
+    let timeline_incarnation = exported_session
+        .clone()
         .or_else(|| wrapperless_token(&payload))
         .unwrap_or_else(|| format!("unattributed:{}", runtime_id.unwrap_or(identity)));
     let mut timeline =
@@ -501,10 +1206,8 @@ pub fn run_observe(
         runtime_id,
         event,
         &payload,
-        std::env::var(SESSION_ENV).ok().filter(|t| !t.is_empty()),
-        std::env::var(SESSION_SEQ_ENV)
-            .ok()
-            .and_then(|seq| seq.parse::<u64>().ok()),
+        exported_session,
+        exported_seq,
     );
     if event == "SessionStart" {
         // The one event that names a session boundary: even if the new session's first state
@@ -969,6 +1672,7 @@ mod tests {
 
     use super::*;
     use crate::harness_state::harness_state_path;
+    use crate::provider_session::run_provider;
 
     #[test]
     fn duplicate_json_settings_keep_lifecycle_hooks_and_authored_plugins() {
@@ -1854,5 +2558,431 @@ mod tests {
             raw.contains("\"incarnation\":\"claude-session-abc\""),
             "{raw}"
         );
+    }
+
+    const RESUME_ID: &str = "019fae17-c215-7882-a4d9-5f247168ffcd";
+
+    fn write_transcript(root: &Path, workspace: &Path) -> PathBuf {
+        let transcript = root.join(format!("{RESUME_ID}.jsonl"));
+        let child = workspace.join("child");
+        fs::create_dir_all(&child).unwrap();
+        fs::write(
+            &transcript,
+            format!(
+                "{}\n{}\n",
+                serde_json::json!({"sessionId": RESUME_ID, "cwd": workspace}),
+                serde_json::json!({"sessionId": RESUME_ID, "cwd": child}),
+            ),
+        )
+        .unwrap();
+        transcript
+    }
+
+    fn residency_binding(
+        workspace: &Path,
+        transcript_path: &Path,
+        runtime_incarnation: &str,
+        resume_generation: Option<crate::residency::Generation>,
+    ) -> ClaudeSessionBinding {
+        ClaudeSessionBinding {
+            schema: BINDING_SCHEMA.to_string(),
+            agent: "h.worker".to_string(),
+            runtime_id: "h.worker".to_string(),
+            runtime_incarnation: runtime_incarnation.to_string(),
+            native_session_id: RESUME_ID.to_string(),
+            canonical_workspace: fs::canonicalize(workspace).unwrap(),
+            transcript_path: transcript_path.to_path_buf(),
+            resume_generation,
+        }
+    }
+
+    #[test]
+    fn claude_residency_validates_transcript_and_lowers_exact_native_resume() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        let transcript = write_transcript(temp.path(), &workspace);
+        let state = temp.path().join("state");
+        let binding = residency_binding(&workspace, &transcript, "runtime-prior", None);
+        crate::residency::atomic_json(&state.join(BINDING_FILE), &binding).unwrap();
+        checkpoint_residency(
+            &state,
+            "h.worker",
+            "h.worker",
+            crate::residency::Generation(1),
+            crate::residency::Generation(2),
+        )
+        .unwrap();
+
+        let native = required_residency_resume(
+            &state,
+            "h.worker",
+            "h.worker",
+            &workspace,
+            crate::residency::Generation(2),
+            &[
+                "claude".into(),
+                "--model".into(),
+                "sonnet".into(),
+                "boot".into(),
+            ],
+        )
+        .unwrap();
+        assert_eq!(native, RESUME_ID);
+        assert_eq!(
+            with_resume_and_option_terminator(
+                vec![
+                    "claude".into(),
+                    "--model".into(),
+                    "sonnet".into(),
+                    "boot".into(),
+                ],
+                Some(&native),
+            )
+            .unwrap(),
+            [
+                "claude", "--model", "sonnet", "--resume", RESUME_ID, "--", "boot",
+            ]
+        );
+
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&transcript)
+            .unwrap()
+            .write_all(
+                format!(
+                    "{}\n",
+                    serde_json::json!({"sessionId": RESUME_ID, "cwd": workspace})
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+        let error = required_residency_resume(
+            &state,
+            "h.worker",
+            "h.worker",
+            &workspace,
+            crate::residency::Generation(2),
+            &["claude".into(), "boot".into()],
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("changed after residency checkpoint")
+        );
+    }
+
+    #[test]
+    fn mandatory_claude_resume_refuses_corrupt_foreign_and_stale_checkpoints() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        let transcript = write_transcript(temp.path(), &workspace);
+        let state = temp.path().join("state");
+        let binding = residency_binding(&workspace, &transcript, "runtime-prior", None);
+        crate::residency::atomic_json(&state.join(BINDING_FILE), &binding).unwrap();
+        checkpoint_residency(
+            &state,
+            "h.worker",
+            "h.worker",
+            crate::residency::Generation(1),
+            crate::residency::Generation(2),
+        )
+        .unwrap();
+        let path = state.join(CHECKPOINT_FILE);
+        let checkpoint = fs::read(&path).unwrap();
+
+        fs::write(&path, b"{").unwrap();
+        assert!(
+            required_residency_resume(
+                &state,
+                "h.worker",
+                "h.worker",
+                &workspace,
+                crate::residency::Generation(2),
+                &["claude".into(), "boot".into()],
+            )
+            .is_err()
+        );
+
+        let mut foreign: serde_json::Value = serde_json::from_slice(&checkpoint).unwrap();
+        foreign["binding"]["agent"] = serde_json::json!("h.other");
+        fs::write(&path, serde_json::to_vec(&foreign).unwrap()).unwrap();
+        let error = required_residency_resume(
+            &state,
+            "h.worker",
+            "h.worker",
+            &workspace,
+            crate::residency::Generation(2),
+            &["claude".into(), "boot".into()],
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("different agent runtime"));
+
+        let mut stale: serde_json::Value = serde_json::from_slice(&checkpoint).unwrap();
+        stale["resumeGeneration"] = serde_json::json!(3);
+        fs::write(&path, serde_json::to_vec(&stale).unwrap()).unwrap();
+        let error = required_residency_resume(
+            &state,
+            "h.worker",
+            "h.worker",
+            &workspace,
+            crate::residency::Generation(2),
+            &["claude".into(), "boot".into()],
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("different generation"));
+    }
+
+    #[test]
+    fn claude_readiness_promotes_only_the_exact_new_session_start() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        let transcript = write_transcript(temp.path(), &workspace);
+        let state = temp.path().join("state");
+        let prior = residency_binding(&workspace, &transcript, "runtime-prior", None);
+        crate::residency::atomic_json(&state.join(BINDING_FILE), &prior).unwrap();
+        checkpoint_residency(
+            &state,
+            "h.worker",
+            "h.worker",
+            crate::residency::Generation(1),
+            crate::residency::Generation(2),
+        )
+        .unwrap();
+
+        let mut wrong = residency_binding(
+            &workspace,
+            &transcript,
+            "runtime-next",
+            Some(crate::residency::Generation(2)),
+        );
+        wrong.native_session_id = "019fae17-c215-7882-a4d9-5f247168ffce".to_string();
+        crate::residency::atomic_json(&state.join(PENDING_BINDING_FILE), &wrong).unwrap();
+        let error = residency_ready(
+            &state,
+            "h.worker",
+            "h.worker",
+            crate::residency::Generation(2),
+            "runtime-next",
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("different native session"));
+        assert_eq!(
+            load_binding(&state, "h.worker", "h.worker").unwrap(),
+            Some(prior)
+        );
+
+        let failed_candidate = residency_binding(
+            &workspace,
+            &transcript,
+            "runtime-failed",
+            Some(crate::residency::Generation(2)),
+        );
+        crate::residency::atomic_json(&state.join(PENDING_BINDING_FILE), &failed_candidate)
+            .unwrap();
+        let error = residency_ready(
+            &state,
+            "h.worker",
+            "h.worker",
+            crate::residency::Generation(2),
+            "runtime-retry",
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("wrapper incarnation"));
+
+        let candidate = residency_binding(
+            &workspace,
+            &transcript,
+            "runtime-next",
+            Some(crate::residency::Generation(2)),
+        );
+        crate::residency::atomic_json(&state.join(PENDING_BINDING_FILE), &candidate).unwrap();
+        assert!(
+            residency_ready(
+                &state,
+                "h.worker",
+                "h.worker",
+                crate::residency::Generation(2),
+                "runtime-next",
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            load_binding(&state, "h.worker", "h.worker").unwrap(),
+            Some(candidate.clone())
+        );
+        assert!(!state.join(PENDING_BINDING_FILE).exists());
+
+        assert!(
+            !residency_ready(
+                &state,
+                "h.worker",
+                "h.worker",
+                crate::residency::Generation(2),
+                "runtime-retry",
+            )
+            .unwrap()
+        );
+        crate::residency::atomic_json(&state.join(PENDING_BINDING_FILE), &candidate).unwrap();
+        let mut switched = candidate.clone();
+        switched.native_session_id = "019fae17-c215-7882-a4d9-5f247168ffce".to_string();
+        switched.resume_generation = None;
+        crate::residency::atomic_json(&state.join(BINDING_FILE), &switched).unwrap();
+        let error = residency_ready(
+            &state,
+            "h.worker",
+            "h.worker",
+            crate::residency::Generation(2),
+            "runtime-next",
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("changed after"));
+        assert_eq!(
+            load_binding(&state, "h.worker", "h.worker").unwrap(),
+            Some(switched)
+        );
+    }
+
+    #[test]
+    fn claude_transcript_lineage_rejects_sibling_roots_and_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        let first = workspace.join("first");
+        let second = workspace.join("second");
+        fs::create_dir_all(&first).unwrap();
+        fs::create_dir_all(&second).unwrap();
+        let transcript = temp.path().join(format!("{RESUME_ID}.jsonl"));
+        fs::write(
+            &transcript,
+            format!(
+                "{}\n{}\n",
+                serde_json::json!({"sessionId": RESUME_ID, "cwd": first}),
+                serde_json::json!({"sessionId": RESUME_ID, "cwd": second}),
+            ),
+        )
+        .unwrap();
+        let error = validate_transcript(&transcript, RESUME_ID, &workspace).unwrap_err();
+        assert!(error.to_string().contains("malformed or ambiguous"));
+
+        fs::write(
+            &transcript,
+            format!(
+                "{}\n",
+                serde_json::json!({"sessionId": RESUME_ID, "cwd": workspace})
+            ),
+        )
+        .unwrap();
+        let link_root = temp.path().join("link");
+        fs::create_dir_all(&link_root).unwrap();
+        let link = link_root.join(format!("{RESUME_ID}.jsonl"));
+        symlink(&transcript, &link).unwrap();
+        assert!(validate_transcript(&link, RESUME_ID, &workspace).is_err());
+    }
+
+    #[test]
+    fn claude_transcript_must_be_the_unique_managed_harness_match() {
+        let temp = tempfile::tempdir().unwrap();
+        let claude_root = temp.path().join("claude/projects/project");
+        let codex_root = temp.path().join("codex/sessions");
+        fs::create_dir_all(&claude_root).unwrap();
+        fs::create_dir_all(&codex_root).unwrap();
+        let transcript = claude_root.join(format!("{RESUME_ID}.jsonl"));
+        fs::write(&transcript, "{}\n").unwrap();
+
+        assert_eq!(
+            resolve_managed_transcript(
+                &transcript,
+                RESUME_ID,
+                &temp.path().join("claude/projects"),
+                &codex_root,
+            )
+            .unwrap(),
+            fs::canonicalize(&transcript).unwrap()
+        );
+        let rogue = temp.path().join(format!("{RESUME_ID}.jsonl"));
+        fs::write(&rogue, "{}\n").unwrap();
+        let error = resolve_managed_transcript(
+            &rogue,
+            RESUME_ID,
+            &temp.path().join("claude/projects"),
+            &codex_root,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("does not identify"));
+
+        let codex = codex_root.join(format!("rollout-{RESUME_ID}.jsonl"));
+        fs::write(&codex, "{}\n").unwrap();
+        let error = resolve_managed_transcript(
+            &transcript,
+            RESUME_ID,
+            &temp.path().join("claude/projects"),
+            &codex_root,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("across managed harness stores"));
+    }
+    #[test]
+    fn mandatory_claude_resume_refuses_authored_selectors_and_precedes_provider_spawn() {
+        for authored in [
+            vec!["claude".into(), "--continue".into(), "boot".into()],
+            vec![
+                "claude".into(),
+                "--resume".into(),
+                RESUME_ID.into(),
+                "boot".into(),
+            ],
+            vec![
+                "claude".into(),
+                "--session-id".into(),
+                RESUME_ID.into(),
+                "boot".into(),
+            ],
+            vec!["claude".into(), "--fork-session".into(), "boot".into()],
+            vec!["claude".into(), "--from-pr=1".into(), "boot".into()],
+        ] {
+            assert!(ensure_no_authored_session_selection(&authored).is_err());
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let empty_incarnation = run_residency_attempt(
+            temp.path(),
+            "no-spawn.worker".into(),
+            "no-spawn.worker".into(),
+            vec!["claude".into()],
+            crate::residency::Generation(2),
+            String::new(),
+        )
+        .unwrap_err();
+        assert!(
+            empty_incarnation
+                .to_string()
+                .contains("required runtime incarnation is empty")
+        );
+        let marker = temp.path().join("provider-started");
+        let provider = temp.path().join("claude");
+        fs::write(
+            &provider,
+            format!("#!/bin/sh\ntouch '{}'\n", marker.display()),
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&provider).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o755);
+        fs::set_permissions(&provider, permissions).unwrap();
+        let error = run_residency_attempt(
+            temp.path(),
+            "no-spawn.worker".into(),
+            "no-spawn.worker".into(),
+            vec![provider.display().to_string(), "boot".into()],
+            crate::residency::Generation(2),
+            "attempt-test".into(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("residency checkpoint"));
+        assert!(!marker.exists());
     }
 }

@@ -1,6 +1,9 @@
 use std::path::Path;
 
-use agent_spec::{DeclaredSeverity, DeclaredValue, parse_declared_document};
+use agent_spec::{
+    AgentDesiredState, DeclaredLifecycleSource, DeclaredSeverity, DeclaredValue,
+    parse_declared_document,
+};
 
 const MANAGED: &str = r#"agent "worker" {
   host "example"
@@ -152,6 +155,84 @@ fn parsing_is_deterministic_across_a_small_mutation_corpus() {
         let first = parse_declared_document(Path::new("candidate.kdl"), &source);
         let second = parse_declared_document(Path::new("candidate.kdl"), &source);
         assert_eq!(first, second, "non-deterministic parse for {source}");
+    }
+}
+
+#[test]
+fn declared_lifecycle_preserves_spelling_and_normalizes_state() {
+    let cases = [
+        (
+            "",
+            DeclaredLifecycleSource::Implicit,
+            AgentDesiredState::Running,
+        ),
+        (
+            "desired-state \"running\"",
+            DeclaredLifecycleSource::DesiredState,
+            AgentDesiredState::Running,
+        ),
+        (
+            "desired-state \"suspended\" reason=\"Waiting for capacity\"",
+            DeclaredLifecycleSource::DesiredState,
+            AgentDesiredState::Suspended {
+                reason: "Waiting for capacity".to_owned(),
+            },
+        ),
+        (
+            "desired-state \"retired\" reason=\"Mission complete\"",
+            DeclaredLifecycleSource::DesiredState,
+            AgentDesiredState::Retired {
+                reason: Some("Mission complete".to_owned()),
+            },
+        ),
+        (
+            "retired #true",
+            DeclaredLifecycleSource::Retired(true),
+            AgentDesiredState::Retired { reason: None },
+        ),
+        (
+            "retired #false",
+            DeclaredLifecycleSource::Retired(false),
+            AgentDesiredState::Running,
+        ),
+    ];
+
+    for (spelling, expected_source, expected_state) in cases {
+        let source = format!("agent \"worker\" {{ {spelling} }}");
+        let parsed = parse_declared_document(Path::new("candidate.kdl"), &source);
+        let document = parsed.document.expect("document");
+        let lifecycle = document.agents[0].lifecycle().unwrap();
+        assert_eq!(lifecycle.source, expected_source, "{spelling}");
+        assert_eq!(lifecycle.desired_state, expected_state, "{spelling}");
+    }
+}
+
+#[test]
+fn declared_lifecycle_fails_closed_for_ambiguous_or_invalid_forms() {
+    let cases = [
+        "desired-state \"running\"; desired-state \"running\"",
+        "retired #true; retired #false",
+        "retired #false; desired-state \"running\"",
+        "desired-state #true",
+        "desired-state \"running\" because=\"no\"",
+        "desired-state \"suspended\" reason=#true",
+        "retired \"false\"",
+        "retired #false extra=#true",
+        "desired-state \"running\" reason=\"no\"",
+        "desired-state \"suspended\"",
+        "desired-state \"retired\" reason=\"\"",
+        "desired-state \"suspended\" reason=\" padded \"",
+        "desired-state \"paused\" reason=\"no\"",
+    ];
+
+    for lifecycle in cases {
+        let source = format!("agent \"worker\" {{ {lifecycle} }}");
+        let parsed = parse_declared_document(Path::new("candidate.kdl"), &source);
+        let document = parsed.document.expect("document");
+        assert!(
+            document.agents[0].lifecycle().is_err(),
+            "accepted invalid lifecycle: {lifecycle}"
+        );
     }
 }
 

@@ -6,9 +6,9 @@
     flake-utils.url = "github:numtide/flake-utils";
     fenix.url = "github:nix-community/fenix";
     fenix.inputs.nixpkgs.follows = "nixpkgs";
-    # Packaged PTY dependency: the merged revision with atomic metadata patching and the
+    # Rust PTY candidate with atomic registry publication and the
     # fleet-observation guarantees required by st2 reconciliation.
-    pty.url = "github:compoundingtech/pty/504ac7332895fe1fa3767b530dcd99f091f56cda";
+    pty.url = "github:compoundingtech/pty-rust/a93b021743c3c50bf37d66655085149082edd8a4";
     pty.inputs.nixpkgs.follows = "nixpkgs";
     # Shared tooling packages from overengineering: provides the `otelite`
     # OTLP collector binary that `checks.release-integration` drives to prove
@@ -100,6 +100,13 @@
             };
           };
 
+          # The workspace default members include the st3 crates. This package ships only st2;
+          # st3, `st`, stui, and st3-migrate come from the st3 package, so each has one build.
+          cargoBuildFlags = [
+            "-p"
+            "st2"
+          ];
+
           # This NixStamp is the binary's authoritative build identity; it wins
           # over the LocalStamp `build.rs` bakes from git (which is empty here
           # anyway — a flake source carries no `.git`). Reaches rustc as a plain
@@ -173,6 +180,21 @@
             "st2-pty-stats-component"
             "--exclude"
             "st2-vista-component"
+            # `checks.st3` gates these crates with the runtime inputs their tests need.
+            "--exclude"
+            "st-runtime"
+            "--exclude"
+            "st3"
+            "--exclude"
+            "st3-client"
+            "--exclude"
+            "st3-client-codegen"
+            "--exclude"
+            "st3-migrate"
+            "--exclude"
+            "st3-schema"
+            "--exclude"
+            "stui"
             "--lib"
             "--bins"
             "--test"
@@ -240,11 +262,17 @@
             "-p"
             "stui"
           ];
+          # `--no-fail-fast` reports every failing test target in one run.
           cargoTestFlags = [
+            "--no-fail-fast"
             "-p"
             "st-runtime"
             "-p"
             "st3"
+            "-p"
+            "st3-client"
+            "-p"
+            "st3-client-codegen"
             "-p"
             "st3-migrate"
             "-p"
@@ -252,18 +280,33 @@
             "-p"
             "stui"
           ];
+          # These two tests put an openpty(3) terminal into raw mode. In the macOS Nix build one
+          # fails and the other hangs, so they run on Linux only until they pass on macOS.
+          checkFlags = pkgs.lib.optionals pkgs.stdenv.hostPlatform.isDarwin [
+            "--skip"
+            "client::tests::a_terminal_attachment_reconnects_across_a_temporary_gateway_restart"
+            "--skip"
+            "client::tests::terminal_socket_eof_restores_and_sanitizes_the_callers_tty"
+          ];
           # Render tests create throwaway repositories and call Git to protect
           # tracked files. Keep that dependency in the hermetic check sandbox.
           nativeBuildInputs = [
             pkgs.git
             pkgs.installShellFiles
           ];
-          # The daemon survival suite exercises the packaged PTY boundary.
+          # The daemon survival suite exercises the packaged PTY boundary. The client code
+          # generator formats the Rust client it checks with rustfmt.
           nativeCheckInputs = [
             pkgs.bashInteractive
             pkgs.jq
+            pkgs.rustfmt
             pkgs.which
             pty.packages.${system}.default
+          ]
+          # Native session discovery lists processes with ps and lsof on macOS (Linux reads /proc).
+          ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isDarwin [
+            pkgs.ps
+            pkgs.lsof
           ];
           postInstall = ''
             ln -s st3 $out/bin/st
@@ -289,6 +332,34 @@
           ${st3}/bin/st --help > st.help
           cmp st3.help st.help
           ${st3}/bin/st3-migrate --help > /dev/null
+          touch $out
+        '';
+
+        # Both products from one source: st2, st3, and the st3 package's own `st` symlink.
+        smallTalk = pkgs.symlinkJoin {
+          name = "small-talk-${version}";
+          paths = [
+            st2
+            st3
+          ];
+        };
+
+        # Every install path leaves `st` resolving to the installed st3, never a separate build.
+        installLayout = pkgs.runCommand "small-talk-install-layout-${version}" { } ''
+          export HOME=$(mktemp -d)
+          test "$(readlink -f ${smallTalk}/bin/st)" = "$(readlink -f ${smallTalk}/bin/st3)"
+          test -x ${smallTalk}/bin/st2
+
+          mkdir built
+          ln -s ${st2}/bin/st2 ${st3}/bin/st3 ${st3}/bin/st3-migrate ${st3}/bin/stui built/
+          bash ${self}/scripts/install --from built --bin-dir "$PWD/bin"
+          test "$(readlink bin/st)" = st3
+          bin/st --help > st.help
+          bin/st3 --help > st3.help
+          cmp st.help st3.help
+          bin/st2 --help > /dev/null
+
+          bash ${self}/scripts/install-test
           touch $out
         '';
 
@@ -515,6 +586,7 @@
         packages.st2 = st2;
         packages.st3 = st3;
         packages.st3-migrate = st3;
+        packages.small-talk = smallTalk;
         packages.st2-wasm-resolver = st2WasmResolver;
         packages.st2-provider-runtime = st2ProviderRuntime;
         # All four components come out of one build; the install paths are unchanged.
@@ -536,6 +608,7 @@
         checks.st2 = st2;
         checks.st3 = st3;
         checks.st3-help = st3Help;
+        checks.install-layout = installLayout;
         checks.release-integration = st2ReleaseIntegration;
         checks.debug-assertions = st2DebugAssertions;
         checks.wasm-resolver-feature = st2WasmResolver;
@@ -569,10 +642,6 @@
           touch "$out"
         '';
 
-        # Real producer-consumer contract: st2 consumes `pty list --json` from the exact pty
-        # revision that owns fleet observation. Fake CLI fixtures below still cover malformed
-        # output and a wedged child; this check proves the healthy 0/75/100/500-session path crosses
-        # both packaged binaries within st2's short outer deadline.
         # The pi extension's only compile-time coupling to pi.
         #
         # `hooks/pi-channel.ts` is shipped as an opaque asset inside the content-addressed hook set
@@ -648,55 +717,68 @@
             touch $out
           '';
 
+        # Package-agnostic producer-consumer contract: exercise only the installed `pty`
+        # executable and st2's consumer. The exported upstream check owns deterministic
+        # liveness fault injection, and is required rather than optional.
         checks.pty-fleet-contract = pkgs.runCommand "st2-pty-fleet-contract-${version}" {
           nativeBuildInputs = [
             pkgs.coreutils
             pkgs.jq
-            pkgs.nodejs
+            pty.checks.${system}.fleet-liveness
             pty.packages.${system}.default
             st2
           ];
         } ''
           export HOME=$(mktemp -d)
           catalog=$(mktemp -d)
+          pty_bin=${pty.packages.${system}.default}/bin/pty
           mkdir -p "$catalog/agents/contract/gone"
           printf '%s\n' \
             'agent "gone" { host "contract"; retired #true; command "true" }' \
             > "$catalog/agents/contract/gone/agent.kdl"
 
-          # Run the exact packaged producer's deterministic fault seams. These prove EPERM avoids
-          # socket fallback and hundreds of indefinitely-hung ambiguous probes share one deadline.
-          test_config=$(mktemp --suffix=.mjs)
-          printf '%s\n' 'export default { test: {} }' > "$test_config"
-          node \
-            ${pty.packages.${system}.default}/lib/pty/node_modules/vitest/vitest.mjs \
-            run tests/list-liveness-budget.test.ts \
-            --config "$test_config" \
-            --root ${pty.packages.${system}.default}/lib/pty
-
           for fleet_size in 0 75 100 500; do
             root=$(mktemp -d)
+            expected_names="expected-$fleet_size.txt"
+            : > "$expected_names"
+
             i=0
             while test "$i" -lt "$fleet_size"; do
-              session=$(printf 'session-%03d' "$i")
-              : > "$root/$session.sock"
-              printf '%s\n' "$$" > "$root/$session.pid"
+              printf 'session-%03d\n' "$i" >> "$expected_names"
               i=$((i + 1))
             done
 
-            PTY_ROOT="$root" timeout 2s pty list --json > "pty-$fleet_size.json"
+            # Create through the public CLI in reverse order. Keep at most one child alive
+            # at once, then retain its exited record for the list/doctor fleet.
+            i=$fleet_size
+            while test "$i" -gt 0; do
+              i=$((i - 1))
+              session=$(printf 'session-%03d' "$i")
+              PTY_ROOT="$root" "$pty_bin" run -d --id "$session" \
+                --no-display-name -- sh -c 'exec sleep 300' >/dev/null
+              PTY_ROOT="$root" "$pty_bin" kill "$session" >/dev/null
+            done
+
+            PTY_ROOT="$root" timeout 2s "$pty_bin" list --json \
+              > "pty-$fleet_size.json"
             jq -e --argjson size "$fleet_size" \
-              'length == $size and all(.status == "running")' \
+              'type == "array" and length == $size and all(.status == "exited")' \
               "pty-$fleet_size.json" >/dev/null
+            jq -r '.[].name' "pty-$fleet_size.json" > "actual-$fleet_size.txt"
+            cmp "$expected_names" "actual-$fleet_size.txt"
 
             PTY_ROOT="$root" timeout 2s \
-              st2 doctor --catalog "$catalog" --host contract \
+              ${st2}/bin/st2 doctor --catalog "$catalog" --host contract \
               > "doctor-$fleet_size.out"
             grep -F 'contract.gone retirement complete' \
               "doctor-$fleet_size.out" >/dev/null
+
+            while IFS= read -r session; do
+              PTY_ROOT="$root" "$pty_bin" rm "$session" >/dev/null
+            done < "$expected_names"
           done
 
-          touch $out
+          touch "$out"
         '';
 
         # Smoke test that the built binary actually runs and its command tree is

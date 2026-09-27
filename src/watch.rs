@@ -22,15 +22,14 @@ use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 pub(crate) fn watch_recursive_mutations(
     dir: &Path,
     tx: Sender<()>,
-) -> Option<notify::RecommendedWatcher> {
+) -> notify::Result<notify::RecommendedWatcher> {
     let mut watcher = recommended_watcher(move |result: notify::Result<Event>| {
         if result.is_ok_and(|event| is_mutation(&event)) {
             let _ = tx.send(());
         }
-    })
-    .ok()?;
-    watcher.watch(dir, RecursiveMode::Recursive).ok()?;
-    Some(watcher)
+    })?;
+    watcher.watch(dir, RecursiveMode::Recursive)?;
+    Ok(watcher)
 }
 
 /// Watch only the inputs a native delivery pump consumes: the agent's `resources/inbox` subtree
@@ -684,6 +683,16 @@ mod tests {
             "payload depth must not drive watch allocation: {delta} watches for a \
              900-directory payload tree"
         );
+    }
+
+    #[test]
+    fn recursive_watch_registration_failure_is_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing");
+        let (tx, _rx) = std::sync::mpsc::channel();
+
+        watch_recursive_mutations(&missing, tx)
+            .expect_err("callers that require prompt wakeups must receive registration failure");
     }
 
     #[cfg(target_os = "linux")]

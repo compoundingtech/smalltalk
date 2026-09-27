@@ -1,0 +1,116 @@
+version 2
+
+// Variant of eval.kdl. The fixed Codex gpt-6-sol and Claude opus seats each pair with one seat of
+// the harness under test: OMP on openai-codex/gpt-5.6-luna. The protocol, deadlines, and gates are unchanged.
+mission "eval/cross-harness-message-wake" state="ready" timeout="40m" {
+  completion { when "all-steps-exhausted" }
+  goal "Codex and Claude each reach paired consensus with one OMP on openai-codex/gpt-5.6-luna seat at startup and from exact idle, through durable messages without terminal input."
+
+  agent "wake.codex" {
+    workspace "${ST_WORKSPACE}"
+    harness "codex" {
+      model "gpt-6-sol"
+      effort "medium"
+      args "--dangerously-bypass-approvals-and-sandbox" "--dangerously-bypass-hook-trust"
+    }
+    restart "never"
+    env {
+      PATH "${ST_WORKSPACE}/audit-bin:${PATH}"
+      PTY_AUDIT_LOG "${ST_WORKSPACE}/pty-audit.log"
+    }
+  }
+
+  agent "wake.claude" {
+    workspace "${ST_WORKSPACE}"
+    under "agent/${ST_MISSION_RUN}/wake.codex" reason="participate in one bounded cross-harness consensus"
+    harness "claude" {
+      model "opus"
+      effort "medium"
+      args "--permission-mode" "bypassPermissions"
+    }
+    restart "never"
+    env {
+      PATH "${ST_WORKSPACE}/audit-bin:${PATH}"
+      PTY_AUDIT_LOG "${ST_WORKSPACE}/pty-audit.log"
+    }
+  }
+
+  agent "wake.omp" {
+    workspace "${ST_WORKSPACE}"
+    under "agent/${ST_MISSION_RUN}/wake.codex" reason="pair with Codex through native message wake"
+    harness "omp" {
+      model "openai-codex/gpt-5.6-luna"
+      effort "medium"
+    }
+    restart "never"
+    env {
+      PATH "${ST_WORKSPACE}/audit-bin:${PATH}"
+      PTY_AUDIT_LOG "${ST_WORKSPACE}/pty-audit.log"
+    }
+  }
+
+  agent "wake.omp-2" {
+    workspace "${ST_WORKSPACE}"
+    under "agent/${ST_MISSION_RUN}/wake.claude" reason="pair with Claude through native message wake"
+    harness "omp" {
+      model "openai-codex/gpt-5.6-luna"
+      effort "medium"
+    }
+    restart "never"
+    env {
+      PATH "${ST_WORKSPACE}/audit-bin:${PATH}"
+      PTY_AUDIT_LOG "${ST_WORKSPACE}/pty-audit.log"
+    }
+  }
+
+  step "exercise-message-wake" timeout="35m" {
+    agentless
+    title "Both mixed pairs complete startup and idle message-only consensus"
+    exec "cross-harness-message-wake/controller" {
+      host "local"
+      workspace "${ST_WORKSPACE}"
+      cwd "${ST_WORKSPACE}"
+      command "bash ./controller.sh"
+      restart "never"
+      env {
+        WAKE_PAIRS "codex:omp claude:omp-2"
+      }
+    }
+    gate "the controller observed both final reports" {
+      field "exit_code" "exec/${ST_MISSION_RUN}/cross-harness-message-wake/controller" is 0
+    }
+  }
+
+  step "held-out-gates" timeout="4m" {
+    agentless
+    depends-on { step "exercise-message-wake" completed }
+    gate "the canonical conversation proves wake, exchange, and consensus" {
+      exec "bash ./judges/coordination.sh"
+      host "local"
+      workspace "${ST_WORKSPACE}"
+      env {
+        WAKE_PAIRS "codex:omp claude:omp-2"
+      }
+      time-limit "3m"
+    }
+    gate "no terminal input path participated" {
+      exec "bash ./judges/no-terminal-input.sh"
+      host "local"
+      workspace "${ST_WORKSPACE}"
+      env {
+        WAKE_PAIRS "codex:omp claude:omp-2"
+      }
+      time-limit "1m"
+    }
+  }
+
+  finally {
+    step "cleanup-agents" timeout="2m" {
+      agentless
+      stop "agent/${ST_MISSION_RUN}/wake.codex"
+      stop "agent/${ST_MISSION_RUN}/wake.claude"
+      stop "agent/${ST_MISSION_RUN}/wake.omp"
+      stop "agent/${ST_MISSION_RUN}/wake.omp-2"
+    }
+  }
+}

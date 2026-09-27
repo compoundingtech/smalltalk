@@ -9,24 +9,8 @@ startup_deadline_seconds="${WAKE_STARTUP_DEADLINE_SECONDS:-180}"
 idle_deadline_seconds="${WAKE_IDLE_DEADLINE_SECONDS:-300}"
 run_tag="mission-run:$ST_MISSION_RUN"
 
-names=(codex claude pi omp)
-declare -A agents peers tokens results
-agents[codex]="agent/$ST_MISSION_RUN/wake.codex"
-agents[claude]="agent/$ST_MISSION_RUN/wake.claude"
-agents[pi]="agent/$ST_MISSION_RUN/wake.pi"
-agents[omp]="agent/$ST_MISSION_RUN/wake.omp"
-peers[codex]="${agents[claude]}"
-peers[claude]="${agents[codex]}"
-peers[pi]="${agents[omp]}"
-peers[omp]="${agents[pi]}"
-tokens[codex]="EMBER"
-tokens[claude]="ORBIT"
-tokens[pi]="QUARTZ"
-tokens[omp]="RIVER"
-results[codex]="EMBER+ORBIT"
-results[claude]="EMBER+ORBIT"
-results[pi]="QUARTZ+RIVER"
-results[omp]="QUARTZ+RIVER"
+# shellcheck source=participants.sh
+source ./participants.sh
 
 agent_json() {
   st3 agents show "$1" --all --json 2>/dev/null
@@ -234,4 +218,4 @@ run_phase startup
 wait_for_exact_idle
 run_phase idle
 
-printf 'all four harnesses completed startup and exact-idle consensus\n'
+printf 'all %s harnesses completed startup and exact-idle consensus\n' "${#names[@]}"

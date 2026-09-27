@@ -1,0 +1,78 @@
+version 2
+
+// One durable seat serves several missions, one step at a time, in the order of its queue.
+//
+// A seat holds at most one claimed step. Each run that has a step assigned to the seat joins the
+// end of the seat's queue and leaves it when the run ends. When the seat is free, st3 wakes it for
+// the first ready step in queue order. A run whose step is waiting on a gate or a dependency is
+// passed over until that step is ready. `work claim` refuses a later run's step while an earlier
+// run has ready work for the seat, and names that next work.
+//
+// Apply one worker seat from seats/, and seats/chief.kdl if an agent should reorder the queue.
+// Then publish these two missions and start one run of each:
+//
+//   st3 agents apply examples/st3/seats/omp.kdl --as person/operator
+//   st3 agents apply examples/st3/seats/chief.kdl --as person/operator
+//   st3 missions publish examples/st3/seat-queue.kdl --as person/operator
+//   st3 missions start example/docs-refresh --id example/docs-refresh/2026-10-01 \
+//     --workspace /srv/example/app --as person/operator
+//   st3 missions start example/release-notes --id example/release-notes/2026-10-01 \
+//     --workspace /srv/example/app --as person/operator
+//
+// Start order is the default queue order. Show the held step, the next work, each queued run,
+// and the recent moves:
+//
+//   st3 agents queue agent/example/worker
+//
+// Move the release run ahead. A move never interrupts or releases the step the seat holds now; the
+// new order applies when the seat is free. Use exactly one of --top, --bottom, --before RUN, or
+// --after RUN. A person moves runs with a person identity; the chief uses its own identity, and
+// the daemon checks its `queue-authority` on every move:
+//
+//   st3 agents queue move agent/example/worker mission-run/example/release-notes/2026-10-01 \
+//     --top --reason "the release needs its notes first" --as person/operator
+//   st3 agents queue move agent/example/worker mission-run/example/docs-refresh/2026-10-01 \
+//     --after mission-run/example/release-notes/2026-10-01 --as agent/example/chief
+//
+// The worker cannot reorder its own queue unless a person grants it `queue-authority` over itself.
+// `queue {}` inside a mission orders steps within one run; the seat queue orders runs.
+
+mission "example/docs-refresh" state="ready" {
+  goal "Bring the invented project's README in line with its current command-line options."
+
+  step "update-readme" timeout="45m" {
+    assigned-to "agent/example/worker"
+    goal "Update README.md so every documented option matches the current `--help` output, then commit and push the change to the docs-refresh branch."
+  }
+
+  step "check-links" timeout="20m" {
+    assigned-to "agent/example/worker"
+    depends-on { step "update-readme" completed }
+    goal "Check every relative link in README.md on the pushed branch and fix any broken link."
+  }
+}
+
+mission "example/release-notes" state="ready" {
+  goal "Draft release notes for the next invented release and hold them for a person's sign-off."
+
+  step "draft" timeout="45m" {
+    assigned-to "agent/example/worker"
+    goal "Write RELEASE-NOTES.md from the commits since the last tag, then commit and push it to the release-notes branch."
+  }
+
+  // While this gate waits, the seat is free to work on the docs run.
+  step "sign-off" {
+    agentless
+    depends-on { step "draft" completed }
+    gate "the operator signs off the release notes" type="human" {
+      reviewer "person/operator"
+      question "Are the release notes on the release-notes branch ready to publish?"
+    }
+  }
+
+  step "publish" timeout="20m" {
+    assigned-to "agent/example/worker"
+    depends-on { step "sign-off" completed }
+    goal "Merge the release-notes branch into main and push main."
+  }
+}

@@ -432,6 +432,7 @@ fn up_once_never_mutates_the_ambient_codex_config_before_account_selection() {
     let selected_codex_home = tmp.path().join("selected-codex-home");
     let bin = tmp.path().join("bin");
     let pty_log = tmp.path().join("pty.log");
+    let pty_state = tmp.path().join("pty-state.json");
     let declaration = catalog.join("agents/h/worker/agent.kdl");
     fs::create_dir_all(declaration.parent().unwrap()).unwrap();
     fs::create_dir_all(&workspace).unwrap();
@@ -452,8 +453,16 @@ fn up_once_never_mutates_the_ambient_codex_config_before_account_selection() {
     write_executable(
         &bin.join("pty"),
         &format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nif [ \"$1\" = list ]; then printf '[]\\n'; fi\n",
-            pty_log.display()
+            "#!/bin/sh\n\
+             printf '%s\\n' \"$*\" >> '{}'\n\
+             state='{}'\n\
+             case \"$1\" in\n\
+               run) printf '%s\\n' '[{{\"name\":\"h.worker\",\"status\":\"running\",\"pid\":4242,\"createdAt\":\"generation\",\"tags\":{{}}}}]' > \"$state\" ;;\n\
+               list) if [ -f \"$state\" ]; then IFS= read -r record < \"$state\"; printf '%s\\n' \"$record\"; else printf '[]\\n'; fi ;;\n\
+               stats) printf '%s\\n' '{{\"name\":\"h.worker\",\"process\":{{\"alive\":true}},\"daemon\":{{\"pid\":4242}},\"createdAt\":\"generation\"}}' ;;\n\
+             esac\n",
+            pty_log.display(),
+            pty_state.display()
         ),
     );
     assert!(

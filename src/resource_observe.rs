@@ -329,7 +329,7 @@ pub fn submit_request(
     let receipt_dir = scope.observe_receipt_dir();
     let request_dir = scope.observe_request_dir();
     let (wake_tx, wake) = mpsc::channel();
-    let watcher = crate::watch::watch_recursive_mutations(&receipt_dir, wake_tx);
+    let watcher = crate::watch::watch_recursive_mutations(&receipt_dir, wake_tx).ok();
     let receipt_path = receipt_path(&receipt_dir, &request.request_id)?;
     let request_path = request_path(&request_dir, &request.request_id)?;
     let _lock = lock_request_scope(&request_dir)?;

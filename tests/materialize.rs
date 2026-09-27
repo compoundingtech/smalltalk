@@ -1,10 +1,12 @@
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{PermissionsExt, symlink};
 use std::os::unix::process::CommandExt as _;
 use std::path::Path;
 use std::process::Command;
 
-use st2::materialize::{materialize_catalog, materialize_catalog_against, parse_plan};
+use st2::materialize::{
+    materialize_catalog, materialize_catalog_against, parse_plan, validate_agent,
+};
 use st2::{AgentSpec, discover};
 
 fn write(path: &Path, contents: impl AsRef<[u8]>) {
@@ -1043,6 +1045,50 @@ fn suspended_declaration_does_not_materialize_workspace_content() {
 }
 
 #[test]
+fn running_render_validation_checks_source_presence_and_destination_safety() {
+    let tmp = tempfile::tempdir().unwrap();
+    let catalog = tmp.path().join("catalog");
+    let workspace = tmp.path().join("workspace");
+    fs::create_dir_all(&workspace).unwrap();
+    write(
+        &catalog.join("agents/Silber/cos/agent.kdl"),
+        format!(
+            r#"agent "cos" {{
+  host "Silber"
+  workspace "{}"
+  command "true"
+  render {{ copy "_templates/source" "safe" }}
+}}
+"#,
+            workspace.display()
+        ),
+    );
+    let found = discover(&catalog);
+    assert!(found.errors.is_empty(), "{:?}", found.errors);
+    let missing = validate_agent(&catalog, &found.specs[0], "Silber")
+        .unwrap_err()
+        .to_string();
+    assert!(missing.contains("does not exist"), "{missing}");
+
+    write(&catalog.join("_templates/source"), "source");
+    let unsafe_declaration = fs::read_to_string(catalog.join("agents/Silber/cos/agent.kdl"))
+        .unwrap()
+        .replace(r#""safe""#, r#""../escape""#);
+    write(
+        &catalog.join("agents/Silber/cos/agent.kdl"),
+        unsafe_declaration,
+    );
+    let unsafe_found = discover(&catalog);
+    let error = validate_agent(&catalog, &unsafe_found.specs[0], "Silber")
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("workspace-relative path without `..`"),
+        "{error}"
+    );
+}
+
+#[test]
 fn missing_git_executable_fails_closed_before_workspace_write() {
     let tmp = tempfile::tempdir().unwrap();
     let catalog = tmp.path().join("catalog");
@@ -1152,6 +1198,13 @@ fn up_materialize_only_writes_the_overlay_without_needing_pty() {
         &catalog.join("agents/Silber/cos/agent.kdl"),
         agent_kdl(&workspace, r#"    copy "_templates/brief.md" "AGENTS.md""#),
     );
+    let bin = tmp.path().join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    let git = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+        .map(|directory| directory.join("git"))
+        .find(|candidate| candidate.is_file())
+        .expect("git is available on the test runner's PATH");
+    symlink(git, bin.join("git")).unwrap();
 
     let output = Command::new(env!("CARGO_BIN_EXE_st2"))
         .args(["up"])
@@ -1159,7 +1212,7 @@ fn up_materialize_only_writes_the_overlay_without_needing_pty() {
         .args(["--host", "Silber", "--materialize-only"])
         // Proves this path never tries the runtime's external pty backend.
         .env("ST_HOOKS", &hooks_root)
-        .env("PATH", "/usr/bin:/bin")
+        .env("PATH", &bin)
         .output()
         .unwrap();
     assert!(
