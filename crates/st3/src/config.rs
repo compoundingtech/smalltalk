@@ -206,6 +206,14 @@ impl Config {
         Ok(config)
     }
 
+    /// Load the config, merge `STATE/fleet/fleet.toml`, and validate the result.
+    pub fn load_with_fleet(path: Option<&Path>) -> Result<Self> {
+        let mut config = Self::load_unvalidated(path)?;
+        config.apply_fleet_file()?;
+        config.validate()?;
+        Ok(config)
+    }
+
     pub fn load_unvalidated(path: Option<&Path>) -> Result<Self> {
         let selected = path
             .map(Path::to_path_buf)

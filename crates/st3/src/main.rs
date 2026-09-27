@@ -4458,7 +4458,7 @@ async fn run_replication(
 fn run_service(command: ServiceCommand, json_output: bool) -> Result<()> {
     match command {
         ServiceCommand::Install { config } => {
-            st3::service::install(Config::load(config.as_deref())?)
+            st3::service::install(Config::load_with_fleet(config.as_deref())?)
         }
         ServiceCommand::Status => {
             let report = st3::service::status()?;
@@ -4500,7 +4500,7 @@ fn run_service(command: ServiceCommand, json_output: bool) -> Result<()> {
             }
         }
         ServiceCommand::Restart { config } => {
-            st3::service::restart(Config::load(config.as_deref())?)
+            st3::service::restart(Config::load_with_fleet(config.as_deref())?)
         }
         ServiceCommand::Reset { config } => {
             let config = Config::load(config.as_deref())?;

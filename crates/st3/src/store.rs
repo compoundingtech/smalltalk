@@ -15666,6 +15666,69 @@ impl Store {
         fleet_membership_tx(&connection)
     }
 
+    /// Whether transport observations about `peer` belong in the graph. A dial-out member is
+    /// never dialed and never reports on others, so neither side records one.
+    pub fn observes_transport_to(&self, peer: &str) -> Result<bool> {
+        let membership = self.fleet_membership()?;
+        let dial_out = |name: &str| {
+            matches!(
+                membership.state(name),
+                crate::fleet::MemberState::Current(incarnation) if incarnation.mode == "dial-out"
+            )
+        };
+        Ok(!dial_out(&self.origin) && !dial_out(peer))
+    }
+
+    /// This node's member public key, when it has one.
+    pub fn member_public_key(&self) -> Option<String> {
+        self.member_key
+            .read()
+            .expect("member key lock poisoned")
+            .as_ref()
+            .map(|key| key.public().to_owned())
+    }
+
+    /// Publish this member's mode and endpoints when they differ from its last announcement.
+    /// Returns whether a claim was written.
+    pub fn publish_fleet_endpoints(
+        &self,
+        mode: &str,
+        endpoints: &[Value],
+        build: &str,
+    ) -> Result<bool> {
+        let Some(member_key) = self.member_public_key() else {
+            return Ok(false);
+        };
+        let subject = format!("host/{}", self.origin);
+        if let Some(latest) = self.latest_claim(&subject, Some("fleet.member-endpoints"))? {
+            let fields = latest.body.get("fields").cloned().unwrap_or_default();
+            if fields["member_key"] == member_key
+                && fields["mode"] == mode
+                && fields["endpoints"].as_array().map(Vec::as_slice) == Some(endpoints)
+            {
+                return Ok(false);
+            }
+        }
+        self.append_claim(&ClaimInput {
+            subject,
+            kind: "fleet.member-endpoints".into(),
+            actor: None,
+            fields: BTreeMap::from([
+                ("member_key".into(), Value::String(member_key)),
+                ("mode".into(), Value::String(mode.into())),
+                ("endpoints".into(), Value::Array(endpoints.to_vec())),
+                ("build".into(), Value::String(build.into())),
+            ]),
+            evidence: Vec::new(),
+            expected_subject: None,
+            idempotency_key: None,
+        })
+        .map_err(anyhow::Error::from)?;
+        // Seed and sign at once, so the announcement counts in this node's own fold.
+        self.replication_snapshot()?;
+        Ok(true)
+    }
+
     /// The membership view the replication worker uses to decide who may exchange.
     pub fn fleet_view(&self) -> Result<crate::fleet::FleetView> {
         Ok(crate::fleet::FleetView::from_membership(
@@ -16345,6 +16408,55 @@ mod fleet_admission_tests {
 
     fn a_anchor(a: &Store) -> Arc<MemberKey> {
         a.member_key.read().unwrap().clone().unwrap()
+    }
+
+    #[test]
+    fn a_dial_out_member_is_never_observed_and_endpoints_are_announced_once() {
+        let (d_key, s_key) = (key(), key());
+        let anchor = key();
+        let a = node("a", Some(&anchor), Some(&anchor));
+        admit(&a, "a", &anchor, "anchor", None);
+        admit(&a, "server", &s_key, "invite", None);
+        append(
+            &a,
+            "fleet.member-admitted",
+            "host/laptop",
+            json!({
+                "fleet_id": FLEET, "member_key": d_key.public(), "via": "invite",
+                "mode": "dial-out", "sponsor": "host/a",
+            }),
+        );
+        assert!(!a.observes_transport_to("laptop").unwrap());
+        assert!(a.observes_transport_to("server").unwrap());
+        assert!(a.observes_transport_to("legacy-peer").unwrap());
+
+        let laptop = node("laptop", Some(&d_key), Some(&anchor));
+        sync(&a, &laptop);
+        assert!(
+            laptop
+                .publish_fleet_endpoints("dial-out", &[], "test")
+                .unwrap()
+        );
+        assert!(
+            !laptop
+                .publish_fleet_endpoints("dial-out", &[], "test")
+                .unwrap()
+        );
+        assert!(!laptop.observes_transport_to("a").unwrap());
+        let endpoint = [json!({"transport": "loopback", "address": "127.0.0.1:1"})];
+        assert!(
+            laptop
+                .publish_fleet_endpoints("listening", &endpoint, "test")
+                .unwrap()
+        );
+        assert!(laptop.observes_transport_to("a").unwrap());
+        sync(&laptop, &a);
+        let membership = a.fleet_membership().unwrap();
+        let MemberState::Current(incarnation) = membership.state("laptop") else {
+            panic!("the laptop is current");
+        };
+        assert_eq!(incarnation.mode, "listening");
+        assert_eq!(incarnation.endpoints, endpoint);
     }
 
     #[test]

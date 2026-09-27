@@ -701,10 +701,34 @@ fn machine_resources(
 
     let local_host = client_host_id(&state.node);
     let mut host_ids = BTreeSet::from([local_host.clone()]);
+    // Fleet members count as configured hosts; ended members are history. A config peer that
+    // ended as a member is history too, even while its [[peers]] entry remains.
+    let fleet = state.store.fleet_view()?;
+    let dial_out_hosts = fleet
+        .members
+        .iter()
+        .filter(|member| member.state == "current" && member.mode == "dial-out")
+        .map(|member| client_host_id(&member.name))
+        .collect::<BTreeSet<_>>();
+    let ended_hosts = fleet
+        .members
+        .iter()
+        .filter(|member| fleet.current(&member.name).is_empty())
+        .map(|member| client_host_id(&member.name))
+        .chain(fleet.legacy_removed.iter().map(|name| client_host_id(name)))
+        .collect::<BTreeSet<_>>();
     let configured_hosts = state
         .configured_peers
         .iter()
         .map(|peer| client_host_id(peer))
+        .chain(
+            fleet
+                .members
+                .iter()
+                .filter(|member| member.state != "ended")
+                .map(|member| client_host_id(&member.name)),
+        )
+        .filter(|host| !ended_hosts.contains(host))
         .collect::<BTreeSet<_>>();
     host_ids.extend(configured_hosts.iter().cloned());
     host_ids.extend(host_runtime_ids.keys().cloned());
@@ -740,7 +764,22 @@ fn machine_resources(
             operational_layer,
             operational_actionable,
             operational_reasons,
-        ) = if host_id == local_host {
+        ) = if host_id != local_host && dial_out_hosts.contains(&host_id) {
+            // A dial-out member is never dialed, so it is never reachable or unreachable from
+            // here: show when it last exchanged with this node instead.
+            let last_success_at = state.store.replication_peer_last_success(&name)?;
+            (
+                "dial-out",
+                vec![json!({
+                    "protocol": "replication",
+                    "status": "unknown",
+                    "last_success_at": last_success_at.map(client_timestamp),
+                })],
+                "current".to_owned(),
+                false,
+                vec!["dial-out-member".to_owned()],
+            )
+        } else if host_id == local_host {
             (
                 "local",
                 vec![json!({
@@ -4459,6 +4498,76 @@ mod tests {
         assert_eq!(
             edge["transports"][0]["last_success_at"],
             client_timestamp(peer_success)
+        );
+    }
+
+    #[test]
+    fn a_dial_out_member_is_dial_out_and_an_ended_member_is_history() {
+        const FLEET: &str = "018f6f0d-4a5d-7b8c-9d0e-123456789abd";
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state_named(root.path(), "hub");
+        state.store.bind_fleet(FLEET).unwrap();
+        let anchor = Arc::new(crate::fleet::MemberKey::generate().unwrap().0);
+        state.store.pin_fleet_anchor(anchor.public()).unwrap();
+        state.store.set_member_key(Some(anchor.clone())).unwrap();
+        let admit = |name: &str, key: &str, via: &str, mode: &str| {
+            state
+                .store
+                .append_claim(&ClaimInput {
+                    subject: format!("host/{name}"),
+                    kind: "fleet.member-admitted".into(),
+                    actor: None,
+                    fields: BTreeMap::from([
+                        ("fleet_id".into(), Value::String(FLEET.into())),
+                        ("member_key".into(), Value::String(key.into())),
+                        ("via".into(), Value::String(via.into())),
+                        ("mode".into(), Value::String(mode.into())),
+                    ]),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: None,
+                })
+                .unwrap();
+        };
+        admit("hub", anchor.public(), "anchor", "listening");
+        admit("laptop", "laptop-key", "invite", "dial-out");
+        admit("gone", "gone-key", "invite", "listening");
+        state
+            .store
+            .append_claim(&ClaimInput {
+                subject: "host/gone".into(),
+                kind: "fleet.member-removed".into(),
+                actor: None,
+                fields: BTreeMap::from([
+                    ("member_key".into(), Value::String("gone-key".into())),
+                    ("high_water".into(), Value::from(0)),
+                    ("reason".into(), Value::String("test".into())),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+        // An old observation says the laptop was down; it no longer decides anything.
+        state
+            .store
+            .record_transport_observation("laptop", "down", Some("asleep"), None)
+            .unwrap();
+
+        let session = ClientSession::local(Some("person/nathan")).unwrap();
+        let machines =
+            machine_resources(&state, false, &new_client_snapshot(&state), &session).unwrap();
+        let laptop = machines
+            .iter()
+            .find(|machine| machine["host_id"] == "host/laptop")
+            .expect("the dial-out member is a current machine");
+        assert_eq!(laptop["state"], "dial-out");
+        assert_eq!(laptop["transports"][0]["status"], "unknown");
+        assert!(
+            machines
+                .iter()
+                .all(|machine| machine["host_id"] != "host/gone"),
+            "an ended member is history, not a current machine"
         );
     }
 
