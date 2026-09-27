@@ -3019,6 +3019,16 @@ impl Store {
     }
 
     pub fn active_mission_runs_for_origin(&self, origin: &str) -> Result<Vec<MissionRunView>> {
+        self.active_mission_run_ids_for_origin(origin)?
+            .iter()
+            .map(|id| self.mission_run_for_reconcile(id))
+            .collect()
+    }
+
+    /// The IDs of the active runs that `origin` created, oldest first. The reconciler builds each
+    /// run's view on its own with [`Store::mission_run_for_reconcile`], so one run whose view
+    /// cannot be built does not hide the others.
+    pub fn active_mission_run_ids_for_origin(&self, origin: &str) -> Result<Vec<String>> {
         let connection = self.readers.get();
         let mut statement = connection.prepare(
             "SELECT mission_runs.id
@@ -3032,16 +3042,86 @@ impl Store {
                )
              ORDER BY mission_runs.created_at_unix_ms",
         )?;
-        let ids = statement
+        statement
             .query_map([origin], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    /// One run's view with the effective step state and definitions the reconciler needs.
+    ///
+    /// The presentation view scans message history for each step's wake badge. Doing that for
+    /// every active run on every graph change is quadratic in fleet history and can saturate an
+    /// otherwise idle daemon.
+    pub fn mission_run_for_reconcile(&self, id: &str) -> Result<MissionRunView> {
+        let connection = self.readers.get();
+        mission_run_view_for_reconcile_tx(&connection, id).map_err(Into::into)
+    }
+
+    /// The faults this host recorded that have not recovered, keyed by subject and scope.
+    pub fn open_reconcile_faults(
+        &self,
+        origin: &str,
+    ) -> Result<BTreeMap<(String, String), String>> {
+        let connection = self.readers.get();
+        let mut statement = connection.prepare(
+            "SELECT subject, body FROM claims
+             WHERE kind='reconcile.fault' AND origin=?1
+             ORDER BY store_index",
+        )?;
+        let rows = statement
+            .query_map([origin], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
             .collect::<Result<Vec<_>, _>>()?;
-        ids.into_iter()
-            // The reconciler only needs effective step state and definitions. The
-            // presentation view scans message history for each step's wake badge;
-            // doing that for every active run on every graph change is quadratic
-            // in fleet history and can saturate an otherwise idle daemon.
-            .map(|id| mission_run_view_for_reconcile_tx(&connection, &id).map_err(Into::into))
-            .collect()
+        let mut faults = BTreeMap::new();
+        for (subject, body) in rows {
+            let body: Value = serde_json::from_str(&body)?;
+            let fields = body.get("fields").unwrap_or(&body);
+            let Some(scope) = fields.get("scope").and_then(Value::as_str) else {
+                continue;
+            };
+            let key = (subject, scope.to_owned());
+            if fields.get("status").and_then(Value::as_str) == Some("faulted") {
+                let reason = fields
+                    .get("reason")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned();
+                faults.insert(key, reason);
+            } else {
+                faults.remove(&key);
+            }
+        }
+        Ok(faults)
+    }
+
+    /// The reason for an open fault on `subject` in `scope`, if the latest record is a fault.
+    pub fn reconcile_fault(&self, subject: &str, scope: &str) -> Result<Option<String>> {
+        let connection = self.readers.get();
+        let body: Option<String> = connection
+            .query_row(
+                "SELECT body FROM claims WHERE subject=?1 AND kind='reconcile.fault'
+                   AND json_extract(body, '$.fields.scope')=?2
+                 ORDER BY store_index DESC LIMIT 1",
+                params![subject, scope],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(body) = body else {
+            return Ok(None);
+        };
+        let body: Value = serde_json::from_str(&body)?;
+        let fields = body.get("fields").unwrap_or(&body);
+        Ok(
+            (fields.get("status").and_then(Value::as_str) == Some("faulted")).then(|| {
+                fields
+                    .get("reason")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned()
+            }),
+        )
     }
 
     pub fn next_active_mission_deadline(&self, origin: &str) -> Result<Option<u128>> {
@@ -7905,6 +7985,7 @@ impl Store {
                  WHERE subject=?1 AND kind!='intent.desired'
                    AND kind NOT LIKE 'harness.%'
                    AND kind!='runtime.readiness-deadline-reached'
+                   AND kind!='reconcile.fault'
                  ORDER BY store_index DESC LIMIT 1",
                 [subject],
                 |row| row.get(0),
@@ -13116,6 +13197,7 @@ fn selected_actual_source_at(
                 kind != "intent.desired"
                     && !kind.starts_with("harness.")
                     && kind != "runtime.readiness-deadline-reached"
+                    && kind != "reconcile.fault"
             })
         });
     let Some((selected_id, _, selected_origin, _, selected_body)) = selected else {
@@ -13197,6 +13279,7 @@ fn latest_actual_at(
            AND kind!='intent.desired'
            AND kind NOT LIKE 'harness.%'
            AND kind!='runtime.readiness-deadline-reached'
+           AND kind!='reconcile.fault'
            AND store_index<=?2
          ORDER BY store_index",
     )?;

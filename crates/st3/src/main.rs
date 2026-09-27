@@ -1833,7 +1833,7 @@ async fn run_up(args: UpArgs) -> Result<()> {
         notify.clone(),
         event_notify.clone(),
     )?);
-    tokio::spawn(reconciler.run());
+    tokio::spawn(reconciler.supervise());
     #[cfg(target_os = "macos")]
     tokio::spawn(async {
         // Startup and replication can leave large, empty malloc zones resident on macOS.
@@ -9486,7 +9486,7 @@ mod tests {
             "fault": "render refuses to change tracked file .claude/settings.local.json"
         }))
         .unwrap();
-        let card = render_client_agent(&agent);
+        let card = render_client_agent(&agent, &[], 0);
         assert!(card.contains("STATE        failed"));
         assert!(card.contains(
             "FAULT        render refuses to change tracked file .claude/settings.local.json"
