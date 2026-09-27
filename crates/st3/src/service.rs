@@ -290,6 +290,11 @@ pub fn reset(mut config: Config) -> Result<()> {
     Ok(())
 }
 
+/// Stop the st3 services without removing them.
+pub fn stop() -> Result<()> {
+    stop_native_service()
+}
+
 pub fn uninstall() -> Result<()> {
     uninstall_native_service()?;
     println!("uninstalled");
