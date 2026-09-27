@@ -307,8 +307,9 @@ private key (below).
   then prints: "If you did not use this code before, someone else may have. Check
   `st fleet invites` on a member."
 - The join route exists only while the sponsor holds at least one unexpired invite. Otherwise it
-  returns 404 like any unknown path. Its body is limited to 4 KiB, and it accepts at most 10
-  requests a minute across all invites.
+  returns 404 like any unknown path. Its body is limited to 4 KiB. It has no request quota: a
+  quota spent before the proof is checked would let any caller block real joins, while a request
+  is cheap to refuse and a 128-bit token cannot be guessed.
 
 ## Join
 
