@@ -7375,8 +7375,8 @@ async fn publish_harness_state(
     Ok(())
 }
 
-/// One pi-family message frame. The content is the shared st3 envelope that Codex and Claude also
-/// receive, steered into a running turn at its next tool boundary. omp backgrounds an in-flight
+/// One pi-family message frame. The content is the shared `<smalltalk-message>` envelope that
+/// Codex also receives, steered into a running turn at its next tool boundary. omp backgrounds an in-flight
 /// shell or eval call when a steer arrives, and one live omp seat then repeated a send whose
 /// result it had not seen. Queueing mail with `followUp` instead was measured and was worse: omp
 /// read the queued messages during its turn, the queue then re-delivered them as new prompts, and
@@ -7389,8 +7389,10 @@ fn pi_family_message_frame(message: &st3::model::MessageView, body: &str, identi
         "content": st2::ding::st3_notification_text(
             &message.subject,
             &message.from,
+            &message.to,
             message.title.as_deref(),
             body,
+            &st2::ding::st3_body_sha256(body),
         ),
         "meta": {
             "from": message.from,
@@ -8258,6 +8260,12 @@ async fn forward_projected_messages(
                 };
                 let mut tags = message.tags.clone();
                 tags.push(format!("{TAG_PREFIX}{}", message.subject));
+                tags.push(format!("{}{}", st2::ding::ST3_TO_TAG, message.to));
+                tags.push(format!(
+                    "{}{}",
+                    st2::ding::ST3_SHA256_TAG,
+                    st2::ding::st3_body_sha256(&content)
+                ));
                 let filename = st2::message::send_to_inbox(
                     inbox,
                     &message.from,
@@ -8547,16 +8555,11 @@ mod tests {
         assert_eq!(omp["deliverAs"], "steer");
         assert_eq!(
             omp["content"],
-            st2::ding::st3_notification_text(
-                "message/0123456789abcdef",
-                "agent/run-1/wake.claude",
-                Some("Cross-harness consensus: idle"),
-                "FACT QUARTZ",
-            )
-        );
-        assert!(
-            omp["content"].as_str().unwrap().starts_with(
-                "[PING from st3] message/0123456789abcdef from agent/run-1/wake.claude:"
+            format!(
+                "<smalltalk-message id=\"0123456789abcdef\" from=\"agent/run-1/wake.claude\" \
+                 to=\"agent/run-1/wake.omp-2\" subject=\"Cross-harness consensus: idle\" \
+                 sha256=\"{}\" graph=\"message/0123456789abcdef\">\nFACT QUARTZ\n</smalltalk-message>",
+                st2::ding::st3_body_sha256("FACT QUARTZ")
             )
         );
         assert_eq!(omp["meta"]["messageId"], "message/0123456789abcdef");
@@ -10654,6 +10657,65 @@ mission "review" state="ready" {
         assert!(!inbox.join(&filename).exists());
         assert!(archive.join(filename).is_file());
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn a_projected_message_envelope_names_the_graph_recipient_and_exact_body_hash() {
+        use axum::{Json, Router, routing::get};
+
+        let app = Router::new().route(
+            "/v1/messages/page",
+            get(|| async {
+                Json(serde_json::json!({
+                    "api_version": "st3.v1",
+                    "value": {
+                        "items": [{
+                            "subject": "message/fact", "from": "agent/run-1/wake.left",
+                            "to": "agent/run-1/wake.right", "content": "FACT <b>QUARTZ</b>",
+                            "status": "staged", "title": "Fact", "created_index": 1
+                        }],
+                        "has_more": false, "next_cursor": null, "limit": 100
+                    }
+                }))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = Client::new(Endpoint::Http(format!("http://{address}")));
+        let root = tempfile::tempdir().unwrap();
+        let inbox = root.path().join("inbox");
+        let archive = root.path().join("archive");
+
+        forward_projected_messages(
+            &client,
+            "agent/run-1/wake.right",
+            &inbox,
+            &archive,
+            "codex",
+            NativeDeliveryReceipts::ClaudeChannel {
+                agent_dir: root.path(),
+                incarnation: "one",
+            },
+        )
+        .await
+        .unwrap();
+        server.abort();
+
+        let projected = st2::message::list_inbox(&inbox).unwrap();
+        assert_eq!(projected.len(), 1);
+        // The inbox file appends a newline, so the hash must come from the graph content.
+        assert_eq!(projected[0].body, "FACT <b>QUARTZ</b>\n");
+        let catalog = tempfile::tempdir().unwrap();
+        assert_eq!(
+            st2::ding::poke_text(catalog.path(), "h", "run-1/wake.right", &projected[0]),
+            format!(
+                "<smalltalk-message id=\"fact\" from=\"agent/run-1/wake.left\" \
+                 to=\"agent/run-1/wake.right\" subject=\"Fact\" sha256=\"{}\" \
+                 graph=\"message/fact\">\nFACT &lt;b&gt;QUARTZ&lt;/b&gt;\n</smalltalk-message>",
+                st2::ding::st3_body_sha256("FACT <b>QUARTZ</b>")
+            )
+        );
     }
 
     #[tokio::test]
