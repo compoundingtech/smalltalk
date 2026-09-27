@@ -32,6 +32,7 @@ use crate::store::Store;
 const PROTOCOL: &str = "st3-replication-v1";
 const EXCHANGE_PATH: &str = "/v1/peer/exchange";
 const REPLICATION_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(20);
+const REPLICATION_WAKE_COALESCE: Duration = Duration::from_secs(1);
 const CLIENT_READ_PATH: &str = "/v1/peer/client-read";
 const MAX_CLIENT_READ_BYTES: usize = 1_048_576;
 /// A relayed long poll must answer well inside the relay's 15-second request timeout.
@@ -800,15 +801,23 @@ fn start_outbound(
             let mut backoff = Duration::from_secs(1);
             loop {
                 match exchange(&http, &backend, &node, &peer, &auth, &main_socket).await {
-                    Ok(_) => {
+                    Ok(moved) => {
                         backoff = Duration::from_secs(1);
                         // A busy harness can write several observations while one exchange is
                         // in flight. Keep the first exchange immediate, then coalesce the
                         // resulting wake burst without disabling the 30-second retry path.
-                        let not_before = tokio::time::Instant::now() + Duration::from_secs(10);
-                        tokio::select! {
-                            _ = notify.changed() => {}
-                            _ = tokio::time::sleep(Duration::from_secs(30)) => {}
+                        // The window stays short so a publish is startable on every peer
+                        // within seconds.
+                        let not_before = tokio::time::Instant::now() + REPLICATION_WAKE_COALESCE;
+                        if moved {
+                            // One exchange carries a bounded batch. Keep going while envelopes
+                            // still move instead of leaving the rest of a backlog to the timer.
+                            notify.borrow_and_update();
+                        } else {
+                            tokio::select! {
+                                _ = notify.changed() => {}
+                                _ = tokio::time::sleep(Duration::from_secs(30)) => {}
+                            }
                         }
                         tokio::time::sleep_until(not_before).await;
                     }

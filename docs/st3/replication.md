@@ -35,6 +35,8 @@ The service installer creates a separate systemd user service or launchd agent f
 
 A local graph change writes `replication.wake`. The worker watches only this file, not the SQLite files.
 
+The worker coalesces wake bursts for one second, so new authority, such as a mission publish, reaches every peer within seconds. An exchange that moved envelopes runs again at once until a backlog drains.
+
 The worker also runs a 30-second anti-entropy exchange. This timer repairs a missed file event or a network interruption.
 
 ## Protocol
@@ -48,6 +50,10 @@ The secret never enters a request, response, database, or log.
 One exchange sends an inventory of envelope identities. An identity is `(writer, sequence, envelope hash)`.
 
 The inventory is a set, not a high-water cursor. Sparse delivery and two candidates at one writer sequence are valid.
+
+The inventory is compact. It carries one digest per writer range of 256 sequences, and it lists identities only for ranges whose digests differ. A peer sends a range the other side lacks entirely, and it sends identities within a differing range only after the other side has listed that range. One two-phase exchange therefore converges both directions without sending the whole authority log. A peer without range digests receives and sends the full identity list, as before.
+
+One exchange carries at most 512 envelopes in each direction.
 
 Each missing envelope contains one base64-encoded CBOR payload. Receipt stores the outer envelope before it decodes the payload.
 

@@ -13,12 +13,17 @@ const dir = fs.mkdtempSync(path.join(os.tmpdir(), "st2-omp-smoke-"));
 const framesPath = path.join(dir, "frames.jsonl");
 // Lines appended here are what the channel sends the extension, as `message` frames do.
 const outboxPath = path.join(dir, "outbox.jsonl");
+const pidPath = path.join(dir, "channel-pids");
+const delayedHelloPath = path.join(dir, "delay-hello");
 const recorder = path.join(dir, "recorder");
 fs.writeFileSync(
   recorder,
   `#!${process.execPath}
 import fs from "node:fs";
-process.stdout.write(JSON.stringify({ type: "hello", protocol: 1, sessionContext: "" }) + "\\n");
+fs.appendFileSync(${JSON.stringify(pidPath)}, process.pid + "\\n");
+const hello = () => process.stdout.write(JSON.stringify({ type: "hello", protocol: 1, sessionContext: fs.existsSync(${JSON.stringify(delayedHelloPath)}) ? "late seat context" : "" }) + "\\n");
+if (fs.existsSync(${JSON.stringify(delayedHelloPath)})) setTimeout(hello, 6000);
+else hello();
 process.stdin.setEncoding("utf8");
 process.stdin.on("data", (chunk) => fs.appendFileSync(${JSON.stringify(framesPath)}, chunk));
 process.stdin.on("end", () => process.exit(0));
@@ -57,11 +62,13 @@ assert.strictEqual(typeof mod.default, "function", "extension exports its entry 
 const handlers = new Map();
 // Every message the extension hands to omp, with the options it chose.
 const handedOver = [];
+const sessionMessages = [];
 const pi = {
   on: (name, handler) => handlers.set(name, handler),
   sendUserMessage: (content, options) => {
     handedOver.push(options === undefined ? { content } : { content, options });
   },
+  sendMessage: (message, options) => sessionMessages.push({ message, options }),
 };
 mod.default(pi);
 for (const name of [
@@ -360,6 +367,39 @@ assert.deepStrictEqual(
   "every message is acknowledged exactly once",
 );
 fs.rmSync(outboxPath, { force: true });
+
+// A channel that dies during a hold must be replaced. The successor re-sends the unacknowledged
+// message; the retired channel's held copy must never be handed off or acknowledged.
+await handlers.get("session_start")({}, holdCtx);
+await handlers.get("agent_start")({}, holdCtx);
+const reheld = { type: "message", deliverAs: "steer", content: "after reconnect", meta: { messageId: "message/reopen" } };
+fs.appendFileSync(outboxPath, JSON.stringify(reheld) + "\n");
+await pause(200);
+const beforeReopen = handedOver.length;
+const oldPid = Number(fs.readFileSync(pidPath, "utf8").trim().split("\n").at(-1));
+fs.writeFileSync(outboxPath, "");
+process.kill(oldPid);
+let newPid = oldPid;
+for (let i = 0; i < 30 && newPid === oldPid; i++) {
+  await pause(100);
+  newPid = Number(fs.readFileSync(pidPath, "utf8").trim().split("\n").at(-1));
+}
+assert.notStrictEqual(newPid, oldPid, "the channel reopens after an unexpected exit");
+fs.appendFileSync(outboxPath, JSON.stringify(reheld) + "\n");
+await pause(200);
+assert.strictEqual(handedOver.length, beforeReopen, "successor mail is still held during the turn");
+await handlers.get("agent_end")(successfulEnd, holdCtx);
+await pause(100);
+assert.strictEqual(acknowledged().filter((id) => id === "message/reopen").length, 1);
+fs.rmSync(outboxPath, { force: true });
+
+// The channel may answer after session_start's bounded wait. Its seat context still reaches the
+// next turn, so a slow PTY projection cannot leave an unnamed seat.
+fs.writeFileSync(delayedHelloPath, "1");
+await handlers.get("session_start")({}, fullCtx);
+await pause(1500);
+assert.ok(sessionMessages.some(({ message }) => message.content === "late seat context"));
+fs.rmSync(delayedHelloPath, { force: true });
 
 // `session_shutdown` has no reason field upstream and always denotes process exit. Closing must
 // make a later observational frame a no-op.

@@ -84,6 +84,9 @@ type Stash = {
   expectedNativeSession?: string;
   resumeGeneration?: string;
   child?: childProcess.ChildProcess;
+  reconnectTimer?: ReturnType<typeof setTimeout>;
+  reconnectAttempt?: number;
+  shuttingDown?: boolean;
   /**
    * The last assistant message's `usage.cost.total`.
    *
@@ -275,7 +278,7 @@ export default function (pi: ExtensionAPI) {
   };
 
   /** Open a channel and resolve with the hello's restored context (empty if none, or on timeout). */
-  const open = async (ctx: ExtensionContext): Promise<string> => {
+  const open = async (ctx: ExtensionContext, reconnecting = false): Promise<string> => {
     if (!bin || !catalog || !identity) return Promise.resolve("");
     if (typeof ctx.isIdle !== "function") {
       // Refuse rather than degrade. Without a positive idle proof this extension cannot choose
@@ -294,6 +297,9 @@ export default function (pi: ExtensionAPI) {
       );
       return Promise.resolve("");
     }
+    state.shuttingDown = false;
+    if (state.reconnectTimer !== undefined) clearTimeout(state.reconnectTimer);
+    state.reconnectTimer = undefined;
     // Close the PREVIOUS session's channel and wait (bounded) before spawning: the successor
     // shares the seat's record, and a predecessor draining its queued frames after the new
     // session's seed would land stale state into fresh records.
@@ -303,9 +309,14 @@ export default function (pi: ExtensionAPI) {
     // The predecessor's cost belongs to the predecessor. The stash outlives session replacement
     // by design, so without this a replacement session's first frames would restate the old
     // session's cost as their own.
-    state.lastCostUsd = undefined;
-    state.pendingAskToolCallId = undefined;
-    resetHold();
+    if (reconnecting) {
+      dropHeldForChannel();
+    } else {
+      state.reconnectAttempt = 0;
+      state.lastCostUsd = undefined;
+      state.pendingAskToolCallId = undefined;
+      resetHold();
+    }
 
     cancelSettle();
     const channelEnv: NodeJS.ProcessEnv = { ...process.env };
@@ -325,23 +336,26 @@ export default function (pi: ExtensionAPI) {
 
     return new Promise<string>((resolve) => {
       let settled = false;
+      let timedOut = false;
       const settle = (value: string) => {
         if (settled) return;
         settled = true;
         resolve(value);
       };
-      const timer = setTimeout(() => settle(""), HELLO_TIMEOUT_MS);
+      const timer = setTimeout(() => { timedOut = true; settle(""); }, HELLO_TIMEOUT_MS);
       timer.unref?.();
-      child.on("error", () => {
-        if (state.child === child) state.child = undefined;
+      const retire = () => {
+        if (state.child !== child) return;
+        state.child = undefined;
+        dropHeldForChannel();
         settle("");
-      });
+        scheduleReconnect(ctx);
+      };
+      child.on("error", retire);
       // An observability pipe must never take the host down: EPIPE on a closed stdin is an
       // uncaught exception without a listener. Retire the channel instead — fail-open.
-      child.stdin.on("error", () => {
-        if (state.child === child) state.child = undefined;
-      });
-      child.on("exit", () => settle(""));
+      child.stdin.on("error", retire);
+      child.on("exit", retire);
 
       const send = (frame: Record<string, unknown>) => {
         if (child.stdin.destroyed) return;
@@ -356,6 +370,7 @@ export default function (pi: ExtensionAPI) {
         } catch {
           return;
         }
+        if (state.child !== child) return;
         if (frame.type === "hello") {
           // A newer control plane may speak a wire this asset was not written against. Refusing
           // is the honest outcome: presence still decays, so the agent reads as unreachable
@@ -376,7 +391,18 @@ export default function (pi: ExtensionAPI) {
           state.expectedNativeSession = undefined;
           state.resumeGeneration = undefined;
           clearTimeout(timer);
-          settle(typeof frame.sessionContext === "string" ? frame.sessionContext : "");
+          const context = typeof frame.sessionContext === "string" ? frame.sessionContext : "";
+          if (timedOut && context.trim()) {
+            // A slow PTY projection may outlast the bounded session_start wait. Carry the seat
+            // identity into the next turn instead of silently dropping the late hello.
+            try {
+              pi.sendMessage(
+                { customType: "st2-session-start", content: context, display: true },
+                { deliverAs: "nextTurn" },
+              );
+            } catch { /* session shutdown may have begun */ }
+          }
+          settle(context);
           return;
         }
         if (frame.type !== "message" || typeof frame.content !== "string") return;
@@ -405,6 +431,18 @@ export default function (pi: ExtensionAPI) {
         }
       });
     });
+  };
+
+  const scheduleReconnect = (ctx: ExtensionContext) => {
+    if (state.shuttingDown || state.reconnectTimer !== undefined) return;
+    const attempt = Math.min((state.reconnectAttempt ?? 0) + 1, 6);
+    state.reconnectAttempt = attempt;
+    const delay = Math.min(500 * (2 ** (attempt - 1)), 15_000);
+    state.reconnectTimer = setTimeout(() => {
+      state.reconnectTimer = undefined;
+      if (!state.shuttingDown && !state.child) void open(ctx, true);
+    }, delay);
+    state.reconnectTimer.unref?.();
   };
 
   // Frames are observational — st2 decides what becomes of them — and a closed channel drops
@@ -502,10 +540,13 @@ export default function (pi: ExtensionAPI) {
     state.holdTimer = undefined;
   };
   /** Held mail belongs to the channel that sent it; that channel's successor re-sends it. */
-  const resetHold = () => {
+  const dropHeldForChannel = () => {
     clearHoldTimer();
-    state.running = false;
     state.held = [];
+  };
+  const resetHold = () => {
+    dropHeldForChannel();
+    state.running = false;
     toolCallsInFlight().clear();
   };
 
@@ -869,6 +910,9 @@ export default function (pi: ExtensionAPI) {
   // Replacement is a separate session-switch lifecycle and remains handled by `open()` closing
   // the named predecessor.
   pi.on("session_shutdown", async () => {
+    state.shuttingDown = true;
+    if (state.reconnectTimer !== undefined) clearTimeout(state.reconnectTimer);
+    state.reconnectTimer = undefined;
     cancelSettle();
     state.pendingAskToolCallId = undefined;
     resetHold();

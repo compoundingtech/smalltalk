@@ -47,7 +47,8 @@ use crate::model::{
     ReplicationStatus, ReviewRequest, RevisionApprovalRequest, RevisionCancelRequest,
     RevisionCutover, RevisionProposalView, RevisionSubmissionView, RunGenerationView,
     SessionControlResponse, SessionInputMode, SessionInputRequest, SessionLogChunk, SessionScreen,
-    SessionSignalRequest, St3Error, StatusResponse, StepRunView, WorkRequest, WorkWakeRequest,
+    SessionSignalRequest, St3Error, StatusResponse, StepRunView, WorkRequest, WorkRetryRequest,
+    WorkWakeRequest,
 };
 use crate::store::Store;
 
@@ -354,6 +355,11 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
         .route("/v1/reviews/{*subject}", post(post_review))
         .route("/v1/attention", get(list_attention).post(request_attention))
         .route("/v1/attention/resolve/{*subject}", post(resolve_attention))
+        .route("/v1/subscription-requests", get(list_subscription_requests))
+        .route(
+            "/v1/subscription-requests/{decision}/{request}",
+            post(decide_subscription_request),
+        )
         .route(
             "/v1/attention/withdraw/{*subject}",
             post(withdraw_attention),
@@ -414,6 +420,7 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
         .route("/v1/work-items/{*subject}", get(get_work))
         .route("/v1/work/mission/{*subject}", post(publish_work_mission))
         .route("/v1/work/wake/{*subject}", post(wake_work))
+        .route("/v1/work/retry/{*subject}", post(retry_work))
         .route("/v1/work/{action}/{*subject}", post(post_work_action))
         .route("/v1/gate-results", post(post_gate_result))
         .route("/v1/agent-queue-moves", post(move_agent_queue))
@@ -1193,10 +1200,11 @@ fn client_agent_resources(
                     Some("ended" | "failed"),
                     _,
                 ) => "failed",
+                // A harness fenced at a login or trust prompt waits on a person.
                 (
                     Some("running" | "ready" | "working" | "idle"),
                     Some(_),
-                    Some("indeterminate" | "unknown"),
+                    Some("indeterminate" | "unknown" | "unauthenticated" | "blocked"),
                     _,
                 ) => "waiting",
                 (Some("running" | "ready" | "working" | "idle"), Some(_), _, _) => "starting",
@@ -1610,6 +1618,40 @@ fn client_attention_actions(kind: &str) -> Vec<&'static str> {
     }
 }
 
+/// Both the default and the history view rank a fault by the severity its requester gave.
+fn attention_priority(severity: &str) -> &'static str {
+    match severity {
+        "critical" => "critical",
+        "error" => "high",
+        "warning" => "normal",
+        _ => "low",
+    }
+}
+
+/// Beside each fault target, what that target is doing now, so a leftover request is
+/// recognizable without opening every target.
+fn insert_attention_target_states(
+    store: &Store,
+    resource: &mut serde_json::Map<String, Value>,
+    targets: &[String],
+) -> anyhow::Result<()> {
+    let states = store
+        .attention_target_states(targets)?
+        .into_iter()
+        .map(|state| {
+            let mut value = json!({ "id": state.id, "state": state.state });
+            if let Some(since) = state.since_unix_ms {
+                value["since"] = Value::String(client_timestamp(since));
+            }
+            value
+        })
+        .collect::<Vec<_>>();
+    if !states.is_empty() {
+        resource.insert("target_states".into(), Value::Array(states));
+    }
+    Ok(())
+}
+
 fn client_attention_resources(
     store: &Store,
     person: Option<&str>,
@@ -1620,9 +1662,17 @@ fn client_attention_resources(
         .iter()
         .map(|item| item.subject.as_str())
         .collect::<std::collections::BTreeSet<_>>();
+    let mut retired_seats = None;
     let mut resources = BTreeMap::new();
     for item in &current {
         let id = attention_resource_id(&item.subject);
+        let priority = if item.kind == "fault" {
+            store
+                .attention_request(&item.subject)?
+                .map_or("high", |request| attention_priority(&request.severity))
+        } else {
+            "normal"
+        };
         let revision = store
             .claims_for(&item.subject, None)?
             .last()
@@ -1638,7 +1688,7 @@ fn client_attention_resources(
             "updated_at": client_timestamp(item.requested_at_unix_ms),
             "title": item.title,
             "detail": item.detail,
-            "priority": if item.kind == "fault" { "high" } else { "normal" },
+            "priority": priority,
             "state": "open",
             "requested_at": client_timestamp(item.requested_at_unix_ms),
             "targets": item.targets,
@@ -1648,6 +1698,9 @@ fn client_attention_resources(
         let object = resource
             .as_object_mut()
             .expect("an attention resource is an object");
+        if item.kind == "fault" && attention_requester_retired(store, item, &mut retired_seats)? {
+            object["operational"]["reasons"] = json!(["requester-retired"]);
+        }
         if let Some(mission) = &item.mission {
             object.insert("mission_id".into(), Value::String(mission.clone()));
         }
@@ -1656,6 +1709,9 @@ fn client_attention_resources(
         }
         if let Some(step) = &item.step {
             object.insert("step_run_id".into(), Value::String(step.clone()));
+        }
+        if item.kind == "fault" {
+            insert_attention_target_states(store, object, &item.targets)?;
         }
         resources.insert(id, resource);
     }
@@ -1669,9 +1725,7 @@ fn client_attention_resources(
                 reasons.push("superseded");
             }
             let id = attention_resource_id(&request.subject);
-            resources.insert(
-                id.clone(),
-                json!({
+            let mut resource = json!({
                     "id": id,
                     "kind": "attention",
                     "attention_kind": "fault",
@@ -1681,14 +1735,21 @@ fn client_attention_resources(
                     "updated_at": client_timestamp(request.resolved_at_unix_ms.unwrap_or(request.requested_at_unix_ms)),
                     "title": request.title,
                     "detail": request.reason,
-                    "priority": match request.severity.as_str() { "critical" => "critical", "error" => "high", "warning" => "normal", _ => "low" },
+                    "priority": attention_priority(&request.severity),
                     "state": if request.status == "pending" { "open" } else { "resolved" },
                     "requested_at": client_timestamp(request.requested_at_unix_ms),
                     "targets": request.targets,
                     "actions": if current { client_attention_actions("fault") } else { Vec::<&str>::new() },
                     "operational": { "layer": if current { "current" } else { "history" }, "actionable": current, "reasons": reasons }
-                }),
-            );
+            });
+            insert_attention_target_states(
+                store,
+                resource
+                    .as_object_mut()
+                    .expect("an attention resource is an object"),
+                &request.targets,
+            )?;
+            resources.insert(id, resource);
         }
     }
     let mut resources = resources.into_values().collect::<Vec<_>>();
@@ -1709,6 +1770,30 @@ fn client_attention_resources(
             .then_with(|| left["id"].as_str().cmp(&right["id"].as_str()))
     });
     Ok(resources)
+}
+
+/// A fault whose requesting seat was stopped, or whose owning run or generation ended, has no
+/// one left to withdraw it. Only its reviewer can close it now.
+fn attention_requester_retired(
+    store: &Store,
+    item: &crate::model::AttentionItemView,
+    retired_seats: &mut Option<std::collections::BTreeSet<String>>,
+) -> anyhow::Result<bool> {
+    let Some(request) = store.attention_request(&item.subject)? else {
+        return Ok(false);
+    };
+    if !request.actor.starts_with("agent/") {
+        return Ok(false);
+    }
+    if store.selected_desired_kind(&request.actor)?.as_deref() == Some("stop") {
+        return Ok(true);
+    }
+    if retired_seats.is_none() {
+        *retired_seats = Some(store.terminal_owned_runtime_subjects()?);
+    }
+    Ok(retired_seats
+        .as_ref()
+        .is_some_and(|seats| seats.contains(&request.actor)))
 }
 
 fn client_message_resources(
@@ -2691,6 +2776,16 @@ where
 }
 
 pub async fn serve_unix(socket: &Path, app: Router) -> anyhow::Result<()> {
+    serve_unix_inner(socket, app, false).await
+}
+
+/// The local daemon binds a Unix peer to the harness identity inherited by that peer or one of
+/// its parents. Test servers and the paired gateway use the ordinary unbound listener.
+pub async fn serve_unix_bound(socket: &Path, app: Router) -> anyhow::Result<()> {
+    serve_unix_inner(socket, app, true).await
+}
+
+async fn serve_unix_inner(socket: &Path, app: Router, bind_harness: bool) -> anyhow::Result<()> {
     if let Some(parent) = socket.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -2703,11 +2798,31 @@ pub async fn serve_unix(socket: &Path, app: Router) -> anyhow::Result<()> {
     fs::set_permissions(socket, fs::Permissions::from_mode(0o600))?;
     loop {
         let (stream, _) = listener.accept().await?;
+        let bound_agent = if bind_harness {
+            stream
+                .peer_cred()
+                .ok()
+                .and_then(|cred| cred.pid())
+                .and_then(|pid| u32::try_from(pid).ok())
+                .and_then(harness_ancestor)
+        } else {
+            None
+        };
         let app = app.clone();
         tokio::spawn(async move {
             let service = hyper::service::service_fn(move |request: Request<Incoming>| {
                 let app = app.clone();
-                async move { app.oneshot(request.map(Body::new)).await }
+                let bound_agent = bound_agent.clone();
+                async move {
+                    let request = request.map(Body::new);
+                    let request = match guard_bound_request(request, bound_agent.as_deref()).await {
+                        Ok(request) => request,
+                        Err(error) => {
+                            return Ok::<_, std::convert::Infallible>(error.into_response());
+                        }
+                    };
+                    app.oneshot(request).await
+                }
             });
             let _ = http1::Builder::new()
                 .serve_connection(TokioIo::new(stream), service)
@@ -2715,6 +2830,83 @@ pub async fn serve_unix(socket: &Path, app: Router) -> anyhow::Result<()> {
                 .await;
         });
     }
+}
+
+#[cfg(target_os = "linux")]
+fn harness_ancestor(mut pid: u32) -> Option<String> {
+    use std::collections::BTreeSet;
+    let mut seen = BTreeSet::new();
+    while pid > 1 && pid != std::process::id() && seen.insert(pid) {
+        let environment = fs::read(format!("/proc/{pid}/environ")).ok()?;
+        if let Some(agent) = environment.split(|byte| *byte == 0).find_map(|entry| {
+            std::str::from_utf8(entry)
+                .ok()?
+                .strip_prefix("ST_AGENT=")
+                .filter(|value| value.starts_with("agent/"))
+                .map(str::to_owned)
+        }) {
+            return Some(agent);
+        }
+        let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        pid = stat
+            .rsplit_once(") ")?
+            .1
+            .split_whitespace()
+            .nth(1)?
+            .parse()
+            .ok()?;
+    }
+    None
+}
+
+#[cfg(not(target_os = "linux"))]
+fn harness_ancestor(_pid: u32) -> Option<String> {
+    None
+}
+
+async fn guard_bound_request(
+    request: Request<Body>,
+    bound_agent: Option<&str>,
+) -> Result<Request<Body>, ApiError> {
+    let Some(bound_agent) = bound_agent else {
+        return Ok(request);
+    };
+    if request.method() == axum::http::Method::GET {
+        return Ok(request);
+    }
+    let path = request.uri().path();
+    if ![
+        "/v1/intent/apply",
+        "/v1/agent-queue-moves",
+        "/v1/work/",
+        "/v1/attention",
+        "/v1/launches",
+        "/v1/mission-runs/start",
+        "/v1/claims",
+        "/v1/diagnostic",
+    ]
+    .iter()
+    .any(|prefix| path.starts_with(prefix))
+    {
+        return Ok(request);
+    }
+    let (parts, body) = request.into_parts();
+    let bytes = axum::body::to_bytes(body, 16 * 1024 * 1024)
+        .await
+        .map_err(ApiError::internal)?;
+    if let Ok(value) = serde_json::from_slice::<Value>(&bytes) {
+        for key in ["actor", "requester"] {
+            if let Some(actor) = value.get(key).and_then(Value::as_str)
+                && actor != bound_agent
+            {
+                return Err(ApiError::bad(St3Error::new(
+                    "foreign-agent-actor",
+                    format!("this harness is `{bound_agent}` and cannot act as `{actor}`"),
+                )));
+            }
+        }
+    }
+    Ok(Request::from_parts(parts, Body::from(bytes)))
 }
 
 pub async fn serve_tcp(address: &str, app: Router) -> anyhow::Result<()> {
@@ -4852,9 +5044,43 @@ async fn apply(
                 .with_detail("agent", granted.subject.clone()),
             ));
         }
+        for desired in intent.subjects.values() {
+            if desired.subject.starts_with("agent/")
+                && matches!(desired.kind.as_str(), "agent" | "stop")
+            {
+                require_agent_seat_authority(
+                    &state,
+                    actor,
+                    if desired.kind == "stop" {
+                        "stop"
+                    } else {
+                        "declare"
+                    },
+                    &desired.subject,
+                )?;
+            }
+        }
+        refuse_agent_granted_mission_authority(&state, &intent, actor)?;
     }
     for declaration in intent.mission_runs.values() {
         if let Some(creation) = &declaration.creation {
+            if creation.requester == "person/requester" {
+                return Err(ApiError::bad(St3Error::new(
+                    "placeholder-run-requester",
+                    "a mission run needs a concrete requester, not `person/requester`",
+                )));
+            }
+            if let Some(agent) = normalized_agent_actor(actor)
+                && creation.requester != agent
+            {
+                return Err(ApiError::bad(St3Error::new(
+                    "run-requester-actor-mismatch",
+                    format!(
+                        "`{actor}` cannot create a run for requester `{}`",
+                        creation.requester
+                    ),
+                )));
+            }
             require_agent_mission_authority(&state, actor, "start", &creation.mission)?;
         }
         for revision in declaration.revisions.values() {
@@ -5231,13 +5457,14 @@ async fn list_attention(
 
 async fn request_attention(
     State(state): State<AppState>,
-    Json(request): Json<AttentionRequest>,
+    Json(post): Json<crate::model::AttentionRequestPost>,
 ) -> Result<Json<AttentionRequestView>, ApiError> {
+    let request: &AttentionRequest = &post.request;
     let id = hex::encode(Sha256::digest(request.idempotency_key.as_bytes()));
     let subject = format!("attention/{}", &id[..32]);
     let response = state
         .store
-        .request_attention(&subject, &request)
+        .request_attention_until(&subject, request, post.until.as_deref())
         .map_err(ApiError::bad)?;
     signal_changed(&state);
     Ok(Json(response))
@@ -5252,6 +5479,40 @@ async fn resolve_attention(
         .store
         .resolve_attention(&subject, &request)
         .map_err(ApiError::bad)?;
+    signal_changed(&state);
+    Ok(Json(response))
+}
+
+#[derive(Deserialize)]
+struct SubscriptionRequestQuery {
+    subscription: String,
+}
+
+async fn list_subscription_requests(
+    State(state): State<AppState>,
+    Query(query): Query<SubscriptionRequestQuery>,
+) -> Result<Json<Vec<crate::model::SubscriptionRequestView>>, ApiError> {
+    let subscription = if query.subscription.starts_with("subscription/") {
+        query.subscription
+    } else {
+        format!("subscription/{}", query.subscription)
+    };
+    let store = state.store.clone();
+    blocking_store(move || store.subscription_requests(&subscription))
+        .await
+        .map(Json)
+}
+
+/// Release a held subscription request or cancel an open one as a person.
+async fn decide_subscription_request(
+    State(state): State<AppState>,
+    AxumPath((decision, request)): AxumPath<(String, String)>,
+    Json(input): Json<crate::model::SubscriptionRequestDecision>,
+) -> Result<Json<crate::model::SubscriptionRequestView>, ApiError> {
+    let store = state.store.clone();
+    let response =
+        blocking_action(move || store.decide_subscription_request(&request, &decision, &input))
+            .await?;
     signal_changed(&state);
     Ok(Json(response))
 }
@@ -6129,7 +6390,18 @@ async fn start_mission_run_action(
     State(state): State<AppState>,
     Json(request): Json<MissionRunRequest>,
 ) -> Result<Json<MissionRunView>, ApiError> {
-    let requester = request.requester.as_deref().unwrap_or("person/requester");
+    let requester = request.requester.as_deref().ok_or_else(|| {
+        ApiError::bad(St3Error::new(
+            "missing-run-requester",
+            "a mission run needs an explicit requester",
+        ))
+    })?;
+    if requester == "person/requester" {
+        return Err(ApiError::bad(St3Error::new(
+            "placeholder-run-requester",
+            "a mission run needs a concrete requester, not `person/requester`",
+        )));
+    }
     require_agent_mission_authority(&state, requester, "start", &request.mission)?;
     let response = state
         .store
@@ -6247,6 +6519,9 @@ async fn revise_mission_run(
         format!("agent/{}", request.actor)
     };
     require_agent_mission_authority(&state, &actor, "revise", mission_id)?;
+    if normalized_agent_actor(&actor).is_some() {
+        refuse_agent_widened_mission_authority(&state, &actor, replacement, Some(&old))?;
+    }
     let (_, reviewers) = crate::store::analyze_mission_revision(
         &old,
         replacement,
@@ -6281,44 +6556,47 @@ async fn revise_mission_run(
             &format!("{}:publish", request.idempotency_key),
         )
         .map_err(ApiError::bad)?;
-    let revised =
-        if reviewers.is_empty() && matches!(old.revision_cutover, RevisionCutover::RestartActive) {
-            let mission_run = state
+    // A failed run has no active work to drain, so it adopts an unreviewed revision now.
+    let reopening = current.status == "failed" && current.phase == "terminal";
+    let revised = if reviewers.is_empty()
+        && (reopening || matches!(old.revision_cutover, RevisionCutover::RestartActive))
+    {
+        let mission_run = state
+            .store
+            .adopt_mission_revision(
+                &run,
+                replacement,
+                &actor,
+                &request.reason,
+                &format!("{}:adopt", request.idempotency_key),
+            )
+            .map_err(ApiError::bad)?;
+        RevisionSubmissionView {
+            status: "applied".into(),
+            mission_run,
+            proposal: None,
+        }
+    } else {
+        let proposal = state
+            .store
+            .create_revision_proposal(
+                &run,
+                replacement,
+                &actor,
+                &request.reason,
+                &format!("{}:propose", request.idempotency_key),
+            )
+            .map_err(ApiError::bad)?;
+        RevisionSubmissionView {
+            status: proposal.status.clone(),
+            mission_run: state
                 .store
-                .adopt_mission_revision(
-                    &run,
-                    replacement,
-                    &actor,
-                    &request.reason,
-                    &format!("{}:adopt", request.idempotency_key),
-                )
-                .map_err(ApiError::bad)?;
-            RevisionSubmissionView {
-                status: "applied".into(),
-                mission_run,
-                proposal: None,
-            }
-        } else {
-            let proposal = state
-                .store
-                .create_revision_proposal(
-                    &run,
-                    replacement,
-                    &actor,
-                    &request.reason,
-                    &format!("{}:propose", request.idempotency_key),
-                )
-                .map_err(ApiError::bad)?;
-            RevisionSubmissionView {
-                status: proposal.status.clone(),
-                mission_run: state
-                    .store
-                    .mission_run(&run)
-                    .map_err(ApiError::internal)?
-                    .expect("the revised mission run exists"),
-                proposal: Some(proposal),
-            }
-        };
+                .mission_run(&run)
+                .map_err(ApiError::internal)?
+                .expect("the revised mission run exists"),
+            proposal: Some(proposal),
+        }
+    };
     signal_changed(&state);
     Ok(Json(revised))
 }
@@ -6516,6 +6794,35 @@ async fn wake_work(
             "a manual work wake needs a reason",
         )));
     }
+    let step = state
+        .store
+        .step_run(&subject)
+        .map_err(ApiError::internal)?
+        .ok_or_else(|| ApiError::not_found(format!("step run `{subject}` does not exist")))?;
+    let agent = step.assigned_to.as_deref().ok_or_else(|| {
+        ApiError::bad(St3Error::new(
+            "work-has-no-assignee",
+            format!("step run `{}` has no exact assignee to wake", step.subject),
+        ))
+    })?;
+    let allowed = request
+        .actor
+        .strip_prefix("person/")
+        .is_some_and(|name| !name.is_empty() && !name.contains('/'))
+        || normalized_agent_actor(&request.actor).is_some_and(|actor| {
+            actor == agent
+                || current_agent_declaration(&state, &actor, "missing-agent-queue-authority")
+                    .ok()
+                    .is_some_and(|desired| {
+                        crate::graph::agent_queue_authority(&desired).allows_move(agent)
+                    })
+        });
+    if !allowed {
+        return Err(ApiError::bad(St3Error::new(
+            "work-wake-authority-denied",
+            format!("`{}` cannot wake work assigned to `{agent}`", request.actor),
+        )));
+    }
     if let Some(existing) = state
         .store
         .operation_claim(&request.idempotency_key)
@@ -6530,11 +6837,6 @@ async fn wake_work(
             .ok_or_else(|| ApiError::internal("the wake operation message is unavailable"))?;
         return Ok(Json(message));
     }
-    let step = state
-        .store
-        .step_run(&subject)
-        .map_err(ApiError::internal)?
-        .ok_or_else(|| ApiError::not_found(format!("step run `{subject}` does not exist")))?;
     if step.status != "ready" {
         return Err(ApiError::bad(St3Error::new(
             "work-not-ready",
@@ -6544,12 +6846,6 @@ async fn wake_work(
             ),
         )));
     }
-    let agent = step.assigned_to.as_deref().ok_or_else(|| {
-        ApiError::bad(St3Error::new(
-            "work-has-no-assignee",
-            format!("step run `{}` has no exact assignee to wake", step.subject),
-        ))
-    })?;
     let harness = state
         .store
         .current_harness(agent)
@@ -6581,6 +6877,54 @@ async fn wake_work(
     .map_err(ApiError::internal)?;
     signal_changed(&state);
     Ok(Json(message))
+}
+
+/// Retry one failed step as a person or as an agent that may revise its mission.
+async fn retry_work(
+    State(state): State<AppState>,
+    AxumPath(subject): AxumPath<String>,
+    Json(request): Json<WorkRetryRequest>,
+) -> Result<Json<MissionRunView>, ApiError> {
+    if request.reason.trim().is_empty() {
+        return Err(ApiError::bad(St3Error::new(
+            "missing-retry-reason",
+            "a work retry needs a reason",
+        )));
+    }
+    if let Some(cached) = state
+        .store
+        .cached_idempotency_response::<MissionRunView>(&request.idempotency_key)
+        .map_err(ApiError::internal)?
+    {
+        return Ok(Json(cached));
+    }
+    let actor = match request.actor.as_str() {
+        actor if actor.starts_with("person/") => actor.to_owned(),
+        actor => normalized_agent_actor(actor).ok_or_else(|| {
+            ApiError::bad(St3Error::new(
+                "retry-authority-denied",
+                "a work retry needs a person or an agent with mission revise authority",
+            ))
+        })?,
+    };
+    let step = state
+        .store
+        .step_run(&subject)
+        .map_err(ApiError::internal)?
+        .ok_or_else(|| ApiError::not_found(format!("step run `{subject}` does not exist")))?;
+    let run = state
+        .store
+        .mission_run(&step.run)
+        .map_err(ApiError::internal)?
+        .ok_or_else(|| ApiError::not_found(format!("mission run `{}` does not exist", step.run)))?;
+    require_agent_mission_authority(&state, &actor, "revise", &run.mission)?;
+    let store = state.store.clone();
+    let retried = blocking_action(move || {
+        store.retry_failed_step(&subject, &actor, &request.reason, &request.idempotency_key)
+    })
+    .await?;
+    signal_changed(&state);
+    Ok(Json(retried))
 }
 
 async fn publish_work_mission(
@@ -6663,6 +7007,7 @@ async fn publish_work_mission(
     let resolved_kdl =
         resolve_document_references(&request.intent.kdl, &bindings).map_err(ApiError::bad)?;
     let intent = parse_intent(&resolved_kdl, &state.node).map_err(ApiError::bad)?;
+    refuse_agent_granted_mission_authority(&state, &intent, &actor)?;
     let mission = intent
         .missions
         .values()
@@ -6716,6 +7061,62 @@ async fn publish_work_mission(
         .map_err(ApiError::bad)?;
     signal_changed(&state);
     Ok(Json(output))
+}
+
+/// Only a person grants authority. A mission an agent publishes or revises may not declare an
+/// agent, at any depth, whose `mission-authority` or `queue-authority` differs from the grant
+/// already published for that agent; otherwise a narrow `publish` and `start` grant becomes any
+/// authority the agent writes into a run's seat.
+fn refuse_agent_widened_mission_authority(
+    state: &AppState,
+    actor: &str,
+    mission: &crate::model::MissionSpec,
+    current: Option<&crate::model::MissionSpec>,
+) -> Result<(), ApiError> {
+    let proposed = crate::graph::mission_declared_authority_grants(mission, &state.node)
+        .map_err(ApiError::bad)?;
+    if proposed.is_empty() {
+        return Ok(());
+    }
+    let published = current
+        .map(|current| crate::graph::mission_declared_authority_grants(current, &state.node))
+        .transpose()
+        .map_err(ApiError::bad)?
+        .unwrap_or_default();
+    for (subject, grant) in &proposed {
+        if published.get(subject) != Some(grant) {
+            return Err(ApiError::bad(
+                St3Error::new(
+                    "agent-authority-grant-denied",
+                    format!(
+                        "`{actor}` cannot grant authority in the declaration of `{subject}`; only a person can"
+                    ),
+                )
+                .with_detail("agent", subject.clone()),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// `refuse_agent_widened_mission_authority` for every top-level mission of one publication,
+/// against the mission revision currently published under the same ID.
+fn refuse_agent_granted_mission_authority(
+    state: &AppState,
+    intent: &crate::model::NormalizedIntent,
+    actor: &str,
+) -> Result<(), ApiError> {
+    for id in crate::mission::top_level_mission_ids(&intent.missions) {
+        let Some(mission) = intent.missions.get(&id) else {
+            continue;
+        };
+        let current = state
+            .store
+            .mission_spec(&id, None)
+            .map_err(ApiError::internal)?;
+        refuse_agent_widened_mission_authority(state, actor, mission, current.as_ref())?;
+    }
+    Ok(())
 }
 
 /// The actor's current desired agent declaration, which is where a person grants it authority.
@@ -6781,6 +7182,27 @@ fn require_agent_queue_authority(
                 format!("`{actor}` cannot move runs in the queue of `{seat}`"),
             )
             .with_detail("actor", actor.clone())
+            .with_detail("agent", seat.to_owned()),
+        ))
+    }
+}
+
+fn require_agent_seat_authority(
+    state: &AppState,
+    actor: &str,
+    action: &str,
+    seat: &str,
+) -> Result<(), ApiError> {
+    let desired = current_agent_declaration(state, actor, "missing-agent-seat-authority")?;
+    if crate::graph::agent_seat_authority(&desired).allows(action, seat) {
+        Ok(())
+    } else {
+        Err(ApiError::bad(
+            St3Error::new(
+                "agent-seat-publication-denied",
+                format!("`{actor}` cannot {action} seat `{seat}`"),
+            )
+            .with_detail("actor", actor.to_owned())
             .with_detail("agent", seat.to_owned()),
         ))
     }
@@ -7833,6 +8255,85 @@ mod tests {
     use axum::body::to_bytes;
     use axum::http::Request;
     use std::path::PathBuf;
+
+    #[tokio::test]
+    async fn a_bound_harness_cannot_post_a_queue_move_as_another_actor() {
+        for path in [
+            "/v1/agent-queue-moves",
+            "/v1/work/revision/approve/proposal",
+        ] {
+            for actor in ["agent/peer", "person/operator"] {
+                let request = Request::builder()
+                    .method("POST")
+                    .uri(path)
+                    .body(Body::from(
+                        json!({"actor": actor, "agent": "agent/worker"}).to_string(),
+                    ))
+                    .unwrap();
+                let error = match guard_bound_request(request, Some("agent/own")).await {
+                    Ok(_) => panic!("bound harness acted as {actor} at {path}"),
+                    Err(error) => error,
+                };
+                assert_eq!(error.code, "foreign-agent-actor");
+            }
+        }
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/agent-queue-moves")
+            .body(Body::from(json!({"actor": "agent/own"}).to_string()))
+            .unwrap();
+        assert!(
+            guard_bound_request(request, Some("agent/own"))
+                .await
+                .is_ok()
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_unix_peer_is_bound_to_its_harness_environment() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("10")
+            .env("ST_AGENT", "agent/fixture/worker")
+            .spawn()
+            .unwrap();
+        let mut bound = None;
+        for _ in 0..50 {
+            bound = harness_ancestor(child.id());
+            if bound.is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(bound.as_deref(), Some("agent/fixture/worker"));
+        child.kill().unwrap();
+        child.wait().unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_run_start_api_refuses_placeholder_requesters() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        for requester in [None, Some("person/requester".to_owned())] {
+            let request = MissionRunRequest {
+                mission: "demo".into(),
+                revision: None,
+                workspace: root.path().display().to_string(),
+                requester,
+                mode: Some("run".into()),
+                inputs: BTreeMap::new(),
+                idempotency_key: "placeholder-run".into(),
+            };
+            let error = match start_mission_run_action(State(state.clone()), Json(request)).await {
+                Ok(_) => panic!("placeholder requester created a run"),
+                Err(error) => error,
+            };
+            assert!(matches!(
+                error.code.as_str(),
+                "missing-run-requester" | "placeholder-run-requester"
+            ));
+        }
+    }
 
     #[test]
     fn owner_cursor_expiry_remains_a_typed_retryable_gateway_error() {
@@ -9350,6 +9851,39 @@ mission "planned/direct" state="ready" {
     }
 
     #[test]
+    fn an_agent_known_only_from_its_own_harness_observations_is_history() {
+        let root = tempfile::tempdir().unwrap();
+        let store = state(root.path()).store;
+        let subject = "agent/diagnostic-run/sig.base";
+        store
+            .append_claim(&ClaimInput {
+                subject: subject.into(),
+                kind: "harness.observed".into(),
+                actor: Some(subject.into()),
+                fields: BTreeMap::from([
+                    ("state".into(), Value::String("idle".into())),
+                    ("driver".into(), Value::String("codex".into())),
+                    ("incarnation_id".into(), Value::String("sig-1".into())),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some("sig-base-observed".into()),
+            })
+            .unwrap();
+        let current =
+            client_agent_resources(&store, false, "snapshot", store.index().unwrap()).unwrap();
+        assert!(
+            current.iter().all(|agent| agent["id"] != subject),
+            "{current:?}"
+        );
+        let history =
+            client_agent_resources(&store, true, "snapshot", store.index().unwrap()).unwrap();
+        let agent = history.iter().find(|agent| agent["id"] == subject).unwrap();
+        assert_eq!(agent["operational"]["layer"], "history");
+        assert_eq!(agent["operational"]["reasons"], json!(["undeclared"]));
+    }
+
+    #[test]
     fn client_work_projection_includes_agentless_mission_steps() {
         let root = tempfile::tempdir().unwrap();
         let workspace = root.path().join("workspace");
@@ -10508,9 +11042,40 @@ mission "wake" state="ready" {
         assert_eq!(status, StatusCode::OK, "{repeated}");
         assert_eq!(repeated["subject"], first["subject"]);
         assert_eq!(state.store.messages(Some(&agent), true).unwrap().len(), 1);
+        let app = router(state.clone());
+        let (status, denied) = json_request(
+            app.clone(),
+            &path,
+            serde_json::to_value(WorkWakeRequest {
+                actor: "agent/other".into(),
+                reason: "unrelated agent attempted a wake".into(),
+                idempotency_key: "manual-wake-foreign".into(),
+            })
+            .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{denied}");
+        assert_eq!(denied["code"], "work-wake-authority-denied");
+        for n in 2..=3 {
+            let (status, wake) = json_request(
+                app.clone(),
+                &path,
+                serde_json::to_value(WorkWakeRequest {
+                    actor: "person/operator".into(),
+                    reason: "retry the manual delivery".into(),
+                    idempotency_key: format!("manual-wake-request-{n}"),
+                })
+                .unwrap(),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{wake}");
+        }
         let projected = state.store.step_run(&step.subject).unwrap().unwrap();
         let wake = projected.wake.expect("wake projection");
-        assert_eq!(wake.attempts, 1);
+        assert_eq!(
+            wake.attempts, 0,
+            "manual wakes must not use automatic attempts"
+        );
         assert_eq!(wake.assignee_state, "idle");
     }
 
@@ -10652,6 +11217,88 @@ mission "agent-health" state="ready" {
         assert_eq!(resources[0]["operational"]["layer"], "current");
     }
 
+    #[test]
+    fn an_unauthenticated_harness_is_waiting_not_starting() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let store = state.store.clone();
+        let source = r#"
+version 2
+mission "agent-auth" state="ready" {
+  goal "Exercise an unauthenticated harness."
+  agent "worker" { workspace "/tmp"; harness "claude" {} }
+  step "queued" { assigned-to "agent/${ST_MISSION_RUN}/worker" }
+}
+"#;
+        let intent = parse_intent(source, "node").unwrap();
+        let planned = store
+            .mission(
+                &intent,
+                crate::model::IntentInput {
+                    kdl: source.into(),
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        store
+            .apply(&intent, &planned.subject_tokens, "agent-auth-source")
+            .unwrap();
+        let run = store
+            .create_mission_run(&MissionRunRequest {
+                mission: "agent-auth".into(),
+                revision: None,
+                workspace: "/tmp".into(),
+                requester: Some("person/test".into()),
+                mode: Some("run".into()),
+                inputs: BTreeMap::new(),
+                idempotency_key: "agent-auth-run".into(),
+            })
+            .unwrap();
+        materialize_run_agents(&state, &run);
+        let subject = format!("agent/{}/worker", run.id);
+        for (kind, fields, key) in [
+            (
+                "runtime.observed",
+                BTreeMap::from([
+                    ("status".into(), Value::String("running".into())),
+                    ("runtime_id".into(), Value::String("node.worker".into())),
+                    ("incarnation_id".into(), Value::String("worker-1".into())),
+                ]),
+                "agent-auth-runtime",
+            ),
+            (
+                "harness.diagnostic",
+                BTreeMap::from([
+                    ("severity".into(), Value::String("error".into())),
+                    ("status".into(), Value::String("unauthenticated".into())),
+                    ("code".into(), Value::String("provider-auth-expired".into())),
+                    (
+                        "reason".into(),
+                        Value::String("Claude reports an expired login".into()),
+                    ),
+                    ("incarnation_id".into(), Value::String("worker-1".into())),
+                ]),
+                "agent-auth-expired",
+            ),
+        ] {
+            store
+                .append_claim(&ClaimInput {
+                    subject: subject.clone(),
+                    kind: kind.into(),
+                    actor: (kind == "harness.diagnostic").then(|| subject.clone()),
+                    fields,
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: Some(key.into()),
+                })
+                .unwrap();
+        }
+        let resources =
+            client_agent_resources(&store, false, "snapshot", store.index().unwrap()).unwrap();
+        assert_eq!(resources[0]["harness_state"], "unauthenticated");
+        assert_eq!(resources[0]["state"], "waiting");
+    }
+
     #[tokio::test]
     async fn a_mission_revision_requires_current_agent_authority() {
         let root = tempfile::tempdir().unwrap();
@@ -10735,6 +11382,88 @@ version 2
         assert_eq!(revised["mission_run"]["root_revision"], run.root_revision);
         assert_eq!(revised["mission_run"]["steps"][0]["status"], "pending");
         assert_eq!(state.store.desired_subjects().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_work_retry_needs_a_person_or_mission_revise_authority() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let source = r#"
+version 2
+
+  mission "retry" state="ready" {
+    goal "Retry one failed check."
+    agent "sup" {
+      workspace "."
+      command "true"
+      mission-authority { revise "retry" }
+    }
+    agent "worker" { workspace "."; command "true" }
+    step "check" { goal "Run the check." }
+  }
+
+"#;
+        let intent = parse_intent(source, "node").unwrap();
+        let planned = state
+            .store
+            .mission(
+                &intent,
+                crate::model::IntentInput {
+                    kdl: source.into(),
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        state
+            .store
+            .apply(&intent, &planned.subject_tokens, "retry-mission")
+            .unwrap();
+        let run = state
+            .store
+            .create_mission_run(&MissionRunRequest {
+                mission: "retry".into(),
+                revision: None,
+                workspace: root.path().display().to_string(),
+                requester: Some("person/test".into()),
+                mode: Some("run".into()),
+                inputs: BTreeMap::new(),
+                idempotency_key: "retry-run".into(),
+            })
+            .unwrap();
+        materialize_run_agents(&state, &run);
+        let check = run.steps[0].subject.clone();
+        state
+            .store
+            .set_step_state(&check, "failed", Some("the check failed"))
+            .unwrap();
+        let retry = |actor: String, key: &str| {
+            serde_json::to_value(WorkRetryRequest {
+                actor,
+                reason: "the check host is back".into(),
+                idempotency_key: key.into(),
+            })
+            .unwrap()
+        };
+        let path = format!("/v1/work/retry/{}", urlencoding::encode(&check));
+
+        let (status, denied) = json_request(
+            router(state.clone()),
+            &path,
+            retry(format!("agent/{}/worker", run.id), "retry-worker"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{denied}");
+        assert_eq!(denied["code"], "mission-authority-denied");
+
+        let (status, retried) = json_request(
+            router(state.clone()),
+            &path,
+            retry(format!("agent/{}/sup", run.id), "retry-sup"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{retried}");
+        assert_eq!(retried["steps"][0]["status"], "pending");
+        assert_eq!(retried["steps"][0]["attempt"], 2);
     }
 
     #[tokio::test]
@@ -10952,6 +11681,406 @@ mission "authority-self-grant" state="ready" {
         assert_eq!(body["code"], "mission-authority-denied");
     }
 
+    /// Review 2026-09-27 area 1: any agent can replace another seat's top-level declaration.
+    /// The replacement cannot carry authority, so it silently strips the grant a person gave.
+    #[tokio::test]
+    async fn review_an_agent_redeclares_another_seat_and_strips_its_grant() {
+        const SEAT: &str = "agent/fleet/worker";
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let source = r#"
+version 2
+
+agent "fleet/worker" { workspace "."; command "true"; }
+agent "fleet/chief" {
+  workspace "."
+  command "true"
+  queue-authority { move "fleet/worker" }
+}
+agent "fleet/helper" { workspace "."; command "true"; }
+mission "queued" state="ready" {
+  concurrent-runs
+  goal "Give the durable seat one step in each run."
+  step "work" { assigned-to "agent/fleet/worker" }
+}
+"#;
+        let intent = parse_intent(source, "node").unwrap();
+        let preview = state
+            .store
+            .mission(
+                &intent,
+                crate::model::IntentInput {
+                    kdl: source.into(),
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        state
+            .store
+            .apply(&intent, &preview.subject_tokens, "seat-redeclare")
+            .unwrap();
+        let start = |key: &str| {
+            std::thread::sleep(Duration::from_millis(2));
+            state
+                .store
+                .create_mission_run(&MissionRunRequest {
+                    mission: "queued".into(),
+                    revision: None,
+                    workspace: root.path().display().to_string(),
+                    requester: Some("person/test".into()),
+                    mode: Some("run".into()),
+                    inputs: BTreeMap::new(),
+                    idempotency_key: key.into(),
+                })
+                .unwrap()
+        };
+        let first = start("seat-redeclare-first").subject;
+        let second = start("seat-redeclare-second").subject;
+        let app = router(state.clone());
+        let promote = |actor: &str, key: &str| {
+            json!({
+                "agent": SEAT,
+                "run": second,
+                "placement": "top",
+                "actor": actor,
+                "idempotency_key": key,
+            })
+        };
+
+        // The helper, a seat with no grant of any kind, replaces the chief's declaration with
+        // one that changes its command and drops its queue authority.
+        let (status, body) = json_request(
+            app.clone(),
+            "/v1/intent/apply",
+            serde_json::to_value(apply_request(
+                &state,
+                "version 2\nagent \"fleet/chief\" { workspace \".\"; command \"sh -c 'echo replaced'\"; }\n",
+                "agent/fleet/helper",
+                "helper-redeclares-chief",
+            ))
+            .unwrap(),
+        )
+        .await;
+        eprintln!("REVIEW helper redeclares chief: {status} {body}");
+        // And stops the worker seat outright.
+        let (stop_status, stop_body) = json_request(
+            app.clone(),
+            "/v1/intent/apply",
+            serde_json::to_value(apply_request(
+                &state,
+                "version 2\nstop \"agent/fleet/worker\"\n",
+                "agent/fleet/helper",
+                "helper-stops-worker",
+            ))
+            .unwrap(),
+        )
+        .await;
+        eprintln!("REVIEW helper stops worker: {stop_status} {stop_body}");
+        let (move_status, move_body) = json_request(
+            app,
+            "/v1/agent-queue-moves",
+            promote("agent/fleet/chief", "chief-after-redeclare"),
+        )
+        .await;
+        eprintln!("REVIEW chief move after redeclare: {move_status} {move_body}");
+        assert_eq!(
+            status,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "an agent must not replace another seat's declaration: {body}"
+        );
+        assert_eq!(body["code"], "agent-seat-publication-denied");
+        assert_eq!(stop_status, StatusCode::UNPROCESSABLE_ENTITY, "{stop_body}");
+        assert_eq!(stop_body["code"], "agent-seat-publication-denied");
+        assert_eq!(
+            move_status,
+            StatusCode::OK,
+            "the chief keeps its grant: {move_body}"
+        );
+        let _ = first;
+    }
+
+    #[tokio::test]
+    async fn agent_with_seat_authority_can_declare_and_stop_only_granted_seats() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let source = r#"
+version 2
+agent "fleet/builder" {
+  workspace "."
+  command "true"
+  seat-authority { declare "fleet/workers/*"; stop "fleet/workers/*" }
+}
+"#;
+        let intent = parse_intent(source, "node").unwrap();
+        let preview = state
+            .store
+            .mission(
+                &intent,
+                crate::model::IntentInput {
+                    kdl: source.into(),
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        state
+            .store
+            .apply(&intent, &preview.subject_tokens, "seat-grant")
+            .unwrap();
+        let app = router(state.clone());
+        let actor = "agent/fleet/builder";
+        for (source, key) in [
+            (
+                "version 2\nagent \"fleet/workers/one\" { workspace \".\"; command \"true\" }\n",
+                "declare-granted",
+            ),
+            (
+                "version 2\nstop \"agent/fleet/workers/one\"\n",
+                "stop-granted",
+            ),
+        ] {
+            let (status, body) = json_request(
+                app.clone(),
+                "/v1/intent/apply",
+                serde_json::to_value(apply_request(&state, source, actor, key)).unwrap(),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+        }
+        let (status, body) = json_request(
+            app,
+            "/v1/intent/apply",
+            serde_json::to_value(apply_request(
+                &state,
+                "version 2\nagent \"fleet/chief\" { workspace \".\"; command \"true\" }\n",
+                actor,
+                "declare-ungranted",
+            ))
+            .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        assert_eq!(body["code"], "agent-seat-publication-denied");
+    }
+
+    /// Review 2026-09-27 area 1: an agent with a namespace publish grant must not be able to
+    /// publish a mission whose own agent declaration carries authority nobody granted.
+    #[tokio::test]
+    async fn review_an_agent_cannot_grant_authority_through_a_published_mission() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let source = r#"
+version 2
+
+mission "grant-host" state="ready" {
+  goal "Hold one planner with a narrow publish and start grant."
+  agent "planner" {
+    workspace "."
+    command "true"
+    mission-authority { publish "gen/*"; start "gen/*" }
+  }
+}
+"#;
+        let intent = parse_intent(source, "node").unwrap();
+        let preview = state
+            .store
+            .mission(
+                &intent,
+                crate::model::IntentInput {
+                    kdl: source.into(),
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        state
+            .store
+            .apply(&intent, &preview.subject_tokens, "grant-host")
+            .unwrap();
+        let host = state
+            .store
+            .create_mission_run(&MissionRunRequest {
+                mission: "grant-host".into(),
+                revision: None,
+                workspace: root.path().display().to_string(),
+                requester: Some("person/test".into()),
+                mode: Some("run".into()),
+                inputs: BTreeMap::new(),
+                idempotency_key: "grant-host-run".into(),
+            })
+            .unwrap();
+        materialize_run_agents(&state, &host);
+        let planner = format!("agent/{}/planner", host.id);
+        let app = router(state.clone());
+
+        // The planner publishes a mission inside its namespace. The mission's own agent
+        // declaration grants fleet-wide authority the planner does not hold.
+        let escalate = r#"version 2
+mission "gen/escalate" state="ready" {
+  goal "Carry authority the publisher does not hold."
+  agent "boss" {
+    workspace "."
+    command "true"
+    mission-authority { publish "victim"; start "victim"; revise "victim" }
+    queue-authority { move "fleet/*" }
+  }
+  step "work" { assigned-to "agent/${ST_MISSION_RUN}/boss" }
+}
+"#;
+        let (status, body) = json_request(
+            app.clone(),
+            "/v1/intent/apply",
+            serde_json::to_value(apply_request(
+                &state,
+                escalate,
+                &planner,
+                "escalate-publish",
+            ))
+            .unwrap(),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "an agent publication must not grant authority: {body}"
+        );
+        assert_eq!(body["code"], "agent-authority-grant-denied", "{body}");
+    }
+
+    /// Review 2026-09-27 area 1: the consequence of the accepted publication above. The
+    /// planner starts the run with its own `start` grant, and the run's agent holds the
+    /// escalated authority.
+    #[tokio::test]
+    async fn review_escalated_run_agent_holds_authority_nobody_granted() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let source = r#"
+version 2
+
+mission "grant-host" state="ready" {
+  goal "Hold one planner with a narrow publish and start grant."
+  agent "planner" {
+    workspace "."
+    command "true"
+    mission-authority { publish "gen/*"; start "gen/*" }
+  }
+}
+"#;
+        let intent = parse_intent(source, "node").unwrap();
+        let preview = state
+            .store
+            .mission(
+                &intent,
+                crate::model::IntentInput {
+                    kdl: source.into(),
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        state
+            .store
+            .apply(&intent, &preview.subject_tokens, "grant-host")
+            .unwrap();
+        let host = state
+            .store
+            .create_mission_run(&MissionRunRequest {
+                mission: "grant-host".into(),
+                revision: None,
+                workspace: root.path().display().to_string(),
+                requester: Some("person/test".into()),
+                mode: Some("run".into()),
+                inputs: BTreeMap::new(),
+                idempotency_key: "grant-host-run".into(),
+            })
+            .unwrap();
+        materialize_run_agents(&state, &host);
+        let planner = format!("agent/{}/planner", host.id);
+        let app = router(state.clone());
+        let escalate = r#"version 2
+mission "gen/escalate" state="ready" {
+  goal "Carry authority the publisher does not hold."
+  agent "boss" {
+    workspace "."
+    command "true"
+    mission-authority { publish "victim"; start "victim"; revise "victim" }
+    queue-authority { move "fleet/*" }
+  }
+  step "work" { assigned-to "agent/${ST_MISSION_RUN}/boss" }
+}
+"#;
+        let (status, body) = json_request(
+            app.clone(),
+            "/v1/intent/apply",
+            serde_json::to_value(apply_request(
+                &state,
+                escalate,
+                &planner,
+                "escalate-publish",
+            ))
+            .unwrap(),
+        )
+        .await;
+        eprintln!("REVIEW publish by planner: {status} {body}");
+        if status != StatusCode::OK {
+            return;
+        }
+        let revision = state
+            .store
+            .mission_spec("gen/escalate", None)
+            .unwrap()
+            .unwrap()
+            .revision;
+        let start = format!(
+            "version 2\nmission-run \"gen/escalate/one\" {{\n  mission {:?}\n  workspace {:?}\n  requester {planner:?}\n}}\n",
+            format!("mission/gen/escalate@{revision}"),
+            root.path().display().to_string(),
+        );
+        let (status, body) = json_request(
+            app.clone(),
+            "/v1/intent/apply",
+            serde_json::to_value(apply_request(&state, &start, &planner, "escalate-start"))
+                .unwrap(),
+        )
+        .await;
+        eprintln!("REVIEW start by planner: {status} {body}");
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let run = state
+            .store
+            .mission_run("gen/escalate/one")
+            .unwrap()
+            .unwrap();
+        materialize_run_agents(&state, &run);
+        let boss = format!("agent/{}/boss", run.id);
+        let desired = state
+            .store
+            .desired_subjects()
+            .unwrap()
+            .into_iter()
+            .find(|desired| desired.kind == "agent" && desired.subject == boss)
+            .expect("the run agent is declared");
+        let mission_authority = crate::graph::agent_mission_authority(&desired.desired);
+        let queue_authority = crate::graph::agent_queue_authority(&desired.desired);
+        eprintln!(
+            "REVIEW {boss} publish victim={} start victim={} revise victim={} move fleet/worker={}",
+            mission_authority.allows("publish", "victim"),
+            mission_authority.allows("start", "victim"),
+            mission_authority.allows("revise", "victim"),
+            queue_authority.allows_move("agent/fleet/worker"),
+        );
+        // The boss now publishes a mission outside the planner's namespace.
+        let victim = "version 2\nmission \"victim\" state=\"ready\" {\n  goal \"Published with escalated authority.\"\n}\n";
+        let (status, body) = json_request(
+            app,
+            "/v1/intent/apply",
+            serde_json::to_value(apply_request(&state, victim, &boss, "victim-publish")).unwrap(),
+        )
+        .await;
+        eprintln!("REVIEW publish victim by boss: {status} {body}");
+        assert_ne!(
+            status,
+            StatusCode::OK,
+            "the boss published outside every person-granted namespace: {body}"
+        );
+    }
+
     #[tokio::test]
     async fn an_agent_moves_a_seat_queue_only_with_queue_authority() {
         const SEAT: &str = "agent/fleet/worker";
@@ -11044,7 +12173,7 @@ mission "queued" state="ready" {
         assert_eq!(state.store.seat_queue(SEAT).unwrap().move_count, 0);
 
         // Only a person grants authority. An agent cannot declare itself or another seat with
-        // queue or mission authority, but it can still declare a seat without any.
+        // queue or mission authority.
         for (key, declaration) in [
             (
                 "self-grant",
@@ -11089,7 +12218,8 @@ mission "queued" state="ready" {
             .unwrap(),
         )
         .await;
-        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        assert_eq!(body["code"], "agent-seat-publication-denied", "{body}");
         let (status, body) = json_request(
             app.clone(),
             "/v1/agent-queue-moves",
@@ -11788,6 +12918,156 @@ version 2
         assert_eq!(resolved["status"], "resolved");
         let (_, empty) = get_request(app, "/v1/attention?person=nathan").await;
         assert_eq!(empty, json!([]));
+    }
+
+    #[test]
+    fn a_fault_from_a_retired_requester_seat_is_labelled() {
+        let store = Store::open_memory("node").unwrap();
+        let apply = |intent: &crate::model::NormalizedIntent, key: &str| {
+            let planned = store
+                .mission(
+                    intent,
+                    crate::model::IntentInput {
+                        kdl: key.into(),
+                        source_name: None,
+                    },
+                )
+                .unwrap();
+            store.apply(intent, &planned.subject_tokens, key).unwrap();
+        };
+        let parse = |source: &str| crate::graph::parse_intent(source, "node").unwrap();
+        apply(
+            &parse(
+                r#"version 2
+agent "stopped" { workspace "/tmp"; command "true" }
+agent "live" { workspace "/tmp"; command "true" }
+mission "standing" state="ready" {
+  goal "Keep a seat."
+  step "hold" { agentless }
+}
+"#,
+            ),
+            "requesters",
+        );
+        let run = store
+            .create_mission_run(&crate::model::MissionRunRequest {
+                mission: "standing".into(),
+                revision: None,
+                workspace: "/tmp".into(),
+                requester: Some("person/nathan".into()),
+                mode: Some("run".into()),
+                inputs: BTreeMap::new(),
+                idempotency_key: "standing-run".into(),
+            })
+            .unwrap();
+        // The run owns this seat, as a standing mission owns its agents.
+        let mut owned = parse(
+            r#"version 2
+agent "seat" { workspace "/tmp"; command "true" }
+"#,
+        );
+        let desired = owned.subjects.get_mut("agent/node.seat").unwrap();
+        desired.owner_run = Some(run.subject.clone());
+        desired.owner_generation = Some(run.generation.clone());
+        apply(&owned, "owned-seat");
+        let seat = "agent/node.seat".to_owned();
+        for (subject, actor) in [
+            ("attention/from-stopped", "agent/node.stopped"),
+            ("attention/from-live", "agent/node.live"),
+            ("attention/from-seat", seat.as_str()),
+        ] {
+            store
+                .request_attention(
+                    subject,
+                    &AttentionRequest {
+                        reviewer: "person/nathan".into(),
+                        title: format!("Fault from {actor}"),
+                        reason: "a person must decide".into(),
+                        severity: "warning".into(),
+                        targets: Vec::new(),
+                        actor: actor.into(),
+                        idempotency_key: format!("{subject}:requested"),
+                    },
+                )
+                .unwrap();
+        }
+        let reasons = |store: &Store| {
+            client_attention_resources(store, Some("person/nathan"), false)
+                .unwrap()
+                .into_iter()
+                .map(|resource| {
+                    (
+                        resource["source_id"].as_str().unwrap().to_owned(),
+                        resource["operational"]["reasons"].clone(),
+                    )
+                })
+                .collect::<BTreeMap<_, _>>()
+        };
+        assert!(
+            reasons(&store)
+                .values()
+                .all(|reasons| reasons == &json!([]))
+        );
+
+        apply(
+            &parse("version 2\nstop \"agent/node.stopped\"\n"),
+            "stop-requester",
+        );
+        store
+            .set_mission_run_state(&run.id, "cancelled", "terminal", Some("moved to a seat"))
+            .unwrap();
+
+        let reasons = reasons(&store);
+        assert_eq!(
+            reasons["attention/from-stopped"],
+            json!(["requester-retired"])
+        );
+        assert_eq!(reasons["attention/from-seat"], json!(["requester-retired"]));
+        assert_eq!(reasons["attention/from-live"], json!([]));
+    }
+
+    #[tokio::test]
+    async fn attention_priority_follows_severity_with_and_without_history() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let app = router(state.clone());
+        for (severity, key) in [
+            ("warning", "api-attention-warning"),
+            ("error", "api-attention-error"),
+        ] {
+            let request = serde_json::to_value(AttentionRequest {
+                reviewer: "person/nathan".into(),
+                title: format!("{severity} fault"),
+                reason: "The queue did not recover.".into(),
+                severity: severity.into(),
+                targets: vec!["resource/fabric/queue".into()],
+                actor: "agent/fabric/worker".into(),
+                idempotency_key: key.into(),
+            })
+            .unwrap();
+            let (status, created) = json_request(app.clone(), "/v1/attention", request).await;
+            assert_eq!(status, StatusCode::OK, "{created}");
+        }
+        for history in [false, true] {
+            let resources =
+                client_attention_resources(&state.store, Some("person/nathan"), history).unwrap();
+            let priority = |title: &str| {
+                resources
+                    .iter()
+                    .find(|resource| resource["title"] == title)
+                    .map(|resource| resource["priority"].clone())
+            };
+            assert_eq!(
+                priority("warning fault"),
+                Some(json!("normal")),
+                "history={history}"
+            );
+            assert_eq!(
+                priority("error fault"),
+                Some(json!("high")),
+                "history={history}"
+            );
+        }
     }
 
     #[tokio::test]

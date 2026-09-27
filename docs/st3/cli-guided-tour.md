@@ -96,6 +96,7 @@ st3 work complete --help
 st3 work fail --help
 st3 work release --help
 st3 work wake --help
+st3 work retry --help
 st3 work publish-mission --help
 st3 work revise --help
 st3 work revision --help
@@ -132,6 +133,15 @@ st3 attention reject --help
 
 Every row should say why Nathan is involved, what happens if he does nothing, whether it is stale,
 and the exact actions available now.
+
+A subscription that holds mission requests for a person raises one attention item. Inspect the
+subscription request commands without changing live state:
+
+```sh
+st3 missions requests --help
+st3 missions release --help
+st3 missions cancel-request --help
+```
 
 ### 5. `launch` — chat, shape, approve, and launch a mission
 
@@ -224,9 +234,11 @@ runtime, host, work, conversation, stale state, and whether stopped history stay
 
 Copy a durable seat into `agents queue`. Check that the current claim comes first, then each queued
 mission run in order with `claimed`, `ready`, or `waiting`, and that `NEXT WORK` matches
-`agents show`. `agents queue move AGENT RUN --top`, `--bottom`, `--before RUN`, or `--after RUN`
-is a person-authorized mutation; move only a run we agreed to reorder, then confirm the move is
-listed with its author and time and that a held step stayed held.
+`agents show`. `st3 missions queued AGENT` prints the exact same view for someone who thinks of
+this as a mission question rather than an agent one. `agents queue move AGENT RUN --top`,
+`--bottom`, `--before RUN`, or `--after RUN` is a person-authorized mutation; move only a run we
+agreed to reorder, then confirm the move is listed with its author and time and that a held step
+stayed held.
 
 ### 8. `terminals` — inspect and attach without shell nesting
 
