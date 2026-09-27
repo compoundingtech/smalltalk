@@ -1,6 +1,6 @@
-# st3 fleet replication
+# st fleet replication
 
-Fleet replication is optional. A node without peer configuration is a complete local-only st3 system.
+Fleet replication is optional. A node without peer configuration is a complete local-only st system.
 
 Replication makes the logical authority equal across configured nodes. It does not make the SQLite files byte-identical.
 
@@ -89,11 +89,11 @@ Terminal revision proposal states do not regress during replay. Local rules stil
 Use these commands:
 
 ```sh
-st3 replication status
-st3 replication diff node-b
-st3 replication invalid
-st3 replication inspect record/HASH
-st3 doctor
+st replication status
+st replication diff node-b
+st replication invalid
+st replication inspect record/HASH
+st doctor
 ```
 
 The status view reports the authority digest, graph digest, record counts, projection health, and last peer results.
@@ -101,7 +101,7 @@ The status view reports the authority digest, graph digest, record counts, proje
 Repair publishes a new claim. It does not delete or change the bad record.
 
 ```sh
-st3 replication repair record/HASH \
+st replication repair record/HASH \
   --with CLAIM_ID \
   --reason "replace the invalid observation" \
   --as person/operator
