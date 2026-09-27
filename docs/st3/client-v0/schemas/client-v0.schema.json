@@ -127,10 +127,21 @@
             "state": { "enum": ["open", "resolved"] },
             "requested_at": { "$ref": "#/$defs/Timestamp" },
             "targets": { "type": "array", "items": { "$ref": "#/$defs/Id" } },
+            "target_states": { "type": "array", "items": { "$ref": "#/$defs/AttentionTargetState" } },
             "actions": { "type": "array", "items": { "type": "string", "enum": ["attention.resolve", "review.approve", "review.reject", "launch.approve", "launch.cancel", "mission.approve-revision", "mission.cancel-revision", "message.read"] } }
           }
         }
       ]
+    },
+    "AttentionTargetState": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "state"],
+      "properties": {
+        "id": { "$ref": "#/$defs/Id" },
+        "state": { "type": "string" },
+        "since": { "$ref": "#/$defs/Timestamp" }
+      }
     },
     "Message": {
       "allOf": [

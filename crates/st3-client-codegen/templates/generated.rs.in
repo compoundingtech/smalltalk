@@ -169,7 +169,16 @@ pub struct Attention {
     #[serde(default)]
     pub targets: Vec<String>,
     #[serde(default)]
+    pub target_states: Vec<AttentionTargetState>,
+    #[serde(default)]
     pub actions: Vec<String>,
+}
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct AttentionTargetState {
+    pub id: String,
+    pub state: String,
+    #[serde(default)]
+    pub since: Option<String>,
 }
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct Message {

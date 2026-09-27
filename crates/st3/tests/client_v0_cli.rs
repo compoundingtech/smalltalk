@@ -319,6 +319,97 @@ async fn attention_withdraw_removes_an_obsolete_request_from_now() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn now_shows_the_state_of_each_fault_target() {
+    let root = tempfile::tempdir().unwrap();
+    let socket = root.path().join("st3.sock");
+    let state = test_state(root.path());
+    let store = state.store.clone();
+    let source = r#"version 2
+mission "typecase" state="ready" {
+  goal "Publish a revision."
+  step "publish" { agentless }
+}
+"#;
+    let intent = st3::graph::parse_intent(source, "client-v0-cli").unwrap();
+    let planned = store
+        .mission(
+            &intent,
+            IntentInput {
+                kdl: source.into(),
+                source_name: None,
+            },
+        )
+        .unwrap();
+    store
+        .apply(&intent, &planned.subject_tokens, "typecase-source")
+        .unwrap();
+    let run = store
+        .create_mission_run(&MissionRunRequest {
+            mission: "typecase".into(),
+            revision: None,
+            workspace: "/tmp".into(),
+            requester: Some("person/nathan".into()),
+            mode: Some("run".into()),
+            inputs: BTreeMap::new(),
+            idempotency_key: "typecase-run".into(),
+        })
+        .unwrap();
+    store
+        .set_mission_run_state(&run.id, "cancelled", "terminal", Some("moved to a seat"))
+        .unwrap();
+    store
+        .request_attention(
+            "attention/typecase-remote-control",
+            &AttentionRequest {
+                reviewer: "person/nathan".into(),
+                title: "Publish Typecase without remote control".into(),
+                reason: "Publish the prepared revision as a person.".into(),
+                severity: "warning".into(),
+                targets: vec!["mission/typecase".into(), "resource/typecase/kdl".into()],
+                actor: "agent/fleet/st3".into(),
+                idempotency_key: "typecase-remote-control".into(),
+            },
+        )
+        .unwrap();
+    let server_socket = socket.clone();
+    let server =
+        tokio::spawn(
+            async move { st3::api::serve_unix(&server_socket, st3::api::router(state)).await },
+        );
+    for _ in 0..100 {
+        if socket.exists() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert!(socket.exists());
+
+    let now = run_cli_human(&socket, &["now", "--as", "person/nathan"]).await;
+    assert!(
+        now.status.success(),
+        "{}",
+        String::from_utf8_lossy(&now.stderr)
+    );
+    let now = String::from_utf8(now.stdout).unwrap();
+    assert!(
+        now.contains("  target mission/typecase: cancelled "),
+        "now did not show the target state:\n{now}"
+    );
+    assert!(
+        !now.contains("target resource/"),
+        "a resource has no state to show:\n{now}"
+    );
+
+    let listed = value(&run_cli(&socket, &["attention", "ls", "--as", "person/nathan"]).await);
+    let states = &listed["value"]["items"][0]["target_states"];
+    assert_eq!(states[0]["id"], "mission/typecase");
+    assert_eq!(states[0]["state"], "cancelled");
+    assert!(states[0]["since"].is_string());
+    assert_eq!(states.as_array().unwrap().len(), 1);
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn canonical_product_cli_uses_real_client_v0_envelopes_and_fences() {
     let root = tempfile::tempdir().unwrap();
     let socket = root.path().join("st3.sock");

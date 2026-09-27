@@ -6994,6 +6994,26 @@ impl Store {
             .collect())
     }
 
+    /// The current state of each fault target that has one. Resources, documents and unknown
+    /// kinds have no state to show and are left out.
+    pub fn attention_target_states(
+        &self,
+        targets: &[String],
+    ) -> Result<Vec<crate::model::AttentionTargetState>> {
+        let connection = self.readers.get();
+        let mut states = Vec::new();
+        for target in targets {
+            if let Some((state, since_unix_ms)) = attention_target_state_tx(&connection, target)? {
+                states.push(crate::model::AttentionTargetState {
+                    id: target.clone(),
+                    state,
+                    since_unix_ms,
+                });
+            }
+        }
+        Ok(states)
+    }
+
     pub fn attention_items(&self, person: Option<&str>) -> Result<Vec<AttentionItemView>> {
         let mut items = Vec::new();
         let reviews = self.pending_human_reviews(person)?;
@@ -12823,6 +12843,110 @@ fn attention_request_is_current_tx(
         }
     }
     Ok(true)
+}
+
+type TargetState = (String, Option<u128>);
+
+fn attention_target_state_tx(connection: &Connection, target: &str) -> Result<Option<TargetState>> {
+    let row = |sql: &str, id: &str| -> Result<Option<TargetState>> {
+        connection
+            .query_row(sql, [id], |row| {
+                let since = row.get::<_, String>(1)?;
+                Ok((row.get::<_, String>(0)?, since.parse().ok()))
+            })
+            .optional()
+            .map_err(Into::into)
+    };
+    if let Some(mission) = target.strip_prefix("mission/") {
+        // The same summary `missions ls` shows: an active run wins, then the latest run.
+        let mut statement = connection.prepare(
+            "SELECT status, updated_at_unix_ms FROM mission_runs WHERE mission_id=?1
+             ORDER BY CAST(created_at_unix_ms AS INTEGER) DESC, id DESC",
+        )?;
+        let runs = statement
+            .query_map([mission], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        let definition = row(
+            "SELECT mission_definitions.state, claims.accepted_at_unix_ms
+             FROM mission_definitions JOIN claims ON claims.id=mission_definitions.claim_id
+             WHERE mission_definitions.mission_id=?1",
+            mission,
+        )?;
+        if let Some((state, since)) = &definition
+            && state == "retired"
+        {
+            return Ok(Some((state.clone(), *since)));
+        }
+        let run = ["running", "standing"]
+            .iter()
+            .find_map(|active| runs.iter().find(|(status, _)| status == active))
+            .or(runs.first());
+        return Ok(match run {
+            Some((status, since)) => Some((status.clone(), since.parse().ok())),
+            None => definition.map(|(state, _)| (state, None)),
+        });
+    }
+    if let Some(run) = target.strip_prefix("mission-run/") {
+        return row(
+            "SELECT status, updated_at_unix_ms FROM mission_runs WHERE id=?1",
+            run,
+        );
+    }
+    if let Some(generation) = target.strip_prefix("run-generation/") {
+        return row(
+            "SELECT status, updated_at_unix_ms FROM run_generations WHERE id=?1",
+            generation,
+        );
+    }
+    if target.starts_with("step-run/") {
+        return row(
+            "SELECT status, updated_at_unix_ms FROM step_runs WHERE subject=?1",
+            target,
+        );
+    }
+    if target.starts_with("attention/") {
+        if let Some(request) = attention_request_view_tx(connection, target)? {
+            return Ok(Some(match request.resolved_at_unix_ms {
+                Some(resolved_at) => (request.status, Some(resolved_at)),
+                None => ("open".into(), Some(request.requested_at_unix_ms)),
+            }));
+        }
+        // A client attention ID names a human gate by a digest of its owner, as
+        // `attention_resource_id` in the API does.
+        let pending = pending_human_reviews_tx(connection, None)?
+            .into_iter()
+            .find(|review| {
+                let digest = hex::encode(Sha256::digest(review.owner.as_bytes()));
+                format!("attention/{}", &digest[..24]) == target
+            });
+        return Ok(Some(match pending {
+            Some(review) => ("open".into(), Some(review.requested_at_unix_ms)),
+            None => ("not pending".into(), None),
+        }));
+    }
+    if target.starts_with("agent/") {
+        let stopped = row(
+            "SELECT desired.kind, claims.accepted_at_unix_ms
+             FROM desired JOIN claims ON claims.id=desired.claim_id
+             WHERE desired.subject=?1 AND desired.kind='stop'",
+            target,
+        )?;
+        if let Some((_, since)) = stopped {
+            return Ok(Some(("stopped".into(), since)));
+        }
+        if let Some(harness) = current_harness_at(connection, target, None)? {
+            return Ok(Some((harness.state, Some(harness.observed_at_unix_ms))));
+        }
+        return row(
+            "SELECT coalesce(json_extract(body, '$.fields.status'), 'unknown'), accepted_at_unix_ms
+             FROM claims WHERE subject=?1 AND kind='runtime.observed'
+             ORDER BY store_index DESC LIMIT 1",
+            target,
+        );
+    }
+    Ok(None)
 }
 
 fn attention_action(label: &str, argv: &[&str]) -> AttentionActionView {
@@ -26793,6 +26917,112 @@ mission "review-current" state="ready" revision-cutover="restart-active" {{
             .set_mission_run_state(&revised.id, "cancelled", "normal", None)
             .unwrap();
         assert!(store.pending_human_reviews(None).unwrap().is_empty());
+    }
+
+    #[test]
+    fn attention_target_states_describe_each_target_with_a_lifecycle() {
+        let store = Store::open_memory("node").unwrap();
+        publish_mission(
+            &store,
+            r#"version 2
+mission "typecase" state="ready" {
+  goal "Publish a revision."
+  step "publish" { goal "Publish it."; agentless }
+}"#,
+            "typecase-publish",
+        );
+        let run = store
+            .create_mission_run(&MissionRunRequest {
+                mission: "typecase".into(),
+                revision: None,
+                workspace: ".".into(),
+                requester: Some("person/nathan".into()),
+                mode: Some("run".into()),
+                inputs: BTreeMap::new(),
+                idempotency_key: "typecase-run".into(),
+            })
+            .unwrap();
+        let request = AttentionRequest {
+            reviewer: "person/nathan".into(),
+            title: "Another fault".into(),
+            reason: "a person must decide".into(),
+            severity: "warning".into(),
+            targets: Vec::new(),
+            actor: "agent/node.requester".into(),
+            idempotency_key: "other-fault".into(),
+        };
+        store
+            .request_attention("attention/other-fault", &request)
+            .unwrap();
+        let targets = [
+            "mission/typecase",
+            run.subject.as_str(),
+            "attention/other-fault",
+            "resource/typecase/kdl",
+            "agent/node.stopped",
+        ]
+        .map(str::to_owned);
+        let states = |store: &Store| {
+            store
+                .attention_target_states(&targets)
+                .unwrap()
+                .into_iter()
+                .map(|state| (state.id, state.state))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            states(&store),
+            [
+                ("mission/typecase".into(), "running".into()),
+                (run.subject.clone(), "running".into()),
+                ("attention/other-fault".into(), "open".into()),
+            ]
+        );
+
+        store
+            .set_mission_run_state(&run.id, "cancelled", "terminal", Some("moved to a seat"))
+            .unwrap();
+        store
+            .withdraw_attention(
+                "attention/other-fault",
+                &AttentionWithdrawRequest {
+                    reason: "cleared".into(),
+                    actor: "agent/node.requester".into(),
+                    idempotency_key: "other-fault-withdrawn".into(),
+                },
+            )
+            .unwrap();
+        let source = "version 2\nstop \"agent/node.stopped\"\n";
+        let intent = crate::graph::parse_intent(source, "node").unwrap();
+        let planned = store
+            .mission(
+                &intent,
+                IntentInput {
+                    kdl: source.into(),
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        store
+            .apply(&intent, &planned.subject_tokens, "stopped-agent")
+            .unwrap();
+
+        assert_eq!(
+            states(&store),
+            [
+                ("mission/typecase".into(), "cancelled".into()),
+                (run.subject.clone(), "cancelled".into()),
+                ("attention/other-fault".into(), "withdrawn".into()),
+                ("agent/node.stopped".into(), "stopped".into()),
+            ]
+        );
+        assert!(
+            store
+                .attention_target_states(&targets)
+                .unwrap()
+                .iter()
+                .all(|state| state.since_unix_ms.is_some())
+        );
     }
 
     #[test]
