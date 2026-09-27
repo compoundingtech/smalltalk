@@ -40,6 +40,8 @@ const BRACKETED_PASTE_START: &str = "\x1b[200~";
 const BRACKETED_PASTE_END: &str = "\x1b[201~";
 const SUBJECT_MAX_CHARS: usize = 160;
 const SENDER_MAX_CHARS: usize = 80;
+/// Envelope identities are whole graph subjects, so they keep a larger bound than the PING header.
+const ADDRESS_MAX_CHARS: usize = 256;
 const ST3_BODY_MAX_CHARS: usize = 2048;
 /// The marker for a declared non-agent event source. A fixed st2-chosen literal — never
 /// producer-supplied text — so the bounded-notice proofs are unaffected.
@@ -79,28 +81,103 @@ pub fn st3_message_reference(msg: &Message) -> Option<&str> {
         .filter(|reference| reference.starts_with("message/") && reference.len() > "message/".len())
 }
 
-/// One recognizable ST3 envelope, shared by native drivers and extension channels.
+/// The st3 bridge records the graph recipient and the SHA-256 of the exact graph body on each
+/// projected inbox file, because the inbox round trip may add a trailing newline to the body.
+pub const ST3_TO_TAG: &str = "st3-to:";
+pub const ST3_SHA256_TAG: &str = "st3-sha256:";
+
+fn st3_tag<'a>(msg: &'a Message, prefix: &str) -> Option<&'a str> {
+    msg.tags.iter().find_map(|tag| tag.strip_prefix(prefix))
+}
+
+/// Lowercase hex SHA-256 of one exact graph message body.
+pub fn st3_body_sha256(body: &str) -> String {
+    use sha2::{Digest as _, Sha256};
+    format!("{:x}", Sha256::digest(body.as_bytes()))
+}
+
+fn st3_body_preview(body: &str) -> (String, bool) {
+    let normalized = normalize_line(body);
+    let mut characters = normalized.chars();
+    let preview: String = characters.by_ref().take(ST3_BODY_MAX_CHARS).collect();
+    let truncated = characters.next().is_some();
+    (preview, truncated)
+}
+
+/// The plain ST3 notice. Claude receives it inside its own channel tag.
 /// The graph remains the source of the complete message when the preview is bounded.
-pub fn st3_notification_text(
-    reference: &str,
-    from: &str,
-    subject: Option<&str>,
-    body: &str,
-) -> String {
+pub fn st3_ping_text(reference: &str, from: &str, subject: Option<&str>, body: &str) -> String {
     let from = normalize_field(Some(from), "unknown", SENDER_MAX_CHARS);
     let subject = normalize_field(subject, "(no subject)", SUBJECT_MAX_CHARS);
     let header = format!("[PING from st3] {reference} from {from}: {subject}");
-    let normalized_body = normalize_line(body);
-    if normalized_body.is_empty() {
-        return header;
-    }
-    let mut characters = normalized_body.chars();
-    let preview: String = characters.by_ref().take(ST3_BODY_MAX_CHARS).collect();
-    if characters.next().is_some() {
+    let (preview, truncated) = st3_body_preview(body);
+    if preview.is_empty() {
+        header
+    } else if truncated {
         format!("{header}\n\n{preview}… [read the full message in st3]")
     } else {
         format!("{header}\n\n{preview}")
     }
+}
+
+/// One `<smalltalk-message>` envelope, shared by the Codex, OpenCode, pi, and omp drivers.
+///
+/// `graph` is the message subject, `message/ID`; `id` is its ID; `sha256` hashes the complete
+/// graph body. Every value is escaped, so no sender-chosen text can close the element or add an
+/// attribute. The body is a bounded one-line preview; truncation is noted after the element.
+pub fn st3_notification_text(
+    reference: &str,
+    from: &str,
+    to: &str,
+    subject: Option<&str>,
+    body: &str,
+    body_sha256: &str,
+) -> String {
+    let graph = normalize_field(Some(reference), "message/unknown", ADDRESS_MAX_CHARS);
+    let id = graph.strip_prefix("message/").unwrap_or(&graph);
+    let from = normalize_field(Some(from), "unknown", ADDRESS_MAX_CHARS);
+    let to = normalize_field(Some(to), "unknown", ADDRESS_MAX_CHARS);
+    let subject = normalize_field(subject, "(no subject)", SUBJECT_MAX_CHARS);
+    let sha256 = normalize_field(Some(body_sha256), "unknown", 64);
+    let mut envelope = format!(
+        "<smalltalk-message id=\"{}\" from=\"{}\" to=\"{}\" subject=\"{}\" sha256=\"{}\" graph=\"{}\">\n",
+        xml_escape(id, true),
+        xml_escape(&from, true),
+        xml_escape(&to, true),
+        xml_escape(&subject, true),
+        xml_escape(&sha256, true),
+        xml_escape(&graph, true),
+    );
+    let (preview, truncated) = st3_body_preview(body);
+    if !preview.is_empty() {
+        envelope.push_str(&xml_escape(&preview, false));
+        if truncated {
+            envelope.push('…');
+        }
+        envelope.push('\n');
+    }
+    envelope.push_str("</smalltalk-message>");
+    if truncated {
+        envelope.push_str("\n[preview truncated; read the full message in st3]");
+    }
+    envelope
+}
+
+/// Escape markup characters so sender text cannot start or close an element. Attribute values
+/// also escape both quote characters.
+fn xml_escape(text: &str, attribute: bool) -> String {
+    let mut escaped = String::with_capacity(text.len());
+    for ch in text.chars() {
+        match ch {
+            '&' => escaped.push_str("&amp;"),
+            '<' => escaped.push_str("&lt;"),
+            '>' => escaped.push_str("&gt;"),
+            '"' if attribute => escaped.push_str("&quot;"),
+            '\'' if attribute => escaped.push_str("&apos;"),
+            _ => escaped.push(ch),
+        }
+    }
+    escaped
 }
 
 /// Convert arbitrary text into one printable line.
@@ -221,11 +298,16 @@ fn poke_text_with_resolver(
     msg: &Message,
 ) -> String {
     if let Some(reference) = st3_message_reference(msg) {
+        let sha256 = st3_tag(msg, ST3_SHA256_TAG)
+            .filter(|hash| hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_hexdigit()))
+            .map_or_else(|| st3_body_sha256(&msg.body), str::to_owned);
         return st3_notification_text(
             reference,
             msg.from.as_deref().unwrap_or_default(),
+            st3_tag(msg, ST3_TO_TAG).unwrap_or(recipient),
             msg.subject.as_deref(),
             &msg.body,
+            &sha256,
         );
     }
     let subject = normalize_field(msg.subject.as_deref(), "(no subject)", SUBJECT_MAX_CHARS);
