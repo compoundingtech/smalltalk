@@ -9596,6 +9596,8 @@ impl Store {
     }
 
     pub fn validate_replication_backlog(&self) -> Result<ReplicationAdmission> {
+        // Seed and sign local batches first, so local membership claims decide admission.
+        self.replication_snapshot()?;
         let mut connection = self.connection.lock().expect("store mutex poisoned");
         let mut statement = connection.prepare(
             "WITH retry_ids AS (
@@ -15658,8 +15660,17 @@ impl Store {
 
     /// The current fleet membership, folded from admitted `fleet.*` claims.
     pub fn fleet_membership(&self) -> Result<crate::fleet::Membership> {
+        // A local claim counts only once its batch is an envelope with this node's signature.
+        self.replication_snapshot()?;
         let connection = self.readers.get();
         fleet_membership_tx(&connection)
+    }
+
+    /// The membership view the replication worker uses to decide who may exchange.
+    pub fn fleet_view(&self) -> Result<crate::fleet::FleetView> {
+        Ok(crate::fleet::FleetView::from_membership(
+            &self.fleet_membership()?,
+        ))
     }
 
     /// Sign every envelope of this node's writer that has no signature by its member key,

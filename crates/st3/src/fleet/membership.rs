@@ -257,6 +257,11 @@ impl Membership {
             .collect()
     }
 
+    /// Config peers that were never members and were removed.
+    pub fn legacy_removed_names(&self) -> impl Iterator<Item = String> + '_ {
+        self.legacy_ends.keys().cloned()
+    }
+
     /// Whether this writer has ever had a key.
     pub fn is_keyed_writer(&self, writer: &str) -> bool {
         self.incarnations
