@@ -3228,6 +3228,7 @@ dependencies = [
  "proptest",
  "pty-core",
  "reqwest",
+ "ring",
  "rusqlite",
  "serde",
  "serde_json",

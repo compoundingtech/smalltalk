@@ -7,6 +7,7 @@ pub(crate) mod checkout;
 pub mod client;
 pub mod config;
 pub(crate) mod external_sessions;
+pub mod fleet;
 pub mod graph;
 pub mod mission;
 pub mod model;

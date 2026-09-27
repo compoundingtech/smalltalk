@@ -3,7 +3,7 @@
 This file is generated from `st3-schema`.
 
 Schema: `st3.v1`
-Digest: `f81286256120e584ba4feac75a6fa82d663a449c231e37b27b82909b8c7c5a36`
+Digest: `798f07e477fded5f9e4f4ca10d63ea4530fc254535a16ad78e40b263d14c8675`
 
 ## Subject families
 
@@ -17,6 +17,7 @@ Digest: `f81286256120e584ba4feac75a6fa82d663a449c231e37b27b82909b8c7c5a36`
 | `doc` | `doc/NAME` | no | A named immutable document lineage. |
 | `exec` | `exec/RUN/LOCAL_ID` | no | A mission-run exec runtime. |
 | `file` | `file/HOST:/ABSOLUTE_PATH` | no | A read-only file gate target. |
+| `fleet-invite` | `fleet-invite/ID` | no | A single-use fleet join invite. |
 | `gate-operation` | `gate-operation/IDENTITY` | no | One gate evaluation attempt. |
 | `host` | `host/NAME` | no | A graph host. |
 | `loop-run` | `loop-run/GENERATION/PATH` | no | One bounded loop execution. |
@@ -66,6 +67,13 @@ Custom subjects use `custom/NAMESPACE/NAME`. Custom claims use `custom.NAMESPACE
 | `doc.bound` | `doc` | `authorized-requester` | `append` | `executable:boolean`, `hash:string`, `name:string`, `size:integer` | `doc` |
 | `eval.verdict` | `mission-run` | `system-only` | `once` | `reason:string`, `residue:array`, `verdict!:string` |  |
 | `file.observed` | `file` | `system-only` | `append` | `blob_hash:string`, `content:string`, `content_hash:string`, `mode:integer`, `path!:string`, `reason:string`, `status!:string` | `gate` |
+| `fleet.invite-created` | `fleet-invite` | `system-only` | `append` | `created_by:subject-reference(person)`, `expires_at_unix_ms!:integer`, `name:string`, `sponsor!:subject-reference(host)`, `transports:array` |  |
+| `fleet.invite-redeemed` | `fleet-invite` | `system-only` | `append` | `member_key!:string`, `name!:string` |  |
+| `fleet.invite-revoked` | `fleet-invite` | `system-only` | `append` | `reason!:string`, `revoked_by:subject-reference(person)` |  |
+| `fleet.member-admitted` | `host` | `system-only` | `append` | `admitted_by:subject-reference(person)`, `fleet_id!:string`, `invite:subject-reference(fleet-invite)`, `member_key!:string`, `mode!:string`, `sponsor:subject-reference(host)`, `via!:string`, `writer_floor:integer` |  |
+| `fleet.member-endpoints` | `host` | `system-only` | `append` | `build:string`, `endpoints:array`, `member_key!:string`, `mode!:string` |  |
+| `fleet.member-left` | `host` | `system-only` | `append` | `high_water!:integer`, `member_key!:string` |  |
+| `fleet.member-removed` | `host` | `system-only` | `append` | `high_water!:integer`, `member_key:string`, `reason!:string`, `removed_by:subject-reference(person)` |  |
 | `gate.requested` | `gate-operation` | `system-only` | `once` | `attempt:integer`, `baseline:boolean`, `capability_expires_at:string`, `capability_hash:string`, `decisions:array`, `gate:string`, `mission_revision:string`, `model:string`, `operation:subject-reference`, `owner:subject-reference`, `question:string`, `review_targets:array`, `reviewer:subject-reference`, `runner:string`, `status:string`, `step_definition:string`, `token_budget:integer`, `tools:array` | `gate` |
 | `gate.result` | `gate-operation` | `capability-holder` | `append` | `baseline:boolean`, `field:string`, `gate:string`, `operation:subject-reference`, `reason:string`, `request:string`, `stage:string`, `token_usage:integer`, `value:any`, `verdict!:string` | `gate` |
 | `harness.context-clear.requested` | `agent` | `authorized-requester` | `append` | `context_epoch:string`, `incarnation_id:string`, `operation_status:string`, `runtime_id:string` |  |
