@@ -16227,6 +16227,115 @@ mission "gated" state="ready" {
         seat.work(&head, "claim", "seat-refuse-head").unwrap();
     }
 
+    const REVIEW_DRAINING_SOURCE: &str = r#"
+version 2
+
+mission "draining" state="ready" revision-cutover="when-idle" {
+  concurrent-runs
+  goal "Hold the durable seat's step while another seat's work drains."
+  step "helper" { assigned-to "agent/node.helper" }
+  step "work" { assigned-to "agent/node.worker" }
+}
+"#;
+
+    const REVIEW_DRAINING_REVISED: &str = r#"
+version 2
+
+mission "draining" state="ready" revision-cutover="when-idle" {
+  concurrent-runs
+  goal "Hold the durable seat's step while another seat's work drains, revised."
+  step "helper" { assigned-to "agent/node.helper" }
+  step "work" { assigned-to "agent/node.worker" }
+}
+"#;
+
+    /// Review 2026-09-27 area 1: the work list, the queue view and the wake hide a
+    /// draining run's ready step, so the claim-order check must not name it as the
+    /// seat's next work.
+    #[test]
+    fn review_claim_order_check_agrees_with_the_wake_while_a_head_run_drains() {
+        let seat = SeatQueueFixture::new();
+        apply_source(&seat.store, REVIEW_DRAINING_SOURCE, "review-draining");
+        let head = seat.start("draining", "review-drain-head");
+        let later = seat.start("queued", "review-drain-later");
+        let helper_step = SeatQueueFixture::step(&head, "helper");
+        let head_work = SeatQueueFixture::step(&head, "work");
+        let later_work = SeatQueueFixture::step(&later, "work");
+        assert_eq!(seat.next().as_deref(), Some(head_work.as_str()));
+
+        // Another seat holds the head run's other step, so a drained cutover waits.
+        seat.store
+            .set_step_state(&helper_step, "ready", None)
+            .unwrap();
+        seat.store
+            .work_action(
+                &helper_step,
+                "claim",
+                &crate::model::WorkRequest {
+                    actor: Some("agent/node.helper".into()),
+                    incarnation: Some("helper-one".into()),
+                    summary: None,
+                    reason: None,
+                    evidence: Vec::new(),
+                    idempotency_key: "review-helper-claim".into(),
+                },
+            )
+            .unwrap();
+        apply_source(&seat.store, REVIEW_DRAINING_REVISED, "review-draining-revised");
+        let revised = parse_intent(REVIEW_DRAINING_REVISED, "node").unwrap().missions["draining"]
+            .clone();
+        let proposal = seat
+            .store
+            .create_revision_proposal(
+                &head.id,
+                &revised,
+                "person/requester",
+                "drain the head run",
+                "review-drain-proposal",
+            )
+            .unwrap();
+        assert_eq!(proposal.status, "draining");
+        assert_eq!(
+            seat.store.mission_run(&head.id).unwrap().unwrap().phase,
+            "revision-draining"
+        );
+
+        // Every view the seat and the reconciler use now points at the later run.
+        let listed = seat
+            .store
+            .work_for_reconcile(SEAT)
+            .unwrap()
+            .into_iter()
+            .map(|step| step.subject)
+            .collect::<Vec<_>>();
+        assert!(!listed.contains(&head_work), "the draining step is hidden: {listed:?}");
+        seat.reconciler.reconcile_once().unwrap();
+        let queue_next = seat.queue().next_work_id;
+        let roster_next = seat
+            .store
+            .agent_work_queues()
+            .unwrap()
+            .remove(SEAT)
+            .and_then(|queue| queue.next_work_id);
+        assert_eq!(queue_next.as_deref(), Some(later_work.as_str()));
+        assert_eq!(seat.wake().as_deref(), Some(later_work.as_str()));
+        assert_eq!(
+            roster_next.as_deref(),
+            Some(later_work.as_str()),
+            "the roster names the hidden draining step as next work"
+        );
+        let head_claim = seat.work(&head_work, "claim", "review-head-claim").unwrap_err();
+        assert_eq!(head_claim.code, "run-generation-draining");
+
+        // The claim check must agree with the wake it was sent.
+        if let Err(error) = seat.work(&later_work, "claim", "review-later-claim") {
+            panic!(
+                "the seat cannot claim the work it was woken for: {} {}",
+                error.code, error.message
+            );
+        }
+    }
+
     #[test]
     fn seat_queue_lets_a_claim_pass_over_a_waiting_head_run() {
         let seat = SeatQueueFixture::new();
