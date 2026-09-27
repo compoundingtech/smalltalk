@@ -4,10 +4,31 @@ This document compares the idle cost of the seat queue branch with the st3 commi
 It records the method, the fixture, the numbers, one fix made because of them, and what the
 memory numbers do and do not measure.
 
+## Verdict
+
+**Not yet.** The evals pass, apart from one Claude start failure and one void run, but the 9-hour
+overnight run shows the branch using more idle CPU and waking far more often than base. Merge
+after the extra wakeups are explained, or accept the cost knowingly.
+
+- **For merging:** the seat queue works with live agents. 16 of the 18 runs last night on Claude,
+  Codex and omp seats passed. One Claude seat never reached idle before any work existed. One omp
+  run is void because the agent re-declared its own seat, and `16aa754` now refuses that. No seat
+  claimed out of order, preempted a held claim, or used terminal input. The reads are cheap.
+- **Against merging now:** after about an hour, the branch daemon's voluntary context switches
+  rose from about 6,000 to 10,000–12,000 a minute and stayed there. Its thread count went from 20
+  to 22, and base peaked at 21. Base stayed at about 6,500 a minute. Idle CPU was 45 s/hour against
+  41 on base (+9%). The 30-minute windows below could not see this, because it starts later. I
+  have not found the cause.
+- **Memory growth is not the branch's.** Resident memory grew 11 to 13 MiB an hour on both builds
+  for the whole night. The branch ended 22 MiB higher (232 against 210 MiB).
+- **The measured build is not the branch head.** The overnight run used `2ee767c`. `37ac4b2` and
+  `16aa754` add agent queue moves and the seat declaration check, and were not measured overnight.
+
 ## Result
 
-- **Idle CPU is not higher after one fix.** The branch as first measured used 3.3% more idle CPU
-  than base when the graph took six writes a minute, because the reconciler read every seat's
+- **Idle CPU is not higher in 30-minute windows after one fix.** The branch as first measured
+  used 3.3% more idle CPU than base when the graph took six writes a minute, because the
+  reconciler read every seat's
   order on each loop. `d2c4ee8` reads a seat's order only when the seat must choose between runs.
   After it, idle CPU is 0.357 against 0.354 s/min with read-only traffic and 0.622 against
   0.623 s/min with writes. A reconcile after one write costs 43.7 to 44.3 ms of CPU against 43.3
@@ -25,8 +46,7 @@ memory numbers do and do not measure.
   order 0.18 ms, and the agent queue read 0.8 ms of daemon CPU. `st3 agents queue` takes about
   4 ms from the CLI, mostly process start.
 
-A longer side-by-side run of base and the fixed branch would show slow CPU or RSS growth that a
-30-minute window cannot.
+Series 4, a 9-hour side-by-side run, found what a 30-minute window cannot: see the verdict.
 
 ## Builds
 
@@ -280,6 +300,44 @@ heap, so a quiet daemon holds about 130 MiB instead of 570 to 600 MiB. The fixed
 higher in two of three starts, by 8 to 13 MiB, and lower in the third. Three starts cannot
 separate that from noise. A 30-minute jemalloc window pair was started and stopped at 12 minutes
 when the mission was restarted, and its samples are not used.
+
+## Series 4: overnight side by side
+
+Base and branch `2ee767c` ran at the same time on one host for 546 minutes, 21:22Z to 07:15Z,
+with the Series 2 fixture and six writes a minute. The first 5 minutes are warmup. Each row
+covers one hour of the run. The eval runs in this branch ran on their own daemons between
+21:50Z and 22:58Z, before the branch diverged.
+
+| Hour | CPU s, base | CPU s, branch | Voluntary switches, base | Voluntary switches, branch | Threads, base / branch | RSS MiB at end, base | RSS MiB at end, branch |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 50.3 | 49.7 | 365,808 | 373,456 | 20 / 21 | 121.7 | 126.7 |
+| 2 | 41.5 | 45.0 | 383,166 | 679,244 | 20 / 22 | 144.3 | 153.9 |
+| 3 | 41.7 | 44.7 | 396,621 | 652,827 | 20 / 22 | 166.1 | 163.1 |
+| 4 | 43.2 | 46.5 | 460,474 | 690,972 | 21 / 22 | 175.8 | 184.5 |
+| 5 | 39.8 | 45.5 | 395,671 | 668,904 | 21 / 22 | 179.0 | 194.9 |
+| 6 | 40.5 | 44.5 | 409,177 | 594,635 | 21 / 22 | 182.1 | 210.7 |
+| 7 | 40.2 | 45.0 | 399,622 | 658,672 | 21 / 22 | 187.7 | 215.6 |
+| 8 | 40.9 | 45.6 | 396,359 | 651,155 | 21 / 22 | 200.0 | 229.6 |
+| 9 | 42.3 | 46.9 | 446,008 | 685,852 | 21 / 22 | 209.1 | 232.1 |
+
+Involuntary switches were 6,000 to 8,100 an hour on both after the first hour. Across the whole
+window, CPU was 0.704 s/min on base and 0.765 on the branch, and all switches were 6,898 and
+10,611 a minute. Both started near 600 MiB resident, dropped to about 120 MiB within the first
+hour, and then grew steadily.
+
+The divergence is the finding. For the first hour the branch matched base minute by minute at
+about 6,100 voluntary switches. From about 23:04Z the branch rose to 7,800, then 9,900, then
+10,000 to 12,000 a minute, and gained a 21st and then a 22nd thread. Base never did. Something
+on the branch starts about an hour in and then wakes about 70 more times a second. That fits a
+timer or a waiting task added by the seat queue, but I have not confirmed it. The probes at the
+end matched: the roster read, one seat's work list and mailbox, and a claim write with its
+reconcile all cost the same on both builds.
+
+Growth: RSS grew about 88 MiB on base and 105 MiB on the branch over 8.5 hours, still rising
+at the end on both. CPU per hour did not grow on either after the first hour.
+
+Evidence: `target/seat-queue-overnight/perf/` in the builder's worktree holds `samples.csv`,
+`probe.json`, `memory.txt`, and the daemon and traffic logs for each build.
 
 ## Other findings
 
