@@ -38,9 +38,15 @@ const CLAUDE_TRUST_SCREEN_RECHECK_MS: u128 = 2_000;
 const CLAUDE_TRUST_RECOVERY_ATTEMPTS: usize = 3;
 const CLAUDE_TRUST_RECOVERY_WINDOW_MS: u128 = 10 * 60_000;
 
-fn claude_login_expired(screen: &str) -> bool {
-    screen.contains("Login expired · Please run /login")
-        || screen.contains("Not logged in · Run /login")
+/// The screen line on which Claude asks for /login. Claude prints the prompt as its own line,
+/// at most after a status glyph, so a line that only quotes the phrase, such as source code or
+/// grep output a session prints, does not match.
+fn claude_login_expired(screen: &str) -> Option<&str> {
+    screen.lines().map(str::trim).find(|line| {
+        let text = line.trim_start_matches(['●', '⎿']).trim_start();
+        text.starts_with("Login expired · Please run /login")
+            || text.starts_with("Not logged in · Run /login")
+    })
 }
 
 /// Claude's workspace trust dialog as `pty peek --plain` renders it. Every phrase must be present,
@@ -1094,9 +1100,9 @@ impl<R: RuntimeControl> Reconciler<R> {
         let Ok(screen) = self.runtime.screen(&member.runtime_id) else {
             return Ok(());
         };
-        if !claude_login_expired(&screen) {
+        let Some(matched_line) = claude_login_expired(&screen) else {
             return Ok(());
-        }
+        };
         let key = format!("claude-auth-expired:{}:{incarnation}", subject.subject);
         let digest = hex::encode(sha2::Sha256::digest(key.as_bytes()));
         let attention_subject = format!("attention/{}", &digest[..32]);
@@ -1113,6 +1119,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                     ("code".into(), Value::String("provider-auth-expired".into())),
                     ("reason".into(), Value::String("Claude reports an expired login; a person must run /login in this terminal and restart the harness".into())),
                     ("incarnation_id".into(), Value::String(incarnation.into())),
+                    ("matched_line".into(), Value::String(matched_line.into())),
                 ]),
                 evidence: Vec::new(),
                 expected_subject: None,
@@ -8152,13 +8159,30 @@ fn now_ms() -> u128 {
 mod tests {
     #[test]
     fn claude_login_screen_recognizes_only_explicit_auth_prompts() {
-        assert!(super::claude_login_expired(
-            "● Login expired · Please run /login"
-        ));
-        assert!(super::claude_login_expired("Not logged in · Run /login"));
-        assert!(!super::claude_login_expired(
-            "Please use /login to switch accounts"
-        ));
+        assert_eq!(
+            super::claude_login_expired("● Login expired · Please run /login"),
+            Some("● Login expired · Please run /login")
+        );
+        assert_eq!(
+            super::claude_login_expired("> \n  ⎿  Not logged in · Run /login  \n"),
+            Some("⎿  Not logged in · Run /login")
+        );
+        assert_eq!(
+            super::claude_login_expired("Please use /login to switch accounts"),
+            None
+        );
+    }
+
+    #[test]
+    fn claude_login_screen_ignores_quoted_source_and_grep_output() {
+        for screen in [
+            r#"37:    screen.contains("Login expired · Please run /login")"#,
+            r#"  ⎿  37:    screen.contains("Login expired · Please run /login")"#,
+            r#"● The detector matches "Not logged in · Run /login" anywhere."#,
+            "fn claude_login_expired(screen: &str) -> bool { // Login expired · Please run /login",
+        ] {
+            assert_eq!(super::claude_login_expired(screen), None, "{screen}");
+        }
     }
 
     /// Claude Code 2.1.283's trust dialog as `pty peek --plain` rendered it at 80 columns.
@@ -14532,6 +14556,74 @@ version 2
             runtime.keys.lock().unwrap().is_empty(),
             "recovery must never type into a terminal"
         );
+    }
+
+    /// A seat whose screen shows the detector's own source, as a builder's grep output did on
+    /// 2026-09-27, stays authenticated. A seat that shows Claude's login prompt is fenced, and its
+    /// diagnostic records the exact screen line that matched.
+    #[test]
+    fn a_claude_login_prompt_line_fences_the_seat_and_records_the_matched_line() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        let workspace = tempfile::tempdir().unwrap();
+        let workspace = workspace.path().display().to_string();
+        let source = format!(
+            "version 2\n\
+             agent \"seat-a\" {{ workspace {workspace:?}; harness \"claude\" {{ prompt \"Work.\" }} }}\n\
+             agent \"seat-b\" {{ workspace {workspace:?}; harness \"claude\" {{ prompt \"Work.\" }} }}\n"
+        );
+        apply_source(&store, &source, "claude-login-line");
+        let runtime = Arc::new(FakeRuntime::default());
+        *runtime.screen.lock().unwrap() = "╭─ Claude Code ─╮\n> ".into();
+        let reconciler = Reconciler::new(
+            store.clone(),
+            runtime.clone(),
+            "node".into(),
+            Arc::new(Notify::new()),
+        );
+        reconciler.reconcile_once().unwrap();
+        *runtime.ptys.lock().unwrap() = vec![
+            claude_seat_pty("seat-a", "running", "a-one"),
+            claude_seat_pty("seat-b", "running", "b-one"),
+        ];
+        runtime.screens.lock().unwrap().extend([
+            (
+                "node.seat-a".to_owned(),
+                concat!(
+                    "● Bash(grep -n 'Login expired' crates/st3/src/reconcile.rs)\n",
+                    "  ⎿  37:    screen.contains(\"Login expired · Please run /login\")\n",
+                )
+                .to_owned(),
+            ),
+            (
+                "node.seat-b".to_owned(),
+                "> Work.\n\n● Login expired · Please run /login\n".to_owned(),
+            ),
+        ]);
+        reconciler.reconcile_once().unwrap();
+
+        assert!(
+            store
+                .claims_for("agent/node.seat-a", Some("harness.diagnostic"))
+                .unwrap()
+                .is_empty()
+        );
+        let diagnostics = store
+            .claims_for("agent/node.seat-b", Some("harness.diagnostic"))
+            .unwrap();
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(
+            diagnostics[0].body.pointer("/fields/code"),
+            Some(&Value::String("provider-auth-expired".into()))
+        );
+        assert_eq!(
+            diagnostics[0].body.pointer("/fields/matched_line"),
+            Some(&Value::String("● Login expired · Please run /login".into()))
+        );
+        let harness = store.current_harness("agent/node.seat-b").unwrap().unwrap();
+        assert_eq!(harness.reason.as_deref(), Some("providerAuth"));
+        let attention = store.attention_items(Some("person/nathan")).unwrap();
+        assert_eq!(attention.len(), 1);
+        assert_eq!(attention[0].targets, ["agent/node.seat-b"]);
     }
 
     #[test]
