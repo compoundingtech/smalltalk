@@ -1396,6 +1396,12 @@ impl<R: RuntimeControl> Reconciler<R> {
             let mut attempts = messages
                 .iter()
                 .filter(|message| {
+                    !message
+                        .tags
+                        .iter()
+                        .any(|tag| tag == "st3-wake-source:manual")
+                })
+                .filter(|message| {
                     work_message_target(message).is_some_and(
                         |(subject, attempt, readiness_epoch, message_incarnation)| {
                             subject == step.subject
@@ -7744,8 +7750,13 @@ pub(crate) fn append_work_wake_message(
         .zip(step.queue_position)
         .map(|(queue, position)| format!("\nQueue: {queue} #{position}"))
         .unwrap_or_default();
+    let wake_description = if source == "manual" {
+        format!("manual request ({reason})")
+    } else {
+        format!("{source} attempt {wake_attempt} ({reason})")
+    };
     let content = format!(
-        "A mission step is ready: {0}. Run `st3 work claim {0}` to read and claim it.\n\nTitle: {1}{queue}\nWake: {source} attempt {wake_attempt} ({reason})",
+        "A mission step is ready: {0}. Run `st3 work claim {0}` to read and claim it.\n\nTitle: {1}{queue}\nWake: {wake_description}",
         step.subject,
         step.title.as_deref().unwrap_or(&step.step),
     );
@@ -16020,6 +16031,62 @@ mission "gated" state="ready" {
                 )
                 .map(|_| ())
         }
+    }
+
+    #[test]
+    fn manual_wakes_do_not_exhaust_the_reconcilers_automatic_budget() {
+        let seat = SeatQueueFixture::new();
+        let run = seat
+            .store
+            .create_mission_run(&crate::model::MissionRunRequest {
+                mission: "queued".into(),
+                revision: None,
+                workspace: "/tmp".into(),
+                requester: Some("person/requester".into()),
+                mode: Some("run".into()),
+                inputs: BTreeMap::new(),
+                idempotency_key: "manual-budget-run".into(),
+            })
+            .unwrap();
+        let subject = SeatQueueFixture::step(&run, "work");
+        let step = seat.store.step_run(&subject).unwrap().unwrap();
+        for n in 1..=3 {
+            append_work_wake_message(
+                &seat.store,
+                &step,
+                SEAT,
+                "seat-one",
+                n,
+                "manual",
+                "person/operator",
+                "explicit retry",
+                format!("manual-budget-{n}"),
+            )
+            .unwrap();
+        }
+        seat.reconciler.reconcile_once().unwrap();
+        let messages = seat.store.messages(Some(SEAT), true).unwrap();
+        assert_eq!(
+            messages.len(),
+            4,
+            "one automatic wake follows three manual wakes"
+        );
+        assert!(messages.iter().any(|message| {
+            message
+                .tags
+                .iter()
+                .any(|tag| tag == "st3-wake-source:automatic")
+        }));
+        assert_eq!(
+            seat.store
+                .step_run(&subject)
+                .unwrap()
+                .unwrap()
+                .wake
+                .unwrap()
+                .attempts,
+            1
+        );
     }
 
     #[test]

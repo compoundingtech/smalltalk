@@ -949,6 +949,10 @@ An operator can request another delivery through the same driver path with:
 st3 work wake STEP --as person/operator --reason "retry native delivery"
 ```
 
+The assignee may also wake its own step. Another agent needs `queue-authority` for the assignee's
+seat. Manual wakes are recorded in the inbox but do not consume the three automatic retry
+attempts shown by `st3 work show`.
+
 Generic terminal programs without a maintained native driver do not have an automatic wake path.
 
 A provider or runtime fault creates a `harness.diagnostic` claim. The roster and mission views show the fault.

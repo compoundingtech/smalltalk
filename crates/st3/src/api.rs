@@ -6515,6 +6515,35 @@ async fn wake_work(
             "a manual work wake needs a reason",
         )));
     }
+    let step = state
+        .store
+        .step_run(&subject)
+        .map_err(ApiError::internal)?
+        .ok_or_else(|| ApiError::not_found(format!("step run `{subject}` does not exist")))?;
+    let agent = step.assigned_to.as_deref().ok_or_else(|| {
+        ApiError::bad(St3Error::new(
+            "work-has-no-assignee",
+            format!("step run `{}` has no exact assignee to wake", step.subject),
+        ))
+    })?;
+    let allowed = request
+        .actor
+        .strip_prefix("person/")
+        .is_some_and(|name| !name.is_empty() && !name.contains('/'))
+        || normalized_agent_actor(&request.actor).is_some_and(|actor| {
+            actor == agent
+                || current_agent_declaration(&state, &actor, "missing-agent-queue-authority")
+                    .ok()
+                    .is_some_and(|desired| {
+                        crate::graph::agent_queue_authority(&desired).allows_move(agent)
+                    })
+        });
+    if !allowed {
+        return Err(ApiError::bad(St3Error::new(
+            "work-wake-authority-denied",
+            format!("`{}` cannot wake work assigned to `{agent}`", request.actor),
+        )));
+    }
     if let Some(existing) = state
         .store
         .operation_claim(&request.idempotency_key)
@@ -6529,11 +6558,6 @@ async fn wake_work(
             .ok_or_else(|| ApiError::internal("the wake operation message is unavailable"))?;
         return Ok(Json(message));
     }
-    let step = state
-        .store
-        .step_run(&subject)
-        .map_err(ApiError::internal)?
-        .ok_or_else(|| ApiError::not_found(format!("step run `{subject}` does not exist")))?;
     if step.status != "ready" {
         return Err(ApiError::bad(St3Error::new(
             "work-not-ready",
@@ -6543,12 +6567,6 @@ async fn wake_work(
             ),
         )));
     }
-    let agent = step.assigned_to.as_deref().ok_or_else(|| {
-        ApiError::bad(St3Error::new(
-            "work-has-no-assignee",
-            format!("step run `{}` has no exact assignee to wake", step.subject),
-        ))
-    })?;
     let harness = state
         .store
         .current_harness(agent)
@@ -10507,9 +10525,40 @@ mission "wake" state="ready" {
         assert_eq!(status, StatusCode::OK, "{repeated}");
         assert_eq!(repeated["subject"], first["subject"]);
         assert_eq!(state.store.messages(Some(&agent), true).unwrap().len(), 1);
+        let app = router(state.clone());
+        let (status, denied) = json_request(
+            app.clone(),
+            &path,
+            serde_json::to_value(WorkWakeRequest {
+                actor: "agent/other".into(),
+                reason: "unrelated agent attempted a wake".into(),
+                idempotency_key: "manual-wake-foreign".into(),
+            })
+            .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{denied}");
+        assert_eq!(denied["code"], "work-wake-authority-denied");
+        for n in 2..=3 {
+            let (status, wake) = json_request(
+                app.clone(),
+                &path,
+                serde_json::to_value(WorkWakeRequest {
+                    actor: "person/operator".into(),
+                    reason: "retry the manual delivery".into(),
+                    idempotency_key: format!("manual-wake-request-{n}"),
+                })
+                .unwrap(),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{wake}");
+        }
         let projected = state.store.step_run(&step.subject).unwrap().unwrap();
         let wake = projected.wake.expect("wake projection");
-        assert_eq!(wake.attempts, 1);
+        assert_eq!(
+            wake.attempts, 0,
+            "manual wakes must not use automatic attempts"
+        );
         assert_eq!(wake.assignee_state, "idle");
     }
 
