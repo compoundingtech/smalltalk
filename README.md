@@ -1,240 +1,228 @@
 # Small Talk
 
-Small Talk (`st3`) coordinates durable agent work across machines without losing operational truth.
-Missions hold goals, constraints, ordered or parallel work, agents, terminals, gates, documents,
-queues, nested missions, schedules, and cleanup. The graph remains authoritative across harness,
-daemon, and machine restarts.
+Small Talk (`st3`) runs coding agents as durable seats and hands them work as missions. The graph
+records every seat, mission, step, message, and decision, so the state of your agents survives
+harness, daemon, and machine restarts. One daemon runs on each machine; machines can join a fleet.
 
-The normal product entry points answer three questions:
-
-- `st3 now`: what is happening and what needs action?
-- `st3 attention ls --as person/NAME`: what needs this person's decision?
-- `st3 launch start ... --as person/NAME`: what work should the network launch next?
+`st` is the same program as `st3`, under a shorter name. This guide uses `st3`.
 
 ## Install
 
-The Nix package installs `st3`, the shorter `st` symlink, the `stui` terminal
-app, `st3-migrate`, and the pinned `pty` runtime:
+With Nix, from a checkout:
 
 ```sh
 nix profile install .#st3
-st3 --help
 ```
 
-To install st2 beside it, use the `small-talk` package, which carries both products and the same
-`st` symlink:
+This installs `st3`, the `st` symlink, the `stui` terminal app, `st3-migrate`, and the pinned
+`pty` terminal runtime.
+
+Without Nix, build and install from a checkout with a Rust toolchain:
 
 ```sh
-nix profile install .#small-talk
+scripts/install                  # into ~/.local/bin
+scripts/install --bin-dir DIR    # or anywhere else
 ```
 
-From a checkout without Nix, `scripts/install` builds st2 and st3 once, installs `st2`, `st3`,
-`st3-migrate`, and `stui` into `~/.local/bin` (or `--bin-dir DIR`), and makes `st` a symlink to the
-installed `st3`. `st` is never a separate build.
+The script builds everything once, installs `st3`, `stui`, and `st3-migrate` (and `st2`, the
+previous generation), and makes `st` a symlink to the installed `st3`. `st` is never a separate
+build. A source install also needs [`pty`](https://github.com/compoundingtech/pty-rust) on `PATH`.
 
-For repository development:
+Each seat runs a coding harness, so install and log in to at least one: Claude Code, Codex, omp,
+pi, or OpenCode. Log in as the same user that runs the daemon.
+
+## Run the daemon
+
+Tell st3 who you are. Commands that act for a person read this, so you do not repeat `--as` on
+every command. The file is `$XDG_CONFIG_HOME/st3/config.toml` when that variable is set:
 
 ```sh
-cargo build -p st3 -p st3-migrate --locked
-target/debug/st3 --help
+mkdir -p ~/.config/st3
+printf 'person = "person/ada"\n' > ~/.config/st3/config.toml
 ```
 
-Source builds need `pty` on `PATH`; the Nix package includes it. Native agents
-also need their selected harness, such as Codex, Claude, pi, OMP, or OpenCode.
-
-## Start and check this machine
+Then install the daemon as a user service and check it:
 
 ```sh
 st3 service install
 st3 service status
 st3 doctor --strict
-st3 now
 ```
 
-The default state directory is `${XDG_STATE_HOME:-$HOME/.local/state}/st3`. The local API uses a
-Unix socket below `${XDG_RUNTIME_DIR}` when available and otherwise below the state directory.
+On Linux the service is a systemd user unit. It needs a working user manager; enable lingering
+(`loginctl enable-linger`) so seats keep running after you log out. On macOS it is a launchd
+agent; run `st3 service permissions` once for the Full Disk Access and Developer Tools steps.
 
-The service manager and mission runtimes are separate. Restarting the daemon does not stop a live
-agent, terminal, or exec process; reconciliation adopts the exact surviving incarnation. Linux uses
-systemd user scopes and macOS uses independent process sessions. On macOS, run
-`st3 service permissions` for the one-time Full Disk Access and Developer Tools instructions.
+State lives in `~/.local/state/st3` and the local API is a Unix socket. Restarting the daemon
+does not stop running seats; it adopts them. To run the daemon in the foreground instead, use
+`st3 up`.
 
-Finite client requests have bounded timeouts and actionable failures. Terminal attachment and an
-explicit follow remain open after connecting. Fleet replication is optional; Fabric, Tailscale, or
-another authenticated transport can expose the paired client and replication endpoints between
-machines. See [fleet replication](docs/st3/replication.md).
-
-## Launch work
-
-`launch` turns a natural-language request into a durable planning conversation and an exact mission
-preview. Human authority is always explicit as a complete `person/...` subject.
+## First commands
 
 ```sh
-st3 launch start --id release request.md \
-  --workspace /work/release \
-  --as person/operator
-
-st3 launch show launch/release/SESSION
-st3 launch preview launch/release/SESSION --variant default
-st3 launch approve-and-launch launch/release/SESSION PREVIEW_HASH \
-  --workspace /work/release \
-  --as person/operator
+st3 now                  # what needs you, what is working, what is unhealthy
+st3 agents ls            # seats and other running agents
+st3 missions ls          # missions with current runs
+st3 work ls              # steps that are ready or in progress
+st3 attention ls         # decisions and requests waiting for you
+st3 conversations ls person/ada
 ```
 
-The planner can ask typed, revisioned questions. Answers may be boolean, single-choice,
-multiple-choice, ranked-choice, or free text, and every answer may include an explanation. Use
-`launch revise` to add feedback, `launch compare` to compare variants, and `launch cancel` to end an
-unwanted conversation.
+Lists show current state. Add `--all` for history. Every command has `--help`, and the global
+`--json` flag prints the stable client format that the apps read. Run `stui` for the same views
+in a terminal app.
 
-An approved mission can also be started separately:
+## Declare a seat
+
+A seat is a durable agent: a harness, a model, and a workspace, kept running by st3. Write its
+declaration with `st3 agents start --print-kdl` and keep the file in Git:
 
 ```sh
-st3 missions start release \
-  --id release-candidate-42 \
-  --input request="Prepare release 42" \
-  --as person/operator \
-  --follow
+cd ~/src/garden
+st3 agents start example/worker --harness claude --model claude-sonnet-5 --effort medium \
+  --as person/ada --print-kdl > worker.kdl
 ```
 
-The mission run pins the exact revision, workspace, requester, and inputs. Missions permit one
-nonterminal run by default unless their declaration opts into concurrent runs.
-
-Exact hand-authored mission KDL does not need a planner session:
-
-```sh
-st3 missions publish missions/release.kdl --as person/operator
+```kdl
+version 2
+agent "example/worker" {
+    workspace "/home/ada/src/garden"
+    restart always
+    harness claude {
+        model claude-sonnet-5
+        effort medium
+    }
+}
 ```
 
-An agent can publish through the same command when its already-running declaration grants matching
-`mission-authority publish`. Publishing and starting remain separate, explicit actions.
-
-## Do mission work
-
-Every native harness receives a generated `.st3/boot.md`. It lists the exact graph-owned work and
-teaches the harness the small worker protocol:
+Apply it and look at it:
 
 ```sh
-"$ST3_BIN" work ls
-"$ST3_BIN" work claim step-run/RUN/STEP
-"$ST3_BIN" work progress step-run/RUN/STEP --summary "The tests now pass."
-"$ST3_BIN" work complete step-run/RUN/STEP --summary "The change is ready."
+st3 agents apply worker.kdl --as person/ada
+st3 agents show agent/example/worker
+st3 terminals peek agent/example/worker
 ```
 
-Use `work release` when another eligible agent should take the step and `work fail` when its goal
-cannot be met. An agent may publish a generated nested mission only from claimed work with declared
-`mission-authority` and a matching `produces-mission` contract. Use `queue {}` in mission KDL when
-source order is intentional; do not encode ordering only in prompts.
+The seat starts its harness in the workspace. Its first turn reads the generated
+`.st3/boot.md`, checks for work, and waits. `st3 terminals attach agent/example/worker` opens its
+terminal; Ctrl+\\ detaches without stopping it.
 
-The versioned examples in [`examples/st3`](examples/st3/README.md) are indexed by task. They
-cover durable seats for each harness, seat queues, parallel fan-out, GitHub intake, waiting for
-checks, a time, a person, or an agent, revisions, and bounded loops.
+A running seat keeps its current process when you apply a changed declaration; the change takes
+effect the next time it starts. To use it now, stop the seat and apply again. `st3 agents stop
+agent/example/worker --as person/ada` stops a seat until you apply its file again.
 
-## Understand the network
+[`examples/st3/seats`](examples/st3/seats) has a seat file for each harness.
 
-These are the normal operational views:
+## Give it work
+
+Work reaches a seat as mission steps assigned to it. A mission is a KDL file:
+
+```kdl
+version 2
+
+mission "example/first-note" state="ready" {
+  goal "Leave a short note in the workspace."
+
+  step "write-note" timeout="10m" {
+    assigned-to "agent/example/worker"
+    goal "Create notes/hello.md in ${ST_WORKSPACE} with one sentence that says what this project is for."
+  }
+}
+```
+
+Publish it once, then start a run:
 
 ```sh
-st3 now
-st3 machines
-st3 missions ls
-st3 missions show MISSION_OR_RUN
-st3 agents ls
-st3 agents tree
-st3 agents queue AGENT
+st3 missions publish first-note.kdl --as person/ada
+st3 missions start example/first-note --id example/first-note/1 \
+  --workspace ~/src/garden --as person/ada --follow
+st3 missions show mission-run/example/first-note/1
+```
+
+Publishing stores an immutable definition. Each `missions start` is one run. The run joins the
+seat's queue, st3 wakes the seat, and the seat claims the step, does it, and completes it.
+`--follow` returns when the run ends. While it runs:
+
+```sh
 st3 work ls
-st3 terminals ls
-st3 activity
+st3 agents queue agent/example/worker
 ```
 
-Current state is the default. Historical, stopped, and terminal records appear only behind the
-command's explicit `--all` option. Bounded lists print the exact continuation command when another
-page exists.
+A seat holds one step at a time and takes the next ready step in queue order. Steps can depend on
+each other, run in parallel, wait on gates, loop until a check passes, or ask a person to decide;
+see [the examples](examples/st3/README.md).
 
-Use `st3 subject show SUBJECT` for one typed card, `st3 subject history SUBJECT` for its immutable
-history, and `st3 schema subjects` to inspect the authoritative model. `st3 doctor` diagnoses local
-health; `st3 repair dry-run` produces an exact bounded repair plan before any mutation.
+## Talk to a seat
 
-## Attention and conversations
-
-The human inbox contains only current gates, approvals, unread person messages, and explicit fault
-requests for the selected person:
+Messages are for conversation, not for handing out work:
 
 ```sh
-st3 attention ls --as person/operator
-st3 attention show ATTENTION --as person/operator
-```
-
-Rendered items include exact approve, reject, read, resolve, or dismiss commands. No human action
-inherits `ST_AGENT`, `ST_PERSON`, local configuration, or a parent terminal.
-
-Conversations are normalized durable records:
-
-```sh
-st3 conversations send agent/fleet/example/worker \
-  --from person/operator \
-  --subject "Check the new request" \
-  --body "A new mission step is ready."
-
-st3 conversations ls agent/fleet/example/worker
-st3 conversations read MESSAGE --as agent/fleet/example/worker
+st3 conversations send agent/example/worker --from person/ada \
+  --subject "Hello" --body "Reply with one short sentence."
+st3 conversations ls person/ada
+st3 conversations read MESSAGE --as person/ada
 st3 conversations thread MESSAGE
+st3 conversations archive MESSAGE --as person/ada
 ```
 
-`conversations sessions` and `conversations timeline` expose normalized Codex, Claude, and OMP
-session history, including tool activity and available usage data.
+`st3 conversations sessions` lists harness sessions and `st3 conversations timeline SESSION`
+shows one session's messages and tool calls.
 
-## Import an existing harness session
+## Bring in sessions st3 does not own
 
-`import` discovers native Codex, Claude, and OMP sessions without claiming they are already managed:
+st3 can find Codex, Claude Code, omp, pi, and OpenCode sessions you started yourself and move one
+under its ownership:
 
 ```sh
-st3 import ls
-st3 import ls --all
+st3 import ls            # running sessions
+st3 import ls --all      # saved sessions too
 st3 import show SESSION
-st3 import run SESSION --as person/operator
+st3 conversations timeline SESSION
 ```
 
-Saved legacy sessions are readable through the normalized conversation view. Import revalidates the
-exact process fingerprint, stops only that process, publishes a durable resume mission, and starts
-the same native session under st3 ownership. Ambiguous or changed processes are refused.
-
-## Terminals
+`import show` gives the harness, the native session ID, the workspace, and the process, if one is
+running. A running harness whose command line does not name its session is listed as blocked; exit
+it, and import its saved session from `import ls --all`. Check the workspace before you import:
+do not import a session that a seat is already running.
 
 ```sh
-st3 terminals ls
-st3 terminals peek PTY
-st3 terminals attach PTY
-st3 terminals send PTY "status"
+st3 import run SESSION --as person/ada
 ```
 
-`terminals attach` uses the same binary terminal transport as the runtime. Ctrl+\\ detaches without
-stopping the session. The client restores terminal modes and sanitizes terminal state on normal
-exit, remote EOF, and errors. Nested attachment is refused unless `--force` is intentional.
+Import stops that exact process if it is still running, declares a durable seat named
+`agent/import/HARNESS/ID`, where `ID` is the one in `session/external-ID`, and starts the harness
+resuming the same native session. The seat has no mission owner, so st3 keeps it running like any
+seat you declare, and it appears in `agents`, `terminals`, and `conversations`.
+`st3 subject show agent/import/HARNESS/ID` shows the declaration import wrote.
 
-## Stable client data
-
-Human output is readable by default. Add global `--json` for the stable client-v0 envelope used by
-the future TUI and native applications:
+The resumed session keeps the settings it was saved with, such as its permission mode. To choose
+them, declare the seat yourself with the same identity, workspace, and resume arguments, and keep
+that file with your other seats. For a Claude Code session:
 
 ```sh
-st3 --json now
-st3 --json machines
-st3 --json conversations sessions
+st3 agents start import/claude/ID --harness claude --workspace WORKSPACE \
+  --model claude-sonnet-5 --effort medium \
+  --arg=--resume --arg NATIVE_SESSION_ID --arg=--permission-mode --arg auto \
+  --as person/ada --print-kdl > imported.kdl
+st3 agents stop agent/import/claude/ID --as person/ada
+st3 agents apply imported.kdl --as person/ada
 ```
 
-The client contract includes snapshots, fences, pagination, typed resources, structured diffs,
-capabilities, events, pairing, and normalized session timelines. Raw document bytes, terminal
-screens, streaming traces, and completion scripts retain their purpose-specific output.
+One limit remains: a resumed Claude Code session does not load st3's channel yet, so st3 cannot
+wake an imported Claude seat for new mission work or messages. Give mission work to a seat you
+declare yourself.
 
-## Documentation
+## Where to go next
 
-- [Documentation index](docs/st3/README.md)
-- [Architecture](docs/st3/design.md)
-- [Mission graph runtime](docs/st3/mission-graph-runtime.md)
-- [KDL lifecycle](docs/st3/kdl-lifecycle.md)
-- [Schema registry](docs/st3/schema.md)
-- [Examples](examples/st3/README.md)
-- [Product roadmap](docs/st3/roadmap.md)
+- [Examples](examples/st3/README.md), indexed by task: a seat for each harness, seat queues,
+  one mission across several seats, parallel fan-out, GitHub intake, and waiting for checks, a
+  time, a person, or another agent.
+- [Running st3 with omp](docs/st3/omp.md): omp seat setup, behavior, and known limits.
+- [Documentation index](docs/st3/README.md): architecture, the mission language, seat queues,
+  fleet replication, and the client contract.
+- [Guided CLI tour](docs/st3/cli-guided-tour.md): every command and subcommand.
+- `st3 launch start`: describe work in plain language and review the mission a planner drafts
+  before it runs.
 
-The st2 implementation remains in this repository for migration testing. It is not part of the st3
-CLI contract.
+This repository also carries st2, the previous generation; its guide is
+[README.st2.md](README.st2.md).
