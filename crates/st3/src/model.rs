@@ -1365,6 +1365,25 @@ pub struct ClientResourcePage {
     pub filters: BTreeMap<String, String>,
     pub items: Vec<Value>,
     pub page: ClientPageInfo,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sync: Option<ClientSyncNotice>,
+}
+
+/// Present on every page while this host is catching up with a peer, because its projections
+/// can then show early history as current.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ClientSyncNotice {
+    pub state: String,
+    pub peers: Vec<ClientSyncPeer>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ClientSyncPeer {
+    pub host_id: String,
+    pub peer_only_envelopes: u64,
+    pub local_only_envelopes: u64,
+    pub last_exchange_at: Option<String>,
+    pub estimated_catch_up_seconds: Option<u64>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -2371,6 +2390,32 @@ pub struct ReplicationPeerStatus {
     pub schema_digest: Option<String>,
     pub authority_digest: Option<String>,
     pub graph_digest: Option<String>,
+    /// How far apart the two envelope sets were at the last exchange that measured them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sync: Option<ReplicationPeerSync>,
+}
+
+/// The difference between this node's envelopes and one peer's, measured from the inventory the
+/// peer sent in its last exchange.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+pub struct ReplicationPeerSync {
+    /// Envelopes the peer holds that this node lacks.
+    pub peer_only_envelopes: u64,
+    /// Envelopes this node holds that the peer lacks.
+    pub local_only_envelopes: u64,
+    pub measured_at_unix_ms: u128,
+    /// Envelopes received from the peer per second over recent exchanges.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receive_rate_per_second: Option<f64>,
+    /// How fast `peer_only_envelopes` shrinks, net of the envelopes the peer keeps writing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub catch_up_rate_per_second: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimated_catch_up_seconds: Option<u64>,
+    /// The peer recently held more envelopes than one exchange carries, so this node's views
+    /// can show early history as current.
+    #[serde(default)]
+    pub catching_up: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

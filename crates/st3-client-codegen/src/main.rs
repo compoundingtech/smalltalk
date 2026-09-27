@@ -446,6 +446,8 @@ fn validate_surfaces(
         "MachineCapacity",
         "MachineOccupancy",
         "MachineTransport",
+        "SyncNotice",
+        "SyncPeer",
         "StructuredDiff",
         "Visualization",
         "VisualizationNode",
