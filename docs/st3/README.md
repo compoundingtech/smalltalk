@@ -13,6 +13,8 @@ Use these documents for implementation details:
 - [Agent seat queues](seat-queue.md) explains how each seat orders its mission runs and how moves
   are recorded and replicated.
 - [Resource subscriptions](resource-subscriptions.md) defines observers and automatic intake.
+- [Command recorder](command-recorder.md) explains how every `git` and `gh` call st3 starts is
+  recorded, the log format, and what the recorder cannot see.
 - [Agent migration](agent-migration.md) defines isolated rehearsal, cutover, and rollback.
 - [Eval audit](eval-audit.md) records the test intent and prompt boundary for each st3 eval.
 - [Running st3 with omp](omp.md) covers omp seat setup, behavior, and known limits;

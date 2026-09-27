@@ -13,6 +13,7 @@ pub mod model;
 pub mod peer;
 pub mod projection;
 pub mod reconcile;
+pub mod recorder;
 pub mod render;
 pub mod resource;
 pub mod seat_queue;

@@ -115,6 +115,8 @@ pub trait RuntimeControl: Send + Sync + 'static {
 pub struct NativeRuntime {
     pty: st_runtime::PtyRuntime,
     exec: st_runtime::ExecRuntime,
+    /// Goes first on every member's PATH so its `git` and `gh` calls are recorded.
+    recorder: Option<PathBuf>,
 }
 
 impl NativeRuntime {
@@ -127,8 +129,29 @@ impl NativeRuntime {
             )
             .with_binary(pty_binary.to_string_lossy()),
             exec: st_runtime::ExecRuntime::new(state_dir.join("exec"), state_dir.join("logs")),
+            recorder: None,
         }
     }
+
+    pub fn with_recorder(mut self, directory: Option<PathBuf>) -> Self {
+        self.recorder = directory;
+        self
+    }
+}
+
+/// Puts the recorder directory first on a member's PATH, after the declaration and the st3
+/// executable directory are applied, so no authored PATH can place a program before it.
+fn record_member_commands(
+    environment: &mut BTreeMap<String, String>,
+    recorder: Option<&Path>,
+) -> Result<()> {
+    let Some(recorder) = recorder else {
+        return Ok(());
+    };
+    let path =
+        crate::recorder::prepend(recorder, environment.get("PATH").map(std::ffi::OsStr::new))?;
+    environment.insert("PATH".into(), path.to_string_lossy().into_owned());
+    Ok(())
 }
 
 fn observed_pty_status(observation: &st_runtime::PtyObservation) -> String {
@@ -209,7 +232,9 @@ impl RuntimeControl for NativeRuntime {
 
     fn start(&self, member: &MemberSpec) -> Result<()> {
         let executable = launch_executable()?;
-        let environment = st_runtime::materialize_environment(&member.environment, &executable)?;
+        let mut environment =
+            st_runtime::materialize_environment(&member.environment, &executable)?;
+        record_member_commands(&mut environment, self.recorder.as_deref())?;
         let mut launch = st_runtime::Launch::from(&member.launch);
         match &mut launch {
             st_runtime::Launch::Shell(source) => {
@@ -358,17 +383,17 @@ impl Reconciler<NativeRuntime> {
         endpoint: String,
         notify: Arc<Notify>,
         event_notify: watch::Sender<u64>,
+        recorder: Option<PathBuf>,
     ) -> Result<Self> {
         let selected_pty_root = pty_root
             .map(Path::to_path_buf)
             .unwrap_or_else(|| state_dir.join("pty"));
         Ok(Self {
             store,
-            runtime: Arc::new(NativeRuntime::new(
-                state_dir,
-                Some(&selected_pty_root),
-                pty_binary,
-            )),
+            runtime: Arc::new(
+                NativeRuntime::new(state_dir, Some(&selected_pty_root), pty_binary)
+                    .with_recorder(recorder),
+            ),
             host,
             endpoint,
             driver_state_dir: state_dir.join("drivers"),
@@ -18389,6 +18414,23 @@ version 2
         std::fs::write(&installed, b"").unwrap();
         assert_eq!(replaced_executable(&deleted), Some(installed.clone()));
         assert_eq!(replaced_executable(&installed), None);
+    }
+
+    #[test]
+    fn the_recorder_leads_a_member_path_after_its_declaration() {
+        let mut environment = BTreeMap::from([(
+            "PATH".to_owned(),
+            "/workspace/bin:/state/recorder/bin:/usr/bin".to_owned(),
+        )]);
+        record_member_commands(&mut environment, Some(Path::new("/state/recorder/bin"))).unwrap();
+        assert_eq!(
+            environment["PATH"],
+            "/state/recorder/bin:/workspace/bin:/usr/bin"
+        );
+
+        let mut unrecorded = BTreeMap::from([("PATH".to_owned(), "/usr/bin".to_owned())]);
+        record_member_commands(&mut unrecorded, None).unwrap();
+        assert_eq!(unrecorded["PATH"], "/usr/bin");
     }
 
     #[test]

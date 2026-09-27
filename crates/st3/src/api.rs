@@ -3281,6 +3281,12 @@ fn doctor_report(state: &AppState) -> Result<Json<DoctorReport>, ApiError> {
             message: error.to_string(),
         }),
     }
+    let (recording, message) = crate::recorder::health(&state.state_dir);
+    checks.push(DoctorCheck {
+        name: "command-recorder".into(),
+        status: if recording { "pass" } else { "warn" }.into(),
+        message,
+    });
     let report_status = if checks.iter().any(|check| check.status == "fail") {
         "fail"
     } else if checks.iter().any(|check| check.status == "warn") {
