@@ -1525,7 +1525,12 @@ mod tests {
             vec![working, submitted, quiet],
         );
 
-        let rendered = render_mission_run(&root, &[root.clone()], OutputStyle::plain(), 3_000);
+        let rendered = render_mission_run(
+            &root,
+            std::slice::from_ref(&root),
+            OutputStyle::plain(),
+            3_000,
+        );
 
         assert!(rendered.contains("  progress: Tests pass; opening the pull request\n"));
         assert!(rendered.contains(&format!("  done: {}…\n", "x".repeat(120))));
