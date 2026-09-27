@@ -10,7 +10,8 @@ import { listCollectionPages, settleCollections, withConcurrency, type Collectio
 import { agentLabel, agentTree } from './agentTree';
 import { tabsChangedByProjectionEvents } from './projectionRefresh';
 import { rememberBounded } from './boundedCache';
-import { withFreshTerminalFence } from './terminalControls';
+import { followTerminal, withFreshTerminalFence } from './terminalControls';
+import { terminalRunStyle } from './terminalStyle';
 import { coalescedRefreshDelay, RefreshFlight } from './refreshFlight';
 import { ForegroundGate } from './foreground';
 import { gatewayFetch } from './gatewayFetch';
@@ -21,6 +22,7 @@ const tabs = ['Now', 'Chat', 'Control', 'Fleet'] as const;
 type Tab = typeof tabs[number];
 const emptyConversation: Conversation<TimelineEntry> = { entries: [], hasOlder: false, newestSequence: -1 };
 const URL_KEY = 'st3.gateway.url', ORDER_KEY = 'st3.tabs.order', CREDENTIAL_KEY = 'st3.device.credential';
+const TERMINAL_COLORS = { fg: '#d6dee3', bg: '#101923' };
 function items<K extends Resource['kind']>(page: Page, kind: K): Extract<Resource, { kind: K }>[] {
   return page.items.filter((item): item is Extract<Resource, { kind: K }> => item.kind === kind);
 }
@@ -396,25 +398,16 @@ export default function App() {
     return () => { live = false; };
   }, [client, sessionId, status, appActive, maxPageItems, timelineUnresolved, active, chatDetailOpen, terminalId]);
   useEffect(() => {
-    if (!client || !terminalId || !chatDetailOpen || active !== 'Chat' || !appActive) return;
-    let live = true, polling = false, unavailable = false;
-    async function poll() {
-      if (!live || polling || unavailable || status !== 'online' || !foreground.current.active) return;
-      polling = true;
-      try {
-        const result = await client!.terminalScreen(terminalId);
-        if (live) {
-          if (!terminalIncarnation.current) terminalIncarnation.current = result.value.runtime_incarnation;
-          setScreen(result.value);
-          setTerminalIssue(terminalIncarnation.current === result.value.runtime_incarnation ? '' : 'Terminal restarted; reopen it before sending input.');
-        }
-      } catch (error) {
-        if (live && error instanceof ClientError && error.status >= 400 && error.status < 500) { unavailable = true; setTerminalIssue(errorText(error)); }
-      } finally { polling = false; }
-    }
-    void poll();
-    const timer = setInterval(() => { void poll(); }, 1500);
-    return () => { live = false; clearInterval(timer); };
+    if (!client || !terminalId || !chatDetailOpen || active !== 'Chat' || !appActive || status !== 'online') return;
+    // The gateway pushes each changed screen over one attached stream; the app never polls.
+    const follow = followTerminal(client, terminalId, {
+      onScreen: next => {
+        if (!terminalIncarnation.current) terminalIncarnation.current = next.runtime_incarnation;
+        setScreen(next);
+      },
+      onIssue: setTerminalIssue,
+    }, actionId);
+    return () => follow.close();
   }, [client, terminalId, chatDetailOpen, active, appActive, status]);
 
   async function review(id: string) { if (!client || status !== 'online') return; try { const result = await client.launchVariantsList(id, { limit: Math.min(caps?.limits.max_page_items ?? 30, 30) }); setReviewLaunch(id); setVariants(items(result.value, 'launch-variant')); setError(''); } catch (e) { setError(errorText(e)); } }
@@ -432,9 +425,7 @@ export default function App() {
         return client.terminalInput({ id, idempotency_key: id, fence, parameters: { terminal_id: terminalId, mode, value } });
       });
       if (mode === 'line') setTerminalDraft('');
-      const latest = await client.terminalScreen(terminalId);
-      if (latest.value.runtime_incarnation !== incarnation) throw new Error('Terminal restarted; reopen it before sending input.');
-      setScreen(latest.value); setTerminalIssue(''); setTerminalActionNotice(''); setError('');
+      setTerminalActionNotice(''); setError('');
     } catch (cause) { setTerminalActionNotice(`Input was not confirmed. Inspect the screen before retrying: ${errorText(cause)}`); }
     finally { terminalSending.current = false; setBusy(false); }
   }
@@ -534,7 +525,7 @@ export default function App() {
               </View>
               <Text style={styles.muted}>Inputs require a live paired connection and are fenced to this terminal incarnation.</Text>
             </> : null}
-            <Card title="Screen" detail={screen ? screen.lines.map(line => line.text).join('\n') : terminalIssue || (status === 'online' ? 'Loading terminal screen…' : 'Offline; no terminal screen is cached.')} />
+            {screen ? <Card title="Screen"><View style={styles.terminal}>{screen.lines.map(line => <Text key={line.row} style={styles.terminalLine}>{line.redacted ? '[redacted]' : line.runs.length ? line.runs.map((run, index) => <Text key={index} style={terminalRunStyle(run, TERMINAL_COLORS)}>{run.text}</Text>) : line.text || ' '}</Text>)}</View></Card> : <Card title="Screen" detail={terminalIssue || (status === 'online' ? 'Loading terminal screen…' : 'Offline; no terminal screen is cached.')} />}
             {screen && status !== 'online' ? <Text style={styles.muted}>Offline · showing the last terminal frame.</Text> : null}
           </> : <>
             {!isUnmanaged(selectedSession) && selectedSession.state === 'running' ? data.runtimes.filter(r => r.terminal_id && r.owner_id === selectedSession.owner_id).map(r => <Button key={r.id} label="View terminal" disabled={status !== 'online'} onPress={() => void showTerminal(r.terminal_id!)} />) : null}
@@ -616,4 +607,4 @@ export default function App() {
     </ScrollView><View accessibilityRole="tablist" style={styles.tabs}>{order.map(t => <Pressable key={t} accessibilityRole="tab" accessibilityState={{ selected: active === t }} onPress={() => setActive(t)} style={[styles.tab, active === t && styles.activeTab]}><Text style={[styles.tabText, active === t && styles.activeTabText]}>{t}</Text></Pressable>)}</View>
   </SafeAreaView>;
 }
-const styles = StyleSheet.create({ page: { flex: 1, backgroundColor: '#101923' }, header: { paddingHorizontal: 22, paddingTop: 16, paddingBottom: 14, borderBottomColor: '#344651', borderBottomWidth: 1 }, brand: { color: '#f3f7fa', fontSize: 24, fontWeight: '700' }, status: { color: '#f0ad69', marginTop: 4 }, good: { color: '#67d6c5' }, content: { flex: 1 }, scroll: { padding: 20, paddingBottom: 48 }, title: { color: '#f3f7fa', fontSize: 27, fontWeight: '700', marginBottom: 10 }, section: { color: '#67d6c5', fontSize: 20, fontWeight: '700', marginTop: 25, marginBottom: 10 }, muted: { color: '#b8c7d0', fontSize: 14, lineHeight: 21, marginTop: 4 }, warning: { color: '#f0c77c', fontSize: 13, lineHeight: 19, marginTop: 8, marginBottom: 6 }, small: { color: '#a9bac5', fontSize: 12, lineHeight: 18 }, card: { backgroundColor: '#1b2b36', borderRadius: 12, padding: 15, marginTop: 10 }, cardTitle: { color: '#f3f7fa', fontSize: 16, fontWeight: '600' }, detailToggle: { alignSelf: 'flex-start', paddingVertical: 8, marginTop: 3 }, detailToggleText: { color: '#67d6c5', fontSize: 14, fontWeight: '600' }, input: { borderWidth: 1, borderColor: '#49606b', borderRadius: 10, color: '#f3f7fa', padding: 12, marginTop: 11, fontSize: 15 }, composer: { minHeight: 86, textAlignVertical: 'top' }, button: { backgroundColor: '#176d69', borderRadius: 9, paddingVertical: 10, paddingHorizontal: 13, alignSelf: 'flex-start', marginTop: 10 }, buttonText: { color: '#fff', fontWeight: '700', fontSize: 14 }, disabled: { opacity: 0.45 }, choice: { borderColor: '#49606b', borderWidth: 1, borderRadius: 10, padding: 10, marginTop: 8 }, selected: { borderColor: '#67d6c5', backgroundColor: '#214144' }, row: { flexDirection: 'row', flexWrap: 'wrap', gap: 5 }, chip: { borderRadius: 8, borderWidth: 1, borderColor: '#49606b', padding: 7, marginTop: 7 }, error: { backgroundColor: '#633b3b', padding: 10 }, errorText: { color: '#fff3ed' }, orderRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingVertical: 5 }, tabs: { flexDirection: 'row', borderTopWidth: 1, borderTopColor: '#344651' }, tab: { flex: 1, alignItems: 'center', paddingVertical: 16 }, activeTab: { borderTopWidth: 3, borderTopColor: '#67d6c5' }, tabText: { color: '#a9bac5', fontSize: 13, fontWeight: '600' }, activeTabText: { color: '#f3f7fa' } });
+const styles = StyleSheet.create({ page: { flex: 1, backgroundColor: '#101923' }, header: { paddingHorizontal: 22, paddingTop: 16, paddingBottom: 14, borderBottomColor: '#344651', borderBottomWidth: 1 }, brand: { color: '#f3f7fa', fontSize: 24, fontWeight: '700' }, status: { color: '#f0ad69', marginTop: 4 }, good: { color: '#67d6c5' }, content: { flex: 1 }, scroll: { padding: 20, paddingBottom: 48 }, title: { color: '#f3f7fa', fontSize: 27, fontWeight: '700', marginBottom: 10 }, section: { color: '#67d6c5', fontSize: 20, fontWeight: '700', marginTop: 25, marginBottom: 10 }, muted: { color: '#b8c7d0', fontSize: 14, lineHeight: 21, marginTop: 4 }, warning: { color: '#f0c77c', fontSize: 13, lineHeight: 19, marginTop: 8, marginBottom: 6 }, small: { color: '#a9bac5', fontSize: 12, lineHeight: 18 }, card: { backgroundColor: '#1b2b36', borderRadius: 12, padding: 15, marginTop: 10 }, cardTitle: { color: '#f3f7fa', fontSize: 16, fontWeight: '600' }, detailToggle: { alignSelf: 'flex-start', paddingVertical: 8, marginTop: 3 }, detailToggleText: { color: '#67d6c5', fontSize: 14, fontWeight: '600' }, input: { borderWidth: 1, borderColor: '#49606b', borderRadius: 10, color: '#f3f7fa', padding: 12, marginTop: 11, fontSize: 15 }, composer: { minHeight: 86, textAlignVertical: 'top' }, button: { backgroundColor: '#176d69', borderRadius: 9, paddingVertical: 10, paddingHorizontal: 13, alignSelf: 'flex-start', marginTop: 10 }, buttonText: { color: '#fff', fontWeight: '700', fontSize: 14 }, disabled: { opacity: 0.45 }, choice: { borderColor: '#49606b', borderWidth: 1, borderRadius: 10, padding: 10, marginTop: 8 }, selected: { borderColor: '#67d6c5', backgroundColor: '#214144' }, row: { flexDirection: 'row', flexWrap: 'wrap', gap: 5 }, chip: { borderRadius: 8, borderWidth: 1, borderColor: '#49606b', padding: 7, marginTop: 7 }, error: { backgroundColor: '#633b3b', padding: 10 }, errorText: { color: '#fff3ed' }, orderRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingVertical: 5 }, tabs: { flexDirection: 'row', borderTopWidth: 1, borderTopColor: '#344651' }, tab: { flex: 1, alignItems: 'center', paddingVertical: 16 }, activeTab: { borderTopWidth: 3, borderTopColor: '#67d6c5' }, tabText: { color: '#a9bac5', fontSize: 13, fontWeight: '600' }, activeTabText: { color: '#f3f7fa' }, terminal: { backgroundColor: '#101923', borderRadius: 8, padding: 8, marginTop: 8 }, terminalLine: { color: TERMINAL_COLORS.fg, fontFamily: 'Menlo', fontSize: 11, lineHeight: 14 } });

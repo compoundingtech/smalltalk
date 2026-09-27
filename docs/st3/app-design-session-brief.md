@@ -35,8 +35,8 @@ The foundation is materially ready for UI work:
   and live execution overlay data; neither app needs to parse KDL or Markdown to visualize a plan.
 - Device-to-person pairing produces scoped, revocable credentials. Remote request bodies cannot
   choose their own actor.
-- The terminal protocol provides a screen snapshot, ordered frames, attach/detach, input, resize,
-  reconnect, and incarnation fencing over WebSocket.
+- The terminal protocol streams whole styled screens over one held WebSocket, with attach/detach,
+  input, resize, reconnect, and incarnation fencing.
 - A generated Rust client supports local Unix sockets and authenticated remote HTTP. A generated
   Swift package supports the remote contract.
 - Saved/running Codex, Claude, Pi, OMP, and OpenCode sessions have a harness-neutral normalized timeline and a

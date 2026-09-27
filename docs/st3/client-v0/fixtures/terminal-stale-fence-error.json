@@ -1,0 +1,9 @@
+{
+  "api_version": "st3.client.v0",
+  "error_version": "st3.client.error.v0",
+  "request_id": "request/terminal-stream-end-1",
+  "code": "stale-fence",
+  "message": "subject `release-shell` changed incarnation",
+  "retryable": false,
+  "details": {}
+}

@@ -52,6 +52,7 @@ use crate::model::{
 use crate::store::Store;
 
 mod client_v0;
+mod terminal_view;
 
 #[derive(Clone)]
 pub struct AppState {
