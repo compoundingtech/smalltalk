@@ -285,10 +285,13 @@ const toolResult = (id) =>
 await handlers.get("session_start")({}, holdCtx);
 
 // Measured failure: a steer that arrived while the model streamed backgrounded the next batch's
-// commands as they started. The message now waits for the whole batch and is steered as its last
-// call returns, inside the awaited handler, so omp finds it at that same boundary.
+// commands as they started. Mail now waits for the whole batch and is steered as its last call
+// returns, inside the awaited handler, so omp finds it at that same boundary. omp injects one
+// queued steer per boundary, so mail released together is one steer: a second one would wait
+// through the next model turn and background that turn's batch.
 await handlers.get("agent_start")({}, holdCtx);
 sendMail("while streaming");
+sendMail("also while streaming");
 await pause(200);
 assert.deepStrictEqual(handedOver, [], "mail during a running turn is held, not steered at once");
 await toolCall("batch-a");
@@ -299,11 +302,15 @@ assert.deepStrictEqual(handedOver, [], "held while any call of the batch is in f
 await toolResult("batch-b");
 assert.deepStrictEqual(
   handedOver,
-  [{ content: "while streaming", options: { deliverAs: "steer" } }],
-  "steered by the time the batch's last tool_result handler returns",
+  [{ content: "while streaming\n\nalso while streaming", options: { deliverAs: "steer" } }],
+  "one steer by the time the batch's last tool_result handler returns",
 );
 await pause(100);
-assert.deepStrictEqual(acknowledged(), ["message/hold-1"], "acknowledged once omp has it");
+assert.deepStrictEqual(
+  acknowledged(),
+  ["message/hold-1", "message/hold-2"],
+  "each message is acknowledged once omp has it",
+);
 
 // Mail held to the end of a run is steered at `agent_end`, where omp is not yet idle, and omp's
 // queued-message drain continues the session with it. It never waits for the idle proof: a new
@@ -342,7 +349,7 @@ await handlers.get("agent_end")(successfulEnd, holdCtx);
 await pause(100);
 assert.deepStrictEqual(
   acknowledged(),
-  ["message/hold-1", "message/hold-2", "message/hold-3", "message/hold-4"],
+  ["message/hold-1", "message/hold-2", "message/hold-3", "message/hold-4", "message/hold-5"],
   "every message is acknowledged exactly once",
 );
 fs.rmSync(outboxPath, { force: true });

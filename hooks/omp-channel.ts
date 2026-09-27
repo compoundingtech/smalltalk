@@ -481,20 +481,28 @@ export default function (pi: ExtensionAPI) {
     toolCallsInFlight().clear();
   };
 
-  const handOff = async (message: HeldMessage) => {
+  // omp injects one queued steer per boundary (its default steering mode is `one-at-a-time`). A
+  // second steer released at the same boundary waited through the next model turn and then
+  // backgrounded that turn's whole batch (cross-omp-hold-luna-20260927-m), so mail released
+  // together reaches omp as one message.
+  const handOff = async (messages: HeldMessage[]) => {
+    const [first] = messages;
+    const content = messages.map((message) => message.content).join("\n\n");
     try {
       // `deliverAs` is required only while a turn is streaming, and an idle send that carries
       // one is rejected, so the idle proof selects the call shape. It never selects the
       // policy. Not optional-chained: reading a missing idle proof as "idle" would silently
       // turn every mid-turn delivery into a plain send.
-      if (message.ctx.isIdle()) {
-        await pi.sendUserMessage(message.content);
+      if (first.ctx.isIdle()) {
+        await pi.sendUserMessage(content);
       } else {
-        await pi.sendUserMessage(message.content, { deliverAs: message.deliverAs });
+        await pi.sendUserMessage(content, { deliverAs: first.deliverAs });
       }
-      message.reply({ type: "delivered", meta: message.meta });
+      for (const message of messages) message.reply({ type: "delivered", meta: message.meta });
     } catch (error) {
-      message.reply({ type: "failed", meta: message.meta, error: String(error) });
+      for (const message of messages) {
+        message.reply({ type: "failed", meta: message.meta, error: String(error) });
+      }
     }
   };
 
@@ -503,9 +511,8 @@ export default function (pi: ExtensionAPI) {
     clearHoldTimer();
     const batch = heldMessages().splice(0);
     const deliver = async () => {
-      for (const message of batch) {
-        if (message.channel === state.child) await handOff(message);
-      }
+      const current = batch.filter((message) => message.channel === state.child);
+      if (current.length > 0) await handOff(current);
     };
     state.handoff = (state.handoff ?? Promise.resolve()).then(deliver, deliver);
     return state.handoff;
