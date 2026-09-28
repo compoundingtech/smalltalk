@@ -9256,9 +9256,10 @@ impl Store {
              FROM claims AS request
              WHERE request.subject=?1 AND request.kind='schedule.work-requested'
                AND NOT EXISTS (
-                 SELECT 1 FROM claims AS started
-                 WHERE started.subject=request.subject AND started.kind='schedule.work-started'
-                   AND json_extract(started.body, '$.fields.request')=request.id
+                 SELECT 1 FROM claims AS closed
+                 WHERE closed.subject=request.subject
+                   AND closed.kind IN ('schedule.work-started','schedule.work-failed')
+                   AND json_extract(closed.body, '$.fields.request')=request.id
                )
              ORDER BY request.store_index",
         )?;
