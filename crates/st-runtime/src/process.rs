@@ -98,6 +98,7 @@ impl ExecRuntime {
         let mut command = crate::wrap_isolated(&unit, program.as_os_str(), &argument_refs);
         command
             .current_dir(cwd)
+            .env_clear()
             .envs(env)
             .stdin(Stdio::null())
             .stdout(log.try_clone()?)
@@ -466,7 +467,7 @@ mod tests {
     fn retains_the_current_and_previous_log_generations() {
         let root = tempfile::tempdir().unwrap();
         let runtime = ExecRuntime::new(root.path().join("exec"), root.path().join("logs"));
-        let environment = BTreeMap::new();
+        let environment = std::env::vars().collect::<BTreeMap<_, _>>();
         let cwd = root.path();
         let first = runtime
             .spawn(

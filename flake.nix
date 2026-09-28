@@ -295,6 +295,14 @@
             "--skip"
             "client::tests::terminal_socket_eof_restores_and_sanitizes_the_callers_tty"
           ];
+          # Give login-shell capture a disposable home and the sandbox's tool PATH.
+          # macOS /etc/profile otherwise puts host tools (such as /bin/ps, which
+          # cannot execute in the sandbox) ahead of their declared Nix equivalents.
+          preCheck = ''
+            export HOME=$(mktemp -d)
+            export SHELL=${pkgs.bashInteractive}/bin/bash
+            printf 'export PATH=%q\n' "$PATH" > "$HOME/.bash_profile"
+          '';
           # Render tests create throwaway repositories and call Git to protect
           # tracked files. Keep that dependency in the hermetic check sandbox.
           nativeBuildInputs = [
