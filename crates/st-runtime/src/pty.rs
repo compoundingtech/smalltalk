@@ -123,6 +123,7 @@ pub struct PtyRuntime {
     binary: String,
     root: PathBuf,
     spawn_timeout: Duration,
+    command_timeout: Duration,
     command_environment: Option<BTreeMap<String, String>>,
 }
 
@@ -144,6 +145,7 @@ impl PtyRuntime {
             binary: "pty".into(),
             root,
             spawn_timeout: SPAWN_PUBLICATION_TIMEOUT,
+            command_timeout: PTY_COMMAND_TIMEOUT,
             command_environment: None,
         }
     }
@@ -165,8 +167,14 @@ impl PtyRuntime {
         self
     }
 
+    #[cfg(test)]
+    fn with_command_timeout(mut self, timeout: Duration) -> Self {
+        self.command_timeout = timeout;
+        self
+    }
+
     pub fn snapshot(&self) -> Result<Vec<PtyObservation>> {
-        let output = self.command().args(["list", "--json"]).output()?;
+        let output = self.run(["list", "--json"])?;
         require_success("list PTYs", output).and_then(|bytes| parse_snapshot(&bytes))
     }
 
@@ -381,7 +389,7 @@ impl PtyRuntime {
 
     pub fn stop_if(&self, id: &str, expected_incarnation: Option<&str>) -> Result<()> {
         self.require_incarnation(id, expected_incarnation)?;
-        let output = self.command().args(["kill", id]).output()?;
+        let output = self.run(["kill", id])?;
         require_success("stop PTY", output)?;
         Ok(())
     }
@@ -414,7 +422,7 @@ impl PtyRuntime {
         // inside the terminal. Signalling that PID makes the registry disappear while leaving
         // the provider tree alive. Resolve the terminal child through the same daemon and fence
         // it against the list snapshot before delivering the signal.
-        let output = self.command().args(["stats", id, "--json"]).output()?;
+        let output = self.run(["stats", id, "--json"])?;
         let bytes = require_success("read PTY process identity", output)?;
         let stats: PtyStats =
             serde_json::from_slice(&bytes).context("parse PTY process identity")?;
@@ -458,7 +466,7 @@ impl PtyRuntime {
     }
 
     pub fn remove(&self, id: &str) -> Result<()> {
-        let output = self.command().args(["remove", id]).output()?;
+        let output = self.run(["remove", id])?;
         require_success("remove PTY", output)?;
         Ok(())
     }
@@ -486,10 +494,7 @@ impl PtyRuntime {
         expected_incarnation: Option<&str>,
     ) -> Result<()> {
         self.require_incarnation(id, expected_incarnation)?;
-        let output = self
-            .command()
-            .args(["send", id, "--seq", text, "--seq", "key:return"])
-            .output()?;
+        let output = self.run(["send", id, "--seq", text, "--seq", "key:return"])?;
         require_success("send PTY input", output)?;
         Ok(())
     }
@@ -509,12 +514,11 @@ impl PtyRuntime {
             !bytes.contains(&0),
             "terminal input cannot contain a NUL byte"
         );
-        let output = self
-            .command()
-            .arg("send")
-            .arg(id)
-            .arg(OsString::from_vec(bytes.to_vec()))
-            .output()?;
+        let output = self.run([
+            OsString::from("send"),
+            OsString::from(id),
+            OsString::from_vec(bytes.to_vec()),
+        ])?;
         require_success("send PTY input", output)?;
         Ok(())
     }
@@ -530,16 +534,13 @@ impl PtyRuntime {
         expected_incarnation: Option<&str>,
     ) -> Result<()> {
         self.require_incarnation(id, expected_incarnation)?;
-        let output = self
-            .command()
-            .args(["send", id, "--seq", &format!("key:{key}")])
-            .output()?;
+        let output = self.run(["send", id, "--seq", &format!("key:{key}")])?;
         require_success("send PTY key", output)?;
         Ok(())
     }
 
     pub fn screen(&self, id: &str) -> Result<String> {
-        let output = self.command().args(["peek", "--plain", id]).output()?;
+        let output = self.run(["peek", "--plain", id])?;
         let bytes = require_success("read PTY screen", output)?;
         String::from_utf8(bytes).context("the PTY screen is not UTF-8")
     }
@@ -559,6 +560,46 @@ impl PtyRuntime {
         }
         command.env("PTY_ROOT", &self.root);
         command
+    }
+
+    /// Run one `pty` command within its time limit.
+    fn run<I, S>(&self, arguments: I) -> Result<Output>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<std::ffi::OsStr>,
+    {
+        let mut command = self.command();
+        command.args(arguments);
+        output_within(command, self.command_timeout)
+    }
+}
+
+/// How long one `pty` command may run. The reconciler runs these inline for every member, so a
+/// command that stops answering, for example on a stuck registry lock, would stall the host.
+const PTY_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Run `command` and collect its output, killing it once `timeout` passes.
+fn output_within(mut command: Command, timeout: Duration) -> Result<Output> {
+    let child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let pid = child.id();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = sender.send(child.wait_with_output());
+    });
+    match receiver.recv_timeout(timeout) {
+        Ok(output) => Ok(output?),
+        Err(_) => {
+            // The child is not reaped until its waiter returns, so the pid is still its own.
+            unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+            anyhow::bail!(
+                "the pty command did not finish within {}s",
+                timeout.as_secs()
+            )
+        }
     }
 }
 
@@ -620,6 +661,19 @@ mod tests {
     use std::fs;
     use std::os::unix::process::CommandExt as _;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn a_pty_command_that_never_answers_times_out() {
+        let root = tempfile::tempdir().unwrap();
+        let binary = fake_executable(root.path(), "pty", "#!/bin/sh\nexec sleep 60\n");
+        let runtime = PtyRuntime::new(root.path().join("pty"))
+            .with_binary(binary.to_string_lossy())
+            .with_command_timeout(Duration::from_millis(200));
+        let started = Instant::now();
+        let error = runtime.snapshot().unwrap_err();
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(error.to_string().contains("did not finish"), "{error:#}");
+    }
 
     #[test]
     fn one_unreadable_pty_record_is_unknown_instead_of_failing_the_snapshot() {
