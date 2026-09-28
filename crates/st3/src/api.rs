@@ -157,6 +157,14 @@ fn signal_changed(state: &AppState) {
 // Usage samples and lease renewals are durable and visible, but neither can
 // advance a mission on its own. Terminal child state, claim expiry deadlines,
 // and harness readiness still wake the reconciler through their own paths.
+// A local observation never replicates and cannot advance a mission, so it only
+// wakes clients that follow this node's event feed.
+fn signal_local_change(state: &AppState) {
+    state
+        .event_notify
+        .send_modify(|generation| *generation = generation.saturating_add(1));
+}
+
 fn signal_visible_change(state: &AppState) {
     state
         .event_notify
@@ -1559,9 +1567,15 @@ fn managed_session_resources(
             });
             same_incarnation || (incarnation.is_none() && same_runtime)
         });
-        let accepted_times = incarnation_claims
+        let mut accepted_times = incarnation_claims
             .map(|claim| claim.accepted_at_unix_ms)
             .collect::<Vec<_>>();
+        if let Some(incarnation) = incarnation
+            && let Some(observed) =
+                store.latest_local_timeline_at(&subject.subject, incarnation, snapshot_index)?
+        {
+            accepted_times.push(observed);
+        }
         let started = fields
             .and_then(|fields| fields.get("started_at_unix_ms"))
             .and_then(|value| value.as_u64().map(u128::from))
@@ -5324,7 +5338,9 @@ async fn post_claim(
         .append_client_claim_outcome(&request)
         .map_err(ApiError::bad)?;
     if appended {
-        if request.kind == "harness.usage" {
+        if crate::store::local_observation_position(&response).is_some() {
+            signal_local_change(&state);
+        } else if request.kind == "harness.usage" {
             signal_visible_change(&state);
         } else {
             signal_changed(&state);
