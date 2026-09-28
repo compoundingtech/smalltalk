@@ -651,11 +651,14 @@ impl PeerBackend {
         }
     }
 
+    /// Hand an exchange to the main daemon. `round_trip` is how long this worker's request that
+    /// returned it took, when the exchange is a response.
     async fn receive(
         &self,
         peer: &str,
         fleet_id: &str,
         exchange: &ReplicationExchange,
+        round_trip: Option<Duration>,
     ) -> Result<ReplicationReceiveResponse> {
         match self {
             Self::Main(client) => {
@@ -666,12 +669,16 @@ impl PeerBackend {
                             peer: peer.to_owned(),
                             fleet_id: fleet_id.to_owned(),
                             exchange: exchange.clone(),
+                            round_trip_ms: round_trip.map(|duration| duration.as_millis() as u64),
                         },
                     )
                     .await
             }
             #[cfg(test)]
             Self::Local(store) => {
+                if let Some(round_trip) = round_trip {
+                    store.record_replication_round_trip(round_trip);
+                }
                 let receipt = store
                     .receive_replication_exchange(peer, fleet_id, exchange)
                     .map_err(anyhow::Error::msg)?;
@@ -1629,7 +1636,7 @@ async fn receive_exchange(
             serde_json::from_slice(&body).context("decode the replication exchange")?;
         let received = state
             .backend
-            .receive(&relay, state.auth.fleet_id(), &request)
+            .receive(&relay, state.auth.fleet_id(), &request, None)
             .await?;
         if received.changed {
             wake_main(&state.main_socket).await;
@@ -1861,11 +1868,13 @@ async fn exchange(
         envelopes: Vec::new(),
         ..first
     };
+    let started = std::time::Instant::now();
     let remote = post_signed(http, peer, node, auth, fleet, &query).await?;
+    let round_trip = started.elapsed();
     let different = remote.inventory.digest != local_digest;
     let pulled = !remote.envelopes.is_empty();
     let received = backend
-        .receive(&peer.name, auth.fleet_id(), &remote)
+        .receive(&peer.name, auth.fleet_id(), &remote, Some(round_trip))
         .await?;
     if received.changed {
         wake_main(main_socket).await;
@@ -1885,10 +1894,12 @@ async fn exchange(
             .await?
             .exchange;
         pushed = !push.envelopes.is_empty();
+        let started = std::time::Instant::now();
         let response = post_signed(http, peer, node, auth, fleet, &push).await?;
+        let round_trip = started.elapsed();
         pulled_follow_up = !response.envelopes.is_empty();
         let received = backend
-            .receive(&peer.name, auth.fleet_id(), &response)
+            .receive(&peer.name, auth.fleet_id(), &response, Some(round_trip))
             .await?;
         if received.changed {
             wake_main(main_socket).await;
@@ -2860,7 +2871,10 @@ mod tests {
             .export_replication_exchange(fleet, &ReplicationInventory::default())
             .unwrap();
         let backend = PeerBackend::Main(Client::unix(socket));
-        let received = backend.receive("source", fleet, &exchange).await.unwrap();
+        let received = backend
+            .receive("source", fleet, &exchange, None)
+            .await
+            .unwrap();
         assert!(received.changed);
         assert!(received.receipt.received > 0);
         let exported = backend
@@ -2906,7 +2920,10 @@ mod tests {
                 .len(),
             before + 1
         );
-        backend.receive("source", fleet, &exchange).await.unwrap();
+        backend
+            .receive("source", fleet, &exchange, None)
+            .await
+            .unwrap();
         let recovered = store
             .latest_claim("host/source", Some("transport.observed"))
             .unwrap()
