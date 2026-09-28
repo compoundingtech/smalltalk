@@ -149,6 +149,13 @@ the stable `id` ascending. No locale-sensitive ordering is permitted.
 | Sessions | `/sessions`, `/sessions/{id}` | updated time descending, ID |
 | Session timeline | `/sessions/{id}/timeline` | sequence ascending |
 
+A page carries an optional `sync` notice while its host is catching up with a fleet peer. Its
+projections can then show early history as current, such as an attention request that a
+not-yet-received envelope resolves. The notice lists each peer that holds more envelopes than one
+replication exchange carries, with `peer_only_envelopes` (held by the peer, missing here),
+`local_only_envelopes`, `last_exchange_at`, and `estimated_catch_up_seconds` (null until a rate is
+measured). Clients show the notice above the page. The page omits it once the host has caught up.
+
 IDs are stable opaque strings with a type prefix. Renames change labels, not IDs. A detail response
 uses the same representation as its list item plus its documented detail fields. Deletion is
 represented by an event tombstone; an ID is never reused.

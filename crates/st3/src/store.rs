@@ -26,10 +26,10 @@ use crate::model::{
     PlannerSpec, PlanningCandidateView, PlanningPreviewView, PlanningSessionDeclaration,
     PlanningSessionView, PlanningVariantView, ReplicaBatch, ReplicaEnvelope, ReplicaEnvelopeId,
     ReplicaRecordView, ReplicaRepairDeclaration, ReplicationExchange, ReplicationInventory,
-    ReplicationInventoryBucket, ReplicationPeerStatus, ReplicationReceipt, ReplicationStatus,
-    ResourceObservationOutcome, ResourceRefreshOperation, RevisionCutover, RevisionProposalView,
-    RevisionSubmissionView, RunGenerationView, RuntimeResetOperation, St3Error, StatusResponse,
-    StepRunView, SubjectChange, SubjectStatus, SubscriptionConditionSpec,
+    ReplicationInventoryBucket, ReplicationPeerStatus, ReplicationPeerSync, ReplicationReceipt,
+    ReplicationStatus, ResourceObservationOutcome, ResourceRefreshOperation, RevisionCutover,
+    RevisionProposalView, RevisionSubmissionView, RunGenerationView, RuntimeResetOperation,
+    St3Error, StatusResponse, StepRunView, SubjectChange, SubjectStatus, SubscriptionConditionSpec,
     SubscriptionRequestDecision, SubscriptionRequestView, SubscriptionSpec, UsageSummary,
     WorkRequest, WorkSelector, WorkWakeView,
 };
@@ -595,6 +595,7 @@ pub struct Store {
     seeded_batch_rowid: AtomicI64,
     replica_generation: AtomicU64,
     replication_snapshot: Mutex<Option<Arc<ReplicationSnapshot>>>,
+    replication_sync: Mutex<BTreeMap<String, PeerSyncProgress>>,
     /// This node's fleet member key. Set, it signs every envelope of this node's writer.
     member_key: std::sync::RwLock<Option<Arc<crate::fleet::MemberKey>>>,
     origin: String,
@@ -668,6 +669,71 @@ struct ReplicationSnapshot {
     authority_digest: String,
     graph_generation: i64,
     graph_digest: String,
+}
+
+/// Live sync measurements for one peer. They are rebuilt by the first exchange after a restart,
+/// so they stay in memory rather than in the graph.
+#[derive(Clone, Debug, Default)]
+struct PeerSyncProgress {
+    measured: Option<ReplicationPeerSync>,
+    window_started_at_unix_ms: u128,
+    window_peer_only: u64,
+    window_received: u64,
+}
+
+impl PeerSyncProgress {
+    /// Record one receipt from the peer and, when the peer's inventory allowed it, the measured
+    /// difference `(peer_only, local_only)`. Rates are sampled over windows of at least
+    /// `REPLICATION_SYNC_WINDOW_MS` and smoothed so one slow exchange does not swing the estimate.
+    fn observe(&mut self, received: usize, difference: Option<(u64, u64)>, now: u128) {
+        self.window_received = self.window_received.saturating_add(received as u64);
+        let Some((peer_only, local_only)) = difference else {
+            return;
+        };
+        let mut sync = self.measured.take().unwrap_or_default();
+        sync.peer_only_envelopes = peer_only;
+        sync.local_only_envelopes = local_only;
+        sync.measured_at_unix_ms = now;
+        let elapsed = now.saturating_sub(self.window_started_at_unix_ms);
+        if self.window_started_at_unix_ms != 0 && elapsed >= REPLICATION_SYNC_WINDOW_MS {
+            if elapsed <= REPLICATION_SYNC_STALE_MS {
+                let seconds = elapsed as f64 / 1000.0;
+                let smooth = |previous: Option<f64>, sample: f64| {
+                    Some(previous.map_or(sample, |previous| (previous + sample) / 2.0))
+                };
+                sync.receive_rate_per_second = smooth(
+                    sync.receive_rate_per_second,
+                    self.window_received as f64 / seconds,
+                );
+                let caught_up = self.window_peer_only as f64 - peer_only as f64;
+                sync.catch_up_rate_per_second =
+                    smooth(sync.catch_up_rate_per_second, caught_up.max(0.0) / seconds);
+            }
+            self.window_started_at_unix_ms = 0;
+        }
+        if self.window_started_at_unix_ms == 0 {
+            self.window_started_at_unix_ms = now;
+            self.window_peer_only = peer_only;
+            self.window_received = 0;
+        }
+        sync.estimated_catch_up_seconds = if peer_only == 0 {
+            Some(0)
+        } else {
+            sync.catch_up_rate_per_second
+                .filter(|rate| *rate > 0.0)
+                .map(|rate| (peer_only as f64 / rate).ceil() as u64)
+        };
+        self.measured = Some(sync);
+    }
+
+    /// The last measurement, marked as catching up while it is recent and the peer holds more
+    /// than one exchange of envelopes this node lacks.
+    fn view(&self, now: u128) -> Option<ReplicationPeerSync> {
+        let mut sync = self.measured.clone()?;
+        sync.catching_up = sync.peer_only_envelopes > REPLICATION_EXCHANGE_ENVELOPE_LIMIT as u64
+            && now.saturating_sub(sync.measured_at_unix_ms) <= REPLICATION_SYNC_STALE_MS;
+        Some(sync)
+    }
 }
 
 /// The replica envelope identities a snapshot keeps for its whole life. Writers are interned
@@ -1212,6 +1278,7 @@ impl Store {
             seeded_batch_rowid: AtomicI64::new(seeded_batch_rowid),
             replica_generation: AtomicU64::new(0),
             replication_snapshot: Mutex::new(None),
+            replication_sync: Mutex::new(BTreeMap::new()),
             member_key: std::sync::RwLock::new(None),
             origin,
         })
@@ -1252,6 +1319,7 @@ impl Store {
             seeded_batch_rowid: AtomicI64::new(seeded_batch_rowid),
             replica_generation: AtomicU64::new(0),
             replication_snapshot: Mutex::new(None),
+            replication_sync: Mutex::new(BTreeMap::new()),
             member_key: std::sync::RwLock::new(None),
             origin,
         })
@@ -6383,7 +6451,21 @@ impl Store {
                 .with_detail("current_head", json!(actual)));
             }
         }
-        let stored_fields = normalize_resource_observation(&transaction, input)?;
+        let mut stored_fields = normalize_resource_observation(&transaction, input)?;
+        // A leave names its own batch as the last sequence of its window. The sequence is only
+        // known here, under the writer lock, so a zero high water stands for "this batch".
+        if input.kind == "fleet.member-left"
+            && input.fields.get("high_water").and_then(Value::as_u64) == Some(0)
+        {
+            let mut fields = stored_fields
+                .clone()
+                .unwrap_or_else(|| input.fields.clone());
+            fields.insert(
+                "high_water".into(),
+                Value::from(next_replica_sequence(&transaction, &self.origin).map_err(internal)?),
+            );
+            stored_fields = Some(fields);
+        }
         if validate_message_transition(&transaction, input)? {
             let latest_id = latest_claim_id_tx(&transaction, &input.subject)
                 .map_err(internal)?
@@ -8461,6 +8543,7 @@ impl Store {
                     kind: "fault".into(),
                     subject: failure.id,
                     person: reviewer,
+                    requester_id: None,
                     title: "Subscription mission failed".into(),
                     detail: format!("{code}: {reason}"),
                     mission: None,
@@ -9178,9 +9261,10 @@ impl Store {
              FROM claims AS request
              WHERE request.subject=?1 AND request.kind='schedule.work-requested'
                AND NOT EXISTS (
-                 SELECT 1 FROM claims AS started
-                 WHERE started.subject=request.subject AND started.kind='schedule.work-started'
-                   AND json_extract(started.body, '$.fields.request')=request.id
+                 SELECT 1 FROM claims AS closed
+                 WHERE closed.subject=request.subject
+                   AND closed.kind IN ('schedule.work-started','schedule.work-failed')
+                   AND json_extract(closed.body, '$.fields.request')=request.id
                )
              ORDER BY request.store_index",
         )?;
@@ -10331,6 +10415,17 @@ impl Store {
         }
         drop(connection);
         let snapshot = self.replication_snapshot().map_err(internal)?;
+        let difference = replication_inventory_difference(
+            &snapshot.inventory,
+            &snapshot.buckets,
+            &input.inventory,
+        );
+        self.replication_sync
+            .lock()
+            .expect("replication sync mutex poisoned")
+            .entry(relay.to_owned())
+            .or_default()
+            .observe(received, difference, now_ms());
         Ok(ReplicationReceipt {
             received,
             duplicate,
@@ -10702,7 +10797,30 @@ impl Store {
             .find(|record| record.record_ref == record_ref))
     }
 
-    pub fn record_peer_failure(&self, peer: &str, status: &str, error: &str) -> Result<()> {
+    pub fn record_peer_failure(&self, peer: &str, status: &str, error: &str) -> Result<bool> {
+        // An inbound exchange is just as good evidence of reachability as an outbound one.
+        // Keep the last success during a short missed-exchange window, so a failed dial on
+        // one side cannot flap a peer that is still exchanging in the other direction.
+        if self
+            .replication_peer_last_success(peer)?
+            .is_some_and(|last| now_ms().saturating_sub(last) < 90_000)
+        {
+            return Ok(false);
+        }
+        if self
+            .readers
+            .get()
+            .query_row(
+                "SELECT status FROM replication_peers WHERE peer=?1",
+                [peer],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .as_deref()
+            == Some(status)
+        {
+            return Ok(true);
+        }
         {
             let connection = self.connection.lock().expect("store mutex poisoned");
             connection.execute(
@@ -10713,7 +10831,7 @@ impl Store {
                 params![peer, status, error, now_ms().to_string()],
             )?;
         }
-        Ok(())
+        Ok(true)
     }
 
     pub(crate) fn record_transport_observation(
@@ -10779,6 +10897,44 @@ impl Store {
             .and_then(|value| value.parse().ok()))
     }
 
+    /// Whether any peer's latest measurement says this node is catching up with it.
+    pub fn replication_catching_up(&self) -> bool {
+        let now = now_ms();
+        self.replication_sync
+            .lock()
+            .expect("replication sync mutex poisoned")
+            .values()
+            .any(|progress| progress.view(now).is_some_and(|sync| sync.catching_up))
+    }
+
+    /// The latest sync measurement for each configured peer that has one.
+    pub fn replication_peer_sync(
+        &self,
+        configured_peers: &[String],
+    ) -> BTreeMap<String, ReplicationPeerSync> {
+        let now = now_ms();
+        let progress = self
+            .replication_sync
+            .lock()
+            .expect("replication sync mutex poisoned");
+        configured_peers
+            .iter()
+            .filter_map(|peer| Some((peer.clone(), progress.get(peer)?.view(now)?)))
+            .collect()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn age_replication_peer_for_test(&self, peer: &str) {
+        self.connection
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE replication_peers SET last_success_at_unix_ms=?2 WHERE peer=?1",
+                params![peer, now_ms().saturating_sub(86_400_000).to_string()],
+            )
+            .unwrap();
+    }
+
     pub fn replication_status(
         &self,
         configured: bool,
@@ -10794,40 +10950,43 @@ impl Store {
                 |row| row.get(0),
             )?)
         };
+        let sync = self.replication_peer_sync(configured_peers);
         let mut peers = Vec::new();
         for peer in configured_peers {
-            peers.push(
-                connection
-                    .query_row(
-                        "SELECT status, last_success_at_unix_ms, last_error, schema_digest,
+            let mut status = connection
+                .query_row(
+                    "SELECT status, last_success_at_unix_ms, last_error, schema_digest,
                                 authority_digest, graph_digest
                          FROM replication_peers WHERE peer=?1",
-                        [peer],
-                        |row| {
-                            Ok(ReplicationPeerStatus {
-                                peer: peer.clone(),
-                                status: row.get(0)?,
-                                last_success_at_unix_ms: row
-                                    .get::<_, Option<String>>(1)?
-                                    .and_then(|value| value.parse().ok()),
-                                last_error: row.get(2)?,
-                                schema_digest: row.get(3)?,
-                                authority_digest: row.get(4)?,
-                                graph_digest: row.get(5)?,
-                            })
-                        },
-                    )
-                    .optional()?
-                    .unwrap_or(ReplicationPeerStatus {
-                        peer: peer.clone(),
-                        status: "unknown".into(),
-                        last_success_at_unix_ms: None,
-                        last_error: None,
-                        schema_digest: None,
-                        authority_digest: None,
-                        graph_digest: None,
-                    }),
-            );
+                    [peer],
+                    |row| {
+                        Ok(ReplicationPeerStatus {
+                            peer: peer.clone(),
+                            status: row.get(0)?,
+                            last_success_at_unix_ms: row
+                                .get::<_, Option<String>>(1)?
+                                .and_then(|value| value.parse().ok()),
+                            last_error: row.get(2)?,
+                            schema_digest: row.get(3)?,
+                            authority_digest: row.get(4)?,
+                            graph_digest: row.get(5)?,
+                            sync: None,
+                        })
+                    },
+                )
+                .optional()?
+                .unwrap_or(ReplicationPeerStatus {
+                    peer: peer.clone(),
+                    status: "unknown".into(),
+                    last_success_at_unix_ms: None,
+                    last_error: None,
+                    schema_digest: None,
+                    authority_digest: None,
+                    graph_digest: None,
+                    sync: None,
+                });
+            status.sync = sync.get(peer).cloned();
+            peers.push(status);
         }
         Ok(ReplicationStatus {
             configured,
@@ -15168,6 +15327,7 @@ fn attention_item_from_review(review: HumanReviewView) -> AttentionItemView {
         kind: "human-gate".into(),
         subject: review.owner.clone(),
         person: review.reviewer.clone(),
+        requester_id: None,
         title: review
             .title
             .clone()
@@ -15215,6 +15375,7 @@ fn attention_item_from_planning(
         kind: "launch-approval".into(),
         subject: session.subject.clone(),
         person: session.requester.clone(),
+        requester_id: None,
         title: format!("Approve mission/{}", session.mission),
         detail: "The current launch preview is ready for approval.".into(),
         mission: Some(format!("mission/{}", session.mission)),
@@ -15265,6 +15426,7 @@ fn attention_item_from_revision(
         kind: "revision-approval".into(),
         subject: proposal.subject.clone(),
         person: reviewer.to_owned(),
+        requester_id: None,
         title: format!("Approve a revision of {}", run.mission),
         detail: proposal.reason.clone(),
         mission: Some(run.mission.clone()),
@@ -15311,6 +15473,7 @@ fn attention_item_from_message(
         kind: "unread-message".into(),
         subject: message.subject.clone(),
         person: message.to.clone(),
+        requester_id: None,
         title: message
             .title
             .unwrap_or_else(|| format!("Message from {}", message.from)),
@@ -15334,11 +15497,17 @@ fn attention_item_from_message(
     }
 }
 
+pub(crate) fn agent_attention_requester(actor: &str) -> bool {
+    actor.starts_with("agent/") && actor != "agent/st3/reconciler"
+}
+
 fn attention_item_from_request(request: AttentionRequestView) -> AttentionItemView {
+    let agent_request = agent_attention_requester(&request.actor);
     AttentionItemView {
-        kind: "fault".into(),
+        kind: if agent_request { "agent-request" } else { "fault" }.into(),
         subject: request.subject.clone(),
         person: request.reviewer.clone(),
+        requester_id: Some(request.actor.clone()),
         title: request.title,
         detail: request.reason,
         mission: None,
@@ -15348,7 +15517,7 @@ fn attention_item_from_request(request: AttentionRequestView) -> AttentionItemVi
         requested_at_unix_ms: request.requested_at_unix_ms,
         actions: vec![
             attention_action(
-                "resolve",
+                if agent_request { "answer" } else { "resolve" },
                 &[
                     "st",
                     "attention",
@@ -16490,6 +16659,9 @@ impl Store {
     /// Whether transport observations about `peer` belong in the graph. A dial-out member is
     /// never dialed and never reports on others, so neither side records one.
     pub fn observes_transport_to(&self, peer: &str) -> Result<bool> {
+        if self.fleet_leaving()? {
+            return Ok(false);
+        }
         let membership = self.fleet_membership()?;
         let dial_out = |name: &str| {
             matches!(
@@ -16917,6 +17089,15 @@ fn store_envelope_signature_tx(
     )?)
 }
 
+/// What `st fleet remove` did.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct FleetRemoval {
+    pub name: String,
+    pub keys: Vec<String>,
+    pub high_water: u64,
+    pub revoked_invites: Vec<String>,
+}
+
 /// An invite this node just created. The token is returned once, for the join code.
 #[derive(Clone, Debug)]
 pub struct CreatedFleetInvite {
@@ -17063,6 +17244,158 @@ impl Store {
             token,
             expires_at_unix_ms: expires_at,
         })
+    }
+
+    /// Remove a member, or a config peer that was never one. Ends every current incarnation of
+    /// `name` at the highest sequence this node holds for that writer, and revokes the invites
+    /// it sponsored.
+    pub fn remove_fleet_member(
+        &self,
+        name: &str,
+        reason: &str,
+        person: &str,
+    ) -> Result<FleetRemoval, St3Error> {
+        use crate::fleet::MemberState;
+        if name == self.origin {
+            return Err(St3Error::new(
+                "cannot-remove-self",
+                "a member cannot remove itself; use st fleet leave",
+            ));
+        }
+        let own_key = self.member_public_key().ok_or_else(|| {
+            St3Error::new(
+                "not-a-member",
+                "only a member with a member key can remove; this node has none",
+            )
+        })?;
+        let membership = self.fleet_membership().map_err(internal)?;
+        if !matches!(membership.state(&self.origin), MemberState::Current(own) if own.member_key == own_key)
+        {
+            return Err(St3Error::new(
+                "not-a-member",
+                "this node is not a current fleet member",
+            ));
+        }
+        let keys = match membership.state(name) {
+            MemberState::Current(incarnation) => vec![Some(incarnation.member_key.clone())],
+            MemberState::Conflicted(current) => current
+                .iter()
+                .map(|incarnation| Some(incarnation.member_key.clone()))
+                .collect(),
+            MemberState::Ended(_) | MemberState::LegacyRemoved(_) => {
+                return Err(St3Error::new(
+                    "already-removed",
+                    format!("`{name}` is already out of the fleet"),
+                ));
+            }
+            MemberState::NotMember => vec![None],
+        };
+        let high_water: u64 = {
+            let connection = self.readers.get();
+            connection
+                .query_row(
+                    "SELECT COALESCE(MAX(sequence), 0) FROM replica_envelopes WHERE writer=?1",
+                    [name],
+                    |row| row.get(0),
+                )
+                .map_err(internal)?
+        };
+        if keys == [None] && high_water == 0 {
+            return Err(St3Error::new(
+                "unknown-member",
+                format!("`{name}` has never been a member or written to this fleet"),
+            ));
+        }
+        for key in &keys {
+            let mut fields = BTreeMap::from([
+                ("high_water".into(), Value::from(high_water)),
+                ("reason".into(), Value::String(reason.into())),
+                ("removed_by".into(), Value::String(person.into())),
+            ]);
+            if let Some(key) = key {
+                fields.insert("member_key".into(), Value::String(key.clone()));
+            }
+            self.append_claim(&ClaimInput {
+                subject: format!("host/{name}"),
+                kind: "fleet.member-removed".into(),
+                actor: Some(person.into()),
+                fields,
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            })?;
+        }
+        let sponsored = self
+            .fleet_invites(false)
+            .map_err(internal)?
+            .into_iter()
+            .filter(|invite| invite.state == "open" && invite.sponsor == format!("host/{name}"))
+            .collect::<Vec<_>>();
+        for invite in &sponsored {
+            self.revoke_fleet_invite(
+                invite.invite.trim_start_matches("fleet-invite/"),
+                "sponsor-removed",
+                Some(person),
+            )
+            .map_err(internal)?;
+        }
+        self.replication_snapshot().map_err(internal)?;
+        Ok(FleetRemoval {
+            name: name.into(),
+            keys: keys.into_iter().flatten().collect(),
+            high_water,
+            revoked_invites: sponsored.into_iter().map(|invite| invite.invite).collect(),
+        })
+    }
+
+    /// Append this member's leave as its writer's last batch.
+    /// Write this node's leave, once per member key: running `st fleet leave` again returns the
+    /// leave already written, so nothing follows it.
+    pub fn leave_fleet(&self, person: &str) -> Result<ClaimRecord, St3Error> {
+        let key = self
+            .member_public_key()
+            .ok_or_else(|| St3Error::new("not-a-member", "this node has no member key"))?;
+        let subject = format!("host/{}", self.origin);
+        if let Some(written) = self
+            .latest_claim(&subject, Some("fleet.member-left"))
+            .map_err(internal)?
+            .filter(|claim| claim.body["fields"]["member_key"] == key.as_str())
+        {
+            return Ok(written);
+        }
+        let record = self.append_claim(&ClaimInput {
+            subject,
+            kind: "fleet.member-left".into(),
+            actor: Some(person.into()),
+            fields: BTreeMap::from([
+                ("member_key".into(), Value::String(key)),
+                ("high_water".into(), Value::from(0)),
+            ]),
+            evidence: Vec::new(),
+            expected_subject: None,
+            idempotency_key: None,
+        })?;
+        self.replication_snapshot().map_err(internal)?;
+        Ok(record)
+    }
+
+    /// While leaving, this node refuses new local writes, so its leave stays its last.
+    pub fn set_fleet_leaving(&self, leaving: bool) -> Result<()> {
+        let connection = self.connection.lock().expect("store mutex poisoned");
+        if leaving {
+            connection.execute(
+                "INSERT OR REPLACE INTO meta(key, value) VALUES ('fleet_leaving', '1')",
+                [],
+            )?;
+        } else {
+            connection.execute("DELETE FROM meta WHERE key='fleet_leaving'", [])?;
+        }
+        Ok(())
+    }
+
+    pub fn fleet_leaving(&self) -> Result<bool> {
+        let connection = self.readers.get();
+        Ok(fleet_meta(&connection, "fleet_leaving")?.is_some())
     }
 
     /// The anchor admits itself, once.
@@ -17590,6 +17923,34 @@ mod fleet_admission_tests {
 
     fn admitted(store: &Store, claim: &ClaimRecord) -> bool {
         store.claim_by_id(&claim.id).unwrap().is_some()
+    }
+
+    #[test]
+    fn a_member_leaves_once_and_a_second_leave_writes_nothing() {
+        let anchor_key = key();
+        let laptop_key = key();
+        let anchor = node("anchor", Some(&anchor_key), Some(&anchor_key));
+        anchor
+            .admit_fleet_anchor(FLEET, anchor_key.public(), "listening")
+            .unwrap();
+        admit(&anchor, "laptop", &laptop_key, "invite", None);
+        let laptop = node("laptop", Some(&laptop_key), Some(&anchor_key));
+        sync(&anchor, &laptop);
+
+        let first = laptop.leave_fleet("person/test").unwrap();
+        let head = highest_sequence(&laptop, "laptop");
+        assert_eq!(first.body["fields"]["high_water"], json!(head));
+        let again = laptop.leave_fleet("person/test").unwrap();
+        assert_eq!(again.id, first.id);
+        assert_eq!(highest_sequence(&laptop, "laptop"), head);
+
+        sync(&laptop, &anchor);
+        let membership = anchor.fleet_membership().unwrap();
+        let MemberState::Ended(ended) = membership.state("laptop") else {
+            panic!("the anchor did not see the leave");
+        };
+        assert_eq!(ended.ended.as_deref(), Some("left"));
+        assert_eq!(ended.end, Some(head));
     }
 
     fn highest_sequence(store: &Store, writer: &str) -> u64 {
@@ -18173,6 +18534,13 @@ fn full_compact_replication_inventory(
 /// divergent exchange lists beyond its first differing range.
 const REPLICATION_EXCHANGE_ENVELOPE_LIMIT: usize = 512;
 
+/// The shortest span one sync rate sample covers.
+const REPLICATION_SYNC_WINDOW_MS: u128 = 10_000;
+
+/// A sync measurement older than this no longer says the node is catching up, and a longer gap
+/// between measurements gives no rate sample.
+const REPLICATION_SYNC_STALE_MS: u128 = 300_000;
+
 /// Sequences per compact inventory range. A range digest lets two peers skip every range they
 /// already share, so an exchange lists only the identities in ranges that differ.
 const REPLICATION_BUCKET_WIDTH: u64 = 256;
@@ -18266,6 +18634,104 @@ fn compact_replication_difference(
         );
     }
     (missing, listed)
+}
+
+/// Count the envelopes only the peer holds and only this node holds, as `(peer_only,
+/// local_only)`, from the inventory the peer sent. A range both sides hold with different
+/// digests counts exactly when the peer listed it, and otherwise counts the difference in range
+/// sizes, which is a lower bound. `None` means the inventory cannot tell, such as a bare digest
+/// that this node has since moved past.
+fn replication_inventory_difference(
+    inventory: &CompactReplicationInventory,
+    buckets: &[ReplicationInventoryBucket],
+    remote: &ReplicationInventory,
+) -> Option<(u64, u64)> {
+    if !remote.digest.is_empty() && remote.digest == inventory.digest {
+        return Some((0, 0));
+    }
+    if !remote.buckets.is_empty() {
+        let local_buckets = buckets
+            .iter()
+            .map(|bucket| ((bucket.writer.as_str(), bucket.start), bucket))
+            .collect::<BTreeMap<_, _>>();
+        let mut remote_listed = BTreeMap::<(&str, u64), Vec<&ReplicaEnvelopeId>>::new();
+        for identity in &remote.envelopes {
+            remote_listed
+                .entry((
+                    identity.writer.as_str(),
+                    replication_bucket_start(identity.sequence),
+                ))
+                .or_default()
+                .push(identity);
+        }
+        let mut shared = BTreeSet::new();
+        let (mut peer_only, mut local_only) = (0_u64, 0_u64);
+        for theirs in &remote.buckets {
+            let key = (theirs.writer.as_str(), theirs.start);
+            let Some(ours) = local_buckets.get(&key) else {
+                peer_only += theirs.count;
+                continue;
+            };
+            shared.insert(key);
+            if ours.digest == theirs.digest {
+                continue;
+            }
+            let known = remote_listed.get_mut(&key).and_then(|known| {
+                known.sort_unstable();
+                known.dedup();
+                (known.len() as u64 == theirs.count
+                    && replication_bucket_digest(known.iter().copied()) == theirs.digest)
+                    .then_some(&*known)
+            });
+            if let Some(known) = known {
+                let local = inventory.identities(inventory.range(&ours.writer, ours.start));
+                peer_only += known
+                    .iter()
+                    .filter(|identity| local.binary_search(**identity).is_err())
+                    .count() as u64;
+                local_only += local
+                    .iter()
+                    .filter(|identity| known.binary_search(identity).is_err())
+                    .count() as u64;
+            } else {
+                peer_only += theirs.count.saturating_sub(ours.count);
+                local_only += ours.count.saturating_sub(theirs.count);
+            }
+        }
+        local_only += buckets
+            .iter()
+            .filter(|bucket| !shared.contains(&(bucket.writer.as_str(), bucket.start)))
+            .map(|bucket| bucket.count)
+            .sum::<u64>();
+        return Some((peer_only, local_only));
+    }
+    if !remote.digest.is_empty() && remote.digest == replication_inventory_digest(&remote.envelopes)
+    {
+        // A peer without range digests, or with an empty store, lists its whole inventory once
+        // per identity. Look each one up in its range rather than expanding every local one.
+        let mut buffer = [0; 64];
+        let shared = remote
+            .envelopes
+            .iter()
+            .filter(|identity| {
+                inventory
+                    .range(
+                        &identity.writer,
+                        replication_bucket_start(identity.sequence),
+                    )
+                    .iter()
+                    .any(|envelope| {
+                        envelope.sequence == identity.sequence
+                            && inventory.hash_text(envelope, &mut buffer) == identity.hash
+                    })
+            })
+            .count();
+        return Some((
+            (remote.envelopes.len() - shared) as u64,
+            (inventory.envelopes.len() - shared) as u64,
+        ));
+    }
+    None
 }
 
 fn replication_identity_digest<'a>(
@@ -18999,6 +19465,185 @@ fn compact_replication_exchange_waits_for_a_complete_listing() {
     let (missing, listed) = compact_replication_difference(&inventory, &buckets, &listing, limit);
     assert!(missing.is_empty());
     assert_eq!(listed, inventory.public().envelopes);
+}
+
+#[cfg(test)]
+#[test]
+fn replication_difference_counts_what_each_side_lacks() {
+    let local = TestReplica(
+        [
+            test_envelope_ids("origin", 1..=2_000, "a"),
+            test_envelope_ids("relay", 1..=10, "a"),
+        ]
+        .concat()
+        .into_iter()
+        .collect(),
+    );
+    let mut peer = TestReplica(
+        [
+            test_envelope_ids("origin", 1..=1_500, "a"),
+            test_envelope_ids("relay", 1..=10, "a"),
+            test_envelope_ids("newcomer", 1..=5, "a"),
+            // A second candidate at one writer sequence inside a range both sides hold.
+            test_envelope_ids("origin", [700], "b"),
+        ]
+        .concat()
+        .into_iter()
+        .collect(),
+    );
+    let (inventory, buckets) = local.inventory();
+    let difference = |remote: &ReplicationInventory| -> Option<(u64, u64)> {
+        replication_inventory_difference(&inventory, &buckets, remote)
+    };
+    // The newcomer's five and the fork are only on the peer; origin 1501..=2000 only here.
+    assert_eq!(difference(&peer.summary()), Some((6, 500)));
+    let (_, listed) = peer.answer(&local.summary());
+    assert_eq!(difference(&listed), Some((6, 500)));
+
+    // Equal range sizes with different members: the summary can only bound the difference, and
+    // the peer's listing makes it exact.
+    peer.0.remove(&test_envelope_ids("relay", [3], "a")[0]);
+    peer.0.extend(test_envelope_ids("relay", [11], "a"));
+    assert_eq!(difference(&peer.summary()), Some((6, 500)));
+    let (_, listed) = peer.answer(&local.summary());
+    assert_eq!(difference(&listed), Some((7, 501)));
+
+    // An older peer lists its whole inventory, and so does a peer with an empty store.
+    let full = peer.inventory().0.public();
+    assert_eq!(difference(&full), Some((7, 501)));
+    let empty = ReplicationInventory {
+        digest: replication_inventory_digest(&[]),
+        ..ReplicationInventory::default()
+    };
+    assert_eq!(
+        difference(&empty),
+        Some((0, inventory.envelopes.len() as u64))
+    );
+
+    // A matching digest needs nothing else; a bare different digest cannot tell.
+    assert_eq!(difference(&local.summary()), Some((0, 0)));
+    let bare = ReplicationInventory {
+        digest: peer.summary().digest,
+        ..ReplicationInventory::default()
+    };
+    assert_eq!(difference(&bare), None);
+}
+
+#[cfg(test)]
+#[test]
+fn sync_progress_estimates_catch_up_from_net_progress() {
+    let mut progress = PeerSyncProgress::default();
+    progress.observe(0, Some((10_000, 0)), 1_000);
+    let sync = progress.view(1_000).unwrap();
+    assert!(sync.catching_up);
+    assert_eq!(sync.estimated_catch_up_seconds, None, "no rate sample yet");
+
+    // One full window: 1,000 envelopes in 10 seconds.
+    progress.observe(500, Some((9_500, 0)), 6_000);
+    progress.observe(500, Some((9_000, 2)), 11_000);
+    let sync = progress.view(11_000).unwrap();
+    assert_eq!(sync.local_only_envelopes, 2);
+    assert_eq!(sync.receive_rate_per_second, Some(100.0));
+    assert_eq!(sync.catch_up_rate_per_second, Some(100.0));
+    assert_eq!(sync.estimated_catch_up_seconds, Some(90));
+
+    // The peer keeps writing, so only half of what arrives closes the gap.
+    progress.observe(1_000, Some((8_500, 0)), 21_000);
+    let sync = progress.view(21_000).unwrap();
+    assert_eq!(sync.receive_rate_per_second, Some(100.0));
+    assert_eq!(sync.catch_up_rate_per_second, Some(75.0));
+    assert_eq!(sync.estimated_catch_up_seconds, Some(114));
+
+    // A receipt whose inventory could not be measured keeps the last measurement.
+    progress.observe(5, None, 22_000);
+    assert_eq!(progress.view(22_000).unwrap().peer_only_envelopes, 8_500);
+
+    // One exchange carries the rest, so this is no longer catching up.
+    progress.observe(
+        0,
+        Some((REPLICATION_EXCHANGE_ENVELOPE_LIMIT as u64, 0)),
+        23_000,
+    );
+    assert!(!progress.view(23_000).unwrap().catching_up);
+
+    // A measurement from a peer that went quiet stops claiming the node is behind.
+    progress.observe(0, Some((5_000, 0)), 24_000);
+    assert!(progress.view(24_000).unwrap().catching_up);
+    assert!(
+        !progress
+            .view(24_000 + REPLICATION_SYNC_STALE_MS + 1)
+            .unwrap()
+            .catching_up
+    );
+    progress.observe(0, Some((0, 0)), 30_000);
+    assert_eq!(
+        progress.view(30_000).unwrap().estimated_catch_up_seconds,
+        Some(0)
+    );
+}
+
+#[cfg(test)]
+#[test]
+fn a_receipt_measures_how_far_behind_this_node_is() {
+    const FLEET: &str = "018f6f0d-4a5d-7b8c-9d0e-123456789abc";
+    let source = Store::open_memory("source").unwrap();
+    for index in 0..1_200 {
+        source
+            .append_client_claim(&ClaimInput {
+                subject: format!("resource/sync-{index}"),
+                kind: "resource.observed".into(),
+                actor: None,
+                fields: BTreeMap::from([(
+                    "kind".into(),
+                    Value::String("custom.test.replication".into()),
+                )]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+    }
+    source.bind_fleet(FLEET).unwrap();
+    let target = Store::open_memory("target").unwrap();
+    target.bind_fleet(FLEET).unwrap();
+    let peers = ["source".to_owned()];
+    assert!(target.replication_peer_sync(&peers).is_empty());
+
+    let total = source.replication_inventory().unwrap().envelopes.len() as u64;
+    let local = target.replication_inventory().unwrap().envelopes.len() as u64;
+    let pull = || {
+        let summary = target.export_replication_summary(FLEET).unwrap();
+        let response = source
+            .export_replication_exchange(FLEET, &summary.inventory)
+            .unwrap();
+        target
+            .receive_replication_exchange("source", FLEET, &response)
+            .unwrap();
+        (
+            response.envelopes.len() as u64,
+            target.replication_peer_sync(&peers)["source"].clone(),
+        )
+    };
+    let (mut received, sync) = pull();
+    assert_eq!(sync.peer_only_envelopes, total - received);
+    assert_eq!(sync.local_only_envelopes, local);
+    assert!(sync.catching_up, "more than one exchange remains");
+    let status = target
+        .replication_status(true, Some(FLEET), &peers)
+        .unwrap();
+    assert_eq!(status.peers[0].sync.as_ref(), Some(&sync));
+
+    let (more, sync) = pull();
+    received += more;
+    assert_eq!(sync.peer_only_envelopes, total - received);
+    assert!(!sync.catching_up, "the rest fits in one exchange");
+
+    // An unconfigured relay's measurement is not reported.
+    assert!(
+        target
+            .replication_peer_sync(&["elsewhere".to_owned()])
+            .is_empty()
+    );
 }
 
 fn collect_referenced_blobs(
@@ -33858,7 +34503,7 @@ mission "review-current" state="ready" revision-cutover="restart-active" {{
                     reason: "a person must decide".into(),
                     severity: "warning".into(),
                     targets: targets.iter().map(|target| (*target).to_owned()).collect(),
-                    actor: "agent/node.requester".into(),
+                    actor: "daemon/runtime".into(),
                     idempotency_key: format!("{subject}:requested"),
                 },
             )
@@ -34200,7 +34845,8 @@ mission "typecase" state="ready" {
         assert_eq!(first.status, "pending");
         let items = store.attention_items(Some("person/nathan")).unwrap();
         assert_eq!(items.len(), 1);
-        assert_eq!(items[0].kind, "fault");
+        assert_eq!(items[0].kind, "agent-request");
+        assert_eq!(items[0].actions[0].label, "answer");
         assert_eq!(items[0].actions.len(), 2);
         assert!(
             store
