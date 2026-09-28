@@ -1674,7 +1674,7 @@ fn rewrite_owned_references(subjects: &mut BTreeMap<String, DesiredSubject>, run
 
 pub(crate) fn parse_gate(node: &KdlNode, default_host: &str) -> Result<GateSpec, St3Error> {
     reject_type(node)?;
-    ensure_only_properties(node, &["type"])?;
+    ensure_only_properties(node, &["type", "mode"])?;
     let name = one_string_with_children(node)?;
     if name.is_empty() || name.len() > 160 {
         return Err(St3Error::new(
@@ -1686,6 +1686,13 @@ pub(crate) fn parse_gate(node: &KdlNode, default_host: &str) -> Result<GateSpec,
         .children()
         .ok_or_else(|| St3Error::new("missing-gate-body", format!("gate `{name}` has no body")))?;
     let gate_type = property_string(node, "type")?;
+    let mode = property_string(node, "mode")?;
+    if mode.is_some() && gate_type.as_deref() != Some("human") {
+        return Err(St3Error::new(
+            "invalid-gate-mode",
+            "only a human gate accepts a mode",
+        ));
+    }
     if gate_type
         .as_deref()
         .is_some_and(|kind| matches!(kind, "llm" | "human"))
@@ -1937,11 +1944,12 @@ fn parse_running_gate(
     name: String,
     default_host: &str,
 ) -> Result<GateSpec, St3Error> {
-    ensure_only_properties(node, &["type"])?;
+    ensure_only_properties(node, &["type", "mode"])?;
     let body = node
         .children()
         .ok_or_else(|| St3Error::new("missing-gate-body", format!("gate `{name}` has no body")))?;
     let gate_type = property_string(node, "type")?;
+    let mode = property_string(node, "mode")?;
     let allowed: &[&str] = match gate_type.as_deref() {
         None => &["exec", "host", "workspace", "env", "time-limit"],
         Some("llm") => &[
@@ -1967,6 +1975,13 @@ fn parse_running_gate(
         unique_child(body, child)?;
     }
     if gate_type.as_deref() == Some("human") {
+        let mode = mode.unwrap_or_else(|| "approve".into());
+        if !matches!(mode.as_str(), "approve" | "feedback") {
+            return Err(St3Error::new(
+                "invalid-human-gate-mode",
+                format!("human gate `{name}` has invalid mode `{mode}`"),
+            ));
+        }
         let reviewer = required_child_string(body, "reviewer", &name)?;
         if !reviewer.starts_with("person/") {
             return Err(St3Error::new(
@@ -1994,6 +2009,7 @@ fn parse_running_gate(
         return Ok(GateSpec::Human {
             name,
             reviewer,
+            mode,
             question,
             review_targets,
         });

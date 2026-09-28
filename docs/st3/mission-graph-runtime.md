@@ -126,6 +126,11 @@ The mission baseline protects the run admission boundary. The inspection product
 
 The release decision is a final mission product. The human gate is a mission-level acceptance condition.
 
+A human gate uses `mode="approve"` by default. On a worker-owned step, `mode="feedback"`
+offers `approved` and `changes-requested` instead of approve and reject. A request for changes
+requires free text, sends it to the worker, and starts a new attempt with that text appended to
+the step goals. See [the feedback example](../../examples/st3/human-feedback.kdl).
+
 After acceptance, cleanup stops both agents before the run becomes completed.
 
 ## Mission syntax

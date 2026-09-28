@@ -122,6 +122,8 @@ pub trait RuntimeControl: Send + Sync + 'static {
 pub struct NativeRuntime {
     pty: st_runtime::PtyRuntime,
     exec: st_runtime::ExecRuntime,
+    /// Goes first on every member's PATH so its `git` and `gh` calls are recorded.
+    recorder: Option<PathBuf>,
 }
 
 impl NativeRuntime {
@@ -134,7 +136,12 @@ impl NativeRuntime {
             )
             .with_binary(pty_binary.to_string_lossy()),
             exec: st_runtime::ExecRuntime::new(state_dir.join("exec"), state_dir.join("logs")),
+            recorder: None,
         }
+    }
+    pub fn with_recorder(mut self, directory: Option<PathBuf>) -> Self {
+        self.recorder = directory;
+        self
     }
     fn pty(&self) -> Result<st_runtime::PtyRuntime> {
         Ok(self
@@ -142,6 +149,21 @@ impl NativeRuntime {
             .clone()
             .with_environment(crate::environment::snapshot()?))
     }
+}
+
+/// Puts the recorder directory first on a member's PATH, after the declaration and the st3
+/// executable directory are applied, so no authored PATH can place a program before it.
+fn record_member_commands(
+    environment: &mut BTreeMap<String, String>,
+    recorder: Option<&Path>,
+) -> Result<()> {
+    let Some(recorder) = recorder else {
+        return Ok(());
+    };
+    let path =
+        crate::recorder::prepend(recorder, environment.get("PATH").map(std::ffi::OsStr::new))?;
+    environment.insert("PATH".into(), path.to_string_lossy().into_owned());
+    Ok(())
 }
 
 fn observed_pty_status(observation: &st_runtime::PtyObservation) -> String {
@@ -222,11 +244,12 @@ impl RuntimeControl for NativeRuntime {
 
     fn start(&self, member: &MemberSpec) -> Result<()> {
         let executable = launch_executable()?;
-        let environment = st_runtime::overlay_environment(
+        let mut environment = st_runtime::overlay_environment(
             crate::environment::snapshot()?,
             &member.environment,
             &executable,
         )?;
+        record_member_commands(&mut environment, self.recorder.as_deref())?;
         let mut launch = st_runtime::Launch::from(&member.launch);
         match &mut launch {
             st_runtime::Launch::Shell(source) => {
@@ -417,17 +440,17 @@ impl Reconciler<NativeRuntime> {
         endpoint: String,
         notify: Arc<Notify>,
         event_notify: watch::Sender<u64>,
+        recorder: Option<PathBuf>,
     ) -> Result<Self> {
         let selected_pty_root = pty_root
             .map(Path::to_path_buf)
             .unwrap_or_else(|| state_dir.join("pty"));
         Ok(Self {
             store,
-            runtime: Arc::new(NativeRuntime::new(
-                state_dir,
-                Some(&selected_pty_root),
-                pty_binary,
-            )),
+            runtime: Arc::new(
+                NativeRuntime::new(state_dir, Some(&selected_pty_root), pty_binary)
+                    .with_recorder(recorder),
+            ),
             host,
             endpoint,
             driver_state_dir: state_dir.join("drivers"),
@@ -7035,6 +7058,7 @@ impl<R: RuntimeControl> Reconciler<R> {
         expand_gate(&mut gate, variables, &run.workspace)?;
         if let GateSpec::Human {
             reviewer,
+            mode,
             question,
             review_targets,
             ..
@@ -7047,6 +7071,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                 definition_hash,
                 attempt,
                 reviewer,
+                mode,
                 question.as_deref(),
                 review_targets,
             );
@@ -7073,6 +7098,7 @@ impl<R: RuntimeControl> Reconciler<R> {
         definition_hash: &str,
         attempt: u32,
         reviewer: &str,
+        mode: &str,
         question: Option<&str>,
         review_targets: &[String],
     ) -> Result<GateOutcome> {
@@ -7082,6 +7108,7 @@ impl<R: RuntimeControl> Reconciler<R> {
         let mut fields = BTreeMap::from([
             ("owner".into(), Value::String(subject.to_owned())),
             ("reviewer".into(), Value::String(reviewer.into())),
+            ("mode".into(), Value::String(mode.into())),
             ("question".into(), Value::String(question)),
             (
                 "review_targets".into(),
@@ -7090,10 +7117,14 @@ impl<R: RuntimeControl> Reconciler<R> {
             (
                 "decisions".into(),
                 Value::Array(
-                    ["approved", "rejected"]
-                        .into_iter()
-                        .map(|value| Value::String(value.into()))
-                        .collect(),
+                    if mode == "feedback" {
+                        ["approved", "changes-requested"]
+                    } else {
+                        ["approved", "rejected"]
+                    }
+                    .into_iter()
+                    .map(|value| Value::String(value.into()))
+                    .collect(),
                 ),
             ),
             (
@@ -7143,11 +7174,99 @@ impl<R: RuntimeControl> Reconciler<R> {
             .flatten()
         }) {
             Some("pass") => Ok(GateOutcome::Pass),
+            Some("feedback") if mode == "feedback" => {
+                let decision = decision.as_ref().expect("a feedback decision exists");
+                let reason = decision
+                    .body
+                    .pointer("/fields/reason")
+                    .and_then(Value::as_str)
+                    .filter(|reason| !reason.trim().is_empty())
+                    .context("a request for changes has no feedback text")?;
+                self.apply_human_feedback(subject, attempt, reviewer, reason, &decision.id)?;
+                Ok(GateOutcome::Pending)
+            }
             Some("fail") => Ok(GateOutcome::Fail(human_review_failure_reason(
                 decision.as_ref().expect("a failed decision exists"),
             ))),
             _ => Ok(GateOutcome::Pending),
         }
+    }
+
+    fn apply_human_feedback(
+        &self,
+        subject: &str,
+        attempt: u32,
+        reviewer: &str,
+        reason: &str,
+        decision_id: &str,
+    ) -> Result<()> {
+        let step = self
+            .store
+            .step_run(subject)?
+            .context("the feedback step disappeared")?;
+        if step.attempt != attempt {
+            return Ok(());
+        }
+        let claimant = self
+            .store
+            .claims_for(subject, Some("work.claimed"))?
+            .into_iter()
+            .rev()
+            .find(|claim| {
+                claim
+                    .body
+                    .pointer("/fields/attempt")
+                    .and_then(Value::as_u64)
+                    == Some(u64::from(attempt))
+            })
+            .and_then(|claim| {
+                claim
+                    .body
+                    .pointer("/fields/claimant")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
+            .or(step.claimant)
+            .or(step.carried_claimant)
+            .or(step.assigned_to)
+            .context("a feedback step has no claimant or assignee")?;
+        let key = format!("human-feedback:{decision_id}:{claimant}");
+        let message_id = hex::encode(sha2::Sha256::digest(key.as_bytes()));
+        self.store.append_claim(&ClaimInput {
+            subject: format!("message/{}", &message_id[..16]),
+            kind: "message.sent".into(),
+            actor: Some(reviewer.into()),
+            fields: BTreeMap::from([
+                ("from".into(), Value::String(reviewer.into())),
+                ("to".into(), Value::String(claimant)),
+                (
+                    "content".into(),
+                    Value::String(format!(
+                        "Reviewer requested changes to `{subject}`: {reason}. Claim the new attempt and address this feedback."
+                    )),
+                ),
+                ("status".into(), Value::String("sent".into())),
+                (
+                    "title".into(),
+                    Value::String("Human review requested changes".into()),
+                ),
+                ("in_reply_to".into(), Value::Null),
+                (
+                    "tags".into(),
+                    Value::Array(vec![Value::String(format!("st3-feedback:{subject}"))]),
+                ),
+            ]),
+            evidence: Vec::new(),
+            expected_subject: None,
+            idempotency_key: Some(key),
+        })?;
+        if self
+            .store
+            .retry_step_for_feedback(subject, attempt, reason, reviewer)?
+        {
+            self.signal_changed();
+        }
+        Ok(())
     }
 
     fn step_timed_out(
@@ -12073,6 +12192,116 @@ version 2
                 .unwrap_or_default()
                 .contains("The proof needs a source.")
         );
+    }
+
+    #[test]
+    fn feedback_review_retries_with_written_goals_and_messages_the_worker() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        apply_source(
+            &store,
+            r#"
+version 2
+agent "worker" { workspace "/tmp"; command "true" }
+mission "feedback-review" state="ready" {
+  goal "Review a draft."
+  step "draft" {
+    assigned-to "agent/worker"
+    goal "Submit a draft."
+    gate "review" type="human" mode="feedback" { reviewer "person/operator" }
+  }
+}
+"#,
+            "feedback-review-source",
+        );
+        let run = store
+            .create_mission_run(&crate::model::MissionRunRequest {
+                mission: "feedback-review".into(),
+                revision: None,
+                workspace: "/tmp".into(),
+                requester: Some("person/test".into()),
+                mode: Some("run".into()),
+                inputs: BTreeMap::new(),
+                idempotency_key: "feedback-review-run".into(),
+            })
+            .unwrap();
+        let step = &run.steps[0];
+        let claimant = step.assigned_to.clone().unwrap();
+        store.set_step_state(&step.subject, "ready", None).unwrap();
+        let work = |key: &str| crate::model::WorkRequest {
+            actor: Some(claimant.clone()),
+            incarnation: Some("test-incarnation".into()),
+            summary: Some("Draft submitted".into()),
+            reason: None,
+            evidence: Vec::new(),
+            idempotency_key: key.into(),
+        };
+        store
+            .work_action(&step.subject, "claim", &work("draft-claim-1"))
+            .unwrap();
+        store
+            .work_action(&step.subject, "complete", &work("draft-submit-1"))
+            .unwrap();
+        let reconciler = Reconciler::new(
+            store.clone(),
+            Arc::new(FakeRuntime::default()),
+            "node".into(),
+            Arc::new(Notify::new()),
+        );
+        reconciler.reconcile_once().unwrap();
+        let request = store
+            .gate_request_for_owner(&step.subject)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            request.body.pointer("/fields/mode").and_then(Value::as_str),
+            Some("feedback")
+        );
+        store
+            .append_claim(&ClaimInput {
+                subject: request.subject.clone(),
+                kind: "gate.result".into(),
+                actor: Some("person/operator".into()),
+                fields: BTreeMap::from([
+                    ("verdict".into(), Value::String("feedback".into())),
+                    (
+                        "reason".into(),
+                        Value::String("Add a source for the estimate.".into()),
+                    ),
+                    ("request".into(), Value::String(request.id.clone())),
+                ]),
+                evidence: vec![request.id],
+                expected_subject: None,
+                idempotency_key: Some("draft-feedback-1".into()),
+            })
+            .unwrap();
+        reconciler.reconcile_once().unwrap();
+        let retried = store.step_run(&step.subject).unwrap().unwrap();
+        assert_eq!(retried.attempt, 2);
+        assert_ne!(retried.status, "failed");
+        assert!(
+            retried
+                .goals
+                .iter()
+                .any(|goal| goal.contains("Add a source for the estimate."))
+        );
+        let retry_claim = store
+            .latest_claim(&step.subject, Some("step-run.retried"))
+            .unwrap()
+            .unwrap();
+        assert!(retry_claim
+            .body
+            .pointer("/fields/not_before_unix_ms")
+            .unwrap()
+            .is_null());
+        let messages = store.messages(Some(&claimant), false).unwrap();
+        assert_eq!(messages.len(), 1);
+        assert!(
+            messages[0]
+                .content
+                .contains("Add a source for the estimate.")
+        );
+        reconciler.reconcile_once().unwrap();
+        assert_eq!(store.messages(Some(&claimant), false).unwrap().len(), 1);
     }
 
     #[test]
@@ -19360,6 +19589,23 @@ version 2
         std::fs::write(&installed, b"").unwrap();
         assert_eq!(replaced_executable(&deleted), Some(installed.clone()));
         assert_eq!(replaced_executable(&installed), None);
+    }
+
+    #[test]
+    fn the_recorder_leads_a_member_path_after_its_declaration() {
+        let mut environment = BTreeMap::from([(
+            "PATH".to_owned(),
+            "/workspace/bin:/state/recorder/bin:/usr/bin".to_owned(),
+        )]);
+        record_member_commands(&mut environment, Some(Path::new("/state/recorder/bin"))).unwrap();
+        assert_eq!(
+            environment["PATH"],
+            "/state/recorder/bin:/workspace/bin:/usr/bin"
+        );
+
+        let mut unrecorded = BTreeMap::from([("PATH".to_owned(), "/usr/bin".to_owned())]);
+        record_member_commands(&mut unrecorded, None).unwrap();
+        assert_eq!(unrecorded["PATH"], "/usr/bin");
     }
 
     #[test]

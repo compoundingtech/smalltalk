@@ -30,6 +30,7 @@ const ACTIONS: &[&str] = &[
     "attention.resolve",
     "review.approve",
     "review.reject",
+    "review.request-changes",
     "message.send",
     "message.read",
     "message.close",
@@ -50,6 +51,7 @@ const ACTIONS: &[&str] = &[
     "work.complete",
     "work.fail",
     "work.release",
+    "work.retry",
     "work.publish-mission",
     "agent.queue-move",
     "runtime.stop",
@@ -67,6 +69,7 @@ const AVAILABLE_ACTIONS: &[&str] = &[
     "attention.resolve",
     "review.approve",
     "review.reject",
+    "review.request-changes",
     "message.send",
     "message.read",
     "message.close",
@@ -86,7 +89,11 @@ const AVAILABLE_ACTIONS: &[&str] = &[
     "work.complete",
     "work.fail",
     "work.release",
+    "work.retry",
     "agent.queue-move",
+    "runtime.stop",
+    "runtime.restart",
+    "runtime.reset",
     "runtime.context-clear",
     "runtime.signal",
     "terminal.input",
@@ -569,6 +576,7 @@ fn runtime_resources(
         }
         let local = authoritative && observed == "running" && actual_origin == state.store.origin();
         let incarnation_id = fields.get("incarnation_id").and_then(Value::as_str);
+        let desired_revision = state.store.selected_desired_token(&owner_id)?;
         let updated_at = state
             .store
             .claim_by_id(actual_claim)?
@@ -586,7 +594,7 @@ fn runtime_resources(
             "state": runtime_state,
             "runtime_id": runtime_id,
             "incarnation_id": incarnation_id,
-            "desired_revision": actual_claim,
+            "desired_revision": desired_revision,
             "owner_run_id": selected.owner_run,
             "terminal_id": terminal_id,
             "terminal_sequence": terminal.then_some(snapshot.store_index),
@@ -615,6 +623,146 @@ fn runtime_resources(
             .then_with(|| left["id"].as_str().cmp(&right["id"].as_str()))
     });
     Ok(values)
+}
+
+fn observer_subscription_resources(
+    state: &AppState,
+    kind: &str,
+    history: bool,
+    snapshot: &ClientSnapshot,
+) -> anyhow::Result<Vec<Value>> {
+    let mut values = Vec::new();
+    for desired in state.store.desired_subjects()? {
+        if desired.kind != kind
+            && !(desired.kind == "stop" && desired.subject.starts_with(&format!("{kind}/")))
+        {
+            continue;
+        }
+        let spec = if kind == "observer" {
+            let Some(spec) = crate::graph::observer_spec(&desired.desired) else {
+                continue;
+            };
+            serde_json::to_value(spec)?
+        } else {
+            let Some(spec) = crate::graph::subscription_spec(&desired.desired) else {
+                continue;
+            };
+            serde_json::to_value(spec)?
+        };
+        let stopped = spec
+            .get("stopped")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if stopped && !history {
+            continue;
+        }
+        let claim_kind = if kind == "observer" {
+            "observer.state"
+        } else {
+            "subscription.state"
+        };
+        let claim = state
+            .store
+            .claims_for_subject_kind_at(
+                &desired.subject,
+                claim_kind,
+                Some(snapshot.store_index.saturating_add(1)),
+                true,
+                1,
+            )?
+            .claims
+            .into_iter()
+            .next();
+        let observed_state = claim
+            .as_ref()
+            .and_then(|claim| claim.body.pointer("/fields/state"))
+            .and_then(Value::as_str);
+        let state_name = if stopped {
+            "stopped"
+        } else {
+            observed_state.unwrap_or("pending")
+        };
+        let revision = state
+            .store
+            .selected_desired_revision(&desired.subject)?
+            .unwrap_or_else(|| "unknown".into());
+        let updated_at = claim
+            .as_ref()
+            .map(|claim| client_timestamp(claim.accepted_at_unix_ms))
+            .unwrap_or_else(|| snapshot.created_at.clone());
+        values.push(json!({
+            "id": desired.subject,
+            "kind": kind,
+            "revision": revision,
+            "updated_at": updated_at,
+            "state": state_name,
+            "spec": spec,
+            "owner_run_id": desired.owner_run,
+            "owner_generation_id": desired.owner_generation,
+            "owner_step_id": desired.owner_step,
+            "operational": {
+                "layer": if stopped { "history" } else { "current" },
+                "actionable": !stopped,
+                "reasons": if stopped { vec!["stopped"] } else { Vec::<&str>::new() }
+            }
+        }));
+    }
+    values.sort_by(|left, right| left["id"].as_str().cmp(&right["id"].as_str()));
+    Ok(values)
+}
+
+pub(super) async fn observers(
+    State(state): State<AppState>,
+    Extension(snapshot): Extension<ClientSnapshot>,
+    Extension(session): Extension<ClientSession>,
+    Query(query): Query<ClientListQuery>,
+) -> Result<Json<ClientResourcePage>, ApiError> {
+    require_scope(&session, "read.projections")?;
+    let items = observer_subscription_resources(&state, "observer", query.history, &snapshot)
+        .map_err(ApiError::internal)?;
+    client_page(&state, &snapshot, "observers", items, &query).map(Json)
+}
+
+pub(super) async fn observer_detail(
+    State(state): State<AppState>,
+    Extension(snapshot): Extension<ClientSnapshot>,
+    Extension(session): Extension<ClientSession>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<Value>, ApiError> {
+    require_scope(&session, "read.projections")?;
+    client_detail(
+        observer_subscription_resources(&state, "observer", true, &snapshot)
+            .map_err(ApiError::internal)?,
+        "observer",
+        &id,
+    )
+}
+
+pub(super) async fn subscriptions(
+    State(state): State<AppState>,
+    Extension(snapshot): Extension<ClientSnapshot>,
+    Extension(session): Extension<ClientSession>,
+    Query(query): Query<ClientListQuery>,
+) -> Result<Json<ClientResourcePage>, ApiError> {
+    require_scope(&session, "read.projections")?;
+    let items = observer_subscription_resources(&state, "subscription", query.history, &snapshot)
+        .map_err(ApiError::internal)?;
+    client_page(&state, &snapshot, "subscriptions", items, &query).map(Json)
+}
+
+pub(super) async fn subscription_detail(
+    State(state): State<AppState>,
+    Extension(snapshot): Extension<ClientSnapshot>,
+    Extension(session): Extension<ClientSession>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<Value>, ApiError> {
+    require_scope(&session, "read.projections")?;
+    client_detail(
+        observer_subscription_resources(&state, "subscription", true, &snapshot)
+            .map_err(ApiError::internal)?,
+        "subscription",
+        &id,
+    )
 }
 
 fn machine_resources(
@@ -2705,6 +2853,8 @@ fn safe_event_projection(state: &AppState, record: &EventRecord) -> (String, Vec
     if record.subject.starts_with("message/")
         || record.subject.starts_with("attention/")
         || record.subject.starts_with("agent/")
+        || record.subject.starts_with("observer/")
+        || record.subject.starts_with("subscription/")
         || record.subject.starts_with("step-run/")
         || record.subject.starts_with("mission/")
     {
@@ -4131,7 +4281,7 @@ async fn terminal_stream_socket(
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct Fence {
     snapshot_id: String,
@@ -4142,6 +4292,7 @@ pub(super) struct Fence {
     attempt: Option<u32>,
     readiness_epoch: Option<u64>,
     runtime_incarnation: Option<String>,
+    runtime_desired_revision: Option<String>,
     terminal_sequence: Option<u64>,
     preview_token: Option<String>,
 }
@@ -4353,12 +4504,11 @@ fn contains_identity_selector(value: &Value) -> bool {
 }
 
 fn validate_work_fence(state: &AppState, target: &str, fence: &Fence) -> Result<(), ApiError> {
+    let target = client_detail_id("step-run", target);
     let work = state
         .store
-        .work(None, true)
+        .step_run(&target)
         .map_err(ApiError::internal)?
-        .into_iter()
-        .find(|work| work.subject == target || work.subject == client_detail_id("step-run", target))
         .ok_or_else(|| ApiError::not_found(format!("work `{target}` does not exist")))?;
     if fence.mission_generation.as_deref() != Some(work.generation.as_str())
         || fence.step_definition.as_deref() != Some(work.definition_hash.as_str())
@@ -4375,6 +4525,73 @@ fn validate_work_fence(state: &AppState, target: &str, fence: &Fence) -> Result<
         )));
     }
     Ok(())
+}
+
+fn runtime_control_target(
+    state: &AppState,
+    snapshot: &ClientSnapshot,
+    session: &ClientSession,
+    request: &ActionRequest,
+) -> Result<Value, ApiError> {
+    let target = parameter_string(&request.parameters, "target_id")?;
+    let runtime = runtime_resources(state, true, snapshot, session)
+        .map_err(ApiError::internal)?
+        .into_iter()
+        .find(|runtime| runtime["id"] == target || runtime["owner_id"] == target)
+        .ok_or_else(|| ApiError::not_found(format!("runtime `{target}` does not exist")))?;
+    let expected_incarnation = request
+        .fence
+        .runtime_incarnation
+        .as_deref()
+        .ok_or_else(|| validation("runtime control requires an incarnation fence"))?;
+    let expected_desired = request
+        .fence
+        .runtime_desired_revision
+        .as_deref()
+        .ok_or_else(|| validation("runtime control requires a desired revision fence"))?;
+    if runtime["incarnation_id"].as_str() != Some(expected_incarnation)
+        || runtime["desired_revision"].as_str() != Some(expected_desired)
+    {
+        return Err(stale("the runtime incarnation or desired revision changed"));
+    }
+    Ok(runtime)
+}
+
+async fn apply_runtime_control_intent(
+    state: &AppState,
+    snapshot: &ClientSnapshot,
+    request: &ActionRequest,
+    actor: &str,
+    kdl: String,
+) -> Result<Vec<String>, ApiError> {
+    let intent = IntentInput {
+        kdl,
+        source_name: Some(format!("client {}", request.action_type)),
+    };
+    let preview = mission(
+        State(state.clone()),
+        Json(MissionRequest {
+            intent,
+            at_index: Some(snapshot.store_index),
+        }),
+    )
+    .await?
+    .0;
+    if !preview.blockers.is_empty() {
+        return Err(validation(preview.blockers.join("; ")));
+    }
+    let result = apply(
+        State(state.clone()),
+        Json(ApplyRequest {
+            intent: preview.resolved_intent,
+            expected_subjects: preview.subject_tokens,
+            idempotency_key: format!("{}:runtime-intent", request.idempotency_key),
+            actor: Some(actor.to_owned()),
+        }),
+    )
+    .await?
+    .0;
+    Ok(result.reconcile_subjects)
 }
 
 fn validate_launch_fence(state: &AppState, target: &str, fence: &Fence) -> Result<(), ApiError> {
@@ -4451,17 +4668,18 @@ async fn dispatch_action(
     let p = &request.parameters;
     let authority_actor = &session.authority_actor;
     match request.action_type.as_str() {
-        decision @ ("review.approve" | "review.reject") => {
+        decision @ ("review.approve" | "review.reject" | "review.request-changes") => {
             let target = parameter_string(p, "target_id")?;
             let result = post_review(
                 State(state.clone()),
                 AxumPath(target),
                 Json(ReviewRequest {
-                    decision: if decision == "review.approve" {
-                        "approved".into()
-                    } else {
-                        "rejected".into()
-                    },
+                    decision: match decision {
+                        "review.approve" => "approved",
+                        "review.request-changes" => "changes-requested",
+                        _ => "rejected",
+                    }
+                    .into(),
                     reason: p.get("reason").and_then(Value::as_str).map(str::to_owned),
                     actor: Some(authority_actor.clone()),
                     expected_subject: None,
@@ -4753,6 +4971,22 @@ async fn dispatch_action(
             signal_changed(state);
             Ok(vec![result.subject])
         }
+        "work.retry" => {
+            let target = parameter_string(p, "target_id")?;
+            validate_work_fence(state, &target, &request.fence)?;
+            let result = retry_work(
+                State(state.clone()),
+                AxumPath(target),
+                Json(WorkRetryRequest {
+                    actor: authority_actor.clone(),
+                    reason: parameter_string(p, "reason")?,
+                    idempotency_key: request.idempotency_key.clone(),
+                }),
+            )
+            .await?
+            .0;
+            Ok(vec![result.subject])
+        }
         "mission.start" => {
             let inputs = p
                 .get("inputs")
@@ -4937,6 +5171,84 @@ async fn dispatch_action(
             signal_changed(state);
             Ok(vec![agent])
         }
+        action @ ("runtime.stop" | "runtime.restart" | "runtime.reset") => {
+            let runtime = runtime_control_target(state, snapshot, session, request)?;
+            let owner = runtime["owner_id"]
+                .as_str()
+                .ok_or_else(|| ApiError::internal("runtime has no owner"))?;
+            let reason = p
+                .get("reason")
+                .and_then(Value::as_str)
+                .filter(|reason| !reason.trim().is_empty())
+                .unwrap_or("requested through the client");
+            match action {
+                "runtime.stop" => {
+                    let kdl = format!(
+                        "version 2\nstop {}\n",
+                        serde_json::to_string(owner).map_err(ApiError::internal)?
+                    );
+                    apply_runtime_control_intent(state, snapshot, request, authority_actor, kdl)
+                        .await?;
+                    Ok(vec![owner.to_owned()])
+                }
+                "runtime.restart" => {
+                    let member = state
+                        .store
+                        .desired_subjects()
+                        .map_err(ApiError::internal)?
+                        .into_iter()
+                        .find(|desired| desired.subject == owner)
+                        .and_then(|desired| desired.member)
+                        .ok_or_else(|| validation("runtime restart requires a declared member"))?;
+                    if member.restart != crate::model::RestartType::Always {
+                        return Err(validation(
+                            "runtime restart requires an always restart policy",
+                        ));
+                    }
+                    let result = signal_session_as(
+                        state.clone(),
+                        owner.to_owned(),
+                        SessionSignalRequest {
+                            expected_incarnation: request
+                                .fence
+                                .runtime_incarnation
+                                .clone()
+                                .expect("validated incarnation"),
+                            signal: "terminate".into(),
+                            idempotency_key: format!("{}:runtime-restart", request.idempotency_key),
+                        },
+                        authority_actor,
+                    )
+                    .await?
+                    .0;
+                    Ok(vec![result.subject])
+                }
+                "runtime.reset" => {
+                    let run_id = runtime["owner_run_id"]
+                        .as_str()
+                        .ok_or_else(|| validation("runtime reset requires a run-owned runtime"))?;
+                    let run = state
+                        .store
+                        .mission_run(run_id)
+                        .map_err(ApiError::internal)?
+                        .ok_or_else(|| {
+                            ApiError::not_found(format!("mission run `{run_id}` does not exist"))
+                        })?;
+                    let kdl = format!(
+                        "version 2\nmission-run {} {{\n  reset {} {{\n    runtime {}\n    from {}\n    reason {}\n  }}\n}}\n",
+                        serde_json::to_string(&run.id).map_err(ApiError::internal)?,
+                        serde_json::to_string(&request.id).map_err(ApiError::internal)?,
+                        serde_json::to_string(owner).map_err(ApiError::internal)?,
+                        serde_json::to_string(&run.generation).map_err(ApiError::internal)?,
+                        serde_json::to_string(reason).map_err(ApiError::internal)?,
+                    );
+                    apply_runtime_control_intent(state, snapshot, request, authority_actor, kdl)
+                        .await?;
+                    Ok(vec![owner.to_owned()])
+                }
+                _ => unreachable!(),
+            }
+        }
         "runtime.context-clear" => {
             let target = terminal_subject(&parameter_string(p, "target_id")?);
             let result = clear_context(
@@ -4955,16 +5267,17 @@ async fn dispatch_action(
         }
         "runtime.signal" => {
             let target = terminal_subject(&parameter_string(p, "target_id")?);
-            let result = signal_session(
-                State(state.clone()),
-                AxumPath(target),
-                Json(SessionSignalRequest {
+            let result = signal_session_as(
+                state.clone(),
+                target,
+                SessionSignalRequest {
                     expected_incarnation: request.fence.runtime_incarnation.clone().ok_or_else(
                         || validation("runtime control requires an incarnation fence"),
                     )?,
                     signal: parameter_string(p, "signal")?,
                     idempotency_key: request.idempotency_key.clone(),
-                }),
+                },
+                authority_actor,
             )
             .await?
             .0;
@@ -5305,6 +5618,371 @@ mod tests {
             native_session_home: None,
             planner_default: crate::model::PlannerSpec::default(),
         }
+    }
+
+    #[test]
+    fn observers_subscriptions_and_agentless_gate_kinds_are_projected() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state_named(root.path(), "client-watch-test");
+        let source = r#"
+version 2
+mission "watch-work" state="ready" {
+  goal "Project gate types."
+  step "watch" { agentless }
+  step "flag" {
+    agentless
+    gate "flag is ready" { field "status" "resource/watch/source" "is" "ready" }
+  }
+  step "command" {
+    agentless
+    gate "command succeeds" { exec "true"; host "local"; workspace "/tmp" }
+  }
+}
+"#;
+        let intent = crate::graph::parse_intent(source, "client-watch-test").unwrap();
+        let planned = state
+            .store
+            .mission(
+                &intent,
+                IntentInput {
+                    kdl: source.into(),
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        assert!(planned.blockers.is_empty(), "{:?}", planned.blockers);
+        state
+            .store
+            .apply(&intent, &planned.subject_tokens, "client-watch-fixture")
+            .unwrap();
+        let run = state
+            .store
+            .create_mission_run(&MissionRunRequest {
+                mission: "watch-work".into(),
+                revision: None,
+                workspace: root.path().display().to_string(),
+                requester: Some("person/nathan".into()),
+                mode: Some("run".into()),
+                inputs: BTreeMap::new(),
+                idempotency_key: "client-watch-run".into(),
+            })
+            .unwrap();
+        for step in &run.steps {
+            state
+                .store
+                .set_step_state(&step.subject, "ready", None)
+                .unwrap();
+        }
+        let observer_source = r#"
+version 2
+resource "watch/source" { kind "filesystem.file" }
+observer "watch/source" {
+  resource "resource/watch/source"
+  provider "local.file"
+  locator "/tmp/client-watch-source"
+  field "status"
+}
+subscription "watch/source" {
+  observer "observer/watch/source"
+  to "agent/client-watch-test.worker"
+  on "status"
+  delivery "message"
+}
+"#;
+        let observer_intent =
+            crate::graph::parse_execution_intent(observer_source, "client-watch-test", "watch-run")
+                .unwrap();
+        state
+            .store
+            .apply_internal(&observer_intent, "client-watch-observer")
+            .unwrap();
+        let snapshot = new_client_snapshot(&state);
+        let observers =
+            observer_subscription_resources(&state, "observer", false, &snapshot).unwrap();
+        let subscriptions =
+            observer_subscription_resources(&state, "subscription", false, &snapshot).unwrap();
+        assert_eq!(observers.len(), 1);
+        assert_eq!(observers[0]["spec"]["resource"], "resource/watch/source");
+        assert_eq!(subscriptions.len(), 1);
+        assert_eq!(
+            subscriptions[0]["spec"]["observer"],
+            "observer/watch-run/watch/source"
+        );
+        let work = super::super::client_work_resources(
+            &state.store,
+            None,
+            false,
+            client_snapshot_time(&snapshot),
+            snapshot.store_index,
+        )
+        .unwrap();
+        let gate = |path: &str| {
+            work.iter()
+                .find(|item| item["mission_run_id"] == run.subject && item["path"] == path)
+                .unwrap()["gate_kind"]
+                .clone()
+        };
+        assert_eq!(gate("watch"), "watch");
+        assert_eq!(gate("flag"), "predicate");
+        assert_eq!(gate("command"), "command");
+    }
+
+    #[tokio::test]
+    async fn runtime_stop_uses_the_person_and_rejects_a_stale_desired_fence() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state_named(root.path(), "client-control-test");
+        let source = "version 2\nagent \"worker\" { workspace \"/tmp\"; command \"true\"; restart \"always\" }\n";
+        let intent = crate::graph::parse_intent(source, "client-control-test").unwrap();
+        let planned = state
+            .store
+            .mission(
+                &intent,
+                IntentInput {
+                    kdl: source.into(),
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        state
+            .store
+            .apply(&intent, &planned.subject_tokens, "client-control-agent")
+            .unwrap();
+        let owner = state
+            .store
+            .desired_subjects()
+            .unwrap()
+            .into_iter()
+            .find(|desired| desired.kind == "agent")
+            .unwrap()
+            .subject;
+        let incarnation = "client-control-runtime:i1";
+        state
+            .store
+            .append_claim(&ClaimInput {
+                subject: owner.clone(),
+                kind: "runtime.observed".into(),
+                actor: Some(owner.clone()),
+                fields: BTreeMap::from([
+                    ("status".into(), Value::String("running".into())),
+                    (
+                        "runtime_id".into(),
+                        Value::String("client-control-runtime".into()),
+                    ),
+                    ("incarnation_id".into(), Value::String(incarnation.into())),
+                    ("terminal".into(), Value::Bool(false)),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+        let session = ClientSession::local(Some("person/nathan")).unwrap();
+        let snapshot = new_client_snapshot(&state);
+        let desired = state.store.selected_desired_token(&owner).unwrap().unwrap();
+        let request = ActionRequest {
+            api_version: CLIENT_API_VERSION.into(),
+            id: "action/stop-worker".into(),
+            action_type: "runtime.stop".into(),
+            idempotency_key: "stop-worker-client-0001".into(),
+            fence: Fence {
+                snapshot_id: snapshot.id.clone(),
+                runtime_incarnation: Some(incarnation.into()),
+                runtime_desired_revision: Some("stale-desired".into()),
+                ..Fence::default()
+            },
+            parameters: json!({"target_id": "runtime/client-control-runtime", "reason": "operator stop"}),
+        };
+        assert_eq!(
+            dispatch_action(&state, &snapshot, &session, &request)
+                .await
+                .unwrap_err()
+                .code,
+            "stale-fence"
+        );
+        let mut current = request;
+        current.fence.runtime_desired_revision = Some(desired);
+        assert_eq!(
+            dispatch_action(&state, &snapshot, &session, &current)
+                .await
+                .unwrap(),
+            vec![owner.clone()]
+        );
+        assert_eq!(
+            state
+                .store
+                .selected_desired_kind(&owner)
+                .unwrap()
+                .as_deref(),
+            Some("stop")
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_reset_records_the_run_local_reset_operation() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state_named(root.path(), "client-reset-test");
+        let mission_source = "version 2\nmission \"reset-work\" state=\"ready\" { goal \"Reset a runtime.\"; step \"hold\" { agentless } }\n";
+        let intent = crate::graph::parse_intent(mission_source, "client-reset-test").unwrap();
+        let planned = state
+            .store
+            .mission(
+                &intent,
+                IntentInput {
+                    kdl: mission_source.into(),
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        state
+            .store
+            .apply(&intent, &planned.subject_tokens, "reset-mission")
+            .unwrap();
+        let run = state
+            .store
+            .create_mission_run(&MissionRunRequest {
+                mission: "reset-work".into(),
+                revision: None,
+                workspace: root.path().display().to_string(),
+                requester: Some("person/nathan".into()),
+                mode: Some("run".into()),
+                inputs: BTreeMap::new(),
+                idempotency_key: "reset-run".into(),
+            })
+            .unwrap();
+        let runtime_source = "version 2\nagent \"worker\" { workspace \"/tmp\"; command \"true\"; restart \"always\" }\n";
+        let runtime_intent =
+            crate::graph::parse_execution_intent(runtime_source, "client-reset-test", &run.id)
+                .unwrap();
+        state
+            .store
+            .apply_internal(&runtime_intent, "reset-runtime")
+            .unwrap();
+        let owner = runtime_intent
+            .subjects
+            .keys()
+            .find(|id| id.starts_with("agent/"))
+            .unwrap()
+            .clone();
+        let incarnation = "client-reset-runtime:i1";
+        state
+            .store
+            .append_claim(&ClaimInput {
+                subject: owner.clone(),
+                kind: "runtime.observed".into(),
+                actor: Some(owner.clone()),
+                fields: BTreeMap::from([
+                    ("status".into(), Value::String("running".into())),
+                    (
+                        "runtime_id".into(),
+                        Value::String("client-reset-runtime".into()),
+                    ),
+                    ("incarnation_id".into(), Value::String(incarnation.into())),
+                    ("terminal".into(), Value::Bool(false)),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+        let snapshot = new_client_snapshot(&state);
+        let session = ClientSession::local(Some("person/nathan")).unwrap();
+        let request = ActionRequest {
+            api_version: CLIENT_API_VERSION.into(),
+            id: "action/reset-worker".into(),
+            action_type: "runtime.reset".into(),
+            idempotency_key: "reset-worker-client-0001".into(),
+            fence: Fence {
+                snapshot_id: snapshot.id.clone(),
+                runtime_incarnation: Some(incarnation.into()),
+                runtime_desired_revision: state.store.selected_desired_token(&owner).unwrap(),
+                ..Fence::default()
+            },
+            parameters: json!({"target_id": "runtime/client-reset-runtime", "reason": "clear restart limit"}),
+        };
+        assert_eq!(
+            dispatch_action(&state, &snapshot, &session, &request)
+                .await
+                .unwrap(),
+            vec![owner.clone()]
+        );
+        let reset = state
+            .store
+            .latest_claim(&owner, Some("runtime.restart-window-reset"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(reset.body["fields"]["reason"], "clear restart limit");
+    }
+
+    #[tokio::test]
+    async fn client_work_retry_uses_the_person_and_execution_fence() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state_named(root.path(), "client-retry-test");
+        let source = "version 2\nmission \"retry-work\" state=\"ready\" { goal \"Retry one check.\"; step \"check\" { agentless; goal \"Check the result.\" } }\n";
+        let intent = crate::graph::parse_intent(source, "client-retry-test").unwrap();
+        let planned = state
+            .store
+            .mission(
+                &intent,
+                IntentInput {
+                    kdl: source.into(),
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        state
+            .store
+            .apply(&intent, &planned.subject_tokens, "client-retry-mission")
+            .unwrap();
+        let run = state
+            .store
+            .create_mission_run(&MissionRunRequest {
+                mission: "retry-work".into(),
+                revision: None,
+                workspace: root.path().display().to_string(),
+                requester: Some("person/nathan".into()),
+                mode: Some("run".into()),
+                inputs: BTreeMap::new(),
+                idempotency_key: "client-retry-run".into(),
+            })
+            .unwrap();
+        let step = &run.steps[0];
+        state
+            .store
+            .set_step_state(&step.subject, "failed", Some("check failed"))
+            .unwrap();
+        let current = state.store.step_run(&step.subject).unwrap().unwrap();
+        let snapshot = new_client_snapshot(&state);
+        let session = ClientSession::local(Some("person/nathan")).unwrap();
+        let mut request = ActionRequest {
+            api_version: CLIENT_API_VERSION.into(),
+            id: "action/retry-check".into(),
+            action_type: "work.retry".into(),
+            idempotency_key: "client-retry-check-0001".into(),
+            fence: Fence {
+                snapshot_id: snapshot.id.clone(),
+                mission_generation: Some(current.generation.clone()),
+                step_definition: Some(current.definition_hash.clone()),
+                attempt: Some(current.attempt),
+                readiness_epoch: Some(u64::from(current.readiness_epoch)),
+                ..Fence::default()
+            },
+            parameters: json!({"target_id": step.subject, "reason": "check host recovered"}),
+        };
+        request.fence.attempt = Some(current.attempt + 1);
+        assert_eq!(
+            dispatch_action(&state, &snapshot, &session, &request)
+                .await
+                .unwrap_err()
+                .code,
+            "stale-fence"
+        );
+        request.fence.attempt = Some(current.attempt);
+        let affected = dispatch_action(&state, &snapshot, &session, &request)
+            .await
+            .unwrap();
+        assert_eq!(affected, vec![run.subject]);
+        let retried = state.store.step_run(&step.subject).unwrap().unwrap();
+        assert_eq!(retried.attempt, current.attempt + 1);
     }
 
     #[test]
@@ -5875,6 +6553,7 @@ mission "example/zero-run" state="ready" {
                 attempt: None,
                 readiness_epoch: None,
                 runtime_incarnation: None,
+                runtime_desired_revision: None,
                 terminal_sequence: None,
                 preview_token: None,
             },
@@ -6609,6 +7288,7 @@ mission "example/zero-run" state="ready" {
                 attempt: None,
                 readiness_epoch: None,
                 runtime_incarnation: None,
+                runtime_desired_revision: None,
                 terminal_sequence: None,
                 preview_token: None,
             },
@@ -7596,6 +8276,7 @@ mission "example/zero-run" state="ready" {
                 attempt: None,
                 readiness_epoch: None,
                 runtime_incarnation: Some("terminal-runtime:i1".into()),
+                runtime_desired_revision: None,
                 terminal_sequence: Some(1),
                 preview_token: None,
             },
@@ -7663,6 +8344,7 @@ mission "example/zero-run" state="ready" {
                 attempt: None,
                 readiness_epoch: None,
                 runtime_incarnation: Some("terminal-runtime:i1".into()),
+                runtime_desired_revision: None,
                 terminal_sequence: None,
                 preview_token: None,
             },
@@ -7741,6 +8423,7 @@ mission "example/zero-run" state="ready" {
                 attempt: None,
                 readiness_epoch: None,
                 runtime_incarnation: Some("concurrent-terminal-runtime:i1".into()),
+                runtime_desired_revision: None,
                 terminal_sequence: Some(snapshot.store_index),
                 preview_token: None,
             },
@@ -7858,6 +8541,7 @@ mission "example/zero-run" state="ready" {
                 attempt: None,
                 readiness_epoch: None,
                 runtime_incarnation: Some("same-runtime-id:i1".into()),
+                runtime_desired_revision: None,
                 terminal_sequence: Some(owner.store.index().unwrap()),
                 preview_token: None,
             },
