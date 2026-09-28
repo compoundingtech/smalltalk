@@ -160,7 +160,11 @@ fn attention(model: &Model, extras: &Extras) -> Vec<Attention> {
                             _ => "raised for you".into(),
                         },
                         fix: None,
-                        source: item.source_id.clone(),
+                        source: if item.source_id == item.header.id {
+                            String::new()
+                        } else {
+                            item.source_id.clone()
+                        },
                     },
                 ),
             };
@@ -201,9 +205,30 @@ fn attention(model: &Model, extras: &Extras) -> Vec<Attention> {
                     }
                     _ => None,
                 });
+            let related = item
+                .targets
+                .iter()
+                .filter(|target| **target != item.header.id)
+                .map(|target| {
+                    let state = item
+                        .target_states
+                        .iter()
+                        .find(|state| &state.id == target)
+                        .map(|state| state.state.clone());
+                    (target.clone(), state)
+                })
+                .collect();
+            let raised_by = item
+                .extra
+                .get("requester_id")
+                .or_else(|| item.extra.get("actor"))
+                .and_then(Value::as_str)
+                .map(str::to_owned);
             Attention {
                 id: item.header.id.clone(),
                 agent,
+                related,
+                raised_by,
                 tier,
                 title: clean_message_text(&item.title),
                 waiting: step.map(|step| format!("step {step}")),

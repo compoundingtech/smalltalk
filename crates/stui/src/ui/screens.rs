@@ -682,7 +682,9 @@ pub fn home_detail(world: &World, id: Option<&str>, width: usize, drafts: &Draft
             card.wrap(&text::inline(what, theme::text()), inner);
             card.blank();
             card.field("because", because, inner, theme::soft());
-            card.field("source", source, inner, theme::soft());
+            if !source.is_empty() {
+                card.field("source", source, inner, theme::soft());
+            }
             if let Some(fix) = fix {
                 card.blank();
                 let mut suggestion = Doc::new();
@@ -720,6 +722,39 @@ pub fn home_detail(world: &World, id: Option<&str>, width: usize, drafts: &Draft
                     ),
                 ]);
             }
+        }
+    }
+    card.blank();
+    // What the item is about, as links wherever st names a graph subject.
+    card.section("related", None, inner);
+    card.line(Line::from(vec![
+        span(format!("{:<10}", "raised by"), theme::dim()),
+        match &item.raised_by {
+            Some(who) => span(who.clone(), theme::soft()),
+            None => span("st does not say yet", theme::dim()),
+        },
+    ]));
+    if item.related.is_empty() && item.mission.is_none() && item.agent.is_none() {
+        card.line(Line::from(span(
+            "st names no agent, mission or step for this item.",
+            theme::dim(),
+        )));
+    }
+    for (target, state) in &item.related {
+        let prefix = format!("{:<10}", target.split('/').next().unwrap_or("item"));
+        if target.starts_with("agent/")
+            || target.starts_with("mission/")
+            || target.starts_with("attention/")
+        {
+            link(&mut card, &prefix, target, target);
+        } else {
+            card.line(Line::from(vec![
+                span(prefix, theme::dim()),
+                span(target.clone(), theme::soft()),
+            ]));
+        }
+        if let Some(state) = state {
+            card.line(Line::from(span(format!("{:<10}{state}", ""), theme::dim())));
         }
     }
     card.blank();

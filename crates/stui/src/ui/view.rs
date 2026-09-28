@@ -89,6 +89,10 @@ pub struct Attention {
     pub kind: AttentionKind,
     /// The actions st offers for this item. Empty in the demo, where every button works.
     pub actions: Vec<String>,
+    /// Graph subjects the item points at, with their state when st says.
+    pub related: Vec<(String, Option<String>)>,
+    /// Who raised it, when st says.
+    pub raised_by: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -410,4 +414,9 @@ pub enum Body {
     },
     /// A graph event worth a line: a step became ready, a run started.
     Event(String),
+    /// A message sent from here that st has not reported back yet, or that failed.
+    Pending {
+        text: String,
+        failed: Option<String>,
+    },
 }

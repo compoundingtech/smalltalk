@@ -27,6 +27,16 @@ use std::{
     time::{Duration, Instant},
 };
 
+/// A message sent from here that st has not reported back yet.
+struct Pending {
+    token: String,
+    agent: String,
+    text: String,
+    at: String,
+    message_id: Option<String>,
+    failed: Option<String>,
+}
+
 pub struct Context {
     pub client: Client,
     pub runtime: tokio::runtime::Runtime,
@@ -40,6 +50,8 @@ enum Fetched {
     Messages(String, Vec<st3_client::Message>),
     Preview(String, Load<MissionPreview>),
     Notice(String),
+    /// A send finished: the pending token and st's message id, or why it failed.
+    Sent(String, Result<Option<String>, String>),
     Failed(String, String),
 }
 
@@ -64,7 +76,7 @@ pub fn run(context: Context) -> Result<()> {
     let mut stale: HashSet<String> = HashSet::new();
     let mut preview_requested: HashSet<String> = HashSet::new();
     // Messages sent from here, shown at once until st reports them back.
-    let mut pending: Vec<(String, String, String)> = Vec::new();
+    let mut pending: Vec<Pending> = Vec::new();
     // Conversations to refresh quickly because a reply is likely soon.
     let mut hot: BTreeMap<String, Instant> = BTreeMap::new();
     let mut ui = Ui::new(adapt::world(&model, &person, &extras));
@@ -128,14 +140,22 @@ pub fn run(context: Context) -> Result<()> {
                     timelines.insert(agent, entries);
                 }
                 Fetched::Messages(agent, items) => {
-                    // A pending message is done once st reports it back.
-                    pending.retain(|(to, text, _)| {
-                        to != &agent
-                            || !items.iter().any(|message| {
-                                message.to == agent && message.content.trim() == text.trim()
-                            })
+                    // A pending message is done once st reports its id back.
+                    pending.retain(|pending| {
+                        pending
+                            .message_id
+                            .as_ref()
+                            .is_none_or(|id| !items.iter().any(|message| &message.header.id == id))
                     });
                     messages.insert(agent, items);
+                }
+                Fetched::Sent(token, outcome) => {
+                    if let Some(entry) = pending.iter_mut().find(|entry| entry.token == token) {
+                        match outcome {
+                            Ok(id) => entry.message_id = id,
+                            Err(error) => entry.failed = Some(error),
+                        }
+                    }
                 }
                 Fetched::Preview(id, preview) => {
                     extras.previews.insert(id, preview);
@@ -227,49 +247,61 @@ pub fn run(context: Context) -> Result<()> {
             });
         }
 
-        for effect in &ui.effects {
-            if let Effect::Send { agent, text }
-            | Effect::Discuss {
-                to: agent, text, ..
-            } = effect
-            {
-                pending.push((
-                    agent.clone(),
-                    text.clone(),
-                    chrono::Local::now().format("%H:%M").to_string(),
-                ));
-                hot.insert(agent.clone(), Instant::now() + Duration::from_secs(120));
-                requested.remove(agent);
-                changed = true;
-            }
-        }
         for effect in std::mem::take(&mut ui.effects) {
+            let token = match &effect {
+                Effect::Send { agent, text }
+                | Effect::Discuss {
+                    to: agent, text, ..
+                } => {
+                    let token = uuid::Uuid::now_v7().to_string();
+                    pending.push(Pending {
+                        token: token.clone(),
+                        agent: agent.clone(),
+                        text: text.clone(),
+                        at: chrono::Local::now().format("%H:%M").to_string(),
+                        message_id: None,
+                        failed: None,
+                    });
+                    hot.insert(agent.clone(), Instant::now() + Duration::from_secs(120));
+                    requested.remove(agent);
+                    changed = true;
+                    Some(token)
+                }
+                _ => None,
+            };
             let client = client.clone();
             let tx = fetched_tx.clone();
             let person = person.clone();
             let model = model.clone();
             runtime.spawn(async move {
-                let notice = match perform(&client, &person, &model, effect).await {
-                    Ok(notice) => notice,
+                let outcome = perform(&client, &person, &model, effect).await;
+                if let Some(token) = token {
+                    let _ = tx.send(Fetched::Sent(
+                        token,
+                        outcome
+                            .as_ref()
+                            .map(|(_, id)| id.clone())
+                            .map_err(|error| error.to_string()),
+                    ));
+                }
+                let _ = tx.send(Fetched::Notice(match outcome {
+                    Ok((notice, _)) => notice,
                     Err(error) => format!("Failed: {error}"),
-                };
-                let _ = tx.send(Fetched::Notice(notice));
+                }));
             });
         }
 
         if changed {
             extras.conversations =
                 conversations(&model, &person, &timelines, &messages, &failed, &requested);
-            for (agent, text, at) in &pending {
-                if let Some(Load::Ready(entries)) = extras.conversations.get_mut(agent) {
+            for entry in &pending {
+                if let Some(Load::Ready(entries)) = extras.conversations.get_mut(&entry.agent) {
                     entries.push(super::view::Entry {
-                        id: format!("pending:{}", entries.len()),
-                        at: at.clone(),
-                        body: super::view::Body::Mail {
-                            from: "you".into(),
-                            to: agent.trim_start_matches("agent/").into(),
-                            subject: "sending…".into(),
-                            body: text.clone(),
+                        id: format!("pending:{}", entry.token),
+                        at: entry.at.clone(),
+                        body: super::view::Body::Pending {
+                            text: entry.text.clone(),
+                            failed: entry.failed.clone(),
                         },
                     });
                 }
@@ -397,10 +429,17 @@ fn conversations(
     out
 }
 
-async fn perform(client: &Client, person: &str, model: &Model, effect: Effect) -> Result<String> {
+async fn perform(
+    client: &Client,
+    person: &str,
+    model: &Model,
+    effect: Effect,
+) -> Result<(String, Option<String>)> {
     match effect {
         Effect::Attention { id, action, reason } => {
-            crate::attention_action(client, person, &id, &action, reason).await
+            crate::attention_action(client, person, &id, &action, reason)
+                .await
+                .map(|notice| (notice, None))
         }
         Effect::LaunchRevise { id, feedback } => {
             let current = client.attention_get(&id).await?;
@@ -430,7 +469,7 @@ async fn perform(client: &Client, person: &str, model: &Model, effect: Effect) -
                     },
                 )
                 .await?;
-            Ok("Sent your changes to the planner".into())
+            Ok(("Sent your changes to the planner".into(), None))
         }
         Effect::Reply { id, to, text } => {
             let current = client.attention_get(&id).await?;
@@ -446,7 +485,7 @@ async fn perform(client: &Client, person: &str, model: &Model, effect: Effect) -
                 None,
             )
             .await?;
-            Ok("Reply sent".into())
+            Ok(("Reply sent".into(), None))
         }
         Effect::Discuss { to, title, text } => {
             let (to, session) = (
@@ -456,8 +495,11 @@ async fn perform(client: &Client, person: &str, model: &Model, effect: Effect) -
                     .find(|candidate| candidate.header.id == to)
                     .and_then(|agent| agent.current_session_id.clone()),
             );
-            send_titled(client, model, &to, text, Some(title), session).await?;
-            Ok("Sent; the reply will show here and in their conversation".into())
+            let id = send_titled(client, model, &to, text, Some(title), session).await?;
+            Ok((
+                "Sent; the reply will show here and in their conversation".into(),
+                id,
+            ))
         }
         Effect::CancelRun { mission } => {
             let found = model
@@ -494,15 +536,15 @@ async fn perform(client: &Client, person: &str, model: &Model, effect: Effect) -
                     },
                 )
                 .await?;
-            Ok(format!("Cancelled {run}"))
+            Ok((format!("Cancelled {run}"), None))
         }
         Effect::Send { agent, text } => {
             let session = model
                 .agents()
                 .find(|candidate| candidate.header.id == agent)
                 .and_then(|agent| agent.current_session_id.clone());
-            send(client, model, &agent, text, None, session).await?;
-            Ok("Message sent".into())
+            let id = send(client, model, &agent, text, None, session).await?;
+            Ok(("Message sent".into(), id))
         }
     }
 }
@@ -514,7 +556,7 @@ async fn send(
     content: String,
     in_reply_to: Option<String>,
     session_id: Option<String>,
-) -> Result<()> {
+) -> Result<Option<String>> {
     send_message(client, model, to, content, None, in_reply_to, session_id).await
 }
 
@@ -525,7 +567,7 @@ async fn send_titled(
     content: String,
     title: Option<String>,
     session_id: Option<String>,
-) -> Result<()> {
+) -> Result<Option<String>> {
     send_message(client, model, to, content, title, None, session_id).await
 }
 
@@ -537,7 +579,7 @@ async fn send_message(
     title: Option<String>,
     in_reply_to: Option<String>,
     session_id: Option<String>,
-) -> Result<()> {
+) -> Result<Option<String>> {
     let snapshot = model
         .messages
         .snapshot
@@ -550,7 +592,7 @@ async fn send_message(
         ..Fence::default()
     };
     let (id, idem) = crate::action_pair();
-    client
+    let result = client
         .message_send(
             id,
             idem,
@@ -565,5 +607,10 @@ async fn send_message(
             },
         )
         .await?;
-    Ok(())
+    // The new message's id, so the pending copy can give way to the real one.
+    Ok(result
+        .value
+        .affected_ids
+        .into_iter()
+        .find(|id| id.starts_with("message/")))
 }

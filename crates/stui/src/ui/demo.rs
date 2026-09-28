@@ -103,6 +103,8 @@ fn attention() -> Vec<Attention> {
             mission: Some(s("mission/fleet/atlas/store-move")),
             agent: Some(s("agent/fleet/atlas/builder")),
             actions: vec![],
+            related: vec![],
+            raised_by: None,
             kind: AttentionKind::Review {
                 question: s(
                     "The row counts agree and the contract check passed. Cut over to the new store?",
@@ -133,6 +135,8 @@ fn attention() -> Vec<Attention> {
             mission: Some(s("mission/fleet/site/pricing-page")),
             agent: Some(s("agent/fleet/docs/writer")),
             actions: vec![],
+            related: vec![],
+            raised_by: None,
             kind: AttentionKind::Feedback {
                 question: s(
                     "Here is the draft of the pricing page. What should change before it goes live?",
@@ -159,6 +163,8 @@ fn attention() -> Vec<Attention> {
             mission: None,
             agent: Some(s("agent/fleet/planner")),
             actions: vec![],
+            related: vec![],
+            raised_by: None,
             kind: AttentionKind::Launch {
                 planner: s("Planner"),
                 name: s("harbor/nightly-audit"),
@@ -219,6 +225,8 @@ fn attention() -> Vec<Attention> {
             mission: Some(s("mission/fleet/release/weekly")),
             agent: Some(s("agent/fleet/release/captain")),
             actions: vec![],
+            related: vec![],
+            raised_by: None,
             kind: AttentionKind::Fault {
                 what: s(
                     "Release Captain exited 4 times in 10 minutes and st stopped restarting it.",
@@ -239,6 +247,8 @@ fn attention() -> Vec<Attention> {
             mission: Some(s("mission/fleet/rekey")),
             agent: Some(s("agent/fleet/rekey/worker")),
             actions: vec![],
+            related: vec![],
+            raised_by: None,
             kind: AttentionKind::Revision {
                 reason: s(
                     "A key rotated mid-run last week and nobody noticed. An audit step would catch it.",
@@ -264,6 +274,8 @@ fn attention() -> Vec<Attention> {
             mission: None,
             agent: Some(s("agent/fleet/cos")),
             actions: vec![],
+            related: vec![],
+            raised_by: None,
             kind: AttentionKind::Message {
                 from: s("Chief of Staff"),
                 body: s(

@@ -242,6 +242,33 @@ fn render_entry(entry: &Entry, width: usize, open: bool, spinner: &str) -> Doc {
                 doc.line(Line::from(spans));
             }
         }
+        Body::Pending { text: body, failed } => {
+            // Dim until st has it; red if it never got there.
+            let (bar, label, style) = match failed {
+                None => (theme::SURFACE2, "you · sending…".to_owned(), theme::dim()),
+                Some(error) => (
+                    theme::RED,
+                    format!("you · not sent: {error}"),
+                    theme::fg(theme::RED),
+                ),
+            };
+            let bar = run("▎ ", theme::fg(bar));
+            doc.lines(text::wrap(
+                &[
+                    run(label, style),
+                    run(format!("  {}", entry.at), theme::dim()),
+                ],
+                inner,
+                std::slice::from_ref(&bar),
+                std::slice::from_ref(&bar),
+                None,
+            ));
+            for line in text::markdown(body, inner.saturating_sub(2), theme::dim()) {
+                let mut spans = vec![Span::styled(bar.text.clone(), bar.style)];
+                spans.extend(line.spans);
+                doc.line(Line::from(spans));
+            }
+        }
         Body::Event(event) => {
             let label = text::truncate(
                 &format!(" {} · {} ", text::sanitize(event), entry.at),
