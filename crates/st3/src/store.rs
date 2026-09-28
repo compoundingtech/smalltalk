@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fs;
 use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
@@ -598,6 +598,8 @@ pub struct Store {
     committed_index: Arc<AtomicU64>,
     actual_cache: Mutex<HashMap<String, (u64, Option<Value>)>>,
     message_cache: Mutex<HashMap<String, MessageCacheEntry>>,
+    agent_status_cache: Mutex<VecDeque<(u64, u64, Arc<StatusResponse>)>>,
+    agent_resources_cache: Mutex<VecDeque<(u64, u64, bool, Arc<Vec<Value>>)>>,
     seeded_batch_rowid: AtomicI64,
     replica_generation: AtomicU64,
     replication_snapshot: Mutex<Option<Arc<ReplicationSnapshot>>>,
@@ -1281,6 +1283,8 @@ impl Store {
             committed_index,
             actual_cache: Mutex::new(HashMap::new()),
             message_cache: Mutex::new(HashMap::new()),
+            agent_status_cache: Mutex::new(VecDeque::new()),
+            agent_resources_cache: Mutex::new(VecDeque::new()),
             seeded_batch_rowid: AtomicI64::new(seeded_batch_rowid),
             replica_generation: AtomicU64::new(0),
             replication_snapshot: Mutex::new(None),
@@ -1322,6 +1326,8 @@ impl Store {
             committed_index,
             actual_cache: Mutex::new(HashMap::new()),
             message_cache: Mutex::new(HashMap::new()),
+            agent_status_cache: Mutex::new(VecDeque::new()),
+            agent_resources_cache: Mutex::new(VecDeque::new()),
             seeded_batch_rowid: AtomicI64::new(seeded_batch_rowid),
             replica_generation: AtomicU64::new(0),
             replication_snapshot: Mutex::new(None),
@@ -1337,6 +1343,56 @@ impl Store {
 
     pub fn index(&self) -> Result<u64> {
         Ok(self.committed_index.load(Ordering::Acquire))
+    }
+
+    /// Diagnostic claims on the daemon cannot change agent cards. Ignore them when deciding
+    /// whether an agent projection must be rebuilt, including diagnostics raised by a slow
+    /// agent-list request itself.
+    pub(crate) fn agent_projection_index(&self, snapshot_index: u64) -> Result<u64> {
+        let connection = self.readers.get();
+        Ok(connection
+            .query_row(
+                "SELECT store_index FROM claims WHERE store_index<=?1
+                 AND kind!='daemon.diagnostic' ORDER BY store_index DESC LIMIT 1",
+                [snapshot_index],
+                |row| row.get(0),
+            )
+            .optional()?
+            .unwrap_or_default())
+    }
+
+    pub(crate) fn cached_agent_resources(
+        &self,
+        index: u64,
+        history: bool,
+        build: impl FnOnce() -> Result<Vec<Value>>,
+    ) -> Result<Vec<Value>> {
+        let mut cache = self
+            .agent_resources_cache
+            .lock()
+            .expect("agent resources cache poisoned");
+        if let Some((_, _, _, items)) = cache.iter().find(|(cached_index, _, cached_history, _)| {
+            *cached_index == index && *cached_history == history
+        }) {
+            return Ok((**items).clone());
+        }
+        let projection_index = self.agent_projection_index(index)?;
+        if let Some((cached_index, _, _, items)) =
+            cache
+                .iter_mut()
+                .find(|(_, cached_projection, cached_history, _)| {
+                    *cached_projection == projection_index && *cached_history == history
+                })
+        {
+            *cached_index = index;
+            return Ok((**items).clone());
+        }
+        let items = build()?;
+        cache.push_back((index, projection_index, history, Arc::new(items.clone())));
+        if cache.len() > 8 {
+            cache.pop_front();
+        }
+        Ok(items)
     }
 
     pub fn operation_projection_drift(&self) -> Result<Vec<String>> {
@@ -7183,6 +7239,51 @@ impl Store {
         at_index: Option<u64>,
         include_history: bool,
     ) -> Result<StatusResponse> {
+        // Agent listings are expensive on large graphs. Hold this lock while building the
+        // snapshot so concurrent callers share one reduction, then serve clones at the same
+        // store index. A later index always rebuilds, preserving snapshot semantics.
+        if prefix == "agent/" && include_history {
+            let current = self.index()?;
+            let index = selected_index(current, at_index).map_err(anyhow::Error::new)?;
+            let mut cache = self
+                .agent_status_cache
+                .lock()
+                .expect("agent status cache poisoned");
+            if let Some((_, _, status)) = cache
+                .iter()
+                .find(|(cached_index, _, _)| *cached_index == index)
+            {
+                let mut result = (**status).clone();
+                result.store_index = index;
+                return Ok(result);
+            }
+            let projection_index = self.agent_projection_index(index)?;
+            if let Some((cached_index, _, status)) = cache
+                .iter_mut()
+                .find(|(_, cached_projection, _)| *cached_projection == projection_index)
+            {
+                *cached_index = index;
+                let mut result = (**status).clone();
+                result.store_index = index;
+                return Ok(result);
+            }
+            let status =
+                self.status_for_subject_prefix_uncached(prefix, Some(index), include_history)?;
+            cache.push_back((index, projection_index, Arc::new(status.clone())));
+            if cache.len() > 8 {
+                cache.pop_front();
+            }
+            return Ok(status);
+        }
+        self.status_for_subject_prefix_uncached(prefix, at_index, include_history)
+    }
+
+    fn status_for_subject_prefix_uncached(
+        &self,
+        prefix: &str,
+        at_index: Option<u64>,
+        include_history: bool,
+    ) -> Result<StatusResponse> {
         let connection = self.readers.get();
         let current = current_index(&connection)?;
         let store_index = selected_index(current, at_index).map_err(anyhow::Error::new)?;
@@ -7227,23 +7328,50 @@ impl Store {
         store_index: u64,
         include_history: bool,
     ) -> Result<StatusResponse> {
-        let mut selected_subjects = Vec::new();
-        let mut pending_actions = Vec::new();
-        for subject in subjects {
-            let status =
-                self.status_at_view(Some(&subject), None, Some(store_index), include_history)?;
-            for selected in status.subjects {
-                if include_history || selected.projection.actionable {
-                    selected_subjects.push(selected);
-                }
-            }
-            pending_actions.extend(status.pending_actions);
+        if subjects.len() <= 64 {
+            return self.status_at_view_for_names(
+                None,
+                None,
+                Some(store_index),
+                include_history,
+                Some(subjects),
+            );
         }
-        Ok(StatusResponse {
+        // The read pool has four connections. Divide a large bounded projection across them;
+        // each worker holds one snapshot connection for its slice, then merge in subject order.
+        let subjects = subjects.into_iter().collect::<Vec<_>>();
+        let chunk_size = subjects.len().div_ceil(READ_CONNECTIONS);
+        let parts = std::thread::scope(|scope| {
+            subjects
+                .chunks(chunk_size)
+                .map(|chunk| {
+                    let names = chunk.iter().cloned().collect::<BTreeSet<_>>();
+                    scope.spawn(move || {
+                        self.status_at_view_for_names(
+                            None,
+                            None,
+                            Some(store_index),
+                            include_history,
+                            Some(names),
+                        )
+                    })
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|worker| worker.join().expect("status projection worker panicked"))
+                .collect::<Vec<_>>()
+        });
+        let mut merged = StatusResponse {
             store_index,
-            subjects: selected_subjects,
-            pending_actions,
-        })
+            subjects: Vec::new(),
+            pending_actions: Vec::new(),
+        };
+        for part in parts {
+            let part = part?;
+            merged.subjects.extend(part.subjects);
+            merged.pending_actions.extend(part.pending_actions);
+        }
+        Ok(merged)
     }
 
     fn status_at_view(
@@ -7253,13 +7381,31 @@ impl Store {
         at_index: Option<u64>,
         include_history: bool,
     ) -> Result<StatusResponse> {
+        self.status_at_view_for_names(
+            selected,
+            selected_owner_run,
+            at_index,
+            include_history,
+            None,
+        )
+    }
+
+    fn status_at_view_for_names(
+        &self,
+        selected: Option<&str>,
+        selected_owner_run: Option<&str>,
+        at_index: Option<u64>,
+        include_history: bool,
+        selected_names: Option<BTreeSet<String>>,
+    ) -> Result<StatusResponse> {
         let connection = self.readers.get();
         let current = current_index(&connection)?;
         let store_index = selected_index(current, at_index).map_err(anyhow::Error::new)?;
-        let mut subject_names = BTreeSet::new();
+        let bounded_names = selected_names.is_some();
+        let mut subject_names = selected_names.unwrap_or_default();
         if let Some(selected) = selected {
             subject_names.insert(selected.to_owned());
-        } else {
+        } else if !bounded_names {
             let mut statement = connection.prepare(
                 "SELECT DISTINCT subject FROM claims WHERE store_index<=?1 ORDER BY subject",
             )?;
@@ -26082,6 +26228,38 @@ observer "ordered/file" {
     }
 
     #[test]
+    fn repeated_agent_snapshot_does_not_wait_for_busy_read_connections() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        let snapshot = store.index().unwrap();
+        store
+            .status_for_subject_prefix_at("agent/", Some(snapshot), true)
+            .unwrap();
+
+        let (ready_send, ready_recv) = std::sync::mpsc::channel();
+        let (release_send, release_recv) = std::sync::mpsc::channel();
+        let holder = store.clone();
+        let held = std::thread::spawn(move || {
+            holder.hold_read_connections_for_test(|| {
+                ready_send.send(()).unwrap();
+                release_recv.recv().unwrap();
+            });
+        });
+        ready_recv.recv().unwrap();
+        let reader = store.clone();
+        let (result_send, result_recv) = std::sync::mpsc::channel();
+        let read = std::thread::spawn(move || {
+            result_send
+                .send(reader.status_for_subject_prefix_at("agent/", Some(snapshot), true))
+                .unwrap();
+        });
+        let result = result_recv.recv_timeout(std::time::Duration::from_millis(250));
+        release_send.send(()).unwrap();
+        held.join().unwrap();
+        read.join().unwrap();
+        assert_eq!(result.unwrap().unwrap().store_index, snapshot);
+    }
+
+    #[test]
     fn bounded_status_reductions_select_only_relevant_subjects() {
         let store = Store::open_memory("node").unwrap();
         let observe = |subject: &str, runtime_id: &str| {
@@ -26148,6 +26326,37 @@ observer "ordered/file" {
         assert_eq!(first_snapshot.store_index, first_index);
         assert_eq!(first_snapshot.subjects.len(), 1);
         assert_eq!(first_snapshot.subjects[0].subject, "agent/selected");
+
+        observe("agent/new", "new");
+        let current_agents = store
+            .status_for_subject_prefix_at("agent/", None, true)
+            .unwrap();
+        assert_eq!(current_agents.subjects.len(), 2);
+        let old_agents = store
+            .status_for_subject_prefix_at("agent/", Some(first_index), true)
+            .unwrap();
+        assert_eq!(old_agents.subjects.len(), 1);
+
+        for number in 0..80 {
+            observe(&format!("agent/bulk-{number:02}"), "bulk");
+        }
+        let bulk = store
+            .status_for_subject_prefix_at("agent/", None, true)
+            .unwrap();
+        assert_eq!(bulk.subjects.len(), 82);
+        assert!(
+            bulk.subjects
+                .windows(2)
+                .all(|pair| pair[0].subject < pair[1].subject)
+        );
+        assert_eq!(
+            store
+                .status_for_subject_prefix_at("agent/", Some(first_index), true)
+                .unwrap()
+                .subjects
+                .len(),
+            1
+        );
     }
 
     #[test]
