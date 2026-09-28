@@ -303,6 +303,16 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
         .route("/v1/client/missions/{*id}", get(client_v0::mission_detail))
         .route("/v1/client/runtimes", get(client_v0::runtimes))
         .route("/v1/client/runtimes/{*id}", get(client_v0::runtime_detail))
+        .route("/v1/client/observers", get(client_v0::observers))
+        .route(
+            "/v1/client/observers/{*id}",
+            get(client_v0::observer_detail),
+        )
+        .route("/v1/client/subscriptions", get(client_v0::subscriptions))
+        .route(
+            "/v1/client/subscriptions/{*id}",
+            get(client_v0::subscription_detail),
+        )
         .route("/v1/client/terminals", get(client_v0::terminals))
         .route("/v1/client/operations", get(client_v0::operations))
         .route(
@@ -1103,6 +1113,27 @@ fn client_work_resources(
         });
     }
     let desired = store.desired_subjects()?;
+    let mut step_specs = BTreeMap::<String, BTreeMap<String, crate::model::StepSpec>>::new();
+    for run_id in work
+        .iter()
+        .filter(|item| item.agentless)
+        .map(|item| &item.run)
+    {
+        if step_specs.contains_key(run_id) {
+            continue;
+        }
+        let Some(run) = store.mission_run(run_id)? else {
+            continue;
+        };
+        let Some(mission) = store.mission_spec(
+            run.mission.trim_start_matches("mission/"),
+            Some(&run.revision),
+        )?
+        else {
+            continue;
+        };
+        step_specs.insert(run_id.clone(), mission.steps);
+    }
     work.into_iter()
         .map(|work| {
             let operational = store.work_annotation(&work)?;
@@ -1113,6 +1144,54 @@ fn client_work_resources(
             };
             let usage =
                 aggregate_usage_for_step(store, &desired, &work.subject, Some(snapshot_index))?;
+            let gate_kind = if work.agentless {
+                let spec = step_specs
+                    .get(&work.run)
+                    .and_then(|steps| steps.get(&work.step));
+                match spec {
+                    Some(spec) if spec.after_run.is_some() => Some("run"),
+                    Some(spec) if spec.gates.is_empty() => Some("watch"),
+                    Some(spec)
+                        if spec.gates.iter().all(|gate| {
+                            matches!(gate, crate::model::GateSpec::Mechanical { .. })
+                        }) =>
+                    {
+                        Some("command")
+                    }
+                    Some(spec)
+                        if spec
+                            .gates
+                            .iter()
+                            .all(|gate| matches!(gate, crate::model::GateSpec::Llm { .. })) =>
+                    {
+                        Some("llm")
+                    }
+                    Some(spec)
+                        if spec
+                            .gates
+                            .iter()
+                            .all(|gate| matches!(gate, crate::model::GateSpec::Human { .. })) =>
+                    {
+                        Some("human")
+                    }
+                    Some(spec)
+                        if spec.gates.iter().all(|gate| {
+                            !matches!(
+                                gate,
+                                crate::model::GateSpec::Mechanical { .. }
+                                    | crate::model::GateSpec::Llm { .. }
+                                    | crate::model::GateSpec::Human { .. }
+                            )
+                        }) =>
+                    {
+                        Some("predicate")
+                    }
+                    Some(_) => Some("mixed"),
+                    None => None,
+                }
+            } else {
+                None
+            };
             Ok(json!({
                 "id": work.subject,
                 "kind": "work",
@@ -1124,6 +1203,7 @@ fn client_work_resources(
                 "path": work.step,
                 "state": state,
                 "agentless": work.agentless,
+                "gate_kind": gate_kind,
                 "attempt": work.attempt,
                 "readiness_epoch": work.readiness_epoch,
                 "claimant": work.claimant,
@@ -8573,8 +8653,18 @@ async fn signal_session(
     AxumPath(subject): AxumPath<String>,
     Json(request): Json<SessionSignalRequest>,
 ) -> Result<Json<SessionControlResponse>, ApiError> {
+    signal_session_as(state, subject, request, "requester").await
+}
+
+async fn signal_session_as(
+    state: AppState,
+    subject: String,
+    request: SessionSignalRequest,
+    actor: &str,
+) -> Result<Json<SessionControlResponse>, ApiError> {
     let signal = match request.signal.as_str() {
         "interrupt" => libc::SIGINT,
+        "terminate" => libc::SIGTERM,
         "hangup" => libc::SIGHUP,
         "user-1" => libc::SIGUSR1,
         "user-2" => libc::SIGUSR2,
@@ -8623,7 +8713,7 @@ async fn signal_session(
         .append_claim(&ClaimInput {
             subject: subject.clone(),
             kind: "runtime.action.requested".into(),
-            actor: Some("requester".into()),
+            actor: Some(actor.into()),
             fields: BTreeMap::from([
                 ("action".into(), Value::String("signal".into())),
                 ("operation".into(), Value::String(result_key.clone())),

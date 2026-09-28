@@ -114,6 +114,8 @@ fn operation_manifest_is_launch_only_and_covers_v0_resources_and_actions() {
         "agents.list",
         "agent-queue.get",
         "runtimes.list",
+        "observers.list",
+        "subscriptions.list",
         "operations.list",
         "history.list",
         "sessions.list",
@@ -151,6 +153,7 @@ fn operation_manifest_is_launch_only_and_covers_v0_resources_and_actions() {
         "work.complete",
         "work.fail",
         "work.release",
+        "work.retry",
         "work.publish-mission",
         "agent.queue-move",
         "runtime.stop",
@@ -207,7 +210,9 @@ fn resource_fixture_covers_every_resource_kind_with_stable_unique_ids() {
         "message",
         "mission",
         "operation",
+        "observer",
         "runtime",
+        "subscription",
         "device",
         "session",
         "work",
@@ -333,7 +338,10 @@ fn event_feeds_are_contiguous_and_terminal_streams_replace_whole_screens() {
         screens[0]["value"]["runtime_incarnation"],
         screens[1]["value"]["runtime_incarnation"]
     );
-    assert_ne!(screens[0]["value"]["revision"], screens[1]["value"]["revision"]);
+    assert_ne!(
+        screens[0]["value"]["revision"],
+        screens[1]["value"]["revision"]
+    );
     for screen in &screens {
         for line in screen["value"]["lines"].as_array().unwrap() {
             let spelled = line["runs"]
@@ -342,7 +350,10 @@ fn event_feeds_are_contiguous_and_terminal_streams_replace_whole_screens() {
                 .iter()
                 .map(|run| run["text"].as_str().unwrap())
                 .collect::<String>();
-            assert_eq!(spelled.trim_end_matches(' '), line["text"].as_str().unwrap());
+            assert_eq!(
+                spelled.trim_end_matches(' '),
+                line["text"].as_str().unwrap()
+            );
         }
     }
     assert_eq!(

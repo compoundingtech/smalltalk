@@ -226,6 +226,10 @@ export class St3Client {
     async agentQueueGet(id: string): Promise<EnvelopeOf<AgentQueue>> { return this.get(`/v1/client/agent-queues/${encodeURIComponent(routedId(id))}`); }
     async runtimesList(options: ListOptions = {}): Promise<EnvelopeOf<Page>> { return this.get('/v1/client/runtimes' + query(options)); }
     async runtimesGet(id: string): Promise<EnvelopeOf<Resource>> { return this.get(`/v1/client/runtimes/${encodeURIComponent(routedId(id))}`); }
+    async observersList(options: ListOptions = {}): Promise<EnvelopeOf<Page>> { return this.get('/v1/client/observers' + query(options)); }
+    async observersGet(id: string): Promise<EnvelopeOf<Resource>> { return this.get(`/v1/client/observers/${encodeURIComponent(routedId(id))}`); }
+    async subscriptionsList(options: ListOptions = {}): Promise<EnvelopeOf<Page>> { return this.get('/v1/client/subscriptions' + query(options)); }
+    async subscriptionsGet(id: string): Promise<EnvelopeOf<Resource>> { return this.get(`/v1/client/subscriptions/${encodeURIComponent(routedId(id))}`); }
     async terminalsList(options: ListOptions = {}): Promise<EnvelopeOf<Page>> { return this.get('/v1/client/terminals' + query(options)); }
     async operationsList(options: ListOptions = {}): Promise<EnvelopeOf<Page>> { return this.get('/v1/client/operations' + query(options)); }
     async operationsGet(id: string): Promise<EnvelopeOf<Resource>> { return this.get(`/v1/client/operations/${encodeURIComponent(routedId(id))}`); }
@@ -273,4 +277,5 @@ export class St3Client {
     async workPublishMission(input: Omit<ActionOf<'work.publish-mission'>, 'api_version' | 'type'>): Promise<EnvelopeOf<ActionResult>> { return this.submitAction({ ...input, api_version: API_VERSION, type: 'work.publish-mission' } as ActionOf<'work.publish-mission'>); }
     async workRelease(input: Omit<ActionOf<'work.release'>, 'api_version' | 'type'>): Promise<EnvelopeOf<ActionResult>> { return this.submitAction({ ...input, api_version: API_VERSION, type: 'work.release' } as ActionOf<'work.release'>); }
     async workRenew(input: Omit<ActionOf<'work.renew'>, 'api_version' | 'type'>): Promise<EnvelopeOf<ActionResult>> { return this.submitAction({ ...input, api_version: API_VERSION, type: 'work.renew' } as ActionOf<'work.renew'>); }
+    async workRetry(input: Omit<ActionOf<'work.retry'>, 'api_version' | 'type'>): Promise<EnvelopeOf<ActionResult>> { return this.submitAction({ ...input, api_version: API_VERSION, type: 'work.retry' } as ActionOf<'work.retry'>); }
 }
