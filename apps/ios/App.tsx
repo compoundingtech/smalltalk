@@ -398,17 +398,18 @@ export default function App() {
     return () => { live = false; };
   }, [client, sessionId, status, appActive, maxPageItems, timelineUnresolved, active, chatDetailOpen, terminalId]);
   useEffect(() => {
-    if (!client || !terminalId || !chatDetailOpen || active !== 'Chat' || !appActive || status !== 'online') return;
-    // The gateway pushes each changed screen over one attached stream; the app never polls.
+    if (!client || !terminalId || !chatDetailOpen || active !== 'Chat' || status !== 'online') return;
+    // The gateway pushes each changed screen over one attached stream; the app never polls. The
+    // follower closes the stream in the background and reattaches in the foreground.
     const follow = followTerminal(client, terminalId, {
       onScreen: next => {
         if (!terminalIncarnation.current) terminalIncarnation.current = next.runtime_incarnation;
         setScreen(next);
       },
       onIssue: setTerminalIssue,
-    }, actionId);
+    }, actionId, foreground.current);
     return () => follow.close();
-  }, [client, terminalId, chatDetailOpen, active, appActive, status]);
+  }, [client, terminalId, chatDetailOpen, active, status]);
 
   async function review(id: string) { if (!client || status !== 'online') return; try { const result = await client.launchVariantsList(id, { limit: Math.min(caps?.limits.max_page_items ?? 30, 30) }); setReviewLaunch(id); setVariants(items(result.value, 'launch-variant')); setError(''); } catch (e) { setError(errorText(e)); } }
   async function preview(launch: Launch, variant: LaunchVariant) { if (!client) return; await runAction(() => { const id = actionId(); return client.launchPreview({ id, idempotency_key: id, fence: fence({ [launch.id]: launch.revision, [variant.id]: variant.revision }), parameters: { launch_id: launch.id, variant_id: variant.id } }); }); void review(launch.id); }
