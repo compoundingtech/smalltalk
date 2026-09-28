@@ -1,4 +1,4 @@
-//! Install the st3 daemon as a native user service.
+//! Install the st daemon as a native user service.
 
 use std::env;
 use std::fs;
@@ -130,9 +130,9 @@ pub fn install(mut config: Config) -> Result<()> {
     #[cfg(target_os = "linux")]
     anyhow::ensure!(
         st_runtime::isolation_mode() != st_runtime::Isolation::DegradedDetached,
-        "st3 service install needs a working systemd user manager and transient user scopes"
+        "st service install needs a working systemd user manager and transient user scopes"
     );
-    let exe = env::current_exe().context("resolve the current st3 executable")?;
+    let exe = env::current_exe().context("resolve the current st executable")?;
     let current = env::current_dir().context("resolve the service install directory")?;
     config.state_dir = absolute_from(&current, &config.state_dir);
     config.socket = absolute_from(&current, &config.socket);
@@ -201,12 +201,12 @@ pub fn permissions(open: bool) -> Result<()> {
 pub fn permissions_guidance() -> Result<String> {
     #[cfg(target_os = "macos")]
     {
-        let executable = env::current_exe().context("resolve the current st3 executable")?;
+        let executable = env::current_exe().context("resolve the current st executable")?;
         Ok(macos_permission_guidance(&executable))
     }
     #[cfg(not(target_os = "macos"))]
     {
-        Ok("st3 does not need a macOS privacy approval on this host.\n".into())
+        Ok("st does not need a macOS privacy approval on this host.\n".into())
     }
 }
 
@@ -228,13 +228,13 @@ pub fn open_permissions_settings() -> Result<()> {
 #[cfg(any(target_os = "macos", test))]
 fn macos_permission_guidance(executable: &Path) -> String {
     format!(
-        "st3 executable\t{}\n\
+        "st executable\t{}\n\
 1. Open System Settings > Privacy & Security > Full Disk Access.\n\
-2. Add the st3 executable and enable it.\n\
+2. Add the st executable and enable it.\n\
 3. Open System Settings > Privacy & Security > Developer Tools.\n\
-4. Add the st3 executable and enable it.\n\
-5. Run `st3 service restart` after an approval changes.\n\
-macOS assigns service-owned file and developer access to st3, not to the terminal that installed it.\n\
+4. Add the st executable and enable it.\n\
+5. Run `st service restart` after an approval changes.\n\
+macOS assigns service-owned file and developer access to st, not to the terminal that installed it.\n\
 A launchd property list cannot grant these approvals.\n",
         executable.display()
     )
@@ -268,20 +268,20 @@ pub fn reset(mut config: Config) -> Result<()> {
     match fs::remove_dir_all(&config.state_dir) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error).context("erase the st3 state directory"),
+        Err(error) => return Err(error).context("erase the st state directory"),
     }
     if !config.socket.starts_with(&config.state_dir) {
         match fs::remove_file(&config.socket) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error).context("erase the st3 socket"),
+            Err(error) => return Err(error).context("erase the st socket"),
         }
     }
     if !config.client_gateway_socket.starts_with(&config.state_dir) {
         match fs::remove_file(&config.client_gateway_socket) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error).context("erase the st3 client gateway socket"),
+            Err(error) => return Err(error).context("erase the st client gateway socket"),
         }
     }
     start_native_service()?;
@@ -304,7 +304,7 @@ pub fn uninstall() -> Result<()> {
 fn validate_reset_target(config: &Config) -> Result<()> {
     anyhow::ensure!(
         config.state_dir.is_absolute(),
-        "the st3 state directory must be absolute"
+        "the st state directory must be absolute"
     );
     anyhow::ensure!(
         config.state_dir != Path::new("/"),
@@ -318,7 +318,7 @@ fn validate_reset_target(config: &Config) -> Result<()> {
     }
     anyhow::ensure!(
         config.state_dir.components().count() >= 3,
-        "the st3 state directory is too broad to erase"
+        "the st state directory is too broad to erase"
     );
     Ok(())
 }
@@ -530,7 +530,7 @@ fn install_native_service(spec: &ServiceSpec) -> Result<()> {
                 "the launchd install failed, and rollback also failed: {rollback:#}"
             ));
         }
-        return Err(error).context("the launchd install failed; st3 restored the prior service");
+        return Err(error).context("the launchd install failed; st restored the prior service");
     }
     println!("plist\t{}", plist.display());
     if spec.config.fleet_id.is_some() {
@@ -751,7 +751,7 @@ fn install_systemd_user(spec: &ServiceSpec) -> Result<()> {
                 "the systemd install failed, and rollback also failed: {rollback:#}"
             ));
         }
-        return Err(error).context("the systemd install failed; st3 restored the prior service");
+        return Err(error).context("the systemd install failed; st restored the prior service");
     }
     println!("unit\t{}", unit_path.display());
     if spec.config.fleet_id.is_some() {
@@ -834,7 +834,7 @@ fn uninstall_systemd_user() -> Result<()> {
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn unsupported() -> Result<()> {
-    bail!("st3 service is available only on Linux and macOS")
+    bail!("st service is available only on Linux and macOS")
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -940,7 +940,7 @@ fn wait_for_socket_for(socket: &Path, timeout: std::time::Duration) -> Result<()
         std::thread::sleep(std::time::Duration::from_millis(25));
     }
     anyhow::bail!(
-        "the st3 service did not accept connections at {}",
+        "the st service did not accept connections at {}",
         socket.display()
     )
 }
@@ -964,7 +964,7 @@ pub fn render_systemd_user_unit(spec: &ServiceSpec) -> String {
         .join(" ");
     format!(
         "[Unit]\n\
-Description=st3 claims graph daemon\n\
+Description=st claims graph daemon\n\
 After=network.target\n\
 \n\
 [Service]\n\
@@ -986,7 +986,7 @@ WantedBy=default.target\n",
 
 pub fn render_systemd_replication_unit(spec: &ServiceSpec) -> String {
     render_systemd_program_unit(
-        "st3 authenticated replication worker",
+        "st authenticated replication worker",
         &spec.replication_program_arguments(),
         spec,
     )
@@ -1243,7 +1243,7 @@ mod tests {
     #[test]
     fn macos_permission_guidance_names_the_exact_binary_and_manual_steps() {
         let guidance = macos_permission_guidance(Path::new("/Users/test/bin/st3"));
-        assert!(guidance.contains("st3 executable\t/Users/test/bin/st3"));
+        assert!(guidance.contains("st executable\t/Users/test/bin/st3"));
         assert!(guidance.contains("Full Disk Access"));
         assert!(guidance.contains("Developer Tools"));
         assert!(guidance.contains("cannot grant"));
