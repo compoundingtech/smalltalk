@@ -320,6 +320,25 @@ Read-only scope permits snapshots, details, timelines, and event feeds. `termina
 terminal input and resize; other control scopes are action-family-specific. A capabilities response
 must distinguish unavailable, ungranted, and unsupported features.
 
+## Conversation stream
+
+`GET /v1/client/conversations/{id}/stream` opens one authenticated WebSocket
+with subprotocol `st3.client.conversation.v0`. A client may pass `after=CURSOR` to
+resume. `{id}` may be a session ID, an agent peer ID (resolved to its current
+session), or a st message ID with a session peer. A cursor remains tied to the
+resolved session, so a new agent incarnation needs a fresh stream.
+The first envelope has a `ConversationChanges` value with an empty `items`
+array and a `next_cursor` when opening at the live edge. Later envelopes contain
+new chronological `TimelineEntry` values, including st messages, and a cursor to
+save after applying the batch. The owner sends no WebSocket data while idle.
+
+The gateway routes managed sessions to their owning host using the authenticated
+daemon relay. The owner holds a bounded change read for up to ten seconds. A
+reconnect replays at most 200 entries; an older cursor returns `cursor-gap`, so
+the client must reload the timeline before reopening. Cursors belong to one
+session and one owner. `GET /v1/client/conversations/{id}/changes?after=CURSOR&wait_ms=N`
+offers the same bounded change read for clients that cannot open WebSockets.
+
 ## Terminal protocol
 
 Terminal access is a client protocol, not raw PTY ownership. The server sends screens, never PTY

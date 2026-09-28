@@ -198,6 +198,8 @@ fn rust_operation_methods(
                 out,
                 "    pub async fn timeline(&self, session_id: &str, cursor: Option<&str>, limit: Option<usize>) -> Result<Envelope<TimelinePage>, ClientError> {{ self.timeline_page_internal(session_id, cursor, limit).await }}"
             )?;
+        } else if id == "conversation.changes" {
+            writeln!(out, "    pub async fn conversation_changes(&self, session_id: &str, after: Option<&str>, wait_ms: u64) -> Result<Envelope<ConversationChanges>, ClientError> {{ self.conversation_changes_internal(session_id, after, wait_ms).await }}")?;
         } else if id == "events.list" {
             writeln!(
                 out,
@@ -267,6 +269,7 @@ fn swift_operation_methods(
             id,
             "capabilities.get"
                 | "timeline.list"
+                | "conversation.changes"
                 | "events.list"
                 | "terminal.screen"
                 | "agent-queue.get"
@@ -438,6 +441,7 @@ fn validate_surfaces(
         "AgentQueueMove",
         "TimelineEntry",
         "TimelinePage",
+        "ConversationChanges",
         "PairingBegin",
         "PairingChallenge",
         "PairingComplete",
@@ -500,6 +504,7 @@ fn validate_surfaces(
         let rust_method = match read["id"].as_str().context("read id")? {
             "capabilities.get" => "capabilities".into(),
             "timeline.list" => "timeline".into(),
+            "conversation.changes" => "conversation_changes".into(),
             "events.list" => "events".into(),
             "terminal.screen" => "terminal_screen".into(),
             "agent-queue.get" => "agent_queue".into(),
@@ -509,6 +514,7 @@ fn validate_surfaces(
         let swift_method = match read["id"].as_str().unwrap() {
             "capabilities.get" => "capabilities".into(),
             "timeline.list" => "timeline".into(),
+            "conversation.changes" => "conversationChanges".into(),
             "events.list" => "events".into(),
             "terminal.screen" => "terminalScreen".into(),
             "agent-queue.get" => "agentQueue".into(),
@@ -924,6 +930,8 @@ fn typescript_operation_methods(
                 out,
                 "    async {method}(options: EventOptions = {{}}): Promise<EnvelopeOf<{response}>> {{ return this.get('{route}' + query(options), 'events'); }}"
             )?;
+        } else if id == "conversation.changes" {
+            writeln!(out, "    async {method}(id: string, options: {{ after?: string; wait_ms?: number }} = {{}}): Promise<EnvelopeOf<{response}>> {{ return this.get(`{route}` + query(options)); }}")?;
         } else if id == "timeline.list" || id == "terminal.screen" || id.ends_with(".get") {
             let query_suffix = if id == "timeline.list" {
                 " + query(options)"

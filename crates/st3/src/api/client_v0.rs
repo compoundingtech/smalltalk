@@ -4,6 +4,7 @@ use axum::http::header::{AUTHORIZATION, SEC_WEBSOCKET_PROTOCOL};
 use std::collections::BTreeSet;
 
 const TERMINAL_SUBPROTOCOL: &str = "st3.client.terminal.v0";
+const CONVERSATION_SUBPROTOCOL: &str = "st3.client.conversation.v0";
 const TERMINAL_CAPABILITY_PROTOCOL_PREFIX: &str = "st3.cap.";
 const LOCAL_PERSON_HEADER: &str = "x-st3-person";
 
@@ -1488,6 +1489,48 @@ fn native_timeline_page(
 ) -> Result<Json<Value>, ApiError> {
     let mut items =
         crate::external_sessions::normalized_timeline(external).map_err(ApiError::internal)?;
+    if let Some((owner, _, _)) =
+        super::managed_session_owner_at(&state.store, snapshot.store_index, session_id)
+            .map_err(ApiError::internal)?
+    {
+        for claim in state
+            .store
+            .claims_for_kind_at(
+                "message.sent",
+                snapshot.store_index.checked_add(1),
+                true,
+                10_000,
+            )
+            .map_err(ApiError::internal)?
+            .claims
+        {
+            let fields = claim.body.get("fields").unwrap_or(&claim.body);
+            if fields.get("session_id").and_then(Value::as_str) != Some(session_id) {
+                continue;
+            }
+            let from = fields.get("from").and_then(Value::as_str);
+            let to = fields.get("to").and_then(Value::as_str);
+            if from != Some(owner.as_str()) && to != Some(owner.as_str()) {
+                continue;
+            }
+            let role = if from == Some(owner.as_str()) {
+                "assistant"
+            } else {
+                "user"
+            };
+            let stamp = client_timestamp(claim.accepted_at_unix_ms);
+            let digest = hex::encode(Sha256::digest(claim.id.as_bytes()));
+            let base = claim.store_index.saturating_mul(4);
+            items.push(json!({"id":format!("timeline-entry/{}/{}-message", session_id.trim_start_matches("session/"), &digest[..16]), "sequence":base, "revision":1, "timestamp":stamp, "role":role, "type":"message", "final":true, "body":{"message_id":claim.subject,"reply_to":fields.get("in_reply_to")}}));
+            items.push(json!({"id":format!("timeline-entry/{}/{}-content", session_id.trim_start_matches("session/"), &digest[..16]), "sequence":base+1, "revision":1, "timestamp":stamp, "role":role, "type":"content", "final":true, "body":{"media_type":"text/plain","text":fields.get("content").and_then(Value::as_str).unwrap_or_default()}}));
+        }
+        items.sort_by(|a, b| {
+            a["timestamp"]
+                .as_str()
+                .cmp(&b["timestamp"].as_str())
+                .then_with(|| a["sequence"].as_u64().cmp(&b["sequence"].as_u64()))
+        });
+    }
     items.reverse();
     let mut page = client_page(
         state,
@@ -2041,6 +2084,495 @@ pub(super) fn timeline_value(
         "items": page.items,
         "page": page.page
     })))
+}
+
+#[derive(Default, Deserialize)]
+pub(super) struct ConversationQuery {
+    after: Option<String>,
+    wait_ms: Option<u64>,
+}
+
+fn conversation_cursor(
+    state: &AppState,
+    session_id: &str,
+    store_index: u64,
+    local_position: u64,
+    native_sequence: u64,
+) -> String {
+    format!(
+        "conversation-cursor/{}/{}/{}.{}.{}",
+        state.node,
+        session_id.trim_start_matches("session/"),
+        store_index,
+        local_position,
+        native_sequence
+    )
+}
+
+fn conversation_session_id(state: &AppState, id: &str) -> Result<String, ApiError> {
+    if id.starts_with("agent/") {
+        let status = state
+            .store
+            .status_for_subject_prefix_at("agent/", None, true)
+            .map_err(ApiError::internal)?;
+        let subject = status
+            .subjects
+            .into_iter()
+            .find(|subject| subject.subject == id)
+            .ok_or_else(|| ApiError::not_found(format!("agent `{id}` does not exist")))?;
+        let fields = subject
+            .actual
+            .as_ref()
+            .map(|actual| actual.get("fields").unwrap_or(actual));
+        let incarnation = fields
+            .and_then(|fields| fields.get("incarnation_id"))
+            .and_then(Value::as_str)
+            .or(subject.projection.runtime_incarnation.as_deref())
+            .or_else(|| {
+                fields
+                    .and_then(|fields| fields.get("runtime_id"))
+                    .and_then(Value::as_str)
+            })
+            .ok_or_else(|| validation("the agent has no current session"))?;
+        return Ok(client_session_id(id, incarnation));
+    }
+    if id.starts_with("message/") {
+        let claim = state
+            .store
+            .claims_for(id, Some("message.sent"))
+            .map_err(ApiError::internal)?
+            .into_iter()
+            .next()
+            .ok_or_else(|| ApiError::not_found(format!("message `{id}` does not exist")))?;
+        let session_id = claim
+            .body
+            .pointer("/fields/session_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| validation("the message has no session peer"))?;
+        return Ok(session_id.to_owned());
+    }
+    Ok(client_detail_id("session", id))
+}
+
+fn conversation_position(
+    state: &AppState,
+    session_id: &str,
+    after: &str,
+) -> Result<(u64, u64, u64), ApiError> {
+    let prefix = format!(
+        "conversation-cursor/{}/{}/",
+        state.node,
+        session_id.trim_start_matches("session/")
+    );
+    after
+        .strip_prefix(&prefix)
+        .and_then(|part| {
+            let mut parts = part.split('.');
+            let result = (
+                parts.next()?.parse().ok()?,
+                parts.next()?.parse().ok()?,
+                parts.next()?.parse().ok()?,
+            );
+            parts.next().is_none().then_some(result)
+        })
+        .ok_or_else(|| ApiError {
+            status: StatusCode::GONE,
+            code: "cursor-gap".into(),
+            message: "the conversation cursor belongs to another owner or session".into(),
+            details: Box::new(serde_json::Map::from_iter([(
+                "full_resync".into(),
+                Value::Bool(true),
+            )])),
+        })
+}
+
+fn conversation_read_now(
+    state: &AppState,
+    session: &ClientSession,
+    session_id: &str,
+    after: Option<&str>,
+) -> Result<Value, ApiError> {
+    let snapshot = new_client_snapshot(state);
+    let page = timeline_value(
+        state,
+        &snapshot,
+        session,
+        session_id,
+        &ClientListQuery {
+            limit: Some(200),
+            ..Default::default()
+        },
+    )?
+    .0;
+    let all = page["items"]
+        .as_array()
+        .ok_or_else(|| ApiError::internal("the timeline has no items"))?;
+    let native_latest = all
+        .iter()
+        .filter(|item| {
+            item["id"]
+                .as_str()
+                .is_some_and(|id| id.starts_with("timeline-entry/native-"))
+        })
+        .filter_map(|item| item["sequence"].as_u64())
+        .max()
+        .unwrap_or(0);
+    let local_latest = state
+        .store
+        .local_observations_tail(1)
+        .map_err(ApiError::internal)?
+        .first()
+        .and_then(crate::store::local_observation_position)
+        .unwrap_or(0);
+    let position = after
+        .map(|cursor| conversation_position(state, session_id, cursor))
+        .transpose()?;
+    if let Some((store_index, local_position, native_sequence)) = position {
+        if store_index > snapshot.store_index
+            || local_position > local_latest
+            || native_sequence > native_latest
+            || (all.len() == 200
+                && (snapshot.store_index.saturating_sub(store_index) > 200
+                    || local_latest.saturating_sub(local_position) > 200))
+        {
+            return Err(ApiError {
+                status: StatusCode::GONE,
+                code: "cursor-gap".into(),
+                message: "the conversation cursor is outside the bounded replay window".into(),
+                details: Box::new(serde_json::Map::from_iter([(
+                    "full_resync".into(),
+                    Value::Bool(true),
+                )])),
+            });
+        }
+    }
+    let mut changed_indexes = BTreeSet::new();
+    let mut explicit_ids = BTreeSet::new();
+    let mut message_indexes = BTreeSet::new();
+    if let Some((store_index, local_position, _)) = position {
+        let owner = super::managed_session_owner_at(&state.store, snapshot.store_index, session_id)
+            .map_err(ApiError::internal)?
+            .map(|managed| managed.0);
+        if let Some(owner) = owner.as_deref() {
+            for claim in state
+                .store
+                .claims_page(Some(owner), None, store_index, None, false, 10_000)
+                .map_err(ApiError::internal)?
+                .claims
+            {
+                changed_indexes.insert(claim.store_index);
+                if claim.kind == "harness.timeline" {
+                    if let Some(id) = claim
+                        .body
+                        .pointer("/fields/entry_id")
+                        .and_then(Value::as_str)
+                    {
+                        explicit_ids.insert(id.to_owned());
+                    }
+                }
+            }
+        }
+        for claim in state
+            .store
+            .claims_for_kind_at("message.sent", None, true, 10_000)
+            .map_err(ApiError::internal)?
+            .claims
+        {
+            let fields = claim.body.get("fields").unwrap_or(&claim.body);
+            if claim.store_index > store_index
+                && fields.get("session_id").and_then(Value::as_str) == Some(session_id)
+                && owner.as_deref().is_some_and(|owner| {
+                    fields.get("from").and_then(Value::as_str) == Some(owner)
+                        || fields.get("to").and_then(Value::as_str) == Some(owner)
+                })
+            {
+                changed_indexes.insert(claim.store_index);
+                message_indexes.insert(claim.store_index);
+            }
+        }
+        for claim in state
+            .store
+            .local_observations_after(local_position, 10_000)
+            .map_err(ApiError::internal)?
+        {
+            if claim.subject == owner.as_deref().unwrap_or_default()
+                && claim.kind == "harness.timeline"
+            {
+                if let Some(id) = claim
+                    .body
+                    .pointer("/fields/entry_id")
+                    .and_then(Value::as_str)
+                {
+                    explicit_ids.insert(id.to_owned());
+                }
+            }
+        }
+    }
+    let mut items = all
+        .iter()
+        .filter(|item| {
+            let Some((_, _, native_sequence)) = position else {
+                return false;
+            };
+            let id = item["id"].as_str().unwrap_or_default();
+            if id.starts_with("timeline-entry/native-") {
+                return item["sequence"]
+                    .as_u64()
+                    .is_some_and(|sequence| sequence > native_sequence);
+            }
+            explicit_ids.contains(id)
+                || item["sequence"]
+                    .as_u64()
+                    .is_some_and(|sequence| changed_indexes.contains(&(sequence / 4)))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    items.sort_by(|a, b| {
+        a["timestamp"]
+            .as_str()
+            .cmp(&b["timestamp"].as_str())
+            .then_with(|| a["sequence"].as_u64().cmp(&b["sequence"].as_u64()))
+    });
+    if message_indexes.iter().any(|index| {
+        ![
+            index.saturating_mul(4),
+            index.saturating_mul(4).saturating_add(1),
+        ]
+        .iter()
+        .all(|sequence| {
+            items
+                .iter()
+                .any(|item| item["sequence"].as_u64() == Some(*sequence))
+        })
+    }) || explicit_ids
+        .iter()
+        .any(|id| !items.iter().any(|item| item["id"].as_str() == Some(id)))
+        || (all.len() == 200
+            && position.is_some_and(|(_, _, native)| {
+                all.iter()
+                    .find(|item| {
+                        item["id"]
+                            .as_str()
+                            .is_some_and(|id| id.starts_with("timeline-entry/native-"))
+                    })
+                    .and_then(|item| item["sequence"].as_u64())
+                    .is_some_and(|first| first > native)
+            }))
+    {
+        return Err(ApiError {
+            status: StatusCode::GONE,
+            code: "cursor-gap".into(),
+            message: "the conversation exceeded its bounded replay window".into(),
+            details: Box::new(serde_json::Map::from_iter([(
+                "full_resync".into(),
+                Value::Bool(true),
+            )])),
+        });
+    }
+    Ok(
+        json!({"kind":"conversation-changes", "session_id":session_id, "items":items, "next_cursor":conversation_cursor(state, session_id, snapshot.store_index, local_latest, native_latest)}),
+    )
+}
+
+async fn conversation_changes_local(
+    state: &AppState,
+    session: &ClientSession,
+    session_id: &str,
+    after: Option<&str>,
+    wait_ms: u64,
+) -> Result<Value, ApiError> {
+    let mut changed = state.event_notify.subscribe();
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(wait_ms.min(30_000));
+    loop {
+        let value = conversation_read_now(state, session, session_id, after)?;
+        if !value["items"]
+            .as_array()
+            .is_some_and(|items| items.is_empty())
+            || after.is_none()
+            || tokio::time::Instant::now() >= deadline
+        {
+            return Ok(value);
+        }
+        let pause = Duration::from_millis(250)
+            .min(deadline.saturating_duration_since(tokio::time::Instant::now()));
+        tokio::select! { _ = changed.changed() => {}, _ = tokio::time::sleep(pause) => {} }
+    }
+}
+
+pub(super) async fn conversation_changes(
+    State(state): State<AppState>,
+    Extension(session): Extension<ClientSession>,
+    AxumPath(id): AxumPath<String>,
+    Query(query): Query<ConversationQuery>,
+) -> Result<Json<Value>, ApiError> {
+    require_scope(&session, "read.projections")?;
+    let session_id = conversation_session_id(&state, &id)?;
+    let snapshot = new_client_snapshot(&state);
+    if let Some((_, _, Some(origin))) =
+        super::managed_session_owner_at(&state.store, snapshot.store_index, &session_id)
+            .map_err(ApiError::internal)?
+    {
+        if origin != state.store.origin() {
+            if !session.authority_actor.starts_with("person/") {
+                return Err(forbidden(
+                    "remote conversation changes require a concrete person",
+                ));
+            }
+            let owner = client_host_id(&origin);
+            let relay = state
+                .client_relay
+                .as_ref()
+                .ok_or_else(|| remote_unavailable(&owner))?;
+            let value = relay
+                .read(
+                    &owner,
+                    &crate::peer::ClientReadRequest {
+                        authority_actor: session.authority_actor,
+                        request: crate::peer::ClientReadOperation::ConversationChanges {
+                            session_id,
+                            after: query.after,
+                            wait_ms: query.wait_ms.unwrap_or(0).min(30_000),
+                        },
+                    },
+                )
+                .await
+                .map_err(|error| remote_read_error(&owner, error))?;
+            return Ok(Json(value));
+        }
+    }
+    conversation_changes_local(
+        &state,
+        &session,
+        &session_id,
+        query.after.as_deref(),
+        query.wait_ms.unwrap_or(0),
+    )
+    .await
+    .map(Json)
+}
+
+pub(super) async fn conversation_stream(
+    websocket: WebSocketUpgrade,
+    State(state): State<AppState>,
+    Extension(session): Extension<ClientSession>,
+    AxumPath(id): AxumPath<String>,
+    Query(query): Query<ConversationQuery>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    require_scope(&session, "read.projections")?;
+    let protocols = headers
+        .get_all(SEC_WEBSOCKET_PROTOCOL)
+        .iter()
+        .filter_map(|header| header.to_str().ok())
+        .flat_map(|header| header.split(','))
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    if protocols != [CONVERSATION_SUBPROTOCOL] {
+        return Err(validation(
+            "the conversation WebSocket requires exactly st3.client.conversation.v0",
+        ));
+    }
+    let session_id = conversation_session_id(&state, &id)?;
+    let snapshot = new_client_snapshot(&state);
+    let remote = super::managed_session_owner_at(&state.store, snapshot.store_index, &session_id)
+        .map_err(ApiError::internal)?
+        .and_then(|(_, _, origin)| origin)
+        .filter(|origin| origin != state.store.origin())
+        .map(|origin| client_host_id(&origin));
+    if remote.is_some() && !session.authority_actor.starts_with("person/") {
+        return Err(forbidden(
+            "remote conversation stream requires a concrete person",
+        ));
+    }
+    if let Some(owner) = &remote {
+        if state
+            .client_relay
+            .as_ref()
+            .is_none_or(|relay| !relay.has_peer(owner))
+        {
+            return Err(remote_unavailable(owner));
+        }
+    } else {
+        conversation_read_now(&state, &session, &session_id, query.after.as_deref())?;
+    }
+    Ok(websocket
+        .protocols([CONVERSATION_SUBPROTOCOL])
+        .on_upgrade(move |socket| {
+            conversation_stream_socket(socket, state, session, session_id, query.after, remote)
+        }))
+}
+
+async fn conversation_stream_socket(
+    mut socket: WebSocket,
+    state: AppState,
+    session: ClientSession,
+    session_id: String,
+    mut after: Option<String>,
+    remote: Option<String>,
+) {
+    loop {
+        let after_input = after.clone();
+        let read = async {
+            if let Some(owner) = &remote {
+                let relay = state
+                    .client_relay
+                    .as_ref()
+                    .ok_or_else(|| remote_unavailable(owner))?;
+                relay
+                    .read(
+                        owner,
+                        &crate::peer::ClientReadRequest {
+                            authority_actor: session.authority_actor.clone(),
+                            request: crate::peer::ClientReadOperation::ConversationChanges {
+                                session_id: session_id.clone(),
+                                after: after_input.clone(),
+                                wait_ms: 10_000,
+                            },
+                        },
+                    )
+                    .await
+                    .map_err(|error| remote_read_error(owner, error))
+            } else {
+                conversation_changes_local(
+                    &state,
+                    &session,
+                    &session_id,
+                    after_input.as_deref(),
+                    10_000,
+                )
+                .await
+            }
+        };
+        tokio::pin!(read);
+        let value = tokio::select! { value = &mut read => value, message = socket.recv() => { if matches!(message, None | Some(Err(_)) | Some(Ok(WsMessage::Close(_)))) { return; } else { continue; } } };
+        let value = match value {
+            Ok(value) => value,
+            Err(error) => {
+                close_terminal_stream_with_error(&mut socket, &error).await;
+                return;
+            }
+        };
+        let next = value["next_cursor"].as_str().map(str::to_owned);
+        if after.is_none()
+            || value["items"]
+                .as_array()
+                .is_some_and(|items| !items.is_empty())
+        {
+            if !send_terminal_stream_value(&mut socket, &terminal_stream_envelope(&state, value))
+                .await
+            {
+                close_terminal_stream(
+                    &mut socket,
+                    1009,
+                    "conversation update exceeds the client limit",
+                )
+                .await;
+                return;
+            }
+        }
+        after = next;
+    }
 }
 
 #[derive(Default, Deserialize)]
@@ -5849,6 +6381,168 @@ mission "example/zero-run" state="ready" {
     }
 
     #[tokio::test]
+    async fn conversation_changes_resume_across_isolated_nodes_without_idle_data() {
+        let owner_root = tempfile::tempdir().unwrap();
+        let follower_root = tempfile::tempdir().unwrap();
+        let owner = test_state_named(owner_root.path(), "conversation-owner");
+        let follower = test_state_named(follower_root.path(), "conversation-follower");
+        let agent = "agent/conversation-worker";
+        let incarnation = "conversation-runtime:i1";
+        owner
+            .store
+            .append_claim(&ClaimInput {
+                subject: agent.into(),
+                kind: "runtime.observed".into(),
+                actor: Some(agent.into()),
+                fields: BTreeMap::from([
+                    ("status".into(), json!("running")),
+                    ("runtime_id".into(), json!("conversation-runtime")),
+                    ("incarnation_id".into(), json!(incarnation)),
+                    ("terminal".into(), json!(false)),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some("conversation-runtime".into()),
+            })
+            .unwrap();
+        follower
+            .store
+            .import_replication(
+                "conversation-owner",
+                &owner.store.export_replication(0).unwrap(),
+            )
+            .unwrap();
+        let session_id = managed_session_id(agent, incarnation);
+        assert_eq!(conversation_session_id(&owner, agent).unwrap(), session_id);
+        let session = ClientSession::local(Some("person/example")).unwrap();
+        let origin = super::super::managed_session_owner_at(
+            &follower.store,
+            follower.store.index().unwrap(),
+            &session_id,
+        )
+        .unwrap()
+        .unwrap()
+        .2
+        .unwrap();
+        assert_eq!(origin, "conversation-owner");
+        let baseline = conversation_changes_local(&owner, &session, &session_id, None, 0)
+            .await
+            .unwrap();
+        let cursor = baseline["next_cursor"].as_str().unwrap().to_owned();
+        assert!(baseline["items"].as_array().unwrap().is_empty());
+        let idle = conversation_changes_local(&owner, &session, &session_id, Some(&cursor), 100)
+            .await
+            .unwrap();
+        assert!(idle["items"].as_array().unwrap().is_empty());
+        let waiting_owner = owner.clone();
+        let waiting_session = session.clone();
+        let waiting_session_id = session_id.clone();
+        let waiting_cursor = cursor.clone();
+        let waiting = tokio::spawn(async move {
+            conversation_changes_local(
+                &waiting_owner,
+                &waiting_session,
+                &waiting_session_id,
+                Some(&waiting_cursor),
+                1000,
+            )
+            .await
+            .unwrap()
+        });
+        tokio::task::yield_now().await;
+        owner
+            .store
+            .append_claim(&ClaimInput {
+                subject: "message/conversation-first".into(),
+                kind: "message.sent".into(),
+                actor: Some("person/example".into()),
+                fields: BTreeMap::from([
+                    ("from".into(), json!("person/example")),
+                    ("to".into(), json!(agent)),
+                    ("session_id".into(), json!(session_id)),
+                    ("content".into(), json!("first")),
+                    ("status".into(), json!("sent")),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some("conversation-first".into()),
+            })
+            .unwrap();
+        assert_eq!(
+            conversation_session_id(&owner, "message/conversation-first").unwrap(),
+            session_id
+        );
+        signal_changed(&owner);
+        let first = tokio::time::timeout(Duration::from_millis(900), waiting)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(first["items"].as_array().unwrap().len(), 2);
+        let resume = first["next_cursor"].as_str().unwrap();
+        owner
+            .store
+            .append_claim(&ClaimInput {
+                subject: agent.into(),
+                kind: "harness.timeline".into(),
+                actor: Some(agent.into()),
+                fields: BTreeMap::from([
+                    ("operation".into(), json!("append")),
+                    (
+                        "entry_id".into(),
+                        json!("timeline-entry/conversation-reply"),
+                    ),
+                    ("revision".into(), json!(1)),
+                    ("role".into(), json!("assistant")),
+                    ("entry_type".into(), json!("content")),
+                    ("final".into(), json!(true)),
+                    (
+                        "body".into(),
+                        json!({"media_type":"text/plain","text":"reply"}),
+                    ),
+                    ("driver".into(), json!("codex")),
+                    ("incarnation_id".into(), json!(incarnation)),
+                    ("sequence".into(), json!(1)),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some("conversation-reply".into()),
+            })
+            .unwrap();
+        let replay = conversation_changes_local(&owner, &session, &session_id, Some(resume), 0)
+            .await
+            .unwrap();
+        assert_eq!(replay["items"].as_array().unwrap().len(), 1);
+        assert_eq!(replay["items"][0]["body"]["text"], "reply");
+        assert!(
+            conversation_changes_local(&follower, &session, &session_id, Some(resume), 0)
+                .await
+                .is_err()
+        );
+        for ordinal in 0..101 {
+            owner
+                .store
+                .append_claim(&ClaimInput {
+                    subject: format!("message/conversation-burst-{ordinal}"),
+                    kind: "message.sent".into(),
+                    actor: Some("person/example".into()),
+                    fields: BTreeMap::from([
+                        ("from".into(), json!("person/example")),
+                        ("to".into(), json!(agent)),
+                        ("session_id".into(), json!(session_id)),
+                        ("content".into(), json!(format!("burst {ordinal}"))),
+                        ("status".into(), json!("sent")),
+                    ]),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: Some(format!("conversation-burst-{ordinal}")),
+                })
+                .unwrap();
+        }
+        let gap = conversation_read_now(&owner, &session, &session_id, Some(&cursor)).unwrap_err();
+        assert_eq!(gap.code, "cursor-gap");
+    }
+
+    #[tokio::test]
     async fn current_agent_session_fences_composer_messages_and_timeline_history() {
         let root = tempfile::tempdir().unwrap();
         let state = test_state_named(root.path(), "session-message-node");
@@ -6104,6 +6798,41 @@ mission "example/zero-run" state="ready" {
         assert!(timeline["items"].as_array().unwrap().iter().any(|item| {
             item["type"] == "content" && item["body"]["text"] == "Exact managed transcript"
         }));
+        let baseline = conversation_read_now(&state, &session, &session_id, None).unwrap();
+        let baseline_cursor = baseline["next_cursor"].as_str().unwrap();
+        state
+            .store
+            .append_claim(&ClaimInput {
+                subject: "message/managed-native".into(),
+                kind: "message.sent".into(),
+                actor: Some("person/nathan".into()),
+                fields: BTreeMap::from([
+                    ("from".into(), json!("person/nathan")),
+                    ("to".into(), json!(owner)),
+                    ("session_id".into(), json!(session_id)),
+                    ("content".into(), json!("Native message")),
+                    ("status".into(), json!("sent")),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some("managed-native-message".into()),
+            })
+            .unwrap();
+        let message_update =
+            conversation_read_now(&state, &session, &session_id, Some(baseline_cursor)).unwrap();
+        assert_eq!(message_update["items"].as_array().unwrap().len(), 2);
+        let message_cursor = message_update["next_cursor"].as_str().unwrap();
+        use std::io::Write as _;
+        writeln!(std::fs::OpenOptions::new().append(true).open(&transcript).unwrap(), "{}", json!({"type":"response_item","timestamp":"2026-09-24T12:00:02Z","payload":{"type":"message","role":"assistant","id":"later","content":[{"type":"output_text","text":"Native reply"}]}})).unwrap();
+        let native_update =
+            conversation_read_now(&state, &session, &session_id, Some(message_cursor)).unwrap();
+        assert!(
+            native_update["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| item["body"]["text"] == "Native reply")
+        );
         std::fs::write(
             directory.join("binding.json"),
             serde_json::to_vec(
