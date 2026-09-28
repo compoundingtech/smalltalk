@@ -53,3 +53,17 @@ fn the_cli_combines_host_logs_without_a_daemon() {
     assert_eq!(report["gh_api_candidates_by_agent"][0]["calls"], 1);
     assert_eq!(report["failures"][0]["command"], "gh api");
 }
+
+#[test]
+fn an_out_of_range_period_is_a_cli_error() {
+    let root = tempfile::tempdir().unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_st3"))
+        .args(["recorder", "report", "--hours", "10000000000"])
+        .env("HOME", root.path())
+        .env("XDG_CONFIG_HOME", root.path().join("config"))
+        .env("XDG_STATE_HOME", root.path().join("state"))
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("--hours is too large"));
+}

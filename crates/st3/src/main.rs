@@ -2957,7 +2957,9 @@ fn run_recorder(command: RecorderCommand, config: &Config, json_output: bool) ->
             let hours = i64::try_from(args.hours).context("--hours is too large")?;
             let window = chrono::Duration::try_hours(hours).context("--hours is too large")?;
             let until = chrono::Utc::now();
-            let since = until - window;
+            let since = until
+                .checked_sub_signed(window)
+                .context("--hours is too large")?;
             let logs = if args.logs.is_empty() {
                 let local = st3::recorder::log_path(&config.state_dir)?;
                 if local.exists() {
