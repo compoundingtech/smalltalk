@@ -1018,14 +1018,17 @@ mod tests {
         assert_plain_outage(&refused, OutagePhase::Connect);
         assert!(format!("{refused:#}").contains("connection refused"));
 
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        drop(listener);
+        // Hold the port without listening on it: a connection is refused, and no test running
+        // at the same time can bind the port and answer in the meantime.
+        let reserved = tokio::net::TcpSocket::new_v4().unwrap();
+        reserved.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let address = reserved.local_addr().unwrap();
         let http = fast_client(Endpoint::Http(format!("http://{address}")))
             .get::<Value>("/v1/status")
             .await
             .unwrap_err();
         assert_plain_outage(&http, OutagePhase::Connect);
+        drop(reserved);
     }
 
     #[tokio::test]

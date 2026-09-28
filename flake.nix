@@ -76,6 +76,13 @@
           "fish"
         ];
 
+        # pty's own test suite runs in pty-rust's CI. Running it again inside this build only
+        # imported that suite's timing-sensitive tests as failures here (a proctable test on
+        # Linux and a registry test on macOS, 2026-09-27) and cost CI time on every run.
+        ptyPackage = pty.packages.${system}.default.overrideAttrs (_: {
+          doCheck = false;
+        });
+
         # buildRustPackage compiles the workspace once per derivation, so a gate that differs from
         # an existing derivation only by test selection is folded into that derivation's check
         # phase instead of paying for a second compile. These extra runs deliberately mirror
@@ -290,6 +297,14 @@
             "--skip"
             "client::tests::terminal_socket_eof_restores_and_sanitizes_the_callers_tty"
           ];
+          # Give login-shell capture a disposable home and the sandbox's tool PATH.
+          # macOS /etc/profile otherwise puts host tools (such as /bin/ps, which
+          # cannot execute in the sandbox) ahead of their declared Nix equivalents.
+          preCheck = ''
+            export HOME=$(mktemp -d)
+            export SHELL=${pkgs.bashInteractive}/bin/bash
+            printf 'export PATH=%q\n' "$PATH" > "$HOME/.bash_profile"
+          '';
           # Render tests create throwaway repositories and call Git to protect
           # tracked files. Keep that dependency in the hermetic check sandbox.
           nativeBuildInputs = [
@@ -303,7 +318,7 @@
             pkgs.jq
             pkgs.rustfmt
             pkgs.which
-            pty.packages.${system}.default
+            ptyPackage
           ]
           # Native session discovery lists processes with ps and lsof on macOS (Linux reads /proc).
           ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isDarwin [
@@ -312,7 +327,7 @@
           ];
           postInstall = ''
             ln -s st3 $out/bin/st
-            ln -s ${pty.packages.${system}.default}/bin/pty $out/bin/pty
+            ln -s ${ptyPackage}/bin/pty $out/bin/pty
             $out/bin/st completions bash > st.bash
             $out/bin/st completions zsh > _st
             $out/bin/st completions fish > st.fish
@@ -470,7 +485,7 @@
           cargoCheckFeatures = [ ];
           nativeBuildInputs = (old.nativeBuildInputs or [ ]) ++ [
             pkgs.lld
-            pty.packages.${system}.default
+            ptyPackage
           ];
           ST2_GITHUB_ISSUE_COMPONENT = providerComponentPath "st2_github_issue_component";
           ST2_GITHUB_PR_COMPONENT = providerComponentPath "st2_github_pr_component";
@@ -531,7 +546,7 @@
           # both `st2 up --once` drivers shell out to `pty list --json`, so the real producer must
           # be on PATH — without it no pass reconciles and no task ever reaches the park.
           nativeCheckInputs = (old.nativeCheckInputs or [ ]) ++ [
-            pty.packages.${system}.default
+            ptyPackage
             effect-utils.packages.${system}.otelite
           ];
           ST2_OTELITE_BIN = "${effect-utils.packages.${system}.otelite}/bin/otelite";
@@ -731,13 +746,13 @@
             pkgs.coreutils
             pkgs.jq
             pty.checks.${system}.fleet-liveness
-            pty.packages.${system}.default
+            ptyPackage
             st2
           ];
         } ''
           export HOME=$(mktemp -d)
           catalog=$(mktemp -d)
-          pty_bin=${pty.packages.${system}.default}/bin/pty
+          pty_bin=${ptyPackage}/bin/pty
           mkdir -p "$catalog/agents/contract/gone"
           printf '%s\n' \
             'agent "gone" { host "contract"; retired #true; command "true" }' \
@@ -880,7 +895,7 @@
             # wasm guest modules (resource-profile resolvers) link with lld; nixpkgs rustc does
             # not bundle rust-lld the way the rustup toolchain does.
             pkgs.lld
-            pty.packages.${system}.default
+            ptyPackage
             # Local runs of the OTLP export integration gate
             # (`cargo test --test otel_export`) need the same collector the
             # Nix check pins; `ST2_OTELITE_BIN` points at it.

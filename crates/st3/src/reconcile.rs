@@ -134,6 +134,12 @@ impl NativeRuntime {
             exec: st_runtime::ExecRuntime::new(state_dir.join("exec"), state_dir.join("logs")),
         }
     }
+    fn pty(&self) -> Result<st_runtime::PtyRuntime> {
+        Ok(self
+            .pty
+            .clone()
+            .with_environment(crate::environment::snapshot()?))
+    }
 }
 
 fn observed_pty_status(observation: &st_runtime::PtyObservation) -> String {
@@ -163,7 +169,7 @@ fn local_process_is_alive(_pid: u32) -> bool {
 
 impl RuntimeControl for NativeRuntime {
     fn snapshot_ptys(&self) -> Result<Vec<RuntimeObservation>> {
-        self.pty
+        self.pty()?
             .snapshot()?
             .into_iter()
             .map(|item| {
@@ -214,7 +220,11 @@ impl RuntimeControl for NativeRuntime {
 
     fn start(&self, member: &MemberSpec) -> Result<()> {
         let executable = launch_executable()?;
-        let environment = st_runtime::materialize_environment(&member.environment, &executable)?;
+        let environment = st_runtime::overlay_environment(
+            crate::environment::snapshot()?,
+            &member.environment,
+            &executable,
+        )?;
         let mut launch = st_runtime::Launch::from(&member.launch);
         match &mut launch {
             st_runtime::Launch::Shell(source) => {
@@ -226,10 +236,31 @@ impl RuntimeControl for NativeRuntime {
                 }
             }
         }
+        // Resolve before crossing the PTY/isolation boundary; service-manager PATH is
+        // unrelated to the environment captured from the account's login shell.
+        match &mut launch {
+            st_runtime::Launch::Shell(source) => {
+                launch = st_runtime::Launch::Argv(vec![
+                    st_runtime::resolve_executable("sh", &environment)?
+                        .to_string_lossy()
+                        .into_owned(),
+                    "-c".into(),
+                    source.clone(),
+                ]);
+            }
+            st_runtime::Launch::Argv(argv) => {
+                let program = argv
+                    .first_mut()
+                    .context("an argv launch must contain a program")?;
+                *program = st_runtime::resolve_executable(program, &environment)?
+                    .to_string_lossy()
+                    .into_owned();
+            }
+        }
         let cwd = PathBuf::from(&member.cwd);
         if member.terminal {
             let pty_binary = st_runtime::resolve_executable("pty", &environment)?;
-            self.pty
+            self.pty()?
                 .clone()
                 .with_binary(pty_binary.to_string_lossy())
                 .spawn(
@@ -254,7 +285,7 @@ impl RuntimeControl for NativeRuntime {
         expected_incarnation: Option<&str>,
     ) -> Result<()> {
         if terminal {
-            self.pty.stop_if(runtime_id, expected_incarnation)
+            self.pty()?.stop_if(runtime_id, expected_incarnation)
         } else {
             self.exec.stop_if(runtime_id, expected_incarnation)
         }
@@ -267,7 +298,7 @@ impl RuntimeControl for NativeRuntime {
         expected_incarnation: Option<&str>,
     ) -> Result<()> {
         if terminal {
-            self.pty.kill_if(runtime_id, expected_incarnation)
+            self.pty()?.kill_if(runtime_id, expected_incarnation)
         } else {
             self.exec.kill_if(runtime_id, expected_incarnation)
         }
@@ -276,12 +307,12 @@ impl RuntimeControl for NativeRuntime {
     fn remove(&self, runtime_id: &str, terminal: bool) -> Result<()> {
         if terminal {
             if self
-                .pty
+                .pty()?
                 .snapshot()?
                 .iter()
                 .any(|item| item.name == runtime_id)
             {
-                self.pty.remove(runtime_id)
+                self.pty()?.remove(runtime_id)
             } else {
                 Ok(())
             }
@@ -291,11 +322,11 @@ impl RuntimeControl for NativeRuntime {
     }
 
     fn screen(&self, runtime_id: &str) -> Result<String> {
-        self.pty.screen(runtime_id)
+        self.pty()?.screen(runtime_id)
     }
 
     fn send_key(&self, runtime_id: &str, key: &str) -> Result<()> {
-        self.pty.send_key(runtime_id, key)
+        self.pty()?.send_key(runtime_id, key)
     }
 
     fn read_exec_log(&self, runtime_id: &str) -> Result<Option<String>> {
@@ -9483,6 +9514,68 @@ fn now_ms() -> u128 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn native_exec_and_gate_shell_resolve_the_declared_path() {
+        use super::{NativeRuntime, RuntimeControl};
+        use std::os::unix::fs::PermissionsExt as _;
+        let root = tempfile::tempdir().unwrap();
+        let program = root.path().join("orchid-tool");
+        std::fs::write(&program, "#!/bin/sh\nprintf '%s' \"$ORCHID_VALUE\"\n").unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let intent = crate::graph::parse_test_intent(
+            &format!(
+                r#"version 2
+exec "orchid" {{ command "orchid-tool"; workspace "{}"; }}"#,
+                root.path().display()
+            ),
+            "orchid",
+        )
+        .unwrap();
+        let mut member = intent
+            .subjects
+            .values()
+            .find_map(|subject| subject.member.clone())
+            .unwrap();
+        member.environment.insert(
+            "PATH".into(),
+            format!("{}:${{PATH}}", root.path().display()),
+        );
+        member
+            .environment
+            .insert("ORCHID_VALUE".into(), "from-declaration".into());
+        let runtime = NativeRuntime::new(root.path(), None, std::path::Path::new("unused-pty"));
+        for (id, launch) in [
+            (
+                "orchid-argv",
+                crate::model::LaunchSpec::Argv(vec!["orchid-tool".into()]),
+            ),
+            (
+                "orchid-shell",
+                crate::model::LaunchSpec::Shell("orchid-tool".into()),
+            ),
+        ] {
+            member.runtime_id = id.into();
+            member.launch = launch;
+            runtime.start(&member).unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                if runtime
+                    .observe_exec(id)
+                    .unwrap()
+                    .is_some_and(|observation| observation.status == "exited")
+                {
+                    break;
+                }
+                assert!(std::time::Instant::now() < deadline);
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            assert_eq!(
+                runtime.read_exec_log(id).unwrap().unwrap(),
+                "from-declaration"
+            );
+        }
+    }
+
     #[test]
     fn claude_login_screen_recognizes_only_explicit_auth_prompts() {
         assert_eq!(

@@ -10,11 +10,12 @@ mod process;
 mod pty;
 
 pub use environment::{
-    expand_path_placeholder, login_environment, materialize_environment, resolve_executable,
+    expand_path_placeholder, login_environment, materialize_environment, overlay_environment,
+    resolve_executable,
 };
 pub use isolate::{
-    Isolation, mode as isolation_mode, scope_unit, systemd_user_available, warn_if_degraded,
-    wrap as wrap_isolated,
+    Isolation, initialize_isolation, mode as isolation_mode, scope_unit, systemd_user_available,
+    warn_if_degraded, wrap as wrap_isolated,
 };
 pub use process::{ExecGeneration, ExecObservation, ExecRuntime, process_start_token};
 pub use pty::{Launch, PtyObservation, PtyRuntime, PtySpawnTimeout, PtySpawnTimeoutPhase};
