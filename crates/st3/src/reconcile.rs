@@ -530,11 +530,12 @@ impl<R: RuntimeControl> Reconciler<R> {
 
     pub async fn run(self: Arc<Self>) {
         self.notify.notify_one();
-        let mut unchanged = false;
+        // When the last pass began, and whether it changed nothing.
+        let mut quiet_pass_started = None;
         loop {
             match self.next_reconcile_deadline() {
                 Ok(Some(deadline)) => {
-                    let delay = deadline_sleep_ms(deadline, now_ms(), unchanged);
+                    let delay = deadline_sleep_ms(deadline, now_ms(), quiet_pass_started);
                     tokio::select! {
                         _ = self.notify.notified() => {}
                         _ = tokio::time::sleep(Duration::from_millis(delay)) => {}
@@ -556,6 +557,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                 }
             }
             for pass in 0..64 {
+                let started = now_ms();
                 let before = self.store.index().ok();
                 if let Err(error) = self.reconcile_once() {
                     let _ = self.record_once(
@@ -572,7 +574,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                 self.event_notify
                     .send_modify(|generation| *generation = generation.saturating_add(1));
                 let changed = before != self.store.index().ok();
-                unchanged = !changed;
+                quiet_pass_started = (!changed).then_some(started);
                 if !changed {
                     break;
                 }
@@ -7131,540 +7133,599 @@ impl<R: RuntimeControl> Reconciler<R> {
 
     fn reconcile_schedules(&self, desired: &[DesiredSubject]) -> Result<()> {
         for schedule in desired.iter().filter(|item| item.kind == "schedule") {
-            let Some(spec) = crate::graph::schedule_spec(&schedule.desired, &self.host) else {
-                continue;
-            };
-            if spec.stopped || spec.host != self.host {
-                continue;
+            self.isolate("schedule", &schedule.subject, || {
+                self.reconcile_schedule(schedule)
+            });
+        }
+        Ok(())
+    }
+
+    /// Record this schedule's next occurrence and arm its timer.
+    fn reconcile_schedule(&self, schedule: &DesiredSubject) -> Result<()> {
+        let Some(spec) = crate::graph::schedule_spec(&schedule.desired, &self.host) else {
+            return Ok(());
+        };
+        if spec.stopped || spec.host != self.host {
+            return Ok(());
+        }
+        if self.schedule_has_open_work(&schedule.subject)? {
+            return Ok(());
+        }
+        let Some(revision) = self.store.selected_desired_revision(&schedule.subject)? else {
+            return Ok(());
+        };
+        let reached = self
+            .store
+            .claims_for(&schedule.subject, Some("schedule.occurrence-reached"))?;
+        let last = reached
+            .iter()
+            .filter(|claim| {
+                claim
+                    .body
+                    .pointer("/fields/revision")
+                    .and_then(Value::as_str)
+                    == Some(&revision)
+            })
+            .filter_map(|claim| {
+                claim
+                    .body
+                    .pointer("/fields/occurrence")
+                    .and_then(Value::as_u64)
+            })
+            .max();
+        let now = now_ms() as i64;
+        let (occurrence, scheduled_at) = if let Some(at) = spec.at_unix_ms {
+            if last.is_some() {
+                return Ok(());
             }
-            if self.schedule_has_open_work(&schedule.subject)? {
-                continue;
-            }
-            let Some(revision) = self.store.selected_desired_revision(&schedule.subject)? else {
-                continue;
+            (0_u64, at)
+        } else {
+            let Some(interval) = spec.every_ms else {
+                return Ok(());
             };
-            let reached = self
-                .store
-                .claims_for(&schedule.subject, Some("schedule.occurrence-reached"))?;
-            let last = reached
-                .iter()
-                .filter(|claim| {
-                    claim
-                        .body
-                        .pointer("/fields/revision")
-                        .and_then(Value::as_str)
-                        == Some(&revision)
-                })
-                .filter_map(|claim| {
-                    claim
-                        .body
-                        .pointer("/fields/occurrence")
-                        .and_then(Value::as_u64)
-                })
-                .max();
-            let now = now_ms() as i64;
-            let (occurrence, scheduled_at) = if let Some(at) = spec.at_unix_ms {
-                if last.is_some() {
-                    continue;
-                }
-                (0_u64, at)
+            let Some(anchor) = spec.anchor_unix_ms else {
+                return Ok(());
+            };
+            let current = if now < anchor {
+                0
             } else {
-                let Some(interval) = spec.every_ms else {
-                    continue;
-                };
-                let Some(anchor) = spec.anchor_unix_ms else {
-                    continue;
-                };
-                let current = if now < anchor {
-                    0
-                } else {
-                    ((now - anchor) as u64) / interval
-                };
-                let mut next = last.map_or(0, |value| value.saturating_add(1));
-                if now >= anchor && next <= current {
-                    match spec.catch_up.as_str() {
-                        "latest" => next = current,
-                        "skip" => next = current.saturating_add(1),
-                        "all" => {
-                            let remaining = current.saturating_sub(next).saturating_add(1);
-                            if remaining > spec.max_catch_up.unwrap_or(0) as u64 {
-                                self.record_once(
-                                    &schedule.subject,
-                                    "runtime.reconcile-decision",
-                                    BTreeMap::from([
-                                        ("decision".into(), Value::String("raise".into())),
-                                        (
-                                            "reachability".into(),
-                                            Value::String("unreachable".into()),
-                                        ),
-                                        (
-                                            "reason".into(),
-                                            Value::String(
-                                                "the schedule exceeds max-catch-up".into(),
-                                            ),
-                                        ),
-                                    ]),
-                                )?;
-                                continue;
-                            }
-                        }
-                        _ => continue,
-                    }
-                }
-                let offset = interval
-                    .checked_mul(next)
-                    .context("schedule occurrence overflow")?;
-                let scheduled = anchor
-                    .checked_add(offset as i64)
-                    .context("schedule timestamp overflow")?;
-                (next, scheduled)
+                ((now - anchor) as u64) / interval
             };
-            let operation = format!("{}:{revision}:{occurrence}", schedule.subject);
-            if !self
-                .armed_schedules
-                .lock()
-                .expect("schedule mutex poisoned")
-                .insert(operation.clone())
-            {
-                continue;
-            }
-            let request = self.store.append_claim(&ClaimInput {
-                subject: schedule.subject.clone(),
-                kind: "schedule.occurrence-scheduled".into(),
-                actor: None,
-                fields: BTreeMap::from([
-                    ("revision".into(), Value::String(revision.clone())),
-                    ("occurrence".into(), Value::from(occurrence)),
-                    (
-                        "scheduled_at_unix_ms".into(),
-                        Value::String(scheduled_at.to_string()),
-                    ),
-                ]),
-                evidence: Vec::new(),
-                expected_subject: None,
-                idempotency_key: Some(format!("clock-wake:{operation}")),
-            })?;
-            self.event_notify
-                .send_modify(|generation| *generation = generation.saturating_add(1));
-            let work = spec.work.clone();
-            let store = self.store.clone();
-            let notify = self.notify.clone();
-            let event_notify = self.event_notify.clone();
-            let armed = self.armed_schedules.clone();
-            let schedule_subject = schedule.subject.clone();
-            if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                handle.spawn(async move {
-                    let delay = scheduled_at.saturating_sub(now_ms() as i64).max(0) as u64;
-                    tokio::time::sleep(Duration::from_millis(delay)).await;
-                    if store
-                        .selected_desired_revision(&schedule_subject)
-                        .ok()
-                        .flatten()
-                        .as_deref()
-                        != Some(revision.as_str())
-                    {
-                        let _ = store.append_claim(&ClaimInput {
-                            subject: schedule_subject.clone(),
-                            kind: "schedule.occurrence-cancelled".into(),
-                            actor: None,
-                            fields: BTreeMap::from([
-                                ("revision".into(), Value::String(revision.clone())),
-                                ("occurrence".into(), Value::from(occurrence)),
-                                (
-                                    "reason".into(),
-                                    Value::String("the schedule revision changed".into()),
-                                ),
-                            ]),
-                            evidence: vec![request.id.clone()],
-                            expected_subject: None,
-                            idempotency_key: Some(format!("clock-cancel:{operation}")),
-                        });
-                        armed
-                            .lock()
-                            .expect("schedule mutex poisoned")
-                            .remove(&operation);
-                        signal_changed(&notify, &event_notify);
-                        return;
+            let mut next = last.map_or(0, |value| value.saturating_add(1));
+            if now >= anchor && next <= current {
+                match spec.catch_up.as_str() {
+                    "latest" => next = current,
+                    "skip" => next = current.saturating_add(1),
+                    "all" => {
+                        let remaining = current.saturating_sub(next).saturating_add(1);
+                        if remaining > spec.max_catch_up.unwrap_or(0) as u64 {
+                            self.record_once(
+                                &schedule.subject,
+                                "runtime.reconcile-decision",
+                                BTreeMap::from([
+                                    ("decision".into(), Value::String("raise".into())),
+                                    ("reachability".into(), Value::String("unreachable".into())),
+                                    (
+                                        "reason".into(),
+                                        Value::String("the schedule exceeds max-catch-up".into()),
+                                    ),
+                                ]),
+                            )?;
+                            return Ok(());
+                        }
                     }
-                    let reached = store.append_claim(&ClaimInput {
+                    _ => return Ok(()),
+                }
+            }
+            let offset = interval
+                .checked_mul(next)
+                .context("schedule occurrence overflow")?;
+            let scheduled = anchor
+                .checked_add(offset as i64)
+                .context("schedule timestamp overflow")?;
+            (next, scheduled)
+        };
+        let operation = format!("{}:{revision}:{occurrence}", schedule.subject);
+        if !self
+            .armed_schedules
+            .lock()
+            .expect("schedule mutex poisoned")
+            .insert(operation.clone())
+        {
+            return Ok(());
+        }
+        let request = self.store.append_claim(&ClaimInput {
+            subject: schedule.subject.clone(),
+            kind: "schedule.occurrence-scheduled".into(),
+            actor: None,
+            fields: BTreeMap::from([
+                ("revision".into(), Value::String(revision.clone())),
+                ("occurrence".into(), Value::from(occurrence)),
+                (
+                    "scheduled_at_unix_ms".into(),
+                    Value::String(scheduled_at.to_string()),
+                ),
+            ]),
+            evidence: Vec::new(),
+            expected_subject: None,
+            idempotency_key: Some(format!("clock-wake:{operation}")),
+        })?;
+        self.event_notify
+            .send_modify(|generation| *generation = generation.saturating_add(1));
+        let work = spec.work.clone();
+        let store = self.store.clone();
+        let notify = self.notify.clone();
+        let event_notify = self.event_notify.clone();
+        let armed = self.armed_schedules.clone();
+        let schedule_subject = schedule.subject.clone();
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                let delay = scheduled_at.saturating_sub(now_ms() as i64).max(0) as u64;
+                tokio::time::sleep(Duration::from_millis(delay)).await;
+                if store
+                    .selected_desired_revision(&schedule_subject)
+                    .ok()
+                    .flatten()
+                    .as_deref()
+                    != Some(revision.as_str())
+                {
+                    let _ = store.append_claim(&ClaimInput {
                         subject: schedule_subject.clone(),
-                        kind: "schedule.occurrence-reached".into(),
+                        kind: "schedule.occurrence-cancelled".into(),
                         actor: None,
                         fields: BTreeMap::from([
                             ("revision".into(), Value::String(revision.clone())),
                             ("occurrence".into(), Value::from(occurrence)),
                             (
-                                "scheduled_at_unix_ms".into(),
-                                Value::String(scheduled_at.to_string()),
+                                "reason".into(),
+                                Value::String("the schedule revision changed".into()),
                             ),
                         ]),
-                        evidence: vec![request.id],
+                        evidence: vec![request.id.clone()],
                         expected_subject: None,
-                        idempotency_key: Some(format!("clock-reached:{operation}")),
+                        idempotency_key: Some(format!("clock-cancel:{operation}")),
                     });
-                    if let (Ok(reached), Some(work)) = (reached, work) {
-                        let _ = store.append_claim(&ClaimInput {
-                            subject: schedule_subject.clone(),
-                            kind: "schedule.work-requested".into(),
-                            actor: None,
-                            fields: BTreeMap::from([
-                                ("revision".into(), Value::String(revision.clone())),
-                                ("occurrence".into(), Value::from(occurrence)),
-                                (
-                                    "mission".into(),
-                                    Value::String(format!("mission/{}", work.mission)),
-                                ),
-                                ("mission_revision".into(), Value::String(work.revision)),
-                                ("workspace".into(), Value::String(work.workspace)),
-                                (
-                                    "inputs".into(),
-                                    serde_json::to_value(work.inputs).unwrap_or_default(),
-                                ),
-                            ]),
-                            evidence: vec![reached.id],
-                            expected_subject: None,
-                            idempotency_key: Some(format!("schedule-work-request:{operation}")),
-                        });
-                    }
                     armed
                         .lock()
                         .expect("schedule mutex poisoned")
                         .remove(&operation);
                     signal_changed(&notify, &event_notify);
+                    return;
+                }
+                let reached = store.append_claim(&ClaimInput {
+                    subject: schedule_subject.clone(),
+                    kind: "schedule.occurrence-reached".into(),
+                    actor: None,
+                    fields: BTreeMap::from([
+                        ("revision".into(), Value::String(revision.clone())),
+                        ("occurrence".into(), Value::from(occurrence)),
+                        (
+                            "scheduled_at_unix_ms".into(),
+                            Value::String(scheduled_at.to_string()),
+                        ),
+                    ]),
+                    evidence: vec![request.id],
+                    expected_subject: None,
+                    idempotency_key: Some(format!("clock-reached:{operation}")),
                 });
-            } else {
-                self.armed_schedules
+                if let (Ok(reached), Some(work)) = (reached, work) {
+                    let _ = store.append_claim(&ClaimInput {
+                        subject: schedule_subject.clone(),
+                        kind: "schedule.work-requested".into(),
+                        actor: None,
+                        fields: BTreeMap::from([
+                            ("revision".into(), Value::String(revision.clone())),
+                            ("occurrence".into(), Value::from(occurrence)),
+                            (
+                                "mission".into(),
+                                Value::String(format!("mission/{}", work.mission)),
+                            ),
+                            ("mission_revision".into(), Value::String(work.revision)),
+                            ("workspace".into(), Value::String(work.workspace)),
+                            (
+                                "inputs".into(),
+                                serde_json::to_value(work.inputs).unwrap_or_default(),
+                            ),
+                        ]),
+                        evidence: vec![reached.id],
+                        expected_subject: None,
+                        idempotency_key: Some(format!("schedule-work-request:{operation}")),
+                    });
+                }
+                armed
                     .lock()
                     .expect("schedule mutex poisoned")
                     .remove(&operation);
-            }
+                signal_changed(&notify, &event_notify);
+            });
+        } else {
+            self.armed_schedules
+                .lock()
+                .expect("schedule mutex poisoned")
+                .remove(&operation);
         }
         Ok(())
     }
 
     fn schedule_has_open_work(&self, schedule: &str) -> Result<bool> {
-        let Some(request) = self
+        Ok(!self
             .store
-            .latest_claim(schedule, Some("schedule.work-requested"))?
-        else {
-            return Ok(false);
-        };
-        let Some(started) = self
-            .store
-            .schedule_work_start_for_request(schedule, &request.id)?
-        else {
-            return Ok(true);
-        };
-        let Some(run) = started
-            .body
-            .pointer("/fields/mission_run")
-            .and_then(Value::as_str)
-        else {
-            return Ok(true);
-        };
-        Ok(self.store.mission_run(run)?.is_some_and(|view| {
-            !matches!(view.status.as_str(), "completed" | "cancelled" | "failed")
-        }))
+            .pending_schedule_work_requests(schedule)?
+            .is_empty()
+            || self.store.schedule_has_active_started_run(schedule)?)
     }
 
     fn reconcile_scheduled_work(&self, desired: &[DesiredSubject]) -> Result<()> {
         for schedule in desired.iter().filter(|item| item.kind == "schedule") {
-            if intake_is_stopped(schedule, &self.host) {
-                continue;
-            }
-            let requests = self
-                .store
-                .pending_schedule_work_requests(&schedule.subject)?;
-            if requests.is_empty()
-                || self
-                    .store
-                    .schedule_has_active_started_run(&schedule.subject)?
-            {
-                continue;
-            }
-            for request in requests {
-                if self
-                    .store
-                    .schedule_has_active_started_run(&schedule.subject)?
-                {
-                    break;
-                }
-                let Some(mission) = request
-                    .body
-                    .pointer("/fields/mission")
-                    .and_then(Value::as_str)
-                else {
-                    continue;
-                };
-                let Some(revision) = request
-                    .body
-                    .pointer("/fields/mission_revision")
-                    .and_then(Value::as_str)
-                else {
-                    continue;
-                };
-                let Some(root) = request
-                    .body
-                    .pointer("/fields/workspace")
-                    .and_then(Value::as_str)
-                else {
-                    continue;
-                };
-                let suffix = &hex::encode(sha2::Sha256::digest(request.id.as_bytes()))[..16];
-                let workspace = Path::new(root).join(suffix).to_string_lossy().into_owned();
-                let inputs = serde_json::from_value(
-                    request
-                        .body
-                        .pointer("/fields/inputs")
-                        .cloned()
-                        .unwrap_or_default(),
-                )
-                .unwrap_or_default();
-                let request_value = MissionRunRequest {
-                    mission: mission.into(),
-                    revision: Some(revision.into()),
-                    workspace,
-                    requester: Some(format!("daemon/{}", self.host)),
-                    mode: None,
-                    inputs,
-                    idempotency_key: format!("schedule-work:{}", request.id),
-                };
-                let created = schedule
-                    .owner_run
-                    .as_deref()
-                    .and_then(|owner| self.store.mission_run(owner).ok().flatten())
-                    .map_or_else(
-                        || self.store.create_mission_run(&request_value),
-                        |parent| {
-                            self.store.create_child_mission_run(
-                                &request_value,
-                                &parent,
-                                &schedule.subject,
-                                None,
-                            )
-                        },
-                    );
-                let run = match created {
-                    Ok(run) => run,
-                    Err(error) if error.code == "mission-run-capacity" => continue,
-                    Err(error) => return Err(anyhow::anyhow!(error.to_string())),
-                };
-                self.store.append_claim(&ClaimInput {
-                    subject: schedule.subject.clone(),
-                    kind: "schedule.work-started".into(),
-                    actor: None,
-                    fields: BTreeMap::from([
-                        ("request".into(), Value::String(request.id.clone())),
-                        ("mission_run".into(), Value::String(run.subject)),
-                    ]),
-                    evidence: vec![request.id],
-                    expected_subject: None,
-                    idempotency_key: Some(format!("schedule-work-started:{}", run.id)),
-                })?;
-            }
+            self.isolate("schedule-work", &schedule.subject, || {
+                self.reconcile_schedule_work(schedule)
+            });
         }
+        Ok(())
+    }
+
+    /// Start the work that this schedule's occurrences requested. A request that cannot start
+    /// for a lasting reason is failed so the schedule can fire again. A request that waits for
+    /// something this host has not received yet stays pending, and the schedule records why.
+    fn reconcile_schedule_work(&self, schedule: &DesiredSubject) -> Result<()> {
+        if intake_is_stopped(schedule, &self.host) {
+            return Ok(());
+        }
+        // Every peer replicates the same requests. Only the host that requested the work starts it.
+        let requests = self
+            .store
+            .pending_schedule_work_requests(&schedule.subject)?
+            .into_iter()
+            .filter(|request| request.origin == self.host)
+            .collect::<Vec<_>>();
+        if requests.is_empty()
+            || self
+                .store
+                .schedule_has_active_started_run(&schedule.subject)?
+        {
+            return Ok(());
+        }
+        let mut waiting = Vec::new();
+        for request in requests {
+            if self
+                .store
+                .schedule_has_active_started_run(&schedule.subject)?
+            {
+                break;
+            }
+            let fields = request.body.get("fields").unwrap_or(&request.body);
+            let field = |name: &str| fields.get(name).and_then(Value::as_str);
+            let (Some(mission), Some(revision), Some(root)) = (
+                field("mission"),
+                field("mission_revision"),
+                field("workspace"),
+            ) else {
+                self.fail_schedule_work(
+                    schedule,
+                    &request.id,
+                    "invalid-request",
+                    "the request names no mission, revision, or workspace",
+                )?;
+                continue;
+            };
+            let suffix = &hex::encode(sha2::Sha256::digest(request.id.as_bytes()))[..16];
+            let workspace = Path::new(root).join(suffix).to_string_lossy().into_owned();
+            let inputs = serde_json::from_value(fields.get("inputs").cloned().unwrap_or_default())
+                .unwrap_or_default();
+            let request_value = MissionRunRequest {
+                mission: mission.into(),
+                revision: Some(revision.into()),
+                workspace,
+                requester: Some(format!("daemon/{}", self.host)),
+                mode: None,
+                inputs,
+                idempotency_key: format!("schedule-work:{}", request.id),
+            };
+            let created = match &schedule.owner_run {
+                Some(owner) => match self.store.mission_run(owner)? {
+                    Some(parent) => self.store.create_child_mission_run(
+                        &request_value,
+                        &parent,
+                        &schedule.subject,
+                        None,
+                    ),
+                    None => {
+                        waiting.push(format!(
+                            "request {}: its owner run {owner} is not stored here yet",
+                            request.id
+                        ));
+                        continue;
+                    }
+                },
+                None => self.store.create_mission_run(&request_value),
+            };
+            let run = match created {
+                Ok(run) => run,
+                Err(error) if error.code == "mission-run-capacity" => continue,
+                Err(error) if start_waits_for_replication(&error) => {
+                    waiting.push(format!("request {}: {error}", request.id));
+                    continue;
+                }
+                Err(error) => {
+                    self.fail_schedule_work(schedule, &request.id, error.code, &error.to_string())?;
+                    continue;
+                }
+            };
+            self.store.append_claim(&ClaimInput {
+                subject: schedule.subject.clone(),
+                kind: "schedule.work-started".into(),
+                actor: None,
+                fields: BTreeMap::from([
+                    ("request".into(), Value::String(request.id.clone())),
+                    ("mission_run".into(), Value::String(run.subject)),
+                ]),
+                evidence: vec![request.id],
+                expected_subject: None,
+                idempotency_key: Some(format!("schedule-work-started:{}", run.id)),
+            })?;
+        }
+        anyhow::ensure!(waiting.is_empty(), "{}", waiting.join("; "));
+        Ok(())
+    }
+
+    fn fail_schedule_work(
+        &self,
+        schedule: &DesiredSubject,
+        request: &str,
+        code: &str,
+        reason: &str,
+    ) -> Result<()> {
+        self.store.append_claim(&ClaimInput {
+            subject: schedule.subject.clone(),
+            kind: "schedule.work-failed".into(),
+            actor: None,
+            fields: BTreeMap::from([
+                ("request".into(), Value::String(request.into())),
+                ("code".into(), Value::String(code.into())),
+                ("reason".into(), Value::String(reason.into())),
+            ]),
+            evidence: vec![request.into()],
+            expected_subject: None,
+            idempotency_key: Some(format!("schedule-work-failed:{request}")),
+        })?;
         Ok(())
     }
 
     fn reconcile_subscription_missions(&self, desired: &[DesiredSubject]) -> Result<()> {
         for item in desired.iter().filter(|item| item.kind == "subscription") {
-            let Some(spec) = crate::graph::subscription_spec(&item.desired) else {
-                continue;
-            };
-            // Every peer replicates the same requests. Only the declaring host starts their runs.
-            if self
-                .store
-                .selected_desired_origin(&item.subject)?
-                .as_deref()
-                != Some(self.host.as_str())
-            {
-                continue;
-            }
-            if spec.stopped {
-                self.cancel_unstarted_subscription_requests(&item.subject)?;
-                continue;
-            }
-            if spec.delivery != "mission" {
-                continue;
-            }
-            let requests = self
-                .store
-                .pending_subscription_mission_requests(&item.subject)?;
-            if requests.is_empty() {
-                continue;
-            }
-            let is_held = |request: &crate::model::ClaimRecord| {
-                request
-                    .body
-                    .pointer("/fields/held")
-                    .and_then(Value::as_bool)
-                    == Some(true)
-            };
-            let released = if requests.iter().any(is_held) {
-                self.store
-                    .claims_for(&item.subject, Some("subscription.mission-request-released"))?
-                    .into_iter()
-                    .filter_map(|claim| {
-                        claim
-                            .body
-                            .pointer("/fields/request")
-                            .and_then(Value::as_str)
-                            .map(str::to_owned)
-                    })
-                    .collect::<BTreeSet<_>>()
-            } else {
-                BTreeSet::new()
-            };
-            let mut deferrals = BTreeMap::new();
-            for claim in self
-                .store
-                .claims_for(&item.subject, Some("subscription.mission-deferred"))?
-            {
-                if let (Some(request), Some(deadline)) = (
+            self.isolate("subscription", &item.subject, || {
+                self.reconcile_subscription_mission(item)
+            });
+        }
+        Ok(())
+    }
+
+    /// Start the missions that this subscription's deliveries requested.
+    fn reconcile_subscription_mission(&self, item: &DesiredSubject) -> Result<()> {
+        let Some(spec) = crate::graph::subscription_spec(&item.desired) else {
+            return Ok(());
+        };
+        // Every peer replicates the same requests. Only the declaring host starts their runs.
+        if self
+            .store
+            .selected_desired_origin(&item.subject)?
+            .as_deref()
+            != Some(self.host.as_str())
+        {
+            return Ok(());
+        }
+        if spec.stopped {
+            self.cancel_unstarted_subscription_requests(&item.subject)?;
+            return Ok(());
+        }
+        if spec.delivery != "mission" {
+            return Ok(());
+        }
+        let requests = self
+            .store
+            .pending_subscription_mission_requests(&item.subject)?;
+        if requests.is_empty() {
+            return Ok(());
+        }
+        let is_held = |request: &crate::model::ClaimRecord| {
+            request
+                .body
+                .pointer("/fields/held")
+                .and_then(Value::as_bool)
+                == Some(true)
+        };
+        let released = if requests.iter().any(is_held) {
+            self.store
+                .claims_for(&item.subject, Some("subscription.mission-request-released"))?
+                .into_iter()
+                .filter_map(|claim| {
                     claim
                         .body
                         .pointer("/fields/request")
-                        .and_then(Value::as_str),
-                    claim
-                        .body
-                        .pointer("/fields/not_before_unix_ms")
-                        .and_then(Value::as_u64),
-                ) {
-                    let entry = deferrals.entry(request.to_owned()).or_insert((0, 0));
-                    *entry = (deadline, entry.1 + 1);
-                }
-            }
-            let mut held = BTreeMap::<String, usize>::new();
-            for request in requests {
-                if is_held(&request) && !released.contains(&request.id) {
-                    let observation = request
-                        .body
-                        .pointer("/evidence/0")
                         .and_then(Value::as_str)
-                        .unwrap_or(request.id.as_str())
-                        .to_owned();
-                    *held.entry(observation).or_default() += 1;
-                    continue;
-                }
-                if deferrals
-                    .get(&request.id)
-                    .is_some_and(|(deadline, _)| u128::from(*deadline) > now_ms())
-                {
-                    continue;
-                }
-                let fields = request.body.get("fields").unwrap_or(&request.body);
-                let Some(mission) = fields.get("mission").and_then(Value::as_str) else {
-                    continue;
-                };
-                let Some(revision) = fields.get("mission_revision").and_then(Value::as_str) else {
-                    continue;
-                };
-                let Some(resource) = fields.get("resource").and_then(Value::as_str) else {
-                    continue;
-                };
-                let Some(discovery) = fields.get("discovery").and_then(Value::as_str) else {
-                    continue;
-                };
-                let Some(input) = fields.get("resource_input").and_then(Value::as_str) else {
-                    continue;
-                };
-                let Some(root) = fields.get("workspace").and_then(Value::as_str) else {
-                    continue;
-                };
-                let requester = fields
-                    .get("requester")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned)
-                    .unwrap_or_else(|| format!("daemon/{}", self.host));
-                let suffix = &hex::encode(sha2::Sha256::digest(request.id.as_bytes()))[..16];
-                let workspace = Path::new(root).join(suffix).to_string_lossy().into_owned();
-                let request_value = MissionRunRequest {
-                    mission: mission.into(),
-                    revision: Some(revision.into()),
-                    workspace,
-                    requester: Some(requester),
-                    mode: None,
-                    inputs: BTreeMap::from([(input.into(), format!("{resource}@{discovery}"))]),
-                    idempotency_key: format!("subscription-mission:{}", request.id),
-                };
-                let created = item
-                    .owner_run
-                    .as_deref()
-                    .and_then(|owner| self.store.mission_run(owner).ok().flatten())
-                    .map_or_else(
-                        || self.store.create_mission_run(&request_value),
-                        |parent| {
-                            self.store.create_child_mission_run(
-                                &request_value,
-                                &parent,
-                                &item.subject,
-                                None,
-                            )
-                        },
-                    );
-                let run = match created {
-                    Ok(run) => run,
-                    Err(error) if error.code == "mission-run-capacity" => {
-                        let attempt = deferrals
-                            .get(&request.id)
-                            .map_or(1_u32, |(_, attempts)| attempts + 1);
-                        let delay_ms =
-                            1_000_u128.saturating_mul(1_u128 << attempt.saturating_sub(1).min(6));
-                        let not_before = now_ms().saturating_add(delay_ms);
-                        self.store.append_claim(&ClaimInput {
-                            subject: item.subject.clone(),
-                            kind: "subscription.mission-deferred".into(),
-                            actor: None,
-                            fields: BTreeMap::from([
-                                ("request".into(), Value::String(request.id.clone())),
-                                ("not_before_unix_ms".into(), Value::from(not_before as u64)),
-                            ]),
-                            evidence: vec![request.id.clone()],
-                            expected_subject: None,
-                            idempotency_key: Some(format!(
-                                "subscription-mission-deferred:{}:{attempt}",
-                                request.id
-                            )),
-                        })?;
-                        continue;
-                    }
-                    Err(error) => {
-                        self.store.append_claim(&ClaimInput {
-                            subject: item.subject.clone(),
-                            kind: "subscription.mission-failed".into(),
-                            actor: None,
-                            fields: BTreeMap::from([
-                                ("request".into(), Value::String(request.id.clone())),
-                                ("code".into(), Value::String(error.code.into())),
-                                ("reason".into(), Value::String(error.to_string())),
-                            ]),
-                            evidence: vec![request.id.clone()],
-                            expected_subject: None,
-                            idempotency_key: Some(format!(
-                                "subscription-mission-failed:{}",
-                                request.id
-                            )),
-                        })?;
-                        continue;
-                    }
-                };
-                self.store.append_claim(&ClaimInput {
-                    subject: item.subject.clone(),
-                    kind: "subscription.mission-started".into(),
-                    actor: None,
-                    fields: BTreeMap::from([
-                        ("request".into(), Value::String(request.id.clone())),
-                        ("mission_run".into(), Value::String(run.subject)),
-                    ]),
-                    evidence: vec![request.id],
-                    expected_subject: None,
-                    idempotency_key: Some(format!("subscription-mission-started:{}", run.id)),
-                })?;
-            }
-            for (observation, count) in held {
-                self.request_held_subscription_attention(&item.subject, &observation, count)?;
+                        .map(str::to_owned)
+                })
+                .collect::<BTreeSet<_>>()
+        } else {
+            BTreeSet::new()
+        };
+        let mut deferrals = BTreeMap::new();
+        for claim in self
+            .store
+            .claims_for(&item.subject, Some("subscription.mission-deferred"))?
+        {
+            if let (Some(request), Some(deadline)) = (
+                claim
+                    .body
+                    .pointer("/fields/request")
+                    .and_then(Value::as_str),
+                claim
+                    .body
+                    .pointer("/fields/not_before_unix_ms")
+                    .and_then(Value::as_u64),
+            ) {
+                let entry = deferrals.entry(request.to_owned()).or_insert((0, 0));
+                *entry = (deadline, entry.1 + 1);
             }
         }
+        let mut held = BTreeMap::<String, usize>::new();
+        let mut waiting = Vec::new();
+        for request in requests {
+            if is_held(&request) && !released.contains(&request.id) {
+                let observation = request
+                    .body
+                    .pointer("/evidence/0")
+                    .and_then(Value::as_str)
+                    .unwrap_or(request.id.as_str())
+                    .to_owned();
+                *held.entry(observation).or_default() += 1;
+                continue;
+            }
+            if deferrals
+                .get(&request.id)
+                .is_some_and(|(deadline, _)| u128::from(*deadline) > now_ms())
+            {
+                continue;
+            }
+            let fields = request.body.get("fields").unwrap_or(&request.body);
+            let field = |name: &str| fields.get(name).and_then(Value::as_str);
+            let (
+                Some(mission),
+                Some(revision),
+                Some(resource),
+                Some(discovery),
+                Some(input),
+                Some(root),
+            ) = (
+                field("mission"),
+                field("mission_revision"),
+                field("resource"),
+                field("discovery"),
+                field("resource_input"),
+                field("workspace"),
+            )
+            else {
+                self.fail_subscription_request(
+                    item,
+                    &request.id,
+                    "invalid-request",
+                    "the request lacks a mission, revision, resource, discovery, input, or workspace",
+                )?;
+                continue;
+            };
+            let requester = field("requester")
+                .map(str::to_owned)
+                .unwrap_or_else(|| format!("daemon/{}", self.host));
+            let suffix = &hex::encode(sha2::Sha256::digest(request.id.as_bytes()))[..16];
+            let workspace = Path::new(root).join(suffix).to_string_lossy().into_owned();
+            let request_value = MissionRunRequest {
+                mission: mission.into(),
+                revision: Some(revision.into()),
+                workspace,
+                requester: Some(requester),
+                mode: None,
+                inputs: BTreeMap::from([(input.into(), format!("{resource}@{discovery}"))]),
+                idempotency_key: format!("subscription-mission:{}", request.id),
+            };
+            let created = match &item.owner_run {
+                Some(owner) => match self.store.mission_run(owner)? {
+                    Some(parent) => self.store.create_child_mission_run(
+                        &request_value,
+                        &parent,
+                        &item.subject,
+                        None,
+                    ),
+                    None => {
+                        waiting.push(format!(
+                            "request {}: its owner run {owner} is not stored here yet",
+                            request.id
+                        ));
+                        continue;
+                    }
+                },
+                None => self.store.create_mission_run(&request_value),
+            };
+            let run = match created {
+                Ok(run) => run,
+                Err(error) if error.code == "mission-run-capacity" => {
+                    let attempt = deferrals
+                        .get(&request.id)
+                        .map_or(1_u32, |(_, attempts)| attempts + 1);
+                    let delay_ms =
+                        1_000_u128.saturating_mul(1_u128 << attempt.saturating_sub(1).min(6));
+                    let not_before = now_ms().saturating_add(delay_ms);
+                    self.store.append_claim(&ClaimInput {
+                        subject: item.subject.clone(),
+                        kind: "subscription.mission-deferred".into(),
+                        actor: None,
+                        fields: BTreeMap::from([
+                            ("request".into(), Value::String(request.id.clone())),
+                            ("not_before_unix_ms".into(), Value::from(not_before as u64)),
+                        ]),
+                        evidence: vec![request.id.clone()],
+                        expected_subject: None,
+                        idempotency_key: Some(format!(
+                            "subscription-mission-deferred:{}:{attempt}",
+                            request.id
+                        )),
+                    })?;
+                    continue;
+                }
+                // The request stays pending and starts once replication delivers what it names.
+                Err(error) if start_waits_for_replication(&error) => {
+                    waiting.push(format!("request {}: {error}", request.id));
+                    continue;
+                }
+                Err(error) => {
+                    self.fail_subscription_request(
+                        item,
+                        &request.id,
+                        error.code,
+                        &error.to_string(),
+                    )?;
+                    continue;
+                }
+            };
+            self.store.append_claim(&ClaimInput {
+                subject: item.subject.clone(),
+                kind: "subscription.mission-started".into(),
+                actor: None,
+                fields: BTreeMap::from([
+                    ("request".into(), Value::String(request.id.clone())),
+                    ("mission_run".into(), Value::String(run.subject)),
+                ]),
+                evidence: vec![request.id],
+                expected_subject: None,
+                idempotency_key: Some(format!("subscription-mission-started:{}", run.id)),
+            })?;
+        }
+        for (observation, count) in held {
+            self.request_held_subscription_attention(&item.subject, &observation, count)?;
+        }
+        anyhow::ensure!(waiting.is_empty(), "{}", waiting.join("; "));
+        Ok(())
+    }
+
+    fn fail_subscription_request(
+        &self,
+        item: &DesiredSubject,
+        request: &str,
+        code: &str,
+        reason: &str,
+    ) -> Result<()> {
+        self.store.append_claim(&ClaimInput {
+            subject: item.subject.clone(),
+            kind: "subscription.mission-failed".into(),
+            actor: None,
+            fields: BTreeMap::from([
+                ("request".into(), Value::String(request.into())),
+                ("code".into(), Value::String(code.into())),
+                ("reason".into(), Value::String(reason.into())),
+            ]),
+            evidence: vec![request.into()],
+            expected_subject: None,
+            idempotency_key: Some(format!("subscription-mission-failed:{request}")),
+        })?;
         Ok(())
     }
 
@@ -7756,303 +7817,306 @@ impl<R: RuntimeControl> Reconciler<R> {
             }
         }
         for observer in desired.iter().filter(|item| item.kind == "observer") {
-            let Some(mut spec) = crate::graph::observer_spec(&observer.desired) else {
-                continue;
-            };
-            let selected = subscriptions_by_resource
-                .get(&spec.resource)
-                .cloned()
-                .unwrap_or_default();
-            if spec.stopped {
-                let is_stopped = self
-                    .store
-                    .latest_actual_value(&observer.subject)?
-                    .and_then(|actual| {
-                        actual
-                            .get("state")
-                            .and_then(Value::as_str)
-                            .map(str::to_owned)
-                    })
-                    .as_deref()
-                    == Some("stopped");
-                if !is_stopped {
-                    self.store.append_claim(&ClaimInput {
-                        subject: observer.subject.clone(),
-                        kind: "observer.state".into(),
-                        actor: None,
-                        fields: BTreeMap::from([("state".into(), Value::String("stopped".into()))]),
-                        evidence: Vec::new(),
-                        expected_subject: None,
-                        idempotency_key: None,
-                    })?;
-                }
-                continue;
-            }
-            if self
+            self.isolate("observer", &observer.subject, || {
+                self.reconcile_resource_observer(observer, &subscriptions_by_resource)
+            });
+        }
+        Ok(())
+    }
+
+    /// Settle a stopped observer, or arm this observer's next observation.
+    fn reconcile_resource_observer(
+        &self,
+        observer: &DesiredSubject,
+        subscriptions_by_resource: &HashMap<String, Vec<(String, SubscriptionSpec)>>,
+    ) -> Result<()> {
+        let Some(mut spec) = crate::graph::observer_spec(&observer.desired) else {
+            return Ok(());
+        };
+        let selected = subscriptions_by_resource
+            .get(&spec.resource)
+            .cloned()
+            .unwrap_or_default();
+        if spec.stopped {
+            let is_stopped = self
                 .store
-                .selected_desired_origin(&observer.subject)?
-                .as_deref()
-                != Some(self.host.as_str())
-            {
-                continue;
-            }
-            spec.fields.extend(
-                selected
-                    .iter()
-                    .filter(|(_, subscription)| subscription.observer == observer.subject)
-                    .flat_map(|(_, subscription)| subscription.fields.iter().cloned()),
-            );
-            spec.fields.sort();
-            spec.fields.dedup();
-            let Some(revision) = self.store.selected_desired_revision(&observer.subject)? else {
-                continue;
-            };
-            let observer_actual = self.store.latest_actual_value(&observer.subject)?;
-            if observer_actual.as_ref().is_some_and(|actual| {
-                actual.get("state").and_then(Value::as_str) == Some("degraded")
-                    && actual.get("revision").and_then(Value::as_str) == Some(revision.as_str())
-                    && actual
-                        .get("error_code")
-                        .and_then(Value::as_str)
-                        .is_some_and(permanent_observation_error)
-            }) {
-                continue;
-            }
-            let refresh_attempt = self
-                .store
-                .pending_observer_refresh_attempt(&observer.subject)?;
-            let deadline_key = format!("{}:{revision}", observer.subject);
-            let next_check = refresh_attempt
-                .as_ref()
-                .map(|_| now_ms())
-                .unwrap_or_else(|| {
-                    self.observer_deadlines
-                        .lock()
-                        .expect("observer deadline mutex poisoned")
-                        .get(&deadline_key)
-                        .copied()
-                        .or_else(|| {
-                            observer_actual
-                                .as_ref()
-                                .and_then(|actual| actual.get("next_check_unix_ms"))
-                                .and_then(Value::as_str)
-                                .and_then(|value| value.parse().ok())
-                        })
-                        .unwrap_or_else(now_ms)
-                });
-            let operation = format!(
-                "{}:{revision}:{}",
-                observer.subject,
-                refresh_attempt.as_deref().unwrap_or("scheduled")
-            );
-            if !self
-                .armed_observers
-                .lock()
-                .expect("observer mutex poisoned")
-                .insert(operation.clone())
-            {
-                continue;
-            }
-            let store = self.store.clone();
-            let provider = self.resource_provider.clone();
-            let notify = self.notify.clone();
-            let event_notify = self.event_notify.clone();
-            let armed = self.armed_observers.clone();
-            let deadlines = self.observer_deadlines.clone();
-            let cursors = self.observer_cursors.clone();
-            let observer_subject = observer.subject.clone();
-            let observer_owner_run = observer.owner_run.clone();
-            let previous_facts = self
-                .store
-                .latest_actual_value(&spec.resource)?
-                .and_then(|actual| actual.get("facts").cloned());
-            let cursor = self
-                .observer_cursors
-                .lock()
-                .expect("observer cursor mutex poisoned")
-                .get(&deadline_key)
-                .cloned()
-                .unwrap_or_else(|| {
-                    observer_actual
-                        .as_ref()
-                        .and_then(|actual| actual.get("cursor"))
+                .latest_actual_value(&observer.subject)?
+                .and_then(|actual| {
+                    actual
+                        .get("state")
                         .and_then(Value::as_str)
                         .map(str::to_owned)
-                });
-            if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                handle.spawn(async move {
-                    let delay = next_check.saturating_sub(now_ms()).min(u64::MAX as u128) as u64;
-                    tokio::time::sleep(Duration::from_millis(delay)).await;
-                    if store
-                        .selected_desired_revision(&observer_subject)
-                        .ok()
-                        .flatten()
-                        .as_deref()
-                        != Some(revision.as_str())
-                    {
-                        armed
-                            .lock()
-                            .expect("observer mutex poisoned")
-                            .remove(&operation);
-                        signal_changed(&notify, &event_notify);
-                        return;
-                    }
-                    let request = ObservationRequest {
-                        provider: spec.provider.clone(),
-                        locator: spec.locator.clone(),
-                        fields: spec.fields.iter().cloned().collect(),
-                        cursor,
-                        previous_facts,
-                    };
-                    match provider.observe(request).await {
-                        Ok(observation) => {
-                            match store.record_resource_observation(
-                                &observer_subject,
-                                &revision,
-                                refresh_attempt.as_deref(),
-                                &spec.resource,
-                                observation.cursor.as_deref(),
-                                &observation.facts,
-                                observation.next_check_unix_ms,
-                                &selected,
-                            ) {
-                                Ok(_) => {
-                                    deadlines
-                                        .lock()
-                                        .expect("observer deadline mutex poisoned")
-                                        .insert(
-                                            deadline_key.clone(),
-                                            observation.next_check_unix_ms,
-                                        );
-                                    cursors
-                                        .lock()
-                                        .expect("observer cursor mutex poisoned")
-                                        .insert(deadline_key.clone(), observation.cursor);
-                                }
-                                Err(error) => {
-                                    let retry_at = now_ms().saturating_add(60_000);
-                                    deadlines
-                                        .lock()
-                                        .expect("observer deadline mutex poisoned")
-                                        .insert(deadline_key.clone(), retry_at);
-                                    let reason = error.to_string();
-                                    let failure_hash = hex::encode(sha2::Sha256::digest(
-                                        format!("{revision}:{}:{reason}", error.code).as_bytes(),
-                                    ));
-                                    let mut fields = BTreeMap::from([
-                                        ("state".into(), Value::String("degraded".into())),
-                                        ("reason".into(), Value::String(reason)),
-                                        ("error_code".into(), Value::String(error.code.into())),
-                                        ("revision".into(), Value::String(revision.clone())),
-                                    ]);
-                                    if let Some(attempt) = &refresh_attempt {
-                                        fields.insert(
-                                            "attempt".into(),
-                                            Value::String(attempt.clone()),
-                                        );
-                                    }
-                                    let _ = store.append_claim(&ClaimInput {
-                                        subject: observer_subject.clone(),
-                                        kind: "observer.state".into(),
-                                        actor: None,
-                                        fields,
-                                        evidence: Vec::new(),
-                                        expected_subject: None,
-                                        idempotency_key: Some(format!(
-                                            "observer-rejected:{}",
-                                            &failure_hash[..20]
-                                        )),
-                                    });
-                                }
-                            }
-                        }
-                        Err(error) => {
-                            let rate_limit = error.downcast_ref::<ProviderRateLimit>();
-                            let retry_at = rate_limit.map_or_else(
-                                || now_ms().saturating_add(60_000),
-                                |limit| limit.retry_at_unix_ms.max(now_ms().saturating_add(1_000)),
-                            );
-                            let reason = error.to_string();
-                            deadlines
-                                .lock()
-                                .expect("observer deadline mutex poisoned")
-                                .insert(deadline_key.clone(), retry_at);
-                            if rate_limit.is_some_and(|limit| limit.unauthenticated)
-                                || error.downcast_ref::<ProviderUnauthenticated>().is_some()
-                                || observer_unreachable_since(&store, &observer_subject)
-                                    .ok()
-                                    .flatten()
-                                    .is_some_and(|since| {
-                                        now_ms().saturating_sub(since) >= 3_600_000
-                                    })
-                            {
-                                let _ = request_observer_attention(
-                                    &store,
-                                    &observer_subject,
-                                    observer_owner_run.as_deref(),
-                                    &revision,
-                                    &reason,
-                                );
-                            }
-                            let unchanged_failure = store
-                                .latest_actual_value(&observer_subject)
-                                .ok()
-                                .flatten()
-                                .is_some_and(|actual| {
-                                    actual.get("state").and_then(Value::as_str)
-                                        == Some("unreachable")
-                                        && actual.get("reason").and_then(Value::as_str)
-                                            == Some(reason.as_str())
-                                });
-                            if unchanged_failure && refresh_attempt.is_none() {
-                                armed
-                                    .lock()
-                                    .expect("observer mutex poisoned")
-                                    .remove(&operation);
-                                signal_changed(&notify, &event_notify);
-                                return;
-                            }
-                            let failure_hash = hex::encode(sha2::Sha256::digest(
-                                format!("{operation}:{reason}").as_bytes(),
-                            ));
-                            let mut fields = BTreeMap::from([
-                                ("state".into(), Value::String("unreachable".into())),
-                                ("reason".into(), Value::String(reason)),
-                                ("revision".into(), Value::String(revision.clone())),
-                                (
-                                    "next_check_unix_ms".into(),
-                                    Value::String(retry_at.to_string()),
-                                ),
-                            ]);
-                            if let Some(attempt) = &refresh_attempt {
-                                fields.insert("attempt".into(), Value::String(attempt.clone()));
-                            }
-                            let _ = store.append_claim(&ClaimInput {
-                                subject: observer_subject.clone(),
-                                kind: "observer.state".into(),
-                                actor: None,
-                                fields,
-                                evidence: Vec::new(),
-                                expected_subject: None,
-                                idempotency_key: Some(format!(
-                                    "observer-failure:{}",
-                                    &failure_hash[..20]
-                                )),
-                            });
-                        }
-                    }
+                })
+                .as_deref()
+                == Some("stopped");
+            if !is_stopped {
+                self.store.append_claim(&ClaimInput {
+                    subject: observer.subject.clone(),
+                    kind: "observer.state".into(),
+                    actor: None,
+                    fields: BTreeMap::from([("state".into(), Value::String("stopped".into()))]),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: None,
+                })?;
+            }
+            return Ok(());
+        }
+        if self
+            .store
+            .selected_desired_origin(&observer.subject)?
+            .as_deref()
+            != Some(self.host.as_str())
+        {
+            return Ok(());
+        }
+        spec.fields.extend(
+            selected
+                .iter()
+                .filter(|(_, subscription)| subscription.observer == observer.subject)
+                .flat_map(|(_, subscription)| subscription.fields.iter().cloned()),
+        );
+        spec.fields.sort();
+        spec.fields.dedup();
+        let Some(revision) = self.store.selected_desired_revision(&observer.subject)? else {
+            return Ok(());
+        };
+        let observer_actual = self.store.latest_actual_value(&observer.subject)?;
+        if observer_actual.as_ref().is_some_and(|actual| {
+            actual.get("state").and_then(Value::as_str) == Some("degraded")
+                && actual.get("revision").and_then(Value::as_str) == Some(revision.as_str())
+                && actual
+                    .get("error_code")
+                    .and_then(Value::as_str)
+                    .is_some_and(permanent_observation_error)
+        }) {
+            return Ok(());
+        }
+        let refresh_attempt = self
+            .store
+            .pending_observer_refresh_attempt(&observer.subject)?;
+        let deadline_key = format!("{}:{revision}", observer.subject);
+        let next_check = refresh_attempt
+            .as_ref()
+            .map(|_| now_ms())
+            .unwrap_or_else(|| {
+                self.observer_deadlines
+                    .lock()
+                    .expect("observer deadline mutex poisoned")
+                    .get(&deadline_key)
+                    .copied()
+                    .or_else(|| {
+                        observer_actual
+                            .as_ref()
+                            .and_then(|actual| actual.get("next_check_unix_ms"))
+                            .and_then(Value::as_str)
+                            .and_then(|value| value.parse().ok())
+                    })
+                    .unwrap_or_else(now_ms)
+            });
+        let operation = format!(
+            "{}:{revision}:{}",
+            observer.subject,
+            refresh_attempt.as_deref().unwrap_or("scheduled")
+        );
+        if !self
+            .armed_observers
+            .lock()
+            .expect("observer mutex poisoned")
+            .insert(operation.clone())
+        {
+            return Ok(());
+        }
+        let store = self.store.clone();
+        let provider = self.resource_provider.clone();
+        let notify = self.notify.clone();
+        let event_notify = self.event_notify.clone();
+        let armed = self.armed_observers.clone();
+        let deadlines = self.observer_deadlines.clone();
+        let cursors = self.observer_cursors.clone();
+        let observer_subject = observer.subject.clone();
+        let observer_owner_run = observer.owner_run.clone();
+        let previous_facts = self
+            .store
+            .latest_actual_value(&spec.resource)?
+            .and_then(|actual| actual.get("facts").cloned());
+        let cursor = self
+            .observer_cursors
+            .lock()
+            .expect("observer cursor mutex poisoned")
+            .get(&deadline_key)
+            .cloned()
+            .unwrap_or_else(|| {
+                observer_actual
+                    .as_ref()
+                    .and_then(|actual| actual.get("cursor"))
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            });
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                let delay = next_check.saturating_sub(now_ms()).min(u64::MAX as u128) as u64;
+                tokio::time::sleep(Duration::from_millis(delay)).await;
+                if store
+                    .selected_desired_revision(&observer_subject)
+                    .ok()
+                    .flatten()
+                    .as_deref()
+                    != Some(revision.as_str())
+                {
                     armed
                         .lock()
                         .expect("observer mutex poisoned")
                         .remove(&operation);
                     signal_changed(&notify, &event_notify);
-                });
-            } else {
-                self.armed_observers
+                    return;
+                }
+                let request = ObservationRequest {
+                    provider: spec.provider.clone(),
+                    locator: spec.locator.clone(),
+                    fields: spec.fields.iter().cloned().collect(),
+                    cursor,
+                    previous_facts,
+                };
+                match provider.observe(request).await {
+                    Ok(observation) => {
+                        match store.record_resource_observation(
+                            &observer_subject,
+                            &revision,
+                            refresh_attempt.as_deref(),
+                            &spec.resource,
+                            observation.cursor.as_deref(),
+                            &observation.facts,
+                            observation.next_check_unix_ms,
+                            &selected,
+                        ) {
+                            Ok(_) => {
+                                deadlines
+                                    .lock()
+                                    .expect("observer deadline mutex poisoned")
+                                    .insert(deadline_key.clone(), observation.next_check_unix_ms);
+                                cursors
+                                    .lock()
+                                    .expect("observer cursor mutex poisoned")
+                                    .insert(deadline_key.clone(), observation.cursor);
+                            }
+                            Err(error) => {
+                                let retry_at = now_ms().saturating_add(60_000);
+                                deadlines
+                                    .lock()
+                                    .expect("observer deadline mutex poisoned")
+                                    .insert(deadline_key.clone(), retry_at);
+                                let reason = error.to_string();
+                                let failure_hash = hex::encode(sha2::Sha256::digest(
+                                    format!("{revision}:{}:{reason}", error.code).as_bytes(),
+                                ));
+                                let mut fields = BTreeMap::from([
+                                    ("state".into(), Value::String("degraded".into())),
+                                    ("reason".into(), Value::String(reason)),
+                                    ("error_code".into(), Value::String(error.code.into())),
+                                    ("revision".into(), Value::String(revision.clone())),
+                                ]);
+                                if let Some(attempt) = &refresh_attempt {
+                                    fields.insert("attempt".into(), Value::String(attempt.clone()));
+                                }
+                                let _ = store.append_claim(&ClaimInput {
+                                    subject: observer_subject.clone(),
+                                    kind: "observer.state".into(),
+                                    actor: None,
+                                    fields,
+                                    evidence: Vec::new(),
+                                    expected_subject: None,
+                                    idempotency_key: Some(format!(
+                                        "observer-rejected:{}",
+                                        &failure_hash[..20]
+                                    )),
+                                });
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        let rate_limit = error.downcast_ref::<ProviderRateLimit>();
+                        let retry_at = rate_limit.map_or_else(
+                            || now_ms().saturating_add(60_000),
+                            |limit| limit.retry_at_unix_ms.max(now_ms().saturating_add(1_000)),
+                        );
+                        let reason = error.to_string();
+                        deadlines
+                            .lock()
+                            .expect("observer deadline mutex poisoned")
+                            .insert(deadline_key.clone(), retry_at);
+                        if rate_limit.is_some_and(|limit| limit.unauthenticated)
+                            || error.downcast_ref::<ProviderUnauthenticated>().is_some()
+                            || observer_unreachable_since(&store, &observer_subject)
+                                .ok()
+                                .flatten()
+                                .is_some_and(|since| now_ms().saturating_sub(since) >= 3_600_000)
+                        {
+                            let _ = request_observer_attention(
+                                &store,
+                                &observer_subject,
+                                observer_owner_run.as_deref(),
+                                &revision,
+                                &reason,
+                            );
+                        }
+                        let unchanged_failure = store
+                            .latest_actual_value(&observer_subject)
+                            .ok()
+                            .flatten()
+                            .is_some_and(|actual| {
+                                actual.get("state").and_then(Value::as_str) == Some("unreachable")
+                                    && actual.get("reason").and_then(Value::as_str)
+                                        == Some(reason.as_str())
+                            });
+                        if unchanged_failure && refresh_attempt.is_none() {
+                            armed
+                                .lock()
+                                .expect("observer mutex poisoned")
+                                .remove(&operation);
+                            signal_changed(&notify, &event_notify);
+                            return;
+                        }
+                        let failure_hash = hex::encode(sha2::Sha256::digest(
+                            format!("{operation}:{reason}").as_bytes(),
+                        ));
+                        let mut fields = BTreeMap::from([
+                            ("state".into(), Value::String("unreachable".into())),
+                            ("reason".into(), Value::String(reason)),
+                            ("revision".into(), Value::String(revision.clone())),
+                            (
+                                "next_check_unix_ms".into(),
+                                Value::String(retry_at.to_string()),
+                            ),
+                        ]);
+                        if let Some(attempt) = &refresh_attempt {
+                            fields.insert("attempt".into(), Value::String(attempt.clone()));
+                        }
+                        let _ = store.append_claim(&ClaimInput {
+                            subject: observer_subject.clone(),
+                            kind: "observer.state".into(),
+                            actor: None,
+                            fields,
+                            evidence: Vec::new(),
+                            expected_subject: None,
+                            idempotency_key: Some(format!(
+                                "observer-failure:{}",
+                                &failure_hash[..20]
+                            )),
+                        });
+                    }
+                }
+                armed
                     .lock()
                     .expect("observer mutex poisoned")
                     .remove(&operation);
-            }
+                signal_changed(&notify, &event_notify);
+            });
+        } else {
+            self.armed_observers
+                .lock()
+                .expect("observer mutex poisoned")
+                .remove(&operation);
         }
         Ok(())
     }
@@ -9216,6 +9280,16 @@ fn step_path_of_subject(subject: &str) -> Option<&str> {
         .map(|(_, path)| path)
 }
 
+/// Whether a mission run could not start only because this host lacks a claim that replication
+/// can still deliver, such as a mission revision, an owner run, or an input's claim published on
+/// another host.
+fn start_waits_for_replication(error: &crate::model::St3Error) -> bool {
+    matches!(
+        error.code,
+        "missing-mission" | "missing-mission-run" | "missing-resource-input-version" | "internal"
+    )
+}
+
 /// Run `item`, turning a panic into an error so one item cannot end the reconciler task.
 fn caught<T>(item: impl FnOnce() -> Result<T>) -> Result<T> {
     std::panic::catch_unwind(AssertUnwindSafe(item)).unwrap_or_else(|panic| {
@@ -9470,8 +9544,12 @@ fn work_wake_deadline(
         .min()
 }
 
-fn deadline_sleep_ms(deadline: u128, now: u128, unchanged: bool) -> u64 {
-    if unchanged && deadline <= now {
+/// How long to sleep before the next pass. A deadline that was already due when the last pass
+/// began, and that pass changed nothing, cannot be acted on yet, so the loop backs off instead of
+/// spinning. A deadline that fell due during or after that pass has not been evaluated, so it
+/// runs at once: a mission timeout must not wait out the back-off.
+fn deadline_sleep_ms(deadline: u128, now: u128, quiet_pass_started: Option<u128>) -> u64 {
+    if quiet_pass_started.is_some_and(|started| deadline <= started) {
         WORK_WAKE_RETRY_MS as u64
     } else {
         deadline.saturating_sub(now).min(u128::from(u64::MAX)) as u64
@@ -14919,7 +14997,7 @@ mission "absent-stop" state="ready" {
         ));
         let task = tokio::spawn(reconciler.run());
 
-        tokio::time::timeout(Duration::from_secs(1), async {
+        tokio::time::timeout(Duration::from_secs(10), async {
             loop {
                 let current = store.mission_run(&run.id).unwrap().unwrap();
                 if current.status == "failed" && current.phase == "terminal" {
@@ -20379,10 +20457,18 @@ mission "ios-proof-blocked" state="ready" {
     #[test]
     fn an_unchanged_pass_floors_a_past_wake_deadline() {
         assert_eq!(
-            deadline_sleep_ms(1_000, 2_000, true),
+            deadline_sleep_ms(1_000, 2_000, Some(1_500)),
             WORK_WAKE_RETRY_MS as u64
         );
-        assert_eq!(deadline_sleep_ms(3_000, 2_000, true), 1_000);
+        assert_eq!(deadline_sleep_ms(3_000, 2_000, Some(1_500)), 1_000);
+    }
+
+    /// A mission deadline that falls due while a quiet pass runs has not been evaluated, so the
+    /// next pass runs at once rather than after the back-off.
+    #[test]
+    fn a_deadline_that_falls_due_during_a_quiet_pass_runs_at_once() {
+        assert_eq!(deadline_sleep_ms(1_600, 2_000, Some(1_500)), 0);
+        assert_eq!(deadline_sleep_ms(1_600, 2_000, None), 0);
     }
 
     #[test]

@@ -178,6 +178,8 @@ pub struct JoinOptions {
     pub settings: MemberSettings,
     /// A migration keeps the node's config-peer secret file.
     pub legacy_secret_file: Option<PathBuf>,
+    /// A migration can keep the Fabric exposure name the node already uses.
+    pub fabric_protocol: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -373,7 +375,10 @@ pub async fn join(options: &JoinOptions) -> Result<Joined> {
         mode: options.settings.mode,
         port: options.settings.port()?,
         transports: options.settings.transports(),
-        fabric_protocol: sealed.fabric_protocol.clone(),
+        fabric_protocol: options
+            .fabric_protocol
+            .clone()
+            .or_else(|| sealed.fabric_protocol.clone()),
         legacy_peers: code.migrate,
         advertise_loopback: options.settings.advertise_loopback,
         writer_floor: sealed.writer_floor,
@@ -398,5 +403,63 @@ pub async fn join(options: &JoinOptions) -> Result<Joined> {
         writer_floor: sealed.writer_floor,
         migrate: code.migrate,
         resumed: false,
+    })
+}
+
+/// Make this config-peer node the anchor of its existing fleet: it keeps its fleet ID, secret,
+/// store, and history, gets a member key, and admits itself when the daemon next starts.
+/// Legacy exchanges stay accepted until `st fleet migrate --finish`.
+pub fn migrate_anchor(
+    state_dir: &Path,
+    node: &str,
+    fleet_id: &str,
+    secret_file: &Path,
+    settings: &MemberSettings,
+    fabric_protocol: Option<String>,
+) -> Result<Founded> {
+    anyhow::ensure!(
+        FleetFile::load(state_dir)?.is_none(),
+        "this machine already has fleet membership settings"
+    );
+    anyhow::ensure!(
+        valid_fleet_node_name(node),
+        "`{node}` cannot name a fleet member"
+    );
+    {
+        let store = Store::open(&state_dir.join("claims.sqlite3"), node)?;
+        match store.bound_fleet()? {
+            Some(bound) => anyhow::ensure!(
+                bound == fleet_id,
+                "this store belongs to fleet {bound}, not the configured {fleet_id}"
+            ),
+            None => anyhow::bail!("this store is not bound to a fleet yet; start st3 once first"),
+        }
+    }
+    let key = MemberKey::load_or_create(&fleet_dir(state_dir).join("node.key"))?;
+    let port = settings.port()?;
+    let transports = settings.transports();
+    FleetFile {
+        fleet_id: fleet_id.into(),
+        secret_file: secret_file.to_path_buf(),
+        node_key_file: "node.key".into(),
+        anchor_key: Some(key.public().into()),
+        node: Some(node.into()),
+        mode: settings.mode,
+        port,
+        transports: transports.clone(),
+        fabric_protocol,
+        legacy_peers: true,
+        advertise_loopback: settings.advertise_loopback,
+        fabric: settings.fabric.clone(),
+        tailscale: settings.tailscale.clone(),
+        ..FleetFile::default()
+    }
+    .save(state_dir)?;
+    Ok(Founded {
+        fleet_id: fleet_id.into(),
+        node: node.into(),
+        anchor_key: key.public().into(),
+        port,
+        transports,
     })
 }

@@ -191,7 +191,8 @@ impl ApiError {
             | "missing-subject-token"
             | "stale-document-token"
             | "stale-incarnation"
-            | "stale-launch-preview" => StatusCode::CONFLICT,
+            | "stale-launch-preview"
+            | "fleet-leaving" => StatusCode::CONFLICT,
             "launch-review-not-authorized" | "wrong-message-recipient" => StatusCode::FORBIDDEN,
             "internal" => StatusCode::INTERNAL_SERVER_ERROR,
             _ => StatusCode::UNPROCESSABLE_ENTITY,
@@ -408,6 +409,10 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
             post(fleet_invite_revoke),
         )
         .route("/v1/internal/fleet/redeem", post(fleet_redeem))
+        .route("/v1/internal/fleet/remove", post(fleet_remove))
+        .route("/v1/internal/fleet/leave/begin", post(fleet_leave_begin))
+        .route("/v1/internal/fleet/leave/cancel", post(fleet_leave_cancel))
+        .route("/v1/internal/fleet/leave/claim", post(fleet_leave_claim))
         .route(
             "/v1/internal/fleet/endpoints",
             post(fleet_publish_endpoints),
@@ -456,11 +461,12 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
         .route("/v1/sessions/attach/{*subject}", post(attach_session))
         .route("/v1/sessions/{subject}/attach", post(attach_session))
         .route("/v1/sessions/terminal/{*subject}", get(terminal_session));
-    app.layer(from_fn_with_state(
-        (state.clone(), transport),
-        response_envelope,
-    ))
-    .with_state(state)
+    app.layer(from_fn_with_state(state.clone(), refuse_while_leaving))
+        .layer(from_fn_with_state(
+            (state.clone(), transport),
+            response_envelope,
+        ))
+        .with_state(state)
 }
 
 async fn schema() -> Json<Value> {
@@ -3945,6 +3951,99 @@ async fn fleet_redeem(
         signal_changed(&state);
     }
     Ok(Json(answer))
+}
+
+#[derive(Deserialize, Serialize)]
+pub struct FleetRemoveRequest {
+    pub name: String,
+    pub reason: String,
+    pub person: String,
+}
+
+#[derive(Deserialize, Serialize)]
+pub struct FleetPersonRequest {
+    pub person: String,
+}
+
+async fn fleet_remove(
+    State(state): State<AppState>,
+    Json(request): Json<FleetRemoveRequest>,
+) -> Result<Json<crate::store::FleetRemoval>, ApiError> {
+    concrete_person(&request.person)?;
+    let store = state.store.clone();
+    let removal = blocking_action(move || {
+        store.remove_fleet_member(&request.name, &request.reason, &request.person)
+    })
+    .await?;
+    signal_changed(&state);
+    Ok(Json(removal))
+}
+
+async fn fleet_leave_begin(
+    State(state): State<AppState>,
+    Json(request): Json<FleetPersonRequest>,
+) -> Result<Json<Value>, ApiError> {
+    concrete_person(&request.person)?;
+    let store = state.store.clone();
+    blocking_store(move || store.set_fleet_leaving(true)).await?;
+    Ok(Json(json!({ "leaving": true })))
+}
+
+/// The body is read and ignored, so the answer never races a client still sending it.
+async fn fleet_leave_cancel(
+    State(state): State<AppState>,
+    _body: axum::body::Bytes,
+) -> Result<Json<Value>, ApiError> {
+    let store = state.store.clone();
+    blocking_store(move || store.set_fleet_leaving(false)).await?;
+    Ok(Json(json!({ "leaving": false })))
+}
+
+async fn fleet_leave_claim(
+    State(state): State<AppState>,
+    Json(request): Json<FleetPersonRequest>,
+) -> Result<Json<ClaimRecord>, ApiError> {
+    concrete_person(&request.person)?;
+    let store = state.store.clone();
+    let claim = blocking_action(move || store.leave_fleet(&request.person)).await?;
+    signal_changed(&state);
+    Ok(Json(claim))
+}
+
+/// While this node leaves its fleet, it refuses every new write except the leave itself and
+/// replication traffic, so the leave stays its writer's last batch.
+async fn refuse_while_leaving(
+    State(state): State<AppState>,
+    request: Request<Body>,
+    next: Next,
+) -> Response {
+    let path = request.uri().path();
+    let mutating =
+        request.method() != axum::http::Method::GET && request.method() != axum::http::Method::HEAD;
+    // Replication keeps running so the drain can finish; it writes no local claims while
+    // leaving, because transport observations stop. Everything else that writes waits,
+    // including invite redemption and endpoint announcements.
+    let allowed = path.starts_with("/v1/internal/fleet/leave/")
+        || matches!(
+            path,
+            "/v1/health"
+                | "/v1/internal/replication/export"
+                | "/v1/internal/replication/receive"
+                | "/v1/internal/replication/peer-failure"
+                | "/v1/internal/replication-wake"
+        );
+    if mutating && !allowed && state.store.fleet_leaving().unwrap_or(false) {
+        // Read the body before refusing: an answer sent while the client is still writing
+        // closes the connection under it, and the client then reports a broken pipe instead
+        // of this refusal.
+        let _ = axum::body::to_bytes(request.into_body(), 1 << 20).await;
+        return ApiError::bad(St3Error::new(
+            "fleet-leaving",
+            "this node is leaving its fleet and accepts no new writes; `st fleet leave --cancel` stops the leave",
+        ))
+        .into_response();
+    }
+    next.run(request).await
 }
 
 async fn fleet_membership_view(
