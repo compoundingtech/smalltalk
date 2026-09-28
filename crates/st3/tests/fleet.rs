@@ -1109,7 +1109,8 @@ async fn a_leaving_member_writes_nothing_after_it_begins_to_leave() {
             &json!({"mode": "listening", "endpoints": []}),
         )
         .await;
-    assert!(announced.is_err());
+    let refusal = announced.unwrap_err().to_string();
+    assert!(refusal.contains("leaving its fleet"), "{refusal}");
     let claim: Result<Value, _> = b
         .client()
         .post(
@@ -1125,7 +1126,8 @@ async fn a_leaving_member_writes_nothing_after_it_begins_to_leave() {
             },
         )
         .await;
-    assert!(claim.is_err());
+    let refusal = claim.unwrap_err().to_string();
+    assert!(refusal.contains("leaving its fleet"), "{refusal}");
     tokio::time::sleep(Duration::from_secs(1)).await;
     let local_writes = b
         .claims()

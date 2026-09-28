@@ -3978,7 +3978,11 @@ async fn fleet_leave_begin(
     Ok(Json(json!({ "leaving": true })))
 }
 
-async fn fleet_leave_cancel(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
+/// The body is read and ignored, so the answer never races a client still sending it.
+async fn fleet_leave_cancel(
+    State(state): State<AppState>,
+    _body: axum::body::Bytes,
+) -> Result<Json<Value>, ApiError> {
     let store = state.store.clone();
     blocking_store(move || store.set_fleet_leaving(false)).await?;
     Ok(Json(json!({ "leaving": false })))
@@ -4018,6 +4022,10 @@ async fn refuse_while_leaving(
                 | "/v1/internal/replication-wake"
         );
     if mutating && !allowed && state.store.fleet_leaving().unwrap_or(false) {
+        // Read the body before refusing: an answer sent while the client is still writing
+        // closes the connection under it, and the client then reports a broken pipe instead
+        // of this refusal.
+        let _ = axum::body::to_bytes(request.into_body(), 1 << 20).await;
         return ApiError::bad(St3Error::new(
             "fleet-leaving",
             "this node is leaving its fleet and accepts no new writes; `st fleet leave --cancel` stops the leave",
