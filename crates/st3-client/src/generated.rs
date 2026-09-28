@@ -1888,56 +1888,82 @@ pub struct PairedSession {
 pub struct TerminalLine {
     pub row: usize,
     pub text: String,
+    /// Styled runs from column zero. Their text, without trailing spaces, is `text`.
+    #[serde(default)]
+    pub runs: Vec<TerminalRun>,
     pub redacted: bool,
     pub truncated: bool,
+}
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+pub struct TerminalRun {
+    pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fg: Option<TerminalColor>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bg: Option<TerminalColor>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub bold: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub dim: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub italic: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub underline: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub inverse: bool,
+}
+/// A palette index (0-255) or a `#rrggbb` color. An absent color is the terminal default.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum TerminalColor {
+    Palette(u8),
+    Rgb(String),
 }
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct TerminalCursor {
     pub row: usize,
     pub column: usize,
     pub visible: bool,
+    #[serde(default)]
+    pub style: TerminalCursorStyle,
+    #[serde(default)]
+    pub blinking: bool,
+}
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum TerminalCursorStyle {
+    #[default]
+    Block,
+    Underline,
+    Bar,
+    #[serde(other)]
+    Unknown,
+}
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+pub struct TerminalModes {
+    pub alternate_screen: bool,
+    pub application_cursor: bool,
+    pub application_keypad: bool,
+    pub bracketed_paste: bool,
+    pub focus_events: bool,
+    pub mouse_tracking: String,
+    pub mouse_encoding: String,
 }
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct TerminalScreen {
     pub kind: String,
     pub terminal_id: String,
     pub runtime_incarnation: String,
+    /// Equal revisions mean equal screens; a stream never sends the same revision twice.
+    #[serde(default)]
+    pub revision: String,
     pub rows: usize,
     pub columns: usize,
     pub cursor: TerminalCursor,
     pub title: String,
+    #[serde(default)]
+    pub modes: TerminalModes,
     pub lines: Vec<TerminalLine>,
     pub next_sequence: u64,
     pub truncated: bool,
-}
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
-pub struct TerminalFrame {
-    pub id: String,
-    pub terminal_id: String,
-    pub runtime_incarnation: String,
-    pub sequence: u64,
-    #[serde(rename = "type")]
-    pub frame_type: TerminalFrameType,
-    pub timestamp: String,
-    pub body: Value,
-}
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-pub enum TerminalFrameType {
-    Output,
-    Resize,
-    Title,
-    Bell,
-    Exit,
-    Resync,
-    #[serde(other)]
-    Unknown,
-}
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
-pub struct TerminalFramePage {
-    pub kind: String,
-    pub terminal_id: String,
-    pub runtime_incarnation: String,
-    pub frames: Vec<TerminalFrame>,
-    pub resume_sequence: u64,
 }

@@ -35,6 +35,8 @@ const REPLICATION_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(20);
 const REPLICATION_WAKE_COALESCE: Duration = Duration::from_secs(1);
 const CLIENT_READ_PATH: &str = "/v1/peer/client-read";
 const MAX_CLIENT_READ_BYTES: usize = 1_048_576;
+/// A relayed long poll must answer well inside the relay's 15-second request timeout.
+const CLIENT_READ_MAX_WAIT_MS: u64 = 10_000;
 const HEADER_FLEET: &str = "x-st3-fleet";
 const HEADER_NODE: &str = "x-st3-node";
 const HEADER_BODY: &str = "x-st3-body-sha256";
@@ -203,6 +205,12 @@ pub enum ClientReadOperation {
     },
     TerminalScreen {
         terminal_id: String,
+    },
+    /// Wait on the owner until the screen's revision differs from `after_revision`.
+    TerminalScreenChange {
+        terminal_id: String,
+        after_revision: String,
+        wait_ms: u64,
     },
     TerminalControl {
         action_id: String,
@@ -597,6 +605,21 @@ async fn receive_client_read(
             }
             ClientReadOperation::TerminalScreen { terminal_id } => {
                 let value = client.terminal_screen(&terminal_id).await?.value;
+                Ok(serde_json::to_value(value)?)
+            }
+            ClientReadOperation::TerminalScreenChange {
+                terminal_id,
+                after_revision,
+                wait_ms,
+            } => {
+                anyhow::ensure!(
+                    wait_ms <= CLIENT_READ_MAX_WAIT_MS,
+                    "the terminal screen wait exceeds its bound"
+                );
+                let value = client
+                    .terminal_screen_change(&terminal_id, &after_revision, wait_ms)
+                    .await?
+                    .value;
                 Ok(serde_json::to_value(value)?)
             }
             ClientReadOperation::TerminalControl {
@@ -1122,6 +1145,177 @@ mod tests {
         let result = tokio::time::timeout(Duration::from_secs(25), request).await;
         stalled.abort();
         assert!(matches!(result, Ok(Err(error)) if error.is_timeout()));
+    }
+
+    #[tokio::test]
+    async fn a_gateway_streams_a_remote_terminal_through_owner_long_polls() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let owner_root = tempfile::tempdir().unwrap();
+        let gateway_root = tempfile::tempdir().unwrap();
+        let app_state = |root: &Path, node: &str| crate::api::AppState {
+            store: Arc::new(Store::open(&root.join("graph.db"), node).unwrap()),
+            notify: Arc::new(tokio::sync::Notify::new()),
+            event_notify: watch::channel(0_u64).0,
+            node: node.into(),
+            state_dir: root.to_path_buf(),
+            pty_root: root.join("pty"),
+            pty_binary: root.join("unused-pty"),
+            fleet_id: None,
+            configured_peers: Vec::new(),
+            client_relay: None,
+            native_session_home: None,
+            planner_default: crate::model::PlannerSpec::default(),
+        };
+        let owner = app_state(owner_root.path(), "owner-node");
+        let mut gateway = app_state(gateway_root.path(), "gateway-node");
+        owner
+            .store
+            .append_claim(&ClaimInput {
+                subject: "agent/remote-shell".into(),
+                kind: "runtime.observed".into(),
+                actor: Some("agent/remote-shell".into()),
+                fields: BTreeMap::from([
+                    ("runtime_id".into(), Value::String("remote-runtime".into())),
+                    (
+                        "incarnation_id".into(),
+                        Value::String("remote-runtime:i1".into()),
+                    ),
+                    ("status".into(), Value::String("running".into())),
+                    ("terminal".into(), Value::Bool(true)),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some("remote-shell-running".into()),
+            })
+            .unwrap();
+        gateway
+            .store
+            .import_replication("owner-node", &owner.store.export_replication(0).unwrap())
+            .unwrap();
+
+        // The owner's PTY session: a replay on PEEK, then whatever output the test writes.
+        fs::create_dir_all(&owner.pty_root).unwrap();
+        let sessions = tokio::net::UnixListener::bind(owner.pty_root.join("remote-runtime.sock"))
+            .unwrap();
+        let (output, _) = tokio::sync::broadcast::channel::<Vec<u8>>(16);
+        let session_output = output.clone();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = sessions.accept().await {
+                let mut output = session_output.subscribe();
+                tokio::spawn(async move {
+                    let packet = |kind: u8, payload: &[u8]| {
+                        let mut packet = vec![kind];
+                        packet.extend((payload.len() as u32).to_be_bytes());
+                        packet.extend(payload);
+                        packet
+                    };
+                    let mut peek = [0_u8; 6];
+                    if stream.read_exact(&mut peek).await.is_err()
+                        || stream.write_all(&packet(10, &[0, 24, 0, 80])).await.is_err()
+                        || stream.write_all(&packet(5, b"owner shell\r\n$ ")).await.is_err()
+                    {
+                        return;
+                    }
+                    while let Ok(bytes) = output.recv().await {
+                        if stream.write_all(&packet(0, &bytes)).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+
+        let owner_socket = owner_root.path().join("st3.sock");
+        let main_socket = owner_socket.clone();
+        let owner_app = crate::api::router(owner.clone());
+        tokio::spawn(async move { crate::api::serve_unix(&main_socket, owner_app).await });
+        let peer = PeerState {
+            backend: PeerBackend::Main(Client::unix(&owner_socket)),
+            node: "owner-node".into(),
+            auth: FleetAuth::test("fleet-test", &[7; 32]),
+            peers: BTreeSet::from(["gateway-node".into()]),
+            main_socket: owner_socket.clone(),
+            outbound_notify: watch::channel(0_u64).0,
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, peer_router(peer)).await });
+
+        let secret = gateway_root.path().join("fleet-secret");
+        fs::write(&secret, [7_u8; 32]).unwrap();
+        fs::set_permissions(&secret, fs::Permissions::from_mode(0o600)).unwrap();
+        gateway.client_relay = ClientRelay::from_config(&Config {
+            node: "gateway-node".into(),
+            fleet_id: Some("fleet-test".into()),
+            shared_secret_file: Some(secret),
+            peers: vec![PeerConfig {
+                name: "owner-node".into(),
+                url: format!("http://{address}"),
+            }],
+            ..Default::default()
+        })
+        .unwrap();
+        let gateway_socket = gateway_root.path().join("st3.sock");
+        let served_socket = gateway_socket.clone();
+        let gateway_app = crate::api::router(gateway);
+        tokio::spawn(async move { crate::api::serve_unix(&served_socket, gateway_app).await });
+        for socket in [&owner_socket, &gateway_socket] {
+            for _ in 0..200 {
+                if tokio::net::UnixStream::connect(socket).await.is_ok() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+
+        let client = st3_client::Client::unix_as(&gateway_socket, "person/avery");
+        let capabilities = client.capabilities().await.unwrap();
+        let attachment = client
+            .terminal_attach(
+                "action/remote-terminal-attach",
+                "remote-terminal-attach-0000001",
+                st3_client::Fence {
+                    snapshot_id: capabilities.snapshot.id,
+                    runtime_incarnation: Some("remote-runtime:i1".into()),
+                    terminal_sequence: Some(capabilities.snapshot.store_index),
+                    ..st3_client::Fence::default()
+                },
+                st3_client::TargetParameters {
+                    target_id: "terminal/agent/remote-shell".into(),
+                    ..st3_client::TargetParameters::default()
+                },
+            )
+            .await
+            .unwrap()
+            .value
+            .terminal_attachment
+            .unwrap();
+        assert_eq!(attachment.owner_host_id, "host/owner-node");
+        let mut stream = client
+            .terminal_stream(
+                &attachment.terminal_id,
+                Some("remote-runtime:i1"),
+                attachment.stream_capability.as_deref().unwrap(),
+            )
+            .await
+            .unwrap();
+        let first = stream.next().await.unwrap().unwrap();
+        assert_eq!(first.value.lines[0].text, "owner shell");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(1_500), stream.next())
+                .await
+                .is_err(),
+            "an idle remote terminal must send nothing"
+        );
+        output.send(b"echo remote".to_vec()).unwrap();
+        let changed = tokio::time::timeout(Duration::from_secs(5), stream.next())
+            .await
+            .expect("the owner long poll must return the change promptly")
+            .unwrap()
+            .unwrap();
+        assert_eq!(changed.value.lines[1].text, "$ echo remote");
+        assert_eq!(changed.value.runtime_incarnation, "remote-runtime:i1");
+        assert_ne!(changed.value.revision, first.value.revision);
     }
 
     #[tokio::test]
