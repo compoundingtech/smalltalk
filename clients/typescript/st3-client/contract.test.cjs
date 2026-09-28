@@ -122,6 +122,23 @@ test('a normal close ends the terminal stream without an error', async () => {
     assert.deepEqual(ends, [undefined]);
 });
 
+test('conversation stream opens at a cursor and delivers bounded changes', async () => {
+    const socket = { onmessage: null, onclose: null, onerror: null, close() {} };
+    const opened = [];
+    const received = [];
+    const client = new St3Client({ baseUrl: 'https://example.test', credential: () => 'secret', fetchImpl: async () => { throw new Error('no HTTP'); } });
+    const stream = await client.conversationStream('session/example', {
+        after: 'conversation-cursor/owner/example/1.2.3',
+        onChange: change => received.push(change.value),
+        socket: (url, protocols, headers) => { opened.push({ url, protocols, headers }); return socket; },
+    });
+    assert.deepEqual(opened, [{ url: 'wss://example.test/v1/client/conversations/example/stream?after=conversation-cursor%2Fowner%2Fexample%2F1.2.3', protocols: ['st3.client.conversation.v0'], headers: { Authorization: 'Bearer secret' } }]);
+    const change = { kind: 'conversation-changes', session_id: 'session/example', items: [{ id: 'timeline-entry/example', sequence: 4, revision: 1, timestamp: snapshot.created_at, role: 'assistant', type: 'content', final: true, body: { media_type: 'text/plain', text: 'reply' } }], next_cursor: 'conversation-cursor/owner/example/1.3.3' };
+    socket.onmessage({ data: JSON.stringify(envelope(change)) });
+    assert.deepEqual(received, [change]);
+    stream.close();
+});
+
 test('generated hash uses normative schema and operations bytes', () => {
     const crypto = require('node:crypto');
     const root = path.join(__dirname, '../../..');
