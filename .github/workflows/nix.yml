@@ -30,8 +30,8 @@ jobs:
           cache-on-failure: true
       # The provider component integration tests require Wasm artifacts supplied
       # by the tag-only Nix check; its library tests still run here.
-      - run: nix develop --command cargo test --workspace --exclude st2-resource-providers --locked
-      - run: nix develop --command cargo test -p st2-resource-providers --lib --locked
+      - run: nix develop --command cargo nextest run --workspace --exclude st2-resource-providers --locked
+      - run: nix develop --command cargo nextest run -p st2-resource-providers --lib --locked
       - run: nix develop --command cargo clippy --workspace --all-targets --locked
 
   # The full Nix release/check graph is useful for tags, but compiling it on
