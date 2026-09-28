@@ -1,0 +1,91 @@
+#!/usr/bin/env bash
+# Build and verify a native Smalltalk archive. Never installs or restarts a service.
+# Usage: scripts/release-smalltalk TARGET OUTPUT_DIRECTORY
+set -Eeuo pipefail
+
+target=${1:?expected Rust target}
+out=${2:?expected output directory}
+case "$target:$(uname -sm)" in
+  x86_64-unknown-linux-gnu:Linux\ x86_64 | aarch64-apple-darwin:Darwin\ arm64) ;;
+  *) echo "release-smalltalk: target does not match this native host" >&2; exit 1 ;;
+esac
+repo=$(cd "$(dirname "$0")/.." && pwd)
+cd "$repo"
+test -z "$(git status --porcelain --untracked-files=no)"
+mkdir -p "$out"
+out=$(cd "$out" && pwd)
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
+package="smalltalk-$target"
+mkdir -p "$work/$package/bin"
+
+# The runtime pin is the Nix package's PTY input, not the distinct pty-core library pin.
+python3 - "$work/pin.json" <<'PY'
+import json, re, sys
+lock = json.load(open('flake.lock'))
+pin = lock['nodes'][lock['nodes']['root']['inputs']['pty']]['locked']
+assert pin['type'] == 'github' and re.fullmatch(r'[0-9a-f]{40}', pin['rev'])
+json.dump(pin, open(sys.argv[1], 'w'))
+PY
+pty_rev=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["rev"])' "$work/pin.json")
+pty_url=$(python3 -c 'import json,sys; p=json.load(open(sys.argv[1])); print("https://github.com/"+p["owner"]+"/"+p["repo"]+".git")' "$work/pin.json")
+cargo build --release --locked --target "$target" -p st3 -p st3-migrate -p stui
+build_dir=$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])')
+for binary in st3 st3-migrate stui; do
+  install -m 0755 "$build_dir/$target/release/$binary" "$work/$package/bin/$binary"
+done
+
+git init -q "$work/pty"
+git -C "$work/pty" remote add origin "$pty_url"
+git -C "$work/pty" fetch --depth 1 origin "$pty_rev"
+git -C "$work/pty" checkout -q --detach FETCH_HEAD
+test "$(git -C "$work/pty" rev-parse HEAD)" = "$pty_rev"
+cargo build --release --locked --manifest-path "$work/pty/Cargo.toml" \
+  --target-dir "$work/pty-target" --target "$target" -p pty --bin pty
+install -m 0755 "$work/pty-target/$target/release/pty" "$work/$package/bin/pty"
+ln -s st3 "$work/$package/bin/st"
+install -m 0755 scripts/install-release "$work/$package/install.sh"
+cp docs/st3/binary-releases.md "$work/$package/README.md"
+
+for binary in st3 stui st3-migrate pty; do
+  path="$work/$package/bin/$binary"
+  file "$path"
+  if [[ $target == *linux* ]]; then
+    readelf --program-headers "$path" > "$work/headers"
+    if grep -F '/nix/store/' "$work/headers"; then exit 1; fi
+    ldd "$path" > "$work/links"
+    if grep -E 'not found|/nix/store/' "$work/links"; then exit 1; fi
+  else
+    otool -L "$path" > "$work/links"
+    # Standalone archives may link only Apple's system libraries.
+    if tail -n +2 "$work/links" | grep -Ev '^[[:space:]]+(/usr/lib/|/System/Library/)'; then exit 1; fi
+    codesign --force --sign - "$path"
+    codesign --verify "$path"
+  fi
+done
+python3 - "$work/$package/BUILD.json" "$target" "$pty_rev" <<'PY'
+import json, os, subprocess, sys
+json.dump({'source': subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip(),
+           'target': sys.argv[2], 'pty_revision': sys.argv[3],
+           'tag': os.environ.get('RELEASE_TAG'),
+           'rustc': subprocess.check_output(['rustc', '--version'], text=True).strip()},
+          open(sys.argv[1], 'w'), indent=2)
+PY
+archive="$out/$package.tar.gz"
+tar -C "$work" -czf "$archive" "$package"
+# Verify the delivered bytes, not just the pre-archive staging directory.
+mkdir "$work/extracted"
+tar -C "$work/extracted" -xzf "$archive"
+"$work/extracted/$package/install.sh" --bin-dir "$work/installed"
+"$work/installed/st3" --help >/dev/null
+"$work/installed/st" --help >/dev/null
+"$work/installed/st3-migrate" --help >/dev/null
+"$work/installed/pty" --version
+ST3_PERSON=person/release-smoke ST3_ENDPOINT="$work/absent.sock" \
+  python3 crates/stui/tests/pty_smoke.py "$work/installed/stui" --no-panic
+python3 - "$archive" <<'PY'
+import hashlib, pathlib, sys
+p = pathlib.Path(sys.argv[1])
+p.with_name(p.name + '.sha256').write_text(hashlib.sha256(p.read_bytes()).hexdigest() + '  ' + p.name + '\n')
+PY
+printf 'verified %s\n' "$archive"

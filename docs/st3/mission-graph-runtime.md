@@ -900,7 +900,19 @@ For example, use `${ST_MISSION_RUN}` directly. Do not write a manual mapping suc
 
 The exact built-in names are reserved in authored `env` maps. st rejects an attempt to replace them. Other names, including other `ST_*` names, remain available to applications.
 
-`${PATH}` is also available for KDL interpolation. It uses the deterministic daemon service path.
+`${PATH}` is also available for KDL interpolation. Gates and exec steps use the account's
+interactive login-shell environment, just like agents. Programs resolve through that captured
+PATH, so tools installed by shell startup files do not need absolute executable paths.
+Declared environment values override the snapshot; `${PATH}` in an override expands against
+the captured shell PATH. The active st executable directory is prepended for launched work.
+
+The daemon captures this environment at startup and refreshes it on use every 60 seconds,
+including shell configuration and exported credential changes. `st doctor` reports its PATH
+and whether GitHub observers have a token, without displaying credential values. Observers
+check `GH_TOKEN`, `GITHUB_TOKEN`, then `gh auth token` on every poll. If none supplies a token,
+the observer records an explicit authentication failure and sends no anonymous request.
+Run `gh auth login` as the daemon account or export a token in its shell startup files;
+the next poll retries authentication.
 
 An agent receives its own subject in both `ST3_SUBJECT` and `ST_AGENT`. A nested task receives its task subject in `ST3_SUBJECT` and its parent agent in `ST_AGENT`.
 

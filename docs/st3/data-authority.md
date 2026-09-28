@@ -6,6 +6,36 @@ Schema version 13 upgrades schema versions 10, 11, and 12 in place.
 
 The claim log and immutable blobs are the durable graph authority.
 
+A claim kind of `local` retention (`st3 schema show KIND`) is an observation that only the node
+that made it reads. The daemon records it in `local_observations` instead of the claim log. It gets
+no batch, no envelope and no digest, so it never replicates and trimming it never changes what a
+peer holds. Every node computes the same graph from the same admitted claims. The daemon trims
+the table at startup and hourly: rows older than `[observations] retention` (default `7d`, at
+least `1h`) and rows beyond `max_per_subject_kind` (default 20,000) go. The newest row of each
+subject and kind stays. An older build that still writes such a kind as a claim replicates it as
+before, and readers merge those claims with the local rows.
+
+A node can also send every local observation to an OpenTelemetry collector. The exporter is off
+unless the config names a collector:
+
+```toml
+[observations.otlp]
+endpoint = "http://127.0.0.1:4318"             # OTLP/HTTP; logs go to /v1/logs
+headers_file = "/absolute/path/otlp-headers.toml" # optional, for example x-api-key = "..."
+```
+
+Each local observation becomes one OTLP log record in OTLP/HTTP JSON:
+
+- the record's timestamp is the observation time, and its body holds the fields;
+- its attributes are `st3.subject`, `st3.kind`, `st3.actor`, `st3.incarnation_id` and
+  `st3.local_id`;
+- the resource names `service.name = st3` and `st3.node`.
+
+The exporter keeps its cursor in `meta` and moves it only after the collector accepts a batch of
+at most 512 observations, so delivery is at least once. A collector that is down delays export
+with backoff up to five minutes and never blocks a write. Observations trimmed before export are
+counted in the daemon log.
+
 Runtime observations and harness observations remain separate claims. The status projection puts
 runtime fields in `actual` and the current incarnation's harness fields in `harness`.
 
@@ -31,6 +61,7 @@ order from the same admitted claims.
 | `run_generations` | Projection | `run-generation.*` claims |
 | `step_runs` | Projection | `step-run.*` and `work.*` claims |
 | `local_work_lease_renewals` | Local operational fact | Recent quiet lease renewals; replayed over replicated claim projections and bounded by periodic `work.renewed` anchors |
+| `local_observations` | Local observation log | Observations of `local` retention made on this node; never replicated, trimmed after `[observations] retention` |
 | `revision_proposals` | Projection | `revision-proposal.*` claims |
 | `planning_sessions` | Projection | `planning-session.*` claims |
 | `planning_candidates` | Projection | `planning-session.candidate-submitted` claims |
