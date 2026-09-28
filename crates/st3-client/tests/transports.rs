@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 use bytes::Bytes;
 use http_body_util::Empty;
@@ -15,8 +16,9 @@ use st3::store::Store;
 use st3_client::{
     AttentionResolveParameters, Capabilities, Client, ClientError, Envelope, ErrorCode, Fence,
     LaunchVariantParameters, PairingBegin, PairingComplete, Resource, TargetParameters,
-    TerminalAttachment, TerminalInputMode, TerminalInputParameters, TerminalResizeParameters,
-    TimelineBody, TimelineUsageSemantics,
+    TerminalAttachment, TerminalColor, TerminalInputMode, TerminalInputParameters,
+    TerminalResizeParameters, TerminalRun, TerminalScreen, TerminalStream, TimelineBody,
+    TimelineUsageSemantics,
 };
 use tokio::sync::{Notify, watch};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
@@ -93,6 +95,248 @@ fn publish_terminal(state: &AppState, incarnation: &str) {
             idempotency_key: Some(format!("timeline-usage-{incarnation}")),
         })
         .unwrap();
+    // The reconciler announces every observation it records; so does this stand-in.
+    state
+        .event_notify
+        .send_modify(|generation| *generation = generation.saturating_add(1));
+}
+
+/// A PTY session socket that answers a read-only PEEK the way `pty` does: the geometry, the
+/// replayed screen, then live output until the process exits.
+#[derive(Clone)]
+struct FakePty {
+    replay: Arc<std::sync::Mutex<Vec<u8>>>,
+    output: tokio::sync::broadcast::Sender<Option<Vec<u8>>>,
+}
+
+fn pty_packet(kind: u8, payload: &[u8]) -> Vec<u8> {
+    let mut packet = vec![kind];
+    packet.extend((payload.len() as u32).to_be_bytes());
+    packet.extend(payload);
+    packet
+}
+
+impl FakePty {
+    fn start(state: &AppState, rows: u16, columns: u16) -> Self {
+        std::fs::create_dir_all(&state.pty_root).unwrap();
+        let listener =
+            tokio::net::UnixListener::bind(state.pty_root.join("terminal-demo-runtime.sock"))
+                .unwrap();
+        let pty = Self {
+            replay: Arc::new(std::sync::Mutex::new(b"terminal ready\r\n$ ".to_vec())),
+            output: tokio::sync::broadcast::channel(4_096).0,
+        };
+        let session = pty.clone();
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let (replay, mut output) = {
+                    let replay = session.replay.lock().unwrap();
+                    (replay.clone(), session.output.subscribe())
+                };
+                tokio::spawn(async move {
+                    let mut peek = [0_u8; 6];
+                    if stream.read_exact(&mut peek).await.is_err() || peek[0] != 6 {
+                        return;
+                    }
+                    let mut geometry = rows.to_be_bytes().to_vec();
+                    geometry.extend(columns.to_be_bytes());
+                    if stream.write_all(&pty_packet(10, &geometry)).await.is_err()
+                        || stream.write_all(&pty_packet(5, &replay)).await.is_err()
+                    {
+                        return;
+                    }
+                    while let Ok(output) = output.recv().await {
+                        let exited = output.is_none();
+                        let packet = match output {
+                            Some(bytes) => pty_packet(0, &bytes),
+                            None => pty_packet(4, &0_i32.to_be_bytes()),
+                        };
+                        if stream.write_all(&packet).await.is_err() || exited {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        pty
+    }
+
+    fn write(&self, bytes: &[u8]) {
+        let mut replay = self.replay.lock().unwrap();
+        replay.extend_from_slice(bytes);
+        let _ = self.output.send(Some(bytes.to_vec()));
+    }
+
+    fn exit(&self) {
+        let _ = self.output.send(None);
+    }
+}
+
+async fn first_screen(
+    client: &Client,
+    attachment: &TerminalAttachment,
+    incarnation: &str,
+) -> Result<(TerminalStream, Envelope<TerminalScreen>), ClientError> {
+    let mut stream = client
+        .terminal_stream(
+            &attachment.terminal_id,
+            Some(incarnation),
+            attachment.stream_capability.as_deref().unwrap(),
+        )
+        .await?;
+    let screen = stream
+        .next()
+        .await?
+        .ok_or_else(|| ClientError::Protocol("the stream closed before its first screen".into()))?;
+    Ok((stream, screen))
+}
+
+async fn serve_terminal_state(
+    name: &str,
+    rows: u16,
+    columns: u16,
+) -> (
+    tempfile::TempDir,
+    AppState,
+    FakePty,
+    Client,
+    tokio::task::AbortHandle,
+) {
+    let root = tempfile::tempdir().unwrap();
+    let socket = root.path().join("st3.sock");
+    let state = state(root.path(), name);
+    publish_terminal(&state, "terminal-demo-runtime:i1");
+    let pty = FakePty::start(&state, rows, columns);
+    let app = st3::api::router(state.clone());
+    let server_socket = socket.clone();
+    let server = tokio::spawn(async move { st3::api::serve_unix(&server_socket, app).await });
+    wait_for_socket(&socket).await;
+    (
+        root,
+        state,
+        pty,
+        Client::unix_as(&socket, "person/avery"),
+        server.abort_handle(),
+    )
+}
+
+#[tokio::test]
+async fn terminal_stream_sends_changed_screens_and_nothing_while_idle() {
+    let (_root, state, pty, client, server) =
+        serve_terminal_state("client-stream-changes", 24, 80).await;
+    let attachment = attach_terminal(&client, "stream-changes").await;
+    let (mut stream, first) = first_screen(&client, &attachment, "terminal-demo-runtime:i1")
+        .await
+        .unwrap();
+    assert_eq!(first.value.lines[0].text, "terminal ready");
+    assert!(!first.value.revision.is_empty());
+
+    assert!(
+        tokio::time::timeout(Duration::from_millis(1_500), stream.next())
+            .await
+            .is_err(),
+        "an idle terminal must send nothing"
+    );
+
+    pty.write(b"\x1b[1;32mecho\x1b[0m hi");
+    let changed = tokio::time::timeout(Duration::from_secs(5), stream.next())
+        .await
+        .expect("a change must arrive promptly")
+        .unwrap()
+        .unwrap();
+    assert_eq!(changed.value.lines[1].text, "$ echo hi");
+    assert_eq!(
+        changed.value.lines[1].runs[1],
+        TerminalRun {
+            text: "echo".into(),
+            fg: Some(TerminalColor::Palette(2)),
+            bold: true,
+            ..TerminalRun::default()
+        }
+    );
+    assert_ne!(changed.value.revision, first.value.revision);
+
+    // Output that leaves the screen as it was is not a change.
+    pty.write(b"\x08i");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(1_000), stream.next())
+            .await
+            .is_err(),
+        "an unchanged screen must not be sent again"
+    );
+
+    publish_terminal(&state, "terminal-demo-runtime:i2");
+    let ended = tokio::time::timeout(Duration::from_secs(5), stream.next())
+        .await
+        .expect("a changed incarnation must end the stream promptly");
+    assert!(
+        matches!(ended, Err(ClientError::Api(ErrorCode::StaleFence, _, _))),
+        "a changed incarnation must close the stream with stale-fence: {ended:?}"
+    );
+
+    let attachment = attach_terminal(&client, "stream-exit").await;
+    let (mut stream, reconnected) =
+        first_screen(&client, &attachment, "terminal-demo-runtime:i2")
+            .await
+            .unwrap();
+    assert_eq!(reconnected.value.lines[1].text, "$ echo hi");
+    pty.exit();
+    let ended = tokio::time::timeout(Duration::from_secs(5), stream.next())
+        .await
+        .expect("an exited terminal must end the stream promptly");
+    assert!(
+        matches!(ended, Err(ClientError::Api(ErrorCode::StaleFence, _, _))),
+        "an exited terminal must close the stream with stale-fence: {ended:?}"
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn a_slow_terminal_client_gets_the_latest_screen_not_a_backlog() {
+    const ROWS: usize = 100;
+    const CHANGES: usize = 200;
+    let (_root, _state, pty, client, server) =
+        serve_terminal_state("client-stream-slow", ROWS as u16, 250).await;
+    let attachment = attach_terminal(&client, "stream-slow").await;
+    let (mut stream, _) = first_screen(&client, &attachment, "terminal-demo-runtime:i1")
+        .await
+        .unwrap();
+    // Fill every row with the change number, and read nothing while the terminal keeps changing
+    // for four seconds: long enough to fill the socket buffers between server and client.
+    for change in 0..CHANGES {
+        let row = format!("{change:04} ").repeat(49);
+        let screen = vec![row; ROWS].join("\r\n");
+        pty.write(format!("\x1b[H{screen}").as_bytes());
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let mut received = Vec::new();
+    while let Ok(screen) = tokio::time::timeout(Duration::from_millis(1_500), stream.next()).await
+    {
+        received.push(screen.unwrap().unwrap());
+    }
+    let last = received.last().expect("the latest screen arrives");
+    assert!(
+        last.value.lines[0].text.starts_with(&format!("{:04}", CHANGES - 1)),
+        "the last screen must be the latest one: {:?}",
+        &last.value.lines[0].text[..10]
+    );
+    let changes = received
+        .iter()
+        .map(|screen| screen.value.lines[0].text[..4].parse::<usize>().unwrap())
+        .collect::<Vec<_>>();
+    assert!(
+        changes.windows(2).all(|pair| pair[0] < pair[1]),
+        "screens only move forward: {changes:?}"
+    );
+    // The watcher publishes at most one screen per 100 ms, about 40 in four seconds. A client
+    // that fell behind receives what its socket buffers held plus the latest, never every one.
+    assert!(
+        received.len() <= 20,
+        "a slow client must not receive a backlog of {} screens: {changes:?}",
+        received.len()
+    );
+    server.abort();
 }
 
 async fn wait_for_socket(socket: &Path) {
@@ -205,6 +449,7 @@ async fn generated_client_conforms_over_the_real_unix_transport() {
     let server_socket = socket.clone();
     let state = state(root.path(), "client-unix");
     publish_terminal(&state, "terminal-demo-runtime:i1");
+    let _pty = FakePty::start(&state, 24, 80);
     state
         .store
         .request_attention(
@@ -412,20 +657,15 @@ async fn generated_client_conforms_over_the_real_unix_transport() {
     );
 
     let read_only_attachment = attach_terminal(&read_only, "unix-read-only").await;
-    let read_only_stream = read_only
-        .terminal_frames(
-            &read_only_attachment.terminal_id,
-            None,
-            Some(&read_only_attachment.runtime_incarnation),
-            read_only_attachment.stream_capability.as_deref().unwrap(),
-            Some(1_000),
-        )
-        .await
-        .expect("a plain Unix client may consume its read-only viewer capability");
-    assert_eq!(
-        read_only_stream.screen.value.lines[0].text,
-        "terminal ready"
-    );
+    let (read_only_stream, read_only_screen) = first_screen(
+        &read_only,
+        &read_only_attachment,
+        &read_only_attachment.runtime_incarnation,
+    )
+    .await
+    .expect("a plain Unix client may consume its read-only viewer capability");
+    assert_eq!(read_only_screen.value.lines[0].text, "terminal ready");
+    read_only_stream.close().await;
     let read_only_fence = read_only.capabilities().await.unwrap();
     for denied in [
         read_only
@@ -471,31 +711,16 @@ async fn generated_client_conforms_over_the_real_unix_transport() {
     detach_terminal(&read_only, &read_only_attachment, "unix-read-only").await;
 
     let first_attachment = attach_terminal(&client, "unix-first").await;
-    let first = client
-        .terminal_frames(
-            &first_attachment.terminal_id,
-            None,
-            Some("terminal-demo-runtime:i1"),
-            first_attachment.stream_capability.as_deref().unwrap(),
-            Some(1_000),
-        )
-        .await
-        .unwrap();
-    assert_eq!(
-        first.screen.value.runtime_incarnation,
-        "terminal-demo-runtime:i1"
-    );
-    assert_eq!(first.screen.value.lines[0].text, "terminal ready");
-    let frames = first.frames.expect("bounded initial frame page");
-    assert_eq!(frames.value.frames.len(), 1);
-    assert_eq!(
-        frames.value.frames[0].frame_type,
-        st3_client::TerminalFrameType::Resync
-    );
-    assert_eq!(
-        frames.value.frames[0].runtime_incarnation,
-        "terminal-demo-runtime:i1"
-    );
+    let (first_stream, first) =
+        first_screen(&client, &first_attachment, "terminal-demo-runtime:i1")
+            .await
+            .unwrap();
+    assert_eq!(first.value.runtime_incarnation, "terminal-demo-runtime:i1");
+    assert_eq!(first.value.lines[0].text, "terminal ready");
+    assert_eq!(first.value.lines[1].text, "$");
+    assert_eq!((first.value.rows, first.value.columns), (24, 80));
+    assert_eq!((first.value.cursor.row, first.value.cursor.column), (1, 2));
+    first_stream.close().await;
 
     let control_fence = client.capabilities().await.unwrap();
     let input = client
@@ -541,16 +766,14 @@ async fn generated_client_conforms_over_the_real_unix_transport() {
 
     assert!(
         client
-            .terminal_frames(
+            .terminal_stream(
                 &first_attachment.terminal_id,
-                None,
                 Some("terminal-demo-runtime:wrong"),
                 attach_terminal(&client, "unix-wrong")
                     .await
                     .stream_capability
                     .as_deref()
                     .unwrap(),
-                Some(100),
             )
             .await
             .is_err(),
@@ -576,40 +799,30 @@ async fn generated_client_conforms_over_the_real_unix_transport() {
     publish_terminal(&state, "terminal-demo-runtime:i2");
     assert!(
         client
-            .terminal_frames(
+            .terminal_stream(
                 &replacement_fence.terminal_id,
-                None,
                 Some("terminal-demo-runtime:i1"),
                 replacement_fence.stream_capability.as_deref().unwrap(),
-                Some(100),
             )
             .await
             .is_err(),
         "reconnect to a replaced incarnation must reject the old fence"
     );
     let second_attachment = attach_terminal(&client, "unix-second").await;
-    let replacement = client
-        .terminal_frames(
-            &second_attachment.terminal_id,
-            None,
-            Some("terminal-demo-runtime:i2"),
-            second_attachment.stream_capability.as_deref().unwrap(),
-            Some(1_000),
-        )
-        .await
-        .unwrap();
+    let (_replacement_stream, replacement) =
+        first_screen(&client, &second_attachment, "terminal-demo-runtime:i2")
+            .await
+            .unwrap();
     assert_eq!(
-        replacement.screen.value.runtime_incarnation,
+        replacement.value.runtime_incarnation,
         "terminal-demo-runtime:i2"
     );
     assert!(
         client
-            .terminal_frames(
+            .terminal_stream(
                 &second_attachment.terminal_id,
-                None,
                 Some("terminal-demo-runtime:i2"),
                 second_attachment.stream_capability.as_deref().unwrap(),
-                Some(100),
             )
             .await
             .is_err(),
@@ -620,12 +833,10 @@ async fn generated_client_conforms_over_the_real_unix_transport() {
     detach_terminal(&client, &detached, "unix-repeat").await;
     assert!(
         client
-            .terminal_frames(
+            .terminal_stream(
                 &detached.terminal_id,
-                None,
                 Some("terminal-demo-runtime:i2"),
                 detached.stream_capability.as_deref().unwrap(),
-                Some(100),
             )
             .await
             .is_err(),
@@ -639,6 +850,7 @@ async fn generated_client_conforms_over_paired_loopback_and_rejects_bad_credenti
     let root = tempfile::tempdir().unwrap();
     let state = state(root.path(), "client-loopback");
     publish_terminal(&state, "terminal-demo-runtime:fabric-i1");
+    let _pty = FakePty::start(&state, 24, 80);
 
     let socket = root.path().join("st3.sock");
     let server_socket = socket.clone();
@@ -713,12 +925,10 @@ async fn generated_client_conforms_over_paired_loopback_and_rejects_bad_credenti
     );
     let direct_attachment = attach_terminal(&direct_gateway, "gateway-unix").await;
     direct_gateway
-        .terminal_frames(
+        .terminal_stream(
             &direct_attachment.terminal_id,
-            None,
             Some("terminal-demo-runtime:fabric-i1"),
             direct_attachment.stream_capability.as_deref().unwrap(),
-            Some(1_000),
         )
         .await
         .unwrap();
@@ -754,29 +964,22 @@ async fn generated_client_conforms_over_paired_loopback_and_rejects_bad_credenti
     assert_eq!(error.code, st3_client::ErrorCode::Forbidden);
 
     let fabric_attachment = attach_terminal(&client, "fabric-first").await;
-    let terminal = client
-        .terminal_frames(
-            &fabric_attachment.terminal_id,
-            None,
-            Some("terminal-demo-runtime:fabric-i1"),
-            fabric_attachment.stream_capability.as_deref().unwrap(),
-            Some(1_000),
-        )
-        .await
-        .unwrap();
+    let (_terminal_stream, terminal) =
+        first_screen(&client, &fabric_attachment, "terminal-demo-runtime:fabric-i1")
+            .await
+            .unwrap();
     assert_eq!(
-        terminal.screen.value.runtime_incarnation,
+        terminal.value.runtime_incarnation,
         "terminal-demo-runtime:fabric-i1"
     );
+    assert_eq!(terminal.value.lines[0].text, "terminal ready");
     let bad_attachment = "not-a-real-stream-capability-0000000000";
     assert!(
         Client::fabric_loopback(&base, "not-a-real-client-credential")
-            .terminal_frames(
+            .terminal_stream(
                 &fabric_attachment.terminal_id,
-                None,
                 Some("terminal-demo-runtime:fabric-i1"),
                 bad_attachment,
-                Some(100),
             )
             .await
             .is_err(),
@@ -824,12 +1027,10 @@ async fn generated_client_conforms_over_paired_loopback_and_rejects_bad_credenti
         .unwrap();
     assert!(
         client
-            .terminal_frames(
+            .terminal_stream(
                 &revoked_attachment.terminal_id,
-                None,
                 Some("terminal-demo-runtime:fabric-i1"),
                 revoked_attachment.stream_capability.as_deref().unwrap(),
-                Some(100),
             )
             .await
             .is_err(),
