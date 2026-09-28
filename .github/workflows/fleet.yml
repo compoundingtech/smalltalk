@@ -1,11 +1,9 @@
 name: Fleet compatibility
 
-# Every pull request, with no path filter: the fleet join series touches the store, the CLI,
-# the schema, and the worker, and any of them can break replication with an older build.
+# Every fork pull request, with no path filter: the fleet join series touches the store,
+# the CLI, the schema, and the worker. st/ci checks our own PRs and main.
 on:
   pull_request:
-  push:
-    branches: [main]
 
 concurrency:
   group: fleet-${{ github.workflow }}-${{ github.ref }}
@@ -13,6 +11,7 @@ concurrency:
 
 jobs:
   fleet-compat:
+    if: ${{ github.event.pull_request.head.repo.full_name != github.repository }}
     name: fleet-compat (${{ matrix.os }})
     # macOS never runs on GitHub (#632): it is too slow and too expensive there. The fleet
     # suite runs on macOS in st's own CI on the fleet's Mac.

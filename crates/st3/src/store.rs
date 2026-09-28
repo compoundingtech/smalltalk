@@ -10457,6 +10457,16 @@ impl Store {
         // Seed and sign local batches first, so local membership claims decide admission.
         self.replication_snapshot()?;
         let mut connection = self.connection.lock().expect("store mutex poisoned");
+        // Builds before the insertion-order hash fallback rejected genuine claims from
+        // 2026-09-16 as hash mismatches. Check those records once more, once.
+        let retry_hash_mismatches = connection
+            .query_row(
+                "SELECT 1 FROM meta WHERE key='legacy_claim_hash_retried'",
+                [],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_none();
         let mut statement = connection.prepare(
             "WITH retry_ids AS (
                  SELECT writer, sequence, envelope_hash FROM replica_envelopes
@@ -10466,6 +10476,7 @@ impl Store {
                  WHERE state='unknown'
                     OR (state='invalid' AND error_code='invalid-replicated-claim'
                         AND error_message LIKE '%violates unknown-claim-field:%')
+                    OR (?1 AND state='invalid' AND error_code='claim-hash-mismatch')
              )
              SELECT envelopes.writer, envelopes.sequence, envelopes.envelope_hash,
                     envelopes.previous_hash, envelopes.accepted_at_unix_ms, envelopes.payload
@@ -10475,7 +10486,7 @@ impl Store {
              ORDER BY envelopes.writer, envelopes.sequence, envelopes.envelope_hash",
         )?;
         let envelopes = statement
-            .query_map([], |row| {
+            .query_map([retry_hash_mismatches], |row| {
                 Ok(ReplicaEnvelope {
                     writer: row.get(0)?,
                     sequence: row.get(1)?,
@@ -10529,6 +10540,12 @@ impl Store {
             }
             membership = fleet_membership_tx(&connection)?;
             pending = held;
+        }
+        if retry_hash_mismatches {
+            connection.execute(
+                "INSERT OR REPLACE INTO meta(key, value) VALUES ('legacy_claim_hash_retried', ?1)",
+                [now_ms().to_string()],
+            )?;
         }
         Ok(outcome)
     }
@@ -16424,6 +16441,36 @@ fn claim_hash(
     canonical_hash(&(batch_id, subject, kind, origin, actor, body, predecessors))
 }
 
+/// Whether a replicated claim's ID is the hash of its content. On 2026-09-16, builds between
+/// eaec66a and 2537978d hashed each body in field insertion order: a new dependency switched
+/// serde_json to `preserve_order` before claim hashes sorted object keys. Those claims are
+/// genuine, so a node that verifies them later accepts that hash too. Bodies still decode with
+/// `preserve_order`, so the writer's field order survives to reproduce it.
+fn claim_id_is_content_hash(claim: &ClaimRecord) -> Result<bool> {
+    let canonical = claim_hash(
+        &claim.batch_id,
+        &claim.subject,
+        &claim.kind,
+        &claim.origin,
+        claim.actor.as_deref(),
+        &claim.body,
+        &claim.predecessors,
+    )?;
+    if canonical == claim.id {
+        return Ok(true);
+    }
+    let insertion_order = canonical_hash(&(
+        &claim.batch_id,
+        &claim.subject,
+        &claim.kind,
+        &claim.origin,
+        claim.actor.as_deref(),
+        &claim.body,
+        &claim.predecessors,
+    ))?;
+    Ok(insertion_order == claim.id)
+}
+
 fn canonical_json_value(value: &Value) -> Value {
     match value {
         Value::Array(values) => Value::Array(values.iter().map(canonical_json_value).collect()),
@@ -20104,17 +20151,7 @@ fn validate_replicated_claim(
             ),
         ));
     }
-    let expected = claim_hash(
-        &claim.batch_id,
-        &claim.subject,
-        &claim.kind,
-        &claim.origin,
-        claim.actor.as_deref(),
-        &claim.body,
-        &claim.predecessors,
-    )
-    .map_err(internal)?;
-    if expected != claim.id {
+    if !claim_id_is_content_hash(claim).map_err(internal)? {
         return Err(St3Error::new(
             "claim-hash-mismatch",
             format!("replicated claim `{}` failed verification", claim.id),
@@ -20496,17 +20533,7 @@ fn verify_replica_batch(batch: &ReplicaBatch) -> Result<(), St3Error> {
                 ),
             ));
         }
-        let expected = claim_hash(
-            &claim.batch_id,
-            &claim.subject,
-            &claim.kind,
-            &claim.origin,
-            claim.actor.as_deref(),
-            &claim.body,
-            &claim.predecessors,
-        )
-        .map_err(internal)?;
-        if expected != claim.id {
+        if !claim_id_is_content_hash(claim).map_err(internal)? {
             return Err(St3Error::new(
                 "claim-hash-mismatch",
                 format!("replicated claim `{}` failed verification", claim.id),
@@ -28735,6 +28762,173 @@ mission "proposal-replay" state="ready" revisions="human-only" revision-reviewer
             .import_replication("source", &batch)
             .expect_err("tampering must fail");
         assert_eq!(error.code, "claim-hash-mismatch");
+    }
+
+    /// One source claim whose body lists its fields in reverse order and whose ID is the hash of
+    /// that order, the way builds between eaec66a and 2537978d wrote claims on 2026-09-16.
+    fn insertion_order_hashed_batch() -> ReplicationBatch {
+        let source = Store::open_memory("source").unwrap();
+        source
+            .append_claim(&ClaimInput {
+                subject: "host/source".into(),
+                kind: "transport.observed".into(),
+                actor: None,
+                fields: BTreeMap::from([
+                    ("protocol".into(), Value::String("http-replication".into())),
+                    ("status".into(), Value::String("up".into())),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+        let mut batch = source.export_replication(0).unwrap();
+        let claim = &mut batch.batches[0].claims[0];
+        let reversed = |value: &Value| {
+            let mut fields = value.as_object().unwrap().iter().collect::<Vec<_>>();
+            fields.sort_by(|left, right| right.0.cmp(left.0));
+            Value::Object(
+                fields
+                    .into_iter()
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect(),
+            )
+        };
+        let mut body = reversed(&claim.body);
+        body["fields"] = reversed(&claim.body["fields"]);
+        claim.body = body;
+        claim.id = canonical_hash(&(
+            &claim.batch_id,
+            &claim.subject,
+            &claim.kind,
+            &claim.origin,
+            claim.actor.as_deref(),
+            &claim.body,
+            &claim.predecessors,
+        ))
+        .unwrap();
+        batch
+    }
+
+    #[test]
+    fn a_claim_hashed_in_field_insertion_order_still_verifies() {
+        let batch = insertion_order_hashed_batch();
+        let claim = &batch.batches[0].claims[0];
+        let canonical = claim_hash(
+            &claim.batch_id,
+            &claim.subject,
+            &claim.kind,
+            &claim.origin,
+            claim.actor.as_deref(),
+            &claim.body,
+            &claim.predecessors,
+        )
+        .unwrap();
+        assert_ne!(canonical, claim.id, "the fixture must not be canonical");
+        assert!(claim_id_is_content_hash(claim).unwrap());
+
+        // A new node decodes the body from CBOR. It must keep the writer's field order.
+        let mut bytes = Vec::new();
+        ciborium::into_writer(claim, &mut bytes).unwrap();
+        let decoded: ClaimRecord = ciborium::from_reader(bytes.as_slice()).unwrap();
+        assert!(claim_id_is_content_hash(&decoded).unwrap());
+
+        let mut tampered = decoded;
+        tampered.body["fields"]["status"] = Value::String("down".into());
+        assert!(!claim_id_is_content_hash(&tampered).unwrap());
+
+        let target = Store::open_memory("target").unwrap();
+        target.import_replication("source", &batch).unwrap();
+        assert!(target.claim_by_id(&claim.id).unwrap().is_some());
+    }
+
+    #[test]
+    fn a_node_that_rejected_insertion_order_hashes_admits_them_once_upgraded() {
+        const FLEET: &str = "018f6f0d-4a5d-7b8c-9d0e-123456789abc";
+        let envelope = |batch: &ReplicaBatch| {
+            let mut bytes = Vec::new();
+            ciborium::into_writer(
+                &ReplicaEnvelopePayload {
+                    batch: batch.clone(),
+                    blobs: BTreeMap::new(),
+                },
+                &mut bytes,
+            )
+            .unwrap();
+            ReplicaEnvelope {
+                writer: batch.origin.clone(),
+                sequence: batch.replica_sequence,
+                previous_hash: batch.previous_hash.clone(),
+                hash: replica_envelope_hash(
+                    &batch.origin,
+                    batch.replica_sequence,
+                    batch.previous_hash.as_deref(),
+                    batch.accepted_at_unix_ms,
+                    &bytes,
+                ),
+                accepted_at_unix_ms: batch.accepted_at_unix_ms,
+                payload: base64::engine::general_purpose::STANDARD.encode(&bytes),
+                member_key: None,
+                signature: None,
+            }
+        };
+        let receive = |store: &Store, envelope: ReplicaEnvelope| {
+            store
+                .receive_replication_exchange(
+                    "source",
+                    FLEET,
+                    &ReplicationExchange {
+                        peer: "source".into(),
+                        fleet_id: FLEET.into(),
+                        schema_digest: String::new(),
+                        authority_digest: String::new(),
+                        graph_digest: String::new(),
+                        inventory: ReplicationInventory::default(),
+                        envelopes: vec![envelope],
+                        signature_requests: Vec::new(),
+                        signatures: Vec::new(),
+                    },
+                )
+                .unwrap();
+        };
+        let batch = insertion_order_hashed_batch().batches.remove(0);
+        let legacy = envelope(&batch);
+        let target = Store::open_memory("target").unwrap();
+        receive(&target, legacy.clone());
+        // An older build rejected the genuine claim as a hash mismatch.
+        record_invalid_replica_envelope(
+            &target.connection.lock().unwrap(),
+            &legacy,
+            &St3Error::new("claim-hash-mismatch", "failed verification"),
+        )
+        .unwrap();
+        assert_eq!(target.replica_records(true).unwrap().len(), 1);
+
+        let admission = target.validate_replication_backlog().unwrap();
+        assert_eq!(admission.invalid, 0);
+        assert!(target.replica_records(true).unwrap().is_empty());
+        assert!(target.claim_by_id(&batch.claims[0].id).unwrap().is_some());
+
+        // A claim that fails both hashes stays invalid and is not checked again on every wake.
+        let mut tampered = batch.clone();
+        tampered.replica_sequence += 1;
+        tampered.hash = batch_header_hash(
+            &tampered.origin,
+            tampered.replica_sequence,
+            tampered.previous_hash.as_deref(),
+            tampered.accepted_at_unix_ms,
+        )
+        .unwrap();
+        tampered.id = format!(
+            "batch/{}/{}/{}",
+            tampered.origin, tampered.replica_sequence, tampered.hash
+        );
+        tampered.claims[0].batch_id = tampered.id.clone();
+        tampered.claims[0].body["fields"]["status"] = Value::String("down".into());
+        receive(&target, envelope(&tampered));
+        assert_eq!(target.validate_replication_backlog().unwrap().invalid, 1);
+        assert_eq!(target.validate_replication_backlog().unwrap().invalid, 0);
+        assert_eq!(target.replica_records(true).unwrap().len(), 1);
     }
 
     #[test]
