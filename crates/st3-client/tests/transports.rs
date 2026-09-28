@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::io::{Read as _, Write as _};
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::Path;
 use std::sync::Arc;
@@ -8,6 +9,7 @@ use http_body_util::Empty;
 use hyper::client::conn::http1;
 use hyper::{Request, StatusCode};
 use hyper_util::rt::TokioIo;
+use pty_core::protocol::{MessageType, PacketReader, encode_screen};
 use serde_json::Value;
 use st3::api::AppState;
 use st3::model::{AttentionRequest, ClaimInput};
@@ -21,14 +23,37 @@ use st3_client::{
 use tokio::sync::{Notify, watch};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
 
+/// The demo terminal's PTY session socket: it answers every screen read (PEEK) with the demo
+/// screen and accepts nothing else.
+fn serve_terminal_screen(pty_root: &Path) {
+    std::fs::create_dir_all(pty_root).unwrap();
+    let listener =
+        std::os::unix::net::UnixListener::bind(pty_root.join("terminal-demo-runtime.sock"))
+            .unwrap();
+    std::thread::spawn(move || {
+        for mut socket in listener.incoming().flatten() {
+            let mut reader = PacketReader::new();
+            let mut buffer = [0; 4096];
+            while let Ok(read) = socket.read(&mut buffer) {
+                if read == 0 {
+                    break;
+                }
+                let Ok(packets) = reader.feed(&buffer[..read]) else {
+                    break;
+                };
+                if packets
+                    .iter()
+                    .any(|packet| packet.type_ == MessageType::Peek)
+                {
+                    let _ = socket.write_all(&encode_screen(b"terminal ready\n$ "));
+                }
+            }
+        }
+    });
+}
+
 fn state(root: &Path, name: &str) -> AppState {
-    let pty_binary = root.join(format!("{name}-fake-pty"));
-    std::fs::write(
-        &pty_binary,
-        "#!/bin/sh\nif [ \"$1\" = peek ]; then printf 'terminal ready\\n$ '; exit 0; fi\nexit 1\n",
-    )
-    .unwrap();
-    std::fs::set_permissions(&pty_binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+    serve_terminal_screen(&root.join("pty"));
     AppState {
         store: Arc::new(Store::open_memory(name).unwrap()),
         notify: Arc::new(Notify::new()),
@@ -36,7 +61,7 @@ fn state(root: &Path, name: &str) -> AppState {
         node: name.into(),
         state_dir: root.to_path_buf(),
         pty_root: root.join("pty"),
-        pty_binary,
+        pty_binary: root.join("unused-pty"),
         fleet_id: None,
         configured_peers: Vec::new(),
         client_relay: None,
