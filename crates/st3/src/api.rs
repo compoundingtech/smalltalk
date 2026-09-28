@@ -3625,8 +3625,8 @@ async fn replication_peer_failure(
     let store = state.store.clone();
     let changed = blocking_store(move || {
         let before_index = store.index()?;
-        store.record_peer_failure(&request.peer, &request.status, &request.error)?;
-        if store.observes_transport_to(&request.peer)? {
+        let stale = store.record_peer_failure(&request.peer, &request.status, &request.error)?;
+        if stale && store.observes_transport_to(&request.peer)? {
             store.record_transport_observation(
                 &request.peer,
                 &request.status,

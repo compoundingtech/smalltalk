@@ -10766,7 +10766,30 @@ impl Store {
             .find(|record| record.record_ref == record_ref))
     }
 
-    pub fn record_peer_failure(&self, peer: &str, status: &str, error: &str) -> Result<()> {
+    pub fn record_peer_failure(&self, peer: &str, status: &str, error: &str) -> Result<bool> {
+        // An inbound exchange is just as good evidence of reachability as an outbound one.
+        // Keep the last success during a short missed-exchange window, so a failed dial on
+        // one side cannot flap a peer that is still exchanging in the other direction.
+        if self
+            .replication_peer_last_success(peer)?
+            .is_some_and(|last| now_ms().saturating_sub(last) < 90_000)
+        {
+            return Ok(false);
+        }
+        if self
+            .readers
+            .get()
+            .query_row(
+                "SELECT status FROM replication_peers WHERE peer=?1",
+                [peer],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .as_deref()
+            == Some(status)
+        {
+            return Ok(true);
+        }
         {
             let connection = self.connection.lock().expect("store mutex poisoned");
             connection.execute(
@@ -10777,7 +10800,7 @@ impl Store {
                 params![peer, status, error, now_ms().to_string()],
             )?;
         }
-        Ok(())
+        Ok(true)
     }
 
     pub(crate) fn record_transport_observation(
@@ -10841,6 +10864,18 @@ impl Store {
             .optional()?
             .flatten()
             .and_then(|value| value.parse().ok()))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn age_replication_peer_for_test(&self, peer: &str) {
+        self.connection
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE replication_peers SET last_success_at_unix_ms=?2 WHERE peer=?1",
+                params![peer, now_ms().saturating_sub(86_400_000).to_string()],
+            )
+            .unwrap();
     }
 
     pub fn replication_status(
