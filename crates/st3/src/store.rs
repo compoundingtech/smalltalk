@@ -6416,6 +6416,30 @@ impl Store {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
+    /// The last local observation the OpenTelemetry exporter delivered.
+    pub fn otlp_export_cursor(&self) -> Result<u64> {
+        let connection = self.readers.get();
+        Ok(connection
+            .query_row(
+                "SELECT value FROM meta WHERE key='otlp_export_cursor'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0))
+    }
+
+    pub fn set_otlp_export_cursor(&self, cursor: u64) -> Result<()> {
+        let connection = self.connection.lock().expect("store mutex poisoned");
+        connection.execute(
+            "INSERT INTO meta(key, value) VALUES ('otlp_export_cursor', ?1)
+             ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            [cursor.to_string()],
+        )?;
+        Ok(())
+    }
+
     /// The first local observation that follows the claim at `store_index`, if any. Event
     /// cursors that name only a claim resume from here.
     pub fn local_observation_floor_after_claim(&self, store_index: u64) -> Result<u64> {

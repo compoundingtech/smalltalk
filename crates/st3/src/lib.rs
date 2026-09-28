@@ -10,6 +10,7 @@ pub(crate) mod external_sessions;
 pub mod graph;
 pub mod mission;
 pub mod model;
+pub mod otlp;
 pub mod peer;
 pub mod projection;
 pub mod reconcile;
