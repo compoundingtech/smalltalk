@@ -3068,20 +3068,6 @@ version 2
       }
     }
 
-    #[test]
-    fn feedback_gate_example_requires_a_worker_step() {
-        let source = include_str!("../../../examples/st3/human-feedback.kdl");
-        let intent = crate::graph::parse_intent(source, "node").unwrap();
-        let gate = &intent.missions["example/draft-feedback"].steps["draft"].gates[0];
-        assert!(matches!(gate, GateSpec::Human { mode, .. } if mode == "feedback"));
-
-        let invalid = source.replace(
-            "assigned-to \"agent/example/worker\"",
-            "agentless",
-        );
-        let error = crate::graph::parse_intent(&invalid, "node").unwrap_err();
-        assert_eq!(error.code, "feedback-gate-needs-worker");
-    }
   }
 
 "#,
@@ -3109,6 +3095,18 @@ version 2
                 "doc/reports/run@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
             ]
         );
+    }
+
+    #[test]
+    fn feedback_gate_example_requires_a_worker_step() {
+        let source = include_str!("../../../examples/st3/human-feedback.kdl");
+        let intent = crate::graph::parse_intent(source, "node").unwrap();
+        let gate = &intent.missions["example/draft-feedback"].steps["draft"].gates[0];
+        assert!(matches!(gate, crate::model::GateSpec::Human { mode, .. } if mode == "feedback"));
+
+        let invalid = source.replace("assigned-to \"agent/example/worker\"", "agentless");
+        let error = crate::graph::parse_intent(&invalid, "node").unwrap_err();
+        assert_eq!(error.code, "feedback-gate-needs-worker");
     }
 
     #[test]

@@ -6046,14 +6046,20 @@ async fn post_review(
     AxumPath(subject): AxumPath<String>,
     Json(request): Json<ReviewRequest>,
 ) -> Result<Json<ClaimRecord>, ApiError> {
-    if !matches!(request.decision.as_str(), "approved" | "rejected" | "changes-requested") {
+    if !matches!(
+        request.decision.as_str(),
+        "approved" | "rejected" | "changes-requested"
+    ) {
         return Err(ApiError::bad(St3Error::new(
             "invalid-review-decision",
             "a review decision must be approved, rejected, or changes-requested",
         )));
     }
     if matches!(request.decision.as_str(), "rejected" | "changes-requested")
-        && request.reason.as_deref().is_none_or(|reason| reason.trim().is_empty())
+        && request
+            .reason
+            .as_deref()
+            .is_none_or(|reason| reason.trim().is_empty())
     {
         return Err(ApiError::bad(St3Error::new(
             "missing-review-reason",
@@ -6126,7 +6132,10 @@ async fn post_review(
     } {
         return Err(ApiError::bad(St3Error::new(
             "review-decision-not-offered",
-            format!("`{}` is not offered by this {mode} review", request.decision),
+            format!(
+                "`{}` is not offered by this {mode} review",
+                request.decision
+            ),
         )));
     }
     let verdict = match request.decision.as_str() {
@@ -6182,11 +6191,15 @@ async fn post_review(
                             .into_iter()
                             .rev()
                             .find(|claim| {
-                                claim.body.pointer("/fields/attempt").and_then(Value::as_u64)
+                                claim
+                                    .body
+                                    .pointer("/fields/attempt")
+                                    .and_then(Value::as_u64)
                                     == Some(u64::from(step.attempt))
                             })
                             .and_then(|claim| {
-                                claim.body
+                                claim
+                                    .body
                                     .pointer("/fields/claimant")
                                     .and_then(Value::as_str)
                                     .map(str::to_owned)
@@ -13592,6 +13605,91 @@ version 2
         let messages = store.messages(Some(&claimant), false).unwrap();
         assert_eq!(messages.len(), 1);
         assert!(messages[0].content.contains("the evidence is incomplete"));
+
+        store
+            .set_mission_run_state(&run.id, "failed", "terminal", None)
+            .unwrap();
+        let feedback_run = store
+            .create_mission_run(&MissionRunRequest {
+                mission: "review-api".into(),
+                revision: None,
+                workspace: root.path().display().to_string(),
+                requester: Some("person/test".into()),
+                mode: Some("run".into()),
+                inputs: BTreeMap::new(),
+                idempotency_key: "review-api-feedback-run".into(),
+            })
+            .unwrap();
+        let feedback_step = &feedback_run.steps[0];
+        let feedback_claimant = feedback_step.assigned_to.clone().unwrap();
+        store
+            .set_step_state(&feedback_step.subject, "ready", None)
+            .unwrap();
+        for action in ["claim", "complete"] {
+            store
+                .work_action(
+                    &feedback_step.subject,
+                    action,
+                    &crate::model::WorkRequest {
+                        actor: Some(feedback_claimant.clone()),
+                        incarnation: Some("test-incarnation".into()),
+                        summary: Some("Candidate submitted".into()),
+                        reason: None,
+                        evidence: Vec::new(),
+                        idempotency_key: format!("feedback-api-{action}"),
+                    },
+                )
+                .unwrap();
+        }
+        let mut feedback_fields = request_fields(
+            feedback_step.subject.clone(),
+            feedback_step.definition_hash.clone(),
+            "gate-operation/review-api/feedback",
+        );
+        feedback_fields.insert("mode".into(), Value::String("feedback".into()));
+        feedback_fields.insert("decisions".into(), json!(["approved", "changes-requested"]));
+        let feedback_request = store
+            .append_claim(&ClaimInput {
+                subject: "gate-operation/review-api/feedback".into(),
+                kind: "gate.requested".into(),
+                actor: None,
+                fields: feedback_fields,
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some("feedback-api-request".into()),
+            })
+            .unwrap();
+        let (_, attention) = get_request(app.clone(), "/v1/attention?person=person%2Fnathan").await;
+        assert_eq!(attention[0]["review_mode"], "feedback");
+        assert!(
+            attention[0]["actions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|action| action["label"] == "request changes")
+        );
+        let feedback_path = format!("/v1/reviews/{}", feedback_step.subject);
+        let (status, invalid) = json_request(
+            app.clone(),
+            &feedback_path,
+            json!({
+                "decision": "rejected", "reason": "More detail", "actor": "person/nathan"
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{invalid}");
+        assert_eq!(invalid["code"], "review-decision-not-offered");
+        let (status, accepted) = json_request(
+            app.clone(),
+            &feedback_path,
+            json!({
+                "decision": "changes-requested", "reason": "Add a source.", "actor": "person/nathan"
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{accepted}");
+        assert_eq!(accepted["body"]["fields"]["verdict"], "feedback");
+        assert_eq!(accepted["body"]["fields"]["request"], feedback_request.id);
 
         let (_, empty) = get_request(app, "/v1/reviews?reviewer=person%2Fnathan").await;
         assert_eq!(empty, json!([]));

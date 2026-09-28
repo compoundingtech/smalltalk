@@ -2842,8 +2842,12 @@ async fn remote_terminal_stream_socket(
         }
         if !send_terminal_stream_value(&mut socket, &terminal_stream_envelope(&state, screen)).await
         {
-            close_terminal_stream(&mut socket, 1009, "terminal screen exceeds the client limit")
-                .await;
+            close_terminal_stream(
+                &mut socket,
+                1009,
+                "terminal screen exceeds the client limit",
+            )
+            .await;
             return;
         }
         sent = Some(revision);
@@ -3442,7 +3446,9 @@ async fn terminal_stream_socket(
                 }
             };
         }
-        let Some(screen) = screen.take() else { continue };
+        let Some(screen) = screen.take() else {
+            continue;
+        };
         if sent.as_deref() == Some(screen.revision()) {
             continue;
         }
@@ -3457,8 +3463,12 @@ async fn terminal_stream_socket(
         let value = screen.value(&terminal_id, &live.incarnation_id, next_sequence);
         if !send_terminal_stream_value(&mut socket, &terminal_stream_envelope(&state, value)).await
         {
-            close_terminal_stream(&mut socket, 1009, "terminal screen exceeds the client limit")
-                .await;
+            close_terminal_stream(
+                &mut socket,
+                1009,
+                "terminal screen exceeds the client limit",
+            )
+            .await;
             return;
         }
         sent = Some(screen.revision().to_owned());

@@ -3422,11 +3422,7 @@ async fn run_pty(
                 "terminals stream",
             )?;
             let mut stream = generated_client(endpoint, Some(&person))?
-                .terminal_stream(
-                    &args.subject,
-                    args.incarnation.as_deref(),
-                    &args.capability,
-                )
+                .terminal_stream(&args.subject, args.incarnation.as_deref(), &args.capability)
                 .await?;
             let mut shown = 0_u64;
             while args.count.is_none_or(|count| shown < count) {

@@ -14751,7 +14751,7 @@ fn pending_human_reviews_tx(
                    AND result.kind='gate.result'
                    AND json_extract(result.body, '$.fields.request')=request.id
                    AND result.actor=json_extract(request.body, '$.fields.reviewer')
-                   AND json_extract(result.body, '$.fields.verdict') IN ('pass','fail')
+                   AND json_extract(result.body, '$.fields.verdict') IN ('pass','fail','feedback')
                )
              ORDER BY request.store_index",
         )?;
@@ -15298,11 +15298,19 @@ fn attention_item_from_review(review: HumanReviewView) -> AttentionItemView {
                 ],
             ),
             attention_action(
-                if review.mode == "feedback" { "request changes" } else { "reject" },
+                if review.mode == "feedback" {
+                    "request changes"
+                } else {
+                    "reject"
+                },
                 &[
                     "st",
                     "attention",
-                    if review.mode == "feedback" { "request-changes" } else { "reject" },
+                    if review.mode == "feedback" {
+                        "request-changes"
+                    } else {
+                        "reject"
+                    },
                     &review.owner,
                     "--as",
                     &review.reviewer,
@@ -15453,7 +15461,12 @@ pub(crate) fn agent_attention_requester(actor: &str) -> bool {
 fn attention_item_from_request(request: AttentionRequestView) -> AttentionItemView {
     let agent_request = agent_attention_requester(&request.actor);
     AttentionItemView {
-        kind: if agent_request { "agent-request" } else { "fault" }.into(),
+        kind: if agent_request {
+            "agent-request"
+        } else {
+            "fault"
+        }
+        .into(),
         review_mode: None,
         subject: request.subject.clone(),
         person: request.reviewer.clone(),

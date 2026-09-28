@@ -1969,7 +1969,10 @@ fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
             ("baseline", boolean()),
         ],
         "gate.result" => &[
-            ("verdict", required_enum(&["pass", "fail", "error", "feedback"])),
+            (
+                "verdict",
+                required_enum(&["pass", "fail", "error", "feedback"]),
+            ),
             ("decision", string()),
             ("reason", string()),
             ("operation", reference()),

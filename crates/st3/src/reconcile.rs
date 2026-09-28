@@ -7046,9 +7046,9 @@ impl<R: RuntimeControl> Reconciler<R> {
                     } else {
                         ["approved", "rejected"]
                     }
-                        .into_iter()
-                        .map(|value| Value::String(value.into()))
-                        .collect(),
+                    .into_iter()
+                    .map(|value| Value::String(value.into()))
+                    .collect(),
                 ),
             ),
             (
@@ -7137,11 +7137,15 @@ impl<R: RuntimeControl> Reconciler<R> {
             .into_iter()
             .rev()
             .find(|claim| {
-                claim.body.pointer("/fields/attempt").and_then(Value::as_u64)
+                claim
+                    .body
+                    .pointer("/fields/attempt")
+                    .and_then(Value::as_u64)
                     == Some(u64::from(attempt))
             })
             .and_then(|claim| {
-                claim.body
+                claim
+                    .body
                     .pointer("/fields/claimant")
                     .and_then(Value::as_str)
                     .map(str::to_owned)
@@ -11953,6 +11957,107 @@ version 2
                 .unwrap_or_default()
                 .contains("The proof needs a source.")
         );
+    }
+
+    #[test]
+    fn feedback_review_retries_with_written_goals_and_messages_the_worker() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        apply_source(
+            &store,
+            r#"
+version 2
+agent "worker" { workspace "/tmp"; command "true" }
+mission "feedback-review" state="ready" {
+  goal "Review a draft."
+  step "draft" {
+    assigned-to "agent/worker"
+    goal "Submit a draft."
+    gate "review" type="human" mode="feedback" { reviewer "person/operator" }
+  }
+}
+"#,
+            "feedback-review-source",
+        );
+        let run = store
+            .create_mission_run(&crate::model::MissionRunRequest {
+                mission: "feedback-review".into(),
+                revision: None,
+                workspace: "/tmp".into(),
+                requester: Some("person/test".into()),
+                mode: Some("run".into()),
+                inputs: BTreeMap::new(),
+                idempotency_key: "feedback-review-run".into(),
+            })
+            .unwrap();
+        let step = &run.steps[0];
+        let claimant = step.assigned_to.clone().unwrap();
+        store.set_step_state(&step.subject, "ready", None).unwrap();
+        let work = |key: &str| crate::model::WorkRequest {
+            actor: Some(claimant.clone()),
+            incarnation: Some("test-incarnation".into()),
+            summary: Some("Draft submitted".into()),
+            reason: None,
+            evidence: Vec::new(),
+            idempotency_key: key.into(),
+        };
+        store
+            .work_action(&step.subject, "claim", &work("draft-claim-1"))
+            .unwrap();
+        store
+            .work_action(&step.subject, "complete", &work("draft-submit-1"))
+            .unwrap();
+        let reconciler = Reconciler::new(
+            store.clone(),
+            Arc::new(FakeRuntime::default()),
+            "node".into(),
+            Arc::new(Notify::new()),
+        );
+        reconciler.reconcile_once().unwrap();
+        let request = store
+            .gate_request_for_owner(&step.subject)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            request.body.pointer("/fields/mode").and_then(Value::as_str),
+            Some("feedback")
+        );
+        store
+            .append_claim(&ClaimInput {
+                subject: request.subject.clone(),
+                kind: "gate.result".into(),
+                actor: Some("person/operator".into()),
+                fields: BTreeMap::from([
+                    ("verdict".into(), Value::String("feedback".into())),
+                    (
+                        "reason".into(),
+                        Value::String("Add a source for the estimate.".into()),
+                    ),
+                    ("request".into(), Value::String(request.id.clone())),
+                ]),
+                evidence: vec![request.id],
+                expected_subject: None,
+                idempotency_key: Some("draft-feedback-1".into()),
+            })
+            .unwrap();
+        reconciler.reconcile_once().unwrap();
+        let retried = store.step_run(&step.subject).unwrap().unwrap();
+        assert_eq!(retried.attempt, 2);
+        assert_ne!(retried.status, "failed");
+        assert!(
+            retried
+                .goals
+                .iter()
+                .any(|goal| goal.contains("Add a source for the estimate."))
+        );
+        let messages = store.messages(Some(&claimant), false).unwrap();
+        assert_eq!(messages.len(), 1);
+        assert!(
+            messages[0]
+                .content
+                .contains("Add a source for the estimate.")
+        );
+        reconciler.reconcile_once().unwrap();
+        assert_eq!(store.messages(Some(&claimant), false).unwrap().len(), 1);
     }
 
     #[test]
