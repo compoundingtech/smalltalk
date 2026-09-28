@@ -7446,7 +7446,8 @@ impl<R: RuntimeControl> Reconciler<R> {
                     "skip" => next = current.saturating_add(1),
                     "all" => {
                         let remaining = current.saturating_sub(next).saturating_add(1);
-                        if remaining > spec.max_catch_up.unwrap_or(0) as u64 {
+                        let max = spec.max_catch_up.unwrap_or(0);
+                        if remaining > max as u64 {
                             self.record_once(
                                 &schedule.subject,
                                 "runtime.reconcile-decision",
@@ -7459,7 +7460,12 @@ impl<R: RuntimeControl> Reconciler<R> {
                                     ),
                                 ]),
                             )?;
-                            return Ok(());
+                            // The schedule holds instead of starting a burst of missed work. That
+                            // is a fault on the schedule, so it is seen rather than silently frozen.
+                            anyhow::bail!(
+                                "the missed occurrences exceed max-catch-up {max}; raise max-catch-up \
+                                 or choose catch-up \"latest\" or \"skip\""
+                            );
                         }
                     }
                     _ => return Ok(()),
@@ -7616,9 +7622,6 @@ impl<R: RuntimeControl> Reconciler<R> {
     /// for a lasting reason is failed so the schedule can fire again. A request that waits for
     /// something this host has not received yet stays pending, and the schedule records why.
     fn reconcile_schedule_work(&self, schedule: &DesiredSubject) -> Result<()> {
-        if intake_is_stopped(schedule, &self.host) {
-            return Ok(());
-        }
         // Every peer replicates the same requests. Only the host that requested the work starts it.
         let requests = self
             .store
@@ -7626,6 +7629,19 @@ impl<R: RuntimeControl> Reconciler<R> {
             .into_iter()
             .filter(|request| request.origin == self.host)
             .collect::<Vec<_>>();
+        // A stopped schedule's queued work is cancelled, so declaring the schedule again does not
+        // start work that was requested before it stopped.
+        if intake_is_stopped(schedule, &self.host) {
+            for request in requests {
+                self.fail_schedule_work(
+                    schedule,
+                    &request.id,
+                    "schedule-stopped",
+                    "the schedule stopped before this work started",
+                )?;
+            }
+            return Ok(());
+        }
         if requests.is_empty()
             || self
                 .store
@@ -8110,19 +8126,23 @@ impl<R: RuntimeControl> Reconciler<R> {
             return Ok(());
         };
         let observer_actual = self.store.latest_actual_value(&observer.subject)?;
-        if observer_actual.as_ref().is_some_and(|actual| {
-            actual.get("state").and_then(Value::as_str) == Some("degraded")
-                && actual.get("revision").and_then(Value::as_str) == Some(revision.as_str())
-                && actual
-                    .get("error_code")
-                    .and_then(Value::as_str)
-                    .is_some_and(permanent_observation_error)
-        }) {
-            return Ok(());
-        }
         let refresh_attempt = self
             .store
             .pending_observer_refresh_attempt(&observer.subject)?;
+        // A permanent error is not polled again on the same revision. A refresh request still
+        // polls it once, so the observer and its subscriptions can recover without a new revision.
+        if refresh_attempt.is_none()
+            && observer_actual.as_ref().is_some_and(|actual| {
+                actual.get("state").and_then(Value::as_str) == Some("degraded")
+                    && actual.get("revision").and_then(Value::as_str) == Some(revision.as_str())
+                    && actual
+                        .get("error_code")
+                        .and_then(Value::as_str)
+                        .is_some_and(permanent_observation_error)
+            })
+        {
+            return Ok(());
+        }
         let deadline_key = format!("{}:{revision}", observer.subject);
         let next_check = refresh_attempt
             .as_ref()
@@ -8247,6 +8267,15 @@ impl<R: RuntimeControl> Reconciler<R> {
                                 if let Some(attempt) = &refresh_attempt {
                                     fields.insert("attempt".into(), Value::String(attempt.clone()));
                                 }
+                                // A refresh that meets the same failure still records its
+                                // attempt, which serves the refresh request.
+                                let key = match &refresh_attempt {
+                                    Some(attempt) => format!(
+                                        "observer-rejected:{}:{attempt}",
+                                        &failure_hash[..20]
+                                    ),
+                                    None => format!("observer-rejected:{}", &failure_hash[..20]),
+                                };
                                 let _ = store.append_claim(&ClaimInput {
                                     subject: observer_subject.clone(),
                                     kind: "observer.state".into(),
@@ -8254,10 +8283,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                                     fields,
                                     evidence: Vec::new(),
                                     expected_subject: None,
-                                    idempotency_key: Some(format!(
-                                        "observer-rejected:{}",
-                                        &failure_hash[..20]
-                                    )),
+                                    idempotency_key: Some(key),
                                 });
                             }
                         }
@@ -14946,6 +14972,119 @@ mission "scheduled-cycle" state="ready" {
         );
     }
 
+    #[test]
+    fn a_stopped_schedule_cancels_its_queued_work() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        let revision = scheduled_mission_revision(&store);
+        let declared = format!(
+            r#"version 2
+ schedule "held" {{
+   every "1h"
+   anchor "2030-01-01T00:00:00Z"
+   work {{ mission "scheduled-cycle@{revision}"; workspace "/tmp/st3-schedule-test" }}
+ }}"#
+        );
+        apply_source(&store, &declared, "held-schedule");
+        let schedule_revision = store
+            .selected_desired_revision("schedule/held")
+            .unwrap()
+            .unwrap();
+        let request = store
+            .append_claim(&ClaimInput {
+                subject: "schedule/held".into(),
+                kind: "schedule.work-requested".into(),
+                actor: None,
+                fields: BTreeMap::from([
+                    ("revision".into(), Value::String(schedule_revision)),
+                    ("occurrence".into(), Value::from(0)),
+                    (
+                        "mission".into(),
+                        Value::String("mission/scheduled-cycle".into()),
+                    ),
+                    ("mission_revision".into(), Value::String(revision)),
+                    (
+                        "workspace".into(),
+                        Value::String("/tmp/st3-schedule-test".into()),
+                    ),
+                    ("inputs".into(), serde_json::json!({})),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+        apply_source(
+            &store,
+            "version 2\nschedule \"held\" { stop }\n",
+            "stop-held-schedule",
+        );
+        let reconciler = Reconciler::new(
+            store.clone(),
+            Arc::new(FakeRuntime::default()),
+            "node".into(),
+            Arc::new(Notify::new()),
+        );
+
+        reconciler.reconcile_once().unwrap();
+
+        let failed = store
+            .claims_for("schedule/held", Some("schedule.work-failed"))
+            .unwrap();
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0].body["fields"]["request"], request.id.as_str());
+        assert_eq!(failed[0].body["fields"]["code"], "schedule-stopped");
+
+        // Declared again, the schedule does not start the work queued before it stopped.
+        apply_source(&store, &declared, "held-schedule-again");
+        reconciler.reconcile_once().unwrap();
+        assert!(
+            store
+                .claims_for("schedule/held", Some("schedule.work-started"))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn all_catch_up_beyond_its_maximum_holds_with_a_fault_on_the_schedule() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        let revision = scheduled_mission_revision(&store);
+        let anchor = (Utc::now() - chrono::Duration::seconds(10))
+            .to_rfc3339_opts(SecondsFormat::Millis, true);
+        let source = format!(
+            r#"version 2
+ schedule "burst" {{
+   every "1s"
+   anchor "{anchor}"
+   catch-up "all"
+   max-catch-up 3
+   work {{ mission "scheduled-cycle@{revision}"; workspace "/tmp/st3-schedule-test" }}
+ }}"#
+        );
+        apply_source(&store, &source, "burst-schedule");
+        let reconciler = Reconciler::new(
+            store.clone(),
+            Arc::new(FakeRuntime::default()),
+            "node".into(),
+            Arc::new(Notify::new()),
+        )
+        .tolerating_faults();
+
+        reconciler.reconcile_once().unwrap();
+
+        let fault = store
+            .reconcile_fault("schedule/burst", "schedule")
+            .unwrap()
+            .expect("the held schedule recorded no fault");
+        assert!(fault.contains("max-catch-up 3"), "{fault}");
+        assert!(
+            store
+                .claims_for("schedule/burst", Some("schedule.occurrence-scheduled"))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
     #[tokio::test]
     async fn latest_catch_up_starts_only_the_current_missed_occurrence() {
         let store = Arc::new(Store::open_memory("node").unwrap());
@@ -17958,6 +18097,40 @@ observer "repo" {
         );
         reconciler.reconcile_once().unwrap();
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        // A refresh request still polls the paused observer, once.
+        let revision = store
+            .selected_desired_revision("observer/repo")
+            .unwrap()
+            .unwrap();
+        store
+            .append_claim(&ClaimInput {
+                subject: "observer/repo".into(),
+                kind: "observer.refresh-requested".into(),
+                actor: Some("person/test".into()),
+                fields: BTreeMap::from([
+                    ("revision".into(), Value::String(revision)),
+                    ("attempt".into(), Value::String("refresh-1".into())),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+        reconciler.reconcile_once().unwrap();
+        tokio::time::timeout(Duration::from_secs(1), event_changed.changed())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            store
+                .pending_observer_refresh_attempt("observer/repo")
+                .unwrap(),
+            None
+        );
+        reconciler.reconcile_once().unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
     struct RateLimitedResourceProvider {
