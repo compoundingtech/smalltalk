@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use st3_client::{
     Agent, Attention, Client, ClientError, Device, Envelope, ErrorCode, EventPage, EventType,
     Fence, Launch, Machine, Message, Mission, Page, Resource, Runtime, Session, Snapshot,
-    TimelineBody, TimelineEntry, TimelineRole, Work,
+    SyncNotice, TimelineBody, TimelineEntry, TimelineRole, Work,
 };
 
 /// Each collection is deliberately capped. The UI shows a truncation marker when a cap is hit.
@@ -17,6 +17,9 @@ pub struct Collection {
     pub items: Vec<Resource>,
     pub snapshot: Option<Snapshot>,
     pub truncated: bool,
+    /// Present while the host was catching up with a peer when it served this collection.
+    #[serde(default)]
+    pub sync: Option<SyncNotice>,
 }
 
 impl Collection {
@@ -51,6 +54,7 @@ pub struct Model {
     pub runtimes: Collection,
     pub machines: Collection,
     pub devices: Collection,
+    pub tree: crate::tree::MissionsTree,
     pub timeline: Vec<TimelineEntry>,
     pub timeline_truncated: bool,
     pub event_cursor: String,
@@ -59,6 +63,8 @@ pub struct Model {
     recent_events: VecDeque<String>,
     #[serde(skip)]
     pending_refresh: BTreeSet<Kind>,
+    #[serde(skip)]
+    pending_tree_refresh: bool,
     #[serde(skip)]
     last_observation_refresh: Option<std::time::Instant>,
     #[serde(skip)]
@@ -77,14 +83,16 @@ impl Model {
             actor: capabilities.session_actor,
             ..Self::default()
         };
-        let (now, agents, sessions) = tokio::try_join!(
+        let (now, agents, sessions, tree) = tokio::try_join!(
             read_pages(client, Kind::Now),
             read_pages(client, Kind::Agents),
             read_pages(client, Kind::Sessions),
+            read_tree(client),
         )?;
         model.now = now;
         model.agents = agents;
         model.sessions = sessions;
+        model.tree = tree;
         model.status = "Connected · loading details…".into();
         Ok(model)
     }
@@ -132,6 +140,7 @@ impl Model {
                 self.timeline.clear();
                 self.recent_events.clear();
                 self.reload(client).await?;
+                self.tree = read_tree(client).await?;
                 self.status = "Resynchronized after cursor gap".into();
                 return Ok((true, Vec::new(), true));
             }
@@ -207,10 +216,25 @@ impl Model {
                 Kind::NativeSessions => unreachable!("native discovery has its own refresh"),
             }
         }
+        if self.pending_tree_refresh {
+            self.tree = read_tree(client).await?;
+            self.pending_tree_refresh = false;
+        }
         Ok(())
     }
 
     /// Native harnesses may start outside st3, so no graph event announces them.
+    /// While the host catches up, its notice changes with every exchange, but few projection
+    /// events name a collection on screen. Re-read Now for a current notice, and reload every
+    /// collection once the host has caught up so none keeps showing early history.
+    pub async fn refresh_sync_notice(&mut self, client: &Client) -> Result<()> {
+        self.now = read_pages(client, Kind::Now).await?;
+        if self.sync_notice().is_none() {
+            self.reload(client).await?;
+        }
+        Ok(())
+    }
+
     pub async fn refresh_sessions(&mut self, client: &Client) -> Result<bool> {
         let native = read_pages(client, Kind::NativeSessions).await?;
         let mut next = self.sessions.clone();
@@ -256,6 +280,7 @@ impl Model {
             }
             if matches!(event.event_type, EventType::CapabilitiesChanged) {
                 self.pending_refresh.extend(Kind::ALL);
+                self.pending_tree_refresh = true;
             } else if matches!(event.event_type, EventType::TerminalAvailable) {
                 self.pending_refresh.insert(Kind::Runtimes);
             } else if matches!(
@@ -268,10 +293,12 @@ impl Model {
                             == Some("session-timeline-invalidated"))
                     {
                         self.pending_refresh.extend(Kind::for_resource(id));
+                        self.pending_tree_refresh |= tree_resource(id);
                     }
                 }
+                self.pending_tree_refresh |= change == Some("agent.queue.moved");
             }
-            changed = !self.pending_refresh.is_empty();
+            changed = !self.pending_refresh.is_empty() || self.pending_tree_refresh;
             if event.body.get("reason").and_then(serde_json::Value::as_str)
                 == Some("session-timeline-invalidated")
             {
@@ -359,8 +386,31 @@ impl Model {
             items: value.items,
             snapshot: Some(snapshot),
             truncated: value.page.has_more,
+            sync: value.sync,
         };
         Ok(())
+    }
+
+    /// The sync notice from the most recently served collection. An older collection that has
+    /// not reloaded since the host caught up must not keep the notice alive.
+    pub fn sync_notice(&self) -> Option<&SyncNotice> {
+        // Now comes last so it wins a tie: it is the collection re-read while syncing.
+        [
+            &self.messages,
+            &self.launches,
+            &self.missions,
+            &self.work,
+            &self.agents,
+            &self.sessions,
+            &self.runtimes,
+            &self.machines,
+            &self.devices,
+            &self.now,
+        ]
+        .into_iter()
+        .filter_map(|collection| Some((collection.snapshot.as_ref()?.store_index, collection)))
+        .max_by_key(|(store_index, _)| *store_index)
+        .and_then(|(_, collection)| collection.sync.as_ref())
     }
 
     pub fn attention(&self) -> impl Iterator<Item = &Attention> {
@@ -485,6 +535,23 @@ impl Kind {
             &[]
         }
     }
+}
+
+fn tree_resource(id: &str) -> bool {
+    [
+        "mission/",
+        "mission-run/",
+        "step-run/",
+        "agent/",
+        "runtime/",
+        "host/",
+    ]
+    .iter()
+    .any(|prefix| id.starts_with(prefix))
+}
+
+async fn read_tree(client: &Client) -> Result<crate::tree::MissionsTree> {
+    crate::tree::MissionsTree::from_response(client.missions_tree().await?)
 }
 
 async fn read_pages(client: &Client, kind: Kind) -> Result<Collection> {
@@ -625,6 +692,7 @@ async fn read_pages_once_inner(
             }
         };
         result.snapshot = Some(snapshot);
+        result.sync = value.sync;
         result.items.extend(value.items);
         if !value.page.has_more {
             return Ok(result);
@@ -867,6 +935,50 @@ fn markdown_like(input: &str) -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn mission_and_queue_events_invalidate_tree_without_a_timer() {
+        let mut model = Model::default();
+        let event = |id: &str, subject: &str, change: &str| st3_client::ProjectionEvent {
+            id: id.into(),
+            epoch: "epoch/one".into(),
+            sequence: 1,
+            previous_cursor: "cursor/one".into(),
+            next_cursor: format!("cursor/{id}"),
+            timestamp: "2026-09-28T10:00:00Z".into(),
+            event_type: EventType::Upsert,
+            resource_ids: vec![subject.into()],
+            snapshot_id: "snapshot/one".into(),
+            body: serde_json::json!({"change": change}),
+        };
+        let page = |item| EventPage {
+            kind: "events".into(),
+            oldest_cursor: "cursor/one".into(),
+            resume_cursor: "cursor/end".into(),
+            items: vec![item],
+            has_more: false,
+        };
+        assert!(
+            !model
+                .consume_events(page(event("one", "unknown/one", "custom.other")))
+                .0
+        );
+        assert!(!model.pending_tree_refresh);
+        assert!(
+            model
+                .consume_events(page(event("two", "mission/atlas", "mission.started")))
+                .0
+        );
+        assert!(model.pending_tree_refresh);
+        model.pending_tree_refresh = false;
+        model.pending_refresh.clear();
+        assert!(
+            model
+                .consume_events(page(event("three", "agent/orbit", "agent.queue.moved")))
+                .0
+        );
+        assert!(model.pending_tree_refresh);
+    }
+
     fn work_resource(id: &str, state: &str, layer: &str) -> Resource {
         serde_json::from_value(serde_json::json!({
             "kind":"work", "id":id, "revision":"one", "updated_at":"2026-09-25T08:00:00Z",
@@ -1072,6 +1184,7 @@ mod tests {
                 created_at: "2026-09-20T11:00:00Z".into(),
             }),
             truncated: false,
+            sync: None,
         };
         let fence = collection.fence("attention/one").unwrap();
         assert_eq!(fence.snapshot_id, "snapshot/one");

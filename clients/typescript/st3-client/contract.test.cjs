@@ -80,6 +80,65 @@ test('completes pairing with either canonical or bare pairing ID', async () => {
     assert.ok(calls.every(call => call.init.method === 'POST'));
 });
 
+test('follows terminal screens until the server ends the stream with its error', async () => {
+    const screenFixture = require('../../../docs/st3/client-v0/fixtures/terminal-screen.json');
+    const changedFixture = require('../../../docs/st3/client-v0/fixtures/terminal-screen-changed.json');
+    const staleFixture = require('../../../docs/st3/client-v0/fixtures/terminal-stale-fence-error.json');
+    const opened = [];
+    const socket = { onmessage: null, onclose: null, onerror: null, closed: [], close(code) { this.closed.push(code); } };
+    const client = new St3Client({ baseUrl: 'https://example.test/', credential: () => 'secret', fetchImpl: async () => { throw new Error('no HTTP'); } });
+    const screens = [];
+    let ended;
+    await client.terminalStream('terminal/release-shell', {
+        streamCapability: 'capability-proof',
+        incarnation: 'pty-4:2026-09-20T11:10:00Z',
+        onScreen: screen => screens.push(screen),
+        onEnd: error => { ended = error ?? null; },
+        socket: (url, protocols, headers) => { opened.push({ url, protocols, headers }); return socket; },
+    });
+    assert.deepEqual(opened, [{
+        url: 'wss://example.test/v1/client/terminals/terminal%2Frelease-shell/stream?incarnation=pty-4%3A2026-09-20T11%3A10%3A00Z',
+        protocols: ['st3.client.terminal.v0', 'st3.cap.capability-proof'],
+        headers: { Authorization: 'Bearer secret' },
+    }]);
+    socket.onmessage({ data: JSON.stringify(screenFixture) });
+    socket.onmessage({ data: JSON.stringify(changedFixture) });
+    assert.deepEqual(screens.map(screen => screen.value.revision), [screenFixture.value.revision, changedFixture.value.revision]);
+    assert.equal(ended, undefined);
+    socket.onmessage({ data: JSON.stringify(staleFixture) });
+    assert.ok(ended instanceof ClientError);
+    assert.equal(ended.response.code, 'stale-fence');
+    assert.deepEqual(socket.closed, [1000]);
+    assert.equal(socket.onmessage, null);
+});
+
+test('a normal close ends the terminal stream without an error', async () => {
+    const socket = { onmessage: null, onclose: null, onerror: null, close() {} };
+    const client = new St3Client({ baseUrl: 'http://100.64.0.1:7777', fetchImpl: async () => { throw new Error('no HTTP'); } });
+    const ends = [];
+    const stream = await client.terminalStream('terminal/release-shell', { streamCapability: 'c', onScreen: () => {}, onEnd: error => ends.push(error), socket: url => { assert.ok(url.startsWith('ws://100.64.0.1:7777/')); return socket; } });
+    socket.onclose({ code: 1000, reason: '' });
+    stream.close();
+    assert.deepEqual(ends, [undefined]);
+});
+
+test('conversation stream opens at a cursor and delivers bounded changes', async () => {
+    const socket = { onmessage: null, onclose: null, onerror: null, close() {} };
+    const opened = [];
+    const received = [];
+    const client = new St3Client({ baseUrl: 'https://example.test', credential: () => 'secret', fetchImpl: async () => { throw new Error('no HTTP'); } });
+    const stream = await client.conversationStream('session/example', {
+        after: 'conversation-cursor/owner/example/1.2.3',
+        onChange: change => received.push(change.value),
+        socket: (url, protocols, headers) => { opened.push({ url, protocols, headers }); return socket; },
+    });
+    assert.deepEqual(opened, [{ url: 'wss://example.test/v1/client/conversations/example/stream?after=conversation-cursor%2Fowner%2Fexample%2F1.2.3', protocols: ['st3.client.conversation.v0'], headers: { Authorization: 'Bearer secret' } }]);
+    const change = { kind: 'conversation-changes', session_id: 'session/example', items: [{ id: 'timeline-entry/example', sequence: 4, revision: 1, timestamp: snapshot.created_at, role: 'assistant', type: 'content', final: true, body: { media_type: 'text/plain', text: 'reply' } }], next_cursor: 'conversation-cursor/owner/example/1.3.3' };
+    socket.onmessage({ data: JSON.stringify(envelope(change)) });
+    assert.deepEqual(received, [change]);
+    stream.close();
+});
+
 test('generated hash uses normative schema and operations bytes', () => {
     const crypto = require('node:crypto');
     const root = path.join(__dirname, '../../..');

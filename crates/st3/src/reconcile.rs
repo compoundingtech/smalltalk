@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
+use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -43,6 +44,12 @@ const CLAUDE_TRUST_RECOVERY_ATTEMPTS: usize = 3;
 const CLAUDE_TRUST_RECOVERY_WINDOW_MS: u128 = 10 * 60_000;
 // A failed checkout fetch or worktree command waits this long before Git runs again.
 const CHECKOUT_RETRY_MS: u128 = 30_000;
+const DECLARED_CHECKOUT_LIMIT: usize = 4096;
+
+#[cfg(test)]
+thread_local! {
+    static DECLARATION_PARSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
 /// The screen line on which Claude asks for /login. Claude prints the prompt as its own line,
 /// at most after a status glyph, so a line that only quotes the phrase, such as source code or
@@ -129,6 +136,12 @@ impl NativeRuntime {
             exec: st_runtime::ExecRuntime::new(state_dir.join("exec"), state_dir.join("logs")),
         }
     }
+    fn pty(&self) -> Result<st_runtime::PtyRuntime> {
+        Ok(self
+            .pty
+            .clone()
+            .with_environment(crate::environment::snapshot()?))
+    }
 }
 
 fn observed_pty_status(observation: &st_runtime::PtyObservation) -> String {
@@ -158,7 +171,7 @@ fn local_process_is_alive(_pid: u32) -> bool {
 
 impl RuntimeControl for NativeRuntime {
     fn snapshot_ptys(&self) -> Result<Vec<RuntimeObservation>> {
-        self.pty
+        self.pty()?
             .snapshot()?
             .into_iter()
             .map(|item| {
@@ -209,7 +222,11 @@ impl RuntimeControl for NativeRuntime {
 
     fn start(&self, member: &MemberSpec) -> Result<()> {
         let executable = launch_executable()?;
-        let environment = st_runtime::materialize_environment(&member.environment, &executable)?;
+        let environment = st_runtime::overlay_environment(
+            crate::environment::snapshot()?,
+            &member.environment,
+            &executable,
+        )?;
         let mut launch = st_runtime::Launch::from(&member.launch);
         match &mut launch {
             st_runtime::Launch::Shell(source) => {
@@ -221,10 +238,31 @@ impl RuntimeControl for NativeRuntime {
                 }
             }
         }
+        // Resolve before crossing the PTY/isolation boundary; service-manager PATH is
+        // unrelated to the environment captured from the account's login shell.
+        match &mut launch {
+            st_runtime::Launch::Shell(source) => {
+                launch = st_runtime::Launch::Argv(vec![
+                    st_runtime::resolve_executable("sh", &environment)?
+                        .to_string_lossy()
+                        .into_owned(),
+                    "-c".into(),
+                    source.clone(),
+                ]);
+            }
+            st_runtime::Launch::Argv(argv) => {
+                let program = argv
+                    .first_mut()
+                    .context("an argv launch must contain a program")?;
+                *program = st_runtime::resolve_executable(program, &environment)?
+                    .to_string_lossy()
+                    .into_owned();
+            }
+        }
         let cwd = PathBuf::from(&member.cwd);
         if member.terminal {
             let pty_binary = st_runtime::resolve_executable("pty", &environment)?;
-            self.pty
+            self.pty()?
                 .clone()
                 .with_binary(pty_binary.to_string_lossy())
                 .spawn(
@@ -249,7 +287,7 @@ impl RuntimeControl for NativeRuntime {
         expected_incarnation: Option<&str>,
     ) -> Result<()> {
         if terminal {
-            self.pty.stop_if(runtime_id, expected_incarnation)
+            self.pty()?.stop_if(runtime_id, expected_incarnation)
         } else {
             self.exec.stop_if(runtime_id, expected_incarnation)
         }
@@ -262,7 +300,7 @@ impl RuntimeControl for NativeRuntime {
         expected_incarnation: Option<&str>,
     ) -> Result<()> {
         if terminal {
-            self.pty.kill_if(runtime_id, expected_incarnation)
+            self.pty()?.kill_if(runtime_id, expected_incarnation)
         } else {
             self.exec.kill_if(runtime_id, expected_incarnation)
         }
@@ -271,12 +309,12 @@ impl RuntimeControl for NativeRuntime {
     fn remove(&self, runtime_id: &str, terminal: bool) -> Result<()> {
         if terminal {
             if self
-                .pty
+                .pty()?
                 .snapshot()?
                 .iter()
                 .any(|item| item.name == runtime_id)
             {
-                self.pty.remove(runtime_id)
+                self.pty()?.remove(runtime_id)
             } else {
                 Ok(())
             }
@@ -286,20 +324,29 @@ impl RuntimeControl for NativeRuntime {
     }
 
     fn attach(&self, runtime_id: &str) -> Result<()> {
-        self.pty.attach(runtime_id)
+        self.pty()?.attach(runtime_id)
     }
 
     fn screen(&self, runtime_id: &str) -> Result<String> {
-        self.pty.screen(runtime_id)
+        self.pty()?.screen(runtime_id)
     }
 
     fn send_key(&self, runtime_id: &str, key: &str) -> Result<()> {
-        self.pty.send_key(runtime_id, key)
+        self.pty()?.send_key(runtime_id, key)
     }
 
     fn read_exec_log(&self, runtime_id: &str) -> Result<Option<String>> {
         self.exec.read_log(runtime_id)
     }
+}
+
+/// A test hook that fails one item of a reconcile pass where the reconciler takes it up.
+///
+/// `fault(scope, subject)` returns the error that item should fail with, or panics to fail it
+/// with a panic. The daemon never installs one; fault-isolation tests use it to fail each kind of
+/// item on its own.
+pub trait FaultInjection: Send + Sync + 'static {
+    fn fault(&self, scope: &str, subject: &str) -> Option<String>;
 }
 
 pub struct Reconciler<R = NativeRuntime> {
@@ -318,6 +365,9 @@ pub struct Reconciler<R = NativeRuntime> {
     delayed_restarts: Arc<Mutex<HashMap<String, u128>>>,
     /// When a failed `checkout` may run Git again, and why it failed, by agent subject.
     checkout_retries: Arc<Mutex<HashMap<String, (u128, String)>>>,
+    /// The last agent declaration's run-end checkout and workspace, by subject, with the store
+    /// index of the subject's newest declaration it was read from.
+    declared_checkouts: Mutex<HashMap<String, (u64, Option<(Checkout, String)>)>>,
     materialized_mission_generations: Mutex<BTreeSet<String>>,
     retired_predecessor_generations: Mutex<BTreeSet<String>>,
     #[cfg(test)]
@@ -326,6 +376,15 @@ pub struct Reconciler<R = NativeRuntime> {
     file_watchers_used: Arc<Mutex<HashSet<String>>>,
     file_observations: Arc<Mutex<HashMap<String, FileStamp>>>,
     resource_provider: Arc<dyn ResourceProvider>,
+    /// Open faults by subject and scope, loaded from the graph on first use.
+    faults: Mutex<Option<BTreeMap<(String, String), String>>>,
+    /// Faults that could not be recorded in the graph during the current pass.
+    unrecorded_faults: Mutex<Vec<String>>,
+    fault_injection: Option<Arc<dyn FaultInjection>>,
+    /// Unit tests fail a pass that raises a fault unless they opt in, so an isolated error
+    /// cannot hide inside a test that expects a clean pass.
+    #[cfg(test)]
+    raised_faults: Mutex<Option<Vec<String>>>,
 }
 
 #[derive(Clone, Eq, PartialEq)]
@@ -392,6 +451,7 @@ impl Reconciler<NativeRuntime> {
             observer_cursors: Arc::new(Mutex::new(HashMap::new())),
             delayed_restarts: Arc::new(Mutex::new(HashMap::new())),
             checkout_retries: Arc::new(Mutex::new(HashMap::new())),
+            declared_checkouts: Mutex::new(HashMap::new()),
             materialized_mission_generations: Mutex::new(BTreeSet::new()),
             retired_predecessor_generations: Mutex::new(BTreeSet::new()),
             #[cfg(test)]
@@ -400,6 +460,11 @@ impl Reconciler<NativeRuntime> {
             file_watchers_used: Arc::new(Mutex::new(HashSet::new())),
             file_observations: Arc::new(Mutex::new(HashMap::new())),
             resource_provider: Arc::new(RegisteredResourceProvider),
+            faults: Mutex::new(None),
+            unrecorded_faults: Mutex::new(Vec::new()),
+            fault_injection: None,
+            #[cfg(test)]
+            raised_faults: Mutex::new(Some(Vec::new())),
         })
     }
 }
@@ -421,6 +486,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             observer_cursors: Arc::new(Mutex::new(HashMap::new())),
             delayed_restarts: Arc::new(Mutex::new(HashMap::new())),
             checkout_retries: Arc::new(Mutex::new(HashMap::new())),
+            declared_checkouts: Mutex::new(HashMap::new()),
             materialized_mission_generations: Mutex::new(BTreeSet::new()),
             retired_predecessor_generations: Mutex::new(BTreeSet::new()),
             #[cfg(test)]
@@ -429,7 +495,25 @@ impl<R: RuntimeControl> Reconciler<R> {
             file_watchers_used: Arc::new(Mutex::new(HashSet::new())),
             file_observations: Arc::new(Mutex::new(HashMap::new())),
             resource_provider: Arc::new(RegisteredResourceProvider),
+            faults: Mutex::new(None),
+            unrecorded_faults: Mutex::new(Vec::new()),
+            fault_injection: None,
+            #[cfg(test)]
+            raised_faults: Mutex::new(Some(Vec::new())),
         }
+    }
+
+    #[doc(hidden)]
+    pub fn with_fault_injection(mut self, injection: Arc<dyn FaultInjection>) -> Self {
+        self.fault_injection = Some(injection);
+        self
+    }
+
+    /// Let passes raise faults, for a unit test of fault isolation itself.
+    #[cfg(test)]
+    fn tolerating_faults(self) -> Self {
+        *self.raised_faults.lock().unwrap() = None;
+        self
     }
 
     #[cfg(test)]
@@ -446,11 +530,12 @@ impl<R: RuntimeControl> Reconciler<R> {
 
     pub async fn run(self: Arc<Self>) {
         self.notify.notify_one();
-        let mut unchanged = false;
+        // When the last pass began, and whether it changed nothing.
+        let mut quiet_pass_started = None;
         loop {
             match self.next_reconcile_deadline() {
                 Ok(Some(deadline)) => {
-                    let delay = deadline_sleep_ms(deadline, now_ms(), unchanged);
+                    let delay = deadline_sleep_ms(deadline, now_ms(), quiet_pass_started);
                     tokio::select! {
                         _ = self.notify.notified() => {}
                         _ = tokio::time::sleep(Duration::from_millis(delay)) => {}
@@ -472,6 +557,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                 }
             }
             for pass in 0..64 {
+                let started = now_ms();
                 let before = self.store.index().ok();
                 if let Err(error) = self.reconcile_once() {
                     let _ = self.record_once(
@@ -488,7 +574,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                 self.event_notify
                     .send_modify(|generation| *generation = generation.saturating_add(1));
                 let changed = before != self.store.index().ok();
-                unchanged = !changed;
+                quiet_pass_started = (!changed).then_some(started);
                 if !changed {
                     break;
                 }
@@ -501,8 +587,134 @@ impl<R: RuntimeControl> Reconciler<R> {
         }
     }
 
+    /// Run the reconciler and start it again if it panics. A panic ends only the task, so without
+    /// this the daemon would keep serving its API with nothing reconciling the host.
+    pub async fn supervise(self: Arc<Self>) {
+        let mut delay = Duration::from_secs(1);
+        loop {
+            let started = std::time::Instant::now();
+            let Err(error) = tokio::spawn(self.clone().run()).await else {
+                return;
+            };
+            if !error.is_panic() {
+                return;
+            }
+            let reason = panic_message(error.into_panic().as_ref());
+            let _ = self.record_once(
+                &format!("daemon/{}", self.host),
+                "daemon.diagnostic",
+                BTreeMap::from([
+                    ("severity".into(), Value::String("error".into())),
+                    ("code".into(), Value::String("reconciler-panicked".into())),
+                    ("status".into(), Value::String("restarting".into())),
+                    ("reason".into(), Value::String(reason)),
+                ]),
+            );
+            if started.elapsed() > Duration::from_secs(60) {
+                delay = Duration::from_secs(1);
+            }
+            tokio::time::sleep(delay).await;
+            delay = (delay * 2).min(Duration::from_secs(30));
+        }
+    }
+
     fn signal_changed(&self) {
         signal_changed(&self.notify, &self.event_notify);
+    }
+
+    /// Reconcile one item of the pass on its own. An error or a panic is recorded as a fault on
+    /// `subject` in `scope`, and the pass carries on with every other item. The next success
+    /// records the item's recovery.
+    fn isolate<T>(
+        &self,
+        scope: &str,
+        subject: &str,
+        item: impl FnOnce() -> Result<T>,
+    ) -> Option<T> {
+        let result = caught(|| {
+            if let Some(reason) = self
+                .fault_injection
+                .as_ref()
+                .and_then(|injection| injection.fault(scope, subject))
+            {
+                anyhow::bail!(reason);
+            }
+            item()
+        });
+        let (value, outcome) = match result {
+            Ok(value) => (Some(value), Ok(())),
+            Err(error) => (None, Err(error)),
+        };
+        #[cfg(test)]
+        if let (Err(error), Some(raised)) = (&outcome, self.raised_faults.lock().unwrap().as_mut())
+        {
+            raised.push(format!("{subject} {scope}: {error:#}"));
+        }
+        if let Err(error) = self.record_fault(subject, scope, outcome) {
+            self.unrecorded_faults
+                .lock()
+                .expect("unrecorded fault mutex poisoned")
+                .push(format!("{subject} {scope}: {error:#}"));
+        }
+        value
+    }
+
+    /// Record a fault when it first appears or its cause changes, and its recovery once.
+    fn record_fault(&self, subject: &str, scope: &str, outcome: Result<()>) -> Result<()> {
+        match outcome {
+            Err(error) => {
+                let reason = format!("{error:#}");
+                let mut faults = self.open_faults()?;
+                let open = faults.get_or_insert_with(BTreeMap::new);
+                let key = (subject.to_owned(), scope.to_owned());
+                if open.get(&key) == Some(&reason) {
+                    return Ok(());
+                }
+                self.append_fault(subject, scope, "faulted", &reason)?;
+                open.insert(key, reason);
+                Ok(())
+            }
+            Ok(()) => self.close_fault(subject, scope, "the item reconciled successfully"),
+        }
+    }
+
+    fn close_fault(&self, subject: &str, scope: &str, reason: &str) -> Result<()> {
+        let mut faults = self.open_faults()?;
+        let open = faults.get_or_insert_with(BTreeMap::new);
+        let key = (subject.to_owned(), scope.to_owned());
+        if !open.contains_key(&key) {
+            return Ok(());
+        }
+        self.append_fault(subject, scope, "recovered", reason)?;
+        open.remove(&key);
+        Ok(())
+    }
+
+    fn open_faults(
+        &self,
+    ) -> Result<std::sync::MutexGuard<'_, Option<BTreeMap<(String, String), String>>>> {
+        let mut faults = self.faults.lock().expect("fault mutex poisoned");
+        if faults.is_none() {
+            *faults = Some(self.store.open_reconcile_faults(&self.host)?);
+        }
+        Ok(faults)
+    }
+
+    fn append_fault(&self, subject: &str, scope: &str, status: &str, reason: &str) -> Result<()> {
+        self.store.append_claim(&ClaimInput {
+            subject: subject.into(),
+            kind: "reconcile.fault".into(),
+            actor: None,
+            fields: BTreeMap::from([
+                ("scope".into(), Value::String(scope.into())),
+                ("status".into(), Value::String(status.into())),
+                ("reason".into(), Value::String(reason.into())),
+            ]),
+            evidence: Vec::new(),
+            expected_subject: None,
+            idempotency_key: None,
+        })?;
+        Ok(())
     }
 
     fn next_reconcile_deadline(&self) -> Result<Option<u128>> {
@@ -729,7 +941,30 @@ impl<R: RuntimeControl> Reconciler<R> {
             .copied()
             .filter(|subject| !member_errors.contains_key(&subject.subject))
             .collect::<Vec<_>>();
-        for (subject, result) in crate::render::apply_all(&self.store, &renderable, &self.host) {
+        // A render panic faults this host's members; stops never render, so they still run.
+        let rendered = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            crate::render::apply_all(&self.store, &renderable, &self.host)
+        }))
+        .unwrap_or_else(|panic| {
+            let reason = panic_message(panic.as_ref());
+            renderable
+                .iter()
+                .filter(|subject| {
+                    subject.kind != "stop"
+                        && subject
+                            .member
+                            .as_ref()
+                            .is_some_and(|member| member.host == self.host)
+                })
+                .map(|subject| {
+                    (
+                        subject.subject.clone(),
+                        Err(anyhow::anyhow!("render panicked: {reason}")),
+                    )
+                })
+                .collect()
+        });
+        for (subject, result) in rendered {
             let result = result.and_then(|result| {
                 for warning in result.warnings {
                     self.record_once(
@@ -788,7 +1023,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                     continue;
                 }
             }
-            let result = (|| -> Result<()> {
+            let result = caught(|| -> Result<()> {
                 if let Some(error) = member_errors.remove(&subject.subject) {
                     return Err(error);
                 }
@@ -916,7 +1151,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                     }
                 }
                 Ok(())
-            })();
+            });
             // A running agent's member pass also includes deferred work delivery.
             let deferred = result.is_ok()
                 && work_message_agents
@@ -928,50 +1163,83 @@ impl<R: RuntimeControl> Reconciler<R> {
                 diagnostic_errors.push(format!("{}: {error:#}", subject.subject));
             }
         }
+        // Each later stage runs on its own. A stage that fails records a fault on this daemon and
+        // the stages after it still run, so no intake item can hold back mission evaluation, run
+        // cleanup, or work delivery on this host.
+        let daemon = format!("daemon/{}", self.host);
         // Intake left by a terminal owner or a superseded generation must not observe, deliver,
         // or start work. A stopped declaration still runs so it can settle its own state.
-        let retired_intake = self.store.retired_owned_intake_subjects()?;
-        let intake = desired
-            .iter()
-            .filter(|subject| {
-                matches!(
-                    subject.kind.as_str(),
-                    "observer" | "subscription" | "schedule"
-                )
-            })
-            .filter(|subject| {
-                !retired_intake.contains(&subject.subject) || intake_is_stopped(subject, &self.host)
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        self.reconcile_resource_observers(&intake)?;
-        self.reconcile_schedules(&intake)?;
-        self.reconcile_scheduled_work(&intake)?;
-        self.reconcile_subscription_missions(&intake)?;
-        self.reconcile_provider_capacity_retries(&desired)?;
-        self.resolve_attention_for_retired_agents(&desired)?;
+        let intake = self.isolate("stage/intake", &daemon, || {
+            let retired_intake = self.store.retired_owned_intake_subjects()?;
+            Ok(desired
+                .iter()
+                .filter(|subject| {
+                    matches!(
+                        subject.kind.as_str(),
+                        "observer" | "subscription" | "schedule"
+                    )
+                })
+                .filter(|subject| {
+                    !retired_intake.contains(&subject.subject)
+                        || intake_is_stopped(subject, &self.host)
+                })
+                .cloned()
+                .collect::<Vec<_>>())
+        });
+        if let Some(intake) = intake {
+            self.isolate("stage/observers", &daemon, || {
+                self.reconcile_resource_observers(&intake)
+            });
+            self.isolate("stage/schedules", &daemon, || {
+                self.reconcile_schedules(&intake)
+            });
+            self.isolate("stage/scheduled-work", &daemon, || {
+                self.reconcile_scheduled_work(&intake)
+            });
+            self.isolate("stage/subscriptions", &daemon, || {
+                self.reconcile_subscription_missions(&intake)
+            });
+        }
+        self.isolate("stage/provider-capacity-retries", &daemon, || {
+            self.reconcile_provider_capacity_retries(&desired)
+        });
+        self.isolate("stage/retired-agent-attention", &daemon, || {
+            self.resolve_attention_for_retired_agents(&desired)
+        });
         self.file_watchers_used
             .lock()
             .expect("file watcher mutex poisoned")
             .clear();
-        let mission_result = self.evaluate_mission_runs();
+        self.isolate("stage/missions", &daemon, || self.evaluate_mission_runs());
         self.release_unused_file_watchers();
-        mission_result?;
-        self.resolve_attention_whose_until_holds()?;
+        self.isolate("stage/attention-until", &daemon, || {
+            self.resolve_attention_whose_until_holds()
+        });
         // Mission state is the primary control-plane projection. Evaluate it before
         // wake-message bookkeeping so a large mailbox or work history cannot starve
         // newly-created runs of their first readiness pass.
         for (agent, incarnation) in work_message_agents {
-            let result = self.reconcile_work_messages(&agent, &incarnation);
+            let result = caught(|| self.reconcile_work_messages(&agent, &incarnation));
             if let Err(error) = self.record_member_reconcile_result(&agent, result) {
                 diagnostic_errors.push(format!("{agent}: {error:#}"));
             }
         }
+        diagnostic_errors.append(
+            &mut self
+                .unrecorded_faults
+                .lock()
+                .expect("unrecorded fault mutex poisoned"),
+        );
         anyhow::ensure!(
             diagnostic_errors.is_empty(),
             "record member faults: {}",
             diagnostic_errors.join("; ")
         );
+        #[cfg(test)]
+        if let Some(raised) = self.raised_faults.lock().unwrap().as_mut() {
+            let raised = std::mem::take(raised);
+            anyhow::ensure!(raised.is_empty(), "reconcile faults: {}", raised.join("; "));
+        }
         Ok(())
     }
 
@@ -1479,7 +1747,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                     ("severity".into(), Value::String("error".into())),
                     ("status".into(), Value::String("blocked".into())),
                     ("code".into(), Value::String("provider-trust-prompt".into())),
-                    ("reason".into(), Value::String("Claude is waiting at its workspace trust prompt and cannot accept work; st3 replaces this incarnation so its driver admits the workspace again".into())),
+                    ("reason".into(), Value::String("Claude is waiting at its workspace trust prompt and cannot accept work; st replaces this incarnation so its driver admits the workspace again".into())),
                     ("incarnation_id".into(), Value::String(incarnation.into())),
                 ]),
                 evidence: vec![runtime_claim.id],
@@ -1511,7 +1779,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                         reviewer: "person/operator".into(),
                         title: "Claude keeps stopping at its workspace trust prompt".into(),
                         reason: format!(
-                            "{} on {} reached Claude's workspace trust prompt {recent} times in {} minutes, so st3 stopped replacing it. Check that its driver can record the workspace trust in the Claude config, then restart the seat.",
+                            "{} on {} reached Claude's workspace trust prompt {recent} times in {} minutes, so st stopped replacing it. Check that its driver can record the workspace trust in the Claude config, then restart the seat.",
                             subject.subject,
                             self.host,
                             CLAUDE_TRUST_RECOVERY_WINDOW_MS / 60_000
@@ -1963,29 +2231,7 @@ impl<R: RuntimeControl> Reconciler<R> {
         let Some(run) = subject.owner_run.as_deref() else {
             return Ok(None);
         };
-        let Some(declaration) = self
-            .store
-            .claims_for(&subject.subject, Some("intent.desired"))?
-            .into_iter()
-            .rev()
-            .find(|claim| claim.body.get("kind").and_then(Value::as_str) == Some("agent"))
-        else {
-            return Ok(None);
-        };
-        let Some(checkout) = declaration
-            .body
-            .get("desired")
-            .and_then(Checkout::from_desired)
-            .filter(|checkout| checkout.remove_at_run_end)
-        else {
-            return Ok(None);
-        };
-        let Some(member) = declaration
-            .body
-            .get("member")
-            .and_then(|member| serde_json::from_value::<MemberSpec>(member.clone()).ok())
-            .filter(|member| member.host == self.host)
-        else {
+        let Some((checkout, workspace)) = self.declared_run_end_checkout(&subject.subject)? else {
             return Ok(None);
         };
         // A run stops its owned agents in its cleanup phase, before it becomes terminal.
@@ -2000,7 +2246,55 @@ impl<R: RuntimeControl> Reconciler<R> {
             .is_some_and(|actual| {
                 actual_field(&actual, "status").and_then(Value::as_str) == Some("stopped")
             });
-        Ok((run_ended && stopped).then_some((checkout, member.workspace)))
+        Ok((run_ended && stopped).then_some((checkout, workspace)))
+    }
+
+    /// The run-end checkout and workspace of the subject's last agent declaration for this host.
+    /// Every stop subject asks on every pass. Declarations are append-only claims, so the parsed
+    /// answer holds until another `intent.desired` claim arrives for the subject.
+    fn declared_run_end_checkout(&self, subject: &str) -> Result<Option<(Checkout, String)>> {
+        let newest = self.store.newest_claim_index(subject, "intent.desired")?;
+        if let Some((index, declared)) = self
+            .declared_checkouts
+            .lock()
+            .expect("declared checkout mutex poisoned")
+            .get(subject)
+            && *index == newest
+        {
+            return Ok(declared.clone());
+        }
+        #[cfg(test)]
+        DECLARATION_PARSES.with(|parses| parses.set(parses.get() + 1));
+        let declared = self
+            .store
+            .claims_for(subject, Some("intent.desired"))?
+            .into_iter()
+            .rev()
+            .find(|claim| claim.body.get("kind").and_then(Value::as_str) == Some("agent"))
+            .and_then(|declaration| {
+                let checkout = declaration
+                    .body
+                    .get("desired")
+                    .and_then(Checkout::from_desired)
+                    .filter(|checkout| checkout.remove_at_run_end)?;
+                let member = declaration
+                    .body
+                    .get("member")
+                    .and_then(|member| serde_json::from_value::<MemberSpec>(member.clone()).ok())
+                    .filter(|member| member.host == self.host)?;
+                Some((checkout, member.workspace))
+            });
+        let mut declared_checkouts = self
+            .declared_checkouts
+            .lock()
+            .expect("declared checkout mutex poisoned");
+        if declared_checkouts.len() >= DECLARED_CHECKOUT_LIMIT
+            && !declared_checkouts.contains_key(subject)
+        {
+            declared_checkouts.clear();
+        }
+        declared_checkouts.insert(subject.to_owned(), (newest, declared.clone()));
+        Ok(declared)
     }
 
     /// Remove a finished checkout unless a current member uses its workspace. A worktree with
@@ -3010,12 +3304,22 @@ impl<R: RuntimeControl> Reconciler<R> {
         Ok(())
     }
 
+    /// Evaluate each active run on its own. A run that fails records a fault on that run, and
+    /// every other run, including runs in cleanup, is still evaluated in the same pass.
     fn evaluate_mission_runs(&self) -> Result<()> {
-        let runs = self.store.active_mission_runs_for_origin(&self.host)?;
-        let active_generations = runs
-            .iter()
-            .map(|run| run.generation.as_str())
-            .collect::<BTreeSet<_>>();
+        let ids = self.store.active_mission_run_ids_for_origin(&self.host)?;
+        let mut active_generations = BTreeSet::new();
+        let mut changed = false;
+        for id in &ids {
+            let subject = format!("mission-run/{id}");
+            changed |= self
+                .isolate("mission-run", &subject, || {
+                    let run = self.store.mission_run_for_reconcile(id)?;
+                    active_generations.insert(run.generation.clone());
+                    self.evaluate_active_mission_run(&run)
+                })
+                .unwrap_or(false);
+        }
         self.materialized_mission_generations
             .lock()
             .expect("mission materialization mutex poisoned")
@@ -3024,73 +3328,89 @@ impl<R: RuntimeControl> Reconciler<R> {
             .lock()
             .expect("generation retirement mutex poisoned")
             .retain(|generation| active_generations.contains(generation.as_str()));
-        let mut changed = false;
-        for run in runs {
-            if run
-                .deadline_at_unix_ms
-                .is_some_and(|deadline| deadline <= now_ms())
-                && !run.phase.starts_with("cleanup-")
-            {
-                let timeout = run.timeout_ms.unwrap_or_default();
-                let reason = format!("the mission timeout expired after {timeout}ms");
-                changed |= self
-                    .store
-                    .terminate_mission_run_descendants(&run.id, &reason)?;
-                changed |= self.store.set_mission_run_state(
-                    &run.id,
-                    "running",
-                    "cleanup-failed",
-                    Some(&reason),
-                )?;
-                continue;
-            }
-            if run.phase == "revision-draining" {
-                if self.store.apply_drained_revision(&run.id)?.is_some() {
-                    changed = true;
-                    continue;
-                }
-                // A replica can receive the old proposal's draining claim after the
-                // successor generation. Recover the persisted run phase when no
-                // draining proposal still targets its current generation.
-                if !self
-                    .store
-                    .revision_proposal_for_run(&run.id)?
-                    .is_some_and(|proposal| proposal.status == "draining")
-                {
-                    changed |=
-                        self.store
-                            .set_mission_run_state(&run.id, &run.status, "normal", None)?;
-                    continue;
-                }
-            }
-            let mission_id = run.mission.strip_prefix("mission/").unwrap_or(&run.mission);
-            let Some(mission) = self.store.mission_spec(mission_id, Some(&run.revision))? else {
-                changed |= self.store.set_mission_run_state(
-                    &run.id,
-                    "blocked",
-                    &run.phase,
-                    Some("the selected mission revision is unavailable"),
-                )?;
-                continue;
-            };
-            let mission = match crate::mission::run_mission(mission, run.after.as_deref()) {
-                Ok(mission) => mission,
-                Err(error) => {
-                    changed |= self.store.set_mission_run_state(
-                        &run.id,
-                        "blocked",
-                        &run.phase,
-                        Some(&error.message),
-                    )?;
-                    continue;
-                }
-            };
-            changed |= self.evaluate_mission_run(&run, &mission)?;
+        // A run that left the active set while faulted has nothing left to fail.
+        let active = ids
+            .iter()
+            .map(|id| format!("mission-run/{id}"))
+            .collect::<BTreeSet<_>>();
+        let inactive = self
+            .open_faults()?
+            .iter()
+            .flatten()
+            .filter(|((subject, scope), _)| scope == "mission-run" && !active.contains(subject))
+            .map(|((subject, _), _)| subject.clone())
+            .collect::<Vec<_>>();
+        for subject in inactive {
+            self.close_fault(&subject, "mission-run", "the run is no longer active")?;
         }
         if changed {
             self.signal_changed();
         }
         Ok(())
+    }
+
+    fn evaluate_active_mission_run(&self, run: &MissionRunView) -> Result<bool> {
+        if run
+            .deadline_at_unix_ms
+            .is_some_and(|deadline| deadline <= now_ms())
+            && !run.phase.starts_with("cleanup-")
+        {
+            let timeout = run.timeout_ms.unwrap_or_default();
+            let reason = format!("the mission timeout expired after {timeout}ms");
+            let mut changed = self
+                .store
+                .terminate_mission_run_descendants(&run.id, &reason)?;
+            changed |= self.store.set_mission_run_state(
+                &run.id,
+                "running",
+                "cleanup-failed",
+                Some(&reason),
+            )?;
+            return Ok(changed);
+        }
+        if run.phase == "revision-draining" {
+            if self.store.apply_drained_revision(&run.id)?.is_some() {
+                return Ok(true);
+            }
+            // A replica can receive the old proposal's draining claim after the
+            // successor generation. Recover the persisted run phase when no
+            // draining proposal still targets its current generation.
+            if !self
+                .store
+                .revision_proposal_for_run(&run.id)?
+                .is_some_and(|proposal| proposal.status == "draining")
+            {
+                return self
+                    .store
+                    .set_mission_run_state(&run.id, &run.status, "normal", None);
+            }
+        }
+        // Cleanup reads only the run's owned declarations. It never waits for the mission
+        // revision or its steps, so a run whose revision is unavailable still stops its runtimes.
+        if run.phase.starts_with("cleanup-") {
+            return self.reconcile_mission_run_cleanup(run);
+        }
+        let mission_id = run.mission.strip_prefix("mission/").unwrap_or(&run.mission);
+        let Some(mission) = self.store.mission_spec(mission_id, Some(&run.revision))? else {
+            return self.store.set_mission_run_state(
+                &run.id,
+                "blocked",
+                &run.phase,
+                Some("the selected mission revision is unavailable"),
+            );
+        };
+        let mission = match crate::mission::run_mission(mission, run.after.as_deref()) {
+            Ok(mission) => mission,
+            Err(error) => {
+                return self.store.set_mission_run_state(
+                    &run.id,
+                    "blocked",
+                    &run.phase,
+                    Some(&error.message),
+                );
+            }
+        };
+        self.evaluate_mission_run(run, &mission)
     }
 
     fn evaluate_mission_run(&self, run: &MissionRunView, mission: &MissionSpec) -> Result<bool> {
@@ -3240,7 +3560,10 @@ impl<R: RuntimeControl> Reconciler<R> {
         }
         if completion_selected {
             for step in flat.iter().filter(|step| !step.spec.finally) {
-                let view = views[step.spec.path.as_str()];
+                // A step whose run has not reached this host yet has nothing to cancel.
+                let Some(view) = views.get(step.spec.path.as_str()) else {
+                    continue;
+                };
                 if !matches!(view.status.as_str(), "completed" | "failed" | "cancelled") {
                     changed |= self.store.set_step_state(
                         &view.subject,
@@ -6593,7 +6916,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             .map(|field| format!(" --field {field}"))
             .collect::<String>();
         let content = format!(
-            "`{}` was submitted, but its declared product `{}` has not been observed{}. Record that exact subject, for example `st3 claim {} resource.observed --actor {agent}{example}`, or fail the step with the reason. No action is needed if another actor produces it.",
+            "`{}` was submitted, but its declared product `{}` has not been observed{}. Record that exact subject, for example `st claim {} resource.observed --actor {agent}{example}`, or fail the step with the reason. No action is needed if another actor produces it.",
             view.subject,
             missing.subject,
             if expected.is_empty() {
@@ -6775,9 +7098,9 @@ impl<R: RuntimeControl> Reconciler<R> {
             .flatten()
         }) {
             Some("pass") => Ok(GateOutcome::Pass),
-            Some("fail") => Ok(GateOutcome::Fail(
-                "the human reviewer rejected the work".into(),
-            )),
+            Some("fail") => Ok(GateOutcome::Fail(human_review_failure_reason(
+                decision.as_ref().expect("a failed decision exists"),
+            ))),
             _ => Ok(GateOutcome::Pending),
         }
     }
@@ -6816,540 +7139,599 @@ impl<R: RuntimeControl> Reconciler<R> {
 
     fn reconcile_schedules(&self, desired: &[DesiredSubject]) -> Result<()> {
         for schedule in desired.iter().filter(|item| item.kind == "schedule") {
-            let Some(spec) = crate::graph::schedule_spec(&schedule.desired, &self.host) else {
-                continue;
-            };
-            if spec.stopped || spec.host != self.host {
-                continue;
+            self.isolate("schedule", &schedule.subject, || {
+                self.reconcile_schedule(schedule)
+            });
+        }
+        Ok(())
+    }
+
+    /// Record this schedule's next occurrence and arm its timer.
+    fn reconcile_schedule(&self, schedule: &DesiredSubject) -> Result<()> {
+        let Some(spec) = crate::graph::schedule_spec(&schedule.desired, &self.host) else {
+            return Ok(());
+        };
+        if spec.stopped || spec.host != self.host {
+            return Ok(());
+        }
+        if self.schedule_has_open_work(&schedule.subject)? {
+            return Ok(());
+        }
+        let Some(revision) = self.store.selected_desired_revision(&schedule.subject)? else {
+            return Ok(());
+        };
+        let reached = self
+            .store
+            .claims_for(&schedule.subject, Some("schedule.occurrence-reached"))?;
+        let last = reached
+            .iter()
+            .filter(|claim| {
+                claim
+                    .body
+                    .pointer("/fields/revision")
+                    .and_then(Value::as_str)
+                    == Some(&revision)
+            })
+            .filter_map(|claim| {
+                claim
+                    .body
+                    .pointer("/fields/occurrence")
+                    .and_then(Value::as_u64)
+            })
+            .max();
+        let now = now_ms() as i64;
+        let (occurrence, scheduled_at) = if let Some(at) = spec.at_unix_ms {
+            if last.is_some() {
+                return Ok(());
             }
-            if self.schedule_has_open_work(&schedule.subject)? {
-                continue;
-            }
-            let Some(revision) = self.store.selected_desired_revision(&schedule.subject)? else {
-                continue;
+            (0_u64, at)
+        } else {
+            let Some(interval) = spec.every_ms else {
+                return Ok(());
             };
-            let reached = self
-                .store
-                .claims_for(&schedule.subject, Some("schedule.occurrence-reached"))?;
-            let last = reached
-                .iter()
-                .filter(|claim| {
-                    claim
-                        .body
-                        .pointer("/fields/revision")
-                        .and_then(Value::as_str)
-                        == Some(&revision)
-                })
-                .filter_map(|claim| {
-                    claim
-                        .body
-                        .pointer("/fields/occurrence")
-                        .and_then(Value::as_u64)
-                })
-                .max();
-            let now = now_ms() as i64;
-            let (occurrence, scheduled_at) = if let Some(at) = spec.at_unix_ms {
-                if last.is_some() {
-                    continue;
-                }
-                (0_u64, at)
+            let Some(anchor) = spec.anchor_unix_ms else {
+                return Ok(());
+            };
+            let current = if now < anchor {
+                0
             } else {
-                let Some(interval) = spec.every_ms else {
-                    continue;
-                };
-                let Some(anchor) = spec.anchor_unix_ms else {
-                    continue;
-                };
-                let current = if now < anchor {
-                    0
-                } else {
-                    ((now - anchor) as u64) / interval
-                };
-                let mut next = last.map_or(0, |value| value.saturating_add(1));
-                if now >= anchor && next <= current {
-                    match spec.catch_up.as_str() {
-                        "latest" => next = current,
-                        "skip" => next = current.saturating_add(1),
-                        "all" => {
-                            let remaining = current.saturating_sub(next).saturating_add(1);
-                            if remaining > spec.max_catch_up.unwrap_or(0) as u64 {
-                                self.record_once(
-                                    &schedule.subject,
-                                    "runtime.reconcile-decision",
-                                    BTreeMap::from([
-                                        ("decision".into(), Value::String("raise".into())),
-                                        (
-                                            "reachability".into(),
-                                            Value::String("unreachable".into()),
-                                        ),
-                                        (
-                                            "reason".into(),
-                                            Value::String(
-                                                "the schedule exceeds max-catch-up".into(),
-                                            ),
-                                        ),
-                                    ]),
-                                )?;
-                                continue;
-                            }
-                        }
-                        _ => continue,
-                    }
-                }
-                let offset = interval
-                    .checked_mul(next)
-                    .context("schedule occurrence overflow")?;
-                let scheduled = anchor
-                    .checked_add(offset as i64)
-                    .context("schedule timestamp overflow")?;
-                (next, scheduled)
+                ((now - anchor) as u64) / interval
             };
-            let operation = format!("{}:{revision}:{occurrence}", schedule.subject);
-            if !self
-                .armed_schedules
-                .lock()
-                .expect("schedule mutex poisoned")
-                .insert(operation.clone())
-            {
-                continue;
-            }
-            let request = self.store.append_claim(&ClaimInput {
-                subject: schedule.subject.clone(),
-                kind: "schedule.occurrence-scheduled".into(),
-                actor: None,
-                fields: BTreeMap::from([
-                    ("revision".into(), Value::String(revision.clone())),
-                    ("occurrence".into(), Value::from(occurrence)),
-                    (
-                        "scheduled_at_unix_ms".into(),
-                        Value::String(scheduled_at.to_string()),
-                    ),
-                ]),
-                evidence: Vec::new(),
-                expected_subject: None,
-                idempotency_key: Some(format!("clock-wake:{operation}")),
-            })?;
-            self.event_notify
-                .send_modify(|generation| *generation = generation.saturating_add(1));
-            let work = spec.work.clone();
-            let store = self.store.clone();
-            let notify = self.notify.clone();
-            let event_notify = self.event_notify.clone();
-            let armed = self.armed_schedules.clone();
-            let schedule_subject = schedule.subject.clone();
-            if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                handle.spawn(async move {
-                    let delay = scheduled_at.saturating_sub(now_ms() as i64).max(0) as u64;
-                    tokio::time::sleep(Duration::from_millis(delay)).await;
-                    if store
-                        .selected_desired_revision(&schedule_subject)
-                        .ok()
-                        .flatten()
-                        .as_deref()
-                        != Some(revision.as_str())
-                    {
-                        let _ = store.append_claim(&ClaimInput {
-                            subject: schedule_subject.clone(),
-                            kind: "schedule.occurrence-cancelled".into(),
-                            actor: None,
-                            fields: BTreeMap::from([
-                                ("revision".into(), Value::String(revision.clone())),
-                                ("occurrence".into(), Value::from(occurrence)),
-                                (
-                                    "reason".into(),
-                                    Value::String("the schedule revision changed".into()),
-                                ),
-                            ]),
-                            evidence: vec![request.id.clone()],
-                            expected_subject: None,
-                            idempotency_key: Some(format!("clock-cancel:{operation}")),
-                        });
-                        armed
-                            .lock()
-                            .expect("schedule mutex poisoned")
-                            .remove(&operation);
-                        signal_changed(&notify, &event_notify);
-                        return;
+            let mut next = last.map_or(0, |value| value.saturating_add(1));
+            if now >= anchor && next <= current {
+                match spec.catch_up.as_str() {
+                    "latest" => next = current,
+                    "skip" => next = current.saturating_add(1),
+                    "all" => {
+                        let remaining = current.saturating_sub(next).saturating_add(1);
+                        if remaining > spec.max_catch_up.unwrap_or(0) as u64 {
+                            self.record_once(
+                                &schedule.subject,
+                                "runtime.reconcile-decision",
+                                BTreeMap::from([
+                                    ("decision".into(), Value::String("raise".into())),
+                                    ("reachability".into(), Value::String("unreachable".into())),
+                                    (
+                                        "reason".into(),
+                                        Value::String("the schedule exceeds max-catch-up".into()),
+                                    ),
+                                ]),
+                            )?;
+                            return Ok(());
+                        }
                     }
-                    let reached = store.append_claim(&ClaimInput {
+                    _ => return Ok(()),
+                }
+            }
+            let offset = interval
+                .checked_mul(next)
+                .context("schedule occurrence overflow")?;
+            let scheduled = anchor
+                .checked_add(offset as i64)
+                .context("schedule timestamp overflow")?;
+            (next, scheduled)
+        };
+        let operation = format!("{}:{revision}:{occurrence}", schedule.subject);
+        if !self
+            .armed_schedules
+            .lock()
+            .expect("schedule mutex poisoned")
+            .insert(operation.clone())
+        {
+            return Ok(());
+        }
+        let request = self.store.append_claim(&ClaimInput {
+            subject: schedule.subject.clone(),
+            kind: "schedule.occurrence-scheduled".into(),
+            actor: None,
+            fields: BTreeMap::from([
+                ("revision".into(), Value::String(revision.clone())),
+                ("occurrence".into(), Value::from(occurrence)),
+                (
+                    "scheduled_at_unix_ms".into(),
+                    Value::String(scheduled_at.to_string()),
+                ),
+            ]),
+            evidence: Vec::new(),
+            expected_subject: None,
+            idempotency_key: Some(format!("clock-wake:{operation}")),
+        })?;
+        self.event_notify
+            .send_modify(|generation| *generation = generation.saturating_add(1));
+        let work = spec.work.clone();
+        let store = self.store.clone();
+        let notify = self.notify.clone();
+        let event_notify = self.event_notify.clone();
+        let armed = self.armed_schedules.clone();
+        let schedule_subject = schedule.subject.clone();
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                let delay = scheduled_at.saturating_sub(now_ms() as i64).max(0) as u64;
+                tokio::time::sleep(Duration::from_millis(delay)).await;
+                if store
+                    .selected_desired_revision(&schedule_subject)
+                    .ok()
+                    .flatten()
+                    .as_deref()
+                    != Some(revision.as_str())
+                {
+                    let _ = store.append_claim(&ClaimInput {
                         subject: schedule_subject.clone(),
-                        kind: "schedule.occurrence-reached".into(),
+                        kind: "schedule.occurrence-cancelled".into(),
                         actor: None,
                         fields: BTreeMap::from([
                             ("revision".into(), Value::String(revision.clone())),
                             ("occurrence".into(), Value::from(occurrence)),
                             (
-                                "scheduled_at_unix_ms".into(),
-                                Value::String(scheduled_at.to_string()),
+                                "reason".into(),
+                                Value::String("the schedule revision changed".into()),
                             ),
                         ]),
-                        evidence: vec![request.id],
+                        evidence: vec![request.id.clone()],
                         expected_subject: None,
-                        idempotency_key: Some(format!("clock-reached:{operation}")),
+                        idempotency_key: Some(format!("clock-cancel:{operation}")),
                     });
-                    if let (Ok(reached), Some(work)) = (reached, work) {
-                        let _ = store.append_claim(&ClaimInput {
-                            subject: schedule_subject.clone(),
-                            kind: "schedule.work-requested".into(),
-                            actor: None,
-                            fields: BTreeMap::from([
-                                ("revision".into(), Value::String(revision.clone())),
-                                ("occurrence".into(), Value::from(occurrence)),
-                                (
-                                    "mission".into(),
-                                    Value::String(format!("mission/{}", work.mission)),
-                                ),
-                                ("mission_revision".into(), Value::String(work.revision)),
-                                ("workspace".into(), Value::String(work.workspace)),
-                                (
-                                    "inputs".into(),
-                                    serde_json::to_value(work.inputs).unwrap_or_default(),
-                                ),
-                            ]),
-                            evidence: vec![reached.id],
-                            expected_subject: None,
-                            idempotency_key: Some(format!("schedule-work-request:{operation}")),
-                        });
-                    }
                     armed
                         .lock()
                         .expect("schedule mutex poisoned")
                         .remove(&operation);
                     signal_changed(&notify, &event_notify);
+                    return;
+                }
+                let reached = store.append_claim(&ClaimInput {
+                    subject: schedule_subject.clone(),
+                    kind: "schedule.occurrence-reached".into(),
+                    actor: None,
+                    fields: BTreeMap::from([
+                        ("revision".into(), Value::String(revision.clone())),
+                        ("occurrence".into(), Value::from(occurrence)),
+                        (
+                            "scheduled_at_unix_ms".into(),
+                            Value::String(scheduled_at.to_string()),
+                        ),
+                    ]),
+                    evidence: vec![request.id],
+                    expected_subject: None,
+                    idempotency_key: Some(format!("clock-reached:{operation}")),
                 });
-            } else {
-                self.armed_schedules
+                if let (Ok(reached), Some(work)) = (reached, work) {
+                    let _ = store.append_claim(&ClaimInput {
+                        subject: schedule_subject.clone(),
+                        kind: "schedule.work-requested".into(),
+                        actor: None,
+                        fields: BTreeMap::from([
+                            ("revision".into(), Value::String(revision.clone())),
+                            ("occurrence".into(), Value::from(occurrence)),
+                            (
+                                "mission".into(),
+                                Value::String(format!("mission/{}", work.mission)),
+                            ),
+                            ("mission_revision".into(), Value::String(work.revision)),
+                            ("workspace".into(), Value::String(work.workspace)),
+                            (
+                                "inputs".into(),
+                                serde_json::to_value(work.inputs).unwrap_or_default(),
+                            ),
+                        ]),
+                        evidence: vec![reached.id],
+                        expected_subject: None,
+                        idempotency_key: Some(format!("schedule-work-request:{operation}")),
+                    });
+                }
+                armed
                     .lock()
                     .expect("schedule mutex poisoned")
                     .remove(&operation);
-            }
+                signal_changed(&notify, &event_notify);
+            });
+        } else {
+            self.armed_schedules
+                .lock()
+                .expect("schedule mutex poisoned")
+                .remove(&operation);
         }
         Ok(())
     }
 
     fn schedule_has_open_work(&self, schedule: &str) -> Result<bool> {
-        let Some(request) = self
+        Ok(!self
             .store
-            .latest_claim(schedule, Some("schedule.work-requested"))?
-        else {
-            return Ok(false);
-        };
-        let Some(started) = self
-            .store
-            .schedule_work_start_for_request(schedule, &request.id)?
-        else {
-            return Ok(true);
-        };
-        let Some(run) = started
-            .body
-            .pointer("/fields/mission_run")
-            .and_then(Value::as_str)
-        else {
-            return Ok(true);
-        };
-        Ok(self.store.mission_run(run)?.is_some_and(|view| {
-            !matches!(view.status.as_str(), "completed" | "cancelled" | "failed")
-        }))
+            .pending_schedule_work_requests(schedule)?
+            .is_empty()
+            || self.store.schedule_has_active_started_run(schedule)?)
     }
 
     fn reconcile_scheduled_work(&self, desired: &[DesiredSubject]) -> Result<()> {
         for schedule in desired.iter().filter(|item| item.kind == "schedule") {
-            if intake_is_stopped(schedule, &self.host) {
-                continue;
-            }
-            let requests = self
-                .store
-                .pending_schedule_work_requests(&schedule.subject)?;
-            if requests.is_empty()
-                || self
-                    .store
-                    .schedule_has_active_started_run(&schedule.subject)?
-            {
-                continue;
-            }
-            for request in requests {
-                if self
-                    .store
-                    .schedule_has_active_started_run(&schedule.subject)?
-                {
-                    break;
-                }
-                let Some(mission) = request
-                    .body
-                    .pointer("/fields/mission")
-                    .and_then(Value::as_str)
-                else {
-                    continue;
-                };
-                let Some(revision) = request
-                    .body
-                    .pointer("/fields/mission_revision")
-                    .and_then(Value::as_str)
-                else {
-                    continue;
-                };
-                let Some(root) = request
-                    .body
-                    .pointer("/fields/workspace")
-                    .and_then(Value::as_str)
-                else {
-                    continue;
-                };
-                let suffix = &hex::encode(sha2::Sha256::digest(request.id.as_bytes()))[..16];
-                let workspace = Path::new(root).join(suffix).to_string_lossy().into_owned();
-                let inputs = serde_json::from_value(
-                    request
-                        .body
-                        .pointer("/fields/inputs")
-                        .cloned()
-                        .unwrap_or_default(),
-                )
-                .unwrap_or_default();
-                let request_value = MissionRunRequest {
-                    mission: mission.into(),
-                    revision: Some(revision.into()),
-                    workspace,
-                    requester: Some(format!("daemon/{}", self.host)),
-                    mode: None,
-                    inputs,
-                    idempotency_key: format!("schedule-work:{}", request.id),
-                };
-                let created = schedule
-                    .owner_run
-                    .as_deref()
-                    .and_then(|owner| self.store.mission_run(owner).ok().flatten())
-                    .map_or_else(
-                        || self.store.create_mission_run(&request_value),
-                        |parent| {
-                            self.store.create_child_mission_run(
-                                &request_value,
-                                &parent,
-                                &schedule.subject,
-                                None,
-                            )
-                        },
-                    );
-                let run = match created {
-                    Ok(run) => run,
-                    Err(error) if error.code == "mission-run-capacity" => continue,
-                    Err(error) => return Err(anyhow::anyhow!(error.to_string())),
-                };
-                self.store.append_claim(&ClaimInput {
-                    subject: schedule.subject.clone(),
-                    kind: "schedule.work-started".into(),
-                    actor: None,
-                    fields: BTreeMap::from([
-                        ("request".into(), Value::String(request.id.clone())),
-                        ("mission_run".into(), Value::String(run.subject)),
-                    ]),
-                    evidence: vec![request.id],
-                    expected_subject: None,
-                    idempotency_key: Some(format!("schedule-work-started:{}", run.id)),
-                })?;
-            }
+            self.isolate("schedule-work", &schedule.subject, || {
+                self.reconcile_schedule_work(schedule)
+            });
         }
+        Ok(())
+    }
+
+    /// Start the work that this schedule's occurrences requested. A request that cannot start
+    /// for a lasting reason is failed so the schedule can fire again. A request that waits for
+    /// something this host has not received yet stays pending, and the schedule records why.
+    fn reconcile_schedule_work(&self, schedule: &DesiredSubject) -> Result<()> {
+        if intake_is_stopped(schedule, &self.host) {
+            return Ok(());
+        }
+        // Every peer replicates the same requests. Only the host that requested the work starts it.
+        let requests = self
+            .store
+            .pending_schedule_work_requests(&schedule.subject)?
+            .into_iter()
+            .filter(|request| request.origin == self.host)
+            .collect::<Vec<_>>();
+        if requests.is_empty()
+            || self
+                .store
+                .schedule_has_active_started_run(&schedule.subject)?
+        {
+            return Ok(());
+        }
+        let mut waiting = Vec::new();
+        for request in requests {
+            if self
+                .store
+                .schedule_has_active_started_run(&schedule.subject)?
+            {
+                break;
+            }
+            let fields = request.body.get("fields").unwrap_or(&request.body);
+            let field = |name: &str| fields.get(name).and_then(Value::as_str);
+            let (Some(mission), Some(revision), Some(root)) = (
+                field("mission"),
+                field("mission_revision"),
+                field("workspace"),
+            ) else {
+                self.fail_schedule_work(
+                    schedule,
+                    &request.id,
+                    "invalid-request",
+                    "the request names no mission, revision, or workspace",
+                )?;
+                continue;
+            };
+            let suffix = &hex::encode(sha2::Sha256::digest(request.id.as_bytes()))[..16];
+            let workspace = Path::new(root).join(suffix).to_string_lossy().into_owned();
+            let inputs = serde_json::from_value(fields.get("inputs").cloned().unwrap_or_default())
+                .unwrap_or_default();
+            let request_value = MissionRunRequest {
+                mission: mission.into(),
+                revision: Some(revision.into()),
+                workspace,
+                requester: Some(format!("daemon/{}", self.host)),
+                mode: None,
+                inputs,
+                idempotency_key: format!("schedule-work:{}", request.id),
+            };
+            let created = match &schedule.owner_run {
+                Some(owner) => match self.store.mission_run(owner)? {
+                    Some(parent) => self.store.create_child_mission_run(
+                        &request_value,
+                        &parent,
+                        &schedule.subject,
+                        None,
+                    ),
+                    None => {
+                        waiting.push(format!(
+                            "request {}: its owner run {owner} is not stored here yet",
+                            request.id
+                        ));
+                        continue;
+                    }
+                },
+                None => self.store.create_mission_run(&request_value),
+            };
+            let run = match created {
+                Ok(run) => run,
+                Err(error) if error.code == "mission-run-capacity" => continue,
+                Err(error) if start_waits_for_replication(&error) => {
+                    waiting.push(format!("request {}: {error}", request.id));
+                    continue;
+                }
+                Err(error) => {
+                    self.fail_schedule_work(schedule, &request.id, error.code, &error.to_string())?;
+                    continue;
+                }
+            };
+            self.store.append_claim(&ClaimInput {
+                subject: schedule.subject.clone(),
+                kind: "schedule.work-started".into(),
+                actor: None,
+                fields: BTreeMap::from([
+                    ("request".into(), Value::String(request.id.clone())),
+                    ("mission_run".into(), Value::String(run.subject)),
+                ]),
+                evidence: vec![request.id],
+                expected_subject: None,
+                idempotency_key: Some(format!("schedule-work-started:{}", run.id)),
+            })?;
+        }
+        anyhow::ensure!(waiting.is_empty(), "{}", waiting.join("; "));
+        Ok(())
+    }
+
+    fn fail_schedule_work(
+        &self,
+        schedule: &DesiredSubject,
+        request: &str,
+        code: &str,
+        reason: &str,
+    ) -> Result<()> {
+        self.store.append_claim(&ClaimInput {
+            subject: schedule.subject.clone(),
+            kind: "schedule.work-failed".into(),
+            actor: None,
+            fields: BTreeMap::from([
+                ("request".into(), Value::String(request.into())),
+                ("code".into(), Value::String(code.into())),
+                ("reason".into(), Value::String(reason.into())),
+            ]),
+            evidence: vec![request.into()],
+            expected_subject: None,
+            idempotency_key: Some(format!("schedule-work-failed:{request}")),
+        })?;
         Ok(())
     }
 
     fn reconcile_subscription_missions(&self, desired: &[DesiredSubject]) -> Result<()> {
         for item in desired.iter().filter(|item| item.kind == "subscription") {
-            let Some(spec) = crate::graph::subscription_spec(&item.desired) else {
-                continue;
-            };
-            // Every peer replicates the same requests. Only the declaring host starts their runs.
-            if self
-                .store
-                .selected_desired_origin(&item.subject)?
-                .as_deref()
-                != Some(self.host.as_str())
-            {
-                continue;
-            }
-            if spec.stopped {
-                self.cancel_unstarted_subscription_requests(&item.subject)?;
-                continue;
-            }
-            if spec.delivery != "mission" {
-                continue;
-            }
-            let requests = self
-                .store
-                .pending_subscription_mission_requests(&item.subject)?;
-            if requests.is_empty() {
-                continue;
-            }
-            let is_held = |request: &crate::model::ClaimRecord| {
-                request
-                    .body
-                    .pointer("/fields/held")
-                    .and_then(Value::as_bool)
-                    == Some(true)
-            };
-            let released = if requests.iter().any(is_held) {
-                self.store
-                    .claims_for(&item.subject, Some("subscription.mission-request-released"))?
-                    .into_iter()
-                    .filter_map(|claim| {
-                        claim
-                            .body
-                            .pointer("/fields/request")
-                            .and_then(Value::as_str)
-                            .map(str::to_owned)
-                    })
-                    .collect::<BTreeSet<_>>()
-            } else {
-                BTreeSet::new()
-            };
-            let mut deferrals = BTreeMap::new();
-            for claim in self
-                .store
-                .claims_for(&item.subject, Some("subscription.mission-deferred"))?
-            {
-                if let (Some(request), Some(deadline)) = (
+            self.isolate("subscription", &item.subject, || {
+                self.reconcile_subscription_mission(item)
+            });
+        }
+        Ok(())
+    }
+
+    /// Start the missions that this subscription's deliveries requested.
+    fn reconcile_subscription_mission(&self, item: &DesiredSubject) -> Result<()> {
+        let Some(spec) = crate::graph::subscription_spec(&item.desired) else {
+            return Ok(());
+        };
+        // Every peer replicates the same requests. Only the declaring host starts their runs.
+        if self
+            .store
+            .selected_desired_origin(&item.subject)?
+            .as_deref()
+            != Some(self.host.as_str())
+        {
+            return Ok(());
+        }
+        if spec.stopped {
+            self.cancel_unstarted_subscription_requests(&item.subject)?;
+            return Ok(());
+        }
+        if spec.delivery != "mission" {
+            return Ok(());
+        }
+        let requests = self
+            .store
+            .pending_subscription_mission_requests(&item.subject)?;
+        if requests.is_empty() {
+            return Ok(());
+        }
+        let is_held = |request: &crate::model::ClaimRecord| {
+            request
+                .body
+                .pointer("/fields/held")
+                .and_then(Value::as_bool)
+                == Some(true)
+        };
+        let released = if requests.iter().any(is_held) {
+            self.store
+                .claims_for(&item.subject, Some("subscription.mission-request-released"))?
+                .into_iter()
+                .filter_map(|claim| {
                     claim
                         .body
                         .pointer("/fields/request")
-                        .and_then(Value::as_str),
-                    claim
-                        .body
-                        .pointer("/fields/not_before_unix_ms")
-                        .and_then(Value::as_u64),
-                ) {
-                    let entry = deferrals.entry(request.to_owned()).or_insert((0, 0));
-                    *entry = (deadline, entry.1 + 1);
-                }
-            }
-            let mut held = BTreeMap::<String, usize>::new();
-            for request in requests {
-                if is_held(&request) && !released.contains(&request.id) {
-                    let observation = request
-                        .body
-                        .pointer("/evidence/0")
                         .and_then(Value::as_str)
-                        .unwrap_or(request.id.as_str())
-                        .to_owned();
-                    *held.entry(observation).or_default() += 1;
-                    continue;
-                }
-                if deferrals
-                    .get(&request.id)
-                    .is_some_and(|(deadline, _)| u128::from(*deadline) > now_ms())
-                {
-                    continue;
-                }
-                let fields = request.body.get("fields").unwrap_or(&request.body);
-                let Some(mission) = fields.get("mission").and_then(Value::as_str) else {
-                    continue;
-                };
-                let Some(revision) = fields.get("mission_revision").and_then(Value::as_str) else {
-                    continue;
-                };
-                let Some(resource) = fields.get("resource").and_then(Value::as_str) else {
-                    continue;
-                };
-                let Some(discovery) = fields.get("discovery").and_then(Value::as_str) else {
-                    continue;
-                };
-                let Some(input) = fields.get("resource_input").and_then(Value::as_str) else {
-                    continue;
-                };
-                let Some(root) = fields.get("workspace").and_then(Value::as_str) else {
-                    continue;
-                };
-                let requester = fields
-                    .get("requester")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned)
-                    .unwrap_or_else(|| format!("daemon/{}", self.host));
-                let suffix = &hex::encode(sha2::Sha256::digest(request.id.as_bytes()))[..16];
-                let workspace = Path::new(root).join(suffix).to_string_lossy().into_owned();
-                let request_value = MissionRunRequest {
-                    mission: mission.into(),
-                    revision: Some(revision.into()),
-                    workspace,
-                    requester: Some(requester),
-                    mode: None,
-                    inputs: BTreeMap::from([(input.into(), format!("{resource}@{discovery}"))]),
-                    idempotency_key: format!("subscription-mission:{}", request.id),
-                };
-                let created = item
-                    .owner_run
-                    .as_deref()
-                    .and_then(|owner| self.store.mission_run(owner).ok().flatten())
-                    .map_or_else(
-                        || self.store.create_mission_run(&request_value),
-                        |parent| {
-                            self.store.create_child_mission_run(
-                                &request_value,
-                                &parent,
-                                &item.subject,
-                                None,
-                            )
-                        },
-                    );
-                let run = match created {
-                    Ok(run) => run,
-                    Err(error) if error.code == "mission-run-capacity" => {
-                        let attempt = deferrals
-                            .get(&request.id)
-                            .map_or(1_u32, |(_, attempts)| attempts + 1);
-                        let delay_ms =
-                            1_000_u128.saturating_mul(1_u128 << attempt.saturating_sub(1).min(6));
-                        let not_before = now_ms().saturating_add(delay_ms);
-                        self.store.append_claim(&ClaimInput {
-                            subject: item.subject.clone(),
-                            kind: "subscription.mission-deferred".into(),
-                            actor: None,
-                            fields: BTreeMap::from([
-                                ("request".into(), Value::String(request.id.clone())),
-                                ("not_before_unix_ms".into(), Value::from(not_before as u64)),
-                            ]),
-                            evidence: vec![request.id.clone()],
-                            expected_subject: None,
-                            idempotency_key: Some(format!(
-                                "subscription-mission-deferred:{}:{attempt}",
-                                request.id
-                            )),
-                        })?;
-                        continue;
-                    }
-                    Err(error) => {
-                        self.store.append_claim(&ClaimInput {
-                            subject: item.subject.clone(),
-                            kind: "subscription.mission-failed".into(),
-                            actor: None,
-                            fields: BTreeMap::from([
-                                ("request".into(), Value::String(request.id.clone())),
-                                ("code".into(), Value::String(error.code.into())),
-                                ("reason".into(), Value::String(error.to_string())),
-                            ]),
-                            evidence: vec![request.id.clone()],
-                            expected_subject: None,
-                            idempotency_key: Some(format!(
-                                "subscription-mission-failed:{}",
-                                request.id
-                            )),
-                        })?;
-                        continue;
-                    }
-                };
-                self.store.append_claim(&ClaimInput {
-                    subject: item.subject.clone(),
-                    kind: "subscription.mission-started".into(),
-                    actor: None,
-                    fields: BTreeMap::from([
-                        ("request".into(), Value::String(request.id.clone())),
-                        ("mission_run".into(), Value::String(run.subject)),
-                    ]),
-                    evidence: vec![request.id],
-                    expected_subject: None,
-                    idempotency_key: Some(format!("subscription-mission-started:{}", run.id)),
-                })?;
-            }
-            for (observation, count) in held {
-                self.request_held_subscription_attention(&item.subject, &observation, count)?;
+                        .map(str::to_owned)
+                })
+                .collect::<BTreeSet<_>>()
+        } else {
+            BTreeSet::new()
+        };
+        let mut deferrals = BTreeMap::new();
+        for claim in self
+            .store
+            .claims_for(&item.subject, Some("subscription.mission-deferred"))?
+        {
+            if let (Some(request), Some(deadline)) = (
+                claim
+                    .body
+                    .pointer("/fields/request")
+                    .and_then(Value::as_str),
+                claim
+                    .body
+                    .pointer("/fields/not_before_unix_ms")
+                    .and_then(Value::as_u64),
+            ) {
+                let entry = deferrals.entry(request.to_owned()).or_insert((0, 0));
+                *entry = (deadline, entry.1 + 1);
             }
         }
+        let mut held = BTreeMap::<String, usize>::new();
+        let mut waiting = Vec::new();
+        for request in requests {
+            if is_held(&request) && !released.contains(&request.id) {
+                let observation = request
+                    .body
+                    .pointer("/evidence/0")
+                    .and_then(Value::as_str)
+                    .unwrap_or(request.id.as_str())
+                    .to_owned();
+                *held.entry(observation).or_default() += 1;
+                continue;
+            }
+            if deferrals
+                .get(&request.id)
+                .is_some_and(|(deadline, _)| u128::from(*deadline) > now_ms())
+            {
+                continue;
+            }
+            let fields = request.body.get("fields").unwrap_or(&request.body);
+            let field = |name: &str| fields.get(name).and_then(Value::as_str);
+            let (
+                Some(mission),
+                Some(revision),
+                Some(resource),
+                Some(discovery),
+                Some(input),
+                Some(root),
+            ) = (
+                field("mission"),
+                field("mission_revision"),
+                field("resource"),
+                field("discovery"),
+                field("resource_input"),
+                field("workspace"),
+            )
+            else {
+                self.fail_subscription_request(
+                    item,
+                    &request.id,
+                    "invalid-request",
+                    "the request lacks a mission, revision, resource, discovery, input, or workspace",
+                )?;
+                continue;
+            };
+            let requester = field("requester")
+                .map(str::to_owned)
+                .unwrap_or_else(|| format!("daemon/{}", self.host));
+            let suffix = &hex::encode(sha2::Sha256::digest(request.id.as_bytes()))[..16];
+            let workspace = Path::new(root).join(suffix).to_string_lossy().into_owned();
+            let request_value = MissionRunRequest {
+                mission: mission.into(),
+                revision: Some(revision.into()),
+                workspace,
+                requester: Some(requester),
+                mode: None,
+                inputs: BTreeMap::from([(input.into(), format!("{resource}@{discovery}"))]),
+                idempotency_key: format!("subscription-mission:{}", request.id),
+            };
+            let created = match &item.owner_run {
+                Some(owner) => match self.store.mission_run(owner)? {
+                    Some(parent) => self.store.create_child_mission_run(
+                        &request_value,
+                        &parent,
+                        &item.subject,
+                        None,
+                    ),
+                    None => {
+                        waiting.push(format!(
+                            "request {}: its owner run {owner} is not stored here yet",
+                            request.id
+                        ));
+                        continue;
+                    }
+                },
+                None => self.store.create_mission_run(&request_value),
+            };
+            let run = match created {
+                Ok(run) => run,
+                Err(error) if error.code == "mission-run-capacity" => {
+                    let attempt = deferrals
+                        .get(&request.id)
+                        .map_or(1_u32, |(_, attempts)| attempts + 1);
+                    let delay_ms =
+                        1_000_u128.saturating_mul(1_u128 << attempt.saturating_sub(1).min(6));
+                    let not_before = now_ms().saturating_add(delay_ms);
+                    self.store.append_claim(&ClaimInput {
+                        subject: item.subject.clone(),
+                        kind: "subscription.mission-deferred".into(),
+                        actor: None,
+                        fields: BTreeMap::from([
+                            ("request".into(), Value::String(request.id.clone())),
+                            ("not_before_unix_ms".into(), Value::from(not_before as u64)),
+                        ]),
+                        evidence: vec![request.id.clone()],
+                        expected_subject: None,
+                        idempotency_key: Some(format!(
+                            "subscription-mission-deferred:{}:{attempt}",
+                            request.id
+                        )),
+                    })?;
+                    continue;
+                }
+                // The request stays pending and starts once replication delivers what it names.
+                Err(error) if start_waits_for_replication(&error) => {
+                    waiting.push(format!("request {}: {error}", request.id));
+                    continue;
+                }
+                Err(error) => {
+                    self.fail_subscription_request(
+                        item,
+                        &request.id,
+                        error.code,
+                        &error.to_string(),
+                    )?;
+                    continue;
+                }
+            };
+            self.store.append_claim(&ClaimInput {
+                subject: item.subject.clone(),
+                kind: "subscription.mission-started".into(),
+                actor: None,
+                fields: BTreeMap::from([
+                    ("request".into(), Value::String(request.id.clone())),
+                    ("mission_run".into(), Value::String(run.subject)),
+                ]),
+                evidence: vec![request.id],
+                expected_subject: None,
+                idempotency_key: Some(format!("subscription-mission-started:{}", run.id)),
+            })?;
+        }
+        for (observation, count) in held {
+            self.request_held_subscription_attention(&item.subject, &observation, count)?;
+        }
+        anyhow::ensure!(waiting.is_empty(), "{}", waiting.join("; "));
+        Ok(())
+    }
+
+    fn fail_subscription_request(
+        &self,
+        item: &DesiredSubject,
+        request: &str,
+        code: &str,
+        reason: &str,
+    ) -> Result<()> {
+        self.store.append_claim(&ClaimInput {
+            subject: item.subject.clone(),
+            kind: "subscription.mission-failed".into(),
+            actor: None,
+            fields: BTreeMap::from([
+                ("request".into(), Value::String(request.into())),
+                ("code".into(), Value::String(code.into())),
+                ("reason".into(), Value::String(reason.into())),
+            ]),
+            evidence: vec![request.into()],
+            expected_subject: None,
+            idempotency_key: Some(format!("subscription-mission-failed:{request}")),
+        })?;
         Ok(())
     }
 
@@ -7399,7 +7781,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                 reviewer: "person/operator".into(),
                 title: "A subscription is holding mission requests".into(),
                 reason: format!(
-                    "One observation for {subscription} requested more than {} mission runs, so {count} wait for a person. List them with `st3 missions requests {subscription}`, then release or cancel each one.",
+                    "One observation for {subscription} requested more than {} mission runs, so {count} wait for a person. List them with `st missions requests {subscription}`, then release or cancel each one.",
                     crate::store::MAX_OBSERVATION_DELIVERIES
                 ),
                 severity: "warning".into(),
@@ -7441,303 +7823,306 @@ impl<R: RuntimeControl> Reconciler<R> {
             }
         }
         for observer in desired.iter().filter(|item| item.kind == "observer") {
-            let Some(mut spec) = crate::graph::observer_spec(&observer.desired) else {
-                continue;
-            };
-            let selected = subscriptions_by_resource
-                .get(&spec.resource)
-                .cloned()
-                .unwrap_or_default();
-            if spec.stopped {
-                let is_stopped = self
-                    .store
-                    .latest_actual_value(&observer.subject)?
-                    .and_then(|actual| {
-                        actual
-                            .get("state")
-                            .and_then(Value::as_str)
-                            .map(str::to_owned)
-                    })
-                    .as_deref()
-                    == Some("stopped");
-                if !is_stopped {
-                    self.store.append_claim(&ClaimInput {
-                        subject: observer.subject.clone(),
-                        kind: "observer.state".into(),
-                        actor: None,
-                        fields: BTreeMap::from([("state".into(), Value::String("stopped".into()))]),
-                        evidence: Vec::new(),
-                        expected_subject: None,
-                        idempotency_key: None,
-                    })?;
-                }
-                continue;
-            }
-            if self
+            self.isolate("observer", &observer.subject, || {
+                self.reconcile_resource_observer(observer, &subscriptions_by_resource)
+            });
+        }
+        Ok(())
+    }
+
+    /// Settle a stopped observer, or arm this observer's next observation.
+    fn reconcile_resource_observer(
+        &self,
+        observer: &DesiredSubject,
+        subscriptions_by_resource: &HashMap<String, Vec<(String, SubscriptionSpec)>>,
+    ) -> Result<()> {
+        let Some(mut spec) = crate::graph::observer_spec(&observer.desired) else {
+            return Ok(());
+        };
+        let selected = subscriptions_by_resource
+            .get(&spec.resource)
+            .cloned()
+            .unwrap_or_default();
+        if spec.stopped {
+            let is_stopped = self
                 .store
-                .selected_desired_origin(&observer.subject)?
-                .as_deref()
-                != Some(self.host.as_str())
-            {
-                continue;
-            }
-            spec.fields.extend(
-                selected
-                    .iter()
-                    .filter(|(_, subscription)| subscription.observer == observer.subject)
-                    .flat_map(|(_, subscription)| subscription.fields.iter().cloned()),
-            );
-            spec.fields.sort();
-            spec.fields.dedup();
-            let Some(revision) = self.store.selected_desired_revision(&observer.subject)? else {
-                continue;
-            };
-            let observer_actual = self.store.latest_actual_value(&observer.subject)?;
-            if observer_actual.as_ref().is_some_and(|actual| {
-                actual.get("state").and_then(Value::as_str) == Some("degraded")
-                    && actual.get("revision").and_then(Value::as_str) == Some(revision.as_str())
-                    && actual
-                        .get("error_code")
-                        .and_then(Value::as_str)
-                        .is_some_and(permanent_observation_error)
-            }) {
-                continue;
-            }
-            let refresh_attempt = self
-                .store
-                .pending_observer_refresh_attempt(&observer.subject)?;
-            let deadline_key = format!("{}:{revision}", observer.subject);
-            let next_check = refresh_attempt
-                .as_ref()
-                .map(|_| now_ms())
-                .unwrap_or_else(|| {
-                    self.observer_deadlines
-                        .lock()
-                        .expect("observer deadline mutex poisoned")
-                        .get(&deadline_key)
-                        .copied()
-                        .or_else(|| {
-                            observer_actual
-                                .as_ref()
-                                .and_then(|actual| actual.get("next_check_unix_ms"))
-                                .and_then(Value::as_str)
-                                .and_then(|value| value.parse().ok())
-                        })
-                        .unwrap_or_else(now_ms)
-                });
-            let operation = format!(
-                "{}:{revision}:{}",
-                observer.subject,
-                refresh_attempt.as_deref().unwrap_or("scheduled")
-            );
-            if !self
-                .armed_observers
-                .lock()
-                .expect("observer mutex poisoned")
-                .insert(operation.clone())
-            {
-                continue;
-            }
-            let store = self.store.clone();
-            let provider = self.resource_provider.clone();
-            let notify = self.notify.clone();
-            let event_notify = self.event_notify.clone();
-            let armed = self.armed_observers.clone();
-            let deadlines = self.observer_deadlines.clone();
-            let cursors = self.observer_cursors.clone();
-            let observer_subject = observer.subject.clone();
-            let observer_owner_run = observer.owner_run.clone();
-            let previous_facts = self
-                .store
-                .latest_actual_value(&spec.resource)?
-                .and_then(|actual| actual.get("facts").cloned());
-            let cursor = self
-                .observer_cursors
-                .lock()
-                .expect("observer cursor mutex poisoned")
-                .get(&deadline_key)
-                .cloned()
-                .unwrap_or_else(|| {
-                    observer_actual
-                        .as_ref()
-                        .and_then(|actual| actual.get("cursor"))
+                .latest_actual_value(&observer.subject)?
+                .and_then(|actual| {
+                    actual
+                        .get("state")
                         .and_then(Value::as_str)
                         .map(str::to_owned)
-                });
-            if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                handle.spawn(async move {
-                    let delay = next_check.saturating_sub(now_ms()).min(u64::MAX as u128) as u64;
-                    tokio::time::sleep(Duration::from_millis(delay)).await;
-                    if store
-                        .selected_desired_revision(&observer_subject)
-                        .ok()
-                        .flatten()
-                        .as_deref()
-                        != Some(revision.as_str())
-                    {
-                        armed
-                            .lock()
-                            .expect("observer mutex poisoned")
-                            .remove(&operation);
-                        signal_changed(&notify, &event_notify);
-                        return;
-                    }
-                    let request = ObservationRequest {
-                        provider: spec.provider.clone(),
-                        locator: spec.locator.clone(),
-                        fields: spec.fields.iter().cloned().collect(),
-                        cursor,
-                        previous_facts,
-                    };
-                    match provider.observe(request).await {
-                        Ok(observation) => {
-                            match store.record_resource_observation(
-                                &observer_subject,
-                                &revision,
-                                refresh_attempt.as_deref(),
-                                &spec.resource,
-                                observation.cursor.as_deref(),
-                                &observation.facts,
-                                observation.next_check_unix_ms,
-                                &selected,
-                            ) {
-                                Ok(_) => {
-                                    deadlines
-                                        .lock()
-                                        .expect("observer deadline mutex poisoned")
-                                        .insert(
-                                            deadline_key.clone(),
-                                            observation.next_check_unix_ms,
-                                        );
-                                    cursors
-                                        .lock()
-                                        .expect("observer cursor mutex poisoned")
-                                        .insert(deadline_key.clone(), observation.cursor);
-                                }
-                                Err(error) => {
-                                    let retry_at = now_ms().saturating_add(60_000);
-                                    deadlines
-                                        .lock()
-                                        .expect("observer deadline mutex poisoned")
-                                        .insert(deadline_key.clone(), retry_at);
-                                    let reason = error.to_string();
-                                    let failure_hash = hex::encode(sha2::Sha256::digest(
-                                        format!("{revision}:{}:{reason}", error.code).as_bytes(),
-                                    ));
-                                    let mut fields = BTreeMap::from([
-                                        ("state".into(), Value::String("degraded".into())),
-                                        ("reason".into(), Value::String(reason)),
-                                        ("error_code".into(), Value::String(error.code.into())),
-                                        ("revision".into(), Value::String(revision.clone())),
-                                    ]);
-                                    if let Some(attempt) = &refresh_attempt {
-                                        fields.insert(
-                                            "attempt".into(),
-                                            Value::String(attempt.clone()),
-                                        );
-                                    }
-                                    let _ = store.append_claim(&ClaimInput {
-                                        subject: observer_subject.clone(),
-                                        kind: "observer.state".into(),
-                                        actor: None,
-                                        fields,
-                                        evidence: Vec::new(),
-                                        expected_subject: None,
-                                        idempotency_key: Some(format!(
-                                            "observer-rejected:{}",
-                                            &failure_hash[..20]
-                                        )),
-                                    });
-                                }
-                            }
-                        }
-                        Err(error) => {
-                            let rate_limit = error.downcast_ref::<ProviderRateLimit>();
-                            let retry_at = rate_limit.map_or_else(
-                                || now_ms().saturating_add(60_000),
-                                |limit| limit.retry_at_unix_ms.max(now_ms().saturating_add(1_000)),
-                            );
-                            let reason = error.to_string();
-                            deadlines
-                                .lock()
-                                .expect("observer deadline mutex poisoned")
-                                .insert(deadline_key.clone(), retry_at);
-                            if rate_limit.is_some_and(|limit| limit.unauthenticated)
-                                || error.downcast_ref::<ProviderUnauthenticated>().is_some()
-                                || observer_unreachable_since(&store, &observer_subject)
-                                    .ok()
-                                    .flatten()
-                                    .is_some_and(|since| {
-                                        now_ms().saturating_sub(since) >= 3_600_000
-                                    })
-                            {
-                                let _ = request_observer_attention(
-                                    &store,
-                                    &observer_subject,
-                                    observer_owner_run.as_deref(),
-                                    &revision,
-                                    &reason,
-                                );
-                            }
-                            let unchanged_failure = store
-                                .latest_actual_value(&observer_subject)
-                                .ok()
-                                .flatten()
-                                .is_some_and(|actual| {
-                                    actual.get("state").and_then(Value::as_str)
-                                        == Some("unreachable")
-                                        && actual.get("reason").and_then(Value::as_str)
-                                            == Some(reason.as_str())
-                                });
-                            if unchanged_failure && refresh_attempt.is_none() {
-                                armed
-                                    .lock()
-                                    .expect("observer mutex poisoned")
-                                    .remove(&operation);
-                                signal_changed(&notify, &event_notify);
-                                return;
-                            }
-                            let failure_hash = hex::encode(sha2::Sha256::digest(
-                                format!("{operation}:{reason}").as_bytes(),
-                            ));
-                            let mut fields = BTreeMap::from([
-                                ("state".into(), Value::String("unreachable".into())),
-                                ("reason".into(), Value::String(reason)),
-                                ("revision".into(), Value::String(revision.clone())),
-                                (
-                                    "next_check_unix_ms".into(),
-                                    Value::String(retry_at.to_string()),
-                                ),
-                            ]);
-                            if let Some(attempt) = &refresh_attempt {
-                                fields.insert("attempt".into(), Value::String(attempt.clone()));
-                            }
-                            let _ = store.append_claim(&ClaimInput {
-                                subject: observer_subject.clone(),
-                                kind: "observer.state".into(),
-                                actor: None,
-                                fields,
-                                evidence: Vec::new(),
-                                expected_subject: None,
-                                idempotency_key: Some(format!(
-                                    "observer-failure:{}",
-                                    &failure_hash[..20]
-                                )),
-                            });
-                        }
-                    }
+                })
+                .as_deref()
+                == Some("stopped");
+            if !is_stopped {
+                self.store.append_claim(&ClaimInput {
+                    subject: observer.subject.clone(),
+                    kind: "observer.state".into(),
+                    actor: None,
+                    fields: BTreeMap::from([("state".into(), Value::String("stopped".into()))]),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: None,
+                })?;
+            }
+            return Ok(());
+        }
+        if self
+            .store
+            .selected_desired_origin(&observer.subject)?
+            .as_deref()
+            != Some(self.host.as_str())
+        {
+            return Ok(());
+        }
+        spec.fields.extend(
+            selected
+                .iter()
+                .filter(|(_, subscription)| subscription.observer == observer.subject)
+                .flat_map(|(_, subscription)| subscription.fields.iter().cloned()),
+        );
+        spec.fields.sort();
+        spec.fields.dedup();
+        let Some(revision) = self.store.selected_desired_revision(&observer.subject)? else {
+            return Ok(());
+        };
+        let observer_actual = self.store.latest_actual_value(&observer.subject)?;
+        if observer_actual.as_ref().is_some_and(|actual| {
+            actual.get("state").and_then(Value::as_str) == Some("degraded")
+                && actual.get("revision").and_then(Value::as_str) == Some(revision.as_str())
+                && actual
+                    .get("error_code")
+                    .and_then(Value::as_str)
+                    .is_some_and(permanent_observation_error)
+        }) {
+            return Ok(());
+        }
+        let refresh_attempt = self
+            .store
+            .pending_observer_refresh_attempt(&observer.subject)?;
+        let deadline_key = format!("{}:{revision}", observer.subject);
+        let next_check = refresh_attempt
+            .as_ref()
+            .map(|_| now_ms())
+            .unwrap_or_else(|| {
+                self.observer_deadlines
+                    .lock()
+                    .expect("observer deadline mutex poisoned")
+                    .get(&deadline_key)
+                    .copied()
+                    .or_else(|| {
+                        observer_actual
+                            .as_ref()
+                            .and_then(|actual| actual.get("next_check_unix_ms"))
+                            .and_then(Value::as_str)
+                            .and_then(|value| value.parse().ok())
+                    })
+                    .unwrap_or_else(now_ms)
+            });
+        let operation = format!(
+            "{}:{revision}:{}",
+            observer.subject,
+            refresh_attempt.as_deref().unwrap_or("scheduled")
+        );
+        if !self
+            .armed_observers
+            .lock()
+            .expect("observer mutex poisoned")
+            .insert(operation.clone())
+        {
+            return Ok(());
+        }
+        let store = self.store.clone();
+        let provider = self.resource_provider.clone();
+        let notify = self.notify.clone();
+        let event_notify = self.event_notify.clone();
+        let armed = self.armed_observers.clone();
+        let deadlines = self.observer_deadlines.clone();
+        let cursors = self.observer_cursors.clone();
+        let observer_subject = observer.subject.clone();
+        let observer_owner_run = observer.owner_run.clone();
+        let previous_facts = self
+            .store
+            .latest_actual_value(&spec.resource)?
+            .and_then(|actual| actual.get("facts").cloned());
+        let cursor = self
+            .observer_cursors
+            .lock()
+            .expect("observer cursor mutex poisoned")
+            .get(&deadline_key)
+            .cloned()
+            .unwrap_or_else(|| {
+                observer_actual
+                    .as_ref()
+                    .and_then(|actual| actual.get("cursor"))
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            });
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                let delay = next_check.saturating_sub(now_ms()).min(u64::MAX as u128) as u64;
+                tokio::time::sleep(Duration::from_millis(delay)).await;
+                if store
+                    .selected_desired_revision(&observer_subject)
+                    .ok()
+                    .flatten()
+                    .as_deref()
+                    != Some(revision.as_str())
+                {
                     armed
                         .lock()
                         .expect("observer mutex poisoned")
                         .remove(&operation);
                     signal_changed(&notify, &event_notify);
-                });
-            } else {
-                self.armed_observers
+                    return;
+                }
+                let request = ObservationRequest {
+                    provider: spec.provider.clone(),
+                    locator: spec.locator.clone(),
+                    fields: spec.fields.iter().cloned().collect(),
+                    cursor,
+                    previous_facts,
+                };
+                match provider.observe(request).await {
+                    Ok(observation) => {
+                        match store.record_resource_observation(
+                            &observer_subject,
+                            &revision,
+                            refresh_attempt.as_deref(),
+                            &spec.resource,
+                            observation.cursor.as_deref(),
+                            &observation.facts,
+                            observation.next_check_unix_ms,
+                            &selected,
+                        ) {
+                            Ok(_) => {
+                                deadlines
+                                    .lock()
+                                    .expect("observer deadline mutex poisoned")
+                                    .insert(deadline_key.clone(), observation.next_check_unix_ms);
+                                cursors
+                                    .lock()
+                                    .expect("observer cursor mutex poisoned")
+                                    .insert(deadline_key.clone(), observation.cursor);
+                            }
+                            Err(error) => {
+                                let retry_at = now_ms().saturating_add(60_000);
+                                deadlines
+                                    .lock()
+                                    .expect("observer deadline mutex poisoned")
+                                    .insert(deadline_key.clone(), retry_at);
+                                let reason = error.to_string();
+                                let failure_hash = hex::encode(sha2::Sha256::digest(
+                                    format!("{revision}:{}:{reason}", error.code).as_bytes(),
+                                ));
+                                let mut fields = BTreeMap::from([
+                                    ("state".into(), Value::String("degraded".into())),
+                                    ("reason".into(), Value::String(reason)),
+                                    ("error_code".into(), Value::String(error.code.into())),
+                                    ("revision".into(), Value::String(revision.clone())),
+                                ]);
+                                if let Some(attempt) = &refresh_attempt {
+                                    fields.insert("attempt".into(), Value::String(attempt.clone()));
+                                }
+                                let _ = store.append_claim(&ClaimInput {
+                                    subject: observer_subject.clone(),
+                                    kind: "observer.state".into(),
+                                    actor: None,
+                                    fields,
+                                    evidence: Vec::new(),
+                                    expected_subject: None,
+                                    idempotency_key: Some(format!(
+                                        "observer-rejected:{}",
+                                        &failure_hash[..20]
+                                    )),
+                                });
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        let rate_limit = error.downcast_ref::<ProviderRateLimit>();
+                        let retry_at = rate_limit.map_or_else(
+                            || now_ms().saturating_add(60_000),
+                            |limit| limit.retry_at_unix_ms.max(now_ms().saturating_add(1_000)),
+                        );
+                        let reason = error.to_string();
+                        deadlines
+                            .lock()
+                            .expect("observer deadline mutex poisoned")
+                            .insert(deadline_key.clone(), retry_at);
+                        if rate_limit.is_some_and(|limit| limit.unauthenticated)
+                            || error.downcast_ref::<ProviderUnauthenticated>().is_some()
+                            || observer_unreachable_since(&store, &observer_subject)
+                                .ok()
+                                .flatten()
+                                .is_some_and(|since| now_ms().saturating_sub(since) >= 3_600_000)
+                        {
+                            let _ = request_observer_attention(
+                                &store,
+                                &observer_subject,
+                                observer_owner_run.as_deref(),
+                                &revision,
+                                &reason,
+                            );
+                        }
+                        let unchanged_failure = store
+                            .latest_actual_value(&observer_subject)
+                            .ok()
+                            .flatten()
+                            .is_some_and(|actual| {
+                                actual.get("state").and_then(Value::as_str) == Some("unreachable")
+                                    && actual.get("reason").and_then(Value::as_str)
+                                        == Some(reason.as_str())
+                            });
+                        if unchanged_failure && refresh_attempt.is_none() {
+                            armed
+                                .lock()
+                                .expect("observer mutex poisoned")
+                                .remove(&operation);
+                            signal_changed(&notify, &event_notify);
+                            return;
+                        }
+                        let failure_hash = hex::encode(sha2::Sha256::digest(
+                            format!("{operation}:{reason}").as_bytes(),
+                        ));
+                        let mut fields = BTreeMap::from([
+                            ("state".into(), Value::String("unreachable".into())),
+                            ("reason".into(), Value::String(reason)),
+                            ("revision".into(), Value::String(revision.clone())),
+                            (
+                                "next_check_unix_ms".into(),
+                                Value::String(retry_at.to_string()),
+                            ),
+                        ]);
+                        if let Some(attempt) = &refresh_attempt {
+                            fields.insert("attempt".into(), Value::String(attempt.clone()));
+                        }
+                        let _ = store.append_claim(&ClaimInput {
+                            subject: observer_subject.clone(),
+                            kind: "observer.state".into(),
+                            actor: None,
+                            fields,
+                            evidence: Vec::new(),
+                            expected_subject: None,
+                            idempotency_key: Some(format!(
+                                "observer-failure:{}",
+                                &failure_hash[..20]
+                            )),
+                        });
+                    }
+                }
+                armed
                     .lock()
                     .expect("observer mutex poisoned")
                     .remove(&operation);
-            }
+                signal_changed(&notify, &event_notify);
+            });
+        } else {
+            self.armed_observers
+                .lock()
+                .expect("observer mutex poisoned")
+                .remove(&operation);
         }
         Ok(())
     }
@@ -7926,9 +8311,9 @@ impl<R: RuntimeControl> Reconciler<R> {
                         .flatten()
                 }) {
                     Some("pass") => GateOutcome::Pass,
-                    Some("fail") => {
-                        GateOutcome::Fail("the human reviewer rejected the work".into())
-                    }
+                    Some("fail") => GateOutcome::Fail(human_review_failure_reason(
+                        decision.as_ref().expect("a failed decision exists"),
+                    )),
                     _ => GateOutcome::Pending,
                 }
             }
@@ -8270,7 +8655,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             ]),
         )?;
         let instruction = format!(
-            "{prompt}\n\nYou are a held-out st3 gate. Inspect only the declared workspace and tools. When you decide, run exactly one of these commands:\n  \"$ST3_BIN\" gate-result pass --reason 'REASON'\n  \"$ST3_BIN\" gate-result fail --reason 'REASON'\nDo not finish without posting a gate-result."
+            "{prompt}\n\nYou are a held-out st gate. Inspect only the declared workspace and tools. When you decide, run exactly one of these commands:\n  \"$ST3_BIN\" gate-result pass --reason 'REASON'\n  \"$ST3_BIN\" gate-result fail --reason 'REASON'\nDo not finish without posting a gate-result."
         );
         let argv = if model.starts_with("claude") {
             vec![
@@ -8901,6 +9286,34 @@ fn step_path_of_subject(subject: &str) -> Option<&str> {
         .map(|(_, path)| path)
 }
 
+/// Whether a mission run could not start only because this host lacks a claim that replication
+/// can still deliver, such as a mission revision, an owner run, or an input's claim published on
+/// another host.
+fn start_waits_for_replication(error: &crate::model::St3Error) -> bool {
+    matches!(
+        error.code,
+        "missing-mission" | "missing-mission-run" | "missing-resource-input-version" | "internal"
+    )
+}
+
+/// Run `item`, turning a panic into an error so one item cannot end the reconciler task.
+fn caught<T>(item: impl FnOnce() -> Result<T>) -> Result<T> {
+    std::panic::catch_unwind(AssertUnwindSafe(item)).unwrap_or_else(|panic| {
+        Err(anyhow::anyhow!(
+            "panicked: {}",
+            panic_message(panic.as_ref())
+        ))
+    })
+}
+
+fn panic_message(panic: &(dyn std::any::Any + Send)) -> String {
+    panic
+        .downcast_ref::<&str>()
+        .map(|message| (*message).to_owned())
+        .or_else(|| panic.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "a panic without a message".into())
+}
+
 fn signal_changed(reconcile_notify: &Notify, event_notify: &watch::Sender<u64>) {
     reconcile_notify.notify_one();
     event_notify.send_modify(|generation| *generation = generation.saturating_add(1));
@@ -9002,7 +9415,7 @@ pub(crate) fn append_work_wake_message(
         format!("{source} attempt {wake_attempt} ({reason})")
     };
     let content = format!(
-        "A mission step is ready: {0}. Run `st3 work claim {0}` to read and claim it.\n\nTitle: {1}{queue}\nWake: {wake_description}",
+        "A mission step is ready: {0}. Run `st work claim {0}` to read and claim it.\n\nTitle: {1}{queue}\nWake: {wake_description}",
         step.subject,
         step.title.as_deref().unwrap_or(&step.step),
     );
@@ -9137,8 +9550,12 @@ fn work_wake_deadline(
         .min()
 }
 
-fn deadline_sleep_ms(deadline: u128, now: u128, unchanged: bool) -> u64 {
-    if unchanged && deadline <= now {
+/// How long to sleep before the next pass. A deadline that was already due when the last pass
+/// began, and that pass changed nothing, cannot be acted on yet, so the loop backs off instead of
+/// spinning. A deadline that fell due during or after that pass has not been evaluated, so it
+/// runs at once: a mission timeout must not wait out the back-off.
+fn deadline_sleep_ms(deadline: u128, now: u128, quiet_pass_started: Option<u128>) -> u64 {
+    if quiet_pass_started.is_some_and(|started| deadline <= started) {
         WORK_WAKE_RETRY_MS as u64
     } else {
         deadline.saturating_sub(now).min(u128::from(u64::MAX)) as u64
@@ -9303,6 +9720,18 @@ enum GateOutcome {
     Fail(String),
 }
 
+fn human_review_failure_reason(decision: &crate::model::ClaimRecord) -> String {
+    match decision
+        .body
+        .pointer("/fields/reason")
+        .and_then(Value::as_str)
+        .filter(|reason| !reason.trim().is_empty())
+    {
+        Some(reason) => format!("the human reviewer rejected the work: {reason}"),
+        None => "the human reviewer rejected the work".into(),
+    }
+}
+
 enum LoopBranchOutcome {
     Pending,
     Completed,
@@ -9321,7 +9750,7 @@ enum UsedMissionOutcome {
     Failed(String),
 }
 
-/// The st3 executable members launch with. A deploy installs the new binary before it restarts
+/// The st executable members launch with. A deploy installs the new binary before it restarts
 /// the daemon, and in between Linux names this process's image `PATH (deleted)`. Launching that
 /// name fails every start in the window and can hold a seat in a crash loop, so use the
 /// replacement installed at the original path.
@@ -9461,6 +9890,68 @@ fn now_ms() -> u128 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn native_exec_and_gate_shell_resolve_the_declared_path() {
+        use super::{NativeRuntime, RuntimeControl};
+        use std::os::unix::fs::PermissionsExt as _;
+        let root = tempfile::tempdir().unwrap();
+        let program = root.path().join("orchid-tool");
+        std::fs::write(&program, "#!/bin/sh\nprintf '%s' \"$ORCHID_VALUE\"\n").unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let intent = crate::graph::parse_test_intent(
+            &format!(
+                r#"version 2
+exec "orchid" {{ command "orchid-tool"; workspace "{}"; }}"#,
+                root.path().display()
+            ),
+            "orchid",
+        )
+        .unwrap();
+        let mut member = intent
+            .subjects
+            .values()
+            .find_map(|subject| subject.member.clone())
+            .unwrap();
+        member.environment.insert(
+            "PATH".into(),
+            format!("{}:${{PATH}}", root.path().display()),
+        );
+        member
+            .environment
+            .insert("ORCHID_VALUE".into(), "from-declaration".into());
+        let runtime = NativeRuntime::new(root.path(), None, std::path::Path::new("unused-pty"));
+        for (id, launch) in [
+            (
+                "orchid-argv",
+                crate::model::LaunchSpec::Argv(vec!["orchid-tool".into()]),
+            ),
+            (
+                "orchid-shell",
+                crate::model::LaunchSpec::Shell("orchid-tool".into()),
+            ),
+        ] {
+            member.runtime_id = id.into();
+            member.launch = launch;
+            runtime.start(&member).unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                if runtime
+                    .observe_exec(id)
+                    .unwrap()
+                    .is_some_and(|observation| observation.status == "exited")
+                {
+                    break;
+                }
+                assert!(std::time::Instant::now() < deadline);
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            assert_eq!(
+                runtime.read_exec_log(id).unwrap().unwrap(),
+                "from-declaration"
+            );
+        }
+    }
+
     #[test]
     fn claude_login_screen_recognizes_only_explicit_auth_prompts() {
         assert_eq!(
@@ -11404,6 +11895,56 @@ version 2
             store.mission_run(&run.id).unwrap().unwrap().steps[0].status,
             "completed"
         );
+        store
+            .set_mission_run_state(&run.id, "completed", "terminal", None)
+            .unwrap();
+
+        let rejected_run = store
+            .create_mission_run(&crate::model::MissionRunRequest {
+                mission: "review".into(),
+                revision: None,
+                workspace: "/tmp".into(),
+                requester: Some("person/test".into()),
+                mode: Some("run".into()),
+                inputs: BTreeMap::new(),
+                idempotency_key: "review-rejected-run".into(),
+            })
+            .unwrap();
+        reconciler.reconcile_once().unwrap();
+        reconciler.reconcile_once().unwrap();
+        let rejected_step = &rejected_run.steps[0].subject;
+        let rejected_request = store
+            .gate_request_for_owner(rejected_step)
+            .unwrap()
+            .expect("the second review was not requested");
+        store
+            .append_claim(&ClaimInput {
+                subject: rejected_request.subject,
+                kind: "gate.result".into(),
+                actor: Some("person/nathan".into()),
+                fields: BTreeMap::from([
+                    ("verdict".into(), Value::String("fail".into())),
+                    (
+                        "reason".into(),
+                        Value::String("The proof needs a source.".into()),
+                    ),
+                    ("request".into(), Value::String(rejected_request.id)),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some("review-rejected-result".into()),
+            })
+            .unwrap();
+        reconciler.reconcile_once().unwrap();
+        let failed = store.step_run(rejected_step).unwrap().unwrap();
+        assert_eq!(failed.status, "failed");
+        assert!(
+            failed
+                .blocked_reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("The proof needs a source.")
+        );
     }
 
     #[test]
@@ -13199,6 +13740,69 @@ agent "worker" {
     }
 
     #[test]
+    fn a_stopped_agents_declared_checkout_is_read_once_per_declaration() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        let declare = |command: &str| {
+            let source =
+                format!("version 2\n  agent \"worker\" {{\n    command \"{command}\"\n  }}\n");
+            let intent = parse_intent(&source, "node").unwrap();
+            let mission = store
+                .mission(
+                    &intent,
+                    crate::model::IntentInput {
+                        kdl: source.clone(),
+                        source_name: None,
+                    },
+                )
+                .unwrap();
+            store
+                .apply(
+                    &intent,
+                    &mission.subject_tokens,
+                    &format!("declare {command}"),
+                )
+                .unwrap();
+        };
+        declare("sleep 60");
+        let reconciler = Reconciler::new(
+            store.clone(),
+            Arc::new(FakeRuntime::default()),
+            "node".into(),
+            Arc::new(Notify::new()),
+        );
+        let parses = || DECLARATION_PARSES.with(std::cell::Cell::get);
+        let before = parses();
+        reconciler
+            .declared_run_end_checkout("agent/node.worker")
+            .unwrap();
+        store
+            .append_claim(&ClaimInput {
+                subject: "agent/node.other".into(),
+                kind: "runtime.observed".into(),
+                actor: None,
+                fields: BTreeMap::from([("status".into(), Value::String("running".into()))]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+        reconciler
+            .declared_run_end_checkout("agent/node.worker")
+            .unwrap();
+        assert_eq!(
+            parses() - before,
+            1,
+            "an unrelated write must not re-read a stopped agent's declarations"
+        );
+
+        declare("sleep 61");
+        reconciler
+            .declared_run_end_checkout("agent/node.worker")
+            .unwrap();
+        assert_eq!(parses() - before, 2);
+    }
+
+    #[test]
     fn stop_waits_for_exit_and_then_kills_the_same_incarnation() {
         let store = Arc::new(Store::open_memory("node").unwrap());
         let running_source = r#"
@@ -14073,7 +14677,7 @@ mission "scheduled-cycle" state="ready" {
             version 2
 
               mission "checkout-lifecycle" state="ready" timeout="1m" {{
-                goal "Work in a worktree that st3 creates and removes."
+                goal "Work in a worktree that st creates and removes."
                 agent "worker" {{
                   workspace {workspace:?}
                   checkout {repository:?} base="origin/main" branch="example/${{ST_MISSION_RUN}}" remove-at-run-end=#true
@@ -14438,7 +15042,7 @@ mission "absent-stop" state="ready" {
         ));
         let task = tokio::spawn(reconciler.run());
 
-        tokio::time::timeout(Duration::from_secs(1), async {
+        tokio::time::timeout(Duration::from_secs(10), async {
             loop {
                 let current = store.mission_run(&run.id).unwrap().unwrap();
                 if current.status == "failed" && current.phase == "terminal" {
@@ -17892,7 +18496,7 @@ version 2
     }
 
     #[test]
-    fn one_mission_run_rejects_a_runtime_id_in_two_steps() {
+    fn one_mission_run_rejects_a_runtime_id_in_two_steps_without_holding_later_runs() {
         let store = Arc::new(Store::open_memory("node").unwrap());
         let source = r#"
 version 2
@@ -17903,28 +18507,52 @@ version 2
     step "two" { agentless;  exec "same" { command "true"; restart "never" }  }
   }
 
+  mission "later" state="ready" {
+    goal "Complete beside a faulted run."
+    completion { when "all-steps-exhausted" }
+    step "one" { }
+  }
+
 "#;
         apply_source(&store, source, "publish-collision");
-        store
-            .create_mission_run(&MissionRunRequest {
-                mission: "collision".into(),
-                revision: None,
-                workspace: ".".into(),
-                requester: None,
-                mode: None,
-                inputs: BTreeMap::new(),
-                idempotency_key: "collision-run".into(),
-            })
-            .unwrap();
+        let request = |mission: &str| MissionRunRequest {
+            mission: mission.into(),
+            revision: None,
+            workspace: ".".into(),
+            requester: None,
+            mode: None,
+            inputs: BTreeMap::new(),
+            idempotency_key: format!("{mission}-run"),
+        };
+        let collision = store.create_mission_run(&request("collision")).unwrap();
+        // The faulted run is older, so it is evaluated first in every pass.
+        std::thread::sleep(Duration::from_millis(2));
+        let later = store.create_mission_run(&request("later")).unwrap();
         let reconciler = Reconciler::new(
-            store,
+            store.clone(),
             Arc::new(FakeRuntime::default()),
             "node".into(),
             Arc::new(Notify::new()),
+        )
+        .tolerating_faults();
+        for _ in 0..8 {
+            reconciler.reconcile_once().unwrap();
+        }
+        let fault = store
+            .reconcile_fault(&collision.subject, "mission-run")
+            .unwrap()
+            .expect("the colliding run records its fault");
+        assert!(fault.contains("more than one mission or step"), "{fault}");
+        assert_eq!(
+            store.mission_run(&later.id).unwrap().unwrap().status,
+            "completed"
         );
-        reconciler.reconcile_once().unwrap();
-        let error = reconciler.reconcile_once().unwrap_err();
-        assert!(error.to_string().contains("more than one mission or step"));
+        assert!(
+            store
+                .reconcile_fault("daemon/node", "stage/missions")
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -19937,10 +20565,18 @@ mission "ios-proof-blocked" state="ready" {
     #[test]
     fn an_unchanged_pass_floors_a_past_wake_deadline() {
         assert_eq!(
-            deadline_sleep_ms(1_000, 2_000, true),
+            deadline_sleep_ms(1_000, 2_000, Some(1_500)),
             WORK_WAKE_RETRY_MS as u64
         );
-        assert_eq!(deadline_sleep_ms(3_000, 2_000, true), 1_000);
+        assert_eq!(deadline_sleep_ms(3_000, 2_000, Some(1_500)), 1_000);
+    }
+
+    /// A mission deadline that falls due while a quiet pass runs has not been evaluated, so the
+    /// next pass runs at once rather than after the back-off.
+    #[test]
+    fn a_deadline_that_falls_due_during_a_quiet_pass_runs_at_once() {
+        assert_eq!(deadline_sleep_ms(1_600, 2_000, Some(1_500)), 0);
+        assert_eq!(deadline_sleep_ms(1_600, 2_000, None), 0);
     }
 
     #[test]

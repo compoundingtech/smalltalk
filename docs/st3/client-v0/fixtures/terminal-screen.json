@@ -7,11 +7,18 @@
   },
   "value": {
     "kind": "terminal-screen", "terminal_id": "terminal/release-shell", "runtime_incarnation": "pty-4:2026-09-20T11:10:00Z",
-    "rows": 3, "columns": 80, "cursor": { "row": 2, "column": 2, "visible": true }, "title": "release",
+    "revision": "5f2c0d9e41a7b3c8d6e1f0a2",
+    "rows": 3, "columns": 80,
+    "cursor": { "row": 2, "column": 2, "visible": true, "style": "block", "blinking": true },
+    "title": "release",
+    "modes": {
+      "alternate_screen": false, "application_cursor": false, "application_keypad": false,
+      "bracketed_paste": true, "focus_events": false, "mouse_tracking": "none", "mouse_encoding": "default"
+    },
     "lines": [
-      { "row": 0, "text": "$ cargo build", "redacted": false, "truncated": false },
-      { "row": 1, "text": "Finished", "redacted": false, "truncated": false },
-      { "row": 2, "text": "$ ", "redacted": false, "truncated": false }
+      { "row": 0, "text": "$ cargo build", "runs": [{ "text": "$ ", "fg": 2, "bold": true }, { "text": "cargo build" }], "redacted": false, "truncated": false },
+      { "row": 1, "text": "Finished", "runs": [{ "text": "Finished", "fg": "#5fd75f" }, { "text": "  ", "bg": 236 }], "redacted": false, "truncated": false },
+      { "row": 2, "text": "$", "runs": [{ "text": "$", "fg": 2, "bold": true }], "redacted": false, "truncated": false }
     ],
     "next_sequence": 41, "truncated": false
   }

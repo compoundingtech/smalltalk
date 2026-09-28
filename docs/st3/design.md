@@ -95,6 +95,35 @@ older copy of the config that lacks the new workspace.
 Native harnesses receive the same generated `.st3/boot.md`. A harness prompt can add stable
 repository context. It cannot replace the runtime contract.
 
+## Fault isolation
+
+The reconciler takes up each item of a pass on its own. The items are:
+
+- each member;
+- each observer, schedule, and subscription;
+- each mission run;
+- each later stage of the pass: intake, observers, schedules, scheduled work, subscriptions,
+  provider-capacity retries, retired-agent attention, mission evaluation, and attention `until`
+  conditions.
+
+When an item fails or panics, the reconciler records the fault on that item's subject and carries
+on with every other item:
+
+- a member fault is a `runtime.reconcile-decision` claim;
+- an observer, schedule, subscription, or mission-run fault is a `reconcile.fault` claim on that
+  subject;
+- a stage fault is a `reconcile.fault` claim on `daemon/HOST`, naming the stage.
+
+A fault is recorded again only when its cause changes. The item's next success records its
+recovery.
+
+Cleanup of a cancelled, failed, or finished run reads only the declarations that the run owns. It
+never waits for the run's mission revision or its steps, so a run whose revision is unavailable
+still stops its runtimes.
+
+A panic that escapes a pass restarts the reconciler with backoff and records `daemon.diagnostic`
+with the code `reconciler-panicked`.
+
 ## Messages and attention
 
 Small Talk messages are durable claims. Delivery is a separate lifecycle with sent, delivered,

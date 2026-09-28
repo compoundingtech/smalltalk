@@ -168,17 +168,13 @@ async fn observe_github_ref(request: ObservationRequest) -> Result<ProviderObser
     let client = reqwest::Client::builder()
         .user_agent("st3-resource-observer/0.1")
         .build()?;
-    let token = github_token().await;
+    let token = github_token().await?;
     let request_json = |url: String| {
         let request = client
             .get(url)
             .header("Accept", "application/vnd.github+json")
             .header("X-GitHub-Api-Version", "2022-11-28");
-        if let Some(token) = &token {
-            request.bearer_auth(token)
-        } else {
-            request
-        }
+        request.bearer_auth(&token)
     };
     let base = format!(
         "https://api.github.com/repos/{}/{}",
@@ -288,8 +284,8 @@ fn normalize_github_ref(
 }
 
 async fn observe_github_repository(request: ObservationRequest) -> Result<ProviderObservation> {
-    let token = github_token().await;
-    observe_github_repository_at(request, "https://api.github.com", token.as_deref()).await
+    let token = github_token().await?;
+    observe_github_repository_at(request, "https://api.github.com", Some(&token)).await
 }
 
 async fn observe_github_repository_at(
@@ -297,6 +293,9 @@ async fn observe_github_repository_at(
     api_base: &str,
     token: Option<&str>,
 ) -> Result<ProviderObservation> {
+    let token = token
+        .filter(|value| !value.trim().is_empty())
+        .context(GITHUB_AUTH_REMEDY)?;
     let (owner, repository) = request
         .locator
         .split_once('/')
@@ -316,9 +315,7 @@ async fn observe_github_repository_at(
         if let Some(etag) = etag {
             request = request.header(reqwest::header::IF_NONE_MATCH, etag);
         }
-        if let Some(token) = token {
-            request = request.bearer_auth(token);
-        }
+        request = request.bearer_auth(token);
         request
     };
     let base = format!("{api_base}/repos/{owner}/{repository}");
@@ -348,7 +345,7 @@ async fn observe_github_repository_at(
         request_json(base.clone(), repository_etag.as_deref())
             .send()
             .await?,
-        token.is_none(),
+        false,
     )?;
     let repository_id = match previous_repository_id {
         Some(previous) if response.status() == reqwest::StatusCode::NOT_MODIFIED => previous,
@@ -368,7 +365,7 @@ async fn observe_github_repository_at(
             &request_json,
             format!("{base}/pulls?state=open&per_page=100"),
             pulls_etag.as_deref(),
-            token.is_none(),
+            false,
         )
         .await?
     {
@@ -382,7 +379,7 @@ async fn observe_github_repository_at(
             &request_json,
             format!("{base}/issues?state=open&per_page=100"),
             issues_etag.as_deref(),
-            token.is_none(),
+            false,
         )
         .await?
     {
@@ -482,36 +479,40 @@ fn github_next_page(link: &str) -> Option<String> {
     })
 }
 
-async fn github_token() -> Option<String> {
-    static TOKEN: tokio::sync::OnceCell<Option<String>> = tokio::sync::OnceCell::const_new();
-    TOKEN.get_or_init(lookup_github_token).await.clone()
+pub(crate) const GITHUB_AUTH_REMEDY: &str = "GitHub observers have no token; run `gh auth login` as the daemon account or export GH_TOKEN/GITHUB_TOKEN in that account's login-shell startup files. Check the daemon PATH with `st doctor`. No anonymous request was sent; authentication is checked again on the next poll.";
+
+pub(crate) async fn github_token() -> Result<String> {
+    let environment = tokio::task::spawn_blocking(crate::environment::snapshot).await??;
+    lookup_github_token(&environment)
+        .await
+        .context(GITHUB_AUTH_REMEDY)
 }
 
-async fn lookup_github_token() -> Option<String> {
-    if let Some(token) = std::env::var("GH_TOKEN")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .or_else(|| {
-            std::env::var("GITHUB_TOKEN")
-                .ok()
-                .filter(|value| !value.trim().is_empty())
-        })
+async fn lookup_github_token(
+    environment: &std::collections::BTreeMap<String, String>,
+) -> Result<String> {
+    if let Some(token) = ["GH_TOKEN", "GITHUB_TOKEN"]
+        .into_iter()
+        .filter_map(|name| environment.get(name))
+        .find(|value| !value.trim().is_empty())
     {
-        return Some(token);
+        return Ok(token.clone());
     }
-    let output = tokio::process::Command::new("gh")
-        .args(["auth", "token"])
-        .kill_on_drop(true)
-        .output()
-        .await
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    String::from_utf8(output.stdout)
-        .ok()
-        .map(|token| token.trim().to_owned())
-        .filter(|token| !token.is_empty())
+    // Do not cache successes or failures: gh's credential store can change between polls.
+    let mut command =
+        tokio::process::Command::from(crate::environment::command_in("gh", environment)?);
+    let output = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        command.args(["auth", "token"]).kill_on_drop(true).output(),
+    )
+    .await
+    .context("GitHub credential lookup timed out")??;
+    // gh stderr can contain sensitive data. Only report a fixed, actionable error.
+    anyhow::ensure!(output.status.success(), "gh auth token failed");
+    let token = String::from_utf8(output.stdout).context("gh returned a non-UTF-8 token")?;
+    let token = token.trim();
+    anyhow::ensure!(!token.is_empty(), "gh returned an empty token");
+    Ok(token.to_owned())
 }
 
 /// Merge one complete repository listing into the previous facts. Items are identified by
@@ -653,17 +654,13 @@ async fn observe_github_pull_request(request: ObservationRequest) -> Result<Prov
     let client = reqwest::Client::builder()
         .user_agent("st3-resource-observer/0.1")
         .build()?;
-    let token = github_token().await;
+    let token = github_token().await?;
     let request_json = |url: String| {
         let request = client
             .get(url)
             .header("Accept", "application/vnd.github+json")
             .header("X-GitHub-Api-Version", "2022-11-28");
-        if let Some(token) = &token {
-            request.bearer_auth(token)
-        } else {
-            request
-        }
+        request.bearer_auth(&token)
     };
     let base = format!("https://api.github.com/repos/{owner}/{repository}");
     let pull: Value = request_json(format!("{base}/pulls/{number}"))
@@ -756,6 +753,54 @@ async fn observe_github_pull_request(request: ObservationRequest) -> Result<Prov
 mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    #[tokio::test]
+    async fn credentials_recover_after_a_missing_token_and_rotate() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let root = tempfile::tempdir().unwrap();
+        let environment =
+            std::collections::BTreeMap::from([("PATH".into(), root.path().display().to_string())]);
+        assert!(lookup_github_token(&environment).await.is_err());
+        let gh = root.path().join("gh");
+        std::fs::write(&gh, "#!/bin/sh\nexit 1\n").unwrap();
+        std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(lookup_github_token(&environment).await.is_err());
+        for token in ["orchid-first", "orchid-rotated"] {
+            std::fs::write(&gh, format!("#!/bin/sh\nprintf '%s' '{token}'\n")).unwrap();
+            assert_eq!(lookup_github_token(&environment).await.unwrap(), token);
+        }
+        let mut exported = environment;
+        exported.insert("GH_TOKEN".into(), "orchid-exported".into());
+        assert_eq!(
+            lookup_github_token(&exported).await.unwrap(),
+            "orchid-exported"
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_credentials_never_send_an_anonymous_request() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let request = ObservationRequest {
+            provider: "github.repository".into(),
+            locator: "orchid/garden".into(),
+            fields: BTreeSet::new(),
+            cursor: None,
+            previous_facts: None,
+        };
+        for token in [None, Some(""), Some(" ")] {
+            let error = observe_github_repository_at(request.clone(), &base, token)
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("no token"));
+            assert!(error.to_string().contains("gh auth login"));
+        }
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(30), listener.accept())
+                .await
+                .is_err()
+        );
+    }
 
     struct FakeProvider;
 
@@ -969,7 +1014,7 @@ mod tests {
             cursor: None,
             previous_facts: None,
         };
-        let first = observe_github_repository_at(request.clone(), &base, None)
+        let first = observe_github_repository_at(request.clone(), &base, Some("orchid-test-token"))
             .await
             .unwrap();
         let second = observe_github_repository_at(
@@ -979,7 +1024,7 @@ mod tests {
                 ..request
             },
             &base,
-            None,
+            Some("orchid-test-token"),
         )
         .await
         .unwrap();
@@ -991,6 +1036,11 @@ mod tests {
             .into_iter()
             .map(|request| request.to_ascii_lowercase())
             .collect::<Vec<_>>();
+        assert!(
+            requests
+                .iter()
+                .all(|request| request.contains("authorization: bearer orchid-test-token"))
+        );
         assert!(requests[0].starts_with("get /repos/example/repo "));
         assert!(requests[1].starts_with("get /repos/example/repo/issues?"));
         assert!(!requests[0].contains("if-none-match"));

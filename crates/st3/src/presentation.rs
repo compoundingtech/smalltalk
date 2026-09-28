@@ -505,6 +505,9 @@ pub(crate) fn render_attention_list(
             item.title
         );
         let _ = write!(output, "    {}", item.person);
+        if let Some(requester) = &item.requester_id {
+            let _ = write!(output, " · from {requester}");
+        }
         if let Some(mission) = &item.mission {
             let _ = write!(output, " · {mission}");
         }
@@ -525,7 +528,7 @@ pub(crate) fn render_attention_list(
         let _ = writeln!(output, "    subject: {}", item.subject);
         let _ = writeln!(
             output,
-            "    inspect: st3 attention show {} --as {}",
+            "    inspect: st attention show {} --as {}",
             item.subject, item.person
         );
         for action in &item.actions {
@@ -551,6 +554,9 @@ pub(crate) fn render_attention_show(
     let _ = writeln!(output, "SUBJECT   {}", item.subject);
     let _ = writeln!(output, "KIND      {}", item.kind);
     let _ = writeln!(output, "PERSON    {}", item.person);
+    if let Some(requester) = &item.requester_id {
+        let _ = writeln!(output, "FROM      {requester}");
+    }
     let _ = writeln!(
         output,
         "REQUESTED {}",
@@ -1403,6 +1409,7 @@ mod tests {
             kind: "fault".into(),
             subject: "attention/fabric".into(),
             person: "person/nathan".into(),
+            requester_id: None,
             title: "Fabric needs review".into(),
             detail: "The queue did not recover.".into(),
             mission: Some("mission/fabric".into()),
@@ -1436,7 +1443,7 @@ mod tests {
         assert!(rendered.contains("--reason 'It is fixed'"));
         assert!(!rendered.contains("The queue did not recover."));
         assert!(
-            rendered.contains("inspect: st3 attention show attention/fabric --as person/nathan")
+            rendered.contains("inspect: st attention show attention/fabric --as person/nathan")
         );
 
         let shown = render_attention_show(&item, OutputStyle::plain(), 180_000);

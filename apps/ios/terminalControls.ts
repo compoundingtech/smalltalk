@@ -1,5 +1,5 @@
-import type { St3Client } from '../../clients/typescript/st3-client';
-import type { Fence } from '../../clients/typescript/st3-client/Models.generated';
+import type { St3Client, TerminalStream } from '../../clients/typescript/st3-client';
+import type { Fence, TerminalScreen } from '../../clients/typescript/st3-client/Models.generated';
 
 type TerminalFence = Fence & Required<Pick<Fence, 'runtime_incarnation' | 'terminal_sequence'>>;
 
@@ -33,4 +33,88 @@ export async function withFreshTerminalFence<T>(
     catch (error) { if (!isStaleFence(error) || attempt === 2) throw error; }
   }
   throw new Error('Terminal changed too often; try again.');
+}
+
+export const TERMINAL_RESTARTED = 'Terminal restarted; reopen it before sending input.';
+const RETRY_DELAYS_MS = [1_000, 2_000, 5_000, 10_000, 30_000];
+
+type Client = Pick<St3Client, 'terminalScreen' | 'terminalAttach' | 'terminalStream'>;
+
+export type TerminalFollowHandlers = {
+  /** Each screen replaces the one before it. */
+  onScreen: (screen: TerminalScreen) => void;
+  /** A problem to show; an empty string clears it. */
+  onIssue: (issue: string) => void;
+};
+
+function errorCode(error: unknown): string | undefined {
+  if (!error || typeof error !== 'object' || !('response' in error)) return undefined;
+  const response = (error as { response?: { code?: unknown } }).response;
+  return typeof response?.code === 'string' ? response.code : undefined;
+}
+
+function errorMessage(error: unknown): string {
+  const code = errorCode(error);
+  const message = error instanceof Error ? error.message : String(error);
+  return code ? `${code}: ${message}` : message;
+}
+
+// Follow one terminal without polling: read its current screen, attach, then hold one stream
+// open and show each screen the server sends. A dropped stream reattaches after a backoff and
+// resumes from the current screen. A new runtime incarnation (`stale-fence`) or a refused
+// request stops following, because only reopening the terminal can resolve it.
+export function followTerminal(
+  client: Client,
+  terminalId: string,
+  handlers: TerminalFollowHandlers,
+  newActionId: () => string,
+  retryDelaysMs: readonly number[] = RETRY_DELAYS_MS,
+): { close(): void } {
+  let closed = false, incarnation = '', failures = 0;
+  let stream: TerminalStream | undefined, timer: ReturnType<typeof setTimeout> | undefined;
+
+  function stop(issue: string) { closed = true; handlers.onIssue(issue); }
+  function retry(error: unknown) {
+    if (closed) return;
+    const code = errorCode(error);
+    if (code === 'stale-fence' || (error instanceof Error && error.message === TERMINAL_RESTARTED)) { stop(TERMINAL_RESTARTED); return; }
+    if (code && code !== 'internal' && code !== 'remote-unavailable' && code !== 'rate-limited') { stop(errorMessage(error)); return; }
+    const delay = retryDelaysMs[Math.min(failures, retryDelaysMs.length - 1)];
+    failures++;
+    handlers.onIssue(`Terminal stream interrupted; reconnecting (${errorMessage(error)}).`);
+    timer = setTimeout(() => { void open(); }, delay);
+  }
+
+  async function open() {
+    try {
+      const screen = await client.terminalScreen(terminalId);
+      if (closed) return;
+      if (!incarnation) incarnation = screen.value.runtime_incarnation;
+      if (screen.value.runtime_incarnation !== incarnation) throw new Error(TERMINAL_RESTARTED);
+      handlers.onScreen(screen.value);
+      const result = await withFreshTerminalFence(client, terminalId, incarnation, fence => {
+        const id = newActionId();
+        return client.terminalAttach({ id, idempotency_key: id, fence, parameters: { target_id: terminalId } });
+      });
+      const attachment = result.value.terminal_attachment;
+      if (!attachment?.stream_capability) throw new Error('The gateway returned no terminal stream.');
+      if (closed) return;
+      stream = await client.terminalStream(terminalId, {
+        streamCapability: attachment.stream_capability,
+        incarnation: attachment.runtime_incarnation,
+        onScreen: next => {
+          if (closed) return;
+          if (next.value.runtime_incarnation !== incarnation) { stream?.close(); stop(TERMINAL_RESTARTED); return; }
+          failures = 0;
+          handlers.onIssue('');
+          handlers.onScreen(next.value);
+        },
+        onEnd: error => { stream = undefined; retry(error ?? new Error('The terminal stream closed.')); },
+      });
+      if (closed) stream.close();
+    } catch (error) { retry(error); }
+  }
+
+  void open();
+  return { close() { closed = true; clearTimeout(timer); stream?.close(); } };
 }

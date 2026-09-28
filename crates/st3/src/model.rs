@@ -1301,7 +1301,7 @@ pub struct SubjectStatus {
     pub projection: OperationalAnnotation,
 }
 
-/// The status conditions `st3 trace wait --for` accepts, which an attention request can also use
+/// The status conditions `st trace wait --for` accepts, which an attention request can also use
 /// as its `until` condition.
 pub const STATUS_WAIT_CONDITIONS: &[&str] = &[
     "running",
@@ -1365,6 +1365,25 @@ pub struct ClientResourcePage {
     pub filters: BTreeMap<String, String>,
     pub items: Vec<Value>,
     pub page: ClientPageInfo,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sync: Option<ClientSyncNotice>,
+}
+
+/// Present on every page while this host is catching up with a peer, because its projections
+/// can then show early history as current.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ClientSyncNotice {
+    pub state: String,
+    pub peers: Vec<ClientSyncPeer>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ClientSyncPeer {
+    pub host_id: String,
+    pub peer_only_envelopes: u64,
+    pub local_only_envelopes: u64,
+    pub last_exchange_at: Option<String>,
+    pub estimated_catch_up_seconds: Option<u64>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -1503,6 +1522,8 @@ pub struct AttentionItemView {
     pub kind: String,
     pub subject: String,
     pub person: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requester_id: Option<String>,
     pub title: String,
     pub detail: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2252,6 +2273,22 @@ pub struct ReplicaEnvelope {
     pub accepted_at_unix_ms: u128,
     /// Base64-encoded CBOR. Receipt does not decode this field.
     pub payload: String,
+    /// The writer's member key and its signature over this envelope, when the writer is a
+    /// keyed fleet member. Older peers ignore and drop both fields.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub member_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
+}
+
+/// A writer's signature for an envelope that the other side already holds.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ReplicaEnvelopeSignature {
+    pub writer: String,
+    pub sequence: u64,
+    pub hash: String,
+    pub member_key: String,
+    pub signature: String,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -2286,12 +2323,21 @@ pub struct ReplicationExchange {
     pub inventory: ReplicationInventory,
     #[serde(default)]
     pub envelopes: Vec<ReplicaEnvelope>,
+    /// Envelopes the sender holds but cannot admit until it has their writer's signature.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub signature_requests: Vec<ReplicaEnvelopeId>,
+    /// Signatures answering the other side's `signature_requests`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub signatures: Vec<ReplicaEnvelopeSignature>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ReplicationReceipt {
     pub received: usize,
     pub duplicate: usize,
+    /// Envelope signatures stored for the first time.
+    #[serde(default)]
+    pub signatures: usize,
     pub inventory: ReplicationInventory,
 }
 
@@ -2301,6 +2347,9 @@ pub struct ReplicationExportRequest {
     pub inventory: ReplicationInventory,
     #[serde(default)]
     pub summary_only: bool,
+    /// The other side's signature requests, to answer in the exported exchange.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub signature_requests: Vec<ReplicaEnvelopeId>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -2358,6 +2407,12 @@ pub struct ReplicationStatus {
     pub unknown_records: u64,
     pub invalid_records: u64,
     pub repaired_records: u64,
+    /// Envelopes of keyed writers held until their writer's signature arrives.
+    #[serde(default)]
+    pub unsigned_envelopes: u64,
+    /// Envelopes held because no incarnation of their writer holds their sequence.
+    #[serde(default)]
+    pub fenced_envelopes: u64,
     pub unhealthy_projections: u64,
     pub peers: Vec<ReplicationPeerStatus>,
 }
@@ -2371,6 +2426,32 @@ pub struct ReplicationPeerStatus {
     pub schema_digest: Option<String>,
     pub authority_digest: Option<String>,
     pub graph_digest: Option<String>,
+    /// How far apart the two envelope sets were at the last exchange that measured them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sync: Option<ReplicationPeerSync>,
+}
+
+/// The difference between this node's envelopes and one peer's, measured from the inventory the
+/// peer sent in its last exchange.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+pub struct ReplicationPeerSync {
+    /// Envelopes the peer holds that this node lacks.
+    pub peer_only_envelopes: u64,
+    /// Envelopes this node holds that the peer lacks.
+    pub local_only_envelopes: u64,
+    pub measured_at_unix_ms: u128,
+    /// Envelopes received from the peer per second over recent exchanges.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receive_rate_per_second: Option<f64>,
+    /// How fast `peer_only_envelopes` shrinks, net of the envelopes the peer keeps writing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub catch_up_rate_per_second: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimated_catch_up_seconds: Option<u64>,
+    /// The peer recently held more envelopes than one exchange carries, so this node's views
+    /// can show early history as current.
+    #[serde(default)]
+    pub catching_up: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

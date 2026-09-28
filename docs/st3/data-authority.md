@@ -31,6 +31,27 @@ semantics, a compaction or model change, a reading at least five minutes after t
 one while the harness works, and any reading while it does not. The newest pending reading
 replicates when the harness stops working.
 
+A node can also send every local observation to an OpenTelemetry collector. The exporter is off
+unless the config names a collector:
+
+```toml
+[observations.otlp]
+endpoint = "http://127.0.0.1:4318"             # OTLP/HTTP; logs go to /v1/logs
+headers_file = "/absolute/path/otlp-headers.toml" # optional, for example x-api-key = "..."
+```
+
+Each local observation becomes one OTLP log record in OTLP/HTTP JSON:
+
+- the record's timestamp is the observation time, and its body holds the fields;
+- its attributes are `st3.subject`, `st3.kind`, `st3.actor`, `st3.incarnation_id` and
+  `st3.local_id`;
+- the resource names `service.name = st3` and `st3.node`.
+
+The exporter keeps its cursor in `meta` and moves it only after the collector accepts a batch of
+at most 512 observations, so delivery is at least once. A collector that is down delays export
+with backoff up to five minutes and never blocks a write. Observations trimmed before export are
+counted in the daemon log.
+
 Runtime observations and harness observations remain separate claims. The status projection puts
 runtime fields in `actual` and the current incarnation's harness fields in `harness`.
 
@@ -68,6 +89,8 @@ order from the same admitted claims.
 | `replica_envelopes` | Replicated authority | Authenticated outer envelopes and their exact payloads |
 | `replica_records` | Admission state | Envelope records, validation results, and repair references |
 | `projection_health` | Local diagnostic projection | Projection attempts against admitted authority |
+| `replica_envelope_signatures` | Replicated authority | Writers' member-key signatures over envelopes, verified at receipt |
+| `replica_envelope_holds` | Admission state | Envelopes held as `unsigned` or `fenced` by fleet membership; retried on each wake |
 | `replication_peers` | Local transport state | Last signed exchange or transport failure for each configured peer |
 | `peer_cursors` | Legacy test state | The removed cursor protocol; production does not use this table |
 | `peer_replica_cursors` | Legacy test state | The removed cursor protocol; production does not use this table |
