@@ -20,7 +20,7 @@ The commit status description includes the mission run ID. On hetz:
 
 ```sh
 st missions show mission-run/fleet/smalltalk/ci/run/RUN-ID
-st trace show --subject mission-run/fleet/smalltalk/ci/run/RUN-ID
+st trace show mission-run/fleet/smalltalk/ci/run/RUN-ID
 ```
 
 The Linux checkout, summary and test logs are under
