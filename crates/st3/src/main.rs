@@ -2653,9 +2653,41 @@ impl std::fmt::Display for CommandExit {
 
 impl std::error::Error for CommandExit {}
 
-#[tokio::main]
-async fn main() -> ExitCode {
+fn main() -> ExitCode {
+    // A recorder link starts st3 as `git` or `gh`. It must not build the async runtime.
+    if let Some(program) = st3::recorder::invoked_program() {
+        st3::recorder::run(program);
+    }
     let cli = Cli::parse();
+    if let Command::Up(args) = &cli.command {
+        record_daemon_commands(args);
+    }
+    run_cli(cli)
+}
+
+/// The daemon finds `git` and `gh` through its recorder like every member does. `run_up` installs
+/// the directory; until then PATH lookups skip it.
+fn record_daemon_commands(args: &UpArgs) {
+    let state_dir = match &args.state_dir {
+        Some(state_dir) => state_dir.clone(),
+        None => match Config::load_unvalidated(args.config.as_deref()) {
+            Ok(config) => config.state_dir,
+            // `run_up` reports the configuration error.
+            Err(_) => return,
+        },
+    };
+    let Ok(directory) = st3::recorder::directory(&state_dir) else {
+        return;
+    };
+    let Ok(path) = st3::recorder::prepend(&directory, std::env::var_os("PATH").as_deref()) else {
+        return;
+    };
+    // SAFETY: no other thread exists yet; the async runtime starts after this returns.
+    unsafe { std::env::set_var("PATH", path) };
+}
+
+#[tokio::main]
+async fn run_cli(cli: Cli) -> ExitCode {
     match run(cli).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
@@ -3013,6 +3045,7 @@ async fn run_up(args: UpArgs) -> Result<()> {
         Some(pty_binary) => pty_binary,
         None => st_runtime::resolve_executable("pty", &login_environment)?,
     };
+    let recorder = install_recorder(&config, &login_environment);
     let state = AppState {
         store: store.clone(),
         notify: notify.clone(),
@@ -3036,6 +3069,7 @@ async fn run_up(args: UpArgs) -> Result<()> {
         config.socket.display().to_string(),
         notify.clone(),
         event_notify.clone(),
+        recorder.map(|installation| installation.directory),
     )?);
     tokio::spawn(reconciler.supervise());
     tokio::spawn(trim_local_observations(
@@ -3074,6 +3108,47 @@ async fn run_up(args: UpArgs) -> Result<()> {
         serve_unix(&client_gateway_socket, fabric_router(state)),
     )?;
     Ok(())
+}
+
+/// Links `git` and `gh` to this executable for the daemon and its members. The daemon still
+/// starts when it cannot; it then says so, and nothing is recorded.
+fn install_recorder(
+    config: &Config,
+    login_environment: &BTreeMap<String, String>,
+) -> Option<st3::recorder::Installation> {
+    let daemon_path = std::env::var_os("PATH").unwrap_or_default();
+    let login_path = login_environment
+        .get("PATH")
+        .map(std::ffi::OsString::from)
+        .unwrap_or_default();
+    let installed = std::env::current_exe()
+        .context("find the st3 executable")
+        .and_then(|executable| {
+            st3::recorder::install(
+                &config.state_dir,
+                &config.node,
+                &executable,
+                &[&daemon_path, &login_path],
+            )
+        });
+    match installed {
+        Ok(installation) if installation.programs.is_empty() => {
+            eprintln!("st: neither git nor gh is on PATH, so no calls are recorded");
+            Some(installation)
+        }
+        Ok(installation) => {
+            eprintln!(
+                "st: recording {} calls in {}",
+                installation.programs.join(" and "),
+                installation.log.display()
+            );
+            Some(installation)
+        }
+        Err(error) => {
+            eprintln!("st: not recording git and gh calls: {error:#}");
+            None
+        }
+    }
 }
 
 #[cfg(target_os = "macos")]

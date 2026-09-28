@@ -79,6 +79,11 @@ Seat drivers wait as long as the restart takes, keep their notes out of the seat
 `~/.local/state/st3/driver-api-warnings.log`, and resume from the graph. To run the daemon in the
 foreground instead, use `st up`.
 
+st records every `git` and `gh` call it starts, including its own, in
+`~/.local/state/st3/recorder/commands.jsonl`, then runs the real program unchanged. A call by
+absolute path is not recorded. The [command recorder](docs/st3/command-recorder.md) describes the
+log.
+
 ## First commands
 
 ```sh
