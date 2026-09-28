@@ -50,11 +50,11 @@ const labels = missionLabels([
   { id: 'mission/__st3/copilot-1468/loop/green/round', title: '__st3/copilot-1468/loop/green/round' },
   { id: 'mission/__st3/refresh-1445/loop/green/round', title: '__st3/refresh-1445/loop/green/round' },
 ]);
-assert.equal(labels.get('mission/fleet/st3/issue-triage'), 'Issue Triage · ST3');
+assert.equal(labels.get('mission/fleet/st3/issue-triage'), 'Issue Triage · ST');
 assert.equal(labels.get('mission/fleet/app-apple/issue-triage'), 'Issue Triage · App Apple');
 assert.equal(labels.get('mission/fleet/app-apple/deploy'), 'Deploy');
 assert.equal(labels.get('mission/fleet/st3/tui-ios-fixes'), 'TUI iOS Fixes');
-assert.equal(labels.get('mission/fleet/st3'), 'ST3');
+assert.equal(labels.get('mission/fleet/st3'), 'ST');
 assert.equal(new Set(labels.values()).size, labels.size);
 
 // (11) Actions and kinds are presented in words, never as raw action IDs.

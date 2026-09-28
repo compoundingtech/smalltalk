@@ -1449,7 +1449,7 @@ fn bounded_text(value: &str) -> String {
         .chars()
         .take(MAX_TIMELINE_VALUE_BYTES)
         .collect::<String>();
-    output.push_str("\n[st3 truncated this native timeline value]");
+    output.push_str("\n[st truncated this native timeline value]");
     output
 }
 
