@@ -3,7 +3,7 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::body::{Body, to_bytes};
 use axum::extract::ws::{Message as WsMessage, WebSocket, WebSocketUpgrade};
@@ -504,6 +504,8 @@ async fn response_envelope(
     mut request: Request<Body>,
     next: Next,
 ) -> Response {
+    let started = Instant::now();
+    let request_path = request.uri().path().to_owned();
     let client_request = request.uri().path().starts_with("/v1/client/");
     let fabric_boundary_error = (matches!(transport, ClientTransportBoundary::FabricLoopback)
         && !client_request
@@ -567,6 +569,7 @@ async fn response_envelope(
             .and_then(|value| value.to_str().ok())
             .is_some_and(|value| value.starts_with("application/json"))
     {
+        report_slow_request(&state, &request_path, started);
         return response;
     }
     let status = response.status();
@@ -639,7 +642,37 @@ async fn response_envelope(
     };
     let body = serde_json::to_vec(&envelope).unwrap_or_else(|_| b"{}".to_vec());
     parts.headers.remove(axum::http::header::CONTENT_LENGTH);
+    report_slow_request(&state, &request_path, started);
     Response::from_parts(parts, Body::from(body))
+}
+
+fn report_slow_request(state: &AppState, path: &str, started: Instant) {
+    let elapsed = started.elapsed();
+    if elapsed < Duration::from_secs(1) {
+        return;
+    }
+    let store = state.store.clone();
+    let subject = format!("daemon/{}", state.node);
+    let reason = format!("request {path} took {} ms", elapsed.as_millis());
+    tokio::task::spawn_blocking(move || {
+        let result = store.append_claim(&ClaimInput {
+            subject,
+            kind: "daemon.diagnostic".into(),
+            actor: None,
+            fields: BTreeMap::from([
+                ("severity".into(), Value::String("error".into())),
+                ("code".into(), Value::String("slow-request".into())),
+                ("status".into(), Value::String("faulted".into())),
+                ("reason".into(), Value::String(reason.clone())),
+            ]),
+            evidence: Vec::new(),
+            expected_subject: None,
+            idempotency_key: None,
+        });
+        if let Err(error) = result {
+            eprintln!("slow request fault could not be recorded: {reason}: {error}");
+        }
+    });
 }
 
 fn new_request_id() -> String {
@@ -1295,6 +1328,22 @@ fn client_agent_resources(
     at: &str,
     snapshot_index: u64,
 ) -> anyhow::Result<Vec<Value>> {
+    let mut items = store.cached_agent_resources(snapshot_index, history, || {
+        client_agent_resources_uncached(store, history, snapshot_index)
+    })?;
+    for item in &mut items {
+        if item.get("updated_at").and_then(Value::as_str) == Some("") {
+            item["updated_at"] = Value::String(at.to_owned());
+        }
+    }
+    Ok(items)
+}
+
+fn client_agent_resources_uncached(
+    store: &Store,
+    history: bool,
+    snapshot_index: u64,
+) -> anyhow::Result<Vec<Value>> {
     // The default store status scan omits unhealthy current agents along with
     // history. Scan both, then keep current-layer agents below.
     let status = store.status_for_subject_prefix_at("agent/", Some(snapshot_index), true)?;
@@ -1395,7 +1444,7 @@ fn client_agent_resources(
                             .map(|claim| client_timestamp(claim.accepted_at_unix_ms))
                     })
                 })
-                .unwrap_or_else(|| at.to_owned());
+                .unwrap_or_default();
             let name = subject
                 .desired
                 .as_ref()
@@ -2563,13 +2612,14 @@ async fn client_agents(
     if query.cursor.is_some() {
         return client_page(&state, &snapshot, "agents", Vec::new(), &query).map(Json);
     }
-    let mut items = client_agent_resources(
-        &state.store,
-        query.history,
-        &snapshot.created_at,
-        snapshot.store_index,
-    )
-    .map_err(ApiError::internal)?;
+    let store = state.store.clone();
+    let history = query.history;
+    let created_at = snapshot.created_at.clone();
+    let snapshot_index = snapshot.store_index;
+    let mut items = blocking_store(move || {
+        client_agent_resources(&store, history, &created_at, snapshot_index)
+    })
+    .await?;
     if let Some(status) = query.status.as_deref() {
         items.retain(|item| item.get("state").and_then(Value::as_str) == Some(status));
     }
@@ -2582,17 +2632,15 @@ async fn client_agents_detail(
     AxumPath(id): AxumPath<String>,
     Query(query): Query<ClientListQuery>,
 ) -> Result<Json<Value>, ApiError> {
-    client_detail(
-        client_agent_resources(
-            &state.store,
-            query.history,
-            &snapshot.created_at,
-            snapshot.store_index,
-        )
-        .map_err(ApiError::internal)?,
-        "agent",
-        &id,
-    )
+    let store = state.store.clone();
+    let history = query.history;
+    let created_at = snapshot.created_at.clone();
+    let snapshot_index = snapshot.store_index;
+    let items = blocking_store(move || {
+        client_agent_resources(&store, history, &created_at, snapshot_index)
+    })
+    .await?;
+    client_detail(items, "agent", &id)
 }
 
 async fn client_sessions(
@@ -3497,6 +3545,12 @@ fn doctor_report(state: &AppState) -> Result<Json<DoctorReport>, ApiError> {
             message: error.to_string(),
         }),
     }
+    let (recording, message) = crate::recorder::health(&state.state_dir);
+    checks.push(DoctorCheck {
+        name: "command-recorder".into(),
+        status: if recording { "pass" } else { "warn" }.into(),
+        message,
+    });
     // Once a node pins a fleet anchor, membership decides admission. Report what waits for a
     // signature, what is fenced, and what was admitted before this node knew better.
     match state.store.fleet_anchor() {
@@ -9204,6 +9258,115 @@ mod tests {
         let admitted_local = client_request_snapshot(&gateway, Some(local.clone()));
         assert_eq!(admitted_local.id, local.id);
         assert_eq!(admitted_local.store_index, local.store_index);
+    }
+
+    #[tokio::test]
+    async fn slow_request_records_a_durable_fault() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        report_slow_request(
+            &state,
+            "/v1/client/agents",
+            Instant::now() - Duration::from_secs(2),
+        );
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(claim) = state
+                    .store
+                    .latest_claim("daemon/node", Some("daemon.diagnostic"))
+                    .unwrap()
+                {
+                    assert_eq!(claim.body["fields"]["code"], "slow-request");
+                    assert!(
+                        claim.body["fields"]["reason"]
+                            .as_str()
+                            .unwrap()
+                            .contains("/v1/client/agents")
+                    );
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn busy_agent_projection_does_not_block_other_async_requests() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let snapshot = new_client_snapshot(&state);
+        let store = state.store.clone();
+        let (ready_send, ready_recv) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            store.hold_read_connections_for_test(|| {
+                ready_send.send(()).unwrap();
+                std::thread::sleep(Duration::from_millis(300));
+            });
+        });
+        ready_recv.recv().unwrap();
+        let handler = tokio::spawn(client_agents(
+            State(state),
+            Extension(snapshot),
+            Query(ClientListQuery::default()),
+        ));
+        let started = Instant::now();
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert!(started.elapsed() < Duration::from_millis(150));
+        holder.join().unwrap();
+        let _ = handler.await.unwrap().unwrap();
+    }
+
+    #[test]
+    fn repeated_agent_list_does_not_wait_for_busy_read_connections() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let index = state.store.index().unwrap();
+        client_agent_resources(&state.store, false, "first", index).unwrap();
+        let index = state
+            .store
+            .append_claim(&ClaimInput {
+                subject: "daemon/node".into(),
+                kind: "daemon.diagnostic".into(),
+                actor: None,
+                fields: BTreeMap::from([
+                    ("severity".into(), Value::String("error".into())),
+                    ("code".into(), Value::String("slow-request".into())),
+                    (
+                        "reason".into(),
+                        Value::String("a request exceeded one second".into()),
+                    ),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap()
+            .store_index;
+        client_agent_resources(&state.store, false, "after diagnostic", index).unwrap();
+        let (ready_send, ready_recv) = std::sync::mpsc::channel();
+        let (release_send, release_recv) = std::sync::mpsc::channel();
+        let holder = state.store.clone();
+        let held = std::thread::spawn(move || {
+            holder.hold_read_connections_for_test(|| {
+                ready_send.send(()).unwrap();
+                release_recv.recv().unwrap();
+            });
+        });
+        ready_recv.recv().unwrap();
+        let store = state.store.clone();
+        let (result_send, result_recv) = std::sync::mpsc::channel();
+        let read = std::thread::spawn(move || {
+            result_send
+                .send(client_agent_resources(&store, false, "second", index))
+                .unwrap();
+        });
+        let result = result_recv.recv_timeout(Duration::from_millis(250));
+        release_send.send(()).unwrap();
+        held.join().unwrap();
+        read.join().unwrap();
+        assert!(result.unwrap().unwrap().is_empty());
     }
 
     fn state(root: &Path) -> AppState {
