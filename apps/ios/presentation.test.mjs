@@ -61,6 +61,7 @@ assert.equal(new Set(labels.values()).size, labels.size);
 assert.equal(attentionActionLabel('attention.resolve'), 'Resolve');
 assert.equal(attentionActionLabel('mission.approve-revision'), 'Approve revision');
 assert.equal(attentionKindLabel('human-gate'), 'Needs a decision');
+assert.equal(attentionKindLabel('agent-request'), 'Agent request');
 for (const action of ['attention.resolve', 'review.approve', 'review.reject', 'launch.approve', 'launch.cancel', 'mission.approve-revision', 'mission.cancel-revision', 'message.read']) assert.doesNotMatch(attentionActionLabel(action), /\./);
 
 // (6) Delivery envelopes read as a message, without the unknown marker or raw IDs.
