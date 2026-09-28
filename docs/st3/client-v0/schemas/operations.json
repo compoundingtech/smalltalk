@@ -42,6 +42,7 @@
     { "id": "sessions.list", "method": "GET", "path": "/v1/client/sessions", "response": "Page" },
     { "id": "sessions.get", "method": "GET", "path": "/v1/client/sessions/{id}", "response": "Resource" },
     { "id": "timeline.list", "method": "GET", "path": "/v1/client/sessions/{id}/timeline", "response": "TimelinePage" },
+    { "id": "conversation.changes", "method": "GET", "path": "/v1/client/conversations/{id}/changes", "response": "ConversationChanges" },
     { "id": "events.list", "method": "GET", "path": "/v1/client/events", "response": "EventPage" },
     { "id": "terminal.screen", "method": "GET", "path": "/v1/client/terminals/{id}/screen", "response": "TerminalScreen" }
   ],
@@ -49,7 +50,8 @@
     { "id": "action.submit", "method": "POST", "path": "/v1/client/actions", "request": "ActionRequest", "response": "ActionResult" },
     { "id": "pairing.begin", "method": "POST", "path": "/v1/client/pairings", "request": "PairingBegin", "response": "PairingChallenge", "local_only": true },
     { "id": "pairing.complete", "method": "POST", "path": "/v1/client/pairings/{id}/complete", "request": "PairingComplete", "response": "PairedSession" },
-    { "id": "terminal.stream", "method": "GET", "path": "/v1/client/terminals/{id}/stream", "response": "TerminalScreen", "websocket_protocol": "st3.client.terminal.v0" }
+    { "id": "terminal.stream", "method": "GET", "path": "/v1/client/terminals/{id}/stream", "response": "TerminalScreen", "websocket_protocol": "st3.client.terminal.v0" },
+    { "id": "conversation.stream", "method": "GET", "path": "/v1/client/conversations/{id}/stream", "response": "ConversationChanges", "websocket_protocol": "st3.client.conversation.v0" }
   ],
   "actions": {
     "review.approve": { "capability": "control.attention", "parameters": "TargetParameters" },

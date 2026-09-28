@@ -846,6 +846,14 @@ impl Resource {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct ConversationChanges {
+    pub kind: String,
+    pub session_id: String,
+    pub items: Vec<TimelineEntry>,
+    pub next_cursor: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct TimelinePage {
     pub kind: String,
     pub session_id: String,

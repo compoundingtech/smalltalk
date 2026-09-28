@@ -115,6 +115,30 @@ pub struct TerminalStream {
     limit: usize,
 }
 
+/// A held stream of new conversation entries with a cursor for reconnecting.
+pub struct ConversationStream {
+    socket: TerminalSocket,
+    limit: usize,
+}
+
+impl ConversationStream {
+    pub async fn next(&mut self) -> Result<Option<Envelope<ConversationChanges>>, ClientError> {
+        let payload = match &mut self.socket {
+            TerminalSocket::Unix(socket) => next_websocket_payload(socket, self.limit).await?,
+            TerminalSocket::Remote(socket) => next_websocket_payload(socket, self.limit).await?,
+        };
+        payload
+            .map(|bytes| decode_conversation_message(&bytes))
+            .transpose()
+    }
+    pub async fn close(mut self) {
+        let _ = match &mut self.socket {
+            TerminalSocket::Unix(socket) => socket.close(None).await,
+            TerminalSocket::Remote(socket) => socket.close(None).await,
+        };
+    }
+}
+
 enum TerminalSocket {
     Unix(WebSocketStream<tokio::net::UnixStream>),
     Remote(WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>),
@@ -386,6 +410,10 @@ impl Client {
         self.get(&format!("/v1/client/now?{}", query.join("&")))
             .await
     }
+    /// Read the bounded mission and seat tree in one projection response.
+    pub async fn missions_tree(&self) -> Result<serde_json::Value, ClientError> {
+        self.get("/v1/client/missions-tree").await
+    }
     pub async fn work_list_for_actor(
         &self,
         actor: &str,
@@ -507,6 +535,20 @@ impl Client {
         let routed_id = percent_encode_segment(session_id.trim_start_matches("session/"));
         self.get(&format!("/v1/client/sessions/{routed_id}/timeline{suffix}"))
             .await
+    }
+    async fn conversation_changes_internal(
+        &self,
+        session_id: &str,
+        after: Option<&str>,
+        wait_ms: u64,
+    ) -> Result<Envelope<ConversationChanges>, ClientError> {
+        let routed_id = percent_encode_segment(session_id.trim_start_matches("session/"));
+        let mut path = format!("/v1/client/conversations/{routed_id}/changes?wait_ms={wait_ms}");
+        if let Some(after) = after {
+            path.push_str("&after=");
+            path.push_str(&percent_encode(after));
+        }
+        self.get(&path).await
     }
     async fn events_internal(
         &self,
@@ -746,6 +788,15 @@ impl Client {
         limit: Option<usize>,
     ) -> Result<Envelope<TimelinePage>, ClientError> {
         self.timeline_page_internal(session_id, cursor, limit).await
+    }
+    pub async fn conversation_changes(
+        &self,
+        session_id: &str,
+        after: Option<&str>,
+        wait_ms: u64,
+    ) -> Result<Envelope<ConversationChanges>, ClientError> {
+        self.conversation_changes_internal(session_id, after, wait_ms)
+            .await
     }
     pub async fn events(
         &self,
@@ -1290,6 +1341,81 @@ impl Client {
         })
     }
 
+    pub async fn conversation_stream(
+        &self,
+        session_id: &str,
+        after: Option<&str>,
+    ) -> Result<ConversationStream, ClientError> {
+        let routed_id = percent_encode_segment(session_id.trim_start_matches("session/"));
+        let suffix = after
+            .map(|after| format!("?after={}", percent_encode(after)))
+            .unwrap_or_default();
+        let path = format!("/v1/client/conversations/{routed_id}/stream{suffix}");
+        let request_for = |base: &str| -> Result<Request<()>, ClientError> {
+            let mut request = websocket_request(
+                &format!("{base}{path}"),
+                self.credential.as_deref(),
+                self.local_person.as_deref(),
+                None,
+            )?;
+            request.headers_mut().insert(
+                hyper::header::SEC_WEBSOCKET_PROTOCOL,
+                hyper::header::HeaderValue::from_static("st3.client.conversation.v0"),
+            );
+            Ok(request)
+        };
+        let socket = match &self.endpoint {
+            Endpoint::Unix(path) => {
+                let stream = tokio::time::timeout(
+                    STREAM_HANDSHAKE_DEADLINE,
+                    tokio::net::UnixStream::connect(path),
+                )
+                .await
+                .map_err(|_| {
+                    ClientError::Transport("conversation stream connect deadline exceeded".into())
+                })?
+                .map_err(|error| unreachable_error(&path.display().to_string(), &error))?;
+                let (socket, response) = tokio::time::timeout(
+                    STREAM_HANDSHAKE_DEADLINE,
+                    tokio_tungstenite::client_async(request_for("ws://localhost")?, stream),
+                )
+                .await
+                .map_err(|_| {
+                    ClientError::Transport("conversation stream handshake deadline exceeded".into())
+                })?
+                .map_err(|error| ClientError::Transport(error.to_string()))?;
+                validate_conversation_subprotocol(&response)?;
+                TerminalSocket::Unix(socket)
+            }
+            Endpoint::FabricLoopback(base) => {
+                let websocket_base = if let Some(base) = base.strip_prefix("https://") {
+                    format!("wss://{base}")
+                } else if let Some(base) = base.strip_prefix("http://") {
+                    format!("ws://{base}")
+                } else {
+                    return Err(ClientError::Protocol(
+                        "Fabric loopback endpoint must use http or https".into(),
+                    ));
+                };
+                let (socket, response) = tokio::time::timeout(
+                    STREAM_HANDSHAKE_DEADLINE,
+                    connect_async(request_for(&websocket_base)?),
+                )
+                .await
+                .map_err(|_| {
+                    ClientError::Transport("conversation stream handshake deadline exceeded".into())
+                })?
+                .map_err(|error| ClientError::Transport(error.to_string()))?;
+                validate_conversation_subprotocol(&response)?;
+                TerminalSocket::Remote(socket)
+            }
+        };
+        Ok(ConversationStream {
+            socket,
+            limit: self.response_limit(),
+        })
+    }
+
     fn response_limit(&self) -> usize {
         self.max_response_bytes.load(Ordering::Relaxed)
     }
@@ -1573,6 +1699,45 @@ fn validate_terminal_subprotocol(
         )));
     }
     Ok(())
+}
+
+fn validate_conversation_subprotocol(
+    response: &tokio_tungstenite::tungstenite::handshake::client::Response,
+) -> Result<(), ClientError> {
+    let selected = response
+        .headers()
+        .get(hyper::header::SEC_WEBSOCKET_PROTOCOL)
+        .and_then(|value| value.to_str().ok());
+    if selected != Some("st3.client.conversation.v0") {
+        return Err(ClientError::Protocol(format!(
+            "conversation WebSocket selected {selected:?}"
+        )));
+    }
+    Ok(())
+}
+
+fn decode_conversation_message(bytes: &[u8]) -> Result<Envelope<ConversationChanges>, ClientError> {
+    let value: serde_json::Value =
+        serde_json::from_slice(bytes).map_err(|error| ClientError::Protocol(error.to_string()))?;
+    if value.get("error_version").is_some() {
+        let error: ErrorEnvelope = serde_json::from_value(value)
+            .map_err(|error| ClientError::Protocol(error.to_string()))?;
+        return Err(ClientError::Api(
+            error.code.clone(),
+            error.message.clone(),
+            Box::new(error),
+        ));
+    }
+    if value
+        .pointer("/value/kind")
+        .and_then(serde_json::Value::as_str)
+        != Some("conversation-changes")
+    {
+        return Err(ClientError::Protocol(
+            "unexpected conversation stream value".into(),
+        ));
+    }
+    serde_json::from_value(value).map_err(|error| ClientError::Protocol(error.to_string()))
 }
 
 fn decode_terminal_message(bytes: &[u8]) -> Result<Envelope<TerminalScreen>, ClientError> {
