@@ -20,6 +20,11 @@ fn clean_path() -> tempfile::TempDir {
                         .windows(b"st2-recorder-wrapper".len())
                         .any(|window| window == b"st2-recorder-wrapper")
                 })
+                && Command::new(path)
+                    .arg("--version")
+                    .env("PATH", "")
+                    .output()
+                    .is_ok_and(|output| output.status.success())
         })
         .expect("the native authoring guide requires git on PATH");
     symlink(git, bin.path().join("git")).unwrap();
