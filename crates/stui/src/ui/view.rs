@@ -252,6 +252,8 @@ pub enum Word {
     /// Ready, waiting its turn behind other work on a busy agent. Nothing to do.
     Queued,
     Working,
+    /// Kept open by st so its observers can start other missions. Nothing is running.
+    Watching,
     Held,
     Idle,
     Done,
@@ -267,6 +269,7 @@ impl Word {
             Word::Unclaimed => "unclaimed",
             Word::Queued => "queued",
             Word::Working => "working",
+            Word::Watching => "watching",
             Word::Held => "held",
             Word::Idle => "idle",
             Word::Done => "done",
@@ -281,6 +284,7 @@ impl Word {
             Word::Unclaimed => "a step is ready; st has not said which agent takes it",
             Word::Queued => "a step is waiting its turn on a busy agent; nothing to do",
             Word::Working => "an agent is doing a step now",
+            Word::Watching => "st keeps this open and starts other missions when something happens",
             Word::Held => "waiting on something outside the fleet",
             Word::Idle => "running, with nothing ready",
             Word::Done => "every step finished",

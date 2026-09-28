@@ -1,0 +1,223 @@
+[
+ {
+  "id": "entry-1",
+  "sequence": 1,
+  "revision": 1,
+  "timestamp": "2026-09-28T09:00:00Z",
+  "role": "user",
+  "final": true,
+  "type": "content",
+  "body": {
+   "media_type": "text/plain",
+   "text": "Please check why the nightly build failed and fix it."
+  }
+ },
+ {
+  "id": "entry-2",
+  "sequence": 2,
+  "revision": 1,
+  "timestamp": "2026-09-28T09:01:00Z",
+  "role": "assistant",
+  "final": true,
+  "type": "content",
+  "body": {
+   "media_type": "text/plain",
+   "text": "I'll look at the build log first."
+  }
+ },
+ {
+  "id": "entry-3",
+  "sequence": 3,
+  "revision": 1,
+  "timestamp": "2026-09-28T09:02:00Z",
+  "role": "user",
+  "final": true,
+  "type": "content",
+  "body": {
+   "media_type": "text/plain",
+   "text": "<task-notification>\n<summary>Stop hook feedback</summary>\n</task-notification>\n<system-reminder>\nStop hook blocking error from command \"SessionStart:startup\": Run the st2 boot ritual now: set your status to available, then drain your inbox by reading, acting on, replying when useful, and archiving each handled message.\n\n</system-reminder>"
+  }
+ },
+ {
+  "id": "entry-4",
+  "sequence": 4,
+  "revision": 1,
+  "timestamp": "2026-09-28T09:03:00Z",
+  "role": "user",
+  "final": true,
+  "type": "content",
+  "body": {
+   "media_type": "text/plain",
+   "text": "<task-notification>\n<task-id>a53fe8b326564e841</task-id>\n<tool-use-id>toolu_01DFKWExusGHhDrmUxSrP5bq</tool-use-id>\n<output-file>/tmp/claude-1000/-home-robin-src-github-com-example-org-st2--pty-rust/4b5f38c2-5bba-47cb-afaa-44bd0c005f0a/tasks/a53fe8b326564e841.output</output-file>\n<status>failed</status>\n<summary>Agent \"Lane C: client operations\" failed: Agent terminated early due to an API error: You've hit your session limit · resets 3:50pm (UTC) (error type rate_limit, HTTP 429, request id req_011CeX87VRY5w6GkLEb97KJG, model sent to the API: claude-fable-5)</summary>\n<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>\n<result>Now I need the full protocol inventory that got persisted, the parity-plan sections, the Node source files this lane ports, and the current consumers of `pty_core::client` in the workspace.</result>\n</task-notification>"
+  }
+ },
+ {
+  "id": "entry-5",
+  "sequence": 5,
+  "revision": 1,
+  "timestamp": "2026-09-28T09:04:00Z",
+  "role": "user",
+  "final": true,
+  "type": "content",
+  "body": {
+   "media_type": "text/plain",
+   "text": "<task-notification>\n<task-id>a86db1a954b5a346b</task-id>\n<tool-use-id>toolu_01TcE7HxapeoBDwjvUAcem2A</tool-use-id>\n<output-file>/tmp/claude-1000/-home-robin-src-github-com-example-org-st2--pty-rust/4b5f38c2-5bba-47cb-afaa-44bd0c005f0a/tasks/a86db1a954b5a346b.output</output-file>\n<status>failed</status>\n<summary>Agent \"Lane A: registry, locks, events\" failed: Agent terminated early due to an API error: You've hit your session limit · resets 3:50pm (UTC) (error type rate_limit, HTTP 429, request id req_011CeX87bVALPgBgNobyBb4E, model sent to the API: claude-fable-5)</summary>\n<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>\n<result>Now I'll create the worktree and read the plan docs and design notes in parallel.</result>\n</task-notification>"
+  }
+ },
+ {
+  "id": "entry-6",
+  "sequence": 6,
+  "revision": 1,
+  "timestamp": "2026-09-28T09:05:00Z",
+  "role": "assistant",
+  "final": true,
+  "type": "content",
+  "body": {
+   "media_type": "text/plain",
+   "text": "Two helpers stopped at the session limit; I'll rerun them after the reset."
+  }
+ },
+ {
+  "id": "entry-7",
+  "sequence": 7,
+  "revision": 1,
+  "timestamp": "2026-09-28T09:06:00Z",
+  "role": "user",
+  "final": true,
+  "type": "content",
+  "body": {
+   "media_type": "text/plain",
+   "text": "Thanks. Keep going.\n<system-reminder>\nThe task tools haven't been used recently. This is a gentle reminder.\n</system-reminder>"
+  }
+ },
+ {
+  "id": "entry-8",
+  "sequence": 8,
+  "revision": 1,
+  "timestamp": "2026-09-28T09:07:00Z",
+  "role": "user",
+  "final": true,
+  "type": "content",
+  "body": {
+   "media_type": "text/plain",
+   "text": "<channel source=\"plugin:st3-channel:st3\" from=\"st3/runtime\" identity=\"agent/si.agent\" messageId=\"message/82c49d87b10eb883\" threadId=\"message/82c49d87b10eb883\">\nSubject: Plan step ready: The worker invokes every eval skill across both scopes\n\nA durable st3 plan step is ready. This Small Talk message contains the full assignment. Run `st3 work claim step-run/5b21deb6cb8a522f1e04726c10f2c938/exercise-skill-union` with plain output. Do not use `--json` or run help. A parent claim exposes its inherited nested steps. Those steps do not send separate Small Talk messages. Use plain `st3 work ls` to find, claim, and complete each ready nested step. The claim prints the step goal. Use `st3 work progress step-run/5b21deb6cb8a522f1e04726c10f2c938/exercise-skill-union` only for a material update. Finish with `st3 work complete step-run/5b21deb6cb8a522f1e04726c10f2c938/exercise-skill-union` or `st3 work fail step-run/5b21deb6cb8a522f1e04726c10f2c938/exercise-skill-union`. The `--evidence` option accepts stored claim IDs only.\n\nTitle: The worker invokes every eval skill across both scopes\nGoal: Invoke every available skill whose name contains evalskill. Follow each loaded skill exactly. Do not fabricate a skill effect. Report the invoked skill names when both scopes are complete.\n</channel>"
+  }
+ },
+ {
+  "id": "entry-9",
+  "sequence": 9,
+  "revision": 1,
+  "timestamp": "2026-09-28T09:08:00Z",
+  "role": "user",
+  "final": true,
+  "type": "content",
+  "body": {
+   "media_type": "text/plain",
+   "text": "<channel source=\"plugin:st2-channel:st2\" from=\"harbor.mix.worker\" identity=\"harbor.mix.sup\" messageFilename=\"1787998917450-tc4t9f.md\" threadFilename=\"1787998864106-mps4b3.md\">\nSubject: re: Change widget license to MIT\n\nDone. Changed license to MIT in the widget repo.\n\nFiles changed: LICENSE, package.json\nCommit: 8d93fbdb0d7b11153df0cc2f4db70c731b68e44c \"Change license to MIT\"\n\nVerification:\n- LICENSE now contains the canonical MIT License text (copyright holder/year preserved: \"Copyright (c) 2026 Example Corp.\")\n- package.json \"license\" field == \"MIT\"\n- grep for proprietary/confidential/all-rights-reserved text across the repo: none found\n- git status: clean working tree\n\n</channel>"
+  }
+ },
+ {
+  "id": "entry-10",
+  "sequence": 10,
+  "revision": 1,
+  "timestamp": "2026-09-28T09:09:00Z",
+  "role": "user",
+  "final": true,
+  "type": "content",
+  "body": {
+   "media_type": "text/plain",
+   "text": "<channel source=\"plugin:st3-channel:st3\" from=\"agent/lmc.worker\" identity=\"agent/lmc.sup\" messageId=\"message/0fe0f10b9291bb02\" threadId=\"message/d6a98383978deebd\">\nSubject: Re: Change widget license to MIT\n\nDone. Changed files: LICENSE, package.json.\n\nCommit: 752abf9 - \"Change widget license to MIT\"\n\nVerification:\n- LICENSE now contains the canonical MIT License text with copyright line \"Copyright (c) 2026 Example Corp.\" (confirmed by reading file contents).\n- package.json \"license\" field is now \"MIT\" (confirmed by reading file contents).\n- Searched repo for 'proprietary'/'confidential' (case-insensitive, excluding .git) — no matches remain.\n- git status --porcelain returned empty output after commit — worktree is clean.\n</channel>"
+  }
+ },
+ {
+  "id": "entry-11",
+  "sequence": 11,
+  "revision": 1,
+  "timestamp": "2026-09-28T09:10:00Z",
+  "role": "user",
+  "final": true,
+  "type": "content",
+  "body": {
+   "media_type": "text/plain",
+   "text": "<local-command-caveat>Caveat: The messages below were generated by the user while running local commands. DO NOT respond to these messages or otherwise consider them in your response unless the user explicitly asks you to.</local-command-caveat>"
+  }
+ },
+ {
+  "id": "entry-12",
+  "sequence": 12,
+  "revision": 1,
+  "timestamp": "2026-09-28T09:11:00Z",
+  "role": "user",
+  "final": true,
+  "type": "content",
+  "body": {
+   "media_type": "text/plain",
+   "text": "<command-name>/usage</command-name>\n            <command-message>usage</command-message>\n            <command-args></command-args>"
+  }
+ },
+ {
+  "id": "entry-13",
+  "sequence": 13,
+  "revision": 1,
+  "timestamp": "2026-09-28T09:12:00Z",
+  "role": "user",
+  "final": true,
+  "type": "content",
+  "body": {
+   "media_type": "text/plain",
+   "text": "<command-name>/mcp</command-name>\n            <command-message>mcp</command-message>\n            <command-args></command-args>"
+  }
+ },
+ {
+  "id": "entry-14",
+  "sequence": 14,
+  "revision": 1,
+  "timestamp": "2026-09-28T09:13:00Z",
+  "role": "user",
+  "final": true,
+  "type": "content",
+  "body": {
+   "media_type": "text/plain",
+   "text": "<local-command-stdout>Reconnected to plugin:st3-channel:st3.</local-command-stdout>"
+  }
+ },
+ {
+  "id": "entry-15",
+  "sequence": 15,
+  "revision": 1,
+  "timestamp": "2026-09-28T09:14:00Z",
+  "role": "user",
+  "final": true,
+  "type": "content",
+  "body": {
+   "media_type": "text/plain",
+   "text": "<local-command-stdout>Login successful</local-command-stdout>"
+  }
+ },
+ {
+  "id": "entry-16",
+  "sequence": 16,
+  "revision": 1,
+  "timestamp": "2026-09-28T09:15:00Z",
+  "role": "assistant",
+  "final": true,
+  "type": "content",
+  "body": {
+   "media_type": "text/plain",
+   "text": "I've claimed the st3 step `message-envelope`. Now reading the notification code paths before wrapping them in `<smalltalk-message>`."
+  }
+ },
+ {
+  "id": "entry-17",
+  "sequence": 17,
+  "revision": 1,
+  "timestamp": "2026-09-28T09:16:00Z",
+  "role": "assistant",
+  "final": true,
+  "type": "content",
+  "body": {
+   "media_type": "text/plain",
+   "text": "The nightly build is fixed: the cache key now includes the toolchain version."
+  }
+ }
+]

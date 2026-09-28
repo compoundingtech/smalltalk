@@ -243,7 +243,10 @@ fn render_entry(entry: &Entry, width: usize, open: bool, spinner: &str) -> Doc {
             }
         }
         Body::Event(event) => {
-            let label = format!(" {} · {} ", text::sanitize(event), entry.at);
+            let label = text::truncate(
+                &format!(" {} · {} ", text::sanitize(event), entry.at),
+                width.saturating_sub(1),
+            );
             let side = width.saturating_sub(text::width(&label)) / 2;
             doc.line(Line::from(vec![
                 Span::styled("─".repeat(side.min(6)), theme::fg(theme::SURFACE1)),

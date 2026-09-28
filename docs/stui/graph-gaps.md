@@ -192,6 +192,13 @@ and `last_progress`. Also add `title`, `assigned_to` and `last_progress` to `Wor
   there is no client action for `st work retry`. stui can only cancel a run or point at the CLI.
   Offer restart, reset and retry to persons through the client API, fenced like `mission.cancel`.
 
+- **Standing watchers look like running work.** An intake mission keeps its observer and
+  subscriptions alive with an agentless step that never finishes until "intake retired" is
+  recorded, so it shows as a running mission with a working step and no agent. The client
+  cannot see observers or subscriptions at all. Either make a standing observer a first-class
+  subject, or project a mission's observers and subscriptions (what it watches and what it
+  starts) so a client can say "watching the repository for pull requests".
+
 ## 6. Proposed order of work
 
 Smallest useful change first:

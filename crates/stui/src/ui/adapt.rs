@@ -479,6 +479,16 @@ fn missions(model: &Model) -> Vec<Mission> {
                 Word::Stalled
             } else if states.iter().any(|state| matches!(*state, "failed")) {
                 Word::Failed
+            } else if !work.is_empty()
+                && work.iter().all(|work| {
+                    work.state == "completed"
+                        || (matches!(work.state.as_str(), "claimed" | "running")
+                            && crate::work_owner(model, work) == "Agentless step")
+                })
+                && work.iter().any(|work| work.state != "completed")
+            {
+                // Only st's own keep-open steps are running: an intake that watches.
+                Word::Watching
             } else if states
                 .iter()
                 .any(|state| matches!(*state, "claimed" | "running"))
@@ -543,7 +553,11 @@ fn missions(model: &Model) -> Vec<Mission> {
                     Step {
                         name: work.path.clone(),
                         state,
-                        owner: (!owner.is_empty() && owner != "unassigned").then_some(owner),
+                        owner: match owner.as_str() {
+                            "" | "unassigned" => None,
+                            "Agentless step" => Some("st".into()),
+                            _ => Some(owner),
+                        },
                         note: note.or_else(|| work.blocked_reason.clone()),
                         after: vec![],
                         age: age(&work.header.updated_at),
@@ -664,12 +678,23 @@ pub fn conversation(
     for entry in timeline {
         let at = clock(&entry.timestamp);
         let body = match (&entry.role, &entry.body) {
-            (TimelineRole::User, TimelineBody::Content(content)) => {
-                let text = clean_message_text(content.text.as_deref().unwrap_or(""));
-                if text.is_empty() {
-                    continue;
+            (TimelineRole::User | TimelineRole::System, TimelineBody::Content(content)) => {
+                // Harness markup becomes what it means; context blocks disappear.
+                let bodies = from_harness(
+                    entry.role == TimelineRole::User,
+                    content.text.as_deref().unwrap_or(""),
+                );
+                for (index, body) in bodies.into_iter().enumerate() {
+                    stamped.push((
+                        entry.timestamp.clone(),
+                        Entry {
+                            id: format!("{}#{index}", entry.id),
+                            at: at.clone(),
+                            body,
+                        },
+                    ));
                 }
-                Body::User(text)
+                continue;
             }
             (TimelineRole::Assistant, TimelineBody::Content(content)) => {
                 let text = clean_message_text(content.text.as_deref().unwrap_or(""));
@@ -780,6 +805,165 @@ pub fn conversation(
     stamped.into_iter().map(|(_, entry)| entry).collect()
 }
 
+/// Blocks harnesses add to a transcript for the model's benefit. None of it is conversation.
+const CONTEXT_BLOCKS: &[&str] = &[
+    "system-reminder",
+    "local-command-caveat",
+    "environment_context",
+    "permissions",
+    "collaboration_mode",
+    "multi_agent_mode",
+    "apps_instructions",
+    "plugins_instructions",
+    "skills_instructions",
+    "user_instructions",
+    "developer_instructions",
+    "command-message",
+    "command-args",
+];
+
+/// Take every `<tag …>…</tag>` block out of `text`, returning the inner texts. A block that
+/// never closes runs to the end, so a truncated wrapper cannot leak either.
+fn take_blocks(text: &mut String, tag: &str) -> Vec<String> {
+    let mut found = Vec::new();
+    let open = format!("<{tag}");
+    let close = format!("</{tag}>");
+    let mut from = 0;
+    while let Some(offset) = text[from..].find(&open) {
+        let start = from + offset;
+        let after = &text[start + open.len()..];
+        // `<permissions` must not match `<permissionsfoo`.
+        if !after.starts_with(['>', ' ', '/', '\n']) {
+            from = start + open.len();
+            continue;
+        }
+        let Some(head_end) = after.find('>').map(|index| start + open.len() + index + 1) else {
+            text.truncate(start);
+            break;
+        };
+        let (inner, end) = match text[head_end..].find(&close) {
+            Some(index) => (
+                text[head_end..head_end + index].to_owned(),
+                head_end + index + close.len(),
+            ),
+            None => (text[head_end..].to_owned(), text.len()),
+        };
+        found.push(inner);
+        text.replace_range(start..end, "");
+        from = start;
+    }
+    found
+}
+
+fn field(block: &str, tag: &str) -> Option<String> {
+    let mut copy = block.to_owned();
+    take_blocks(&mut copy, tag)
+        .into_iter()
+        .next()
+        .map(|value| value.trim().to_owned())
+}
+
+fn shorten(text: &str, max: usize) -> String {
+    let line = text.lines().next().unwrap_or("").trim();
+    if line.chars().count() <= max {
+        line.to_owned()
+    } else {
+        format!("{}…", line.chars().take(max).collect::<String>())
+    }
+}
+
+/// A user or system entry from a harness transcript, turned into what a person should see.
+pub fn from_harness(is_user: bool, raw: &str) -> Vec<Body> {
+    let mut text = raw.replace("\r\n", "\n");
+    let mut bodies = Vec::new();
+    for block in take_blocks(&mut text, "task-notification") {
+        let status = field(&block, "status").unwrap_or_else(|| "update".into());
+        let summary = field(&block, "summary").unwrap_or_default();
+        bodies.push(Body::Event(format!(
+            "background task {status}: {}",
+            shorten(&summary, 90)
+        )));
+    }
+    // st and st2 deliveries: the message itself is in the stream as mail.
+    let mut deliveries = Vec::new();
+    let mut from = 0;
+    while let Some(offset) = text[from..].find("<channel") {
+        let start = from + offset;
+        let head_end = text[start..]
+            .find('>')
+            .map(|index| start + index + 1)
+            .unwrap_or(text.len());
+        let head = text[start..head_end].to_owned();
+        let sender = head
+            .split("from=\"")
+            .nth(1)
+            .and_then(|rest| rest.split('"').next())
+            .unwrap_or("someone")
+            .to_owned();
+        deliveries.push(sender);
+        from = start + 1;
+    }
+    for (block, sender) in take_blocks(&mut text, "channel")
+        .into_iter()
+        .zip(deliveries)
+    {
+        let subject = block
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("Subject:").map(str::trim))
+            .map(str::to_owned)
+            .unwrap_or_else(|| shorten(&clean_message_text(&block), 70));
+        bodies.push(Body::Event(format!(
+            "delivered to the agent: {} · from {sender}",
+            shorten(&subject, 80)
+        )));
+    }
+    for command in take_blocks(&mut text, "command-name") {
+        let args = field(raw, "command-args").unwrap_or_default();
+        bodies.push(Body::User(
+            format!("{} {}", command.trim(), args).trim().to_owned(),
+        ));
+    }
+    for (tag, state) in [
+        ("local-command-stdout", ToolState::Ok),
+        ("local-command-stderr", ToolState::Failed),
+    ] {
+        for output in take_blocks(&mut text, tag) {
+            bodies.push(Body::Tool {
+                title: "command output".into(),
+                state,
+                output: output.trim().lines().map(str::to_owned).collect(),
+            });
+        }
+    }
+    for _ in take_blocks(&mut text, "turn_aborted") {
+        bodies.push(Body::Event("the turn was interrupted".into()));
+    }
+    for reply in take_blocks(&mut text, "send_user_message_question_reply") {
+        let answers = serde_json::from_str::<Value>(reply.trim())
+            .ok()
+            .and_then(|value| value.as_array().cloned())
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|item| {
+                item.get("answer")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
+            .collect::<Vec<_>>();
+        if !answers.is_empty() {
+            bodies.push(Body::User(answers.join("\n")));
+        }
+    }
+    for tag in CONTEXT_BLOCKS {
+        take_blocks(&mut text, tag);
+    }
+    let rest = clean_message_text(&text);
+    if is_user && !rest.is_empty() {
+        bodies.insert(0, Body::User(rest));
+    }
+    bodies
+}
+
 fn clock(timestamp: &str) -> String {
     chrono::DateTime::parse_from_rfc3339(timestamp)
         .map(|time| {
@@ -834,6 +1018,131 @@ fn tool_output(content: &Value) -> Vec<String> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    const HARNESS_TAGS: &[&str] = &[
+        "task-notification",
+        "task-id",
+        "tool-use-id",
+        "output-file",
+        "<status>",
+        "<summary>",
+        "<result>",
+        "<note>",
+        "<channel",
+        "system-reminder",
+        "command-name",
+        "command-message",
+        "command-args",
+        "local-command",
+        "environment_context",
+        "<permissions",
+        "collaboration_mode",
+        "multi_agent_mode",
+        "apps_instructions",
+        "plugins_instructions",
+        "skills_instructions",
+        "turn_aborted",
+        "send_user_message_question_reply",
+        "<cwd>",
+        "<shell>",
+        "<timezone>",
+    ];
+
+    fn rendered(fixture: &str) -> String {
+        let timeline: Vec<TimelineEntry> = serde_json::from_str(fixture).unwrap();
+        let entries = conversation(&timeline, &[], &BTreeMap::new());
+        let doc = super::super::conversation::Cache::default().render(
+            &entries,
+            100,
+            &Default::default(),
+            "⠋",
+        );
+        doc.lines
+            .iter()
+            .map(super::super::text::plain)
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn assert_clean(text: &str) {
+        for tag in HARNESS_TAGS {
+            let needle = if tag.starts_with('<') {
+                tag.to_string()
+            } else {
+                format!("<{tag}")
+            };
+            assert!(!text.contains(&needle), "{needle} leaked into:\n{text}");
+            assert!(
+                !text.contains(&format!("</{}", tag.trim_start_matches('<'))),
+                "closing {tag} leaked into:\n{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_real_claude_transcript_shows_no_harness_markup_and_keeps_the_conversation() {
+        let text = rendered(include_str!("../../tests/fixtures/transcripts/claude.json"));
+        assert_clean(&text);
+        for kept in [
+            "Please check why the nightly build failed and fix it.",
+            "Two helpers stopped at the session limit",
+            "Thanks. Keep going.",
+            "background task failed: Agent \"Lane C: client operations\" failed",
+            "delivered to the agent: re: Change widget license to MIT",
+            "delivered to the agent: Plan step ready",
+            "/usage",
+            "Login successful",
+            "The nightly build is fixed",
+        ] {
+            assert!(text.contains(kept), "lost {kept:?} from:\n{text}");
+        }
+        assert!(
+            !text.contains("gentle reminder"),
+            "system reminders are for the model:\n{text}"
+        );
+        assert!(
+            !text.contains("DO NOT respond"),
+            "the local command caveat is for the model:\n{text}"
+        );
+        // The agent may still talk about a tag by name.
+        assert!(text.contains("<smalltalk-message>"), "{text}");
+    }
+
+    #[test]
+    fn a_real_codex_transcript_shows_no_harness_markup_and_keeps_the_conversation() {
+        let text = rendered(include_str!("../../tests/fixtures/transcripts/codex.json"));
+        assert_clean(&text);
+        for kept in [
+            "Rotate the signing keys in harbor",
+            "Starting with an inventory of every key reader.",
+            "the turn was interrupted",
+            "You run it as me",
+            "Thanks, I'll wait for the revision output.",
+        ] {
+            assert!(text.contains(kept), "lost {kept:?} from:\n{text}");
+        }
+        for context in [
+            "sandbox_mode",
+            "Collaboration Mode",
+            "Plugins",
+            "Skills",
+            "/tmp/st3-osh",
+        ] {
+            assert!(
+                !text.contains(context),
+                "{context} is harness context:\n{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unclosed_wrapper_cannot_leak() {
+        let bodies = from_harness(true, "hello\n<system-reminder>\nnever closed");
+        assert!(
+            matches!(&bodies[..], [Body::User(text)] if text == "hello"),
+            "{bodies:?}"
+        );
+    }
 
     #[test]
     fn a_launch_preview_reads_steps_assignees_dependencies_and_person_gates() {
