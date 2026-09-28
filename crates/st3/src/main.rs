@@ -4291,6 +4291,14 @@ async fn run_replication(
                 status.repaired_records
             );
             println!("unhealthy-projections\t{}", status.unhealthy_projections);
+            for projection in &status.unhealthy {
+                println!(
+                    "unhealthy\t{}\t{}\t{}",
+                    projection.aggregate,
+                    projection.error_code.as_deref().unwrap_or(""),
+                    projection.error_message.as_deref().unwrap_or("")
+                );
+            }
             for peer in status.peers {
                 println!(
                     "peer\t{}\t{}\t{}",

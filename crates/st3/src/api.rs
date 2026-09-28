@@ -3263,10 +3263,19 @@ fn doctor_report(state: &AppState) -> Result<Json<DoctorReport>, ApiError> {
                 name: "replication".into(),
                 status: status.into(),
                 message: format!(
-                    "{} envelopes; {} unresolved records; {} unhealthy projections; peers {}",
+                    "{} envelopes; {} unresolved records; {} unhealthy projections{}; peers {}",
                     replication.received_envelopes,
                     unresolved,
                     replication.unhealthy_projections,
+                    replication
+                        .unhealthy
+                        .first()
+                        .map(|projection| format!(
+                            " ({}: {})",
+                            projection.aggregate,
+                            projection.error_message.as_deref().unwrap_or("no reason recorded")
+                        ))
+                        .unwrap_or_default(),
                     if unavailable.is_empty() {
                         "up".into()
                     } else {
