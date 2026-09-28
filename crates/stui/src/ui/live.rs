@@ -90,7 +90,8 @@ pub fn run(context: Context) -> Result<()> {
     terminal.hide_cursor()?;
     let started = Instant::now();
     let mut changed = true;
-    while !ui.quit {
+    let stopping = super::stop_flag()?;
+    while !ui.quit && !stopping.load(std::sync::atomic::Ordering::Relaxed) {
         ui.tick = (started.elapsed().as_millis() / 100) as u64;
         if ui
             .flash

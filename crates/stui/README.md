@@ -1,5 +1,10 @@
 # Smalltalk terminal client
 
+`stui` opens the new screens on the live graph (Home, Agents, Missions, Fleet, and a demo-only
+Worktrees tab). `stui --demo` shows them on invented data and sends nothing; `stui --old` opens
+the previous screens, described below, while they are retired. The screens follow
+[docs/clients/ui-contract.md](../../docs/clients/ui-contract.md), shared with the iOS app.
+
 `stui` connects through the generated Rust `st3.client.v0` client, the same typed data boundary
 used by the CLI. It paints immediately, hydrates attention/agents/sessions first, then fills in
 mission and fleet details without blocking keys. A private, actor-and-endpoint-scoped read-only

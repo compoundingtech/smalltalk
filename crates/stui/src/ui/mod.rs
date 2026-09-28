@@ -2399,6 +2399,19 @@ fn copy(text: &str) {
 
 struct Guard;
 
+/// A flag set by SIGINT, SIGTERM or SIGHUP, so the loop exits and `Guard` restores the terminal.
+fn stop_flag() -> Result<std::sync::Arc<std::sync::atomic::AtomicBool>> {
+    let stopping = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    for signal in [
+        signal_hook::consts::SIGINT,
+        signal_hook::consts::SIGTERM,
+        signal_hook::consts::SIGHUP,
+    ] {
+        signal_hook::flag::register(signal, stopping.clone())?;
+    }
+    Ok(stopping)
+}
+
 impl Guard {
     fn enter() -> Result<Self> {
         enable_raw_mode()?;
@@ -2440,7 +2453,8 @@ pub fn run_demo(args: &[String]) -> Result<()> {
         harbor_seen: None,
     });
     let started = Instant::now();
-    while !ui.quit {
+    let stopping = stop_flag()?;
+    while !ui.quit && !stopping.load(std::sync::atomic::Ordering::Relaxed) {
         ui.tick = (started.elapsed().as_millis() / 100) as u64;
         ui.step_demo();
         if ui

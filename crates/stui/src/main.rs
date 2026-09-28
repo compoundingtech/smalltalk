@@ -2654,7 +2654,8 @@ fn main() -> Result<()> {
             }
         }
     });
-    if args.iter().any(|arg| arg == "--new") {
+    // The new screens are the default; `--old` keeps the previous ones for a while.
+    if !args.iter().any(|arg| arg == "--old") {
         let cached = cache_path
             .as_deref()
             .zip(person.as_deref())
