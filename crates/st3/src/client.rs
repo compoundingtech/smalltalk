@@ -459,6 +459,13 @@ pub fn is_not_found(error: &anyhow::Error) -> bool {
         .is_some_and(|error| error.status == 404 || error.code == "not-found")
 }
 
+/// The code of the API error that an API call failed with, if it failed with one.
+pub fn api_error_code(error: &anyhow::Error) -> Option<&str> {
+    error
+        .downcast_ref::<ApiResponseError>()
+        .map(|error| error.code.as_str())
+}
+
 fn terminal_reconnect_is_refused(error: &anyhow::Error) -> bool {
     error
         .downcast_ref::<ApiResponseError>()
