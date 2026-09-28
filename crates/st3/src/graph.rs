@@ -2009,7 +2009,7 @@ fn parse_running_gate(
         return Ok(GateSpec::Human {
             name,
             reviewer,
-            mode,
+            mode: Some(mode),
             question,
             review_targets,
         });

@@ -120,6 +120,10 @@ recovery.
 A running member whose workspace or render fails is still observed, checked, and woken for its
 work. The failure blocks only its start and restart.
 
+Two members can render different bytes to the same file. Then only the member that would change
+the file on disk faults. The member whose content is already there keeps rendering, so declaring a
+new member never takes down one that runs.
+
 Sometimes the PTY registry does not answer, or one PTY's record cannot be read. Terminal members then
 wait for the next readable snapshot: none is started, restarted, or recorded as stopped. Exec
 members and the rest of the pass still run.
@@ -149,6 +153,12 @@ The daemon's other loops keep the same rule:
   whose document is not on this host, is recorded once as a `harness.diagnostic` with the code
   `message-unforwarded`. The recipient's other messages keep arriving.
 - A driver skips renewing a step whose claim ended in the meantime, and keeps running.
+- A panic while the store's writer is held does not disable the store. The panic rolls back its
+  open transaction as it unwinds, and the next write proceeds. The reconciler's own locks recover
+  the same way.
+- A wake message whose close fails does not keep an agent's other messages open or delay its next
+  wake.
+- Session discovery skips a transcript it cannot read and lists the rest.
 
 ## Messages and attention
 
