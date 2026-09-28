@@ -424,6 +424,17 @@ fn agents(model: &Model) -> Vec<Agent> {
     agents
 }
 
+/// Whether an agentless step only holds its run open (so the run's observers keep watching).
+/// st does not say whether an agentless step waits on a flag or runs a command, so this goes
+/// by the names the fleet uses for keep-open steps; anything else counts as work.
+fn keeps_open(path: &str) -> bool {
+    let name = path.rsplit('/').next().unwrap_or(path);
+    matches!(
+        name,
+        "keep-watch" | "retire" | "steward-intake" | "standing" | "keep-open"
+    ) || name.ends_with("-retirement")
+}
+
 /// The agent whose queue holds this work, if st says.
 fn queued_for<'a>(model: &'a Model, work: &str) -> Option<&'a st3_client::Agent> {
     model.agents().find(|agent| {
@@ -483,7 +494,8 @@ fn missions(model: &Model) -> Vec<Mission> {
                 && work.iter().all(|work| {
                     work.state == "completed"
                         || (matches!(work.state.as_str(), "claimed" | "running")
-                            && crate::work_owner(model, work) == "Agentless step")
+                            && crate::work_owner(model, work) == "Agentless step"
+                            && keeps_open(&work.path))
                 })
                 && work.iter().any(|work| work.state != "completed")
             {

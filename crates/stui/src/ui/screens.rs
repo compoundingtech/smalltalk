@@ -1875,7 +1875,22 @@ pub fn agent_details(world: &World, agent: &Agent, width: usize, spinner: &'stat
     let mut doc = Doc::new();
     let details = &agent.details;
     let unknown = || span("st has not said", theme::dim());
-    doc.blank();
+    // A close control on the pane itself, not only on the header rule.
+    let close = "× close";
+    doc.targets.push(super::doc::Target {
+        line: 0,
+        column: width.saturating_sub(text::width(close)) as u16,
+        width: text::width(close) as u16,
+        hit: Hit::Key('i'),
+    });
+    doc.line(Line::from(vec![
+        span("details", theme::label()),
+        span(
+            " ".repeat(width.saturating_sub(7 + text::width(close))),
+            theme::dim(),
+        ),
+        span(close, theme::fg(theme::OVERLAY1)),
+    ]));
     if let Some(fault) = &details.fault {
         let mut inner = Doc::new();
         inner.wrap(&text::inline(fault, theme::text()), width.saturating_sub(4));

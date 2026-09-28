@@ -63,6 +63,10 @@ pub fn run(context: Context) -> Result<()> {
     let mut requested: BTreeMap<String, Instant> = BTreeMap::new();
     let mut stale: HashSet<String> = HashSet::new();
     let mut preview_requested: HashSet<String> = HashSet::new();
+    // Messages sent from here, shown at once until st reports them back.
+    let mut pending: Vec<(String, String, String)> = Vec::new();
+    // Conversations to refresh quickly because a reply is likely soon.
+    let mut hot: BTreeMap<String, Instant> = BTreeMap::new();
     let mut ui = Ui::new(adapt::world(&model, &person, &extras));
     ui.live = true;
 
@@ -91,6 +95,14 @@ pub fn run(context: Context) -> Result<()> {
                     extras.live = true;
                     extras.offline = None;
                     changed = true;
+                    // Something changed in the graph; the open conversation may have new mail.
+                    if let (1, Some(agent)) = ui.focus()
+                        && requested
+                            .get(&agent)
+                            .is_some_and(|at| at.elapsed() > Duration::from_secs(3))
+                    {
+                        requested.remove(&agent);
+                    }
                 }
                 Update::TimelineInvalidated(session) => {
                     stale.insert(session);
@@ -116,6 +128,13 @@ pub fn run(context: Context) -> Result<()> {
                     timelines.insert(agent, entries);
                 }
                 Fetched::Messages(agent, items) => {
+                    // A pending message is done once st reports it back.
+                    pending.retain(|(to, text, _)| {
+                        to != &agent
+                            || !items.iter().any(|message| {
+                                message.to == agent && message.content.trim() == text.trim()
+                            })
+                    });
                     messages.insert(agent, items);
                 }
                 Fetched::Preview(id, preview) => {
@@ -135,9 +154,14 @@ pub fn run(context: Context) -> Result<()> {
             && let Some(agent) = selected.clone()
         {
             let session = session_for(&model, &agent);
+            let interval = if hot.get(&agent).is_some_and(|until| Instant::now() < *until) {
+                Duration::from_secs(3)
+            } else {
+                CONVERSATION_FALLBACK
+            };
             let due = requested
                 .get(&agent)
-                .is_none_or(|at| at.elapsed() >= CONVERSATION_FALLBACK)
+                .is_none_or(|at| at.elapsed() >= interval)
                 || session
                     .as_ref()
                     .is_some_and(|session| stale.contains(session));
@@ -203,6 +227,22 @@ pub fn run(context: Context) -> Result<()> {
             });
         }
 
+        for effect in &ui.effects {
+            if let Effect::Send { agent, text }
+            | Effect::Discuss {
+                to: agent, text, ..
+            } = effect
+            {
+                pending.push((
+                    agent.clone(),
+                    text.clone(),
+                    chrono::Local::now().format("%H:%M").to_string(),
+                ));
+                hot.insert(agent.clone(), Instant::now() + Duration::from_secs(120));
+                requested.remove(agent);
+                changed = true;
+            }
+        }
         for effect in std::mem::take(&mut ui.effects) {
             let client = client.clone();
             let tx = fetched_tx.clone();
@@ -220,6 +260,20 @@ pub fn run(context: Context) -> Result<()> {
         if changed {
             extras.conversations =
                 conversations(&model, &person, &timelines, &messages, &failed, &requested);
+            for (agent, text, at) in &pending {
+                if let Some(Load::Ready(entries)) = extras.conversations.get_mut(agent) {
+                    entries.push(super::view::Entry {
+                        id: format!("pending:{}", entries.len()),
+                        at: at.clone(),
+                        body: super::view::Body::Mail {
+                            from: "you".into(),
+                            to: agent.trim_start_matches("agent/").into(),
+                            subject: "sending…".into(),
+                            body: text.clone(),
+                        },
+                    });
+                }
+            }
             ui.set_world(adapt::world(&model, &person, &extras));
             changed = false;
         }

@@ -483,6 +483,7 @@ impl Ui {
                 0 => hints.extend([("keys", "on the card"), ("c", "write")]),
                 1 => hints.extend([
                     ("c", "message"),
+                    ("i", "details"),
                     ("o", "expand tools"),
                     ("end", "latest"),
                     ("drag", "select + copy"),
@@ -955,7 +956,17 @@ impl Ui {
                 Hit::Key('i'),
             );
         }
-        let composer_height = if agent.unmanaged { 0 } else { 3 };
+        // The composer grows with the draft (up to eight lines) and keeps the cursor in view.
+        let composer = if agent.unmanaged {
+            Vec::new()
+        } else {
+            self.composer_lines(agent, width)
+        };
+        let composer_height = if agent.unmanaged {
+            0
+        } else {
+            composer.len() as u16 + 2
+        };
         let body = Rect {
             y: area.y + header_height,
             height: area.height.saturating_sub(header_height + composer_height),
@@ -1018,37 +1029,15 @@ impl Ui {
                     theme::SURFACE0
                 }),
             );
-            let draft = self.drafts.get(&agent.id).cloned().unwrap_or_default();
-            let line = if self.editing {
-                Line::from(vec![
-                    Span::styled("› ", theme::strong(theme::ACCENT)),
-                    Span::styled(
-                        text::truncate(&draft, width.saturating_sub(4)),
-                        theme::text(),
-                    ),
-                    Span::styled("█", theme::fg(theme::ACCENT)),
-                ])
-            } else if draft.is_empty() {
-                Line::from(vec![
-                    Span::styled("› ", theme::dim()),
-                    Span::styled(format!("Message {} · c or click", agent.name), theme::dim()),
-                ])
-            } else {
-                Line::from(vec![
-                    Span::styled("› ", theme::dim()),
-                    Span::styled(
-                        text::truncate(&draft, width.saturating_sub(4)),
-                        theme::soft(),
-                    ),
-                ])
-            };
-            buf.set_line(area.x, y + 1, &line, area.width);
+            for (offset, line) in composer.iter().enumerate() {
+                buf.set_line(area.x, y + 1 + offset as u16, line, area.width);
+            }
             self.hit(
                 Rect {
                     x: area.x,
                     y: y + 1,
                     width: area.width,
-                    height: 1,
+                    height: composer.len().max(1) as u16,
                 },
                 Hit::Composer,
             );
@@ -1207,6 +1196,54 @@ impl Ui {
                 );
             }
         }
+    }
+
+    /// The message box under a conversation, wrapped, newest lines last.
+    fn composer_lines(&self, agent: &Agent, width: usize) -> Vec<Line<'static>> {
+        let draft = self.drafts.get(&agent.id).cloned().unwrap_or_default();
+        if draft.is_empty() && !self.editing {
+            return vec![Line::from(vec![
+                Span::styled("› ", theme::dim()),
+                Span::styled(format!("Message {} · c or click", agent.name), theme::dim()),
+            ])];
+        }
+        let style = if self.editing {
+            theme::text()
+        } else {
+            theme::soft()
+        };
+        let mut lines = Vec::new();
+        let paragraphs = draft.split('\n').collect::<Vec<_>>();
+        for (index, paragraph) in paragraphs.iter().enumerate() {
+            let mut runs = vec![text::run(paragraph.to_string(), style)];
+            if self.editing && index == paragraphs.len() - 1 {
+                runs.push(text::run("█", theme::fg(theme::ACCENT)));
+            }
+            let first = if index == 0 {
+                text::run(
+                    "› ",
+                    if self.editing {
+                        theme::strong(theme::ACCENT)
+                    } else {
+                        theme::dim()
+                    },
+                )
+            } else {
+                text::run("  ", theme::dim())
+            };
+            lines.extend(text::wrap(
+                &runs,
+                width.saturating_sub(1),
+                &[first],
+                &[text::run("  ", theme::dim())],
+                None,
+            ));
+        }
+        let keep = 8;
+        if lines.len() > keep {
+            lines.drain(..lines.len() - keep);
+        }
+        lines
     }
 
     fn draw_help(&self, buf: &mut Buffer, area: Rect) {
@@ -1408,6 +1445,16 @@ impl Ui {
         }
         if self.editing {
             let key_id = self.draft_key().unwrap_or_default();
+            let newline = (key.code == KeyCode::Enter
+                && key
+                    .modifiers
+                    .intersects(KeyModifiers::ALT | KeyModifiers::SHIFT))
+                || (key.code == KeyCode::Char('j')
+                    && key.modifiers.contains(KeyModifiers::CONTROL));
+            if newline {
+                self.drafts.entry(key_id).or_default().push('\n');
+                return;
+            }
             match key.code {
                 KeyCode::Esc => self.editing = false,
                 KeyCode::Enter => self.submit(),
@@ -1789,6 +1836,7 @@ impl Ui {
                 Some(effect) => {
                     self.effects.push(effect);
                     self.drafts.remove(&id);
+                    self.follow_latest();
                     self.flash("Sending…");
                 }
                 None => self.flash("This needs the st CLI for now"),
@@ -2782,5 +2830,25 @@ mod tests {
             ui.list_top.borrow()[1] < lines - height,
             "a new selection comes back into view"
         );
+    }
+    #[test]
+    fn the_message_box_grows_with_the_draft_and_keeps_new_lines() {
+        let mut ui = Ui::new(demo::world());
+        ui.tab = 1;
+        press(&mut ui, KeyCode::Char('c'));
+        for character in
+            "first line of a long message that has to wrap across the box at least once or twice"
+                .chars()
+        {
+            press(&mut ui, KeyCode::Char(character));
+        }
+        ui.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT));
+        for character in "second paragraph".chars() {
+            press(&mut ui, KeyCode::Char(character));
+        }
+        let screen = frame(&ui, 110, 40).join("\n");
+        assert!(screen.contains("first line of a long message"), "{screen}");
+        assert!(screen.contains("second paragraph"), "{screen}");
+        assert!(ui.editing, "Alt+Enter adds a line instead of sending");
     }
 }
