@@ -386,7 +386,19 @@ pub fn apply_all(
                 .map(|(name, _)| *name)
                 .collect::<Vec<_>>()
                 .join(", ");
-            for (subject, _) in owners {
+            // The owner whose content is already on disk keeps it. Only an owner that would
+            // change it fails, so declaring a new member never takes down one that runs.
+            let current = fs::read(destination).ok();
+            let incumbent = owners
+                .iter()
+                .find(|(_, write)| current.as_deref() == Some(write.bytes.as_slice()))
+                .map(|(_, write)| *write);
+            for (subject, write) in owners {
+                if incumbent.is_some_and(|incumbent| {
+                    incumbent.bytes == write.bytes && incumbent.mode == write.mode
+                }) {
+                    continue;
+                }
                 results.insert(
                     subject.to_owned(),
                     Err(anyhow::anyhow!(
