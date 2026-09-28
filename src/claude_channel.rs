@@ -159,14 +159,14 @@ pub fn verify_st3_installed() -> Result<()> {
     let marketplace = st3_marketplace_root()?;
     verify_st3_marketplace_at(&marketplace)?;
     if !st3_marketplace_is_registered_at(&marketplace)? {
-        bail!("the st3 Claude marketplace is not registered; run `st3 claude-channel install`");
+        bail!("the st Claude marketplace is not registered; run `st claude-channel install`");
     }
     if !st3_plugin_is_installed()? {
-        bail!("the st3 Claude channel plugin is not installed; run `st3 claude-channel install`");
+        bail!("the st Claude channel plugin is not installed; run `st claude-channel install`");
     }
     let policy = st3_policy_path()?;
     if !st3_policy_is_current_at(&policy) {
-        bail!("the st3 Claude channel policy is not installed; run `st3 claude-channel install`");
+        bail!("the st Claude channel policy is not installed; run `st claude-channel install`");
     }
     Ok(())
 }
@@ -215,7 +215,7 @@ pub fn status_st3() -> Result<()> {
     if assets && marketplace_ready && plugin_ready && policy_ready {
         Ok(())
     } else {
-        bail!("the st3 Claude channel installation is incomplete")
+        bail!("the st Claude channel installation is incomplete")
     }
 }
 
@@ -419,7 +419,7 @@ fn st3_policy_value() -> Value {
 
 fn st3_policy_bytes() -> Vec<u8> {
     let mut bytes = serde_json::to_vec_pretty(&st3_policy_value())
-        .expect("the built-in st3 channel policy is serializable");
+        .expect("the built-in st channel policy is serializable");
     bytes.push(b'\n');
     bytes
 }
@@ -501,14 +501,14 @@ fn remove_st3_policy_with_elevation(path: &Path) -> Result<()> {
 }
 
 fn run_st3_elevated(action: &str) -> Result<()> {
-    let exe = env::current_exe().context("resolving the current st3 executable")?;
+    let exe = env::current_exe().context("resolving the current st executable")?;
     let status = Command::new("sudo")
         .arg(exe)
         .args(["claude-channel", action])
         .status()
-        .with_context(|| format!("running the elevated st3 Claude channel {action}"))?;
+        .with_context(|| format!("running the elevated st Claude channel {action}"))?;
     if !status.success() {
-        bail!("the elevated st3 Claude channel {action} failed with status {status}");
+        bail!("the elevated st Claude channel {action} failed with status {status}");
     }
     Ok(())
 }

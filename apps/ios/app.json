@@ -40,7 +40,7 @@
             }
           }
         },
-        "NSLocalNetworkUsageDescription": "Smalltalk connects to your paired st3 gateway on your local network when you enter a .local name or private LAN address."
+        "NSLocalNetworkUsageDescription": "Smalltalk connects to your paired st gateway on your local network when you enter a .local name or private LAN address."
       }
     }
   }
