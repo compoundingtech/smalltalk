@@ -20,7 +20,7 @@ Choose a tag from the repository's Releases page, then download the archive for 
 and its `.sha256` file. For example, with GitHub CLI:
 
 ```sh
-tag=v0.1.0 # replace with the release you want
+tag=v0.3.0 # replace with the release you want
 archive=smalltalk-x86_64-unknown-linux-gnu.tar.gz
 # On Apple Silicon: archive=smalltalk-aarch64-apple-darwin.tar.gz
 gh release download "$tag" --repo compoundingtech/smalltalk \
@@ -33,8 +33,8 @@ tar -xzf "$archive"
 Put the chosen bin directory on `PATH`. The installer stages all four tools and the `st` link,
 then replaces each by rename; existing processes retain their old executable. It does not restart
 anything, change configuration, or erase state. Keep the previous archive to roll back using the
-same procedure. A first daemon install uses `st3 service install`. For an existing daemon, schedule
-`st3 service restart` after installation and verify `st3 doctor --strict` and peer health. Restarting
+same procedure. A first daemon install uses `st service install`. For an existing daemon, schedule
+`st service restart` after installation and verify `st doctor --strict` and peer health. Restarting
 invalidates an ongoing continuous soak window, so coordinate that separately from downloading or
 installing files.
 
