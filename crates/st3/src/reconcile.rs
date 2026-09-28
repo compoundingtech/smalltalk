@@ -530,11 +530,12 @@ impl<R: RuntimeControl> Reconciler<R> {
 
     pub async fn run(self: Arc<Self>) {
         self.notify.notify_one();
-        let mut unchanged = false;
+        // When the last pass began, and whether it changed nothing.
+        let mut quiet_pass_started = None;
         loop {
             match self.next_reconcile_deadline() {
                 Ok(Some(deadline)) => {
-                    let delay = deadline_sleep_ms(deadline, now_ms(), unchanged);
+                    let delay = deadline_sleep_ms(deadline, now_ms(), quiet_pass_started);
                     tokio::select! {
                         _ = self.notify.notified() => {}
                         _ = tokio::time::sleep(Duration::from_millis(delay)) => {}
@@ -556,6 +557,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                 }
             }
             for pass in 0..64 {
+                let started = now_ms();
                 let before = self.store.index().ok();
                 if let Err(error) = self.reconcile_once() {
                     let _ = self.record_once(
@@ -572,7 +574,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                 self.event_notify
                     .send_modify(|generation| *generation = generation.saturating_add(1));
                 let changed = before != self.store.index().ok();
-                unchanged = !changed;
+                quiet_pass_started = (!changed).then_some(started);
                 if !changed {
                     break;
                 }
@@ -7141,9 +7143,9 @@ impl<R: RuntimeControl> Reconciler<R> {
             .flatten()
         }) {
             Some("pass") => Ok(GateOutcome::Pass),
-            Some("fail") => Ok(GateOutcome::Fail(
-                "the human reviewer rejected the work".into(),
-            )),
+            Some("fail") => Ok(GateOutcome::Fail(human_review_failure_reason(
+                decision.as_ref().expect("a failed decision exists"),
+            ))),
             _ => Ok(GateOutcome::Pending),
         }
     }
@@ -8354,9 +8356,9 @@ impl<R: RuntimeControl> Reconciler<R> {
                         .flatten()
                 }) {
                     Some("pass") => GateOutcome::Pass,
-                    Some("fail") => {
-                        GateOutcome::Fail("the human reviewer rejected the work".into())
-                    }
+                    Some("fail") => GateOutcome::Fail(human_review_failure_reason(
+                        decision.as_ref().expect("a failed decision exists"),
+                    )),
                     _ => GateOutcome::Pending,
                 }
             }
@@ -9593,8 +9595,12 @@ fn work_wake_deadline(
         .min()
 }
 
-fn deadline_sleep_ms(deadline: u128, now: u128, unchanged: bool) -> u64 {
-    if unchanged && deadline <= now {
+/// How long to sleep before the next pass. A deadline that was already due when the last pass
+/// began, and that pass changed nothing, cannot be acted on yet, so the loop backs off instead of
+/// spinning. A deadline that fell due during or after that pass has not been evaluated, so it
+/// runs at once: a mission timeout must not wait out the back-off.
+fn deadline_sleep_ms(deadline: u128, now: u128, quiet_pass_started: Option<u128>) -> u64 {
+    if quiet_pass_started.is_some_and(|started| deadline <= started) {
         WORK_WAKE_RETRY_MS as u64
     } else {
         deadline.saturating_sub(now).min(u128::from(u64::MAX)) as u64
@@ -9757,6 +9763,18 @@ enum GateOutcome {
     Pass,
     Pending,
     Fail(String),
+}
+
+fn human_review_failure_reason(decision: &crate::model::ClaimRecord) -> String {
+    match decision
+        .body
+        .pointer("/fields/reason")
+        .and_then(Value::as_str)
+        .filter(|reason| !reason.trim().is_empty())
+    {
+        Some(reason) => format!("the human reviewer rejected the work: {reason}"),
+        None => "the human reviewer rejected the work".into(),
+    }
 }
 
 enum LoopBranchOutcome {
@@ -12004,6 +12022,56 @@ version 2
         assert_eq!(
             store.mission_run(&run.id).unwrap().unwrap().steps[0].status,
             "completed"
+        );
+        store
+            .set_mission_run_state(&run.id, "completed", "terminal", None)
+            .unwrap();
+
+        let rejected_run = store
+            .create_mission_run(&crate::model::MissionRunRequest {
+                mission: "review".into(),
+                revision: None,
+                workspace: "/tmp".into(),
+                requester: Some("person/test".into()),
+                mode: Some("run".into()),
+                inputs: BTreeMap::new(),
+                idempotency_key: "review-rejected-run".into(),
+            })
+            .unwrap();
+        reconciler.reconcile_once().unwrap();
+        reconciler.reconcile_once().unwrap();
+        let rejected_step = &rejected_run.steps[0].subject;
+        let rejected_request = store
+            .gate_request_for_owner(rejected_step)
+            .unwrap()
+            .expect("the second review was not requested");
+        store
+            .append_claim(&ClaimInput {
+                subject: rejected_request.subject,
+                kind: "gate.result".into(),
+                actor: Some("person/nathan".into()),
+                fields: BTreeMap::from([
+                    ("verdict".into(), Value::String("fail".into())),
+                    (
+                        "reason".into(),
+                        Value::String("The proof needs a source.".into()),
+                    ),
+                    ("request".into(), Value::String(rejected_request.id)),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some("review-rejected-result".into()),
+            })
+            .unwrap();
+        reconciler.reconcile_once().unwrap();
+        let failed = store.step_run(rejected_step).unwrap().unwrap();
+        assert_eq!(failed.status, "failed");
+        assert!(
+            failed
+                .blocked_reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("The proof needs a source.")
         );
     }
 
@@ -20631,10 +20699,18 @@ mission "ios-proof-blocked" state="ready" {
     #[test]
     fn an_unchanged_pass_floors_a_past_wake_deadline() {
         assert_eq!(
-            deadline_sleep_ms(1_000, 2_000, true),
+            deadline_sleep_ms(1_000, 2_000, Some(1_500)),
             WORK_WAKE_RETRY_MS as u64
         );
-        assert_eq!(deadline_sleep_ms(3_000, 2_000, true), 1_000);
+        assert_eq!(deadline_sleep_ms(3_000, 2_000, Some(1_500)), 1_000);
+    }
+
+    /// A mission deadline that falls due while a quiet pass runs has not been evaluated, so the
+    /// next pass runs at once rather than after the back-off.
+    #[test]
+    fn a_deadline_that_falls_due_during_a_quiet_pass_runs_at_once() {
+        assert_eq!(deadline_sleep_ms(1_600, 2_000, Some(1_500)), 0);
+        assert_eq!(deadline_sleep_ms(1_600, 2_000, None), 0);
     }
 
     #[test]
