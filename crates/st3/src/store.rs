@@ -556,13 +556,257 @@ struct ReplicationSnapshot {
     store_index: u64,
     replica_generation: u64,
     max_envelope_rowid: i64,
-    inventory: ReplicationInventory,
+    inventory: CompactReplicationInventory,
     buckets: Vec<ReplicationInventoryBucket>,
     /// The inventory digest state before each range in `buckets`.
     digest_prefixes: Vec<Sha256>,
     authority_digest: String,
     graph_generation: i64,
     graph_digest: String,
+}
+
+/// The replica envelope identities a snapshot keeps for its whole life. Writers are interned
+/// and SHA-256 hashes are kept as bytes, so an identity takes 48 bytes instead of two heap
+/// strings. Public identities are expanded only for the ranges an exchange lists.
+#[derive(Clone, Default)]
+struct CompactReplicationInventory {
+    digest: String,
+    /// Sorted, so writer indexes order identities the way writer names do.
+    writers: Vec<String>,
+    /// Hashes a peer sent that are not lowercase SHA-256 hex, kept verbatim.
+    irregular_hashes: Vec<String>,
+    /// In `ReplicaEnvelopeId` order: writer, sequence, then hash text.
+    envelopes: Vec<CompactEnvelopeId>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CompactEnvelopeId {
+    writer: u32,
+    /// Zero for a SHA-256 `hash`; otherwise one more than an `irregular_hashes` index.
+    irregular: u32,
+    sequence: u64,
+    hash: [u8; 32],
+}
+
+impl CompactReplicationInventory {
+    /// Build from identities already in `ReplicaEnvelopeId` order.
+    #[cfg(test)]
+    fn from_sorted(identities: impl IntoIterator<Item = ReplicaEnvelopeId>) -> Self {
+        let mut inventory = Self::default();
+        for identity in identities {
+            inventory.push_sorted(identity);
+        }
+        inventory.refresh_digest();
+        inventory
+    }
+
+    /// Append an identity that sorts after every held one. The digest is left for the caller.
+    fn push_sorted(&mut self, identity: ReplicaEnvelopeId) {
+        if self.writers.last() != Some(&identity.writer) {
+            self.writers.push(identity.writer.clone());
+        }
+        let writer = self.writers.len() as u32 - 1;
+        let envelope = self.compact(writer, identity);
+        self.envelopes.push(envelope);
+    }
+
+    fn refresh_digest(&mut self) {
+        self.digest = self.digest_of(INVENTORY_DIGEST_DOMAIN, &self.envelopes);
+    }
+
+    /// Set the inventory digest by resuming at range `from`; the value equals
+    /// `refresh_digest`. `prefixes[i]` holds the digest state before `buckets[i]`, which must
+    /// list the held identities range by range, and no range before `from` may have changed
+    /// since `prefixes` was built. Ranges are ordered by writer, so new envelopes re-hash only
+    /// their own later ranges and those of later writers.
+    fn resume_digest(
+        &mut self,
+        buckets: &[ReplicationInventoryBucket],
+        prefixes: &mut Vec<Sha256>,
+        from: usize,
+    ) {
+        let from = from.min(prefixes.len().saturating_sub(1));
+        let mut digest = match prefixes.get(from) {
+            Some(state) => state.clone(),
+            None => {
+                let mut digest = Sha256::new();
+                digest.update(INVENTORY_DIGEST_DOMAIN);
+                digest
+            }
+        };
+        prefixes.truncate(from);
+        let mut position = buckets[..from.min(buckets.len())]
+            .iter()
+            .map(|bucket| bucket.count as usize)
+            .sum::<usize>();
+        let mut buffer = [0; 64];
+        for bucket in buckets.iter().skip(from) {
+            prefixes.push(digest.clone());
+            let end = position + bucket.count as usize;
+            for envelope in &self.envelopes[position..end] {
+                update_identity_digest(
+                    &mut digest,
+                    &self.writers[envelope.writer as usize],
+                    envelope.sequence,
+                    self.hash_text(envelope, &mut buffer),
+                );
+            }
+            #[cfg(test)]
+            INVENTORY_IDENTITIES_HASHED.with(|hashed| hashed.set(hashed.get() + end - position));
+            position = end;
+        }
+        debug_assert_eq!(position, self.envelopes.len());
+        self.digest = hex::encode(digest.finalize());
+    }
+
+    fn compact(&mut self, writer: u32, identity: ReplicaEnvelopeId) -> CompactEnvelopeId {
+        let mut hash = [0_u8; 32];
+        let canonical = identity.hash.len() == 64
+            && identity
+                .hash
+                .bytes()
+                .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+            && hex::decode_to_slice(&identity.hash, &mut hash).is_ok();
+        let irregular = if canonical {
+            0
+        } else {
+            self.irregular_hashes.push(identity.hash);
+            self.irregular_hashes.len() as u32
+        };
+        CompactEnvelopeId {
+            writer,
+            irregular,
+            sequence: identity.sequence,
+            hash,
+        }
+    }
+
+    /// Insert one identity in order. The digest is left for the caller to recompute.
+    fn insert(&mut self, identity: ReplicaEnvelopeId) {
+        let writer = match self.writers.binary_search(&identity.writer) {
+            Ok(writer) => writer,
+            Err(writer) => {
+                self.writers.insert(writer, identity.writer.clone());
+                for envelope in &mut self.envelopes {
+                    if envelope.writer as usize >= writer {
+                        envelope.writer += 1;
+                    }
+                }
+                writer
+            }
+        };
+        let envelope = self.compact(writer as u32, identity);
+        let position = self
+            .envelopes
+            .binary_search_by(|probe| self.order(probe, &envelope))
+            .unwrap_or_else(|at| at);
+        self.envelopes.insert(position, envelope);
+    }
+
+    fn order(&self, left: &CompactEnvelopeId, right: &CompactEnvelopeId) -> std::cmp::Ordering {
+        left.writer
+            .cmp(&right.writer)
+            .then(left.sequence.cmp(&right.sequence))
+            .then_with(|| {
+                if left.irregular == 0 && right.irregular == 0 {
+                    // Byte order of two hashes is the order of their lowercase hex text.
+                    left.hash.cmp(&right.hash)
+                } else {
+                    let (mut left_buffer, mut right_buffer) = ([0; 64], [0; 64]);
+                    self.hash_text(left, &mut left_buffer)
+                        .cmp(self.hash_text(right, &mut right_buffer))
+                }
+            })
+    }
+
+    fn hash_text<'a>(&'a self, envelope: &CompactEnvelopeId, buffer: &'a mut [u8; 64]) -> &'a str {
+        if envelope.irregular == 0 {
+            hex::encode_to_slice(envelope.hash, buffer).expect("a SHA-256 hash has 64 hex bytes");
+            std::str::from_utf8(buffer).expect("hex is ASCII")
+        } else {
+            &self.irregular_hashes[envelope.irregular as usize - 1]
+        }
+    }
+
+    fn identity(&self, envelope: &CompactEnvelopeId) -> ReplicaEnvelopeId {
+        let mut buffer = [0; 64];
+        ReplicaEnvelopeId {
+            writer: self.writers[envelope.writer as usize].clone(),
+            sequence: envelope.sequence,
+            hash: self.hash_text(envelope, &mut buffer).to_owned(),
+        }
+    }
+
+    fn identities(&self, range: &[CompactEnvelopeId]) -> Vec<ReplicaEnvelopeId> {
+        range
+            .iter()
+            .map(|envelope| self.identity(envelope))
+            .collect()
+    }
+
+    fn public(&self) -> ReplicationInventory {
+        ReplicationInventory {
+            digest: self.digest.clone(),
+            envelopes: self.identities(&self.envelopes),
+            buckets: Vec::new(),
+        }
+    }
+
+    fn digest_of(&self, domain: &[u8], range: &[CompactEnvelopeId]) -> String {
+        let mut digest = Sha256::new();
+        digest.update(domain);
+        let mut buffer = [0; 64];
+        for envelope in range {
+            update_identity_digest(
+                &mut digest,
+                &self.writers[envelope.writer as usize],
+                envelope.sequence,
+                self.hash_text(envelope, &mut buffer),
+            );
+        }
+        hex::encode(digest.finalize())
+    }
+
+    /// The identities of one writer sequence range.
+    fn range(&self, writer: &str, start: u64) -> &[CompactEnvelopeId] {
+        let Ok(writer) = self
+            .writers
+            .binary_search_by(|name| name.as_str().cmp(writer))
+        else {
+            return &[];
+        };
+        let writer = writer as u32;
+        let end = start.saturating_add(REPLICATION_BUCKET_WIDTH);
+        let from = self
+            .envelopes
+            .partition_point(|envelope| (envelope.writer, envelope.sequence) < (writer, start));
+        let to = self
+            .envelopes
+            .partition_point(|envelope| (envelope.writer, envelope.sequence) < (writer, end));
+        &self.envelopes[from..to]
+    }
+
+    /// Summarize one non-empty range of a single writer.
+    fn bucket(&self, range: &[CompactEnvelopeId]) -> ReplicationInventoryBucket {
+        ReplicationInventoryBucket {
+            writer: self.writers[range[0].writer as usize].clone(),
+            start: replication_bucket_start(range[0].sequence),
+            count: range.len() as u64,
+            digest: self.digest_of(BUCKET_DIGEST_DOMAIN, range),
+        }
+    }
+
+    /// One digest per writer sequence range.
+    fn buckets(&self) -> Vec<ReplicationInventoryBucket> {
+        self.envelopes
+            .chunk_by(|left, right| {
+                left.writer == right.writer
+                    && replication_bucket_start(left.sequence)
+                        == replication_bucket_start(right.sequence)
+            })
+            .map(|range| self.bucket(range))
+            .collect()
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -9197,7 +9441,7 @@ impl Store {
     }
 
     pub fn replication_inventory(&self) -> Result<ReplicationInventory> {
-        Ok(self.replication_snapshot()?.inventory.clone())
+        Ok(self.replication_snapshot()?.inventory.public())
     }
 
     fn replication_snapshot(&self) -> Result<Arc<ReplicationSnapshot>> {
@@ -9244,15 +9488,15 @@ impl Store {
                 row.get(0)
             })?;
         let full = |connection: &Connection| -> Result<_> {
-            let (envelopes, max_rowid) = full_replication_inventory_rows(connection)?;
-            let buckets = replication_inventory_buckets(&envelopes);
-            Ok((envelopes, max_rowid, buckets, Vec::new(), 0))
+            let (inventory, max_rowid) = full_compact_replication_inventory(connection)?;
+            let buckets = inventory.buckets();
+            Ok((inventory, max_rowid, buckets, Vec::new(), 0))
         };
-        let (envelopes, max_envelope_rowid, buckets, mut digest_prefixes, resume_from) =
+        let (mut inventory, max_envelope_rowid, buckets, mut digest_prefixes, resume_from) =
             if let Some(previous) = previous {
                 let mut statement = connection.prepare(
                     "SELECT rowid, writer, sequence, envelope_hash FROM replica_envelopes
-                 WHERE rowid>?1 ORDER BY rowid",
+                     WHERE rowid>?1 ORDER BY rowid",
                 )?;
                 let additions = statement
                     .query_map([previous.max_envelope_rowid], |row| {
@@ -9272,15 +9516,15 @@ impl Store {
                     // into the successor so a graph write does not allocate and free
                     // every envelope ID. Keep the old snapshot intact for concurrent
                     // callers that still hold it.
-                    let (mut envelopes, mut buckets, digest_prefixes) =
+                    let (mut inventory, mut buckets, digest_prefixes) =
                         match Arc::try_unwrap(previous) {
                             Ok(snapshot) => (
-                                snapshot.inventory.envelopes,
+                                snapshot.inventory,
                                 snapshot.buckets,
                                 snapshot.digest_prefixes,
                             ),
                             Err(shared) => (
-                                shared.inventory.envelopes.clone(),
+                                shared.inventory.clone(),
                                 shared.buckets.clone(),
                                 shared.digest_prefixes.clone(),
                             ),
@@ -9292,14 +9536,11 @@ impl Store {
                             identity.writer.clone(),
                             replication_bucket_start(identity.sequence),
                         ));
-                        let position = envelopes.binary_search(&identity).unwrap_or_else(|at| at);
-                        envelopes.insert(position, identity);
+                        inventory.insert(identity);
                     }
                     // Only the ranges that gained an envelope need a new digest.
                     for (writer, start) in &touched {
-                        let bucket = replication_inventory_bucket(replication_bucket_slice(
-                            &envelopes, writer, *start,
-                        ));
+                        let bucket = inventory.bucket(inventory.range(writer, *start));
                         match buckets.binary_search_by(|existing| {
                             (existing.writer.as_str(), existing.start)
                                 .cmp(&(writer.as_str(), *start))
@@ -9308,8 +9549,8 @@ impl Store {
                             Err(position) => buckets.insert(position, bucket),
                         }
                     }
-                    // Every range before the first one that gained an envelope is unchanged, so the
-                    // inventory digest resumes there instead of hashing every identity again.
+                    // Every range before the first one that gained an envelope is unchanged, so
+                    // the inventory digest resumes there instead of hashing every identity again.
                     let resume_from = touched
                         .iter()
                         .map(|(writer, start)| {
@@ -9320,23 +9561,14 @@ impl Store {
                         })
                         .min()
                         .unwrap_or(buckets.len());
-                    (envelopes, max_rowid, buckets, digest_prefixes, resume_from)
+                    (inventory, max_rowid, buckets, digest_prefixes, resume_from)
                 } else {
                     full(&connection)?
                 }
             } else {
                 full(&connection)?
             };
-        let inventory = ReplicationInventory {
-            digest: resume_replication_inventory_digest(
-                &envelopes,
-                &buckets,
-                &mut digest_prefixes,
-                resume_from,
-            ),
-            envelopes,
-            buckets: Vec::new(),
-        };
+        inventory.resume_digest(&buckets, &mut digest_prefixes, resume_from);
         // Envelope hashes already commit the complete payload (and chain metadata). The
         // inventory digest therefore commits the authority log without hex-encoding and hashing
         // every payload again on each graph change.
@@ -9390,9 +9622,10 @@ impl Store {
         if !same && !remote.buckets.is_empty() {
             // The peer sent range digests, so only differing ranges need identities.
             let (missing, listed) = compact_replication_difference(
-                &snapshot.inventory.envelopes,
+                &snapshot.inventory,
                 &snapshot.buckets,
                 remote,
+                REPLICATION_EXCHANGE_ENVELOPE_LIMIT,
             );
             return Ok(ReplicationExchange {
                 peer: self.origin.clone(),
@@ -9408,6 +9641,8 @@ impl Store {
                 envelopes: self.replica_envelopes(missing)?,
             });
         }
+        // A peer without range digests (an older build, or an explicit full-inventory request)
+        // still exchanges complete inventories.
         let remote_is_complete = if remote.digest.is_empty() {
             true
         } else {
@@ -9419,13 +9654,13 @@ impl Store {
             // Only membership is needed. Borrow IDs from the request instead of
             // duplicating the remote's entire inventory on every divergent sync.
             let known = remote.envelopes.iter().collect::<BTreeSet<_>>();
-            snapshot
-                .inventory
+            let inventory = &snapshot.inventory;
+            inventory
                 .envelopes
                 .iter()
-                .filter(|identity| !known.contains(*identity))
+                .map(|envelope| inventory.identity(envelope))
+                .filter(|identity| !known.contains(identity))
                 .take(REPLICATION_EXCHANGE_ENVELOPE_LIMIT)
-                .cloned()
                 .collect::<Vec<_>>()
         };
         Ok(ReplicationExchange {
@@ -9441,7 +9676,7 @@ impl Store {
                     buckets: Vec::new(),
                 }
             } else {
-                snapshot.inventory.clone()
+                snapshot.inventory.public()
             },
             envelopes: self.replica_envelopes(missing)?,
         })
@@ -15659,6 +15894,7 @@ fn replica_record_ref(writer: &str, sequence: u64, envelope_hash: &str, position
     format!("record/{}", hex::encode(digest))
 }
 
+#[cfg(test)]
 fn full_replication_inventory_rows(
     connection: &Connection,
 ) -> Result<(Vec<ReplicaEnvelopeId>, i64)> {
@@ -15687,7 +15923,31 @@ fn full_replication_inventory_rows(
     Ok((envelopes, max_rowid))
 }
 
-/// The most envelopes one exchange response or request carries.
+/// Read every envelope identity straight into compact form, without a public copy.
+fn full_compact_replication_inventory(
+    connection: &Connection,
+) -> Result<(CompactReplicationInventory, i64)> {
+    let mut statement = connection.prepare(
+        "SELECT rowid, writer, sequence, envelope_hash FROM replica_envelopes
+         ORDER BY writer, sequence, envelope_hash",
+    )?;
+    let mut rows = statement.query([])?;
+    let mut inventory = CompactReplicationInventory::default();
+    let mut max_rowid = 0;
+    while let Some(row) = rows.next()? {
+        max_rowid = max_rowid.max(row.get::<_, i64>(0)?);
+        inventory.push_sorted(ReplicaEnvelopeId {
+            writer: row.get(1)?,
+            sequence: row.get(2)?,
+            hash: row.get(3)?,
+        });
+    }
+    inventory.refresh_digest();
+    Ok((inventory, max_rowid))
+}
+
+/// The most envelopes one exchange response or request carries, and the most identities one
+/// divergent exchange lists beyond its first differing range.
 const REPLICATION_EXCHANGE_ENVELOPE_LIMIT: usize = 512;
 
 /// Sequences per compact inventory range. A range digest lets two peers skip every range they
@@ -15695,6 +15955,7 @@ const REPLICATION_EXCHANGE_ENVELOPE_LIMIT: usize = 512;
 const REPLICATION_BUCKET_WIDTH: u64 = 256;
 
 const INVENTORY_DIGEST_DOMAIN: &[u8] = b"st3-replication-inventory-v1\0";
+const BUCKET_DIGEST_DOMAIN: &[u8] = b"st3-replication-bucket-v1\0";
 
 fn replication_inventory_digest(envelopes: &[ReplicaEnvelopeId]) -> String {
     replication_identity_digest(INVENTORY_DIGEST_DOMAIN, envelopes)
@@ -15703,55 +15964,23 @@ fn replication_inventory_digest(envelopes: &[ReplicaEnvelopeId]) -> String {
 fn replication_bucket_digest<'a>(
     envelopes: impl IntoIterator<Item = &'a ReplicaEnvelopeId>,
 ) -> String {
-    replication_identity_digest(b"st3-replication-bucket-v1\0", envelopes)
+    replication_identity_digest(BUCKET_DIGEST_DOMAIN, envelopes)
 }
 
 fn replication_bucket_start(sequence: u64) -> u64 {
     sequence - sequence % REPLICATION_BUCKET_WIDTH
 }
 
-/// Summarize a canonically ordered inventory as one digest per writer sequence range.
-fn replication_inventory_buckets(
-    envelopes: &[ReplicaEnvelopeId],
-) -> Vec<ReplicationInventoryBucket> {
-    envelopes
-        .chunk_by(|left, right| {
-            left.writer == right.writer
-                && replication_bucket_start(left.sequence)
-                    == replication_bucket_start(right.sequence)
-        })
-        .map(replication_inventory_bucket)
-        .collect()
-}
-
-/// Summarize one non-empty range of a single writer.
-fn replication_inventory_bucket(range: &[ReplicaEnvelopeId]) -> ReplicationInventoryBucket {
-    ReplicationInventoryBucket {
-        writer: range[0].writer.clone(),
-        start: replication_bucket_start(range[0].sequence),
-        count: range.len() as u64,
-        digest: replication_bucket_digest(range),
-    }
-}
-
-fn replication_bucket_slice<'a>(
-    envelopes: &'a [ReplicaEnvelopeId],
-    writer: &str,
-    start: u64,
-) -> &'a [ReplicaEnvelopeId] {
-    let end = start.saturating_add(REPLICATION_BUCKET_WIDTH);
-    let from = envelopes.partition_point(|id| (id.writer.as_str(), id.sequence) < (writer, start));
-    let to = envelopes.partition_point(|id| (id.writer.as_str(), id.sequence) < (writer, end));
-    &envelopes[from..to]
-}
-
 /// Compare a local inventory with a peer's compact inventory. Returns the local envelopes the
-/// peer provably lacks, bounded per exchange, and the local identities in every range both
-/// sides hold with different digests so the peer can compute the reverse difference.
+/// peer provably lacks, bounded per exchange, and the local identities of the ranges both
+/// sides hold with different digests, so the peer can compute the reverse difference. Whole
+/// ranges are listed in order while they fit `listing_limit`. The first differing range is
+/// always listed, so each exchange settles at least one range and later ones follow.
 fn compact_replication_difference(
-    envelopes: &[ReplicaEnvelopeId],
+    inventory: &CompactReplicationInventory,
     buckets: &[ReplicationInventoryBucket],
     remote: &ReplicationInventory,
+    listing_limit: usize,
 ) -> (Vec<ReplicaEnvelopeId>, Vec<ReplicaEnvelopeId>) {
     let remote_buckets = remote
         .buckets
@@ -15770,19 +15999,30 @@ fn compact_replication_difference(
     }
     let mut missing = Vec::new();
     let mut listed = Vec::new();
+    let mut listing_full = false;
     for bucket in buckets {
         let key = (bucket.writer.as_str(), bucket.start);
-        let local = replication_bucket_slice(envelopes, &bucket.writer, bucket.start);
+        let local = inventory.range(&bucket.writer, bucket.start);
         let room = REPLICATION_EXCHANGE_ENVELOPE_LIMIT.saturating_sub(missing.len());
         let Some(theirs) = remote_buckets.get(&key) else {
             // The peer holds nothing in this range.
-            missing.extend(local.iter().take(room).cloned());
+            missing.extend(
+                local
+                    .iter()
+                    .take(room)
+                    .map(|envelope| inventory.identity(envelope)),
+            );
             continue;
         };
         if theirs.digest == bucket.digest {
             continue;
         }
-        listed.extend_from_slice(local);
+        let local = inventory.identities(local);
+        if !listing_full && (listed.is_empty() || listed.len() + local.len() <= listing_limit) {
+            listed.extend_from_slice(&local);
+        } else {
+            listing_full = true;
+        }
         // Only the peer's complete listing of this range proves which identities it lacks. A
         // range that changed after the peer chose what to list waits for the next exchange.
         let Some(known) = remote_listed.get_mut(&key) else {
@@ -15797,10 +16037,9 @@ fn compact_replication_difference(
         }
         missing.extend(
             local
-                .iter()
-                .filter(|identity| known.binary_search(identity).is_err())
-                .take(room)
-                .cloned(),
+                .into_iter()
+                .filter(|identity| known.binary_search(&identity).is_err())
+                .take(room),
         );
     }
     (missing, listed)
@@ -15813,17 +16052,18 @@ fn replication_identity_digest<'a>(
     let mut digest = Sha256::new();
     digest.update(domain);
     for envelope in envelopes {
-        update_identity_digest(&mut digest, envelope);
+        update_identity_digest(
+            &mut digest,
+            &envelope.writer,
+            envelope.sequence,
+            &envelope.hash,
+        );
     }
     hex::encode(digest.finalize())
 }
 
-fn update_identity_digest(digest: &mut Sha256, envelope: &ReplicaEnvelopeId) {
-    for field in [
-        envelope.writer.as_str(),
-        &envelope.sequence.to_string(),
-        envelope.hash.as_str(),
-    ] {
+fn update_identity_digest(digest: &mut Sha256, writer: &str, sequence: u64, hash: &str) {
+    for field in [writer, &sequence.to_string(), hash] {
         digest.update((field.len() as u64).to_be_bytes());
         digest.update(field.as_bytes());
     }
@@ -15833,45 +16073,6 @@ fn update_identity_digest(digest: &mut Sha256, envelope: &ReplicaEnvelopeId) {
 thread_local! {
     static INVENTORY_IDENTITIES_HASHED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static GRAPH_DIGESTS_COMPUTED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-}
-
-/// The inventory digest, resumed at range `from`. It equals
-/// `replication_inventory_digest(envelopes)`. `prefixes[i]` holds the digest state before
-/// `buckets[i]`, which must list `envelopes` range by range. The caller guarantees that no
-/// range before `from` changed since `prefixes` was built. Ranges are ordered by writer, so a
-/// peer's new envelopes re-hash only its later ranges and those of later writers.
-fn resume_replication_inventory_digest(
-    envelopes: &[ReplicaEnvelopeId],
-    buckets: &[ReplicationInventoryBucket],
-    prefixes: &mut Vec<Sha256>,
-    from: usize,
-) -> String {
-    let from = from.min(prefixes.len().saturating_sub(1));
-    let mut digest = match prefixes.get(from) {
-        Some(state) => state.clone(),
-        None => {
-            let mut digest = Sha256::new();
-            digest.update(INVENTORY_DIGEST_DOMAIN);
-            digest
-        }
-    };
-    prefixes.truncate(from);
-    let mut position = buckets[..from.min(buckets.len())]
-        .iter()
-        .map(|bucket| bucket.count as usize)
-        .sum::<usize>();
-    for bucket in buckets.iter().skip(from) {
-        prefixes.push(digest.clone());
-        let end = position + bucket.count as usize;
-        for envelope in &envelopes[position..end] {
-            update_identity_digest(&mut digest, envelope);
-        }
-        #[cfg(test)]
-        INVENTORY_IDENTITIES_HASHED.with(|hashed| hashed.set(hashed.get() + end - position));
-        position = end;
-    }
-    debug_assert_eq!(position, envelopes.len());
-    hex::encode(digest.finalize())
 }
 
 /// The projected tables the graph digest commits: digest label, table, digested columns in
@@ -16158,13 +16359,189 @@ fn replication_snapshot_inserts_new_envelopes_in_canonical_order() {
     let incremental = target.replication_snapshot().unwrap();
     let connection = target.connection.lock().unwrap();
     let (full, max_rowid) = full_replication_inventory_rows(&connection).unwrap();
-    assert_eq!(incremental.inventory.envelopes, full);
+    assert_eq!(incremental.inventory.public().envelopes, full);
     assert_eq!(incremental.max_envelope_rowid, max_rowid);
     assert_eq!(
         incremental.inventory.digest,
         replication_inventory_digest(&full)
     );
-    assert_eq!(incremental.buckets, replication_inventory_buckets(&full));
+    assert_eq!(incremental.buckets, test_replication_buckets(&full));
+}
+
+/// Range digests computed from public identities, independent of the compact inventory.
+#[cfg(test)]
+fn test_replication_buckets(envelopes: &[ReplicaEnvelopeId]) -> Vec<ReplicationInventoryBucket> {
+    envelopes
+        .chunk_by(|left, right| {
+            left.writer == right.writer
+                && replication_bucket_start(left.sequence)
+                    == replication_bucket_start(right.sequence)
+        })
+        .map(|range| ReplicationInventoryBucket {
+            writer: range[0].writer.clone(),
+            start: replication_bucket_start(range[0].sequence),
+            count: range.len() as u64,
+            digest: replication_bucket_digest(range),
+        })
+        .collect()
+}
+
+#[cfg(test)]
+#[test]
+fn replication_snapshot_keeps_compact_envelope_identifiers() {
+    assert_eq!(std::mem::size_of::<CompactEnvelopeId>(), 48);
+    let store = Store::open_memory("node").unwrap();
+    for index in 0..100 {
+        store
+            .append_client_claim(&ClaimInput {
+                subject: format!("resource/compact-envelope-{index}"),
+                kind: "resource.observed".into(),
+                actor: None,
+                fields: BTreeMap::from([(
+                    "kind".into(),
+                    Value::String("custom.test.replication".into()),
+                )]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+    }
+    let snapshot = store.replication_snapshot().unwrap();
+    assert!(snapshot.inventory.envelopes.len() >= 100);
+    assert_eq!(snapshot.inventory.writers, ["node"]);
+    assert!(
+        snapshot.inventory.irregular_hashes.is_empty(),
+        "every local envelope hash is stored as SHA-256 bytes"
+    );
+}
+
+#[cfg(test)]
+#[test]
+fn compact_replication_inventory_matches_its_public_identities() {
+    let mut identities = [
+        test_envelope_ids("silber-like", 1..=300, "a"),
+        test_envelope_ids("hetz-like", 250..=600, "a"),
+        test_envelope_ids("hetz-like", [255, 256, 511], "b"),
+    ]
+    .concat();
+    // Hashes a peer could send that are not lowercase SHA-256 hex keep their exact text.
+    let upper = identities[0].hash.to_uppercase();
+    identities.extend([
+        ReplicaEnvelopeId {
+            writer: "hetz-like".into(),
+            sequence: 256,
+            hash: upper.clone(),
+        },
+        ReplicaEnvelopeId {
+            writer: "bluey-like".into(),
+            sequence: 7,
+            hash: "not-a-hash".into(),
+        },
+        ReplicaEnvelopeId {
+            writer: "silber-like".into(),
+            sequence: 7,
+            hash: String::new(),
+        },
+    ]);
+    let mut sorted = identities.clone();
+    sorted.sort();
+
+    let bulk = CompactReplicationInventory::from_sorted(sorted.clone());
+    // Insert in a scattered order so new writers and hashes land between held ones.
+    let mut incremental = CompactReplicationInventory::default();
+    for (index, identity) in identities.iter().enumerate().rev() {
+        if index % 2 == 0 {
+            incremental.insert(identity.clone());
+        }
+    }
+    for (index, identity) in identities.iter().enumerate() {
+        if index % 2 == 1 {
+            incremental.insert(identity.clone());
+        }
+    }
+    incremental.refresh_digest();
+
+    for inventory in [&bulk, &incremental] {
+        assert_eq!(inventory.public().envelopes, sorted);
+        assert_eq!(inventory.digest, replication_inventory_digest(&sorted));
+        assert_eq!(inventory.buckets(), test_replication_buckets(&sorted));
+        assert_eq!(inventory.irregular_hashes.len(), 3);
+        let range = inventory.range("hetz-like", 256);
+        assert_eq!(
+            inventory.identities(range),
+            sorted
+                .iter()
+                .filter(|id| id.writer == "hetz-like" && (256..512).contains(&id.sequence))
+                .cloned()
+                .collect::<Vec<_>>()
+        );
+    }
+    assert!(inventory_holds(&incremental, "hetz-like", 256, &upper));
+    assert!(inventory_holds(&incremental, "bluey-like", 7, "not-a-hash"));
+    assert!(bulk.range("absent", 0).is_empty());
+
+    fn inventory_holds(
+        inventory: &CompactReplicationInventory,
+        writer: &str,
+        start: u64,
+        hash: &str,
+    ) -> bool {
+        inventory
+            .identities(inventory.range(writer, replication_bucket_start(start)))
+            .iter()
+            .any(|id| id.hash == hash)
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn a_malformed_peer_hash_does_not_stop_replication() {
+    const FLEET: &str = "018f6f0d-4a5d-7b8c-9d0e-123456789abc";
+    let source = Store::open_memory("source").unwrap();
+    let target = Store::open_memory("target").unwrap();
+    source.bind_fleet(FLEET).unwrap();
+    target.bind_fleet(FLEET).unwrap();
+    let mut exchange = source.export_replication_summary(FLEET).unwrap();
+    exchange.envelopes = vec![ReplicaEnvelope {
+        writer: "source".into(),
+        sequence: 1,
+        previous_hash: None,
+        hash: "NOT-A-SHA256".into(),
+        accepted_at_unix_ms: 1,
+        payload: "{}".into(),
+    }];
+    target
+        .receive_replication_exchange("source", FLEET, &exchange)
+        .unwrap();
+
+    let inventory = target.replication_inventory().unwrap();
+    assert!(
+        inventory
+            .envelopes
+            .iter()
+            .any(|id| id.writer == "source" && id.hash == "NOT-A-SHA256"),
+        "the stored identity keeps its exact hash text"
+    );
+    assert_eq!(
+        inventory.digest,
+        replication_inventory_digest(&inventory.envelopes)
+    );
+    // The stored row is still found by its identity when a peer asks for it.
+    let fresh = Store::open_memory("fresh").unwrap();
+    fresh.bind_fleet(FLEET).unwrap();
+    let forwarded = target
+        .export_replication_exchange(
+            FLEET,
+            &fresh.export_replication_summary(FLEET).unwrap().inventory,
+        )
+        .unwrap();
+    assert!(
+        forwarded
+            .envelopes
+            .iter()
+            .any(|envelope| envelope.hash == "NOT-A-SHA256")
+    );
 }
 
 #[cfg(test)]
@@ -16178,7 +16555,7 @@ fn test_envelope_ids(
         .map(|sequence| ReplicaEnvelopeId {
             writer: writer.into(),
             sequence,
-            hash: format!("{fork}-{writer}-{sequence}"),
+            hash: hex::encode(Sha256::digest(format!("{fork}-{writer}-{sequence}"))),
         })
         .collect()
 }
@@ -16188,16 +16565,16 @@ struct TestReplica(BTreeSet<ReplicaEnvelopeId>);
 
 #[cfg(test)]
 impl TestReplica {
-    fn inventory(&self) -> (Vec<ReplicaEnvelopeId>, Vec<ReplicationInventoryBucket>) {
-        let envelopes = self.0.iter().cloned().collect::<Vec<_>>();
-        let buckets = replication_inventory_buckets(&envelopes);
-        (envelopes, buckets)
+    fn inventory(&self) -> (CompactReplicationInventory, Vec<ReplicationInventoryBucket>) {
+        let inventory = CompactReplicationInventory::from_sorted(self.0.iter().cloned());
+        let buckets = inventory.buckets();
+        (inventory, buckets)
     }
 
     fn summary(&self) -> ReplicationInventory {
-        let (envelopes, buckets) = self.inventory();
+        let (inventory, buckets) = self.inventory();
         ReplicationInventory {
-            digest: replication_inventory_digest(&envelopes),
+            digest: inventory.digest,
             envelopes: Vec::new(),
             buckets,
         }
@@ -16209,10 +16586,21 @@ impl TestReplica {
         &self,
         remote: &ReplicationInventory,
     ) -> (Vec<ReplicaEnvelopeId>, ReplicationInventory) {
-        let (envelopes, buckets) = self.inventory();
-        let (missing, listed) = compact_replication_difference(&envelopes, &buckets, remote);
+        self.answer_listing(remote, REPLICATION_EXCHANGE_ENVELOPE_LIMIT)
+    }
+
+    /// Answer with a listing limit. `usize::MAX` lists every differing range, as builds before
+    /// the listing limit do.
+    fn answer_listing(
+        &self,
+        remote: &ReplicationInventory,
+        listing_limit: usize,
+    ) -> (Vec<ReplicaEnvelopeId>, ReplicationInventory) {
+        let (inventory, buckets) = self.inventory();
+        let (missing, listed) =
+            compact_replication_difference(&inventory, &buckets, remote, listing_limit);
         let inventory = ReplicationInventory {
-            digest: replication_inventory_digest(&envelopes),
+            digest: inventory.digest,
             envelopes: listed,
             buckets,
         };
@@ -16221,13 +16609,20 @@ impl TestReplica {
 
     /// Run one two-phase outbound exchange from `self` to `peer`, as `peer::exchange` does.
     fn exchange(&mut self, peer: &mut Self) -> usize {
-        let (pulled, response) = peer.answer(&self.summary());
+        let limit = REPLICATION_EXCHANGE_ENVELOPE_LIMIT;
+        self.exchange_listing(limit, peer, limit)
+    }
+
+    /// Run one exchange where each side lists differing ranges up to its own limit, and return
+    /// the largest listing either side sent.
+    fn exchange_listing(&mut self, own_limit: usize, peer: &mut Self, peer_limit: usize) -> usize {
+        let (pulled, response) = peer.answer_listing(&self.summary(), peer_limit);
         let mut listed = response.envelopes.len();
         self.0.extend(pulled);
-        let (pushed, push) = self.answer(&response);
+        let (pushed, push) = self.answer_listing(&response, own_limit);
         listed = listed.max(push.envelopes.len());
         peer.0.extend(pushed);
-        let (pulled, _) = peer.answer(&push);
+        let (pulled, _) = peer.answer_listing(&push, peer_limit);
         self.0.extend(pulled);
         listed
     }
@@ -16266,7 +16661,7 @@ fn compact_replication_exchange_lists_only_ranges_that_differ() {
 
     let full = serde_json::to_vec(&ReplicationInventory {
         digest: String::new(),
-        envelopes: left.inventory().0,
+        envelopes: left.0.iter().cloned().collect(),
         buckets: Vec::new(),
     })
     .unwrap()
@@ -16276,6 +16671,56 @@ fn compact_replication_exchange_lists_only_ranges_that_differ() {
         compact * 50 < full,
         "the compact inventory ({compact} bytes) must be far smaller than the full one ({full} bytes)"
     );
+}
+
+/// Two peers that each miss one envelope in every range. Each exchange lists a bounded prefix
+/// of the differing ranges, so no response carries every identity, and the peers still
+/// converge, including with a peer that lists every differing range as earlier builds do.
+#[cfg(test)]
+#[test]
+fn compact_replication_exchange_bounds_the_listing_of_many_differing_ranges() {
+    let all = test_envelope_ids("hetz-like", 1..=5_000, "a");
+    let ranges = 5_000 / REPLICATION_BUCKET_WIDTH as usize + 1;
+    let replica = |skip: u64| {
+        TestReplica(
+            all.iter()
+                .filter(|id| id.sequence % REPLICATION_BUCKET_WIDTH != skip)
+                .cloned()
+                .collect(),
+        )
+    };
+    let limit = REPLICATION_EXCHANGE_ENVELOPE_LIMIT;
+    for (own, peer_limit) in [(limit, limit), (limit, usize::MAX), (usize::MAX, limit)] {
+        let (mut left, mut right) = (replica(1), replica(2));
+        let (_, response) = right.answer_listing(&left.summary(), peer_limit);
+        if peer_limit == limit {
+            let bytes = serde_json::to_vec(&response).unwrap().len();
+            assert!(
+                response.envelopes.len() <= limit && bytes < 128 * 1024,
+                "a divergent answer lists {} identities in {bytes} bytes",
+                response.envelopes.len()
+            );
+        }
+        let mut exchanges = 0;
+        while left.0 != right.0 {
+            exchanges += 1;
+            assert!(
+                exchanges <= ranges,
+                "every exchange settles at least one differing range"
+            );
+            let listed = left.exchange_listing(own, &mut right, peer_limit);
+            if own == limit && peer_limit == limit {
+                assert!(listed <= limit, "one exchange listed {listed} identities");
+            }
+        }
+        assert_eq!(left.0.len(), all.len());
+        if own == limit && peer_limit == limit {
+            assert!(
+                exchanges > 1,
+                "the listing limit spreads the ranges over exchanges"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -16304,7 +16749,7 @@ fn compact_replication_exchange_drains_a_backlog_in_bounded_batches() {
 #[cfg(test)]
 #[test]
 fn compact_replication_exchange_waits_for_a_complete_listing() {
-    let (envelopes, buckets) = TestReplica(
+    let (inventory, buckets) = TestReplica(
         test_envelope_ids("origin", 1..=10, "a")
             .into_iter()
             .collect(),
@@ -16315,19 +16760,20 @@ fn compact_replication_exchange_waits_for_a_complete_listing() {
             .into_iter()
             .collect(),
     );
+    let limit = REPLICATION_EXCHANGE_ENVELOPE_LIMIT;
     let mut listing = ReplicationInventory {
         digest: String::new(),
         envelopes: test_envelope_ids("origin", 1..=8, "a"),
         buckets: peer.summary().buckets,
     };
-    let (missing, _) = compact_replication_difference(&envelopes, &buckets, &listing);
+    let (missing, _) = compact_replication_difference(&inventory, &buckets, &listing, limit);
     assert_eq!(missing, test_envelope_ids("origin", 9..=10, "a"));
 
     // A truncated listing cannot prove what the peer lacks, so nothing is resent blindly.
     listing.envelopes.truncate(4);
-    let (missing, listed) = compact_replication_difference(&envelopes, &buckets, &listing);
+    let (missing, listed) = compact_replication_difference(&inventory, &buckets, &listing, limit);
     assert!(missing.is_empty());
-    assert_eq!(listed, envelopes);
+    assert_eq!(listed, inventory.public().envelopes);
 }
 
 fn collect_referenced_blobs(
@@ -21467,6 +21913,82 @@ mod tests {
     }
 
     #[test]
+    fn one_divergent_envelope_exchanges_only_its_inventory_range() {
+        let observe = |store: &Store, subject: &str, number: usize| {
+            store
+                .append_claim(&ClaimInput {
+                    subject: subject.into(),
+                    kind: "transport.observed".into(),
+                    actor: None,
+                    fields: BTreeMap::from([
+                        ("status".into(), Value::String("up".into())),
+                        ("reason".into(), Value::String(format!("sample {number}"))),
+                    ]),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: None,
+                })
+                .unwrap();
+        };
+        let remote = Store::open_memory("remote").unwrap();
+        for number in 0..1_100 {
+            observe(&remote, "host/remote", number);
+        }
+        let local = Store::open_memory("local").unwrap();
+        for after in [0, 512, 1_024] {
+            local
+                .import_replication("remote", &remote.export_replication(after).unwrap())
+                .unwrap();
+        }
+        observe(&remote, "host/remote", 1_100);
+
+        // The local peer's summary starts the exchange. The remote lists one range, not the
+        // 1,100 identities both peers already share.
+        let summary = local.export_replication_summary(TEST_FLEET).unwrap();
+        let response = remote
+            .export_replication_exchange(TEST_FLEET, &summary.inventory)
+            .unwrap();
+        assert!(!response.inventory.envelopes.is_empty());
+        assert!(response.inventory.envelopes.len() <= REPLICATION_BUCKET_WIDTH as usize);
+        assert!(serde_json::to_vec(&response).unwrap().len() < 65_536);
+        local
+            .receive_replication_exchange("remote", TEST_FLEET, &response)
+            .unwrap();
+        let push = local
+            .export_replication_exchange(TEST_FLEET, &response.inventory)
+            .unwrap();
+        assert!(push.inventory.envelopes.len() <= REPLICATION_BUCKET_WIDTH as usize);
+        remote
+            .receive_replication_exchange("local", TEST_FLEET, &push)
+            .unwrap();
+        let pull = remote
+            .export_replication_exchange(TEST_FLEET, &push.inventory)
+            .unwrap();
+        assert_eq!(pull.envelopes.len(), 1);
+        local
+            .receive_replication_exchange("remote", TEST_FLEET, &pull)
+            .unwrap();
+        assert_eq!(
+            local
+                .export_replication_summary(TEST_FLEET)
+                .unwrap()
+                .inventory
+                .digest,
+            remote
+                .export_replication_summary(TEST_FLEET)
+                .unwrap()
+                .inventory
+                .digest
+        );
+
+        // An explicit full-inventory request still gets every identity.
+        let explicit = local
+            .export_replication_exchange(TEST_FLEET, &ReplicationInventory::default())
+            .unwrap();
+        assert!(explicit.inventory.envelopes.len() > 1_100);
+    }
+
+    #[test]
     fn quiet_claim_detection_requires_only_usage_or_renewal_since_cursor() {
         let store = Store::open_memory("node").unwrap();
         let before = store.index().unwrap();
@@ -26175,15 +26697,15 @@ version 2
             "one new envelope re-hashed {hashed} of {} identities",
             after.inventory.envelopes.len()
         );
+        let public = after.inventory.public();
         assert_eq!(
             after.inventory.digest,
-            replication_inventory_digest(&after.inventory.envelopes)
+            replication_inventory_digest(&public.envelopes)
         );
         let connection = store.connection.lock().unwrap();
-        assert_eq!(
-            after.inventory.envelopes,
-            full_replication_inventory_rows(&connection).unwrap().0
-        );
+        let (full, _) = full_compact_replication_inventory(&connection).unwrap();
+        assert_eq!(public.envelopes, full.public().envelopes);
+        assert_eq!(after.inventory.digest, full.digest);
     }
 
     proptest! {
@@ -26196,44 +26718,42 @@ version 2
             ),
         ) {
             let writers = ["Silber", "fleet-node", "hetz"];
+            // Some hashes are not SHA-256 hex, so the digest also covers verbatim hashes.
             let identity = |(writer, sequence): (usize, u64)| ReplicaEnvelopeId {
                 writer: writers[writer].into(),
                 sequence,
-                hash: format!("{sequence:064x}"),
+                hash: if sequence % 7 == 0 {
+                    format!("irregular-{sequence}")
+                } else {
+                    format!("{sequence:064x}")
+                },
             };
-            let mut envelopes = initial
-                .into_iter()
-                .map(identity)
-                .collect::<BTreeSet<_>>()
-                .into_iter()
-                .collect::<Vec<_>>();
-            let mut buckets = replication_inventory_buckets(&envelopes);
+            let mut all = initial.into_iter().map(identity).collect::<BTreeSet<_>>();
+            let mut inventory = CompactReplicationInventory::from_sorted(all.iter().cloned());
+            let mut buckets = inventory.buckets();
             let mut prefixes = Vec::new();
+            inventory.resume_digest(&buckets, &mut prefixes, 0);
             prop_assert_eq!(
-                resume_replication_inventory_digest(&envelopes, &buckets, &mut prefixes, 0),
-                replication_inventory_digest(&envelopes)
+                &inventory.digest,
+                &replication_inventory_digest(&all.iter().cloned().collect::<Vec<_>>())
             );
             for round in rounds {
                 let before = buckets.clone();
                 for identity in round.into_iter().map(identity) {
-                    if let Err(position) = envelopes.binary_search(&identity) {
-                        envelopes.insert(position, identity);
+                    if all.insert(identity.clone()) {
+                        inventory.insert(identity);
                     }
                 }
-                buckets = replication_inventory_buckets(&envelopes);
+                buckets = inventory.buckets();
                 let resume_from = buckets
                     .iter()
                     .zip(&before)
                     .position(|(after, before)| after != before)
                     .unwrap_or(before.len().min(buckets.len()));
+                inventory.resume_digest(&buckets, &mut prefixes, resume_from);
                 prop_assert_eq!(
-                    resume_replication_inventory_digest(
-                        &envelopes,
-                        &buckets,
-                        &mut prefixes,
-                        resume_from,
-                    ),
-                    replication_inventory_digest(&envelopes)
+                    &inventory.digest,
+                    &replication_inventory_digest(&all.iter().cloned().collect::<Vec<_>>())
                 );
             }
         }
