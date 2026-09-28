@@ -335,6 +335,7 @@ fn parse_mission(
             }
             "gate" => {
                 let gate = crate::graph::parse_gate(child, default_host)?;
+                require_approve_mode_outside_step(&gate)?;
                 if !gate_names.insert(crate::graph::gate_name(&gate).to_owned()) {
                     return Err(St3Error::new(
                         "duplicate-gate",
@@ -848,6 +849,16 @@ fn parse_loop_branch(
         .transpose()
 }
 
+fn require_approve_mode_outside_step(gate: &GateSpec) -> Result<(), St3Error> {
+    if matches!(gate, GateSpec::Human { mode, .. } if mode == "feedback") {
+        return Err(St3Error::new(
+            "feedback-gate-needs-step",
+            "a feedback gate must be a step gate so the worker can rerun the step",
+        ));
+    }
+    Ok(())
+}
+
 fn parse_until(node: &KdlNode, default_host: &str) -> Result<Vec<GateSpec>, St3Error> {
     ensure_bare(node)?;
     let body = node
@@ -867,6 +878,7 @@ fn parse_until(node: &KdlNode, default_host: &str) -> Result<Vec<GateSpec>, St3E
                 ));
             }
             let gate = crate::graph::parse_gate(child, default_host)?;
+            require_approve_mode_outside_step(&gate)?;
             if !names.insert(crate::graph::gate_name(&gate).to_owned()) {
                 return Err(St3Error::new("duplicate-gate", "an until gate repeats"));
             }
@@ -1063,7 +1075,10 @@ fn parse_loop_exhaustion(
             LoopExhaustionSpec::Succeed
         }
         "gate" => match crate::graph::parse_gate(child, default_host)? {
-            gate @ GateSpec::Human { .. } => LoopExhaustionSpec::Human { gate },
+            gate @ GateSpec::Human { .. } => {
+                require_approve_mode_outside_step(&gate)?;
+                LoopExhaustionSpec::Human { gate }
+            }
             _ => {
                 return Err(St3Error::new(
                     "invalid-loop-exhaustion-gate",
@@ -1342,6 +1357,16 @@ fn parse_step(
             ));
         }
         agentless = true;
+    }
+    if agentless
+        && gates
+            .iter()
+            .any(|gate| matches!(gate, GateSpec::Human { mode, .. } if mode == "feedback"))
+    {
+        return Err(St3Error::new(
+            "feedback-gate-needs-worker",
+            format!("step `{path}` needs a worker for a feedback gate"),
+        ));
     }
     let work_selector = build_work_selector(
         &format!("step `{path}`"),
@@ -3042,6 +3067,7 @@ version 2
         review "doc/reports/run@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
       }
     }
+
   }
 
 "#,
@@ -3051,6 +3077,7 @@ version 2
         let gate = &intent.missions["review"].steps["approval"].gates[0];
         let crate::model::GateSpec::Human {
             reviewer,
+            mode,
             question,
             review_targets,
             ..
@@ -3059,6 +3086,7 @@ version 2
             panic!("the gate is not human");
         };
         assert_eq!(reviewer, "person/nathan");
+        assert_eq!(mode, "approve");
         assert_eq!(question.as_deref(), Some("Is this change ready to merge?"));
         assert_eq!(
             review_targets,
@@ -3067,6 +3095,18 @@ version 2
                 "doc/reports/run@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
             ]
         );
+    }
+
+    #[test]
+    fn feedback_gate_example_requires_a_worker_step() {
+        let source = include_str!("../../../examples/st3/human-feedback.kdl");
+        let intent = crate::graph::parse_intent(source, "node").unwrap();
+        let gate = &intent.missions["example/draft-feedback"].steps["draft"].gates[0];
+        assert!(matches!(gate, crate::model::GateSpec::Human { mode, .. } if mode == "feedback"));
+
+        let invalid = source.replace("assigned-to \"agent/example/worker\"", "agentless");
+        let error = crate::graph::parse_intent(&invalid, "node").unwrap_err();
+        assert_eq!(error.code, "feedback-gate-needs-worker");
     }
 
     #[test]

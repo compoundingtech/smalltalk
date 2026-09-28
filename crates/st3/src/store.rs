@@ -4806,6 +4806,68 @@ impl Store {
         Ok(true)
     }
 
+    /// A reviewer's request for changes starts a fresh attempt without a failed-step interval.
+    pub fn retry_step_for_feedback(
+        &self,
+        subject: &str,
+        reviewed_attempt: u32,
+        reason: &str,
+        reviewer: &str,
+    ) -> Result<bool> {
+        let subject = normalize_step_run(subject);
+        let mut connection = self.connection.lock().expect("store mutex poisoned");
+        let transaction = connection.transaction()?;
+        let current: Option<(String, u32, String)> = transaction
+            .query_row(
+                "SELECT status, attempt, goals FROM step_runs WHERE subject=?1",
+                [&subject],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+        let Some((status, attempt, goals_json)) = current else {
+            return Ok(false);
+        };
+        if attempt != reviewed_attempt
+            || !matches!(status.as_str(), "verifying" | "working" | "blocked")
+            || step_owner_is_terminal_tx(&transaction, &subject)?
+        {
+            return Ok(false);
+        }
+        let mut goals: Vec<String> = serde_json::from_str(&goals_json)?;
+        goals.push(format!("Reviewer feedback: {reason}"));
+        let next_attempt = attempt.saturating_add(1);
+        let now = now_ms();
+        transaction.execute(
+            "UPDATE step_runs SET status='pending', attempt=?2, goals=?3, worker_reported=0,
+                    lease_owner=NULL, lease_incarnation=NULL, lease_expires_at_unix_ms=NULL,
+                    blocked_reason=?4, not_before_unix_ms=NULL, activated_at_unix_ms=NULL,
+                    updated_at_unix_ms=?5 WHERE subject=?1",
+            params![
+                subject,
+                next_attempt,
+                serde_json::to_string(&goals)?,
+                reason,
+                now.to_string()
+            ],
+        )?;
+        let body = json!({"fields": {
+            "status": "pending", "attempt": next_attempt, "reason": reason,
+            "goals": goals, "not_before_unix_ms": null
+        }});
+        append_claim_tx(
+            &transaction,
+            &self.origin,
+            &subject,
+            "step-run.retried",
+            Some(reviewer),
+            &body,
+            &[],
+            None,
+        )?;
+        transaction.commit()?;
+        Ok(true)
+    }
+
     pub fn set_mission_run_state(
         &self,
         run: &str,
@@ -8507,6 +8569,7 @@ impl Store {
                     .unwrap_or_default();
                 items.push(AttentionItemView {
                     kind: "fault".into(),
+                    review_mode: None,
                     subject: failure.id,
                     person: reviewer,
                     requester_id: None,
@@ -15123,6 +15186,11 @@ fn current_human_review(
         step,
         title,
         reviewer: reviewer.to_owned(),
+        mode: fields
+            .get("mode")
+            .and_then(Value::as_str)
+            .unwrap_or("approve")
+            .to_owned(),
         question: fields
             .get("question")
             .and_then(Value::as_str)
@@ -15154,7 +15222,7 @@ fn pending_human_reviews_tx(
                    AND result.kind='gate.result'
                    AND json_extract(result.body, '$.fields.request')=request.id
                    AND result.actor=json_extract(request.body, '$.fields.reviewer')
-                   AND json_extract(result.body, '$.fields.verdict') IN ('pass','fail')
+                   AND json_extract(result.body, '$.fields.verdict') IN ('pass','fail','feedback')
                )
              ORDER BY request.store_index",
         )?;
@@ -15673,6 +15741,7 @@ fn attention_action(label: &str, argv: &[&str]) -> AttentionActionView {
 fn attention_item_from_review(review: HumanReviewView) -> AttentionItemView {
     AttentionItemView {
         kind: "human-gate".into(),
+        review_mode: Some(review.mode.clone()),
         subject: review.owner.clone(),
         person: review.reviewer.clone(),
         requester_id: None,
@@ -15700,11 +15769,19 @@ fn attention_item_from_review(review: HumanReviewView) -> AttentionItemView {
                 ],
             ),
             attention_action(
-                "reject",
+                if review.mode == "feedback" {
+                    "request changes"
+                } else {
+                    "reject"
+                },
                 &[
                     "st",
                     "attention",
-                    "reject",
+                    if review.mode == "feedback" {
+                        "request-changes"
+                    } else {
+                        "reject"
+                    },
                     &review.owner,
                     "--as",
                     &review.reviewer,
@@ -15721,6 +15798,7 @@ fn attention_item_from_planning(
 ) -> AttentionItemView {
     AttentionItemView {
         kind: "launch-approval".into(),
+        review_mode: None,
         subject: session.subject.clone(),
         person: session.requester.clone(),
         requester_id: None,
@@ -15772,6 +15850,7 @@ fn attention_item_from_revision(
     let preview_hash = proposal.preview_hash.as_deref().unwrap_or_default();
     AttentionItemView {
         kind: "revision-approval".into(),
+        review_mode: None,
         subject: proposal.subject.clone(),
         person: reviewer.to_owned(),
         requester_id: None,
@@ -15819,6 +15898,7 @@ fn attention_item_from_message(
 ) -> AttentionItemView {
     AttentionItemView {
         kind: "unread-message".into(),
+        review_mode: None,
         subject: message.subject.clone(),
         person: message.to.clone(),
         requester_id: None,
@@ -15852,7 +15932,13 @@ pub(crate) fn agent_attention_requester(actor: &str) -> bool {
 fn attention_item_from_request(request: AttentionRequestView) -> AttentionItemView {
     let agent_request = agent_attention_requester(&request.actor);
     AttentionItemView {
-        kind: if agent_request { "agent-request" } else { "fault" }.into(),
+        kind: if agent_request {
+            "agent-request"
+        } else {
+            "fault"
+        }
+        .into(),
+        review_mode: None,
         subject: request.subject.clone(),
         person: request.reviewer.clone(),
         requester_id: Some(request.actor.clone()),
@@ -21371,12 +21457,18 @@ fn project_mission_run_update(
             .get("not_before_unix_ms")
             .and_then(Value::as_u64)
             .map(|value| value.to_string());
+        let goals = fields
+            .get("goals")
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(internal)?;
         transaction
             .execute(
                 "UPDATE step_runs SET status='pending', attempt=?2, worker_reported=0, lease_owner=NULL,
                         lease_incarnation=NULL, lease_expires_at_unix_ms=NULL, blocked_reason=?3,
-                        not_before_unix_ms=?4, activated_at_unix_ms=NULL, updated_at_unix_ms=?5 WHERE subject=?1",
-                params![claim.subject, attempt, fields.get("reason").and_then(Value::as_str), not_before, claim.accepted_at_unix_ms.to_string()],
+                        not_before_unix_ms=?4, activated_at_unix_ms=NULL, updated_at_unix_ms=?5,
+                        goals=COALESCE(?6, goals) WHERE subject=?1",
+                params![claim.subject, attempt, fields.get("reason").and_then(Value::as_str), not_before, claim.accepted_at_unix_ms.to_string(), goals],
             )
             .map_err(internal)?;
         return Ok(());

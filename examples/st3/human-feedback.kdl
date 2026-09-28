@@ -1,0 +1,22 @@
+version 2
+
+// A worker submits a draft, then a person either accepts it or sends written feedback.
+// Requesting changes starts a fresh attempt and includes the feedback in the worker's goals.
+//
+//   st attention ls --as person/operator
+//   st attention request-changes step-run/GENERATION/draft \
+//     --reason "Add a source for the estimate." --as person/operator
+//   st attention approve step-run/GENERATION/draft --as person/operator
+
+mission "example/draft-feedback" state="ready" {
+  goal "Produce an invented project brief that a person accepts."
+
+  step "draft" {
+    assigned-to "agent/example/worker"
+    goal "Write and submit the invented project brief."
+    gate "review the project brief" type="human" mode="feedback" {
+      reviewer "person/operator"
+      question "Is the project brief ready?"
+    }
+  }
+}
