@@ -8,8 +8,8 @@ commit. A pull request run merges that commit with the latest `main` in a tempor
 before running `cargo test --workspace --locked` and
 `cargo clippy --workspace --all-targets --locked -- -D warnings`.
 
-`st/ci` is the Linux result from hetz. `st/ci-macos` is the Silber result and runs in
-parallel, so a slow macOS build does not delay the Linux result. Both reuse a host-local Cargo
+`st/ci` is the Linux result from hetz. `st/ci-macos` is the Silber result and starts
+after the Linux result, so a slow macOS build does not delay `st/ci`. Both reuse a host-local Cargo
 target directory and isolate `HOME` and XDG directories for each run. Forked pull requests
 are excluded before any code from them runs on these machines. GitHub Actions handles tags
 and forks.
