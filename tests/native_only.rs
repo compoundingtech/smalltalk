@@ -15,6 +15,7 @@ fn clean_path() -> tempfile::TempDir {
         .map(|dir| dir.join("git"))
         .find(|path| {
             path.is_file()
+                && !path.parent().unwrap().join("st3-recorder.json").exists()
                 && fs::read(path).is_ok_and(|bytes| {
                     !bytes
                         .windows(b"st2-recorder-wrapper".len())
