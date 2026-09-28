@@ -2911,11 +2911,23 @@ fn apply_v1_requires_a_declared_pty_root_outside_the_catalog() {
             .unwrap();
         assert!(captured.status.success());
         let captured: Value = serde_json::from_slice(&captured.stdout).unwrap();
-        let rejected = apply(
-            &catalog,
-            &prepared,
-            captured["rootSha256"].as_str().unwrap(),
-        );
+        let root_sha256 = captured["rootSha256"].as_str().unwrap();
+        let rejected = st2()
+            .args([
+                "catalog",
+                "apply",
+                "--catalog",
+                catalog.to_str().unwrap(),
+                "--prepared",
+                prepared.to_str().unwrap(),
+                "--input-sha256",
+                root_sha256,
+                "--expect-sha256",
+                root_sha256,
+                "--json",
+            ])
+            .output()
+            .unwrap();
         assert!(
             !rejected.status.success(),
             "{case} unexpectedly admitted: {}",
@@ -2924,7 +2936,9 @@ fn apply_v1_requires_a_declared_pty_root_outside_the_catalog() {
         assert!(
             String::from_utf8_lossy(&rejected.stderr).contains("requires pty-root outside")
                 || String::from_utf8_lossy(&rejected.stderr)
-                    .contains("requires an explicit external pty-root")
+                    .contains("requires an explicit external pty-root"),
+            "{case} rejected before pty-root validation: {}",
+            String::from_utf8_lossy(&rejected.stderr)
         );
         assert!(!catalog.join(".st2/catalog-apply-incomplete").exists());
     }
