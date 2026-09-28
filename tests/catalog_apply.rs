@@ -2879,13 +2879,9 @@ fn prepared_state_symlinks_and_pty_root_changes_fail_before_a_marker() {
 #[test]
 fn apply_v1_requires_a_declared_pty_root_outside_the_catalog() {
     let temp = tempfile::tempdir().unwrap();
-    for (case, suffix) in [
-        ("default", "d"),
-        ("relative", "r"),
-        ("catalog-variable", "v"),
-    ] {
-        let catalog = temp.path().join(format!("catalog-{suffix}"));
-        write_agent(&catalog, "worker", false);
+    for case in ["default", "relative", "catalog-variable"] {
+        let catalog = temp.path().join(format!("catalog-{case}"));
+        fs::create_dir_all(&catalog).unwrap();
         match case {
             "default" => {}
             "relative" => fs::write(
@@ -2895,12 +2891,12 @@ fn apply_v1_requires_a_declared_pty_root_outside_the_catalog() {
             .unwrap(),
             "catalog-variable" => fs::write(
                 catalog.join("catalog.kdl"),
-                "catalog { pty-root \"$CATALOG/../catalog-v/pty\" }\n",
+                "catalog { pty-root \"$CATALOG/../catalog-catalog-variable/pty\" }\n",
             )
             .unwrap(),
             _ => unreachable!(),
         }
-        let prepared = temp.path().join(format!("prepared-{suffix}"));
+        let prepared = temp.path().join(format!("prepared-{case}"));
         let captured = st2()
             .args([
                 "catalog",
@@ -2929,7 +2925,8 @@ fn apply_v1_requires_a_declared_pty_root_outside_the_catalog() {
             String::from_utf8_lossy(&rejected.stderr).contains("requires pty-root outside")
                 || String::from_utf8_lossy(&rejected.stderr)
                     .contains("requires an explicit external pty-root"),
-            "{case} rejected before pty-root validation: {}",
+            "{case}: stdout={} stderr={}",
+            String::from_utf8_lossy(&rejected.stdout),
             String::from_utf8_lossy(&rejected.stderr)
         );
         assert!(!catalog.join(".st2/catalog-apply-incomplete").exists());
