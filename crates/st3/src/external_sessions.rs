@@ -1503,6 +1503,20 @@ mod tests {
     use super::*;
 
     #[test]
+    #[ignore = "fails on main: process discovery uses the command's basename and misses a harness launched through a symlink"]
+    fn a_harness_launched_through_a_symlink_is_identified() {
+        let root = tempfile::tempdir().unwrap();
+        let harness = root.path().join("claude");
+        fs::write(&harness, "#!/bin/sh\nexit 0\n").unwrap();
+        let shim = root.path().join("agent-shim");
+        std::os::unix::fs::symlink(&harness, &shim).unwrap();
+        assert_eq!(
+            driver_for_command(shim.to_str().unwrap()),
+            Some(ExternalDriver::Claude)
+        );
+    }
+
+    #[test]
     fn metadata_cache_refreshes_after_a_transcript_changes() {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("session.jsonl");
