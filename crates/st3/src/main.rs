@@ -11879,6 +11879,7 @@ mod tests {
             reasons: vec!["requester-retired".into()],
             owner_generation: None,
             runtime_incarnation: None,
+            runtime_desired_revision: None,
         });
         let rendered = render_product_page("NOW", &page, "st now");
         assert!(
