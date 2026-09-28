@@ -242,6 +242,8 @@ enum FleetCommand {
     Leave(FleetLeaveArgs),
     /// Move a machine of a config-peer fleet to membership, keeping its history.
     Migrate(FleetMigrateArgs),
+    /// Switch this member between listening and dial-out.
+    Mode(FleetModeArgs),
     /// Show this node, the fleet's members, and open invites.
     Status,
 }
@@ -678,6 +680,33 @@ async fn run_fleet(endpoint: &Endpoint, command: FleetCommand, json_output: bool
         }
         FleetCommand::Remove(args) => run_fleet_remove(&client, &config, args).await,
         FleetCommand::Migrate(args) => run_fleet_migrate(&client, &config, args).await,
+        FleetCommand::Mode(args) => {
+            let mut file = st3::config::FleetFile::load(&config.state_dir)?
+                .context("this machine is not a fleet member")?;
+            file.mode = match args.mode.as_str() {
+                "listening" => st3::config::FleetMode::Listening,
+                "dial-out" => st3::config::FleetMode::DialOut,
+                _ => anyhow::bail!("the mode is listening or dial-out"),
+            };
+            file.port = match file.mode {
+                st3::config::FleetMode::DialOut => None,
+                st3::config::FleetMode::Listening => Some(match args.port.or(file.port) {
+                    Some(port) => port,
+                    None => st3::fleet::join::free_port(st3::fleet::join::DEFAULT_PORT)?,
+                }),
+            };
+            file.save(&config.state_dir)?;
+            println!(
+                "This member is now {}; it announces the change when its replication worker starts.",
+                file.mode.as_str()
+            );
+            if !args.no_service && services_installed() {
+                st3::service::install(Config::load_with_fleet(None)?)?;
+            } else {
+                println!("Restart st3 replication-worker for the change to take effect.");
+            }
+            Ok(())
+        }
         FleetCommand::Leave(args) => {
             let person = fleet_person(args.actor.clone(), &config)?;
             if args.cancel {
@@ -1078,6 +1107,17 @@ async fn run_uninstall(endpoint: &Endpoint, args: UninstallArgs) -> Result<()> {
 }
 
 #[derive(Args)]
+struct FleetModeArgs {
+    /// listening or dial-out.
+    mode: String,
+    /// The replication port when switching to listening.
+    #[arg(long)]
+    port: Option<u16>,
+    #[arg(long)]
+    no_service: bool,
+}
+
+#[derive(Args)]
 struct FleetMigrateArgs {
     /// A migration code from `st fleet invite NAME --migrate`, or - to read it from standard input.
     code: Option<String>,
@@ -1164,10 +1204,18 @@ async fn run_fleet_migrate(client: &Client, config: &Config, args: FleetMigrateA
         .fleet_id
         .clone()
         .context("this machine has no config-peer fleet to migrate; use st fleet join")?;
-    let secret_file = config
+    // fleet.toml resolves a relative path under STATE/fleet, and --finish removes the
+    // config.toml override, so record the secret file's absolute path now.
+    let configured_secret = config
         .shared_secret_file
         .clone()
         .context("config.toml names no shared_secret_file")?;
+    let secret_file = fs::canonicalize(&configured_secret).with_context(|| {
+        format!(
+            "the shared secret file {} is not readable from here; name it with an absolute path in config.toml",
+            configured_secret.display()
+        )
+    })?;
     let use_services = !args.no_service && services_installed();
     if client.get::<Value>("/v1/health").await.is_ok() {
         anyhow::ensure!(

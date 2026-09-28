@@ -91,6 +91,7 @@ impl Node {
         let mut command = Command::new(ST3);
         command
             .args(arguments)
+            .current_dir(&self.root)
             .env_clear()
             .env("PATH", std::env::var_os("PATH").unwrap_or_default())
             .env("HOME", self.root.join("home"))
@@ -1034,7 +1035,9 @@ async fn a_config_peer_fleet_migrates_to_membership() {
     let dead = free_port();
     // The running fleet's shape: a lists b, and lists the laptop at a port nothing serves.
     a.legacy_config(fleet_id, &secret, &[("b", b.port), ("l", dead)]);
-    b.legacy_config(fleet_id, &secret, &[("a", a.port)]);
+    // b names its secret relative to where its commands run.
+    fs::copy(&secret, b.root.join("fleet.secret")).unwrap();
+    b.legacy_config(fleet_id, Path::new("fleet.secret"), &[("a", a.port)]);
     l.legacy_config(fleet_id, &secret, &[("a", a.port)]);
     for node in [&mut a, &mut b, &mut l] {
         node.start().await;
@@ -1103,9 +1106,22 @@ async fn a_config_peer_fleet_migrates_to_membership() {
     let downs = down_observations(&a, "l").await;
     for node in [&a, &b, &l] {
         node.st_ok(&["fleet", "migrate", "--finish", "--no-service"]);
+        // Do what --finish says: delete the config-peer lines from config.toml.
+        fs::write(
+            node.root.join("config/st3/config.toml"),
+            format!("node = \"{}\"\nperson = \"{PERSON}\"\n", node.name),
+        )
+        .unwrap();
     }
     for node in [&mut a, &mut b, &mut l] {
         node.restart().await;
+        assert!(
+            node.worker
+                .as_mut()
+                .is_some_and(|worker| worker.try_wait().unwrap().is_none()),
+            "{}'s replication worker did not start without the config-peer lines",
+            node.name
+        );
     }
     a.note("a-2").await;
     b.note("b-2").await;
@@ -1196,4 +1212,45 @@ async fn a_leaving_member_writes_nothing_after_it_begins_to_leave() {
         .await
         .unwrap();
     b.note("after-cancel").await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_member_switches_between_listening_and_dial_out() {
+    let root = tempfile::tempdir().unwrap();
+    let a = anchor(root.path(), "a").await;
+    let mut b = joined(root.path(), &a, "b", &[]).await;
+    b.wait_listening().await;
+    b.st_ok(&["fleet", "mode", "dial-out", "--no-service"]);
+    b.restart().await;
+    wait_until("a sees b as dial-out", 60, || async {
+        a.st_json(&["fleet", "status"])["view"]["members"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|member| {
+                member["name"] == "b"
+                    && member["mode"] == "dial-out"
+                    && member["endpoints"].as_array().is_some_and(Vec::is_empty)
+            })
+    })
+    .await;
+    b.note("while-dial-out").await;
+    wait_for_notes(
+        &a,
+        &BTreeSet::from(["custom/fleet-test/while-dial-out".to_owned()]),
+        60,
+        &[&a, &b],
+    )
+    .await;
+    let port = b.port.to_string();
+    b.st_ok(&[
+        "fleet",
+        "mode",
+        "listening",
+        "--port",
+        &port,
+        "--no-service",
+    ]);
+    b.restart().await;
+    b.wait_listening().await;
 }
