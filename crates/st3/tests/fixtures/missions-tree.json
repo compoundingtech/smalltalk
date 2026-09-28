@@ -1,0 +1,26 @@
+{
+  "snapshot": {"id":"snapshot/orbit/1","host_id":"host/orbit","store_index":1},
+  "value": {
+    "runs": [
+      {"id":"mission-run/atlas/1","mission":"mission/atlas","state":"running","steps":[
+        {"id":"step-run/atlas/plan","name":"plan","state":"completed"},
+        {"id":"step-run/atlas/build","name":"build","state":"claimed"},
+        {"id":"step-run/atlas/review","name":"review","state":"pending"}
+      ]}
+    ],
+    "standing_queues": [
+      {"agent_id":"agent/orbit/standing","current_work_ids":["step-run/atlas/build"],"next_work_id":"step-run/boron/check","runs":[
+        {"mission_run_id":"mission-run/atlas/1","state":"claimed"},
+        {"mission_run_id":"mission-run/boron/1","state":"waiting"}
+      ]}
+    ],
+    "unstarted_missions": [
+      {"id":"mission/cedar","title":"cedar","state":"ready"},
+      {"id":"mission/delta","title":"delta","state":"draft"}
+    ],
+    "agents": [
+      {"id":"agent/orbit/standing","name":"orbit/standing","host_id":"host/orbit","seat_kind":"standing","driver":"codex","model":"gpt-6-sol","effort":"medium","state":"running","harness_state":"working"},
+      {"id":"agent/orbit/mission","name":"orbit/mission","host_id":"host/orbit","seat_kind":"mission","driver":"claude","model":"sonnet","effort":"high","state":"running","harness_state":"idle"}
+    ]
+  }
+}

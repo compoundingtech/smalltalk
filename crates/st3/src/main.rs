@@ -27,11 +27,12 @@ use st3::model::{
     MissionRevisionRequest, MissionRunView, MissionState, OperationalRepairApplyRequest,
     OperationalRepairPlan, OperationalRepairResult, PlannerSpec, PlanningApprovalRequest,
     PlanningCandidateSubmitRequest, PlanningProposalRequest, PlanningSessionView,
-    ReplicaRecordView, ReplicationRepairRequest, ReplicationStatus, ReviewRequest,
-    RevisionApprovalRequest, RevisionCancelRequest, RevisionProposalView, RevisionSubmissionView,
-    RunGenerationView, SessionControlResponse, SessionInputMode, SessionInputRequest,
-    SessionScreen, SessionSignalRequest, StatusResponse, StepRunView, SubscriptionRequestDecision,
-    SubscriptionRequestView, WorkRequest, WorkRetryRequest, WorkWakeRequest,
+    ReplicaRecordView, ReplicationPeerStatus, ReplicationRepairRequest, ReplicationStatus,
+    ReviewRequest, RevisionApprovalRequest, RevisionCancelRequest, RevisionProposalView,
+    RevisionSubmissionView, RunGenerationView, SessionControlResponse, SessionInputMode,
+    SessionInputRequest, SessionScreen, SessionSignalRequest, StatusResponse, StepRunView,
+    SubscriptionRequestDecision, SubscriptionRequestView, WorkRequest, WorkRetryRequest,
+    WorkWakeRequest,
 };
 use st3::reconcile::Reconciler;
 use st3::store::Store;
@@ -43,7 +44,8 @@ use st3_client::{
     TargetParameters as ClientTargetParameters, TerminalInputMode as ClientTerminalInputMode,
     TerminalInputParameters as ClientTerminalInputParameters,
     TerminalScreen as ClientTerminalScreen, TimelineBody as ClientTimelineBody,
-    TimelineEntry as ClientTimelineEntry, TimelinePage as ClientTimelinePage,
+    TimelineEntry as ClientTimelineEntry, TimelinePage as ClientTimelinePage, catch_up_estimate,
+    envelope_count,
 };
 use tokio::sync::{Notify, watch};
 
@@ -143,6 +145,8 @@ enum Command {
         #[command(subcommand)]
         command: RepairCommand,
     },
+    /// Remove st3 from this machine: leave its fleet, then its services, state, and settings.
+    Uninstall(UninstallArgs),
     /// Join machines into a fleet: create, invite, join, and inspect members.
     Fleet {
         #[command(subcommand)]
@@ -236,6 +240,14 @@ enum FleetCommand {
     },
     /// Join this machine to a fleet with a code from `st fleet invite`.
     Join(FleetJoinArgs),
+    /// Remove another member, or a config peer, from the fleet.
+    Remove(FleetRemoveArgs),
+    /// Take this machine out of its fleet after everything it wrote has reached a member.
+    Leave(FleetLeaveArgs),
+    /// Move a machine of a config-peer fleet to membership, keeping its history.
+    Migrate(FleetMigrateArgs),
+    /// Switch this member between listening and dial-out.
+    Mode(FleetModeArgs),
     /// Show this node, the fleet's members, and open invites.
     Status,
 }
@@ -643,6 +655,7 @@ async fn run_fleet(endpoint: &Endpoint, command: FleetCommand, json_output: bool
                 via: args.via.clone(),
                 settings: args.member.settings(),
                 legacy_secret_file: None,
+                fabric_protocol: None,
             })
             .await?;
             if let Some(path) = code_path {
@@ -666,6 +679,71 @@ async fn run_fleet(endpoint: &Endpoint, command: FleetCommand, json_output: bool
                 );
             } else if !json_output {
                 println!("Start st3 up and st3 replication-worker to begin syncing.");
+            }
+            Ok(())
+        }
+        FleetCommand::Remove(args) => run_fleet_remove(&client, &config, args).await,
+        FleetCommand::Migrate(args) => run_fleet_migrate(&client, &config, args).await,
+        FleetCommand::Mode(args) => {
+            let mut file = st3::config::FleetFile::load(&config.state_dir)?
+                .context("this machine is not a fleet member")?;
+            file.mode = match args.mode.as_str() {
+                "listening" => st3::config::FleetMode::Listening,
+                "dial-out" => st3::config::FleetMode::DialOut,
+                _ => anyhow::bail!("the mode is listening or dial-out"),
+            };
+            file.port = match file.mode {
+                st3::config::FleetMode::DialOut => None,
+                st3::config::FleetMode::Listening => Some(match args.port.or(file.port) {
+                    Some(port) => port,
+                    None => st3::fleet::join::free_port(st3::fleet::join::DEFAULT_PORT)?,
+                }),
+            };
+            file.save(&config.state_dir)?;
+            println!(
+                "This member is now {}; it announces the change when its replication worker starts.",
+                file.mode.as_str()
+            );
+            if !args.no_service && services_installed() {
+                st3::service::install(Config::load_with_fleet(None)?)?;
+            } else {
+                println!("Restart st3 replication-worker for the change to take effect.");
+            }
+            Ok(())
+        }
+        FleetCommand::Leave(args) => {
+            let person = fleet_person(args.actor.clone(), &config)?;
+            if args.cancel {
+                let _: Value = client
+                    .post("/v1/internal/fleet/leave/cancel", &json!({}))
+                    .await?;
+                println!("leave cancelled");
+                return Ok(());
+            }
+            let use_services = !args.no_service && services_installed();
+            let confirmed = fleet_leave(
+                &client,
+                &config,
+                &person,
+                args.offline,
+                args.force,
+                parse_fleet_duration(&args.wait)?,
+            )
+            .await?;
+            match confirmed {
+                Some(member) => println!("{member} holds everything this machine wrote."),
+                None => println!(
+                    "Left without reaching a member. On another member run: st fleet remove {} --reason \"left offline\"",
+                    config.node
+                ),
+            }
+            if use_services {
+                st3::service::install(Config::load_with_fleet(None)?)?;
+                println!("st3 now runs local-only on this machine.");
+            } else {
+                println!(
+                    "Stop st3 replication-worker; st3 up now runs local-only after a restart."
+                );
             }
             Ok(())
         }
@@ -721,6 +799,570 @@ async fn run_fleet(endpoint: &Endpoint, command: FleetCommand, json_output: bool
             Ok(())
         }
     }
+}
+
+#[derive(Args)]
+struct FleetRemoveArgs {
+    /// The member (or config peer) to remove.
+    name: String,
+    #[arg(long)]
+    reason: String,
+    #[arg(long = "as")]
+    actor: Option<String>,
+}
+
+#[derive(Args)]
+struct FleetLeaveArgs {
+    /// Leave without reaching any member; another member must then remove this one.
+    #[arg(long)]
+    offline: bool,
+    /// Leave even while seats run on this machine.
+    #[arg(long)]
+    force: bool,
+    /// Stop a leave that has not written its leave claim yet.
+    #[arg(long)]
+    cancel: bool,
+    /// Do not stop, reinstall, or start services.
+    #[arg(long)]
+    no_service: bool,
+    /// How long to wait for a member to hold everything this machine wrote.
+    #[arg(long, default_value = "10m")]
+    wait: String,
+    #[arg(long = "as")]
+    actor: Option<String>,
+}
+
+#[derive(Args)]
+struct UninstallArgs {
+    /// List what would be removed, and remove nothing.
+    #[arg(long)]
+    dry_run: bool,
+    /// Remove without asking.
+    #[arg(long)]
+    yes: bool,
+    /// Leave the fleet without reaching any member first.
+    #[arg(long)]
+    offline: bool,
+    /// Keep the installed st3, st, stui, st3-migrate, and pty executables.
+    #[arg(long)]
+    keep_binaries: bool,
+    /// Also required when this machine's graph exists nowhere else.
+    #[arg(long)]
+    erase_local_graph: bool,
+    /// Never touch service managers; the daemon and worker must already be stopped.
+    #[arg(long)]
+    no_service: bool,
+    #[arg(long = "as")]
+    actor: Option<String>,
+}
+
+/// Who confirms that a member holds everything this node wrote: a peer that reports this node's
+/// authority digest holds every envelope this node holds. A member that refuses this node as
+/// left does so only after it admitted this node's leave, which is this node's last write. Once
+/// it has, it stops exchanging with this node, so a matching digest may never come.
+fn leave_confirmation(
+    status: &ReplicationStatus,
+    removed: Option<&st3::config::FleetRemoval>,
+) -> Result<Option<String>> {
+    if let Some(peer) = status
+        .peers
+        .iter()
+        .find(|peer| peer.authority_digest.as_deref() == Some(status.authority_digest.as_str()))
+    {
+        return Ok(Some(peer.peer.clone()));
+    }
+    match removed {
+        Some(removal) if removal.code == "member-left" => Ok(Some(removal.reported_by.clone())),
+        Some(removal) => anyhow::bail!(
+            "{} reports this machine as {}, so what it wrote after that will not replicate; \
+             finish with st fleet leave --offline",
+            removal.reported_by,
+            removal.code
+        ),
+        None => Ok(None),
+    }
+}
+
+/// One line per peer for a leave that timed out.
+fn leave_peer_summary(status: &ReplicationStatus) -> String {
+    if status.peers.is_empty() {
+        return "no peers".into();
+    }
+    status
+        .peers
+        .iter()
+        .map(|peer| {
+            let digest = match &peer.authority_digest {
+                None => "no digest reported",
+                Some(digest) if *digest == status.authority_digest => "same digest",
+                Some(_) => "different digest",
+            };
+            let error = peer
+                .last_error
+                .as_deref()
+                .map(|error| format!(", last error: {error}"))
+                .unwrap_or_default();
+            format!("{} {} ({digest}{error})", peer.peer, peer.status)
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// Wait until a member confirms it holds everything this node wrote (see
+/// `leave_confirmation`). `stage` names the wait in the error.
+async fn wait_for_leave_confirmation(
+    client: &Client,
+    state_dir: &Path,
+    stage: &str,
+    seconds: u64,
+) -> Result<String> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(seconds);
+    loop {
+        let status: ReplicationStatus = client.get("/v1/replication/status").await?;
+        let file = st3::config::FleetFile::load(state_dir)?;
+        let removed = file.as_ref().and_then(|file| file.removed.as_ref());
+        if let Some(member) = leave_confirmation(&status, removed)? {
+            return Ok(member);
+        }
+        anyhow::ensure!(
+            std::time::Instant::now() < deadline,
+            "{stage}, no member reported holding everything this machine wrote within {seconds} \
+             seconds ({}); run st fleet leave again, or st fleet leave --offline and remove this \
+             machine from another member",
+            leave_peer_summary(&status)
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
+fn running_local_runtimes(machines: &Value, node: &str) -> u64 {
+    machines["items"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|machine| machine["host_id"] == format!("host/{node}"))
+        .and_then(|machine| machine["occupancy"]["running_runtimes"].as_u64())
+        .unwrap_or(0)
+}
+
+/// Leave the fleet: stop local writes, drain, write the leave as the last batch, confirm, and
+/// remove this machine's fleet settings. Returns the member that confirmed, if any.
+async fn fleet_leave(
+    client: &Client,
+    config: &Config,
+    person: &str,
+    offline: bool,
+    force: bool,
+    wait_seconds: u64,
+) -> Result<Option<String>> {
+    let file = st3::config::FleetFile::load(&config.state_dir)?
+        .context("this machine is not a fleet member")?;
+    let mut confirmed = None;
+    if !offline {
+        let machines: Value = client.get("/v1/client/machines").await.unwrap_or_default();
+        let running = running_local_runtimes(&machines, &config.node);
+        anyhow::ensure!(
+            force || running == 0,
+            "{running} runtimes still run on this machine; stop its seats first or pass --force"
+        );
+        let _: Value = client
+            .post(
+                "/v1/internal/fleet/leave/begin",
+                &st3::api::FleetPersonRequest {
+                    person: person.into(),
+                },
+            )
+            .await?;
+        wait_for_leave_confirmation(
+            client,
+            &config.state_dir,
+            "before writing the leave",
+            wait_seconds,
+        )
+        .await?;
+        let claim: ClaimRecord = client
+            .post(
+                "/v1/internal/fleet/leave/claim",
+                &st3::api::FleetPersonRequest {
+                    person: person.into(),
+                },
+            )
+            .await?;
+        confirmed = Some(
+            wait_for_leave_confirmation(
+                client,
+                &config.state_dir,
+                "after writing the leave",
+                wait_seconds,
+            )
+            .await?,
+        );
+        println!("left\t{}", claim.id);
+    }
+    if file
+        .transports
+        .iter()
+        .any(|transport| transport == "fabric")
+        && let Some(fabric) = st3::fleet::transport::resolve_tool(file.fabric.as_deref(), "fabric")
+    {
+        let protocol = file
+            .fabric_protocol
+            .clone()
+            .unwrap_or_else(|| st3::fleet::transport::default_fabric_protocol(&file.fleet_id));
+        let _ = std::process::Command::new(fabric)
+            .args(["unexpose", &protocol])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
+    st3::fleet::join::write_private(
+        &config.state_dir.join("left-fleet.json"),
+        serde_json::to_string(&json!({
+            "fleet_id": file.fleet_id,
+            "offline": offline,
+            "confirmed_by": confirmed,
+        }))?
+        .as_bytes(),
+    )?;
+    fs::remove_dir_all(config.state_dir.join("fleet"))?;
+    // Local writes resume; the store stays bound to the fleet ID.
+    let _: Result<Value> = client
+        .post("/v1/internal/fleet/leave/cancel", &json!({}))
+        .await;
+    Ok(confirmed)
+}
+
+async fn run_fleet_remove(client: &Client, config: &Config, args: FleetRemoveArgs) -> Result<()> {
+    let person = fleet_person(args.actor, config)?;
+    let removal: st3::store::FleetRemoval = client
+        .post(
+            "/v1/internal/fleet/remove",
+            &st3::api::FleetRemoveRequest {
+                name: args.name.clone(),
+                reason: args.reason,
+                person,
+            },
+        )
+        .await?;
+    println!(
+        "Removed {} (high water {}). Each member refuses it once this removal reaches it.",
+        removal.name, removal.high_water
+    );
+    for invite in &removal.revoked_invites {
+        println!("revoked\t{invite}");
+    }
+    println!(
+        "Writes {} made after this node's last exchange with it are not accepted. On {}, if it still runs: st uninstall",
+        removal.name, removal.name
+    );
+    if st3::config::FleetFile::load(&config.state_dir)?.is_some_and(|file| file.legacy_peers) {
+        println!(
+            "This member still accepts legacy exchanges from config peers, so a machine that keeps the fleet secret can pose as one of them until st fleet migrate --finish."
+        );
+    }
+    Ok(())
+}
+
+async fn run_uninstall(endpoint: &Endpoint, args: UninstallArgs) -> Result<()> {
+    let config = Config::load_unvalidated(None)?;
+    let client = Client::new(endpoint.clone());
+    let config_dir = Config::default_path()
+        .parent()
+        .map(Path::to_path_buf)
+        .context("the config path has no directory")?;
+    let data_home = std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/share")))
+        .context("HOME is not set")?;
+    let state_home = config
+        .state_dir
+        .parent()
+        .map(Path::to_path_buf)
+        .context("the state directory has no parent")?;
+    let data_dir = data_home.join("st3");
+    let manifest: Option<Value> = fs::read(data_dir.join("install.json"))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok());
+    let binaries = manifest
+        .as_ref()
+        .and_then(|manifest| manifest["files"].as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|path| path.as_str().map(PathBuf::from))
+        .collect::<Vec<_>>();
+    let st2_state = state_home.join("st2");
+    let st2_only_hooks = fs::read_dir(&st2_state)
+        .is_ok_and(|entries| entries.flatten().all(|entry| entry.file_name() == "hooks"));
+    let mut paths = vec![
+        config.state_dir.clone(),
+        config_dir,
+        data_dir,
+        config.socket.clone(),
+        config.client_gateway_socket.clone(),
+    ];
+    if st2_only_hooks {
+        paths.push(st2_state);
+    }
+    if !args.keep_binaries {
+        paths.extend(binaries.iter().cloned());
+    }
+    paths.sort();
+    paths.dedup();
+    if args.dry_run {
+        for path in &paths {
+            println!("remove\t{}", path.display());
+        }
+        println!("remove\tthe st3 user services, if installed");
+        if manifest.is_none() && !args.keep_binaries {
+            println!(
+                "keep\tthe st3 executables: no release install manifest; remove them the way you installed them"
+            );
+        }
+        return Ok(());
+    }
+    anyhow::ensure!(
+        args.yes,
+        "st uninstall erases this machine's st3 state, settings, and services; run it again with --yes, or --dry-run to list them"
+    );
+    let daemon_running = client.get::<Value>("/v1/health").await.is_ok();
+    if let Some(file) = st3::config::FleetFile::load(&config.state_dir)?
+        && file.removed.is_none()
+    {
+        if args.offline {
+            fleet_leave(&client, &config, "person/uninstall", true, true, 0).await?;
+        } else {
+            anyhow::ensure!(
+                daemon_running,
+                "start st3 so this machine can leave its fleet first, or pass --offline"
+            );
+            let person = fleet_person(args.actor.clone(), &config)?;
+            fleet_leave(&client, &config, &person, false, false, 600).await?;
+        }
+    }
+    let local_only = config.fleet_id.is_none()
+        && !config.state_dir.join("left-fleet.json").exists()
+        && !config.state_dir.join("fleet").exists()
+        && config.state_dir.join("claims.sqlite3").exists();
+    anyhow::ensure!(
+        !local_only || args.erase_local_graph,
+        "this machine's graph exists nowhere else; pass --erase-local-graph to erase it"
+    );
+    if !args.no_service && services_installed() {
+        st3::service::stop_owned_runtimes(&config)?;
+        st3::service::uninstall()?;
+    } else if client.get::<Value>("/v1/health").await.is_ok() {
+        anyhow::bail!("stop st3 up and st3 replication-worker, then run st uninstall --yes again");
+    }
+    for path in &paths {
+        let result = if path.is_dir() {
+            fs::remove_dir_all(path)
+        } else {
+            fs::remove_file(path)
+        };
+        if let Err(error) = result
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            eprintln!("could not remove {}: {error}", path.display());
+        }
+    }
+    let remaining = paths
+        .iter()
+        .filter(|path| path.exists())
+        .collect::<Vec<_>>();
+    for path in &remaining {
+        println!("remains\t{}", path.display());
+    }
+    println!(
+        "Nothing else to remove needs this user. If you installed the Claude Code policy, remove it as root: st3 claude-channel uninstall-policy"
+    );
+    anyhow::ensure!(remaining.is_empty(), "some st3 files remain");
+    println!("uninstalled");
+    Ok(())
+}
+
+#[derive(Args)]
+struct FleetModeArgs {
+    /// listening or dial-out.
+    mode: String,
+    /// The replication port when switching to listening.
+    #[arg(long)]
+    port: Option<u16>,
+    #[arg(long)]
+    no_service: bool,
+}
+
+#[derive(Args)]
+struct FleetMigrateArgs {
+    /// A migration code from `st fleet invite NAME --migrate`, or - to read it from standard input.
+    code: Option<String>,
+    #[arg(long)]
+    code_file: Option<PathBuf>,
+    #[arg(long)]
+    fabric_inbox: bool,
+    /// Make this machine the anchor: the first machine of the fleet to migrate.
+    #[arg(long, conflicts_with_all = ["code", "code_file", "fabric_inbox", "finish", "unfinish"])]
+    anchor: bool,
+    /// Stop accepting legacy exchanges once every config peer is a member or removed.
+    #[arg(long, conflicts_with = "unfinish")]
+    finish: bool,
+    /// Accept legacy exchanges again, to roll a machine back to an older build.
+    #[arg(long)]
+    unfinish: bool,
+    /// The Fabric exposure name this machine already uses.
+    #[arg(long)]
+    fabric_protocol: Option<String>,
+    #[arg(long)]
+    no_service: bool,
+    #[command(flatten)]
+    member: FleetMemberArgs,
+}
+
+/// Settings for a migrating node: its existing replication port unless one is given.
+fn migration_settings(args: &FleetMemberArgs, config: &Config) -> st3::fleet::join::MemberSettings {
+    let mut settings = args.settings();
+    if settings.port.is_none() {
+        settings.port = config
+            .peer_listen
+            .as_deref()
+            .and_then(|address| address.parse::<std::net::SocketAddr>().ok())
+            .map(|address| address.port());
+    }
+    settings
+}
+
+async fn run_fleet_migrate(client: &Client, config: &Config, args: FleetMigrateArgs) -> Result<()> {
+    if args.finish || args.unfinish {
+        let mut file = st3::config::FleetFile::load(&config.state_dir)?
+            .context("this machine has not migrated yet")?;
+        if args.finish {
+            let status: st3::api::FleetStatus = client.get("/v1/internal/fleet/status").await?;
+            let waiting = config
+                .peers
+                .iter()
+                .filter(|peer| {
+                    let known = status
+                        .view
+                        .members
+                        .iter()
+                        .any(|member| member.name == peer.name)
+                        || status.view.legacy_removed.contains(&peer.name);
+                    !known
+                })
+                .map(|peer| peer.name.clone())
+                .collect::<Vec<_>>();
+            anyhow::ensure!(
+                waiting.is_empty(),
+                "these config peers are neither members nor removed yet: {}",
+                waiting.join(", ")
+            );
+        }
+        file.legacy_peers = args.unfinish;
+        file.save(&config.state_dir)?;
+        if args.finish {
+            println!(
+                "This machine no longer accepts legacy exchanges. Delete these lines from {}:",
+                Config::default_path().display()
+            );
+            println!("  fleet_id, shared_secret_file, peer_listen, and every [[peers]] entry");
+        } else {
+            println!("This machine accepts legacy exchanges from config peers again.");
+        }
+        if !args.no_service && services_installed() {
+            st3::service::install(Config::load_with_fleet(None)?)?;
+        } else {
+            println!("Restart st3 replication-worker for this to take effect.");
+        }
+        return Ok(());
+    }
+    let fleet_id = config
+        .fleet_id
+        .clone()
+        .context("this machine has no config-peer fleet to migrate; use st fleet join")?;
+    // fleet.toml resolves a relative path under STATE/fleet, and --finish removes the
+    // config.toml override, so record the secret file's absolute path now.
+    let configured_secret = config
+        .shared_secret_file
+        .clone()
+        .context("config.toml names no shared_secret_file")?;
+    let secret_file = fs::canonicalize(&configured_secret).with_context(|| {
+        format!(
+            "the shared secret file {} is not readable from here; name it with an absolute path in config.toml",
+            configured_secret.display()
+        )
+    })?;
+    let use_services = !args.no_service && services_installed();
+    if client.get::<Value>("/v1/health").await.is_ok() {
+        anyhow::ensure!(
+            use_services,
+            "stop the running st3 daemon first: nothing may write while this machine migrates"
+        );
+        st3::service::stop()?;
+    }
+    let settings = migration_settings(&args.member, config);
+    if args.anchor {
+        let founded = st3::fleet::join::migrate_anchor(
+            &config.state_dir,
+            &config.node,
+            &fleet_id,
+            &secret_file,
+            &settings,
+            args.fabric_protocol.clone(),
+        )?;
+        println!(
+            "{} is the anchor of fleet {}. It admits itself and signs its history when st3 starts.",
+            founded.node, founded.fleet_id
+        );
+    } else {
+        let (code, code_path) = if args.fabric_inbox {
+            let path = fabric_inbox_code()?;
+            (fs::read_to_string(&path)?, Some(path))
+        } else if let Some(path) = &args.code_file {
+            (fs::read_to_string(path)?, Some(path.clone()))
+        } else {
+            match args.code.as_deref() {
+                Some("-") => {
+                    let mut text = String::new();
+                    std::io::Read::read_to_string(&mut std::io::stdin(), &mut text)?;
+                    (text, None)
+                }
+                Some(code) => (code.to_owned(), None),
+                None => (read_code_without_echo()?, None),
+            }
+        };
+        let joined = st3::fleet::join::join(&st3::fleet::join::JoinOptions {
+            state_dir: config.state_dir.clone(),
+            configured_node: config.node.clone(),
+            code: code.trim().to_owned(),
+            name: Some(config.node.clone()),
+            via: None,
+            settings,
+            legacy_secret_file: Some(secret_file),
+            fabric_protocol: args.fabric_protocol.clone(),
+        })
+        .await?;
+        anyhow::ensure!(
+            joined.migrate,
+            "that code is a join code; use st fleet join"
+        );
+        if let Some(path) = code_path {
+            let _ = fs::remove_file(path);
+        }
+        println!(
+            "{} migrated to membership in fleet {} through {}.",
+            joined.name, joined.fleet_id, joined.sponsor
+        );
+    }
+    if use_services {
+        st3::service::install(Config::load_with_fleet(None)?)?;
+        println!(
+            "The st3 services now run as a fleet member, with legacy exchanges still accepted."
+        );
+    } else {
+        println!(
+            "Start st3 up and st3 replication-worker; legacy exchanges stay accepted until st fleet migrate --finish."
+        );
+    }
+    Ok(())
 }
 
 fn unix_ms() -> u128 {
@@ -800,6 +1442,8 @@ enum LaunchCommand {
 
 #[derive(Subcommand)]
 enum MissionViewCommand {
+    /// Show active runs, standing queues, unstarted missions, and agents by host.
+    Tree,
     /// List current missions; use --all for historical terminal missions.
     Ls {
         #[arg(long)]
@@ -2141,6 +2785,7 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Repair { command } => run_repair(&client, command, cli.json).await,
         Command::Replication { command } => run_replication(&client, command, cli.json).await,
         Command::Fleet { command } => run_fleet(&endpoint, command, cli.json).await,
+        Command::Uninstall(args) => run_uninstall(&endpoint, args).await,
         Command::Service { command } => run_service(command, cli.json),
         Command::ClaudeChannel { command } => run_claude_channel(command),
         Command::Subject { command } => run_subject(&client, command, cli.json).await,
@@ -2792,6 +3437,15 @@ async fn run_mission_view(
     json_output: bool,
 ) -> Result<()> {
     match command {
+        MissionViewCommand::Tree => {
+            let view: Value = client.get("/v1/client/missions-tree").await?;
+            if json_output {
+                print_value(&view, true)
+            } else {
+                print!("{}", render_missions_tree(&view));
+                Ok(())
+            }
+        }
         MissionViewCommand::Ls { all, cursor, limit } => {
             anyhow::ensure!(
                 limit > 0 && limit <= 200,
@@ -3431,11 +4085,7 @@ async fn run_pty(
                 "terminals stream",
             )?;
             let mut stream = generated_client(endpoint, Some(&person))?
-                .terminal_stream(
-                    &args.subject,
-                    args.incarnation.as_deref(),
-                    &args.capability,
-                )
+                .terminal_stream(&args.subject, args.incarnation.as_deref(), &args.capability)
                 .await?;
             let mut shown = 0_u64;
             while args.count.is_none_or(|count| shown < count) {
@@ -3864,6 +4514,9 @@ fn render_now_page(page: &ClientPage, continuation_command: &str) -> String {
     });
     working.page.next_cursor = None;
     let mut output = String::new();
+    if let Some(sync) = &page.sync {
+        output.push_str(&render_sync_notice(sync, now_ms()));
+    }
     output.push_str(&render_product_page(
         "NEEDS YOU",
         &needs_you,
@@ -4034,11 +4687,40 @@ fn print_product_page(
     if json_output {
         return print_value(response, true);
     }
+    if let Some(sync) = &response.value.sync {
+        print!("{}", render_sync_notice(sync, now_ms()));
+    }
     print!(
         "{}",
         render_product_page(title, &response.value, continuation_command)
     );
     Ok(())
+}
+
+/// A host catching up with a peer shows early history as current, so say so before the items.
+fn render_sync_notice(sync: &st3_client::SyncNotice, now: u128) -> String {
+    use std::fmt::Write as _;
+
+    let mut output = String::new();
+    for peer in &sync.peers {
+        let last_exchange = peer
+            .last_exchange_at
+            .as_deref()
+            .and_then(|at| chrono::DateTime::parse_from_rfc3339(at).ok())
+            .map(|at| {
+                format!(
+                    " · last exchange {}",
+                    relative_time(at.timestamp_millis().max(0) as u128, now)
+                )
+            })
+            .unwrap_or_default();
+        let _ = writeln!(output, "SYNCING  {}{last_exchange}", peer.summary());
+    }
+    let _ = writeln!(
+        output,
+        "  Until then, items below can be out of date. Progress: st3 replication status\n"
+    );
+    output
 }
 
 /// `target mission/fleet/typecase: cancelled 4h ago`
@@ -4891,6 +5573,78 @@ async fn run_repair(client: &Client, command: RepairCommand, json_output: bool) 
     Ok(())
 }
 
+/// Each peer's line, then how far apart the two envelope sets are and how long catching up
+/// should take, in words.
+fn render_replication_peers(peers: &[ReplicationPeerStatus], now: u128) -> String {
+    use std::fmt::Write as _;
+
+    let mut output = String::new();
+    for peer in peers
+        .iter()
+        .filter(|peer| peer.sync.as_ref().is_some_and(|sync| sync.catching_up))
+    {
+        let sync = peer.sync.as_ref().expect("filtered on sync");
+        let _ = writeln!(
+            output,
+            "sync\tcatching up: {} has {} this node lacks, {}",
+            peer.peer,
+            envelope_count(sync.peer_only_envelopes),
+            catch_up_estimate(sync.estimated_catch_up_seconds)
+        );
+    }
+    for peer in peers {
+        let _ = writeln!(
+            output,
+            "peer\t{}\t{}\t{}",
+            peer.peer,
+            peer.status,
+            peer.last_error.as_deref().unwrap_or("")
+        );
+        if let Some(at) = peer.last_success_at_unix_ms {
+            let _ = writeln!(output, "  last exchange {}", relative_time(at, now));
+        } else {
+            let _ = writeln!(output, "  no exchange yet");
+        }
+        let Some(sync) = &peer.sync else {
+            let _ = writeln!(output, "  difference not measured yet");
+            continue;
+        };
+        if sync.peer_only_envelopes == 0 && sync.local_only_envelopes == 0 {
+            let _ = writeln!(
+                output,
+                "  in sync: neither side has an envelope the other lacks (measured {})",
+                relative_time(sync.measured_at_unix_ms, now)
+            );
+            continue;
+        }
+        let _ = writeln!(
+            output,
+            "  {} has {} this node lacks",
+            peer.peer,
+            envelope_count(sync.peer_only_envelopes)
+        );
+        let _ = writeln!(
+            output,
+            "  this node has {} {} lacks",
+            envelope_count(sync.local_only_envelopes),
+            peer.peer
+        );
+        if sync.peer_only_envelopes != 0 {
+            let rate = sync
+                .receive_rate_per_second
+                .map(|rate| format!("receiving {rate:.1} envelopes/s, "))
+                .unwrap_or_default();
+            let _ = writeln!(
+                output,
+                "  {rate}{} (measured {})",
+                catch_up_estimate(sync.estimated_catch_up_seconds),
+                relative_time(sync.measured_at_unix_ms, now)
+            );
+        }
+    }
+    output
+}
+
 async fn run_replication(
     client: &Client,
     command: ReplicationCommand,
@@ -4918,14 +5672,7 @@ async fn run_replication(
                 status.repaired_records
             );
             println!("unhealthy-projections\t{}", status.unhealthy_projections);
-            for peer in status.peers {
-                println!(
-                    "peer\t{}\t{}\t{}",
-                    peer.peer,
-                    peer.status,
-                    peer.last_error.as_deref().unwrap_or("")
-                );
-            }
+            print!("{}", render_replication_peers(&status.peers, now_ms()));
             Ok(())
         }
         ReplicationCommand::Invalid { all } => {
@@ -5812,6 +6559,152 @@ async fn run_agent_queue(
     let queue = client.agent_queue(&agent).await?;
     print!("{}", render_agent_queue(&queue.value));
     Ok(())
+}
+
+fn render_missions_tree(response: &Value) -> String {
+    use std::fmt::Write as _;
+    let value = &response["value"];
+    let mut output = String::from("RUNNING MISSIONS\n");
+    let runs = value["runs"].as_array();
+    if runs.is_none_or(Vec::is_empty) {
+        output.push_str("  none\n");
+    }
+    for run in runs.into_iter().flatten() {
+        let steps = run["steps"].as_array();
+        let done = steps
+            .into_iter()
+            .flatten()
+            .filter(|step| step["state"] == "completed")
+            .count();
+        let active_step = steps
+            .into_iter()
+            .flatten()
+            .find(|step| step["state"] == "claimed")
+            .or_else(|| {
+                steps
+                    .into_iter()
+                    .flatten()
+                    .find(|step| step["state"] == "ready")
+            })
+            .and_then(|step| step["id"].as_str());
+        let active = steps
+            .into_iter()
+            .flatten()
+            .find(|step| step["id"].as_str() == active_step)
+            .and_then(|step| step["name"].as_str())
+            .unwrap_or("waiting");
+        let pending = steps
+            .into_iter()
+            .flatten()
+            .filter(|step| step["state"] != "completed" && step["id"].as_str() != active_step)
+            .filter_map(|step| step["name"].as_str())
+            .collect::<Vec<_>>();
+        let mission = run["mission"].as_str().unwrap_or("unknown");
+        let _ = writeln!(
+            output,
+            "  {mission}: {active} → {}  ({done} done)",
+            if pending.is_empty() {
+                "done".to_owned()
+            } else {
+                pending.join(" → ")
+            }
+        );
+    }
+    output.push_str("STANDING QUEUES\n");
+    let queues = value["standing_queues"].as_array();
+    if queues.is_none_or(Vec::is_empty) {
+        output.push_str("  none\n");
+    }
+    for queue in queues.into_iter().flatten() {
+        let id = queue["agent_id"].as_str().unwrap_or("unknown");
+        let current = queue["current_work_ids"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>();
+        let next = queue["next_work_id"].as_str().unwrap_or("none");
+        let waiting = queue["runs"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|run| run["state"] == "waiting")
+            .filter_map(|run| run["mission_run_id"].as_str())
+            .collect::<Vec<_>>();
+        let _ = writeln!(
+            output,
+            "  {id}: current {} · next {next} · waiting {}",
+            if current.is_empty() {
+                "none".to_owned()
+            } else {
+                current.join(", ")
+            },
+            if waiting.is_empty() {
+                "none".to_owned()
+            } else {
+                waiting.join(", ")
+            }
+        );
+    }
+    output.push_str("UNSTARTED MISSIONS\n");
+    let unstarted = value["unstarted_missions"].as_array();
+    if unstarted.is_none_or(Vec::is_empty) {
+        output.push_str("  none\n");
+    }
+    for mission in unstarted.into_iter().flatten() {
+        let suffix = if mission["state"] == "draft" {
+            " (draft)"
+        } else {
+            ""
+        };
+        let _ = writeln!(
+            output,
+            "  {}{suffix}",
+            mission["title"].as_str().unwrap_or("unknown")
+        );
+    }
+    output.push_str("AGENTS BY HOST\n");
+    let mut grouped = BTreeMap::<String, BTreeMap<String, Vec<&Value>>>::new();
+    for agent in value["agents"].as_array().into_iter().flatten() {
+        let host = agent["host_id"].as_str().unwrap_or("unknown").to_owned();
+        let kind = agent["seat_kind"].as_str().unwrap_or("standing").to_owned();
+        grouped
+            .entry(host)
+            .or_default()
+            .entry(kind)
+            .or_default()
+            .push(agent);
+    }
+    if grouped.is_empty() {
+        output.push_str("  none\n");
+    }
+    for (host, kinds) in grouped {
+        let _ = writeln!(output, "  {host}");
+        for kind in ["standing", "mission"] {
+            let Some(agents) = kinds.get(kind) else {
+                continue;
+            };
+            let _ = writeln!(output, "    {kind}");
+            for agent in agents {
+                let state = if agent["harness_state"] == "working" {
+                    "working"
+                } else if agent["state"] == "running" {
+                    "idle"
+                } else {
+                    "waiting"
+                };
+                let _ = writeln!(
+                    output,
+                    "      {}  {} / {} / {}  {state}",
+                    agent["name"].as_str().unwrap_or("unknown"),
+                    agent["driver"].as_str().unwrap_or("unknown"),
+                    agent["model"].as_str().unwrap_or("default"),
+                    agent["effort"].as_str().unwrap_or("default")
+                );
+            }
+        }
+    }
+    output
 }
 
 fn render_agent_queue(queue: &st3_client::AgentQueue) -> String {
@@ -6935,6 +7828,7 @@ fn current_local_pty_incarnation(actor: &str) -> Result<Option<String>> {
 
 async fn wait_for_agent_incarnation(client: &Client, actor: &str) -> Result<String> {
     let mut deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    let mut outage_logged = false;
     let has_local_pty_registry =
         std::env::var_os("PTY_ROOT").is_some_and(|value| !value.is_empty());
     loop {
@@ -6952,6 +7846,13 @@ async fn wait_for_agent_incarnation(client: &Client, actor: &str) -> Result<Stri
                 Ok(None) => {}
                 // A restarting daemon cannot answer yet; its outage does not use up the wait.
                 Err(error) if st3::client::daemon_unreachable(&error).is_some() => {
+                    if !outage_logged {
+                        let _ = write_driver_log(
+                            actor,
+                            "waiting for the runtime incarnation while the daemon restarts",
+                        );
+                        outage_logged = true;
+                    }
                     deadline = tokio::time::Instant::now() + Duration::from_secs(15);
                 }
                 Err(error) => return Err(error),
@@ -9935,9 +10836,10 @@ fn parse_field(value: &str) -> Result<(String, Value), String> {
 }
 
 fn parse_peer(value: &str) -> Result<PeerConfig, String> {
-    let (name, url) = value
-        .split_once('=')
-        .ok_or_else(|| "a peer must use NAME=http://ADDRESS".to_owned())?;
+    let (name, url) = value.split_once('=').unwrap_or((value, ""));
+    if name.is_empty() {
+        return Err("a peer needs a name".to_owned());
+    }
     Ok(PeerConfig {
         name: name.into(),
         url: url.into(),
@@ -9985,6 +10887,71 @@ fn unique_pairs(values: Vec<(String, String)>, kind: &str) -> Result<BTreeMap<St
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn peer_status(peer: &str, digest: Option<&str>) -> st3::model::ReplicationPeerStatus {
+        st3::model::ReplicationPeerStatus {
+            peer: peer.into(),
+            status: "up".into(),
+            last_success_at_unix_ms: None,
+            last_error: None,
+            schema_digest: None,
+            authority_digest: digest.map(str::to_owned),
+            graph_digest: None,
+            sync: None,
+        }
+    }
+
+    #[test]
+    fn a_leave_is_confirmed_by_a_matching_digest_or_a_refusal_as_left() {
+        let mut status = ReplicationStatus {
+            authority_digest: "mine".into(),
+            peers: vec![peer_status("a", Some("theirs")), peer_status("c", None)],
+            ..Default::default()
+        };
+        assert_eq!(leave_confirmation(&status, None).unwrap(), None);
+        assert!(leave_peer_summary(&status).contains("a up (different digest)"));
+
+        // A member that admitted the leave refuses this node and never reports its digest.
+        let left = st3::config::FleetRemoval {
+            reported_by: "a".into(),
+            code: "member-left".into(),
+        };
+        assert_eq!(
+            leave_confirmation(&status, Some(&left)).unwrap(),
+            Some("a".into())
+        );
+
+        // A removal is no confirmation: writes after it do not replicate.
+        let removed = st3::config::FleetRemoval {
+            reported_by: "c".into(),
+            code: "member-removed".into(),
+        };
+        let error = leave_confirmation(&status, Some(&removed)).unwrap_err();
+        assert!(error.to_string().contains("--offline"), "{error}");
+
+        status.peers[1].authority_digest = Some("mine".into());
+        assert_eq!(leave_confirmation(&status, None).unwrap(), Some("c".into()));
+    }
+
+    #[test]
+    fn missions_tree_fixture_renders_all_sections() {
+        let fixture: Value =
+            serde_json::from_str(include_str!("../tests/fixtures/missions-tree.json"))
+                .expect("valid missions tree fixture");
+        assert_eq!(
+            render_missions_tree(&fixture),
+            include_str!("../tests/fixtures/missions-tree.txt")
+        );
+        let cli = Cli::try_parse_from(["st", "missions", "tree", "--json"])
+            .expect("missions tree --json parses");
+        assert!(cli.json);
+        assert!(matches!(
+            cli.command,
+            Command::Missions {
+                command: MissionViewCommand::Tree
+            }
+        ));
+    }
 
     #[test]
     fn usage_report_ranks_each_fleet_group_by_spend() {
@@ -10749,7 +11716,106 @@ mod tests {
                 next_cursor: has_more.then(|| "cursor/next".into()),
                 cursor_expires_at: None,
             },
+            sync: None,
         }
+    }
+
+    #[test]
+    fn replication_status_says_which_side_holds_what_and_how_long_catching_up_takes() {
+        let now = 1_000_000;
+        let peer =
+            |name: &str, sync: Option<st3::model::ReplicationPeerSync>| ReplicationPeerStatus {
+                peer: name.into(),
+                status: "up".into(),
+                last_success_at_unix_ms: Some(now - 2_000),
+                last_error: None,
+                schema_digest: None,
+                authority_digest: None,
+                graph_digest: None,
+                sync,
+            };
+        let output = render_replication_peers(
+            &[
+                peer(
+                    "Silber",
+                    Some(st3::model::ReplicationPeerSync {
+                        peer_only_envelopes: 124_384,
+                        local_only_envelopes: 3,
+                        measured_at_unix_ms: now - 2_000,
+                        receive_rate_per_second: Some(142.5),
+                        catch_up_rate_per_second: Some(140.0),
+                        estimated_catch_up_seconds: Some(889),
+                        catching_up: true,
+                    }),
+                ),
+                peer(
+                    "Quiet",
+                    Some(st3::model::ReplicationPeerSync {
+                        measured_at_unix_ms: now,
+                        ..Default::default()
+                    }),
+                ),
+                peer("Fresh", None),
+            ],
+            now,
+        );
+        assert_eq!(
+            output,
+            "sync\tcatching up: Silber has 124,384 envelopes this node lacks, \
+             caught up in about 15m\n\
+             peer\tSilber\tup\t\n\
+             \x20 last exchange 2s ago\n\
+             \x20 Silber has 124,384 envelopes this node lacks\n\
+             \x20 this node has 3 envelopes Silber lacks\n\
+             \x20 receiving 142.5 envelopes/s, caught up in about 15m (measured 2s ago)\n\
+             peer\tQuiet\tup\t\n\
+             \x20 last exchange 2s ago\n\
+             \x20 in sync: neither side has an envelope the other lacks (measured now)\n\
+             peer\tFresh\tup\t\n\
+             \x20 last exchange 2s ago\n\
+             \x20 difference not measured yet\n"
+        );
+    }
+
+    #[test]
+    fn a_catching_up_page_leads_with_how_far_behind_this_host_is() {
+        let mut page = fixture_product_page(&["attention"], false);
+        page.sync = Some(st3_client::SyncNotice {
+            state: "catching-up".into(),
+            peers: vec![st3_client::SyncPeer {
+                host_id: "host/Silber".into(),
+                peer_only_envelopes: 1,
+                local_only_envelopes: 0,
+                last_exchange_at: Some("1970-01-01T00:16:38Z".into()),
+                estimated_catch_up_seconds: None,
+            }],
+        });
+        let output = render_now_page(&page, "st3 now --as person/nathan");
+        assert!(
+            output.starts_with(
+                "SYNCING  Silber has 1 envelope this host lacks · estimating time to catch up · \
+                 last exchange "
+            ),
+            "{output}"
+        );
+        assert!(
+            output.contains("items below can be out of date"),
+            "{output}"
+        );
+        assert_eq!(
+            render_sync_notice(page.sync.as_ref().unwrap(), 1_000_000),
+            "SYNCING  Silber has 1 envelope this host lacks · estimating time to catch up · \
+             last exchange 2s ago\n  Until then, items below can be out of date. \
+             Progress: st3 replication status\n\n"
+        );
+        assert_eq!(catch_up_estimate(Some(0)), "caught up");
+        assert_eq!(catch_up_estimate(Some(59)), "caught up in under a minute");
+        assert_eq!(catch_up_estimate(Some(3_601)), "caught up in about 1h 1m");
+        assert_eq!(catch_up_estimate(Some(90_000)), "caught up in about 1d 1h");
+        assert_eq!(envelope_count(1_234_567), "1,234,567 envelopes");
+
+        page.sync = None;
+        assert!(!render_now_page(&page, "st3 now").contains("SYNCING"));
     }
 
     #[test]

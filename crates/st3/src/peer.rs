@@ -292,6 +292,11 @@ impl FleetAuth {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "operation", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum ClientReadOperation {
+    ConversationChanges {
+        session_id: String,
+        after: Option<String>,
+        wait_ms: u64,
+    },
     Timeline {
         session_id: String,
         limit: usize,
@@ -391,6 +396,10 @@ impl ClientRelay {
             .iter()
             .find(|peer| peer.name == name)
             .with_context(|| format!("owner `{host_id}` is not a configured peer"))?;
+        anyhow::ensure!(
+            !peer.url.is_empty(),
+            "owner `{host_id}` has no configured dial URL"
+        );
         let body = serde_json::to_vec(request)?;
         anyhow::ensure!(
             body.len() <= 16_384,
@@ -752,8 +761,10 @@ impl PeerBackend {
             }
             #[cfg(test)]
             Self::Local(store) => {
-                store.record_peer_failure(peer, status, error)?;
-                store.record_transport_observation(peer, status, Some(error), None)
+                if store.record_peer_failure(peer, status, error)? {
+                    store.record_transport_observation(peer, status, Some(error), None)?;
+                }
+                Ok(())
             }
         }
     }
@@ -858,6 +869,18 @@ pub async fn run_worker(config: Config) -> Result<()> {
     };
     let fleet_transports = fleet.transports.clone();
     let notify_for_transports = notify.clone();
+    for peer in config.peers.iter().filter(|peer| peer.url.is_empty()) {
+        let backend = backend.clone();
+        let name = peer.name.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(worker_interval(Duration::from_secs(60))).await;
+                let _ = backend
+                    .record_failure(&name, "down", "no recent inbound exchange")
+                    .await;
+            }
+        });
+    }
     start_outbound(
         backend.clone(),
         config.node.clone(),
@@ -1096,7 +1119,7 @@ fn dial_targets(
         }
         let mut routes = config_peers
             .iter()
-            .filter(|peer| peer.name == member.name)
+            .filter(|peer| peer.name == member.name && !peer.url.is_empty())
             .map(|peer| Route::Http(peer.url.clone()))
             .collect::<Vec<_>>();
         routes.extend(routes_from_endpoints(&member.endpoints, local));
@@ -1107,7 +1130,7 @@ fn dial_targets(
     for peer in config_peers {
         let known = view.members.iter().any(|member| member.name == peer.name)
             || view.legacy_removed.contains(&peer.name);
-        if !known && peer.name != own {
+        if !known && peer.name != own && !peer.url.is_empty() {
             targets.insert(peer.name.clone(), vec![Route::Http(peer.url.clone())]);
         }
     }
@@ -1175,6 +1198,22 @@ async fn receive_client_read(
         );
         let client = st3_client::Client::unix_as(&state.main_socket, &request.authority_actor);
         match request.request {
+            ClientReadOperation::ConversationChanges {
+                session_id,
+                after,
+                wait_ms,
+            } => {
+                anyhow::ensure!(
+                    wait_ms <= CLIENT_READ_MAX_WAIT_MS,
+                    "the conversation wait exceeds its bound"
+                );
+                Ok(serde_json::to_value(
+                    client
+                        .conversation_changes(&session_id, after.as_deref(), wait_ms)
+                        .await?
+                        .value,
+                )?)
+            }
             ClientReadOperation::Timeline {
                 session_id,
                 limit,
@@ -2157,6 +2196,213 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_gateway_receives_remote_conversation_changes_without_idle_data() {
+        let owner_root = tempfile::tempdir().unwrap();
+        let gateway_root = tempfile::tempdir().unwrap();
+        let make_state = |root: &Path, node: &str| crate::api::AppState {
+            store: Arc::new(Store::open(&root.join("graph.db"), node).unwrap()),
+            notify: Arc::new(tokio::sync::Notify::new()),
+            event_notify: watch::channel(0_u64).0,
+            node: node.into(),
+            state_dir: root.to_path_buf(),
+            pty_root: root.join("pty"),
+            pty_binary: root.join("unused-pty"),
+            fleet_id: None,
+            configured_peers: Vec::new(),
+            client_relay: None,
+            native_session_home: None,
+            planner_default: crate::model::PlannerSpec::default(),
+        };
+        let owner = make_state(owner_root.path(), "conversation-owner");
+        let mut gateway = make_state(gateway_root.path(), "conversation-gateway");
+        let agent = "agent/conversation-peer";
+        let incarnation = "conversation-runtime:i1";
+        owner
+            .store
+            .append_claim(&ClaimInput {
+                subject: agent.into(),
+                kind: "runtime.observed".into(),
+                actor: Some(agent.into()),
+                fields: BTreeMap::from([
+                    (
+                        "runtime_id".into(),
+                        serde_json::json!("conversation-runtime"),
+                    ),
+                    ("incarnation_id".into(), serde_json::json!(incarnation)),
+                    ("status".into(), serde_json::json!("running")),
+                    ("terminal".into(), serde_json::json!(false)),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some("conversation-peer-runtime".into()),
+            })
+            .unwrap();
+        gateway
+            .store
+            .import_replication(
+                "conversation-owner",
+                &owner.store.export_replication(0).unwrap(),
+            )
+            .unwrap();
+        let session_id = format!(
+            "session/{}",
+            &hex::encode(sha2::Sha256::digest(
+                format!("{agent}:{incarnation}").as_bytes()
+            ))[..24]
+        );
+        let owner_socket = owner_root.path().join("st3.sock");
+        let served_owner = owner_socket.clone();
+        let owner_app = crate::api::router(owner.clone());
+        tokio::spawn(async move { crate::api::serve_unix(&served_owner, owner_app).await });
+        let peer = PeerState {
+            backend: PeerBackend::Main(Client::unix(&owner_socket)),
+            node: "conversation-owner".into(),
+            auth: FleetAuth::test("fleet-test", &[7; 32]),
+            fleet: FleetContext::legacy(BTreeSet::from(["conversation-gateway".into()])),
+            main_socket: owner_socket.clone(),
+            outbound_notify: watch::channel(0_u64).0,
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, peer_router(peer)).await });
+        let secret = gateway_root.path().join("fleet-secret");
+        fs::write(&secret, [7_u8; 32]).unwrap();
+        fs::set_permissions(&secret, fs::Permissions::from_mode(0o600)).unwrap();
+        gateway.client_relay = ClientRelay::from_config(&Config {
+            node: "conversation-gateway".into(),
+            fleet_id: Some("fleet-test".into()),
+            shared_secret_file: Some(secret),
+            peers: vec![PeerConfig {
+                name: "conversation-owner".into(),
+                url: format!("http://{address}"),
+            }],
+            ..Default::default()
+        })
+        .unwrap();
+        let gateway_socket = gateway_root.path().join("st3.sock");
+        let served_gateway = gateway_socket.clone();
+        tokio::spawn(async move {
+            crate::api::serve_unix(&served_gateway, crate::api::router(gateway)).await
+        });
+        for socket in [&owner_socket, &gateway_socket] {
+            for _ in 0..200 {
+                if tokio::net::UnixStream::connect(socket).await.is_ok() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+        let client = st3_client::Client::unix_as(&gateway_socket, "person/example");
+        let baseline = client
+            .conversation_changes(&session_id, None, 0)
+            .await
+            .unwrap()
+            .value;
+        assert!(baseline.items.is_empty());
+        let cursor = baseline.next_cursor;
+        let mut stream = client.conversation_stream(&session_id, None).await.unwrap();
+        let opened = stream.next().await.unwrap().unwrap();
+        assert!(opened.value.items.is_empty());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), stream.next())
+                .await
+                .is_err()
+        );
+        let idle = client
+            .conversation_changes(&session_id, Some(&cursor), 100)
+            .await
+            .unwrap()
+            .value;
+        assert!(idle.items.is_empty());
+        let waiting_client = client.clone();
+        let waiting_id = session_id.clone();
+        let waiting_cursor = cursor.clone();
+        let waiting = tokio::spawn(async move {
+            waiting_client
+                .conversation_changes(&waiting_id, Some(&waiting_cursor), 1000)
+                .await
+                .unwrap()
+                .value
+        });
+        tokio::task::yield_now().await;
+        owner
+            .store
+            .append_claim(&ClaimInput {
+                subject: "message/conversation-peer-first".into(),
+                kind: "message.sent".into(),
+                actor: Some("person/example".into()),
+                fields: BTreeMap::from([
+                    ("from".into(), serde_json::json!("person/example")),
+                    ("to".into(), serde_json::json!(agent)),
+                    ("session_id".into(), serde_json::json!(session_id)),
+                    ("content".into(), serde_json::json!("hello")),
+                    ("status".into(), serde_json::json!("sent")),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some("conversation-peer-message".into()),
+            })
+            .unwrap();
+        owner.event_notify.send_modify(|value| *value += 1);
+        let first = tokio::time::timeout(Duration::from_millis(900), waiting)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.items.len(), 2);
+        let resume = first.next_cursor;
+        let streamed = tokio::time::timeout(Duration::from_millis(900), stream.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(streamed.value.items.len(), 2);
+        let stream_cursor = streamed.value.next_cursor;
+        stream.close().await;
+        owner
+            .store
+            .append_claim(&ClaimInput {
+                subject: agent.into(),
+                kind: "harness.timeline".into(),
+                actor: Some(agent.into()),
+                fields: BTreeMap::from([
+                    ("operation".into(), serde_json::json!("append")),
+                    (
+                        "entry_id".into(),
+                        serde_json::json!("timeline-entry/conversation-peer-reply"),
+                    ),
+                    ("revision".into(), serde_json::json!(1)),
+                    ("role".into(), serde_json::json!("assistant")),
+                    ("entry_type".into(), serde_json::json!("content")),
+                    ("final".into(), serde_json::json!(true)),
+                    (
+                        "body".into(),
+                        serde_json::json!({"media_type":"text/plain","text":"reply"}),
+                    ),
+                    ("driver".into(), serde_json::json!("codex")),
+                    ("incarnation_id".into(), serde_json::json!(incarnation)),
+                    ("sequence".into(), serde_json::json!(1)),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some("conversation-peer-reply".into()),
+            })
+            .unwrap();
+        let replay = client
+            .conversation_changes(&session_id, Some(&resume), 0)
+            .await
+            .unwrap()
+            .value;
+        assert_eq!(replay.items.len(), 1);
+        let mut reconnected = client
+            .conversation_stream(&session_id, Some(&stream_cursor))
+            .await
+            .unwrap();
+        let resumed = reconnected.next().await.unwrap().unwrap();
+        assert_eq!(resumed.value.items.len(), 1);
+        reconnected.close().await;
+    }
+
+    #[tokio::test]
     async fn signed_client_read_returns_an_owner_local_native_timeline() {
         let root = tempfile::tempdir().unwrap();
         let home = root.path().join("native-home");
@@ -2632,11 +2878,34 @@ mod tests {
             .record_failure("source", "down", "test outage")
             .await
             .unwrap();
+        let still_up = store
+            .latest_claim("host/source", Some("transport.observed"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(still_up.body["fields"]["status"], "up");
+        store.age_replication_peer_for_test("source");
+        let before = store
+            .claims_for("host/source", Some("transport.observed"))
+            .unwrap()
+            .len();
+        for _ in 0..1_440 {
+            backend
+                .record_failure("source", "down", "test outage")
+                .await
+                .unwrap();
+        }
         let down = store
             .latest_claim("host/source", Some("transport.observed"))
             .unwrap()
             .unwrap();
         assert_eq!(down.body["fields"]["status"], "down");
+        assert_eq!(
+            store
+                .claims_for("host/source", Some("transport.observed"))
+                .unwrap()
+                .len(),
+            before + 1
+        );
         backend.receive("source", fleet, &exchange).await.unwrap();
         let recovered = store
             .latest_claim("host/source", Some("transport.observed"))
@@ -2644,6 +2913,139 @@ mod tests {
             .unwrap();
         assert_eq!(recovered.body["fields"]["status"], "up");
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn inbound_only_peer_syncs_both_ways_between_isolated_daemons() {
+        let fleet = "1f91ca65-7793-48cc-866e-ac15690130e1";
+        let auth = FleetAuth::test(fleet, &[8; 32]);
+        let source_dir = tempfile::tempdir().unwrap();
+        let target_dir = tempfile::tempdir().unwrap();
+        let mut servers = Vec::new();
+        let mut stores = Vec::new();
+        let mut sockets = Vec::new();
+        for (name, root) in [("source", source_dir.path()), ("target", target_dir.path())] {
+            let store = Arc::new(Store::open(&root.join("graph.db"), name).unwrap());
+            store.bind_fleet(fleet).unwrap();
+            let socket = root.join("main.sock");
+            let app = crate::api::router(crate::api::AppState {
+                store: store.clone(),
+                notify: Arc::new(tokio::sync::Notify::new()),
+                event_notify: watch::channel(0_u64).0,
+                node: name.into(),
+                state_dir: root.into(),
+                pty_root: root.join("pty"),
+                pty_binary: PathBuf::from("pty"),
+                fleet_id: Some(fleet.into()),
+                configured_peers: vec![if name == "source" { "target" } else { "source" }.into()],
+                client_relay: None,
+                native_session_home: None,
+                planner_default: crate::model::PlannerSpec::default(),
+            });
+            let served = socket.clone();
+            servers.push(tokio::spawn(async move {
+                crate::api::serve_unix(&served, app).await
+            }));
+            stores.push(store);
+            sockets.push(socket);
+        }
+        for socket in &sockets {
+            for _ in 0..100 {
+                if socket.exists() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            assert!(socket.exists());
+        }
+        let source = &stores[0];
+        let target = &stores[1];
+        source
+            .record_transport_observation("target", "up", None, None)
+            .unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let inbound = PeerConfig {
+            name: "source".into(),
+            url: String::new(),
+        };
+        assert!(
+            dial_targets(
+                &FleetView::default(),
+                "target",
+                &[inbound],
+                LocalTransports::default()
+            )
+            .is_empty()
+        );
+        let state = PeerState {
+            backend: PeerBackend::Main(Client::unix(&sockets[1])),
+            node: "target".into(),
+            auth: auth.clone(),
+            fleet: FleetContext::legacy(BTreeSet::from(["source".into()])),
+            main_socket: sockets[1].clone(),
+            outbound_notify: watch::channel(0_u64).0,
+        };
+        let peer_server =
+            tokio::spawn(async move { axum::serve(listener, peer_router(state)).await });
+        let peer = PeerConfig {
+            name: "target".into(),
+            url: format!("http://{address}"),
+        };
+        let backend = PeerBackend::Main(Client::unix(&sockets[0]));
+        let context = FleetContext::legacy(BTreeSet::from(["target".into()]));
+        let http = replication_http_client();
+        exchange(
+            &http,
+            &backend,
+            "source",
+            &peer,
+            &auth,
+            &context,
+            &sockets[0],
+        )
+        .await
+        .unwrap();
+        assert!(
+            target
+                .latest_claim("host/target", Some("transport.observed"))
+                .unwrap()
+                .is_some()
+        );
+        target
+            .record_transport_observation("source", "up", None, None)
+            .unwrap();
+        exchange(
+            &http,
+            &backend,
+            "source",
+            &peer,
+            &auth,
+            &context,
+            &sockets[0],
+        )
+        .await
+        .unwrap();
+        assert!(
+            source
+                .latest_claim("host/source", Some("transport.observed"))
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            source
+                .replication_status(true, Some(fleet), &[])
+                .unwrap()
+                .authority_digest,
+            target
+                .replication_status(true, Some(fleet), &[])
+                .unwrap()
+                .authority_digest
+        );
+        peer_server.abort();
+        for server in servers {
+            server.abort();
+        }
     }
 
     #[tokio::test]
@@ -2744,6 +3146,10 @@ mod tests {
                 config("gone", 9004),
                 config("old", 9005),
                 config("legacy", 9006),
+                PeerConfig {
+                    name: "inbound".into(),
+                    url: String::new(),
+                },
             ],
             LocalTransports::default(),
         );
