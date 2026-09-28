@@ -1620,7 +1620,7 @@ pub(super) fn timeline_value(
     let mut claims = timeline_claims;
     claims.extend(owner_claims);
     claims.extend(message_claims);
-    claims.sort_by_key(|claim| claim.store_index);
+    claims.sort_by_key(crate::store::claim_log_order);
     claims.dedup_by_key(|claim| claim.id.clone());
     let session_leaf = session_id.trim_start_matches("session/");
     let mut items = Vec::<Value>::new();
@@ -1888,8 +1888,13 @@ pub(super) struct EventsQuery {
     wait_ms: Option<u64>,
 }
 
-fn decode_event_cursor(node: &str, cursor: Option<&str>) -> Result<u64, ApiError> {
-    let Some(cursor) = cursor else { return Ok(0) };
+fn decode_event_cursor(node: &str, cursor: Option<&str>) -> Result<EventCursor, ApiError> {
+    let Some(cursor) = cursor else {
+        return Ok(EventCursor {
+            claim: 0,
+            local: None,
+        });
+    };
     let mut parts = cursor.split('/');
     if parts.next() != Some("event-cursor") || parts.next() != Some(node) {
         return Err(ApiError {
@@ -1904,7 +1909,16 @@ fn decode_event_cursor(node: &str, cursor: Option<&str>) -> Result<u64, ApiError
     }
     parts
         .next()
-        .and_then(|value| value.parse().ok())
+        .and_then(|value| match value.split_once('.') {
+            Some((claim, local)) => Some(EventCursor {
+                claim: claim.parse().ok()?,
+                local: Some(local.parse().ok()?),
+            }),
+            None => Some(EventCursor {
+                claim: value.parse().ok()?,
+                local: None,
+            }),
+        })
         .filter(|_| parts.next().is_none())
         .ok_or_else(|| validation("the event cursor is malformed"))
 }
@@ -2044,7 +2058,13 @@ pub(super) async fn events(
     let limit = query.limit.unwrap_or(100).clamp(1, 500);
     let (oldest, newest) = state.store.event_bounds().map_err(ApiError::internal)?;
     let after = decode_event_cursor(&state.node, query.after.as_deref())?;
-    validate_event_cursor(&state.node, query.after.is_some(), after, oldest, newest)?;
+    validate_event_cursor(
+        &state.node,
+        query.after.is_some(),
+        after.claim,
+        oldest,
+        newest,
+    )?;
     let deadline =
         tokio::time::Instant::now() + Duration::from_millis(query.wait_ms.unwrap_or(0).min(30_000));
     // Subscribe before the first store read. An event between reading an empty
@@ -2052,11 +2072,9 @@ pub(super) async fn events(
     let mut changed = state.event_notify.subscribe();
     let records = loop {
         let records = if query.after.is_some() {
-            state
-                .store
-                .events_after_bounded(after, limit.saturating_add(1))
+            feed_events_after(&state.store, after, limit.saturating_add(1))
         } else {
-            state.store.events_tail_bounded(limit)
+            feed_events_tail(&state.store, limit)
         }
         .map_err(ApiError::internal)?;
         if !records.is_empty() || tokio::time::Instant::now() >= deadline {
@@ -2074,25 +2092,36 @@ pub(super) async fn events(
     let records = records.into_iter().take(limit).collect::<Vec<_>>();
     let resume = records
         .last()
-        .map(|record| record.store_index)
+        .map(|(record, local)| EventCursor {
+            claim: record.store_index,
+            local: *local,
+        })
         .unwrap_or(after);
     let items = records
         .into_iter()
-        .map(|record| {
-            let previous = format!(
-                "event-cursor/{}/{}",
-                state.node,
-                record.store_index.saturating_sub(1)
-            );
-            let next = format!("event-cursor/{}/{}", state.node, record.store_index);
+        .map(|(record, local)| {
+            let position = EventCursor {
+                claim: record.store_index,
+                local,
+            };
+            let previous = match local {
+                Some(local) => EventCursor {
+                    claim: record.store_index,
+                    local: Some(local.saturating_sub(1)),
+                },
+                None => EventCursor {
+                    claim: record.store_index.saturating_sub(1),
+                    local: None,
+                },
+            };
             let event_snapshot = client_snapshot_at(&state, record.store_index);
             let (event_type, resource_ids, body) = safe_event_projection(&state, &record);
             json!({
-                "id": format!("projection-event/{}/{}", state.node, record.store_index),
+                "id": format!("projection-event/{}/{}", state.node, position.label()),
                 "epoch": state.node,
                 "sequence": record.store_index,
-                "previous_cursor": previous,
-                "next_cursor": next,
+                "previous_cursor": previous.encode(&state.node),
+                "next_cursor": position.encode(&state.node),
                 "timestamp": event_snapshot.created_at,
                 "type": event_type,
                 "resource_ids": resource_ids,
@@ -2104,10 +2133,96 @@ pub(super) async fn events(
     Ok(Json(json!({
         "kind": "event-page",
         "oldest_cursor": format!("event-cursor/{}/{}", state.node, event_resume_floor(oldest)),
-        "resume_cursor": format!("event-cursor/{}/{resume}", state.node),
+        "resume_cursor": resume.encode(&state.node),
         "items": items,
         "has_more": has_more
     })))
+}
+
+/// A position in this node's event feed. Claim events come in store order. A local
+/// observation event follows the claim it was written after, so `local` names the last
+/// local observation delivered after `claim`; `None` means none of them yet.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct EventCursor {
+    claim: u64,
+    local: Option<u64>,
+}
+
+impl EventCursor {
+    fn label(&self) -> String {
+        match self.local {
+            Some(local) => format!("{}.{local}", self.claim),
+            None => self.claim.to_string(),
+        }
+    }
+
+    fn encode(&self, node: &str) -> String {
+        format!("event-cursor/{node}/{}", self.label())
+    }
+}
+
+type FeedEvent = (EventRecord, Option<u64>);
+
+fn local_feed_event(record: ClaimRecord) -> FeedEvent {
+    let local = crate::store::local_observation_position(&record);
+    (
+        EventRecord {
+            store_index: record.store_index,
+            kind: record.kind,
+            subject: record.subject,
+            body: record.body,
+        },
+        local,
+    )
+}
+
+fn feed_order(event: &FeedEvent) -> (u64, u64) {
+    (event.0.store_index, event.1.unwrap_or(0))
+}
+
+/// Claim events and local observation events after `after`, oldest first.
+fn feed_events_after(
+    store: &Store,
+    after: EventCursor,
+    limit: usize,
+) -> anyhow::Result<Vec<FeedEvent>> {
+    let local_after = match after.local {
+        Some(local) => local,
+        None => store.local_observation_floor_after_claim(after.claim)?,
+    };
+    let mut events = store
+        .events_after_bounded(after.claim, limit)?
+        .into_iter()
+        .map(|record| (record, None))
+        .collect::<Vec<_>>();
+    events.extend(
+        store
+            .local_observations_after(local_after, limit)?
+            .into_iter()
+            .map(local_feed_event),
+    );
+    events.sort_by_key(feed_order);
+    events.truncate(limit);
+    Ok(events)
+}
+
+/// The newest `limit` claim and local observation events, oldest first.
+fn feed_events_tail(store: &Store, limit: usize) -> anyhow::Result<Vec<FeedEvent>> {
+    let mut events = store
+        .events_tail_bounded(limit)?
+        .into_iter()
+        .map(|record| (record, None))
+        .collect::<Vec<_>>();
+    events.extend(
+        store
+            .local_observations_tail(limit)?
+            .into_iter()
+            .map(local_feed_event),
+    );
+    events.sort_by_key(feed_order);
+    let excess = events.len().saturating_sub(limit);
+    events.drain(..excess);
+    Ok(events)
 }
 
 #[derive(Deserialize)]
@@ -5098,6 +5213,170 @@ mission "example/zero-run" state="ready" {
     }
 
     #[tokio::test]
+    async fn the_event_feed_carries_local_observations_after_the_claim_they_follow() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state_named(root.path(), "feed-node");
+        let owner = "agent/feed-worker";
+        let message = |id: &str| {
+            state
+                .store
+                .append_claim(&ClaimInput {
+                    subject: format!("message/{id}"),
+                    kind: "message.sent".into(),
+                    actor: Some("person/nathan".into()),
+                    fields: BTreeMap::from([
+                        ("from".into(), Value::String("person/nathan".into())),
+                        ("to".into(), Value::String(owner.into())),
+                        ("content".into(), Value::String(id.into())),
+                        ("status".into(), Value::String("sent".into())),
+                    ]),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: Some(format!("feed-{id}")),
+                })
+                .unwrap()
+        };
+        let timeline = |entry: &str| {
+            let record = state
+                .store
+                .append_claim(&ClaimInput {
+                    subject: owner.into(),
+                    kind: "harness.timeline".into(),
+                    actor: Some(owner.into()),
+                    fields: BTreeMap::from([
+                        ("operation".into(), Value::String("append".into())),
+                        ("entry_id".into(), Value::String(entry.into())),
+                        ("revision".into(), Value::from(1)),
+                        ("role".into(), Value::String("assistant".into())),
+                        ("entry_type".into(), Value::String("content".into())),
+                        ("final".into(), Value::Bool(true)),
+                        (
+                            "body".into(),
+                            json!({"media_type":"text/plain", "text": entry}),
+                        ),
+                        ("driver".into(), Value::String("codex".into())),
+                        ("incarnation_id".into(), Value::String("feed-inc".into())),
+                        (
+                            "sequence".into(),
+                            Value::from(entry[1..].parse::<u64>().unwrap()),
+                        ),
+                    ]),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: Some(format!("feed-timeline-{entry}")),
+                })
+                .unwrap();
+            crate::store::local_observation_position(&record).unwrap()
+        };
+        let first = message("first");
+        let t1 = timeline("t1");
+        let t2 = timeline("t2");
+        let second = message("second");
+        let t3 = timeline("t3");
+        let (s1, s2) = (first.store_index, second.store_index);
+        let page = |after: Option<String>, limit: usize| {
+            let state = state.clone();
+            async move {
+                events(
+                    State(state),
+                    Extension(ClientSession::local(None).unwrap()),
+                    Query(EventsQuery {
+                        after,
+                        limit: Some(limit),
+                        wait_ms: None,
+                    }),
+                )
+                .await
+                .map(|page| page.0)
+            }
+        };
+        let cursors = |page: &Value| {
+            page["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|item| item["next_cursor"].as_str().unwrap().to_owned())
+                .collect::<Vec<_>>()
+        };
+        let cursor = |label: String| format!("event-cursor/feed-node/{label}");
+
+        let all = page(Some(cursor("0".into())), 10).await.unwrap();
+        assert_eq!(
+            cursors(&all),
+            [
+                cursor(s1.to_string()),
+                cursor(format!("{s1}.{t1}")),
+                cursor(format!("{s1}.{t2}")),
+                cursor(s2.to_string()),
+                cursor(format!("{s2}.{t3}")),
+            ]
+        );
+        let local = &all["items"][1];
+        assert_eq!(local["type"], "upsert");
+        assert_eq!(local["body"]["reason"], "session-timeline-invalidated");
+        assert_eq!(
+            local["resource_ids"],
+            json!([client_session_id(owner, "feed-inc")])
+        );
+        assert_eq!(local["sequence"], s1);
+        assert_eq!(local["previous_cursor"], cursor(format!("{s1}.{}", t1 - 1)));
+        assert_eq!(local["id"], format!("projection-event/feed-node/{s1}.{t1}"));
+
+        let mut after = Some(cursor("0".into()));
+        let mut paged = Vec::new();
+        loop {
+            let current = page(after.clone(), 2).await.unwrap();
+            paged.extend(cursors(&current));
+            if current["has_more"] != true {
+                break;
+            }
+            after = current["resume_cursor"].as_str().map(str::to_owned);
+        }
+        assert_eq!(paged, cursors(&all), "pages of two see every event once");
+
+        let from_claim = page(Some(cursor(s1.to_string())), 10).await.unwrap();
+        assert_eq!(
+            cursors(&from_claim),
+            cursors(&all)[1..],
+            "a cursor that names only a claim resumes with the local observations after it"
+        );
+        let replay = page(local["previous_cursor"].as_str().map(str::to_owned), 10)
+            .await
+            .unwrap();
+        assert_eq!(cursors(&replay), cursors(&all)[1..]);
+        let tail = page(None, 2).await.unwrap();
+        assert_eq!(cursors(&tail), cursors(&all)[3..]);
+        assert_eq!(tail["resume_cursor"], cursor(format!("{s2}.{t3}")));
+        let malformed = page(Some(cursor(format!("{s1}.x"))), 10).await.unwrap_err();
+        assert_eq!(malformed.code, "validation-failed");
+
+        let waiter_state = state.clone();
+        let resume = tail["resume_cursor"].as_str().unwrap().to_owned();
+        let waiter = tokio::spawn(async move {
+            events(
+                State(waiter_state),
+                Extension(ClientSession::local(None).unwrap()),
+                Query(EventsQuery {
+                    after: Some(resume),
+                    limit: Some(10),
+                    wait_ms: Some(1_000),
+                }),
+            )
+            .await
+        });
+        tokio::task::yield_now().await;
+        let t4 = timeline("t4");
+        signal_local_change(&state);
+        let woke = tokio::time::timeout(Duration::from_millis(250), waiter)
+            .await
+            .expect("a local observation did not wake the event long poll")
+            .unwrap()
+            .unwrap()
+            .0;
+        assert_eq!(cursors(&woke), [cursor(format!("{s2}.{t4}"))]);
+    }
+
+    #[tokio::test]
     async fn client_event_long_poll_wakes_for_a_new_claim() {
         let root = tempfile::tempdir().unwrap();
         let state = test_state_named(root.path(), "wait-node");
@@ -5626,6 +5905,21 @@ mission "example/zero-run" state="ready" {
             })
             .unwrap();
         assert_eq!(message.kind, "message.sent");
+        let timeline_sequence = |entry_id: &str| {
+            100 + [
+                "timeline-entry/provider-content",
+                "timeline-entry/wrong-incarnation",
+                "timeline-entry/missing-incarnation",
+                "timeline-entry/tool-call",
+                "timeline-entry/tool-result",
+                "timeline-entry/redaction",
+                "timeline-entry/truncation",
+                "timeline-entry/usage-without-source-semantics",
+            ]
+            .iter()
+            .position(|known| *known == entry_id)
+            .expect("the test numbers every entry") as u64
+        };
         let timeline = |operation: &str,
                         entry_id: &str,
                         revision: u64,
@@ -5643,6 +5937,8 @@ mission "example/zero-run" state="ready" {
                 ("body".into(), body),
                 ("driver".into(), Value::String("codex".into())),
                 ("incarnation_id".into(), Value::String(incarnation.into())),
+                // The driver numbers each entry once; revisions keep that number.
+                ("sequence".into(), Value::from(timeline_sequence(entry_id))),
             ])
         };
         append(
