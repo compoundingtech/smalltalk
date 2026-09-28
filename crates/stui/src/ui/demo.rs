@@ -101,6 +101,7 @@ fn attention() -> Vec<Attention> {
             waiting: Some(s("Atlas Builder on harbor")),
             age: s("33m"),
             mission: Some(s("mission/fleet/atlas/store-move")),
+            actions: vec![],
             kind: AttentionKind::Review {
                 question: s(
                     "The row counts agree and the contract check passed. Cut over to the new store?",
@@ -129,6 +130,7 @@ fn attention() -> Vec<Attention> {
             waiting: Some(s("Docs Writer on harbor")),
             age: s("12m"),
             mission: Some(s("mission/fleet/site/pricing-page")),
+            actions: vec![],
             kind: AttentionKind::Feedback {
                 question: s(
                     "Here is the draft of the pricing page. What should change before it goes live?",
@@ -153,6 +155,7 @@ fn attention() -> Vec<Attention> {
             waiting: Some(s("Planner on lark")),
             age: s("1h"),
             mission: None,
+            actions: vec![],
             kind: AttentionKind::Launch {
                 planner: s("Planner"),
                 preview: MissionPreview {
@@ -210,6 +213,7 @@ fn attention() -> Vec<Attention> {
             waiting: None,
             age: s("8m"),
             mission: Some(s("mission/fleet/release/weekly")),
+            actions: vec![],
             kind: AttentionKind::Fault {
                 what: s(
                     "Release Captain exited 4 times in 10 minutes and st stopped restarting it.",
@@ -228,6 +232,7 @@ fn attention() -> Vec<Attention> {
             waiting: Some(s("Rekey Worker on harbor")),
             age: s("19m"),
             mission: Some(s("mission/fleet/rekey")),
+            actions: vec![],
             kind: AttentionKind::Revision {
                 reason: s(
                     "A key rotated mid-run last week and nobody noticed. An audit step would catch it.",
@@ -251,6 +256,7 @@ fn attention() -> Vec<Attention> {
             waiting: None,
             age: s("2h"),
             mission: None,
+            actions: vec![],
             kind: AttentionKind::Message {
                 from: s("Chief of Staff"),
                 body: s(

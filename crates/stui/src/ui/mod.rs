@@ -5,9 +5,11 @@
 //! cached lines. `stui --demo` runs it on an invented world; the live client will feed it the
 //! same `World`.
 
+pub mod adapt;
 pub mod conversation;
 pub mod demo;
 pub mod doc;
+pub mod live;
 pub mod screens;
 pub mod text;
 pub mod theme;
@@ -91,6 +93,29 @@ struct Demo {
     harbor_seen: Option<Instant>,
 }
 
+/// A request the live loop sends to st. The demo never produces these.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Effect {
+    Attention {
+        id: String,
+        action: String,
+        reason: Option<String>,
+    },
+    LaunchRevise {
+        id: String,
+        feedback: String,
+    },
+    Reply {
+        id: String,
+        to: String,
+        text: String,
+    },
+    Send {
+        agent: String,
+        text: String,
+    },
+}
+
 pub struct Ui {
     world: World,
     tab: usize,
@@ -112,6 +137,9 @@ pub struct Ui {
     dragging: bool,
     demo: Option<Demo>,
     quit: bool,
+    /// Live: actions become `effects` for the live loop instead of demo edits.
+    live: bool,
+    effects: Vec<Effect>,
 }
 
 impl Ui {
@@ -137,7 +165,34 @@ impl Ui {
             dragging: false,
             demo: None,
             quit: false,
+            live: false,
+            effects: Vec::new(),
         }
+    }
+
+    /// Replace the world, keeping each tab's selection on the same item.
+    pub fn set_world(&mut self, world: World) {
+        let tab = self.tab;
+        let mut chosen = Vec::new();
+        for index in 0..TABS.len() {
+            self.tab = index;
+            chosen.push(self.selected_id());
+        }
+        self.world = world;
+        for (index, id) in chosen.into_iter().enumerate() {
+            self.tab = index;
+            if let Some(id) = id
+                && let Some(position) = self.ids().iter().position(|candidate| *candidate == id)
+            {
+                self.selected[index] = position;
+            }
+        }
+        self.tab = tab;
+    }
+
+    /// The tab and the id selected in it.
+    pub fn focus(&self) -> (usize, Option<String>) {
+        (self.tab, self.selected_id())
     }
 
     fn spinner(&self) -> &'static str {
@@ -433,7 +488,8 @@ impl Ui {
 
     fn draw_sidebar(&self, buf: &mut Buffer, area: Rect) {
         buf.set_style(area, Style::default().bg(theme::MANTLE));
-        let width = area.width.saturating_sub(1) as usize;
+        // One column for the frame edge and one kept free for the scrollbar.
+        let width = area.width.saturating_sub(2) as usize;
         let listing = self.listing(width);
         let legend_height = if listing.legend.is_empty() {
             0
@@ -1234,6 +1290,47 @@ impl Ui {
             return;
         }
         self.editing = false;
+        if self.live {
+            let effect = match self.tab {
+                1 => Some(Effect::Send {
+                    agent: id.clone(),
+                    text: draft,
+                }),
+                _ => match self
+                    .world
+                    .attention
+                    .items()
+                    .iter()
+                    .find(|item| item.id == id)
+                    .map(|item| item.kind.clone())
+                {
+                    Some(AttentionKind::Review { .. }) => Some(Effect::Attention {
+                        id: id.clone(),
+                        action: "review.reject".into(),
+                        reason: Some(draft),
+                    }),
+                    Some(AttentionKind::Launch { .. }) => Some(Effect::LaunchRevise {
+                        id: id.clone(),
+                        feedback: draft,
+                    }),
+                    Some(AttentionKind::Message { from, .. }) => Some(Effect::Reply {
+                        id: id.clone(),
+                        to: from,
+                        text: draft,
+                    }),
+                    _ => None,
+                },
+            };
+            match effect {
+                Some(effect) => {
+                    self.effects.push(effect);
+                    self.drafts.remove(&id);
+                    self.flash("Sending…");
+                }
+                None => self.flash("This needs the st CLI for now"),
+            }
+            return;
+        }
         match self.tab {
             1 => {
                 let name = self
@@ -1269,6 +1366,37 @@ impl Ui {
 
     fn act(&mut self, action: char) {
         let Some(id) = self.selected_id() else { return };
+        if self.live {
+            let kind = self.current_kind().unwrap_or("");
+            let name = match (kind, action) {
+                ("review", 'a') => "review.approve",
+                ("launch", 'a') => "launch.approve",
+                ("launch", 'd') => "launch.cancel",
+                ("revision", 'a') => "mission.approve-revision",
+                ("revision", 'j') => "mission.cancel-revision",
+                ("fault", 'r') => "attention.resolve",
+                ("message", 'm') => "message.read",
+                _ => return,
+            };
+            let offered = self
+                .world
+                .attention
+                .items()
+                .iter()
+                .find(|item| item.id == id)
+                .is_some_and(|item| item.actions.iter().any(|action| action == name));
+            if offered {
+                self.effects.push(Effect::Attention {
+                    id,
+                    action: name.into(),
+                    reason: None,
+                });
+                self.flash("Sending…");
+            } else {
+                self.flash(format!("st does not offer {name} here"));
+            }
+            return;
+        }
         let message = match action {
             'a' => "Approved",
             'd' => "Launch cancelled",

@@ -1848,12 +1848,27 @@ async fn run_attention_action(
     reason: Option<String>,
 ) -> Result<String> {
     anyhow::ensure!(app.live_ready, "Reconnect before acting");
+    let outcome = attention_action(client, &app.model.actor, attention_id, action, reason).await?;
+    match app.model.reload(client).await {
+        Ok(()) => Ok(outcome),
+        Err(error) => Ok(format!("{outcome}; refresh failed: {error}")),
+    }
+}
+
+/// Perform one attention action against fresh fences. Shared by the old and new screens.
+async fn attention_action(
+    client: &Client,
+    actor: &str,
+    attention_id: &str,
+    action: &str,
+    reason: Option<String>,
+) -> Result<String> {
     let current = client.attention_get(attention_id).await?;
     let Resource::Attention(attention) = &current.value else {
         anyhow::bail!("Attention changed; refresh and choose again");
     };
     anyhow::ensure!(
-        attention.person_id == app.model.actor
+        attention.person_id == actor
             && attention
                 .actions
                 .iter()
@@ -1978,11 +1993,7 @@ async fn run_attention_action(
         }
         _ => anyhow::bail!("This action needs the CLI: {action}"),
     };
-    let outcome = format!("{}: {}", action_label(action), result.value.kind);
-    match app.model.reload(client).await {
-        Ok(()) => Ok(outcome),
-        Err(error) => Ok(format!("{outcome}; refresh failed: {error}")),
-    }
+    Ok(format!("{}: {}", action_label(action), result.value.kind))
 }
 async fn fresh_import_fence(client: &Client, target: &str) -> Result<Fence> {
     let mut cursor = None;
@@ -2618,6 +2629,19 @@ fn main() -> Result<()> {
             }
         }
     });
+    if args.iter().any(|arg| arg == "--new") {
+        let cached = cache_path
+            .as_deref()
+            .zip(person.as_deref())
+            .and_then(|(path, actor)| cache::load(path, actor));
+        return ui::live::run(ui::live::Context {
+            client,
+            runtime,
+            incoming,
+            person: person.unwrap_or_default(),
+            cached,
+        });
+    }
     let mut app = App::new(Model::default());
     app.model.status = "Loading…".into();
     let mut guard = TerminalGuard::enter()?;

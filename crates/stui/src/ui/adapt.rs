@@ -1,0 +1,751 @@
+//! Live st3 data, turned into the view model the screens draw.
+//!
+//! A collection with no snapshot has not loaded yet, so it becomes `Load::Loading`, never an
+//! empty list. Anything the graph does not say stays unsaid.
+
+use super::view::*;
+use crate::model::{Model, clean_message_text};
+use serde_json::Value;
+use st3_client::{TimelineBody, TimelineEntry, TimelineRole, TimelineToolStatus};
+use std::collections::BTreeMap;
+
+/// What the live loop has fetched beside the model: conversations and launch previews.
+#[derive(Default)]
+pub struct Extras {
+    pub conversations: BTreeMap<String, Load<Vec<Entry>>>,
+    pub previews: BTreeMap<String, MissionPreview>,
+    pub live: bool,
+    pub offline: Option<String>,
+}
+
+fn now() -> String {
+    chrono::Utc::now().to_rfc3339()
+}
+
+fn age(then: &str) -> String {
+    let label = crate::age_label(then, &now());
+    label.trim_end_matches(" ago").to_owned()
+}
+
+fn loaded<T>(snapshot: bool, items: Vec<T>) -> Load<Vec<T>> {
+    if snapshot {
+        Load::Ready(items)
+    } else {
+        Load::Loading
+    }
+}
+
+fn short(id: &str) -> String {
+    id.trim_start_matches("mission/")
+        .trim_start_matches("agent/")
+        .to_owned()
+}
+
+pub fn world(model: &Model, person: &str, extras: &Extras) -> World {
+    let link = if let Some(error) = &extras.offline {
+        Link::Offline(error.clone())
+    } else if extras.live {
+        Link::Live
+    } else {
+        Link::Connecting
+    };
+    let host = model
+        .sessions
+        .snapshot
+        .as_ref()
+        .map(|snapshot| snapshot.host_id.trim_start_matches("host/").to_owned())
+        .unwrap_or_else(|| "this machine".into());
+    let attention = attention(model, extras);
+    let missions = missions(model);
+    let quiet = missions
+        .iter()
+        .filter(|mission| !matches!(mission.word, Word::Decision | Word::Done) && !mission.system)
+        .count();
+    World {
+        person: person.to_owned(),
+        host,
+        link,
+        attention: loaded(model.now.snapshot.is_some(), attention),
+        agents: loaded(model.agents.snapshot.is_some(), agents(model)),
+        missions: loaded(
+            model.missions.snapshot.is_some() && model.work.snapshot.is_some(),
+            missions,
+        ),
+        machines: loaded(model.machines.snapshot.is_some(), machines(model)),
+        worktrees: Load::Ready(super::demo::world().worktrees.items().to_vec()),
+        conversations: extras.conversations.clone(),
+        quiet_missions: quiet,
+    }
+}
+
+// ------------------------------------------------------------------ attention
+
+fn attention(model: &Model, extras: &Extras) -> Vec<Attention> {
+    model
+        .attention()
+        .map(|item| {
+            let step = item.step_run_id.as_ref().and_then(|id| {
+                model
+                    .work()
+                    .find(|work| &work.header.id == id)
+                    .map(|work| work.path.clone())
+            });
+            let mission = item.mission_id.clone();
+            let (tier, kind) = match item.attention_kind.as_str() {
+                "human-gate" => (
+                    Tier::Stopped,
+                    AttentionKind::Review {
+                        question: item.detail.clone(),
+                        because: "the step cannot finish until you answer".into(),
+                        look_at: item
+                            .target_states
+                            .iter()
+                            .map(|target| (target.id.clone(), target.state.clone()))
+                            .chain(
+                                item.targets
+                                    .iter()
+                                    .filter(|target| {
+                                        !item.target_states.iter().any(|state| &state.id == *target)
+                                    })
+                                    .map(|target| ("review".to_owned(), target.clone())),
+                            )
+                            .collect(),
+                        step: step.clone().unwrap_or_default(),
+                    },
+                ),
+                "launch-approval" => (
+                    Tier::Today,
+                    AttentionKind::Launch {
+                        planner: "The planner".into(),
+                        preview: extras.previews.get(&item.header.id).cloned().unwrap_or(
+                            MissionPreview {
+                                name: mission
+                                    .as_deref()
+                                    .map(short)
+                                    .unwrap_or_else(|| item.title.clone()),
+                                goals: vec![],
+                                steps: vec![],
+                                agents: vec![],
+                                workspace: String::new(),
+                            },
+                        ),
+                    },
+                ),
+                "revision-approval" => (
+                    Tier::Today,
+                    AttentionKind::Revision {
+                        reason: item.detail.clone(),
+                        changes: vec![],
+                    },
+                ),
+                "unread-message" => (
+                    Tier::Later,
+                    AttentionKind::Message {
+                        from: item
+                            .detail
+                            .strip_prefix("Unread message from ")
+                            .map(|from| from.trim_end_matches('.').to_owned())
+                            .unwrap_or_else(|| item.source_id.clone()),
+                        body: item.title.clone(),
+                    },
+                ),
+                _ => (
+                    if matches!(item.priority.as_str(), "critical" | "high") {
+                        Tier::Alert
+                    } else {
+                        Tier::Today
+                    },
+                    AttentionKind::Fault {
+                        what: item.detail.clone(),
+                        because: match item.priority.as_str() {
+                            "critical" => "marked critical".into(),
+                            "high" => "marked high priority".into(),
+                            _ => "raised for you".into(),
+                        },
+                        fix: None,
+                        source: item.source_id.clone(),
+                    },
+                ),
+            };
+            Attention {
+                id: item.header.id.clone(),
+                tier,
+                title: clean_message_text(&item.title),
+                waiting: step.map(|step| format!("step {step}")),
+                age: age(&item.requested_at),
+                mission,
+                kind,
+                actions: item.actions.clone(),
+            }
+        })
+        .collect()
+}
+
+/// Build a launch preview from a launch variant's normalized mission.
+pub fn preview(name: &str, normalized: &Value) -> MissionPreview {
+    let strings = |value: &Value| {
+        value
+            .as_array()
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| item.as_str().map(clean_message_text))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+    };
+    let order = normalized["display_order"]
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let steps_value = normalized["steps"].as_object().cloned().unwrap_or_default();
+    let mut keys = order
+        .into_iter()
+        .filter(|key| steps_value.contains_key(key))
+        .collect::<Vec<_>>();
+    for key in steps_value.keys() {
+        if !keys.contains(key) {
+            keys.push(key.clone());
+        }
+    }
+    let mut agents = Vec::new();
+    let steps = keys
+        .iter()
+        .filter_map(|key| steps_value.get(key).map(|step| (key, step)))
+        .filter(|(_, step)| !step["finally"].as_bool().unwrap_or(false))
+        .map(|(key, step)| {
+            let selector = &step["work_selector"];
+            let assignee = match selector["kind"].as_str() {
+                Some("assigned") => selector["agent"].as_str().map(short).unwrap_or_default(),
+                Some("available") => "any of several".into(),
+                Some("agentless") => "st".into(),
+                _ => "—".into(),
+            };
+            if let Some(agent) = selector["agent"].as_str()
+                && !agents
+                    .iter()
+                    .any(|known: &PreviewAgent| known.name == short(agent))
+            {
+                agents.push(PreviewAgent {
+                    name: short(agent),
+                    harness: Harness::Unknown,
+                    host: String::new(),
+                });
+            }
+            let after = step["dependencies"]
+                .as_array()
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|dependency| dependency["step"].as_str().map(str::to_owned))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let asks_you = step["gates"]
+                .as_array()
+                .is_some_and(|gates| gates.iter().any(|gate| gate.get("reviewer").is_some()));
+            PreviewStep {
+                name: step["path"].as_str().unwrap_or(key).to_owned(),
+                assignee,
+                after,
+                asks_you,
+            }
+        })
+        .collect();
+    MissionPreview {
+        name: name.to_owned(),
+        goals: strings(&normalized["goals"]),
+        steps,
+        agents,
+        workspace: String::new(),
+    }
+}
+
+// --------------------------------------------------------------------- agents
+
+fn harness(driver: Option<&str>) -> Harness {
+    match driver.unwrap_or("") {
+        driver if driver.contains("claude") => Harness::Claude,
+        driver if driver.contains("codex") => Harness::Codex,
+        driver if driver.contains("omp") => Harness::Omp,
+        "pi" => Harness::Pi,
+        _ => Harness::Unknown,
+    }
+}
+
+fn agents(model: &Model) -> Vec<Agent> {
+    let mut agents = model
+        .agents()
+        .map(|agent| {
+            let state = match (agent.state.as_str(), agent.harness_state.as_deref()) {
+                _ if agent.fault.is_some() => AgentState::Fault,
+                ("failed", _) => AgentState::Fault,
+                ("running", Some("working")) => AgentState::Working,
+                ("running", _) => AgentState::Idle,
+                ("waiting", Some("unauthenticated" | "blocked")) => AgentState::NeedsYou,
+                ("waiting" | "starting" | "desired", _) => AgentState::Starting,
+                ("stopped", _) => AgentState::Stopped,
+                _ => AgentState::Unknown,
+            };
+            let host = model
+                .runtimes()
+                .find(|runtime| runtime.owner_id == agent.header.id)
+                .map(|runtime| runtime.owner_host_id.trim_start_matches("host/").to_owned())
+                .unwrap_or_else(|| "?".into());
+            let work = agent
+                .current_work_ids
+                .first()
+                .and_then(|id| model.work().find(|work| &work.header.id == id));
+            let mission = work.and_then(|work| {
+                model
+                    .missions()
+                    .find(|mission| mission.runs.contains(&work.mission_run_id))
+                    .map(|mission| short(&mission.header.id))
+            });
+            Agent {
+                id: agent.header.id.clone(),
+                name: crate::agent_label(agent),
+                harness: harness(agent.driver.as_deref()),
+                state,
+                host,
+                worktree: None,
+                mission,
+                step: work.map(|work| work.path.clone()),
+                activity: age(&agent.header.updated_at),
+                unmanaged: false,
+                parent: agent
+                    .under
+                    .first()
+                    .map(|relation| relation.agent_id.clone()),
+            }
+        })
+        .collect::<Vec<_>>();
+    let gateway = model
+        .sessions
+        .snapshot
+        .as_ref()
+        .map(|snapshot| snapshot.host_id.trim_start_matches("host/").to_owned())
+        .unwrap_or_default();
+    agents.extend(model.undeclared_sessions().map(|session| {
+        let driver = session.extra.get("driver").and_then(Value::as_str);
+        let workspace = session
+            .extra
+            .get("workspace")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        Agent {
+            id: session.header.id.clone(),
+            name: format!(
+                "{} in {}",
+                driver.unwrap_or("harness"),
+                workspace
+                    .as_deref()
+                    .map(|path| path.rsplit('/').next().unwrap_or(path))
+                    .unwrap_or("?")
+            ),
+            harness: harness(driver),
+            state: AgentState::Unknown,
+            host: gateway.clone(),
+            worktree: workspace,
+            mission: None,
+            step: None,
+            activity: age(&session.header.updated_at),
+            unmanaged: true,
+            parent: None,
+        }
+    }));
+    agents
+}
+
+// ------------------------------------------------------------------- missions
+
+fn missions(model: &Model) -> Vec<Mission> {
+    model
+        .missions()
+        .map(|mission| {
+            let work = model
+                .work()
+                .filter(|work| crate::mission_work_matches(mission, work))
+                .collect::<Vec<_>>();
+            let decision = model
+                .attention()
+                .find(|item| {
+                    item.attention_kind == "human-gate"
+                        && item.mission_id.as_deref() == Some(mission.header.id.as_str())
+                })
+                .map(|item| item.header.id.clone());
+            let states = work
+                .iter()
+                .map(|work| work.state.as_str())
+                .collect::<Vec<_>>();
+            let word = if decision.is_some() {
+                Word::Decision
+            } else if mission.state == "blocked" || states.contains(&"blocked") {
+                Word::Stalled
+            } else if states.iter().any(|state| matches!(*state, "failed")) {
+                Word::Failed
+            } else if states
+                .iter()
+                .any(|state| matches!(*state, "claimed" | "running"))
+            {
+                Word::Working
+            } else if work
+                .iter()
+                .any(|work| work.state == "ready" && work.claimant.is_none())
+            {
+                Word::Unclaimed
+            } else if states.contains(&"waiting") {
+                Word::Held
+            } else if matches!(
+                mission.state.as_str(),
+                "standing" | "running" | "ready" | "draft"
+            ) {
+                Word::Idle
+            } else {
+                Word::Done
+            };
+            let steps =
+                work.iter()
+                    .map(|work| {
+                        let state = match work.state.as_str() {
+                            "completed" => StepState::Done,
+                            "claimed" | "running" => StepState::Working,
+                            "ready" => StepState::Ready,
+                            "waiting" => StepState::Waiting,
+                            "blocked" => StepState::Waiting,
+                            "failed" => StepState::Failed,
+                            _ => StepState::Pending,
+                        };
+                        let owner = crate::work_owner(model, work);
+                        Step {
+                            name: work.path.clone(),
+                            state,
+                            owner: (!owner.is_empty() && owner != "unassigned").then_some(owner),
+                            note: work.blocked_reason.clone().or_else(|| {
+                                work.goals.first().map(|goal| clean_message_text(goal))
+                            }),
+                            after: vec![],
+                            age: age(&work.header.updated_at),
+                        }
+                    })
+                    .collect::<Vec<_>>();
+            let agents = model
+                .agents()
+                .filter(|agent| {
+                    agent
+                        .current_work_ids
+                        .iter()
+                        .any(|id| work.iter().any(|work| &work.header.id == id))
+                })
+                .map(|agent| agent.header.id.clone())
+                .collect();
+            Mission {
+                id: mission.header.id.clone(),
+                title: crate::mission_display_label(mission),
+                word,
+                age: age(&mission.header.updated_at),
+                host: String::new(),
+                goals: vec![],
+                steps,
+                agents,
+                decision,
+                worktree: None,
+                parent: None,
+                system: mission.header.id.starts_with("mission/__st3/"),
+            }
+        })
+        .collect()
+}
+
+// ------------------------------------------------------------------- machines
+
+fn machines(model: &Model) -> Vec<Machine> {
+    let gateway = model
+        .sessions
+        .snapshot
+        .as_ref()
+        .map(|snapshot| snapshot.host_id.clone())
+        .unwrap_or_default();
+    model
+        .machines()
+        .map(|machine| Machine {
+            name: machine.name.clone(),
+            online: matches!(
+                machine.state.as_str(),
+                "online" | "reachable" | "local" | "active"
+            ),
+            platform: machine.state.clone(),
+            seen: age(&machine.header.updated_at),
+            load: Some(format!(
+                "{} running runtimes",
+                machine.occupancy.running_runtimes
+            )),
+            links: machine
+                .transports
+                .iter()
+                .map(|transport| {
+                    (
+                        transport.protocol.clone(),
+                        matches!(
+                            transport.status.as_str(),
+                            "ok" | "connected" | "reachable" | "healthy"
+                        ),
+                        transport.status.clone(),
+                    )
+                })
+                .collect(),
+            you_are_here: machine.host_id == gateway,
+        })
+        .collect()
+}
+
+// -------------------------------------------------------------- conversations
+
+/// Display names for the ids that appear in message headers.
+pub fn names(model: &Model, person: &str) -> BTreeMap<String, String> {
+    let mut names = model
+        .agents()
+        .map(|agent| (agent.header.id.clone(), crate::agent_label(agent)))
+        .collect::<BTreeMap<_, _>>();
+    names.insert(person.to_owned(), "you".into());
+    names
+}
+
+/// One conversation: the harness transcript and Small Talk messages, in time order.
+pub fn conversation(
+    timeline: &[TimelineEntry],
+    messages: &[st3_client::Message],
+    names: &BTreeMap<String, String>,
+) -> Vec<Entry> {
+    let name = |id: &str| -> String {
+        names.get(id).cloned().unwrap_or_else(|| match id {
+            "daemon/runtime" => "st".into(),
+            id if id.starts_with("person/") => id.trim_start_matches("person/").to_owned(),
+            id => short(id),
+        })
+    };
+    let mut stamped: Vec<(String, Entry)> = Vec::new();
+    let mut tools: BTreeMap<String, usize> = BTreeMap::new();
+    for entry in timeline {
+        let at = clock(&entry.timestamp);
+        let body = match (&entry.role, &entry.body) {
+            (TimelineRole::User, TimelineBody::Content(content)) => {
+                let text = clean_message_text(content.text.as_deref().unwrap_or(""));
+                if text.is_empty() {
+                    continue;
+                }
+                Body::User(text)
+            }
+            (TimelineRole::Assistant, TimelineBody::Content(content)) => {
+                let text = clean_message_text(content.text.as_deref().unwrap_or(""));
+                if text.is_empty() {
+                    continue;
+                }
+                Body::Assistant(text)
+            }
+            (TimelineRole::Tool, TimelineBody::Content(content)) => {
+                let text = clean_message_text(content.text.as_deref().unwrap_or(""));
+                if text.is_empty() {
+                    continue;
+                }
+                let mut lines = text.lines().map(str::to_owned);
+                Body::Tool {
+                    title: lines.next().unwrap_or_default(),
+                    state: ToolState::Ok,
+                    output: lines.collect(),
+                }
+            }
+            (_, TimelineBody::ToolCall(call)) => {
+                tools.insert(call.call_id.clone(), stamped.len());
+                Body::Tool {
+                    title: tool_title(&call.name, &call.arguments),
+                    state: ToolState::Running,
+                    output: vec![],
+                }
+            }
+            (_, TimelineBody::ToolResult(result)) => {
+                let output = tool_output(&result.content);
+                let state = match result.status {
+                    TimelineToolStatus::Error => ToolState::Failed,
+                    _ => ToolState::Ok,
+                };
+                if let Some(index) = tools.get(&result.call_id).copied()
+                    && let Some((
+                        _,
+                        Entry {
+                            body:
+                                Body::Tool {
+                                    state: slot,
+                                    output: out,
+                                    ..
+                                },
+                            ..
+                        },
+                    )) = stamped.get_mut(index)
+                {
+                    *slot = state;
+                    *out = output;
+                    continue;
+                }
+                Body::Tool {
+                    title: "tool result".into(),
+                    state,
+                    output,
+                }
+            }
+            (_, TimelineBody::Error(error)) => Body::Event(format!("error: {}", error.message)),
+            _ => continue,
+        };
+        stamped.push((
+            entry.timestamp.clone(),
+            Entry {
+                id: entry.id.clone(),
+                at,
+                body,
+            },
+        ));
+    }
+    for message in messages {
+        let body = clean_message_text(&message.content);
+        if message.from == "daemon/runtime" {
+            // Step-ready pings are graph events, not conversation.
+            let title = message
+                .title
+                .clone()
+                .unwrap_or_else(|| body.lines().next().unwrap_or("").to_owned());
+            stamped.push((
+                message.sent_at.clone(),
+                Entry {
+                    id: message.header.id.clone(),
+                    at: clock(&message.sent_at),
+                    body: Body::Event(title),
+                },
+            ));
+            continue;
+        }
+        stamped.push((
+            message.sent_at.clone(),
+            Entry {
+                id: message.header.id.clone(),
+                at: clock(&message.sent_at),
+                body: Body::Mail {
+                    from: name(&message.from),
+                    to: name(&message.to),
+                    subject: message.title.clone().unwrap_or_default(),
+                    body: if body.is_empty() {
+                        "(notification)".into()
+                    } else {
+                        body
+                    },
+                },
+            },
+        ));
+    }
+    stamped.sort_by(|a, b| a.0.cmp(&b.0));
+    stamped.into_iter().map(|(_, entry)| entry).collect()
+}
+
+fn clock(timestamp: &str) -> String {
+    chrono::DateTime::parse_from_rfc3339(timestamp)
+        .map(|time| {
+            time.with_timezone(&chrono::Local)
+                .format("%H:%M")
+                .to_string()
+        })
+        .unwrap_or_default()
+}
+
+fn tool_title(name: &str, arguments: &Value) -> String {
+    let pick = [
+        "command",
+        "cmd",
+        "file_path",
+        "path",
+        "pattern",
+        "url",
+        "query",
+        "description",
+    ]
+    .iter()
+    .find_map(|key| arguments.get(key).and_then(Value::as_str));
+    match (name, pick) {
+        ("Bash" | "bash" | "shell" | "exec_command", Some(command)) => {
+            format!("$ {}", command.lines().next().unwrap_or(command))
+        }
+        (_, Some(detail)) => format!("{name} {}", detail.lines().next().unwrap_or(detail)),
+        _ => name.to_owned(),
+    }
+}
+
+fn tool_output(content: &Value) -> Vec<String> {
+    let text = match content {
+        Value::String(text) => text.clone(),
+        Value::Array(items) => items
+            .iter()
+            .filter_map(|item| item.get("text").and_then(Value::as_str).or(item.as_str()))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        Value::Null => String::new(),
+        other => other
+            .get("text")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .unwrap_or_else(|| other.to_string()),
+    };
+    text.lines().take(400).map(str::to_owned).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn a_launch_preview_reads_steps_assignees_dependencies_and_person_gates() {
+        let normalized = json!({
+            "goals": ["Audit dependencies"],
+            "display_order": ["scan", "merge"],
+            "steps": {
+                "scan": {"path": "scan", "work_selector": {"kind": "assigned", "agent": "agent/fleet/auditor"}, "dependencies": [], "gates": []},
+                "merge": {"path": "merge", "work_selector": {"kind": "agentless"}, "dependencies": [{"dependency": "step", "step": "scan", "state": "completed"}], "gates": [{"reviewer": "person/robin"}]}
+            }
+        });
+        let preview = preview("harbor/audit", &normalized);
+        assert_eq!(preview.goals, vec!["Audit dependencies"]);
+        assert_eq!(preview.steps[0].assignee, "fleet/auditor");
+        assert_eq!(preview.steps[1].after, vec!["scan"]);
+        assert!(preview.steps[1].asks_you);
+        assert_eq!(preview.agents.len(), 1);
+    }
+
+    #[test]
+    fn tool_calls_take_their_results_and_messages_merge_by_time() {
+        let timeline: Vec<TimelineEntry> = serde_json::from_value(json!([
+            {"id": "1", "sequence": 1, "revision": 1, "timestamp": "2026-09-28T09:00:00Z", "role": "assistant", "final": true,
+             "type": "tool_call", "body": {"call_id": "c", "name": "Bash", "arguments": {"command": "cargo test"}}},
+            {"id": "2", "sequence": 2, "revision": 1, "timestamp": "2026-09-28T09:00:05Z", "role": "tool", "final": true,
+             "type": "tool_result", "body": {"call_id": "c", "status": "error", "media_type": "text/plain", "content": "1 failed"}}
+        ]))
+        .unwrap();
+        let entries = conversation(&timeline, &[], &BTreeMap::new());
+        assert_eq!(entries.len(), 1);
+        match &entries[0].body {
+            Body::Tool {
+                title,
+                state,
+                output,
+            } => {
+                assert_eq!(title, "$ cargo test");
+                assert_eq!(*state, ToolState::Failed);
+                assert_eq!(output, &vec!["1 failed".to_owned()]);
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+}

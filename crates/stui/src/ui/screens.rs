@@ -347,7 +347,9 @@ pub fn home_detail(world: &World, id: Option<&str>, width: usize, drafts: &Draft
             for (label, value) in look_at {
                 card.field(label, value, inner, theme::text());
             }
-            card.field("step", step, inner, theme::soft());
+            if !step.is_empty() {
+                card.field("step", step, inner, theme::soft());
+            }
             card.blank();
             if !confirm_row(&mut card, drafts, "Approve the cut-over") {
                 if drafts.editing || drafts.text.is_some_and(|text| !text.is_empty()) {
@@ -831,8 +833,17 @@ pub fn missions_list(world: &World, spinner: &'static str, system: bool) -> List
         }
         let (glyph, color) = word_style(mission.word, spinner);
         let (done, total) = mission.progress();
-        let mut right = meter(done, total, 5, color);
-        right.push(span(format!(" {done}/{total}"), theme::dim()));
+        // st reports only current steps for many runs, so a 0/1 meter would claim too much.
+        let right = if done > 0 {
+            let mut right = meter(done, total, 5, color);
+            right.push(span(format!(" {done}/{total}"), theme::dim()));
+            right
+        } else {
+            vec![span(
+                format!("{total} step{}", if total == 1 { "" } else { "s" }),
+                theme::dim(),
+            )]
+        };
         items.push(Item::Row {
             index: ids.len(),
             first: vec![
@@ -908,7 +919,11 @@ pub fn mission_detail(world: &World, id: Option<&str>, width: usize, spinner: &'
         ),
         span(format!("  {}", mission.title), theme::bold()),
         span(
-            format!("   on {} · {}", mission.host, mission.age),
+            if mission.host.is_empty() {
+                format!("   {}", mission.age)
+            } else {
+                format!("   on {} · {}", mission.host, mission.age)
+            },
             theme::dim(),
         ),
     ]));
@@ -927,7 +942,9 @@ pub fn mission_detail(world: &World, id: Option<&str>, width: usize, spinner: &'
             None,
         ));
     }
-    doc.card("goals", theme::LAVENDER, false, goals, width);
+    if !goals.lines.is_empty() {
+        doc.card("goals", theme::LAVENDER, false, goals, width);
+    }
     if let Some(decision) = mission
         .decision
         .as_ref()
@@ -984,12 +1001,26 @@ pub fn mission_detail(world: &World, id: Option<&str>, width: usize, spinner: &'
         }),
         inner,
     ));
+    let name_width = mission
+        .steps
+        .iter()
+        .map(|step| text::width(&step.name))
+        .max()
+        .unwrap_or(8)
+        .clamp(8, inner / 3);
     steps.blank();
     for step in &mission.steps {
         let (glyph, color, word) = step_style(step.state, spinner);
         steps.line(Line::from(vec![
             span(format!("{glyph} "), theme::strong(color)),
-            span(format!("{:<14}", step.name), theme::text()),
+            span(
+                format!(
+                    "{:<w$} ",
+                    text::truncate(&step.name, name_width),
+                    w = name_width
+                ),
+                theme::text(),
+            ),
             span(format!("{:<11}", word), theme::fg(color)),
             span(
                 format!("{:<18}", step.owner.as_deref().unwrap_or("nobody")),

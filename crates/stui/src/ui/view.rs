@@ -85,6 +85,8 @@ pub struct Attention {
     pub age: String,
     pub mission: Option<String>,
     pub kind: AttentionKind,
+    /// The actions st offers for this item. Empty in the demo, where every button works.
+    pub actions: Vec<String>,
 }
 
 #[derive(Clone, Debug)]
