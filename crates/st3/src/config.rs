@@ -54,10 +54,15 @@ pub struct FleetFile {
     pub secret_file: PathBuf,
     pub node_key_file: PathBuf,
     pub anchor_key: Option<String>,
+    /// The name this machine joined under. It wins over `config.toml` and `--node`.
+    pub node: Option<String>,
     /// The sponsor's name and member key from the join handshake. Until membership arrives,
     /// the new member trusts only this key and the anchor's.
     pub sponsor: Option<String>,
     pub sponsor_key: Option<String>,
+    /// How this node reached its sponsor during the join: an `http://` URL, or
+    /// `fabric://NODE_ID/PROTOCOL`. The worker dials it until membership arrives.
+    pub sponsor_routes: Vec<String>,
     pub mode: FleetMode,
     pub port: Option<u16>,
     pub transports: Vec<String>,
@@ -312,6 +317,9 @@ impl Config {
             );
         }
         self.fleet_id = Some(file.fleet_id.clone());
+        if let Some(node) = &file.node {
+            self.node = node.clone();
+        }
         if self.shared_secret_file.is_none() {
             self.shared_secret_file = Some(file.secret_path(&self.state_dir));
         }

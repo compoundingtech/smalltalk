@@ -399,6 +399,16 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
             post(replication_peer_failure),
         )
         .route("/v1/internal/fleet/membership", get(fleet_membership_view))
+        .route("/v1/internal/fleet/status", get(fleet_status))
+        .route(
+            "/v1/internal/fleet/invites",
+            get(fleet_invite_list).post(fleet_invite_create),
+        )
+        .route(
+            "/v1/internal/fleet/invites/revoke",
+            post(fleet_invite_revoke),
+        )
+        .route("/v1/internal/fleet/redeem", post(fleet_redeem))
         .route(
             "/v1/internal/fleet/endpoints",
             post(fleet_publish_endpoints),
@@ -3305,7 +3315,7 @@ fn doctor_report(state: &AppState) -> Result<Json<DoctorReport>, ApiError> {
     match state.store.replication_status(
         state.fleet_id.is_some(),
         state.fleet_id.as_deref(),
-        &replication_peer_names(&state),
+        &replication_peer_names(state),
     ) {
         Ok(replication) if !replication.configured => checks.push(DoctorCheck {
             name: "replication".into(),
@@ -3667,6 +3677,269 @@ fn replication_peer_names(state: &AppState) -> Vec<String> {
             && current.iter().all(|member| member.mode != "dial-out")
     });
     names.into_iter().collect()
+}
+
+#[derive(Deserialize, Serialize)]
+pub struct FleetInviteRequest {
+    #[serde(default)]
+    pub name: Option<String>,
+    pub expires_seconds: u64,
+    #[serde(default)]
+    pub via: Option<String>,
+    #[serde(default)]
+    pub migrate: bool,
+    pub person: String,
+}
+
+#[derive(Deserialize, Serialize)]
+pub struct FleetInviteCreated {
+    pub invite: String,
+    pub code: String,
+    pub expires_at_unix_ms: u64,
+}
+
+#[derive(Deserialize, Serialize)]
+pub struct FleetInviteRevokeRequest {
+    pub invite: String,
+    pub reason: String,
+    pub person: String,
+}
+
+#[derive(Deserialize, Serialize)]
+pub struct FleetStatus {
+    pub node: String,
+    pub fleet_id: Option<String>,
+    pub member_key: Option<String>,
+    pub view: crate::fleet::FleetView,
+    pub peers: Vec<crate::model::ReplicationPeerStatus>,
+    pub invites: Vec<crate::store::FleetInviteView>,
+}
+
+fn concrete_person(person: &str) -> Result<(), ApiError> {
+    if person.starts_with("person/") && person.matches('/').count() == 1 && person.len() > 7 {
+        Ok(())
+    } else {
+        Err(ApiError::bad(St3Error::new(
+            "person-required",
+            "fleet operations need a concrete person/NAME",
+        )))
+    }
+}
+
+async fn fleet_status(State(state): State<AppState>) -> Result<Json<FleetStatus>, ApiError> {
+    let peers = replication_peer_names(&state);
+    let store = state.store.clone();
+    let node = state.node.clone();
+    let fleet_id = state.fleet_id.clone();
+    blocking_store(move || {
+        let replication =
+            store.replication_status(fleet_id.is_some(), fleet_id.as_deref(), &peers)?;
+        Ok(FleetStatus {
+            node,
+            fleet_id,
+            member_key: store.member_public_key(),
+            view: store.fleet_view()?,
+            peers: replication.peers,
+            invites: store.fleet_invites(false)?,
+        })
+    })
+    .await
+    .map(Json)
+}
+
+#[derive(Deserialize)]
+struct FleetInviteListQuery {
+    #[serde(default)]
+    all: bool,
+}
+
+async fn fleet_invite_list(
+    State(state): State<AppState>,
+    Query(query): Query<FleetInviteListQuery>,
+) -> Result<Json<Vec<crate::store::FleetInviteView>>, ApiError> {
+    let store = state.store.clone();
+    blocking_store(move || store.fleet_invites(query.all))
+        .await
+        .map(Json)
+}
+
+fn internal_error(error: impl std::fmt::Display) -> St3Error {
+    St3Error::new("internal", error.to_string())
+}
+
+async fn fleet_invite_create(
+    State(state): State<AppState>,
+    Json(request): Json<FleetInviteRequest>,
+) -> Result<Json<FleetInviteCreated>, ApiError> {
+    use crate::fleet::code::{CodeEndpoint, JoinCode, fingerprint};
+    concrete_person(&request.person)?;
+    let fleet_id = state.fleet_id.clone().ok_or_else(|| {
+        ApiError::bad(St3Error::new(
+            "not-in-a-fleet",
+            "this node is not in a fleet; run st fleet create first",
+        ))
+    })?;
+    let store = state.store.clone();
+    let node = state.node.clone();
+    let created = blocking_action(move || {
+        let via = request.via.clone().unwrap_or_else(|| "auto".into());
+        if !matches!(via.as_str(), "auto" | "tailscale" | "fabric" | "loopback") {
+            return Err(St3Error::new(
+                "invalid-via",
+                "--via is auto, tailscale, fabric, or loopback",
+            ));
+        }
+        let membership = store.fleet_membership().map_err(internal_error)?;
+        let crate::fleet::MemberState::Current(own) = membership.state(&node) else {
+            return Err(St3Error::new(
+                "not-a-member",
+                "this node is not a current fleet member",
+            ));
+        };
+        let wanted = |transport: &str| via == "auto" || via == transport;
+        let text = |value: &Value, field: &str| value[field].as_str().map(str::to_owned);
+        let endpoints = own
+            .endpoints
+            .iter()
+            .filter_map(|endpoint| {
+                let transport = endpoint["transport"].as_str()?;
+                if !wanted(transport) {
+                    return None;
+                }
+                match transport {
+                    "tailscale" => Some(CodeEndpoint::Tailscale(text(endpoint, "address")?)),
+                    "fabric" => Some(CodeEndpoint::Fabric {
+                        node: text(endpoint, "node")?,
+                        protocol: text(endpoint, "protocol")?,
+                    }),
+                    "loopback" => Some(CodeEndpoint::Loopback(text(endpoint, "address")?)),
+                    _ => None,
+                }
+            })
+            .collect::<Vec<_>>();
+        if endpoints.is_empty() {
+            return Err(St3Error::new(
+                "no-endpoints",
+                format!(
+                    "this member advertises no {} endpoint yet; is its replication worker running?",
+                    if via == "auto" {
+                        "reachable"
+                    } else {
+                        via.as_str()
+                    }
+                ),
+            ));
+        }
+        let transports = endpoints
+            .iter()
+            .map(|endpoint| match endpoint {
+                CodeEndpoint::Tailscale(_) => "tailscale".to_owned(),
+                CodeEndpoint::Fabric { .. } => "fabric".to_owned(),
+                CodeEndpoint::Loopback(_) => "loopback".to_owned(),
+            })
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let member_key = store
+            .member_public_key()
+            .ok_or_else(|| St3Error::new("no-member-key", "this node has no member key"))?;
+        let invite = store.create_fleet_invite(
+            request.name.as_deref(),
+            std::time::Duration::from_secs(request.expires_seconds),
+            &transports,
+            &request.person,
+            request.migrate,
+        )?;
+        let code = JoinCode {
+            fleet_id: uuid::Uuid::parse_str(&fleet_id).map_err(internal_error)?,
+            invite: hex::decode(&invite.invite)
+                .ok()
+                .and_then(|bytes| bytes.try_into().ok())
+                .ok_or_else(|| St3Error::new("internal", "the invite ID is damaged"))?,
+            token: invite.token,
+            fingerprint: fingerprint(&member_key),
+            expires_at: invite.expires_at_unix_ms / 1000,
+            name: request.name.clone(),
+            migrate: request.migrate,
+            endpoints,
+        }
+        .encode()
+        .map_err(internal_error)?;
+        Ok(FleetInviteCreated {
+            invite: format!("fleet-invite/{}", invite.invite),
+            code,
+            expires_at_unix_ms: invite.expires_at_unix_ms,
+        })
+    })
+    .await?;
+    signal_changed(&state);
+    Ok(Json(created))
+}
+
+async fn fleet_invite_revoke(
+    State(state): State<AppState>,
+    Json(request): Json<FleetInviteRevokeRequest>,
+) -> Result<Json<Value>, ApiError> {
+    concrete_person(&request.person)?;
+    let store = state.store.clone();
+    let invite = request
+        .invite
+        .strip_prefix("fleet-invite/")
+        .unwrap_or(&request.invite)
+        .to_owned();
+    blocking_store(move || {
+        store.revoke_fleet_invite(&invite, &request.reason, Some(&request.person))
+    })
+    .await?;
+    signal_changed(&state);
+    Ok(Json(json!({ "revoked": true })))
+}
+
+async fn fleet_redeem(
+    State(state): State<AppState>,
+    Json(request): Json<crate::fleet::handshake::JoinRequest>,
+) -> Result<Json<Value>, ApiError> {
+    use crate::store::FleetRedemption;
+    let store = state.store.clone();
+    let state_dir = state.state_dir.clone();
+    let fleet_id = state.fleet_id.clone();
+    let (answer, changed) = blocking_store(move || {
+        Ok(match store.redeem_fleet_invite(&request)? {
+            FleetRedemption::Closed => (json!({ "status": "closed" }), false),
+            FleetRedemption::Refused(reason) => {
+                (json!({ "status": "refused", "reason": reason }), false)
+            }
+            FleetRedemption::Admitted {
+                token,
+                writer_floor,
+                admitted_claim,
+                first,
+            } => {
+                let fleet_id =
+                    fleet_id.ok_or_else(|| anyhow::anyhow!("this node is not in a fleet"))?;
+                let fabric_protocol = crate::config::FleetFile::load(&state_dir)?
+                    .and_then(|file| file.fabric_protocol)
+                    .unwrap_or_else(|| crate::fleet::transport::default_fabric_protocol(&fleet_id));
+                (
+                    json!({
+                        "status": "admitted",
+                        "token": hex::encode(token),
+                        "writer_floor": writer_floor,
+                        "admitted_claim": admitted_claim,
+                        "anchor_key": store.fleet_anchor()?,
+                        "fleet_id": fleet_id,
+                        "fabric_protocol": fabric_protocol,
+                    }),
+                    first,
+                )
+            }
+        })
+    })
+    .await?;
+    if changed {
+        signal_changed(&state);
+    }
+    Ok(Json(answer))
 }
 
 async fn fleet_membership_view(

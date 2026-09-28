@@ -459,6 +459,20 @@ CREATE TABLE IF NOT EXISTS replica_envelope_signatures (
     PRIMARY KEY(writer, sequence, envelope_hash, member_key)
 );
 
+CREATE TABLE IF NOT EXISTS fleet_invite_tokens (
+    invite_id TEXT PRIMARY KEY,
+    token TEXT,
+    expires_at_unix_ms TEXT NOT NULL,
+    name TEXT,
+    migrate INTEGER NOT NULL DEFAULT 0,
+    bound_key TEXT,
+    bound_name TEXT,
+    failures INTEGER NOT NULL DEFAULT 0,
+    admitted_claim TEXT,
+    writer_floor INTEGER,
+    created_by TEXT
+);
+
 CREATE TABLE IF NOT EXISTS replica_envelope_holds (
     writer TEXT NOT NULL,
     sequence INTEGER NOT NULL,
@@ -17215,6 +17229,591 @@ fn store_envelope_signature_tx(
          ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
         params![writer, sequence, envelope_hash, member_key, signature, now],
     )?)
+}
+
+/// An invite this node just created. The token is returned once, for the join code.
+#[derive(Clone, Debug)]
+pub struct CreatedFleetInvite {
+    pub invite: String,
+    pub token: [u8; 16],
+    pub expires_at_unix_ms: u64,
+}
+
+/// The sponsor's answer to one join request.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum FleetRedemption {
+    /// This node holds no open invite, so the join route does not exist.
+    Closed,
+    /// Refused. The reason is for this node's records only; the joiner learns nothing.
+    Refused(&'static str),
+    Admitted {
+        token: [u8; 16],
+        writer_floor: Option<u64>,
+        admitted_claim: Option<String>,
+        first: bool,
+    },
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct FleetInviteView {
+    pub invite: String,
+    pub sponsor: String,
+    pub name: Option<String>,
+    pub expires_at_unix_ms: u64,
+    pub created_by: Option<String>,
+    /// `open`, `redeemed`, `revoked`, or `expired`.
+    pub state: String,
+    pub redeemed_name: Option<String>,
+    pub redeemed_key: Option<String>,
+    pub redeemed_at_unix_ms: Option<u128>,
+    pub revoked_reason: Option<String>,
+}
+
+const FLEET_INVITE_FAILURE_LIMIT: u64 = 5;
+
+/// Node names: a letter or digit, then letters, digits, `.`, `_`, or `-`, at most 63 bytes.
+pub fn valid_fleet_node_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 63
+        && name != "local"
+        && name.as_bytes()[0].is_ascii_alphanumeric()
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+}
+
+impl Store {
+    /// Create an invite that this node sponsors. Only a current listening member can.
+    pub fn create_fleet_invite(
+        &self,
+        name: Option<&str>,
+        lifetime: std::time::Duration,
+        transports: &[String],
+        person: &str,
+        migrate: bool,
+    ) -> Result<CreatedFleetInvite, St3Error> {
+        if let Some(name) = name
+            && !valid_fleet_node_name(name)
+        {
+            return Err(St3Error::new(
+                "invalid-node-name",
+                "a node name is a letter or digit followed by letters, digits, `.`, `_`, or `-`",
+            ));
+        }
+        if !(10..=86_400).contains(&lifetime.as_secs()) {
+            return Err(St3Error::new(
+                "invalid-invite-lifetime",
+                "an invite lasts between 10 seconds and 24 hours",
+            ));
+        }
+        let membership = self.fleet_membership().map_err(internal)?;
+        match membership.state(&self.origin) {
+            crate::fleet::MemberState::Current(own) if own.mode == "listening" => {}
+            crate::fleet::MemberState::Current(_) => {
+                return Err(St3Error::new(
+                    "dial-out-cannot-sponsor",
+                    "a dial-out member accepts no connections, so it cannot sponsor an invite; run this on a listening member",
+                ));
+            }
+            _ => {
+                return Err(St3Error::new(
+                    "not-a-member",
+                    "this node is not a current fleet member",
+                ));
+            }
+        }
+        let mut invite = [0_u8; 16];
+        let mut token = [0_u8; 16];
+        getrandom::fill(&mut invite).map_err(internal)?;
+        getrandom::fill(&mut token).map_err(internal)?;
+        let invite = hex::encode(invite);
+        let expires_at = now_ms() + lifetime.as_millis();
+        let expires_at = u64::try_from(expires_at).map_err(internal)?;
+        let mut fields = BTreeMap::from([
+            (
+                "sponsor".into(),
+                Value::String(format!("host/{}", self.origin)),
+            ),
+            ("expires_at_unix_ms".into(), Value::from(expires_at)),
+            (
+                "transports".into(),
+                Value::Array(transports.iter().cloned().map(Value::String).collect()),
+            ),
+            ("created_by".into(), Value::String(person.into())),
+        ]);
+        if let Some(name) = name {
+            fields.insert("name".into(), Value::String(name.into()));
+        }
+        self.append_claim(&ClaimInput {
+            subject: format!("fleet-invite/{invite}"),
+            kind: "fleet.invite-created".into(),
+            actor: Some(person.into()),
+            fields,
+            evidence: Vec::new(),
+            expected_subject: None,
+            idempotency_key: None,
+        })?;
+        {
+            let connection = self.connection.lock().expect("store mutex poisoned");
+            connection
+                .execute(
+                    "INSERT INTO fleet_invite_tokens(
+                         invite_id, token, expires_at_unix_ms, name, migrate, created_by
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    params![
+                        invite,
+                        hex::encode(token),
+                        expires_at.to_string(),
+                        name,
+                        migrate,
+                        person
+                    ],
+                )
+                .map_err(internal)?;
+        }
+        self.replication_snapshot().map_err(internal)?;
+        Ok(CreatedFleetInvite {
+            invite,
+            token,
+            expires_at_unix_ms: expires_at,
+        })
+    }
+
+    /// The anchor admits itself, once.
+    pub fn admit_fleet_anchor(&self, fleet_id: &str, member_key: &str, mode: &str) -> Result<()> {
+        self.append_claim(&ClaimInput {
+            subject: format!("host/{}", self.origin),
+            kind: "fleet.member-admitted".into(),
+            actor: None,
+            fields: BTreeMap::from([
+                ("fleet_id".into(), Value::String(fleet_id.into())),
+                ("member_key".into(), Value::String(member_key.into())),
+                ("via".into(), Value::String("anchor".into())),
+                ("mode".into(), Value::String(mode.into())),
+            ]),
+            evidence: Vec::new(),
+            expected_subject: None,
+            idempotency_key: Some(format!("fleet-anchor:{member_key}")),
+        })
+        .map_err(anyhow::Error::from)?;
+        self.replication_snapshot()?;
+        Ok(())
+    }
+
+    /// This store's own highest batch under `writer`, if it ever wrote as that name.
+    pub fn writer_head(&self, writer: &str) -> Result<Option<(u64, String)>> {
+        let connection = self.readers.get();
+        Ok(connection
+            .query_row(
+                "SELECT replica_sequence, hash FROM batches WHERE origin=?1
+                 ORDER BY replica_sequence DESC LIMIT 1",
+                [writer],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?)
+    }
+
+    /// The fleet this store is bound to, if any.
+    pub fn bound_fleet(&self) -> Result<Option<String>> {
+        let connection = self.readers.get();
+        fleet_meta(&connection, "fleet_id")
+    }
+
+    /// Erase the tokens of invites that expired or were revoked anywhere in the fleet.
+    pub fn sweep_fleet_invites(&self) -> Result<()> {
+        let connection = self.connection.lock().expect("store mutex poisoned");
+        connection.execute(
+            "UPDATE fleet_invite_tokens SET token=NULL
+             WHERE token IS NOT NULL AND (
+               CAST(expires_at_unix_ms AS INTEGER) <= ?1
+               OR EXISTS (
+                 SELECT 1 FROM claims
+                 WHERE claims.subject='fleet-invite/' || fleet_invite_tokens.invite_id
+                   AND claims.kind='fleet.invite-revoked'
+               )
+             )",
+            [now_ms().to_string()],
+        )?;
+        Ok(())
+    }
+
+    /// Whether this node holds an invite that can still be redeemed.
+    pub fn has_open_fleet_invites(&self) -> Result<bool> {
+        self.sweep_fleet_invites()?;
+        let connection = self.readers.get();
+        Ok(connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM fleet_invite_tokens WHERE token IS NOT NULL)",
+            [],
+            |row| row.get(0),
+        )?)
+    }
+
+    /// Decide one join request against the invites this node sponsors.
+    pub fn redeem_fleet_invite(
+        &self,
+        request: &crate::fleet::handshake::JoinRequest,
+    ) -> Result<FleetRedemption> {
+        use crate::fleet::handshake::{RequestFault, verify_request};
+        if !self.has_open_fleet_invites()? {
+            return Ok(FleetRedemption::Closed);
+        }
+        type InviteRow = (
+            String,
+            Option<String>,
+            bool,
+            Option<String>,
+            Option<String>,
+            u64,
+            Option<String>,
+            Option<u64>,
+            Option<String>,
+        );
+        let row: Option<InviteRow> = {
+            let connection = self.readers.get();
+            connection
+                .query_row(
+                    "SELECT token, name, migrate, bound_key, bound_name, failures, admitted_claim,
+                            writer_floor, created_by
+                     FROM fleet_invite_tokens WHERE invite_id=?1 AND token IS NOT NULL",
+                    [&request.invite],
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                            row.get(5)?,
+                            row.get(6)?,
+                            row.get(7)?,
+                            row.get(8)?,
+                        ))
+                    },
+                )
+                .optional()?
+        };
+        let Some((
+            token,
+            pinned,
+            migrate,
+            bound_key,
+            bound_name,
+            failures,
+            admitted_claim,
+            writer_floor,
+            created_by,
+        )) = row
+        else {
+            return Ok(FleetRedemption::Refused("unknown-invite"));
+        };
+        let token: [u8; 16] = hex::decode(&token)
+            .ok()
+            .and_then(|bytes| bytes.try_into().ok())
+            .context("a stored invite token is damaged")?;
+        match verify_request(request, &token) {
+            Ok(()) => {}
+            Err(RequestFault::Proof) => {
+                let failures = failures + 1;
+                let connection = self.connection.lock().expect("store mutex poisoned");
+                connection.execute(
+                    "UPDATE fleet_invite_tokens SET failures=?2 WHERE invite_id=?1",
+                    params![request.invite, failures],
+                )?;
+                drop(connection);
+                if failures >= FLEET_INVITE_FAILURE_LIMIT {
+                    self.revoke_fleet_invite(&request.invite, "too-many-failures", None)?;
+                }
+                return Ok(FleetRedemption::Refused("proof"));
+            }
+            Err(_) => return Ok(FleetRedemption::Refused("request")),
+        }
+        if request.migrate != migrate {
+            return Ok(FleetRedemption::Refused("kind"));
+        }
+        if pinned
+            .as_deref()
+            .is_some_and(|pinned| pinned != request.name)
+            || !valid_fleet_node_name(&request.name)
+            || !matches!(request.mode.as_str(), "listening" | "dial-out")
+        {
+            return Ok(FleetRedemption::Refused("name"));
+        }
+        if let Some(bound) = bound_key {
+            if bound != request.member_key || bound_name.as_deref() != Some(&request.name) {
+                return Ok(FleetRedemption::Refused("bound-to-another-key"));
+            }
+            // The same joiner again: admit it again without new claims, unless the claims were
+            // interrupted before they were written.
+            let admitted_claim = match admitted_claim {
+                Some(claim) => Some(claim),
+                None => Some(self.append_fleet_admission(
+                    request,
+                    migrate,
+                    writer_floor,
+                    created_by.as_deref(),
+                )?),
+            };
+            return Ok(FleetRedemption::Admitted {
+                token,
+                writer_floor,
+                admitted_claim,
+                first: false,
+            });
+        }
+        let floor =
+            match self.fleet_name_floor(&request.name, request.writer_head.is_some(), migrate)? {
+                Ok(floor) => floor,
+                Err(reason) => return Ok(FleetRedemption::Refused(reason)),
+            };
+        let bound = {
+            let connection = self.connection.lock().expect("store mutex poisoned");
+            connection.execute(
+                "UPDATE fleet_invite_tokens SET bound_key=?2, bound_name=?3, writer_floor=?4
+                 WHERE invite_id=?1 AND bound_key IS NULL AND token IS NOT NULL",
+                params![request.invite, request.member_key, request.name, floor],
+            )?
+        };
+        if bound == 0 {
+            // Another request bound it first.
+            return Ok(FleetRedemption::Refused("bound-to-another-key"));
+        }
+        let admitted =
+            self.append_fleet_admission(request, migrate, floor, created_by.as_deref())?;
+        Ok(FleetRedemption::Admitted {
+            token,
+            writer_floor: floor,
+            admitted_claim: Some(admitted),
+            first: true,
+        })
+    }
+
+    /// The name rules from the design: a name with history can be joined again only after its
+    /// incarnations ended, and only by a store that never wrote as it; then the new window
+    /// starts above everything known of the old ones. A migration keeps the node's own history.
+    fn fleet_name_floor(
+        &self,
+        name: &str,
+        joiner_wrote_as_name: bool,
+        migrate: bool,
+    ) -> Result<Result<Option<u64>, &'static str>> {
+        use crate::fleet::MemberState;
+        let membership = self.fleet_membership()?;
+        let state = membership.state(name);
+        if matches!(state, MemberState::Current(_) | MemberState::Conflicted(_)) {
+            return Ok(Err("name-in-use"));
+        }
+        let ended_end = match &state {
+            MemberState::Ended(_) => membership
+                .incarnations()
+                .filter(|incarnation| incarnation.name == name)
+                .filter_map(|incarnation| incarnation.end)
+                .max(),
+            MemberState::LegacyRemoved(high_water) => Some(*high_water),
+            _ => None,
+        };
+        if migrate {
+            return Ok(if ended_end.is_some() {
+                Err("name-was-removed")
+            } else {
+                Ok(None)
+            });
+        }
+        let connection = self.readers.get();
+        let held: Option<u64> = connection.query_row(
+            "SELECT MAX(sequence) FROM replica_envelopes WHERE writer=?1",
+            [name],
+            |row| row.get(0),
+        )?;
+        let claimed: bool = connection.query_row(
+            &format!(
+                "SELECT EXISTS(SELECT 1 FROM claims WHERE subject=?1 AND kind IN ({FLEET_CLAIM_KINDS}))"
+            ),
+            [format!("host/{name}")],
+            |row| row.get(0),
+        )?;
+        if held.is_none() && !claimed {
+            return Ok(Ok(None));
+        }
+        let Some(ended_end) = ended_end else {
+            return Ok(Err("name-has-unremoved-history"));
+        };
+        if joiner_wrote_as_name {
+            return Ok(Err("store-already-wrote-as-name"));
+        }
+        Ok(Ok(Some(held.unwrap_or(0).max(ended_end))))
+    }
+
+    fn append_fleet_admission(
+        &self,
+        request: &crate::fleet::handshake::JoinRequest,
+        migrate: bool,
+        writer_floor: Option<u64>,
+        created_by: Option<&str>,
+    ) -> Result<String> {
+        let fleet_id = {
+            let connection = self.readers.get();
+            fleet_meta(&connection, "fleet_id")?.context("this store is not in a fleet")?
+        };
+        let invite_subject = format!("fleet-invite/{}", request.invite);
+        self.append_claim(&ClaimInput {
+            subject: invite_subject.clone(),
+            kind: "fleet.invite-redeemed".into(),
+            actor: None,
+            fields: BTreeMap::from([
+                ("name".into(), Value::String(request.name.clone())),
+                (
+                    "member_key".into(),
+                    Value::String(request.member_key.clone()),
+                ),
+            ]),
+            evidence: Vec::new(),
+            expected_subject: None,
+            idempotency_key: Some(format!("fleet-invite-redeemed:{}", request.invite)),
+        })?;
+        let mut fields = BTreeMap::from([
+            ("fleet_id".into(), Value::String(fleet_id)),
+            (
+                "member_key".into(),
+                Value::String(request.member_key.clone()),
+            ),
+            (
+                "via".into(),
+                Value::String(if migrate { "migration" } else { "invite" }.into()),
+            ),
+            (
+                "sponsor".into(),
+                Value::String(format!("host/{}", self.origin)),
+            ),
+            ("invite".into(), Value::String(invite_subject)),
+            ("mode".into(), Value::String(request.mode.clone())),
+        ]);
+        if let Some(floor) = writer_floor {
+            fields.insert("writer_floor".into(), Value::from(floor));
+        }
+        if let Some(person) = created_by {
+            fields.insert("admitted_by".into(), Value::String(person.into()));
+        }
+        let admitted = self.append_claim(&ClaimInput {
+            subject: format!("host/{}", request.name),
+            kind: "fleet.member-admitted".into(),
+            actor: created_by.map(str::to_owned),
+            fields,
+            evidence: Vec::new(),
+            expected_subject: None,
+            idempotency_key: Some(format!("fleet-invite-admitted:{}", request.invite)),
+        })?;
+        {
+            let connection = self.connection.lock().expect("store mutex poisoned");
+            connection.execute(
+                "UPDATE fleet_invite_tokens SET admitted_claim=?2 WHERE invite_id=?1",
+                params![request.invite, admitted.id],
+            )?;
+        }
+        // Seed and sign at once: the joiner's first exchange must find itself admitted.
+        self.replication_snapshot()?;
+        Ok(admitted.id)
+    }
+
+    /// Revoke an invite. Any member can; the sponsor erases the token when it sees the claim.
+    pub fn revoke_fleet_invite(
+        &self,
+        invite: &str,
+        reason: &str,
+        person: Option<&str>,
+    ) -> Result<()> {
+        let mut fields = BTreeMap::from([("reason".into(), Value::String(reason.into()))]);
+        if let Some(person) = person {
+            fields.insert("revoked_by".into(), Value::String(person.into()));
+        }
+        self.append_claim(&ClaimInput {
+            subject: format!("fleet-invite/{invite}"),
+            kind: "fleet.invite-revoked".into(),
+            actor: person.map(str::to_owned),
+            fields,
+            evidence: Vec::new(),
+            expected_subject: None,
+            idempotency_key: Some(format!("fleet-invite-revoked:{invite}")),
+        })?;
+        self.sweep_fleet_invites()?;
+        self.replication_snapshot()?;
+        Ok(())
+    }
+
+    /// Invites as the fleet knows them, from their claims.
+    pub fn fleet_invites(&self, all: bool) -> Result<Vec<FleetInviteView>> {
+        let connection = self.readers.get();
+        let mut statement = connection.prepare(
+            "SELECT subject, kind, body, accepted_at_unix_ms FROM claims
+             WHERE kind IN ('fleet.invite-created','fleet.invite-redeemed','fleet.invite-revoked')
+             ORDER BY store_index",
+        )?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut invites: BTreeMap<String, FleetInviteView> = BTreeMap::new();
+        let now = now_ms();
+        for (subject, kind, body, accepted_at) in rows {
+            let Some(invite) = subject.strip_prefix("fleet-invite/") else {
+                continue;
+            };
+            let body: Value = serde_json::from_str(&body)?;
+            let fields = &body["fields"];
+            let text = |name: &str| fields[name].as_str().map(str::to_owned);
+            match kind.as_str() {
+                "fleet.invite-created" => {
+                    invites.insert(
+                        invite.to_owned(),
+                        FleetInviteView {
+                            invite: subject.clone(),
+                            sponsor: text("sponsor").unwrap_or_default(),
+                            name: text("name"),
+                            expires_at_unix_ms: fields["expires_at_unix_ms"].as_u64().unwrap_or(0),
+                            created_by: text("created_by"),
+                            state: "open".into(),
+                            redeemed_name: None,
+                            redeemed_key: None,
+                            redeemed_at_unix_ms: None,
+                            revoked_reason: None,
+                        },
+                    );
+                }
+                "fleet.invite-redeemed" => {
+                    if let Some(view) = invites.get_mut(invite) {
+                        view.state = "redeemed".into();
+                        view.redeemed_name = text("name");
+                        view.redeemed_key = text("member_key");
+                        view.redeemed_at_unix_ms = accepted_at.parse().ok();
+                    }
+                }
+                "fleet.invite-revoked" => {
+                    if let Some(view) = invites.get_mut(invite)
+                        && view.state == "open"
+                    {
+                        view.state = "revoked".into();
+                        view.revoked_reason = text("reason");
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut views = invites.into_values().collect::<Vec<_>>();
+        for view in &mut views {
+            if view.state == "open" && u128::from(view.expires_at_unix_ms) <= now {
+                view.state = "expired".into();
+            }
+        }
+        if !all {
+            views.retain(|view| view.state == "open" || view.state == "redeemed");
+        }
+        Ok(views)
+    }
 }
 
 #[cfg(test)]
