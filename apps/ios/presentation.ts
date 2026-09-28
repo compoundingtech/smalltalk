@@ -47,6 +47,7 @@ const kindLabels: Record<Attention['attention_kind'], string> = {
   'launch-approval': 'Launch approval',
   'revision-approval': 'Revision approval',
   'unread-message': 'Unread message',
+  'agent-request': 'Agent request',
   fault: 'Fault',
 };
 export function attentionKindLabel(kind: string): string {
