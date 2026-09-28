@@ -332,7 +332,7 @@
           ${st3}/bin/st --help > st.help
           cmp st3.help st.help
           grep -F "Usage: st [" st.help
-          test -s ${st3}/share/bash-completion/completions/st
+          test -s ${st3}/share/bash-completion/completions/st.bash
           test -s ${st3}/share/zsh/site-functions/_st
           test -s ${st3}/share/fish/vendor_completions.d/st.fish
           ${st3}/bin/st3-migrate --help > /dev/null
