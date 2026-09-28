@@ -12,7 +12,7 @@ with a running st3 daemon. For source development, use
 `stui` uses `person` from `~/.config/st3/config.toml` (or `$XDG_CONFIG_HOME/st3/config.toml`).
 A concrete person identity is required so Now and devices show the right data.
 
-Keys: `1`–`4` switch Now, Chat, Control, and Fleet; arrow keys or a sidebar click select an item;
+Keys: `1`–`5` switch Now, Chat, Control, Fleet, and Tree; arrow keys or a sidebar click select an item;
 the mouse wheel and PageUp/PageDown scroll the detail pane; `End` follows the newest Chat message;
 `h` or the History control opens Chat history and details, and its Load older pages control fetches more history;
 `s` hides the sidebar; `v` or the Select text control releases mouse capture for native terminal text
@@ -32,6 +32,11 @@ new mission launch. During attach, the
 terminal receives every key except Ctrl+backslash, which detaches. The visible Return control
 can be focused by clicking it and activated with Enter. On terminals narrower than 66 columns,
 the sidebar hides automatically.
+
+Tree shows running mission steps, standing seat queues, unstarted missions, and agents grouped by
+host and seat kind. Select a run or standing seat and press Enter to inspect its steps or queue;
+Esc returns to the overview. The tree uses one bounded server projection and refreshes when
+relevant graph events arrive.
 
 Now contains only open attention addressed to the current person. Agent transcript text and
 unread messages do not become person attention. Resource lists stop after four pages of 50 items;

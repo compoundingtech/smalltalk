@@ -168,8 +168,6 @@ fn declared_delivery_has_one_exact_semantic_address() {
   session-driver "codex"
   delivery-readiness "credential"
   deliver "app-server"
-  session-driver "codex"
-  delivery-readiness "credential"
   argv "tool" "arg"
 }
 "#,
