@@ -831,11 +831,11 @@ fn reject_old_schema(connection: &Connection) -> Result<()> {
     )?;
     anyhow::ensure!(
         table_count == 0 || matches!(version, 10..=13),
-        "this database uses an unsupported st3 schema; start with a new state directory"
+        "this database uses an unsupported st schema; start with a new state directory"
     );
     anyhow::ensure!(
         matches!(version, 0 | 10 | 11 | 12 | 13),
-        "this database uses unsupported st3 schema version {version}"
+        "this database uses unsupported st schema version {version}"
     );
     Ok(())
 }
@@ -1044,7 +1044,7 @@ fn open_read_connections(path: &Path, shared_memory: bool) -> Result<Vec<Connect
     (0..READ_CONNECTIONS)
         .map(|_| {
             let connection = Connection::open_with_flags(path, flags)
-                .with_context(|| format!("open st3 read connection {}", path.display()))?;
+                .with_context(|| format!("open st read connection {}", path.display()))?;
             connection.execute_batch(
                 "PRAGMA busy_timeout = 5000;
                  PRAGMA foreign_keys = ON;
@@ -1063,7 +1063,7 @@ impl Store {
             fs::create_dir_all(parent)?;
         }
         let mut connection = Connection::open(path)
-            .with_context(|| format!("open st3 database {}", path.display()))?;
+            .with_context(|| format!("open st database {}", path.display()))?;
         // Keep the hot graph and replication index pages in SQLite's bounded
         // page cache. The default (~2 MiB per connection) churns against the
         // large durable claim store during otherwise quiet replication.
@@ -4162,7 +4162,7 @@ impl Store {
             return Err(St3Error::new(
                 "seat-queue-order",
                 format!(
-                    "`{subject}` is not the next work for `{actor}`; claim `{next}` first. A person, or an agent with queue authority for this seat, can reorder it with `st3 agents queue move`"
+                    "`{subject}` is not the next work for `{actor}`; claim `{next}` first. A person, or an agent with queue authority for this seat, can reorder it with `st agents queue move`"
                 ),
             )
             .with_detail("next_work_id", next));
@@ -4659,7 +4659,7 @@ impl Store {
     ) -> Result<ApplyResponse, St3Error> {
         let source = IntentInput {
             kdl: String::new(),
-            source_name: Some("st3 reconciler".into()),
+            source_name: Some("st reconciler".into()),
         };
         let mission = self.mission(intent, source)?;
         if !mission.blockers.is_empty() {
@@ -4718,7 +4718,7 @@ impl Store {
         for reference in &intent.document_refs {
             let Some((name, hash)) = reference.rsplit_once('@') else {
                 blockers.push(format!(
-                    "document `{reference}` has no selected binding; run `st3 documents put` first"
+                    "document `{reference}` has no selected binding; run `st documents put` first"
                 ));
                 continue;
             };
@@ -4733,7 +4733,7 @@ impl Store {
                 .is_some();
             if !exists {
                 blockers.push(format!(
-                    "missing document `{reference}`; run `st3 documents put` first"
+                    "missing document `{reference}`; run `st documents put` first"
                 ));
                 continue;
             }
@@ -7529,7 +7529,7 @@ impl Store {
     }
 
     /// Request attention that the daemon resolves on its own once every target meets `until`,
-    /// one of the `st3 trace wait` status conditions.
+    /// one of the `st trace wait` status conditions.
     pub fn request_attention_until(
         &self,
         subject: &str,
@@ -8029,7 +8029,7 @@ impl Store {
                     requested_at_unix_ms: failure.accepted_at_unix_ms,
                     actions: vec![attention_action(
                         "inspect subscription",
-                        &["st3", "subject", &failure.subject],
+                        &["st", "subject", &failure.subject],
                     )],
                 });
             }
@@ -14454,7 +14454,7 @@ fn attention_item_from_review(review: HumanReviewView) -> AttentionItemView {
             attention_action(
                 "approve",
                 &[
-                    "st3",
+                    "st",
                     "attention",
                     "approve",
                     &review.owner,
@@ -14465,7 +14465,7 @@ fn attention_item_from_review(review: HumanReviewView) -> AttentionItemView {
             attention_action(
                 "reject",
                 &[
-                    "st3",
+                    "st",
                     "attention",
                     "reject",
                     &review.owner,
@@ -14498,11 +14498,11 @@ fn attention_item_from_planning(
         ],
         requested_at_unix_ms: preview.created_at_unix_ms,
         actions: vec![
-            attention_action("show", &["st3", "launch", "show", &session.id]),
+            attention_action("show", &["st", "launch", "show", &session.id]),
             attention_action(
                 "approve",
                 &[
-                    "st3",
+                    "st",
                     "launch",
                     "approve",
                     &session.id,
@@ -14514,7 +14514,7 @@ fn attention_item_from_planning(
             attention_action(
                 "cancel",
                 &[
-                    "st3",
+                    "st",
                     "launch",
                     "cancel",
                     &session.id,
@@ -14544,11 +14544,11 @@ fn attention_item_from_revision(
         targets: vec![format!("{}@{}", run.mission, proposal.candidate_revision)],
         requested_at_unix_ms: proposal.created_at_unix_ms,
         actions: vec![
-            attention_action("show", &["st3", "work", "revision", "show", &run.subject]),
+            attention_action("show", &["st", "work", "revision", "show", &run.subject]),
             attention_action(
                 "approve",
                 &[
-                    "st3",
+                    "st",
                     "work",
                     "revision",
                     "approve",
@@ -14561,7 +14561,7 @@ fn attention_item_from_revision(
             attention_action(
                 "cancel",
                 &[
-                    "st3",
+                    "st",
                     "work",
                     "revision",
                     "cancel",
@@ -14594,7 +14594,7 @@ fn attention_item_from_message(
         actions: vec![attention_action(
             "read",
             &[
-                "st3",
+                "st",
                 "conversations",
                 "read",
                 &message.subject,
@@ -14621,7 +14621,7 @@ fn attention_item_from_request(request: AttentionRequestView) -> AttentionItemVi
             attention_action(
                 "resolve",
                 &[
-                    "st3",
+                    "st",
                     "attention",
                     "resolve",
                     &request.subject,
@@ -14634,7 +14634,7 @@ fn attention_item_from_request(request: AttentionRequestView) -> AttentionItemVi
             attention_action(
                 "dismiss",
                 &[
-                    "st3",
+                    "st",
                     "attention",
                     "resolve",
                     &request.subject,
@@ -16946,11 +16946,11 @@ fn validate_and_admit_envelope_tx(
                 let (error_code, error_message) = match classification {
                     ReplicatedClaimAdmission::UnknownKind => (
                         "unknown-claim-kind",
-                        "this st3 build does not know the claim kind",
+                        "this st build does not know the claim kind",
                     ),
                     ReplicatedClaimAdmission::UnknownField => (
                         "unknown-claim-field",
-                        "this st3 build does not know every field on the claim kind",
+                        "this st build does not know every field on the claim kind",
                     ),
                     ReplicatedClaimAdmission::Valid => unreachable!(),
                 };
@@ -26263,7 +26263,7 @@ version 2
         let error = Store::open(&path, "node")
             .err()
             .expect("the old schema must be rejected");
-        assert!(error.to_string().contains("unsupported st3 schema"));
+        assert!(error.to_string().contains("unsupported st schema"));
     }
 
     #[test]
@@ -26280,7 +26280,7 @@ version 2
         let error = Store::open(&path, "node")
             .err()
             .expect("schema version 9 must be rejected");
-        assert!(error.to_string().contains("unsupported st3 schema"));
+        assert!(error.to_string().contains("unsupported st schema"));
     }
 
     #[test]
@@ -31391,7 +31391,7 @@ message "human-attention" {
         assert_eq!(
             items[0].actions[0].argv,
             [
-                "st3",
+                "st",
                 "conversations",
                 "read",
                 "message/human-attention",
