@@ -2203,7 +2203,7 @@ fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
             ("host", string()),
             ("shutdown_timeout_ms", integer()),
         ],
-        "render.applied" => &[("writes", array())],
+        "render.applied" => &[("writes", array()), ("warnings", array())],
         "runtime.restart-window-reset" => &[
             ("desired_token", string()),
             ("incarnation_id", required_string()),
