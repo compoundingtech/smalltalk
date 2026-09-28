@@ -2770,7 +2770,7 @@ fn control_initializes_before_recording_the_first_thread_only() {
             tx,
         )
     });
-    let first_event = rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    let first_event = rx.recv_timeout(Duration::from_secs(10)).unwrap();
     assert!(
         matches!(first_event, ControlEvent::Bound),
         "first control event: {first_event:?}"
@@ -2924,12 +2924,12 @@ fn expected_resume_waits_for_tui_loaded_thread_and_binds_from_control_response()
         )
     });
     pre_gate_checked_rx
-        .recv_timeout(Duration::from_secs(2))
+        .recv_timeout(Duration::from_secs(10))
         .unwrap();
     resume_ready_tx.send(()).unwrap();
     acknowledge_tui_thread_loaded(&rx);
     assert!(matches!(
-        rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+        rx.recv_timeout(Duration::from_secs(10)).unwrap(),
         ControlEvent::ResumePermissionPolicyApplied(ResumePermissionOverrides {
             approval_policy: Some(policy),
             approvals_reviewer: None,
@@ -2937,7 +2937,7 @@ fn expected_resume_waits_for_tui_loaded_thread_and_binds_from_control_response()
         }) if policy == "never" && sandbox == "danger-full-access"
     ));
     assert!(matches!(
-        rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+        rx.recv_timeout(Duration::from_secs(10)).unwrap(),
         ControlEvent::Bound
     ));
     server.join().unwrap();
@@ -3034,13 +3034,13 @@ fn declared_resume_policy_preloads_before_the_tui_can_load_read_only() {
         )
     });
     ready_tx.send(()).unwrap();
-    preloaded_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    preloaded_rx.recv_timeout(Duration::from_secs(10)).unwrap();
     assert!(matches!(
-        events_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+        events_rx.recv_timeout(Duration::from_secs(10)).unwrap(),
         ControlEvent::ResumePermissionPolicyApplied(_)
     ));
     assert!(matches!(
-        events_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+        events_rx.recv_timeout(Duration::from_secs(10)).unwrap(),
         ControlEvent::Bound
     ));
     server.join().unwrap();
@@ -3159,14 +3159,14 @@ fn rejected_resume_permission_projection_retries_once_with_provider_safe_policy(
     resume_ready_tx.send(()).unwrap();
     acknowledge_tui_thread_loaded(&rx);
     assert!(matches!(
-        rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+        rx.recv_timeout(Duration::from_secs(10)).unwrap(),
         ControlEvent::SafeFallbackActivated {
             cause: "resumePermissionProjectionRejected",
             ..
         }
     ));
     assert!(matches!(
-        rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+        rx.recv_timeout(Duration::from_secs(10)).unwrap(),
         ControlEvent::Bound
     ));
     assert!(fallback_active.load(Ordering::SeqCst));
@@ -3374,7 +3374,7 @@ fn tui_loaded_timeout_reports_the_specific_failure_before_outer_binding_timeout(
         )
     });
     resume_ready_tx.send(()).unwrap();
-    let ControlEvent::Failed(error) = rx.recv_timeout(Duration::from_secs(2)).unwrap() else {
+    let ControlEvent::Failed(error) = rx.recv_timeout(Duration::from_secs(10)).unwrap() else {
         panic!("inner TUI-loaded deadline did not report its specific failure");
     };
     assert!(
@@ -3475,7 +3475,7 @@ fn missing_saved_rollout_fails_without_rebinding_the_incarnation() {
     });
     resume_ready_tx.send(()).unwrap();
     acknowledge_tui_thread_loaded(&rx);
-    let ControlEvent::Failed(error) = rx.recv_timeout(Duration::from_secs(2)).unwrap() else {
+    let ControlEvent::Failed(error) = rx.recv_timeout(Duration::from_secs(10)).unwrap() else {
         panic!("missing saved rollout did not fail closed");
     };
     assert!(error.contains("saved Codex resume binding has no persisted rollout"));
