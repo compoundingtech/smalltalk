@@ -2879,8 +2879,12 @@ fn prepared_state_symlinks_and_pty_root_changes_fail_before_a_marker() {
 #[test]
 fn apply_v1_requires_a_declared_pty_root_outside_the_catalog() {
     let temp = tempfile::tempdir().unwrap();
-    for case in ["default", "relative", "catalog-variable"] {
-        let catalog = temp.path().join(format!("catalog-{case}"));
+    for (case, suffix) in [
+        ("default", "d"),
+        ("relative", "r"),
+        ("catalog-variable", "v"),
+    ] {
+        let catalog = temp.path().join(format!("catalog-{suffix}"));
         write_agent(&catalog, "worker", false);
         match case {
             "default" => {}
@@ -2891,12 +2895,12 @@ fn apply_v1_requires_a_declared_pty_root_outside_the_catalog() {
             .unwrap(),
             "catalog-variable" => fs::write(
                 catalog.join("catalog.kdl"),
-                "catalog { pty-root \"$CATALOG/../catalog-catalog-variable/pty\" }\n",
+                "catalog { pty-root \"$CATALOG/../catalog-v/pty\" }\n",
             )
             .unwrap(),
             _ => unreachable!(),
         }
-        let prepared = temp.path().join(format!("prepared-{case}"));
+        let prepared = temp.path().join(format!("prepared-{suffix}"));
         let captured = st2()
             .args([
                 "catalog",
@@ -2911,23 +2915,11 @@ fn apply_v1_requires_a_declared_pty_root_outside_the_catalog() {
             .unwrap();
         assert!(captured.status.success());
         let captured: Value = serde_json::from_slice(&captured.stdout).unwrap();
-        let root_sha256 = captured["rootSha256"].as_str().unwrap();
-        let rejected = st2()
-            .args([
-                "catalog",
-                "apply",
-                "--catalog",
-                catalog.to_str().unwrap(),
-                "--prepared",
-                prepared.to_str().unwrap(),
-                "--input-sha256",
-                root_sha256,
-                "--expect-sha256",
-                root_sha256,
-                "--json",
-            ])
-            .output()
-            .unwrap();
+        let rejected = apply(
+            &catalog,
+            &prepared,
+            captured["rootSha256"].as_str().unwrap(),
+        );
         assert!(
             !rejected.status.success(),
             "{case} unexpectedly admitted: {}",
