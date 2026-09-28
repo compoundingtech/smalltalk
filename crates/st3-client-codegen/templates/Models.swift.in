@@ -213,6 +213,7 @@ public struct TimelineEntry: Codable, Sendable, Identifiable {
     }
 }
 public struct TimelinePage: Codable, Sendable { public let kind: String; public let sessionID: String; public let items: [TimelineEntry]; public let page: PageInfo; enum CodingKeys: String, CodingKey { case kind, sessionID = "session_id", items, page } }
+public struct ConversationChanges: Codable, Sendable { public let kind: String; public let sessionID: String; public let items: [TimelineEntry]; public let nextCursor: String; enum CodingKeys: String, CodingKey { case kind, sessionID = "session_id", items, nextCursor = "next_cursor" } }
 public struct ProjectionEvent: Codable, Sendable, Identifiable { public let id: String; public let epoch: String; public let sequence: UInt64; public let previousCursor: String; public let nextCursor: String; public let timestamp: String; public let type: String; public let resourceIDs: [String]; public let snapshotID: String; public let body: [String: JSONValue]; enum CodingKeys: String, CodingKey { case id, epoch, sequence, previousCursor = "previous_cursor", nextCursor = "next_cursor", timestamp, type, resourceIDs = "resource_ids", snapshotID = "snapshot_id", body } }
 public struct EventPage: Codable, Sendable { public let kind: String; public let oldestCursor: String; public let resumeCursor: String; public let items: [ProjectionEvent]; public let hasMore: Bool; enum CodingKeys: String, CodingKey { case kind, oldestCursor = "oldest_cursor", resumeCursor = "resume_cursor", items, hasMore = "has_more" } }
 
