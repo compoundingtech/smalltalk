@@ -5,7 +5,7 @@ export type AgentRow = { agent: Agent; depth: number };
 export function agentLabel(agent: Agent): string {
   const slug = agent.name.split('/').filter(Boolean).pop() ?? agent.id.split('/').filter(Boolean).pop() ?? agent.id;
   return slug.split('-').map(word => {
-    const known: Record<string, string> = { st3: 'ST3', cos: 'COS', ios: 'iOS', tui: 'TUI', pty: 'PTY', api: 'API' };
+    const known: Record<string, string> = { st3: 'ST', cos: 'COS', ios: 'iOS', tui: 'TUI', pty: 'PTY', api: 'API' };
     return known[word.toLowerCase()] ?? word.charAt(0).toUpperCase() + word.slice(1);
   }).join(' ');
 }

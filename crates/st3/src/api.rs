@@ -157,6 +157,14 @@ fn signal_changed(state: &AppState) {
 // Usage samples and lease renewals are durable and visible, but neither can
 // advance a mission on its own. Terminal child state, claim expiry deadlines,
 // and harness readiness still wake the reconciler through their own paths.
+// A local observation never replicates and cannot advance a mission, so it only
+// wakes clients that follow this node's event feed.
+fn signal_local_change(state: &AppState) {
+    state
+        .event_notify
+        .send_modify(|generation| *generation = generation.saturating_add(1));
+}
+
 fn signal_visible_change(state: &AppState) {
     state
         .event_notify
@@ -1531,9 +1539,15 @@ fn managed_session_resources(
             });
             same_incarnation || (incarnation.is_none() && same_runtime)
         });
-        let accepted_times = incarnation_claims
+        let mut accepted_times = incarnation_claims
             .map(|claim| claim.accepted_at_unix_ms)
             .collect::<Vec<_>>();
+        if let Some(incarnation) = incarnation
+            && let Some(observed) =
+                store.latest_local_timeline_at(&subject.subject, incarnation, snapshot_index)?
+        {
+            accepted_times.push(observed);
+        }
         let started = fields
             .and_then(|fields| fields.get("started_at_unix_ms"))
             .and_then(|value| value.as_u64().map(u128::from))
@@ -2988,7 +3002,7 @@ fn doctor_report(state: &AppState) -> Result<Json<DoctorReport>, ApiError> {
             name: "operational-repair".into(),
             status: "warn".into(),
             message: format!(
-                "{} graph-authorized repairs are available; inspect `st3 repair dry-run` token {}",
+                "{} graph-authorized repairs are available; inspect `st repair dry-run` token {}",
                 plan.items.len(),
                 plan.token
             ),
@@ -3663,7 +3677,7 @@ async fn start_planning_session(
         .into_iter()
         .collect();
     let prompt = format!(
-        "You are the durable {} planner for launch {id}. Use `st3 conversations ls`, read and archive the native Small Talk request, and use `st3 documents get` for each immutable document reference. Write one Markdown mission and one complete version 2 KDL mission. The KDL mission ID must be `{mission_id}` and its state must be ready. You can submit named variants with `st3 launch submit {id} --variant NAME --markdown FILE --kdl KDL_FILE`. Use temporary files outside the workspace, and remove them after submission. Do not change the workspace. Do not publish or run the mission. Stay available for revision messages until approval or cancellation.",
+        "You are the durable {} planner for launch {id}. Use `st conversations ls`, read and archive the native Small Talk request, and use `st documents get` for each immutable document reference. Write one Markdown mission and one complete version 2 KDL mission. The KDL mission ID must be `{mission_id}` and its state must be ready. You can submit named variants with `st launch submit {id} --variant NAME --markdown FILE --kdl KDL_FILE`. Use temporary files outside the workspace, and remove them after submission. Do not change the workspace. Do not publish or run the mission. Stay available for revision messages until approval or cancellation.",
         planner_config.provider
     );
     let arguments = match planner_config.provider.as_str() {
@@ -5302,7 +5316,9 @@ async fn post_claim(
         .append_client_claim_outcome(&request)
         .map_err(ApiError::bad)?;
     if appended {
-        if request.kind == "harness.usage" {
+        if crate::store::local_observation_position(&response).is_some() {
+            signal_local_change(&state);
+        } else if request.kind == "harness.usage" {
             signal_visible_change(&state);
         } else {
             signal_changed(&state);
@@ -7717,7 +7733,7 @@ async fn input_session_as(
             &prior,
             &session,
             Err(anyhow::anyhow!(
-                "the input request committed before an outcome; st3 will not repeat it"
+                "the input request committed before an outcome; st will not repeat it"
             )),
         );
     }
@@ -7800,7 +7816,7 @@ async fn clear_context(
     if !session.terminal || session.driver.as_deref() != Some("claude") {
         return Err(ApiError::bad(St3Error::new(
             "unsupported-capability",
-            "context clear requires a terminal Claude driver in st3 v1",
+            "context clear requires a terminal Claude driver in st v1",
         )));
     }
     let request_key = format!(
@@ -7903,7 +7919,7 @@ async fn signal_session(
             &prior,
             &session,
             Err(anyhow::anyhow!(
-                "the signal request committed before an outcome; st3 will not repeat it"
+                "the signal request committed before an outcome; st will not repeat it"
             )),
         );
     }
