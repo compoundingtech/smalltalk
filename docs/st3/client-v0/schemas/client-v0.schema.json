@@ -48,6 +48,7 @@
         "value": {
           "oneOf": [
             { "$ref": "#/$defs/Capabilities" },
+            { "$ref": "#/$defs/DocumentContent" },
             { "$ref": "#/$defs/Page" },
             { "$ref": "#/$defs/Resource" },
             { "$ref": "#/$defs/TimelinePage" },
@@ -119,6 +120,14 @@
             "source_id": { "$ref": "#/$defs/Id" },
             "person_id": { "$ref": "#/$defs/Id" },
             "requester_id": { "$ref": "#/$defs/Id" },
+            "launch_id": { "$ref": "#/$defs/Id" },
+            "variant_id": { "$ref": "#/$defs/Id" },
+            "message_id": { "$ref": "#/$defs/Id" },
+            "preview_token": { "type": ["string", "null"] },
+            "preview": { "oneOf": [{ "$ref": "#/$defs/LaunchPreview" }, { "type": "null" }] },
+            "what": { "type": "string" },
+            "because": { "type": "string" },
+            "fix": { "type": "object" },
             "review_mode": { "enum": ["approve", "feedback"] },
             "mission_id": { "$ref": "#/$defs/Id" },
             "mission_run_id": { "$ref": "#/$defs/Id" },
@@ -143,6 +152,15 @@
         "id": { "$ref": "#/$defs/Id" },
         "state": { "type": "string" },
         "since": { "$ref": "#/$defs/Timestamp" }
+      }
+    },
+    "DocumentContent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["reference", "bytes"],
+      "properties": {
+        "reference": { "type": "string" },
+        "bytes": { "type": "array", "items": { "type": "integer", "minimum": 0, "maximum": 255 } }
       }
     },
     "Message": {
@@ -194,7 +212,9 @@
             "variants": { "type": "array", "items": { "$ref": "#/$defs/Id" } },
             "decisions": { "type": "array", "items": { "$ref": "#/$defs/Id" } },
             "approvals": { "type": "array", "items": { "$ref": "#/$defs/Id" } },
-            "visualization": { "$ref": "#/$defs/Visualization" }
+            "visualization": { "$ref": "#/$defs/Visualization" },
+            "preview_token": { "type": ["string", "null"] },
+            "preview": { "oneOf": [{ "$ref": "#/$defs/LaunchPreview" }, { "type": "null" }] }
           }
         }
       ]
@@ -205,6 +225,19 @@
         "provider": { "enum": ["codex", "claude", "pi", "omp", "opencode"] },
         "model": { "type": "string", "minLength": 1 },
         "effort": { "type": "string", "minLength": 1 }
+      }
+    },
+    "LaunchPreview": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["goal", "steps", "agents", "gates", "diagnostics_count", "request_excerpt"],
+      "properties": {
+        "goal": { "type": "string" },
+        "steps": { "type": "array", "items": { "type": "object", "required": ["path", "title", "depends"], "properties": { "path": { "type": "string" }, "title": { "type": "string" }, "assignee": { "type": ["string", "null"] }, "depends": { "type": "array", "items": { "type": "string" } } } } },
+        "agents": { "type": "array", "items": { "type": "object", "required": ["id"], "properties": { "id": { "type": "string" }, "harness": {}, "host": { "type": ["string", "null"] }, "worktree": { "type": ["string", "null"] } } } },
+        "gates": { "type": "object", "required": ["human", "automated"], "properties": { "human": { "type": "integer" }, "automated": { "type": "integer" } } },
+        "diagnostics_count": { "type": "integer" },
+        "request_excerpt": { "type": "string" }
       }
     },
     "LaunchVariant": {

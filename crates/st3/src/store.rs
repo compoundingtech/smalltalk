@@ -1266,10 +1266,6 @@ fn discovered_collection_items(
     else {
         return Vec::new();
     };
-    let prior_numbers = previous_items
-        .iter()
-        .filter_map(|item| item.get("number").and_then(Value::as_u64))
-        .collect::<BTreeSet<_>>();
     let Some(current_items) = current.get(field).and_then(Value::as_array) else {
         return Vec::new();
     };
@@ -1277,7 +1273,15 @@ fn discovered_collection_items(
         .iter()
         .filter_map(|item| {
             let number = item.get("number")?.as_u64()?;
-            if prior_numbers.contains(&number) {
+            let prior = previous_items
+                .iter()
+                .find(|old| old.get("number").and_then(Value::as_u64) == Some(number));
+            if prior.is_some_and(|old| match field {
+                "pull_requests" => ["head", "state", "draft"]
+                    .iter()
+                    .all(|name| old.get(*name) == item.get(*name)),
+                _ => true,
+            }) {
                 return None;
             }
             let (segment, kind) = match field {
@@ -1288,7 +1292,12 @@ fn discovered_collection_items(
             let mut facts = serde_json::Map::from_iter([
                 ("repository".into(), Value::String(repository.into())),
                 ("number".into(), Value::from(number)),
-                ("state".into(), Value::String("open".into())),
+                (
+                    "state".into(),
+                    item.get("state")
+                        .cloned()
+                        .unwrap_or_else(|| Value::String("open".into())),
+                ),
             ]);
             for name in ["url", "title"] {
                 if let Some(value) = item.get(name).filter(|value| !value.is_null()) {
@@ -1296,8 +1305,14 @@ fn discovered_collection_items(
                 }
             }
             if field == "pull_requests" {
-                facts.insert("draft".into(), Value::Bool(false));
+                facts.insert(
+                    "draft".into(),
+                    item.get("draft").cloned().unwrap_or(Value::Bool(false)),
+                );
                 facts.insert("merged".into(), Value::Bool(false));
+                if let Some(head) = item.get("head").filter(|head| !head.is_null()) {
+                    facts.insert("head_sha".into(), head.clone());
+                }
             }
             Some((
                 format!("{repository}/{segment}/{number}"),
@@ -7685,6 +7700,31 @@ impl Store {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
+    /// Among `subjects`, each declaration whose member this build cannot read, with the reason.
+    /// `desired_subjects` gives such a declaration no member at all.
+    pub fn unreadable_members(&self, subjects: &[&str]) -> Result<Vec<(String, String)>> {
+        if subjects.is_empty() {
+            return Ok(Vec::new());
+        }
+        let connection = self.readers.get();
+        let mut statement = connection.prepare(
+            "SELECT subject, member FROM desired
+             WHERE member IS NOT NULL AND subject IN (SELECT value FROM json_each(?1))
+             ORDER BY subject",
+        )?;
+        let rows = statement.query_map([serde_json::to_string(subjects)?], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut unreadable = Vec::new();
+        for row in rows {
+            let (subject, member) = row?;
+            if let Err(error) = serde_json::from_str::<crate::model::MemberSpec>(&member) {
+                unreadable.push((subject, error.to_string()));
+            }
+        }
+        Ok(unreadable)
+    }
+
     pub fn desired_subjects_for_owner_step(&self, owner_step: &str) -> Result<Vec<DesiredSubject>> {
         let connection = self.readers.get();
         let mut statement = connection.prepare(
@@ -8399,6 +8439,66 @@ impl Store {
         } else {
             format!("attention/{subject}")
         };
+        if self
+            .attention_request(&subject)
+            .map_err(internal)?
+            .is_none()
+            && let Some(claim_id) = subject.strip_prefix("attention/subscription-failure-")
+        {
+            let failure = self
+                .claim_by_id(claim_id)
+                .map_err(internal)?
+                .filter(|claim| claim.kind == "subscription.mission-failed")
+                .ok_or_else(|| {
+                    St3Error::new(
+                        "missing-attention-request",
+                        format!("attention request `{subject}` does not exist"),
+                    )
+                })?;
+            let fields = failure.body.get("fields").unwrap_or(&failure.body);
+            let original_request = fields
+                .get("request")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let requester = self
+                .claim_by_id(original_request)
+                .map_err(internal)?
+                .and_then(|claim| {
+                    claim
+                        .body
+                        .pointer("/fields/requester")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                })
+                .unwrap_or_default();
+            let requester = if requester.is_empty() {
+                normalize_actor(&request.actor, "person")
+            } else {
+                requester
+            };
+            if requester != normalize_actor(&request.actor, "person") {
+                return Err(St3Error::new(
+                    "wrong-attention-reviewer",
+                    format!("attention request `{subject}` requires `{requester}`"),
+                ));
+            }
+            self.request_attention(
+                &subject,
+                &AttentionRequest {
+                    reviewer: requester,
+                    title: "Subscription mission failed".into(),
+                    reason: fields
+                        .get("reason")
+                        .and_then(Value::as_str)
+                        .unwrap_or("Subscription mission failed")
+                        .into(),
+                    severity: "error".into(),
+                    targets: vec![failure.subject],
+                    actor: "agent/reconciler".into(),
+                    idempotency_key: format!("subscription-failure-attention:{claim_id}"),
+                },
+            )?;
+        }
         let current = self
             .attention_request(&subject)
             .map_err(internal)?
@@ -8751,6 +8851,12 @@ impl Store {
         {
             let connection = self.readers.get();
             for request in pending_attention_requests_tx(&connection, person)? {
+                if request
+                    .subject
+                    .starts_with("attention/subscription-failure-")
+                {
+                    continue;
+                }
                 if attention_request_is_current_tx(&connection, &request)? {
                     items.push(attention_item_from_request(request));
                 }
@@ -8767,6 +8873,12 @@ impl Store {
                 .query_map([], claim_from_row)?
                 .collect::<Result<Vec<_>, _>>()?;
             for failure in failures {
+                let attention_subject = subscription_failure_attention_subject(&failure.id);
+                if attention_request_view_tx(&connection, &attention_subject)?
+                    .is_some_and(|request| request.status != "pending")
+                {
+                    continue;
+                }
                 let fields = failure.body.get("fields").unwrap_or(&failure.body);
                 let request = fields
                     .get("request")
@@ -8783,7 +8895,7 @@ impl Store {
                 let reviewer = requester
                     .filter(|value| value.starts_with("person/"))
                     .unwrap_or_default();
-                if person.is_some_and(|person| person != reviewer) {
+                if person.is_some_and(|person| !reviewer.is_empty() && person != reviewer) {
                     continue;
                 }
                 let code = fields
@@ -8797,9 +8909,12 @@ impl Store {
                 items.push(AttentionItemView {
                     kind: "fault".into(),
                     review_mode: None,
-                    subject: failure.id,
+                    subject: attention_subject,
                     person: reviewer,
                     requester_id: None,
+                    launch_id: None,
+                    variant_id: None,
+                    message_id: None,
                     title: "Subscription mission failed".into(),
                     detail: format!("{code}: {reason}"),
                     mission: None,
@@ -11245,6 +11360,18 @@ impl Store {
             .iter()
             .filter_map(|peer| Some((peer.clone(), progress.get(peer)?.view(now)?)))
             .collect()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn replace_desired_member_for_test(&self, subject: &str, member: &str) {
+        self.connection
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE desired SET member=?2 WHERE subject=?1",
+                params![subject, member],
+            )
+            .unwrap();
     }
 
     #[cfg(test)]
@@ -15122,7 +15249,7 @@ fn current_harness_at(
             "SELECT id, accepted_at_unix_ms, json_extract(body, '$.fields.code') FROM claims
              WHERE subject=?1 AND kind='harness.diagnostic' AND store_index<=?2
                AND json_extract(body, '$.fields.code')
-                   IN ('provider-auth-expired', 'provider-trust-prompt')
+                   IN ('provider-auth-expired', 'provider-auth-restored', 'provider-trust-prompt')
                AND json_extract(body, '$.fields.incarnation_id')=?3
              ORDER BY store_index DESC LIMIT 1",
             params![subject, at_index, incarnation_id],
@@ -15135,7 +15262,10 @@ fn current_harness_at(
             },
         )
         .optional()?;
-    if let Some((claim, observed_at_unix_ms, code)) = prompt_rejection {
+    // A lifted login fence no longer holds the incarnation.
+    if let Some((claim, observed_at_unix_ms, code)) = prompt_rejection
+        && code != "provider-auth-restored"
+    {
         let (state, reason) = if code == "provider-trust-prompt" {
             ("blocked", "providerTrustPrompt")
         } else {
@@ -16084,6 +16214,13 @@ fn attention_action(label: &str, argv: &[&str]) -> AttentionActionView {
     }
 }
 
+fn subscription_failure_attention_subject(claim_id: &str) -> String {
+    format!(
+        "attention/subscription-failure-{}",
+        claim_id.strip_prefix("claim/").unwrap_or(claim_id)
+    )
+}
+
 fn attention_item_from_review(review: HumanReviewView) -> AttentionItemView {
     AttentionItemView {
         kind: "human-gate".into(),
@@ -16091,6 +16228,9 @@ fn attention_item_from_review(review: HumanReviewView) -> AttentionItemView {
         subject: review.owner.clone(),
         person: review.reviewer.clone(),
         requester_id: None,
+        launch_id: None,
+        variant_id: None,
+        message_id: None,
         title: review
             .title
             .clone()
@@ -16147,7 +16287,13 @@ fn attention_item_from_planning(
         review_mode: None,
         subject: session.subject.clone(),
         person: session.requester.clone(),
-        requester_id: None,
+        requester_id: Some(session.requester.clone()),
+        launch_id: Some(format!("launch/{}", session.id)),
+        variant_id: Some(format!(
+            "launch-variant/{}/{}",
+            session.id, candidate.variant
+        )),
+        message_id: None,
         title: format!("Approve mission/{}", session.mission),
         detail: "The current launch preview is ready for approval.".into(),
         mission: Some(format!("mission/{}", session.mission)),
@@ -16200,6 +16346,9 @@ fn attention_item_from_revision(
         subject: proposal.subject.clone(),
         person: reviewer.to_owned(),
         requester_id: None,
+        launch_id: None,
+        variant_id: None,
+        message_id: None,
         title: format!("Approve a revision of {}", run.mission),
         detail: proposal.reason.clone(),
         mission: Some(run.mission.clone()),
@@ -16247,7 +16396,10 @@ fn attention_item_from_message(
         review_mode: None,
         subject: message.subject.clone(),
         person: message.to.clone(),
-        requester_id: None,
+        requester_id: Some(message.from.clone()),
+        launch_id: None,
+        variant_id: None,
+        message_id: Some(message.subject.clone()),
         title: message
             .title
             .unwrap_or_else(|| format!("Message from {}", message.from)),
@@ -16288,6 +16440,9 @@ fn attention_item_from_request(request: AttentionRequestView) -> AttentionItemVi
         subject: request.subject.clone(),
         person: request.reviewer.clone(),
         requester_id: Some(request.actor.clone()),
+        launch_id: None,
+        variant_id: None,
+        message_id: None,
         title: request.title,
         detail: request.reason,
         mission: None,
@@ -17399,12 +17554,18 @@ impl Store {
     /// including envelopes written before the key existed. Returns the number signed now.
     pub fn set_member_key(&self, key: Option<Arc<crate::fleet::MemberKey>>) -> Result<usize> {
         if key.is_none() {
-            *self.member_key.write().unwrap_or_else(PoisonError::into_inner) = None;
+            *self
+                .member_key
+                .write()
+                .unwrap_or_else(PoisonError::into_inner) = None;
             return Ok(0);
         }
         // Seed envelopes for any local batch first, so the full pass below sees all of them.
         self.replication_snapshot()?;
-        *self.member_key.write().unwrap_or_else(PoisonError::into_inner) = key;
+        *self
+            .member_key
+            .write()
+            .unwrap_or_else(PoisonError::into_inner) = key;
         let mut connection = self.connection.write();
         let transaction = connection.transaction()?;
         let signed = self.sign_own_envelopes_tx(&transaction, None)?;
@@ -35493,6 +35654,61 @@ mission "review-guardrail" state="ready" {
         assert_eq!(issues[0].0, "resource/github/acme/demo/issue/8");
         assert_eq!(issues[0].1, "vcs.issue");
         assert_eq!(issues[0].2["repository"], "resource/github/acme/demo");
+    }
+
+    #[test]
+    fn repository_pull_head_changes_and_closure_emit_exact_item_claims() {
+        let before = json!({"repository_id": 7, "pull_requests": [{
+            "number": 4, "head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "state": "open", "draft": false,
+        }]});
+        let after = json!({"repository_id": 7, "pull_requests": [{
+            "number": 4, "head": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "state": "open", "draft": false,
+        }]});
+        let changes = discovered_collection_items(
+            "resource/github/acme/demo",
+            "pull_requests",
+            Some(&before),
+            &after,
+        );
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].0, "resource/github/acme/demo/pull-request/4");
+        assert_eq!(
+            changes[0].2["head_sha"],
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        );
+        let facts = changes[0]
+            .2
+            .as_object()
+            .unwrap()
+            .iter()
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect();
+        st3_schema::registry()
+            .validate_resource_facts("vcs.pull-request", &facts)
+            .unwrap();
+        assert!(
+            discovered_collection_items(
+                "resource/github/acme/demo",
+                "pull_requests",
+                Some(&after),
+                &after,
+            )
+            .is_empty()
+        );
+        let closed = json!({"repository_id": 7, "pull_requests": [{
+            "number": 4, "head": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "state": "closed", "draft": false,
+        }]});
+        let changes = discovered_collection_items(
+            "resource/github/acme/demo",
+            "pull_requests",
+            Some(&after),
+            &closed,
+        );
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].2["state"], "closed");
     }
 
     #[test]

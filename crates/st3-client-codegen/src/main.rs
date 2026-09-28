@@ -193,13 +193,21 @@ fn rust_operation_methods(
                 out,
                 "    pub async fn capabilities(&self) -> Result<Envelope<Capabilities>, ClientError> {{ self.capabilities_internal().await }}"
             )?;
+        } else if id == "document.get" {
+            writeln!(
+                out,
+                "    pub async fn document_get(&self, name: &str) -> Result<Envelope<DocumentContent>, ClientError> {{ self.get(&format!(\"/v1/client/documents/content?name={{}}\", percent_encode(name))).await }}"
+            )?;
         } else if id == "timeline.list" {
             writeln!(
                 out,
                 "    pub async fn timeline(&self, session_id: &str, cursor: Option<&str>, limit: Option<usize>) -> Result<Envelope<TimelinePage>, ClientError> {{ self.timeline_page_internal(session_id, cursor, limit).await }}"
             )?;
         } else if id == "conversation.changes" {
-            writeln!(out, "    pub async fn conversation_changes(&self, session_id: &str, after: Option<&str>, wait_ms: u64) -> Result<Envelope<ConversationChanges>, ClientError> {{ self.conversation_changes_internal(session_id, after, wait_ms).await }}")?;
+            writeln!(
+                out,
+                "    pub async fn conversation_changes(&self, session_id: &str, after: Option<&str>, wait_ms: u64) -> Result<Envelope<ConversationChanges>, ClientError> {{ self.conversation_changes_internal(session_id, after, wait_ms).await }}"
+            )?;
         } else if id == "events.list" {
             writeln!(
                 out,
@@ -275,6 +283,11 @@ fn swift_operation_methods(
                 | "agent-queue.get"
         ) {
             continue;
+        } else if id == "document.get" {
+            writeln!(
+                out,
+                "    public func documentGet(name: String) async throws -> Envelope<DocumentContent> {{ try await get(\"v1/client/documents/content\", query: [.init(name: \"name\", value: name)]) }}"
+            )?;
         } else if id.ends_with(".get") {
             let collection = path
                 .trim_start_matches("/v1/client/")
@@ -436,6 +449,8 @@ fn validate_surfaces(
     }
     for definition in [
         "AttentionTargetState",
+        "DocumentContent",
+        "LaunchPreview",
         "AgentQueue",
         "AgentQueueRun",
         "AgentQueueMove",
@@ -932,8 +947,16 @@ fn typescript_operation_methods(
                 out,
                 "    async {method}(options: EventOptions = {{}}): Promise<EnvelopeOf<{response}>> {{ return this.get('{route}' + query(options), 'events'); }}"
             )?;
+        } else if id == "document.get" {
+            writeln!(
+                out,
+                "    async {method}(name: string): Promise<EnvelopeOf<{response}>> {{ return this.get('{route}' + query({{ name }})); }}"
+            )?;
         } else if id == "conversation.changes" {
-            writeln!(out, "    async {method}(id: string, options: {{ after?: string; wait_ms?: number }} = {{}}): Promise<EnvelopeOf<{response}>> {{ return this.get(`{route}` + query(options)); }}")?;
+            writeln!(
+                out,
+                "    async {method}(id: string, options: {{ after?: string; wait_ms?: number }} = {{}}): Promise<EnvelopeOf<{response}>> {{ return this.get(`{route}` + query(options)); }}"
+            )?;
         } else if id == "timeline.list" || id == "terminal.screen" || id.ends_with(".get") {
             let query_suffix = if id == "timeline.list" {
                 " + query(options)"

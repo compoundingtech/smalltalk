@@ -846,6 +846,8 @@ pub struct ObserverSpec {
     pub provider: String,
     pub locator: String,
     pub fields: Vec<String>,
+    #[serde(default)]
+    pub every_ms: Option<u64>,
     pub stopped: bool,
 }
 
@@ -1536,6 +1538,12 @@ pub struct AttentionItemView {
     pub person: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub requester_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub variant_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message_id: Option<String>,
     pub title: String,
     pub detail: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -250,6 +250,7 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
     let app = Router::new()
         .route("/v1/health", get(health))
         .route("/v1/client/capabilities", get(client_capabilities))
+        .route("/v1/client/documents/content", get(client_v0::document_get))
         .route("/v1/client/now", get(client_v0::now))
         .route("/v1/client/machines", get(client_v0::machines))
         .route("/v1/client/devices", get(client_v0::devices))
@@ -1891,13 +1892,18 @@ fn client_attention_resources(
             .claims_for(&item.subject, None)?
             .last()
             .map(|claim| claim.id.clone())
+            .or_else(|| {
+                item.subject
+                    .strip_prefix("attention/subscription-failure-")
+                    .map(str::to_owned)
+            })
             .ok_or_else(|| anyhow::anyhow!("attention `{}` has no accepted claim", item.subject))?;
         let mut resource = json!({
             "id": id,
             "kind": "attention",
             "attention_kind": item.kind,
             "source_id": item.subject,
-            "person_id": item.person,
+            "person_id": if item.person.is_empty() { "person/any" } else { &item.person },
             "revision": revision,
             "updated_at": client_timestamp(item.requested_at_unix_ms),
             "title": item.title,
@@ -1914,6 +1920,15 @@ fn client_attention_resources(
             .expect("an attention resource is an object");
         if let Some(requester) = &item.requester_id {
             object.insert("requester_id".into(), Value::String(requester.clone()));
+        }
+        for (name, value) in [
+            ("launch_id", &item.launch_id),
+            ("variant_id", &item.variant_id),
+            ("message_id", &item.message_id),
+        ] {
+            if let Some(value) = value {
+                object.insert(name.into(), Value::String(value.clone()));
+            }
         }
         if let Some(mode) = &item.review_mode {
             object.insert("review_mode".into(), Value::String(mode.clone()));
@@ -1934,6 +1949,11 @@ fn client_attention_resources(
         }
         if matches!(item.kind.as_str(), "fault" | "agent-request") {
             insert_attention_target_states(store, object, &item.targets)?;
+        }
+        if item.kind == "fault" {
+            object.insert("what".into(), Value::String(item.title.clone()));
+            object.insert("because".into(), Value::String(item.detail.clone()));
+            object.insert("fix".into(), json!({"action": "attention.resolve", "parameters": {"attention_id": item.subject, "outcome": "resolved"}}));
         }
         resources.insert(id, resource);
     }
@@ -1970,6 +1990,11 @@ fn client_attention_resources(
                     "actions": if current { client_attention_actions(kind, None) } else { Vec::<&str>::new() },
                     "operational": { "layer": if current { "current" } else { "history" }, "actionable": current, "reasons": reasons }
             });
+            if kind == "fault" {
+                resource["what"] = Value::String(request.title.clone());
+                resource["because"] = Value::String(request.reason.clone());
+                resource["fix"] = json!({"action": "attention.resolve", "parameters": {"attention_id": request.subject, "outcome": "resolved"}});
+            }
             insert_attention_target_states(
                 store,
                 resource
@@ -1998,6 +2023,39 @@ fn client_attention_resources(
             .then_with(|| left["id"].as_str().cmp(&right["id"].as_str()))
     });
     Ok(resources)
+}
+
+fn client_attention_resources_with_previews(
+    state: &AppState,
+    person: Option<&str>,
+    history: bool,
+) -> anyhow::Result<Vec<Value>> {
+    let mut items = client_attention_resources(&state.store, person, history)?;
+    for item in &mut items {
+        if item["attention_kind"] != "launch-approval" {
+            continue;
+        }
+        let Some(launch_id) = item["launch_id"]
+            .as_str()
+            .and_then(|id| id.strip_prefix("launch/"))
+        else {
+            continue;
+        };
+        let Some(variant_id) = item["variant_id"].as_str() else {
+            continue;
+        };
+        let Some(session) = state.store.planning_session(launch_id)? else {
+            continue;
+        };
+        if let Some(variant) = client_launch_variant_resources(state, &session)?
+            .into_iter()
+            .find(|variant| variant["id"] == variant_id)
+        {
+            item["preview"] = variant["preview"].clone();
+            item["preview_token"] = variant["preview_token"].clone();
+        }
+    }
+    Ok(items)
 }
 
 /// A fault whose requesting seat was stopped, or whose owning run or generation ended, has no
@@ -2353,42 +2411,148 @@ fn launch_visualization(
     })
 }
 
+fn launch_compact_preview(
+    state: &AppState,
+    session: &PlanningSessionView,
+    intent: &crate::model::NormalizedIntent,
+    mission: &crate::model::MissionSpec,
+    diagnostics_count: usize,
+) -> anyhow::Result<Value> {
+    let steps = mission
+        .display_order
+        .iter()
+        .filter_map(|id| mission.steps.get(id))
+        .map(|step| {
+            let assignee = match step
+                .work_selector
+                .as_ref()
+                .or(mission.work_selector.as_ref())
+            {
+                Some(crate::model::WorkSelector::Assigned { agent }) => Some(agent.as_str()),
+                _ => None,
+            };
+            json!({
+                "path": step.path,
+                "title": step.title.as_deref().unwrap_or(&step.id),
+                "assignee": assignee,
+                "depends": step.dependencies.iter().filter_map(|dependency| match dependency {
+                    crate::model::DependencySpec::Step { step, .. } => Some(step.as_str()),
+                    _ => None,
+                }).collect::<Vec<_>>()
+            })
+        })
+        .collect::<Vec<_>>();
+    let assigned_agents = mission
+        .steps
+        .values()
+        .map(|step| {
+            step.work_selector
+                .as_ref()
+                .or(mission.work_selector.as_ref())
+        })
+        .flat_map(|selector| match selector {
+            Some(crate::model::WorkSelector::Assigned { agent }) => vec![agent.clone()],
+            Some(crate::model::WorkSelector::Available { agents }) => agents.clone(),
+            _ => Vec::new(),
+        })
+        .collect::<BTreeSet<_>>();
+    let mut agents_by_id = state
+        .store
+        .desired_subjects()?
+        .into_iter()
+        .filter(|subject| subject.kind == "agent" && assigned_agents.contains(&subject.subject))
+        .map(|subject| (subject.subject.clone(), subject))
+        .collect::<BTreeMap<_, _>>();
+    agents_by_id.extend(
+        intent
+            .subjects
+            .values()
+            .filter(|subject| subject.kind == "agent")
+            .map(|subject| (subject.subject.clone(), subject.clone())),
+    );
+    let agents = agents_by_id
+        .values()
+        .map(|subject| {
+            json!({
+                "id": subject.subject,
+                "harness": subject.member.as_ref().and_then(|member| member.driver.as_deref()),
+                "host": subject.member.as_ref().map(|member| member.host.as_str()),
+                "worktree": subject.member.as_ref().map(|member| member.workspace.as_str())
+            })
+        })
+        .collect::<Vec<_>>();
+    let gates = mission
+        .gates
+        .iter()
+        .chain(mission.steps.values().flat_map(|step| step.gates.iter()));
+    let (human, automated) = gates.fold((0, 0), |(human, automated), gate| {
+        if matches!(gate, crate::model::GateSpec::Human { .. }) {
+            (human + 1, automated)
+        } else {
+            (human, automated + 1)
+        }
+    });
+    let request_excerpt = session
+        .request
+        .rsplit_once('@')
+        .and_then(|(name, hash)| state.store.get_document(name, hash).ok().flatten())
+        .map(|bytes| {
+            String::from_utf8_lossy(&bytes)
+                .chars()
+                .take(300)
+                .collect::<String>()
+        })
+        .unwrap_or_default();
+    Ok(json!({
+        "goal": mission.goals.first().cloned().unwrap_or_default(),
+        "steps": steps,
+        "agents": agents,
+        "gates": { "human": human, "automated": automated },
+        "diagnostics_count": diagnostics_count,
+        "request_excerpt": request_excerpt
+    }))
+}
+
 fn client_launch_variant_resources(
     state: &AppState,
     session: &PlanningSessionView,
 ) -> anyhow::Result<Vec<Value>> {
     let mut resources = Vec::new();
     for (ordinal, variant) in session.variants.iter().enumerate() {
-        let (normalized, diagnostics, visualization, structured_diff) = if let Some(preview) =
-            &variant.preview
-        {
-            let intent = parse_intent(&preview.mission.resolved_intent.kdl, &state.node)
-                .map_err(|error| anyhow::anyhow!(error.message))?;
-            let mission = intent
-                .missions
-                .get(&session.mission)
-                .ok_or_else(|| anyhow::anyhow!("preview mission is missing"))?;
-            let mut normalized = serde_json::to_value(mission)?;
-            client_safe_json(&mut normalized);
-            (
-                normalized,
-                client_launch_diagnostics(preview),
-                launch_visualization(
-                    mission,
-                    session,
-                    preview,
-                    &client_launch_decision_resources(&state.store, session)?,
-                ),
-                json!({"changes": preview.mission.changes, "predicted_actions": preview.mission.predicted_actions}),
-            )
-        } else {
-            (
-                json!({}),
-                Vec::new(),
-                json!({"version": "st3.visualization.v0", "views": [], "nodes": [], "edges": [], "groups": [], "timeline": {"entries": []}, "swimlanes": [], "goals": [], "constraints": [], "gates": [], "resources": [], "decisions": [], "revision": {}, "diffs": [], "risk": {}, "live_progress": {}}),
-                json!({"changes": [], "predicted_actions": []}),
-            )
-        };
+        let (normalized, diagnostics, visualization, structured_diff, compact_preview) =
+            if let Some(preview) = &variant.preview {
+                let intent = parse_intent(&preview.mission.resolved_intent.kdl, &state.node)
+                    .map_err(|error| anyhow::anyhow!(error.message))?;
+                let mission = intent
+                    .missions
+                    .get(&session.mission)
+                    .ok_or_else(|| anyhow::anyhow!("preview mission is missing"))?;
+                let mut normalized = serde_json::to_value(mission)?;
+                client_safe_json(&mut normalized);
+                let diagnostics = client_launch_diagnostics(preview);
+                let compact_preview =
+                    launch_compact_preview(state, session, &intent, mission, diagnostics.len())?;
+                (
+                    normalized,
+                    diagnostics,
+                    launch_visualization(
+                        mission,
+                        session,
+                        preview,
+                        &client_launch_decision_resources(&state.store, session)?,
+                    ),
+                    json!({"changes": preview.mission.changes, "predicted_actions": preview.mission.predicted_actions}),
+                    Some(compact_preview),
+                )
+            } else {
+                (
+                    json!({}),
+                    Vec::new(),
+                    json!({"version": "st3.visualization.v0", "views": [], "nodes": [], "edges": [], "groups": [], "timeline": {"entries": []}, "swimlanes": [], "goals": [], "constraints": [], "gates": [], "resources": [], "decisions": [], "revision": {}, "diffs": [], "risk": {}, "live_progress": {}}),
+                    json!({"changes": [], "predicted_actions": []}),
+                    None,
+                )
+            };
         let preview_token = variant
             .preview
             .as_ref()
@@ -2415,6 +2579,7 @@ fn client_launch_variant_resources(
             "normalized_mission": normalized,
             "diagnostics": diagnostics,
             "preview_token": preview_token,
+            "preview": compact_preview,
             "structured_diff": structured_diff,
             "visualization": visualization,
             "operational": { "layer": if approved { "history" } else { "current" }, "actionable": !approved && !blocked, "reasons": if blocked { vec!["blocked"] } else if approved { vec!["approved"] } else { Vec::<&str>::new() } }
@@ -2499,10 +2664,10 @@ fn client_launch_resources(state: &AppState, history: bool) -> anyhow::Result<Ve
                 _ => json!({ "type": "new-mission" }),
             };
             let decisions = client_launch_decision_resources(store, &session)?;
-            let visualization = client_launch_variant_resources(state, &session)?
-                .into_iter()
-                .rev()
-                .find_map(|variant| variant.get("visualization").cloned());
+            let latest_variant = client_launch_variant_resources(state, &session)?.into_iter().rev().next();
+            let visualization = latest_variant.as_ref().and_then(|variant| variant.get("visualization").cloned());
+            let preview = latest_variant.as_ref().and_then(|variant| variant.get("preview").cloned());
+            let preview_token = latest_variant.as_ref().and_then(|variant| variant.get("preview_token").cloned());
             let approval_ids = store.claims_for(&session.subject, None)?.into_iter().filter(|claim| claim.kind == "planning-session.approved").filter_map(|claim| claim.body.pointer("/fields/candidate_revision").and_then(Value::as_u64).map(|revision| format!("launch-approval/{}/{revision}", session.id))).collect::<Vec<_>>();
             Ok(json!({
                 "id": format!("launch/{}", session.id),
@@ -2519,6 +2684,8 @@ fn client_launch_resources(state: &AppState, history: bool) -> anyhow::Result<Ve
                 "decisions": decisions.iter().filter_map(|decision| decision["id"].as_str()).collect::<Vec<_>>(),
                 "approvals": approval_ids,
                 "visualization": visualization,
+                "preview": preview,
+                "preview_token": preview_token,
                 "operational": { "layer": if historical { "history" } else { "current" }, "actionable": !historical, "reasons": if historical { vec![phase] } else { Vec::<&str>::new() } }
             }))
         })
@@ -2775,7 +2942,7 @@ async fn client_attention(
     if effective_query.cursor.is_some() {
         return client_page(&state, &snapshot, "attention", Vec::new(), &effective_query).map(Json);
     }
-    let items = client_attention_resources(&state.store, person.as_deref(), query.history)
+    let items = client_attention_resources_with_previews(&state, person.as_deref(), query.history)
         .map_err(ApiError::internal)?;
     client_page(&state, &snapshot, "attention", items, &effective_query).map(Json)
 }
@@ -2788,7 +2955,7 @@ async fn client_attention_detail(
 ) -> Result<Json<Value>, ApiError> {
     let person = client_v0::person_filter(&session, query.person.as_deref())?;
     client_detail(
-        client_attention_resources(&state.store, person.as_deref(), query.history)
+        client_attention_resources_with_previews(&state, person.as_deref(), query.history)
             .map_err(ApiError::internal)?,
         "attention",
         &id,
@@ -3662,7 +3829,10 @@ fn doctor_report(state: &AppState) -> Result<Json<DoctorReport>, ApiError> {
                         .map(|projection| format!(
                             " ({}: {})",
                             projection.aggregate,
-                            projection.error_message.as_deref().unwrap_or("no reason recorded")
+                            projection
+                                .error_message
+                                .as_deref()
+                                .unwrap_or("no reason recorded")
                         ))
                         .unwrap_or_default(),
                     if unavailable.is_empty() {
@@ -10859,6 +11029,40 @@ version 2
         assert!(preview_token.starts_with("lpv0:"));
         assert_eq!(current_hash, preview_token);
         assert_eq!(variant["normalized_mission"]["id"], "planned/work");
+        assert_eq!(
+            variant["preview"]["goal"],
+            "Publish the planned and verified result."
+        );
+        assert_eq!(variant["preview"]["steps"].as_array().unwrap().len(), 3);
+        assert_eq!(variant["preview"]["steps"][2]["depends"], json!(["change"]));
+        let (status, launch_page) = get_request(app.clone(), "/v1/client/launches").await;
+        assert_eq!(status, StatusCode::OK, "{launch_page}");
+        assert_eq!(launch_page["items"][0]["preview"], variant["preview"]);
+        let (status, attention_page) =
+            get_request(app.clone(), "/v1/client/attention?person=person%2Fnathan").await;
+        assert_eq!(status, StatusCode::OK, "{attention_page}");
+        assert_eq!(
+            attention_page["items"][0]["launch_id"],
+            format!("launch/{session}")
+        );
+        assert_eq!(attention_page["items"][0]["preview"], variant["preview"]);
+        assert_eq!(attention_page["items"][0]["preview_token"], preview_token);
+        let document_name = store.planning_session(session).unwrap().unwrap().request;
+        let (status, document) = get_request(
+            app.clone(),
+            &format!(
+                "/v1/client/documents/content?name={}",
+                urlencoding::encode(&document_name)
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{document}");
+        assert_eq!(document["reference"], document_name);
+        assert!(
+            document["bytes"]
+                .as_array()
+                .is_some_and(|bytes| !bytes.is_empty())
+        );
         assert!(
             !serde_json::to_string(&variant["normalized_mission"])
                 .unwrap()
@@ -14484,6 +14688,43 @@ version 2
         assert!(messages[0].content.contains("resolved"));
         let (_, empty) = get_request(app, "/v1/attention?person=nathan").await;
         assert_eq!(empty, json!([]));
+    }
+
+    #[tokio::test]
+    async fn client_now_keeps_attention_priority_order_and_fault_details() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let store = state.store.clone();
+        for (subject, severity) in [
+            ("attention/a-low", "warning"),
+            ("attention/z-high", "error"),
+        ] {
+            store
+                .request_attention(
+                    subject,
+                    &AttentionRequest {
+                        reviewer: "person/nathan".into(),
+                        title: format!("Fault {severity}"),
+                        reason: "The subscription needs a correction.".into(),
+                        severity: severity.into(),
+                        targets: vec![],
+                        actor: "person/system".into(),
+                        idempotency_key: subject.into(),
+                    },
+                )
+                .unwrap();
+        }
+        let app = router(state);
+        let (status, page) = get_request(app, "/v1/client/now?person=person%2Fnathan").await;
+        assert_eq!(status, StatusCode::OK, "{page}");
+        assert_eq!(page["items"][0]["source_id"], "attention/z-high");
+        assert_eq!(page["items"][1]["source_id"], "attention/a-low");
+        assert_eq!(page["items"][0]["what"], "Fault error");
+        assert_eq!(
+            page["items"][0]["because"],
+            "The subscription needs a correction."
+        );
+        assert_eq!(page["items"][0]["fix"]["action"], "attention.resolve");
     }
 
     #[test]
