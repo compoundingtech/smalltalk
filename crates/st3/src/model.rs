@@ -1301,7 +1301,7 @@ pub struct SubjectStatus {
     pub projection: OperationalAnnotation,
 }
 
-/// The status conditions `st3 trace wait --for` accepts, which an attention request can also use
+/// The status conditions `st trace wait --for` accepts, which an attention request can also use
 /// as its `until` condition.
 pub const STATUS_WAIT_CONDITIONS: &[&str] = &[
     "running",

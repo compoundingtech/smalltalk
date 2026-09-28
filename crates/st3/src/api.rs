@@ -2988,7 +2988,7 @@ fn doctor_report(state: &AppState) -> Result<Json<DoctorReport>, ApiError> {
             name: "operational-repair".into(),
             status: "warn".into(),
             message: format!(
-                "{} graph-authorized repairs are available; inspect `st3 repair dry-run` token {}",
+                "{} graph-authorized repairs are available; inspect `st repair dry-run` token {}",
                 plan.items.len(),
                 plan.token
             ),
@@ -3666,7 +3666,7 @@ async fn start_planning_session(
         .into_iter()
         .collect();
     let prompt = format!(
-        "You are the durable {} planner for launch {id}. Use `st3 conversations ls`, read and archive the native Small Talk request, and use `st3 documents get` for each immutable document reference. Write one Markdown mission and one complete version 2 KDL mission. The KDL mission ID must be `{mission_id}` and its state must be ready. You can submit named variants with `st3 launch submit {id} --variant NAME --markdown FILE --kdl KDL_FILE`. Use temporary files outside the workspace, and remove them after submission. Do not change the workspace. Do not publish or run the mission. Stay available for revision messages until approval or cancellation.",
+        "You are the durable {} planner for launch {id}. Use `st conversations ls`, read and archive the native Small Talk request, and use `st documents get` for each immutable document reference. Write one Markdown mission and one complete version 2 KDL mission. The KDL mission ID must be `{mission_id}` and its state must be ready. You can submit named variants with `st launch submit {id} --variant NAME --markdown FILE --kdl KDL_FILE`. Use temporary files outside the workspace, and remove them after submission. Do not change the workspace. Do not publish or run the mission. Stay available for revision messages until approval or cancellation.",
         planner_config.provider
     );
     let arguments = match planner_config.provider.as_str() {
@@ -7720,7 +7720,7 @@ async fn input_session_as(
             &prior,
             &session,
             Err(anyhow::anyhow!(
-                "the input request committed before an outcome; st3 will not repeat it"
+                "the input request committed before an outcome; st will not repeat it"
             )),
         );
     }
@@ -7803,7 +7803,7 @@ async fn clear_context(
     if !session.terminal || session.driver.as_deref() != Some("claude") {
         return Err(ApiError::bad(St3Error::new(
             "unsupported-capability",
-            "context clear requires a terminal Claude driver in st3 v1",
+            "context clear requires a terminal Claude driver in st v1",
         )));
     }
     let request_key = format!(
@@ -7906,7 +7906,7 @@ async fn signal_session(
             &prior,
             &session,
             Err(anyhow::anyhow!(
-                "the signal request committed before an outcome; st3 will not repeat it"
+                "the signal request committed before an outcome; st will not repeat it"
             )),
         );
     }
