@@ -838,6 +838,8 @@ pub struct ObserverSpec {
     pub provider: String,
     pub locator: String,
     pub fields: Vec<String>,
+    #[serde(default)]
+    pub every_ms: Option<u64>,
     pub stopped: bool,
 }
 
