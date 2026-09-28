@@ -6,6 +6,7 @@
 
 pub mod keys;
 pub mod membership;
+pub mod transport;
 pub mod view;
 
 pub use keys::{MemberKey, envelope_signature_message, verify_signature};
