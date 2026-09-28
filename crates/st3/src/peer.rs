@@ -1559,7 +1559,7 @@ mod tests {
             backend: PeerBackend::Main(Client::unix(&owner_socket)),
             node: "owner-node".into(),
             auth: FleetAuth::test("fleet-test", &[7; 32]),
-            peers: BTreeSet::from(["gateway-node".into()]),
+            fleet: FleetContext::legacy(BTreeSet::from(["gateway-node".into()])),
             main_socket: owner_socket.clone(),
             outbound_notify: watch::channel(0_u64).0,
         };
