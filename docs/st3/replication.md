@@ -96,6 +96,15 @@ An unknown claim kind or field can become valid after a schema upgrade. Admissio
 
 A projection fault keeps the last good projection. The daemon continues to serve status and repair commands.
 
+A valid claim can still fail to project, for example a body written by another build. That claim
+is quarantined on its own: its projection is rolled back, and every other claim, from every peer,
+still reaches the graph. `st replication status` lists it as an `unhealthy` projection named
+`projection:base:CLAIM` or `projection:runs:CLAIM`, and `st doctor` names it. Each full replay
+decides the claim again.
+
+A repair that cannot be applied is listed the same way, as `repair:CLAIM`. The other repairs still
+apply, and the daemon still starts.
+
 ## Deterministic convergence
 
 Every node preserves every authenticated envelope candidate.

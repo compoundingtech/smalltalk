@@ -44,6 +44,8 @@ const CLAUDE_TRUST_RECOVERY_ATTEMPTS: usize = 3;
 const CLAUDE_TRUST_RECOVERY_WINDOW_MS: u128 = 10 * 60_000;
 // A failed checkout fetch or worktree command waits this long before Git runs again.
 const CHECKOUT_RETRY_MS: u128 = 30_000;
+// Run cleanup ends this long after it began even if an owned runtime never reports stopped.
+const CLEANUP_DEADLINE: Duration = Duration::from_secs(15 * 60);
 const DECLARED_CHECKOUT_LIMIT: usize = 4096;
 
 #[cfg(test)]
@@ -404,6 +406,8 @@ pub struct Reconciler<R = NativeRuntime> {
     /// Faults that could not be recorded in the graph during the current pass.
     unrecorded_faults: Mutex<Vec<String>>,
     fault_injection: Option<Arc<dyn FaultInjection>>,
+    /// How long run cleanup waits for its runtimes to stop before the run ends without them.
+    cleanup_deadline: Duration,
     /// Unit tests fail a pass that raises a fault unless they opt in, so an isolated error
     /// cannot hide inside a test that expects a clean pass.
     #[cfg(test)]
@@ -486,6 +490,7 @@ impl Reconciler<NativeRuntime> {
             faults: Mutex::new(None),
             unrecorded_faults: Mutex::new(Vec::new()),
             fault_injection: None,
+            cleanup_deadline: CLEANUP_DEADLINE,
             #[cfg(test)]
             raised_faults: Mutex::new(Some(Vec::new())),
         })
@@ -521,6 +526,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             faults: Mutex::new(None),
             unrecorded_faults: Mutex::new(Vec::new()),
             fault_injection: None,
+            cleanup_deadline: CLEANUP_DEADLINE,
             #[cfg(test)]
             raised_faults: Mutex::new(Some(Vec::new())),
         }
@@ -529,6 +535,12 @@ impl<R: RuntimeControl> Reconciler<R> {
     #[doc(hidden)]
     pub fn with_fault_injection(mut self, injection: Arc<dyn FaultInjection>) -> Self {
         self.fault_injection = Some(injection);
+        self
+    }
+
+    #[doc(hidden)]
+    pub fn with_cleanup_deadline(mut self, deadline: Duration) -> Self {
+        self.cleanup_deadline = deadline;
         self
     }
 
@@ -3383,6 +3395,7 @@ impl<R: RuntimeControl> Reconciler<R> {
     fn evaluate_mission_runs(&self) -> Result<()> {
         let ids = self.store.active_mission_run_ids_for_origin(&self.host)?;
         let mut active_generations = BTreeSet::new();
+        let mut active_steps = BTreeSet::new();
         let mut changed = false;
         for id in &ids {
             let subject = format!("mission-run/{id}");
@@ -3390,6 +3403,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                 .isolate("mission-run", &subject, || {
                     let run = self.store.mission_run_for_reconcile(id)?;
                     active_generations.insert(run.generation.clone());
+                    active_steps.extend(run.steps.iter().map(|step| step.subject.clone()));
                     self.evaluate_active_mission_run(&run)
                 })
                 .unwrap_or(false);
@@ -3402,7 +3416,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             .lock()
             .expect("generation retirement mutex poisoned")
             .retain(|generation| active_generations.contains(generation.as_str()));
-        // A run that left the active set while faulted has nothing left to fail.
+        // A run or step that left the active set while faulted has nothing left to fail.
         let active = ids
             .iter()
             .map(|id| format!("mission-run/{id}"))
@@ -3411,11 +3425,15 @@ impl<R: RuntimeControl> Reconciler<R> {
             .open_faults()?
             .iter()
             .flatten()
-            .filter(|((subject, scope), _)| scope == "mission-run" && !active.contains(subject))
-            .map(|((subject, _), _)| subject.clone())
+            .filter(|((subject, scope), _)| match scope.as_str() {
+                "mission-run" => !active.contains(subject),
+                "step" => !active_steps.contains(subject),
+                _ => false,
+            })
+            .map(|((subject, scope), _)| (subject.clone(), scope.clone()))
             .collect::<Vec<_>>();
-        for subject in inactive {
-            self.close_fault(&subject, "mission-run", "the run is no longer active")?;
+        for (subject, scope) in inactive {
+            self.close_fault(&subject, &scope, "it is no longer active")?;
         }
         if changed {
             self.signal_changed();
@@ -3710,284 +3728,303 @@ impl<R: RuntimeControl> Reconciler<R> {
             let Some(view) = views.get(step.spec.path.as_str()).copied() else {
                 continue;
             };
-            let eligible_phase = ((run.phase == "normal" || run.phase == "revision-draining")
-                && !step.spec.finally)
-                || (matches!(run.phase.as_str(), "final" | "final-cancelled") && step.spec.finally);
-            if !eligible_phase {
-                continue;
-            }
-            if run.phase == "revision-draining"
-                && matches!(
-                    view.status.as_str(),
-                    "pending" | "ready" | "blocked" | "failed" | "completed" | "cancelled"
-                )
-            {
-                continue;
-            }
-            if view.status == "failed" {
-                if view.attempt < step.spec.retry.attempts {
-                    changed |= self.store.retry_step(
-                        &view.subject,
-                        "the step repeat policy permits another attempt",
-                        step.spec.retry.backoff_ms,
-                    )?;
-                }
-                continue;
-            }
-            if matches!(view.status.as_str(), "completed" | "cancelled") {
-                continue;
-            }
-            if view.status == "orphaned" {
-                changed |= self.store.set_step_state(
-                    &view.subject,
-                    "ready",
-                    Some("the prior worker incarnation ended"),
-                )?;
-                continue;
-            }
-            if matches!(
-                view.status.as_str(),
-                "claimed" | "working" | "verifying" | "blocked"
-            ) && self.store.work_claim_is_orphaned(view)?
-            {
-                changed |= self.store.set_step_state(
-                    &view.subject,
-                    "orphaned",
-                    Some("the exact worker incarnation ended"),
-                )?;
-                continue;
-            }
-            if view.status == "ready"
-                && view.blocked_reason.as_deref() == Some("the worker lease expired")
-            {
-                if self.step_timed_out(view, &step)? {
-                    changed |= self.store.set_step_state(
-                        &view.subject,
-                        "failed",
-                        Some("the active execution timeout expired"),
-                    )?;
-                    continue;
-                }
-                changed |= self.store.set_step_state(
-                    &view.subject,
-                    "ready",
-                    Some("the worker lease expired"),
-                )?;
-                continue;
-            }
-            if let Some(expiry) = view.claim_expires_at_unix_ms
-                && expiry <= now_ms()
-                && matches!(
-                    view.status.as_str(),
-                    "claimed" | "working" | "verifying" | "blocked"
-                )
-            {
-                changed |= self.store.set_step_state(
-                    &view.subject,
-                    "ready",
-                    Some("the worker lease expired"),
-                )?;
-                continue;
-            }
-            let assignment_blocked = view.status == "blocked"
-                && view
-                    .blocked_reason
-                    .as_deref()
-                    .is_some_and(|reason| reason.starts_with("no eligible agent is present"));
-            let baseline_blocked = view.status == "blocked"
-                && view
-                    .blocked_reason
-                    .as_deref()
-                    .is_some_and(|reason| reason.starts_with("step baseline `"));
-            if view.status == "pending" || assignment_blocked || baseline_blocked {
-                if view
-                    .not_before_unix_ms
-                    .is_some_and(|not_before| not_before > now_ms())
-                {
-                    continue;
-                }
-                if !self.step_dependencies_hold(run, &step, &views)? {
-                    continue;
-                }
-                let mut baseline_holds = true;
-                for baseline in &step.spec.baselines {
-                    for gate in &baseline.gates {
-                        if !matches!(
-                            self.evaluate_mission_gate(run, &step, view, gate)?,
-                            GateOutcome::Pass
-                        ) {
+            // One step that fails records a fault on that step. The run's other steps and its
+            // status are still evaluated.
+            changed |= self
+                .isolate("step", &view.subject, || -> Result<bool> {
+                    let mut changed = false;
+                    let eligible_phase = ((run.phase == "normal"
+                        || run.phase == "revision-draining")
+                        && !step.spec.finally)
+                        || (matches!(run.phase.as_str(), "final" | "final-cancelled")
+                            && step.spec.finally);
+                    if !eligible_phase {
+                        return Ok(changed);
+                    }
+                    if run.phase == "revision-draining"
+                        && matches!(
+                            view.status.as_str(),
+                            "pending" | "ready" | "blocked" | "failed" | "completed" | "cancelled"
+                        )
+                    {
+                        return Ok(changed);
+                    }
+                    if view.status == "failed" {
+                        if view.attempt < step.spec.retry.attempts {
+                            changed |= self.store.retry_step(
+                                &view.subject,
+                                "the step repeat policy permits another attempt",
+                                step.spec.retry.backoff_ms,
+                            )?;
+                        }
+                        return Ok(changed);
+                    }
+                    if matches!(view.status.as_str(), "completed" | "cancelled") {
+                        return Ok(changed);
+                    }
+                    if view.status == "orphaned" {
+                        changed |= self.store.set_step_state(
+                            &view.subject,
+                            "ready",
+                            Some("the prior worker incarnation ended"),
+                        )?;
+                        return Ok(changed);
+                    }
+                    if matches!(
+                        view.status.as_str(),
+                        "claimed" | "working" | "verifying" | "blocked"
+                    ) && self.store.work_claim_is_orphaned(view)?
+                    {
+                        changed |= self.store.set_step_state(
+                            &view.subject,
+                            "orphaned",
+                            Some("the exact worker incarnation ended"),
+                        )?;
+                        return Ok(changed);
+                    }
+                    if view.status == "ready"
+                        && view.blocked_reason.as_deref() == Some("the worker lease expired")
+                    {
+                        if self.step_timed_out(view, &step)? {
+                            changed |= self.store.set_step_state(
+                                &view.subject,
+                                "failed",
+                                Some("the active execution timeout expired"),
+                            )?;
+                            return Ok(changed);
+                        }
+                        changed |= self.store.set_step_state(
+                            &view.subject,
+                            "ready",
+                            Some("the worker lease expired"),
+                        )?;
+                        return Ok(changed);
+                    }
+                    if let Some(expiry) = view.claim_expires_at_unix_ms
+                        && expiry <= now_ms()
+                        && matches!(
+                            view.status.as_str(),
+                            "claimed" | "working" | "verifying" | "blocked"
+                        )
+                    {
+                        changed |= self.store.set_step_state(
+                            &view.subject,
+                            "ready",
+                            Some("the worker lease expired"),
+                        )?;
+                        return Ok(changed);
+                    }
+                    let assignment_blocked = view.status == "blocked"
+                        && view.blocked_reason.as_deref().is_some_and(|reason| {
+                            reason.starts_with("no eligible agent is present")
+                        });
+                    let baseline_blocked = view.status == "blocked"
+                        && view
+                            .blocked_reason
+                            .as_deref()
+                            .is_some_and(|reason| reason.starts_with("step baseline `"));
+                    if view.status == "pending" || assignment_blocked || baseline_blocked {
+                        if view
+                            .not_before_unix_ms
+                            .is_some_and(|not_before| not_before > now_ms())
+                        {
+                            return Ok(changed);
+                        }
+                        if !self.step_dependencies_hold(run, &step, &views)? {
+                            return Ok(changed);
+                        }
+                        let mut baseline_holds = true;
+                        for baseline in &step.spec.baselines {
+                            for gate in &baseline.gates {
+                                if !matches!(
+                                    self.evaluate_mission_gate(run, &step, view, gate)?,
+                                    GateOutcome::Pass
+                                ) {
+                                    changed |= self.store.set_step_state(
+                                        &view.subject,
+                                        "blocked",
+                                        Some(&format!(
+                                            "step baseline `{}` does not hold",
+                                            baseline.name
+                                        )),
+                                    )?;
+                                    baseline_holds = false;
+                                    break;
+                                }
+                            }
+                            if !baseline_holds {
+                                break;
+                            }
+                        }
+                        if !baseline_holds {
+                            return Ok(changed);
+                        }
+                        if baseline_blocked {
+                            changed |= self.store.set_step_state(&view.subject, "pending", None)?;
+                        }
+                        let eligible_agent = || -> Result<bool> {
+                            Ok(view
+                                .assigned_to
+                                .iter()
+                                .chain(view.available_to.iter())
+                                .map(|agent| self.store.selected_desired_kind(agent))
+                                .collect::<Result<Vec<_>>>()?
+                                .iter()
+                                .any(|kind| kind.as_deref() == Some("agent")))
+                        };
+                        let mut eligible = view.agentless || eligible_agent()?;
+                        if !eligible {
+                            // A step can declare its own assigned agent. Create only that agent before
+                            // checking eligibility; other declarations still wait for active execution.
+                            changed |=
+                                self.materialize_step_declarations(run, &step, view, true)?;
+                            eligible = eligible_agent()?;
+                        }
+                        if !eligible {
+                            let eligible = view
+                                .assigned_to
+                                .iter()
+                                .chain(view.available_to.iter())
+                                .map(|agent| format!("`{agent}`"))
+                                .collect::<Vec<_>>()
+                                .join(", ");
                             changed |= self.store.set_step_state(
                                 &view.subject,
                                 "blocked",
-                                Some(&format!("step baseline `{}` does not hold", baseline.name)),
+                                Some(&format!(
+                                    "no eligible agent is present in the desired graph: {eligible}"
+                                )),
                             )?;
-                            baseline_holds = false;
-                            break;
+                            return Ok(changed);
+                        }
+                        changed |= self.store.set_step_state(&view.subject, "ready", None)?;
+                        return Ok(changed);
+                    }
+                    if !matches!(
+                        view.status.as_str(),
+                        "ready" | "claimed" | "working" | "verifying" | "blocked"
+                    ) {
+                        return Ok(changed);
+                    }
+                    // Agentless work has no worker claim to open its execution interval. Admit every
+                    // eligible agentless step automatically before materializing declarations or waiting
+                    // on gates, so its timeout and lifecycle are real instead of remaining `ready`
+                    // forever. Nested missions need the persisted parent transition before their children
+                    // can be evaluated; other agentless work can materialize in this same pass.
+                    if view.status == "ready" && view.agentless {
+                        let reason = awaited_run(run, &step, view)?
+                            .map(|after| format!("waiting for `{after}` to complete"));
+                        changed |= self.store.set_step_state(
+                            &view.subject,
+                            "working",
+                            reason.as_deref(),
+                        )?;
+                        if step.spec.nested_mission.is_some() {
+                            return Ok(changed);
                         }
                     }
-                    if !baseline_holds {
-                        break;
-                    }
-                }
-                if !baseline_holds {
-                    continue;
-                }
-                if baseline_blocked {
-                    changed |= self.store.set_step_state(&view.subject, "pending", None)?;
-                }
-                let eligible_agent = || -> Result<bool> {
-                    Ok(view
-                        .assigned_to
-                        .iter()
-                        .chain(view.available_to.iter())
-                        .map(|agent| self.store.selected_desired_kind(agent))
-                        .collect::<Result<Vec<_>>>()?
-                        .iter()
-                        .any(|kind| kind.as_deref() == Some("agent")))
-                };
-                let mut eligible = view.agentless || eligible_agent()?;
-                if !eligible {
-                    // A step can declare its own assigned agent. Create only that agent before
-                    // checking eligibility; other declarations still wait for active execution.
-                    changed |= self.materialize_step_declarations(run, &step, view, true)?;
-                    eligible = eligible_agent()?;
-                }
-                if !eligible {
-                    let eligible = view
-                        .assigned_to
-                        .iter()
-                        .chain(view.available_to.iter())
-                        .map(|agent| format!("`{agent}`"))
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    changed |= self.store.set_step_state(
-                        &view.subject,
-                        "blocked",
-                        Some(&format!(
-                            "no eligible agent is present in the desired graph: {eligible}"
-                        )),
-                    )?;
-                    continue;
-                }
-                changed |= self.store.set_step_state(&view.subject, "ready", None)?;
-                continue;
-            }
-            if !matches!(
-                view.status.as_str(),
-                "ready" | "claimed" | "working" | "verifying" | "blocked"
-            ) {
-                continue;
-            }
-            // Agentless work has no worker claim to open its execution interval. Admit every
-            // eligible agentless step automatically before materializing declarations or waiting
-            // on gates, so its timeout and lifecycle are real instead of remaining `ready`
-            // forever. Nested missions need the persisted parent transition before their children
-            // can be evaluated; other agentless work can materialize in this same pass.
-            if view.status == "ready" && view.agentless {
-                let reason = awaited_run(run, &step, view)?
-                    .map(|after| format!("waiting for `{after}` to complete"));
-                changed |=
-                    self.store
-                        .set_step_state(&view.subject, "working", reason.as_deref())?;
-                if step.spec.nested_mission.is_some() {
-                    continue;
-                }
-            }
-            changed |= self.materialize_step_declarations(run, &step, view, false)?;
-            if let Some(reason) = self.step_declaration_failure(&view.subject)? {
-                changed |= self
-                    .store
-                    .set_step_state(&view.subject, "failed", Some(&reason))?;
-                continue;
-            }
-            if self.step_timed_out(view, &step)? {
-                changed |= self.store.set_step_state(
-                    &view.subject,
-                    "failed",
-                    Some("the active execution timeout expired"),
-                )?;
-                continue;
-            }
-            if !self.step_declarations_hold(&view.subject)? {
-                continue;
-            }
-            if !view.agentless && !view.worker_reported {
-                continue;
-            }
-            if let Some(loop_spec) = &step.spec.loop_spec {
-                changed |= self.evaluate_loop_step(run, &step, view, loop_spec)?;
-                continue;
-            }
-            if let Some(nested) = &step.spec.nested_mission {
-                let nested_prefix = format!("{}/{}/", step.spec.path, nested.id);
-                if !views
-                    .iter()
-                    .filter(|(path, _)| path.starts_with(&nested_prefix))
-                    .all(|(_, child)| child.status == "completed")
-                {
-                    continue;
-                }
-            }
-            if step.spec.produces_mission.is_some()
-                && !self.produced_mission_holds(step.spec, view)?
-            {
-                continue;
-            }
-            if step.spec.uses_mission.is_some() {
-                let (use_changed, outcome) =
-                    self.evaluate_used_mission(run, &step, view, &views)?;
-                changed |= use_changed;
-                match outcome {
-                    UsedMissionOutcome::Pending => continue,
-                    UsedMissionOutcome::Completed => {}
-                    UsedMissionOutcome::Failed(reason) => {
+                    changed |= self.materialize_step_declarations(run, &step, view, false)?;
+                    if let Some(reason) = self.step_declaration_failure(&view.subject)? {
                         changed |=
                             self.store
                                 .set_step_state(&view.subject, "failed", Some(&reason))?;
-                        continue;
+                        return Ok(changed);
                     }
-                }
-            }
-            if let Some(after) = awaited_run(run, &step, view)? {
-                match self.store.mission_run_status(&after)?.as_deref() {
-                    Some("completed") => {}
-                    Some(status @ ("failed" | "cancelled")) => {
+                    if self.step_timed_out(view, &step)? {
                         changed |= self.store.set_step_state(
                             &view.subject,
                             "failed",
-                            Some(&format!("the awaited mission run `{after}` is {status}")),
+                            Some("the active execution timeout expired"),
                         )?;
-                        continue;
+                        return Ok(changed);
                     }
-                    _ => continue,
-                }
-            }
-            if let Some(missing) = self.missing_product(run, &step, view)? {
-                changed |= self.notify_missing_product(view, &missing)?;
-                continue;
-            }
-            let mut gates_pass = true;
-            for gate in &step.spec.gates {
-                match self.evaluate_mission_gate(run, &step, view, gate)? {
-                    GateOutcome::Pass => {}
-                    GateOutcome::Pending => {
-                        gates_pass = false;
-                        break;
+                    if !self.step_declarations_hold(&view.subject)? {
+                        return Ok(changed);
                     }
-                    GateOutcome::Fail(reason) => {
-                        changed |=
-                            self.store
-                                .set_step_state(&view.subject, "failed", Some(&reason))?;
-                        gates_pass = false;
-                        break;
+                    if !view.agentless && !view.worker_reported {
+                        return Ok(changed);
                     }
-                }
-            }
-            if gates_pass {
-                changed |= self
-                    .store
-                    .set_step_state(&view.subject, "completed", None)?;
-            }
+                    if let Some(loop_spec) = &step.spec.loop_spec {
+                        changed |= self.evaluate_loop_step(run, &step, view, loop_spec)?;
+                        return Ok(changed);
+                    }
+                    if let Some(nested) = &step.spec.nested_mission {
+                        let nested_prefix = format!("{}/{}/", step.spec.path, nested.id);
+                        if !views
+                            .iter()
+                            .filter(|(path, _)| path.starts_with(&nested_prefix))
+                            .all(|(_, child)| child.status == "completed")
+                        {
+                            return Ok(changed);
+                        }
+                    }
+                    if step.spec.produces_mission.is_some()
+                        && !self.produced_mission_holds(step.spec, view)?
+                    {
+                        return Ok(changed);
+                    }
+                    if step.spec.uses_mission.is_some() {
+                        let (use_changed, outcome) =
+                            self.evaluate_used_mission(run, &step, view, &views)?;
+                        changed |= use_changed;
+                        match outcome {
+                            UsedMissionOutcome::Pending => return Ok(changed),
+                            UsedMissionOutcome::Completed => {}
+                            UsedMissionOutcome::Failed(reason) => {
+                                changed |= self.store.set_step_state(
+                                    &view.subject,
+                                    "failed",
+                                    Some(&reason),
+                                )?;
+                                return Ok(changed);
+                            }
+                        }
+                    }
+                    if let Some(after) = awaited_run(run, &step, view)? {
+                        match self.store.mission_run_status(&after)?.as_deref() {
+                            Some("completed") => {}
+                            Some(status @ ("failed" | "cancelled")) => {
+                                changed |= self.store.set_step_state(
+                                    &view.subject,
+                                    "failed",
+                                    Some(&format!("the awaited mission run `{after}` is {status}")),
+                                )?;
+                                return Ok(changed);
+                            }
+                            _ => return Ok(changed),
+                        }
+                    }
+                    if let Some(missing) = self.missing_product(run, &step, view)? {
+                        changed |= self.notify_missing_product(view, &missing)?;
+                        return Ok(changed);
+                    }
+                    let mut gates_pass = true;
+                    for gate in &step.spec.gates {
+                        match self.evaluate_mission_gate(run, &step, view, gate)? {
+                            GateOutcome::Pass => {}
+                            GateOutcome::Pending => {
+                                gates_pass = false;
+                                break;
+                            }
+                            GateOutcome::Fail(reason) => {
+                                changed |= self.store.set_step_state(
+                                    &view.subject,
+                                    "failed",
+                                    Some(&reason),
+                                )?;
+                                gates_pass = false;
+                                break;
+                            }
+                        }
+                    }
+                    if gates_pass {
+                        changed |= self
+                            .store
+                            .set_step_state(&view.subject, "completed", None)?;
+                    }
+                    Ok(changed)
+                })
+                .unwrap_or(false);
         }
         if run.phase == "normal" {
             let refreshed = self
@@ -4089,8 +4126,31 @@ impl<R: RuntimeControl> Reconciler<R> {
                 .apply_internal(&intent, &format!("cleanup-mission-run:{}", run.generation))?;
             return Ok(response.changed || intake_stopped);
         }
+        // Cleanup waits for each owned runtime to stop, but not forever. A runtime on a host that
+        // never answers, or one that cannot be killed, would otherwise hold the run and its slot.
+        // Its stop declaration stays, so stopping continues after the run ends.
+        let mut unstopped = None;
         if !live.is_empty() {
-            return Ok(intake_stopped);
+            let since = self
+                .store
+                .latest_claim(&run.subject, Some("mission-run.state"))?
+                .filter(|claim| {
+                    claim.body.pointer("/fields/phase").and_then(Value::as_str)
+                        == Some(run.phase.as_str())
+                })
+                .map_or_else(now_ms, |claim| claim.accepted_at_unix_ms);
+            let deadline = since.saturating_add(self.cleanup_deadline.as_millis());
+            if now_ms() < deadline {
+                self.arm_restart(&format!("cleanup:{}", run.subject), deadline);
+                return Ok(intake_stopped);
+            }
+            unstopped = Some(format!(
+                "cleanup ended at its deadline with runtimes still live: {}",
+                live.iter()
+                    .map(|subject| subject.subject.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
         }
         let mut status = run.phase.strip_prefix("cleanup-").unwrap_or("failed");
         let mut changed = intake_stopped;
@@ -4105,7 +4165,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                         .and_then(Value::as_str)
                         .map(str::to_owned)
                 });
-            let mut runtime_cleanup_errors = Vec::new();
+            let mut runtime_cleanup_errors = unstopped.iter().cloned().collect::<Vec<_>>();
             match self.store.eval_runtime_records(&run.subject) {
                 Ok(records) => {
                     for (runtime_id, terminal) in records {
@@ -4176,9 +4236,9 @@ impl<R: RuntimeControl> Reconciler<R> {
             self.record_once(&run.subject, "eval.verdict", fields)?;
             changed = true;
         }
-        changed |= self
-            .store
-            .set_mission_run_state(&run.id, status, "terminal", None)?;
+        changed |=
+            self.store
+                .set_mission_run_state(&run.id, status, "terminal", unstopped.as_deref())?;
         Ok(changed)
     }
 
@@ -8712,8 +8772,16 @@ impl<R: RuntimeControl> Reconciler<R> {
                     GateOutcome::Fail(reason.into())
                 });
             }
+            // A runner that posted its verdict but never exits still has the gate's time limit.
+            let timed_out = self
+                .store
+                .latest_claim(&result_subject, Some("gate.requested"))?
+                .is_some_and(|requested| {
+                    now_ms().saturating_sub(requested.accepted_at_unix_ms)
+                        >= u128::from(time_limit_ms)
+                });
             match self.runtime.observe_exec(&runtime_id)? {
-                Some(observation) if observation.status == "running" => {
+                Some(observation) if observation.status == "running" && !timed_out => {
                     if let Ok(handle) = tokio::runtime::Handle::try_current() {
                         let notify = self.notify.clone();
                         handle.spawn(async move {
@@ -8723,10 +8791,13 @@ impl<R: RuntimeControl> Reconciler<R> {
                     }
                     return Ok(GateOutcome::Pending);
                 }
-                Some(observation) if observation.status == "indeterminate" => {
+                Some(observation) if observation.status == "indeterminate" && !timed_out => {
                     return Ok(GateOutcome::Pending);
                 }
                 _ => {}
+            }
+            if timed_out {
+                self.stop_gate_runner(&result_subject, true)?;
             }
             let token_usage = self
                 .runtime
@@ -8742,6 +8813,11 @@ impl<R: RuntimeControl> Reconciler<R> {
                     token_usage,
                 ),
                 Some(token_usage) => (verdict, reason.into(), token_usage),
+                None if timed_out => (
+                    "fail",
+                    format!("LLM gate `{name}` exceeded {time_limit_ms}ms"),
+                    0,
+                ),
                 None => (
                     "fail",
                     format!("LLM gate `{name}` did not report structured token usage"),
@@ -13538,6 +13614,117 @@ mission "render-retire" state="ready" { goal "Retire a broken renderer."; step "
                 .pointer("/fields/verdict")
                 .and_then(Value::as_str),
             Some("fail")
+        );
+    }
+
+    /// A gate stuck in verifying: its runner posted a verdict without token usage and never
+    /// exited. The gate's time limit still ends it.
+    #[test]
+    fn an_llm_gate_whose_runner_never_exits_fails_at_its_time_limit() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        let source = r#"
+            version 2
+
+              mission "proof" state="ready" {
+                goal "Complete mission proof."
+                step "review" {
+                  title "A held-out gate accepts the result"
+                  gate "review" type="llm" {
+                    model "claude-sonnet"
+                    host "node"
+                    workspace "."
+                    tools "shell"
+                    token-budget 10
+                    time-limit "1s"
+                    prompt "Inspect the result."
+                  }
+                }
+              }
+
+        "#;
+        apply_source(&store, source, "mission-llm-hang");
+        store
+            .create_mission_run(&crate::model::MissionRunRequest {
+                mission: "proof".into(),
+                revision: None,
+                workspace: "/tmp".into(),
+                requester: Some("person/test".into()),
+                mode: Some("run".into()),
+                inputs: BTreeMap::new(),
+                idempotency_key: "run-llm-hang".into(),
+            })
+            .unwrap();
+        let runtime = Arc::new(FakeRuntime::default());
+        let reconciler = Reconciler::new(
+            store.clone(),
+            runtime.clone(),
+            "node".into(),
+            Arc::new(Notify::new()),
+        );
+        reconciler.reconcile_once().unwrap();
+        reconciler.reconcile_once().unwrap();
+        let (runtime_id, result_subject) = {
+            let members = runtime.started_members.lock().unwrap();
+            let gate = members
+                .iter()
+                .find(|member| member.driver.as_deref() == Some("llm-gate"))
+                .unwrap();
+            (
+                gate.runtime_id.clone(),
+                gate.environment["ST_GATE_SUBJECT"].clone(),
+            )
+        };
+        store
+            .append_claim(&ClaimInput {
+                subject: result_subject.clone(),
+                kind: "gate.result".into(),
+                actor: None,
+                fields: BTreeMap::from([
+                    ("verdict".into(), Value::String("pass".into())),
+                    ("reason".into(), Value::String("it looks right".into())),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some("llm-posted-result".into()),
+            })
+            .unwrap();
+        runtime.execs.lock().unwrap().insert(
+            runtime_id.clone(),
+            RuntimeObservation {
+                runtime_id: runtime_id.clone(),
+                terminal: false,
+                status: "running".into(),
+                exit_code: None,
+                incarnation_id: Some("gate-run".into()),
+            },
+        );
+        reconciler.reconcile_once().unwrap();
+        assert!(
+            store
+                .latest_claim(&result_subject, Some("gate.result"))
+                .unwrap()
+                .unwrap()
+                .body
+                .pointer("/fields/token_usage")
+                .is_none(),
+            "the gate settled before its time limit"
+        );
+        std::thread::sleep(Duration::from_millis(1_100));
+        reconciler.reconcile_once().unwrap();
+        let result = store
+            .latest_claim(&result_subject, Some("gate.result"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.body["fields"]["verdict"], "fail");
+        assert!(
+            result.body["fields"]["reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("exceeded")),
+            "{result:#?}"
+        );
+        assert!(
+            runtime.stops.lock().unwrap().contains(&runtime_id)
+                || runtime.kills.lock().unwrap().contains(&runtime_id)
         );
     }
 
@@ -18970,11 +19157,26 @@ version 2
         for _ in 0..8 {
             reconciler.reconcile_once().unwrap();
         }
-        let fault = store
-            .reconcile_fault(&collision.subject, "mission-run")
+        // The second step to declare the runtime faults; the run and its first step do not.
+        let faults = store
+            .mission_run(&collision.id)
             .unwrap()
-            .expect("the colliding run records its fault");
-        assert!(fault.contains("more than one mission or step"), "{fault}");
+            .unwrap()
+            .steps
+            .iter()
+            .filter_map(|step| store.reconcile_fault(&step.subject, "step").unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(faults.len(), 1, "{faults:?}");
+        assert!(
+            faults[0].contains("more than one mission or step"),
+            "{faults:?}"
+        );
+        assert_eq!(
+            store
+                .reconcile_fault(&collision.subject, "mission-run")
+                .unwrap(),
+            None
+        );
         assert_eq!(
             store.mission_run(&later.id).unwrap().unwrap().status,
             "completed"
