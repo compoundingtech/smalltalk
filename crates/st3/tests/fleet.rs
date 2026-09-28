@@ -964,15 +964,27 @@ async fn uninstall_leaves_nothing_behind() {
         PERSON,
     ]);
 
-    // Only what the test itself created remains: empty XDG roots and the stub pty.
+    // Only what the test itself created remains: empty XDG roots, the stub pty, and the login
+    // profiles that put it on PATH.
     let mut remaining = Vec::new();
     for entry in walkdir::WalkDir::new(&b.root) {
         let entry = entry.unwrap();
         let relative = entry.path().strip_prefix(&b.root).unwrap().to_path_buf();
         let expected = relative.as_os_str().is_empty()
-            || ["home", "config", "state", "data", "run", "bin", "bin/pty"]
-                .iter()
-                .any(|kept| relative == Path::new(kept))
+            || [
+                "home",
+                "home/.profile",
+                "home/.bash_profile",
+                "home/.zprofile",
+                "config",
+                "state",
+                "data",
+                "run",
+                "bin",
+                "bin/pty",
+            ]
+            .iter()
+            .any(|kept| relative == Path::new(kept))
             || relative.to_string_lossy().ends_with(".log");
         if !expected {
             remaining.push(relative);
