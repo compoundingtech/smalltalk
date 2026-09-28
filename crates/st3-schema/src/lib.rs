@@ -1746,6 +1746,7 @@ fn claim_specs() -> BTreeMap<String, ClaimSpec> {
                 "mission-run",
                 "observer",
                 "schedule",
+                "step-run",
                 "subscription",
             ],
             WritePolicy::SystemOnly,
