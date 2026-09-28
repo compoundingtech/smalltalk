@@ -1,0 +1,20 @@
+# New mission needs every field, then creates a launch.
+appId: com.compoundingtech.smalltalk.starter
+---
+- launchApp:
+    stopApp: true
+- openLink: com.compoundingtech.smalltalk.starter://demo
+- tapOn: "Missions, tab.*"
+- tapOn: New mission
+- tapOn: Create the launch
+- assertVisible: fill in title
+- tapOn: ".*Nightly dependency audit.*"
+- inputText: Nightly audit
+- tapOn: ".*planner turns it into a mission.*"
+- inputText: Audit harbor every night
+- tapOn: ".*like fleet/harbor/nightly-audit.*"
+- inputText: fleet/harbor/nightly-audit
+- tapOn: The directory the agents work in
+- inputText: ~/src/harbor
+- tapOn: Create the launch
+- assertVisible: ".*Launch created · demo: nothing was sent.*"

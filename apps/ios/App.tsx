@@ -7,6 +7,8 @@ import { DarkTheme, NavigationContainer, type LinkingOptions, type ParamListBase
 import { createBottomTabNavigator } from '@react-navigation/bottom-tabs';
 import { createNativeStackNavigator, type NativeStackNavigationOptions } from '@react-navigation/native-stack';
 import { SafeAreaProvider, SafeAreaView } from 'react-native-safe-area-context';
+import { GestureHandlerRootView } from 'react-native-gesture-handler';
+import { NewMissionScreen, TerminalScreen } from './controlScreens';
 import { API_VERSION, St3Client } from '../../clients/typescript/st3-client';
 import { useDemoStore } from './demoStore';
 import { errorText, useLiveStore } from './liveStore';
@@ -49,6 +51,7 @@ const AgentsStack = () => (
   <Stack.Navigator initialRouteName="Agents" screenOptions={stackOptions}>
     <Stack.Screen name="Agents" component={AgentsScreen} options={listOptions('Agents')} />
     <Stack.Screen name="Agent" component={AgentScreen} options={{ title: '' }} />
+    <Stack.Screen name="Terminal" component={TerminalScreen} options={{ title: 'Terminal' }} />
   </Stack.Navigator>
 );
 const MissionsStack = () => (
@@ -109,7 +112,7 @@ const linking: LinkingOptions<ParamListBase> | undefined = __DEV__ ? {
       Tabs: {
         screens: {
           HomeTab: { screens: { Home: 'home', Attention: 'attention' } },
-          AgentsTab: { screens: { Agents: 'agents', Agent: 'agent' } },
+          AgentsTab: { screens: { Agents: 'agents', Agent: 'agent', Terminal: 'terminal' } },
           MissionsTab: { screens: { Missions: 'missions', Mission: 'mission', Declaration: 'declaration' } },
           FleetTab: { screens: { Fleet: 'fleet', Machine: 'machine' } },
           WorktreesTab: { screens: { Worktrees: 'worktrees', Worktree: 'worktree' } },
@@ -118,6 +121,7 @@ const linking: LinkingOptions<ParamListBase> | undefined = __DEV__ ? {
       Peek: 'peek',
       AgentDetails: 'details',
       Settings: 'settings',
+      NewMission: 'new-mission',
     },
     // Nested screens are typed per param list; these routes are untyped by design.
   } as unknown as LinkingOptions<ParamListBase>['config'],
@@ -132,6 +136,7 @@ function Navigation({ store }: { store: Store }) {
           <Stack.Screen name="Peek" component={PeekScreen} options={{ presentation: 'formSheet', sheetAllowedDetents: [0.45, 0.9], sheetGrabberVisible: true, headerShown: false }} />
           <Stack.Screen name="AgentDetails" component={AgentDetailsScreen} options={{ presentation: 'formSheet', sheetAllowedDetents: [0.6, 1], sheetGrabberVisible: true, headerShown: false }} />
           <Stack.Screen name="Settings" component={SettingsScreen} options={{ presentation: 'modal', title: 'Settings' }} />
+          <Stack.Screen name="NewMission" component={NewMissionScreen} options={{ presentation: 'modal', title: 'New mission' }} />
         </Stack.Navigator>
       </NavigationContainer>
     </StoreContext.Provider>
@@ -231,7 +236,7 @@ export default function App() {
       default: return null;
     }
   }, [mode, leave]);
-  if (content) return <SafeAreaProvider>{content}</SafeAreaProvider>;
+  if (content) return <GestureHandlerRootView style={local.root}><SafeAreaProvider>{content}</SafeAreaProvider></GestureHandlerRootView>;
 
   return (
     <SafeAreaProvider>
@@ -265,6 +270,7 @@ export default function App() {
 }
 
 const local = StyleSheet.create({
+  root: { flex: 1 },
   brand: { color: colors.text, fontSize: 28, fontWeight: '800', marginVertical: 8 },
   input: { color: colors.text, backgroundColor: colors.mantle, borderRadius: 10, padding: 12, fontSize: 15 },
   demoIcon: { width: 24, alignItems: 'center' },

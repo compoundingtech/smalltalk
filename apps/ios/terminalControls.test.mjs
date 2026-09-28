@@ -46,3 +46,24 @@ await assert.rejects(withFreshTerminalFence(
   async () => { throw new Error('offline'); },
 ), /offline/);
 assert.equal(nonStaleAttempts, 1);
+
+// An agent's terminal: the bounded runtime list first, then each of its runtimes by id.
+{
+  const { findAgentTerminal, detachTerminal } = await import('./terminalControls.ts');
+  const agent = { id: 'agent/a', runtime_ids: ['runtime/old', 'runtime/live'] };
+  assert.equal(await findAgentTerminal(agent, [{ id: 'runtime/x', owner_id: 'agent/a', terminal_id: 'terminal/x' }], async () => null), 'terminal/x');
+  const asked = [];
+  const found = await findAgentTerminal(agent, [], async id => { asked.push(id); if (id === 'runtime/old') throw new Error('gone'); return { id, owner_id: 'agent/a', terminal_id: 'terminal/live' }; });
+  assert.equal(found, 'terminal/live');
+  assert.deepEqual(asked, ['runtime/old', 'runtime/live']);
+  assert.equal(await findAgentTerminal({ id: 'agent/b', runtime_ids: [] }, [], async () => null), null);
+
+  // Leaving detaches the attachment with a fresh fence.
+  const calls = [];
+  await detachTerminal({
+    terminalScreen: async () => ({ snapshot: { id: 'snapshot/9' }, value: { runtime_incarnation: 'inc/1', next_sequence: 4 } }),
+    terminalDetach: async input => { calls.push(input); return {}; },
+  }, { attachment_id: 'attachment/1', terminal_id: 'terminal/live', runtime_incarnation: 'inc/1' }, () => 'action/d');
+  assert.deepEqual(calls[0].parameters, { target_id: 'attachment/1' });
+  assert.equal(calls[0].fence.terminal_sequence, 4);
+}

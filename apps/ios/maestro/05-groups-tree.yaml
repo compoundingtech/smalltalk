@@ -1,0 +1,17 @@
+# The Groups/Tree switch on Agents and Missions.
+appId: com.compoundingtech.smalltalk.starter
+---
+- launchApp:
+    stopApp: true
+- openLink: com.compoundingtech.smalltalk.starter://demo
+- tapOn: "Agents, tab.*"
+- tapOn: Tree
+- assertVisible: ".*▾ atlas/.*"
+- assertNotVisible: waiting on you
+- tapOn: Groups
+- assertVisible: waiting on you
+- tapOn: "Missions, tab.*"
+- tapOn: Tree
+- assertVisible: ".*▾ release/.*"
+- tapOn: Groups
+- assertVisible: stalled

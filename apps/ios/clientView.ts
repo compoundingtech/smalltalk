@@ -18,6 +18,8 @@ export type World = {
   missions: Load<Mission[]>;
   machines: Load<Machine[]>;
   worktrees: Load<Worktree[]>;
+  /** The person's paired devices. */
+  devices: Load<Device[]>;
   conversations: Record<string, Load<Entry[]>>;
   /** Missions nobody needs the person for, counted so Home can say what it is not showing. */
   quiet_missions: number;
@@ -84,6 +86,8 @@ export type Agent = {
   unmanaged: boolean;
   parent: string | null;
   details: AgentDetails;
+  /** A live terminal the person can open. */
+  terminal: boolean;
 };
 
 /** What the details section shows about an agent. Every field is optional: st may not say. */
@@ -161,6 +165,8 @@ export type Worktree = {
   agents: string[];
   missions: string[];
 };
+
+export type Device = { id: string; name: string; state: string; scopes: string[]; expires: string };
 
 export type Entry = { id: string; at: string; body: Body };
 export type ToolState = 'running' | 'ok' | 'failed';
@@ -257,6 +263,7 @@ const agentRead = struct<Agent>({
   id: str, name: str, harness, state: oneOf<AgentState>('needs_you', 'fault', 'working', 'idle', 'starting', 'stopped', 'unknown'),
   host: str, worktree: nullable(str), mission: nullable(str), step: nullable(str), activity: str, unmanaged: bool, parent: nullable(str),
   details: struct<AgentDetails>({ goal: nullable(str), claimed: nullable(str), next: nullable(str), queue: list(str), queued: num, harness_state: nullable(str), runtime: nullable(str), fault: nullable(str), under: nullable(str) }),
+  terminal: bool,
 });
 const stepRead = struct<Step>({
   name: str, state: oneOf<StepState>('done', 'working', 'ready', 'waiting', 'needs_you', 'failed', 'pending'), owner: nullable(str), note: nullable(str),
@@ -267,6 +274,7 @@ const missionRead = struct<Mission>({
   age: str, host: str, goals: list(str), steps: list(stepRead), agents: list(str), decision: nullable(str), worktree: nullable(str), parent: nullable(str), system: bool, kdl: nullable(str),
 });
 const machineRead = struct<Machine>({ name: str, online: bool, platform: str, seen: str, load: nullable(str), links: list(tuple<[string, boolean, string]>(str, bool, str)), you_are_here: bool });
+const deviceRead = struct<Device>({ id: str, name: str, state: str, scopes: list(str), expires: str });
 const worktreeRead = struct<Worktree>({ path: str, host: str, branch: str, ahead: num, behind: num, dirty: num, agents: list(str), missions: list(str) });
 
 export const readBody: Reader<Body> = (value, path) => {
@@ -298,7 +306,7 @@ export function decodeWorld(value: unknown): World {
   return struct<World>({
     person: str, host: str, link: linkRead,
     attention: load(list(attentionRead)), agents: load(list(agentRead)), missions: load(list(missionRead)),
-    machines: load(list(machineRead)), worktrees: load(list(worktreeRead)),
+    machines: load(list(machineRead)), worktrees: load(list(worktreeRead)), devices: load(list(deviceRead)),
     conversations: () => conversations, quiet_missions: num,
   })(value, 'world');
 }

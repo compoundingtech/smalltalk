@@ -2,7 +2,8 @@
 // every screen works the same on invented data and on the graph.
 
 import { createContext, useContext } from 'react';
-import type { Attention, Mission, World } from './clientView';
+import type { TerminalLine } from '../../clients/typescript/st3-client/Models.generated';
+import type { Agent, Attention, Mission, World } from './clientView';
 
 /** A card's buttons, named by what the person means rather than by st action. */
 export type CardAction =
@@ -17,6 +18,22 @@ export type CardAction =
   | 'read'; // message
 
 export type MissionAction = 'retry' | 'restart' | 'cancel';
+
+/** One terminal screen: its lines with colours and styles, and its size. */
+export type TerminalView = { lines: TerminalLine[]; columns: number; rows: number; cursor?: { row: number; column: number; visible: boolean } };
+
+export type TerminalHandlers = {
+  /** Each screen replaces the one before it. */
+  onScreen: (screen: TerminalView) => void;
+  /** A problem to show; an empty string clears it. */
+  onIssue: (issue: string) => void;
+};
+
+/** An open terminal. Closing it detaches. */
+export type TerminalSession = { close(): void; send(mode: 'line' | 'key', value: string): Promise<boolean> };
+
+/** The New mission form: it creates a launch, which a planner turns into a proposal on Home. */
+export type NewMission = { title: string; request: string; mission: string; workspace: string };
 
 export type Store = {
   mode: 'demo' | 'live';
@@ -38,6 +55,12 @@ export type Store = {
   send(agent: string, text: string): Promise<boolean>;
   snooze(item: string): void;
   missionAction(mission: Mission, action: MissionAction): Promise<void>;
+  /** Attach to an agent's terminal and follow its screen until closed. */
+  openTerminal(agent: Agent, handlers: TerminalHandlers): TerminalSession;
+  /** Whether this device may type into terminals (`terminal.input`). */
+  canTypeInTerminals: boolean;
+  createLaunch(form: NewMission): Promise<boolean>;
+  revokeDevice(id: string): Promise<boolean>;
   /** Leave demo mode, or forget the paired device. */
   leave(): Promise<void>;
   /** For the settings screen: where this app reads from. */

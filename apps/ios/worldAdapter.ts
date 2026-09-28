@@ -3,8 +3,8 @@
 // A collection that has not loaded yet becomes `loading`, never an empty list, and one that
 // failed says why. Anything the graph does not say stays unsaid.
 
-import type { Agent as GraphAgent, Attention as GraphAttention, Mission as GraphMission, Runtime, Work } from '../../clients/typescript/st3-client';
-import type { Agent, AgentState, Attention, AttentionKind, Entry, Harness, Load, Machine, Mission, MissionPreview, PreviewAgent, PreviewStep, Step, StepState, Tier, Word, World, Worktree } from './clientView';
+import type { Agent as GraphAgent, Attention as GraphAttention, Device as GraphDevice, Mission as GraphMission, Runtime, Work } from '../../clients/typescript/st3-client';
+import type { Agent, AgentState, Attention, AttentionKind, Device, Entry, Harness, Load, Machine, Mission, MissionPreview, PreviewAgent, PreviewStep, Step, StepState, Tier, Word, World, Worktree } from './clientView';
 import { emptyDetails } from './clientView.ts';
 import { short, trimPrefix } from './harnessConversation.ts';
 import { cleanMessageText, lines, trim } from './messageText.ts';
@@ -25,7 +25,7 @@ export type Collection<T> = { items: T[]; loaded: boolean; error?: string };
 export const notLoaded = <T>(): Collection<T> => ({ items: [], loaded: false });
 
 export type Graph = {
-  /** The paired person, e.g. `person/robin`. */
+  /** The paired person, e.g. `person/robin` (never the device's session actor). */
   actor: string;
   /** The gateway's host, e.g. `host/lark`, once a read has said. */
   hostId: string | null;
@@ -36,6 +36,7 @@ export type Graph = {
   machines: Collection<GraphMachine>;
   runtimes: Collection<Runtime>;
   sessions: Collection<GraphSession>;
+  devices: Collection<GraphDevice>;
 };
 
 /** A message behind an unread-message item: sender, title and text. */
@@ -127,6 +128,13 @@ export function keepsOpen(path: string): boolean {
   return ['keep-watch', 'retire', 'steward-intake', 'standing', 'keep-open'].includes(name) || name.endsWith('-retirement');
 }
 
+/** The person a paired device acts for. Its session actor is `person/robin/session/…`; the
+ * person is what attention, devices and message headers are addressed to. */
+export function personOf(sessionActor: string, devices: readonly { session_actor: string; person_id: string }[]): string {
+  return devices.find(device => device.session_actor === sessionActor)?.person_id
+    ?? sessionActor.replace(/^(person\/[^/]+)\/.*$/, '$1');
+}
+
 const hostName = (id: string) => trimPrefix(id, 'host/');
 
 function loaded<T>(collection: Collection<unknown>, value: T): Load<T> {
@@ -151,6 +159,7 @@ export function world(graph: Graph, extras: Extras, now: number): World {
     missions: loaded(missionsCollection, missionsView),
     machines: loaded(graph.machines, machines(graph, now)),
     worktrees: extras.worktrees,
+    devices: loaded(graph.devices, devices(graph, now)),
     conversations: extras.conversations,
     quiet_missions: quiet,
   };
@@ -320,6 +329,10 @@ function agents(graph: Graph, now: number): Agent[] {
         fault: agent.fault ?? null,
         under: parent ? (parentAgent ? agentLabel(parentAgent) : short(parent)) : null,
       },
+      // The runtime list is bounded, so an agent's runtime may be missing from it; a running
+      // agent with a runtime is worth trying, and opening fetches its runtimes by id.
+      terminal: graph.runtimes.items.some(candidate => candidate.owner_id === agent.id && !!candidate.terminal_id)
+        || (agent.runtime_ids.length > 0 && agent.state !== 'stopped' && agent.state !== 'failed'),
     };
   });
   const gateway = graph.hostId ? hostName(graph.hostId) : '';
@@ -338,6 +351,7 @@ function agents(graph: Graph, now: number): Agent[] {
       unmanaged: true,
       parent: null,
       details: emptyDetails(),
+      terminal: false,
     };
   });
   return [...declared, ...undeclared];
@@ -425,6 +439,28 @@ function machines(graph: Graph, now: number): Machine[] {
     load: `${machine.occupancy.running_runtimes} running runtimes`,
     links: machine.transports.map((transport): [string, boolean, string] => [transport.protocol, ['ok', 'connected', 'reachable', 'healthy'].includes(transport.status), transport.status]),
     you_are_here: graph.hostId !== null && machine.host_id === graph.hostId,
+  }));
+}
+
+// -------------------------------------------------------------------- devices
+
+/** "in 83 days", "2 days ago": when a device's pairing expires, relative to now. */
+export function expiresIn(then: string, now: number): string {
+  const at = Date.parse(then);
+  if (Number.isNaN(at)) return then;
+  const seconds = Math.floor(Math.abs(at - now) / 1000);
+  const [count, unit] = seconds < 3600 ? [Math.floor(seconds / 60), 'minute'] : seconds < 86400 ? [Math.floor(seconds / 3600), 'hour'] : [Math.floor(seconds / 86400), 'day'];
+  const span = `${count} ${unit}${count === 1 ? '' : 's'}`;
+  return at >= now ? `in ${span}` : `${span} ago`;
+}
+
+function devices(graph: Graph, now: number): Device[] {
+  return graph.devices.items.filter(device => device.person_id === graph.actor || !graph.actor).map(device => ({
+    id: device.id,
+    name: device.name ?? trimPrefix(device.id, 'device/'),
+    state: device.state,
+    scopes: [...device.scopes],
+    expires: expiresIn(device.expires_at, now),
   }));
 }
 

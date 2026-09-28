@@ -1,0 +1,15 @@
+# A card's binding button arms on the first tap and acts on the second; the item then leaves Home.
+appId: com.compoundingtech.smalltalk.starter
+---
+- launchApp:
+    stopApp: true
+- openLink: com.compoundingtech.smalltalk.starter://demo
+- tapOn: ".*Approve the atlas store cut-over.*"
+- assertVisible: Request changes
+- tapOn: Approve
+- assertVisible: "Approve\\? Tap again"
+- tapOn: "Approve\\? Tap again"
+- assertVisible: ".*Approved · demo: nothing was sent.*"
+- assertVisible: ".*This item is no longer open.*"
+- tapOn: "Back to Home"
+- assertNotVisible: ".*Approve the atlas store cut-over.*"

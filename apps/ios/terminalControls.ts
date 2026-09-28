@@ -1,5 +1,5 @@
 import type { St3Client, TerminalStream } from '../../clients/typescript/st3-client';
-import type { Fence, TerminalScreen } from '../../clients/typescript/st3-client/Models.generated';
+import type { Fence, Runtime, TerminalAttachment, TerminalScreen } from '../../clients/typescript/st3-client/Models.generated';
 
 type TerminalFence = Fence & Required<Pick<Fence, 'runtime_incarnation' | 'terminal_sequence'>>;
 
@@ -45,6 +45,8 @@ export type TerminalFollowHandlers = {
   onScreen: (screen: TerminalScreen) => void;
   /** A problem to show; an empty string clears it. */
   onIssue: (issue: string) => void;
+  /** Each attachment the follow makes, so leaving the view can detach it. */
+  onAttached?: (attachment: TerminalAttachment) => void;
 };
 
 function errorCode(error: unknown): string | undefined {
@@ -98,6 +100,7 @@ export function followTerminal(
       });
       const attachment = result.value.terminal_attachment;
       if (!attachment?.stream_capability) throw new Error('The gateway returned no terminal stream.');
+      handlers.onAttached?.(attachment);
       if (closed) return;
       stream = await client.terminalStream(terminalId, {
         streamCapability: attachment.stream_capability,
@@ -117,4 +120,47 @@ export function followTerminal(
 
   void open();
   return { close() { closed = true; clearTimeout(timer); stream?.close(); } };
+}
+
+/** Leaving the view detaches: the attachment is released against a fresh terminal fence. */
+export async function detachTerminal(
+  client: Pick<St3Client, 'terminalScreen' | 'terminalDetach'>,
+  attachment: Pick<TerminalAttachment, 'attachment_id' | 'terminal_id' | 'runtime_incarnation'>,
+  newActionId: () => string,
+): Promise<void> {
+  await withFreshTerminalFence(client, attachment.terminal_id, attachment.runtime_incarnation, fence => {
+    const id = newActionId();
+    return client.terminalDetach({ id, idempotency_key: id, fence, parameters: { target_id: attachment.attachment_id } });
+  });
+}
+
+/** The keys a person can send, by the names st's terminal input takes. */
+export const TERMINAL_KEYS = [
+  { label: 'Enter', value: 'return' },
+  { label: 'Tab', value: 'tab' },
+  { label: 'Esc', value: 'escape' },
+  { label: '↑', value: 'Up' },
+  { label: '↓', value: 'Down' },
+] as const;
+export const INTERRUPT_KEY = 'C-c';
+
+/** How long a terminal may take to send its first screen before the view says so. */
+export const FIRST_SCREEN_MS = 15_000;
+
+type RuntimeTerminal = Pick<Runtime, 'id' | 'owner_id' | 'terminal_id'>;
+
+/** The terminal behind an agent. The runtime list is bounded, so when it does not name one,
+ * ask for each of the agent's runtimes by id until one has a terminal. */
+export async function findAgentTerminal(
+  agent: { id: string; runtime_ids: readonly string[] },
+  known: readonly RuntimeTerminal[],
+  getRuntime: (id: string) => Promise<RuntimeTerminal | null>,
+): Promise<string | null> {
+  const listed = known.find(runtime => runtime.owner_id === agent.id && runtime.terminal_id);
+  if (listed?.terminal_id) return listed.terminal_id;
+  for (const id of agent.runtime_ids) {
+    const runtime = await getRuntime(id).catch(() => null);
+    if (runtime?.terminal_id) return runtime.terminal_id;
+  }
+  return null;
 }

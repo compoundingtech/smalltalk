@@ -1,0 +1,15 @@
+# A paired device is revoked only after a confirmation.
+appId: com.compoundingtech.smalltalk.starter
+---
+- launchApp:
+    stopApp: true
+- openLink: com.compoundingtech.smalltalk.starter://demo
+- tapOn: "Fleet, tab.*"
+- scrollUntilVisible:
+    element: ".*Old tablet.*"
+- assertVisible: ".*Old tablet.*"
+- tapOn:
+    text: Revoke
+    index: 1
+- tapOn: "Revoke\\? Tap again"
+- assertVisible: ".*Device revoked · demo: nothing was sent.*"

@@ -14,6 +14,10 @@ const fixture = name => JSON.parse(readFileSync(new URL(`../../fixtures/clients/
   const world = decodeWorld(raw);
   assert.deepStrictEqual(JSON.parse(JSON.stringify(world)), raw);
   assert.throws(() => decodeWorld({ ...raw, surprise: true }), /no such field/);
+  // The contract names the person's devices and a terminal flag on each agent.
+  assert.deepStrictEqual(world.devices.value.map(device => device.id), ['device/phone', 'device/tablet']);
+  assert.ok(world.agents.value.every(agent => typeof agent.terminal === 'boolean'));
+  assert.equal(world.agents.value.find(agent => agent.unmanaged).terminal, false);
 }
 
 // The words, glyphs and tabs match stui.

@@ -1,0 +1,16 @@
+# Every tab responds to a tap.
+appId: com.compoundingtech.smalltalk.starter
+---
+- launchApp:
+    stopApp: true
+- openLink: com.compoundingtech.smalltalk.starter://demo
+- tapOn: "Agents, tab.*"
+- assertVisible: waiting on you
+- tapOn: "Missions, tab.*"
+- assertVisible: New mission
+- tapOn: "Fleet, tab.*"
+- assertVisible: ".*you are here.*"
+- tapOn: "Worktrees, tab.*"
+- assertVisible: DEMO DATA
+- tapOn: "Home, tab.*"
+- assertVisible: somebody is stopped on you

@@ -1,0 +1,14 @@
+# An agent's terminal opens in place; Ctrl-C needs a second tap.
+appId: com.compoundingtech.smalltalk.starter
+---
+- launchApp:
+    stopApp: true
+- openLink: com.compoundingtech.smalltalk.starter://demo
+# A link sent before navigation mounts is dropped: wait for Home first.
+- assertVisible: somebody is stopped on you
+- openLink: com.compoundingtech.smalltalk.starter://agent?id=agent/fleet/atlas/builder
+- tapOn: Terminal
+- assertVisible: ".*Working on the cut-over review.*"
+- tapOn: Ctrl-C
+- tapOn: "Interrupt it\\? Tap again"
+- assertVisible: ".*demo: keys are not sent.*"

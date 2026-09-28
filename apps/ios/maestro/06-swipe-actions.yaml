@@ -1,0 +1,19 @@
+# Swipe actions: a Home row offers its card's primary action; an agent row offers Message and Details.
+appId: com.compoundingtech.smalltalk.starter
+---
+- launchApp:
+    stopApp: true
+- openLink: com.compoundingtech.smalltalk.starter://demo
+- swipe:
+    from: ".*Release Captain keeps restarting.*"
+    direction: LEFT
+- tapOn: Resolve
+- tapOn: Tap again
+- assertVisible: ".*Marked resolved · demo: nothing was sent.*"
+- assertNotVisible: ".*Release Captain keeps restarting.*"
+- tapOn: "Agents, tab.*"
+- swipe:
+    from: ".*Chief of Staff.*"
+    direction: LEFT
+- tapOn: Details
+- assertVisible: runs as

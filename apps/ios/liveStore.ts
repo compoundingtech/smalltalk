@@ -6,8 +6,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { AppState } from 'react-native';
 import * as Crypto from 'expo-crypto';
-import { ClientError, St3Client, type Agent as GraphAgent, type Attention as GraphAttention, type Fence, type LaunchVariant, type Message, type Mission as GraphMission, type Page, type Resource, type Runtime, type TimelineEntry, type Work } from '../../clients/typescript/st3-client';
-import type { Attention, Entry, Load, Mission, MissionPreview } from './clientView';
+import { ClientError, St3Client, type Agent as GraphAgent, type Device as GraphDevice, type Attention as GraphAttention, type Fence, type LaunchVariant, type Message, type Mission as GraphMission, type Page, type Resource, type Runtime, type TimelineEntry, type Work } from '../../clients/typescript/st3-client';
+import type { Agent, Attention, Entry, Load, Mission, MissionPreview } from './clientView';
 import { listCollectionPages, withConcurrency } from './collectionPages';
 import { demoWorld } from './demoStore';
 import { ForegroundGate } from './foreground';
@@ -16,8 +16,10 @@ import { clock, conversation } from './harnessConversation';
 import { coalescedRefreshDelay } from './refreshFlight';
 import { aboutText, aboutTitle, chatTarget, reconcilePending, withPending, type PendingSend } from './screenModel';
 import { isSnapshotChurn, listSessionPages } from './sessionView';
-import type { CardAction, MissionAction, Store } from './store';
-import { names, notLoaded, openAttention, preview, sessionFor, world, type Collection, type Graph, type GraphMachine, type GraphSession, type MessageBody } from './worldAdapter';
+import type { CardAction, MissionAction, NewMission, Store, TerminalHandlers, TerminalSession } from './store';
+import { detachTerminal, findAgentTerminal, FIRST_SCREEN_MS, followTerminal, withFreshTerminalFence } from './terminalControls';
+import type { TerminalAttachment } from '../../clients/typescript/st3-client/Models.generated';
+import { names, notLoaded, openAttention, personOf, preview, sessionFor, world, type Collection, type Graph, type GraphMachine, type GraphSession, type MessageBody } from './worldAdapter';
 
 export function errorText(error: unknown): string {
   return error instanceof ClientError ? `${error.response.code}: ${error.message}` : error instanceof Error ? error.message : String(error);
@@ -43,7 +45,7 @@ const worktrees = () => (demoWorktrees ??= demoWorld().worktrees);
 
 const emptyGraph = (): Graph => ({
   actor: '', hostId: null,
-  attention: notLoaded(), agents: notLoaded(), missions: notLoaded(), work: notLoaded(), machines: notLoaded(), runtimes: notLoaded(), sessions: notLoaded(),
+  attention: notLoaded(), agents: notLoaded(), missions: notLoaded(), work: notLoaded(), machines: notLoaded(), runtimes: notLoaded(), sessions: notLoaded(), devices: notLoaded(),
 });
 
 /** The newest timeline entries, merged with what was already read (streaming entries revise in place). */
@@ -67,6 +69,7 @@ export function useLiveStore({ url, credential, leave }: { url: string; credenti
   const graphRef = useRef(graph);
   graphRef.current = graph;
   const [live, setLive] = useState(false);
+  const [canType, setCanType] = useState(false);
   const [offline, setOffline] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [snoozed, setSnoozed] = useState<ReadonlySet<string>>(new Set());
@@ -88,6 +91,8 @@ export function useLiveStore({ url, credential, leave }: { url: string; credenti
   const hot = useRef(new Map<string, number>());
   const fetchedAt = useRef(new Map<string, number>());
   const stale = useRef(new Set<string>());
+  /** The session each conversation was last read from, so a newly known session reads at once. */
+  const readSession = useRef(new Map<string, string | null>());
   const requestedAttention = useRef(new Set<string>());
   const [watchVersion, setWatchVersion] = useState(0);
 
@@ -114,6 +119,7 @@ export function useLiveStore({ url, credential, leave }: { url: string; credenti
             () => listCollectionPages(options => client.machinesList(options), limit).then(result => result.pages.flatMap(page => page.value.items as unknown as GraphMachine[]).filter(item => (item as { kind?: string }).kind === 'machine')),
             () => listCollectionPages(options => client.runtimesList(options), limit).then(result => pick(result.pages, 'runtime')),
             () => listSessionPages(options => client.sessionsList(options), limit) as unknown as Promise<GraphSession[]>,
+            () => listCollectionPages(options => client.devicesList(options), limit).then(result => pick(result.pages, 'device')),
           ];
           const settled = await withConcurrency<unknown[]>(tasks, 4);
           const churn = settled.find((result): result is PromiseRejectedResult => result.status === 'rejected' && isSnapshotChurn(result.reason));
@@ -126,8 +132,9 @@ export function useLiveStore({ url, credential, leave }: { url: string; credenti
               // Keep what was shown; a collection that never loaded says why.
               return before.loaded ? before : { items: [], loaded: false, error: errorText(result.reason) };
             };
+            const devices = read<GraphDevice>(7, previous.devices);
             return {
-              actor: capabilities.value.session_actor,
+              actor: personOf(capabilities.value.session_actor, devices.items),
               hostId: hostId || previous.hostId,
               attention: read<GraphAttention>(0, previous.attention),
               agents: read<GraphAgent>(1, previous.agents),
@@ -136,8 +143,10 @@ export function useLiveStore({ url, credential, leave }: { url: string; credenti
               machines: read<GraphMachine>(4, previous.machines),
               runtimes: read<Runtime>(5, previous.runtimes),
               sessions: read<GraphSession>(6, previous.sessions),
+              devices,
             };
           });
+          setCanType(capabilities.value.capabilities.some(capability => capability.id === 'terminal.input' && capability.state === 'granted'));
           setLive(true);
           setOffline(null);
           setNow(Date.now());
@@ -206,6 +215,7 @@ export function useLiveStore({ url, credential, leave }: { url: string; credenti
     fetchedAt.current.set(agent, Date.now());
     stale.current.delete(agent);
     const session = sessionFor(graphRef.current, agent);
+    readSession.current.set(agent, session);
     const tasks: Promise<void>[] = [];
     if (session) {
       tasks.push(loadTimeline(client, session, timelinesRef.current[agent], Math.min(limitRef.current * 3, 100))
@@ -237,7 +247,8 @@ export function useLiveStore({ url, credential, leave }: { url: string; credenti
       const at = Date.now();
       for (const agent of watched.current.keys()) {
         const interval = (hot.current.get(agent) ?? 0) > at ? HOT_INTERVAL_MS : CONVERSATION_FALLBACK_MS;
-        if (stale.current.has(agent) || at - (fetchedAt.current.get(agent) ?? 0) >= interval) void fetchConversation(agent);
+        const sessionChanged = readSession.current.has(agent) && readSession.current.get(agent) !== sessionFor(graphRef.current, agent);
+        if (stale.current.has(agent) || sessionChanged || at - (fetchedAt.current.get(agent) ?? 0) >= interval) void fetchConversation(agent);
       }
     }, 1000);
     return () => clearInterval(timer);
@@ -362,6 +373,11 @@ export function useLiveStore({ url, credential, leave }: { url: string; credenti
     const conversations: Record<string, Load<Entry[]>> = {};
     for (const agent of new Set([...Object.keys(timelines), ...Object.keys(mail), ...Object.keys(conversationErrors), ...watched.current.keys()])) {
       const timeline = timelines[agent], messages = mail[agent];
+      // Mail alone is not the conversation while the transcript is still unread: an agent
+      // whose session is not known yet, or whose timeline has not arrived, is loading.
+      const transcriptPending = !timeline && !conversationErrors[agent]
+        && (agent.startsWith('session/') || sessionFor(graph, agent) !== null || (agent.startsWith('agent/') && (!graph.sessions.loaded || !graph.agents.loaded)));
+      if (transcriptPending && messages) { conversations[agent] = { state: 'loading' }; continue; }
       if (!timeline && !messages) {
         conversations[agent] = conversationErrors[agent] ? { state: 'failed', value: `Could not load this conversation: ${conversationErrors[agent]}` }
           : agent.startsWith('session/') || sessionFor(graph, agent) ? { state: 'loading' }
@@ -465,6 +481,71 @@ export function useLiveStore({ url, credential, leave }: { url: string; credenti
     } catch (error) { setNotice(`Failed: ${errorText(error)}`); }
   }, [client, refresh]);
 
+  /** Resolve the agent's terminal in the background, attach, and follow it; closing detaches. */
+  const openTerminal = useCallback((agent: Agent, handlers: TerminalHandlers): TerminalSession => {
+    let closed = false, terminalId = '', incarnation = '', seen = false;
+    let follow: { close(): void } | undefined, attachment: TerminalAttachment | undefined;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    void (async () => {
+      const graphAgent = graphRef.current.agents.items.find(candidate => candidate.id === agent.id);
+      const found = await findAgentTerminal(
+        { id: agent.id, runtime_ids: graphAgent?.runtime_ids ?? [] },
+        graphRef.current.runtimes.items,
+        async id => { const runtime = (await client.runtimesGet(id)).value; return runtime.kind === 'runtime' ? runtime : null; },
+      );
+      if (closed) return;
+      if (!found) { handlers.onIssue(`${agent.name} has no terminal right now.`); return; }
+      terminalId = found;
+      // Never wait silently: a terminal that sends no first screen is reported.
+      timer = setTimeout(() => { if (!seen && !closed) handlers.onIssue(`${terminalId} sent no screen within ${FIRST_SCREEN_MS / 1000} seconds.`); }, FIRST_SCREEN_MS);
+      follow = followTerminal(client, terminalId, {
+        onScreen: screen => { seen = true; incarnation ||= screen.runtime_incarnation; handlers.onScreen(screen); },
+        onIssue: handlers.onIssue,
+        onAttached: current => { attachment = current; },
+      }, actionId);
+    })().catch(error => { if (!closed) handlers.onIssue(`Could not open the terminal: ${errorText(error)}`); });
+    return {
+      close: () => {
+        closed = true;
+        clearTimeout(timer);
+        follow?.close();
+        if (attachment) void detachTerminal(client, attachment, actionId).catch(error => setNotice(`Detach failed: ${errorText(error)}`));
+      },
+      send: async (mode, value) => {
+        if (!terminalId || !incarnation) { setNotice('The terminal is not open yet'); return false; }
+        try {
+          await withFreshTerminalFence(client, terminalId, incarnation, fence => {
+            const id = actionId();
+            return client.terminalInput({ id, idempotency_key: id, fence, parameters: { terminal_id: terminalId, mode, value } });
+          });
+          return true;
+        } catch (error) { setNotice(`Key not sent: ${errorText(error)}`); return false; }
+      },
+    };
+  }, [client]);
+
+  const createLaunch = useCallback(async (form: NewMission) => {
+    try {
+      const snapshot = (await client.capabilities()).snapshot.id;
+      const id = actionId();
+      await client.launchCreate({ id, idempotency_key: id, fence: { snapshot_id: snapshot, subject_revisions: {} }, parameters: { title: form.title, request: form.request, target: { type: 'new-mission', mission_id: form.mission, workspace: form.workspace } } });
+      setNotice("Launch created; the planner's proposal will appear on Home");
+      void refresh();
+      return true;
+    } catch (error) { setNotice(`Failed: ${errorText(error)}`); return false; }
+  }, [client, refresh]);
+
+  const revokeDevice = useCallback(async (target: string) => {
+    try {
+      const snapshot = (await client.capabilities()).snapshot.id;
+      const id = actionId();
+      await client.pairingRevoke({ id, idempotency_key: id, fence: { snapshot_id: snapshot, subject_revisions: {} }, parameters: { target_id: target } });
+      setNotice('Device revoked');
+      void refresh();
+      return true;
+    } catch (error) { setNotice(`Failed: ${errorText(error)}`); return false; }
+  }, [client, refresh]);
+
   return useMemo<Store>(() => ({
     mode: 'live',
     world: worldValue,
@@ -479,7 +560,11 @@ export function useLiveStore({ url, credential, leave }: { url: string; credenti
     send,
     snooze: id => { setSnoozed(current => new Set([...current, id])); setNotice('Put off until later · this device only'); },
     missionAction,
+    openTerminal,
+    canTypeInTerminals: canType,
+    createLaunch,
+    revokeDevice,
     leave,
     connection: { gateway: url, person: graph.actor, status: offline ? `Offline: ${offline}` : live ? 'Connected' : 'Connecting…' },
-  }), [worldValue, snoozed, notice, refresh, watchConversation, watchAttention, act, discuss, send, missionAction, leave, url, graph.actor, offline, live]);
+  }), [worldValue, snoozed, notice, refresh, watchConversation, watchAttention, act, discuss, send, missionAction, openTerminal, canType, createLaunch, revokeDevice, leave, url, graph.actor, offline, live]);
 }

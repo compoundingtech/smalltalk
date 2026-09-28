@@ -1,0 +1,14 @@
+# Chat about this sends a titled message and shows the thread on the card.
+appId: com.compoundingtech.smalltalk.starter
+---
+- launchApp:
+    stopApp: true
+- openLink: com.compoundingtech.smalltalk.starter://demo
+- tapOn: ".*Release Captain keeps restarting.*"
+- tapOn: Chat about this
+- assertVisible: ".*chat with Release Captain about this.*"
+- tapOn: Message Release Captain
+- inputText: Why did the key expire?
+- hideKeyboard
+- tapOn: Send
+- assertVisible: ".*Good question.*"

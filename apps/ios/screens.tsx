@@ -2,7 +2,9 @@
 // detail screens, references open sheets, and the three list states stay apart.
 
 import { useFocusEffect, useNavigation, useRoute } from '@react-navigation/native';
-import { useCallback, useLayoutEffect, useState } from 'react';
+import { useCallback, useLayoutEffect, useRef, useState } from 'react';
+import Swipeable from 'react-native-gesture-handler/Swipeable';
+import { DevicesCard } from './controlScreens';
 import { FlatList, KeyboardAvoidingView, Pressable, ScrollView, SectionList, StyleSheet, Text, View } from 'react-native';
 import { AttentionCard, agentName, Flow, missionName } from './AttentionCard';
 import type { Agent, Attention, Mission, Step } from './clientView';
@@ -15,7 +17,7 @@ import { colors, type ColorToken } from './theme';
 import { Body, Button, Buttons, Card, Composer, DemoBadge, Dim, Field, Glyph, Legend, ListStateView, Markdown, MONO, NoticeBar, Pill, Section, Segmented, styles as ui } from './ui';
 import { agentInfo, attentionStyle, harnessColor, SPINNER, stepStyle, wordInfo } from './words';
 
-type Params = { id?: string; name?: string; subject?: string; view?: string };
+type Params = { id?: string; name?: string; subject?: string; view?: string; compose?: string };
 const useParams = () => (useRoute().params ?? {}) as Params;
 
 /** The header buttons every tab shares: the demo label and settings. */
@@ -48,6 +50,47 @@ function Folder({ row }: { row: Extract<TreeRow, { kind: 'folder' }> }) {
   return <Text style={[local.folder, { paddingLeft: 16 + row.depth * 16 }]}><Text style={{ color: colors.surface2 }}>▾ </Text>{row.name}</Text>;
 }
 
+type SwipeAction = { label: string; color: ColorToken; confirm?: string; onPress: () => void };
+
+/** A row with swipe actions for the common things a person does to it. */
+function SwipeRow({ actions, children }: { actions: SwipeAction[]; children: React.ReactNode }) {
+  const ref = useRef<Swipeable>(null);
+  if (!actions.length) return <>{children}</>;
+  return (
+    <Swipeable ref={ref} friction={2} rightThreshold={40} overshootRight={false}
+      renderRightActions={() => (
+        <View style={local.swipeActions}>
+          {actions.map(action => (
+            // A fixed short armed label, so the panel does not grow past the screen edge.
+            <Button key={action.label} label={action.label} color={action.color} filled confirm={action.confirm} armedLabel="Tap again"
+              onPress={() => { ref.current?.close(); action.onPress(); }} />
+          ))}
+        </View>
+      )}>
+      <View style={local.swipeFront}>{children}</View>
+    </Swipeable>
+  );
+}
+
+/** The card's primary actions, for a swipe on its Home row. */
+function homeActions(store: ReturnType<typeof useStore>, item: Attention): SwipeAction[] {
+  const act = (action: Parameters<typeof store.act>[1]) => () => { void store.act(item, action); };
+  switch (item.kind.kind) {
+    case 'review': return [{ label: 'Approve', color: 'green', confirm: 'Approve', onPress: act('approve') }];
+    case 'feedback': return [{ label: 'Looks good', color: 'green', confirm: 'Say it looks good', onPress: act('approve') }];
+    case 'launch': return [
+      ...(item.kind.preview.state === 'ready' ? [{ label: 'Approve', color: 'green' as const, confirm: 'Approve and start', onPress: act('approve') }] : []),
+      { label: 'Cancel', color: 'red', confirm: 'Cancel launch', onPress: act('cancel') },
+    ];
+    case 'revision': return [{ label: 'Approve', color: 'green', confirm: 'Approve revision', onPress: act('approve') }];
+    case 'fault': return [{ label: 'Resolve', color: 'green', confirm: 'Mark resolved', onPress: act('resolve') }];
+    case 'message': return [
+      { label: 'Read', color: 'green', onPress: act('read') },
+      { label: 'Later', color: 'overlay1', onPress: () => store.snooze(item.id) },
+    ];
+  }
+}
+
 function Screen({ children }: { children: React.ReactNode }) {
   return <View style={ui.screen}>{children}<NoticeBar /></View>;
 }
@@ -74,8 +117,10 @@ export function HomeScreen() {
         renderItem={({ item }) => {
           const { glyph, color } = attentionStyle(item.kind.kind);
           return (
-            <Row glyph={glyph} color={color} kind={item.kind.kind} title={item.title} onPress={() => navigation.navigate('Attention', { id: item.id })}
-              second={`${item.waiting ? `${item.waiting} · ` : ''}waited ${item.age}`} />
+            <SwipeRow actions={homeActions(store, item)}>
+              <Row glyph={glyph} color={color} kind={item.kind.kind} title={item.title} onPress={() => navigation.navigate('Attention', { id: item.id })}
+                second={`${item.waiting ? `${item.waiting} · ` : ''}waited ${item.age}`} />
+            </SwipeRow>
           );
         }}
         ListEmptyComponent={state.kind === 'empty' ? (
@@ -102,17 +147,19 @@ export function AttentionScreen() {
   const { world } = useStore();
   const { id } = useParams();
   const navigation = useNavigation<Nav>();
+  const scroll = useRef<ScrollView>(null);
   const item = items(world.attention).find(candidate => candidate.id === id);
   useLayoutEffect(() => { if (item) navigation.setOptions({ title: item.kind.kind }); }, [navigation, item?.kind.kind]);
+  // The keyboard insets the scroll view, and an opened text box is scrolled into view.
+  const toEnd = () => setTimeout(() => scroll.current?.scrollToEnd({ animated: true }), 350);
   return (
     <Screen>
-      <KeyboardAvoidingView behavior="padding" style={local.flex} keyboardVerticalOffset={90}>
-        <ScrollView contentContainerStyle={ui.scroll} contentInsetAdjustmentBehavior="automatic" keyboardShouldPersistTaps="handled">
-          {item ? <AttentionCard item={item} /> : world.attention.state === 'loading'
-            ? <ListStateView state={{ kind: 'loading', text: HOME_TEXT.loading }} />
-            : <Card><Body>This item is no longer open. Nothing more to do here.</Body><Buttons><Button label="Back to Home" onPress={() => navigation.goBack()} /></Buttons></Card>}
-        </ScrollView>
-      </KeyboardAvoidingView>
+      <ScrollView ref={scroll} contentContainerStyle={ui.scroll} contentInsetAdjustmentBehavior="automatic" keyboardShouldPersistTaps="handled"
+        automaticallyAdjustKeyboardInsets keyboardDismissMode="interactive">
+        {item ? <AttentionCard item={item} onOpenText={toEnd} /> : world.attention.state === 'loading'
+          ? <ListStateView state={{ kind: 'loading', text: HOME_TEXT.loading }} />
+          : <Card><Body>This item is no longer open. Nothing more to do here.</Body><Buttons><Button label="Back to Home" onPress={() => navigation.goBack()} /></Buttons></Card>}
+      </ScrollView>
     </Screen>
   );
 }
@@ -132,6 +179,10 @@ export function AgentsScreen() {
   const [view, setView] = useState<'groups' | 'tree'>(useParams().view === 'tree' ? 'tree' : 'groups');
   const state = listState(world.agents, 'Loading agents…', 'No agents yet.');
   const open = (agent: Agent) => navigation.navigate('Agent', { id: agent.id });
+  const agentActions = (agent: Agent): SwipeAction[] => agent.unmanaged ? [] : [
+    { label: 'Message', color: 'sapphire', onPress: () => navigation.navigate('Agent', { id: agent.id, compose: '1' }) },
+    { label: 'Details', color: 'overlay1', onPress: () => navigation.navigate('AgentDetails', { id: agent.id }) },
+  ];
   const agentsById = new Map(items(world.agents).map(agent => [agent.id, agent]));
   const header = <Segmented options={[['groups', 'Groups'], ['tree', 'Tree']]} value={view} onChange={setView} />;
   const footer = <Legend entries={AGENT_LEGEND} />;
@@ -148,7 +199,11 @@ export function AgentsScreen() {
           renderSectionHeader={({ section }) => <Section title={section.title} count={section.count} color={section.key === 'waiting on you' ? 'person' : 'overlay1'} />}
           renderItem={({ item: agent }) => {
             const info = agentInfo(agent.state);
-            return <Row glyph={info.glyph} color={info.color} title={agent.name} second={agentPath(agent)} right={<AgentRight agent={agent} />} onPress={() => open(agent)} />;
+            return (
+              <SwipeRow actions={agentActions(agent)}>
+                <Row glyph={info.glyph} color={info.color} title={agent.name} second={agentPath(agent)} right={<AgentRight agent={agent} />} onPress={() => open(agent)} />
+              </SwipeRow>
+            );
           }}
           refreshing={false} onRefresh={() => void store.refresh()}
         />
@@ -162,7 +217,7 @@ export function AgentsScreen() {
             if (row.kind === 'folder') return <Folder row={row} />;
             const agent = agentsById.get(row.id)!;
             const info = agentInfo(agent.state);
-            return <Row depth={row.depth} glyph={info.glyph} color={info.color} title={agent.name} right={<AgentRight agent={agent} />} onPress={() => open(agent)} />;
+            return <SwipeRow actions={agentActions(agent)}><Row depth={row.depth} glyph={info.glyph} color={info.color} title={agent.name} right={<AgentRight agent={agent} />} onPress={() => open(agent)} /></SwipeRow>;
           }}
         />
       )}
@@ -173,7 +228,7 @@ export function AgentsScreen() {
 export function AgentScreen() {
   const store = useStore();
   const { world } = store;
-  const { id = '' } = useParams();
+  const { id = '', compose } = useParams();
   const navigation = useNavigation<Nav>();
   const { peek } = useLinks();
   const [draft, setDraft] = useState('');
@@ -182,9 +237,14 @@ export function AgentScreen() {
   useLayoutEffect(() => {
     navigation.setOptions({
       title: agent?.name ?? agentName(world, id),
-      headerRight: () => agent && !agent.unmanaged ? <Pressable onPress={() => navigation.navigate('AgentDetails', { id })} hitSlop={10} accessibilityRole="button"><Text style={local.headerButton}>Details</Text></Pressable> : null,
+      headerRight: () => agent && !agent.unmanaged ? (
+        <View style={local.headerRight}>
+          {agent.terminal ? <Pressable onPress={() => navigation.navigate('Terminal', { id })} hitSlop={10} accessibilityRole="button"><Text style={local.headerButton}>Terminal</Text></Pressable> : null}
+          <Pressable onPress={() => navigation.navigate('AgentDetails', { id })} hitSlop={10} accessibilityRole="button"><Text style={local.headerButton}>Details</Text></Pressable>
+        </View>
+      ) : null,
     });
-  }, [navigation, agent?.name, agent?.unmanaged, id]);
+  }, [navigation, agent?.name, agent?.unmanaged, agent?.terminal, id]);
   if (!agent) {
     return <Screen><ListStateView state={world.agents.state === 'loading' ? { kind: 'loading', text: 'Loading agents…' } : { kind: 'empty', text: `${id} is not in the current view.` }} /></Screen>;
   }
@@ -218,7 +278,7 @@ export function AgentScreen() {
           empty={agent.unmanaged ? 'st did not start this process, so there is no conversation to show.' : 'Nothing said yet.'} />
         {agent.unmanaged
           ? <Dim style={local.unmanaged}>Found running, not started by st: messages cannot reach it. Start it through st to talk to it here.</Dim>
-          : <Composer value={draft} onChange={setDraft} placeholder={`Message ${agent.name}`} onSend={() => void send()} />}
+          : <Composer value={draft} onChange={setDraft} placeholder={`Message ${agent.name}`} onSend={() => void send()} autoFocus={compose === '1'} />}
       </KeyboardAvoidingView>
     </Screen>
   );
@@ -286,7 +346,12 @@ export function MissionsScreen() {
   const hidden = hiddenSystemMissions(world, system);
   const byId = new Map(items(world.missions).map(mission => [mission.id, mission]));
   const open = (mission: Mission) => navigation.navigate('Mission', { id: mission.id });
-  const header = <Segmented options={[['groups', 'Groups'], ['tree', 'Tree']]} value={view} onChange={setView} />;
+  const header = (
+    <View>
+      <View style={local.newMission}><Button label="New mission" filled onPress={() => navigation.navigate('NewMission')} /></View>
+      <Segmented options={[['groups', 'Groups'], ['tree', 'Tree']]} value={view} onChange={setView} />
+    </View>
+  );
   const footer = (
     <View>
       {hidden || system ? <Pressable onPress={() => setSystem(!system)}><Dim style={local.note}>{system ? 'Hide system missions' : `${hidden} system missions hidden · show them`}</Dim></Pressable> : null}
@@ -411,8 +476,8 @@ export function MissionScreen() {
   const agents = mission.agents.map(agentId => items(world.agents).find(agent => agent.id === agentId)).filter((agent): agent is Agent => agent !== undefined);
   return (
     <Screen>
-      <KeyboardAvoidingView behavior="padding" style={local.flex} keyboardVerticalOffset={90}>
-        <ScrollView contentContainerStyle={ui.scroll} contentInsetAdjustmentBehavior="automatic" keyboardShouldPersistTaps="handled">
+      <ScrollView contentContainerStyle={ui.scroll} contentInsetAdjustmentBehavior="automatic" keyboardShouldPersistTaps="handled"
+        automaticallyAdjustKeyboardInsets keyboardDismissMode="interactive">
           <View style={local.missionHead}>
             <Pill text={`${info.glyph} ${info.name}`} color={info.color} />
             <Text style={local.title}>{mission.title}</Text>
@@ -450,8 +515,7 @@ export function MissionScreen() {
           </Card>
           {mission.worktree ? <Card title="worktree"><Body>{mission.worktree}<Text style={{ color: colors.overlay0 }}>{`  on ${mission.host}`}</Text></Body></Card> : null}
           <Buttons><Button label="The whole declaration" color="overlay1" onPress={() => navigation.navigate('Declaration', { id: mission.id })} /></Buttons>
-        </ScrollView>
-      </KeyboardAvoidingView>
+      </ScrollView>
     </Screen>
   );
 }
@@ -497,7 +561,7 @@ export function FleetScreen() {
         keyExtractor={machine => machine.name}
         contentInsetAdjustmentBehavior="automatic"
         ListEmptyComponent={<ListStateView state={state} retry={() => void store.refresh()} />}
-        ListFooterComponent={<Legend entries={[['●', 'green', 'online'], ['○', 'red', 'offline']]} />}
+        ListFooterComponent={<View><Legend entries={[['●', 'green', 'online'], ['○', 'red', 'offline']]} /><View style={local.devices}><DevicesCard /></View></View>}
         renderItem={({ item: machine }) => {
           const agents = items(world.agents).filter(agent => agent.host === machine.name).length;
           return (
@@ -550,6 +614,7 @@ export function MachineScreen() {
         <Card title="agents here">
           {agents.length ? agents.map(agent => <AgentLine key={agent.id} agent={agent} extra={agent.worktree ?? undefined} />) : <Dim>No agents on this machine.</Dim>}
         </Card>
+        {machine.you_are_here ? <DevicesCard /> : null}
       </ScrollView>
     </Screen>
   );
@@ -724,6 +789,10 @@ const local = StyleSheet.create({
   headerRight: { flexDirection: 'row', alignItems: 'center', gap: 12 },
   gear: { color: colors.subtext0, fontSize: 20 },
   headerButton: { color: colors.accent, fontSize: 16, fontWeight: '600' },
+  swipeActions: { flexDirection: 'row', alignItems: 'center', gap: 6, paddingHorizontal: 8 },
+  swipeFront: { backgroundColor: colors.base },
+  newMission: { flexDirection: 'row', paddingHorizontal: 16, paddingTop: 4 },
+  devices: { paddingHorizontal: 16, paddingBottom: 24 },
   folder: { color: colors.overlay1, paddingVertical: 6, fontSize: 14 },
   nothing: { padding: 24, gap: 8 },
   nothingTitle: { color: colors.text, fontSize: 17, fontWeight: '700' },

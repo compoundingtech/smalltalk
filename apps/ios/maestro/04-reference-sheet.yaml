@@ -1,0 +1,14 @@
+# A name opens a sheet with a summary and Go to.
+appId: com.compoundingtech.smalltalk.starter
+---
+- launchApp:
+    stopApp: true
+- openLink: com.compoundingtech.smalltalk.starter://demo
+# A link sent before navigation mounts is dropped: wait for Home first.
+- assertVisible: somebody is stopped on you
+- openLink: com.compoundingtech.smalltalk.starter://mission?id=mission/fleet/release/weekly
+- tapOn: Chat with it
+- assertVisible: Go to agent
+- assertVisible: Message
+- tapOn: Go to agent
+- assertVisible: Details

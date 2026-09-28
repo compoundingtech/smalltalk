@@ -55,7 +55,8 @@ function TextBox({ title, value, onChange, placeholder, autoFocus }: { title: st
   );
 }
 
-export function AttentionCard({ item }: { item: Attention }) {
+/** `onOpenText` runs when the card opens a text box, so the screen can bring it into view. */
+export function AttentionCard({ item, onOpenText }: { item: Attention; onOpenText?: () => void }) {
   const store = useStore();
   const { world } = store;
   const { goTo } = useLinks();
@@ -69,6 +70,7 @@ export function AttentionCard({ item }: { item: Attention }) {
   const heavy = color === 'person';
 
   useEffect(() => store.watchAttention(item.id), [store.watchAttention, item.id]);
+  useEffect(() => { if (chat || editing) onOpenText?.(); }, [chat, editing]);
   useEffect(() => (chat && target ? store.watchConversation(target.id) : undefined), [chat, target?.id, store.watchConversation]);
 
   const act = async (action: CardAction, text?: string) => {

@@ -3,7 +3,7 @@ import { readFileSync } from 'node:fs';
 import { decodeWorld } from './clientView.ts';
 import { markdown } from './markdown.ts';
 import { aboutText, aboutTitle, agentSections, agentsTree, chatTarget, flowLayers, homeBadge, homeSections, listState, missionHelp, missionSections, reconcilePending, withPending } from './screenModel.ts';
-import { agentLabel, missionDisplayLabel, notLoaded, preview, world } from './worldAdapter.ts';
+import { agentLabel, expiresIn, missionDisplayLabel, notLoaded, personOf, preview, world } from './worldAdapter.ts';
 
 const demo = decodeWorld(JSON.parse(readFileSync(new URL('../../fixtures/clients/demo-world.json', import.meta.url), 'utf8')));
 const noExtras = { conversations: {}, previews: {}, bodies: {}, live: true, offline: null, worktrees: { state: 'ready', value: [] } };
@@ -85,7 +85,7 @@ assert.equal(missionDisplayLabel({ id: 'mission/fleet/stui/ios-parity', title: '
   const graph = {
     actor: 'person/robin', hostId: 'host/lark',
     attention: notLoaded(), agents: { items: [], loaded: false, error: 'forbidden: agents' }, missions: notLoaded(), work: notLoaded(),
-    machines: notLoaded(), runtimes: notLoaded(), sessions: notLoaded(),
+    machines: notLoaded(), runtimes: notLoaded(), sessions: notLoaded(), devices: notLoaded(),
   };
   const empty = world(graph, noExtras, now);
   assert.equal(empty.attention.state, 'loading');
@@ -105,7 +105,11 @@ assert.equal(missionDisplayLabel({ id: 'mission/fleet/stui/ios-parity', title: '
       work('step-run/o1', 'run/o', 'fix', 'ready'),
       work('step-run/x', 'run/x', 'other', 'claimed'),
     ], loaded: true },
-    agents: { items: [agent('agent/fleet/builder', 'running', { current_work_ids: ['step-run/x'], upcoming_work_ids: ['step-run/b1'], harness_state: 'working' })], loaded: true },
+    agents: { items: [
+      agent('agent/fleet/builder', 'running', { current_work_ids: ['step-run/x'], upcoming_work_ids: ['step-run/b1'], harness_state: 'working', runtime_ids: ['runtime/b'] }),
+      agent('agent/fleet/parked', 'stopped', { runtime_ids: ['runtime/p'] }),
+    ], loaded: true },
+    devices: { items: [{ id: 'device/phone', kind: 'device', revision: '1', updated_at: at, name: 'Phone', person_id: 'person/robin', session_actor: 'person/robin', scopes: ['full control'], state: 'active', expires_at: '2026-10-08T12:00:00Z' }], loaded: true },
   }, noExtras, now);
   const words = Object.fromEntries(live.missions.value.map(item => [item.id, item.word]));
   assert.deepStrictEqual(words, { 'mission/fleet/watch': 'watching', 'mission/fleet/busy': 'queued', 'mission/fleet/orphan': 'unclaimed' });
@@ -114,6 +118,10 @@ assert.equal(missionDisplayLabel({ id: 'mission/fleet/stui/ios-parity', title: '
   assert.equal(live.missions.value.find(item => item.id === 'mission/fleet/watch').steps[0].owner, 'st');
   assert.equal(live.agents.value[0].state, 'working');
   assert.equal(live.agents.value[0].activity, '30m');
+  // A running agent with a runtime may have a terminal even when the bounded runtime list lacks it.
+  assert.deepStrictEqual(live.agents.value.map(item => item.terminal), [true, false]);
+  assert.deepStrictEqual(live.devices, { state: 'ready', value: [{ id: 'device/phone', name: 'Phone', state: 'active', scopes: ['full control'], expires: 'in 10 days' }] });
+  assert.equal(expiresIn('2026-09-26T12:00:00Z', now), '2 days ago');
 }
 
 // Markdown keeps lines, and reads headings, bullets, code, tables and inline marks.
@@ -124,3 +132,8 @@ assert.deepStrictEqual(markdown('# Title\n\n- **one** `two`\n```sh\nls\n```\n| a
   { kind: 'code', language: 'sh', lines: ['ls'] },
   { kind: 'table', rows: [['a', 'b'], ['1', '2']] },
 ]);
+
+// A paired device acts as `person/…/session/…`; attention is addressed to the person.
+assert.equal(personOf('person/robin/session/abc', [{ session_actor: 'person/robin/session/abc', person_id: 'person/robin' }]), 'person/robin');
+assert.equal(personOf('person/robin/session/abc', []), 'person/robin');
+assert.equal(personOf('person/robin', []), 'person/robin');

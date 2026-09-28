@@ -59,7 +59,7 @@ export function Pill({ text, color }: { text: string; color: ColorToken }) {
 }
 
 /** A button. With `confirm`, the first tap arms it and says what a second tap will do. */
-export function Button({ label, color = 'accent', onPress, confirm, disabled, filled }: { label: string; color?: ColorToken; onPress: () => void; confirm?: string; disabled?: boolean; filled?: boolean }) {
+export function Button({ label, color = 'accent', onPress, confirm, armedLabel, disabled, filled }: { label: string; color?: ColorToken; onPress: () => void; confirm?: string; armedLabel?: string; disabled?: boolean; filled?: boolean }) {
   const [armed, setArmed] = useState(false);
   useEffect(() => {
     if (!armed) return;
@@ -74,7 +74,7 @@ export function Button({ label, color = 'accent', onPress, confirm, disabled, fi
   return (
     <Pressable accessibilityRole="button" disabled={disabled} onPress={press}
       style={({ pressed }) => [styles.button, { borderColor: colors[color] }, (filled || armed) && { backgroundColor: colors[color] }, pressed && styles.pressed, disabled && styles.disabled]}>
-      <Text style={[styles.buttonText, { color: filled || armed ? colors.crust : colors[color] }]}>{armed ? `${confirm}? Tap again` : label}</Text>
+      <Text style={[styles.buttonText, { color: filled || armed ? colors.crust : colors[color] }]}>{armed ? armedLabel ?? `${confirm}? Tap again` : label}</Text>
     </Pressable>
   );
 }

@@ -11,13 +11,17 @@ import { Body, Dim, ListStateView, Markdown, MONO } from './ui';
 import { SPINNER } from './words';
 
 const COLLAPSED_TOOL_LINES = 5;
+/** A collapsed box also clips each line, so one huge line (a base64 blob) cannot fill the screen. */
+const COLLAPSED_LINE_CHARS = 240;
 
 function ToolBox({ entry }: { entry: Extract<Entry['body'], { kind: 'tool' }>['value'] }) {
   const [open, setOpen] = useState(false);
   const { title, state, output } = entry;
   const [bg, glyph, color] = state === 'running' ? [colors.tool_bg, SPINNER[0], colors.working] : state === 'ok' ? [colors.tool_ok_bg, '✓', colors.green] : [colors.tool_err_bg, '✕', colors.red];
   const everything = state === 'failed' || output.length <= COLLAPSED_TOOL_LINES || open;
-  const shown = everything ? output : output.slice(-COLLAPSED_TOOL_LINES);
+  const lastLines = everything ? output : output.slice(-COLLAPSED_TOOL_LINES);
+  const shown = open ? lastLines : lastLines.map(line => (line.length > COLLAPSED_LINE_CHARS ? `${line.slice(0, COLLAPSED_LINE_CHARS)}…` : line));
+  const clipped = !open && lastLines.some(line => line.length > COLLAPSED_LINE_CHARS);
   const hidden = output.length - shown.length;
   return (
     <View style={[styles.tool, { backgroundColor: bg }]}>
@@ -26,7 +30,7 @@ function ToolBox({ entry }: { entry: Extract<Entry['body'], { kind: 'tool' }>['v
           <Text style={[styles.toolGlyph, { color }]}>{glyph}</Text>
           <Text style={styles.toolTitle} numberOfLines={open ? undefined : 1}>{title}</Text>
         </View>
-        {hidden > 0 ? <Dim style={styles.toolMore}>… {hidden} earlier lines · tap to expand</Dim> : null}
+        {hidden > 0 ? <Dim style={styles.toolMore}>… {hidden} earlier lines · tap to expand</Dim> : clipped ? <Dim style={styles.toolMore}>long lines clipped · tap to expand</Dim> : null}
       </Pressable>
       {shown.length ? (
         <Text selectable style={styles.toolOutput}>
@@ -35,7 +39,7 @@ function ToolBox({ entry }: { entry: Extract<Entry['body'], { kind: 'tool' }>['v
           ))}
         </Text>
       ) : null}
-      {open && output.length > COLLAPSED_TOOL_LINES ? <Pressable onPress={() => setOpen(false)}><Dim style={styles.toolMore}>collapse</Dim></Pressable> : null}
+      {open && (output.length > COLLAPSED_TOOL_LINES || output.some(line => line.length > COLLAPSED_LINE_CHARS)) ? <Pressable onPress={() => setOpen(false)}><Dim style={styles.toolMore}>collapse</Dim></Pressable> : null}
     </View>
   );
 }
