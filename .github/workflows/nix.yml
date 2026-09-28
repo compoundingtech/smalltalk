@@ -3,59 +3,65 @@ on:
   pull_request:
   push:
     branches: [main]
+    tags: ['**']
 
-# One in-flight run per ref: a superseded PR run should not keep three Linux
-# shards and a macOS build competing for hosted capacity.
 concurrency:
   group: nix-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
-# Linux uses five build-graph shards so each remaining cold Rust derivation gets a
-# runner instead of competing with an unrelated compile. The aggregation job
-# preserves the stable `check-x86_64-linux` status used by branch protection.
 jobs:
-  check-x86_64-linux-shard:
-    name: check-x86_64-linux (${{ matrix.group }})
+  check-x86_64-linux:
+    if: ${{ !startsWith(github.ref, 'refs/tags/') }}
     runs-on: ubuntu-latest
-    timeout-minutes: 45
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - group: package
-            targets: >-
-              .#checks.x86_64-linux.st2
-              .#checks.x86_64-linux.debug-assertions
-              .#checks.x86_64-linux.help
-              .#checks.x86_64-linux.completions
-              .#checks.x86_64-linux.hooks-replacement
-              .#checks.x86_64-linux.pty-fleet-contract
-          # install-layout also needs the st2 package, so this shard builds its own st2.
-          - group: st3
-            targets: >-
-              .#checks.x86_64-linux.st3
-              .#checks.x86_64-linux.st3-help
-              .#checks.x86_64-linux.install-layout
-          - group: providers
-            targets: >-
-              .#checks.x86_64-linux.provider-components
-              .#checks.x86_64-linux.wasip2-resource-providers
-          - group: integration
-            targets: >-
-              .#checks.x86_64-linux.release-integration
-              .#checks.x86_64-linux.pi-extension-types
-          - group: wasm
-            targets: >-
-              .#checks.x86_64-linux.wasm-resolver-feature
-              .#checks.x86_64-linux.wasm-resolver-artifact
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      id-token: write
     steps:
       - uses: actions/checkout@v4
       - uses: DeterminateSystems/determinate-nix-action@v3
-      - run: nix build --no-link --print-build-logs ${{ matrix.targets }}
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+      # rust-cache discovers the compiler and Cargo metadata inside the flake's
+      # dev shell. The stable key lets PRs restore the cache seeded by main.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: workspace-debug
+          cmd-format: nix develop -c {0}
+          cache-on-failure: true
+      # The provider component integration tests require Wasm artifacts supplied
+      # by the tag-only Nix check; its library tests still run here.
+      - run: nix develop --command cargo test --workspace --exclude st2-resource-providers --locked
+      - run: nix develop --command cargo test -p st2-resource-providers --lib --locked
+      - run: nix develop --command cargo clippy --workspace --all-targets --locked
 
-  check-x86_64-linux:
-    if: always()
-    needs: check-x86_64-linux-shard
+  # The full Nix release/check graph is useful for tags, but compiling it on
+  # every PR multiplied cold dependency builds and occupied hosted runners.
+  nix-release-x86_64-linux:
+    if: ${{ startsWith(github.ref, 'refs/tags/') }}
     runs-on: ubuntu-latest
+    timeout-minutes: 180
+    permissions:
+      contents: read
+      id-token: write
     steps:
-      - run: test "${{ needs.check-x86_64-linux-shard.result }}" = success
+      - uses: actions/checkout@v4
+      - uses: DeterminateSystems/determinate-nix-action@v3
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+      - run: >-
+          nix build --no-link --print-build-logs
+          .#packages.x86_64-linux.small-talk
+          .#checks.x86_64-linux.st2
+          .#checks.x86_64-linux.st3
+          .#checks.x86_64-linux.debug-assertions
+          .#checks.x86_64-linux.help
+          .#checks.x86_64-linux.completions
+          .#checks.x86_64-linux.hooks-replacement
+          .#checks.x86_64-linux.pty-fleet-contract
+          .#checks.x86_64-linux.st3-help
+          .#checks.x86_64-linux.install-layout
+          .#checks.x86_64-linux.provider-components
+          .#checks.x86_64-linux.wasip2-resource-providers
+          .#checks.x86_64-linux.release-integration
+          .#checks.x86_64-linux.pi-extension-types
+          .#checks.x86_64-linux.wasm-resolver-feature
+          .#checks.x86_64-linux.wasm-resolver-artifact

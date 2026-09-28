@@ -10,7 +10,7 @@ fn write_agent(root: &Path) {
     fs::create_dir_all(&directory).unwrap();
     fs::write(
         directory.join("agent.kdl"),
-        "agent \"worker\" {\n  host \"hetz\"\n  command \"agent\"\n}\n",
+        "agent \"worker\" {\n  host \"hetz\"\n  command \"exec sleep 60\"\n}\n",
     )
     .unwrap();
     st2::event::publish_owner_binding_for_test(root, "hetz").unwrap();
