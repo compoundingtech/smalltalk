@@ -6,9 +6,9 @@ set -euo pipefail
 
 branch="$1"
 scratch="$(/usr/bin/mktemp -d)"
-trap '/usr/bin/git worktree remove --force "$scratch/tree" >/dev/null 2>&1 || true; /bin/rm -rf "$scratch"' EXIT
+trap 'git worktree remove --force "$scratch/tree" >/dev/null 2>&1 || true; /bin/rm -rf "$scratch"' EXIT
 
-/usr/bin/git fetch --quiet origin "$branch"
-/usr/bin/git worktree add --quiet --detach "$scratch/tree" FETCH_HEAD
+git fetch --quiet origin "$branch"
+git worktree add --quiet --detach "$scratch/tree" FETCH_HEAD
 cd "$scratch/tree"
 /usr/bin/make test

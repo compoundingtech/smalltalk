@@ -138,6 +138,11 @@ enum Command {
     },
     /// Check the daemon and runtime dependencies.
     Doctor(DoctorArgs),
+    /// Summarize git and gh command logs.
+    Recorder {
+        #[command(subcommand)]
+        command: RecorderCommand,
+    },
     /// Preview or apply bounded graph-authorized operational repairs.
     Repair {
         #[command(subcommand)]
@@ -1916,6 +1921,25 @@ struct DoctorArgs {
 }
 
 #[derive(Subcommand)]
+enum RecorderCommand {
+    /// Summarize recent calls from local or supplied host logs.
+    Report(RecorderReportArgs),
+}
+
+#[derive(Args)]
+struct RecorderReportArgs {
+    /// Include calls from the last number of hours.
+    #[arg(long, default_value_t = 24)]
+    hours: u64,
+    /// Read this JSONL log. Repeat for logs copied from other hosts; defaults to this host's log.
+    #[arg(long = "log")]
+    logs: Vec<PathBuf>,
+    /// Number of slow calls to show.
+    #[arg(long, default_value_t = 10)]
+    top: usize,
+}
+
+#[derive(Subcommand)]
 enum RepairCommand {
     /// Compute the exact read-only repair plan and approval token.
     DryRun,
@@ -2804,6 +2828,7 @@ async fn run(cli: Cli) -> Result<()> {
             .await
         }
         Command::Doctor(args) => run_doctor(&immediate, args, cli.json).await,
+        Command::Recorder { command } => run_recorder(command, &config, cli.json),
         Command::Repair { command } => run_repair(&client, command, cli.json).await,
         Command::Replication { command } => run_replication(&client, command, cli.json).await,
         Command::Fleet { command } => run_fleet(&endpoint, command, cli.json).await,
@@ -2922,6 +2947,35 @@ fn run_claude_channel(command: ClaudeChannelCommand) -> Result<()> {
             st2::claude_channel::install_st3_policy().map(|_| ())
         }
         ClaudeChannelCommand::UninstallPolicy => st2::claude_channel::uninstall_st3_policy(),
+    }
+}
+
+fn run_recorder(command: RecorderCommand, config: &Config, json_output: bool) -> Result<()> {
+    match command {
+        RecorderCommand::Report(args) => {
+            anyhow::ensure!(args.hours > 0, "--hours must be greater than zero");
+            let hours = i64::try_from(args.hours).context("--hours is too large")?;
+            let window = chrono::Duration::try_hours(hours).context("--hours is too large")?;
+            let until = chrono::Utc::now();
+            let since = until - window;
+            let logs = if args.logs.is_empty() {
+                let local = st3::recorder::log_path(&config.state_dir)?;
+                if local.exists() {
+                    vec![local]
+                } else {
+                    Vec::new()
+                }
+            } else {
+                args.logs
+            };
+            let report = st3::recorder_report::summarize(logs, since, until, args.top)?;
+            if json_output {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                print!("{}", st3::recorder_report::render(&report));
+            }
+            Ok(())
+        }
     }
 }
 
