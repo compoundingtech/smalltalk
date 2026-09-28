@@ -15244,7 +15244,7 @@ fn current_harness_at(
             "SELECT id, accepted_at_unix_ms, json_extract(body, '$.fields.code') FROM claims
              WHERE subject=?1 AND kind='harness.diagnostic' AND store_index<=?2
                AND json_extract(body, '$.fields.code')
-                   IN ('provider-auth-expired', 'provider-trust-prompt')
+                   IN ('provider-auth-expired', 'provider-auth-restored', 'provider-trust-prompt')
                AND json_extract(body, '$.fields.incarnation_id')=?3
              ORDER BY store_index DESC LIMIT 1",
             params![subject, at_index, incarnation_id],
@@ -15257,7 +15257,10 @@ fn current_harness_at(
             },
         )
         .optional()?;
-    if let Some((claim, observed_at_unix_ms, code)) = prompt_rejection {
+    // A lifted login fence no longer holds the incarnation.
+    if let Some((claim, observed_at_unix_ms, code)) = prompt_rejection
+        && code != "provider-auth-restored"
+    {
         let (state, reason) = if code == "provider-trust-prompt" {
             ("blocked", "providerTrustPrompt")
         } else {

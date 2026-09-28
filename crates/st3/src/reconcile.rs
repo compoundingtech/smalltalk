@@ -1801,10 +1801,42 @@ impl<R: RuntimeControl> Reconciler<R> {
         let Ok(screen) = self.runtime.screen(&member.runtime_id) else {
             return Ok(());
         };
+        let (fence, key) = self.claude_auth_fence(&subject.subject, incarnation)?;
         let Some(matched_line) = claude_login_expired(&screen) else {
+            // The prompt is gone: a person ran /login, or the match was false. Either way the
+            // incarnation can take work again, so its fence and the person's request end.
+            if let Some(fence) = fence {
+                self.store.append_claim(&ClaimInput {
+                    subject: subject.subject.clone(),
+                    kind: "harness.diagnostic".into(),
+                    actor: Some(subject.subject.clone()),
+                    fields: BTreeMap::from([
+                        ("status".into(), Value::String("authenticated".into())),
+                        (
+                            "code".into(),
+                            Value::String("provider-auth-restored".into()),
+                        ),
+                        (
+                            "reason".into(),
+                            Value::String("Claude no longer shows its expired-login prompt".into()),
+                        ),
+                        ("incarnation_id".into(), Value::String(incarnation.into())),
+                    ]),
+                    evidence: vec![fence],
+                    expected_subject: None,
+                    idempotency_key: Some(format!("{key}:restored")),
+                })?;
+                self.resolve_pending_alert(
+                    &key,
+                    "Claude no longer shows its expired-login prompt",
+                )?;
+                self.signal_changed();
+            }
             return Ok(());
         };
-        let key = format!("claude-auth-expired:{}:{incarnation}", subject.subject);
+        if fence.is_some() {
+            return Ok(());
+        }
         let digest = hex::encode(sha2::Sha256::digest(key.as_bytes()));
         let attention_subject = format!("attention/{}", &digest[..32]);
         if self.store.attention_request(&attention_subject)?.is_some() {
@@ -1837,6 +1869,37 @@ impl<R: RuntimeControl> Reconciler<R> {
         })?;
         self.signal_changed();
         Ok(())
+    }
+
+    /// The login fence of one Claude incarnation: the claim that fences it, if it is fenced now,
+    /// and the key of that fence, or of the next one. A fence lifted once can fence the same
+    /// incarnation again, so a fence after a lift is keyed by that lift.
+    fn claude_auth_fence(
+        &self,
+        subject: &str,
+        incarnation: &str,
+    ) -> Result<(Option<String>, String)> {
+        let mut fence = None;
+        let mut key = format!("claude-auth-expired:{subject}:{incarnation}");
+        for claim in self.store.claims_for(subject, Some("harness.diagnostic"))? {
+            if claim
+                .body
+                .pointer("/fields/incarnation_id")
+                .and_then(Value::as_str)
+                != Some(incarnation)
+            {
+                continue;
+            }
+            match claim.body.pointer("/fields/code").and_then(Value::as_str) {
+                Some("provider-auth-expired") => fence = Some(claim.id),
+                Some("provider-auth-restored") => {
+                    fence = None;
+                    key = format!("claude-auth-expired:{subject}:{incarnation}:{}", claim.id);
+                }
+                _ => {}
+            }
+        }
+        Ok((fence, key))
     }
 
     /// Claude's workspace trust prompt appears before any hook or channel can report the session,
@@ -20202,6 +20265,81 @@ version 2
         let attention = store.attention_items(Some("person/nathan")).unwrap();
         assert_eq!(attention.len(), 1);
         assert_eq!(attention[0].targets, ["agent/node.seat-b"]);
+    }
+
+    #[test]
+    fn a_claude_login_fence_lifts_when_the_prompt_leaves_the_screen() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        let workspace = tempfile::tempdir().unwrap();
+        let source = format!(
+            "version 2\nagent \"seat\" {{ workspace {:?}; harness \"claude\" {{ prompt \"Work.\" }} }}\n",
+            workspace.path().display().to_string()
+        );
+        apply_source(&store, &source, "claude-login-lift");
+        let runtime = Arc::new(FakeRuntime::default());
+        let reconciler = Reconciler::new(
+            store.clone(),
+            runtime.clone(),
+            "node".into(),
+            Arc::new(Notify::new()),
+        );
+        reconciler.reconcile_once().unwrap();
+        *runtime.ptys.lock().unwrap() = vec![claude_seat_pty("seat", "running", "seat-one")];
+        let show = |screen: &str| {
+            runtime
+                .screens
+                .lock()
+                .unwrap()
+                .insert("node.seat".into(), screen.into());
+        };
+        let fenced = || {
+            store
+                .current_harness("agent/node.seat")
+                .unwrap()
+                .is_some_and(|harness| harness.reason.as_deref() == Some("providerAuth"))
+        };
+
+        show("> Work.\n\n● Login expired · Please run /login\n");
+        reconciler.reconcile_once().unwrap();
+        assert!(fenced());
+        assert_eq!(
+            store.attention_items(Some("person/nathan")).unwrap().len(),
+            1
+        );
+
+        // The prompt is gone, so the same incarnation takes work again.
+        show("> Work.\n\n● Done.\n");
+        reconciler.reconcile_once().unwrap();
+        assert!(!fenced());
+        assert!(
+            store
+                .attention_items(Some("person/nathan"))
+                .unwrap()
+                .is_empty()
+        );
+        reconciler.reconcile_once().unwrap();
+        let codes = store
+            .claims_for("agent/node.seat", Some("harness.diagnostic"))
+            .unwrap()
+            .iter()
+            .filter_map(|claim| {
+                claim
+                    .body
+                    .pointer("/fields/code")?
+                    .as_str()
+                    .map(str::to_owned)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(codes, ["provider-auth-expired", "provider-auth-restored"]);
+
+        // The prompt returns: the incarnation is fenced again, with a new request.
+        show("> Work.\n\n● Login expired · Please run /login\n");
+        reconciler.reconcile_once().unwrap();
+        assert!(fenced());
+        assert_eq!(
+            store.attention_items(Some("person/nathan")).unwrap().len(),
+            1
+        );
     }
 
     #[test]

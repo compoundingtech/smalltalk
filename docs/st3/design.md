@@ -83,9 +83,12 @@ a missing desired member. Final work and explicit cancellation stop owned member
 
 A Claude harness can stop at a screen that no hook reports: an expired login or the workspace trust
 prompt. The reconciler reads the terminal screen for both. Either one fences that incarnation as not
-ready with its reason (`providerAuth` or `providerTrustPrompt`). A login needs a person. A trust
-prompt does not: the reconciler stops that exact incarnation and starts a replacement, whose driver
-admits the workspace again before Claude starts. Nothing is typed into the terminal. After three
+ready with its reason (`providerAuth` or `providerTrustPrompt`). A login needs a person. When the
+login prompt leaves the screen, because a person ran `/login` or the match was wrong, the reconciler
+records `provider-auth-restored`, lifts the fence, and resolves the person's request. If the prompt
+returns, it fences the incarnation again. A trust prompt does not need a person: the reconciler stops
+that exact incarnation and starts a replacement, whose driver admits the workspace again before
+Claude starts. Nothing is typed into the terminal. After three
 trust prompts in ten minutes the reconciler stops replacing the seat and asks the operator.
 
 The driver admits a workspace under Claude's own config lock (`.claude.json.lock`). Every Claude
