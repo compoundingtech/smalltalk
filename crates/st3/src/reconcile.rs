@@ -8073,6 +8073,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                     fields: spec.fields.iter().cloned().collect(),
                     cursor,
                     previous_facts,
+                    every_ms: spec.every_ms,
                 };
                 match provider.observe(request).await {
                     Ok(mut observation) => {

@@ -16,6 +16,7 @@ pub struct ObservationRequest {
     pub fields: BTreeSet<String>,
     pub cursor: Option<String>,
     pub previous_facts: Option<Value>,
+    pub every_ms: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -177,6 +178,7 @@ fn parse_github_ref_locator(locator: &str) -> Result<GithubRefLocator> {
 }
 
 async fn observe_github_ref(request: ObservationRequest) -> Result<ProviderObservation> {
+    let cache_for = github_cache_for(&request);
     let locator = parse_github_ref_locator(&request.locator)?;
     let client = github_client();
     let token = github_token().await?;
@@ -188,6 +190,7 @@ async fn observe_github_ref(request: ObservationRequest) -> Result<ProviderObser
         &client,
         format!("{base}/branches/{}", urlencoding::encode(&locator.name)),
         &token,
+        cache_for,
     )
     .await?
     .value;
@@ -206,6 +209,7 @@ async fn observe_github_ref(request: ObservationRequest) -> Result<ProviderObser
                     &client,
                     format!("{base}/branches?per_page=100&page={page}"),
                     &token,
+                    cache_for,
                 )
                 .await?
                 .value,
@@ -229,6 +233,7 @@ async fn observe_github_ref(request: ObservationRequest) -> Result<ProviderObser
                         &client,
                         format!("{base}/compare/{candidate_head}...{head}"),
                         &token,
+                        cache_for,
                     )
                     .await?
                     .value;
@@ -297,6 +302,7 @@ async fn observe_github_repository_at(
     api_base: &str,
     token: Option<&str>,
 ) -> Result<ProviderObservation> {
+    let cache_for = github_cache_for(&request);
     let token = token
         .filter(|value| !value.trim().is_empty())
         .context(GITHUB_AUTH_REMEDY)?;
@@ -312,7 +318,7 @@ async fn observe_github_repository_at(
     let base = format!("{api_base}/repos/{owner}/{repository}");
     // A renamed repository answers through a redirect. Its numeric ID proves that the locator
     // still names the repository whose items were observed before.
-    let repository_id = github_json(&client, base.clone(), token)
+    let repository_id = github_json(&client, base.clone(), token, cache_for)
         .await?
         .value
         .get("id")
@@ -323,6 +329,7 @@ async fn observe_github_repository_at(
             &client,
             format!("{base}/pulls?state=open&per_page=100"),
             token,
+            cache_for,
         )
         .await?
     } else {
@@ -333,6 +340,7 @@ async fn observe_github_repository_at(
             &client,
             format!("{base}/issues?state=open&per_page=100"),
             token,
+            cache_for,
         )
         .await?
     } else {
@@ -389,6 +397,14 @@ fn github_next_page(link: &str) -> Option<String> {
 
 const GITHUB_CACHE_FOR: Duration = Duration::from_secs(300);
 
+fn github_cache_for(request: &ObservationRequest) -> Duration {
+    request
+        .every_ms
+        .map(Duration::from_millis)
+        .unwrap_or(GITHUB_CACHE_FOR)
+        .min(GITHUB_CACHE_FOR)
+}
+
 #[derive(Clone)]
 struct GithubPayload {
     value: Value,
@@ -431,7 +447,12 @@ fn github_request_count(repository: &str) -> u64 {
 
 /// A URL is fetched at most once per cache interval on this host. A stale entry is revalidated
 /// with its ETag; a 304 keeps the complete prior body, including pagination links.
-async fn github_json(client: &reqwest::Client, url: String, token: &str) -> Result<GithubPayload> {
+async fn github_json(
+    client: &reqwest::Client,
+    url: String,
+    token: &str,
+    cache_for: Duration,
+) -> Result<GithubPayload> {
     let entry = {
         let mut cache = github_cache().lock().await;
         if cache.len() > 4_096 {
@@ -444,7 +465,7 @@ async fn github_json(client: &reqwest::Client, url: String, token: &str) -> Resu
     };
     let mut cached = entry.lock().await;
     if let Some(payload) = cached.as_ref()
-        && payload.checked_at.elapsed() < GITHUB_CACHE_FOR
+        && payload.checked_at.elapsed() < cache_for
     {
         return Ok(payload.clone());
     }
@@ -487,7 +508,12 @@ async fn github_json(client: &reqwest::Client, url: String, token: &str) -> Resu
     Ok(payload)
 }
 
-async fn github_pages(client: &reqwest::Client, url: String, token: &str) -> Result<Vec<Value>> {
+async fn github_pages(
+    client: &reqwest::Client,
+    url: String,
+    token: &str,
+    cache_for: Duration,
+) -> Result<Vec<Value>> {
     let mut next = Some(url);
     let mut pages = 0;
     let mut values = Vec::new();
@@ -496,7 +522,7 @@ async fn github_pages(client: &reqwest::Client, url: String, token: &str) -> Res
             pages < GITHUB_LIST_PAGES,
             "the GitHub listing has more than {GITHUB_LIST_PAGES} pages"
         );
-        let payload = github_json(client, url, token).await?;
+        let payload = github_json(client, url, token, cache_for).await?;
         values.extend(serde_json::from_value::<Vec<Value>>(payload.value)?);
         next = payload.next;
         pages += 1;
@@ -693,6 +719,7 @@ async fn observe_github_pull_request_at(
     api_base: &str,
     token: Option<&str>,
 ) -> Result<ProviderObservation> {
+    let cache_for = github_cache_for(&request);
     let token = token
         .filter(|value| !value.trim().is_empty())
         .context(GITHUB_AUTH_REMEDY)?;
@@ -712,6 +739,7 @@ async fn observe_github_pull_request_at(
         &client,
         format!("{base}/pulls?state=open&per_page=100"),
         token,
+        cache_for,
     )
     .await?;
     let pull = if let Some(pull) = pulls
@@ -720,7 +748,7 @@ async fn observe_github_pull_request_at(
     {
         pull
     } else {
-        github_json(&client, format!("{base}/pulls/{number}"), token)
+        github_json(&client, format!("{base}/pulls/{number}"), token, cache_for)
             .await?
             .value
     };
@@ -746,6 +774,7 @@ async fn observe_github_pull_request_at(
             &client,
             format!("{base}/pulls/{number}/reviews?per_page=100"),
             token,
+            cache_for,
         )
         .await?;
         let normalized = reviews
@@ -771,6 +800,7 @@ async fn observe_github_pull_request_at(
             &client,
             format!("{base}/commits/{head}/check-runs?per_page=100"),
             token,
+            cache_for,
         )
         .await?
         .value;
@@ -842,6 +872,7 @@ mod tests {
             fields: BTreeSet::new(),
             cursor: None,
             previous_facts: None,
+            every_ms: None,
         };
         for token in [None, Some(""), Some(" ")] {
             let error = observe_github_repository_at(request.clone(), &base, token)
@@ -883,6 +914,7 @@ mod tests {
                 fields: BTreeSet::from(["state".into()]),
                 cursor: None,
                 previous_facts: None,
+                every_ms: None,
             })
             .await
             .unwrap();
@@ -956,6 +988,7 @@ mod tests {
                 fields: BTreeSet::from(["content_hash".into(), "size".into(), "status".into()]),
                 cursor: None,
                 previous_facts: None,
+                every_ms: None,
             })
             .await
             .unwrap();
@@ -976,6 +1009,7 @@ mod tests {
                 fields: BTreeSet::from(["status".into()]),
                 cursor: None,
                 previous_facts: None,
+                every_ms: None,
             })
             .await
             .unwrap();
@@ -1068,6 +1102,7 @@ mod tests {
             fields: BTreeSet::from(["issues".into()]),
             cursor: None,
             previous_facts: None,
+            every_ms: None,
         };
         let first = observe_github_repository_at(request.clone(), &base, Some("orchid-test-token"))
             .await
@@ -1085,19 +1120,7 @@ mod tests {
         .unwrap();
         assert_eq!(second.facts, first.facts);
         assert_eq!(second.facts["repository_id"], 7);
-        let entries = github_cache()
-            .lock()
-            .await
-            .iter()
-            .filter(|(url, _)| url.starts_with(&base))
-            .map(|(_, entry)| entry.clone())
-            .collect::<Vec<_>>();
-        for entry in entries {
-            let mut cached = entry.lock().await;
-            if let Some(payload) = cached.as_mut() {
-                payload.checked_at = Instant::now() - GITHUB_CACHE_FOR;
-            }
-        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
         let third = observe_github_repository_at(
             ObservationRequest {
                 cursor: second.cursor.clone(),
@@ -1105,6 +1128,7 @@ mod tests {
                 provider: "github.repository".into(),
                 locator: "example/repo".into(),
                 fields: BTreeSet::from(["issues".into()]),
+                every_ms: Some(1),
             },
             &base,
             Some("orchid-test-token"),
@@ -1161,6 +1185,7 @@ mod tests {
                     fields: BTreeSet::from(["head".into()]),
                     cursor: None,
                     previous_facts: None,
+                    every_ms: None,
                 },
                 &base,
                 Some("orchid-test-token"),
