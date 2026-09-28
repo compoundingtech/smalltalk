@@ -82,6 +82,8 @@ order from the same admitted claims.
 | `replica_envelopes` | Replicated authority | Authenticated outer envelopes and their exact payloads |
 | `replica_records` | Admission state | Envelope records, validation results, and repair references |
 | `projection_health` | Local diagnostic projection | Projection attempts against admitted authority |
+| `replica_envelope_signatures` | Replicated authority | Writers' member-key signatures over envelopes, verified at receipt |
+| `replica_envelope_holds` | Admission state | Envelopes held as `unsigned` or `fenced` by fleet membership; retried on each wake |
 | `replication_peers` | Local transport state | Last signed exchange or transport failure for each configured peer |
 | `peer_cursors` | Legacy test state | The removed cursor protocol; production does not use this table |
 | `peer_replica_cursors` | Legacy test state | The removed cursor protocol; production does not use this table |
