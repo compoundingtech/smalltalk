@@ -582,6 +582,13 @@ impl Client {
     pub async fn capabilities(&self) -> Result<Envelope<Capabilities>, ClientError> {
         self.capabilities_internal().await
     }
+    pub async fn document_get(&self, name: &str) -> Result<Envelope<DocumentContent>, ClientError> {
+        self.get(&format!(
+            "/v1/client/documents/content?name={}",
+            percent_encode(name)
+        ))
+        .await
+    }
     pub async fn now_list(
         &self,
         cursor: Option<&str>,

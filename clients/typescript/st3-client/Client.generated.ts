@@ -205,6 +205,7 @@ export class St3Client {
         return { close: () => { if (!ended) { ended = true; socket.close(1000); } } };
     }
 
+    async documentGet(name: string): Promise<EnvelopeOf<DocumentContent>> { return this.get('/v1/client/documents/content' + query({ name })); }
     async nowList(options: ListOptions = {}): Promise<EnvelopeOf<Page>> { return this.get('/v1/client/now' + query(options)); }
     async machinesList(options: ListOptions = {}): Promise<EnvelopeOf<Page>> { return this.get('/v1/client/machines' + query(options)); }
     async devicesList(options: ListOptions = {}): Promise<EnvelopeOf<Page>> { return this.get('/v1/client/devices' + query(options)); }

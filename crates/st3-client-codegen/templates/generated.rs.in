@@ -232,6 +232,14 @@ pub struct Attention {
     pub source_id: String,
     pub person_id: String,
     pub requester_id: Option<String>,
+    pub launch_id: Option<String>,
+    pub variant_id: Option<String>,
+    pub message_id: Option<String>,
+    pub preview_token: Option<String>,
+    pub preview: Option<LaunchPreview>,
+    pub what: Option<String>,
+    pub because: Option<String>,
+    pub fix: Option<Value>,
     pub review_mode: Option<String>,
     pub mission_id: Option<String>,
     pub mission_run_id: Option<String>,
@@ -254,6 +262,20 @@ pub struct AttentionTargetState {
     pub state: String,
     #[serde(default)]
     pub since: Option<String>,
+}
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct DocumentContent {
+    pub reference: String,
+    pub bytes: Vec<u8>,
+}
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct LaunchPreview {
+    pub goal: String,
+    pub steps: Vec<Value>,
+    pub agents: Vec<Value>,
+    pub gates: Value,
+    pub diagnostics_count: u64,
+    pub request_excerpt: String,
 }
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct Message {
@@ -393,6 +415,8 @@ pub struct Launch {
     pub title: String,
     pub phase: String,
     pub request: String,
+    pub preview_token: Option<String>,
+    pub preview: Option<LaunchPreview>,
     pub planner: String,
     pub planner_config: PlannerConfig,
     pub target: Value,

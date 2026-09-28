@@ -2358,7 +2358,8 @@ impl<R: RuntimeControl> Reconciler<R> {
         let newest = self.store.newest_claim_index(subject, "intent.desired")?;
         if let Some((index, declared)) = self
             .declared_checkouts
-            .lock().unwrap_or_else(PoisonError::into_inner)
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
             .get(subject)
             && *index == newest
         {
@@ -2387,7 +2388,8 @@ impl<R: RuntimeControl> Reconciler<R> {
             });
         let mut declared_checkouts = self
             .declared_checkouts
-            .lock().unwrap_or_else(PoisonError::into_inner);
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         if declared_checkouts.len() >= DECLARED_CHECKOUT_LIMIT
             && !declared_checkouts.contains_key(subject)
         {
@@ -12431,11 +12433,13 @@ mission "feedback-review" state="ready" {
             .latest_claim(&step.subject, Some("step-run.retried"))
             .unwrap()
             .unwrap();
-        assert!(retry_claim
-            .body
-            .pointer("/fields/not_before_unix_ms")
-            .unwrap()
-            .is_null());
+        assert!(
+            retry_claim
+                .body
+                .pointer("/fields/not_before_unix_ms")
+                .unwrap()
+                .is_null()
+        );
         let messages = store.messages(Some(&claimant), false).unwrap();
         assert_eq!(messages.len(), 1);
         assert!(
@@ -18464,6 +18468,36 @@ subscription "reviews" {{
                 .unwrap()
                 .iter()
                 .any(|item| { item.kind == "fault" && item.targets == ["subscription/reviews"] })
+        );
+        let failure_attention = store
+            .attention_items(None)
+            .unwrap()
+            .into_iter()
+            .find(|item| item.kind == "fault" && item.targets == ["subscription/reviews"])
+            .unwrap();
+        assert!(
+            failure_attention
+                .subject
+                .starts_with("attention/subscription-failure-")
+        );
+        let resolved = store
+            .resolve_attention(
+                &failure_attention.subject,
+                &crate::model::AttentionResolveRequest {
+                    outcome: "resolved".into(),
+                    reason: Some("Corrected the subscription input".into()),
+                    actor: "person/nathan".into(),
+                    idempotency_key: "resolve-subscription-failure".into(),
+                },
+            )
+            .unwrap();
+        assert_eq!(resolved.status, "resolved");
+        assert!(
+            !store
+                .attention_items(None)
+                .unwrap()
+                .iter()
+                .any(|item| item.subject == failure_attention.subject)
         );
     }
 
