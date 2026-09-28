@@ -26,10 +26,10 @@ use crate::model::{
     PlannerSpec, PlanningCandidateView, PlanningPreviewView, PlanningSessionDeclaration,
     PlanningSessionView, PlanningVariantView, ReplicaBatch, ReplicaEnvelope, ReplicaEnvelopeId,
     ReplicaRecordView, ReplicaRepairDeclaration, ReplicationExchange, ReplicationInventory,
-    ReplicationInventoryBucket, ReplicationPeerStatus, ReplicationReceipt, ReplicationStatus,
-    ResourceObservationOutcome, ResourceRefreshOperation, RevisionCutover, RevisionProposalView,
-    RevisionSubmissionView, RunGenerationView, RuntimeResetOperation, St3Error, StatusResponse,
-    StepRunView, SubjectChange, SubjectStatus, SubscriptionConditionSpec,
+    ReplicationInventoryBucket, ReplicationPeerStatus, ReplicationPeerSync, ReplicationReceipt,
+    ReplicationStatus, ResourceObservationOutcome, ResourceRefreshOperation, RevisionCutover,
+    RevisionProposalView, RevisionSubmissionView, RunGenerationView, RuntimeResetOperation,
+    St3Error, StatusResponse, StepRunView, SubjectChange, SubjectStatus, SubscriptionConditionSpec,
     SubscriptionRequestDecision, SubscriptionRequestView, SubscriptionSpec, UsageSummary,
     WorkRequest, WorkSelector, WorkWakeView,
 };
@@ -428,6 +428,39 @@ CREATE TABLE IF NOT EXISTS graph_generation (
     value INTEGER NOT NULL
 );
 INSERT OR IGNORE INTO graph_generation(id, value) VALUES (1, 0);
+
+CREATE TABLE IF NOT EXISTS replica_envelope_signatures (
+    writer TEXT NOT NULL,
+    sequence INTEGER NOT NULL,
+    envelope_hash TEXT NOT NULL,
+    member_key TEXT NOT NULL,
+    signature TEXT NOT NULL,
+    stored_at_unix_ms TEXT NOT NULL,
+    PRIMARY KEY(writer, sequence, envelope_hash, member_key)
+);
+
+CREATE TABLE IF NOT EXISTS fleet_invite_tokens (
+    invite_id TEXT PRIMARY KEY,
+    token TEXT,
+    expires_at_unix_ms TEXT NOT NULL,
+    name TEXT,
+    migrate INTEGER NOT NULL DEFAULT 0,
+    bound_key TEXT,
+    bound_name TEXT,
+    failures INTEGER NOT NULL DEFAULT 0,
+    admitted_claim TEXT,
+    writer_floor INTEGER,
+    created_by TEXT
+);
+
+CREATE TABLE IF NOT EXISTS replica_envelope_holds (
+    writer TEXT NOT NULL,
+    sequence INTEGER NOT NULL,
+    envelope_hash TEXT NOT NULL,
+    reason TEXT NOT NULL CHECK(reason IN ('unsigned','fenced')),
+    updated_at_unix_ms TEXT NOT NULL,
+    PRIMARY KEY(writer, sequence, envelope_hash)
+);
 PRAGMA user_version = 13;
 "#;
 
@@ -562,6 +595,9 @@ pub struct Store {
     seeded_batch_rowid: AtomicI64,
     replica_generation: AtomicU64,
     replication_snapshot: Mutex<Option<Arc<ReplicationSnapshot>>>,
+    replication_sync: Mutex<BTreeMap<String, PeerSyncProgress>>,
+    /// This node's fleet member key. Set, it signs every envelope of this node's writer.
+    member_key: std::sync::RwLock<Option<Arc<crate::fleet::MemberKey>>>,
     origin: String,
 }
 
@@ -633,6 +669,71 @@ struct ReplicationSnapshot {
     authority_digest: String,
     graph_generation: i64,
     graph_digest: String,
+}
+
+/// Live sync measurements for one peer. They are rebuilt by the first exchange after a restart,
+/// so they stay in memory rather than in the graph.
+#[derive(Clone, Debug, Default)]
+struct PeerSyncProgress {
+    measured: Option<ReplicationPeerSync>,
+    window_started_at_unix_ms: u128,
+    window_peer_only: u64,
+    window_received: u64,
+}
+
+impl PeerSyncProgress {
+    /// Record one receipt from the peer and, when the peer's inventory allowed it, the measured
+    /// difference `(peer_only, local_only)`. Rates are sampled over windows of at least
+    /// `REPLICATION_SYNC_WINDOW_MS` and smoothed so one slow exchange does not swing the estimate.
+    fn observe(&mut self, received: usize, difference: Option<(u64, u64)>, now: u128) {
+        self.window_received = self.window_received.saturating_add(received as u64);
+        let Some((peer_only, local_only)) = difference else {
+            return;
+        };
+        let mut sync = self.measured.take().unwrap_or_default();
+        sync.peer_only_envelopes = peer_only;
+        sync.local_only_envelopes = local_only;
+        sync.measured_at_unix_ms = now;
+        let elapsed = now.saturating_sub(self.window_started_at_unix_ms);
+        if self.window_started_at_unix_ms != 0 && elapsed >= REPLICATION_SYNC_WINDOW_MS {
+            if elapsed <= REPLICATION_SYNC_STALE_MS {
+                let seconds = elapsed as f64 / 1000.0;
+                let smooth = |previous: Option<f64>, sample: f64| {
+                    Some(previous.map_or(sample, |previous| (previous + sample) / 2.0))
+                };
+                sync.receive_rate_per_second = smooth(
+                    sync.receive_rate_per_second,
+                    self.window_received as f64 / seconds,
+                );
+                let caught_up = self.window_peer_only as f64 - peer_only as f64;
+                sync.catch_up_rate_per_second =
+                    smooth(sync.catch_up_rate_per_second, caught_up.max(0.0) / seconds);
+            }
+            self.window_started_at_unix_ms = 0;
+        }
+        if self.window_started_at_unix_ms == 0 {
+            self.window_started_at_unix_ms = now;
+            self.window_peer_only = peer_only;
+            self.window_received = 0;
+        }
+        sync.estimated_catch_up_seconds = if peer_only == 0 {
+            Some(0)
+        } else {
+            sync.catch_up_rate_per_second
+                .filter(|rate| *rate > 0.0)
+                .map(|rate| (peer_only as f64 / rate).ceil() as u64)
+        };
+        self.measured = Some(sync);
+    }
+
+    /// The last measurement, marked as catching up while it is recent and the peer holds more
+    /// than one exchange of envelopes this node lacks.
+    fn view(&self, now: u128) -> Option<ReplicationPeerSync> {
+        let mut sync = self.measured.clone()?;
+        sync.catching_up = sync.peer_only_envelopes > REPLICATION_EXCHANGE_ENVELOPE_LIMIT as u64
+            && now.saturating_sub(sync.measured_at_unix_ms) <= REPLICATION_SYNC_STALE_MS;
+        Some(sync)
+    }
 }
 
 /// The replica envelope identities a snapshot keeps for its whole life. Writers are interned
@@ -890,6 +991,8 @@ pub struct ReplicationAdmission {
     pub valid: usize,
     pub unknown: usize,
     pub invalid: usize,
+    /// Envelopes held as `unsigned` or `fenced` by the fleet membership rules.
+    pub held: usize,
     pub changed: bool,
 }
 
@@ -1175,6 +1278,8 @@ impl Store {
             seeded_batch_rowid: AtomicI64::new(seeded_batch_rowid),
             replica_generation: AtomicU64::new(0),
             replication_snapshot: Mutex::new(None),
+            replication_sync: Mutex::new(BTreeMap::new()),
+            member_key: std::sync::RwLock::new(None),
             origin,
         })
     }
@@ -1214,6 +1319,8 @@ impl Store {
             seeded_batch_rowid: AtomicI64::new(seeded_batch_rowid),
             replica_generation: AtomicU64::new(0),
             replication_snapshot: Mutex::new(None),
+            replication_sync: Mutex::new(BTreeMap::new()),
+            member_key: std::sync::RwLock::new(None),
             origin,
         })
     }
@@ -6344,7 +6451,21 @@ impl Store {
                 .with_detail("current_head", json!(actual)));
             }
         }
-        let stored_fields = normalize_resource_observation(&transaction, input)?;
+        let mut stored_fields = normalize_resource_observation(&transaction, input)?;
+        // A leave names its own batch as the last sequence of its window. The sequence is only
+        // known here, under the writer lock, so a zero high water stands for "this batch".
+        if input.kind == "fleet.member-left"
+            && input.fields.get("high_water").and_then(Value::as_u64) == Some(0)
+        {
+            let mut fields = stored_fields
+                .clone()
+                .unwrap_or_else(|| input.fields.clone());
+            fields.insert(
+                "high_water".into(),
+                Value::from(next_replica_sequence(&transaction, &self.origin).map_err(internal)?),
+            );
+            stored_fields = Some(fields);
+        }
         if validate_message_transition(&transaction, input)? {
             let latest_id = latest_claim_id_tx(&transaction, &input.subject)
                 .map_err(internal)?
@@ -8422,6 +8543,7 @@ impl Store {
                     kind: "fault".into(),
                     subject: failure.id,
                     person: reviewer,
+                    requester_id: None,
                     title: "Subscription mission failed".into(),
                     detail: format!("{code}: {reason}"),
                     mission: None,
@@ -9914,7 +10036,9 @@ impl Store {
         let latest_batch = max_batch_rowid(&connection)?;
         if latest_batch > seeded_through {
             let transaction = connection.transaction()?;
+            let envelopes_before = max_envelope_rowid(&transaction)?;
             seed_replica_envelopes_tx(&transaction, &self.origin, Some(seeded_through))?;
+            self.sign_own_envelopes_tx(&transaction, Some(envelopes_before))?;
             transaction.commit()?;
             self.seeded_batch_rowid
                 .store(latest_batch, Ordering::Release);
@@ -10045,6 +10169,7 @@ impl Store {
 
     pub fn export_replication_summary(&self, fleet_id: &str) -> Result<ReplicationExchange> {
         let snapshot = self.replication_snapshot()?;
+        let signature_requests = self.replication_signature_requests()?;
         Ok(ReplicationExchange {
             peer: self.origin.clone(),
             fleet_id: fleet_id.to_owned(),
@@ -10057,10 +10182,34 @@ impl Store {
                 buckets: snapshot.buckets.clone(),
             },
             envelopes: Vec::new(),
+            signature_requests,
+            signatures: Vec::new(),
         })
     }
 
     pub fn export_replication_exchange(
+        &self,
+        fleet_id: &str,
+        remote: &ReplicationInventory,
+    ) -> Result<ReplicationExchange> {
+        self.export_replication_exchange_answering(fleet_id, remote, &[])
+    }
+
+    /// Export what the peer lacks, answer its signature requests, and ask for the signatures
+    /// this node still needs.
+    pub fn export_replication_exchange_answering(
+        &self,
+        fleet_id: &str,
+        remote: &ReplicationInventory,
+        signature_requests: &[ReplicaEnvelopeId],
+    ) -> Result<ReplicationExchange> {
+        let mut exchange = self.export_replication_difference(fleet_id, remote)?;
+        exchange.signatures = self.replication_signatures_for(signature_requests)?;
+        exchange.signature_requests = self.replication_signature_requests()?;
+        Ok(exchange)
+    }
+
+    fn export_replication_difference(
         &self,
         fleet_id: &str,
         remote: &ReplicationInventory,
@@ -10087,6 +10236,8 @@ impl Store {
                     buckets: snapshot.buckets.clone(),
                 },
                 envelopes: self.replica_envelopes(missing)?,
+                signature_requests: Vec::new(),
+                signatures: Vec::new(),
             });
         }
         // A peer without range digests (an older build, or an explicit full-inventory request)
@@ -10127,6 +10278,8 @@ impl Store {
                 snapshot.inventory.public()
             },
             envelopes: self.replica_envelopes(missing)?,
+            signature_requests: Vec::new(),
+            signatures: Vec::new(),
         })
     }
 
@@ -10135,9 +10288,19 @@ impl Store {
         let mut envelopes = Vec::with_capacity(missing.len());
         for identity in missing {
             let envelope = connection.query_row(
-                "SELECT previous_hash, accepted_at_unix_ms, payload
-                 FROM replica_envelopes
-                 WHERE writer=?1 AND sequence=?2 AND envelope_hash=?3",
+                "SELECT envelopes.previous_hash, envelopes.accepted_at_unix_ms, envelopes.payload,
+                        (SELECT member_key FROM replica_envelope_signatures AS signatures
+                         WHERE signatures.writer=envelopes.writer
+                           AND signatures.sequence=envelopes.sequence
+                           AND signatures.envelope_hash=envelopes.envelope_hash
+                         ORDER BY member_key LIMIT 1),
+                        (SELECT signature FROM replica_envelope_signatures AS signatures
+                         WHERE signatures.writer=envelopes.writer
+                           AND signatures.sequence=envelopes.sequence
+                           AND signatures.envelope_hash=envelopes.envelope_hash
+                         ORDER BY member_key LIMIT 1)
+                 FROM replica_envelopes AS envelopes
+                 WHERE envelopes.writer=?1 AND envelopes.sequence=?2 AND envelopes.envelope_hash=?3",
                 params![identity.writer, identity.sequence, identity.hash],
                 |row| {
                     let accepted_at = row.get::<_, String>(1)?;
@@ -10148,6 +10311,8 @@ impl Store {
                         hash: identity.hash.clone(),
                         accepted_at_unix_ms: accepted_at.parse().unwrap_or_default(),
                         payload: row.get(2)?,
+                        member_key: row.get(3)?,
+                        signature: row.get(4)?,
                     })
                 },
             )?;
@@ -10178,8 +10343,23 @@ impl Store {
         let transaction = connection.transaction().map_err(internal)?;
         let mut received = 0;
         let mut duplicate = 0;
+        let mut signatures = 0;
         let now = now_ms().to_string();
         for envelope in &input.envelopes {
+            if let (Some(member_key), Some(signature)) = (&envelope.member_key, &envelope.signature)
+            {
+                signatures += store_envelope_signature_tx(
+                    &transaction,
+                    fleet_id,
+                    &envelope.writer,
+                    envelope.sequence,
+                    &envelope.hash,
+                    member_key,
+                    signature,
+                    &now,
+                )
+                .map_err(internal)?;
+            }
             let inserted = transaction
                 .execute(
                     "INSERT OR IGNORE INTO replica_envelopes(
@@ -10204,6 +10384,19 @@ impl Store {
                 received += 1;
             }
         }
+        for signature in &input.signatures {
+            signatures += store_envelope_signature_tx(
+                &transaction,
+                fleet_id,
+                &signature.writer,
+                signature.sequence,
+                &signature.hash,
+                &signature.member_key,
+                &signature.signature,
+                &now,
+            )
+            .map_err(internal)?;
+        }
         transaction
             .execute(
                 "INSERT INTO replication_peers(peer, status, last_success_at_unix_ms, schema_digest,
@@ -10222,9 +10415,21 @@ impl Store {
         }
         drop(connection);
         let snapshot = self.replication_snapshot().map_err(internal)?;
+        let difference = replication_inventory_difference(
+            &snapshot.inventory,
+            &snapshot.buckets,
+            &input.inventory,
+        );
+        self.replication_sync
+            .lock()
+            .expect("replication sync mutex poisoned")
+            .entry(relay.to_owned())
+            .or_default()
+            .observe(received, difference, now_ms());
         Ok(ReplicationReceipt {
             received,
             duplicate,
+            signatures,
             inventory: ReplicationInventory {
                 digest: snapshot.inventory.digest.clone(),
                 envelopes: Vec::new(),
@@ -10234,7 +10439,19 @@ impl Store {
     }
 
     pub fn validate_replication_backlog(&self) -> Result<ReplicationAdmission> {
+        // Seed and sign local batches first, so local membership claims decide admission.
+        self.replication_snapshot()?;
         let mut connection = self.connection.lock().expect("store mutex poisoned");
+        // Builds before the insertion-order hash fallback rejected genuine claims from
+        // 2026-09-16 as hash mismatches. Check those records once more, once.
+        let retry_hash_mismatches = connection
+            .query_row(
+                "SELECT 1 FROM meta WHERE key='legacy_claim_hash_retried'",
+                [],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_none();
         let mut statement = connection.prepare(
             "WITH retry_ids AS (
                  SELECT writer, sequence, envelope_hash FROM replica_envelopes
@@ -10244,6 +10461,7 @@ impl Store {
                  WHERE state='unknown'
                     OR (state='invalid' AND error_code='invalid-replicated-claim'
                         AND error_message LIKE '%violates unknown-claim-field:%')
+                    OR (?1 AND state='invalid' AND error_code='claim-hash-mismatch')
              )
              SELECT envelopes.writer, envelopes.sequence, envelopes.envelope_hash,
                     envelopes.previous_hash, envelopes.accepted_at_unix_ms, envelopes.payload
@@ -10253,7 +10471,7 @@ impl Store {
              ORDER BY envelopes.writer, envelopes.sequence, envelopes.envelope_hash",
         )?;
         let envelopes = statement
-            .query_map([], |row| {
+            .query_map([retry_hash_mismatches], |row| {
                 Ok(ReplicaEnvelope {
                     writer: row.get(0)?,
                     sequence: row.get(1)?,
@@ -10261,51 +10479,58 @@ impl Store {
                     previous_hash: row.get(3)?,
                     accepted_at_unix_ms: row.get::<_, String>(4)?.parse().unwrap_or_default(),
                     payload: row.get(5)?,
+                    member_key: None,
+                    signature: None,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
         drop(statement);
         let mut outcome = ReplicationAdmission::default();
-        for envelope in envelopes {
-            let transaction = connection.transaction()?;
-            let result = validate_and_admit_envelope_tx(&transaction, &envelope, &mut outcome);
-            match result {
-                Ok(()) => transaction.commit()?,
-                Err(error) => {
-                    transaction.rollback()?;
-                    let record_ref =
-                        replica_record_ref(&envelope.writer, envelope.sequence, &envelope.hash, 0);
-                    connection.execute(
-                        "INSERT INTO replica_records(
-                             record_ref, writer, sequence, envelope_hash, position, raw, state,
-                             error_code, error_message, updated_at_unix_ms
-                         ) VALUES (?1, ?2, ?3, ?4, 0, ?5, 'invalid', ?6, ?7, ?8)
-                         ON CONFLICT(record_ref) DO UPDATE SET state='invalid', error_code=excluded.error_code,
-                            error_message=excluded.error_message, updated_at_unix_ms=excluded.updated_at_unix_ms",
-                        params![
-                            record_ref,
-                            envelope.writer,
-                            envelope.sequence,
-                            envelope.hash,
-                            envelope.payload,
-                            error.code,
-                            error.message,
-                            now_ms().to_string(),
-                        ],
-                    )?;
-                    connection.execute(
-                        "UPDATE replica_envelopes SET receipt_state='degraded', validation_error=?4
-                         WHERE writer=?1 AND sequence=?2 AND envelope_hash=?3",
-                        params![
-                            envelope.writer,
-                            envelope.sequence,
-                            envelope.hash,
-                            error.message
-                        ],
-                    )?;
-                    outcome.invalid += 1;
+        let mut membership = fleet_membership_tx(&connection)?;
+        let mut pending = envelopes;
+        // Admitting one envelope can admit a membership claim that decides another envelope,
+        // so held envelopes get another pass whenever membership changes.
+        loop {
+            let mut held = Vec::new();
+            let mut membership_changed = false;
+            for envelope in pending {
+                if let Some(reason) = fleet_admission_hold(&connection, &membership, &envelope)? {
+                    hold_replica_envelope(&connection, &envelope, reason)?;
+                    held.push(envelope);
+                    continue;
+                }
+                let transaction = connection.transaction()?;
+                let result = validate_and_admit_envelope_tx(&transaction, &envelope, &mut outcome);
+                match result {
+                    Ok(()) => {
+                        transaction.execute(
+                            "DELETE FROM replica_envelope_holds
+                             WHERE writer=?1 AND sequence=?2 AND envelope_hash=?3",
+                            params![envelope.writer, envelope.sequence, envelope.hash],
+                        )?;
+                        membership_changed |=
+                            envelope_carries_fleet_claims(&transaction, &envelope)?;
+                        transaction.commit()?;
+                    }
+                    Err(error) => {
+                        transaction.rollback()?;
+                        record_invalid_replica_envelope(&connection, &envelope, &error)?;
+                        outcome.invalid += 1;
+                    }
                 }
             }
+            if !membership_changed || held.is_empty() {
+                outcome.held = held.len();
+                break;
+            }
+            membership = fleet_membership_tx(&connection)?;
+            pending = held;
+        }
+        if retry_hash_mismatches {
+            connection.execute(
+                "INSERT OR REPLACE INTO meta(key, value) VALUES ('legacy_claim_hash_retried', ?1)",
+                [now_ms().to_string()],
+            )?;
         }
         Ok(outcome)
     }
@@ -10589,7 +10814,30 @@ impl Store {
             .find(|record| record.record_ref == record_ref))
     }
 
-    pub fn record_peer_failure(&self, peer: &str, status: &str, error: &str) -> Result<()> {
+    pub fn record_peer_failure(&self, peer: &str, status: &str, error: &str) -> Result<bool> {
+        // An inbound exchange is just as good evidence of reachability as an outbound one.
+        // Keep the last success during a short missed-exchange window, so a failed dial on
+        // one side cannot flap a peer that is still exchanging in the other direction.
+        if self
+            .replication_peer_last_success(peer)?
+            .is_some_and(|last| now_ms().saturating_sub(last) < 90_000)
+        {
+            return Ok(false);
+        }
+        if self
+            .readers
+            .get()
+            .query_row(
+                "SELECT status FROM replication_peers WHERE peer=?1",
+                [peer],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .as_deref()
+            == Some(status)
+        {
+            return Ok(true);
+        }
         {
             let connection = self.connection.lock().expect("store mutex poisoned");
             connection.execute(
@@ -10600,7 +10848,7 @@ impl Store {
                 params![peer, status, error, now_ms().to_string()],
             )?;
         }
-        Ok(())
+        Ok(true)
     }
 
     pub(crate) fn record_transport_observation(
@@ -10666,6 +10914,44 @@ impl Store {
             .and_then(|value| value.parse().ok()))
     }
 
+    /// Whether any peer's latest measurement says this node is catching up with it.
+    pub fn replication_catching_up(&self) -> bool {
+        let now = now_ms();
+        self.replication_sync
+            .lock()
+            .expect("replication sync mutex poisoned")
+            .values()
+            .any(|progress| progress.view(now).is_some_and(|sync| sync.catching_up))
+    }
+
+    /// The latest sync measurement for each configured peer that has one.
+    pub fn replication_peer_sync(
+        &self,
+        configured_peers: &[String],
+    ) -> BTreeMap<String, ReplicationPeerSync> {
+        let now = now_ms();
+        let progress = self
+            .replication_sync
+            .lock()
+            .expect("replication sync mutex poisoned");
+        configured_peers
+            .iter()
+            .filter_map(|peer| Some((peer.clone(), progress.get(peer)?.view(now)?)))
+            .collect()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn age_replication_peer_for_test(&self, peer: &str) {
+        self.connection
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE replication_peers SET last_success_at_unix_ms=?2 WHERE peer=?1",
+                params![peer, now_ms().saturating_sub(86_400_000).to_string()],
+            )
+            .unwrap();
+    }
+
     pub fn replication_status(
         &self,
         configured: bool,
@@ -10681,40 +10967,43 @@ impl Store {
                 |row| row.get(0),
             )?)
         };
+        let sync = self.replication_peer_sync(configured_peers);
         let mut peers = Vec::new();
         for peer in configured_peers {
-            peers.push(
-                connection
-                    .query_row(
-                        "SELECT status, last_success_at_unix_ms, last_error, schema_digest,
+            let mut status = connection
+                .query_row(
+                    "SELECT status, last_success_at_unix_ms, last_error, schema_digest,
                                 authority_digest, graph_digest
                          FROM replication_peers WHERE peer=?1",
-                        [peer],
-                        |row| {
-                            Ok(ReplicationPeerStatus {
-                                peer: peer.clone(),
-                                status: row.get(0)?,
-                                last_success_at_unix_ms: row
-                                    .get::<_, Option<String>>(1)?
-                                    .and_then(|value| value.parse().ok()),
-                                last_error: row.get(2)?,
-                                schema_digest: row.get(3)?,
-                                authority_digest: row.get(4)?,
-                                graph_digest: row.get(5)?,
-                            })
-                        },
-                    )
-                    .optional()?
-                    .unwrap_or(ReplicationPeerStatus {
-                        peer: peer.clone(),
-                        status: "unknown".into(),
-                        last_success_at_unix_ms: None,
-                        last_error: None,
-                        schema_digest: None,
-                        authority_digest: None,
-                        graph_digest: None,
-                    }),
-            );
+                    [peer],
+                    |row| {
+                        Ok(ReplicationPeerStatus {
+                            peer: peer.clone(),
+                            status: row.get(0)?,
+                            last_success_at_unix_ms: row
+                                .get::<_, Option<String>>(1)?
+                                .and_then(|value| value.parse().ok()),
+                            last_error: row.get(2)?,
+                            schema_digest: row.get(3)?,
+                            authority_digest: row.get(4)?,
+                            graph_digest: row.get(5)?,
+                            sync: None,
+                        })
+                    },
+                )
+                .optional()?
+                .unwrap_or(ReplicationPeerStatus {
+                    peer: peer.clone(),
+                    status: "unknown".into(),
+                    last_success_at_unix_ms: None,
+                    last_error: None,
+                    schema_digest: None,
+                    authority_digest: None,
+                    graph_digest: None,
+                    sync: None,
+                });
+            status.sync = sync.get(peer).cloned();
+            peers.push(status);
         }
         Ok(ReplicationStatus {
             configured,
@@ -10731,6 +11020,16 @@ impl Store {
             unknown_records: count("unknown")?,
             invalid_records: count("invalid")?,
             repaired_records: count("repaired")?,
+            unsigned_envelopes: connection.query_row(
+                "SELECT COUNT(*) FROM replica_envelope_holds WHERE reason='unsigned'",
+                [],
+                |row| row.get(0),
+            )?,
+            fenced_envelopes: connection.query_row(
+                "SELECT COUNT(*) FROM replica_envelope_holds WHERE reason='fenced'",
+                [],
+                |row| row.get(0),
+            )?,
             unhealthy_projections: connection.query_row(
                 "SELECT COUNT(*) FROM projection_health WHERE status<>'healthy'",
                 [],
@@ -13772,10 +14071,15 @@ fn insert_event(
     Ok(())
 }
 
+/// The next sequence for a local batch: one past the writer's highest batch, and past the
+/// writer floor this store took when it joined under a name the fleet had used before.
 fn next_replica_sequence(transaction: &Transaction<'_>, origin: &str) -> Result<u64> {
     transaction
         .query_row(
-            "SELECT COALESCE(MAX(replica_sequence), 0) + 1 FROM batches WHERE origin=?1",
+            "SELECT MAX(
+                 COALESCE((SELECT MAX(replica_sequence) FROM batches WHERE origin=?1), 0),
+                 COALESCE((SELECT CAST(value AS INTEGER) FROM meta WHERE key='writer_floor/' || ?1), 0)
+             ) + 1",
             [origin],
             |row| row.get(0),
         )
@@ -15054,6 +15358,7 @@ fn attention_item_from_review(review: HumanReviewView) -> AttentionItemView {
         kind: "human-gate".into(),
         subject: review.owner.clone(),
         person: review.reviewer.clone(),
+        requester_id: None,
         title: review
             .title
             .clone()
@@ -15101,6 +15406,7 @@ fn attention_item_from_planning(
         kind: "launch-approval".into(),
         subject: session.subject.clone(),
         person: session.requester.clone(),
+        requester_id: None,
         title: format!("Approve mission/{}", session.mission),
         detail: "The current launch preview is ready for approval.".into(),
         mission: Some(format!("mission/{}", session.mission)),
@@ -15151,6 +15457,7 @@ fn attention_item_from_revision(
         kind: "revision-approval".into(),
         subject: proposal.subject.clone(),
         person: reviewer.to_owned(),
+        requester_id: None,
         title: format!("Approve a revision of {}", run.mission),
         detail: proposal.reason.clone(),
         mission: Some(run.mission.clone()),
@@ -15197,6 +15504,7 @@ fn attention_item_from_message(
         kind: "unread-message".into(),
         subject: message.subject.clone(),
         person: message.to.clone(),
+        requester_id: None,
         title: message
             .title
             .unwrap_or_else(|| format!("Message from {}", message.from)),
@@ -15220,11 +15528,17 @@ fn attention_item_from_message(
     }
 }
 
+pub(crate) fn agent_attention_requester(actor: &str) -> bool {
+    actor.starts_with("agent/") && actor != "agent/st3/reconciler"
+}
+
 fn attention_item_from_request(request: AttentionRequestView) -> AttentionItemView {
+    let agent_request = agent_attention_requester(&request.actor);
     AttentionItemView {
-        kind: "fault".into(),
+        kind: if agent_request { "agent-request" } else { "fault" }.into(),
         subject: request.subject.clone(),
         person: request.reviewer.clone(),
+        requester_id: Some(request.actor.clone()),
         title: request.title,
         detail: request.reason,
         mission: None,
@@ -15234,7 +15548,7 @@ fn attention_item_from_request(request: AttentionRequestView) -> AttentionItemVi
         requested_at_unix_ms: request.requested_at_unix_ms,
         actions: vec![
             attention_action(
-                "resolve",
+                if agent_request { "answer" } else { "resolve" },
                 &[
                     "st",
                     "attention",
@@ -16121,6 +16435,36 @@ fn claim_hash(
     canonical_hash(&(batch_id, subject, kind, origin, actor, body, predecessors))
 }
 
+/// Whether a replicated claim's ID is the hash of its content. On 2026-09-16, builds between
+/// eaec66a and 2537978d hashed each body in field insertion order: a new dependency switched
+/// serde_json to `preserve_order` before claim hashes sorted object keys. Those claims are
+/// genuine, so a node that verifies them later accepts that hash too. Bodies still decode with
+/// `preserve_order`, so the writer's field order survives to reproduce it.
+fn claim_id_is_content_hash(claim: &ClaimRecord) -> Result<bool> {
+    let canonical = claim_hash(
+        &claim.batch_id,
+        &claim.subject,
+        &claim.kind,
+        &claim.origin,
+        claim.actor.as_deref(),
+        &claim.body,
+        &claim.predecessors,
+    )?;
+    if canonical == claim.id {
+        return Ok(true);
+    }
+    let insertion_order = canonical_hash(&(
+        &claim.batch_id,
+        &claim.subject,
+        &claim.kind,
+        &claim.origin,
+        claim.actor.as_deref(),
+        &claim.body,
+        &claim.predecessors,
+    ))?;
+    Ok(insertion_order == claim.id)
+}
+
 fn canonical_json_value(value: &Value) -> Value {
     match value {
         Value::Array(values) => Value::Array(values.iter().map(canonical_json_value).collect()),
@@ -16282,6 +16626,1772 @@ fn validate_replica_repair(
         ));
     }
     Ok(true)
+}
+
+/// The kinds the membership fold reads.
+const FLEET_CLAIM_KINDS: &str = "'fleet.member-admitted','fleet.member-endpoints','fleet.member-left',\
+                                 'fleet.member-removed','fleet.invite-created','fleet.invite-redeemed',\
+                                 'fleet.invite-revoked'";
+
+/// Upper bound on signature requests or answers in one exchange.
+const REPLICATION_SIGNATURE_LIMIT: usize = 512;
+
+/// One kind of envelope that `st3 doctor` reports: admitted before this node knew better.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct FleetAdmissionResidue {
+    pub writer: String,
+    /// `admitted-beyond-high-water` or `admitted-unsigned`.
+    pub reason: String,
+    pub envelopes: u64,
+}
+
+impl Store {
+    /// Set this node's member key. Every envelope of this node's writer gets its signature,
+    /// including envelopes written before the key existed. Returns the number signed now.
+    pub fn set_member_key(&self, key: Option<Arc<crate::fleet::MemberKey>>) -> Result<usize> {
+        if key.is_none() {
+            *self.member_key.write().expect("member key lock poisoned") = None;
+            return Ok(0);
+        }
+        // Seed envelopes for any local batch first, so the full pass below sees all of them.
+        self.replication_snapshot()?;
+        *self.member_key.write().expect("member key lock poisoned") = key;
+        let mut connection = self.connection.lock().expect("store mutex poisoned");
+        let transaction = connection.transaction()?;
+        let signed = self.sign_own_envelopes_tx(&transaction, None)?;
+        transaction.commit()?;
+        Ok(signed)
+    }
+
+    /// Pin the fleet's anchor key. A node pins it once, from its own founding or from an
+    /// authenticated join or migration handshake, and never replaces it.
+    pub fn pin_fleet_anchor(&self, anchor: &str) -> Result<()> {
+        anyhow::ensure!(!anchor.is_empty(), "the fleet anchor key is empty");
+        let connection = self.connection.lock().expect("store mutex poisoned");
+        let stored = connection
+            .query_row(
+                "SELECT value FROM meta WHERE key='fleet_anchor_key'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        if let Some(stored) = stored {
+            anyhow::ensure!(
+                stored == anchor,
+                "this store already pins another fleet anchor key"
+            );
+            return Ok(());
+        }
+        connection.execute(
+            "INSERT INTO meta(key, value) VALUES ('fleet_anchor_key', ?1)",
+            [anchor],
+        )?;
+        drop(connection);
+        // Held envelopes may be decidable now.
+        self.replica_generation.fetch_add(1, Ordering::AcqRel);
+        Ok(())
+    }
+
+    /// Start this store's own writer above `floor`. A node that joins under a name the fleet
+    /// has used before sets this before it writes anything.
+    pub fn set_writer_floor(&self, floor: u64) -> Result<()> {
+        let connection = self.connection.lock().expect("store mutex poisoned");
+        connection.execute(
+            "INSERT INTO meta(key, value) VALUES ('writer_floor/' || ?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value=MAX(CAST(value AS INTEGER), CAST(excluded.value AS INTEGER))",
+            params![self.origin, floor.to_string()],
+        )?;
+        Ok(())
+    }
+
+    pub fn fleet_anchor(&self) -> Result<Option<String>> {
+        let connection = self.readers.get();
+        fleet_meta(&connection, "fleet_anchor_key")
+    }
+
+    /// The current fleet membership, folded from admitted `fleet.*` claims.
+    pub fn fleet_membership(&self) -> Result<crate::fleet::Membership> {
+        // A local claim counts only once its batch is an envelope with this node's signature.
+        self.replication_snapshot()?;
+        let connection = self.readers.get();
+        fleet_membership_tx(&connection)
+    }
+
+    /// Whether transport observations about `peer` belong in the graph. A dial-out member is
+    /// never dialed and never reports on others, so neither side records one.
+    pub fn observes_transport_to(&self, peer: &str) -> Result<bool> {
+        if self.fleet_leaving()? {
+            return Ok(false);
+        }
+        let membership = self.fleet_membership()?;
+        let dial_out = |name: &str| {
+            matches!(
+                membership.state(name),
+                crate::fleet::MemberState::Current(incarnation) if incarnation.mode == "dial-out"
+            )
+        };
+        Ok(!dial_out(&self.origin) && !dial_out(peer))
+    }
+
+    /// This node's member public key, when it has one.
+    pub fn member_public_key(&self) -> Option<String> {
+        self.member_key
+            .read()
+            .expect("member key lock poisoned")
+            .as_ref()
+            .map(|key| key.public().to_owned())
+    }
+
+    /// Publish this member's mode and endpoints when they differ from its last announcement.
+    /// Returns whether a claim was written.
+    pub fn publish_fleet_endpoints(
+        &self,
+        mode: &str,
+        endpoints: &[Value],
+        build: &str,
+    ) -> Result<bool> {
+        let Some(member_key) = self.member_public_key() else {
+            return Ok(false);
+        };
+        let subject = format!("host/{}", self.origin);
+        if let Some(latest) = self.latest_claim(&subject, Some("fleet.member-endpoints"))? {
+            let fields = latest.body.get("fields").cloned().unwrap_or_default();
+            if fields["member_key"] == member_key
+                && fields["mode"] == mode
+                && fields["endpoints"].as_array().map(Vec::as_slice) == Some(endpoints)
+            {
+                return Ok(false);
+            }
+        }
+        self.append_claim(&ClaimInput {
+            subject,
+            kind: "fleet.member-endpoints".into(),
+            actor: None,
+            fields: BTreeMap::from([
+                ("member_key".into(), Value::String(member_key)),
+                ("mode".into(), Value::String(mode.into())),
+                ("endpoints".into(), Value::Array(endpoints.to_vec())),
+                ("build".into(), Value::String(build.into())),
+            ]),
+            evidence: Vec::new(),
+            expected_subject: None,
+            idempotency_key: None,
+        })
+        .map_err(anyhow::Error::from)?;
+        // Seed and sign at once, so the announcement counts in this node's own fold.
+        self.replication_snapshot()?;
+        Ok(true)
+    }
+
+    /// The membership view the replication worker uses to decide who may exchange.
+    pub fn fleet_view(&self) -> Result<crate::fleet::FleetView> {
+        Ok(crate::fleet::FleetView::from_membership(
+            &self.fleet_membership()?,
+        ))
+    }
+
+    /// Sign every envelope of this node's writer that has no signature by its member key,
+    /// optionally only those added after one `replica_envelopes` row.
+    fn sign_own_envelopes_tx(
+        &self,
+        transaction: &Transaction<'_>,
+        after_rowid: Option<i64>,
+    ) -> Result<usize> {
+        let Some(key) = self
+            .member_key
+            .read()
+            .expect("member key lock poisoned")
+            .clone()
+        else {
+            return Ok(0);
+        };
+        let Some(fleet_id) = fleet_meta(transaction, "fleet_id")? else {
+            return Ok(0);
+        };
+        let mut statement = transaction.prepare(
+            "SELECT sequence, envelope_hash FROM replica_envelopes AS envelopes
+             WHERE writer=?1 AND rowid>?2
+               AND NOT EXISTS (
+                 SELECT 1 FROM replica_envelope_signatures AS signatures
+                 WHERE signatures.writer=envelopes.writer
+                   AND signatures.sequence=envelopes.sequence
+                   AND signatures.envelope_hash=envelopes.envelope_hash
+                   AND signatures.member_key=?3
+               )
+             ORDER BY sequence",
+        )?;
+        let unsigned = statement
+            .query_map(
+                params![self.origin, after_rowid.unwrap_or(i64::MIN), key.public()],
+                |row| Ok((row.get::<_, u64>(0)?, row.get::<_, String>(1)?)),
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(statement);
+        let now = now_ms().to_string();
+        for (sequence, envelope_hash) in &unsigned {
+            let signature = key.sign(&crate::fleet::envelope_signature_message(
+                &fleet_id,
+                &self.origin,
+                *sequence,
+                envelope_hash,
+            ));
+            transaction.execute(
+                "INSERT OR IGNORE INTO replica_envelope_signatures(
+                     writer, sequence, envelope_hash, member_key, signature, stored_at_unix_ms
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    self.origin,
+                    sequence,
+                    envelope_hash,
+                    key.public(),
+                    signature,
+                    now
+                ],
+            )?;
+        }
+        Ok(unsigned.len())
+    }
+
+    /// Envelopes this node holds but cannot admit until their writer's signature arrives.
+    pub fn replication_signature_requests(&self) -> Result<Vec<ReplicaEnvelopeId>> {
+        let connection = self.readers.get();
+        let mut statement = connection.prepare(
+            "SELECT writer, sequence, envelope_hash FROM replica_envelope_holds
+             WHERE reason='unsigned' ORDER BY writer, sequence, envelope_hash LIMIT ?1",
+        )?;
+        let requests = statement
+            .query_map([REPLICATION_SIGNATURE_LIMIT as i64], |row| {
+                Ok(ReplicaEnvelopeId {
+                    writer: row.get(0)?,
+                    sequence: row.get(1)?,
+                    hash: row.get(2)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(requests)
+    }
+
+    /// The signatures this node holds for the requested envelopes.
+    pub fn replication_signatures_for(
+        &self,
+        requests: &[ReplicaEnvelopeId],
+    ) -> Result<Vec<crate::model::ReplicaEnvelopeSignature>> {
+        let connection = self.readers.get();
+        let mut statement = connection.prepare(
+            "SELECT member_key, signature FROM replica_envelope_signatures
+             WHERE writer=?1 AND sequence=?2 AND envelope_hash=?3 ORDER BY member_key",
+        )?;
+        let mut signatures = Vec::new();
+        for request in requests.iter().take(REPLICATION_SIGNATURE_LIMIT) {
+            let rows = statement
+                .query_map(
+                    params![request.writer, request.sequence, request.hash],
+                    |row| {
+                        Ok(crate::model::ReplicaEnvelopeSignature {
+                            writer: request.writer.clone(),
+                            sequence: request.sequence,
+                            hash: request.hash.clone(),
+                            member_key: row.get(0)?,
+                            signature: row.get(1)?,
+                        })
+                    },
+                )?
+                .collect::<Result<Vec<_>, _>>()?;
+            signatures.extend(rows);
+        }
+        Ok(signatures)
+    }
+
+    /// Envelopes this node admitted before it knew that their writer is keyed or that their
+    /// incarnation had ended. Admission decisions are not revisited, so these stay admitted;
+    /// `st3 doctor` reports them.
+    pub fn fleet_admission_residue(&self) -> Result<Vec<FleetAdmissionResidue>> {
+        let connection = self.readers.get();
+        let membership = fleet_membership_tx(&connection)?;
+        let writers = membership
+            .incarnations()
+            .map(|incarnation| incarnation.name.clone())
+            .filter(|writer| *writer != self.origin)
+            .collect::<BTreeSet<_>>();
+        let mut statement = connection.prepare(
+            "SELECT envelopes.sequence,
+                    (SELECT group_concat(member_key, ' ') FROM replica_envelope_signatures AS signatures
+                     WHERE signatures.writer=envelopes.writer
+                       AND signatures.sequence=envelopes.sequence
+                       AND signatures.envelope_hash=envelopes.envelope_hash)
+             FROM replica_envelopes AS envelopes
+             WHERE envelopes.writer=?1 AND envelopes.receipt_state='validated'",
+        )?;
+        let mut residue = Vec::new();
+        for writer in writers {
+            let mut beyond = 0;
+            let mut unsigned = 0;
+            let rows = statement
+                .query_map([&writer], |row| {
+                    Ok((row.get::<_, u64>(0)?, row.get::<_, Option<String>>(1)?))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            for (sequence, signers) in rows {
+                match membership.window(&writer, sequence) {
+                    crate::fleet::Window::Legacy => {}
+                    crate::fleet::Window::Fenced => beyond += 1,
+                    crate::fleet::Window::Keyed(keys) => {
+                        let signed = signers
+                            .as_deref()
+                            .unwrap_or_default()
+                            .split(' ')
+                            .any(|signer| keys.contains(signer));
+                        if !signed {
+                            unsigned += 1;
+                        }
+                    }
+                }
+            }
+            for (reason, envelopes) in [
+                ("admitted-beyond-high-water", beyond),
+                ("admitted-unsigned", unsigned),
+            ] {
+                if envelopes != 0 {
+                    residue.push(FleetAdmissionResidue {
+                        writer: writer.clone(),
+                        reason: reason.into(),
+                        envelopes,
+                    });
+                }
+            }
+        }
+        Ok(residue)
+    }
+}
+
+fn fleet_meta(connection: &Connection, key: &str) -> Result<Option<String>> {
+    Ok(connection
+        .query_row("SELECT value FROM meta WHERE key=?1", [key], |row| {
+            row.get::<_, String>(0)
+        })
+        .optional()?)
+}
+
+fn max_envelope_rowid(connection: &Connection) -> Result<i64> {
+    connection
+        .query_row(
+            "SELECT COALESCE(MAX(rowid), 0) FROM replica_envelopes",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(Into::into)
+}
+
+/// Fold the admitted `fleet.*` claims from the pinned anchor. A store without an anchor has an
+/// empty membership, in which every writer is legacy.
+fn fleet_membership_tx(connection: &Connection) -> Result<crate::fleet::Membership> {
+    let Some(anchor) = fleet_meta(connection, "fleet_anchor_key")? else {
+        return Ok(crate::fleet::Membership::default());
+    };
+    let mut statement = connection.prepare(&format!(
+        "SELECT claims.id, claims.kind, claims.subject, claims.body,
+                batches.origin, batches.replica_sequence, envelopes.envelope_hash
+         FROM claims JOIN batches ON batches.id=claims.batch_id
+         LEFT JOIN replica_envelopes AS envelopes ON envelopes.batch_id=claims.batch_id
+         WHERE claims.kind IN ({FLEET_CLAIM_KINDS})
+         ORDER BY claims.id"
+    ))?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, u64>(5)?,
+                row.get::<_, Option<String>>(6)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    drop(statement);
+    let mut signers_statement = connection.prepare(
+        "SELECT member_key FROM replica_envelope_signatures
+         WHERE writer=?1 AND sequence=?2 AND envelope_hash=?3",
+    )?;
+    let mut claims: Vec<crate::fleet::FleetClaim> = Vec::with_capacity(rows.len());
+    for (id, kind, subject, body, writer, sequence, envelope_hash) in rows {
+        let signers = match &envelope_hash {
+            Some(hash) => signers_statement
+                .query_map(params![writer, sequence, hash], |row| {
+                    row.get::<_, String>(0)
+                })?
+                .collect::<Result<BTreeSet<_>, _>>()?,
+            None => BTreeSet::new(),
+        };
+        if let Some(existing) = claims.iter_mut().find(|claim| claim.id == id) {
+            existing.signers.extend(signers);
+            continue;
+        }
+        let fields = serde_json::from_str::<Value>(&body)?
+            .get("fields")
+            .and_then(Value::as_object)
+            .map(|fields| {
+                fields
+                    .iter()
+                    .map(|(name, value)| (name.clone(), value.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        claims.push(crate::fleet::FleetClaim {
+            id,
+            kind,
+            subject,
+            fields,
+            writer,
+            sequence,
+            signers,
+        });
+    }
+    Ok(crate::fleet::Membership::fold(Some(&anchor), &claims))
+}
+
+/// Whether the membership rules hold this envelope back, and why.
+fn fleet_admission_hold(
+    connection: &Connection,
+    membership: &crate::fleet::Membership,
+    envelope: &ReplicaEnvelope,
+) -> Result<Option<&'static str>> {
+    match membership.window(&envelope.writer, envelope.sequence) {
+        crate::fleet::Window::Legacy => Ok(None),
+        crate::fleet::Window::Fenced => Ok(Some("fenced")),
+        crate::fleet::Window::Keyed(keys) => {
+            let mut statement = connection.prepare_cached(
+                "SELECT member_key FROM replica_envelope_signatures
+                 WHERE writer=?1 AND sequence=?2 AND envelope_hash=?3",
+            )?;
+            let signers = statement
+                .query_map(
+                    params![envelope.writer, envelope.sequence, envelope.hash],
+                    |row| row.get::<_, String>(0),
+                )?
+                .collect::<Result<Vec<_>, _>>()?;
+            // A signature by any other key proves nothing, so it cannot fence the envelope:
+            // it waits, asking for its writer's signature, until one arrives. Only a sequence
+            // outside every window is fenced.
+            if signers.iter().any(|signer| keys.contains(signer)) {
+                Ok(None)
+            } else {
+                Ok(Some("unsigned"))
+            }
+        }
+    }
+}
+
+fn hold_replica_envelope(
+    connection: &Connection,
+    envelope: &ReplicaEnvelope,
+    reason: &str,
+) -> Result<()> {
+    connection.execute(
+        "INSERT INTO replica_envelope_holds(writer, sequence, envelope_hash, reason, updated_at_unix_ms)
+         VALUES (?1, ?2, ?3, ?4, ?5)
+         ON CONFLICT(writer, sequence, envelope_hash) DO UPDATE SET reason=excluded.reason,
+            updated_at_unix_ms=excluded.updated_at_unix_ms
+         WHERE reason<>excluded.reason",
+        params![
+            envelope.writer,
+            envelope.sequence,
+            envelope.hash,
+            reason,
+            now_ms().to_string()
+        ],
+    )?;
+    Ok(())
+}
+
+/// Whether an admitted envelope carried a `fleet.*` claim, which can change membership.
+fn envelope_carries_fleet_claims(
+    connection: &Connection,
+    envelope: &ReplicaEnvelope,
+) -> Result<bool> {
+    Ok(connection.query_row(
+        &format!(
+            "SELECT EXISTS(
+                 SELECT 1 FROM replica_envelopes AS envelopes
+                 JOIN claims ON claims.batch_id=envelopes.batch_id
+                 WHERE envelopes.writer=?1 AND envelopes.sequence=?2 AND envelopes.envelope_hash=?3
+                   AND claims.kind IN ({FLEET_CLAIM_KINDS})
+             )"
+        ),
+        params![envelope.writer, envelope.sequence, envelope.hash],
+        |row| row.get(0),
+    )?)
+}
+
+/// Verify one envelope signature and store it. Returns 1 when it is new. A signature that does
+/// not verify is dropped: the envelope then counts as unsigned.
+#[allow(clippy::too_many_arguments)]
+fn store_envelope_signature_tx(
+    transaction: &Transaction<'_>,
+    fleet_id: &str,
+    writer: &str,
+    sequence: u64,
+    envelope_hash: &str,
+    member_key: &str,
+    signature: &str,
+    now: &str,
+) -> Result<usize> {
+    let message =
+        crate::fleet::envelope_signature_message(fleet_id, writer, sequence, envelope_hash);
+    if !crate::fleet::verify_signature(member_key, &message, signature) {
+        return Ok(0);
+    }
+    Ok(transaction.execute(
+        "INSERT OR IGNORE INTO replica_envelope_signatures(
+             writer, sequence, envelope_hash, member_key, signature, stored_at_unix_ms
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![writer, sequence, envelope_hash, member_key, signature, now],
+    )?)
+}
+
+/// What `st fleet remove` did.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct FleetRemoval {
+    pub name: String,
+    pub keys: Vec<String>,
+    pub high_water: u64,
+    pub revoked_invites: Vec<String>,
+}
+
+/// An invite this node just created. The token is returned once, for the join code.
+#[derive(Clone, Debug)]
+pub struct CreatedFleetInvite {
+    pub invite: String,
+    pub token: [u8; 16],
+    pub expires_at_unix_ms: u64,
+}
+
+/// The sponsor's answer to one join request.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum FleetRedemption {
+    /// This node holds no open invite, so the join route does not exist.
+    Closed,
+    /// Refused. The reason is for this node's records only; the joiner learns nothing.
+    Refused(&'static str),
+    Admitted {
+        token: [u8; 16],
+        writer_floor: Option<u64>,
+        admitted_claim: Option<String>,
+        first: bool,
+    },
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct FleetInviteView {
+    pub invite: String,
+    pub sponsor: String,
+    pub name: Option<String>,
+    pub expires_at_unix_ms: u64,
+    pub created_by: Option<String>,
+    /// `open`, `redeemed`, `revoked`, or `expired`.
+    pub state: String,
+    pub redeemed_name: Option<String>,
+    pub redeemed_key: Option<String>,
+    pub redeemed_at_unix_ms: Option<u128>,
+    pub revoked_reason: Option<String>,
+}
+
+const FLEET_INVITE_FAILURE_LIMIT: u64 = 5;
+
+/// Node names: a letter or digit, then letters, digits, `.`, `_`, or `-`, at most 63 bytes.
+pub fn valid_fleet_node_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 63
+        && name != "local"
+        && name.as_bytes()[0].is_ascii_alphanumeric()
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+}
+
+impl Store {
+    /// Create an invite that this node sponsors. Only a current listening member can.
+    pub fn create_fleet_invite(
+        &self,
+        name: Option<&str>,
+        lifetime: std::time::Duration,
+        transports: &[String],
+        person: &str,
+        migrate: bool,
+    ) -> Result<CreatedFleetInvite, St3Error> {
+        if let Some(name) = name
+            && !valid_fleet_node_name(name)
+        {
+            return Err(St3Error::new(
+                "invalid-node-name",
+                "a node name is a letter or digit followed by letters, digits, `.`, `_`, or `-`",
+            ));
+        }
+        if !(10..=86_400).contains(&lifetime.as_secs()) {
+            return Err(St3Error::new(
+                "invalid-invite-lifetime",
+                "an invite lasts between 10 seconds and 24 hours",
+            ));
+        }
+        let membership = self.fleet_membership().map_err(internal)?;
+        match membership.state(&self.origin) {
+            crate::fleet::MemberState::Current(own) if own.mode == "listening" => {}
+            crate::fleet::MemberState::Current(_) => {
+                return Err(St3Error::new(
+                    "dial-out-cannot-sponsor",
+                    "a dial-out member accepts no connections, so it cannot sponsor an invite; run this on a listening member",
+                ));
+            }
+            _ => {
+                return Err(St3Error::new(
+                    "not-a-member",
+                    "this node is not a current fleet member",
+                ));
+            }
+        }
+        let mut invite = [0_u8; 16];
+        let mut token = [0_u8; 16];
+        getrandom::fill(&mut invite).map_err(internal)?;
+        getrandom::fill(&mut token).map_err(internal)?;
+        let invite = hex::encode(invite);
+        let expires_at = now_ms() + lifetime.as_millis();
+        let expires_at = u64::try_from(expires_at).map_err(internal)?;
+        let mut fields = BTreeMap::from([
+            (
+                "sponsor".into(),
+                Value::String(format!("host/{}", self.origin)),
+            ),
+            ("expires_at_unix_ms".into(), Value::from(expires_at)),
+            (
+                "transports".into(),
+                Value::Array(transports.iter().cloned().map(Value::String).collect()),
+            ),
+            ("created_by".into(), Value::String(person.into())),
+        ]);
+        if let Some(name) = name {
+            fields.insert("name".into(), Value::String(name.into()));
+        }
+        self.append_claim(&ClaimInput {
+            subject: format!("fleet-invite/{invite}"),
+            kind: "fleet.invite-created".into(),
+            actor: Some(person.into()),
+            fields,
+            evidence: Vec::new(),
+            expected_subject: None,
+            idempotency_key: None,
+        })?;
+        {
+            let connection = self.connection.lock().expect("store mutex poisoned");
+            connection
+                .execute(
+                    "INSERT INTO fleet_invite_tokens(
+                         invite_id, token, expires_at_unix_ms, name, migrate, created_by
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    params![
+                        invite,
+                        hex::encode(token),
+                        expires_at.to_string(),
+                        name,
+                        migrate,
+                        person
+                    ],
+                )
+                .map_err(internal)?;
+        }
+        self.replication_snapshot().map_err(internal)?;
+        Ok(CreatedFleetInvite {
+            invite,
+            token,
+            expires_at_unix_ms: expires_at,
+        })
+    }
+
+    /// Remove a member, or a config peer that was never one. Ends every current incarnation of
+    /// `name` at the highest sequence this node holds for that writer, and revokes the invites
+    /// it sponsored.
+    pub fn remove_fleet_member(
+        &self,
+        name: &str,
+        reason: &str,
+        person: &str,
+    ) -> Result<FleetRemoval, St3Error> {
+        use crate::fleet::MemberState;
+        if name == self.origin {
+            return Err(St3Error::new(
+                "cannot-remove-self",
+                "a member cannot remove itself; use st fleet leave",
+            ));
+        }
+        let own_key = self.member_public_key().ok_or_else(|| {
+            St3Error::new(
+                "not-a-member",
+                "only a member with a member key can remove; this node has none",
+            )
+        })?;
+        let membership = self.fleet_membership().map_err(internal)?;
+        if !matches!(membership.state(&self.origin), MemberState::Current(own) if own.member_key == own_key)
+        {
+            return Err(St3Error::new(
+                "not-a-member",
+                "this node is not a current fleet member",
+            ));
+        }
+        let keys = match membership.state(name) {
+            MemberState::Current(incarnation) => vec![Some(incarnation.member_key.clone())],
+            MemberState::Conflicted(current) => current
+                .iter()
+                .map(|incarnation| Some(incarnation.member_key.clone()))
+                .collect(),
+            MemberState::Ended(_) | MemberState::LegacyRemoved(_) => {
+                return Err(St3Error::new(
+                    "already-removed",
+                    format!("`{name}` is already out of the fleet"),
+                ));
+            }
+            MemberState::NotMember => vec![None],
+        };
+        let high_water: u64 = {
+            let connection = self.readers.get();
+            connection
+                .query_row(
+                    "SELECT COALESCE(MAX(sequence), 0) FROM replica_envelopes WHERE writer=?1",
+                    [name],
+                    |row| row.get(0),
+                )
+                .map_err(internal)?
+        };
+        if keys == [None] && high_water == 0 {
+            return Err(St3Error::new(
+                "unknown-member",
+                format!("`{name}` has never been a member or written to this fleet"),
+            ));
+        }
+        for key in &keys {
+            let mut fields = BTreeMap::from([
+                ("high_water".into(), Value::from(high_water)),
+                ("reason".into(), Value::String(reason.into())),
+                ("removed_by".into(), Value::String(person.into())),
+            ]);
+            if let Some(key) = key {
+                fields.insert("member_key".into(), Value::String(key.clone()));
+            }
+            self.append_claim(&ClaimInput {
+                subject: format!("host/{name}"),
+                kind: "fleet.member-removed".into(),
+                actor: Some(person.into()),
+                fields,
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            })?;
+        }
+        let sponsored = self
+            .fleet_invites(false)
+            .map_err(internal)?
+            .into_iter()
+            .filter(|invite| invite.state == "open" && invite.sponsor == format!("host/{name}"))
+            .collect::<Vec<_>>();
+        for invite in &sponsored {
+            self.revoke_fleet_invite(
+                invite.invite.trim_start_matches("fleet-invite/"),
+                "sponsor-removed",
+                Some(person),
+            )
+            .map_err(internal)?;
+        }
+        self.replication_snapshot().map_err(internal)?;
+        Ok(FleetRemoval {
+            name: name.into(),
+            keys: keys.into_iter().flatten().collect(),
+            high_water,
+            revoked_invites: sponsored.into_iter().map(|invite| invite.invite).collect(),
+        })
+    }
+
+    /// Append this member's leave as its writer's last batch.
+    /// Write this node's leave, once per member key: running `st fleet leave` again returns the
+    /// leave already written, so nothing follows it.
+    pub fn leave_fleet(&self, person: &str) -> Result<ClaimRecord, St3Error> {
+        let key = self
+            .member_public_key()
+            .ok_or_else(|| St3Error::new("not-a-member", "this node has no member key"))?;
+        let subject = format!("host/{}", self.origin);
+        if let Some(written) = self
+            .latest_claim(&subject, Some("fleet.member-left"))
+            .map_err(internal)?
+            .filter(|claim| claim.body["fields"]["member_key"] == key.as_str())
+        {
+            return Ok(written);
+        }
+        let record = self.append_claim(&ClaimInput {
+            subject,
+            kind: "fleet.member-left".into(),
+            actor: Some(person.into()),
+            fields: BTreeMap::from([
+                ("member_key".into(), Value::String(key)),
+                ("high_water".into(), Value::from(0)),
+            ]),
+            evidence: Vec::new(),
+            expected_subject: None,
+            idempotency_key: None,
+        })?;
+        self.replication_snapshot().map_err(internal)?;
+        Ok(record)
+    }
+
+    /// While leaving, this node refuses new local writes, so its leave stays its last.
+    pub fn set_fleet_leaving(&self, leaving: bool) -> Result<()> {
+        let connection = self.connection.lock().expect("store mutex poisoned");
+        if leaving {
+            connection.execute(
+                "INSERT OR REPLACE INTO meta(key, value) VALUES ('fleet_leaving', '1')",
+                [],
+            )?;
+        } else {
+            connection.execute("DELETE FROM meta WHERE key='fleet_leaving'", [])?;
+        }
+        Ok(())
+    }
+
+    pub fn fleet_leaving(&self) -> Result<bool> {
+        let connection = self.readers.get();
+        Ok(fleet_meta(&connection, "fleet_leaving")?.is_some())
+    }
+
+    /// The anchor admits itself, once.
+    pub fn admit_fleet_anchor(&self, fleet_id: &str, member_key: &str, mode: &str) -> Result<()> {
+        self.append_claim(&ClaimInput {
+            subject: format!("host/{}", self.origin),
+            kind: "fleet.member-admitted".into(),
+            actor: None,
+            fields: BTreeMap::from([
+                ("fleet_id".into(), Value::String(fleet_id.into())),
+                ("member_key".into(), Value::String(member_key.into())),
+                ("via".into(), Value::String("anchor".into())),
+                ("mode".into(), Value::String(mode.into())),
+            ]),
+            evidence: Vec::new(),
+            expected_subject: None,
+            idempotency_key: Some(format!("fleet-anchor:{member_key}")),
+        })
+        .map_err(anyhow::Error::from)?;
+        self.replication_snapshot()?;
+        Ok(())
+    }
+
+    /// This store's own highest batch under `writer`, if it ever wrote as that name.
+    pub fn writer_head(&self, writer: &str) -> Result<Option<(u64, String)>> {
+        let connection = self.readers.get();
+        Ok(connection
+            .query_row(
+                "SELECT replica_sequence, hash FROM batches WHERE origin=?1
+                 ORDER BY replica_sequence DESC LIMIT 1",
+                [writer],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?)
+    }
+
+    /// The fleet this store is bound to, if any.
+    pub fn bound_fleet(&self) -> Result<Option<String>> {
+        let connection = self.readers.get();
+        fleet_meta(&connection, "fleet_id")
+    }
+
+    /// Erase the tokens of invites that expired or were revoked anywhere in the fleet.
+    pub fn sweep_fleet_invites(&self) -> Result<()> {
+        let connection = self.connection.lock().expect("store mutex poisoned");
+        connection.execute(
+            "UPDATE fleet_invite_tokens SET token=NULL
+             WHERE token IS NOT NULL AND (
+               CAST(expires_at_unix_ms AS INTEGER) <= ?1
+               OR EXISTS (
+                 SELECT 1 FROM claims
+                 WHERE claims.subject='fleet-invite/' || fleet_invite_tokens.invite_id
+                   AND claims.kind='fleet.invite-revoked'
+               )
+             )",
+            [now_ms().to_string()],
+        )?;
+        Ok(())
+    }
+
+    /// Whether this node holds an invite that can still be redeemed.
+    pub fn has_open_fleet_invites(&self) -> Result<bool> {
+        self.sweep_fleet_invites()?;
+        let connection = self.readers.get();
+        Ok(connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM fleet_invite_tokens WHERE token IS NOT NULL)",
+            [],
+            |row| row.get(0),
+        )?)
+    }
+
+    /// Decide one join request against the invites this node sponsors.
+    pub fn redeem_fleet_invite(
+        &self,
+        request: &crate::fleet::handshake::JoinRequest,
+    ) -> Result<FleetRedemption> {
+        use crate::fleet::handshake::{RequestFault, verify_request};
+        if !self.has_open_fleet_invites()? {
+            return Ok(FleetRedemption::Closed);
+        }
+        type InviteRow = (
+            String,
+            Option<String>,
+            bool,
+            Option<String>,
+            Option<String>,
+            u64,
+            Option<String>,
+            Option<u64>,
+            Option<String>,
+        );
+        let row: Option<InviteRow> = {
+            let connection = self.readers.get();
+            connection
+                .query_row(
+                    "SELECT token, name, migrate, bound_key, bound_name, failures, admitted_claim,
+                            writer_floor, created_by
+                     FROM fleet_invite_tokens WHERE invite_id=?1 AND token IS NOT NULL",
+                    [&request.invite],
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                            row.get(5)?,
+                            row.get(6)?,
+                            row.get(7)?,
+                            row.get(8)?,
+                        ))
+                    },
+                )
+                .optional()?
+        };
+        let Some((
+            token,
+            pinned,
+            migrate,
+            bound_key,
+            bound_name,
+            failures,
+            admitted_claim,
+            writer_floor,
+            created_by,
+        )) = row
+        else {
+            return Ok(FleetRedemption::Refused("unknown-invite"));
+        };
+        let token: [u8; 16] = hex::decode(&token)
+            .ok()
+            .and_then(|bytes| bytes.try_into().ok())
+            .context("a stored invite token is damaged")?;
+        match verify_request(request, &token) {
+            Ok(()) => {}
+            Err(RequestFault::Proof) => {
+                let failures = failures + 1;
+                let connection = self.connection.lock().expect("store mutex poisoned");
+                connection.execute(
+                    "UPDATE fleet_invite_tokens SET failures=?2 WHERE invite_id=?1",
+                    params![request.invite, failures],
+                )?;
+                drop(connection);
+                if failures >= FLEET_INVITE_FAILURE_LIMIT {
+                    self.revoke_fleet_invite(&request.invite, "too-many-failures", None)?;
+                }
+                return Ok(FleetRedemption::Refused("proof"));
+            }
+            Err(_) => return Ok(FleetRedemption::Refused("request")),
+        }
+        if request.migrate != migrate {
+            return Ok(FleetRedemption::Refused("kind"));
+        }
+        if pinned
+            .as_deref()
+            .is_some_and(|pinned| pinned != request.name)
+            || !valid_fleet_node_name(&request.name)
+            || !matches!(request.mode.as_str(), "listening" | "dial-out")
+        {
+            return Ok(FleetRedemption::Refused("name"));
+        }
+        if let Some(bound) = bound_key {
+            if bound != request.member_key || bound_name.as_deref() != Some(&request.name) {
+                return Ok(FleetRedemption::Refused("bound-to-another-key"));
+            }
+            // The same joiner again: admit it again without new claims, unless the claims were
+            // interrupted before they were written.
+            let admitted_claim = match admitted_claim {
+                Some(claim) => Some(claim),
+                None => Some(self.append_fleet_admission(
+                    request,
+                    migrate,
+                    writer_floor,
+                    created_by.as_deref(),
+                )?),
+            };
+            return Ok(FleetRedemption::Admitted {
+                token,
+                writer_floor,
+                admitted_claim,
+                first: false,
+            });
+        }
+        let floor =
+            match self.fleet_name_floor(&request.name, request.writer_head.is_some(), migrate)? {
+                Ok(floor) => floor,
+                Err(reason) => return Ok(FleetRedemption::Refused(reason)),
+            };
+        let bound = {
+            let connection = self.connection.lock().expect("store mutex poisoned");
+            connection.execute(
+                "UPDATE fleet_invite_tokens SET bound_key=?2, bound_name=?3, writer_floor=?4
+                 WHERE invite_id=?1 AND bound_key IS NULL AND token IS NOT NULL",
+                params![request.invite, request.member_key, request.name, floor],
+            )?
+        };
+        if bound == 0 {
+            // Another request bound it first.
+            return Ok(FleetRedemption::Refused("bound-to-another-key"));
+        }
+        let admitted =
+            self.append_fleet_admission(request, migrate, floor, created_by.as_deref())?;
+        Ok(FleetRedemption::Admitted {
+            token,
+            writer_floor: floor,
+            admitted_claim: Some(admitted),
+            first: true,
+        })
+    }
+
+    /// The name rules from the design: a name with history can be joined again only after its
+    /// incarnations ended, and only by a store that never wrote as it; then the new window
+    /// starts above everything known of the old ones. A migration keeps the node's own history.
+    fn fleet_name_floor(
+        &self,
+        name: &str,
+        joiner_wrote_as_name: bool,
+        migrate: bool,
+    ) -> Result<Result<Option<u64>, &'static str>> {
+        use crate::fleet::MemberState;
+        let membership = self.fleet_membership()?;
+        let state = membership.state(name);
+        if matches!(state, MemberState::Current(_) | MemberState::Conflicted(_)) {
+            return Ok(Err("name-in-use"));
+        }
+        let ended_end = match &state {
+            MemberState::Ended(_) => membership
+                .incarnations()
+                .filter(|incarnation| incarnation.name == name)
+                .filter_map(|incarnation| incarnation.end)
+                .max(),
+            MemberState::LegacyRemoved(high_water) => Some(*high_water),
+            _ => None,
+        };
+        if migrate {
+            return Ok(if ended_end.is_some() {
+                Err("name-was-removed")
+            } else {
+                Ok(None)
+            });
+        }
+        let connection = self.readers.get();
+        let held: Option<u64> = connection.query_row(
+            "SELECT MAX(sequence) FROM replica_envelopes WHERE writer=?1",
+            [name],
+            |row| row.get(0),
+        )?;
+        let claimed: bool = connection.query_row(
+            &format!(
+                "SELECT EXISTS(SELECT 1 FROM claims WHERE subject=?1 AND kind IN ({FLEET_CLAIM_KINDS}))"
+            ),
+            [format!("host/{name}")],
+            |row| row.get(0),
+        )?;
+        if held.is_none() && !claimed {
+            return Ok(Ok(None));
+        }
+        let Some(ended_end) = ended_end else {
+            return Ok(Err("name-has-unremoved-history"));
+        };
+        if joiner_wrote_as_name {
+            return Ok(Err("store-already-wrote-as-name"));
+        }
+        Ok(Ok(Some(held.unwrap_or(0).max(ended_end))))
+    }
+
+    fn append_fleet_admission(
+        &self,
+        request: &crate::fleet::handshake::JoinRequest,
+        migrate: bool,
+        writer_floor: Option<u64>,
+        created_by: Option<&str>,
+    ) -> Result<String> {
+        let fleet_id = {
+            let connection = self.readers.get();
+            fleet_meta(&connection, "fleet_id")?.context("this store is not in a fleet")?
+        };
+        let invite_subject = format!("fleet-invite/{}", request.invite);
+        self.append_claim(&ClaimInput {
+            subject: invite_subject.clone(),
+            kind: "fleet.invite-redeemed".into(),
+            actor: None,
+            fields: BTreeMap::from([
+                ("name".into(), Value::String(request.name.clone())),
+                (
+                    "member_key".into(),
+                    Value::String(request.member_key.clone()),
+                ),
+            ]),
+            evidence: Vec::new(),
+            expected_subject: None,
+            idempotency_key: Some(format!("fleet-invite-redeemed:{}", request.invite)),
+        })?;
+        let mut fields = BTreeMap::from([
+            ("fleet_id".into(), Value::String(fleet_id)),
+            (
+                "member_key".into(),
+                Value::String(request.member_key.clone()),
+            ),
+            (
+                "via".into(),
+                Value::String(if migrate { "migration" } else { "invite" }.into()),
+            ),
+            (
+                "sponsor".into(),
+                Value::String(format!("host/{}", self.origin)),
+            ),
+            ("invite".into(), Value::String(invite_subject)),
+            ("mode".into(), Value::String(request.mode.clone())),
+        ]);
+        if let Some(floor) = writer_floor {
+            fields.insert("writer_floor".into(), Value::from(floor));
+        }
+        if let Some(person) = created_by {
+            fields.insert("admitted_by".into(), Value::String(person.into()));
+        }
+        let admitted = self.append_claim(&ClaimInput {
+            subject: format!("host/{}", request.name),
+            kind: "fleet.member-admitted".into(),
+            actor: created_by.map(str::to_owned),
+            fields,
+            evidence: Vec::new(),
+            expected_subject: None,
+            idempotency_key: Some(format!("fleet-invite-admitted:{}", request.invite)),
+        })?;
+        {
+            let connection = self.connection.lock().expect("store mutex poisoned");
+            connection.execute(
+                "UPDATE fleet_invite_tokens SET admitted_claim=?2 WHERE invite_id=?1",
+                params![request.invite, admitted.id],
+            )?;
+        }
+        // Seed and sign at once: the joiner's first exchange must find itself admitted.
+        self.replication_snapshot()?;
+        Ok(admitted.id)
+    }
+
+    /// Revoke an invite. Any member can; the sponsor erases the token when it sees the claim.
+    pub fn revoke_fleet_invite(
+        &self,
+        invite: &str,
+        reason: &str,
+        person: Option<&str>,
+    ) -> Result<()> {
+        let mut fields = BTreeMap::from([("reason".into(), Value::String(reason.into()))]);
+        if let Some(person) = person {
+            fields.insert("revoked_by".into(), Value::String(person.into()));
+        }
+        self.append_claim(&ClaimInput {
+            subject: format!("fleet-invite/{invite}"),
+            kind: "fleet.invite-revoked".into(),
+            actor: person.map(str::to_owned),
+            fields,
+            evidence: Vec::new(),
+            expected_subject: None,
+            idempotency_key: Some(format!("fleet-invite-revoked:{invite}")),
+        })?;
+        self.sweep_fleet_invites()?;
+        self.replication_snapshot()?;
+        Ok(())
+    }
+
+    /// Invites as the fleet knows them, from their claims.
+    pub fn fleet_invites(&self, all: bool) -> Result<Vec<FleetInviteView>> {
+        let connection = self.readers.get();
+        let mut statement = connection.prepare(
+            "SELECT subject, kind, body, accepted_at_unix_ms FROM claims
+             WHERE kind IN ('fleet.invite-created','fleet.invite-redeemed','fleet.invite-revoked')
+             ORDER BY store_index",
+        )?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut invites: BTreeMap<String, FleetInviteView> = BTreeMap::new();
+        let now = now_ms();
+        for (subject, kind, body, accepted_at) in rows {
+            let Some(invite) = subject.strip_prefix("fleet-invite/") else {
+                continue;
+            };
+            let body: Value = serde_json::from_str(&body)?;
+            let fields = &body["fields"];
+            let text = |name: &str| fields[name].as_str().map(str::to_owned);
+            match kind.as_str() {
+                "fleet.invite-created" => {
+                    invites.insert(
+                        invite.to_owned(),
+                        FleetInviteView {
+                            invite: subject.clone(),
+                            sponsor: text("sponsor").unwrap_or_default(),
+                            name: text("name"),
+                            expires_at_unix_ms: fields["expires_at_unix_ms"].as_u64().unwrap_or(0),
+                            created_by: text("created_by"),
+                            state: "open".into(),
+                            redeemed_name: None,
+                            redeemed_key: None,
+                            redeemed_at_unix_ms: None,
+                            revoked_reason: None,
+                        },
+                    );
+                }
+                "fleet.invite-redeemed" => {
+                    if let Some(view) = invites.get_mut(invite) {
+                        view.state = "redeemed".into();
+                        view.redeemed_name = text("name");
+                        view.redeemed_key = text("member_key");
+                        view.redeemed_at_unix_ms = accepted_at.parse().ok();
+                    }
+                }
+                "fleet.invite-revoked" => {
+                    if let Some(view) = invites.get_mut(invite)
+                        && view.state == "open"
+                    {
+                        view.state = "revoked".into();
+                        view.revoked_reason = text("reason");
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut views = invites.into_values().collect::<Vec<_>>();
+        for view in &mut views {
+            if view.state == "open" && u128::from(view.expires_at_unix_ms) <= now {
+                view.state = "expired".into();
+            }
+        }
+        if !all {
+            views.retain(|view| view.state == "open" || view.state == "redeemed");
+        }
+        Ok(views)
+    }
+}
+
+#[cfg(test)]
+mod fleet_admission_tests {
+    use super::*;
+    use crate::fleet::{MemberKey, MemberState, envelope_signature_message, verify_signature};
+
+    const FLEET: &str = "7c9e6679-7425-40de-944b-e07fc1f90ae7";
+
+    fn key() -> Arc<MemberKey> {
+        Arc::new(MemberKey::generate().unwrap().0)
+    }
+
+    fn node(name: &str, key: Option<&Arc<MemberKey>>, anchor: Option<&Arc<MemberKey>>) -> Store {
+        let store = Store::open_memory(name).unwrap();
+        store.bind_fleet(FLEET).unwrap();
+        if let Some(anchor) = anchor {
+            store.pin_fleet_anchor(anchor.public()).unwrap();
+        }
+        if let Some(key) = key {
+            store.set_member_key(Some(key.clone())).unwrap();
+        }
+        store
+    }
+
+    fn append(store: &Store, kind: &str, subject: &str, fields: Value) -> ClaimRecord {
+        store
+            .append_claim(&ClaimInput {
+                subject: subject.into(),
+                kind: kind.into(),
+                actor: None,
+                fields: serde_json::from_value(fields).unwrap(),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap()
+    }
+
+    fn note(store: &Store, text: &str) -> ClaimRecord {
+        append(
+            store,
+            "daemon.diagnostic",
+            &format!("daemon/{}", store.origin),
+            json!({"severity": "warning", "code": "fleet-test", "reason": text}),
+        )
+    }
+
+    fn admit(by: &Store, name: &str, member: &MemberKey, via: &str, floor: Option<u64>) {
+        let mut fields = json!({
+            "fleet_id": FLEET,
+            "member_key": member.public(),
+            "via": via,
+            "mode": "listening",
+        });
+        if via != "anchor" {
+            fields["sponsor"] = json!(format!("host/{}", by.origin));
+        }
+        if let Some(floor) = floor {
+            fields["writer_floor"] = json!(floor);
+        }
+        append(by, "fleet.member-admitted", &format!("host/{name}"), fields);
+    }
+
+    fn remove(by: &Store, name: &str, member: Option<&MemberKey>, high_water: u64) {
+        let mut fields = json!({"high_water": high_water, "reason": "test"});
+        if let Some(member) = member {
+            fields["member_key"] = json!(member.public());
+        }
+        append(by, "fleet.member-removed", &format!("host/{name}"), fields);
+    }
+
+    /// One exchange from `from` to `to`, then admission and projection on `to`.
+    fn sync(from: &Store, to: &Store) -> ReplicationAdmission {
+        let exchange = from
+            .export_replication_exchange_answering(
+                FLEET,
+                &to.replication_inventory().unwrap(),
+                &to.replication_signature_requests().unwrap(),
+            )
+            .unwrap();
+        to.receive_replication_exchange(&from.origin, FLEET, &exchange)
+            .unwrap();
+        let admission = to.validate_replication_backlog().unwrap();
+        to.project_replication_backlog().unwrap();
+        admission
+    }
+
+    fn admitted(store: &Store, claim: &ClaimRecord) -> bool {
+        store.claim_by_id(&claim.id).unwrap().is_some()
+    }
+
+    #[test]
+    fn a_member_leaves_once_and_a_second_leave_writes_nothing() {
+        let anchor_key = key();
+        let laptop_key = key();
+        let anchor = node("anchor", Some(&anchor_key), Some(&anchor_key));
+        anchor
+            .admit_fleet_anchor(FLEET, anchor_key.public(), "listening")
+            .unwrap();
+        admit(&anchor, "laptop", &laptop_key, "invite", None);
+        let laptop = node("laptop", Some(&laptop_key), Some(&anchor_key));
+        sync(&anchor, &laptop);
+
+        let first = laptop.leave_fleet("person/test").unwrap();
+        let head = highest_sequence(&laptop, "laptop");
+        assert_eq!(first.body["fields"]["high_water"], json!(head));
+        let again = laptop.leave_fleet("person/test").unwrap();
+        assert_eq!(again.id, first.id);
+        assert_eq!(highest_sequence(&laptop, "laptop"), head);
+
+        sync(&laptop, &anchor);
+        let membership = anchor.fleet_membership().unwrap();
+        let MemberState::Ended(ended) = membership.state("laptop") else {
+            panic!("the anchor did not see the leave");
+        };
+        assert_eq!(ended.ended.as_deref(), Some("left"));
+        assert_eq!(ended.end, Some(head));
+    }
+
+    fn highest_sequence(store: &Store, writer: &str) -> u64 {
+        let connection = store.readers.get();
+        connection
+            .query_row(
+                "SELECT COALESCE(MAX(sequence), 0) FROM replica_envelopes WHERE writer=?1",
+                [writer],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    /// The anchor `a` founds the fleet and admits each named member.
+    fn fleet(members: &[(&str, &Arc<MemberKey>)]) -> (Arc<MemberKey>, Store, Vec<Store>) {
+        let anchor = key();
+        let a = node("a", Some(&anchor), Some(&anchor));
+        admit(&a, "a", &anchor, "anchor", None);
+        let mut stores = Vec::new();
+        for (name, member) in members {
+            admit(&a, name, member, "invite", None);
+            stores.push(node(name, Some(member), Some(&anchor)));
+        }
+        for store in &stores {
+            sync(&a, store);
+        }
+        (anchor, a, stores)
+    }
+
+    #[test]
+    fn keying_signs_every_own_envelope_and_later_batches_are_signed_as_written() {
+        let a = Store::open_memory("a").unwrap();
+        a.bind_fleet(FLEET).unwrap();
+        note(&a, "before the key");
+        let member = key();
+        assert!(a.set_member_key(Some(member.clone())).unwrap() >= 1);
+        note(&a, "after the key");
+        let exchange = a
+            .export_replication_exchange(FLEET, &ReplicationInventory::default())
+            .unwrap();
+        assert!(exchange.envelopes.len() >= 2);
+        for envelope in &exchange.envelopes {
+            assert_eq!(envelope.member_key.as_deref(), Some(member.public()));
+            assert!(verify_signature(
+                member.public(),
+                &envelope_signature_message(FLEET, "a", envelope.sequence, &envelope.hash),
+                envelope.signature.as_deref().unwrap(),
+            ));
+        }
+    }
+
+    #[test]
+    fn a_store_without_an_anchor_admits_every_writer_as_before() {
+        let b_key = key();
+        let b = node("b", Some(&b_key), None);
+        let legacy = node("legacy", None, None);
+        let receiver = node("receiver", None, None);
+        let signed = note(&b, "signed");
+        let unsigned = note(&legacy, "unsigned");
+        sync(&b, &receiver);
+        sync(&legacy, &receiver);
+        assert!(admitted(&receiver, &signed));
+        assert!(admitted(&receiver, &unsigned));
+        assert_eq!(receiver.fleet_membership().unwrap(), Default::default());
+    }
+
+    #[test]
+    fn a_keyed_writers_envelope_needs_its_signature_and_waits_for_it_as_unsigned() {
+        let b_key = key();
+        let (_, a, stores) = fleet(&[("b", &b_key)]);
+        let b = &stores[0];
+        let first = note(b, "signed");
+        sync(b, &a);
+        assert!(admitted(&a, &first));
+
+        // An old build relays b's next envelope without its signature.
+        let later = note(b, "relayed without a signature");
+        let mut exchange = b
+            .export_replication_exchange(FLEET, &a.replication_inventory().unwrap())
+            .unwrap();
+        for envelope in &mut exchange.envelopes {
+            envelope.member_key = None;
+            envelope.signature = None;
+        }
+        exchange.peer = "old-build".into();
+        a.receive_replication_exchange("old-build", FLEET, &exchange)
+            .unwrap();
+        let admission = a.validate_replication_backlog().unwrap();
+        assert_eq!(admission.held, 1);
+        assert!(!admitted(&a, &later));
+        assert_eq!(a.replication_signature_requests().unwrap().len(), 1);
+        let status = a.replication_status(true, Some(FLEET), &[]).unwrap();
+        assert_eq!(status.unsigned_envelopes, 1);
+
+        // The next exchange with a new build answers the request.
+        sync(b, &a);
+        assert!(admitted(&a, &later));
+        assert!(a.replication_signature_requests().unwrap().is_empty());
+        let status = a.replication_status(true, Some(FLEET), &[]).unwrap();
+        assert_eq!(status.unsigned_envelopes, 0);
+    }
+
+    #[test]
+    fn an_envelope_signed_by_another_members_key_or_unsigned_is_never_admitted() {
+        let b_key = key();
+        let (_, a, _) = fleet(&[("b", &b_key)]);
+        // A machine that is not b writes under b's name, with its own key and without one.
+        let forged_key = key();
+        let forger = node("b", Some(&forged_key), None);
+        let forged = note(&forger, "forged with another key");
+        sync(&forger, &a);
+        assert!(!admitted(&a, &forged));
+        let unsigned_forger = node("b", None, None);
+        let unsigned = note(&unsigned_forger, "forged without a key");
+        sync(&unsigned_forger, &a);
+        assert!(!admitted(&a, &unsigned));
+        let status = a.replication_status(true, Some(FLEET), &[]).unwrap();
+        assert!(status.unsigned_envelopes >= 2);
+    }
+
+    #[test]
+    fn a_wrong_key_signature_cannot_strand_an_envelope_its_writer_later_signs() {
+        let b_key = key();
+        let (_, a, stores) = fleet(&[("b", &b_key)]);
+        let b = &stores[0];
+        let genuine = note(b, "genuine");
+        // A relay holding its own key re-signs b's exact envelope and delivers it first.
+        let relay_key = key();
+        let mut exchange = b
+            .export_replication_exchange(FLEET, &a.replication_inventory().unwrap())
+            .unwrap();
+        for envelope in &mut exchange.envelopes {
+            envelope.member_key = Some(relay_key.public().into());
+            envelope.signature = Some(relay_key.sign(&envelope_signature_message(
+                FLEET,
+                &envelope.writer,
+                envelope.sequence,
+                &envelope.hash,
+            )));
+        }
+        exchange.peer = "relay".into();
+        a.receive_replication_exchange("relay", FLEET, &exchange)
+            .unwrap();
+        a.validate_replication_backlog().unwrap();
+        assert!(!admitted(&a, &genuine));
+        assert!(
+            !a.replication_signature_requests().unwrap().is_empty(),
+            "the envelope must keep asking for its writer's signature"
+        );
+        // The writer's signature, answered on request, admits it.
+        sync(b, &a);
+        assert!(admitted(&a, &genuine));
+        let status = a.replication_status(true, Some(FLEET), &[]).unwrap();
+        assert_eq!(status.unsigned_envelopes, 0);
+        assert_eq!(status.fenced_envelopes, 0);
+    }
+
+    #[test]
+    fn a_removed_incarnation_is_fenced_everywhere_that_has_the_removal_even_through_a_relay() {
+        let (b_key, c_key, r_key) = (key(), key(), key());
+        let (_, a, stores) = fleet(&[("b", &b_key), ("c", &c_key), ("r", &r_key)]);
+        let (b, c, r) = (&stores[0], &stores[1], &stores[2]);
+        let before = note(r, "before the removal");
+        sync(r, &a);
+        assert!(admitted(&a, &before));
+
+        // a removes r; c has not heard yet.
+        remove(&a, "r", Some(&r_key), highest_sequence(&a, "r"));
+        sync(&a, b);
+        let after = note(r, "after the removal");
+        // r admits a ghost member and tries to remove b.
+        let ghost_key = key();
+        admit(r, "ghost", &ghost_key, "invite", None);
+        remove(r, "b", Some(&b_key), 1);
+        // r writes as a with its own key.
+        let posing = node("a", Some(&r_key), None);
+        let posed = note(&posing, "r posing as a");
+
+        sync(r, c);
+        sync(&posing, c);
+        assert!(admitted(c, &after), "c did not know of the removal yet");
+        assert!(!admitted(c, &posed), "c knows a's key");
+
+        // c relays everything to a and b, which have the removal.
+        for informed in [&a, b] {
+            sync(c, informed);
+            assert!(!admitted(informed, &after));
+            assert!(!admitted(informed, &posed));
+            let membership = informed.fleet_membership().unwrap();
+            assert_eq!(membership.state("ghost"), MemberState::NotMember);
+            assert!(matches!(membership.state("b"), MemberState::Current(_)));
+            assert!(matches!(membership.state("r"), MemberState::Ended(_)));
+        }
+
+        // c learns of the removal: it admits nothing more from r, and doctor reports the rest.
+        sync(&a, c);
+        let membership = c.fleet_membership().unwrap();
+        assert_eq!(membership.state("ghost"), MemberState::NotMember);
+        assert!(matches!(membership.state("b"), MemberState::Current(_)));
+        let later = note(r, "later still");
+        sync(r, c);
+        assert!(!admitted(c, &later));
+        let residue = c.fleet_admission_residue().unwrap();
+        assert!(
+            residue
+                .iter()
+                .any(|item| item.writer == "r" && item.reason == "admitted-beyond-high-water"),
+            "{residue:?}"
+        );
+        assert!(a.fleet_admission_residue().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_legacy_writer_is_admitted_unsigned_until_a_keyless_removal_ends_its_window() {
+        let (_, a, _) = fleet(&[]);
+        let legacy = node("legacy", None, None);
+        let first = note(&legacy, "legacy history");
+        sync(&legacy, &a);
+        assert!(admitted(&a, &first));
+        let high_water = highest_sequence(&a, "legacy");
+        remove(&a, "legacy", None, high_water);
+        let after = note(&legacy, "after the removal");
+        sync(&legacy, &a);
+        assert!(!admitted(&a, &after));
+        assert_eq!(
+            a.fleet_membership().unwrap().state("legacy"),
+            MemberState::LegacyRemoved(high_water)
+        );
+    }
+
+    #[test]
+    fn a_rejoined_incarnation_starts_above_its_floor_and_the_old_key_stays_fenced() {
+        let old_key = key();
+        let (_, a, stores) = fleet(&[("b", &old_key)]);
+        let old_b = &stores[0];
+        note(old_b, "old history");
+        sync(old_b, &a);
+        let high_water = highest_sequence(&a, "b");
+        remove(&a, "b", Some(&old_key), high_water);
+        let late = note(old_b, "written after the removal");
+
+        // The wiped machine joins again as b with a new key and a floor at the old head.
+        let new_key = key();
+        admit(&a, "b", &new_key, "invite", Some(high_water));
+        let new_b = node("b", Some(&new_key), Some(&a_anchor(&a)));
+        new_b.set_writer_floor(high_water).unwrap();
+        sync(&a, &new_b);
+        let fresh = note(&new_b, "new incarnation");
+        sync(&new_b, &a);
+        sync(old_b, &a);
+        assert!(admitted(&a, &fresh));
+        assert!(!admitted(&a, &late));
+        assert!(matches!(
+            a.fleet_membership().unwrap().state("b"),
+            MemberState::Current(incarnation) if incarnation.member_key == new_key.public()
+        ));
+    }
+
+    fn a_anchor(a: &Store) -> Arc<MemberKey> {
+        a.member_key.read().unwrap().clone().unwrap()
+    }
+
+    #[test]
+    fn a_dial_out_member_is_never_observed_and_endpoints_are_announced_once() {
+        let (d_key, s_key) = (key(), key());
+        let anchor = key();
+        let a = node("a", Some(&anchor), Some(&anchor));
+        admit(&a, "a", &anchor, "anchor", None);
+        admit(&a, "server", &s_key, "invite", None);
+        append(
+            &a,
+            "fleet.member-admitted",
+            "host/laptop",
+            json!({
+                "fleet_id": FLEET, "member_key": d_key.public(), "via": "invite",
+                "mode": "dial-out", "sponsor": "host/a",
+            }),
+        );
+        assert!(!a.observes_transport_to("laptop").unwrap());
+        assert!(a.observes_transport_to("server").unwrap());
+        assert!(a.observes_transport_to("legacy-peer").unwrap());
+
+        let laptop = node("laptop", Some(&d_key), Some(&anchor));
+        sync(&a, &laptop);
+        assert!(
+            laptop
+                .publish_fleet_endpoints("dial-out", &[], "test")
+                .unwrap()
+        );
+        assert!(
+            !laptop
+                .publish_fleet_endpoints("dial-out", &[], "test")
+                .unwrap()
+        );
+        assert!(!laptop.observes_transport_to("a").unwrap());
+        let endpoint = [json!({"transport": "loopback", "address": "127.0.0.1:1"})];
+        assert!(
+            laptop
+                .publish_fleet_endpoints("listening", &endpoint, "test")
+                .unwrap()
+        );
+        assert!(laptop.observes_transport_to("a").unwrap());
+        sync(&laptop, &a);
+        let membership = a.fleet_membership().unwrap();
+        let MemberState::Current(incarnation) = membership.state("laptop") else {
+            panic!("the laptop is current");
+        };
+        assert_eq!(incarnation.mode, "listening");
+        assert_eq!(incarnation.endpoints, endpoint);
+    }
+
+    #[test]
+    fn fleet_claims_are_refused_on_the_public_claim_api() {
+        let a = Store::open_memory("a").unwrap();
+        let error = a
+            .append_client_claim(&ClaimInput {
+                subject: "host/ghost".into(),
+                kind: "fleet.member-admitted".into(),
+                actor: Some("person/ada".into()),
+                fields: serde_json::from_value(json!({
+                    "fleet_id": FLEET,
+                    "member_key": "key",
+                    "via": "invite",
+                    "mode": "listening",
+                }))
+                .unwrap(),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap_err();
+        assert_eq!(error.code, "claim-write-forbidden");
+    }
+
+    #[test]
+    fn a_store_pins_one_anchor() {
+        let a = Store::open_memory("a").unwrap();
+        a.pin_fleet_anchor("first").unwrap();
+        a.pin_fleet_anchor("first").unwrap();
+        assert!(a.pin_fleet_anchor("second").is_err());
+        assert_eq!(a.fleet_anchor().unwrap().as_deref(), Some("first"));
+    }
+}
+
+/// Record an envelope that failed verification, keeping it for inspection and repair.
+fn record_invalid_replica_envelope(
+    connection: &Connection,
+    envelope: &ReplicaEnvelope,
+    error: &St3Error,
+) -> Result<()> {
+    let record_ref = replica_record_ref(&envelope.writer, envelope.sequence, &envelope.hash, 0);
+    connection.execute(
+        "INSERT INTO replica_records(
+             record_ref, writer, sequence, envelope_hash, position, raw, state,
+             error_code, error_message, updated_at_unix_ms
+         ) VALUES (?1, ?2, ?3, ?4, 0, ?5, 'invalid', ?6, ?7, ?8)
+         ON CONFLICT(record_ref) DO UPDATE SET state='invalid', error_code=excluded.error_code,
+            error_message=excluded.error_message, updated_at_unix_ms=excluded.updated_at_unix_ms",
+        params![
+            record_ref,
+            envelope.writer,
+            envelope.sequence,
+            envelope.hash,
+            envelope.payload,
+            error.code,
+            error.message,
+            now_ms().to_string(),
+        ],
+    )?;
+    connection.execute(
+        "UPDATE replica_envelopes SET receipt_state='degraded', validation_error=?4
+         WHERE writer=?1 AND sequence=?2 AND envelope_hash=?3",
+        params![
+            envelope.writer,
+            envelope.sequence,
+            envelope.hash,
+            error.message
+        ],
+    )?;
+    Ok(())
 }
 
 fn max_batch_rowid(connection: &Connection) -> Result<i64> {
@@ -16485,6 +18595,13 @@ fn full_compact_replication_inventory(
 /// divergent exchange lists beyond its first differing range.
 const REPLICATION_EXCHANGE_ENVELOPE_LIMIT: usize = 512;
 
+/// The shortest span one sync rate sample covers.
+const REPLICATION_SYNC_WINDOW_MS: u128 = 10_000;
+
+/// A sync measurement older than this no longer says the node is catching up, and a longer gap
+/// between measurements gives no rate sample.
+const REPLICATION_SYNC_STALE_MS: u128 = 300_000;
+
 /// Sequences per compact inventory range. A range digest lets two peers skip every range they
 /// already share, so an exchange lists only the identities in ranges that differ.
 const REPLICATION_BUCKET_WIDTH: u64 = 256;
@@ -16578,6 +18695,104 @@ fn compact_replication_difference(
         );
     }
     (missing, listed)
+}
+
+/// Count the envelopes only the peer holds and only this node holds, as `(peer_only,
+/// local_only)`, from the inventory the peer sent. A range both sides hold with different
+/// digests counts exactly when the peer listed it, and otherwise counts the difference in range
+/// sizes, which is a lower bound. `None` means the inventory cannot tell, such as a bare digest
+/// that this node has since moved past.
+fn replication_inventory_difference(
+    inventory: &CompactReplicationInventory,
+    buckets: &[ReplicationInventoryBucket],
+    remote: &ReplicationInventory,
+) -> Option<(u64, u64)> {
+    if !remote.digest.is_empty() && remote.digest == inventory.digest {
+        return Some((0, 0));
+    }
+    if !remote.buckets.is_empty() {
+        let local_buckets = buckets
+            .iter()
+            .map(|bucket| ((bucket.writer.as_str(), bucket.start), bucket))
+            .collect::<BTreeMap<_, _>>();
+        let mut remote_listed = BTreeMap::<(&str, u64), Vec<&ReplicaEnvelopeId>>::new();
+        for identity in &remote.envelopes {
+            remote_listed
+                .entry((
+                    identity.writer.as_str(),
+                    replication_bucket_start(identity.sequence),
+                ))
+                .or_default()
+                .push(identity);
+        }
+        let mut shared = BTreeSet::new();
+        let (mut peer_only, mut local_only) = (0_u64, 0_u64);
+        for theirs in &remote.buckets {
+            let key = (theirs.writer.as_str(), theirs.start);
+            let Some(ours) = local_buckets.get(&key) else {
+                peer_only += theirs.count;
+                continue;
+            };
+            shared.insert(key);
+            if ours.digest == theirs.digest {
+                continue;
+            }
+            let known = remote_listed.get_mut(&key).and_then(|known| {
+                known.sort_unstable();
+                known.dedup();
+                (known.len() as u64 == theirs.count
+                    && replication_bucket_digest(known.iter().copied()) == theirs.digest)
+                    .then_some(&*known)
+            });
+            if let Some(known) = known {
+                let local = inventory.identities(inventory.range(&ours.writer, ours.start));
+                peer_only += known
+                    .iter()
+                    .filter(|identity| local.binary_search(**identity).is_err())
+                    .count() as u64;
+                local_only += local
+                    .iter()
+                    .filter(|identity| known.binary_search(identity).is_err())
+                    .count() as u64;
+            } else {
+                peer_only += theirs.count.saturating_sub(ours.count);
+                local_only += ours.count.saturating_sub(theirs.count);
+            }
+        }
+        local_only += buckets
+            .iter()
+            .filter(|bucket| !shared.contains(&(bucket.writer.as_str(), bucket.start)))
+            .map(|bucket| bucket.count)
+            .sum::<u64>();
+        return Some((peer_only, local_only));
+    }
+    if !remote.digest.is_empty() && remote.digest == replication_inventory_digest(&remote.envelopes)
+    {
+        // A peer without range digests, or with an empty store, lists its whole inventory once
+        // per identity. Look each one up in its range rather than expanding every local one.
+        let mut buffer = [0; 64];
+        let shared = remote
+            .envelopes
+            .iter()
+            .filter(|identity| {
+                inventory
+                    .range(
+                        &identity.writer,
+                        replication_bucket_start(identity.sequence),
+                    )
+                    .iter()
+                    .any(|envelope| {
+                        envelope.sequence == identity.sequence
+                            && inventory.hash_text(envelope, &mut buffer) == identity.hash
+                    })
+            })
+            .count();
+        return Some((
+            (remote.envelopes.len() - shared) as u64,
+            (inventory.envelopes.len() - shared) as u64,
+        ));
+    }
+    None
 }
 
 fn replication_identity_digest<'a>(
@@ -17045,6 +19260,8 @@ fn a_malformed_peer_hash_does_not_stop_replication() {
         hash: "NOT-A-SHA256".into(),
         accepted_at_unix_ms: 1,
         payload: "{}".into(),
+        member_key: None,
+        signature: None,
     }];
     target
         .receive_replication_exchange("source", FLEET, &exchange)
@@ -17309,6 +19526,185 @@ fn compact_replication_exchange_waits_for_a_complete_listing() {
     let (missing, listed) = compact_replication_difference(&inventory, &buckets, &listing, limit);
     assert!(missing.is_empty());
     assert_eq!(listed, inventory.public().envelopes);
+}
+
+#[cfg(test)]
+#[test]
+fn replication_difference_counts_what_each_side_lacks() {
+    let local = TestReplica(
+        [
+            test_envelope_ids("origin", 1..=2_000, "a"),
+            test_envelope_ids("relay", 1..=10, "a"),
+        ]
+        .concat()
+        .into_iter()
+        .collect(),
+    );
+    let mut peer = TestReplica(
+        [
+            test_envelope_ids("origin", 1..=1_500, "a"),
+            test_envelope_ids("relay", 1..=10, "a"),
+            test_envelope_ids("newcomer", 1..=5, "a"),
+            // A second candidate at one writer sequence inside a range both sides hold.
+            test_envelope_ids("origin", [700], "b"),
+        ]
+        .concat()
+        .into_iter()
+        .collect(),
+    );
+    let (inventory, buckets) = local.inventory();
+    let difference = |remote: &ReplicationInventory| -> Option<(u64, u64)> {
+        replication_inventory_difference(&inventory, &buckets, remote)
+    };
+    // The newcomer's five and the fork are only on the peer; origin 1501..=2000 only here.
+    assert_eq!(difference(&peer.summary()), Some((6, 500)));
+    let (_, listed) = peer.answer(&local.summary());
+    assert_eq!(difference(&listed), Some((6, 500)));
+
+    // Equal range sizes with different members: the summary can only bound the difference, and
+    // the peer's listing makes it exact.
+    peer.0.remove(&test_envelope_ids("relay", [3], "a")[0]);
+    peer.0.extend(test_envelope_ids("relay", [11], "a"));
+    assert_eq!(difference(&peer.summary()), Some((6, 500)));
+    let (_, listed) = peer.answer(&local.summary());
+    assert_eq!(difference(&listed), Some((7, 501)));
+
+    // An older peer lists its whole inventory, and so does a peer with an empty store.
+    let full = peer.inventory().0.public();
+    assert_eq!(difference(&full), Some((7, 501)));
+    let empty = ReplicationInventory {
+        digest: replication_inventory_digest(&[]),
+        ..ReplicationInventory::default()
+    };
+    assert_eq!(
+        difference(&empty),
+        Some((0, inventory.envelopes.len() as u64))
+    );
+
+    // A matching digest needs nothing else; a bare different digest cannot tell.
+    assert_eq!(difference(&local.summary()), Some((0, 0)));
+    let bare = ReplicationInventory {
+        digest: peer.summary().digest,
+        ..ReplicationInventory::default()
+    };
+    assert_eq!(difference(&bare), None);
+}
+
+#[cfg(test)]
+#[test]
+fn sync_progress_estimates_catch_up_from_net_progress() {
+    let mut progress = PeerSyncProgress::default();
+    progress.observe(0, Some((10_000, 0)), 1_000);
+    let sync = progress.view(1_000).unwrap();
+    assert!(sync.catching_up);
+    assert_eq!(sync.estimated_catch_up_seconds, None, "no rate sample yet");
+
+    // One full window: 1,000 envelopes in 10 seconds.
+    progress.observe(500, Some((9_500, 0)), 6_000);
+    progress.observe(500, Some((9_000, 2)), 11_000);
+    let sync = progress.view(11_000).unwrap();
+    assert_eq!(sync.local_only_envelopes, 2);
+    assert_eq!(sync.receive_rate_per_second, Some(100.0));
+    assert_eq!(sync.catch_up_rate_per_second, Some(100.0));
+    assert_eq!(sync.estimated_catch_up_seconds, Some(90));
+
+    // The peer keeps writing, so only half of what arrives closes the gap.
+    progress.observe(1_000, Some((8_500, 0)), 21_000);
+    let sync = progress.view(21_000).unwrap();
+    assert_eq!(sync.receive_rate_per_second, Some(100.0));
+    assert_eq!(sync.catch_up_rate_per_second, Some(75.0));
+    assert_eq!(sync.estimated_catch_up_seconds, Some(114));
+
+    // A receipt whose inventory could not be measured keeps the last measurement.
+    progress.observe(5, None, 22_000);
+    assert_eq!(progress.view(22_000).unwrap().peer_only_envelopes, 8_500);
+
+    // One exchange carries the rest, so this is no longer catching up.
+    progress.observe(
+        0,
+        Some((REPLICATION_EXCHANGE_ENVELOPE_LIMIT as u64, 0)),
+        23_000,
+    );
+    assert!(!progress.view(23_000).unwrap().catching_up);
+
+    // A measurement from a peer that went quiet stops claiming the node is behind.
+    progress.observe(0, Some((5_000, 0)), 24_000);
+    assert!(progress.view(24_000).unwrap().catching_up);
+    assert!(
+        !progress
+            .view(24_000 + REPLICATION_SYNC_STALE_MS + 1)
+            .unwrap()
+            .catching_up
+    );
+    progress.observe(0, Some((0, 0)), 30_000);
+    assert_eq!(
+        progress.view(30_000).unwrap().estimated_catch_up_seconds,
+        Some(0)
+    );
+}
+
+#[cfg(test)]
+#[test]
+fn a_receipt_measures_how_far_behind_this_node_is() {
+    const FLEET: &str = "018f6f0d-4a5d-7b8c-9d0e-123456789abc";
+    let source = Store::open_memory("source").unwrap();
+    for index in 0..1_200 {
+        source
+            .append_client_claim(&ClaimInput {
+                subject: format!("resource/sync-{index}"),
+                kind: "resource.observed".into(),
+                actor: None,
+                fields: BTreeMap::from([(
+                    "kind".into(),
+                    Value::String("custom.test.replication".into()),
+                )]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+    }
+    source.bind_fleet(FLEET).unwrap();
+    let target = Store::open_memory("target").unwrap();
+    target.bind_fleet(FLEET).unwrap();
+    let peers = ["source".to_owned()];
+    assert!(target.replication_peer_sync(&peers).is_empty());
+
+    let total = source.replication_inventory().unwrap().envelopes.len() as u64;
+    let local = target.replication_inventory().unwrap().envelopes.len() as u64;
+    let pull = || {
+        let summary = target.export_replication_summary(FLEET).unwrap();
+        let response = source
+            .export_replication_exchange(FLEET, &summary.inventory)
+            .unwrap();
+        target
+            .receive_replication_exchange("source", FLEET, &response)
+            .unwrap();
+        (
+            response.envelopes.len() as u64,
+            target.replication_peer_sync(&peers)["source"].clone(),
+        )
+    };
+    let (mut received, sync) = pull();
+    assert_eq!(sync.peer_only_envelopes, total - received);
+    assert_eq!(sync.local_only_envelopes, local);
+    assert!(sync.catching_up, "more than one exchange remains");
+    let status = target
+        .replication_status(true, Some(FLEET), &peers)
+        .unwrap();
+    assert_eq!(status.peers[0].sync.as_ref(), Some(&sync));
+
+    let (more, sync) = pull();
+    received += more;
+    assert_eq!(sync.peer_only_envelopes, total - received);
+    assert!(!sync.catching_up, "the rest fits in one exchange");
+
+    // An unconfigured relay's measurement is not reported.
+    assert!(
+        target
+            .replication_peer_sync(&["elsewhere".to_owned()])
+            .is_empty()
+    );
 }
 
 fn collect_referenced_blobs(
@@ -17749,17 +20145,7 @@ fn validate_replicated_claim(
             ),
         ));
     }
-    let expected = claim_hash(
-        &claim.batch_id,
-        &claim.subject,
-        &claim.kind,
-        &claim.origin,
-        claim.actor.as_deref(),
-        &claim.body,
-        &claim.predecessors,
-    )
-    .map_err(internal)?;
-    if expected != claim.id {
+    if !claim_id_is_content_hash(claim).map_err(internal)? {
         return Err(St3Error::new(
             "claim-hash-mismatch",
             format!("replicated claim `{}` failed verification", claim.id),
@@ -18198,17 +20584,7 @@ fn verify_replica_batch(batch: &ReplicaBatch) -> Result<(), St3Error> {
                 ),
             ));
         }
-        let expected = claim_hash(
-            &claim.batch_id,
-            &claim.subject,
-            &claim.kind,
-            &claim.origin,
-            claim.actor.as_deref(),
-            &claim.body,
-            &claim.predecessors,
-        )
-        .map_err(internal)?;
-        if expected != claim.id {
+        if !claim_id_is_content_hash(claim).map_err(internal)? {
             return Err(St3Error::new(
                 "claim-hash-mismatch",
                 format!("replicated claim `{}` failed verification", claim.id),
@@ -26275,6 +28651,8 @@ mission "proposal-replay" state="ready" revisions="human-only" revision-reviewer
                 buckets: Vec::new(),
             },
             envelopes: vec![candidate],
+            signature_requests: Vec::new(),
+            signatures: Vec::new(),
         };
 
         let target = Store::open_memory("target").unwrap();
@@ -26344,6 +28722,8 @@ mission "proposal-replay" state="ready" revisions="human-only" revision-reviewer
                 buckets: Vec::new(),
             },
             envelopes,
+            signature_requests: Vec::new(),
+            signatures: Vec::new(),
         };
         let left = Store::open_memory("left").unwrap();
         let right = Store::open_memory("right").unwrap();
@@ -26684,6 +29064,173 @@ mission "proposal-replay" state="ready" revisions="human-only" revision-reviewer
             .import_replication("source", &batch)
             .expect_err("tampering must fail");
         assert_eq!(error.code, "claim-hash-mismatch");
+    }
+
+    /// One source claim whose body lists its fields in reverse order and whose ID is the hash of
+    /// that order, the way builds between eaec66a and 2537978d wrote claims on 2026-09-16.
+    fn insertion_order_hashed_batch() -> ReplicationBatch {
+        let source = Store::open_memory("source").unwrap();
+        source
+            .append_claim(&ClaimInput {
+                subject: "host/source".into(),
+                kind: "transport.observed".into(),
+                actor: None,
+                fields: BTreeMap::from([
+                    ("protocol".into(), Value::String("http-replication".into())),
+                    ("status".into(), Value::String("up".into())),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+        let mut batch = source.export_replication(0).unwrap();
+        let claim = &mut batch.batches[0].claims[0];
+        let reversed = |value: &Value| {
+            let mut fields = value.as_object().unwrap().iter().collect::<Vec<_>>();
+            fields.sort_by(|left, right| right.0.cmp(left.0));
+            Value::Object(
+                fields
+                    .into_iter()
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect(),
+            )
+        };
+        let mut body = reversed(&claim.body);
+        body["fields"] = reversed(&claim.body["fields"]);
+        claim.body = body;
+        claim.id = canonical_hash(&(
+            &claim.batch_id,
+            &claim.subject,
+            &claim.kind,
+            &claim.origin,
+            claim.actor.as_deref(),
+            &claim.body,
+            &claim.predecessors,
+        ))
+        .unwrap();
+        batch
+    }
+
+    #[test]
+    fn a_claim_hashed_in_field_insertion_order_still_verifies() {
+        let batch = insertion_order_hashed_batch();
+        let claim = &batch.batches[0].claims[0];
+        let canonical = claim_hash(
+            &claim.batch_id,
+            &claim.subject,
+            &claim.kind,
+            &claim.origin,
+            claim.actor.as_deref(),
+            &claim.body,
+            &claim.predecessors,
+        )
+        .unwrap();
+        assert_ne!(canonical, claim.id, "the fixture must not be canonical");
+        assert!(claim_id_is_content_hash(claim).unwrap());
+
+        // A new node decodes the body from CBOR. It must keep the writer's field order.
+        let mut bytes = Vec::new();
+        ciborium::into_writer(claim, &mut bytes).unwrap();
+        let decoded: ClaimRecord = ciborium::from_reader(bytes.as_slice()).unwrap();
+        assert!(claim_id_is_content_hash(&decoded).unwrap());
+
+        let mut tampered = decoded;
+        tampered.body["fields"]["status"] = Value::String("down".into());
+        assert!(!claim_id_is_content_hash(&tampered).unwrap());
+
+        let target = Store::open_memory("target").unwrap();
+        target.import_replication("source", &batch).unwrap();
+        assert!(target.claim_by_id(&claim.id).unwrap().is_some());
+    }
+
+    #[test]
+    fn a_node_that_rejected_insertion_order_hashes_admits_them_once_upgraded() {
+        const FLEET: &str = "018f6f0d-4a5d-7b8c-9d0e-123456789abc";
+        let envelope = |batch: &ReplicaBatch| {
+            let mut bytes = Vec::new();
+            ciborium::into_writer(
+                &ReplicaEnvelopePayload {
+                    batch: batch.clone(),
+                    blobs: BTreeMap::new(),
+                },
+                &mut bytes,
+            )
+            .unwrap();
+            ReplicaEnvelope {
+                writer: batch.origin.clone(),
+                sequence: batch.replica_sequence,
+                previous_hash: batch.previous_hash.clone(),
+                hash: replica_envelope_hash(
+                    &batch.origin,
+                    batch.replica_sequence,
+                    batch.previous_hash.as_deref(),
+                    batch.accepted_at_unix_ms,
+                    &bytes,
+                ),
+                accepted_at_unix_ms: batch.accepted_at_unix_ms,
+                payload: base64::engine::general_purpose::STANDARD.encode(&bytes),
+                member_key: None,
+                signature: None,
+            }
+        };
+        let receive = |store: &Store, envelope: ReplicaEnvelope| {
+            store
+                .receive_replication_exchange(
+                    "source",
+                    FLEET,
+                    &ReplicationExchange {
+                        peer: "source".into(),
+                        fleet_id: FLEET.into(),
+                        schema_digest: String::new(),
+                        authority_digest: String::new(),
+                        graph_digest: String::new(),
+                        inventory: ReplicationInventory::default(),
+                        envelopes: vec![envelope],
+                        signature_requests: Vec::new(),
+                        signatures: Vec::new(),
+                    },
+                )
+                .unwrap();
+        };
+        let batch = insertion_order_hashed_batch().batches.remove(0);
+        let legacy = envelope(&batch);
+        let target = Store::open_memory("target").unwrap();
+        receive(&target, legacy.clone());
+        // An older build rejected the genuine claim as a hash mismatch.
+        record_invalid_replica_envelope(
+            &target.connection.lock().unwrap(),
+            &legacy,
+            &St3Error::new("claim-hash-mismatch", "failed verification"),
+        )
+        .unwrap();
+        assert_eq!(target.replica_records(true).unwrap().len(), 1);
+
+        let admission = target.validate_replication_backlog().unwrap();
+        assert_eq!(admission.invalid, 0);
+        assert!(target.replica_records(true).unwrap().is_empty());
+        assert!(target.claim_by_id(&batch.claims[0].id).unwrap().is_some());
+
+        // A claim that fails both hashes stays invalid and is not checked again on every wake.
+        let mut tampered = batch.clone();
+        tampered.replica_sequence += 1;
+        tampered.hash = batch_header_hash(
+            &tampered.origin,
+            tampered.replica_sequence,
+            tampered.previous_hash.as_deref(),
+            tampered.accepted_at_unix_ms,
+        )
+        .unwrap();
+        tampered.id = format!(
+            "batch/{}/{}/{}",
+            tampered.origin, tampered.replica_sequence, tampered.hash
+        );
+        tampered.claims[0].batch_id = tampered.id.clone();
+        tampered.claims[0].body["fields"]["status"] = Value::String("down".into());
+        receive(&target, envelope(&tampered));
+        assert_eq!(target.validate_replication_backlog().unwrap().invalid, 1);
+        assert_eq!(target.validate_replication_backlog().unwrap().invalid, 0);
+        assert_eq!(target.replica_records(true).unwrap().len(), 1);
     }
 
     #[test]
@@ -32472,7 +35019,7 @@ mission "review-current" state="ready" revision-cutover="restart-active" {{
                     reason: "a person must decide".into(),
                     severity: "warning".into(),
                     targets: targets.iter().map(|target| (*target).to_owned()).collect(),
-                    actor: "agent/node.requester".into(),
+                    actor: "daemon/runtime".into(),
                     idempotency_key: format!("{subject}:requested"),
                 },
             )
@@ -32814,7 +35361,8 @@ mission "typecase" state="ready" {
         assert_eq!(first.status, "pending");
         let items = store.attention_items(Some("person/nathan")).unwrap();
         assert_eq!(items.len(), 1);
-        assert_eq!(items[0].kind, "fault");
+        assert_eq!(items[0].kind, "agent-request");
+        assert_eq!(items[0].actions[0].label, "answer");
         assert_eq!(items[0].actions.len(), 2);
         assert!(
             store
