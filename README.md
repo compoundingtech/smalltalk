@@ -6,6 +6,9 @@ harness, daemon, and machine restarts. One daemon runs on each machine; machines
 
 ## Install
 
+Download prebuilt Linux x86_64 or macOS arm64 tools from [tagged releases](docs/st3/binary-releases.md),
+or build from source below.
+
 With Nix, from a checkout:
 
 ```sh

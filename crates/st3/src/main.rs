@@ -1872,6 +1872,14 @@ async fn run_up(args: UpArgs) -> Result<()> {
         store.clone(),
         config.observations.clone(),
     ));
+    if let Some(otlp) = &config.observations.otlp {
+        let exporter = st3::otlp::OtlpExporter::new(otlp, &config.node)?;
+        eprintln!(
+            "st3: exporting local observations to OpenTelemetry at {}",
+            otlp.endpoint
+        );
+        tokio::spawn(st3::otlp::run(store.clone(), exporter));
+    }
     #[cfg(target_os = "macos")]
     tokio::spawn(async {
         // Startup and replication can leave large, empty malloc zones resident on macOS.
@@ -6612,21 +6620,22 @@ async fn run_message(
         }
         MessageCommand::Thread(args) => {
             let selected = read_message(client, &args.reference).await?;
-            let mut links = BTreeMap::new();
+            // Page through the whole history once; the daemon reads every message for each pass.
+            let mut messages = Vec::new();
             for_each_message(client, None, true, |message| {
-                links.insert(message.subject, message.in_reply_to);
+                messages.push(message);
                 Ok(())
             })
             .await?;
+            let links = messages
+                .iter()
+                .map(|message| (message.subject.clone(), message.in_reply_to.clone()))
+                .collect::<BTreeMap<_, _>>();
             let root = thread_root_from_links(&selected.subject, &links);
-            let mut thread = Vec::new();
-            for_each_message(client, None, true, |message| {
-                if thread_root_from_links(&message.subject, &links) == root {
-                    thread.push(message);
-                }
-                Ok(())
-            })
-            .await?;
+            let mut thread = messages
+                .into_iter()
+                .filter(|message| thread_root_from_links(&message.subject, &links) == root)
+                .collect::<Vec<_>>();
             thread.sort_by_key(|message| message.created_index);
             print_value(&thread, json_output)
         }
