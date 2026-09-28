@@ -7729,6 +7729,7 @@ fn current_local_pty_incarnation(actor: &str) -> Result<Option<String>> {
 
 async fn wait_for_agent_incarnation(client: &Client, actor: &str) -> Result<String> {
     let mut deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    let mut outage_logged = false;
     let has_local_pty_registry =
         std::env::var_os("PTY_ROOT").is_some_and(|value| !value.is_empty());
     loop {
@@ -7746,6 +7747,13 @@ async fn wait_for_agent_incarnation(client: &Client, actor: &str) -> Result<Stri
                 Ok(None) => {}
                 // A restarting daemon cannot answer yet; its outage does not use up the wait.
                 Err(error) if st3::client::daemon_unreachable(&error).is_some() => {
+                    if !outage_logged {
+                        let _ = write_driver_log(
+                            actor,
+                            "waiting for the runtime incarnation while the daemon restarts",
+                        );
+                        outage_logged = true;
+                    }
                     deadline = tokio::time::Instant::now() + Duration::from_secs(15);
                 }
                 Err(error) => return Err(error),
