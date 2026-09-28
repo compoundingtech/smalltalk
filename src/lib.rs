@@ -101,3 +101,11 @@ pub use run::{
     up_loop, up_loop_specs, up_loop_with_residency, up_once, up_once_selected,
     up_once_selected_specs, up_once_specs, up_once_with_residency,
 };
+
+#[cfg(test)]
+mod ci_proof {
+    #[test]
+    fn deliberately_fails_on_both_hosts() {
+        assert_eq!(1, 2, "intentional CI proof failure");
+    }
+}
