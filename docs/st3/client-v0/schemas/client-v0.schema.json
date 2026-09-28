@@ -51,6 +51,7 @@
             { "$ref": "#/$defs/Page" },
             { "$ref": "#/$defs/Resource" },
             { "$ref": "#/$defs/TimelinePage" },
+            { "$ref": "#/$defs/ConversationChanges" },
             { "$ref": "#/$defs/EventPage" },
             { "$ref": "#/$defs/ActionResult" },
             { "$ref": "#/$defs/PairingChallenge" },
@@ -842,6 +843,16 @@
         "session_id": { "$ref": "#/$defs/Id" },
         "items": { "type": "array", "items": { "$ref": "#/$defs/TimelineEntry" } },
         "page": { "$ref": "#/$defs/PageInfo" }
+      }
+    },
+    "ConversationChanges": {
+      "type": "object", "additionalProperties": false,
+      "required": ["kind", "session_id", "items", "next_cursor"],
+      "properties": {
+        "kind": { "const": "conversation-changes" },
+        "session_id": { "$ref": "#/$defs/Id" },
+        "items": { "type": "array", "maxItems": 200, "items": { "$ref": "#/$defs/TimelineEntry" } },
+        "next_cursor": { "$ref": "#/$defs/Cursor" }
       }
     },
     "ProjectionEvent": {
