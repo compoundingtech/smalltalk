@@ -4947,7 +4947,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                     return Ok(None);
                 }
                 Some(observation) if observation.status == "exited" => {
-                    if observation.exit_code != Some(0) {
+                    if self.gate_exit_code(&subject, &observation)? != Some(0) {
                         anyhow::bail!("metric `{}` exited unsuccessfully", metric.name);
                     }
                     let log = self
@@ -8641,12 +8641,14 @@ impl<R: RuntimeControl> Reconciler<R> {
                     return Ok(GateOutcome::Pending);
                 }
                 Some(observation) if observation.status == "exited" => {
-                    let verdict = if observation.exit_code == Some(0) {
-                        "pass"
-                    } else {
-                        "fail"
+                    let exit_code = self.gate_exit_code(&result_subject, &observation)?;
+                    let verdict = if exit_code == Some(0) { "pass" } else { "fail" };
+                    let reason = match exit_code {
+                        Some(_) => format!("mechanical gate `{name}` {verdict}"),
+                        None => format!(
+                            "mechanical gate `{name}` {verdict}: it exited without an exit status"
+                        ),
                     };
-                    let reason = format!("mechanical gate `{name}` {verdict}");
                     self.record_once(
                         &result_subject,
                         "gate.result",
@@ -8706,6 +8708,32 @@ impl<R: RuntimeControl> Reconciler<R> {
         self.perform_start(&desired, &member, "the mechanical gate was requested")?;
         self.arm_gate_poll();
         Ok(GateOutcome::Pending)
+    }
+
+    /// An exited gate runner's exit code. A runner that outlived a daemon restart is no longer
+    /// this daemon's child, so the exec runtime finds it gone without a status. Its
+    /// `st3 driver exec` wrapper reports the status to the graph before it exits, so that report
+    /// decides. With neither, the wrapper itself was killed, and the runner has no exit code.
+    fn gate_exit_code(
+        &self,
+        subject: &str,
+        observation: &RuntimeObservation,
+    ) -> Result<Option<i64>> {
+        if observation.exit_code.is_some() {
+            return Ok(observation.exit_code);
+        }
+        Ok(self
+            .store
+            .claims_for(subject, Some("runtime.observed"))?
+            .into_iter()
+            .rev()
+            .find(|claim| claim.actor.as_deref() == Some(subject))
+            .and_then(|claim| {
+                claim
+                    .body
+                    .pointer("/fields/exit_code")
+                    .and_then(Value::as_i64)
+            }))
     }
 
     fn arm_gate_poll(&self) {
@@ -13556,6 +13584,119 @@ mission "render-retire" state="ready" { goal "Retire a broken renderer."; step "
         );
         reconciler.reconcile_once().unwrap();
         assert_eq!(runtime.starts.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_mechanical_gate_that_outlives_a_daemon_restart_takes_its_drivers_exit_status() {
+        // After a restart the runner is no longer the daemon's child: the exec runtime finds it
+        // gone without an exit status. Only its `st3 driver exec` report says how it ended.
+        for (report, run_status, verdict) in [
+            (Some(0), "completed", "pass"),
+            (Some(1), "failed", "fail"),
+            (None, "failed", "fail"),
+        ] {
+            let store = Arc::new(Store::open_memory("node").unwrap());
+            let source = r#"
+                version 2
+
+                  mission "proof" state="ready" {
+                    goal "Complete mission proof."
+                    completion { when "all-steps-exhausted" }
+                    step "verify" {
+                      title "The command passes"
+                      gate "verify" {
+                        exec "sleep 60"
+                        host "node"
+                        workspace "."
+                        time-limit "1m"
+                      }
+                    }
+                  }
+
+            "#;
+            apply_source(&store, source, "mission-restarted-gate");
+            let run = store
+                .create_mission_run(&crate::model::MissionRunRequest {
+                    mission: "proof".into(),
+                    revision: None,
+                    workspace: "/tmp".into(),
+                    requester: Some("person/test".into()),
+                    mode: Some("run".into()),
+                    inputs: BTreeMap::new(),
+                    idempotency_key: "run-restarted-gate".into(),
+                })
+                .unwrap();
+            let runtime = Arc::new(FakeRuntime::default());
+            let reconciler = Reconciler::new(
+                store.clone(),
+                runtime.clone(),
+                "node".into(),
+                Arc::new(Notify::new()),
+            );
+            for _ in 0..4 {
+                reconciler.reconcile_once().unwrap();
+            }
+            let gate = runtime
+                .started_members
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|member| member.driver.as_deref() == Some("mechanical-gate"))
+                .cloned()
+                .expect("the mechanical gate did not start");
+            let crate::model::LaunchSpec::Argv(argv) = &gate.launch else {
+                panic!("the gate runner is not wrapped by its driver");
+            };
+            let subject = argv[argv.iter().position(|arg| arg == "--subject").unwrap() + 1].clone();
+            if let Some(code) = report {
+                store
+                    .append_claim(&ClaimInput {
+                        subject: subject.clone(),
+                        kind: "runtime.observed".into(),
+                        actor: Some(subject.clone()),
+                        fields: BTreeMap::from([
+                            ("status".into(), Value::String("exited".into())),
+                            ("exit_code".into(), Value::from(code)),
+                            ("exit_signal".into(), Value::Null),
+                        ]),
+                        evidence: Vec::new(),
+                        expected_subject: None,
+                        idempotency_key: None,
+                    })
+                    .unwrap();
+            }
+            runtime.execs.lock().unwrap().insert(
+                gate.runtime_id.clone(),
+                RuntimeObservation {
+                    runtime_id: gate.runtime_id,
+                    terminal: false,
+                    status: "exited".into(),
+                    exit_code: None,
+                    incarnation_id: Some("gate-one".into()),
+                },
+            );
+
+            for _ in 0..3 {
+                reconciler.reconcile_once().unwrap();
+            }
+
+            let result = store
+                .latest_claim(&subject, Some("gate.result"))
+                .unwrap()
+                .expect("the gate has no result");
+            assert_eq!(result.body["fields"]["verdict"], verdict, "{report:?}");
+            if report.is_none() {
+                assert_eq!(
+                    result.body["fields"]["reason"],
+                    "mechanical gate `verify` fail: it exited without an exit status"
+                );
+            }
+            assert_eq!(
+                store.mission_run(&run.id).unwrap().unwrap().status,
+                run_status,
+                "{report:?}"
+            );
+        }
     }
 
     #[test]
