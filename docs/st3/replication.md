@@ -120,7 +120,7 @@ first exchange after a restart rebuilds them.
 A node is catching up while a peer measured in the last five minutes holds more envelopes than one
 exchange carries. During that time its projections can show early history as current: a request
 that a later envelope resolves still looks open. Every client page then carries a `sync` notice,
-`st3 now` and the other product commands print a `SYNCING` line before their items, and stui shows
+`st now` and the other product commands print a `SYNCING` line before their items, and stui shows
 `⟳ Syncing` with the same line.
 
 Repair publishes a new claim. It does not delete or change the bad record.
