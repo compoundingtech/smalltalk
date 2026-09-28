@@ -525,7 +525,7 @@ pub(crate) fn render_attention_list(
         let _ = writeln!(output, "    subject: {}", item.subject);
         let _ = writeln!(
             output,
-            "    inspect: st3 attention show {} --as {}",
+            "    inspect: st attention show {} --as {}",
             item.subject, item.person
         );
         for action in &item.actions {
@@ -1436,7 +1436,7 @@ mod tests {
         assert!(rendered.contains("--reason 'It is fixed'"));
         assert!(!rendered.contains("The queue did not recover."));
         assert!(
-            rendered.contains("inspect: st3 attention show attention/fabric --as person/nathan")
+            rendered.contains("inspect: st attention show attention/fabric --as person/nathan")
         );
 
         let shown = render_attention_show(&item, OutputStyle::plain(), 180_000);
