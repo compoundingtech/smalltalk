@@ -15,6 +15,22 @@ least `1h`) and rows beyond `max_per_subject_kind` (default 20,000) go. The newe
 subject and kind stays. An older build that still writes such a kind as a claim replicates it as
 before, and readers merge those claims with the local rows.
 
+A kind of `system-local` retention is local when the system records it without an actor and a
+claim when a person or agent writes it as its actor. The reconciler's own `runtime.action.*`
+records, its starts, stop requests, deadlines and kills, stay on the node that runs the runtime,
+where the stop fence, restart windows and adoption read them. A person's signal names its
+requester and replicates with its result. A local observation may cite another local observation
+of the same node as evidence; a claim can cite only claims.
+
+A kind of `latest` retention is an observation that other nodes read only in its latest state. The
+local log keeps every observation. The claim log gets an ordinary claim of the same kind only when
+the state changes, so every node reads the current state from the latest claim, and a checkpoint
+may drop the claims each newer one replaced. `harness.observed` replicates when any field other
+than `observed_at_ms` changes. `harness.usage` replicates the first reading of each incarnation and
+semantics, a compaction or model change, a reading at least five minutes after the last replicated
+one while the harness works, and any reading while it does not. The newest pending reading
+replicates when the harness stops working.
+
 A node can also send every local observation to an OpenTelemetry collector. The exporter is off
 unless the config names a collector:
 
@@ -61,7 +77,8 @@ order from the same admitted claims.
 | `run_generations` | Projection | `run-generation.*` claims |
 | `step_runs` | Projection | `step-run.*` and `work.*` claims |
 | `local_work_lease_renewals` | Local operational fact | Recent quiet lease renewals; replayed over replicated claim projections and bounded by periodic `work.renewed` anchors |
-| `local_observations` | Local observation log | Observations of `local` retention made on this node; never replicated, trimmed after `[observations] retention` |
+| `local_observations` | Local observation log | Observations of `local` and `latest` retention made on this node; never replicated, trimmed after `[observations] retention` |
+| `local_latest_slots` | Local observation log | For each `latest` slot this node writes: its last replicated observation and time, and the newest local observation no claim carries yet |
 | `revision_proposals` | Projection | `revision-proposal.*` claims |
 | `planning_sessions` | Projection | `planning-session.*` claims |
 | `planning_candidates` | Projection | `planning-session.candidate-submitted` claims |
