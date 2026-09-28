@@ -50,6 +50,7 @@
   "actions": {
     "review.approve": { "capability": "control.attention", "parameters": "TargetParameters" },
     "review.reject": { "capability": "control.attention", "parameters": "TargetParameters" },
+    "review.request-changes": { "capability": "control.attention", "parameters": "TargetParameters" },
     "attention.resolve": { "capability": "control.attention", "parameters": "AttentionResolveParameters" },
     "message.send": { "capability": "control.messages", "parameters": "MessageSendParameters" },
     "message.read": { "capability": "control.messages", "parameters": "TargetParameters" },

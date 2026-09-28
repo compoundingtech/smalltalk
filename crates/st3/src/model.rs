@@ -687,11 +687,17 @@ pub enum GateSpec {
     Human {
         name: String,
         reviewer: String,
+        #[serde(default = "default_human_gate_mode")]
+        mode: String,
         #[serde(default)]
         question: Option<String>,
         #[serde(default)]
         review_targets: Vec<String>,
     },
+}
+
+fn default_human_gate_mode() -> String {
+    "approve".into()
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -1483,6 +1489,8 @@ pub struct HumanReviewView {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
     pub reviewer: String,
+    #[serde(default = "default_human_gate_mode")]
+    pub mode: String,
     pub question: String,
     #[serde(default)]
     pub review_targets: Vec<String>,
@@ -1501,6 +1509,8 @@ pub struct AttentionActionView {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct AttentionItemView {
     pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_mode: Option<String>,
     pub subject: String,
     pub person: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]

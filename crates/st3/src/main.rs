@@ -1641,6 +1641,8 @@ enum AttentionCommand {
     Approve(ReviewArgs),
     /// Reject one person-owned gate or launch review.
     Reject(ReviewArgs),
+    /// Ask a feedback-mode step to change its work and rerun.
+    RequestChanges(FeedbackReviewArgs),
 }
 
 #[derive(Args)]
@@ -1943,6 +1945,15 @@ struct ReviewArgs {
 }
 
 #[derive(Args)]
+struct FeedbackReviewArgs {
+    target: String,
+    #[arg(long)]
+    reason: String,
+    #[arg(long = "as", value_parser = parse_person_subject)]
+    actor: String,
+}
+
+#[derive(Args)]
 struct DriverArgs {
     #[arg(value_parser = ["claude", "claude-mcp", "codex", "pi", "pi-channel", "omp", "omp-channel", "opencode", "exec"])]
     driver: String,
@@ -2188,6 +2199,7 @@ fn guard_mutating_cli_actor(
             AttentionCommand::Resolve(args) => Some(args.actor.as_str()),
             AttentionCommand::Withdraw(args) => Some(args.actor.as_str()),
             AttentionCommand::Approve(args) | AttentionCommand::Reject(args) => Some(args.actor.as_str()),
+            AttentionCommand::RequestChanges(args) => Some(args.actor.as_str()),
             _ => None,
         },
         Command::Launch { command } => match command {
@@ -6379,6 +6391,19 @@ async fn run_attention(
         }
         AttentionCommand::Reject(args) => {
             run_review_decision(client, "rejected", args, json_output).await
+        }
+        AttentionCommand::RequestChanges(args) => {
+            run_review_decision(
+                client,
+                "changes-requested",
+                ReviewArgs {
+                    target: args.target,
+                    reason: Some(args.reason),
+                    actor: args.actor,
+                },
+                json_output,
+            )
+            .await
         }
     }
 }

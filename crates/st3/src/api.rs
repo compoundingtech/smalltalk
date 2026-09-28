@@ -1637,8 +1637,11 @@ fn attention_resource_id(subject: &str) -> String {
     }
 }
 
-fn client_attention_actions(kind: &str) -> Vec<&'static str> {
+fn client_attention_actions(kind: &str, review_mode: Option<&str>) -> Vec<&'static str> {
     match kind {
+        "human-gate" if review_mode == Some("feedback") => {
+            vec!["review.approve", "review.request-changes"]
+        }
         "human-gate" => vec!["review.approve", "review.reject"],
         "launch-approval" => vec!["launch.approve", "launch.cancel"],
         "revision-approval" => {
@@ -1724,7 +1727,7 @@ fn client_attention_resources(
             "state": "open",
             "requested_at": client_timestamp(item.requested_at_unix_ms),
             "targets": item.targets,
-            "actions": client_attention_actions(&item.kind),
+            "actions": client_attention_actions(&item.kind, item.review_mode.as_deref()),
             "operational": { "layer": "current", "actionable": true, "reasons": [] }
         });
         let object = resource
@@ -1732,6 +1735,9 @@ fn client_attention_resources(
             .expect("an attention resource is an object");
         if let Some(requester) = &item.requester_id {
             object.insert("requester_id".into(), Value::String(requester.clone()));
+        }
+        if let Some(mode) = &item.review_mode {
+            object.insert("review_mode".into(), Value::String(mode.clone()));
         }
         if matches!(item.kind.as_str(), "fault" | "agent-request")
             && attention_requester_retired(store, item, &mut retired_seats)?
@@ -1782,7 +1788,7 @@ fn client_attention_resources(
                     "state": if request.status == "pending" { "open" } else { "resolved" },
                     "requested_at": client_timestamp(request.requested_at_unix_ms),
                     "targets": request.targets,
-                    "actions": if current { client_attention_actions(kind) } else { Vec::<&str>::new() },
+                    "actions": if current { client_attention_actions(kind, None) } else { Vec::<&str>::new() },
                     "operational": { "layer": if current { "current" } else { "history" }, "actionable": current, "reasons": reasons }
             });
             insert_attention_target_states(
@@ -6040,18 +6046,18 @@ async fn post_review(
     AxumPath(subject): AxumPath<String>,
     Json(request): Json<ReviewRequest>,
 ) -> Result<Json<ClaimRecord>, ApiError> {
-    if !matches!(request.decision.as_str(), "approved" | "rejected") {
+    if !matches!(request.decision.as_str(), "approved" | "rejected" | "changes-requested") {
         return Err(ApiError::bad(St3Error::new(
             "invalid-review-decision",
-            "a review decision must be approved or rejected",
+            "a review decision must be approved, rejected, or changes-requested",
         )));
     }
-    if request.decision == "rejected"
+    if matches!(request.decision.as_str(), "rejected" | "changes-requested")
         && request.reason.as_deref().is_none_or(|reason| reason.trim().is_empty())
     {
         return Err(ApiError::bad(St3Error::new(
             "missing-review-reason",
-            "a rejected review needs a reason",
+            "a rejection or request for changes needs a reason",
         )));
     }
     let subject = if subject.starts_with("resource/")
@@ -6103,13 +6109,34 @@ async fn post_review(
     } else {
         None
     };
-    let verdict = if request.decision == "approved" {
-        "pass"
-    } else {
-        "fail"
+    let mode = review_request
+        .as_ref()
+        .and_then(|claim| claim.body.pointer("/fields/mode"))
+        .and_then(Value::as_str)
+        .unwrap_or("approve");
+    if mode == "feedback" && !subject.starts_with("step-run/") {
+        return Err(ApiError::bad(St3Error::new(
+            "feedback-gate-needs-step",
+            "a feedback review must belong to a step",
+        )));
+    }
+    if !match mode {
+        "feedback" => matches!(request.decision.as_str(), "approved" | "changes-requested"),
+        _ => matches!(request.decision.as_str(), "approved" | "rejected"),
+    } {
+        return Err(ApiError::bad(St3Error::new(
+            "review-decision-not-offered",
+            format!("`{}` is not offered by this {mode} review", request.decision),
+        )));
+    }
+    let verdict = match request.decision.as_str() {
+        "approved" => "pass",
+        "changes-requested" => "feedback",
+        _ => "fail",
     };
     let mut fields = BTreeMap::from([
         ("verdict".into(), Value::String(verdict.into())),
+        ("decision".into(), Value::String(request.decision.clone())),
         (
             "reason".into(),
             request.reason.map(Value::String).unwrap_or(Value::Null),

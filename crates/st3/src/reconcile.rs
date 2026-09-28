@@ -6982,6 +6982,7 @@ impl<R: RuntimeControl> Reconciler<R> {
         expand_gate(&mut gate, variables, &run.workspace)?;
         if let GateSpec::Human {
             reviewer,
+            mode,
             question,
             review_targets,
             ..
@@ -6994,6 +6995,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                 definition_hash,
                 attempt,
                 reviewer,
+                mode,
                 question.as_deref(),
                 review_targets,
             );
@@ -7020,6 +7022,7 @@ impl<R: RuntimeControl> Reconciler<R> {
         definition_hash: &str,
         attempt: u32,
         reviewer: &str,
+        mode: &str,
         question: Option<&str>,
         review_targets: &[String],
     ) -> Result<GateOutcome> {
@@ -7029,6 +7032,7 @@ impl<R: RuntimeControl> Reconciler<R> {
         let mut fields = BTreeMap::from([
             ("owner".into(), Value::String(subject.to_owned())),
             ("reviewer".into(), Value::String(reviewer.into())),
+            ("mode".into(), Value::String(mode.into())),
             ("question".into(), Value::String(question)),
             (
                 "review_targets".into(),
@@ -7037,7 +7041,11 @@ impl<R: RuntimeControl> Reconciler<R> {
             (
                 "decisions".into(),
                 Value::Array(
-                    ["approved", "rejected"]
+                    if mode == "feedback" {
+                        ["approved", "changes-requested"]
+                    } else {
+                        ["approved", "rejected"]
+                    }
                         .into_iter()
                         .map(|value| Value::String(value.into()))
                         .collect(),
@@ -7090,11 +7098,95 @@ impl<R: RuntimeControl> Reconciler<R> {
             .flatten()
         }) {
             Some("pass") => Ok(GateOutcome::Pass),
+            Some("feedback") if mode == "feedback" => {
+                let decision = decision.as_ref().expect("a feedback decision exists");
+                let reason = decision
+                    .body
+                    .pointer("/fields/reason")
+                    .and_then(Value::as_str)
+                    .filter(|reason| !reason.trim().is_empty())
+                    .context("a request for changes has no feedback text")?;
+                self.apply_human_feedback(subject, attempt, reviewer, reason, &decision.id)?;
+                Ok(GateOutcome::Pending)
+            }
             Some("fail") => Ok(GateOutcome::Fail(human_review_failure_reason(
                 decision.as_ref().expect("a failed decision exists"),
             ))),
             _ => Ok(GateOutcome::Pending),
         }
+    }
+
+    fn apply_human_feedback(
+        &self,
+        subject: &str,
+        attempt: u32,
+        reviewer: &str,
+        reason: &str,
+        decision_id: &str,
+    ) -> Result<()> {
+        let step = self
+            .store
+            .step_run(subject)?
+            .context("the feedback step disappeared")?;
+        if step.attempt != attempt {
+            return Ok(());
+        }
+        let claimant = self
+            .store
+            .claims_for(subject, Some("work.claimed"))?
+            .into_iter()
+            .rev()
+            .find(|claim| {
+                claim.body.pointer("/fields/attempt").and_then(Value::as_u64)
+                    == Some(u64::from(attempt))
+            })
+            .and_then(|claim| {
+                claim.body
+                    .pointer("/fields/claimant")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
+            .or(step.claimant)
+            .or(step.carried_claimant)
+            .or(step.assigned_to)
+            .context("a feedback step has no claimant or assignee")?;
+        let key = format!("human-feedback:{decision_id}:{claimant}");
+        let message_id = hex::encode(sha2::Sha256::digest(key.as_bytes()));
+        self.store.append_claim(&ClaimInput {
+            subject: format!("message/{}", &message_id[..16]),
+            kind: "message.sent".into(),
+            actor: Some(reviewer.into()),
+            fields: BTreeMap::from([
+                ("from".into(), Value::String(reviewer.into())),
+                ("to".into(), Value::String(claimant)),
+                (
+                    "content".into(),
+                    Value::String(format!(
+                        "Reviewer requested changes to `{subject}`: {reason}. Claim the new attempt and address this feedback."
+                    )),
+                ),
+                ("status".into(), Value::String("sent".into())),
+                (
+                    "title".into(),
+                    Value::String("Human review requested changes".into()),
+                ),
+                ("in_reply_to".into(), Value::Null),
+                (
+                    "tags".into(),
+                    Value::Array(vec![Value::String(format!("st3-feedback:{subject}"))]),
+                ),
+            ]),
+            evidence: Vec::new(),
+            expected_subject: None,
+            idempotency_key: Some(key),
+        })?;
+        if self
+            .store
+            .retry_step_for_feedback(subject, attempt, reason, reviewer)?
+        {
+            self.signal_changed();
+        }
+        Ok(())
     }
 
     fn step_timed_out(
