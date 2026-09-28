@@ -1,0 +1,720 @@
+#![cfg(unix)]
+//! One failing item never stops the other items on a host.
+//!
+//! Each test fails one item of the reconcile pass, either by injecting a fault where the
+//! reconciler takes that item up or by giving it the graph that stopped a real host. Beside that
+//! failure, a cancelled run must still stop its worker and finish cleanup, and a run started
+//! afterwards must still start its worker. The failure is recorded on the item that failed, and
+//! its recovery is recorded once it clears.
+//!
+//! Every test owns an in-memory graph and a fake runtime, and runs without a tokio runtime so
+//! no observer polls a provider.
+
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+
+use anyhow::Result;
+use serde_json::Value;
+use st3::model::{ClaimInput, IntentInput, MemberSpec, MissionRunRequest, MissionRunView};
+use st3::reconcile::{FaultInjection, Reconciler, RuntimeControl, RuntimeObservation};
+use st3::store::Store;
+use tokio::sync::Notify;
+
+const HOST: &str = "node";
+const DAEMON: &str = "daemon/node";
+
+/// Runtimes that start as running and exit when stopped.
+#[derive(Default)]
+struct Runtime {
+    execs: Mutex<HashMap<String, RuntimeObservation>>,
+    failed_starts: Mutex<BTreeSet<String>>,
+    failed_stops: Mutex<BTreeSet<String>>,
+    incarnations: AtomicU64,
+}
+
+impl Runtime {
+    fn running(&self, runtime_id: &str) -> bool {
+        self.execs
+            .lock()
+            .unwrap()
+            .get(runtime_id)
+            .is_some_and(|exec| exec.status == "running")
+    }
+}
+
+impl RuntimeControl for Runtime {
+    fn snapshot_ptys(&self) -> Result<Vec<RuntimeObservation>> {
+        Ok(self
+            .execs
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|runtime| runtime.terminal)
+            .cloned()
+            .collect())
+    }
+
+    fn observe_exec(&self, runtime_id: &str) -> Result<Option<RuntimeObservation>> {
+        Ok(self
+            .execs
+            .lock()
+            .unwrap()
+            .get(runtime_id)
+            .filter(|runtime| !runtime.terminal)
+            .cloned())
+    }
+
+    fn start(&self, member: &MemberSpec) -> Result<()> {
+        anyhow::ensure!(
+            !self
+                .failed_starts
+                .lock()
+                .unwrap()
+                .contains(&member.runtime_id),
+            "the runtime refused to start {}",
+            member.runtime_id
+        );
+        let incarnation = self.incarnations.fetch_add(1, Ordering::SeqCst);
+        self.execs.lock().unwrap().insert(
+            member.runtime_id.clone(),
+            RuntimeObservation {
+                runtime_id: member.runtime_id.clone(),
+                terminal: member.terminal,
+                status: "running".into(),
+                exit_code: None,
+                incarnation_id: Some(format!("incarnation-{incarnation}")),
+            },
+        );
+        Ok(())
+    }
+
+    fn stop(
+        &self,
+        runtime_id: &str,
+        _terminal: bool,
+        _expected_incarnation: Option<&str>,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            !self.failed_stops.lock().unwrap().contains(runtime_id),
+            "the runtime refused to stop {runtime_id}"
+        );
+        if let Some(exec) = self.execs.lock().unwrap().get_mut(runtime_id) {
+            exec.status = "exited".into();
+            exec.exit_code = Some(0);
+        }
+        Ok(())
+    }
+
+    fn kill(
+        &self,
+        runtime_id: &str,
+        terminal: bool,
+        expected_incarnation: Option<&str>,
+    ) -> Result<()> {
+        self.stop(runtime_id, terminal, expected_incarnation)
+    }
+
+    fn remove(&self, runtime_id: &str, _terminal: bool) -> Result<()> {
+        self.execs.lock().unwrap().remove(runtime_id);
+        Ok(())
+    }
+
+    fn attach(&self, _runtime_id: &str) -> Result<()> {
+        Ok(())
+    }
+
+    fn screen(&self, _runtime_id: &str) -> Result<String> {
+        Ok(String::new())
+    }
+
+    fn send_key(&self, _runtime_id: &str, _key: &str) -> Result<()> {
+        Ok(())
+    }
+
+    fn read_exec_log(&self, _runtime_id: &str) -> Result<Option<String>> {
+        Ok(None)
+    }
+}
+
+#[derive(Clone, Copy)]
+enum Fault {
+    Error,
+    Panic,
+}
+
+/// The items to fail, by scope and subject.
+#[derive(Default)]
+struct Faults {
+    items: Mutex<BTreeMap<(String, String), Fault>>,
+}
+
+impl Faults {
+    fn fail(&self, scope: &str, subject: &str, fault: Fault) {
+        self.items
+            .lock()
+            .unwrap()
+            .insert((scope.into(), subject.into()), fault);
+    }
+
+    fn clear(&self) {
+        self.items.lock().unwrap().clear();
+    }
+}
+
+impl FaultInjection for Faults {
+    fn fault(&self, scope: &str, subject: &str) -> Option<String> {
+        let fault = self
+            .items
+            .lock()
+            .unwrap()
+            .get(&(scope.to_owned(), subject.to_owned()))
+            .copied();
+        match fault {
+            Some(Fault::Error) => Some(format!("injected fault in {scope}")),
+            Some(Fault::Panic) => panic!("injected panic in {scope}"),
+            None => None,
+        }
+    }
+}
+
+struct Host {
+    _root: tempfile::TempDir,
+    workspace: PathBuf,
+    store: Arc<Store>,
+    runtime: Arc<Runtime>,
+    faults: Arc<Faults>,
+    reconciler: Reconciler<Runtime>,
+}
+
+impl Host {
+    fn new() -> Self {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let store = Arc::new(Store::open_memory(HOST).unwrap());
+        let runtime = Arc::new(Runtime::default());
+        let faults = Arc::new(Faults::default());
+        let reconciler = Reconciler::new(
+            store.clone(),
+            runtime.clone(),
+            HOST.into(),
+            Arc::new(Notify::new()),
+        )
+        .with_fault_injection(faults.clone());
+        let host = Self {
+            _root: root,
+            workspace,
+            store,
+            runtime,
+            faults,
+            reconciler,
+        };
+        host.publish(
+            r#"version 2
+mission "worker" state="ready" {
+  goal "Keep one worker running until the run is cancelled."
+  concurrent-runs max=8
+  agent "worker" { workspace "${ST_WORKSPACE}"; command "sleep 600"; restart "never" }
+  step "wait" {
+    assigned-to "agent/${ST_MISSION_RUN}/worker"
+    goal "Wait for cancellation."
+  }
+}"#,
+            "publish-worker",
+        );
+        host
+    }
+
+    fn publish(&self, source: &str, key: &str) {
+        let intent = st3::parse_intent(source, HOST).unwrap();
+        let mission = self
+            .store
+            .mission(
+                &intent,
+                IntentInput {
+                    kdl: source.into(),
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        self.store
+            .apply(&intent, &mission.subject_tokens, key)
+            .unwrap();
+    }
+
+    fn start(&self, key: &str) -> MissionRunView {
+        self.start_mission("worker", key)
+    }
+
+    fn start_mission(&self, mission: &str, key: &str) -> MissionRunView {
+        self.store
+            .create_mission_run(&MissionRunRequest {
+                mission: mission.into(),
+                revision: None,
+                workspace: self.workspace.to_string_lossy().into_owned(),
+                requester: Some("person/operator".into()),
+                mode: None,
+                inputs: BTreeMap::new(),
+                idempotency_key: key.into(),
+            })
+            .unwrap()
+    }
+
+    fn cancel(&self, run: &MissionRunView) {
+        self.store
+            .request_mission_run_cancellation(&run.id, "the operator cancelled it")
+            .unwrap();
+    }
+
+    fn pass(&self, passes: usize) {
+        for _ in 0..passes {
+            self.reconciler.reconcile_once().unwrap();
+        }
+    }
+
+    /// The runtime ID of the run's worker, read while the run still declares it.
+    fn worker(&self, run: &MissionRunView) -> String {
+        self.store
+            .desired_subjects_for_owner_run(&run.subject)
+            .unwrap()
+            .into_iter()
+            .filter(|desired| desired.kind == "agent")
+            .find_map(|desired| desired.member)
+            .map(|member| member.runtime_id)
+            .unwrap_or_else(|| {
+                panic!(
+                    "run {} declares no worker: {:?}, declared {:?}, faults {:?}",
+                    run.id,
+                    self.state(run),
+                    self.store
+                        .desired_subjects()
+                        .unwrap()
+                        .iter()
+                        .map(|desired| (&desired.subject, &desired.kind, &desired.owner_run))
+                        .collect::<Vec<_>>(),
+                    self.store.open_reconcile_faults(HOST).unwrap(),
+                )
+            })
+    }
+
+    /// Report the run's worker ready, as its harness driver does once it has started.
+    fn ready(&self, run: &MissionRunView) {
+        let agent = self.owned(run, "agent");
+        let incarnation = self
+            .runtime
+            .execs
+            .lock()
+            .unwrap()
+            .get(&self.worker(run))
+            .and_then(|runtime| runtime.incarnation_id.clone())
+            .expect("the worker is running");
+        self.store
+            .append_claim(&ClaimInput {
+                subject: agent.clone(),
+                kind: "harness.observed".into(),
+                actor: Some(agent),
+                fields: BTreeMap::from([
+                    ("state".into(), Value::String("ready".into())),
+                    ("driver".into(), Value::String("pi".into())),
+                    ("incarnation_id".into(), Value::String(incarnation)),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+    }
+
+    /// Whether the reconciler sent the run's worker a wake for its ready work.
+    fn woken(&self, run: &MissionRunView) -> bool {
+        !self
+            .store
+            .work_wake_messages_for_reconcile(&self.owned(run, "agent"))
+            .unwrap()
+            .is_empty()
+    }
+
+    /// The subject of the one declaration of `kind` that `run` owns.
+    fn owned(&self, run: &MissionRunView, kind: &str) -> String {
+        self.store
+            .desired_subjects_for_owner_run(&run.subject)
+            .unwrap()
+            .into_iter()
+            .find(|desired| desired.kind == kind)
+            .map(|desired| desired.subject)
+            .unwrap_or_else(|| panic!("run {} declares no {kind}", run.id))
+    }
+
+    /// Start a standing intake run that declares `intake` beside its own seat.
+    fn start_intake(&self, intake: &str) -> MissionRunView {
+        self.publish(
+            &format!(
+                r#"version 2
+resource "repo" {{ kind "vcs.repository" }}
+mission "intake" state="ready" {{
+  goal "Hold intake."
+  agent "seat" {{ workspace "${{ST_WORKSPACE}}"; command "sleep 600"; restart "never" }}
+  step "watch" {{ assigned-to "agent/${{ST_MISSION_RUN}}/seat"; goal "Keep watching." }}
+{intake}
+}}"#
+            ),
+            "publish-intake",
+        );
+        let run = self.start_mission("intake", "intake");
+        self.pass(2);
+        run
+    }
+
+    fn state(&self, run: &MissionRunView) -> (String, String) {
+        let run = self.store.mission_run(&run.id).unwrap().unwrap();
+        (run.status, run.phase)
+    }
+
+    fn fault(&self, subject: &str, scope: &str) -> Option<String> {
+        self.store.reconcile_fault(subject, scope).unwrap()
+    }
+
+    fn fault_records(&self, subject: &str) -> Vec<Value> {
+        self.store
+            .claims_for(subject, Some("reconcile.fault"))
+            .unwrap()
+            .into_iter()
+            .map(|claim| claim.body["fields"].clone())
+            .collect()
+    }
+}
+
+/// Start a run and let its worker come up, so the test can cancel it beside a failure.
+fn running_run(host: &Host, key: &str) -> (MissionRunView, String) {
+    let run = host.start(key);
+    host.pass(4);
+    let worker = host.worker(&run);
+    assert!(
+        host.runtime.running(&worker),
+        "{key} did not start its worker"
+    );
+    (run, worker)
+}
+
+/// With `failure` in place, a cancelled run stops its worker and finishes cleanup, and a run
+/// started afterwards starts its worker and wakes it for its work.
+fn assert_progress_beside(host: &Host, failure: impl FnOnce(&Host)) {
+    let (cancelled, cancelled_worker) = running_run(host, "cancelled");
+    failure(host);
+    host.cancel(&cancelled);
+    let fresh = host.start("fresh");
+    host.pass(12);
+    assert!(
+        !host.runtime.running(&cancelled_worker),
+        "the cancelled run's worker is still running"
+    );
+    assert_eq!(
+        host.state(&cancelled),
+        ("cancelled".into(), "terminal".into()),
+        "the cancelled run did not finish cleanup"
+    );
+    assert!(
+        host.runtime.running(&host.worker(&fresh)),
+        "the fresh run did not start its worker"
+    );
+    host.ready(&fresh);
+    host.pass(2);
+    assert!(host.woken(&fresh), "the fresh run's worker was not woken");
+}
+
+/// Fail one stage of every pass, then clear it: the stages after it still run, and the stage
+/// records one fault and then its recovery.
+fn assert_stage_is_isolated(stage: &str, fault: Fault) {
+    let host = Host::new();
+    assert_progress_beside(&host, |host| host.faults.fail(stage, DAEMON, fault));
+    let reason = host
+        .fault(DAEMON, stage)
+        .unwrap_or_else(|| panic!("{stage} recorded no fault"));
+    assert!(reason.contains(stage), "{stage}: {reason}");
+    host.faults.clear();
+    host.pass(1);
+    assert_eq!(host.fault(DAEMON, stage), None, "{stage} did not recover");
+}
+
+macro_rules! stage_tests {
+    ($($name:ident => $stage:literal,)*) => {
+        mod a_failing_stage_does_not_stop_the_stages_after_it {
+            use super::*;
+            $(
+                mod $name {
+                    use super::*;
+
+                    #[test]
+                    fn with_an_error() {
+                        assert_stage_is_isolated($stage, Fault::Error);
+                    }
+
+                    #[test]
+                    fn with_a_panic() {
+                        assert_stage_is_isolated($stage, Fault::Panic);
+                    }
+                }
+            )*
+        }
+    };
+}
+
+stage_tests! {
+    intake => "stage/intake",
+    observers => "stage/observers",
+    schedules => "stage/schedules",
+    scheduled_work => "stage/scheduled-work",
+    subscriptions => "stage/subscriptions",
+    provider_capacity_retries => "stage/provider-capacity-retries",
+    retired_agent_attention => "stage/retired-agent-attention",
+    attention_until => "stage/attention-until",
+}
+
+#[test]
+fn a_failing_mission_stage_still_stops_and_starts_members() {
+    let host = Host::new();
+    let (cancelled, cancelled_worker) = running_run(&host, "cancelled");
+    host.cancel(&cancelled);
+    // One healthy pass declares the cleanup stops. The member stage carries them out even while
+    // the run list cannot be read, and a new seat still starts.
+    host.pass(1);
+    host.faults.fail("stage/missions", DAEMON, Fault::Error);
+    host.publish(
+        &format!(
+            "version 2\nagent \"standalone\" {{ workspace {:?}; command \"sleep 600\"; restart \"never\" }}\n",
+            host.workspace
+        ),
+        "publish-standalone",
+    );
+    host.pass(4);
+    assert!(!host.runtime.running(&cancelled_worker));
+    let standalone = host
+        .store
+        .desired_subjects()
+        .unwrap()
+        .into_iter()
+        .find(|desired| desired.subject == "agent/node.standalone")
+        .and_then(|desired| desired.member)
+        .expect("the standalone seat is declared")
+        .runtime_id;
+    assert!(host.runtime.running(&standalone));
+    assert!(host.fault(DAEMON, "stage/missions").is_some());
+    host.faults.clear();
+    host.pass(4);
+    assert_eq!(
+        host.state(&cancelled),
+        ("cancelled".into(), "terminal".into())
+    );
+    assert_eq!(host.fault(DAEMON, "stage/missions"), None);
+}
+
+#[test]
+fn a_failing_mission_run_does_not_hold_back_other_runs() {
+    for fault in [Fault::Error, Fault::Panic] {
+        let host = Host::new();
+        let (stuck, _) = running_run(&host, "stuck");
+        assert_progress_beside(&host, |host| {
+            host.faults.fail("mission-run", &stuck.subject, fault);
+        });
+        let reason = host
+            .fault(&stuck.subject, "mission-run")
+            .expect("the failing run records its fault");
+        assert!(reason.contains("mission-run"), "{reason}");
+        host.faults.clear();
+        host.pass(1);
+        assert_eq!(host.fault(&stuck.subject, "mission-run"), None);
+        let records = host.fault_records(&stuck.subject);
+        assert_eq!(
+            records
+                .iter()
+                .map(|record| record["status"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["faulted", "recovered"],
+            "one fault and one recovery, however many passes failed: {records:#?}"
+        );
+    }
+}
+
+#[test]
+fn a_cancelled_run_cleans_up_while_another_run_is_failing() {
+    let host = Host::new();
+    let (failing, failing_worker) = running_run(&host, "failing");
+    host.faults
+        .fail("mission-run", &failing.subject, Fault::Error);
+    assert_progress_beside(&host, |_| {});
+    // The failing run keeps its worker: nothing about it was decided while it failed.
+    assert!(host.runtime.running(&failing_worker));
+    assert_eq!(host.state(&failing).0, "running");
+}
+
+#[test]
+fn a_worker_that_cannot_start_does_not_hold_back_other_runs() {
+    let host = Host::new();
+    assert_progress_beside(&host, |host| {
+        let blocked = host.start("blocked");
+        host.pass(1);
+        let worker = host.worker(&blocked);
+        host.runtime.failed_starts.lock().unwrap().insert(worker);
+    });
+}
+
+#[test]
+fn a_worker_that_cannot_stop_does_not_hold_back_other_cleanup() {
+    let host = Host::new();
+    let (stubborn, stubborn_worker) = running_run(&host, "stubborn");
+    host.runtime
+        .failed_stops
+        .lock()
+        .unwrap()
+        .insert(stubborn_worker.clone());
+    assert_progress_beside(&host, |host| host.cancel(&stubborn));
+    assert!(host.runtime.running(&stubborn_worker));
+    assert_ne!(host.state(&stubborn).1, "terminal");
+}
+
+/// bluey, mid-sync: scheduled work named a mission revision the host had not received yet.
+#[test]
+fn scheduled_work_for_a_revision_this_host_lacks_does_not_stop_cleanup() {
+    let host = Host::new();
+    let revision = host
+        .store
+        .mission_spec("worker", None)
+        .unwrap()
+        .unwrap()
+        .revision;
+    let intake = host.start_intake(&format!(
+        r#"  schedule "nightly" {{
+    at "2099-01-01T00:00:00.000Z"
+    work {{
+      mission "worker@{revision}"
+      workspace "/tmp/st3-fault-isolation"
+    }}
+  }}"#
+    ));
+    let schedule = host.owned(&intake, "schedule");
+    let schedule_revision = host
+        .store
+        .claims_for(&schedule, Some("intent.desired"))
+        .unwrap()
+        .last()
+        .unwrap()
+        .id
+        .clone();
+    assert_progress_beside(&host, |host| {
+        host.store
+            .append_claim(&ClaimInput {
+                subject: schedule.clone(),
+                kind: "schedule.work-requested".into(),
+                actor: None,
+                fields: BTreeMap::from([
+                    ("revision".into(), Value::String(schedule_revision)),
+                    ("occurrence".into(), Value::from(1)),
+                    ("mission".into(), Value::String("mission/worker".into())),
+                    // A revision published on another host that has not replicated here yet.
+                    ("mission_revision".into(), Value::String("f".repeat(64))),
+                    (
+                        "workspace".into(),
+                        Value::String("/tmp/st3-fault-isolation".into()),
+                    ),
+                    ("inputs".into(), Value::Object(Default::default())),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+    });
+    let reason = host
+        .fault(DAEMON, "stage/scheduled-work")
+        .expect("the scheduled-work stage records its fault");
+    assert!(reason.contains("missing-mission"), "{reason}");
+}
+
+/// hetz and Silber, 21:09Z: a subscription delivery pinned to a claim ID instead of a revision.
+#[test]
+fn a_subscription_delivery_pinned_to_a_claim_id_does_not_stop_cleanup() {
+    let host = Host::new();
+    host.publish(
+        r#"version 2
+mission "review" state="ready" {
+  input "source" kind="resource"
+  completion { when "all-steps-exhausted" }
+  goal "Review a discovered item."
+  step "review" { agentless }
+}"#,
+        "publish-review",
+    );
+    let revision = host
+        .store
+        .mission_spec("review", None)
+        .unwrap()
+        .unwrap()
+        .revision;
+    let intake = host.start_intake(&format!(
+        r#"  observer "repo" {{ resource "resource/repo"; provider "github.repository"; locator "example/repo"; field "pull_requests" }}
+  subscription "reviews" {{
+    observer "observer/repo"
+    on "pull_requests"
+    delivery "mission" {{
+      mission "review@{revision}"
+      resource "source"
+      workspace "/tmp/st3-fault-isolation"
+    }}
+  }}"#
+    ));
+    let subscription = host.owned(&intake, "subscription");
+    let request = std::cell::RefCell::new(None);
+    assert_progress_beside(&host, |host| {
+        let discovery = host
+            .store
+            .append_claim(&ClaimInput {
+                subject: "resource/repo".into(),
+                kind: "resource.observed".into(),
+                actor: None,
+                fields: BTreeMap::from([("kind".into(), Value::String("vcs.repository".into()))]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+        let pinned = host
+            .store
+            .append_claim(&ClaimInput {
+                subject: subscription.clone(),
+                kind: "subscription.mission-requested".into(),
+                actor: None,
+                fields: BTreeMap::from([
+                    ("mission".into(), Value::String("mission/review".into())),
+                    // A claim ID where the mission revision belongs.
+                    (
+                        "mission_revision".into(),
+                        Value::String(discovery.id.clone()),
+                    ),
+                    ("resource".into(), Value::String("resource/repo".into())),
+                    ("resource_input".into(), Value::String("source".into())),
+                    (
+                        "workspace".into(),
+                        Value::String("/tmp/st3-fault-isolation".into()),
+                    ),
+                    ("discovery".into(), Value::String(discovery.id)),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+        *request.borrow_mut() = Some(pinned.id);
+    });
+    let failures = host
+        .store
+        .claims_for(&subscription, Some("subscription.mission-failed"))
+        .unwrap();
+    assert_eq!(failures.len(), 1, "{failures:#?}");
+    assert_eq!(
+        failures[0].body["fields"]["request"].as_str(),
+        request.borrow().as_deref()
+    );
+    assert_eq!(failures[0].body["fields"]["code"], "missing-mission");
+}

@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
+use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -334,6 +335,15 @@ impl RuntimeControl for NativeRuntime {
     }
 }
 
+/// A test hook that fails one item of a reconcile pass where the reconciler takes it up.
+///
+/// `fault(scope, subject)` returns the error that item should fail with, or panics to fail it
+/// with a panic. The daemon never installs one; fault-isolation tests use it to fail each kind of
+/// item on its own.
+pub trait FaultInjection: Send + Sync + 'static {
+    fn fault(&self, scope: &str, subject: &str) -> Option<String>;
+}
+
 pub struct Reconciler<R = NativeRuntime> {
     store: Arc<Store>,
     runtime: Arc<R>,
@@ -361,6 +371,15 @@ pub struct Reconciler<R = NativeRuntime> {
     file_watchers_used: Arc<Mutex<HashSet<String>>>,
     file_observations: Arc<Mutex<HashMap<String, FileStamp>>>,
     resource_provider: Arc<dyn ResourceProvider>,
+    /// Open faults by subject and scope, loaded from the graph on first use.
+    faults: Mutex<Option<BTreeMap<(String, String), String>>>,
+    /// Faults that could not be recorded in the graph during the current pass.
+    unrecorded_faults: Mutex<Vec<String>>,
+    fault_injection: Option<Arc<dyn FaultInjection>>,
+    /// Unit tests fail a pass that raises a fault unless they opt in, so an isolated error
+    /// cannot hide inside a test that expects a clean pass.
+    #[cfg(test)]
+    raised_faults: Mutex<Option<Vec<String>>>,
 }
 
 #[derive(Clone, Eq, PartialEq)]
@@ -436,6 +455,11 @@ impl Reconciler<NativeRuntime> {
             file_watchers_used: Arc::new(Mutex::new(HashSet::new())),
             file_observations: Arc::new(Mutex::new(HashMap::new())),
             resource_provider: Arc::new(RegisteredResourceProvider),
+            faults: Mutex::new(None),
+            unrecorded_faults: Mutex::new(Vec::new()),
+            fault_injection: None,
+            #[cfg(test)]
+            raised_faults: Mutex::new(Some(Vec::new())),
         })
     }
 }
@@ -466,7 +490,25 @@ impl<R: RuntimeControl> Reconciler<R> {
             file_watchers_used: Arc::new(Mutex::new(HashSet::new())),
             file_observations: Arc::new(Mutex::new(HashMap::new())),
             resource_provider: Arc::new(RegisteredResourceProvider),
+            faults: Mutex::new(None),
+            unrecorded_faults: Mutex::new(Vec::new()),
+            fault_injection: None,
+            #[cfg(test)]
+            raised_faults: Mutex::new(Some(Vec::new())),
         }
+    }
+
+    #[doc(hidden)]
+    pub fn with_fault_injection(mut self, injection: Arc<dyn FaultInjection>) -> Self {
+        self.fault_injection = Some(injection);
+        self
+    }
+
+    /// Let passes raise faults, for a unit test of fault isolation itself.
+    #[cfg(test)]
+    fn tolerating_faults(self) -> Self {
+        *self.raised_faults.lock().unwrap() = None;
+        self
     }
 
     #[cfg(test)]
@@ -538,8 +580,134 @@ impl<R: RuntimeControl> Reconciler<R> {
         }
     }
 
+    /// Run the reconciler and start it again if it panics. A panic ends only the task, so without
+    /// this the daemon would keep serving its API with nothing reconciling the host.
+    pub async fn supervise(self: Arc<Self>) {
+        let mut delay = Duration::from_secs(1);
+        loop {
+            let started = std::time::Instant::now();
+            let Err(error) = tokio::spawn(self.clone().run()).await else {
+                return;
+            };
+            if !error.is_panic() {
+                return;
+            }
+            let reason = panic_message(error.into_panic().as_ref());
+            let _ = self.record_once(
+                &format!("daemon/{}", self.host),
+                "daemon.diagnostic",
+                BTreeMap::from([
+                    ("severity".into(), Value::String("error".into())),
+                    ("code".into(), Value::String("reconciler-panicked".into())),
+                    ("status".into(), Value::String("restarting".into())),
+                    ("reason".into(), Value::String(reason)),
+                ]),
+            );
+            if started.elapsed() > Duration::from_secs(60) {
+                delay = Duration::from_secs(1);
+            }
+            tokio::time::sleep(delay).await;
+            delay = (delay * 2).min(Duration::from_secs(30));
+        }
+    }
+
     fn signal_changed(&self) {
         signal_changed(&self.notify, &self.event_notify);
+    }
+
+    /// Reconcile one item of the pass on its own. An error or a panic is recorded as a fault on
+    /// `subject` in `scope`, and the pass carries on with every other item. The next success
+    /// records the item's recovery.
+    fn isolate<T>(
+        &self,
+        scope: &str,
+        subject: &str,
+        item: impl FnOnce() -> Result<T>,
+    ) -> Option<T> {
+        let result = caught(|| {
+            if let Some(reason) = self
+                .fault_injection
+                .as_ref()
+                .and_then(|injection| injection.fault(scope, subject))
+            {
+                anyhow::bail!(reason);
+            }
+            item()
+        });
+        let (value, outcome) = match result {
+            Ok(value) => (Some(value), Ok(())),
+            Err(error) => (None, Err(error)),
+        };
+        #[cfg(test)]
+        if let (Err(error), Some(raised)) = (&outcome, self.raised_faults.lock().unwrap().as_mut())
+        {
+            raised.push(format!("{subject} {scope}: {error:#}"));
+        }
+        if let Err(error) = self.record_fault(subject, scope, outcome) {
+            self.unrecorded_faults
+                .lock()
+                .expect("unrecorded fault mutex poisoned")
+                .push(format!("{subject} {scope}: {error:#}"));
+        }
+        value
+    }
+
+    /// Record a fault when it first appears or its cause changes, and its recovery once.
+    fn record_fault(&self, subject: &str, scope: &str, outcome: Result<()>) -> Result<()> {
+        match outcome {
+            Err(error) => {
+                let reason = format!("{error:#}");
+                let mut faults = self.open_faults()?;
+                let open = faults.get_or_insert_with(BTreeMap::new);
+                let key = (subject.to_owned(), scope.to_owned());
+                if open.get(&key) == Some(&reason) {
+                    return Ok(());
+                }
+                self.append_fault(subject, scope, "faulted", &reason)?;
+                open.insert(key, reason);
+                Ok(())
+            }
+            Ok(()) => self.close_fault(subject, scope, "the item reconciled successfully"),
+        }
+    }
+
+    fn close_fault(&self, subject: &str, scope: &str, reason: &str) -> Result<()> {
+        let mut faults = self.open_faults()?;
+        let open = faults.get_or_insert_with(BTreeMap::new);
+        let key = (subject.to_owned(), scope.to_owned());
+        if !open.contains_key(&key) {
+            return Ok(());
+        }
+        self.append_fault(subject, scope, "recovered", reason)?;
+        open.remove(&key);
+        Ok(())
+    }
+
+    fn open_faults(
+        &self,
+    ) -> Result<std::sync::MutexGuard<'_, Option<BTreeMap<(String, String), String>>>> {
+        let mut faults = self.faults.lock().expect("fault mutex poisoned");
+        if faults.is_none() {
+            *faults = Some(self.store.open_reconcile_faults(&self.host)?);
+        }
+        Ok(faults)
+    }
+
+    fn append_fault(&self, subject: &str, scope: &str, status: &str, reason: &str) -> Result<()> {
+        self.store.append_claim(&ClaimInput {
+            subject: subject.into(),
+            kind: "reconcile.fault".into(),
+            actor: None,
+            fields: BTreeMap::from([
+                ("scope".into(), Value::String(scope.into())),
+                ("status".into(), Value::String(status.into())),
+                ("reason".into(), Value::String(reason.into())),
+            ]),
+            evidence: Vec::new(),
+            expected_subject: None,
+            idempotency_key: None,
+        })?;
+        Ok(())
     }
 
     fn next_reconcile_deadline(&self) -> Result<Option<u128>> {
@@ -766,7 +934,30 @@ impl<R: RuntimeControl> Reconciler<R> {
             .copied()
             .filter(|subject| !member_errors.contains_key(&subject.subject))
             .collect::<Vec<_>>();
-        for (subject, result) in crate::render::apply_all(&self.store, &renderable, &self.host) {
+        // A render panic faults this host's members; stops never render, so they still run.
+        let rendered = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            crate::render::apply_all(&self.store, &renderable, &self.host)
+        }))
+        .unwrap_or_else(|panic| {
+            let reason = panic_message(panic.as_ref());
+            renderable
+                .iter()
+                .filter(|subject| {
+                    subject.kind != "stop"
+                        && subject
+                            .member
+                            .as_ref()
+                            .is_some_and(|member| member.host == self.host)
+                })
+                .map(|subject| {
+                    (
+                        subject.subject.clone(),
+                        Err(anyhow::anyhow!("render panicked: {reason}")),
+                    )
+                })
+                .collect()
+        });
+        for (subject, result) in rendered {
             let result = result.and_then(|result| {
                 for warning in result.warnings {
                     self.record_once(
@@ -825,7 +1016,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                     continue;
                 }
             }
-            let result = (|| -> Result<()> {
+            let result = caught(|| -> Result<()> {
                 if let Some(error) = member_errors.remove(&subject.subject) {
                     return Err(error);
                 }
@@ -953,7 +1144,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                     }
                 }
                 Ok(())
-            })();
+            });
             // A running agent's member pass also includes deferred work delivery.
             let deferred = result.is_ok()
                 && work_message_agents
@@ -965,50 +1156,83 @@ impl<R: RuntimeControl> Reconciler<R> {
                 diagnostic_errors.push(format!("{}: {error:#}", subject.subject));
             }
         }
+        // Each later stage runs on its own. A stage that fails records a fault on this daemon and
+        // the stages after it still run, so no intake item can hold back mission evaluation, run
+        // cleanup, or work delivery on this host.
+        let daemon = format!("daemon/{}", self.host);
         // Intake left by a terminal owner or a superseded generation must not observe, deliver,
         // or start work. A stopped declaration still runs so it can settle its own state.
-        let retired_intake = self.store.retired_owned_intake_subjects()?;
-        let intake = desired
-            .iter()
-            .filter(|subject| {
-                matches!(
-                    subject.kind.as_str(),
-                    "observer" | "subscription" | "schedule"
-                )
-            })
-            .filter(|subject| {
-                !retired_intake.contains(&subject.subject) || intake_is_stopped(subject, &self.host)
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        self.reconcile_resource_observers(&intake)?;
-        self.reconcile_schedules(&intake)?;
-        self.reconcile_scheduled_work(&intake)?;
-        self.reconcile_subscription_missions(&intake)?;
-        self.reconcile_provider_capacity_retries(&desired)?;
-        self.resolve_attention_for_retired_agents(&desired)?;
+        let intake = self.isolate("stage/intake", &daemon, || {
+            let retired_intake = self.store.retired_owned_intake_subjects()?;
+            Ok(desired
+                .iter()
+                .filter(|subject| {
+                    matches!(
+                        subject.kind.as_str(),
+                        "observer" | "subscription" | "schedule"
+                    )
+                })
+                .filter(|subject| {
+                    !retired_intake.contains(&subject.subject)
+                        || intake_is_stopped(subject, &self.host)
+                })
+                .cloned()
+                .collect::<Vec<_>>())
+        });
+        if let Some(intake) = intake {
+            self.isolate("stage/observers", &daemon, || {
+                self.reconcile_resource_observers(&intake)
+            });
+            self.isolate("stage/schedules", &daemon, || {
+                self.reconcile_schedules(&intake)
+            });
+            self.isolate("stage/scheduled-work", &daemon, || {
+                self.reconcile_scheduled_work(&intake)
+            });
+            self.isolate("stage/subscriptions", &daemon, || {
+                self.reconcile_subscription_missions(&intake)
+            });
+        }
+        self.isolate("stage/provider-capacity-retries", &daemon, || {
+            self.reconcile_provider_capacity_retries(&desired)
+        });
+        self.isolate("stage/retired-agent-attention", &daemon, || {
+            self.resolve_attention_for_retired_agents(&desired)
+        });
         self.file_watchers_used
             .lock()
             .expect("file watcher mutex poisoned")
             .clear();
-        let mission_result = self.evaluate_mission_runs();
+        self.isolate("stage/missions", &daemon, || self.evaluate_mission_runs());
         self.release_unused_file_watchers();
-        mission_result?;
-        self.resolve_attention_whose_until_holds()?;
+        self.isolate("stage/attention-until", &daemon, || {
+            self.resolve_attention_whose_until_holds()
+        });
         // Mission state is the primary control-plane projection. Evaluate it before
         // wake-message bookkeeping so a large mailbox or work history cannot starve
         // newly-created runs of their first readiness pass.
         for (agent, incarnation) in work_message_agents {
-            let result = self.reconcile_work_messages(&agent, &incarnation);
+            let result = caught(|| self.reconcile_work_messages(&agent, &incarnation));
             if let Err(error) = self.record_member_reconcile_result(&agent, result) {
                 diagnostic_errors.push(format!("{agent}: {error:#}"));
             }
         }
+        diagnostic_errors.append(
+            &mut self
+                .unrecorded_faults
+                .lock()
+                .expect("unrecorded fault mutex poisoned"),
+        );
         anyhow::ensure!(
             diagnostic_errors.is_empty(),
             "record member faults: {}",
             diagnostic_errors.join("; ")
         );
+        #[cfg(test)]
+        if let Some(raised) = self.raised_faults.lock().unwrap().as_mut() {
+            let raised = std::mem::take(raised);
+            anyhow::ensure!(raised.is_empty(), "reconcile faults: {}", raised.join("; "));
+        }
         Ok(())
     }
 
@@ -3063,12 +3287,22 @@ impl<R: RuntimeControl> Reconciler<R> {
         Ok(())
     }
 
+    /// Evaluate each active run on its own. A run that fails records a fault on that run, and
+    /// every other run, including runs in cleanup, is still evaluated in the same pass.
     fn evaluate_mission_runs(&self) -> Result<()> {
-        let runs = self.store.active_mission_runs_for_origin(&self.host)?;
-        let active_generations = runs
-            .iter()
-            .map(|run| run.generation.as_str())
-            .collect::<BTreeSet<_>>();
+        let ids = self.store.active_mission_run_ids_for_origin(&self.host)?;
+        let mut active_generations = BTreeSet::new();
+        let mut changed = false;
+        for id in &ids {
+            let subject = format!("mission-run/{id}");
+            changed |= self
+                .isolate("mission-run", &subject, || {
+                    let run = self.store.mission_run_for_reconcile(id)?;
+                    active_generations.insert(run.generation.clone());
+                    self.evaluate_active_mission_run(&run)
+                })
+                .unwrap_or(false);
+        }
         self.materialized_mission_generations
             .lock()
             .expect("mission materialization mutex poisoned")
@@ -3077,73 +3311,89 @@ impl<R: RuntimeControl> Reconciler<R> {
             .lock()
             .expect("generation retirement mutex poisoned")
             .retain(|generation| active_generations.contains(generation.as_str()));
-        let mut changed = false;
-        for run in runs {
-            if run
-                .deadline_at_unix_ms
-                .is_some_and(|deadline| deadline <= now_ms())
-                && !run.phase.starts_with("cleanup-")
-            {
-                let timeout = run.timeout_ms.unwrap_or_default();
-                let reason = format!("the mission timeout expired after {timeout}ms");
-                changed |= self
-                    .store
-                    .terminate_mission_run_descendants(&run.id, &reason)?;
-                changed |= self.store.set_mission_run_state(
-                    &run.id,
-                    "running",
-                    "cleanup-failed",
-                    Some(&reason),
-                )?;
-                continue;
-            }
-            if run.phase == "revision-draining" {
-                if self.store.apply_drained_revision(&run.id)?.is_some() {
-                    changed = true;
-                    continue;
-                }
-                // A replica can receive the old proposal's draining claim after the
-                // successor generation. Recover the persisted run phase when no
-                // draining proposal still targets its current generation.
-                if !self
-                    .store
-                    .revision_proposal_for_run(&run.id)?
-                    .is_some_and(|proposal| proposal.status == "draining")
-                {
-                    changed |=
-                        self.store
-                            .set_mission_run_state(&run.id, &run.status, "normal", None)?;
-                    continue;
-                }
-            }
-            let mission_id = run.mission.strip_prefix("mission/").unwrap_or(&run.mission);
-            let Some(mission) = self.store.mission_spec(mission_id, Some(&run.revision))? else {
-                changed |= self.store.set_mission_run_state(
-                    &run.id,
-                    "blocked",
-                    &run.phase,
-                    Some("the selected mission revision is unavailable"),
-                )?;
-                continue;
-            };
-            let mission = match crate::mission::run_mission(mission, run.after.as_deref()) {
-                Ok(mission) => mission,
-                Err(error) => {
-                    changed |= self.store.set_mission_run_state(
-                        &run.id,
-                        "blocked",
-                        &run.phase,
-                        Some(&error.message),
-                    )?;
-                    continue;
-                }
-            };
-            changed |= self.evaluate_mission_run(&run, &mission)?;
+        // A run that left the active set while faulted has nothing left to fail.
+        let active = ids
+            .iter()
+            .map(|id| format!("mission-run/{id}"))
+            .collect::<BTreeSet<_>>();
+        let inactive = self
+            .open_faults()?
+            .iter()
+            .flatten()
+            .filter(|((subject, scope), _)| scope == "mission-run" && !active.contains(subject))
+            .map(|((subject, _), _)| subject.clone())
+            .collect::<Vec<_>>();
+        for subject in inactive {
+            self.close_fault(&subject, "mission-run", "the run is no longer active")?;
         }
         if changed {
             self.signal_changed();
         }
         Ok(())
+    }
+
+    fn evaluate_active_mission_run(&self, run: &MissionRunView) -> Result<bool> {
+        if run
+            .deadline_at_unix_ms
+            .is_some_and(|deadline| deadline <= now_ms())
+            && !run.phase.starts_with("cleanup-")
+        {
+            let timeout = run.timeout_ms.unwrap_or_default();
+            let reason = format!("the mission timeout expired after {timeout}ms");
+            let mut changed = self
+                .store
+                .terminate_mission_run_descendants(&run.id, &reason)?;
+            changed |= self.store.set_mission_run_state(
+                &run.id,
+                "running",
+                "cleanup-failed",
+                Some(&reason),
+            )?;
+            return Ok(changed);
+        }
+        if run.phase == "revision-draining" {
+            if self.store.apply_drained_revision(&run.id)?.is_some() {
+                return Ok(true);
+            }
+            // A replica can receive the old proposal's draining claim after the
+            // successor generation. Recover the persisted run phase when no
+            // draining proposal still targets its current generation.
+            if !self
+                .store
+                .revision_proposal_for_run(&run.id)?
+                .is_some_and(|proposal| proposal.status == "draining")
+            {
+                return self
+                    .store
+                    .set_mission_run_state(&run.id, &run.status, "normal", None);
+            }
+        }
+        // Cleanup reads only the run's owned declarations. It never waits for the mission
+        // revision or its steps, so a run whose revision is unavailable still stops its runtimes.
+        if run.phase.starts_with("cleanup-") {
+            return self.reconcile_mission_run_cleanup(run);
+        }
+        let mission_id = run.mission.strip_prefix("mission/").unwrap_or(&run.mission);
+        let Some(mission) = self.store.mission_spec(mission_id, Some(&run.revision))? else {
+            return self.store.set_mission_run_state(
+                &run.id,
+                "blocked",
+                &run.phase,
+                Some("the selected mission revision is unavailable"),
+            );
+        };
+        let mission = match crate::mission::run_mission(mission, run.after.as_deref()) {
+            Ok(mission) => mission,
+            Err(error) => {
+                return self.store.set_mission_run_state(
+                    &run.id,
+                    "blocked",
+                    &run.phase,
+                    Some(&error.message),
+                );
+            }
+        };
+        self.evaluate_mission_run(run, &mission)
     }
 
     fn evaluate_mission_run(&self, run: &MissionRunView, mission: &MissionSpec) -> Result<bool> {
@@ -3293,7 +3543,10 @@ impl<R: RuntimeControl> Reconciler<R> {
         }
         if completion_selected {
             for step in flat.iter().filter(|step| !step.spec.finally) {
-                let view = views[step.spec.path.as_str()];
+                // A step whose run has not reached this host yet has nothing to cancel.
+                let Some(view) = views.get(step.spec.path.as_str()) else {
+                    continue;
+                };
                 if !matches!(view.status.as_str(), "completed" | "failed" | "cancelled") {
                     changed |= self.store.set_step_state(
                         &view.subject,
@@ -8952,6 +9205,24 @@ fn step_path_of_subject(subject: &str) -> Option<&str> {
         .strip_prefix("step-run/")?
         .split_once('/')
         .map(|(_, path)| path)
+}
+
+/// Run `item`, turning a panic into an error so one item cannot end the reconciler task.
+fn caught<T>(item: impl FnOnce() -> Result<T>) -> Result<T> {
+    std::panic::catch_unwind(AssertUnwindSafe(item)).unwrap_or_else(|panic| {
+        Err(anyhow::anyhow!(
+            "panicked: {}",
+            panic_message(panic.as_ref())
+        ))
+    })
+}
+
+fn panic_message(panic: &(dyn std::any::Any + Send)) -> String {
+    panic
+        .downcast_ref::<&str>()
+        .map(|message| (*message).to_owned())
+        .or_else(|| panic.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "a panic without a message".into())
 }
 
 fn signal_changed(reconcile_notify: &Notify, event_notify: &watch::Sender<u64>) {
@@ -17972,7 +18243,7 @@ version 2
     }
 
     #[test]
-    fn one_mission_run_rejects_a_runtime_id_in_two_steps() {
+    fn one_mission_run_rejects_a_runtime_id_in_two_steps_without_holding_later_runs() {
         let store = Arc::new(Store::open_memory("node").unwrap());
         let source = r#"
 version 2
@@ -17983,28 +18254,52 @@ version 2
     step "two" { agentless;  exec "same" { command "true"; restart "never" }  }
   }
 
+  mission "later" state="ready" {
+    goal "Complete beside a faulted run."
+    completion { when "all-steps-exhausted" }
+    step "one" { }
+  }
+
 "#;
         apply_source(&store, source, "publish-collision");
-        store
-            .create_mission_run(&MissionRunRequest {
-                mission: "collision".into(),
-                revision: None,
-                workspace: ".".into(),
-                requester: None,
-                mode: None,
-                inputs: BTreeMap::new(),
-                idempotency_key: "collision-run".into(),
-            })
-            .unwrap();
+        let request = |mission: &str| MissionRunRequest {
+            mission: mission.into(),
+            revision: None,
+            workspace: ".".into(),
+            requester: None,
+            mode: None,
+            inputs: BTreeMap::new(),
+            idempotency_key: format!("{mission}-run"),
+        };
+        let collision = store.create_mission_run(&request("collision")).unwrap();
+        // The faulted run is older, so it is evaluated first in every pass.
+        std::thread::sleep(Duration::from_millis(2));
+        let later = store.create_mission_run(&request("later")).unwrap();
         let reconciler = Reconciler::new(
-            store,
+            store.clone(),
             Arc::new(FakeRuntime::default()),
             "node".into(),
             Arc::new(Notify::new()),
+        )
+        .tolerating_faults();
+        for _ in 0..8 {
+            reconciler.reconcile_once().unwrap();
+        }
+        let fault = store
+            .reconcile_fault(&collision.subject, "mission-run")
+            .unwrap()
+            .expect("the colliding run records its fault");
+        assert!(fault.contains("more than one mission or step"), "{fault}");
+        assert_eq!(
+            store.mission_run(&later.id).unwrap().unwrap().status,
+            "completed"
         );
-        reconciler.reconcile_once().unwrap();
-        let error = reconciler.reconcile_once().unwrap_err();
-        assert!(error.to_string().contains("more than one mission or step"));
+        assert!(
+            store
+                .reconcile_fault("daemon/node", "stage/missions")
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
