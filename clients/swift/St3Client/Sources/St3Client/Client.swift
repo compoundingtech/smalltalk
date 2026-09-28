@@ -38,6 +38,34 @@ public actor St3Client {
         if let limit { query.append(.init(name: "limit", value: String(limit))) }
         return try await get("v1/client/sessions/\(Self.routedSessionID(sessionID))/timeline", query: query)
     }
+    public func conversationChanges(sessionID: String, after: String? = nil, waitMS: UInt64 = 0) async throws -> Envelope<ConversationChanges> {
+        var query: [URLQueryItem] = [.init(name: "wait_ms", value: String(waitMS))]
+        if let after { query.append(.init(name: "after", value: after)) }
+        return try await get("v1/client/conversations/\(Self.routedSessionID(sessionID))/changes", query: query)
+    }
+    public func conversationStream(sessionID: String, after: String? = nil) -> AsyncThrowingStream<Envelope<ConversationChanges>, Error> {
+        var components = URLComponents(url: baseURL.appending(path: "v1/client/conversations/\(Self.routedSessionID(sessionID))/stream"), resolvingAgainstBaseURL: false)!
+        components.scheme = components.scheme == "https" ? "wss" : "ws"
+        if let after { components.queryItems = [.init(name: "after", value: after)] }
+        var request = URLRequest(url: components.url!); request.setValue("st3.client.conversation.v0", forHTTPHeaderField: "Sec-WebSocket-Protocol"); if let credential { request.setValue("Bearer \(credential)", forHTTPHeaderField: "Authorization") }
+        let task = session.webSocketTask(with: request)
+        return AsyncThrowingStream { continuation in
+            continuation.onTermination = { _ in task.cancel(with: .normalClosure, reason: nil) }
+            task.resume()
+            Task {
+                let decoder = JSONDecoder()
+                while true {
+                    let message: URLSessionWebSocketTask.Message
+                    do { message = try await task.receive() } catch { continuation.finish(throwing: task.closeCode == .normalClosure ? nil : error); return }
+                    do {
+                        let data = try Self.websocketData(from: message)
+                        if let error = try? decoder.decode(ErrorEnvelope.self, from: data) { throw error }
+                        continuation.yield(try decoder.decode(Envelope<ConversationChanges>.self, from: data))
+                    } catch { continuation.finish(throwing: error); task.cancel(with: .normalClosure, reason: nil); return }
+                }
+            }
+        }
+    }
     public func events(after: String? = nil, limit: Int? = nil, waitMS: UInt64? = nil) async throws -> Envelope<EventPage> {
         var query: [URLQueryItem] = []
         if let after { query.append(.init(name: "after", value: after)) }; if let limit { query.append(.init(name: "limit", value: String(limit))) }; if let waitMS { query.append(.init(name: "wait_ms", value: String(waitMS))) }
@@ -110,26 +138,35 @@ public actor St3Client {
     public func completePairing(pairingID: String, code: String, devicePublicKey: String) async throws -> Envelope<PairedSession> { try await post("v1/client/pairings/\(pairingID.replacingOccurrences(of: "pairing/", with: ""))/complete", PairingComplete(apiVersion: st3ClientAPIVersion, code: code, devicePublicKey: devicePublicKey)) }
     public func terminalScreen(_ id: String) async throws -> Envelope<TerminalScreen> { try await get("v1/client/terminals/\(id.replacingOccurrences(of: "terminal/", with: ""))/screen") }
     public func agentQueue(_ id: String) async throws -> Envelope<AgentQueue> { try await get("v1/client/agent-queues/\(id)") }
-    public func terminalFrames(_ id: String, after: UInt64? = nil, incarnation: String? = nil, streamCapability: String) async throws -> TerminalStreamBatch {
+    /// Open the terminal stream one `terminal.attach` capability allows. Each element is a whole
+    /// screen that replaces every earlier one: the current screen first, then one per change. The
+    /// sequence finishes when the server closes the stream, and throws the server's error when it
+    /// ends the stream, such as `stale-fence` after the terminal's runtime incarnation changes.
+    public func terminalStream(_ id: String, incarnation: String? = nil, streamCapability: String) -> AsyncThrowingStream<Envelope<TerminalScreen>, Error> {
         var components = URLComponents(url: baseURL.appending(path: "v1/client/terminals/\(id.replacingOccurrences(of: "terminal/", with: ""))/stream"), resolvingAgainstBaseURL: false)!
         components.scheme = components.scheme == "https" ? "wss" : "ws"
-        var query: [URLQueryItem] = []; if let after { query.append(.init(name: "after", value: String(after))) }; if let incarnation { query.append(.init(name: "incarnation", value: incarnation)) }; if !query.isEmpty { components.queryItems = query }
+        if let incarnation { components.queryItems = [.init(name: "incarnation", value: incarnation)] }
         var request = URLRequest(url: components.url!); request.setValue("\(st3ClientTerminalSubprotocol), st3.cap.\(streamCapability)", forHTTPHeaderField: "Sec-WebSocket-Protocol"); if let credential { request.setValue("Bearer \(credential)", forHTTPHeaderField: "Authorization") }
-        let task = session.webSocketTask(with: request); task.resume(); defer { task.cancel(with: .normalClosure, reason: nil) }
-        let decoder = JSONDecoder()
-        let screenData = try websocketData(from: try await task.receive())
-        if let error = try? decoder.decode(ErrorEnvelope.self, from: screenData) { throw error }
-        let screen = try decoder.decode(Envelope<TerminalScreen>.self, from: screenData)
-        let frames: Envelope<TerminalFramePage>?
-        do {
-            let data = try websocketData(from: try await task.receive())
-            if let error = try? decoder.decode(ErrorEnvelope.self, from: data) { throw error }
-            frames = try decoder.decode(Envelope<TerminalFramePage>.self, from: data)
-        } catch let error as ErrorEnvelope { throw error } catch { frames = nil }
-        return TerminalStreamBatch(screen: screen, frames: frames)
+        let task = session.webSocketTask(with: request)
+        return AsyncThrowingStream { continuation in
+            continuation.onTermination = { _ in task.cancel(with: .normalClosure, reason: nil) }
+            task.resume()
+            Task {
+                let decoder = JSONDecoder()
+                while true {
+                    let message: URLSessionWebSocketTask.Message
+                    do { message = try await task.receive() } catch { continuation.finish(throwing: task.closeCode == .normalClosure ? nil : error); return }
+                    do {
+                        let data = try Self.websocketData(from: message)
+                        if let error = try? decoder.decode(ErrorEnvelope.self, from: data) { throw error }
+                        continuation.yield(try decoder.decode(Envelope<TerminalScreen>.self, from: data))
+                    } catch { continuation.finish(throwing: error); task.cancel(with: .normalClosure, reason: nil); return }
+                }
+            }
+        }
     }
 
-    private func websocketData(from message: URLSessionWebSocketTask.Message) throws -> Data {
+    private static func websocketData(from message: URLSessionWebSocketTask.Message) throws -> Data {
         switch message { case .data(let data): return data; case .string(let text): return Data(text.utf8); @unknown default: throw URLError(.cannotParseResponse) }
     }
 

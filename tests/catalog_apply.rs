@@ -2881,7 +2881,7 @@ fn apply_v1_requires_a_declared_pty_root_outside_the_catalog() {
     let temp = tempfile::tempdir().unwrap();
     for case in ["default", "relative", "catalog-variable"] {
         let catalog = temp.path().join(format!("catalog-{case}"));
-        write_agent(&catalog, "worker", false);
+        fs::create_dir_all(&catalog).unwrap();
         match case {
             "default" => {}
             "relative" => fs::write(
@@ -2924,7 +2924,10 @@ fn apply_v1_requires_a_declared_pty_root_outside_the_catalog() {
         assert!(
             String::from_utf8_lossy(&rejected.stderr).contains("requires pty-root outside")
                 || String::from_utf8_lossy(&rejected.stderr)
-                    .contains("requires an explicit external pty-root")
+                    .contains("requires an explicit external pty-root"),
+            "{case}: stdout={} stderr={}",
+            String::from_utf8_lossy(&rejected.stdout),
+            String::from_utf8_lossy(&rejected.stderr)
         );
         assert!(!catalog.join(".st2/catalog-apply-incomplete").exists());
     }

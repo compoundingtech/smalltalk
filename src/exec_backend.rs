@@ -518,7 +518,25 @@ fn process_group_has_live_member(pgid: i32) -> bool {
 #[cfg(target_os = "macos")]
 fn process_group_has_live_member(pgid: i32) -> bool {
     let result = unsafe { libc::kill(-pgid, 0) };
-    result == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+    if result != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+        return false;
+    }
+    // kill(0) succeeds for a group containing only zombies. Match the Linux
+    // check above: retirement is complete once no member can still run.
+    let Ok(output) = std::process::Command::new("/bin/ps")
+        .args(["-axo", "pgid=,stat="])
+        .output()
+    else {
+        return true;
+    };
+    if !output.status.success() {
+        return true;
+    }
+    String::from_utf8_lossy(&output.stdout).lines().any(|line| {
+        let mut fields = line.split_whitespace();
+        fields.next().and_then(|field| field.parse::<i32>().ok()) == Some(pgid)
+            && fields.next().is_some_and(|status| !status.starts_with('Z'))
+    })
 }
 
 const MAX_LEGACY_PID_RECORD_BYTES: u64 = 64;
@@ -912,10 +930,10 @@ fn generation_process_state(generation: &ExecGeneration) -> GenerationProcessSta
         return GenerationProcessState::Exited;
     }
     if process_start_time_ticks(pid).ok() != Some(generation.start_time_ticks) {
-        return if process_alive(pid) {
-            GenerationProcessState::Mismatch
-        } else {
+        return if !process_alive(pid) || process_is_zombie(pid) {
             GenerationProcessState::Exited
+        } else {
+            GenerationProcessState::Mismatch
         };
     }
     if !process_alive(pid) {
@@ -925,6 +943,23 @@ fn generation_process_state(generation: &ExecGeneration) -> GenerationProcessSta
     } else {
         GenerationProcessState::Mismatch
     }
+}
+
+#[cfg(target_os = "macos")]
+fn process_is_zombie(pid: i32) -> bool {
+    // proc_pidinfo can return no task information during the gap before a
+    // dead process is reaped, while kill(pid, 0) still reports it present.
+    std::process::Command::new("/bin/ps")
+        .args(["-o", "stat=", "-p", &pid.to_string()])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .is_some_and(|output| output.stdout.first() == Some(&b'Z'))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn process_is_zombie(_pid: i32) -> bool {
+    false
 }
 
 fn generation_id(runtime_id: &str, pid: u32, created_at: &str, start_time_ticks: u64) -> String {
