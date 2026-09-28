@@ -284,7 +284,7 @@ fn parse_intent_with_owner(
     if declarations.is_empty() {
         return Err(St3Error::new(
             "invalid-root",
-            "an st3 publication must contain at least one declaration after `version 2`",
+            "an st publication must contain at least one declaration after `version 2`",
         ));
     }
     if declarations
@@ -293,7 +293,7 @@ fn parse_intent_with_owner(
     {
         return Err(St3Error::new(
             "removed-subgraph",
-            "`subgraph` is not part of st3 KDL; publish declarations directly after `version 2`",
+            "`subgraph` is not part of st KDL; publish declarations directly after `version 2`",
         ));
     }
     let missions = crate::mission::parse_missions(&document, default_host)?;
@@ -1121,14 +1121,14 @@ fn parse_planning_session_declaration(
             }
             let target_context = creation.target_run.as_ref().map_or_else(String::new, |run| {
                 format!(
-                    " Inspect the current target with `st3 --json mission show {run}` before you revise it. The target generation is `{}`.",
+                    " Inspect the current target with `st --json missions show {run}` before you revise it. The target generation is `{}`.",
                     creation.target_generation.as_deref().unwrap_or_default()
                 )
             });
             harness_body.nodes_mut().push(string_node(
                 "prompt",
                 &format!(
-                    "You are the durable {} planner for launch `{id}`. Read `{}` with `st3 documents get`.{target_context} Write one Markdown mission and one complete version 2 KDL mission. The KDL mission ID must be `{}` and its state must be ready. Submit it with `st3 launch submit {id} --variant default --markdown MARKDOWN_FILE --kdl KDL_FILE`. Use temporary files outside the workspace, and remove them after submission. Do not change the workspace. Do not publish or run the mission. Stay ready for feedback until approval or cancellation.",
+                    "You are the durable {} planner for launch `{id}`. Read `{}` with `st documents get`.{target_context} Write one Markdown mission and one complete version 2 KDL mission. The KDL mission ID must be `{}` and its state must be ready. Submit it with `st launch submit {id} --variant default --markdown MARKDOWN_FILE --kdl KDL_FILE`. Use temporary files outside the workspace, and remove them after submission. Do not change the workspace. Do not publish or run the mission. Stay ready for feedback until approval or cancellation.",
                     creation.planner.provider,
                     creation.request, creation.mission
                 ),
@@ -2103,7 +2103,7 @@ fn driver_member(
         provider.extend(["--channels".into(), st2::claude_channel::ST3_CHANNEL.into()]);
         // The channel wakes the real TUI, while Claude's own lifecycle hooks externalize the
         // resulting turn. Supplying the canonical registration as an additional native settings
-        // source keeps arbitrary user workspaces untouched and gives every typed st3 seat the
+        // source keeps arbitrary user workspaces untouched and gives every typed st seat the
         // same UserPromptSubmit/Stop state edges as a materialized st2 seat.
         provider.extend([
             "--settings".into(),
@@ -2805,7 +2805,7 @@ fn validate_driver(node: &KdlNode) -> Result<(), St3Error> {
     {
         return Err(St3Error::new(
             "native-channel-required",
-            "a typed Claude harness always requires the st3 native channel; use `exec` for an unmanaged non-interactive process",
+            "a typed Claude harness always requires the st native channel; use `exec` for an unmanaged non-interactive process",
         ));
     }
     Ok(())
@@ -4510,7 +4510,7 @@ mod tests {
             );
             parsed += 1;
         }
-        assert!(parsed >= 24, "the st3 eval corpus unexpectedly shrank");
+        assert!(parsed >= 24, "the st eval corpus unexpectedly shrank");
     }
 
     #[test]
@@ -5285,11 +5285,11 @@ planning-session "planning/release/revise" {{
         let planner = &intent.subjects[&planner_subject];
         let desired = serde_json::to_string(&planner.desired).unwrap();
         assert!(
-            desired.contains("st3 launch submit planning/release/revise"),
+            desired.contains("st launch submit planning/release/revise"),
             "{desired}"
         );
         assert!(
-            desired.contains("st3 --json mission show mission-run/release/live"),
+            desired.contains("st --json missions show mission-run/release/live"),
             "{desired}"
         );
         assert!(
