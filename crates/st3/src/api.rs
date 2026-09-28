@@ -3497,6 +3497,12 @@ fn doctor_report(state: &AppState) -> Result<Json<DoctorReport>, ApiError> {
             message: error.to_string(),
         }),
     }
+    let (recording, message) = crate::recorder::health(&state.state_dir);
+    checks.push(DoctorCheck {
+        name: "command-recorder".into(),
+        status: if recording { "pass" } else { "warn" }.into(),
+        message,
+    });
     // Once a node pins a fleet anchor, membership decides admission. Report what waits for a
     // signature, what is fenced, and what was admitted before this node knew better.
     match state.store.fleet_anchor() {
