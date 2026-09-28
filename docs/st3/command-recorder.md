@@ -80,6 +80,26 @@ jq -r '[.actor, .program, (.args | join(" "))] | @tsv' "$log"
 `st doctor` includes a `command-recorder` check. It warns when the recorder directory, its links,
 or an appendable log is missing.
 
+## Summarize calls
+
+`st recorder report` summarizes the last 24 hours of the local log. `--hours` changes the window,
+`--top` changes the number of slow calls, and `--json` produces structured output. To summarize
+several hosts, copy their private logs to the machine running the report and pass each one with
+`--log`:
+
+```sh
+st recorder report --hours 24
+st recorder report --hours 24 --log ./host-a.jsonl --log ./host-b.jsonl
+st --json recorder report --hours 168 --log ./host-a.jsonl --log ./host-b.jsonl
+```
+
+The report groups calls and failures by host, agent, and command; lists the slowest calls; and
+counts `gh` commands whose command family normally uses GitHub's API. That last count is an
+inference from command arguments, **not** a measurement of HTTP requests. Local help calls are
+excluded. A command can fail before reaching GitHub, and one command can make several requests.
+Malformed JSONL lines are counted as skipped. Only calls that reached the recorder appear, so a
+quiet report does not prove that nothing happened.
+
 ## What a recorded call keeps
 
 A recorded call behaves as the real call would:
