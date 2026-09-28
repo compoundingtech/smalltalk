@@ -157,6 +157,8 @@ pub struct Ui {
     effects: Vec<Effect>,
     popover: Option<String>,
     chat: Option<ChatState>,
+    /// The agent details pane beside the conversation.
+    details: bool,
     /// Home items put off until later. Demo only: kept in memory on this machine.
     snoozed: HashSet<String>,
 }
@@ -188,6 +190,7 @@ impl Ui {
             effects: Vec::new(),
             popover: None,
             chat: None,
+            details: true,
             snoozed: HashSet::new(),
         }
     }
@@ -813,6 +816,39 @@ impl Ui {
             buf.set_stringn(area.x, area.y + 1, message, width, theme::dim());
             return;
         };
+        let full = area;
+        let area = if self.details && !agent.unmanaged && area.width >= 90 {
+            let side = (area.width / 3).clamp(30, 44);
+            let pane = Rect {
+                x: area.x + area.width - side,
+                width: side,
+                ..area
+            };
+            for y in area.y..area.y + area.height {
+                buf[(pane.x - 1, y)]
+                    .set_symbol("│")
+                    .set_style(Style::default().fg(theme::SURFACE0).bg(theme::BASE));
+            }
+            let doc = screens::agent_details(&self.world, agent, side as usize - 3, self.spinner());
+            self.pane(
+                buf,
+                &format!("details:{}", agent.id),
+                Rect {
+                    x: pane.x + 1,
+                    width: side - 1,
+                    ..pane
+                },
+                doc,
+                false,
+            );
+            Rect {
+                width: area.width - side - 2,
+                ..area
+            }
+        } else {
+            area
+        };
+        let width = area.width.saturating_sub(1) as usize;
         let header = screens::agent_header(&self.world, agent, width, self.spinner());
         let header_height = header.lines.len() as u16 + 1;
         self.pane(
@@ -833,6 +869,25 @@ impl Ui {
             area.width as usize,
             theme::fg(theme::SURFACE0),
         );
+        if !agent.unmanaged && full.width >= 90 {
+            let label = if self.details {
+                " i hide details ▸ "
+            } else {
+                " ◂ i details "
+            };
+            let width = text::width(label) as u16;
+            let x = area.x + area.width.saturating_sub(width + 1);
+            buf.set_stringn(x, rule_y, label, width as usize, theme::fg(theme::OVERLAY1));
+            self.hit(
+                Rect {
+                    x,
+                    y: rule_y,
+                    width,
+                    height: 1,
+                },
+                Hit::Key('i'),
+            );
+        }
         let composer_height = if agent.unmanaged { 0 } else { 3 };
         let body = Rect {
             y: area.y + header_height,
@@ -1220,7 +1275,7 @@ impl Ui {
         let info = self.frame.borrow();
         info.panes
             .iter()
-            .filter(|pane| pane.key != "agent-header")
+            .filter(|pane| pane.key != "agent-header" && !pane.key.starts_with("details:"))
             .map(|pane| pane.key.clone())
             .next()
     }
@@ -1331,6 +1386,7 @@ impl Ui {
             KeyCode::Char('s') => self.sidebar = !self.sidebar,
             KeyCode::Char('x') if self.tab == 2 => self.system = !self.system,
             KeyCode::Char('o') if self.tab == 1 => self.toggle_all_tools(),
+            KeyCode::Char('i') if self.tab == 1 => self.details = !self.details,
             KeyCode::Enter if self.tab == 1 => self.editing = true,
             KeyCode::Enter if self.tab == 2 => {
                 if let Some(decision) = self.selected_id().and_then(|id| {
@@ -1436,6 +1492,7 @@ impl Ui {
                     _ => {}
                 }
             }
+            1 if key == 'i' => self.details = !self.details,
             1 if key == 'c'
                 && self.world.agents.items().iter().any(|agent| {
                     Some(&agent.id) == self.selected_id().as_ref() && !agent.unmanaged
@@ -2111,8 +2168,8 @@ fn scrollbar(buf: &mut Buffer, area: Rect, top: usize, total: usize) {
     for row in 0..height {
         let on = row >= start && row < start + thumb;
         buf[(area.x, area.y + row as u16)]
-            .set_symbol(if on { "┃" } else { "│" })
-            .set_fg(if on { theme::OVERLAY0 } else { theme::SURFACE0 });
+            .set_symbol(if on { "┃" } else { " " })
+            .set_fg(theme::OVERLAY0);
     }
 }
 

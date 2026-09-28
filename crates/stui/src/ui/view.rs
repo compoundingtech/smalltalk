@@ -216,6 +216,23 @@ pub struct Agent {
     /// Found running on a host but not started by st.
     pub unmanaged: bool,
     pub parent: Option<String>,
+    pub details: AgentDetails,
+}
+
+/// What the details pane shows about an agent. Every field is optional: st may not say.
+#[derive(Clone, Debug, Default)]
+pub struct AgentDetails {
+    /// The goal of the step it holds now.
+    pub goal: Option<String>,
+    pub claimed: Option<String>,
+    /// The next step queued for it, as "mission › step".
+    pub next: Option<String>,
+    pub queue: Vec<String>,
+    pub queued: u64,
+    pub harness_state: Option<String>,
+    pub runtime: Option<String>,
+    pub fault: Option<String>,
+    pub under: Option<String>,
 }
 
 // ------------------------------------------------------------------- missions

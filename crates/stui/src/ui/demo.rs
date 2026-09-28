@@ -296,6 +296,7 @@ fn agent(
         activity: s(activity),
         unmanaged: false,
         parent: None,
+        details: AgentDetails::default(),
     }
 }
 
@@ -405,7 +406,60 @@ fn agents() -> Vec<Agent> {
         activity: s("5m"),
         unmanaged: true,
         parent: None,
+        details: AgentDetails::default(),
     });
+    let detail =
+        |goal: &str, claimed: &str, next: Option<&str>, queue: &[&str], state: &str| AgentDetails {
+            goal: Some(s(goal)),
+            claimed: Some(s(claimed)),
+            next: next.map(s),
+            queue: queue.iter().map(|item| s(item)).collect(),
+            queued: queue.len() as u64,
+            harness_state: Some(s(state)),
+            runtime: Some(s("running · incarnation 3")),
+            fault: None,
+            under: None,
+        };
+    list[0].details = detail(
+        "Cut over to the new store once a person approves.",
+        "33m ago",
+        Some("Move the atlas store › cleanup"),
+        &["Atlas nightly build › build (tonight)"],
+        "idle, waiting for review",
+    );
+    list[1].details = detail(
+        "Draft the pricing page and get feedback.",
+        "12m ago",
+        Some("A new pricing page › publish"),
+        &[],
+        "idle, waiting for feedback",
+    );
+    list[2].details = AgentDetails {
+        goal: Some(s("Tag this week's release.")),
+        claimed: Some(s("1h ago")),
+        next: Some(s("Weekly release › publish")),
+        queue: vec![],
+        queued: 0,
+        harness_state: Some(s("exited 4 times in 10 minutes")),
+        runtime: Some(s("restarts paused")),
+        fault: Some(s("401 Unauthorized: the API key expired at 08:40.")),
+        under: None,
+    };
+    list[3].details = detail(
+        "Keep Robin's fleet moving; answer questions.",
+        "standing",
+        None,
+        &["Rotate harbor's signing keys › report"],
+        "working",
+    );
+    list[4].details = detail(
+        "Review pull request #218.",
+        "4m ago",
+        Some("Review harbor #218 › route"),
+        &[],
+        "working",
+    );
+    list[4].details.under = Some(s("Chief of Staff"));
     list
 }
 

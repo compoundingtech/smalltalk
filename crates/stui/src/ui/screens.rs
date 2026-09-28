@@ -1651,3 +1651,105 @@ pub fn peek(world: &World, subject: &str, width: usize, spinner: &'static str) -
     doc.blank();
     doc
 }
+
+// -------------------------------------------------------------- agent details
+
+/// The pane beside a conversation: what the agent holds, what is next, and how it runs.
+pub fn agent_details(world: &World, agent: &Agent, width: usize, spinner: &'static str) -> Doc {
+    let mut doc = Doc::new();
+    let details = &agent.details;
+    let unknown = || span("st has not said", theme::dim());
+    doc.blank();
+    if let Some(fault) = &details.fault {
+        let mut inner = Doc::new();
+        inner.wrap(&text::inline(fault, theme::text()), width.saturating_sub(4));
+        doc.card("broken", theme::FAULT, true, inner, width);
+        doc.blank();
+    }
+    doc.section("now", None, width);
+    match (&agent.mission, &agent.step) {
+        (Some(mission), Some(step)) => {
+            let title = world
+                .missions
+                .items()
+                .iter()
+                .find(|candidate| &candidate.id == mission)
+                .map(|candidate| candidate.title.clone())
+                .unwrap_or_else(|| mission.trim_start_matches("mission/").to_owned());
+            link(&mut doc, "", &format!("{title} › {step}"), mission);
+            if let Some(goal) = &details.goal {
+                doc.lines(text::wrap(
+                    &text::inline(goal, theme::soft()),
+                    width,
+                    &[],
+                    &[],
+                    None,
+                ));
+            }
+            if let Some(claimed) = &details.claimed {
+                doc.line(Line::from(span(
+                    format!("held since {claimed}"),
+                    theme::dim(),
+                )));
+            }
+        }
+        _ => doc.line(Line::from(span("No step right now.", theme::dim()))),
+    }
+    doc.blank();
+    doc.section("next", Some(details.queued as usize), width);
+    match &details.next {
+        Some(next) => doc.lines(text::wrap(
+            &[run(next.clone(), theme::text())],
+            width,
+            &[run("› ", theme::fg(theme::ACCENT))],
+            &[run("  ", theme::dim())],
+            None,
+        )),
+        None => doc.line(Line::from(span("Nothing queued.", theme::dim()))),
+    }
+    for item in details
+        .queue
+        .iter()
+        .filter(|item| Some(*item) != details.next.as_ref())
+    {
+        doc.lines(text::wrap(
+            &[run(item.clone(), theme::soft())],
+            width,
+            &[run("· ", theme::dim())],
+            &[run("  ", theme::dim())],
+            None,
+        ));
+    }
+    doc.blank();
+    doc.section("runs as", None, width);
+    let (glyph, color) = agent_glyph(agent.state, spinner);
+    doc.line(Line::from(vec![
+        span(format!("{glyph} "), theme::fg(color)),
+        span(agent_word(agent.state), theme::fg(color)),
+    ]));
+    let field = |doc: &mut Doc, label: &str, value: Option<&str>| {
+        let mut spans = vec![span(format!("{label:<9}"), theme::dim())];
+        match value {
+            Some(value) => spans.push(span(value.to_owned(), theme::soft())),
+            None => spans.push(unknown()),
+        }
+        doc.line(Line::from(spans));
+    };
+    field(&mut doc, "harness", Some(agent.harness.name()));
+    field(&mut doc, "state", details.harness_state.as_deref());
+    field(&mut doc, "runtime", details.runtime.as_deref());
+    field(&mut doc, "host", Some(&agent.host));
+    field(&mut doc, "worktree", agent.worktree.as_deref());
+    if let Some(under) = &details.under {
+        field(&mut doc, "under", Some(under));
+    }
+    doc.blank();
+    doc.lines(text::wrap(
+        &[run(agent.id.clone(), theme::dim())],
+        width,
+        &[],
+        &[],
+        None,
+    ));
+    doc
+}

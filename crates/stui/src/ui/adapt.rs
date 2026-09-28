@@ -361,6 +361,31 @@ fn agents(model: &Model) -> Vec<Agent> {
                     .under
                     .first()
                     .map(|relation| relation.agent_id.clone()),
+                details: AgentDetails {
+                    goal: work
+                        .and_then(|work| work.goals.first().map(|goal| clean_message_text(goal))),
+                    claimed: work.map(|work| format!("{} ago", age(&work.header.updated_at))),
+                    next: agent.next_work_id.as_ref().map(|id| step_label(model, id)),
+                    queue: agent
+                        .upcoming_work_ids
+                        .iter()
+                        .map(|id| step_label(model, id))
+                        .collect(),
+                    queued: agent.queued_work_count,
+                    harness_state: agent.harness_state.clone(),
+                    runtime: model
+                        .runtimes()
+                        .find(|runtime| runtime.owner_id == agent.header.id)
+                        .map(|runtime| runtime.state.clone()),
+                    fault: agent.fault.clone(),
+                    under: agent.under.first().map(|relation| {
+                        model
+                            .agents()
+                            .find(|parent| parent.header.id == relation.agent_id)
+                            .map(crate::agent_label)
+                            .unwrap_or_else(|| short(&relation.agent_id))
+                    }),
+                },
             }
         })
         .collect::<Vec<_>>();
@@ -396,9 +421,30 @@ fn agents(model: &Model) -> Vec<Agent> {
             activity: age(&session.header.updated_at),
             unmanaged: true,
             parent: None,
+            details: AgentDetails::default(),
         }
     }));
     agents
+}
+
+/// "Mission › step" for a work id, or the id itself when st has not sent that work.
+fn step_label(model: &Model, id: &str) -> String {
+    model
+        .work()
+        .find(|work| work.header.id == id)
+        .map(|work| {
+            let mission = model
+                .missions()
+                .find(|mission| mission.runs.contains(&work.mission_run_id))
+                .map(crate::mission_display_label)
+                .unwrap_or_else(|| {
+                    work.mission_run_id
+                        .trim_start_matches("mission-run/")
+                        .to_owned()
+                });
+            format!("{mission} › {}", work.path)
+        })
+        .unwrap_or_else(|| id.trim_start_matches("step-run/").to_owned())
 }
 
 // ------------------------------------------------------------------- missions
