@@ -33,6 +33,7 @@ const actionLabels: Record<Attention['actions'][number], string> = {
   'attention.resolve': 'Resolve',
   'review.approve': 'Approve review',
   'review.reject': 'Reject review',
+  'review.request-changes': 'Request changes',
   'launch.approve': 'Approve launch',
   'launch.cancel': 'Cancel launch',
   'mission.approve-revision': 'Approve revision',
