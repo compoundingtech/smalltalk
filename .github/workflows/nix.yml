@@ -28,7 +28,10 @@ jobs:
           shared-key: workspace-debug
           cmd-format: nix develop -c {0}
           cache-on-failure: true
-      - run: nix develop --command cargo test --workspace --locked
+      # The provider component integration tests require Wasm artifacts supplied
+      # by the tag-only Nix check; its library tests still run here.
+      - run: nix develop --command cargo test --workspace --exclude st2-resource-providers --locked
+      - run: nix develop --command cargo test -p st2-resource-providers --lib --locked
       - run: nix develop --command cargo clippy --workspace --all-targets --locked
 
   # The full Nix release/check graph is useful for tags, but compiling it on

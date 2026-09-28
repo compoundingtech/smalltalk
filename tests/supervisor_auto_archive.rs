@@ -34,7 +34,7 @@ fn pty_shim(bin: &Path, sessions: &str) {
     fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
 }
 
-/// A catalog with an empty session registry and a `PATH` holding only the `pty` shim.
+/// A catalog with an empty session registry and a `PATH` preferring the `pty` shim.
 fn fixture(temporary: &tempfile::TempDir) -> (PathBuf, PathBuf) {
     let catalog = temporary.path().join("catalog");
     fs::create_dir_all(&catalog).unwrap();
@@ -53,6 +53,17 @@ fn seat(root: &Path, identity: &str, lifecycle: &str) {
         root,
         &format!("agents/h/{identity}/resources/goal.md"),
         "# goal\n\nfinish the migration\n",
+    );
+}
+
+fn running_seat(root: &Path, identity: &str, lifecycle: &str) {
+    seat(root, identity, lifecycle);
+    write(
+        root,
+        &format!("agents/h/{identity}/agent.kdl"),
+        &format!(
+            "agent \"{identity}\" {{\n  host \"h\"\n  {lifecycle}\n  exec \"task\" {{ command \"sleep 30\" }}\n}}\n"
+        ),
     );
 }
 
@@ -108,7 +119,7 @@ fn up_once(root: &Path, bin: &Path) -> Output {
     let output = Command::new(env!("CARGO_BIN_EXE_st2"))
         .args(["up", "--catalog", root.to_str().unwrap()])
         .args(["--host", "h", "--once"])
-        .env("PATH", bin)
+        .env("PATH", format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()))
         .env("HOME", &home)
         .env("XDG_STATE_HOME", home.join("state"))
         .env("PTY_ROOT", home.join("pty"))
@@ -241,7 +252,7 @@ fn a_declared_grace_period_overrides_the_seven_day_default() {
 fn a_running_or_suspended_seat_is_never_archived() {
     let temporary = tempfile::tempdir().unwrap();
     let (catalog, bin) = fixture(&temporary);
-    seat(&catalog, "live", "desired-state \"running\"");
+    running_seat(&catalog, "live", "desired-state \"running\"");
     seat(
         &catalog,
         "held",
@@ -623,10 +634,10 @@ fn repeated_passes_over_an_archived_seat_change_nothing() {
 fn un_retiring_a_seat_inside_the_grace_period_restarts_its_clock() {
     let temporary = tempfile::tempdir().unwrap();
     let (catalog, bin) = fixture(&temporary);
-    seat(&catalog, "back", RETIRED);
+    running_seat(&catalog, "back", RETIRED);
     seed_ledger(&catalog, &[("back", 6 * DAY_MS)]);
 
-    seat(&catalog, "back", "desired-state \"running\"");
+    running_seat(&catalog, "back", "desired-state \"running\"");
     up_once(&catalog, &bin);
     assert_eq!(
         ledger(&catalog).unwrap()["hosts"]["h"],
@@ -634,7 +645,7 @@ fn un_retiring_a_seat_inside_the_grace_period_restarts_its_clock() {
         "coming back must drop the old observation"
     );
 
-    seat(&catalog, "back", RETIRED);
+    running_seat(&catalog, "back", RETIRED);
     up_once(&catalog, &bin);
     assert!(
         catalog.join("agents/h/back").is_dir(),
