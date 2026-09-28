@@ -886,6 +886,7 @@ async fn leave_drains_everything_before_it_leaves() {
         expected.insert(format!("custom/fleet-test/b-{index}"));
     }
     a.start().await;
+    a.wait_listening().await;
     b.st_ok(&[
         "fleet",
         "leave",
