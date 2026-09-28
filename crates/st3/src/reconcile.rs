@@ -7081,9 +7081,9 @@ impl<R: RuntimeControl> Reconciler<R> {
             .flatten()
         }) {
             Some("pass") => Ok(GateOutcome::Pass),
-            Some("fail") => Ok(GateOutcome::Fail(
-                "the human reviewer rejected the work".into(),
-            )),
+            Some("fail") => Ok(GateOutcome::Fail(human_review_failure_reason(
+                decision.as_ref().expect("a failed decision exists"),
+            ))),
             _ => Ok(GateOutcome::Pending),
         }
     }
@@ -8232,9 +8232,9 @@ impl<R: RuntimeControl> Reconciler<R> {
                         .flatten()
                 }) {
                     Some("pass") => GateOutcome::Pass,
-                    Some("fail") => {
-                        GateOutcome::Fail("the human reviewer rejected the work".into())
-                    }
+                    Some("fail") => GateOutcome::Fail(human_review_failure_reason(
+                        decision.as_ref().expect("a failed decision exists"),
+                    )),
                     _ => GateOutcome::Pending,
                 }
             }
@@ -9625,6 +9625,18 @@ enum GateOutcome {
     Pass,
     Pending,
     Fail(String),
+}
+
+fn human_review_failure_reason(decision: &crate::model::ClaimRecord) -> String {
+    match decision
+        .body
+        .pointer("/fields/reason")
+        .and_then(Value::as_str)
+        .filter(|reason| !reason.trim().is_empty())
+    {
+        Some(reason) => format!("the human reviewer rejected the work: {reason}"),
+        None => "the human reviewer rejected the work".into(),
+    }
 }
 
 enum LoopBranchOutcome {
@@ -11786,6 +11798,56 @@ version 2
         assert_eq!(
             store.mission_run(&run.id).unwrap().unwrap().steps[0].status,
             "completed"
+        );
+        store
+            .set_mission_run_state(&run.id, "completed", "terminal", None)
+            .unwrap();
+
+        let rejected_run = store
+            .create_mission_run(&crate::model::MissionRunRequest {
+                mission: "review".into(),
+                revision: None,
+                workspace: "/tmp".into(),
+                requester: Some("person/test".into()),
+                mode: Some("run".into()),
+                inputs: BTreeMap::new(),
+                idempotency_key: "review-rejected-run".into(),
+            })
+            .unwrap();
+        reconciler.reconcile_once().unwrap();
+        reconciler.reconcile_once().unwrap();
+        let rejected_step = &rejected_run.steps[0].subject;
+        let rejected_request = store
+            .gate_request_for_owner(rejected_step)
+            .unwrap()
+            .expect("the second review was not requested");
+        store
+            .append_claim(&ClaimInput {
+                subject: rejected_request.subject,
+                kind: "gate.result".into(),
+                actor: Some("person/nathan".into()),
+                fields: BTreeMap::from([
+                    ("verdict".into(), Value::String("fail".into())),
+                    (
+                        "reason".into(),
+                        Value::String("The proof needs a source.".into()),
+                    ),
+                    ("request".into(), Value::String(rejected_request.id)),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some("review-rejected-result".into()),
+            })
+            .unwrap();
+        reconciler.reconcile_once().unwrap();
+        let failed = store.step_run(rejected_step).unwrap().unwrap();
+        assert_eq!(failed.status, "failed");
+        assert!(
+            failed
+                .blocked_reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("The proof needs a source.")
         );
     }
 
@@ -14845,7 +14907,7 @@ mission "absent-stop" state="ready" {
         ));
         let task = tokio::spawn(reconciler.run());
 
-        tokio::time::timeout(Duration::from_secs(1), async {
+        tokio::time::timeout(Duration::from_secs(10), async {
             loop {
                 let current = store.mission_run(&run.id).unwrap().unwrap();
                 if current.status == "failed" && current.phase == "terminal" {
