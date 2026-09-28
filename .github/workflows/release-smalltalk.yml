@@ -22,7 +22,7 @@ concurrency:
 
 jobs:
   build:
-    if: github.event_name != 'push' || github.event.deleted == false
+    if: ${{ github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.event.deleted == false) || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) }}
     name: release-build (${{ matrix.target }})
     strategy:
       fail-fast: false

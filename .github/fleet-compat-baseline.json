@@ -1,0 +1,4 @@
+{
+  "commit": "2c45cc60d736d4abb87899797e34d771f2e592e7",
+  "why": "st3 as it was on main before fleet membership. Replace with the pinned v0.3.0 release bundle and its SHA-256 once that release is published."
+}

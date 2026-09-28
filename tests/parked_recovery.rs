@@ -56,24 +56,39 @@ impl Fleet {
     }
 
     fn tasks(&self) -> serde_json::Value {
-        let output = self
-            .st2(&["tasks", "--host", HOST, "--json"])
-            .output()
-            .expect("run st2 tasks");
-        let stdout = String::from_utf8(output.stdout).expect("st2 tasks emits utf-8");
-        let value: serde_json::Value = serde_json::from_str(&stdout)
-            .unwrap_or_else(|error| panic!("st2 tasks emitted {stdout:?}: {error}"));
-        assert_eq!(
-            value["complete"], true,
-            "the inventory was incomplete: {}",
-            value["errors"]
-        );
-        assert!(
-            output.status.success(),
-            "a complete inventory must exit zero (errors: {})",
-            value["errors"]
-        );
-        value
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            let output = self
+                .st2(&["tasks", "--host", HOST, "--json"])
+                .output()
+                .expect("run st2 tasks");
+            let stdout = String::from_utf8(output.stdout).expect("st2 tasks emits utf-8");
+            let value: serde_json::Value = serde_json::from_str(&stdout)
+                .unwrap_or_else(|error| panic!("st2 tasks emitted {stdout:?}: {error}"));
+            let transient_start_time_race = value["errors"].as_array().is_some_and(|errors| {
+                !errors.is_empty()
+                    && errors.iter().all(|error| {
+                        error.as_str().is_some_and(|error| {
+                            error.contains("recorded startTimeTicks does not match the live pid")
+                        })
+                    })
+            });
+            if value["complete"] != true && transient_start_time_race && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(50));
+                continue;
+            }
+            assert_eq!(
+                value["complete"], true,
+                "the inventory was incomplete: {}",
+                value["errors"]
+            );
+            assert!(
+                output.status.success(),
+                "a complete inventory must exit zero (errors: {})",
+                value["errors"]
+            );
+            return value;
+        }
     }
 
     fn row(&self, runtime_id: &str) -> serde_json::Value {
