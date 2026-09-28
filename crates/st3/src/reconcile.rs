@@ -7785,25 +7785,6 @@ impl<R: RuntimeControl> Reconciler<R> {
         } else {
             BTreeSet::new()
         };
-        let mut deferrals = BTreeMap::new();
-        for claim in self
-            .store
-            .claims_for(&item.subject, Some("subscription.mission-deferred"))?
-        {
-            if let (Some(request), Some(deadline)) = (
-                claim
-                    .body
-                    .pointer("/fields/request")
-                    .and_then(Value::as_str),
-                claim
-                    .body
-                    .pointer("/fields/not_before_unix_ms")
-                    .and_then(Value::as_u64),
-            ) {
-                let entry = deferrals.entry(request.to_owned()).or_insert((0, 0));
-                *entry = (deadline, entry.1 + 1);
-            }
-        }
         let mut held = BTreeMap::<String, usize>::new();
         let mut waiting = Vec::new();
         for request in requests {
@@ -7817,10 +7798,10 @@ impl<R: RuntimeControl> Reconciler<R> {
                 *held.entry(observation).or_default() += 1;
                 continue;
             }
-            if deferrals
-                .get(&request.id)
-                .is_some_and(|(deadline, _)| u128::from(*deadline) > now_ms())
-            {
+            let deferral = self
+                .store
+                .subscription_mission_deferral(&item.subject, &request.id)?;
+            if deferral.is_some_and(|(deadline, _)| deadline > now_ms()) {
                 continue;
             }
             let fields = request.body.get("fields").unwrap_or(&request.body);
@@ -7884,9 +7865,8 @@ impl<R: RuntimeControl> Reconciler<R> {
             let run = match created {
                 Ok(run) => run,
                 Err(error) if error.code == "mission-run-capacity" => {
-                    let attempt = deferrals
-                        .get(&request.id)
-                        .map_or(1_u32, |(_, attempts)| attempts + 1);
+                    let attempt =
+                        deferral.map_or(1_u32, |(_, attempts)| attempts.saturating_add(1));
                     let delay_ms =
                         1_000_u128.saturating_mul(1_u128 << attempt.saturating_sub(1).min(6));
                     let not_before = now_ms().saturating_add(delay_ms);
