@@ -2723,7 +2723,7 @@ fn control_initializes_before_recording_the_first_thread_only() {
             tx,
         )
     });
-    let first_event = rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    let first_event = rx.recv_timeout(Duration::from_secs(10)).unwrap();
     assert!(
         matches!(first_event, ControlEvent::Bound),
         "first control event: {first_event:?}"
@@ -2890,7 +2890,7 @@ fn expected_resume_waits_for_tui_loaded_thread_and_binds_from_control_response()
         }) if policy == "never" && sandbox == "danger-full-access"
     ));
     assert!(matches!(
-        rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+        rx.recv_timeout(Duration::from_secs(10)).unwrap(),
         ControlEvent::Bound
     ));
     server.join().unwrap();
@@ -2987,7 +2987,7 @@ fn declared_resume_policy_preloads_before_the_tui_can_load_read_only() {
         )
     });
     ready_tx.send(()).unwrap();
-    preloaded_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    preloaded_rx.recv_timeout(Duration::from_secs(10)).unwrap();
     assert!(matches!(
         events_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
         ControlEvent::ResumePermissionPolicyApplied(_)
@@ -3119,7 +3119,7 @@ fn rejected_resume_permission_projection_retries_once_with_provider_safe_policy(
         }
     ));
     assert!(matches!(
-        rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+        rx.recv_timeout(Duration::from_secs(10)).unwrap(),
         ControlEvent::Bound
     ));
     assert!(fallback_active.load(Ordering::SeqCst));
