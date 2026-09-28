@@ -14,10 +14,12 @@ concurrency:
 jobs:
   fleet-compat:
     name: fleet-compat (${{ matrix.os }})
+    # macOS never runs on GitHub (#632): it is too slow and too expensive there. The fleet
+    # suite runs on macOS in st's own CI on the fleet's Mac.
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-22.04, macos-15]
+        os: [ubuntu-22.04]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 120
     steps:

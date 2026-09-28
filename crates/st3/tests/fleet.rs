@@ -1470,6 +1470,11 @@ fn fleet_workflows_have_no_path_filter() {
         );
     }
     assert!(compat.contains("an_old_build_config_peer_replicates_with_new_members"));
+    // macOS checks never run on GitHub (#632).
+    assert!(
+        !compat.to_ascii_lowercase().contains("macos-"),
+        "fleet.yml runs on a GitHub macOS runner"
+    );
     let baseline: Value = serde_json::from_str(
         &fs::read_to_string(workflows.join("../fleet-compat-baseline.json")).unwrap(),
     )
