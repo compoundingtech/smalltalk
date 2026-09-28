@@ -193,7 +193,7 @@ pub fn run(program: &'static str) -> ! {
         Some(real) if argv0.as_bytes().contains(&b'/') => relay(real, real.as_os_str(), &arguments),
         Some(real) => relay(real, &argv0, &arguments),
         None => {
-            eprintln!("st3 recorder: {program}: command not found after the recorder on PATH");
+            eprintln!("st recorder: {program}: command not found after the recorder on PATH");
             Outcome::Exited(127)
         }
     };
@@ -498,7 +498,7 @@ fn spawn_unrelayed(mut command: std::process::Command, real: &Path) -> Outcome {
 }
 
 fn spawn_failure(real: &Path, error: &std::io::Error) -> Outcome {
-    eprintln!("st3 recorder: cannot run {}: {error}", real.display());
+    eprintln!("st recorder: cannot run {}: {error}", real.display());
     if error.kind() == std::io::ErrorKind::NotFound {
         Outcome::Exited(127)
     } else {

@@ -1921,19 +1921,19 @@ fn install_recorder(
         });
     match installed {
         Ok(installation) if installation.programs.is_empty() => {
-            eprintln!("st3: neither git nor gh is on PATH, so no calls are recorded");
+            eprintln!("st: neither git nor gh is on PATH, so no calls are recorded");
             Some(installation)
         }
         Ok(installation) => {
             eprintln!(
-                "st3: recording {} calls in {}",
+                "st: recording {} calls in {}",
                 installation.programs.join(" and "),
                 installation.log.display()
             );
             Some(installation)
         }
         Err(error) => {
-            eprintln!("st3: not recording git and gh calls: {error:#}");
+            eprintln!("st: not recording git and gh calls: {error:#}");
             None
         }
     }

@@ -17,7 +17,7 @@ directory then goes in front of them, so an authored `PATH` cannot put another `
 `st3-recorder.json`, that names the host and the log. The daemon writes these at startup. It links
 a program only when that program is on the daemon's `PATH` or the login shell's `PATH`, so
 `command -v gh` still fails on a host without `gh`. When the daemon cannot write the directory, it
-prints `st3: not recording git and gh calls: ...` and starts anyway.
+prints `st: not recording git and gh calls: ...` and starts anyway.
 
 When st starts as `git` or `gh`, it does not start the async runtime or read any configuration.
 It finds the real program, runs it, waits for it, appends one line to the log, and exits the way the
@@ -36,7 +36,7 @@ The first remaining match runs with the caller's arguments, environment, working
 stdio. A bare `argv[0]` such as `git` is passed on unchanged. `PATH` is passed on unchanged too,
 so a `git` that `gh` starts is recorded as its own call.
 
-When no match remains, the recorder prints `st3 recorder: git: command not found after the
+When no match remains, the recorder prints `st recorder: git: command not found after the
 recorder on PATH`, records the call with exit code 127, and exits 127.
 
 ## The log
