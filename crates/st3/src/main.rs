@@ -540,8 +540,8 @@ enum PtyCommand {
     Screen(PtyScreenArgs),
     /// Create a short-lived client attachment and show its stream details.
     AttachInfo(PtyScreenArgs),
-    /// Read one bounded terminal frame batch with an attachment capability.
-    Frames(PtyFramesArgs),
+    /// Follow a terminal's screens with an attachment capability until the stream ends.
+    Stream(PtyStreamArgs),
     /// Send input through the client gateway to a local or remote terminal.
     InputClient(PtyClientInputArgs),
     /// End a client attachment by its exact attachment ID.
@@ -566,7 +566,7 @@ struct PtyScreenArgs {
 }
 
 #[derive(Args)]
-struct PtyFramesArgs {
+struct PtyStreamArgs {
     subject: String,
     #[arg(long = "as", value_parser = parse_person_subject)]
     person: Option<String>,
@@ -575,10 +575,9 @@ struct PtyFramesArgs {
     capability: String,
     #[arg(long)]
     incarnation: Option<String>,
-    #[arg(long)]
-    after: Option<u64>,
-    #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u64).range(0..=30_000))]
-    wait_ms: u64,
+    /// Stop after this many screens instead of following until the stream ends.
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+    count: Option<u64>,
 }
 
 #[derive(Args)]
@@ -1807,7 +1806,8 @@ async fn run_up(args: UpArgs) -> Result<()> {
         .pty_root
         .clone()
         .unwrap_or_else(|| config.state_dir.join("pty"));
-    let login_environment = st_runtime::login_environment()?;
+    let login_environment = st3::environment::snapshot()?;
+    st_runtime::initialize_isolation(&login_environment);
     let pty_binary = st_runtime::resolve_executable("pty", &login_environment)?;
     let state = AppState {
         store: store.clone(),
@@ -1834,6 +1834,18 @@ async fn run_up(args: UpArgs) -> Result<()> {
         event_notify.clone(),
     )?);
     tokio::spawn(reconciler.supervise());
+    tokio::spawn(trim_local_observations(
+        store.clone(),
+        config.observations.clone(),
+    ));
+    if let Some(otlp) = &config.observations.otlp {
+        let exporter = st3::otlp::OtlpExporter::new(otlp, &config.node)?;
+        eprintln!(
+            "st3: exporting local observations to OpenTelemetry at {}",
+            otlp.endpoint
+        );
+        tokio::spawn(st3::otlp::run(store.clone(), exporter));
+    }
     #[cfg(target_os = "macos")]
     tokio::spawn(async {
         // Startup and replication can leave large, empty malloc zones resident on macOS.
@@ -2865,36 +2877,36 @@ async fn run_pty(
                 .await?;
             print_client_value(&response, json_output)
         }
-        PtyCommand::Frames(args) => {
+        PtyCommand::Stream(args) => {
             let person = configured_human(
                 args.person.as_deref(),
                 configured_person,
-                "terminals frames",
+                "terminals stream",
             )?;
-            let batch = generated_client(endpoint, Some(&person))?
-                .terminal_frames(
+            let mut stream = generated_client(endpoint, Some(&person))?
+                .terminal_stream(
                     &args.subject,
-                    args.after,
                     args.incarnation.as_deref(),
                     &args.capability,
-                    Some(args.wait_ms),
                 )
                 .await?;
-            if json_output {
-                print_value(
-                    &json!({ "screen": batch.screen, "frames": batch.frames }),
-                    true,
-                )
-            } else {
-                print!("{}", render_terminal_screen(&batch.screen.value));
-                if let Some(frames) = batch.frames {
-                    println!("Resume after sequence {}", frames.value.resume_sequence);
-                    for frame in frames.value.frames {
-                        println!("{} {} {}", frame.sequence, frame.timestamp, frame.body);
+            let mut shown = 0_u64;
+            while args.count.is_none_or(|count| shown < count) {
+                let Some(screen) = stream.next().await? else {
+                    break;
+                };
+                shown += 1;
+                if json_output {
+                    println!("{}", serde_json::to_string(&screen)?);
+                } else {
+                    if shown > 1 {
+                        println!();
                     }
+                    print!("{}", render_terminal_screen(&screen.value));
                 }
-                Ok(())
             }
+            stream.close().await;
+            Ok(())
         }
         PtyCommand::InputClient(args) => {
             let person = configured_human(
@@ -6541,21 +6553,22 @@ async fn run_message(
         }
         MessageCommand::Thread(args) => {
             let selected = read_message(client, &args.reference).await?;
-            let mut links = BTreeMap::new();
+            // Page through the whole history once; the daemon reads every message for each pass.
+            let mut messages = Vec::new();
             for_each_message(client, None, true, |message| {
-                links.insert(message.subject, message.in_reply_to);
+                messages.push(message);
                 Ok(())
             })
             .await?;
+            let links = messages
+                .iter()
+                .map(|message| (message.subject.clone(), message.in_reply_to.clone()))
+                .collect::<BTreeMap<_, _>>();
             let root = thread_root_from_links(&selected.subject, &links);
-            let mut thread = Vec::new();
-            for_each_message(client, None, true, |message| {
-                if thread_root_from_links(&message.subject, &links) == root {
-                    thread.push(message);
-                }
-                Ok(())
-            })
-            .await?;
+            let mut thread = messages
+                .into_iter()
+                .filter(|message| thread_root_from_links(&message.subject, &links) == root)
+                .collect::<Vec<_>>();
             thread.sort_by_key(|message| message.created_index);
             print_value(&thread, json_output)
         }
@@ -9338,6 +9351,35 @@ fn idempotency(kdl: &str, tokens: &BTreeMap<String, Vec<String>>) -> String {
     hex::encode(hash.finalize())
 }
 
+/// Trim the local observation log at startup and then once an hour. Local observations
+/// never replicate, so this never changes what any peer holds.
+async fn trim_local_observations(store: Arc<Store>, observations: st3::config::ObservationsConfig) {
+    const LOCAL_OBSERVATION_TRIM_INTERVAL: Duration = Duration::from_secs(60 * 60);
+    const LOCAL_OBSERVATION_TRIM_CHUNK: usize = 5_000;
+    let retention_ms = observations
+        .retention_ms()
+        .expect("the daemon validated its observation retention");
+    loop {
+        let store = store.clone();
+        let max_per_subject_kind = observations.max_per_subject_kind;
+        let trimmed = tokio::task::spawn_blocking(move || {
+            store.trim_local_observations(
+                now_ms().saturating_sub(u128::from(retention_ms)),
+                max_per_subject_kind,
+                LOCAL_OBSERVATION_TRIM_CHUNK,
+            )
+        })
+        .await;
+        match trimmed {
+            Ok(Ok(0)) => {}
+            Ok(Ok(count)) => eprintln!("st3: trimmed {count} local observations"),
+            Ok(Err(error)) => eprintln!("st3: local observation trim failed: {error:#}"),
+            Err(error) => eprintln!("st3: local observation trim stopped: {error}"),
+        }
+        tokio::time::sleep(LOCAL_OBSERVATION_TRIM_INTERVAL).await;
+    }
+}
+
 fn now_ms() -> u128 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -10611,7 +10653,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             render_terminal_screen(&response.value),
-            "$ cargo build\nFinished\n$ \n"
+            "$ cargo build\nFinished\n$\n"
         );
     }
 
@@ -10631,29 +10673,27 @@ mod tests {
             }
         ));
 
-        let frames = Cli::try_parse_from([
+        let stream = Cli::try_parse_from([
             "st3",
             "terminals",
-            "frames",
+            "stream",
             "terminal/agent/fleet/app-web/standing/app-web",
             "--capability",
             "test-capability",
             "--incarnation",
             "runtime-1",
-            "--after",
-            "41",
-            "--wait-ms",
-            "5000",
+            "--count",
+            "3",
         ])
         .unwrap();
         let Command::Terminals {
-            command: PtyCommand::Frames(args),
-        } = frames.command
+            command: PtyCommand::Stream(args),
+        } = stream.command
         else {
-            panic!("frames did not parse");
+            panic!("stream did not parse");
         };
-        assert_eq!(args.after, Some(41));
-        assert_eq!(args.wait_ms, 5000);
+        assert_eq!(args.incarnation.as_deref(), Some("runtime-1"));
+        assert_eq!(args.count, Some(3));
 
         let input = Cli::try_parse_from([
             "st3",

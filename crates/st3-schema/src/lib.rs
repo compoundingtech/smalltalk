@@ -43,6 +43,24 @@ pub enum Cardinality {
     StateTransition,
 }
 
+/// Where a claim kind lives once written.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Retention {
+    /// A fact in the replicated claim log, kept on every node.
+    #[default]
+    Durable,
+    /// An observation kept only in the local observation log of the node that
+    /// made it and trimmed after that node's retention window.
+    Local,
+}
+
+impl Retention {
+    pub fn is_durable(&self) -> bool {
+        *self == Self::Durable
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct FieldSpec {
     pub value_type: ValueType,
@@ -85,6 +103,8 @@ pub struct ClaimSpec {
     pub wakes_reconciler: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub source_kdl: Vec<String>,
+    #[serde(default, skip_serializing_if = "Retention::is_durable")]
+    pub retention: Retention,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -144,10 +164,10 @@ impl Registry {
         output.push_str(
             "| `custom.NAMESPACE.NAME` | open fact bag | A namespaced custom resource. |\n\n",
         );
-        output.push_str("## Claim kinds\n\n| Kind | Subjects | Write policy | Cardinality | Fields | KDL source |\n|---|---|---|---|---|---|\n");
+        output.push_str("## Claim kinds\n\n| Kind | Subjects | Write policy | Cardinality | Retention | Fields | KDL source |\n|---|---|---|---|---|---|---|\n");
         for spec in self.claims.values() {
             output.push_str(&format!(
-                "| `{}` | {} | `{}` | `{}` | {} | {} |\n",
+                "| `{}` | {} | `{}` | `{}` | `{}` | {} | {} |\n",
                 spec.kind,
                 spec.subjects
                     .iter()
@@ -156,6 +176,7 @@ impl Registry {
                     .join(", "),
                 enum_label(&spec.write_policy),
                 enum_label(&spec.cardinality),
+                enum_label(&spec.retention),
                 field_summary(&spec.fields),
                 spec.source_kdl
                     .iter()
@@ -165,6 +186,7 @@ impl Registry {
             ));
         }
         output.push_str("\n`resource.observed` validates facts against the resource kind. Custom resource facts remain open.\n");
+        output.push_str("\nA `durable` claim is a fact in the replicated claim log. A `local` claim is an observation kept only in the local observation log of the node that made it, trimmed after that node's retention window.\n");
         output
     }
 
@@ -1692,10 +1714,22 @@ fn claim_specs() -> BTreeMap<String, ClaimSpec> {
                 projection: projection.map(str::to_owned),
                 wakes_reconciler: *wake,
                 source_kdl: source_kdl.iter().map(|value| (*value).into()).collect(),
+                retention: claim_retention(kind),
             },
         );
     }
     claims
+}
+
+/// Observations that only the node that made them reads. See
+/// `docs/st3/data-authority.md` for the local observation log.
+fn claim_retention(kind: &str) -> Retention {
+    match kind {
+        // The owner reads a transcript from the harness's own session file, or from this log
+        // when there is none. Other nodes relay timeline reads to the owner.
+        "harness.timeline" => Retention::Local,
+        _ => Retention::Durable,
+    }
 }
 
 fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
@@ -2511,6 +2545,7 @@ fn custom_claim_spec() -> &'static ClaimSpec {
         projection: None,
         wakes_reconciler: false,
         source_kdl: Vec::new(),
+        retention: Retention::Durable,
     })
 }
 
