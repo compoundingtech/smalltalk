@@ -29,8 +29,9 @@ use st3::model::{
 use st3::store::Store;
 
 const FLEET: &str = "5d0c6f8e-2b1a-4c3d-9e8f-7a6b5c4d3e2f";
-const SOURCE_PORT: u16 = 47_311;
-const TARGET_PORT: u16 = 47_312;
+// Below the Linux and macOS ephemeral port ranges, so no outgoing connection can hold them.
+const SOURCE_PORT: u16 = 27_311;
+const TARGET_PORT: u16 = 27_312;
 
 /// Two steps on one standing agent. The agent is not declared, so the source daemon starts no
 /// runtimes while the target syncs.
