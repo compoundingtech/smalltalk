@@ -169,7 +169,7 @@ export class St3Client {
         socket.onmessage = event => {
             let payload: unknown;
             try { payload = JSON.parse(String(event.data)); } catch { fail(new Error('A terminal stream message is not JSON')); return; }
-            if (!payload || typeof payload !== 'object' || (payload as { api_version?: unknown }).api_version !== API_VERSION) { fail(new Error('Unexpected st3 terminal stream message')); return; }
+            if (!payload || typeof payload !== 'object' || (payload as { api_version?: unknown }).api_version !== API_VERSION) { fail(new Error('Unexpected st terminal stream message')); return; }
             if ('error_version' in payload) { fail(new ClientError(payload as ErrorEnvelope, 0)); return; }
             const screen = payload as EnvelopeOf<TerminalScreen>;
             if (screen.value?.kind !== 'terminal-screen') { fail(new Error('A terminal stream message is not a screen')); return; }
