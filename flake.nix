@@ -288,6 +288,9 @@
             "--skip"
             "client::tests::terminal_socket_eof_restores_and_sanitizes_the_callers_tty"
           ];
+          # Login-shell capture starts in HOME. The sandbox's /homeless-shelter does
+          # not exist, so give these tests a real, isolated home just as st2 has above.
+          preCheck = "export HOME=$(mktemp -d)";
           # Render tests create throwaway repositories and call Git to protect
           # tracked files. Keep that dependency in the hermetic check sandbox.
           nativeBuildInputs = [
