@@ -1297,11 +1297,11 @@ Neither job has a path filter, so no change in this series can skip them. A unit
 and fails if a `paths` or `paths-ignore` key appears on the jobs' pull request triggers, or if the
 publish job stops needing `fleet-e2e`.
 
-**The compatibility baseline.** The old build is the `v0.3.0` release bundle, the first release
-the tag workflow publishes. `.github/fleet-compat-baseline.json` pins its tag, source commit, and
-the SHA-256 of each platform's archive. The pull request that adds `fleet-compat` (the last one in
-this series) cannot merge until that release exists; if it does not exist yet, that pull request
-waits for it. Nothing falls back to building from source or to skipping.
+**The compatibility baseline.** Until the `v0.3.0` release bundle exists, the old build is `st3`
+built with Nix at the commit pinned in `.github/fleet-compat-baseline.json`: `main` before fleet
+membership. The pin is its identity, and the job checks that the binary has no `st fleet`. Once
+`v0.3.0` is published, the pin moves to that bundle and the SHA-256 of each platform's archive.
+The job never skips and never falls back: an unbuildable baseline fails it.
 
 ### Live test: `scripts/fleet-live-test`
 
