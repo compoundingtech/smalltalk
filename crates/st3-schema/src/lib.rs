@@ -1658,6 +1658,15 @@ fn claim_specs() -> BTreeMap<String, ClaimSpec> {
             &[],
         ),
         (
+            "reconcile.fault",
+            &["daemon", "mission-run"],
+            WritePolicy::SystemOnly,
+            Cardinality::Append,
+            Some("daemons"),
+            false,
+            &[],
+        ),
+        (
             "record.repaired",
             &["repair"],
             WritePolicy::OrdinaryClient,
@@ -1988,6 +1997,11 @@ fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
             ("protocol", string()),
             ("last_success_at", integer()),
             ("remote_heads", object()),
+        ],
+        "reconcile.fault" => &[
+            ("scope", required_string()),
+            ("status", required_enum(&["faulted", "recovered"])),
+            ("reason", string()),
         ],
         "record.repaired" => &[
             ("record", required_string()),
@@ -2656,6 +2670,7 @@ mod tests {
                 "planning-session.revision-requested",
                 "planning-session.started",
                 "publication.operation",
+                "reconcile.fault",
                 "record.repaired",
                 "render.applied",
                 "repair.applied",

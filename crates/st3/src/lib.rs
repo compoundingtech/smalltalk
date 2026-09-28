@@ -6,6 +6,7 @@ pub mod boot;
 pub(crate) mod checkout;
 pub mod client;
 pub mod config;
+pub mod environment;
 pub(crate) mod external_sessions;
 pub mod graph;
 pub mod mission;
