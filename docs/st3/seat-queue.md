@@ -42,10 +42,10 @@ the two oldest-first orderings that existed before, one in `Store::agent_work_qu
 the reconciler's `next_work_wake_for_agent`. It is now used by:
 
 - `Store::agent_work_queues`, which feeds `NEXT WORK`, `QUEUED WORK`, and `UPCOMING` in
-  `st3 agents show` and the `agents` client resource;
+  `st agents show` and the `agents` client resource;
 - the reconciler's work wake and its retry deadline;
-- `Store::seat_queue`, which feeds `st3 agents queue` and its alias `st3 missions queued`;
-- the client work list when it is filtered to one agent, so `st3 work ls --as AGENT` lists ready
+- `Store::seat_queue`, which feeds `st agents queue` and its alias `st missions queued`;
+- the client work list when it is filtered to one agent, so `st work ls --as AGENT` lists ready
   work in the same order;
 - `work claim`, which refuses to let the seat take a later run's step first.
 
@@ -58,15 +58,15 @@ for the seat, like any other step of its run.
 ## Commands
 
 ```sh
-st3 agents queue agent/fleet/example/worker
-st3 agents queue move agent/fleet/example/worker mission-run/release/2026-09-26 --top \
+st agents queue agent/fleet/example/worker
+st agents queue move agent/fleet/example/worker mission-run/release/2026-09-26 --top \
   --reason "the release needs this first" --as person/operator
-st3 agents queue move agent/fleet/example/worker mission-run/docs/2026-09-26 \
+st agents queue move agent/fleet/example/worker mission-run/docs/2026-09-26 \
   --after mission-run/release/2026-09-26 --as person/operator
 ```
 
-`st3 agents queue AGENT` prints the held step, the next work, each queued run in order with its
-state (`claimed`, `ready`, or `waiting`), and the most recent moves, newest first. `st3 missions
+`st agents queue AGENT` prints the held step, the next work, each queued run in order with its
+state (`claimed`, `ready`, or `waiting`), and the most recent moves, newest first. `st missions
 queued AGENT` runs the exact same show through the same code and prints the identical output,
 including `--json`; there is no `missions queued move`, only `agents queue move`.
 
@@ -85,7 +85,7 @@ MOVES        1 total
 `move` takes exactly one of `--top`, `--bottom`, `--before RUN`, or `--after RUN`. The run and any
 anchor must be queued for the seat. After a move, the command prints the new queue.
 
-A person moves runs with `--as person/NAME` or `person` in the st3 config, like other client-v0
+A person moves runs with `--as person/NAME` or `person` in the st config, like other client-v0
 mutations. With `--json`, it prints the action result.
 
 An agent moves runs with `--as agent/PATH` when a person has granted it that authority in its
@@ -227,7 +227,7 @@ others.
   now refuses that. Inside one run, the mission's dependencies still decide. `available-to` work
   is not queued, so it is not refused. An agent that wants another run first needs a person, or
   an agent with queue authority for the seat, to move it.
-- **The boot contract lists fleet work.** Agents are told to run `st3 work ls` without `--as`. That
+- **The boot contract lists fleet work.** Agents are told to run `st work ls` without `--as`. That
   list is in creation order, not seat order, and it includes steps the agent cannot claim. The
   claim check makes the seat order hold anyway. Changing the boot contract is left to its owner.
 - **Agents move runs only with a declared grant.** A person grants `queue-authority` in the
@@ -237,7 +237,7 @@ others.
   later moves and leaves earlier ones in place. Paired and typed clients have no agent path;
   client-v0 actions stay person-only.
 - **An agent once re-declared its own seat.** In one live eval run an omp seat ran
-  `st3 agents start` for its own identity, as itself. The daemon accepted the declaration, which
+  `st agents start` for its own identity, as itself. The daemon accepted the declaration, which
   replaced the eval's: it dropped the model and the audit environment and set `restart always`.
   Eval cleanup then no longer owned the seat and could not remove its terminal, so the run was
   void although every judge passed. The later `seat-authority` check refuses this unless a person
