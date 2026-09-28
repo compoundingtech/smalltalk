@@ -5013,6 +5013,16 @@ mission "example/zero-run" state="ready" {
             .expect("the zero-run definition is listed");
         assert_eq!(mission["state"], "ready");
         assert_eq!(mission["runs"], json!([]));
+        let tree = missions_tree_value(&state.store, "now", state.store.index().unwrap()).unwrap();
+        assert!(
+            tree["unstarted_missions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| {
+                    item["id"] == "mission/example/zero-run" && item["state"] == "ready"
+                })
+        );
         assert_eq!(mission["operational"]["actionable"], true);
         assert!(mission["visualization"].is_null());
         assert_eq!(
