@@ -110,7 +110,10 @@ pub enum AttentionKind {
     /// A planner proposes a mission; show the mission itself.
     Launch {
         planner: String,
-        preview: MissionPreview,
+        name: String,
+        /// The proposed mission. It can be missing: a planner may not have produced one
+        /// that validates, and then there is nothing honest to show but why.
+        preview: Load<MissionPreview>,
     },
     /// A running mission wants to change its own plan.
     Revision {

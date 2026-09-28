@@ -38,7 +38,7 @@ pub struct Context {
 enum Fetched {
     Timeline(String, Vec<TimelineEntry>),
     Messages(String, Vec<st3_client::Message>),
-    Preview(String, MissionPreview),
+    Preview(String, Load<MissionPreview>),
     Notice(String),
     Failed(String, String),
 }
@@ -167,23 +167,39 @@ pub fn run(context: Context) -> Result<()> {
                 .trim_start_matches("mission/")
                 .to_owned();
             runtime.spawn(async move {
-                if let Ok(variants) = client.launch_variants_list(&source, None, Some(50)).await {
-                    let latest = variants
-                        .value
-                        .items
-                        .iter()
-                        .filter_map(|item| match item {
-                            Resource::LaunchVariant(variant) => Some(variant),
-                            _ => None,
-                        })
-                        .max_by_key(|variant| variant.ordinal);
-                    if let Some(variant) = latest {
-                        let _ = tx.send(Fetched::Preview(
-                            id,
-                            adapt::preview(&name, &variant.normalized_mission),
-                        ));
+                let preview = match client.launch_variants_list(&source, None, Some(50)).await {
+                    Err(error) => Load::Failed(format!("Could not load the proposed mission: {error}")),
+                    Ok(variants) => {
+                        let latest = variants
+                            .value
+                            .items
+                            .iter()
+                            .filter_map(|item| match item {
+                                Resource::LaunchVariant(variant) => Some(variant),
+                                _ => None,
+                            })
+                            .max_by_key(|variant| variant.ordinal);
+                        match latest {
+                            None => Load::Failed("The planner has not proposed a mission yet.".into()),
+                            Some(variant)
+                                if variant.normalized_mission.as_object().is_none_or(|fields| fields.is_empty()) =>
+                            {
+                                let mut reason = format!(
+                                    "The planner's latest candidate ({}) has no preview, so there is no mission to show yet.",
+                                    variant.status
+                                );
+                                for diagnostic in variant.diagnostics.iter().take(3) {
+                                    if let Some(message) = diagnostic.get("message").and_then(|value| value.as_str()) {
+                                        reason.push_str(&format!("\n• {message}"));
+                                    }
+                                }
+                                Load::Failed(reason)
+                            }
+                            Some(variant) => Load::Ready(adapt::preview(&name, &variant.normalized_mission)),
+                        }
                     }
-                }
+                };
+                let _ = tx.send(Fetched::Preview(id, preview));
             });
         }
 

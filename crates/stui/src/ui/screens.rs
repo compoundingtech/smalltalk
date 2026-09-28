@@ -476,7 +476,11 @@ pub fn home_detail(world: &World, id: Option<&str>, width: usize, drafts: &Draft
                 ]);
             }
         }
-        AttentionKind::Launch { planner, preview } => {
+        AttentionKind::Launch {
+            planner,
+            name,
+            preview,
+        } => {
             card.wrap(
                 &[run(
                     format!("{planner} proposes a new mission. Nothing runs until you approve it."),
@@ -485,79 +489,107 @@ pub fn home_detail(world: &World, id: Option<&str>, width: usize, drafts: &Draft
                 inner,
             );
             card.blank();
-            card.field("mission", &preview.name, inner, theme::bold());
-            card.field("in", &preview.workspace, inner, theme::soft());
-            let asks = preview.steps.iter().filter(|step| step.asks_you).count();
-            card.field(
-                "asks you",
-                &format!(
-                    "{asks} time{} before it finishes",
-                    if asks == 1 { "" } else { "s" }
-                ),
-                inner,
-                theme::fg(theme::PERSON),
-            );
-            card.blank();
-            card.section("goals", None, inner);
-            for goal in &preview.goals {
-                card.lines(text::wrap(
-                    &text::inline(goal, theme::text()),
-                    inner,
-                    &[run("◆ ", theme::fg(theme::LAVENDER))],
-                    &[run("  ", theme::dim())],
-                    None,
-                ));
-            }
-            card.blank();
-            card.section("steps", Some(preview.steps.len()), inner);
-            card.lines(flow(
-                preview.steps.iter().map(|step| {
-                    (
-                        step.name.as_str(),
-                        step.after.as_slice(),
-                        if step.asks_you {
-                            theme::PERSON
-                        } else {
-                            theme::SUBTEXT1
-                        },
-                    )
-                }),
-                inner,
-            ));
-            for step in &preview.steps {
-                card.line(Line::from(vec![
-                    span(format!("  {:<12}", step.name), theme::text()),
-                    span(
-                        format!("{:<18}", step.assignee),
-                        if step.asks_you {
-                            theme::fg(theme::PERSON)
-                        } else {
-                            theme::soft()
-                        },
-                    ),
-                    span(
-                        if step.after.is_empty() {
-                            "first".to_owned()
-                        } else {
-                            format!("after {}", step.after.join(", "))
-                        },
+            let preview = match preview {
+                Load::Ready(preview) => Some(preview),
+                Load::Loading => {
+                    card.field("mission", name, inner, theme::bold());
+                    card.blank();
+                    card.line(Line::from(span(
+                        "Loading the proposed mission…",
                         theme::dim(),
+                    )));
+                    card.blank();
+                    None
+                }
+                Load::Failed(reason) => {
+                    card.field("mission", name, inner, theme::bold());
+                    card.blank();
+                    let mut why = Doc::new();
+                    for line in reason.lines() {
+                        why.wrap(&text::inline(line, theme::text()), inner.saturating_sub(4));
+                    }
+                    card.card("nothing to approve yet", theme::YELLOW, false, why, inner);
+                    card.blank();
+                    None
+                }
+            };
+            if let Some(preview) = preview {
+                card.field("mission", &preview.name, inner, theme::bold());
+                if !preview.workspace.is_empty() {
+                    card.field("in", &preview.workspace, inner, theme::soft());
+                }
+                let asks = preview.steps.iter().filter(|step| step.asks_you).count();
+                card.field(
+                    "asks you",
+                    &format!(
+                        "{asks} time{} before it finishes",
+                        if asks == 1 { "" } else { "s" }
                     ),
-                ]));
+                    inner,
+                    theme::fg(theme::PERSON),
+                );
+                card.blank();
+                card.section("goals", None, inner);
+                for goal in &preview.goals {
+                    card.lines(text::wrap(
+                        &text::inline(goal, theme::text()),
+                        inner,
+                        &[run("◆ ", theme::fg(theme::LAVENDER))],
+                        &[run("  ", theme::dim())],
+                        None,
+                    ));
+                }
+                card.blank();
+                card.section("steps", Some(preview.steps.len()), inner);
+                card.lines(flow(
+                    preview.steps.iter().map(|step| {
+                        (
+                            step.name.as_str(),
+                            step.after.as_slice(),
+                            if step.asks_you {
+                                theme::PERSON
+                            } else {
+                                theme::SUBTEXT1
+                            },
+                        )
+                    }),
+                    inner,
+                ));
+                for step in &preview.steps {
+                    card.line(Line::from(vec![
+                        span(format!("  {:<12}", step.name), theme::text()),
+                        span(
+                            format!("{:<18}", step.assignee),
+                            if step.asks_you {
+                                theme::fg(theme::PERSON)
+                            } else {
+                                theme::soft()
+                            },
+                        ),
+                        span(
+                            if step.after.is_empty() {
+                                "first".to_owned()
+                            } else {
+                                format!("after {}", step.after.join(", "))
+                            },
+                            theme::dim(),
+                        ),
+                    ]));
+                }
+                card.blank();
+                card.section("agents", Some(preview.agents.len()), inner);
+                for agent in &preview.agents {
+                    card.line(Line::from(vec![
+                        span(format!("  {:<18}", agent.name), theme::text()),
+                        span(
+                            format!("{:<8}", agent.harness.name()),
+                            theme::fg(harness_color(agent.harness)),
+                        ),
+                        span(format!("on {}", agent.host), theme::dim()),
+                    ]));
+                }
+                card.blank();
             }
-            card.blank();
-            card.section("agents", Some(preview.agents.len()), inner);
-            for agent in &preview.agents {
-                card.line(Line::from(vec![
-                    span(format!("  {:<18}", agent.name), theme::text()),
-                    span(
-                        format!("{:<8}", agent.harness.name()),
-                        theme::fg(harness_color(agent.harness)),
-                    ),
-                    span(format!("on {}", agent.host), theme::dim()),
-                ]));
-            }
-            card.blank();
             if drafts.editing || drafts.text.is_some_and(|text| !text.is_empty()) {
                 text_box(
                     &mut card,
@@ -579,11 +611,18 @@ pub fn home_detail(world: &World, id: Option<&str>, width: usize, drafts: &Draft
                     "Cancel this launch"
                 },
             ) {
-                card.buttons(&[
-                    ("a", "Approve launch", Hit::Key('a'), theme::GREEN),
-                    ("c", "Ask for changes", Hit::Key('c'), theme::YELLOW),
-                    ("d", "Cancel launch", Hit::Key('d'), theme::RED),
-                ]);
+                if preview.is_some() {
+                    card.buttons(&[
+                        ("a", "Approve launch", Hit::Key('a'), theme::GREEN),
+                        ("c", "Ask for changes", Hit::Key('c'), theme::YELLOW),
+                        ("d", "Cancel launch", Hit::Key('d'), theme::RED),
+                    ]);
+                } else {
+                    card.buttons(&[
+                        ("c", "Ask the planner", Hit::Key('c'), theme::YELLOW),
+                        ("d", "Cancel launch", Hit::Key('d'), theme::RED),
+                    ]);
+                }
             }
         }
         AttentionKind::Revision { reason, changes } => {

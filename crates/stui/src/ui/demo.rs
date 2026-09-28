@@ -161,7 +161,8 @@ fn attention() -> Vec<Attention> {
             actions: vec![],
             kind: AttentionKind::Launch {
                 planner: s("Planner"),
-                preview: MissionPreview {
+                name: s("harbor/nightly-audit"),
+                preview: Load::Ready(MissionPreview {
                     name: s("harbor/nightly-audit"),
                     goals: vec![
                         s("Every night, audit harbor's dependencies for known advisories."),
@@ -206,7 +207,7 @@ fn attention() -> Vec<Attention> {
                         },
                     ],
                     workspace: s("~/src/harbor"),
-                },
+                }),
             },
         },
         Attention {

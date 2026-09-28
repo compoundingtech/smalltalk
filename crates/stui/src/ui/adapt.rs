@@ -13,7 +13,7 @@ use std::collections::BTreeMap;
 #[derive(Default)]
 pub struct Extras {
     pub conversations: BTreeMap<String, Load<Vec<Entry>>>,
-    pub previews: BTreeMap<String, MissionPreview>,
+    pub previews: BTreeMap<String, Load<MissionPreview>>,
     pub live: bool,
     pub offline: Option<String>,
 }
@@ -117,18 +117,15 @@ fn attention(model: &Model, extras: &Extras) -> Vec<Attention> {
                     Tier::Today,
                     AttentionKind::Launch {
                         planner: "The planner".into(),
-                        preview: extras.previews.get(&item.header.id).cloned().unwrap_or(
-                            MissionPreview {
-                                name: mission
-                                    .as_deref()
-                                    .map(short)
-                                    .unwrap_or_else(|| item.title.clone()),
-                                goals: vec![],
-                                steps: vec![],
-                                agents: vec![],
-                                workspace: String::new(),
-                            },
-                        ),
+                        name: mission
+                            .as_deref()
+                            .map(short)
+                            .unwrap_or_else(|| item.title.clone()),
+                        preview: extras
+                            .previews
+                            .get(&item.header.id)
+                            .cloned()
+                            .unwrap_or(Load::Loading),
                     },
                 ),
                 "revision-approval" => (

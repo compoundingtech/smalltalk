@@ -140,6 +140,9 @@ pub struct Ui {
     tab: usize,
     selected: [usize; 5],
     list_top: RefCell<[usize; 5]>,
+    /// The selection each sidebar last scrolled into view. The wheel may scroll away from
+    /// the selection; only a new selection brings it back.
+    list_follows: RefCell<[Option<usize>; 5]>,
     panes: RefCell<HashMap<String, PaneState>>,
     expanded: HashSet<String>,
     cache: conversation::Cache,
@@ -176,6 +179,7 @@ impl Ui {
             tab: 0,
             selected: [0; 5],
             list_top: RefCell::new([0; 5]),
+            list_follows: RefCell::new([None; 5]),
             panes: RefCell::new(HashMap::new()),
             expanded: HashSet::new(),
             cache: conversation::Cache::default(),
@@ -683,11 +687,15 @@ impl Ui {
         }
         let height = list.height as usize;
         let mut top = self.list_top.borrow()[self.tab];
-        if selected_range.1 > top + height {
-            top = selected_range.1 - height;
-        }
-        if selected_range.0 < top {
-            top = selected_range.0.saturating_sub(1);
+        let followed = self.list_follows.borrow()[self.tab];
+        if followed != Some(selected) {
+            if selected_range.1 > top + height {
+                top = selected_range.1 - height;
+            }
+            if selected_range.0 < top {
+                top = selected_range.0.saturating_sub(1);
+            }
+            self.list_follows.borrow_mut()[self.tab] = Some(selected);
         }
         top = top.min(rows.len().saturating_sub(height));
         self.list_top.borrow_mut()[self.tab] = top;
@@ -2714,5 +2722,65 @@ mod tests {
         press(&mut ui, KeyCode::Char('g'));
         assert_eq!(ui.tab, 1);
         assert!(ui.popover.is_none());
+    }
+    #[test]
+    fn a_launch_without_a_preview_says_why_and_offers_no_approval() {
+        let mut world = demo::world();
+        if let Load::Ready(items) = &mut world.attention {
+            for item in items.iter_mut() {
+                if let AttentionKind::Launch { preview, .. } = &mut item.kind {
+                    *preview = Load::Failed(
+                        "The planner's latest candidate (draft) has no preview.".into(),
+                    );
+                }
+            }
+        }
+        let mut ui = Ui::new(world);
+        let index = ui.ids().iter().position(|id| id == "attention/3").unwrap();
+        ui.select(index);
+        let screen = frame(&ui, 150, 50).join("\n");
+        assert!(screen.contains("NOTHING TO APPROVE YET"), "{screen}");
+        assert!(!screen.contains("Approve launch"), "{screen}");
+        assert!(!screen.contains("asks you"), "{screen}");
+    }
+    #[test]
+    fn the_wheel_scrolls_the_sidebar_away_from_the_selection_and_stays_there() {
+        let mut world = demo::world();
+        if let Load::Ready(agents) = &mut world.agents {
+            let template = agents[5].clone();
+            for index in 0..40 {
+                let mut agent = template.clone();
+                agent.id = format!("agent/fleet/extra/{index}");
+                agent.name = format!("Extra {index:02}");
+                agents.push(agent);
+            }
+        }
+        let mut ui = Ui::new(world);
+        ui.tab = 1;
+        frame(&ui, 140, 30);
+        for _ in 0..60 {
+            ui.mouse(MouseEvent {
+                kind: MouseEventKind::ScrollDown,
+                column: 2,
+                row: 10,
+                modifiers: KeyModifiers::NONE,
+            });
+            frame(&ui, 140, 30);
+        }
+        let (lines, height) = {
+            let info = ui.frame.borrow();
+            (info.sidebar_lines, info.sidebar_height)
+        };
+        assert_eq!(
+            ui.list_top.borrow()[1],
+            lines - height,
+            "scrolled to the bottom and stayed"
+        );
+        press(&mut ui, KeyCode::Down);
+        frame(&ui, 140, 30);
+        assert!(
+            ui.list_top.borrow()[1] < lines - height,
+            "a new selection comes back into view"
+        );
     }
 }
