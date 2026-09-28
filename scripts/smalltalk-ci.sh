@@ -98,13 +98,38 @@ register_source() {
   }
   number=${BASH_REMATCH[1]}
   facts=$(claim_json "$source")
-  [[ $(jq -r '.state' <<<"$facts") == open && $(jq -r '.draft' <<<"$facts") == false ]] || return 0
+  if [[ $(jq -r '.state' <<<"$facts") != open ]]; then
+    retire_legacy_watcher "$number"
+    return 0
+  fi
+  [[ $(jq -r '.draft' <<<"$facts") == false ]] || return 0
   pull=$(same_repository_pull "$number") || return 0
-  head=$(jq -er '.head' <<<"$facts")
+  head=$(jq -er '.head_sha' <<<"$facts")
   [[ $head =~ ^[a-f0-9]{40}$ && $head == "$(jq -r '.head.sha' <<<"$pull")" ]] || return 0
   run_id="fleet/smalltalk/ci/run/pr-$number-$head"
   "$bin" missions start fleet/smalltalk/ci/run --id "$run_id" --workspace "$state/runs" --input "source=$source" --as "$actor" ||
     "$bin" missions show "mission-run/$run_id" >/dev/null
+  retire_legacy_watcher "$number"
+}
+
+retire_legacy_watcher() {
+  local number=$1 run
+  while IFS= read -r run; do
+    if [[ $("$bin" missions show "$run" --json | jq -r '.status') == running ]]; then
+      "$bin" missions cancel "$run" --as "$actor" --reason 'CI now uses the shared repository observer'
+    fi
+  done < <("$bin" missions ls --json |
+    jq -r --arg id "mission/fleet/smalltalk/ci/watch/$number" \
+      '.value.items[] | select(.id == $id) | .runs[]?')
+}
+
+retire_legacy_watchers() {
+  local number
+  while IFS= read -r number; do
+    retire_legacy_watcher "$number"
+  done < <("$bin" missions ls --json |
+    jq -r '.value.items[] | .id | capture("^mission/fleet/smalltalk/ci/watch/(?<number>[0-9]+)$")? | .number' |
+    sort -nu)
 }
 EOF
   "$bin" missions publish "$watch_file" --as "$actor"
@@ -209,7 +234,7 @@ linux() {
     echo "unexpected CI source" >&2; return 1
   fi
   facts=$(claim_json "$source")
-  head=$(jq -er .head <<<"$facts")
+  head=$(jq -er '(.head_sha // .head)' <<<"$facts")
   [[ $head =~ ^[a-f0-9]{40}$ ]] || return 1
   if [[ $is_main == false ]]; then
     pull=$(same_repository_pull "$number") || { echo "fork rejected before code execution" >&2; return 1; }
@@ -348,7 +373,7 @@ linux() {
 finalize() {
   local source=$1 facts head linux_state result elapsed summary
   facts=$(claim_json "$source")
-  head=$(jq -er .head <<<"$facts")
+  head=$(jq -er '(.head_sha // .head)' <<<"$facts")
   summary="$state/runs/$ST_MISSION_RUN/summary"
   if [[ -f $summary ]] && grep -q '^skipped=' "$summary"; then
     echo "skipped run needs no commit status: $(sed -n 's/^skipped=//p' "$summary" | tail -1)"
@@ -366,7 +391,7 @@ finalize() {
 macos_remote() {
   local source=$1 number= head reason
   [[ $source == resource/github/compoundingtech/smalltalk/ci/*@[a-f0-9]* ]] || return 2
-  head=$(claim_json "$source" | jq -er .head)
+  head=$(claim_json "$source" | jq -er '(.head_sha // .head)')
   if [[ ${source%@*} =~ ^resource/github/compoundingtech/smalltalk/ci/(watch|pull-request)/([0-9]+)$ ]]; then
     number=${BASH_REMATCH[2]}
     if [[ -f $state/watch/$number/baseline-head &&
@@ -402,6 +427,7 @@ macos_remote() {
 
 case ${1:-} in
   register) register_source "${2:?exact discovery source}" ;;
+  retire-legacy-watchers) retire_legacy_watchers ;;
   register-number) register_number "${2:?pull number}" "${3:-run}" ;;
   initial) initial "${2:?pull number}" "${3:-run}" ;;
   linux) linux "${2:?exact source}" ;;

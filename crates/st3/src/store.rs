@@ -1225,7 +1225,7 @@ fn discovered_collection_items(
                 );
                 facts.insert("merged".into(), Value::Bool(false));
                 if let Some(head) = item.get("head").filter(|head| !head.is_null()) {
-                    facts.insert("head".into(), head.clone());
+                    facts.insert("head_sha".into(), head.clone());
                 }
             }
             Some((
@@ -33901,9 +33901,19 @@ mission "review-guardrail" state="ready" {
         assert_eq!(changes.len(), 1);
         assert_eq!(changes[0].0, "resource/github/acme/demo/pull-request/4");
         assert_eq!(
-            changes[0].2["head"],
+            changes[0].2["head_sha"],
             "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
         );
+        let facts = changes[0]
+            .2
+            .as_object()
+            .unwrap()
+            .iter()
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect();
+        st3_schema::registry()
+            .validate_resource_facts("vcs.pull-request", &facts)
+            .unwrap();
         assert!(
             discovered_collection_items(
                 "resource/github/acme/demo",

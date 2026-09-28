@@ -755,6 +755,7 @@ fn resource_specs() -> BTreeMap<String, ResourceSpec> {
                 ("title", string()),
                 ("author", string()),
                 ("head", reference()),
+                ("head_sha", string()),
                 ("base", reference()),
                 ("state", string()),
                 ("draft", boolean()),
