@@ -1,0 +1,12 @@
+RUNNING MISSIONS
+  mission/atlas: build → review  (1 done)
+STANDING QUEUES
+  agent/orbit/standing: current step-run/atlas/build · next step-run/boron/check · waiting mission-run/boron/1
+UNSTARTED MISSIONS
+  cedar
+AGENTS BY HOST
+  host/orbit
+    standing
+      orbit/standing  codex / gpt-6-sol / medium  working
+    mission
+      orbit/mission  claude / sonnet / high  idle
