@@ -3,7 +3,7 @@ on:
   pull_request:
   push:
     branches: [main]
-    tags: ['v*']
+    tags: ['**']
 
 concurrency:
   group: nix-${{ github.workflow }}-${{ github.ref }}
