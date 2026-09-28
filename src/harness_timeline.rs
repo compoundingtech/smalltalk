@@ -1009,7 +1009,7 @@ fn normalize_body(entry_type: EntryType, source_id: &str, value: Value) -> (Valu
                 "cost",
                 "currency",
             ] {
-                if let Some(value) = value.get(key) {
+                if let Some(value) = value.get(key).filter(|value| !value.is_null()) {
                     body.insert(key.into(), value.clone());
                 }
             }
