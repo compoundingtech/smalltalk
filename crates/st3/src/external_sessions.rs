@@ -2,8 +2,6 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fs::{self, File};
 use std::io::{BufRead as _, BufReader, Seek as _, SeekFrom};
 use std::path::{Path, PathBuf};
-#[cfg(not(target_os = "linux"))]
-use std::process::Command;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -876,7 +874,7 @@ fn linux_processes() -> Result<Vec<ProcessCandidate>> {
 
 #[cfg(not(target_os = "linux"))]
 fn ps_processes() -> Result<Vec<ProcessCandidate>> {
-    let output = Command::new("ps")
+    let output = crate::environment::command("ps")?
         .args(["-axo", "pid=,ppid=,lstart=,command="])
         .output()
         .context("list local harness processes")?;
@@ -923,7 +921,8 @@ fn ps_processes() -> Result<Vec<ProcessCandidate>> {
 
 #[cfg(not(target_os = "linux"))]
 fn process_cwd_from_lsof(pid: u32) -> Option<PathBuf> {
-    let output = Command::new("lsof")
+    let output = crate::environment::command("lsof")
+        .ok()?
         .args(["-a", "-p", &pid.to_string(), "-d", "cwd", "-Fn"])
         .output()
         .ok()?;
