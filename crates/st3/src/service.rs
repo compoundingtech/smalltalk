@@ -88,6 +88,17 @@ impl ServiceSpec {
         if let Some(pty_root) = &self.config.pty_root {
             arguments.extend(["--pty-root".into(), pty_root.display().to_string()]);
         }
+        self.push_fleet_arguments(&mut arguments);
+        arguments
+    }
+
+    /// A config-peer node bakes its peers into the unit, as before. A fleet member reads
+    /// `fleet.toml` and membership at run time, so its units carry no peer, fleet, or secret
+    /// arguments and never need reinstalling when membership changes.
+    fn push_fleet_arguments(&self, arguments: &mut Vec<String>) {
+        if self.config.fleet.is_some() {
+            return;
+        }
         if let Some(peer_listen) = &self.config.peer_listen {
             arguments.extend(["--peer-listen".into(), peer_listen.clone()]);
         }
@@ -100,7 +111,6 @@ impl ServiceSpec {
         if let Some(secret) = &self.config.shared_secret_file {
             arguments.extend(["--shared-secret-file".into(), secret.display().to_string()]);
         }
-        arguments
     }
 
     fn replication_program_arguments(&self) -> Vec<String> {
@@ -114,18 +124,7 @@ impl ServiceSpec {
             "--socket".into(),
             self.config.socket.display().to_string(),
         ];
-        if let Some(peer_listen) = &self.config.peer_listen {
-            arguments.extend(["--peer-listen".into(), peer_listen.clone()]);
-        }
-        for peer in &self.config.peers {
-            arguments.extend(["--peer".into(), format!("{}={}", peer.name, peer.url)]);
-        }
-        if let Some(fleet_id) = &self.config.fleet_id {
-            arguments.extend(["--fleet-id".into(), fleet_id.clone()]);
-        }
-        if let Some(secret) = &self.config.shared_secret_file {
-            arguments.extend(["--shared-secret-file".into(), secret.display().to_string()]);
-        }
+        self.push_fleet_arguments(&mut arguments);
         arguments
     }
 }
@@ -955,6 +954,48 @@ fn systemd_quote_arg(argument: &str) -> String {
 mod tests {
     use super::*;
     use crate::config::PeerConfig;
+
+    #[test]
+    fn membership_units_carry_no_peer_fleet_or_secret_arguments() -> Result<()> {
+        let config = Config {
+            node: "node-a".into(),
+            fleet_id: Some("1f91ca65-7793-48cc-866e-ac15690130e1".into()),
+            shared_secret_file: Some("/var/lib/st3/fleet/secret".into()),
+            state_dir: "/var/lib/st3".into(),
+            socket: "/run/user/1000/st3.sock".into(),
+            client_gateway_socket: "/run/user/1000/st3-client.sock".into(),
+            peer_listen: Some("127.0.0.1:31313".into()),
+            peers: vec![PeerConfig {
+                name: "node-b".into(),
+                url: "http://127.0.0.1:31314".into(),
+            }],
+            fleet: Some(crate::config::FleetFile {
+                fleet_id: "1f91ca65-7793-48cc-866e-ac15690130e1".into(),
+                port: Some(31313),
+                ..Default::default()
+            }),
+            ..Config::default()
+        };
+        let spec = ServiceSpec::new("/usr/bin/st3", config, 1024)?;
+        for unit in [
+            render_systemd_user_unit(&spec),
+            render_systemd_replication_unit(&spec),
+            render_launchd_plist(&spec),
+            render_launchd_replication_plist(&spec),
+        ] {
+            for argument in [
+                "--peer",
+                "--peer-listen",
+                "--fleet-id",
+                "--shared-secret-file",
+                "fleet/secret",
+            ] {
+                assert!(!unit.contains(argument), "{argument} in {unit}");
+            }
+            assert!(unit.contains("--state-dir"));
+        }
+        Ok(())
+    }
 
     #[test]
     fn unit_bakes_the_effective_config_and_limit() -> Result<()> {

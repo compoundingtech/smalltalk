@@ -398,6 +398,10 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
             post(replication_peer_failure),
         )
         .route("/v1/internal/fleet/membership", get(fleet_membership_view))
+        .route(
+            "/v1/internal/fleet/endpoints",
+            post(fleet_publish_endpoints),
+        )
         .route("/v1/internal/replication-wake", post(replication_wake))
         .route("/v1/evals", post(start_eval))
         .route("/v1/evals/{*run}", get(get_eval))
@@ -3295,7 +3299,7 @@ fn doctor_report(state: &AppState) -> Result<Json<DoctorReport>, ApiError> {
     match state.store.replication_status(
         state.fleet_id.is_some(),
         state.fleet_id.as_deref(),
-        &state.configured_peers,
+        &replication_peer_names(&state),
     ) {
         Ok(replication) if !replication.configured => checks.push(DoctorCheck {
             name: "replication".into(),
@@ -3425,7 +3429,7 @@ async fn replication_status(
     let store = state.store.clone();
     let configured = state.fleet_id.is_some();
     let fleet = state.fleet_id.clone();
-    let peers = state.configured_peers.clone();
+    let peers = replication_peer_names(&state);
     blocking_store(move || store.replication_status(configured, fleet.as_deref(), &peers))
         .await
         .map(Json)
@@ -3526,9 +3530,14 @@ async fn replication_receive(
             &request.fleet_id,
             &request.exchange,
         )?;
-        store
-            .record_transport_observation(&request.peer, "up", None, None)
-            .map_err(|error| St3Error::new("internal", error.to_string()))?;
+        if store
+            .observes_transport_to(&request.peer)
+            .map_err(|error| St3Error::new("internal", error.to_string()))?
+        {
+            store
+                .record_transport_observation(&request.peer, "up", None, None)
+                .map_err(|error| St3Error::new("internal", error.to_string()))?;
+        }
         let (admission, repairs, projected) =
             if replication_receive_has_new_data(receipt.received + receipt.signatures) {
                 let admission = store
@@ -3590,12 +3599,14 @@ async fn replication_peer_failure(
     let changed = blocking_store(move || {
         let before_index = store.index()?;
         store.record_peer_failure(&request.peer, &request.status, &request.error)?;
-        store.record_transport_observation(
-            &request.peer,
-            &request.status,
-            Some(&request.error),
-            None,
-        )?;
+        if store.observes_transport_to(&request.peer)? {
+            store.record_transport_observation(
+                &request.peer,
+                &request.status,
+                Some(&request.error),
+                None,
+            )?;
+        }
         Ok(store.index()? != before_index)
     })
     .await?;
@@ -3603,6 +3614,53 @@ async fn replication_peer_failure(
         signal_changed(&state);
     }
     Ok(Json(json!({ "recorded": true, "changed": changed })))
+}
+
+#[derive(Deserialize, Serialize)]
+pub struct FleetEndpointsRequest {
+    pub mode: String,
+    pub endpoints: Vec<Value>,
+}
+
+async fn fleet_publish_endpoints(
+    State(state): State<AppState>,
+    Json(request): Json<FleetEndpointsRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let store = state.store.clone();
+    let written = blocking_store(move || {
+        store.publish_fleet_endpoints(&request.mode, &request.endpoints, env!("CARGO_PKG_VERSION"))
+    })
+    .await?;
+    if written {
+        signal_changed(&state);
+    }
+    Ok(Json(json!({ "published": written })))
+}
+
+/// The peers a node reports on: its config peers and the current listening members it dials.
+/// A dial-out member is never dialed, and an ended name is history, so neither is reported.
+fn replication_peer_names(state: &AppState) -> Vec<String> {
+    let view = state.store.fleet_view().unwrap_or_default();
+    let mut names = state
+        .configured_peers
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    names.extend(
+        view.members
+            .iter()
+            .filter(|member| member.state == "current" && member.mode == "listening")
+            .map(|member| member.name.clone()),
+    );
+    names.retain(|name| {
+        let current = view.current(name);
+        let ended = view.members.iter().any(|member| member.name == *name) && current.is_empty();
+        *name != state.node
+            && !ended
+            && !view.legacy_removed.contains(name)
+            && current.iter().all(|member| member.mode != "dial-out")
+    });
+    names.into_iter().collect()
 }
 
 async fn fleet_membership_view(

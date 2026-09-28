@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
@@ -15,6 +15,7 @@ use axum::routing::post;
 use hmac::{Hmac, Mac as _};
 use notify::Watcher as _;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use sha2::{Digest as _, Sha256};
 use tokio::net::TcpListener;
 use tokio::sync::watch;
@@ -483,6 +484,8 @@ struct PeerState {
 #[derive(Clone)]
 struct FleetContext {
     view: Arc<std::sync::RwLock<FleetView>>,
+    /// Bumped whenever the view changes, so the dial set follows membership.
+    view_changed: watch::Sender<u64>,
     config_peers: BTreeSet<String>,
     /// True on a node without `fleet.toml`, or with `legacy_peers = true`.
     legacy: bool,
@@ -500,6 +503,7 @@ impl FleetContext {
     fn legacy(config_peers: BTreeSet<String>) -> Self {
         Self {
             view: Arc::default(),
+            view_changed: watch::channel(0).0,
             config_peers,
             legacy: true,
             own_key: None,
@@ -654,6 +658,27 @@ impl PeerBackend {
         }
     }
 
+    async fn publish_endpoints(&self, mode: &str, endpoints: &[Value]) -> Result<()> {
+        match self {
+            Self::Main(client) => {
+                let _: Value = client
+                    .post(
+                        "/v1/internal/fleet/endpoints",
+                        &crate::api::FleetEndpointsRequest {
+                            mode: mode.into(),
+                            endpoints: endpoints.to_vec(),
+                        },
+                    )
+                    .await?;
+                Ok(())
+            }
+            #[cfg(test)]
+            Self::Local(store) => store
+                .publish_fleet_endpoints(mode, endpoints, "test")
+                .map(|_| ()),
+        }
+    }
+
     async fn fleet_view(&self) -> Result<FleetView> {
         match self {
             Self::Main(client) => client.get("/v1/internal/fleet/membership").await,
@@ -705,6 +730,7 @@ pub async fn run_worker(config: Config) -> Result<()> {
     let auth = FleetAuth::load(fleet_id, secret_file)?.with_member_key(member_key.clone());
     let fleet = FleetContext {
         view: Arc::default(),
+        view_changed: watch::channel(0).0,
         config_peers: config.peers.iter().map(|peer| peer.name.clone()).collect(),
         legacy: config.fleet.as_ref().is_none_or(|file| file.legacy_peers),
         own_key: member_key.as_ref().map(|key| key.public().to_owned()),
@@ -752,7 +778,7 @@ pub async fn run_worker(config: Config) -> Result<()> {
         outbound_notify: notify.clone(),
     };
     start_outbound(
-        backend,
+        backend.clone(),
         config.node.clone(),
         config.peers,
         auth,
@@ -760,6 +786,13 @@ pub async fn run_worker(config: Config) -> Result<()> {
         config.socket,
         notify,
     );
+    if let Some(file) = &config.fleet {
+        tokio::spawn(keep_endpoints_published(
+            backend.clone(),
+            file.mode.as_str(),
+            advertised_endpoints(file, config.peer_listen.as_deref()),
+        ));
+    }
     // A dial-out member accepts no connections.
     let Some(address) = config.peer_listen.as_deref() else {
         std::future::pending::<()>().await;
@@ -775,8 +808,73 @@ pub async fn run_worker(config: Config) -> Result<()> {
 
 async fn refresh_fleet_view(backend: &PeerBackend, fleet: &FleetContext) {
     if let Ok(view) = backend.fleet_view().await {
-        *fleet.view.write().expect("fleet view lock poisoned") = view;
+        let mut current = fleet.view.write().expect("fleet view lock poisoned");
+        if *current != view {
+            *current = view;
+            fleet
+                .view_changed
+                .send_modify(|generation| *generation = generation.wrapping_add(1));
+        }
     }
+}
+
+/// The endpoints this member announces. Tailscale and Fabric endpoints join these in the
+/// transport pull request; a loopback endpoint is announced only when asked for.
+fn advertised_endpoints(file: &crate::config::FleetFile, peer_listen: Option<&str>) -> Vec<Value> {
+    match (file.mode, peer_listen) {
+        (crate::config::FleetMode::Listening, Some(address)) if file.advertise_loopback => {
+            vec![serde_json::json!({"transport": "loopback", "address": address})]
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// Announce this member's mode and endpoints, and repeat every minute; the daemon writes a
+/// claim only when they change.
+async fn keep_endpoints_published(backend: PeerBackend, mode: &'static str, endpoints: Vec<Value>) {
+    loop {
+        let _ = backend.publish_endpoints(mode, &endpoints).await;
+        tokio::time::sleep(Duration::from_secs(60)).await;
+    }
+}
+
+/// Who this node dials, and the loopback URLs that reach each, most preferred first: every
+/// current listening member other than itself, and every config peer that has never been a
+/// member. A dial-out member is never dialed. A config peer entry for a member is that
+/// member's first route from this machine.
+fn dial_targets(
+    view: &FleetView,
+    own: &str,
+    config_peers: &[PeerConfig],
+) -> BTreeMap<String, Vec<String>> {
+    let mut targets = BTreeMap::new();
+    for member in &view.members {
+        if member.name == own || member.state != "current" || member.mode != "listening" {
+            continue;
+        }
+        let mut routes = config_peers
+            .iter()
+            .filter(|peer| peer.name == member.name)
+            .map(|peer| peer.url.clone())
+            .collect::<Vec<_>>();
+        routes.extend(member.endpoints.iter().filter_map(|endpoint| {
+            (endpoint["transport"] == "loopback")
+                .then(|| endpoint["address"].as_str())
+                .flatten()
+                .map(|address| format!("http://{address}"))
+        }));
+        if !routes.is_empty() {
+            targets.insert(member.name.clone(), routes);
+        }
+    }
+    for peer in config_peers {
+        let known = view.members.iter().any(|member| member.name == peer.name)
+            || view.legacy_removed.contains(&peer.name);
+        if !known && peer.name != own {
+            targets.insert(peer.name.clone(), vec![peer.url.clone()]);
+        }
+    }
+    targets
 }
 
 /// Reread membership on every graph change and at least every 30 seconds.
@@ -1029,75 +1127,147 @@ async fn wait_for_main_daemon(socket: &Path) {
 fn start_outbound(
     backend: PeerBackend,
     node: String,
-    peers: Vec<PeerConfig>,
+    config_peers: Vec<PeerConfig>,
     auth: FleetAuth,
     fleet: FleetContext,
     main_socket: PathBuf,
     notify: watch::Sender<u64>,
 ) {
-    for peer in peers {
-        // Retain the connection pool across both phases and later wakeups for this peer.
-        let mut http = replication_http_client();
-        let backend = backend.clone();
-        let node = node.clone();
-        let auth = auth.clone();
-        let fleet = fleet.clone();
-        let main_socket = main_socket.clone();
-        let mut notify = notify.subscribe();
-        tokio::spawn(async move {
-            let mut backoff = Duration::from_secs(1);
-            loop {
-                // A removed node stops dialing; `st3 doctor` says what to do next.
-                if fleet.is_removed() {
-                    tokio::time::sleep(Duration::from_secs(60)).await;
+    // One dialer per target. Targets follow membership: a new listening member gets a dialer,
+    // and a member that ends or turns dial-out loses its dialer.
+    tokio::spawn(async move {
+        let mut view_changes = fleet.view_changed.subscribe();
+        let mut dialers: BTreeMap<
+            String,
+            (
+                Arc<std::sync::RwLock<Vec<String>>>,
+                tokio::task::JoinHandle<()>,
+            ),
+        > = BTreeMap::new();
+        loop {
+            let targets = {
+                let view = fleet.view.read().expect("fleet view lock poisoned");
+                dial_targets(&view, &node, &config_peers)
+            };
+            dialers.retain(|name, (_, task)| {
+                let keep = targets.contains_key(name);
+                if !keep {
+                    task.abort();
+                }
+                keep
+            });
+            for (name, routes) in targets {
+                if let Some((current, _)) = dialers.get(&name) {
+                    *current.write().expect("route lock poisoned") = routes;
                     continue;
                 }
-                match exchange(&http, &backend, &node, &peer, &auth, &fleet, &main_socket).await {
-                    Ok(moved) => {
-                        backoff = Duration::from_secs(1);
-                        // A busy harness can write several observations while one exchange is
-                        // in flight. Keep the first exchange immediate, then coalesce the
-                        // resulting wake burst without disabling the 30-second retry path.
-                        // The window stays short so a publish is startable on every peer
-                        // within seconds.
-                        let not_before = tokio::time::Instant::now() + REPLICATION_WAKE_COALESCE;
-                        if moved {
-                            // One exchange carries a bounded batch. Keep going while envelopes
-                            // still move instead of leaving the rest of a backlog to the timer.
-                            notify.borrow_and_update();
-                        } else {
-                            tokio::select! {
-                                _ = notify.changed() => {}
-                                _ = tokio::time::sleep(Duration::from_secs(30)) => {}
-                            }
-                        }
-                        tokio::time::sleep_until(not_before).await;
-                    }
-                    Err(error) => {
-                        if let Some(removed) = error.downcast_ref::<RemovedFromFleet>() {
-                            fleet.mark_removed(&peer.name, &removed.code);
-                            continue;
-                        }
-                        // A peer can leave an HTTP stream open without making progress. Once
-                        // that exchange times out, discard the pooled connection so the next
-                        // attempt opens a fresh stream through the Fabric dial.
-                        http = replication_http_client();
-                        let status = if error.to_string().contains("signature")
-                            || error.to_string().contains("fleet")
-                        {
-                            "auth-failed"
-                        } else {
-                            "down"
-                        };
-                        let _ = backend
-                            .record_failure(&peer.name, status, &error.to_string())
-                            .await;
-                        tokio::time::sleep(backoff).await;
-                        backoff = (backoff * 2).min(Duration::from_secs(30));
+                let routes = Arc::new(std::sync::RwLock::new(routes));
+                let task = tokio::spawn(dial_peer(
+                    backend.clone(),
+                    node.clone(),
+                    name.clone(),
+                    routes.clone(),
+                    auth.clone(),
+                    fleet.clone(),
+                    main_socket.clone(),
+                    notify.subscribe(),
+                ));
+                dialers.insert(name, (routes, task));
+            }
+            tokio::select! {
+                changed = view_changes.changed() => {
+                    if changed.is_err() {
+                        return;
                     }
                 }
+                _ = tokio::time::sleep(Duration::from_secs(30)) => {}
             }
-        });
+        }
+    });
+}
+
+/// Exchange with one peer for as long as it stays a target, trying its routes in order.
+#[allow(clippy::too_many_arguments)]
+async fn dial_peer(
+    backend: PeerBackend,
+    node: String,
+    name: String,
+    routes: Arc<std::sync::RwLock<Vec<String>>>,
+    auth: FleetAuth,
+    fleet: FleetContext,
+    main_socket: PathBuf,
+    mut notify: watch::Receiver<u64>,
+) {
+    // Retain the connection pool across both phases and later wakeups for this peer.
+    let mut http = replication_http_client();
+    let mut backoff = Duration::from_secs(1);
+    let mut route = 0_usize;
+    loop {
+        // A removed node stops dialing; `st3 doctor` says what to do next.
+        if fleet.is_removed() {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            continue;
+        }
+        let url = {
+            let routes = routes.read().expect("route lock poisoned");
+            if routes.is_empty() {
+                None
+            } else {
+                Some(routes[route % routes.len()].clone())
+            }
+        };
+        let Some(url) = url else {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            continue;
+        };
+        let peer = PeerConfig {
+            name: name.clone(),
+            url,
+        };
+        match exchange(&http, &backend, &node, &peer, &auth, &fleet, &main_socket).await {
+            Ok(moved) => {
+                backoff = Duration::from_secs(1);
+                // A busy harness can write several observations while one exchange is in
+                // flight. Keep the first exchange immediate, then coalesce the resulting wake
+                // burst without disabling the 30-second retry path. The window stays short so a
+                // publish is startable on every peer within seconds.
+                let not_before = tokio::time::Instant::now() + REPLICATION_WAKE_COALESCE;
+                if moved {
+                    // One exchange carries a bounded batch. Keep going while envelopes still
+                    // move instead of leaving the rest of a backlog to the timer.
+                    notify.borrow_and_update();
+                } else {
+                    tokio::select! {
+                        _ = notify.changed() => {}
+                        _ = tokio::time::sleep(Duration::from_secs(30)) => {}
+                    }
+                }
+                tokio::time::sleep_until(not_before).await;
+            }
+            Err(error) => {
+                if let Some(removed) = error.downcast_ref::<RemovedFromFleet>() {
+                    fleet.mark_removed(&peer.name, &removed.code);
+                    continue;
+                }
+                // A peer can leave an HTTP stream open without making progress. Once that
+                // exchange times out, discard the pooled connection so the next attempt opens
+                // a fresh stream, and try the next route.
+                http = replication_http_client();
+                route = route.wrapping_add(1);
+                let status = if error.to_string().contains("signature")
+                    || error.to_string().contains("fleet")
+                {
+                    "auth-failed"
+                } else {
+                    "down"
+                };
+                let _ = backend
+                    .record_failure(&peer.name, status, &error.to_string())
+                    .await;
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(Duration::from_secs(30));
+            }
+        }
     }
 }
 
@@ -2190,6 +2360,68 @@ mod tests {
         );
     }
 
+    #[test]
+    fn the_dial_set_comes_from_membership_and_skips_dial_out_members() {
+        let member =
+            |name: &str, state: &str, mode: &str, endpoints: Vec<Value>| crate::fleet::MemberView {
+                name: name.into(),
+                member_key: format!("{name}-key"),
+                state: state.into(),
+                mode: mode.into(),
+                endpoints,
+                start: 1,
+                end: None,
+                ended: None,
+            };
+        let loopback = |port: u16| {
+            vec![
+                serde_json::json!({"transport": "loopback", "address": format!("127.0.0.1:{port}")}),
+            ]
+        };
+        let view = FleetView {
+            anchor: Some("a-key".into()),
+            members: vec![
+                member("a", "current", "listening", loopback(1)),
+                member("server", "current", "listening", loopback(2)),
+                member("laptop", "current", "dial-out", Vec::new()),
+                member("gone", "ended", "listening", loopback(3)),
+                member("quiet", "current", "listening", Vec::new()),
+            ],
+            legacy_removed: vec!["old".into()],
+        };
+        let config = |name: &str, port: u16| PeerConfig {
+            name: name.into(),
+            url: format!("http://127.0.0.1:{port}"),
+        };
+        let targets = dial_targets(
+            &view,
+            "a",
+            &[
+                config("server", 9002),
+                config("laptop", 9003),
+                config("gone", 9004),
+                config("old", 9005),
+                config("legacy", 9006),
+            ],
+        );
+        assert_eq!(
+            targets,
+            BTreeMap::from([
+                (
+                    "server".to_owned(),
+                    vec![
+                        "http://127.0.0.1:9002".to_owned(),
+                        "http://127.0.0.1:2".to_owned()
+                    ]
+                ),
+                (
+                    "legacy".to_owned(),
+                    vec!["http://127.0.0.1:9006".to_owned()]
+                ),
+            ])
+        );
+    }
+
     fn fleet_claim(store: &Store, kind: &str, subject: &str, fields: Value) {
         store
             .append_claim(&ClaimInput {
@@ -2213,6 +2445,7 @@ mod tests {
     ) -> FleetContext {
         FleetContext {
             view: Arc::new(std::sync::RwLock::new(store.fleet_view().unwrap())),
+            view_changed: watch::channel(0).0,
             config_peers: config_peers.iter().map(|peer| (*peer).into()).collect(),
             legacy,
             own_key: Some(own.public().into()),
