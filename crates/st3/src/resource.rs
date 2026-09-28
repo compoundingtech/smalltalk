@@ -1082,10 +1082,11 @@ mod tests {
             fields: BTreeSet::from(["issues".into()]),
             cursor: None,
             previous_facts: None,
+            every_ms: None,
         };
         let observed = tokio::time::timeout(
             Duration::from_secs(10),
-            observe_github_repository_at(request, &base, None),
+            observe_github_repository_at(request, &base, Some("test")),
         )
         .await
         .expect("the request did not time out");
