@@ -12,6 +12,7 @@ use crate::model::PlannerSpec;
 #[serde(deny_unknown_fields)]
 pub struct PeerConfig {
     pub name: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub url: String,
 }
 
@@ -423,10 +424,8 @@ impl Config {
             );
         }
         anyhow::ensure!(
-            self.peers
-                .iter()
-                .all(|peer| !peer.name.is_empty() && !peer.url.is_empty()),
-            "each peer needs a name and URL"
+            self.peers.iter().all(|peer| !peer.name.is_empty()),
+            "each peer needs a name"
         );
         let mut names = std::collections::HashSet::new();
         for peer in &self.peers {
@@ -436,6 +435,9 @@ impl Config {
                 "peer '{}' uses the local node label",
                 peer.name
             );
+            if peer.url.is_empty() {
+                continue;
+            }
             let url = reqwest::Url::parse(&peer.url)
                 .with_context(|| format!("parse peer URL for '{}'", peer.name))?;
             anyhow::ensure!(
@@ -563,6 +565,20 @@ mod tests {
         config.peer_listen = Some("127.0.0.1:31313".into());
         config.validate().unwrap();
         config.peer_listen = Some("[::1]:31313".into());
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn a_named_peer_without_a_url_is_valid() {
+        let peer: PeerConfig = toml::from_str("name = 'inbound'").unwrap();
+        assert!(peer.url.is_empty());
+        let config = Config {
+            peer_listen: Some("127.0.0.1:31313".into()),
+            fleet_id: Some("1f91ca65-7793-48cc-866e-ac15690130e1".into()),
+            shared_secret_file: Some("/tmp/st3-test-secret".into()),
+            peers: vec![peer],
+            ..Config::default()
+        };
         config.validate().unwrap();
     }
 

@@ -30,25 +30,25 @@ use crate::graph::{parse_intent, resolve_document_references};
 use crate::model::{
     ApplyRequest, ApplyResponse, AttachRequest, Attachment, AttentionItemView, AttentionRequest,
     AttentionRequestView, AttentionResolveRequest, AttentionWithdrawRequest, ClaimInput,
-    ClaimRecord, ClaimsPage, ClientPageInfo, ClientResourcePage, ContextClearRequest, DoctorCheck,
-    DoctorReport, DocumentListResponse, DocumentPutRequest, DocumentVersion, EvalStartRequest,
-    EvalStartResponse, EvalStatus, EventRecord, GateResultRequest, HumanReviewView, IntentInput,
-    LaunchApproveAndStartRequest, LaunchApproveAndStartView, LaunchDecisionAnswerRequest,
-    LaunchDecisionOption, LaunchDecisionRequest, LaunchDecisionResponse, LaunchDecisionType,
-    LaunchStartRequest, MAX_EVAL_TIMEOUT_MS, MessageLifecycleRequest, MessagePage,
-    MessageSendRequest, MessageView, MissionOutputView, MissionProductionRequest, MissionRequest,
-    MissionResponse, MissionRevisionRequest, MissionRunRequest, MissionRunView,
-    OperationalRepairApplyRequest, OperationalRepairPlan, OperationalRepairResult, PlannerSpec,
-    PlanningApprovalRequest, PlanningCancelRequest, PlanningCandidateSubmitRequest,
-    PlanningProposalRequest, PlanningRevisionRequest, PlanningSessionStartRequest,
-    PlanningSessionView, QuickAgentRequest, QuickAgentResponse, ReplicaRecordView,
-    ReplicationExportRequest, ReplicationExportResponse, ReplicationPeerFailureRequest,
-    ReplicationReceiveRequest, ReplicationReceiveResponse, ReplicationRepairRequest,
-    ReplicationStatus, ReviewRequest, RevisionApprovalRequest, RevisionCancelRequest,
-    RevisionCutover, RevisionProposalView, RevisionSubmissionView, RunGenerationView,
-    SessionControlResponse, SessionInputMode, SessionInputRequest, SessionLogChunk, SessionScreen,
-    SessionSignalRequest, St3Error, StatusResponse, StepRunView, WorkRequest, WorkRetryRequest,
-    WorkWakeRequest,
+    ClaimRecord, ClaimsPage, ClientPageInfo, ClientResourcePage, ClientSyncNotice, ClientSyncPeer,
+    ContextClearRequest, DoctorCheck, DoctorReport, DocumentListResponse, DocumentPutRequest,
+    DocumentVersion, EvalStartRequest, EvalStartResponse, EvalStatus, EventRecord,
+    GateResultRequest, HumanReviewView, IntentInput, LaunchApproveAndStartRequest,
+    LaunchApproveAndStartView, LaunchDecisionAnswerRequest, LaunchDecisionOption,
+    LaunchDecisionRequest, LaunchDecisionResponse, LaunchDecisionType, LaunchStartRequest,
+    MAX_EVAL_TIMEOUT_MS, MessageLifecycleRequest, MessagePage, MessageSendRequest, MessageView,
+    MissionOutputView, MissionProductionRequest, MissionRequest, MissionResponse,
+    MissionRevisionRequest, MissionRunRequest, MissionRunView, OperationalRepairApplyRequest,
+    OperationalRepairPlan, OperationalRepairResult, PlannerSpec, PlanningApprovalRequest,
+    PlanningCancelRequest, PlanningCandidateSubmitRequest, PlanningProposalRequest,
+    PlanningRevisionRequest, PlanningSessionStartRequest, PlanningSessionView, QuickAgentRequest,
+    QuickAgentResponse, ReplicaRecordView, ReplicationExportRequest, ReplicationExportResponse,
+    ReplicationPeerFailureRequest, ReplicationReceiveRequest, ReplicationReceiveResponse,
+    ReplicationRepairRequest, ReplicationStatus, ReviewRequest, RevisionApprovalRequest,
+    RevisionCancelRequest, RevisionCutover, RevisionProposalView, RevisionSubmissionView,
+    RunGenerationView, SessionControlResponse, SessionInputMode, SessionInputRequest,
+    SessionLogChunk, SessionScreen, SessionSignalRequest, St3Error, StatusResponse, StepRunView,
+    WorkRequest, WorkRetryRequest, WorkWakeRequest,
 };
 use crate::store::Store;
 
@@ -191,7 +191,8 @@ impl ApiError {
             | "missing-subject-token"
             | "stale-document-token"
             | "stale-incarnation"
-            | "stale-launch-preview" => StatusCode::CONFLICT,
+            | "stale-launch-preview"
+            | "fleet-leaving" => StatusCode::CONFLICT,
             "launch-review-not-authorized" | "wrong-message-recipient" => StatusCode::FORBIDDEN,
             "internal" => StatusCode::INTERNAL_SERVER_ERROR,
             _ => StatusCode::UNPROCESSABLE_ENTITY,
@@ -289,7 +290,16 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
         .route("/v1/client/history/{*id}", get(client_history_detail))
         .route("/v1/client/sessions", get(client_sessions))
         .route("/v1/client/sessions/{*id}", get(client_sessions_detail))
+        .route(
+            "/v1/client/conversations/{id}/changes",
+            get(client_v0::conversation_changes),
+        )
+        .route(
+            "/v1/client/conversations/{id}/stream",
+            get(client_v0::conversation_stream),
+        )
         .route("/v1/client/missions", get(client_v0::missions))
+        .route("/v1/client/missions-tree", get(client_v0::missions_tree))
         .route("/v1/client/missions/{*id}", get(client_v0::mission_detail))
         .route("/v1/client/runtimes", get(client_v0::runtimes))
         .route("/v1/client/runtimes/{*id}", get(client_v0::runtime_detail))
@@ -408,6 +418,10 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
             post(fleet_invite_revoke),
         )
         .route("/v1/internal/fleet/redeem", post(fleet_redeem))
+        .route("/v1/internal/fleet/remove", post(fleet_remove))
+        .route("/v1/internal/fleet/leave/begin", post(fleet_leave_begin))
+        .route("/v1/internal/fleet/leave/cancel", post(fleet_leave_cancel))
+        .route("/v1/internal/fleet/leave/claim", post(fleet_leave_claim))
         .route(
             "/v1/internal/fleet/endpoints",
             post(fleet_publish_endpoints),
@@ -456,11 +470,12 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
         .route("/v1/sessions/attach/{*subject}", post(attach_session))
         .route("/v1/sessions/{subject}/attach", post(attach_session))
         .route("/v1/sessions/terminal/{*subject}", get(terminal_session));
-    app.layer(from_fn_with_state(
-        (state.clone(), transport),
-        response_envelope,
-    ))
-    .with_state(state)
+    app.layer(from_fn_with_state(state.clone(), refuse_while_leaving))
+        .layer(from_fn_with_state(
+            (state.clone(), transport),
+            response_envelope,
+        ))
+        .with_state(state)
 }
 
 async fn schema() -> Json<Value> {
@@ -931,6 +946,38 @@ fn client_page(
             next_cursor,
             cursor_expires_at: has_more.then(|| client_timestamp(expires_at_unix_ms)),
         },
+        sync: client_sync_notice(state),
+    })
+}
+
+/// A host catching up with a peer can show early history as current, so each page it serves
+/// says so and how far behind it is.
+fn client_sync_notice(state: &AppState) -> Option<ClientSyncNotice> {
+    // Naming the peers reads the fleet view, so skip it on the usual page read.
+    if !state.store.replication_catching_up() {
+        return None;
+    }
+    let peers = state
+        .store
+        .replication_peer_sync(&replication_peer_names(state))
+        .into_iter()
+        .filter(|(_, sync)| sync.catching_up)
+        .map(|(peer, sync)| ClientSyncPeer {
+            host_id: client_host_id(&peer),
+            peer_only_envelopes: sync.peer_only_envelopes,
+            local_only_envelopes: sync.local_only_envelopes,
+            last_exchange_at: state
+                .store
+                .replication_peer_last_success(&peer)
+                .ok()
+                .flatten()
+                .map(client_timestamp),
+            estimated_catch_up_seconds: sync.estimated_catch_up_seconds,
+        })
+        .collect::<Vec<_>>();
+    (!peers.is_empty()).then(|| ClientSyncNotice {
+        state: "catching-up".into(),
+        peers,
     })
 }
 
@@ -1645,12 +1692,12 @@ fn client_attention_actions(kind: &str) -> Vec<&'static str> {
             vec!["mission.approve-revision", "mission.cancel-revision"]
         }
         "unread-message" => vec!["message.read"],
-        "fault" => vec!["attention.resolve"],
+        "fault" | "agent-request" => vec!["attention.resolve"],
         _ => Vec::new(),
     }
 }
 
-/// Both the default and the history view rank a fault by the severity its requester gave.
+/// Both the default and the history view rank a request by the severity its requester gave.
 fn attention_priority(severity: &str) -> &'static str {
     match severity {
         "critical" => "critical",
@@ -1660,7 +1707,7 @@ fn attention_priority(severity: &str) -> &'static str {
     }
 }
 
-/// Beside each fault target, what that target is doing now, so a leftover request is
+/// Beside each request target, what that target is doing now, so a leftover request is
 /// recognizable without opening every target.
 fn insert_attention_target_states(
     store: &Store,
@@ -1698,7 +1745,7 @@ fn client_attention_resources(
     let mut resources = BTreeMap::new();
     for item in &current {
         let id = attention_resource_id(&item.subject);
-        let priority = if item.kind == "fault" {
+        let priority = if matches!(item.kind.as_str(), "fault" | "agent-request") {
             store
                 .attention_request(&item.subject)?
                 .map_or("high", |request| attention_priority(&request.severity))
@@ -1730,7 +1777,12 @@ fn client_attention_resources(
         let object = resource
             .as_object_mut()
             .expect("an attention resource is an object");
-        if item.kind == "fault" && attention_requester_retired(store, item, &mut retired_seats)? {
+        if let Some(requester) = &item.requester_id {
+            object.insert("requester_id".into(), Value::String(requester.clone()));
+        }
+        if matches!(item.kind.as_str(), "fault" | "agent-request")
+            && attention_requester_retired(store, item, &mut retired_seats)?
+        {
             object["operational"]["reasons"] = json!(["requester-retired"]);
         }
         if let Some(mission) = &item.mission {
@@ -1742,7 +1794,7 @@ fn client_attention_resources(
         if let Some(step) = &item.step {
             object.insert("step_run_id".into(), Value::String(step.clone()));
         }
-        if item.kind == "fault" {
+        if matches!(item.kind.as_str(), "fault" | "agent-request") {
             insert_attention_target_states(store, object, &item.targets)?;
         }
         resources.insert(id, resource);
@@ -1757,12 +1809,18 @@ fn client_attention_resources(
                 reasons.push("superseded");
             }
             let id = attention_resource_id(&request.subject);
+            let kind = if crate::store::agent_attention_requester(&request.actor) {
+                "agent-request"
+            } else {
+                "fault"
+            };
             let mut resource = json!({
                     "id": id,
                     "kind": "attention",
-                    "attention_kind": "fault",
+                    "attention_kind": kind,
                     "source_id": request.subject,
                     "person_id": request.reviewer,
+                    "requester_id": request.actor,
                     "revision": request.request,
                     "updated_at": client_timestamp(request.resolved_at_unix_ms.unwrap_or(request.requested_at_unix_ms)),
                     "title": request.title,
@@ -1771,7 +1829,7 @@ fn client_attention_resources(
                     "state": if request.status == "pending" { "open" } else { "resolved" },
                     "requested_at": client_timestamp(request.requested_at_unix_ms),
                     "targets": request.targets,
-                    "actions": if current { client_attention_actions("fault") } else { Vec::<&str>::new() },
+                    "actions": if current { client_attention_actions(kind) } else { Vec::<&str>::new() },
                     "operational": { "layer": if current { "current" } else { "history" }, "actionable": current, "reasons": reasons }
             });
             insert_attention_target_states(
@@ -3614,8 +3672,8 @@ async fn replication_peer_failure(
     let store = state.store.clone();
     let changed = blocking_store(move || {
         let before_index = store.index()?;
-        store.record_peer_failure(&request.peer, &request.status, &request.error)?;
-        if store.observes_transport_to(&request.peer)? {
+        let stale = store.record_peer_failure(&request.peer, &request.status, &request.error)?;
+        if stale && store.observes_transport_to(&request.peer)? {
             store.record_transport_observation(
                 &request.peer,
                 &request.status,
@@ -3940,6 +3998,99 @@ async fn fleet_redeem(
         signal_changed(&state);
     }
     Ok(Json(answer))
+}
+
+#[derive(Deserialize, Serialize)]
+pub struct FleetRemoveRequest {
+    pub name: String,
+    pub reason: String,
+    pub person: String,
+}
+
+#[derive(Deserialize, Serialize)]
+pub struct FleetPersonRequest {
+    pub person: String,
+}
+
+async fn fleet_remove(
+    State(state): State<AppState>,
+    Json(request): Json<FleetRemoveRequest>,
+) -> Result<Json<crate::store::FleetRemoval>, ApiError> {
+    concrete_person(&request.person)?;
+    let store = state.store.clone();
+    let removal = blocking_action(move || {
+        store.remove_fleet_member(&request.name, &request.reason, &request.person)
+    })
+    .await?;
+    signal_changed(&state);
+    Ok(Json(removal))
+}
+
+async fn fleet_leave_begin(
+    State(state): State<AppState>,
+    Json(request): Json<FleetPersonRequest>,
+) -> Result<Json<Value>, ApiError> {
+    concrete_person(&request.person)?;
+    let store = state.store.clone();
+    blocking_store(move || store.set_fleet_leaving(true)).await?;
+    Ok(Json(json!({ "leaving": true })))
+}
+
+/// The body is read and ignored, so the answer never races a client still sending it.
+async fn fleet_leave_cancel(
+    State(state): State<AppState>,
+    _body: axum::body::Bytes,
+) -> Result<Json<Value>, ApiError> {
+    let store = state.store.clone();
+    blocking_store(move || store.set_fleet_leaving(false)).await?;
+    Ok(Json(json!({ "leaving": false })))
+}
+
+async fn fleet_leave_claim(
+    State(state): State<AppState>,
+    Json(request): Json<FleetPersonRequest>,
+) -> Result<Json<ClaimRecord>, ApiError> {
+    concrete_person(&request.person)?;
+    let store = state.store.clone();
+    let claim = blocking_action(move || store.leave_fleet(&request.person)).await?;
+    signal_changed(&state);
+    Ok(Json(claim))
+}
+
+/// While this node leaves its fleet, it refuses every new write except the leave itself and
+/// replication traffic, so the leave stays its writer's last batch.
+async fn refuse_while_leaving(
+    State(state): State<AppState>,
+    request: Request<Body>,
+    next: Next,
+) -> Response {
+    let path = request.uri().path();
+    let mutating =
+        request.method() != axum::http::Method::GET && request.method() != axum::http::Method::HEAD;
+    // Replication keeps running so the drain can finish; it writes no local claims while
+    // leaving, because transport observations stop. Everything else that writes waits,
+    // including invite redemption and endpoint announcements.
+    let allowed = path.starts_with("/v1/internal/fleet/leave/")
+        || matches!(
+            path,
+            "/v1/health"
+                | "/v1/internal/replication/export"
+                | "/v1/internal/replication/receive"
+                | "/v1/internal/replication/peer-failure"
+                | "/v1/internal/replication-wake"
+        );
+    if mutating && !allowed && state.store.fleet_leaving().unwrap_or(false) {
+        // Read the body before refusing: an answer sent while the client is still writing
+        // closes the connection under it, and the client then reports a broken pipe instead
+        // of this refusal.
+        let _ = axum::body::to_bytes(request.into_body(), 1 << 20).await;
+        return ApiError::bad(St3Error::new(
+            "fleet-leaving",
+            "this node is leaving its fleet and accepts no new writes; `st fleet leave --cancel` stops the leave",
+        ))
+        .into_response();
+    }
+    next.run(request).await
 }
 
 async fn fleet_membership_view(
@@ -5956,6 +6107,29 @@ async fn resolve_attention(
         .store
         .resolve_attention(&subject, &request)
         .map_err(ApiError::bad)?;
+    if crate::store::agent_attention_requester(&response.actor) {
+        let content = match response.resolution_reason.as_deref() {
+            Some(reason) if !reason.trim().is_empty() => format!(
+                "Your attention request `{}` was {}. Reason: {}",
+                response.subject, request.outcome, reason
+            ),
+            _ => format!(
+                "Your attention request `{}` was {}.",
+                response.subject, request.outcome
+            ),
+        };
+        send_planning_message(
+            &state,
+            &format!(
+                "attention-resolution:{}:{}",
+                response.request, request.idempotency_key
+            ),
+            &request.actor,
+            &response.actor,
+            &content,
+            "Attention request answered",
+        )?;
+    }
     signal_changed(&state);
     Ok(Json(response))
 }
@@ -6016,6 +6190,14 @@ async fn post_review(
         return Err(ApiError::bad(St3Error::new(
             "invalid-review-decision",
             "a review decision must be approved or rejected",
+        )));
+    }
+    if request.decision == "rejected"
+        && request.reason.as_deref().is_none_or(|reason| reason.trim().is_empty())
+    {
+        return Err(ApiError::bad(St3Error::new(
+            "missing-review-reason",
+            "a rejected review needs a reason",
         )));
     }
     let subject = if subject.starts_with("resource/")
@@ -6100,6 +6282,56 @@ async fn post_review(
             idempotency_key: None,
         })
         .map_err(ApiError::bad)?;
+    if request.decision == "rejected" {
+        if let Some(owner) = review_request
+            .as_ref()
+            .and_then(|claim| claim.body.pointer("/fields/owner"))
+            .and_then(Value::as_str)
+        {
+            if owner.starts_with("step-run/") {
+                let step = state.store.step_run(owner).map_err(ApiError::internal)?;
+                let claimant = if let Some(step) = step {
+                    if step.claimant.is_some() || step.carried_claimant.is_some() {
+                        step.claimant.or(step.carried_claimant)
+                    } else {
+                        state
+                            .store
+                            .claims_for(owner, Some("work.claimed"))
+                            .map_err(ApiError::internal)?
+                            .into_iter()
+                            .rev()
+                            .find(|claim| {
+                                claim.body.pointer("/fields/attempt").and_then(Value::as_u64)
+                                    == Some(u64::from(step.attempt))
+                            })
+                            .and_then(|claim| {
+                                claim.body
+                                    .pointer("/fields/claimant")
+                                    .and_then(Value::as_str)
+                                    .map(str::to_owned)
+                            })
+                    }
+                } else {
+                    None
+                };
+                if let Some(claimant) = claimant {
+                    let reason = response
+                        .body
+                        .pointer("/fields/reason")
+                        .and_then(Value::as_str)
+                        .unwrap_or("No reason provided.");
+                    send_planning_message(
+                        &state,
+                        &format!("review-rejected:{}:{claimant}", response.id),
+                        response.actor.as_deref().unwrap_or("daemon/runtime"),
+                        &claimant,
+                        &format!("Your work on `{owner}` was rejected. Reason: {reason}"),
+                        "Human review rejected",
+                    )?;
+                }
+            }
+        }
+    }
     signal_changed(&state);
     Ok(Json(response))
 }
@@ -13202,9 +13434,14 @@ version 2
         let source = r#"
 version 2
 
+  agent "worker" { workspace "/tmp"; command "true" }
   mission "review-api" state="ready" {
     goal "Complete mission review-api."
-    step "approval" { gate "human-review" type="human" { reviewer "person/nathan" } }
+    step "approval" {
+      goal "Submit the candidate."
+      assigned-to "agent/worker"
+      gate "human-review" type="human" { reviewer "person/nathan" }
+    }
   }
 
 "#;
@@ -13236,6 +13473,42 @@ version 2
             })
             .unwrap();
         let step = &run.steps[0];
+        assert!(!step.agentless, "{step:?}");
+        let claimant = step.assigned_to.clone().expect("the step has an assignee");
+        state
+            .store
+            .set_step_state(&step.subject, "ready", None)
+            .unwrap();
+        state
+            .store
+            .work_action(
+                &step.subject,
+                "claim",
+                &crate::model::WorkRequest {
+                    actor: Some(claimant.clone()),
+                    incarnation: Some("test-incarnation".into()),
+                    summary: None,
+                    reason: None,
+                    evidence: Vec::new(),
+                    idempotency_key: "review-api-claim".into(),
+                },
+            )
+            .unwrap();
+        state
+            .store
+            .work_action(
+                &step.subject,
+                "complete",
+                &crate::model::WorkRequest {
+                    actor: Some(claimant.clone()),
+                    incarnation: Some("test-incarnation".into()),
+                    summary: Some("Candidate submitted for review".into()),
+                    reason: None,
+                    evidence: Vec::new(),
+                    idempotency_key: "review-api-submit".into(),
+                },
+            )
+            .unwrap();
         let request_fields = |owner: String, definition: String, operation: &str| {
             BTreeMap::from([
                 ("owner".into(), Value::String(owner)),
@@ -13402,6 +13675,22 @@ version 2
         );
         assert_eq!(accepted_mission["body"]["fields"]["verdict"], "pass");
 
+        let missing_reason = serde_json::to_value(ReviewRequest {
+            decision: "rejected".into(),
+            reason: None,
+            actor: Some("person/nathan".into()),
+            expected_subject: None,
+        })
+        .unwrap();
+        let (status, invalid) = json_request(
+            app.clone(),
+            &format!("/v1/reviews/{}", step.subject),
+            missing_reason,
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{invalid}");
+        assert_eq!(invalid["code"], "missing-review-reason");
+
         let reject = serde_json::to_value(ReviewRequest {
             decision: "rejected".into(),
             reason: Some("the evidence is incomplete".into()),
@@ -13419,15 +13708,20 @@ version 2
         assert_eq!(accepted_step["body"]["fields"]["request"], step_request.id);
         assert_eq!(accepted_step["body"]["fields"]["verdict"], "fail");
         assert_eq!(accepted_step["body"]["evidence"][0], step_request.id);
+        let messages = store.messages(Some(&claimant), false).unwrap();
+        assert_eq!(messages.len(), 1);
+        assert!(messages[0].content.contains("the evidence is incomplete"));
 
         let (_, empty) = get_request(app, "/v1/reviews?reviewer=person%2Fnathan").await;
         assert_eq!(empty, json!([]));
     }
 
     #[tokio::test]
-    async fn attention_routes_request_filter_and_resolve_one_fault() {
+    async fn attention_routes_show_agent_request_and_deliver_resolution_reason() {
         let root = tempfile::tempdir().unwrap();
-        let app = router(state(root.path()));
+        let state = state(root.path());
+        let store = state.store.clone();
+        let app = router(state);
         let request = serde_json::to_value(AttentionRequest {
             reviewer: "nathan".into(),
             title: "Fabric needs review".into(),
@@ -13446,7 +13740,12 @@ version 2
         let (status, selected) = get_request(app.clone(), "/v1/attention?person=nathan").await;
         assert_eq!(status, StatusCode::OK, "{selected}");
         assert_eq!(selected.as_array().unwrap().len(), 1);
-        assert_eq!(selected[0]["kind"], "fault");
+        assert_eq!(selected[0]["kind"], "agent-request");
+        assert_eq!(selected[0]["requester_id"], "agent/fabric/worker");
+        assert_eq!(selected[0]["actions"][0]["label"], "answer");
+        let client = client_attention_resources(&store, Some("person/nathan"), false).unwrap();
+        assert_eq!(client[0]["attention_kind"], "agent-request");
+        assert_eq!(client[0]["requester_id"], "agent/fabric/worker");
         let (_, filtered) =
             get_request(app.clone(), "/v1/attention?person=person%2Fsomeone-else").await;
         assert_eq!(filtered, json!([]));
@@ -13478,11 +13777,22 @@ version 2
         let (status, resolved) = json_request(
             app.clone(),
             &format!("/v1/attention/resolve/{}", urlencoding::encode(subject)),
-            resolution,
+            resolution.clone(),
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{resolved}");
         assert_eq!(resolved["status"], "resolved");
+        let (status, replayed) = json_request(
+            app.clone(),
+            &format!("/v1/attention/resolve/{}", urlencoding::encode(subject)),
+            resolution,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{replayed}");
+        let messages = store.messages(Some("agent/fabric/worker"), false).unwrap();
+        assert_eq!(messages.len(), 1);
+        assert!(messages[0].content.contains("The queue recovered."));
+        assert!(messages[0].content.contains("resolved"));
         let (_, empty) = get_request(app, "/v1/attention?person=nathan").await;
         assert_eq!(empty, json!([]));
     }

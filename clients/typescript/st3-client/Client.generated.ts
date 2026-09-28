@@ -2,7 +2,7 @@
 import { API_VERSION } from './Models.generated';
 import type {
     ActionOf, ActionRequest, ActionResult, AgentQueue, Capabilities, EnvelopeOf,
-    ErrorEnvelope, EventPage, Page, PairingBegin, PairingChallenge,
+    ConversationChanges, ErrorEnvelope, EventPage, Page, PairingBegin, PairingChallenge,
     PairingComplete, PairedSession, Resource, TerminalScreen, TimelinePage,
 } from './Models.generated';
 
@@ -16,6 +16,7 @@ export type ClientOptions = {
 };
 
 export const TERMINAL_SUBPROTOCOL = 'st3.client.terminal.v0';
+export const CONVERSATION_SUBPROTOCOL = 'st3.client.conversation.v0';
 
 /** The WebSocket surface a terminal stream uses. React Native's WebSocket accepts headers. */
 export type TerminalSocket = {
@@ -180,6 +181,30 @@ export class St3Client {
         return { close: () => { if (!ended) { stop(); socket.close(1000); } } };
     }
 
+    async conversationStream(id: string, options: { after?: string; onChange: (change: EnvelopeOf<ConversationChanges>) => void; onEnd?: (error?: Error) => void; socket?: TerminalSocketFactory }): Promise<TerminalStream> {
+        const credential = await this.credential?.();
+        const url = new URL(`${this.baseUrl}/v1/client/conversations/${encodeURIComponent(routedId(id))}/stream`);
+        url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
+        if (options.after) url.searchParams.set('after', options.after);
+        const headers: Record<string, string> = {};
+        if (credential) headers.Authorization = `Bearer ${credential}`;
+        const socket = (options.socket ?? defaultTerminalSocket)(url.toString(), [CONVERSATION_SUBPROTOCOL], headers);
+        let ended = false;
+        const end = (error?: Error) => { if (ended) return; ended = true; socket.onmessage = null; socket.onclose = null; socket.onerror = null; options.onEnd?.(error); };
+        socket.onmessage = event => {
+            try {
+                const payload = JSON.parse(String(event.data)) as EnvelopeOf<ConversationChanges> | ErrorEnvelope;
+                if (!payload || payload.api_version !== API_VERSION) throw new Error('Unexpected st conversation stream message');
+                if ('error_version' in payload) throw new ClientError(payload, 0);
+                if (payload.value?.kind !== 'conversation-changes') throw new Error('A conversation stream message is not a change');
+                options.onChange(payload);
+            } catch (error) { end(error as Error); socket.close(1000); }
+        };
+        socket.onclose = event => end(event.code === 1000 ? undefined : new Error(`The conversation stream closed (${event.code})`));
+        socket.onerror = () => end(new Error('The conversation stream failed'));
+        return { close: () => { if (!ended) { ended = true; socket.close(1000); } } };
+    }
+
     async nowList(options: ListOptions = {}): Promise<EnvelopeOf<Page>> { return this.get('/v1/client/now' + query(options)); }
     async machinesList(options: ListOptions = {}): Promise<EnvelopeOf<Page>> { return this.get('/v1/client/machines' + query(options)); }
     async devicesList(options: ListOptions = {}): Promise<EnvelopeOf<Page>> { return this.get('/v1/client/devices' + query(options)); }
@@ -209,6 +234,7 @@ export class St3Client {
     async sessionsList(options: ListOptions = {}): Promise<EnvelopeOf<Page>> { return this.get('/v1/client/sessions' + query(options)); }
     async sessionsGet(id: string): Promise<EnvelopeOf<Resource>> { return this.get(`/v1/client/sessions/${encodeURIComponent(routedId(id))}`); }
     async timelineList(id: string, options: PageOptions = {}): Promise<EnvelopeOf<TimelinePage>> { return this.get(`/v1/client/sessions/${encodeURIComponent(routedId(id))}/timeline` + query(options)); }
+    async conversationChanges(id: string, options: { after?: string; wait_ms?: number } = {}): Promise<EnvelopeOf<ConversationChanges>> { return this.get(`/v1/client/conversations/${encodeURIComponent(routedId(id))}/changes` + query(options)); }
     async eventsList(options: EventOptions = {}): Promise<EnvelopeOf<EventPage>> { return this.get('/v1/client/events' + query(options), 'events'); }
     async terminalScreen(id: string): Promise<EnvelopeOf<TerminalScreen>> { return this.get(`/v1/client/terminals/${encodeURIComponent(routedId(id))}/screen`); }
     async agentQueueMove(input: Omit<ActionOf<'agent.queue-move'>, 'api_version' | 'type'>): Promise<EnvelopeOf<ActionResult>> { return this.submitAction({ ...input, api_version: API_VERSION, type: 'agent.queue-move' } as ActionOf<'agent.queue-move'>); }

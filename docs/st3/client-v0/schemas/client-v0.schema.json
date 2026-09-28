@@ -51,6 +51,7 @@
             { "$ref": "#/$defs/Page" },
             { "$ref": "#/$defs/Resource" },
             { "$ref": "#/$defs/TimelinePage" },
+            { "$ref": "#/$defs/ConversationChanges" },
             { "$ref": "#/$defs/EventPage" },
             { "$ref": "#/$defs/ActionResult" },
             { "$ref": "#/$defs/PairingChallenge" },
@@ -716,7 +717,29 @@
         "collection": { "type": "string" },
         "filters": { "type": "object", "additionalProperties": { "type": "string" } },
         "items": { "type": "array", "items": { "$ref": "#/$defs/Resource" } },
-        "page": { "$ref": "#/$defs/PageInfo" }
+        "page": { "$ref": "#/$defs/PageInfo" },
+        "sync": { "$ref": "#/$defs/SyncNotice" }
+      }
+    },
+    "SyncNotice": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["state", "peers"],
+      "properties": {
+        "state": { "enum": ["catching-up"] },
+        "peers": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/SyncPeer" } }
+      }
+    },
+    "SyncPeer": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["host_id", "peer_only_envelopes", "local_only_envelopes"],
+      "properties": {
+        "host_id": { "$ref": "#/$defs/Id" },
+        "peer_only_envelopes": { "type": "integer", "minimum": 0 },
+        "local_only_envelopes": { "type": "integer", "minimum": 0 },
+        "last_exchange_at": { "oneOf": [{ "$ref": "#/$defs/Timestamp" }, { "type": "null" }] },
+        "estimated_catch_up_seconds": { "type": ["integer", "null"], "minimum": 0 }
       }
     },
     "TimelineEntry": {
@@ -820,6 +843,16 @@
         "session_id": { "$ref": "#/$defs/Id" },
         "items": { "type": "array", "items": { "$ref": "#/$defs/TimelineEntry" } },
         "page": { "$ref": "#/$defs/PageInfo" }
+      }
+    },
+    "ConversationChanges": {
+      "type": "object", "additionalProperties": false,
+      "required": ["kind", "session_id", "items", "next_cursor"],
+      "properties": {
+        "kind": { "const": "conversation-changes" },
+        "session_id": { "$ref": "#/$defs/Id" },
+        "items": { "type": "array", "maxItems": 200, "items": { "$ref": "#/$defs/TimelineEntry" } },
+        "next_cursor": { "$ref": "#/$defs/Cursor" }
       }
     },
     "ProjectionEvent": {
