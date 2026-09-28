@@ -242,7 +242,12 @@ pub struct AgentDetails {
 pub enum Word {
     Decision,
     Stalled,
+    /// Ready, and the agent that would take it is stopped or broken: a person can fix that.
+    Unstaffed,
+    /// Ready, and st does not say who will take it.
     Unclaimed,
+    /// Ready, waiting its turn behind other work on a busy agent. Nothing to do.
+    Queued,
     Working,
     Held,
     Idle,
@@ -255,7 +260,9 @@ impl Word {
         match self {
             Word::Decision => "needs you",
             Word::Stalled => "stalled",
+            Word::Unstaffed => "unstaffed",
             Word::Unclaimed => "unclaimed",
+            Word::Queued => "queued",
             Word::Working => "working",
             Word::Held => "held",
             Word::Idle => "idle",
@@ -267,7 +274,9 @@ impl Word {
         match self {
             Word::Decision => "a step is waiting for your answer",
             Word::Stalled => "a step has an owner who is not moving",
-            Word::Unclaimed => "a step is ready and nobody has taken it",
+            Word::Unstaffed => "a step is ready but its agent is stopped or broken",
+            Word::Unclaimed => "a step is ready; st has not said which agent takes it",
+            Word::Queued => "a step is waiting its turn on a busy agent; nothing to do",
             Word::Working => "an agent is doing a step now",
             Word::Held => "waiting on something outside the fleet",
             Word::Idle => "running, with nothing ready",
@@ -296,6 +305,11 @@ pub struct Step {
     pub note: Option<String>,
     pub after: Vec<String>,
     pub age: String,
+    pub goals: Vec<String>,
+    pub constraints: Vec<String>,
+    pub gates: Vec<String>,
+    pub attempt: u32,
+    pub blockers: Vec<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -312,6 +326,8 @@ pub struct Mission {
     pub worktree: Option<String>,
     pub parent: Option<String>,
     pub system: bool,
+    /// The mission's declaration as written, when st provides it.
+    pub kdl: Option<String>,
 }
 
 impl Mission {

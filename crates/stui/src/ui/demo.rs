@@ -478,10 +478,80 @@ fn step(
         note: note.map(s),
         after: after.iter().map(|name| s(name)).collect(),
         age: s(age),
+        goals: vec![format!(
+            "Finish the {name} step and record what it produced."
+        )],
+        constraints: vec![s("Never write to the old store.")],
+        gates: vec![],
+        attempt: 1,
+        blockers: vec![],
     }
 }
 
+const ATLAS_KDL: &str = r#"version 2
+
+mission "fleet/atlas/store-move" state="ready" {
+  goal "Move every row to the new store without losing a value."
+  goal "Prove the two stores agree before anything cuts over."
+  goal "Leave the old store readable until a person says otherwise."
+  constraint "Never write to the old store."
+
+  step "snapshot" { assigned-to "agent/fleet/atlas/builder" }
+  step "convert" {
+    assigned-to "agent/fleet/atlas/builder"
+    depends-on { step "snapshot" completed }
+    gate "conversion-check" { exec "atlas-cli check --converted" }
+  }
+  step "compare" {
+    assigned-to "agent/fleet/atlas/builder"
+    depends-on { step "convert" completed }
+  }
+  step "cut-over" {
+    agentless
+    depends-on { step "compare" completed }
+    gate "cut-over-review" type="human" {
+      reviewer "person/robin"
+      question "The row counts agree and the contract check passed. Cut over?"
+      review "doc/atlas/compare-report"
+    }
+  }
+  step "cleanup" {
+    assigned-to "agent/fleet/atlas/builder"
+    depends-on { step "cut-over" completed }
+  }
+}
+"#;
+
 fn missions() -> Vec<Mission> {
+    let mut missions = all_missions();
+    // Gates and retries worth showing when a step is opened.
+    if let Some(step) = missions[0]
+        .steps
+        .iter_mut()
+        .find(|step| step.name == "cut-over")
+    {
+        step.gates = vec![s(
+            "human review by robin: \"The row counts agree and the contract check passed. Cut over?\"",
+        )];
+        step.goals = vec![s(
+            "Switch reads and writes to the new store once a person approves.",
+        )];
+    }
+    if let Some(step) = missions[0]
+        .steps
+        .iter_mut()
+        .find(|step| step.name == "convert")
+    {
+        step.gates = vec![s("conversion-check: atlas-cli check --converted (passed)")];
+    }
+    if let Some(step) = missions[2].steps.iter_mut().find(|step| step.name == "tag") {
+        step.attempt = 4;
+        step.blockers = vec![s("seat release-captain on harbor is not running")];
+    }
+    missions
+}
+
+fn all_missions() -> Vec<Mission> {
     vec![
         Mission {
             id: s("mission/fleet/atlas/store-move"),
@@ -541,6 +611,7 @@ fn missions() -> Vec<Mission> {
             worktree: Some(s("~/src/atlas--store-move")),
             parent: None,
             system: false,
+            kdl: Some(s(ATLAS_KDL)),
         },
         Mission {
             id: s("mission/fleet/site/pricing-page"),
@@ -572,6 +643,7 @@ fn missions() -> Vec<Mission> {
             worktree: Some(s("~/src/site--pricing")),
             parent: None,
             system: false,
+            kdl: None,
         },
         Mission {
             id: s("mission/fleet/release/weekly"),
@@ -611,6 +683,7 @@ fn missions() -> Vec<Mission> {
             worktree: Some(s("~/src/atlas")),
             parent: None,
             system: false,
+            kdl: None,
         },
         Mission {
             id: s("mission/fleet/harbor/pull-request-review"),
@@ -642,11 +715,12 @@ fn missions() -> Vec<Mission> {
             worktree: Some(s("~/src/harbor--review-218")),
             parent: None,
             system: false,
+            kdl: None,
         },
         Mission {
             id: s("mission/fleet/rekey"),
             title: s("Rotate harbor's signing keys"),
-            word: Word::Unclaimed,
+            word: Word::Queued,
             age: s("19m"),
             host: s("harbor"),
             goals: vec![s(
@@ -667,7 +741,7 @@ fn missions() -> Vec<Mission> {
                     None,
                     &["inventory"],
                     "19m",
-                    Some("ready, nobody has taken it"),
+                    Some("queued for Rekey Worker, which finishes harbor/nightly first"),
                 ),
                 step(
                     "report",
@@ -683,6 +757,7 @@ fn missions() -> Vec<Mission> {
             worktree: Some(s("~/src/harbor")),
             parent: None,
             system: false,
+            kdl: None,
         },
         Mission {
             id: s("mission/fleet/docs/handbook"),
@@ -706,6 +781,7 @@ fn missions() -> Vec<Mission> {
             worktree: None,
             parent: None,
             system: false,
+            kdl: None,
         },
         Mission {
             id: s("mission/fleet/atlas/nightly"),
@@ -737,6 +813,7 @@ fn missions() -> Vec<Mission> {
             worktree: None,
             parent: None,
             system: false,
+            kdl: None,
         },
     ]
 }

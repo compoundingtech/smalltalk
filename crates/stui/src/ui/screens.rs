@@ -69,7 +69,7 @@ pub fn agent_glyph(state: AgentState, spinner: &'static str) -> (&'static str, C
 pub fn agent_word(state: AgentState) -> &'static str {
     match state {
         AgentState::NeedsYou => "needs you",
-        AgentState::Fault => "fault",
+        AgentState::Fault => "broken",
         AgentState::Working => "working",
         AgentState::Idle => "idle",
         AgentState::Starting => "starting",
@@ -82,7 +82,9 @@ pub fn word_style(word: Word, spinner: &'static str) -> (&'static str, Color) {
     match word {
         Word::Decision => ("◆", theme::PERSON),
         Word::Stalled => ("▲", theme::FAULT),
-        Word::Unclaimed => ("◇", theme::WAITING),
+        Word::Unstaffed => ("◇", theme::WAITING),
+        Word::Unclaimed => ("◇", theme::OVERLAY1),
+        Word::Queued => ("◌", theme::OVERLAY1),
         Word::Working => (spinner, theme::WORKING),
         Word::Held => ("◐", theme::SAPPHIRE),
         Word::Idle => ("●", theme::IDLE),
@@ -1006,7 +1008,8 @@ pub fn missions_list(world: &World, spinner: &'static str, system: bool) -> List
         legend: legend(&[
             ("◆", theme::PERSON, "needs you"),
             ("▲", theme::FAULT, "stalled"),
-            ("◇", theme::WAITING, "unclaimed"),
+            ("◇", theme::WAITING, "unstaffed"),
+            ("◌", theme::OVERLAY1, "queued"),
             (spinner, theme::WORKING, "working"),
             ("●", theme::IDLE, "idle"),
             ("✓", theme::DONE, "done"),
@@ -1014,7 +1017,14 @@ pub fn missions_list(world: &World, spinner: &'static str, system: bool) -> List
     }
 }
 
-pub fn mission_detail(world: &World, id: Option<&str>, width: usize, spinner: &'static str) -> Doc {
+pub fn mission_detail(
+    world: &World,
+    id: Option<&str>,
+    width: usize,
+    spinner: &'static str,
+    decision_card: Option<Doc>,
+    expanded: &std::collections::HashSet<String>,
+) -> Doc {
     let mut doc = Doc::new();
     let Some(mission) = id.and_then(|id| {
         world
@@ -1070,51 +1080,15 @@ pub fn mission_detail(world: &World, id: Option<&str>, width: usize, spinner: &'
     if !goals.lines.is_empty() {
         doc.card("goals", theme::LAVENDER, false, goals, width);
     }
-    if let Some(decision) = mission
-        .decision
-        .as_ref()
-        .and_then(|id| world.attention.items().iter().find(|item| &item.id == id))
-    {
-        let mut card = Doc::new();
-        card.blank();
-        let question = match &decision.kind {
-            AttentionKind::Review { question, .. } | AttentionKind::Feedback { question, .. } => {
-                question.clone()
-            }
-            _ => decision.title.clone(),
-        };
-        card.wrap(&text::inline(&question, theme::text()), inner);
-        card.blank();
-        card.buttons(&[(
-            "enter",
-            "Answer on Home",
-            Hit::Open(decision.id.clone()),
-            theme::PERSON,
-        )]);
-        card.blank();
-        doc.card(
-            &format!("{} · waiting {}", decision.kind.word(), decision.age),
-            theme::PERSON,
-            true,
-            card,
-            width,
-        );
+    if let Some(card) = decision_card {
+        // The same card Home shows, so the answer can be given right here.
+        doc.append(card, 0);
     }
+    what_you_can_do(&mut doc, world, mission, width, spinner);
     let (done, total) = mission.progress();
-    let available = mission
-        .steps
-        .iter()
-        .filter(|step| matches!(step.state, StepState::Ready))
-        .count();
     let mut steps = Doc::new();
     let mut bar = meter(done, total, 20, theme::DONE);
     bar.push(span(format!("  {done}/{total} done"), theme::dim()));
-    if available > 0 {
-        bar.push(span(
-            format!(" · {available} ready, nobody has it"),
-            theme::fg(theme::WAITING),
-        ));
-    }
     steps.line(Line::from(bar));
     steps.lines(flow(
         mission.steps.iter().map(|step| {
@@ -1136,7 +1110,16 @@ pub fn mission_detail(world: &World, id: Option<&str>, width: usize, spinner: &'
     steps.blank();
     for step in &mission.steps {
         let (glyph, color, word) = step_style(step.state, spinner);
+        let key = format!("step:{}:{}", mission.id, step.name);
+        let open = expanded.contains(&key);
+        steps.targets.push(super::doc::Target {
+            line: steps.lines.len(),
+            column: 0,
+            width: inner as u16,
+            hit: Hit::ToggleTool(key),
+        });
         steps.line(Line::from(vec![
+            span(if open { "▾ " } else { "▸ " }, theme::dim()),
             span(format!("{glyph} "), theme::strong(color)),
             span(
                 format!(
@@ -1161,12 +1144,41 @@ pub fn mission_detail(world: &World, id: Option<&str>, width: usize, spinner: &'
             steps.lines(text::wrap(
                 &text::inline(note, theme::dim()),
                 inner,
-                &[run("    ", theme::dim())],
-                &[run("    ", theme::dim())],
+                &[run("      ", theme::dim())],
+                &[run("      ", theme::dim())],
                 None,
             ));
         }
+        if open {
+            let pad = "      ";
+            let mut field = |label: &str, values: &[String], style: Style| {
+                for (index, value) in values.iter().enumerate() {
+                    let head = if index == 0 {
+                        format!("{pad}{label:<12}")
+                    } else {
+                        format!("{pad}{:<12}", "")
+                    };
+                    steps.lines(text::wrap(
+                        &text::inline(value, style),
+                        inner,
+                        &[run(head, theme::dim())],
+                        &[run(format!("{pad}{:<12}", ""), theme::dim())],
+                        None,
+                    ));
+                }
+            };
+            field("goal", &step.goals, theme::text());
+            field("constraint", &step.constraints, theme::soft());
+            field("gate", &step.gates, theme::fg(theme::PERSON));
+            field("blocked by", &step.blockers, theme::fg(theme::RED));
+            if !step.after.is_empty() {
+                field("after", &[step.after.join(", ")], theme::soft());
+            }
+            field("attempt", &[step.attempt.to_string()], theme::soft());
+            steps.blank();
+        }
     }
+    steps.line(Line::from(span("click a step to open it", theme::dim())));
     doc.card("steps", theme::OVERLAY1, false, steps, width);
     let mut agents = Doc::new();
     for id in &mission.agents {
@@ -1211,7 +1223,170 @@ pub fn mission_detail(world: &World, id: Option<&str>, width: usize, spinner: &'
         ]));
         doc.card("worktree", theme::OVERLAY1, false, place, width);
     }
+    doc.buttons(&[("k", "The whole declaration", Hit::Key('k'), theme::OVERLAY1)]);
     doc
+}
+
+/// The mission as written. st does not send the declaration to clients yet.
+pub fn mission_kdl(world: &World, id: Option<&str>, width: usize) -> Doc {
+    let mut doc = Doc::new();
+    let mission = id.and_then(|id| {
+        world
+            .missions
+            .items()
+            .iter()
+            .find(|mission| mission.id == id)
+    });
+    doc.line(Line::from(vec![
+        span(
+            " declaration ",
+            Style::default()
+                .fg(theme::CRUST)
+                .bg(theme::OVERLAY1)
+                .add_modifier(Modifier::BOLD),
+        ),
+        span(
+            format!(
+                "  {}",
+                mission.map(|mission| mission.id.as_str()).unwrap_or("")
+            ),
+            theme::dim(),
+        ),
+    ]));
+    doc.buttons(&[("k", "Back to the mission", Hit::Key('k'), theme::ACCENT)]);
+    doc.blank();
+    match mission.and_then(|mission| mission.kdl.as_deref()) {
+        Some(kdl) => {
+            for line in text::sanitize(kdl).lines() {
+                let trimmed = line.trim_start();
+                let style = if trimmed.starts_with("//") {
+                    theme::dim()
+                } else if trimmed.starts_with("goal") || trimmed.starts_with("constraint") {
+                    theme::fg(theme::LAVENDER)
+                } else if trimmed.starts_with("gate") || trimmed.starts_with("reviewer") || trimmed.starts_with("question") {
+                    theme::fg(theme::PERSON)
+                } else if trimmed.starts_with("step") || trimmed.starts_with("mission") {
+                    theme::strong(theme::PEACH)
+                } else {
+                    theme::fg(theme::SUBTEXT1)
+                };
+                doc.lines(text::wrap(&[run(line.to_owned(), style)], width, &[], &[run("    ", theme::dim())], None));
+            }
+        }
+        None => doc.wrap(
+            &[run(
+                "st does not send mission declarations to clients yet. Until it does, read it with: st missions show",
+                theme::dim(),
+            )],
+            width,
+        ),
+    }
+    doc
+}
+
+/// For a mission that is not moving: why, and what a person can do about it.
+fn what_you_can_do(
+    doc: &mut Doc,
+    world: &World,
+    mission: &Mission,
+    width: usize,
+    spinner: &'static str,
+) {
+    let inner = width.saturating_sub(4);
+    let mut card = Doc::new();
+    let broken = mission
+        .agents
+        .iter()
+        .filter_map(|id| world.agents.items().iter().find(|agent| &agent.id == id))
+        .find(|agent| matches!(agent.state, AgentState::Fault | AgentState::Stopped));
+    let stuck = mission.steps.iter().find(|step| {
+        matches!(
+            step.state,
+            StepState::Failed | StepState::Ready | StepState::Waiting
+        )
+    });
+    let (title, color) = match mission.word {
+        Word::Stalled | Word::Failed => ("what you can do", theme::FAULT),
+        Word::Unstaffed => ("what you can do", theme::WAITING),
+        Word::Queued => ("nothing for you to do", theme::OVERLAY1),
+        _ => return,
+    };
+    card.blank();
+    if mission.word == Word::Queued {
+        let note = stuck
+            .and_then(|step| step.note.clone())
+            .unwrap_or_else(|| "It is waiting its turn.".into());
+        card.wrap(&text::inline(&note, theme::text()), inner);
+        card.blank();
+        card.wrap(
+            &[run(
+                "It starts by itself when the agent is free.",
+                theme::dim(),
+            )],
+            inner,
+        );
+        card.blank();
+        doc.card(title, color, false, card, width);
+        return;
+    }
+    if let Some(step) = stuck {
+        let (glyph, step_color, word) = step_style(step.state, spinner);
+        card.line(Line::from(vec![
+            span(format!("{glyph} {} ", step.name), theme::strong(step_color)),
+            span(
+                match step.state {
+                    StepState::Failed => "failed".to_owned(),
+                    _ => format!("is {word}"),
+                },
+                theme::fg(step_color),
+            ),
+            span(
+                if step.attempt > 1 {
+                    format!(" after {} attempts", step.attempt)
+                } else {
+                    String::new()
+                },
+                theme::dim(),
+            ),
+        ]));
+        for blocker in &step.blockers {
+            card.wrap(&[run(format!("because {blocker}"), theme::soft())], inner);
+        }
+        card.blank();
+    }
+    if let Some(agent) = broken {
+        card.wrap(
+            &[run(
+                format!(
+                    "{} is {}. Fix the agent and the step can run again.",
+                    agent.name,
+                    screens_word(agent.state)
+                ),
+                theme::text(),
+            )],
+            inner,
+        );
+        card.blank();
+        card.buttons(&[
+            ("R", "Restart the agent", Hit::Key('R'), theme::GREEN),
+            (
+                "t",
+                "Chat with it",
+                Hit::Peek(agent.id.clone()),
+                theme::SAPPHIRE,
+            ),
+        ]);
+    }
+    card.buttons(&[
+        ("r", "Retry the step", Hit::Key('r'), theme::YELLOW),
+        ("X", "Cancel this run", Hit::Key('X'), theme::RED),
+    ]);
+    card.blank();
+    doc.card(title, color, true, card, width);
+}
+
+fn screens_word(state: AgentState) -> &'static str {
+    agent_word(state)
 }
 
 // -------------------------------------------------------------------- fleet

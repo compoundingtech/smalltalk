@@ -427,6 +427,14 @@ fn agents(model: &Model) -> Vec<Agent> {
     agents
 }
 
+/// The agent whose queue holds this work, if st says.
+fn queued_for<'a>(model: &'a Model, work: &str) -> Option<&'a st3_client::Agent> {
+    model.agents().find(|agent| {
+        agent.next_work_id.as_deref() == Some(work)
+            || agent.upcoming_work_ids.iter().any(|id| id == work)
+    })
+}
+
 /// "Mission › step" for a work id, or the id itself when st has not sent that work.
 fn step_label(model: &Model, id: &str) -> String {
     model
@@ -479,11 +487,21 @@ fn missions(model: &Model) -> Vec<Mission> {
                 .any(|state| matches!(*state, "claimed" | "running"))
             {
                 Word::Working
-            } else if work
+            } else if let Some(ready) = work
                 .iter()
-                .any(|work| work.state == "ready" && work.claimant.is_none())
+                .find(|work| work.state == "ready" && work.claimant.is_none())
             {
-                Word::Unclaimed
+                // Who has this step queued decides whether a person is needed.
+                match queued_for(model, &ready.header.id) {
+                    Some(agent)
+                        if matches!(agent.state.as_str(), "failed" | "stopped")
+                            || agent.fault.is_some() =>
+                    {
+                        Word::Unstaffed
+                    }
+                    Some(_) => Word::Queued,
+                    None => Word::Unclaimed,
+                }
             } else if states.contains(&"waiting") {
                 Word::Held
             } else if matches!(
@@ -494,31 +512,60 @@ fn missions(model: &Model) -> Vec<Mission> {
             } else {
                 Word::Done
             };
-            let steps =
-                work.iter()
-                    .map(|work| {
-                        let state = match work.state.as_str() {
-                            "completed" => StepState::Done,
-                            "claimed" | "running" => StepState::Working,
-                            "ready" => StepState::Ready,
-                            "waiting" => StepState::Waiting,
-                            "blocked" => StepState::Waiting,
-                            "failed" => StepState::Failed,
-                            _ => StepState::Pending,
-                        };
-                        let owner = crate::work_owner(model, work);
-                        Step {
-                            name: work.path.clone(),
-                            state,
-                            owner: (!owner.is_empty() && owner != "unassigned").then_some(owner),
-                            note: work.blocked_reason.clone().or_else(|| {
-                                work.goals.first().map(|goal| clean_message_text(goal))
-                            }),
-                            after: vec![],
-                            age: age(&work.header.updated_at),
-                        }
-                    })
-                    .collect::<Vec<_>>();
+            let steps = work
+                .iter()
+                .map(|work| {
+                    let state = match work.state.as_str() {
+                        "completed" => StepState::Done,
+                        "claimed" | "running" => StepState::Working,
+                        "ready" => StepState::Ready,
+                        "waiting" => StepState::Waiting,
+                        "blocked" => StepState::Waiting,
+                        "failed" => StepState::Failed,
+                        _ => StepState::Pending,
+                    };
+                    let owner = crate::work_owner(model, work);
+                    let note = if work.state == "ready" && work.claimant.is_none() {
+                        queued_for(model, &work.header.id).map(|agent| {
+                            let label = crate::agent_label(agent);
+                            match agent.current_work_ids.first() {
+                                Some(current)
+                                    if !matches!(agent.state.as_str(), "failed" | "stopped") =>
+                                {
+                                    format!(
+                                        "queued for {label}, which is busy with {}",
+                                        step_label(model, current)
+                                    )
+                                }
+                                _ => format!("queued for {label}, which is {}", agent.state),
+                            }
+                        })
+                    } else {
+                        None
+                    };
+                    Step {
+                        name: work.path.clone(),
+                        state,
+                        owner: (!owner.is_empty() && owner != "unassigned").then_some(owner),
+                        note: note.or_else(|| work.blocked_reason.clone()),
+                        after: vec![],
+                        age: age(&work.header.updated_at),
+                        goals: work
+                            .goals
+                            .iter()
+                            .map(|goal| clean_message_text(goal))
+                            .collect(),
+                        constraints: work
+                            .constraints
+                            .iter()
+                            .map(|constraint| clean_message_text(constraint))
+                            .collect(),
+                        gates: vec![],
+                        attempt: work.attempt,
+                        blockers: work.blockers.clone(),
+                    }
+                })
+                .collect::<Vec<_>>();
             let agents = model
                 .agents()
                 .filter(|agent| {
@@ -538,6 +585,7 @@ fn missions(model: &Model) -> Vec<Mission> {
                 goals: vec![],
                 steps,
                 agents,
+                kdl: None,
                 decision,
                 worktree: None,
                 parent: None,

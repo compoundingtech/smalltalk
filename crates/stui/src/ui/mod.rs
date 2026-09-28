@@ -159,6 +159,8 @@ pub struct Ui {
     chat: Option<ChatState>,
     /// The agent details pane beside the conversation.
     details: bool,
+    /// The Missions tab shows the selected mission's whole declaration.
+    kdl: bool,
     /// Home items put off until later. Demo only: kept in memory on this machine.
     snoozed: HashSet<String>,
 }
@@ -191,6 +193,7 @@ impl Ui {
             popover: None,
             chat: None,
             details: true,
+            kdl: false,
             snoozed: HashSet::new(),
         }
     }
@@ -249,7 +252,11 @@ impl Ui {
     }
 
     fn draft_key(&self) -> Option<String> {
-        self.selected_id()
+        if self.tab == 1 {
+            self.selected_id()
+        } else {
+            self.attention_focus()
+        }
     }
 
     // ------------------------------------------------------------------ drawing
@@ -717,57 +724,105 @@ impl Ui {
         }
     }
 
+    /// The attention item the current screen acts on: the Home selection, or the decision
+    /// embedded in the selected mission.
+    fn attention_focus(&self) -> Option<String> {
+        match self.tab {
+            0 => self.selected_id(),
+            2 => {
+                let id = self.selected_id()?;
+                self.world
+                    .missions
+                    .items()
+                    .iter()
+                    .find(|mission| mission.id == id)?
+                    .decision
+                    .clone()
+                    .filter(|decision| {
+                        self.world
+                            .attention
+                            .items()
+                            .iter()
+                            .any(|item| &item.id == decision)
+                    })
+            }
+            _ => None,
+        }
+    }
+
+    fn drafts_for(&self, key: &str, width: usize) -> Drafts<'_> {
+        let chat_key = format!("chat:{key}");
+        let chat = self.chat.as_ref().filter(|chat| chat.item == key).map(|chat| {
+            let title = self
+                .world
+                .attention
+                .items()
+                .iter()
+                .find(|item| item.id == key)
+                .map(|item| format!("About: {}", item.title))
+                .unwrap_or_default();
+            let thread = match self.world.conversations.get(&chat.to) {
+                Some(Load::Ready(entries)) => {
+                    let about = entries
+                        .iter()
+                        .filter(|entry| matches!(&entry.body, Body::Mail { subject, .. } if *subject == title))
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    self.cache
+                        .render(&about, width.saturating_sub(4), &self.expanded, self.spinner())
+                        .lines
+                }
+                _ => Vec::new(),
+            };
+            screens::Chat {
+                to: chat.to_name.clone(),
+                text: self.drafts.get(&chat_key).map(String::as_str).unwrap_or(""),
+                editing: chat.editing,
+                thread,
+            }
+        });
+        Drafts {
+            text: self.drafts.get(key).map(String::as_str),
+            editing: self.editing,
+            confirm: self.confirm,
+            chat,
+        }
+    }
+
     fn draw_main(&self, buf: &mut Buffer, area: Rect) {
         let width = area.width.saturating_sub(1) as usize;
         let id = self.selected_id();
         match self.tab {
             0 => {
                 let key = id.clone().unwrap_or_default();
-                let chat_key = format!("chat:{key}");
-                let chat = self.chat.as_ref().filter(|chat| chat.item == key).map(|chat| {
-                    let title = self
-                        .world
-                        .attention
-                        .items()
-                        .iter()
-                        .find(|item| item.id == key)
-                        .map(|item| format!("About: {}", item.title))
-                        .unwrap_or_default();
-                    let thread = match self.world.conversations.get(&chat.to) {
-                        Some(Load::Ready(entries)) => {
-                            let about = entries
-                                .iter()
-                                .filter(|entry| {
-                                    matches!(&entry.body, Body::Mail { subject, .. } if *subject == title)
-                                })
-                                .cloned()
-                                .collect::<Vec<_>>();
-                            self.cache
-                                .render(&about, width.saturating_sub(4), &self.expanded, self.spinner())
-                                .lines
-                        }
-                        _ => Vec::new(),
-                    };
-                    screens::Chat {
-                        to: chat.to_name.clone(),
-                        text: self.drafts.get(&chat_key).map(String::as_str).unwrap_or(""),
-                        editing: chat.editing,
-                        thread,
-                    }
-                });
-                let drafts = Drafts {
-                    text: self.drafts.get(&key).map(String::as_str),
-                    editing: self.editing,
-                    confirm: self.confirm,
-                    chat,
-                };
+                let drafts = self.drafts_for(&key, width);
                 let doc = screens::home_detail(&self.world, id.as_deref(), width, &drafts);
                 self.pane(buf, &format!("home:{key}"), area, doc, false);
             }
             1 => self.draw_agent(buf, area, id.as_deref()),
+            2 if self.kdl => {
+                let doc = screens::mission_kdl(&self.world, id.as_deref(), width);
+                self.pane(
+                    buf,
+                    &format!("kdl:{}", id.unwrap_or_default()),
+                    area,
+                    doc,
+                    false,
+                );
+            }
             2 => {
-                let doc =
-                    screens::mission_detail(&self.world, id.as_deref(), width, self.spinner());
+                let decision = self.attention_focus().map(|decision| {
+                    let drafts = self.drafts_for(&decision, width);
+                    screens::home_detail(&self.world, Some(&decision), width, &drafts)
+                });
+                let doc = screens::mission_detail(
+                    &self.world,
+                    id.as_deref(),
+                    width,
+                    self.spinner(),
+                    decision,
+                    &self.expanded,
+                );
                 self.pane(
                     buf,
                     &format!("mission:{}", id.unwrap_or_default()),
@@ -1237,6 +1292,7 @@ impl Ui {
         self.editing = false;
         self.chat = None;
         self.popover = None;
+        self.kdl = false;
         self.confirm = None;
         self.selection = None;
     }
@@ -1434,7 +1490,7 @@ impl Ui {
     }
 
     fn current_kind(&self) -> Option<&'static str> {
-        let id = self.selected_id()?;
+        let id = self.attention_focus()?;
         self.world
             .attention
             .items()
@@ -1463,8 +1519,25 @@ impl Ui {
     }
 
     fn action_key(&mut self, key: char) {
+        if self.tab == 2 {
+            match key {
+                'k' => {
+                    self.kdl = !self.kdl;
+                    return;
+                }
+                'R' | 'X' => {
+                    self.mission_action(key);
+                    return;
+                }
+                'r' if self.attention_focus().is_none() => {
+                    self.mission_action(key);
+                    return;
+                }
+                _ => {}
+            }
+        }
         match self.tab {
-            0 => {
+            0 | 2 if self.attention_focus().is_some() => {
                 let Some(kind) = self.current_kind() else {
                     return;
                 };
@@ -1504,8 +1577,29 @@ impl Ui {
         }
     }
 
+    /// Retry, restart or cancel from a stalled mission's "what you can do" card.
+    fn mission_action(&mut self, key: char) {
+        let what = match key {
+            'r' => "Retry the step",
+            'R' => "Restart the agent",
+            _ => "Cancel this run",
+        };
+        if self.live {
+            // st's client API has no retry yet, and restart and cancel land with the
+            // broken-agent work; say how to do it rather than pretend.
+            let hint = match key {
+                'r' => "st work retry STEP",
+                'R' => "st agents start AGENT (restart)",
+                _ => "st missions cancel RUN",
+            };
+            self.flash(format!("{what}: not in stui yet · use {hint}"));
+        } else {
+            self.flash(format!("{what} · demo: nothing was sent"));
+        }
+    }
+
     fn current_item(&self) -> Option<&Attention> {
-        let id = self.selected_id()?;
+        let id = self.attention_focus()?;
         self.world
             .attention
             .items()
@@ -1718,7 +1812,9 @@ impl Ui {
     }
 
     fn act(&mut self, action: char) {
-        let Some(id) = self.selected_id() else { return };
+        let Some(id) = self.attention_focus() else {
+            return;
+        };
         if self.live {
             let kind = self.current_kind().unwrap_or("");
             let name = match (kind, action) {
@@ -1782,7 +1878,9 @@ impl Ui {
                 }
             }
         }
-        self.select(self.selected[0]);
+        if self.tab == 0 {
+            self.select(self.selected[0]);
+        }
         self.flash(format!("{message} · demo: nothing was sent"));
     }
 
