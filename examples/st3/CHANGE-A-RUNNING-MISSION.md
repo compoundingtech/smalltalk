@@ -7,8 +7,8 @@ steps have durable state:
 
 ```sh
 revision_workspace="$(mktemp -d)"
-st3 missions publish examples/st3/mission-revision.kdl --as person/operator
-st3 missions start example/revisable-change \
+st missions publish examples/st3/mission-revision.kdl --as person/operator
+st missions start example/revisable-change \
   --id example/revisable-change/first \
   --workspace "$revision_workspace" \
   --input 'request=Create the archive index.' \
@@ -20,8 +20,8 @@ st3 missions start example/revisable-change \
 This publishes a new immutable definition successfully:
 
 ```sh
-st3 missions publish examples/st3/mission-revision-v2.kdl --as person/operator
-st3 missions show mission-run/example/revisable-change/first
+st missions publish examples/st3/mission-revision-v2.kdl --as person/operator
+st missions show mission-run/example/revisable-change/first
 ```
 
 The second command still shows the revision and generation with which the run started. Publication
@@ -31,13 +31,13 @@ An out-of-band request does not mutate it either. If the operator sends the work
 message asking it to perform `summarize-index` now, the correct response is a refusal:
 
 ```sh
-change_message="$(st3 conversations send \
+change_message="$(st conversations send \
   agent/example/worker \
   --from person/operator \
   --subject 'Add the archive summary' \
   --body 'Please run summarize-index in the active archive run.')"
 
-st3 conversations reply "$change_message" \
+st conversations reply "$change_message" \
   --from agent/example/worker \
   --body 'The active generation has no summarize-index work. Apply a graph revision before I act.'
 ```
@@ -50,7 +50,7 @@ new work or authority. Work reaches a seat only as mission steps in its seat que
 Submit the complete replacement through the live-run revision route:
 
 ```sh
-st3 work revise \
+st work revise \
   mission-run/example/revisable-change/first \
   examples/st3/mission-revision-v2.kdl \
   --reason 'Add a summary before final verification.' \
@@ -62,8 +62,8 @@ than silently cutting over. Inspect it, then copy the exact proposal subject and
 the output into the approval command:
 
 ```sh
-st3 work revision show mission-run/example/revisable-change/first
-st3 work revision approve revision-proposal/PROPOSAL PREVIEW_HASH --as person/operator
+st work revision show mission-run/example/revisable-change/first
+st work revision approve revision-proposal/PROPOSAL PREVIEW_HASH --as person/operator
 ```
 
 Its cutover policy is `when-idle`; approval permits the cutover once active work is idle. The
@@ -76,9 +76,9 @@ complete by analogy.
 Inspect both immutable generations to verify that result:
 
 ```sh
-st3 work revision generations mission-run/example/revisable-change/first
-st3 work revision generation run-generation/OLD_GENERATION
-st3 work revision generation run-generation/NEW_GENERATION
+st work revision generations mission-run/example/revisable-change/first
+st work revision generation run-generation/OLD_GENERATION
+st work revision generation run-generation/NEW_GENERATION
 ```
 
 Use the exact generation subjects printed by `generations`; the placeholders above are not literal
