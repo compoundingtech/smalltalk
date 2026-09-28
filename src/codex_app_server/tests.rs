@@ -3147,7 +3147,7 @@ fn a_token_usage_replayed_before_the_resume_response_still_reaches_the_record() 
     let server = thread::spawn(move || {
         let (stream, _) = listener.accept().unwrap();
         stream
-            .set_read_timeout(Some(Duration::from_secs(10)))
+            .set_read_timeout(Some(Duration::from_secs(1)))
             .unwrap();
         let mut websocket = tungstenite::accept(stream).unwrap();
         assert_eq!(
@@ -3235,7 +3235,9 @@ fn a_token_usage_replayed_before_the_resume_response_still_reaches_the_record() 
             Some(ControlResume {
                 thread_id: "thread-prior",
                 ready: resume_ready_rx,
-                tui_loaded_timeout: TUI_LOADED_TIMEOUT,
+                // The replay test does not assert startup latency; busy macOS
+                // runners can take longer than the default handshake window.
+                tui_loaded_timeout: Duration::from_secs(20),
                 permission_overrides: None,
                 preload: false,
                 preloaded: None,
@@ -3246,9 +3248,14 @@ fn a_token_usage_replayed_before_the_resume_response_still_reaches_the_record() 
         )
     });
     resume_ready_tx.send(()).unwrap();
-    acknowledge_tui_thread_loaded(&rx);
+    let ControlEvent::TuiThreadLoaded(acknowledge) =
+        rx.recv_timeout(Duration::from_secs(20)).unwrap()
+    else {
+        panic!("control did not report the TUI-loaded gate");
+    };
+    acknowledge.send(()).unwrap();
     assert!(matches!(
-        rx.recv_timeout(Duration::from_secs(10)).unwrap(),
+        rx.recv_timeout(Duration::from_secs(30)).unwrap(),
         ControlEvent::Bound
     ));
     server.join().unwrap();
