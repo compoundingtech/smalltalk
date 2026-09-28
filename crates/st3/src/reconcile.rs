@@ -12758,6 +12758,70 @@ mission "task" state="ready" {{
         );
     }
 
+    /// Declaring a member that would render different bytes to a file another member already
+    /// rendered faults only the newcomer. The member that owns the file keeps running.
+    #[test]
+    fn a_render_conflict_faults_only_the_member_that_would_change_the_file() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        let workspace = tempfile::tempdir().unwrap();
+        std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(workspace.path())
+            .status()
+            .unwrap();
+        let path = workspace.path().display().to_string();
+        apply_source(
+            &store,
+            &format!(
+                "version 2\nagent \"first\" {{ workspace {path:?}; command \"true\"; render {{ file \"shared\" \"one\" }} }}\n"
+            ),
+            "render-first",
+        );
+        let runtime = Arc::new(FakeRuntime::default());
+        let reconciler = Reconciler::new(
+            store.clone(),
+            runtime.clone(),
+            "node".into(),
+            Arc::new(Notify::new()),
+        );
+        reconciler.reconcile_once().unwrap();
+        assert_eq!(
+            fs::read_to_string(workspace.path().join("shared")).unwrap(),
+            "one"
+        );
+        apply_source(
+            &store,
+            &format!(
+                "version 2\nagent \"second\" {{ workspace {path:?}; command \"true\"; render {{ file \"shared\" \"two\" }} }}\n"
+            ),
+            "render-second",
+        );
+        reconciler.reconcile_once().unwrap();
+        assert!(
+            store
+                .member_reconcile_fault("agent/node.first", None)
+                .unwrap()
+                .is_none(),
+            "the member that owns the file was faulted"
+        );
+        let reason = store
+            .member_reconcile_fault("agent/node.second", None)
+            .unwrap()
+            .expect("the newcomer records the conflict");
+        assert!(reason.contains("disagree"), "{reason}");
+        assert_eq!(
+            fs::read_to_string(workspace.path().join("shared")).unwrap(),
+            "one"
+        );
+        assert!(
+            !runtime
+                .starts
+                .lock()
+                .unwrap()
+                .contains(&"node.second".to_owned())
+        );
+    }
+
     #[test]
     fn a_failed_start_isolated_from_healthy_members() {
         let store = Arc::new(Store::open_memory("node").unwrap());
