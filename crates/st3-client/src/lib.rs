@@ -386,6 +386,10 @@ impl Client {
         self.get(&format!("/v1/client/now?{}", query.join("&")))
             .await
     }
+    /// Read the bounded mission and seat tree in one projection response.
+    pub async fn missions_tree(&self) -> Result<serde_json::Value, ClientError> {
+        self.get("/v1/client/missions-tree").await
+    }
     pub async fn work_list_for_actor(
         &self,
         actor: &str,
