@@ -7648,7 +7648,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             let workspace = Path::new(root).join(suffix);
             if let Err(error) = fs::create_dir_all(&workspace) {
                 self.record_once(
-                    &schedule.subject,
+                    &format!("daemon/{}", self.host),
                     "daemon.diagnostic",
                     BTreeMap::from([
                         ("severity".into(), Value::String("error".into())),
@@ -7656,7 +7656,11 @@ impl<R: RuntimeControl> Reconciler<R> {
                         ("code".into(), Value::String("workspace-unavailable".into())),
                         (
                             "reason".into(),
-                            Value::String(format!("workspace {}: {error}", workspace.display())),
+                            Value::String(format!(
+                                "schedule {} workspace {}: {error}",
+                                schedule.subject,
+                                workspace.display()
+                            )),
                         ),
                     ]),
                 )?;
@@ -14735,7 +14739,7 @@ mission "scheduled-cycle" state="ready" {
             .unwrap()
             .is_empty());
         let diagnostics = store
-            .claims_for("schedule/cycle", Some("harness.diagnostic"))
+            .claims_for("daemon/node", Some("daemon.diagnostic"))
             .unwrap();
         assert!(diagnostics.iter().any(|claim| {
             claim
