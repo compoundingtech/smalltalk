@@ -4,16 +4,16 @@ version 2
 //
 // A seat has no authority over any queue by default, including its own. `queue-authority` lets
 // this agent move runs in the queues it names: an exact seat identity or a terminal `/*`
-// namespace, without the `agent/` prefix. Only a person can grant it. st3 refuses a top-level
+// namespace, without the `agent/` prefix. Only a person can grant it. st refuses a top-level
 // declaration that an agent publishes when it carries `queue-authority` or `mission-authority`.
 //
 // Apply it as a person, after one of the worker seat files beside it:
 //
-//   st3 agents apply examples/st3/seats/chief.kdl --as person/operator
+//   st agents apply examples/st3/seats/chief.kdl --as person/operator
 //
 // The chief then moves a queued run with its own identity, and the move records it as the actor:
 //
-//   st3 agents queue move agent/example/worker mission-run/example/release-notes/2026-10-01 \
+//   st agents queue move agent/example/worker mission-run/example/release-notes/2026-10-01 \
 //     --top --reason "the release needs its notes first" --as agent/example/chief
 //
 // ../seat-queue.kdl walks through the complete queue.

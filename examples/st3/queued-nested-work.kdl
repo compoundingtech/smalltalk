@@ -9,9 +9,9 @@ version 2
 //
 // Each step's completion holds its result. There is no separate reporting step.
 //
-//   st3 agents apply examples/st3/seats/omp.kdl --as person/operator
-//   st3 missions publish examples/st3/queued-nested-work.kdl --as person/operator
-//   st3 missions start example/app/refresh-then-review --id example/app/refresh-then-review/1 \
+//   st agents apply examples/st3/seats/omp.kdl --as person/operator
+//   st missions publish examples/st3/queued-nested-work.kdl --as person/operator
+//   st missions start example/app/refresh-then-review --id example/app/refresh-then-review/1 \
 //     --workspace /srv/example/app --as person/operator
 
 mission "example/app/refresh-then-review" state="ready" {
