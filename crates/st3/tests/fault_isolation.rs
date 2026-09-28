@@ -570,75 +570,251 @@ fn a_worker_that_cannot_stop_does_not_hold_back_other_cleanup() {
     assert_ne!(host.state(&stubborn).1, "terminal");
 }
 
-/// bluey, mid-sync: scheduled work named a mission revision the host had not received yet.
-#[test]
-fn scheduled_work_for_a_revision_this_host_lacks_does_not_stop_cleanup() {
-    let host = Host::new();
-    let revision = host
+fn schedule_work_request(host: &Host, schedule: &str, mission_revision: &str) -> String {
+    let schedule_revision = host
         .store
-        .mission_spec("worker", None)
+        .claims_for(schedule, Some("intent.desired"))
         .unwrap()
+        .last()
         .unwrap()
-        .revision;
-    let intake = host.start_intake(&format!(
-        r#"  schedule "nightly" {{
+        .id
+        .clone();
+    host.store
+        .append_claim(&ClaimInput {
+            subject: schedule.into(),
+            kind: "schedule.work-requested".into(),
+            actor: None,
+            fields: BTreeMap::from([
+                ("revision".into(), Value::String(schedule_revision)),
+                ("occurrence".into(), Value::from(1)),
+                ("mission".into(), Value::String("mission/worker".into())),
+                (
+                    "mission_revision".into(),
+                    Value::String(mission_revision.into()),
+                ),
+                (
+                    "workspace".into(),
+                    Value::String("/tmp/st3-fault-isolation".into()),
+                ),
+                ("inputs".into(), Value::Object(Default::default())),
+            ]),
+            evidence: Vec::new(),
+            expected_subject: None,
+            idempotency_key: None,
+        })
+        .unwrap()
+        .id
+}
+
+fn schedule_source(name: &str, revision: &str) -> String {
+    format!(
+        r#"  schedule "{name}" {{
     at "2099-01-01T00:00:00.000Z"
     work {{
       mission "worker@{revision}"
       workspace "/tmp/st3-fault-isolation"
     }}
   }}"#
+    )
+}
+
+fn worker_revision(host: &Host) -> String {
+    host.store
+        .mission_spec("worker", None)
+        .unwrap()
+        .unwrap()
+        .revision
+}
+
+fn schedule_named(host: &Host, run: &MissionRunView, name: &str) -> String {
+    host.store
+        .desired_subjects_for_owner_run(&run.subject)
+        .unwrap()
+        .into_iter()
+        .find(|desired| desired.kind == "schedule" && desired.subject.ends_with(name))
+        .map(|desired| desired.subject)
+        .unwrap_or_else(|| panic!("run {} declares no schedule {name}", run.id))
+}
+
+/// bluey, mid-sync: scheduled work named a mission revision the host had not received yet.
+#[test]
+fn scheduled_work_for_a_revision_this_host_lacks_waits_beside_other_schedules() {
+    let host = Host::new();
+    let revision = worker_revision(&host);
+    let intake = host.start_intake(&format!(
+        "{}\n{}",
+        schedule_source("behind", &revision),
+        schedule_source("current", &revision)
     ));
-    let schedule = host.owned(&intake, "schedule");
-    let schedule_revision = host
-        .store
-        .claims_for(&schedule, Some("intent.desired"))
-        .unwrap()
-        .last()
-        .unwrap()
-        .id
-        .clone();
+    let behind = schedule_named(&host, &intake, "behind");
+    let current = schedule_named(&host, &intake, "current");
+    let missing = "f".repeat(64);
     assert_progress_beside(&host, |host| {
-        host.store
-            .append_claim(&ClaimInput {
-                subject: schedule.clone(),
-                kind: "schedule.work-requested".into(),
-                actor: None,
-                fields: BTreeMap::from([
-                    ("revision".into(), Value::String(schedule_revision)),
-                    ("occurrence".into(), Value::from(1)),
-                    ("mission".into(), Value::String("mission/worker".into())),
-                    // A revision published on another host that has not replicated here yet.
-                    ("mission_revision".into(), Value::String("f".repeat(64))),
-                    (
-                        "workspace".into(),
-                        Value::String("/tmp/st3-fault-isolation".into()),
-                    ),
-                    ("inputs".into(), Value::Object(Default::default())),
-                ]),
-                evidence: Vec::new(),
-                expected_subject: None,
-                idempotency_key: None,
-            })
-            .unwrap();
+        schedule_work_request(host, &behind, &missing);
+        schedule_work_request(host, &current, &revision);
     });
     let reason = host
-        .fault(DAEMON, "stage/scheduled-work")
-        .expect("the scheduled-work stage records its fault");
+        .fault(&behind, "schedule-work")
+        .expect("the schedule records why its work waits");
     assert!(reason.contains("missing-mission"), "{reason}");
+    assert_eq!(host.fault(DAEMON, "stage/scheduled-work"), None);
+    // The request waits for the revision instead of failing.
+    assert_eq!(
+        host.store
+            .pending_schedule_work_requests(&behind)
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(
+        host.store
+            .claims_for(&behind, Some("schedule.work-failed"))
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        host.store
+            .claims_for(&current, Some("schedule.work-started"))
+            .unwrap()
+            .len(),
+        1,
+        "the other schedule's work did not start"
+    );
+}
+
+/// Every peer replicates a schedule's work requests. Only the host that requested the work
+/// starts it, so a peer never starts a duplicate run or fails on a revision it lacks.
+#[test]
+fn scheduled_work_starts_only_on_the_host_that_requested_it() {
+    let host = Host::new();
+    let revision = worker_revision(&host);
+    let intake = host.start_intake(&schedule_source("nightly", &revision));
+    let schedule = schedule_named(&host, &intake, "nightly");
+    schedule_work_request(&host, &schedule, &revision);
+    let peer = Reconciler::new(
+        host.store.clone(),
+        host.runtime.clone(),
+        "peer".into(),
+        Arc::new(Notify::new()),
+    );
+    peer.reconcile_once().unwrap();
+    assert!(
+        host.store
+            .claims_for(&schedule, Some("schedule.work-started"))
+            .unwrap()
+            .is_empty(),
+        "a peer started work that another host requested"
+    );
+    host.pass(1);
+    assert_eq!(
+        host.store
+            .claims_for(&schedule, Some("schedule.work-started"))
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+/// A request that cannot start for a lasting reason fails, so its schedule can fire again.
+#[test]
+fn scheduled_work_that_cannot_start_fails_without_freezing_its_schedule() {
+    let host = Host::new();
+    let revision = worker_revision(&host);
+    let intake = host.start_intake(&schedule_source("nightly", &revision));
+    let schedule = schedule_named(&host, &intake, "nightly");
+    let request = host
+        .store
+        .append_claim(&ClaimInput {
+            subject: schedule.clone(),
+            kind: "schedule.work-requested".into(),
+            actor: None,
+            fields: BTreeMap::from([
+                ("revision".into(), Value::String("unused".into())),
+                ("occurrence".into(), Value::from(1)),
+                ("mission".into(), Value::String("mission/worker".into())),
+                ("mission_revision".into(), Value::String(revision.clone())),
+                (
+                    "workspace".into(),
+                    Value::String("/tmp/st3-fault-isolation".into()),
+                ),
+                (
+                    "inputs".into(),
+                    serde_json::json!({ "undeclared": "value" }),
+                ),
+            ]),
+            evidence: Vec::new(),
+            expected_subject: None,
+            idempotency_key: None,
+        })
+        .unwrap();
+    host.pass(2);
+    let failures = host
+        .store
+        .claims_for(&schedule, Some("schedule.work-failed"))
+        .unwrap();
+    assert_eq!(failures.len(), 1, "{failures:#?}");
+    assert_eq!(failures[0].body["fields"]["request"], request.id);
+    assert!(
+        host.store
+            .pending_schedule_work_requests(&schedule)
+            .unwrap()
+            .is_empty()
+    );
+    schedule_work_request(&host, &schedule, &revision);
+    host.pass(1);
+    assert_eq!(
+        host.store
+            .claims_for(&schedule, Some("schedule.work-started"))
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+fn subscription_request(
+    host: &Host,
+    subscription: &str,
+    mission_revision: &str,
+    discovery: &str,
+) -> String {
+    host.store
+        .append_claim(&ClaimInput {
+            subject: subscription.into(),
+            kind: "subscription.mission-requested".into(),
+            actor: None,
+            fields: BTreeMap::from([
+                ("mission".into(), Value::String("mission/review".into())),
+                (
+                    "mission_revision".into(),
+                    Value::String(mission_revision.into()),
+                ),
+                ("resource".into(), Value::String("resource/repo".into())),
+                ("resource_input".into(), Value::String("source".into())),
+                (
+                    "workspace".into(),
+                    Value::String("/tmp/st3-fault-isolation".into()),
+                ),
+                ("discovery".into(), Value::String(discovery.into())),
+            ]),
+            evidence: Vec::new(),
+            expected_subject: None,
+            idempotency_key: None,
+        })
+        .unwrap()
+        .id
 }
 
 /// hetz and Silber, 21:09Z: a subscription delivery pinned to a claim ID instead of a revision.
 #[test]
-fn a_subscription_delivery_pinned_to_a_claim_id_does_not_stop_cleanup() {
+fn a_subscription_delivery_pinned_to_a_claim_id_waits_beside_other_deliveries() {
     let host = Host::new();
     host.publish(
         r#"version 2
 mission "review" state="ready" {
   input "source" kind="resource"
-  completion { when "all-steps-exhausted" }
+  concurrent-runs max=8
   goal "Review a discovered item."
-  step "review" { agentless }
+  step "review" { goal "Review it." }
 }"#,
         "publish-review",
     );
@@ -661,7 +837,7 @@ mission "review" state="ready" {
   }}"#
     ));
     let subscription = host.owned(&intake, "subscription");
-    let request = std::cell::RefCell::new(None);
+    let requests = std::cell::RefCell::new(Vec::new());
     assert_progress_beside(&host, |host| {
         let discovery = host
             .store
@@ -674,43 +850,147 @@ mission "review" state="ready" {
                 expected_subject: None,
                 idempotency_key: None,
             })
+            .unwrap()
+            .id;
+        // A claim ID where the mission revision belongs, then a delivery that is fine.
+        let pinned = subscription_request(host, &subscription, &discovery, &discovery);
+        let valid = subscription_request(host, &subscription, &revision, &discovery);
+        *requests.borrow_mut() = vec![pinned, valid];
+    });
+    let requests = requests.into_inner();
+    let reason = host
+        .fault(&subscription, "subscription")
+        .expect("the subscription records why its delivery waits");
+    assert!(
+        reason.contains(&requests[0]) && reason.contains("missing-mission"),
+        "{reason}"
+    );
+    assert_eq!(host.fault(DAEMON, "stage/subscriptions"), None);
+    assert!(
+        host.store
+            .claims_for(&subscription, Some("subscription.mission-failed"))
+            .unwrap()
+            .is_empty(),
+        "a delivery that may still arrive was failed"
+    );
+    let started = host
+        .store
+        .claims_for(&subscription, Some("subscription.mission-started"))
+        .unwrap();
+    assert_eq!(started.len(), 1, "{started:#?}");
+    assert_eq!(
+        started[0].body["fields"]["request"].as_str(),
+        Some(requests[1].as_str())
+    );
+}
+
+/// One failing schedule, subscription, or observer does not hold back the others of its kind.
+#[test]
+fn a_failing_intake_item_does_not_hold_back_its_siblings() {
+    for fault in [Fault::Error, Fault::Panic] {
+        let host = Host::new();
+        host.publish(
+            r#"version 2
+mission "review" state="ready" {
+  input "source" kind="resource"
+  concurrent-runs max=8
+  goal "Review a discovered item."
+  step "review" { goal "Review it." }
+}"#,
+            "publish-review",
+        );
+        let review = host
+            .store
+            .mission_spec("review", None)
+            .unwrap()
+            .unwrap()
+            .revision;
+        let worker = worker_revision(&host);
+        let subscription = |name: &str| {
+            format!(
+                r#"  observer "{name}" {{ resource "resource/repo"; provider "github.repository"; locator "example/repo"; field "pull_requests" }}
+  subscription "{name}" {{
+    observer "observer/{name}"
+    on "pull_requests"
+    delivery "mission" {{
+      mission "review@{review}"
+      resource "source"
+      workspace "/tmp/st3-fault-isolation"
+    }}
+  }}"#
+            )
+        };
+        let intake = host.start_intake(&format!(
+            "{}\n{}\n{}\n{}",
+            schedule_source("first", &worker),
+            schedule_source("second", &worker),
+            subscription("first"),
+            subscription("second"),
+        ));
+        let owned = host
+            .store
+            .desired_subjects_for_owner_run(&intake.subject)
             .unwrap();
-        let pinned = host
+        let named = |kind: &str, name: &str| {
+            owned
+                .iter()
+                .find(|desired| desired.kind == kind && desired.subject.ends_with(name))
+                .map(|desired| desired.subject.clone())
+                .unwrap()
+        };
+        // The first of each kind sorts before its sibling, so it is taken up first.
+        for (scope, kind) in [
+            ("observer", "observer"),
+            ("schedule-work", "schedule"),
+            ("subscription", "subscription"),
+        ] {
+            host.faults.fail(scope, &named(kind, "first"), fault);
+        }
+        let second_schedule = named("schedule", "second");
+        let second_subscription = named("subscription", "second");
+        schedule_work_request(&host, &named("schedule", "first"), &worker);
+        schedule_work_request(&host, &second_schedule, &worker);
+        let discovery = host
             .store
             .append_claim(&ClaimInput {
-                subject: subscription.clone(),
-                kind: "subscription.mission-requested".into(),
+                subject: "resource/repo".into(),
+                kind: "resource.observed".into(),
                 actor: None,
-                fields: BTreeMap::from([
-                    ("mission".into(), Value::String("mission/review".into())),
-                    // A claim ID where the mission revision belongs.
-                    (
-                        "mission_revision".into(),
-                        Value::String(discovery.id.clone()),
-                    ),
-                    ("resource".into(), Value::String("resource/repo".into())),
-                    ("resource_input".into(), Value::String("source".into())),
-                    (
-                        "workspace".into(),
-                        Value::String("/tmp/st3-fault-isolation".into()),
-                    ),
-                    ("discovery".into(), Value::String(discovery.id)),
-                ]),
+                fields: BTreeMap::from([("kind".into(), Value::String("vcs.repository".into()))]),
                 evidence: Vec::new(),
                 expected_subject: None,
                 idempotency_key: None,
             })
-            .unwrap();
-        *request.borrow_mut() = Some(pinned.id);
-    });
-    let failures = host
-        .store
-        .claims_for(&subscription, Some("subscription.mission-failed"))
-        .unwrap();
-    assert_eq!(failures.len(), 1, "{failures:#?}");
-    assert_eq!(
-        failures[0].body["fields"]["request"].as_str(),
-        request.borrow().as_deref()
-    );
-    assert_eq!(failures[0].body["fields"]["code"], "missing-mission");
+            .unwrap()
+            .id;
+        subscription_request(&host, &named("subscription", "first"), &review, &discovery);
+        subscription_request(&host, &second_subscription, &review, &discovery);
+        host.pass(2);
+        for (scope, kind) in [
+            ("observer", "observer"),
+            ("schedule-work", "schedule"),
+            ("subscription", "subscription"),
+        ] {
+            assert!(
+                host.fault(&named(kind, "first"), scope).is_some(),
+                "the failing {kind} recorded no fault"
+            );
+        }
+        assert_eq!(
+            host.store
+                .claims_for(&second_schedule, Some("schedule.work-started"))
+                .unwrap()
+                .len(),
+            1,
+            "the second schedule's work did not start"
+        );
+        assert_eq!(
+            host.store
+                .claims_for(&second_subscription, Some("subscription.mission-started"))
+                .unwrap()
+                .len(),
+            1,
+            "the second subscription's delivery did not start"
+        );
+    }
 }
