@@ -10,7 +10,7 @@ anyhow = "1"
 axum = { version = "0.8", features = ["json", "ws"] }
 base64 = "0.22"
 ciborium = "0.2"
-chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
 clap = { version = "4", features = ["derive", "env"] }
 clap_complete = "4"
 data-encoding = "2"
@@ -27,7 +27,7 @@ notify = "8"
 pty-core = { git = "https://github.com/compoundingtech/pty-rust", rev = "a7c60e5c48bd472b957d952d01e644e2153d8a48" }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 ring = "0.17"
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.32", features = ["bundled", "trace"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"

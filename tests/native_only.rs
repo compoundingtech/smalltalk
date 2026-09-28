@@ -3,6 +3,9 @@ use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+#[path = "support/real_git.rs"]
+mod real_git;
+
 fn executable(path: &Path, body: &str) {
     fs::write(path, body).unwrap();
     fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
@@ -11,17 +14,7 @@ fn executable(path: &Path, body: &str) {
 fn clean_path() -> tempfile::TempDir {
     let bin = tempfile::tempdir().unwrap();
     symlink(env!("CARGO_BIN_EXE_st2"), bin.path().join("st2")).unwrap();
-    let git = std::env::split_paths(&std::env::var_os("PATH").unwrap())
-        .map(|dir| dir.join("git"))
-        .find(|path| {
-            path.is_file()
-                && !path.parent().unwrap().join("st3-recorder.json").exists()
-                && fs::read(path).is_ok_and(|bytes| {
-                    !bytes
-                        .windows(b"st2-recorder-wrapper".len())
-                        .any(|window| window == b"st2-recorder-wrapper")
-                })
-        })
+    let git = real_git::on_path(&std::env::var_os("PATH").unwrap())
         .expect("the native authoring guide requires git on PATH");
     symlink(git, bin.path().join("git")).unwrap();
     executable(
