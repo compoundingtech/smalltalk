@@ -1,0 +1,1980 @@
+//! The new stui rendering layer: a shell that draws a `view::World`.
+//!
+//! The shell owns layout, the click map, scrolling, selection and keys. Screens only build
+//! documents (`screens`), and the conversation renderer (`conversation`) turns entries into
+//! cached lines. `stui --demo` runs it on an invented world; the live client will feed it the
+//! same `World`.
+
+pub mod conversation;
+pub mod demo;
+pub mod doc;
+pub mod screens;
+pub mod text;
+pub mod theme;
+// The live client fills the variants and fields the demo does not use.
+#[allow(dead_code)]
+pub mod view;
+
+use anyhow::Result;
+use crossterm::{
+    event::{
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
+        KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+    },
+    execute,
+    terminal::{
+        BeginSynchronizedUpdate, EndSynchronizedUpdate, EnterAlternateScreen, LeaveAlternateScreen,
+        disable_raw_mode, enable_raw_mode,
+    },
+};
+use doc::{Doc, Hit};
+use ratatui::{
+    Terminal,
+    backend::{Backend, CrosstermBackend, TestBackend},
+    buffer::Buffer,
+    layout::Rect,
+    style::{Modifier, Style},
+    text::{Line, Span},
+};
+use screens::{Drafts, Item, ListState, Listing, TABS};
+use std::{
+    cell::RefCell,
+    collections::{HashMap, HashSet},
+    io::{self, Write},
+    rc::Rc,
+    time::{Duration, Instant},
+};
+use view::*;
+
+const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+#[derive(Default, Clone, Copy)]
+struct PaneState {
+    top: usize,
+    follow: bool,
+    seen: usize,
+    unseen: usize,
+}
+
+struct FramePane {
+    key: String,
+    rect: Rect,
+    top: usize,
+    total: usize,
+    lines: Rc<Vec<Line<'static>>>,
+}
+
+#[derive(Default)]
+struct FrameInfo {
+    hits: Vec<(Rect, Hit)>,
+    panes: Vec<FramePane>,
+    sidebar: Rect,
+    sidebar_lines: usize,
+    sidebar_height: usize,
+}
+
+#[derive(Clone)]
+struct Selection {
+    pane: String,
+    anchor: (usize, u16),
+    head: (usize, u16),
+}
+
+struct Demo {
+    started: Instant,
+    loaded: bool,
+    streamed: usize,
+    mail: bool,
+    tool_done: bool,
+    /// When the person first opened these conversations: their demo motion starts then.
+    cos_seen: Option<Instant>,
+    harbor_seen: Option<Instant>,
+}
+
+pub struct Ui {
+    world: World,
+    tab: usize,
+    selected: [usize; 5],
+    list_top: RefCell<[usize; 5]>,
+    panes: RefCell<HashMap<String, PaneState>>,
+    expanded: HashSet<String>,
+    cache: conversation::Cache,
+    drafts: HashMap<String, String>,
+    editing: bool,
+    confirm: Option<char>,
+    flash: Option<(String, Instant)>,
+    tick: u64,
+    help: bool,
+    sidebar: bool,
+    system: bool,
+    frame: RefCell<FrameInfo>,
+    selection: Option<Selection>,
+    dragging: bool,
+    demo: Option<Demo>,
+    quit: bool,
+}
+
+impl Ui {
+    pub fn new(world: World) -> Self {
+        Self {
+            world,
+            tab: 0,
+            selected: [0; 5],
+            list_top: RefCell::new([0; 5]),
+            panes: RefCell::new(HashMap::new()),
+            expanded: HashSet::new(),
+            cache: conversation::Cache::default(),
+            drafts: HashMap::new(),
+            editing: false,
+            confirm: None,
+            flash: None,
+            tick: 0,
+            help: false,
+            sidebar: true,
+            system: false,
+            frame: RefCell::new(FrameInfo::default()),
+            selection: None,
+            dragging: false,
+            demo: None,
+            quit: false,
+        }
+    }
+
+    fn spinner(&self) -> &'static str {
+        SPINNER[(self.tick as usize) % SPINNER.len()]
+    }
+
+    fn listing(&self, width: usize) -> Listing {
+        match self.tab {
+            0 => screens::home_list(&self.world, self.spinner()),
+            1 => screens::agents_list(&self.world, self.spinner(), width),
+            2 => screens::missions_list(&self.world, self.spinner(), self.system),
+            3 => screens::fleet_list(&self.world),
+            _ => screens::worktrees_list(&self.world),
+        }
+    }
+
+    fn ids(&self) -> Vec<String> {
+        self.listing(40).ids
+    }
+
+    fn selected_id(&self) -> Option<String> {
+        let ids = self.ids();
+        ids.get(self.selected[self.tab].min(ids.len().saturating_sub(1)))
+            .cloned()
+    }
+
+    fn flash(&mut self, message: impl Into<String>) {
+        self.flash = Some((message.into(), Instant::now()));
+    }
+
+    fn draft_key(&self) -> Option<String> {
+        self.selected_id()
+    }
+
+    // ------------------------------------------------------------------ drawing
+
+    pub fn render(&self, frame: &mut ratatui::Frame<'_>) {
+        let area = frame.area();
+        let buf = frame.buffer_mut();
+        *self.frame.borrow_mut() = FrameInfo::default();
+        buf.set_style(area, Style::default().bg(theme::BASE).fg(theme::TEXT));
+        if area.width < 20 || area.height < 6 {
+            buf.set_stringn(
+                area.x,
+                area.y,
+                "stui needs a bigger window",
+                area.width as usize,
+                theme::text(),
+            );
+            return;
+        }
+        self.top_bar(buf, Rect { height: 1, ..area });
+        let body = Rect {
+            y: area.y + 1,
+            height: area.height - 2,
+            ..area
+        };
+        let side = if self.sidebar && area.width >= 70 {
+            (area.width * 3 / 10).clamp(30, 46)
+        } else {
+            0
+        };
+        if side > 0 {
+            let sidebar = Rect {
+                width: side,
+                ..body
+            };
+            self.draw_sidebar(buf, sidebar);
+            for y in body.y..body.y + body.height {
+                buf[(area.x + side, y)]
+                    .set_symbol("│")
+                    .set_style(Style::default().fg(theme::SURFACE0).bg(theme::BASE));
+            }
+        }
+        let main = Rect {
+            x: area.x + side + if side > 0 { 2 } else { 1 },
+            width: area
+                .width
+                .saturating_sub(side + if side > 0 { 3 } else { 2 }),
+            ..body
+        };
+        self.draw_main(buf, main);
+        self.footer(
+            buf,
+            Rect {
+                y: area.y + area.height - 1,
+                height: 1,
+                ..area
+            },
+        );
+        if self.help {
+            self.draw_help(buf, area);
+        }
+    }
+
+    fn hit(&self, rect: Rect, hit: Hit) {
+        self.frame.borrow_mut().hits.push((rect, hit));
+    }
+
+    fn top_bar(&self, buf: &mut Buffer, area: Rect) {
+        buf.set_style(area, Style::default().bg(theme::CRUST));
+        let mut x = area.x;
+        buf.set_stringn(
+            x,
+            area.y,
+            " st ",
+            4,
+            theme::strong(theme::ACCENT).bg(theme::CRUST),
+        );
+        x += 5;
+        for (index, name) in TABS.iter().enumerate() {
+            let badge = match index {
+                0 => self
+                    .world
+                    .attention
+                    .ready()
+                    .map(|items| items.iter().filter(|item| item.tier <= Tier::Alert).count())
+                    .filter(|count| *count > 0),
+                _ => None,
+            };
+            let label = format!(" {} {name} ", index + 1);
+            let selected = index == self.tab;
+            let style = if selected {
+                Style::default()
+                    .fg(theme::CRUST)
+                    .bg(theme::ACCENT)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(theme::SUBTEXT0).bg(theme::CRUST)
+            };
+            let start = x;
+            buf.set_stringn(
+                x,
+                area.y,
+                &label,
+                area.width.saturating_sub(x) as usize,
+                style,
+            );
+            x += text::width(&label) as u16;
+            if let Some(count) = badge {
+                let badge = format!("◆{count} ");
+                buf.set_stringn(
+                    x,
+                    area.y,
+                    &badge,
+                    4,
+                    Style::default()
+                        .fg(theme::PERSON)
+                        .bg(if selected {
+                            theme::ACCENT
+                        } else {
+                            theme::CRUST
+                        })
+                        .add_modifier(Modifier::BOLD),
+                );
+                x += text::width(&badge) as u16;
+            }
+            self.hit(
+                Rect {
+                    x: start,
+                    width: x - start,
+                    ..area
+                },
+                Hit::Tab(index),
+            );
+            x += 1;
+        }
+        let (glyph, word, color) = match &self.world.link {
+            Link::Live => ("●", "live", theme::GREEN),
+            Link::Connecting => (self.spinner(), "connecting", theme::YELLOW),
+            Link::Offline(_) => ("○", "offline", theme::RED),
+        };
+        let person = self.world.person.trim_start_matches("person/");
+        let right = format!("{glyph} {word}  {} · {person} ", self.world.host);
+        let width = text::width(&right) as u16;
+        if x + width < area.x + area.width {
+            let start = area.x + area.width - width;
+            buf.set_stringn(
+                start,
+                area.y,
+                format!("{glyph} {word}"),
+                20,
+                Style::default().fg(color).bg(theme::CRUST),
+            );
+            let rest = format!("  {} · {person} ", self.world.host);
+            buf.set_stringn(
+                start + text::width(&format!("{glyph} {word}")) as u16,
+                area.y,
+                rest,
+                40,
+                Style::default().fg(theme::OVERLAY1).bg(theme::CRUST),
+            );
+            self.hit(
+                Rect {
+                    x: start,
+                    width,
+                    ..area
+                },
+                Hit::Help,
+            );
+        }
+    }
+
+    fn footer(&self, buf: &mut Buffer, area: Rect) {
+        buf.set_style(area, Style::default().bg(theme::CRUST));
+        let hints: Vec<(&str, &str)> = if self.editing {
+            vec![("enter", "send"), ("esc", "stop editing"), ("⌫", "delete")]
+        } else if self.confirm.is_some() {
+            vec![("y", "confirm"), ("esc", "cancel")]
+        } else {
+            let mut hints = vec![("1-5", "tabs"), ("↑↓", "select")];
+            match self.tab {
+                0 => hints.extend([("keys", "on the card"), ("c", "write")]),
+                1 => hints.extend([
+                    ("c", "message"),
+                    ("o", "expand tools"),
+                    ("end", "latest"),
+                    ("drag", "select + copy"),
+                ]),
+                2 => hints.extend([("enter", "answer"), ("x", "system missions")]),
+                _ => {}
+            }
+            hints.extend([("?", "help"), ("q", "quit")]);
+            hints
+        };
+        let mut x = area.x + 1;
+        for (key, label) in hints {
+            let key_text = format!("{key} ");
+            let label_text = format!("{label}   ");
+            if x + (text::width(&key_text) + text::width(&label_text)) as u16 > area.x + area.width
+            {
+                break;
+            }
+            buf.set_stringn(
+                x,
+                area.y,
+                &key_text,
+                20,
+                theme::strong(theme::ACCENT).bg(theme::CRUST),
+            );
+            x += text::width(&key_text) as u16;
+            buf.set_stringn(
+                x,
+                area.y,
+                &label_text,
+                40,
+                Style::default().fg(theme::OVERLAY1).bg(theme::CRUST),
+            );
+            x += text::width(&label_text) as u16;
+        }
+        if let Some((message, _)) = &self.flash {
+            let message = format!(" {message} ");
+            let width = text::width(&message) as u16;
+            let start = (area.x + area.width).saturating_sub(width + 1).max(x);
+            buf.set_stringn(
+                start,
+                area.y,
+                &message,
+                (area.x + area.width - start) as usize,
+                Style::default()
+                    .fg(theme::CRUST)
+                    .bg(theme::GREEN)
+                    .add_modifier(Modifier::BOLD),
+            );
+        } else if self.demo.is_some() {
+            let label = " demo · invented data · nothing is sent ";
+            let width = text::width(label) as u16;
+            if x + width < area.x + area.width {
+                buf.set_stringn(
+                    area.x + area.width - width - 1,
+                    area.y,
+                    label,
+                    width as usize,
+                    Style::default().fg(theme::OVERLAY0).bg(theme::CRUST),
+                );
+            }
+        }
+    }
+
+    fn draw_sidebar(&self, buf: &mut Buffer, area: Rect) {
+        buf.set_style(area, Style::default().bg(theme::MANTLE));
+        let width = area.width.saturating_sub(1) as usize;
+        let listing = self.listing(width);
+        let legend_height = if listing.legend.is_empty() {
+            0
+        } else {
+            listing.legend.len() as u16 + 1
+        };
+        let list = Rect {
+            height: area.height.saturating_sub(legend_height),
+            ..area
+        };
+        {
+            let mut info = self.frame.borrow_mut();
+            info.sidebar = list;
+        }
+        // Legend, pinned to the bottom.
+        if legend_height > 0 {
+            let y = area.y + area.height - legend_height;
+            buf.set_stringn(
+                area.x,
+                y,
+                "─".repeat(area.width as usize),
+                area.width as usize,
+                Style::default().fg(theme::SURFACE0).bg(theme::MANTLE),
+            );
+            for (index, line) in listing.legend.iter().enumerate() {
+                buf.set_line(
+                    area.x + 1,
+                    y + 1 + index as u16,
+                    line,
+                    area.width.saturating_sub(1),
+                );
+            }
+        }
+        match &listing.state {
+            ListState::Loading(message) => {
+                buf.set_stringn(
+                    list.x + 1,
+                    list.y + 1,
+                    format!("{} {message}", self.spinner()),
+                    width,
+                    Style::default().fg(theme::OVERLAY1).bg(theme::MANTLE),
+                );
+                return;
+            }
+            ListState::Empty(message) => {
+                buf.set_stringn(
+                    list.x + 1,
+                    list.y + 1,
+                    format!("✓ {message}"),
+                    width,
+                    Style::default().fg(theme::GREEN).bg(theme::MANTLE),
+                );
+                return;
+            }
+            ListState::Failed(error) => {
+                let lines = text::wrap(
+                    &[text::run(
+                        format!("Could not load: {error}"),
+                        theme::fg(theme::RED),
+                    )],
+                    width.saturating_sub(1),
+                    &[],
+                    &[],
+                    None,
+                );
+                for (index, line) in lines.iter().enumerate().take(list.height as usize) {
+                    buf.set_line(list.x + 1, list.y + 1 + index as u16, line, width as u16);
+                }
+                return;
+            }
+            ListState::Ready => {}
+        }
+        // Lay the items out as lines, remembering where the selected row sits.
+        let selected = self.selected[self.tab].min(listing.ids.len().saturating_sub(1));
+        let mut rows: Vec<(Option<usize>, Line<'static>, bool)> = Vec::new();
+        let mut selected_range = (0, 0);
+        for item in &listing.items {
+            match item {
+                Item::Header {
+                    title,
+                    count,
+                    color,
+                } => {
+                    if !rows.is_empty() {
+                        rows.push((None, Line::default(), false));
+                    }
+                    let label = format!(" {title}");
+                    let count = format!("{count} ");
+                    let fill = width.saturating_sub(text::width(&label) + text::width(&count) + 1);
+                    rows.push((
+                        None,
+                        Line::from(vec![
+                            Span::styled(label, theme::strong(*color)),
+                            Span::styled(
+                                format!(" {}", "─".repeat(fill.saturating_sub(1))),
+                                theme::fg(theme::SURFACE0),
+                            ),
+                            Span::styled(format!(" {count}"), theme::dim()),
+                        ]),
+                        false,
+                    ));
+                }
+                Item::Row {
+                    index,
+                    first,
+                    right,
+                    second,
+                } => {
+                    let is_selected = *index == selected;
+                    if is_selected {
+                        selected_range = (rows.len(), rows.len() + 2);
+                    }
+                    let right_width = right.iter().map(Span::width).sum::<usize>();
+                    let mut spans = truncate_spans(first, width.saturating_sub(right_width + 2));
+                    let used = spans.iter().map(Span::width).sum::<usize>();
+                    spans.push(Span::raw(
+                        " ".repeat(width.saturating_sub(used + right_width + 1)),
+                    ));
+                    spans.extend(right.iter().cloned());
+                    rows.push((Some(*index), Line::from(spans), is_selected));
+                    rows.push((
+                        Some(*index),
+                        Line::from(truncate_spans(second, width)),
+                        is_selected,
+                    ));
+                }
+                Item::Note(line) => {
+                    rows.push((None, Line::default(), false));
+                    rows.push((None, line.clone(), false));
+                }
+            }
+        }
+        let height = list.height as usize;
+        let mut top = self.list_top.borrow()[self.tab];
+        if selected_range.1 > top + height {
+            top = selected_range.1 - height;
+        }
+        if selected_range.0 < top {
+            top = selected_range.0.saturating_sub(1);
+        }
+        top = top.min(rows.len().saturating_sub(height));
+        self.list_top.borrow_mut()[self.tab] = top;
+        {
+            let mut info = self.frame.borrow_mut();
+            info.sidebar_lines = rows.len();
+            info.sidebar_height = height;
+        }
+        for (offset, (index, line, is_selected)) in rows.iter().skip(top).take(height).enumerate() {
+            let y = list.y + offset as u16;
+            let row = Rect {
+                x: list.x,
+                y,
+                width: list.width,
+                height: 1,
+            };
+            if *is_selected {
+                buf.set_style(row, Style::default().bg(theme::ROW_SELECTED));
+                buf[(list.x, y)]
+                    .set_symbol("▌")
+                    .set_style(Style::default().fg(theme::ACCENT).bg(theme::ROW_SELECTED));
+            }
+            buf.set_line(list.x + 1, y, line, list.width.saturating_sub(1));
+            if let Some(index) = index {
+                self.hit(row, Hit::Row(*index));
+            }
+        }
+        if rows.len() > height {
+            scrollbar(
+                buf,
+                Rect {
+                    x: list.x + list.width - 1,
+                    ..list
+                },
+                top,
+                rows.len(),
+            );
+        }
+    }
+
+    fn draw_main(&self, buf: &mut Buffer, area: Rect) {
+        let width = area.width.saturating_sub(1) as usize;
+        let id = self.selected_id();
+        match self.tab {
+            0 => {
+                let key = id.clone().unwrap_or_default();
+                let drafts = Drafts {
+                    text: self.drafts.get(&key).map(String::as_str),
+                    editing: self.editing,
+                    confirm: self.confirm,
+                };
+                let doc = screens::home_detail(&self.world, id.as_deref(), width, &drafts);
+                self.pane(buf, &format!("home:{key}"), area, doc, false);
+            }
+            1 => self.draw_agent(buf, area, id.as_deref()),
+            2 => {
+                let doc =
+                    screens::mission_detail(&self.world, id.as_deref(), width, self.spinner());
+                self.pane(
+                    buf,
+                    &format!("mission:{}", id.unwrap_or_default()),
+                    area,
+                    doc,
+                    false,
+                );
+            }
+            3 => {
+                let doc = screens::fleet_detail(&self.world, id.as_deref(), width, self.spinner());
+                self.pane(
+                    buf,
+                    &format!("fleet:{}", id.unwrap_or_default()),
+                    area,
+                    doc,
+                    false,
+                );
+            }
+            _ => {
+                let doc =
+                    screens::worktree_detail(&self.world, id.as_deref(), width, self.spinner());
+                self.pane(
+                    buf,
+                    &format!("tree:{}", id.unwrap_or_default()),
+                    area,
+                    doc,
+                    false,
+                );
+            }
+        }
+    }
+
+    fn draw_agent(&self, buf: &mut Buffer, area: Rect, id: Option<&str>) {
+        let width = area.width.saturating_sub(1) as usize;
+        let Some(agent) = id.and_then(|id| {
+            self.world
+                .agents
+                .items()
+                .iter()
+                .find(|agent| agent.id == id)
+        }) else {
+            let message = match self.world.agents {
+                Load::Loading => format!("{} Loading agents…", self.spinner()),
+                _ => "Select an agent.".into(),
+            };
+            buf.set_stringn(area.x, area.y + 1, message, width, theme::dim());
+            return;
+        };
+        let header = screens::agent_header(&self.world, agent, width, self.spinner());
+        let header_height = header.lines.len() as u16 + 1;
+        self.pane(
+            buf,
+            "agent-header",
+            Rect {
+                height: header_height.min(area.height),
+                ..area
+            },
+            header,
+            false,
+        );
+        let rule_y = area.y + header_height - 1;
+        buf.set_stringn(
+            area.x,
+            rule_y,
+            "─".repeat(area.width as usize),
+            area.width as usize,
+            theme::fg(theme::SURFACE0),
+        );
+        let composer_height = if agent.unmanaged { 0 } else { 3 };
+        let body = Rect {
+            y: area.y + header_height,
+            height: area.height.saturating_sub(header_height + composer_height),
+            ..area
+        };
+        let doc = match self.world.conversations.get(&agent.id) {
+            None | Some(Load::Loading) => {
+                let mut doc = Doc::new();
+                doc.line(Line::from(Span::styled(
+                    format!(" {} Loading the conversation…", self.spinner()),
+                    theme::dim(),
+                )));
+                doc
+            }
+            Some(Load::Failed(reason)) => {
+                let mut doc = Doc::new();
+                doc.blank();
+                let mut inner = Doc::new();
+                inner.wrap(
+                    &[text::run(reason.clone(), theme::soft())],
+                    width.saturating_sub(4),
+                );
+                doc.card(
+                    "no conversation to show",
+                    theme::OVERLAY1,
+                    false,
+                    inner,
+                    width,
+                );
+                doc
+            }
+            Some(Load::Ready(entries)) if entries.is_empty() => {
+                let mut doc = Doc::new();
+                doc.line(Line::from(Span::styled(" No messages yet.", theme::dim())));
+                doc
+            }
+            Some(Load::Ready(entries)) => {
+                let mut doc = Doc::new();
+                doc.blank();
+                doc.append(
+                    self.cache
+                        .render(entries, width, &self.expanded, self.spinner()),
+                    0,
+                );
+                doc.blank();
+                doc
+            }
+        };
+        self.pane(buf, &format!("chat:{}", agent.id), body, doc, true);
+        if composer_height > 0 {
+            let y = body.y + body.height;
+            buf.set_stringn(
+                area.x,
+                y,
+                "─".repeat(area.width as usize),
+                area.width as usize,
+                theme::fg(if self.editing {
+                    theme::ACCENT
+                } else {
+                    theme::SURFACE0
+                }),
+            );
+            let draft = self.drafts.get(&agent.id).cloned().unwrap_or_default();
+            let line = if self.editing {
+                Line::from(vec![
+                    Span::styled("› ", theme::strong(theme::ACCENT)),
+                    Span::styled(
+                        text::truncate(&draft, width.saturating_sub(4)),
+                        theme::text(),
+                    ),
+                    Span::styled("█", theme::fg(theme::ACCENT)),
+                ])
+            } else if draft.is_empty() {
+                Line::from(vec![
+                    Span::styled("› ", theme::dim()),
+                    Span::styled(format!("Message {} · c or click", agent.name), theme::dim()),
+                ])
+            } else {
+                Line::from(vec![
+                    Span::styled("› ", theme::dim()),
+                    Span::styled(
+                        text::truncate(&draft, width.saturating_sub(4)),
+                        theme::soft(),
+                    ),
+                ])
+            };
+            buf.set_line(area.x, y + 1, &line, area.width);
+            self.hit(
+                Rect {
+                    x: area.x,
+                    y: y + 1,
+                    width: area.width,
+                    height: 1,
+                },
+                Hit::Composer,
+            );
+        }
+    }
+
+    /// Draw a document into a scrolling pane, registering its click targets.
+    fn pane(&self, buf: &mut Buffer, key: &str, area: Rect, doc: Doc, follow_default: bool) {
+        let height = area.height as usize;
+        let total = doc.lines.len();
+        let max_top = total.saturating_sub(height);
+        let state = {
+            let mut panes = self.panes.borrow_mut();
+            let state = panes.entry(key.to_owned()).or_insert(PaneState {
+                follow: follow_default,
+                seen: total,
+                ..PaneState::default()
+            });
+            if state.follow {
+                state.top = max_top;
+                state.unseen = 0;
+            } else {
+                state.top = state.top.min(max_top);
+                if total > state.seen {
+                    state.unseen += total - state.seen;
+                }
+            }
+            state.seen = total;
+            *state
+        };
+        let top = state.top;
+        let lines = Rc::new(doc.lines);
+        for (offset, line) in lines.iter().skip(top).take(height).enumerate() {
+            buf.set_line(
+                area.x,
+                area.y + offset as u16,
+                line,
+                area.width.saturating_sub(1),
+            );
+        }
+        for target in &doc.targets {
+            if target.line >= top && target.line < top + height {
+                let rect = Rect {
+                    x: area.x + target.column,
+                    y: area.y + (target.line - top) as u16,
+                    width: target.width.min(area.width.saturating_sub(target.column)),
+                    height: 1,
+                };
+                self.hit(rect, target.hit.clone());
+            }
+        }
+        if let Some(selection) = &self.selection
+            && selection.pane == key
+        {
+            let (start, end) = order(selection.anchor, selection.head);
+            for line in start.0.max(top)..=end.0.min(top + height.saturating_sub(1)) {
+                let y = area.y + (line - top) as u16;
+                let from = if line == start.0 { start.1 } else { 0 };
+                let to = if line == end.0 {
+                    end.1
+                } else {
+                    area.width.saturating_sub(1)
+                };
+                for x in from..=to.min(area.width.saturating_sub(2)) {
+                    buf[(area.x + x, y)].set_bg(theme::SELECTION_BG);
+                }
+            }
+        }
+        if total > height {
+            scrollbar(
+                buf,
+                Rect {
+                    x: area.x + area.width - 1,
+                    ..area
+                },
+                top,
+                total,
+            );
+        }
+        if !state.follow && state.unseen > 0 && follow_default {
+            let label = format!(" ↓ {} new lines · end ", state.unseen);
+            let width = text::width(&label) as u16;
+            let x = area.x + area.width.saturating_sub(width) / 2;
+            let y = area.y + area.height.saturating_sub(1);
+            buf.set_stringn(
+                x,
+                y,
+                &label,
+                width as usize,
+                Style::default()
+                    .fg(theme::CRUST)
+                    .bg(theme::ACCENT)
+                    .add_modifier(Modifier::BOLD),
+            );
+            self.hit(
+                Rect {
+                    x,
+                    y,
+                    width,
+                    height: 1,
+                },
+                Hit::JumpLatest,
+            );
+        }
+        self.frame.borrow_mut().panes.push(FramePane {
+            key: key.to_owned(),
+            rect: area,
+            top,
+            total,
+            lines,
+        });
+    }
+
+    fn draw_help(&self, buf: &mut Buffer, area: Rect) {
+        let width = 64.min(area.width.saturating_sub(4));
+        let mut inner = Doc::new();
+        let w = width as usize - 4;
+        inner.section("what the marks mean", None, w);
+        for (glyph, color, meaning) in [
+            (
+                "◆",
+                theme::PERSON,
+                "a person is needed: you. Mauve is only ever this.",
+            ),
+            (
+                self.spinner(),
+                theme::WORKING,
+                "working: an agent is producing output now",
+            ),
+            ("●", theme::IDLE, "idle: running, nothing to do"),
+            ("◇", theme::WAITING, "unclaimed: ready, nobody has taken it"),
+            ("▲", theme::FAULT, "stalled: an owner that is not moving"),
+            ("✕", theme::FAULT, "broken or failed"),
+            ("○", theme::QUIET, "stopped"),
+            (
+                "?",
+                theme::QUIET,
+                "not started by st, so st cannot see inside it",
+            ),
+            ("✉", theme::SAPPHIRE, "a Small Talk message"),
+        ] {
+            inner.lines(text::wrap(
+                &[text::run(meaning, theme::soft())],
+                w,
+                &[text::run(format!(" {glyph}  "), theme::strong(color))],
+                &[text::run("    ", theme::dim())],
+                None,
+            ));
+        }
+        inner.blank();
+        inner.section("keys", None, w);
+        for (key, meaning) in [
+            ("1-5 or click", "switch tabs"),
+            ("↑↓ j k or click", "select in the list"),
+            ("wheel pgup pgdn", "scroll the pane under the pointer"),
+            ("end", "jump to the newest message and follow it"),
+            ("drag", "select text in one pane; release copies it"),
+            ("o", "expand or collapse tool output"),
+            ("c", "write: a message, feedback, a reply"),
+            ("s", "hide the sidebar"),
+            ("q", "quit"),
+        ] {
+            inner.line(Line::from(vec![
+                Span::styled(format!(" {key:<18}"), theme::strong(theme::ACCENT)),
+                Span::styled(meaning, theme::soft()),
+            ]));
+        }
+        let mut doc = Doc::new();
+        doc.card(
+            "help · ? or esc closes",
+            theme::ACCENT,
+            false,
+            inner,
+            width as usize,
+        );
+        let height = (doc.lines.len() as u16).min(area.height.saturating_sub(2));
+        let rect = Rect {
+            x: area.x + (area.width - width) / 2,
+            y: area.y + (area.height - height) / 2,
+            width,
+            height,
+        };
+        buf.set_style(rect, Style::default().bg(theme::MANTLE));
+        for (offset, line) in doc.lines.iter().take(height as usize).enumerate() {
+            buf.set_line(rect.x, rect.y + offset as u16, line, rect.width);
+        }
+        self.hit(area, Hit::Help);
+    }
+
+    // ------------------------------------------------------------------- input
+
+    fn select(&mut self, index: usize) {
+        let count = self.ids().len();
+        if count == 0 {
+            return;
+        }
+        self.selected[self.tab] = index.min(count - 1);
+        self.editing = false;
+        self.confirm = None;
+        self.selection = None;
+    }
+
+    fn switch_tab(&mut self, tab: usize) {
+        self.tab = tab.min(TABS.len() - 1);
+        self.editing = false;
+        self.confirm = None;
+        self.selection = None;
+    }
+
+    fn open(&mut self, id: &str) {
+        let tab = if id.starts_with("attention/") {
+            0
+        } else if id.starts_with("mission/") {
+            2
+        } else {
+            1
+        };
+        self.switch_tab(tab);
+        if let Some(index) = self.ids().iter().position(|candidate| candidate == id) {
+            self.select(index);
+        }
+    }
+
+    fn scroll_pane(&self, key: &str, delta: isize) {
+        let info = self.frame.borrow();
+        let Some(pane) = info.panes.iter().find(|pane| pane.key == key) else {
+            return;
+        };
+        let max_top = pane.total.saturating_sub(pane.rect.height as usize);
+        let mut panes = self.panes.borrow_mut();
+        let state = panes.entry(key.to_owned()).or_default();
+        let top = (pane.top as isize + delta).clamp(0, max_top as isize) as usize;
+        state.top = top;
+        state.follow = top >= max_top && key.starts_with("chat:");
+        if state.follow {
+            state.unseen = 0;
+        }
+    }
+
+    fn main_pane_key(&self) -> Option<String> {
+        let info = self.frame.borrow();
+        info.panes
+            .iter()
+            .filter(|pane| pane.key != "agent-header")
+            .map(|pane| pane.key.clone())
+            .next()
+    }
+
+    fn follow_latest(&self) {
+        if let Some(key) = self.main_pane_key() {
+            let mut panes = self.panes.borrow_mut();
+            let state = panes.entry(key).or_default();
+            state.follow = true;
+            state.unseen = 0;
+        }
+    }
+
+    pub fn key(&mut self, key: KeyEvent) {
+        if key.kind != KeyEventKind::Press {
+            return;
+        }
+        if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('c')) {
+            if self.editing {
+                self.editing = false;
+            } else {
+                self.quit = true;
+            }
+            return;
+        }
+        if self.help {
+            self.help = false;
+            return;
+        }
+        if self.editing {
+            let key_id = self.draft_key().unwrap_or_default();
+            match key.code {
+                KeyCode::Esc => self.editing = false,
+                KeyCode::Enter => self.submit(),
+                KeyCode::Backspace => {
+                    self.drafts.entry(key_id).or_default().pop();
+                }
+                KeyCode::Char(character) => self.drafts.entry(key_id).or_default().push(character),
+                _ => {}
+            }
+            return;
+        }
+        if let Some(action) = self.confirm {
+            match key.code {
+                KeyCode::Char('y') | KeyCode::Enter => {
+                    self.confirm = None;
+                    self.act(action);
+                }
+                _ => self.confirm = None,
+            }
+            return;
+        }
+        match key.code {
+            KeyCode::Char('q') => self.quit = true,
+            KeyCode::Char('?') => self.help = true,
+            KeyCode::Char(digit @ '1'..='5') => self.switch_tab(digit as usize - '1' as usize),
+            KeyCode::Tab => self.switch_tab((self.tab + 1) % TABS.len()),
+            KeyCode::BackTab => self.switch_tab((self.tab + TABS.len() - 1) % TABS.len()),
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.select(self.selected[self.tab].saturating_sub(1))
+            }
+            KeyCode::Down | KeyCode::Char('j')
+                if !(self.tab == 0 && self.current_kind() == Some("revision"))
+                    || key.code == KeyCode::Down =>
+            {
+                self.select(self.selected[self.tab] + 1)
+            }
+            KeyCode::PageUp => self.scroll_main(-(self.page() as isize)),
+            KeyCode::PageDown => self.scroll_main(self.page() as isize),
+            KeyCode::Home => self.scroll_main(-100_000),
+            KeyCode::End => {
+                self.follow_latest();
+                self.scroll_main(100_000);
+            }
+            KeyCode::Char('s') => self.sidebar = !self.sidebar,
+            KeyCode::Char('x') if self.tab == 2 => self.system = !self.system,
+            KeyCode::Char('o') if self.tab == 1 => self.toggle_all_tools(),
+            KeyCode::Enter if self.tab == 1 => self.editing = true,
+            KeyCode::Enter if self.tab == 2 => {
+                if let Some(decision) = self.selected_id().and_then(|id| {
+                    self.world
+                        .missions
+                        .items()
+                        .iter()
+                        .find(|mission| mission.id == id)
+                        .and_then(|mission| mission.decision.clone())
+                }) {
+                    self.open(&decision);
+                }
+            }
+            KeyCode::Esc => self.selection = None,
+            KeyCode::Char(character) => self.action_key(character),
+            _ => {}
+        }
+    }
+
+    fn page(&self) -> usize {
+        self.main_pane_key()
+            .and_then(|key| {
+                self.frame
+                    .borrow()
+                    .panes
+                    .iter()
+                    .find(|pane| pane.key == key)
+                    .map(|pane| pane.rect.height as usize)
+            })
+            .unwrap_or(10)
+            .saturating_sub(2)
+            .max(1)
+    }
+
+    fn scroll_main(&self, delta: isize) {
+        if let Some(key) = self.main_pane_key() {
+            self.scroll_pane(&key, delta);
+        }
+    }
+
+    fn current_kind(&self) -> Option<&'static str> {
+        let id = self.selected_id()?;
+        self.world
+            .attention
+            .items()
+            .iter()
+            .find(|item| item.id == id)
+            .map(|item| item.kind.word())
+    }
+
+    fn toggle_all_tools(&mut self) {
+        let Some(id) = self.selected_id() else { return };
+        let Some(Load::Ready(entries)) = self.world.conversations.get(&id) else {
+            return;
+        };
+        let tools = entries
+            .iter()
+            .filter(|entry| matches!(entry.body, Body::Tool { .. }))
+            .map(|entry| entry.id.clone())
+            .collect::<Vec<_>>();
+        if tools.iter().all(|tool| self.expanded.contains(tool)) {
+            for tool in tools {
+                self.expanded.remove(&tool);
+            }
+        } else {
+            self.expanded.extend(tools);
+        }
+    }
+
+    fn action_key(&mut self, key: char) {
+        match self.tab {
+            0 => {
+                let Some(kind) = self.current_kind() else {
+                    return;
+                };
+                match (kind, key) {
+                    ("review" | "feedback" | "launch" | "message", 'c') => self.editing = true,
+                    ("review" | "feedback" | "launch" | "revision", 'a') => {
+                        self.confirm = Some('a')
+                    }
+                    ("launch", 'd') | ("revision", 'j') | ("fault", 'r') => {
+                        self.confirm = Some(key)
+                    }
+                    ("message", 'm') => self.act('m'),
+                    ("fault", 'g') => {
+                        if let Some(agent) = self
+                            .world
+                            .agents
+                            .items()
+                            .iter()
+                            .find(|agent| agent.state == AgentState::Fault)
+                        {
+                            let id = agent.id.clone();
+                            self.open(&id);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            1 if key == 'c' => {
+                if self
+                    .world
+                    .agents
+                    .items()
+                    .iter()
+                    .any(|agent| Some(&agent.id) == self.selected_id().as_ref() && !agent.unmanaged)
+                {
+                    self.editing = true;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn submit(&mut self) {
+        let Some(id) = self.draft_key() else { return };
+        let draft = self.drafts.get(&id).cloned().unwrap_or_default();
+        if draft.trim().is_empty() {
+            self.flash("Write something first");
+            return;
+        }
+        self.editing = false;
+        match self.tab {
+            1 => {
+                let name = self
+                    .world
+                    .agents
+                    .items()
+                    .iter()
+                    .find(|agent| agent.id == id)
+                    .map(|agent| agent.name.clone())
+                    .unwrap_or_default();
+                if let Some(Load::Ready(entries)) = self.world.conversations.get_mut(&id) {
+                    entries.push(Entry {
+                        id: format!("you-{}", entries.len()),
+                        at: chrono::Local::now().format("%H:%M").to_string(),
+                        body: Body::Mail {
+                            from: "you".into(),
+                            to: name,
+                            subject: String::new(),
+                            body: draft,
+                        },
+                    });
+                }
+                self.drafts.remove(&id);
+                self.follow_latest();
+                self.flash("Sent · demo: nothing left this machine");
+            }
+            _ => {
+                self.drafts.remove(&id);
+                self.resolve(&id, "Sent to the agent");
+            }
+        }
+    }
+
+    fn act(&mut self, action: char) {
+        let Some(id) = self.selected_id() else { return };
+        let message = match action {
+            'a' => "Approved",
+            'd' => "Launch cancelled",
+            'j' => "Revision rejected",
+            'r' => "Marked resolved",
+            'm' => "Marked read",
+            _ => "Done",
+        };
+        self.resolve(&id, message);
+    }
+
+    fn resolve(&mut self, id: &str, message: &str) {
+        if let Load::Ready(items) = &mut self.world.attention {
+            items.retain(|item| item.id != id);
+        }
+        for mission in self.world.missions.items().to_vec() {
+            if mission.decision.as_deref() == Some(id)
+                && let Load::Ready(missions) = &mut self.world.missions
+                && let Some(mission) = missions
+                    .iter_mut()
+                    .find(|candidate| candidate.id == mission.id)
+            {
+                mission.decision = None;
+                mission.word = Word::Working;
+                for step in &mut mission.steps {
+                    if step.state == StepState::NeedsYou {
+                        step.state = StepState::Working;
+                        step.note = Some("you answered; the agent is on it".into());
+                    }
+                }
+            }
+        }
+        self.select(self.selected[0]);
+        self.flash(format!("{message} · demo: nothing was sent"));
+    }
+
+    pub fn mouse(&mut self, mouse: MouseEvent) {
+        if self.help {
+            if matches!(mouse.kind, MouseEventKind::Down(_)) {
+                self.help = false;
+            }
+            return;
+        }
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                let hit = {
+                    let info = self.frame.borrow();
+                    info.hits
+                        .iter()
+                        .rev()
+                        .find(|(rect, _)| contains(*rect, mouse.column, mouse.row))
+                        .map(|(_, hit)| hit.clone())
+                };
+                self.selection = None;
+                if let Some(hit) = hit {
+                    self.click(hit);
+                    return;
+                }
+                if let Some((key, line, column)) = self.pane_point(mouse.column, mouse.row) {
+                    self.selection = Some(Selection {
+                        pane: key,
+                        anchor: (line, column),
+                        head: (line, column),
+                    });
+                    self.dragging = true;
+                }
+            }
+            MouseEventKind::Drag(MouseButton::Left) if self.dragging => {
+                let edge = {
+                    let info = self.frame.borrow();
+                    self.selection.as_ref().and_then(|selection| {
+                        info.panes
+                            .iter()
+                            .find(|pane| pane.key == selection.pane)
+                            .map(|pane| (pane.rect, pane.top))
+                    })
+                };
+                if let (Some(selection), Some((rect, top))) = (self.selection.clone(), edge) {
+                    if mouse.row < rect.y {
+                        self.scroll_pane(&selection.pane, -1);
+                    } else if mouse.row >= rect.y + rect.height {
+                        self.scroll_pane(&selection.pane, 1);
+                    }
+                    let row = mouse
+                        .row
+                        .clamp(rect.y, rect.y + rect.height.saturating_sub(1));
+                    let column = mouse
+                        .column
+                        .clamp(rect.x, rect.x + rect.width.saturating_sub(2))
+                        - rect.x;
+                    if let Some(selection) = &mut self.selection {
+                        selection.head = (top + (row - rect.y) as usize, column);
+                    }
+                }
+            }
+            MouseEventKind::Up(MouseButton::Left) if self.dragging => {
+                self.dragging = false;
+                if let Some(selection) = &self.selection {
+                    if selection.anchor == selection.head {
+                        self.selection = None;
+                    } else if let Some(copied) = self.selected_text() {
+                        let count = copied.lines().count();
+                        copy(&copied);
+                        self.flash(format!(
+                            "Copied {count} line{}",
+                            if count == 1 { "" } else { "s" }
+                        ));
+                    }
+                }
+            }
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                let delta = if matches!(mouse.kind, MouseEventKind::ScrollUp) {
+                    -3
+                } else {
+                    3
+                };
+                let (in_sidebar, pane) = {
+                    let info = self.frame.borrow();
+                    (
+                        contains(info.sidebar, mouse.column, mouse.row),
+                        info.panes
+                            .iter()
+                            .find(|pane| contains(pane.rect, mouse.column, mouse.row))
+                            .map(|pane| pane.key.clone()),
+                    )
+                };
+                if in_sidebar {
+                    let (lines, height) = {
+                        let info = self.frame.borrow();
+                        (info.sidebar_lines, info.sidebar_height)
+                    };
+                    let mut tops = self.list_top.borrow_mut();
+                    tops[self.tab] = (tops[self.tab] as isize + delta)
+                        .clamp(0, lines.saturating_sub(height) as isize)
+                        as usize;
+                } else if let Some(key) = pane {
+                    self.scroll_pane(&key, delta);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn click(&mut self, hit: Hit) {
+        match hit {
+            Hit::Tab(tab) => self.switch_tab(tab),
+            Hit::Row(index) => self.select(index),
+            Hit::Key(key) => {
+                if key == 'y' {
+                    if let Some(action) = self.confirm.take() {
+                        self.act(action);
+                    }
+                } else {
+                    self.confirm = None;
+                    self.action_key(key);
+                }
+            }
+            Hit::Enter => self.submit(),
+            Hit::Escape => {
+                self.editing = false;
+                self.confirm = None;
+            }
+            Hit::ToggleTool(id) => {
+                if !self.expanded.remove(&id) {
+                    self.expanded.insert(id);
+                }
+            }
+            Hit::JumpLatest => self.follow_latest(),
+            Hit::Composer => self.editing = true,
+            Hit::Help => self.help = !self.help,
+            Hit::Open(id) => self.open(&id),
+        }
+    }
+
+    fn pane_point(&self, column: u16, row: u16) -> Option<(String, usize, u16)> {
+        let info = self.frame.borrow();
+        let pane = info
+            .panes
+            .iter()
+            .find(|pane| contains(pane.rect, column, row))?;
+        Some((
+            pane.key.clone(),
+            pane.top + (row - pane.rect.y) as usize,
+            column - pane.rect.x,
+        ))
+    }
+
+    fn selected_text(&self) -> Option<String> {
+        let selection = self.selection.as_ref()?;
+        let info = self.frame.borrow();
+        let pane = info.panes.iter().find(|pane| pane.key == selection.pane)?;
+        let (start, end) = order(selection.anchor, selection.head);
+        let mut out = Vec::new();
+        for line in start.0..=end.0.min(pane.lines.len().saturating_sub(1)) {
+            let plain = text::plain(&pane.lines[line]);
+            let from = if line == start.0 { start.1 as usize } else { 0 };
+            let to = if line == end.0 {
+                end.1 as usize + 1
+            } else {
+                usize::MAX
+            };
+            out.push(columns(&plain, from, to).trim_end().to_owned());
+        }
+        Some(out.join("\n"))
+    }
+
+    // -------------------------------------------------------------------- demo
+
+    pub fn step_demo(&mut self) {
+        let Some(demo) = &mut self.demo else { return };
+        let elapsed = demo.started.elapsed();
+        if !demo.loaded {
+            let full = demo::world();
+            let stage = elapsed.as_millis() / 350;
+            if stage >= 1 {
+                self.world.link = Link::Live;
+                self.world.attention = full.attention.clone();
+                self.world.quiet_missions = full.quiet_missions;
+            }
+            if stage >= 2 {
+                self.world.agents = full.agents.clone();
+            }
+            if stage >= 3 {
+                self.world.missions = full.missions.clone();
+                self.world.machines = full.machines.clone();
+                self.world.worktrees = full.worktrees.clone();
+                self.world.conversations = full.conversations;
+                if let Some(Load::Ready(entries)) = self
+                    .world
+                    .conversations
+                    .get_mut("agent/fleet/harbor/reviewer")
+                {
+                    entries.push(Entry {
+                        id: "h3".into(),
+                        at: "09:14".into(),
+                        body: Body::Tool {
+                            title: "$ cargo test -p harbor --test retry".into(),
+                            state: ToolState::Running,
+                            output: vec!["compiling harbor v0.9.0".into()],
+                        },
+                    });
+                }
+                demo.loaded = true;
+            }
+            return;
+        }
+        let viewing = (self.tab == 1)
+            .then(|| {
+                let ids = screens::agent_order(&self.world)
+                    .into_iter()
+                    .map(|agent| agent.id.clone())
+                    .collect::<Vec<_>>();
+                ids.get(self.selected[1]).cloned()
+            })
+            .flatten();
+        let Some(demo) = &mut self.demo else { return };
+        let now = Instant::now();
+        match viewing.as_deref() {
+            Some("agent/fleet/cos") if demo.cos_seen.is_none() => demo.cos_seen = Some(now),
+            Some("agent/fleet/harbor/reviewer") if demo.harbor_seen.is_none() => {
+                demo.harbor_seen = Some(now)
+            }
+            _ => {}
+        }
+        let cos = demo
+            .cos_seen
+            .map(|at| at.elapsed().as_secs_f32())
+            .unwrap_or(0.0);
+        let harbor = demo
+            .harbor_seen
+            .map(|at| at.elapsed().as_secs_f32())
+            .unwrap_or(0.0);
+        if cos > 1.5 {
+            let words = demo::STREAM.split(' ').collect::<Vec<_>>();
+            let want = (((cos - 1.5) * 6.0) as usize).min(words.len());
+            if want > demo.streamed
+                && let Some(Load::Ready(entries)) =
+                    self.world.conversations.get_mut("agent/fleet/cos")
+            {
+                let text = words[..want].join(" ");
+                if let Some(entry) = entries.iter_mut().find(|entry| entry.id == "stream") {
+                    entry.body = Body::Assistant(text);
+                } else {
+                    entries.push(Entry {
+                        id: "stream".into(),
+                        at: "09:50".into(),
+                        body: Body::Assistant(text),
+                    });
+                }
+                demo.streamed = want;
+            }
+        }
+        if harbor > 3.0 && !demo.tool_done {
+            demo.tool_done = true;
+            if let Some(Load::Ready(entries)) = self
+                .world
+                .conversations
+                .get_mut("agent/fleet/harbor/reviewer")
+                && let Some(entry) = entries.iter_mut().find(|entry| entry.id == "h3")
+            {
+                entry.body = Body::Tool {
+                    title: "$ cargo test -p harbor --test retry".into(),
+                    state: ToolState::Ok,
+                    output: vec![
+                        "compiling harbor v0.9.0".into(),
+                        "running 3 tests".into(),
+                        "test retry_after_is_milliseconds ... ok".into(),
+                        "test paused_clock_backoff ... ok".into(),
+                        "test gives_up_after_five ... ok".into(),
+                        "".into(),
+                        "test result: ok. 3 passed; 0 failed".into(),
+                    ],
+                };
+            }
+        }
+        if cos > 8.0 && !demo.mail {
+            demo.mail = true;
+            if let Some(Load::Ready(entries)) = self.world.conversations.get_mut("agent/fleet/cos")
+            {
+                entries.push(demo::late_mail());
+            }
+        }
+    }
+}
+
+fn order(a: (usize, u16), b: (usize, u16)) -> ((usize, u16), (usize, u16)) {
+    if a <= b { (a, b) } else { (b, a) }
+}
+
+fn contains(rect: Rect, column: u16, row: u16) -> bool {
+    column >= rect.x && column < rect.x + rect.width && row >= rect.y && row < rect.y + rect.height
+}
+
+/// The part of `line` between two display columns.
+fn columns(line: &str, from: usize, to: usize) -> String {
+    use unicode_width::UnicodeWidthChar;
+    let mut column = 0;
+    let mut out = String::new();
+    for character in line.chars() {
+        let width = character.width().unwrap_or(0);
+        if column >= from && column < to {
+            out.push(character);
+        }
+        column += width;
+    }
+    out
+}
+
+fn truncate_spans(spans: &[Span<'static>], width: usize) -> Vec<Span<'static>> {
+    let mut out = Vec::new();
+    let mut used = 0;
+    for span in spans {
+        let span_width = span.width();
+        if used + span_width <= width {
+            out.push(span.clone());
+            used += span_width;
+        } else {
+            let room = width.saturating_sub(used);
+            if room > 0 {
+                out.push(Span::styled(
+                    text::truncate(&span.content, room),
+                    span.style,
+                ));
+            }
+            break;
+        }
+    }
+    out
+}
+
+fn scrollbar(buf: &mut Buffer, area: Rect, top: usize, total: usize) {
+    let height = area.height as usize;
+    if total <= height || height == 0 {
+        return;
+    }
+    let thumb = (height * height / total).max(1);
+    let max_top = total - height;
+    let start = (height - thumb) * top / max_top.max(1);
+    for row in 0..height {
+        let on = row >= start && row < start + thumb;
+        buf[(area.x, area.y + row as u16)]
+            .set_symbol(if on { "┃" } else { "│" })
+            .set_fg(if on { theme::OVERLAY0 } else { theme::SURFACE0 });
+    }
+}
+
+/// Copy through OSC 52, which kitty, iTerm2, WezTerm and tmux (with set-clipboard) accept.
+fn copy(text: &str) {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let bytes = text.as_bytes();
+    let mut encoded = String::new();
+    for chunk in bytes.chunks(3) {
+        let n = (chunk[0] as u32) << 16
+            | (*chunk.get(1).unwrap_or(&0) as u32) << 8
+            | *chunk.get(2).unwrap_or(&0) as u32;
+        for index in 0..4 {
+            if index <= chunk.len() {
+                encoded.push(TABLE[(n >> (18 - 6 * index) & 63) as usize] as char);
+            } else {
+                encoded.push('=');
+            }
+        }
+    }
+    let mut stdout = io::stdout();
+    let _ = write!(stdout, "\x1b]52;c;{encoded}\x07");
+    let _ = stdout.flush();
+}
+
+// ------------------------------------------------------------------------ run
+
+struct Guard;
+
+impl Guard {
+    fn enter() -> Result<Self> {
+        enable_raw_mode()?;
+        execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
+        Ok(Self)
+    }
+}
+
+impl Drop for Guard {
+    fn drop(&mut self) {
+        let _ = execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen);
+        let _ = disable_raw_mode();
+    }
+}
+
+fn arg(args: &[String], name: &str) -> Option<String> {
+    args.iter()
+        .position(|arg| arg == name)
+        .and_then(|index| args.get(index + 1))
+        .cloned()
+}
+
+/// `stui --demo`: the new interface on invented data. `--dump` prints one frame as text.
+pub fn run_demo(args: &[String]) -> Result<()> {
+    if args.iter().any(|arg| arg == "--dump") {
+        return dump(args);
+    }
+    let _guard = Guard::enter()?;
+    let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
+    terminal.hide_cursor()?;
+    let mut ui = Ui::new(demo::loading());
+    ui.demo = Some(Demo {
+        started: Instant::now(),
+        loaded: false,
+        streamed: 0,
+        mail: false,
+        tool_done: false,
+        cos_seen: None,
+        harbor_seen: None,
+    });
+    let started = Instant::now();
+    while !ui.quit {
+        ui.tick = (started.elapsed().as_millis() / 100) as u64;
+        ui.step_demo();
+        if ui
+            .flash
+            .as_ref()
+            .is_some_and(|(_, at)| at.elapsed() > Duration::from_secs(3))
+        {
+            ui.flash = None;
+        }
+        execute!(io::stdout(), BeginSynchronizedUpdate)?;
+        terminal.draw(|frame| ui.render(frame))?;
+        execute!(io::stdout(), EndSynchronizedUpdate)?;
+        if event::poll(Duration::from_millis(80))? {
+            // Drain everything queued so a fast wheel does not lag behind.
+            loop {
+                match event::read()? {
+                    Event::Key(key) => ui.key(key),
+                    Event::Mouse(mouse) => ui.mouse(mouse),
+                    _ => {}
+                }
+                if !event::poll(Duration::ZERO)? {
+                    break;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn dump(args: &[String]) -> Result<()> {
+    let width = arg(args, "--width")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(140);
+    let height = arg(args, "--height")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(44);
+    let mut ui = Ui::new(if args.iter().any(|arg| arg == "--loading") {
+        demo::loading()
+    } else {
+        demo::world()
+    });
+    let mut terminal = Terminal::new(TestBackend::new(width, height))?;
+    // Keys: each character is a key; "\n" is Enter, "<esc>", "<end>", "<pgdn>", "<pgup>", "<down>".
+    if let Some(keys) = arg(args, "--keys") {
+        let mut rest = keys.as_str();
+        while !rest.is_empty() {
+            terminal.draw(|frame| ui.render(frame))?;
+            let (code, len) =
+                if let Some(end) = rest.strip_prefix('<').and_then(|tail| tail.find('>')) {
+                    let name = &rest[1..=end];
+                    let code = match name {
+                        "esc" => KeyCode::Esc,
+                        "end" => KeyCode::End,
+                        "pgdn" => KeyCode::PageDown,
+                        "pgup" => KeyCode::PageUp,
+                        "down" => KeyCode::Down,
+                        "up" => KeyCode::Up,
+                        "enter" => KeyCode::Enter,
+                        "tab" => KeyCode::Tab,
+                        _ => KeyCode::Null,
+                    };
+                    (code, end + 2)
+                } else {
+                    let character = rest.chars().next().unwrap_or(' ');
+                    (KeyCode::Char(character), character.len_utf8())
+                };
+            ui.key(KeyEvent::new(code, KeyModifiers::NONE));
+            rest = &rest[len..];
+        }
+    }
+    if let Some(click) = arg(args, "--click") {
+        terminal.draw(|frame| ui.render(frame))?;
+        let mut parts = click.split(',').filter_map(|v| v.parse::<u16>().ok());
+        if let (Some(column), Some(row)) = (parts.next(), parts.next()) {
+            ui.mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column,
+                row,
+                modifiers: KeyModifiers::NONE,
+            });
+        }
+    }
+    terminal.draw(|frame| ui.render(frame))?;
+    // Draw twice so panes that follow the end settle.
+    terminal.draw(|frame| ui.render(frame))?;
+    let buffer = terminal.backend().buffer();
+    let mut out = String::new();
+    for y in 0..buffer.area.height {
+        let mut line = String::new();
+        let mut skip = 0;
+        for x in 0..buffer.area.width {
+            if skip > 0 {
+                skip -= 1;
+                continue;
+            }
+            let symbol = buffer[(x, y)].symbol();
+            skip = text::width(symbol).saturating_sub(1);
+            line.push_str(symbol);
+        }
+        out.push_str(line.trim_end());
+        out.push('\n');
+    }
+    let _ = terminal.backend_mut().flush();
+    print!("{out}");
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn frame(ui: &Ui, width: u16, height: u16) -> Vec<String> {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|frame| ui.render(frame)).unwrap();
+        terminal.draw(|frame| ui.render(frame)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        (0..height)
+            .map(|y| {
+                (0..width)
+                    .map(|x| buffer[(x, y)].symbol().to_owned())
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn loading_never_says_empty() {
+        let mut ui = Ui::new(demo::loading());
+        for tab in 0..5 {
+            ui.tab = tab;
+            let screen = frame(&ui, 120, 30).join("\n");
+            assert!(!screen.contains("No agents"), "tab {tab}");
+            assert!(!screen.contains("Nothing needs you"), "tab {tab}");
+            assert!(
+                screen.contains("Loading") || screen.contains("Checking"),
+                "tab {tab}: {screen}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_tab_is_clickable() {
+        let mut ui = Ui::new(demo::world());
+        frame(&ui, 140, 40);
+        let tabs = ui
+            .frame
+            .borrow()
+            .hits
+            .iter()
+            .filter(|(_, hit)| matches!(hit, Hit::Tab(_)))
+            .map(|(rect, hit)| (*rect, hit.clone()))
+            .collect::<Vec<_>>();
+        assert_eq!(tabs.len(), 5);
+        let (rect, _) = tabs[3];
+        ui.mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: rect.x + 1,
+            row: rect.y,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(ui.tab, 3);
+    }
+
+    #[test]
+    fn a_conversation_follows_new_lines_until_scrolled_up() {
+        let mut ui = Ui::new(demo::world());
+        ui.tab = 1;
+        let cos = ui
+            .ids()
+            .iter()
+            .position(|id| id == "agent/fleet/cos")
+            .unwrap();
+        ui.select(cos);
+        frame(&ui, 140, 30);
+        let key = "chat:agent/fleet/cos".to_owned();
+        assert!(ui.panes.borrow()[&key].follow);
+        ui.scroll_pane(&key, -5);
+        assert!(!ui.panes.borrow()[&key].follow);
+        if let Some(Load::Ready(entries)) = ui.world.conversations.get_mut("agent/fleet/cos") {
+            entries.push(demo::late_mail());
+        }
+        let screen = frame(&ui, 140, 30).join("\n");
+        assert!(screen.contains("new lines"), "{screen}");
+        ui.follow_latest();
+        frame(&ui, 140, 30);
+        assert!(ui.panes.borrow()[&key].follow);
+    }
+
+    #[test]
+    fn selection_copies_only_its_own_pane() {
+        let mut ui = Ui::new(demo::world());
+        ui.tab = 1;
+        frame(&ui, 140, 30);
+        let pane = ui
+            .frame
+            .borrow()
+            .panes
+            .iter()
+            .find(|pane| pane.key.starts_with("chat:"))
+            .map(|pane| pane.rect)
+            .unwrap();
+        ui.mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 0,
+            row: pane.y + 2,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(
+            ui.selection.is_none(),
+            "a press in the sidebar is not a text selection"
+        );
+        ui.mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: pane.x + 1,
+            row: pane.y + 2,
+            modifiers: KeyModifiers::NONE,
+        });
+        ui.mouse(MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            column: 0,
+            row: pane.y + 4,
+            modifiers: KeyModifiers::NONE,
+        });
+        let selection = ui.selection.clone().unwrap();
+        assert!(selection.pane.starts_with("chat:"));
+        assert_eq!(
+            selection.head.1, 0,
+            "dragging past the pane edge clamps to the pane"
+        );
+    }
+
+    #[test]
+    fn every_attention_kind_draws_its_own_card() {
+        let mut ui = Ui::new(demo::world());
+        let expectations = [
+            ("attention/1", "Request changes"),
+            ("attention/2", "YOUR FEEDBACK"),
+            ("attention/3", "Approve launch"),
+            ("attention/4", "SUGGESTED FIX"),
+            ("attention/5", "Approve revision"),
+            ("attention/6", "Reply"),
+        ];
+        for (id, text) in expectations {
+            let index = ui
+                .ids()
+                .iter()
+                .position(|candidate| candidate == id)
+                .unwrap();
+            ui.select(index);
+            let screen = frame(&ui, 150, 60).join("\n");
+            assert!(screen.contains(text), "{id} should show {text}:\n{screen}");
+        }
+    }
+
+    #[test]
+    fn frames_never_exceed_their_width() {
+        let mut ui = Ui::new(demo::world());
+        for width in [72u16, 100, 160] {
+            for tab in 0..5 {
+                ui.tab = tab;
+                for line in frame(&ui, width, 40) {
+                    assert!(text::width(&line) <= width as usize);
+                }
+            }
+        }
+    }
+}

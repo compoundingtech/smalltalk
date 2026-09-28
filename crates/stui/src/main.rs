@@ -1,5 +1,6 @@
 mod cache;
 mod model;
+mod ui;
 
 use anyhow::{Context, Result};
 use crossterm::{
@@ -1667,7 +1668,11 @@ fn terminal_run_style(run: &st3_client::TerminalRun) -> Style {
         st3_client::TerminalColor::Palette(index) => Some(Color::Indexed(*index)),
         st3_client::TerminalColor::Rgb(hex) => {
             let value = u32::from_str_radix(hex.strip_prefix('#')?, 16).ok()?;
-            Some(Color::Rgb((value >> 16) as u8, (value >> 8) as u8, value as u8))
+            Some(Color::Rgb(
+                (value >> 16) as u8,
+                (value >> 8) as u8,
+                value as u8,
+            ))
         }
     };
     let mut style = Style::default();
@@ -2464,6 +2469,10 @@ async fn handle_key(app: &mut App, client: &Client, key: KeyEvent) -> Result<boo
 }
 
 fn main() -> Result<()> {
+    let args = std::env::args().collect::<Vec<_>>();
+    if args.iter().any(|arg| arg == "--demo") {
+        return ui::run_demo(&args);
+    }
     if !io::stdout().is_terminal() {
         anyhow::bail!("stui needs an interactive terminal");
     }
