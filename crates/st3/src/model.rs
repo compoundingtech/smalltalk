@@ -689,8 +689,10 @@ pub enum GateSpec {
     Human {
         name: String,
         reviewer: String,
-        #[serde(default = "default_human_gate_mode")]
-        mode: String,
+        // Preserve absence in older mission claims: their revision was hashed before
+        // human gates carried a mode. Runtime evaluation treats None as approve.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mode: Option<String>,
         #[serde(default)]
         question: Option<String>,
         #[serde(default)]

@@ -7137,7 +7137,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                 definition_hash,
                 attempt,
                 reviewer,
-                mode,
+                mode.as_deref().unwrap_or("approve"),
                 question.as_deref(),
                 review_targets,
             );
