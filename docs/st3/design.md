@@ -120,6 +120,10 @@ recovery.
 A running member whose workspace or render fails is still observed, checked, and woken for its
 work. The failure blocks only its start and restart.
 
+Two members can render different bytes to the same file. Then only the member that would change
+the file on disk faults. The member whose content is already there keeps rendering, so declaring a
+new member never takes down one that runs.
+
 Sometimes the PTY registry does not answer, or one PTY's record cannot be read. Terminal members then
 wait for the next readable snapshot: none is started, restarted, or recorded as stopped. Exec
 members and the rest of the pass still run.
