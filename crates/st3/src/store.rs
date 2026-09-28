@@ -26,10 +26,10 @@ use crate::model::{
     PlannerSpec, PlanningCandidateView, PlanningPreviewView, PlanningSessionDeclaration,
     PlanningSessionView, PlanningVariantView, ReplicaBatch, ReplicaEnvelope, ReplicaEnvelopeId,
     ReplicaRecordView, ReplicaRepairDeclaration, ReplicationExchange, ReplicationInventory,
-    ReplicationInventoryBucket, ReplicationPeerStatus, ReplicationReceipt, ReplicationStatus,
-    ResourceObservationOutcome, ResourceRefreshOperation, RevisionCutover, RevisionProposalView,
-    RevisionSubmissionView, RunGenerationView, RuntimeResetOperation, St3Error, StatusResponse,
-    StepRunView, SubjectChange, SubjectStatus, SubscriptionConditionSpec,
+    ReplicationInventoryBucket, ReplicationPeerStatus, ReplicationPeerSync, ReplicationReceipt,
+    ReplicationStatus, ResourceObservationOutcome, ResourceRefreshOperation, RevisionCutover,
+    RevisionProposalView, RevisionSubmissionView, RunGenerationView, RuntimeResetOperation,
+    St3Error, StatusResponse, StepRunView, SubjectChange, SubjectStatus, SubscriptionConditionSpec,
     SubscriptionRequestDecision, SubscriptionRequestView, SubscriptionSpec, UsageSummary,
     WorkRequest, WorkSelector, WorkWakeView,
 };
@@ -595,6 +595,7 @@ pub struct Store {
     seeded_batch_rowid: AtomicI64,
     replica_generation: AtomicU64,
     replication_snapshot: Mutex<Option<Arc<ReplicationSnapshot>>>,
+    replication_sync: Mutex<BTreeMap<String, PeerSyncProgress>>,
     /// This node's fleet member key. Set, it signs every envelope of this node's writer.
     member_key: std::sync::RwLock<Option<Arc<crate::fleet::MemberKey>>>,
     origin: String,
@@ -668,6 +669,71 @@ struct ReplicationSnapshot {
     authority_digest: String,
     graph_generation: i64,
     graph_digest: String,
+}
+
+/// Live sync measurements for one peer. They are rebuilt by the first exchange after a restart,
+/// so they stay in memory rather than in the graph.
+#[derive(Clone, Debug, Default)]
+struct PeerSyncProgress {
+    measured: Option<ReplicationPeerSync>,
+    window_started_at_unix_ms: u128,
+    window_peer_only: u64,
+    window_received: u64,
+}
+
+impl PeerSyncProgress {
+    /// Record one receipt from the peer and, when the peer's inventory allowed it, the measured
+    /// difference `(peer_only, local_only)`. Rates are sampled over windows of at least
+    /// `REPLICATION_SYNC_WINDOW_MS` and smoothed so one slow exchange does not swing the estimate.
+    fn observe(&mut self, received: usize, difference: Option<(u64, u64)>, now: u128) {
+        self.window_received = self.window_received.saturating_add(received as u64);
+        let Some((peer_only, local_only)) = difference else {
+            return;
+        };
+        let mut sync = self.measured.take().unwrap_or_default();
+        sync.peer_only_envelopes = peer_only;
+        sync.local_only_envelopes = local_only;
+        sync.measured_at_unix_ms = now;
+        let elapsed = now.saturating_sub(self.window_started_at_unix_ms);
+        if self.window_started_at_unix_ms != 0 && elapsed >= REPLICATION_SYNC_WINDOW_MS {
+            if elapsed <= REPLICATION_SYNC_STALE_MS {
+                let seconds = elapsed as f64 / 1000.0;
+                let smooth = |previous: Option<f64>, sample: f64| {
+                    Some(previous.map_or(sample, |previous| (previous + sample) / 2.0))
+                };
+                sync.receive_rate_per_second = smooth(
+                    sync.receive_rate_per_second,
+                    self.window_received as f64 / seconds,
+                );
+                let caught_up = self.window_peer_only as f64 - peer_only as f64;
+                sync.catch_up_rate_per_second =
+                    smooth(sync.catch_up_rate_per_second, caught_up.max(0.0) / seconds);
+            }
+            self.window_started_at_unix_ms = 0;
+        }
+        if self.window_started_at_unix_ms == 0 {
+            self.window_started_at_unix_ms = now;
+            self.window_peer_only = peer_only;
+            self.window_received = 0;
+        }
+        sync.estimated_catch_up_seconds = if peer_only == 0 {
+            Some(0)
+        } else {
+            sync.catch_up_rate_per_second
+                .filter(|rate| *rate > 0.0)
+                .map(|rate| (peer_only as f64 / rate).ceil() as u64)
+        };
+        self.measured = Some(sync);
+    }
+
+    /// The last measurement, marked as catching up while it is recent and the peer holds more
+    /// than one exchange of envelopes this node lacks.
+    fn view(&self, now: u128) -> Option<ReplicationPeerSync> {
+        let mut sync = self.measured.clone()?;
+        sync.catching_up = sync.peer_only_envelopes > REPLICATION_EXCHANGE_ENVELOPE_LIMIT as u64
+            && now.saturating_sub(sync.measured_at_unix_ms) <= REPLICATION_SYNC_STALE_MS;
+        Some(sync)
+    }
 }
 
 /// The replica envelope identities a snapshot keeps for its whole life. Writers are interned
@@ -1212,6 +1278,7 @@ impl Store {
             seeded_batch_rowid: AtomicI64::new(seeded_batch_rowid),
             replica_generation: AtomicU64::new(0),
             replication_snapshot: Mutex::new(None),
+            replication_sync: Mutex::new(BTreeMap::new()),
             member_key: std::sync::RwLock::new(None),
             origin,
         })
@@ -1252,6 +1319,7 @@ impl Store {
             seeded_batch_rowid: AtomicI64::new(seeded_batch_rowid),
             replica_generation: AtomicU64::new(0),
             replication_snapshot: Mutex::new(None),
+            replication_sync: Mutex::new(BTreeMap::new()),
             member_key: std::sync::RwLock::new(None),
             origin,
         })
@@ -10347,6 +10415,17 @@ impl Store {
         }
         drop(connection);
         let snapshot = self.replication_snapshot().map_err(internal)?;
+        let difference = replication_inventory_difference(
+            &snapshot.inventory,
+            &snapshot.buckets,
+            &input.inventory,
+        );
+        self.replication_sync
+            .lock()
+            .expect("replication sync mutex poisoned")
+            .entry(relay.to_owned())
+            .or_default()
+            .observe(received, difference, now_ms());
         Ok(ReplicationReceipt {
             received,
             duplicate,
@@ -10363,6 +10442,16 @@ impl Store {
         // Seed and sign local batches first, so local membership claims decide admission.
         self.replication_snapshot()?;
         let mut connection = self.connection.lock().expect("store mutex poisoned");
+        // Builds before the insertion-order hash fallback rejected genuine claims from
+        // 2026-09-16 as hash mismatches. Check those records once more, once.
+        let retry_hash_mismatches = connection
+            .query_row(
+                "SELECT 1 FROM meta WHERE key='legacy_claim_hash_retried'",
+                [],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_none();
         let mut statement = connection.prepare(
             "WITH retry_ids AS (
                  SELECT writer, sequence, envelope_hash FROM replica_envelopes
@@ -10372,6 +10461,7 @@ impl Store {
                  WHERE state='unknown'
                     OR (state='invalid' AND error_code='invalid-replicated-claim'
                         AND error_message LIKE '%violates unknown-claim-field:%')
+                    OR (?1 AND state='invalid' AND error_code='claim-hash-mismatch')
              )
              SELECT envelopes.writer, envelopes.sequence, envelopes.envelope_hash,
                     envelopes.previous_hash, envelopes.accepted_at_unix_ms, envelopes.payload
@@ -10381,7 +10471,7 @@ impl Store {
              ORDER BY envelopes.writer, envelopes.sequence, envelopes.envelope_hash",
         )?;
         let envelopes = statement
-            .query_map([], |row| {
+            .query_map([retry_hash_mismatches], |row| {
                 Ok(ReplicaEnvelope {
                     writer: row.get(0)?,
                     sequence: row.get(1)?,
@@ -10435,6 +10525,12 @@ impl Store {
             }
             membership = fleet_membership_tx(&connection)?;
             pending = held;
+        }
+        if retry_hash_mismatches {
+            connection.execute(
+                "INSERT OR REPLACE INTO meta(key, value) VALUES ('legacy_claim_hash_retried', ?1)",
+                [now_ms().to_string()],
+            )?;
         }
         Ok(outcome)
     }
@@ -10818,6 +10914,32 @@ impl Store {
             .and_then(|value| value.parse().ok()))
     }
 
+    /// Whether any peer's latest measurement says this node is catching up with it.
+    pub fn replication_catching_up(&self) -> bool {
+        let now = now_ms();
+        self.replication_sync
+            .lock()
+            .expect("replication sync mutex poisoned")
+            .values()
+            .any(|progress| progress.view(now).is_some_and(|sync| sync.catching_up))
+    }
+
+    /// The latest sync measurement for each configured peer that has one.
+    pub fn replication_peer_sync(
+        &self,
+        configured_peers: &[String],
+    ) -> BTreeMap<String, ReplicationPeerSync> {
+        let now = now_ms();
+        let progress = self
+            .replication_sync
+            .lock()
+            .expect("replication sync mutex poisoned");
+        configured_peers
+            .iter()
+            .filter_map(|peer| Some((peer.clone(), progress.get(peer)?.view(now)?)))
+            .collect()
+    }
+
     #[cfg(test)]
     pub(crate) fn age_replication_peer_for_test(&self, peer: &str) {
         self.connection
@@ -10845,40 +10967,43 @@ impl Store {
                 |row| row.get(0),
             )?)
         };
+        let sync = self.replication_peer_sync(configured_peers);
         let mut peers = Vec::new();
         for peer in configured_peers {
-            peers.push(
-                connection
-                    .query_row(
-                        "SELECT status, last_success_at_unix_ms, last_error, schema_digest,
+            let mut status = connection
+                .query_row(
+                    "SELECT status, last_success_at_unix_ms, last_error, schema_digest,
                                 authority_digest, graph_digest
                          FROM replication_peers WHERE peer=?1",
-                        [peer],
-                        |row| {
-                            Ok(ReplicationPeerStatus {
-                                peer: peer.clone(),
-                                status: row.get(0)?,
-                                last_success_at_unix_ms: row
-                                    .get::<_, Option<String>>(1)?
-                                    .and_then(|value| value.parse().ok()),
-                                last_error: row.get(2)?,
-                                schema_digest: row.get(3)?,
-                                authority_digest: row.get(4)?,
-                                graph_digest: row.get(5)?,
-                            })
-                        },
-                    )
-                    .optional()?
-                    .unwrap_or(ReplicationPeerStatus {
-                        peer: peer.clone(),
-                        status: "unknown".into(),
-                        last_success_at_unix_ms: None,
-                        last_error: None,
-                        schema_digest: None,
-                        authority_digest: None,
-                        graph_digest: None,
-                    }),
-            );
+                    [peer],
+                    |row| {
+                        Ok(ReplicationPeerStatus {
+                            peer: peer.clone(),
+                            status: row.get(0)?,
+                            last_success_at_unix_ms: row
+                                .get::<_, Option<String>>(1)?
+                                .and_then(|value| value.parse().ok()),
+                            last_error: row.get(2)?,
+                            schema_digest: row.get(3)?,
+                            authority_digest: row.get(4)?,
+                            graph_digest: row.get(5)?,
+                            sync: None,
+                        })
+                    },
+                )
+                .optional()?
+                .unwrap_or(ReplicationPeerStatus {
+                    peer: peer.clone(),
+                    status: "unknown".into(),
+                    last_success_at_unix_ms: None,
+                    last_error: None,
+                    schema_digest: None,
+                    authority_digest: None,
+                    graph_digest: None,
+                    sync: None,
+                });
+            status.sync = sync.get(peer).cloned();
+            peers.push(status);
         }
         Ok(ReplicationStatus {
             configured,
@@ -16296,6 +16421,36 @@ fn claim_hash(
     canonical_hash(&(batch_id, subject, kind, origin, actor, body, predecessors))
 }
 
+/// Whether a replicated claim's ID is the hash of its content. On 2026-09-16, builds between
+/// eaec66a and 2537978d hashed each body in field insertion order: a new dependency switched
+/// serde_json to `preserve_order` before claim hashes sorted object keys. Those claims are
+/// genuine, so a node that verifies them later accepts that hash too. Bodies still decode with
+/// `preserve_order`, so the writer's field order survives to reproduce it.
+fn claim_id_is_content_hash(claim: &ClaimRecord) -> Result<bool> {
+    let canonical = claim_hash(
+        &claim.batch_id,
+        &claim.subject,
+        &claim.kind,
+        &claim.origin,
+        claim.actor.as_deref(),
+        &claim.body,
+        &claim.predecessors,
+    )?;
+    if canonical == claim.id {
+        return Ok(true);
+    }
+    let insertion_order = canonical_hash(&(
+        &claim.batch_id,
+        &claim.subject,
+        &claim.kind,
+        &claim.origin,
+        claim.actor.as_deref(),
+        &claim.body,
+        &claim.predecessors,
+    ))?;
+    Ok(insertion_order == claim.id)
+}
+
 fn canonical_json_value(value: &Value) -> Value {
     match value {
         Value::Array(values) => Value::Array(values.iter().map(canonical_json_value).collect()),
@@ -18426,6 +18581,13 @@ fn full_compact_replication_inventory(
 /// divergent exchange lists beyond its first differing range.
 const REPLICATION_EXCHANGE_ENVELOPE_LIMIT: usize = 512;
 
+/// The shortest span one sync rate sample covers.
+const REPLICATION_SYNC_WINDOW_MS: u128 = 10_000;
+
+/// A sync measurement older than this no longer says the node is catching up, and a longer gap
+/// between measurements gives no rate sample.
+const REPLICATION_SYNC_STALE_MS: u128 = 300_000;
+
 /// Sequences per compact inventory range. A range digest lets two peers skip every range they
 /// already share, so an exchange lists only the identities in ranges that differ.
 const REPLICATION_BUCKET_WIDTH: u64 = 256;
@@ -18519,6 +18681,104 @@ fn compact_replication_difference(
         );
     }
     (missing, listed)
+}
+
+/// Count the envelopes only the peer holds and only this node holds, as `(peer_only,
+/// local_only)`, from the inventory the peer sent. A range both sides hold with different
+/// digests counts exactly when the peer listed it, and otherwise counts the difference in range
+/// sizes, which is a lower bound. `None` means the inventory cannot tell, such as a bare digest
+/// that this node has since moved past.
+fn replication_inventory_difference(
+    inventory: &CompactReplicationInventory,
+    buckets: &[ReplicationInventoryBucket],
+    remote: &ReplicationInventory,
+) -> Option<(u64, u64)> {
+    if !remote.digest.is_empty() && remote.digest == inventory.digest {
+        return Some((0, 0));
+    }
+    if !remote.buckets.is_empty() {
+        let local_buckets = buckets
+            .iter()
+            .map(|bucket| ((bucket.writer.as_str(), bucket.start), bucket))
+            .collect::<BTreeMap<_, _>>();
+        let mut remote_listed = BTreeMap::<(&str, u64), Vec<&ReplicaEnvelopeId>>::new();
+        for identity in &remote.envelopes {
+            remote_listed
+                .entry((
+                    identity.writer.as_str(),
+                    replication_bucket_start(identity.sequence),
+                ))
+                .or_default()
+                .push(identity);
+        }
+        let mut shared = BTreeSet::new();
+        let (mut peer_only, mut local_only) = (0_u64, 0_u64);
+        for theirs in &remote.buckets {
+            let key = (theirs.writer.as_str(), theirs.start);
+            let Some(ours) = local_buckets.get(&key) else {
+                peer_only += theirs.count;
+                continue;
+            };
+            shared.insert(key);
+            if ours.digest == theirs.digest {
+                continue;
+            }
+            let known = remote_listed.get_mut(&key).and_then(|known| {
+                known.sort_unstable();
+                known.dedup();
+                (known.len() as u64 == theirs.count
+                    && replication_bucket_digest(known.iter().copied()) == theirs.digest)
+                    .then_some(&*known)
+            });
+            if let Some(known) = known {
+                let local = inventory.identities(inventory.range(&ours.writer, ours.start));
+                peer_only += known
+                    .iter()
+                    .filter(|identity| local.binary_search(**identity).is_err())
+                    .count() as u64;
+                local_only += local
+                    .iter()
+                    .filter(|identity| known.binary_search(identity).is_err())
+                    .count() as u64;
+            } else {
+                peer_only += theirs.count.saturating_sub(ours.count);
+                local_only += ours.count.saturating_sub(theirs.count);
+            }
+        }
+        local_only += buckets
+            .iter()
+            .filter(|bucket| !shared.contains(&(bucket.writer.as_str(), bucket.start)))
+            .map(|bucket| bucket.count)
+            .sum::<u64>();
+        return Some((peer_only, local_only));
+    }
+    if !remote.digest.is_empty() && remote.digest == replication_inventory_digest(&remote.envelopes)
+    {
+        // A peer without range digests, or with an empty store, lists its whole inventory once
+        // per identity. Look each one up in its range rather than expanding every local one.
+        let mut buffer = [0; 64];
+        let shared = remote
+            .envelopes
+            .iter()
+            .filter(|identity| {
+                inventory
+                    .range(
+                        &identity.writer,
+                        replication_bucket_start(identity.sequence),
+                    )
+                    .iter()
+                    .any(|envelope| {
+                        envelope.sequence == identity.sequence
+                            && inventory.hash_text(envelope, &mut buffer) == identity.hash
+                    })
+            })
+            .count();
+        return Some((
+            (remote.envelopes.len() - shared) as u64,
+            (inventory.envelopes.len() - shared) as u64,
+        ));
+    }
+    None
 }
 
 fn replication_identity_digest<'a>(
@@ -19254,6 +19514,185 @@ fn compact_replication_exchange_waits_for_a_complete_listing() {
     assert_eq!(listed, inventory.public().envelopes);
 }
 
+#[cfg(test)]
+#[test]
+fn replication_difference_counts_what_each_side_lacks() {
+    let local = TestReplica(
+        [
+            test_envelope_ids("origin", 1..=2_000, "a"),
+            test_envelope_ids("relay", 1..=10, "a"),
+        ]
+        .concat()
+        .into_iter()
+        .collect(),
+    );
+    let mut peer = TestReplica(
+        [
+            test_envelope_ids("origin", 1..=1_500, "a"),
+            test_envelope_ids("relay", 1..=10, "a"),
+            test_envelope_ids("newcomer", 1..=5, "a"),
+            // A second candidate at one writer sequence inside a range both sides hold.
+            test_envelope_ids("origin", [700], "b"),
+        ]
+        .concat()
+        .into_iter()
+        .collect(),
+    );
+    let (inventory, buckets) = local.inventory();
+    let difference = |remote: &ReplicationInventory| -> Option<(u64, u64)> {
+        replication_inventory_difference(&inventory, &buckets, remote)
+    };
+    // The newcomer's five and the fork are only on the peer; origin 1501..=2000 only here.
+    assert_eq!(difference(&peer.summary()), Some((6, 500)));
+    let (_, listed) = peer.answer(&local.summary());
+    assert_eq!(difference(&listed), Some((6, 500)));
+
+    // Equal range sizes with different members: the summary can only bound the difference, and
+    // the peer's listing makes it exact.
+    peer.0.remove(&test_envelope_ids("relay", [3], "a")[0]);
+    peer.0.extend(test_envelope_ids("relay", [11], "a"));
+    assert_eq!(difference(&peer.summary()), Some((6, 500)));
+    let (_, listed) = peer.answer(&local.summary());
+    assert_eq!(difference(&listed), Some((7, 501)));
+
+    // An older peer lists its whole inventory, and so does a peer with an empty store.
+    let full = peer.inventory().0.public();
+    assert_eq!(difference(&full), Some((7, 501)));
+    let empty = ReplicationInventory {
+        digest: replication_inventory_digest(&[]),
+        ..ReplicationInventory::default()
+    };
+    assert_eq!(
+        difference(&empty),
+        Some((0, inventory.envelopes.len() as u64))
+    );
+
+    // A matching digest needs nothing else; a bare different digest cannot tell.
+    assert_eq!(difference(&local.summary()), Some((0, 0)));
+    let bare = ReplicationInventory {
+        digest: peer.summary().digest,
+        ..ReplicationInventory::default()
+    };
+    assert_eq!(difference(&bare), None);
+}
+
+#[cfg(test)]
+#[test]
+fn sync_progress_estimates_catch_up_from_net_progress() {
+    let mut progress = PeerSyncProgress::default();
+    progress.observe(0, Some((10_000, 0)), 1_000);
+    let sync = progress.view(1_000).unwrap();
+    assert!(sync.catching_up);
+    assert_eq!(sync.estimated_catch_up_seconds, None, "no rate sample yet");
+
+    // One full window: 1,000 envelopes in 10 seconds.
+    progress.observe(500, Some((9_500, 0)), 6_000);
+    progress.observe(500, Some((9_000, 2)), 11_000);
+    let sync = progress.view(11_000).unwrap();
+    assert_eq!(sync.local_only_envelopes, 2);
+    assert_eq!(sync.receive_rate_per_second, Some(100.0));
+    assert_eq!(sync.catch_up_rate_per_second, Some(100.0));
+    assert_eq!(sync.estimated_catch_up_seconds, Some(90));
+
+    // The peer keeps writing, so only half of what arrives closes the gap.
+    progress.observe(1_000, Some((8_500, 0)), 21_000);
+    let sync = progress.view(21_000).unwrap();
+    assert_eq!(sync.receive_rate_per_second, Some(100.0));
+    assert_eq!(sync.catch_up_rate_per_second, Some(75.0));
+    assert_eq!(sync.estimated_catch_up_seconds, Some(114));
+
+    // A receipt whose inventory could not be measured keeps the last measurement.
+    progress.observe(5, None, 22_000);
+    assert_eq!(progress.view(22_000).unwrap().peer_only_envelopes, 8_500);
+
+    // One exchange carries the rest, so this is no longer catching up.
+    progress.observe(
+        0,
+        Some((REPLICATION_EXCHANGE_ENVELOPE_LIMIT as u64, 0)),
+        23_000,
+    );
+    assert!(!progress.view(23_000).unwrap().catching_up);
+
+    // A measurement from a peer that went quiet stops claiming the node is behind.
+    progress.observe(0, Some((5_000, 0)), 24_000);
+    assert!(progress.view(24_000).unwrap().catching_up);
+    assert!(
+        !progress
+            .view(24_000 + REPLICATION_SYNC_STALE_MS + 1)
+            .unwrap()
+            .catching_up
+    );
+    progress.observe(0, Some((0, 0)), 30_000);
+    assert_eq!(
+        progress.view(30_000).unwrap().estimated_catch_up_seconds,
+        Some(0)
+    );
+}
+
+#[cfg(test)]
+#[test]
+fn a_receipt_measures_how_far_behind_this_node_is() {
+    const FLEET: &str = "018f6f0d-4a5d-7b8c-9d0e-123456789abc";
+    let source = Store::open_memory("source").unwrap();
+    for index in 0..1_200 {
+        source
+            .append_client_claim(&ClaimInput {
+                subject: format!("resource/sync-{index}"),
+                kind: "resource.observed".into(),
+                actor: None,
+                fields: BTreeMap::from([(
+                    "kind".into(),
+                    Value::String("custom.test.replication".into()),
+                )]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+    }
+    source.bind_fleet(FLEET).unwrap();
+    let target = Store::open_memory("target").unwrap();
+    target.bind_fleet(FLEET).unwrap();
+    let peers = ["source".to_owned()];
+    assert!(target.replication_peer_sync(&peers).is_empty());
+
+    let total = source.replication_inventory().unwrap().envelopes.len() as u64;
+    let local = target.replication_inventory().unwrap().envelopes.len() as u64;
+    let pull = || {
+        let summary = target.export_replication_summary(FLEET).unwrap();
+        let response = source
+            .export_replication_exchange(FLEET, &summary.inventory)
+            .unwrap();
+        target
+            .receive_replication_exchange("source", FLEET, &response)
+            .unwrap();
+        (
+            response.envelopes.len() as u64,
+            target.replication_peer_sync(&peers)["source"].clone(),
+        )
+    };
+    let (mut received, sync) = pull();
+    assert_eq!(sync.peer_only_envelopes, total - received);
+    assert_eq!(sync.local_only_envelopes, local);
+    assert!(sync.catching_up, "more than one exchange remains");
+    let status = target
+        .replication_status(true, Some(FLEET), &peers)
+        .unwrap();
+    assert_eq!(status.peers[0].sync.as_ref(), Some(&sync));
+
+    let (more, sync) = pull();
+    received += more;
+    assert_eq!(sync.peer_only_envelopes, total - received);
+    assert!(!sync.catching_up, "the rest fits in one exchange");
+
+    // An unconfigured relay's measurement is not reported.
+    assert!(
+        target
+            .replication_peer_sync(&["elsewhere".to_owned()])
+            .is_empty()
+    );
+}
+
 fn collect_referenced_blobs(
     connection: &Connection,
     claims: &[ClaimRecord],
@@ -19692,17 +20131,7 @@ fn validate_replicated_claim(
             ),
         ));
     }
-    let expected = claim_hash(
-        &claim.batch_id,
-        &claim.subject,
-        &claim.kind,
-        &claim.origin,
-        claim.actor.as_deref(),
-        &claim.body,
-        &claim.predecessors,
-    )
-    .map_err(internal)?;
-    if expected != claim.id {
+    if !claim_id_is_content_hash(claim).map_err(internal)? {
         return Err(St3Error::new(
             "claim-hash-mismatch",
             format!("replicated claim `{}` failed verification", claim.id),
@@ -20084,17 +20513,7 @@ fn verify_replica_batch(batch: &ReplicaBatch) -> Result<(), St3Error> {
                 ),
             ));
         }
-        let expected = claim_hash(
-            &claim.batch_id,
-            &claim.subject,
-            &claim.kind,
-            &claim.origin,
-            claim.actor.as_deref(),
-            &claim.body,
-            &claim.predecessors,
-        )
-        .map_err(internal)?;
-        if expected != claim.id {
+        if !claim_id_is_content_hash(claim).map_err(internal)? {
             return Err(St3Error::new(
                 "claim-hash-mismatch",
                 format!("replicated claim `{}` failed verification", claim.id),
@@ -28323,6 +28742,173 @@ mission "proposal-replay" state="ready" revisions="human-only" revision-reviewer
             .import_replication("source", &batch)
             .expect_err("tampering must fail");
         assert_eq!(error.code, "claim-hash-mismatch");
+    }
+
+    /// One source claim whose body lists its fields in reverse order and whose ID is the hash of
+    /// that order, the way builds between eaec66a and 2537978d wrote claims on 2026-09-16.
+    fn insertion_order_hashed_batch() -> ReplicationBatch {
+        let source = Store::open_memory("source").unwrap();
+        source
+            .append_claim(&ClaimInput {
+                subject: "host/source".into(),
+                kind: "transport.observed".into(),
+                actor: None,
+                fields: BTreeMap::from([
+                    ("protocol".into(), Value::String("http-replication".into())),
+                    ("status".into(), Value::String("up".into())),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+        let mut batch = source.export_replication(0).unwrap();
+        let claim = &mut batch.batches[0].claims[0];
+        let reversed = |value: &Value| {
+            let mut fields = value.as_object().unwrap().iter().collect::<Vec<_>>();
+            fields.sort_by(|left, right| right.0.cmp(left.0));
+            Value::Object(
+                fields
+                    .into_iter()
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect(),
+            )
+        };
+        let mut body = reversed(&claim.body);
+        body["fields"] = reversed(&claim.body["fields"]);
+        claim.body = body;
+        claim.id = canonical_hash(&(
+            &claim.batch_id,
+            &claim.subject,
+            &claim.kind,
+            &claim.origin,
+            claim.actor.as_deref(),
+            &claim.body,
+            &claim.predecessors,
+        ))
+        .unwrap();
+        batch
+    }
+
+    #[test]
+    fn a_claim_hashed_in_field_insertion_order_still_verifies() {
+        let batch = insertion_order_hashed_batch();
+        let claim = &batch.batches[0].claims[0];
+        let canonical = claim_hash(
+            &claim.batch_id,
+            &claim.subject,
+            &claim.kind,
+            &claim.origin,
+            claim.actor.as_deref(),
+            &claim.body,
+            &claim.predecessors,
+        )
+        .unwrap();
+        assert_ne!(canonical, claim.id, "the fixture must not be canonical");
+        assert!(claim_id_is_content_hash(claim).unwrap());
+
+        // A new node decodes the body from CBOR. It must keep the writer's field order.
+        let mut bytes = Vec::new();
+        ciborium::into_writer(claim, &mut bytes).unwrap();
+        let decoded: ClaimRecord = ciborium::from_reader(bytes.as_slice()).unwrap();
+        assert!(claim_id_is_content_hash(&decoded).unwrap());
+
+        let mut tampered = decoded;
+        tampered.body["fields"]["status"] = Value::String("down".into());
+        assert!(!claim_id_is_content_hash(&tampered).unwrap());
+
+        let target = Store::open_memory("target").unwrap();
+        target.import_replication("source", &batch).unwrap();
+        assert!(target.claim_by_id(&claim.id).unwrap().is_some());
+    }
+
+    #[test]
+    fn a_node_that_rejected_insertion_order_hashes_admits_them_once_upgraded() {
+        const FLEET: &str = "018f6f0d-4a5d-7b8c-9d0e-123456789abc";
+        let envelope = |batch: &ReplicaBatch| {
+            let mut bytes = Vec::new();
+            ciborium::into_writer(
+                &ReplicaEnvelopePayload {
+                    batch: batch.clone(),
+                    blobs: BTreeMap::new(),
+                },
+                &mut bytes,
+            )
+            .unwrap();
+            ReplicaEnvelope {
+                writer: batch.origin.clone(),
+                sequence: batch.replica_sequence,
+                previous_hash: batch.previous_hash.clone(),
+                hash: replica_envelope_hash(
+                    &batch.origin,
+                    batch.replica_sequence,
+                    batch.previous_hash.as_deref(),
+                    batch.accepted_at_unix_ms,
+                    &bytes,
+                ),
+                accepted_at_unix_ms: batch.accepted_at_unix_ms,
+                payload: base64::engine::general_purpose::STANDARD.encode(&bytes),
+                member_key: None,
+                signature: None,
+            }
+        };
+        let receive = |store: &Store, envelope: ReplicaEnvelope| {
+            store
+                .receive_replication_exchange(
+                    "source",
+                    FLEET,
+                    &ReplicationExchange {
+                        peer: "source".into(),
+                        fleet_id: FLEET.into(),
+                        schema_digest: String::new(),
+                        authority_digest: String::new(),
+                        graph_digest: String::new(),
+                        inventory: ReplicationInventory::default(),
+                        envelopes: vec![envelope],
+                        signature_requests: Vec::new(),
+                        signatures: Vec::new(),
+                    },
+                )
+                .unwrap();
+        };
+        let batch = insertion_order_hashed_batch().batches.remove(0);
+        let legacy = envelope(&batch);
+        let target = Store::open_memory("target").unwrap();
+        receive(&target, legacy.clone());
+        // An older build rejected the genuine claim as a hash mismatch.
+        record_invalid_replica_envelope(
+            &target.connection.lock().unwrap(),
+            &legacy,
+            &St3Error::new("claim-hash-mismatch", "failed verification"),
+        )
+        .unwrap();
+        assert_eq!(target.replica_records(true).unwrap().len(), 1);
+
+        let admission = target.validate_replication_backlog().unwrap();
+        assert_eq!(admission.invalid, 0);
+        assert!(target.replica_records(true).unwrap().is_empty());
+        assert!(target.claim_by_id(&batch.claims[0].id).unwrap().is_some());
+
+        // A claim that fails both hashes stays invalid and is not checked again on every wake.
+        let mut tampered = batch.clone();
+        tampered.replica_sequence += 1;
+        tampered.hash = batch_header_hash(
+            &tampered.origin,
+            tampered.replica_sequence,
+            tampered.previous_hash.as_deref(),
+            tampered.accepted_at_unix_ms,
+        )
+        .unwrap();
+        tampered.id = format!(
+            "batch/{}/{}/{}",
+            tampered.origin, tampered.replica_sequence, tampered.hash
+        );
+        tampered.claims[0].batch_id = tampered.id.clone();
+        tampered.claims[0].body["fields"]["status"] = Value::String("down".into());
+        receive(&target, envelope(&tampered));
+        assert_eq!(target.validate_replication_backlog().unwrap().invalid, 1);
+        assert_eq!(target.validate_replication_backlog().unwrap().invalid, 0);
+        assert_eq!(target.replica_records(true).unwrap().len(), 1);
     }
 
     #[test]
