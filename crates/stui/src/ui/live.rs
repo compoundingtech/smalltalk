@@ -91,7 +91,12 @@ pub fn run(context: Context) -> Result<()> {
     let started = Instant::now();
     let mut changed = true;
     let stopping = super::stop_flag()?;
-    while !ui.quit && !stopping.load(std::sync::atomic::Ordering::Relaxed) {
+    // A closed terminal ends the loop: without this check a detached stui spins and keeps
+    // polling the daemon forever.
+    while !ui.quit
+        && !stopping.load(std::sync::atomic::Ordering::Relaxed)
+        && !crate::stdin_hung_up()
+    {
         ui.tick = (started.elapsed().as_millis() / 100) as u64;
         if ui
             .flash

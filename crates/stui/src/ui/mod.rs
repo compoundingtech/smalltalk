@@ -2454,7 +2454,10 @@ pub fn run_demo(args: &[String]) -> Result<()> {
     });
     let started = Instant::now();
     let stopping = stop_flag()?;
-    while !ui.quit && !stopping.load(std::sync::atomic::Ordering::Relaxed) {
+    while !ui.quit
+        && !stopping.load(std::sync::atomic::Ordering::Relaxed)
+        && !crate::stdin_hung_up()
+    {
         ui.tick = (started.elapsed().as_millis() / 100) as u64;
         ui.step_demo();
         if ui
