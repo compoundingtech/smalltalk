@@ -30,6 +30,7 @@ const ACTIONS: &[&str] = &[
     "attention.resolve",
     "review.approve",
     "review.reject",
+    "review.request-changes",
     "message.send",
     "message.read",
     "message.close",
@@ -68,6 +69,7 @@ const AVAILABLE_ACTIONS: &[&str] = &[
     "attention.resolve",
     "review.approve",
     "review.reject",
+    "review.request-changes",
     "message.send",
     "message.read",
     "message.close",
@@ -4666,17 +4668,18 @@ async fn dispatch_action(
     let p = &request.parameters;
     let authority_actor = &session.authority_actor;
     match request.action_type.as_str() {
-        decision @ ("review.approve" | "review.reject") => {
+        decision @ ("review.approve" | "review.reject" | "review.request-changes") => {
             let target = parameter_string(p, "target_id")?;
             let result = post_review(
                 State(state.clone()),
                 AxumPath(target),
                 Json(ReviewRequest {
-                    decision: if decision == "review.approve" {
-                        "approved".into()
-                    } else {
-                        "rejected".into()
-                    },
+                    decision: match decision {
+                        "review.approve" => "approved",
+                        "review.request-changes" => "changes-requested",
+                        _ => "rejected",
+                    }
+                    .into(),
                     reason: p.get("reason").and_then(Value::as_str).map(str::to_owned),
                     actor: Some(authority_actor.clone()),
                     expected_subject: None,

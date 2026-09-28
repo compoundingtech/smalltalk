@@ -270,7 +270,7 @@ The v0 action discriminators are:
 
 | Family | Actions | Required fences |
 |---|---|---|
-| Attention | `attention.resolve`, `review.approve`, `review.reject` | attention or review revision |
+| Attention | `attention.resolve`, `review.approve`, `review.reject`, `review.request-changes` | attention or review revision |
 | Messages | `message.send`, `message.read`, `message.close` | reply/message revision when present |
 | Launches | `launch.create`, `launch.revise`, `launch.preview`, `launch.approve`, `launch.cancel` | launch revision; target generation and preview token where applicable |
 | Missions | `mission.start`, `mission.revise`, `mission.approve-revision`, `mission.cancel-revision`, `mission.cancel` | mission revision and current generation where applicable |

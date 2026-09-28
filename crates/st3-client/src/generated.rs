@@ -231,6 +231,8 @@ pub struct Attention {
     pub attention_kind: String,
     pub source_id: String,
     pub person_id: String,
+    pub requester_id: Option<String>,
+    pub review_mode: Option<String>,
     pub mission_id: Option<String>,
     pub mission_run_id: Option<String>,
     pub step_run_id: Option<String>,
@@ -1230,6 +1232,8 @@ pub enum ActionType {
     ReviewApprove,
     #[serde(rename = "review.reject")]
     ReviewReject,
+    #[serde(rename = "review.request-changes")]
+    ReviewRequestChanges,
     #[serde(rename = "message.send")]
     MessageSend,
     #[serde(rename = "message.read")]
@@ -1577,6 +1581,20 @@ impl ActionRequest {
         Self::new(
             id,
             ActionType::ReviewReject,
+            idempotency_key,
+            fence,
+            &parameters,
+        )
+    }
+    pub fn review_request_changes(
+        id: impl Into<String>,
+        idempotency_key: impl Into<String>,
+        fence: Fence,
+        parameters: TargetParameters,
+    ) -> Result<Self, serde_json::Error> {
+        Self::new(
+            id,
+            ActionType::ReviewRequestChanges,
             idempotency_key,
             fence,
             &parameters,
