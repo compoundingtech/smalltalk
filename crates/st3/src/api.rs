@@ -3867,6 +3867,9 @@ async fn replication_receive(
         let projection_was_healthy = !store
             .replication_projection_needs_recovery()
             .map_err(|error| St3Error::new("internal", error.to_string()))?;
+        if let Some(round_trip_ms) = request.round_trip_ms {
+            store.record_replication_round_trip(Duration::from_millis(round_trip_ms));
+        }
         let receipt = store.receive_replication_exchange(
             &request.peer,
             &request.fleet_id,

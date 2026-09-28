@@ -5675,6 +5675,24 @@ async fn run_replication(
                     projection.error_message.as_deref().unwrap_or("")
                 );
             }
+            let timings = &status.timings;
+            println!(
+                "timings\t{} exchanges, {} envelopes received; ms: round-trip={} export={} snapshot={} receipt={} admission={} (verify={}) projection={} repair={} signing={} sqlite={} ({} commits, {} ms)",
+                timings.exchanges,
+                timings.envelopes_received,
+                timings.round_trip_ms,
+                timings.export_ms,
+                timings.snapshot_ms,
+                timings.receipt_ms,
+                timings.admission_ms,
+                timings.verify_ms,
+                timings.projection_ms,
+                timings.repair_ms,
+                timings.signing_ms,
+                timings.sqlite_ms,
+                timings.commits,
+                timings.commit_ms
+            );
             print!("{}", render_replication_peers(&status.peers, now_ms()));
             Ok(())
         }
