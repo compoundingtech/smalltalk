@@ -230,11 +230,11 @@ impl Config {
             }
             Err(error) => {
                 return Err(error)
-                    .with_context(|| format!("read st3 config {}", selected.display()));
+                    .with_context(|| format!("read st config {}", selected.display()));
             }
         };
         let mut config: Self = toml::from_str(&bytes)
-            .with_context(|| format!("parse st3 config {}", selected.display()))?;
+            .with_context(|| format!("parse st config {}", selected.display()))?;
         let defaults = Self::default();
         if config.node.is_empty() {
             config.node = defaults.node;
@@ -306,7 +306,7 @@ impl Config {
             self.planner.provider != "opencode" || self.planner.effort.is_none(),
             "the OpenCode planner does not accept an effort override"
         );
-        anyhow::ensure!(!self.node.trim().is_empty(), "the st3 node label is empty");
+        anyhow::ensure!(!self.node.trim().is_empty(), "the st node label is empty");
         anyhow::ensure!(
             self.person.as_deref().is_none_or(|person| {
                 person.starts_with("person/")
@@ -378,7 +378,7 @@ impl Config {
                 .with_context(|| format!("parse peer URL for '{}'", peer.name))?;
             anyhow::ensure!(
                 url.scheme() == "http",
-                "peer '{}' must use plain http:// in st3 v1",
+                "peer '{}' must use plain http:// in st v1",
                 peer.name
             );
             let host = url.host_str().unwrap_or_default();
