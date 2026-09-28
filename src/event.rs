@@ -878,10 +878,12 @@ fn test_predecessor_archive_checkpoint(inbox: &Path) -> anyhow::Result<()> {
     };
     // Event ingress uses an fd-relative capability path such as /proc/self/fd/9.
     // Resolve it for this test-only catalog check.
-    let Ok(inbox_path) = fs::canonicalize(inbox) else {
+    let (Ok(inbox_path), Ok(catalog_path)) =
+        (fs::canonicalize(inbox), fs::canonicalize(catalog))
+    else {
         return Ok(());
     };
-    if !inbox_path.starts_with(catalog) || Path::new(&release).parent() != Some(catalog) {
+    if !inbox_path.starts_with(&catalog_path) || Path::new(&release).parent() != Some(catalog) {
         return Ok(());
     }
     fs::write(&ready, b"validated")?;
