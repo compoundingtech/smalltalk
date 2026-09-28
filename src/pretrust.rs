@@ -501,6 +501,7 @@ mod tests {
             .collect::<Vec<_>>();
 
         let stop = Arc::new(AtomicBool::new(false));
+        let (writer_started, writer_running) = std::sync::mpsc::sync_channel(0);
         let claude = std::thread::spawn({
             let (config, claude_lock, stop) = (config.clone(), claude_lock.clone(), stop.clone());
             move || {
@@ -509,6 +510,11 @@ mod tests {
                     if std::fs::create_dir(&claude_lock).is_err() {
                         std::thread::sleep(Duration::from_millis(1));
                         continue;
+                    }
+                    if saves == 0 {
+                        // Start the seats only after Claude has taken its lock. The writer is
+                        // now guaranteed to finish at least one save before it sees `stop`.
+                        writer_started.send(()).unwrap();
                     }
                     let mut current: Value =
                         serde_json::from_str(&std::fs::read_to_string(&config).unwrap()).unwrap();
@@ -523,6 +529,7 @@ mod tests {
             }
         });
 
+        writer_running.recv().unwrap();
         let start = Arc::new(Barrier::new(workspaces.len()));
         let seats = workspaces
             .iter()
