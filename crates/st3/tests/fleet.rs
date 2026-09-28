@@ -1627,6 +1627,20 @@ async fn a_removed_members_writes_relayed_by_an_uninformed_member_are_refused() 
     let mut c = joined(root.path(), &a, "c", &[]).await;
     c.wait_listening().await;
     let mut r = joined(root.path(), &a, "r", &[]).await;
+    r.wait_listening().await;
+    wait_until("c learns r's listening endpoint", 60, || async {
+        c.st_json(&["fleet", "status"])["view"]["members"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|member| {
+                member["name"] == "r"
+                    && member["endpoints"]
+                        .as_array()
+                        .is_some_and(|endpoints| !endpoints.is_empty())
+            })
+    })
+    .await;
     r.note("r-before").await;
     let before = BTreeSet::from(["custom/fleet-test/r-before".to_owned()]);
     wait_for_notes(&a, &before, 60, &[&a, &c, &r]).await;
