@@ -115,9 +115,11 @@
           "required": ["kind", "attention_kind", "source_id", "person_id", "title", "detail", "priority", "state", "requested_at", "actions"],
           "properties": {
             "kind": { "const": "attention" },
-            "attention_kind": { "enum": ["human-gate", "launch-approval", "revision-approval", "unread-message", "fault"] },
+            "attention_kind": { "enum": ["human-gate", "launch-approval", "revision-approval", "unread-message", "agent-request", "fault"] },
             "source_id": { "$ref": "#/$defs/Id" },
             "person_id": { "$ref": "#/$defs/Id" },
+            "requester_id": { "$ref": "#/$defs/Id" },
+            "review_mode": { "enum": ["approve", "feedback"] },
             "mission_id": { "$ref": "#/$defs/Id" },
             "mission_run_id": { "$ref": "#/$defs/Id" },
             "step_run_id": { "$ref": "#/$defs/Id" },
@@ -128,7 +130,7 @@
             "requested_at": { "$ref": "#/$defs/Timestamp" },
             "targets": { "type": "array", "items": { "$ref": "#/$defs/Id" } },
             "target_states": { "type": "array", "items": { "$ref": "#/$defs/AttentionTargetState" } },
-            "actions": { "type": "array", "items": { "type": "string", "enum": ["attention.resolve", "review.approve", "review.reject", "launch.approve", "launch.cancel", "mission.approve-revision", "mission.cancel-revision", "message.read"] } }
+            "actions": { "type": "array", "items": { "type": "string", "enum": ["attention.resolve", "review.approve", "review.reject", "review.request-changes", "launch.approve", "launch.cancel", "mission.approve-revision", "mission.cancel-revision", "message.read"] } }
           }
         }
       ]
@@ -933,7 +935,7 @@
         "api_version": { "const": "st3.client.v0" },
         "id": { "$ref": "#/$defs/Id" },
         "type": {
-          "enum": ["attention.resolve", "review.approve", "review.reject", "message.send", "message.read", "message.close", "launch.create", "launch.revise", "launch.preview", "launch.approve", "launch.cancel", "mission.start", "mission.revise", "mission.approve-revision", "mission.cancel-revision", "mission.cancel", "session.import", "work.claim", "work.renew", "work.progress", "work.complete", "work.fail", "work.release", "work.publish-mission", "agent.queue-move", "runtime.stop", "runtime.restart", "runtime.reset", "runtime.context-clear", "runtime.signal", "terminal.input", "terminal.resize", "terminal.attach", "terminal.detach", "pairing.revoke"]
+          "enum": ["attention.resolve", "review.approve", "review.reject", "review.request-changes", "message.send", "message.read", "message.close", "launch.create", "launch.revise", "launch.preview", "launch.approve", "launch.cancel", "mission.start", "mission.revise", "mission.approve-revision", "mission.cancel-revision", "mission.cancel", "session.import", "work.claim", "work.renew", "work.progress", "work.complete", "work.fail", "work.release", "work.publish-mission", "agent.queue-move", "runtime.stop", "runtime.restart", "runtime.reset", "runtime.context-clear", "runtime.signal", "terminal.input", "terminal.resize", "terminal.attach", "terminal.detach", "pairing.revoke"]
         },
         "idempotency_key": { "type": "string", "minLength": 16, "maxLength": 256 },
         "fence": { "$ref": "#/$defs/Fence" },
@@ -956,7 +958,7 @@
             }
           }
         },
-        { "properties": { "type": { "enum": ["review.approve", "review.reject"] }, "parameters": { "$ref": "#/$defs/TargetParameters" } } },
+        { "properties": { "type": { "enum": ["review.approve", "review.reject", "review.request-changes"] }, "parameters": { "$ref": "#/$defs/TargetParameters" } } },
         {
           "properties": {
             "type": { "const": "message.send" },
