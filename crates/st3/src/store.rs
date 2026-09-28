@@ -6466,7 +6466,7 @@ impl Store {
             .as_deref()
             .map(|key| local_observation_dedupe_key(&input.kind, key));
         let request_digest = claim_operation(input)?.map(|(_, digest)| digest);
-        let mut connection = self.connection.lock().expect("store mutex poisoned");
+        let mut connection = self.connection.write();
         let transaction = connection.transaction().map_err(internal)?;
         if let Some(key) = &dedupe_key
             && let Some((existing, stored_digest)) = transaction
@@ -6586,7 +6586,7 @@ impl Store {
     }
 
     pub fn set_otlp_export_cursor(&self, cursor: u64) -> Result<()> {
-        let connection = self.connection.lock().expect("store mutex poisoned");
+        let connection = self.connection.write();
         connection.execute(
             "INSERT INTO meta(key, value) VALUES ('otlp_export_cursor', ?1)
              ON CONFLICT(key) DO UPDATE SET value=excluded.value",
@@ -6636,7 +6636,7 @@ impl Store {
         let max_per_subject_kind = max_per_subject_kind.max(1).min(i64::MAX as usize) as i64;
         let mut deleted = 0;
         loop {
-            let connection = self.connection.lock().expect("store mutex poisoned");
+            let connection = self.connection.write();
             let removed = connection.execute(
                 "DELETE FROM local_observations WHERE id IN (
                     SELECT id FROM (
