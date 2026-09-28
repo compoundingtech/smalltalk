@@ -10748,7 +10748,28 @@ impl Store {
         let mut connection = self.connection.lock().expect("store mutex poisoned");
         let transaction = connection.transaction()?;
         let result = (|| -> Result<(), St3Error> {
-            if !try_project_simple_replication_tx(&transaction)? {
+            // An incremental projection that fails is rolled back and replaced by a full replay,
+            // which quarantines the claim it cannot project instead of failing the graph.
+            transaction
+                .execute_batch("SAVEPOINT project_incremental")
+                .map_err(internal)?;
+            let projected = match try_project_simple_replication_tx(&transaction) {
+                Ok(projected) => {
+                    transaction
+                        .execute_batch("RELEASE project_incremental")
+                        .map_err(internal)?;
+                    projected
+                }
+                Err(_) => {
+                    transaction
+                        .execute_batch(
+                            "ROLLBACK TO project_incremental; RELEASE project_incremental",
+                        )
+                        .map_err(internal)?;
+                    false
+                }
+            };
+            if !projected {
                 rebuild_operations_tx(&transaction).map_err(internal)?;
                 project_replicated_base_claims(&transaction)?;
                 project_replicated_mission_runs(&transaction)?;
@@ -10853,6 +10874,8 @@ impl Store {
         Ok(total != 0 && other == 0)
     }
 
+    /// Apply each recorded repair on its own. A repair that cannot be applied is recorded as an
+    /// unhealthy projection that names it, so one bad repair never stops replication or startup.
     pub fn apply_replication_repairs(&self) -> Result<usize> {
         let mut connection = self.connection.lock().expect("store mutex poisoned");
         let transaction = connection.transaction()?;
@@ -10866,51 +10889,28 @@ impl Store {
         drop(statement);
         let mut changed = 0;
         for (repair_claim, body) in repairs {
-            let body: Value = serde_json::from_str(&body)?;
-            let fields = body.get("fields").unwrap_or(&body);
-            let Some(record_ref) = fields.get("record").and_then(Value::as_str) else {
-                continue;
-            };
-            let Some(replacement) = fields.get("replacement").and_then(Value::as_str) else {
-                continue;
-            };
-            let replacement_exists = transaction
-                .query_row(
-                    "SELECT 1 FROM claims WHERE id=?1",
-                    [replacement],
-                    |_| Ok(()),
-                )
-                .optional()?
-                .is_some();
-            if !replacement_exists {
-                continue;
+            transaction.execute_batch("SAVEPOINT apply_repair")?;
+            let result = apply_replication_repair_tx(&transaction, &repair_claim, &body);
+            match result {
+                Ok(applied) => {
+                    transaction.execute_batch("RELEASE apply_repair")?;
+                    changed += applied;
+                }
+                Err(error) => {
+                    transaction.execute_batch("ROLLBACK TO apply_repair; RELEASE apply_repair")?;
+                    transaction.execute(
+                        "INSERT INTO projection_health(aggregate, status, error_code, error_message, updated_at_unix_ms)
+                         VALUES (?1, 'stale', 'repair-failed', ?2, ?3)
+                         ON CONFLICT(aggregate) DO UPDATE SET status='stale', error_code=excluded.error_code,
+                            error_message=excluded.error_message, updated_at_unix_ms=excluded.updated_at_unix_ms",
+                        params![
+                            format!("repair:{repair_claim}"),
+                            format!("repair {repair_claim}: {error:#}"),
+                            now_ms().to_string()
+                        ],
+                    )?;
+                }
             }
-            let repaired_claim = transaction
-                .query_row(
-                    "SELECT claim_id FROM replica_records WHERE record_ref=?1",
-                    [record_ref],
-                    |row| row.get::<_, Option<String>>(0),
-                )
-                .optional()?
-                .flatten();
-            changed += transaction.execute(
-                "UPDATE replica_records SET state='repaired', replacement_claim_id=?2,
-                    error_code=NULL, error_message=NULL, updated_at_unix_ms=?3
-                 WHERE record_ref=?1 AND state IN ('valid','invalid','unknown','repaired')
-                   AND (replacement_claim_id IS NULL OR replacement_claim_id<>?2)",
-                params![record_ref, replacement, now_ms().to_string()],
-            )?;
-            if let Some(repaired_claim) = repaired_claim {
-                select_desired_repair_tx(&transaction, &repaired_claim, replacement)?;
-            }
-            transaction.execute(
-                "INSERT INTO projection_health(aggregate, status, last_good_store_index, updated_at_unix_ms)
-                 VALUES (?1, 'healthy', ?2, ?3)
-                 ON CONFLICT(aggregate) DO UPDATE SET status='healthy',
-                    last_good_store_index=excluded.last_good_store_index, error_code=NULL,
-                    error_message=NULL, updated_at_unix_ms=excluded.updated_at_unix_ms",
-                params![format!("repair:{record_ref}:{repair_claim}"), current_index_tx(&transaction)?, now_ms().to_string()],
-            )?;
         }
         transaction.commit()?;
         Ok(changed)
@@ -11244,6 +11244,20 @@ impl Store {
                 [],
                 |row| row.get(0),
             )?,
+            unhealthy: connection
+                .prepare(
+                    "SELECT aggregate, status, error_code, error_message FROM projection_health
+                     WHERE status<>'healthy' ORDER BY aggregate LIMIT 50",
+                )?
+                .query_map([], |row| {
+                    Ok(crate::model::UnhealthyProjection {
+                        aggregate: row.get(0)?,
+                        status: row.get(1)?,
+                        error_code: row.get(2)?,
+                        error_message: row.get(3)?,
+                    })
+                })?
+                .collect::<Result<Vec<_>, _>>()?,
             peers,
         })
     }
@@ -20706,6 +20720,7 @@ fn project_replicated_base_claims(transaction: &Transaction<'_>) -> Result<(), S
         )
         .map_err(internal)?;
     let claims = statement.query_map([], claim_from_row).map_err(internal)?;
+    clear_quarantined_claims_tx(transaction, "projection:base")?;
     for claim in claims {
         let claim = claim.map_err(internal)?;
         insert_event(
@@ -20716,19 +20731,75 @@ fn project_replicated_base_claims(transaction: &Transaction<'_>) -> Result<(), S
             &claim.body,
         )
         .map_err(internal)?;
-        match claim.kind.as_str() {
-            "intent.desired" => {
-                let desired = serde_json::from_value::<DesiredSubject>(claim.body.clone())
-                    .map_err(internal)?;
-                select_replicated_desired(transaction, &claim, &desired)?;
+        project_claim_isolated_tx(transaction, "projection:base", &claim, || {
+            match claim.kind.as_str() {
+                "intent.desired" => {
+                    let desired = serde_json::from_value::<DesiredSubject>(claim.body.clone())
+                        .map_err(internal)?;
+                    select_replicated_desired(transaction, &claim, &desired)?;
+                }
+                "doc.bound" => select_replicated_document(transaction, &claim, claim.store_index)?,
+                "mission.published" => {
+                    select_replicated_mission(transaction, &claim, claim.store_index)?
+                }
+                _ => {}
             }
-            "doc.bound" => select_replicated_document(transaction, &claim, claim.store_index)?,
-            "mission.published" => {
-                select_replicated_mission(transaction, &claim, claim.store_index)?
-            }
-            _ => {}
+            Ok(())
+        })?;
+    }
+    Ok(())
+}
+
+/// Project one replicated claim on its own. A claim whose projection fails is rolled back alone
+/// and recorded as an unhealthy projection that names it, so one claim a build cannot project
+/// never holds every later claim from every peer out of the graph.
+fn project_claim_isolated_tx(
+    transaction: &Transaction<'_>,
+    aggregate: &str,
+    claim: &ClaimRecord,
+    project: impl FnOnce() -> Result<(), St3Error>,
+) -> Result<(), St3Error> {
+    transaction
+        .execute_batch("SAVEPOINT project_claim")
+        .map_err(internal)?;
+    match project() {
+        Ok(()) => transaction
+            .execute_batch("RELEASE project_claim")
+            .map_err(internal),
+        Err(error) => {
+            transaction
+                .execute_batch("ROLLBACK TO project_claim; RELEASE project_claim")
+                .map_err(internal)?;
+            transaction
+                .execute(
+                    "INSERT INTO projection_health(aggregate, status, error_code, error_message, updated_at_unix_ms)
+                     VALUES (?1, 'stale', ?2, ?3, ?4)
+                     ON CONFLICT(aggregate) DO UPDATE SET status='stale', error_code=excluded.error_code,
+                        error_message=excluded.error_message, updated_at_unix_ms=excluded.updated_at_unix_ms",
+                    params![
+                        format!("{aggregate}:{}", claim.id),
+                        error.code,
+                        format!("{} on {}: {}", claim.kind, claim.subject, error.message),
+                        now_ms().to_string()
+                    ],
+                )
+                .map_err(internal)?;
+            Ok(())
         }
     }
+}
+
+/// A full replay decides every claim again, so it first forgets the claims it quarantined before.
+fn clear_quarantined_claims_tx(
+    transaction: &Transaction<'_>,
+    aggregate: &str,
+) -> Result<(), St3Error> {
+    transaction
+        .execute(
+            "DELETE FROM projection_health WHERE aggregate LIKE ?1",
+            [format!("{aggregate}:%")],
+        )
+        .map_err(internal)?;
     Ok(())
 }
 
@@ -20825,6 +20896,64 @@ fn select_replicated_desired(
     Ok(())
 }
 
+fn apply_replication_repair_tx(
+    transaction: &Transaction<'_>,
+    repair_claim: &str,
+    body: &str,
+) -> Result<usize> {
+    let body: Value = serde_json::from_str(body)?;
+    let fields = body.get("fields").unwrap_or(&body);
+    let Some(record_ref) = fields.get("record").and_then(Value::as_str) else {
+        return Ok(0);
+    };
+    let Some(replacement) = fields.get("replacement").and_then(Value::as_str) else {
+        return Ok(0);
+    };
+    let replacement_exists = transaction
+        .query_row(
+            "SELECT 1 FROM claims WHERE id=?1",
+            [replacement],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if !replacement_exists {
+        return Ok(0);
+    }
+    let repaired_claim = transaction
+        .query_row(
+            "SELECT claim_id FROM replica_records WHERE record_ref=?1",
+            [record_ref],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()?
+        .flatten();
+    let changed = transaction.execute(
+        "UPDATE replica_records SET state='repaired', replacement_claim_id=?2,
+                error_code=NULL, error_message=NULL, updated_at_unix_ms=?3
+             WHERE record_ref=?1 AND state IN ('valid','invalid','unknown','repaired')
+               AND (replacement_claim_id IS NULL OR replacement_claim_id<>?2)",
+        params![record_ref, replacement, now_ms().to_string()],
+    )?;
+    if let Some(repaired_claim) = repaired_claim {
+        select_desired_repair_tx(transaction, &repaired_claim, replacement)?;
+    }
+    transaction.execute(
+            "INSERT INTO projection_health(aggregate, status, last_good_store_index, updated_at_unix_ms)
+             VALUES (?1, 'healthy', ?2, ?3)
+             ON CONFLICT(aggregate) DO UPDATE SET status='healthy',
+                last_good_store_index=excluded.last_good_store_index, error_code=NULL,
+                error_message=NULL, updated_at_unix_ms=excluded.updated_at_unix_ms",
+            params![format!("repair:{record_ref}:{repair_claim}"), current_index_tx(transaction)?, now_ms().to_string()],
+        )?;
+    // A repair that failed before and applies now is no longer unhealthy.
+    transaction.execute(
+        "DELETE FROM projection_health WHERE aggregate=?1",
+        [format!("repair:{repair_claim}")],
+    )?;
+    Ok(changed)
+}
+
 fn select_desired_repair_tx(
     transaction: &Transaction<'_>,
     repaired_claim_id: &str,
@@ -20883,6 +21012,7 @@ fn select_desired_repair_tx(
 }
 
 fn project_replicated_mission_runs(transaction: &Transaction<'_>) -> Result<(), St3Error> {
+    clear_quarantined_claims_tx(transaction, "projection:runs")?;
     for pass in 0..3 {
         let filter = match pass {
             0 => "claims.kind='mission-run.created'",
@@ -20907,11 +21037,11 @@ fn project_replicated_mission_runs(transaction: &Transaction<'_>) -> Result<(), 
         let claims = statement.query_map([], claim_from_row).map_err(internal)?;
         for claim in claims {
             let claim = claim.map_err(internal)?;
-            match pass {
-                0 => project_mission_run_created(transaction, &claim)?,
-                1 => project_mission_run_update(transaction, &claim)?,
-                _ => reconcile_carried_step_tx(transaction, &claim)?,
-            }
+            project_claim_isolated_tx(transaction, "projection:runs", &claim, || match pass {
+                0 => project_mission_run_created(transaction, &claim),
+                1 => project_mission_run_update(transaction, &claim),
+                _ => reconcile_carried_step_tx(transaction, &claim),
+            })?;
         }
     }
     Ok(())
@@ -24964,6 +25094,198 @@ mod tests {
         let connection = store.connection.lock().unwrap();
         assert!(connection.total_changes() - before <= 2);
         assert!(operation_tx(&connection, "op/existing").unwrap().is_some());
+    }
+
+    /// A claim this build cannot project, such as a desired body from another build, is
+    /// quarantined and named. Every other claim still reaches the graph.
+    #[test]
+    fn one_claim_that_cannot_be_projected_is_quarantined_while_the_rest_project() {
+        let store = Store::open_memory("node").unwrap();
+        let source = "version 2\nagent \"bad\" { workspace \"/tmp\"; command \"true\" }\nagent \"good\" { workspace \"/tmp\"; command \"true\" }\n";
+        let intent = parse_intent(source, "node").unwrap();
+        let preview = store
+            .mission(
+                &intent,
+                IntentInput {
+                    kdl: source.into(),
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        store
+            .apply(&intent, &preview.subject_tokens, "quarantine")
+            .unwrap();
+        let bad_claim = {
+            let connection = store.connection.lock().unwrap();
+            let bad_claim: String = connection
+                .query_row(
+                    "SELECT claim_id FROM desired WHERE subject='agent/node.bad'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "UPDATE claims SET body='{\"from\":\"another build\"}' WHERE id=?1",
+                    [&bad_claim],
+                )
+                .unwrap();
+            connection.execute("DELETE FROM desired", []).unwrap();
+            connection
+                .execute(
+                    "UPDATE projection_health SET status='stale' WHERE aggregate='graph'",
+                    [],
+                )
+                .unwrap();
+            bad_claim
+        };
+        assert!(store.project_replication_backlog().unwrap());
+        let desired = store.desired_subjects().unwrap();
+        assert!(
+            desired
+                .iter()
+                .any(|subject| subject.subject == "agent/node.good")
+        );
+        assert!(
+            !desired
+                .iter()
+                .any(|subject| subject.subject == "agent/node.bad")
+        );
+        let status = store.replication_status(false, None, &[]).unwrap();
+        assert_eq!(status.unhealthy_projections, 1);
+        assert_eq!(
+            status.unhealthy[0].aggregate,
+            format!("projection:base:{bad_claim}")
+        );
+        assert!(
+            status.unhealthy[0]
+                .error_message
+                .as_deref()
+                .is_some_and(|message| message.contains("agent/node.bad"))
+        );
+        // A later full replay decides the claim again instead of keeping a stale quarantine.
+        {
+            let connection = store.connection.lock().unwrap();
+            connection
+                .execute("DELETE FROM claims WHERE id=?1", [&bad_claim])
+                .unwrap();
+            connection
+                .execute(
+                    "UPDATE projection_health SET status='stale' WHERE aggregate='graph'",
+                    [],
+                )
+                .unwrap();
+        }
+        assert!(store.project_replication_backlog().unwrap());
+        assert_eq!(
+            store
+                .replication_status(false, None, &[])
+                .unwrap()
+                .unhealthy_projections,
+            0
+        );
+    }
+
+    /// One repair that cannot be applied never stops the others, replication, or startup.
+    #[test]
+    fn one_repair_that_cannot_be_applied_is_named_and_the_rest_apply() {
+        let store = Store::open_memory("node").unwrap();
+        let source = "version 2\nagent \"one\" { workspace \"/tmp\"; command \"true\" }\nagent \"two\" { workspace \"/tmp\"; command \"true\" }\n";
+        let intent = parse_intent(source, "node").unwrap();
+        let preview = store
+            .mission(
+                &intent,
+                IntentInput {
+                    kdl: source.into(),
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        store
+            .apply(&intent, &preview.subject_tokens, "repairs")
+            .unwrap();
+        let broken = {
+            let mut connection = store.connection.lock().unwrap();
+            let transaction = connection.transaction().unwrap();
+            let mut repairs = Vec::new();
+            for (position, agent) in ["one", "two"].into_iter().enumerate() {
+                let subject = format!("agent/node.{agent}");
+                let repaired: String = transaction
+                    .query_row(
+                        "SELECT claim_id FROM desired WHERE subject=?1",
+                        [&subject],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                let body: String = transaction
+                    .query_row("SELECT body FROM claims WHERE id=?1", [&repaired], |row| {
+                        row.get(0)
+                    })
+                    .unwrap();
+                let replacement = append_claim_tx(
+                    &transaction,
+                    &store.origin,
+                    &subject,
+                    "intent.desired",
+                    None,
+                    &serde_json::from_str::<Value>(&body).unwrap(),
+                    &[],
+                    None,
+                )
+                .unwrap()
+                .id;
+                transaction
+                    .execute(
+                        "INSERT INTO replica_records(record_ref, writer, sequence, envelope_hash,
+                            position, raw, state, claim_id, updated_at_unix_ms)
+                         VALUES (?1, 'peer', 1, 'envelope', ?2, x'00', 'valid', ?3, '0')",
+                        params![format!("record/{agent}"), position as i64, repaired],
+                    )
+                    .unwrap();
+                repairs.push((
+                    replacement.clone(),
+                    append_claim_tx(
+                        &transaction,
+                        &store.origin,
+                        &format!("repair/{agent}"),
+                        "record.repaired",
+                        None,
+                        &json!({"fields": {
+                            "record": format!("record/{agent}"),
+                            "replacement": replacement,
+                            "reason": "a test repair"
+                        }}),
+                        &[],
+                        None,
+                    )
+                    .unwrap()
+                    .id,
+                ));
+            }
+            // The first replacement names a desired body that this build cannot read.
+            transaction
+                .execute(
+                    "UPDATE claims SET body='{\"from\":\"another build\"}' WHERE id=?1",
+                    [&repairs[0].0],
+                )
+                .unwrap();
+            transaction.commit().unwrap();
+            repairs[0].1.clone()
+        };
+        store.apply_replication_repairs().unwrap();
+        let status = store.replication_status(false, None, &[]).unwrap();
+        assert_eq!(
+            status
+                .unhealthy
+                .iter()
+                .map(|projection| projection.aggregate.clone())
+                .collect::<Vec<_>>(),
+            [format!("repair:{broken}")]
+        );
+        assert_eq!(
+            status.repaired_records, 1,
+            "the second repair still applied"
+        );
     }
 
     #[test]

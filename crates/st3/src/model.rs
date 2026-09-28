@@ -2424,7 +2424,18 @@ pub struct ReplicationStatus {
     #[serde(default)]
     pub fenced_envelopes: u64,
     pub unhealthy_projections: u64,
+    /// Each unhealthy projection, such as one replicated claim this build could not project.
+    #[serde(default)]
+    pub unhealthy: Vec<UnhealthyProjection>,
     pub peers: Vec<ReplicationPeerStatus>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct UnhealthyProjection {
+    pub aggregate: String,
+    pub status: String,
+    pub error_code: Option<String>,
+    pub error_message: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
