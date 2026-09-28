@@ -111,6 +111,23 @@ the graph has worktree resources, and must be hidden before a release.
 ### Fleet
 
 Machines with online state, platform, last seen, the peers each reaches, and the agents on it.
+The person's own paired devices are listed here too (name, scope, last seen), each revocable
+after a confirmation (`pairing.revoke`).
+
+### Terminals
+
+An agent with a live terminal can be opened in place from its conversation: the screen streams
+with its colours and styles (never polled), follows the terminal's size, and says so when the
+terminal restarts. With the `terminal.input` capability the person can send a line and the keys
+Enter, Tab, Esc, Up, Down, and a confirmed Ctrl-C; every input takes a fresh terminal fence and
+refuses a changed runtime incarnation. Leaving the view detaches. stui: Enter on an agent opens
+it and Ctrl+\ returns; iOS: a Terminal button on the agent screen.
+
+### Starting a mission
+
+Missions has **New mission**: the person writes what they want (and picks a workspace), and the
+client creates a launch. The planner's proposal then appears on Home as a launch card. Nothing
+runs until the person approves it there.
 
 ## Conversations
 
@@ -160,6 +177,8 @@ Same capabilities, native idioms:
 | Drag to select and copy | Native text selection on messages |
 | Composer grows to eight lines | Growing text input above the keyboard |
 | Loading / empty / failed | The same three states, never an empty list while loading |
+| Enter on an agent: its terminal | Terminal button on the agent screen; keys as buttons |
+| `n` on Missions: new mission | A New mission button opening a composer sheet |
 
 The demo mode (invented data, nothing sent) must exist on iOS too, reading `demo-world.json`.
 
