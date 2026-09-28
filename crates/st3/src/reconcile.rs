@@ -44,6 +44,12 @@ const CLAUDE_TRUST_RECOVERY_ATTEMPTS: usize = 3;
 const CLAUDE_TRUST_RECOVERY_WINDOW_MS: u128 = 10 * 60_000;
 // A failed checkout fetch or worktree command waits this long before Git runs again.
 const CHECKOUT_RETRY_MS: u128 = 30_000;
+const DECLARED_CHECKOUT_LIMIT: usize = 4096;
+
+#[cfg(test)]
+thread_local! {
+    static DECLARATION_PARSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
 /// The screen line on which Claude asks for /login. Claude prints the prompt as its own line,
 /// at most after a status glyph, so a line that only quotes the phrase, such as source code or
@@ -328,6 +334,9 @@ pub struct Reconciler<R = NativeRuntime> {
     delayed_restarts: Arc<Mutex<HashMap<String, u128>>>,
     /// When a failed `checkout` may run Git again, and why it failed, by agent subject.
     checkout_retries: Arc<Mutex<HashMap<String, (u128, String)>>>,
+    /// The last agent declaration's run-end checkout and workspace, by subject, with the store
+    /// index of the subject's newest declaration it was read from.
+    declared_checkouts: Mutex<HashMap<String, (u64, Option<(Checkout, String)>)>>,
     materialized_mission_generations: Mutex<BTreeSet<String>>,
     retired_predecessor_generations: Mutex<BTreeSet<String>>,
     #[cfg(test)]
@@ -411,6 +420,7 @@ impl Reconciler<NativeRuntime> {
             observer_cursors: Arc::new(Mutex::new(HashMap::new())),
             delayed_restarts: Arc::new(Mutex::new(HashMap::new())),
             checkout_retries: Arc::new(Mutex::new(HashMap::new())),
+            declared_checkouts: Mutex::new(HashMap::new()),
             materialized_mission_generations: Mutex::new(BTreeSet::new()),
             retired_predecessor_generations: Mutex::new(BTreeSet::new()),
             #[cfg(test)]
@@ -445,6 +455,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             observer_cursors: Arc::new(Mutex::new(HashMap::new())),
             delayed_restarts: Arc::new(Mutex::new(HashMap::new())),
             checkout_retries: Arc::new(Mutex::new(HashMap::new())),
+            declared_checkouts: Mutex::new(HashMap::new()),
             materialized_mission_generations: Mutex::new(BTreeSet::new()),
             retired_predecessor_generations: Mutex::new(BTreeSet::new()),
             #[cfg(test)]
@@ -1745,7 +1756,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                     ("severity".into(), Value::String("error".into())),
                     ("status".into(), Value::String("blocked".into())),
                     ("code".into(), Value::String("provider-trust-prompt".into())),
-                    ("reason".into(), Value::String("Claude is waiting at its workspace trust prompt and cannot accept work; st3 replaces this incarnation so its driver admits the workspace again".into())),
+                    ("reason".into(), Value::String("Claude is waiting at its workspace trust prompt and cannot accept work; st replaces this incarnation so its driver admits the workspace again".into())),
                     ("incarnation_id".into(), Value::String(incarnation.into())),
                 ]),
                 evidence: vec![runtime_claim.id],
@@ -1777,7 +1788,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                         reviewer: "person/operator".into(),
                         title: "Claude keeps stopping at its workspace trust prompt".into(),
                         reason: format!(
-                            "{} on {} reached Claude's workspace trust prompt {recent} times in {} minutes, so st3 stopped replacing it. Check that its driver can record the workspace trust in the Claude config, then restart the seat.",
+                            "{} on {} reached Claude's workspace trust prompt {recent} times in {} minutes, so st stopped replacing it. Check that its driver can record the workspace trust in the Claude config, then restart the seat.",
                             subject.subject,
                             self.host,
                             CLAUDE_TRUST_RECOVERY_WINDOW_MS / 60_000
@@ -2233,29 +2244,7 @@ impl<R: RuntimeControl> Reconciler<R> {
         let Some(run) = subject.owner_run.as_deref() else {
             return Ok(None);
         };
-        let Some(declaration) = self
-            .store
-            .claims_for(&subject.subject, Some("intent.desired"))?
-            .into_iter()
-            .rev()
-            .find(|claim| claim.body.get("kind").and_then(Value::as_str) == Some("agent"))
-        else {
-            return Ok(None);
-        };
-        let Some(checkout) = declaration
-            .body
-            .get("desired")
-            .and_then(Checkout::from_desired)
-            .filter(|checkout| checkout.remove_at_run_end)
-        else {
-            return Ok(None);
-        };
-        let Some(member) = declaration
-            .body
-            .get("member")
-            .and_then(|member| serde_json::from_value::<MemberSpec>(member.clone()).ok())
-            .filter(|member| member.host == self.host)
-        else {
+        let Some((checkout, workspace)) = self.declared_run_end_checkout(&subject.subject)? else {
             return Ok(None);
         };
         // A run stops its owned agents in its cleanup phase, before it becomes terminal.
@@ -2270,7 +2259,55 @@ impl<R: RuntimeControl> Reconciler<R> {
             .is_some_and(|actual| {
                 actual_field(&actual, "status").and_then(Value::as_str) == Some("stopped")
             });
-        Ok((run_ended && stopped).then_some((checkout, member.workspace)))
+        Ok((run_ended && stopped).then_some((checkout, workspace)))
+    }
+
+    /// The run-end checkout and workspace of the subject's last agent declaration for this host.
+    /// Every stop subject asks on every pass. Declarations are append-only claims, so the parsed
+    /// answer holds until another `intent.desired` claim arrives for the subject.
+    fn declared_run_end_checkout(&self, subject: &str) -> Result<Option<(Checkout, String)>> {
+        let newest = self.store.newest_claim_index(subject, "intent.desired")?;
+        if let Some((index, declared)) = self
+            .declared_checkouts
+            .lock()
+            .expect("declared checkout mutex poisoned")
+            .get(subject)
+            && *index == newest
+        {
+            return Ok(declared.clone());
+        }
+        #[cfg(test)]
+        DECLARATION_PARSES.with(|parses| parses.set(parses.get() + 1));
+        let declared = self
+            .store
+            .claims_for(subject, Some("intent.desired"))?
+            .into_iter()
+            .rev()
+            .find(|claim| claim.body.get("kind").and_then(Value::as_str) == Some("agent"))
+            .and_then(|declaration| {
+                let checkout = declaration
+                    .body
+                    .get("desired")
+                    .and_then(Checkout::from_desired)
+                    .filter(|checkout| checkout.remove_at_run_end)?;
+                let member = declaration
+                    .body
+                    .get("member")
+                    .and_then(|member| serde_json::from_value::<MemberSpec>(member.clone()).ok())
+                    .filter(|member| member.host == self.host)?;
+                Some((checkout, member.workspace))
+            });
+        let mut declared_checkouts = self
+            .declared_checkouts
+            .lock()
+            .expect("declared checkout mutex poisoned");
+        if declared_checkouts.len() >= DECLARED_CHECKOUT_LIMIT
+            && !declared_checkouts.contains_key(subject)
+        {
+            declared_checkouts.clear();
+        }
+        declared_checkouts.insert(subject.to_owned(), (newest, declared.clone()));
+        Ok(declared)
     }
 
     /// Remove a finished checkout unless a current member uses its workspace. A worktree with
@@ -4302,14 +4339,27 @@ impl<R: RuntimeControl> Reconciler<R> {
         variables.insert("ST_LOOP_FEEDBACK".into(), prior_feedback.clone());
         variables.insert("loop.feedback".into(), prior_feedback.clone());
         variables.insert("ST_LOOP_ITEM_ID".into(), String::new());
-        self.record_once(
-            &loop_subject,
-            "loop.state",
-            BTreeMap::from([
-                ("status".into(), Value::String("running".into())),
-                ("round".into(), Value::from(view.attempt)),
-            ]),
-        )?;
+        // Every pass enters here. A later write in the same round (a gate wait, a winner, a
+        // reschedule) already says the round is running, so a bare entry claim would only
+        // replace it, and the next pass would write that later claim again.
+        let round_running = self
+            .store
+            .latest_claim(&loop_subject, Some("loop.state"))?
+            .is_some_and(|claim| {
+                claim.body.pointer("/fields/status").and_then(Value::as_str) == Some("running")
+                    && claim.body.pointer("/fields/round").and_then(Value::as_u64)
+                        == Some(u64::from(view.attempt))
+            });
+        if !round_running {
+            self.record_once(
+                &loop_subject,
+                "loop.state",
+                BTreeMap::from([
+                    ("status".into(), Value::String("running".into())),
+                    ("round".into(), Value::from(view.attempt)),
+                ]),
+            )?;
+        }
         let first_execution = self.loop_first_execution_at(run, view)?;
         let timed_out = loop_spec.timeout_ms.is_some_and(|timeout| {
             first_execution
@@ -6878,7 +6928,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             .map(|field| format!(" --field {field}"))
             .collect::<String>();
         let content = format!(
-            "`{}` was submitted, but its declared product `{}` has not been observed{}. Record that exact subject, for example `st3 claim {} resource.observed --actor {agent}{example}`, or fail the step with the reason. No action is needed if another actor produces it.",
+            "`{}` was submitted, but its declared product `{}` has not been observed{}. Record that exact subject, for example `st claim {} resource.observed --actor {agent}{example}`, or fail the step with the reason. No action is needed if another actor produces it.",
             view.subject,
             missing.subject,
             if expected.is_empty() {
@@ -7743,7 +7793,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                 reviewer: "person/operator".into(),
                 title: "A subscription is holding mission requests".into(),
                 reason: format!(
-                    "One observation for {subscription} requested more than {} mission runs, so {count} wait for a person. List them with `st3 missions requests {subscription}`, then release or cancel each one.",
+                    "One observation for {subscription} requested more than {} mission runs, so {count} wait for a person. List them with `st missions requests {subscription}`, then release or cancel each one.",
                     crate::store::MAX_OBSERVATION_DELIVERIES
                 ),
                 severity: "warning".into(),
@@ -8617,7 +8667,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             ]),
         )?;
         let instruction = format!(
-            "{prompt}\n\nYou are a held-out st3 gate. Inspect only the declared workspace and tools. When you decide, run exactly one of these commands:\n  \"$ST3_BIN\" gate-result pass --reason 'REASON'\n  \"$ST3_BIN\" gate-result fail --reason 'REASON'\nDo not finish without posting a gate-result."
+            "{prompt}\n\nYou are a held-out st gate. Inspect only the declared workspace and tools. When you decide, run exactly one of these commands:\n  \"$ST3_BIN\" gate-result pass --reason 'REASON'\n  \"$ST3_BIN\" gate-result fail --reason 'REASON'\nDo not finish without posting a gate-result."
         );
         let argv = if model.starts_with("claude") {
             vec![
@@ -9377,7 +9427,7 @@ pub(crate) fn append_work_wake_message(
         format!("{source} attempt {wake_attempt} ({reason})")
     };
     let content = format!(
-        "A mission step is ready: {0}. Run `st3 work claim {0}` to read and claim it.\n\nTitle: {1}{queue}\nWake: {wake_description}",
+        "A mission step is ready: {0}. Run `st work claim {0}` to read and claim it.\n\nTitle: {1}{queue}\nWake: {wake_description}",
         step.subject,
         step.title.as_deref().unwrap_or(&step.step),
     );
@@ -9696,7 +9746,7 @@ enum UsedMissionOutcome {
     Failed(String),
 }
 
-/// The st3 executable members launch with. A deploy installs the new binary before it restarts
+/// The st executable members launch with. A deploy installs the new binary before it restarts
 /// the daemon, and in between Linux names this process's image `PATH (deleted)`. Launching that
 /// name fails every start in the window and can hold a seat in a crash loop, so use the
 /// replacement installed at the original path.
@@ -13765,6 +13815,69 @@ agent "worker" {
     }
 
     #[test]
+    fn a_stopped_agents_declared_checkout_is_read_once_per_declaration() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        let declare = |command: &str| {
+            let source =
+                format!("version 2\n  agent \"worker\" {{\n    command \"{command}\"\n  }}\n");
+            let intent = parse_intent(&source, "node").unwrap();
+            let mission = store
+                .mission(
+                    &intent,
+                    crate::model::IntentInput {
+                        kdl: source.clone(),
+                        source_name: None,
+                    },
+                )
+                .unwrap();
+            store
+                .apply(
+                    &intent,
+                    &mission.subject_tokens,
+                    &format!("declare {command}"),
+                )
+                .unwrap();
+        };
+        declare("sleep 60");
+        let reconciler = Reconciler::new(
+            store.clone(),
+            Arc::new(FakeRuntime::default()),
+            "node".into(),
+            Arc::new(Notify::new()),
+        );
+        let parses = || DECLARATION_PARSES.with(std::cell::Cell::get);
+        let before = parses();
+        reconciler
+            .declared_run_end_checkout("agent/node.worker")
+            .unwrap();
+        store
+            .append_claim(&ClaimInput {
+                subject: "agent/node.other".into(),
+                kind: "runtime.observed".into(),
+                actor: None,
+                fields: BTreeMap::from([("status".into(), Value::String("running".into()))]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+        reconciler
+            .declared_run_end_checkout("agent/node.worker")
+            .unwrap();
+        assert_eq!(
+            parses() - before,
+            1,
+            "an unrelated write must not re-read a stopped agent's declarations"
+        );
+
+        declare("sleep 61");
+        reconciler
+            .declared_run_end_checkout("agent/node.worker")
+            .unwrap();
+        assert_eq!(parses() - before, 2);
+    }
+
+    #[test]
     fn stop_waits_for_exit_and_then_kills_the_same_incarnation() {
         let store = Arc::new(Store::open_memory("node").unwrap());
         let running_source = r#"
@@ -14600,7 +14713,7 @@ mission "scheduled-cycle" state="ready" {
             version 2
 
               mission "checkout-lifecycle" state="ready" timeout="1m" {{
-                goal "Work in a worktree that st3 creates and removes."
+                goal "Work in a worktree that st creates and removes."
                 agent "worker" {{
                   workspace {workspace:?}
                   checkout {repository:?} base="origin/main" branch="example/${{ST_MISSION_RUN}}" remove-at-run-end=#true
@@ -15659,6 +15772,94 @@ mission "human-exhaustion" state="ready" {
         let completed = store.mission_run(&run.id).unwrap().unwrap();
         assert_eq!(completed.status, "completed");
         assert_eq!(completed.loops[0].status, "exhausted");
+    }
+
+    #[test]
+    fn a_loop_waiting_on_its_gate_writes_its_state_once() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        let source = r#"
+version 2
+mission "gated-loop" state="ready" {
+  goal "Wait for a person without rewriting the loop state."
+  completion { when "all-steps-exhausted" }
+  loop "improve" {
+    max-rounds 2
+    until {
+      gate "accept" type="human" {
+        reviewer "person/example"
+        question "Accept this round?"
+      }
+    }
+    round { completion { when "all-steps-exhausted" } }
+  }
+}
+"#;
+        apply_source(&store, source, "gated-loop-source");
+        let run = store
+            .create_mission_run(&MissionRunRequest {
+                mission: "gated-loop".into(),
+                revision: None,
+                workspace: "/tmp".into(),
+                requester: Some("person/test".into()),
+                mode: Some("run".into()),
+                inputs: BTreeMap::new(),
+                idempotency_key: "gated-loop-run".into(),
+            })
+            .unwrap();
+        let loop_subject = format!(
+            "loop-run/{}/improve",
+            run.generation.strip_prefix("run-generation/").unwrap()
+        );
+        let reconciler = Reconciler::new(
+            store.clone(),
+            Arc::new(FakeRuntime::default()),
+            "node".into(),
+            Arc::new(Notify::new()),
+        );
+        let mut waiting = false;
+        for _ in 0..20 {
+            reconciler.reconcile_once().unwrap();
+            if store
+                .gate_request_for_owner(&loop_subject)
+                .unwrap()
+                .is_some()
+            {
+                waiting = true;
+                break;
+            }
+        }
+        assert!(waiting, "the loop never asked for its gate");
+        reconciler.reconcile_once().unwrap();
+        let states = store
+            .claims_for(&loop_subject, Some("loop.state"))
+            .unwrap()
+            .len();
+        for _ in 0..30 {
+            reconciler.reconcile_once().unwrap();
+        }
+
+        let after = store.claims_for(&loop_subject, Some("loop.state")).unwrap();
+        assert_eq!(after.len(), states, "a waiting loop rewrote its state");
+        let latest = after.last().unwrap();
+        assert_eq!(
+            latest
+                .body
+                .pointer("/fields/status")
+                .and_then(Value::as_str),
+            Some("running")
+        );
+        assert_eq!(
+            latest
+                .body
+                .pointer("/fields/best_round")
+                .and_then(Value::as_u64),
+            Some(1),
+            "the latest state keeps the round's best result"
+        );
+        assert_ne!(
+            store.mission_run(&run.id).unwrap().unwrap().status,
+            "completed"
+        );
     }
 
     #[test]

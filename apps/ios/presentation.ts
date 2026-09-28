@@ -7,7 +7,7 @@ function operational(resource: object): Operational | undefined {
   return (resource as { operational?: Operational }).operational;
 }
 
-const acronyms: Record<string, string> = { st3: 'ST3', cos: 'COS', ios: 'iOS', tui: 'TUI', pty: 'PTY', api: 'API' };
+const acronyms: Record<string, string> = { st3: 'ST', cos: 'COS', ios: 'iOS', tui: 'TUI', pty: 'PTY', api: 'API' };
 export function words(slug: string): string {
   return slug.split('-').map(word => acronyms[word.toLowerCase()] ?? word.charAt(0).toUpperCase() + word.slice(1)).join(' ');
 }
