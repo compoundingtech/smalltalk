@@ -120,6 +120,31 @@ st doctor
 
 The status view reports the authority digest, graph digest, record counts, projection health, and last peer results.
 
+For each peer, the status view also reports when the last exchange happened and how far apart the
+two envelope sets were at that exchange:
+
+```text
+sync	catching up: node-b has 124,384 envelopes this node lacks, caught up in about 15m
+peer	node-b	up
+  last exchange 2s ago
+  node-b has 124,384 envelopes this node lacks
+  this node has 3 envelopes node-b lacks
+  receiving 142.5 envelopes/s, caught up in about 15m (measured 2s ago)
+```
+
+Each node measures the difference from the inventory its peer already sends in every exchange, so
+the protocol does not change and a peer on an older build is measured too. A range both sides hold
+with different digests counts exactly once the peer lists it; until then its count is a lower
+bound. The estimate divides the remaining envelopes by how fast that number shrank over recent
+10-second windows, so a peer that keeps writing lengthens it. The measurements live in memory; the
+first exchange after a restart rebuilds them.
+
+A node is catching up while a peer measured in the last five minutes holds more envelopes than one
+exchange carries. During that time its projections can show early history as current: a request
+that a later envelope resolves still looks open. Every client page then carries a `sync` notice,
+`st now` and the other product commands print a `SYNCING` line before their items, and stui shows
+`⟳ Syncing` with the same line.
+
 Repair publishes a new claim. It does not delete or change the bad record.
 
 ```sh
