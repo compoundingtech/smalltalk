@@ -819,24 +819,80 @@ struct UninstallArgs {
     actor: Option<String>,
 }
 
-/// Wait until a peer reports the same authority digest as this node: it holds every envelope
-/// this node holds, including everything this node wrote.
-async fn wait_for_peer_agreement(client: &Client, seconds: u64) -> Result<String> {
+/// Who confirms that a member holds everything this node wrote: a peer that reports this node's
+/// authority digest holds every envelope this node holds. A member that refuses this node as
+/// left does so only after it admitted this node's leave, which is this node's last write. Once
+/// it has, it stops exchanging with this node, so a matching digest may never come.
+fn leave_confirmation(
+    status: &ReplicationStatus,
+    removed: Option<&st3::config::FleetRemoval>,
+) -> Result<Option<String>> {
+    if let Some(peer) = status
+        .peers
+        .iter()
+        .find(|peer| peer.authority_digest.as_deref() == Some(status.authority_digest.as_str()))
+    {
+        return Ok(Some(peer.peer.clone()));
+    }
+    match removed {
+        Some(removal) if removal.code == "member-left" => Ok(Some(removal.reported_by.clone())),
+        Some(removal) => anyhow::bail!(
+            "{} reports this machine as {}, so what it wrote after that will not replicate; \
+             finish with st fleet leave --offline",
+            removal.reported_by,
+            removal.code
+        ),
+        None => Ok(None),
+    }
+}
+
+/// One line per peer for a leave that timed out.
+fn leave_peer_summary(status: &ReplicationStatus) -> String {
+    if status.peers.is_empty() {
+        return "no peers".into();
+    }
+    status
+        .peers
+        .iter()
+        .map(|peer| {
+            let digest = match &peer.authority_digest {
+                None => "no digest reported",
+                Some(digest) if *digest == status.authority_digest => "same digest",
+                Some(_) => "different digest",
+            };
+            let error = peer
+                .last_error
+                .as_deref()
+                .map(|error| format!(", last error: {error}"))
+                .unwrap_or_default();
+            format!("{} {} ({digest}{error})", peer.peer, peer.status)
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// Wait until a member confirms it holds everything this node wrote (see
+/// `leave_confirmation`). `stage` names the wait in the error.
+async fn wait_for_leave_confirmation(
+    client: &Client,
+    state_dir: &Path,
+    stage: &str,
+    seconds: u64,
+) -> Result<String> {
     let deadline = std::time::Instant::now() + Duration::from_secs(seconds);
     loop {
         let status: ReplicationStatus = client.get("/v1/replication/status").await?;
-        if let Some(peer) = status
-            .peers
-            .iter()
-            .find(|peer| peer.authority_digest.as_deref() == Some(status.authority_digest.as_str()))
-        {
-            return Ok(peer.peer.clone());
+        let file = st3::config::FleetFile::load(state_dir)?;
+        let removed = file.as_ref().and_then(|file| file.removed.as_ref());
+        if let Some(member) = leave_confirmation(&status, removed)? {
+            return Ok(member);
         }
         anyhow::ensure!(
             std::time::Instant::now() < deadline,
-            "no member reported holding everything this machine wrote within {seconds} seconds; \
-             run st fleet leave again, or st fleet leave --offline and remove this machine from \
-             another member"
+            "{stage}, no member reported holding everything this machine wrote within {seconds} \
+             seconds ({}); run st fleet leave again, or st fleet leave --offline and remove this \
+             machine from another member",
+            leave_peer_summary(&status)
         );
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
@@ -880,7 +936,13 @@ async fn fleet_leave(
                 },
             )
             .await?;
-        wait_for_peer_agreement(client, wait_seconds).await?;
+        wait_for_leave_confirmation(
+            client,
+            &config.state_dir,
+            "before writing the leave",
+            wait_seconds,
+        )
+        .await?;
         let claim: ClaimRecord = client
             .post(
                 "/v1/internal/fleet/leave/claim",
@@ -889,7 +951,15 @@ async fn fleet_leave(
                 },
             )
             .await?;
-        confirmed = Some(wait_for_peer_agreement(client, wait_seconds).await?);
+        confirmed = Some(
+            wait_for_leave_confirmation(
+                client,
+                &config.state_dir,
+                "after writing the leave",
+                wait_seconds,
+            )
+            .await?,
+        );
         println!("left\t{}", claim.id);
     }
     if file
@@ -10195,6 +10265,50 @@ fn unique_pairs(values: Vec<(String, String)>, kind: &str) -> Result<BTreeMap<St
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn peer_status(peer: &str, digest: Option<&str>) -> st3::model::ReplicationPeerStatus {
+        st3::model::ReplicationPeerStatus {
+            peer: peer.into(),
+            status: "up".into(),
+            last_success_at_unix_ms: None,
+            last_error: None,
+            schema_digest: None,
+            authority_digest: digest.map(str::to_owned),
+            graph_digest: None,
+        }
+    }
+
+    #[test]
+    fn a_leave_is_confirmed_by_a_matching_digest_or_a_refusal_as_left() {
+        let mut status = ReplicationStatus {
+            authority_digest: "mine".into(),
+            peers: vec![peer_status("a", Some("theirs")), peer_status("c", None)],
+            ..Default::default()
+        };
+        assert_eq!(leave_confirmation(&status, None).unwrap(), None);
+        assert!(leave_peer_summary(&status).contains("a up (different digest)"));
+
+        // A member that admitted the leave refuses this node and never reports its digest.
+        let left = st3::config::FleetRemoval {
+            reported_by: "a".into(),
+            code: "member-left".into(),
+        };
+        assert_eq!(
+            leave_confirmation(&status, Some(&left)).unwrap(),
+            Some("a".into())
+        );
+
+        // A removal is no confirmation: writes after it do not replicate.
+        let removed = st3::config::FleetRemoval {
+            reported_by: "c".into(),
+            code: "member-removed".into(),
+        };
+        let error = leave_confirmation(&status, Some(&removed)).unwrap_err();
+        assert!(error.to_string().contains("--offline"), "{error}");
+
+        status.peers[1].authority_digest = Some("mine".into());
+        assert_eq!(leave_confirmation(&status, None).unwrap(), Some("c".into()));
+    }
 
     #[test]
     fn conversations_ls_accepts_the_read_spelling_of_its_mailbox() {

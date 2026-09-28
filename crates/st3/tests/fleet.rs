@@ -912,6 +912,70 @@ async fn leave_drains_everything_before_it_leaves() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_leave_already_refused_as_left_finishes_when_run_again() {
+    let root = tempfile::tempdir().unwrap();
+    let a = anchor(root.path(), "a").await;
+    let b = joined(root.path(), &a, "b", &[]).await;
+    b.note("from-b").await;
+    wait_for_notes(
+        &a,
+        &BTreeSet::from(["custom/fleet-test/from-b".to_owned()]),
+        60,
+        &[&a, &b],
+    )
+    .await;
+
+    // An earlier leave wrote its claim, and a admitted it before b heard back. From then on a
+    // refuses b as left and never exchanges with it, so no digest of a's reaches b again.
+    for step in ["begin", "claim"] {
+        let _: Value = b
+            .client()
+            .post(
+                &format!("/v1/internal/fleet/leave/{step}"),
+                &json!({ "person": PERSON }),
+            )
+            .await
+            .unwrap();
+    }
+    wait_until("a admits b's leave", 60, || async {
+        a.st_json(&["fleet", "status"])["view"]["members"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|member| member["name"] == "b" && member["ended"] == "left")
+    })
+    .await;
+    wait_until("a refuses b as left", 60, || async {
+        fs::read_to_string(b.state_dir().join("fleet/fleet.toml"))
+            .is_ok_and(|settings| settings.contains("member-left"))
+    })
+    .await;
+
+    // Running the leave again finishes on that refusal and writes no second leave.
+    let output = b.st_ok(&[
+        "fleet",
+        "leave",
+        "--no-service",
+        "--wait",
+        "30s",
+        "--as",
+        PERSON,
+    ]);
+    assert!(output.contains("left\t"), "{output}");
+    let record: Value =
+        serde_json::from_str(&fs::read_to_string(b.state_dir().join("left-fleet.json")).unwrap())
+            .unwrap();
+    assert_eq!(record["confirmed_by"], "a");
+    let leaves = b
+        .claims()
+        .await
+        .into_iter()
+        .filter(|claim| claim["subject"] == "host/b" && claim["kind"] == "fleet.member-left")
+        .count();
+    assert_eq!(leaves, 1, "the second leave wrote another leave claim");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn uninstall_leaves_nothing_behind() {
     let root = tempfile::tempdir().unwrap();
     let a = anchor(root.path(), "a").await;
