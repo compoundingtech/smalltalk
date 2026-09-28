@@ -1270,6 +1270,14 @@ Each finite cycle can be a nested mission. The parent mission keeps the stable a
 
 Use `catch-up "latest"` when a restart must create at most one missed wake occurrence.
 
+With `catch-up "all"`, more missed occurrences than `max-catch-up` hold the schedule rather than
+start a burst of work. The schedule records a `reconcile.fault` saying so. Raise `max-catch-up`, or
+choose `catch-up "latest"` or `"skip"`, to release it.
+
+Stopping a schedule (`schedule "NAME" { stop }`) cancels the work it requested that has not started.
+Each such request records `schedule.work-failed` with the code `schedule-stopped`, so declaring the
+schedule again never starts work from before the stop.
+
 The schedule does not assign work. The referenced mission defines its work selectors.
 
 ## Mission revisions

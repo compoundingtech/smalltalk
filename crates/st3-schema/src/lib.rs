@@ -711,6 +711,7 @@ fn resource_specs() -> BTreeMap<String, ResourceSpec> {
                 ("pull_requests", array()),
                 ("issues", array()),
                 ("repository_id", integer()),
+                ("github_http_requests_since_start", integer()),
             ],
         ),
     );
@@ -761,6 +762,7 @@ fn resource_specs() -> BTreeMap<String, ResourceSpec> {
                 ("title", string()),
                 ("author", string()),
                 ("head", reference()),
+                ("head_sha", string()),
                 ("base", reference()),
                 ("state", string()),
                 ("draft", boolean()),

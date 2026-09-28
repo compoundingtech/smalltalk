@@ -460,6 +460,8 @@
             "state": { "enum": ["draft", "ready", "running", "standing", "completed", "failed", "cancelled"] },
             "mission_revision": { "$ref": "#/$defs/Revision" },
             "runs": { "type": "array", "items": { "$ref": "#/$defs/Id" } },
+            "run_details": { "type": "array", "items": { "$ref": "#/$defs/MissionRunSummary" } },
+            "must_act": { "enum": ["you", "agent", "system", "blocked", "nobody"] },
             "active_runs": { "type": "integer", "minimum": 0 },
             "run_generations": { "type": "object", "additionalProperties": { "$ref": "#/$defs/Id" } },
             "visualization": { "$ref": "#/$defs/Visualization" },
@@ -467,6 +469,26 @@
           }
         }
       ]
+    },
+    "MissionRunSummary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "requester", "status", "phase", "progress", "current_steps", "must_act", "state_since"],
+      "properties": {
+        "id": { "$ref": "#/$defs/Id" },
+        "generation_id": { "$ref": "#/$defs/Id" },
+        "requester": { "$ref": "#/$defs/Id" },
+        "status": { "type": "string" },
+        "phase": { "type": "string" },
+        "progress": { "type": "object", "required": ["done", "total"], "properties": { "done": { "type": "integer" }, "total": { "type": "integer" } } },
+        "current_steps": { "type": "array", "items": { "type": "object", "required": ["id", "title", "state", "since"], "properties": { "id": { "$ref": "#/$defs/Id" }, "title": { "type": ["string", "null"] }, "assignee": { "oneOf": [{ "$ref": "#/$defs/Id" }, { "type": "null" }] }, "claimant": { "oneOf": [{ "$ref": "#/$defs/Id" }, { "type": "null" }] }, "state": { "type": "string" }, "since": { "$ref": "#/$defs/Timestamp" } } } },
+        "must_act": { "enum": ["you", "agent", "system", "blocked", "nobody"] },
+        "state_since": { "$ref": "#/$defs/Timestamp" },
+        "last_progress": { "type": ["string", "null"] },
+        "blocker": { "type": ["object", "null"] },
+        "after": { "oneOf": [{ "$ref": "#/$defs/Id" }, { "type": "null" }] },
+        "deadline": { "oneOf": [{ "$ref": "#/$defs/Timestamp" }, { "type": "null" }] }
+      }
     },
     "Work": {
       "allOf": [
@@ -481,6 +503,9 @@
             "generation_id": { "$ref": "#/$defs/Id" },
             "definition_id": { "$ref": "#/$defs/Revision" },
             "path": { "type": "string" },
+            "title": { "type": ["string", "null"] },
+            "assigned_to": { "oneOf": [{ "$ref": "#/$defs/Id" }, { "type": "null" }] },
+            "last_progress": { "type": ["string", "null"] },
             "state": { "enum": ["waiting", "ready", "claimed", "blocked", "verifying", "completed", "failed", "cancelled"] },
             "attempt": { "type": "integer", "minimum": 0 },
             "readiness_epoch": { "type": "integer", "minimum": 0 },
@@ -510,6 +535,9 @@
             "owner_run_id": { "oneOf": [{ "$ref": "#/$defs/Id" }, { "type": "null" }] },
             "driver": { "type": ["string", "null"] },
             "harness_state": { "type": ["string", "null"] },
+            "host_id": { "oneOf": [{ "$ref": "#/$defs/Id" }, { "type": "null" }] },
+            "last_activity_at": { "oneOf": [{ "$ref": "#/$defs/Timestamp" }, { "type": "null" }] },
+            "silent_since": { "oneOf": [{ "$ref": "#/$defs/Timestamp" }, { "type": "null" }] },
             "fault": { "type": ["string", "null"], "description": "Current member reconcile failure; cleared by a successful pass." },
             "incarnation_id": { "type": ["string", "null"] },
             "current_session_id": { "type": ["string", "null"] },

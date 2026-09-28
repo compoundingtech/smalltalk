@@ -439,6 +439,11 @@ fn mission_resources(
     history: bool,
     selected_id: Option<&str>,
 ) -> anyhow::Result<Vec<Value>> {
+    let attention = store.attention_items(None)?;
+    let human_attention_runs = attention
+        .iter()
+        .filter_map(|item| item.mission_run.as_deref())
+        .collect::<BTreeSet<_>>();
     let mut missions = BTreeMap::<String, Vec<MissionRunView>>::new();
     for run in store.mission_run_headers()? {
         missions.entry(run.mission.clone()).or_default().push(run);
@@ -508,6 +513,94 @@ fn mission_resources(
                 .iter()
                 .filter(|run| !matches!(run.status.as_str(), "completed" | "failed" | "cancelled"))
                 .count();
+            let run_details = runs
+                .iter()
+                .map(|header| {
+                    let run = store
+                        .mission_run(&header.id)?
+                        .unwrap_or_else(|| header.clone());
+                    let done = run
+                        .steps
+                        .iter()
+                        .filter(|step| step.status == "completed")
+                        .count();
+                    let current_steps = run
+                        .steps
+                        .iter()
+                        .filter(|step| {
+                            matches!(
+                                step.status.as_str(),
+                                "ready" | "claimed" | "working" | "verifying" | "blocked"
+                            )
+                        })
+                        .map(|step| {
+                            json!({
+                                "id": step.subject,
+                                "title": step.title,
+                                "assignee": step.assigned_to,
+                                "claimant": step.claimant,
+                                "state": step.status,
+                                "since": client_timestamp(step.updated_at_unix_ms),
+                            })
+                        })
+                        .collect::<Vec<_>>();
+                    let last_progress = run
+                        .steps
+                        .iter()
+                        .filter_map(|step| {
+                            Some((step.progress_at_unix_ms?, step.progress_summary.as_ref()?))
+                        })
+                        .max_by_key(|(at, _)| *at)
+                        .map(|(_, summary)| summary.clone());
+                    let must_act =
+                        if matches!(run.status.as_str(), "completed" | "failed" | "cancelled") {
+                            "nobody"
+                        } else if human_attention_runs.contains(run.subject.as_str()) {
+                            "you"
+                        } else if run.steps.iter().any(|step| {
+                            matches!(step.status.as_str(), "ready" | "claimed" | "working")
+                                && (step.assigned_to.is_some()
+                                    || !step.available_to.is_empty()
+                                    || step.claimant.is_some())
+                        }) {
+                            "agent"
+                        } else if run.status == "blocked"
+                            || run.steps.iter().any(|step| step.status == "blocked")
+                        {
+                            "blocked"
+                        } else {
+                            "system"
+                        };
+                    let state_since = store
+                        .claims_for(&run.subject, Some("mission-run.state"))?
+                        .last()
+                        .map(|claim| claim.accepted_at_unix_ms)
+                        .unwrap_or(run.created_at_unix_ms);
+                    let blocker =
+                        run.steps.iter().find(|step| step.status == "blocked").map(
+                            |step| json!({"step": step.subject, "reason": step.blocked_reason}),
+                        );
+                    Ok::<Value, anyhow::Error>(json!({
+                        "id": run.subject,
+                        "generation_id": run.generation,
+                        "requester": run.requester,
+                        "status": run.status,
+                        "phase": run.phase,
+                        "progress": {"done": done, "total": run.steps.len()},
+                        "current_steps": current_steps,
+                        "must_act": must_act,
+                        "state_since": client_timestamp(state_since),
+                        "last_progress": last_progress,
+                        "blocker": blocker,
+                        "after": run.after,
+                        "deadline": run.deadline_at_unix_ms.map(client_timestamp),
+                    }))
+                })
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            let must_act = ["you", "agent", "blocked", "system"]
+                .into_iter()
+                .find(|kind| run_details.iter().any(|run| run["must_act"] == *kind))
+                .unwrap_or("nobody");
             let usage = aggregate_usage_for_runs(store, &desired, &run_ids, Some(snapshot_index))?;
             let revision = latest
                 .map(|run| run.revision.as_str())
@@ -531,6 +624,8 @@ fn mission_resources(
                 "state": state,
                 "mission_revision": revision,
                 "runs": runs.into_iter().map(|run| run.subject).collect::<Vec<_>>(),
+                "run_details": run_details,
+                "must_act": must_act,
                 "active_runs": active_runs,
                 "run_generations": run_generations,
                 "visualization": visualization,
@@ -6442,6 +6537,17 @@ mission "example/looped" state="ready" {
             .unwrap();
         assert_eq!(looped["runs"].as_array().unwrap().len(), 2);
         assert_eq!(looped["active_runs"], 1);
+        assert_eq!(looped["run_details"].as_array().unwrap().len(), 2);
+        let current_run = looped["run_details"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|run| run["status"] == "running")
+            .unwrap();
+        assert_eq!(current_run["requester"], "person/operator");
+        assert_eq!(current_run["progress"]["total"], 1);
+        assert_eq!(current_run["current_steps"].as_array().unwrap().len(), 0);
+        assert!(current_run["state_since"].is_string());
     }
 
     #[test]

@@ -93,6 +93,12 @@ CREATE INDEX IF NOT EXISTS claims_subject_kind_index ON claims(subject, kind, st
 CREATE INDEX IF NOT EXISTS claims_message_to_index
 ON claims(json_extract(body, '$.fields.to'), subject)
 WHERE kind='message.sent';
+CREATE INDEX IF NOT EXISTS claims_message_from_index
+ON claims(json_extract(body, '$.fields.from'), store_index)
+WHERE kind='message.sent';
+CREATE INDEX IF NOT EXISTS claims_actor_progress_index
+ON claims(actor, store_index)
+WHERE kind IN ('work.progress', 'work.submitted');
 CREATE INDEX IF NOT EXISTS claims_timeline_incarnation_index
 ON claims(subject, kind, json_extract(body, '$.fields.incarnation_id'), store_index)
 WHERE kind='harness.timeline';
@@ -1281,10 +1287,6 @@ fn discovered_collection_items(
     else {
         return Vec::new();
     };
-    let prior_numbers = previous_items
-        .iter()
-        .filter_map(|item| item.get("number").and_then(Value::as_u64))
-        .collect::<BTreeSet<_>>();
     let Some(current_items) = current.get(field).and_then(Value::as_array) else {
         return Vec::new();
     };
@@ -1292,7 +1294,15 @@ fn discovered_collection_items(
         .iter()
         .filter_map(|item| {
             let number = item.get("number")?.as_u64()?;
-            if prior_numbers.contains(&number) {
+            let prior = previous_items
+                .iter()
+                .find(|old| old.get("number").and_then(Value::as_u64) == Some(number));
+            if prior.is_some_and(|old| match field {
+                "pull_requests" => ["head", "state", "draft"]
+                    .iter()
+                    .all(|name| old.get(*name) == item.get(*name)),
+                _ => true,
+            }) {
                 return None;
             }
             let (segment, kind) = match field {
@@ -1303,7 +1313,12 @@ fn discovered_collection_items(
             let mut facts = serde_json::Map::from_iter([
                 ("repository".into(), Value::String(repository.into())),
                 ("number".into(), Value::from(number)),
-                ("state".into(), Value::String("open".into())),
+                (
+                    "state".into(),
+                    item.get("state")
+                        .cloned()
+                        .unwrap_or_else(|| Value::String("open".into())),
+                ),
             ]);
             for name in ["url", "title"] {
                 if let Some(value) = item.get(name).filter(|value| !value.is_null()) {
@@ -1311,8 +1326,14 @@ fn discovered_collection_items(
                 }
             }
             if field == "pull_requests" {
-                facts.insert("draft".into(), Value::Bool(false));
+                facts.insert(
+                    "draft".into(),
+                    item.get("draft").cloned().unwrap_or(Value::Bool(false)),
+                );
                 facts.insert("merged".into(), Value::Bool(false));
+                if let Some(head) = item.get("head").filter(|head| !head.is_null()) {
+                    facts.insert("head_sha".into(), head.clone());
+                }
             }
             Some((
                 format!("{repository}/{segment}/{number}"),
@@ -7766,6 +7787,31 @@ impl Store {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
+    /// Among `subjects`, each declaration whose member this build cannot read, with the reason.
+    /// `desired_subjects` gives such a declaration no member at all.
+    pub fn unreadable_members(&self, subjects: &[&str]) -> Result<Vec<(String, String)>> {
+        if subjects.is_empty() {
+            return Ok(Vec::new());
+        }
+        let connection = self.readers.get();
+        let mut statement = connection.prepare(
+            "SELECT subject, member FROM desired
+             WHERE member IS NOT NULL AND subject IN (SELECT value FROM json_each(?1))
+             ORDER BY subject",
+        )?;
+        let rows = statement.query_map([serde_json::to_string(subjects)?], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut unreadable = Vec::new();
+        for row in rows {
+            let (subject, member) = row?;
+            if let Err(error) = serde_json::from_str::<crate::model::MemberSpec>(&member) {
+                unreadable.push((subject, error.to_string()));
+            }
+        }
+        Ok(unreadable)
+    }
+
     pub fn desired_subjects_for_owner_step(&self, owner_step: &str) -> Result<Vec<DesiredSubject>> {
         let connection = self.readers.get();
         let mut statement = connection.prepare(
@@ -10227,6 +10273,74 @@ impl Store {
             .map_err(Into::into)
     }
 
+    /// Last substantive activity for an agent, excluding heartbeat and usage observations.
+    pub fn agent_last_activity_at(
+        &self,
+        agent: &str,
+        incarnation: Option<&str>,
+        snapshot_index: u64,
+    ) -> Result<Option<u128>> {
+        let connection = self.readers.get();
+        let mut times = Vec::new();
+        if let Some(incarnation) = incarnation {
+            let local: Option<i64> = connection.query_row(
+                "SELECT observed_at_unix_ms FROM local_observations
+                 WHERE subject=?1 AND kind='harness.timeline'
+                   AND json_extract(body, '$.fields.incarnation_id')=?2
+                   AND json_extract(body, '$.fields.entry_type') IN ('message','content','tool_call','tool_result')
+                   AND after_store_index<=?3 ORDER BY id DESC LIMIT 1",
+                params![agent, incarnation, snapshot_index], |row| row.get(0),
+            ).optional()?;
+            if let Some(time) = local {
+                times.push(time.max(0) as u128);
+            }
+            let replicated: Option<String> = connection.query_row(
+                "SELECT accepted_at_unix_ms FROM claims
+                 WHERE subject=?1 AND kind='harness.timeline'
+                   AND json_extract(body, '$.fields.incarnation_id')=?2
+                   AND json_extract(body, '$.fields.entry_type') IN ('message','content','tool_call','tool_result')
+                   AND store_index<=?3 ORDER BY store_index DESC LIMIT 1",
+                params![agent, incarnation, snapshot_index], |row| row.get(0),
+            ).optional()?;
+            times.extend(replicated.and_then(|time| time.parse::<u128>().ok()));
+        }
+        for query in [
+            "SELECT accepted_at_unix_ms FROM claims WHERE actor=?1 AND kind IN ('work.progress','work.submitted') AND store_index<=?2 ORDER BY store_index DESC LIMIT 1",
+            "SELECT accepted_at_unix_ms FROM claims WHERE kind='message.sent' AND json_extract(body, '$.fields.from')=?1 AND store_index<=?2 ORDER BY store_index DESC LIMIT 1",
+            "SELECT accepted_at_unix_ms FROM claims WHERE kind='message.sent' AND json_extract(body, '$.fields.to')=?1 AND store_index<=?2 ORDER BY store_index DESC LIMIT 1",
+        ] {
+            let time: Option<String> = connection
+                .query_row(query, params![agent, snapshot_index], |row| row.get(0))
+                .optional()?;
+            times.extend(time.and_then(|time| time.parse::<u128>().ok()));
+        }
+        Ok(times.into_iter().max())
+    }
+
+    pub fn agent_working_since(
+        &self,
+        agent: &str,
+        incarnation: &str,
+        snapshot_index: u64,
+    ) -> Result<Option<u128>> {
+        let connection = self.readers.get();
+        let previous: Option<u64> = connection.query_row(
+            "SELECT MAX(store_index) FROM claims WHERE subject=?1 AND kind='harness.observed'
+             AND json_extract(body, '$.fields.incarnation_id')=?2
+             AND json_extract(body, '$.fields.state')!='working' AND store_index<=?3",
+            params![agent, incarnation, snapshot_index],
+            |row| row.get(0),
+        )?;
+        let started: Option<String> = connection.query_row(
+            "SELECT accepted_at_unix_ms FROM claims WHERE subject=?1 AND kind='harness.observed'
+             AND json_extract(body, '$.fields.incarnation_id')=?2
+             AND json_extract(body, '$.fields.state')='working'
+             AND store_index>?3 AND store_index<=?4 ORDER BY store_index LIMIT 1",
+            params![agent, incarnation, previous.unwrap_or(0), snapshot_index], |row| row.get(0),
+        ).optional()?;
+        Ok(started.and_then(|time| time.parse().ok()))
+    }
+
     fn timeline_claim_rows_for_incarnation_at(
         &self,
         subject: &str,
@@ -11532,6 +11646,18 @@ impl Store {
             .iter()
             .filter_map(|peer| Some((peer.clone(), progress.get(peer)?.view(now)?)))
             .collect()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn replace_desired_member_for_test(&self, subject: &str, member: &str) {
+        self.connection
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE desired SET member=?2 WHERE subject=?1",
+                params![subject, member],
+            )
+            .unwrap();
     }
 
     #[cfg(test)]
@@ -15506,7 +15632,7 @@ fn current_harness_at(
             "SELECT id, accepted_at_unix_ms, json_extract(body, '$.fields.code') FROM claims
              WHERE subject=?1 AND kind='harness.diagnostic' AND store_index<=?2
                AND json_extract(body, '$.fields.code')
-                   IN ('provider-auth-expired', 'provider-trust-prompt')
+                   IN ('provider-auth-expired', 'provider-auth-restored', 'provider-trust-prompt')
                AND json_extract(body, '$.fields.incarnation_id')=?3
              ORDER BY store_index DESC LIMIT 1",
             params![subject, at_index, incarnation_id],
@@ -15519,7 +15645,10 @@ fn current_harness_at(
             },
         )
         .optional()?;
-    if let Some((claim, observed_at_unix_ms, code)) = prompt_rejection {
+    // A lifted login fence no longer holds the incarnation.
+    if let Some((claim, observed_at_unix_ms, code)) = prompt_rejection
+        && code != "provider-auth-restored"
+    {
         let (state, reason) = if code == "provider-trust-prompt" {
             ("blocked", "providerTrustPrompt")
         } else {
@@ -33285,6 +33414,83 @@ mission "nested-work" state="ready" {
         }
     }
 
+    #[test]
+    fn agent_activity_ignores_timeline_status_and_tracks_content() {
+        let store = Store::open_memory("node").unwrap();
+        let agent = "agent/node.worker";
+        let mut status = timeline_observation(agent, "inc-1", "idle");
+        status
+            .fields
+            .insert("entry_type".into(), Value::String("status".into()));
+        store.append_claim(&status).unwrap();
+        assert_eq!(
+            store
+                .agent_last_activity_at(agent, Some("inc-1"), store.index().unwrap())
+                .unwrap(),
+            None
+        );
+        let content = store
+            .append_claim(&timeline_observation(agent, "inc-1", "answer"))
+            .unwrap();
+        assert_eq!(
+            store
+                .agent_last_activity_at(agent, Some("inc-1"), store.index().unwrap())
+                .unwrap(),
+            Some(content.accepted_at_unix_ms)
+        );
+        let mut later_status = timeline_observation(agent, "inc-1", "working");
+        later_status
+            .fields
+            .insert("entry_type".into(), Value::String("status".into()));
+        store.append_claim(&later_status).unwrap();
+        assert_eq!(
+            store
+                .agent_last_activity_at(agent, Some("inc-1"), store.index().unwrap())
+                .unwrap(),
+            Some(content.accepted_at_unix_ms)
+        );
+    }
+
+    #[test]
+    fn agent_silence_starts_at_the_latest_working_transition() {
+        let store = Store::open_memory("node").unwrap();
+        let agent = "agent/node.worker";
+        let observe = |state: &str, key: &str| {
+            store
+                .append_claim(&ClaimInput {
+                    subject: agent.into(),
+                    kind: "harness.observed".into(),
+                    actor: Some(agent.into()),
+                    fields: BTreeMap::from([
+                        ("state".into(), Value::String(state.into())),
+                        ("driver".into(), Value::String("codex".into())),
+                        ("incarnation_id".into(), Value::String("inc-1".into())),
+                    ]),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: Some(key.into()),
+                })
+                .unwrap()
+        };
+        observe("idle", "idle-one");
+        let first = observe("working", "work-one");
+        observe("working", "work-heartbeat");
+        assert_eq!(
+            store
+                .agent_working_since(agent, "inc-1", store.index().unwrap())
+                .unwrap(),
+            Some(first.accepted_at_unix_ms)
+        );
+        observe("idle", "idle-two");
+        let second = observe("working", "work-two");
+        assert_eq!(
+            store
+                .agent_working_since(agent, "inc-1", store.index().unwrap())
+                .unwrap(),
+            Some(second.accepted_at_unix_ms)
+        );
+    }
+
     fn timeline_entries(page: &ClaimsPage) -> Vec<String> {
         page.claims
             .iter()
@@ -36045,6 +36251,61 @@ mission "review-guardrail" state="ready" {
         assert_eq!(issues[0].0, "resource/github/acme/demo/issue/8");
         assert_eq!(issues[0].1, "vcs.issue");
         assert_eq!(issues[0].2["repository"], "resource/github/acme/demo");
+    }
+
+    #[test]
+    fn repository_pull_head_changes_and_closure_emit_exact_item_claims() {
+        let before = json!({"repository_id": 7, "pull_requests": [{
+            "number": 4, "head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "state": "open", "draft": false,
+        }]});
+        let after = json!({"repository_id": 7, "pull_requests": [{
+            "number": 4, "head": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "state": "open", "draft": false,
+        }]});
+        let changes = discovered_collection_items(
+            "resource/github/acme/demo",
+            "pull_requests",
+            Some(&before),
+            &after,
+        );
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].0, "resource/github/acme/demo/pull-request/4");
+        assert_eq!(
+            changes[0].2["head_sha"],
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        );
+        let facts = changes[0]
+            .2
+            .as_object()
+            .unwrap()
+            .iter()
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect();
+        st3_schema::registry()
+            .validate_resource_facts("vcs.pull-request", &facts)
+            .unwrap();
+        assert!(
+            discovered_collection_items(
+                "resource/github/acme/demo",
+                "pull_requests",
+                Some(&after),
+                &after,
+            )
+            .is_empty()
+        );
+        let closed = json!({"repository_id": 7, "pull_requests": [{
+            "number": 4, "head": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "state": "closed", "draft": false,
+        }]});
+        let changes = discovered_collection_items(
+            "resource/github/acme/demo",
+            "pull_requests",
+            Some(&after),
+            &closed,
+        );
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].2["state"], "closed");
     }
 
     #[test]

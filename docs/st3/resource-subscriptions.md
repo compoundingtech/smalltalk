@@ -127,6 +127,10 @@ resource claim.
 
 The refresh operation records `observer.refresh-requested`. Its matching `observer.observed` receipt completes the request.
 
+An observer whose revision met a permanent error, such as a rejected observation, is not polled again
+on that revision. A refresh request still polls it once, and the resulting `observer.state` carries
+the request's attempt, so the observer and its subscriptions can recover without a new revision.
+
 ## Provider contract
 
 A registered provider converts one locator into normalized resource fields.

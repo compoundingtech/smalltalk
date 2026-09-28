@@ -2960,7 +2960,7 @@ fn validate_observer(node: &KdlNode) -> Result<(), St3Error> {
     }
     reject_unknown_children(
         body,
-        &["resource", "provider", "locator", "field"],
+        &["resource", "provider", "locator", "field", "every"],
         "observer",
         "observer",
     )?;
@@ -2987,6 +2987,9 @@ fn validate_observer(node: &KdlNode) -> Result<(), St3Error> {
             "duplicate-observer-field",
             "an observer field repeats",
         ));
+    }
+    if let Some(every) = child_string(body, "every")? {
+        parse_duration(&every, true)?;
     }
     Ok(())
 }
@@ -3621,6 +3624,7 @@ pub fn observer_spec(value: &Value) -> Option<ObserverSpec> {
             provider: String::new(),
             locator: String::new(),
             fields: Vec::new(),
+            every_ms: None,
             stopped: true,
         });
     }
@@ -3635,6 +3639,9 @@ pub fn observer_spec(value: &Value) -> Option<ObserverSpec> {
             .as_str()?
             .to_owned(),
         fields: canonical_child_values(value, "field"),
+        every_ms: canonical_child_value(value, "every")
+            .and_then(Value::as_str)
+            .and_then(|value| parse_duration(value, true).ok()),
         stopped: false,
     })
 }
@@ -5203,6 +5210,24 @@ version 2
             .expect("the observer has a valid specification");
         assert_eq!(observer.provider, "example.queue");
         assert_eq!(observer.fields, ["priority"]);
+    }
+
+    #[test]
+    fn observer_every_sets_a_positive_poll_interval() {
+        let source = r#"version 2
+resource "repo" { kind "vcs.repository" }
+observer "github" {
+    resource "resource/repo"
+    provider "github.repository"
+    locator "example/repo"
+    field "pull_requests"
+    every "5m"
+}"#;
+        let intent = parse_test_intent(source, "node").unwrap();
+        let observer = observer_spec(&intent.subjects["observer/github"].desired).unwrap();
+        assert_eq!(observer.every_ms, Some(300_000));
+        let error = parse_test_intent(&source.replace("5m", "0s"), "node").unwrap_err();
+        assert_eq!(error.code, "invalid-duration");
     }
 
     #[test]
