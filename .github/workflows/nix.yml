@@ -27,7 +27,7 @@ jobs:
         with:
           shared-key: workspace-debug
           cmd-format: nix develop -c {0}
-          cache-workspace-crates: true
+          cache-on-failure: true
       - run: nix develop --command cargo test --workspace --locked
       - run: nix develop --command cargo clippy --workspace --all-targets --locked
 
