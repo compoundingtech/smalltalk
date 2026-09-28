@@ -534,7 +534,10 @@ fn discover_files(home: &Path) -> Result<Vec<SessionMetadata>> {
         (ExternalDriver::Omp, home.join(".oh-omp/agent/sessions")),
         (ExternalDriver::Omp, home.join(".omp/agent/sessions")),
     ];
-    let mut found = discover_opencode_sessions(home)?;
+    // One session source or file that cannot be read, such as a locked database, a transcript
+    // deleted while the walk ran, or a line that is not UTF-8, is skipped. The sessions that can be
+    // read are still listed.
+    let mut found = discover_opencode_sessions(home).unwrap_or_default();
     for (driver, root) in roots {
         if !root.is_dir() {
             continue;
@@ -554,7 +557,7 @@ fn discover_files(home: &Path) -> Result<Vec<SessionMetadata>> {
             if found.len() >= MAX_DISCOVERED_FILES {
                 break;
             }
-            if let Some(metadata) = read_metadata(driver, entry.path())? {
+            if let Ok(Some(metadata)) = read_metadata(driver, entry.path()) {
                 found.push(metadata);
             }
         }
@@ -1540,6 +1543,27 @@ mod tests {
             .unwrap();
         assert_eq!(second.native_id, "second-longer");
         assert_ne!(second.revision, first.revision);
+    }
+
+    #[test]
+    fn one_unreadable_session_file_is_skipped_rather_than_failing_discovery() {
+        let home = tempfile::tempdir().unwrap();
+        let project = home.path().join(".claude/projects/example");
+        fs::create_dir_all(&project).unwrap();
+        fs::write(project.join("broken-id.jsonl"), b"\xff\xfe not UTF-8\n").unwrap();
+        fs::write(
+            project.join("good-id.jsonl"),
+            r#"{"sessionId":"good-id","cwd":"/tmp","timestamp":"2026-09-24T00:00:00Z","type":"user","message":{"content":"hello"}}"#,
+        )
+        .unwrap();
+        let found = discover_files(home.path()).unwrap();
+        assert_eq!(
+            found
+                .iter()
+                .map(|session| session.native_id.as_str())
+                .collect::<Vec<_>>(),
+            ["good-id"]
+        );
     }
 
     #[test]

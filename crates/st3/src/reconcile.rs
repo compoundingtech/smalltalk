@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use anyhow::{Context as _, Result};
@@ -621,7 +621,7 @@ impl<R: RuntimeControl> Reconciler<R> {
         if let Err(error) = self.record_fault(subject, scope, outcome) {
             self.unrecorded_faults
                 .lock()
-                .expect("unrecorded fault mutex poisoned")
+                .unwrap_or_else(PoisonError::into_inner)
                 .push(format!("{subject} {scope}: {error:#}"));
         }
         value
@@ -661,7 +661,7 @@ impl<R: RuntimeControl> Reconciler<R> {
     fn open_faults(
         &self,
     ) -> Result<std::sync::MutexGuard<'_, Option<BTreeMap<(String, String), String>>>> {
-        let mut faults = self.faults.lock().expect("fault mutex poisoned");
+        let mut faults = self.faults.lock().unwrap_or_else(PoisonError::into_inner);
         if faults.is_none() {
             *faults = Some(self.store.open_reconcile_faults(&self.host)?);
         }
@@ -693,7 +693,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             self.store.next_subscription_mission_retry_deadline()?,
             self.delayed_restarts
                 .lock()
-                .expect("restart mutex poisoned")
+                .unwrap_or_else(PoisonError::into_inner)
                 .values()
                 .copied()
                 .min(),
@@ -1214,7 +1214,7 @@ impl<R: RuntimeControl> Reconciler<R> {
         });
         self.file_watchers_used
             .lock()
-            .expect("file watcher mutex poisoned")
+            .unwrap_or_else(PoisonError::into_inner)
             .clear();
         self.isolate("stage/missions", &daemon, || self.evaluate_mission_runs());
         self.release_unused_file_watchers();
@@ -1238,7 +1238,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             &mut self
                 .unrecorded_faults
                 .lock()
-                .expect("unrecorded fault mutex poisoned"),
+                .unwrap_or_else(PoisonError::into_inner),
         );
         anyhow::ensure!(
             diagnostic_errors.is_empty(),
@@ -1883,66 +1883,75 @@ impl<R: RuntimeControl> Reconciler<R> {
             return Ok(());
         }
 
+        let mut message_errors = Vec::new();
         for message in messages.iter().filter(|message| message.status != "closed") {
-            let Some((step_subject, attempt, readiness_epoch, message_incarnation)) =
-                work_message_target(message)
-            else {
-                continue;
-            };
-            let turn_acknowledged = work
-                .iter()
-                .find(|step| step.subject == step_subject)
-                .is_some_and(|step| {
-                    message_sent_at(&self.store, message).is_some_and(|requested| {
-                        harness.as_ref().is_some_and(|harness| {
-                            step.status == "ready"
-                                && harness.state == "working"
-                                && harness.observed_at_unix_ms >= requested
+            // One message whose close fails does not keep the agent's other messages open or
+            // hold back its next wake.
+            let closed = (|| -> Result<()> {
+                let Some((step_subject, attempt, readiness_epoch, message_incarnation)) =
+                    work_message_target(message)
+                else {
+                    return Ok(());
+                };
+                let turn_acknowledged = work
+                    .iter()
+                    .find(|step| step.subject == step_subject)
+                    .is_some_and(|step| {
+                        message_sent_at(&self.store, message).is_some_and(|requested| {
+                            harness.as_ref().is_some_and(|harness| {
+                                step.status == "ready"
+                                    && harness.state == "working"
+                                    && harness.observed_at_unix_ms >= requested
+                            })
                         })
-                    })
-                });
-            if !work_message_should_close(
-                &work,
-                step_subject,
-                attempt,
-                readiness_epoch,
-                message_incarnation,
-                &incarnation_key,
-                turn_acknowledged,
-            ) {
-                continue;
-            }
-            if message.status == "delivered" {
+                    });
+                if !work_message_should_close(
+                    &work,
+                    step_subject,
+                    attempt,
+                    readiness_epoch,
+                    message_incarnation,
+                    &incarnation_key,
+                    turn_acknowledged,
+                ) {
+                    return Ok(());
+                }
+                if message.status == "delivered" {
+                    self.store.append_claim(&ClaimInput {
+                        subject: message.subject.clone(),
+                        kind: "message.read".into(),
+                        actor: Some(agent.into()),
+                        fields: BTreeMap::from([("status".into(), Value::String("read".into()))]),
+                        evidence: Vec::new(),
+                        expected_subject: None,
+                        idempotency_key: Some(format!("work-message-read:{}", message.subject)),
+                    })?;
+                }
+                if message.status == "sent" && turn_acknowledged {
+                    return Ok(());
+                }
                 self.store.append_claim(&ClaimInput {
                     subject: message.subject.clone(),
-                    kind: "message.read".into(),
-                    actor: Some(agent.into()),
-                    fields: BTreeMap::from([("status".into(), Value::String("read".into()))]),
+                    kind: "message.closed".into(),
+                    actor: Some(
+                        if matches!(message.status.as_str(), "sent" | "staged") {
+                            "daemon/runtime"
+                        } else {
+                            agent
+                        }
+                        .into(),
+                    ),
+                    fields: BTreeMap::from([("status".into(), Value::String("closed".into()))]),
                     evidence: Vec::new(),
                     expected_subject: None,
-                    idempotency_key: Some(format!("work-message-read:{}", message.subject)),
+                    idempotency_key: Some(format!("message-close:{}", message.subject)),
                 })?;
+                self.signal_changed();
+                Ok(())
+            })();
+            if let Err(error) = closed {
+                message_errors.push(format!("{}: {error:#}", message.subject));
             }
-            if message.status == "sent" && turn_acknowledged {
-                continue;
-            }
-            self.store.append_claim(&ClaimInput {
-                subject: message.subject.clone(),
-                kind: "message.closed".into(),
-                actor: Some(
-                    if matches!(message.status.as_str(), "sent" | "staged") {
-                        "daemon/runtime"
-                    } else {
-                        agent
-                    }
-                    .into(),
-                ),
-                fields: BTreeMap::from([("status".into(), Value::String("closed".into()))]),
-                evidence: Vec::new(),
-                expected_subject: None,
-                idempotency_key: Some(format!("message-close:{}", message.subject)),
-            })?;
-            self.signal_changed();
         }
 
         let run_order = if seat_chooses_between_runs(agent, &work) {
@@ -2043,6 +2052,11 @@ impl<R: RuntimeControl> Reconciler<R> {
                 WorkWakeDecision::Wait => {}
             }
         }
+        anyhow::ensure!(
+            message_errors.is_empty(),
+            "close work messages: {}",
+            message_errors.join("; ")
+        );
         Ok(())
     }
 
@@ -2175,7 +2189,7 @@ impl<R: RuntimeControl> Reconciler<R> {
         if let Some((_, failure)) = self
             .checkout_retries
             .lock()
-            .expect("checkout retry mutex poisoned")
+            .unwrap_or_else(PoisonError::into_inner)
             .get(subject)
             .filter(|(retry_at, _)| *retry_at > now)
         {
@@ -2185,7 +2199,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             Ok(warnings) => {
                 self.checkout_retries
                     .lock()
-                    .expect("checkout retry mutex poisoned")
+                    .unwrap_or_else(PoisonError::into_inner)
                     .remove(subject);
                 for warning in warnings {
                     self.record_once(
@@ -2209,7 +2223,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                 let retry_at = now.saturating_add(CHECKOUT_RETRY_MS);
                 self.checkout_retries
                     .lock()
-                    .expect("checkout retry mutex poisoned")
+                    .unwrap_or_else(PoisonError::into_inner)
                     .insert(subject.into(), (retry_at, failure.clone()));
                 self.arm_restart(&format!("checkout:{subject}"), retry_at);
                 Ok(Some(failure))
@@ -2301,7 +2315,7 @@ impl<R: RuntimeControl> Reconciler<R> {
         if self
             .checkout_retries
             .lock()
-            .expect("checkout retry mutex poisoned")
+            .unwrap_or_else(PoisonError::into_inner)
             .get(subject)
             .is_some_and(|(retry_at, _)| *retry_at > now)
         {
@@ -2311,7 +2325,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             let reason = format!("kept worktree {}: {error:#}", workspace.display());
             self.checkout_retries
                 .lock()
-                .expect("checkout retry mutex poisoned")
+                .unwrap_or_else(PoisonError::into_inner)
                 .insert(
                     subject.into(),
                     (now.saturating_add(CHECKOUT_RETRY_MS), reason.clone()),
@@ -2719,7 +2733,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             RestartDecision::Start => {
                 self.delayed_restarts
                     .lock()
-                    .expect("restart mutex poisoned")
+                    .unwrap_or_else(PoisonError::into_inner)
                     .remove(&subject.subject);
                 self.perform_start(subject, member, "the prior generation exited")
             }
@@ -2872,7 +2886,7 @@ impl<R: RuntimeControl> Reconciler<R> {
         }
         self.delayed_restarts
             .lock()
-            .expect("restart mutex poisoned")
+            .unwrap_or_else(PoisonError::into_inner)
             .remove(&subject.subject);
         Ok(false)
     }
@@ -3218,7 +3232,7 @@ impl<R: RuntimeControl> Reconciler<R> {
         let mut armed = self
             .delayed_restarts
             .lock()
-            .expect("restart mutex poisoned");
+            .unwrap_or_else(PoisonError::into_inner);
         if armed.get(subject).is_some_and(|current| *current == until) {
             return;
         }
@@ -3234,7 +3248,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             tokio::time::sleep(Duration::from_millis(delay)).await;
             delayed
                 .lock()
-                .expect("restart mutex poisoned")
+                .unwrap_or_else(PoisonError::into_inner)
                 .remove(&subject);
             notify.notify_one();
         });
@@ -3311,11 +3325,11 @@ impl<R: RuntimeControl> Reconciler<R> {
         }
         self.materialized_mission_generations
             .lock()
-            .expect("mission materialization mutex poisoned")
+            .unwrap_or_else(PoisonError::into_inner)
             .retain(|generation| active_generations.contains(generation.as_str()));
         self.retired_predecessor_generations
             .lock()
-            .expect("generation retirement mutex poisoned")
+            .unwrap_or_else(PoisonError::into_inner)
             .retain(|generation| active_generations.contains(generation.as_str()));
         // A run or step that left the active set while faulted has nothing left to fail.
         let active = ids
@@ -3490,20 +3504,20 @@ impl<R: RuntimeControl> Reconciler<R> {
             let already_materialized = self
                 .materialized_mission_generations
                 .lock()
-                .expect("mission materialization mutex poisoned")
+                .unwrap_or_else(PoisonError::into_inner)
                 .contains(&run.generation);
             if !already_materialized {
                 changed |= self.materialize_mission_declarations(run, mission)?;
                 self.materialized_mission_generations
                     .lock()
-                    .expect("mission materialization mutex poisoned")
+                    .unwrap_or_else(PoisonError::into_inner)
                     .insert(run.generation.clone());
             }
         }
         let predecessor_retired = self
             .retired_predecessor_generations
             .lock()
-            .expect("generation retirement mutex poisoned")
+            .unwrap_or_else(PoisonError::into_inner)
             .contains(&run.generation);
         if !predecessor_retired {
             let (retired, complete) = self.retire_predecessor_generation(run)?;
@@ -3511,7 +3525,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             if complete {
                 self.retired_predecessor_generations
                     .lock()
-                    .expect("generation retirement mutex poisoned")
+                    .unwrap_or_else(PoisonError::into_inner)
                     .insert(run.generation.clone());
             }
         }
@@ -7257,7 +7271,7 @@ impl<R: RuntimeControl> Reconciler<R> {
         if !self
             .armed_schedules
             .lock()
-            .expect("schedule mutex poisoned")
+            .unwrap_or_else(PoisonError::into_inner)
             .insert(operation.clone())
         {
             return Ok(());
@@ -7315,7 +7329,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                     });
                     armed
                         .lock()
-                        .expect("schedule mutex poisoned")
+                        .unwrap_or_else(PoisonError::into_inner)
                         .remove(&operation);
                     signal_changed(&notify, &event_notify);
                     return;
@@ -7362,14 +7376,14 @@ impl<R: RuntimeControl> Reconciler<R> {
                 }
                 armed
                     .lock()
-                    .expect("schedule mutex poisoned")
+                    .unwrap_or_else(PoisonError::into_inner)
                     .remove(&operation);
                 signal_changed(&notify, &event_notify);
             });
         } else {
             self.armed_schedules
                 .lock()
-                .expect("schedule mutex poisoned")
+                .unwrap_or_else(PoisonError::into_inner)
                 .remove(&operation);
         }
         Ok(())
@@ -7930,7 +7944,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             .unwrap_or_else(|| {
                 self.observer_deadlines
                     .lock()
-                    .expect("observer deadline mutex poisoned")
+                    .unwrap_or_else(PoisonError::into_inner)
                     .get(&deadline_key)
                     .copied()
                     .or_else(|| {
@@ -7950,7 +7964,7 @@ impl<R: RuntimeControl> Reconciler<R> {
         if !self
             .armed_observers
             .lock()
-            .expect("observer mutex poisoned")
+            .unwrap_or_else(PoisonError::into_inner)
             .insert(operation.clone())
         {
             return Ok(());
@@ -7971,7 +7985,7 @@ impl<R: RuntimeControl> Reconciler<R> {
         let cursor = self
             .observer_cursors
             .lock()
-            .expect("observer cursor mutex poisoned")
+            .unwrap_or_else(PoisonError::into_inner)
             .get(&deadline_key)
             .cloned()
             .unwrap_or_else(|| {
@@ -7994,7 +8008,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                 {
                     armed
                         .lock()
-                        .expect("observer mutex poisoned")
+                        .unwrap_or_else(PoisonError::into_inner)
                         .remove(&operation);
                     signal_changed(&notify, &event_notify);
                     return;
@@ -8021,18 +8035,18 @@ impl<R: RuntimeControl> Reconciler<R> {
                             Ok(_) => {
                                 deadlines
                                     .lock()
-                                    .expect("observer deadline mutex poisoned")
+                                    .unwrap_or_else(PoisonError::into_inner)
                                     .insert(deadline_key.clone(), observation.next_check_unix_ms);
                                 cursors
                                     .lock()
-                                    .expect("observer cursor mutex poisoned")
+                                    .unwrap_or_else(PoisonError::into_inner)
                                     .insert(deadline_key.clone(), observation.cursor);
                             }
                             Err(error) => {
                                 let retry_at = now_ms().saturating_add(60_000);
                                 deadlines
                                     .lock()
-                                    .expect("observer deadline mutex poisoned")
+                                    .unwrap_or_else(PoisonError::into_inner)
                                     .insert(deadline_key.clone(), retry_at);
                                 let reason = error.to_string();
                                 let failure_hash = hex::encode(sha2::Sha256::digest(
@@ -8071,7 +8085,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                         let reason = error.to_string();
                         deadlines
                             .lock()
-                            .expect("observer deadline mutex poisoned")
+                            .unwrap_or_else(PoisonError::into_inner)
                             .insert(deadline_key.clone(), retry_at);
                         if rate_limit.is_some_and(|limit| limit.unauthenticated)
                             || error.downcast_ref::<ProviderUnauthenticated>().is_some()
@@ -8100,7 +8114,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                         if unchanged_failure && refresh_attempt.is_none() {
                             armed
                                 .lock()
-                                .expect("observer mutex poisoned")
+                                .unwrap_or_else(PoisonError::into_inner)
                                 .remove(&operation);
                             signal_changed(&notify, &event_notify);
                             return;
@@ -8136,14 +8150,14 @@ impl<R: RuntimeControl> Reconciler<R> {
                 }
                 armed
                     .lock()
-                    .expect("observer mutex poisoned")
+                    .unwrap_or_else(PoisonError::into_inner)
                     .remove(&operation);
                 signal_changed(&notify, &event_notify);
             });
         } else {
             self.armed_observers
                 .lock()
-                .expect("observer mutex poisoned")
+                .unwrap_or_else(PoisonError::into_inner)
                 .remove(&operation);
         }
         Ok(())
@@ -8884,7 +8898,7 @@ impl<R: RuntimeControl> Reconciler<R> {
         if before.as_ref().is_some_and(|stamp| {
             self.file_observations
                 .lock()
-                .expect("file observation mutex poisoned")
+                .unwrap_or_else(PoisonError::into_inner)
                 .get(subject)
                 == Some(stamp)
         }) {
@@ -8913,7 +8927,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                 let mut observations = self
                     .file_observations
                     .lock()
-                    .expect("file observation mutex poisoned");
+                    .unwrap_or_else(PoisonError::into_inner);
                 if before == after {
                     if let Some(stamp) = after {
                         observations.insert(subject.into(), stamp);
@@ -8925,7 +8939,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             Err(error) => {
                 self.file_observations
                     .lock()
-                    .expect("file observation mutex poisoned")
+                    .unwrap_or_else(PoisonError::into_inner)
                     .remove(subject);
                 self.record_once(
                     subject,
@@ -8944,12 +8958,12 @@ impl<R: RuntimeControl> Reconciler<R> {
     fn ensure_file_watch(&self, subject: &str, path: &Path) -> Result<()> {
         self.file_watchers_used
             .lock()
-            .expect("file watcher mutex poisoned")
+            .unwrap_or_else(PoisonError::into_inner)
             .insert(subject.into());
         let mut watchers = self
             .file_watchers
             .lock()
-            .expect("file watcher mutex poisoned");
+            .unwrap_or_else(PoisonError::into_inner);
         if watchers.contains_key(subject) {
             return Ok(());
         }
@@ -8961,7 +8975,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                 if event.is_ok() {
                     observations
                         .lock()
-                        .expect("file observation mutex poisoned")
+                        .unwrap_or_else(PoisonError::into_inner)
                         .remove(&watched_subject);
                     notify.notify_one();
                 }
@@ -8980,15 +8994,15 @@ impl<R: RuntimeControl> Reconciler<R> {
             &mut *self
                 .file_watchers_used
                 .lock()
-                .expect("file watcher mutex poisoned"),
+                .unwrap_or_else(PoisonError::into_inner),
         );
         self.file_watchers
             .lock()
-            .expect("file watcher mutex poisoned")
+            .unwrap_or_else(PoisonError::into_inner)
             .retain(|subject, _| used.contains(subject));
         self.file_observations
             .lock()
-            .expect("file observation mutex poisoned")
+            .unwrap_or_else(PoisonError::into_inner)
             .retain(|subject, _| used.contains(subject));
     }
 }
@@ -19788,6 +19802,114 @@ mission "wake" state="ready" {
                 idempotency_key: Some("closed-wake-evidence".into()),
             })
             .unwrap();
+    }
+
+    /// One wake message whose close fails does not hold back the agent's next wake.
+    #[test]
+    fn a_work_message_that_cannot_close_does_not_hold_back_the_next_wake() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        let source = r#"
+version 2
+
+agent "worker" { workspace "/tmp"; command "true" }
+mission "task" state="ready" {
+  goal "Do the work."
+  concurrent-runs max=2
+  step "work" { assigned-to "agent/node.worker"; goal "Do it." }
+}
+"#;
+        apply_source(&store, source, "stuck-close-mission");
+        let run = |key: &str| {
+            store
+                .create_mission_run(&crate::model::MissionRunRequest {
+                    mission: "task".into(),
+                    revision: None,
+                    workspace: "/tmp".into(),
+                    requester: Some("person/test".into()),
+                    mode: Some("run".into()),
+                    inputs: BTreeMap::new(),
+                    idempotency_key: key.into(),
+                })
+                .unwrap()
+        };
+        let first = run("first-run");
+        let desired = store
+            .desired_subjects()
+            .unwrap()
+            .into_iter()
+            .find(|subject| subject.subject == "agent/node.worker")
+            .unwrap();
+        let runtime = Arc::new(FakeRuntime::default());
+        runtime.ptys.lock().unwrap().push(RuntimeObservation {
+            runtime_id: desired.member.as_ref().unwrap().runtime_id.clone(),
+            terminal: true,
+            status: "running".into(),
+            exit_code: None,
+            incarnation_id: Some("worker-one".into()),
+        });
+        let reconciler = Reconciler::new(
+            store.clone(),
+            runtime.clone(),
+            "node".into(),
+            Arc::new(Notify::new()),
+        );
+        reconciler.reconcile_once().unwrap();
+        store
+            .append_claim(&ClaimInput {
+                subject: desired.subject.clone(),
+                kind: "harness.observed".into(),
+                actor: Some(desired.subject.clone()),
+                fields: BTreeMap::from([
+                    ("state".into(), Value::String("ready".into())),
+                    ("driver".into(), Value::String("codex".into())),
+                    ("incarnation_id".into(), Value::String("worker-one".into())),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some("worker-one-ready".into()),
+            })
+            .unwrap();
+        reconciler.reconcile_once().unwrap();
+        let first_wake = store.messages(Some("agent/node.worker"), true).unwrap();
+        assert_eq!(first_wake.len(), 1);
+        // Another request already holds the key the close would use, so the close fails.
+        store
+            .append_claim(&ClaimInput {
+                subject: "daemon/node".into(),
+                kind: "daemon.diagnostic".into(),
+                actor: None,
+                fields: BTreeMap::from([
+                    ("severity".into(), Value::String("warning".into())),
+                    ("code".into(), Value::String("occupied".into())),
+                    (
+                        "reason".into(),
+                        Value::String("an unrelated request".into()),
+                    ),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some(format!("message-close:{}", first_wake[0].subject)),
+            })
+            .unwrap();
+        store
+            .request_mission_run_cancellation(&first.id, "the first run is not needed")
+            .unwrap();
+        let second = run("second-run");
+        for _ in 0..4 {
+            reconciler.reconcile_once().unwrap();
+        }
+        let messages = store.messages(Some("agent/node.worker"), true).unwrap();
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.content.contains(&second.steps[0].subject)),
+            "the second run's step was never woken: {messages:#?}"
+        );
+        let fault = store
+            .member_reconcile_fault("agent/node.worker", None)
+            .unwrap()
+            .expect("the failed close is recorded on the agent");
+        assert!(fault.contains(&first_wake[0].subject), "{fault}");
     }
 
     #[test]

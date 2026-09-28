@@ -3,7 +3,7 @@ use std::fs;
 use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context as _, Result};
@@ -422,14 +422,22 @@ impl WriterConnection {
         }
     }
 
+    /// The writer. A panic while the writer was held cannot leave a half-written database: its
+    /// open transaction rolls back as the panic unwinds. So a poisoned lock is recovered, rather
+    /// than turning every later write into a panic while the daemon keeps running.
+    fn write(&self) -> WriterGuard<'_> {
+        WriterGuard {
+            connection: self
+                .connection
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner),
+            committed_index: &self.committed_index,
+        }
+    }
+
+    #[cfg(test)]
     fn lock(&self) -> Result<WriterGuard<'_>, &'static str> {
-        self.connection
-            .lock()
-            .map(|connection| WriterGuard {
-                connection,
-                committed_index: &self.committed_index,
-            })
-            .map_err(|_| "store mutex poisoned")
+        Ok(self.write())
     }
 }
 
@@ -477,12 +485,12 @@ impl ReadPool {
         let mut connections = self
             .connections
             .lock()
-            .expect("store read-pool mutex poisoned");
+            .unwrap_or_else(PoisonError::into_inner);
         while connections.is_empty() {
             connections = self
                 .available
                 .wait(connections)
-                .expect("store read-pool mutex poisoned");
+                .unwrap_or_else(PoisonError::into_inner);
         }
         ReadGuard {
             pool: self,
@@ -507,7 +515,7 @@ impl Drop for ReadGuard<'_> {
             .pool
             .connections
             .lock()
-            .expect("store read-pool mutex poisoned");
+            .unwrap_or_else(PoisonError::into_inner);
         connections.push(
             self.connection
                 .take()
@@ -939,7 +947,7 @@ impl Store {
     }
 
     pub fn rebuild_claim_projections(&self) -> Result<()> {
-        let mut connection = self.connection.lock().expect("store mutex poisoned");
+        let mut connection = self.connection.write();
         let transaction = connection.transaction()?;
         rebuild_operations_tx(&transaction)?;
         rebuild_planning_tx(&transaction)?;
@@ -969,7 +977,7 @@ impl Store {
         key: &str,
         response: &T,
     ) -> Result<()> {
-        let connection = self.connection.lock().expect("store mutex poisoned");
+        let connection = self.connection.write();
         connection.execute(
             "INSERT OR IGNORE INTO idempotency(operation_id, response) VALUES (?1, ?2)",
             params![opaque_cache_key(key), serde_json::to_string(response)?],
@@ -1046,7 +1054,7 @@ impl Store {
         source_generation: Option<&str>,
     ) -> Result<PlanningSessionView, St3Error> {
         let now = now_ms().to_string();
-        let connection = self.connection.lock().expect("store mutex poisoned");
+        let connection = self.connection.write();
         connection
             .execute(
                 "INSERT OR IGNORE INTO planning_sessions(id, mission_id, request_ref, workspace, requester, planner, planner_spec_json, status, target_run_id, source_generation_id, created_at_unix_ms, updated_at_unix_ms)
@@ -1090,7 +1098,7 @@ impl Store {
         mission_revision: &str,
     ) -> Result<PlanningSessionView, St3Error> {
         let id = id.strip_prefix("planning-session/").unwrap_or(id);
-        let mut connection = self.connection.lock().expect("store mutex poisoned");
+        let mut connection = self.connection.write();
         let transaction = connection.transaction().map_err(internal)?;
         let (planner, status): (String, String) = transaction
             .query_row(
@@ -1192,7 +1200,7 @@ impl Store {
     ) -> Result<PlanningSessionView, St3Error> {
         let id = id.strip_prefix("planning-session/").unwrap_or(id);
         let now = now_ms().to_string();
-        let connection = self.connection.lock().expect("store mutex poisoned");
+        let connection = self.connection.write();
         connection
             .execute(
                 "INSERT INTO planning_previews(session_id, variant, candidate_revision, hash, store_index, graph, diff, mission_response, created_at_unix_ms)
@@ -1250,7 +1258,7 @@ impl Store {
         published_revision: Option<&str>,
     ) -> Result<PlanningSessionView, St3Error> {
         let id = id.strip_prefix("planning-session/").unwrap_or(id);
-        let connection = self.connection.lock().expect("store mutex poisoned");
+        let connection = self.connection.write();
         let (requester, current): (String, String) = connection
             .query_row(
                 "SELECT requester, status FROM planning_sessions WHERE id=?1",
@@ -1386,7 +1394,7 @@ impl Store {
             }))
             .map_err(internal)?,
         ));
-        let mut connection = self.connection.lock().expect("store mutex poisoned");
+        let mut connection = self.connection.write();
         if let Some((response, stored_hash)) = connection
             .query_row(
                 "SELECT i.response, r.request_hash FROM idempotency i JOIN mission_run_requests r ON r.operation_id=i.operation_id WHERE i.operation_id=?1",
@@ -1593,7 +1601,7 @@ impl Store {
         let subject = normalize_step_run(subject);
         let actor = normalize_actor(actor, "agent");
         let now = now_ms();
-        let mut connection = self.connection.lock().expect("store mutex poisoned");
+        let mut connection = self.connection.write();
         if let Some(response) = connection
             .query_row(
                 "SELECT response FROM idempotency WHERE operation_id=?1",
@@ -1959,7 +1967,7 @@ impl Store {
             .map_err(internal)?,
         ));
         let now = now_ms();
-        let mut connection = self.connection.lock().expect("store mutex poisoned");
+        let mut connection = self.connection.write();
         if let Some(response) = connection
             .query_row(
                 "SELECT response FROM idempotency WHERE operation_id=?1",
@@ -2062,7 +2070,7 @@ impl Store {
             .strip_prefix("revision-proposal/")
             .unwrap_or(proposal);
         let actor = normalize_actor(actor, "person");
-        let mut connection = self.connection.lock().expect("store mutex poisoned");
+        let mut connection = self.connection.write();
         if let Some(response) = connection
             .query_row(
                 "SELECT response FROM idempotency WHERE operation_id=?1",
@@ -2198,7 +2206,7 @@ impl Store {
                 mission_run: run,
                 proposal: Some(applied),
             };
-            let connection = self.connection.lock().expect("store mutex poisoned");
+            let connection = self.connection.write();
             connection
                 .execute(
                     "INSERT INTO idempotency(operation_id, response) VALUES (?1, ?2)",
@@ -2224,7 +2232,7 @@ impl Store {
             mission_run: run,
             proposal: Some(proposal),
         };
-        let connection = self.connection.lock().expect("store mutex poisoned");
+        let connection = self.connection.write();
         connection
             .execute(
                 "INSERT INTO idempotency(operation_id, response) VALUES (?1, ?2)",
@@ -2255,7 +2263,7 @@ impl Store {
                 "agent"
             },
         );
-        let mut connection = self.connection.lock().expect("store mutex poisoned");
+        let mut connection = self.connection.write();
         if let Some(response) = connection
             .query_row(
                 "SELECT response FROM idempotency WHERE operation_id=?1",
@@ -2336,7 +2344,7 @@ impl Store {
     ) -> Result<Option<RevisionSubmissionView>, St3Error> {
         let run_id = run.strip_prefix("mission-run/").unwrap_or(run);
         let proposal = {
-            let connection = self.connection.lock().expect("store mutex poisoned");
+            let connection = self.connection.write();
             let active: u32 = connection
                 .query_row(
                     "SELECT COUNT(*) FROM step_runs
@@ -2466,7 +2474,7 @@ impl Store {
 
     pub fn mission_run_for_parent_step(&self, step: &str) -> Result<Option<MissionRunView>> {
         let step = normalize_step_run(step);
-        let connection = self.connection.lock().expect("store mutex poisoned");
+        let connection = self.connection.write();
         let run_id = connection
             .query_row(
                 "SELECT id FROM mission_runs WHERE parent_step_run=?1 ORDER BY created_at_unix_ms DESC LIMIT 1",
@@ -2766,7 +2774,7 @@ impl Store {
         let mut new_steps = Vec::new();
         flatten_steps(mission, None, &[], &mut new_steps);
 
-        let mut connection = self.connection.lock().expect("store mutex poisoned");
+        let mut connection = self.connection.write();
         if let Some(response) = connection
             .query_row(
                 "SELECT response FROM idempotency WHERE operation_id=?1",
@@ -3171,7 +3179,7 @@ impl Store {
         } else {
             format!("mission-run/{run}")
         };
-        let mut connection = self.connection.lock().expect("store mutex poisoned");
+        let mut connection = self.connection.write();
         let transaction = connection.transaction().map_err(internal)?;
         let claim_ids =
             cancel_mission_run_tx(&transaction, &self.origin, &run, reason, None, now_ms())?;
@@ -3181,7 +3189,7 @@ impl Store {
 
     pub fn terminate_mission_run_descendants(&self, run: &str, reason: &str) -> Result<bool> {
         let run = run.strip_prefix("mission-run/").unwrap_or(run);
-        let mut connection = self.connection.lock().expect("store mutex poisoned");
+        let mut connection = self.connection.write();
         let transaction = connection.transaction()?;
         let generation: Option<String> = transaction
             .query_row(
@@ -3831,7 +3839,7 @@ impl Store {
                 )
             })?;
         let now = now_ms();
-        let mut connection = self.connection.lock().expect("store mutex poisoned");
+        let mut connection = self.connection.write();
         if let Some(response) = connection
             .query_row(
                 "SELECT response FROM idempotency WHERE operation_id=?1",
@@ -4202,7 +4210,7 @@ impl Store {
         reason: Option<&str>,
     ) -> Result<bool> {
         let subject = normalize_step_run(subject);
-        let mut connection = self.connection.lock().expect("store mutex poisoned");
+        let mut connection = self.connection.write();
         let transaction = connection.transaction()?;
         let current: Option<StepStateRow> = transaction
             .query_row(
@@ -4291,7 +4299,7 @@ impl Store {
         backoff_ms: u64,
     ) -> Result<bool> {
         let subject = normalize_step_run(subject);
-        let mut connection = self.connection.lock().expect("store mutex poisoned");
+        let mut connection = self.connection.write();
         let transaction = connection.transaction()?;
         let current: Option<StepRetryRow> = transaction
             .query_row(
@@ -4372,7 +4380,7 @@ impl Store {
     ) -> Result<bool> {
         let run = run.strip_prefix("mission-run/").unwrap_or(run);
         let subject = format!("mission-run/{run}");
-        let mut connection = self.connection.lock().expect("store mutex poisoned");
+        let mut connection = self.connection.write();
         let transaction = connection.transaction()?;
         let current: Option<(String, String)> = transaction
             .query_row(
@@ -4987,7 +4995,7 @@ impl Store {
         idempotency_key: &str,
         actor: Option<&str>,
     ) -> Result<ApplyResponse, St3Error> {
-        let mut connection = self.connection.lock().expect("store mutex poisoned");
+        let mut connection = self.connection.write();
         if let Some(response) = connection
             .query_row(
                 "SELECT response FROM idempotency WHERE operation_id = ?1",
@@ -5802,7 +5810,7 @@ impl Store {
             St3Error::new("document-not-text", "a document must contain valid UTF-8")
         })?;
         let hash = hex::encode(Sha256::digest(bytes));
-        let mut connection = self.connection.lock().expect("store mutex poisoned");
+        let mut connection = self.connection.write();
         if let Some(response) = connection
             .query_row(
                 "SELECT response FROM idempotency WHERE operation_id=?1",
@@ -5964,7 +5972,7 @@ impl Store {
     ) -> Result<(ClaimRecord, bool), St3Error> {
         self.validate_claim_input(input)?;
         let operation = claim_operation(input)?;
-        let mut connection = self.connection.lock().expect("store mutex poisoned");
+        let mut connection = self.connection.write();
         if let Some((operation_id, request_digest)) = &operation
             && let Some((stored_digest, canonical_claim, state)) =
                 operation_tx(&connection, operation_id).map_err(internal)?
@@ -6152,7 +6160,7 @@ impl Store {
             ));
         }
         let repair_subject = format!("repair/{digest}");
-        let mut connection = self.connection.lock().expect("store mutex poisoned");
+        let mut connection = self.connection.write();
         let transaction = connection.transaction().map_err(internal)?;
         if let Some(receipt) = transaction
             .query_row(
@@ -6714,7 +6722,7 @@ impl Store {
 
     #[cfg(test)]
     pub(crate) fn prune_events_before(&self, retain_from: u64) -> Result<usize> {
-        let connection = self.connection.lock().expect("store mutex poisoned");
+        let connection = self.connection.write();
         connection
             .execute("DELETE FROM events WHERE store_index < ?1", [retain_from])
             .map_err(Into::into)
@@ -6896,7 +6904,7 @@ impl Store {
             format!("mission-run/{run}")
         };
         let run_id = run.strip_prefix("mission-run/").unwrap_or(&run);
-        let mut connection = self.connection.lock().expect("store mutex poisoned");
+        let mut connection = self.connection.write();
         let transaction = connection.transaction()?;
         let mode: Option<String> = transaction
             .query_row(
@@ -6934,7 +6942,7 @@ impl Store {
     }
 
     pub fn discard_desired_owned_by(&self, owner_run: &str) -> Result<usize> {
-        let connection = self.connection.lock().expect("store mutex poisoned");
+        let connection = self.connection.write();
         connection
             .execute("DELETE FROM desired WHERE owner_run=?1", [owner_run])
             .map_err(Into::into)
@@ -6947,7 +6955,7 @@ impl Store {
             format!("mission-run/{run}")
         };
         let run_id = run.strip_prefix("mission-run/").unwrap_or(&run);
-        let connection = self.connection.lock().expect("store mutex poisoned");
+        let connection = self.connection.write();
         let mode: Option<String> = connection
             .query_row(
                 "SELECT mode FROM mission_runs WHERE id=?1",
@@ -7126,7 +7134,7 @@ impl Store {
         if let Some(view) = self
             .message_cache
             .lock()
-            .expect("message cache mutex poisoned")
+            .unwrap_or_else(PoisonError::into_inner)
             .get(subject)
             .filter(|entry| {
                 entry.latest_claim_index == latest_claim_index
@@ -7141,7 +7149,7 @@ impl Store {
         let mut cache = self
             .message_cache
             .lock()
-            .expect("message cache mutex poisoned");
+            .unwrap_or_else(PoisonError::into_inner);
         if cache.len() >= MESSAGE_CACHE_LIMIT && !cache.contains_key(subject) {
             cache.clear();
         }
@@ -8017,7 +8025,7 @@ impl Store {
         ))
         .map_err(internal)?;
         let idempotency_key = format!("resource-observation:{operation_hash}");
-        let mut connection = self.connection.lock().expect("store mutex poisoned");
+        let mut connection = self.connection.write();
         if let Some(response) = connection
             .query_row(
                 "SELECT response FROM idempotency WHERE operation_id=?1",
@@ -8997,7 +9005,7 @@ impl Store {
         if let Some((_, value)) = self
             .actual_cache
             .lock()
-            .expect("actual cache mutex poisoned")
+            .unwrap_or_else(PoisonError::into_inner)
             .get(subject)
             .filter(|(index, _)| *index == before)
         {
@@ -9010,7 +9018,7 @@ impl Store {
             let mut cache = self
                 .actual_cache
                 .lock()
-                .expect("actual cache mutex poisoned");
+                .unwrap_or_else(PoisonError::into_inner);
             if self.committed_index.load(Ordering::Acquire) == after {
                 // Entries from an earlier store index can never be hit again.
                 // Keeping them would retain historical subjects indefinitely.
@@ -9152,7 +9160,7 @@ impl Store {
         let secret = hex::encode(bytes);
         let secret_hash = hex::encode(Sha256::digest(secret.as_bytes()));
         let expires = now_ms().saturating_add(lifetime_ms as u128);
-        let connection = self.connection.lock().expect("store mutex poisoned");
+        let connection = self.connection.write();
         connection.execute(
             "INSERT INTO capabilities(secret_hash, kind, subject, incarnation_id, expires_at_unix_ms, used)
              VALUES (?1, ?2, ?3, ?4, ?5, 0)",
@@ -9207,7 +9215,7 @@ impl Store {
             return Ok(capability);
         }
         let hash = hex::encode(Sha256::digest(secret.as_bytes()));
-        let connection = self.connection.lock().expect("store mutex poisoned");
+        let connection = self.connection.write();
         let changed = connection
             .execute(
                 "UPDATE capabilities SET used=1 WHERE secret_hash=?1 AND used=0",
@@ -9228,7 +9236,7 @@ impl Store {
 
     pub fn put_blob(&self, bytes: &[u8]) -> Result<String> {
         let hash = hex::encode(Sha256::digest(bytes));
-        let connection = self.connection.lock().expect("store mutex poisoned");
+        let connection = self.connection.write();
         connection.execute(
             "INSERT OR IGNORE INTO blobs(hash, bytes, size) VALUES (?1, ?2, ?3)",
             params![hash, bytes, bytes.len() as u64],
@@ -9247,7 +9255,7 @@ impl Store {
     }
 
     pub fn bind_fleet(&self, fleet_id: &str) -> Result<()> {
-        let connection = self.connection.lock().expect("store mutex poisoned");
+        let connection = self.connection.write();
         let stored = connection
             .query_row("SELECT value FROM meta WHERE key='fleet_id'", [], |row| {
                 row.get::<_, String>(0)
@@ -9277,7 +9285,7 @@ impl Store {
         if let Some(snapshot) = self
             .replication_snapshot
             .lock()
-            .expect("replication snapshot mutex poisoned")
+            .unwrap_or_else(PoisonError::into_inner)
             .as_ref()
             .filter(|snapshot| {
                 snapshot.store_index == store_index
@@ -9288,7 +9296,7 @@ impl Store {
             return Ok(snapshot);
         }
 
-        let mut connection = self.connection.lock().expect("store mutex poisoned");
+        let mut connection = self.connection.write();
         let seeded_through = self.seeded_batch_rowid.load(Ordering::Acquire);
         let latest_batch = max_batch_rowid(&connection)?;
         if latest_batch > seeded_through {
@@ -9301,7 +9309,7 @@ impl Store {
         let previous = self
             .replication_snapshot
             .lock()
-            .expect("replication snapshot mutex poisoned")
+            .unwrap_or_else(PoisonError::into_inner)
             .take();
         let envelope_count: usize =
             connection.query_row("SELECT COUNT(*) FROM replica_envelopes", [], |row| {
@@ -9389,7 +9397,7 @@ impl Store {
         *self
             .replication_snapshot
             .lock()
-            .expect("replication snapshot mutex poisoned") = Some(snapshot.clone());
+            .unwrap_or_else(PoisonError::into_inner) = Some(snapshot.clone());
         Ok(snapshot)
     }
 
@@ -9521,7 +9529,7 @@ impl Store {
                 "the peer belongs to another fleet",
             ));
         }
-        let mut connection = self.connection.lock().expect("store mutex poisoned");
+        let mut connection = self.connection.write();
         let transaction = connection.transaction().map_err(internal)?;
         let mut received = 0;
         let mut duplicate = 0;
@@ -9581,7 +9589,7 @@ impl Store {
     }
 
     pub fn validate_replication_backlog(&self) -> Result<ReplicationAdmission> {
-        let mut connection = self.connection.lock().expect("store mutex poisoned");
+        let mut connection = self.connection.write();
         let mut statement = connection.prepare(
             "WITH retry_ids AS (
                  SELECT writer, sequence, envelope_hash FROM replica_envelopes
@@ -9658,7 +9666,7 @@ impl Store {
     }
 
     pub fn project_replication_backlog(&self) -> Result<bool> {
-        let mut connection = self.connection.lock().expect("store mutex poisoned");
+        let mut connection = self.connection.write();
         let transaction = connection.transaction()?;
         let result = (|| -> Result<(), St3Error> {
             // An incremental projection that fails is rolled back and replaced by a full replay,
@@ -9790,7 +9798,7 @@ impl Store {
     /// Apply each recorded repair on its own. A repair that cannot be applied is recorded as an
     /// unhealthy projection that names it, so one bad repair never stops replication or startup.
     pub fn apply_replication_repairs(&self) -> Result<usize> {
-        let mut connection = self.connection.lock().expect("store mutex poisoned");
+        let mut connection = self.connection.write();
         let transaction = connection.transaction()?;
         let mut statement = transaction
             .prepare("SELECT id, body FROM claims WHERE kind='record.repaired' ORDER BY id")?;
@@ -9838,7 +9846,7 @@ impl Store {
         idempotency_key: &str,
     ) -> Result<ClaimRecord, St3Error> {
         {
-            let connection = self.connection.lock().expect("store mutex poisoned");
+            let connection = self.connection.write();
             let state = connection
                 .query_row(
                     "SELECT state FROM replica_records WHERE record_ref=?1",
@@ -9938,7 +9946,7 @@ impl Store {
 
     pub fn record_peer_failure(&self, peer: &str, status: &str, error: &str) -> Result<()> {
         {
-            let connection = self.connection.lock().expect("store mutex poisoned");
+            let connection = self.connection.write();
             connection.execute(
                 "INSERT INTO replication_peers(peer, status, last_error, updated_at_unix_ms)
                  VALUES (?1, ?2, ?3, ?4)
@@ -10204,7 +10212,7 @@ impl Store {
                 ));
             }
         }
-        let mut connection = self.connection.lock().expect("store mutex poisoned");
+        let mut connection = self.connection.write();
         let transaction = connection.transaction().map_err(internal)?;
         for (hash, bytes) in &input.blobs {
             transaction
@@ -21406,6 +21414,39 @@ mod tests {
         let connection = store.connection.lock().unwrap();
         assert!(connection.total_changes() - before <= 2);
         assert!(operation_tx(&connection, "op/existing").unwrap().is_some());
+    }
+
+    /// A panic while the writer is held leaves no half-written transaction behind, so it must not
+    /// turn every later write into a panic while the daemon keeps running.
+    #[test]
+    fn a_panic_while_the_writer_is_held_does_not_disable_the_store() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        let panicking = store.clone();
+        let panicked = std::thread::spawn(move || {
+            let _writer = panicking.connection.write();
+            panic!("a panic while the writer is held");
+        })
+        .join();
+        assert!(panicked.is_err());
+        assert!(store.connection.connection.is_poisoned());
+        store
+            .append_claim(&ClaimInput {
+                subject: "daemon/node".into(),
+                kind: "daemon.diagnostic".into(),
+                actor: None,
+                fields: BTreeMap::from([
+                    ("severity".into(), Value::String("error".into())),
+                    ("code".into(), Value::String("after-a-panic".into())),
+                    (
+                        "reason".into(),
+                        Value::String("the store still writes".into()),
+                    ),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
     }
 
     /// A claim this build cannot project, such as a desired body from another build, is
