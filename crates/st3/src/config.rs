@@ -184,6 +184,8 @@ pub struct ObservationsConfig {
     pub retention: String,
     /// The most observations to keep for one subject and kind.
     pub max_per_subject_kind: usize,
+    /// Export every local observation to an OpenTelemetry collector. Off when absent.
+    pub otlp: Option<crate::otlp::OtlpConfig>,
 }
 
 impl Default for ObservationsConfig {
@@ -191,6 +193,7 @@ impl Default for ObservationsConfig {
         Self {
             retention: "7d".into(),
             max_per_subject_kind: 20_000,
+            otlp: None,
         }
     }
 }
@@ -363,6 +366,9 @@ impl Config {
             self.observations.max_per_subject_kind > 0,
             "observations.max_per_subject_kind must be positive"
         );
+        if let Some(otlp) = &self.observations.otlp {
+            otlp.validate()?;
+        }
         anyhow::ensure!(
             self.person.as_deref().is_none_or(|person| {
                 person.starts_with("person/")
@@ -500,6 +506,13 @@ mod tests {
         }
         let mut config = Config::default();
         config.observations.max_per_subject_kind = 0;
+        assert!(config.validate().is_err());
+        assert_eq!(Config::default().observations.otlp, None);
+        let exported: Config =
+            toml::from_str("[observations.otlp]\nendpoint = \"http://127.0.0.1:4318\"\n").unwrap();
+        exported.validate().unwrap();
+        let mut config = exported.clone();
+        config.observations.otlp.as_mut().unwrap().endpoint = "ftp://collector".into();
         assert!(config.validate().is_err());
     }
 
