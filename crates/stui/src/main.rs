@@ -1,5 +1,6 @@
 mod cache;
 mod model;
+mod tree;
 
 use anyhow::{Context, Result};
 use crossterm::{
@@ -37,7 +38,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-const TABS: [&str; 4] = ["Now", "Chat", "Control", "Fleet"];
+const TABS: [&str; 5] = ["Now", "Chat", "Control", "Fleet", "Tree"];
 const TIMELINE_REFRESH: Duration = Duration::from_secs(30);
 struct TerminalGuard {
     terminal: Terminal<CrosstermBackend<Stdout>>,
@@ -125,8 +126,9 @@ enum Update {
 struct App {
     model: Model,
     tab: usize,
-    selected: [usize; 4],
-    scroll: [u16; 4],
+    selected: [usize; 5],
+    scroll: [u16; 5],
+    tree_open: Option<tree::Target>,
     sidebar: bool,
     show_system_missions: bool,
     mode: Mode,
@@ -151,7 +153,7 @@ struct App {
     action_result: Option<String>,
     notice: Option<String>,
     chat_max_scroll: Cell<u16>,
-    sidebar_offsets: [Cell<usize>; 4],
+    sidebar_offsets: [Cell<usize>; 5],
     live_ready: bool,
     dirty: bool,
     timeline_requested: Option<String>,
@@ -167,8 +169,9 @@ impl App {
         Self {
             model,
             tab: 0,
-            selected: [0; 4],
-            scroll: [0, u16::MAX, 0, 0],
+            selected: [0; 5],
+            scroll: [0, u16::MAX, 0, 0, 0],
+            tree_open: None,
             sidebar: true,
             show_system_missions: false,
             mode: Mode::Normal,
@@ -193,7 +196,13 @@ impl App {
             action_result: None,
             notice: None,
             chat_max_scroll: Cell::new(0),
-            sidebar_offsets: [Cell::new(0), Cell::new(0), Cell::new(0), Cell::new(0)],
+            sidebar_offsets: [
+                Cell::new(0),
+                Cell::new(0),
+                Cell::new(0),
+                Cell::new(0),
+                Cell::new(0),
+            ],
             live_ready: false,
             dirty: true,
             timeline_requested: None,
@@ -375,7 +384,8 @@ impl App {
             0 => self.model.attention().count(),
             1 => self.agent_tree().len() + self.model.undeclared_sessions().count(),
             2 => self.control_missions().len(),
-            _ => self.model.machines().count(),
+            3 => self.model.machines().count(),
+            _ => self.model.tree.targets().len(),
         }
     }
     fn mission_group(&self, mission: &st3_client::Mission) -> &'static str {
@@ -438,7 +448,10 @@ impl App {
                 chunks[0],
             );
         } else {
-            let connection = if self.live_ready {
+            let syncing = self.model.sync_notice().is_some();
+            let connection = if self.live_ready && syncing {
+                "⟳ Syncing"
+            } else if self.live_ready {
                 "● Online"
             } else if self.model.status.is_empty()
                 || self.model.status.starts_with("Loading")
@@ -505,7 +518,7 @@ impl App {
                 self.select_control.get(),
             );
             frame.render_widget(
-                Paragraph::new(state).style(Style::default().fg(if self.live_ready {
+                Paragraph::new(state).style(Style::default().fg(if self.live_ready && !syncing {
                     Color::Green
                 } else {
                     Color::Yellow
@@ -529,7 +542,7 @@ impl App {
             .split(chunks[1]);
             if columns[0].width > 0 {
                 frame.render_widget(
-                    Paragraph::new("Now\nChat\nControl\nFleet")
+                    Paragraph::new("Now\nChat\nControl\nFleet\nTree")
                         .style(Style::default().fg(Color::DarkGray))
                         .block(Block::default().borders(Borders::ALL)),
                     columns[0],
@@ -640,10 +653,17 @@ impl App {
                         )
                     })
                     .collect(),
-                _ => self
+                3 => self
                     .model
                     .machines()
                     .map(|v| format!("{} {}", v.name, v.state))
+                    .collect(),
+                _ => self
+                    .model
+                    .tree
+                    .targets()
+                    .iter()
+                    .map(|target| self.model.tree.target_label(target))
                     .collect(),
             };
             let entries = list
@@ -691,6 +711,15 @@ impl App {
         if self.status_details {
             lines.push(format!("Connection: {}", self.model.status));
             lines.push("i hide connection details".into());
+            lines.push(String::new());
+        }
+        if let Some(sync) = self.model.sync_notice() {
+            lines.extend(
+                sync.peers
+                    .iter()
+                    .map(|peer| format!("SYNCING  {}", peer.summary())),
+            );
+            lines.push("Until this host catches up, what you see here can be out of date.".into());
             lines.push(String::new());
         }
         if let Some(result) = &self.action_result {
@@ -985,7 +1014,7 @@ impl App {
                     lines.push("Older completed steps omitted".into());
                 }
             }
-            _ => {
+            3 => {
                 lines.push("FLEET  /  MACHINES".into());
                 lines.push(String::new());
                 let selected_machine = self.model.machines().nth(self.selected[3]);
@@ -1069,6 +1098,15 @@ impl App {
                 }
                 if self.model.machines.truncated || self.model.devices.truncated {
                     lines.push("[More fleet items beyond bounded view]".into());
+                }
+            }
+            _ => {
+                if let Some(target) = &self.tree_open {
+                    lines.extend(self.model.tree.detail_lines(target));
+                    lines.push(String::new());
+                    lines.push("Esc  Return to tree".into());
+                } else {
+                    lines.extend(self.model.tree.overview_lines());
                 }
             }
         }
@@ -1177,7 +1215,11 @@ impl App {
                     }
                 }
                 2 => "↑↓/click mission · wheel/Pg scroll · c new mission · q quit".into(),
-                _ => "↑↓/click machine · wheel/Pg scroll · q quit".into(),
+                3 => "↑↓/click machine · wheel/Pg scroll · q quit".into(),
+                _ if self.tree_open.is_some() => {
+                    "↑↓ select run or seat · Enter details · Esc tree · Pg/wheel scroll".into()
+                }
+                _ => "↑↓ select run or seat · Enter details · Pg/wheel scroll · q quit".into(),
             },
             Mode::Confirm => self
                 .pending_action
@@ -1667,7 +1709,11 @@ fn terminal_run_style(run: &st3_client::TerminalRun) -> Style {
         st3_client::TerminalColor::Palette(index) => Some(Color::Indexed(*index)),
         st3_client::TerminalColor::Rgb(hex) => {
             let value = u32::from_str_radix(hex.strip_prefix('#')?, 16).ok()?;
-            Some(Color::Rgb((value >> 16) as u8, (value >> 8) as u8, value as u8))
+            Some(Color::Rgb(
+                (value >> 16) as u8,
+                (value >> 8) as u8,
+                value as u8,
+            ))
         }
     };
     let mut style = Style::default();
@@ -2329,9 +2375,13 @@ async fn handle_key(app: &mut App, client: &Client, key: KeyEvent) -> Result<boo
         return Ok(false);
     }
     match key.code {
+        KeyCode::Esc if app.tab == 4 && app.tree_open.is_some() => {
+            app.tree_open = None;
+            app.scroll[4] = 0;
+        }
         KeyCode::Char('q') | KeyCode::Esc => return Ok(true),
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => return Ok(true),
-        KeyCode::Char(d @ '1'..='4') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+        KeyCode::Char(d @ '1'..='5') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
             app.tab = d as usize - '1' as usize;
             app.selected[app.tab] = app.selected[app.tab].min(app.count().saturating_sub(1));
         }
@@ -2457,6 +2507,10 @@ async fn handle_key(app: &mut App, client: &Client, key: KeyEvent) -> Result<boo
                 app.notice = Some("Reconnect before attaching a terminal".into());
             }
         }
+        KeyCode::Enter if app.tab == 4 => {
+            app.tree_open = app.model.tree.targets().get(app.selected[4]).cloned();
+            app.scroll[4] = 0;
+        }
         _ => {}
     }
     app.dirty = true;
@@ -2536,6 +2590,7 @@ fn main() -> Result<()> {
         let mut last_external_scan = Instant::now() - Duration::from_secs(60);
         let mut last_cache_save = Instant::now();
         let mut last_full_reload = Instant::now();
+        let mut last_sync_refresh = Instant::now();
         let mut was_offline = false;
         loop {
             let mut changed = match model.sync(&background_client).await {
@@ -2583,6 +2638,18 @@ fn main() -> Result<()> {
                     }
                 }
                 last_external_scan = Instant::now();
+            }
+            if model.sync_notice().is_some()
+                && last_sync_refresh.elapsed() >= Duration::from_secs(5)
+            {
+                match model.refresh_sync_notice(&background_client).await {
+                    Ok(()) => changed = true,
+                    Err(error) => {
+                        let _ = background_updates
+                            .send(Update::Error(format!("Sync refresh: {error}")));
+                    }
+                }
+                last_sync_refresh = Instant::now();
             }
             if last_full_reload.elapsed() >= Duration::from_secs(120) {
                 match model.reload(&background_client).await {
@@ -2640,6 +2707,7 @@ fn main() -> Result<()> {
                             app.model.agents = model.agents;
                             app.model.sessions = model.sessions;
                             app.model.messages = model.messages;
+                            app.model.tree = model.tree;
                             app.model.status = "Cached · loading details…".into();
                         } else {
                             app.model = *model;
@@ -2668,9 +2736,16 @@ fn main() -> Result<()> {
                     {
                         app.notice = None;
                     }
-                    for tab in 0..4 {
+                    for tab in 0..TABS.len() {
                         app.selected[tab] =
                             app.selected[tab].min(app.count_for(tab).saturating_sub(1));
+                    }
+                    if app
+                        .tree_open
+                        .as_ref()
+                        .is_some_and(|target| !app.model.tree.contains(target))
+                    {
+                        app.tree_open = None;
                     }
                     app.dirty = true;
                 }
@@ -3143,6 +3218,95 @@ mod tests {
                 assert!(content.contains(label));
             }
         }
+    }
+
+    #[tokio::test]
+    async fn tree_screen_navigates_into_a_run_and_seat() {
+        let fixture =
+            serde_json::from_str(include_str!("../../st3/tests/fixtures/missions-tree.json"))
+                .unwrap();
+        let mut model = Model::default();
+        model.tree = tree::MissionsTree::from_response(fixture).unwrap();
+        let mut app = App::new(model);
+        let client = Client::unix("/tmp/stui-tree-test.sock");
+        let mut terminal = Terminal::new(TestBackend::new(110, 30)).unwrap();
+        handle_key(
+            &mut app,
+            &client,
+            KeyEvent::new(KeyCode::Char('5'), KeyModifiers::NONE),
+        )
+        .await
+        .unwrap();
+        assert_eq!(app.tab, 4);
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        let screen = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(screen.contains("RUNNING MISSIONS"));
+        assert!(screen.contains("mission/atlas: build"));
+        handle_key(
+            &mut app,
+            &client,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            app.tree_open,
+            Some(tree::Target::Run("mission-run/atlas/1".into()))
+        );
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        let screen = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(screen.contains("MISSION RUN"));
+        assert!(screen.contains("step-run/atlas/review"));
+        assert!(
+            !handle_key(
+                &mut app,
+                &client,
+                KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)
+            )
+            .await
+            .unwrap()
+        );
+        assert!(app.tree_open.is_none());
+        handle_key(
+            &mut app,
+            &client,
+            KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+        )
+        .await
+        .unwrap();
+        handle_key(
+            &mut app,
+            &client,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            app.tree_open,
+            Some(tree::Target::Seat("agent/orbit/standing".into()))
+        );
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        let screen = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(screen.contains("STANDING SEAT"));
+        assert!(screen.contains("mission-run/boron/1"));
     }
     #[test]
     fn terminal_key_encoding() {
@@ -3672,6 +3836,60 @@ mod tests {
         assert!(first.contains("Online"));
         assert!(!first.contains("Smalltalk"));
         assert!(buffer[(1, 0)].bg != Color::Reset);
+    }
+    #[test]
+    fn a_catching_up_host_says_it_is_syncing_and_how_far_behind() {
+        let snapshot = |store_index| st3_client::Snapshot {
+            id: format!("snapshot/hub/{store_index}"),
+            host_id: "host/hub".into(),
+            store_index,
+            projection_version: "client-projection.v0".into(),
+            created_at: "2026-09-27T21:30:00Z".into(),
+        };
+        let notice = st3_client::SyncNotice {
+            state: "catching-up".into(),
+            peers: vec![st3_client::SyncPeer {
+                host_id: "host/Silber".into(),
+                peer_only_envelopes: 124_384,
+                local_only_envelopes: 3,
+                last_exchange_at: None,
+                estimated_catch_up_seconds: Some(840),
+            }],
+        };
+        let mut model = Model::default();
+        model.now.snapshot = Some(snapshot(10));
+        model.now.sync = Some(notice);
+        model.agents.snapshot = Some(snapshot(9));
+        let mut app = App::new(model);
+        app.live_ready = true;
+        let mut terminal = Terminal::new(TestBackend::new(120, 25)).unwrap();
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let rows = (0..25)
+            .map(|y| {
+                (0..120)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
+        assert!(rows[0].contains("Syncing"), "{}", rows[0]);
+        assert!(!rows[0].contains("Online"));
+        assert!(
+            rows.iter().any(|row| row.contains(
+                "SYNCING  Silber has 124,384 envelopes this host lacks · caught up in about 14m"
+            )),
+            "{rows:#?}"
+        );
+
+        // A newer collection served after the host caught up clears the notice.
+        app.model.agents.snapshot = Some(snapshot(11));
+        assert!(app.model.sync_notice().is_none());
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let top = (0..120)
+            .map(|x| buffer[(x, 0)].symbol())
+            .collect::<String>();
+        assert!(top.contains("Online"), "{top}");
     }
     #[test]
     fn connection_error_is_available_on_demand_not_in_footer() {

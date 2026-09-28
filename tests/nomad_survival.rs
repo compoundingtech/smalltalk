@@ -149,7 +149,7 @@ impl Fixture {
   identity "{identity}"
   host "{HOST}"
   type "service"
-{explicit_env}  command #"(printenv NO_COLOR || printf 'unset\n') >> "$CATALOG/{identity}.color-env""#
+{explicit_env}  command #"(printenv NO_COLOR || printf 'unset\n') >> "$CATALOG/{identity}.color-env"; exec sleep 120"#
 }}
 "##
         );
