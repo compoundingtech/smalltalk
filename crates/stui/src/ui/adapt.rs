@@ -1150,7 +1150,9 @@ mod tests {
 
     #[test]
     fn a_real_claude_transcript_shows_no_harness_markup_and_keeps_the_conversation() {
-        let text = rendered(include_str!("../../tests/fixtures/transcripts/claude.json"));
+        let text = rendered(include_str!(
+            "../../../../fixtures/clients/transcripts/claude.json"
+        ));
         assert_clean(&text);
         for kept in [
             "Please check why the nightly build failed and fix it.",
@@ -1179,7 +1181,9 @@ mod tests {
 
     #[test]
     fn a_real_codex_transcript_shows_no_harness_markup_and_keeps_the_conversation() {
-        let text = rendered(include_str!("../../tests/fixtures/transcripts/codex.json"));
+        let text = rendered(include_str!(
+            "../../../../fixtures/clients/transcripts/codex.json"
+        ));
         assert_clean(&text);
         for kept in [
             "Rotate the signing keys in harbor",

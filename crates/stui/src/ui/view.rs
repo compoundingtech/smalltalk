@@ -6,7 +6,8 @@
 use std::collections::BTreeMap;
 
 /// Something that arrives later. `Loading` is never drawn as empty.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize)]
+#[serde(tag = "state", content = "value", rename_all = "snake_case")]
 pub enum Load<T> {
     Loading,
     Ready(T),
@@ -28,14 +29,15 @@ impl<T> Load<Vec<T>> {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Link {
     Live,
     Connecting,
     Offline(String),
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize)]
 pub struct World {
     pub person: String,
     pub host: String,
@@ -52,7 +54,8 @@ pub struct World {
 
 // ------------------------------------------------------------------ attention
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Tier {
     /// An agent or mission cannot move until the person answers.
     Stopped,
@@ -75,7 +78,7 @@ impl Tier {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize)]
 pub struct Attention {
     pub id: String,
     pub tier: Tier,
@@ -95,7 +98,8 @@ pub struct Attention {
     pub raised_by: Option<String>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum AttentionKind {
     /// A human review gate: approve, or send it back with a reason the agent will read.
     Review {
@@ -149,7 +153,7 @@ impl AttentionKind {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize)]
 pub struct MissionPreview {
     pub name: String,
     pub goals: Vec<String>,
@@ -158,7 +162,7 @@ pub struct MissionPreview {
     pub workspace: String,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize)]
 pub struct PreviewStep {
     pub name: String,
     pub assignee: String,
@@ -166,7 +170,7 @@ pub struct PreviewStep {
     pub asks_you: bool,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize)]
 pub struct PreviewAgent {
     pub name: String,
     pub harness: Harness,
@@ -175,7 +179,8 @@ pub struct PreviewAgent {
 
 // --------------------------------------------------------------------- agents
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Harness {
     Claude,
     Codex,
@@ -196,7 +201,8 @@ impl Harness {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum AgentState {
     /// Waiting on the person.
     NeedsYou,
@@ -208,7 +214,7 @@ pub enum AgentState {
     Unknown,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize)]
 pub struct Agent {
     /// The graph path, a stable id.
     pub id: String,
@@ -227,7 +233,7 @@ pub struct Agent {
 }
 
 /// What the details pane shows about an agent. Every field is optional: st may not say.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, serde::Serialize)]
 pub struct AgentDetails {
     /// The goal of the step it holds now.
     pub goal: Option<String>,
@@ -245,7 +251,8 @@ pub struct AgentDetails {
 // ------------------------------------------------------------------- missions
 
 /// One word naming who has to move, shared by every mission surface.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Word {
     Decision,
     Stalled,
@@ -297,7 +304,8 @@ impl Word {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum StepState {
     Done,
     Working,
@@ -308,7 +316,7 @@ pub enum StepState {
     Pending,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize)]
 pub struct Step {
     pub name: String,
     pub state: StepState,
@@ -323,7 +331,7 @@ pub struct Step {
     pub blockers: Vec<String>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize)]
 pub struct Mission {
     pub id: String,
     pub title: String,
@@ -355,7 +363,7 @@ impl Mission {
 
 // ---------------------------------------------------------------- fleet, trees
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize)]
 pub struct Machine {
     pub name: String,
     pub online: bool,
@@ -366,7 +374,7 @@ pub struct Machine {
     pub you_are_here: bool,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize)]
 pub struct Worktree {
     pub path: String,
     pub host: String,
@@ -380,21 +388,23 @@ pub struct Worktree {
 
 // -------------------------------------------------------------- conversations
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize)]
 pub struct Entry {
     pub id: String,
     pub at: String,
     pub body: Body,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ToolState {
     Running,
     Ok,
     Failed,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
 pub enum Body {
     /// Text typed into the harness: the person, or a delivery the harness shows as a prompt.
     User(String),

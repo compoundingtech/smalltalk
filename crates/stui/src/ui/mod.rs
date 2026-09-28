@@ -6,6 +6,8 @@
 //! same `World`.
 
 pub mod adapt;
+#[cfg(test)]
+mod contract;
 pub mod conversation;
 pub mod demo;
 pub mod doc;
