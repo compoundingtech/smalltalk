@@ -8,6 +8,38 @@ const CONVERSATION_SUBPROTOCOL: &str = "st3.client.conversation.v0";
 const TERMINAL_CAPABILITY_PROTOCOL_PREFIX: &str = "st3.cap.";
 const LOCAL_PERSON_HEADER: &str = "x-st3-person";
 
+#[derive(Deserialize)]
+pub(super) struct ClientDocumentQuery {
+    name: String,
+}
+
+pub(super) async fn document_get(
+    State(state): State<AppState>,
+    Extension(session): Extension<ClientSession>,
+    Query(query): Query<ClientDocumentQuery>,
+) -> Result<Json<Value>, ApiError> {
+    require_scope(&session, "read.projections")?;
+    let (name, hash) = query.name.rsplit_once('@').ok_or_else(|| {
+        ApiError::bad(St3Error::new(
+            "invalid-document-reference",
+            "a document name needs `@HASH`",
+        ))
+    })?;
+    if name.is_empty() || hash.is_empty() {
+        return Err(ApiError::bad(St3Error::new(
+            "invalid-document-reference",
+            "a document name needs `@HASH`",
+        )));
+    }
+    let store = state.store.clone();
+    let name = name.to_owned();
+    let hash = hash.to_owned();
+    let bytes = blocking_store(move || store.get_document(&name, &hash))
+        .await?
+        .ok_or_else(|| ApiError::not_found(format!("document `{}` is not stored", query.name)))?;
+    Ok(Json(json!({ "reference": query.name, "bytes": bytes })))
+}
+
 const ALL_SCOPES: &[&str] = &[
     "read.projections",
     "terminal.read",
@@ -1333,7 +1365,7 @@ pub(super) async fn now(
     let mut effective_query = query.clone();
     effective_query.person.clone_from(&person);
     let mut items =
-        super::client_attention_resources(&state.store, person.as_deref(), query.history)
+        super::client_attention_resources_with_previews(&state, person.as_deref(), query.history)
             .map_err(ApiError::internal)?;
     // The default Now view is the person's attention queue. Mission work belongs
     // in Control; only an explicit work filter opts it into this combined view.
@@ -1351,16 +1383,7 @@ pub(super) async fn now(
         }
         items.extend(work);
     }
-    let priority = |item: &Value| match item["kind"].as_str() {
-        Some("attention") => 0,
-        Some("work") => 1,
-        _ => 2,
-    };
-    items.sort_by(|left, right| {
-        priority(left)
-            .cmp(&priority(right))
-            .then_with(|| left["id"].as_str().cmp(&right["id"].as_str()))
-    });
+    // Attention is already ranked by the daemon. Keep that order when work is included.
     client_page(&state, &snapshot, "now", items, &effective_query).map(Json)
 }
 
@@ -4694,11 +4717,32 @@ async fn dispatch_action(
             let attention = state
                 .store
                 .attention_request(&target)
-                .map_err(ApiError::internal)?
-                .ok_or_else(|| {
-                    ApiError::not_found(format!("attention `{target}` does not exist"))
-                })?;
-            if attention.reviewer != *authority_actor {
+                .map_err(ApiError::internal)?;
+            let reviewer = if let Some(attention) = attention {
+                attention.reviewer
+            } else if target.starts_with("attention/subscription-failure-") {
+                state
+                    .store
+                    .attention_items(Some(authority_actor))
+                    .map_err(ApiError::internal)?
+                    .into_iter()
+                    .find(|item| item.subject == target)
+                    .map(|item| {
+                        if item.person.is_empty() {
+                            authority_actor.clone()
+                        } else {
+                            item.person
+                        }
+                    })
+                    .ok_or_else(|| {
+                        ApiError::not_found(format!("attention `{target}` does not exist"))
+                    })?
+            } else {
+                return Err(ApiError::not_found(format!(
+                    "attention `{target}` does not exist"
+                )));
+            };
+            if reviewer != *authority_actor {
                 return Err(forbidden(format!(
                     "attention `{target}` belongs to another person"
                 )));

@@ -8409,6 +8409,66 @@ impl Store {
         } else {
             format!("attention/{subject}")
         };
+        if self
+            .attention_request(&subject)
+            .map_err(internal)?
+            .is_none()
+            && let Some(claim_id) = subject.strip_prefix("attention/subscription-failure-")
+        {
+            let failure = self
+                .claim_by_id(claim_id)
+                .map_err(internal)?
+                .filter(|claim| claim.kind == "subscription.mission-failed")
+                .ok_or_else(|| {
+                    St3Error::new(
+                        "missing-attention-request",
+                        format!("attention request `{subject}` does not exist"),
+                    )
+                })?;
+            let fields = failure.body.get("fields").unwrap_or(&failure.body);
+            let original_request = fields
+                .get("request")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let requester = self
+                .claim_by_id(original_request)
+                .map_err(internal)?
+                .and_then(|claim| {
+                    claim
+                        .body
+                        .pointer("/fields/requester")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                })
+                .unwrap_or_default();
+            let requester = if requester.is_empty() {
+                normalize_actor(&request.actor, "person")
+            } else {
+                requester
+            };
+            if requester != normalize_actor(&request.actor, "person") {
+                return Err(St3Error::new(
+                    "wrong-attention-reviewer",
+                    format!("attention request `{subject}` requires `{requester}`"),
+                ));
+            }
+            self.request_attention(
+                &subject,
+                &AttentionRequest {
+                    reviewer: requester,
+                    title: "Subscription mission failed".into(),
+                    reason: fields
+                        .get("reason")
+                        .and_then(Value::as_str)
+                        .unwrap_or("Subscription mission failed")
+                        .into(),
+                    severity: "error".into(),
+                    targets: vec![failure.subject],
+                    actor: "agent/reconciler".into(),
+                    idempotency_key: format!("subscription-failure-attention:{claim_id}"),
+                },
+            )?;
+        }
         let current = self
             .attention_request(&subject)
             .map_err(internal)?
@@ -8761,6 +8821,12 @@ impl Store {
         {
             let connection = self.readers.get();
             for request in pending_attention_requests_tx(&connection, person)? {
+                if request
+                    .subject
+                    .starts_with("attention/subscription-failure-")
+                {
+                    continue;
+                }
                 if attention_request_is_current_tx(&connection, &request)? {
                     items.push(attention_item_from_request(request));
                 }
@@ -8777,6 +8843,12 @@ impl Store {
                 .query_map([], claim_from_row)?
                 .collect::<Result<Vec<_>, _>>()?;
             for failure in failures {
+                let attention_subject = subscription_failure_attention_subject(&failure.id);
+                if attention_request_view_tx(&connection, &attention_subject)?
+                    .is_some_and(|request| request.status != "pending")
+                {
+                    continue;
+                }
                 let fields = failure.body.get("fields").unwrap_or(&failure.body);
                 let request = fields
                     .get("request")
@@ -8793,7 +8865,7 @@ impl Store {
                 let reviewer = requester
                     .filter(|value| value.starts_with("person/"))
                     .unwrap_or_default();
-                if person.is_some_and(|person| person != reviewer) {
+                if person.is_some_and(|person| !reviewer.is_empty() && person != reviewer) {
                     continue;
                 }
                 let code = fields
@@ -8807,9 +8879,12 @@ impl Store {
                 items.push(AttentionItemView {
                     kind: "fault".into(),
                     review_mode: None,
-                    subject: failure.id,
+                    subject: attention_subject,
                     person: reviewer,
                     requester_id: None,
+                    launch_id: None,
+                    variant_id: None,
+                    message_id: None,
                     title: "Subscription mission failed".into(),
                     detail: format!("{code}: {reason}"),
                     mission: None,
@@ -16094,6 +16169,13 @@ fn attention_action(label: &str, argv: &[&str]) -> AttentionActionView {
     }
 }
 
+fn subscription_failure_attention_subject(claim_id: &str) -> String {
+    format!(
+        "attention/subscription-failure-{}",
+        claim_id.strip_prefix("claim/").unwrap_or(claim_id)
+    )
+}
+
 fn attention_item_from_review(review: HumanReviewView) -> AttentionItemView {
     AttentionItemView {
         kind: "human-gate".into(),
@@ -16101,6 +16183,9 @@ fn attention_item_from_review(review: HumanReviewView) -> AttentionItemView {
         subject: review.owner.clone(),
         person: review.reviewer.clone(),
         requester_id: None,
+        launch_id: None,
+        variant_id: None,
+        message_id: None,
         title: review
             .title
             .clone()
@@ -16157,7 +16242,13 @@ fn attention_item_from_planning(
         review_mode: None,
         subject: session.subject.clone(),
         person: session.requester.clone(),
-        requester_id: None,
+        requester_id: Some(session.requester.clone()),
+        launch_id: Some(format!("launch/{}", session.id)),
+        variant_id: Some(format!(
+            "launch-variant/{}/{}",
+            session.id, candidate.variant
+        )),
+        message_id: None,
         title: format!("Approve mission/{}", session.mission),
         detail: "The current launch preview is ready for approval.".into(),
         mission: Some(format!("mission/{}", session.mission)),
@@ -16210,6 +16301,9 @@ fn attention_item_from_revision(
         subject: proposal.subject.clone(),
         person: reviewer.to_owned(),
         requester_id: None,
+        launch_id: None,
+        variant_id: None,
+        message_id: None,
         title: format!("Approve a revision of {}", run.mission),
         detail: proposal.reason.clone(),
         mission: Some(run.mission.clone()),
@@ -16257,7 +16351,10 @@ fn attention_item_from_message(
         review_mode: None,
         subject: message.subject.clone(),
         person: message.to.clone(),
-        requester_id: None,
+        requester_id: Some(message.from.clone()),
+        launch_id: None,
+        variant_id: None,
+        message_id: Some(message.subject.clone()),
         title: message
             .title
             .unwrap_or_else(|| format!("Message from {}", message.from)),
@@ -16298,6 +16395,9 @@ fn attention_item_from_request(request: AttentionRequestView) -> AttentionItemVi
         subject: request.subject.clone(),
         person: request.reviewer.clone(),
         requester_id: Some(request.actor.clone()),
+        launch_id: None,
+        variant_id: None,
+        message_id: None,
         title: request.title,
         detail: request.reason,
         mission: None,
@@ -17409,12 +17509,18 @@ impl Store {
     /// including envelopes written before the key existed. Returns the number signed now.
     pub fn set_member_key(&self, key: Option<Arc<crate::fleet::MemberKey>>) -> Result<usize> {
         if key.is_none() {
-            *self.member_key.write().unwrap_or_else(PoisonError::into_inner) = None;
+            *self
+                .member_key
+                .write()
+                .unwrap_or_else(PoisonError::into_inner) = None;
             return Ok(0);
         }
         // Seed envelopes for any local batch first, so the full pass below sees all of them.
         self.replication_snapshot()?;
-        *self.member_key.write().unwrap_or_else(PoisonError::into_inner) = key;
+        *self
+            .member_key
+            .write()
+            .unwrap_or_else(PoisonError::into_inner) = key;
         let mut connection = self.connection.write();
         let transaction = connection.transaction()?;
         let signed = self.sign_own_envelopes_tx(&transaction, None)?;

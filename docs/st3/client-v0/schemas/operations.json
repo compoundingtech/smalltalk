@@ -9,6 +9,7 @@
   },
   "reads": [
     { "id": "capabilities.get", "method": "GET", "path": "/v1/client/capabilities", "response": "Capabilities" },
+    { "id": "document.get", "method": "GET", "path": "/v1/client/documents/content", "response": "DocumentContent" },
     { "id": "now.list", "method": "GET", "path": "/v1/client/now", "response": "Page" },
     { "id": "machines.list", "method": "GET", "path": "/v1/client/machines", "response": "Page" },
     { "id": "devices.list", "method": "GET", "path": "/v1/client/devices", "response": "Page" },
