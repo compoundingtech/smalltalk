@@ -16686,12 +16686,22 @@ impl Store {
     }
 
     /// Append this member's leave as its writer's last batch.
+    /// Write this node's leave, once per member key: running `st fleet leave` again returns the
+    /// leave already written, so nothing follows it.
     pub fn leave_fleet(&self, person: &str) -> Result<ClaimRecord, St3Error> {
         let key = self
             .member_public_key()
             .ok_or_else(|| St3Error::new("not-a-member", "this node has no member key"))?;
+        let subject = format!("host/{}", self.origin);
+        if let Some(written) = self
+            .latest_claim(&subject, Some("fleet.member-left"))
+            .map_err(internal)?
+            .filter(|claim| claim.body["fields"]["member_key"] == key.as_str())
+        {
+            return Ok(written);
+        }
         let record = self.append_claim(&ClaimInput {
-            subject: format!("host/{}", self.origin),
+            subject,
             kind: "fleet.member-left".into(),
             actor: Some(person.into()),
             fields: BTreeMap::from([
@@ -17250,6 +17260,34 @@ mod fleet_admission_tests {
 
     fn admitted(store: &Store, claim: &ClaimRecord) -> bool {
         store.claim_by_id(&claim.id).unwrap().is_some()
+    }
+
+    #[test]
+    fn a_member_leaves_once_and_a_second_leave_writes_nothing() {
+        let anchor_key = key();
+        let laptop_key = key();
+        let anchor = node("anchor", Some(&anchor_key), Some(&anchor_key));
+        anchor
+            .admit_fleet_anchor(FLEET, anchor_key.public(), "listening")
+            .unwrap();
+        admit(&anchor, "laptop", &laptop_key, "invite", None);
+        let laptop = node("laptop", Some(&laptop_key), Some(&anchor_key));
+        sync(&anchor, &laptop);
+
+        let first = laptop.leave_fleet("person/test").unwrap();
+        let head = highest_sequence(&laptop, "laptop");
+        assert_eq!(first.body["fields"]["high_water"], json!(head));
+        let again = laptop.leave_fleet("person/test").unwrap();
+        assert_eq!(again.id, first.id);
+        assert_eq!(highest_sequence(&laptop, "laptop"), head);
+
+        sync(&laptop, &anchor);
+        let membership = anchor.fleet_membership().unwrap();
+        let MemberState::Ended(ended) = membership.state("laptop") else {
+            panic!("the anchor did not see the leave");
+        };
+        assert_eq!(ended.ended.as_deref(), Some("left"));
+        assert_eq!(ended.end, Some(head));
     }
 
     fn highest_sequence(store: &Store, writer: &str) -> u64 {
