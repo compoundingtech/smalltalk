@@ -1,4 +1,4 @@
-# st3 client v0 contract
+# st client v0 contract
 
 Status: implemented client boundary with operational projections, resumable events, authenticated
 pairing, fenced actions, terminal snapshots/frames, and generated Rust and Swift clients. The files in
@@ -27,7 +27,7 @@ mutation queue, push notification service, cached graph authority, or multi-mast
 
 ### Tailnet carrier
 
-`st3 up` listens on two different Unix sockets. `st3.sock` is the privileged trusted-local API;
+`st up` listens on two different Unix sockets. `st3.sock` is the privileged trusted-local API;
 `st3-client.sock` is the paired-only client gateway backed by `fabric_router`. The latter rejects
 ordinary requests without a paired bearer credential, except for pairing completion. The socket
 paths can be set with `socket` and `client_gateway_socket` in `config.toml`, or with `--socket` and
@@ -63,21 +63,21 @@ On macOS, verify the HTTPS route with an unauthenticated request to
 If Tailscale Serve returns `502` when pointed at the Unix socket, run a persistent
 launchd-managed bridge from a loopback-only TCP port to `st3-client.sock`, then
 point Tailscale Serve at that port. The bridge must bind `127.0.0.1`, reconnect to
-the socket for each request, and start independently of the st3 daemon so a daemon
+the socket for each request, and start independently of the st daemon so a daemon
 restart does not leave the HTTPS route pointing at an absent process. Recheck the
 HTTPS route after every rollout, then make an authenticated paired-client read.
 
 This provides tailnet-only HTTPS and WebSocket transport at the host's Tailscale name while the
 gateway continues to enforce the same paired credential, scopes, terminal subprotocol, and
 single-use attachment capability. Begin pairing over the trusted local socket with, for example,
-`st3 devices --as person/nathan pair "Nathan iPhone"`; complete pairing from the remote device over
+`st devices --as person/nathan pair "Nathan iPhone"`; complete pairing from the remote device over
 the served gateway. To remove the carrier without changing graph credentials or daemon state:
 
 ```sh
 tailscale serve reset
 ```
 
-Warning: `tailscale serve reset` clears all Serve configuration on the host, not only the st3
+Warning: `tailscale serve reset` clears all Serve configuration on the host, not only the st
 gateway.
 
 The equivalent trusted-peer Fabric carrier lifecycle is:
@@ -311,7 +311,7 @@ Pairing codes expire after five minutes and reveal no fleet secret. The remote d
 request its own actor or scopes. By default the trusted local begin grants projection reads,
 terminal reads, attention control, and launch control. For an intentionally trusted device that
 needs Chat sends, mission/work actions, runtime control, and terminal input, the initiating person
-must use `st3 devices --as person/nathan pair --full-control "Nathan iPhone"` on the trusted local
+must use `st devices --as person/nathan pair --full-control "Nathan iPhone"` on the trusted local
 socket. The selected concrete scopes are sealed into that pairing; existing limited devices are
 not silently upgraded and must be re-paired, then revoked when no longer needed. Revocation takes
 effect for every subsequent request, including a new bounded terminal WebSocket exchange.

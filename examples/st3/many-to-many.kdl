@@ -13,28 +13,28 @@ version 2
 // `depends-on` orders the steps inside one run. Each seat orders its work across runs with its own
 // queue. A run joins the end of a seat's queue when it first has a step for that seat, which is
 // when the run starts, and leaves when the run ends. A seat holds one step at a time. When it is
-// free, st3 wakes it for the first ready step in its queue. A run whose step for the seat still
+// free, st wakes it for the first ready step in its queue. A run whose step for the seat still
 // waits on a dependency is passed over until that step is ready. So the worker fixes the typo while
 // the planner plans, and builds the option once the plan is complete and the worker is free. To
-// reorder a queue, use `st3 agents queue move`, as seat-queue.kdl shows.
+// reorder a queue, use `st agents queue move`, as seat-queue.kdl shows.
 //
 // Each seat has its own checkout of the invented repository, so one seat's branch never disturbs
 // another's. Apply the three seats, publish both missions, and start one run of each:
 //
-//   st3 agents apply examples/st3/seats/planner.kdl --as person/operator
-//   st3 agents apply examples/st3/seats/claude.kdl --as person/operator
-//   st3 agents apply examples/st3/seats/reviewer.kdl --as person/operator
-//   st3 missions publish examples/st3/many-to-many.kdl --as person/operator
-//   st3 missions start example/greeting-option --id example/greeting-option/2026-10-01 \
+//   st agents apply examples/st3/seats/planner.kdl --as person/operator
+//   st agents apply examples/st3/seats/claude.kdl --as person/operator
+//   st agents apply examples/st3/seats/reviewer.kdl --as person/operator
+//   st missions publish examples/st3/many-to-many.kdl --as person/operator
+//   st missions start example/greeting-option --id example/greeting-option/2026-10-01 \
 //     --workspace /srv/example/app --as person/operator
-//   st3 missions start example/usage-typo --id example/usage-typo/2026-10-01 \
+//   st missions start example/usage-typo --id example/usage-typo/2026-10-01 \
 //     --workspace /srv/example/app --as person/operator
 //
 // Each seat's queue lists the runs it serves. The worker's lists both runs:
 //
-//   st3 agents queue agent/example/planner
-//   st3 agents queue agent/example/worker
-//   st3 agents queue agent/example/reviewer
+//   st agents queue agent/example/planner
+//   st agents queue agent/example/worker
+//   st agents queue agent/example/reviewer
 //
 // This example ran live on 2026-09-27 on an isolated daemon, with Claude claude-sonnet-5 on all
 // three seats. For that run the seats also passed `args "--permission-mode" "bypassPermissions"`
@@ -56,7 +56,7 @@ mission "example/greeting-option" state="ready" {
 
   step "plan" timeout="30m" {
     assigned-to "agent/example/planner"
-    goal "Read greet.sh on main and write a short plan for a `--name NAME` option that changes who is greeted. Store the plan with `st3 documents put` and complete this step with the stored document reference."
+    goal "Read greet.sh on main and write a short plan for a `--name NAME` option that changes who is greeted. Store the plan with `st documents put` and complete this step with the stored document reference."
     constraint "Do not change repository files."
   }
 
