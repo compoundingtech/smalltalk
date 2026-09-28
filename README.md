@@ -39,6 +39,33 @@ build. A source install also needs [`pty`](https://github.com/compoundingtech/pt
 Each seat runs a coding harness, so install and log in to at least one: Claude Code, Codex, omp,
 pi, or OpenCode. Log in as the same user that runs the daemon.
 
+### Home Manager
+
+Import `inputs.smalltalk.homeManagerModules.default` and configure the user service:
+
+```nix
+services.smalltalk = {
+  enable = true;
+  person = "person/ada";
+  declarations = {
+    seats = [ ./seat.kdl ];
+    missions = [ ./mission.kdl ];
+  };
+  # ptyPackage = inputs.pty.packages.${pkgs.system}.default;
+};
+```
+
+The module installs `st3`, writes `st3/config.toml`, and starts a systemd user
+service on Linux or a launchd agent on macOS. When declarations are provided,
+an additional oneshot service applies seat files and publishes mission files
+as `person`, retrying while the daemon starts. `declarationsApply.enable = false`
+disables this step. Reapplying is safe, but removing a file does **not** delete
+its previously published declaration until managed-set apply exists (#646).
+The optional `ptyPackage` replaces the bundled `pty` for both the daemon and
+seats, working around the executable-directory PATH precedence in #633.
+Linux user-manager lingering and macOS `st service permissions` remain host
+setup prerequisites. Fleet/replication setup is not managed by this module.
+
 ## Run the daemon
 
 Tell st who you are. Commands that act for a person read this, so you do not repeat `--as` on
