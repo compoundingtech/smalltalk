@@ -505,6 +505,9 @@ pub(crate) fn render_attention_list(
             item.title
         );
         let _ = write!(output, "    {}", item.person);
+        if let Some(requester) = &item.requester_id {
+            let _ = write!(output, " · from {requester}");
+        }
         if let Some(mission) = &item.mission {
             let _ = write!(output, " · {mission}");
         }
@@ -551,6 +554,9 @@ pub(crate) fn render_attention_show(
     let _ = writeln!(output, "SUBJECT   {}", item.subject);
     let _ = writeln!(output, "KIND      {}", item.kind);
     let _ = writeln!(output, "PERSON    {}", item.person);
+    if let Some(requester) = &item.requester_id {
+        let _ = writeln!(output, "FROM      {requester}");
+    }
     let _ = writeln!(
         output,
         "REQUESTED {}",
@@ -1403,6 +1409,7 @@ mod tests {
             kind: "fault".into(),
             subject: "attention/fabric".into(),
             person: "person/nathan".into(),
+            requester_id: None,
             title: "Fabric needs review".into(),
             detail: "The queue did not recover.".into(),
             mission: Some("mission/fabric".into()),

@@ -8475,6 +8475,7 @@ impl Store {
                     kind: "fault".into(),
                     subject: failure.id,
                     person: reviewer,
+                    requester_id: None,
                     title: "Subscription mission failed".into(),
                     detail: format!("{code}: {reason}"),
                     mission: None,
@@ -10716,7 +10717,30 @@ impl Store {
             .find(|record| record.record_ref == record_ref))
     }
 
-    pub fn record_peer_failure(&self, peer: &str, status: &str, error: &str) -> Result<()> {
+    pub fn record_peer_failure(&self, peer: &str, status: &str, error: &str) -> Result<bool> {
+        // An inbound exchange is just as good evidence of reachability as an outbound one.
+        // Keep the last success during a short missed-exchange window, so a failed dial on
+        // one side cannot flap a peer that is still exchanging in the other direction.
+        if self
+            .replication_peer_last_success(peer)?
+            .is_some_and(|last| now_ms().saturating_sub(last) < 90_000)
+        {
+            return Ok(false);
+        }
+        if self
+            .readers
+            .get()
+            .query_row(
+                "SELECT status FROM replication_peers WHERE peer=?1",
+                [peer],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .as_deref()
+            == Some(status)
+        {
+            return Ok(true);
+        }
         {
             let connection = self.connection.lock().expect("store mutex poisoned");
             connection.execute(
@@ -10727,7 +10751,7 @@ impl Store {
                 params![peer, status, error, now_ms().to_string()],
             )?;
         }
-        Ok(())
+        Ok(true)
     }
 
     pub(crate) fn record_transport_observation(
@@ -10791,6 +10815,18 @@ impl Store {
             .optional()?
             .flatten()
             .and_then(|value| value.parse().ok()))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn age_replication_peer_for_test(&self, peer: &str) {
+        self.connection
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE replication_peers SET last_success_at_unix_ms=?2 WHERE peer=?1",
+                params![peer, now_ms().saturating_sub(86_400_000).to_string()],
+            )
+            .unwrap();
     }
 
     pub fn replication_status(
@@ -15182,6 +15218,7 @@ fn attention_item_from_review(review: HumanReviewView) -> AttentionItemView {
         kind: "human-gate".into(),
         subject: review.owner.clone(),
         person: review.reviewer.clone(),
+        requester_id: None,
         title: review
             .title
             .clone()
@@ -15229,6 +15266,7 @@ fn attention_item_from_planning(
         kind: "launch-approval".into(),
         subject: session.subject.clone(),
         person: session.requester.clone(),
+        requester_id: None,
         title: format!("Approve mission/{}", session.mission),
         detail: "The current launch preview is ready for approval.".into(),
         mission: Some(format!("mission/{}", session.mission)),
@@ -15279,6 +15317,7 @@ fn attention_item_from_revision(
         kind: "revision-approval".into(),
         subject: proposal.subject.clone(),
         person: reviewer.to_owned(),
+        requester_id: None,
         title: format!("Approve a revision of {}", run.mission),
         detail: proposal.reason.clone(),
         mission: Some(run.mission.clone()),
@@ -15325,6 +15364,7 @@ fn attention_item_from_message(
         kind: "unread-message".into(),
         subject: message.subject.clone(),
         person: message.to.clone(),
+        requester_id: None,
         title: message
             .title
             .unwrap_or_else(|| format!("Message from {}", message.from)),
@@ -15348,11 +15388,17 @@ fn attention_item_from_message(
     }
 }
 
+pub(crate) fn agent_attention_requester(actor: &str) -> bool {
+    actor.starts_with("agent/") && actor != "agent/st3/reconciler"
+}
+
 fn attention_item_from_request(request: AttentionRequestView) -> AttentionItemView {
+    let agent_request = agent_attention_requester(&request.actor);
     AttentionItemView {
-        kind: "fault".into(),
+        kind: if agent_request { "agent-request" } else { "fault" }.into(),
         subject: request.subject.clone(),
         person: request.reviewer.clone(),
+        requester_id: Some(request.actor.clone()),
         title: request.title,
         detail: request.reason,
         mission: None,
@@ -15362,7 +15408,7 @@ fn attention_item_from_request(request: AttentionRequestView) -> AttentionItemVi
         requested_at_unix_ms: request.requested_at_unix_ms,
         actions: vec![
             attention_action(
-                "resolve",
+                if agent_request { "answer" } else { "resolve" },
                 &[
                     "st",
                     "attention",
@@ -34064,7 +34110,7 @@ mission "review-current" state="ready" revision-cutover="restart-active" {{
                     reason: "a person must decide".into(),
                     severity: "warning".into(),
                     targets: targets.iter().map(|target| (*target).to_owned()).collect(),
-                    actor: "agent/node.requester".into(),
+                    actor: "daemon/runtime".into(),
                     idempotency_key: format!("{subject}:requested"),
                 },
             )
@@ -34406,7 +34452,8 @@ mission "typecase" state="ready" {
         assert_eq!(first.status, "pending");
         let items = store.attention_items(Some("person/nathan")).unwrap();
         assert_eq!(items.len(), 1);
-        assert_eq!(items[0].kind, "fault");
+        assert_eq!(items[0].kind, "agent-request");
+        assert_eq!(items[0].actions[0].label, "answer");
         assert_eq!(items[0].actions.len(), 2);
         assert!(
             store
