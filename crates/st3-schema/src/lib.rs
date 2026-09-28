@@ -53,6 +53,10 @@ pub enum Retention {
     /// An observation kept only in the local observation log of the node that
     /// made it and trimmed after that node's retention window.
     Local,
+    /// An observation kept in the local observation log. The replicated claim log
+    /// gets a claim only when its state changes; each claim replaces the previous
+    /// one for the same subject.
+    Latest,
 }
 
 impl Retention {
@@ -186,7 +190,7 @@ impl Registry {
             ));
         }
         output.push_str("\n`resource.observed` validates facts against the resource kind. Custom resource facts remain open.\n");
-        output.push_str("\nA `durable` claim is a fact in the replicated claim log. A `local` claim is an observation kept only in the local observation log of the node that made it, trimmed after that node's retention window.\n");
+        output.push_str("\nA `durable` claim is a fact in the replicated claim log. A `local` claim is an observation kept only in the local observation log of the node that made it, trimmed after that node's retention window. A `latest` claim is an observation kept in that log whose replicated claims are written only when its state changes; each one replaces the previous one for its subject.\n");
         output
     }
 
@@ -1797,6 +1801,9 @@ fn claim_retention(kind: &str) -> Retention {
         // The owner reads a transcript from the harness's own session file, or from this log
         // when there is none. Other nodes relay timeline reads to the owner.
         "harness.timeline" => Retention::Local,
+        // Other nodes read the current harness state and usage: step readiness is judged on
+        // the mission's node and fleet views run anywhere. Nothing reads a heartbeat.
+        "harness.observed" | "harness.usage" => Retention::Latest,
         _ => Retention::Durable,
     }
 }

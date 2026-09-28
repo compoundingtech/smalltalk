@@ -368,6 +368,17 @@ ON local_observations(dedupe_key) WHERE dedupe_key IS NOT NULL;
 CREATE INDEX IF NOT EXISTS local_observations_timeline_index
 ON local_observations(subject, json_extract(body, '$.fields.incarnation_id'), id)
 WHERE kind='harness.timeline';
+-- The last replicated observation of each `latest` slot this node wrote, and the newest
+-- local observation of the slot that no replicated claim carries yet.
+CREATE TABLE IF NOT EXISTS local_latest_slots (
+    subject TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    slot TEXT NOT NULL,
+    published_at_unix_ms INTEGER NOT NULL,
+    published_fields TEXT NOT NULL,
+    pending_local_id INTEGER,
+    PRIMARY KEY (subject, kind, slot)
+);
 CREATE TABLE IF NOT EXISTS revision_proposals (
     id TEXT PRIMARY KEY,
     run_id TEXT NOT NULL REFERENCES mission_runs(id),
@@ -6516,6 +6527,9 @@ impl Store {
         if local_retention(&input.kind) {
             return self.append_local_observation(input);
         }
+        if latest_retention(&input.kind) {
+            return self.append_latest_observation(input, now_ms());
+        }
         let operation = claim_operation(input)?;
         let mut connection = self.connection.lock().expect("store mutex poisoned");
         if let Some((operation_id, request_digest)) = &operation
@@ -6670,122 +6684,41 @@ impl Store {
         &self,
         input: &ClaimInput,
     ) -> Result<(ClaimRecord, bool), St3Error> {
-        if input.expected_subject.is_some() {
-            return Err(St3Error::new(
-                "local-observation-head",
-                "a local observation does not take part in the subject's claim head",
-            ));
-        }
-        let body = json!({
-            "fields": &input.fields,
-            "evidence": input.evidence,
-        });
-        st3_schema::registry()
-            .validate_claim(&input.subject, &input.kind, &input.fields)
-            .map_err(|error| St3Error::new(error.code, error.message))?;
-        // A timeline entry keeps the sequence its driver gave it. A replicated claim could
-        // fall back to its unique store index, but local observations share the index of the
-        // claim they follow, so they could not order themselves.
-        if input.kind == "harness.timeline" && !input.fields.contains_key("sequence") {
-            return Err(St3Error::new(
-                "missing-claim-field",
-                "a local timeline observation needs the sequence its driver assigned",
-            ));
-        }
-        let dedupe_key = input
-            .idempotency_key
-            .as_deref()
-            .map(|key| local_observation_dedupe_key(&input.kind, key));
-        let request_digest = claim_operation(input)?.map(|(_, digest)| digest);
+        validate_local_observation(input)?;
         let mut connection = self.connection.lock().expect("store mutex poisoned");
         let transaction = connection.transaction().map_err(internal)?;
-        if let Some(key) = &dedupe_key
-            && let Some((existing, stored_digest)) = transaction
-                .query_row(
-                    &format!(
-                        "SELECT id, after_store_index, subject, kind, actor, body, observed_at_unix_ms, request_digest
-                         FROM local_observations WHERE dedupe_key=?1"
-                    ),
-                    [key],
-                    |row| {
-                        Ok((
-                            local_observation_from_row(&self.origin, row)?,
-                            row.get::<_, Option<String>>(7)?,
-                        ))
-                    },
-                )
-                .optional()
-                .map_err(internal)?
-        {
-            // A retry must repeat the original request exactly, as for a claim.
-            if stored_digest != request_digest {
-                return Err(St3Error::new(
-                    "idempotency-mismatch",
-                    "the idempotency key already identifies a different request",
-                )
-                .with_detail("stored_digest", json!(stored_digest))
-                .with_detail("request_digest", json!(request_digest)));
-            }
-            return Ok((existing, false));
-        }
-        for evidence in &input.evidence {
-            let exists = transaction
-                .query_row("SELECT 1 FROM claims WHERE id=?1", [evidence], |_| Ok(()))
-                .optional()
-                .map_err(internal)?
-                .is_some();
-            if !exists {
-                return Err(St3Error::new(
-                    "missing-evidence",
-                    format!("evidence claim `{evidence}` is not stored"),
-                ));
-            }
-        }
-        let after_store_index: u64 = transaction
-            .query_row(
-                "SELECT COALESCE(MAX(store_index), 0) FROM claims",
-                [],
-                |row| row.get(0),
-            )
-            .map_err(internal)?;
-        let observed_at = now_ms();
-        transaction
-            .execute(
-                "INSERT INTO local_observations(
-                    after_store_index, subject, kind, actor, body, dedupe_key, request_digest,
-                    observed_at_unix_ms
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                params![
-                    after_store_index,
-                    input.subject,
-                    input.kind,
-                    input.actor,
-                    canonical_json_text(&body).map_err(internal)?,
-                    dedupe_key,
-                    request_digest,
-                    observed_at as i64,
-                ],
-            )
-            .map_err(internal)?;
-        let id = transaction.last_insert_rowid();
+        let outcome = insert_local_observation_tx(&transaction, &self.origin, input, now_ms())?;
         transaction.commit().map_err(internal)?;
-        Ok((
-            ClaimRecord {
-                id: local_observation_id(&self.origin, id),
-                store_index: after_store_index,
-                batch_id: String::new(),
-                subject: input.subject.clone(),
-                kind: input.kind.clone(),
-                origin: self.origin.clone(),
-                actor: input.actor.clone(),
-                operation_id: None,
-                request_digest: None,
-                body,
-                predecessors: Vec::new(),
-                accepted_at_unix_ms: observed_at,
-            },
-            true,
-        ))
+        Ok(outcome)
+    }
+
+    /// Record an observation of `latest` retention. The local observation log keeps every
+    /// one. The replicated claim log gets a claim only when the observed state changes; the
+    /// returned record is that claim, or the local observation when nothing replicated.
+    fn append_latest_observation(
+        &self,
+        input: &ClaimInput,
+        now: u128,
+    ) -> Result<(ClaimRecord, bool), St3Error> {
+        validate_local_observation(input)?;
+        let mut connection = self.connection.lock().expect("store mutex poisoned");
+        let transaction = connection.transaction().map_err(internal)?;
+        let (local, appended) =
+            insert_local_observation_tx(&transaction, &self.origin, input, now)?;
+        if !appended {
+            return Ok((local, false));
+        }
+        let published = match input.kind.as_str() {
+            "harness.observed" => {
+                publish_changed_harness_state_tx(&transaction, &self.origin, input, now)?
+            }
+            "harness.usage" => {
+                publish_due_usage_tx(&transaction, &self.origin, input, &local, now)?
+            }
+            _ => None,
+        };
+        transaction.commit().map_err(internal)?;
+        Ok((published.unwrap_or(local), true))
     }
 
     /// Local observations written after `after`, oldest first. The records carry the
@@ -13517,6 +13450,371 @@ fn local_retention(kind: &str) -> bool {
     st3_schema::registry()
         .claim(kind)
         .is_some_and(|spec| spec.retention == st3_schema::Retention::Local)
+}
+
+fn latest_retention(kind: &str) -> bool {
+    st3_schema::registry()
+        .claim(kind)
+        .is_some_and(|spec| spec.retention == st3_schema::Retention::Latest)
+}
+
+/// While a harness works, its usage replicates at most once in this window. Once it stops
+/// working, its newest usage replicates at once.
+const USAGE_PUBLISH_INTERVAL_MS: u128 = 5 * 60 * 1000;
+
+fn validate_local_observation(input: &ClaimInput) -> Result<(), St3Error> {
+    if input.expected_subject.is_some() {
+        return Err(St3Error::new(
+            "local-observation-head",
+            "a local observation does not take part in the subject's claim head",
+        ));
+    }
+    st3_schema::registry()
+        .validate_claim(&input.subject, &input.kind, &input.fields)
+        .map_err(|error| St3Error::new(error.code, error.message))?;
+    // A timeline entry keeps the sequence its driver gave it. A replicated claim could
+    // fall back to its unique store index, but local observations share the index of the
+    // claim they follow, so they could not order themselves.
+    if input.kind == "harness.timeline" && !input.fields.contains_key("sequence") {
+        return Err(St3Error::new(
+            "missing-claim-field",
+            "a local timeline observation needs the sequence its driver assigned",
+        ));
+    }
+    Ok(())
+}
+
+/// Insert one local observation. A repeated idempotency key returns the first observation
+/// and `false`.
+fn insert_local_observation_tx(
+    transaction: &Transaction<'_>,
+    origin: &str,
+    input: &ClaimInput,
+    observed_at: u128,
+) -> Result<(ClaimRecord, bool), St3Error> {
+    let body = json!({
+        "fields": &input.fields,
+        "evidence": input.evidence,
+    });
+    let dedupe_key = input
+        .idempotency_key
+        .as_deref()
+        .map(|key| local_observation_dedupe_key(&input.kind, key));
+    let request_digest = claim_operation(input)?.map(|(_, digest)| digest);
+    if let Some(key) = &dedupe_key
+        && let Some((existing, stored_digest)) = transaction
+            .query_row(
+                "SELECT id, after_store_index, subject, kind, actor, body, observed_at_unix_ms, request_digest
+                 FROM local_observations WHERE dedupe_key=?1",
+                [key],
+                |row| {
+                    Ok((
+                        local_observation_from_row(origin, row)?,
+                        row.get::<_, Option<String>>(7)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(internal)?
+    {
+        // A retry must repeat the original request exactly, as for a claim.
+        if stored_digest != request_digest {
+            return Err(St3Error::new(
+                "idempotency-mismatch",
+                "the idempotency key already identifies a different request",
+            )
+            .with_detail("stored_digest", json!(stored_digest))
+            .with_detail("request_digest", json!(request_digest)));
+        }
+        return Ok((existing, false));
+    }
+    for evidence in &input.evidence {
+        let exists = transaction
+            .query_row("SELECT 1 FROM claims WHERE id=?1", [evidence], |_| Ok(()))
+            .optional()
+            .map_err(internal)?
+            .is_some();
+        if !exists {
+            return Err(St3Error::new(
+                "missing-evidence",
+                format!("evidence claim `{evidence}` is not stored"),
+            ));
+        }
+    }
+    let after_store_index: u64 = transaction
+        .query_row(
+            "SELECT COALESCE(MAX(store_index), 0) FROM claims",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(internal)?;
+    transaction
+        .execute(
+            "INSERT INTO local_observations(
+                after_store_index, subject, kind, actor, body, dedupe_key, request_digest,
+                observed_at_unix_ms
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                after_store_index,
+                input.subject,
+                input.kind,
+                input.actor,
+                canonical_json_text(&body).map_err(internal)?,
+                dedupe_key,
+                request_digest,
+                observed_at.min(i64::MAX as u128) as i64,
+            ],
+        )
+        .map_err(internal)?;
+    let id = transaction.last_insert_rowid();
+    Ok((
+        ClaimRecord {
+            id: local_observation_id(origin, id),
+            store_index: after_store_index,
+            batch_id: String::new(),
+            subject: input.subject.clone(),
+            kind: input.kind.clone(),
+            origin: origin.to_owned(),
+            actor: input.actor.clone(),
+            operation_id: None,
+            request_digest: None,
+            body,
+            predecessors: Vec::new(),
+            accepted_at_unix_ms: observed_at,
+        },
+        true,
+    ))
+}
+
+fn latest_claim_of_kind_tx(
+    transaction: &Transaction<'_>,
+    subject: &str,
+    kind: &str,
+) -> Result<Option<ClaimRecord>, St3Error> {
+    transaction
+        .query_row(
+            "SELECT id, store_index, batch_id, subject, kind, origin, actor, body, predecessors, accepted_at_unix_ms
+             FROM claims WHERE subject=?1 AND kind=?2 ORDER BY store_index DESC LIMIT 1",
+            params![subject, kind],
+            claim_from_row,
+        )
+        .optional()
+        .map_err(internal)
+}
+
+/// Replicate an observation of the same kind and subject as an ordinary claim.
+fn publish_latest_claim_tx(
+    transaction: &Transaction<'_>,
+    origin: &str,
+    subject: &str,
+    kind: &str,
+    actor: Option<&str>,
+    fields: &Value,
+) -> Result<ClaimRecord, St3Error> {
+    let predecessors = latest_claim_id_tx(transaction, subject)
+        .map_err(internal)?
+        .into_iter()
+        .collect::<Vec<_>>();
+    append_claim_tx(
+        transaction,
+        origin,
+        subject,
+        kind,
+        actor,
+        &json!({ "fields": fields, "evidence": [] }),
+        &predecessors,
+        None,
+    )
+    .map_err(claim_append_error)
+}
+
+/// Publish a harness observation when any field other than its observation time differs
+/// from the subject's latest replicated observation. When the harness stops working, its
+/// usage that is still only local replicates too.
+fn publish_changed_harness_state_tx(
+    transaction: &Transaction<'_>,
+    origin: &str,
+    input: &ClaimInput,
+    now: u128,
+) -> Result<Option<ClaimRecord>, St3Error> {
+    fn state_fields<'a>(
+        fields: impl IntoIterator<Item = (&'a String, &'a Value)>,
+    ) -> BTreeMap<&'a str, &'a Value> {
+        fields
+            .into_iter()
+            .filter(|(name, _)| name.as_str() != "observed_at_ms")
+            .map(|(name, value)| (name.as_str(), value))
+            .collect()
+    }
+    let latest = latest_claim_of_kind_tx(transaction, &input.subject, &input.kind)?;
+    let unchanged = latest.as_ref().is_some_and(|claim| {
+        claim
+            .body
+            .get("fields")
+            .and_then(Value::as_object)
+            .is_some_and(|fields| state_fields(fields) == state_fields(&input.fields))
+    });
+    if unchanged {
+        return Ok(None);
+    }
+    let claim = publish_latest_claim_tx(
+        transaction,
+        origin,
+        &input.subject,
+        &input.kind,
+        input.actor.as_deref(),
+        &json!(input.fields),
+    )?;
+    if input.fields.get("state").and_then(Value::as_str) != Some("working") {
+        publish_pending_usage_tx(transaction, origin, &input.subject, now)?;
+    }
+    Ok(Some(claim))
+}
+
+fn usage_slot(fields: &BTreeMap<String, Value>) -> String {
+    json!([fields.get("incarnation_id"), fields.get("semantics")]).to_string()
+}
+
+/// Publish a usage observation when its slot (incarnation and semantics) has no claim yet,
+/// its compactions or model changed, this node last replicated the slot at least
+/// `USAGE_PUBLISH_INTERVAL_MS` ago, or the harness is not working. Otherwise it stays local
+/// and pending until one of those holds or the harness stops working.
+fn publish_due_usage_tx(
+    transaction: &Transaction<'_>,
+    origin: &str,
+    input: &ClaimInput,
+    local: &ClaimRecord,
+    now: u128,
+) -> Result<Option<ClaimRecord>, St3Error> {
+    let slot = usage_slot(&input.fields);
+    let last = transaction
+        .query_row(
+            "SELECT published_at_unix_ms, published_fields FROM local_latest_slots
+             WHERE subject=?1 AND kind='harness.usage' AND slot=?2",
+            params![input.subject, slot],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()
+        .map_err(internal)?;
+    let working = latest_claim_of_kind_tx(transaction, &input.subject, "harness.observed")?
+        .is_some_and(|claim| {
+            claim.body.pointer("/fields/state").and_then(Value::as_str) == Some("working")
+        });
+    let due = match &last {
+        None => true,
+        Some((published_at, published_fields)) => {
+            let published: BTreeMap<String, Value> =
+                serde_json::from_str(published_fields).unwrap_or_default();
+            !working
+                || now.saturating_sub((*published_at).max(0) as u128) >= USAGE_PUBLISH_INTERVAL_MS
+                || ["compactions", "model"]
+                    .iter()
+                    .any(|name| published.get(*name) != input.fields.get(*name))
+        }
+    };
+    if !due {
+        let local_id = local_observation_position(local)
+            .ok_or_else(|| St3Error::new("internal", "a local observation has no position"))?;
+        transaction
+            .execute(
+                "UPDATE local_latest_slots SET pending_local_id=?3
+                 WHERE subject=?1 AND kind='harness.usage' AND slot=?2",
+                params![input.subject, slot, local_id as i64],
+            )
+            .map_err(internal)?;
+        return Ok(None);
+    }
+    publish_usage_slot_tx(
+        transaction,
+        origin,
+        &input.subject,
+        input.actor.as_deref(),
+        &input.fields,
+        now,
+    )
+    .map(Some)
+}
+
+fn publish_usage_slot_tx(
+    transaction: &Transaction<'_>,
+    origin: &str,
+    subject: &str,
+    actor: Option<&str>,
+    fields: &BTreeMap<String, Value>,
+    now: u128,
+) -> Result<ClaimRecord, St3Error> {
+    let fields_text = canonical_json_text(&json!(fields)).map_err(internal)?;
+    transaction
+        .execute(
+            "INSERT INTO local_latest_slots(
+                subject, kind, slot, published_at_unix_ms, published_fields, pending_local_id
+             ) VALUES (?1, 'harness.usage', ?2, ?3, ?4, NULL)
+             ON CONFLICT(subject, kind, slot) DO UPDATE SET
+                published_at_unix_ms=excluded.published_at_unix_ms,
+                published_fields=excluded.published_fields,
+                pending_local_id=NULL",
+            params![
+                subject,
+                usage_slot(fields),
+                now.min(i64::MAX as u128) as i64,
+                fields_text
+            ],
+        )
+        .map_err(internal)?;
+    publish_latest_claim_tx(
+        transaction,
+        origin,
+        subject,
+        "harness.usage",
+        actor,
+        &json!(fields),
+    )
+}
+
+/// Replicate the newest local usage of each pending slot of `subject`.
+fn publish_pending_usage_tx(
+    transaction: &Transaction<'_>,
+    origin: &str,
+    subject: &str,
+    now: u128,
+) -> Result<Vec<ClaimRecord>, St3Error> {
+    let pending = {
+        let mut statement = transaction
+            .prepare(&format!(
+                "{LOCAL_OBSERVATION_COLUMNS} WHERE id IN (
+                    SELECT pending_local_id FROM local_latest_slots
+                    WHERE subject=?1 AND kind='harness.usage' AND pending_local_id IS NOT NULL
+                 ) ORDER BY id"
+            ))
+            .map_err(internal)?;
+        let rows = statement
+            .query_map([subject], |row| local_observation_from_row(origin, row))
+            .map_err(internal)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(internal)?
+    };
+    transaction
+        .execute(
+            "UPDATE local_latest_slots SET pending_local_id=NULL
+             WHERE subject=?1 AND kind='harness.usage'",
+            [subject],
+        )
+        .map_err(internal)?;
+    pending
+        .into_iter()
+        .map(|observation| {
+            let fields =
+                schema_fields_for_body("harness.usage", &observation.body).map_err(internal)?;
+            publish_usage_slot_tx(
+                transaction,
+                origin,
+                subject,
+                observation.actor.as_deref(),
+                &fields,
+                now,
+            )
+        })
+        .collect()
 }
 
 fn local_observation_id(origin: &str, id: i64) -> String {
@@ -30448,6 +30746,8 @@ version 2
         );
     }
 
+    /// A replicated harness observation. Each one is a new transition: a repeat that changed
+    /// only `observed_at_ms` would stay in the local observation log.
     fn observe_harness(store: &Store, observed_at_ms: u64) {
         store
             .append_claim(&ClaimInput {
@@ -30457,6 +30757,7 @@ version 2
                 fields: BTreeMap::from([
                     ("state".into(), json!("working")),
                     ("observed_at_ms".into(), json!(observed_at_ms)),
+                    ("transition_sequence".into(), json!(observed_at_ms)),
                 ]),
                 evidence: Vec::new(),
                 expected_subject: None,
@@ -32466,6 +32767,219 @@ mission "nested-work" state="ready" {
                 .unwrap(),
             19
         );
+    }
+
+    fn harness_state(subject: &str, state: &str, observed_at_ms: u64) -> ClaimInput {
+        ClaimInput {
+            subject: subject.into(),
+            kind: "harness.observed".into(),
+            actor: Some(subject.into()),
+            fields: BTreeMap::from([
+                ("state".into(), Value::String(state.into())),
+                ("incarnation_id".into(), Value::String("inc-1".into())),
+                ("observed_at_ms".into(), Value::from(observed_at_ms)),
+            ]),
+            evidence: Vec::new(),
+            expected_subject: None,
+            idempotency_key: Some(format!("state:{subject}:{state}:{observed_at_ms}")),
+        }
+    }
+
+    fn harness_usage(subject: &str, semantics: &str, tokens: u64, compactions: u64) -> ClaimInput {
+        ClaimInput {
+            subject: subject.into(),
+            kind: "harness.usage".into(),
+            actor: Some(subject.into()),
+            fields: BTreeMap::from([
+                ("driver".into(), Value::String("codex".into())),
+                ("incarnation_id".into(), Value::String("inc-1".into())),
+                ("semantics".into(), Value::String(semantics.into())),
+                ("context_used_tokens".into(), Value::from(tokens)),
+                ("compactions".into(), Value::from(compactions)),
+                ("model".into(), Value::String("example-model".into())),
+            ]),
+            evidence: Vec::new(),
+            expected_subject: None,
+            idempotency_key: Some(format!(
+                "usage:{subject}:{semantics}:{tokens}:{compactions}"
+            )),
+        }
+    }
+
+    #[test]
+    fn a_harness_state_replicates_only_when_it_changes() {
+        let store = Store::open_memory("node").unwrap();
+        let subject = "agent/node.worker";
+        let inventory_before = store.replication_inventory().unwrap().envelopes.len();
+        let mut replicated = Vec::new();
+        for (state, observed_at, expect_claim) in [
+            ("working", 1_000, true),
+            ("working", 301_000, false),
+            ("working", 601_000, false),
+            ("idle", 602_000, true),
+            ("idle", 902_000, false),
+            ("working", 903_000, true),
+        ] {
+            let (record, appended) = store
+                .append_claim_outcome(&harness_state(subject, state, observed_at))
+                .unwrap();
+            assert!(appended);
+            assert_eq!(
+                local_observation_position(&record).is_none(),
+                expect_claim,
+                "{state} at {observed_at}"
+            );
+            if expect_claim {
+                replicated.push(record.id);
+            }
+        }
+        let (repeated, appended) = store
+            .append_claim_outcome(&harness_state(subject, "idle", 902_000))
+            .unwrap();
+        assert!(!appended);
+        assert!(local_observation_position(&repeated).is_some());
+
+        let claims = store.claims_for(subject, Some("harness.observed")).unwrap();
+        assert_eq!(
+            claims
+                .iter()
+                .map(|claim| claim.id.clone())
+                .collect::<Vec<_>>(),
+            replicated
+        );
+        assert_eq!(
+            store.replication_inventory().unwrap().envelopes.len(),
+            inventory_before + 3
+        );
+        let local = store.local_observations_after(0, 100).unwrap();
+        assert_eq!(local.len(), 6, "the local log keeps every observation");
+        assert!(local.iter().all(|record| record.kind == "harness.observed"));
+        let latest = store
+            .latest_claim(subject, Some("harness.observed"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(latest.body["fields"]["state"], "working");
+        assert_eq!(latest.body["fields"]["observed_at_ms"], 903_000);
+
+        let replica = Store::open_memory("replica").unwrap();
+        receive_and_project(
+            &replica,
+            "node",
+            &exchange_from(&store, &ReplicationInventory::default()),
+        );
+        assert_eq!(
+            replica
+                .claims_for(subject, Some("harness.observed"))
+                .unwrap()
+                .len(),
+            3
+        );
+        assert!(replica.local_observations_after(0, 100).unwrap().is_empty());
+    }
+
+    #[test]
+    fn harness_usage_replicates_on_a_schedule_while_working_and_at_once_when_it_stops() {
+        let store = Store::open_memory("node").unwrap();
+        let subject = "agent/node.worker";
+        let start = now_ms();
+        let minute = 60_000_u128;
+        let usage_claims = |store: &Store| {
+            store
+                .claims_for(subject, Some("harness.usage"))
+                .unwrap()
+                .iter()
+                .map(|claim| {
+                    (
+                        claim.body["fields"]["semantics"]
+                            .as_str()
+                            .unwrap()
+                            .to_owned(),
+                        claim.body["fields"]["context_used_tokens"]
+                            .as_u64()
+                            .unwrap(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let occupancy = |tokens: u64| ("context_occupancy".to_owned(), tokens);
+        store
+            .append_claim_outcome(&harness_state(subject, "working", 1))
+            .unwrap();
+        let usage = |semantics: &str, tokens: u64, compactions: u64, at: u128| {
+            store
+                .append_latest_observation(
+                    &harness_usage(subject, semantics, tokens, compactions),
+                    at,
+                )
+                .unwrap()
+        };
+
+        assert!(local_observation_position(&usage("context_occupancy", 10, 0, start).0).is_none());
+        assert!(
+            local_observation_position(&usage("context_occupancy", 20, 0, start + minute).0)
+                .is_some()
+        );
+        assert!(
+            local_observation_position(&usage("context_occupancy", 30, 0, start + 2 * minute).0)
+                .is_some()
+        );
+        assert_eq!(
+            usage_claims(&store),
+            [occupancy(10)],
+            "while working, a changed reading waits for the interval"
+        );
+        assert!(
+            local_observation_position(&usage("session_cumulative", 500, 0, start + 2 * minute).0)
+                .is_none(),
+            "each semantics has its own slot"
+        );
+        assert!(
+            local_observation_position(&usage("context_occupancy", 5, 1, start + 3 * minute).0)
+                .is_none(),
+            "a compaction replicates at once"
+        );
+        assert!(
+            local_observation_position(&usage("context_occupancy", 15, 1, start + 4 * minute).0)
+                .is_some()
+        );
+        assert!(
+            local_observation_position(&usage("context_occupancy", 25, 1, start + 9 * minute).0)
+                .is_none(),
+            "the interval has passed since the last replicated reading"
+        );
+        assert!(
+            local_observation_position(&usage("context_occupancy", 35, 1, start + 10 * minute).0)
+                .is_some()
+        );
+        assert_eq!(
+            usage_claims(&store),
+            [
+                occupancy(10),
+                ("session_cumulative".into(), 500),
+                occupancy(5),
+                occupancy(25),
+            ]
+        );
+
+        store
+            .append_claim_outcome(&harness_state(subject, "idle", 2))
+            .unwrap();
+        assert_eq!(
+            usage_claims(&store).last(),
+            Some(&occupancy(35)),
+            "the newest pending reading replicates when the harness stops working"
+        );
+        let settled = usage_claims(&store).len();
+        store
+            .append_claim_outcome(&harness_state(subject, "idle", 3))
+            .unwrap();
+        assert_eq!(usage_claims(&store).len(), settled, "nothing was pending");
+        assert!(
+            local_observation_position(&usage("context_occupancy", 36, 1, start + 11 * minute).0)
+                .is_none(),
+            "an idle harness replicates its usage at once"
+        );
+        assert_eq!(store.local_observations_after(0, 100).unwrap().len(), 12);
     }
 
     #[test]
