@@ -27,11 +27,11 @@ use crate::model::{
     PlanningSessionView, PlanningVariantView, ReplicaBatch, ReplicaEnvelope, ReplicaEnvelopeId,
     ReplicaRecordView, ReplicaRepairDeclaration, ReplicationExchange, ReplicationInventory,
     ReplicationInventoryBucket, ReplicationPeerStatus, ReplicationPeerSync, ReplicationReceipt,
-    ReplicationStatus, ResourceObservationOutcome, ResourceRefreshOperation, RevisionCutover,
-    RevisionProposalView, RevisionSubmissionView, RunGenerationView, RuntimeResetOperation,
-    St3Error, StatusResponse, StepRunView, SubjectChange, SubjectStatus, SubscriptionConditionSpec,
-    SubscriptionRequestDecision, SubscriptionRequestView, SubscriptionSpec, UsageSummary,
-    WorkRequest, WorkSelector, WorkWakeView,
+    ReplicationStatus, ReplicationTimings, ResourceObservationOutcome, ResourceRefreshOperation,
+    RevisionCutover, RevisionProposalView, RevisionSubmissionView, RunGenerationView,
+    RuntimeResetOperation, St3Error, StatusResponse, StepRunView, SubjectChange, SubjectStatus,
+    SubscriptionConditionSpec, SubscriptionRequestDecision, SubscriptionRequestView,
+    SubscriptionSpec, UsageSummary, WorkRequest, WorkSelector, WorkWakeView,
 };
 #[cfg(test)]
 use crate::model::{ReplicaRange, ReplicationBatch, ReplicationResponse};
@@ -623,6 +623,7 @@ pub struct Store {
     replica_generation: AtomicU64,
     replication_snapshot: Mutex<Option<Arc<ReplicationSnapshot>>>,
     replication_sync: Mutex<BTreeMap<String, PeerSyncProgress>>,
+    replication_timers: ReplicationTimers,
     /// This node's fleet member key. Set, it signs every envelope of this node's writer.
     member_key: std::sync::RwLock<Option<Arc<crate::fleet::MemberKey>>>,
     origin: String,
@@ -701,6 +702,56 @@ struct ReplicationSnapshot {
     authority_digest: String,
     graph_generation: i64,
     graph_digest: String,
+}
+
+/// Nanoseconds every SQLite statement in this process has taken, from SQLite's profile hook.
+static SQLITE_NANOS: AtomicU64 = AtomicU64::new(0);
+/// The part of that time, and the count, of `COMMIT` statements, which wait for a disk flush.
+static SQLITE_COMMITS: AtomicU64 = AtomicU64::new(0);
+static SQLITE_COMMIT_NANOS: AtomicU64 = AtomicU64::new(0);
+
+fn record_sqlite_time(statement: &str, duration: std::time::Duration) {
+    SQLITE_NANOS.fetch_add(duration.as_nanos() as u64, Ordering::Relaxed);
+    if statement == "COMMIT" {
+        SQLITE_COMMITS.fetch_add(1, Ordering::Relaxed);
+        SQLITE_COMMIT_NANOS.fetch_add(duration.as_nanos() as u64, Ordering::Relaxed);
+    }
+}
+
+/// Cumulative replication time by stage, in nanoseconds.
+#[derive(Default)]
+struct ReplicationTimers {
+    exchanges: AtomicU64,
+    envelopes_received: AtomicU64,
+    round_trip: AtomicU64,
+    export: AtomicU64,
+    snapshot: AtomicU64,
+    receipt: AtomicU64,
+    admission: AtomicU64,
+    verify: AtomicU64,
+    projection: AtomicU64,
+    repair: AtomicU64,
+    signing: AtomicU64,
+}
+
+/// Adds the time until it drops to one stage counter.
+struct StageTimer<'a> {
+    counter: &'a AtomicU64,
+    started: std::time::Instant,
+}
+
+fn time_stage(counter: &AtomicU64) -> StageTimer<'_> {
+    StageTimer {
+        counter,
+        started: std::time::Instant::now(),
+    }
+}
+
+impl Drop for StageTimer<'_> {
+    fn drop(&mut self) {
+        self.counter
+            .fetch_add(self.started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    }
 }
 
 /// Live sync measurements for one peer. They are rebuilt by the first exchange after a restart,
@@ -1026,6 +1077,9 @@ pub struct ReplicationAdmission {
     /// Envelopes held as `unsigned` or `fenced` by the fleet membership rules.
     pub held: usize,
     pub changed: bool,
+    /// Time spent decoding envelopes, checking their hashes and claim schemas, and looking up
+    /// their stored signatures.
+    pub verify: std::time::Duration,
 }
 
 enum ReplicatedClaimAdmission {
@@ -1262,8 +1316,9 @@ fn open_read_connections(path: &Path, shared_memory: bool) -> Result<Vec<Connect
     };
     (0..READ_CONNECTIONS)
         .map(|_| {
-            let connection = Connection::open_with_flags(path, flags)
+            let mut connection = Connection::open_with_flags(path, flags)
                 .with_context(|| format!("open st read connection {}", path.display()))?;
+            connection.profile(Some(record_sqlite_time));
             connection.execute_batch(
                 "PRAGMA busy_timeout = 5000;
                  PRAGMA foreign_keys = ON;
@@ -1283,6 +1338,7 @@ impl Store {
         }
         let mut connection = Connection::open(path)
             .with_context(|| format!("open st database {}", path.display()))?;
+        connection.profile(Some(record_sqlite_time));
         // Keep the hot graph and replication index pages in SQLite's bounded
         // page cache. The default (~2 MiB per connection) churns against the
         // large durable claim store during otherwise quiet replication.
@@ -1313,6 +1369,7 @@ impl Store {
             replica_generation: AtomicU64::new(0),
             replication_snapshot: Mutex::new(None),
             replication_sync: Mutex::new(BTreeMap::new()),
+            replication_timers: ReplicationTimers::default(),
             member_key: std::sync::RwLock::new(None),
             origin,
         })
@@ -1330,6 +1387,7 @@ impl Store {
                 | OpenFlags::SQLITE_OPEN_CREATE
                 | OpenFlags::SQLITE_OPEN_URI,
         )?;
+        connection.profile(Some(record_sqlite_time));
         reject_old_schema(&connection)?;
         migrate_schema(&connection)?;
         connection.execute_batch(SCHEMA)?;
@@ -1356,6 +1414,7 @@ impl Store {
             replica_generation: AtomicU64::new(0),
             replication_snapshot: Mutex::new(None),
             replication_sync: Mutex::new(BTreeMap::new()),
+            replication_timers: ReplicationTimers::default(),
             member_key: std::sync::RwLock::new(None),
             origin,
         })
@@ -10259,6 +10318,7 @@ impl Store {
         }
 
         let mut connection = self.connection.write();
+        let _timing = time_stage(&self.replication_timers.snapshot);
         let seeded_through = self.seeded_batch_rowid.load(Ordering::Acquire);
         let latest_batch = max_batch_rowid(&connection)?;
         if latest_batch > seeded_through {
@@ -10396,6 +10456,7 @@ impl Store {
 
     pub fn export_replication_summary(&self, fleet_id: &str) -> Result<ReplicationExchange> {
         let snapshot = self.replication_snapshot()?;
+        let _timing = time_stage(&self.replication_timers.export);
         let signature_requests = self.replication_signature_requests()?;
         Ok(ReplicationExchange {
             peer: self.origin.clone(),
@@ -10431,6 +10492,7 @@ impl Store {
         signature_requests: &[ReplicaEnvelopeId],
     ) -> Result<ReplicationExchange> {
         let mut exchange = self.export_replication_difference(fleet_id, remote)?;
+        let _timing = time_stage(&self.replication_timers.export);
         exchange.signatures = self.replication_signatures_for(signature_requests)?;
         exchange.signature_requests = self.replication_signature_requests()?;
         Ok(exchange)
@@ -10442,6 +10504,7 @@ impl Store {
         remote: &ReplicationInventory,
     ) -> Result<ReplicationExchange> {
         let snapshot = self.replication_snapshot()?;
+        let _timing = time_stage(&self.replication_timers.export);
         let same = !remote.digest.is_empty() && remote.digest == snapshot.inventory.digest;
         if !same && !remote.buckets.is_empty() {
             // The peer sent range digests, so only differing ranges need identities.
@@ -10567,6 +10630,7 @@ impl Store {
             ));
         }
         let mut connection = self.connection.write();
+        let timing = time_stage(&self.replication_timers.receipt);
         let transaction = connection.transaction().map_err(internal)?;
         let mut received = 0;
         let mut duplicate = 0;
@@ -10637,6 +10701,13 @@ impl Store {
             )
             .map_err(internal)?;
         transaction.commit().map_err(internal)?;
+        drop(timing);
+        self.replication_timers
+            .exchanges
+            .fetch_add(1, Ordering::Relaxed);
+        self.replication_timers
+            .envelopes_received
+            .fetch_add(received as u64, Ordering::Relaxed);
         if received != 0 {
             self.replica_generation.fetch_add(1, Ordering::AcqRel);
         }
@@ -10669,6 +10740,7 @@ impl Store {
         // Seed and sign local batches first, so local membership claims decide admission.
         self.replication_snapshot()?;
         let mut connection = self.connection.write();
+        let _timing = time_stage(&self.replication_timers.admission);
         // Builds before the insertion-order hash fallback rejected genuine claims from
         // 2026-09-16 as hash mismatches. Check those records once more, once.
         let retry_hash_mismatches = connection
@@ -10721,7 +10793,10 @@ impl Store {
             let mut held = Vec::new();
             let mut membership_changed = false;
             for envelope in pending {
-                if let Some(reason) = fleet_admission_hold(&connection, &membership, &envelope)? {
+                let started = std::time::Instant::now();
+                let hold = fleet_admission_hold(&connection, &membership, &envelope)?;
+                outcome.verify += started.elapsed();
+                if let Some(reason) = hold {
                     hold_replica_envelope(&connection, &envelope, reason)?;
                     held.push(envelope);
                     continue;
@@ -10753,6 +10828,9 @@ impl Store {
             membership = fleet_membership_tx(&connection)?;
             pending = held;
         }
+        self.replication_timers
+            .verify
+            .fetch_add(outcome.verify.as_nanos() as u64, Ordering::Relaxed);
         if retry_hash_mismatches {
             connection.execute(
                 "INSERT OR REPLACE INTO meta(key, value) VALUES ('legacy_claim_hash_retried', ?1)",
@@ -10764,6 +10842,7 @@ impl Store {
 
     pub fn project_replication_backlog(&self) -> Result<bool> {
         let mut connection = self.connection.write();
+        let _timing = time_stage(&self.replication_timers.projection);
         let transaction = connection.transaction()?;
         let result = (|| -> Result<(), St3Error> {
             // An incremental projection that fails is rolled back and replaced by a full replay,
@@ -10896,6 +10975,7 @@ impl Store {
     /// unhealthy projection that names it, so one bad repair never stops replication or startup.
     pub fn apply_replication_repairs(&self) -> Result<usize> {
         let mut connection = self.connection.write();
+        let _timing = time_stage(&self.replication_timers.repair);
         let transaction = connection.transaction()?;
         let mut statement = transaction
             .prepare("SELECT id, body FROM claims WHERE kind='record.repaired' ORDER BY id")?;
@@ -11179,6 +11259,35 @@ impl Store {
             .unwrap();
     }
 
+    /// Count one of this node's requests to a peer, from send to response.
+    pub fn record_replication_round_trip(&self, duration: std::time::Duration) {
+        self.replication_timers
+            .round_trip
+            .fetch_add(duration.as_nanos() as u64, Ordering::Relaxed);
+    }
+
+    /// Where this process has spent replication time since it started.
+    pub fn replication_timings(&self) -> ReplicationTimings {
+        let timers = &self.replication_timers;
+        let ms = |counter: &AtomicU64| counter.load(Ordering::Relaxed) / 1_000_000;
+        ReplicationTimings {
+            exchanges: timers.exchanges.load(Ordering::Relaxed),
+            envelopes_received: timers.envelopes_received.load(Ordering::Relaxed),
+            round_trip_ms: ms(&timers.round_trip),
+            export_ms: ms(&timers.export),
+            snapshot_ms: ms(&timers.snapshot),
+            receipt_ms: ms(&timers.receipt),
+            admission_ms: ms(&timers.admission),
+            verify_ms: ms(&timers.verify),
+            projection_ms: ms(&timers.projection),
+            repair_ms: ms(&timers.repair),
+            signing_ms: ms(&timers.signing),
+            sqlite_ms: ms(&SQLITE_NANOS),
+            commits: SQLITE_COMMITS.load(Ordering::Relaxed),
+            commit_ms: ms(&SQLITE_COMMIT_NANOS),
+        }
+    }
+
     pub fn replication_status(
         &self,
         configured: bool,
@@ -11277,6 +11386,7 @@ impl Store {
                 })?
                 .collect::<Result<Vec<_>, _>>()?,
             peers,
+            timings: self.replication_timings(),
         })
     }
 
@@ -17436,6 +17546,7 @@ impl Store {
         transaction: &Transaction<'_>,
         after_rowid: Option<i64>,
     ) -> Result<usize> {
+        let _timing = time_stage(&self.replication_timers.signing);
         let Some(key) = self
             .member_key
             .read()
@@ -20492,6 +20603,7 @@ fn validate_and_admit_envelope_tx(
     envelope: &ReplicaEnvelope,
     outcome: &mut ReplicationAdmission,
 ) -> Result<(), St3Error> {
+    let started = std::time::Instant::now();
     let payload_bytes = base64::engine::general_purpose::STANDARD
         .decode(envelope.payload.as_bytes())
         .map_err(|error| {
@@ -20532,6 +20644,7 @@ fn validate_and_admit_envelope_tx(
         ));
     }
     verify_replica_batch_header(batch)?;
+    outcome.verify += started.elapsed();
     let now = now_ms().to_string();
     let mut degraded = false;
     for (offset, (hash, bytes)) in payload.blobs.iter().enumerate() {
@@ -20644,7 +20757,9 @@ fn validate_and_admit_envelope_tx(
             )
             .optional()
             .map_err(internal)?;
+        let started = std::time::Instant::now();
         let classification = validate_replicated_claim(transaction, batch, claim);
+        outcome.verify += started.elapsed();
         match classification {
             Ok(ReplicatedClaimAdmission::Valid) => {
                 let inserted = transaction

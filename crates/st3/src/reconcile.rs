@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
@@ -30,6 +31,9 @@ use crate::store::Store;
 
 const HARNESS_READINESS_DEADLINE_MS: u128 = 60_000;
 const WORK_WAKE_RETRY_MS: u128 = 15_000;
+// A mechanical gate may run for minutes. Polling it every 100 ms reruns the entire host
+// reconciliation pass (including PTY snapshots and render checks) while it is still running.
+const GATE_POLL_INTERVAL: Duration = Duration::from_secs(2);
 const WORK_WAKE_MAX_ATTEMPTS: u32 = 3;
 // A new harness can spend longer than the retry sequence reading its boot
 // contract before it claims work. Keep the quick delivery retries, but do not
@@ -385,6 +389,7 @@ pub struct Reconciler<R = NativeRuntime> {
     event_notify: watch::Sender<u64>,
     armed_schedules: Arc<Mutex<std::collections::HashSet<String>>>,
     armed_observers: Arc<Mutex<std::collections::HashSet<String>>>,
+    gate_poll_armed: Arc<AtomicBool>,
     observer_deadlines: Arc<Mutex<HashMap<String, u128>>>,
     observer_cursors: Arc<Mutex<HashMap<String, Option<String>>>>,
     delayed_restarts: Arc<Mutex<HashMap<String, u128>>>,
@@ -474,6 +479,7 @@ impl Reconciler<NativeRuntime> {
             event_notify,
             armed_schedules: Arc::new(Mutex::new(std::collections::HashSet::new())),
             armed_observers: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            gate_poll_armed: Arc::new(AtomicBool::new(false)),
             observer_deadlines: Arc::new(Mutex::new(HashMap::new())),
             observer_cursors: Arc::new(Mutex::new(HashMap::new())),
             delayed_restarts: Arc::new(Mutex::new(HashMap::new())),
@@ -510,6 +516,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             event_notify: watch::channel(0_u64).0,
             armed_schedules: Arc::new(Mutex::new(std::collections::HashSet::new())),
             armed_observers: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            gate_poll_armed: Arc::new(AtomicBool::new(false)),
             observer_deadlines: Arc::new(Mutex::new(HashMap::new())),
             observer_cursors: Arc::new(Mutex::new(HashMap::new())),
             delayed_restarts: Arc::new(Mutex::new(HashMap::new())),
@@ -8751,9 +8758,14 @@ impl<R: RuntimeControl> Reconciler<R> {
 
     fn arm_gate_poll(&self) {
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            if self.gate_poll_armed.swap(true, Ordering::AcqRel) {
+                return;
+            }
             let notify = self.notify.clone();
+            let armed = self.gate_poll_armed.clone();
             handle.spawn(async move {
-                tokio::time::sleep(Duration::from_millis(100)).await;
+                tokio::time::sleep(GATE_POLL_INTERVAL).await;
+                armed.store(false, Ordering::Release);
                 notify.notify_one();
             });
         }
@@ -10436,6 +10448,35 @@ exec "orchid" {{ command "orchid-tool"; workspace "{}"; }}"#,
         fn read_exec_log(&self, runtime_id: &str) -> Result<Option<String>> {
             Ok(self.logs.lock().unwrap().get(runtime_id).cloned())
         }
+    }
+
+    #[tokio::test]
+    async fn active_gates_share_a_bounded_reconcile_poll() {
+        let notify = Arc::new(Notify::new());
+        let reconciler = Reconciler::new(
+            Arc::new(Store::open_memory("node").unwrap()),
+            Arc::new(FakeRuntime::default()),
+            "node".into(),
+            notify.clone(),
+        );
+
+        // Several pending mechanical gates must not restart a full host pass every 100 ms.
+        for _ in 0..10 {
+            reconciler.arm_gate_poll();
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(500), notify.notified())
+                .await
+                .is_err()
+        );
+        tokio::time::timeout(Duration::from_secs(3), notify.notified())
+            .await
+            .expect("the gate poll should eventually wake reconciliation");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), notify.notified())
+                .await
+                .is_err()
+        );
     }
 
     #[test]

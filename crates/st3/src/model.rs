@@ -2375,6 +2375,9 @@ pub struct ReplicationReceiveRequest {
     pub peer: String,
     pub fleet_id: String,
     pub exchange: ReplicationExchange,
+    /// How long the worker's request that returned this exchange took, when it made one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub round_trip_ms: Option<u64>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -2430,6 +2433,44 @@ pub struct ReplicationStatus {
     #[serde(default)]
     pub unhealthy: Vec<UnhealthyProjection>,
     pub peers: Vec<ReplicationPeerStatus>,
+    /// Where this process spent replication time since it started.
+    #[serde(default)]
+    pub timings: ReplicationTimings,
+}
+
+/// Cumulative replication time in one daemon process since it started, split by stage, for
+/// profiling a sync. Each store stage starts once it holds the store's write connection, so the
+/// stages do not overlap one another, except that admission includes verification and snapshot
+/// includes signing. SQLite time is every statement the process ran, inside any stage or outside
+/// all of them.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ReplicationTimings {
+    /// Exchanges this node received from peers, in either direction.
+    pub exchanges: u64,
+    pub envelopes_received: u64,
+    /// This node's own requests to peers, from send to response, including the peer's work.
+    pub round_trip_ms: u64,
+    /// Comparing inventories and reading envelopes to send.
+    pub export_ms: u64,
+    /// Refreshing this node's inventory and digests after a write, including sealing and
+    /// signing its own new envelopes.
+    pub snapshot_ms: u64,
+    /// Storing received envelopes.
+    pub receipt_ms: u64,
+    /// Validating and admitting received envelopes as claims.
+    pub admission_ms: u64,
+    /// The part of admission spent decoding envelopes, checking their hashes and claim schemas,
+    /// and looking up their stored signatures. Receipt verifies the signatures themselves.
+    pub verify_ms: u64,
+    /// Reducing admitted claims into the current graph.
+    pub projection_ms: u64,
+    pub repair_ms: u64,
+    /// Signing this node's own envelopes with its member key.
+    pub signing_ms: u64,
+    pub sqlite_ms: u64,
+    /// SQLite commits, and their part of `sqlite_ms`. Each one waits for a disk flush.
+    pub commits: u64,
+    pub commit_ms: u64,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]

@@ -148,6 +148,18 @@ bound. The estimate divides the remaining envelopes by how fast that number shra
 10-second windows, so a peer that keeps writing lengthens it. The measurements live in memory; the
 first exchange after a restart rebuilds them.
 
+The `timings` line shows where this daemon has spent replication time since it started:
+
+```text
+timings	486 exchanges, 130004 envelopes received; ms: round-trip=6088 export=340 snapshot=2775 receipt=1591 admission=33634 (verify=1971) projection=489104 repair=12 signing=0 sqlite=566278 (132887 commits, 17587 ms)
+```
+
+Each store stage counts only the time it holds the store's write connection, so one stage does
+not count another's wait. Round trips are this node's own requests to its peers, including the
+peer's work to answer them. SQLite time is every statement the daemon ran; each commit waits for
+a disk flush. `/v1/replication/status` carries the same numbers as `timings`.
+`crates/st3/tests/first_sync.rs` uses them to profile an empty node syncing from a peer.
+
 A node is catching up while a peer measured in the last five minutes holds more envelopes than one
 exchange carries. During that time its projections can show early history as current: a request
 that a later envelope resolves still looks open. Every client page then carries a `sync` notice,
