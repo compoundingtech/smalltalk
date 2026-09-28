@@ -21,6 +21,7 @@ use tokio::sync::watch;
 
 use crate::client::Client;
 use crate::config::{Config, PeerConfig};
+use crate::fleet::{Acceptance, FleetView, MemberKey, Refusal, Sender, verify_signature};
 use crate::model::{
     ApiResponse, ReplicaEnvelopeId, ReplicationExchange, ReplicationExportRequest,
     ReplicationExportResponse, ReplicationInventory, ReplicationPeerFailureRequest,
@@ -42,6 +43,9 @@ const HEADER_NODE: &str = "x-st3-node";
 const HEADER_BODY: &str = "x-st3-body-sha256";
 const HEADER_SIGNATURE: &str = "x-st3-signature";
 const HEADER_REQUEST: &str = "x-st3-request-digest";
+const HEADER_MEMBER_KEY: &str = "x-st3-member-key";
+const HEADER_MEMBER_SIGNATURE: &str = "x-st3-member-signature";
+const MEMBER_SIGNATURE_DOMAIN: &str = "st3-member-v1";
 pub(crate) const MAX_EXCHANGE_BYTES: usize = 64 * 1024 * 1024;
 
 type HmacSha256 = Hmac<Sha256>;
@@ -50,6 +54,8 @@ type HmacSha256 = Hmac<Sha256>;
 pub struct FleetAuth {
     fleet_id: String,
     secret: Arc<Vec<u8>>,
+    /// This member's key. Set, every request and response also carries a member signature.
+    member: Option<Arc<MemberKey>>,
 }
 
 impl FleetAuth {
@@ -76,7 +82,18 @@ impl FleetAuth {
         Ok(Self {
             fleet_id: fleet_id.into(),
             secret: Arc::new(secret),
+            member: None,
         })
+    }
+
+    /// Sign every request and response with this member key as well.
+    pub fn with_member_key(mut self, member: Option<Arc<MemberKey>>) -> Self {
+        self.member = member;
+        self
+    }
+
+    pub fn member_key(&self) -> Option<&str> {
+        self.member.as_deref().map(MemberKey::public)
     }
 
     #[cfg(test)]
@@ -84,7 +101,38 @@ impl FleetAuth {
         Self {
             fleet_id: fleet_id.into(),
             secret: Arc::new(secret.to_vec()),
+            member: None,
         }
+    }
+
+    fn canonical(
+        &self,
+        method: &str,
+        path: &str,
+        node: &str,
+        body_digest: &str,
+        request_digest: Option<&str>,
+    ) -> String {
+        format!(
+            "{PROTOCOL}\n{method}\n{path}\n{}\n{node}\n{body_digest}\n{}",
+            self.fleet_id,
+            request_digest.unwrap_or_default()
+        )
+    }
+
+    fn member_message(canonical: &str) -> Vec<u8> {
+        format!("{MEMBER_SIGNATURE_DOMAIN}\n{canonical}").into_bytes()
+    }
+
+    fn add_member_signature(&self, headers: &mut HeaderMap, canonical: &str) -> Result<()> {
+        if let Some(member) = &self.member {
+            headers.insert(HEADER_MEMBER_KEY, HeaderValue::from_str(member.public())?);
+            headers.insert(
+                HEADER_MEMBER_SIGNATURE,
+                HeaderValue::from_str(&member.sign(&Self::member_message(canonical)))?,
+            );
+        }
+        Ok(())
     }
 
     pub fn fleet_id(&self) -> &str {
@@ -103,11 +151,7 @@ impl FleetAuth {
         body_digest: &str,
         request_digest: Option<&str>,
     ) -> String {
-        let canonical = format!(
-            "{PROTOCOL}\n{method}\n{path}\n{}\n{node}\n{body_digest}\n{}",
-            self.fleet_id,
-            request_digest.unwrap_or_default()
-        );
+        let canonical = self.canonical(method, path, node, body_digest, request_digest);
         let mut mac =
             HmacSha256::new_from_slice(&self.secret).expect("HMAC accepts a secret of any length");
         mac.update(canonical.as_bytes());
@@ -121,7 +165,12 @@ impl FleetAuth {
     fn request_headers_for(&self, path: &str, node: &str, body: &[u8]) -> Result<HeaderMap> {
         let digest = Self::body_digest(body);
         let signature = self.signature("POST", path, node, &digest, None);
-        headers(&self.fleet_id, node, &digest, &signature, None)
+        let mut headers = headers(&self.fleet_id, node, &digest, &signature, None)?;
+        self.add_member_signature(
+            &mut headers,
+            &self.canonical("POST", path, node, &digest, None),
+        )?;
+        Ok(headers)
     }
 
     fn response_headers_for(
@@ -133,13 +182,18 @@ impl FleetAuth {
     ) -> Result<HeaderMap> {
         let digest = Self::body_digest(body);
         let signature = self.signature("RESPONSE", path, node, &digest, Some(request_digest));
-        headers(
+        let mut headers = headers(
             &self.fleet_id,
             node,
             &digest,
             &signature,
             Some(request_digest),
-        )
+        )?;
+        self.add_member_signature(
+            &mut headers,
+            &self.canonical("RESPONSE", path, node, &digest, Some(request_digest)),
+        )?;
+        Ok(headers)
     }
 
     fn verify(
@@ -151,6 +205,20 @@ impl FleetAuth {
         expected_node: Option<&str>,
         request_digest: Option<&str>,
     ) -> Result<String> {
+        self.verify_sender(headers, method, path, body, expected_node, request_digest)
+            .map(|sender| sender.name)
+    }
+
+    /// Check the fleet HMAC, then read the optional member key and check its signature.
+    fn verify_sender(
+        &self,
+        headers: &HeaderMap,
+        method: &str,
+        path: &str,
+        body: &[u8],
+        expected_node: Option<&str>,
+        request_digest: Option<&str>,
+    ) -> Result<Sender> {
         let field = |name: &str| -> Result<&str> {
             headers
                 .get(name)
@@ -181,17 +249,30 @@ impl FleetAuth {
         }
         let signature = hex::decode(field(HEADER_SIGNATURE)?)
             .context("the replication signature is not hexadecimal")?;
-        let canonical = format!(
-            "{PROTOCOL}\n{method}\n{path}\n{}\n{node}\n{digest}\n{}",
-            self.fleet_id,
-            request_digest.unwrap_or_default()
-        );
+        let canonical = self.canonical(method, path, node, &digest, request_digest);
         let mut mac =
             HmacSha256::new_from_slice(&self.secret).expect("HMAC accepts a secret of any length");
         mac.update(canonical.as_bytes());
         mac.verify_slice(&signature)
             .context("the replication signature does not match")?;
-        Ok(node.into())
+        let optional = |name: &str| {
+            headers
+                .get(name)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned)
+        };
+        let member_key = optional(HEADER_MEMBER_KEY);
+        let member_signature_valid = match (&member_key, optional(HEADER_MEMBER_SIGNATURE)) {
+            (Some(key), Some(signature)) => {
+                verify_signature(key, &Self::member_message(&canonical), &signature)
+            }
+            _ => false,
+        };
+        Ok(Sender {
+            name: node.into(),
+            member_key,
+            member_signature_valid,
+        })
     }
 }
 
@@ -392,10 +473,101 @@ struct PeerState {
     backend: PeerBackend,
     node: String,
     auth: FleetAuth,
-    peers: BTreeSet<String>,
+    fleet: FleetContext,
     main_socket: PathBuf,
     outbound_notify: watch::Sender<u64>,
 }
+
+/// What this worker knows about the fleet: the membership view, its config peers, and whether
+/// it still accepts HMAC-only exchanges from config peers.
+#[derive(Clone)]
+struct FleetContext {
+    view: Arc<std::sync::RwLock<FleetView>>,
+    config_peers: BTreeSet<String>,
+    /// True on a node without `fleet.toml`, or with `legacy_peers = true`.
+    legacy: bool,
+    own_key: Option<String>,
+    /// Keys this node trusts before membership arrives: its pinned anchor and its sponsor.
+    bootstrap_keys: BTreeSet<String>,
+    /// Set once a member refused this node with a signed refusal naming its own key.
+    removed: Arc<std::sync::atomic::AtomicBool>,
+    state_dir: Option<PathBuf>,
+}
+
+impl FleetContext {
+    /// A node without membership: config peers only, as before.
+    #[cfg(test)]
+    fn legacy(config_peers: BTreeSet<String>) -> Self {
+        Self {
+            view: Arc::default(),
+            config_peers,
+            legacy: true,
+            own_key: None,
+            bootstrap_keys: BTreeSet::new(),
+            removed: Arc::default(),
+            state_dir: None,
+        }
+    }
+
+    fn accept(&self, sender: &Sender) -> Result<Acceptance, Refusal> {
+        let view = self.view.read().expect("fleet view lock poisoned");
+        // Before membership arrives, a new member knows only its anchor and its sponsor.
+        if sender.member_signature_valid
+            && view.members.iter().all(|member| member.name != sender.name)
+            && sender
+                .member_key
+                .as_ref()
+                .is_some_and(|key| self.bootstrap_keys.contains(key))
+        {
+            return Ok(Acceptance::Member);
+        }
+        crate::fleet::accept(
+            &view,
+            sender,
+            self.config_peers.contains(&sender.name),
+            self.legacy,
+        )
+    }
+
+    fn is_removed(&self) -> bool {
+        self.removed.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Record that a member refused this node for good, so it stops dialing and `st3 doctor`
+    /// can say what happened.
+    fn mark_removed(&self, reported_by: &str, code: &str) {
+        self.removed
+            .store(true, std::sync::atomic::Ordering::Release);
+        if let Some(state_dir) = &self.state_dir
+            && let Ok(Some(mut file)) = crate::config::FleetFile::load(state_dir)
+            && file.removed.is_none()
+        {
+            file.removed = Some(crate::config::FleetRemoval {
+                reported_by: reported_by.into(),
+                code: code.into(),
+            });
+            let _ = file.save(state_dir);
+        }
+    }
+}
+
+/// A signed refusal from a member that names this node's own key as ended.
+#[derive(Debug)]
+struct RemovedFromFleet {
+    code: String,
+}
+
+impl std::fmt::Display for RemovedFromFleet {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "this node is no longer a member of the fleet ({})",
+            self.code
+        )
+    }
+}
+
+impl std::error::Error for RemovedFromFleet {}
 
 #[derive(Clone)]
 enum PeerBackend {
@@ -482,6 +654,14 @@ impl PeerBackend {
         }
     }
 
+    async fn fleet_view(&self) -> Result<FleetView> {
+        match self {
+            Self::Main(client) => client.get("/v1/internal/fleet/membership").await,
+            #[cfg(test)]
+            Self::Local(store) => store.fleet_view(),
+        }
+    }
+
     async fn record_failure(&self, peer: &str, status: &str, error: &str) -> Result<()> {
         match self {
             Self::Main(client) => {
@@ -516,11 +696,32 @@ pub async fn run_worker(config: Config) -> Result<()> {
         .shared_secret_file
         .as_deref()
         .context("the replication worker needs shared_secret_file")?;
-    let address = config
-        .peer_listen
-        .as_deref()
-        .context("the replication worker needs peer_listen")?;
-    let auth = FleetAuth::load(fleet_id, secret_file)?;
+    let member_key = match &config.fleet {
+        Some(file) => Some(Arc::new(MemberKey::load(
+            &file.node_key_path(&config.state_dir),
+        )?)),
+        None => None,
+    };
+    let auth = FleetAuth::load(fleet_id, secret_file)?.with_member_key(member_key.clone());
+    let fleet = FleetContext {
+        view: Arc::default(),
+        config_peers: config.peers.iter().map(|peer| peer.name.clone()).collect(),
+        legacy: config.fleet.as_ref().is_none_or(|file| file.legacy_peers),
+        own_key: member_key.as_ref().map(|key| key.public().to_owned()),
+        bootstrap_keys: config
+            .fleet
+            .iter()
+            .flat_map(|file| [file.anchor_key.clone(), file.sponsor_key.clone()])
+            .flatten()
+            .collect(),
+        removed: Arc::new(std::sync::atomic::AtomicBool::new(
+            config
+                .fleet
+                .as_ref()
+                .is_some_and(|file| file.removed.is_some()),
+        )),
+        state_dir: Some(config.state_dir.clone()),
+    };
     wait_for_main_daemon(&config.socket).await;
     let backend = PeerBackend::Main(Client::unix(config.socket.clone()));
     let (notify, _notify_receiver) = watch::channel(0_u64);
@@ -536,11 +737,17 @@ pub async fn run_worker(config: Config) -> Result<()> {
             }
         })?;
     database_watcher.watch(&wake_file, notify::RecursiveMode::NonRecursive)?;
+    refresh_fleet_view(&backend, &fleet).await;
+    tokio::spawn(keep_fleet_view_current(
+        backend.clone(),
+        fleet.clone(),
+        notify.subscribe(),
+    ));
     let state = PeerState {
         backend: backend.clone(),
         node: config.node.clone(),
         auth: auth.clone(),
-        peers: config.peers.iter().map(|peer| peer.name.clone()).collect(),
+        fleet: fleet.clone(),
         main_socket: config.socket.clone(),
         outbound_notify: notify.clone(),
     };
@@ -549,15 +756,46 @@ pub async fn run_worker(config: Config) -> Result<()> {
         config.node.clone(),
         config.peers,
         auth,
+        fleet,
         config.socket,
         notify,
     );
+    // A dial-out member accepts no connections.
+    let Some(address) = config.peer_listen.as_deref() else {
+        std::future::pending::<()>().await;
+        return Ok(());
+    };
     let listener = TcpListener::bind(address)
         .await
         .with_context(|| format!("bind the replication listener at {address}"))?;
     let app = peer_router(state);
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+async fn refresh_fleet_view(backend: &PeerBackend, fleet: &FleetContext) {
+    if let Ok(view) = backend.fleet_view().await {
+        *fleet.view.write().expect("fleet view lock poisoned") = view;
+    }
+}
+
+/// Reread membership on every graph change and at least every 30 seconds.
+async fn keep_fleet_view_current(
+    backend: PeerBackend,
+    fleet: FleetContext,
+    mut notify: watch::Receiver<u64>,
+) {
+    loop {
+        tokio::select! {
+            changed = notify.changed() => {
+                if changed.is_err() {
+                    return;
+                }
+            }
+            _ = tokio::time::sleep(Duration::from_secs(30)) => {}
+        }
+        refresh_fleet_view(&backend, &fleet).await;
+    }
 }
 
 fn peer_router(state: PeerState) -> Router {
@@ -576,13 +814,14 @@ async fn receive_client_read(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let sender = match state
-        .auth
-        .verify(&headers, "POST", CLIENT_READ_PATH, &body, None, None)
-    {
-        Ok(sender) if state.peers.contains(&sender) => sender,
-        _ => return (StatusCode::UNAUTHORIZED, "untrusted fleet client read").into_response(),
-    };
+    let sender =
+        match state
+            .auth
+            .verify_sender(&headers, "POST", CLIENT_READ_PATH, &body, None, None)
+        {
+            Ok(sender) if state.fleet.accept(&sender).is_ok() => sender.name,
+            _ => return (StatusCode::UNAUTHORIZED, "untrusted fleet client read").into_response(),
+        };
     let request_digest = FleetAuth::body_digest(&body);
     let result: Result<serde_json::Value> = async {
         anyhow::ensure!(
@@ -792,6 +1031,7 @@ fn start_outbound(
     node: String,
     peers: Vec<PeerConfig>,
     auth: FleetAuth,
+    fleet: FleetContext,
     main_socket: PathBuf,
     notify: watch::Sender<u64>,
 ) {
@@ -801,12 +1041,18 @@ fn start_outbound(
         let backend = backend.clone();
         let node = node.clone();
         let auth = auth.clone();
+        let fleet = fleet.clone();
         let main_socket = main_socket.clone();
         let mut notify = notify.subscribe();
         tokio::spawn(async move {
             let mut backoff = Duration::from_secs(1);
             loop {
-                match exchange(&http, &backend, &node, &peer, &auth, &main_socket).await {
+                // A removed node stops dialing; `st3 doctor` says what to do next.
+                if fleet.is_removed() {
+                    tokio::time::sleep(Duration::from_secs(60)).await;
+                    continue;
+                }
+                match exchange(&http, &backend, &node, &peer, &auth, &fleet, &main_socket).await {
                     Ok(moved) => {
                         backoff = Duration::from_secs(1);
                         // A busy harness can write several observations while one exchange is
@@ -828,6 +1074,10 @@ fn start_outbound(
                         tokio::time::sleep_until(not_before).await;
                     }
                     Err(error) => {
+                        if let Some(removed) = error.downcast_ref::<RemovedFromFleet>() {
+                            fleet.mark_removed(&peer.name, &removed.code);
+                            continue;
+                        }
                         // A peer can leave an HTTP stream open without making progress. Once
                         // that exchange times out, discard the pooled connection so the next
                         // attempt opens a fresh stream through the Fabric dial.
@@ -864,11 +1114,11 @@ async fn receive_exchange(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let relay = match state
+    let sender = match state
         .auth
-        .verify(&headers, "POST", EXCHANGE_PATH, &body, None, None)
+        .verify_sender(&headers, "POST", EXCHANGE_PATH, &body, None, None)
     {
-        Ok(relay) => relay,
+        Ok(sender) => sender,
         Err(error) => {
             return (
                 StatusCode::UNAUTHORIZED,
@@ -878,8 +1128,13 @@ async fn receive_exchange(
         }
     };
     let request_digest = FleetAuth::body_digest(&body);
+    if let Err(refusal) = state.fleet.accept(&sender) {
+        // Signed, so a removed member can trust it and stop dialing.
+        return signed_refusal(&state, &request_digest, &refusal)
+            .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
+    }
+    let relay = sender.name;
     let result = async {
-        anyhow::ensure!(state.peers.contains(&relay), "the peer is not configured");
         let request: ReplicationExchange =
             serde_json::from_slice(&body).context("decode the replication exchange")?;
         let received = state
@@ -888,6 +1143,7 @@ async fn receive_exchange(
             .await?;
         if received.changed {
             wake_main(&state.main_socket).await;
+            refresh_fleet_view(&state.backend, &state.fleet).await;
         }
         if received.receipt.received != 0 {
             state
@@ -926,6 +1182,32 @@ async fn receive_exchange(
             .unwrap_or_else(|_| (StatusCode::INTERNAL_SERVER_ERROR, message).into_response())
         }
     }
+}
+
+fn signed_refusal(state: &PeerState, request_digest: &str, refusal: &Refusal) -> Result<Response> {
+    let envelope = ApiResponse {
+        api_version: "st3.v1".into(),
+        request_id: uuid::Uuid::now_v7().to_string(),
+        snapshot_host: state.node.clone(),
+        store_index: 0,
+        value: serde_json::json!({
+            "code": refusal.code,
+            "message": refusal.message,
+            "member_key": refusal.member_key,
+        }),
+    };
+    let body = serde_json::to_vec(&envelope)?;
+    let headers =
+        state
+            .auth
+            .response_headers_for(EXCHANGE_PATH, &state.node, &body, request_digest)?;
+    let status = StatusCode::from_u16(refusal.status).unwrap_or(StatusCode::FORBIDDEN);
+    let mut response = (status, body).into_response();
+    response
+        .headers_mut()
+        .insert("content-type", HeaderValue::from_static("application/json"));
+    response.headers_mut().extend(headers);
+    Ok(response)
 }
 
 fn signed_response<T: Serialize>(
@@ -1016,6 +1298,7 @@ async fn exchange(
     node: &str,
     peer: &PeerConfig,
     auth: &FleetAuth,
+    fleet: &FleetContext,
     main_socket: &Path,
 ) -> Result<bool> {
     let first = backend
@@ -1027,7 +1310,7 @@ async fn exchange(
         envelopes: Vec::new(),
         ..first
     };
-    let remote = post_signed(http, peer, node, auth, &query).await?;
+    let remote = post_signed(http, peer, node, auth, fleet, &query).await?;
     let different = remote.inventory.digest != local_digest;
     let pulled = !remote.envelopes.is_empty();
     let received = backend
@@ -1051,7 +1334,7 @@ async fn exchange(
             .await?
             .exchange;
         pushed = !push.envelopes.is_empty();
-        let response = post_signed(http, peer, node, auth, &push).await?;
+        let response = post_signed(http, peer, node, auth, fleet, &push).await?;
         pulled_follow_up = !response.envelopes.is_empty();
         let received = backend
             .receive(&peer.name, auth.fleet_id(), &response)
@@ -1068,6 +1351,7 @@ async fn post_signed(
     peer: &PeerConfig,
     node: &str,
     auth: &FleetAuth,
+    fleet: &FleetContext,
     exchange: &ReplicationExchange,
 ) -> Result<ReplicationExchange> {
     let body = serde_json::to_vec(exchange)?;
@@ -1102,7 +1386,7 @@ async fn post_signed(
             )
         })?
         .to_vec();
-    auth.verify(
+    let responder = auth.verify_sender(
         &headers,
         "RESPONSE",
         EXCHANGE_PATH,
@@ -1110,12 +1394,36 @@ async fn post_signed(
         Some(&peer.name),
         Some(&request_digest),
     )?;
-    anyhow::ensure!(
-        status.is_success(),
-        "peer {} returned {status}: {}",
-        peer.name,
-        String::from_utf8_lossy(&bytes)
-    );
+    if let Err(refusal) = fleet.accept(&responder) {
+        anyhow::bail!(
+            "peer {} failed member authentication ({}): {}",
+            peer.name,
+            refusal.code,
+            refusal.message
+        );
+    }
+    if !status.is_success() {
+        // A signed refusal that names this node's own key ends its membership.
+        let refusal = serde_json::from_slice::<ApiResponse<serde_json::Value>>(&bytes)
+            .ok()
+            .map(|response| response.value);
+        let code = refusal
+            .as_ref()
+            .and_then(|value| value["code"].as_str())
+            .unwrap_or_default();
+        let about_us = refusal
+            .as_ref()
+            .and_then(|value| value["member_key"].as_str())
+            .is_some_and(|key| Some(key) == fleet.own_key.as_deref());
+        if matches!(code, "member-removed" | "member-left") && about_us {
+            return Err(RemovedFromFleet { code: code.into() }.into());
+        }
+        anyhow::bail!(
+            "peer {} returned {status}: {}",
+            peer.name,
+            String::from_utf8_lossy(&bytes)
+        );
+    }
     let response: ApiResponse<ReplicationExchange> =
         serde_json::from_slice(&bytes).context("decode the signed peer response")?;
     anyhow::ensure!(
@@ -1251,7 +1559,7 @@ mod tests {
             backend: PeerBackend::Main(Client::unix(&owner_socket)),
             node: "owner-node".into(),
             auth: FleetAuth::test("fleet-test", &[7; 32]),
-            peers: BTreeSet::from(["gateway-node".into()]),
+            fleet: FleetContext::legacy(BTreeSet::from(["gateway-node".into()])),
             main_socket: owner_socket.clone(),
             outbound_notify: watch::channel(0_u64).0,
         };
@@ -1386,7 +1694,7 @@ mod tests {
             backend: PeerBackend::Main(Client::unix(&socket)),
             node: "owner".into(),
             auth: auth.clone(),
-            peers: BTreeSet::from(["source".into()]),
+            fleet: FleetContext::legacy(BTreeSet::from(["source".into()])),
             main_socket: socket,
             outbound_notify: watch::channel(0_u64).0,
         };
@@ -1528,7 +1836,7 @@ mod tests {
                 backend: PeerBackend::Local(Arc::new(Store::open_memory("target").unwrap())),
                 node: "target".into(),
                 auth: auth.clone(),
-                peers: BTreeSet::from(["source".into()]),
+                fleet: FleetContext::legacy(BTreeSet::from(["source".into()])),
                 main_socket: PathBuf::from("/no/such/socket"),
                 outbound_notify: watch::channel(0_u64).0,
             }),
@@ -1558,7 +1866,7 @@ mod tests {
             backend: PeerBackend::Local(Arc::new(Store::open_memory("target").unwrap())),
             node: "target".into(),
             auth: auth.clone(),
-            peers: BTreeSet::from(["source".into()]),
+            fleet: FleetContext::legacy(BTreeSet::from(["source".into()])),
             main_socket: PathBuf::from("/no/such/socket"),
             outbound_notify: watch::channel(0_u64).0,
         };
@@ -1625,7 +1933,7 @@ mod tests {
             backend: PeerBackend::Local(target.clone()),
             node: "target".into(),
             auth: auth.clone(),
-            peers: BTreeSet::from(["source".into()]),
+            fleet: FleetContext::legacy(BTreeSet::from(["source".into()])),
             main_socket: PathBuf::from("/no/such/socket"),
             outbound_notify: watch::channel(0_u64).0,
         };
@@ -1666,6 +1974,7 @@ mod tests {
             "source",
             &peer,
             &auth,
+            &FleetContext::legacy(BTreeSet::from(["target".into()])),
             Path::new("/no/such/socket"),
         )
         .await
@@ -1694,6 +2003,7 @@ mod tests {
             "source",
             &peer,
             &auth,
+            &FleetContext::legacy(BTreeSet::from(["target".into()])),
             Path::new("/no/such/socket"),
         )
         .await
@@ -1721,6 +2031,7 @@ mod tests {
             "source",
             &peer,
             &auth,
+            &FleetContext::legacy(BTreeSet::from(["target".into()])),
             Path::new("/no/such/socket"),
         )
         .await
@@ -1851,7 +2162,7 @@ mod tests {
             backend: PeerBackend::Local(target),
             node: "target".into(),
             auth: auth.clone(),
-            peers: BTreeSet::from(["source".into()]),
+            fleet: FleetContext::legacy(BTreeSet::from(["source".into()])),
             main_socket: PathBuf::from("/no/such/socket"),
             outbound_notify,
         };
@@ -1877,5 +2188,168 @@ mod tests {
             !outbound_wake.has_changed().unwrap(),
             "a duplicate receipt must not start a replication echo loop"
         );
+    }
+
+    fn fleet_claim(store: &Store, kind: &str, subject: &str, fields: Value) {
+        store
+            .append_claim(&ClaimInput {
+                subject: subject.into(),
+                kind: kind.into(),
+                actor: None,
+                fields: serde_json::from_value(fields).unwrap(),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+    }
+
+    fn member_context(
+        store: &Store,
+        own: &MemberKey,
+        bootstrap: &[&str],
+        config_peers: &[&str],
+        legacy: bool,
+    ) -> FleetContext {
+        FleetContext {
+            view: Arc::new(std::sync::RwLock::new(store.fleet_view().unwrap())),
+            config_peers: config_peers.iter().map(|peer| (*peer).into()).collect(),
+            legacy,
+            own_key: Some(own.public().into()),
+            bootstrap_keys: bootstrap.iter().map(|key| (*key).into()).collect(),
+            removed: Arc::default(),
+            state_dir: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn members_exchange_with_signatures_and_a_removed_member_is_refused() {
+        let fleet = "3b241101-e2bb-4255-8caf-4136c566a962";
+        let secret = [9_u8; 32];
+        let anchor = Arc::new(MemberKey::generate().unwrap().0);
+        let member = Arc::new(MemberKey::generate().unwrap().0);
+        let a = Arc::new(Store::open_memory("a").unwrap());
+        let b = Arc::new(Store::open_memory("b").unwrap());
+        for (store, key) in [(&a, &anchor), (&b, &member)] {
+            store.bind_fleet(fleet).unwrap();
+            store.pin_fleet_anchor(anchor.public()).unwrap();
+            store.set_member_key(Some(key.clone())).unwrap();
+        }
+        let admitted = |name: &str, key: &MemberKey, via: &str| {
+            serde_json::json!({
+                "fleet_id": fleet, "member_key": key.public(), "via": via, "mode": "listening"
+            })
+            .as_object()
+            .map(|fields| {
+                fleet_claim(
+                    &a,
+                    "fleet.member-admitted",
+                    &format!("host/{name}"),
+                    Value::Object(fields.clone()),
+                )
+            })
+        };
+        admitted("a", &anchor, "anchor");
+        admitted("b", &member, "invite");
+
+        // a listens as a member, without legacy acceptance.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let a_fleet = member_context(&a, &anchor, &[], &[], false);
+        let state = PeerState {
+            backend: PeerBackend::Local(a.clone()),
+            node: "a".into(),
+            auth: FleetAuth::test(fleet, &secret).with_member_key(Some(anchor.clone())),
+            fleet: a_fleet.clone(),
+            main_socket: PathBuf::from("/no/such/socket"),
+            outbound_notify: watch::channel(0_u64).0,
+        };
+        let server = tokio::spawn(async move {
+            axum::serve(listener, peer_router(state)).await.unwrap();
+        });
+        let peer = PeerConfig {
+            name: "a".into(),
+            url: format!("http://{address}"),
+        };
+        let http = replication_http_client();
+        let b_auth = FleetAuth::test(fleet, &secret).with_member_key(Some(member.clone()));
+        // b knows nothing yet but its anchor, which is enough to trust a's answer.
+        let b_fleet = member_context(&b, &member, &[anchor.public()], &[], false);
+        exchange(
+            &http,
+            &PeerBackend::Local(b.clone()),
+            "b",
+            &peer,
+            &b_auth,
+            &b_fleet,
+            Path::new("/no/such/socket"),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            b.fleet_membership().unwrap().state("b"),
+            crate::fleet::MemberState::Current(_)
+        ));
+
+        // Without its member key, b is refused.
+        let unsigned = exchange(
+            &http,
+            &PeerBackend::Local(b.clone()),
+            "b",
+            &peer,
+            &FleetAuth::test(fleet, &secret),
+            &b_fleet,
+            Path::new("/no/such/socket"),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            unsigned.to_string().contains("member-signature-required"),
+            "{unsigned:#}"
+        );
+
+        // a removes b; b's next exchange gets a signed refusal that names its key.
+        fleet_claim(
+            &a,
+            "fleet.member-removed",
+            "host/b",
+            serde_json::json!({"member_key": member.public(), "high_water": 100, "reason": "test"}),
+        );
+        *a_fleet.view.write().unwrap() = a.fleet_view().unwrap();
+        *b_fleet.view.write().unwrap() = b.fleet_view().unwrap();
+        let refused = exchange(
+            &http,
+            &PeerBackend::Local(b.clone()),
+            "b",
+            &peer,
+            &b_auth,
+            &b_fleet,
+            Path::new("/no/such/socket"),
+        )
+        .await
+        .unwrap_err();
+        let removed = refused
+            .downcast_ref::<RemovedFromFleet>()
+            .expect("a signed refusal naming b's key");
+        assert_eq!(removed.code, "member-removed");
+
+        // Another machine without a key, posing as b or as an unknown name, is refused too.
+        // It accepts a's answers as a legacy config peer, so it sees a's refusal itself.
+        let stranger = FleetContext::legacy(BTreeSet::from(["a".into()]));
+        for name in ["b", "stranger"] {
+            let error = exchange(
+                &http,
+                &PeerBackend::Local(b.clone()),
+                name,
+                &peer,
+                &FleetAuth::test(fleet, &secret),
+                &stranger,
+                Path::new("/no/such/socket"),
+            )
+            .await
+            .unwrap_err();
+            assert!(error.to_string().contains("403"), "{error:#}");
+        }
+        server.abort();
     }
 }

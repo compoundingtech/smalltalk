@@ -397,6 +397,7 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
             "/v1/internal/replication/peer-failure",
             post(replication_peer_failure),
         )
+        .route("/v1/internal/fleet/membership", get(fleet_membership_view))
         .route("/v1/internal/replication-wake", post(replication_wake))
         .route("/v1/evals", post(start_eval))
         .route("/v1/evals/{*run}", get(get_eval))
@@ -3602,6 +3603,13 @@ async fn replication_peer_failure(
         signal_changed(&state);
     }
     Ok(Json(json!({ "recorded": true, "changed": changed })))
+}
+
+async fn fleet_membership_view(
+    State(state): State<AppState>,
+) -> Result<Json<crate::fleet::FleetView>, ApiError> {
+    let store = state.store.clone();
+    blocking_store(move || store.fleet_view()).await.map(Json)
 }
 
 async fn replication_wake(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {

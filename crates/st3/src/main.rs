@@ -1536,6 +1536,7 @@ async fn run(cli: Cli) -> Result<()> {
         if !args.peer.is_empty() {
             config.peers = args.peer;
         }
+        config.apply_fleet_file()?;
         return st3::peer::run_worker(config).await;
     }
     let config = Config::load_unvalidated(None)?;
@@ -1746,6 +1747,7 @@ async fn run_up(args: UpArgs) -> Result<()> {
     if !args.peer.is_empty() {
         config.peers = args.peer;
     }
+    config.apply_fleet_file()?;
     config.validate()?;
     st2::hooks::ensure_installed().context(
         "publishing this st binary's required lifecycle hook set before starting the daemon",
@@ -1757,6 +1759,18 @@ async fn run_up(args: UpArgs) -> Result<()> {
     )?);
     if let Some(fleet_id) = &config.fleet_id {
         store.bind_fleet(fleet_id)?;
+    }
+    // A member pins its anchor, applies its writer floor, and signs with its key before it
+    // writes anything, so every local batch after this point is signed.
+    if let Some(fleet) = &config.fleet {
+        if let Some(anchor) = &fleet.anchor_key {
+            store.pin_fleet_anchor(anchor)?;
+        }
+        if let Some(floor) = fleet.writer_floor {
+            store.set_writer_floor(floor)?;
+        }
+        let key = st3::fleet::MemberKey::load(&fleet.node_key_path(&config.state_dir))?;
+        store.set_member_key(Some(Arc::new(key)))?;
     }
     let admission = store.validate_replication_backlog()?;
     store.apply_replication_repairs()?;

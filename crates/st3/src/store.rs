@@ -16473,6 +16473,13 @@ impl Store {
         fleet_membership_tx(&connection)
     }
 
+    /// The membership view the replication worker uses to decide who may exchange.
+    pub fn fleet_view(&self) -> Result<crate::fleet::FleetView> {
+        Ok(crate::fleet::FleetView::from_membership(
+            &self.fleet_membership()?,
+        ))
+    }
+
     /// Sign every envelope of this node's writer that has no signature by its member key,
     /// optionally only those added after one `replica_envelopes` row.
     fn sign_own_envelopes_tx(

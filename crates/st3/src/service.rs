@@ -974,6 +974,7 @@ mod tests {
             }],
             planner: crate::model::PlannerSpec::default(),
             observations: crate::config::ObservationsConfig::default(),
+            fleet: None,
         };
         let spec = ServiceSpec::new("/usr/bin/st3", config, 1024)?;
         let unit = render_systemd_user_unit(&spec);
