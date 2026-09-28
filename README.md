@@ -22,6 +22,13 @@ With Nix, from a checkout:
 nix profile install .#st3
 ```
 
+For local development, enter `nix develop`. The shell provides Rust, sccache,
+cargo-nextest, and mold on Linux. Cargo uses mold for Linux links and the system
+linker on macOS; dev and test builds keep line tables for workspace crates and
+omit dependency debug info. Run tests with `cargo nextest run --workspace --locked`.
+Outside the Nix shell, install mold on Linux and cargo-nextest separately; the
+repository's `.cargo/config.toml` still selects mold for Linux builds.
+
 This installs `st3`, the `st` symlink, the `stui` terminal app, `st3-migrate`, and the pinned
 `pty` terminal runtime.
 
