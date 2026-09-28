@@ -5132,4 +5132,8 @@ fn terminate_child(child: &mut Child) {
 }
 
 #[cfg(test)]
+mod seat_state_tests;
+#[cfg(test)]
+mod thread_switch_tests;
+#[cfg(test)]
 mod tests;

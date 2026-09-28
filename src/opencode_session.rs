@@ -1711,6 +1711,8 @@ pub fn consumed_delivery_filenames(
 }
 
 #[cfg(test)]
+mod seat_state_tests;
+#[cfg(test)]
 mod tests {
 
     /// Pins the admitted set itself: widening opencode has to be a deliberate edit here, beside

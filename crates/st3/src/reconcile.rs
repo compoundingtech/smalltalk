@@ -9793,6 +9793,8 @@ fn now_ms() -> u128 {
 }
 
 #[cfg(test)]
+mod login_screen_tests;
+#[cfg(test)]
 mod tests {
     #[test]
     fn native_exec_and_gate_shell_resolve_the_declared_path() {
