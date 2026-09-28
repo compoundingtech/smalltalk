@@ -31,6 +31,7 @@ struct Runtime {
     execs: Mutex<HashMap<String, RuntimeObservation>>,
     failed_starts: Mutex<BTreeSet<String>>,
     failed_stops: Mutex<BTreeSet<String>>,
+    snapshot_unavailable: std::sync::atomic::AtomicBool,
     incarnations: AtomicU64,
 }
 
@@ -46,6 +47,10 @@ impl Runtime {
 
 impl RuntimeControl for Runtime {
     fn snapshot_ptys(&self) -> Result<Vec<RuntimeObservation>> {
+        anyhow::ensure!(
+            !self.snapshot_unavailable.load(Ordering::SeqCst),
+            "the PTY registry did not answer"
+        );
         Ok(self
             .execs
             .lock()
@@ -217,6 +222,16 @@ mission "worker" state="ready" {
   goal "Keep one worker running until the run is cancelled."
   concurrent-runs max=8
   agent "worker" { workspace "${ST_WORKSPACE}"; command "sleep 600"; restart "never" }
+  step "wait" {
+    assigned-to "agent/${ST_MISSION_RUN}/worker"
+    goal "Wait for cancellation."
+  }
+}
+mission "job" state="ready" {
+  goal "Run one command beside the seats."
+  concurrent-runs max=8
+  agent "worker" { workspace "${ST_WORKSPACE}"; command "sleep 600"; restart "never" }
+  exec "task" { command "sleep 600"; restart "never" }
   step "wait" {
     assigned-to "agent/${ST_MISSION_RUN}/worker"
     goal "Wait for cancellation."
@@ -997,4 +1012,101 @@ mission "review" state="ready" {
             "the second subscription's delivery did not start"
         );
     }
+}
+
+fn exec_member(host: &Host, run: &MissionRunView) -> String {
+    host.store
+        .desired_subjects_for_owner_run(&run.subject)
+        .unwrap()
+        .into_iter()
+        .filter(|desired| desired.kind == "exec")
+        .find_map(|desired| desired.member)
+        .map(|member| member.runtime_id)
+        .unwrap_or_else(|| panic!("run {} declares no exec member", run.id))
+}
+
+fn actual_status(host: &Host, subject: &str) -> Option<String> {
+    host.store
+        .latest_actual_value(subject)
+        .unwrap()
+        .and_then(|actual| {
+            actual
+                .get("fields")
+                .unwrap_or(&actual)
+                .get("status")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+}
+
+/// While the PTY registry does not answer, a terminal seat is neither started, restarted, nor
+/// judged stopped, and everything else on the host still runs.
+#[test]
+fn an_unavailable_pty_snapshot_holds_only_terminal_members() {
+    let host = Host::new();
+    let (cancelled, cancelled_worker) = running_run(&host, "cancelled");
+    let seat = host.owned(&cancelled, "agent");
+    host.runtime
+        .snapshot_unavailable
+        .store(true, Ordering::SeqCst);
+    host.cancel(&cancelled);
+    let fresh = host.start("fresh");
+    let job = host.start_mission("job", "job");
+    host.pass(8);
+    assert!(
+        host.runtime.running(&exec_member(&host, &job)),
+        "an exec member did not start while the PTY snapshot was unavailable"
+    );
+    assert_eq!(
+        actual_status(&host, &seat).as_deref(),
+        Some("running"),
+        "the cancelled seat was judged without a snapshot"
+    );
+    assert_ne!(host.state(&cancelled).1, "terminal");
+    assert!(
+        !host.runtime.running(&host.worker(&fresh)),
+        "a seat started without knowing whether it already runs"
+    );
+    host.runtime
+        .snapshot_unavailable
+        .store(false, Ordering::SeqCst);
+    host.pass(8);
+    assert!(!host.runtime.running(&cancelled_worker));
+    assert_eq!(
+        host.state(&cancelled),
+        ("cancelled".into(), "terminal".into())
+    );
+    assert!(host.runtime.running(&host.worker(&fresh)));
+}
+
+/// A PTY whose record cannot be read may still run, so its stop waits instead of recording it
+/// stopped.
+#[test]
+fn a_pty_in_an_unknown_state_is_never_recorded_stopped() {
+    let host = Host::new();
+    let (cancelled, cancelled_worker) = running_run(&host, "cancelled");
+    let seat = host.owned(&cancelled, "agent");
+    host.runtime
+        .execs
+        .lock()
+        .unwrap()
+        .get_mut(&cancelled_worker)
+        .unwrap()
+        .status = "unknown".into();
+    host.cancel(&cancelled);
+    host.pass(8);
+    assert_ne!(actual_status(&host, &seat).as_deref(), Some("stopped"));
+    assert_ne!(host.state(&cancelled).1, "terminal");
+    host.runtime
+        .execs
+        .lock()
+        .unwrap()
+        .get_mut(&cancelled_worker)
+        .unwrap()
+        .status = "running".into();
+    host.pass(8);
+    assert_eq!(
+        host.state(&cancelled),
+        ("cancelled".into(), "terminal".into())
+    );
 }
