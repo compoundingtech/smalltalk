@@ -501,6 +501,12 @@ pub fn observe_claude(writer: &mut Writer, event: &str, payload: &Value) -> Resu
 /// Claude's Stop hook has the exact native transcript path, while its event
 /// payload does not contain the assistant's answer. Publish a small recent
 /// answer window only at turn boundaries; never poll the growing transcript.
+#[derive(Deserialize, Serialize)]
+struct ClaudeTranscriptCursor {
+    session_id: String,
+    offset: u64,
+}
+
 pub fn observe_claude_stop_transcript(
     writer: &mut Writer,
     payload: &Value,
@@ -525,20 +531,39 @@ pub fn observe_claude_stop_transcript(
         "Claude Stop transcript is not the exact session beneath the native projects directory"
     );
     let mut file = fs::File::open(&transcript)?;
-    let start = file.metadata()?.len().saturating_sub(2 * 1024 * 1024);
+    let length = file.metadata()?.len();
+    let cursor_path = writer
+        .path
+        .with_file_name(".harness-timeline-claude-cursor");
+    let start = fs::read(&cursor_path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<ClaudeTranscriptCursor>(&bytes).ok())
+        .filter(|cursor| cursor.session_id == session_id && cursor.offset <= length)
+        .map(|cursor| cursor.offset)
+        .unwrap_or(0);
     file.seek(SeekFrom::Start(start))?;
     let mut reader = BufReader::new(file);
-    if start > 0 {
-        let mut partial = String::new();
-        reader.read_line(&mut partial)?;
-    }
+    let mut offset = start;
+    let mut index = 0_usize;
     let mut answers = BTreeMap::<String, (usize, String)>::new();
     let mut usage = BTreeMap::<String, (usize, Value)>::new();
     let mut turn_id = String::new();
-    for (index, line) in reader.lines().enumerate() {
-        let Ok(value) = serde_json::from_str::<Value>(&line?) else {
+    loop {
+        let mut line = String::new();
+        let bytes = reader.read_line(&mut line)?;
+        if bytes == 0 {
+            break;
+        }
+        let Ok(value) = serde_json::from_str::<Value>(&line) else {
+            // A growing transcript may end in a partial JSON line. Read it on the next Stop.
+            if !line.ends_with('\n') {
+                break;
+            }
+            offset = offset.saturating_add(bytes as u64);
             continue;
         };
+        offset = offset.saturating_add(bytes as u64);
+        index = index.saturating_add(1);
         if value["type"] == "user"
             && value
                 .get("sessionId")
@@ -598,6 +623,15 @@ pub fn observe_claude_stop_transcript(
             .join("\n");
         if !text.is_empty() {
             answers.insert(message_id.to_owned(), (index, text));
+            if answers.len() > 8 {
+                let oldest = answers
+                    .iter()
+                    .min_by_key(|(_, (at, _))| *at)
+                    .map(|(id, _)| id.clone());
+                if let Some(oldest) = oldest {
+                    answers.remove(&oldest);
+                }
+            }
         }
     }
     let mut answers = answers.into_iter().collect::<Vec<_>>();
@@ -620,6 +654,13 @@ pub fn observe_claude_stop_transcript(
             true,
         )?;
     }
+    fs::write(
+        &cursor_path,
+        serde_json::to_vec(&ClaudeTranscriptCursor {
+            session_id: session_id.into(),
+            offset,
+        })?,
+    )?;
     Ok(())
 }
 
@@ -1262,6 +1303,49 @@ mod tests {
         assert_eq!(usage[0].body["cached_tokens"], 13);
         assert_eq!(usage[0].body["total_tokens"], 36);
         assert_eq!(usage[1].body["turn_id"], "turn-b");
+    }
+
+    #[test]
+    fn claude_stop_cursor_keeps_usage_before_large_tool_output() {
+        let temporary = tempfile::tempdir().unwrap();
+        let home = temporary.path().join("home");
+        let projects = home.join(".claude/projects/workspace");
+        fs::create_dir_all(&projects).unwrap();
+        let transcript = projects.join("native-current.jsonl");
+        let lines = [
+            json!({"type":"user","uuid":"turn-a","sessionId":"native-current"}),
+            json!({"type":"assistant","sessionId":"native-current","message":{"id":"response-a","model":"claude-example","usage":{"input_tokens":2,"output_tokens":3,"cache_read_input_tokens":5}}}),
+            json!({"type":"user","uuid":"tool-a","sessionId":"native-current","message":{"content":[{"type":"tool_result","content":"x".repeat(3 * 1024 * 1024)}]}}),
+            json!({"type":"assistant","sessionId":"native-current","message":{"id":"response-b","model":"claude-example","usage":{"input_tokens":7,"output_tokens":11,"cache_read_input_tokens":13}}}),
+        ];
+        fs::write(
+            &transcript,
+            format!(
+                "{}\n",
+                lines
+                    .iter()
+                    .map(Value::to_string)
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            ),
+        )
+        .unwrap();
+        let agent = temporary.path().join("agent");
+        let mut writer = Writer::new(&agent, "claude", "inc-current");
+        let payload = json!({"session_id":"native-current","transcript_path":transcript});
+        observe_claude_stop_transcript(&mut writer, &payload, &home).unwrap();
+        observe_claude_stop_transcript(&mut writer, &payload, &home).unwrap();
+        let record = read(&timeline_path(&agent)).unwrap();
+        let usage = record
+            .operations
+            .iter()
+            .filter(|op| op.entry_type == "usage")
+            .collect::<Vec<_>>();
+        assert_eq!(usage.len(), 2);
+        assert_eq!(usage[0].body["turn_id"], "turn-a");
+        assert_eq!(usage[1].body["turn_id"], "turn-a");
+        assert_eq!(usage[0].body["total_tokens"], 10);
+        assert_eq!(usage[1].body["total_tokens"], 31);
     }
 
     #[test]
