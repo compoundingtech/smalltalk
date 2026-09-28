@@ -391,6 +391,10 @@ impl ClientRelay {
             .iter()
             .find(|peer| peer.name == name)
             .with_context(|| format!("owner `{host_id}` is not a configured peer"))?;
+        anyhow::ensure!(
+            !peer.url.is_empty(),
+            "owner `{host_id}` has no configured dial URL"
+        );
         let body = serde_json::to_vec(request)?;
         anyhow::ensure!(
             body.len() <= 16_384,
@@ -752,8 +756,10 @@ impl PeerBackend {
             }
             #[cfg(test)]
             Self::Local(store) => {
-                store.record_peer_failure(peer, status, error)?;
-                store.record_transport_observation(peer, status, Some(error), None)
+                if store.record_peer_failure(peer, status, error)? {
+                    store.record_transport_observation(peer, status, Some(error), None)?;
+                }
+                Ok(())
             }
         }
     }
@@ -858,6 +864,18 @@ pub async fn run_worker(config: Config) -> Result<()> {
     };
     let fleet_transports = fleet.transports.clone();
     let notify_for_transports = notify.clone();
+    for peer in config.peers.iter().filter(|peer| peer.url.is_empty()) {
+        let backend = backend.clone();
+        let name = peer.name.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(worker_interval(Duration::from_secs(60))).await;
+                let _ = backend
+                    .record_failure(&name, "down", "no recent inbound exchange")
+                    .await;
+            }
+        });
+    }
     start_outbound(
         backend.clone(),
         config.node.clone(),
@@ -1096,7 +1114,7 @@ fn dial_targets(
         }
         let mut routes = config_peers
             .iter()
-            .filter(|peer| peer.name == member.name)
+            .filter(|peer| peer.name == member.name && !peer.url.is_empty())
             .map(|peer| Route::Http(peer.url.clone()))
             .collect::<Vec<_>>();
         routes.extend(routes_from_endpoints(&member.endpoints, local));
@@ -1107,7 +1125,7 @@ fn dial_targets(
     for peer in config_peers {
         let known = view.members.iter().any(|member| member.name == peer.name)
             || view.legacy_removed.contains(&peer.name);
-        if !known && peer.name != own {
+        if !known && peer.name != own && !peer.url.is_empty() {
             targets.insert(peer.name.clone(), vec![Route::Http(peer.url.clone())]);
         }
     }
@@ -2632,11 +2650,34 @@ mod tests {
             .record_failure("source", "down", "test outage")
             .await
             .unwrap();
+        let still_up = store
+            .latest_claim("host/source", Some("transport.observed"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(still_up.body["fields"]["status"], "up");
+        store.age_replication_peer_for_test("source");
+        let before = store
+            .claims_for("host/source", Some("transport.observed"))
+            .unwrap()
+            .len();
+        for _ in 0..1_440 {
+            backend
+                .record_failure("source", "down", "test outage")
+                .await
+                .unwrap();
+        }
         let down = store
             .latest_claim("host/source", Some("transport.observed"))
             .unwrap()
             .unwrap();
         assert_eq!(down.body["fields"]["status"], "down");
+        assert_eq!(
+            store
+                .claims_for("host/source", Some("transport.observed"))
+                .unwrap()
+                .len(),
+            before + 1
+        );
         backend.receive("source", fleet, &exchange).await.unwrap();
         let recovered = store
             .latest_claim("host/source", Some("transport.observed"))
@@ -2644,6 +2685,139 @@ mod tests {
             .unwrap();
         assert_eq!(recovered.body["fields"]["status"], "up");
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn inbound_only_peer_syncs_both_ways_between_isolated_daemons() {
+        let fleet = "1f91ca65-7793-48cc-866e-ac15690130e1";
+        let auth = FleetAuth::test(fleet, &[8; 32]);
+        let source_dir = tempfile::tempdir().unwrap();
+        let target_dir = tempfile::tempdir().unwrap();
+        let mut servers = Vec::new();
+        let mut stores = Vec::new();
+        let mut sockets = Vec::new();
+        for (name, root) in [("source", source_dir.path()), ("target", target_dir.path())] {
+            let store = Arc::new(Store::open(&root.join("graph.db"), name).unwrap());
+            store.bind_fleet(fleet).unwrap();
+            let socket = root.join("main.sock");
+            let app = crate::api::router(crate::api::AppState {
+                store: store.clone(),
+                notify: Arc::new(tokio::sync::Notify::new()),
+                event_notify: watch::channel(0_u64).0,
+                node: name.into(),
+                state_dir: root.into(),
+                pty_root: root.join("pty"),
+                pty_binary: PathBuf::from("pty"),
+                fleet_id: Some(fleet.into()),
+                configured_peers: vec![if name == "source" { "target" } else { "source" }.into()],
+                client_relay: None,
+                native_session_home: None,
+                planner_default: crate::model::PlannerSpec::default(),
+            });
+            let served = socket.clone();
+            servers.push(tokio::spawn(async move {
+                crate::api::serve_unix(&served, app).await
+            }));
+            stores.push(store);
+            sockets.push(socket);
+        }
+        for socket in &sockets {
+            for _ in 0..100 {
+                if socket.exists() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            assert!(socket.exists());
+        }
+        let source = &stores[0];
+        let target = &stores[1];
+        source
+            .record_transport_observation("target", "up", None, None)
+            .unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let inbound = PeerConfig {
+            name: "source".into(),
+            url: String::new(),
+        };
+        assert!(
+            dial_targets(
+                &FleetView::default(),
+                "target",
+                &[inbound],
+                LocalTransports::default()
+            )
+            .is_empty()
+        );
+        let state = PeerState {
+            backend: PeerBackend::Main(Client::unix(&sockets[1])),
+            node: "target".into(),
+            auth: auth.clone(),
+            fleet: FleetContext::legacy(BTreeSet::from(["source".into()])),
+            main_socket: sockets[1].clone(),
+            outbound_notify: watch::channel(0_u64).0,
+        };
+        let peer_server =
+            tokio::spawn(async move { axum::serve(listener, peer_router(state)).await });
+        let peer = PeerConfig {
+            name: "target".into(),
+            url: format!("http://{address}"),
+        };
+        let backend = PeerBackend::Main(Client::unix(&sockets[0]));
+        let context = FleetContext::legacy(BTreeSet::from(["target".into()]));
+        let http = replication_http_client();
+        exchange(
+            &http,
+            &backend,
+            "source",
+            &peer,
+            &auth,
+            &context,
+            &sockets[0],
+        )
+        .await
+        .unwrap();
+        assert!(
+            target
+                .latest_claim("host/target", Some("transport.observed"))
+                .unwrap()
+                .is_some()
+        );
+        target
+            .record_transport_observation("source", "up", None, None)
+            .unwrap();
+        exchange(
+            &http,
+            &backend,
+            "source",
+            &peer,
+            &auth,
+            &context,
+            &sockets[0],
+        )
+        .await
+        .unwrap();
+        assert!(
+            source
+                .latest_claim("host/source", Some("transport.observed"))
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            source
+                .replication_status(true, Some(fleet), &[])
+                .unwrap()
+                .authority_digest,
+            target
+                .replication_status(true, Some(fleet), &[])
+                .unwrap()
+                .authority_digest
+        );
+        peer_server.abort();
+        for server in servers {
+            server.abort();
+        }
     }
 
     #[tokio::test]
@@ -2744,6 +2918,10 @@ mod tests {
                 config("gone", 9004),
                 config("old", 9005),
                 config("legacy", 9006),
+                PeerConfig {
+                    name: "inbound".into(),
+                    url: String::new(),
+                },
             ],
             LocalTransports::default(),
         );
