@@ -345,6 +345,29 @@ CREATE TABLE IF NOT EXISTS local_work_lease_renewals (
     lease_expires_at_unix_ms TEXT NOT NULL,
     updated_at_unix_ms TEXT NOT NULL
 );
+-- Observations of `local` retention. Rows never enter a batch, an envelope or a digest and
+-- never replicate. `after_store_index` is the newest claim when the row was written, so a
+-- row sorts after that claim and before the next one.
+CREATE TABLE IF NOT EXISTS local_observations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    after_store_index INTEGER NOT NULL,
+    subject TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    actor TEXT,
+    body TEXT NOT NULL,
+    dedupe_key TEXT,
+    request_digest TEXT,
+    observed_at_unix_ms INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS local_observations_subject_kind_index
+ON local_observations(subject, kind, id);
+CREATE INDEX IF NOT EXISTS local_observations_time_index
+ON local_observations(observed_at_unix_ms);
+CREATE UNIQUE INDEX IF NOT EXISTS local_observations_dedupe_index
+ON local_observations(dedupe_key) WHERE dedupe_key IS NOT NULL;
+CREATE INDEX IF NOT EXISTS local_observations_timeline_index
+ON local_observations(subject, json_extract(body, '$.fields.incarnation_id'), id)
+WHERE kind='harness.timeline';
 CREATE TABLE IF NOT EXISTS revision_proposals (
     id TEXT PRIMARY KEY,
     run_id TEXT NOT NULL REFERENCES mission_runs(id),
@@ -399,10 +422,23 @@ CREATE TABLE IF NOT EXISTS planning_previews (
     created_at_unix_ms TEXT NOT NULL,
     PRIMARY KEY(session_id, variant)
 );
+
+CREATE TABLE IF NOT EXISTS graph_generation (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    value INTEGER NOT NULL
+);
+INSERT OR IGNORE INTO graph_generation(id, value) VALUES (1, 0);
 PRAGMA user_version = 13;
 "#;
 
 const READ_CONNECTIONS: usize = 4;
+
+const CLAIMS_FOR_SUBJECT: &str =
+    "SELECT id, store_index, batch_id, subject, kind, origin, actor, body, predecessors, accepted_at_unix_ms
+     FROM claims WHERE subject=?1 ORDER BY store_index";
+const CLAIMS_FOR_SUBJECT_KIND: &str =
+    "SELECT id, store_index, batch_id, subject, kind, origin, actor, body, predecessors, accepted_at_unix_ms
+     FROM claims WHERE subject=?1 AND kind=?2 ORDER BY store_index";
 
 struct WriterConnection {
     connection: Mutex<Connection>,
@@ -592,7 +628,10 @@ struct ReplicationSnapshot {
     max_envelope_rowid: i64,
     inventory: CompactReplicationInventory,
     buckets: Vec<ReplicationInventoryBucket>,
+    /// The inventory digest state before each range in `buckets`.
+    digest_prefixes: Vec<Sha256>,
     authority_digest: String,
+    graph_generation: i64,
     graph_digest: String,
 }
 
@@ -643,6 +682,51 @@ impl CompactReplicationInventory {
 
     fn refresh_digest(&mut self) {
         self.digest = self.digest_of(INVENTORY_DIGEST_DOMAIN, &self.envelopes);
+    }
+
+    /// Set the inventory digest by resuming at range `from`; the value equals
+    /// `refresh_digest`. `prefixes[i]` holds the digest state before `buckets[i]`, which must
+    /// list the held identities range by range, and no range before `from` may have changed
+    /// since `prefixes` was built. Ranges are ordered by writer, so new envelopes re-hash only
+    /// their own later ranges and those of later writers.
+    fn resume_digest(
+        &mut self,
+        buckets: &[ReplicationInventoryBucket],
+        prefixes: &mut Vec<Sha256>,
+        from: usize,
+    ) {
+        let from = from.min(prefixes.len().saturating_sub(1));
+        let mut digest = match prefixes.get(from) {
+            Some(state) => state.clone(),
+            None => {
+                let mut digest = Sha256::new();
+                digest.update(INVENTORY_DIGEST_DOMAIN);
+                digest
+            }
+        };
+        prefixes.truncate(from);
+        let mut position = buckets[..from.min(buckets.len())]
+            .iter()
+            .map(|bucket| bucket.count as usize)
+            .sum::<usize>();
+        let mut buffer = [0; 64];
+        for bucket in buckets.iter().skip(from) {
+            prefixes.push(digest.clone());
+            let end = position + bucket.count as usize;
+            for envelope in &self.envelopes[position..end] {
+                update_identity_digest(
+                    &mut digest,
+                    &self.writers[envelope.writer as usize],
+                    envelope.sequence,
+                    self.hash_text(envelope, &mut buffer),
+                );
+            }
+            #[cfg(test)]
+            INVENTORY_IDENTITIES_HASHED.with(|hashed| hashed.set(hashed.get() + end - position));
+            position = end;
+        }
+        debug_assert_eq!(position, self.envelopes.len());
+        self.digest = hex::encode(digest.finalize());
     }
 
     fn compact(&mut self, writer: u32, identity: ReplicaEnvelopeId) -> CompactEnvelopeId {
@@ -1071,6 +1155,7 @@ impl Store {
         reject_old_schema(&connection)?;
         migrate_schema(&connection)?;
         connection.execute_batch(SCHEMA)?;
+        create_graph_generation_triggers(&connection)?;
         {
             let transaction = connection.transaction()?;
             rebuild_operations_tx(&transaction)?;
@@ -1109,6 +1194,7 @@ impl Store {
         reject_old_schema(&connection)?;
         migrate_schema(&connection)?;
         connection.execute_batch(SCHEMA)?;
+        create_graph_generation_triggers(&connection)?;
         {
             let transaction = connection.transaction()?;
             rebuild_operations_tx(&transaction)?;
@@ -6122,6 +6208,9 @@ impl Store {
         input: &ClaimInput,
     ) -> Result<(ClaimRecord, bool), St3Error> {
         self.validate_claim_input(input)?;
+        if local_retention(&input.kind) {
+            return self.append_local_observation(input);
+        }
         let operation = claim_operation(input)?;
         let mut connection = self.connection.lock().expect("store mutex poisoned");
         if let Some((operation_id, request_digest)) = &operation
@@ -6253,6 +6342,215 @@ impl Store {
             )
             .map_err(|error| St3Error::new(error.code, error.message))?;
         self.append_claim_outcome(input)
+    }
+
+    /// Record an observation of `local` retention on this node only. It gets no batch, no
+    /// envelope and no idempotency row, and it never replicates. A repeated idempotency key
+    /// returns the first observation. The record's ID starts with `local-observation/`.
+    fn append_local_observation(
+        &self,
+        input: &ClaimInput,
+    ) -> Result<(ClaimRecord, bool), St3Error> {
+        if input.expected_subject.is_some() {
+            return Err(St3Error::new(
+                "local-observation-head",
+                "a local observation does not take part in the subject's claim head",
+            ));
+        }
+        let body = json!({
+            "fields": &input.fields,
+            "evidence": input.evidence,
+        });
+        st3_schema::registry()
+            .validate_claim(&input.subject, &input.kind, &input.fields)
+            .map_err(|error| St3Error::new(error.code, error.message))?;
+        // A timeline entry keeps the sequence its driver gave it. A replicated claim could
+        // fall back to its unique store index, but local observations share the index of the
+        // claim they follow, so they could not order themselves.
+        if input.kind == "harness.timeline" && !input.fields.contains_key("sequence") {
+            return Err(St3Error::new(
+                "missing-claim-field",
+                "a local timeline observation needs the sequence its driver assigned",
+            ));
+        }
+        let dedupe_key = input
+            .idempotency_key
+            .as_deref()
+            .map(|key| local_observation_dedupe_key(&input.kind, key));
+        let request_digest = claim_operation(input)?.map(|(_, digest)| digest);
+        let mut connection = self.connection.lock().expect("store mutex poisoned");
+        let transaction = connection.transaction().map_err(internal)?;
+        if let Some(key) = &dedupe_key
+            && let Some((existing, stored_digest)) = transaction
+                .query_row(
+                    &format!(
+                        "SELECT id, after_store_index, subject, kind, actor, body, observed_at_unix_ms, request_digest
+                         FROM local_observations WHERE dedupe_key=?1"
+                    ),
+                    [key],
+                    |row| {
+                        Ok((
+                            local_observation_from_row(&self.origin, row)?,
+                            row.get::<_, Option<String>>(7)?,
+                        ))
+                    },
+                )
+                .optional()
+                .map_err(internal)?
+        {
+            // A retry must repeat the original request exactly, as for a claim.
+            if stored_digest != request_digest {
+                return Err(St3Error::new(
+                    "idempotency-mismatch",
+                    "the idempotency key already identifies a different request",
+                )
+                .with_detail("stored_digest", json!(stored_digest))
+                .with_detail("request_digest", json!(request_digest)));
+            }
+            return Ok((existing, false));
+        }
+        for evidence in &input.evidence {
+            let exists = transaction
+                .query_row("SELECT 1 FROM claims WHERE id=?1", [evidence], |_| Ok(()))
+                .optional()
+                .map_err(internal)?
+                .is_some();
+            if !exists {
+                return Err(St3Error::new(
+                    "missing-evidence",
+                    format!("evidence claim `{evidence}` is not stored"),
+                ));
+            }
+        }
+        let after_store_index: u64 = transaction
+            .query_row(
+                "SELECT COALESCE(MAX(store_index), 0) FROM claims",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(internal)?;
+        let observed_at = now_ms();
+        transaction
+            .execute(
+                "INSERT INTO local_observations(
+                    after_store_index, subject, kind, actor, body, dedupe_key, request_digest,
+                    observed_at_unix_ms
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    after_store_index,
+                    input.subject,
+                    input.kind,
+                    input.actor,
+                    canonical_json_text(&body).map_err(internal)?,
+                    dedupe_key,
+                    request_digest,
+                    observed_at as i64,
+                ],
+            )
+            .map_err(internal)?;
+        let id = transaction.last_insert_rowid();
+        transaction.commit().map_err(internal)?;
+        Ok((
+            ClaimRecord {
+                id: local_observation_id(&self.origin, id),
+                store_index: after_store_index,
+                batch_id: String::new(),
+                subject: input.subject.clone(),
+                kind: input.kind.clone(),
+                origin: self.origin.clone(),
+                actor: input.actor.clone(),
+                operation_id: None,
+                request_digest: None,
+                body,
+                predecessors: Vec::new(),
+                accepted_at_unix_ms: observed_at,
+            },
+            true,
+        ))
+    }
+
+    /// Local observations written after `after`, oldest first. The records carry the
+    /// `store_index` of the claim each one follows.
+    pub fn local_observations_after(&self, after: u64, limit: usize) -> Result<Vec<ClaimRecord>> {
+        let connection = self.readers.get();
+        let mut statement = connection.prepare(&format!(
+            "{LOCAL_OBSERVATION_COLUMNS} WHERE id > ?1 ORDER BY id LIMIT ?2"
+        ))?;
+        let rows = statement.query_map(
+            params![after as i64, limit.min(i64::MAX as usize) as i64],
+            |row| local_observation_from_row(&self.origin, row),
+        )?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// The first local observation that follows the claim at `store_index`, if any. Event
+    /// cursors that name only a claim resume from here.
+    pub fn local_observation_floor_after_claim(&self, store_index: u64) -> Result<u64> {
+        let connection = self.readers.get();
+        connection
+            .query_row(
+                "SELECT COALESCE(MIN(id), (SELECT COALESCE(MAX(id), 0) + 1 FROM local_observations))
+                 FROM local_observations WHERE after_store_index >= ?1",
+                [store_index],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|id| (id.max(1) - 1) as u64)
+            .map_err(Into::into)
+    }
+
+    /// The newest local observations, oldest first.
+    pub fn local_observations_tail(&self, limit: usize) -> Result<Vec<ClaimRecord>> {
+        let connection = self.readers.get();
+        let mut statement = connection.prepare(&format!(
+            "SELECT * FROM ({LOCAL_OBSERVATION_COLUMNS} ORDER BY id DESC LIMIT ?1) ORDER BY id"
+        ))?;
+        let rows = statement.query_map([limit.min(i64::MAX as usize) as i64], |row| {
+            local_observation_from_row(&self.origin, row)
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// Delete local observations older than `older_than_unix_ms`, and all but the newest
+    /// `max_per_subject_kind` of each subject and kind. The newest observation of each
+    /// subject and kind stays. Deletes run in short transactions of at most `chunk` rows, so
+    /// a crash leaves a consistent table that the next pass finishes.
+    pub fn trim_local_observations(
+        &self,
+        older_than_unix_ms: u128,
+        max_per_subject_kind: usize,
+        chunk: usize,
+    ) -> Result<usize> {
+        let chunk = chunk.max(1).min(i64::MAX as usize) as i64;
+        let max_per_subject_kind = max_per_subject_kind.max(1).min(i64::MAX as usize) as i64;
+        let mut deleted = 0;
+        loop {
+            let connection = self.connection.lock().expect("store mutex poisoned");
+            let removed = connection.execute(
+                "DELETE FROM local_observations WHERE id IN (
+                    SELECT id FROM (
+                        SELECT id, observed_at_unix_ms,
+                               ROW_NUMBER() OVER (
+                                   PARTITION BY subject, kind ORDER BY id DESC
+                               ) AS newest_rank
+                        FROM local_observations
+                    )
+                    WHERE newest_rank > 1
+                      AND (observed_at_unix_ms < ?1 OR newest_rank > ?2)
+                    ORDER BY id
+                    LIMIT ?3
+                 )",
+                params![
+                    older_than_unix_ms.min(i64::MAX as u128) as i64,
+                    max_per_subject_kind,
+                    chunk
+                ],
+            )?;
+            drop(connection);
+            deleted += removed;
+            if (removed as i64) < chunk {
+                return Ok(deleted);
+            }
+        }
     }
 
     pub fn idempotent_claim(&self, key: &str) -> Result<Option<ClaimRecord>> {
@@ -8685,11 +8983,20 @@ impl Store {
 
     pub fn claims_for(&self, subject: &str, kind: Option<&str>) -> Result<Vec<ClaimRecord>> {
         let connection = self.readers.get();
-        let query = "SELECT id, store_index, batch_id, subject, kind, origin, actor, body, predecessors, accepted_at_unix_ms
-                     FROM claims WHERE subject=?1 AND (?2 IS NULL OR kind=?2) ORDER BY store_index";
-        let mut statement = connection.prepare(query)?;
-        let rows = statement.query_map(params![subject, kind], claim_from_row)?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+        // One statement with `(?2 IS NULL OR kind=?2)` hides the kind from the planner, which then
+        // reads every claim of the subject to test it. A busy agent holds thousands of observations,
+        // and the reconciler asks for one kind of each agent's claims on every pass.
+        let rows = match kind {
+            Some(kind) => connection
+                .prepare(CLAIMS_FOR_SUBJECT_KIND)?
+                .query_map(params![subject, kind], claim_from_row)?
+                .collect::<Result<Vec<_>, _>>(),
+            None => connection
+                .prepare(CLAIMS_FOR_SUBJECT)?
+                .query_map([subject], claim_from_row)?
+                .collect::<Result<Vec<_>, _>>(),
+        };
+        rows.map_err(Into::into)
     }
 
     pub fn pending_subscription_mission_requests(&self, subject: &str) -> Result<Vec<ClaimRecord>> {
@@ -9040,7 +9347,86 @@ impl Store {
 
     /// Bounded timeline history for exactly one runtime incarnation. The
     /// expression index keeps old incarnations from consuming the page bound.
+    /// The page merges replicated timeline claims, which older builds wrote, with
+    /// this node's local timeline observations; a local observation sorts after the
+    /// claim it follows.
     pub fn timeline_claims_for_incarnation_at(
+        &self,
+        subject: &str,
+        incarnation: &str,
+        before_index: Option<u64>,
+        descending: bool,
+        limit: usize,
+    ) -> Result<ClaimsPage> {
+        let claims = self.timeline_claim_rows_for_incarnation_at(
+            subject,
+            incarnation,
+            before_index,
+            descending,
+            limit,
+        )?;
+        let local = {
+            let connection = self.readers.get();
+            let order = if descending { "DESC" } else { "ASC" };
+            let mut statement = connection.prepare(&format!(
+                "{LOCAL_OBSERVATION_COLUMNS}
+                 WHERE subject=?1 AND kind='harness.timeline'
+                   AND json_extract(body, '$.fields.incarnation_id')=?2
+                   AND (?3 IS NULL OR after_store_index<?3)
+                 ORDER BY id {order} LIMIT ?4"
+            ))?;
+            let rows = statement.query_map(
+                params![
+                    subject,
+                    incarnation,
+                    before_index,
+                    limit.saturating_add(1) as u64
+                ],
+                |row| local_observation_from_row(&self.origin, row),
+            )?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let mut merged = claims.claims;
+        merged.extend(local);
+        merged.sort_by_key(claim_log_order);
+        if descending {
+            merged.reverse();
+        }
+        let more = claims.next_cursor.is_some() || merged.len() > limit;
+        merged.truncate(limit);
+        let next_cursor = more
+            .then(|| merged.last().map(|claim| claim.store_index))
+            .flatten();
+        Ok(ClaimsPage {
+            claims: merged,
+            next_cursor,
+        })
+    }
+
+    /// The newest local timeline observation for one incarnation at or before a snapshot.
+    pub fn latest_local_timeline_at(
+        &self,
+        subject: &str,
+        incarnation: &str,
+        snapshot_index: u64,
+    ) -> Result<Option<u128>> {
+        let connection = self.readers.get();
+        connection
+            .query_row(
+                "SELECT observed_at_unix_ms FROM local_observations
+                 WHERE subject=?1 AND kind='harness.timeline'
+                   AND json_extract(body, '$.fields.incarnation_id')=?2
+                   AND after_store_index<=?3
+                 ORDER BY id DESC LIMIT 1",
+                params![subject, incarnation, snapshot_index],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map(|value| value.map(|value| value.max(0) as u128))
+            .map_err(Into::into)
+    }
+
+    fn timeline_claim_rows_for_incarnation_at(
         &self,
         subject: &str,
         incarnation: &str,
@@ -9432,6 +9818,13 @@ impl Store {
             .lock()
             .expect("replication snapshot mutex poisoned")
             .take();
+        // Harness observations, timelines, usage and lease renewals change none of the digested
+        // tables, so their writes leave the generation, and the graph digest, unchanged.
+        let graph_generation = graph_generation(&connection)?;
+        let reusable_graph_digest = previous
+            .as_ref()
+            .filter(|previous| previous.graph_generation == graph_generation)
+            .map(|previous| previous.graph_digest.clone());
         let envelope_count: usize =
             connection.query_row("SELECT COUNT(*) FROM replica_envelopes", [], |row| {
                 row.get(0)
@@ -9439,74 +9832,103 @@ impl Store {
         let full = |connection: &Connection| -> Result<_> {
             let (inventory, max_rowid) = full_compact_replication_inventory(connection)?;
             let buckets = inventory.buckets();
-            Ok((inventory, max_rowid, buckets))
+            Ok((inventory, max_rowid, buckets, Vec::new(), 0))
         };
-        let (inventory, max_envelope_rowid, buckets) = if let Some(previous) = previous {
-            let mut statement = connection.prepare(
-                "SELECT rowid, writer, sequence, envelope_hash FROM replica_envelopes
-                 WHERE rowid>?1 ORDER BY rowid",
-            )?;
-            let additions = statement
-                .query_map([previous.max_envelope_rowid], |row| {
-                    Ok((
-                        row.get::<_, i64>(0)?,
-                        ReplicaEnvelopeId {
-                            writer: row.get(1)?,
-                            sequence: row.get(2)?,
-                            hash: row.get(3)?,
-                        },
-                    ))
-                })?
-                .collect::<Result<Vec<_>, _>>()?;
-            if envelope_count == previous.inventory.envelopes.len() + additions.len() {
-                let mut max_rowid = previous.max_envelope_rowid;
-                // Most snapshots are owned only by this cache. Move their inventory
-                // into the successor so a graph write does not allocate and free
-                // every envelope ID. Keep the old snapshot intact for concurrent
-                // callers that still hold it.
-                let (mut inventory, mut buckets) = match Arc::try_unwrap(previous) {
-                    Ok(snapshot) => (snapshot.inventory, snapshot.buckets),
-                    Err(shared) => (shared.inventory.clone(), shared.buckets.clone()),
-                };
-                let mut touched = BTreeSet::new();
-                for (rowid, identity) in additions {
-                    max_rowid = max_rowid.max(rowid);
-                    touched.insert((
-                        identity.writer.clone(),
-                        replication_bucket_start(identity.sequence),
-                    ));
-                    inventory.insert(identity);
-                }
-                // Only the ranges that gained an envelope need a new digest.
-                for (writer, start) in touched {
-                    let bucket = inventory.bucket(inventory.range(&writer, start));
-                    match buckets.binary_search_by(|existing| {
-                        (existing.writer.as_str(), existing.start).cmp(&(writer.as_str(), start))
-                    }) {
-                        Ok(position) => buckets[position] = bucket,
-                        Err(position) => buckets.insert(position, bucket),
+        let (mut inventory, max_envelope_rowid, buckets, mut digest_prefixes, resume_from) =
+            if let Some(previous) = previous {
+                let mut statement = connection.prepare(
+                    "SELECT rowid, writer, sequence, envelope_hash FROM replica_envelopes
+                     WHERE rowid>?1 ORDER BY rowid",
+                )?;
+                let additions = statement
+                    .query_map([previous.max_envelope_rowid], |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            ReplicaEnvelopeId {
+                                writer: row.get(1)?,
+                                sequence: row.get(2)?,
+                                hash: row.get(3)?,
+                            },
+                        ))
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?;
+                if envelope_count == previous.inventory.envelopes.len() + additions.len() {
+                    let mut max_rowid = previous.max_envelope_rowid;
+                    // Most snapshots are owned only by this cache. Move their inventory
+                    // into the successor so a graph write does not allocate and free
+                    // every envelope ID. Keep the old snapshot intact for concurrent
+                    // callers that still hold it.
+                    let (mut inventory, mut buckets, digest_prefixes) =
+                        match Arc::try_unwrap(previous) {
+                            Ok(snapshot) => (
+                                snapshot.inventory,
+                                snapshot.buckets,
+                                snapshot.digest_prefixes,
+                            ),
+                            Err(shared) => (
+                                shared.inventory.clone(),
+                                shared.buckets.clone(),
+                                shared.digest_prefixes.clone(),
+                            ),
+                        };
+                    let mut touched = BTreeSet::new();
+                    for (rowid, identity) in additions {
+                        max_rowid = max_rowid.max(rowid);
+                        touched.insert((
+                            identity.writer.clone(),
+                            replication_bucket_start(identity.sequence),
+                        ));
+                        inventory.insert(identity);
                     }
+                    // Only the ranges that gained an envelope need a new digest.
+                    for (writer, start) in &touched {
+                        let bucket = inventory.bucket(inventory.range(writer, *start));
+                        match buckets.binary_search_by(|existing| {
+                            (existing.writer.as_str(), existing.start)
+                                .cmp(&(writer.as_str(), *start))
+                        }) {
+                            Ok(position) => buckets[position] = bucket,
+                            Err(position) => buckets.insert(position, bucket),
+                        }
+                    }
+                    // Every range before the first one that gained an envelope is unchanged, so
+                    // the inventory digest resumes there instead of hashing every identity again.
+                    let resume_from = touched
+                        .iter()
+                        .map(|(writer, start)| {
+                            buckets.partition_point(|existing| {
+                                (existing.writer.as_str(), existing.start)
+                                    < (writer.as_str(), *start)
+                            })
+                        })
+                        .min()
+                        .unwrap_or(buckets.len());
+                    (inventory, max_rowid, buckets, digest_prefixes, resume_from)
+                } else {
+                    full(&connection)?
                 }
-                inventory.refresh_digest();
-                (inventory, max_rowid, buckets)
             } else {
                 full(&connection)?
-            }
-        } else {
-            full(&connection)?
-        };
+            };
+        inventory.resume_digest(&buckets, &mut digest_prefixes, resume_from);
         // Envelope hashes already commit the complete payload (and chain metadata). The
         // inventory digest therefore commits the authority log without hex-encoding and hashing
         // every payload again on each graph change.
         let authority_digest = inventory.digest.clone();
+        let graph_digest = match reusable_graph_digest {
+            Some(digest) => digest,
+            None => graph_digest(&connection)?,
+        };
         let snapshot = Arc::new(ReplicationSnapshot {
             store_index: current_index(&connection)?,
             replica_generation: self.replica_generation.load(Ordering::Acquire),
             max_envelope_rowid,
             inventory,
             buckets,
+            digest_prefixes,
             authority_digest,
-            graph_digest: graph_digest(&connection)?,
+            graph_generation,
+            graph_digest,
         });
         *self
             .replication_snapshot
@@ -10192,7 +10614,7 @@ impl Store {
             configured,
             fleet_id: fleet_id.map(str::to_owned),
             authority_digest: snapshot.authority_digest.clone(),
-            graph_digest: graph_digest(&connection)?,
+            graph_digest: snapshot.graph_digest.clone(),
             received_envelopes: connection.query_row(
                 "SELECT COUNT(*) FROM replica_envelopes",
                 [],
@@ -12457,6 +12879,77 @@ fn latest_resource_kind(
 
 fn registered_client_claim_kind(kind: &str) -> bool {
     st3_schema::is_known_claim(kind)
+}
+
+const LOCAL_OBSERVATION_COLUMNS: &str = "SELECT id, after_store_index, subject, kind, actor, body, observed_at_unix_ms FROM local_observations";
+
+const LOCAL_OBSERVATION_ID_PREFIX: &str = "local-observation/";
+
+fn local_retention(kind: &str) -> bool {
+    st3_schema::registry()
+        .claim(kind)
+        .is_some_and(|spec| spec.retention == st3_schema::Retention::Local)
+}
+
+fn local_observation_id(origin: &str, id: i64) -> String {
+    format!("{LOCAL_OBSERVATION_ID_PREFIX}{origin}/{id}")
+}
+
+/// The local log position of a record that `append_local_observation` or a local
+/// observation read produced; `None` for a claim.
+pub fn local_observation_position(record: &ClaimRecord) -> Option<u64> {
+    record
+        .id
+        .strip_prefix(LOCAL_OBSERVATION_ID_PREFIX)?
+        .rsplit_once('/')?
+        .1
+        .parse()
+        .ok()
+}
+
+/// Claims in store order, each local observation after the claim it follows.
+pub fn claim_log_order(record: &ClaimRecord) -> (u64, u64) {
+    (
+        record.store_index,
+        local_observation_position(record).unwrap_or(0),
+    )
+}
+
+fn local_observation_dedupe_key(kind: &str, key: &str) -> String {
+    format!(
+        "local/{}",
+        hex::encode(Sha256::digest(
+            [
+                b"st3.local-observation.v1\0".as_slice(),
+                kind.as_bytes(),
+                b"\0",
+                key.as_bytes()
+            ]
+            .concat()
+        ))
+    )
+}
+
+fn local_observation_from_row(
+    origin: &str,
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<ClaimRecord> {
+    let id: i64 = row.get(0)?;
+    let body: String = row.get(5)?;
+    Ok(ClaimRecord {
+        id: local_observation_id(origin, id),
+        store_index: row.get(1)?,
+        batch_id: String::new(),
+        subject: row.get(2)?,
+        kind: row.get(3)?,
+        origin: origin.to_owned(),
+        actor: row.get(4)?,
+        operation_id: None,
+        request_digest: None,
+        body: serde_json::from_str(&body).unwrap_or(Value::Null),
+        predecessors: Vec::new(),
+        accepted_at_unix_ms: row.get::<_, i64>(6)?.max(0) as u128,
+    })
 }
 
 fn opaque_cache_key(key: &str) -> String {
@@ -15989,41 +16482,135 @@ fn update_identity_digest(digest: &mut Sha256, writer: &str, sequence: u64, hash
     }
 }
 
-fn graph_digest(connection: &Connection) -> Result<String> {
-    digest_queries(
-        connection,
+#[cfg(test)]
+thread_local! {
+    static INVENTORY_IDENTITIES_HASHED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static GRAPH_DIGESTS_COMPUTED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// The projected tables the graph digest commits: digest label, table, digested columns in
+/// order, and row order. Triggers built from the same list bump `graph_generation` whenever one
+/// of these columns changes.
+const GRAPH_DIGEST_TABLES: [(&str, &str, &[&str], &str); 6] = [
+    (
+        "desired",
+        "desired",
         &[
-            (
-                "desired",
-                "SELECT json_array(subject, kind, revision, claim_id, body, member, owner_run, owner_generation, owner_step)
-                 FROM desired ORDER BY subject",
-            ),
-            (
-                "missions",
-                "SELECT json_array(mission_id, revision, state, claim_id)
-                 FROM mission_definitions ORDER BY mission_id",
-            ),
-            (
-                "runs",
-                "SELECT json_array(id, mission_id, current_generation_id, status, phase)
-                 FROM mission_runs ORDER BY id",
-            ),
-            (
-                "generations",
-                "SELECT json_array(id, run_id, revision, predecessor_id, status)
-                 FROM run_generations ORDER BY id",
-            ),
-            (
-                "steps",
-                "SELECT json_array(subject, generation_id, step_path, status, attempt, lease_owner, blocked_reason)
-                 FROM step_runs ORDER BY subject",
-            ),
-            (
-                "proposals",
-                "SELECT json_array(id, run_id, source_generation_id, candidate_revision, status, approvals, successor_generation_id)
-                 FROM revision_proposals ORDER BY id",
-            ),
+            "subject",
+            "kind",
+            "revision",
+            "claim_id",
+            "body",
+            "member",
+            "owner_run",
+            "owner_generation",
+            "owner_step",
         ],
+        "subject",
+    ),
+    (
+        "missions",
+        "mission_definitions",
+        &["mission_id", "revision", "state", "claim_id"],
+        "mission_id",
+    ),
+    (
+        "runs",
+        "mission_runs",
+        &[
+            "id",
+            "mission_id",
+            "current_generation_id",
+            "status",
+            "phase",
+        ],
+        "id",
+    ),
+    (
+        "generations",
+        "run_generations",
+        &["id", "run_id", "revision", "predecessor_id", "status"],
+        "id",
+    ),
+    (
+        "steps",
+        "step_runs",
+        &[
+            "subject",
+            "generation_id",
+            "step_path",
+            "status",
+            "attempt",
+            "lease_owner",
+            "blocked_reason",
+        ],
+        "subject",
+    ),
+    (
+        "proposals",
+        "revision_proposals",
+        &[
+            "id",
+            "run_id",
+            "source_generation_id",
+            "candidate_revision",
+            "status",
+            "approvals",
+            "successor_generation_id",
+        ],
+        "id",
+    ),
+];
+
+fn graph_digest(connection: &Connection) -> Result<String> {
+    #[cfg(test)]
+    GRAPH_DIGESTS_COMPUTED.with(|computed| computed.set(computed.get() + 1));
+    let queries = GRAPH_DIGEST_TABLES
+        .iter()
+        .map(|(label, table, columns, order)| {
+            (
+                *label,
+                format!(
+                    "SELECT json_array({}) FROM {table} ORDER BY {order}",
+                    columns.join(", ")
+                ),
+            )
+        })
+        .collect::<Vec<_>>();
+    let queries = queries
+        .iter()
+        .map(|(label, query)| (*label, query.as_str()))
+        .collect::<Vec<_>>();
+    digest_queries(connection, &queries)
+}
+
+/// Bump `graph_generation` in the same transaction as any change to a digested column, so a
+/// replication snapshot can reuse the graph digest across writes that change none of them.
+fn create_graph_generation_triggers(connection: &Connection) -> Result<()> {
+    for (_, table, columns, _) in GRAPH_DIGEST_TABLES {
+        let changed = columns
+            .iter()
+            .map(|column| format!("OLD.{column} IS NOT NEW.{column}"))
+            .collect::<Vec<_>>()
+            .join(" OR ");
+        connection.execute_batch(&format!(
+            "CREATE TRIGGER IF NOT EXISTS {table}_graph_insert AFTER INSERT ON {table}
+             BEGIN UPDATE graph_generation SET value=value+1 WHERE id=1; END;
+             CREATE TRIGGER IF NOT EXISTS {table}_graph_update AFTER UPDATE ON {table}
+             WHEN {changed}
+             BEGIN UPDATE graph_generation SET value=value+1 WHERE id=1; END;
+             CREATE TRIGGER IF NOT EXISTS {table}_graph_delete AFTER DELETE ON {table}
+             BEGIN UPDATE graph_generation SET value=value+1 WHERE id=1; END;"
+        ))?;
+    }
+    Ok(())
+}
+
+fn graph_generation(connection: &Connection) -> Result<i64> {
+    Ok(
+        connection.query_row("SELECT value FROM graph_generation WHERE id=1", [], |row| {
+            row.get(0)
+        })?,
     )
 }
 
@@ -26444,6 +27031,64 @@ version 2
     }
 
     #[test]
+    fn claims_of_one_kind_use_the_subject_kind_index() {
+        let store = Store::open_memory("node").unwrap();
+        let connection = store.connection.lock().unwrap();
+        let mut statement = connection
+            .prepare(&format!("EXPLAIN QUERY PLAN {CLAIMS_FOR_SUBJECT_KIND}"))
+            .unwrap();
+        let plan = statement
+            .query_map(params!["agent/example", "harness.diagnostic"], |row| {
+                row.get::<_, String>(3)
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+            .join("\n");
+        assert!(
+            plan.contains("claims_subject_kind_index (subject=? AND kind=?)"),
+            "one kind of a subject's claims must not read every claim of the subject:\n{plan}"
+        );
+        drop(statement);
+        drop(connection);
+
+        let mut connection = store.connection.lock().unwrap();
+        let transaction = connection.transaction().unwrap();
+        for (kind, fields) in (0..20)
+            .map(|sequence| {
+                (
+                    "harness.observed",
+                    json!({"state": "working", "observed_at_ms": sequence}),
+                )
+            })
+            .chain([(
+                "harness.diagnostic",
+                json!({"code": "provider-capacity", "status": "waiting"}),
+            )])
+        {
+            append_claim_tx(
+                &transaction,
+                &store.origin,
+                "agent/example",
+                kind,
+                None,
+                &json!({ "fields": fields }),
+                &[],
+                None,
+            )
+            .unwrap();
+        }
+        transaction.commit().unwrap();
+        drop(connection);
+        let diagnostics = store
+            .claims_for("agent/example", Some("harness.diagnostic"))
+            .unwrap();
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].kind, "harness.diagnostic");
+        assert_eq!(store.claims_for("agent/example", None).unwrap().len(), 21);
+    }
+
+    #[test]
     fn owned_subject_queries_look_owners_up_by_primary_key() {
         let store = Store::open_memory("node").unwrap();
         let connection = store.connection.lock().unwrap();
@@ -26523,6 +27168,167 @@ version 2
             batch_claims.contains("claims_batch_index"),
             "the inventory seed query must use the claim batch index:\n{batch_claims}"
         );
+    }
+
+    fn observe_harness(store: &Store, observed_at_ms: u64) {
+        store
+            .append_claim(&ClaimInput {
+                subject: "agent/example".into(),
+                kind: "harness.observed".into(),
+                actor: Some("agent/example".into()),
+                fields: BTreeMap::from([
+                    ("state".into(), json!("working")),
+                    ("observed_at_ms".into(), json!(observed_at_ms)),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn a_local_write_rehashes_only_its_own_inventory_range() {
+        let store = Store::open_memory("hetz").unwrap();
+        for observed_at_ms in 0..600 {
+            observe_harness(&store, observed_at_ms);
+        }
+        let before = store.replication_snapshot().unwrap();
+        assert!(before.inventory.envelopes.len() >= 600);
+        INVENTORY_IDENTITIES_HASHED.with(|hashed| hashed.set(0));
+
+        observe_harness(&store, 600);
+        let after = store.replication_snapshot().unwrap();
+        let hashed = INVENTORY_IDENTITIES_HASHED.with(std::cell::Cell::get);
+        assert!(
+            hashed <= REPLICATION_BUCKET_WIDTH as usize,
+            "one new envelope re-hashed {hashed} of {} identities",
+            after.inventory.envelopes.len()
+        );
+        let public = after.inventory.public();
+        assert_eq!(
+            after.inventory.digest,
+            replication_inventory_digest(&public.envelopes)
+        );
+        let connection = store.connection.lock().unwrap();
+        let (full, _) = full_compact_replication_inventory(&connection).unwrap();
+        assert_eq!(public.envelopes, full.public().envelopes);
+        assert_eq!(after.inventory.digest, full.digest);
+    }
+
+    proptest! {
+        #[test]
+        fn a_resumed_inventory_digest_matches_a_full_pass(
+            initial in proptest::collection::vec((0usize..3, 1u64..2000), 0..300),
+            rounds in proptest::collection::vec(
+                proptest::collection::vec((0usize..3, 1u64..2000), 1..20),
+                1..6,
+            ),
+        ) {
+            let writers = ["Silber", "fleet-node", "hetz"];
+            // Some hashes are not SHA-256 hex, so the digest also covers verbatim hashes.
+            let identity = |(writer, sequence): (usize, u64)| ReplicaEnvelopeId {
+                writer: writers[writer].into(),
+                sequence,
+                hash: if sequence % 7 == 0 {
+                    format!("irregular-{sequence}")
+                } else {
+                    format!("{sequence:064x}")
+                },
+            };
+            let mut all = initial.into_iter().map(identity).collect::<BTreeSet<_>>();
+            let mut inventory = CompactReplicationInventory::from_sorted(all.iter().cloned());
+            let mut buckets = inventory.buckets();
+            let mut prefixes = Vec::new();
+            inventory.resume_digest(&buckets, &mut prefixes, 0);
+            prop_assert_eq!(
+                &inventory.digest,
+                &replication_inventory_digest(&all.iter().cloned().collect::<Vec<_>>())
+            );
+            for round in rounds {
+                let before = buckets.clone();
+                for identity in round.into_iter().map(identity) {
+                    if all.insert(identity.clone()) {
+                        inventory.insert(identity);
+                    }
+                }
+                buckets = inventory.buckets();
+                let resume_from = buckets
+                    .iter()
+                    .zip(&before)
+                    .position(|(after, before)| after != before)
+                    .unwrap_or(before.len().min(buckets.len()));
+                inventory.resume_digest(&buckets, &mut prefixes, resume_from);
+                prop_assert_eq!(
+                    &inventory.digest,
+                    &replication_inventory_digest(&all.iter().cloned().collect::<Vec<_>>())
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn replication_reuses_the_graph_digest_until_a_digested_column_changes() {
+        let store = Store::open_memory("hetz").unwrap();
+        observe_harness(&store, 0);
+        let first = store.replication_snapshot().unwrap();
+        GRAPH_DIGESTS_COMPUTED.with(|computed| computed.set(0));
+        observe_harness(&store, 1);
+        let second = store.replication_snapshot().unwrap();
+        assert_ne!(first.store_index, second.store_index);
+        assert_eq!(
+            GRAPH_DIGESTS_COMPUTED.with(std::cell::Cell::get),
+            0,
+            "a harness observation must not recompute the graph digest"
+        );
+        assert_eq!(second.graph_digest, first.graph_digest);
+
+        let generation =
+            |store: &Store| graph_generation(&store.connection.lock().unwrap()).unwrap();
+        let execute = |store: &Store, sql: &str| {
+            store.connection.lock().unwrap().execute(sql, []).unwrap();
+        };
+        let before = generation(&store);
+        execute(
+            &store,
+            "INSERT INTO mission_runs(id, mission_id, initial_revision, current_generation_id,
+                 root_revision, root_run_id, workspace, requester, inputs, mode, status, phase,
+                 created_at_unix_ms, updated_at_unix_ms)
+             VALUES ('run-example', 'mission/example', 'revision', 'generation', 'revision',
+                 'run-example', '/tmp/example', 'person/example', '{}', 'normal', 'running',
+                 'normal', '1', '1')",
+        );
+        assert_eq!(generation(&store), before + 1);
+        execute(
+            &store,
+            "UPDATE mission_runs SET updated_at_unix_ms='2' WHERE id='run-example'",
+        );
+        assert_eq!(
+            generation(&store),
+            before + 1,
+            "an undigested column must not change the generation"
+        );
+        execute(
+            &store,
+            "UPDATE mission_runs SET status='running' WHERE id='run-example'",
+        );
+        assert_eq!(generation(&store), before + 1);
+        execute(
+            &store,
+            "UPDATE mission_runs SET status='completed' WHERE id='run-example'",
+        );
+        assert_eq!(generation(&store), before + 2);
+
+        observe_harness(&store, 2);
+        let third = store.replication_snapshot().unwrap();
+        assert_eq!(GRAPH_DIGESTS_COMPUTED.with(std::cell::Cell::get), 1);
+        assert_ne!(third.graph_digest, first.graph_digest);
+        assert_eq!(
+            third.graph_digest,
+            graph_digest(&store.connection.lock().unwrap()).unwrap()
+        );
+        execute(&store, "DELETE FROM mission_runs WHERE id='run-example'");
+        assert_eq!(generation(&store), before + 3);
     }
 
     #[test]
@@ -28070,6 +28876,317 @@ mission "nested-work" state="ready" {
         assert_eq!(
             reopened.claims_for(subject, Some("work.renewed")).unwrap()[0].body["fields"]["summary"],
             "Made progress on the review"
+        );
+    }
+
+    fn timeline_observation(subject: &str, incarnation: &str, entry: &str) -> ClaimInput {
+        ClaimInput {
+            subject: subject.into(),
+            kind: "harness.timeline".into(),
+            actor: Some(subject.into()),
+            fields: BTreeMap::from([
+                ("operation".into(), Value::String("append".into())),
+                ("entry_id".into(), Value::String(entry.into())),
+                ("revision".into(), Value::from(1)),
+                ("role".into(), Value::String("assistant".into())),
+                ("entry_type".into(), Value::String("content".into())),
+                ("final".into(), Value::Bool(true)),
+                (
+                    "body".into(),
+                    json!({"media_type": "text/plain", "text": entry}),
+                ),
+                ("driver".into(), Value::String("codex".into())),
+                ("incarnation_id".into(), Value::String(incarnation.into())),
+                ("sequence".into(), Value::from(entry.len() as u64)),
+            ]),
+            evidence: Vec::new(),
+            expected_subject: None,
+            idempotency_key: Some(format!("timeline:{subject}:{incarnation}:{entry}")),
+        }
+    }
+
+    fn timeline_entries(page: &ClaimsPage) -> Vec<String> {
+        page.claims
+            .iter()
+            .map(|claim| {
+                claim.body["fields"]["entry_id"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_local_timeline_observation_stays_on_the_node_that_made_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("local.sqlite3");
+        let store = Store::open(&path, "node").unwrap();
+        let subject = "agent/node.worker";
+        let index_before = store.index().unwrap();
+        let inventory_before = store.replication_inventory().unwrap();
+
+        let mut written = Vec::new();
+        for entry in ["first", "second", "third"] {
+            let (record, appended) = store
+                .append_claim_outcome(&timeline_observation(subject, "inc-1", entry))
+                .unwrap();
+            assert!(appended);
+            assert!(
+                record.id.starts_with("local-observation/node/"),
+                "{}",
+                record.id
+            );
+            assert_eq!(record.store_index, index_before);
+            written.push(record);
+        }
+        let (repeated, appended) = store
+            .append_claim_outcome(&timeline_observation(subject, "inc-1", "second"))
+            .unwrap();
+        assert!(!appended, "a repeated idempotency key records nothing new");
+        assert_eq!(repeated.id, written[1].id);
+        let mut changed = timeline_observation(subject, "inc-1", "second");
+        changed.fields.insert(
+            "body".into(),
+            json!({"media_type": "text/plain", "text": "a different body"}),
+        );
+        assert_eq!(
+            store.append_claim_outcome(&changed).unwrap_err().code,
+            "idempotency-mismatch",
+            "a retry with a changed body is not silently dropped"
+        );
+        let mut elsewhere = timeline_observation("agent/node.other", "inc-1", "second");
+        elsewhere.idempotency_key =
+            timeline_observation(subject, "inc-1", "second").idempotency_key;
+        assert_eq!(
+            store.append_claim_outcome(&elsewhere).unwrap_err().code,
+            "idempotency-mismatch",
+            "a key reused for another subject does not return the first subject's row"
+        );
+        let mut unkeyed = timeline_observation(subject, "inc-1", "second");
+        unkeyed.idempotency_key = None;
+        assert!(
+            store.append_claim_outcome(&unkeyed).unwrap().1,
+            "an observation without a key is always new"
+        );
+
+        assert_eq!(store.index().unwrap(), index_before, "no claim was written");
+        assert!(
+            store
+                .claims_for(subject, Some("harness.timeline"))
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            store.replication_inventory().unwrap().envelopes,
+            inventory_before.envelopes,
+            "a local observation adds no envelope"
+        );
+        let page = store
+            .timeline_claims_for_incarnation_at(subject, "inc-1", None, false, 10)
+            .unwrap();
+        assert_eq!(
+            timeline_entries(&page),
+            ["first", "second", "third", "second"]
+        );
+        assert_eq!(page.next_cursor, None);
+
+        let replica = Store::open_memory("replica").unwrap();
+        let exchange = exchange_from(&store, &ReplicationInventory::default());
+        receive_and_project(&replica, "node", &exchange);
+        assert!(
+            replica
+                .timeline_claims_for_incarnation_at(subject, "inc-1", None, false, 10)
+                .unwrap()
+                .claims
+                .is_empty(),
+            "a peer never receives a local observation"
+        );
+
+        drop(store);
+        let reopened = Store::open(&path, "node").unwrap();
+        let page = reopened
+            .timeline_claims_for_incarnation_at(subject, "inc-1", None, false, 10)
+            .unwrap();
+        assert_eq!(
+            timeline_entries(&page),
+            ["first", "second", "third", "second"]
+        );
+        let mut with_head = timeline_observation(subject, "inc-1", "fourth");
+        with_head.expected_subject = Some(None);
+        assert_eq!(
+            reopened.append_claim_outcome(&with_head).unwrap_err().code,
+            "local-observation-head"
+        );
+        let mut missing = timeline_observation(subject, "inc-1", "fifth");
+        missing.fields.remove("incarnation_id");
+        assert_eq!(
+            reopened.append_claim_outcome(&missing).unwrap_err().code,
+            "missing-claim-field"
+        );
+        let mut unnumbered = timeline_observation(subject, "inc-1", "sixth");
+        unnumbered.fields.remove("sequence");
+        assert_eq!(
+            reopened.append_claim_outcome(&unnumbered).unwrap_err().code,
+            "missing-claim-field"
+        );
+    }
+
+    #[test]
+    fn a_timeline_page_merges_claims_from_older_builds_with_local_observations() {
+        let store = Store::open_memory("node").unwrap();
+        let subject = "agent/node.worker";
+        // An older build wrote timeline entries as replicated claims.
+        let legacy = |entry: &str| {
+            let input = timeline_observation(subject, "inc-1", entry);
+            let mut connection = store.connection.lock().unwrap();
+            let transaction = connection.transaction().unwrap();
+            append_claim_tx(
+                &transaction,
+                "older-node",
+                subject,
+                "harness.timeline",
+                Some(subject),
+                &json!({ "fields": input.fields, "evidence": [] }),
+                &[],
+                None,
+            )
+            .unwrap();
+            transaction.commit().unwrap();
+        };
+        legacy("legacy-1");
+        legacy("legacy-2");
+        store
+            .append_claim(&timeline_observation(subject, "inc-1", "local-1"))
+            .unwrap();
+        store
+            .append_claim(&timeline_observation(subject, "inc-2", "other-incarnation"))
+            .unwrap();
+        legacy("legacy-3");
+        store
+            .append_claim(&timeline_observation(subject, "inc-1", "local-2"))
+            .unwrap();
+        store
+            .append_claim(&timeline_observation(subject, "inc-1", "local-3"))
+            .unwrap();
+
+        let ascending = store
+            .timeline_claims_for_incarnation_at(subject, "inc-1", None, false, 10)
+            .unwrap();
+        assert_eq!(
+            timeline_entries(&ascending),
+            [
+                "legacy-1", "legacy-2", "local-1", "legacy-3", "local-2", "local-3"
+            ]
+        );
+        let newest = store
+            .timeline_claims_for_incarnation_at(subject, "inc-1", None, true, 2)
+            .unwrap();
+        assert_eq!(timeline_entries(&newest), ["local-3", "local-2"]);
+        assert!(newest.next_cursor.is_some());
+        let legacy_three = ascending.claims[3].store_index;
+        let before = store
+            .timeline_claims_for_incarnation_at(subject, "inc-1", Some(legacy_three), true, 10)
+            .unwrap();
+        assert_eq!(
+            timeline_entries(&before),
+            ["local-1", "legacy-2", "legacy-1"],
+            "a snapshot before a claim excludes the local observations written after it"
+        );
+        assert_eq!(
+            store
+                .latest_local_timeline_at(subject, "inc-1", legacy_three)
+                .unwrap(),
+            Some(ascending.claims[5].accepted_at_unix_ms)
+        );
+        assert_eq!(
+            store
+                .latest_local_timeline_at(subject, "inc-1", legacy_three - 1)
+                .unwrap(),
+            Some(ascending.claims[2].accepted_at_unix_ms)
+        );
+    }
+
+    #[test]
+    fn trimming_local_observations_keeps_the_newest_of_each_subject_and_kind() {
+        let store = Store::open_memory("node").unwrap();
+        for entry in 0..10 {
+            store
+                .append_claim(&timeline_observation(
+                    "agent/node.first",
+                    "inc",
+                    &format!("entry-{entry}"),
+                ))
+                .unwrap();
+        }
+        for entry in 0..3 {
+            store
+                .append_claim(&timeline_observation(
+                    "agent/node.second",
+                    "inc",
+                    &format!("entry-{entry}"),
+                ))
+                .unwrap();
+        }
+        let positions = |store: &Store| {
+            store
+                .local_observations_after(0, 100)
+                .unwrap()
+                .iter()
+                .map(|record| local_observation_position(record).unwrap())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(positions(&store), (1..=13).collect::<Vec<_>>());
+        assert_eq!(
+            store
+                .trim_local_observations(now_ms().saturating_sub(3_600_000), 20_000, 2)
+                .unwrap(),
+            0,
+            "nothing is older than the window yet"
+        );
+        store
+            .connection
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE local_observations SET observed_at_unix_ms=1000 WHERE id <= 12",
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            store.trim_local_observations(2_000, 20_000, 2).unwrap(),
+            11,
+            "each chunk deletes at most two rows until nothing old is left"
+        );
+        assert_eq!(
+            positions(&store),
+            [10, 13],
+            "the newest observation of each subject and kind stays"
+        );
+        assert_eq!(store.local_observations_tail(1).unwrap().len(), 1);
+
+        for entry in 0..5 {
+            store
+                .append_claim(&timeline_observation(
+                    "agent/node.third",
+                    "inc",
+                    &format!("entry-{entry}"),
+                ))
+                .unwrap();
+        }
+        assert_eq!(store.trim_local_observations(0, 2, 100).unwrap(), 3);
+        assert_eq!(positions(&store), [10, 13, 17, 18]);
+        // AUTOINCREMENT never reuses a trimmed position, so event cursors stay ordered.
+        let (record, _) = store
+            .append_claim_outcome(&timeline_observation("agent/node.third", "inc", "later"))
+            .unwrap();
+        assert_eq!(local_observation_position(&record), Some(19));
+        assert_eq!(store.local_observation_floor_after_claim(0).unwrap(), 9);
+        assert_eq!(
+            store
+                .local_observation_floor_after_claim(store.index().unwrap() + 1)
+                .unwrap(),
+            19
         );
     }
 
