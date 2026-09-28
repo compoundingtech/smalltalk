@@ -308,7 +308,7 @@ fn timeline_is_ordered_typed_and_links_tool_results_to_prior_calls() {
 }
 
 #[test]
-fn event_and_terminal_streams_are_contiguous_and_resumable() {
+fn event_feeds_are_contiguous_and_terminal_streams_replace_whole_screens() {
     let events = fixture("events.json");
     let items = events["value"]["items"].as_array().unwrap();
     for pair in items.windows(2) {
@@ -323,18 +323,32 @@ fn event_and_terminal_streams_are_contiguous_and_resumable() {
         events["value"]["resume_cursor"]
     );
 
-    let frames = fixture("terminal-frames.json");
-    let expected_incarnation = frames["value"]["runtime_incarnation"].as_str().unwrap();
-    let frames = frames["value"]["frames"].as_array().unwrap();
-    for (index, frame) in frames.iter().enumerate() {
-        assert_eq!(frame["runtime_incarnation"], expected_incarnation);
-        if index > 0 {
-            assert_eq!(
-                frames[index - 1]["sequence"].as_u64().unwrap() + 1,
-                frame["sequence"].as_u64().unwrap()
-            );
+    // A terminal stream is a sequence of whole screens for one incarnation. Each replaces the
+    // one before it, so consecutive screens differ in revision and every run spells its line.
+    let screens = [
+        fixture("terminal-screen.json"),
+        fixture("terminal-screen-changed.json"),
+    ];
+    assert_eq!(
+        screens[0]["value"]["runtime_incarnation"],
+        screens[1]["value"]["runtime_incarnation"]
+    );
+    assert_ne!(screens[0]["value"]["revision"], screens[1]["value"]["revision"]);
+    for screen in &screens {
+        for line in screen["value"]["lines"].as_array().unwrap() {
+            let spelled = line["runs"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|run| run["text"].as_str().unwrap())
+                .collect::<String>();
+            assert_eq!(spelled.trim_end_matches(' '), line["text"].as_str().unwrap());
         }
     }
+    assert_eq!(
+        fixture("terminal-stale-fence-error.json")["code"],
+        "stale-fence"
+    );
 }
 
 fn test_state(root: &Path) -> AppState {

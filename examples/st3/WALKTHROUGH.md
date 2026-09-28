@@ -98,8 +98,9 @@ than to one round. The gate command therefore ends with the shell comment `# rou
 st substitutes the round number, so each round runs the check again. Without it, the first
 round's failure would be reused for every later round.
 
-Mechanical gates have a minimal `PATH` and no login shell. Use an absolute binary path, as the
-example does with `/usr/bin/test`. Keep the owning step or loop timeout longer than the gate's
+Mechanical gates use the captured interactive login-shell environment. Tools resolve through
+that PATH; the example's `/usr/bin/test` also works as an explicit path. `st doctor` shows the
+daemon PATH. Keep the owning step or loop timeout longer than the gate's
 `time-limit`; here 30 minutes exceeds one minute. Syntax-check nontrivial shell with
 `/bin/bash -n` before publishing it.
 
