@@ -70,7 +70,12 @@ impl Daemon {
             server.abort();
             let _ = server.await;
         }
-        assert!(std::os::unix::net::UnixStream::connect(&self.socket).is_err());
+        wait_until(
+            "the stopped daemon refuses new connections",
+            Duration::from_secs(5),
+            || std::os::unix::net::UnixStream::connect(&self.socket).is_err(),
+        )
+        .await;
     }
 
     fn append(&self, subject: &str, kind: &str, fields: Value) {
