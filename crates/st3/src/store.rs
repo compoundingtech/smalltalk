@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fs;
 use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -624,6 +624,10 @@ pub struct Store {
     replication_snapshot: Mutex<Option<Arc<ReplicationSnapshot>>>,
     replication_sync: Mutex<BTreeMap<String, PeerSyncProgress>>,
     replication_timers: ReplicationTimers,
+    /// Admitted replicated claims wait for a projection a catching-up node deferred.
+    replication_projection_deferred: AtomicBool,
+    /// When this process last projected replicated claims, in Unix milliseconds.
+    last_replication_projection_unix_ms: AtomicU64,
     /// This node's fleet member key. Set, it signs every envelope of this node's writer.
     member_key: std::sync::RwLock<Option<Arc<crate::fleet::MemberKey>>>,
     origin: String,
@@ -1365,6 +1369,8 @@ impl Store {
             replication_snapshot: Mutex::new(None),
             replication_sync: Mutex::new(BTreeMap::new()),
             replication_timers: ReplicationTimers::default(),
+            replication_projection_deferred: AtomicBool::new(false),
+            last_replication_projection_unix_ms: AtomicU64::new(0),
             member_key: std::sync::RwLock::new(None),
             origin,
         })
@@ -1410,6 +1416,8 @@ impl Store {
             replication_snapshot: Mutex::new(None),
             replication_sync: Mutex::new(BTreeMap::new()),
             replication_timers: ReplicationTimers::default(),
+            replication_projection_deferred: AtomicBool::new(false),
+            last_replication_projection_unix_ms: AtomicU64::new(0),
             member_key: std::sync::RwLock::new(None),
             origin,
         })
@@ -10787,35 +10795,40 @@ impl Store {
         loop {
             let mut held = Vec::new();
             let mut membership_changed = false;
+            // One transaction, and so one disk flush, per pass. Each envelope is admitted in its
+            // own savepoint, so an invalid one is rolled back and recorded alone.
+            let mut pass = connection.transaction()?;
             for envelope in pending {
                 let started = std::time::Instant::now();
-                let hold = fleet_admission_hold(&connection, &membership, &envelope)?;
+                let hold = fleet_admission_hold(&pass, &membership, &envelope)?;
                 outcome.verify += started.elapsed();
                 if let Some(reason) = hold {
-                    hold_replica_envelope(&connection, &envelope, reason)?;
+                    hold_replica_envelope(&pass, &envelope, reason)?;
                     held.push(envelope);
                     continue;
                 }
-                let transaction = connection.transaction()?;
-                let result = validate_and_admit_envelope_tx(&transaction, &envelope, &mut outcome);
+                let mut savepoint = pass.savepoint()?;
+                let result = validate_and_admit_envelope_tx(&savepoint, &envelope, &mut outcome);
                 match result {
                     Ok(()) => {
-                        transaction.execute(
+                        savepoint.execute(
                             "DELETE FROM replica_envelope_holds
                              WHERE writer=?1 AND sequence=?2 AND envelope_hash=?3",
                             params![envelope.writer, envelope.sequence, envelope.hash],
                         )?;
                         membership_changed |=
-                            envelope_carries_fleet_claims(&transaction, &envelope)?;
-                        transaction.commit()?;
+                            envelope_carries_fleet_claims(&savepoint, &envelope)?;
+                        savepoint.commit()?;
                     }
                     Err(error) => {
-                        transaction.rollback()?;
-                        record_invalid_replica_envelope(&connection, &envelope, &error)?;
+                        savepoint.rollback()?;
+                        drop(savepoint);
+                        record_invalid_replica_envelope(&pass, &envelope, &error)?;
                         outcome.invalid += 1;
                     }
                 }
             }
+            pass.commit()?;
             if !membership_changed || held.is_empty() {
                 outcome.held = held.len();
                 break;
@@ -10835,9 +10848,34 @@ impl Store {
         Ok(outcome)
     }
 
+    /// Project admitted replicated claims, unless this node is catching up with a peer and
+    /// projected within the last `CATCH_UP_PROJECTION_INTERVAL_MS`. History arrives older than
+    /// this node's own claims, so a catching-up node cannot extend its projection and would
+    /// replay the whole graph after every exchange. It projects at most once per interval
+    /// instead, and again as soon as it has caught up. `None` means it deferred.
+    pub fn project_replication_backlog_unless_catching_up(&self) -> Result<Option<bool>> {
+        let since = (now_ms() as u64)
+            .saturating_sub(self.last_replication_projection_unix_ms.load(Ordering::Acquire));
+        if since < CATCH_UP_PROJECTION_INTERVAL_MS && self.replication_catching_up() {
+            self.replication_projection_deferred
+                .store(true, Ordering::Release);
+            return Ok(None);
+        }
+        self.project_replication_backlog().map(Some)
+    }
+
+    /// Whether admitted replicated claims wait for a deferred projection.
+    pub fn replication_projection_deferred(&self) -> bool {
+        self.replication_projection_deferred.load(Ordering::Acquire)
+    }
+
     pub fn project_replication_backlog(&self) -> Result<bool> {
         let mut connection = self.connection.write();
         let _timing = time_stage(&self.replication_timers.projection);
+        self.replication_projection_deferred
+            .store(false, Ordering::Release);
+        self.last_replication_projection_unix_ms
+            .store(now_ms() as u64, Ordering::Release);
         let transaction = connection.transaction()?;
         let result = (|| -> Result<(), St3Error> {
             // An incremental projection that fails is rolled back and replaced by a full replay,
@@ -10862,6 +10900,8 @@ impl Store {
                 }
             };
             if !projected {
+                #[cfg(test)]
+                FULL_REPLAYS.with(|replays| replays.set(replays.get() + 1));
                 rebuild_operations_tx(&transaction).map_err(internal)?;
                 project_replicated_base_claims(&transaction)?;
                 project_replicated_mission_runs(&transaction)?;
@@ -19340,6 +19380,9 @@ fn full_compact_replication_inventory(
 /// divergent exchange lists beyond its first differing range.
 const REPLICATION_EXCHANGE_ENVELOPE_LIMIT: usize = 512;
 
+/// How often a node catching up with a peer projects the claims it has admitted.
+const CATCH_UP_PROJECTION_INTERVAL_MS: u64 = 30_000;
+
 /// The shortest span one sync rate sample covers.
 const REPLICATION_SYNC_WINDOW_MS: u128 = 10_000;
 
@@ -19568,6 +19611,7 @@ fn update_identity_digest(digest: &mut Sha256, writer: &str, sequence: u64, hash
 thread_local! {
     static INVENTORY_IDENTITIES_HASHED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static GRAPH_DIGESTS_COMPUTED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static FULL_REPLAYS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// The projected tables the graph digest commits: digest label, table, digested columns in
@@ -20452,6 +20496,159 @@ fn a_receipt_measures_how_far_behind_this_node_is() {
     );
 }
 
+#[cfg(test)]
+impl Store {
+    /// The store index the replicated projection last reached.
+    fn projected_through(&self) -> u64 {
+        self.readers
+            .get()
+            .query_row(
+                "SELECT last_good_store_index FROM projection_health WHERE aggregate='graph'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn a_catching_up_node_projects_once_per_interval_and_again_when_caught_up() {
+    const FLEET: &str = "018f6f0d-4a5d-7b8c-9d0e-123456789abc";
+    let source = Store::open_memory("source").unwrap();
+    for index in 0..1_800 {
+        source
+            .append_client_claim(&ClaimInput {
+                subject: format!("resource/sync-{index}"),
+                kind: "resource.observed".into(),
+                actor: None,
+                fields: BTreeMap::from([(
+                    "kind".into(),
+                    Value::String("custom.test.replication".into()),
+                )]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+    }
+    source.bind_fleet(FLEET).unwrap();
+    let target = Store::open_memory("target").unwrap();
+    target.bind_fleet(FLEET).unwrap();
+    let pull = || {
+        let summary = target.export_replication_summary(FLEET).unwrap();
+        let response = source
+            .export_replication_exchange(FLEET, &summary.inventory)
+            .unwrap();
+        target
+            .receive_replication_exchange("source", FLEET, &response)
+            .unwrap();
+        target.validate_replication_backlog().unwrap();
+        target.project_replication_backlog_unless_catching_up().unwrap()
+    };
+
+    // The first exchange projects, so the node shows something at once.
+    assert_eq!(pull(), Some(true));
+    assert!(target.replication_catching_up());
+    let first = target.projected_through();
+    assert_eq!(first, target.index().unwrap());
+
+    // While more than one exchange remains, a node that just projected defers.
+    assert_eq!(pull(), None);
+    assert!(target.replication_catching_up());
+    assert!(target.replication_projection_deferred());
+    assert_eq!(target.projected_through(), first);
+
+    // Once the interval has passed, it projects again even while catching up.
+    target
+        .last_replication_projection_unix_ms
+        .store(0, Ordering::Release);
+    assert_eq!(
+        target.project_replication_backlog_unless_catching_up().unwrap(),
+        Some(true)
+    );
+    assert!(!target.replication_projection_deferred());
+    assert_eq!(target.projected_through(), target.index().unwrap());
+
+    // Once no more than one exchange remains, every exchange projects at once.
+    assert_eq!(pull(), Some(true));
+    assert!(!target.replication_catching_up());
+    assert_eq!(target.projected_through(), target.index().unwrap());
+    assert!(!target.replication_projection_deferred());
+}
+
+#[cfg(test)]
+#[test]
+fn batches_accepted_in_one_millisecond_extend_the_projection_without_a_replay() {
+    const FLEET: &str = "018f6f0d-4a5d-7b8c-9d0e-123456789abc";
+    let source = Store::open_memory("source").unwrap();
+    source.bind_fleet(FLEET).unwrap();
+    let target = Store::open_memory("target").unwrap();
+    target.bind_fleet(FLEET).unwrap();
+    let sync = || {
+        let response = source
+            .export_replication_exchange(FLEET, &target.replication_inventory().unwrap())
+            .unwrap();
+        assert!(!response.envelopes.is_empty());
+        target
+            .receive_replication_exchange("source", FLEET, &response)
+            .unwrap();
+        target.validate_replication_backlog().unwrap();
+        assert!(target.project_replication_backlog().unwrap());
+    };
+    let put = |index: usize| {
+        source
+            .put_document(
+                &format!("doc/same-millisecond-{index}"),
+                b"An invented document.",
+                &None,
+                &format!("same-millisecond-{index}"),
+            )
+            .unwrap();
+    };
+    // The first projection of an empty node is a full replay.
+    put(0);
+    sync();
+
+    // Write document bindings, each its own batch, until two share an accepted millisecond.
+    let bindings = |source: &Store| {
+        source
+            .claims_page(None, None, 0, None, false, 10_000)
+            .unwrap()
+            .claims
+            .into_iter()
+            .filter(|claim| claim.kind == "doc.bound")
+            .collect::<Vec<_>>()
+    };
+    let mut index = 1;
+    loop {
+        put(index);
+        index += 1;
+        let written = bindings(&source);
+        let [.., previous, last] = written.as_slice() else {
+            continue;
+        };
+        if previous.accepted_at_unix_ms == last.accepted_at_unix_ms {
+            assert_ne!(previous.batch_id, last.batch_id);
+            break;
+        }
+        assert!(index < 5_000, "no two bindings shared a millisecond");
+    }
+    FULL_REPLAYS.with(|replays| replays.set(0));
+    sync();
+    assert_eq!(FULL_REPLAYS.with(std::cell::Cell::get), 0);
+    assert_eq!(
+        target
+            .replication_status(true, Some(FLEET), &[])
+            .unwrap()
+            .graph_digest,
+        source
+            .replication_status(true, Some(FLEET), &[])
+            .unwrap()
+            .graph_digest
+    );
+}
+
 fn collect_referenced_blobs(
     connection: &Connection,
     claims: &[ClaimRecord],
@@ -20574,7 +20771,7 @@ fn canonical_child_strings(value: &Value, name: &str) -> Vec<String> {
         .collect()
 }
 
-fn ensure_claim_blobs(transaction: &Transaction<'_>, claim: &ClaimRecord) -> Result<(), St3Error> {
+fn ensure_claim_blobs(transaction: &Connection, claim: &ClaimRecord) -> Result<(), St3Error> {
     let mut hashes = BTreeSet::new();
     collect_hash_fields(&claim.body, &mut hashes);
     for hash in hashes {
@@ -20594,7 +20791,7 @@ fn ensure_claim_blobs(transaction: &Transaction<'_>, claim: &ClaimRecord) -> Res
 }
 
 fn validate_and_admit_envelope_tx(
-    transaction: &Transaction<'_>,
+    transaction: &Connection,
     envelope: &ReplicaEnvelope,
     outcome: &mut ReplicationAdmission,
 ) -> Result<(), St3Error> {
@@ -20881,7 +21078,7 @@ fn verify_replica_batch_header(batch: &ReplicaBatch) -> Result<(), St3Error> {
 }
 
 fn validate_replicated_claim(
-    transaction: &Transaction<'_>,
+    transaction: &Connection,
     batch: &ReplicaBatch,
     claim: &ClaimRecord,
 ) -> Result<ReplicatedClaimAdmission, St3Error> {
@@ -20983,8 +21180,16 @@ fn reapply_local_work_lease_renewals_tx(transaction: &Transaction<'_>) -> Result
     Ok(())
 }
 
+/// A batch's writer and sequence from its ID, `batch/WRITER/SEQUENCE/HASH`.
+fn batch_order_key(batch_id: &str) -> Option<(String, u64)> {
+    let rest = batch_id.strip_prefix("batch/")?;
+    let (rest, _hash) = rest.rsplit_once('/')?;
+    let (writer, sequence) = rest.rsplit_once('/')?;
+    Some((writer.to_owned(), sequence.parse().ok()?))
+}
+
 /// Advance from a healthy frontier when the new claims have unambiguous operation IDs and
-/// structural claims are strictly newer than the previously projected accepted-time order.
+/// structural claims sort after everything projected, in the order the full replay uses.
 fn try_project_simple_replication_tx(transaction: &Transaction<'_>) -> Result<bool, St3Error> {
     let health: Option<(String, u64)> = transaction
         .query_row(
@@ -21019,12 +21224,15 @@ fn try_project_simple_replication_tx(transaction: &Transaction<'_>) -> Result<bo
         .filter(|claim| claim.kind.starts_with("work."))
         .collect::<Vec<_>>();
     work_claims.sort_by_key(|claim| claim.accepted_at_unix_ms);
-    let mut last_accepted: Option<u128> = None;
+    // The full replay orders claims by accepted time, then by batch writer and sequence. A
+    // structural claim extends the projection only when it sorts after everything projected
+    // so far; the claims of one batch share that key and keep their order within the batch.
+    let mut last_key: Option<(u128, String, u64)> = None;
     if claims
         .iter()
         .any(|claim| !Store::simple_replication_kind(&claim.kind))
     {
-        last_accepted = transaction
+        let last_accepted = transaction
             .query_row(
                 "SELECT accepted_at_unix_ms FROM claims WHERE store_index<=?1
                  ORDER BY length(accepted_at_unix_ms) DESC, accepted_at_unix_ms DESC LIMIT 1",
@@ -21032,8 +21240,28 @@ fn try_project_simple_replication_tx(transaction: &Transaction<'_>) -> Result<bo
                 |row| row.get::<_, String>(0),
             )
             .optional()
-            .map_err(internal)?
-            .and_then(|value| value.parse::<u128>().ok());
+            .map_err(internal)?;
+        if let Some(accepted) = last_accepted {
+            let mut statement = transaction
+                .prepare(
+                    "SELECT batch_id FROM claims WHERE store_index<=?1 AND accepted_at_unix_ms=?2",
+                )
+                .map_err(internal)?;
+            let batches = statement
+                .query_map(params![frontier, accepted], |row| row.get::<_, String>(0))
+                .map_err(internal)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(internal)?;
+            let Some((writer, sequence)) = batches
+                .iter()
+                .map(|batch| batch_order_key(batch))
+                .collect::<Option<Vec<_>>>()
+                .and_then(|keys| keys.into_iter().max())
+            else {
+                return Ok(false);
+            };
+            last_key = Some((accepted.parse().map_err(internal)?, writer, sequence));
+        }
     }
     for claim in &claims {
         let has_operation = claim.body.get("_operation").is_some();
@@ -21062,10 +21290,14 @@ fn try_project_simple_replication_tx(transaction: &Transaction<'_>) -> Result<bo
             return Ok(false);
         }
         if !Store::simple_replication_kind(&claim.kind) {
-            if last_accepted.is_some_and(|previous| claim.accepted_at_unix_ms <= previous) {
+            let Some((writer, sequence)) = batch_order_key(&claim.batch_id) else {
+                return Ok(false);
+            };
+            let key = (claim.accepted_at_unix_ms, writer, sequence);
+            if last_key.as_ref().is_some_and(|last| key < *last) {
                 return Ok(false);
             }
-            last_accepted = Some(claim.accepted_at_unix_ms);
+            last_key = Some(key);
             let repaired: bool = transaction
                 .query_row(
                     "SELECT EXISTS(SELECT 1 FROM replica_records WHERE claim_id=?1 AND state='repaired')",
