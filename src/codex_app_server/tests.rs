@@ -1103,6 +1103,7 @@ fn delivery_config(root: &Path) -> CodexDeliveryConfig {
         this_host: "h".into(),
         supervisor: None,
         producer_version: Some("codex-cli 0.153.0".into()),
+        model: None,
     }
 }
 
