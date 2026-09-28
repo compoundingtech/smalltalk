@@ -606,7 +606,7 @@
             "kind": { "const": "machine" },
             "host_id": { "$ref": "#/$defs/Id" },
             "name": { "type": "string" },
-            "state": { "enum": ["local", "reachable", "unreachable", "indeterminate"] },
+            "state": { "enum": ["local", "reachable", "unreachable", "indeterminate", "dial-out"] },
             "fleet_id": { "type": ["string", "null"] },
             "capacity": { "$ref": "#/$defs/MachineCapacity" },
             "occupancy": { "$ref": "#/$defs/MachineOccupancy" },
