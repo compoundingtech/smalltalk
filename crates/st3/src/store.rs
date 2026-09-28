@@ -8461,6 +8461,7 @@ impl Store {
                     kind: "fault".into(),
                     subject: failure.id,
                     person: reviewer,
+                    requester_id: None,
                     title: "Subscription mission failed".into(),
                     detail: format!("{code}: {reason}"),
                     mission: None,
@@ -15168,6 +15169,7 @@ fn attention_item_from_review(review: HumanReviewView) -> AttentionItemView {
         kind: "human-gate".into(),
         subject: review.owner.clone(),
         person: review.reviewer.clone(),
+        requester_id: None,
         title: review
             .title
             .clone()
@@ -15215,6 +15217,7 @@ fn attention_item_from_planning(
         kind: "launch-approval".into(),
         subject: session.subject.clone(),
         person: session.requester.clone(),
+        requester_id: None,
         title: format!("Approve mission/{}", session.mission),
         detail: "The current launch preview is ready for approval.".into(),
         mission: Some(format!("mission/{}", session.mission)),
@@ -15265,6 +15268,7 @@ fn attention_item_from_revision(
         kind: "revision-approval".into(),
         subject: proposal.subject.clone(),
         person: reviewer.to_owned(),
+        requester_id: None,
         title: format!("Approve a revision of {}", run.mission),
         detail: proposal.reason.clone(),
         mission: Some(run.mission.clone()),
@@ -15311,6 +15315,7 @@ fn attention_item_from_message(
         kind: "unread-message".into(),
         subject: message.subject.clone(),
         person: message.to.clone(),
+        requester_id: None,
         title: message
             .title
             .unwrap_or_else(|| format!("Message from {}", message.from)),
@@ -15334,11 +15339,17 @@ fn attention_item_from_message(
     }
 }
 
+pub(crate) fn agent_attention_requester(actor: &str) -> bool {
+    actor.starts_with("agent/") && actor != "agent/st3/reconciler"
+}
+
 fn attention_item_from_request(request: AttentionRequestView) -> AttentionItemView {
+    let agent_request = agent_attention_requester(&request.actor);
     AttentionItemView {
-        kind: "fault".into(),
+        kind: if agent_request { "agent-request" } else { "fault" }.into(),
         subject: request.subject.clone(),
         person: request.reviewer.clone(),
+        requester_id: Some(request.actor.clone()),
         title: request.title,
         detail: request.reason,
         mission: None,
@@ -15348,7 +15359,7 @@ fn attention_item_from_request(request: AttentionRequestView) -> AttentionItemVi
         requested_at_unix_ms: request.requested_at_unix_ms,
         actions: vec![
             attention_action(
-                "resolve",
+                if agent_request { "answer" } else { "resolve" },
                 &[
                     "st",
                     "attention",
@@ -33858,7 +33869,7 @@ mission "review-current" state="ready" revision-cutover="restart-active" {{
                     reason: "a person must decide".into(),
                     severity: "warning".into(),
                     targets: targets.iter().map(|target| (*target).to_owned()).collect(),
-                    actor: "agent/node.requester".into(),
+                    actor: "daemon/runtime".into(),
                     idempotency_key: format!("{subject}:requested"),
                 },
             )
@@ -34200,7 +34211,8 @@ mission "typecase" state="ready" {
         assert_eq!(first.status, "pending");
         let items = store.attention_items(Some("person/nathan")).unwrap();
         assert_eq!(items.len(), 1);
-        assert_eq!(items[0].kind, "fault");
+        assert_eq!(items[0].kind, "agent-request");
+        assert_eq!(items[0].actions[0].label, "answer");
         assert_eq!(items[0].actions.len(), 2);
         assert!(
             store

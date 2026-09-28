@@ -1645,12 +1645,12 @@ fn client_attention_actions(kind: &str) -> Vec<&'static str> {
             vec!["mission.approve-revision", "mission.cancel-revision"]
         }
         "unread-message" => vec!["message.read"],
-        "fault" => vec!["attention.resolve"],
+        "fault" | "agent-request" => vec!["attention.resolve"],
         _ => Vec::new(),
     }
 }
 
-/// Both the default and the history view rank a fault by the severity its requester gave.
+/// Both the default and the history view rank a request by the severity its requester gave.
 fn attention_priority(severity: &str) -> &'static str {
     match severity {
         "critical" => "critical",
@@ -1660,7 +1660,7 @@ fn attention_priority(severity: &str) -> &'static str {
     }
 }
 
-/// Beside each fault target, what that target is doing now, so a leftover request is
+/// Beside each request target, what that target is doing now, so a leftover request is
 /// recognizable without opening every target.
 fn insert_attention_target_states(
     store: &Store,
@@ -1698,7 +1698,7 @@ fn client_attention_resources(
     let mut resources = BTreeMap::new();
     for item in &current {
         let id = attention_resource_id(&item.subject);
-        let priority = if item.kind == "fault" {
+        let priority = if matches!(item.kind.as_str(), "fault" | "agent-request") {
             store
                 .attention_request(&item.subject)?
                 .map_or("high", |request| attention_priority(&request.severity))
@@ -1730,7 +1730,12 @@ fn client_attention_resources(
         let object = resource
             .as_object_mut()
             .expect("an attention resource is an object");
-        if item.kind == "fault" && attention_requester_retired(store, item, &mut retired_seats)? {
+        if let Some(requester) = &item.requester_id {
+            object.insert("requester_id".into(), Value::String(requester.clone()));
+        }
+        if matches!(item.kind.as_str(), "fault" | "agent-request")
+            && attention_requester_retired(store, item, &mut retired_seats)?
+        {
             object["operational"]["reasons"] = json!(["requester-retired"]);
         }
         if let Some(mission) = &item.mission {
@@ -1742,7 +1747,7 @@ fn client_attention_resources(
         if let Some(step) = &item.step {
             object.insert("step_run_id".into(), Value::String(step.clone()));
         }
-        if item.kind == "fault" {
+        if matches!(item.kind.as_str(), "fault" | "agent-request") {
             insert_attention_target_states(store, object, &item.targets)?;
         }
         resources.insert(id, resource);
@@ -1757,12 +1762,18 @@ fn client_attention_resources(
                 reasons.push("superseded");
             }
             let id = attention_resource_id(&request.subject);
+            let kind = if crate::store::agent_attention_requester(&request.actor) {
+                "agent-request"
+            } else {
+                "fault"
+            };
             let mut resource = json!({
                     "id": id,
                     "kind": "attention",
-                    "attention_kind": "fault",
+                    "attention_kind": kind,
                     "source_id": request.subject,
                     "person_id": request.reviewer,
+                    "requester_id": request.actor,
                     "revision": request.request,
                     "updated_at": client_timestamp(request.resolved_at_unix_ms.unwrap_or(request.requested_at_unix_ms)),
                     "title": request.title,
@@ -1771,7 +1782,7 @@ fn client_attention_resources(
                     "state": if request.status == "pending" { "open" } else { "resolved" },
                     "requested_at": client_timestamp(request.requested_at_unix_ms),
                     "targets": request.targets,
-                    "actions": if current { client_attention_actions("fault") } else { Vec::<&str>::new() },
+                    "actions": if current { client_attention_actions(kind) } else { Vec::<&str>::new() },
                     "operational": { "layer": if current { "current" } else { "history" }, "actionable": current, "reasons": reasons }
             });
             insert_attention_target_states(
@@ -5950,6 +5961,29 @@ async fn resolve_attention(
         .store
         .resolve_attention(&subject, &request)
         .map_err(ApiError::bad)?;
+    if crate::store::agent_attention_requester(&response.actor) {
+        let content = match response.resolution_reason.as_deref() {
+            Some(reason) if !reason.trim().is_empty() => format!(
+                "Your attention request `{}` was {}. Reason: {}",
+                response.subject, request.outcome, reason
+            ),
+            _ => format!(
+                "Your attention request `{}` was {}.",
+                response.subject, request.outcome
+            ),
+        };
+        send_planning_message(
+            &state,
+            &format!(
+                "attention-resolution:{}:{}",
+                response.request, request.idempotency_key
+            ),
+            &request.actor,
+            &response.actor,
+            &content,
+            "Attention request answered",
+        )?;
+    }
     signal_changed(&state);
     Ok(Json(response))
 }
@@ -6010,6 +6044,14 @@ async fn post_review(
         return Err(ApiError::bad(St3Error::new(
             "invalid-review-decision",
             "a review decision must be approved or rejected",
+        )));
+    }
+    if request.decision == "rejected"
+        && request.reason.as_deref().is_none_or(|reason| reason.trim().is_empty())
+    {
+        return Err(ApiError::bad(St3Error::new(
+            "missing-review-reason",
+            "a rejected review needs a reason",
         )));
     }
     let subject = if subject.starts_with("resource/")
@@ -6094,6 +6136,56 @@ async fn post_review(
             idempotency_key: None,
         })
         .map_err(ApiError::bad)?;
+    if request.decision == "rejected" {
+        if let Some(owner) = review_request
+            .as_ref()
+            .and_then(|claim| claim.body.pointer("/fields/owner"))
+            .and_then(Value::as_str)
+        {
+            if owner.starts_with("step-run/") {
+                let step = state.store.step_run(owner).map_err(ApiError::internal)?;
+                let claimant = if let Some(step) = step {
+                    if step.claimant.is_some() || step.carried_claimant.is_some() {
+                        step.claimant.or(step.carried_claimant)
+                    } else {
+                        state
+                            .store
+                            .claims_for(owner, Some("work.claimed"))
+                            .map_err(ApiError::internal)?
+                            .into_iter()
+                            .rev()
+                            .find(|claim| {
+                                claim.body.pointer("/fields/attempt").and_then(Value::as_u64)
+                                    == Some(u64::from(step.attempt))
+                            })
+                            .and_then(|claim| {
+                                claim.body
+                                    .pointer("/fields/claimant")
+                                    .and_then(Value::as_str)
+                                    .map(str::to_owned)
+                            })
+                    }
+                } else {
+                    None
+                };
+                if let Some(claimant) = claimant {
+                    let reason = response
+                        .body
+                        .pointer("/fields/reason")
+                        .and_then(Value::as_str)
+                        .unwrap_or("No reason provided.");
+                    send_planning_message(
+                        &state,
+                        &format!("review-rejected:{}:{claimant}", response.id),
+                        response.actor.as_deref().unwrap_or("daemon/runtime"),
+                        &claimant,
+                        &format!("Your work on `{owner}` was rejected. Reason: {reason}"),
+                        "Human review rejected",
+                    )?;
+                }
+            }
+        }
+    }
     signal_changed(&state);
     Ok(Json(response))
 }
@@ -13196,9 +13288,14 @@ version 2
         let source = r#"
 version 2
 
+  agent "worker" { workspace "/tmp"; command "true" }
   mission "review-api" state="ready" {
     goal "Complete mission review-api."
-    step "approval" { gate "human-review" type="human" { reviewer "person/nathan" } }
+    step "approval" {
+      goal "Submit the candidate."
+      assigned-to "agent/worker"
+      gate "human-review" type="human" { reviewer "person/nathan" }
+    }
   }
 
 "#;
@@ -13230,6 +13327,42 @@ version 2
             })
             .unwrap();
         let step = &run.steps[0];
+        assert!(!step.agentless, "{step:?}");
+        let claimant = step.assigned_to.clone().expect("the step has an assignee");
+        state
+            .store
+            .set_step_state(&step.subject, "ready", None)
+            .unwrap();
+        state
+            .store
+            .work_action(
+                &step.subject,
+                "claim",
+                &crate::model::WorkRequest {
+                    actor: Some(claimant.clone()),
+                    incarnation: Some("test-incarnation".into()),
+                    summary: None,
+                    reason: None,
+                    evidence: Vec::new(),
+                    idempotency_key: "review-api-claim".into(),
+                },
+            )
+            .unwrap();
+        state
+            .store
+            .work_action(
+                &step.subject,
+                "complete",
+                &crate::model::WorkRequest {
+                    actor: Some(claimant.clone()),
+                    incarnation: Some("test-incarnation".into()),
+                    summary: Some("Candidate submitted for review".into()),
+                    reason: None,
+                    evidence: Vec::new(),
+                    idempotency_key: "review-api-submit".into(),
+                },
+            )
+            .unwrap();
         let request_fields = |owner: String, definition: String, operation: &str| {
             BTreeMap::from([
                 ("owner".into(), Value::String(owner)),
@@ -13396,6 +13529,22 @@ version 2
         );
         assert_eq!(accepted_mission["body"]["fields"]["verdict"], "pass");
 
+        let missing_reason = serde_json::to_value(ReviewRequest {
+            decision: "rejected".into(),
+            reason: None,
+            actor: Some("person/nathan".into()),
+            expected_subject: None,
+        })
+        .unwrap();
+        let (status, invalid) = json_request(
+            app.clone(),
+            &format!("/v1/reviews/{}", step.subject),
+            missing_reason,
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{invalid}");
+        assert_eq!(invalid["code"], "missing-review-reason");
+
         let reject = serde_json::to_value(ReviewRequest {
             decision: "rejected".into(),
             reason: Some("the evidence is incomplete".into()),
@@ -13413,15 +13562,20 @@ version 2
         assert_eq!(accepted_step["body"]["fields"]["request"], step_request.id);
         assert_eq!(accepted_step["body"]["fields"]["verdict"], "fail");
         assert_eq!(accepted_step["body"]["evidence"][0], step_request.id);
+        let messages = store.messages(Some(&claimant), false).unwrap();
+        assert_eq!(messages.len(), 1);
+        assert!(messages[0].content.contains("the evidence is incomplete"));
 
         let (_, empty) = get_request(app, "/v1/reviews?reviewer=person%2Fnathan").await;
         assert_eq!(empty, json!([]));
     }
 
     #[tokio::test]
-    async fn attention_routes_request_filter_and_resolve_one_fault() {
+    async fn attention_routes_show_agent_request_and_deliver_resolution_reason() {
         let root = tempfile::tempdir().unwrap();
-        let app = router(state(root.path()));
+        let state = state(root.path());
+        let store = state.store.clone();
+        let app = router(state);
         let request = serde_json::to_value(AttentionRequest {
             reviewer: "nathan".into(),
             title: "Fabric needs review".into(),
@@ -13440,7 +13594,12 @@ version 2
         let (status, selected) = get_request(app.clone(), "/v1/attention?person=nathan").await;
         assert_eq!(status, StatusCode::OK, "{selected}");
         assert_eq!(selected.as_array().unwrap().len(), 1);
-        assert_eq!(selected[0]["kind"], "fault");
+        assert_eq!(selected[0]["kind"], "agent-request");
+        assert_eq!(selected[0]["requester_id"], "agent/fabric/worker");
+        assert_eq!(selected[0]["actions"][0]["label"], "answer");
+        let client = client_attention_resources(&store, Some("person/nathan"), false).unwrap();
+        assert_eq!(client[0]["attention_kind"], "agent-request");
+        assert_eq!(client[0]["requester_id"], "agent/fabric/worker");
         let (_, filtered) =
             get_request(app.clone(), "/v1/attention?person=person%2Fsomeone-else").await;
         assert_eq!(filtered, json!([]));
@@ -13472,11 +13631,22 @@ version 2
         let (status, resolved) = json_request(
             app.clone(),
             &format!("/v1/attention/resolve/{}", urlencoding::encode(subject)),
-            resolution,
+            resolution.clone(),
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{resolved}");
         assert_eq!(resolved["status"], "resolved");
+        let (status, replayed) = json_request(
+            app.clone(),
+            &format!("/v1/attention/resolve/{}", urlencoding::encode(subject)),
+            resolution,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{replayed}");
+        let messages = store.messages(Some("agent/fabric/worker"), false).unwrap();
+        assert_eq!(messages.len(), 1);
+        assert!(messages[0].content.contains("The queue recovered."));
+        assert!(messages[0].content.contains("resolved"));
         let (_, empty) = get_request(app, "/v1/attention?person=nathan").await;
         assert_eq!(empty, json!([]));
     }
