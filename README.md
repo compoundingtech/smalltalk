@@ -84,6 +84,9 @@ st records every `git` and `gh` call it starts, including its own, in
 absolute path is not recorded. The [command recorder](docs/st3/command-recorder.md) describes the
 log.
 
+If the state directory has a long path, set `XDG_RUNTIME_DIR` to a shorter directory or pass
+`--socket` and `--client-gateway-socket` to `st up` so both Unix socket paths fit the OS limit.
+
 ## First commands
 
 ```sh

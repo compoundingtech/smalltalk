@@ -14,7 +14,7 @@ use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 use st3::api::{AppState, fabric_router, router, serve_unix};
 use st3::client::{Client, Endpoint};
-use st3::config::{Config, PeerConfig};
+use st3::config::{Config, PeerConfig, validate_unix_socket_path};
 use st3::model::{
     ApplyRequest, ApplyResponse, AttachRequest, Attachment, AttentionItemView, AttentionRequest,
     AttentionRequestView, AttentionResolveRequest, AttentionWithdrawRequest, ClaimInput,
@@ -2956,6 +2956,8 @@ async fn run_up(args: UpArgs) -> Result<()> {
     }
     config.apply_fleet_file()?;
     config.validate()?;
+    validate_unix_socket_path(&config.socket, "--socket")?;
+    validate_unix_socket_path(&config.client_gateway_socket, "--client-gateway-socket")?;
     st2::hooks::ensure_installed().context(
         "publishing this st binary's required lifecycle hook set before starting the daemon",
     )?;
