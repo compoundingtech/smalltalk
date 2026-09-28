@@ -261,6 +261,7 @@ fn attention() -> Vec<Attention> {
     ]
 }
 
+#[allow(clippy::too_many_arguments)]
 fn agent(
     id: &str,
     name: &str,

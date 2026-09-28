@@ -807,8 +807,7 @@ pub fn mission_order(world: &World, system: bool) -> Vec<&Mission> {
         .iter()
         .filter(|mission| system || !mission.system)
         .collect::<Vec<_>>();
-    missions
-        .sort_by(|a, b| (a.word, a.title.to_lowercase()).cmp(&(b.word, b.title.to_lowercase())));
+    missions.sort_by_key(|mission| (mission.word, mission.title.to_lowercase()));
     missions
 }
 

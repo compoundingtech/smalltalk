@@ -1199,16 +1199,12 @@ impl Ui {
                     _ => {}
                 }
             }
-            1 if key == 'c' => {
-                if self
-                    .world
-                    .agents
-                    .items()
-                    .iter()
-                    .any(|agent| Some(&agent.id) == self.selected_id().as_ref() && !agent.unmanaged)
-                {
-                    self.editing = true;
-                }
+            1 if key == 'c'
+                && self.world.agents.items().iter().any(|agent| {
+                    Some(&agent.id) == self.selected_id().as_ref() && !agent.unmanaged
+                }) =>
+            {
+                self.editing = true;
             }
             _ => {}
         }
