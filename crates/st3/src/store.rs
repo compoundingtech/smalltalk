@@ -1261,10 +1261,6 @@ fn discovered_collection_items(
     else {
         return Vec::new();
     };
-    let prior_numbers = previous_items
-        .iter()
-        .filter_map(|item| item.get("number").and_then(Value::as_u64))
-        .collect::<BTreeSet<_>>();
     let Some(current_items) = current.get(field).and_then(Value::as_array) else {
         return Vec::new();
     };
@@ -1272,7 +1268,15 @@ fn discovered_collection_items(
         .iter()
         .filter_map(|item| {
             let number = item.get("number")?.as_u64()?;
-            if prior_numbers.contains(&number) {
+            let prior = previous_items
+                .iter()
+                .find(|old| old.get("number").and_then(Value::as_u64) == Some(number));
+            if prior.is_some_and(|old| match field {
+                "pull_requests" => ["head", "state", "draft"]
+                    .iter()
+                    .all(|name| old.get(*name) == item.get(*name)),
+                _ => true,
+            }) {
                 return None;
             }
             let (segment, kind) = match field {
@@ -1283,7 +1287,12 @@ fn discovered_collection_items(
             let mut facts = serde_json::Map::from_iter([
                 ("repository".into(), Value::String(repository.into())),
                 ("number".into(), Value::from(number)),
-                ("state".into(), Value::String("open".into())),
+                (
+                    "state".into(),
+                    item.get("state")
+                        .cloned()
+                        .unwrap_or_else(|| Value::String("open".into())),
+                ),
             ]);
             for name in ["url", "title"] {
                 if let Some(value) = item.get(name).filter(|value| !value.is_null()) {
@@ -1291,8 +1300,14 @@ fn discovered_collection_items(
                 }
             }
             if field == "pull_requests" {
-                facts.insert("draft".into(), Value::Bool(false));
+                facts.insert(
+                    "draft".into(),
+                    item.get("draft").cloned().unwrap_or(Value::Bool(false)),
+                );
                 facts.insert("merged".into(), Value::Bool(false));
+                if let Some(head) = item.get("head").filter(|head| !head.is_null()) {
+                    facts.insert("head_sha".into(), head.clone());
+                }
             }
             Some((
                 format!("{repository}/{segment}/{number}"),
@@ -35594,6 +35609,61 @@ mission "review-guardrail" state="ready" {
         assert_eq!(issues[0].0, "resource/github/acme/demo/issue/8");
         assert_eq!(issues[0].1, "vcs.issue");
         assert_eq!(issues[0].2["repository"], "resource/github/acme/demo");
+    }
+
+    #[test]
+    fn repository_pull_head_changes_and_closure_emit_exact_item_claims() {
+        let before = json!({"repository_id": 7, "pull_requests": [{
+            "number": 4, "head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "state": "open", "draft": false,
+        }]});
+        let after = json!({"repository_id": 7, "pull_requests": [{
+            "number": 4, "head": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "state": "open", "draft": false,
+        }]});
+        let changes = discovered_collection_items(
+            "resource/github/acme/demo",
+            "pull_requests",
+            Some(&before),
+            &after,
+        );
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].0, "resource/github/acme/demo/pull-request/4");
+        assert_eq!(
+            changes[0].2["head_sha"],
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        );
+        let facts = changes[0]
+            .2
+            .as_object()
+            .unwrap()
+            .iter()
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect();
+        st3_schema::registry()
+            .validate_resource_facts("vcs.pull-request", &facts)
+            .unwrap();
+        assert!(
+            discovered_collection_items(
+                "resource/github/acme/demo",
+                "pull_requests",
+                Some(&after),
+                &after,
+            )
+            .is_empty()
+        );
+        let closed = json!({"repository_id": 7, "pull_requests": [{
+            "number": 4, "head": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "state": "closed", "draft": false,
+        }]});
+        let changes = discovered_collection_items(
+            "resource/github/acme/demo",
+            "pull_requests",
+            Some(&after),
+            &closed,
+        );
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].2["state"], "closed");
     }
 
     #[test]

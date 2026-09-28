@@ -8214,9 +8214,14 @@ impl<R: RuntimeControl> Reconciler<R> {
                     fields: spec.fields.iter().cloned().collect(),
                     cursor,
                     previous_facts,
+                    every_ms: spec.every_ms,
                 };
                 match provider.observe(request).await {
-                    Ok(observation) => {
+                    Ok(mut observation) => {
+                        if let Some(every_ms) = spec.every_ms {
+                            observation.next_check_unix_ms =
+                                now_ms().saturating_add(every_ms as u128);
+                        }
                         match store.record_resource_observation(
                             &observer_subject,
                             &revision,
