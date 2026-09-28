@@ -137,6 +137,21 @@ impl Daemon {
             })
             .collect()
     }
+
+    fn has_diagnostic(&self, subject: &str, incarnation: &str, code: &str) -> bool {
+        self.store
+            .claims_for(subject, Some("harness.diagnostic"))
+            .unwrap_or_default()
+            .into_iter()
+            .any(|claim| {
+                claim.body.pointer("/fields/code").and_then(Value::as_str) == Some(code)
+                    && claim
+                        .body
+                        .pointer("/fields/incarnation_id")
+                        .and_then(Value::as_str)
+                        == Some(incarnation)
+            })
+    }
 }
 
 async fn wait_until(what: &str, limit: Duration, mut condition: impl FnMut() -> bool) {
@@ -230,7 +245,16 @@ async fn a_claude_seat_starts_through_a_daemon_restart_and_then_keeps_its_mail()
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    tokio::time::sleep(Duration::from_millis(1_500)).await;
+    wait_until(
+        "the starting driver observes the daemon outage",
+        Duration::from_secs(20),
+        || {
+            assert_alive(&mut driver, "a starting Claude driver");
+            driver_log(root)
+                .contains("waiting for the runtime incarnation while the daemon restarts")
+        },
+    )
+    .await;
     assert_alive(&mut driver, "a starting Claude driver");
     assert!(daemon.harness_states(seat, incarnation).is_empty());
 
@@ -246,16 +270,28 @@ async fn a_claude_seat_starts_through_a_daemon_restart_and_then_keeps_its_mail()
     // once the daemon is back, without the driver exiting or writing to the seat's terminal.
     daemon.stop().await;
     daemon.send("message/restart-claude-mail", seat, "AMBER LANTERN");
-    tokio::time::sleep(Duration::from_millis(2_500)).await;
+    wait_until(
+        "native delivery observes the daemon outage",
+        Duration::from_secs(20),
+        || {
+            assert_alive(&mut driver, "a running Claude driver");
+            driver_log(root).contains("native conversation delivery paused")
+        },
+    )
+    .await;
     assert_alive(&mut driver, "a running Claude driver");
     assert!(files_containing(&root.join("drivers"), "AMBER LANTERN").is_empty());
     daemon.start().await;
     wait_until(
-        "the driver projects the message to the Claude channel",
-        Duration::from_secs(10),
-        || !files_containing(&root.join("drivers"), "AMBER LANTERN").is_empty(),
+        "native delivery records recovery after the daemon restart",
+        Duration::from_secs(20),
+        || daemon.has_diagnostic(seat, incarnation, "native-delivery-recovered"),
     )
     .await;
+    assert!(
+        !files_containing(&root.join("drivers"), "AMBER LANTERN").is_empty(),
+        "the recovered driver did not project the message to the Claude channel"
+    );
     wait_until(
         "the driver records that delivery resumed",
         Duration::from_secs(10),

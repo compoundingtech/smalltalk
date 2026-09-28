@@ -977,6 +977,131 @@ pub(super) async fn missions(
     client_page(&state, &snapshot, "missions", items, &query).map(Json)
 }
 
+/// A single read of the projections used by mission show, agent tree, and seat queues.
+pub(super) async fn missions_tree(
+    State(state): State<AppState>,
+    Extension(snapshot): Extension<ClientSnapshot>,
+    Extension(session): Extension<ClientSession>,
+) -> Result<Json<Value>, ApiError> {
+    require_scope(&session, "read.projections")?;
+    let store = state.store.clone();
+    let at = snapshot.created_at.clone();
+    let index = snapshot.store_index;
+    let view = super::blocking_store(move || missions_tree_value(&store, &at, index)).await?;
+    Ok(Json(json!({ "snapshot": snapshot, "value": view })))
+}
+
+fn desired_child_arg(value: &Value, name: &str) -> Option<String> {
+    value
+        .get("children")?
+        .as_array()?
+        .iter()
+        .find(|child| child.get("name").and_then(Value::as_str) == Some(name))?
+        .get("arguments")?
+        .as_array()?
+        .first()?
+        .as_str()
+        .map(str::to_owned)
+}
+
+fn missions_tree_value(store: &Store, at: &str, index: u64) -> anyhow::Result<Value> {
+    let mut runs = store
+        .mission_run_headers()?
+        .into_iter()
+        .filter(|run| matches!(run.status.as_str(), "running" | "standing" | "blocked"))
+        .collect::<Vec<_>>();
+    runs.sort_by(|a, b| {
+        a.mission
+            .cmp(&b.mission)
+            .then_with(|| a.subject.cmp(&b.subject))
+    });
+    anyhow::ensure!(runs.len() <= 200, "missions tree exceeds 200 active runs");
+    let mut run_values = Vec::with_capacity(runs.len());
+    for run in runs {
+        let full = store
+            .mission_run(&run.subject)?
+            .ok_or_else(|| anyhow::anyhow!("run disappeared: {}", run.subject))?;
+        anyhow::ensure!(
+            full.steps.len() <= 200,
+            "missions tree run exceeds 200 steps: {}",
+            full.subject
+        );
+        run_values.push(json!({
+            "id": full.subject, "mission": full.mission, "state": full.status,
+            "steps": full.steps.iter().map(|step| json!({
+                "id": step.subject, "name": step.title.as_deref().unwrap_or(&step.step),
+                "path": step.step, "state": step.status
+            })).collect::<Vec<_>>()
+        }));
+    }
+    let mut unstarted = mission_resources(store, index, false, None)?
+        .into_iter()
+        .filter(|mission| {
+            matches!(mission["state"].as_str(), Some("ready" | "draft"))
+                && mission["runs"].as_array().is_some_and(Vec::is_empty)
+        })
+        .map(|mission| json!({ "id": mission["id"], "title": mission["title"], "state": mission["state"] }))
+        .collect::<Vec<_>>();
+    unstarted.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
+    anyhow::ensure!(
+        unstarted.len() <= 200,
+        "missions tree exceeds 200 unstarted missions"
+    );
+
+    let desired = store
+        .desired_subjects()?
+        .into_iter()
+        .map(|seat| (seat.subject.clone(), seat))
+        .collect::<BTreeMap<_, _>>();
+    let mut agents = client_agent_resources(store, false, at, index)?;
+    anyhow::ensure!(agents.len() <= 200, "missions tree exceeds 200 agents");
+    for agent in &mut agents {
+        let Some(id) = agent["id"].as_str() else {
+            continue;
+        };
+        let Some(seat) = desired.get(id) else {
+            continue;
+        };
+        let host = seat
+            .member
+            .as_ref()
+            .map(|member| member.host.clone())
+            .or_else(|| desired_child_arg(&seat.desired, "host"));
+        agent["host_id"] = json!(host.as_deref().map(client_host_id));
+        let harness = seat
+            .desired
+            .get("children")
+            .and_then(Value::as_array)
+            .and_then(|children| children.iter().find(|child| child["name"] == "harness"));
+        agent["model"] = json!(harness.and_then(|harness| desired_child_arg(harness, "model")));
+        agent["effort"] = json!(harness.and_then(|harness| desired_child_arg(harness, "effort")));
+        agent["seat_kind"] = json!(if agent["owner_run_id"].is_string() {
+            "mission"
+        } else {
+            "standing"
+        });
+    }
+    let mut queues = Vec::new();
+    let mut queued_runs = 0;
+    for agent in &agents {
+        if agent["seat_kind"] != "standing" {
+            continue;
+        }
+        let Some(id) = agent["id"].as_str() else {
+            continue;
+        };
+        let queue = store.seat_queue(id)?;
+        queued_runs += queue.runs.len();
+        anyhow::ensure!(
+            queued_runs <= 1000,
+            "missions tree exceeds 1000 queued runs"
+        );
+        queues.push(agent_queue_value(&queue));
+    }
+    Ok(json!({ "runs": run_values, "standing_queues": queues,
+        "unstarted_missions": unstarted, "agents": agents }))
+}
+
 pub(super) async fn mission_detail(
     State(state): State<AppState>,
     Extension(snapshot): Extension<ClientSnapshot>,
@@ -2048,6 +2173,7 @@ fn safe_event_projection(state: &AppState, record: &EventRecord) -> (String, Vec
     }
     let mut resource_ids = Vec::new();
     if record.subject.starts_with("message/")
+        || record.subject.starts_with("attention/")
         || record.subject.starts_with("agent/")
         || record.subject.starts_with("step-run/")
         || record.subject.starts_with("mission/")
@@ -4700,6 +4826,108 @@ mod tests {
     }
 
     #[test]
+    fn attention_events_name_the_attention_they_change() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state(root.path());
+        let before = state.store.index().unwrap();
+        state
+            .store
+            .request_attention(
+                "attention/sync-demo",
+                &crate::model::AttentionRequest {
+                    reviewer: "person/nathan".into(),
+                    title: "Review the invented plan".into(),
+                    reason: "A replicated change must refresh Now.".into(),
+                    severity: "warning".into(),
+                    targets: Vec::new(),
+                    actor: "agent/fleet/example/builder".into(),
+                    idempotency_key: "attention-event".into(),
+                },
+            )
+            .unwrap();
+        let records = state.store.events_after_bounded(before, 10).unwrap();
+        let record = records
+            .iter()
+            .find(|record| record.subject == "attention/sync-demo")
+            .unwrap();
+        let (_, resource_ids, _) = safe_event_projection(&state, record);
+        assert_eq!(resource_ids, ["attention/sync-demo"]);
+    }
+
+    #[test]
+    fn pages_say_when_the_host_is_catching_up_with_a_peer() {
+        const FLEET: &str = "018f6f0d-4a5d-7b8c-9d0e-123456789abc";
+        let root = tempfile::tempdir().unwrap();
+        let mut state = test_state_named(root.path(), "hub");
+        state.configured_peers = vec!["edge".into()];
+        state.store.bind_fleet(FLEET).unwrap();
+        let edge = Store::open_memory("edge").unwrap();
+        edge.bind_fleet(FLEET).unwrap();
+        for index in 0..1_200 {
+            edge.append_client_claim(&crate::model::ClaimInput {
+                subject: format!("resource/sync-{index}"),
+                kind: "resource.observed".into(),
+                actor: None,
+                fields: BTreeMap::from([(
+                    "kind".into(),
+                    Value::String("custom.test.replication".into()),
+                )]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+        }
+        let page = |state: &AppState| {
+            super::super::client_page(
+                state,
+                &new_client_snapshot(state),
+                "now",
+                Vec::new(),
+                &super::super::ClientListQuery::default(),
+            )
+            .unwrap()
+        };
+        assert!(page(&state).sync.is_none(), "nothing is measured yet");
+        let pull = |state: &AppState| {
+            let summary = state.store.export_replication_summary(FLEET).unwrap();
+            let exchange = edge
+                .export_replication_exchange(FLEET, &summary.inventory)
+                .unwrap();
+            state
+                .store
+                .receive_replication_exchange("edge", FLEET, &exchange)
+                .unwrap();
+            exchange.envelopes.len() as u64
+        };
+
+        let received = pull(&state);
+        let sync = page(&state).sync.expect("the hub is catching up");
+        assert_eq!(sync.state, "catching-up");
+        let [peer] = sync.peers.as_slice() else {
+            panic!("one peer is ahead: {:?}", sync.peers);
+        };
+        assert_eq!(peer.host_id, "host/edge");
+        let total = edge.replication_inventory().unwrap().envelopes.len() as u64;
+        assert_eq!(peer.peer_only_envelopes, total - received);
+        assert_eq!(
+            peer.last_exchange_at,
+            state
+                .store
+                .replication_peer_last_success("edge")
+                .unwrap()
+                .map(client_timestamp)
+        );
+        let json = serde_json::to_value(page(&state)).unwrap();
+        assert_eq!(json["sync"]["peers"][0]["host_id"], "host/edge");
+
+        // Once the rest fits in one exchange, pages stop carrying the notice.
+        pull(&state);
+        let json = serde_json::to_value(page(&state)).unwrap();
+        assert!(json.get("sync").is_none(), "{json}");
+    }
+
+    #[test]
     fn a_dial_out_member_is_dial_out_and_an_ended_member_is_history() {
         const FLEET: &str = "018f6f0d-4a5d-7b8c-9d0e-123456789abd";
         let root = tempfile::tempdir().unwrap();
@@ -5000,6 +5228,16 @@ mission "example/zero-run" state="ready" {
             .expect("the zero-run definition is listed");
         assert_eq!(mission["state"], "ready");
         assert_eq!(mission["runs"], json!([]));
+        let tree = missions_tree_value(&state.store, "now", state.store.index().unwrap()).unwrap();
+        assert!(
+            tree["unstarted_missions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| {
+                    item["id"] == "mission/example/zero-run" && item["state"] == "ready"
+                })
+        );
         assert_eq!(mission["operational"]["actionable"], true);
         assert!(mission["visualization"].is_null());
         assert_eq!(

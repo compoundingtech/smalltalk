@@ -30,25 +30,25 @@ use crate::graph::{parse_intent, resolve_document_references};
 use crate::model::{
     ApplyRequest, ApplyResponse, AttachRequest, Attachment, AttentionItemView, AttentionRequest,
     AttentionRequestView, AttentionResolveRequest, AttentionWithdrawRequest, ClaimInput,
-    ClaimRecord, ClaimsPage, ClientPageInfo, ClientResourcePage, ContextClearRequest, DoctorCheck,
-    DoctorReport, DocumentListResponse, DocumentPutRequest, DocumentVersion, EvalStartRequest,
-    EvalStartResponse, EvalStatus, EventRecord, GateResultRequest, HumanReviewView, IntentInput,
-    LaunchApproveAndStartRequest, LaunchApproveAndStartView, LaunchDecisionAnswerRequest,
-    LaunchDecisionOption, LaunchDecisionRequest, LaunchDecisionResponse, LaunchDecisionType,
-    LaunchStartRequest, MAX_EVAL_TIMEOUT_MS, MessageLifecycleRequest, MessagePage,
-    MessageSendRequest, MessageView, MissionOutputView, MissionProductionRequest, MissionRequest,
-    MissionResponse, MissionRevisionRequest, MissionRunRequest, MissionRunView,
-    OperationalRepairApplyRequest, OperationalRepairPlan, OperationalRepairResult, PlannerSpec,
-    PlanningApprovalRequest, PlanningCancelRequest, PlanningCandidateSubmitRequest,
-    PlanningProposalRequest, PlanningRevisionRequest, PlanningSessionStartRequest,
-    PlanningSessionView, QuickAgentRequest, QuickAgentResponse, ReplicaRecordView,
-    ReplicationExportRequest, ReplicationExportResponse, ReplicationPeerFailureRequest,
-    ReplicationReceiveRequest, ReplicationReceiveResponse, ReplicationRepairRequest,
-    ReplicationStatus, ReviewRequest, RevisionApprovalRequest, RevisionCancelRequest,
-    RevisionCutover, RevisionProposalView, RevisionSubmissionView, RunGenerationView,
-    SessionControlResponse, SessionInputMode, SessionInputRequest, SessionLogChunk, SessionScreen,
-    SessionSignalRequest, St3Error, StatusResponse, StepRunView, WorkRequest, WorkRetryRequest,
-    WorkWakeRequest,
+    ClaimRecord, ClaimsPage, ClientPageInfo, ClientResourcePage, ClientSyncNotice, ClientSyncPeer,
+    ContextClearRequest, DoctorCheck, DoctorReport, DocumentListResponse, DocumentPutRequest,
+    DocumentVersion, EvalStartRequest, EvalStartResponse, EvalStatus, EventRecord,
+    GateResultRequest, HumanReviewView, IntentInput, LaunchApproveAndStartRequest,
+    LaunchApproveAndStartView, LaunchDecisionAnswerRequest, LaunchDecisionOption,
+    LaunchDecisionRequest, LaunchDecisionResponse, LaunchDecisionType, LaunchStartRequest,
+    MAX_EVAL_TIMEOUT_MS, MessageLifecycleRequest, MessagePage, MessageSendRequest, MessageView,
+    MissionOutputView, MissionProductionRequest, MissionRequest, MissionResponse,
+    MissionRevisionRequest, MissionRunRequest, MissionRunView, OperationalRepairApplyRequest,
+    OperationalRepairPlan, OperationalRepairResult, PlannerSpec, PlanningApprovalRequest,
+    PlanningCancelRequest, PlanningCandidateSubmitRequest, PlanningProposalRequest,
+    PlanningRevisionRequest, PlanningSessionStartRequest, PlanningSessionView, QuickAgentRequest,
+    QuickAgentResponse, ReplicaRecordView, ReplicationExportRequest, ReplicationExportResponse,
+    ReplicationPeerFailureRequest, ReplicationReceiveRequest, ReplicationReceiveResponse,
+    ReplicationRepairRequest, ReplicationStatus, ReviewRequest, RevisionApprovalRequest,
+    RevisionCancelRequest, RevisionCutover, RevisionProposalView, RevisionSubmissionView,
+    RunGenerationView, SessionControlResponse, SessionInputMode, SessionInputRequest,
+    SessionLogChunk, SessionScreen, SessionSignalRequest, St3Error, StatusResponse, StepRunView,
+    WorkRequest, WorkRetryRequest, WorkWakeRequest,
 };
 use crate::store::Store;
 
@@ -291,6 +291,7 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
         .route("/v1/client/sessions", get(client_sessions))
         .route("/v1/client/sessions/{*id}", get(client_sessions_detail))
         .route("/v1/client/missions", get(client_v0::missions))
+        .route("/v1/client/missions-tree", get(client_v0::missions_tree))
         .route("/v1/client/missions/{*id}", get(client_v0::mission_detail))
         .route("/v1/client/runtimes", get(client_v0::runtimes))
         .route("/v1/client/runtimes/{*id}", get(client_v0::runtime_detail))
@@ -937,6 +938,38 @@ fn client_page(
             next_cursor,
             cursor_expires_at: has_more.then(|| client_timestamp(expires_at_unix_ms)),
         },
+        sync: client_sync_notice(state),
+    })
+}
+
+/// A host catching up with a peer can show early history as current, so each page it serves
+/// says so and how far behind it is.
+fn client_sync_notice(state: &AppState) -> Option<ClientSyncNotice> {
+    // Naming the peers reads the fleet view, so skip it on the usual page read.
+    if !state.store.replication_catching_up() {
+        return None;
+    }
+    let peers = state
+        .store
+        .replication_peer_sync(&replication_peer_names(state))
+        .into_iter()
+        .filter(|(_, sync)| sync.catching_up)
+        .map(|(peer, sync)| ClientSyncPeer {
+            host_id: client_host_id(&peer),
+            peer_only_envelopes: sync.peer_only_envelopes,
+            local_only_envelopes: sync.local_only_envelopes,
+            last_exchange_at: state
+                .store
+                .replication_peer_last_success(&peer)
+                .ok()
+                .flatten()
+                .map(client_timestamp),
+            estimated_catch_up_seconds: sync.estimated_catch_up_seconds,
+        })
+        .collect::<Vec<_>>();
+    (!peers.is_empty()).then(|| ClientSyncNotice {
+        state: "catching-up".into(),
+        peers,
     })
 }
 

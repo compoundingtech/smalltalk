@@ -27,11 +27,12 @@ use st3::model::{
     MissionRevisionRequest, MissionRunView, MissionState, OperationalRepairApplyRequest,
     OperationalRepairPlan, OperationalRepairResult, PlannerSpec, PlanningApprovalRequest,
     PlanningCandidateSubmitRequest, PlanningProposalRequest, PlanningSessionView,
-    ReplicaRecordView, ReplicationRepairRequest, ReplicationStatus, ReviewRequest,
-    RevisionApprovalRequest, RevisionCancelRequest, RevisionProposalView, RevisionSubmissionView,
-    RunGenerationView, SessionControlResponse, SessionInputMode, SessionInputRequest,
-    SessionScreen, SessionSignalRequest, StatusResponse, StepRunView, SubscriptionRequestDecision,
-    SubscriptionRequestView, WorkRequest, WorkRetryRequest, WorkWakeRequest,
+    ReplicaRecordView, ReplicationPeerStatus, ReplicationRepairRequest, ReplicationStatus,
+    ReviewRequest, RevisionApprovalRequest, RevisionCancelRequest, RevisionProposalView,
+    RevisionSubmissionView, RunGenerationView, SessionControlResponse, SessionInputMode,
+    SessionInputRequest, SessionScreen, SessionSignalRequest, StatusResponse, StepRunView,
+    SubscriptionRequestDecision, SubscriptionRequestView, WorkRequest, WorkRetryRequest,
+    WorkWakeRequest,
 };
 use st3::reconcile::Reconciler;
 use st3::store::Store;
@@ -43,7 +44,8 @@ use st3_client::{
     TargetParameters as ClientTargetParameters, TerminalInputMode as ClientTerminalInputMode,
     TerminalInputParameters as ClientTerminalInputParameters,
     TerminalScreen as ClientTerminalScreen, TimelineBody as ClientTimelineBody,
-    TimelineEntry as ClientTimelineEntry, TimelinePage as ClientTimelinePage,
+    TimelineEntry as ClientTimelineEntry, TimelinePage as ClientTimelinePage, catch_up_estimate,
+    envelope_count,
 };
 use tokio::sync::{Notify, watch};
 
@@ -1438,6 +1440,8 @@ enum LaunchCommand {
 
 #[derive(Subcommand)]
 enum MissionViewCommand {
+    /// Show active runs, standing queues, unstarted missions, and agents by host.
+    Tree,
     /// List current missions; use --all for historical terminal missions.
     Ls {
         #[arg(long)]
@@ -3424,6 +3428,15 @@ async fn run_mission_view(
     json_output: bool,
 ) -> Result<()> {
     match command {
+        MissionViewCommand::Tree => {
+            let view: Value = client.get("/v1/client/missions-tree").await?;
+            if json_output {
+                print_value(&view, true)
+            } else {
+                print!("{}", render_missions_tree(&view));
+                Ok(())
+            }
+        }
         MissionViewCommand::Ls { all, cursor, limit } => {
             anyhow::ensure!(
                 limit > 0 && limit <= 200,
@@ -4492,6 +4505,9 @@ fn render_now_page(page: &ClientPage, continuation_command: &str) -> String {
     });
     working.page.next_cursor = None;
     let mut output = String::new();
+    if let Some(sync) = &page.sync {
+        output.push_str(&render_sync_notice(sync, now_ms()));
+    }
     output.push_str(&render_product_page(
         "NEEDS YOU",
         &needs_you,
@@ -4662,11 +4678,40 @@ fn print_product_page(
     if json_output {
         return print_value(response, true);
     }
+    if let Some(sync) = &response.value.sync {
+        print!("{}", render_sync_notice(sync, now_ms()));
+    }
     print!(
         "{}",
         render_product_page(title, &response.value, continuation_command)
     );
     Ok(())
+}
+
+/// A host catching up with a peer shows early history as current, so say so before the items.
+fn render_sync_notice(sync: &st3_client::SyncNotice, now: u128) -> String {
+    use std::fmt::Write as _;
+
+    let mut output = String::new();
+    for peer in &sync.peers {
+        let last_exchange = peer
+            .last_exchange_at
+            .as_deref()
+            .and_then(|at| chrono::DateTime::parse_from_rfc3339(at).ok())
+            .map(|at| {
+                format!(
+                    " · last exchange {}",
+                    relative_time(at.timestamp_millis().max(0) as u128, now)
+                )
+            })
+            .unwrap_or_default();
+        let _ = writeln!(output, "SYNCING  {}{last_exchange}", peer.summary());
+    }
+    let _ = writeln!(
+        output,
+        "  Until then, items below can be out of date. Progress: st3 replication status\n"
+    );
+    output
 }
 
 /// `target mission/fleet/typecase: cancelled 4h ago`
@@ -5448,6 +5493,78 @@ async fn run_repair(client: &Client, command: RepairCommand, json_output: bool) 
     Ok(())
 }
 
+/// Each peer's line, then how far apart the two envelope sets are and how long catching up
+/// should take, in words.
+fn render_replication_peers(peers: &[ReplicationPeerStatus], now: u128) -> String {
+    use std::fmt::Write as _;
+
+    let mut output = String::new();
+    for peer in peers
+        .iter()
+        .filter(|peer| peer.sync.as_ref().is_some_and(|sync| sync.catching_up))
+    {
+        let sync = peer.sync.as_ref().expect("filtered on sync");
+        let _ = writeln!(
+            output,
+            "sync\tcatching up: {} has {} this node lacks, {}",
+            peer.peer,
+            envelope_count(sync.peer_only_envelopes),
+            catch_up_estimate(sync.estimated_catch_up_seconds)
+        );
+    }
+    for peer in peers {
+        let _ = writeln!(
+            output,
+            "peer\t{}\t{}\t{}",
+            peer.peer,
+            peer.status,
+            peer.last_error.as_deref().unwrap_or("")
+        );
+        if let Some(at) = peer.last_success_at_unix_ms {
+            let _ = writeln!(output, "  last exchange {}", relative_time(at, now));
+        } else {
+            let _ = writeln!(output, "  no exchange yet");
+        }
+        let Some(sync) = &peer.sync else {
+            let _ = writeln!(output, "  difference not measured yet");
+            continue;
+        };
+        if sync.peer_only_envelopes == 0 && sync.local_only_envelopes == 0 {
+            let _ = writeln!(
+                output,
+                "  in sync: neither side has an envelope the other lacks (measured {})",
+                relative_time(sync.measured_at_unix_ms, now)
+            );
+            continue;
+        }
+        let _ = writeln!(
+            output,
+            "  {} has {} this node lacks",
+            peer.peer,
+            envelope_count(sync.peer_only_envelopes)
+        );
+        let _ = writeln!(
+            output,
+            "  this node has {} {} lacks",
+            envelope_count(sync.local_only_envelopes),
+            peer.peer
+        );
+        if sync.peer_only_envelopes != 0 {
+            let rate = sync
+                .receive_rate_per_second
+                .map(|rate| format!("receiving {rate:.1} envelopes/s, "))
+                .unwrap_or_default();
+            let _ = writeln!(
+                output,
+                "  {rate}{} (measured {})",
+                catch_up_estimate(sync.estimated_catch_up_seconds),
+                relative_time(sync.measured_at_unix_ms, now)
+            );
+        }
+    }
+    output
+}
+
 async fn run_replication(
     client: &Client,
     command: ReplicationCommand,
@@ -5475,14 +5592,7 @@ async fn run_replication(
                 status.repaired_records
             );
             println!("unhealthy-projections\t{}", status.unhealthy_projections);
-            for peer in status.peers {
-                println!(
-                    "peer\t{}\t{}\t{}",
-                    peer.peer,
-                    peer.status,
-                    peer.last_error.as_deref().unwrap_or("")
-                );
-            }
+            print!("{}", render_replication_peers(&status.peers, now_ms()));
             Ok(())
         }
         ReplicationCommand::Invalid { all } => {
@@ -6369,6 +6479,152 @@ async fn run_agent_queue(
     let queue = client.agent_queue(&agent).await?;
     print!("{}", render_agent_queue(&queue.value));
     Ok(())
+}
+
+fn render_missions_tree(response: &Value) -> String {
+    use std::fmt::Write as _;
+    let value = &response["value"];
+    let mut output = String::from("RUNNING MISSIONS\n");
+    let runs = value["runs"].as_array();
+    if runs.is_none_or(Vec::is_empty) {
+        output.push_str("  none\n");
+    }
+    for run in runs.into_iter().flatten() {
+        let steps = run["steps"].as_array();
+        let done = steps
+            .into_iter()
+            .flatten()
+            .filter(|step| step["state"] == "completed")
+            .count();
+        let active_step = steps
+            .into_iter()
+            .flatten()
+            .find(|step| step["state"] == "claimed")
+            .or_else(|| {
+                steps
+                    .into_iter()
+                    .flatten()
+                    .find(|step| step["state"] == "ready")
+            })
+            .and_then(|step| step["id"].as_str());
+        let active = steps
+            .into_iter()
+            .flatten()
+            .find(|step| step["id"].as_str() == active_step)
+            .and_then(|step| step["name"].as_str())
+            .unwrap_or("waiting");
+        let pending = steps
+            .into_iter()
+            .flatten()
+            .filter(|step| step["state"] != "completed" && step["id"].as_str() != active_step)
+            .filter_map(|step| step["name"].as_str())
+            .collect::<Vec<_>>();
+        let mission = run["mission"].as_str().unwrap_or("unknown");
+        let _ = writeln!(
+            output,
+            "  {mission}: {active} → {}  ({done} done)",
+            if pending.is_empty() {
+                "done".to_owned()
+            } else {
+                pending.join(" → ")
+            }
+        );
+    }
+    output.push_str("STANDING QUEUES\n");
+    let queues = value["standing_queues"].as_array();
+    if queues.is_none_or(Vec::is_empty) {
+        output.push_str("  none\n");
+    }
+    for queue in queues.into_iter().flatten() {
+        let id = queue["agent_id"].as_str().unwrap_or("unknown");
+        let current = queue["current_work_ids"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>();
+        let next = queue["next_work_id"].as_str().unwrap_or("none");
+        let waiting = queue["runs"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|run| run["state"] == "waiting")
+            .filter_map(|run| run["mission_run_id"].as_str())
+            .collect::<Vec<_>>();
+        let _ = writeln!(
+            output,
+            "  {id}: current {} · next {next} · waiting {}",
+            if current.is_empty() {
+                "none".to_owned()
+            } else {
+                current.join(", ")
+            },
+            if waiting.is_empty() {
+                "none".to_owned()
+            } else {
+                waiting.join(", ")
+            }
+        );
+    }
+    output.push_str("UNSTARTED MISSIONS\n");
+    let unstarted = value["unstarted_missions"].as_array();
+    if unstarted.is_none_or(Vec::is_empty) {
+        output.push_str("  none\n");
+    }
+    for mission in unstarted.into_iter().flatten() {
+        let suffix = if mission["state"] == "draft" {
+            " (draft)"
+        } else {
+            ""
+        };
+        let _ = writeln!(
+            output,
+            "  {}{suffix}",
+            mission["title"].as_str().unwrap_or("unknown")
+        );
+    }
+    output.push_str("AGENTS BY HOST\n");
+    let mut grouped = BTreeMap::<String, BTreeMap<String, Vec<&Value>>>::new();
+    for agent in value["agents"].as_array().into_iter().flatten() {
+        let host = agent["host_id"].as_str().unwrap_or("unknown").to_owned();
+        let kind = agent["seat_kind"].as_str().unwrap_or("standing").to_owned();
+        grouped
+            .entry(host)
+            .or_default()
+            .entry(kind)
+            .or_default()
+            .push(agent);
+    }
+    if grouped.is_empty() {
+        output.push_str("  none\n");
+    }
+    for (host, kinds) in grouped {
+        let _ = writeln!(output, "  {host}");
+        for kind in ["standing", "mission"] {
+            let Some(agents) = kinds.get(kind) else {
+                continue;
+            };
+            let _ = writeln!(output, "    {kind}");
+            for agent in agents {
+                let state = if agent["harness_state"] == "working" {
+                    "working"
+                } else if agent["state"] == "running" {
+                    "idle"
+                } else {
+                    "waiting"
+                };
+                let _ = writeln!(
+                    output,
+                    "      {}  {} / {} / {}  {state}",
+                    agent["name"].as_str().unwrap_or("unknown"),
+                    agent["driver"].as_str().unwrap_or("unknown"),
+                    agent["model"].as_str().unwrap_or("default"),
+                    agent["effort"].as_str().unwrap_or("default")
+                );
+            }
+        }
+    }
+    output
 }
 
 fn render_agent_queue(queue: &st3_client::AgentQueue) -> String {
@@ -7498,6 +7754,7 @@ fn current_local_pty_incarnation(actor: &str) -> Result<Option<String>> {
 
 async fn wait_for_agent_incarnation(client: &Client, actor: &str) -> Result<String> {
     let mut deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    let mut outage_logged = false;
     let has_local_pty_registry =
         std::env::var_os("PTY_ROOT").is_some_and(|value| !value.is_empty());
     loop {
@@ -7515,6 +7772,13 @@ async fn wait_for_agent_incarnation(client: &Client, actor: &str) -> Result<Stri
                 Ok(None) => {}
                 // A restarting daemon cannot answer yet; its outage does not use up the wait.
                 Err(error) if st3::client::daemon_unreachable(&error).is_some() => {
+                    if !outage_logged {
+                        let _ = write_driver_log(
+                            actor,
+                            "waiting for the runtime incarnation while the daemon restarts",
+                        );
+                        outage_logged = true;
+                    }
                     deadline = tokio::time::Instant::now() + Duration::from_secs(15);
                 }
                 Err(error) => return Err(error),
@@ -10555,6 +10819,7 @@ mod tests {
             schema_digest: None,
             authority_digest: digest.map(str::to_owned),
             graph_digest: None,
+            sync: None,
         }
     }
 
@@ -10588,6 +10853,26 @@ mod tests {
 
         status.peers[1].authority_digest = Some("mine".into());
         assert_eq!(leave_confirmation(&status, None).unwrap(), Some("c".into()));
+    }
+
+    #[test]
+    fn missions_tree_fixture_renders_all_sections() {
+        let fixture: Value =
+            serde_json::from_str(include_str!("../tests/fixtures/missions-tree.json"))
+                .expect("valid missions tree fixture");
+        assert_eq!(
+            render_missions_tree(&fixture),
+            include_str!("../tests/fixtures/missions-tree.txt")
+        );
+        let cli = Cli::try_parse_from(["st", "missions", "tree", "--json"])
+            .expect("missions tree --json parses");
+        assert!(cli.json);
+        assert!(matches!(
+            cli.command,
+            Command::Missions {
+                command: MissionViewCommand::Tree
+            }
+        ));
     }
 
     #[test]
@@ -11337,7 +11622,106 @@ mod tests {
                 next_cursor: has_more.then(|| "cursor/next".into()),
                 cursor_expires_at: None,
             },
+            sync: None,
         }
+    }
+
+    #[test]
+    fn replication_status_says_which_side_holds_what_and_how_long_catching_up_takes() {
+        let now = 1_000_000;
+        let peer =
+            |name: &str, sync: Option<st3::model::ReplicationPeerSync>| ReplicationPeerStatus {
+                peer: name.into(),
+                status: "up".into(),
+                last_success_at_unix_ms: Some(now - 2_000),
+                last_error: None,
+                schema_digest: None,
+                authority_digest: None,
+                graph_digest: None,
+                sync,
+            };
+        let output = render_replication_peers(
+            &[
+                peer(
+                    "Silber",
+                    Some(st3::model::ReplicationPeerSync {
+                        peer_only_envelopes: 124_384,
+                        local_only_envelopes: 3,
+                        measured_at_unix_ms: now - 2_000,
+                        receive_rate_per_second: Some(142.5),
+                        catch_up_rate_per_second: Some(140.0),
+                        estimated_catch_up_seconds: Some(889),
+                        catching_up: true,
+                    }),
+                ),
+                peer(
+                    "Quiet",
+                    Some(st3::model::ReplicationPeerSync {
+                        measured_at_unix_ms: now,
+                        ..Default::default()
+                    }),
+                ),
+                peer("Fresh", None),
+            ],
+            now,
+        );
+        assert_eq!(
+            output,
+            "sync\tcatching up: Silber has 124,384 envelopes this node lacks, \
+             caught up in about 15m\n\
+             peer\tSilber\tup\t\n\
+             \x20 last exchange 2s ago\n\
+             \x20 Silber has 124,384 envelopes this node lacks\n\
+             \x20 this node has 3 envelopes Silber lacks\n\
+             \x20 receiving 142.5 envelopes/s, caught up in about 15m (measured 2s ago)\n\
+             peer\tQuiet\tup\t\n\
+             \x20 last exchange 2s ago\n\
+             \x20 in sync: neither side has an envelope the other lacks (measured now)\n\
+             peer\tFresh\tup\t\n\
+             \x20 last exchange 2s ago\n\
+             \x20 difference not measured yet\n"
+        );
+    }
+
+    #[test]
+    fn a_catching_up_page_leads_with_how_far_behind_this_host_is() {
+        let mut page = fixture_product_page(&["attention"], false);
+        page.sync = Some(st3_client::SyncNotice {
+            state: "catching-up".into(),
+            peers: vec![st3_client::SyncPeer {
+                host_id: "host/Silber".into(),
+                peer_only_envelopes: 1,
+                local_only_envelopes: 0,
+                last_exchange_at: Some("1970-01-01T00:16:38Z".into()),
+                estimated_catch_up_seconds: None,
+            }],
+        });
+        let output = render_now_page(&page, "st3 now --as person/nathan");
+        assert!(
+            output.starts_with(
+                "SYNCING  Silber has 1 envelope this host lacks · estimating time to catch up · \
+                 last exchange "
+            ),
+            "{output}"
+        );
+        assert!(
+            output.contains("items below can be out of date"),
+            "{output}"
+        );
+        assert_eq!(
+            render_sync_notice(page.sync.as_ref().unwrap(), 1_000_000),
+            "SYNCING  Silber has 1 envelope this host lacks · estimating time to catch up · \
+             last exchange 2s ago\n  Until then, items below can be out of date. \
+             Progress: st3 replication status\n\n"
+        );
+        assert_eq!(catch_up_estimate(Some(0)), "caught up");
+        assert_eq!(catch_up_estimate(Some(59)), "caught up in under a minute");
+        assert_eq!(catch_up_estimate(Some(3_601)), "caught up in about 1h 1m");
+        assert_eq!(catch_up_estimate(Some(90_000)), "caught up in about 1d 1h");
+        assert_eq!(envelope_count(1_234_567), "1,234,567 envelopes");
+
+        page.sync = None;
+        assert!(!render_now_page(&page, "st3 now").contains("SYNCING"));
     }
 
     #[test]

@@ -126,6 +126,77 @@ pub struct Page {
     pub filters: BTreeMap<String, String>,
     pub items: Vec<Resource>,
     pub page: PageInfo,
+    /// Present while this host is catching up with a peer, so the page can show early history
+    /// as current.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sync: Option<SyncNotice>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct SyncNotice {
+    pub state: String,
+    pub peers: Vec<SyncPeer>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct SyncPeer {
+    pub host_id: String,
+    /// Envelopes the peer holds that this host lacks.
+    pub peer_only_envelopes: u64,
+    /// Envelopes this host holds that the peer lacks.
+    pub local_only_envelopes: u64,
+    #[serde(default)]
+    pub last_exchange_at: Option<String>,
+    #[serde(default)]
+    pub estimated_catch_up_seconds: Option<u64>,
+}
+
+impl SyncPeer {
+    /// `Silber has 124,384 envelopes this host lacks · caught up in about 14m`
+    pub fn summary(&self) -> String {
+        format!(
+            "{} has {} this host lacks · {}",
+            self.host_id.strip_prefix("host/").unwrap_or(&self.host_id),
+            envelope_count(self.peer_only_envelopes),
+            catch_up_estimate(self.estimated_catch_up_seconds)
+        )
+    }
+}
+
+/// `1 envelope` or `124,384 envelopes`.
+pub fn envelope_count(count: u64) -> String {
+    let digits = count.to_string();
+    let mut grouped = String::new();
+    for (index, digit) in digits.chars().enumerate() {
+        if index != 0 && (digits.len() - index) % 3 == 0 {
+            grouped.push(',');
+        }
+        grouped.push(digit);
+    }
+    format!("{grouped} envelope{}", if count == 1 { "" } else { "s" })
+}
+
+/// `caught up in about 14m`, rounded up so a short remainder never reads as done.
+pub fn catch_up_estimate(seconds: Option<u64>) -> String {
+    let Some(seconds) = seconds else {
+        return "estimating time to catch up".into();
+    };
+    let minutes = seconds.div_ceil(60);
+    if seconds == 0 {
+        "caught up".into()
+    } else if seconds < 60 {
+        "caught up in under a minute".into()
+    } else if minutes < 60 {
+        format!("caught up in about {minutes}m")
+    } else if minutes < 24 * 60 {
+        format!("caught up in about {}h {}m", minutes / 60, minutes % 60)
+    } else {
+        format!(
+            "caught up in about {}d {}h",
+            minutes / (24 * 60),
+            minutes % (24 * 60) / 60
+        )
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
