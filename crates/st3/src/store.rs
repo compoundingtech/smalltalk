@@ -8444,23 +8444,16 @@ impl Store {
                 .query_map([], claim_from_row)?
                 .collect::<Result<Vec<_>, _>>()?;
             for failure in failures {
+                let attention_subject = format!("attention/subscription-failure/{}", failure.id);
+                let Some(attention) = attention_request_view_tx(&connection, &attention_subject)?
+                else {
+                    continue;
+                };
+                if attention.status != "pending" {
+                    continue;
+                }
                 let fields = failure.body.get("fields").unwrap_or(&failure.body);
-                let request = fields
-                    .get("request")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default();
-                let requester: Option<String> = connection
-                    .query_row(
-                        "SELECT json_extract(body, '$.fields.requester') FROM claims WHERE id=?1",
-                        [request],
-                        |row| row.get(0),
-                    )
-                    .optional()?
-                    .flatten();
-                let reviewer = requester
-                    .filter(|value| value.starts_with("person/"))
-                    .unwrap_or_default();
-                if person.is_some_and(|person| person != reviewer) {
+                if person.is_some_and(|person| person != attention.reviewer) {
                     continue;
                 }
                 let code = fields
@@ -8473,9 +8466,9 @@ impl Store {
                     .unwrap_or_default();
                 items.push(AttentionItemView {
                     kind: "fault".into(),
-                    subject: failure.id,
-                    person: reviewer,
-                    requester_id: None,
+                    subject: attention_subject,
+                    person: attention.reviewer,
+                    requester_id: Some("daemon/runtime".into()),
                     title: "Subscription mission failed".into(),
                     detail: format!("{code}: {reason}"),
                     mission: None,
@@ -14730,7 +14723,7 @@ fn attention_request_view_tx(
         )
         .optional()?;
     let Some(requested) = requested else {
-        return Ok(None);
+        return subscription_failure_attention_view_tx(connection, subject);
     };
     let resolved = connection
         .query_row(
@@ -14800,6 +14793,83 @@ fn attention_request_view_tx(
             .get("until")
             .and_then(Value::as_str)
             .map(str::to_owned),
+    }))
+}
+
+fn subscription_failure_attention_view_tx(
+    connection: &Connection,
+    subject: &str,
+) -> Result<Option<AttentionRequestView>> {
+    let Some(id) = subject.strip_prefix("attention/subscription-failure/") else {
+        return Ok(None);
+    };
+    let failure = connection
+        .query_row(
+            "SELECT id, store_index, batch_id, subject, kind, origin, actor, body,
+                    predecessors, accepted_at_unix_ms
+             FROM claims WHERE id=?1 AND kind='subscription.mission-failed'",
+            [id],
+            claim_from_row,
+        )
+        .optional()?;
+    let Some(failure) = failure else {
+        return Ok(None);
+    };
+    let fields = failure.body.get("fields").unwrap_or(&failure.body);
+    let request = fields
+        .get("request")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let requester: Option<String> = connection
+        .query_row(
+            "SELECT json_extract(body, '$.fields.requester') FROM claims WHERE id=?1",
+            [request],
+            |row| row.get(0),
+        )
+        .optional()?
+        .flatten();
+    let reviewer = requester
+        .filter(|value| value.starts_with("person/"))
+        .unwrap_or_else(|| "person/nathan".into());
+    let resolved = connection
+        .query_row(
+            "SELECT id, store_index, batch_id, subject, kind, origin, actor, body,
+                    predecessors, accepted_at_unix_ms
+             FROM claims WHERE subject=?1 AND kind='attention.resolved'
+             ORDER BY store_index DESC LIMIT 1",
+            [subject],
+            claim_from_row,
+        )
+        .optional()?;
+    let resolution_fields = resolved
+        .as_ref()
+        .map(|claim| claim.body.get("fields").unwrap_or(&claim.body));
+    let outcome = resolution_fields
+        .and_then(|fields| fields.get("outcome"))
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    Ok(Some(AttentionRequestView {
+        subject: subject.into(),
+        request: failure.id,
+        reviewer,
+        title: "Subscription mission failed".into(),
+        reason: fields
+            .get("reason")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .into(),
+        severity: "error".into(),
+        targets: vec![failure.subject],
+        actor: "daemon/runtime".into(),
+        status: outcome.clone().unwrap_or_else(|| "pending".into()),
+        outcome,
+        resolution_reason: resolution_fields
+            .and_then(|fields| fields.get("reason"))
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        requested_at_unix_ms: failure.accepted_at_unix_ms,
+        resolved_at_unix_ms: resolved.map(|claim| claim.accepted_at_unix_ms),
+        until: None,
     }))
 }
 
@@ -15267,7 +15337,7 @@ fn attention_item_from_planning(
         kind: "launch-approval".into(),
         subject: session.subject.clone(),
         person: session.requester.clone(),
-        requester_id: None,
+        requester_id: Some(session.requester.clone()),
         title: format!("Approve mission/{}", session.mission),
         detail: "The current launch preview is ready for approval.".into(),
         mission: Some(format!("mission/{}", session.mission)),
@@ -15365,7 +15435,7 @@ fn attention_item_from_message(
         kind: "unread-message".into(),
         subject: message.subject.clone(),
         person: message.to.clone(),
-        requester_id: None,
+        requester_id: Some(message.from.clone()),
         title: message
             .title
             .unwrap_or_else(|| format!("Message from {}", message.from)),
@@ -15396,7 +15466,12 @@ pub(crate) fn agent_attention_requester(actor: &str) -> bool {
 fn attention_item_from_request(request: AttentionRequestView) -> AttentionItemView {
     let agent_request = agent_attention_requester(&request.actor);
     AttentionItemView {
-        kind: if agent_request { "agent-request" } else { "fault" }.into(),
+        kind: if agent_request {
+            "agent-request"
+        } else {
+            "fault"
+        }
+        .into(),
         subject: request.subject.clone(),
         person: request.reviewer.clone(),
         requester_id: Some(request.actor.clone()),

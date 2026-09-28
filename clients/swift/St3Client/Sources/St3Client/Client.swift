@@ -45,6 +45,7 @@ public actor St3Client {
     }
     private func submit(_ action: ActionRequest) async throws -> Envelope<ActionResult> { try await post("v1/client/actions", action) }
     public func nowList(cursor: String? = nil, limit: Int? = nil, history: Bool = false) async throws -> Envelope<ResourcePage> { try await list("now", cursor: cursor, limit: limit, history: history) }
+    public func documentGet(reference: String) async throws -> Envelope<DocumentContent> { try await get("v1/client/documents/content", query: [.init(name: "name", value: reference)]) }
     public func machinesList(cursor: String? = nil, limit: Int? = nil, history: Bool = false) async throws -> Envelope<ResourcePage> { try await list("machines", cursor: cursor, limit: limit, history: history) }
     public func devicesList(cursor: String? = nil, limit: Int? = nil, history: Bool = false) async throws -> Envelope<ResourcePage> { try await list("devices", cursor: cursor, limit: limit, history: history) }
     public func attentionList(cursor: String? = nil, limit: Int? = nil, history: Bool = false) async throws -> Envelope<ResourcePage> { try await list("attention", cursor: cursor, limit: limit, history: history) }

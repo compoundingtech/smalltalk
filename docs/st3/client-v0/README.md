@@ -149,6 +149,10 @@ the stable `id` ascending. No locale-sensitive ordering is permitted.
 | Sessions | `/sessions`, `/sessions/{id}` | updated time descending, ID |
 | Session timeline | `/sessions/{id}/timeline` | sequence ascending |
 
+`GET /documents/content?name=doc/NAME@HASH` reads an exact immutable document version with
+`read.projections` scope. The response contains `reference` and its byte array. The Rust, Swift,
+and TypeScript clients expose this as `document_get` or `documentGet`.
+
 IDs are stable opaque strings with a type prefix. Renames change labels, not IDs. A detail response
 uses the same representation as its list item plus its documented detail fields. Deletion is
 represented by an event tombstone; an ID is never reused.
@@ -161,6 +165,13 @@ Every attention resource carries its concrete `person_id`, original `source_id`,
 `attention_kind`, optional mission/run/step context, and currently meaningful typed actions. A
 client can therefore render a mixed inbox, navigate to the source, and act without recovering
 identity or graph context from prose.
+
+Attention also exposes `requester_id` when known. Launch approvals provide `launch_id`,
+`variant_id`, and a compact `preview`; unread messages provide `message_id`. The same launch
+preview appears on `Launch` and includes its goal, steps, agents, gate counts, diagnostics count,
+and request excerpt. Faults expose `what`, `because`, and optional `fix`. Agent requests have the
+`agent-request` kind. Subscription failures have resolvable attention IDs, and a resolution
+removes them from the current inbox. `/now` preserves the attention queue order.
 
 A `fault` also carries `target_states`: for each target with a lifecycle (a mission, run,
 generation, step, attention item, or agent), its current `state` and, when known, the `since`

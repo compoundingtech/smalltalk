@@ -249,6 +249,10 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
         .route("/v1/health", get(health))
         .route("/v1/client/capabilities", get(client_capabilities))
         .route("/v1/client/now", get(client_v0::now))
+        .route(
+            "/v1/client/documents/content",
+            get(client_v0::document_content),
+        )
         .route("/v1/client/machines", get(client_v0::machines))
         .route("/v1/client/devices", get(client_v0::devices))
         .route("/v1/client/attention", get(client_attention))
@@ -1694,6 +1698,7 @@ fn client_attention_resources(
     store: &Store,
     person: Option<&str>,
     history: bool,
+    node: &str,
 ) -> anyhow::Result<Vec<Value>> {
     let current = store.attention_items(person)?;
     let current_subjects = current
@@ -1715,6 +1720,11 @@ fn client_attention_resources(
             .claims_for(&item.subject, None)?
             .last()
             .map(|claim| claim.id.clone())
+            .or_else(|| {
+                item.subject
+                    .strip_prefix("attention/subscription-failure/")
+                    .map(str::to_owned)
+            })
             .ok_or_else(|| anyhow::anyhow!("attention `{}` has no accepted claim", item.subject))?;
         let mut resource = json!({
             "id": id,
@@ -1739,6 +1749,40 @@ fn client_attention_resources(
         if let Some(requester) = &item.requester_id {
             object.insert("requester_id".into(), Value::String(requester.clone()));
         }
+        match item.kind.as_str() {
+            "launch-approval" => {
+                if let Some(session_id) = item.subject.strip_prefix("planning-session/")
+                    && let Some(session) = store.planning_session(session_id)?
+                {
+                    object.insert(
+                        "launch_id".into(),
+                        Value::String(format!("launch/{}", session.id)),
+                    );
+                    if let Some(candidate) = &session.candidate {
+                        object.insert(
+                            "variant_id".into(),
+                            Value::String(format!(
+                                "launch-variant/{}/{}",
+                                session.id, candidate.variant
+                            )),
+                        );
+                    }
+                    if let Some(preview) = compact_launch_preview(store, node, &session)? {
+                        if let Some(token) = preview
+                            .get("preview_token")
+                            .filter(|token| !token.is_null())
+                        {
+                            object.insert("preview_token".into(), token.clone());
+                        }
+                        object.insert("preview".into(), preview);
+                    }
+                }
+            }
+            "unread-message" => {
+                object.insert("message_id".into(), Value::String(item.subject.clone()));
+            }
+            _ => {}
+        }
         if matches!(item.kind.as_str(), "fault" | "agent-request")
             && attention_requester_retired(store, item, &mut retired_seats)?
         {
@@ -1755,6 +1799,37 @@ fn client_attention_resources(
         }
         if matches!(item.kind.as_str(), "fault" | "agent-request") {
             insert_attention_target_states(store, object, &item.targets)?;
+        }
+        if item.kind == "fault" {
+            let claim =
+                if let Some(id) = item.subject.strip_prefix("attention/subscription-failure/") {
+                    store.claim_by_id(id)?
+                } else {
+                    store
+                        .claims_for(&item.subject, Some("attention.requested"))?
+                        .into_iter()
+                        .next()
+                };
+            let fields = claim
+                .as_ref()
+                .map(|claim| claim.body.get("fields").unwrap_or(&claim.body));
+            object.insert(
+                "what".into(),
+                fields
+                    .and_then(|fields| fields.get("what"))
+                    .cloned()
+                    .unwrap_or_else(|| Value::String(item.title.clone())),
+            );
+            object.insert(
+                "because".into(),
+                fields
+                    .and_then(|fields| fields.get("because"))
+                    .cloned()
+                    .unwrap_or_else(|| Value::String(item.detail.clone())),
+            );
+            object.insert("fix".into(), fields.and_then(|fields| fields.get("fix")).cloned().unwrap_or_else(|| {
+                item.subject.strip_prefix("attention/subscription-failure/").map_or(Value::Null, |_| json!({"action": "inspect-subscription", "target": item.targets.first()}))
+            }));
         }
         resources.insert(id, resource);
     }
@@ -1791,6 +1866,24 @@ fn client_attention_resources(
                     "actions": if current { client_attention_actions(kind) } else { Vec::<&str>::new() },
                     "operational": { "layer": if current { "current" } else { "history" }, "actionable": current, "reasons": reasons }
             });
+            if kind == "fault" {
+                let claim = store.claim_by_id(&request.request)?;
+                let fields = claim
+                    .as_ref()
+                    .map(|claim| claim.body.get("fields").unwrap_or(&claim.body));
+                resource["what"] = fields
+                    .and_then(|fields| fields.get("what"))
+                    .cloned()
+                    .unwrap_or_else(|| Value::String(request.title.clone()));
+                resource["because"] = fields
+                    .and_then(|fields| fields.get("because"))
+                    .cloned()
+                    .unwrap_or_else(|| Value::String(request.reason.clone()));
+                resource["fix"] = fields
+                    .and_then(|fields| fields.get("fix"))
+                    .cloned()
+                    .unwrap_or(Value::Null);
+            }
             insert_attention_target_states(
                 store,
                 resource
@@ -2070,6 +2163,96 @@ fn launch_preview_token_values(
     ))
 }
 
+fn compact_launch_preview(
+    store: &Store,
+    node: &str,
+    session: &PlanningSessionView,
+) -> anyhow::Result<Option<Value>> {
+    let (Some(candidate), Some(preview)) = (&session.candidate, &session.preview) else {
+        return Ok(None);
+    };
+    if preview.candidate_revision != candidate.revision || preview.variant != candidate.variant {
+        return Ok(None);
+    }
+    let intent = parse_intent(&preview.mission.resolved_intent.kdl, node)
+        .map_err(|error| anyhow::anyhow!(error.message))?;
+    let mission = intent
+        .missions
+        .get(&session.mission)
+        .ok_or_else(|| anyhow::anyhow!("preview mission is missing"))?;
+    let diagnostics = client_launch_diagnostics(preview);
+    let mut normalized = serde_json::to_value(mission)?;
+    client_safe_json(&mut normalized);
+    let preview_token = session
+        .variants
+        .iter()
+        .find(|variant| variant.name == candidate.variant)
+        .map(|variant| launch_preview_token(session, variant, &normalized, &diagnostics))
+        .transpose()?;
+    let steps = mission
+        .display_order
+        .iter()
+        .filter_map(|id| mission.steps.get(id))
+        .map(|step| {
+            let assignee = match &step.work_selector {
+                Some(crate::model::WorkSelector::Assigned { agent }) => Some(agent.clone()),
+                Some(crate::model::WorkSelector::Available { agents }) => Some(agents.join(", ")),
+                Some(crate::model::WorkSelector::Agentless) => Some("system".into()),
+                None => None,
+            };
+            let depends = step
+                .dependencies
+                .iter()
+                .filter_map(|dependency| match dependency {
+                    crate::model::DependencySpec::Step { step, .. } => Some(step.clone()),
+                    crate::model::DependencySpec::Predicate { .. } => None,
+                })
+                .collect::<Vec<_>>();
+            json!({"path": step.path, "title": step.title.as_deref().unwrap_or(&step.id), "assignee": assignee, "depends": depends})
+        })
+        .collect::<Vec<_>>();
+    let agents = intent
+        .subjects
+        .values()
+        .filter_map(|subject| {
+            let member = subject.member.as_ref()?;
+            matches!(&member.kind, crate::model::MemberKind::Agent).then(
+                || json!({"id": subject.subject, "harness": member.driver, "host": member.host}),
+            )
+        })
+        .collect::<Vec<_>>();
+    let gates = mission
+        .gates
+        .iter()
+        .chain(mission.steps.values().flat_map(|step| step.gates.iter()));
+    let (human, automated) = gates.fold((0_usize, 0_usize), |(human, automated), gate| {
+        if matches!(gate, crate::model::GateSpec::Human { .. }) {
+            (human + 1, automated)
+        } else {
+            (human, automated + 1)
+        }
+    });
+    let request_excerpt = session
+        .request
+        .rsplit_once('@')
+        .and_then(|(name, hash)| store.get_document(name, hash).ok().flatten())
+        .map(|bytes| {
+            String::from_utf8_lossy(&bytes)
+                .chars()
+                .take(240)
+                .collect::<String>()
+        });
+    Ok(Some(json!({
+        "goal": mission.goals.first(),
+        "steps": steps,
+        "agents": agents,
+        "gates": { "human": human, "automated": automated },
+        "diagnostics_count": diagnostics.len(),
+        "request_excerpt": request_excerpt,
+        "preview_token": preview_token,
+    })))
+}
+
 fn launch_visualization(
     mission: &crate::model::MissionSpec,
     session: &PlanningSessionView,
@@ -2324,6 +2507,7 @@ fn client_launch_resources(state: &AppState, history: bool) -> anyhow::Result<Ve
                 .into_iter()
                 .rev()
                 .find_map(|variant| variant.get("visualization").cloned());
+            let preview = compact_launch_preview(store, &state.node, &session)?;
             let approval_ids = store.claims_for(&session.subject, None)?.into_iter().filter(|claim| claim.kind == "planning-session.approved").filter_map(|claim| claim.body.pointer("/fields/candidate_revision").and_then(Value::as_u64).map(|revision| format!("launch-approval/{}/{revision}", session.id))).collect::<Vec<_>>();
             Ok(json!({
                 "id": format!("launch/{}", session.id),
@@ -2340,6 +2524,7 @@ fn client_launch_resources(state: &AppState, history: bool) -> anyhow::Result<Ve
                 "decisions": decisions.iter().filter_map(|decision| decision["id"].as_str()).collect::<Vec<_>>(),
                 "approvals": approval_ids,
                 "visualization": visualization,
+                "preview": preview,
                 "operational": { "layer": if historical { "history" } else { "current" }, "actionable": !historical, "reasons": if historical { vec![phase] } else { Vec::<&str>::new() } }
             }))
         })
@@ -2605,8 +2790,9 @@ async fn client_attention(
     if effective_query.cursor.is_some() {
         return client_page(&state, &snapshot, "attention", Vec::new(), &effective_query).map(Json);
     }
-    let items = client_attention_resources(&state.store, person.as_deref(), query.history)
-        .map_err(ApiError::internal)?;
+    let items =
+        client_attention_resources(&state.store, person.as_deref(), query.history, &state.node)
+            .map_err(ApiError::internal)?;
     client_page(&state, &snapshot, "attention", items, &effective_query).map(Json)
 }
 
@@ -2618,7 +2804,7 @@ async fn client_attention_detail(
 ) -> Result<Json<Value>, ApiError> {
     let person = client_v0::person_filter(&session, query.person.as_deref())?;
     client_detail(
-        client_attention_resources(&state.store, person.as_deref(), query.history)
+        client_attention_resources(&state.store, person.as_deref(), query.history, &state.node)
             .map_err(ApiError::internal)?,
         "attention",
         &id,
@@ -6146,7 +6332,10 @@ async fn post_review(
         )));
     }
     if request.decision == "rejected"
-        && request.reason.as_deref().is_none_or(|reason| reason.trim().is_empty())
+        && request
+            .reason
+            .as_deref()
+            .is_none_or(|reason| reason.trim().is_empty())
     {
         return Err(ApiError::bad(St3Error::new(
             "missing-review-reason",
@@ -6254,11 +6443,15 @@ async fn post_review(
                             .into_iter()
                             .rev()
                             .find(|claim| {
-                                claim.body.pointer("/fields/attempt").and_then(Value::as_u64)
+                                claim
+                                    .body
+                                    .pointer("/fields/attempt")
+                                    .and_then(Value::as_u64)
                                     == Some(u64::from(step.attempt))
                             })
                             .and_then(|claim| {
-                                claim.body
+                                claim
+                                    .body
                                     .pointer("/fields/claimant")
                                     .and_then(Value::as_str)
                                     .map(str::to_owned)
@@ -9248,6 +9441,71 @@ mod tests {
         assert_eq!(second["has_more"], false);
     }
 
+    #[tokio::test]
+    async fn client_reads_only_an_immutable_document_reference() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let version = state
+            .store
+            .put_document("doc/review", b"finding", &None, "client-document")
+            .unwrap();
+        let app = router(state);
+        let reference = format!("doc/review@{}", version.hash);
+        let (status, body) = get_request(
+            app.clone(),
+            &format!(
+                "/v1/client/documents/content?name={}",
+                urlencoding::encode(&reference)
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["reference"], reference);
+        assert_eq!(body["bytes"], json!([102, 105, 110, 100, 105, 110, 103]));
+        let invalid = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/client/documents/content?name=doc%2Freview")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(invalid.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[tokio::test]
+    async fn client_now_keeps_attention_priority_order() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        for (subject, severity, key) in [
+            ("attention/alpha", "warning", "first-warning"),
+            ("attention/zulu", "error", "second-error"),
+        ] {
+            state
+                .store
+                .request_attention(
+                    subject,
+                    &AttentionRequest {
+                        reviewer: "person/nathan".into(),
+                        title: subject.into(),
+                        reason: "Needs review".into(),
+                        severity: severity.into(),
+                        targets: Vec::new(),
+                        actor: "agent/st3/reconciler".into(),
+                        idempotency_key: key.into(),
+                    },
+                )
+                .unwrap();
+        }
+        let (status, now) = get_request(router(state), "/v1/client/now").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(now["items"][0]["source_id"], "attention/zulu");
+        assert_eq!(now["items"][1]["source_id"], "attention/alpha");
+        assert_eq!(now["items"][0]["what"], "attention/zulu");
+        assert_eq!(now["items"][0]["because"], "Needs review");
+    }
+
     async fn json_request(app: Router, path: &str, value: Value) -> (StatusCode, Value) {
         let response = app
             .oneshot(
@@ -10207,6 +10465,19 @@ version 2
         let preview_token = variant["preview_token"].as_str().unwrap().to_owned();
         assert!(preview_token.starts_with("lpv0:"));
         assert_eq!(current_hash, preview_token);
+        let (_, attention) =
+            get_request(app.clone(), "/v1/client/attention?person=person%2Fnathan").await;
+        let review = &attention["items"][0];
+        assert_eq!(review["launch_id"], format!("launch/{session}"));
+        assert_eq!(
+            review["variant_id"],
+            format!("launch-variant/{session}/default")
+        );
+        assert_eq!(review["preview"]["preview_token"], preview_token);
+        assert_eq!(review["preview_token"], preview_token);
+        assert_eq!(review["preview"]["steps"][2]["depends"], json!(["change"]));
+        let (_, launch) = get_request(app.clone(), &format!("/v1/client/launches/{session}")).await;
+        assert_eq!(launch["preview"], review["preview"]);
         assert_eq!(variant["normalized_mission"]["id"], "planned/work");
         assert!(
             !serde_json::to_string(&variant["normalized_mission"])
@@ -13696,7 +13967,8 @@ version 2
         assert_eq!(selected[0]["kind"], "agent-request");
         assert_eq!(selected[0]["requester_id"], "agent/fabric/worker");
         assert_eq!(selected[0]["actions"][0]["label"], "answer");
-        let client = client_attention_resources(&store, Some("person/nathan"), false).unwrap();
+        let client =
+            client_attention_resources(&store, Some("person/nathan"), false, "node").unwrap();
         assert_eq!(client[0]["attention_kind"], "agent-request");
         assert_eq!(client[0]["requester_id"], "agent/fabric/worker");
         let (_, filtered) =
@@ -13822,7 +14094,7 @@ agent "seat" { workspace "/tmp"; command "true" }
                 .unwrap();
         }
         let reasons = |store: &Store| {
-            client_attention_resources(store, Some("person/nathan"), false)
+            client_attention_resources(store, Some("person/nathan"), false, "node")
                 .unwrap()
                 .into_iter()
                 .map(|resource| {
@@ -13879,8 +14151,13 @@ agent "seat" { workspace "/tmp"; command "true" }
             assert_eq!(status, StatusCode::OK, "{created}");
         }
         for history in [false, true] {
-            let resources =
-                client_attention_resources(&state.store, Some("person/nathan"), history).unwrap();
+            let resources = client_attention_resources(
+                &state.store,
+                Some("person/nathan"),
+                history,
+                &state.node,
+            )
+            .unwrap();
             let priority = |title: &str| {
                 resources
                     .iter()

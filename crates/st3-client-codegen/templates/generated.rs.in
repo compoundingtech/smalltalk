@@ -158,6 +158,15 @@ pub struct Attention {
     pub attention_kind: String,
     pub source_id: String,
     pub person_id: String,
+    pub requester_id: Option<String>,
+    pub launch_id: Option<String>,
+    pub variant_id: Option<String>,
+    pub message_id: Option<String>,
+    pub preview_token: Option<String>,
+    pub preview: Option<LaunchPreview>,
+    pub what: Option<String>,
+    pub because: Option<String>,
+    pub fix: Option<Value>,
     pub mission_id: Option<String>,
     pub mission_run_id: Option<String>,
     pub step_run_id: Option<String>,
@@ -179,6 +188,39 @@ pub struct AttentionTargetState {
     pub state: String,
     #[serde(default)]
     pub since: Option<String>,
+}
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct DocumentContent {
+    pub reference: String,
+    pub bytes: Vec<u8>,
+}
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct LaunchPreview {
+    pub goal: Option<String>,
+    pub steps: Vec<LaunchPreviewStep>,
+    pub agents: Vec<LaunchPreviewAgent>,
+    pub gates: LaunchGateCounts,
+    pub diagnostics_count: usize,
+    pub request_excerpt: Option<String>,
+    pub preview_token: Option<String>,
+}
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct LaunchPreviewStep {
+    pub path: String,
+    pub title: String,
+    pub assignee: Option<String>,
+    pub depends: Vec<String>,
+}
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct LaunchPreviewAgent {
+    pub id: String,
+    pub harness: Option<String>,
+    pub host: String,
+}
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct LaunchGateCounts {
+    pub human: usize,
+    pub automated: usize,
 }
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct Message {
@@ -329,6 +371,7 @@ pub struct Launch {
     pub approvals: Vec<String>,
     #[serde(default)]
     pub visualization: Option<Visualization>,
+    pub preview: Option<LaunchPreview>,
 }
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct LaunchVariant {

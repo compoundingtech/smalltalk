@@ -7,6 +7,40 @@ const TERMINAL_SUBPROTOCOL: &str = "st3.client.terminal.v0";
 const TERMINAL_CAPABILITY_PROTOCOL_PREFIX: &str = "st3.cap.";
 const LOCAL_PERSON_HEADER: &str = "x-st3-person";
 
+#[derive(Deserialize)]
+pub(super) struct ClientDocumentQuery {
+    name: String,
+}
+
+#[derive(Serialize)]
+pub(super) struct ClientDocumentContent {
+    reference: String,
+    bytes: Vec<u8>,
+}
+
+pub(super) async fn document_content(
+    State(state): State<AppState>,
+    Extension(session): Extension<ClientSession>,
+    Query(query): Query<ClientDocumentQuery>,
+) -> Result<Json<ClientDocumentContent>, ApiError> {
+    require_scope(&session, "read.projections")?;
+    let (name, hash) = query.name.rsplit_once('@').ok_or_else(|| {
+        ApiError::bad(St3Error::new(
+            "invalid-document-reference",
+            "a document reference needs `@HASH`",
+        ))
+    })?;
+    let bytes = state
+        .store
+        .get_document(name, hash)
+        .map_err(ApiError::internal)?
+        .ok_or_else(|| ApiError::not_found(format!("document `{}` is not stored", query.name)))?;
+    Ok(Json(ClientDocumentContent {
+        reference: query.name,
+        bytes,
+    }))
+}
+
 const ALL_SCOPES: &[&str] = &[
     "read.projections",
     "terminal.read",
@@ -1058,9 +1092,13 @@ pub(super) async fn now(
     let person = person_filter(&session, query.person.as_deref())?;
     let mut effective_query = query.clone();
     effective_query.person.clone_from(&person);
-    let mut items =
-        super::client_attention_resources(&state.store, person.as_deref(), query.history)
-            .map_err(ApiError::internal)?;
+    let mut items = super::client_attention_resources(
+        &state.store,
+        person.as_deref(),
+        query.history,
+        &state.node,
+    )
+    .map_err(ApiError::internal)?;
     // The default Now view is the person's attention queue. Mission work belongs
     // in Control; only an explicit work filter opts it into this combined view.
     if query.actor.is_some() || query.owner_run.is_some() {
@@ -1077,16 +1115,6 @@ pub(super) async fn now(
         }
         items.extend(work);
     }
-    let priority = |item: &Value| match item["kind"].as_str() {
-        Some("attention") => 0,
-        Some("work") => 1,
-        _ => 2,
-    };
-    items.sort_by(|left, right| {
-        priority(left)
-            .cmp(&priority(right))
-            .then_with(|| left["id"].as_str().cmp(&right["id"].as_str()))
-    });
     client_page(&state, &snapshot, "now", items, &effective_query).map(Json)
 }
 
@@ -2840,8 +2868,12 @@ async fn remote_terminal_stream_socket(
         }
         if !send_terminal_stream_value(&mut socket, &terminal_stream_envelope(&state, screen)).await
         {
-            close_terminal_stream(&mut socket, 1009, "terminal screen exceeds the client limit")
-                .await;
+            close_terminal_stream(
+                &mut socket,
+                1009,
+                "terminal screen exceeds the client limit",
+            )
+            .await;
             return;
         }
         sent = Some(revision);
@@ -3440,7 +3472,9 @@ async fn terminal_stream_socket(
                 }
             };
         }
-        let Some(screen) = screen.take() else { continue };
+        let Some(screen) = screen.take() else {
+            continue;
+        };
         if sent.as_deref() == Some(screen.revision()) {
             continue;
         }
@@ -3455,8 +3489,12 @@ async fn terminal_stream_socket(
         let value = screen.value(&terminal_id, &live.incarnation_id, next_sequence);
         if !send_terminal_stream_value(&mut socket, &terminal_stream_envelope(&state, value)).await
         {
-            close_terminal_stream(&mut socket, 1009, "terminal screen exceeds the client limit")
-                .await;
+            close_terminal_stream(
+                &mut socket,
+                1009,
+                "terminal screen exceeds the client limit",
+            )
+            .await;
             return;
         }
         sent = Some(screen.revision().to_owned());

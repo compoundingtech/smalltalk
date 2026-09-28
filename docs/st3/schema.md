@@ -3,7 +3,7 @@
 This file is generated from `st3-schema`.
 
 Schema: `st3.v1`
-Digest: `f3bbef587e72dd66806014d9f526d58d951bc430b666167f0d219600014bb27e`
+Digest: `dbbb3942dd5d5a6aae7ee5822cc136a1ab744bd36528549dd20b3909f1b01aa8`
 
 ## Subject families
 
@@ -60,7 +60,7 @@ Custom subjects use `custom/NAMESPACE/NAME`. Custom claims use `custom.NAMESPACE
 | `agent.account` | `agent` | `same-subject-actor` | `state-transition` | `durable` | `account!:subject-reference(account)` |  |
 | `agent.presence` | `agent` | `same-subject-actor` | `append` | `durable` | `presence!:string`, `reachability:string`, `reason:string` |  |
 | `agent.queue.moved` | `agent` | `authorized-requester` | `append` | `durable` | `anchor:subject-reference(mission-run)`, `placement!:string`, `reason:string`, `run!:subject-reference(mission-run)` |  |
-| `attention.requested` | `attention` | `authorized-participant` | `once` | `durable` | `reason!:string`, `reviewer!:subject-reference(person)`, `severity!:string`, `targets:array`, `title!:string`, `until:string` |  |
+| `attention.requested` | `attention` | `authorized-participant` | `once` | `durable` | `because:string`, `fix:object`, `reason!:string`, `reviewer!:subject-reference(person)`, `severity!:string`, `targets:array`, `title!:string`, `until:string`, `what:string` |  |
 | `attention.resolved` | `attention` | `authorized-participant` | `once` | `durable` | `outcome!:string`, `reason:string`, `request!:string` |  |
 | `daemon.diagnostic` | `daemon` | `system-only` | `append` | `durable` | `code!:string`, `reason!:string`, `severity!:string`, `status:string` |  |
 | `daemon.started` | `daemon` | `system-only` | `append` | `durable` | `pid:integer`, `schema:string`, `schema_digest:string`, `status!:string`, `version:string` | `reset` |

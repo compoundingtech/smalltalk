@@ -56,7 +56,8 @@
             { "$ref": "#/$defs/PairingChallenge" },
             { "$ref": "#/$defs/PairedSession" },
             { "$ref": "#/$defs/TerminalScreen" },
-            { "$ref": "#/$defs/AgentQueue" }
+            { "$ref": "#/$defs/AgentQueue" },
+            { "$ref": "#/$defs/DocumentContent" }
           ]
         }
       }
@@ -106,6 +107,15 @@
         "updated_at": { "$ref": "#/$defs/Timestamp" }
       }
     },
+    "DocumentContent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["reference", "bytes"],
+      "properties": {
+        "reference": { "type": "string", "pattern": "^doc/.+@[0-9a-f]{64}$" },
+        "bytes": { "type": "array", "items": { "type": "integer", "minimum": 0, "maximum": 255 } }
+      }
+    },
     "Attention": {
       "allOf": [
         { "$ref": "#/$defs/ResourceHeader" },
@@ -114,9 +124,18 @@
           "required": ["kind", "attention_kind", "source_id", "person_id", "title", "detail", "priority", "state", "requested_at", "actions"],
           "properties": {
             "kind": { "const": "attention" },
-            "attention_kind": { "enum": ["human-gate", "launch-approval", "revision-approval", "unread-message", "fault"] },
+            "attention_kind": { "enum": ["human-gate", "launch-approval", "revision-approval", "unread-message", "agent-request", "fault"] },
             "source_id": { "$ref": "#/$defs/Id" },
             "person_id": { "$ref": "#/$defs/Id" },
+            "requester_id": { "$ref": "#/$defs/Id" },
+            "launch_id": { "$ref": "#/$defs/Id" },
+            "variant_id": { "$ref": "#/$defs/Id" },
+            "message_id": { "$ref": "#/$defs/Id" },
+            "preview_token": { "type": "string", "pattern": "^lpv0:[0-9a-f]{64}$" },
+            "preview": { "$ref": "#/$defs/LaunchPreview" },
+            "what": { "type": "string" },
+            "because": { "type": "string" },
+            "fix": { "type": ["object", "null"] },
             "mission_id": { "$ref": "#/$defs/Id" },
             "mission_run_id": { "$ref": "#/$defs/Id" },
             "step_run_id": { "$ref": "#/$defs/Id" },
@@ -140,6 +159,26 @@
         "id": { "$ref": "#/$defs/Id" },
         "state": { "type": "string" },
         "since": { "$ref": "#/$defs/Timestamp" }
+      }
+    },
+    "LaunchPreview": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["goal", "steps", "agents", "gates", "diagnostics_count", "request_excerpt", "preview_token"],
+      "properties": {
+        "goal": { "type": ["string", "null"] },
+        "steps": { "type": "array", "items": { "type": "object", "additionalProperties": false, "required": ["path", "title", "assignee", "depends"], "properties": {
+          "path": { "type": "string" }, "title": { "type": "string" }, "assignee": { "type": ["string", "null"] }, "depends": { "type": "array", "items": { "type": "string" } }
+        } } },
+        "agents": { "type": "array", "items": { "type": "object", "additionalProperties": false, "required": ["id", "harness", "host"], "properties": {
+          "id": { "$ref": "#/$defs/Id" }, "harness": { "type": ["string", "null"] }, "host": { "type": "string" }
+        } } },
+        "gates": { "type": "object", "additionalProperties": false, "required": ["human", "automated"], "properties": {
+          "human": { "type": "integer", "minimum": 0 }, "automated": { "type": "integer", "minimum": 0 }
+        } },
+        "diagnostics_count": { "type": "integer", "minimum": 0 },
+        "request_excerpt": { "type": ["string", "null"] },
+        "preview_token": { "type": ["string", "null"] }
       }
     },
     "Message": {
@@ -191,7 +230,8 @@
             "variants": { "type": "array", "items": { "$ref": "#/$defs/Id" } },
             "decisions": { "type": "array", "items": { "$ref": "#/$defs/Id" } },
             "approvals": { "type": "array", "items": { "$ref": "#/$defs/Id" } },
-            "visualization": { "$ref": "#/$defs/Visualization" }
+            "visualization": { "$ref": "#/$defs/Visualization" },
+            "preview": { "oneOf": [{ "$ref": "#/$defs/LaunchPreview" }, { "type": "null" }] }
           }
         }
       ]

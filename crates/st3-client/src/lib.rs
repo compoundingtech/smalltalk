@@ -548,6 +548,16 @@ impl Client {
     ) -> Result<Envelope<Page>, ClientError> {
         self.list_internal("now", cursor, limit, history).await
     }
+    pub async fn document_get(
+        &self,
+        reference: &str,
+    ) -> Result<Envelope<DocumentContent>, ClientError> {
+        self.get(&format!(
+            "/v1/client/documents/content?name={}",
+            percent_encode(reference)
+        ))
+        .await
+    }
     pub async fn machines_list(
         &self,
         cursor: Option<&str>,

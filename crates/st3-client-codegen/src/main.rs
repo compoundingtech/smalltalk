@@ -213,6 +213,11 @@ fn rust_operation_methods(
                 out,
                 "    pub async fn agent_queue(&self, agent_id: &str) -> Result<Envelope<AgentQueue>, ClientError> {{ self.agent_queue_internal(agent_id).await }}"
             )?;
+        } else if id == "document.get" {
+            writeln!(
+                out,
+                "    pub async fn document_get(&self, reference: &str) -> Result<Envelope<DocumentContent>, ClientError> {{ self.get(&format!(\"/v1/client/documents/content?name={{}}\", percent_encode(reference))).await }}"
+            )?;
         } else if id.ends_with(".get") {
             let collection = path
                 .trim_start_matches("/v1/client/")
@@ -272,6 +277,11 @@ fn swift_operation_methods(
                 | "agent-queue.get"
         ) {
             continue;
+        } else if id == "document.get" {
+            writeln!(
+                out,
+                "    public func documentGet(reference: String) async throws -> Envelope<DocumentContent> {{ try await get(\"v1/client/documents/content\", query: [.init(name: \"name\", value: reference)]) }}"
+            )?;
         } else if id.ends_with(".get") {
             let collection = path
                 .trim_start_matches("/v1/client/")
@@ -432,6 +442,8 @@ fn validate_surfaces(
         }
     }
     for definition in [
+        "DocumentContent",
+        "LaunchPreview",
         "AttentionTargetState",
         "AgentQueue",
         "AgentQueueRun",
@@ -917,7 +929,12 @@ fn typescript_operation_methods(
         } else {
             path.to_owned()
         };
-        if id == "events.list" {
+        if id == "document.get" {
+            writeln!(
+                out,
+                "    async documentGet(reference: string): Promise<EnvelopeOf<DocumentContent>> {{ return this.get('/v1/client/documents/content?name=' + encodeURIComponent(reference)); }}"
+            )?;
+        } else if id == "events.list" {
             writeln!(
                 out,
                 "    async {method}(options: EventOptions = {{}}): Promise<EnvelopeOf<{response}>> {{ return this.get('{route}' + query(options), 'events'); }}"

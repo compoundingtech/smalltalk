@@ -17461,12 +17461,33 @@ subscription "reviews" {{
             .unwrap();
         assert_eq!(starts.len(), 1);
         assert_eq!(starts[0].body["fields"]["request"], good.id);
+        let fault = store
+            .attention_items(Some("person/nathan"))
+            .unwrap()
+            .into_iter()
+            .find(|item| item.kind == "fault" && item.targets == ["subscription/reviews"])
+            .expect("subscription failure should be visible to the reviewer");
+        assert_eq!(
+            store
+                .resolve_attention(
+                    &fault.subject,
+                    &crate::model::AttentionResolveRequest {
+                        outcome: "resolved".into(),
+                        reason: Some("Fixed the input name".into()),
+                        actor: "person/nathan".into(),
+                        idempotency_key: "resolve-subscription-failure".into(),
+                    },
+                )
+                .unwrap()
+                .status,
+            "resolved"
+        );
         assert!(
             store
-                .attention_items(None)
+                .attention_items(Some("person/nathan"))
                 .unwrap()
-                .iter()
-                .any(|item| { item.kind == "fault" && item.targets == ["subscription/reviews"] })
+                .into_iter()
+                .all(|item| item.subject != fault.subject)
         );
     }
 

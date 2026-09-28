@@ -2,7 +2,7 @@
 import { API_VERSION } from './Models.generated';
 import type {
     ActionOf, ActionRequest, ActionResult, AgentQueue, Capabilities, EnvelopeOf,
-    ErrorEnvelope, EventPage, Page, PairingBegin, PairingChallenge,
+    DocumentContent, ErrorEnvelope, EventPage, Page, PairingBegin, PairingChallenge,
     PairingComplete, PairedSession, Resource, TerminalScreen, TimelinePage,
 } from './Models.generated';
 
@@ -181,6 +181,7 @@ export class St3Client {
     }
 
     async nowList(options: ListOptions = {}): Promise<EnvelopeOf<Page>> { return this.get('/v1/client/now' + query(options)); }
+    async documentGet(reference: string): Promise<EnvelopeOf<DocumentContent>> { return this.get('/v1/client/documents/content?name=' + encodeURIComponent(reference)); }
     async machinesList(options: ListOptions = {}): Promise<EnvelopeOf<Page>> { return this.get('/v1/client/machines' + query(options)); }
     async devicesList(options: ListOptions = {}): Promise<EnvelopeOf<Page>> { return this.get('/v1/client/devices' + query(options)); }
     async attentionList(options: ListOptions = {}): Promise<EnvelopeOf<Page>> { return this.get('/v1/client/attention' + query(options)); }
