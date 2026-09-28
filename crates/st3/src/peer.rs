@@ -41,6 +41,8 @@ const EXCHANGE_PATH: &str = "/v1/peer/exchange";
 const REPLICATION_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(20);
 const REPLICATION_WAKE_COALESCE: Duration = Duration::from_secs(1);
 const CLIENT_READ_PATH: &str = "/v1/peer/client-read";
+const JOIN_PATH: &str = "/v1/fleet/join";
+const MAX_JOIN_BYTES: usize = 4096;
 const MAX_CLIENT_READ_BYTES: usize = 1_048_576;
 /// A relayed long poll must answer well inside the relay's 15-second request timeout.
 const CLIENT_READ_MAX_WAIT_MS: u64 = 10_000;
@@ -100,6 +102,11 @@ impl FleetAuth {
 
     pub fn member_key(&self) -> Option<&str> {
         self.member.as_deref().map(MemberKey::public)
+    }
+
+    /// The fleet secret as the hexadecimal text a secret file holds.
+    fn secret_hex(&self) -> String {
+        hex::encode(self.secret.as_slice())
     }
 
     #[cfg(test)]
@@ -500,6 +507,9 @@ struct FleetContext {
     /// Which transports this machine can dial with right now.
     transports: Arc<std::sync::RwLock<LocalTransports>>,
     fabric: Option<Fabric>,
+    /// The sponsor and how this node reached it when it joined, dialed until membership names
+    /// the sponsor.
+    bootstrap: Option<(String, Vec<Route>)>,
     /// Set once a member refused this node with a signed refusal naming its own key.
     removed: Arc<std::sync::atomic::AtomicBool>,
     state_dir: Option<PathBuf>,
@@ -518,6 +528,7 @@ impl FleetContext {
             bootstrap_keys: BTreeSet::new(),
             transports: Arc::default(),
             fabric: None,
+            bootstrap: None,
             removed: Arc::default(),
             state_dir: None,
         }
@@ -689,6 +700,33 @@ impl PeerBackend {
         }
     }
 
+    async fn redeem(&self, request: &crate::fleet::handshake::JoinRequest) -> Result<Value> {
+        match self {
+            Self::Main(client) => client.post("/v1/internal/fleet/redeem", request).await,
+            #[cfg(test)]
+            Self::Local(store) => Ok(match store.redeem_fleet_invite(request)? {
+                crate::store::FleetRedemption::Closed => serde_json::json!({"status": "closed"}),
+                crate::store::FleetRedemption::Refused(reason) => {
+                    serde_json::json!({"status": "refused", "reason": reason})
+                }
+                crate::store::FleetRedemption::Admitted {
+                    token,
+                    writer_floor,
+                    admitted_claim,
+                    ..
+                } => serde_json::json!({
+                    "status": "admitted",
+                    "token": hex::encode(token),
+                    "writer_floor": writer_floor,
+                    "admitted_claim": admitted_claim,
+                    "anchor_key": store.fleet_anchor()?,
+                    "fleet_id": store.bound_fleet()?,
+                    "fabric_protocol": serde_json::Value::Null,
+                }),
+            }),
+        }
+    }
+
     async fn fleet_view(&self) -> Result<FleetView> {
         match self {
             Self::Main(client) => client.get("/v1/internal/fleet/membership").await,
@@ -763,6 +801,15 @@ pub async fn run_worker(config: Config) -> Result<()> {
             fabric: fabric.is_some(),
         })),
         fabric: fabric.clone(),
+        bootstrap: config.fleet.as_ref().and_then(|file| {
+            let sponsor = file.sponsor.clone()?;
+            let routes = file
+                .sponsor_routes
+                .iter()
+                .filter_map(|route| parse_route(route))
+                .collect::<Vec<_>>();
+            (!routes.is_empty()).then_some((sponsor, routes))
+        }),
         config_peers: config.peers.iter().map(|peer| peer.name.clone()).collect(),
         legacy: config.fleet.as_ref().is_none_or(|file| file.legacy_peers),
         own_key: member_key.as_ref().map(|key| key.public().to_owned()),
@@ -972,7 +1019,7 @@ async fn keep_tailnet_current(
                 .collect::<Vec<_>>();
             endpoints.update(|set| set.tailscale = addresses);
         }
-        tokio::time::sleep(Duration::from_secs(60)).await;
+        tokio::time::sleep(worker_interval(Duration::from_secs(60))).await;
     }
 }
 
@@ -990,7 +1037,7 @@ async fn keep_fabric_exposed(
         {
             endpoints.update(|set| set.fabric = Some((node, protocol.clone())));
         }
-        tokio::time::sleep(Duration::from_secs(60)).await;
+        tokio::time::sleep(worker_interval(Duration::from_secs(60))).await;
     }
 }
 
@@ -1013,9 +1060,23 @@ async fn keep_endpoints_published(backend: PeerBackend, mode: &'static str, endp
         let _ = backend.publish_endpoints(mode, &endpoints.list()).await;
         tokio::select! {
             _ = endpoints.changed.notified() => {}
-            _ = tokio::time::sleep(Duration::from_secs(60)) => {}
+            _ = tokio::time::sleep(worker_interval(Duration::from_secs(60))) => {}
         }
     }
+}
+
+/// A route recorded in `fleet.toml`: an `http://` URL or `fabric://NODE_ID/PROTOCOL`.
+fn parse_route(route: &str) -> Option<Route> {
+    if let Some(rest) = route.strip_prefix("fabric://") {
+        let (node, protocol) = rest.split_once('/')?;
+        return Some(Route::Fabric {
+            node: node.into(),
+            protocol: protocol.into(),
+        });
+    }
+    route
+        .starts_with("http://")
+        .then(|| Route::Http(route.into()))
 }
 
 /// Who this node dials, and the loopback URLs that reach each, most preferred first: every
@@ -1066,7 +1127,7 @@ async fn keep_fleet_view_current(
                     return;
                 }
             }
-            _ = tokio::time::sleep(Duration::from_secs(30)) => {}
+            _ = tokio::time::sleep(worker_interval(Duration::from_secs(30))) => {}
         }
         refresh_fleet_view(&backend, &fleet).await;
     }
@@ -1075,6 +1136,10 @@ async fn keep_fleet_view_current(
 fn peer_router(state: PeerState) -> Router {
     Router::new()
         .route(EXCHANGE_PATH, post(receive_exchange))
+        .route(
+            JOIN_PATH,
+            post(receive_join).layer(DefaultBodyLimit::max(MAX_JOIN_BYTES)),
+        )
         .route(
             CLIENT_READ_PATH,
             post(receive_client_read).layer(DefaultBodyLimit::max(16_384)),
@@ -1300,6 +1365,12 @@ async fn wait_for_main_daemon(socket: &Path) {
     }
 }
 
+/// One dialer: its peer's current routes and the task that uses them.
+type Dialer = (
+    Arc<std::sync::RwLock<Vec<Route>>>,
+    tokio::task::JoinHandle<()>,
+);
+
 fn start_outbound(
     backend: PeerBackend,
     node: String,
@@ -1313,19 +1384,22 @@ fn start_outbound(
     // and a member that ends or turns dial-out loses its dialer.
     tokio::spawn(async move {
         let mut view_changes = fleet.view_changed.subscribe();
-        let mut dialers: BTreeMap<
-            String,
-            (
-                Arc<std::sync::RwLock<Vec<Route>>>,
-                tokio::task::JoinHandle<()>,
-            ),
-        > = BTreeMap::new();
+        let mut dialers: BTreeMap<String, Dialer> = BTreeMap::new();
         let mut transport_changes = notify.subscribe();
         loop {
             let targets = {
                 let view = fleet.view.read().expect("fleet view lock poisoned");
                 let local = *fleet.transports.read().expect("transport lock poisoned");
-                dial_targets(&view, &node, &config_peers, local)
+                let mut targets = dial_targets(&view, &node, &config_peers, local);
+                // Until membership names the sponsor, dial it the way the join reached it.
+                if let Some((sponsor, routes)) = &fleet.bootstrap
+                    && view.members.iter().all(|member| member.name != *sponsor)
+                {
+                    targets
+                        .entry(sponsor.clone())
+                        .or_insert_with(|| routes.clone());
+                }
+                targets
             };
             dialers.retain(|name, (_, task)| {
                 let keep = targets.contains_key(name);
@@ -1359,7 +1433,7 @@ fn start_outbound(
                     }
                 }
                 _ = transport_changes.changed() => {}
-                _ = tokio::time::sleep(Duration::from_secs(30)) => {}
+                _ = tokio::time::sleep(worker_interval(Duration::from_secs(30))) => {}
             }
         }
     });
@@ -1384,7 +1458,7 @@ async fn dial_peer(
     loop {
         // A removed node stops dialing; `st3 doctor` says what to do next.
         if fleet.is_removed() {
-            tokio::time::sleep(Duration::from_secs(60)).await;
+            tokio::time::sleep(worker_interval(Duration::from_secs(60))).await;
             continue;
         }
         let selected = {
@@ -1433,7 +1507,7 @@ async fn dial_peer(
                 } else {
                     tokio::select! {
                         _ = notify.changed() => {}
-                        _ = tokio::time::sleep(Duration::from_secs(30)) => {}
+                        _ = tokio::time::sleep(worker_interval(Duration::from_secs(30))) => {}
                     }
                 }
                 tokio::time::sleep_until(not_before).await;
@@ -1463,6 +1537,19 @@ async fn dial_peer(
             }
         }
     }
+}
+
+/// A worker timer. `ST3_WORKER_INTERVAL_MS` caps every one of them, so tests of several nodes on
+/// one machine need not wait out the 30- and 60-second defaults.
+fn worker_interval(default: Duration) -> Duration {
+    static CAP: std::sync::OnceLock<Option<Duration>> = std::sync::OnceLock::new();
+    CAP.get_or_init(|| {
+        std::env::var("ST3_WORKER_INTERVAL_MS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .map(Duration::from_millis)
+    })
+    .map_or(default, |cap| cap.min(default))
 }
 
 fn replication_http_client() -> reqwest::Client {
@@ -1545,6 +1632,67 @@ async fn receive_exchange(
             )
             .unwrap_or_else(|_| (StatusCode::INTERNAL_SERVER_ERROR, message).into_response())
         }
+    }
+}
+
+/// The join route. It exists only while this node sponsors an open invite; otherwise it answers
+/// 404 like any unknown path. Every refusal looks the same to the caller.
+///
+/// There is no request quota: one spent before the proof is checked would let any caller block
+/// real joins. A request is cheap to refuse (a bounded body, one lookup, one HMAC), a 128-bit
+/// token cannot be guessed, and five bad proofs naming one invite burn that invite, which only
+/// someone holding the code can name.
+async fn receive_join(State(state): State<PeerState>, body: Bytes) -> Response {
+    let refused = || {
+        (
+            StatusCode::FORBIDDEN,
+            axum::Json(serde_json::json!({"code": "invite-invalid"})),
+        )
+            .into_response()
+    };
+    let Ok(request) = serde_json::from_slice::<crate::fleet::handshake::JoinRequest>(&body) else {
+        return refused();
+    };
+    let Some(member) = state.auth.member.clone() else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let answer = match state.backend.redeem(&request).await {
+        Ok(answer) => answer,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    match answer["status"].as_str() {
+        Some("admitted") => {}
+        Some("closed") => return StatusCode::NOT_FOUND.into_response(),
+        _ => return refused(),
+    }
+    let text = |field: &str| answer[field].as_str().map(str::to_owned);
+    let Some(token) = text("token").and_then(|token| hex::decode(token).ok()) else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let payload = crate::fleet::handshake::SealedJoin {
+        fleet_id: text("fleet_id").unwrap_or_else(|| state.auth.fleet_id().to_owned()),
+        // A migrating node already holds the secret; it is never sent again.
+        secret: (!request.migrate).then(|| state.auth.secret_hex()),
+        anchor_key: text("anchor_key").unwrap_or_default(),
+        sponsor: state.node.clone(),
+        writer_floor: answer["writer_floor"].as_u64(),
+        fabric_protocol: text("fabric_protocol"),
+        admitted_claim: text("admitted_claim"),
+    };
+    match crate::fleet::handshake::seal_response(&request, &token, &state.node, &member, &payload) {
+        Ok(response) => {
+            // A test fault point: drop this one answer after the invite is bound, as a lost
+            // response would.
+            if let Some(marker) = std::env::var_os("ST3_TEST_DROP_JOIN_ANSWER")
+                && std::fs::remove_file(&marker).is_ok()
+            {
+                return StatusCode::SERVICE_UNAVAILABLE.into_response();
+            }
+            // The new member dials soon; let the dialers see it.
+            refresh_fleet_view(&state.backend, &state.fleet).await;
+            (StatusCode::OK, axum::Json(response)).into_response()
+        }
+        Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
     }
 }
 
@@ -2647,6 +2795,7 @@ mod tests {
             bootstrap_keys: bootstrap.iter().map(|key| (*key).into()).collect(),
             transports: Arc::default(),
             fabric: None,
+            bootstrap: None,
             removed: Arc::default(),
             state_dir: None,
         }
