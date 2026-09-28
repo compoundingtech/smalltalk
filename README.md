@@ -25,7 +25,8 @@ nix profile install .#st3
 For local development, enter `nix develop`. The shell provides Rust, sccache,
 cargo-nextest, and mold on Linux. Cargo uses mold for Linux links and the system
 linker on macOS; dev and test builds keep line tables for workspace crates and
-omit dependency debug info. Run tests with `cargo nextest run --workspace --locked`.
+omit dependency debug info. On both platforms the shell sets `RUSTC_WRAPPER` to
+sccache. Run tests with `cargo nextest run --workspace --locked`.
 Outside the Nix shell, install mold on Linux and cargo-nextest separately; the
 repository's `.cargo/config.toml` still selects mold for Linux builds.
 
