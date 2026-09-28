@@ -27468,6 +27468,8 @@ version 2
         );
     }
 
+    /// A replicated harness observation. Each one is a new transition: a repeat that changed
+    /// only `observed_at_ms` would stay in the local observation log.
     fn observe_harness(store: &Store, observed_at_ms: u64) {
         store
             .append_claim(&ClaimInput {
@@ -27477,6 +27479,7 @@ version 2
                 fields: BTreeMap::from([
                     ("state".into(), json!("working")),
                     ("observed_at_ms".into(), json!(observed_at_ms)),
+                    ("transition_sequence".into(), json!(observed_at_ms)),
                 ]),
                 evidence: Vec::new(),
                 expected_subject: None,
