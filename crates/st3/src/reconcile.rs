@@ -1529,7 +1529,7 @@ impl<R: RuntimeControl> Reconciler<R> {
         );
         let deadline_recorded = self
             .store
-            .claims_for(&subject.subject, Some("runtime.readiness-deadline-reached"))?
+            .observations_for(&subject.subject, "runtime.readiness-deadline-reached")?
             .iter()
             .any(|claim| {
                 claim
@@ -1623,7 +1623,7 @@ impl<R: RuntimeControl> Reconciler<R> {
     ) -> Result<()> {
         for claim in self
             .store
-            .claims_for(subject, Some("runtime.readiness-deadline-reached"))?
+            .observations_for(subject, "runtime.readiness-deadline-reached")?
         {
             let Some(old_incarnation) = claim_incarnation(&claim) else {
                 continue;
@@ -1900,7 +1900,7 @@ impl<R: RuntimeControl> Reconciler<R> {
         }
         Ok(self
             .store
-            .claims_for(subject, Some("runtime.action.requested"))?
+            .observations_for(subject, "runtime.action.requested")?
             .iter()
             .any(|claim| {
                 claim.body.pointer("/fields/action").and_then(Value::as_str) == Some("terminate")
@@ -2119,7 +2119,7 @@ impl<R: RuntimeControl> Reconciler<R> {
         };
         Ok(self
             .store
-            .claims_for(subject, Some("runtime.action.succeeded"))?
+            .observations_for(subject, "runtime.action.succeeded")?
             .into_iter()
             .rev()
             .any(|claim| {
@@ -2454,7 +2454,7 @@ impl<R: RuntimeControl> Reconciler<R> {
         let incarnation = incarnation.unwrap_or("unknown");
         let requests = self
             .store
-            .claims_for(subject, Some("runtime.action.requested"))?;
+            .observations_for(subject, "runtime.action.requested")?;
         let request = requests.into_iter().rev().find(|claim| {
             claim.body.pointer("/fields/action").and_then(Value::as_str) == Some("terminate")
                 && claim
@@ -2530,7 +2530,7 @@ impl<R: RuntimeControl> Reconciler<R> {
         })?;
         if self
             .store
-            .claims_for(subject, Some("runtime.action.succeeded"))?
+            .observations_for(subject, "runtime.action.succeeded")?
             .iter()
             .any(|claim| {
                 claim
@@ -2601,7 +2601,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             }
             let recent_failures = self
                 .store
-                .claims_for(&subject.subject, Some("runtime.action.failed"))?
+                .observations_for(&subject.subject, "runtime.action.failed")?
                 .into_iter()
                 .filter(|claim| {
                     claim.body.pointer("/fields/action").and_then(Value::as_str) == Some("start")
@@ -2898,7 +2898,7 @@ impl<R: RuntimeControl> Reconciler<R> {
     fn start_failures(&self, subject: &str, token: &str) -> Result<Vec<crate::model::ClaimRecord>> {
         Ok(self
             .store
-            .claims_for(subject, Some("runtime.action.failed"))?
+            .observations_for(subject, "runtime.action.failed")?
             .into_iter()
             .filter(|claim| {
                 claim.body.pointer("/fields/action").and_then(Value::as_str) == Some("start")
@@ -2922,7 +2922,7 @@ impl<R: RuntimeControl> Reconciler<R> {
         }
         let last_success_index = self
             .store
-            .claims_for(&subject.subject, Some("runtime.action.succeeded"))?
+            .observations_for(&subject.subject, "runtime.action.succeeded")?
             .into_iter()
             .filter(|claim| {
                 claim
@@ -2980,7 +2980,7 @@ impl<R: RuntimeControl> Reconciler<R> {
         }
         let first_launch = self
             .store
-            .claims_for(&subject.subject, Some("runtime.action.succeeded"))?
+            .observations_for(&subject.subject, "runtime.action.succeeded")?
             .into_iter()
             .filter(|claim| {
                 claim
@@ -3170,7 +3170,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             .unwrap_or_default();
         let mut launches = self
             .store
-            .claims_for(&subject.subject, Some("runtime.action.succeeded"))?
+            .observations_for(&subject.subject, "runtime.action.succeeded")?
             .into_iter()
             .filter(|claim| {
                 claim
@@ -3363,7 +3363,7 @@ impl<R: RuntimeControl> Reconciler<R> {
     ) -> Result<()> {
         if self
             .store
-            .latest_claim(subject, Some(kind))?
+            .latest_observation(subject, kind)?
             .is_some_and(|claim| {
                 claim.body.get("fields")
                     == Some(&serde_json::to_value(&fields).unwrap_or(Value::Null))
@@ -3371,7 +3371,7 @@ impl<R: RuntimeControl> Reconciler<R> {
         {
             return Ok(());
         }
-        self.store.append_claim(&ClaimInput {
+        let record = self.store.append_claim(&ClaimInput {
             subject: subject.into(),
             kind: kind.into(),
             actor: None,
@@ -3380,7 +3380,13 @@ impl<R: RuntimeControl> Reconciler<R> {
             expected_subject: None,
             idempotency_key: None,
         })?;
-        self.signal_changed();
+        if crate::store::local_observation_position(&record).is_some() {
+            // Only this node reads a local observation, and it cannot advance a mission.
+            self.event_notify
+                .send_modify(|generation| *generation = generation.saturating_add(1));
+        } else {
+            self.signal_changed();
+        }
         Ok(())
     }
 
@@ -6918,7 +6924,7 @@ impl<R: RuntimeControl> Reconciler<R> {
 
             let action_failure = self
                 .store
-                .latest_claim(&subject.subject, Some("runtime.action.failed"))?
+                .latest_observation(&subject.subject, "runtime.action.failed")?
                 .and_then(|claim| {
                     claim
                         .body
@@ -8972,7 +8978,7 @@ impl<R: RuntimeControl> Reconciler<R> {
         let action = if hard { "kill-gate" } else { "stop-gate" };
         if self
             .store
-            .claims_for(subject, Some("runtime.action.succeeded"))?
+            .observations_for(subject, "runtime.action.succeeded")?
             .iter()
             .any(|claim| {
                 claim.body.pointer("/fields/action").and_then(Value::as_str) == Some(action)
@@ -11267,7 +11273,7 @@ version 2
         assert!(starts.contains(&good_runtime));
         assert!(
             store
-                .latest_claim(&bad_subject, Some("runtime.action.failed"))
+                .latest_observation(&bad_subject, "runtime.action.failed")
                 .unwrap()
                 .is_some()
         );
@@ -11378,7 +11384,7 @@ version 2
                 .contains(&"exec.task".to_owned())
         );
         let applied = store
-            .claims_for("exec/task", Some("render.applied"))
+            .observations_for("exec/task", "render.applied")
             .unwrap();
         assert!(
             applied.iter().any(|claim| claim.body["fields"]["warnings"]
@@ -14530,6 +14536,45 @@ agent "worker" {
         std::thread::sleep(Duration::from_millis(2));
         reconciler.reconcile_once().unwrap();
         assert_eq!(&*runtime.kills.lock().unwrap(), &["node.worker"]);
+
+        // The stop request, its deadline and the kill are this node's own records. They stay
+        // local, and each cites the one before it.
+        for kind in [
+            "runtime.action.requested",
+            "runtime.action.deadline-reached",
+            "runtime.action.succeeded",
+        ] {
+            assert!(
+                store
+                    .claims_for("agent/node.worker", Some(kind))
+                    .unwrap()
+                    .is_empty(),
+                "{kind} replicated"
+            );
+        }
+        let request = store
+            .observations_for("agent/node.worker", "runtime.action.requested")
+            .unwrap()
+            .into_iter()
+            .find(|record| record.body["fields"]["action"] == "terminate")
+            .unwrap();
+        let deadline = store
+            .latest_observation("agent/node.worker", "runtime.action.deadline-reached")
+            .unwrap()
+            .unwrap();
+        assert_eq!(deadline.body["evidence"], serde_json::json!([request.id]));
+        let kill = store
+            .latest_observation("agent/node.worker", "runtime.action.succeeded")
+            .unwrap()
+            .unwrap();
+        assert_eq!(kill.body["fields"]["action"], "kill");
+        assert_eq!(kill.body["evidence"], serde_json::json!([deadline.id]));
+        reconciler.reconcile_once().unwrap();
+        assert_eq!(
+            runtime.kills.lock().unwrap().len(),
+            1,
+            "the local kill record fences a second kill"
+        );
     }
 
     #[test]
@@ -16441,6 +16486,62 @@ mission "gated-loop" state="ready" {
         assert_ne!(
             store.mission_run(&run.id).unwrap().unwrap().status,
             "completed"
+        );
+    }
+
+    #[test]
+    fn a_render_receipt_is_recorded_once_on_the_node_that_rendered() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        let reconciler = Reconciler::new(
+            store.clone(),
+            Arc::new(FakeRuntime::default()),
+            "node".into(),
+            Arc::new(Notify::new()),
+        );
+        let receipt = |sha: &str| {
+            BTreeMap::from([(
+                "writes".into(),
+                serde_json::json!([{"destination": "/work/example/.st3/boot.md", "mode": 420, "sha256": sha}]),
+            )])
+        };
+        let generation = *reconciler.event_notify.borrow();
+        reconciler
+            .record_once("agent/node.worker", "render.applied", receipt("first"))
+            .unwrap();
+        reconciler
+            .record_once("agent/node.worker", "render.applied", receipt("first"))
+            .unwrap();
+        assert_eq!(
+            store
+                .observations_for("agent/node.worker", "render.applied")
+                .unwrap()
+                .len(),
+            1,
+            "an unchanged receipt is not recorded again"
+        );
+        assert!(
+            store
+                .claims_for("agent/node.worker", Some("render.applied"))
+                .unwrap()
+                .is_empty(),
+            "a render receipt stays on this node"
+        );
+        assert_eq!(*reconciler.event_notify.borrow(), generation + 1);
+        reconciler
+            .record_once("agent/node.worker", "render.applied", receipt("second"))
+            .unwrap();
+        let receipts = store
+            .observations_for("agent/node.worker", "render.applied")
+            .unwrap();
+        assert_eq!(receipts.len(), 2);
+        assert_eq!(receipts[1].body["fields"]["writes"][0]["sha256"], "second");
+        assert_eq!(
+            store
+                .latest_observation("agent/node.worker", "render.applied")
+                .unwrap()
+                .unwrap()
+                .id,
+            receipts[1].id
         );
     }
 
@@ -19870,13 +19971,20 @@ version 2
         assert_eq!(*event_notify.borrow(), first_generation);
         assert_eq!(
             store
+                .observations_for("agent/node.worker", "runtime.readiness-deadline-reached")
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(
+            store
                 .claims_for(
                     "agent/node.worker",
                     Some("runtime.readiness-deadline-reached")
                 )
                 .unwrap()
-                .len(),
-            1
+                .is_empty(),
+            "the deadline stays on this node; its attention request replicates"
         );
         let attention = store.attention_items(Some("person/operator")).unwrap();
         assert_eq!(attention.len(), 1);
@@ -20240,7 +20348,7 @@ agent "keeper" { workspace "/tmp"; command "true"; restart "never" }
             .unwrap();
         assert!(
             store
-                .claims_for(&desired.subject, Some("runtime.readiness-deadline-reached"))
+                .observations_for(&desired.subject, "runtime.readiness-deadline-reached")
                 .unwrap()
                 .is_empty()
         );
