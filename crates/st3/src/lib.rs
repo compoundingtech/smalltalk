@@ -8,6 +8,7 @@ pub mod client;
 pub mod config;
 pub mod environment;
 pub(crate) mod external_sessions;
+pub mod fleet;
 pub mod graph;
 pub mod mission;
 pub mod model;

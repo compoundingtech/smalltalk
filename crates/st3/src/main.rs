@@ -141,6 +141,11 @@ enum Command {
         #[command(subcommand)]
         command: RepairCommand,
     },
+    /// Join machines into a fleet: create, invite, join, and inspect members.
+    Fleet {
+        #[command(subcommand)]
+        command: FleetCommand,
+    },
     /// Inspect and repair fleet replication.
     Replication {
         #[command(subcommand)]
@@ -214,6 +219,515 @@ struct ReplicationWorkerArgs {
     peer: Vec<PeerConfig>,
 }
 
+#[derive(Subcommand)]
+enum FleetCommand {
+    /// Found a new fleet with this machine as its first member (the anchor).
+    Create(FleetCreateArgs),
+    /// Create a single-use code that lets one new machine join.
+    Invite(FleetInviteArgs),
+    /// List invites, or revoke one.
+    Invites {
+        #[arg(long)]
+        all: bool,
+        #[command(subcommand)]
+        command: Option<FleetInvitesCommand>,
+    },
+    /// Join this machine to a fleet with a code from `st fleet invite`.
+    Join(FleetJoinArgs),
+    /// Show this node, the fleet's members, and open invites.
+    Status,
+}
+
+#[derive(Subcommand)]
+enum FleetInvitesCommand {
+    /// Revoke an invite. The sponsor refuses it once the revocation reaches it.
+    Revoke {
+        invite: String,
+        #[arg(long)]
+        reason: String,
+        #[arg(long = "as")]
+        actor: Option<String>,
+    },
+}
+
+#[derive(Args, Clone)]
+struct FleetMemberArgs {
+    /// Accept no connections and dial listening members: for a laptop that is often away.
+    #[arg(long)]
+    dial_out: bool,
+    /// The replication port. The default is 31313 or the next free port.
+    #[arg(long)]
+    port: Option<u16>,
+    /// Transports to listen on and dial with: tailscale, fabric. The default detects both.
+    #[arg(long, value_delimiter = ',')]
+    transports: Option<Vec<String>>,
+    /// Also announce the loopback endpoint (for nodes on one machine and for tunnels).
+    #[arg(long)]
+    advertise_loopback: bool,
+    #[arg(long, hide = true)]
+    fabric: Option<PathBuf>,
+    #[arg(long, hide = true)]
+    tailscale: Option<PathBuf>,
+}
+
+impl FleetMemberArgs {
+    fn settings(&self) -> st3::fleet::join::MemberSettings {
+        st3::fleet::join::MemberSettings {
+            mode: if self.dial_out {
+                st3::config::FleetMode::DialOut
+            } else {
+                st3::config::FleetMode::Listening
+            },
+            port: self.port,
+            transports: self.transports.clone(),
+            advertise_loopback: self.advertise_loopback,
+            fabric: self.fabric.clone(),
+            tailscale: self.tailscale.clone(),
+        }
+    }
+}
+
+#[derive(Args)]
+struct FleetCreateArgs {
+    /// This machine's name in the fleet. The default is the configured node name.
+    #[arg(long)]
+    name: Option<String>,
+    /// Do not install or restart services; print the foreground commands instead.
+    #[arg(long)]
+    no_service: bool,
+    #[command(flatten)]
+    member: FleetMemberArgs,
+}
+
+#[derive(Args)]
+struct FleetInviteArgs {
+    /// The name the new machine must use.
+    name: Option<String>,
+    /// How long the code stays valid: 10s to 24h.
+    #[arg(long, default_value = "15m")]
+    expires: String,
+    /// Which of this member's endpoints go into the code: auto, tailscale, fabric, loopback.
+    #[arg(long, default_value = "auto")]
+    via: String,
+    /// A code that moves an existing config-peer machine to membership.
+    #[arg(long)]
+    migrate: bool,
+    /// Send the code to NAME's Fabric inbox instead of showing it.
+    #[arg(long)]
+    send_fabric: bool,
+    /// Print only the code.
+    #[arg(long)]
+    code_only: bool,
+    /// Write the code to a new 0600 file instead of printing it.
+    #[arg(long)]
+    code_file: Option<PathBuf>,
+    #[arg(long = "as")]
+    actor: Option<String>,
+}
+
+#[derive(Args)]
+struct FleetJoinArgs {
+    /// The join code, or - to read it from standard input. Without it, join asks for it.
+    code: Option<String>,
+    /// Read the code from this file, and delete the file after a successful join.
+    #[arg(long)]
+    code_file: Option<PathBuf>,
+    /// Read the code that `st fleet invite --send-fabric` put in this machine's Fabric inbox.
+    #[arg(long)]
+    fabric_inbox: bool,
+    /// This machine's name in the fleet.
+    #[arg(long)]
+    name: Option<String>,
+    /// A loopback URL that reaches the sponsor, instead of the code's endpoints.
+    #[arg(long)]
+    via: Option<String>,
+    /// Do not stop, install, or start services; print the foreground commands instead.
+    #[arg(long)]
+    no_service: bool,
+    #[command(flatten)]
+    member: FleetMemberArgs,
+}
+
+fn parse_fleet_duration(text: &str) -> Result<u64> {
+    let text = text.trim();
+    let (number, unit) = text
+        .find(|character: char| !character.is_ascii_digit())
+        .map_or((text, "s"), |split| text.split_at(split));
+    let number: u64 = number
+        .parse()
+        .context("a duration is a number and a unit, like 15m")?;
+    Ok(number
+        * match unit {
+            "s" => 1,
+            "m" => 60,
+            "h" => 3600,
+            _ => anyhow::bail!("a duration unit is s, m, or h"),
+        })
+}
+
+/// The person a fleet command acts for. Inside an agent seat it must be explicit.
+fn fleet_person(actor: Option<String>, config: &Config) -> Result<String> {
+    if let Some(actor) = actor {
+        return Ok(actor);
+    }
+    anyhow::ensure!(
+        std::env::var("ST_AGENT").is_err(),
+        "inside an agent seat, fleet commands need an explicit --as person/NAME"
+    );
+    config
+        .person
+        .clone()
+        .context("set person in config.toml or pass --as person/NAME")
+}
+
+fn read_code_without_echo() -> Result<String> {
+    use std::io::{BufRead as _, IsTerminal as _};
+    let stdin = std::io::stdin();
+    let terminal = stdin.is_terminal();
+    let mut saved = None;
+    if terminal {
+        eprint!("Paste the join code: ");
+        // SAFETY: plain termios calls on standard input; the saved settings are restored below.
+        unsafe {
+            let mut settings: libc::termios = std::mem::zeroed();
+            if libc::tcgetattr(0, &mut settings) == 0 {
+                saved = Some(settings);
+                settings.c_lflag &= !libc::ECHO;
+                libc::tcsetattr(0, libc::TCSANOW, &settings);
+            }
+        }
+    }
+    let mut line = String::new();
+    let result = stdin.lock().read_line(&mut line);
+    if let Some(settings) = saved {
+        // SAFETY: restores the settings read above.
+        unsafe {
+            libc::tcsetattr(0, libc::TCSANOW, &settings);
+        }
+        eprintln!();
+    }
+    result?;
+    Ok(line.trim().to_owned())
+}
+
+/// The one `st-fleet-join-*.code` file in this machine's Fabric inbox.
+fn fabric_inbox_code() -> Result<PathBuf> {
+    let home = std::env::var_os("FABRIC_HOME")
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/share/fabric"))
+        })
+        .context("HOME is not set")?;
+    let inbox = home.join("inbox");
+    let mut found = Vec::new();
+    for sender in fs::read_dir(&inbox)
+        .with_context(|| format!("read the Fabric inbox {}", inbox.display()))?
+    {
+        let sender = sender?.path();
+        if !sender.is_dir() {
+            continue;
+        }
+        for entry in fs::read_dir(&sender)? {
+            let path = entry?.path();
+            if path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("st-fleet-join-") && name.ends_with(".code"))
+            {
+                found.push(path);
+            }
+        }
+    }
+    match found.len() {
+        1 => Ok(found.remove(0)),
+        0 => anyhow::bail!("no join code in the Fabric inbox {}", inbox.display()),
+        _ => anyhow::bail!(
+            "{} join codes in the Fabric inbox {}; remove the old ones",
+            found.len(),
+            inbox.display()
+        ),
+    }
+}
+
+fn services_installed() -> bool {
+    st3::service::status()
+        .map(|report| report.services.iter().any(|service| service.installed))
+        .unwrap_or(false)
+}
+
+async fn run_fleet(endpoint: &Endpoint, command: FleetCommand, json_output: bool) -> Result<()> {
+    let config = Config::load_unvalidated(None)?;
+    let client = Client::new(endpoint.clone());
+    match command {
+        FleetCommand::Create(args) => {
+            anyhow::ensure!(
+                config.fleet_id.is_none(),
+                "config.toml already configures a fleet with config peers; move it to membership with st fleet migrate"
+            );
+            let node = args.name.unwrap_or_else(|| config.node.clone());
+            let founded =
+                st3::fleet::join::found(&config.state_dir, &node, &args.member.settings())?;
+            if json_output {
+                return print_value(&founded, true);
+            }
+            println!(
+                "Created fleet {} with {} as its first member.",
+                founded.fleet_id, founded.node
+            );
+            if !args.no_service && services_installed() {
+                st3::service::install(Config::load_with_fleet(None)?)?;
+                println!("The st3 services now run as a fleet member. Next: st fleet invite NAME");
+            } else {
+                println!(
+                    "Restart st3 up and start st3 replication-worker, then: st fleet invite NAME"
+                );
+            }
+            Ok(())
+        }
+        FleetCommand::Invite(args) => {
+            let person = fleet_person(args.actor.clone(), &config)?;
+            if args.send_fabric {
+                anyhow::ensure!(
+                    args.name.is_some(),
+                    "--send-fabric needs the NAME of the machine to send it to"
+                );
+            }
+            let created: st3::api::FleetInviteCreated = client
+                .post(
+                    "/v1/internal/fleet/invites",
+                    &st3::api::FleetInviteRequest {
+                        name: args.name.clone(),
+                        expires_seconds: parse_fleet_duration(&args.expires)?,
+                        via: Some(args.via.clone()),
+                        migrate: args.migrate,
+                        person,
+                    },
+                )
+                .await?;
+            let command = if args.migrate { "migrate" } else { "join" };
+            if let Some(path) = &args.code_file {
+                st3::fleet::join::write_private(path, created.code.as_bytes())?;
+                println!("{}\t{}", created.invite, path.display());
+            } else if args.send_fabric {
+                let name = args.name.as_deref().unwrap_or_default();
+                let fabric = st3::config::FleetFile::load(&config.state_dir)?
+                    .and_then(|file| file.fabric)
+                    .or_else(|| st3::fleet::transport::resolve_tool(None, "fabric"))
+                    .context("--send-fabric needs the fabric command")?;
+                let temporary = config
+                    .state_dir
+                    .join("fleet")
+                    .join(format!(".send-{}.code", std::process::id()));
+                st3::fleet::join::write_private(&temporary, created.code.as_bytes())?;
+                let invite_id = created.invite.trim_start_matches("fleet-invite/");
+                let sent = std::process::Command::new(&fabric)
+                    .args(["send-file", name])
+                    .arg(&temporary)
+                    .args(["--as", &format!("st-fleet-join-{invite_id}.code")])
+                    .status();
+                let _ = fs::remove_file(&temporary);
+                anyhow::ensure!(
+                    sent?.success(),
+                    "fabric send-file to {name} failed; the invite stays open until it expires"
+                );
+                println!(
+                    "Sent invite {} to {name}'s Fabric inbox. On {name}, run:\n  st fleet {command} --fabric-inbox",
+                    created.invite
+                );
+            } else if args.code_only {
+                println!("{}", created.code);
+            } else if json_output {
+                return print_value(&created, true);
+            } else {
+                let expires_in =
+                    (u128::from(created.expires_at_unix_ms).saturating_sub(unix_ms()) / 60_000) + 1;
+                let target = args.name.as_deref().unwrap_or("the new machine");
+                println!(
+                    "Invite {} for {target} expires in about {expires_in} minutes.",
+                    created.invite
+                );
+                println!(
+                    "On {target}, run this and paste the code when asked:\n  st fleet {command}"
+                );
+                println!("Code:\n  {}", created.code);
+                if let Some(name) = &args.name {
+                    println!(
+                        "Or, if {name} is a Fabric peer of this machine, send the code instead of showing it:\n  st fleet invite {name} --send-fabric\n  fabric exec {name} -- st fleet {command} --fabric-inbox"
+                    );
+                }
+            }
+            Ok(())
+        }
+        FleetCommand::Invites { all, command } => match command {
+            None => {
+                let invites: Vec<st3::store::FleetInviteView> = client
+                    .get(&format!("/v1/internal/fleet/invites?all={all}"))
+                    .await?;
+                if json_output {
+                    return print_value(&invites, true);
+                }
+                println!("INVITES  {}", invites.len());
+                for invite in invites {
+                    let detail = match invite.state.as_str() {
+                        "redeemed" => format!(
+                            "by {} (key {}…)",
+                            invite.redeemed_name.as_deref().unwrap_or("?"),
+                            invite
+                                .redeemed_key
+                                .as_deref()
+                                .map(|key| &key[..key.len().min(8)])
+                                .unwrap_or("?")
+                        ),
+                        "revoked" => invite.revoked_reason.clone().unwrap_or_default(),
+                        _ => format!("for {}", invite.name.as_deref().unwrap_or("any name")),
+                    };
+                    println!(
+                        "{}  {}  sponsor {}  {}",
+                        invite.invite, invite.state, invite.sponsor, detail
+                    );
+                }
+                Ok(())
+            }
+            Some(FleetInvitesCommand::Revoke {
+                invite,
+                reason,
+                actor,
+            }) => {
+                let person = fleet_person(actor, &config)?;
+                let _: Value = client
+                    .post(
+                        "/v1/internal/fleet/invites/revoke",
+                        &st3::api::FleetInviteRevokeRequest {
+                            invite: invite.clone(),
+                            reason,
+                            person,
+                        },
+                    )
+                    .await?;
+                println!("revoked\t{invite}");
+                Ok(())
+            }
+        },
+        FleetCommand::Join(args) => {
+            let (code, code_path) = if args.fabric_inbox {
+                let path = fabric_inbox_code()?;
+                (fs::read_to_string(&path)?, Some(path))
+            } else if let Some(path) = &args.code_file {
+                (fs::read_to_string(path)?, Some(path.clone()))
+            } else {
+                match args.code.as_deref() {
+                    Some("-") => {
+                        let mut text = String::new();
+                        std::io::Read::read_to_string(&mut std::io::stdin(), &mut text)?;
+                        (text, None)
+                    }
+                    Some(code) => (code.to_owned(), None),
+                    None => (read_code_without_echo()?, None),
+                }
+            };
+            let use_services = !args.no_service && services_installed();
+            if client.get::<Value>("/v1/health").await.is_ok() {
+                anyhow::ensure!(
+                    use_services,
+                    "stop the running st3 daemon first: nothing may write while this machine joins"
+                );
+                st3::service::stop()?;
+            }
+            let joined = st3::fleet::join::join(&st3::fleet::join::JoinOptions {
+                state_dir: config.state_dir.clone(),
+                configured_node: config.node.clone(),
+                code: code.trim().to_owned(),
+                name: args.name.clone(),
+                via: args.via.clone(),
+                settings: args.member.settings(),
+                legacy_secret_file: None,
+            })
+            .await?;
+            if let Some(path) = code_path {
+                let _ = fs::remove_file(path);
+            }
+            if json_output {
+                print_value(&joined, true)?;
+            } else {
+                println!(
+                    "{} joined fleet {} through {}{}.",
+                    joined.name,
+                    joined.fleet_id,
+                    joined.sponsor,
+                    if joined.resumed { " (resumed)" } else { "" }
+                );
+            }
+            if use_services {
+                st3::service::install(Config::load_with_fleet(None)?)?;
+                println!(
+                    "The st3 services now run as a fleet member; st fleet status shows the sync."
+                );
+            } else if !json_output {
+                println!("Start st3 up and st3 replication-worker to begin syncing.");
+            }
+            Ok(())
+        }
+        FleetCommand::Status => {
+            let status: st3::api::FleetStatus = client.get("/v1/internal/fleet/status").await?;
+            if json_output {
+                return print_value(&status, true);
+            }
+            println!(
+                "FLEET  {}   this node: {}",
+                status.fleet_id.as_deref().unwrap_or("none"),
+                status.node
+            );
+            println!("MEMBER  MODE  STATE  ROUTE-ENDPOINTS");
+            for member in &status.view.members {
+                let transports = member
+                    .endpoints
+                    .iter()
+                    .filter_map(|endpoint| endpoint["transport"].as_str())
+                    .collect::<Vec<_>>()
+                    .join(",");
+                println!(
+                    "{}  {}  {}{}  {}",
+                    member.name,
+                    member.mode,
+                    member.state,
+                    member
+                        .ended
+                        .as_deref()
+                        .map(|ended| format!(" ({ended})"))
+                        .unwrap_or_default(),
+                    if transports.is_empty() {
+                        "-".into()
+                    } else {
+                        transports
+                    }
+                );
+            }
+            for peer in &status.peers {
+                println!(
+                    "PEER  {}  {}{}",
+                    peer.peer,
+                    peer.status,
+                    peer.last_error
+                        .as_deref()
+                        .map(|error| format!("  {error}"))
+                        .unwrap_or_default()
+                );
+            }
+            for invite in &status.invites {
+                println!("INVITE  {}  {}", invite.invite, invite.state);
+            }
+            Ok(())
+        }
+    }
+}
+
+fn unix_ms() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+}
+
 #[derive(Args)]
 struct UpArgs {
     #[arg(long)]
@@ -238,6 +752,9 @@ struct UpArgs {
     shared_secret_file: Option<PathBuf>,
     #[arg(long, value_parser = parse_peer)]
     peer: Vec<PeerConfig>,
+    /// Use this pty executable instead of resolving it from the login environment.
+    #[arg(long, hide = true)]
+    pty_binary: Option<PathBuf>,
 }
 
 #[derive(Subcommand)]
@@ -1568,6 +2085,7 @@ async fn run(cli: Cli) -> Result<()> {
         if !args.peer.is_empty() {
             config.peers = args.peer;
         }
+        config.apply_fleet_file()?;
         return st3::peer::run_worker(config).await;
     }
     let config = Config::load_unvalidated(None)?;
@@ -1633,6 +2151,7 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Doctor(args) => run_doctor(&immediate, args, cli.json).await,
         Command::Repair { command } => run_repair(&client, command, cli.json).await,
         Command::Replication { command } => run_replication(&client, command, cli.json).await,
+        Command::Fleet { command } => run_fleet(&endpoint, command, cli.json).await,
         Command::Service { command } => run_service(command, cli.json),
         Command::ClaudeChannel { command } => run_claude_channel(command),
         Command::Subject { command } => run_subject(&client, command, cli.json).await,
@@ -1778,6 +2297,7 @@ async fn run_up(args: UpArgs) -> Result<()> {
     if !args.peer.is_empty() {
         config.peers = args.peer;
     }
+    config.apply_fleet_file()?;
     config.validate()?;
     st2::hooks::ensure_installed().context(
         "publishing this st binary's required lifecycle hook set before starting the daemon",
@@ -1790,6 +2310,9 @@ async fn run_up(args: UpArgs) -> Result<()> {
     if let Some(fleet_id) = &config.fleet_id {
         store.bind_fleet(fleet_id)?;
     }
+    // A member pins its anchor, applies its writer floor, and signs with its key before it
+    // writes anything, so every local batch after this point is signed.
+    st3::fleet::activate(&store, &config)?;
     let admission = store.validate_replication_backlog()?;
     store.apply_replication_repairs()?;
     let projected = store.project_replication_backlog()?;
@@ -1840,7 +2363,10 @@ async fn run_up(args: UpArgs) -> Result<()> {
         .unwrap_or_else(|| config.state_dir.join("pty"));
     let login_environment = st3::environment::snapshot()?;
     st_runtime::initialize_isolation(&login_environment);
-    let pty_binary = st_runtime::resolve_executable("pty", &login_environment)?;
+    let pty_binary = match args.pty_binary.clone() {
+        Some(pty_binary) => pty_binary,
+        None => st_runtime::resolve_executable("pty", &login_environment)?,
+    };
     let recorder = install_recorder(&config, &login_environment);
     let state = AppState {
         store: store.clone(),
@@ -4528,7 +5054,7 @@ async fn run_replication(
 fn run_service(command: ServiceCommand, json_output: bool) -> Result<()> {
     match command {
         ServiceCommand::Install { config } => {
-            st3::service::install(Config::load(config.as_deref())?)
+            st3::service::install(Config::load_with_fleet(config.as_deref())?)
         }
         ServiceCommand::Status => {
             let report = st3::service::status()?;
@@ -4570,7 +5096,7 @@ fn run_service(command: ServiceCommand, json_output: bool) -> Result<()> {
             }
         }
         ServiceCommand::Restart { config } => {
-            st3::service::restart(Config::load(config.as_deref())?)
+            st3::service::restart(Config::load_with_fleet(config.as_deref())?)
         }
         ServiceCommand::Reset { config } => {
             let config = Config::load(config.as_deref())?;
