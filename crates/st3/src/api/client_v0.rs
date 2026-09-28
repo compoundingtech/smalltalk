@@ -980,6 +980,11 @@ fn missions_tree_value(store: &Store, at: &str, index: u64) -> anyhow::Result<Va
         let full = store
             .mission_run(&run.subject)?
             .ok_or_else(|| anyhow::anyhow!("run disappeared: {}", run.subject))?;
+        anyhow::ensure!(
+            full.steps.len() <= 200,
+            "missions tree run exceeds 200 steps: {}",
+            full.subject
+        );
         run_values.push(json!({
             "id": full.subject, "mission": full.mission, "state": full.status,
             "steps": full.steps.iter().map(|step| json!({
@@ -1015,8 +1020,12 @@ fn missions_tree_value(store: &Store, at: &str, index: u64) -> anyhow::Result<Va
         let Some(seat) = desired.get(id) else {
             continue;
         };
-        let host = seat.member.as_ref().map(|member| member.host.as_str());
-        agent["host_id"] = json!(host.map(client_host_id));
+        let host = seat
+            .member
+            .as_ref()
+            .map(|member| member.host.clone())
+            .or_else(|| desired_child_arg(&seat.desired, "host"));
+        agent["host_id"] = json!(host.as_deref().map(client_host_id));
         let harness = seat
             .desired
             .get("children")
@@ -1031,6 +1040,7 @@ fn missions_tree_value(store: &Store, at: &str, index: u64) -> anyhow::Result<Va
         });
     }
     let mut queues = Vec::new();
+    let mut queued_runs = 0;
     for agent in &agents {
         if agent["seat_kind"] != "standing" {
             continue;
@@ -1038,7 +1048,13 @@ fn missions_tree_value(store: &Store, at: &str, index: u64) -> anyhow::Result<Va
         let Some(id) = agent["id"].as_str() else {
             continue;
         };
-        queues.push(agent_queue_value(&store.seat_queue(id)?));
+        let queue = store.seat_queue(id)?;
+        queued_runs += queue.runs.len();
+        anyhow::ensure!(
+            queued_runs <= 1000,
+            "missions tree exceeds 1000 queued runs"
+        );
+        queues.push(agent_queue_value(&queue));
     }
     Ok(json!({ "runs": run_values, "standing_queues": queues,
         "unstarted_missions": unstarted, "agents": agents }))
