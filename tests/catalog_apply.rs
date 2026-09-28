@@ -2879,8 +2879,13 @@ fn prepared_state_symlinks_and_pty_root_changes_fail_before_a_marker() {
 #[test]
 fn apply_v1_requires_a_declared_pty_root_outside_the_catalog() {
     let temp = tempfile::tempdir().unwrap();
-    for case in ["default", "relative", "catalog-variable"] {
-        let catalog = temp.path().join(format!("catalog-{case}"));
+    for (case, directory) in [
+        ("default", "d"),
+        ("relative", "r"),
+        ("catalog-variable", "v"),
+    ] {
+        // Keep this path short enough to test pty-root admission before socket length.
+        let catalog = temp.path().join(directory);
         write_agent(&catalog, "worker", false);
         match case {
             "default" => {}
@@ -2891,7 +2896,7 @@ fn apply_v1_requires_a_declared_pty_root_outside_the_catalog() {
             .unwrap(),
             "catalog-variable" => fs::write(
                 catalog.join("catalog.kdl"),
-                "catalog { pty-root \"$CATALOG/../catalog-catalog-variable/pty\" }\n",
+                "catalog { pty-root \"$CATALOG/../v/pty\" }\n",
             )
             .unwrap(),
             _ => unreachable!(),
