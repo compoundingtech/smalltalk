@@ -835,7 +835,14 @@ impl Runner for PtyCli {
             if out.status.success() {
                 return self.confirm_spawned_session(&target.pty_id, &pty_root);
             }
-            last_err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let detail = if stderr.trim().is_empty() {
+                stdout.trim()
+            } else {
+                stderr.trim()
+            };
+            last_err = format!("{}: {detail}", out.status);
             let corpse_race = last_err.contains("already in use");
             if !corpse_race || attempt + 1 == SPAWN_ATTEMPTS {
                 break;
