@@ -837,6 +837,214 @@ async fn the_secret_never_leaves_its_file() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_removed_member_is_refused() {
+    let root = tempfile::tempdir().unwrap();
+    let a = anchor(root.path(), "a").await;
+    let b = joined(root.path(), &a, "b", &[]).await;
+    b.note("before").await;
+    wait_for_notes(
+        &a,
+        &BTreeSet::from(["custom/fleet-test/before".to_owned()]),
+        60,
+        &[&a, &b],
+    )
+    .await;
+
+    a.st_ok(&["fleet", "remove", "b", "--reason", "test", "--as", PERSON]);
+    // b learns it was removed from a signed refusal naming its own key, and stops dialing.
+    wait_until("b records its removal", 60, || async {
+        fs::read_to_string(b.state_dir().join("fleet/fleet.toml"))
+            .is_ok_and(|file| file.contains("[removed]") && file.contains("member-removed"))
+    })
+    .await;
+    b.note("after").await;
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert!(
+        !a.notes().await.contains("custom/fleet-test/after"),
+        "a write after the removal reached a"
+    );
+    let members = a.st_json(&["fleet", "status"])["view"]["members"].clone();
+    assert!(
+        members.as_array().unwrap().iter().any(|member| {
+            member["name"] == "b" && member["state"] == "ended" && member["ended"] == "removed"
+        }),
+        "{members}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn leave_drains_everything_before_it_leaves() {
+    let root = tempfile::tempdir().unwrap();
+    let mut a = anchor(root.path(), "a").await;
+    let b = joined(root.path(), &a, "b", &[]).await;
+    b.wait_listening().await;
+    a.stop();
+    let mut expected = BTreeSet::new();
+    // More than one exchange carries, written while the anchor is away.
+    for index in 0..700 {
+        b.note(&format!("b-{index}")).await;
+        expected.insert(format!("custom/fleet-test/b-{index}"));
+    }
+    a.start().await;
+    a.wait_listening().await;
+    b.st_ok(&[
+        "fleet",
+        "leave",
+        "--no-service",
+        "--wait",
+        "2m",
+        "--as",
+        PERSON,
+    ]);
+    // Everything b wrote reached a before the leave, and the leave ended b.
+    wait_for_notes(&a, &expected, 10, &[&a, &b]).await;
+    let members = a.st_json(&["fleet", "status"])["view"]["members"].clone();
+    assert!(
+        members.as_array().unwrap().iter().any(|member| {
+            member["name"] == "b" && member["state"] == "ended" && member["ended"] == "left"
+        }),
+        "{members}"
+    );
+    assert!(!b.state_dir().join("fleet").exists());
+    assert!(b.state_dir().join("left-fleet.json").exists());
+    // While leaving, b refused new writes; now it accepts them again, locally.
+    b.note("local-after-leave").await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_leave_already_refused_as_left_finishes_when_run_again() {
+    let root = tempfile::tempdir().unwrap();
+    let a = anchor(root.path(), "a").await;
+    let b = joined(root.path(), &a, "b", &[]).await;
+    b.note("from-b").await;
+    wait_for_notes(
+        &a,
+        &BTreeSet::from(["custom/fleet-test/from-b".to_owned()]),
+        60,
+        &[&a, &b],
+    )
+    .await;
+
+    // An earlier leave wrote its claim, and a admitted it before b heard back. From then on a
+    // refuses b as left and never exchanges with it, so no digest of a's reaches b again.
+    for step in ["begin", "claim"] {
+        let _: Value = b
+            .client()
+            .post(
+                &format!("/v1/internal/fleet/leave/{step}"),
+                &json!({ "person": PERSON }),
+            )
+            .await
+            .unwrap();
+    }
+    wait_until("a admits b's leave", 60, || async {
+        a.st_json(&["fleet", "status"])["view"]["members"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|member| member["name"] == "b" && member["ended"] == "left")
+    })
+    .await;
+    wait_until("a refuses b as left", 60, || async {
+        fs::read_to_string(b.state_dir().join("fleet/fleet.toml"))
+            .is_ok_and(|settings| settings.contains("member-left"))
+    })
+    .await;
+
+    // Running the leave again finishes on that refusal and writes no second leave.
+    let output = b.st_ok(&[
+        "fleet",
+        "leave",
+        "--no-service",
+        "--wait",
+        "30s",
+        "--as",
+        PERSON,
+    ]);
+    assert!(output.contains("left\t"), "{output}");
+    let record: Value =
+        serde_json::from_str(&fs::read_to_string(b.state_dir().join("left-fleet.json")).unwrap())
+            .unwrap();
+    assert_eq!(record["confirmed_by"], "a");
+    let leaves = b
+        .claims()
+        .await
+        .into_iter()
+        .filter(|claim| claim["subject"] == "host/b" && claim["kind"] == "fleet.member-left")
+        .count();
+    assert_eq!(leaves, 1, "the second leave wrote another leave claim");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn uninstall_leaves_nothing_behind() {
+    let root = tempfile::tempdir().unwrap();
+    let a = anchor(root.path(), "a").await;
+    let mut b = joined(root.path(), &a, "b", &[]).await;
+    b.note("from-b").await;
+    wait_for_notes(
+        &a,
+        &BTreeSet::from(["custom/fleet-test/from-b".to_owned()]),
+        60,
+        &[&a, &b],
+    )
+    .await;
+
+    // The dry run lists and removes nothing.
+    let listed = b.st_ok(&["uninstall", "--dry-run", "--keep-binaries", "--no-service"]);
+    assert!(listed.contains(&b.state_dir().display().to_string()));
+    assert!(b.state_dir().exists());
+
+    // With the daemon running, uninstall first leaves the fleet, then asks for the foreground
+    // processes to stop, since no service manager stops them.
+    let first = b.st(&[
+        "uninstall",
+        "--yes",
+        "--keep-binaries",
+        "--no-service",
+        "--as",
+        PERSON,
+    ]);
+    assert!(!first.status.success());
+    assert!(
+        String::from_utf8_lossy(&first.stderr).contains("stop st3 up"),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    b.stop();
+    b.st_ok(&[
+        "uninstall",
+        "--yes",
+        "--keep-binaries",
+        "--no-service",
+        "--as",
+        PERSON,
+    ]);
+
+    // Only what the test itself created remains: empty XDG roots and the stub pty.
+    let mut remaining = Vec::new();
+    for entry in walkdir::WalkDir::new(&b.root) {
+        let entry = entry.unwrap();
+        let relative = entry.path().strip_prefix(&b.root).unwrap().to_path_buf();
+        let expected = relative.as_os_str().is_empty()
+            || ["home", "config", "state", "data", "run", "bin", "bin/pty"]
+                .iter()
+                .any(|kept| relative == Path::new(kept))
+            || relative.to_string_lossy().ends_with(".log");
+        if !expected {
+            remaining.push(relative);
+        }
+    }
+    assert!(remaining.is_empty(), "uninstall left {remaining:?}");
+    let members = a.st_json(&["fleet", "status"])["view"]["members"].clone();
+    assert!(
+        members.as_array().unwrap().iter().any(|member| {
+            member["name"] == "b" && member["state"] == "ended" && member["ended"] == "left"
+        }),
+        "{members}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_flood_of_invalid_join_requests_does_not_block_a_valid_join() {
     let root = tempfile::tempdir().unwrap();
     let a = anchor(root.path(), "a").await;
@@ -869,4 +1077,72 @@ async fn a_flood_of_invalid_join_requests_does_not_block_a_valid_join() {
         "a valid join was blocked: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_leaving_member_writes_nothing_after_it_begins_to_leave() {
+    let root = tempfile::tempdir().unwrap();
+    let a = anchor(root.path(), "a").await;
+    let b = joined(root.path(), &a, "b", &[]).await;
+    b.wait_listening().await;
+    // b sponsors an invite, then begins to leave.
+    let code = b.invite("c", &[]);
+    let _: Value = b
+        .client()
+        .post("/v1/internal/fleet/leave/begin", &json!({"person": PERSON}))
+        .await
+        .unwrap();
+    let before = b.claims().await.len();
+
+    // Redemption, invites, endpoint announcements, and ordinary claims are all refused.
+    let c = Node::new(root.path(), "c");
+    assert!(
+        !c.join(&code, &[]).status.success(),
+        "b admitted c while leaving"
+    );
+    let invite = b.st(&["fleet", "invite", "d", "--code-only", "--as", PERSON]);
+    assert!(!invite.status.success());
+    let announced: Result<Value, _> = b
+        .client()
+        .post(
+            "/v1/internal/fleet/endpoints",
+            &json!({"mode": "listening", "endpoints": []}),
+        )
+        .await;
+    let refusal = announced.unwrap_err().to_string();
+    assert!(refusal.contains("leaving its fleet"), "{refusal}");
+    let claim: Result<Value, _> = b
+        .client()
+        .post(
+            "/v1/claims",
+            &ClaimInput {
+                subject: "custom/fleet-test/while-leaving".into(),
+                kind: NOTE.into(),
+                actor: Some(PERSON.into()),
+                fields: Default::default(),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            },
+        )
+        .await;
+    let refusal = claim.unwrap_err().to_string();
+    assert!(refusal.contains("leaving its fleet"), "{refusal}");
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let local_writes = b
+        .claims()
+        .await
+        .into_iter()
+        .skip(before)
+        .filter(|claim| claim["origin"] == "b")
+        .count();
+    assert_eq!(local_writes, 0, "b wrote while leaving");
+
+    // Cancelling the leave restores writes.
+    let _: Value = b
+        .client()
+        .post("/v1/internal/fleet/leave/cancel", &json!({}))
+        .await
+        .unwrap();
+    b.note("after-cancel").await;
 }
