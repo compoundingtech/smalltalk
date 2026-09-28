@@ -166,3 +166,13 @@ The demo mode (invented data, nothing sent) must exist on iOS too, reading `demo
 ## What the graph still lacks
 
 `docs/stui/graph-gaps.md` lists it; clients show an honest "st does not say" until then.
+
+## Next reuse step: derive the view once, in st
+
+Today each client derives the view from raw projections: who must act on a mission, an agent's
+state, a step's queue position, a cleaned conversation, an attention card. stui does it in Rust
+(`ui/adapt.rs`) and the iOS app will do it again in TypeScript, held together only by the shared
+fixtures. The larger saving is to move that derivation into st's client API: a presentation
+projection per mission (its word, the stuck step and why, what a person can do), per agent (state,
+now, next) and per session (the cleaned, merged conversation, streamed once live conversations
+land). Clients would then only draw, and the fixtures above become the daemon's golden tests.
