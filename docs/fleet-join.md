@@ -650,9 +650,10 @@ writer itself has all of its own.
    without a key ended `W`'s legacy window below `s`; then it is fenced.
 2. Otherwise, find the incarnation of `W` whose window contains `s`. If it is `W`'s legacy window
    (from before `W` had any key), admit the envelope as in rule 1. If it is a keyed incarnation,
-   admit the envelope only when it carries a valid signature by that incarnation's key. Without a
-   signature it waits in the new admission state `unsigned`. With a wrong signature it is
-   `invalid`.
+   admit the envelope only when a valid signature by that incarnation's key is held for it. Until
+   then it waits in the new admission state `unsigned` and keeps requesting one. A signature by
+   any other key proves nothing and changes nothing, so a relay cannot strand an envelope by
+   signing it first.
 3. If no window contains `s`, the envelope is `fenced`.
 
 `unsigned` and `fenced` records are retried whenever a signature arrives or membership changes,
