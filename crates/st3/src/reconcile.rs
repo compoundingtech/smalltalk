@@ -14734,18 +14734,17 @@ mission "scheduled-cycle" state="ready" {
         reconciler.reconcile_once().unwrap();
         tokio::time::sleep(Duration::from_millis(100)).await;
         reconciler.reconcile_once().unwrap();
-        assert!(store
-            .claims_for("schedule/cycle", Some("schedule.work-started"))
-            .unwrap()
-            .is_empty());
+        assert!(
+            store
+                .claims_for("schedule/cycle", Some("schedule.work-started"))
+                .unwrap()
+                .is_empty()
+        );
         let diagnostics = store
             .claims_for("daemon/node", Some("daemon.diagnostic"))
             .unwrap();
         assert!(diagnostics.iter().any(|claim| {
-            claim
-                .body
-                .pointer("/fields/code")
-                .and_then(Value::as_str)
+            claim.body.pointer("/fields/code").and_then(Value::as_str)
                 == Some("workspace-unavailable")
         }));
 
