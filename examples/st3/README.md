@@ -100,9 +100,9 @@ the setup.
 
 ## Gates that work
 
-Gates run through `sh -c` with a minimal environment and no login shell:
+Gates run through `sh -c` with the daemon's login environment and the command recorder first on `PATH`:
 
-- Use absolute binary paths, such as `/usr/bin/git`.
+- Call `git` by name so its calls appear in the recorder log.
 - `${NAME}` is an st variable; write shell variables as plain `$NAME`, or `$${NAME}` for braces.
 - A gate on files checks the committed, pushed tree, not an agent's working tree.
 - A gate result is cached by its definition and step attempt. A loop's `until` gate puts
