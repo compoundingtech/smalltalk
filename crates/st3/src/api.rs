@@ -3543,7 +3543,10 @@ fn doctor_report(state: &AppState) -> Result<Json<DoctorReport>, ApiError> {
                         .map(|projection| format!(
                             " ({}: {})",
                             projection.aggregate,
-                            projection.error_message.as_deref().unwrap_or("no reason recorded")
+                            projection
+                                .error_message
+                                .as_deref()
+                                .unwrap_or("no reason recorded")
                         ))
                         .unwrap_or_default(),
                     if unavailable.is_empty() {
@@ -9508,9 +9511,10 @@ mod tests {
         assert_eq!(report["rows"][0]["total_tokens"], 29);
         assert_eq!(report["rows"][0]["cache_write_tokens"], 3);
         assert_eq!(report["rows"][0]["cached_tokens"], 20);
+        // The response timeline and its latest-retention rollup both stay local.
         assert_eq!(
             state.store.local_observations_after(0, 10).unwrap().len(),
-            1
+            2
         );
         assert_eq!(
             state
@@ -9520,6 +9524,85 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn a_local_only_harness_observation_wakes_only_the_client_feed() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let wake_file = root.path().join("replication.wake");
+        let mut client_feed = state.event_notify.subscribe();
+        let subject = "agent/node.worker";
+        let observed = |state_name: &str, observed_at_ms: u64| ClaimInput {
+            subject: subject.into(),
+            kind: "harness.observed".into(),
+            actor: Some(subject.into()),
+            fields: BTreeMap::from([
+                ("state".into(), Value::String(state_name.into())),
+                ("incarnation_id".into(), Value::String("inc-1".into())),
+                ("observed_at_ms".into(), Value::from(observed_at_ms)),
+            ]),
+            evidence: Vec::new(),
+            expected_subject: None,
+            idempotency_key: Some(format!("wake-{state_name}-{observed_at_ms}")),
+        };
+        let usage = |tokens: u64| ClaimInput {
+            subject: subject.into(),
+            kind: "harness.usage".into(),
+            actor: Some(subject.into()),
+            fields: BTreeMap::from([
+                ("driver".into(), Value::String("codex".into())),
+                ("incarnation_id".into(), Value::String("inc-1".into())),
+                (
+                    "semantics".into(),
+                    Value::String("context_occupancy".into()),
+                ),
+                ("context_used_tokens".into(), Value::from(tokens)),
+            ]),
+            evidence: Vec::new(),
+            expected_subject: None,
+            idempotency_key: Some(format!("wake-usage-{tokens}")),
+        };
+        let post = |input: ClaimInput| post_claim(State(state.clone()), Json(input));
+        let reconciler_woke = || async {
+            tokio::time::timeout(Duration::from_millis(20), state.notify.notified())
+                .await
+                .is_ok()
+        };
+        let mut client_feed_woke = || {
+            let changed = client_feed.has_changed().unwrap();
+            client_feed.borrow_and_update();
+            changed
+        };
+
+        let change = post(observed("working", 1)).await.unwrap().0;
+        assert!(crate::store::local_observation_position(&change).is_none());
+        assert!(reconciler_woke().await);
+        assert!(wake_file.exists());
+        assert!(client_feed_woke());
+        fs::remove_file(&wake_file).unwrap();
+
+        let heartbeat = post(observed("working", 300_001)).await.unwrap().0;
+        assert!(crate::store::local_observation_position(&heartbeat).is_some());
+        assert!(!reconciler_woke().await, "a heartbeat does not reconcile");
+        assert!(!wake_file.exists(), "a heartbeat does not wake replication");
+        assert!(client_feed_woke(), "clients still see the observation");
+
+        let first_usage = post(usage(10)).await.unwrap().0;
+        assert!(crate::store::local_observation_position(&first_usage).is_none());
+        assert!(wake_file.exists(), "replicated usage wakes replication");
+        assert!(!reconciler_woke().await, "usage never reconciles");
+        assert!(client_feed_woke());
+        fs::remove_file(&wake_file).unwrap();
+
+        let throttled = post(usage(20)).await.unwrap().0;
+        assert!(crate::store::local_observation_position(&throttled).is_some());
+        assert!(
+            !wake_file.exists(),
+            "usage kept local does not wake replication"
+        );
+        assert!(!reconciler_woke().await);
+        assert!(client_feed_woke());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
