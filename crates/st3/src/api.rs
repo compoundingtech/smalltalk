@@ -1238,6 +1238,9 @@ fn client_work_resources(
                 "generation_id": work.generation,
                 "definition_id": work.definition_hash,
                 "path": work.step,
+                "title": work.title,
+                "assigned_to": work.assigned_to,
+                "last_progress": work.progress_summary,
                 "state": state,
                 "agentless": work.agentless,
                 "gate_kind": gate_kind,
@@ -1352,6 +1355,14 @@ fn client_agent_resources_uncached(
     // history. Scan both, then keep current-layer agents below.
     let status = store.status_for_subject_prefix_at("agent/", Some(snapshot_index), true)?;
     let work_queues = store.agent_work_queues()?;
+    let desired_hosts = store
+        .desired_subjects()?
+        .into_iter()
+        .filter_map(|desired| {
+            let host = desired.member.map(|member| member.host)?;
+            Some((desired.subject, client_host_id(&host)))
+        })
+        .collect::<BTreeMap<_, _>>();
     let mut agents = status
         .subjects
         .into_iter()
@@ -1377,6 +1388,33 @@ fn client_agent_resources_uncached(
                 .harness
                 .as_ref()
                 .map(|harness| harness.state.clone());
+            let last_activity_at = store.agent_last_activity_at(
+                &subject.subject,
+                subject
+                    .harness
+                    .as_ref()
+                    .map(|harness| harness.incarnation_id.as_str()),
+                snapshot_index,
+            )?;
+            let silent_since = if harness_state.as_deref() == Some("working") {
+                let working_since = match subject.harness.as_ref() {
+                    Some(harness) => store
+                        .agent_working_since(
+                            &subject.subject,
+                            &harness.incarnation_id,
+                            snapshot_index,
+                        )?
+                        .or(Some(harness.observed_at_unix_ms)),
+                    None => None,
+                };
+                match (last_activity_at, working_since) {
+                    (Some(activity), Some(start)) => Some(activity.max(start)),
+                    (Some(activity), None) => Some(activity),
+                    (None, start) => start,
+                }
+            } else {
+                None
+            };
             // A live wrapper is necessary but not sufficient for a running agent. Native
             // harnesses only become running once the current runtime incarnation has produced a
             // ready observation; an ended or indeterminate harness must never be painted green
@@ -1482,6 +1520,9 @@ fn client_agent_resources_uncached(
                 "owner_run_id": subject.owner_run,
                 "driver": driver,
                 "harness_state": harness_state,
+                "host_id": desired_hosts.get(&subject.subject),
+                "last_activity_at": last_activity_at.map(client_timestamp),
+                "silent_since": silent_since.map(client_timestamp),
                 "fault": fault,
                 "incarnation_id": incarnation_id,
                 "current_session_id": current_session_id,
@@ -11464,7 +11505,7 @@ mission "planned/direct" state="ready" {
         let kdl = r#"version 2
 mission "visible-agentless" state="ready" {
   goal "Keep agentless work visible in Control."
-  step "steward" { agentless }
+  step "steward" { title "Keep watch"; agentless }
 }"#;
         let intent = parse_intent(kdl, "node").unwrap();
         let preview = state
@@ -11506,6 +11547,9 @@ mission "visible-agentless" state="ready" {
             .find(|item| item["mission_run_id"] == run.subject)
             .unwrap();
         assert_eq!(step["path"], "steward");
+        assert_eq!(step["title"], "Keep watch");
+        assert_eq!(step["assigned_to"], Value::Null);
+        assert_eq!(step["last_progress"], Value::Null);
         assert_eq!(step["agentless"], true);
         assert!(
             client_work_resources(
@@ -12713,6 +12757,8 @@ mission "agent-health" state="ready" {
         let resources =
             client_agent_resources(&store, false, "snapshot", store.index().unwrap()).unwrap();
         assert_eq!(resources[0]["state"], "starting");
+        assert_eq!(resources[0]["host_id"], "host/node");
+        assert!(resources[0]["last_activity_at"].is_null());
         assert_eq!(resources[0]["next_work_id"], queued);
         assert_eq!(resources[0]["upcoming_work_ids"], json!([queued]));
         assert_eq!(resources[0]["queued_work_count"], 1);
