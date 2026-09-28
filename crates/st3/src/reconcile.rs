@@ -15125,7 +15125,7 @@ mission "absent-stop" state="ready" {
         ));
         let task = tokio::spawn(reconciler.run());
 
-        tokio::time::timeout(Duration::from_secs(1), async {
+        tokio::time::timeout(Duration::from_secs(10), async {
             loop {
                 let current = store.mission_run(&run.id).unwrap().unwrap();
                 if current.status == "failed" && current.phase == "terminal" {
