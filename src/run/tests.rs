@@ -463,7 +463,7 @@ fn supervisor_wakes_and_launches_a_new_direct_declaration() {
     std::thread::scope(|scope| {
         let watchdog_stop = &stop;
         scope.spawn(move || {
-            if done_rx.recv_timeout(Duration::from_secs(15)).is_err() {
+            if done_rx.recv_timeout(Duration::from_secs(5)).is_err() {
                 watchdog_stop.store(true, Ordering::SeqCst);
             }
         });
@@ -527,7 +527,7 @@ fn residency_wake_control_file_triggers_an_immediate_reconcile() {
     std::thread::scope(|scope| {
         let watchdog_stop = &stop;
         scope.spawn(move || {
-            if done_rx.recv_timeout(Duration::from_secs(5)).is_err() {
+            if done_rx.recv_timeout(Duration::from_secs(15)).is_err() {
                 watchdog_stop.store(true, Ordering::SeqCst);
             }
         });

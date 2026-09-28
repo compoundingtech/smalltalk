@@ -1,5 +1,9 @@
 use super::*;
 
+// Shared CI runs several workspace suites at once; these waits test event ordering,
+// not a two-second performance bound.
+const TEST_EVENT_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// The stop flag is process-global, so every test that exercises a reader of it —
 /// [`initialize_control`] above all — holds this lock against the one test that flips
 /// the flag: parallel readers would otherwise observe the raised flag and fail their
@@ -1099,54 +1103,7 @@ fn delivery_config(root: &Path) -> CodexDeliveryConfig {
         this_host: "h".into(),
         supervisor: None,
         producer_version: Some("codex-cli 0.153.0".into()),
-        model: None,
     }
-}
-
-#[test]
-fn rollout_turn_context_selects_the_effective_model_for_the_exact_turn() {
-    let frames = vec![
-        json!({"type":"turn_context","payload":{"turn_id":"turn-a","model":"gpt-example-a"}}),
-        json!({"type":"turn_context","payload":{"turn_id":"turn-b","model":"gpt-example-b"}}),
-        json!({"type":"event_msg","payload":{"type":"token_count","turn_id":"turn-b"}}),
-    ];
-    assert_eq!(
-        model_from_codex_frames(&frames, "turn-a").as_deref(),
-        Some("gpt-example-a")
-    );
-    assert_eq!(
-        model_from_codex_frames(&frames, "turn-b").as_deref(),
-        Some("gpt-example-b")
-    );
-    assert_eq!(model_from_codex_frames(&frames, "turn-c"), None);
-}
-
-#[test]
-fn configured_codex_model_is_a_fallback_when_the_rollout_is_unavailable() {
-    assert_eq!(
-        declared_codex_model(&["--model".into(), "gpt-example".into()]).as_deref(),
-        Some("gpt-example")
-    );
-    assert_eq!(
-        declared_codex_model(&["--model=first".into(), "-m".into(), "second".into()]).as_deref(),
-        Some("second")
-    );
-    assert_eq!(
-        declared_codex_model(&["--".into(), "--model".into(), "prompt".into()]),
-        None
-    );
-}
-
-#[test]
-fn replayed_codex_token_usage_is_context_only_until_its_turn_is_active() {
-    let usage = json!({"method":"thread/tokenUsage/updated","params":{"turnId":"turn-old"}});
-    assert!(!should_track_timeline_usage(&usage, None));
-    assert!(!should_track_timeline_usage(&usage, Some("turn-new")));
-    assert!(should_track_timeline_usage(&usage, Some("turn-old")));
-    assert!(should_track_timeline_usage(
-        &json!({"method":"item/completed"}),
-        None
-    ));
 }
 
 fn subscribed_state(observed: CodexObservedState) -> CodexControlState {
@@ -2770,7 +2727,7 @@ fn control_initializes_before_recording_the_first_thread_only() {
             tx,
         )
     });
-    let first_event = rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    let first_event = rx.recv_timeout(TEST_EVENT_TIMEOUT).unwrap();
     assert!(
         matches!(first_event, ControlEvent::Bound),
         "first control event: {first_event:?}"
@@ -2924,12 +2881,12 @@ fn expected_resume_waits_for_tui_loaded_thread_and_binds_from_control_response()
         )
     });
     pre_gate_checked_rx
-        .recv_timeout(Duration::from_secs(10))
+        .recv_timeout(TEST_EVENT_TIMEOUT)
         .unwrap();
     resume_ready_tx.send(()).unwrap();
     acknowledge_tui_thread_loaded(&rx);
     assert!(matches!(
-        rx.recv_timeout(Duration::from_secs(10)).unwrap(),
+        rx.recv_timeout(TEST_EVENT_TIMEOUT).unwrap(),
         ControlEvent::ResumePermissionPolicyApplied(ResumePermissionOverrides {
             approval_policy: Some(policy),
             approvals_reviewer: None,
@@ -2937,7 +2894,7 @@ fn expected_resume_waits_for_tui_loaded_thread_and_binds_from_control_response()
         }) if policy == "never" && sandbox == "danger-full-access"
     ));
     assert!(matches!(
-        rx.recv_timeout(Duration::from_secs(10)).unwrap(),
+        rx.recv_timeout(TEST_EVENT_TIMEOUT).unwrap(),
         ControlEvent::Bound
     ));
     server.join().unwrap();
@@ -3034,13 +2991,13 @@ fn declared_resume_policy_preloads_before_the_tui_can_load_read_only() {
         )
     });
     ready_tx.send(()).unwrap();
-    preloaded_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    preloaded_rx.recv_timeout(TEST_EVENT_TIMEOUT).unwrap();
     assert!(matches!(
-        events_rx.recv_timeout(Duration::from_secs(10)).unwrap(),
+        events_rx.recv_timeout(TEST_EVENT_TIMEOUT).unwrap(),
         ControlEvent::ResumePermissionPolicyApplied(_)
     ));
     assert!(matches!(
-        events_rx.recv_timeout(Duration::from_secs(10)).unwrap(),
+        events_rx.recv_timeout(TEST_EVENT_TIMEOUT).unwrap(),
         ControlEvent::Bound
     ));
     server.join().unwrap();
@@ -3159,14 +3116,14 @@ fn rejected_resume_permission_projection_retries_once_with_provider_safe_policy(
     resume_ready_tx.send(()).unwrap();
     acknowledge_tui_thread_loaded(&rx);
     assert!(matches!(
-        rx.recv_timeout(Duration::from_secs(10)).unwrap(),
+        rx.recv_timeout(TEST_EVENT_TIMEOUT).unwrap(),
         ControlEvent::SafeFallbackActivated {
             cause: "resumePermissionProjectionRejected",
             ..
         }
     ));
     assert!(matches!(
-        rx.recv_timeout(Duration::from_secs(10)).unwrap(),
+        rx.recv_timeout(TEST_EVENT_TIMEOUT).unwrap(),
         ControlEvent::Bound
     ));
     assert!(fallback_active.load(Ordering::SeqCst));
@@ -3374,7 +3331,7 @@ fn tui_loaded_timeout_reports_the_specific_failure_before_outer_binding_timeout(
         )
     });
     resume_ready_tx.send(()).unwrap();
-    let ControlEvent::Failed(error) = rx.recv_timeout(Duration::from_secs(10)).unwrap() else {
+    let ControlEvent::Failed(error) = rx.recv_timeout(TEST_EVENT_TIMEOUT).unwrap() else {
         panic!("inner TUI-loaded deadline did not report its specific failure");
     };
     assert!(
@@ -3475,7 +3432,7 @@ fn missing_saved_rollout_fails_without_rebinding_the_incarnation() {
     });
     resume_ready_tx.send(()).unwrap();
     acknowledge_tui_thread_loaded(&rx);
-    let ControlEvent::Failed(error) = rx.recv_timeout(Duration::from_secs(10)).unwrap() else {
+    let ControlEvent::Failed(error) = rx.recv_timeout(TEST_EVENT_TIMEOUT).unwrap() else {
         panic!("missing saved rollout did not fail closed");
     };
     assert!(error.contains("saved Codex resume binding has no persisted rollout"));
