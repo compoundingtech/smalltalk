@@ -195,6 +195,10 @@ struct Host {
 
 impl Host {
     fn new() -> Self {
+        Self::with_cleanup_deadline(None)
+    }
+
+    fn with_cleanup_deadline(cleanup_deadline: Option<std::time::Duration>) -> Self {
         let root = tempfile::tempdir().unwrap();
         let workspace = root.path().join("workspace");
         std::fs::create_dir_all(&workspace).unwrap();
@@ -208,6 +212,10 @@ impl Host {
             Arc::new(Notify::new()),
         )
         .with_fault_injection(faults.clone());
+        let reconciler = match cleanup_deadline {
+            Some(deadline) => reconciler.with_cleanup_deadline(deadline),
+            None => reconciler,
+        };
         let host = Self {
             _root: root,
             workspace,
@@ -221,7 +229,7 @@ impl Host {
 mission "worker" state="ready" {
   goal "Keep one worker running until the run is cancelled."
   concurrent-runs max=8
-  agent "worker" { workspace "${ST_WORKSPACE}"; command "sleep 600"; restart "never" }
+  agent "worker" { workspace "${ST_WORKSPACE}"; command "sleep 600"; restart "never"; shutdown-timeout "50ms" }
   step "wait" {
     assigned-to "agent/${ST_MISSION_RUN}/worker"
     goal "Wait for cancellation."
@@ -236,6 +244,13 @@ mission "job" state="ready" {
     assigned-to "agent/${ST_MISSION_RUN}/worker"
     goal "Wait for cancellation."
   }
+}
+mission "pair" state="ready" {
+  goal "Offer two independent steps."
+  concurrent-runs max=8
+  agent "worker" { workspace "${ST_WORKSPACE}"; command "sleep 600"; restart "never" }
+  step "first" { assigned-to "agent/${ST_MISSION_RUN}/worker"; goal "Do the first part." }
+  step "second" { assigned-to "agent/${ST_MISSION_RUN}/worker"; goal "Do the second part." }
 }"#,
             "publish-worker",
         );
@@ -1108,5 +1123,75 @@ fn a_pty_in_an_unknown_state_is_never_recorded_stopped() {
     assert_eq!(
         host.state(&cancelled),
         ("cancelled".into(), "terminal".into())
+    );
+}
+
+/// One step of a run that fails does not hold back the run's other steps.
+#[test]
+fn a_failing_step_does_not_hold_back_the_other_steps_of_its_run() {
+    for fault in [Fault::Error, Fault::Panic] {
+        let host = Host::new();
+        let run = host.start_mission("pair", "pair");
+        let step = |path: &str| {
+            host.store
+                .mission_run(&run.id)
+                .unwrap()
+                .unwrap()
+                .steps
+                .into_iter()
+                .find(|step| step.step == path)
+                .unwrap()
+        };
+        // The failing step comes first in the run's step order.
+        let first = step("first").subject;
+        host.faults.fail("step", &first, fault);
+        host.pass(4);
+        assert_eq!(step("first").status, "pending");
+        assert_eq!(step("second").status, "ready");
+        assert!(host.fault(&first, "step").is_some());
+        assert_eq!(host.fault(&run.subject, "mission-run"), None);
+        host.faults.clear();
+        host.pass(2);
+        assert_eq!(step("first").status, "ready");
+        assert_eq!(host.fault(&first, "step"), None);
+    }
+}
+
+/// A runtime that never stops ends its run at the cleanup deadline instead of holding it and its
+/// active-run slot forever. Its stop stays declared and completes once the runtime can stop.
+#[test]
+fn a_runtime_that_never_stops_ends_its_run_at_the_cleanup_deadline() {
+    let host = Host::with_cleanup_deadline(Some(std::time::Duration::ZERO));
+    let (stubborn, stubborn_worker) = running_run(&host, "stubborn");
+    host.runtime
+        .failed_stops
+        .lock()
+        .unwrap()
+        .insert(stubborn_worker.clone());
+    host.cancel(&stubborn);
+    host.pass(8);
+    let ended = host.store.mission_run(&stubborn.id).unwrap().unwrap();
+    assert_eq!(
+        (ended.status.as_str(), ended.phase.as_str()),
+        ("cancelled", "terminal")
+    );
+    let reason = host
+        .store
+        .latest_claim(&stubborn.subject, Some("mission-run.state"))
+        .unwrap()
+        .unwrap()
+        .body["fields"]["reason"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned();
+    assert!(reason.contains("still live"), "{reason}");
+    assert!(host.runtime.running(&stubborn_worker));
+    host.runtime.failed_stops.lock().unwrap().clear();
+    // The failed stop waits out the worker's shutdown timeout and then kills it.
+    std::thread::sleep(std::time::Duration::from_millis(60));
+    host.pass(4);
+    assert!(
+        !host.runtime.running(&stubborn_worker),
+        "the stop was abandoned when its run ended"
     );
 }
