@@ -31135,6 +31135,61 @@ version 2
     }
 
     #[test]
+    fn legacy_human_gate_mission_keeps_its_revision_during_replication() {
+        let store = Store::open_memory("node").unwrap();
+        assert!(store.project_replication_backlog().unwrap());
+        let intent = parse_intent(
+            "version 2\nmission \"sample/review\" state=\"ready\" {\n  goal \"Review a sample change.\"\n  step \"approval\" {\n    gate \"review\" type=\"human\" { reviewer \"person/reviewer\" }\n  }\n}\n",
+            "node",
+        )
+        .unwrap();
+        let mut mission = intent.missions["sample/review"].clone();
+        mission.revision.clear();
+        // This is the serialized form from before human gates had a mode field.
+        let current_json = serde_json::to_string(&mission).unwrap();
+        let legacy_json = current_json.replace(",\"mode\":\"approve\"", "");
+        assert_ne!(legacy_json, current_json);
+        let revision = hex::encode(Sha256::digest(legacy_json.as_bytes()));
+        let mut body: Value = serde_json::from_str(&legacy_json).unwrap();
+        body["revision"] = Value::String(revision.clone());
+        let claim = {
+            let mut connection = store.connection.lock().unwrap();
+            let transaction = connection.transaction().unwrap();
+            let claim = append_claim_tx(
+                &transaction,
+                &store.origin,
+                "mission/sample/review",
+                "mission.published",
+                None,
+                &body,
+                &[],
+                None,
+            )
+            .unwrap();
+            transaction.commit().unwrap();
+            claim
+        };
+        assert!(store.project_replication_backlog().unwrap());
+        let connection = store.connection.lock().unwrap();
+        let selected: String = connection
+            .query_row(
+                "SELECT revision FROM mission_revisions WHERE mission_id='sample/review'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(selected, revision);
+        assert!(store.operation_projection_drift().unwrap().is_empty());
+        assert!(!connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM projection_health WHERE aggregate=?1 AND status='stale')",
+                [format!("projection:base:{}", claim.id)],
+                |row| row.get::<_, bool>(0),
+            )
+            .unwrap());
+    }
+
+    #[test]
     fn operation_projection_drift_uses_one_snapshot_during_writes() {
         let directory = tempfile::tempdir().unwrap();
         let store = Arc::new(Store::open(&directory.path().join("state.sqlite3"), "node").unwrap());
