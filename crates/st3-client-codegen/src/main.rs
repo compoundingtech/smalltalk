@@ -454,6 +454,8 @@ fn validate_surfaces(
         "MachineCapacity",
         "MachineOccupancy",
         "MachineTransport",
+        "ObserverSpec",
+        "SubscriptionSpec",
         "SyncNotice",
         "SyncPeer",
         "StructuredDiff",
