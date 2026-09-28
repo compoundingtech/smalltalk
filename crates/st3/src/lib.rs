@@ -16,6 +16,7 @@ pub mod otlp;
 pub mod peer;
 pub mod projection;
 pub mod reconcile;
+/// Observes git and gh calls without changing their command behavior.
 pub mod recorder;
 pub mod render;
 pub mod resource;
