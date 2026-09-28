@@ -1529,7 +1529,7 @@ impl<R: RuntimeControl> Reconciler<R> {
         );
         let deadline_recorded = self
             .store
-            .claims_for(&subject.subject, Some("runtime.readiness-deadline-reached"))?
+            .observations_for(&subject.subject, "runtime.readiness-deadline-reached")?
             .iter()
             .any(|claim| {
                 claim
@@ -1623,7 +1623,7 @@ impl<R: RuntimeControl> Reconciler<R> {
     ) -> Result<()> {
         for claim in self
             .store
-            .claims_for(subject, Some("runtime.readiness-deadline-reached"))?
+            .observations_for(subject, "runtime.readiness-deadline-reached")?
         {
             let Some(old_incarnation) = claim_incarnation(&claim) else {
                 continue;
@@ -3363,7 +3363,7 @@ impl<R: RuntimeControl> Reconciler<R> {
     ) -> Result<()> {
         if self
             .store
-            .latest_claim(subject, Some(kind))?
+            .latest_observation(subject, kind)?
             .is_some_and(|claim| {
                 claim.body.get("fields")
                     == Some(&serde_json::to_value(&fields).unwrap_or(Value::Null))
@@ -3371,7 +3371,7 @@ impl<R: RuntimeControl> Reconciler<R> {
         {
             return Ok(());
         }
-        self.store.append_claim(&ClaimInput {
+        let record = self.store.append_claim(&ClaimInput {
             subject: subject.into(),
             kind: kind.into(),
             actor: None,
@@ -3380,7 +3380,13 @@ impl<R: RuntimeControl> Reconciler<R> {
             expected_subject: None,
             idempotency_key: None,
         })?;
-        self.signal_changed();
+        if crate::store::local_observation_position(&record).is_some() {
+            // Only this node reads a local observation, and it cannot advance a mission.
+            self.event_notify
+                .send_modify(|generation| *generation = generation.saturating_add(1));
+        } else {
+            self.signal_changed();
+        }
         Ok(())
     }
 
@@ -11373,7 +11379,7 @@ version 2
                 .contains(&"exec.task".to_owned())
         );
         let applied = store
-            .claims_for("exec/task", Some("render.applied"))
+            .observations_for("exec/task", "render.applied")
             .unwrap();
         assert!(
             applied.iter().any(|claim| claim.body["fields"]["warnings"]
@@ -16440,6 +16446,62 @@ mission "gated-loop" state="ready" {
     }
 
     #[test]
+    fn a_render_receipt_is_recorded_once_on_the_node_that_rendered() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        let reconciler = Reconciler::new(
+            store.clone(),
+            Arc::new(FakeRuntime::default()),
+            "node".into(),
+            Arc::new(Notify::new()),
+        );
+        let receipt = |sha: &str| {
+            BTreeMap::from([(
+                "writes".into(),
+                serde_json::json!([{"destination": "/work/example/.st3/boot.md", "mode": 420, "sha256": sha}]),
+            )])
+        };
+        let generation = *reconciler.event_notify.borrow();
+        reconciler
+            .record_once("agent/node.worker", "render.applied", receipt("first"))
+            .unwrap();
+        reconciler
+            .record_once("agent/node.worker", "render.applied", receipt("first"))
+            .unwrap();
+        assert_eq!(
+            store
+                .observations_for("agent/node.worker", "render.applied")
+                .unwrap()
+                .len(),
+            1,
+            "an unchanged receipt is not recorded again"
+        );
+        assert!(
+            store
+                .claims_for("agent/node.worker", Some("render.applied"))
+                .unwrap()
+                .is_empty(),
+            "a render receipt stays on this node"
+        );
+        assert_eq!(*reconciler.event_notify.borrow(), generation + 1);
+        reconciler
+            .record_once("agent/node.worker", "render.applied", receipt("second"))
+            .unwrap();
+        let receipts = store
+            .observations_for("agent/node.worker", "render.applied")
+            .unwrap();
+        assert_eq!(receipts.len(), 2);
+        assert_eq!(receipts[1].body["fields"]["writes"][0]["sha256"], "second");
+        assert_eq!(
+            store
+                .latest_observation("agent/node.worker", "render.applied")
+                .unwrap()
+                .unwrap()
+                .id,
+            receipts[1].id
+        );
+    }
+
+    #[test]
     fn a_failed_loop_requests_attention_once() {
         let store = Arc::new(Store::open_memory("node").unwrap());
         let source = r#"
@@ -19865,13 +19927,20 @@ version 2
         assert_eq!(*event_notify.borrow(), first_generation);
         assert_eq!(
             store
+                .observations_for("agent/node.worker", "runtime.readiness-deadline-reached")
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(
+            store
                 .claims_for(
                     "agent/node.worker",
                     Some("runtime.readiness-deadline-reached")
                 )
                 .unwrap()
-                .len(),
-            1
+                .is_empty(),
+            "the deadline stays on this node; its attention request replicates"
         );
         let attention = store.attention_items(Some("person/operator")).unwrap();
         assert_eq!(attention.len(), 1);
@@ -20235,7 +20304,7 @@ agent "keeper" { workspace "/tmp"; command "true"; restart "never" }
             .unwrap();
         assert!(
             store
-                .claims_for(&desired.subject, Some("runtime.readiness-deadline-reached"))
+                .observations_for(&desired.subject, "runtime.readiness-deadline-reached")
                 .unwrap()
                 .is_empty()
         );
