@@ -1,0 +1,120 @@
+name: Smalltalk tag release
+
+on:
+  push:
+    tags: ['**']
+  # Both paths exercise the complete build/package/verification pipeline without publishing.
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - '.github/workflows/release-smalltalk.yml'
+      - 'scripts/release-smalltalk*'
+      - 'scripts/install-release*'
+      - 'docs/st3/binary-releases.md'
+      - 'flake.lock'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: smalltalk-release-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  build:
+    if: ${{ github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.event.deleted == false) || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) }}
+    name: release-build (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+          - runner: macos-15
+            target: aarch64-apple-darwin
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    env:
+      MACOSX_DEPLOYMENT_TARGET: '15.0'
+      RELEASE_TAG: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        with:
+          version: 0.15.2
+      - name: Test installer
+        run: scripts/install-release-test
+      - name: Build, package, and test extracted tools
+        run: scripts/release-smalltalk '${{ matrix.target }}' dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  assemble:
+    name: release-assemble
+    needs: build
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          merge-multiple: true
+          path: dist
+      - name: Verify both targets and record exact sources
+        env:
+          SOURCE_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          cd dist
+          cat ./*.sha256 > SHA256SUMS
+          sha256sum --check SHA256SUMS
+          python3 ../scripts/release-smalltalk-manifest.py "$SOURCE_SHA"
+          cp ../docs/st3/binary-releases.md RELEASE-NOTES.md
+          printf '\nExact source: `%s`. See RELEASE.json for the PTY revision and targets.\n' "$SOURCE_SHA" >> RELEASE-NOTES.md
+      - uses: actions/upload-artifact@v4
+        with:
+          name: smalltalk-release
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    name: release-publish
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') && github.event.deleted == false
+    needs: assemble
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      TAG: ${{ github.ref_name }}
+      SOURCE_SHA: ${{ github.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/download-artifact@v4
+        with:
+          name: smalltalk-release
+          path: dist
+      - name: Publish the verified tag artifacts
+        run: |
+          set -euo pipefail
+          git fetch origin "refs/tags/$TAG"
+          test "$(git rev-parse 'FETCH_HEAD^{commit}')" = "$SOURCE_SHA"
+          cd dist
+          sha256sum --check SHA256SUMS
+          python3 ../scripts/release-smalltalk-manifest.py "$SOURCE_SHA"
+          # Refuse to replace any existing release or its assets. A partial draft stays private
+          # for inspection; delete that draft before retrying, never move the tag.
+          gh release create "$TAG" --verify-tag --draft --title "Smalltalk $TAG" \
+            --notes-file RELEASE-NOTES.md ./*.tar.gz ./*.sha256 SHA256SUMS RELEASE.json
+          gh release edit "$TAG" --draft=false

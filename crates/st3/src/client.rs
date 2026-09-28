@@ -56,7 +56,7 @@ pub enum OutagePhase {
     Response,
 }
 
-/// The st3 daemon could not be reached, typically because it is restarting.
+/// The st daemon could not be reached, typically because it is restarting.
 ///
 /// Every caller sees this one error for an outage, so the CLI, the native drivers, and the
 /// channels can say the same plain thing and decide how to wait. It never tells anyone to start
@@ -114,11 +114,11 @@ impl DaemonUnreachable {
     pub fn summary(&self) -> String {
         match self.phase {
             OutagePhase::Connect => format!(
-                "the st3 daemon at {} is not reachable ({}); it may be restarting",
+                "the st daemon at {} is not reachable ({}); it may be restarting",
                 self.endpoint, self.reason
             ),
             OutagePhase::Response => format!(
-                "the st3 daemon at {} closed the connection before it answered ({}); it may be restarting, and the request may or may not have been applied",
+                "the st daemon at {} closed the connection before it answered ({}); it may be restarting, and the request may or may not have been applied",
                 self.endpoint, self.reason
             ),
         }
@@ -134,12 +134,12 @@ impl fmt::Display for DaemonUnreachable {
         match self.phase {
             OutagePhase::Connect => write!(
                 formatter,
-                "the st3 daemon at {} was not reachable for {seconds}s ({}); it may be restarting or stopped. Nothing was sent; run the command again once the daemon is back",
+                "the st daemon at {} was not reachable for {seconds}s ({}); it may be restarting or stopped. Nothing was sent; run the command again once the daemon is back",
                 self.endpoint, self.reason
             ),
             OutagePhase::Response => write!(
                 formatter,
-                "the st3 daemon at {} stopped answering for {seconds}s ({}); it may be restarting or stopped. The last request may or may not have been applied; check its result once the daemon is back",
+                "the st daemon at {} stopped answering for {seconds}s ({}); it may be restarting or stopped. The last request may or may not have been applied; check its result once the daemon is back",
                 self.endpoint, self.reason
             ),
         }
@@ -184,7 +184,7 @@ impl Client {
             http: reqwest::Client::builder()
                 .connect_timeout(deadlines.connect)
                 .build()
-                .expect("the st3 HTTP client configuration is valid"),
+                .expect("the st HTTP client configuration is valid"),
             deadlines,
             person: None,
             outage_wait: Duration::ZERO,
@@ -275,7 +275,7 @@ impl Client {
             }
             if self.announce_outage_wait && !announced {
                 eprintln!(
-                    "st3: {}; retrying for up to {}s",
+                    "st: {}; retrying for up to {}s",
                     outage.summary(),
                     self.outage_wait.as_secs()
                 );
@@ -490,7 +490,7 @@ impl fmt::Display for ApiResponseError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             formatter,
-            "st3 API returned {} {}: {}",
+            "st API returned {} {}: {}",
             self.status, self.code, self.message
         )
     }
@@ -678,14 +678,14 @@ async fn unix_request(
     let header_end = response
         .windows(4)
         .position(|window| window == b"\r\n\r\n")
-        .context("the st3 API returned an incomplete HTTP response")?;
+        .context("the st API returned an incomplete HTTP response")?;
     let header = std::str::from_utf8(&response[..header_end])?;
     let status = header
         .lines()
         .next()
         .and_then(|line| line.split_whitespace().nth(1))
         .and_then(|value| value.parse::<u16>().ok())
-        .context("the st3 API returned an invalid HTTP status")?;
+        .context("the st API returned an invalid HTTP status")?;
     let mut body = response[(header_end + 4)..].to_vec();
     if header
         .lines()
@@ -701,7 +701,7 @@ async fn unix_request(
     }) {
         anyhow::ensure!(
             body.len() >= length,
-            "the st3 API returned an incomplete HTTP response: expected {length} body bytes, received {}",
+            "the st API returned an incomplete HTTP response: expected {length} body bytes, received {}",
             body.len()
         );
         body.truncate(length);
@@ -752,12 +752,12 @@ fn http_send_error(base: &str, url: &str, error: reqwest::Error) -> anyhow::Erro
             .unwrap_or_else(|| error.to_string());
         return DaemonUnreachable::connect(base, reason).into();
     }
-    anyhow::Error::from(error).context(format!("send the request to the st3 API at {url}"))
+    anyhow::Error::from(error).context(format!("send the request to the st API at {url}"))
 }
 
 fn deadline_error(endpoint: &str, phase: &str, deadline: Duration) -> anyhow::Error {
     anyhow::anyhow!(
-        "st3 API endpoint `{endpoint}` exceeded the {phase} limit of {} ms; the service may be busy or unavailable, retry the command",
+        "st API endpoint `{endpoint}` exceeded the {phase} limit of {} ms; the service may be busy or unavailable, retry the command",
         deadline.as_millis()
     )
 }
@@ -806,30 +806,30 @@ fn api_error(status: u16, bytes: &[u8]) -> anyhow::Error {
             }
             .into();
         }
-        return anyhow::anyhow!("st3 API returned {status}: {message}");
+        return anyhow::anyhow!("st API returned {status}: {message}");
     }
     anyhow::anyhow!(
-        "st3 API returned {status}: {}",
+        "st API returned {status}: {}",
         String::from_utf8_lossy(bytes).trim()
     )
 }
 
 fn decode_api_response<O: DeserializeOwned>(bytes: &[u8]) -> Result<O> {
     let mut envelope: serde_json::Value =
-        serde_json::from_slice(bytes).context("decode the st3 API response envelope")?;
+        serde_json::from_slice(bytes).context("decode the st API response envelope")?;
     let version = envelope
         .get("api_version")
         .and_then(serde_json::Value::as_str)
-        .context("the st3 API response envelope has no api_version")?;
+        .context("the st API response envelope has no api_version")?;
     anyhow::ensure!(
         matches!(version, "st3.v1" | "st3.client.v0"),
-        "the st3 API returned unsupported version {version}"
+        "the st API returned unsupported version {version}"
     );
     let value = envelope
         .as_object_mut()
         .and_then(|envelope| envelope.remove("value"))
-        .context("the st3 API response envelope has no value")?;
-    serde_json::from_value(value).context("decode the st3 API response value")
+        .context("the st API response envelope has no value")?;
+    serde_json::from_value(value).context("decode the st API response value")
 }
 
 #[cfg(test)]
@@ -993,9 +993,9 @@ mod tests {
         let outage = daemon_unreachable(error).expect("the error is a daemon outage");
         assert_eq!(outage.phase(), phase);
         let message = format!("{error:#}");
-        assert!(message.contains("st3 daemon"), "{message}");
+        assert!(message.contains("st daemon"), "{message}");
         assert!(message.contains("restarting"), "{message}");
-        assert!(!message.contains("st3 up"), "{message}");
+        assert!(!message.contains("st up"), "{message}");
     }
 
     #[tokio::test]
@@ -1018,14 +1018,17 @@ mod tests {
         assert_plain_outage(&refused, OutagePhase::Connect);
         assert!(format!("{refused:#}").contains("connection refused"));
 
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        drop(listener);
+        // Hold the port without listening on it: a connection is refused, and no test running
+        // at the same time can bind the port and answer in the meantime.
+        let reserved = tokio::net::TcpSocket::new_v4().unwrap();
+        reserved.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let address = reserved.local_addr().unwrap();
         let http = fast_client(Endpoint::Http(format!("http://{address}")))
             .get::<Value>("/v1/status")
             .await
             .unwrap_err();
         assert_plain_outage(&http, OutagePhase::Connect);
+        drop(reserved);
     }
 
     #[tokio::test]
@@ -1353,7 +1356,7 @@ mod tests {
                                 StatusCode::SERVICE_UNAVAILABLE,
                                 Json(json!({
                                     "code": "gateway-restarting",
-                                    "message": "the st3 gateway is restarting",
+                                    "message": "the st gateway is restarting",
                                     "details": {}
                                 })),
                             )
