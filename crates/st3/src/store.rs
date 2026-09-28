@@ -16664,7 +16664,7 @@ impl Store {
         // Seed envelopes for any local batch first, so the full pass below sees all of them.
         self.replication_snapshot()?;
         *self.member_key.write().expect("member key lock poisoned") = key;
-        let mut connection = self.connection.lock().expect("store mutex poisoned");
+        let mut connection = self.connection.write();
         let transaction = connection.transaction()?;
         let signed = self.sign_own_envelopes_tx(&transaction, None)?;
         transaction.commit()?;
@@ -16675,7 +16675,7 @@ impl Store {
     /// authenticated join or migration handshake, and never replaces it.
     pub fn pin_fleet_anchor(&self, anchor: &str) -> Result<()> {
         anyhow::ensure!(!anchor.is_empty(), "the fleet anchor key is empty");
-        let connection = self.connection.lock().expect("store mutex poisoned");
+        let connection = self.connection.write();
         let stored = connection
             .query_row(
                 "SELECT value FROM meta WHERE key='fleet_anchor_key'",
@@ -16703,7 +16703,7 @@ impl Store {
     /// Start this store's own writer above `floor`. A node that joins under a name the fleet
     /// has used before sets this before it writes anything.
     pub fn set_writer_floor(&self, floor: u64) -> Result<()> {
-        let connection = self.connection.lock().expect("store mutex poisoned");
+        let connection = self.connection.write();
         connection.execute(
             "INSERT INTO meta(key, value) VALUES ('writer_floor/' || ?1, ?2)
              ON CONFLICT(key) DO UPDATE SET value=MAX(CAST(value AS INTEGER), CAST(excluded.value AS INTEGER))",
@@ -17290,7 +17290,7 @@ impl Store {
             idempotency_key: None,
         })?;
         {
-            let connection = self.connection.lock().expect("store mutex poisoned");
+            let connection = self.connection.write();
             connection
                 .execute(
                     "INSERT INTO fleet_invite_tokens(
@@ -17450,7 +17450,7 @@ impl Store {
 
     /// While leaving, this node refuses new local writes, so its leave stays its last.
     pub fn set_fleet_leaving(&self, leaving: bool) -> Result<()> {
-        let connection = self.connection.lock().expect("store mutex poisoned");
+        let connection = self.connection.write();
         if leaving {
             connection.execute(
                 "INSERT OR REPLACE INTO meta(key, value) VALUES ('fleet_leaving', '1')",
@@ -17509,7 +17509,7 @@ impl Store {
 
     /// Erase the tokens of invites that expired or were revoked anywhere in the fleet.
     pub fn sweep_fleet_invites(&self) -> Result<()> {
-        let connection = self.connection.lock().expect("store mutex poisoned");
+        let connection = self.connection.write();
         connection.execute(
             "UPDATE fleet_invite_tokens SET token=NULL
              WHERE token IS NOT NULL AND (
@@ -17602,7 +17602,7 @@ impl Store {
             Ok(()) => {}
             Err(RequestFault::Proof) => {
                 let failures = failures + 1;
-                let connection = self.connection.lock().expect("store mutex poisoned");
+                let connection = self.connection.write();
                 connection.execute(
                     "UPDATE fleet_invite_tokens SET failures=?2 WHERE invite_id=?1",
                     params![request.invite, failures],
@@ -17654,7 +17654,7 @@ impl Store {
                 Err(reason) => return Ok(FleetRedemption::Refused(reason)),
             };
         let bound = {
-            let connection = self.connection.lock().expect("store mutex poisoned");
+            let connection = self.connection.write();
             connection.execute(
                 "UPDATE fleet_invite_tokens SET bound_key=?2, bound_name=?3, writer_floor=?4
                  WHERE invite_id=?1 AND bound_key IS NULL AND token IS NOT NULL",
@@ -17791,7 +17791,7 @@ impl Store {
             idempotency_key: Some(format!("fleet-invite-admitted:{}", request.invite)),
         })?;
         {
-            let connection = self.connection.lock().expect("store mutex poisoned");
+            let connection = self.connection.write();
             connection.execute(
                 "UPDATE fleet_invite_tokens SET admitted_claim=?2 WHERE invite_id=?1",
                 params![request.invite, admitted.id],
