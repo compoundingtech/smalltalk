@@ -63,8 +63,30 @@ fn generated_models_decode_every_stream_fixture() {
     ));
     let screen: Envelope<TerminalScreen> = decode("terminal-screen.json");
     assert_eq!(screen.value.lines.len(), 3);
-    let frames: Envelope<TerminalFramePage> = decode("terminal-frames.json");
-    assert_eq!(frames.value.frames.len(), 2);
+    assert_eq!(screen.value.cursor.style, TerminalCursorStyle::Block);
+    assert!(screen.value.modes.bracketed_paste);
+    for line in &screen.value.lines {
+        let spelled = line.runs.iter().map(|run| run.text.as_str()).collect::<String>();
+        assert_eq!(spelled.trim_end_matches(' '), line.text);
+    }
+    assert_eq!(
+        screen.value.lines[0].runs[0],
+        TerminalRun {
+            text: "$ ".into(),
+            fg: Some(TerminalColor::Palette(2)),
+            bold: true,
+            ..TerminalRun::default()
+        }
+    );
+    assert_eq!(
+        screen.value.lines[1].runs[0].fg,
+        Some(TerminalColor::Rgb("#5fd75f".into()))
+    );
+    let changed: Envelope<TerminalScreen> = decode("terminal-screen-changed.json");
+    assert_eq!(changed.value.terminal_id, screen.value.terminal_id);
+    assert_ne!(changed.value.revision, screen.value.revision);
+    let ended: ErrorEnvelope = decode("terminal-stale-fence-error.json");
+    assert_eq!(ended.code, ErrorCode::StaleFence);
     let pairing: Envelope<PairedSession> = decode("pairing.json");
     assert!(pairing.value.credential.len() >= 32);
 }
