@@ -1099,7 +1099,54 @@ fn delivery_config(root: &Path) -> CodexDeliveryConfig {
         this_host: "h".into(),
         supervisor: None,
         producer_version: Some("codex-cli 0.153.0".into()),
+        model: None,
     }
+}
+
+#[test]
+fn rollout_turn_context_selects_the_effective_model_for_the_exact_turn() {
+    let frames = vec![
+        json!({"type":"turn_context","payload":{"turn_id":"turn-a","model":"gpt-example-a"}}),
+        json!({"type":"turn_context","payload":{"turn_id":"turn-b","model":"gpt-example-b"}}),
+        json!({"type":"event_msg","payload":{"type":"token_count","turn_id":"turn-b"}}),
+    ];
+    assert_eq!(
+        model_from_codex_frames(&frames, "turn-a").as_deref(),
+        Some("gpt-example-a")
+    );
+    assert_eq!(
+        model_from_codex_frames(&frames, "turn-b").as_deref(),
+        Some("gpt-example-b")
+    );
+    assert_eq!(model_from_codex_frames(&frames, "turn-c"), None);
+}
+
+#[test]
+fn configured_codex_model_is_a_fallback_when_the_rollout_is_unavailable() {
+    assert_eq!(
+        declared_codex_model(&["--model".into(), "gpt-example".into()]).as_deref(),
+        Some("gpt-example")
+    );
+    assert_eq!(
+        declared_codex_model(&["--model=first".into(), "-m".into(), "second".into()]).as_deref(),
+        Some("second")
+    );
+    assert_eq!(
+        declared_codex_model(&["--".into(), "--model".into(), "prompt".into()]),
+        None
+    );
+}
+
+#[test]
+fn replayed_codex_token_usage_is_context_only_until_its_turn_is_active() {
+    let usage = json!({"method":"thread/tokenUsage/updated","params":{"turnId":"turn-old"}});
+    assert!(!should_track_timeline_usage(&usage, None));
+    assert!(!should_track_timeline_usage(&usage, Some("turn-new")));
+    assert!(should_track_timeline_usage(&usage, Some("turn-old")));
+    assert!(should_track_timeline_usage(
+        &json!({"method":"item/completed"}),
+        None
+    ));
 }
 
 fn subscribed_state(observed: CodexObservedState) -> CodexControlState {

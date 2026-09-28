@@ -2134,6 +2134,11 @@ fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
             ("output_tokens", integer()),
             ("total_tokens", integer()),
             ("cached_tokens", integer()),
+            ("cache_write_tokens", integer()),
+            ("owner_run", string()),
+            ("owner_step", string()),
+            ("host", string()),
+            ("observed_at_unix_ms", integer()),
             ("context_used_tokens", integer()),
             ("context_window_tokens", integer()),
             ("context_used_percent", number()),
@@ -2144,7 +2149,12 @@ fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
             ("currency", string()),
             (
                 "semantics",
-                required_enum(&["context_occupancy", "session_cumulative", "response"]),
+                required_enum(&[
+                    "context_occupancy",
+                    "session_cumulative",
+                    "response",
+                    "response_rollup",
+                ]),
             ),
             ("driver", required_string()),
             ("model", string()),
@@ -2156,6 +2166,7 @@ fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
                 required_enum(&["append", "replace", "finalize"]),
             ),
             ("entry_id", required_string()),
+            ("source_id", string()),
             ("sequence", integer()),
             ("revision", required_integer()),
             (

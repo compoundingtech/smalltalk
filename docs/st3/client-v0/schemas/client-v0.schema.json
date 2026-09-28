@@ -404,6 +404,7 @@
         "input_tokens": { "type": "integer", "minimum": 0 },
         "output_tokens": { "type": "integer", "minimum": 0 },
         "cached_tokens": { "type": "integer", "minimum": 0 },
+        "cache_write_tokens": { "type": "integer", "minimum": 0 },
         "cost": { "type": "number", "minimum": 0 },
         "currency": { "type": "string" },
         "incarnation_count": { "type": "integer", "minimum": 0 },
@@ -480,6 +481,7 @@
             "next_work_id": { "oneOf": [{ "$ref": "#/$defs/Id" }, { "type": "null" }] },
             "upcoming_work_ids": { "type": "array", "items": { "$ref": "#/$defs/Id" } },
             "queued_work_count": { "type": "integer", "minimum": 0 },
+            "usage": { "oneOf": [{ "$ref": "#/$defs/UsageSummary" }, { "type": "null" }] },
             "under": { "type": "array", "items": { "$ref": "#/$defs/AgentRelationship" } }
           }
         }
@@ -779,6 +781,8 @@
         "input_tokens": { "type": "integer", "minimum": 0 },
         "output_tokens": { "type": "integer", "minimum": 0 },
         "cached_tokens": { "type": "integer", "minimum": 0 },
+        "cache_write_tokens": { "type": "integer", "minimum": 0 },
+        "turn_id": { "type": "string" },
         "total_tokens": { "type": "integer", "minimum": 0 },
         "context_used_tokens": { "type": "integer", "minimum": 0 },
         "context_window_tokens": { "type": "integer", "minimum": 0 },

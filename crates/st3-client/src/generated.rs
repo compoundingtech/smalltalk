@@ -419,6 +419,8 @@ pub struct UsageSummary {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub cached_tokens: u64,
+    #[serde(default)]
+    pub cache_write_tokens: u64,
     pub cost: Option<f64>,
     pub currency: Option<String>,
     pub incarnation_count: usize,
@@ -508,6 +510,8 @@ pub struct Agent {
     pub upcoming_work_ids: Vec<String>,
     #[serde(default)]
     pub queued_work_count: u64,
+    #[serde(default)]
+    pub usage: Option<UsageSummary>,
     #[serde(default)]
     pub under: Vec<AgentRelationship>,
 }
@@ -973,6 +977,10 @@ pub struct TimelineUsageBody {
     pub output_tokens: Option<u64>,
     #[serde(default)]
     pub cached_tokens: Option<u64>,
+    #[serde(default)]
+    pub cache_write_tokens: Option<u64>,
+    #[serde(default)]
+    pub turn_id: Option<String>,
     #[serde(default)]
     pub total_tokens: Option<u64>,
     #[serde(default)]

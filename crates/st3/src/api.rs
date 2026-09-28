@@ -358,6 +358,7 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
         .route("/v1/documents/content", get(get_document))
         .route("/v1/diagnostics/harness", post(post_harness_diagnostic))
         .route("/v1/claims", get(list_claims).post(post_claim))
+        .route("/v1/usage", get(get_usage))
         .route("/v1/claims/by-id/{id}", get(get_claim))
         .route("/v1/reviews", get(list_reviews))
         .route("/v1/reviews/{*subject}", post(post_review))
@@ -1099,6 +1100,9 @@ fn aggregate_usage<'a>(
         total.input_tokens = total.input_tokens.saturating_add(usage.input_tokens);
         total.output_tokens = total.output_tokens.saturating_add(usage.output_tokens);
         total.cached_tokens = total.cached_tokens.saturating_add(usage.cached_tokens);
+        total.cache_write_tokens = total
+            .cache_write_tokens
+            .saturating_add(usage.cache_write_tokens);
         total.incarnation_count = total
             .incarnation_count
             .saturating_add(usage.incarnation_count);
@@ -1275,6 +1279,7 @@ fn client_agent_resources(
                 .get(&subject.subject)
                 .cloned()
                 .unwrap_or_default();
+            let usage = store.usage_summary_at(&subject.subject, None, Some(snapshot_index))?;
             let value = json!({
                 "id": subject.subject,
                 "kind": "agent",
@@ -1295,6 +1300,7 @@ fn client_agent_resources(
                 "next_work_id": queue.next_work_id,
                 "upcoming_work_ids": queue.upcoming_work_ids,
                 "queued_work_count": queue.queued_work_count,
+                "usage": usage,
                 "under": subject.under.into_iter().map(|relationship| json!({
                     "agent_id": relationship.agent,
                     "reason": relationship.reason
@@ -5352,6 +5358,20 @@ async fn post_claim(
         .store
         .append_client_claim_outcome(&request)
         .map_err(ApiError::bad)?;
+    // Publish only the cumulative buckets. The response detail and turn ID remain local.
+    if let Some(rollup) = state
+        .store
+        .usage_rollup_for_timeline(&response)
+        .map_err(ApiError::internal)?
+    {
+        let (_, updated) = state
+            .store
+            .append_client_claim_outcome(&rollup)
+            .map_err(ApiError::bad)?;
+        if updated {
+            signal_visible_change(&state);
+        }
+    }
     if appended {
         if crate::store::local_observation_position(&response).is_some() {
             signal_local_change(&state);
@@ -5362,6 +5382,35 @@ async fn post_claim(
         }
     }
     Ok(Json(response))
+}
+
+#[derive(Deserialize)]
+struct UsageQuery {
+    since_ms: Option<u64>,
+    until_ms: Option<u64>,
+}
+
+async fn get_usage(
+    State(state): State<AppState>,
+    Query(query): Query<UsageQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let until_ms = query.until_ms.unwrap_or(client_now_ms() as u64);
+    let since_ms = query
+        .since_ms
+        .unwrap_or(until_ms.saturating_sub(86_400_000));
+    if since_ms > until_ms {
+        return Err(ApiError::bad(St3Error::new(
+            "invalid-usage-period",
+            "usage start must be before its end",
+        )));
+    }
+    let rows = state
+        .store
+        .usage_period_rows(since_ms, until_ms)
+        .map_err(ApiError::internal)?;
+    Ok(Json(
+        json!({"since_ms": since_ms, "until_ms": until_ms, "rows": rows}),
+    ))
 }
 
 #[derive(Deserialize)]
@@ -8470,6 +8519,84 @@ mod tests {
             native_session_home: None,
             planner_default: PlannerSpec::default(),
         }
+    }
+
+    #[tokio::test]
+    async fn isolated_daemon_exposes_only_rollups_in_the_fleet_usage_endpoint() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let app = router(state.clone());
+        let subject = "agent/example.worker";
+        let request = ClaimInput {
+            subject: subject.into(),
+            kind: "harness.timeline".into(),
+            actor: Some(subject.into()),
+            fields: BTreeMap::from([
+                ("operation".into(), Value::String("append".into())),
+                ("entry_id".into(), Value::String("response-a".into())),
+                (
+                    "source_id".into(),
+                    Value::String("response-a-source".into()),
+                ),
+                ("sequence".into(), Value::from(1)),
+                ("revision".into(), Value::from(1)),
+                ("role".into(), Value::String("system".into())),
+                ("entry_type".into(), Value::String("usage".into())),
+                ("final".into(), Value::Bool(true)),
+                ("driver".into(), Value::String("claude".into())),
+                ("incarnation_id".into(), Value::String("inc-one".into())),
+                (
+                    "body".into(),
+                    json!({"semantics":"response","turn_id":"turn-a","model":"claude-example",
+                    "input_tokens":4,"output_tokens":2,"cache_write_tokens":3,"cached_tokens":20,"total_tokens":29}),
+                ),
+            ]),
+            evidence: Vec::new(),
+            expected_subject: None,
+            idempotency_key: Some("usage-api-response-a".into()),
+        };
+        let (status, observation) = json_request(
+            app.clone(),
+            "/v1/claims",
+            serde_json::to_value(&request).unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{observation}");
+        assert!(
+            observation["id"]
+                .as_str()
+                .unwrap()
+                .starts_with("local-observation/")
+        );
+        let (status, repeated) = json_request(
+            app.clone(),
+            "/v1/claims",
+            serde_json::to_value(&request).unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{repeated}");
+        assert_eq!(repeated["id"], observation["id"]);
+        let (_, report) = get_request(
+            app,
+            &format!("/v1/usage?since_ms=0&until_ms={}", client_now_ms() + 60_000),
+        )
+        .await;
+        assert_eq!(report["rows"].as_array().unwrap().len(), 1);
+        assert_eq!(report["rows"][0]["total_tokens"], 29);
+        assert_eq!(report["rows"][0]["cache_write_tokens"], 3);
+        assert_eq!(report["rows"][0]["cached_tokens"], 20);
+        assert_eq!(
+            state.store.local_observations_after(0, 10).unwrap().len(),
+            1
+        );
+        assert_eq!(
+            state
+                .store
+                .claims_for(subject, Some("harness.usage"))
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

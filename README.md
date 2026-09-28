@@ -107,6 +107,15 @@ st agents show agent/example/worker
 st terminals peek agent/example/worker
 ```
 
+Token spend across the fleet is available by agent, mission, model, or host. The period ends now:
+
+```sh
+st usage --hours 24 --by agent
+st usage --hours 24 --by mission
+st usage --hours 24 --by model
+st usage --hours 24 --by host
+```
+
 The seat starts its harness in the workspace. Its first turn reads the generated
 `.st3/boot.md`, checks for work, and waits. `st terminals attach agent/example/worker` opens its
 terminal; Ctrl+\\ detaches without stopping it.

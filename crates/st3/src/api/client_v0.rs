@@ -1675,7 +1675,7 @@ pub(super) fn timeline_value(
             if entry_type == "usage" {
                 body = normalized_timeline_usage_body(
                     body,
-                    &attribution,
+                    fields.get("attribution").unwrap_or(&attribution),
                     fields.get("driver").and_then(Value::as_str),
                 );
             }
@@ -1810,6 +1810,9 @@ pub(super) fn timeline_value(
             continue;
         }
         if claim.subject == owner && claim.kind == "harness.usage" {
+            if fields.get("semantics").and_then(Value::as_str) == Some("response_rollup") {
+                continue;
+            }
             if !applies_to_incarnation(fields) {
                 continue;
             }

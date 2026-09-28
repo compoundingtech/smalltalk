@@ -18,6 +18,13 @@ before, and readers merge those claims with the local rows.
 A node can also send every local observation to an OpenTelemetry collector. The exporter is off
 unless the config names a collector:
 
+Claude and Codex response token buckets are `harness.timeline` usage observations. They retain
+the turn ID, model, agent, mission run, and step on the producing node. `local_usage_seen` makes
+replayed provider responses idempotent across harness incarnations; `local_usage_totals` keeps
+monotonic cumulative buckets even after the observation log is trimmed. The node replicates
+`harness.usage` response rollups by agent, incarnation, model, mission step, and host. Fleet usage
+queries subtract the last rollup before a period from the last rollup inside it.
+
 ```toml
 [observations.otlp]
 endpoint = "http://127.0.0.1:4318"             # OTLP/HTTP; logs go to /v1/logs
@@ -62,6 +69,8 @@ order from the same admitted claims.
 | `step_runs` | Projection | `step-run.*` and `work.*` claims |
 | `local_work_lease_renewals` | Local operational fact | Recent quiet lease renewals; replayed over replicated claim projections and bounded by periodic `work.renewed` anchors |
 | `local_observations` | Local observation log | Observations of `local` retention made on this node; never replicated, trimmed after `[observations] retention` |
+| `local_usage_seen` | Local deduplication index | Stable provider response IDs from local timeline observations; never replicated |
+| `local_usage_totals` | Local cumulative observation projection | Token buckets from accepted local response observations; never replicated and retained across log trimming |
 | `revision_proposals` | Projection | `revision-proposal.*` claims |
 | `planning_sessions` | Projection | `planning-session.*` claims |
 | `planning_candidates` | Projection | `planning-session.candidate-submitted` claims |

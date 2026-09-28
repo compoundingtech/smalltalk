@@ -597,7 +597,7 @@ impl App {
                     .iter()
                     .map(|(v, depth)| {
                         format!(
-                            "{}{} {}{}  ·  {}",
+                            "{}{} {}{}{}  ·  {}",
                             "  ".repeat(*depth),
                             state_glyph(&v.state),
                             agent_label(v),
@@ -611,6 +611,9 @@ impl App {
                             } else {
                                 String::new()
                             },
+                            v.usage.as_ref().filter(|usage| usage.incarnation_count > 0)
+                                .map(|usage| format!(" · {} tokens", usage.total_tokens))
+                                .unwrap_or_default(),
                             v.reachability
                         )
                     })
@@ -755,6 +758,18 @@ impl App {
                             "Harness: {driver} · {}",
                             peer.harness_state.as_deref().unwrap_or("unknown")
                         ));
+                    }
+                    if let Some(usage) = &peer.usage {
+                        if usage.incarnation_count > 0 {
+                            lines.push(format!("Usage: {} tokens", usage.total_tokens));
+                            lines.push(format!(
+                                "  input {} · output {} · cache write {} · cache read {}",
+                                usage.input_tokens,
+                                usage.output_tokens,
+                                usage.cache_write_tokens,
+                                usage.cached_tokens
+                            ));
+                        }
                     }
                     lines.push(format!(
                         "Current session: {}",
@@ -2970,7 +2985,7 @@ mod tests {
     #[test]
     fn regression_agent_header_shows_harness_state() {
         let mut model = Model::default();
-        model.agents.items.push(serde_json::from_str(r#"{"kind":"agent","id":"agent/st3","revision":"a","updated_at":"2026-09-25T08:00:00Z","name":"ST","state":"running","reachability":"reachable","driver":"claude","harness_state":"ready"}"#).unwrap());
+        model.agents.items.push(serde_json::from_str(r#"{"kind":"agent","id":"agent/st3","revision":"a","updated_at":"2026-09-25T08:00:00Z","name":"ST","state":"running","reachability":"reachable","driver":"claude","harness_state":"ready","usage":{"total_tokens":42,"input_tokens":4,"output_tokens":2,"cache_write_tokens":6,"cached_tokens":30,"incarnation_count":1,"aggregation":"cumulative-per-incarnation-else-response-deltas"}}"#).unwrap());
         let mut app = App::new(model);
         app.tab = 1;
         let mut terminal = Terminal::new(TestBackend::new(120, 35)).unwrap();
@@ -2983,6 +2998,8 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
         assert!(content.contains("Harness: claude · ready"));
+        assert!(content.contains("Usage: 42 tokens"));
+        assert!(content.contains("cache write 6 · cache read 30"));
         assert!(content.contains("observed"));
     }
 
