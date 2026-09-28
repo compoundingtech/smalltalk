@@ -1,7 +1,7 @@
 # Conversations and messaging live E2E — 2026-09-23
 
-This audit exercised the existing Hetz/Silber st3 network before and after the
-conversation and delivery hardening on the `st3` branch. Tests used isolated
+This audit exercised the existing Hetz/Silber st network before and after the
+conversation and delivery hardening on the `st` branch. Tests used isolated
 mailboxes and archived every probe message after inspection.
 
 ## Baseline
@@ -73,8 +73,8 @@ that proves mission declarations cannot relaunch the stopped agent.
 
 - `nix build .#checks.x86_64-linux.st3 --no-link`
   - st-runtime: 19 passed
-  - st3 library: 362 passed
-  - st3 CLI: 71 passed
+  - st library: 362 passed
+  - st CLI: 71 passed
   - client-v0 CLI/contract: 20 passed
   - examples/evals: 27 passed
   - operational-state contract: 12 passed
@@ -97,7 +97,7 @@ directions correctly.
 - Installed binary: `$HOME/.local/bin/st3` 0.1.0, SHA-256
   `e8605015679ca43f37862b9b564ac1d96e0d49e8c771fd0a982df2f0266bcaab`.
 - Restarting the daemon and replication services did not restart the standing
-  st3 harness; it retained incarnation
+  st harness; it retained incarnation
   `3171390:2026-09-23T12:07:01.885Z`.
 - After two successful disposable runs, `mission/fleet/st3` was published at
   store index 56002 with `gpt-6-sol` and `medium` effort for future Codex
@@ -116,7 +116,7 @@ directions correctly.
   1,182 files each.
 - `machine/Silber` was reachable, its peer status was `up`, and the peers had
   the same graph digest. Replication reported zero pending, unknown, invalid, or
-  unhealthy-projection records. `st3 doctor --strict` passed every check.
+  unhealthy-projection records. `st doctor --strict` passed every check.
 - Disposable run `mission-run/live-wake-probe-20260923-v2` proved a real
   graph-to-harness wake independently of message staging. Agent
   `agent/live-wake-probe-20260923-v2/probe` had exactly one start request and

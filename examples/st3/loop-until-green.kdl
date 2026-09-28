@@ -15,9 +15,9 @@ version 2
 //
 //   /bin/bash -n examples/st3/test-pushed-branch.sh
 //   /bin/cp examples/st3/test-pushed-branch.sh /srv/example/app/
-//   st3 agents apply examples/st3/seats/omp.kdl --as person/operator
-//   st3 missions publish examples/st3/loop-until-green.kdl --as person/operator
-//   st3 missions start example/loop-until-green --id example/loop-until-green/1 \
+//   st agents apply examples/st3/seats/omp.kdl --as person/operator
+//   st missions publish examples/st3/loop-until-green.kdl --as person/operator
+//   st missions start example/loop-until-green --id example/loop-until-green/1 \
 //     --workspace /srv/example/app --as person/operator --follow
 //
 // For GitHub checks instead of a local test run, see wait-for-green-checks.kdl.

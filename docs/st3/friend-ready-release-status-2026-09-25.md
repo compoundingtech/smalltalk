@@ -1,19 +1,19 @@
 # Friend-ready candidate status — 2026-09-25
 
-**Release hold.** Source `8fa5be9` for `st3` and `4be1a21` for `stui` is deployed
+**Release hold.** Source `8fa5be9` for `st` and `4be1a21` for `stui` is deployed
 as host-native binaries on Hetz and Silber. The direct-network iOS source is
 merged at `e49c097`. A late cross-host reply on September 26 invalidated the
 delivery window, and a peer-down sample invalidated the idle window. After the
 peer recovery fix and bidirectional exact receipts, both evidence windows
 restarted at 10:25:36 UTC (`1790418336`) on September 26. The September 27 idle
-report failed its RSS gate. The September 27 `st3` rollout invalidated both old
+report failed its RSS gate. The September 27 `st` rollout invalidated both old
 windows. Both complete evidence clocks restarted at 10:55:55 UTC
 (`1790506555`) on September 27, after post-rollout linked receipts in both
 directions. The new idle and delivery windows are due September 28 and 30 at
 10:55:55 UTC, respectively. The failed samples and report remain retained.
 Do not describe the friend-ready trial as released until both reports pass and
 their retained evidence is reviewed. The continuously running gate watcher
-notifies the standing st3 operator of post-due transitions; it does not turn a
+notifies the standing st operator of post-due transitions; it does not turn a
 short diagnostic into release evidence.
 The [friend trial handoff](friend-trial-handoff.md) is staged for that review,
 not an invitation to start the trial while this hold is active.
@@ -49,16 +49,16 @@ the release gates after the final tested rollout.
   concurrent caller holds it, preserving copy-on-write behavior when one does.
   Divergent peer exports now borrow remote IDs for membership checks. A new
   regression verifies buffer reuse; the existing shared-snapshot and canonical
-  order tests pass. The full Linux `st3` test suite, focused macOS snapshot
+  order tests pass. The full Linux `st` test suite, focused macOS snapshot
   tests, release builds on both hosts, formatting, and the Nix pi/OMP extension
   check passed.
-- Hetz and Silber installed `st3` SHA-256
+- Hetz and Silber installed `st` SHA-256
   `baa39f82d533e8166cf2e1b99c82d65e013438ad1a1cae712b76e044ab5d2601`
   and `0edda69973aaaafe2285e3f383acfd14d21cdc1dc40a5ff81fe78c3f20949993`,
   respectively. Both saved the prior executable in local
   `rollout-backups/8fa5be9-20260927/st3-before`. Daemon and replication worker
   were restarted one host at a time. Both strict doctors pass, signed peers
-  report up, and pending records are zero. ST3, pty-rust, OMP, and CoS seats
+  report up, and pending records are zero. ST, pty-rust, OMP, and CoS seats
   remain reachable.
 - The first post-restart Hetz-to-Silber monitor send failed: the newly enforced
   harness guard saw the monitor service's operator `ST_AGENT` while the probe
@@ -86,15 +86,15 @@ the release gates after the final tested rollout.
   Hetz-to-Silber delivery probe sent at 09:54:34 UTC failed its 180-second
   deadline even though Silber replied at 09:56:17 UTC; Hetz received the
   reply around 09:58:50 UTC. Fabric's direct peer probe remained reachable.
-  ST3's HTTP replication exchange could remain open for its former 120-second
+  ST's HTTP replication exchange could remain open for its former 120-second
   limit without completing. The exact cause inside the stalled exchange is
   still unproven. The failure and late receipt remain in the retained logs.
 - `476aab6` bounds one HTTP exchange at 20 seconds and discards the pooled
   client after an error, so the next backoff attempt opens a fresh Fabric
   stream. A stalled local HTTP server reproduced the old behavior: the
   regression failed before the fix and passed at the new timeout. All 419
-  ST3 library tests, formatting, and whitespace checks passed. The change was
-  pushed to the GitHub `st3` branch and Fabric origin before deployment.
+  ST library tests, formatting, and whitespace checks passed. The change was
+  pushed to the GitHub `st` branch and Fabric origin before deployment.
 - The Hetz and Silber release binaries have SHA-256
   `39c9dff70ae501c3fbeff0c87d19b2862503934215c49ff2378abc3b4f12d8fe`
   and `a7eb85e836e2bfc4d3f7a63d3577b7249c0b0dec7d2630fd6ca87abffecad3d0`,
@@ -146,7 +146,7 @@ the release gates after the final tested rollout.
   formats short JSON tool output for the TUI. Both restarted daemons returned
   the same 116-entry saved OMP timeline page: 32 tool calls, 32 tool-role
   messages, and 32 tool-role content entries. The native conversation is a
-  durable JSONL file on its host; the graph separately holds addressed ST3
+  durable JSONL file on its host; the graph separately holds addressed ST
   messages and work, not a replicated copy of the entire native transcript.
 - CoS measured `4be1a21` on the same Silber daemon PID in three alternating
   90-second no-viewer/Chat-viewer pairs. The equal-activity quiet pair was
@@ -159,11 +159,11 @@ the release gates after the final tested rollout.
 - Both strict doctors passed after the daemon restart, including ready native
   drivers, peers up, and zero unresolved replication records. Installed PTY
   attachment QA passed on Hetz and Silber; Chat click, wheel, History, older
-  pages, and selection QA passed on Hetz. Hetz installed `st3` SHA-256
+  pages, and selection QA passed on Hetz. Hetz installed `st` SHA-256
   `1ca8fcc9002332426771df83fc542334e4e4f01ee005482befe19947378d7f37`
   and `stui` SHA-256
   `9d73a108e2737df3e8eb133a86521a4f0d5f83959253137c85e55ce3b615d6db`.
-  Silber installed `st3` SHA-256
+  Silber installed `st` SHA-256
   `eaea25a57b4f1f5409d05ae77ce9f5c1f2f1ac0be7c953f1bd95e7e50204981b`
   and `stui` SHA-256
   `8c63e0de10a81ebac959c04e2d5e57e1e7d6a9795d755cede1196f75c87c463a`.
@@ -190,15 +190,15 @@ the release gates after the final tested rollout.
 - The live OMP timeline returned identical first pages on Hetz and Silber:
   42 message entries, 31 content entries, and 27 tool calls. This is a
   bounded 100-entry page, not the entire saved conversation. The full local
-  suites passed 418 ST3 library, 88 CLI, and 48 active TUI tests. The Mac
+  suites passed 418 ST library, 88 CLI, and 48 active TUI tests. The Mac
   TUI suite passed 48 active tests. Installed PTY attachment QA passed on
   both hosts after rollout, and both strict doctors passed with signed peers
   up and zero unresolved replication records. CoS has been asked for one
   consolidated final retest.
-- Installed SHA-256 for Hetz: `st3`
+- Installed SHA-256 for Hetz: `st`
   `1b94dd874c9d422774dde1f24015940d457bb4742b83ba0ddd3bacacacf09df3`,
   `stui` `30fedc13689d65794b0d00781abed82bbf0a32649d7b30d096cf303853d229ef`.
-  Installed SHA-256 for Silber: `st3`
+  Installed SHA-256 for Silber: `st`
   `9572d69c650e1d280a3b86f83dca7b5f6d6aedf13f7d247a58defdf0a7ca5320`,
   `stui` `e554b2a5faad90cc61c35897a1cceff1cb2f99593e644060db5df293c9a045c4`.
   Both hosts retained the prior binaries in their local rollout backups.
@@ -214,7 +214,7 @@ the release gates after the final tested rollout.
   Live installed PTY attachment QA passed both controls against OMP on Hetz
   and Fabric on Silber. A transient reconnect also exposed a stale footer
   notice; the TUI clears it after a successful model refresh.
-- Transient `st3` driver API warnings now append to a private host state log
+- Transient `st` driver API warnings now append to a private host state log
   instead of stderr shared with the harness PTY. Silber's idle Fabric steward
   was restarted from its unchanged `st3-network` KDL at 20:38:29 UTC to pick
   up the driver fix; it returned to an idle new incarnation with no active
@@ -222,11 +222,11 @@ the release gates after the final tested rollout.
   Claude hook set missing on Silber. The exact set was copied from Hetz and
   restored on Silber before the restart. The new terminal shows neither
   reported diagnostic.
-- Hetz installed `st3` SHA-256
+- Hetz installed `st` SHA-256
   `291a7cb2f3960c39b6d9d528c034ff5ad0e9a4b4500c8fc5f92647189da41838`
   and `stui` SHA-256
   `f1534c54ac91fbe088de99b2feab97233519917260dd04a6fcdcbdeb034b3953`;
-  Silber installed `st3` SHA-256
+  Silber installed `st` SHA-256
   `74a8904c1833e762eee426f6da08003672dea5849407fe4a1cd0766d0cf08d2d`
   and `stui` SHA-256
   `b14c0b69e8f6dbd09fead9fc66f51982f6ca295d8e9c24499f473b63bebc3759`.
@@ -269,14 +269,14 @@ the release gates after the final tested rollout.
   5.36 seconds of daemon CPU without the TUI (17.9% of one core) and 6.90
   seconds with Chat open (23.0%). These short measurements are not the
   24-hour idle gate.
-- The `st3` library suite passed 417 tests. The installed TUI source passed
+- The `st` library suite passed 417 tests. The installed TUI source passed
   46 active unit tests and the PTY click, wheel, History, older-page, and Esc
   selection interaction test on both hosts. Both strict doctors pass after
-  the final rollout. Hetz installed `st3` SHA-256
+  the final rollout. Hetz installed `st` SHA-256
   `ab9c99a5bbc12c4e589d034d6ac0e7da48fbc30e1cfe8676174d95e795df305c`
   and `stui` SHA-256
   `c2dcf457edc8b3b6b8ffd0242c50ecc7e4f1255c02530c2cfe4ce6d068525be1`;
-  Silber installed `st3` SHA-256
+  Silber installed `st` SHA-256
   `a2143c6c0ab13ab5a0b7a003848fa6523a653caf2ddfed259decb0c125d666f1`
   and `stui` SHA-256
   `100552afeeabe1cfbfef699aa4c095bc37ef04f996d56dc21dec9b11af4db022`.
@@ -315,7 +315,7 @@ the release gates after the final tested rollout.
   operational tests). After Hetz received the fix, the UI mission advanced
   through its stop steps to `completed/terminal`; Silber now projects the
   same state.
-- Hetz installed `st3` SHA-256
+- Hetz installed `st` SHA-256
   `2de9ce3f578fd3d10807496f5ba2c830202521a0b03aa727991dd968db6ecf95`;
   Silber installed
   `56966efe664e933a0e74fcd3daa6c73a176abda38f5a33e23e9b715314397d75`.
@@ -349,10 +349,10 @@ the release gates after the final tested rollout.
   follow-ups do not settle another party's inbox. The regression failed before
   the fix, then passed across OMP, PI, Claude, Codex and OpenCode transport
   labels, including idempotent retry and an empty post-answer mailbox. The full
-  locked `st3` suite passed 415 library, 88 CLI, 5 client CLI, 21 contract, 27
+  locked `st` suite passed 415 library, 88 CLI, 5 client CLI, 21 contract, 27
   example and 12 operational tests; Silber passed the focused regression and
   built its host-native release binary.
-- Silber installed `st3` SHA-256
+- Silber installed `st` SHA-256
   `88718b04000f37de58aedc09168d8b3da348369b42f5208ea2d65ed09b7bc0b3`;
   Hetz installed
   `ac6006347ef8c6af6a71e5c680606eb372d24741d17df94efd084a4151e17f43`.
@@ -423,14 +423,14 @@ the release gates after the final tested rollout.
   repeatedly rescanned the graph. Claiming the step at 13:45 removed the
   overdue deadline and CPU fell from roughly 80% to roughly 20% of a core.
   Regression `work_actions_require_an_active_incarnation_bound_lease` failed
-  before `f9a9116` and passes after it; the full locked `st3` suite passed
+  before `f9a9116` and passes after it; the full locked `st` suite passed
   413 library, 88 CLI, 5 client CLI, 21 contract, 27 example, and 12
   operational tests. The fix treats a read or closed wake in the current
   incarnation as acknowledged when scheduling reconcile work.
 - `ea74722` temporarily reverts the separate staged OMP model gate so this CPU
   hotfix can be installed while Nathan's declared model remains absent from
   OMP's registry. The model gate patch is retained at `5e3b80f` for reapplication
-  with his chosen exact model. Hetz installed `st3` SHA-256
+  with his chosen exact model. Hetz installed `st` SHA-256
   `7a2be4eedd262274a2a0d7a42f9b915b237acff8b8d21d4fa2f2ad948278404e`
   (daemon PID `3356763`, replication PID `3356765`); Silber installed
   `fdc71b0edebd6d8b9418cabc6079bad9f754ba3154aa12ddc3024aa74b54cd37`
@@ -465,12 +465,12 @@ the release gates after the final tested rollout.
   because Crossterm can stay inside its event poll on a closed tmux PTY. The
   macOS release PTY smoke now passes quit, signal, delayed getter, direct PTY
   hangup, and tmux session close; the installed binaries pass the same smoke on
-  both hosts. A Claude conversation fixture verifies that Chat hides ST3 channel
-  wrappers and delivery markers. The locked suites passed 413 `st3` library,
+  both hosts. A Claude conversation fixture verifies that Chat hides ST channel
+  wrappers and delivery markers. The locked suites passed 413 `st` library,
   88 CLI, 5 client CLI, 21 contract, 27 example, 12 operational, and 40 `stui`
   tests (two live benchmarks ignored).
 - Hetz installed SHA-256 `ecbfea8e8627e66d48fd6cf991c44aa363cdfad0ff0133cbd2e42d5b7a75e0d5`
-  for `st3` and `b959b33267a69e3dac212b3a345c538b6e838a488a8d12d9b453492a02eac431`
+  for `st` and `b959b33267a69e3dac212b3a345c538b6e838a488a8d12d9b453492a02eac431`
   for `stui`; daemon PID `1833382`, replication PID `1833384`. Silber installed
   `1f0ccb7a80b403f3db77a5a414448d251880227ae9e1675f4a33dde37a24b0fc`
   and `977a58e49f96fb80eca847332070528e20074c6d35ad0726915abf738f1f0cb5`;
@@ -487,7 +487,7 @@ the release gates after the final tested rollout.
   unauthenticated 403 over direct LAN, `.local`, and tailnet HTTP. The native
   iOS simulator used its existing paired credential over direct LAN HTTP after
   rollout: Now showed four actionable items, all collection reads succeeded,
-  the live ST3 timeline rendered, and six connections remained established
+  the live ST timeline rendered, and six connections remained established
   through 30 seconds of long polling with no transport errors.
 - The 24-hour idle and 72-hour delivery markers were reset to Unix
   `1790336444` (11:40:44 UTC). The early preflight passes with three
@@ -514,9 +514,9 @@ the release gates after the final tested rollout.
   corrected debug and installed-release smokes pass quit, signal, delayed
   getter, and hangup on both hosts, plus the debug panic case. The `stui` unit
   suite passes 40 tests (two live benchmarks ignored); the earlier full locked
-  `st3` suite and Nix package build passed for the same production changes.
+  `st` suite and Nix package build passed for the same production changes.
 - Hetz installed SHA-256 `6f74516e5bddd599440be7efd624b1cb1edb12c737bbb1e0c2e2837db214f309`
-  for `st3` and `7d9945b618c455a5455779ec0d07aa27f5fc539a46b4f019d393e863f89c70a9`
+  for `st` and `7d9945b618c455a5455779ec0d07aa27f5fc539a46b4f019d393e863f89c70a9`
   for `stui`; daemon PID `1777376`, worker PID `1777378`. Silber installed
   `68718549bd4ddb9d2f1622cfe8bb4024a57eed5392317ae0e9cf96f38c071b14`
   and `61eaefd811552227b58379233a8e648790607df3de896c40a83ace741702aa2a`;
@@ -534,7 +534,7 @@ the release gates after the final tested rollout.
   `.local` name, and tailnet IP after
   the restart. The rebuilt iPhone 18 Pro simulator app used its existing paired
   credential over direct LAN HTTP after the rollout: Now showed four actionable
-  items, the ST3 conversation rendered with the older-history marker above its
+  items, the ST conversation rendered with the older-history marker above its
   content, and three long polls remained connected for 30 seconds with no
   transport error. Nathan's TUI retest remains pending. The final 24-hour and
   72-hour markers were pinned to Unix
@@ -552,14 +552,14 @@ the release gates after the final tested rollout.
 ## 10:08 UTC TUI, iOS, and direct-network rollout
 
 - `5c41edc` merges the TUI and iOS presentation/refresh repairs with bounded
-  reads. Hetz and Silber now run host-linked release `st3` and `stui` binaries
+  reads. Hetz and Silber now run host-linked release `st` and `stui` binaries
   built from that commit. A first Hetz attempt copied the Nix-linked binaries
   into a service environment with a system allocator preload; its runtime
   linker rejected that combination. The prior binaries were restored, services
   returned to health, and the host-linked build was tested before the final
   install. Both hosts retain rollback copies of the pre-rollout binaries.
 - Hetz installed SHA-256 `010bd61a3dc64a2e1cf08b4e3bd83b76ee98c3b435e1fac790c4280dcd3866eb`
-  for `st3` and `6179df84d985ab13381f7ec738c2fb221976920dc9fe919086b4699094aa8ecd`
+  for `st` and `6179df84d985ab13381f7ec738c2fb221976920dc9fe919086b4699094aa8ecd`
   for `stui`; daemon PID `1465196`, replication PID `1465194`. Silber installed
   `ccebf57f6225aeb0ced164a17361da11fc75a09973ced9c0a15fbecade6b1322`
   and `33f95879745cc7c540baff2a4e43330a7f2941bea7b5d339c45605ee4efa1e89`;
@@ -603,7 +603,7 @@ the release gates after the final tested rollout.
   native delivery. The focused 81 Codex tests include delivery and exact
   receipt on transcripts larger than the former control limit, with bounded
   request and transcript bytes. The full st2 suite passed with the documented
-  optional otel skip, and st3 passed 410 library and 87 CLI tests.
+  optional otel skip, and st passed 410 library and 87 CLI tests.
 - Hetz installed `623f9cb` SHA
   `42dbf325460808bc88b47240e4e81deabda599f9024b071dcb722f5ee8134ca8`
   at 08:54 UTC, daemon PID `1297290`, replication worker PID `1297308`.
@@ -617,7 +617,7 @@ the release gates after the final tested rollout.
   both signed peers were up with zero pending, invalid, or unhealthy records,
   both standing seats were reachable, and the Silber restart notice arrived
   natively. `nix build .#st3 --no-link` passed from `623f9cb`, including
-  release-profile checks for 410 st3 library, 87 CLI, and 17 stui tests.
+  release-profile checks for 410 st library, 87 CLI, and 17 stui tests.
 - The old 05:08:50 UTC idle window now has two daemon PIDs on each host and
   a retained Silber bad sample. Its alert is an expected release hold, not
   evidence for the next window. The original append-only logs remain intact.
@@ -707,7 +707,7 @@ from this restart. The 05:08:50 UTC release markers were not reset. The full
   clients without waking the full reconciler for those claims alone. It
   retains full reconciliation for harness readiness, mission transitions,
   non-quiet replicated claims, and projection recovery. The full st3/stui
-  suites passed (408 st3 library, 86 CLI, and 17 stui tests; 2 live stui
+  suites passed (408 st library, 86 CLI, and 17 stui tests; 2 live stui
   tests ignored). A new full-day measurement is required to establish whether
   this reduces whole-daemon idle CPU enough.
 - `b6837bb` was installed on Hetz at 04:09:08 UTC (PID `482626`, binary SHA
@@ -732,9 +732,9 @@ from this restart. The 05:08:50 UTC release markers were not reset. The full
   or whole-system benchmarks.
 - `8866c11` limits work-wake reconciliation to indexed sent-message candidates
   with work tags while retaining closed attempts. The focused regression and
-  full st3 test suite passed. `0da07d7` additionally limits deadline wake-history
+  full st test suite passed. `0da07d7` additionally limits deadline wake-history
   enrichment to the next ready item for each local agent. The parity regression
-  and full st3 test suite passed. The combined whole-daemon idle CPU is now
+  and full st test suite passed. The combined whole-daemon idle CPU is now
   being measured on the new `b6837bb` window.
 
 ## Product checks
@@ -754,10 +754,10 @@ from this restart. The 05:08:50 UTC release markers were not reset. The full
   restoration check passed separately on the debug binary.
 - The package was rebuilt and its help check passed again from the deployed
   `b6837bb` daemon source (tree at `2d861e6`); release-profile checks passed
-  408 st3 library, 86 CLI, and 17 stui tests, with two live stui tests ignored.
+  408 st library, 86 CLI, and 17 stui tests, with two live stui tests ignored.
 - The final source at `db99329` also passed `nix build .#st3 --no-link` and
   `nix build .#checks.x86_64-linux.st3-help --no-link`. Its release-profile
-  checks passed 408 st3 library, 87 CLI, and 17 stui tests, with two live stui
+  checks passed 408 st library, 87 CLI, and 17 stui tests, with two live stui
   tests ignored. This verifies packaging; the 24-hour and 72-hour live gates
   remain pending.
 - Live TUI bootstrap was 121 ms and full snapshot 437 ms against the local
@@ -798,11 +798,11 @@ from this restart. The 05:08:50 UTC release markers were not reset. The full
   [idle baseline](idle-stability-2026-09-23.md) is not a matched 24-hour window.
 - Long-running Fabric `exec` clients were observed hanging after remote
   commands had stopped, including one build response during this rollout and
-  an independent COS check at 05:07 UTC. Short commands and st3 signed
+  an independent COS check at 05:07 UTC. Short commands and st signed
   replication kept working; the build artifact and doctors were checked
   separately. The Fabric owner has requested a graph-queued diagnosis and
   regression; this operator-path issue remains open rather than being silently
-  counted as a passed st3 messaging check.
+  counted as a passed st messaging check.
 
 The exact gate definitions and override rules are in the
 [friend-ready delivery gate](friend-ready-delivery-gate.md). Any failure is a
@@ -817,11 +817,11 @@ do not delete evidence or lower thresholds to obtain a pass.
   inbox deliveries indefinitely. Commit `678103d` recovers only a matching
   failed completion from a bounded transcript tail. The 82 Codex driver tests
   and 836 ST2 library tests passed (one library test ignored).
-- Commit `6217e0d` gives ST3 messages the same `[PING from st3]` envelope,
+- Commit `6217e0d` gives ST messages the same `[PING from st3]` envelope,
   canonical message ID, sender, title, and bounded body preview in Codex,
   OpenCode, Claude, Pi, and OMP. Rendered `boot.md` explains exact-ID reads,
   threaded replies, and the recipient's own mailbox. The 837 ST2 library tests
-  and 418 ST3 library tests passed (one ST2 test ignored). This also addresses
+  and 418 ST library tests passed (one ST2 test ignored). This also addresses
   a live reverse-probe failure where the recipient read the sender's mailbox.
 - The final `6217e0d` daemon and driver were installed and restarted on both
   hosts. Both strict doctors passed, both new recipient incarnations ran, and
