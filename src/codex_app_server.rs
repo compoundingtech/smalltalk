@@ -5047,7 +5047,7 @@ fn read_json_message(websocket: &mut WebSocket<UnixStream>) -> Result<Option<Val
     // Darwin reports a timed Unix-socket read as EAGAIN/EWOULDBLOCK.  During
     // handshake the peer may briefly be descheduled; treat that transient as
     // retryable instead of turning scheduler timing into a protocol failure.
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         let message = match websocket.read() {
             Ok(message) => message,
