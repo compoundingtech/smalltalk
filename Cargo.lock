@@ -3329,6 +3329,7 @@ dependencies = [
  "ciborium",
  "clap",
  "clap_complete",
+ "data-encoding",
  "futures-util",
  "getrandom 0.3.4",
  "hex",
