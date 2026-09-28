@@ -28,7 +28,7 @@ fn login_environment_from(shell: &Path, timeout: Duration) -> Result<BTreeMap<St
             "-l",
             "-i",
             "-c",
-            "/usr/bin/printf '\\0ST3_ENV_BEGIN\\0'; /usr/bin/env -0; /usr/bin/printf 'ST3_ENV_END\\0'",
+            "printf '\\0ST3_ENV_BEGIN\\0'; env -0; printf 'ST3_ENV_END\\0'",
         ],
     )
 }
@@ -154,7 +154,7 @@ pub fn materialize_environment(
     overlay_environment(environment, declared, executable)
 }
 
-fn overlay_environment(
+pub fn overlay_environment(
     mut environment: BTreeMap<String, String>,
     declared: &BTreeMap<String, String>,
     executable: &Path,
@@ -243,7 +243,14 @@ fn account_shell() -> Option<PathBuf> {
     }
     let shell = unsafe { CStr::from_ptr((*entry).pw_shell) };
     let shell = shell.to_string_lossy();
-    (!shell.is_empty()).then(|| PathBuf::from(shell.as_ref()))
+    let shell = PathBuf::from(shell.as_ref());
+    // Build sandboxes and service accounts may have a synthetic /noshell entry.
+    // Use an explicit SHELL only when the account has no executable default.
+    if shell.is_file() && is_executable(&shell) {
+        Some(shell)
+    } else {
+        std::env::var_os("SHELL").map(PathBuf::from)
+    }
 }
 
 #[cfg(not(unix))]

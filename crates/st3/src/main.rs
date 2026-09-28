@@ -1807,7 +1807,7 @@ async fn run_up(args: UpArgs) -> Result<()> {
         .pty_root
         .clone()
         .unwrap_or_else(|| config.state_dir.join("pty"));
-    let login_environment = st_runtime::login_environment()?;
+    let login_environment = st3::environment::snapshot()?;
     let pty_binary = st_runtime::resolve_executable("pty", &login_environment)?;
     let state = AppState {
         store: store.clone(),

@@ -4,7 +4,7 @@ This example verifies an invented catalog index with
 [`gate-recovery.kdl`](gate-recovery.kdl) and
 [`verify-catalog-index.sh`](verify-catalog-index.sh).
 
-## Failure first: three independent clocks and environments
+## Failure first: time limits and unchecked scripts
 
 A gate like this is fragile:
 
@@ -20,17 +20,19 @@ step "verify-index" timeout="1m" {
 }
 ```
 
-It assumes `bash` is on `PATH`, gives the step no time beyond its own gate, and says nothing about
-whether the shell file parses. Gates run without a login shell and with a minimal `PATH`; a command
-that works interactively can therefore fail immediately. Equal limits create the opposite failure:
-the owning step can time out while its gate is still legitimately using its full minute. A syntax
-error waits until runtime if nobody checks it before publication.
+It gives the step no time beyond its own gate and says nothing about whether the shell file
+parses. The owning step can time out while its gate is still legitimately using its full minute.
+A syntax error waits until runtime if nobody checks it before publication.
+
+Gates use the same captured interactive login-shell environment as agents and daemon commands.
+Programs such as `bash` resolve through that PATH; absolute binary paths are optional.
+The daemon refreshes the snapshot on use every 60 seconds. `st doctor` shows the effective PATH.
 
 ## Supported recovery: run the complete files
 
-The checked-in example addresses all three failures:
+The checked-in example makes these choices explicit:
 
-- the gate invokes `/bin/bash`, and every external command inside the script has an absolute path;
+- the example pins `/bin/bash` and its tools with absolute paths; using the captured PATH also works;
 - the step allows two minutes while the gate allows one;
 - the shell is checked before the mission is published.
 
@@ -50,8 +52,8 @@ st missions start example/catalog-gate \
   --follow
 ```
 
-For a different gate, syntax-check the exact script used by `exec`, keep every invoked binary
-absolute, and make the owning step timeout strictly longer than the gate's `time-limit`.
+For a different gate, syntax-check the exact script used by `exec`, ensure its tools are on the
+captured PATH, and make the owning step timeout strictly longer than the gate's `time-limit`.
 
 ## Three more rules that bite later
 
