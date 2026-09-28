@@ -399,6 +399,12 @@ CREATE TABLE IF NOT EXISTS planning_previews (
     created_at_unix_ms TEXT NOT NULL,
     PRIMARY KEY(session_id, variant)
 );
+
+CREATE TABLE IF NOT EXISTS graph_generation (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    value INTEGER NOT NULL
+);
+INSERT OR IGNORE INTO graph_generation(id, value) VALUES (1, 0);
 PRAGMA user_version = 13;
 "#;
 
@@ -592,7 +598,10 @@ struct ReplicationSnapshot {
     max_envelope_rowid: i64,
     inventory: CompactReplicationInventory,
     buckets: Vec<ReplicationInventoryBucket>,
+    /// The inventory digest state before each range in `buckets`.
+    digest_prefixes: Vec<Sha256>,
     authority_digest: String,
+    graph_generation: i64,
     graph_digest: String,
 }
 
@@ -643,6 +652,51 @@ impl CompactReplicationInventory {
 
     fn refresh_digest(&mut self) {
         self.digest = self.digest_of(INVENTORY_DIGEST_DOMAIN, &self.envelopes);
+    }
+
+    /// Set the inventory digest by resuming at range `from`; the value equals
+    /// `refresh_digest`. `prefixes[i]` holds the digest state before `buckets[i]`, which must
+    /// list the held identities range by range, and no range before `from` may have changed
+    /// since `prefixes` was built. Ranges are ordered by writer, so new envelopes re-hash only
+    /// their own later ranges and those of later writers.
+    fn resume_digest(
+        &mut self,
+        buckets: &[ReplicationInventoryBucket],
+        prefixes: &mut Vec<Sha256>,
+        from: usize,
+    ) {
+        let from = from.min(prefixes.len().saturating_sub(1));
+        let mut digest = match prefixes.get(from) {
+            Some(state) => state.clone(),
+            None => {
+                let mut digest = Sha256::new();
+                digest.update(INVENTORY_DIGEST_DOMAIN);
+                digest
+            }
+        };
+        prefixes.truncate(from);
+        let mut position = buckets[..from.min(buckets.len())]
+            .iter()
+            .map(|bucket| bucket.count as usize)
+            .sum::<usize>();
+        let mut buffer = [0; 64];
+        for bucket in buckets.iter().skip(from) {
+            prefixes.push(digest.clone());
+            let end = position + bucket.count as usize;
+            for envelope in &self.envelopes[position..end] {
+                update_identity_digest(
+                    &mut digest,
+                    &self.writers[envelope.writer as usize],
+                    envelope.sequence,
+                    self.hash_text(envelope, &mut buffer),
+                );
+            }
+            #[cfg(test)]
+            INVENTORY_IDENTITIES_HASHED.with(|hashed| hashed.set(hashed.get() + end - position));
+            position = end;
+        }
+        debug_assert_eq!(position, self.envelopes.len());
+        self.digest = hex::encode(digest.finalize());
     }
 
     fn compact(&mut self, writer: u32, identity: ReplicaEnvelopeId) -> CompactEnvelopeId {
@@ -1071,6 +1125,7 @@ impl Store {
         reject_old_schema(&connection)?;
         migrate_schema(&connection)?;
         connection.execute_batch(SCHEMA)?;
+        create_graph_generation_triggers(&connection)?;
         {
             let transaction = connection.transaction()?;
             rebuild_operations_tx(&transaction)?;
@@ -1109,6 +1164,7 @@ impl Store {
         reject_old_schema(&connection)?;
         migrate_schema(&connection)?;
         connection.execute_batch(SCHEMA)?;
+        create_graph_generation_triggers(&connection)?;
         {
             let transaction = connection.transaction()?;
             rebuild_operations_tx(&transaction)?;
@@ -9432,6 +9488,13 @@ impl Store {
             .lock()
             .expect("replication snapshot mutex poisoned")
             .take();
+        // Harness observations, timelines, usage and lease renewals change none of the digested
+        // tables, so their writes leave the generation, and the graph digest, unchanged.
+        let graph_generation = graph_generation(&connection)?;
+        let reusable_graph_digest = previous
+            .as_ref()
+            .filter(|previous| previous.graph_generation == graph_generation)
+            .map(|previous| previous.graph_digest.clone());
         let envelope_count: usize =
             connection.query_row("SELECT COUNT(*) FROM replica_envelopes", [], |row| {
                 row.get(0)
@@ -9439,74 +9502,103 @@ impl Store {
         let full = |connection: &Connection| -> Result<_> {
             let (inventory, max_rowid) = full_compact_replication_inventory(connection)?;
             let buckets = inventory.buckets();
-            Ok((inventory, max_rowid, buckets))
+            Ok((inventory, max_rowid, buckets, Vec::new(), 0))
         };
-        let (inventory, max_envelope_rowid, buckets) = if let Some(previous) = previous {
-            let mut statement = connection.prepare(
-                "SELECT rowid, writer, sequence, envelope_hash FROM replica_envelopes
-                 WHERE rowid>?1 ORDER BY rowid",
-            )?;
-            let additions = statement
-                .query_map([previous.max_envelope_rowid], |row| {
-                    Ok((
-                        row.get::<_, i64>(0)?,
-                        ReplicaEnvelopeId {
-                            writer: row.get(1)?,
-                            sequence: row.get(2)?,
-                            hash: row.get(3)?,
-                        },
-                    ))
-                })?
-                .collect::<Result<Vec<_>, _>>()?;
-            if envelope_count == previous.inventory.envelopes.len() + additions.len() {
-                let mut max_rowid = previous.max_envelope_rowid;
-                // Most snapshots are owned only by this cache. Move their inventory
-                // into the successor so a graph write does not allocate and free
-                // every envelope ID. Keep the old snapshot intact for concurrent
-                // callers that still hold it.
-                let (mut inventory, mut buckets) = match Arc::try_unwrap(previous) {
-                    Ok(snapshot) => (snapshot.inventory, snapshot.buckets),
-                    Err(shared) => (shared.inventory.clone(), shared.buckets.clone()),
-                };
-                let mut touched = BTreeSet::new();
-                for (rowid, identity) in additions {
-                    max_rowid = max_rowid.max(rowid);
-                    touched.insert((
-                        identity.writer.clone(),
-                        replication_bucket_start(identity.sequence),
-                    ));
-                    inventory.insert(identity);
-                }
-                // Only the ranges that gained an envelope need a new digest.
-                for (writer, start) in touched {
-                    let bucket = inventory.bucket(inventory.range(&writer, start));
-                    match buckets.binary_search_by(|existing| {
-                        (existing.writer.as_str(), existing.start).cmp(&(writer.as_str(), start))
-                    }) {
-                        Ok(position) => buckets[position] = bucket,
-                        Err(position) => buckets.insert(position, bucket),
+        let (mut inventory, max_envelope_rowid, buckets, mut digest_prefixes, resume_from) =
+            if let Some(previous) = previous {
+                let mut statement = connection.prepare(
+                    "SELECT rowid, writer, sequence, envelope_hash FROM replica_envelopes
+                     WHERE rowid>?1 ORDER BY rowid",
+                )?;
+                let additions = statement
+                    .query_map([previous.max_envelope_rowid], |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            ReplicaEnvelopeId {
+                                writer: row.get(1)?,
+                                sequence: row.get(2)?,
+                                hash: row.get(3)?,
+                            },
+                        ))
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?;
+                if envelope_count == previous.inventory.envelopes.len() + additions.len() {
+                    let mut max_rowid = previous.max_envelope_rowid;
+                    // Most snapshots are owned only by this cache. Move their inventory
+                    // into the successor so a graph write does not allocate and free
+                    // every envelope ID. Keep the old snapshot intact for concurrent
+                    // callers that still hold it.
+                    let (mut inventory, mut buckets, digest_prefixes) =
+                        match Arc::try_unwrap(previous) {
+                            Ok(snapshot) => (
+                                snapshot.inventory,
+                                snapshot.buckets,
+                                snapshot.digest_prefixes,
+                            ),
+                            Err(shared) => (
+                                shared.inventory.clone(),
+                                shared.buckets.clone(),
+                                shared.digest_prefixes.clone(),
+                            ),
+                        };
+                    let mut touched = BTreeSet::new();
+                    for (rowid, identity) in additions {
+                        max_rowid = max_rowid.max(rowid);
+                        touched.insert((
+                            identity.writer.clone(),
+                            replication_bucket_start(identity.sequence),
+                        ));
+                        inventory.insert(identity);
                     }
+                    // Only the ranges that gained an envelope need a new digest.
+                    for (writer, start) in &touched {
+                        let bucket = inventory.bucket(inventory.range(writer, *start));
+                        match buckets.binary_search_by(|existing| {
+                            (existing.writer.as_str(), existing.start)
+                                .cmp(&(writer.as_str(), *start))
+                        }) {
+                            Ok(position) => buckets[position] = bucket,
+                            Err(position) => buckets.insert(position, bucket),
+                        }
+                    }
+                    // Every range before the first one that gained an envelope is unchanged, so
+                    // the inventory digest resumes there instead of hashing every identity again.
+                    let resume_from = touched
+                        .iter()
+                        .map(|(writer, start)| {
+                            buckets.partition_point(|existing| {
+                                (existing.writer.as_str(), existing.start)
+                                    < (writer.as_str(), *start)
+                            })
+                        })
+                        .min()
+                        .unwrap_or(buckets.len());
+                    (inventory, max_rowid, buckets, digest_prefixes, resume_from)
+                } else {
+                    full(&connection)?
                 }
-                inventory.refresh_digest();
-                (inventory, max_rowid, buckets)
             } else {
                 full(&connection)?
-            }
-        } else {
-            full(&connection)?
-        };
+            };
+        inventory.resume_digest(&buckets, &mut digest_prefixes, resume_from);
         // Envelope hashes already commit the complete payload (and chain metadata). The
         // inventory digest therefore commits the authority log without hex-encoding and hashing
         // every payload again on each graph change.
         let authority_digest = inventory.digest.clone();
+        let graph_digest = match reusable_graph_digest {
+            Some(digest) => digest,
+            None => graph_digest(&connection)?,
+        };
         let snapshot = Arc::new(ReplicationSnapshot {
             store_index: current_index(&connection)?,
             replica_generation: self.replica_generation.load(Ordering::Acquire),
             max_envelope_rowid,
             inventory,
             buckets,
+            digest_prefixes,
             authority_digest,
-            graph_digest: graph_digest(&connection)?,
+            graph_generation,
+            graph_digest,
         });
         *self
             .replication_snapshot
@@ -10192,7 +10284,7 @@ impl Store {
             configured,
             fleet_id: fleet_id.map(str::to_owned),
             authority_digest: snapshot.authority_digest.clone(),
-            graph_digest: graph_digest(&connection)?,
+            graph_digest: snapshot.graph_digest.clone(),
             received_envelopes: connection.query_row(
                 "SELECT COUNT(*) FROM replica_envelopes",
                 [],
@@ -15989,41 +16081,135 @@ fn update_identity_digest(digest: &mut Sha256, writer: &str, sequence: u64, hash
     }
 }
 
-fn graph_digest(connection: &Connection) -> Result<String> {
-    digest_queries(
-        connection,
+#[cfg(test)]
+thread_local! {
+    static INVENTORY_IDENTITIES_HASHED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static GRAPH_DIGESTS_COMPUTED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// The projected tables the graph digest commits: digest label, table, digested columns in
+/// order, and row order. Triggers built from the same list bump `graph_generation` whenever one
+/// of these columns changes.
+const GRAPH_DIGEST_TABLES: [(&str, &str, &[&str], &str); 6] = [
+    (
+        "desired",
+        "desired",
         &[
-            (
-                "desired",
-                "SELECT json_array(subject, kind, revision, claim_id, body, member, owner_run, owner_generation, owner_step)
-                 FROM desired ORDER BY subject",
-            ),
-            (
-                "missions",
-                "SELECT json_array(mission_id, revision, state, claim_id)
-                 FROM mission_definitions ORDER BY mission_id",
-            ),
-            (
-                "runs",
-                "SELECT json_array(id, mission_id, current_generation_id, status, phase)
-                 FROM mission_runs ORDER BY id",
-            ),
-            (
-                "generations",
-                "SELECT json_array(id, run_id, revision, predecessor_id, status)
-                 FROM run_generations ORDER BY id",
-            ),
-            (
-                "steps",
-                "SELECT json_array(subject, generation_id, step_path, status, attempt, lease_owner, blocked_reason)
-                 FROM step_runs ORDER BY subject",
-            ),
-            (
-                "proposals",
-                "SELECT json_array(id, run_id, source_generation_id, candidate_revision, status, approvals, successor_generation_id)
-                 FROM revision_proposals ORDER BY id",
-            ),
+            "subject",
+            "kind",
+            "revision",
+            "claim_id",
+            "body",
+            "member",
+            "owner_run",
+            "owner_generation",
+            "owner_step",
         ],
+        "subject",
+    ),
+    (
+        "missions",
+        "mission_definitions",
+        &["mission_id", "revision", "state", "claim_id"],
+        "mission_id",
+    ),
+    (
+        "runs",
+        "mission_runs",
+        &[
+            "id",
+            "mission_id",
+            "current_generation_id",
+            "status",
+            "phase",
+        ],
+        "id",
+    ),
+    (
+        "generations",
+        "run_generations",
+        &["id", "run_id", "revision", "predecessor_id", "status"],
+        "id",
+    ),
+    (
+        "steps",
+        "step_runs",
+        &[
+            "subject",
+            "generation_id",
+            "step_path",
+            "status",
+            "attempt",
+            "lease_owner",
+            "blocked_reason",
+        ],
+        "subject",
+    ),
+    (
+        "proposals",
+        "revision_proposals",
+        &[
+            "id",
+            "run_id",
+            "source_generation_id",
+            "candidate_revision",
+            "status",
+            "approvals",
+            "successor_generation_id",
+        ],
+        "id",
+    ),
+];
+
+fn graph_digest(connection: &Connection) -> Result<String> {
+    #[cfg(test)]
+    GRAPH_DIGESTS_COMPUTED.with(|computed| computed.set(computed.get() + 1));
+    let queries = GRAPH_DIGEST_TABLES
+        .iter()
+        .map(|(label, table, columns, order)| {
+            (
+                *label,
+                format!(
+                    "SELECT json_array({}) FROM {table} ORDER BY {order}",
+                    columns.join(", ")
+                ),
+            )
+        })
+        .collect::<Vec<_>>();
+    let queries = queries
+        .iter()
+        .map(|(label, query)| (*label, query.as_str()))
+        .collect::<Vec<_>>();
+    digest_queries(connection, &queries)
+}
+
+/// Bump `graph_generation` in the same transaction as any change to a digested column, so a
+/// replication snapshot can reuse the graph digest across writes that change none of them.
+fn create_graph_generation_triggers(connection: &Connection) -> Result<()> {
+    for (_, table, columns, _) in GRAPH_DIGEST_TABLES {
+        let changed = columns
+            .iter()
+            .map(|column| format!("OLD.{column} IS NOT NEW.{column}"))
+            .collect::<Vec<_>>()
+            .join(" OR ");
+        connection.execute_batch(&format!(
+            "CREATE TRIGGER IF NOT EXISTS {table}_graph_insert AFTER INSERT ON {table}
+             BEGIN UPDATE graph_generation SET value=value+1 WHERE id=1; END;
+             CREATE TRIGGER IF NOT EXISTS {table}_graph_update AFTER UPDATE ON {table}
+             WHEN {changed}
+             BEGIN UPDATE graph_generation SET value=value+1 WHERE id=1; END;
+             CREATE TRIGGER IF NOT EXISTS {table}_graph_delete AFTER DELETE ON {table}
+             BEGIN UPDATE graph_generation SET value=value+1 WHERE id=1; END;"
+        ))?;
+    }
+    Ok(())
+}
+
+fn graph_generation(connection: &Connection) -> Result<i64> {
+    Ok(
+        connection.query_row("SELECT value FROM graph_generation WHERE id=1", [], |row| {
+            row.get(0)
+        })?,
     )
 }
 
@@ -26523,6 +26709,167 @@ version 2
             batch_claims.contains("claims_batch_index"),
             "the inventory seed query must use the claim batch index:\n{batch_claims}"
         );
+    }
+
+    fn observe_harness(store: &Store, observed_at_ms: u64) {
+        store
+            .append_claim(&ClaimInput {
+                subject: "agent/example".into(),
+                kind: "harness.observed".into(),
+                actor: Some("agent/example".into()),
+                fields: BTreeMap::from([
+                    ("state".into(), json!("working")),
+                    ("observed_at_ms".into(), json!(observed_at_ms)),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn a_local_write_rehashes_only_its_own_inventory_range() {
+        let store = Store::open_memory("hetz").unwrap();
+        for observed_at_ms in 0..600 {
+            observe_harness(&store, observed_at_ms);
+        }
+        let before = store.replication_snapshot().unwrap();
+        assert!(before.inventory.envelopes.len() >= 600);
+        INVENTORY_IDENTITIES_HASHED.with(|hashed| hashed.set(0));
+
+        observe_harness(&store, 600);
+        let after = store.replication_snapshot().unwrap();
+        let hashed = INVENTORY_IDENTITIES_HASHED.with(std::cell::Cell::get);
+        assert!(
+            hashed <= REPLICATION_BUCKET_WIDTH as usize,
+            "one new envelope re-hashed {hashed} of {} identities",
+            after.inventory.envelopes.len()
+        );
+        let public = after.inventory.public();
+        assert_eq!(
+            after.inventory.digest,
+            replication_inventory_digest(&public.envelopes)
+        );
+        let connection = store.connection.lock().unwrap();
+        let (full, _) = full_compact_replication_inventory(&connection).unwrap();
+        assert_eq!(public.envelopes, full.public().envelopes);
+        assert_eq!(after.inventory.digest, full.digest);
+    }
+
+    proptest! {
+        #[test]
+        fn a_resumed_inventory_digest_matches_a_full_pass(
+            initial in proptest::collection::vec((0usize..3, 1u64..2000), 0..300),
+            rounds in proptest::collection::vec(
+                proptest::collection::vec((0usize..3, 1u64..2000), 1..20),
+                1..6,
+            ),
+        ) {
+            let writers = ["Silber", "fleet-node", "hetz"];
+            // Some hashes are not SHA-256 hex, so the digest also covers verbatim hashes.
+            let identity = |(writer, sequence): (usize, u64)| ReplicaEnvelopeId {
+                writer: writers[writer].into(),
+                sequence,
+                hash: if sequence % 7 == 0 {
+                    format!("irregular-{sequence}")
+                } else {
+                    format!("{sequence:064x}")
+                },
+            };
+            let mut all = initial.into_iter().map(identity).collect::<BTreeSet<_>>();
+            let mut inventory = CompactReplicationInventory::from_sorted(all.iter().cloned());
+            let mut buckets = inventory.buckets();
+            let mut prefixes = Vec::new();
+            inventory.resume_digest(&buckets, &mut prefixes, 0);
+            prop_assert_eq!(
+                &inventory.digest,
+                &replication_inventory_digest(&all.iter().cloned().collect::<Vec<_>>())
+            );
+            for round in rounds {
+                let before = buckets.clone();
+                for identity in round.into_iter().map(identity) {
+                    if all.insert(identity.clone()) {
+                        inventory.insert(identity);
+                    }
+                }
+                buckets = inventory.buckets();
+                let resume_from = buckets
+                    .iter()
+                    .zip(&before)
+                    .position(|(after, before)| after != before)
+                    .unwrap_or(before.len().min(buckets.len()));
+                inventory.resume_digest(&buckets, &mut prefixes, resume_from);
+                prop_assert_eq!(
+                    &inventory.digest,
+                    &replication_inventory_digest(&all.iter().cloned().collect::<Vec<_>>())
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn replication_reuses_the_graph_digest_until_a_digested_column_changes() {
+        let store = Store::open_memory("hetz").unwrap();
+        observe_harness(&store, 0);
+        let first = store.replication_snapshot().unwrap();
+        GRAPH_DIGESTS_COMPUTED.with(|computed| computed.set(0));
+        observe_harness(&store, 1);
+        let second = store.replication_snapshot().unwrap();
+        assert_ne!(first.store_index, second.store_index);
+        assert_eq!(
+            GRAPH_DIGESTS_COMPUTED.with(std::cell::Cell::get),
+            0,
+            "a harness observation must not recompute the graph digest"
+        );
+        assert_eq!(second.graph_digest, first.graph_digest);
+
+        let generation =
+            |store: &Store| graph_generation(&store.connection.lock().unwrap()).unwrap();
+        let execute = |store: &Store, sql: &str| {
+            store.connection.lock().unwrap().execute(sql, []).unwrap();
+        };
+        let before = generation(&store);
+        execute(
+            &store,
+            "INSERT INTO mission_runs(id, mission_id, initial_revision, current_generation_id,
+                 root_revision, root_run_id, workspace, requester, inputs, mode, status, phase,
+                 created_at_unix_ms, updated_at_unix_ms)
+             VALUES ('run-example', 'mission/example', 'revision', 'generation', 'revision',
+                 'run-example', '/tmp/example', 'person/example', '{}', 'normal', 'running',
+                 'normal', '1', '1')",
+        );
+        assert_eq!(generation(&store), before + 1);
+        execute(
+            &store,
+            "UPDATE mission_runs SET updated_at_unix_ms='2' WHERE id='run-example'",
+        );
+        assert_eq!(
+            generation(&store),
+            before + 1,
+            "an undigested column must not change the generation"
+        );
+        execute(
+            &store,
+            "UPDATE mission_runs SET status='running' WHERE id='run-example'",
+        );
+        assert_eq!(generation(&store), before + 1);
+        execute(
+            &store,
+            "UPDATE mission_runs SET status='completed' WHERE id='run-example'",
+        );
+        assert_eq!(generation(&store), before + 2);
+
+        observe_harness(&store, 2);
+        let third = store.replication_snapshot().unwrap();
+        assert_eq!(GRAPH_DIGESTS_COMPUTED.with(std::cell::Cell::get), 1);
+        assert_ne!(third.graph_digest, first.graph_digest);
+        assert_eq!(
+            third.graph_digest,
+            graph_digest(&store.connection.lock().unwrap()).unwrap()
+        );
+        execute(&store, "DELETE FROM mission_runs WHERE id='run-example'");
+        assert_eq!(generation(&store), before + 3);
     }
 
     #[test]
