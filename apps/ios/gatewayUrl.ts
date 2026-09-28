@@ -40,4 +40,4 @@ export function normalizeGatewayUrl(input: string): string | null {
   return `${url.protocol}//${url.host}${url.pathname.replace(/\/+$/, '')}`;
 }
 
-export const LAN_HTTP_WARNING = 'Plain HTTP on a local network is not encrypted. Anyone on this network can read the paired credential and your st3 data. Use it only on a network you trust.';
+export const LAN_HTTP_WARNING = 'Plain HTTP on a local network is not encrypted. Anyone on this network can read the paired credential and your st data. Use it only on a network you trust.';
