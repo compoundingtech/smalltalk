@@ -106,6 +106,6 @@ pub use run::{
 mod ci_proof {
     #[test]
     fn deliberately_fails_on_both_hosts() {
-        assert_eq!(1, 2, "intentional CI proof failure");
+        assert_eq!(1, 1, "intentional CI proof recovery");
     }
 }
