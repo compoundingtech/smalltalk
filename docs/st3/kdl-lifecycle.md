@@ -408,6 +408,24 @@ human gates. Human authority is required and never inferred from an environment 
 
 The decision target is the mission run or step run that owns the gate. The command binds the decision to the exact current request.
 
+Human gates default to `mode="approve"`: `st attention approve` passes the gate and
+`st attention reject --reason TEXT` fails it with the reviewer's reason. A worker-owned step
+can instead use `mode="feedback"`:
+
+```kdl
+gate "review the draft" type="human" mode="feedback" {
+  reviewer "person/operator"
+  question "Does the draft need changes?"
+}
+```
+
+That review offers approve and request changes. Run `st attention request-changes
+step-run/GENERATION/draft --reason "Add the missing source." --as person/operator` to send
+feedback to the step's worker. The step starts a new attempt without entering `failed`, and its
+goals include `Reviewer feedback: Add the missing source.` The worker must claim and complete that
+new attempt; the next review is a distinct request. Feedback gates require a worker-owned step.
+Mission-level, loop, and agentless gates use approve mode.
+
 ## Human attention
 
 `st attention ls --as person/NAME` is the complete inbox for one explicit person. It includes these current items:

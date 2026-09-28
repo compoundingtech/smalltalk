@@ -456,13 +456,14 @@ async fn github_json(client: &reqwest::Client, url: String, token: &str) -> Resu
     if let Some(etag) = cached.as_ref().and_then(|payload| payload.etag.as_deref()) {
         request = request.header(reqwest::header::IF_NONE_MATCH, etag);
     }
+    let response = request.send().await?;
     if let Some(repository) = github_repository_key(&url) {
         let mut counts = github_request_counts()
             .lock()
             .expect("GitHub count mutex poisoned");
         *counts.entry(repository).or_default() += 1;
     }
-    let response = github_response(request.send().await?, false)?;
+    let response = github_response(response, false)?;
     if response.status() == reqwest::StatusCode::NOT_MODIFIED {
         let payload = cached
             .as_mut()
