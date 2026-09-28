@@ -93,6 +93,12 @@ CREATE INDEX IF NOT EXISTS claims_subject_kind_index ON claims(subject, kind, st
 CREATE INDEX IF NOT EXISTS claims_message_to_index
 ON claims(json_extract(body, '$.fields.to'), subject)
 WHERE kind='message.sent';
+CREATE INDEX IF NOT EXISTS claims_message_from_index
+ON claims(json_extract(body, '$.fields.from'), store_index)
+WHERE kind='message.sent';
+CREATE INDEX IF NOT EXISTS claims_actor_progress_index
+ON claims(actor, store_index)
+WHERE kind IN ('work.progress', 'work.submitted');
 CREATE INDEX IF NOT EXISTS claims_timeline_incarnation_index
 ON claims(subject, kind, json_extract(body, '$.fields.incarnation_id'), store_index)
 WHERE kind='harness.timeline';
@@ -10008,6 +10014,74 @@ impl Store {
             .optional()
             .map(|value| value.map(|value| value.max(0) as u128))
             .map_err(Into::into)
+    }
+
+    /// Last substantive activity for an agent, excluding heartbeat and usage observations.
+    pub fn agent_last_activity_at(
+        &self,
+        agent: &str,
+        incarnation: Option<&str>,
+        snapshot_index: u64,
+    ) -> Result<Option<u128>> {
+        let connection = self.readers.get();
+        let mut times = Vec::new();
+        if let Some(incarnation) = incarnation {
+            let local: Option<i64> = connection.query_row(
+                "SELECT observed_at_unix_ms FROM local_observations
+                 WHERE subject=?1 AND kind='harness.timeline'
+                   AND json_extract(body, '$.fields.incarnation_id')=?2
+                   AND json_extract(body, '$.fields.entry_type') IN ('message','content','tool_call','tool_result')
+                   AND after_store_index<=?3 ORDER BY id DESC LIMIT 1",
+                params![agent, incarnation, snapshot_index], |row| row.get(0),
+            ).optional()?;
+            if let Some(time) = local {
+                times.push(time.max(0) as u128);
+            }
+            let replicated: Option<String> = connection.query_row(
+                "SELECT accepted_at_unix_ms FROM claims
+                 WHERE subject=?1 AND kind='harness.timeline'
+                   AND json_extract(body, '$.fields.incarnation_id')=?2
+                   AND json_extract(body, '$.fields.entry_type') IN ('message','content','tool_call','tool_result')
+                   AND store_index<=?3 ORDER BY store_index DESC LIMIT 1",
+                params![agent, incarnation, snapshot_index], |row| row.get(0),
+            ).optional()?;
+            times.extend(replicated.and_then(|time| time.parse::<u128>().ok()));
+        }
+        for query in [
+            "SELECT accepted_at_unix_ms FROM claims WHERE actor=?1 AND kind IN ('work.progress','work.submitted') AND store_index<=?2 ORDER BY store_index DESC LIMIT 1",
+            "SELECT accepted_at_unix_ms FROM claims WHERE kind='message.sent' AND json_extract(body, '$.fields.from')=?1 AND store_index<=?2 ORDER BY store_index DESC LIMIT 1",
+            "SELECT accepted_at_unix_ms FROM claims WHERE kind='message.sent' AND json_extract(body, '$.fields.to')=?1 AND store_index<=?2 ORDER BY store_index DESC LIMIT 1",
+        ] {
+            let time: Option<String> = connection
+                .query_row(query, params![agent, snapshot_index], |row| row.get(0))
+                .optional()?;
+            times.extend(time.and_then(|time| time.parse::<u128>().ok()));
+        }
+        Ok(times.into_iter().max())
+    }
+
+    pub fn agent_working_since(
+        &self,
+        agent: &str,
+        incarnation: &str,
+        snapshot_index: u64,
+    ) -> Result<Option<u128>> {
+        let connection = self.readers.get();
+        let previous: Option<u64> = connection.query_row(
+            "SELECT MAX(store_index) FROM claims WHERE subject=?1 AND kind='harness.observed'
+             AND json_extract(body, '$.fields.incarnation_id')=?2
+             AND json_extract(body, '$.fields.state')!='working' AND store_index<=?3",
+            params![agent, incarnation, snapshot_index],
+            |row| row.get(0),
+        )?;
+        let started: Option<String> = connection.query_row(
+            "SELECT accepted_at_unix_ms FROM claims WHERE subject=?1 AND kind='harness.observed'
+             AND json_extract(body, '$.fields.incarnation_id')=?2
+             AND json_extract(body, '$.fields.state')='working'
+             AND store_index>?3 AND store_index<=?4 ORDER BY store_index LIMIT 1",
+            params![agent, incarnation, previous.unwrap_or(0), snapshot_index], |row| row.get(0),
+        ).optional()?;
+        Ok(started.and_then(|time| time.parse().ok()))
     }
 
     fn timeline_claim_rows_for_incarnation_at(
@@ -32969,6 +33043,83 @@ mission "nested-work" state="ready" {
             expected_subject: None,
             idempotency_key: Some(format!("timeline:{subject}:{incarnation}:{entry}")),
         }
+    }
+
+    #[test]
+    fn agent_activity_ignores_timeline_status_and_tracks_content() {
+        let store = Store::open_memory("node").unwrap();
+        let agent = "agent/node.worker";
+        let mut status = timeline_observation(agent, "inc-1", "idle");
+        status
+            .fields
+            .insert("entry_type".into(), Value::String("status".into()));
+        store.append_claim(&status).unwrap();
+        assert_eq!(
+            store
+                .agent_last_activity_at(agent, Some("inc-1"), store.index().unwrap())
+                .unwrap(),
+            None
+        );
+        let content = store
+            .append_claim(&timeline_observation(agent, "inc-1", "answer"))
+            .unwrap();
+        assert_eq!(
+            store
+                .agent_last_activity_at(agent, Some("inc-1"), store.index().unwrap())
+                .unwrap(),
+            Some(content.accepted_at_unix_ms)
+        );
+        let mut later_status = timeline_observation(agent, "inc-1", "working");
+        later_status
+            .fields
+            .insert("entry_type".into(), Value::String("status".into()));
+        store.append_claim(&later_status).unwrap();
+        assert_eq!(
+            store
+                .agent_last_activity_at(agent, Some("inc-1"), store.index().unwrap())
+                .unwrap(),
+            Some(content.accepted_at_unix_ms)
+        );
+    }
+
+    #[test]
+    fn agent_silence_starts_at_the_latest_working_transition() {
+        let store = Store::open_memory("node").unwrap();
+        let agent = "agent/node.worker";
+        let observe = |state: &str, key: &str| {
+            store
+                .append_claim(&ClaimInput {
+                    subject: agent.into(),
+                    kind: "harness.observed".into(),
+                    actor: Some(agent.into()),
+                    fields: BTreeMap::from([
+                        ("state".into(), Value::String(state.into())),
+                        ("driver".into(), Value::String("codex".into())),
+                        ("incarnation_id".into(), Value::String("inc-1".into())),
+                    ]),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: Some(key.into()),
+                })
+                .unwrap()
+        };
+        observe("idle", "idle-one");
+        let first = observe("working", "work-one");
+        observe("working", "work-heartbeat");
+        assert_eq!(
+            store
+                .agent_working_since(agent, "inc-1", store.index().unwrap())
+                .unwrap(),
+            Some(first.accepted_at_unix_ms)
+        );
+        observe("idle", "idle-two");
+        let second = observe("working", "work-two");
+        assert_eq!(
+            store
+                .agent_working_since(agent, "inc-1", store.index().unwrap())
+                .unwrap(),
+            Some(second.accepted_at_unix_ms)
+        );
     }
 
     fn timeline_entries(page: &ClaimsPage) -> Vec<String> {

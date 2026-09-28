@@ -451,6 +451,7 @@ fn validate_surfaces(
         "AttentionTargetState",
         "DocumentContent",
         "LaunchPreview",
+        "MissionRunSummary",
         "AgentQueue",
         "AgentQueueRun",
         "AgentQueueMove",
