@@ -1,0 +1,89 @@
+name: Publish portable st2 source
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Exact accepted commit SHA to build
+        required: true
+        type: string
+      tag:
+        description: Successor release tag
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  linux-x86_64:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      SOURCE_SHA: ${{ inputs.source_sha }}
+      TAG: ${{ inputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source_sha }}
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Verify accepted immutable source
+        run: |
+          set -euo pipefail
+          test -n "$SOURCE_SHA"
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          git merge-base --is-ancestor "$SOURCE_SHA" origin/main
+          test -z "$(git status --porcelain)"
+          SHORT_SHA="$(git rev-parse --short=7 HEAD)"
+          echo "SHORT_SHA=$SHORT_SHA" >> "$GITHUB_ENV"
+      - name: Build and verify portable binary
+        run: |
+          set -euo pipefail
+          cargo build --release --locked
+          ./target/release/st2 --version | tee st2.version.txt
+          grep -F "$SHORT_SHA" st2.version.txt
+          file target/release/st2 | tee st2.file.txt
+          grep -F "ELF 64-bit LSB" st2.file.txt
+          readelf --program-headers target/release/st2 | tee st2.program-headers.txt
+          ! grep -F "/nix/store/" st2.program-headers.txt
+          grep -E "Requesting program interpreter: /(lib64|lib/x86_64-linux-gnu)/" st2.program-headers.txt
+          ldd target/release/st2 | tee st2.ldd.txt
+          ! grep -F "not found" st2.ldd.txt
+      - name: Package and checksum
+        run: |
+          set -euo pipefail
+          ARCHIVE="st2-${TAG#v}-x86_64-unknown-linux-gnu.tar.gz"
+          install -m 0755 target/release/st2 st2
+          tar -czf "$ARCHIVE" st2
+          sha256sum "$ARCHIVE" > SHA256SUMS
+          test "$(tar -tzf "$ARCHIVE")" = st2
+          echo "ARCHIVE=$ARCHIVE" >> "$GITHUB_ENV"
+      - name: Publish successor release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git fetch --tags origin
+          if git rev-parse "refs/tags/$TAG" >/dev/null 2>&1; then
+            test "$(git rev-list -n 1 "$TAG")" = "$SOURCE_SHA"
+          else
+            git config user.name github-actions
+            git config user.email github-actions@github.com
+            git tag -a "$TAG" "$SOURCE_SHA" -m "st2 $TAG"
+            git push origin "refs/tags/$TAG"
+          fi
+          printf 'Exact source: `%s`.\n\nPortable Linux x86_64 artifact with checksum and fresh-download execution proof.\n' "$SOURCE_SHA" > release-notes.md
+          gh release create "$TAG" --verify-tag --target "$SOURCE_SHA" --prerelease --title "st2 $TAG" --notes-file release-notes.md -- "$ARCHIVE" SHA256SUMS
+      - name: Verify fresh download and execution
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir verified-download
+          gh release download "$TAG" --dir verified-download --pattern "$ARCHIVE" --pattern SHA256SUMS
+          cd verified-download
+          sha256sum --check SHA256SUMS
+          tar -xzf "$ARCHIVE"
+          ./st2 --version | tee verified.version.txt
+          grep -F "$SHORT_SHA" verified.version.txt

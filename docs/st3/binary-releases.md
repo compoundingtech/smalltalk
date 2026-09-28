@@ -1,10 +1,12 @@
 # Smalltalk binary releases
 
-Every pushed Git tag runs **Smalltalk tag release**. The Linux build must pass before a
+Every pushed Git tag runs **Smalltalk tag release**. Both native builds must pass before a
 GitHub release is published. Each release contains:
 
 - `smalltalk-x86_64-unknown-linux-gnu.tar.gz`: Linux x86_64, built on Ubuntu 22.04 (glibc 2.35 or newer).
-- A `.sha256` checksum, `SHA256SUMS`, and `RELEASE.json` with the exact
+- `smalltalk-aarch64-apple-darwin.tar.gz`: Apple Silicon, macOS 15 or newer. The executables are
+  ad-hoc signed, not Developer ID signed or notarized; macOS may require approval to open them.
+- One `.sha256` checksum per archive, combined `SHA256SUMS`, and `RELEASE.json` with the exact
   source commit, target, Rust compiler version, and PTY runtime revision.
 
 Each archive has `bin/st3`, `bin/st` (a relative symlink to `st3`), `bin/stui`, `bin/st3-migrate`,
@@ -14,12 +16,13 @@ archives need neither Nix nor Rust installed. Harness CLIs and their logins rema
 
 ## Install or update
 
-Choose a tag from the repository's Releases page, then download the Linux archive
+Choose a tag from the repository's Releases page, then download the archive for your machine
 and its `.sha256` file. For example, with GitHub CLI:
 
 ```sh
 tag=v0.3.0 # replace with the release you want
 archive=smalltalk-x86_64-unknown-linux-gnu.tar.gz
+# On Apple Silicon: archive=smalltalk-aarch64-apple-darwin.tar.gz
 gh release download "$tag" --repo compoundingtech/smalltalk \
   --pattern "$archive" --pattern "$archive.sha256"
 shasum -a 256 -c "$archive.sha256"
@@ -37,7 +40,7 @@ installing files.
 
 ## Build and publication proof
 
-Fork PRs changing release files run the Linux build,
+PRs changing release files and manual **Run workflow** invocations run both native builds,
 archive extraction, a temporary-directory installation, CLI help checks, the TUI PTY smoke suite,
 and combined checksum/source validation. They upload `smalltalk-release` as an Actions artifact
 and never publish a GitHub release. Tag pushes use the same jobs, then verify that the tag still
@@ -53,5 +56,4 @@ three tags: push release tags individually from a person or app credential.
 
 The runner and trigger choices follow GitHub's [runner reference](https://docs.github.com/en/actions/reference/runners/github-hosted-runners)
 and [push event rules](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#push).
-The prior manual `release-portable.yml` workflow was removed so hosted runners only run for
-tags and fork PRs.
+The prior `release-portable.yml` remains the separate manual st2 release path.

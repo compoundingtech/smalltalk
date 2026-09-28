@@ -6,7 +6,8 @@ as `smalltalk-ci-*.kdl` and `smalltalk-ci*.sh`. The standing `st` mission observ
 same-repository pull request heads and pushes to `main`. Each run checks the exact observed
 commit. A pull request run merges that commit with the latest `main` in a temporary checkout
 before running `cargo test --workspace --locked` and
-`cargo clippy --workspace --all-targets --locked`.
+`cargo clippy --workspace --all-targets --locked`. Linux also checks generated clients and
+runs the fleet compatibility test against the pinned older st3 baseline.
 
 `st/ci` is the Linux result from hetz. `st/ci-macos` is the Silber result and starts
 after the Linux result, so a slow macOS build does not delay `st/ci`. Both reuse a host-local Cargo
