@@ -1,0 +1,47 @@
+name: Fleet compatibility
+
+# Every pull request, with no path filter: the fleet join series touches the store, the CLI,
+# the schema, and the worker, and any of them can break replication with an older build.
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: fleet-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  fleet-compat:
+    name: fleet-compat (${{ matrix.os }})
+    # macOS never runs on GitHub (#632): it is too slow and too expensive there. The fleet
+    # suite runs on macOS in st's own CI on the fleet's Mac.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: DeterminateSystems/determinate-nix-action@v3
+      - name: Build the pinned baseline st3
+        run: |
+          baseline=$(jq -r .commit .github/fleet-compat-baseline.json)
+          test -n "$baseline"
+          # Only the binary: the baseline's own test suite is not what this job checks.
+          BASELINE="$baseline" nix build --impure --out-link baseline --print-build-logs --expr '
+            ((builtins.getFlake "github:compoundingtech/smalltalk/${builtins.getEnv "BASELINE"}")
+              .packages.${builtins.currentSystem}.st3).overrideAttrs (_: { doCheck = false; })'
+          test -x baseline/bin/st3
+          if baseline/bin/st3 fleet --help > /dev/null 2>&1; then
+            echo "the baseline must predate fleet membership" >&2
+            exit 1
+          fi
+          echo "ST3_COMPAT_BIN=$PWD/baseline/bin/st3" >> "$GITHUB_ENV"
+      - name: Replicate between the baseline and new members
+        run: |
+          test -n "$ST3_COMPAT_BIN"
+          nix develop --command cargo test -p st3 --test fleet -- --ignored --exact \
+            an_old_build_config_peer_replicates_with_new_members 2>&1 | tee compat.log
+          grep -q "test result: ok. 1 passed" compat.log
