@@ -50,6 +50,9 @@ st service status
 st doctor --strict
 ```
 
+Run `st service install` again after upgrading the binaries. It updates the installed definitions
+and restarts the services so they use the new executables.
+
 On Linux the service is a systemd user unit. It needs a working user manager; enable lingering
 (`loginctl enable-linger`) so seats keep running after you log out. On macOS it is a launchd
 agent; run `st service permissions` once for the Full Disk Access and Developer Tools steps.
