@@ -12049,6 +12049,15 @@ mission "feedback-review" state="ready" {
                 .iter()
                 .any(|goal| goal.contains("Add a source for the estimate."))
         );
+        let retry_claim = store
+            .latest_claim(&step.subject, Some("step-run.retried"))
+            .unwrap()
+            .unwrap();
+        assert!(retry_claim
+            .body
+            .pointer("/fields/not_before_unix_ms")
+            .unwrap()
+            .is_null());
         let messages = store.messages(Some(&claimant), false).unwrap();
         assert_eq!(messages.len(), 1);
         assert!(

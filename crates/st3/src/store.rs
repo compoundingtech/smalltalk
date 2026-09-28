@@ -4773,7 +4773,7 @@ impl Store {
         )?;
         let body = json!({"fields": {
             "status": "pending", "attempt": next_attempt, "reason": reason,
-            "goals": goals, "not_before_unix_ms": now
+            "goals": goals, "not_before_unix_ms": null
         }});
         append_claim_tx(
             &transaction,
