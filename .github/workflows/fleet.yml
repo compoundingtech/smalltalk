@@ -1,0 +1,42 @@
+name: Fleet compatibility
+
+# Every pull request, with no path filter: the fleet join series touches the store, the CLI,
+# the schema, and the worker, and any of them can break replication with an older build.
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: fleet-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  fleet-compat:
+    name: fleet-compat (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, macos-15]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: DeterminateSystems/determinate-nix-action@v3
+      - name: Build the pinned baseline st3
+        run: |
+          baseline=$(jq -r .commit .github/fleet-compat-baseline.json)
+          test -n "$baseline"
+          nix build "github:compoundingtech/smalltalk/$baseline#st3" --out-link baseline --print-build-logs
+          test -x baseline/bin/st3
+          if baseline/bin/st3 fleet --help > /dev/null 2>&1; then
+            echo "the baseline must predate fleet membership" >&2
+            exit 1
+          fi
+          echo "ST3_COMPAT_BIN=$PWD/baseline/bin/st3" >> "$GITHUB_ENV"
+      - name: Replicate between the baseline and new members
+        run: |
+          test -n "$ST3_COMPAT_BIN"
+          nix develop --command cargo test -p st3 --test fleet -- --ignored --exact \
+            an_old_build_config_peer_replicates_with_new_members 2>&1 | tee compat.log
+          grep -q "test result: ok. 1 passed" compat.log

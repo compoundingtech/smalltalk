@@ -31,6 +31,8 @@ fn free_port() -> u16 {
 struct Node {
     name: String,
     root: PathBuf,
+    /// The st3 executable this node runs; an older release for compatibility tests.
+    binary: PathBuf,
     port: u16,
     env: Vec<(String, String)>,
     daemon: Option<Child>,
@@ -58,8 +60,14 @@ impl Node {
         let pty = root.join("bin/pty");
         fs::write(&pty, "#!/bin/sh\nexit 0\n").unwrap();
         fs::set_permissions(&pty, fs::Permissions::from_mode(0o755)).unwrap();
+        // A release without --pty-binary finds pty through the login shell's PATH.
+        let profile = format!("export PATH=\"{}:$PATH\"\n", root.join("bin").display());
+        for file in [".profile", ".bash_profile", ".zprofile"] {
+            fs::write(root.join("home").join(file), &profile).unwrap();
+        }
         Self {
             name: name.into(),
+            binary: PathBuf::from(ST3),
             root,
             port: free_port(),
             env: Vec::new(),
@@ -88,7 +96,7 @@ impl Node {
                 .map(|argument| (*argument).to_owned())
                 .collect(),
         );
-        let mut command = Command::new(ST3);
+        let mut command = Command::new(&self.binary);
         command
             .args(arguments)
             .current_dir(&self.root)
@@ -149,8 +157,13 @@ impl Node {
     async fn start(&mut self) {
         let pty = self.root.join("bin/pty");
         let log = |name: &str| fs::File::create(self.root.join(name)).unwrap();
+        let up: Vec<&str> = if self.binary == Path::new(ST3) {
+            vec!["up", "--pty-binary", pty.to_str().unwrap()]
+        } else {
+            vec!["up"]
+        };
         let daemon = self
-            .command(&["up", "--pty-binary", pty.to_str().unwrap()])
+            .command(&up)
             .stdin(Stdio::null())
             .stdout(log("daemon.log"))
             .stderr(log("daemon.stderr.log"))
@@ -1253,4 +1266,98 @@ async fn a_member_switches_between_listening_and_dial_out() {
     ]);
     b.restart().await;
     b.wait_listening().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs ST3_COMPAT_BIN: the st3 of the pinned baseline release"]
+async fn an_old_build_config_peer_replicates_with_new_members() {
+    let old = PathBuf::from(
+        std::env::var("ST3_COMPAT_BIN").expect("ST3_COMPAT_BIN names the baseline st3"),
+    );
+    assert!(
+        !Command::new(&old)
+            .args(["fleet", "--help"])
+            .output()
+            .unwrap()
+            .status
+            .success(),
+        "the baseline must predate membership"
+    );
+    let root = tempfile::tempdir().unwrap();
+    let fleet_id = "2a9d7c5e-1b3f-4e6a-8c0d-9e8f7a6b5c4d";
+    let secret = root.path().join("fleet.secret");
+    fs::write(&secret, hex::encode([7_u8; 32])).unwrap();
+    fs::set_permissions(&secret, fs::Permissions::from_mode(0o600)).unwrap();
+    let mut o = Node::new(root.path(), "o");
+    o.binary = old;
+    let mut n1 = Node::new(root.path(), "n1");
+    let mut n2 = Node::new(root.path(), "n2");
+    o.legacy_config(fleet_id, &secret, &[("n1", n1.port)]);
+    n1.legacy_config(fleet_id, &secret, &[("o", o.port), ("n2", n2.port)]);
+    n2.legacy_config(fleet_id, &secret, &[("n1", n1.port)]);
+    for node in [&mut o, &mut n1, &mut n2] {
+        node.start().await;
+    }
+    o.note("o-0").await;
+    n2.note("n2-0").await;
+    let mut expected = BTreeSet::from([
+        "custom/fleet-test/o-0".to_owned(),
+        "custom/fleet-test/n2-0".to_owned(),
+    ]);
+    for node in [&o, &n1, &n2] {
+        wait_for_notes(node, &expected, 60, &[&o, &n1, &n2]).await;
+    }
+
+    // n1 and n2 move to membership while the old build keeps replicating with them.
+    n1.stop();
+    n1.migrate(&["--anchor"]);
+    n1.start().await;
+    n1.wait_listening().await;
+    let code = n1.invite("n2", &["--migrate"]);
+    n2.stop();
+    n2.migrate(&[&code]);
+    n2.start().await;
+    // A newly joined member reaches the old build only through the members it can dial.
+    let n4 = joined(root.path(), &n1, "n4", &[]).await;
+    o.note("o-1").await;
+    n2.note("n2-1").await;
+    n4.note("n4-0").await;
+    for text in ["o-1", "n2-1", "n4-0"] {
+        expected.insert(format!("custom/fleet-test/{text}"));
+    }
+    for node in [&o, &n1, &n2, &n4] {
+        wait_for_notes(node, &expected, 90, &[&o, &n1, &n2, &n4]).await;
+    }
+    // The old build keeps the fleet claims it cannot read as unknown, never invalid.
+    let status = o.st_json(&["replication", "status"]);
+    assert_eq!(status["invalid_records"], 0, "{status}");
+    assert!(
+        status["unknown_records"].as_u64().unwrap_or(0) > 0,
+        "the old build admitted fleet claims it cannot know: {status}"
+    );
+    for node in [&n1, &n2, &n4] {
+        let status = node.st_json(&["replication", "status"]);
+        assert_eq!(status["unsigned_envelopes"], 0, "{}: {status}", node.name);
+        assert_eq!(status["invalid_records"], 0, "{}: {status}", node.name);
+    }
+}
+
+#[test]
+fn fleet_workflows_have_no_path_filter() {
+    let workflows = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.github/workflows");
+    let compat = fs::read_to_string(workflows.join("fleet.yml")).unwrap();
+    assert!(compat.contains("fleet-compat"));
+    assert!(compat.contains("pull_request:"));
+    for filter in ["paths:", "paths-ignore:", "branches-ignore:"] {
+        assert!(
+            !compat.contains(filter),
+            "fleet.yml filters its runs with {filter}"
+        );
+    }
+    assert!(compat.contains("an_old_build_config_peer_replicates_with_new_members"));
+    let baseline: Value = serde_json::from_str(
+        &fs::read_to_string(workflows.join("../fleet-compat-baseline.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(baseline["commit"].as_str().map(str::len), Some(40));
 }
