@@ -53,6 +53,7 @@ use crate::model::{
 use crate::store::Store;
 
 mod client_v0;
+mod terminal_view;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -157,6 +158,14 @@ fn signal_changed(state: &AppState) {
 // Usage samples and lease renewals are durable and visible, but neither can
 // advance a mission on its own. Terminal child state, claim expiry deadlines,
 // and harness readiness still wake the reconciler through their own paths.
+// A local observation never replicates and cannot advance a mission, so it only
+// wakes clients that follow this node's event feed.
+fn signal_local_change(state: &AppState) {
+    state
+        .event_notify
+        .send_modify(|generation| *generation = generation.saturating_add(1));
+}
+
 fn signal_visible_change(state: &AppState) {
     state
         .event_notify
@@ -1531,9 +1540,15 @@ fn managed_session_resources(
             });
             same_incarnation || (incarnation.is_none() && same_runtime)
         });
-        let accepted_times = incarnation_claims
+        let mut accepted_times = incarnation_claims
             .map(|claim| claim.accepted_at_unix_ms)
             .collect::<Vec<_>>();
+        if let Some(incarnation) = incarnation
+            && let Some(observed) =
+                store.latest_local_timeline_at(&subject.subject, incarnation, snapshot_index)?
+        {
+            accepted_times.push(observed);
+        }
         let started = fields
             .and_then(|fields| fields.get("started_at_unix_ms"))
             .and_then(|value| value.as_u64().map(u128::from))
@@ -2951,9 +2966,53 @@ fn isolation_name(mode: st_runtime::Isolation) -> &'static str {
 }
 
 async fn doctor(State(state): State<AppState>) -> Result<Json<DoctorReport>, ApiError> {
-    tokio::task::spawn_blocking(move || doctor_report(&state))
+    let environment = tokio::task::spawn_blocking(crate::environment::snapshot)
         .await
-        .map_err(ApiError::internal)?
+        .map_err(ApiError::internal)?;
+    let token = crate::resource::github_token().await;
+    let mut report = tokio::task::spawn_blocking(move || doctor_report(&state))
+        .await
+        .map_err(ApiError::internal)??
+        .0;
+    report.checks.push(match environment {
+        Ok(environment) => DoctorCheck {
+            name: "daemon-environment".into(),
+            status: "pass".into(),
+            message: format!(
+                "account interactive login shell; refreshed on use every 60 seconds; PATH={}",
+                environment.get("PATH").map(String::as_str).unwrap_or("")
+            ),
+        },
+        Err(error) => DoctorCheck {
+            name: "daemon-environment".into(),
+            status: "fail".into(),
+            message: error.to_string(),
+        },
+    });
+    report.checks.push(DoctorCheck {
+        name: "github-observer-auth".into(),
+        status: if token.is_ok() { "pass" } else { "warn" }.into(),
+        message: if token.is_ok() {
+            "GitHub observers have a token; credential values are not displayed".into()
+        } else {
+            crate::resource::GITHUB_AUTH_REMEDY.into()
+        },
+    });
+    report.status = if report.checks.iter().any(|check| check.status == "fail") {
+        "fail"
+    } else if report.checks.iter().any(|check| check.status == "warn") {
+        "warn"
+    } else {
+        "pass"
+    }
+    .into();
+    Ok(Json(report))
+}
+
+fn daemon_pty(state: &AppState) -> anyhow::Result<st_runtime::PtyRuntime> {
+    Ok(st_runtime::PtyRuntime::new(state.pty_root.clone())
+        .with_binary(state.pty_binary.to_string_lossy())
+        .with_environment(crate::environment::snapshot()?))
 }
 
 fn doctor_report(state: &AppState) -> Result<Json<DoctorReport>, ApiError> {
@@ -3051,9 +3110,7 @@ fn doctor_report(state: &AppState) -> Result<Json<DoctorReport>, ApiError> {
             .as_ref()
             .is_some_and(|member| member.terminal)
     });
-    let pty_snapshot = st_runtime::PtyRuntime::new(state.pty_root.clone())
-        .with_binary(state.pty_binary.to_string_lossy())
-        .snapshot();
+    let pty_snapshot = daemon_pty(state).and_then(|runtime| runtime.snapshot());
     match &pty_snapshot {
         Ok(items) => checks.push(DoctorCheck {
             name: "pty-runtime".into(),
@@ -5314,7 +5371,9 @@ async fn post_claim(
         .append_client_claim_outcome(&request)
         .map_err(ApiError::bad)?;
     if appended {
-        if request.kind == "harness.usage" {
+        if crate::store::local_observation_position(&response).is_some() {
+            signal_local_change(&state);
+        } else if request.kind == "harness.usage" {
             signal_visible_change(&state);
         } else {
             signal_changed(&state);
@@ -7649,9 +7708,8 @@ async fn screen_session(
             "an exec session has a log instead of a terminal screen",
         )));
     }
-    let screen = st_runtime::PtyRuntime::new(state.pty_root.clone())
-        .with_binary(state.pty_binary.to_string_lossy())
-        .screen(&session.runtime_id)
+    let screen = daemon_pty(&state)
+        .and_then(|runtime| runtime.screen(&session.runtime_id))
         .map_err(ApiError::internal)?;
     Ok(Json(SessionScreen {
         subject,
@@ -7764,9 +7822,7 @@ async fn input_session_as(
             idempotency_key: Some(request_key),
         })
         .map_err(ApiError::bad)?;
-    let runtime = st_runtime::PtyRuntime::new(state.pty_root.clone())
-        .with_binary(state.pty_binary.to_string_lossy());
-    let effect = match request.mode {
+    let effect = daemon_pty(state).and_then(|runtime| match request.mode {
         SessionInputMode::Line => runtime.send_line_if(
             &session.runtime_id,
             &request.value,
@@ -7780,7 +7836,7 @@ async fn input_session_as(
             &request.value,
             Some(&session.incarnation_id),
         ),
-    };
+    });
     finish_session_control(
         state,
         &subject,
@@ -7855,9 +7911,9 @@ async fn clear_context(
             idempotency_key: Some(request_key),
         })
         .map_err(ApiError::bad)?;
-    let effect = st_runtime::PtyRuntime::new(state.pty_root.clone())
-        .with_binary(state.pty_binary.to_string_lossy())
-        .send_line_if(&session.runtime_id, "/clear", Some(&session.incarnation_id));
+    let effect = daemon_pty(&state).and_then(|runtime| {
+        runtime.send_line_if(&session.runtime_id, "/clear", Some(&session.incarnation_id))
+    });
     finish_session_control(
         &state,
         &subject,
@@ -7944,9 +8000,9 @@ async fn signal_session(
         })
         .map_err(ApiError::bad)?;
     let effect = if session.terminal {
-        st_runtime::PtyRuntime::new(state.pty_root.clone())
-            .with_binary(state.pty_binary.to_string_lossy())
-            .signal_if(&session.runtime_id, Some(&session.incarnation_id), signal)
+        daemon_pty(&state).and_then(|runtime| {
+            runtime.signal_if(&session.runtime_id, Some(&session.incarnation_id), signal)
+        })
     } else {
         st_runtime::ExecRuntime::new(state.state_dir.join("exec"), state.state_dir.join("logs"))
             .signal_if(&session.runtime_id, Some(&session.incarnation_id), signal)

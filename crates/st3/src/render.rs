@@ -3,6 +3,7 @@ use std::fs;
 use std::io::Write as _;
 use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
+#[cfg(test)]
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -542,7 +543,7 @@ fn host_document_refs(desired: &Value) -> Vec<String> {
 const RENDER_GIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 fn git_tracks(workspace: &Path, relative: &Path) -> Result<bool> {
-    let mut child = Command::new("git")
+    let mut child = crate::environment::command("git")?
         .arg("-C")
         .arg(workspace)
         .args(["ls-files", "--error-unmatch", "--"])

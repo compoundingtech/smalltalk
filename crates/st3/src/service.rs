@@ -1130,6 +1130,7 @@ mod tests {
                 url: "http://127.0.0.1:31314".into(),
             }],
             planner: crate::model::PlannerSpec::default(),
+            observations: crate::config::ObservationsConfig::default(),
         };
         let spec = ServiceSpec::new("/usr/bin/st3", config, 1024)?;
         let unit = render_systemd_user_unit(&spec);

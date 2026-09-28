@@ -118,12 +118,24 @@ struct PtyStatsDaemon {
     pid: u32,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct PtyRuntime {
     binary: String,
     root: PathBuf,
     spawn_timeout: Duration,
     command_timeout: Duration,
+    command_environment: Option<BTreeMap<String, String>>,
+}
+
+impl std::fmt::Debug for PtyRuntime {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PtyRuntime")
+            .field("binary", &self.binary)
+            .field("root", &self.root)
+            .field("spawn_timeout", &self.spawn_timeout)
+            .finish_non_exhaustive()
+    }
 }
 
 impl PtyRuntime {
@@ -134,11 +146,18 @@ impl PtyRuntime {
             root,
             spawn_timeout: SPAWN_PUBLICATION_TIMEOUT,
             command_timeout: PTY_COMMAND_TIMEOUT,
+            command_environment: None,
         }
     }
 
     pub fn with_binary(mut self, binary: impl Into<String>) -> Self {
         self.binary = binary.into();
+        self
+    }
+
+    /// Environment for the PTY CLI itself, in addition to the target's explicit --env.
+    pub fn with_environment(mut self, environment: BTreeMap<String, String>) -> Self {
+        self.command_environment = Some(environment);
         self
     }
 
@@ -246,6 +265,9 @@ impl PtyRuntime {
         for attempt in 0..ATTEMPTS {
             let mut command =
                 crate::wrap_isolated(&unit, std::ffi::OsStr::new(&self.binary), &argument_refs);
+            if let Some(environment) = &self.command_environment {
+                command.env_clear().envs(environment);
+            }
             command.env("PTY_ROOT", &self.root);
             let output = match command.output() {
                 Ok(output) => output,
@@ -533,6 +555,9 @@ impl PtyRuntime {
 
     fn command(&self) -> Command {
         let mut command = Command::new(&self.binary);
+        if let Some(environment) = &self.command_environment {
+            command.env_clear().envs(environment);
+        }
         command.env("PTY_ROOT", &self.root);
         command
     }
