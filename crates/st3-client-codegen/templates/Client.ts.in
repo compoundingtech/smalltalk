@@ -101,13 +101,13 @@ export class St3Client {
         });
         const payload: unknown = await response.json();
         if (!payload || typeof payload !== 'object' || (payload as { api_version?: unknown }).api_version !== API_VERSION) {
-            throw new Error('Unexpected st3 client API response');
+            throw new Error('Unexpected st client API response');
         }
         if (!response.ok || 'error_version' in payload) {
             throw new ClientError(payload as ErrorEnvelope, response.status);
         }
         if (!('snapshot' in payload) || !('value' in payload)) {
-            throw new Error('Incomplete st3 client API response');
+            throw new Error('Incomplete st client API response');
         }
         return payload as EnvelopeOf<T>;
     }

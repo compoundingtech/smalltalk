@@ -731,7 +731,7 @@ impl App {
                     for action in &v.actions {
                         lines.push(format!("  {}", action_label(action)));
                     }
-                    lines.push("Choose a key, then confirm with y. CLI actions need st3.".into());
+                    lines.push("Choose a key, then confirm with y. CLI actions need st.".into());
                     lines.push("└────────────────────────".into());
                 } else {
                     lines.push("Nothing needs your attention.".into());
@@ -802,16 +802,16 @@ impl App {
                             .then_with(|| a.header.id.cmp(&b.header.id))
                     });
                     lines.push(if conversation.is_empty() && !recent.is_empty() {
-                        "ST3 MESSAGES · native transcript unavailable".into()
+                        "ST MESSAGES · native transcript unavailable".into()
                     } else {
-                        "ST3 MESSAGES".into()
+                        "ST MESSAGES".into()
                     });
                     if conversation.is_empty() && recent.is_empty() {
                         lines.push(
                             if self.messages_requested.as_deref() == Some(peer.header.id.as_str())
                                 && self.model.messages.snapshot.is_none()
                             {
-                                "Loading ST3 messages…".into()
+                                "Loading ST messages…".into()
                             } else if self
                                 .selected_session_id()
                                 .is_some_and(|id| self.timeline_cache.contains_key(&id))
@@ -884,7 +884,7 @@ impl App {
                         }
                     }
                     lines.push(if session_is_importable(session) {
-                        "m import session into st3 · confirmation stops the exact process and resumes it under st3".into()
+                        "m import session into st · confirmation stops the exact process and resumes it under st".into()
                     } else if exact {
                         format!(
                             "Import unavailable: {}",
@@ -1169,7 +1169,7 @@ impl App {
                         self.model.messages(None, &peer.header.id).next().is_some()
                     }) && self.model.timeline.iter().all(|entry| !matches!(entry.body, st3_client::TimelineBody::Content(_)));
                     if graph_only {
-                        format!("{selected}ST3 messages · transcript unavailable · Pg/wheel scroll · Enter terminal")
+                        format!("{selected}ST messages · transcript unavailable · Pg/wheel scroll · Enter terminal")
                     } else if self.runtime().is_some() {
                         format!("{selected}Enter terminal · Pg/wheel scroll · h history · c message · v select")
                     } else {
@@ -1188,7 +1188,7 @@ impl App {
                 .unwrap_or_else(|| "Esc cancel".into()),
             Mode::ActionReason => format!("Reason: {}█ · Enter continue · Esc cancel", self.input),
             Mode::ImportConfirm => format!(
-                "y confirm import {} · Esc cancel · stops exact process, resumes under st3",
+                "y confirm import {} · Esc cancel · stops exact process, resumes under st",
                 self.pending_import.as_deref().unwrap_or("session")
             ),
             Mode::Chat => format!("Message: {}█ · Enter send · Esc cancel", self.input),
@@ -1213,7 +1213,7 @@ fn mission_label(mission: &st3_client::Mission) -> String {
         .map(|word| match word.to_ascii_lowercase().as_str() {
             "tui" => "TUI".into(),
             "ios" => "iOS".into(),
-            "st3" => "ST3".into(),
+            "st3" => "ST".into(),
             "omp" => "OMP".into(),
             "api" => "API".into(),
             "pty" => "PTY".into(),
@@ -1591,7 +1591,7 @@ fn agent_label(agent: &st3_client::Agent) -> String {
     let label = |slug: &str| {
         slug.split('-')
             .map(|word| match word.to_ascii_lowercase().as_str() {
-                "st3" => "ST3".to_string(),
+                "st3" => "ST".to_string(),
                 "cos" => "COS".to_string(),
                 "ios" => "iOS".to_string(),
                 "tui" => "TUI".to_string(),
@@ -2482,7 +2482,7 @@ fn main() -> Result<()> {
         person
             .as_deref()
             .is_some_and(|person| person.starts_with("person/") && person.len() > 7),
-        "stui needs ST3_PERSON=person/NAME or person = \"person/NAME\" in the st3 config"
+        "stui needs ST3_PERSON=person/NAME or person = \"person/NAME\" in the st config"
     );
     let cache_path = person
         .as_deref()
@@ -2970,7 +2970,7 @@ mod tests {
     #[test]
     fn regression_agent_header_shows_harness_state() {
         let mut model = Model::default();
-        model.agents.items.push(serde_json::from_str(r#"{"kind":"agent","id":"agent/st3","revision":"a","updated_at":"2026-09-25T08:00:00Z","name":"ST3","state":"running","reachability":"reachable","driver":"claude","harness_state":"ready"}"#).unwrap());
+        model.agents.items.push(serde_json::from_str(r#"{"kind":"agent","id":"agent/st3","revision":"a","updated_at":"2026-09-25T08:00:00Z","name":"ST","state":"running","reachability":"reachable","driver":"claude","harness_state":"ready"}"#).unwrap());
         let mut app = App::new(model);
         app.tab = 1;
         let mut terminal = Terminal::new(TestBackend::new(120, 35)).unwrap();
@@ -3071,7 +3071,7 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect::<String>();
-        assert!(loading.contains("Loading ST3 messages…"));
+        assert!(loading.contains("Loading ST messages…"));
     }
 
     #[test]
@@ -3100,7 +3100,7 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
         assert!(
-            content.contains("ST3 messages · transcript unavailable"),
+            content.contains("ST messages · transcript unavailable"),
             "{content}"
         );
         assert!(content.contains("message 5:"), "{content}");
@@ -3108,7 +3108,7 @@ mod tests {
     #[test]
     fn recent_message_preserves_line_breaks_without_return_glyphs() {
         let mut model = Model::default();
-        model.agents.items.push(serde_json::from_str(r#"{"kind":"agent","id":"agent/st3","revision":"one","updated_at":"2026-09-25T08:00:00Z","name":"ST3","state":"running","reachability":"reachable"}"#).unwrap());
+        model.agents.items.push(serde_json::from_str(r#"{"kind":"agent","id":"agent/st3","revision":"one","updated_at":"2026-09-25T08:00:00Z","name":"ST","state":"running","reachability":"reachable"}"#).unwrap());
         model.messages.items.push(serde_json::from_str(r#"{"kind":"message","id":"message/two-lines","revision":"one","updated_at":"2026-09-25T08:00:00Z","from":"agent/cos","to":"agent/st3","title":null,"content":"first line\nsecond line","state":"closed","sent_at":"2026-09-25T08:00:00Z","in_reply_to":null,"session_id":null}"#).unwrap());
         let mut app = App::new(model);
         app.tab = 1;
@@ -3419,7 +3419,7 @@ mod tests {
     fn st3_descendants_nest_and_top_level_omp_shows_its_work() {
         let mut model = Model::default();
         for (id, name, driver, active) in [
-            ("agent/fleet/st3/standing/st3", "ST3", "codex", 0),
+            ("agent/fleet/st3/standing/st3", "ST", "codex", 0),
             (
                 "agent/st3/tui-ios-fixes/2026-09-25/st3-tui-fixer",
                 "TUI fixer",
