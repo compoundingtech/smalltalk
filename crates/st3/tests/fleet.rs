@@ -1499,3 +1499,62 @@ async fn the_fabric_transport_works_through_the_worker_alone() {
         "a join code appeared in an argument list"
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_removed_members_writes_relayed_by_an_uninformed_member_are_refused() {
+    let root = tempfile::tempdir().unwrap();
+    let mut a = anchor(root.path(), "a").await;
+    let mut c = joined(root.path(), &a, "c", &[]).await;
+    c.wait_listening().await;
+    let mut r = joined(root.path(), &a, "r", &[]).await;
+    r.note("r-before").await;
+    let before = BTreeSet::from(["custom/fleet-test/r-before".to_owned()]);
+    wait_for_notes(&a, &before, 60, &[&a, &c, &r]).await;
+    wait_for_notes(&c, &before, 60, &[&a, &c, &r]).await;
+
+    // a removes r while c is away, then goes away itself before r can hear of it.
+    c.stop();
+    r.stop();
+    a.st_ok(&["fleet", "remove", "r", "--reason", "lost", "--as", PERSON]);
+    a.stop();
+
+    // r writes on and relays through c, which has not heard of the removal.
+    c.start().await;
+    r.start().await;
+    r.note("r-after").await;
+    let after = BTreeSet::from(["custom/fleet-test/r-after".to_owned()]);
+    wait_for_notes(&c, &after, 60, &[&c, &r]).await;
+
+    // a returns: c relays r's late envelope to it, and a refuses it.
+    a.start().await;
+    wait_until("c hears of the removal", 60, || async {
+        c.st_json(&["fleet", "status"])["view"]["members"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|member| member["name"] == "r" && member["state"] == "ended")
+    })
+    .await;
+    wait_until("a holds r's late envelope as fenced", 60, || async {
+        a.st_json(&["replication", "status"])["fenced_envelopes"]
+            .as_u64()
+            .unwrap_or(0)
+            >= 1
+    })
+    .await;
+    assert!(
+        !a.notes().await.contains("custom/fleet-test/r-after"),
+        "a admitted a removed member's write relayed through c"
+    );
+    // c admitted it before it knew; doctor says so.
+    let doctor = c.st(&["--json", "doctor"]);
+    let report = String::from_utf8_lossy(&doctor.stdout);
+    assert!(
+        report.contains("beyond high water"),
+        "c's doctor does not report what it admitted from r: {report}"
+    );
+    // From now on c refuses r too.
+    r.note("r-later").await;
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert!(!c.notes().await.contains("custom/fleet-test/r-later"));
+}
