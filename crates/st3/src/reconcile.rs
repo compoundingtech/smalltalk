@@ -4023,14 +4023,27 @@ impl<R: RuntimeControl> Reconciler<R> {
         variables.insert("ST_LOOP_FEEDBACK".into(), prior_feedback.clone());
         variables.insert("loop.feedback".into(), prior_feedback.clone());
         variables.insert("ST_LOOP_ITEM_ID".into(), String::new());
-        self.record_once(
-            &loop_subject,
-            "loop.state",
-            BTreeMap::from([
-                ("status".into(), Value::String("running".into())),
-                ("round".into(), Value::from(view.attempt)),
-            ]),
-        )?;
+        // Every pass enters here. A later write in the same round (a gate wait, a winner, a
+        // reschedule) already says the round is running, so a bare entry claim would only
+        // replace it, and the next pass would write that later claim again.
+        let round_running = self
+            .store
+            .latest_claim(&loop_subject, Some("loop.state"))?
+            .is_some_and(|claim| {
+                claim.body.pointer("/fields/status").and_then(Value::as_str) == Some("running")
+                    && claim.body.pointer("/fields/round").and_then(Value::as_u64)
+                        == Some(u64::from(view.attempt))
+            });
+        if !round_running {
+            self.record_once(
+                &loop_subject,
+                "loop.state",
+                BTreeMap::from([
+                    ("status".into(), Value::String("running".into())),
+                    ("round".into(), Value::from(view.attempt)),
+                ]),
+            )?;
+        }
         let first_execution = self.loop_first_execution_at(run, view)?;
         let timed_out = loop_spec.timeout_ms.is_some_and(|timeout| {
             first_execution
@@ -15099,6 +15112,94 @@ mission "human-exhaustion" state="ready" {
         let completed = store.mission_run(&run.id).unwrap().unwrap();
         assert_eq!(completed.status, "completed");
         assert_eq!(completed.loops[0].status, "exhausted");
+    }
+
+    #[test]
+    fn a_loop_waiting_on_its_gate_writes_its_state_once() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        let source = r#"
+version 2
+mission "gated-loop" state="ready" {
+  goal "Wait for a person without rewriting the loop state."
+  completion { when "all-steps-exhausted" }
+  loop "improve" {
+    max-rounds 2
+    until {
+      gate "accept" type="human" {
+        reviewer "person/example"
+        question "Accept this round?"
+      }
+    }
+    round { completion { when "all-steps-exhausted" } }
+  }
+}
+"#;
+        apply_source(&store, source, "gated-loop-source");
+        let run = store
+            .create_mission_run(&MissionRunRequest {
+                mission: "gated-loop".into(),
+                revision: None,
+                workspace: "/tmp".into(),
+                requester: Some("person/test".into()),
+                mode: Some("run".into()),
+                inputs: BTreeMap::new(),
+                idempotency_key: "gated-loop-run".into(),
+            })
+            .unwrap();
+        let loop_subject = format!(
+            "loop-run/{}/improve",
+            run.generation.strip_prefix("run-generation/").unwrap()
+        );
+        let reconciler = Reconciler::new(
+            store.clone(),
+            Arc::new(FakeRuntime::default()),
+            "node".into(),
+            Arc::new(Notify::new()),
+        );
+        let mut waiting = false;
+        for _ in 0..20 {
+            reconciler.reconcile_once().unwrap();
+            if store
+                .gate_request_for_owner(&loop_subject)
+                .unwrap()
+                .is_some()
+            {
+                waiting = true;
+                break;
+            }
+        }
+        assert!(waiting, "the loop never asked for its gate");
+        reconciler.reconcile_once().unwrap();
+        let states = store
+            .claims_for(&loop_subject, Some("loop.state"))
+            .unwrap()
+            .len();
+        for _ in 0..30 {
+            reconciler.reconcile_once().unwrap();
+        }
+
+        let after = store.claims_for(&loop_subject, Some("loop.state")).unwrap();
+        assert_eq!(after.len(), states, "a waiting loop rewrote its state");
+        let latest = after.last().unwrap();
+        assert_eq!(
+            latest
+                .body
+                .pointer("/fields/status")
+                .and_then(Value::as_str),
+            Some("running")
+        );
+        assert_eq!(
+            latest
+                .body
+                .pointer("/fields/best_round")
+                .and_then(Value::as_u64),
+            Some(1),
+            "the latest state keeps the round's best result"
+        );
+        assert_ne!(
+            store.mission_run(&run.id).unwrap().unwrap().status,
+            "completed"
+        );
     }
 
     #[test]
