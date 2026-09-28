@@ -1361,3 +1361,141 @@ fn fleet_workflows_have_no_path_filter() {
     .unwrap();
     assert_eq!(baseline["commit"].as_str().map(str::len), Some(40));
 }
+
+/// A stand-in for `fabric`: every node's shim shares one registry directory. `expose` records
+/// a node's loopback listener under its protocol, `dial` prints the exposed address (all nodes
+/// share this machine's loopback), and `send-file` drops a file into the peer's inbox.
+fn fabric_shim(root: &Path, node: &str) -> PathBuf {
+    let registry = root.join("fabric-registry");
+    fs::create_dir_all(&registry).unwrap();
+    let shim = root.join(format!("fabric-{node}"));
+    fs::write(
+        &shim,
+        format!(
+            r#"#!/bin/sh
+registry="{registry}"
+me="{node}-fabric-id"
+echo "$me $*" >> "$registry/calls"
+key() {{ echo "$1.$(echo "$2" | tr '/' '_')"; }}
+case "$1" in
+  id) echo "$me" ;;
+  expose) echo "$4" > "$registry/$(key "$me" "$2")" ;;
+  unexpose) rm -f "$registry/$(key "$me" "$2")" ;;
+  dial) f="$registry/$(key "$2" "$3")"; [ -f "$f" ] || {{ echo "no such exposure" >&2; exit 1; }}; cat "$f" ;;
+  send-file) mkdir -p "$registry/home-$2/inbox/$me" && cp "$3" "$registry/home-$2/inbox/$me/$5" ;;
+  probe) [ -f "$registry/$(key "$2" "$3")" ] ;;
+  *) exit 1 ;;
+esac
+"#,
+            registry = registry.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&shim, fs::Permissions::from_mode(0o755)).unwrap();
+    shim
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_fabric_transport_works_through_the_worker_alone() {
+    let root = tempfile::tempdir().unwrap();
+    let registry = root.path().join("fabric-registry");
+    let no_tailscale = root.path().join("no-tailscale");
+    let mut a = Node::new(root.path(), "a");
+    let shim_a = fabric_shim(root.path(), "a");
+    let port = a.port.to_string();
+    a.st_ok(&[
+        "fleet",
+        "create",
+        "--no-service",
+        "--name",
+        "a",
+        "--port",
+        &port,
+        "--transports",
+        "fabric",
+        "--fabric",
+        shim_a.to_str().unwrap(),
+        "--tailscale",
+        no_tailscale.to_str().unwrap(),
+    ]);
+    a.start().await;
+    a.wait_listening().await;
+    a.note("over-fabric-a").await;
+
+    // The code travels as a Fabric file and never appears in an argument list.
+    a.st_ok(&[
+        "fleet",
+        "invite",
+        "b",
+        "--via",
+        "fabric",
+        "--send-fabric",
+        "--as",
+        PERSON,
+    ]);
+    let mut b = Node::new(root.path(), "b");
+    b.env.push((
+        "FABRIC_HOME".into(),
+        registry.join("home-b").display().to_string(),
+    ));
+    let shim_b = fabric_shim(root.path(), "b");
+    let port = b.port.to_string();
+    b.st_ok(&[
+        "fleet",
+        "join",
+        "--fabric-inbox",
+        "--no-service",
+        "--name",
+        "b",
+        "--port",
+        &port,
+        "--transports",
+        "fabric",
+        "--fabric",
+        shim_b.to_str().unwrap(),
+        "--tailscale",
+        no_tailscale.to_str().unwrap(),
+    ]);
+    b.start().await;
+    b.note("over-fabric-b").await;
+    let expected = BTreeSet::from([
+        "custom/fleet-test/over-fabric-a".to_owned(),
+        "custom/fleet-test/over-fabric-b".to_owned(),
+    ]);
+    wait_for_notes(&a, &expected, 60, &[&a, &b]).await;
+    wait_for_notes(&b, &expected, 60, &[&a, &b]).await;
+
+    let calls = fs::read_to_string(registry.join("calls")).unwrap();
+    for (node, peer) in [("a", "b"), ("b", "a")] {
+        assert!(
+            calls.contains(&format!("{node}-fabric-id expose st3/fleet/"))
+                && calls.contains("--ephemeral"),
+            "{node} did not expose itself ephemerally:\n{calls}"
+        );
+        assert!(
+            calls.contains(&format!(
+                "{node}-fabric-id dial {peer}-fabric-id st3/fleet/"
+            )),
+            "{node} never dialed {peer} through Fabric:\n{calls}"
+        );
+    }
+    let inbox = registry.join("home-b/inbox");
+    assert!(
+        walkdir::WalkDir::new(&inbox)
+            .into_iter()
+            .flatten()
+            .all(|entry| !entry.file_type().is_file()),
+        "join left the code in the Fabric inbox"
+    );
+    let code_arguments = [&a, &b]
+        .iter()
+        .flat_map(|node| node.arguments.lock().unwrap().clone())
+        .flatten()
+        .chain(calls.split_whitespace().map(str::to_owned))
+        .filter(|argument| argument.starts_with("stj1-"))
+        .count();
+    assert_eq!(
+        code_arguments, 0,
+        "a join code appeared in an argument list"
+    );
+}
