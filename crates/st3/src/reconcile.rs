@@ -530,11 +530,12 @@ impl<R: RuntimeControl> Reconciler<R> {
 
     pub async fn run(self: Arc<Self>) {
         self.notify.notify_one();
-        let mut unchanged = false;
+        // When the last pass began, and whether it changed nothing.
+        let mut quiet_pass_started = None;
         loop {
             match self.next_reconcile_deadline() {
                 Ok(Some(deadline)) => {
-                    let delay = deadline_sleep_ms(deadline, now_ms(), unchanged);
+                    let delay = deadline_sleep_ms(deadline, now_ms(), quiet_pass_started);
                     tokio::select! {
                         _ = self.notify.notified() => {}
                         _ = tokio::time::sleep(Duration::from_millis(delay)) => {}
@@ -556,6 +557,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                 }
             }
             for pass in 0..64 {
+                let started = now_ms();
                 let before = self.store.index().ok();
                 if let Err(error) = self.reconcile_once() {
                     let _ = self.record_once(
@@ -572,7 +574,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                 self.event_notify
                     .send_modify(|generation| *generation = generation.saturating_add(1));
                 let changed = before != self.store.index().ok();
-                unchanged = !changed;
+                quiet_pass_started = (!changed).then_some(started);
                 if !changed {
                     break;
                 }
@@ -9542,8 +9544,12 @@ fn work_wake_deadline(
         .min()
 }
 
-fn deadline_sleep_ms(deadline: u128, now: u128, unchanged: bool) -> u64 {
-    if unchanged && deadline <= now {
+/// How long to sleep before the next pass. A deadline that was already due when the last pass
+/// began, and that pass changed nothing, cannot be acted on yet, so the loop backs off instead of
+/// spinning. A deadline that fell due during or after that pass has not been evaluated, so it
+/// runs at once: a mission timeout must not wait out the back-off.
+fn deadline_sleep_ms(deadline: u128, now: u128, quiet_pass_started: Option<u128>) -> u64 {
+    if quiet_pass_started.is_some_and(|started| deadline <= started) {
         WORK_WAKE_RETRY_MS as u64
     } else {
         deadline.saturating_sub(now).min(u128::from(u64::MAX)) as u64
@@ -20451,10 +20457,18 @@ mission "ios-proof-blocked" state="ready" {
     #[test]
     fn an_unchanged_pass_floors_a_past_wake_deadline() {
         assert_eq!(
-            deadline_sleep_ms(1_000, 2_000, true),
+            deadline_sleep_ms(1_000, 2_000, Some(1_500)),
             WORK_WAKE_RETRY_MS as u64
         );
-        assert_eq!(deadline_sleep_ms(3_000, 2_000, true), 1_000);
+        assert_eq!(deadline_sleep_ms(3_000, 2_000, Some(1_500)), 1_000);
+    }
+
+    /// A mission deadline that falls due while a quiet pass runs has not been evaluated, so the
+    /// next pass runs at once rather than after the back-off.
+    #[test]
+    fn a_deadline_that_falls_due_during_a_quiet_pass_runs_at_once() {
+        assert_eq!(deadline_sleep_ms(1_600, 2_000, Some(1_500)), 0);
+        assert_eq!(deadline_sleep_ms(1_600, 2_000, None), 0);
     }
 
     #[test]
