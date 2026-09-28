@@ -84,12 +84,13 @@ export type AgentRelationship = {
 
 export type Attention = ResourceHeader & {
   actions: Array<"attention.resolve" | "review.approve" | "review.reject" | "launch.approve" | "launch.cancel" | "mission.approve-revision" | "mission.cancel-revision" | "message.read">;
-  attention_kind: "human-gate" | "launch-approval" | "revision-approval" | "unread-message" | "fault";
+  attention_kind: "human-gate" | "launch-approval" | "revision-approval" | "unread-message" | "agent-request" | "fault";
   detail: string;
   kind: "attention";
   mission_id?: Id;
   mission_run_id?: Id;
   person_id: Id;
+  requester_id?: Id;
   priority: "critical" | "high" | "normal" | "low";
   requested_at: Timestamp;
   source_id: Id;

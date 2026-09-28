@@ -1522,6 +1522,8 @@ pub struct AttentionItemView {
     pub kind: String,
     pub subject: String,
     pub person: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requester_id: Option<String>,
     pub title: String,
     pub detail: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]

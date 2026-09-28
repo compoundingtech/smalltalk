@@ -1297,6 +1297,12 @@ Neither job has a path filter, so no change in this series can skip them. A unit
 and fails if a `paths` or `paths-ignore` key appears on the jobs' pull request triggers, or if the
 publish job stops needing `fleet-e2e`.
 
+As built, no macOS job runs on GitHub (#632, Nathan 2026-09-28: too slow and too expensive
+there). `fleet-compat` runs on `ubuntu-22.04` only, and `fleet_workflows_have_no_path_filter`
+fails if `fleet.yml` names a macOS runner. On macOS, the fleet suite runs in st's own CI
+(`st/ci-macos`, on the fleet's Mac), which runs `cargo test --workspace` and so skips the
+ignored compatibility test.
+
 **The compatibility baseline.** Until the `v0.3.0` release bundle exists, the old build is `st3`
 built with Nix at the commit pinned in `.github/fleet-compat-baseline.json`: `main` before fleet
 membership. The pin is its identity, and the job checks that the binary has no `st fleet`. Once
@@ -1412,7 +1418,10 @@ differences, found while building it or raised by intake reviews:
   keeps it (and every other fleet command that has the flag) away from service managers, which
   macOS does not isolate by `HOME`.
 - **The leave drain condition** is that a peer reports the same authority digest as this node,
-  checked before and after the leave claim. Leaving mode refuses every mutating route except
+  checked before and after the leave claim, or that a member refused this machine with a signed
+  `member-left` naming its key, as step 4 describes. A member that pulls the leave first stops
+  exchanging with the leaving machine, so only that refusal reaches it. Writing the leave again
+  returns the leave already written. Leaving mode refuses every mutating route except
   `/v1/internal/fleet/leave/*` and replication traffic (#612 intake finding).
 - **The join route has no request quota** (#611 intake finding).
 - **A signature by a key outside the writer's window** leaves an envelope `unsigned`, still

@@ -201,6 +201,14 @@ The GitHub issues endpoint also returns pull requests. The provider removes thos
 
 The delivery cites the discovery claim. A retry uses the same run. A capacity limit leaves the request pending.
 
+A request can name a mission revision, an owner run, or an input claim that has not reached this host
+yet. That request also stays pending, and it starts once replication delivers the claim. Meanwhile
+the subscription records a `reconcile.fault` naming the request and the cause.
+
+A request that lacks a field records `subscription.mission-failed`, and so does a request that
+cannot start for any other reason. A failing request never holds back the subscription's other
+requests or another subscription.
+
 A later observed field change creates one `resource.observed` claim. An unchanged observation creates no resource claim.
 
 A scheduled unchanged observation creates no durable observer claim. A manual refresh creates one `observer.observed` receipt for its exact attempt.
