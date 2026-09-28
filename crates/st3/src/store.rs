@@ -16048,13 +16048,13 @@ fn fleet_admission_hold(
                     |row| row.get::<_, String>(0),
                 )?
                 .collect::<Result<Vec<_>, _>>()?;
+            // A signature by any other key proves nothing, so it cannot fence the envelope:
+            // it waits, asking for its writer's signature, until one arrives. Only a sequence
+            // outside every window is fenced.
             if signers.iter().any(|signer| keys.contains(signer)) {
                 Ok(None)
-            } else if signers.is_empty() {
-                Ok(Some("unsigned"))
             } else {
-                // Signed, but by a key whose window does not hold this sequence.
-                Ok(Some("fenced"))
+                Ok(Some("unsigned"))
             }
         }
     }
@@ -17068,8 +17068,44 @@ mod fleet_admission_tests {
         sync(&unsigned_forger, &a);
         assert!(!admitted(&a, &unsigned));
         let status = a.replication_status(true, Some(FLEET), &[]).unwrap();
-        assert!(status.fenced_envelopes >= 1);
-        assert!(status.unsigned_envelopes >= 1);
+        assert!(status.unsigned_envelopes >= 2);
+    }
+
+    #[test]
+    fn a_wrong_key_signature_cannot_strand_an_envelope_its_writer_later_signs() {
+        let b_key = key();
+        let (_, a, stores) = fleet(&[("b", &b_key)]);
+        let b = &stores[0];
+        let genuine = note(b, "genuine");
+        // A relay holding its own key re-signs b's exact envelope and delivers it first.
+        let relay_key = key();
+        let mut exchange = b
+            .export_replication_exchange(FLEET, &a.replication_inventory().unwrap())
+            .unwrap();
+        for envelope in &mut exchange.envelopes {
+            envelope.member_key = Some(relay_key.public().into());
+            envelope.signature = Some(relay_key.sign(&envelope_signature_message(
+                FLEET,
+                &envelope.writer,
+                envelope.sequence,
+                &envelope.hash,
+            )));
+        }
+        exchange.peer = "relay".into();
+        a.receive_replication_exchange("relay", FLEET, &exchange)
+            .unwrap();
+        a.validate_replication_backlog().unwrap();
+        assert!(!admitted(&a, &genuine));
+        assert!(
+            !a.replication_signature_requests().unwrap().is_empty(),
+            "the envelope must keep asking for its writer's signature"
+        );
+        // The writer's signature, answered on request, admits it.
+        sync(b, &a);
+        assert!(admitted(&a, &genuine));
+        let status = a.replication_status(true, Some(FLEET), &[]).unwrap();
+        assert_eq!(status.unsigned_envelopes, 0);
+        assert_eq!(status.fenced_envelopes, 0);
     }
 
     #[test]
