@@ -49,6 +49,8 @@ enum Fetched {
     Timeline(String, Vec<TimelineEntry>),
     Messages(String, Vec<st3_client::Message>),
     Preview(String, Load<MissionPreview>),
+    /// The message behind an unread-message item: sender, title and text.
+    Body(String, String, Option<String>, String),
     Notice(String),
     /// A send finished: the pending token and st's message id, or why it failed.
     Sent(String, Result<Option<String>, String>),
@@ -75,6 +77,7 @@ pub fn run(context: Context) -> Result<()> {
     let mut requested: BTreeMap<String, Instant> = BTreeMap::new();
     let mut stale: HashSet<String> = HashSet::new();
     let mut preview_requested: HashSet<String> = HashSet::new();
+    let mut body_requested: HashSet<String> = HashSet::new();
     // Messages sent from here, shown at once until st reports them back.
     let mut pending: Vec<Pending> = Vec::new();
     // Conversations to refresh quickly because a reply is likely soon.
@@ -159,6 +162,9 @@ pub fn run(context: Context) -> Result<()> {
                 }
                 Fetched::Preview(id, preview) => {
                     extras.previews.insert(id, preview);
+                }
+                Fetched::Body(id, from, title, content) => {
+                    extras.bodies.insert(id, (from, title, content));
                 }
                 Fetched::Notice(notice) => ui.flash(notice),
                 Fetched::Failed(agent, error) => {
@@ -247,6 +253,31 @@ pub fn run(context: Context) -> Result<()> {
             });
         }
 
+        // An unread-message item names its message; load the message itself.
+        if tab == 0
+            && let Some(id) = selected.clone()
+            && !body_requested.contains(&id)
+            && let Some(item) = model
+                .attention()
+                .find(|item| item.header.id == id && item.attention_kind == "unread-message")
+        {
+            body_requested.insert(id.clone());
+            let client = client.clone();
+            let tx = fetched_tx.clone();
+            let source = item.source_id.clone();
+            runtime.spawn(async move {
+                if let Ok(found) = client.messages_get(&source).await
+                    && let Resource::Message(message) = found.value
+                {
+                    let _ = tx.send(Fetched::Body(
+                        id,
+                        message.from,
+                        message.title,
+                        message.content,
+                    ));
+                }
+            });
+        }
         for effect in std::mem::take(&mut ui.effects) {
             let token = match &effect {
                 Effect::Send { agent, text }
@@ -512,12 +543,7 @@ async fn perform(
                 .cloned()
                 .ok_or_else(|| anyhow::anyhow!("It has no run"))?;
             let generation = found.run_generations.get(&run).cloned();
-            let snapshot = model
-                .missions
-                .snapshot
-                .as_ref()
-                .map(|snapshot| snapshot.id.clone())
-                .ok_or_else(|| anyhow::anyhow!("Not connected yet"))?;
+            let snapshot = client.capabilities().await?.snapshot.id;
             let fence = Fence {
                 snapshot_id: snapshot,
                 mission_generation: generation,
@@ -573,44 +599,52 @@ async fn send_titled(
 
 async fn send_message(
     client: &Client,
-    model: &Model,
+    _model: &Model,
     to: &str,
     content: String,
     title: Option<String>,
     in_reply_to: Option<String>,
     session_id: Option<String>,
 ) -> Result<Option<String>> {
-    let snapshot = model
-        .messages
-        .snapshot
-        .as_ref()
-        .or(model.agents.snapshot.as_ref())
-        .map(|snapshot| snapshot.id.clone())
-        .ok_or_else(|| anyhow::anyhow!("Not connected yet"))?;
-    let fence = Fence {
-        snapshot_id: snapshot,
-        ..Fence::default()
-    };
-    let (id, idem) = crate::action_pair();
-    let result = client
-        .message_send(
-            id,
-            idem,
-            fence,
-            MessageSendParameters {
-                to: to.to_owned(),
-                content,
-                title,
-                in_reply_to,
-                session_id,
-                tags: vec![],
-            },
-        )
-        .await?;
-    // The new message's id, so the pending copy can give way to the real one.
-    Ok(result
-        .value
-        .affected_ids
-        .into_iter()
-        .find(|id| id.starts_with("message/")))
+    // A send only needs a current snapshot. Take a fresh one each time, and once more if the
+    // graph moves between reading it and sending: a stale fence is not the person's problem.
+    let mut last = None;
+    for _ in 0..2 {
+        let snapshot = client.capabilities().await?.snapshot.id;
+        let fence = Fence {
+            snapshot_id: snapshot,
+            ..Fence::default()
+        };
+        let (id, idem) = crate::action_pair();
+        match client
+            .message_send(
+                id,
+                idem,
+                fence,
+                MessageSendParameters {
+                    to: to.to_owned(),
+                    content: content.clone(),
+                    title: title.clone(),
+                    in_reply_to: in_reply_to.clone(),
+                    session_id: session_id.clone(),
+                    tags: vec![],
+                },
+            )
+            .await
+        {
+            Ok(result) => {
+                // The new message's id, so the pending copy can give way to the real one.
+                return Ok(result
+                    .value
+                    .affected_ids
+                    .into_iter()
+                    .find(|id| id.starts_with("message/")));
+            }
+            Err(error) if error.to_string().contains("StaleFence") => last = Some(error),
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Err(last
+        .map(Into::into)
+        .unwrap_or_else(|| anyhow::anyhow!("the graph kept changing; try again")))
 }

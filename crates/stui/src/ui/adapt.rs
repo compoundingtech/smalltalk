@@ -14,6 +14,8 @@ use std::collections::BTreeMap;
 pub struct Extras {
     pub conversations: BTreeMap<String, Load<Vec<Entry>>>,
     pub previews: BTreeMap<String, Load<MissionPreview>>,
+    /// Loaded messages behind unread-message items: sender, title, text.
+    pub bodies: BTreeMap<String, (String, Option<String>, String)>,
     pub live: bool,
     pub offline: Option<String>,
 }
@@ -137,13 +139,28 @@ fn attention(model: &Model, extras: &Extras) -> Vec<Attention> {
                 ),
                 "unread-message" => (
                     Tier::Later,
-                    AttentionKind::Message {
-                        from: item
-                            .detail
-                            .strip_prefix("Unread message from ")
-                            .map(|from| from.trim_end_matches('.').to_owned())
-                            .unwrap_or_else(|| item.source_id.clone()),
-                        body: item.title.clone(),
+                    match extras.bodies.get(&item.header.id) {
+                        Some((from, title, content)) => AttentionKind::Message {
+                            from: from.clone(),
+                            body: match title {
+                                Some(title) if !title.is_empty() => {
+                                    format!(
+                                        "**{}**\n\n{}",
+                                        clean_message_text(title),
+                                        clean_message_text(content)
+                                    )
+                                }
+                                _ => clean_message_text(content),
+                            },
+                        },
+                        None => AttentionKind::Message {
+                            from: item
+                                .detail
+                                .strip_prefix("Unread message from ")
+                                .map(|from| from.trim_end_matches('.').to_owned())
+                                .unwrap_or_else(|| item.source_id.clone()),
+                            body: "Loading the message…".into(),
+                        },
                     },
                 ),
                 _ => (
@@ -233,7 +250,19 @@ fn attention(model: &Model, extras: &Extras) -> Vec<Attention> {
                 related,
                 raised_by,
                 tier,
-                title: clean_message_text(&item.title),
+                title: extras
+                    .bodies
+                    .get(&item.header.id)
+                    .and_then(|(_, title, content)| {
+                        title.clone().filter(|title| !title.is_empty()).or_else(|| {
+                            content
+                                .lines()
+                                .find(|line| !line.trim().is_empty())
+                                .map(str::to_owned)
+                        })
+                    })
+                    .map(|title| clean_message_text(&title))
+                    .unwrap_or_else(|| clean_message_text(&item.title)),
                 waiting: step.map(|step| format!("step {step}")),
                 age: age(&item.requested_at),
                 mission,
