@@ -52,6 +52,8 @@ enum Fetched {
     /// The message behind an unread-message item: sender, title and text.
     Body(String, String, Option<String>, String),
     Notice(String),
+    /// An attach finished: the agent's name and the attachment, or why it failed.
+    Attached(String, Result<Box<crate::Attached>, String>),
     /// A send finished: the pending token and st's message id, or why it failed.
     Sent(String, Result<Option<String>, String>),
     Failed(String, String),
@@ -90,7 +92,14 @@ pub fn run(context: Context) -> Result<()> {
     terminal.hide_cursor()?;
     let started = Instant::now();
     let mut changed = true;
-    while !ui.quit {
+    let stopping = super::stop_flag()?;
+    let mut attached: Option<crate::Attached> = None;
+    // A closed terminal ends the loop: without this check a detached stui spins and keeps
+    // polling the daemon forever.
+    while !ui.quit
+        && !stopping.load(std::sync::atomic::Ordering::Relaxed)
+        && !crate::stdin_hung_up()
+    {
         ui.tick = (started.elapsed().as_millis() / 100) as u64;
         if ui
             .flash
@@ -167,6 +176,17 @@ pub fn run(context: Context) -> Result<()> {
                     extras.bodies.insert(id, (from, title, content));
                 }
                 Fetched::Notice(notice) => ui.flash(notice),
+                Fetched::Attached(name, result) => match result {
+                    Ok(current) => {
+                        ui.terminal = Some(super::TerminalView {
+                            title: format!("{name} · {}", current.screen.title),
+                            lines: screen_lines(&current.screen),
+                            ended: None,
+                        });
+                        attached = Some(*current);
+                    }
+                    Err(error) => ui.flash(format!("Could not open the terminal: {error}")),
+                },
                 Fetched::Failed(agent, error) => {
                     failed.insert(agent, error);
                 }
@@ -278,7 +298,121 @@ pub fn run(context: Context) -> Result<()> {
                 }
             });
         }
+        // A newer screen from the attached terminal, if any.
+        if let Some(current) = attached.as_mut()
+            && let Some(receiver) = current.updates.as_mut()
+            && receiver.has_changed().unwrap_or(false)
+        {
+            let update = receiver.borrow_and_update().clone();
+            match update {
+                Some(crate::TerminalUpdate::Screen(screen)) => {
+                    current.screen = *screen;
+                    if let Some(view) = ui.terminal.as_mut() {
+                        view.lines = screen_lines(&current.screen);
+                    }
+                }
+                Some(crate::TerminalUpdate::Ended(reason)) => {
+                    if let Some(view) = ui.terminal.as_mut() {
+                        view.ended = Some(reason);
+                    }
+                }
+                None => {}
+            }
+        }
+        let mut effects = Vec::new();
         for effect in std::mem::take(&mut ui.effects) {
+            match effect {
+                Effect::OpenTerminal { agent } => {
+                    // Never block the loop on the network: resolve and attach in the background.
+                    let known = model
+                        .runtimes()
+                        .find(|runtime| runtime.owner_id == agent && runtime.terminal_id.is_some())
+                        .map(|runtime| {
+                            (
+                                runtime.header.id.clone(),
+                                runtime.terminal_id.clone().unwrap_or_default(),
+                            )
+                        });
+                    let ids = model
+                        .agents()
+                        .find(|candidate| candidate.header.id == agent)
+                        .map(|candidate| candidate.runtime_ids.clone())
+                        .unwrap_or_default();
+                    let name = model
+                        .agents()
+                        .find(|candidate| candidate.header.id == agent)
+                        .map(crate::agent_label)
+                        .unwrap_or(agent);
+                    let client = client.clone();
+                    let tx = fetched_tx.clone();
+                    runtime.spawn(async move {
+                        let mut found = known;
+                        if found.is_none() {
+                            // The bounded runtime list may not include it; ask for it by id.
+                            for id in ids {
+                                if let Ok(envelope) = client.runtimes_get(&id).await
+                                    && let Resource::Runtime(current) = envelope.value
+                                    && let Some(terminal) = current.terminal_id.clone()
+                                {
+                                    found = Some((current.header.id.clone(), terminal));
+                                    break;
+                                }
+                            }
+                        }
+                        let result = match found {
+                            None => Err("that agent has no terminal right now".to_owned()),
+                            Some((runtime_id, terminal_id)) => {
+                                // Never wait silently: a terminal that sends no first screen is reported.
+                                match tokio::time::timeout(
+                                    Duration::from_secs(15),
+                                    crate::attach_terminal(&client, &runtime_id, &terminal_id),
+                                )
+                                .await
+                                {
+                                    Ok(result) => {
+                                        result.map(Box::new).map_err(|error| error.to_string())
+                                    }
+                                    Err(_) => Err(format!(
+                                        "{terminal_id} sent no screen within 15 seconds"
+                                    )),
+                                }
+                            }
+                        };
+                        let _ = tx.send(Fetched::Attached(name, result));
+                    });
+                }
+                Effect::CloseTerminal => {
+                    if let Some(current) = attached.take() {
+                        let client = client.clone();
+                        let tx = fetched_tx.clone();
+                        runtime.spawn(async move {
+                            if let Err(error) = crate::detach_terminal(&client, &current).await {
+                                let _ = tx.send(Fetched::Notice(format!("Detach failed: {error}")));
+                            }
+                        });
+                    }
+                    ui.terminal = None;
+                }
+                Effect::TerminalKey(key) => {
+                    if let Some(current) = &attached {
+                        let client = client.clone();
+                        let tx = fetched_tx.clone();
+                        let terminal = current.terminal_id.clone();
+                        let incarnation = current.screen.runtime_incarnation.clone();
+                        runtime.spawn(async move {
+                            if let Err(error) =
+                                crate::send_terminal_key(&client, &terminal, &incarnation, key)
+                                    .await
+                            {
+                                let _ = tx.send(Fetched::Notice(format!("Key not sent: {error}")));
+                            }
+                        });
+                    }
+                }
+                other => effects.push(other),
+            }
+        }
+        for effect in effects {
             let token = match &effect {
                 Effect::Send { agent, text }
                 | Effect::Discuss {
@@ -356,7 +490,39 @@ pub fn run(context: Context) -> Result<()> {
             }
         }
     }
+    // Leave no attachment behind.
+    if let Some(current) = attached.take() {
+        let _ = runtime.block_on(crate::detach_terminal(&client, &current));
+    }
     Ok(())
+}
+
+/// A terminal screen as styled lines, the way the old screens drew it.
+fn screen_lines(screen: &st3_client::TerminalScreen) -> Vec<ratatui::text::Line<'static>> {
+    use ratatui::text::{Line, Span};
+    screen
+        .lines
+        .iter()
+        .map(|line| {
+            if line.redacted {
+                Line::from("[redacted]")
+            } else if line.runs.is_empty() {
+                Line::from(super::text::sanitize(&line.text))
+            } else {
+                Line::from(
+                    line.runs
+                        .iter()
+                        .map(|run| {
+                            Span::styled(
+                                super::text::sanitize(&run.text),
+                                crate::terminal_run_style(run),
+                            )
+                        })
+                        .collect::<Vec<_>>(),
+                )
+            }
+        })
+        .collect()
 }
 
 /// The session whose transcript is this agent's conversation.
@@ -563,6 +729,62 @@ async fn perform(
                 )
                 .await?;
             Ok((format!("Cancelled {run}"), None))
+        }
+        Effect::CreateLaunch {
+            title,
+            request,
+            mission,
+            workspace,
+        } => {
+            let snapshot = client.capabilities().await?.snapshot.id;
+            let (id, idem) = crate::action_pair();
+            client
+                .launch_create(
+                    id,
+                    idem,
+                    Fence {
+                        snapshot_id: snapshot,
+                        ..Fence::default()
+                    },
+                    st3_client::LaunchCreateParameters {
+                        title,
+                        request,
+                        target: st3_client::LaunchTarget::NewMission {
+                            mission_id: mission,
+                            workspace,
+                        },
+                        provider: None,
+                        model: None,
+                        effort: None,
+                    },
+                )
+                .await?;
+            Ok((
+                "Launch created; the planner's proposal will appear on Home".into(),
+                None,
+            ))
+        }
+        Effect::RevokeDevice { id } => {
+            let snapshot = client.capabilities().await?.snapshot.id;
+            let (action, idem) = crate::action_pair();
+            client
+                .pairing_revoke(
+                    action,
+                    idem,
+                    Fence {
+                        snapshot_id: snapshot,
+                        ..Fence::default()
+                    },
+                    st3_client::TargetParameters {
+                        target_id: id,
+                        ..Default::default()
+                    },
+                )
+                .await?;
+            Ok(("Device revoked".into(), None))
+        }
+        Effect::OpenTerminal { .. } | Effect::TerminalKey(_) | Effect::CloseTerminal => {
+            Ok((String::new(), None))
         }
         Effect::Send { agent, text } => {
             let session = model

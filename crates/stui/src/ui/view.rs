@@ -47,6 +47,8 @@ pub struct World {
     pub missions: Load<Vec<Mission>>,
     pub machines: Load<Vec<Machine>>,
     pub worktrees: Load<Vec<Worktree>>,
+    /// The person's paired devices.
+    pub devices: Load<Vec<Device>>,
     pub conversations: BTreeMap<String, Load<Vec<Entry>>>,
     /// Missions nobody needs the person for, counted so Home can say what it is not showing.
     pub quiet_missions: usize,
@@ -230,6 +232,8 @@ pub struct Agent {
     pub unmanaged: bool,
     pub parent: Option<String>,
     pub details: AgentDetails,
+    /// A live terminal the person can open.
+    pub terminal: bool,
 }
 
 /// What the details pane shows about an agent. Every field is optional: st may not say.
@@ -384,6 +388,15 @@ pub struct Worktree {
     pub dirty: u32,
     pub agents: Vec<String>,
     pub missions: Vec<String>,
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct Device {
+    pub id: String,
+    pub name: String,
+    pub state: String,
+    pub scopes: Vec<String>,
+    pub expires: String,
 }
 
 // -------------------------------------------------------------- conversations

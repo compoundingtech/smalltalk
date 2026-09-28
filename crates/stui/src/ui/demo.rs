@@ -71,6 +71,22 @@ pub fn world() -> World {
         missions: Load::Ready(missions()),
         machines: Load::Ready(machines()),
         worktrees: Load::Ready(worktrees()),
+        devices: Load::Ready(vec![
+            Device {
+                id: s("device/phone"),
+                name: s("Robin's phone"),
+                state: s("active"),
+                scopes: vec![s("full control")],
+                expires: s("in 83 days"),
+            },
+            Device {
+                id: s("device/tablet"),
+                name: s("Old tablet"),
+                state: s("active"),
+                scopes: vec![s("read"), s("attention")],
+                expires: s("in 4 days"),
+            },
+        ]),
         conversations,
         quiet_missions: 6,
     }
@@ -87,6 +103,7 @@ pub fn loading() -> World {
         missions: Load::Loading,
         machines: Load::Loading,
         worktrees: Load::Loading,
+        devices: Load::Loading,
         conversations: BTreeMap::new(),
         quiet_missions: 0,
     }
@@ -310,6 +327,7 @@ fn agent(
         unmanaged: false,
         parent: None,
         details: AgentDetails::default(),
+        terminal: !matches!(state, AgentState::Stopped),
     }
 }
 
@@ -420,6 +438,7 @@ fn agents() -> Vec<Agent> {
         unmanaged: true,
         parent: None,
         details: AgentDetails::default(),
+        terminal: false,
     });
     let detail =
         |goal: &str, claimed: &str, next: Option<&str>, queue: &[&str], state: &str| AgentDetails {
@@ -1222,4 +1241,45 @@ pub fn late_mail() -> Entry {
             ),
         },
     )
+}
+
+/// An invented terminal screen for the demo: what opening an agent's terminal looks like.
+pub fn terminal(name: &str) -> Vec<ratatui::text::Line<'static>> {
+    use ratatui::style::{Color, Modifier, Style};
+    use ratatui::text::{Line, Span};
+    let dim = Style::default().fg(Color::Rgb(0x6c, 0x70, 0x86));
+    let accent = Style::default()
+        .fg(Color::Rgb(0xfa, 0xb3, 0x87))
+        .add_modifier(Modifier::BOLD);
+    vec![
+        Line::from(Span::styled(
+            format!("╭─ {name} ─────────────────────────────────────────╮"),
+            dim,
+        )),
+        Line::from(vec![
+            Span::styled("│ ", dim),
+            Span::styled("✻ Working on the cut-over review", accent),
+        ]),
+        Line::from(Span::styled("│", dim)),
+        Line::from(Span::styled(
+            "│ ⏺ Read(docs/compare-report.md)",
+            Style::default(),
+        )),
+        Line::from(Span::styled("│   ⎿ 42 lines", dim)),
+        Line::from(Span::styled(
+            "│ ⏺ Waiting for a person to approve the cut-over.",
+            Style::default(),
+        )),
+        Line::from(Span::styled(
+            "╰────────────────────────────────────────────────────╯",
+            dim,
+        )),
+        Line::default(),
+        Line::from(vec![Span::styled("> ", accent), Span::raw("█")]),
+        Line::default(),
+        Line::from(Span::styled(
+            "  demo: this screen is invented and keys are not sent",
+            dim,
+        )),
+    ]
 }

@@ -75,6 +75,21 @@ pub fn world(model: &Model, person: &str, extras: &Extras) -> World {
         ),
         machines: loaded(model.machines.snapshot.is_some(), machines(model)),
         worktrees: Load::Ready(super::demo::world().worktrees.items().to_vec()),
+        devices: loaded(
+            model.devices.snapshot.is_some(),
+            model
+                .devices()
+                .map(|device| Device {
+                    id: device.header.id.clone(),
+                    name: device.name.clone().unwrap_or_else(|| {
+                        device.header.id.trim_start_matches("device/").to_owned()
+                    }),
+                    state: device.state.clone(),
+                    scopes: device.scopes.clone(),
+                    expires: device.expires_at.clone(),
+                })
+                .collect(),
+        ),
         conversations: extras.conversations.clone(),
         quiet_missions: quiet,
     }
@@ -411,6 +426,12 @@ fn agents(model: &Model) -> Vec<Agent> {
                 step: work.map(|work| work.path.clone()),
                 activity: age(&agent.header.updated_at),
                 unmanaged: false,
+                // The runtime list is bounded, so an agent's runtime may be missing from it;
+                // a running agent with a runtime is worth trying, and opening fetches it by id.
+                terminal: model.runtimes().any(|runtime| {
+                    runtime.owner_id == agent.header.id && runtime.terminal_id.is_some()
+                }) || (!agent.runtime_ids.is_empty()
+                    && !matches!(agent.state.as_str(), "stopped" | "failed")),
                 parent: agent
                     .under
                     .first()
@@ -476,6 +497,7 @@ fn agents(model: &Model) -> Vec<Agent> {
             unmanaged: true,
             parent: None,
             details: AgentDetails::default(),
+            terminal: false,
         }
     }));
     agents

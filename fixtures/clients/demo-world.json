@@ -25,6 +25,7 @@
         "parent": null,
         "state": "needs_you",
         "step": "cut-over",
+        "terminal": true,
         "unmanaged": false,
         "worktree": "~/src/atlas--store-move"
       },
@@ -49,6 +50,7 @@
         "parent": null,
         "state": "needs_you",
         "step": "draft",
+        "terminal": true,
         "unmanaged": false,
         "worktree": "~/src/site--pricing"
       },
@@ -73,6 +75,7 @@
         "parent": null,
         "state": "fault",
         "step": "tag",
+        "terminal": true,
         "unmanaged": false,
         "worktree": "~/src/atlas"
       },
@@ -99,6 +102,7 @@
         "parent": null,
         "state": "working",
         "step": null,
+        "terminal": true,
         "unmanaged": false,
         "worktree": null
       },
@@ -123,6 +127,7 @@
         "parent": "agent/fleet/cos",
         "state": "working",
         "step": "review",
+        "terminal": true,
         "unmanaged": false,
         "worktree": "~/src/harbor--review-218"
       },
@@ -147,6 +152,7 @@
         "parent": null,
         "state": "idle",
         "step": "rotate",
+        "terminal": true,
         "unmanaged": false,
         "worktree": "~/src/harbor"
       },
@@ -171,6 +177,7 @@
         "parent": null,
         "state": "idle",
         "step": null,
+        "terminal": true,
         "unmanaged": false,
         "worktree": "~/src/sketches"
       },
@@ -195,6 +202,7 @@
         "parent": null,
         "state": "stopped",
         "step": null,
+        "terminal": false,
         "unmanaged": false,
         "worktree": null
       },
@@ -219,6 +227,7 @@
         "parent": null,
         "state": "needs_you",
         "step": null,
+        "terminal": true,
         "unmanaged": false,
         "worktree": null
       },
@@ -243,6 +252,7 @@
         "parent": null,
         "state": "unknown",
         "step": null,
+        "terminal": false,
         "unmanaged": true,
         "worktree": "~/src/scratch"
       }
@@ -925,6 +935,30 @@
       "state": "failed",
       "value": "This codex process was found running on lark, but st cannot tell which session file it writes, so there is no conversation to show. Start it through st to see it here."
     }
+  },
+  "devices": {
+    "state": "ready",
+    "value": [
+      {
+        "expires": "in 83 days",
+        "id": "device/phone",
+        "name": "Robin's phone",
+        "scopes": [
+          "full control"
+        ],
+        "state": "active"
+      },
+      {
+        "expires": "in 4 days",
+        "id": "device/tablet",
+        "name": "Old tablet",
+        "scopes": [
+          "read",
+          "attention"
+        ],
+        "state": "active"
+      }
+    ]
   },
   "host": "lark",
   "link": "live",
