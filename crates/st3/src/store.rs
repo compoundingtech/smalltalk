@@ -25941,7 +25941,12 @@ version 2
         let mut connection = store.connection.lock().unwrap();
         let transaction = connection.transaction().unwrap();
         for (kind, fields) in (0..20)
-            .map(|sequence| ("harness.observed", json!({"state": "working", "observed_at_ms": sequence})))
+            .map(|sequence| {
+                (
+                    "harness.observed",
+                    json!({"state": "working", "observed_at_ms": sequence}),
+                )
+            })
             .chain([(
                 "harness.diagnostic",
                 json!({"code": "provider-capacity", "status": "waiting"}),
