@@ -462,3 +462,33 @@ async fn a_cli_command_waits_out_a_daemon_restart() {
     );
     let _: Value = serde_json::from_slice(&output.stdout).unwrap();
 }
+
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_agent_in_a_network_sandbox_can_reach_its_local_runtime() {
+    if Command::new("bwrap").arg("--version").output().is_err() {
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let mut daemon = Daemon::new(root.path());
+    daemon.start().await;
+    let socket = daemon.socket.clone();
+    let output = tokio::task::spawn_blocking(move || {
+        Command::new("bwrap")
+            .args(["--ro-bind", "/", "/", "--dev-bind", "/dev", "/dev", "--proc", "/proc", "--unshare-net", "--"])
+            .arg(assert_cmd::cargo::cargo_bin!("st3"))
+            .arg("--endpoint")
+            .arg(socket)
+            .args(["--json", "machines", "--limit", "1"])
+            .output()
+            .unwrap()
+    })
+    .await
+    .unwrap();
+    assert!(
+        output.status.success(),
+        "sandboxed runtime request failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let _: Value = serde_json::from_slice(&output.stdout).unwrap();
+}
