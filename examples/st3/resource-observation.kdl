@@ -4,8 +4,8 @@ version 2
 // are `status` (`ready`, `missing`, or `unreadable`), `path`, `content_hash`, `size`, and `mode`,
 // never the content.
 //
-//   st3 missions publish examples/st3/resource-observation.kdl --as person/operator
-//   st3 missions start example/config-check --id example/config-check/1 \
+//   st missions publish examples/st3/resource-observation.kdl --as person/operator
+//   st missions start example/config-check --id example/config-check/1 \
 //     --workspace /srv/example/app --as person/operator
 
 resource "example/config" { kind "filesystem.file" }

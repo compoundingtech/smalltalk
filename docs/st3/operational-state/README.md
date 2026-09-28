@@ -1,4 +1,4 @@
-# st3 operational-state contract
+# st operational-state contract
 
 Status: contract and red-fixture baseline. This document defines selection semantics; it does not
 implement them.
@@ -150,9 +150,9 @@ because they exist. Commands with the same why are merged; legacy aliases are re
 
 Two CLI reproductions are release-blocking:
 
-- `st3 agents ls --status running --enrich` and its JSON form must select the same enriched running
+- `st agents ls --status running --enrich` and its JSON form must select the same enriched running
   agents. Enrichment cannot run after a destructive filter that makes valid rows disappear.
-- A short ID printed by `st3 conversations send` must be accepted unchanged by
+- A short ID printed by `st conversations send` must be accepted unchanged by
   `--in-reply-to`. If the canonical value is `message/ID`, both display and parser use it; callers
   never repair an identifier manually.
 
@@ -160,13 +160,13 @@ Compact list, detail, human tree, and JSON are renderers of typed models, not in
 
 ## Doctor and operational repair
 
-`st3 doctor` is read-only. Its `operational-repair` check computes the same bounded plan returned by
-`GET /v1/repair` and points to `st3 repair dry-run` when contradictions exist. A plan uses
+`st doctor` is read-only. Its `operational-repair` check computes the same bounded plan returned by
+`GET /v1/repair` and points to `st repair dry-run` when contradictions exist. A plan uses
 `st3.operational-repair.v0`, lists the exact affected subjects and reasons, and carries an
 `orpv0:<sha256>` token over the canonically ordered repair items. Snapshot index is diagnostic and
 is not part of the token.
 
-`st3 repair apply TOKEN` applies only that exact recomputed plan. A changed plan fails with
+`st repair apply TOKEN` applies only that exact recomputed plan. A changed plan fails with
 `stale-repair-plan`; callers must inspect a new dry-run. Registered classes are terminal
 descendants, orphaned readiness, expired claims, superseded attention, contradicted wake failures,
 and impossible run/generation state. Apply appends normal graph transition claims and one
