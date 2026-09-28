@@ -21,6 +21,8 @@ pub enum Hit {
     Composer,
     Help,
     Open(String),
+    /// Show a popover card for a graph subject.
+    Peek(String),
 }
 
 #[derive(Clone, Debug)]

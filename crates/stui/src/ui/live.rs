@@ -378,6 +378,17 @@ async fn perform(client: &Client, person: &str, model: &Model, effect: Effect) -
             .await?;
             Ok("Reply sent".into())
         }
+        Effect::Discuss { to, title, text } => {
+            let (to, session) = (
+                to.clone(),
+                model
+                    .agents()
+                    .find(|candidate| candidate.header.id == to)
+                    .and_then(|agent| agent.current_session_id.clone()),
+            );
+            send_titled(client, model, &to, text, Some(title), session).await?;
+            Ok("Sent; the reply will show here and in their conversation".into())
+        }
         Effect::Send { agent, text } => {
             let session = model
                 .agents()
@@ -394,6 +405,29 @@ async fn send(
     model: &Model,
     to: &str,
     content: String,
+    in_reply_to: Option<String>,
+    session_id: Option<String>,
+) -> Result<()> {
+    send_message(client, model, to, content, None, in_reply_to, session_id).await
+}
+
+async fn send_titled(
+    client: &Client,
+    model: &Model,
+    to: &str,
+    content: String,
+    title: Option<String>,
+    session_id: Option<String>,
+) -> Result<()> {
+    send_message(client, model, to, content, title, None, session_id).await
+}
+
+async fn send_message(
+    client: &Client,
+    model: &Model,
+    to: &str,
+    content: String,
+    title: Option<String>,
     in_reply_to: Option<String>,
     session_id: Option<String>,
 ) -> Result<()> {
@@ -417,7 +451,7 @@ async fn send(
             MessageSendParameters {
                 to: to.to_owned(),
                 content,
-                title: None,
+                title,
                 in_reply_to,
                 session_id,
                 tags: vec![],

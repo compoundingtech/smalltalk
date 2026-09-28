@@ -146,10 +146,15 @@ fn legend(entries: &[(&str, Color, &str)]) -> Vec<Line<'static>> {
 
 // --------------------------------------------------------------------- home
 
-pub fn home_list(world: &World, _spinner: &'static str) -> Listing {
+pub fn home_list(world: &World, snoozed: &std::collections::HashSet<String>) -> Listing {
     let mut items = Vec::new();
     let mut ids = Vec::new();
-    let mut attention = world.attention.items().iter().collect::<Vec<_>>();
+    let mut attention = world
+        .attention
+        .items()
+        .iter()
+        .filter(|item| !snoozed.contains(&item.id))
+        .collect::<Vec<_>>();
     attention.sort_by_key(|item| item.tier);
     let mut current = None;
     for item in attention {
@@ -189,6 +194,18 @@ pub fn home_list(world: &World, _spinner: &'static str) -> Listing {
         });
         ids.push(item.id.clone());
     }
+    let later = world
+        .attention
+        .items()
+        .iter()
+        .filter(|item| snoozed.contains(&item.id))
+        .count();
+    if later > 0 {
+        items.push(Item::Note(Line::from(span(
+            format!(" {later} put off until later · demo, this machine only"),
+            theme::dim(),
+        ))));
+    }
     if world.attention.ready().is_some() && world.quiet_missions > 0 {
         items.push(Item::Note(Line::from(span(
             format!(
@@ -218,6 +235,32 @@ pub struct Drafts<'a> {
     pub text: Option<&'a str>,
     pub editing: bool,
     pub confirm: Option<char>,
+    /// "Chat about this": who it goes to, the draft, and the thread so far.
+    pub chat: Option<Chat<'a>>,
+}
+
+pub struct Chat<'a> {
+    pub to: String,
+    pub text: &'a str,
+    pub editing: bool,
+    pub thread: Vec<Line<'static>>,
+}
+
+/// A clickable reference to a graph subject; clicking it opens a popover.
+pub fn link(doc: &mut Doc, prefix: &str, label: &str, subject: &str) {
+    doc.targets.push(super::doc::Target {
+        line: doc.lines.len(),
+        column: text::width(prefix) as u16,
+        width: text::width(label) as u16,
+        hit: Hit::Peek(subject.to_owned()),
+    });
+    doc.line(Line::from(vec![
+        span(prefix.to_owned(), theme::dim()),
+        span(
+            label.to_owned(),
+            theme::fg(theme::BLUE).add_modifier(Modifier::UNDERLINED),
+        ),
+    ]));
 }
 
 fn text_box(doc: &mut Doc, title: &str, drafts: &Drafts<'_>, placeholder: &str, width: usize) {
@@ -324,14 +367,24 @@ pub fn home_detail(world: &World, id: Option<&str>, width: usize, drafts: &Draft
     meta.push(span(format!("{} ago", item.age), theme::dim()));
     card.line(Line::from(meta));
     if let Some(mission) = &item.mission {
-        let label = format!("↗ {mission}");
-        card.targets.push(super::doc::Target {
-            line: card.lines.len(),
-            column: 0,
-            width: text::width(&label) as u16,
-            hit: Hit::Open(mission.clone()),
-        });
-        card.line(Line::from(span(label, theme::fg(theme::BLUE))));
+        let label = world
+            .missions
+            .items()
+            .iter()
+            .find(|candidate| &candidate.id == mission)
+            .map(|candidate| candidate.title.clone())
+            .unwrap_or_else(|| mission.trim_start_matches("mission/").to_owned());
+        link(&mut card, "mission  ", &label, mission);
+    }
+    if let Some(agent) = &item.agent {
+        let label = world
+            .agents
+            .items()
+            .iter()
+            .find(|candidate| &candidate.id == agent)
+            .map(|candidate| candidate.name.clone())
+            .unwrap_or_else(|| agent.trim_start_matches("agent/").to_owned());
+        link(&mut card, "agent    ", &label, agent);
     }
     card.blank();
     match &item.kind {
@@ -550,7 +603,19 @@ pub fn home_detail(world: &World, id: Option<&str>, width: usize, drafts: &Draft
                 ));
             }
             card.blank();
-            if !confirm_row(
+            if drafts.editing || drafts.text.is_some_and(|text| !text.is_empty()) {
+                text_box(
+                    &mut card,
+                    "what should change · the proposing agent reads this",
+                    drafts,
+                    "",
+                    inner,
+                );
+                card.buttons(&[
+                    ("enter", "Ask for these changes", Hit::Enter, theme::YELLOW),
+                    ("esc", "Cancel", Hit::Escape, theme::OVERLAY1),
+                ]);
+            } else if !confirm_row(
                 &mut card,
                 drafts,
                 if drafts.confirm == Some('a') {
@@ -561,6 +626,7 @@ pub fn home_detail(world: &World, id: Option<&str>, width: usize, drafts: &Draft
             ) {
                 card.buttons(&[
                     ("a", "Approve revision", Hit::Key('a'), theme::GREEN),
+                    ("c", "Ask for changes", Hit::Key('c'), theme::YELLOW),
                     ("j", "Reject", Hit::Key('j'), theme::RED),
                 ]);
             }
@@ -583,10 +649,7 @@ pub fn home_detail(world: &World, id: Option<&str>, width: usize, drafts: &Draft
             }
             card.blank();
             if !confirm_row(&mut card, drafts, "Mark this fault resolved") {
-                card.buttons(&[
-                    ("r", "Mark resolved", Hit::Key('r'), theme::GREEN),
-                    ("g", "Open the agent", Hit::Key('g'), theme::ACCENT),
-                ]);
+                card.buttons(&[("r", "Mark resolved", Hit::Key('r'), theme::GREEN)]);
             }
         }
         AttentionKind::Message { from, body } => {
@@ -607,9 +670,67 @@ pub fn home_detail(world: &World, id: Option<&str>, width: usize, drafts: &Draft
                 card.buttons(&[
                     ("c", "Reply", Hit::Key('c'), theme::ACCENT),
                     ("m", "Mark read", Hit::Key('m'), theme::GREEN),
+                    (
+                        "l",
+                        "Remind me later · demo",
+                        Hit::Key('l'),
+                        theme::OVERLAY1,
+                    ),
                 ]);
             }
         }
+    }
+    card.blank();
+    // Every item: talk to whoever can act on it, or go to what it is about.
+    if let Some(chat) = &drafts.chat {
+        card.section(&format!("chat with {} about this", chat.to), None, inner);
+        if chat.thread.is_empty() {
+            card.wrap(
+                &[run(
+                    format!(
+                        "{} gets this item as context: its title, mission and question.",
+                        chat.to
+                    ),
+                    theme::dim(),
+                )],
+                inner,
+            );
+        } else {
+            card.lines(chat.thread.iter().cloned());
+        }
+        card.blank();
+        let box_drafts = Drafts {
+            text: Some(chat.text),
+            editing: chat.editing,
+            confirm: None,
+            chat: None,
+        };
+        text_box(
+            &mut card,
+            &format!("message {}", chat.to),
+            &box_drafts,
+            "",
+            inner,
+        );
+        card.buttons(&[
+            ("enter", "Send", Hit::Enter, theme::ACCENT),
+            ("esc", "Close chat", Hit::Escape, theme::OVERLAY1),
+        ]);
+    } else if !drafts.editing && drafts.confirm.is_none() {
+        let mut buttons = vec![("t", "Chat about this", Hit::Key('t'), theme::SAPPHIRE)];
+        if item.mission.is_some() || item.agent.is_some() {
+            buttons.push((
+                "g",
+                if item.mission.is_some() {
+                    "Go to the mission"
+                } else {
+                    "Go to the agent"
+                },
+                Hit::Key('g'),
+                theme::OVERLAY1,
+            ));
+        }
+        card.buttons(&buttons);
     }
     card.blank();
     let title = format!("{} · waiting {}", item.kind.word(), item.age);
@@ -787,16 +908,20 @@ pub fn agent_header(world: &World, agent: &Agent, width: usize, spinner: &'stati
     }
     doc.line(Line::from(second));
     if let (Some(mission), Some(step)) = (&agent.mission, &agent.step) {
-        let label = format!("   ↗ {mission} › {step}");
-        doc.targets.push(super::doc::Target {
-            line: 2,
-            column: 0,
-            width: text::width(&label) as u16,
-            hit: Hit::Open(format!("mission/fleet/{mission}")),
-        });
-        doc.line(Line::from(span(label, theme::fg(theme::BLUE))));
+        let title = world
+            .missions
+            .items()
+            .iter()
+            .find(|candidate| &candidate.id == mission)
+            .map(|candidate| candidate.title.clone())
+            .unwrap_or_else(|| mission.trim_start_matches("mission/").to_owned());
+        link(
+            &mut doc,
+            "   mission ",
+            &format!("{title} › {step}"),
+            mission,
+        );
     }
-    let _ = world;
     doc
 }
 
@@ -1052,7 +1177,7 @@ pub fn mission_detail(world: &World, id: Option<&str>, width: usize, spinner: &'
                 line: agents.lines.len(),
                 column: 0,
                 width: text::width(&label) as u16,
-                hit: Hit::Open(agent.id.clone()),
+                hit: Hit::Peek(agent.id.clone()),
             });
             agents.line(Line::from(vec![
                 span(label, theme::fg(color)),
@@ -1194,7 +1319,7 @@ pub fn fleet_detail(world: &World, id: Option<&str>, width: usize, spinner: &'st
             line: agents.lines.len(),
             column: 0,
             width: text::width(&label) as u16,
-            hit: Hit::Open(agent.id.clone()),
+            hit: Hit::Peek(agent.id.clone()),
         });
         agents.line(Line::from(vec![
             span(label, theme::fg(color)),
@@ -1323,7 +1448,7 @@ pub fn worktree_detail(
                 line: agents.lines.len(),
                 column: 0,
                 width: text::width(&label) as u16,
-                hit: Hit::Open(agent.id.clone()),
+                hit: Hit::Peek(agent.id.clone()),
             });
             agents.line(Line::from(vec![
                 span(label, theme::fg(color)),
@@ -1349,7 +1474,7 @@ pub fn worktree_detail(
                 line: missions.lines.len(),
                 column: 0,
                 width: text::width(&label) as u16,
-                hit: Hit::Open(mission.id.clone()),
+                hit: Hit::Peek(mission.id.clone()),
             });
             missions.line(Line::from(vec![
                 span(label, theme::fg(color)),
@@ -1389,4 +1514,140 @@ fn demo_banner(doc: &mut Doc, width: usize) {
         None,
     ));
     doc.blank();
+}
+
+// ------------------------------------------------------------------ popovers
+
+/// The small card a clicked reference opens: enough to recognise the subject, and a way
+/// to go to it.
+pub fn peek(world: &World, subject: &str, width: usize, spinner: &'static str) -> Doc {
+    let mut doc = Doc::new();
+    doc.blank();
+    if let Some(agent) = world
+        .agents
+        .items()
+        .iter()
+        .find(|agent| agent.id == subject)
+    {
+        let (glyph, color) = agent_glyph(agent.state, spinner);
+        doc.line(Line::from(vec![
+            span(format!("{glyph} "), theme::strong(color)),
+            span(agent.name.clone(), theme::bold()),
+            span(format!("  {}", agent_word(agent.state)), theme::fg(color)),
+        ]));
+        doc.line(Line::from(span(agent.id.clone(), theme::dim())));
+        doc.blank();
+        doc.field(
+            "harness",
+            agent.harness.name(),
+            width,
+            theme::fg(harness_color(agent.harness)),
+        );
+        doc.field("host", &agent.host, width, theme::soft());
+        if let Some(tree) = &agent.worktree {
+            doc.field("worktree", tree, width, theme::soft());
+        }
+        if let (Some(mission), Some(step)) = (&agent.mission, &agent.step) {
+            let title = world
+                .missions
+                .items()
+                .iter()
+                .find(|candidate| &candidate.id == mission)
+                .map(|candidate| candidate.title.clone())
+                .unwrap_or_else(|| mission.trim_start_matches("mission/").to_owned());
+            doc.field("doing", &format!("{title} › {step}"), width, theme::text());
+        }
+        doc.field(
+            "last seen",
+            &format!("{} ago", agent.activity),
+            width,
+            theme::soft(),
+        );
+        doc.blank();
+        if agent.unmanaged {
+            doc.buttons(&[("g", "Go to agent", Hit::Key('g'), theme::ACCENT)]);
+        } else {
+            doc.buttons(&[
+                ("g", "Go to agent", Hit::Key('g'), theme::ACCENT),
+                ("t", "Message", Hit::Key('t'), theme::SAPPHIRE),
+            ]);
+        }
+    } else if let Some(mission) = world
+        .missions
+        .items()
+        .iter()
+        .find(|mission| mission.id == subject)
+    {
+        let (glyph, color) = word_style(mission.word, spinner);
+        doc.line(Line::from(vec![
+            span(format!("{glyph} "), theme::strong(color)),
+            span(mission.title.clone(), theme::bold()),
+            span(format!("  {}", mission.word.name()), theme::fg(color)),
+        ]));
+        doc.line(Line::from(span(mission.id.clone(), theme::dim())));
+        doc.line(Line::from(span(mission.word.explain(), theme::fg(color))));
+        doc.blank();
+        let (done, total) = mission.progress();
+        doc.field(
+            "steps",
+            &format!("{done} of {total} done"),
+            width,
+            theme::soft(),
+        );
+        for step in mission
+            .steps
+            .iter()
+            .filter(|step| !matches!(step.state, StepState::Done | StepState::Pending))
+            .take(3)
+        {
+            let (glyph, color, word) = step_style(step.state, spinner);
+            doc.line(Line::from(vec![
+                span(format!("          {glyph} "), theme::fg(color)),
+                span(format!("{} ", step.name), theme::text()),
+                span(word, theme::fg(color)),
+                span(
+                    format!("  {}", step.owner.as_deref().unwrap_or("nobody")),
+                    theme::dim(),
+                ),
+            ]));
+        }
+        let names = mission
+            .agents
+            .iter()
+            .filter_map(|id| world.agents.items().iter().find(|agent| &agent.id == id))
+            .map(|agent| agent.name.clone())
+            .collect::<Vec<_>>();
+        if !names.is_empty() {
+            doc.field("agents", &names.join(", "), width, theme::soft());
+        }
+        doc.blank();
+        doc.buttons(&[("g", "Go to mission", Hit::Key('g'), theme::ACCENT)]);
+    } else if let Some(item) = world
+        .attention
+        .items()
+        .iter()
+        .find(|item| item.id == subject)
+    {
+        let (glyph, color) = attention_style(&item.kind);
+        doc.line(Line::from(vec![
+            span(format!("{glyph} {} ", item.kind.word()), theme::fg(color)),
+            span(item.title.clone(), theme::bold()),
+        ]));
+        doc.line(Line::from(span(
+            format!("waiting {}", item.age),
+            theme::dim(),
+        )));
+        doc.blank();
+        doc.buttons(&[("g", "Open on Home", Hit::Key('g'), theme::PERSON)]);
+    } else {
+        doc.wrap(
+            &[run(
+                format!("{subject} is not in the current view."),
+                theme::dim(),
+            )],
+            width,
+        );
+    }
+    doc.blank();
+    doc
 }

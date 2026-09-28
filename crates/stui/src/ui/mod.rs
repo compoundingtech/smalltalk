@@ -114,6 +114,21 @@ pub enum Effect {
         agent: String,
         text: String,
     },
+    /// "Chat about this": a new message to `to`, titled after the item, with its context.
+    Discuss {
+        to: String,
+        title: String,
+        text: String,
+    },
+}
+
+/// An open "chat about this" on a Home item.
+#[derive(Clone, Debug)]
+struct ChatState {
+    item: String,
+    to: String,
+    to_name: String,
+    editing: bool,
 }
 
 pub struct Ui {
@@ -140,6 +155,10 @@ pub struct Ui {
     /// Live: actions become `effects` for the live loop instead of demo edits.
     live: bool,
     effects: Vec<Effect>,
+    popover: Option<String>,
+    chat: Option<ChatState>,
+    /// Home items put off until later. Demo only: kept in memory on this machine.
+    snoozed: HashSet<String>,
 }
 
 impl Ui {
@@ -167,6 +186,9 @@ impl Ui {
             quit: false,
             live: false,
             effects: Vec::new(),
+            popover: None,
+            chat: None,
+            snoozed: HashSet::new(),
         }
     }
 
@@ -201,7 +223,7 @@ impl Ui {
 
     fn listing(&self, width: usize) -> Listing {
         match self.tab {
-            0 => screens::home_list(&self.world, self.spinner()),
+            0 => screens::home_list(&self.world, &self.snoozed),
             1 => screens::agents_list(&self.world, self.spinner(), width),
             2 => screens::missions_list(&self.world, self.spinner(), self.system),
             3 => screens::fleet_list(&self.world),
@@ -283,6 +305,9 @@ impl Ui {
                 ..area
             },
         );
+        if let Some(subject) = &self.popover {
+            self.draw_popover(buf, area, subject);
+        }
         if self.help {
             self.draw_help(buf, area);
         }
@@ -298,19 +323,27 @@ impl Ui {
         buf.set_stringn(
             x,
             area.y,
-            " st ",
-            4,
+            " ≡ st ",
+            6,
             theme::strong(theme::ACCENT).bg(theme::CRUST),
         );
-        x += 5;
+        self.hit(Rect { width: 6, ..area }, Hit::Key('s'));
+        x += 7;
         for (index, name) in TABS.iter().enumerate() {
             let badge = match index {
                 0 => self
                     .world
                     .attention
                     .ready()
-                    .map(|items| items.iter().filter(|item| item.tier <= Tier::Alert).count())
-                    .filter(|count| *count > 0),
+                    .map(|items| {
+                        items
+                            .iter()
+                            .filter(|item| !self.snoozed.contains(&item.id))
+                            .fold((0, false), |(total, blocking), item| {
+                                (total + 1, blocking || item.tier == Tier::Stopped)
+                            })
+                    })
+                    .filter(|(total, _)| *total > 0),
                 _ => None,
             };
             let label = format!(" {} {name} ", index + 1);
@@ -332,15 +365,25 @@ impl Ui {
                 style,
             );
             x += text::width(&label) as u16;
-            if let Some(count) = badge {
-                let badge = format!("◆{count} ");
+            if let Some((count, blocking)) = badge {
+                let badge = if blocking {
+                    format!("◆{count} ")
+                } else {
+                    format!("{count} ")
+                };
                 buf.set_stringn(
                     x,
                     area.y,
                     &badge,
                     4,
                     Style::default()
-                        .fg(theme::PERSON)
+                        .fg(if selected {
+                            theme::CRUST
+                        } else if blocking {
+                            theme::PERSON
+                        } else {
+                            theme::SUBTEXT0
+                        })
                         .bg(if selected {
                             theme::ACCENT
                         } else {
@@ -677,10 +720,43 @@ impl Ui {
         match self.tab {
             0 => {
                 let key = id.clone().unwrap_or_default();
+                let chat_key = format!("chat:{key}");
+                let chat = self.chat.as_ref().filter(|chat| chat.item == key).map(|chat| {
+                    let title = self
+                        .world
+                        .attention
+                        .items()
+                        .iter()
+                        .find(|item| item.id == key)
+                        .map(|item| format!("About: {}", item.title))
+                        .unwrap_or_default();
+                    let thread = match self.world.conversations.get(&chat.to) {
+                        Some(Load::Ready(entries)) => {
+                            let about = entries
+                                .iter()
+                                .filter(|entry| {
+                                    matches!(&entry.body, Body::Mail { subject, .. } if *subject == title)
+                                })
+                                .cloned()
+                                .collect::<Vec<_>>();
+                            self.cache
+                                .render(&about, width.saturating_sub(4), &self.expanded, self.spinner())
+                                .lines
+                        }
+                        _ => Vec::new(),
+                    };
+                    screens::Chat {
+                        to: chat.to_name.clone(),
+                        text: self.drafts.get(&chat_key).map(String::as_str).unwrap_or(""),
+                        editing: chat.editing,
+                        thread,
+                    }
+                });
                 let drafts = Drafts {
                     text: self.drafts.get(&key).map(String::as_str),
                     editing: self.editing,
                     confirm: self.confirm,
+                    chat,
                 };
                 let doc = screens::home_detail(&self.world, id.as_deref(), width, &drafts);
                 self.pane(buf, &format!("home:{key}"), area, doc, false);
@@ -964,6 +1040,53 @@ impl Ui {
         });
     }
 
+    /// A floating card for one graph subject, with a way to go to it.
+    fn draw_popover(&self, buf: &mut Buffer, area: Rect, subject: &str) {
+        let width = 72.min(area.width.saturating_sub(4));
+        let inner = screens::peek(&self.world, subject, width as usize - 4, self.spinner());
+        let mut doc = Doc::new();
+        let title = match subject.split('/').next().unwrap_or("") {
+            "agent" | "session" => "agent",
+            "mission" => "mission",
+            "attention" => "needs you",
+            _ => "details",
+        };
+        doc.card(
+            &format!("{title} · esc closes"),
+            theme::ACCENT,
+            false,
+            inner,
+            width as usize,
+        );
+        let height = (doc.lines.len() as u16).min(area.height.saturating_sub(2));
+        let rect = Rect {
+            x: area.x + (area.width - width) / 2,
+            y: area.y + (area.height.saturating_sub(height)) / 3,
+            width,
+            height,
+        };
+        // Everything outside the card closes it.
+        self.hit(area, Hit::Escape);
+        buf.set_style(rect, Style::default().bg(theme::MANTLE));
+        for (offset, line) in doc.lines.iter().take(height as usize).enumerate() {
+            buf.set_line(rect.x, rect.y + offset as u16, line, rect.width);
+        }
+        self.hit(rect, Hit::Peek(subject.to_owned()));
+        for target in &doc.targets {
+            if (target.line as u16) < height {
+                self.hit(
+                    Rect {
+                        x: rect.x + target.column,
+                        y: rect.y + target.line as u16,
+                        width: target.width,
+                        height: 1,
+                    },
+                    target.hit.clone(),
+                );
+            }
+        }
+    }
+
     fn draw_help(&self, buf: &mut Buffer, area: Rect) {
         let width = 64.min(area.width.saturating_sub(4));
         let mut inner = Doc::new();
@@ -1049,6 +1172,7 @@ impl Ui {
         }
         self.selected[self.tab] = index.min(count - 1);
         self.editing = false;
+        self.chat = None;
         self.confirm = None;
         self.selection = None;
     }
@@ -1056,6 +1180,8 @@ impl Ui {
     fn switch_tab(&mut self, tab: usize) {
         self.tab = tab.min(TABS.len() - 1);
         self.editing = false;
+        self.chat = None;
+        self.popover = None;
         self.confirm = None;
         self.selection = None;
     }
@@ -1120,8 +1246,41 @@ impl Ui {
             }
             return;
         }
+        if key.code == KeyCode::F(1) {
+            self.help = !self.help;
+            return;
+        }
         if self.help {
             self.help = false;
+            return;
+        }
+        if let Some(chat) = self.chat.clone().filter(|chat| chat.editing) {
+            let key_id = format!("chat:{}", chat.item);
+            match key.code {
+                KeyCode::Esc => {
+                    if let Some(chat) = &mut self.chat {
+                        chat.editing = false;
+                    }
+                }
+                KeyCode::Enter => self.submit_chat(),
+                KeyCode::Backspace => {
+                    self.drafts.entry(key_id).or_default().pop();
+                }
+                KeyCode::Char(character) => self.drafts.entry(key_id).or_default().push(character),
+                _ => {}
+            }
+            return;
+        }
+        if let Some(subject) = self.popover.clone() {
+            self.popover = None;
+            match key.code {
+                KeyCode::Char('g') | KeyCode::Enter => self.open(&subject),
+                KeyCode::Char('t') if subject.starts_with("agent/") => {
+                    self.open(&subject);
+                    self.editing = true;
+                }
+                _ => {}
+            }
             return;
         }
         if self.editing {
@@ -1185,7 +1344,13 @@ impl Ui {
                     self.open(&decision);
                 }
             }
-            KeyCode::Esc => self.selection = None,
+            KeyCode::Esc => {
+                if self.chat.is_some() {
+                    self.chat = None;
+                } else {
+                    self.selection = None;
+                }
+            }
             KeyCode::Char(character) => self.action_key(character),
             _ => {}
         }
@@ -1248,7 +1413,19 @@ impl Ui {
                     return;
                 };
                 match (kind, key) {
-                    ("review" | "feedback" | "launch" | "message", 'c') => self.editing = true,
+                    (_, 'g') => self.go_to_subject(),
+                    (_, 't') => self.start_chat(),
+                    ("message", 'l') => {
+                        if let Some(id) = self.selected_id() {
+                            self.snoozed.insert(id);
+                            let index = self.selected[0];
+                            self.select(index);
+                            self.flash("Put off until later · demo, this machine only");
+                        }
+                    }
+                    ("review" | "feedback" | "launch" | "message" | "revision", 'c') => {
+                        self.editing = true
+                    }
                     ("review" | "feedback" | "launch" | "revision", 'a') => {
                         self.confirm = Some('a')
                     }
@@ -1256,18 +1433,6 @@ impl Ui {
                         self.confirm = Some(key)
                     }
                     ("message", 'm') => self.act('m'),
-                    ("fault", 'g') => {
-                        if let Some(agent) = self
-                            .world
-                            .agents
-                            .items()
-                            .iter()
-                            .find(|agent| agent.state == AgentState::Fault)
-                        {
-                            let id = agent.id.clone();
-                            self.open(&id);
-                        }
-                    }
                     _ => {}
                 }
             }
@@ -1280,6 +1445,126 @@ impl Ui {
             }
             _ => {}
         }
+    }
+
+    fn current_item(&self) -> Option<&Attention> {
+        let id = self.selected_id()?;
+        self.world
+            .attention
+            .items()
+            .iter()
+            .find(|item| item.id == id)
+    }
+
+    /// Go to what a Home item is about: its mission, or else its agent.
+    fn go_to_subject(&mut self) {
+        let Some(item) = self.current_item() else {
+            return;
+        };
+        if let Some(target) = item.mission.clone().or_else(|| item.agent.clone()) {
+            self.open(&target);
+        }
+    }
+
+    /// Who to talk to about an item: the agent involved, or the chief of staff.
+    fn chat_target(&self, item: &Attention) -> Option<(String, String)> {
+        let agents = self.world.agents.items();
+        let named = |id: &str| {
+            agents
+                .iter()
+                .find(|agent| agent.id == id)
+                .map(|agent| (agent.id.clone(), agent.name.clone()))
+        };
+        item.agent.as_deref().and_then(named).or_else(|| {
+            agents
+                .iter()
+                .find(|agent| agent.id.ends_with("/cos") || agent.name == "Chief of Staff")
+                .map(|agent| (agent.id.clone(), agent.name.clone()))
+        })
+    }
+
+    fn start_chat(&mut self) {
+        let Some(item) = self.current_item().cloned() else {
+            return;
+        };
+        match self.chat_target(&item) {
+            Some((to, to_name)) => {
+                self.chat = Some(ChatState {
+                    item: item.id.clone(),
+                    to,
+                    to_name,
+                    editing: true,
+                });
+                self.editing = false;
+                self.confirm = None;
+            }
+            None => self.flash("Nobody to chat with about this yet"),
+        }
+    }
+
+    fn submit_chat(&mut self) {
+        let Some(chat) = self.chat.clone() else {
+            return;
+        };
+        let key = format!("chat:{}", chat.item);
+        let text = self.drafts.get(&key).cloned().unwrap_or_default();
+        if text.trim().is_empty() {
+            self.flash("Write something first");
+            return;
+        }
+        let Some(item) = self
+            .world
+            .attention
+            .items()
+            .iter()
+            .find(|item| item.id == chat.item)
+            .cloned()
+        else {
+            return;
+        };
+        let title = format!("About: {}", item.title);
+        self.drafts.remove(&key);
+        if let Some(state) = &mut self.chat {
+            state.editing = false;
+        }
+        if self.live {
+            let mut context = format!("{text}\n\n---\nThis is about {} ({}", item.title, item.id);
+            if let Some(mission) = &item.mission {
+                context.push_str(&format!(", mission {mission}"));
+            }
+            context.push(')');
+            self.effects.push(Effect::Discuss {
+                to: chat.to,
+                title,
+                text: context,
+            });
+            self.flash("Sending…");
+            return;
+        }
+        let at = chrono::Local::now().format("%H:%M").to_string();
+        if let Some(Load::Ready(entries)) = self.world.conversations.get_mut(&chat.to) {
+            entries.push(Entry {
+                id: format!("about-{}", entries.len()),
+                at: at.clone(),
+                body: Body::Mail {
+                    from: "you".into(),
+                    to: chat.to_name.clone(),
+                    subject: title.clone(),
+                    body: text,
+                },
+            });
+            entries.push(Entry {
+                id: format!("about-{}", entries.len()),
+                at,
+                body: Body::Mail {
+                    from: chat.to_name.clone(),
+                    to: "you".into(),
+                    subject: title,
+                    body: "Good question. Here is what I know, and what I would need from you to go on. (demo reply)".into(),
+                },
+            });
+        }
+        self.flash("Sent · demo: nothing left this machine");
     }
 
     fn submit(&mut self) {
@@ -1318,6 +1603,17 @@ impl Ui {
                         to: from,
                         text: draft,
                     }),
+                    Some(AttentionKind::Revision { .. }) => self
+                        .current_item()
+                        .and_then(|item| {
+                            self.chat_target(item)
+                                .map(|(to, _)| (to, item.title.clone()))
+                        })
+                        .map(|(to, title)| Effect::Discuss {
+                            to,
+                            title: format!("Changes to: {title}"),
+                            text: draft,
+                        }),
                     _ => None,
                 },
             };
@@ -1544,6 +1840,17 @@ impl Ui {
         match hit {
             Hit::Tab(tab) => self.switch_tab(tab),
             Hit::Row(index) => self.select(index),
+            Hit::Key(key) if self.popover.is_some() => {
+                let subject = self.popover.take().unwrap_or_default();
+                match key {
+                    'g' => self.open(&subject),
+                    't' if subject.starts_with("agent/") => {
+                        self.open(&subject);
+                        self.editing = true;
+                    }
+                    _ => {}
+                }
+            }
             Hit::Key(key) => {
                 if key == 'y' {
                     if let Some(action) = self.confirm.take() {
@@ -1554,10 +1861,25 @@ impl Ui {
                     self.action_key(key);
                 }
             }
-            Hit::Enter => self.submit(),
+            Hit::Enter => {
+                if self.chat.is_some() {
+                    self.submit_chat()
+                } else {
+                    self.submit()
+                }
+            }
             Hit::Escape => {
-                self.editing = false;
-                self.confirm = None;
+                if self.popover.take().is_none() {
+                    self.editing = false;
+                    self.confirm = None;
+                    if let Some(chat) = &mut self.chat {
+                        if chat.editing {
+                            chat.editing = false;
+                        } else {
+                            self.chat = None;
+                        }
+                    }
+                }
             }
             Hit::ToggleTool(id) => {
                 if !self.expanded.remove(&id) {
@@ -1565,9 +1887,20 @@ impl Ui {
                 }
             }
             Hit::JumpLatest => self.follow_latest(),
-            Hit::Composer => self.editing = true,
+            Hit::Composer => {
+                if let Some(chat) = &mut self.chat {
+                    chat.editing = true;
+                } else {
+                    self.editing = true;
+                }
+            }
             Hit::Help => self.help = !self.help,
             Hit::Open(id) => self.open(&id),
+            Hit::Peek(id) => {
+                if self.popover.as_deref() != Some(id.as_str()) {
+                    self.popover = Some(id);
+                }
+            }
         }
     }
 
@@ -2116,5 +2449,94 @@ mod tests {
                 }
             }
         }
+    }
+    fn press(ui: &mut Ui, code: KeyCode) {
+        ui.key(KeyEvent::new(code, KeyModifiers::NONE));
+    }
+
+    #[test]
+    fn g_goes_to_the_mission_behind_a_home_item() {
+        let mut ui = Ui::new(demo::world());
+        let index = ui.ids().iter().position(|id| id == "attention/1").unwrap();
+        ui.select(index);
+        press(&mut ui, KeyCode::Char('g'));
+        assert_eq!(ui.tab, 2);
+        assert_eq!(
+            ui.selected_id().as_deref(),
+            Some("mission/fleet/atlas/store-move")
+        );
+    }
+
+    #[test]
+    fn chat_about_this_starts_a_thread_with_the_agent_involved() {
+        let mut ui = Ui::new(demo::world());
+        let index = ui.ids().iter().position(|id| id == "attention/1").unwrap();
+        ui.select(index);
+        press(&mut ui, KeyCode::Char('t'));
+        assert_eq!(ui.chat.as_ref().unwrap().to, "agent/fleet/atlas/builder");
+        for character in "why now?".chars() {
+            press(&mut ui, KeyCode::Char(character));
+        }
+        press(&mut ui, KeyCode::Enter);
+        let screen = frame(&ui, 150, 70).join("\n");
+        assert!(
+            screen.contains("CHAT WITH ATLAS BUILDER")
+                || screen.contains("chat with Atlas Builder"),
+            "{screen}"
+        );
+        assert!(screen.contains("why now?"), "{screen}");
+    }
+
+    #[test]
+    fn a_fault_with_nobody_attached_is_discussed_with_the_chief_of_staff() {
+        let mut ui = Ui::new(demo::world());
+        let mut world = demo::world();
+        if let Load::Ready(items) = &mut world.attention {
+            for item in items.iter_mut() {
+                item.agent = None;
+            }
+        }
+        ui.set_world(world);
+        let item = ui.world.attention.items()[3].clone();
+        assert_eq!(ui.chat_target(&item).unwrap().0, "agent/fleet/cos");
+    }
+
+    #[test]
+    fn remind_me_later_hides_a_message_and_the_badge_counts_what_is_left() {
+        let mut ui = Ui::new(demo::world());
+        let index = ui.ids().iter().position(|id| id == "attention/6").unwrap();
+        ui.select(index);
+        press(&mut ui, KeyCode::Char('l'));
+        assert!(!ui.ids().contains(&"attention/6".to_owned()));
+        let top = frame(&ui, 150, 30)[0].clone();
+        assert!(top.contains("◆5"), "{top}");
+    }
+
+    #[test]
+    fn clicking_an_agent_in_a_mission_opens_a_popover_not_another_tab() {
+        let mut ui = Ui::new(demo::world());
+        ui.tab = 2;
+        frame(&ui, 150, 60);
+        let (rect, _) = ui
+            .frame
+            .borrow()
+            .hits
+            .iter()
+            .find(|(_, hit)| matches!(hit, Hit::Peek(id) if id.starts_with("agent/")))
+            .cloned()
+            .unwrap();
+        ui.mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: rect.x,
+            row: rect.y,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(ui.tab, 2);
+        assert!(ui.popover.is_some());
+        let screen = frame(&ui, 150, 60).join("\n");
+        assert!(screen.contains("Go to agent"), "{screen}");
+        press(&mut ui, KeyCode::Char('g'));
+        assert_eq!(ui.tab, 1);
+        assert!(ui.popover.is_none());
     }
 }

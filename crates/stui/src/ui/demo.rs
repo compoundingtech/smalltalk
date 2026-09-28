@@ -101,6 +101,7 @@ fn attention() -> Vec<Attention> {
             waiting: Some(s("Atlas Builder on harbor")),
             age: s("33m"),
             mission: Some(s("mission/fleet/atlas/store-move")),
+            agent: Some(s("agent/fleet/atlas/builder")),
             actions: vec![],
             kind: AttentionKind::Review {
                 question: s(
@@ -130,6 +131,7 @@ fn attention() -> Vec<Attention> {
             waiting: Some(s("Docs Writer on harbor")),
             age: s("12m"),
             mission: Some(s("mission/fleet/site/pricing-page")),
+            agent: Some(s("agent/fleet/docs/writer")),
             actions: vec![],
             kind: AttentionKind::Feedback {
                 question: s(
@@ -155,6 +157,7 @@ fn attention() -> Vec<Attention> {
             waiting: Some(s("Planner on lark")),
             age: s("1h"),
             mission: None,
+            agent: Some(s("agent/fleet/planner")),
             actions: vec![],
             kind: AttentionKind::Launch {
                 planner: s("Planner"),
@@ -213,6 +216,7 @@ fn attention() -> Vec<Attention> {
             waiting: None,
             age: s("8m"),
             mission: Some(s("mission/fleet/release/weekly")),
+            agent: Some(s("agent/fleet/release/captain")),
             actions: vec![],
             kind: AttentionKind::Fault {
                 what: s(
@@ -232,6 +236,7 @@ fn attention() -> Vec<Attention> {
             waiting: Some(s("Rekey Worker on harbor")),
             age: s("19m"),
             mission: Some(s("mission/fleet/rekey")),
+            agent: Some(s("agent/fleet/rekey/worker")),
             actions: vec![],
             kind: AttentionKind::Revision {
                 reason: s(
@@ -256,6 +261,7 @@ fn attention() -> Vec<Attention> {
             waiting: None,
             age: s("2h"),
             mission: None,
+            agent: Some(s("agent/fleet/cos")),
             actions: vec![],
             kind: AttentionKind::Message {
                 from: s("Chief of Staff"),
@@ -302,7 +308,7 @@ fn agents() -> Vec<Agent> {
             AgentState::NeedsYou,
             "harbor",
             Some("~/src/atlas--store-move"),
-            Some(("atlas/store-move", "cut-over")),
+            Some(("mission/fleet/atlas/store-move", "cut-over")),
             "33m",
         ),
         agent(
@@ -312,7 +318,7 @@ fn agents() -> Vec<Agent> {
             AgentState::NeedsYou,
             "harbor",
             Some("~/src/site--pricing"),
-            Some(("site/pricing-page", "draft")),
+            Some(("mission/fleet/site/pricing-page", "draft")),
             "12m",
         ),
         agent(
@@ -322,7 +328,7 @@ fn agents() -> Vec<Agent> {
             AgentState::Fault,
             "harbor",
             Some("~/src/atlas"),
-            Some(("release/weekly", "tag")),
+            Some(("mission/fleet/release/weekly", "tag")),
             "8m",
         ),
         agent(
@@ -342,7 +348,7 @@ fn agents() -> Vec<Agent> {
             AgentState::Working,
             "harbor",
             Some("~/src/harbor--review-218"),
-            Some(("harbor/pull-request-review", "review")),
+            Some(("mission/fleet/harbor/pull-request-review", "review")),
             "1m",
         ),
         agent(
@@ -352,7 +358,7 @@ fn agents() -> Vec<Agent> {
             AgentState::Idle,
             "harbor",
             Some("~/src/harbor"),
-            Some(("rekey", "rotate")),
+            Some(("mission/fleet/rekey", "rotate")),
             "19m",
         ),
         agent(
@@ -376,6 +382,16 @@ fn agents() -> Vec<Agent> {
             "2d",
         ),
     ];
+    list.push(agent(
+        "agent/fleet/planner",
+        "Planner",
+        Harness::Claude,
+        AgentState::NeedsYou,
+        "lark",
+        None,
+        None,
+        "1h",
+    ));
     list[4].parent = Some(s("agent/fleet/cos"));
     list.push(Agent {
         id: s("session/unmanaged-1"),

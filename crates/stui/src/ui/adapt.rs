@@ -167,8 +167,46 @@ fn attention(model: &Model, extras: &Extras) -> Vec<Attention> {
                     },
                 ),
             };
+            let agent = item
+                .step_run_id
+                .as_ref()
+                .and_then(|id| model.work().find(|work| &work.header.id == id))
+                .and_then(|work| work.claimant.clone())
+                .or_else(|| {
+                    // The agents working in the mission, for a gate that has no claimant.
+                    item.mission_id
+                        .as_ref()
+                        .and_then(|mission| {
+                            model
+                                .missions()
+                                .find(|candidate| &candidate.header.id == mission)
+                                .and_then(|mission| {
+                                    model.agents().find(|agent| {
+                                        agent.current_work_ids.iter().any(|id| {
+                                            model.work().any(|work| {
+                                                &work.header.id == id
+                                                    && crate::mission_work_matches(mission, work)
+                                            })
+                                        })
+                                    })
+                                })
+                        })
+                        .map(|agent| agent.header.id.clone())
+                })
+                .or_else(|| {
+                    item.source_id
+                        .starts_with("agent/")
+                        .then(|| item.source_id.clone())
+                })
+                .or_else(|| match &kind {
+                    AttentionKind::Message { from, .. } if from.starts_with("agent/") => {
+                        Some(from.clone())
+                    }
+                    _ => None,
+                });
             Attention {
                 id: item.header.id.clone(),
+                agent,
                 tier,
                 title: clean_message_text(&item.title),
                 waiting: step.map(|step| format!("step {step}")),
@@ -306,7 +344,7 @@ fn agents(model: &Model) -> Vec<Agent> {
                 model
                     .missions()
                     .find(|mission| mission.runs.contains(&work.mission_run_id))
-                    .map(|mission| short(&mission.header.id))
+                    .map(|mission| mission.header.id.clone())
             });
             Agent {
                 id: agent.header.id.clone(),

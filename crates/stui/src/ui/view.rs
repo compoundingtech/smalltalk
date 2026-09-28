@@ -84,6 +84,8 @@ pub struct Attention {
     pub waiting: Option<String>,
     pub age: String,
     pub mission: Option<String>,
+    /// The agent that did the work or raised the item: who to talk to about it.
+    pub agent: Option<String>,
     pub kind: AttentionKind,
     /// The actions st offers for this item. Empty in the demo, where every button works.
     pub actions: Vec<String>,
