@@ -5,8 +5,6 @@ use std::collections::BTreeSet;
 
 const TERMINAL_SUBPROTOCOL: &str = "st3.client.terminal.v0";
 const TERMINAL_CAPABILITY_PROTOCOL_PREFIX: &str = "st3.cap.";
-const TERMINAL_MAX_LINES: usize = 200;
-const TERMINAL_MAX_LINE_BYTES: usize = 4_096;
 const LOCAL_PERSON_HEADER: &str = "x-st3-person";
 
 const ALL_SCOPES: &[&str] = &[
@@ -2545,22 +2543,31 @@ fn remote_terminal_live_session(
     })
 }
 
-fn bounded_terminal_line(text: &str) -> (String, bool) {
-    if text.len() <= TERMINAL_MAX_LINE_BYTES {
-        return (text.to_owned(), false);
+/// How long a viewer waits for a terminal's first screen before giving up.
+const TERMINAL_FIRST_SCREEN_TIMEOUT: Duration = Duration::from_secs(5);
+/// A gateway's owner long poll stays inside the peer relay's request deadline.
+const TERMINAL_RELAY_WAIT_MS: u64 = 10_000;
+/// The most often an open terminal stream rechecks its runtime incarnation fence.
+const TERMINAL_FENCE_CHECK_INTERVAL: Duration = Duration::from_millis(250);
+
+fn terminal_view_error(end: terminal_view::ViewEnd) -> ApiError {
+    match end {
+        terminal_view::ViewEnd::Unavailable(message) => ApiError::internal(message),
+        terminal_view::ViewEnd::Exited | terminal_view::ViewEnd::Idle => {
+            stale("the terminal session ended")
+        }
     }
-    let mut end = TERMINAL_MAX_LINE_BYTES;
-    while !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    (text[..end].to_owned(), true)
 }
 
-fn terminal_screen_value(
+/// Read the owner-local screen. With `after`, wait up to `wait` for a screen whose revision
+/// differs, then return the current screen either way.
+async fn terminal_screen_value(
     state: &AppState,
     id: &str,
     expected_incarnation: Option<&str>,
-) -> Result<(Value, LiveSession), ApiError> {
+    after: Option<&str>,
+    wait: Duration,
+) -> Result<Value, ApiError> {
     let subject = terminal_subject(id);
     let live = terminal_live_session(state, &subject, expected_incarnation)?;
     if !live.terminal {
@@ -2568,48 +2575,55 @@ fn terminal_screen_value(
             "the requested runtime does not expose a terminal",
         ));
     }
-    let screen = st_runtime::PtyRuntime::new(state.pty_root.clone())
-        .with_binary(state.pty_binary.to_string_lossy())
-        .screen(&live.runtime_id)
-        .map_err(ApiError::internal)?;
-    let screen_line_count = screen.lines().count();
-    let mut lines = screen
-        .lines()
-        .take(TERMINAL_MAX_LINES)
-        .enumerate()
-        .map(|(row, text)| {
-            let (text, truncated) = bounded_terminal_line(text);
-            json!({ "row": row, "text": text, "redacted": false, "truncated": truncated })
-        })
-        .collect::<Vec<_>>();
-    if lines.is_empty() {
-        lines.push(json!({ "row": 0, "text": "", "redacted": false, "truncated": false }));
+    let mut screens =
+        terminal_view::subscribe(&state.pty_root, &live.runtime_id, &live.incarnation_id);
+    let first = tokio::time::Instant::now() + TERMINAL_FIRST_SCREEN_TIMEOUT;
+    let mut screen = terminal_view::next_screen(&mut screens, None, first)
+        .await
+        .map_err(terminal_view_error)?
+        .ok_or_else(|| ApiError::internal("the terminal screen did not arrive"))?;
+    if let Some(after) = after
+        && screen.revision() == after
+    {
+        let deadline = tokio::time::Instant::now() + wait;
+        if let Some(changed) = terminal_view::next_screen(&mut screens, Some(after), deadline)
+            .await
+            .map_err(terminal_view_error)?
+        {
+            screen = changed;
+        }
     }
-    let rows = lines.len().max(1);
-    let columns = lines
-        .iter()
-        .filter_map(|line| line["text"].as_str().map(str::chars).map(Iterator::count))
-        .max()
-        .unwrap_or(1)
-        .max(1);
-    let value = json!({
-        "kind": "terminal-screen", "terminal_id": client_detail_id("terminal", id),
-        "runtime_incarnation": live.incarnation_id, "rows": rows, "columns": columns,
-        "cursor": { "row": rows - 1, "column": 0, "visible": true }, "title": live.runtime_id,
-        "lines": lines, "next_sequence": state.store.index().map_err(ApiError::internal)?,
-        "truncated": screen_line_count > TERMINAL_MAX_LINES
-    });
-    Ok((value, live))
+    Ok(screen.value(
+        &client_detail_id("terminal", id),
+        &live.incarnation_id,
+        state.store.index().map_err(ApiError::internal)?,
+    ))
+}
+
+#[derive(Default, Deserialize)]
+pub(super) struct TerminalScreenQuery {
+    after: Option<String>,
+    wait_ms: Option<u64>,
 }
 
 pub(super) async fn terminal_screen(
     State(state): State<AppState>,
     Extension(session): Extension<ClientSession>,
     AxumPath(id): AxumPath<String>,
+    Query(query): Query<TerminalScreenQuery>,
 ) -> Result<Json<Value>, ApiError> {
     require_scope(&session, "terminal.read")?;
-    match terminal_screen_value(&state, &id, None) {
-        Ok((screen, _)) => Ok(Json(screen)),
+    let wait_ms = query.wait_ms.unwrap_or(0).min(30_000);
+    match terminal_screen_value(
+        &state,
+        &id,
+        None,
+        query.after.as_deref(),
+        Duration::from_millis(wait_ms),
+    )
+    .await
+    {
+        Ok(screen) => Ok(Json(screen)),
         Err(error) if error.code == "runtime-not-local" => {
             let subject = terminal_subject(&id);
             let status = state
@@ -2631,14 +2645,21 @@ pub(super) async fn terminal_screen(
                     "remote terminal screen requires a concrete person",
                 ));
             }
+            let terminal_id = client_detail_id("terminal", &id);
+            let request = match query.after {
+                Some(after_revision) => crate::peer::ClientReadOperation::TerminalScreenChange {
+                    terminal_id,
+                    after_revision,
+                    wait_ms: wait_ms.min(TERMINAL_RELAY_WAIT_MS),
+                },
+                None => crate::peer::ClientReadOperation::TerminalScreen { terminal_id },
+            };
             let value = relay
                 .read(
                     &host,
                     &crate::peer::ClientReadRequest {
                         authority_actor: session.authority_actor.clone(),
-                        request: crate::peer::ClientReadOperation::TerminalScreen {
-                            terminal_id: client_detail_id("terminal", &id),
-                        },
+                        request,
                     },
                 )
                 .await
@@ -2651,7 +2672,6 @@ pub(super) async fn terminal_screen(
 
 #[derive(Default, Deserialize)]
 pub(super) struct TerminalStreamQuery {
-    after: Option<u64>,
     incarnation: Option<String>,
 }
 
@@ -2733,17 +2753,17 @@ pub(super) async fn terminal_stream(
                     owner,
                     authority_actor,
                     expected_incarnation,
-                    query.after,
                 )
             }));
     }
     Ok(websocket
         .protocols([TERMINAL_SUBPROTOCOL])
-        .on_upgrade(move |socket| {
-            terminal_stream_socket(socket, state, id, expected_incarnation, query.after)
-        }))
+        .on_upgrade(move |socket| terminal_stream_socket(socket, state, id, expected_incarnation)))
 }
 
+/// Relay a terminal another host owns. Each owner long poll returns as soon as the owner
+/// publishes a screen whose revision differs from the last one sent, so an idle terminal
+/// costs one request per relay wait and sends the client nothing.
 async fn remote_terminal_stream_socket(
     mut socket: WebSocket,
     state: AppState,
@@ -2751,82 +2771,81 @@ async fn remote_terminal_stream_socket(
     owner: String,
     authority_actor: String,
     incarnation: String,
-    after: Option<u64>,
 ) {
     let Some(relay) = state.client_relay.as_ref() else {
         close_terminal_stream(&mut socket, 1012, "terminal owner unavailable").await;
         return;
     };
-    let request = crate::peer::ClientReadRequest {
-        authority_actor,
-        request: crate::peer::ClientReadOperation::TerminalScreen {
-            terminal_id: client_detail_id("terminal", &id),
-        },
-    };
-    let screen = match relay.read(&owner, &request).await {
-        Ok(screen) if screen["runtime_incarnation"].as_str() == Some(incarnation.as_str()) => {
-            screen
-        }
-        _ => {
-            close_terminal_stream(&mut socket, 1012, "terminal incarnation changed").await;
+    let terminal_id = client_detail_id("terminal", &id);
+    let mut sent: Option<String> = None;
+    let mut failures = 0_u32;
+    loop {
+        let request = crate::peer::ClientReadRequest {
+            authority_actor: authority_actor.clone(),
+            request: match sent.clone() {
+                Some(after_revision) => crate::peer::ClientReadOperation::TerminalScreenChange {
+                    terminal_id: terminal_id.clone(),
+                    after_revision,
+                    wait_ms: TERMINAL_RELAY_WAIT_MS,
+                },
+                None => crate::peer::ClientReadOperation::TerminalScreen {
+                    terminal_id: terminal_id.clone(),
+                },
+            },
+        };
+        let read = relay.read(&owner, &request);
+        tokio::pin!(read);
+        let read = loop {
+            tokio::select! {
+                read = &mut read => break read,
+                message = socket.recv() => {
+                    if matches!(message, None | Some(Err(_)) | Some(Ok(WsMessage::Close(_)))) {
+                        return;
+                    }
+                }
+            }
+        };
+        let screen = match read {
+            Ok(screen) => screen,
+            Err(error) => {
+                let error = remote_read_error(&owner, error);
+                if error.code == "remote-unavailable" && failures < 3 {
+                    failures += 1;
+                    tokio::time::sleep(Duration::from_millis(500 * u64::from(failures))).await;
+                    continue;
+                }
+                close_terminal_stream_with_error(&mut socket, &error).await;
+                return;
+            }
+        };
+        failures = 0;
+        if screen["runtime_incarnation"].as_str() != Some(incarnation.as_str()) {
+            close_terminal_stream_with_error(
+                &mut socket,
+                &stale("the terminal incarnation fence is stale"),
+            )
+            .await;
             return;
         }
-    };
-    if !send_terminal_stream_value(
-        &mut socket,
-        &terminal_stream_envelope(&state, screen.clone()),
-    )
-    .await
-    {
-        close_terminal_stream(
-            &mut socket,
-            1009,
-            "terminal screen exceeds the client limit",
-        )
-        .await;
-        return;
+        let Some(revision) = screen["revision"].as_str().map(str::to_owned) else {
+            close_terminal_stream_with_error(
+                &mut socket,
+                &ApiError::internal("the terminal owner does not publish screen revisions"),
+            )
+            .await;
+            return;
+        };
+        if sent.as_deref() == Some(revision.as_str()) {
+            continue;
+        }
+        if !send_terminal_stream_value(&mut socket, &terminal_stream_envelope(&state, screen)).await
+        {
+            close_terminal_stream(&mut socket, 1009, "terminal screen exceeds the client limit")
+                .await;
+            return;
+        }
+        sent = Some(revision);
     }
-    // Match the owner-local stream's second fence check after writing the first message.
-    if relay.read(&owner, &request).await.map_or(true, |fresh| {
-        fresh["runtime_incarnation"].as_str() != Some(incarnation.as_str())
-    }) {
-        close_terminal_stream(&mut socket, 1012, "terminal incarnation replaced").await;
-        return;
-    }
-    let sequence = screen["next_sequence"].as_u64().unwrap_or_default();
-    let frames = if after == Some(sequence) {
-        Vec::new()
-    } else {
-        vec![json!({
-            "id": format!("terminal-frame/{}/{}", id.trim_start_matches("terminal/"), sequence),
-            "terminal_id": client_detail_id("terminal", &id),
-            "runtime_incarnation": incarnation,
-            "sequence": sequence,
-            "type": "resync",
-            "timestamp": client_timestamp(client_now_ms()),
-            "body": { "screen": screen }
-        })]
-    };
-    let page = terminal_stream_envelope(
-        &state,
-        json!({
-            "kind": "terminal-frame-page",
-            "terminal_id": client_detail_id("terminal", &id),
-            "runtime_incarnation": incarnation,
-            "frames": frames,
-            "resume_sequence": sequence.saturating_add(1),
-        }),
-    );
-    if !send_terminal_stream_value(&mut socket, &page).await {
-        close_terminal_stream(
-            &mut socket,
-            1009,
-            "terminal frame page exceeds the client limit",
-        )
-        .await;
-        return;
-    }
-    close_terminal_stream(&mut socket, 1000, "terminal snapshot complete").await;
 }
 
 fn terminal_attachment_subject(id: &str) -> Result<String, ApiError> {
@@ -3312,85 +3331,136 @@ async fn send_terminal_stream_value(socket: &mut WebSocket, value: &Value) -> bo
     socket.send(WsMessage::Text(text.into())).await.is_ok()
 }
 
-async fn close_terminal_stream(socket: &mut WebSocket, code: u16, reason: &'static str) {
+async fn close_terminal_stream(socket: &mut WebSocket, code: u16, reason: &str) {
     let _ = socket
         .send(WsMessage::Close(Some(axum::extract::ws::CloseFrame {
             code,
-            reason: reason.into(),
+            reason: reason.to_owned().into(),
         })))
         .await;
 }
 
+/// End a stream with one error envelope, then a close frame whose reason is the error code.
+async fn close_terminal_stream_with_error(socket: &mut WebSocket, error: &ApiError) {
+    let envelope = terminal_stream_error(error);
+    let _ = send_terminal_stream_value(socket, &envelope).await;
+    let code = envelope["code"].as_str().unwrap_or("internal").to_owned();
+    let close = if code == "internal" { 1011 } else { 1008 };
+    close_terminal_stream(socket, close, &code).await;
+}
+
+/// Hold an owner-local terminal stream open. The first message is the current screen; every
+/// later message is a newer screen that replaces it. The shared watcher publishes changes at a
+/// capped rate, and a viewer busy sending reads only the latest screen when it is ready.
 async fn terminal_stream_socket(
     mut socket: WebSocket,
     state: AppState,
     id: String,
     expected_incarnation: String,
-    after: Option<u64>,
 ) {
-    let (screen, live) = match terminal_screen_value(&state, &id, Some(&expected_incarnation)) {
-        Ok(value) => value,
+    let subject = terminal_subject(&id);
+    let live = match terminal_live_session(&state, &subject, Some(&expected_incarnation)) {
+        Ok(live) => live,
         Err(error) => {
-            let _ = send_terminal_stream_value(&mut socket, &terminal_stream_error(&error)).await;
-            close_terminal_stream(&mut socket, 1008, "terminal incarnation changed").await;
+            close_terminal_stream_with_error(&mut socket, &error).await;
             return;
         }
     };
-    let screen_envelope = terminal_stream_envelope(&state, screen.clone());
-    if !send_terminal_stream_value(&mut socket, &screen_envelope).await {
-        close_terminal_stream(
-            &mut socket,
-            1009,
-            "terminal screen exceeds the client limit",
-        )
-        .await;
-        return;
-    }
-
-    // Revalidate after the screen write. A replacement racing the upgrade is never allowed to
-    // append frames from a different incarnation to the atomic first message.
-    if let Err(error) =
-        terminal_live_session(&state, &terminal_subject(&id), Some(&expected_incarnation))
-    {
-        let _ = send_terminal_stream_value(&mut socket, &terminal_stream_error(&error)).await;
-        close_terminal_stream(&mut socket, 1012, "terminal incarnation replaced").await;
-        return;
-    }
-
-    let sequence = screen["next_sequence"].as_u64().unwrap_or_default();
-    let frames = if after == Some(sequence) {
-        Vec::new()
-    } else {
-        vec![json!({
-            "id": format!("terminal-frame/{}/{}", id.trim_start_matches("terminal/"), sequence),
-            "terminal_id": client_detail_id("terminal", &id),
-            "runtime_incarnation": live.incarnation_id,
-            "sequence": sequence,
-            "type": "resync",
-            "timestamp": client_timestamp(client_now_ms()),
-            "body": { "screen": screen }
-        })]
+    let terminal_id = client_detail_id("terminal", &id);
+    let mut graph = state.event_notify.subscribe();
+    let mut screens =
+        terminal_view::subscribe(&state.pty_root, &live.runtime_id, &live.incarnation_id);
+    let first = tokio::time::Instant::now() + TERMINAL_FIRST_SCREEN_TIMEOUT;
+    let mut screen = match terminal_view::next_screen(&mut screens, None, first).await {
+        Ok(Some(screen)) => Some(screen),
+        Ok(None) => {
+            close_terminal_stream_with_error(
+                &mut socket,
+                &ApiError::internal("the terminal screen did not arrive"),
+            )
+            .await;
+            return;
+        }
+        Err(end) => {
+            close_terminal_stream_with_error(&mut socket, &terminal_view_error(end)).await;
+            return;
+        }
     };
-    let page = terminal_stream_envelope(
-        &state,
-        json!({
-            "kind": "terminal-frame-page",
-            "terminal_id": client_detail_id("terminal", &id),
-            "runtime_incarnation": live.incarnation_id,
-            "frames": frames,
-            "resume_sequence": sequence.saturating_add(1)
-        }),
-    );
-    if !send_terminal_stream_value(&mut socket, &page).await {
-        close_terminal_stream(
-            &mut socket,
-            1009,
-            "terminal frame page exceeds the client limit",
-        )
-        .await;
-        return;
+    let mut sent = None::<String>;
+    let mut fence_check_at = None::<tokio::time::Instant>;
+    let mut last_fence_check = tokio::time::Instant::now();
+    loop {
+        if screen.is_none() {
+            screen = tokio::select! {
+                changed = screens.changed() => {
+                    if changed.is_err() {
+                        close_terminal_stream_with_error(
+                            &mut socket,
+                            &terminal_view_error(terminal_view::ViewEnd::Exited),
+                        )
+                        .await;
+                        return;
+                    }
+                    let latest = screens.borrow_and_update().clone();
+                    match latest {
+                        terminal_view::ViewState::Screen(screen) => Some(screen),
+                        terminal_view::ViewState::Ended(end) => {
+                            close_terminal_stream_with_error(&mut socket, &terminal_view_error(end))
+                                .await;
+                            return;
+                        }
+                        terminal_view::ViewState::Connecting => None,
+                    }
+                }
+                changed = graph.changed(), if fence_check_at.is_none() => {
+                    if changed.is_ok() {
+                        let earliest = last_fence_check + TERMINAL_FENCE_CHECK_INTERVAL;
+                        fence_check_at = Some(earliest.max(tokio::time::Instant::now()));
+                    }
+                    None
+                }
+                _ = tokio::time::sleep_until(fence_check_at.unwrap_or_else(tokio::time::Instant::now)),
+                    if fence_check_at.is_some() =>
+                {
+                    fence_check_at = None;
+                    last_fence_check = tokio::time::Instant::now();
+                    if let Err(error) =
+                        terminal_live_session(&state, &subject, Some(&expected_incarnation))
+                    {
+                        close_terminal_stream_with_error(&mut socket, &error).await;
+                        return;
+                    }
+                    None
+                }
+                message = socket.recv() => {
+                    if matches!(message, None | Some(Err(_)) | Some(Ok(WsMessage::Close(_)))) {
+                        return;
+                    }
+                    None
+                }
+            };
+        }
+        let Some(screen) = screen.take() else { continue };
+        if sent.as_deref() == Some(screen.revision()) {
+            continue;
+        }
+        let Ok(next_sequence) = state.store.index() else {
+            close_terminal_stream_with_error(
+                &mut socket,
+                &ApiError::internal("the store index is unavailable"),
+            )
+            .await;
+            return;
+        };
+        let value = screen.value(&terminal_id, &live.incarnation_id, next_sequence);
+        if !send_terminal_stream_value(&mut socket, &terminal_stream_envelope(&state, value)).await
+        {
+            close_terminal_stream(&mut socket, 1009, "terminal screen exceeds the client limit")
+                .await;
+            return;
+        }
+        sent = Some(screen.revision().to_owned());
     }
-    close_terminal_stream(&mut socket, 1000, "terminal snapshot complete").await;
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -6840,8 +6910,18 @@ mission "example/zero-run" state="ready" {
         )
         .unwrap_err();
         assert_eq!(error.code, "forbidden");
-        let error =
-            terminal_screen_value(&follower, subject, Some("same-runtime-id:i1")).unwrap_err();
+        let error = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(terminal_screen_value(
+                &follower,
+                subject,
+                Some("same-runtime-id:i1"),
+                None,
+                Duration::ZERO,
+            ))
+            .unwrap_err();
         assert_eq!(error.code, "runtime-not-local");
 
         let secret = follower_root.path().join("fleet-secret");

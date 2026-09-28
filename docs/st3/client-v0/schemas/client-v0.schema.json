@@ -56,7 +56,6 @@
             { "$ref": "#/$defs/PairingChallenge" },
             { "$ref": "#/$defs/PairedSession" },
             { "$ref": "#/$defs/TerminalScreen" },
-            { "$ref": "#/$defs/TerminalFramePage" },
             { "$ref": "#/$defs/AgentQueue" }
           ]
         }
@@ -1162,80 +1161,78 @@
     "TerminalLine": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["row", "text", "redacted", "truncated"],
+      "required": ["row", "text", "runs", "redacted", "truncated"],
       "properties": {
         "row": { "type": "integer", "minimum": 0 },
         "text": { "type": "string" },
+        "runs": { "type": "array", "items": { "$ref": "#/$defs/TerminalRun" } },
         "redacted": { "type": "boolean" },
         "truncated": { "type": "boolean" }
+      }
+    },
+    "TerminalRun": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["text"],
+      "properties": {
+        "text": { "type": "string", "minLength": 1 },
+        "fg": { "$ref": "#/$defs/TerminalColor" },
+        "bg": { "$ref": "#/$defs/TerminalColor" },
+        "bold": { "const": true },
+        "dim": { "const": true },
+        "italic": { "const": true },
+        "underline": { "const": true },
+        "inverse": { "const": true }
+      }
+    },
+    "TerminalColor": {
+      "oneOf": [
+        { "type": "integer", "minimum": 0, "maximum": 255 },
+        { "type": "string", "pattern": "^#[0-9a-f]{6}$" }
+      ]
+    },
+    "TerminalModes": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["alternate_screen", "application_cursor", "application_keypad", "bracketed_paste", "focus_events", "mouse_tracking", "mouse_encoding"],
+      "properties": {
+        "alternate_screen": { "type": "boolean" },
+        "application_cursor": { "type": "boolean" },
+        "application_keypad": { "type": "boolean" },
+        "bracketed_paste": { "type": "boolean" },
+        "focus_events": { "type": "boolean" },
+        "mouse_tracking": { "enum": ["none", "click", "drag", "motion"] },
+        "mouse_encoding": { "enum": ["default", "utf8", "sgr"] }
       }
     },
     "TerminalScreen": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["kind", "terminal_id", "runtime_incarnation", "rows", "columns", "cursor", "title", "lines", "next_sequence", "truncated"],
+      "required": ["kind", "terminal_id", "runtime_incarnation", "revision", "rows", "columns", "cursor", "title", "modes", "lines", "next_sequence", "truncated"],
       "properties": {
         "kind": { "const": "terminal-screen" },
         "terminal_id": { "$ref": "#/$defs/Id" },
         "runtime_incarnation": { "type": "string" },
+        "revision": { "type": "string", "minLength": 1 },
         "rows": { "type": "integer", "minimum": 1 },
         "columns": { "type": "integer", "minimum": 1 },
         "cursor": {
           "type": "object",
-          "required": ["row", "column", "visible"],
-          "properties": { "row": { "type": "integer" }, "column": { "type": "integer" }, "visible": { "type": "boolean" } },
+          "required": ["row", "column", "visible", "style", "blinking"],
+          "properties": {
+            "row": { "type": "integer" },
+            "column": { "type": "integer" },
+            "visible": { "type": "boolean" },
+            "style": { "enum": ["block", "underline", "bar"] },
+            "blinking": { "type": "boolean" }
+          },
           "additionalProperties": false
         },
         "title": { "type": "string" },
+        "modes": { "$ref": "#/$defs/TerminalModes" },
         "lines": { "type": "array", "items": { "$ref": "#/$defs/TerminalLine" } },
         "next_sequence": { "type": "integer", "minimum": 0 },
         "truncated": { "type": "boolean" }
-      }
-    },
-    "TerminalFrame": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["id", "terminal_id", "runtime_incarnation", "sequence", "type", "timestamp", "body"],
-      "properties": {
-        "id": { "$ref": "#/$defs/Id" },
-        "terminal_id": { "$ref": "#/$defs/Id" },
-        "runtime_incarnation": { "type": "string" },
-        "sequence": { "type": "integer", "minimum": 0 },
-        "type": { "enum": ["output", "resize", "title", "bell", "exit", "resync"] },
-        "timestamp": { "$ref": "#/$defs/Timestamp" },
-        "body": { "type": "object" }
-      },
-      "allOf": [
-        { "if": { "properties": { "type": { "const": "output" } } }, "then": { "properties": { "body": { "$ref": "#/$defs/TerminalOutputBody" } } } },
-        { "if": { "properties": { "type": { "const": "resize" } } }, "then": { "properties": { "body": { "$ref": "#/$defs/TerminalResizeBody" } } } },
-        { "if": { "properties": { "type": { "const": "title" } } }, "then": { "properties": { "body": { "type": "object", "additionalProperties": false, "required": ["title"], "properties": { "title": { "type": "string" } } } } } },
-        { "if": { "properties": { "type": { "const": "bell" } } }, "then": { "properties": { "body": { "type": "object", "maxProperties": 0 } } } },
-        { "if": { "properties": { "type": { "const": "exit" } } }, "then": { "properties": { "body": { "$ref": "#/$defs/TerminalExitBody" } } } },
-        { "if": { "properties": { "type": { "const": "resync" } } }, "then": { "properties": { "body": { "type": "object", "additionalProperties": false, "required": ["screen"], "properties": { "screen": { "$ref": "#/$defs/TerminalScreen" } } } } } }
-      ]
-    },
-    "TerminalOutputBody": {
-      "type": "object", "additionalProperties": false, "required": ["data_base64", "redacted", "truncated"],
-      "properties": { "data_base64": { "type": "string", "contentEncoding": "base64" }, "redacted": { "type": "boolean" }, "truncated": { "type": "boolean" } }
-    },
-    "TerminalResizeBody": {
-      "type": "object", "additionalProperties": false, "required": ["rows", "columns"],
-      "properties": { "rows": { "type": "integer", "minimum": 1 }, "columns": { "type": "integer", "minimum": 1 } }
-    },
-    "TerminalExitBody": {
-      "type": "object", "additionalProperties": false,
-      "properties": { "exit_code": { "type": ["integer", "null"] }, "exit_signal": { "type": ["integer", "null"] }, "reason": { "type": "string" } }
-    },
-    "TerminalFramePage": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["kind", "terminal_id", "runtime_incarnation", "frames", "resume_sequence"],
-      "properties": {
-        "kind": { "const": "terminal-frame-page" },
-        "terminal_id": { "$ref": "#/$defs/Id" },
-        "runtime_incarnation": { "type": "string" },
-        "frames": { "type": "array", "items": { "$ref": "#/$defs/TerminalFrame" } },
-        "resume_sequence": { "type": "integer", "minimum": 0 }
       }
     },
     "ErrorEnvelope": {

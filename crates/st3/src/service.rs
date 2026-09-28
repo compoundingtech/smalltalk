@@ -13,9 +13,12 @@ use anyhow::bail;
 
 use crate::config::Config;
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod install;
+
+#[cfg(any(target_os = "linux", test))]
 const SERVICE_NAME: &str = "st3.service";
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", test))]
 const REPLICATION_SERVICE_NAME: &str = "st3-replication.service";
 const SERVICE_LABEL: &str = "com.compoundingtech.st3";
 const REPLICATION_SERVICE_LABEL: &str = "com.compoundingtech.st3.replication";
@@ -434,104 +437,13 @@ fn start_native_service() -> Result<()> {
 
 #[cfg(target_os = "macos")]
 fn install_native_service(spec: &ServiceSpec) -> Result<()> {
-    let plist = launch_agent_path()?;
-    let replication_plist = replication_launch_agent_path()?;
-    let logs = spec.config.state_dir.join("logs");
-    fs::create_dir_all(&logs)?;
-    if let Some(parent) = plist.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let previous = read_existing_file(&plist)?;
-    let previous_replication = read_existing_file(&replication_plist)?;
-    fs::write(&plist, render_launchd_plist(spec))?;
-    if spec.config.fleet_id.is_some() {
-        fs::write(&replication_plist, render_launchd_replication_plist(spec))?;
-    }
-    let domain = launch_domain();
-    let service = format!("{domain}/{SERVICE_LABEL}");
-    let replication_service = format!("{domain}/{REPLICATION_SERVICE_LABEL}");
-    let install = (|| -> Result<()> {
-        let _ = Command::new("launchctl")
-            .args(["bootout", &service])
-            .status();
-        let _ = Command::new("launchctl")
-            .args(["bootout", &replication_service])
-            .status();
-        run_command("launchctl", &["enable", &service])?;
-        run_command(
-            "launchctl",
-            &["bootstrap", &domain, &plist.display().to_string()],
-        )?;
-        run_command("launchctl", &["kickstart", &service])?;
-        if spec.config.fleet_id.is_some() {
-            run_command("launchctl", &["enable", &replication_service])?;
-            run_command(
-                "launchctl",
-                &[
-                    "bootstrap",
-                    &domain,
-                    &replication_plist.display().to_string(),
-                ],
-            )?;
-            run_command("launchctl", &["kickstart", &replication_service])?;
-        } else {
-            let _ = Command::new("launchctl")
-                .args(["disable", &replication_service])
-                .status();
-            if replication_plist.exists() {
-                fs::remove_file(&replication_plist)?;
-            }
-        }
-        wait_for_service_sockets(&spec.config)
-    })();
-    if let Err(error) = install {
-        let rollback = (|| -> Result<()> {
-            let _ = Command::new("launchctl")
-                .args(["bootout", &service])
-                .status();
-            let _ = Command::new("launchctl")
-                .args(["bootout", &replication_service])
-                .status();
-            restore_file(&plist, previous.as_deref())?;
-            restore_file(&replication_plist, previous_replication.as_deref())?;
-            if previous.is_some() {
-                run_command("launchctl", &["enable", &service])?;
-                run_command(
-                    "launchctl",
-                    &["bootstrap", &domain, &plist.display().to_string()],
-                )?;
-                run_command("launchctl", &["kickstart", &service])?;
-            } else {
-                let _ = Command::new("launchctl")
-                    .args(["disable", &service])
-                    .status();
-            }
-            if previous_replication.is_some() {
-                run_command("launchctl", &["enable", &replication_service])?;
-                run_command(
-                    "launchctl",
-                    &[
-                        "bootstrap",
-                        &domain,
-                        &replication_plist.display().to_string(),
-                    ],
-                )?;
-                run_command("launchctl", &["kickstart", &replication_service])?;
-            }
-            Ok(())
-        })();
-        if let Err(rollback) = rollback {
-            return Err(error).context(format!(
-                "the launchd install failed, and rollback also failed: {rollback:#}"
-            ));
-        }
-        return Err(error).context("the launchd install failed; st restored the prior service");
-    }
-    println!("plist\t{}", plist.display());
-    if spec.config.fleet_id.is_some() {
-        println!("replication-plist\t{}", replication_plist.display());
-    }
-    Ok(())
+    install::launchd(
+        spec,
+        &launch_agent_path()?,
+        &replication_launch_agent_path()?,
+        &launch_domain(),
+        &mut install::NativeCommands("launchctl"),
+    )
 }
 
 #[cfg(target_os = "macos")]
@@ -683,76 +595,12 @@ fn start_native_service() -> Result<()> {
 
 #[cfg(target_os = "linux")]
 fn install_systemd_user(spec: &ServiceSpec) -> Result<()> {
-    let unit_path = systemd_user_unit_path()?;
-    let replication_path = replication_systemd_user_unit_path()?;
-    if let Some(parent) = unit_path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let previous = read_existing_file(&unit_path)?;
-    let previous_replication = read_existing_file(&replication_path)?;
-    fs::write(&unit_path, render_systemd_user_unit(spec))?;
-    if spec.config.fleet_id.is_some() {
-        fs::write(&replication_path, render_systemd_replication_unit(spec))?;
-    }
-    let install = (|| -> Result<()> {
-        run_command("systemctl", &["--user", "daemon-reload"])?;
-        run_command("systemctl", &["--user", "enable", SERVICE_NAME])?;
-        run_command("systemctl", &["--user", "restart", SERVICE_NAME])?;
-        if spec.config.fleet_id.is_some() {
-            run_command("systemctl", &["--user", "enable", REPLICATION_SERVICE_NAME])?;
-            run_command(
-                "systemctl",
-                &["--user", "restart", REPLICATION_SERVICE_NAME],
-            )?;
-        } else {
-            let _ = Command::new("systemctl")
-                .args(["--user", "disable", "--now", REPLICATION_SERVICE_NAME])
-                .status();
-            if replication_path.exists() {
-                fs::remove_file(&replication_path)?;
-                run_command("systemctl", &["--user", "daemon-reload"])?;
-            }
-        }
-        wait_for_service_sockets(&spec.config)
-    })();
-    if let Err(error) = install {
-        let rollback = (|| -> Result<()> {
-            if previous.is_some() {
-                restore_file(&unit_path, previous.as_deref())?;
-                restore_file(&replication_path, previous_replication.as_deref())?;
-                run_command("systemctl", &["--user", "daemon-reload"])?;
-                run_command("systemctl", &["--user", "restart", SERVICE_NAME])?;
-                if previous_replication.is_some() {
-                    run_command(
-                        "systemctl",
-                        &["--user", "restart", REPLICATION_SERVICE_NAME],
-                    )?;
-                }
-            } else {
-                let _ = Command::new("systemctl")
-                    .args(["--user", "disable", "--now", SERVICE_NAME])
-                    .status();
-                let _ = Command::new("systemctl")
-                    .args(["--user", "disable", "--now", REPLICATION_SERVICE_NAME])
-                    .status();
-                restore_file(&unit_path, None)?;
-                restore_file(&replication_path, previous_replication.as_deref())?;
-                run_command("systemctl", &["--user", "daemon-reload"])?;
-            }
-            Ok(())
-        })();
-        if let Err(rollback) = rollback {
-            return Err(error).context(format!(
-                "the systemd install failed, and rollback also failed: {rollback:#}"
-            ));
-        }
-        return Err(error).context("the systemd install failed; st restored the prior service");
-    }
-    println!("unit\t{}", unit_path.display());
-    if spec.config.fleet_id.is_some() {
-        println!("replication-unit\t{}", replication_path.display());
-    }
-    Ok(())
+    install::systemd(
+        spec,
+        &systemd_user_unit_path()?,
+        &replication_systemd_user_unit_path()?,
+        &mut install::NativeCommands("systemctl"),
+    )
 }
 
 #[cfg(target_os = "linux")]
@@ -864,12 +712,7 @@ fn start_native_service() -> Result<()> {
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn run_command(program: &str, arguments: &[&str]) -> Result<()> {
-    let status = Command::new(program)
-        .args(arguments)
-        .status()
-        .with_context(|| format!("run {program} {}", arguments.join(" ")))?;
-    anyhow::ensure!(status.success(), "{program} failed with {status}");
-    Ok(())
+    install::Commands::run(&mut install::NativeCommands(program), arguments)
 }
 
 #[cfg(target_os = "macos")]
