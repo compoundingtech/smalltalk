@@ -2881,7 +2881,7 @@ fn apply_v1_requires_a_declared_pty_root_outside_the_catalog() {
     let temp = tempfile::tempdir().unwrap();
     for case in ["default", "relative", "catalog-variable"] {
         let catalog = temp.path().join(format!("catalog-{case}"));
-        write_agent(&catalog, "worker", false);
+        fs::create_dir_all(&catalog).unwrap();
         match case {
             "default" => {}
             "relative" => fs::write(
