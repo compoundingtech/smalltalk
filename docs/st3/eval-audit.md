@@ -1,8 +1,8 @@
-# st3 eval audit
+# st eval audit
 
 Status: reviewed on 2026-09-08.
 
-This table records the purpose and the prompt boundary for every st3 eval.
+This table records the purpose and the prompt boundary for every st eval.
 
 | Eval | Audit result |
 | --- | --- |
@@ -43,4 +43,4 @@ This table records the purpose and the prompt boundary for every st3 eval.
 | `weird-git-setup` | Keep. It proves work in a nonstandard repository layout. |
 | `work-wake-reliability` | Keep. It repeatedly proves fresh mission assignment, two live revisions, post-restart assignment, durable wake acknowledgement, cancellation, and agentless finalization without terminal input. |
 
-Eval personas can contain domain facts and fixture ownership. They cannot duplicate st3 conversations, claim, or boot procedures.
+Eval personas can contain domain facts and fixture ownership. They cannot duplicate st conversations, claim, or boot procedures.
