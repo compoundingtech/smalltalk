@@ -164,6 +164,7 @@ fn record_member_commands(
         crate::recorder::prepend(recorder, environment.get("PATH").map(std::ffi::OsStr::new))?;
     environment.insert("PATH".into(), path.to_string_lossy().into_owned());
     Ok(())
+}
 
 fn observed_pty_status(observation: &st_runtime::PtyObservation) -> String {
     if observation.status == "running"
