@@ -22,9 +22,9 @@ use tokio::sync::watch;
 use crate::client::Client;
 use crate::config::{Config, PeerConfig};
 use crate::model::{
-    ApiResponse, ReplicationExchange, ReplicationExportRequest, ReplicationExportResponse,
-    ReplicationInventory, ReplicationPeerFailureRequest, ReplicationReceiveRequest,
-    ReplicationReceiveResponse,
+    ApiResponse, ReplicaEnvelopeId, ReplicationExchange, ReplicationExportRequest,
+    ReplicationExportResponse, ReplicationInventory, ReplicationPeerFailureRequest,
+    ReplicationReceiveRequest, ReplicationReceiveResponse,
 };
 #[cfg(test)]
 use crate::store::Store;
@@ -410,6 +410,7 @@ impl PeerBackend {
         fleet_id: &str,
         inventory: &ReplicationInventory,
         summary_only: bool,
+        signature_requests: &[ReplicaEnvelopeId],
     ) -> Result<ReplicationExportResponse> {
         match self {
             Self::Main(client) => {
@@ -420,6 +421,7 @@ impl PeerBackend {
                             fleet_id: fleet_id.to_owned(),
                             inventory: inventory.clone(),
                             summary_only,
+                            signature_requests: signature_requests.to_vec(),
                         },
                     )
                     .await
@@ -429,7 +431,11 @@ impl PeerBackend {
                 let exchange = if summary_only {
                     store.export_replication_summary(fleet_id)?
                 } else {
-                    store.export_replication_exchange(fleet_id, inventory)?
+                    store.export_replication_exchange_answering(
+                        fleet_id,
+                        inventory,
+                        signature_requests,
+                    )?
                 };
                 Ok(ReplicationExportResponse {
                     exchange,
@@ -890,7 +896,12 @@ async fn receive_exchange(
         }
         let response = state
             .backend
-            .export(state.auth.fleet_id(), &request.inventory, false)
+            .export(
+                state.auth.fleet_id(),
+                &request.inventory,
+                false,
+                &request.signature_requests,
+            )
             .await?;
         signed_response(
             &state,
@@ -1008,7 +1019,7 @@ async fn exchange(
     main_socket: &Path,
 ) -> Result<bool> {
     let first = backend
-        .export(auth.fleet_id(), &ReplicationInventory::default(), true)
+        .export(auth.fleet_id(), &ReplicationInventory::default(), true, &[])
         .await?
         .exchange;
     let local_digest = first.inventory.digest.clone();
@@ -1027,9 +1038,16 @@ async fn exchange(
     }
     let mut pushed = false;
     let mut pulled_follow_up = false;
-    if different {
+    // A follow-up also carries the signatures the peer asked for, even when both sides hold
+    // the same envelopes.
+    if different || !remote.signature_requests.is_empty() {
         let push = backend
-            .export(auth.fleet_id(), &remote.inventory, false)
+            .export(
+                auth.fleet_id(),
+                &remote.inventory,
+                false,
+                &remote.signature_requests,
+            )
             .await?
             .exchange;
         pushed = !push.envelopes.is_empty();
@@ -1552,6 +1570,8 @@ mod tests {
             graph_digest: String::new(),
             inventory: ReplicationInventory::default(),
             envelopes: Vec::new(),
+            signature_requests: Vec::new(),
+            signatures: Vec::new(),
         };
         let mut body = serde_json::to_vec(&exchange).unwrap();
         body.resize(2 * 1024 * 1024 + 1, b' ');
@@ -1775,12 +1795,12 @@ mod tests {
         assert!(received.changed);
         assert!(received.receipt.received > 0);
         let exported = backend
-            .export(fleet, &ReplicationInventory::default(), false)
+            .export(fleet, &ReplicationInventory::default(), false, &[])
             .await
             .unwrap();
         assert!(!exported.exchange.inventory.envelopes.is_empty());
         let summary = backend
-            .export(fleet, &ReplicationInventory::default(), true)
+            .export(fleet, &ReplicationInventory::default(), true, &[])
             .await
             .unwrap();
         assert!(summary.exchange.inventory.envelopes.is_empty());

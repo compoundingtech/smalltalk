@@ -3338,6 +3338,52 @@ fn doctor_report(state: &AppState) -> Result<Json<DoctorReport>, ApiError> {
             message: error.to_string(),
         }),
     }
+    // Once a node pins a fleet anchor, membership decides admission. Report what waits for a
+    // signature, what is fenced, and what was admitted before this node knew better.
+    match state.store.fleet_anchor() {
+        Ok(None) => {}
+        Ok(Some(_)) => match (
+            state
+                .store
+                .replication_status(true, state.fleet_id.as_deref(), &[]),
+            state.store.fleet_admission_residue(),
+        ) {
+            (Ok(holds), Ok(residue)) => {
+                let mut notes = vec![format!(
+                    "{} envelopes wait for their writer's signature; {} are fenced",
+                    holds.unsigned_envelopes, holds.fenced_envelopes
+                )];
+                notes.extend(residue.iter().map(|item| {
+                    format!(
+                        "{} envelopes from {} were {}",
+                        item.envelopes,
+                        item.writer,
+                        item.reason.replace('-', " ")
+                    )
+                }));
+                checks.push(DoctorCheck {
+                    name: "fleet-admission".into(),
+                    status: if residue.is_empty() && holds.unsigned_envelopes == 0 {
+                        "pass"
+                    } else {
+                        "warn"
+                    }
+                    .into(),
+                    message: notes.join("; "),
+                });
+            }
+            (Err(error), _) | (_, Err(error)) => checks.push(DoctorCheck {
+                name: "fleet-admission".into(),
+                status: "fail".into(),
+                message: error.to_string(),
+            }),
+        },
+        Err(error) => checks.push(DoctorCheck {
+            name: "fleet-admission".into(),
+            status: "fail".into(),
+            message: error.to_string(),
+        }),
+    }
     let report_status = if checks.iter().any(|check| check.status == "fail") {
         "fail"
     } else if checks.iter().any(|check| check.status == "warn") {
@@ -3448,7 +3494,11 @@ async fn replication_export(
         let exchange = if request.summary_only {
             store.export_replication_summary(&request.fleet_id)?
         } else {
-            store.export_replication_exchange(&request.fleet_id, &request.inventory)?
+            store.export_replication_exchange_answering(
+                &request.fleet_id,
+                &request.inventory,
+                &request.signature_requests,
+            )?
         };
         Ok(Json(ReplicationExportResponse {
             exchange,
@@ -3478,21 +3528,21 @@ async fn replication_receive(
         store
             .record_transport_observation(&request.peer, "up", None, None)
             .map_err(|error| St3Error::new("internal", error.to_string()))?;
-        let (admission, repairs, projected) = if replication_receive_has_new_data(receipt.received)
-        {
-            let admission = store
-                .validate_replication_backlog()
-                .map_err(|error| St3Error::new("internal", error.to_string()))?;
-            let repairs = store
-                .apply_replication_repairs()
-                .map_err(|error| St3Error::new("internal", error.to_string()))?;
-            let projected = store
-                .project_replication_backlog()
-                .map_err(|error| St3Error::new("internal", error.to_string()))?;
-            (admission, repairs, projected)
-        } else {
-            (Default::default(), 0, true)
-        };
+        let (admission, repairs, projected) =
+            if replication_receive_has_new_data(receipt.received + receipt.signatures) {
+                let admission = store
+                    .validate_replication_backlog()
+                    .map_err(|error| St3Error::new("internal", error.to_string()))?;
+                let repairs = store
+                    .apply_replication_repairs()
+                    .map_err(|error| St3Error::new("internal", error.to_string()))?;
+                let projected = store
+                    .project_replication_backlog()
+                    .map_err(|error| St3Error::new("internal", error.to_string()))?;
+                (admission, repairs, projected)
+            } else {
+                (Default::default(), 0, true)
+            };
         let store_index = store
             .index()
             .map_err(|error| St3Error::new("internal", error.to_string()))?;
