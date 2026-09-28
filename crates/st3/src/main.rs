@@ -8667,11 +8667,12 @@ async fn renew_claimed_work(client: &Client, subject: &str, minute: u64) -> Resu
     let work: Vec<StepRunView> = client
         .get(&format!("/v1/work?actor={}", urlencoding::encode(subject)))
         .await?;
+    let mut failure = None;
     for step in work
         .into_iter()
         .filter(|step| work_claim_has_active_harness(step, subject, harness))
     {
-        let _: StepRunView = client
+        let renewed: Result<StepRunView> = client
             .post(
                 &format!("/v1/work/renew/{}", urlencoding::encode(&step.subject)),
                 &WorkRequest {
@@ -8683,9 +8684,31 @@ async fn renew_claimed_work(client: &Client, subject: &str, minute: u64) -> Resu
                     idempotency_key: format!("native-renew:{}:{subject}:{minute}", step.subject),
                 },
             )
-            .await?;
+            .await;
+        match renewed {
+            Ok(_) => {}
+            // The claim moved on between reading the work and renewing it. That step no longer
+            // needs this lease, and the driver's other steps still do.
+            Err(error) if renewal_lost_its_claim(&error) => {
+                let _ = write_driver_log(
+                    subject,
+                    &format!("skip renewing {}: {error:#}", step.subject),
+                );
+            }
+            Err(error) => {
+                failure.get_or_insert(error);
+            }
+        }
     }
-    Ok(())
+    failure.map_or(Ok(()), Err)
+}
+
+/// Whether a renewal failed only because the step's claim ended or moved to another incarnation.
+fn renewal_lost_its_claim(error: &anyhow::Error) -> bool {
+    matches!(
+        st3::client::api_error_code(error),
+        Some("work-not-claimed" | "wrong-work-incarnation")
+    )
 }
 
 fn work_claim_has_active_harness(
@@ -8829,6 +8852,42 @@ async fn record_native_delivery_diagnostic(
     Ok(())
 }
 
+async fn report_unforwarded_message(
+    client: &Client,
+    subject: &str,
+    incarnation: &str,
+    transport: &str,
+    message: &str,
+    reason: &str,
+) -> Result<()> {
+    let _: ClaimRecord = client
+        .post(
+            "/v1/claims",
+            &ClaimInput {
+                subject: subject.into(),
+                kind: "harness.diagnostic".into(),
+                actor: Some(subject.into()),
+                fields: BTreeMap::from([
+                    ("severity".into(), Value::String("warning".into())),
+                    ("status".into(), Value::String("degraded".into())),
+                    ("code".into(), Value::String("message-unforwarded".into())),
+                    (
+                        "reason".into(),
+                        Value::String(format!("{message} could not be forwarded: {reason}")),
+                    ),
+                    ("incarnation_id".into(), Value::String(incarnation.into())),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some(format!(
+                    "message-unforwarded:{subject}:{incarnation}:{transport}:{message}"
+                )),
+            },
+        )
+        .await?;
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn supervise_native_delivery(
     client: &Client,
@@ -8844,7 +8903,20 @@ async fn supervise_native_delivery(
         return;
     }
     match forward_projected_messages(client, subject, inbox, archive, transport, receipts).await {
-        Ok(()) => {
+        Ok(unforwarded) => {
+            // A message that cannot be forwarded is recorded once on its own and retried with the
+            // next poll. It never pauses delivery of the recipient's other messages.
+            for (message, reason) in unforwarded {
+                let _ = report_unforwarded_message(
+                    client,
+                    subject,
+                    incarnation,
+                    transport,
+                    &message,
+                    &reason,
+                )
+                .await;
+            }
             if supervisor.failures == 0 {
                 return;
             }
@@ -8918,6 +8990,8 @@ async fn supervise_native_delivery(
     }
 }
 
+/// Forward the recipient's queued messages into its native inbox. Each message is forwarded on
+/// its own; the ones that could not be forwarded are returned with their reasons.
 async fn forward_projected_messages(
     client: &Client,
     subject: &str,
@@ -8925,7 +8999,7 @@ async fn forward_projected_messages(
     archive: &Path,
     transport: &str,
     receipts: NativeDeliveryReceipts<'_>,
-) -> Result<()> {
+) -> Result<Vec<(String, String)>> {
     const TAG_PREFIX: &str = "st3-message:";
     let mut present = projected_message_files(inbox, archive)?;
     let mut consumed_by_recipient = BTreeSet::new();
@@ -8952,6 +9026,7 @@ async fn forward_projected_messages(
         } => st2::opencode_session::consumed_delivery_filenames(catalog_root, identity, runtime_id),
     }?;
     let mut cursor = None;
+    let mut failures = Vec::new();
     loop {
         let page = message_page(client, Some(subject), false, cursor.as_deref()).await?;
         for message in page.items {
@@ -8963,69 +9038,79 @@ async fn forward_projected_messages(
             if !matches!(message.status.as_str(), "sent" | "staged") {
                 continue;
             }
-            let filename = if let Some(filename) = present.get(&message.subject) {
-                filename.clone()
-            } else {
-                let content = if message.content.starts_with("doc/") {
-                    let value: Value = client
-                        .get(&format!(
-                            "/v1/documents/content?reference={}",
-                            urlencoding::encode(&message.content)
-                        ))
-                        .await?;
-                    let bytes = serde_json::from_value::<Vec<u8>>(
-                        value
-                            .get("bytes")
-                            .cloned()
-                            .context("document response lacks bytes")?,
-                    )?;
-                    String::from_utf8(bytes).context("message document is not UTF-8")?
+            // One message that cannot be forwarded, such as a document missing on this host, is
+            // reported without holding back the messages after it.
+            let message_subject = message.subject.clone();
+            let forwarded: Result<()> = async {
+                let filename = if let Some(filename) = present.get(&message.subject) {
+                    filename.clone()
                 } else {
-                    message.content.clone()
+                    let content = if message.content.starts_with("doc/") {
+                        let value: Value = client
+                            .get(&format!(
+                                "/v1/documents/content?reference={}",
+                                urlencoding::encode(&message.content)
+                            ))
+                            .await?;
+                        let bytes = serde_json::from_value::<Vec<u8>>(
+                            value
+                                .get("bytes")
+                                .cloned()
+                                .context("document response lacks bytes")?,
+                        )?;
+                        String::from_utf8(bytes).context("message document is not UTF-8")?
+                    } else {
+                        message.content.clone()
+                    };
+                    let mut tags = message.tags.clone();
+                    tags.push(format!("{TAG_PREFIX}{}", message.subject));
+                    tags.push(format!("{}{}", st2::ding::ST3_TO_TAG, message.to));
+                    tags.push(format!(
+                        "{}{}",
+                        st2::ding::ST3_SHA256_TAG,
+                        st2::ding::st3_body_sha256(&content)
+                    ));
+                    let filename = st2::message::send_to_inbox(
+                        inbox,
+                        &message.from,
+                        message.title.as_deref(),
+                        message.in_reply_to.as_deref(),
+                        &tags,
+                        &content,
+                    )?;
+                    present.insert(message.subject.clone(), filename.clone());
+                    filename
                 };
-                let mut tags = message.tags.clone();
-                tags.push(format!("{TAG_PREFIX}{}", message.subject));
-                tags.push(format!("{}{}", st2::ding::ST3_TO_TAG, message.to));
-                tags.push(format!(
-                    "{}{}",
-                    st2::ding::ST3_SHA256_TAG,
-                    st2::ding::st3_body_sha256(&content)
-                ));
-                let filename = st2::message::send_to_inbox(
-                    inbox,
-                    &message.from,
-                    message.title.as_deref(),
-                    message.in_reply_to.as_deref(),
-                    &tags,
-                    &content,
-                )?;
-                present.insert(message.subject.clone(), filename.clone());
-                filename
-            };
-            if message.status == "sent" {
-                stage_message(
+                if message.status == "sent" {
+                    stage_message(
+                        client,
+                        &message.subject,
+                        subject,
+                        transport,
+                        stage_runtime_id,
+                        format!("native-staged:{transport}:{subject}:{}", message.subject),
+                    )
+                    .await?;
+                }
+                // Receipt-backed transports advance graph delivery only after their durable ledger proves
+                // that the exact inbox file was consumed by a provider turn. Materialization alone is
+                // merely queued native delivery.
+                if !native_delivery_receipted(&consumed, &filename) {
+                    return Ok(());
+                }
+                deliver_message(
                     client,
                     &message.subject,
                     subject,
-                    transport,
-                    stage_runtime_id,
-                    format!("native-staged:{transport}:{subject}:{}", message.subject),
+                    format!("native-delivered:{transport}:{subject}:{}", message.subject),
                 )
                 .await?;
+                Ok(())
             }
-            // Receipt-backed transports advance graph delivery only after their durable ledger proves
-            // that the exact inbox file was consumed by a provider turn. Materialization alone is
-            // merely queued native delivery.
-            if !native_delivery_receipted(&consumed, &filename) {
-                continue;
+            .await;
+            if let Err(error) = forwarded {
+                failures.push((message_subject, format!("{error:#}")));
             }
-            deliver_message(
-                client,
-                &message.subject,
-                subject,
-                format!("native-delivered:{transport}:{subject}:{}", message.subject),
-            )
-            .await?;
         }
         match page.next_cursor {
             Some(next) => cursor = Some(next),
@@ -9053,7 +9138,7 @@ async fn forward_projected_messages(
         }
     }
     sync_consumed_projected_messages(inbox, archive, &consumed_by_recipient)?;
-    Ok(())
+    Ok(failures)
 }
 
 #[derive(Clone, Copy)]
@@ -12025,6 +12110,122 @@ mission "review" state="ready" {
                 st2::ding::st3_body_sha256("FACT <b>QUARTZ</b>")
             )
         );
+    }
+
+    /// A renewal race, where the step's claim ended between reading the work and renewing it, is
+    /// not a reason to end the driver. Any other API error still is.
+    #[tokio::test]
+    async fn a_renewal_that_lost_its_claim_is_skipped_rather_than_ending_the_driver() {
+        use axum::{Router, http::StatusCode, response::IntoResponse as _, routing::post};
+
+        let app = Router::new()
+            .route(
+                "/v1/work/renew/step-run/lost",
+                post(|| async {
+                    (
+                        StatusCode::CONFLICT,
+                        axum::Json(serde_json::json!({
+                            "code": "work-not-claimed",
+                            "message": "the step is not claimed"
+                        })),
+                    )
+                        .into_response()
+                }),
+            )
+            .route(
+                "/v1/work/renew/step-run/broken",
+                post(|| async {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        axum::Json(serde_json::json!({
+                            "code": "internal",
+                            "message": "the store failed"
+                        })),
+                    )
+                        .into_response()
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = Client::new(Endpoint::Http(format!("http://{address}")));
+        let renew = |step: &'static str| {
+            let client = &client;
+            async move {
+                client
+                    .post::<_, Value>(
+                        &format!("/v1/work/renew/step-run/{step}"),
+                        &serde_json::json!({}),
+                    )
+                    .await
+                    .unwrap_err()
+            }
+        };
+        assert!(renewal_lost_its_claim(&renew("lost").await));
+        assert!(!renewal_lost_its_claim(&renew("broken").await));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn one_message_that_cannot_be_forwarded_does_not_hold_back_the_next() {
+        use axum::{Json, Router, routing::get};
+
+        let app = Router::new().route(
+            "/v1/messages/page",
+            get(|| async {
+                Json(serde_json::json!({
+                    "api_version": "st3.v1",
+                    "value": {
+                        "items": [
+                            {
+                                "subject": "message/missing", "from": "agent/sender",
+                                "to": "agent/test", "content": "doc/notes/missing@abc",
+                                "status": "staged", "created_index": 1
+                            },
+                            {
+                                "subject": "message/next", "from": "agent/sender",
+                                "to": "agent/test", "content": "the next message",
+                                "status": "staged", "created_index": 2
+                            }
+                        ],
+                        "has_more": false, "next_cursor": null, "limit": 100
+                    }
+                }))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = Client::new(Endpoint::Http(format!("http://{address}")));
+        let root = tempfile::tempdir().unwrap();
+        let inbox = root.path().join("inbox");
+        let archive = root.path().join("archive");
+
+        let unforwarded = forward_projected_messages(
+            &client,
+            "agent/test",
+            &inbox,
+            &archive,
+            "claude-channel",
+            NativeDeliveryReceipts::ClaudeChannel {
+                agent_dir: root.path(),
+                incarnation: "one",
+            },
+        )
+        .await
+        .unwrap();
+        server.abort();
+
+        assert_eq!(
+            unforwarded
+                .iter()
+                .map(|(message, _)| message.as_str())
+                .collect::<Vec<_>>(),
+            ["message/missing"]
+        );
+        let projected = st2::message::list_inbox(&inbox).unwrap();
+        assert_eq!(projected.len(), 1);
+        assert_eq!(projected[0].body, "the next message\n");
     }
 
     #[tokio::test]

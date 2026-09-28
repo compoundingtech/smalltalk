@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 use std::future::Future;
 use std::path::Path;
 use std::pin::Pin;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context as _, Result, bail};
 use serde_json::{Value, json};
@@ -165,9 +165,7 @@ fn parse_github_ref_locator(locator: &str) -> Result<GithubRefLocator> {
 
 async fn observe_github_ref(request: ObservationRequest) -> Result<ProviderObservation> {
     let locator = parse_github_ref_locator(&request.locator)?;
-    let client = reqwest::Client::builder()
-        .user_agent("st3-resource-observer/0.1")
-        .build()?;
+    let client = github_client()?;
     let token = github_token().await;
     let request_json = |url: String| {
         let request = client
@@ -305,9 +303,7 @@ async fn observe_github_repository_at(
         !owner.is_empty() && !repository.is_empty() && !repository.contains('/'),
         "a GitHub repository locator needs OWNER/REPO"
     );
-    let client = reqwest::Client::builder()
-        .user_agent("st3-resource-observer/0.1")
-        .build()?;
+    let client = github_client()?;
     let request_json = |url: String, etag: Option<&str>| {
         let mut request = client
             .get(url)
@@ -482,9 +478,43 @@ fn github_next_page(link: &str) -> Option<String> {
     })
 }
 
+/// A hung connection must end, or its observer would never be polled again.
+const GITHUB_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const GITHUB_REQUEST_TIMEOUT: Duration = if cfg!(test) {
+    Duration::from_secs(2)
+} else {
+    Duration::from_secs(60)
+};
+/// How long `gh auth token` may take, and how long a failed lookup waits before the next one.
+const GITHUB_TOKEN_LOOKUP_TIMEOUT: Duration = Duration::from_secs(10);
+const GITHUB_TOKEN_RETRY: Duration = Duration::from_secs(5 * 60);
+
+fn github_client() -> Result<reqwest::Client> {
+    Ok(reqwest::Client::builder()
+        .user_agent("st3-resource-observer/0.1")
+        .connect_timeout(GITHUB_CONNECT_TIMEOUT)
+        .timeout(GITHUB_REQUEST_TIMEOUT)
+        .build()?)
+}
+
+/// The token for GitHub requests. A token is kept once found. A lookup that fails or hangs is
+/// tried again later, so one failure never leaves every observer unauthenticated for the life of
+/// the daemon.
 async fn github_token() -> Option<String> {
-    static TOKEN: tokio::sync::OnceCell<Option<String>> = tokio::sync::OnceCell::const_new();
-    TOKEN.get_or_init(lookup_github_token).await.clone()
+    static TOKEN: tokio::sync::Mutex<Option<(Option<String>, Instant)>> =
+        tokio::sync::Mutex::const_new(None);
+    let mut cached = TOKEN.lock().await;
+    if let Some((token, looked_up)) = cached.as_ref()
+        && (token.is_some() || looked_up.elapsed() < GITHUB_TOKEN_RETRY)
+    {
+        return token.clone();
+    }
+    let token = tokio::time::timeout(GITHUB_TOKEN_LOOKUP_TIMEOUT, lookup_github_token())
+        .await
+        .ok()
+        .flatten();
+    *cached = Some((token.clone(), Instant::now()));
+    token
 }
 
 async fn lookup_github_token() -> Option<String> {
@@ -650,9 +680,7 @@ async fn observe_github_pull_request(request: ObservationRequest) -> Result<Prov
     let number = number
         .parse::<u64>()
         .context("a GitHub pull request number must be an integer")?;
-    let client = reqwest::Client::builder()
-        .user_agent("st3-resource-observer/0.1")
-        .build()?;
+    let client = github_client()?;
     let token = github_token().await;
     let request_json = |url: String| {
         let request = client
@@ -920,6 +948,33 @@ mod tests {
         assert_eq!(facts["pull_requests"].as_array().unwrap().len(), 2);
         let repeated = normalize_github_repository(Some(&facts), 7, &[], &[], &fields).unwrap();
         assert_eq!(repeated, facts);
+    }
+
+    /// A provider that accepts the connection and never answers must not hold its observer forever.
+    #[tokio::test]
+    async fn a_github_request_that_never_answers_times_out() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            drop(stream);
+        });
+        let request = ObservationRequest {
+            provider: "github.repository".into(),
+            locator: "example/repo".into(),
+            fields: BTreeSet::from(["issues".into()]),
+            cursor: None,
+            previous_facts: None,
+        };
+        let observed = tokio::time::timeout(
+            Duration::from_secs(10),
+            observe_github_repository_at(request, &base, None),
+        )
+        .await
+        .expect("the request did not time out");
+        assert!(observed.is_err());
+        server.abort();
     }
 
     #[tokio::test]
