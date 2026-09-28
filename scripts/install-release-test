@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+repo=$(cd "$(dirname "$0")/.." && pwd)
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
+mkdir -p "$work/package/bin" "$work/installed"
+cp "$repo/scripts/install-release" "$work/package/install.sh"
+for binary in st3 stui st3-migrate pty; do
+  printf '#!/bin/sh\necho new-%s\n' "$binary" > "$work/package/bin/$binary"
+  chmod +x "$work/package/bin/$binary"
+  printf 'old\n' > "$work/installed/$binary"
+done
+ln -s /missing/old-st "$work/installed/st"
+"$work/package/install.sh" --bin-dir "$work/installed"
+test "$(readlink "$work/installed/st")" = st3
+test "$("$work/installed/st")" = new-st3
+for binary in st3 stui st3-migrate pty; do
+  test "$("$work/installed/$binary")" = "new-$binary"
+done
+# Missing payload and directory collisions must fail before replacing installed files.
+rm "$work/package/bin/pty"
+if "$work/package/install.sh" --bin-dir "$work/installed"; then exit 1; fi
+test "$("$work/installed/st")" = new-st3
+cp "$work/package/bin/st3" "$work/package/bin/pty"
+mkdir -p "$work/blocked/st"
+if "$work/package/install.sh" --bin-dir "$work/blocked"; then exit 1; fi
+test ! -e "$work/blocked/st3"
+echo 'Release installer tests passed'

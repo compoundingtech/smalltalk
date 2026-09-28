@@ -168,9 +168,56 @@ pub struct Config {
     pub peers: Vec<PeerConfig>,
     /// Default harness configuration for new planning sessions only.
     pub planner: PlannerSpec,
+    /// The local observation log of this node.
+    pub observations: ObservationsConfig,
     /// `STATE/fleet/fleet.toml`, merged by `apply_fleet_file` after command-line overrides.
     #[serde(skip)]
     pub fleet: Option<FleetFile>,
+}
+
+/// Observations of `local` retention stay on the node that made them. The daemon trims
+/// them once an hour; the newest observation of each subject and kind always stays.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ObservationsConfig {
+    /// How long to keep an observation, as a number followed by `s`, `m`, `h` or `d`.
+    pub retention: String,
+    /// The most observations to keep for one subject and kind.
+    pub max_per_subject_kind: usize,
+}
+
+impl Default for ObservationsConfig {
+    fn default() -> Self {
+        Self {
+            retention: "7d".into(),
+            max_per_subject_kind: 20_000,
+        }
+    }
+}
+
+impl ObservationsConfig {
+    pub const MINIMUM_RETENTION_MS: u64 = 60 * 60 * 1000;
+
+    pub fn retention_ms(&self) -> Result<u64> {
+        let value = self.retention.trim();
+        let split = value
+            .find(|character: char| !character.is_ascii_digit())
+            .unwrap_or(value.len());
+        let (amount, unit) = value.split_at(split);
+        let amount: u64 = amount
+            .parse()
+            .with_context(|| format!("observations.retention `{value}` needs a number"))?;
+        let unit_ms: u64 = match unit {
+            "s" => 1_000,
+            "m" => 60_000,
+            "h" => 3_600_000,
+            "d" => 86_400_000,
+            _ => anyhow::bail!("observations.retention `{value}` needs a unit of s, m, h or d"),
+        };
+        amount
+            .checked_mul(unit_ms)
+            .with_context(|| format!("observations.retention `{value}` is too long"))
+    }
 }
 
 impl Default for Config {
@@ -193,6 +240,7 @@ impl Default for Config {
             peer_listen: None,
             peers: Vec::new(),
             planner: PlannerSpec::default(),
+            observations: ObservationsConfig::default(),
             fleet: None,
         }
     }
@@ -308,6 +356,14 @@ impl Config {
         );
         anyhow::ensure!(!self.node.trim().is_empty(), "the st node label is empty");
         anyhow::ensure!(
+            self.observations.retention_ms()? >= ObservationsConfig::MINIMUM_RETENTION_MS,
+            "observations.retention must be at least 1h"
+        );
+        anyhow::ensure!(
+            self.observations.max_per_subject_kind > 0,
+            "observations.max_per_subject_kind must be positive"
+        );
+        anyhow::ensure!(
             self.person.as_deref().is_none_or(|person| {
                 person.starts_with("person/")
                     && person.matches('/').count() == 1
@@ -419,6 +475,33 @@ fn host_name() -> String {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn observation_retention_defaults_to_a_week_and_rejects_short_windows() {
+        let config = Config::default();
+        assert_eq!(config.observations.retention_ms().unwrap(), 7 * 86_400_000);
+        config.validate().unwrap();
+
+        let parsed: Config =
+            toml::from_str("[observations]\nretention = \"36h\"\nmax_per_subject_kind = 50\n")
+                .unwrap();
+        assert_eq!(parsed.observations.retention_ms().unwrap(), 36 * 3_600_000);
+        assert_eq!(parsed.observations.max_per_subject_kind, 50);
+
+        for (retention, message) in [
+            ("59m", "at least 1h"),
+            ("7w", "unit of s, m, h or d"),
+            ("d", "needs a number"),
+        ] {
+            let mut config = Config::default();
+            config.observations.retention = retention.into();
+            let error = config.validate().unwrap_err().to_string();
+            assert!(error.contains(message), "{retention}: {error}");
+        }
+        let mut config = Config::default();
+        config.observations.max_per_subject_kind = 0;
+        assert!(config.validate().is_err());
+    }
 
     #[test]
     fn defaults_to_a_local_only_daemon() {

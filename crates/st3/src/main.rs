@@ -3003,6 +3003,10 @@ async fn run_up(args: UpArgs) -> Result<()> {
         event_notify.clone(),
     )?);
     tokio::spawn(reconciler.run());
+    tokio::spawn(trim_local_observations(
+        store.clone(),
+        config.observations.clone(),
+    ));
     #[cfg(target_os = "macos")]
     tokio::spawn(async {
         // Startup and replication can leave large, empty malloc zones resident on macOS.
@@ -10412,6 +10416,35 @@ fn idempotency(kdl: &str, tokens: &BTreeMap<String, Vec<String>>) -> String {
     hash.update(kdl.as_bytes());
     hash.update(serde_json::to_vec(tokens).expect("tokens serialize"));
     hex::encode(hash.finalize())
+}
+
+/// Trim the local observation log at startup and then once an hour. Local observations
+/// never replicate, so this never changes what any peer holds.
+async fn trim_local_observations(store: Arc<Store>, observations: st3::config::ObservationsConfig) {
+    const LOCAL_OBSERVATION_TRIM_INTERVAL: Duration = Duration::from_secs(60 * 60);
+    const LOCAL_OBSERVATION_TRIM_CHUNK: usize = 5_000;
+    let retention_ms = observations
+        .retention_ms()
+        .expect("the daemon validated its observation retention");
+    loop {
+        let store = store.clone();
+        let max_per_subject_kind = observations.max_per_subject_kind;
+        let trimmed = tokio::task::spawn_blocking(move || {
+            store.trim_local_observations(
+                now_ms().saturating_sub(u128::from(retention_ms)),
+                max_per_subject_kind,
+                LOCAL_OBSERVATION_TRIM_CHUNK,
+            )
+        })
+        .await;
+        match trimmed {
+            Ok(Ok(0)) => {}
+            Ok(Ok(count)) => eprintln!("st3: trimmed {count} local observations"),
+            Ok(Err(error)) => eprintln!("st3: local observation trim failed: {error:#}"),
+            Err(error) => eprintln!("st3: local observation trim stopped: {error}"),
+        }
+        tokio::time::sleep(LOCAL_OBSERVATION_TRIM_INTERVAL).await;
+    }
 }
 
 fn now_ms() -> u128 {
