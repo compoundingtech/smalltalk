@@ -438,7 +438,10 @@ impl App {
                 chunks[0],
             );
         } else {
-            let connection = if self.live_ready {
+            let syncing = self.model.sync_notice().is_some();
+            let connection = if self.live_ready && syncing {
+                "⟳ Syncing"
+            } else if self.live_ready {
                 "● Online"
             } else if self.model.status.is_empty()
                 || self.model.status.starts_with("Loading")
@@ -505,7 +508,7 @@ impl App {
                 self.select_control.get(),
             );
             frame.render_widget(
-                Paragraph::new(state).style(Style::default().fg(if self.live_ready {
+                Paragraph::new(state).style(Style::default().fg(if self.live_ready && !syncing {
                     Color::Green
                 } else {
                     Color::Yellow
@@ -691,6 +694,15 @@ impl App {
         if self.status_details {
             lines.push(format!("Connection: {}", self.model.status));
             lines.push("i hide connection details".into());
+            lines.push(String::new());
+        }
+        if let Some(sync) = self.model.sync_notice() {
+            lines.extend(
+                sync.peers
+                    .iter()
+                    .map(|peer| format!("SYNCING  {}", peer.summary())),
+            );
+            lines.push("Until this host catches up, what you see here can be out of date.".into());
             lines.push(String::new());
         }
         if let Some(result) = &self.action_result {
@@ -2536,6 +2548,7 @@ fn main() -> Result<()> {
         let mut last_external_scan = Instant::now() - Duration::from_secs(60);
         let mut last_cache_save = Instant::now();
         let mut last_full_reload = Instant::now();
+        let mut last_sync_refresh = Instant::now();
         let mut was_offline = false;
         loop {
             let mut changed = match model.sync(&background_client).await {
@@ -2583,6 +2596,18 @@ fn main() -> Result<()> {
                     }
                 }
                 last_external_scan = Instant::now();
+            }
+            if model.sync_notice().is_some()
+                && last_sync_refresh.elapsed() >= Duration::from_secs(5)
+            {
+                match model.refresh_sync_notice(&background_client).await {
+                    Ok(()) => changed = true,
+                    Err(error) => {
+                        let _ = background_updates
+                            .send(Update::Error(format!("Sync refresh: {error}")));
+                    }
+                }
+                last_sync_refresh = Instant::now();
             }
             if last_full_reload.elapsed() >= Duration::from_secs(120) {
                 match model.reload(&background_client).await {
@@ -3672,6 +3697,60 @@ mod tests {
         assert!(first.contains("Online"));
         assert!(!first.contains("Smalltalk"));
         assert!(buffer[(1, 0)].bg != Color::Reset);
+    }
+    #[test]
+    fn a_catching_up_host_says_it_is_syncing_and_how_far_behind() {
+        let snapshot = |store_index| st3_client::Snapshot {
+            id: format!("snapshot/hub/{store_index}"),
+            host_id: "host/hub".into(),
+            store_index,
+            projection_version: "client-projection.v0".into(),
+            created_at: "2026-09-27T21:30:00Z".into(),
+        };
+        let notice = st3_client::SyncNotice {
+            state: "catching-up".into(),
+            peers: vec![st3_client::SyncPeer {
+                host_id: "host/Silber".into(),
+                peer_only_envelopes: 124_384,
+                local_only_envelopes: 3,
+                last_exchange_at: None,
+                estimated_catch_up_seconds: Some(840),
+            }],
+        };
+        let mut model = Model::default();
+        model.now.snapshot = Some(snapshot(10));
+        model.now.sync = Some(notice);
+        model.agents.snapshot = Some(snapshot(9));
+        let mut app = App::new(model);
+        app.live_ready = true;
+        let mut terminal = Terminal::new(TestBackend::new(120, 25)).unwrap();
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let rows = (0..25)
+            .map(|y| {
+                (0..120)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
+        assert!(rows[0].contains("Syncing"), "{}", rows[0]);
+        assert!(!rows[0].contains("Online"));
+        assert!(
+            rows.iter().any(|row| row.contains(
+                "SYNCING  Silber has 124,384 envelopes this host lacks · caught up in about 14m"
+            )),
+            "{rows:#?}"
+        );
+
+        // A newer collection served after the host caught up clears the notice.
+        app.model.agents.snapshot = Some(snapshot(11));
+        assert!(app.model.sync_notice().is_none());
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let top = (0..120)
+            .map(|x| buffer[(x, 0)].symbol())
+            .collect::<String>();
+        assert!(top.contains("Online"), "{top}");
     }
     #[test]
     fn connection_error_is_available_on_demand_not_in_footer() {
