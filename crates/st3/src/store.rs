@@ -399,10 +399,23 @@ CREATE TABLE IF NOT EXISTS planning_previews (
     created_at_unix_ms TEXT NOT NULL,
     PRIMARY KEY(session_id, variant)
 );
+
+CREATE TABLE IF NOT EXISTS graph_generation (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    value INTEGER NOT NULL
+);
+INSERT OR IGNORE INTO graph_generation(id, value) VALUES (1, 0);
 PRAGMA user_version = 13;
 "#;
 
 const READ_CONNECTIONS: usize = 4;
+
+const CLAIMS_FOR_SUBJECT: &str =
+    "SELECT id, store_index, batch_id, subject, kind, origin, actor, body, predecessors, accepted_at_unix_ms
+     FROM claims WHERE subject=?1 ORDER BY store_index";
+const CLAIMS_FOR_SUBJECT_KIND: &str =
+    "SELECT id, store_index, batch_id, subject, kind, origin, actor, body, predecessors, accepted_at_unix_ms
+     FROM claims WHERE subject=?1 AND kind=?2 ORDER BY store_index";
 
 struct WriterConnection {
     connection: Mutex<Connection>,
@@ -531,6 +544,46 @@ pub struct Store {
 
 const MESSAGE_CACHE_LIMIT: usize = 4096;
 
+// Owner joins compare the run ID with the reference's suffix, so SQLite looks each owner up by
+// primary key instead of scanning every run for each desired row on every reconcile pass.
+const TERMINAL_OWNED_RUNTIME_SUBJECTS: &str = "SELECT desired.subject
+     FROM desired
+     JOIN mission_runs owner
+       ON substr(desired.owner_run, 1, 12)='mission-run/'
+      AND owner.id=substr(desired.owner_run, 13)
+     JOIN mission_runs root ON root.id=owner.root_run_id
+     LEFT JOIN run_generations generation
+       ON substr(desired.owner_generation, 1, 15)='run-generation/'
+      AND generation.id=substr(desired.owner_generation, 16)
+     WHERE desired.member IS NOT NULL
+       AND (
+         owner.status IN ('completed','failed','cancelled')
+         OR owner.phase='terminal'
+         OR root.status IN ('completed','failed','cancelled')
+         OR root.phase='terminal'
+         OR generation.status IN ('completed','failed','cancelled')
+       )
+     ORDER BY desired.subject";
+const RETIRED_OWNED_INTAKE_SUBJECTS: &str = "SELECT desired.subject
+     FROM desired
+     JOIN mission_runs owner
+       ON substr(desired.owner_run, 1, 12)='mission-run/'
+      AND owner.id=substr(desired.owner_run, 13)
+     JOIN mission_runs root ON root.id=owner.root_run_id
+     WHERE desired.kind IN ('observer','subscription','schedule')
+       AND (
+         owner.status IN ('completed','failed','cancelled')
+         OR owner.phase='terminal'
+         OR root.status IN ('completed','failed','cancelled')
+         OR root.phase='terminal'
+         OR (
+           desired.owner_generation IS NOT NULL
+           AND desired.owner_generation != ('run-generation/' || owner.current_generation_id)
+         )
+       )
+     ORDER BY desired.subject";
+const ACTUAL_CACHE_LIMIT: usize = 4096;
+
 struct MessageCacheEntry {
     latest_claim_index: u64,
     desired_claim_id: Option<String>,
@@ -552,7 +605,10 @@ struct ReplicationSnapshot {
     max_envelope_rowid: i64,
     inventory: CompactReplicationInventory,
     buckets: Vec<ReplicationInventoryBucket>,
+    /// The inventory digest state before each range in `buckets`.
+    digest_prefixes: Vec<Sha256>,
     authority_digest: String,
+    graph_generation: i64,
     graph_digest: String,
 }
 
@@ -603,6 +659,51 @@ impl CompactReplicationInventory {
 
     fn refresh_digest(&mut self) {
         self.digest = self.digest_of(INVENTORY_DIGEST_DOMAIN, &self.envelopes);
+    }
+
+    /// Set the inventory digest by resuming at range `from`; the value equals
+    /// `refresh_digest`. `prefixes[i]` holds the digest state before `buckets[i]`, which must
+    /// list the held identities range by range, and no range before `from` may have changed
+    /// since `prefixes` was built. Ranges are ordered by writer, so new envelopes re-hash only
+    /// their own later ranges and those of later writers.
+    fn resume_digest(
+        &mut self,
+        buckets: &[ReplicationInventoryBucket],
+        prefixes: &mut Vec<Sha256>,
+        from: usize,
+    ) {
+        let from = from.min(prefixes.len().saturating_sub(1));
+        let mut digest = match prefixes.get(from) {
+            Some(state) => state.clone(),
+            None => {
+                let mut digest = Sha256::new();
+                digest.update(INVENTORY_DIGEST_DOMAIN);
+                digest
+            }
+        };
+        prefixes.truncate(from);
+        let mut position = buckets[..from.min(buckets.len())]
+            .iter()
+            .map(|bucket| bucket.count as usize)
+            .sum::<usize>();
+        let mut buffer = [0; 64];
+        for bucket in buckets.iter().skip(from) {
+            prefixes.push(digest.clone());
+            let end = position + bucket.count as usize;
+            for envelope in &self.envelopes[position..end] {
+                update_identity_digest(
+                    &mut digest,
+                    &self.writers[envelope.writer as usize],
+                    envelope.sequence,
+                    self.hash_text(envelope, &mut buffer),
+                );
+            }
+            #[cfg(test)]
+            INVENTORY_IDENTITIES_HASHED.with(|hashed| hashed.set(hashed.get() + end - position));
+            position = end;
+        }
+        debug_assert_eq!(position, self.envelopes.len());
+        self.digest = hex::encode(digest.finalize());
     }
 
     fn compact(&mut self, writer: u32, identity: ReplicaEnvelopeId) -> CompactEnvelopeId {
@@ -791,11 +892,11 @@ fn reject_old_schema(connection: &Connection) -> Result<()> {
     )?;
     anyhow::ensure!(
         table_count == 0 || matches!(version, 10..=13),
-        "this database uses an unsupported st3 schema; start with a new state directory"
+        "this database uses an unsupported st schema; start with a new state directory"
     );
     anyhow::ensure!(
         matches!(version, 0 | 10 | 11 | 12 | 13),
-        "this database uses unsupported st3 schema version {version}"
+        "this database uses unsupported st schema version {version}"
     );
     Ok(())
 }
@@ -1004,7 +1105,7 @@ fn open_read_connections(path: &Path, shared_memory: bool) -> Result<Vec<Connect
     (0..READ_CONNECTIONS)
         .map(|_| {
             let connection = Connection::open_with_flags(path, flags)
-                .with_context(|| format!("open st3 read connection {}", path.display()))?;
+                .with_context(|| format!("open st read connection {}", path.display()))?;
             connection.execute_batch(
                 "PRAGMA busy_timeout = 5000;
                  PRAGMA foreign_keys = ON;
@@ -1023,7 +1124,7 @@ impl Store {
             fs::create_dir_all(parent)?;
         }
         let mut connection = Connection::open(path)
-            .with_context(|| format!("open st3 database {}", path.display()))?;
+            .with_context(|| format!("open st database {}", path.display()))?;
         // Keep the hot graph and replication index pages in SQLite's bounded
         // page cache. The default (~2 MiB per connection) churns against the
         // large durable claim store during otherwise quiet replication.
@@ -1031,6 +1132,7 @@ impl Store {
         reject_old_schema(&connection)?;
         migrate_schema(&connection)?;
         connection.execute_batch(SCHEMA)?;
+        create_graph_generation_triggers(&connection)?;
         {
             let transaction = connection.transaction()?;
             rebuild_operations_tx(&transaction)?;
@@ -1069,6 +1171,7 @@ impl Store {
         reject_old_schema(&connection)?;
         migrate_schema(&connection)?;
         connection.execute_batch(SCHEMA)?;
+        create_graph_generation_triggers(&connection)?;
         {
             let transaction = connection.transaction()?;
             rebuild_operations_tx(&transaction)?;
@@ -4122,7 +4225,7 @@ impl Store {
             return Err(St3Error::new(
                 "seat-queue-order",
                 format!(
-                    "`{subject}` is not the next work for `{actor}`; claim `{next}` first. A person, or an agent with queue authority for this seat, can reorder it with `st3 agents queue move`"
+                    "`{subject}` is not the next work for `{actor}`; claim `{next}` first. A person, or an agent with queue authority for this seat, can reorder it with `st agents queue move`"
                 ),
             )
             .with_detail("next_work_id", next));
@@ -4619,7 +4722,7 @@ impl Store {
     ) -> Result<ApplyResponse, St3Error> {
         let source = IntentInput {
             kdl: String::new(),
-            source_name: Some("st3 reconciler".into()),
+            source_name: Some("st reconciler".into()),
         };
         let mission = self.mission(intent, source)?;
         if !mission.blockers.is_empty() {
@@ -4678,7 +4781,7 @@ impl Store {
         for reference in &intent.document_refs {
             let Some((name, hash)) = reference.rsplit_once('@') else {
                 blockers.push(format!(
-                    "document `{reference}` has no selected binding; run `st3 documents put` first"
+                    "document `{reference}` has no selected binding; run `st documents put` first"
                 ));
                 continue;
             };
@@ -4693,7 +4796,7 @@ impl Store {
                 .is_some();
             if !exists {
                 blockers.push(format!(
-                    "missing document `{reference}`; run `st3 documents put` first"
+                    "missing document `{reference}`; run `st documents put` first"
                 ));
                 continue;
             }
@@ -6931,24 +7034,7 @@ impl Store {
     /// survives a revision keeps running.
     pub fn terminal_owned_runtime_subjects(&self) -> Result<BTreeSet<String>> {
         let connection = self.readers.get();
-        let mut statement = connection.prepare(
-            "SELECT desired.subject
-             FROM desired
-             JOIN mission_runs owner
-               ON desired.owner_run='mission-run/' || owner.id
-             JOIN mission_runs root ON root.id=owner.root_run_id
-             LEFT JOIN run_generations generation
-               ON desired.owner_generation='run-generation/' || generation.id
-             WHERE desired.member IS NOT NULL
-               AND (
-                 owner.status IN ('completed','failed','cancelled')
-                 OR owner.phase='terminal'
-                 OR root.status IN ('completed','failed','cancelled')
-                 OR root.phase='terminal'
-                 OR generation.status IN ('completed','failed','cancelled')
-               )
-             ORDER BY desired.subject",
-        )?;
+        let mut statement = connection.prepare(TERMINAL_OWNED_RUNTIME_SUBJECTS)?;
         statement
             .query_map([], |row| row.get::<_, String>(0))?
             .collect::<Result<BTreeSet<_>, _>>()
@@ -6959,25 +7045,7 @@ impl Store {
     /// generation is no longer current. They must not observe, deliver, or start work.
     pub fn retired_owned_intake_subjects(&self) -> Result<BTreeSet<String>> {
         let connection = self.readers.get();
-        let mut statement = connection.prepare(
-            "SELECT desired.subject
-             FROM desired
-             JOIN mission_runs owner
-               ON desired.owner_run='mission-run/' || owner.id
-             JOIN mission_runs root ON root.id=owner.root_run_id
-             WHERE desired.kind IN ('observer','subscription','schedule')
-               AND (
-                 owner.status IN ('completed','failed','cancelled')
-                 OR owner.phase='terminal'
-                 OR root.status IN ('completed','failed','cancelled')
-                 OR root.phase='terminal'
-                 OR (
-                   desired.owner_generation IS NOT NULL
-                   AND desired.owner_generation != ('run-generation/' || owner.current_generation_id)
-                 )
-               )
-             ORDER BY desired.subject",
-        )?;
+        let mut statement = connection.prepare(RETIRED_OWNED_INTAKE_SUBJECTS)?;
         statement
             .query_map([], |row| row.get::<_, String>(0))?
             .collect::<Result<BTreeSet<_>, _>>()
@@ -7524,7 +7592,7 @@ impl Store {
     }
 
     /// Request attention that the daemon resolves on its own once every target meets `until`,
-    /// one of the `st3 trace wait` status conditions.
+    /// one of the `st trace wait` status conditions.
     pub fn request_attention_until(
         &self,
         subject: &str,
@@ -8024,7 +8092,7 @@ impl Store {
                     requested_at_unix_ms: failure.accepted_at_unix_ms,
                     actions: vec![attention_action(
                         "inspect subscription",
-                        &["st3", "subject", &failure.subject],
+                        &["st", "subject", &failure.subject],
                     )],
                 });
             }
@@ -8680,11 +8748,20 @@ impl Store {
 
     pub fn claims_for(&self, subject: &str, kind: Option<&str>) -> Result<Vec<ClaimRecord>> {
         let connection = self.readers.get();
-        let query = "SELECT id, store_index, batch_id, subject, kind, origin, actor, body, predecessors, accepted_at_unix_ms
-                     FROM claims WHERE subject=?1 AND (?2 IS NULL OR kind=?2) ORDER BY store_index";
-        let mut statement = connection.prepare(query)?;
-        let rows = statement.query_map(params![subject, kind], claim_from_row)?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+        // One statement with `(?2 IS NULL OR kind=?2)` hides the kind from the planner, which then
+        // reads every claim of the subject to test it. A busy agent holds thousands of observations,
+        // and the reconciler asks for one kind of each agent's claims on every pass.
+        let rows = match kind {
+            Some(kind) => connection
+                .prepare(CLAIMS_FOR_SUBJECT_KIND)?
+                .query_map(params![subject, kind], claim_from_row)?
+                .collect::<Result<Vec<_>, _>>(),
+            None => connection
+                .prepare(CLAIMS_FOR_SUBJECT)?
+                .query_map([subject], claim_from_row)?
+                .collect::<Result<Vec<_>, _>>(),
+        };
+        rows.map_err(Into::into)
     }
 
     pub fn pending_subscription_mission_requests(&self, subject: &str) -> Result<Vec<ClaimRecord>> {
@@ -9109,38 +9186,45 @@ impl Store {
         })
     }
 
+    /// The store index of the subject's newest claim of `kind`, or 0 when it has none. Claims are
+    /// append-only, so an unchanged index means the subject's claims of that kind are unchanged.
+    pub fn newest_claim_index(&self, subject: &str, kind: &str) -> Result<u64> {
+        let connection = self.readers.get();
+        Ok(connection
+            .prepare_cached(
+                "SELECT COALESCE(MAX(store_index), 0) FROM claims WHERE subject=?1 AND kind=?2",
+            )?
+            .query_row(params![subject, kind], |row| row.get(0))?)
+    }
+
     pub fn latest_actual_value(&self, subject: &str) -> Result<Option<Value>> {
-        let before = self.committed_index.load(Ordering::Acquire);
+        let connection = self.readers.get();
+        // The actual state folds only this subject's append-only claims, so the subject's newest
+        // claim identifies it. A write elsewhere in the graph must not make every reconcile pass
+        // re-read and re-parse the history of every stopped runtime.
+        let newest: u64 = connection
+            .prepare_cached("SELECT COALESCE(MAX(store_index), 0) FROM claims WHERE subject=?1")?
+            .query_row([subject], |row| row.get(0))?;
         if let Some((_, value)) = self
             .actual_cache
             .lock()
             .expect("actual cache mutex poisoned")
             .get(subject)
-            .filter(|(index, _)| *index == before)
+            .filter(|(index, _)| *index == newest)
         {
             return Ok(value.clone());
         }
-        let connection = self.readers.get();
+        // A claim committed after `newest` can only make this value newer than its key, and the
+        // next read then misses and folds again.
         let value = latest_actual(&connection, subject)?;
-        let after = self.committed_index.load(Ordering::Acquire);
-        if before == after {
-            let mut cache = self
-                .actual_cache
-                .lock()
-                .expect("actual cache mutex poisoned");
-            if self.committed_index.load(Ordering::Acquire) == after {
-                // Entries from an earlier store index can never be hit again.
-                // Keeping them would retain historical subjects indefinitely.
-                if cache
-                    .values()
-                    .next()
-                    .is_some_and(|(index, _)| *index != after)
-                {
-                    cache.clear();
-                }
-                cache.insert(subject.to_owned(), (after, value.clone()));
-            }
+        let mut cache = self
+            .actual_cache
+            .lock()
+            .expect("actual cache mutex poisoned");
+        if cache.len() >= ACTUAL_CACHE_LIMIT && !cache.contains_key(subject) {
+            cache.clear();
         }
+        cache.insert(subject.to_owned(), (newest, value.clone()));
         Ok(value)
     }
 
@@ -9420,6 +9504,13 @@ impl Store {
             .lock()
             .expect("replication snapshot mutex poisoned")
             .take();
+        // Harness observations, timelines, usage and lease renewals change none of the digested
+        // tables, so their writes leave the generation, and the graph digest, unchanged.
+        let graph_generation = graph_generation(&connection)?;
+        let reusable_graph_digest = previous
+            .as_ref()
+            .filter(|previous| previous.graph_generation == graph_generation)
+            .map(|previous| previous.graph_digest.clone());
         let envelope_count: usize =
             connection.query_row("SELECT COUNT(*) FROM replica_envelopes", [], |row| {
                 row.get(0)
@@ -9427,74 +9518,103 @@ impl Store {
         let full = |connection: &Connection| -> Result<_> {
             let (inventory, max_rowid) = full_compact_replication_inventory(connection)?;
             let buckets = inventory.buckets();
-            Ok((inventory, max_rowid, buckets))
+            Ok((inventory, max_rowid, buckets, Vec::new(), 0))
         };
-        let (inventory, max_envelope_rowid, buckets) = if let Some(previous) = previous {
-            let mut statement = connection.prepare(
-                "SELECT rowid, writer, sequence, envelope_hash FROM replica_envelopes
-                 WHERE rowid>?1 ORDER BY rowid",
-            )?;
-            let additions = statement
-                .query_map([previous.max_envelope_rowid], |row| {
-                    Ok((
-                        row.get::<_, i64>(0)?,
-                        ReplicaEnvelopeId {
-                            writer: row.get(1)?,
-                            sequence: row.get(2)?,
-                            hash: row.get(3)?,
-                        },
-                    ))
-                })?
-                .collect::<Result<Vec<_>, _>>()?;
-            if envelope_count == previous.inventory.envelopes.len() + additions.len() {
-                let mut max_rowid = previous.max_envelope_rowid;
-                // Most snapshots are owned only by this cache. Move their inventory
-                // into the successor so a graph write does not allocate and free
-                // every envelope ID. Keep the old snapshot intact for concurrent
-                // callers that still hold it.
-                let (mut inventory, mut buckets) = match Arc::try_unwrap(previous) {
-                    Ok(snapshot) => (snapshot.inventory, snapshot.buckets),
-                    Err(shared) => (shared.inventory.clone(), shared.buckets.clone()),
-                };
-                let mut touched = BTreeSet::new();
-                for (rowid, identity) in additions {
-                    max_rowid = max_rowid.max(rowid);
-                    touched.insert((
-                        identity.writer.clone(),
-                        replication_bucket_start(identity.sequence),
-                    ));
-                    inventory.insert(identity);
-                }
-                // Only the ranges that gained an envelope need a new digest.
-                for (writer, start) in touched {
-                    let bucket = inventory.bucket(inventory.range(&writer, start));
-                    match buckets.binary_search_by(|existing| {
-                        (existing.writer.as_str(), existing.start).cmp(&(writer.as_str(), start))
-                    }) {
-                        Ok(position) => buckets[position] = bucket,
-                        Err(position) => buckets.insert(position, bucket),
+        let (mut inventory, max_envelope_rowid, buckets, mut digest_prefixes, resume_from) =
+            if let Some(previous) = previous {
+                let mut statement = connection.prepare(
+                    "SELECT rowid, writer, sequence, envelope_hash FROM replica_envelopes
+                     WHERE rowid>?1 ORDER BY rowid",
+                )?;
+                let additions = statement
+                    .query_map([previous.max_envelope_rowid], |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            ReplicaEnvelopeId {
+                                writer: row.get(1)?,
+                                sequence: row.get(2)?,
+                                hash: row.get(3)?,
+                            },
+                        ))
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?;
+                if envelope_count == previous.inventory.envelopes.len() + additions.len() {
+                    let mut max_rowid = previous.max_envelope_rowid;
+                    // Most snapshots are owned only by this cache. Move their inventory
+                    // into the successor so a graph write does not allocate and free
+                    // every envelope ID. Keep the old snapshot intact for concurrent
+                    // callers that still hold it.
+                    let (mut inventory, mut buckets, digest_prefixes) =
+                        match Arc::try_unwrap(previous) {
+                            Ok(snapshot) => (
+                                snapshot.inventory,
+                                snapshot.buckets,
+                                snapshot.digest_prefixes,
+                            ),
+                            Err(shared) => (
+                                shared.inventory.clone(),
+                                shared.buckets.clone(),
+                                shared.digest_prefixes.clone(),
+                            ),
+                        };
+                    let mut touched = BTreeSet::new();
+                    for (rowid, identity) in additions {
+                        max_rowid = max_rowid.max(rowid);
+                        touched.insert((
+                            identity.writer.clone(),
+                            replication_bucket_start(identity.sequence),
+                        ));
+                        inventory.insert(identity);
                     }
+                    // Only the ranges that gained an envelope need a new digest.
+                    for (writer, start) in &touched {
+                        let bucket = inventory.bucket(inventory.range(writer, *start));
+                        match buckets.binary_search_by(|existing| {
+                            (existing.writer.as_str(), existing.start)
+                                .cmp(&(writer.as_str(), *start))
+                        }) {
+                            Ok(position) => buckets[position] = bucket,
+                            Err(position) => buckets.insert(position, bucket),
+                        }
+                    }
+                    // Every range before the first one that gained an envelope is unchanged, so
+                    // the inventory digest resumes there instead of hashing every identity again.
+                    let resume_from = touched
+                        .iter()
+                        .map(|(writer, start)| {
+                            buckets.partition_point(|existing| {
+                                (existing.writer.as_str(), existing.start)
+                                    < (writer.as_str(), *start)
+                            })
+                        })
+                        .min()
+                        .unwrap_or(buckets.len());
+                    (inventory, max_rowid, buckets, digest_prefixes, resume_from)
+                } else {
+                    full(&connection)?
                 }
-                inventory.refresh_digest();
-                (inventory, max_rowid, buckets)
             } else {
                 full(&connection)?
-            }
-        } else {
-            full(&connection)?
-        };
+            };
+        inventory.resume_digest(&buckets, &mut digest_prefixes, resume_from);
         // Envelope hashes already commit the complete payload (and chain metadata). The
         // inventory digest therefore commits the authority log without hex-encoding and hashing
         // every payload again on each graph change.
         let authority_digest = inventory.digest.clone();
+        let graph_digest = match reusable_graph_digest {
+            Some(digest) => digest,
+            None => graph_digest(&connection)?,
+        };
         let snapshot = Arc::new(ReplicationSnapshot {
             store_index: current_index(&connection)?,
             replica_generation: self.replica_generation.load(Ordering::Acquire),
             max_envelope_rowid,
             inventory,
             buckets,
+            digest_prefixes,
             authority_digest,
-            graph_digest: graph_digest(&connection)?,
+            graph_generation,
+            graph_digest,
         });
         *self
             .replication_snapshot
@@ -10180,7 +10300,7 @@ impl Store {
             configured,
             fleet_id: fleet_id.map(str::to_owned),
             authority_digest: snapshot.authority_digest.clone(),
-            graph_digest: graph_digest(&connection)?,
+            graph_digest: snapshot.graph_digest.clone(),
             received_envelopes: connection.query_row(
                 "SELECT COUNT(*) FROM replica_envelopes",
                 [],
@@ -14442,7 +14562,7 @@ fn attention_item_from_review(review: HumanReviewView) -> AttentionItemView {
             attention_action(
                 "approve",
                 &[
-                    "st3",
+                    "st",
                     "attention",
                     "approve",
                     &review.owner,
@@ -14453,7 +14573,7 @@ fn attention_item_from_review(review: HumanReviewView) -> AttentionItemView {
             attention_action(
                 "reject",
                 &[
-                    "st3",
+                    "st",
                     "attention",
                     "reject",
                     &review.owner,
@@ -14486,11 +14606,11 @@ fn attention_item_from_planning(
         ],
         requested_at_unix_ms: preview.created_at_unix_ms,
         actions: vec![
-            attention_action("show", &["st3", "launch", "show", &session.id]),
+            attention_action("show", &["st", "launch", "show", &session.id]),
             attention_action(
                 "approve",
                 &[
-                    "st3",
+                    "st",
                     "launch",
                     "approve",
                     &session.id,
@@ -14502,7 +14622,7 @@ fn attention_item_from_planning(
             attention_action(
                 "cancel",
                 &[
-                    "st3",
+                    "st",
                     "launch",
                     "cancel",
                     &session.id,
@@ -14532,11 +14652,11 @@ fn attention_item_from_revision(
         targets: vec![format!("{}@{}", run.mission, proposal.candidate_revision)],
         requested_at_unix_ms: proposal.created_at_unix_ms,
         actions: vec![
-            attention_action("show", &["st3", "work", "revision", "show", &run.subject]),
+            attention_action("show", &["st", "work", "revision", "show", &run.subject]),
             attention_action(
                 "approve",
                 &[
-                    "st3",
+                    "st",
                     "work",
                     "revision",
                     "approve",
@@ -14549,7 +14669,7 @@ fn attention_item_from_revision(
             attention_action(
                 "cancel",
                 &[
-                    "st3",
+                    "st",
                     "work",
                     "revision",
                     "cancel",
@@ -14582,7 +14702,7 @@ fn attention_item_from_message(
         actions: vec![attention_action(
             "read",
             &[
-                "st3",
+                "st",
                 "conversations",
                 "read",
                 &message.subject,
@@ -14609,7 +14729,7 @@ fn attention_item_from_request(request: AttentionRequestView) -> AttentionItemVi
             attention_action(
                 "resolve",
                 &[
-                    "st3",
+                    "st",
                     "attention",
                     "resolve",
                     &request.subject,
@@ -14622,7 +14742,7 @@ fn attention_item_from_request(request: AttentionRequestView) -> AttentionItemVi
             attention_action(
                 "dismiss",
                 &[
-                    "st3",
+                    "st",
                     "attention",
                     "resolve",
                     &request.subject,
@@ -15977,41 +16097,135 @@ fn update_identity_digest(digest: &mut Sha256, writer: &str, sequence: u64, hash
     }
 }
 
-fn graph_digest(connection: &Connection) -> Result<String> {
-    digest_queries(
-        connection,
+#[cfg(test)]
+thread_local! {
+    static INVENTORY_IDENTITIES_HASHED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static GRAPH_DIGESTS_COMPUTED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// The projected tables the graph digest commits: digest label, table, digested columns in
+/// order, and row order. Triggers built from the same list bump `graph_generation` whenever one
+/// of these columns changes.
+const GRAPH_DIGEST_TABLES: [(&str, &str, &[&str], &str); 6] = [
+    (
+        "desired",
+        "desired",
         &[
-            (
-                "desired",
-                "SELECT json_array(subject, kind, revision, claim_id, body, member, owner_run, owner_generation, owner_step)
-                 FROM desired ORDER BY subject",
-            ),
-            (
-                "missions",
-                "SELECT json_array(mission_id, revision, state, claim_id)
-                 FROM mission_definitions ORDER BY mission_id",
-            ),
-            (
-                "runs",
-                "SELECT json_array(id, mission_id, current_generation_id, status, phase)
-                 FROM mission_runs ORDER BY id",
-            ),
-            (
-                "generations",
-                "SELECT json_array(id, run_id, revision, predecessor_id, status)
-                 FROM run_generations ORDER BY id",
-            ),
-            (
-                "steps",
-                "SELECT json_array(subject, generation_id, step_path, status, attempt, lease_owner, blocked_reason)
-                 FROM step_runs ORDER BY subject",
-            ),
-            (
-                "proposals",
-                "SELECT json_array(id, run_id, source_generation_id, candidate_revision, status, approvals, successor_generation_id)
-                 FROM revision_proposals ORDER BY id",
-            ),
+            "subject",
+            "kind",
+            "revision",
+            "claim_id",
+            "body",
+            "member",
+            "owner_run",
+            "owner_generation",
+            "owner_step",
         ],
+        "subject",
+    ),
+    (
+        "missions",
+        "mission_definitions",
+        &["mission_id", "revision", "state", "claim_id"],
+        "mission_id",
+    ),
+    (
+        "runs",
+        "mission_runs",
+        &[
+            "id",
+            "mission_id",
+            "current_generation_id",
+            "status",
+            "phase",
+        ],
+        "id",
+    ),
+    (
+        "generations",
+        "run_generations",
+        &["id", "run_id", "revision", "predecessor_id", "status"],
+        "id",
+    ),
+    (
+        "steps",
+        "step_runs",
+        &[
+            "subject",
+            "generation_id",
+            "step_path",
+            "status",
+            "attempt",
+            "lease_owner",
+            "blocked_reason",
+        ],
+        "subject",
+    ),
+    (
+        "proposals",
+        "revision_proposals",
+        &[
+            "id",
+            "run_id",
+            "source_generation_id",
+            "candidate_revision",
+            "status",
+            "approvals",
+            "successor_generation_id",
+        ],
+        "id",
+    ),
+];
+
+fn graph_digest(connection: &Connection) -> Result<String> {
+    #[cfg(test)]
+    GRAPH_DIGESTS_COMPUTED.with(|computed| computed.set(computed.get() + 1));
+    let queries = GRAPH_DIGEST_TABLES
+        .iter()
+        .map(|(label, table, columns, order)| {
+            (
+                *label,
+                format!(
+                    "SELECT json_array({}) FROM {table} ORDER BY {order}",
+                    columns.join(", ")
+                ),
+            )
+        })
+        .collect::<Vec<_>>();
+    let queries = queries
+        .iter()
+        .map(|(label, query)| (*label, query.as_str()))
+        .collect::<Vec<_>>();
+    digest_queries(connection, &queries)
+}
+
+/// Bump `graph_generation` in the same transaction as any change to a digested column, so a
+/// replication snapshot can reuse the graph digest across writes that change none of them.
+fn create_graph_generation_triggers(connection: &Connection) -> Result<()> {
+    for (_, table, columns, _) in GRAPH_DIGEST_TABLES {
+        let changed = columns
+            .iter()
+            .map(|column| format!("OLD.{column} IS NOT NEW.{column}"))
+            .collect::<Vec<_>>()
+            .join(" OR ");
+        connection.execute_batch(&format!(
+            "CREATE TRIGGER IF NOT EXISTS {table}_graph_insert AFTER INSERT ON {table}
+             BEGIN UPDATE graph_generation SET value=value+1 WHERE id=1; END;
+             CREATE TRIGGER IF NOT EXISTS {table}_graph_update AFTER UPDATE ON {table}
+             WHEN {changed}
+             BEGIN UPDATE graph_generation SET value=value+1 WHERE id=1; END;
+             CREATE TRIGGER IF NOT EXISTS {table}_graph_delete AFTER DELETE ON {table}
+             BEGIN UPDATE graph_generation SET value=value+1 WHERE id=1; END;"
+        ))?;
+    }
+    Ok(())
+}
+
+fn graph_generation(connection: &Connection) -> Result<i64> {
+    Ok(
+        connection.query_row("SELECT value FROM graph_generation WHERE id=1", [], |row| {
+            row.get(0)
+        })?,
     )
 }
 
@@ -16934,11 +17148,11 @@ fn validate_and_admit_envelope_tx(
                 let (error_code, error_message) = match classification {
                     ReplicatedClaimAdmission::UnknownKind => (
                         "unknown-claim-kind",
-                        "this st3 build does not know the claim kind",
+                        "this st build does not know the claim kind",
                     ),
                     ReplicatedClaimAdmission::UnknownField => (
                         "unknown-claim-field",
-                        "this st3 build does not know every field on the claim kind",
+                        "this st build does not know every field on the claim kind",
                     ),
                     ReplicatedClaimAdmission::Valid => unreachable!(),
                 };
@@ -22908,42 +23122,46 @@ observer "ordered/file" {
     }
 
     #[test]
-    fn the_current_actual_cache_follows_the_store_index() {
+    fn the_actual_cache_follows_each_subjects_newest_claim() {
         let store = Store::open_memory("node").unwrap();
+        let observe = |subject: &str, status: &str| {
+            store
+                .append_claim(&ClaimInput {
+                    subject: subject.into(),
+                    kind: "runtime.observed".into(),
+                    actor: None,
+                    fields: BTreeMap::from([("status".into(), Value::String(status.into()))]),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: None,
+                })
+                .unwrap()
+        };
         let subject = "agent/run/worker";
-        store
-            .append_claim(&ClaimInput {
-                subject: subject.into(),
-                kind: "runtime.observed".into(),
-                actor: None,
-                fields: BTreeMap::from([("status".into(), Value::String("running".into()))]),
-                evidence: Vec::new(),
-                expected_subject: None,
-                idempotency_key: None,
-            })
-            .unwrap();
-        let first = store.latest_actual_value(subject).unwrap().unwrap();
-        assert_eq!(first["status"], "running");
-        store.latest_actual_value("agent/old").unwrap();
-        assert!(store.actual_cache.lock().unwrap().contains_key("agent/old"));
-        let first_index = store.actual_cache.lock().unwrap().get(subject).unwrap().0;
+        let stopped = observe(subject, "stopped");
+        assert_eq!(
+            store.latest_actual_value(subject).unwrap().unwrap()["status"],
+            "stopped"
+        );
+        let cached = |store: &Store| store.actual_cache.lock().unwrap().get(subject).cloned();
+        assert_eq!(cached(&store).unwrap().0, stopped.store_index);
 
-        store
-            .append_claim(&ClaimInput {
-                subject: subject.into(),
-                kind: "runtime.observed".into(),
-                actor: None,
-                fields: BTreeMap::from([("status".into(), Value::String("stopped".into()))]),
-                evidence: Vec::new(),
-                expected_subject: None,
-                idempotency_key: None,
-            })
-            .unwrap();
-        let second = store.latest_actual_value(subject).unwrap().unwrap();
-        assert_eq!(second["status"], "stopped");
-        let cache = store.actual_cache.lock().unwrap();
-        assert!(cache.get(subject).unwrap().0 > first_index);
-        assert!(!cache.contains_key("agent/old"));
+        // Other subjects' writes leave a stopped runtime's folded state valid.
+        observe("agent/run/other", "running");
+        let before = cached(&store).unwrap();
+        store.latest_actual_value(subject).unwrap();
+        assert_eq!(
+            cached(&store).unwrap(),
+            before,
+            "an unrelated write must not refold this subject's history"
+        );
+
+        let running = observe(subject, "running");
+        assert_eq!(
+            store.latest_actual_value(subject).unwrap().unwrap()["status"],
+            "running"
+        );
+        assert_eq!(cached(&store).unwrap().0, running.store_index);
     }
 
     #[test]
@@ -26247,7 +26465,7 @@ version 2
         let error = Store::open(&path, "node")
             .err()
             .expect("the old schema must be rejected");
-        assert!(error.to_string().contains("unsupported st3 schema"));
+        assert!(error.to_string().contains("unsupported st schema"));
     }
 
     #[test]
@@ -26264,7 +26482,7 @@ version 2
         let error = Store::open(&path, "node")
             .err()
             .expect("schema version 9 must be rejected");
-        assert!(error.to_string().contains("unsupported st3 schema"));
+        assert!(error.to_string().contains("unsupported st schema"));
     }
 
     #[test]
@@ -26428,6 +26646,97 @@ version 2
     }
 
     #[test]
+    fn claims_of_one_kind_use_the_subject_kind_index() {
+        let store = Store::open_memory("node").unwrap();
+        let connection = store.connection.lock().unwrap();
+        let mut statement = connection
+            .prepare(&format!("EXPLAIN QUERY PLAN {CLAIMS_FOR_SUBJECT_KIND}"))
+            .unwrap();
+        let plan = statement
+            .query_map(params!["agent/example", "harness.diagnostic"], |row| {
+                row.get::<_, String>(3)
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+            .join("\n");
+        assert!(
+            plan.contains("claims_subject_kind_index (subject=? AND kind=?)"),
+            "one kind of a subject's claims must not read every claim of the subject:\n{plan}"
+        );
+        drop(statement);
+        drop(connection);
+
+        let mut connection = store.connection.lock().unwrap();
+        let transaction = connection.transaction().unwrap();
+        for (kind, fields) in (0..20)
+            .map(|sequence| {
+                (
+                    "harness.observed",
+                    json!({"state": "working", "observed_at_ms": sequence}),
+                )
+            })
+            .chain([(
+                "harness.diagnostic",
+                json!({"code": "provider-capacity", "status": "waiting"}),
+            )])
+        {
+            append_claim_tx(
+                &transaction,
+                &store.origin,
+                "agent/example",
+                kind,
+                None,
+                &json!({ "fields": fields }),
+                &[],
+                None,
+            )
+            .unwrap();
+        }
+        transaction.commit().unwrap();
+        drop(connection);
+        let diagnostics = store
+            .claims_for("agent/example", Some("harness.diagnostic"))
+            .unwrap();
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].kind, "harness.diagnostic");
+        assert_eq!(store.claims_for("agent/example", None).unwrap().len(), 21);
+    }
+
+    #[test]
+    fn owned_subject_queries_look_owners_up_by_primary_key() {
+        let store = Store::open_memory("node").unwrap();
+        let connection = store.connection.lock().unwrap();
+        for (name, query) in [
+            ("terminal owned runtimes", TERMINAL_OWNED_RUNTIME_SUBJECTS),
+            ("retired owned intake", RETIRED_OWNED_INTAKE_SUBJECTS),
+        ] {
+            let mut statement = connection
+                .prepare(&format!("EXPLAIN QUERY PLAN {query}"))
+                .unwrap();
+            let plan = statement
+                .query_map([], |row| row.get::<_, String>(3))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            assert!(
+                !plan
+                    .iter()
+                    .any(|step| step.starts_with("SCAN owner")
+                        || step.starts_with("SCAN generation")),
+                "{name} must not scan owners for each desired row:\n{}",
+                plan.join("\n")
+            );
+            assert!(
+                plan.iter()
+                    .any(|step| step.starts_with("SEARCH owner USING INDEX")),
+                "{name} must look its owner run up by primary key:\n{}",
+                plan.join("\n")
+            );
+        }
+    }
+
+    #[test]
     fn replication_inventory_uses_the_batch_indexes() {
         let store = Store::open_memory("node").unwrap();
         let connection = store.connection.lock().unwrap();
@@ -26474,6 +26783,167 @@ version 2
             batch_claims.contains("claims_batch_index"),
             "the inventory seed query must use the claim batch index:\n{batch_claims}"
         );
+    }
+
+    fn observe_harness(store: &Store, observed_at_ms: u64) {
+        store
+            .append_claim(&ClaimInput {
+                subject: "agent/example".into(),
+                kind: "harness.observed".into(),
+                actor: Some("agent/example".into()),
+                fields: BTreeMap::from([
+                    ("state".into(), json!("working")),
+                    ("observed_at_ms".into(), json!(observed_at_ms)),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn a_local_write_rehashes_only_its_own_inventory_range() {
+        let store = Store::open_memory("hetz").unwrap();
+        for observed_at_ms in 0..600 {
+            observe_harness(&store, observed_at_ms);
+        }
+        let before = store.replication_snapshot().unwrap();
+        assert!(before.inventory.envelopes.len() >= 600);
+        INVENTORY_IDENTITIES_HASHED.with(|hashed| hashed.set(0));
+
+        observe_harness(&store, 600);
+        let after = store.replication_snapshot().unwrap();
+        let hashed = INVENTORY_IDENTITIES_HASHED.with(std::cell::Cell::get);
+        assert!(
+            hashed <= REPLICATION_BUCKET_WIDTH as usize,
+            "one new envelope re-hashed {hashed} of {} identities",
+            after.inventory.envelopes.len()
+        );
+        let public = after.inventory.public();
+        assert_eq!(
+            after.inventory.digest,
+            replication_inventory_digest(&public.envelopes)
+        );
+        let connection = store.connection.lock().unwrap();
+        let (full, _) = full_compact_replication_inventory(&connection).unwrap();
+        assert_eq!(public.envelopes, full.public().envelopes);
+        assert_eq!(after.inventory.digest, full.digest);
+    }
+
+    proptest! {
+        #[test]
+        fn a_resumed_inventory_digest_matches_a_full_pass(
+            initial in proptest::collection::vec((0usize..3, 1u64..2000), 0..300),
+            rounds in proptest::collection::vec(
+                proptest::collection::vec((0usize..3, 1u64..2000), 1..20),
+                1..6,
+            ),
+        ) {
+            let writers = ["Silber", "fleet-node", "hetz"];
+            // Some hashes are not SHA-256 hex, so the digest also covers verbatim hashes.
+            let identity = |(writer, sequence): (usize, u64)| ReplicaEnvelopeId {
+                writer: writers[writer].into(),
+                sequence,
+                hash: if sequence % 7 == 0 {
+                    format!("irregular-{sequence}")
+                } else {
+                    format!("{sequence:064x}")
+                },
+            };
+            let mut all = initial.into_iter().map(identity).collect::<BTreeSet<_>>();
+            let mut inventory = CompactReplicationInventory::from_sorted(all.iter().cloned());
+            let mut buckets = inventory.buckets();
+            let mut prefixes = Vec::new();
+            inventory.resume_digest(&buckets, &mut prefixes, 0);
+            prop_assert_eq!(
+                &inventory.digest,
+                &replication_inventory_digest(&all.iter().cloned().collect::<Vec<_>>())
+            );
+            for round in rounds {
+                let before = buckets.clone();
+                for identity in round.into_iter().map(identity) {
+                    if all.insert(identity.clone()) {
+                        inventory.insert(identity);
+                    }
+                }
+                buckets = inventory.buckets();
+                let resume_from = buckets
+                    .iter()
+                    .zip(&before)
+                    .position(|(after, before)| after != before)
+                    .unwrap_or(before.len().min(buckets.len()));
+                inventory.resume_digest(&buckets, &mut prefixes, resume_from);
+                prop_assert_eq!(
+                    &inventory.digest,
+                    &replication_inventory_digest(&all.iter().cloned().collect::<Vec<_>>())
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn replication_reuses_the_graph_digest_until_a_digested_column_changes() {
+        let store = Store::open_memory("hetz").unwrap();
+        observe_harness(&store, 0);
+        let first = store.replication_snapshot().unwrap();
+        GRAPH_DIGESTS_COMPUTED.with(|computed| computed.set(0));
+        observe_harness(&store, 1);
+        let second = store.replication_snapshot().unwrap();
+        assert_ne!(first.store_index, second.store_index);
+        assert_eq!(
+            GRAPH_DIGESTS_COMPUTED.with(std::cell::Cell::get),
+            0,
+            "a harness observation must not recompute the graph digest"
+        );
+        assert_eq!(second.graph_digest, first.graph_digest);
+
+        let generation =
+            |store: &Store| graph_generation(&store.connection.lock().unwrap()).unwrap();
+        let execute = |store: &Store, sql: &str| {
+            store.connection.lock().unwrap().execute(sql, []).unwrap();
+        };
+        let before = generation(&store);
+        execute(
+            &store,
+            "INSERT INTO mission_runs(id, mission_id, initial_revision, current_generation_id,
+                 root_revision, root_run_id, workspace, requester, inputs, mode, status, phase,
+                 created_at_unix_ms, updated_at_unix_ms)
+             VALUES ('run-example', 'mission/example', 'revision', 'generation', 'revision',
+                 'run-example', '/tmp/example', 'person/example', '{}', 'normal', 'running',
+                 'normal', '1', '1')",
+        );
+        assert_eq!(generation(&store), before + 1);
+        execute(
+            &store,
+            "UPDATE mission_runs SET updated_at_unix_ms='2' WHERE id='run-example'",
+        );
+        assert_eq!(
+            generation(&store),
+            before + 1,
+            "an undigested column must not change the generation"
+        );
+        execute(
+            &store,
+            "UPDATE mission_runs SET status='running' WHERE id='run-example'",
+        );
+        assert_eq!(generation(&store), before + 1);
+        execute(
+            &store,
+            "UPDATE mission_runs SET status='completed' WHERE id='run-example'",
+        );
+        assert_eq!(generation(&store), before + 2);
+
+        observe_harness(&store, 2);
+        let third = store.replication_snapshot().unwrap();
+        assert_eq!(GRAPH_DIGESTS_COMPUTED.with(std::cell::Cell::get), 1);
+        assert_ne!(third.graph_digest, first.graph_digest);
+        assert_eq!(
+            third.graph_digest,
+            graph_digest(&store.connection.lock().unwrap()).unwrap()
+        );
+        execute(&store, "DELETE FROM mission_runs WHERE id='run-example'");
+        assert_eq!(generation(&store), before + 3);
     }
 
     #[test]
@@ -31342,7 +31812,7 @@ message "human-attention" {
         assert_eq!(
             items[0].actions[0].argv,
             [
-                "st3",
+                "st",
                 "conversations",
                 "read",
                 "message/human-attention",
