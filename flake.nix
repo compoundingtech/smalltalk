@@ -6,10 +6,11 @@
     flake-utils.url = "github:numtide/flake-utils";
     fenix.url = "github:nix-community/fenix";
     fenix.inputs.nixpkgs.follows = "nixpkgs";
-    # pty-rust main at the commit that added pty-client. The `pty` binary st3
-    # starts sessions with comes from the same commit as the pty-core and
-    # pty-client crates it reads and controls them through (Cargo.lock).
-    pty.url = "github:compoundingtech/pty-rust/4f6d4daed58e1d29f0cc3c35ab8131f2fc4c323b";
+    # pty-rust main, with pty-client (#51) and the Darwin link fix for the
+    # pty binary (#52). The `pty` binary st3 starts sessions with comes from
+    # the same commit as the pty-core and pty-client crates it reads and
+    # controls them through (Cargo.lock).
+    pty.url = "github:compoundingtech/pty-rust/06c303f708a49a8110a5eb640194deab0561fa3a";
     pty.inputs.nixpkgs.follows = "nixpkgs";
     # Shared tooling packages from overengineering: provides the `otelite`
     # OTLP collector binary that `checks.release-integration` drives to prove
@@ -97,7 +98,7 @@
           cargoLock = {
             lockFile = ./Cargo.lock;
             outputHashes = {
-              "pty-core-0.13.0-rust" = "sha256-vzDiqgZmT7737k7UTsZtch2VMYLZjJipboli+XSQYug=";
+              "pty-core-0.13.0-rust" = "sha256-TSW58AGBm8pidBkv894prejHmfJts24Ns9vwMw8FaEo=";
             };
           };
 
@@ -252,7 +253,7 @@
           cargoLock = {
             lockFile = ./Cargo.lock;
             outputHashes = {
-              "pty-core-0.13.0-rust" = "sha256-vzDiqgZmT7737k7UTsZtch2VMYLZjJipboli+XSQYug=";
+              "pty-core-0.13.0-rust" = "sha256-TSW58AGBm8pidBkv894prejHmfJts24Ns9vwMw8FaEo=";
             };
           };
           cargoBuildFlags = [
@@ -421,7 +422,7 @@
           cargoLock = {
             lockFile = ./Cargo.lock;
             outputHashes = {
-              "pty-core-0.13.0-rust" = "sha256-vzDiqgZmT7737k7UTsZtch2VMYLZjJipboli+XSQYug=";
+              "pty-core-0.13.0-rust" = "sha256-TSW58AGBm8pidBkv894prejHmfJts24Ns9vwMw8FaEo=";
             };
           };
           buildPhase = ''

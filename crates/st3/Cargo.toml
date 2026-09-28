@@ -23,8 +23,8 @@ hyper-util = { version = "0.1", features = ["tokio"] }
 kdl = "6"
 libc = "0.2"
 notify = "8"
-pty-client = { git = "https://github.com/compoundingtech/pty-rust", rev = "4f6d4daed58e1d29f0cc3c35ab8131f2fc4c323b" }
-pty-core = { git = "https://github.com/compoundingtech/pty-rust", rev = "4f6d4daed58e1d29f0cc3c35ab8131f2fc4c323b" }
+pty-client = { git = "https://github.com/compoundingtech/pty-rust", rev = "06c303f708a49a8110a5eb640194deab0561fa3a" }
+pty-core = { git = "https://github.com/compoundingtech/pty-rust", rev = "06c303f708a49a8110a5eb640194deab0561fa3a" }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
