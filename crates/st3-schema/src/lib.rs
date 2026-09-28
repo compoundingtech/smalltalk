@@ -1935,6 +1935,7 @@ fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
             ("status", string()),
             ("attempt", integer()),
             ("reason", string()),
+            ("goals", array()),
             ("not_before_unix_ms", integer()),
         ],
         "step-run.carried" => &[
@@ -1965,6 +1966,7 @@ fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
             ("status", string()),
             ("owner", reference()),
             ("reviewer", reference()),
+            ("mode", enumeration(&["approve", "feedback"])),
             ("question", string()),
             ("review_targets", array()),
             ("decisions", array()),
@@ -1982,7 +1984,11 @@ fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
             ("baseline", boolean()),
         ],
         "gate.result" => &[
-            ("verdict", required_enum(&["pass", "fail", "error"])),
+            (
+                "verdict",
+                required_enum(&["pass", "fail", "error", "feedback"]),
+            ),
+            ("decision", string()),
             ("reason", string()),
             ("operation", reference()),
             ("request", string()),

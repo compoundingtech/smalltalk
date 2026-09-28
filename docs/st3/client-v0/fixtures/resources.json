@@ -70,6 +70,16 @@
     "incarnation_id": "runtime-9:2026-09-20T11:06:30Z", "desired_revision": "desired-3", "owner_run_id": "mission-run/release"
   },
   {
+    "id": "observer/release", "kind": "observer", "revision": "ob1", "updated_at": "2026-09-20T11:09:01Z",
+    "state": "healthy", "spec": {"resource":"resource/release","provider":"github.repository","locator":"example/release","fields":["pull_requests"],"stopped":false},
+    "owner_run_id": "mission-run/release", "owner_generation_id": "run-generation/release", "owner_step_id": "step-run/release/watch"
+  },
+  {
+    "id": "subscription/release", "kind": "subscription", "revision": "su1", "updated_at": "2026-09-20T11:09:02Z",
+    "state": "active", "spec": {"observer":"observer/release","to":"agent/release","fields":["pull_requests"],"delivery":"message","stopped":false},
+    "owner_run_id": "mission-run/release", "owner_generation_id": "run-generation/release", "owner_step_id": "step-run/release/watch"
+  },
+  {
     "id": "machine/host-a", "kind": "machine", "revision": "mh5", "updated_at": "2026-09-20T11:09:10Z",
     "host_id": "host/host-a", "name": "host-a", "state": "local", "fleet_id": "fleet/release",
     "capacity": {"state":"unknown","reason":"no capacity observation"}, "occupancy": {"running_runtimes":1}, "projects": [],
