@@ -4812,7 +4812,7 @@ impl Store {
         reviewer: &str,
     ) -> Result<bool> {
         let subject = normalize_step_run(subject);
-        let mut connection = self.connection.lock().expect("store mutex poisoned");
+        let mut connection = self.connection.write();
         let transaction = connection.transaction()?;
         let current: Option<(String, u32, String)> = transaction
             .query_row(
