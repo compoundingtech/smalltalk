@@ -190,6 +190,12 @@ Each move names its run, placement, optional anchor run, actor, optional reason,
 joins the queue when it first has a step assigned to the seat and leaves when it is terminal. An
 unknown agent returns `not-found`.
 
+Observer and subscription lists and details are available at `/v1/client/observers` and
+`/v1/client/subscriptions`. Each resource includes its normalized specification, current state,
+and owning run, generation, and step. Agentless work includes `gate_kind`: `watch` for a standing
+step with no gate, `predicate`, `command`, `llm`, or `human` for a single gate family, `mixed`
+for combined families, and `run` for an `after-run` step.
+
 ## Harness-neutral session timeline
 
 The timeline schema deliberately contains no Claude, Codex, Pi, OMP, or transcript-file types. A
@@ -269,11 +275,18 @@ The v0 action discriminators are:
 | Launches | `launch.create`, `launch.revise`, `launch.preview`, `launch.approve`, `launch.cancel` | launch revision; target generation and preview token where applicable |
 | Missions | `mission.start`, `mission.revise`, `mission.approve-revision`, `mission.cancel-revision`, `mission.cancel` | mission revision and current generation where applicable |
 | Sessions | `session.import` | exact native-session revision; an exact running-process fingerprint is revalidated server-side |
-| Work | `work.claim`, `work.renew`, `work.progress`, `work.complete`, `work.fail`, `work.release`, `work.publish-mission` | generation, definition, attempt, readiness epoch, and claimant incarnation after claim |
+| Work | `work.claim`, `work.renew`, `work.progress`, `work.complete`, `work.fail`, `work.release`, `work.retry`, `work.publish-mission` | generation, definition, attempt, readiness epoch, and claimant incarnation after claim |
 | Seat queues | `agent.queue-move` | snapshot; the run and any anchor run must be queued for the seat |
-| Runtimes | `runtime.stop`, `runtime.restart`, `runtime.reset`, `runtime.context-clear`, `runtime.signal` | runtime incarnation and desired revision |
+| Runtimes | `runtime.stop`, `runtime.restart`, `runtime.reset`, `runtime.context-clear`, `runtime.signal` | runtime incarnation; stop, restart, and reset also require `runtime_desired_revision` from the runtime resource |
 | Terminals | `terminal.input`, `terminal.resize`, `terminal.attach`, `terminal.detach` | runtime incarnation and terminal sequence |
 | Pairing | `pairing.begin`, `pairing.complete`, `pairing.revoke` | pairing/device revision where applicable |
+
+`runtime.stop` publishes a stop for the selected member. `runtime.restart` terminates the current
+incarnation of a member with an `always` restart policy; its desired state then starts the next
+incarnation. `runtime.reset` publishes a restart-window reset for a run-owned member. A client
+submits the runtime resource ID as `target_id` and copies its `incarnation_id` and
+`desired_revision` into the action fence. Runtimes with no selected desired state have a null
+`desired_revision` and cannot use these controls.
 
 `agent.queue-move` takes `agent_id`, `mission_run_id`, `placement` (`top`, `bottom`, `before`, or
 `after`), `anchor_run_id` for `before` and `after`, and an optional `reason`. It records one

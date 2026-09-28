@@ -672,6 +672,30 @@ impl Client {
     pub async fn runtimes_get(&self, id: &str) -> Result<Envelope<Resource>, ClientError> {
         self.resource_internal("runtimes", id).await
     }
+    pub async fn observers_list(
+        &self,
+        cursor: Option<&str>,
+        limit: Option<usize>,
+        history: bool,
+    ) -> Result<Envelope<Page>, ClientError> {
+        self.list_internal("observers", cursor, limit, history)
+            .await
+    }
+    pub async fn observers_get(&self, id: &str) -> Result<Envelope<Resource>, ClientError> {
+        self.resource_internal("observers", id).await
+    }
+    pub async fn subscriptions_list(
+        &self,
+        cursor: Option<&str>,
+        limit: Option<usize>,
+        history: bool,
+    ) -> Result<Envelope<Page>, ClientError> {
+        self.list_internal("subscriptions", cursor, limit, history)
+            .await
+    }
+    pub async fn subscriptions_get(&self, id: &str) -> Result<Envelope<Resource>, ClientError> {
+        self.resource_internal("subscriptions", id).await
+    }
     pub async fn terminals_list(
         &self,
         cursor: Option<&str>,
@@ -1121,6 +1145,17 @@ impl Client {
         parameters: TargetParameters,
     ) -> Result<Envelope<ActionResult>, ClientError> {
         let request = ActionRequest::work_renew(id, idempotency_key, fence, parameters)
+            .map_err(|error| ClientError::Protocol(error.to_string()))?;
+        self.action_internal(&request).await
+    }
+    pub async fn work_retry(
+        &self,
+        id: impl Into<String>,
+        idempotency_key: impl Into<String>,
+        fence: Fence,
+        parameters: WorkRetryParameters,
+    ) -> Result<Envelope<ActionResult>, ClientError> {
+        let request = ActionRequest::work_retry(id, idempotency_key, fence, parameters)
             .map_err(|error| ClientError::Protocol(error.to_string()))?;
         self.action_internal(&request).await
     }

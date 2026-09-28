@@ -101,7 +101,7 @@
       "required": ["id", "kind", "revision", "updated_at"],
       "properties": {
         "id": { "$ref": "#/$defs/Id" },
-        "kind": { "enum": ["attention", "message", "launch", "launch-variant", "launch-decision", "launch-approval", "mission", "work", "agent", "runtime", "device", "operation", "history", "session"] },
+        "kind": { "enum": ["attention", "message", "launch", "launch-variant", "launch-decision", "launch-approval", "mission", "work", "agent", "runtime", "observer", "subscription", "device", "operation", "history", "session"] },
         "revision": { "$ref": "#/$defs/Revision" },
         "updated_at": { "$ref": "#/$defs/Timestamp" }
       }
@@ -439,6 +439,7 @@
           "required": ["kind", "mission_run_id", "generation_id", "definition_id", "path", "state", "attempt", "readiness_epoch", "goals", "constraints"],
           "properties": {
             "kind": { "const": "work" },
+            "gate_kind": { "enum": ["watch", "predicate", "command", "llm", "human", "mixed", "run", null] },
             "mission_run_id": { "$ref": "#/$defs/Id" },
             "generation_id": { "$ref": "#/$defs/Id" },
             "definition_id": { "$ref": "#/$defs/Revision" },
@@ -552,7 +553,7 @@
             "state": { "enum": ["pending", "starting", "running", "stopping", "stopped", "exited", "failed", "unreachable"] },
             "runtime_id": { "type": "string" },
             "incarnation_id": { "type": ["string", "null"] },
-            "desired_revision": { "$ref": "#/$defs/Revision" },
+            "desired_revision": { "oneOf": [{ "$ref": "#/$defs/Revision" }, { "type": "null" }] },
             "owner_run_id": { "oneOf": [{ "$ref": "#/$defs/Id" }, { "type": "null" }] },
             "terminal_id": { "oneOf": [{ "$ref": "#/$defs/Id" }, { "type": "null" }] },
             "terminal_sequence": { "type": ["integer", "null"], "minimum": 0 },
@@ -568,6 +569,64 @@
           }
         }
       ]
+    },
+    "Observer": {
+      "allOf": [
+        { "$ref": "#/$defs/ResourceHeader" },
+        { "type": "object", "required": ["kind", "state", "spec", "owner_run_id", "owner_generation_id", "owner_step_id"],
+          "properties": {
+            "kind": { "const": "observer" },
+            "state": { "type": "string" },
+            "spec": { "$ref": "#/$defs/ObserverSpec" },
+            "owner_run_id": { "type": ["string", "null"] },
+            "owner_generation_id": { "type": ["string", "null"] },
+            "owner_step_id": { "type": ["string", "null"] }
+          }
+        }
+      ]
+    },
+    "Subscription": {
+      "allOf": [
+        { "$ref": "#/$defs/ResourceHeader" },
+        { "type": "object", "required": ["kind", "state", "spec", "owner_run_id", "owner_generation_id", "owner_step_id"],
+          "properties": {
+            "kind": { "const": "subscription" },
+            "state": { "type": "string" },
+            "spec": { "$ref": "#/$defs/SubscriptionSpec" },
+            "owner_run_id": { "type": ["string", "null"] },
+            "owner_generation_id": { "type": ["string", "null"] },
+            "owner_step_id": { "type": ["string", "null"] }
+          }
+        }
+      ]
+    },
+    "ObserverSpec": {
+      "type": "object", "additionalProperties": false,
+      "required": ["resource", "provider", "locator", "fields", "stopped"],
+      "properties": {
+        "resource": { "type": "string" },
+        "provider": { "type": "string" },
+        "locator": { "type": "string" },
+        "fields": { "type": "array", "items": { "type": "string" } },
+        "stopped": { "type": "boolean" }
+      }
+    },
+    "SubscriptionSpec": {
+      "type": "object", "additionalProperties": false,
+      "required": ["observer", "to", "fields", "delivery", "stopped"],
+      "properties": {
+        "observer": { "type": "string" },
+        "to": { "type": "string" },
+        "fields": { "type": "array", "items": { "type": "string" } },
+        "condition": { "type": ["object", "null"] },
+        "delivery": { "type": "string" },
+        "mission": { "type": ["string", "null"] },
+        "revision": { "type": ["string", "null"] },
+        "resource_input": { "type": ["string", "null"] },
+        "workspace": { "type": ["string", "null"] },
+        "requester": { "type": ["string", "null"] },
+        "stopped": { "type": "boolean" }
+      }
     },
     "MachineCapacity": {
       "type": "object",
@@ -695,6 +754,7 @@
         { "$ref": "#/$defs/LaunchDecision" }, { "$ref": "#/$defs/LaunchApproval" },
         { "$ref": "#/$defs/Mission" }, { "$ref": "#/$defs/Work" },
         { "$ref": "#/$defs/Agent" }, { "$ref": "#/$defs/Runtime" },
+        { "$ref": "#/$defs/Observer" }, { "$ref": "#/$defs/Subscription" },
         { "$ref": "#/$defs/Machine" },
         { "$ref": "#/$defs/Device" },
         { "$ref": "#/$defs/Operation" }, { "$ref": "#/$defs/History" },
@@ -906,6 +966,7 @@
         "attempt": { "type": "integer", "minimum": 0 },
         "readiness_epoch": { "type": "integer", "minimum": 0 },
         "runtime_incarnation": { "type": "string" },
+        "runtime_desired_revision": { "type": "string" },
         "terminal_sequence": { "type": "integer", "minimum": 0 },
         "preview_token": { "type": "string", "pattern": "^lpv0:[0-9a-f]{64}$" }
       }
@@ -918,7 +979,7 @@
         "api_version": { "const": "st3.client.v0" },
         "id": { "$ref": "#/$defs/Id" },
         "type": {
-          "enum": ["attention.resolve", "review.approve", "review.reject", "message.send", "message.read", "message.close", "launch.create", "launch.revise", "launch.preview", "launch.approve", "launch.cancel", "mission.start", "mission.revise", "mission.approve-revision", "mission.cancel-revision", "mission.cancel", "session.import", "work.claim", "work.renew", "work.progress", "work.complete", "work.fail", "work.release", "work.publish-mission", "agent.queue-move", "runtime.stop", "runtime.restart", "runtime.reset", "runtime.context-clear", "runtime.signal", "terminal.input", "terminal.resize", "terminal.attach", "terminal.detach", "pairing.revoke"]
+          "enum": ["attention.resolve", "review.approve", "review.reject", "message.send", "message.read", "message.close", "launch.create", "launch.revise", "launch.preview", "launch.approve", "launch.cancel", "mission.start", "mission.revise", "mission.approve-revision", "mission.cancel-revision", "mission.cancel", "session.import", "work.claim", "work.renew", "work.progress", "work.complete", "work.fail", "work.release", "work.retry", "work.publish-mission", "agent.queue-move", "runtime.stop", "runtime.restart", "runtime.reset", "runtime.context-clear", "runtime.signal", "terminal.input", "terminal.resize", "terminal.attach", "terminal.detach", "pairing.revoke"]
         },
         "idempotency_key": { "type": "string", "minLength": 16, "maxLength": 256 },
         "fence": { "$ref": "#/$defs/Fence" },
@@ -1042,6 +1103,16 @@
         },
         {
           "properties": {
+            "type": { "const": "work.retry" },
+            "fence": { "allOf": [{ "$ref": "#/$defs/Fence" }, { "required": ["mission_generation", "step_definition", "attempt", "readiness_epoch"] }] },
+            "parameters": {
+              "type": "object", "additionalProperties": false, "required": ["target_id", "reason"],
+              "properties": { "target_id": { "$ref": "#/$defs/Id" }, "reason": { "type": "string", "minLength": 1 } }
+            }
+          }
+        },
+        {
+          "properties": {
             "type": { "const": "work.publish-mission" },
             "fence": { "allOf": [{ "$ref": "#/$defs/Fence" }, { "required": ["mission_generation", "step_definition", "attempt", "readiness_epoch", "runtime_incarnation"] }] },
             "parameters": {
@@ -1067,7 +1138,14 @@
         },
         {
           "properties": {
-            "type": { "enum": ["runtime.stop", "runtime.restart", "runtime.reset", "runtime.context-clear"] },
+            "type": { "enum": ["runtime.stop", "runtime.restart", "runtime.reset"] },
+            "fence": { "allOf": [{ "$ref": "#/$defs/Fence" }, { "required": ["runtime_incarnation", "runtime_desired_revision"] }] },
+            "parameters": { "$ref": "#/$defs/TargetParameters" }
+          }
+        },
+        {
+          "properties": {
+            "type": { "const": "runtime.context-clear" },
             "fence": { "allOf": [{ "$ref": "#/$defs/Fence" }, { "required": ["runtime_incarnation"] }] },
             "parameters": { "$ref": "#/$defs/TargetParameters" }
           }

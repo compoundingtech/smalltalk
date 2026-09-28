@@ -218,6 +218,8 @@ pub struct Operational {
     pub owner_generation: Option<String>,
     #[serde(default)]
     pub runtime_incarnation: Option<String>,
+    #[serde(default)]
+    pub runtime_desired_revision: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -229,7 +231,6 @@ pub struct Attention {
     pub attention_kind: String,
     pub source_id: String,
     pub person_id: String,
-    pub requester_id: Option<String>,
     pub mission_id: Option<String>,
     pub mission_run_id: Option<String>,
     pub step_run_id: Option<String>,
@@ -528,6 +529,7 @@ pub struct Work {
     pub definition_id: String,
     pub path: String,
     pub state: String,
+    pub gate_kind: Option<String>,
     pub attempt: u32,
     pub readiness_epoch: u64,
     pub claimant: Option<String>,
@@ -649,7 +651,7 @@ pub struct Runtime {
     pub state: String,
     pub runtime_id: String,
     pub incarnation_id: Option<String>,
-    pub desired_revision: String,
+    pub desired_revision: Option<String>,
     #[serde(default)]
     pub owner_run_id: Option<String>,
     #[serde(default)]
@@ -658,6 +660,52 @@ pub struct Runtime {
     pub terminal_sequence: Option<u64>,
     #[serde(default)]
     pub terminal_access: Option<TerminalAccess>,
+}
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct Observer {
+    #[serde(flatten)]
+    pub header: ResourceHeader,
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, Value>,
+    pub state: String,
+    pub spec: ObserverSpec,
+    pub owner_run_id: Option<String>,
+    pub owner_generation_id: Option<String>,
+    pub owner_step_id: Option<String>,
+}
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct Subscription {
+    #[serde(flatten)]
+    pub header: ResourceHeader,
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, Value>,
+    pub state: String,
+    pub spec: SubscriptionSpec,
+    pub owner_run_id: Option<String>,
+    pub owner_generation_id: Option<String>,
+    pub owner_step_id: Option<String>,
+}
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct ObserverSpec {
+    pub resource: String,
+    pub provider: String,
+    pub locator: String,
+    pub fields: Vec<String>,
+    pub stopped: bool,
+}
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct SubscriptionSpec {
+    pub observer: String,
+    pub to: String,
+    pub fields: Vec<String>,
+    pub condition: Option<Value>,
+    pub delivery: String,
+    pub mission: Option<String>,
+    pub revision: Option<String>,
+    pub resource_input: Option<String>,
+    pub workspace: Option<String>,
+    pub requester: Option<String>,
+    pub stopped: bool,
 }
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct MachineCapacity {
@@ -764,6 +812,8 @@ pub enum Resource {
     Work(Work),
     Agent(Agent),
     Runtime(Runtime),
+    Observer(Observer),
+    Subscription(Subscription),
     Machine(Machine),
     Device(Device),
     Operation(Operation),
@@ -784,6 +834,8 @@ impl Resource {
             Self::Work(v) => &v.header,
             Self::Agent(v) => &v.header,
             Self::Runtime(v) => &v.header,
+            Self::Observer(v) => &v.header,
+            Self::Subscription(v) => &v.header,
             Self::Machine(v) => &v.header,
             Self::Device(v) => &v.header,
             Self::Operation(v) => &v.header,
@@ -1210,6 +1262,8 @@ pub enum ActionType {
     WorkFail,
     #[serde(rename = "work.release")]
     WorkRelease,
+    #[serde(rename = "work.retry")]
+    WorkRetry,
     #[serde(rename = "work.publish-mission")]
     WorkPublishMission,
     #[serde(rename = "agent.queue-move")]
@@ -1758,6 +1812,20 @@ impl ActionRequest {
             &parameters,
         )
     }
+    pub fn work_retry(
+        id: impl Into<String>,
+        idempotency_key: impl Into<String>,
+        fence: Fence,
+        parameters: WorkRetryParameters,
+    ) -> Result<Self, serde_json::Error> {
+        Self::new(
+            id,
+            ActionType::WorkRetry,
+            idempotency_key,
+            fence,
+            &parameters,
+        )
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
@@ -1769,6 +1837,11 @@ pub struct TargetParameters {
     pub summary: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub evidence: Vec<String>,
+}
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct WorkRetryParameters {
+    pub target_id: String,
+    pub reason: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]

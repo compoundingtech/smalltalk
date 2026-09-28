@@ -64,6 +64,10 @@ public actor St3Client {
     public func agentsGet(id: String) async throws -> Envelope<Resource> { try await resource("agents", id: id) }
     public func runtimesList(cursor: String? = nil, limit: Int? = nil, history: Bool = false) async throws -> Envelope<ResourcePage> { try await list("runtimes", cursor: cursor, limit: limit, history: history) }
     public func runtimesGet(id: String) async throws -> Envelope<Resource> { try await resource("runtimes", id: id) }
+    public func observersList(cursor: String? = nil, limit: Int? = nil, history: Bool = false) async throws -> Envelope<ResourcePage> { try await list("observers", cursor: cursor, limit: limit, history: history) }
+    public func observersGet(id: String) async throws -> Envelope<Resource> { try await resource("observers", id: id) }
+    public func subscriptionsList(cursor: String? = nil, limit: Int? = nil, history: Bool = false) async throws -> Envelope<ResourcePage> { try await list("subscriptions", cursor: cursor, limit: limit, history: history) }
+    public func subscriptionsGet(id: String) async throws -> Envelope<Resource> { try await resource("subscriptions", id: id) }
     public func terminalsList(cursor: String? = nil, limit: Int? = nil, history: Bool = false) async throws -> Envelope<ResourcePage> { try await list("terminals", cursor: cursor, limit: limit, history: history) }
     public func operationsList(cursor: String? = nil, limit: Int? = nil, history: Bool = false) async throws -> Envelope<ResourcePage> { try await list("operations", cursor: cursor, limit: limit, history: history) }
     public func operationsGet(id: String) async throws -> Envelope<Resource> { try await resource("operations", id: id) }
@@ -106,6 +110,7 @@ public actor St3Client {
     public func workPublishMission(id: String, idempotencyKey: String, fence: Fence, parameters: WorkPublishMissionParameters) async throws -> Envelope<ActionResult> { try await submit(try .workPublishMission(id: id, idempotencyKey: idempotencyKey, fence: fence, parameters: parameters)) }
     public func workRelease(id: String, idempotencyKey: String, fence: Fence, parameters: TargetParameters) async throws -> Envelope<ActionResult> { try await submit(try .workRelease(id: id, idempotencyKey: idempotencyKey, fence: fence, parameters: parameters)) }
     public func workRenew(id: String, idempotencyKey: String, fence: Fence, parameters: TargetParameters) async throws -> Envelope<ActionResult> { try await submit(try .workRenew(id: id, idempotencyKey: idempotencyKey, fence: fence, parameters: parameters)) }
+    public func workRetry(id: String, idempotencyKey: String, fence: Fence, parameters: WorkRetryParameters) async throws -> Envelope<ActionResult> { try await submit(try .workRetry(id: id, idempotencyKey: idempotencyKey, fence: fence, parameters: parameters)) }
     public func beginPairing(deviceName: String, personID: String) async throws -> Envelope<PairingChallenge> { try await post("v1/client/pairings", PairingBegin(apiVersion: st3ClientAPIVersion, deviceName: deviceName, personID: personID)) }
     public func completePairing(pairingID: String, code: String, devicePublicKey: String) async throws -> Envelope<PairedSession> { try await post("v1/client/pairings/\(pairingID.replacingOccurrences(of: "pairing/", with: ""))/complete", PairingComplete(apiVersion: st3ClientAPIVersion, code: code, devicePublicKey: devicePublicKey)) }
     public func terminalScreen(_ id: String) async throws -> Envelope<TerminalScreen> { try await get("v1/client/terminals/\(id.replacingOccurrences(of: "terminal/", with: ""))/screen") }
