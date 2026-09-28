@@ -57,6 +57,9 @@ pub enum Retention {
     /// gets a claim only when its state changes; each claim replaces the previous
     /// one for the same subject.
     Latest,
+    /// `Local` when the system records it without an actor; a request or result
+    /// that a person or agent writes as its actor replicates as a claim.
+    SystemLocal,
 }
 
 impl Retention {
@@ -190,7 +193,7 @@ impl Registry {
             ));
         }
         output.push_str("\n`resource.observed` validates facts against the resource kind. Custom resource facts remain open.\n");
-        output.push_str("\nA `durable` claim is a fact in the replicated claim log. A `local` claim is an observation kept only in the local observation log of the node that made it, trimmed after that node's retention window. A `latest` claim is an observation kept in that log whose replicated claims are written only when its state changes; each one replaces the previous one for its subject.\n");
+        output.push_str("\nA `durable` claim is a fact in the replicated claim log. A `local` claim is an observation kept only in the local observation log of the node that made it, trimmed after that node's retention window. A `latest` claim is an observation kept in that log whose replicated claims are written only when its state changes; each one replaces the previous one for its subject. A `system-local` claim is `local` when the system records it without an actor and replicates when a person or agent writes it as its actor.\n");
         output
     }
 
@@ -1710,6 +1713,14 @@ fn claim_retention(kind: &str) -> Retention {
         // Only the node that made them reads these: render receipts and the readiness
         // deadline, whose attention request replicates.
         "render.applied" | "runtime.readiness-deadline-reached" => Retention::Local,
+        // The owner's reconciler records its own starts, stops and kills: the stop deadline
+        // fence, restart windows and adoption read them on that node only. Another node
+        // stops a runtime through a replicated `stop` intent. A person's signal names its
+        // requester and replicates.
+        "runtime.action.requested"
+        | "runtime.action.succeeded"
+        | "runtime.action.failed"
+        | "runtime.action.deadline-reached" => Retention::SystemLocal,
         // Other nodes read the current harness state and usage: step readiness is judged on
         // the mission's node and fleet views run anywhere. Nothing reads a heartbeat.
         "harness.observed" | "harness.usage" => Retention::Latest,

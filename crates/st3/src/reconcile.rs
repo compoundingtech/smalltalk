@@ -1555,7 +1555,7 @@ impl<R: RuntimeControl> Reconciler<R> {
         }
         Ok(self
             .store
-            .claims_for(subject, Some("runtime.action.requested"))?
+            .observations_for(subject, "runtime.action.requested")?
             .iter()
             .any(|claim| {
                 claim.body.pointer("/fields/action").and_then(Value::as_str) == Some("terminate")
@@ -1774,7 +1774,7 @@ impl<R: RuntimeControl> Reconciler<R> {
         };
         Ok(self
             .store
-            .claims_for(subject, Some("runtime.action.succeeded"))?
+            .observations_for(subject, "runtime.action.succeeded")?
             .into_iter()
             .rev()
             .any(|claim| {
@@ -2075,7 +2075,7 @@ impl<R: RuntimeControl> Reconciler<R> {
         let incarnation = incarnation.unwrap_or("unknown");
         let requests = self
             .store
-            .claims_for(subject, Some("runtime.action.requested"))?;
+            .observations_for(subject, "runtime.action.requested")?;
         let request = requests.into_iter().rev().find(|claim| {
             claim.body.pointer("/fields/action").and_then(Value::as_str) == Some("terminate")
                 && claim
@@ -2151,7 +2151,7 @@ impl<R: RuntimeControl> Reconciler<R> {
         })?;
         if self
             .store
-            .claims_for(subject, Some("runtime.action.succeeded"))?
+            .observations_for(subject, "runtime.action.succeeded")?
             .iter()
             .any(|claim| {
                 claim
@@ -2221,7 +2221,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             }
             let recent_failures = self
                 .store
-                .claims_for(&subject.subject, Some("runtime.action.failed"))?
+                .observations_for(&subject.subject, "runtime.action.failed")?
                 .into_iter()
                 .filter(|claim| {
                     claim.body.pointer("/fields/action").and_then(Value::as_str) == Some("start")
@@ -2518,7 +2518,7 @@ impl<R: RuntimeControl> Reconciler<R> {
     fn start_failures(&self, subject: &str, token: &str) -> Result<Vec<crate::model::ClaimRecord>> {
         Ok(self
             .store
-            .claims_for(subject, Some("runtime.action.failed"))?
+            .observations_for(subject, "runtime.action.failed")?
             .into_iter()
             .filter(|claim| {
                 claim.body.pointer("/fields/action").and_then(Value::as_str) == Some("start")
@@ -2542,7 +2542,7 @@ impl<R: RuntimeControl> Reconciler<R> {
         }
         let last_success_index = self
             .store
-            .claims_for(&subject.subject, Some("runtime.action.succeeded"))?
+            .observations_for(&subject.subject, "runtime.action.succeeded")?
             .into_iter()
             .filter(|claim| {
                 claim
@@ -2600,7 +2600,7 @@ impl<R: RuntimeControl> Reconciler<R> {
         }
         let first_launch = self
             .store
-            .claims_for(&subject.subject, Some("runtime.action.succeeded"))?
+            .observations_for(&subject.subject, "runtime.action.succeeded")?
             .into_iter()
             .filter(|claim| {
                 claim
@@ -2790,7 +2790,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             .unwrap_or_default();
         let mut launches = self
             .store
-            .claims_for(&subject.subject, Some("runtime.action.succeeded"))?
+            .observations_for(&subject.subject, "runtime.action.succeeded")?
             .into_iter()
             .filter(|claim| {
                 claim
@@ -6454,7 +6454,7 @@ impl<R: RuntimeControl> Reconciler<R> {
 
             let action_failure = self
                 .store
-                .latest_claim(&subject.subject, Some("runtime.action.failed"))?
+                .latest_observation(&subject.subject, "runtime.action.failed")?
                 .and_then(|claim| {
                     claim
                         .body
@@ -8329,7 +8329,7 @@ impl<R: RuntimeControl> Reconciler<R> {
         let action = if hard { "kill-gate" } else { "stop-gate" };
         if self
             .store
-            .claims_for(subject, Some("runtime.action.succeeded"))?
+            .observations_for(subject, "runtime.action.succeeded")?
             .iter()
             .any(|claim| {
                 claim.body.pointer("/fields/action").and_then(Value::as_str) == Some(action)
@@ -10518,7 +10518,7 @@ version 2
         assert!(starts.contains(&good_runtime));
         assert!(
             store
-                .latest_claim(&bad_subject, Some("runtime.action.failed"))
+                .latest_observation(&bad_subject, "runtime.action.failed")
                 .unwrap()
                 .is_some()
         );
@@ -13256,6 +13256,45 @@ agent "worker" {
         std::thread::sleep(Duration::from_millis(2));
         reconciler.reconcile_once().unwrap();
         assert_eq!(&*runtime.kills.lock().unwrap(), &["node.worker"]);
+
+        // The stop request, its deadline and the kill are this node's own records. They stay
+        // local, and each cites the one before it.
+        for kind in [
+            "runtime.action.requested",
+            "runtime.action.deadline-reached",
+            "runtime.action.succeeded",
+        ] {
+            assert!(
+                store
+                    .claims_for("agent/node.worker", Some(kind))
+                    .unwrap()
+                    .is_empty(),
+                "{kind} replicated"
+            );
+        }
+        let request = store
+            .observations_for("agent/node.worker", "runtime.action.requested")
+            .unwrap()
+            .into_iter()
+            .find(|record| record.body["fields"]["action"] == "terminate")
+            .unwrap();
+        let deadline = store
+            .latest_observation("agent/node.worker", "runtime.action.deadline-reached")
+            .unwrap()
+            .unwrap();
+        assert_eq!(deadline.body["evidence"], serde_json::json!([request.id]));
+        let kill = store
+            .latest_observation("agent/node.worker", "runtime.action.succeeded")
+            .unwrap()
+            .unwrap();
+        assert_eq!(kill.body["fields"]["action"], "kill");
+        assert_eq!(kill.body["evidence"], serde_json::json!([deadline.id]));
+        reconciler.reconcile_once().unwrap();
+        assert_eq!(
+            runtime.kills.lock().unwrap().len(),
+            1,
+            "the local kill record fences a second kill"
+        );
     }
 
     #[test]

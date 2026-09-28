@@ -5917,7 +5917,9 @@ impl Store {
         input: &ClaimInput,
     ) -> Result<(ClaimRecord, bool), St3Error> {
         self.validate_claim_input(input)?;
-        if local_retention(&input.kind) {
+        if local_retention(&input.kind)
+            || (input.actor.is_none() && system_local_retention(&input.kind))
+        {
             return self.append_local_observation(input);
         }
         if latest_retention(&input.kind) {
@@ -12542,6 +12544,12 @@ fn local_retention(kind: &str) -> bool {
         .is_some_and(|spec| spec.retention == st3_schema::Retention::Local)
 }
 
+fn system_local_retention(kind: &str) -> bool {
+    st3_schema::registry()
+        .claim(kind)
+        .is_some_and(|spec| spec.retention == st3_schema::Retention::SystemLocal)
+}
+
 fn latest_retention(kind: &str) -> bool {
     st3_schema::registry()
         .claim(kind)
@@ -12618,12 +12626,30 @@ fn insert_local_observation_tx(
         }
         return Ok((existing, false));
     }
+    // A local observation may cite a claim or another local observation of this node.
     for evidence in &input.evidence {
-        let exists = transaction
-            .query_row("SELECT 1 FROM claims WHERE id=?1", [evidence], |_| Ok(()))
-            .optional()
-            .map_err(internal)?
-            .is_some();
+        let exists = match evidence
+            .strip_prefix(LOCAL_OBSERVATION_ID_PREFIX)
+            .and_then(|rest| rest.rsplit_once('/'))
+        {
+            Some((evidence_origin, position)) => {
+                evidence_origin == origin
+                    && transaction
+                        .query_row(
+                            "SELECT 1 FROM local_observations WHERE id=?1",
+                            [position],
+                            |_| Ok(()),
+                        )
+                        .optional()
+                        .map_err(internal)?
+                        .is_some()
+            }
+            None => transaction
+                .query_row("SELECT 1 FROM claims WHERE id=?1", [evidence], |_| Ok(()))
+                .optional()
+                .map_err(internal)?
+                .is_some(),
+        };
         if !exists {
             return Err(St3Error::new(
                 "missing-evidence",
@@ -28735,6 +28761,116 @@ mission "nested-work" state="ready" {
             "an idle harness replicates its usage at once"
         );
         assert_eq!(store.local_observations_after(0, 100).unwrap().len(), 12);
+    }
+
+    #[test]
+    fn a_system_runtime_action_stays_local_while_a_requested_one_replicates() {
+        let store = Store::open_memory("node").unwrap();
+        let subject = "agent/node.worker";
+        let action =
+            |action: &str, actor: Option<&str>, evidence: Vec<String>, key: &str| ClaimInput {
+                subject: subject.into(),
+                kind: if action == "signal-result" {
+                    "runtime.action.succeeded".into()
+                } else {
+                    "runtime.action.requested".into()
+                },
+                actor: actor.map(str::to_owned),
+                fields: BTreeMap::from([(
+                    "action".into(),
+                    Value::String(
+                        if action == "signal-result" {
+                            "signal"
+                        } else {
+                            action
+                        }
+                        .into(),
+                    ),
+                )]),
+                evidence,
+                expected_subject: None,
+                idempotency_key: Some(key.into()),
+            };
+        let system = store
+            .append_claim(&action("terminate", None, Vec::new(), "system-stop"))
+            .unwrap();
+        assert!(local_observation_position(&system).is_some());
+        let deadline = store
+            .append_claim(&ClaimInput {
+                subject: subject.into(),
+                kind: "runtime.action.deadline-reached".into(),
+                actor: None,
+                fields: BTreeMap::from([("action".into(), Value::String("terminate".into()))]),
+                evidence: vec![system.id.clone()],
+                expected_subject: None,
+                idempotency_key: Some("system-deadline".into()),
+            })
+            .unwrap();
+        assert!(
+            local_observation_position(&deadline).is_some(),
+            "a local observation may cite another"
+        );
+
+        let requested = store
+            .append_claim(&action(
+                "signal",
+                Some("requester"),
+                Vec::new(),
+                "person-signal",
+            ))
+            .unwrap();
+        assert!(
+            local_observation_position(&requested).is_none(),
+            "a request that names its actor replicates"
+        );
+        let result = store
+            .append_claim(&action(
+                "signal-result",
+                Some("requester"),
+                vec![requested.id.clone()],
+                "person-signal-result",
+            ))
+            .unwrap();
+        assert!(local_observation_position(&result).is_none());
+        assert_eq!(
+            store
+                .append_claim(&action(
+                    "signal-result",
+                    Some("requester"),
+                    vec![system.id.clone()],
+                    "cites-local",
+                ))
+                .unwrap_err()
+                .code,
+            "missing-evidence",
+            "a replicated claim never cites a local observation"
+        );
+        assert_eq!(
+            store
+                .append_claim(&ClaimInput {
+                    subject: subject.into(),
+                    kind: "runtime.action.deadline-reached".into(),
+                    actor: None,
+                    fields: BTreeMap::from([("action".into(), Value::String("terminate".into()))]),
+                    evidence: vec!["local-observation/another-node/1".into()],
+                    expected_subject: None,
+                    idempotency_key: Some("foreign-local".into()),
+                })
+                .unwrap_err()
+                .code,
+            "missing-evidence",
+            "another node's local observation is never here"
+        );
+        let recorded = store
+            .observations_for(subject, "runtime.action.requested")
+            .unwrap();
+        assert_eq!(
+            recorded
+                .iter()
+                .map(|record| record.id.clone())
+                .collect::<Vec<_>>(),
+            [system.id, requested.id]
+        );
     }
 
     #[test]
