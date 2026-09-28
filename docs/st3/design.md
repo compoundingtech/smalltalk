@@ -117,6 +117,20 @@ on with every other item:
 A fault is recorded again only when its cause changes. The item's next success records its
 recovery.
 
+Sometimes a fault cannot be recorded on its item, for example when a store write fails. The item
+was still skipped on its own and the pass carried on. The daemon then records `daemon.diagnostic`
+with the code `fault-record-failed` and status `faulted`, and the host is not reported as
+unreachable.
+
+A member declaration that this build cannot read is not skipped silently. The host that published it
+records a member fault naming the parse error, until a build that can read it takes it up.
+
+The reconciler reads each source of its next wake-up time on its own: mission deadlines, work wakes,
+provider-capacity retries, and subscription retries. A source that fails records a stage fault
+named `deadline/SOURCE` and is read again within five seconds, and the other sources keep their
+deadlines. A step whose wake cannot be read loses only its own wake-up, with a `wake-deadline`
+fault on its step-run.
+
 A running member whose workspace or render fails is still observed, checked, and woken for its
 work. The failure blocks only its start and restart.
 

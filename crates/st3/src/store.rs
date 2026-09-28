@@ -7695,6 +7695,31 @@ impl Store {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
+    /// Among `subjects`, each declaration whose member this build cannot read, with the reason.
+    /// `desired_subjects` gives such a declaration no member at all.
+    pub fn unreadable_members(&self, subjects: &[&str]) -> Result<Vec<(String, String)>> {
+        if subjects.is_empty() {
+            return Ok(Vec::new());
+        }
+        let connection = self.readers.get();
+        let mut statement = connection.prepare(
+            "SELECT subject, member FROM desired
+             WHERE member IS NOT NULL AND subject IN (SELECT value FROM json_each(?1))
+             ORDER BY subject",
+        )?;
+        let rows = statement.query_map([serde_json::to_string(subjects)?], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut unreadable = Vec::new();
+        for row in rows {
+            let (subject, member) = row?;
+            if let Err(error) = serde_json::from_str::<crate::model::MemberSpec>(&member) {
+                unreadable.push((subject, error.to_string()));
+            }
+        }
+        Ok(unreadable)
+    }
+
     pub fn desired_subjects_for_owner_step(&self, owner_step: &str) -> Result<Vec<DesiredSubject>> {
         let connection = self.readers.get();
         let mut statement = connection.prepare(
@@ -11330,6 +11355,18 @@ impl Store {
             .iter()
             .filter_map(|peer| Some((peer.clone(), progress.get(peer)?.view(now)?)))
             .collect()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn replace_desired_member_for_test(&self, subject: &str, member: &str) {
+        self.connection
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE desired SET member=?2 WHERE subject=?1",
+                params![subject, member],
+            )
+            .unwrap();
     }
 
     #[cfg(test)]
