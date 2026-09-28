@@ -44,6 +44,9 @@ const CLAUDE_TRUST_RECOVERY_ATTEMPTS: usize = 3;
 const CLAUDE_TRUST_RECOVERY_WINDOW_MS: u128 = 10 * 60_000;
 // A failed checkout fetch or worktree command waits this long before Git runs again.
 const CHECKOUT_RETRY_MS: u128 = 30_000;
+// A deadline source that could not be read is read again this soon, so the deadlines it holds
+// are late by at most this much.
+const DEADLINE_SOURCE_RETRY_MS: u128 = 5_000;
 // Run cleanup ends this long after it began even if an owned runtime never reports stopped.
 const CLEANUP_DEADLINE: Duration = Duration::from_secs(15 * 60);
 const DECLARED_CHECKOUT_LIMIT: usize = 4096;
@@ -569,27 +572,14 @@ impl<R: RuntimeControl> Reconciler<R> {
         let mut quiet_pass_started = None;
         loop {
             match self.next_reconcile_deadline() {
-                Ok(Some(deadline)) => {
+                Some(deadline) => {
                     let delay = deadline_sleep_ms(deadline, now_ms(), quiet_pass_started);
                     tokio::select! {
                         _ = self.notify.notified() => {}
                         _ = tokio::time::sleep(Duration::from_millis(delay)) => {}
                     }
                 }
-                Ok(None) => self.notify.notified().await,
-                Err(error) => {
-                    let _ = self.record_once(
-                        &format!("daemon/{}", self.host),
-                        "daemon.diagnostic",
-                        BTreeMap::from([
-                            ("severity".into(), Value::String("error".into())),
-                            ("code".into(), Value::String("deadline-read-failed".into())),
-                            ("status".into(), Value::String("indeterminate".into())),
-                            ("reason".into(), Value::String(error.to_string())),
-                        ]),
-                    );
-                    tokio::time::sleep(Duration::from_secs(1)).await;
-                }
+                None => self.notify.notified().await,
             }
             for pass in 0..64 {
                 let started = now_ms();
@@ -752,12 +742,26 @@ impl<R: RuntimeControl> Reconciler<R> {
         Ok(())
     }
 
-    fn next_reconcile_deadline(&self) -> Result<Option<u128>> {
-        Ok([
-            self.store.next_active_mission_deadline(&self.host)?,
-            self.next_work_wake_deadline()?,
-            self.next_provider_capacity_retry_deadline()?,
-            self.store.next_subscription_mission_retry_deadline()?,
+    /// The earliest time the reconciler must wake. Each deadline source is read on its own. One
+    /// that fails records a fault on the daemon and asks to be read again shortly, so the other
+    /// sources keep their deadlines.
+    fn next_reconcile_deadline(&self) -> Option<u128> {
+        let daemon = format!("daemon/{}", self.host);
+        let retry = now_ms().saturating_add(DEADLINE_SOURCE_RETRY_MS);
+        let read = |scope: &str, source: &dyn Fn() -> Result<Option<u128>>| {
+            self.isolate(scope, &daemon, source).unwrap_or(Some(retry))
+        };
+        [
+            read("deadline/missions", &|| {
+                self.store.next_active_mission_deadline(&self.host)
+            }),
+            read("deadline/work-wakes", &|| self.next_work_wake_deadline()),
+            read("deadline/provider-capacity-retries", &|| {
+                self.next_provider_capacity_retry_deadline()
+            }),
+            read("deadline/subscription-retries", &|| {
+                self.store.next_subscription_mission_retry_deadline()
+            }),
             self.delayed_restarts
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
@@ -767,7 +771,7 @@ impl<R: RuntimeControl> Reconciler<R> {
         ]
         .into_iter()
         .flatten()
-        .min())
+        .min()
     }
 
     fn next_work_wake_deadline(&self) -> Result<Option<u128>> {
@@ -796,7 +800,12 @@ impl<R: RuntimeControl> Reconciler<R> {
         let now = now_ms();
         for step in &mut work {
             if candidates.contains(step.subject.as_str()) {
-                self.store.populate_work_wake_for_reconcile(step, now)?;
+                // A step whose wake cannot be read keeps no wake, so it loses only its own
+                // deadline.
+                let subject = step.subject.clone();
+                self.isolate("wake-deadline", &subject, || {
+                    self.store.populate_work_wake_for_reconcile(step, now)
+                });
             }
         }
         Ok(work_wake_deadline(&work, &local_agents, &run_orders, now))
@@ -1050,6 +1059,7 @@ impl<R: RuntimeControl> Reconciler<R> {
         let mut work_message_agents = Vec::new();
         let mut deferred_member_faults = BTreeMap::new();
         let mut diagnostic_errors = Vec::new();
+        self.record_unreadable_members(&active, &mut diagnostic_errors);
         for subject in &active {
             let owner = if let Some(member) = &subject.member {
                 Ok(Some(member.host.clone()))
@@ -1307,17 +1317,72 @@ impl<R: RuntimeControl> Reconciler<R> {
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner),
         );
-        anyhow::ensure!(
-            diagnostic_errors.is_empty(),
-            "record member faults: {}",
-            diagnostic_errors.join("; ")
-        );
+        if !diagnostic_errors.is_empty() {
+            // Each of these items was already skipped on its own and the pass carried on. Only
+            // the record of its fault is missing, so the host is faulted, not unreachable.
+            let reason = format!("unrecorded item faults: {}", diagnostic_errors.join("; "));
+            #[cfg(test)]
+            if let Some(raised) = self.raised_faults.lock().unwrap().as_mut() {
+                raised.push(reason.clone());
+            }
+            self.record_once(
+                &daemon,
+                "daemon.diagnostic",
+                BTreeMap::from([
+                    ("severity".into(), Value::String("error".into())),
+                    ("code".into(), Value::String("fault-record-failed".into())),
+                    ("status".into(), Value::String("faulted".into())),
+                    ("reason".into(), Value::String(reason)),
+                ]),
+            )?;
+        }
         #[cfg(test)]
         if let Some(raised) = self.raised_faults.lock().unwrap().as_mut() {
             let raised = std::mem::take(raised);
             anyhow::ensure!(raised.is_empty(), "reconcile faults: {}", raised.join("; "));
         }
         Ok(())
+    }
+
+    /// A member declaration this build cannot read has no member, so the member loop would
+    /// pass over it without a word: never observed, started or stopped. The host that published
+    /// it records the fault on it instead, until a build that can read it takes it up.
+    fn record_unreadable_members(
+        &self,
+        active: &[&DesiredSubject],
+        diagnostic_errors: &mut Vec<String>,
+    ) {
+        let candidates = active
+            .iter()
+            .filter(|subject| subject.member.is_none() && subject.kind != "stop")
+            .map(|subject| subject.subject.as_str())
+            .collect::<Vec<_>>();
+        let unreadable = match self.store.unreadable_members(&candidates) {
+            Ok(unreadable) => unreadable,
+            Err(error) => {
+                diagnostic_errors.push(format!("read member declarations: {error:#}"));
+                return;
+            }
+        };
+        for (subject, reason) in unreadable {
+            let result = self
+                .store
+                .selected_desired_origin(&subject)
+                .and_then(|origin| {
+                    if origin.as_deref() != Some(self.host.as_str()) {
+                        return Ok(());
+                    }
+                    self.record_member_reconcile_result(
+                        &subject,
+                        Err(anyhow::anyhow!(
+                            "this build cannot read the member declaration: {reason}"
+                        )),
+                    )
+                });
+            if let Err(error) = result {
+                diagnostic_errors.push(format!("{subject}: {error:#}"));
+            }
+        }
     }
 
     fn record_member_reconcile_result(&self, subject: &str, result: Result<()>) -> Result<()> {
@@ -11321,7 +11386,6 @@ version 2
         assert!(
             reconciler
                 .next_reconcile_deadline()
-                .unwrap()
                 .is_some_and(|deadline| deadline > now_ms())
         );
     }
@@ -11359,11 +11423,92 @@ version 2
             assert!(
                 reconciler
                     .next_reconcile_deadline()
-                    .unwrap()
                     .is_some_and(|deadline| deadline > now_ms()),
                 "{source}"
             );
         }
+    }
+
+    /// Fails every item of one scope.
+    struct FailScope(&'static str);
+
+    impl FaultInjection for FailScope {
+        fn fault(&self, scope: &str, _subject: &str) -> Option<String> {
+            (scope == self.0).then(|| format!("injected fault in {scope}"))
+        }
+    }
+
+    #[test]
+    fn a_deadline_source_that_fails_loses_only_its_own_deadlines() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        let reconciler = Reconciler::new(
+            store.clone(),
+            Arc::new(FakeRuntime::default()),
+            "node".into(),
+            Arc::new(Notify::new()),
+        )
+        .with_fault_injection(Arc::new(FailScope("deadline/work-wakes")));
+        let restart = now_ms() + 1_000;
+        reconciler
+            .delayed_restarts
+            .lock()
+            .unwrap()
+            .insert("agent/sample".into(), restart);
+
+        let deadline = reconciler
+            .next_reconcile_deadline()
+            .expect("the failing source took the other deadlines with it");
+        assert!(deadline <= restart);
+        assert_eq!(
+            store
+                .reconcile_fault("daemon/node", "deadline/work-wakes")
+                .unwrap()
+                .as_deref(),
+            Some("injected fault in deadline/work-wakes")
+        );
+
+        // Alone, the failing source is read again within a few seconds, not every second.
+        reconciler.delayed_restarts.lock().unwrap().clear();
+        let before = now_ms();
+        let retry = reconciler
+            .next_reconcile_deadline()
+            .expect("a failing source asked for no retry");
+        assert!(retry >= before + DEADLINE_SOURCE_RETRY_MS);
+        assert!(retry <= now_ms() + DEADLINE_SOURCE_RETRY_MS);
+    }
+
+    #[test]
+    fn a_member_declaration_this_build_cannot_read_is_faulted_on_itself() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        apply_source(
+            &store,
+            "version 2\nexec \"odd\" { workspace \"/tmp\"; command \"true\"; restart \"never\" }\nexec \"fine\" { workspace \"/tmp\"; command \"true\"; restart \"never\" }\n",
+            "unreadable-member",
+        );
+        // A newer build's member, as an older build that replicated it would see it.
+        store.replace_desired_member_for_test("exec/odd", r#"{"kind":"exec","sandbox":"strict"}"#);
+        let runtime = Arc::new(FakeRuntime::default());
+        let reconciler = Reconciler::new(
+            store.clone(),
+            runtime.clone(),
+            "node".into(),
+            Arc::new(Notify::new()),
+        );
+
+        reconciler.reconcile_once().unwrap();
+
+        assert_eq!(
+            *runtime.starts.lock().unwrap(),
+            vec!["exec.fine".to_owned()]
+        );
+        let fault = store
+            .member_reconcile_fault("exec/odd", None)
+            .unwrap()
+            .expect("the unreadable declaration was skipped without a fault");
+        assert!(
+            fault.starts_with("this build cannot read the member declaration: "),
+            "{fault}"
+        );
     }
 
     #[test]
