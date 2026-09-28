@@ -28,7 +28,7 @@ fn login_environment_from(shell: &Path, timeout: Duration) -> Result<BTreeMap<St
             "-l",
             "-i",
             "-c",
-            "/usr/bin/printf '\\0ST3_ENV_BEGIN\\0'; /usr/bin/env -0; /usr/bin/printf 'ST3_ENV_END\\0'",
+            "printf '\\0ST3_ENV_BEGIN\\0'; env -0; printf 'ST3_ENV_END\\0'",
         ],
     )
 }
@@ -154,7 +154,7 @@ pub fn materialize_environment(
     overlay_environment(environment, declared, executable)
 }
 
-fn overlay_environment(
+pub fn overlay_environment(
     mut environment: BTreeMap<String, String>,
     declared: &BTreeMap<String, String>,
     executable: &Path,
@@ -243,7 +243,24 @@ fn account_shell() -> Option<PathBuf> {
     }
     let shell = unsafe { CStr::from_ptr((*entry).pw_shell) };
     let shell = shell.to_string_lossy();
-    (!shell.is_empty()).then(|| PathBuf::from(shell.as_ref()))
+    let shell = PathBuf::from(shell.as_ref());
+    select_account_shell(&shell, std::env::var_os("SHELL").map(PathBuf::from))
+}
+
+#[cfg(unix)]
+fn select_account_shell(shell: &Path, explicit_shell: Option<PathBuf>) -> Option<PathBuf> {
+    // Synthetic build/service accounts may have no interactive default. A real account
+    // shell still wins over SHELL, but /noshell, nologin and false cannot capture an
+    // environment. Only use the explicitly supplied alternative in that case.
+    let non_login = matches!(
+        shell.file_name().and_then(|name| name.to_str()),
+        Some("nologin" | "false")
+    );
+    if !non_login && shell.is_file() && is_executable(shell) {
+        Some(shell.to_owned())
+    } else {
+        explicit_shell
+    }
 }
 
 #[cfg(not(unix))]
@@ -292,6 +309,40 @@ mod tests {
             .map(|directory| directory.join("sh"))
             .find(|candidate| is_executable(candidate))
             .expect("the test environment must provide executable `sh` on PATH")
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_login_accounts_use_the_explicit_shell_for_capture() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let root = tempfile::tempdir().unwrap();
+        let shell = test_shell();
+        for name in ["nologin", "false"] {
+            let account = root.path().join(name);
+            std::fs::write(&account, "#!/bin/sh\nexit 1\n").unwrap();
+            std::fs::set_permissions(&account, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let selected = select_account_shell(&account, Some(shell.clone())).unwrap();
+            let environment = login_environment_with_args(
+                &selected,
+                Duration::from_secs(2),
+                Some(root.path()),
+                &[
+                    "-c",
+                    "printf '\\0ST3_ENV_BEGIN\\0PATH=/orchid/bin\\0ST3_ENV_END\\0'",
+                ],
+            )
+            .unwrap();
+            assert_eq!(environment["PATH"], "/orchid/bin");
+            assert_eq!(select_account_shell(&account, None), None);
+            assert_eq!(
+                select_account_shell(&shell, Some(account)),
+                Some(shell.clone())
+            );
+        }
+        assert_eq!(
+            select_account_shell(&root.path().join("missing-shell"), Some(shell.clone())),
+            Some(shell)
+        );
     }
 
     #[test]
