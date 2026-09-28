@@ -537,6 +537,38 @@ fn host_document_refs(desired: &Value) -> Vec<String> {
         .collect()
 }
 
+/// How long render waits for `git ls-files`. Render runs inline in the reconcile pass for every
+/// member, so a git that stops answering, for example on a stuck index lock, would stall the host.
+const RENDER_GIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+fn git_tracks(workspace: &Path, relative: &Path) -> Result<bool> {
+    let mut child = Command::new("git")
+        .arg("-C")
+        .arg(workspace)
+        .args(["ls-files", "--error-unmatch", "--"])
+        .arg(relative)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()?;
+    let pid = child.id();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = sender.send(child.wait());
+    });
+    match receiver.recv_timeout(RENDER_GIT_TIMEOUT) {
+        Ok(status) => Ok(status?.success()),
+        Err(_) => {
+            // The child is not reaped until its waiter returns, so the pid is still its own.
+            unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+            anyhow::bail!(
+                "git ls-files did not finish within {}s",
+                RENDER_GIT_TIMEOUT.as_secs()
+            )
+        }
+    }
+}
+
 fn ensure_tracked_file_is_unchanged(
     workspace: &Path,
     destination: &Path,
@@ -545,16 +577,8 @@ fn ensure_tracked_file_is_unchanged(
     let Ok(relative) = destination.strip_prefix(workspace) else {
         return Ok(());
     };
-    let tracked = Command::new("git")
-        .arg("-C")
-        .arg(workspace)
-        .args(["ls-files", "--error-unmatch", "--"])
-        .arg(relative)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .with_context(|| format!("check whether {} is tracked", destination.display()))?
-        .success();
+    let tracked = git_tracks(workspace, relative)
+        .with_context(|| format!("check whether {} is tracked", destination.display()))?;
     if tracked {
         let current = fs::read(destination).with_context(|| {
             format!("read tracked render destination {}", destination.display())

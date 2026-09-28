@@ -159,6 +159,9 @@ The daemon's other loops keep the same rule:
 - A wake message whose close fails does not keep an agent's other messages open or delay its next
   wake.
 - Session discovery skips a transcript it cannot read and lists the rest.
+- Every `pty` command and the `git ls-files` check that render makes have a time limit. The
+  reconciler runs them inline for every member, so one command that stops answering cannot stall
+  the host.
 
 ## Messages and attention
 
