@@ -110,12 +110,22 @@ fn github_response(
     Ok(response.error_for_status()?)
 }
 
+/// A hung connection must end, or its observer would never be polled again.
+const GITHUB_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const GITHUB_REQUEST_TIMEOUT: Duration = if cfg!(test) {
+    Duration::from_secs(2)
+} else {
+    Duration::from_secs(60)
+};
+
 fn github_client() -> reqwest::Client {
     static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
     CLIENT
         .get_or_init(|| {
             reqwest::Client::builder()
                 .user_agent("st3-resource-observer/0.1")
+                .connect_timeout(GITHUB_CONNECT_TIMEOUT)
+                .timeout(GITHUB_REQUEST_TIMEOUT)
                 .build()
                 .expect("GitHub HTTP client configuration is valid")
         })
@@ -1054,6 +1064,33 @@ mod tests {
         assert_eq!(facts["pull_requests"].as_array().unwrap().len(), 2);
         let repeated = normalize_github_repository(Some(&facts), 7, &[], &[], &fields).unwrap();
         assert_eq!(repeated["pull_requests"][1]["state"], "closed");
+    }
+
+    /// A provider that accepts the connection and never answers must not hold its observer forever.
+    #[tokio::test]
+    async fn a_github_request_that_never_answers_times_out() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            drop(stream);
+        });
+        let request = ObservationRequest {
+            provider: "github.repository".into(),
+            locator: "example/repo".into(),
+            fields: BTreeSet::from(["issues".into()]),
+            cursor: None,
+            previous_facts: None,
+        };
+        let observed = tokio::time::timeout(
+            Duration::from_secs(10),
+            observe_github_repository_at(request, &base, None),
+        )
+        .await
+        .expect("the request did not time out");
+        assert!(observed.is_err());
+        server.abort();
     }
 
     #[tokio::test]

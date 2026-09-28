@@ -106,6 +106,12 @@ WHERE kind IN (
     'subscription.mission-failed',
     'subscription.mission-request-cancelled'
 );
+CREATE INDEX IF NOT EXISTS claims_subscription_deferred_request_index
+ON claims(subject, json_extract(body, '$.fields.request'), store_index)
+WHERE kind='subscription.mission-deferred';
+CREATE INDEX IF NOT EXISTS claims_subscription_deferred_deadline_index
+ON claims(CAST(json_extract(body, '$.fields.not_before_unix_ms') AS INTEGER))
+WHERE kind='subscription.mission-deferred';
 CREATE INDEX IF NOT EXISTS claims_schedule_started_request_index
 ON claims(subject, json_extract(body, '$.fields.request'))
 WHERE kind='schedule.work-started';
@@ -3667,7 +3673,8 @@ impl Store {
         let now = now_ms() as i64;
         let deadline: Option<i64> = connection.query_row(
             "SELECT MIN(CAST(json_extract(body, '$.fields.not_before_unix_ms') AS INTEGER))
-             FROM claims WHERE kind='subscription.mission-deferred'
+             FROM claims INDEXED BY claims_subscription_deferred_deadline_index
+             WHERE kind='subscription.mission-deferred'
                AND CAST(json_extract(body, '$.fields.not_before_unix_ms') AS INTEGER)>?1",
             [now],
             |row| row.get(0),
@@ -9442,6 +9449,36 @@ impl Store {
             .query_map([subject], claim_from_row)?
             .collect::<Result<Vec<_>, _>>()
             .map_err(Into::into)
+    }
+
+    /// Read only one pending request's retry history. The request index covers the count and
+    /// locates its newest deadline without materializing every deferral on the subscription.
+    pub fn subscription_mission_deferral(
+        &self,
+        subject: &str,
+        request: &str,
+    ) -> Result<Option<(u128, u32)>> {
+        let connection = self.readers.get();
+        let count: u32 = connection.query_row(
+            "SELECT COUNT(*) FROM claims
+             WHERE subject=?1 AND kind='subscription.mission-deferred'
+               AND json_extract(body, '$.fields.request')=?2",
+            params![subject, request],
+            |row| row.get(0),
+        )?;
+        if count == 0 {
+            return Ok(None);
+        }
+        let deadline: Option<u64> = connection.query_row(
+            "SELECT CAST(json_extract(body, '$.fields.not_before_unix_ms') AS INTEGER)
+             FROM claims
+             WHERE subject=?1 AND kind='subscription.mission-deferred'
+               AND json_extract(body, '$.fields.request')=?2
+             ORDER BY store_index DESC LIMIT 1",
+            params![subject, request],
+            |row| row.get(0),
+        )?;
+        Ok(deadline.map(|deadline| (u128::from(deadline), count)))
     }
 
     pub fn pending_schedule_work_requests(&self, subject: &str) -> Result<Vec<ClaimRecord>> {
@@ -25266,6 +25303,80 @@ mod tests {
             .unwrap();
         assert_eq!(writer_cache_kib, -32768);
         assert_eq!(reader_cache_kib, -8192);
+    }
+
+    #[test]
+    fn subscription_retry_queries_use_history_indexes() {
+        let store = Store::open_memory("node").unwrap();
+        let subject = "subscription/reviews";
+        let first = now_ms() as u64 + 10_000;
+        let second = first + 20_000;
+        for (request, deadline) in [
+            ("request-a", first),
+            ("request-b", first),
+            ("request-a", second),
+        ] {
+            store
+                .append_claim(&ClaimInput {
+                    subject: subject.into(),
+                    kind: "subscription.mission-deferred".into(),
+                    actor: None,
+                    fields: BTreeMap::from([
+                        ("request".into(), Value::String(request.into())),
+                        ("not_before_unix_ms".into(), Value::from(deadline)),
+                    ]),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: None,
+                })
+                .unwrap();
+        }
+        assert_eq!(
+            store
+                .subscription_mission_deferral(subject, "request-a")
+                .unwrap(),
+            Some((u128::from(second), 2)),
+        );
+        assert_eq!(
+            store
+                .subscription_mission_deferral(subject, "request-b")
+                .unwrap(),
+            Some((u128::from(first), 1)),
+        );
+        assert_eq!(
+            store
+                .subscription_mission_deferral(subject, "missing")
+                .unwrap(),
+            None,
+        );
+        let connection = store.readers.get();
+        let request_plan: String = connection
+            .query_row(
+                "EXPLAIN QUERY PLAN SELECT COUNT(*) FROM claims
+                 WHERE subject=?1 AND kind='subscription.mission-deferred'
+                   AND json_extract(body, '$.fields.request')=?2",
+                params![subject, "request-a"],
+                |row| row.get(3),
+            )
+            .unwrap();
+        assert!(
+            request_plan.contains("claims_subscription_deferred_request_index"),
+            "{request_plan}"
+        );
+        let deadline_plan: String = connection
+            .query_row(
+                "EXPLAIN QUERY PLAN SELECT MIN(CAST(json_extract(body, '$.fields.not_before_unix_ms') AS INTEGER))
+                 FROM claims INDEXED BY claims_subscription_deferred_deadline_index
+                 WHERE kind='subscription.mission-deferred'
+                   AND CAST(json_extract(body, '$.fields.not_before_unix_ms') AS INTEGER)>?1",
+                [now_ms() as i64],
+                |row| row.get(3),
+            )
+            .unwrap();
+        assert!(
+            deadline_plan.contains("claims_subscription_deferred_deadline_index"),
+            "{deadline_plan}"
+        );
     }
 
     #[test]

@@ -151,6 +151,9 @@ The daemon keeps each next-check deadline and cursor in local scheduler memory. 
 
 The provider applies bounded retries and backoff. It records authentication, rate-limit, and transport failures on the observer subject.
 
+Each GitHub request times out after one minute, so a connection that never answers cannot hold its
+observer.
+
 An unchanged failure creates no new claim. A later success replaces the complete observer health state and clears the old failure reason.
 
 An observer checks its declared fields. Its effective field set also includes the union of its subscription fields.

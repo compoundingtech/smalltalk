@@ -147,6 +147,8 @@ struct ClientPageCursor {
     #[serde(default)]
     native_only: bool,
     items_digest: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    before_index: Option<u64>,
     expires_at_unix_ms: u128,
 }
 
@@ -956,6 +958,7 @@ fn client_page(
             status: query.status.clone(),
             native_only: query.native_only,
             items_digest,
+            before_index: None,
             expires_at_unix_ms,
         })?)
     } else {
@@ -2529,34 +2532,26 @@ fn client_launch_resources(state: &AppState, history: bool) -> anyhow::Result<Ve
     Ok(resources)
 }
 
-fn client_history_resources(store: &Store) -> anyhow::Result<Vec<Value>> {
-    let index = store.index()?;
-    let page = store.claims_page(None, None, 0, None, true, index as usize + 1)?;
-    Ok(page
-        .claims
-        .into_iter()
-        .map(|claim| {
-            let mut targets = vec![claim.subject.clone()];
-            if let Some(actor) = &claim.actor
-                && actor.contains('/')
-                && !actor.chars().any(char::is_whitespace)
-            {
-                targets.push(actor.clone());
-            }
-            json!({
-                "id": format!("history/{}", claim.store_index),
-                "kind": "history",
-                "revision": claim.id,
-                "updated_at": client_timestamp(claim.accepted_at_unix_ms),
-                "event_type": claim.kind,
-                "occurred_at": client_timestamp(claim.accepted_at_unix_ms),
-                "store_index": claim.store_index,
-                "summary": format!("{} on {}", claim.kind, claim.subject),
-                "targets": targets,
-                "operational": { "layer": "history", "actionable": false, "reasons": ["audit"] }
-            })
-        })
-        .collect())
+fn client_history_resource(claim: ClaimRecord) -> Value {
+    let mut targets = vec![claim.subject.clone()];
+    if let Some(actor) = &claim.actor
+        && actor.contains('/')
+        && !actor.chars().any(char::is_whitespace)
+    {
+        targets.push(actor.clone());
+    }
+    json!({
+        "id": format!("history/{}", claim.store_index),
+        "kind": "history",
+        "revision": claim.id,
+        "updated_at": client_timestamp(claim.accepted_at_unix_ms),
+        "event_type": claim.kind,
+        "occurred_at": client_timestamp(claim.accepted_at_unix_ms),
+        "store_index": claim.store_index,
+        "summary": format!("{} on {}", claim.kind, claim.subject),
+        "targets": targets,
+        "operational": { "layer": "history", "actionable": false, "reasons": ["audit"] }
+    })
 }
 
 async fn client_work(
@@ -2962,19 +2957,140 @@ async fn client_history(
     Extension(snapshot): Extension<ClientSnapshot>,
     Query(query): Query<ClientListQuery>,
 ) -> Result<Json<ClientResourcePage>, ApiError> {
-    let items = client_history_resources(&state.store).map_err(ApiError::internal)?;
-    client_page(&state, &snapshot, "history", items, &query).map(Json)
+    let requested_limit = query
+        .limit
+        .unwrap_or(CLIENT_DEFAULT_PAGE_ITEMS)
+        .clamp(1, CLIENT_MAX_PAGE_ITEMS);
+    let (before_index, limit, offset, expires_at_unix_ms) = if let Some(encoded) = &query.cursor {
+        let cursor = decode_client_cursor(encoded)?;
+        if cursor.collection != "history"
+            || cursor.snapshot.id != snapshot.id
+            || cursor.snapshot.store_index != snapshot.store_index
+            || cursor.history != query.history
+            || cursor.person != query.person
+            || cursor.actor != query.actor
+            || cursor.owner_run != query.owner_run
+            || cursor.status != query.status
+            || cursor.native_only != query.native_only
+            || query
+                .limit
+                .is_some_and(|limit| limit.clamp(1, CLIENT_MAX_PAGE_ITEMS) != cursor.limit)
+        {
+            return Err(client_page_expired(
+                "the page cursor does not match this collection, snapshot, or filter",
+            ));
+        }
+        if client_now_ms() > cursor.expires_at_unix_ms {
+            return Err(client_page_expired("the page cursor expired"));
+        }
+        let before = cursor
+            .before_index
+            .ok_or_else(|| client_page_expired("the history cursor is malformed"))?;
+        (
+            before,
+            cursor.limit,
+            cursor.offset,
+            cursor.expires_at_unix_ms,
+        )
+    } else {
+        if state.store.index().map_err(ApiError::internal)? != snapshot.store_index {
+            return Err(client_page_expired(
+                "the snapshot changed; restart pagination from the first page",
+            ));
+        }
+        (
+            snapshot.store_index.saturating_add(1),
+            requested_limit,
+            0,
+            client_now_ms().saturating_add(CLIENT_PAGE_TTL_MS),
+        )
+    };
+    let store = state.store.clone();
+    let page =
+        blocking_store(move || store.claims_page(None, None, 0, Some(before_index), true, limit))
+            .await?;
+    let has_more = page.next_cursor.is_some();
+    let items = page
+        .claims
+        .into_iter()
+        .map(client_history_resource)
+        .collect::<Vec<_>>();
+    let next_cursor = page
+        .next_cursor
+        .map(|next| {
+            encode_client_cursor(&ClientPageCursor {
+                snapshot: snapshot.clone(),
+                collection: "history".into(),
+                offset: offset.saturating_add(items.len()),
+                limit,
+                history: query.history,
+                person: query.person.clone(),
+                actor: query.actor.clone(),
+                owner_run: query.owner_run.clone(),
+                status: query.status.clone(),
+                native_only: query.native_only,
+                items_digest: String::new(),
+                before_index: Some(next),
+                expires_at_unix_ms,
+            })
+        })
+        .transpose()?;
+    let mut filters = BTreeMap::new();
+    if query.history {
+        filters.insert("history".into(), "all".into());
+    }
+    for (name, value) in [
+        ("person", query.person.as_ref()),
+        ("actor", query.actor.as_ref()),
+        ("owner_run", query.owner_run.as_ref()),
+        ("status", query.status.as_ref()),
+    ] {
+        if let Some(value) = value {
+            filters.insert(name.into(), value.clone());
+        }
+    }
+    if query.native_only {
+        filters.insert("native_only".into(), "true".into());
+    }
+    Ok(Json(ClientResourcePage {
+        kind: "page".into(),
+        collection: "history".into(),
+        filters,
+        items,
+        page: ClientPageInfo {
+            limit,
+            has_more,
+            next_cursor,
+            cursor_expires_at: has_more.then(|| client_timestamp(expires_at_unix_ms)),
+        },
+        sync: client_sync_notice(&state),
+    }))
 }
 
 async fn client_history_detail(
     State(state): State<AppState>,
     AxumPath(id): AxumPath<String>,
 ) -> Result<Json<Value>, ApiError> {
-    client_detail(
-        client_history_resources(&state.store).map_err(ApiError::internal)?,
-        "history",
-        &id,
-    )
+    let id = client_detail_id("history", &id);
+    let index = id
+        .strip_prefix("history/")
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|index| *index > 0)
+        .ok_or_else(|| ApiError::not_found(format!("history `{id}` does not exist")))?;
+    let upper = index
+        .checked_add(1)
+        .ok_or_else(|| ApiError::not_found(format!("history `{id}` does not exist")))?;
+    let store = state.store.clone();
+    let page =
+        blocking_store(move || store.claims_page(None, None, index - 1, Some(upper), true, 1))
+            .await?;
+    page.claims
+        .into_iter()
+        .next()
+        .filter(|claim| claim.store_index == index)
+        .map(client_history_resource)
+        .map(Json)
+        .ok_or_else(|| ApiError::not_found(format!("history `{id}` does not exist")))
 }
 
 async fn blocking_store<T, F>(operation: F) -> Result<T, ApiError>
@@ -3021,7 +3137,16 @@ async fn serve_unix_inner(socket: &Path, app: Router, bind_harness: bool) -> any
     let listener = UnixListener::bind(socket)?;
     fs::set_permissions(socket, fs::Permissions::from_mode(0o600))?;
     loop {
-        let (stream, _) = listener.accept().await?;
+        let stream = match listener.accept().await {
+            Ok((stream, _)) => stream,
+            // Running out of file descriptors, or a peer that hung up before it was accepted,
+            // fails one accept. It must not end the daemon: back off and keep serving.
+            Err(error) => {
+                eprintln!("st3: accept a local API connection: {error}");
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            }
+        };
         let bound_agent = if bind_harness {
             stream
                 .peer_cred()
@@ -9148,6 +9273,72 @@ mod tests {
     use axum::body::to_bytes;
     use axum::http::Request;
     use std::path::PathBuf;
+
+    #[tokio::test]
+    async fn history_pages_and_detail_do_not_cache_the_whole_claim_log() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        for number in 0..8 {
+            state
+                .store
+                .append_claim(&ClaimInput {
+                    subject: "daemon/node".into(),
+                    kind: "daemon.diagnostic".into(),
+                    actor: None,
+                    fields: BTreeMap::from([
+                        ("code".into(), Value::String("history-test".into())),
+                        ("severity".into(), Value::String("error".into())),
+                        ("reason".into(), Value::String(number.to_string())),
+                    ]),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: None,
+                })
+                .unwrap();
+        }
+        let snapshot = new_client_snapshot(&state);
+        let first = client_history(
+            State(state.clone()),
+            Extension(snapshot.clone()),
+            Query(ClientListQuery {
+                limit: Some(1),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(first.items.len(), 1);
+        let first_index = first.items[0]["store_index"].as_u64().unwrap();
+        let cursor = first.page.next_cursor.unwrap();
+        assert!(
+            !client_page_cache()
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|entry| { entry.snapshot_id == snapshot.id && entry.collection == "history" }),
+            "a history page must not retain every claim in the process cache"
+        );
+        let second = client_history(
+            State(state.clone()),
+            Extension(snapshot),
+            Query(ClientListQuery {
+                limit: Some(1),
+                cursor: Some(cursor),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(second.items.len(), 1);
+        assert!(second.items[0]["store_index"].as_u64().unwrap() < first_index);
+        let detail = client_history_detail(State(state), AxumPath(first_index.to_string()))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(detail["store_index"], first_index);
+    }
 
     #[tokio::test]
     async fn a_bound_harness_cannot_post_a_queue_move_as_another_actor() {
