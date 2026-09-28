@@ -4369,28 +4369,20 @@ async fn fleet_membership_view(
 }
 
 async fn replication_wake(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
-    let admission = state
-        .store
-        .validate_replication_backlog()
-        .map_err(ApiError::internal)?;
-    let repairs = state
-        .store
-        .apply_replication_repairs()
-        .map_err(ApiError::internal)?;
-    let projection_attempted = admission.changed
-        || repairs != 0
-        || state
-            .store
-            .replication_projection_needs_recovery()
-            .map_err(ApiError::internal)?;
-    let projected = if projection_attempted {
-        state
-            .store
-            .project_replication_backlog()
-            .map_err(ApiError::internal)?
-    } else {
-        true
-    };
+    let store = state.store.clone();
+    let (admission, repairs, projection_attempted, projected) = blocking_store(move || {
+        let admission = store.validate_replication_backlog()?;
+        let repairs = store.apply_replication_repairs()?;
+        let projection_attempted =
+            admission.changed || repairs != 0 || store.replication_projection_needs_recovery()?;
+        let projected = if projection_attempted {
+            store.project_replication_backlog()?
+        } else {
+            true
+        };
+        Ok((admission, repairs, projection_attempted, projected))
+    })
+    .await?;
     if projected && (admission.changed || repairs != 0) {
         signal_changed(&state);
     }
@@ -6162,14 +6154,16 @@ async fn post_claim(
     State(state): State<AppState>,
     Json(request): Json<ClaimInput>,
 ) -> Result<Json<ClaimRecord>, ApiError> {
-    let (response, appended) = state
-        .store
-        .append_client_claim_outcome(&request)
-        .map_err(ApiError::bad)?;
+    // A write can wait for the store's writer. It waits on the blocking pool, so the API's
+    // workers keep answering other requests meanwhile.
+    let store = state.store.clone();
+    let kind = request.kind.clone();
+    let (response, appended) =
+        blocking_action(move || store.append_client_claim_outcome(&request)).await?;
     if appended {
         if crate::store::local_observation_position(&response).is_some() {
             signal_local_change(&state);
-        } else if request.kind == "harness.usage" {
+        } else if kind == "harness.usage" {
             signal_visible_change(&state);
         } else {
             signal_changed(&state);
@@ -9859,6 +9853,47 @@ mod tests {
         assert_eq!(second["items"][0]["name"], "doc/late/target");
         assert_ne!(first["items"][0]["hash"], second["items"][0]["hash"]);
         assert_eq!(second["has_more"], false);
+    }
+
+    #[tokio::test]
+    async fn a_claim_waiting_for_the_store_writer_leaves_the_api_answering() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let store = state.store.clone();
+        let app = router(state);
+        let (held, holding) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            store.hold_writer_for_test(|| {
+                held.send(()).unwrap();
+                std::thread::sleep(Duration::from_millis(1_500));
+            });
+        });
+        holding.recv().unwrap();
+
+        // This test runs on one thread. A claim that waited for the writer on it would hold the
+        // whole runtime, even this sleep, until the writer was released.
+        let started = std::time::Instant::now();
+        let claim = tokio::spawn(json_request(
+            app.clone(),
+            "/v1/claims",
+            json!({
+                "subject": "custom/acme/fact",
+                "kind": "custom.acme.found",
+                "fields": {},
+            }),
+        ));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let (status, _) = get_request(app, "/v1/health").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            started.elapsed() < Duration::from_millis(750),
+            "health waited {:?} behind a claim that was waiting for the writer",
+            started.elapsed()
+        );
+
+        holder.join().unwrap();
+        let (status, body) = claim.await.unwrap();
+        assert_eq!(status, StatusCode::OK, "{body}");
     }
 
     async fn json_request(app: Router, path: &str, value: Value) -> (StatusCode, Value) {

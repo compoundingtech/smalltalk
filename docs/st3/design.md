@@ -153,6 +153,9 @@ The daemon's other loops keep the same rule:
   whose document is not on this host, is recorded once as a `harness.diagnostic` with the code
   `message-unforwarded`. The recipient's other messages keep arriving.
 - A driver skips renewing a step whose claim ended in the meantime, and keeps running.
+- A claim write, a replication wake and each reconcile pass run on the blocking pool. One that waits
+  for the store's writer does not hold an async worker, so the API, its health check and timers
+  keep answering.
 - A panic while the store's writer is held does not disable the store. The panic rolls back its
   open transaction as it unwinds, and the next write proceeds. The reconciler's own locks recover
   the same way.
