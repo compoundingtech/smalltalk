@@ -1398,6 +1398,38 @@ Small pull requests, in order, each from a branch off `origin/main`:
 The docs, release-e2e, and live steps follow with the README section, the `v0.3.1` tag, and
 `scripts/fleet-live-test`.
 
+## As built
+
+The implementation (#599, #602, #603, #606, #611, #612, #613) follows this design with these
+differences, found while building it or raised by intake reviews:
+
+- **`st fleet remove` does not look at seats.** It removes the member and revokes its invites;
+  seats declared on that host stay declared and resume if a machine joins again under the name.
+  Stop them first with `st3 agents stop`. `--stop-seats` is not built.
+- **`st uninstall` leaves two things for later:** the generated `.st3/` files in seat workspaces
+  and the st3 Claude channel registration. The isolated tests have no seats; both need the seat
+  declarations read before the state directory goes. It prints what needs root. `--no-service`
+  keeps it (and every other fleet command that has the flag) away from service managers, which
+  macOS does not isolate by `HOME`.
+- **The leave drain condition** is that a peer reports the same authority digest as this node,
+  checked before and after the leave claim. Leaving mode refuses every mutating route except
+  `/v1/internal/fleet/leave/*` and replication traffic (#612 intake finding).
+- **The join route has no request quota** (#611 intake finding).
+- **A signature by a key outside the writer's window** leaves an envelope `unsigned`, still
+  requesting its writer's signature, rather than `fenced` (#599 intake finding).
+- **Migration records the secret file's absolute path** in `fleet.toml` (#613 intake finding).
+- **Fabric dials go through `fabric dial … --tcp 127.0.0.1:0`,** a loopback tunnel, instead of a
+  Unix socket.
+- **`st fleet mode listening|dial-out`** is built, as is `st fleet invites revoke`.
+- **Integration tests** in `crates/st3/tests/fleet.rs`: 1, 2, 3, 6, 7, 8, 10, 11, 12, 13, 14, and 15
+  as described above, plus a flood of invalid join requests, a leaving sponsor that writes nothing,
+  and a member switching modes. Test 4 (forged relay) and test 5 (impersonation) are covered at the
+  store and peer level (`a_removed_incarnation_is_fenced_everywhere_that_has_the_removal_even_through_a_relay`,
+  `members_exchange_with_signatures_and_a_removed_member_is_refused`), not yet end to end. Test 9's
+  1,500-envelope drain runs with 700 envelopes and no injected faults. Test 15 runs a baseline built
+  from the pinned commit.
+- **`fleet-e2e`** waits for the tag workflow in #585; the release-e2e step adds it.
+
 ## Not in this design
 
 - **Rotating the fleet secret.** Once every writer is keyed and every member has finished
