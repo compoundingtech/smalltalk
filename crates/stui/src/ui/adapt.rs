@@ -155,6 +155,9 @@ fn attention(model: &Model, extras: &Extras) -> Vec<Attention> {
                     AttentionKind::Fault {
                         what: item.detail.clone(),
                         because: match item.priority.as_str() {
+                            _ if item.attention_kind == "agent-request" => {
+                                "an agent is asking you for help".into()
+                            }
                             "critical" => "marked critical".into(),
                             "high" => "marked high priority".into(),
                             _ => "raised for you".into(),
