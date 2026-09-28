@@ -53,6 +53,7 @@ use crate::model::{
 use crate::store::Store;
 
 mod client_v0;
+mod terminal_view;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -2984,9 +2985,53 @@ fn isolation_name(mode: st_runtime::Isolation) -> &'static str {
 }
 
 async fn doctor(State(state): State<AppState>) -> Result<Json<DoctorReport>, ApiError> {
-    tokio::task::spawn_blocking(move || doctor_report(&state))
+    let environment = tokio::task::spawn_blocking(crate::environment::snapshot)
         .await
-        .map_err(ApiError::internal)?
+        .map_err(ApiError::internal)?;
+    let token = crate::resource::github_token().await;
+    let mut report = tokio::task::spawn_blocking(move || doctor_report(&state))
+        .await
+        .map_err(ApiError::internal)??
+        .0;
+    report.checks.push(match environment {
+        Ok(environment) => DoctorCheck {
+            name: "daemon-environment".into(),
+            status: "pass".into(),
+            message: format!(
+                "account interactive login shell; refreshed on use every 60 seconds; PATH={}",
+                environment.get("PATH").map(String::as_str).unwrap_or("")
+            ),
+        },
+        Err(error) => DoctorCheck {
+            name: "daemon-environment".into(),
+            status: "fail".into(),
+            message: error.to_string(),
+        },
+    });
+    report.checks.push(DoctorCheck {
+        name: "github-observer-auth".into(),
+        status: if token.is_ok() { "pass" } else { "warn" }.into(),
+        message: if token.is_ok() {
+            "GitHub observers have a token; credential values are not displayed".into()
+        } else {
+            crate::resource::GITHUB_AUTH_REMEDY.into()
+        },
+    });
+    report.status = if report.checks.iter().any(|check| check.status == "fail") {
+        "fail"
+    } else if report.checks.iter().any(|check| check.status == "warn") {
+        "warn"
+    } else {
+        "pass"
+    }
+    .into();
+    Ok(Json(report))
+}
+
+fn daemon_pty(state: &AppState) -> anyhow::Result<st_runtime::PtyRuntime> {
+    Ok(st_runtime::PtyRuntime::new(state.pty_root.clone())
+        .with_binary(state.pty_binary.to_string_lossy())
+        .with_environment(crate::environment::snapshot()?))
 }
 
 fn doctor_report(state: &AppState) -> Result<Json<DoctorReport>, ApiError> {
@@ -3084,9 +3129,7 @@ fn doctor_report(state: &AppState) -> Result<Json<DoctorReport>, ApiError> {
             .as_ref()
             .is_some_and(|member| member.terminal)
     });
-    let pty_snapshot = st_runtime::PtyRuntime::new(state.pty_root.clone())
-        .with_binary(state.pty_binary.to_string_lossy())
-        .snapshot();
+    let pty_snapshot = daemon_pty(state).and_then(|runtime| runtime.snapshot());
     match &pty_snapshot {
         Ok(items) => checks.push(DoctorCheck {
             name: "pty-runtime".into(),
@@ -3323,6 +3366,52 @@ fn doctor_report(state: &AppState) -> Result<Json<DoctorReport>, ApiError> {
             message: error.to_string(),
         }),
     }
+    // Once a node pins a fleet anchor, membership decides admission. Report what waits for a
+    // signature, what is fenced, and what was admitted before this node knew better.
+    match state.store.fleet_anchor() {
+        Ok(None) => {}
+        Ok(Some(_)) => match (
+            state
+                .store
+                .replication_status(true, state.fleet_id.as_deref(), &[]),
+            state.store.fleet_admission_residue(),
+        ) {
+            (Ok(holds), Ok(residue)) => {
+                let mut notes = vec![format!(
+                    "{} envelopes wait for their writer's signature; {} are fenced",
+                    holds.unsigned_envelopes, holds.fenced_envelopes
+                )];
+                notes.extend(residue.iter().map(|item| {
+                    format!(
+                        "{} envelopes from {} were {}",
+                        item.envelopes,
+                        item.writer,
+                        item.reason.replace('-', " ")
+                    )
+                }));
+                checks.push(DoctorCheck {
+                    name: "fleet-admission".into(),
+                    status: if residue.is_empty() && holds.unsigned_envelopes == 0 {
+                        "pass"
+                    } else {
+                        "warn"
+                    }
+                    .into(),
+                    message: notes.join("; "),
+                });
+            }
+            (Err(error), _) | (_, Err(error)) => checks.push(DoctorCheck {
+                name: "fleet-admission".into(),
+                status: "fail".into(),
+                message: error.to_string(),
+            }),
+        },
+        Err(error) => checks.push(DoctorCheck {
+            name: "fleet-admission".into(),
+            status: "fail".into(),
+            message: error.to_string(),
+        }),
+    }
     let report_status = if checks.iter().any(|check| check.status == "fail") {
         "fail"
     } else if checks.iter().any(|check| check.status == "warn") {
@@ -3433,7 +3522,11 @@ async fn replication_export(
         let exchange = if request.summary_only {
             store.export_replication_summary(&request.fleet_id)?
         } else {
-            store.export_replication_exchange(&request.fleet_id, &request.inventory)?
+            store.export_replication_exchange_answering(
+                &request.fleet_id,
+                &request.inventory,
+                &request.signature_requests,
+            )?
         };
         Ok(Json(ReplicationExportResponse {
             exchange,
@@ -3463,21 +3556,21 @@ async fn replication_receive(
         store
             .record_transport_observation(&request.peer, "up", None, None)
             .map_err(|error| St3Error::new("internal", error.to_string()))?;
-        let (admission, repairs, projected) = if replication_receive_has_new_data(receipt.received)
-        {
-            let admission = store
-                .validate_replication_backlog()
-                .map_err(|error| St3Error::new("internal", error.to_string()))?;
-            let repairs = store
-                .apply_replication_repairs()
-                .map_err(|error| St3Error::new("internal", error.to_string()))?;
-            let projected = store
-                .project_replication_backlog()
-                .map_err(|error| St3Error::new("internal", error.to_string()))?;
-            (admission, repairs, projected)
-        } else {
-            (Default::default(), 0, true)
-        };
+        let (admission, repairs, projected) =
+            if replication_receive_has_new_data(receipt.received + receipt.signatures) {
+                let admission = store
+                    .validate_replication_backlog()
+                    .map_err(|error| St3Error::new("internal", error.to_string()))?;
+                let repairs = store
+                    .apply_replication_repairs()
+                    .map_err(|error| St3Error::new("internal", error.to_string()))?;
+                let projected = store
+                    .project_replication_backlog()
+                    .map_err(|error| St3Error::new("internal", error.to_string()))?;
+                (admission, repairs, projected)
+            } else {
+                (Default::default(), 0, true)
+            };
         let store_index = store
             .index()
             .map_err(|error| St3Error::new("internal", error.to_string()))?;
@@ -7675,9 +7768,8 @@ async fn screen_session(
             "an exec session has a log instead of a terminal screen",
         )));
     }
-    let screen = st_runtime::PtyRuntime::new(state.pty_root.clone())
-        .with_binary(state.pty_binary.to_string_lossy())
-        .screen(&session.runtime_id)
+    let screen = daemon_pty(&state)
+        .and_then(|runtime| runtime.screen(&session.runtime_id))
         .map_err(ApiError::internal)?;
     Ok(Json(SessionScreen {
         subject,
@@ -7790,9 +7882,7 @@ async fn input_session_as(
             idempotency_key: Some(request_key),
         })
         .map_err(ApiError::bad)?;
-    let runtime = st_runtime::PtyRuntime::new(state.pty_root.clone())
-        .with_binary(state.pty_binary.to_string_lossy());
-    let effect = match request.mode {
+    let effect = daemon_pty(state).and_then(|runtime| match request.mode {
         SessionInputMode::Line => runtime.send_line_if(
             &session.runtime_id,
             &request.value,
@@ -7806,7 +7896,7 @@ async fn input_session_as(
             &request.value,
             Some(&session.incarnation_id),
         ),
-    };
+    });
     finish_session_control(
         state,
         &subject,
@@ -7881,9 +7971,9 @@ async fn clear_context(
             idempotency_key: Some(request_key),
         })
         .map_err(ApiError::bad)?;
-    let effect = st_runtime::PtyRuntime::new(state.pty_root.clone())
-        .with_binary(state.pty_binary.to_string_lossy())
-        .send_line_if(&session.runtime_id, "/clear", Some(&session.incarnation_id));
+    let effect = daemon_pty(&state).and_then(|runtime| {
+        runtime.send_line_if(&session.runtime_id, "/clear", Some(&session.incarnation_id))
+    });
     finish_session_control(
         &state,
         &subject,
@@ -7970,9 +8060,9 @@ async fn signal_session(
         })
         .map_err(ApiError::bad)?;
     let effect = if session.terminal {
-        st_runtime::PtyRuntime::new(state.pty_root.clone())
-            .with_binary(state.pty_binary.to_string_lossy())
-            .signal_if(&session.runtime_id, Some(&session.incarnation_id), signal)
+        daemon_pty(&state).and_then(|runtime| {
+            runtime.signal_if(&session.runtime_id, Some(&session.incarnation_id), signal)
+        })
     } else {
         st_runtime::ExecRuntime::new(state.state_dir.join("exec"), state.state_dir.join("logs"))
             .signal_if(&session.runtime_id, Some(&session.incarnation_id), signal)

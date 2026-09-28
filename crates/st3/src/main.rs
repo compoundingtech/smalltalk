@@ -542,8 +542,8 @@ enum PtyCommand {
     Screen(PtyScreenArgs),
     /// Create a short-lived client attachment and show its stream details.
     AttachInfo(PtyScreenArgs),
-    /// Read one bounded terminal frame batch with an attachment capability.
-    Frames(PtyFramesArgs),
+    /// Follow a terminal's screens with an attachment capability until the stream ends.
+    Stream(PtyStreamArgs),
     /// Send input through the client gateway to a local or remote terminal.
     InputClient(PtyClientInputArgs),
     /// End a client attachment by its exact attachment ID.
@@ -568,7 +568,7 @@ struct PtyScreenArgs {
 }
 
 #[derive(Args)]
-struct PtyFramesArgs {
+struct PtyStreamArgs {
     subject: String,
     #[arg(long = "as", value_parser = parse_person_subject)]
     person: Option<String>,
@@ -577,10 +577,9 @@ struct PtyFramesArgs {
     capability: String,
     #[arg(long)]
     incarnation: Option<String>,
-    #[arg(long)]
-    after: Option<u64>,
-    #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u64).range(0..=30_000))]
-    wait_ms: u64,
+    /// Stop after this many screens instead of following until the stream ends.
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+    count: Option<u64>,
 }
 
 #[derive(Args)]
@@ -1809,7 +1808,8 @@ async fn run_up(args: UpArgs) -> Result<()> {
         .pty_root
         .clone()
         .unwrap_or_else(|| config.state_dir.join("pty"));
-    let login_environment = st_runtime::login_environment()?;
+    let login_environment = st3::environment::snapshot()?;
+    st_runtime::initialize_isolation(&login_environment);
     let pty_binary = st_runtime::resolve_executable("pty", &login_environment)?;
     let state = AppState {
         store: store.clone(),
@@ -1835,7 +1835,7 @@ async fn run_up(args: UpArgs) -> Result<()> {
         notify.clone(),
         event_notify.clone(),
     )?);
-    tokio::spawn(reconciler.run());
+    tokio::spawn(reconciler.supervise());
     tokio::spawn(trim_local_observations(
         store.clone(),
         config.observations.clone(),
@@ -2879,36 +2879,36 @@ async fn run_pty(
                 .await?;
             print_client_value(&response, json_output)
         }
-        PtyCommand::Frames(args) => {
+        PtyCommand::Stream(args) => {
             let person = configured_human(
                 args.person.as_deref(),
                 configured_person,
-                "terminals frames",
+                "terminals stream",
             )?;
-            let batch = generated_client(endpoint, Some(&person))?
-                .terminal_frames(
+            let mut stream = generated_client(endpoint, Some(&person))?
+                .terminal_stream(
                     &args.subject,
-                    args.after,
                     args.incarnation.as_deref(),
                     &args.capability,
-                    Some(args.wait_ms),
                 )
                 .await?;
-            if json_output {
-                print_value(
-                    &json!({ "screen": batch.screen, "frames": batch.frames }),
-                    true,
-                )
-            } else {
-                print!("{}", render_terminal_screen(&batch.screen.value));
-                if let Some(frames) = batch.frames {
-                    println!("Resume after sequence {}", frames.value.resume_sequence);
-                    for frame in frames.value.frames {
-                        println!("{} {} {}", frame.sequence, frame.timestamp, frame.body);
+            let mut shown = 0_u64;
+            while args.count.is_none_or(|count| shown < count) {
+                let Some(screen) = stream.next().await? else {
+                    break;
+                };
+                shown += 1;
+                if json_output {
+                    println!("{}", serde_json::to_string(&screen)?);
+                } else {
+                    if shown > 1 {
+                        println!();
                     }
+                    print!("{}", render_terminal_screen(&screen.value));
                 }
-                Ok(())
             }
+            stream.close().await;
+            Ok(())
         }
         PtyCommand::InputClient(args) => {
             let person = configured_human(
@@ -10758,7 +10758,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             render_terminal_screen(&response.value),
-            "$ cargo build\nFinished\n$ \n"
+            "$ cargo build\nFinished\n$\n"
         );
     }
 
@@ -10778,29 +10778,27 @@ mod tests {
             }
         ));
 
-        let frames = Cli::try_parse_from([
+        let stream = Cli::try_parse_from([
             "st3",
             "terminals",
-            "frames",
+            "stream",
             "terminal/agent/fleet/app-web/standing/app-web",
             "--capability",
             "test-capability",
             "--incarnation",
             "runtime-1",
-            "--after",
-            "41",
-            "--wait-ms",
-            "5000",
+            "--count",
+            "3",
         ])
         .unwrap();
         let Command::Terminals {
-            command: PtyCommand::Frames(args),
-        } = frames.command
+            command: PtyCommand::Stream(args),
+        } = stream.command
         else {
-            panic!("frames did not parse");
+            panic!("stream did not parse");
         };
-        assert_eq!(args.after, Some(41));
-        assert_eq!(args.wait_ms, 5000);
+        assert_eq!(args.incarnation.as_deref(), Some("runtime-1"));
+        assert_eq!(args.count, Some(3));
 
         let input = Cli::try_parse_from([
             "st3",

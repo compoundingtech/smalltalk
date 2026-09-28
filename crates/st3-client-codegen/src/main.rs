@@ -443,6 +443,10 @@ fn validate_surfaces(
         "PairingComplete",
         "PairedSession",
         "TerminalAttachment",
+        "TerminalScreen",
+        "TerminalLine",
+        "TerminalRun",
+        "TerminalModes",
         "MachineCapacity",
         "MachineOccupancy",
         "MachineTransport",
@@ -459,7 +463,8 @@ fn validate_surfaces(
     for token in [
         "pub async fn pairing_begin",
         "pub async fn pairing_complete",
-        "pub async fn terminal_frames",
+        "pub async fn terminal_stream",
+        "pub async fn terminal_screen_change",
         "Endpoint::Unix",
         "Endpoint::FabricLoopback",
     ] {
@@ -475,7 +480,7 @@ fn validate_surfaces(
         "func beginPairing(",
         "func completePairing(",
         "func terminalScreen(",
-        "func terminalFrames(",
+        "func terminalStream(",
         "func agentQueue(",
     ] {
         if !swift_client.contains(token) {

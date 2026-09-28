@@ -109,10 +109,41 @@ pub struct Client {
     announce_outage_wait: bool,
 }
 
-#[derive(Clone, Debug)]
-pub struct TerminalStreamBatch {
-    pub screen: Envelope<TerminalScreen>,
-    pub frames: Option<Envelope<TerminalFramePage>>,
+/// An open terminal stream. Each message is a whole screen that replaces every earlier one.
+pub struct TerminalStream {
+    socket: TerminalSocket,
+    limit: usize,
+}
+
+enum TerminalSocket {
+    Unix(WebSocketStream<tokio::net::UnixStream>),
+    Remote(WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>),
+}
+
+impl TerminalStream {
+    /// Wait for the next screen. The first is the current screen; later ones arrive only when it
+    /// changes. Returns `None` after a normal close, and the server's error when it ends the
+    /// stream, such as `stale-fence` after the terminal's runtime incarnation changes.
+    pub async fn next(&mut self) -> Result<Option<Envelope<TerminalScreen>>, ClientError> {
+        let payload = match &mut self.socket {
+            TerminalSocket::Unix(websocket) => {
+                next_websocket_payload(websocket, self.limit).await?
+            }
+            TerminalSocket::Remote(websocket) => {
+                next_websocket_payload(websocket, self.limit).await?
+            }
+        };
+        payload
+            .map(|bytes| decode_terminal_message(&bytes))
+            .transpose()
+    }
+
+    pub async fn close(mut self) {
+        let _ = match &mut self.socket {
+            TerminalSocket::Unix(websocket) => websocket.close(None).await,
+            TerminalSocket::Remote(websocket) => websocket.close(None).await,
+        };
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -1130,32 +1161,37 @@ impl Client {
         ))
         .await
     }
-    pub async fn terminal_frames(
+    /// Wait up to `wait_ms` for a screen whose revision differs from `after_revision`, then
+    /// return the current screen either way. Gateways use this to relay a remote terminal.
+    pub async fn terminal_screen_change(
         &self,
         terminal_id: &str,
-        after: Option<u64>,
+        after_revision: &str,
+        wait_ms: u64,
+    ) -> Result<Envelope<TerminalScreen>, ClientError> {
+        self.get(&format!(
+            "/v1/client/terminals/{}/screen?after={}&wait_ms={wait_ms}",
+            percent_encode_segment(terminal_id.trim_start_matches("terminal/")),
+            percent_encode(after_revision)
+        ))
+        .await
+    }
+
+    /// Open the terminal stream that one `terminal.attach` capability allows.
+    pub async fn terminal_stream(
+        &self,
+        terminal_id: &str,
         incarnation: Option<&str>,
         stream_capability: &str,
-        wait_ms: Option<u64>,
-    ) -> Result<TerminalStreamBatch, ClientError> {
-        let mut query = Vec::new();
-        if let Some(after) = after {
-            query.push(format!("after={after}"));
-        }
-        if let Some(incarnation) = incarnation {
-            query.push(format!("incarnation={}", percent_encode(incarnation)));
-        }
-        let suffix = if query.is_empty() {
-            String::new()
-        } else {
-            format!("?{}", query.join("&"))
-        };
+    ) -> Result<TerminalStream, ClientError> {
+        let suffix = incarnation
+            .map(|incarnation| format!("?incarnation={}", percent_encode(incarnation)))
+            .unwrap_or_default();
         let path = format!(
             "/v1/client/terminals/{}/stream{suffix}",
             percent_encode_segment(terminal_id.trim_start_matches("terminal/"))
         );
-        let wait = Duration::from_millis(wait_ms.unwrap_or_default().min(30_000));
-        match &self.endpoint {
+        let socket = match &self.endpoint {
             Endpoint::Unix(socket) => {
                 let stream = tokio::time::timeout(
                     STREAM_HANDSHAKE_DEADLINE,
@@ -1182,7 +1218,7 @@ impl Client {
                 })?
                 .map_err(|error| ClientError::Transport(error.to_string()))?;
                 validate_terminal_subprotocol(&response)?;
-                read_terminal_stream(websocket, self.response_limit(), wait).await
+                TerminalSocket::Unix(websocket)
             }
             Endpoint::FabricLoopback(base) => {
                 let websocket_base = if let Some(base) = base.strip_prefix("https://") {
@@ -1210,9 +1246,13 @@ impl Client {
                         })?
                         .map_err(|error| ClientError::Transport(error.to_string()))?;
                 validate_terminal_subprotocol(&response)?;
-                read_terminal_stream(websocket, self.response_limit(), wait).await
+                TerminalSocket::Remote(websocket)
             }
-        }
+        };
+        Ok(TerminalStream {
+            socket,
+            limit: self.response_limit(),
+        })
     }
 
     fn response_limit(&self) -> usize {
@@ -1500,64 +1540,28 @@ fn validate_terminal_subprotocol(
     Ok(())
 }
 
-async fn read_terminal_stream<S>(
-    mut websocket: WebSocketStream<S>,
-    limit: usize,
-    wait: Duration,
-) -> Result<TerminalStreamBatch, ClientError>
-where
-    S: AsyncRead + AsyncWrite + Unpin,
-{
-    let first = tokio::time::timeout(
-        STREAM_HANDSHAKE_DEADLINE,
-        next_websocket_payload(&mut websocket, limit),
-    )
-    .await
-    .map_err(|_| ClientError::Transport("terminal atomic-screen deadline exceeded".into()))??
-    .ok_or_else(|| {
-        ClientError::Protocol("terminal WebSocket closed before its atomic screen".into())
-    })?;
-    let first_value: serde_json::Value =
-        serde_json::from_slice(&first).map_err(|error| ClientError::Protocol(error.to_string()))?;
-    if first_value
+fn decode_terminal_message(bytes: &[u8]) -> Result<Envelope<TerminalScreen>, ClientError> {
+    let value: serde_json::Value =
+        serde_json::from_slice(bytes).map_err(|error| ClientError::Protocol(error.to_string()))?;
+    if value.get("error_version").is_some() {
+        let error: ErrorEnvelope = serde_json::from_value(value)
+            .map_err(|error| ClientError::Protocol(error.to_string()))?;
+        return Err(ClientError::Api(
+            error.code.clone(),
+            error.message.clone(),
+            Box::new(error),
+        ));
+    }
+    if value
         .pointer("/value/kind")
         .and_then(serde_json::Value::as_str)
         != Some("terminal-screen")
     {
         return Err(ClientError::Protocol(
-            "the first terminal WebSocket message is not an atomic screen".into(),
+            "a terminal WebSocket message is not a screen".into(),
         ));
     }
-    let screen = serde_json::from_value(first_value)
-        .map_err(|error| ClientError::Protocol(error.to_string()))?;
-
-    let frames = if wait.is_zero() {
-        None
-    } else {
-        match tokio::time::timeout(wait, next_websocket_payload(&mut websocket, limit)).await {
-            Err(_) | Ok(Ok(None)) => None,
-            Ok(Err(error)) => return Err(error),
-            Ok(Ok(Some(bytes))) => {
-                let value: serde_json::Value = serde_json::from_slice(&bytes)
-                    .map_err(|error| ClientError::Protocol(error.to_string()))?;
-                if value
-                    .pointer("/value/kind")
-                    .and_then(serde_json::Value::as_str)
-                    != Some("terminal-frame-page")
-                {
-                    return Err(ClientError::Protocol(
-                        "terminal WebSocket message is not a frame page".into(),
-                    ));
-                }
-                Some(
-                    serde_json::from_value(value)
-                        .map_err(|error| ClientError::Protocol(error.to_string()))?,
-                )
-            }
-        }
-    };
-    let _ = websocket.close(None).await;
-    Ok(TerminalStreamBatch { screen, frames })
+    serde_json::from_value(value).map_err(|error| ClientError::Protocol(error.to_string()))
 }
 
 async fn next_websocket_payload<S>(
@@ -1889,7 +1893,7 @@ mod tests {
 
     #[test]
     #[allow(clippy::result_large_err)]
-    fn unix_terminal_stream_negotiates_protocol_and_forwards_resume_fence() {
+    fn unix_terminal_stream_yields_screens_until_the_server_error() {
         runtime().block_on(async {
             let directory = tempfile::tempdir().unwrap();
             let socket = directory.path().join("st3.sock");
@@ -1902,7 +1906,7 @@ mod tests {
                      mut response: tokio_tungstenite::tungstenite::handshake::server::Response| {
                         assert_eq!(
                             request.uri().path_and_query().unwrap().as_str(),
-                            "/v1/client/terminals/release-shell/stream?after=40&incarnation=pty-4%3A2026-09-20T11%3A10%3A00Z"
+                            "/v1/client/terminals/release-shell/stream?incarnation=pty-4%3A2026-09-20T11%3A10%3A00Z"
                         );
                         assert_eq!(
                             request
@@ -1922,35 +1926,33 @@ mod tests {
                 )
                 .await
                 .unwrap();
-                websocket
-                    .send(WsMessage::Text(
-                        include_str!("../../../docs/st3/client-v0/fixtures/terminal-screen.json")
-                            .into(),
-                    ))
-                    .await
-                    .unwrap();
-                websocket
-                    .send(WsMessage::Text(
-                        include_str!("../../../docs/st3/client-v0/fixtures/terminal-frames.json")
-                            .into(),
-                    ))
-                    .await
-                    .unwrap();
+                for fixture in [
+                    include_str!("../../../docs/st3/client-v0/fixtures/terminal-screen.json"),
+                    include_str!("../../../docs/st3/client-v0/fixtures/terminal-screen-changed.json"),
+                    include_str!("../../../docs/st3/client-v0/fixtures/terminal-stale-fence-error.json"),
+                ] {
+                    websocket.send(WsMessage::Text(fixture.into())).await.unwrap();
+                }
                 websocket.close(None).await.unwrap();
             });
 
-            let batch = Client::unix(&socket)
-                .terminal_frames(
+            let mut stream = Client::unix(&socket)
+                .terminal_stream(
                     "terminal/release-shell",
-                    Some(40),
                     Some("pty-4:2026-09-20T11:10:00Z"),
                     "fixture-stream-capability-0000000000000000",
-                    Some(1_000),
                 )
                 .await
                 .unwrap();
-            assert_eq!(batch.screen.value.next_sequence, 41);
-            assert_eq!(batch.frames.unwrap().value.resume_sequence, 43);
+            let first = stream.next().await.unwrap().unwrap();
+            assert_eq!(first.value.next_sequence, 41);
+            let changed = stream.next().await.unwrap().unwrap();
+            assert_ne!(changed.value.revision, first.value.revision);
+            assert_eq!(changed.value.lines[2].text, "$ ls");
+            assert!(matches!(
+                stream.next().await,
+                Err(ClientError::Api(ErrorCode::StaleFence, _, _))
+            ));
             server.await.unwrap();
         });
     }

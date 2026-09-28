@@ -1,8 +1,8 @@
 # st client v0 contract
 
 Status: implemented client boundary with operational projections, resumable events, authenticated
-pairing, fenced actions, terminal snapshots/frames, and generated Rust and Swift clients. The files in
-[`schemas`](schemas) and [`fixtures`](fixtures) are the normative wire examples. Rust and Swift
+pairing, fenced actions, streamed terminal screens, and generated Rust and Swift clients. The files
+in [`schemas`](schemas) and [`fixtures`](fixtures) are the normative wire examples. Rust and Swift
 clients consume the same JSON; no client parses CLI output, Markdown, KDL, claim envelopes, or
 harness transcript files.
 
@@ -322,22 +322,52 @@ must distinguish unavailable, ungranted, and unsupported features.
 
 ## Terminal protocol
 
-Terminal access is a client protocol, not raw PTY ownership. V0 exposes a real but bounded viewer
-lifecycle rather than an unbounded push feed. `terminal.attach` returns a short-lived, single-use
-stream capability and URL bound to the authenticated session, terminal, and runtime incarnation;
-`terminal.detach` idempotently invalidates that viewer. A client opens the URL on the same Unix or
-Fabric-loopback gateway with WebSocket subprotocol `st3.client.terminal.v0`. Authentication,
-single-use capability consumption, and runtime-incarnation validation happen before upgrade.
-The first server message is an atomic screen snapshot with runtime incarnation, dimensions, cursor
-state, title, ordered screen lines, and `next_sequence`. The optional second message is one bounded,
-resume-fenced frame page; the server then closes explicitly. `after == next_sequence` produces an
-empty page, while any other retained/resume position produces a bounded `resync` frame carrying the
-atomic screen. A changed incarnation rejects the exchange, so the client reconnects with the new
-incarnation. Reconnect requires a fresh `terminal.attach`, providing explicit reattach/resync
-semantics. Input and resize remain fenced typed actions.
+Terminal access is a client protocol, not raw PTY ownership. The server sends screens, never PTY
+bytes: each screen is complete and replaces every earlier one, so nothing is replayed and a client
+that falls behind skips to the latest screen. Interactive attach from a terminal (`pty attach`,
+`st terminals attach`) is a different, privileged path that passes raw bytes.
 
-Read-only terminal scope permits screen snapshots and frames but rejects input and resize. Frame and
-screen payloads obey negotiated byte limits and use explicit `redacted` or `truncated` markers.
+`terminal.attach` returns a short-lived, single-use stream capability and URL bound to the
+authenticated session, terminal, and runtime incarnation; `terminal.detach` idempotently invalidates
+that viewer. A client opens the URL on the same Unix or Fabric-loopback gateway with WebSocket
+subprotocol `st3.client.terminal.v0`. Authentication, single-use capability consumption, and
+runtime-incarnation validation happen before upgrade.
+
+The WebSocket then stays open. The first message is the current screen. After that the server sends
+a new screen only when the screen changes: the first change after a quiet period at once, and later
+changes at most every 100 ms. An idle terminal sends nothing, including no keepalive; a client that
+needs one sends WebSocket pings, which the server answers. A slow client receives the latest screen
+when it can read again, not every screen it missed. Every message is an envelope whose value is a
+`TerminalScreen`, the same value `GET /v1/client/terminals/{id}/screen` returns.
+
+A screen carries the runtime incarnation, `rows` and `columns`, the cursor (`row`, `column`,
+`visible`, `style` of `block`, `underline`, or `bar`, and `blinking`), the title, the input `modes` a
+client needs to encode keys and pastes (`alternate_screen`, `application_cursor`,
+`application_keypad`, `bracketed_paste`, `focus_events`, `mouse_tracking`, `mouse_encoding`), one
+line per row, and `next_sequence`, the fence for input and resize. `revision` digests the rest of
+the screen: equal revisions mean equal screens, and a stream never sends the same revision twice.
+
+Each line keeps its plain `text`, without trailing spaces, and adds `runs`: styled text from column
+zero. A run has `text` and, when they differ from the terminal default, `fg` and `bg` colors and
+`bold`, `dim`, `italic`, `underline`, and `inverse` flags that are present only when set. A color is
+a palette index from 0 to 255, where 0 to 15 are the client's ANSI theme colors, or a `#rrggbb`
+string. The runs spell `text`, followed by any trailing blanks that are visible because of their
+background, inverse, or underline. Hidden text is sent as spaces.
+
+When the terminal's runtime incarnation changes or its process exits, the server sends one
+`stale-fence` error envelope and closes the stream, with the error code as the close reason. Other
+failures end the same way with their own code. A client reconnects with a fresh `terminal.attach`,
+and its first message is again the current screen. Input and resize remain fenced typed actions.
+
+A gateway relays a terminal that another host owns through bounded owner long polls:
+`GET /v1/client/terminals/{id}/screen?after=REVISION&wait_ms=N` returns as soon as the screen's
+revision differs from `after`, or the current screen after `wait_ms` (at most 30000). The owner
+follows its PTY and answers the moment the screen changes; an idle remote terminal costs one relay
+request per 10-second wait and still sends the client nothing.
+
+Read-only terminal scope permits screens but rejects input and resize. Screen payloads obey
+negotiated byte limits: at most 200 lines and 4096 bytes of text per line, with explicit
+`redacted` and `truncated` markers.
 
 ## Errors and evolution
 

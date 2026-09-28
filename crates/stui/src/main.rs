@@ -15,8 +15,8 @@ use ratatui::{
     Terminal,
     backend::CrosstermBackend,
     layout::{Constraint, Layout, Rect},
-    style::{Color, Style},
-    text::Line,
+    style::{Color, Modifier, Style},
+    text::{Line, Span},
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Tabs, Wrap},
 };
 use st3_client::{
@@ -83,6 +83,21 @@ struct Attached {
     terminal_id: String,
     attachment_id: String,
     screen: TerminalScreen,
+    /// Newer screens from the open terminal stream; `None` in tests without a stream.
+    updates: Option<tokio::sync::watch::Receiver<Option<TerminalUpdate>>>,
+    follower: Option<tokio::task::JoinHandle<()>>,
+}
+impl Drop for Attached {
+    fn drop(&mut self) {
+        if let Some(follower) = &self.follower {
+            follower.abort();
+        }
+    }
+}
+#[derive(Clone)]
+enum TerminalUpdate {
+    Screen(Box<TerminalScreen>),
+    Ended(String),
 }
 struct PendingTerminalInput {
     key: KeyCode,
@@ -146,7 +161,6 @@ struct App {
     last_timeline: Instant,
     messages_requested: Option<String>,
     last_messages: Instant,
-    last_terminal: Instant,
 }
 impl App {
     fn new(model: Model) -> Self {
@@ -189,7 +203,6 @@ impl App {
             last_timeline: Instant::now(),
             messages_requested: None,
             last_messages: Instant::now(),
-            last_terminal: Instant::now(),
         }
     }
     fn cancel_terminal_input(&mut self) {
@@ -530,11 +543,18 @@ impl App {
                 .lines
                 .iter()
                 .map(|line| {
-                    Line::from(if line.redacted {
-                        "[redacted]"
+                    if line.redacted {
+                        Line::from("[redacted]")
+                    } else if line.runs.is_empty() {
+                        Line::from(line.text.as_str())
                     } else {
-                        &line.text
-                    })
+                        Line::from(
+                            line.runs
+                                .iter()
+                                .map(|run| Span::styled(run.text.as_str(), terminal_run_style(run)))
+                                .collect::<Vec<_>>(),
+                        )
+                    }
                 })
                 .collect();
             frame.render_widget(
@@ -1654,6 +1674,35 @@ fn key_input(key: KeyEvent) -> Option<String> {
     }
 }
 
+fn terminal_run_style(run: &st3_client::TerminalRun) -> Style {
+    let color = |color: &st3_client::TerminalColor| match color {
+        st3_client::TerminalColor::Palette(index) => Some(Color::Indexed(*index)),
+        st3_client::TerminalColor::Rgb(hex) => {
+            let value = u32::from_str_radix(hex.strip_prefix('#')?, 16).ok()?;
+            Some(Color::Rgb((value >> 16) as u8, (value >> 8) as u8, value as u8))
+        }
+    };
+    let mut style = Style::default();
+    if let Some(fg) = run.fg.as_ref().and_then(color) {
+        style = style.fg(fg);
+    }
+    if let Some(bg) = run.bg.as_ref().and_then(color) {
+        style = style.bg(bg);
+    }
+    for (set, modifier) in [
+        (run.bold, Modifier::BOLD),
+        (run.dim, Modifier::DIM),
+        (run.italic, Modifier::ITALIC),
+        (run.underline, Modifier::UNDERLINED),
+        (run.inverse, Modifier::REVERSED),
+    ] {
+        if set {
+            style = style.add_modifier(modifier);
+        }
+    }
+    style
+}
+
 fn is_detach_key(key: KeyEvent) -> bool {
     key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('\\' | '4'))
 }
@@ -1707,25 +1756,42 @@ async fn attach(app: &mut App, client: &Client) -> Result<()> {
         }
     }
     let attachment = attached.context("attach returned no viewer")?;
-    let screen = if let Some(capability) = attachment.stream_capability.as_deref() {
-        client
-            .terminal_frames(
-                &terminal_id,
-                None,
-                Some(&attachment.runtime_incarnation),
-                capability,
-                Some(0),
-            )
-            .await?
-            .screen
-            .value
-    } else {
-        client.terminal_screen(&terminal_id).await?.value
-    };
+    let capability = attachment
+        .stream_capability
+        .as_deref()
+        .context("attach returned no stream capability")?;
+    let mut stream = client
+        .terminal_stream(
+            &terminal_id,
+            Some(&attachment.runtime_incarnation),
+            capability,
+        )
+        .await?;
+    let screen = stream
+        .next()
+        .await?
+        .context("the terminal stream closed before its first screen")?
+        .value;
+    let (updates, receiver) = tokio::sync::watch::channel(None);
+    let follower = tokio::spawn(async move {
+        loop {
+            let update = match stream.next().await {
+                Ok(Some(screen)) => TerminalUpdate::Screen(Box::new(screen.value)),
+                Ok(None) => TerminalUpdate::Ended("The terminal stream closed".into()),
+                Err(error) => TerminalUpdate::Ended(error.to_string()),
+            };
+            let ended = matches!(update, TerminalUpdate::Ended(_));
+            if updates.send(Some(update)).is_err() || ended {
+                break;
+            }
+        }
+    });
     app.attached = Some(Attached {
         terminal_id,
         attachment_id: attachment.attachment_id,
         screen,
+        updates: Some(receiver),
+        follower: Some(follower),
     });
     app.notice = None;
     app.dirty = true;
@@ -2867,16 +2933,26 @@ fn main() -> Result<()> {
                 _ => {}
             }
         }
-        if let Some(attached) = app.attached.as_mut()
-            && app.last_terminal.elapsed() >= Duration::from_millis(400)
-        {
-            if let Ok(screen) = runtime.block_on(client.terminal_screen(&attached.terminal_id))
-                && attached.screen != screen.value
-            {
-                attached.screen = screen.value;
+        let update = app
+            .attached
+            .as_mut()
+            .and_then(|attached| attached.updates.as_mut())
+            .filter(|updates| updates.has_changed().unwrap_or(false))
+            .and_then(|updates| updates.borrow_and_update().clone());
+        match update {
+            Some(TerminalUpdate::Screen(screen)) => {
+                if let Some(attached) = app.attached.as_mut() {
+                    attached.screen = *screen;
+                }
                 app.dirty = true;
             }
-            app.last_terminal = Instant::now();
+            Some(TerminalUpdate::Ended(reason)) => {
+                let _ = runtime.block_on(detach(&mut app, &client));
+                app.attached = None;
+                app.model.status = format!("Terminal detached: {reason}");
+                app.dirty = true;
+            }
+            None => {}
         }
     }
     if app.attached.is_some() {
@@ -3167,6 +3243,8 @@ mod tests {
                 terminal_id: screen.value.terminal_id.clone(),
                 attachment_id: "attachment/test".into(),
                 screen: screen.value,
+                updates: None,
+                follower: None,
             });
             let key = KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL);
             let (client, server) = terminal_test_client();
