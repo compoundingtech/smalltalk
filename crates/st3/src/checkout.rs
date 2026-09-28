@@ -6,7 +6,9 @@
 
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+#[cfg(test)]
+use std::process::Command;
+use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result};
@@ -113,7 +115,7 @@ impl Checkout {
     }
 
     fn git(&self, arguments: &[&str], timeout: Duration) -> Result<String> {
-        let mut child = Command::new("git")
+        let mut child = crate::environment::command("git")?
             .arg("-C")
             .arg(&self.repository)
             .args(arguments)

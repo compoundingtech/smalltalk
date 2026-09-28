@@ -15,6 +15,27 @@ least `1h`) and rows beyond `max_per_subject_kind` (default 20,000) go. The newe
 subject and kind stays. An older build that still writes such a kind as a claim replicates it as
 before, and readers merge those claims with the local rows.
 
+A node can also send every local observation to an OpenTelemetry collector. The exporter is off
+unless the config names a collector:
+
+```toml
+[observations.otlp]
+endpoint = "http://127.0.0.1:4318"             # OTLP/HTTP; logs go to /v1/logs
+headers_file = "/absolute/path/otlp-headers.toml" # optional, for example x-api-key = "..."
+```
+
+Each local observation becomes one OTLP log record in OTLP/HTTP JSON:
+
+- the record's timestamp is the observation time, and its body holds the fields;
+- its attributes are `st3.subject`, `st3.kind`, `st3.actor`, `st3.incarnation_id` and
+  `st3.local_id`;
+- the resource names `service.name = st3` and `st3.node`.
+
+The exporter keeps its cursor in `meta` and moves it only after the collector accepts a batch of
+at most 512 observations, so delivery is at least once. A collector that is down delays export
+with backoff up to five minutes and never blocks a write. Observations trimmed before export are
+counted in the daemon log.
+
 Runtime observations and harness observations remain separate claims. The status projection puts
 runtime fields in `actual` and the current incarnation's harness fields in `harness`.
 
