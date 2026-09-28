@@ -295,6 +295,20 @@ impl Ui {
                 );
                 x += text::width(&badge) as u16;
             }
+            if index == 4 {
+                // The graph has no worktrees yet; this tab shows invented data and says so.
+                buf.set_stringn(
+                    x,
+                    area.y,
+                    " demo ",
+                    6,
+                    Style::default()
+                        .fg(theme::CRUST)
+                        .bg(theme::YELLOW)
+                        .add_modifier(Modifier::BOLD),
+                );
+                x += 6;
+            }
             self.hit(
                 Rect {
                     x: start,
@@ -547,7 +561,9 @@ impl Ui {
                     ));
                 }
                 Item::Note(line) => {
-                    rows.push((None, Line::default(), false));
+                    if !rows.is_empty() {
+                        rows.push((None, Line::default(), false));
+                    }
                     rows.push((None, line.clone(), false));
                 }
             }

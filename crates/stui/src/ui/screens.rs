@@ -1186,6 +1186,16 @@ pub fn fleet_detail(world: &World, id: Option<&str>, width: usize, spinner: &'st
 pub fn worktrees_list(world: &World) -> Listing {
     let mut items = Vec::new();
     let mut ids = Vec::new();
+    items.push(Item::Note(Line::from(vec![
+        span(
+            " DEMO ",
+            Style::default()
+                .fg(theme::CRUST)
+                .bg(theme::YELLOW)
+                .add_modifier(Modifier::BOLD),
+        ),
+        span(" invented worktrees", theme::fg(theme::YELLOW)),
+    ])));
     let mut trees = world.worktrees.items().iter().collect::<Vec<_>>();
     trees.sort_by(|a, b| (&a.host, &a.path).cmp(&(&b.host, &b.path)));
     let mut current = "";
@@ -1250,6 +1260,7 @@ pub fn worktree_detail(
     spinner: &'static str,
 ) -> Doc {
     let mut doc = Doc::new();
+    demo_banner(&mut doc, width);
     let Some(tree) = id.and_then(|id| {
         world
             .worktrees
@@ -1322,13 +1333,29 @@ pub fn worktree_detail(
         )));
     }
     doc.card("missions here", theme::OVERLAY1, false, missions, width);
-    doc.blank();
-    doc.wrap(
+    doc
+}
+
+/// Every worktree screen starts with this: st does not track worktrees yet.
+fn demo_banner(doc: &mut Doc, width: usize) {
+    doc.lines(text::wrap(
         &[run(
-            "Prototype: st does not track worktrees as graph resources yet. These are invented.",
-            theme::dim(),
+            "st does not track worktrees yet. Everything on this tab is invented.",
+            theme::fg(theme::YELLOW),
         )],
         width,
-    );
-    doc
+        &[
+            run(
+                " DEMO DATA ",
+                Style::default()
+                    .fg(theme::CRUST)
+                    .bg(theme::YELLOW)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            run(" ", theme::dim()),
+        ],
+        &[run("            ", theme::dim())],
+        None,
+    ));
+    doc.blank();
 }
