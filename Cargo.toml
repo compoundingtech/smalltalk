@@ -34,6 +34,18 @@ default-members = [
   "crates/stui",
 ]
 
+[profile.dev]
+debug = 1
+
+[profile.dev.package."*"]
+debug = 0
+
+[profile.test]
+debug = 1
+
+[profile.test.package."*"]
+debug = 0
+
 [package]
 name = "st2"
 version = "0.1.0"
