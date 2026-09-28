@@ -9985,9 +9985,10 @@ fn parse_field(value: &str) -> Result<(String, Value), String> {
 }
 
 fn parse_peer(value: &str) -> Result<PeerConfig, String> {
-    let (name, url) = value
-        .split_once('=')
-        .ok_or_else(|| "a peer must use NAME=http://ADDRESS".to_owned())?;
+    let (name, url) = value.split_once('=').unwrap_or((value, ""));
+    if name.is_empty() {
+        return Err("a peer needs a name".to_owned());
+    }
     Ok(PeerConfig {
         name: name.into(),
         url: url.into(),
