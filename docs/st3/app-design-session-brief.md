@@ -19,7 +19,7 @@ From either app Nathan can:
    devices through the appropriate release path.
 
 “Chat with Codex” does not mean embedding an untracked local chatbot in each UI. The apps render a
-durable normalized st3 conversation and send typed actions to the server. Codex runs in a
+durable normalized st conversation and send typed actions to the server. Codex runs in a
 mission-owned harness, turns the conversation into typed launch variants, and only graph actions
 approve, launch, or deploy work. Conversation text alone grants no authority.
 
@@ -95,7 +95,7 @@ We should design these screens together and then build vertical slices across bo
 | Agents | Who is working under which mission? | Open agent, runtime, work, conversation, terminal |
 | Machines | Where can work run and what is reachable? | Inspect capacity, connection, diagnostics |
 | Conversations | What did a person or harness say/do? | Reply, mark read, archive, open tools/usage |
-| Native sessions | Which Codex/Claude/Pi/OMP/OpenCode sessions exist outside st3? | Read timeline, inspect fence, import |
+| Native sessions | Which Codex/Claude/Pi/OMP/OpenCode sessions exist outside st? | Read timeline, inspect fence, import |
 | Terminals | Which sessions can I view or control? | Peek, attach, detach, input, resize |
 | Devices | Which clients can act as me? | Pair, inspect scopes, revoke |
 | Network | How is this client reaching the fleet? | Inspect Fabric/Tailscale config, topology, reachability, retry |
@@ -129,7 +129,7 @@ revoke the device.
 The existing paired-only `st3-client.sock` can be exposed privately with Tailscale Serve. Serve
 routes a tailnet HTTPS name to a local service while tailnet access controls still apply. The iPhone
 can therefore use its normal Tailscale client and the Expo app can speak ordinary HTTPS/WebSocket to
-the paired st3 gateway. This is the fastest way to prove the whole product and remains a supported
+the paired st gateway. This is the fastest way to prove the whole product and remains a supported
 fallback.
 
 ### Preferred carrier: Fabric
@@ -155,10 +155,10 @@ work therefore needs an explicit spike:
 6. build an XCFramework, development build, and physical-device test before promising Fabric as the
    default iOS carrier.
 
-Do not begin with a packet tunnel. An app-scoped Fabric connection to the st3 service is a smaller
+Do not begin with a packet tunnel. An app-scoped Fabric connection to the st service is a smaller
 authority and product surface. A packet tunnel or app proxy introduces an extension target and
 Network Extension entitlement and should be selected only if direct embedded dialing cannot meet
-the product need. iOS background execution is scheduled and bounded; st3 must not require the app
+the product need. iOS background execution is scheduled and bounded; st must not require the app
 to keep a permanent user-space daemon alive while closed. Push notifications can tell the user
 about new attention or completed work, and the app can reconnect/resync when opened.
 
@@ -188,7 +188,7 @@ There are two deployment classes:
 | Expo native/Fabric/entitlements | EAS/Xcode build, sign, install via internal distribution or TestFlight | Cannot be delivered as an EAS JS update |
 
 EAS Workflows can be triggered from GitHub or its API and can build, test, submit, and publish
-updates. We should still model each release as an st3 operation with exact commit/artifact evidence,
+updates. We should still model each release as an st operation with exact commit/artifact evidence,
 idempotency, progress, terminal outcome, and rollback target. EAS is an executor, not the source of
 Smalltalk's operational truth.
 

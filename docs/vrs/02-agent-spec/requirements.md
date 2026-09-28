@@ -4,7 +4,7 @@
 
 The canonical Agent Spec and its proof corpus live in
 [compoundingtech/evals at commit `e9b53e79b05b1c0e1d7eea02db2eaba47376fe05`](https://github.com/compoundingtech/evals/blob/e9b53e79b05b1c0e1d7eea02db2eaba47376fe05/AGENT-SPEC.md).
-st2 is one implementation. Another implementation, including a future st3, can
+st2 is one implementation. Another implementation, including a future st, can
 target the same contract and proofs.
 
 This sub-VRS defines desired st2 conformance when a normalized Agent Spec

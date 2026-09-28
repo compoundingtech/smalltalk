@@ -1,10 +1,10 @@
-# st3 mission graph runtime
+# st mission graph runtime
 
 Status: current language and runtime specification.
 
 See [kdl-lifecycle.md](./kdl-lifecycle.md) for complete day-to-day publication workflows.
 
-Every st3 KDL document starts with `version 2`. Declarations follow the version directly.
+Every st KDL document starts with `version 2`. Declarations follow the version directly.
 
 A mission is an immutable definition in the claims graph. Publishing a mission does not start it.
 
@@ -23,8 +23,8 @@ A mission run has one stable subject. Each immutable run generation binds that r
 - Durable availability belongs to top-level agent seats, not open mission runs.
 - `depends-on` defines execution order. Source order defines display order only.
 - A missing `depends-on` makes a step a root. It does not imply a dependency on the previous step.
-- st3 rejects missing step references and dependency cycles.
-- st3 does not accept `outcome`, `judges`, or `judge`.
+- st rejects missing step references and dependency cycles.
+- st does not accept `outcome`, `judges`, or `judge`.
 - `assigned-to` and `available-to` can set a mission default or select one step.
 - `agentless` is step-only. A step with no inherited selector is also agentless.
 - A selector does not grant revision authority.
@@ -177,7 +177,7 @@ The input set and kinds cannot change across revisions of an active run. Input v
 
 The default active run limit is one. Bare `concurrent-runs` removes the limit. `concurrent-runs max=4` sets a positive limit.
 
-When active revisions declare different limits, st3 uses the strictest limit. A lower limit does not cancel existing runs.
+When active revisions declare different limits, st uses the strictest limit. A lower limit does not cancel existing runs.
 
 An exact idempotent retry returns its existing run before the capacity check. A direct start error lists the active run subjects.
 
@@ -192,7 +192,7 @@ so a zero-step mission completes immediately.
 
 `timeout` is optional for an ordinary mission. It starts when the mission run is created and applies to the complete run, not one step or generation. A revision cannot extend or reset the stored deadline.
 
-The daemon arms an exact wake for the nearest deadline. It does not depend on a client process or periodic polling. At expiry, st3 fails the run, terminates descendant runs, skips remaining normal and final work, removes run-owned runtime state, and records the timeout as the eval failure reason when the run is an eval.
+The daemon arms an exact wake for the nearest deadline. It does not depend on a client process or periodic polling. At expiry, st fails the run, terminates descendant runs, skips remaining normal and final work, removes run-owned runtime state, and records the timeout as the eval failure reason when the run is an eval.
 
 Every eval entry mission needs a timeout of 20 minutes or less. The store enforces this rule for both the eval API and a directly published eval-mode mission run.
 
@@ -219,7 +219,7 @@ A replica stores the run and its steps. It can accept eligible work claims, but 
 
 This rule prevents two nodes from creating different local runtimes for one replicated run. An explicit member `host` can place work elsewhere.
 
-An authored runtime ID is local to the run. st3 expands it to these subjects:
+An authored runtime ID is local to the run. st expands it to these subjects:
 
 - `agent/RUN/LOCAL_ID`;
 - `exec/RUN/LOCAL_ID`;
@@ -234,7 +234,7 @@ Run-owned runtimes remain scoped to the run and stop during terminal cleanup. A 
 an exact top-level agent seat. Named mission-run cancellation remains the way to stop a run and all
 of its run-owned state.
 
-The default mission permits one nonterminal run. This default also lets `st3 missions show MISSION` identify the current run.
+The default mission permits one nonterminal run. This default also lets `st missions show MISSION` identify the current run.
 
 Bare `concurrent-runs` permits unlimited nonterminal runs. `concurrent-runs max=N` sets a positive limit.
 
@@ -400,7 +400,7 @@ Generated round and branch missions inherit the smaller loop or parent mission t
 
 The embedded mission revision is immutable. A client cannot start it directly. The parent loop starts each exact child run.
 
-An agent declared inside `round` belongs to that child run. st3 removes it when the child run ends.
+An agent declared inside `round` belongs to that child run. st removes it when the child run ends.
 
 An agent declared outside the loop belongs to the root run. A round can address it with `ST_ROOT_MISSION_RUN_ID`.
 
@@ -501,9 +501,9 @@ An agent constraint is a work rule, not runtime configuration. It is not part of
 
 A top-level agent seat has no mission steps, so it cannot declare a constraint. Publication fails with `agent-constraint-outside-mission`.
 
-st3 shows the effective list when an agent shows or claims work.
+st shows the effective list when an agent shows or claims work.
 
-Do not repeat universal st3 behavior as a mission constraint. The generated boot file defines that behavior.
+Do not repeat universal st behavior as a mission constraint. The generated boot file defines that behavior.
 
 Do not disable harness features to make an eval pass. A mission constraint must describe a real mission requirement.
 
@@ -518,10 +518,10 @@ input "source" kind="resource"
 
 A start request must provide exactly the declared names. Missing and extra names are errors.
 
-Use `${input.message}` and `${input.source}` in execution content. st3 preserves quoted and multiline text when it writes interpolated KDL.
+Use `${input.message}` and `${input.source}` in execution content. st preserves quoted and multiline text when it writes interpolated KDL.
 
 A resource input accepts `resource/NAME` or `resource/NAME@CLAIM_ID`.
-st3 resolves a bare subject to its latest `resource.observed` claim atomically.
+st resolves a bare subject to its latest `resource.observed` claim atomically.
 
 The run stores the exact resource subject and claim ID. Later claims do not change gates, inspection, or execution for that input.
 
@@ -530,13 +530,13 @@ Inputs do not support defaults, lists, secrets, schemas, or automatic environmen
 Nested child missions cannot declare inputs in this version.
 
 ```sh
-# After the mission has been approved through st3 launch:
-st3 missions start MISSION_ID \
+# After the mission has been approved through st launch:
+st missions start MISSION_ID \
   --input message="Review this release." \
   --input source=resource/release-source \
   --as person/operator
 
-st3 claim resource/mission-inputs/source resource.observed \
+st claim resource/mission-inputs/source resource.observed \
   --field kind=custom.st3.document-source \
   --field state=ready
 ```
@@ -556,11 +556,11 @@ A baseline contains one or more graph predicates. Its predicates form an AND rel
 
 Baselines accept `exists`, `empty`, `field`, `has`, and `lacks`. They do not execute shell, LLM, human, or deadline work.
 
-Mission baselines run before root work admission. st3 does not materialize a mission runtime before these baselines pass.
+Mission baselines run before root work admission. st does not materialize a mission runtime before these baselines pass.
 
-A false mission baseline puts the mission run in blocked state. st3 rechecks it after relevant graph changes while admission remains blocked.
+A false mission baseline puts the mission run in blocked state. st rechecks it after relevant graph changes while admission remains blocked.
 
-Once normal work is admitted, the mission baseline is latched. st3 does not re-evaluate it as a continuous gate.
+Once normal work is admitted, the mission baseline is latched. st does not re-evaluate it as a continuous gate.
 
 Step baselines run after dependencies hold and before each attempt becomes ready. A false step baseline blocks the step. It does not consume an attempt. A retry checks the baseline again.
 
@@ -588,10 +588,10 @@ All products in one block must hold.
 
 A step product is intermediate output for that step. A mission product is a final contract for the complete normal phase.
 
-The worker creates or observes products. st3 verifies them. The `produces` keyword does not perform the action.
+The worker creates or observes products. st verifies them. The `produces` keyword does not perform the action.
 
 A worker-submitted step stays `verifying` until its products hold. Once the submitting worker's
-turn has ended, st3 sends that worker one message per step attempt. The message names the exact
+turn has ended, st sends that worker one message per step attempt. The message names the exact
 product subject and fields the step waits for, so a worker that recorded the wrong subject can
 correct it.
 
@@ -703,9 +703,9 @@ gate "the release is approved" type="human" {
 
 A human gate requires a full `person/...` reviewer. The question and repeated review targets are optional.
 
-st3 creates one `gate.requested` claim for the exact mission or step revision and attempt. A review decision must match that request.
+st creates one `gate.requested` claim for the exact mission or step revision and attempt. A review decision must match that request.
 
-`st3 attention ls --as person/NAME` shows the selected person's pending KDL human gates together
+`st attention ls --as person/NAME` shows the selected person's pending KDL human gates together
 with their other current decisions and faults.
 
 The human view shows the mission, owner step, question, review targets, age, and exact decision commands. `--json` returns the same current review records as structured data.
@@ -714,7 +714,7 @@ The list excludes resolved requests, old generations, changed definitions, old a
 
 ### Human attention inbox
 
-`st3 attention ls --as person/NAME` combines every current item that needs that person. It includes
+`st attention ls --as person/NAME` combines every current item that needs that person. It includes
 human gates, launch approvals, revision approvals, unread person messages, and explicit fault
 requests. `--json` returns typed records and exact action argument arrays. The person argument is
 required and is never inferred from ambient process state.
@@ -765,7 +765,7 @@ To make one run wait without changing its mission, start it with `after`. See [S
 
 Each run starts with all steps in pending state.
 
-For a normal step, st3 performs this sequence:
+For a normal step, st performs this sequence:
 
 1. Wait for the normal phase.
 2. Wait for the parent nested step, when present.
@@ -782,7 +782,7 @@ For a normal step, st3 performs this sequence:
 13. Evaluate gates.
 14. Mark the step completed or failed.
 
-When a step retry permits another attempt, st3 increments the attempt, applies backoff, and starts at dependency admission.
+When a step retry permits another attempt, st increments the attempt, applies backoff, and starts at dependency admission.
 
 Each attempt can submit or fail its work once. A failed gate can return the step for another retry attempt.
 
@@ -790,14 +790,14 @@ Each attempt can submit or fail its work once. A failed gate can return the step
 
 A retryable failure does not terminate the mission before the next attempt.
 
-A step has one attempt by default. st3 does not repeat a failure automatically: a failed attempt is
+A step has one attempt by default. st does not repeat a failure automatically: a failed attempt is
 usually an agent's judgment or a false gate, and a repeated attempt repeats its side effects. Declare
 `retry` on a step whose failure is known to be transient.
 
 A person, or an agent with `revise` authority for the mission, can retry one failed step:
 
 ```sh
-st3 work retry STEP_RUN --as person/operator --reason "the deploy check host is back"
+st work retry STEP_RUN --as person/operator --reason "the deploy check host is back"
 ```
 
 While its run is active, the step starts its next attempt in place. When that step is the only
@@ -809,7 +809,7 @@ A failed run does not reopen when several steps failed, when work was cancelled 
 than the failure, when a mission gate or the mission timeout failed it, when it is a nested or eval
 run, or when its mission deadline has passed. Revise the run instead to restart several failed steps.
 
-The `completion` frontier selects when st3 checks mission products and gates. st3 then enters the final phase when one exists.
+The `completion` frontier selects when st checks mission products and gates. st then enters the final phase when one exists.
 
 The run reaches `completed` after successful final work. A final failure makes the run failed.
 
@@ -840,10 +840,10 @@ step "compile-mission" {
 The worker must hold the producing step or one of its nested steps with the same assigned agent.
 
 ```sh
-st3 work publish-mission step-run/GENERATION/compile-mission generated.kdl --as agent/planner
+st work publish-mission step-run/GENERATION/compile-mission generated.kdl --as agent/planner
 ```
 
-The published document must contain exactly one ready mission with the declared ID. st3 publishes the immutable revision and binds it to the producing definition and attempt.
+The published document must contain exactly one ready mission with the declared ID. st publishes the immutable revision and binds it to the producing definition and attempt.
 
 A later step can start that exact output:
 
@@ -867,7 +867,7 @@ A used mission starts one linked child run. The wrapper completes only after the
 
 ## Automatic context
 
-st3 supplies these exact context names:
+st supplies these exact context names:
 
 | Name | Value |
 | --- | --- |
@@ -887,7 +887,7 @@ st3 supplies these exact context names:
 | `ST_GATE` | Gate name in a running gate context. |
 | `ST3_SUBJECT` | Full subject of the current runtime member. |
 | `ST_AGENT` | Full owning agent subject. It is absent for agentless runtimes. |
-| `ST3_BIN` | Absolute path to the exact st3 executable that started the runtime. |
+| `ST3_BIN` | Absolute path to the exact st executable that started the runtime. |
 | `ST_LOOP_ROUND` | Current loop round. It is present in loop child missions. |
 | `ST_LOOP_FEEDBACK` | Exact prior feedback document, or an empty value. |
 
@@ -895,13 +895,13 @@ The mission and step values are available for `${NAME}` KDL interpolation when t
 
 Loop KDL can also use `${loop.round}` and `${loop.feedback}`.
 
-Publication rejects an unknown `${NAME}`. Write `$${NAME}` for the literal text `${NAME}`, for example in a goal that quotes a shell variable. st3 removes the first `$`.
+Publication rejects an unknown `${NAME}`. Write `$${NAME}` for the literal text `${NAME}`, for example in a goal that quotes a shell variable. st removes the first `$`.
 
 `ST3_SUBJECT`, `ST_AGENT`, and `ST3_BIN` are runtime-only values because they depend on the materialized member.
 
 For example, use `${ST_MISSION_RUN}` directly. Do not write a manual mapping such as `env { MISSION_RUN "${ST_MISSION_RUN}" }` only to rename the built-in value.
 
-The exact built-in names are reserved in authored `env` maps. st3 rejects an attempt to replace them. Other names, including other `ST_*` names, remain available to applications.
+The exact built-in names are reserved in authored `env` maps. st rejects an attempt to replace them. Other names, including other `ST_*` names, remain available to applications.
 
 `${PATH}` is also available for KDL interpolation. It uses the deterministic daemon service path.
 
@@ -919,10 +919,10 @@ An unknown variable or a variable that is not available in the current phase is 
 
 An agent harness prompt is optional.
 
-st3 appends this exact text once to every agent launch:
+st appends this exact text once to every agent launch:
 
 ```text
-Read @.st3/boot.md completely. Then list, claim, do, and finish your current st3 work.
+Read @.st3/boot.md completely. Then list, claim, do, and finish your current st work.
 ```
 
 Each member’s render transaction writes the canonical `.st3/boot.md` before its native harness starts.
@@ -931,13 +931,13 @@ The file explains graph work, Small Talk, wait behavior, and diagnostics. It doe
 
 An authored prompt can add stable harness context. It cannot replace or duplicate the boot contract.
 
-A tracked `.st3/boot.md` with different bytes fails that member’s render transaction and prevents its runtime from starting. Other members continue rendering and reconciling. Render, start, observation, and stop failures appear as the member’s fault in `st3 agents show` and `st3 doctor`; a successful pass clears the fault. Stopped and superseded members bypass rendering.
+A tracked `.st3/boot.md` with different bytes fails that member’s render transaction and prevents its runtime from starting. Other members continue rendering and reconciling. Render, start, observation, and stop failures appear as the member’s fault in `st agents show` and `st doctor`; a successful pass clears the fault. Stopped and superseded members bypass rendering.
 
 Repeated `git-exclude` operations build on one another. Seats in worktrees sharing a repository’s exclude file contribute their paths to one combined update. Conflicting ordinary file owners are still rejected, without blocking unrelated members.
 
 ## Workspace existence
 
-st3 requires every member workspace to exist before the member starts.
+st requires every member workspace to exist before the member starts.
 
 Use an explicit create property when the mission owns creation of that directory:
 
@@ -947,7 +947,7 @@ workspace "${ST_WORKSPACE}/generated" create=#true
 
 The default refusal prevents a spelling error from creating an unintended directory.
 
-An agent can declare a Git checkout instead. st3 then creates the agent's workspace as a worktree of an existing repository before the agent starts:
+An agent can declare a Git checkout instead. st then creates the agent's workspace as a worktree of an existing repository before the agent starts:
 
 ```kdl
 agent "parser" {
@@ -959,13 +959,13 @@ agent "parser" {
 ```
 
 - The repository and the workspace must be absolute paths after variable substitution.
-- When `base` names a remote branch, such as `origin/main`, st3 fetches it first. When the fetch fails, st3 uses the repository's current ref and records a `checkout-fetch-failed` warning.
+- When `base` names a remote branch, such as `origin/main`, st fetches it first. When the fetch fails, st uses the repository's current ref and records a `checkout-fetch-failed` warning.
 - A new `branch` starts at `base` without upstream tracking. A branch that already exists is checked out as it is.
 - A workspace that already exists is used as it is.
-- When the checkout fails, the agent does not start. st3 records a `workspace-unavailable` diagnostic and retries after 30 seconds.
-- With `remove-at-run-end=#true`, st3 removes the worktree after the agent's run ends and its runtime stops. The branch stays in the repository.
-- st3 keeps a worktree that has uncommitted or untracked changes, and records a `checkout-kept` warning. It also keeps a worktree whose workspace a current member still uses.
-- `render { git-exclude ".st3/" }` keeps the files st3 writes for each harness out of Git, so a finished worktree is clean.
+- When the checkout fails, the agent does not start. st records a `workspace-unavailable` diagnostic and retries after 30 seconds.
+- With `remove-at-run-end=#true`, st removes the worktree after the agent's run ends and its runtime stops. The branch stays in the repository.
+- st keeps a worktree that has uncommitted or untracked changes, and records a `checkout-kept` warning. It also keeps a worktree whose workspace a current member still uses.
+- `render { git-exclude ".st3/" }` keeps the files st writes for each harness out of Git, so a finished worktree is clean.
 
 [`fan-out.kdl`](../../examples/st3/fan-out.kdl) gives three parallel workers one checkout each.
 
@@ -984,12 +984,12 @@ bounded one-line body preview
 ```
 
 `sha256` is the lowercase hex SHA-256 of the complete message body in the graph, and
-`st3 conversations read message/ID` shows that body. Every attribute value and the preview are
+`st conversations read message/ID` shows that body. Every attribute value and the preview are
 XML-escaped, so sender text cannot close the element or add an attribute. A truncated preview ends
 with `…`, and a note after the closing tag says so. Claude receives the plain
 `[PING from st3] message/ID from SENDER: TITLE` notice and preview inside its own channel tag. OpenCode
 acknowledges the assistant turn whose `parentID` is the exact stable user-message ID. Copying a
-message into an inbox or successfully writing transport bytes is not delivery. st3 advances the
+message into an inbox or successfully writing transport bytes is not delivery. st advances the
 graph only from the durable provider receipt and never injects text or Enter into a terminal
 composer.
 
@@ -1018,22 +1018,22 @@ The seat's next work is the first ready step, in queue order, that is assigned t
 whose steps for the seat are waiting on a gate, a dependency, or another seat is passed over, so
 it never blocks the runs behind it. It becomes next again as soon as it has a ready step. Inside
 one run, `depends-on` and `queue {}` still decide which steps are ready, and ready steps of the
-same run keep creation order. `st3 agents show`, `st3 agents ls --enrich`, and the reconciler's
+same run keep creation order. `st agents show`, `st agents ls --enrich`, and the reconciler's
 work wake all use this one selector.
 
 The queue matters most for a durable top-level seat that serves many runs. A mission-scoped seat
 normally serves one run, so its queue has one entry.
 
 ```sh
-st3 agents queue agent/fleet/example/worker
-st3 agents queue move agent/fleet/example/worker mission-run/release/2026-09-26 --top \
+st agents queue agent/fleet/example/worker
+st agents queue move agent/fleet/example/worker mission-run/release/2026-09-26 --top \
   --reason "the release needs this first" --as person/operator
-st3 agents queue move agent/fleet/example/worker mission-run/docs/2026-09-26 \
+st agents queue move agent/fleet/example/worker mission-run/docs/2026-09-26 \
   --after mission-run/release/2026-09-26 --as person/operator
 ```
 
-`st3 agents queue AGENT` shows the step the seat holds now, its next work, and then each queued
-run in order with its state: `claimed`, `ready`, or `waiting`. `st3 missions queued AGENT` is the
+`st agents queue AGENT` shows the step the seat holds now, its next work, and then each queued
+run in order with its state: `claimed`, `ready`, or `waiting`. `st missions queued AGENT` is the
 same show command reached from the `missions` group. A move places one run at the top, at the
 bottom, or directly before or after another queued run. It needs explicit person authority, like
 other client mutations.
@@ -1047,22 +1047,22 @@ change has an author and a time.
 A move changes only which run is next. It never releases, reassigns, or interrupts a step the seat
 already holds; the new order applies when the seat is free again.
 
-`st3 work show STEP` exposes ready age, assignee state, wake attempts, acknowledgement, and failure.
+`st work show STEP` exposes ready age, assignee state, wake attempts, acknowledgement, and failure.
 An operator can request another delivery through the same driver path with:
 
 ```sh
-st3 work wake STEP --as person/operator --reason "retry native delivery"
+st work wake STEP --as person/operator --reason "retry native delivery"
 ```
 
 The assignee may also wake its own step. Another agent needs `queue-authority` for the assignee's
 seat. Manual wakes are recorded in the inbox but do not consume the three automatic retry
-attempts shown by `st3 work show`.
+attempts shown by `st work show`.
 
 Generic terminal programs without a maintained native driver do not have an automatic wake path.
 
 A provider or runtime fault creates a `harness.diagnostic` claim. The roster and mission views show the fault.
 
-The runtime can also send one fault message for a new diagnostic epoch. st3 does not require a special supervisor, root, or chief-of-staff agent.
+The runtime can also send one fault message for a new diagnostic epoch. st does not require a special supervisor, root, or chief-of-staff agent.
 
 ## Agent grouping
 
@@ -1079,7 +1079,7 @@ agent "researcher" {
 
 A bare target inside a mission uses the same mission run. A full external agent subject stays full.
 
-The relation is visible in `st3 agents --json`, status, and assigned work. It is suitable for a tree or graph UI.
+The relation is visible in `st agents --json`, status, and assigned work. It is suitable for a tree or graph UI.
 
 The relation does not create permission, lifecycle, scheduling, or mandatory reporting behavior.
 
@@ -1097,7 +1097,7 @@ host "local" {
 
 The host document gives stable host facts to agents on that host. It must not contain current work.
 
-st3 renders each exact document under `.st3/host/` for every native harness on that host.
+st renders each exact document under `.st3/host/` for every native harness on that host.
 
 The generated `.st3/boot.md` lists each exact reference and rendered path. A missing document, invalid text, or path collision refuses the render transaction.
 
@@ -1147,13 +1147,13 @@ Claimed work uses a renewable claim bound to the agent identity and runtime inca
 A nested work action renews active ancestor leases held by the same agent incarnation.
 
 ```sh
-st3 work ls --as agent/RUN/node.worker
-st3 work show step-run/GENERATION/step
-st3 work claim step-run/GENERATION/step --as agent/RUN/node.worker
-st3 work progress step-run/GENERATION/step --summary "The tests are running."
-st3 work complete step-run/GENERATION/step --summary "The product is published."
-st3 work fail step-run/GENERATION/step --reason "The compiler rejected the source."
-st3 work release step-run/GENERATION/step --reason "The work needs another owner."
+st work ls --as agent/RUN/node.worker
+st work show step-run/GENERATION/step
+st work claim step-run/GENERATION/step --as agent/RUN/node.worker
+st work progress step-run/GENERATION/step --summary "The tests are running."
+st work complete step-run/GENERATION/step --summary "The product is published."
+st work fail step-run/GENERATION/step --reason "The compiler rejected the source."
+st work release step-run/GENERATION/step --reason "The work needs another owner."
 ```
 
 The default work list shows ready, active, and blocked work. It summarizes waiting and terminal work.
@@ -1187,11 +1187,11 @@ agent "fleet/cos/standing/cos" {
 ```
 
 The subject is exactly `agent/fleet/cos/standing/cos`; placement does not change its identity.
-Typed harnesses always run their real interactive TUI in a PTY. Claude always loads the native st3
+Typed harnesses always run their real interactive TUI in a PTY. Claude always loads the native st
 channel. Use `exec {}` for non-interactive provider commands.
 
-Use `st3 agents apply FILE --as person/NAME` for authored KDL or `st3 agents start ...` as a
-convenience. `--print-kdl` prints the exact declaration. `st3 agents stop SUBJECT` publishes an
+Use `st agents apply FILE --as person/NAME` for authored KDL or `st agents start ...` as a
+convenience. `--print-kdl` prints the exact declaration. `st agents stop SUBJECT` publishes an
 explicit root stop.
 
 A mission run does not stop because a controller deletes its runtime. The graph must publish cancellation.
@@ -1213,13 +1213,13 @@ Cancellation also cancels active descendant mission runs. Each descendant uses i
 
 The terminal state is `cancelled` after successful final work. A final failure makes the run failed.
 
-After final work, st3 enters cleanup and stops every runtime owned by the mission run.
+After final work, st enters cleanup and stops every runtime owned by the mission run.
 
 The run becomes terminal only after those runtime subjects report a stopped, absent, or exited state.
 
 An exact repeated cancellation is idempotent. The old run and its immutable generations remain readable.
 
-st3 sends a cancellation message to each active claimant. The message tells the agent to stop that step.
+st sends a cancellation message to each active claimant. The message tells the agent to stop that step.
 
 ## Continuous missions
 
@@ -1283,7 +1283,7 @@ Each rule accepts an exact mission ID or a terminal `/*` namespace. The value om
 
 No agent receives mission authority by default. `publish`, `start`, and `revise` are separate permissions.
 
-Mission publication requires a claimed step with the exact `produces-mission` declaration. The agent must use `st3 work publish-mission`.
+Mission publication requires a claimed step with the exact `produces-mission` declaration. The agent must use `st work publish-mission`.
 
 Mission start requires `start` authority. Mission revision requires both `revise` authority and existing structural revision authority.
 
@@ -1293,7 +1293,7 @@ Persons and internal system actions keep their existing authority. System starts
 
 This check protects a trusted local runtime. Caller identity is not cryptographically authenticated, so `--as` remains a trusted-operator boundary.
 
-st3 checks the current generation. A candidate cannot add itself as an owner and use that new authority.
+st checks the current generation. A candidate cannot add itself as an owner and use that new authority.
 
 `revisions="human-only"` protects a mission or step. The protection is inherited by nested steps.
 
@@ -1302,13 +1302,13 @@ st3 checks the current generation. A candidate cannot add itself as an owner and
 All distinct reviewers for the changed paths must approve. Each approval names the exact proposal preview token.
 
 ```sh
-st3 work revise MISSION_RUN replacement.kdl \
+st work revise MISSION_RUN replacement.kdl \
   --as agent/RUN/worker \
   --reason "The generated source adds one verification step."
 
-st3 work revision show MISSION_RUN
-st3 work revision approve PROPOSAL PREVIEW_TOKEN --as person/reviewer
-st3 work revision cancel PROPOSAL --as person/reviewer --reason "The request changed."
+st work revision show MISSION_RUN
+st work revision approve PROPOSAL PREVIEW_TOKEN --as person/reviewer
+st work revision cancel PROPOSAL --as person/reviewer --reason "The request changed."
 ```
 
 A run can have one pending proposal. A second proposal fails until the first proposal is applied or cancelled.
@@ -1342,11 +1342,11 @@ Each accepted revision creates one immutable successor generation. The stable mi
 The cutover transaction creates generation-specific step-run subjects. It also marks the old generation as superseded.
 
 ```sh
-st3 work revision generations MISSION_RUN
-st3 work revision generation RUN_GENERATION
+st work revision generations MISSION_RUN
+st work revision generation RUN_GENERATION
 ```
 
-st3 compares normalized step definition hashes. A changed step and every transitive dependent start without prior completion.
+st compares normalized step definition hashes. A changed step and every transitive dependent start without prior completion.
 
 Every compatible state carries to the successor. Compatible claimed, working, or blocked work keeps its
 worker lease, so the worker continues without claiming again. Compatible verifying work that its
@@ -1381,35 +1381,35 @@ The run keeps its initial revision and root revision. Its current revision is th
 `document` on a step always requires `doc/NAME@SHA256`.
 
 ```sh
-st3 documents put request.md --as doc/project/request
-st3 documents get doc/project/request@SHA256 --output request.md
-st3 documents ls doc/project/request
+st documents put request.md --as doc/project/request
+st documents get doc/project/request@SHA256 --output request.md
+st documents ls doc/project/request
 ```
 
 Bare document names can appear in an intent before preview. The preview resolves them to the current exact hash. Apply validates the bytes and binds that exact version.
 
-Do not store credentials or raw private measurements in Git or shared st3 documents.
+Do not store credentials or raw private measurements in Git or shared st documents.
 
 Store a summary, a redacted sample, or a hash when later work needs durable evidence. Keep raw private data in a restricted external store.
 
 ## Review, approve, and start
 
-`st3 missions publish FILE --as ACTOR` previews and publishes exact authored KDL with authority and
-subject-head checks. `st3 launch preview SESSION` validates a planner candidate, resolves documents,
+`st missions publish FILE --as ACTOR` previews and publishes exact authored KDL with authority and
+subject-head checks. `st launch preview SESSION` validates a planner candidate, resolves documents,
 displays changes, and returns the approval hash.
-`st3 launch approve SESSION HASH --as person/NAME` applies that exact candidate without starting it.
-`st3 launch approve-and-launch` performs the approval and idempotent start as one product workflow.
-An authorized agent uses `st3 work publish-mission`, fenced to its claimed producing step.
+`st launch approve SESSION HASH --as person/NAME` applies that exact candidate without starting it.
+`st launch approve-and-launch` performs the approval and idempotent start as one product workflow.
+An authorized agent uses `st work publish-mission`, fenced to its claimed producing step.
 
-`st3 missions start MISSION --as ACTOR` publishes one mission-run declaration for the current ready revision. Add `--follow` to follow the run until it becomes terminal.
+`st missions start MISSION --as ACTOR` publishes one mission-run declaration for the current ready revision. Add `--follow` to follow the run until it becomes terminal.
 
 `missions publish` prints each revision it created. Pass that value to `missions start --revision REVISION` to start exactly that revision. A mission published on another host reaches this host by replication. When the mission or the requested revision is not here yet, `start` waits up to 60 seconds with a plain message instead of failing. When a later revision already replaced the requested one, `start` names the replacement and stops. After a run starts, `start` names its revision on standard error and says whether other revisions share the mission name.
 
-`st3 missions show MISSION_RUN` reads one exact run. `st3 missions show MISSION` works only when that mission has exactly one nonterminal run.
+`st missions show MISSION_RUN` reads one exact run. `st missions show MISSION` works only when that mission has exactly one nonterminal run.
 
 The default mission view shows the complete run summary and its active graph branch. Add `--follow` to watch an existing run.
 
-Each step shows one line from its worker: the `work complete` summary once submitted, otherwise the latest `work progress` summary. Both come from the current attempt, and `--json` carries them as `completion_summary`, `progress_summary`, and `progress_at_unix_ms`. `st3 agents show` prints each current step with its latest progress summary and age.
+Each step shows one line from its worker: the `work complete` summary once submitted, otherwise the latest `work progress` summary. Both come from the current attempt, and `--json` carries them as `completion_summary`, `progress_summary`, and `progress_at_unix_ms`. `st agents show` prints each current step with its latest progress summary and age.
 
 Follow mode redraws one screen on a terminal. It appends each changed snapshot when another program reads the output.
 
@@ -1422,30 +1422,30 @@ The mission shortcut fails when it finds zero or multiple active runs. The error
 Planning mode asks one durable Codex harness to author Markdown and KDL for review.
 
 ```sh
-st3 launch start --id release-mission request.md \
+st launch start --id release-mission request.md \
   --workspace ./project \
   --as person/nathan \
   --model gpt-5.6-sol \
   --effort medium
 
-st3 launch show SESSION
-st3 launch preview SESSION
-st3 launch revise SESSION feedback.md --as person/nathan
-st3 launch approve SESSION PREVIEW_TOKEN --as person/nathan
-st3 launch cancel SESSION --as person/nathan --reason "The request changed."
+st launch show SESSION
+st launch preview SESSION
+st launch revise SESSION feedback.md --as person/nathan
+st launch approve SESSION PREVIEW_TOKEN --as person/nathan
+st launch cancel SESSION --as person/nathan --reason "The request changed."
 ```
 
 Planning can also prepare a revision for one current mission run:
 
 ```sh
-st3 launch start --run MISSION_RUN request.md \
+st launch start --run MISSION_RUN request.md \
   --workspace ./project \
   --as person/nathan
 
-st3 launch preview SESSION --variant compact
-st3 launch preview SESSION --variant extended
-st3 launch compare SESSION compact extended
-st3 launch propose SESSION extended \
+st launch preview SESSION --variant compact
+st launch preview SESSION --variant extended
+st launch compare SESSION compact extended
+st launch propose SESSION extended \
   --as person/nathan \
   --reason "The extended variant covers the discovered risk."
 ```
@@ -1453,7 +1453,7 @@ st3 launch propose SESSION extended \
 The planner uses this command:
 
 ```sh
-st3 launch submit SESSION --variant compact --markdown MISSION.md --kdl mission.kdl
+st launch submit SESSION --variant compact --markdown MISSION.md --kdl mission.kdl
 ```
 
 The session stores the request, feedback, Markdown, and KDL as immutable documents. Small Talk carries document references, not mutable file paths.
