@@ -538,6 +538,46 @@ pub struct Store {
 
 const MESSAGE_CACHE_LIMIT: usize = 4096;
 
+// Owner joins compare the run ID with the reference's suffix, so SQLite looks each owner up by
+// primary key instead of scanning every run for each desired row on every reconcile pass.
+const TERMINAL_OWNED_RUNTIME_SUBJECTS: &str = "SELECT desired.subject
+     FROM desired
+     JOIN mission_runs owner
+       ON substr(desired.owner_run, 1, 12)='mission-run/'
+      AND owner.id=substr(desired.owner_run, 13)
+     JOIN mission_runs root ON root.id=owner.root_run_id
+     LEFT JOIN run_generations generation
+       ON substr(desired.owner_generation, 1, 15)='run-generation/'
+      AND generation.id=substr(desired.owner_generation, 16)
+     WHERE desired.member IS NOT NULL
+       AND (
+         owner.status IN ('completed','failed','cancelled')
+         OR owner.phase='terminal'
+         OR root.status IN ('completed','failed','cancelled')
+         OR root.phase='terminal'
+         OR generation.status IN ('completed','failed','cancelled')
+       )
+     ORDER BY desired.subject";
+const RETIRED_OWNED_INTAKE_SUBJECTS: &str = "SELECT desired.subject
+     FROM desired
+     JOIN mission_runs owner
+       ON substr(desired.owner_run, 1, 12)='mission-run/'
+      AND owner.id=substr(desired.owner_run, 13)
+     JOIN mission_runs root ON root.id=owner.root_run_id
+     WHERE desired.kind IN ('observer','subscription','schedule')
+       AND (
+         owner.status IN ('completed','failed','cancelled')
+         OR owner.phase='terminal'
+         OR root.status IN ('completed','failed','cancelled')
+         OR root.phase='terminal'
+         OR (
+           desired.owner_generation IS NOT NULL
+           AND desired.owner_generation != ('run-generation/' || owner.current_generation_id)
+         )
+       )
+     ORDER BY desired.subject";
+const ACTUAL_CACHE_LIMIT: usize = 4096;
+
 struct MessageCacheEntry {
     latest_claim_index: u64,
     desired_claim_id: Option<String>,
@@ -6938,24 +6978,7 @@ impl Store {
     /// survives a revision keeps running.
     pub fn terminal_owned_runtime_subjects(&self) -> Result<BTreeSet<String>> {
         let connection = self.readers.get();
-        let mut statement = connection.prepare(
-            "SELECT desired.subject
-             FROM desired
-             JOIN mission_runs owner
-               ON desired.owner_run='mission-run/' || owner.id
-             JOIN mission_runs root ON root.id=owner.root_run_id
-             LEFT JOIN run_generations generation
-               ON desired.owner_generation='run-generation/' || generation.id
-             WHERE desired.member IS NOT NULL
-               AND (
-                 owner.status IN ('completed','failed','cancelled')
-                 OR owner.phase='terminal'
-                 OR root.status IN ('completed','failed','cancelled')
-                 OR root.phase='terminal'
-                 OR generation.status IN ('completed','failed','cancelled')
-               )
-             ORDER BY desired.subject",
-        )?;
+        let mut statement = connection.prepare(TERMINAL_OWNED_RUNTIME_SUBJECTS)?;
         statement
             .query_map([], |row| row.get::<_, String>(0))?
             .collect::<Result<BTreeSet<_>, _>>()
@@ -6966,25 +6989,7 @@ impl Store {
     /// generation is no longer current. They must not observe, deliver, or start work.
     pub fn retired_owned_intake_subjects(&self) -> Result<BTreeSet<String>> {
         let connection = self.readers.get();
-        let mut statement = connection.prepare(
-            "SELECT desired.subject
-             FROM desired
-             JOIN mission_runs owner
-               ON desired.owner_run='mission-run/' || owner.id
-             JOIN mission_runs root ON root.id=owner.root_run_id
-             WHERE desired.kind IN ('observer','subscription','schedule')
-               AND (
-                 owner.status IN ('completed','failed','cancelled')
-                 OR owner.phase='terminal'
-                 OR root.status IN ('completed','failed','cancelled')
-                 OR root.phase='terminal'
-                 OR (
-                   desired.owner_generation IS NOT NULL
-                   AND desired.owner_generation != ('run-generation/' || owner.current_generation_id)
-                 )
-               )
-             ORDER BY desired.subject",
-        )?;
+        let mut statement = connection.prepare(RETIRED_OWNED_INTAKE_SUBJECTS)?;
         statement
             .query_map([], |row| row.get::<_, String>(0))?
             .collect::<Result<BTreeSet<_>, _>>()
@@ -9125,38 +9130,45 @@ impl Store {
         })
     }
 
+    /// The store index of the subject's newest claim of `kind`, or 0 when it has none. Claims are
+    /// append-only, so an unchanged index means the subject's claims of that kind are unchanged.
+    pub fn newest_claim_index(&self, subject: &str, kind: &str) -> Result<u64> {
+        let connection = self.readers.get();
+        Ok(connection
+            .prepare_cached(
+                "SELECT COALESCE(MAX(store_index), 0) FROM claims WHERE subject=?1 AND kind=?2",
+            )?
+            .query_row(params![subject, kind], |row| row.get(0))?)
+    }
+
     pub fn latest_actual_value(&self, subject: &str) -> Result<Option<Value>> {
-        let before = self.committed_index.load(Ordering::Acquire);
+        let connection = self.readers.get();
+        // The actual state folds only this subject's append-only claims, so the subject's newest
+        // claim identifies it. A write elsewhere in the graph must not make every reconcile pass
+        // re-read and re-parse the history of every stopped runtime.
+        let newest: u64 = connection
+            .prepare_cached("SELECT COALESCE(MAX(store_index), 0) FROM claims WHERE subject=?1")?
+            .query_row([subject], |row| row.get(0))?;
         if let Some((_, value)) = self
             .actual_cache
             .lock()
             .expect("actual cache mutex poisoned")
             .get(subject)
-            .filter(|(index, _)| *index == before)
+            .filter(|(index, _)| *index == newest)
         {
             return Ok(value.clone());
         }
-        let connection = self.readers.get();
+        // A claim committed after `newest` can only make this value newer than its key, and the
+        // next read then misses and folds again.
         let value = latest_actual(&connection, subject)?;
-        let after = self.committed_index.load(Ordering::Acquire);
-        if before == after {
-            let mut cache = self
-                .actual_cache
-                .lock()
-                .expect("actual cache mutex poisoned");
-            if self.committed_index.load(Ordering::Acquire) == after {
-                // Entries from an earlier store index can never be hit again.
-                // Keeping them would retain historical subjects indefinitely.
-                if cache
-                    .values()
-                    .next()
-                    .is_some_and(|(index, _)| *index != after)
-                {
-                    cache.clear();
-                }
-                cache.insert(subject.to_owned(), (after, value.clone()));
-            }
+        let mut cache = self
+            .actual_cache
+            .lock()
+            .expect("actual cache mutex poisoned");
+        if cache.len() >= ACTUAL_CACHE_LIMIT && !cache.contains_key(subject) {
+            cache.clear();
         }
+        cache.insert(subject.to_owned(), (newest, value.clone()));
         Ok(value)
     }
 
@@ -22924,42 +22936,46 @@ observer "ordered/file" {
     }
 
     #[test]
-    fn the_current_actual_cache_follows_the_store_index() {
+    fn the_actual_cache_follows_each_subjects_newest_claim() {
         let store = Store::open_memory("node").unwrap();
+        let observe = |subject: &str, status: &str| {
+            store
+                .append_claim(&ClaimInput {
+                    subject: subject.into(),
+                    kind: "runtime.observed".into(),
+                    actor: None,
+                    fields: BTreeMap::from([("status".into(), Value::String(status.into()))]),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: None,
+                })
+                .unwrap()
+        };
         let subject = "agent/run/worker";
-        store
-            .append_claim(&ClaimInput {
-                subject: subject.into(),
-                kind: "runtime.observed".into(),
-                actor: None,
-                fields: BTreeMap::from([("status".into(), Value::String("running".into()))]),
-                evidence: Vec::new(),
-                expected_subject: None,
-                idempotency_key: None,
-            })
-            .unwrap();
-        let first = store.latest_actual_value(subject).unwrap().unwrap();
-        assert_eq!(first["status"], "running");
-        store.latest_actual_value("agent/old").unwrap();
-        assert!(store.actual_cache.lock().unwrap().contains_key("agent/old"));
-        let first_index = store.actual_cache.lock().unwrap().get(subject).unwrap().0;
+        let stopped = observe(subject, "stopped");
+        assert_eq!(
+            store.latest_actual_value(subject).unwrap().unwrap()["status"],
+            "stopped"
+        );
+        let cached = |store: &Store| store.actual_cache.lock().unwrap().get(subject).cloned();
+        assert_eq!(cached(&store).unwrap().0, stopped.store_index);
 
-        store
-            .append_claim(&ClaimInput {
-                subject: subject.into(),
-                kind: "runtime.observed".into(),
-                actor: None,
-                fields: BTreeMap::from([("status".into(), Value::String("stopped".into()))]),
-                evidence: Vec::new(),
-                expected_subject: None,
-                idempotency_key: None,
-            })
-            .unwrap();
-        let second = store.latest_actual_value(subject).unwrap().unwrap();
-        assert_eq!(second["status"], "stopped");
-        let cache = store.actual_cache.lock().unwrap();
-        assert!(cache.get(subject).unwrap().0 > first_index);
-        assert!(!cache.contains_key("agent/old"));
+        // Other subjects' writes leave a stopped runtime's folded state valid.
+        observe("agent/run/other", "running");
+        let before = cached(&store).unwrap();
+        store.latest_actual_value(subject).unwrap();
+        assert_eq!(
+            cached(&store).unwrap(),
+            before,
+            "an unrelated write must not refold this subject's history"
+        );
+
+        let running = observe(subject, "running");
+        assert_eq!(
+            store.latest_actual_value(subject).unwrap().unwrap()["status"],
+            "running"
+        );
+        assert_eq!(cached(&store).unwrap().0, running.store_index);
     }
 
     #[test]
@@ -26499,6 +26515,39 @@ version 2
         assert_eq!(diagnostics.len(), 1);
         assert_eq!(diagnostics[0].kind, "harness.diagnostic");
         assert_eq!(store.claims_for("agent/example", None).unwrap().len(), 21);
+    }
+
+    #[test]
+    fn owned_subject_queries_look_owners_up_by_primary_key() {
+        let store = Store::open_memory("node").unwrap();
+        let connection = store.connection.lock().unwrap();
+        for (name, query) in [
+            ("terminal owned runtimes", TERMINAL_OWNED_RUNTIME_SUBJECTS),
+            ("retired owned intake", RETIRED_OWNED_INTAKE_SUBJECTS),
+        ] {
+            let mut statement = connection
+                .prepare(&format!("EXPLAIN QUERY PLAN {query}"))
+                .unwrap();
+            let plan = statement
+                .query_map([], |row| row.get::<_, String>(3))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            assert!(
+                !plan
+                    .iter()
+                    .any(|step| step.starts_with("SCAN owner")
+                        || step.starts_with("SCAN generation")),
+                "{name} must not scan owners for each desired row:\n{}",
+                plan.join("\n")
+            );
+            assert!(
+                plan.iter()
+                    .any(|step| step.starts_with("SEARCH owner USING INDEX")),
+                "{name} must look its owner run up by primary key:\n{}",
+                plan.join("\n")
+            );
+        }
     }
 
     #[test]
