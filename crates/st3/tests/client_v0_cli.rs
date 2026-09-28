@@ -266,6 +266,77 @@ async fn conversations_cli_handles_multiple_message_pages_and_exact_reads() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_conversation_thread_pages_through_the_history_once() {
+    let root = tempfile::tempdir().unwrap();
+    let socket = root.path().join("st3.sock");
+    let state = test_state(root.path());
+    for index in 0..205 {
+        let mut fields = BTreeMap::from([
+            ("from".into(), Value::String("agent/sender".into())),
+            ("to".into(), Value::String("agent/receiver".into())),
+            ("content".into(), Value::String(format!("body {index}"))),
+            ("status".into(), Value::String("sent".into())),
+        ]);
+        if index == 204 {
+            fields.insert(
+                "in_reply_to".into(),
+                Value::String("message/page-000".into()),
+            );
+        }
+        state
+            .store
+            .append_claim(&ClaimInput {
+                subject: format!("message/page-{index:03}"),
+                kind: "message.sent".into(),
+                actor: Some("agent/sender".into()),
+                fields,
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+    }
+    let pages = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = pages.clone();
+    let router = st3::api::router(state).layer(axum::middleware::from_fn(
+        move |request: axum::extract::Request, next: axum::middleware::Next| {
+            let counted = counted.clone();
+            async move {
+                if request.uri().path() == "/v1/messages/page" {
+                    counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+                next.run(request).await
+            }
+        },
+    ));
+    let server_socket = socket.clone();
+    let server = tokio::spawn(async move { st3::api::serve_unix(&server_socket, router).await });
+    for _ in 0..100 {
+        if socket.exists() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert!(socket.exists());
+
+    let thread = value(&run_cli(&socket, &["conversations", "thread", "message/page-204"]).await);
+    let subjects = thread
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|message| message["subject"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(subjects, ["message/page-000", "message/page-204"]);
+    // 205 messages are three pages of 100. Every page makes the daemon read each message.
+    assert_eq!(
+        pages.load(std::sync::atomic::Ordering::SeqCst),
+        3,
+        "a thread must page through the message history once"
+    );
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn attention_withdraw_removes_an_obsolete_request_from_now() {
     let root = tempfile::tempdir().unwrap();
     let socket = root.path().join("st3.sock");

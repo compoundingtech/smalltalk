@@ -114,10 +114,12 @@ impl Daemon {
         );
     }
 
+    /// The in-memory store shares one cache between its connections, so a read that meets the
+    /// API's write lock fails with `SQLITE_LOCKED`. A waiting read treats that as "not yet".
     fn harness_states(&self, subject: &str, incarnation: &str) -> Vec<String> {
         self.store
             .claims_for(subject, Some("harness.observed"))
-            .unwrap()
+            .unwrap_or_default()
             .into_iter()
             .filter(|claim| {
                 claim
@@ -389,7 +391,8 @@ async fn a_pi_family_channel_keeps_state_and_mail_through_a_daemon_restart() {
             daemon
                 .store
                 .message("message/restart-omp-mail")
-                .unwrap()
+                .ok()
+                .flatten()
                 .is_some_and(|message| message.status == "delivered")
         },
     )
