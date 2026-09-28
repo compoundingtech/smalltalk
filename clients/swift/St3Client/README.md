@@ -2,7 +2,7 @@
 
 Swift 6 package for iOS 17/macOS 14 clients of `st3.client.v0`. It is an online thin client over an
 authenticated Fabric-loopback URL and includes typed capabilities, resources, timeline/events,
-actions, pairing, and terminal screen/frame models.
+actions, pairing, and styled terminal screens; `terminalStream` yields each changed screen.
 
 ```swift
 let client = St3Client(fabricLoopbackURL: gatewayURL, credential: credential)

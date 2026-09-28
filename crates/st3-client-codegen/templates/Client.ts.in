@@ -15,6 +15,34 @@ export type ClientOptions = {
     fetchImpl?: typeof fetch;
 };
 
+export const TERMINAL_SUBPROTOCOL = 'st3.client.terminal.v0';
+
+/** The WebSocket surface a terminal stream uses. React Native's WebSocket accepts headers. */
+export type TerminalSocket = {
+    onmessage: ((event: { data: unknown }) => void) | null;
+    onclose: ((event: { code: number; reason: string }) => void) | null;
+    onerror: ((event: unknown) => void) | null;
+    close(code?: number, reason?: string): void;
+};
+export type TerminalSocketFactory = (url: string, protocols: string[], headers: Record<string, string>) => TerminalSocket;
+export type TerminalStreamOptions = {
+    /** The single-use capability from `terminal.attach`. */
+    streamCapability: string;
+    incarnation?: string;
+    /** Each screen replaces every earlier one: the current screen first, then one per change. */
+    onScreen: (screen: EnvelopeOf<TerminalScreen>) => void;
+    /** Called once when the server ends the stream: without an error after a normal close, or
+     * with the server's error, such as `stale-fence` after the runtime incarnation changes. */
+    onEnd?: (error?: Error) => void;
+    socket?: TerminalSocketFactory;
+};
+export type TerminalStream = { close(): void };
+
+function defaultTerminalSocket(url: string, protocols: string[], headers: Record<string, string>): TerminalSocket {
+    const Socket = WebSocket as unknown as new (url: string, protocols: string[], options: { headers: Record<string, string> }) => TerminalSocket;
+    return new Socket(url, protocols, { headers });
+}
+
 export class ClientError extends Error {
     constructor(public readonly response: ErrorEnvelope, public readonly status: number) {
         super(response.message);
@@ -123,6 +151,33 @@ export class St3Client {
                 options.signal?.addEventListener('abort', onAbort, { once: true });
             });
         }
+    }
+
+    /** Open the terminal stream that one `terminal.attach` capability allows. */
+    async terminalStream(id: string, options: TerminalStreamOptions): Promise<TerminalStream> {
+        const credential = await this.credential?.();
+        const url = new URL(`${this.baseUrl}/v1/client/terminals/${encodeURIComponent(routedId(id))}/stream`);
+        url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
+        if (options.incarnation) url.searchParams.set('incarnation', options.incarnation);
+        const headers: Record<string, string> = {};
+        if (credential) headers.Authorization = `Bearer ${credential}`;
+        const socket = (options.socket ?? defaultTerminalSocket)(url.toString(), [TERMINAL_SUBPROTOCOL, `st3.cap.${options.streamCapability}`], headers);
+        let ended = false;
+        const stop = () => { ended = true; socket.onmessage = null; socket.onclose = null; socket.onerror = null; };
+        const end = (error?: Error) => { if (ended) return; stop(); options.onEnd?.(error); };
+        const fail = (error: Error) => { end(error); socket.close(1000); };
+        socket.onmessage = event => {
+            let payload: unknown;
+            try { payload = JSON.parse(String(event.data)); } catch { fail(new Error('A terminal stream message is not JSON')); return; }
+            if (!payload || typeof payload !== 'object' || (payload as { api_version?: unknown }).api_version !== API_VERSION) { fail(new Error('Unexpected st terminal stream message')); return; }
+            if ('error_version' in payload) { fail(new ClientError(payload as ErrorEnvelope, 0)); return; }
+            const screen = payload as EnvelopeOf<TerminalScreen>;
+            if (screen.value?.kind !== 'terminal-screen') { fail(new Error('A terminal stream message is not a screen')); return; }
+            options.onScreen(screen);
+        };
+        socket.onclose = event => end(event.code === 1000 ? undefined : new Error(`The terminal stream closed (${event.code}${event.reason ? ` ${event.reason}` : ''})`));
+        socket.onerror = () => end(new Error('The terminal stream failed'));
+        return { close: () => { if (!ended) { stop(); socket.close(1000); } } };
     }
 
     // @st3-codegen:typescript-operation-methods

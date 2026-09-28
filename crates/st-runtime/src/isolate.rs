@@ -31,6 +31,44 @@ pub fn mode() -> Isolation {
     *MODE.get_or_init(detect)
 }
 
+/// Select daemon isolation before constructing runtimes, using its captured login environment.
+/// Other callers retain the existing ambient-environment default.
+pub fn initialize_isolation(environment: &std::collections::BTreeMap<String, String>) -> Isolation {
+    *MODE.get_or_init(|| {
+        if !cfg!(target_os = "linux") {
+            Isolation::Detached
+        } else if systemd_user_available_in(environment) {
+            Isolation::Scope
+        } else {
+            Isolation::DegradedDetached
+        }
+    })
+}
+
+fn systemd_user_available_in(environment: &std::collections::BTreeMap<String, String>) -> bool {
+    if !environment.contains_key("XDG_RUNTIME_DIR") {
+        return false;
+    }
+    [
+        ("systemd-run", vec!["--version"]),
+        ("systemctl", vec!["--user", "show-environment"]),
+    ]
+    .into_iter()
+    .all(|(program, arguments)| {
+        let Ok(program) = crate::resolve_executable(program, environment) else {
+            return false;
+        };
+        Command::new(program)
+            .args(arguments)
+            .env_clear()
+            .envs(environment)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+    })
+}
+
 pub fn warn_if_degraded(product: &str) {
     if mode() == Isolation::DegradedDetached && !WARNED.swap(true, Ordering::Relaxed) {
         eprintln!(
@@ -126,6 +164,24 @@ pub fn wrap(unit: &str, program: &OsStr, arguments: &[&OsStr]) -> Command {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn isolation_probe_resolves_tools_from_the_captured_path() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let root = tempfile::tempdir().unwrap();
+        let environment = std::collections::BTreeMap::from([
+            ("PATH".into(), root.path().display().to_string()),
+            ("XDG_RUNTIME_DIR".into(), root.path().display().to_string()),
+            ("ORCHID_CONTROL".into(), "captured".into()),
+        ]);
+        assert!(!systemd_user_available_in(&environment));
+        for program in ["systemd-run", "systemctl"] {
+            let path = root.path().join(program);
+            std::fs::write(&path, "#!/bin/sh\n[ \"$ORCHID_CONTROL\" = captured ]\n").unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        assert!(systemd_user_available_in(&environment));
+    }
 
     #[test]
     fn scope_names_are_unique_and_safe() {

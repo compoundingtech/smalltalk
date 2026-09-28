@@ -3,6 +3,7 @@ use std::fs;
 use std::io::Write as _;
 use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
+#[cfg(test)]
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -545,7 +546,7 @@ fn ensure_tracked_file_is_unchanged(
     let Ok(relative) = destination.strip_prefix(workspace) else {
         return Ok(());
     };
-    let tracked = Command::new("git")
+    let tracked = crate::environment::command("git")?
         .arg("-C")
         .arg(workspace)
         .args(["ls-files", "--error-unmatch", "--"])
