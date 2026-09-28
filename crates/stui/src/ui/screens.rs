@@ -25,6 +25,8 @@ pub enum Item {
         second: Vec<Span<'static>>,
     },
     Note(Line<'static>),
+    /// A folder line in a tree: no spacing around it.
+    Folder(Line<'static>),
 }
 
 /// Sidebar rows. `index` in each row is the position in the tab's selectable order.
@@ -2018,4 +2020,154 @@ pub fn agent_details(world: &World, agent: &Agent, width: usize, spinner: &'stat
         None,
     ));
     doc
+}
+
+// ---------------------------------------------------------------- tree views
+
+/// A listing laid out as the graph's path tree: folders from the id, one line per leaf.
+fn tree_listing(
+    mut leaves: Vec<(Vec<String>, String, Vec<Span<'static>>, Vec<Span<'static>>)>,
+    state: ListState,
+    legend: Vec<Line<'static>>,
+) -> Listing {
+    leaves.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut items = Vec::new();
+    let mut ids = Vec::new();
+    let mut open: Vec<String> = Vec::new();
+    for (path, id, first, right) in leaves {
+        let folders = &path[..path.len().saturating_sub(1)];
+        let shared = open.iter().zip(folders).take_while(|(a, b)| a == b).count();
+        open.truncate(shared);
+        for (depth, folder) in folders.iter().enumerate().skip(shared) {
+            items.push(Item::Folder(Line::from(vec![
+                span(
+                    format!(" {}▾ ", "  ".repeat(depth)),
+                    theme::fg(theme::SURFACE2),
+                ),
+                span(format!("{folder}/"), theme::fg(theme::OVERLAY1)),
+            ])));
+            open.push(folder.clone());
+        }
+        let mut row = vec![span("  ".repeat(folders.len()), theme::dim())];
+        row.extend(first);
+        items.push(Item::Row {
+            index: ids.len(),
+            first: row,
+            right,
+            second: vec![],
+        });
+        ids.push(id);
+    }
+    Listing {
+        items,
+        ids,
+        state,
+        legend,
+    }
+}
+
+pub fn agents_tree(world: &World, spinner: &'static str) -> Listing {
+    let leaves = agent_order(world)
+        .into_iter()
+        .map(|agent| {
+            let (glyph, color) = agent_glyph(agent.state, spinner);
+            let path = agent
+                .id
+                .trim_start_matches("agent/")
+                .split('/')
+                .map(str::to_owned)
+                .collect::<Vec<_>>();
+            (
+                path,
+                agent.id.clone(),
+                vec![
+                    span(format!("{glyph} "), theme::strong(color)),
+                    span(agent.name.clone(), theme::bold()),
+                ],
+                vec![
+                    span(
+                        agent.harness.name(),
+                        theme::fg(harness_color(agent.harness)),
+                    ),
+                    span(format!(" {:>4}", agent.activity), theme::dim()),
+                ],
+            )
+        })
+        .collect();
+    let mut listing = tree_listing(
+        leaves,
+        state_of(&world.agents, "Loading agents…", "No agents yet."),
+        vec![],
+    );
+    listing.legend = agents_list(world, spinner, 40).legend;
+    listing
+}
+
+pub fn missions_tree(world: &World, spinner: &'static str, system: bool) -> Listing {
+    let leaves = mission_order(world, system)
+        .into_iter()
+        .map(|mission| {
+            let (glyph, color) = word_style(mission.word, spinner);
+            let path = mission
+                .id
+                .trim_start_matches("mission/")
+                .split('/')
+                .map(str::to_owned)
+                .collect::<Vec<_>>();
+            let (done, total) = mission.progress();
+            (
+                path.clone(),
+                mission.id.clone(),
+                vec![
+                    span(format!("{glyph} "), theme::strong(color)),
+                    span(path.last().cloned().unwrap_or_default(), theme::bold()),
+                ],
+                vec![span(
+                    format!("{} {done}/{total}", mission.word.name()),
+                    theme::fg(color),
+                )],
+            )
+        })
+        .collect();
+    let mut listing = tree_listing(
+        leaves,
+        state_of(&world.missions, "Loading missions…", "No missions yet."),
+        vec![],
+    );
+    listing.legend = missions_list(world, spinner, system).legend;
+    listing
+}
+
+#[cfg(test)]
+mod tree_tests {
+    use super::*;
+
+    #[test]
+    fn a_tree_has_one_line_per_folder_and_leaf_in_path_order() {
+        let listing = agents_tree(&super::super::demo::world(), "⠋");
+        let kinds = listing
+            .items
+            .iter()
+            .map(|item| match item {
+                Item::Folder(line) => format!("F {}", super::super::text::plain(line).trim()),
+                Item::Row { first, .. } => format!(
+                    "R {}",
+                    first
+                        .iter()
+                        .map(|span| span.content.as_ref())
+                        .collect::<String>()
+                        .trim()
+                ),
+                Item::Note(_) => "N".into(),
+                Item::Header { .. } => "H".into(),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(kinds[0], "F ▾ fleet/", "{kinds:#?}");
+        assert!(
+            kinds
+                .iter()
+                .all(|kind| !kind.starts_with('N') && !kind.starts_with('H')),
+            "{kinds:#?}"
+        );
+    }
 }

@@ -168,6 +168,8 @@ pub struct Ui {
     details: bool,
     /// The Missions tab shows the selected mission's whole declaration.
     kdl: bool,
+    /// Agents and Missions list as the graph's path tree instead of grouped by state.
+    tree: bool,
     /// Home items put off until later. Demo only: kept in memory on this machine.
     snoozed: HashSet<String>,
 }
@@ -202,6 +204,7 @@ impl Ui {
             chat: None,
             details: true,
             kdl: false,
+            tree: false,
             snoozed: HashSet::new(),
         }
     }
@@ -238,7 +241,9 @@ impl Ui {
     fn listing(&self, width: usize) -> Listing {
         match self.tab {
             0 => screens::home_list(&self.world, &self.snoozed),
+            1 if self.tree => screens::agents_tree(&self.world, self.spinner()),
             1 => screens::agents_list(&self.world, self.spinner(), width),
+            2 if self.tree => screens::missions_tree(&self.world, self.spinner(), self.system),
             2 => screens::missions_list(&self.world, self.spinner(), self.system),
             3 => screens::fleet_list(&self.world),
             _ => screens::worktrees_list(&self.world),
@@ -662,7 +667,8 @@ impl Ui {
                 } => {
                     let is_selected = *index == selected;
                     if is_selected {
-                        selected_range = (rows.len(), rows.len() + 2);
+                        let height = if second.is_empty() { 1 } else { 2 };
+                        selected_range = (rows.len(), rows.len() + height);
                     }
                     let right_width = right.iter().map(Span::width).sum::<usize>();
                     let mut spans = truncate_spans(first, width.saturating_sub(right_width + 2));
@@ -672,12 +678,15 @@ impl Ui {
                     ));
                     spans.extend(right.iter().cloned());
                     rows.push((Some(*index), Line::from(spans), is_selected));
-                    rows.push((
-                        Some(*index),
-                        Line::from(truncate_spans(second, width)),
-                        is_selected,
-                    ));
+                    if !second.is_empty() {
+                        rows.push((
+                            Some(*index),
+                            Line::from(truncate_spans(second, width)),
+                            is_selected,
+                        ));
+                    }
                 }
+                Item::Folder(line) => rows.push((None, line.clone(), false)),
                 Item::Note(line) => {
                     if !rows.is_empty() {
                         rows.push((None, Line::default(), false));
@@ -1502,6 +1511,20 @@ impl Ui {
             KeyCode::Char('x') if self.tab == 2 => self.system = !self.system,
             KeyCode::Char('o') if self.tab == 1 => self.toggle_all_tools(),
             KeyCode::Char('i') if self.tab == 1 => self.details = !self.details,
+            KeyCode::Char('t') if matches!(self.tab, 1 | 2) => {
+                let id = self.selected_id();
+                self.tree = !self.tree;
+                if let Some(index) =
+                    id.and_then(|id| self.ids().iter().position(|candidate| *candidate == id))
+                {
+                    self.selected[self.tab] = index;
+                }
+                self.flash(if self.tree {
+                    "Tree view · t for groups"
+                } else {
+                    "Grouped view · t for the tree"
+                });
+            }
             KeyCode::Enter if self.tab == 1 => self.editing = true,
             KeyCode::Enter if self.tab == 2 => {
                 if let Some(decision) = self.selected_id().and_then(|id| {
