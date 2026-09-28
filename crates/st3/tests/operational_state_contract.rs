@@ -191,8 +191,8 @@ fn command_inventory_resolves_every_baseline_command_to_a_complete_purpose() {
         assert!(
             installed
                 .iter()
-                .any(|row| row["path"] == format!("st3 {root}")),
-            "installed root st3 {root} is absent from the transition matrix"
+                .any(|row| row["path"] == format!("st {root}")),
+            "installed root st {root} is absent from the transition matrix"
         );
     }
     assert!(contract["conformance"].as_array().unwrap().len() >= 14);
