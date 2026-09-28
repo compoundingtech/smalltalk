@@ -2924,7 +2924,9 @@ fn apply_v1_requires_a_declared_pty_root_outside_the_catalog() {
         assert!(
             String::from_utf8_lossy(&rejected.stderr).contains("requires pty-root outside")
                 || String::from_utf8_lossy(&rejected.stderr)
-                    .contains("requires an explicit external pty-root")
+                    .contains("requires an explicit external pty-root"),
+            "{case}: {}",
+            String::from_utf8_lossy(&rejected.stderr)
         );
         assert!(!catalog.join(".st2/catalog-apply-incomplete").exists());
     }
