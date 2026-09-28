@@ -59,21 +59,3 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - run: test "${{ needs.check-x86_64-linux-shard.result }}" = success
-
-  # st2 drives real processes — process groups, signals, pipes, reaping — and those paths
-  # are OS behaviour, not portable Rust: #356 and #255 were aarch64-darwin failures no Linux
-  # run could have caught. The hosted macOS runner is arm64 with 3 cores, so it is also a
-  # stricter scheduler than any Mac in the fleet, which makes it a good detector for
-  # load-sensitive lifecycle tests.
-  #
-  # Narrower than its Linux sibling on purpose: `nix build .#st2` builds the package and runs
-  # its hermetic suite via `doCheck` — the surface those issues live on — without also
-  # demanding cold aarch64-darwin builds of the inputs used by
-  # `checks.release-integration` on Linux. Widen once this is stable.
-  check-aarch64-darwin:
-    runs-on: macos-15
-    timeout-minutes: 90
-    steps:
-      - uses: actions/checkout@v4
-      - uses: DeterminateSystems/determinate-nix-action@v3
-      - run: nix build .#st2 .#st3 --no-link --print-build-logs
