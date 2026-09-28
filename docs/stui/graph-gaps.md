@@ -186,6 +186,12 @@ and `last_progress`. Also add `title`, `assigned_to` and `last_progress` to `Wor
 - **Resolution reasons in history.** `AttentionRequestView.resolution_reason` (`model.rs:1606`)
   isn't in the projection, so "what did I decide" can't be shown.
 
+- **A person cannot fix a broken agent or a stalled step from a client.** `runtime.restart`,
+  `runtime.reset` and `runtime.stop` are person actions but are left out of the client's
+  `AVAILABLE_ACTIONS` (`crates/st3/src/api/client_v0.rs`, the two action lists near the top), and
+  there is no client action for `st work retry`. stui can only cancel a run or point at the CLI.
+  Offer restart, reset and retry to persons through the client API, fenced like `mission.cancel`.
+
 ## 6. Proposed order of work
 
 Smallest useful change first:

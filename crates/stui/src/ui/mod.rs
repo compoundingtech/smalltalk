@@ -114,6 +114,10 @@ pub enum Effect {
         agent: String,
         text: String,
     },
+    /// Cancel a mission's latest run.
+    CancelRun {
+        mission: String,
+    },
     /// "Chat about this": a new message to `to`, titled after the item, with its context.
     Discuss {
         to: String,
@@ -1584,15 +1588,20 @@ impl Ui {
             'R' => "Restart the agent",
             _ => "Cancel this run",
         };
+        if key == 'X' {
+            self.confirm = Some('X');
+            self.flash("Cancel this run and stop its work? y to confirm");
+            return;
+        }
         if self.live {
-            // st's client API has no retry yet, and restart and cancel land with the
-            // broken-agent work; say how to do it rather than pretend.
+            // st's client API lets a person neither retry a step nor restart an agent yet.
             let hint = match key {
                 'r' => "st work retry STEP",
-                'R' => "st agents start AGENT (restart)",
-                _ => "st missions cancel RUN",
+                _ => "st agents start AGENT",
             };
-            self.flash(format!("{what}: not in stui yet · use {hint}"));
+            self.flash(format!(
+                "{what}: st does not let stui do this yet · use {hint}"
+            ));
         } else {
             self.flash(format!("{what} · demo: nothing was sent"));
         }
@@ -1812,6 +1821,18 @@ impl Ui {
     }
 
     fn act(&mut self, action: char) {
+        if action == 'X' {
+            let Some(mission) = self.selected_id().filter(|_| self.tab == 2) else {
+                return;
+            };
+            if self.live {
+                self.effects.push(Effect::CancelRun { mission });
+                self.flash("Cancelling…");
+            } else {
+                self.flash("Run cancelled · demo: nothing was sent");
+            }
+            return;
+        }
         let Some(id) = self.attention_focus() else {
             return;
         };

@@ -389,6 +389,43 @@ async fn perform(client: &Client, person: &str, model: &Model, effect: Effect) -
             send_titled(client, model, &to, text, Some(title), session).await?;
             Ok("Sent; the reply will show here and in their conversation".into())
         }
+        Effect::CancelRun { mission } => {
+            let found = model
+                .missions()
+                .find(|candidate| candidate.header.id == mission)
+                .ok_or_else(|| anyhow::anyhow!("That mission is gone"))?;
+            let run = found
+                .runs
+                .last()
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("It has no run"))?;
+            let generation = found.run_generations.get(&run).cloned();
+            let snapshot = model
+                .missions
+                .snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.id.clone())
+                .ok_or_else(|| anyhow::anyhow!("Not connected yet"))?;
+            let fence = Fence {
+                snapshot_id: snapshot,
+                mission_generation: generation,
+                ..Fence::default()
+            };
+            let (id, idem) = crate::action_pair();
+            client
+                .mission_cancel(
+                    id,
+                    idem,
+                    fence,
+                    st3_client::TargetParameters {
+                        target_id: run.clone(),
+                        reason: Some(format!("cancelled from stui by {person}")),
+                        ..Default::default()
+                    },
+                )
+                .await?;
+            Ok(format!("Cancelled {run}"))
+        }
         Effect::Send { agent, text } => {
             let session = model
                 .agents()
