@@ -4,6 +4,7 @@ STANDING QUEUES
   agent/orbit/standing: current step-run/atlas/build · next step-run/boron/check · waiting mission-run/boron/1
 UNSTARTED MISSIONS
   cedar
+  delta (draft)
 AGENTS BY HOST
   host/orbit
     standing

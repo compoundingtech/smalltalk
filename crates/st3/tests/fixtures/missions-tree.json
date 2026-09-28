@@ -14,7 +14,10 @@
         {"mission_run_id":"mission-run/boron/1","state":"waiting"}
       ]}
     ],
-    "unstarted_missions": [{"id":"mission/cedar","title":"cedar"}],
+    "unstarted_missions": [
+      {"id":"mission/cedar","title":"cedar","state":"ready"},
+      {"id":"mission/delta","title":"delta","state":"draft"}
+    ],
     "agents": [
       {"id":"agent/orbit/standing","name":"orbit/standing","host_id":"host/orbit","seat_kind":"standing","driver":"codex","model":"gpt-6-sol","effort":"medium","state":"running","harness_state":"working"},
       {"id":"agent/orbit/mission","name":"orbit/mission","host_id":"host/orbit","seat_kind":"mission","driver":"claude","model":"sonnet","effort":"high","state":"running","harness_state":"idle"}

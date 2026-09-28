@@ -5294,9 +5294,14 @@ fn render_missions_tree(response: &Value) -> String {
         output.push_str("  none\n");
     }
     for mission in unstarted.into_iter().flatten() {
+        let suffix = if mission["state"] == "draft" {
+            " (draft)"
+        } else {
+            ""
+        };
         let _ = writeln!(
             output,
-            "  {}",
+            "  {}{suffix}",
             mission["title"].as_str().unwrap_or("unknown")
         );
     }

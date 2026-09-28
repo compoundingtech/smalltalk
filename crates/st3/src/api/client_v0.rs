@@ -996,9 +996,10 @@ fn missions_tree_value(store: &Store, at: &str, index: u64) -> anyhow::Result<Va
     let mut unstarted = mission_resources(store, index, false, None)?
         .into_iter()
         .filter(|mission| {
-            mission["state"] == "ready" && mission["runs"].as_array().is_some_and(Vec::is_empty)
+            matches!(mission["state"].as_str(), Some("ready" | "draft"))
+                && mission["runs"].as_array().is_some_and(Vec::is_empty)
         })
-        .map(|mission| json!({ "id": mission["id"], "title": mission["title"] }))
+        .map(|mission| json!({ "id": mission["id"], "title": mission["title"], "state": mission["state"] }))
         .collect::<Vec<_>>();
     unstarted.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
     anyhow::ensure!(
