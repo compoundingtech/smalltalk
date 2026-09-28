@@ -303,6 +303,16 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
         .route("/v1/client/missions/{*id}", get(client_v0::mission_detail))
         .route("/v1/client/runtimes", get(client_v0::runtimes))
         .route("/v1/client/runtimes/{*id}", get(client_v0::runtime_detail))
+        .route("/v1/client/observers", get(client_v0::observers))
+        .route(
+            "/v1/client/observers/{*id}",
+            get(client_v0::observer_detail),
+        )
+        .route("/v1/client/subscriptions", get(client_v0::subscriptions))
+        .route(
+            "/v1/client/subscriptions/{*id}",
+            get(client_v0::subscription_detail),
+        )
         .route("/v1/client/terminals", get(client_v0::terminals))
         .route("/v1/client/operations", get(client_v0::operations))
         .route(
@@ -1103,6 +1113,27 @@ fn client_work_resources(
         });
     }
     let desired = store.desired_subjects()?;
+    let mut step_specs = BTreeMap::<String, BTreeMap<String, crate::model::StepSpec>>::new();
+    for run_id in work
+        .iter()
+        .filter(|item| item.agentless)
+        .map(|item| &item.run)
+    {
+        if step_specs.contains_key(run_id) {
+            continue;
+        }
+        let Some(run) = store.mission_run(run_id)? else {
+            continue;
+        };
+        let Some(mission) = store.mission_spec(
+            run.mission.trim_start_matches("mission/"),
+            Some(&run.revision),
+        )?
+        else {
+            continue;
+        };
+        step_specs.insert(run_id.clone(), mission.steps);
+    }
     work.into_iter()
         .map(|work| {
             let operational = store.work_annotation(&work)?;
@@ -1113,6 +1144,54 @@ fn client_work_resources(
             };
             let usage =
                 aggregate_usage_for_step(store, &desired, &work.subject, Some(snapshot_index))?;
+            let gate_kind = if work.agentless {
+                let spec = step_specs
+                    .get(&work.run)
+                    .and_then(|steps| steps.get(&work.step));
+                match spec {
+                    Some(spec) if spec.after_run.is_some() => Some("run"),
+                    Some(spec) if spec.gates.is_empty() => Some("watch"),
+                    Some(spec)
+                        if spec.gates.iter().all(|gate| {
+                            matches!(gate, crate::model::GateSpec::Mechanical { .. })
+                        }) =>
+                    {
+                        Some("command")
+                    }
+                    Some(spec)
+                        if spec
+                            .gates
+                            .iter()
+                            .all(|gate| matches!(gate, crate::model::GateSpec::Llm { .. })) =>
+                    {
+                        Some("llm")
+                    }
+                    Some(spec)
+                        if spec
+                            .gates
+                            .iter()
+                            .all(|gate| matches!(gate, crate::model::GateSpec::Human { .. })) =>
+                    {
+                        Some("human")
+                    }
+                    Some(spec)
+                        if spec.gates.iter().all(|gate| {
+                            !matches!(
+                                gate,
+                                crate::model::GateSpec::Mechanical { .. }
+                                    | crate::model::GateSpec::Llm { .. }
+                                    | crate::model::GateSpec::Human { .. }
+                            )
+                        }) =>
+                    {
+                        Some("predicate")
+                    }
+                    Some(_) => Some("mixed"),
+                    None => None,
+                }
+            } else {
+                None
+            };
             Ok(json!({
                 "id": work.subject,
                 "kind": "work",
@@ -1124,6 +1203,7 @@ fn client_work_resources(
                 "path": work.step,
                 "state": state,
                 "agentless": work.agentless,
+                "gate_kind": gate_kind,
                 "attempt": work.attempt,
                 "readiness_epoch": work.readiness_epoch,
                 "claimant": work.claimant,
@@ -1684,8 +1764,11 @@ fn attention_resource_id(subject: &str) -> String {
     }
 }
 
-fn client_attention_actions(kind: &str) -> Vec<&'static str> {
+fn client_attention_actions(kind: &str, review_mode: Option<&str>) -> Vec<&'static str> {
     match kind {
+        "human-gate" if review_mode == Some("feedback") => {
+            vec!["review.approve", "review.request-changes"]
+        }
         "human-gate" => vec!["review.approve", "review.reject"],
         "launch-approval" => vec!["launch.approve", "launch.cancel"],
         "revision-approval" => {
@@ -1771,7 +1854,7 @@ fn client_attention_resources(
             "state": "open",
             "requested_at": client_timestamp(item.requested_at_unix_ms),
             "targets": item.targets,
-            "actions": client_attention_actions(&item.kind),
+            "actions": client_attention_actions(&item.kind, item.review_mode.as_deref()),
             "operational": { "layer": "current", "actionable": true, "reasons": [] }
         });
         let object = resource
@@ -1779,6 +1862,9 @@ fn client_attention_resources(
             .expect("an attention resource is an object");
         if let Some(requester) = &item.requester_id {
             object.insert("requester_id".into(), Value::String(requester.clone()));
+        }
+        if let Some(mode) = &item.review_mode {
+            object.insert("review_mode".into(), Value::String(mode.clone()));
         }
         if matches!(item.kind.as_str(), "fault" | "agent-request")
             && attention_requester_retired(store, item, &mut retired_seats)?
@@ -1829,7 +1915,7 @@ fn client_attention_resources(
                     "state": if request.status == "pending" { "open" } else { "resolved" },
                     "requested_at": client_timestamp(request.requested_at_unix_ms),
                     "targets": request.targets,
-                    "actions": if current { client_attention_actions(kind) } else { Vec::<&str>::new() },
+                    "actions": if current { client_attention_actions(kind, None) } else { Vec::<&str>::new() },
                     "operational": { "layer": if current { "current" } else { "history" }, "actionable": current, "reasons": reasons }
             });
             insert_attention_target_states(
@@ -3411,6 +3497,12 @@ fn doctor_report(state: &AppState) -> Result<Json<DoctorReport>, ApiError> {
             message: error.to_string(),
         }),
     }
+    let (recording, message) = crate::recorder::health(&state.state_dir);
+    checks.push(DoctorCheck {
+        name: "command-recorder".into(),
+        status: if recording { "pass" } else { "warn" }.into(),
+        message,
+    });
     // Once a node pins a fleet anchor, membership decides admission. Report what waits for a
     // signature, what is fenced, and what was admitted before this node knew better.
     match state.store.fleet_anchor() {
@@ -6180,18 +6272,24 @@ async fn post_review(
     AxumPath(subject): AxumPath<String>,
     Json(request): Json<ReviewRequest>,
 ) -> Result<Json<ClaimRecord>, ApiError> {
-    if !matches!(request.decision.as_str(), "approved" | "rejected") {
+    if !matches!(
+        request.decision.as_str(),
+        "approved" | "rejected" | "changes-requested"
+    ) {
         return Err(ApiError::bad(St3Error::new(
             "invalid-review-decision",
-            "a review decision must be approved or rejected",
+            "a review decision must be approved, rejected, or changes-requested",
         )));
     }
-    if request.decision == "rejected"
-        && request.reason.as_deref().is_none_or(|reason| reason.trim().is_empty())
+    if matches!(request.decision.as_str(), "rejected" | "changes-requested")
+        && request
+            .reason
+            .as_deref()
+            .is_none_or(|reason| reason.trim().is_empty())
     {
         return Err(ApiError::bad(St3Error::new(
             "missing-review-reason",
-            "a rejected review needs a reason",
+            "a rejection or request for changes needs a reason",
         )));
     }
     let subject = if subject.starts_with("resource/")
@@ -6243,13 +6341,37 @@ async fn post_review(
     } else {
         None
     };
-    let verdict = if request.decision == "approved" {
-        "pass"
-    } else {
-        "fail"
+    let mode = review_request
+        .as_ref()
+        .and_then(|claim| claim.body.pointer("/fields/mode"))
+        .and_then(Value::as_str)
+        .unwrap_or("approve");
+    if mode == "feedback" && !subject.starts_with("step-run/") {
+        return Err(ApiError::bad(St3Error::new(
+            "feedback-gate-needs-step",
+            "a feedback review must belong to a step",
+        )));
+    }
+    if !match mode {
+        "feedback" => matches!(request.decision.as_str(), "approved" | "changes-requested"),
+        _ => matches!(request.decision.as_str(), "approved" | "rejected"),
+    } {
+        return Err(ApiError::bad(St3Error::new(
+            "review-decision-not-offered",
+            format!(
+                "`{}` is not offered by this {mode} review",
+                request.decision
+            ),
+        )));
+    }
+    let verdict = match request.decision.as_str() {
+        "approved" => "pass",
+        "changes-requested" => "feedback",
+        _ => "fail",
     };
     let mut fields = BTreeMap::from([
         ("verdict".into(), Value::String(verdict.into())),
+        ("decision".into(), Value::String(request.decision.clone())),
         (
             "reason".into(),
             request.reason.map(Value::String).unwrap_or(Value::Null),
@@ -6295,11 +6417,15 @@ async fn post_review(
                             .into_iter()
                             .rev()
                             .find(|claim| {
-                                claim.body.pointer("/fields/attempt").and_then(Value::as_u64)
+                                claim
+                                    .body
+                                    .pointer("/fields/attempt")
+                                    .and_then(Value::as_u64)
                                     == Some(u64::from(step.attempt))
                             })
                             .and_then(|claim| {
-                                claim.body
+                                claim
+                                    .body
                                     .pointer("/fields/claimant")
                                     .and_then(Value::as_str)
                                     .map(str::to_owned)
@@ -8533,8 +8659,18 @@ async fn signal_session(
     AxumPath(subject): AxumPath<String>,
     Json(request): Json<SessionSignalRequest>,
 ) -> Result<Json<SessionControlResponse>, ApiError> {
+    signal_session_as(state, subject, request, "requester").await
+}
+
+async fn signal_session_as(
+    state: AppState,
+    subject: String,
+    request: SessionSignalRequest,
+    actor: &str,
+) -> Result<Json<SessionControlResponse>, ApiError> {
     let signal = match request.signal.as_str() {
         "interrupt" => libc::SIGINT,
+        "terminate" => libc::SIGTERM,
         "hangup" => libc::SIGHUP,
         "user-1" => libc::SIGUSR1,
         "user-2" => libc::SIGUSR2,
@@ -8583,7 +8719,7 @@ async fn signal_session(
         .append_claim(&ClaimInput {
             subject: subject.clone(),
             kind: "runtime.action.requested".into(),
-            actor: Some("requester".into()),
+            actor: Some(actor.into()),
             fields: BTreeMap::from([
                 ("action".into(), Value::String("signal".into())),
                 ("operation".into(), Value::String(result_key.clone())),
@@ -13784,6 +13920,91 @@ version 2
         let messages = store.messages(Some(&claimant), false).unwrap();
         assert_eq!(messages.len(), 1);
         assert!(messages[0].content.contains("the evidence is incomplete"));
+
+        store
+            .set_mission_run_state(&run.id, "failed", "terminal", None)
+            .unwrap();
+        let feedback_run = store
+            .create_mission_run(&MissionRunRequest {
+                mission: "review-api".into(),
+                revision: None,
+                workspace: root.path().display().to_string(),
+                requester: Some("person/test".into()),
+                mode: Some("run".into()),
+                inputs: BTreeMap::new(),
+                idempotency_key: "review-api-feedback-run".into(),
+            })
+            .unwrap();
+        let feedback_step = &feedback_run.steps[0];
+        let feedback_claimant = feedback_step.assigned_to.clone().unwrap();
+        store
+            .set_step_state(&feedback_step.subject, "ready", None)
+            .unwrap();
+        for action in ["claim", "complete"] {
+            store
+                .work_action(
+                    &feedback_step.subject,
+                    action,
+                    &crate::model::WorkRequest {
+                        actor: Some(feedback_claimant.clone()),
+                        incarnation: Some("test-incarnation".into()),
+                        summary: Some("Candidate submitted".into()),
+                        reason: None,
+                        evidence: Vec::new(),
+                        idempotency_key: format!("feedback-api-{action}"),
+                    },
+                )
+                .unwrap();
+        }
+        let mut feedback_fields = request_fields(
+            feedback_step.subject.clone(),
+            feedback_step.definition_hash.clone(),
+            "gate-operation/review-api/feedback",
+        );
+        feedback_fields.insert("mode".into(), Value::String("feedback".into()));
+        feedback_fields.insert("decisions".into(), json!(["approved", "changes-requested"]));
+        let feedback_request = store
+            .append_claim(&ClaimInput {
+                subject: "gate-operation/review-api/feedback".into(),
+                kind: "gate.requested".into(),
+                actor: None,
+                fields: feedback_fields,
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some("feedback-api-request".into()),
+            })
+            .unwrap();
+        let (_, attention) = get_request(app.clone(), "/v1/attention?person=person%2Fnathan").await;
+        assert_eq!(attention[0]["review_mode"], "feedback");
+        assert!(
+            attention[0]["actions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|action| action["label"] == "request changes")
+        );
+        let feedback_path = format!("/v1/reviews/{}", feedback_step.subject);
+        let (status, invalid) = json_request(
+            app.clone(),
+            &feedback_path,
+            json!({
+                "decision": "rejected", "reason": "More detail", "actor": "person/nathan"
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{invalid}");
+        assert_eq!(invalid["code"], "review-decision-not-offered");
+        let (status, accepted) = json_request(
+            app.clone(),
+            &feedback_path,
+            json!({
+                "decision": "changes-requested", "reason": "Add a source.", "actor": "person/nathan"
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{accepted}");
+        assert_eq!(accepted["body"]["fields"]["verdict"], "feedback");
+        assert_eq!(accepted["body"]["fields"]["request"], feedback_request.id);
 
         let (_, empty) = get_request(app, "/v1/reviews?reviewer=person%2Fnathan").await;
         assert_eq!(empty, json!([]));
