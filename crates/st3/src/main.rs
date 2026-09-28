@@ -1440,6 +1440,8 @@ enum LaunchCommand {
 
 #[derive(Subcommand)]
 enum MissionViewCommand {
+    /// Show active runs, standing queues, unstarted missions, and agents by host.
+    Tree,
     /// List current missions; use --all for historical terminal missions.
     Ls {
         #[arg(long)]
@@ -3414,6 +3416,15 @@ async fn run_mission_view(
     json_output: bool,
 ) -> Result<()> {
     match command {
+        MissionViewCommand::Tree => {
+            let view: Value = client.get("/v1/client/missions-tree").await?;
+            if json_output {
+                print_value(&view, true)
+            } else {
+                print!("{}", render_missions_tree(&view));
+                Ok(())
+            }
+        }
         MissionViewCommand::Ls { all, cursor, limit } => {
             anyhow::ensure!(
                 limit > 0 && limit <= 200,
@@ -4053,11 +4064,7 @@ async fn run_pty(
                 "terminals stream",
             )?;
             let mut stream = generated_client(endpoint, Some(&person))?
-                .terminal_stream(
-                    &args.subject,
-                    args.incarnation.as_deref(),
-                    &args.capability,
-                )
+                .terminal_stream(&args.subject, args.incarnation.as_deref(), &args.capability)
                 .await?;
             let mut shown = 0_u64;
             while args.count.is_none_or(|count| shown < count) {
@@ -6460,6 +6467,152 @@ async fn run_agent_queue(
     let queue = client.agent_queue(&agent).await?;
     print!("{}", render_agent_queue(&queue.value));
     Ok(())
+}
+
+fn render_missions_tree(response: &Value) -> String {
+    use std::fmt::Write as _;
+    let value = &response["value"];
+    let mut output = String::from("RUNNING MISSIONS\n");
+    let runs = value["runs"].as_array();
+    if runs.is_none_or(Vec::is_empty) {
+        output.push_str("  none\n");
+    }
+    for run in runs.into_iter().flatten() {
+        let steps = run["steps"].as_array();
+        let done = steps
+            .into_iter()
+            .flatten()
+            .filter(|step| step["state"] == "completed")
+            .count();
+        let active_step = steps
+            .into_iter()
+            .flatten()
+            .find(|step| step["state"] == "claimed")
+            .or_else(|| {
+                steps
+                    .into_iter()
+                    .flatten()
+                    .find(|step| step["state"] == "ready")
+            })
+            .and_then(|step| step["id"].as_str());
+        let active = steps
+            .into_iter()
+            .flatten()
+            .find(|step| step["id"].as_str() == active_step)
+            .and_then(|step| step["name"].as_str())
+            .unwrap_or("waiting");
+        let pending = steps
+            .into_iter()
+            .flatten()
+            .filter(|step| step["state"] != "completed" && step["id"].as_str() != active_step)
+            .filter_map(|step| step["name"].as_str())
+            .collect::<Vec<_>>();
+        let mission = run["mission"].as_str().unwrap_or("unknown");
+        let _ = writeln!(
+            output,
+            "  {mission}: {active} → {}  ({done} done)",
+            if pending.is_empty() {
+                "done".to_owned()
+            } else {
+                pending.join(" → ")
+            }
+        );
+    }
+    output.push_str("STANDING QUEUES\n");
+    let queues = value["standing_queues"].as_array();
+    if queues.is_none_or(Vec::is_empty) {
+        output.push_str("  none\n");
+    }
+    for queue in queues.into_iter().flatten() {
+        let id = queue["agent_id"].as_str().unwrap_or("unknown");
+        let current = queue["current_work_ids"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>();
+        let next = queue["next_work_id"].as_str().unwrap_or("none");
+        let waiting = queue["runs"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|run| run["state"] == "waiting")
+            .filter_map(|run| run["mission_run_id"].as_str())
+            .collect::<Vec<_>>();
+        let _ = writeln!(
+            output,
+            "  {id}: current {} · next {next} · waiting {}",
+            if current.is_empty() {
+                "none".to_owned()
+            } else {
+                current.join(", ")
+            },
+            if waiting.is_empty() {
+                "none".to_owned()
+            } else {
+                waiting.join(", ")
+            }
+        );
+    }
+    output.push_str("UNSTARTED MISSIONS\n");
+    let unstarted = value["unstarted_missions"].as_array();
+    if unstarted.is_none_or(Vec::is_empty) {
+        output.push_str("  none\n");
+    }
+    for mission in unstarted.into_iter().flatten() {
+        let suffix = if mission["state"] == "draft" {
+            " (draft)"
+        } else {
+            ""
+        };
+        let _ = writeln!(
+            output,
+            "  {}{suffix}",
+            mission["title"].as_str().unwrap_or("unknown")
+        );
+    }
+    output.push_str("AGENTS BY HOST\n");
+    let mut grouped = BTreeMap::<String, BTreeMap<String, Vec<&Value>>>::new();
+    for agent in value["agents"].as_array().into_iter().flatten() {
+        let host = agent["host_id"].as_str().unwrap_or("unknown").to_owned();
+        let kind = agent["seat_kind"].as_str().unwrap_or("standing").to_owned();
+        grouped
+            .entry(host)
+            .or_default()
+            .entry(kind)
+            .or_default()
+            .push(agent);
+    }
+    if grouped.is_empty() {
+        output.push_str("  none\n");
+    }
+    for (host, kinds) in grouped {
+        let _ = writeln!(output, "  {host}");
+        for kind in ["standing", "mission"] {
+            let Some(agents) = kinds.get(kind) else {
+                continue;
+            };
+            let _ = writeln!(output, "    {kind}");
+            for agent in agents {
+                let state = if agent["harness_state"] == "working" {
+                    "working"
+                } else if agent["state"] == "running" {
+                    "idle"
+                } else {
+                    "waiting"
+                };
+                let _ = writeln!(
+                    output,
+                    "      {}  {} / {} / {}  {state}",
+                    agent["name"].as_str().unwrap_or("unknown"),
+                    agent["driver"].as_str().unwrap_or("unknown"),
+                    agent["model"].as_str().unwrap_or("default"),
+                    agent["effort"].as_str().unwrap_or("default")
+                );
+            }
+        }
+    }
+    output
 }
 
 fn render_agent_queue(queue: &st3_client::AgentQueue) -> String {
@@ -10667,6 +10820,26 @@ mod tests {
 
         status.peers[1].authority_digest = Some("mine".into());
         assert_eq!(leave_confirmation(&status, None).unwrap(), Some("c".into()));
+    }
+
+    #[test]
+    fn missions_tree_fixture_renders_all_sections() {
+        let fixture: Value =
+            serde_json::from_str(include_str!("../tests/fixtures/missions-tree.json"))
+                .expect("valid missions tree fixture");
+        assert_eq!(
+            render_missions_tree(&fixture),
+            include_str!("../tests/fixtures/missions-tree.txt")
+        );
+        let cli = Cli::try_parse_from(["st", "missions", "tree", "--json"])
+            .expect("missions tree --json parses");
+        assert!(cli.json);
+        assert!(matches!(
+            cli.command,
+            Command::Missions {
+                command: MissionViewCommand::Tree
+            }
+        ));
     }
 
     #[test]

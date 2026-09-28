@@ -975,6 +975,131 @@ pub(super) async fn missions(
     client_page(&state, &snapshot, "missions", items, &query).map(Json)
 }
 
+/// A single read of the projections used by mission show, agent tree, and seat queues.
+pub(super) async fn missions_tree(
+    State(state): State<AppState>,
+    Extension(snapshot): Extension<ClientSnapshot>,
+    Extension(session): Extension<ClientSession>,
+) -> Result<Json<Value>, ApiError> {
+    require_scope(&session, "read.projections")?;
+    let store = state.store.clone();
+    let at = snapshot.created_at.clone();
+    let index = snapshot.store_index;
+    let view = super::blocking_store(move || missions_tree_value(&store, &at, index)).await?;
+    Ok(Json(json!({ "snapshot": snapshot, "value": view })))
+}
+
+fn desired_child_arg(value: &Value, name: &str) -> Option<String> {
+    value
+        .get("children")?
+        .as_array()?
+        .iter()
+        .find(|child| child.get("name").and_then(Value::as_str) == Some(name))?
+        .get("arguments")?
+        .as_array()?
+        .first()?
+        .as_str()
+        .map(str::to_owned)
+}
+
+fn missions_tree_value(store: &Store, at: &str, index: u64) -> anyhow::Result<Value> {
+    let mut runs = store
+        .mission_run_headers()?
+        .into_iter()
+        .filter(|run| matches!(run.status.as_str(), "running" | "standing" | "blocked"))
+        .collect::<Vec<_>>();
+    runs.sort_by(|a, b| {
+        a.mission
+            .cmp(&b.mission)
+            .then_with(|| a.subject.cmp(&b.subject))
+    });
+    anyhow::ensure!(runs.len() <= 200, "missions tree exceeds 200 active runs");
+    let mut run_values = Vec::with_capacity(runs.len());
+    for run in runs {
+        let full = store
+            .mission_run(&run.subject)?
+            .ok_or_else(|| anyhow::anyhow!("run disappeared: {}", run.subject))?;
+        anyhow::ensure!(
+            full.steps.len() <= 200,
+            "missions tree run exceeds 200 steps: {}",
+            full.subject
+        );
+        run_values.push(json!({
+            "id": full.subject, "mission": full.mission, "state": full.status,
+            "steps": full.steps.iter().map(|step| json!({
+                "id": step.subject, "name": step.title.as_deref().unwrap_or(&step.step),
+                "path": step.step, "state": step.status
+            })).collect::<Vec<_>>()
+        }));
+    }
+    let mut unstarted = mission_resources(store, index, false, None)?
+        .into_iter()
+        .filter(|mission| {
+            matches!(mission["state"].as_str(), Some("ready" | "draft"))
+                && mission["runs"].as_array().is_some_and(Vec::is_empty)
+        })
+        .map(|mission| json!({ "id": mission["id"], "title": mission["title"], "state": mission["state"] }))
+        .collect::<Vec<_>>();
+    unstarted.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
+    anyhow::ensure!(
+        unstarted.len() <= 200,
+        "missions tree exceeds 200 unstarted missions"
+    );
+
+    let desired = store
+        .desired_subjects()?
+        .into_iter()
+        .map(|seat| (seat.subject.clone(), seat))
+        .collect::<BTreeMap<_, _>>();
+    let mut agents = client_agent_resources(store, false, at, index)?;
+    anyhow::ensure!(agents.len() <= 200, "missions tree exceeds 200 agents");
+    for agent in &mut agents {
+        let Some(id) = agent["id"].as_str() else {
+            continue;
+        };
+        let Some(seat) = desired.get(id) else {
+            continue;
+        };
+        let host = seat
+            .member
+            .as_ref()
+            .map(|member| member.host.clone())
+            .or_else(|| desired_child_arg(&seat.desired, "host"));
+        agent["host_id"] = json!(host.as_deref().map(client_host_id));
+        let harness = seat
+            .desired
+            .get("children")
+            .and_then(Value::as_array)
+            .and_then(|children| children.iter().find(|child| child["name"] == "harness"));
+        agent["model"] = json!(harness.and_then(|harness| desired_child_arg(harness, "model")));
+        agent["effort"] = json!(harness.and_then(|harness| desired_child_arg(harness, "effort")));
+        agent["seat_kind"] = json!(if agent["owner_run_id"].is_string() {
+            "mission"
+        } else {
+            "standing"
+        });
+    }
+    let mut queues = Vec::new();
+    let mut queued_runs = 0;
+    for agent in &agents {
+        if agent["seat_kind"] != "standing" {
+            continue;
+        }
+        let Some(id) = agent["id"].as_str() else {
+            continue;
+        };
+        let queue = store.seat_queue(id)?;
+        queued_runs += queue.runs.len();
+        anyhow::ensure!(
+            queued_runs <= 1000,
+            "missions tree exceeds 1000 queued runs"
+        );
+        queues.push(agent_queue_value(&queue));
+    }
+    Ok(json!({ "runs": run_values, "standing_queues": queues,
+        "unstarted_missions": unstarted, "agents": agents }))
+}
+
 pub(super) async fn mission_detail(
     State(state): State<AppState>,
     Extension(snapshot): Extension<ClientSnapshot>,
@@ -2841,8 +2966,12 @@ async fn remote_terminal_stream_socket(
         }
         if !send_terminal_stream_value(&mut socket, &terminal_stream_envelope(&state, screen)).await
         {
-            close_terminal_stream(&mut socket, 1009, "terminal screen exceeds the client limit")
-                .await;
+            close_terminal_stream(
+                &mut socket,
+                1009,
+                "terminal screen exceeds the client limit",
+            )
+            .await;
             return;
         }
         sent = Some(revision);
@@ -3441,7 +3570,9 @@ async fn terminal_stream_socket(
                 }
             };
         }
-        let Some(screen) = screen.take() else { continue };
+        let Some(screen) = screen.take() else {
+            continue;
+        };
         if sent.as_deref() == Some(screen.revision()) {
             continue;
         }
@@ -3456,8 +3587,12 @@ async fn terminal_stream_socket(
         let value = screen.value(&terminal_id, &live.incarnation_id, next_sequence);
         if !send_terminal_stream_value(&mut socket, &terminal_stream_envelope(&state, value)).await
         {
-            close_terminal_stream(&mut socket, 1009, "terminal screen exceeds the client limit")
-                .await;
+            close_terminal_stream(
+                &mut socket,
+                1009,
+                "terminal screen exceeds the client limit",
+            )
+            .await;
             return;
         }
         sent = Some(screen.revision().to_owned());
@@ -5090,6 +5225,16 @@ mission "example/zero-run" state="ready" {
             .expect("the zero-run definition is listed");
         assert_eq!(mission["state"], "ready");
         assert_eq!(mission["runs"], json!([]));
+        let tree = missions_tree_value(&state.store, "now", state.store.index().unwrap()).unwrap();
+        assert!(
+            tree["unstarted_missions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| {
+                    item["id"] == "mission/example/zero-run" && item["state"] == "ready"
+                })
+        );
         assert_eq!(mission["operational"]["actionable"], true);
         assert!(mission["visualization"].is_null());
         assert_eq!(
