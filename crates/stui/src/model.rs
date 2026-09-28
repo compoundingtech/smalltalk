@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use st3_client::{
     Agent, Attention, Client, ClientError, Device, Envelope, ErrorCode, EventPage, EventType,
     Fence, Launch, Machine, Message, Mission, Page, Resource, Runtime, Session, Snapshot,
-    TimelineBody, TimelineEntry, TimelineRole, Work,
+    SyncNotice, TimelineBody, TimelineEntry, TimelineRole, Work,
 };
 
 /// Each collection is deliberately capped. The UI shows a truncation marker when a cap is hit.
@@ -17,6 +17,9 @@ pub struct Collection {
     pub items: Vec<Resource>,
     pub snapshot: Option<Snapshot>,
     pub truncated: bool,
+    /// Present while the host was catching up with a peer when it served this collection.
+    #[serde(default)]
+    pub sync: Option<SyncNotice>,
 }
 
 impl Collection {
@@ -211,6 +214,17 @@ impl Model {
     }
 
     /// Native harnesses may start outside st3, so no graph event announces them.
+    /// While the host catches up, its notice changes with every exchange, but few projection
+    /// events name a collection on screen. Re-read Now for a current notice, and reload every
+    /// collection once the host has caught up so none keeps showing early history.
+    pub async fn refresh_sync_notice(&mut self, client: &Client) -> Result<()> {
+        self.now = read_pages(client, Kind::Now).await?;
+        if self.sync_notice().is_none() {
+            self.reload(client).await?;
+        }
+        Ok(())
+    }
+
     pub async fn refresh_sessions(&mut self, client: &Client) -> Result<bool> {
         let native = read_pages(client, Kind::NativeSessions).await?;
         let mut next = self.sessions.clone();
@@ -359,8 +373,31 @@ impl Model {
             items: value.items,
             snapshot: Some(snapshot),
             truncated: value.page.has_more,
+            sync: value.sync,
         };
         Ok(())
+    }
+
+    /// The sync notice from the most recently served collection. An older collection that has
+    /// not reloaded since the host caught up must not keep the notice alive.
+    pub fn sync_notice(&self) -> Option<&SyncNotice> {
+        // Now comes last so it wins a tie: it is the collection re-read while syncing.
+        [
+            &self.messages,
+            &self.launches,
+            &self.missions,
+            &self.work,
+            &self.agents,
+            &self.sessions,
+            &self.runtimes,
+            &self.machines,
+            &self.devices,
+            &self.now,
+        ]
+        .into_iter()
+        .filter_map(|collection| Some((collection.snapshot.as_ref()?.store_index, collection)))
+        .max_by_key(|(store_index, _)| *store_index)
+        .and_then(|(_, collection)| collection.sync.as_ref())
     }
 
     pub fn attention(&self) -> impl Iterator<Item = &Attention> {
@@ -625,6 +662,7 @@ async fn read_pages_once_inner(
             }
         };
         result.snapshot = Some(snapshot);
+        result.sync = value.sync;
         result.items.extend(value.items);
         if !value.page.has_more {
             return Ok(result);
@@ -1072,6 +1110,7 @@ mod tests {
                 created_at: "2026-09-20T11:00:00Z".into(),
             }),
             truncated: false,
+            sync: None,
         };
         let fence = collection.fence("attention/one").unwrap();
         assert_eq!(fence.snapshot_id, "snapshot/one");

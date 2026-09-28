@@ -2046,6 +2046,7 @@ fn safe_event_projection(state: &AppState, record: &EventRecord) -> (String, Vec
     }
     let mut resource_ids = Vec::new();
     if record.subject.starts_with("message/")
+        || record.subject.starts_with("attention/")
         || record.subject.starts_with("agent/")
         || record.subject.starts_with("step-run/")
         || record.subject.starts_with("mission/")
@@ -4684,6 +4685,108 @@ mod tests {
             edge["transports"][0]["last_success_at"],
             client_timestamp(peer_success)
         );
+    }
+
+    #[test]
+    fn attention_events_name_the_attention_they_change() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state(root.path());
+        let before = state.store.index().unwrap();
+        state
+            .store
+            .request_attention(
+                "attention/sync-demo",
+                &crate::model::AttentionRequest {
+                    reviewer: "person/nathan".into(),
+                    title: "Review the invented plan".into(),
+                    reason: "A replicated change must refresh Now.".into(),
+                    severity: "warning".into(),
+                    targets: Vec::new(),
+                    actor: "agent/fleet/example/builder".into(),
+                    idempotency_key: "attention-event".into(),
+                },
+            )
+            .unwrap();
+        let records = state.store.events_after_bounded(before, 10).unwrap();
+        let record = records
+            .iter()
+            .find(|record| record.subject == "attention/sync-demo")
+            .unwrap();
+        let (_, resource_ids, _) = safe_event_projection(&state, record);
+        assert_eq!(resource_ids, ["attention/sync-demo"]);
+    }
+
+    #[test]
+    fn pages_say_when_the_host_is_catching_up_with_a_peer() {
+        const FLEET: &str = "018f6f0d-4a5d-7b8c-9d0e-123456789abc";
+        let root = tempfile::tempdir().unwrap();
+        let mut state = test_state_named(root.path(), "hub");
+        state.configured_peers = vec!["edge".into()];
+        state.store.bind_fleet(FLEET).unwrap();
+        let edge = Store::open_memory("edge").unwrap();
+        edge.bind_fleet(FLEET).unwrap();
+        for index in 0..1_200 {
+            edge.append_client_claim(&crate::model::ClaimInput {
+                subject: format!("resource/sync-{index}"),
+                kind: "resource.observed".into(),
+                actor: None,
+                fields: BTreeMap::from([(
+                    "kind".into(),
+                    Value::String("custom.test.replication".into()),
+                )]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+        }
+        let page = |state: &AppState| {
+            super::super::client_page(
+                state,
+                &new_client_snapshot(state),
+                "now",
+                Vec::new(),
+                &super::super::ClientListQuery::default(),
+            )
+            .unwrap()
+        };
+        assert!(page(&state).sync.is_none(), "nothing is measured yet");
+        let pull = |state: &AppState| {
+            let summary = state.store.export_replication_summary(FLEET).unwrap();
+            let exchange = edge
+                .export_replication_exchange(FLEET, &summary.inventory)
+                .unwrap();
+            state
+                .store
+                .receive_replication_exchange("edge", FLEET, &exchange)
+                .unwrap();
+            exchange.envelopes.len() as u64
+        };
+
+        let received = pull(&state);
+        let sync = page(&state).sync.expect("the hub is catching up");
+        assert_eq!(sync.state, "catching-up");
+        let [peer] = sync.peers.as_slice() else {
+            panic!("one peer is ahead: {:?}", sync.peers);
+        };
+        assert_eq!(peer.host_id, "host/edge");
+        let total = edge.replication_inventory().unwrap().envelopes.len() as u64;
+        assert_eq!(peer.peer_only_envelopes, total - received);
+        assert_eq!(
+            peer.last_exchange_at,
+            state
+                .store
+                .replication_peer_last_success("edge")
+                .unwrap()
+                .map(client_timestamp)
+        );
+        let json = serde_json::to_value(page(&state)).unwrap();
+        assert_eq!(json["sync"]["peers"][0]["host_id"], "host/edge");
+
+        // Once the rest fits in one exchange, pages stop carrying the notice.
+        pull(&state);
+        let json = serde_json::to_value(page(&state)).unwrap();
+        assert!(json.get("sync").is_none(), "{json}");
     }
 
     #[test]
