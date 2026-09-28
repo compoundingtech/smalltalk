@@ -3,8 +3,6 @@ name: Smalltalk tag release
 on:
   push:
     tags: ['**']
-  # Both paths exercise the complete build/package/verification pipeline without publishing.
-  workflow_dispatch:
   pull_request:
     paths:
       - '.github/workflows/release-smalltalk.yml'
@@ -22,20 +20,11 @@ concurrency:
 
 jobs:
   build:
-    if: github.event_name != 'push' || github.event.deleted == false
-    name: release-build (${{ matrix.target }})
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - runner: ubuntu-22.04
-            target: x86_64-unknown-linux-gnu
-          - runner: macos-15
-            target: aarch64-apple-darwin
-    runs-on: ${{ matrix.runner }}
+    if: ${{ (github.event_name == 'push' && github.event.deleted == false) || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) }}
+    name: release-build (x86_64-unknown-linux-gnu)
+    runs-on: ubuntu-22.04
     timeout-minutes: 90
     env:
-      MACOSX_DEPLOYMENT_TARGET: '15.0'
       RELEASE_TAG: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
     steps:
       - uses: actions/checkout@v4
@@ -48,10 +37,10 @@ jobs:
       - name: Test installer
         run: scripts/install-release-test
       - name: Build, package, and test extracted tools
-        run: scripts/release-smalltalk '${{ matrix.target }}' dist
+        run: scripts/release-smalltalk x86_64-unknown-linux-gnu dist
       - uses: actions/upload-artifact@v4
         with:
-          name: release-${{ matrix.target }}
+          name: release-x86_64-unknown-linux-gnu
           path: dist/*
           if-no-files-found: error
 
@@ -68,7 +57,7 @@ jobs:
           pattern: release-*
           merge-multiple: true
           path: dist
-      - name: Verify both targets and record exact sources
+      - name: Verify the Linux target and record exact sources
         env:
           SOURCE_SHA: ${{ github.sha }}
         run: |

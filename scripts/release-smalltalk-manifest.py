@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Validate both release archives and emit a source/target manifest (run in dist)."""
+"""Validate release archives and emit a source/target manifest (run in dist)."""
 import json
 import pathlib
 import sys
 import tarfile
 
 source = sys.argv[1]
-targets = ('x86_64-unknown-linux-gnu', 'aarch64-apple-darwin')
+targets = ('x86_64-unknown-linux-gnu',)
 records = []
 for target in targets:
     package = f'smalltalk-{target}'
@@ -23,4 +23,4 @@ for target in targets:
 assert len({record['pty_revision'] for record in records}) == 1, 'PTY pins differ'
 assert len({record['tag'] for record in records}) == 1, 'tags differ'
 pathlib.Path('RELEASE.json').write_text(json.dumps({'source': source, 'builds': records}, indent=2) + '\n')
-print(f'Validated both release targets at {source}')
+print(f'Validated release targets at {source}')
