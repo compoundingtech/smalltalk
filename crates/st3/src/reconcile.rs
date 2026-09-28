@@ -31,9 +31,10 @@ use crate::store::Store;
 
 const HARNESS_READINESS_DEADLINE_MS: u128 = 60_000;
 const WORK_WAKE_RETRY_MS: u128 = 15_000;
-// A mechanical gate may run for minutes. Polling it every 100 ms reruns the entire host
-// reconciliation pass (including PTY snapshots and render checks) while it is still running.
-const GATE_POLL_INTERVAL: Duration = Duration::from_secs(2);
+// A mechanical gate may run for minutes. Each poll reruns the entire host reconciliation
+// pass, including PTY snapshots. Ten seconds bounds result recognition without keeping a
+// busy host in near-continuous reconciliation while gates are still running.
+const GATE_POLL_INTERVAL: Duration = Duration::from_secs(10);
 const WORK_WAKE_MAX_ATTEMPTS: u32 = 3;
 // A new harness can spend longer than the retry sequence reading its boot
 // contract before it claims work. Keep the quick delivery retries, but do not
@@ -10435,7 +10436,7 @@ exec "orchid" {{ command "orchid-tool"; workspace "{}"; }}"#,
     }
 
     #[tokio::test]
-    async fn active_gates_share_a_bounded_reconcile_poll() {
+    async fn active_gates_share_a_slow_bounded_reconcile_poll() {
         let notify = Arc::new(Notify::new());
         let reconciler = Reconciler::new(
             Arc::new(Store::open_memory("node").unwrap()),
@@ -10444,16 +10445,16 @@ exec "orchid" {{ command "orchid-tool"; workspace "{}"; }}"#,
             notify.clone(),
         );
 
-        // Several pending mechanical gates must not restart a full host pass every 100 ms.
+        // Several pending gates must not restart a full host pass every two seconds.
         for _ in 0..10 {
             reconciler.arm_gate_poll();
         }
         assert!(
-            tokio::time::timeout(Duration::from_millis(500), notify.notified())
+            tokio::time::timeout(Duration::from_secs(4), notify.notified())
                 .await
                 .is_err()
         );
-        tokio::time::timeout(Duration::from_secs(3), notify.notified())
+        tokio::time::timeout(Duration::from_secs(8), notify.notified())
             .await
             .expect("the gate poll should eventually wake reconciliation");
         assert!(
