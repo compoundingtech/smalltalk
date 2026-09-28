@@ -853,7 +853,7 @@ fn finish_predecessor(
     if archive_entry.is_none()
         && let Some((file, _)) = inbox_entry.as_ref()
     {
-        test_predecessor_archive_checkpoint()?;
+        test_predecessor_archive_checkpoint(inbox)?;
         archive_validated_file(file, inbox, archive, &predecessor.filename)?;
     } else if let (Some((inbox_file, _)), Some((archive_file, _))) =
         (inbox_entry.as_ref(), archive_entry.as_ref())
@@ -864,13 +864,26 @@ fn finish_predecessor(
 }
 
 #[cfg(debug_assertions)]
-fn test_predecessor_archive_checkpoint() -> anyhow::Result<()> {
+fn test_predecessor_archive_checkpoint(inbox: &Path) -> anyhow::Result<()> {
     let (Ok(ready), Ok(release)) = (
         std::env::var("ST2_TEST_EVENT_ARCHIVE_READY"),
         std::env::var("ST2_TEST_EVENT_ARCHIVE_RELEASE"),
     ) else {
         return Ok(());
     };
+    // This process-wide test hook belongs to one temporary catalog. Parallel
+    // event tests use other catalogs and must not signal or wait on its gate.
+    let Some(catalog) = Path::new(&ready).parent() else {
+        return Ok(());
+    };
+    // Event ingress uses an fd-relative capability path such as /proc/self/fd/9.
+    // Resolve it for this test-only catalog check.
+    let Ok(inbox_path) = fs::canonicalize(inbox) else {
+        return Ok(());
+    };
+    if !inbox_path.starts_with(catalog) || Path::new(&release).parent() != Some(catalog) {
+        return Ok(());
+    }
     fs::write(&ready, b"validated")?;
     while !Path::new(&release).exists() {
         std::thread::yield_now();
@@ -879,7 +892,7 @@ fn test_predecessor_archive_checkpoint() -> anyhow::Result<()> {
 }
 
 #[cfg(not(debug_assertions))]
-fn test_predecessor_archive_checkpoint() -> anyhow::Result<()> {
+fn test_predecessor_archive_checkpoint(_inbox: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
