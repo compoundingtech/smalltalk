@@ -1,5 +1,6 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
+use std::net::SocketAddr;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -15,12 +16,17 @@ use axum::routing::post;
 use hmac::{Hmac, Mac as _};
 use notify::Watcher as _;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use sha2::{Digest as _, Sha256};
 use tokio::net::TcpListener;
 use tokio::sync::watch;
 
 use crate::client::Client;
 use crate::config::{Config, PeerConfig};
+use crate::fleet::transport::{
+    Fabric, LocalTransports, Route, bindable_tailnet_addresses, default_fabric_protocol,
+    local_addresses, resolve_tool, routes_from_endpoints, tailscale_addresses,
+};
 use crate::fleet::{Acceptance, FleetView, MemberKey, Refusal, Sender, verify_signature};
 use crate::model::{
     ApiResponse, ReplicaEnvelopeId, ReplicationExchange, ReplicationExportRequest,
@@ -483,12 +489,17 @@ struct PeerState {
 #[derive(Clone)]
 struct FleetContext {
     view: Arc<std::sync::RwLock<FleetView>>,
+    /// Bumped whenever the view changes, so the dial set follows membership.
+    view_changed: watch::Sender<u64>,
     config_peers: BTreeSet<String>,
     /// True on a node without `fleet.toml`, or with `legacy_peers = true`.
     legacy: bool,
     own_key: Option<String>,
     /// Keys this node trusts before membership arrives: its pinned anchor and its sponsor.
     bootstrap_keys: BTreeSet<String>,
+    /// Which transports this machine can dial with right now.
+    transports: Arc<std::sync::RwLock<LocalTransports>>,
+    fabric: Option<Fabric>,
     /// Set once a member refused this node with a signed refusal naming its own key.
     removed: Arc<std::sync::atomic::AtomicBool>,
     state_dir: Option<PathBuf>,
@@ -500,10 +511,13 @@ impl FleetContext {
     fn legacy(config_peers: BTreeSet<String>) -> Self {
         Self {
             view: Arc::default(),
+            view_changed: watch::channel(0).0,
             config_peers,
             legacy: true,
             own_key: None,
             bootstrap_keys: BTreeSet::new(),
+            transports: Arc::default(),
+            fabric: None,
             removed: Arc::default(),
             state_dir: None,
         }
@@ -654,6 +668,27 @@ impl PeerBackend {
         }
     }
 
+    async fn publish_endpoints(&self, mode: &str, endpoints: &[Value]) -> Result<()> {
+        match self {
+            Self::Main(client) => {
+                let _: Value = client
+                    .post(
+                        "/v1/internal/fleet/endpoints",
+                        &crate::api::FleetEndpointsRequest {
+                            mode: mode.into(),
+                            endpoints: endpoints.to_vec(),
+                        },
+                    )
+                    .await?;
+                Ok(())
+            }
+            #[cfg(test)]
+            Self::Local(store) => store
+                .publish_fleet_endpoints(mode, endpoints, "test")
+                .map(|_| ()),
+        }
+    }
+
     async fn fleet_view(&self) -> Result<FleetView> {
         match self {
             Self::Main(client) => client.get("/v1/internal/fleet/membership").await,
@@ -703,8 +738,31 @@ pub async fn run_worker(config: Config) -> Result<()> {
         None => None,
     };
     let auth = FleetAuth::load(fleet_id, secret_file)?.with_member_key(member_key.clone());
+    let wants = |transport: &str| {
+        config
+            .fleet
+            .as_ref()
+            .is_some_and(|file| file.transports.iter().any(|name| name == transport))
+    };
+    let tailscale = config
+        .fleet
+        .as_ref()
+        .filter(|_| wants("tailscale"))
+        .and_then(|file| resolve_tool(file.tailscale.as_deref(), "tailscale"));
+    let fabric = config
+        .fleet
+        .as_ref()
+        .filter(|_| wants("fabric"))
+        .and_then(|file| resolve_tool(file.fabric.as_deref(), "fabric"))
+        .map(Fabric::new);
     let fleet = FleetContext {
         view: Arc::default(),
+        view_changed: watch::channel(0).0,
+        transports: Arc::new(std::sync::RwLock::new(LocalTransports {
+            tailscale: false,
+            fabric: fabric.is_some(),
+        })),
+        fabric: fabric.clone(),
         config_peers: config.peers.iter().map(|peer| peer.name.clone()).collect(),
         legacy: config.fleet.as_ref().is_none_or(|file| file.legacy_peers),
         own_key: member_key.as_ref().map(|key| key.public().to_owned()),
@@ -751,8 +809,10 @@ pub async fn run_worker(config: Config) -> Result<()> {
         main_socket: config.socket.clone(),
         outbound_notify: notify.clone(),
     };
+    let fleet_transports = fleet.transports.clone();
+    let notify_for_transports = notify.clone();
     start_outbound(
-        backend,
+        backend.clone(),
         config.node.clone(),
         config.peers,
         auth,
@@ -760,23 +820,237 @@ pub async fn run_worker(config: Config) -> Result<()> {
         config.socket,
         notify,
     );
+    let endpoints = Endpoints::default();
+    let app = peer_router(state);
+    let listening = config
+        .fleet
+        .as_ref()
+        .is_none_or(|file| file.mode == crate::config::FleetMode::Listening);
+    let listener = match config.peer_listen.as_deref().filter(|_| listening) {
+        Some(address) => Some(
+            TcpListener::bind(address)
+                .await
+                .with_context(|| format!("bind the replication listener at {address}"))?,
+        ),
+        None => None,
+    };
+    let loopback = listener
+        .as_ref()
+        .and_then(|listener| listener.local_addr().ok());
+    if let Some(file) = &config.fleet {
+        if let (Some(address), true) = (loopback, file.advertise_loopback) {
+            endpoints.set_loopback(Some(address));
+        }
+        if let Some(tailscale) = tailscale {
+            tokio::spawn(keep_tailnet_current(
+                tailscale,
+                loopback.map(|address| (address.port(), app.clone())),
+                endpoints.clone(),
+                fleet_transports,
+                notify_for_transports,
+            ));
+        }
+        if let (Some(fabric), Some(address)) = (fabric, loopback) {
+            let protocol = file
+                .fabric_protocol
+                .clone()
+                .unwrap_or_else(|| default_fabric_protocol(&file.fleet_id));
+            tokio::spawn(keep_fabric_exposed(
+                fabric,
+                protocol,
+                address,
+                endpoints.clone(),
+            ));
+        }
+        tokio::spawn(keep_endpoints_published(
+            backend,
+            file.mode.as_str(),
+            endpoints.clone(),
+        ));
+    }
     // A dial-out member accepts no connections.
-    let Some(address) = config.peer_listen.as_deref() else {
+    let Some(listener) = listener else {
         std::future::pending::<()>().await;
         return Ok(());
     };
-    let listener = TcpListener::bind(address)
-        .await
-        .with_context(|| format!("bind the replication listener at {address}"))?;
-    let app = peer_router(state);
     axum::serve(listener, app).await?;
     Ok(())
 }
 
+/// The endpoints this member announces, as its transports come up.
+#[derive(Clone, Default)]
+struct Endpoints {
+    set: Arc<std::sync::Mutex<EndpointSet>>,
+    changed: Arc<tokio::sync::Notify>,
+}
+
+#[derive(Clone, Default, PartialEq)]
+struct EndpointSet {
+    tailscale: Vec<SocketAddr>,
+    fabric: Option<(String, String)>,
+    loopback: Option<SocketAddr>,
+}
+
+impl Endpoints {
+    fn update(&self, change: impl FnOnce(&mut EndpointSet)) {
+        let mut set = self.set.lock().expect("endpoint lock poisoned");
+        let before = set.clone();
+        change(&mut set);
+        if *set != before {
+            self.changed.notify_one();
+        }
+    }
+
+    fn set_loopback(&self, address: Option<SocketAddr>) {
+        self.update(|set| set.loopback = address);
+    }
+
+    fn list(&self) -> Vec<Value> {
+        let set = self.set.lock().expect("endpoint lock poisoned");
+        let mut endpoints = set
+            .tailscale
+            .iter()
+            .map(|address| {
+                serde_json::json!({"transport": "tailscale", "address": address.to_string()})
+            })
+            .collect::<Vec<_>>();
+        if let Some((node, protocol)) = &set.fabric {
+            endpoints.push(
+                serde_json::json!({"transport": "fabric", "node": node, "protocol": protocol}),
+            );
+        }
+        if let Some(address) = set.loopback {
+            endpoints
+                .push(serde_json::json!({"transport": "loopback", "address": address.to_string()}));
+        }
+        endpoints
+    }
+}
+
+/// Follow this machine's tailnet addresses: dial over Tailscale while it has one, and, for a
+/// listening member, bind each new address on the replication port and announce it.
+async fn keep_tailnet_current(
+    tailscale: PathBuf,
+    listen: Option<(u16, Router)>,
+    endpoints: Endpoints,
+    transports: Arc<std::sync::RwLock<LocalTransports>>,
+    notify: watch::Sender<u64>,
+) {
+    let mut bound = BTreeSet::new();
+    loop {
+        let bindable = match tailscale_addresses(&tailscale).await {
+            Ok(reported) => bindable_tailnet_addresses(&reported, &local_addresses()),
+            Err(_) => Vec::new(),
+        };
+        let up = !bindable.is_empty();
+        let was_up = std::mem::replace(
+            &mut transports
+                .write()
+                .expect("transport lock poisoned")
+                .tailscale,
+            up,
+        );
+        if up != was_up {
+            notify.send_modify(|generation| *generation = generation.wrapping_add(1));
+        }
+        if let Some((port, app)) = &listen {
+            for address in bindable {
+                if bound.contains(&address) {
+                    continue;
+                }
+                if let Ok(listener) = TcpListener::bind(SocketAddr::new(address, *port)).await {
+                    bound.insert(address);
+                    let app = app.clone();
+                    tokio::spawn(async move {
+                        let _ = axum::serve(listener, app).await;
+                    });
+                }
+            }
+            let addresses = bound
+                .iter()
+                .map(|address| SocketAddr::new(*address, *port))
+                .collect::<Vec<_>>();
+            endpoints.update(|set| set.tailscale = addresses);
+        }
+        tokio::time::sleep(Duration::from_secs(60)).await;
+    }
+}
+
+/// Keep the loopback listener exposed through Fabric. The exposure is ephemeral, so it is
+/// asserted again every minute and vanishes when Fabric restarts without this worker.
+async fn keep_fabric_exposed(
+    fabric: Fabric,
+    protocol: String,
+    address: SocketAddr,
+    endpoints: Endpoints,
+) {
+    loop {
+        if fabric.expose(&protocol, &address.to_string()).await.is_ok()
+            && let Ok(node) = fabric.id().await
+        {
+            endpoints.update(|set| set.fabric = Some((node, protocol.clone())));
+        }
+        tokio::time::sleep(Duration::from_secs(60)).await;
+    }
+}
+
 async fn refresh_fleet_view(backend: &PeerBackend, fleet: &FleetContext) {
     if let Ok(view) = backend.fleet_view().await {
-        *fleet.view.write().expect("fleet view lock poisoned") = view;
+        let mut current = fleet.view.write().expect("fleet view lock poisoned");
+        if *current != view {
+            *current = view;
+            fleet
+                .view_changed
+                .send_modify(|generation| *generation = generation.wrapping_add(1));
+        }
     }
+}
+
+/// Announce this member's mode and endpoints whenever they change, and again every minute;
+/// the daemon writes a claim only when they differ from the last one.
+async fn keep_endpoints_published(backend: PeerBackend, mode: &'static str, endpoints: Endpoints) {
+    loop {
+        let _ = backend.publish_endpoints(mode, &endpoints.list()).await;
+        tokio::select! {
+            _ = endpoints.changed.notified() => {}
+            _ = tokio::time::sleep(Duration::from_secs(60)) => {}
+        }
+    }
+}
+
+/// Who this node dials, and the loopback URLs that reach each, most preferred first: every
+/// current listening member other than itself, and every config peer that has never been a
+/// member. A dial-out member is never dialed. A config peer entry for a member is that
+/// member's first route from this machine.
+fn dial_targets(
+    view: &FleetView,
+    own: &str,
+    config_peers: &[PeerConfig],
+    local: LocalTransports,
+) -> BTreeMap<String, Vec<Route>> {
+    let mut targets = BTreeMap::new();
+    for member in &view.members {
+        if member.name == own || member.state != "current" || member.mode != "listening" {
+            continue;
+        }
+        let mut routes = config_peers
+            .iter()
+            .filter(|peer| peer.name == member.name)
+            .map(|peer| Route::Http(peer.url.clone()))
+            .collect::<Vec<_>>();
+        routes.extend(routes_from_endpoints(&member.endpoints, local));
+        if !routes.is_empty() {
+            targets.insert(member.name.clone(), routes);
+        }
+    }
+    for peer in config_peers {
+        let known = view.members.iter().any(|member| member.name == peer.name)
+            || view.legacy_removed.contains(&peer.name);
+        if !known && peer.name != own {
+            targets.insert(peer.name.clone(), vec![Route::Http(peer.url.clone())]);
+        }
+    }
+    targets
 }
 
 /// Reread membership on every graph change and at least every 30 seconds.
@@ -1029,75 +1303,165 @@ async fn wait_for_main_daemon(socket: &Path) {
 fn start_outbound(
     backend: PeerBackend,
     node: String,
-    peers: Vec<PeerConfig>,
+    config_peers: Vec<PeerConfig>,
     auth: FleetAuth,
     fleet: FleetContext,
     main_socket: PathBuf,
     notify: watch::Sender<u64>,
 ) {
-    for peer in peers {
-        // Retain the connection pool across both phases and later wakeups for this peer.
-        let mut http = replication_http_client();
-        let backend = backend.clone();
-        let node = node.clone();
-        let auth = auth.clone();
-        let fleet = fleet.clone();
-        let main_socket = main_socket.clone();
-        let mut notify = notify.subscribe();
-        tokio::spawn(async move {
-            let mut backoff = Duration::from_secs(1);
-            loop {
-                // A removed node stops dialing; `st3 doctor` says what to do next.
-                if fleet.is_removed() {
-                    tokio::time::sleep(Duration::from_secs(60)).await;
+    // One dialer per target. Targets follow membership: a new listening member gets a dialer,
+    // and a member that ends or turns dial-out loses its dialer.
+    tokio::spawn(async move {
+        let mut view_changes = fleet.view_changed.subscribe();
+        let mut dialers: BTreeMap<
+            String,
+            (
+                Arc<std::sync::RwLock<Vec<Route>>>,
+                tokio::task::JoinHandle<()>,
+            ),
+        > = BTreeMap::new();
+        let mut transport_changes = notify.subscribe();
+        loop {
+            let targets = {
+                let view = fleet.view.read().expect("fleet view lock poisoned");
+                let local = *fleet.transports.read().expect("transport lock poisoned");
+                dial_targets(&view, &node, &config_peers, local)
+            };
+            dialers.retain(|name, (_, task)| {
+                let keep = targets.contains_key(name);
+                if !keep {
+                    task.abort();
+                }
+                keep
+            });
+            for (name, routes) in targets {
+                if let Some((current, _)) = dialers.get(&name) {
+                    *current.write().expect("route lock poisoned") = routes;
                     continue;
                 }
-                match exchange(&http, &backend, &node, &peer, &auth, &fleet, &main_socket).await {
-                    Ok(moved) => {
-                        backoff = Duration::from_secs(1);
-                        // A busy harness can write several observations while one exchange is
-                        // in flight. Keep the first exchange immediate, then coalesce the
-                        // resulting wake burst without disabling the 30-second retry path.
-                        // The window stays short so a publish is startable on every peer
-                        // within seconds.
-                        let not_before = tokio::time::Instant::now() + REPLICATION_WAKE_COALESCE;
-                        if moved {
-                            // One exchange carries a bounded batch. Keep going while envelopes
-                            // still move instead of leaving the rest of a backlog to the timer.
-                            notify.borrow_and_update();
-                        } else {
-                            tokio::select! {
-                                _ = notify.changed() => {}
-                                _ = tokio::time::sleep(Duration::from_secs(30)) => {}
-                            }
-                        }
-                        tokio::time::sleep_until(not_before).await;
-                    }
-                    Err(error) => {
-                        if let Some(removed) = error.downcast_ref::<RemovedFromFleet>() {
-                            fleet.mark_removed(&peer.name, &removed.code);
-                            continue;
-                        }
-                        // A peer can leave an HTTP stream open without making progress. Once
-                        // that exchange times out, discard the pooled connection so the next
-                        // attempt opens a fresh stream through the Fabric dial.
-                        http = replication_http_client();
-                        let status = if error.to_string().contains("signature")
-                            || error.to_string().contains("fleet")
-                        {
-                            "auth-failed"
-                        } else {
-                            "down"
-                        };
-                        let _ = backend
-                            .record_failure(&peer.name, status, &error.to_string())
-                            .await;
-                        tokio::time::sleep(backoff).await;
-                        backoff = (backoff * 2).min(Duration::from_secs(30));
+                let routes = Arc::new(std::sync::RwLock::new(routes));
+                let task = tokio::spawn(dial_peer(
+                    backend.clone(),
+                    node.clone(),
+                    name.clone(),
+                    routes.clone(),
+                    auth.clone(),
+                    fleet.clone(),
+                    main_socket.clone(),
+                    notify.subscribe(),
+                ));
+                dialers.insert(name, (routes, task));
+            }
+            tokio::select! {
+                changed = view_changes.changed() => {
+                    if changed.is_err() {
+                        return;
                     }
                 }
+                _ = transport_changes.changed() => {}
+                _ = tokio::time::sleep(Duration::from_secs(30)) => {}
             }
-        });
+        }
+    });
+}
+
+/// Exchange with one peer for as long as it stays a target, trying its routes in order.
+#[allow(clippy::too_many_arguments)]
+async fn dial_peer(
+    backend: PeerBackend,
+    node: String,
+    name: String,
+    routes: Arc<std::sync::RwLock<Vec<Route>>>,
+    auth: FleetAuth,
+    fleet: FleetContext,
+    main_socket: PathBuf,
+    mut notify: watch::Receiver<u64>,
+) {
+    // Retain the connection pool across both phases and later wakeups for this peer.
+    let mut http = replication_http_client();
+    let mut backoff = Duration::from_secs(1);
+    let mut route = 0_usize;
+    loop {
+        // A removed node stops dialing; `st3 doctor` says what to do next.
+        if fleet.is_removed() {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            continue;
+        }
+        let selected = {
+            let routes = routes.read().expect("route lock poisoned");
+            if routes.is_empty() {
+                None
+            } else {
+                Some(routes[route % routes.len()].clone())
+            }
+        };
+        let url = match selected {
+            Some(Route::Http(url)) => Some(url),
+            // The worker dials Fabric itself: a local tunnel, reused while it lives.
+            Some(Route::Fabric { node, protocol }) => match &fleet.fabric {
+                Some(fabric) => fabric
+                    .dial(&node, &protocol)
+                    .await
+                    .ok()
+                    .map(|address| format!("http://{address}")),
+                None => None,
+            },
+            None => None,
+        };
+        let Some(url) = url else {
+            route = route.wrapping_add(1);
+            tokio::time::sleep(backoff).await;
+            backoff = (backoff * 2).min(Duration::from_secs(30));
+            continue;
+        };
+        let peer = PeerConfig {
+            name: name.clone(),
+            url,
+        };
+        match exchange(&http, &backend, &node, &peer, &auth, &fleet, &main_socket).await {
+            Ok(moved) => {
+                backoff = Duration::from_secs(1);
+                // A busy harness can write several observations while one exchange is in
+                // flight. Keep the first exchange immediate, then coalesce the resulting wake
+                // burst without disabling the 30-second retry path. The window stays short so a
+                // publish is startable on every peer within seconds.
+                let not_before = tokio::time::Instant::now() + REPLICATION_WAKE_COALESCE;
+                if moved {
+                    // One exchange carries a bounded batch. Keep going while envelopes still
+                    // move instead of leaving the rest of a backlog to the timer.
+                    notify.borrow_and_update();
+                } else {
+                    tokio::select! {
+                        _ = notify.changed() => {}
+                        _ = tokio::time::sleep(Duration::from_secs(30)) => {}
+                    }
+                }
+                tokio::time::sleep_until(not_before).await;
+            }
+            Err(error) => {
+                if let Some(removed) = error.downcast_ref::<RemovedFromFleet>() {
+                    fleet.mark_removed(&peer.name, &removed.code);
+                    continue;
+                }
+                // A peer can leave an HTTP stream open without making progress. Once that
+                // exchange times out, discard the pooled connection so the next attempt opens
+                // a fresh stream, and try the next route.
+                http = replication_http_client();
+                route = route.wrapping_add(1);
+                let status = if error.to_string().contains("signature")
+                    || error.to_string().contains("fleet")
+                {
+                    "auth-failed"
+                } else {
+                    "down"
+                };
+                let _ = backend
+                    .record_failure(&peer.name, status, &error.to_string())
+                    .await;
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(Duration::from_secs(30));
+            }
+        }
     }
 }
 
@@ -2190,6 +2554,69 @@ mod tests {
         );
     }
 
+    #[test]
+    fn the_dial_set_comes_from_membership_and_skips_dial_out_members() {
+        let member =
+            |name: &str, state: &str, mode: &str, endpoints: Vec<Value>| crate::fleet::MemberView {
+                name: name.into(),
+                member_key: format!("{name}-key"),
+                state: state.into(),
+                mode: mode.into(),
+                endpoints,
+                start: 1,
+                end: None,
+                ended: None,
+            };
+        let loopback = |port: u16| {
+            vec![
+                serde_json::json!({"transport": "loopback", "address": format!("127.0.0.1:{port}")}),
+            ]
+        };
+        let view = FleetView {
+            anchor: Some("a-key".into()),
+            members: vec![
+                member("a", "current", "listening", loopback(1)),
+                member("server", "current", "listening", loopback(2)),
+                member("laptop", "current", "dial-out", Vec::new()),
+                member("gone", "ended", "listening", loopback(3)),
+                member("quiet", "current", "listening", Vec::new()),
+            ],
+            legacy_removed: vec!["old".into()],
+        };
+        let config = |name: &str, port: u16| PeerConfig {
+            name: name.into(),
+            url: format!("http://127.0.0.1:{port}"),
+        };
+        let targets = dial_targets(
+            &view,
+            "a",
+            &[
+                config("server", 9002),
+                config("laptop", 9003),
+                config("gone", 9004),
+                config("old", 9005),
+                config("legacy", 9006),
+            ],
+            LocalTransports::default(),
+        );
+        assert_eq!(
+            targets,
+            BTreeMap::from([
+                (
+                    "server".to_owned(),
+                    vec![
+                        Route::Http("http://127.0.0.1:9002".into()),
+                        Route::Http("http://127.0.0.1:2".into())
+                    ]
+                ),
+                (
+                    "legacy".to_owned(),
+                    vec![Route::Http("http://127.0.0.1:9006".into())]
+                ),
+            ])
+        );
+    }
+
     fn fleet_claim(store: &Store, kind: &str, subject: &str, fields: Value) {
         store
             .append_claim(&ClaimInput {
@@ -2213,10 +2640,13 @@ mod tests {
     ) -> FleetContext {
         FleetContext {
             view: Arc::new(std::sync::RwLock::new(store.fleet_view().unwrap())),
+            view_changed: watch::channel(0).0,
             config_peers: config_peers.iter().map(|peer| (*peer).into()).collect(),
             legacy,
             own_key: Some(own.public().into()),
             bootstrap_keys: bootstrap.iter().map(|key| (*key).into()).collect(),
+            transports: Arc::default(),
+            fabric: None,
             removed: Arc::default(),
             state_dir: None,
         }
