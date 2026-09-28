@@ -42,7 +42,8 @@ const actionLabels: Record<Attention['actions'][number], string> = {
 export function attentionActionLabel(action: string): string {
   return actionLabels[action as keyof typeof actionLabels] ?? titleCase(action.replace(/[.-]/g, ' '));
 }
-const kindLabels: Record<Attention['attention_kind'], string> = {
+// The server can introduce a kind before this generated client contract catches up.
+const kindLabels: Record<string, string> = {
   'human-gate': 'Needs a decision',
   'launch-approval': 'Launch approval',
   'revision-approval': 'Revision approval',
