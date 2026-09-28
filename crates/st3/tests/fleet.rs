@@ -19,12 +19,28 @@ const ST3: &str = env!("CARGO_BIN_EXE_st3");
 const PERSON: &str = "person/fleet-tester";
 const NOTE: &str = "custom.fleet-test.note";
 
+/// A port for a node's listener. It comes from below every ephemeral range (Linux hands out
+/// 32768-60999 and macOS 49152-65535 to outgoing connections), so it is still free when a
+/// stopped node starts again.
 fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
+    use std::sync::atomic::{AtomicU16, Ordering};
+    const LOW: u16 = 20_000;
+    const SPAN: u16 = 12_000;
+    static NEXT: AtomicU16 = AtomicU16::new(0);
+    let mut seed = [0_u8; 2];
+    getrandom::fill(&mut seed).unwrap();
+    let _ = NEXT.compare_exchange(
+        0,
+        u16::from_le_bytes(seed) % SPAN + 1,
+        Ordering::AcqRel,
+        Ordering::Acquire,
+    );
+    loop {
+        let port = LOW + NEXT.fetch_add(1, Ordering::AcqRel) % SPAN;
+        if std::net::TcpListener::bind(("127.0.0.1", port)).is_ok() {
+            return port;
+        }
+    }
 }
 
 /// One isolated node: its own directories, daemon, and replication worker.
@@ -123,11 +139,12 @@ impl Node {
         let output = self.st(arguments);
         assert!(
             output.status.success(),
-            "st3 {} on {} failed:\n{}{}",
+            "st3 {} on {} failed:\n{}{}\n{}",
             arguments.join(" "),
             self.name,
             String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
+            String::from_utf8_lossy(&output.stderr),
+            self.logs()
         );
         String::from_utf8(output.stdout).unwrap()
     }
@@ -139,19 +156,24 @@ impl Node {
     }
 
     fn logs(&self) -> String {
-        ["daemon.log", "worker.log"]
-            .iter()
-            .map(|log| {
-                let text = fs::read_to_string(self.root.join(log)).unwrap_or_default();
-                let tail = text.lines().rev().take(20).collect::<Vec<_>>();
-                format!(
-                    "--- {} {log}\n{}",
-                    self.name,
-                    tail.into_iter().rev().collect::<Vec<_>>().join("\n")
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
+        [
+            "daemon.log",
+            "daemon.stderr.log",
+            "worker.log",
+            "worker.stderr.log",
+        ]
+        .iter()
+        .map(|log| {
+            let text = fs::read_to_string(self.root.join(log)).unwrap_or_default();
+            let tail = text.lines().rev().take(20).collect::<Vec<_>>();
+            format!(
+                "--- {} {log}\n{}",
+                self.name,
+                tail.into_iter().rev().collect::<Vec<_>>().join("\n")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
     }
 
     async fn start(&mut self) {
@@ -288,27 +310,41 @@ impl Node {
         self.st_ok(&arguments).trim().to_owned()
     }
 
-    /// Wait until this member announces a loopback endpoint, so its invites can carry it.
+    /// Wait until this member announces a loopback endpoint, so its invites can carry it, and its
+    /// worker accepts connections. After a restart the announcement is the previous run's, so
+    /// only the open port says the new worker listens.
     async fn wait_listening(&self) {
-        wait_until(
-            &format!("{} announces its endpoint", self.name),
-            30,
-            || async {
-                let status: Value = match self.client().get("/v1/internal/fleet/status").await {
-                    Ok(status) => status,
-                    Err(_) => return false,
-                };
-                status["view"]["members"].as_array().is_some_and(|members| {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let announced = match self
+                .client()
+                .get::<Value>("/v1/internal/fleet/status")
+                .await
+            {
+                Ok(status) => status["view"]["members"].as_array().is_some_and(|members| {
                     members.iter().any(|member| {
                         member["name"] == self.name.as_str()
                             && member["endpoints"]
                                 .as_array()
                                 .is_some_and(|endpoints| !endpoints.is_empty())
                     })
-                })
-            },
-        )
-        .await;
+                }),
+                Err(_) => false,
+            };
+            let open = tokio::net::TcpStream::connect(("127.0.0.1", self.port))
+                .await
+                .is_ok();
+            if announced && open {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "{} did not announce and open its endpoint (announced {announced}, open {open})\n{}",
+                self.name,
+                self.logs()
+            );
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
     }
 
     async fn note(&self, text: &str) -> String {
@@ -895,6 +931,7 @@ async fn leave_drains_everything_before_it_leaves() {
         expected.insert(format!("custom/fleet-test/b-{index}"));
     }
     a.start().await;
+    a.wait_listening().await;
     b.st_ok(&[
         "fleet",
         "leave",
